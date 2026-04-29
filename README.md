@@ -4,6 +4,7 @@ Python SDK for the [Radiant (RXD) blockchain](https://radiantblockchain.org/).
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Documentation Status](https://readthedocs.org/projects/pyrxd/badge/?version=latest)](https://pyrxd.readthedocs.io/en/latest/?badge=latest)
 
 A typed, async-first SDK for building applications on Radiant. Includes
 transaction construction, HD wallets, the Glyph token protocol (NFT, FT,
@@ -132,10 +133,15 @@ AWS) and is the correct shape for any application handling real funds.
 
 ## Documentation
 
+Hosted at **[pyrxd.readthedocs.io](https://pyrxd.readthedocs.io/)** (API
+reference + tutorials + how-to guides + concepts).
+
+Other resources in this repo:
+
+- [`examples/`](examples/) — runnable end-to-end demos
 - [`docs/dmint-followup.md`](docs/dmint-followup.md) — premine vs PoW dMint scope
 - [`docs/dmint-research-photonic.md`](docs/dmint-research-photonic.md) — Photonic Wallet TS reference
 - [`docs/dmint-research-mainnet.md`](docs/dmint-research-mainnet.md) — decoded live dMint contracts
-- [`examples/`](examples/) — runnable end-to-end demos
 - [`SECURITY.md`](SECURITY.md) — security policy and disclosure
 
 ## Contributing
