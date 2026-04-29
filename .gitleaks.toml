@@ -1,0 +1,51 @@
+# Gitleaks configuration for pyrxd
+#
+# We extend the default ruleset and allowlist a small set of well-known
+# published test vectors that gitleaks otherwise flags as generic API keys.
+# These are NOT real secrets — they are widely-published reference values
+# used by every Bitcoin/secp256k1 library to verify implementation
+# correctness against a known-good answer.
+#
+# DO NOT add real private keys, mnemonics, or API keys to this allowlist.
+# If gitleaks flags something not on this list, investigate it as a real
+# leak first.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Published test vectors and known-non-secret hex constants"
+
+# Files where well-known test vectors are deliberately included.
+# These files are *test code* — they verify that our library produces the
+# correct output for inputs published in BIPs, the Bitcoin Wiki, and
+# reference libraries.
+paths = [
+    '''tests/test_keys\.py$''',
+    '''tests/test_btc_wallet\.py$''',
+    # The frozen golden-vector file pins ECDSA RFC-6979 outputs against a
+    # trivially-known private key (all-0x01 scalar) for determinism testing.
+    '''tests/test_golden_vectors\.py$''',
+]
+
+# Specific hex values that are universally known test vectors.
+# These appear in BIP-178, Bitcoin Wiki "Private key" article, and the
+# secp256k1 reference test suite.
+regexes = [
+    # "private key = 1" (the trivial vector), all encodings
+    '''0{63}1''',
+    '''0000000000000000000000000000000000000000000000000000000000000001''',
+    # WIF for k=1 (compressed and uncompressed)
+    '''KwDiBf89QgGbjEhKnhXJuH7LrciVrZi3qYjgd9M7rFU73sVHnoWn''',
+    '''5HpHagT65TZzG1PH3CSu63k8DbpvD8s5ip4nEB3kEsreAnchuDf''',
+    # Bitcoin Wiki WIF example
+    '''0C28FCA386C7A227600B2FE50B7CAE11EC86D3BF1FBE471BE89827E19D72AA1D''',
+    '''0c28fca386c7a227600b2fe50b7cae11ec86d3bf1fbe471be89827e19d72aa1d''',
+    # secp256k1 reference test vector
+    '''E9873D79C6D87DC0FB6A5778633389F4453213303DA61F20BD67FC233AA33262''',
+    '''e9873d79c6d87dc0fb6a5778633389f4453213303da61f20bd67fc233aa33262''',
+    # BIP-178 test vector
+    '''ef235aacf90d9f4aadd8c92e4b2562e1d9eb97f0df9ba3b508258739cb013db2''',
+    # WIF for the BIP-178 vector
+    '''L5EZftvrYaSudiozVRzTqLcHLNDoVn7H5HSfM9BAN6tMJX8oTWz6''',
+]

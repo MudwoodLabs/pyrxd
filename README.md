@@ -3,7 +3,7 @@
 Python SDK for the [Radiant (RXD) blockchain](https://radiantblockchain.org/).
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 
 A typed, async-first SDK for building applications on Radiant. Includes
 transaction construction, HD wallets, the Glyph token protocol (NFT, FT,
@@ -39,7 +39,7 @@ Cryptographic primitives have not been independently audited. See
 pip install pyrxd
 ```
 
-Requires Python 3.9 or newer.
+Requires Python 3.10 or newer.
 
 ## Quick start
 
