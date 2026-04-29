@@ -116,8 +116,6 @@ covenant variants in this module are experimental.
   engineering.
 - `docs/dmint-research-mainnet.md` — decoded live mainnet dMint
   contracts.
-- `docs/plans/` — feature plans.
-- `docs/solutions/` — implementation notes for cross-cutting features.
 
 ### Known limitations
 
