@@ -69,7 +69,7 @@ hypothesis = "^6.98.0"
 pytest-asyncio = ">=1.3.0"
 
 [tool.poetry.group.spark.dependencies]
-pyspark = ">=3.0.0"
+pyspark = ">=4.1.1"
 
 [tool.poetry.group.test.dependencies]
 bandit = {version = "^1.7.8", extras = ["toml"]}
