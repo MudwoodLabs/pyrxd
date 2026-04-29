@@ -68,9 +68,6 @@ ruff = "^0.3.4"
 hypothesis = "^6.98.0"
 pytest-asyncio = ">=1.3.0"
 
-[tool.poetry.group.spark.dependencies]
-pyspark = ">=3.0.0"
-
 [tool.poetry.group.test.dependencies]
 bandit = {version = "^1.7.8", extras = ["toml"]}
 black = ">=26.3.1"
@@ -171,7 +168,6 @@ markers = [
     "integration: marks as integration test",
     "notebooks: marks as notebook test",
     "gpu: marks as gpu test",
-    "spark: marks tests which need Spark",
     "slow: marks tests as slow",
     "unit: fast offline tests",
 ]
@@ -179,31 +175,15 @@ markers = [
 [tool.tox]
 legacy_tox_ini = """
 [tox]
-envlist = py, integration, spark, all
+envlist = py, integration
 
 [testenv]
 commands =
-    pytest -m "not integration and not spark" {posargs}
+    pytest -m "not integration" {posargs}
 
 [testenv:integration]
 commands =
     pytest -m "integration" {posargs}
-
-[testenv:spark]
-extras = spark
-setenv =
-       PYSPARK_DRIVER_PYTHON = {envpython}
-       PYSPARK_PYTHON = {envpython}
-commands =
-    pytest -m "spark" {posargs}
-
-[testenv:all]
-extras = all
-setenv =
-       PYSPARK_DRIVER_PYTHON = {envpython}
-       PYSPARK_PYTHON = {envpython}
-commands =
-    pytest {posargs}
 """
 
 [tool.pylint]
@@ -302,7 +282,7 @@ check-str-concat-over-line-jumps="no"
 
 [tool.pylint.'TYPECHECK']
 contextmanager-decorators="contextlib.contextmanager"
-generated-members="numpy.*,np.*,pyspark.sql.functions,collect_list"
+generated-members="numpy.*,np.*"
 ignore-mixin-members="yes"
 ignore-none="yes"
 ignore-on-opaque-inference="yes"
