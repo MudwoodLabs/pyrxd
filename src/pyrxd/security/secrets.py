@@ -19,7 +19,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import hmac
-from typing import Any, Dict
+from typing import Any, Dict, SupportsIndex
 
 from .errors import KeyMaterialError
 
@@ -109,7 +109,7 @@ class SecretBytes:
         raise TypeError("SecretBytes instances are not hashable (secret leak risk)")
 
     # ------------------------------------------------------------------ serialization guards
-    def __reduce_ex__(self, protocol: int) -> object:
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
         raise TypeError(
             f"{type(self).__name__} cannot be pickled — serializing secret material "
             "to a byte stream defeats the purpose of in-memory protection."
@@ -120,7 +120,7 @@ class SecretBytes:
     def __copy__(self) -> "SecretBytes":
         raise TypeError(f"{type(self).__name__} cannot be copied (use explicit construction)")
 
-    def __deepcopy__(self, memo: dict) -> "SecretBytes":
+    def __deepcopy__(self, memo: dict[int, Any]) -> "SecretBytes":
         raise TypeError(f"{type(self).__name__} cannot be deep-copied (use explicit construction)")
 
     def __len__(self) -> int:
