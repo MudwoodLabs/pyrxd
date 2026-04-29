@@ -16,35 +16,35 @@ import pytest
 # ---------------------------------------------------------------------------
 
 class TestToplevelImports:
-    def test_glyphbuilder_importable_from_rxdpy(self):
+    def test_glyphbuilder_importable_from_pyrxd(self):
         from pyrxd import GlyphBuilder
         assert GlyphBuilder is not None
 
-    def test_glyphmetadata_importable_from_rxdpy(self):
+    def test_glyphmetadata_importable_from_pyrxd(self):
         from pyrxd import GlyphMetadata
         assert GlyphMetadata is not None
 
-    def test_glyphprotocol_importable_from_rxdpy(self):
+    def test_glyphprotocol_importable_from_pyrxd(self):
         from pyrxd import GlyphProtocol
         assert GlyphProtocol is not None
 
-    def test_glyphref_importable_from_rxdpy(self):
+    def test_glyphref_importable_from_pyrxd(self):
         from pyrxd import GlyphRef
         assert GlyphRef is not None
 
-    def test_gravitytrade_importable_from_rxdpy(self):
+    def test_gravitytrade_importable_from_pyrxd(self):
         from pyrxd import GravityTrade
         assert GravityTrade is not None
 
-    def test_privatekey_importable_from_rxdpy(self):
+    def test_privatekey_importable_from_pyrxd(self):
         from pyrxd import PrivateKey
         assert PrivateKey is not None
 
-    def test_rxdsdkerror_importable_from_rxdpy(self):
+    def test_rxdsdkerror_importable_from_pyrxd(self):
         from pyrxd import RxdSdkError
         assert issubclass(RxdSdkError, Exception)
 
-    def test_validationerror_importable_from_rxdpy(self):
+    def test_validationerror_importable_from_pyrxd(self):
         from pyrxd import ValidationError, RxdSdkError
         assert issubclass(ValidationError, RxdSdkError)
 

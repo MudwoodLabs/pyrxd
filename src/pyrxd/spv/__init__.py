@@ -1,6 +1,6 @@
 """Bitcoin SPV primitives for the Radiant-side covenant.
 
-This module is the highest-risk layer of rxd-python-sdk: a forged SPV proof
+This module is the highest-risk layer of pyrxd: a forged SPV proof
 accepted here drains a Maker's RXD. Every verifier here mirrors the
 battle-tested Node.js prototype at ``gravity-rxd-prototype/`` and
 incorporates the 12 audit-hardening fixes called out in

@@ -1,4 +1,4 @@
-"""Security primitives for rxd-python-sdk.
+"""Security primitives for pyrxd.
 
 This package contains the security foundation the rest of the SDK is built on:
 exception hierarchy, key-material wrappers, secure RNG helpers, and typed

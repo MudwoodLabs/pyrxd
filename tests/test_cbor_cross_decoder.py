@@ -213,10 +213,10 @@ class TestImageFields:
         assert "image_sha256" not in payload
 
 
-class TestFhcPayload:
+class TestRealWorldPayload:
     """Full reference CBOR payload — the exact shape that will go on-chain."""
 
-    def test_fhc_payload_all_fields_round_trip(self):
+    def test_real_world_payload_all_fields_round_trip(self):
         meta = GlyphMetadata.for_dmint_ft(
             ticker="TST",
             name="Test Token",
@@ -237,7 +237,7 @@ class TestFhcPayload:
         assert payload["image_sha256"] == "a" * 64
         assert "decimals" not in payload  # 0 is omitted
 
-    def test_fhc_payload_cbor_is_deterministic(self):
+    def test_real_world_payload_cbor_is_deterministic(self):
         meta = GlyphMetadata.for_dmint_ft(
             ticker="TST",
             name="Test Token",

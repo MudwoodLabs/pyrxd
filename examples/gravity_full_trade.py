@@ -71,8 +71,8 @@ FINALIZE_FEE   = FEE_RATE_PH_PER_BYTE * FINALIZE_TX_BYTES      # 55,000,000 phot
 BTC_SATOSHIS = int(os.environ.get("BTC_SATOSHIS", "1500"))   # sats to pay on BTC side
 BTC_FEE_SATS = int(os.environ.get("BTC_FEE_SATS", "500"))    # BTC tx fee
 
-EXPECTED_HOT_WALLET_ADDR = "1A4uLV5MpZXXj4N4uaFppRYrZACgYm36j9"
-HOT_WALLET_PKH_HEX = "63761159b864370b740f6358ba21c061bd5f997f"
+EXPECTED_HOT_WALLET_ADDR = os.environ.get("EXPECTED_MAKER_ADDR", "")
+HOT_WALLET_PKH_HEX = os.environ.get("EXPECTED_MAKER_PKH_HEX", "")
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -126,7 +126,7 @@ async def mode_offer() -> None:
     maker_pkh = hashlib.new("ripemd160", hashlib.sha256(maker_pub).digest()).digest()
     from pyrxd.base58 import base58check_encode
     maker_addr = base58check_encode(b"\x00" + maker_pkh)
-    if maker_addr != EXPECTED_HOT_WALLET_ADDR:
+    if EXPECTED_HOT_WALLET_ADDR and maker_addr != EXPECTED_HOT_WALLET_ADDR:
         _fail(f"WIF derives {maker_addr}, expected {EXPECTED_HOT_WALLET_ADDR}")
     _ok(f"Maker address: {maker_addr}")
 

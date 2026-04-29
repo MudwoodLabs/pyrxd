@@ -254,7 +254,7 @@ async def main() -> None:
     metadata = GlyphMetadata(
         protocol=[GlyphProtocol.NFT],
         name="pyrxd-sdk-mint-test",
-        description="First Glyph NFT minted via rxd-python-sdk — integration test",
+        description="First Glyph NFT minted via pyrxd — integration test",
         token_type="sdk-test",
         attrs={"sdk_version": "0.0.2", "minted_at": str(int(time.time()))},
     )

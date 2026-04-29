@@ -130,7 +130,7 @@ async def run_demo() -> None:
 
     print()
     print("=" * 70)
-    print("  rxd-python-sdk  —  Gravity BTC↔RXD Swap Demo")
+    print("  pyrxd  —  Gravity BTC↔RXD Swap Demo")
     print(f"  Mode: {'DRY RUN (no broadcasts)' if DRY_RUN else 'LIVE TESTNET'}")
     print("=" * 70)
 

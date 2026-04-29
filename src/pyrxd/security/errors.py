@@ -1,4 +1,4 @@
-"""Exception hierarchy for rxd-python-sdk.
+"""Exception hierarchy for pyrxd.
 
 Design rules
 ------------
@@ -78,7 +78,7 @@ def redact(value: Any) -> Any:
 
 
 class RxdSdkError(Exception):
-    """Base class for every exception raised by rxd-python-sdk.
+    """Base class for every exception raised by pyrxd.
 
     Applying ``redact`` to each positional arg on construction defends against
     accidental key-material leakage when callers pass user-supplied values

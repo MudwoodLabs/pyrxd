@@ -1,14 +1,18 @@
-.. rxdpy docs documentation master file, created by
-   sphinx-quickstart on Thu May  5 14:06:45 2022.
-   You can adapt this file completely to your liking, but it should at least
-   contain the root `toctree` directive.
+pyrxd
+=====
 
-Welcome to rxdpy docs's documentation!
-==========================================
+Python SDK for the Radiant (RXD) blockchain — transaction building, HD
+wallets, the Glyph token protocol (NFT/FT/dMint), Gravity cross-chain
+atomic swaps, SPV verification, and ElectrumX networking.
+
+This is the auto-generated API reference. Tutorials and how-to guides are
+forthcoming. Until then, runnable end-to-end examples live in the
+``examples/`` directory of the repository.
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
+   :caption: Contents
+
    modules
 
 

@@ -25,9 +25,11 @@ DRY_RUN=1 (default): builds all txs with real covenant bytecode, no broadcast.
 DRY_RUN=0: attempts to broadcast make_offer_tx on Radiant mainnet (needs MAKER_RXD_WIF
            and a funded UTXO). BTC broadcast still disabled.
 
-Key / address reference (RXD mainnet hot wallet — do NOT expose WIF in logs):
-  Address: 1A4uLV5MpZXXj4N4uaFppRYrZACgYm36j9
-  WIF:     set via MAKER_RXD_WIF env var
+Key / address (RXD mainnet maker — do NOT expose WIF in logs):
+  WIF:     set via MAKER_RXD_WIF env var (required for live broadcast)
+  Address: optionally pin via EXPECTED_MAKER_ADDR (and EXPECTED_MAKER_PKH_HEX)
+           to assert the WIF derives the address you expect; leave unset
+           to skip the pin check.
 """
 
 from __future__ import annotations
@@ -102,8 +104,10 @@ def _hash256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
 
 
-# Expected hot-wallet address (from CLAUDE.md project memory, 2026-04-21)
-EXPECTED_HOT_WALLET_ADDR = "1A4uLV5MpZXXj4N4uaFppRYrZACgYm36j9"
+# Optional pinned address. If set, the script asserts the WIF derives
+# this exact address (sanity check against accidentally swapping WIFs).
+# Leave unset to skip the pin check.
+EXPECTED_HOT_WALLET_ADDR = os.environ.get("EXPECTED_MAKER_ADDR", "")
 
 
 async def phase_1_key_derivation():
@@ -130,13 +134,14 @@ async def phase_1_key_derivation():
     _ok(f"WIF -> PKH: {pkh.hex()}")
     _ok(f"WIF -> addr: {addr}")
 
-    if addr != EXPECTED_HOT_WALLET_ADDR:
-        _fail(
-            f"WIF does not match expected hot-wallet address\n"
-            f"       expected: {EXPECTED_HOT_WALLET_ADDR}\n"
-            f"       got:      {addr}"
-        )
-    _ok(f"Derived address matches known hot-wallet: {EXPECTED_HOT_WALLET_ADDR}")
+    if EXPECTED_HOT_WALLET_ADDR:
+        if addr != EXPECTED_HOT_WALLET_ADDR:
+            _fail(
+                f"WIF does not match pinned EXPECTED_MAKER_ADDR\n"
+                f"       expected: {EXPECTED_HOT_WALLET_ADDR}\n"
+                f"       got:      {addr}"
+            )
+        _ok(f"Derived address matches pinned EXPECTED_MAKER_ADDR: {EXPECTED_HOT_WALLET_ADDR}")
     return pk, pkh, addr
 
 
@@ -155,20 +160,24 @@ async def phase_2_rxd_network():
         tip_height = int(tip)
         _ok(f"RXD tip height: {tip_height}  (source: ElectrumX server)")
 
-        # Script-hash for P2PKH of hot wallet address
-        # scriptPubKey = 76 a9 14 <pkh> 88 ac
-        pkh_hex = "63761159b864370b740f6358ba21c061bd5f997f"
-        script = bytes.fromhex("76a914" + pkh_hex + "88ac")
-        script_hash_le = hashlib.sha256(script).digest()[::-1]
-        try:
-            confirmed, unconfirmed = await rxd.get_balance(Hex32(script_hash_le))
-            balance = int(confirmed)
-            _ok(f"Hot wallet confirmed balance: {balance} photons "
-                f"= {balance / 1e8:.8f} RXD  (source: ElectrumX get_balance)")
-            if unconfirmed:
-                _info(f"Hot wallet unconfirmed: {int(unconfirmed)} photons")
-        except Exception as exc:
-            _warn(f"Could not fetch balance: {type(exc).__name__}: {exc}")
+        # Script-hash for P2PKH of the maker address (set EXPECTED_MAKER_PKH_HEX
+        # in env to query a balance). scriptPubKey = 76 a9 14 <pkh> 88 ac
+        pkh_hex = os.environ.get("EXPECTED_MAKER_PKH_HEX", "")
+        balance = 0
+        if not pkh_hex:
+            _info("EXPECTED_MAKER_PKH_HEX not set; skipping balance check.")
+        else:
+            script = bytes.fromhex("76a914" + pkh_hex + "88ac")
+            script_hash_le = hashlib.sha256(script).digest()[::-1]
+            try:
+                confirmed, unconfirmed = await rxd.get_balance(Hex32(script_hash_le))
+                balance = int(confirmed)
+                _ok(f"Maker confirmed balance: {balance} photons "
+                    f"= {balance / 1e8:.8f} RXD  (source: ElectrumX get_balance)")
+                if unconfirmed:
+                    _info(f"Maker unconfirmed: {int(unconfirmed)} photons")
+            except Exception as exc:
+                _warn(f"Could not fetch balance: {type(exc).__name__}: {exc}")
 
     return tip_height, balance
 
@@ -463,7 +472,10 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
         import hashlib as _hl
 
         async with websockets.connect(RXD_ELECTRUMX_URL) as ws:
-            pkh_hex = "63761159b864370b740f6358ba21c061bd5f997f"
+            pkh_hex = os.environ.get("EXPECTED_MAKER_PKH_HEX", "")
+            if not pkh_hex:
+                _fail("DRY_RUN=0 requires EXPECTED_MAKER_PKH_HEX to be set "
+                      "(matching MAKER_RXD_WIF) for UTXO lookup.")
             script = bytes.fromhex("76a914" + pkh_hex + "88ac")
             script_hash_le = _hl.sha256(script).digest()[::-1].hex()
             req = _json.dumps({"id": 1, "method": "blockchain.scripthash.listunspent",
@@ -554,7 +566,7 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
 async def run() -> None:
     print()
     print("=" * 70)
-    print("  rxd-python-sdk  —  Gravity LIVE integration test")
+    print("  pyrxd  —  Gravity LIVE integration test")
     print(f"  Mode: DRY_RUN={DRY_RUN}")
     print("=" * 70)
 
