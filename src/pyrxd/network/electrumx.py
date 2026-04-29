@@ -506,7 +506,7 @@ class ElectrumXClient:
                     continue
                 try:
                     await ws.close()
-                except Exception:
+                except Exception:  # nosec B110 — best-effort cleanup of losing race connection
                     pass
 
         if winner_ws is not None:

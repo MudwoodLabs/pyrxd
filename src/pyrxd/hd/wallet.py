@@ -126,7 +126,7 @@ class HdWallet:
     def from_mnemonic(
         cls,
         mnemonic: str,
-        passphrase: str = "",
+        passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         account: int = 0,
     ) -> "HdWallet":
         """Create a fresh wallet from a BIP39 mnemonic."""
@@ -140,7 +140,7 @@ class HdWallet:
         cls,
         path: Path,
         mnemonic: str,
-        passphrase: str = "",
+        passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
     ) -> "HdWallet":
         """Load a previously saved wallet from *path*.
 
@@ -162,7 +162,7 @@ class HdWallet:
         cls,
         path: Path,
         mnemonic: str,
-        passphrase: str = "",
+        passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         account: int = 0,
     ) -> "HdWallet":
         """Load a wallet from *path*, or build a fresh one if the file is missing.
