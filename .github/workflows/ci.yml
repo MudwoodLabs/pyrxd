@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Poetry
+        run: pip install poetry
+      - name: Install dependencies
+        run: poetry install --sync
+      - name: Run tests
+        run: poetry run pytest tests/ -v --tb=short
+      - name: Security module coverage (must be 100%)
+        run: poetry run pytest tests/security/ --cov=pyrxd.security --cov-fail-under=100
+      - name: Overall coverage (must be 85%)
+        run: poetry run pytest tests/ --cov=pyrxd --cov-fail-under=85
+      - name: Bandit security scan
+        run: poetry run bandit -r src/ -c pyproject.toml
+      - name: Type check
+        run: poetry run mypy src/pyrxd/security/

@@ -1,0 +1,396 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[project]
+name = "pyrxd"
+version = "0.2.0"
+description = "Python SDK for the Radiant (RXD) blockchain — transactions, HD wallets, Glyph tokens (NFT/FT/dMint), Gravity cross-chain atomic swaps, SPV, and ElectrumX."
+authors = [
+    {name = "Mudwood Labs", email = "opensource@mudwoodlabs.com"}
+]
+license = "Apache-2.0"
+readme = "README.md"
+requires-python = ">=3.9,<4.0"
+keywords = ["radiant", "rxd", "blockchain", "glyph", "nft", "ft", "dmint", "gravity", "atomic-swap", "bip32", "bip39", "bip44", "electrumx"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security :: Cryptography",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+[project.urls]
+Homepage = "https://github.com/MudwoodLabs/pyrxd"
+Documentation = "https://github.com/MudwoodLabs/pyrxd#readme"
+Source = "https://github.com/MudwoodLabs/pyrxd"
+Tracker = "https://github.com/MudwoodLabs/pyrxd/issues"
+Changelog = "https://github.com/MudwoodLabs/pyrxd/blob/main/CHANGELOG.md"
+
+[tool.poetry]
+packages = [{include = "pyrxd", from = "src"}]
+include = [
+    { path = "src/pyrxd/gravity/artifacts/*.json", format = ["sdist", "wheel"] },
+    { path = "src/pyrxd/hd/wordlist/*.txt",        format = ["sdist", "wheel"] },
+    { path = "src/pyrxd/py.typed",                 format = ["sdist", "wheel"] },
+]
+
+[tool.taskipy.tasks]
+lint = "flake8 src"
+format = "black src"
+test = "pytest"
+docs = "sphinx-build -b html docs docs/_build/html"
+docs-clean = "rm -rf docs/_build"
+docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
+
+[tool.poetry.dependencies]
+aiohttp = ">=3.9.0"
+coincurve = "^21.0.0"
+base58 = "^2.1.1"
+pycryptodomex = "^3.22.0"
+websockets = "^15.0.1"
+websocket-client = "^1.8.0"
+cbor2 = "^5.6"
+
+[tool.poetry.group.dev.dependencies]
+taskipy = "^1.14.1"
+bandit = {version = "^1.7.8", extras = ["toml"]}
+pip-audit = "^2.7.3"
+detect-secrets = "^1.4.0"
+mypy = "^1.8.0"
+ruff = "^0.3.4"
+hypothesis = "^6.98.0"
+pytest-asyncio = "^0.23.5"
+
+[tool.poetry.group.spark.dependencies]
+pyspark = ">=3.0.0"
+
+[tool.poetry.group.test.dependencies]
+bandit = {version = "^1.7.8", extras = ["toml"]}
+black = ">=26.3.1"
+check-manifest = "0.49"
+flake8-bugbear = "23.5.9"
+flake8-docstrings = "*"
+flake8-formatter_junit_xml = "*"
+flake8 = "*"
+flake8-pyproject = "*"
+pre-commit = "3.3.1"
+pylint = "2.17.4"
+pylint_junit = "*"
+pytest-cov = "4.0.0"
+pytest-mock = "<3.10.1"
+pytest-runner = "*"
+pytest = ">=9.0.3"
+pytest-github-actions-annotate-failures = "*"
+shellcheck-py = "0.9.0.2"
+
+[tool.bandit]
+exclude_dirs = ["tests"]
+skips = []
+
+[tool.mypy]
+strict = true
+python_version = "3.9"
+exclude = ["tests/"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "S", "B", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # assert allowed in tests
+
+[tool.black]
+line-length = 120
+fast = true
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 85
+
+[tool.flake8]
+max-line-length = 120
+select = "F,E,W,B,B901,B902,B903"
+exclude = [
+    ".eggs",
+    ".git",
+    ".tox",
+    "nssm",
+    "obj",
+    "out",
+    "packages",
+    "pywin32",
+    "tests",
+    "swagger_client"
+]
+ignore = [
+    "E722",
+    "B001",
+    "W503",
+    "E203"
+]
+
+[tool.pyright]
+include = ["src"]
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+]
+venv = "env"
+
+reportMissingImports = true
+reportMissingTypeStubs = false
+
+pythonVersion = "3.9"
+pythonPlatform = "Linux"
+
+executionEnvironments = [
+  { root = "src" }
+]
+
+[tool.pytest.ini_options]
+addopts = "--cov-report xml:coverage.xml --cov src --cov-fail-under 0 --cov-append -m 'not integration'"
+pythonpath = [
+  "src"
+]
+testpaths = "tests"
+junit_family = "xunit2"
+asyncio_mode = "auto"
+markers = [
+    "integration: marks as integration test",
+    "notebooks: marks as notebook test",
+    "gpu: marks as gpu test",
+    "spark: marks tests which need Spark",
+    "slow: marks tests as slow",
+    "unit: fast offline tests",
+]
+
+[tool.tox]
+legacy_tox_ini = """
+[tox]
+envlist = py, integration, spark, all
+
+[testenv]
+commands =
+    pytest -m "not integration and not spark" {posargs}
+
+[testenv:integration]
+commands =
+    pytest -m "integration" {posargs}
+
+[testenv:spark]
+extras = spark
+setenv =
+       PYSPARK_DRIVER_PYTHON = {envpython}
+       PYSPARK_PYTHON = {envpython}
+commands =
+    pytest -m "spark" {posargs}
+
+[testenv:all]
+extras = all
+setenv =
+       PYSPARK_DRIVER_PYTHON = {envpython}
+       PYSPARK_PYTHON = {envpython}
+commands =
+    pytest {posargs}
+"""
+
+[tool.pylint]
+extension-pkg-whitelist= [
+    "numpy",
+    "torch",
+    "cv2",
+    "pyodbc",
+    "pydantic",
+    "ciso8601",
+    "netcdf4",
+    "scipy"
+]
+ignore="CVS"
+ignore-patterns="test.*?py,conftest.py"
+init-hook='import sys; sys.setrecursionlimit(8 * sys.getrecursionlimit())'
+jobs=0
+limit-inference-results=100
+persistent="yes"
+suggestion-mode="yes"
+unsafe-load-any-extension="no"
+
+[tool.pylint.'MESSAGES CONTROL']
+enable="c-extension-no-member"
+
+[tool.pylint.'REPORTS']
+evaluation="10.0 - ((float(5 * error + warning + refactor + convention) / statement) * 10)"
+output-format="text"
+reports="no"
+score="yes"
+
+[tool.pylint.'REFACTORING']
+max-nested-blocks=5
+never-returning-functions="sys.exit"
+
+[tool.pylint.'BASIC']
+argument-naming-style="snake_case"
+attr-naming-style="snake_case"
+bad-names= [
+    "foo",
+    "bar"
+]
+class-attribute-naming-style="any"
+class-naming-style="PascalCase"
+const-naming-style="UPPER_CASE"
+docstring-min-length=-1
+function-naming-style="snake_case"
+good-names= [
+    "i",
+    "j",
+    "k",
+    "ex",
+    "Run",
+    "_"
+]
+include-naming-hint="yes"
+inlinevar-naming-style="any"
+method-naming-style="snake_case"
+module-naming-style="any"
+no-docstring-rgx="^_"
+property-classes="abc.abstractproperty"
+variable-naming-style="snake_case"
+
+[tool.pylint.'FORMAT']
+ignore-long-lines="^\\s*(# )?.*['\"]?<?https?://\\S+>?"
+indent-after-paren=4
+indent-string='    '
+max-line-length=120
+max-module-lines=1000
+single-line-class-stmt="no"
+single-line-if-stmt="no"
+
+[tool.pylint.'LOGGING']
+logging-format-style="old"
+logging-modules="logging"
+
+[tool.pylint.'MISCELLANEOUS']
+notes= [
+    "FIXME",
+    "XXX",
+    "TODO"
+]
+
+[tool.pylint.'SIMILARITIES']
+ignore-comments="yes"
+ignore-docstrings="yes"
+ignore-imports="yes"
+min-similarity-lines=7
+
+[tool.pylint.'SPELLING']
+max-spelling-suggestions=4
+spelling-store-unknown-words="no"
+
+[tool.pylint.'STRING']
+check-str-concat-over-line-jumps="no"
+
+[tool.pylint.'TYPECHECK']
+contextmanager-decorators="contextlib.contextmanager"
+generated-members="numpy.*,np.*,pyspark.sql.functions,collect_list"
+ignore-mixin-members="yes"
+ignore-none="yes"
+ignore-on-opaque-inference="yes"
+ignored-classes="optparse.Values,thread._local,_thread._local,numpy,torch,swagger_client"
+ignored-modules="numpy,torch,swagger_client,netCDF4,scipy"
+missing-member-hint="yes"
+missing-member-hint-distance=1
+missing-member-max-choices=1
+
+[tool.pylint.'VARIABLES']
+additional-builtins="dbutils"
+allow-global-unused-variables="yes"
+callbacks= [
+    "cb_",
+    "_cb"
+]
+dummy-variables-rgx="_+$|(_[a-zA-Z0-9_]*[a-zA-Z0-9]+?$)|dummy|^ignored_|^unused_"
+ignored-argument-names="_.*|^ignored_|^unused_"
+init-import="no"
+redefining-builtins-modules="six.moves,past.builtins,future.builtins,builtins,io"
+
+[tool.pylint.'CLASSES']
+defining-attr-methods= [
+    "__init__",
+    "__new__",
+    "setUp",
+    "__post_init__"
+]
+exclude-protected= [
+    "_asdict",
+    "_fields",
+    "_replace",
+    "_source",
+    "_make"
+]
+valid-classmethod-first-arg="cls"
+valid-metaclass-classmethod-first-arg="cls"
+
+[tool.pylint.'DESIGN']
+max-args=5
+max-attributes=7
+max-bool-expr=5
+max-branches=12
+max-locals=15
+max-parents=7
+max-public-methods=20
+max-returns=6
+max-statements=50
+min-public-methods=2
+
+[tool.pylint.'IMPORTS']
+allow-wildcard-with-all="no"
+analyse-fallback-blocks="no"
+deprecated-modules="optparse,tkinter.tix"
+
+[tool.pylint.'EXCEPTIONS']
+overgeneral-exceptions= [
+    "BaseException",
+    "Exception"
+]
+
+[tool.sphinx]
+project = "pyrxd"
+copyright = "2026, Mudwood Labs"
+author = "Mudwood Labs"
+version = "0.2.0"
+release = "0.2.0"
+extensions = [
+    "sphinx.ext.autodoc",
+    "sphinx.ext.doctest",
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.ifconfig",
+    "sphinx.ext.viewcode",
+    "sphinx.ext.napoleon",
+    "sphinx.ext.githubpages",
+]
+templates_path = ["docs/_templates"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+html_theme = "sphinx_rtd_theme"
+html_static_path = ["docs/_static"]
+napoleon_include_init_with_doc = true
+napoleon_include_private_with_doc = true
+
+[tool.poetry.group.docs.dependencies]
+sphinx = "^7.0.0"
+sphinx-rtd-theme = "^2.0.0"
+sphinx-autodoc-typehints = "^1.25.0"
+myst-parser = "^2.0.0"
+sphinx-copybutton = "^0.5.2"
+sphinx-autobuild = "^2021.3.14"

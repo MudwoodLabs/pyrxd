@@ -1,0 +1,11 @@
+pyrxd — Python SDK for the Radiant (RXD) blockchain
+Copyright 2026 Mudwood Labs
+
+This product includes software developed by Mudwood Labs
+(https://mudwoodlabs.com).
+
+The reverse-engineered Photonic dMint protocol research notes
+incorporated in docs/ reference the Photonic Wallet TypeScript
+implementation by the Radiant Blockchain Community
+(https://github.com/RadiantBlockchain-Community/photonic-wallet)
+and the Glyph Protocol REP-3010 / REP-3011 specifications.
