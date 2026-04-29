@@ -1,0 +1,75 @@
+name: Bug report
+description: Report a defect in pyrxd
+title: "[Bug] "
+labels:
+  - bug
+  - triage
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+
+        **For security vulnerabilities, please email security@mudwoodlabs.com
+        instead of filing a public issue.** See [SECURITY.md](../blob/main/SECURITY.md).
+
+  - type: input
+    id: pyrxd-version
+    attributes:
+      label: pyrxd version
+      description: Output of `pip show pyrxd | grep Version` (or the commit SHA if installed from git).
+      placeholder: "0.2.1"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      description: Output of `python --version`.
+      placeholder: "3.12.3"
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      description: OS and version (e.g. Ubuntu 24.04, macOS 14.5, Windows 11).
+      placeholder: "Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the actual behavior. Paste tracebacks verbatim.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: The smallest snippet of code (or commands) that triggers the bug.
+      render: python
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Anything else that might help — network (mainnet/testnet/regtest), upstream node version, related issues.
+    validations:
+      required: false
