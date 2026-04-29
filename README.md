@@ -135,8 +135,8 @@ AWS) and is the correct shape for any application handling real funds.
 - [`docs/dmint-followup.md`](docs/dmint-followup.md) — premine vs PoW dMint scope
 - [`docs/dmint-research-photonic.md`](docs/dmint-research-photonic.md) — Photonic Wallet TS reference
 - [`docs/dmint-research-mainnet.md`](docs/dmint-research-mainnet.md) — decoded live dMint contracts
-- [`docs/threat-model.md`](docs/threat-model.md) — threat model
 - [`examples/`](examples/) — runnable end-to-end demos
+- [`SECURITY.md`](SECURITY.md) — security policy and disclosure
 
 ## Contributing
 

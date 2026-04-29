@@ -111,8 +111,6 @@ covenant variants in this module are experimental.
 
 ### Documentation
 
-- `docs/threat-model.md` — threat model.
-- `docs/tx-construction.md` — transaction construction reference.
 - `docs/dmint-followup.md` — premine vs PoW dMint scope.
 - `docs/dmint-research-photonic.md` — Photonic Wallet TS reverse
   engineering.
