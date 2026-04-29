@@ -344,32 +344,9 @@ overgeneral-exceptions= [
     "Exception"
 ]
 
-[tool.sphinx]
-project = "pyrxd"
-copyright = "2026, Mudwood Labs"
-author = "Mudwood Labs"
-version = "0.2.0"
-release = "0.2.0"
-extensions = [
-    "sphinx.ext.autodoc",
-    "sphinx.ext.doctest",
-    "sphinx.ext.intersphinx",
-    "sphinx.ext.ifconfig",
-    "sphinx.ext.viewcode",
-    "sphinx.ext.napoleon",
-    "sphinx.ext.githubpages",
-]
-templates_path = ["docs/_templates"]
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
-html_theme = "sphinx_rtd_theme"
-html_static_path = ["docs/_static"]
-napoleon_include_init_with_doc = true
-napoleon_include_private_with_doc = true
-
 [tool.poetry.group.docs.dependencies]
 sphinx = "^7.0.0"
-sphinx-rtd-theme = "^2.0.0"
-sphinx-autodoc-typehints = "^1.25.0"
+furo = "^2024.0"
 myst-parser = "^4.0.1"
 sphinx-copybutton = "^0.5.2"
 sphinx-autobuild = "^2021.3.14"

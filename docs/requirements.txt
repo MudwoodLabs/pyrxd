@@ -1,0 +1,6 @@
+# Sphinx + extensions for building pyrxd's documentation on
+# Read the Docs. Pinned to compatible major versions.
+
+sphinx>=7,<9
+furo>=2024,<2026
+myst-parser>=4,<5

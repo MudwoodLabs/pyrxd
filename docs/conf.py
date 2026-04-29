@@ -1,43 +1,85 @@
-# Configuration file for the Sphinx documentation builder.
-#
-# This file only contains a selection of the most common options. For a full
-# list see the documentation:
-# https://www.sphinx-doc.org/en/master/usage/configuration.html
+"""Sphinx configuration for pyrxd documentation.
 
-# -- Path setup --------------------------------------------------------------
+Builds the public-facing docs at https://pyrxd.readthedocs.io. Favours
+clarity and zero-warning builds over feature breadth.
+"""
+from __future__ import annotations
 
-# If extensions (or modules to document with autodoc) are in another directory,
-# add these directories to sys.path here. If the directory is relative to the
-# documentation root, use os.path.abspath to make it absolute, like shown here.
-#
 import os
 import sys
-import tomli
+from datetime import datetime
 
-sys.path.insert(0, os.path.abspath("../src/"))
+# Make `import pyrxd` work for autodoc.
+sys.path.insert(0, os.path.abspath("../src"))
 
-# Read project configuration from pyproject.toml
-with open("../pyproject.toml", "rb") as f:
-    pyproject = tomli.load(f)
+# -- Project information --
 
-# -- Project information -----------------------------------------------------
-sphinx_config = pyproject["tool"]["sphinx"]
+project = "pyrxd"
+author = "Mudwood Labs"
+copyright = f"{datetime.now().year}, {author}"
 
-project = sphinx_config["project"]
-copyright = sphinx_config["copyright"]
-author = sphinx_config["author"]
-version = sphinx_config["version"]
-release = sphinx_config["release"]
+# Read the version from the package itself so docs and code never drift.
+from pyrxd import __version__ as _pyrxd_version  # noqa: E402
 
-# -- General configuration ---------------------------------------------------
-extensions = sphinx_config["extensions"]
-templates_path = sphinx_config["templates_path"]
-exclude_patterns = sphinx_config["exclude_patterns"]
+version = _pyrxd_version
+release = _pyrxd_version
 
-# -- Options for HTML output -------------------------------------------------
-html_theme = sphinx_config["html_theme"]
-html_static_path = sphinx_config["html_static_path"]
+# -- General configuration --
 
-# Napoleon settings
-napoleon_include_init_with_doc = sphinx_config["napoleon_include_init_with_doc"]
-napoleon_include_private_with_doc = sphinx_config["napoleon_include_private_with_doc"]
+extensions = [
+    "sphinx.ext.autodoc",
+    "sphinx.ext.napoleon",
+    "sphinx.ext.viewcode",
+    "sphinx.ext.intersphinx",
+    "myst_parser",
+]
+
+source_suffix = {
+    ".rst": "restructuredtext",
+    ".md": "markdown",
+}
+
+templates_path = ["_templates"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+
+# -- Autodoc --
+
+autodoc_default_options = {
+    "members": True,
+    "member-order": "bysource",
+    "undoc-members": False,
+    "show-inheritance": True,
+}
+autodoc_typehints = "description"
+autodoc_class_signature = "separated"
+
+# -- Napoleon (Google / NumPy style docstrings) --
+
+napoleon_google_docstring = True
+napoleon_numpy_docstring = True
+napoleon_include_init_with_doc = True
+
+# -- Intersphinx --
+
+intersphinx_mapping = {
+    "python": ("https://docs.python.org/3", None),
+}
+
+# -- HTML --
+
+html_theme = "furo"
+html_title = f"pyrxd {version}"
+html_static_path = ["_static"]
+html_theme_options = {
+    "source_repository": "https://github.com/MudwoodLabs/pyrxd",
+    "source_branch": "main",
+    "source_directory": "docs/",
+}
+
+# -- MyST --
+
+myst_enable_extensions = [
+    "colon_fence",
+    "deflist",
+    "smartquotes",
+]

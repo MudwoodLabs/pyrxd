@@ -1,19 +1,28 @@
 pyrxd
 =====
 
-Python SDK for the Radiant (RXD) blockchain — transaction building, HD
-wallets, the Glyph token protocol (NFT/FT/dMint), Gravity cross-chain
-atomic swaps, SPV verification, and ElectrumX networking.
+Python SDK for the `Radiant (RXD) blockchain <https://radiantblockchain.org/>`_ —
+transaction building, HD wallets, the Glyph token protocol (NFT/FT/dMint),
+Gravity cross-chain atomic swaps, SPV verification, and ElectrumX networking.
 
-This is the auto-generated API reference. Tutorials and how-to guides are
-forthcoming. Until then, runnable end-to-end examples live in the
-``examples/`` directory of the repository.
+Install with ``pip install pyrxd``.
 
 .. toctree::
-   :maxdepth: 2
-   :caption: Contents
+   :maxdepth: 1
+   :caption: Documentation
 
-   modules
+   tutorials/index
+   how-to/index
+   concepts/index
+   api/index
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Project
+
+   Source on GitHub <https://github.com/MudwoodLabs/pyrxd>
+   Issue tracker <https://github.com/MudwoodLabs/pyrxd/issues>
+   PyPI <https://pypi.org/project/pyrxd/>
 
 
 Indices and tables
