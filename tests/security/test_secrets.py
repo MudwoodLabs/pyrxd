@@ -329,3 +329,30 @@ class TestPrivateKeyMaterialGenerate:
             raw = pk.unsafe_raw_bytes()
             seen.add(raw)
         assert len(seen) == 10
+
+
+# ---------------------------------------------------------------------------
+# Pickling / copy guards — SecretBytes refuses serialization
+# ---------------------------------------------------------------------------
+
+class TestSecretBytesSerializationGuards:
+    """Closes coverage gap: SecretBytes must refuse pickle/copy/deepcopy
+    so secret material cannot leak via accidental serialization."""
+
+    def test_pickle_raises_typeerror(self):
+        import pickle
+        sb = SecretBytes(b"secret-payload-do-not-leak" + b"\x00" * 6)
+        with pytest.raises(TypeError, match="cannot be pickled"):
+            pickle.dumps(sb)
+
+    def test_copy_raises_typeerror(self):
+        import copy
+        sb = SecretBytes(b"secret-payload-do-not-leak" + b"\x00" * 6)
+        with pytest.raises(TypeError, match="cannot be copied"):
+            copy.copy(sb)
+
+    def test_deepcopy_raises_typeerror(self):
+        import copy
+        sb = SecretBytes(b"secret-payload-do-not-leak" + b"\x00" * 6)
+        with pytest.raises(TypeError, match="cannot be deep-copied"):
+            copy.deepcopy(sb)

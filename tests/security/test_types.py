@@ -285,3 +285,43 @@ class TestSighashFlag:
     def test_rejects_non_int(self) -> None:
         with pytest.raises(ValidationError):
             SighashFlag("0x41")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# _FixedBytes.from_hex — error paths (closes coverage gap on types.py 91-99)
+# ---------------------------------------------------------------------------
+
+class TestFixedBytesFromHex:
+    def test_from_hex_rejects_non_str(self) -> None:
+        from pyrxd.security.types import Hex32
+        with pytest.raises(ValidationError, match="requires str"):
+            Hex32.from_hex(b"\x00" * 32)  # type: ignore[arg-type]
+
+    def test_from_hex_rejects_non_str_int(self) -> None:
+        from pyrxd.security.types import Hex32
+        with pytest.raises(ValidationError, match="requires str"):
+            Hex32.from_hex(42)  # type: ignore[arg-type]
+
+    def test_from_hex_rejects_invalid_hex(self) -> None:
+        from pyrxd.security.types import Hex32
+        # 64 chars but contains non-hex 'z'
+        with pytest.raises(ValidationError, match="invalid hex"):
+            Hex32.from_hex("z" * 64)
+
+    def test_from_hex_rejects_odd_length(self) -> None:
+        from pyrxd.security.types import Hex32
+        # Odd-length hex string is invalid
+        with pytest.raises(ValidationError, match="invalid hex"):
+            Hex32.from_hex("0" * 63)
+
+    def test_from_hex_rejects_wrong_length(self) -> None:
+        from pyrxd.security.types import Hex32
+        # 60 chars decodes to 30 bytes, not 32 — caught by Hex32 length check
+        with pytest.raises(ValidationError):
+            Hex32.from_hex("0" * 60)
+
+    def test_from_hex_accepts_valid(self) -> None:
+        from pyrxd.security.types import Hex32
+        h = Hex32.from_hex("0" * 64)
+        assert isinstance(h, Hex32)
+        assert bytes(h) == b"\x00" * 32

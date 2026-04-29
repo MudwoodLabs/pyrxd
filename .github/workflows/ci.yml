@@ -24,9 +24,9 @@ jobs:
       - name: Run tests
         run: poetry run pytest tests/ -v --tb=short
       - name: Security module coverage (must be 100%)
-        run: poetry run pytest tests/security/ --cov=pyrxd.security --cov-fail-under=100
+        run: poetry run pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100
       - name: Overall coverage (must be 85%)
-        run: poetry run pytest tests/ --cov=pyrxd --cov-fail-under=85
+        run: poetry run pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85
       - name: Bandit security scan
         run: poetry run bandit -r src/ -c pyproject.toml
       - name: Type check
