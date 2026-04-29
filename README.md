@@ -52,7 +52,7 @@ from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import ElectrumXClient, script_hash_for_address
 
 async def main():
-    priv = PrivateKey.generate()
+    priv = PrivateKey()  # no-arg constructor generates a fresh key
     addr = priv.public_key().address()
     print(f"address: {addr}")
 
