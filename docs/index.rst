@@ -1,7 +1,7 @@
 pyrxd
 =====
 
-Python SDK for the `Radiant (RXD) blockchain <https://radiantblockchain.org/>`_ —
+Python SDK for the `Radiant (RXD) blockchain <https://radiantcore.org/>`_ —
 transaction building, HD wallets, the Glyph token protocol (NFT/FT/dMint),
 Gravity cross-chain atomic swaps, SPV verification, and ElectrumX networking.
 

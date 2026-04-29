@@ -1,10 +1,10 @@
 # pyrxd
 
-Python SDK for the [Radiant (RXD) blockchain](https://radiantblockchain.org/).
+Python SDK for the [Radiant (RXD) blockchain](https://radiantcore.org/).
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Documentation Status](https://readthedocs.org/projects/pyrxd/badge/?version=latest)](https://pyrxd.readthedocs.io/en/latest/?badge=latest)
+[![Docs](https://github.com/MudwoodLabs/pyrxd/actions/workflows/docs.yml/badge.svg)](https://mudwoodlabs.github.io/pyrxd/)
 
 A typed, async-first SDK for building applications on Radiant. Includes
 transaction construction, HD wallets, the Glyph token protocol (NFT, FT,
@@ -133,7 +133,7 @@ AWS) and is the correct shape for any application handling real funds.
 
 ## Documentation
 
-Hosted at **[pyrxd.readthedocs.io](https://pyrxd.readthedocs.io/)** (API
+Hosted at **[mudwoodlabs.github.io/pyrxd](https://mudwoodlabs.github.io/pyrxd/)** (API
 reference + tutorials + how-to guides + concepts).
 
 Other resources in this repo:
