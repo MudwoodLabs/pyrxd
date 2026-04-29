@@ -28,7 +28,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/MudwoodLabs/pyrxd"
-Documentation = "https://github.com/MudwoodLabs/pyrxd#readme"
+Documentation = "https://pyrxd.readthedocs.io/"
 Source = "https://github.com/MudwoodLabs/pyrxd"
 Tracker = "https://github.com/MudwoodLabs/pyrxd/issues"
 Changelog = "https://github.com/MudwoodLabs/pyrxd/blob/main/CHANGELOG.md"
