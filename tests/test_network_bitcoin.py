@@ -12,12 +12,9 @@ source uses a controlled fake HTTP layer.  We test each source method's:
 """
 from __future__ import annotations
 
-import asyncio
 import json
-import struct
-from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 

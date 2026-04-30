@@ -5,7 +5,6 @@ Test vectors for hashOutputHashes were generated from radiantjs
 verified against the confirmed mainnet reveal tx
 dac1e2dfed64fbfd0f0fe6b925e144cfc32ef76803abc7a6a4058406d707b407.
 """
-import pytest
 
 from pyrxd.script.script import Script
 from pyrxd.transaction.transaction_output import TransactionOutput
@@ -131,11 +130,11 @@ class TestTwoPassSigning:
     def test_stale_signature_without_reset(self):
         """Reproduces the bypass bug: sign() skips re-signing if unlocking_script is set."""
         from pyrxd.keys import PrivateKey
-        from pyrxd.script.type import P2PKH, to_unlock_script_template, encode_pushdata
+        from pyrxd.script.type import P2PKH
         from pyrxd.transaction.transaction import Transaction, TransactionInput
 
         pk = PrivateKey(b"\x12" * 32)
-        addr = pk.public_key().address()
+        pk.public_key().address()
 
         src_out = _out(P2PKH_AA, 1_000_000)
         src_tx = Transaction(tx_inputs=[], tx_outputs=[src_out])

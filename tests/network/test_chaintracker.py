@@ -16,26 +16,12 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock
 
-import pytest
 
-from pyrxd.network.bitcoin import BtcDataSource
 from pyrxd.network.chaintracker import ChainTracker
 from pyrxd.security.types import BlockHeight, Hex32
 
 # ── Block 840000 fixture ──────────────────────────────────────────────────────
 # Raw 80-byte header for Bitcoin block 840000 (the fourth halving block).
-# Obtained from blockstream.info/api/block/0000000000000000000320283a032748cef8227773ec551afcf718b0a4f23b/ header
-# and verified against the known Merkle root.
-#
-# Header hex (80 bytes):
-_BLOCK_840000_HEADER_HEX = (
-    "0400e020"                                          # version (LE)
-    "8da32e00850b5db3e50a1c7fb3fc27e22c4f8b4e"         # prev_hash part 1
-    "0000000000000000"                                  # prev_hash part 2 (padding to 32 bytes total)
-    # NOTE: The above is a placeholder. We construct a synthetic header below
-    # where we know the exact Merkle root for a deterministic test.
-)
-
 # Rather than using a real block header (which requires exact byte values we
 # can't verify offline), we construct a synthetic 80-byte header where we
 # control the Merkle root field, and test against that.

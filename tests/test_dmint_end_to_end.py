@@ -7,7 +7,6 @@ Covers:
 """
 from __future__ import annotations
 
-import struct
 
 import pytest
 
@@ -19,19 +18,15 @@ from pyrxd.glyph.dmint import (
     DmintState,
     MAX_SHA256D_TARGET,
     MAX_V2_TARGET_256,
-    _push_4bytes_le,
-    _push_minimal,
     build_dmint_contract_script,
     build_dmint_mint_tx,
-    compute_next_target_asert,
-    compute_next_target_linear,
 )
 from pyrxd.glyph.builder import (
     DmintDeployResult,
     DmintFullDeployParams,
     GlyphBuilder,
 )
-from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
+from pyrxd.glyph.types import GlyphMetadata, GlyphRef
 from pyrxd.security.errors import ValidationError
 
 # ---------------------------------------------------------------------------

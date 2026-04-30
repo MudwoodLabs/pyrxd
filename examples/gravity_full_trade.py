@@ -109,7 +109,6 @@ async def mode_offer() -> None:
     from pyrxd.btc_wallet.keys import generate_keypair
     from pyrxd.gravity.covenant import build_gravity_offer
     from pyrxd.gravity.transactions import build_maker_offer_tx
-    from pyrxd.network.electrumx import ElectrumXClient
     from pyrxd.network.bitcoin import BlockstreamSource
     from pyrxd.security.types import BlockHeight
 
@@ -312,7 +311,7 @@ async def mode_claim() -> None:
 
     taker_privkey = PrivateKeyMaterial(bytes.fromhex(s["taker_rxd_privkey_hex"]))
     taker_raw = taker_privkey.unsafe_raw_bytes()
-    taker_pub = coincurve.PrivateKey(taker_raw).public_key.format(compressed=True)
+    coincurve.PrivateKey(taker_raw).public_key.format(compressed=True)
     taker_pkh = bytes.fromhex(s["taker_rxd_pkh"])
     taker_rxd_addr = base58check_encode(b"\x00" + taker_pkh)
     _ok(f"Taker RXD address (finalize destination): {taker_rxd_addr}")
@@ -524,7 +523,7 @@ async def mode_forfeit() -> None:
     if not maker_wif:
         _fail("Set MAKER_RXD_WIF to sign the forfeit/cancel tx.")
     from pyrxd.security.secrets import PrivateKeyMaterial as _PKM
-    maker_pk_mat = _PKM.from_wif(maker_wif)
+    _PKM.from_wif(maker_wif)
     maker_wif = None
 
     if s.get("claimed_txid"):

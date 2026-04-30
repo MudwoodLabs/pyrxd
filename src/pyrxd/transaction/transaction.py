@@ -1,4 +1,3 @@
-import math
 from contextlib import suppress
 from typing import List, Optional, Union, Dict, Any
 
@@ -15,7 +14,6 @@ from ..constants import (
 )
 from ..hash import hash256
 from ..merkle_path import MerklePath
-from ..script.type import P2PKH
 from .transaction_input import TransactionInput
 from .transaction_output import TransactionOutput
 

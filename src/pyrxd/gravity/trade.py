@@ -35,7 +35,7 @@ from typing import List, Optional
 
 from pyrxd.network.bitcoin import BtcDataSource
 from pyrxd.network.electrumx import ElectrumXClient
-from pyrxd.security.errors import NetworkError, SpvVerificationError, ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.security.types import BlockHeight, Txid
 from pyrxd.spv.proof import CovenantParams, SpvProofBuilder
@@ -244,9 +244,9 @@ class GravityTrade:
         validated_txid = Txid(btc_txid)
 
         for attempt in range(self._cfg.max_poll_attempts):
-            tip = await self._btc.get_tip_height()
+            await self._btc.get_tip_height()
             try:
-                raw = await self._btc.get_raw_tx(validated_txid, min_confirmations=0)
+                await self._btc.get_raw_tx(validated_txid, min_confirmations=0)
             except NetworkError:
                 # Tx not yet visible in mempool — keep polling
                 if attempt + 1 < self._cfg.max_poll_attempts:

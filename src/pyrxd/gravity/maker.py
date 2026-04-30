@@ -37,7 +37,7 @@ from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-from .codehash import compute_p2sh_script_pubkey, hash256
+from .codehash import compute_p2sh_script_pubkey
 from .transactions import build_cancel_tx, build_maker_offer_tx
 from .types import CancelResult, GravityOffer, MakerOfferResult
 

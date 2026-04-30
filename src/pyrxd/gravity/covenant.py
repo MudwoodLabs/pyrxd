@@ -42,7 +42,6 @@ from typing import Any
 from pyrxd.security.errors import ValidationError
 from pyrxd.gravity.codehash import (
     compute_p2sh_code_hash,
-    compute_p2sh_script_pubkey,
 )
 
 __all__ = [

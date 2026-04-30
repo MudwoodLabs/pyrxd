@@ -351,7 +351,7 @@ def test_verify_creator_signature_wrong_key():
 
 def test_sign_verify_round_trip_with_dmint():
     """Signing works with complex V2 metadata including dmint_params."""
-    from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload, DaaMode
+    from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload
     dmint = DmintCborPayload(
         algo=DmintAlgo.SHA256D, num_contracts=1, max_height=10_000,
         reward=100, premine=0, diff=1000,

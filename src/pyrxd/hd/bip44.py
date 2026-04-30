@@ -1,5 +1,5 @@
 from typing import Union, List
-from .bip32 import Xprv, Xpub, step_to_index, bip32_derive_xprv_from_mnemonic, bip32_derive_xkeys_from_xkey
+from .bip32 import Xprv, Xpub, step_to_index, bip32_derive_xprv_from_mnemonic
 from ..constants import Network, BIP44_DERIVATION_PATH
 
 

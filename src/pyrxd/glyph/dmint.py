@@ -11,7 +11,6 @@ import hashlib
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional
 
 from pyrxd.security.errors import ValidationError
 
@@ -20,10 +19,6 @@ from .types import GlyphRef
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-
-# V2 state has exactly 10 items (height, contractRef, tokenRef, maxHeight,
-# reward, algoId, daaMode, targetTime, lastTime, target).
-_V2_STATE_ITEM_COUNT = 10
 
 # Maximum SHA256d target (64-bit; first 4 bytes implicitly zero).
 # Valid: hash[0..4] == 0 AND hash[4..12] < MAX_SHA256D_TARGET.
@@ -915,7 +910,6 @@ def build_dmint_mint_tx(
         ``nonce`` is not 8 bytes; ``miner_pkh`` is not 20 bytes.
     :returns: :class:`DmintMintResult` with the unsigned tx and updated state.
     """
-    from typing import Any as _Any
 
     # Local imports to keep module-load-time light (mirrors builder.py pattern).
     from pyrxd.script.script import Script

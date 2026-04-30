@@ -44,7 +44,6 @@ import hashlib
 import os
 import sys
 import time
-from dataclasses import dataclass
 from typing import Optional
 
 # ─────────────────────────────────────────────────────────────
@@ -117,13 +116,11 @@ def _hash256(data: bytes) -> bytes:
 async def run_demo() -> None:
     # Late imports so the module is importable even without the SDK installed
     from pyrxd.security.secrets import PrivateKeyMaterial
-    from pyrxd.security.rng import secure_random_bytes
-    from pyrxd.btc_wallet.keys import BtcKeypair, generate_keypair, keypair_from_wif
+    from pyrxd.btc_wallet.keys import generate_keypair, keypair_from_wif
     from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
     from pyrxd.network.electrumx import ElectrumXClient
     from pyrxd.network.bitcoin import MempoolSpaceSource
     from pyrxd.gravity.types import GravityOffer
-    from pyrxd.gravity.trade import GravityTrade, TradeConfig
     from pyrxd.gravity.transactions import build_claim_tx, build_finalize_tx
     from pyrxd.spv.proof import CovenantParams, SpvProofBuilder
     from pyrxd.spv.witness import strip_witness

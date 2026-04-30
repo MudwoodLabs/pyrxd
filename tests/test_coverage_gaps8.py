@@ -417,7 +417,6 @@ class TestBlockstreamMoreBranches:
 
     @pytest.mark.asyncio
     async def test_get_tx_block_height_coerces_str_txid(self):
-        from pyrxd.security.types import BlockHeight
         src = self._src()
         status_data = {"confirmed": True, "block_height": 800000}
         session = _MagicMock()

@@ -58,9 +58,6 @@ _valid_scalar = st.integers(min_value=1, max_value=_SECP256K1_N - 1)
 # Script bytes: up to 520 bytes (Bitcoin's max pushdata)
 _script_bytes = st.binary(min_size=0, max_size=520)
 
-# Small positive integers for satoshis / block heights
-_non_neg_int = st.integers(min_value=0, max_value=2_100_000_000_000_000)
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -68,7 +65,7 @@ def _minimal_transaction(version: int = 1, locktime: int = 0) -> Transaction:
     """Return a valid minimal transaction with one input and one output."""
     src_txid = "a" * 64
     locking = Script(bytes.fromhex("76a914" + "00" * 20 + "88ac"))  # P2PKH-like
-    src_tx = Transaction(
+    Transaction(
         tx_inputs=[],
         tx_outputs=[TransactionOutput(locking_script=locking, satoshis=1_000)],
         version=1,

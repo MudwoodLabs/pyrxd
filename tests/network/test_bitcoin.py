@@ -5,8 +5,7 @@ Uses unittest.mock to avoid real network calls.
 from __future__ import annotations
 
 import json
-from io import BytesIO
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -21,7 +20,6 @@ _VALID_TXID = "b" * 64
 # Minimal valid raw tx (65+ bytes).
 _VALID_RAW = bytes(range(65))
 _VALID_RAW_HEX = _VALID_RAW.hex()
-_FAKE_HEADER = b"\x00" * 80
 
 
 # ── aiohttp response mock helpers ─────────────────────────────────────────────

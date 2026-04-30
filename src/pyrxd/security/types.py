@@ -20,7 +20,7 @@ material -- the error message uses a bounded summary (length, redacted tag).
 from __future__ import annotations
 
 import re
-from typing import Any, ClassVar, FrozenSet, Union
+from typing import Any, ClassVar, FrozenSet
 
 from .errors import ValidationError
 
@@ -290,8 +290,3 @@ class SighashFlag(int):
         if value not in _VALID_SIGHASH_FLAGS:
             raise ValidationError(f"Invalid sighash flag: {hex(value)}")
         return int.__new__(cls, value)
-
-
-# Type alias convenient for callers that can accept either a plain int or
-# an already-validated SighashFlag.
-SighashLike = Union[int, SighashFlag]

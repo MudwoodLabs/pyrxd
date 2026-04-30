@@ -1,7 +1,5 @@
 """Tests for pyrxd.gravity.covenant — artifact loading, param substitution, code hash."""
 
-import hashlib
-import json
 import time
 from pathlib import Path
 
@@ -84,7 +82,7 @@ class TestEncodeIntPush:
     def test_round_trip_via_bytes(self):
         for n in [0, 1, 16, 17, 127, 128, 255, 256, 65535, 1_000_000]:
             encoded = _encode_int_push(n)
-            body = encoded[1:1 + encoded[0]] if encoded[0] not in range(0x51, 0x61) else bytes([encoded[0] - 0x50])
+            encoded[1:1 + encoded[0]] if encoded[0] not in range(0x51, 0x61) else bytes([encoded[0] - 0x50])
             # Just check no exception and length > 0
             assert len(encoded) >= 1
 

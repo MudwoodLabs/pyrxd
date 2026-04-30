@@ -19,21 +19,17 @@ Finding inventory:
 from __future__ import annotations
 
 import hashlib
-import struct
 
 import cbor2
 import pytest
 
-from pyrxd.glyph.builder import CommitParams, GlyphBuilder
 from pyrxd.glyph.creator import sign_metadata, verify_creator_signature
 from pyrxd.glyph.dmint import MAX_SHA256D_TARGET, verify_sha256d_solution
 from pyrxd.glyph.payload import build_mutable_scriptsig, decode_payload
 from pyrxd.glyph.types import (
     GlyphCreator,
     GlyphMetadata,
-    GlyphPolicy,
     GlyphProtocol,
-    GlyphRights,
     GlyphRoyalty,
 )
 from pyrxd.keys import PrivateKey
@@ -55,7 +51,7 @@ class TestRT01CborSizeBomb:
         # Build a valid CBOR payload that approaches but doesn't exceed 64 KB.
         # Use a large 'desc' value (~63 KB) — within the 64-char cap after decode,
         # but the raw CBOR bytes themselves can be large.
-        valid_cbor = cbor2.dumps({
+        cbor2.dumps({
             "p": [1],  # FT protocol
             "name": "Bomb Test",
             "ticker": "BMB",

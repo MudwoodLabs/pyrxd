@@ -19,22 +19,17 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
-import hashlib
 import struct
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from pyrxd.gravity.trade import (
-    ConfirmationStatus,
     GravityTrade,
     TradeConfig,
     _find_output_zero_offset,
 )
-from pyrxd.gravity.transactions import build_claim_tx, build_finalize_tx
+from pyrxd.gravity.transactions import build_finalize_tx
 from pyrxd.gravity.types import ClaimResult, FinalizeResult, GravityOffer
 from pyrxd.network.bitcoin import BtcDataSource
 from pyrxd.network.electrumx import ElectrumXClient

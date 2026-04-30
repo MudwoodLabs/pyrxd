@@ -13,8 +13,6 @@ runs without adding RXinDexer to pyrxd's dependencies.
 """
 from __future__ import annotations
 
-import sys
-import os
 import cbor2
 import pytest
 

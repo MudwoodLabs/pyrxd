@@ -7,9 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.payload import GLY_MARKER, encode_payload
-from pyrxd.glyph.scanner import GlyphItem, GlyphScanner
+from pyrxd.glyph.scanner import GlyphScanner
 from pyrxd.glyph.script import build_ft_locking_script, build_nft_locking_script
 from pyrxd.glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
@@ -436,7 +435,7 @@ class TestRevealMetadataConcurrency:
             import time
             get_tx_calls.append(time.monotonic())
             await asyncio.sleep(delay)
-            txid_str = str(txid)
+            str(txid)
             # First-pass UTXO source-tx fetches use TXID_A; the
             # reveal-metadata path uses ref.txid (which is also TXID_A
             # in this construction). Both legitimately return the

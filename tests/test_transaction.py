@@ -1,8 +1,6 @@
 import pytest
 
 from pyrxd.transaction.transaction import Transaction
-from pyrxd.transaction.transaction_input import TransactionInput
-from pyrxd.transaction.transaction_output import TransactionOutput
 # pytest is used by the additional hardening tests below
 
 

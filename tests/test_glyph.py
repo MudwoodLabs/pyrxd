@@ -7,9 +7,8 @@ import cbor2
 import pytest
 
 from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
-from pyrxd.glyph.inspector import GlyphInspector, GlyphOutput
+from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.payload import (
-    GLY_MARKER,
     build_reveal_scriptsig_suffix,
     decode_payload,
     encode_payload,
@@ -26,7 +25,7 @@ from pyrxd.glyph.script import (
     is_ft_script,
     is_nft_script,
 )
-from pyrxd.glyph.types import GlyphFt, GlyphMedia, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
+from pyrxd.glyph.types import GlyphMedia, GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
 

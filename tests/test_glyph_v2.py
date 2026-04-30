@@ -14,7 +14,6 @@ from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.security.errors import ValidationError
 
 _REF_A = GlyphRef(txid='aa' * 32, vout=1)
-_REF_B = GlyphRef(txid='bb' * 32, vout=0)
 _HASH32 = bytes(range(32))
 
 

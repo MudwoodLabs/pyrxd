@@ -36,19 +36,6 @@ def encode_payload(metadata: GlyphMetadata) -> tuple[bytes, bytes]:
     return cbor_bytes, hash_payload(cbor_bytes)
 
 
-_STR_FIELDS: dict[str, int] = {
-    'name': 64,
-    'ticker': 16,
-    'desc': 1000,
-    'type': 64,
-    'loc': 512,
-    'loc_hash': 128,
-    'image': 512,
-    'image_ipfs': 128,
-    'image_sha256': 64,
-}
-
-
 def _cbor_str(d: dict, key: str, max_len: int) -> str:
     """Extract a string field from a CBOR dict, enforcing type and length."""
     v = d.get(key, '')

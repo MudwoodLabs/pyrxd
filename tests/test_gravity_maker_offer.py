@@ -15,11 +15,9 @@ from pyrxd.gravity import (
 from pyrxd.gravity.codehash import (
     compute_p2sh_address_from_redeem,
     compute_p2sh_script_pubkey,
-    hash160,
     hash256,
 )
-from pyrxd.gravity.covenant import CovenantArtifact, build_gravity_offer
-from pyrxd.gravity.transactions import _varint, _push_data
+from pyrxd.gravity.covenant import build_gravity_offer
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 

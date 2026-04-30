@@ -14,7 +14,6 @@ source satoshis, which involves significant setup. These tests cover:
 """
 import pytest
 
-from pyrxd.constants import OpCode
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH, BareMultisig, RPuzzle

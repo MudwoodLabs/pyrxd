@@ -15,13 +15,11 @@ import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from pyrxd.script.script import Script
-from pyrxd.security.errors import ValidationError, NetworkError
 from pyrxd.security.types import BlockHeight, Hex32
 from pyrxd.transaction.transaction_output import TransactionOutput
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.utils import (
-    Reader, Writer, encode_int, from_base58, to_base58, to_bytes,
-    unsigned_to_varint,
+    Reader, encode_int, from_base58, to_base58, to_bytes,
 )
 
 

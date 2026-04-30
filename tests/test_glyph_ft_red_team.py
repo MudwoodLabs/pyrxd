@@ -8,12 +8,10 @@ scope for the SDK, e.g. node/consensus responsibility) say so explicitly.
 """
 from __future__ import annotations
 
-import cbor2
 import pytest
 
 from pyrxd.glyph.builder import (
     CommitParams,
-    FtTransferParams,
     FtUtxo,
     GlyphBuilder,
     RevealParams,
@@ -21,7 +19,6 @@ from pyrxd.glyph.builder import (
 )
 from pyrxd.glyph.ft import FtUtxoSet
 from pyrxd.glyph.script import (
-    build_commit_locking_script,
     build_ft_locking_script,
     build_nft_locking_script,
     extract_ref_from_ft_script,
@@ -39,7 +36,6 @@ from pyrxd.security.types import Hex20, Txid
 
 _ALICE_KEY_INT = 0x1111111111111111111111111111111111111111111111111111111111111111
 _BOB_PKH = bytes(range(20, 40))
-_CHARLIE_PKH = bytes(range(40, 60))
 
 _REF_TXID = "cd" * 32
 _REF_VOUT = 0
@@ -819,7 +815,7 @@ class TestAuditFindings2026:
         The fixed check fires when ft_change < 0 (inputs insufficient after
         select() passes — shouldn't happen in practice but guards future bugs).
         """
-        from pyrxd.glyph.ft import FtUtxo, FtUtxoSet
+        from pyrxd.glyph.ft import FtUtxoSet
         from pyrxd.security.errors import ValidationError
         # Directly monkey-patch a manipulated utxo set where ft_in < amount
         # to reach the conservation check.  select() normally prevents this,

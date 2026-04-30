@@ -19,7 +19,6 @@ import hashlib
 import cbor2
 
 from pyrxd.keys import PrivateKey, PublicKey
-from pyrxd.security.errors import ValidationError
 
 from .types import GlyphCreator, GlyphMetadata
 

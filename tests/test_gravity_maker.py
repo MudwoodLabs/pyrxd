@@ -24,8 +24,6 @@ from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.transaction.transaction import Transaction
-from pyrxd.transaction.transaction_input import TransactionInput
-from pyrxd.transaction.transaction_output import TransactionOutput
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +469,7 @@ class TestCheckStatus:
         # Build offer with deadline already in the past
         active = _make_active_offer(priv, offer_txid=offer_txid)
         # Patch claim_deadline to be in the past
-        past_deadline = int(time.time()) - 3600
+        int(time.time()) - 3600
         # Rebuild offer with expired deadline
         # We need to use accept_short_deadline=True since deadline < 24h from now
         expired_offer = _make_offer(
@@ -480,7 +478,7 @@ class TestCheckStatus:
         )
         # Use object.__setattr__ to override frozen dataclass field
         import dataclasses
-        expired_offer_patched = dataclasses.replace(expired_offer)
+        dataclasses.replace(expired_offer)
         # Since GravityOffer is frozen we cannot directly mutate it.
         # Instead, patch time.time in the check_status call.
         # We verify by using a future deadline and mocking time.

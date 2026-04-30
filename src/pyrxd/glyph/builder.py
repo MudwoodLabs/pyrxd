@@ -9,7 +9,6 @@ from pyrxd.security.types import Hex20
 
 from .dmint import (
     DmintDeployParams,
-    DmintState,
     build_dmint_contract_script,
 )
 from .payload import build_reveal_scriptsig_suffix, encode_payload
@@ -882,7 +881,7 @@ class TransferResult:
 # ft.py uses build_ft_locking_script / extract_ref_from_ft_script from
 # script.py directly).
 
-from .ft import FtTransferResult, FtUtxo  # noqa: E402 (re-export)
+from .ft import FtTransferResult, FtUtxo  # noqa: E402,F401 (re-export)
 
 
 @dataclass

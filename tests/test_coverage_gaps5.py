@@ -1,7 +1,6 @@
 """Coverage gap tests batch 5: BEEF format, witness stripping, RPuzzle, script type unlocks,
 tx_preimages variants."""
 
-import struct
 import pytest
 
 from pyrxd.transaction.transaction import Transaction
@@ -11,7 +10,6 @@ from pyrxd.merkle_path import MerklePath
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH, P2PK, BareMultisig, RPuzzle
 from pyrxd.keys import PrivateKey
-from pyrxd.utils import Writer
 from pyrxd.hash import hash256
 from pyrxd.constants import SIGHASH
 
@@ -20,7 +18,6 @@ from pyrxd.constants import SIGHASH
 # Helpers for building minimal valid transactions
 # ──────────────────────────────────────────────────────────────────────────────
 
-_ZERO_TXID = "00" * 32
 _DUMMY_TXID = "aa" * 32
 
 
@@ -212,7 +209,7 @@ class TestStripWitness:
         assert result == expected_stripped
 
     def test_too_short_raises(self):
-        from pyrxd.spv.witness import strip_witness, ValidationError
+        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError as VE
         with pytest.raises(VE):
             strip_witness(b"\x01\x00\x00\x00\x00")  # 5 bytes < 10

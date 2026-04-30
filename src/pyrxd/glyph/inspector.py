@@ -8,8 +8,6 @@ from pyrxd.security.errors import ValidationError
 from .payload import GLY_MARKER, decode_payload
 from .script import (
     MUTABLE_NFT_SCRIPT_RE,
-    extract_owner_pkh_from_ft_script,
-    extract_owner_pkh_from_nft_script,
     extract_ref_from_ft_script,
     extract_ref_from_nft_script,
     is_ft_script,

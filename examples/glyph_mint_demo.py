@@ -35,8 +35,6 @@ import websockets
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from pyrxd.glyph import GlyphBuilder, GlyphMetadata, GlyphProtocol
-from pyrxd.glyph.builder import CommitParams, RevealParams
-from pyrxd.glyph.payload import build_reveal_scriptsig_suffix
 from pyrxd.hash import sha256
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script

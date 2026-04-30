@@ -1,7 +1,5 @@
 from ..fee_model import FeeModel
-from abc import ABC
 import math
-import asyncio
 
 
 class SatoshisPerKilobyte(FeeModel):
