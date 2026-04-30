@@ -46,6 +46,7 @@ def _make_ws_mock(response_payload: dict):
             return response_str
         # Mimic a real socket — block until cancelled.
         await asyncio.Event().wait()
+        return None  # unreachable; satisfies static analyzers
 
     ws.recv = _recv
     ws.close = AsyncMock(return_value=None)
@@ -567,7 +568,7 @@ class TestResponseCorrelation:
         await client.close()
 
         with pytest.raises(NetworkError, match="closed|lost"):
-            await task
+            _ = await task
 
     @pytest.mark.asyncio
     async def test_per_call_timeout_does_not_affect_siblings(self):
@@ -615,7 +616,7 @@ class TestResponseCorrelation:
         # A must time out as NetworkError, not propagate the raw
         # asyncio.TimeoutError.
         with pytest.raises(NetworkError, match="timed out"):
-            await task_a
+            _ = await task_a
 
         await client.close()
 

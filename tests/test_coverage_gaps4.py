@@ -15,8 +15,7 @@ import pytest
 from pyrxd.merkle_path import MerklePath
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord, _coerce_hex32
 from pyrxd.security.errors import NetworkError, ValidationError
-from pyrxd.security.types import BlockHeight, Hex32, RawTx, Txid
-from pyrxd.utils import to_hex, to_bytes
+from pyrxd.security.types import BlockHeight, Hex32, Txid
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +179,7 @@ class TestMerklePathCombine:
 
     def test_combine_same_height_and_root(self):
         mp_a, mp_b = self._twin_paths()
-        root_before = mp_a.compute_root()
+        mp_a.compute_root()
         mp_a.combine(mp_b)
         # Combined path should have more leaves
         assert len(mp_a.path[0]) >= 2
@@ -516,6 +515,7 @@ class TestElectrumXCallParsing:
                 # No more scripted responses — block so the reader stays
                 # waiting like a real socket would.
                 await asyncio.Event().wait()
+                return None  # unreachable; satisfies static analyzers
 
         ws.recv = _recv
         ws.close = AsyncMock()

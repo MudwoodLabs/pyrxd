@@ -305,10 +305,12 @@ class HdWallet:
                 try:
                     os.close(fd)
                 except OSError:
+                    # Best-effort cleanup; original exception is re-raised below.
                     pass
             try:
                 os.unlink(tmp_path)
             except OSError:
+                # Best-effort cleanup; original exception is re-raised below.
                 pass
             raise
 

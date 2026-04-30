@@ -3,13 +3,13 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from pyrxd.security.errors import ValidationError
-from pyrxd.security.types import Hex20, Hex32, Txid
+from pyrxd.security.types import Hex20, Txid
 
-if TYPE_CHECKING:
-    from .dmint import DmintCborPayload
+# Forward references to .dmint.DmintCborPayload below are kept as string
+# annotations to avoid an unsafe cyclic import (.dmint imports from .types).
 
 
 class GlyphProtocol(IntEnum):
@@ -64,7 +64,6 @@ class GlyphMedia:
 
 
 _VALID_PROTOCOL_VALUES = frozenset(p.value for p in GlyphProtocol)
-_IMAGE_SHA256_RE = None  # lazy-compiled below
 
 
 # ---------------------------------------------------------------------------

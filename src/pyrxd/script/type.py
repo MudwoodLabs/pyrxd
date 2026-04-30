@@ -20,14 +20,14 @@ def to_unlock_script_template(sign, estimated_unlocking_byte_length):
 
 class ScriptTemplate(metaclass=ABCMeta):
     @abstractmethod
-    def lock(self, **kwargs) -> Script:
+    def lock(self, *args, **kwargs) -> Script:
         """
         :returns: locking script
         """
         raise NotImplementedError("ScriptTemplate.locking")
 
     @abstractmethod
-    def unlock(self, **kwargs) -> UnlockingScriptTemplate:
+    def unlock(self, *args, **kwargs) -> UnlockingScriptTemplate:
         """
         :returns: sign (function), estimated_unlocking_byte_length (function)
         """

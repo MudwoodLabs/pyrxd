@@ -49,19 +49,19 @@ class TestToplevelImports:
         assert issubclass(ValidationError, RxdSdkError)
 
     def test_version_string_present(self):
-        import pyrxd
+        import pyrxd as _pyrxd
         # Don't pin the exact version — that brittle assertion broke
         # on every release. Pin the *shape* (PEP 440 — non-empty,
         # starts with a digit) and that the symbol is exported.
-        assert isinstance(pyrxd.__version__, str)
-        assert len(pyrxd.__version__) > 0
-        assert pyrxd.__version__[0].isdigit()
+        assert isinstance(_pyrxd.__version__, str)
+        assert len(_pyrxd.__version__) > 0
+        assert _pyrxd.__version__[0].isdigit()
 
     def test_all_defines_exported_names(self):
-        import pyrxd
-        assert hasattr(pyrxd, "__all__")
-        for name in pyrxd.__all__:
-            assert hasattr(pyrxd, name), f"__all__ lists {name!r} but it's not defined"
+        import pyrxd as _pyrxd
+        assert hasattr(_pyrxd, "__all__")
+        for name in _pyrxd.__all__:
+            assert hasattr(_pyrxd, name), f"__all__ lists {name!r} but it's not defined"
 
 
 # ---------------------------------------------------------------------------
@@ -99,10 +99,10 @@ class TestScriptPublicAPI:
         assert ScriptTemplate is not None
 
     def test_all_defines_exported_names(self):
-        import pyrxd.script as s
-        assert hasattr(s, "__all__")
-        for name in s.__all__:
-            assert hasattr(s, name), f"script.__all__ lists {name!r} but it's not defined"
+        import pyrxd.script as _script_mod
+        assert hasattr(_script_mod, "__all__")
+        for name in _script_mod.__all__:
+            assert hasattr(_script_mod, name), f"script.__all__ lists {name!r} but it's not defined"
 
 
 # ---------------------------------------------------------------------------
@@ -127,10 +127,10 @@ class TestTransactionPublicAPI:
         assert issubclass(InsufficientFunds, ValueError)
 
     def test_all_defines_exported_names(self):
-        import pyrxd.transaction as t
-        assert hasattr(t, "__all__")
-        for name in t.__all__:
-            assert hasattr(t, name), f"transaction.__all__ lists {name!r} but it's not defined"
+        import pyrxd.transaction as _tx_mod
+        assert hasattr(_tx_mod, "__all__")
+        for name in _tx_mod.__all__:
+            assert hasattr(_tx_mod, name), f"transaction.__all__ lists {name!r} but it's not defined"
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +138,6 @@ class TestTransactionPublicAPI:
 # ---------------------------------------------------------------------------
 
 from pyrxd.script.script import Script
-from pyrxd.script.type import P2PKH
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput

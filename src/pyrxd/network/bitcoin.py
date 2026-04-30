@@ -795,14 +795,14 @@ class MultiSourceBtcDataSource(BtcDataSource):
     async def get_tip_height(self) -> BlockHeight:
         self._check_quorum_possible()
         results = await self._gather_results(lambda s: s.get_tip_height())
-        return self._require_quorum(results, lambda h: int(h))
+        return self._require_quorum(results, int)
 
     async def get_block_hash(self, height: BlockHeight) -> Hex32:
         if not isinstance(height, BlockHeight):
             height = BlockHeight(height)
         self._check_quorum_possible()
         results = await self._gather_results(lambda s: s.get_block_hash(height))
-        return self._require_quorum(results, lambda h: bytes(h))
+        return self._require_quorum(results, bytes)
 
     async def get_block_header_hex(self, height: BlockHeight) -> bytes:
         if not isinstance(height, BlockHeight):
@@ -841,7 +841,7 @@ class MultiSourceBtcDataSource(BtcDataSource):
             txid = Txid(txid)
         self._check_quorum_possible()
         results = await self._gather_results(lambda s: s.get_tx_block_height(txid))
-        return self._require_quorum(results, lambda h: int(h))
+        return self._require_quorum(results, int)
 
     async def get_tx_output_script_type(
         self, txid: Txid, output_index: int

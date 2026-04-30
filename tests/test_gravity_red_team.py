@@ -27,7 +27,6 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -48,7 +47,6 @@ from pyrxd.gravity.covenant import (
     build_gravity_offer,
     validate_claim_deadline,
 )
-from pyrxd.gravity.transactions import _radiant_address_to_p2pkh_script
 from pyrxd.gravity.types import MIN_CLAIM_DEADLINE
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
@@ -1479,7 +1477,6 @@ class TestAuditFindings2026:
         CcPrivateKey equality is variable-time over raw secret bytes; a timing oracle
         could reconstruct the key one bit at a time. Fixed to use hmac.compare_digest.
         """
-        import hmac
         from pyrxd.keys import PrivateKey
         k1 = PrivateKey(0x1111111111111111111111111111111111111111111111111111111111111111)
         k2 = PrivateKey(0x1111111111111111111111111111111111111111111111111111111111111111)
@@ -1487,8 +1484,9 @@ class TestAuditFindings2026:
         assert k1 == k2
         assert k1 != k3
         # Verify the comparison uses hmac.compare_digest by checking it returns bool
-        result = (k1 == k2)
-        assert isinstance(result, bool)
+        # (not NotImplemented) for both equal and unequal keys.
+        assert isinstance(k1.__eq__(k2), bool)
+        assert isinstance(k1.__eq__(k3), bool)
 
     def test_claim_deadline_above_uint32_max_raises(self):
         """HIGH: claim_deadline > 0xFFFFFFFF must raise ValidationError at offer construction.

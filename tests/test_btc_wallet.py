@@ -5,8 +5,6 @@ from __future__ import annotations
 import pytest
 
 from pyrxd.btc_wallet import (
-    BtcKeypair,
-    BtcPaymentTx,
     BtcUtxo,
     build_payment_tx,
     generate_keypair,
@@ -114,7 +112,6 @@ class TestAddressFormats:
 
     def test_pkh_matches_p2pkh_address_embedding(self):
         """The PKH embedded in P2PKH address should match keypair.pkh."""
-        import hashlib
 
         from pyrxd.base58 import b58_decode
 
@@ -298,8 +295,7 @@ class TestBuildPaymentTx:
         stripped = strip_witness(raw)
         # After version(4) + input_count(1) + prevout(36), scriptSig length byte
         scriptsig_len = stripped[41]
-        assert scriptsig_len == 23  # 1(varint 0x16) + 22(redeem) — but varint IS included in len
-        # Actually: scriptSig = 0x16 + redeem(22) = 23 bytes total on wire
+        # scriptSig = 0x16 + redeem(22) = 23 bytes total on wire
         # The length byte at offset 41 is the varint for the scriptSig bytes
         assert scriptsig_len == 23
 

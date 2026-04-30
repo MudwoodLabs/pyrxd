@@ -4,7 +4,7 @@ from __future__ import annotations
 import asyncio
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -612,6 +612,7 @@ class TestGapScanErrorPropagation:
         try:
             asyncio.get_event_loop().run_until_complete(w.refresh(client))
         except NetworkError:
+            # Expected — verifying state is consistent after the failure below.
             pass
         # No false-negative records may remain.
         assert all(r.used is True for r in w.addresses.values()) or w.addresses == {}

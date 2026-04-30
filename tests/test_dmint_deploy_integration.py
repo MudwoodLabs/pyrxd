@@ -22,20 +22,19 @@ Run with VPS:      pytest tests/test_dmint_deploy_integration.py -m integration
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 import cbor2
 import pytest
 
-from pyrxd.glyph.builder import CommitParams, GlyphBuilder, MIN_FEE_RATE
+from pyrxd.glyph.builder import CommitParams, GlyphBuilder
 from pyrxd.glyph.payload import encode_payload
-from pyrxd.glyph.script import build_commit_locking_script, extract_ref_from_ft_script
+from pyrxd.glyph.script import extract_ref_from_ft_script
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
-from pyrxd.security.types import Hex20, Hex32
+from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
@@ -46,7 +45,6 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 
 _SUPPLY = 1_000_000  # 1M test units (rehearsal scale)
 _TREASURY_PKH = Hex20(bytes.fromhex("11" * 20))
-_FUNDING_PKH  = Hex20(bytes.fromhex("22" * 20))
 
 # Glyph marker bytes
 _GLY = b"gly"
@@ -346,8 +344,8 @@ def _build_real_bundle() -> _DeployBundle:
     # Fetch UTXOs from VPS node
     result = subprocess.run(
         ["ssh", "-o", "ConnectTimeout=10", "ericadmin@89.117.20.219",
-         "sudo docker exec radiant-mainnet radiant-cli "
-         "-datadir=/home/radiant/.radiant listunspent"],
+         "sudo docker exec radiant-mainnet radiant-cli"
+         + " -datadir=/home/radiant/.radiant listunspent"],
         capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, f"listunspent failed: {result.stderr}"

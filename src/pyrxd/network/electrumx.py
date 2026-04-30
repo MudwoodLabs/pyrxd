@@ -171,6 +171,7 @@ class ElectrumXClient:
             try:
                 await self._reader_task
             except (asyncio.CancelledError, Exception):
+                # Reader task is being torn down — ignore both cancellation and any final error.
                 pass
         self._reader_task = None
 
@@ -251,7 +252,7 @@ class ElectrumXClient:
         # Build a MerklePath from the ElectrumX branch format.
         # ElectrumX returns hashes in display (reversed) order; we pass the
         # txid as the leaf and build a linear proof path.
-        n_leaves = 2 ** len(merkle_hashes)
+        2 ** len(merkle_hashes)
         path: list = [
             [{"offset": pos, "hash_str": str(txid), "txid": True}]
         ]
