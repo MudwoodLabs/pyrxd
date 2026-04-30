@@ -41,6 +41,7 @@ from pyrxd.security import (
     RxdSdkError,
     ValidationError,
 )
+from pyrxd.wallet import RxdWallet
 
 __version__ = "0.2.0"
 
@@ -65,6 +66,8 @@ __all__ = [
     "PrivateKey",
     # Errors
     "RxdSdkError",
+    # Single-key wallet facade
+    "RxdWallet",
     # Network utilities
     "UtxoRecord",
     "ValidationError",

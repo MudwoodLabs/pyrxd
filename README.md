@@ -111,6 +111,35 @@ metadata = GlyphMetadata(
 # See examples/ft_deploy_premine.py for the full flow.
 ```
 
+## Command line
+
+`pip install pyrxd` also installs a `pyrxd` CLI. The command surface is
+intentionally narrow — it covers wallet management and (in v0.3+)
+Glyph token operations, the things that don't have a clean
+equivalent in `radiant-cli` (the node wallet). For plain RXD
+sendtoaddress on a node, prefer `radiant-cli`.
+
+```bash
+# Create a fresh HD wallet. The mnemonic is shown ONCE — write it down.
+pyrxd wallet new
+
+# Show the next unused receive address.
+pyrxd address
+
+# Check balance via ElectrumX.
+pyrxd balance --refresh
+
+# Look up a deterministic index without scanning.
+pyrxd address --index 5
+
+# Quiet mode for scripting.
+pyrxd --quiet balance --refresh
+```
+
+`pyrxd <command> --help` prints the full reference for any subcommand.
+JSON mode for scripting: pass `--json` (and `--yes` for any
+broadcasting operation).
+
 ## Production architecture
 
 If you're building a web app that interacts with Radiant in production,
