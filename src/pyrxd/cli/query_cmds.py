@@ -36,7 +36,7 @@ def _load_wallet(ctx: CliContext, *, prompt_passphrase: bool = False) -> HdWalle
             cause="no input received",
             fix="enter the BIP39 mnemonic the wallet was created with",
         )
-    passphrase = ""
+    passphrase = ""  # nosec B105 — empty string is the BIP39 spec default (no passphrase), not a hardcoded secret
     if prompt_passphrase:
         passphrase = prompt_passphrase_input(optional=False)
     try:

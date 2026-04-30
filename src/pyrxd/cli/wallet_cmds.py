@@ -68,7 +68,7 @@ def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool) -> None:
     # passed --yes deliberately, so we trust them. In any other mode,
     # show the box + Enter gate.
     if ctx.output_mode == "json":
-        passphrase_str = ""
+        passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default, not a hardcoded secret
         if passphrase:
             passphrase_str = prompt_passphrase_input(optional=True)
         wallet = HdWallet.from_mnemonic(mnemonic, passphrase=passphrase_str)
@@ -86,7 +86,7 @@ def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool) -> None:
         return
 
     show_mnemonic(mnemonic.split(), ctx=ctx)
-    passphrase_str = ""
+    passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default, not a hardcoded secret
     if passphrase:
         passphrase_str = prompt_passphrase_input(optional=True)
     wallet = HdWallet.from_mnemonic(mnemonic, passphrase=passphrase_str)
@@ -130,7 +130,7 @@ def wallet_load(ctx: CliContext, passphrase: bool) -> None:
             fix="enter the BIP39 mnemonic the wallet was created with",
         )
 
-    passphrase_str = ""
+    passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default, not a hardcoded secret
     if passphrase:
         passphrase_str = prompt_passphrase_input(optional=False)
 
