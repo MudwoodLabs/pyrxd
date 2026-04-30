@@ -60,22 +60,24 @@ paperwork process. Most editors and CI systems handle DCO transparently.
 
 We use:
 
-- **`ruff`** for linting and import sorting (`ruff check .` should pass).
-- **`black`** for formatting (`black --check .` should pass).
-- **`mypy --strict`** for type checking.
+- **`ruff check`** for linting + import sorting (must pass over `src/`, `tests/`, `examples/`).
+- **`ruff format`** for formatting — black-compatible, byte-identical output for ~99.9% of code.
+- **`mypy --strict`** for type checking on `src/pyrxd/security/`.
 
-The pre-commit config in `.pre-commit-config.yaml` runs all three.
-Install hooks with `pre-commit install` after cloning.
+Ruff replaced the previous flake8 + black combo in 0.3 — config lives in
+`[tool.ruff]` in `pyproject.toml`. Pre-commit (`.pre-commit-config.yaml`)
+runs both ruff hooks plus bandit and detect-secrets. Install hooks with
+`pre-commit install` after cloning.
 
 ## Testing your changes
 
 Before opening a PR:
 
 ```bash
-pytest                      # full suite
-ruff check .                # linter
-black --check .             # formatter
-mypy src/                   # type checker
+poetry run task test                 # full pytest suite
+poetry run task lint                 # ruff check src tests examples
+poetry run task format               # ruff format src tests examples
+poetry run mypy src/pyrxd/security/  # type checker (security module is strict-typed)
 ```
 
 CI runs the same checks; local feedback is faster.

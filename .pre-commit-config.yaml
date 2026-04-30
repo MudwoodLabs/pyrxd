@@ -9,15 +9,14 @@ repos:
       - id: check-merge-conflict
       - id: no-commit-to-branch
         args: [--branch, main]
-  - repo: https://github.com/psf/black
-    rev: 24.3.0
-    hooks:
-      - id: black
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.3.4
+    rev: v0.15.12
     hooks:
+      # Lint: fail on errors, auto-fix what's safe.
       - id: ruff
         args: [--fix]
+      # Format: black-compatible formatter.
+      - id: ruff-format
   - repo: https://github.com/PyCQA/bandit
     rev: 1.7.8
     hooks:

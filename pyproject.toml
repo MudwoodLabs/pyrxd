@@ -42,8 +42,8 @@ include = [
 ]
 
 [tool.taskipy.tasks]
-lint = "flake8 src"
-format = "black src"
+lint = "ruff check src tests examples"
+format = "ruff format src tests examples"
 test = "pytest"
 docs = "sphinx-build -b html docs docs/_build/html"
 docs-clean = "rm -rf docs/_build"
@@ -64,22 +64,14 @@ bandit = {version = "^1.7.8", extras = ["toml"]}
 pip-audit = "^2.7.3"
 detect-secrets = "^1.5.0"
 mypy = "^1.8.0"
-ruff = "^0.3.4"
+ruff = "^0.15.0"
 hypothesis = "^6.98.0"
 pytest-asyncio = ">=1.3.0"
 
 [tool.poetry.group.test.dependencies]
 bandit = {version = "^1.7.8", extras = ["toml"]}
-black = ">=26.3.1"
 check-manifest = "0.49"
-flake8-bugbear = "23.5.9"
-flake8-docstrings = "*"
-flake8-formatter_junit_xml = "*"
-flake8 = "*"
-flake8-pyproject = "*"
 pre-commit = "3.3.1"
-pylint = "2.17.4"
-pylint_junit = "*"
 pytest-cov = "4.0.0"
 pytest-mock = "<3.10.1"
 pytest-runner = "*"
@@ -99,44 +91,68 @@ exclude = ["tests/"]
 [tool.ruff]
 target-version = "py310"
 line-length = 120
+extend-exclude = ["docs/_build"]
 
 [tool.ruff.lint]
-select = ["E", "F", "W", "S", "B", "I"]
+# Enabled rule families:
+#   E, W   pycodestyle errors / warnings
+#   F      pyflakes (unused imports/vars, undefined names)
+#   I      isort (import ordering, including the required `from __future__ import annotations`)
+#   B      flake8-bugbear (likely bugs)
+#   UP     pyupgrade (modern Python idioms)
+#   SIM    flake8-simplify (clearer rewrites)
+#   RUF    ruff-specific rules
+#   S      flake8-bandit subset (security smell detection)
+#   FA     flake8-future-annotations (require `from __future__ import annotations` so X|Y unions work on 3.10)
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "S", "FA"]
+ignore = [
+    "E501",   # line-too-long: ruff format handles wrapping; long URLs/strings are OK
+    "E741",   # ambiguous variable name 'l' / 'I' — sometimes the natural choice in math
+    "E702",   # multiple statements on one line with semicolon — used in compact byte parsers
+    "S101",   # assert: legitimate in src/ where used as runtime invariants
+    "S105",   # hardcoded password string false positives on BIP39 passphrase=""
+    "S110",   # try/except/pass — flagged when the exception is intentional swallow with explanatory comment
+    "S324",   # SHA1 used in BIP32 (per spec, not for security)
+    "SIM105", # contextlib.suppress: explicit try/except is fine and avoids an import
+    "SIM108", # if/else as ternary — sometimes the long form is clearer
+    "SIM117", # combine nested with: not always readable
+    "B008",   # function call in default arg: used intentionally in PrivateKey() / dataclass defaults
+    "B904",   # raise-without-from-inside-except: chain suppression often intentional in this codebase
+    "B905",   # zip without explicit strict — codebase predates Python 3.10's strict argument
+    "RUF001", # ambiguous unicode in strings (em dash, en dash) — intentional in error messages
+    "RUF002", # ambiguous unicode in docstrings — intentional in writing
+    "RUF003", # ambiguous unicode in comments — intentional in writing
+    "RUF012", # mutable class default — accepted pattern for dataclass defaults_factory
+    "RUF013", # implicit Optional from = None — codebase uses this style consistently
+    "RUF043", # pytest-raises-ambiguous-pattern — flagged on regex backslashes that are correct
+]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101"]  # assert allowed in tests
+"tests/**" = [
+    "S",      # whole bandit family — secrets, hardcoded values, etc. are expected in tests
+    "B011",   # assert False: legit in tests
+    "B017",   # assert raises Exception: tests intentionally check broad failure modes
+    "E402",   # module-level imports below other code: tests group imports near related test classes
+]
+"examples/**" = [
+    "S",      # examples use test keys / hardcoded WIFs intentionally
+    "E402",   # examples may reorder imports for narrative clarity
+]
+"docs/conf.py" = ["E", "F", "I"]
 
-[tool.black]
-line-length = 120
-fast = true
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.format]
+# Match the existing 120-char line length. ruff format is a black-compatible
+# formatter; output is byte-identical to black for ~99.9% of code.
+line-ending = "lf"
 
 [tool.coverage.run]
 branch = true
 
 [tool.coverage.report]
 fail_under = 85
-
-[tool.flake8]
-max-line-length = 120
-select = "F,E,W,B,B901,B902,B903"
-exclude = [
-    ".eggs",
-    ".git",
-    ".tox",
-    "nssm",
-    "obj",
-    "out",
-    "packages",
-    "pywin32",
-    "tests",
-    "swagger_client"
-]
-ignore = [
-    "E722",
-    "B001",
-    "W503",
-    "E203"
-]
 
 [tool.pyright]
 include = ["src"]
