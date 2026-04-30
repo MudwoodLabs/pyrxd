@@ -140,6 +140,28 @@ pyrxd --quiet balance --refresh
 JSON mode for scripting: pass `--json` (and `--yes` for any
 broadcasting operation).
 
+### Security: scripting `wallet new` with `--json --yes`
+
+In `--json --yes` mode, `pyrxd wallet new` prints the mnemonic in
+the JSON payload on stdout — that's the only way scripted automation
+can capture a freshly-generated mnemonic. The user is responsible
+for ensuring the consumer of stdout is itself secure:
+
+- **Never run `pyrxd wallet new --json --yes | tee mnemonic.txt`** —
+  that writes the mnemonic to disk unencrypted.
+- **Never run it in a shell whose history is recorded with stdout** —
+  most shells don't capture stdout in history, but some configurations
+  and tools (`script`, terminal recorders, CI log collectors) do.
+- **Don't run it in a container where stdout is logged to a shared
+  log aggregator** — containerized stdout is captured by the
+  orchestrator and ends up in centralized logging.
+
+The interactive form (`pyrxd wallet new` without `--json`) shows the
+mnemonic in a clearly-flagged box and waits for the user to press
+Enter. Even then, terminal scrollback, tmux/screen buffers, and
+screen-sharing can expose the mnemonic — do not run wallet
+generation on a shared or recorded display.
+
 ## Production architecture
 
 If you're building a web app that interacts with Radiant in production,
