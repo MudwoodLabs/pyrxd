@@ -45,7 +45,10 @@ include = [
 ]
 
 [tool.taskipy.tasks]
-lint = "ruff check src tests examples"
+# `task lint` runs the same set CI runs: ruff (style + safety) and
+# bandit (security smell detection on src/). Catch failures locally
+# before pushing.
+lint = "ruff check src tests examples && bandit -r src/ -c pyproject.toml --quiet"
 format = "ruff format src tests examples"
 test = "pytest"
 docs = "sphinx-build -b html docs docs/_build/html"

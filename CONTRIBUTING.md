@@ -75,7 +75,7 @@ Before opening a PR:
 
 ```bash
 poetry run task test                 # full pytest suite
-poetry run task lint                 # ruff check src tests examples
+poetry run task lint                 # ruff check + bandit security scan
 poetry run task format               # ruff format src tests examples
 poetry run mypy src/pyrxd/security/  # type checker (security module is strict-typed)
 ```
