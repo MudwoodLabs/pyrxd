@@ -66,9 +66,22 @@ def prompt_mnemonic_input() -> str:
     Uses ``click.prompt(hide_input=True)`` rather than ``getpass`` so
     ``CliRunner.invoke(input=...)`` works in tests without a TTY. The
     on-terminal behavior is the same: characters are not displayed.
+
+    The returned string is normalized:
+    * leading/trailing whitespace stripped,
+    * runs of internal whitespace collapsed to a single space,
+
+    so a user pasting from a multi-line note or with stray tabs
+    doesn't trip the BIP39 validator on a benign formatting issue.
+    The validator still rejects unknown words and checksum mismatches.
     """
     raw = click.prompt("Mnemonic (input hidden)", hide_input=True, default="", show_default=False)
-    return str(raw).strip()
+    return _normalize_mnemonic(str(raw))
+
+
+def _normalize_mnemonic(s: str) -> str:
+    """Collapse runs of whitespace and strip ends. Never logs *s*."""
+    return " ".join(s.split())
 
 
 def prompt_passphrase_input(*, optional: bool = True) -> str:

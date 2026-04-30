@@ -136,9 +136,12 @@ def wallet_load(ctx: CliContext, passphrase: bool) -> None:
 
     try:
         wallet = HdWallet.load(ctx.wallet_path, mnemonic, passphrase_str)
-    except ValidationError as exc:
-        # Library raises a single static "Could not decrypt" message.
-        # Surface that to the user under exit code 3.
+    except (ValidationError, ValueError) as exc:
+        # ValidationError: the library's static "Could not decrypt" message.
+        # ValueError:      bip39.validate_mnemonic raises ValueError when
+        #                  a word isn't in the wordlist. Both surface to
+        #                  the user as exit code 3 with the same static
+        #                  message — we never echo the user's input.
         raise WalletDecryptError() from exc
 
     payload = {

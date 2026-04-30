@@ -119,3 +119,85 @@ class TestWalletLoad:
         )
         assert result.exit_code != 0
         assert "mnemonic" in result.output
+
+    def test_debug_emits_traceback_on_decrypt_failure(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """--debug must show the chained exception traceback so a user
+        can diagnose decrypt failures, but the traceback must NOT
+        contain mnemonic values (only variable names from source lines)."""
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        wrong = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        result = runner.invoke(
+            cli,
+            ["--debug", "--wallet", str(tmp_wallet_path), "wallet", "load"],
+            input=f"{wrong}\n",
+        )
+        assert result.exit_code == 3
+        # The user-facing block is still the static decrypt message.
+        assert "Could not decrypt wallet file" in result.output
+        # Traceback shows up.
+        assert "Traceback" in result.output
+        # The mnemonic VALUE must not appear anywhere — only the
+        # variable name `mnemonic` in source lines is acceptable.
+        # The wrong mnemonic happens to be all "abandon" + "about"
+        # which would also appear in random words sometimes; check the
+        # specific 12-word phrase.
+        assert wrong not in result.output
+
+    def test_no_debug_hides_traceback(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """Without --debug, decrypt failure shows ONLY the static error block."""
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        wrong = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "wallet", "load"],
+            input=f"{wrong}\n",
+        )
+        assert result.exit_code == 3
+        assert "Traceback" not in result.output
+
+
+class TestMnemonicEdgeCases:
+    """Real-world inputs that previously could surface raw exceptions."""
+
+    def test_mnemonic_with_extra_whitespace_normalized(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """`abc  def` (double space) and tabs must not crash — they
+        normalize to a single space before validation."""
+        new_result = runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        mnemonic = _extract_json(new_result.output)["mnemonic"]
+        # Insert tabs, double-spaces, leading/trailing whitespace.
+        mangled = "  " + mnemonic.replace(" ", "  \t ") + "\n  "
+
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "--json", "wallet", "load"],
+            input=f"{mangled}\n",
+        )
+        assert result.exit_code == 0, result.output
+
+    def test_mnemonic_with_unknown_word_exits_3(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """A word not in the BIP39 list raises ValueError — must surface
+        as exit code 3 with the static decrypt-failed message, never as
+        a raw traceback."""
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        bad = "notaword " * 11 + "alsobogus"
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "wallet", "load"],
+            input=f"{bad}\n",
+        )
+        assert result.exit_code == 3
+        assert "decrypt" in result.output.lower()
+        assert "Traceback" not in result.output
+        # The user's input must NEVER appear in the output.
+        assert "notaword" not in result.output
+
+    def test_mnemonic_empty_after_normalize_errors(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """All-whitespace input collapses to '' and is rejected up front."""
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "wallet", "load"],
+            input="   \t \n",
+        )
+        assert result.exit_code != 0
+        assert "mnemonic" in result.output.lower()

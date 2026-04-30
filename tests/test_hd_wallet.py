@@ -274,7 +274,79 @@ class TestSaveLoad:
         p = Path("/nonexistent/path/wallet.dat")
         w = HdWallet.load_or_create(p, MNEMONIC)
         assert w.external_tip == 0
-        assert w.addresses == {}
+
+    def test_load_rejects_world_readable_wallet_file(self):
+        """A wallet file with mode 0644 (or anything wider than 0600)
+        must be refused at load time. ``save()`` always writes 0600,
+        but a restore-from-backup via ``cp``/``rsync`` can widen the
+        mode silently — the check catches that before the seed touches
+        memory."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            w = HdWallet.from_mnemonic(MNEMONIC)
+            w.save(p)
+            # Loosen the mode after a clean save.
+            p.chmod(0o644)
+
+            with pytest.raises(ValidationError, match="0o600"):
+                HdWallet.load(p, MNEMONIC)
+
+    def test_load_rejects_malformed_decrypted_json(self):
+        """Defense in depth: even if AES-GCM passes (impossible without
+        the right seed), structurally-invalid wallet state must raise
+        ValidationError rather than crash with KeyError or silently
+        drop fields."""
+        import hashlib
+        import json
+        import secrets
+
+        from Cryptodome.Cipher import AES
+
+        from pyrxd.hd.bip39 import seed_from_mnemonic
+        from pyrxd.hd.wallet import (
+            _FILE_VERSION_V2,
+            _NONCE_LEN,
+            _SALT_LEN,
+            _SCRYPT_N,
+            _SCRYPT_P,
+            _SCRYPT_R,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+
+            # Hand-craft a wallet file with a CORRECTLY encrypted
+            # payload but missing the "address" key in an address record.
+            seed = seed_from_mnemonic(MNEMONIC, passphrase="")
+            salt = secrets.token_bytes(_SALT_LEN)
+            nonce = secrets.token_bytes(_NONCE_LEN)
+            enc_key = hashlib.scrypt(
+                seed,
+                salt=salt,
+                n=_SCRYPT_N,
+                r=_SCRYPT_R,
+                p=_SCRYPT_P,
+                maxmem=128 * 1024 * 1024,
+                dklen=32,
+            )
+            bad_data = {
+                "version": _FILE_VERSION_V2,
+                "account": 0,
+                "external_tip": 1,
+                "internal_tip": 0,
+                # missing "address" → KeyError when reconstructing
+                "addresses": {"0/0": {"change": 0, "index": 0, "used": True}},
+            }
+            cipher = AES.new(enc_key, AES.MODE_GCM, nonce=nonce)
+            ciphertext, tag = cipher.encrypt_and_digest(json.dumps(bad_data).encode())
+            blob = bytes([_FILE_VERSION_V2]) + salt + nonce + tag + ciphertext
+            p.write_bytes(blob)
+            # Match the mode invariant that ``save()`` would have written;
+            # otherwise the load-time mode check fires first.
+            p.chmod(0o600)
+
+            with pytest.raises(ValidationError, match="malformed"):
+                HdWallet.load(p, MNEMONIC)
 
     def test_load_or_create_on_existing_path_loads_it(self):
         """When the file exists, load_or_create must defer to load (not

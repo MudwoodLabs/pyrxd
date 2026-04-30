@@ -41,7 +41,12 @@ def _load_wallet(ctx: CliContext, *, prompt_passphrase: bool = False) -> HdWalle
         passphrase = prompt_passphrase_input(optional=False)
     try:
         return HdWallet.load(ctx.wallet_path, mnemonic, passphrase)
-    except ValidationError as exc:
+    except (ValidationError, ValueError) as exc:
+        # ValidationError: library's "Could not decrypt" surface.
+        # ValueError:      bip39.validate_mnemonic on a non-wordlist word.
+        # Both collapse to a single decrypt-failed exit code — we never
+        # echo the user's input back, so distinguishing them would only
+        # leak information about which guess was closer.
         raise WalletDecryptError() from exc
 
 

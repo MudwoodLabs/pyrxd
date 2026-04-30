@@ -11,11 +11,42 @@ Exit codes (per docs/wallet-cli-plan.md §"Exit codes"):
   2   network error
   3   wallet decryption failed
   4   unexpected error (bug)
+
+Debug traceback handling
+------------------------
+When the user passes ``--debug``, ``run()`` sets a module-level flag
+that ``CliError.show()`` reads. The traceback printed is the standard
+:func:`traceback.format_exception` form — function names, line numbers,
+source lines. **Local variables are never captured.** The source lines
+themselves may contain variable names like ``mnemonic`` or
+``passphrase`` (per Python's standard traceback format) but never their
+values; that's the same exposure surface as any uncaught exception in
+a Python program. We do NOT use ``capture_locals=True`` anywhere.
 """
 
 from __future__ import annotations
 
+import traceback
+
 import click
+
+# Set by main.run() when --debug is passed. Read by CliError.show().
+_DEBUG: bool = False
+
+
+def set_debug(enabled: bool) -> None:
+    """Enable or disable traceback emission for CliError.show().
+
+    Called by ``main.run()`` based on the ``--debug`` flag. Affects the
+    process-global state — every CliError raised after the call honors
+    the new setting.
+    """
+    global _DEBUG
+    _DEBUG = bool(enabled)
+
+
+def is_debug() -> bool:
+    return _DEBUG
 
 
 class CliError(click.ClickException):
@@ -53,9 +84,17 @@ class CliError(click.ClickException):
         return "\n".join(parts)
 
     # Override show() so the prefix is just our formatted block (no
-    # "Error: " click prefix).
+    # "Error: " click prefix). When --debug is on, also append the
+    # exception traceback (standard format — no captured locals).
     def show(self, file=None) -> None:  # type: ignore[override]
         click.echo(self.format_message(), file=file, err=True)
+        if _DEBUG and self.__cause__ is not None:
+            tb_lines = traceback.format_exception(
+                type(self.__cause__),
+                self.__cause__,
+                self.__cause__.__traceback__,
+            )
+            click.echo("".join(tb_lines), file=file, err=True, nl=False)
 
 
 class UserError(CliError):

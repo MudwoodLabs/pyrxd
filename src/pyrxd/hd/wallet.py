@@ -187,6 +187,24 @@ class HdWallet:
 
     @classmethod
     def _load_existing(cls, path: Path, mnemonic: str, passphrase: str) -> HdWallet:
+        # Mode check: refuse to load a wallet that's group/world readable.
+        # ``save()`` always writes 0o600, but a user who restored from
+        # backup with ``cp`` or ``rsync`` might end up with a wider
+        # mode and not realize it. Catch it at load rather than silently
+        # operating with a world-readable seed file.
+        # Skipped on platforms without POSIX mode bits (Windows: stat.st_mode
+        # returns dummy values, so the check is meaningless). We fall back to
+        # warning-via-exception only when stat reports POSIX-shaped bits.
+        try:
+            mode = path.stat().st_mode & 0o777
+        except OSError:
+            mode = None
+        if mode is not None and (mode & 0o077) and os.name == "posix":
+            raise ValidationError(
+                f"Wallet file at {path} has mode {oct(mode)}; "
+                "must be 0o600 (owner-only). Run `chmod 0600 <path>` and retry."
+            )
+
         seed = seed_from_mnemonic(mnemonic, passphrase=passphrase)
 
         raw = path.read_bytes()
@@ -227,24 +245,35 @@ class HdWallet:
             # explicitly, do not return a partial wallet.
             raise ValidationError("Wallet file decrypted but contains invalid JSON — disk corruption?") from exc
 
-        account = int(data.get("account", 0))
-        account_xprv = bip32_derive_xprv_from_mnemonic(
-            mnemonic, passphrase=passphrase, path=f"{_RADIANT_PATH}/{account}'"
-        )
-        wallet = cls(
-            _xprv=account_xprv,
-            _seed=SecretBytes(seed),
-            account=account,
-            external_tip=int(data.get("external_tip", 0)),
-            internal_tip=int(data.get("internal_tip", 0)),
-        )
-        for key, rec in data.get("addresses", {}).items():
-            wallet.addresses[key] = AddressRecord(
-                address=rec["address"],
-                change=int(rec["change"]),
-                index=int(rec["index"]),
-                used=bool(rec["used"]),
+        try:
+            account = int(data.get("account", 0))
+            account_xprv = bip32_derive_xprv_from_mnemonic(
+                mnemonic, passphrase=passphrase, path=f"{_RADIANT_PATH}/{account}'"
             )
+            wallet = cls(
+                _xprv=account_xprv,
+                _seed=SecretBytes(seed),
+                account=account,
+                external_tip=int(data.get("external_tip", 0)),
+                internal_tip=int(data.get("internal_tip", 0)),
+            )
+            for key, rec in data.get("addresses", {}).items():
+                wallet.addresses[key] = AddressRecord(
+                    address=rec["address"],
+                    change=int(rec["change"]),
+                    index=int(rec["index"]),
+                    used=bool(rec["used"]),
+                )
+        except (KeyError, TypeError, ValueError) as exc:
+            # AEAD makes structural corruption an "impossible" path —
+            # if we land here the disk is genuinely damaged or someone
+            # has bypassed the AEAD layer. Refuse to return a partial
+            # wallet rather than silently dropping the malformed bits;
+            # users would otherwise lose external_tip / address records
+            # without any indication.
+            raise ValidationError(
+                "Wallet file decrypted but contains malformed wallet state — disk corruption?"
+            ) from exc
         return wallet
 
     # ------------------------------------------------------------------

@@ -31,6 +31,7 @@ import click
 
 from .. import __version__ as _pyrxd_version
 from . import config as _config
+from . import errors as _errors
 from .context import CliContext
 from .errors import CliError
 
@@ -99,6 +100,11 @@ def cli(
     if json_output and quiet:
         click.echo("error: --json and --quiet are mutually exclusive", err=True)
         sys.exit(1)
+
+    # --debug flips the module-global flag that CliError.show() reads.
+    # We set it as early as possible so any error during config load
+    # also benefits from the traceback.
+    _errors.set_debug(debug)
 
     cfg = _config.load(config_path)
 
