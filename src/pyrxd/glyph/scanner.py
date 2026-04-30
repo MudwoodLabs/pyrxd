@@ -3,11 +3,12 @@
 Wires together GlyphInspector (pure parser), ElectrumXClient (network),
 and the GlyphNft / GlyphFt types into a single async API.
 """
+
 from __future__ import annotations
 
 import asyncio
 import logging
-from typing import TYPE_CHECKING, List, Union
+from typing import TYPE_CHECKING
 
 from ..network.electrumx import script_hash_for_address
 from ..security.errors import NetworkError
@@ -24,7 +25,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-GlyphItem = Union[GlyphNft, GlyphFt]
+GlyphItem = GlyphNft | GlyphFt
 
 
 class GlyphScanner:
@@ -38,11 +39,11 @@ class GlyphScanner:
         context manager and pass it in.
     """
 
-    def __init__(self, client: "ElectrumXClient") -> None:
+    def __init__(self, client: ElectrumXClient) -> None:
         self._client = client
         self._inspector = GlyphInspector()
 
-    async def scan_address(self, address: str) -> List[GlyphItem]:
+    async def scan_address(self, address: str) -> list[GlyphItem]:
         """Return all Glyph outputs currently owned at *address*.
 
         Parameters
@@ -59,9 +60,7 @@ class GlyphScanner:
         sh = script_hash_for_address(address)
         return await self.scan_script_hash(sh)
 
-    async def scan_script_hash(
-        self, script_hash: "Hex32 | bytes | str"
-    ) -> List[GlyphItem]:
+    async def scan_script_hash(self, script_hash: Hex32 | bytes | str) -> list[GlyphItem]:
         """Return all Glyph outputs for *script_hash*.
 
         Fetches UTXOs, raw transactions, and (where available) reveal
@@ -91,7 +90,7 @@ class GlyphScanner:
         # collect every (utxo, glyph) pair we'd want metadata for.
         # Two-pass split lets us issue all reveal-metadata fetches as a
         # single gather() instead of one-await-per-glyph.
-        pending: List[tuple] = []  # (utxo, glyph)
+        pending: list[tuple] = []  # (utxo, glyph)
         for utxo, raw in zip(utxos, raw_txs):
             if isinstance(raw, Exception):
                 logger.warning("Failed to fetch tx %s: %s", utxo.tx_hash, raw)
@@ -102,10 +101,7 @@ class GlyphScanner:
                 logger.warning("Failed to parse tx %s", utxo.tx_hash)
                 continue
 
-            output_pairs = [
-                (out.satoshis, out.locking_script.serialize())
-                for out in tx.outputs
-            ]
+            output_pairs = [(out.satoshis, out.locking_script.serialize()) for out in tx.outputs]
             glyphs = self._inspector.find_glyphs(output_pairs)
 
             for g in glyphs:
@@ -124,7 +120,7 @@ class GlyphScanner:
             return_exceptions=True,
         )
 
-        results: List[GlyphItem] = []
+        results: list[GlyphItem] = []
         for (utxo, g), meta in zip(pending, metadatas):
             # _fetch_reveal_metadata catches its own exceptions and
             # returns None — but gather(return_exceptions=True) means a
@@ -137,9 +133,7 @@ class GlyphScanner:
             try:
                 if g.glyph_type == "nft":
                     pkh = extract_owner_pkh_from_nft_script(script)
-                    results.append(
-                        GlyphNft(ref=g.ref, owner_pkh=pkh, metadata=metadata)
-                    )
+                    results.append(GlyphNft(ref=g.ref, owner_pkh=pkh, metadata=metadata))
                 elif g.glyph_type == "ft":
                     pkh = extract_owner_pkh_from_ft_script(script)
                     results.append(
@@ -153,7 +147,9 @@ class GlyphScanner:
             except Exception as exc:
                 logger.warning(
                     "Could not construct Glyph for %s vout %d: %s",
-                    utxo.tx_hash, utxo.tx_pos, exc,
+                    utxo.tx_hash,
+                    utxo.tx_pos,
+                    exc,
                 )
 
         return results

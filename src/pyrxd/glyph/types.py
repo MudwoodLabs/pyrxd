@@ -3,35 +3,38 @@ from __future__ import annotations
 import struct
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import Optional
+from typing import TYPE_CHECKING
 
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
 
-# Forward references to .dmint.DmintCborPayload below are kept as string
-# annotations to avoid an unsafe cyclic import (.dmint imports from .types).
+if TYPE_CHECKING:
+    # Imported only for type checking; at runtime PEP 563 makes the annotation
+    # a string. .dmint imports from .types, so a runtime import here would
+    # create a cycle.
+    from .dmint import DmintCborPayload
 
 
 class GlyphProtocol(IntEnum):
-    FT = 1           # Fungible token
-    NFT = 2          # Non-fungible singleton
-    DAT = 3          # Data storage
-    DMINT = 4        # dMint (combined with FT: [1, 4])
-    MUT = 5          # Mutable
-    BURN = 6         # Explicit burn
-    CONTAINER = 7    # Collection
-    ENCRYPTED = 8    # Encrypted content
-    TIMELOCK = 9     # Timelocked reveal (requires ENCRYPTED)
-    AUTHORITY = 10   # Issuer authority
-    WAVE = 11        # On-chain naming
+    FT = 1  # Fungible token
+    NFT = 2  # Non-fungible singleton
+    DAT = 3  # Data storage
+    DMINT = 4  # dMint (combined with FT: [1, 4])
+    MUT = 5  # Mutable
+    BURN = 6  # Explicit burn
+    CONTAINER = 7  # Collection
+    ENCRYPTED = 8  # Encrypted content
+    TIMELOCK = 9  # Timelocked reveal (requires ENCRYPTED)
+    AUTHORITY = 10  # Issuer authority
+    WAVE = 11  # On-chain naming
 
 
 @dataclass(frozen=True)
 class GlyphRef:
     """36-byte Glyph reference: txid (reversed LE) + vout (4-byte LE)."""
 
-    txid: Txid   # hex txid (not reversed)
-    vout: int    # output index
+    txid: Txid  # hex txid (not reversed)
+    vout: int  # output index
 
     def __post_init__(self) -> None:
         if self.vout < 0 or self.vout > 0xFFFFFFFF:
@@ -39,7 +42,7 @@ class GlyphRef:
 
     def to_bytes(self) -> bytes:
         """Encode as 36-byte wire format: txid_reversed + vout_le."""
-        return bytes.fromhex(self.txid)[::-1] + struct.pack('<I', self.vout)
+        return bytes.fromhex(self.txid)[::-1] + struct.pack("<I", self.vout)
 
     @classmethod
     def from_bytes(cls, data: bytes) -> GlyphRef:
@@ -47,17 +50,17 @@ class GlyphRef:
         if len(data) != 36:
             raise ValidationError(f"GlyphRef must be 36 bytes, got {len(data)}")
         txid = data[:32][::-1].hex()
-        vout = struct.unpack('<I', data[32:])[0]
+        vout = struct.unpack("<I", data[32:])[0]
         return cls(txid=Txid(txid), vout=vout)
 
 
 @dataclass(frozen=True)
 class GlyphMedia:
     mime_type: str  # e.g. "image/webp"
-    data: bytes     # raw binary
+    data: bytes  # raw binary
 
     def __post_init__(self) -> None:
-        if not self.mime_type or '/' not in self.mime_type:
+        if not self.mime_type or "/" not in self.mime_type:
             raise ValidationError("Invalid MIME type")
         if len(self.data) > 100_000:  # 100KB limit for on-chain media
             raise ValidationError("On-chain media too large (max 100KB)")
@@ -70,6 +73,7 @@ _VALID_PROTOCOL_VALUES = frozenset(p.value for p in GlyphProtocol)
 # V2 sub-objects (mirror of GlyphV2* types in Photonic Wallet v2metadata.ts)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class GlyphCreator:
     """Creator identity and optional ECDSA signature over the metadata commit hash.
@@ -78,18 +82,19 @@ class GlyphCreator:
     sig:    DER-encoded ECDSA signature, hex-encoded (empty string = unsigned).
     algo:   Signing algorithm identifier string.
     """
+
     pubkey: str
     sig: str = ""
     algo: str = "ecdsa-secp256k1"
 
     def __post_init__(self) -> None:
         import re
-        if not re.fullmatch(r'0[23][0-9a-f]{64}', self.pubkey.lower()):
+
+        if not re.fullmatch(r"0[23][0-9a-f]{64}", self.pubkey.lower()):
             raise ValidationError(
-                "creator.pubkey must be a 33-byte compressed secp256k1 pubkey "
-                "(02 or 03 prefix, 66 hex chars)"
+                "creator.pubkey must be a 33-byte compressed secp256k1 pubkey (02 or 03 prefix, 66 hex chars)"
             )
-        if self.sig and not re.fullmatch(r'[0-9a-f]+', self.sig.lower()):
+        if self.sig and not re.fullmatch(r"[0-9a-f]+", self.sig.lower()):
             raise ValidationError("creator.sig must be hex-encoded DER bytes or empty string")
 
     def to_cbor_dict(self) -> dict:
@@ -101,7 +106,7 @@ class GlyphCreator:
         return d
 
     @classmethod
-    def from_cbor_dict(cls, d: dict) -> "GlyphCreator":
+    def from_cbor_dict(cls, d: dict) -> GlyphCreator:
         if isinstance(d, str):
             # Simple string form: just a pubkey with no sig
             return cls(pubkey=d)
@@ -123,6 +128,7 @@ class GlyphRoyalty:
     splits:   Optional list of (address, bps) pairs for royalty splitting.
               The sum of split bps should equal the top-level bps.
     """
+
     bps: int
     address: str
     enforced: bool = False
@@ -139,14 +145,10 @@ class GlyphRoyalty:
         if self.splits:
             for addr, split_bps in self.splits:
                 if not (0 <= split_bps <= 10_000):
-                    raise ValidationError(
-                        f"royalty split bps must be 0..10000, got {split_bps} for '{addr}'"
-                    )
+                    raise ValidationError(f"royalty split bps must be 0..10000, got {split_bps} for '{addr}'")
             split_total = sum(b for _, b in self.splits)
             if split_total > self.bps:
-                raise ValidationError(
-                    f"royalty splits sum ({split_total} bps) exceeds total bps ({self.bps})"
-                )
+                raise ValidationError(f"royalty splits sum ({split_total} bps) exceeds total bps ({self.bps})")
 
     def to_cbor_dict(self) -> dict:
         d: dict = {
@@ -161,13 +163,9 @@ class GlyphRoyalty:
         return d
 
     @classmethod
-    def from_cbor_dict(cls, d: dict) -> "GlyphRoyalty":
+    def from_cbor_dict(cls, d: dict) -> GlyphRoyalty:
         splits_raw = d.get("splits", [])
-        splits = tuple(
-            (str(s["address"]), int(s["bps"]))
-            for s in splits_raw
-            if isinstance(s, dict)
-        )
+        splits = tuple((str(s["address"]), int(s["bps"])) for s in splits_raw if isinstance(s, dict))
         return cls(
             bps=int(d["bps"]),
             address=str(d["address"]),
@@ -180,10 +178,11 @@ class GlyphRoyalty:
 @dataclass(frozen=True)
 class GlyphPolicy:
     """Token behaviour policy flags."""
-    renderable: Optional[bool] = None   # wallets may display/render this token
-    executable: Optional[bool] = None  # token contains executable content
-    nsfw: Optional[bool] = None         # not safe for work
-    transferable: Optional[bool] = None # False = soulbound (non-transferable)
+
+    renderable: bool | None = None  # wallets may display/render this token
+    executable: bool | None = None  # token contains executable content
+    nsfw: bool | None = None  # not safe for work
+    transferable: bool | None = None  # False = soulbound (non-transferable)
 
     def to_cbor_dict(self) -> dict:
         d: dict = {}
@@ -198,10 +197,11 @@ class GlyphPolicy:
         return d
 
     @classmethod
-    def from_cbor_dict(cls, d: dict) -> "GlyphPolicy":
-        def _opt_bool(key: str) -> Optional[bool]:
+    def from_cbor_dict(cls, d: dict) -> GlyphPolicy:
+        def _opt_bool(key: str) -> bool | None:
             v = d.get(key)
             return bool(v) if v is not None else None
+
         return cls(
             renderable=_opt_bool("renderable"),
             executable=_opt_bool("executable"),
@@ -213,8 +213,9 @@ class GlyphPolicy:
 @dataclass(frozen=True)
 class GlyphRights:
     """Licensing and attribution information."""
-    license: str = ""      # SPDX identifier or URL (e.g. "CC-BY-4.0")
-    terms: str = ""        # Human-readable license terms
+
+    license: str = ""  # SPDX identifier or URL (e.g. "CC-BY-4.0")
+    terms: str = ""  # Human-readable license terms
     attribution: str = ""  # Required attribution text
 
     def to_cbor_dict(self) -> dict:
@@ -228,7 +229,7 @@ class GlyphRights:
         return d
 
     @classmethod
-    def from_cbor_dict(cls, d: dict) -> "GlyphRights":
+    def from_cbor_dict(cls, d: dict) -> GlyphRights:
         return cls(
             license=str(d.get("license", "")),
             terms=str(d.get("terms", "")),
@@ -240,30 +241,33 @@ class GlyphRights:
 class GlyphMetadata:
     """CBOR payload for a Glyph token."""
 
-    protocol: list[int]                           # e.g. [2] for NFT, [1] for FT, [1,4] for dMint FT
+    protocol: list[int]  # e.g. [2] for NFT, [1] for FT, [1,4] for dMint FT
     name: str = ""
-    ticker: str = ""                              # FT only
+    ticker: str = ""  # FT only
     description: str = ""
-    token_type: str = ""                          # NFT type tag
-    main: Optional[GlyphMedia] = None
+    token_type: str = ""  # NFT type tag
+    main: GlyphMedia | None = None
     attrs: dict[str, str] = field(default_factory=dict)
-    loc: str = ""                                 # IPFS or external URI
-    loc_hash: str = ""                            # integrity hash
-    decimals: int = 0                             # FT decimals (display only — consensus is 1 photon = 1 unit)
-    image_url: str = ""                           # HTTPS URL for token display image
-    image_ipfs: str = ""                          # IPFS CID (ipfs://... form)
-    image_sha256: str = ""                        # hex SHA256 of image bytes — lets clients verify hosted image wasn't swapped
-    v: Optional[int] = None                       # Glyph version (None=V1, 2=V2); indexers use this to select parser
-    dmint_params: Optional["DmintCborPayload"] = None  # V2 dMint config object; required when GlyphProtocol.DMINT in protocol
-    creator: Optional[GlyphCreator] = None        # V2 creator identity + optional ECDSA signature
-    royalty: Optional[GlyphRoyalty] = None        # V2 royalty hint for secondary markets
-    policy: Optional[GlyphPolicy] = None          # V2 behaviour flags (soulbound, nsfw, etc.)
-    rights: Optional[GlyphRights] = None          # V2 licensing and attribution
-    created: str = ""                             # V2 ISO8601 creation timestamp
-    commit_outpoint: str = ""                     # V2 txid:vout of the commit UTXO
+    loc: str = ""  # IPFS or external URI
+    loc_hash: str = ""  # integrity hash
+    decimals: int = 0  # FT decimals (display only — consensus is 1 photon = 1 unit)
+    image_url: str = ""  # HTTPS URL for token display image
+    image_ipfs: str = ""  # IPFS CID (ipfs://... form)
+    image_sha256: str = ""  # hex SHA256 of image bytes — lets clients verify hosted image wasn't swapped
+    v: int | None = None  # Glyph version (None=V1, 2=V2); indexers use this to select parser
+    dmint_params: DmintCborPayload | None = (
+        None  # V2 dMint config object; required when GlyphProtocol.DMINT in protocol
+    )
+    creator: GlyphCreator | None = None  # V2 creator identity + optional ECDSA signature
+    royalty: GlyphRoyalty | None = None  # V2 royalty hint for secondary markets
+    policy: GlyphPolicy | None = None  # V2 behaviour flags (soulbound, nsfw, etc.)
+    rights: GlyphRights | None = None  # V2 licensing and attribution
+    created: str = ""  # V2 ISO8601 creation timestamp
+    commit_outpoint: str = ""  # V2 txid:vout of the commit UTXO
 
     def __post_init__(self) -> None:
         import re
+
         # protocol must be a non-empty list (or tuple) of known GlyphProtocol int values.
         # Coerce to tuple immediately so the stored value is immutable even though
         # frozen=True only prevents field reassignment, not in-place list mutation.
@@ -274,37 +278,31 @@ class GlyphMetadata:
             )
         # Store as tuple for immutability (frozen dataclass prevents reassignment
         # but not list.append / list.pop on a mutable list field).
-        object.__setattr__(self, 'protocol', tuple(self.protocol))
+        object.__setattr__(self, "protocol", tuple(self.protocol))
         if not self.protocol:
             raise ValidationError(
-                "protocol list must not be empty. "
-                "Use e.g. [GlyphProtocol.FT] or [GlyphProtocol.NFT]."
+                "protocol list must not be empty. Use e.g. [GlyphProtocol.FT] or [GlyphProtocol.NFT]."
             )
         for p in self.protocol:
             if not isinstance(p, int) or isinstance(p, bool):
-                raise ValidationError(
-                    f"protocol values must be int, got {type(p).__name__!r}: {p!r}"
-                )
+                raise ValidationError(f"protocol values must be int, got {type(p).__name__!r}: {p!r}")
             if p not in _VALID_PROTOCOL_VALUES:
                 raise ValidationError(
-                    f"Unknown protocol value {p!r}. "
-                    f"Valid values: {sorted(_VALID_PROTOCOL_VALUES)} (see GlyphProtocol)."
+                    f"Unknown protocol value {p!r}. Valid values: {sorted(_VALID_PROTOCOL_VALUES)} (see GlyphProtocol)."
                 )
         # Protocol combination rules (mirrors Photonic Wallet protocols.ts §3.5).
         # FT and NFT are mutually exclusive base types.
         if GlyphProtocol.FT in self.protocol and GlyphProtocol.NFT in self.protocol:
-            raise ValidationError(
-                "FT (1) and NFT (2) are mutually exclusive protocol markers."
-            )
+            raise ValidationError("FT (1) and NFT (2) are mutually exclusive protocol markers.")
         # Each extension protocol has at least one required co-protocol.
         _REQUIREMENTS: dict[int, list[int]] = {
-            GlyphProtocol.DMINT:     [GlyphProtocol.FT],
-            GlyphProtocol.MUT:       [GlyphProtocol.NFT],
+            GlyphProtocol.DMINT: [GlyphProtocol.FT],
+            GlyphProtocol.MUT: [GlyphProtocol.NFT],
             GlyphProtocol.CONTAINER: [GlyphProtocol.NFT],
             GlyphProtocol.ENCRYPTED: [GlyphProtocol.NFT],
-            GlyphProtocol.TIMELOCK:  [GlyphProtocol.ENCRYPTED],
+            GlyphProtocol.TIMELOCK: [GlyphProtocol.ENCRYPTED],
             GlyphProtocol.AUTHORITY: [GlyphProtocol.NFT],
-            GlyphProtocol.WAVE:      [GlyphProtocol.NFT, GlyphProtocol.MUT],
+            GlyphProtocol.WAVE: [GlyphProtocol.NFT, GlyphProtocol.MUT],
         }
         for ext, required in _REQUIREMENTS.items():
             if ext in self.protocol:
@@ -312,8 +310,7 @@ class GlyphMetadata:
                 if missing:
                     names = ", ".join(GlyphProtocol(r).name for r in missing)
                     raise ValidationError(
-                        f"protocol {GlyphProtocol(ext).name} ({ext}) requires "
-                        f"{names} to also be present."
+                        f"protocol {GlyphProtocol(ext).name} ({ext}) requires {names} to also be present."
                     )
         # decimals must be in a sane display range.
         if not isinstance(self.decimals, int) or isinstance(self.decimals, bool):
@@ -324,12 +321,11 @@ class GlyphMetadata:
                 "Negative decimals produce 10x display errors; > 18 is not meaningful."
             )
         # image_sha256 must be exactly 64 lowercase hex chars if provided.
-        if self.image_sha256:
-            if not re.fullmatch(r"[0-9a-f]{64}", self.image_sha256):
-                raise ValidationError(
-                    f"image_sha256 must be 64 lowercase hex chars (SHA-256), "
-                    f"got {len(self.image_sha256)!r} chars: {self.image_sha256[:16]!r}..."
-                )
+        if self.image_sha256 and not re.fullmatch(r"[0-9a-f]{64}", self.image_sha256):
+            raise ValidationError(
+                f"image_sha256 must be 64 lowercase hex chars (SHA-256), "
+                f"got {len(self.image_sha256)!r} chars: {self.image_sha256[:16]!r}..."
+            )
 
     def to_cbor_dict(self) -> dict:
         """Build the dict that gets CBOR-encoded (excluding 'gly' marker)."""
@@ -391,9 +387,9 @@ class GlyphMetadata:
         image_url: str = "",
         image_ipfs: str = "",
         image_sha256: str = "",
-        protocol: Optional[list[int]] = None,
-        dmint_params: Optional["DmintCborPayload"] = None,
-    ) -> "GlyphMetadata":
+        protocol: list[int] | None = None,
+        dmint_params: DmintCborPayload | None = None,
+    ) -> GlyphMetadata:
         """Construct GlyphMetadata for a dMint-marked FT deploy.
 
         Pass ``dmint_params`` (a ``DmintCborPayload``) to embed the dMint
@@ -422,7 +418,7 @@ class GlyphNft:
     """A minted or transferable NFT Glyph."""
 
     ref: GlyphRef
-    owner_pkh: Hex20    # 20-byte P2PKH hash of current owner
+    owner_pkh: Hex20  # 20-byte P2PKH hash of current owner
     metadata: GlyphMetadata
 
 
@@ -432,5 +428,5 @@ class GlyphFt:
 
     ref: GlyphRef
     owner_pkh: Hex20
-    amount: int         # in photons (Radiant satoshi equivalent)
+    amount: int  # in photons (Radiant satoshi equivalent)
     metadata: GlyphMetadata

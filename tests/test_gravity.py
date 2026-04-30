@@ -28,12 +28,13 @@ from pyrxd.gravity.codehash import (
     compute_p2sh_script_pubkey,
 )
 from pyrxd.security.errors import ValidationError
-from pyrxd.spv.proof import CovenantParams, SpvProof, _BUILDER_TOKEN
-
+from pyrxd.security.secrets import PrivateKeyMaterial
+from pyrxd.spv.proof import _BUILDER_TOKEN, CovenantParams, SpvProof
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _make_gravity_offer(**kwargs) -> GravityOffer:
     """Return a valid GravityOffer, with field overrides from *kwargs*.
@@ -88,6 +89,7 @@ def _make_spv_proof(headers: list[bytes] | None = None) -> SpvProof:
 # codehash tests
 # ---------------------------------------------------------------------------
 
+
 class TestCodeHash:
     def test_p2sh_script_pubkey_is_23_bytes(self):
         redeem = b"\x00" * 100
@@ -97,8 +99,8 @@ class TestCodeHash:
     def test_p2sh_script_pubkey_opcodes(self):
         redeem = b"\xab" * 50
         spk = compute_p2sh_script_pubkey(redeem)
-        assert spk[0] == 0xA9   # OP_HASH160
-        assert spk[1] == 0x14   # PUSH 20
+        assert spk[0] == 0xA9  # OP_HASH160
+        assert spk[1] == 0x14  # PUSH 20
         assert spk[-1] == 0x87  # OP_EQUAL
 
     def test_p2sh_code_hash_is_32_bytes(self):
@@ -130,6 +132,7 @@ class TestCodeHash:
 # ---------------------------------------------------------------------------
 # GravityOffer validation tests
 # ---------------------------------------------------------------------------
+
 
 class TestGravityOffer:
     def test_valid_offer_constructs(self):
@@ -179,6 +182,7 @@ class TestGravityOffer:
     def test_exact_min_deadline_accepted(self):
         """The boundary value MIN_CLAIM_DEADLINE itself must be accepted."""
         from pyrxd.gravity.types import MIN_CLAIM_DEADLINE
+
         offer = _make_gravity_offer(claim_deadline=MIN_CLAIM_DEADLINE)
         assert offer.claim_deadline == MIN_CLAIM_DEADLINE
 
@@ -211,6 +215,7 @@ class TestGravityOffer:
 # ---------------------------------------------------------------------------
 # build_finalize_tx tests
 # ---------------------------------------------------------------------------
+
 
 class TestBuildFinalizeTx:
     def test_finalize_tx_produces_valid_hex(self):
@@ -368,6 +373,7 @@ class TestBuildFinalizeTx:
 # build_forfeit_tx tests
 # ---------------------------------------------------------------------------
 
+
 class TestBuildForfeitTx:
     PAST_DEADLINE = 1_735_686_400  # exactly MIN_CLAIM_DEADLINE = 2025-01-01
 
@@ -406,15 +412,23 @@ class TestBuildForfeitTx:
         )
         with pytest.raises(ValidationError, match="future"):
             build_forfeit_tx(
-                offer, "aa" * 32, 0, 1_000_000,
-                "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+                offer,
+                "aa" * 32,
+                0,
+                1_000_000,
+                "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+                1_000,
             )
 
     def test_forfeit_past_deadline_builds_tx(self):
         offer = self._past_offer()
         result = build_forfeit_tx(
-            offer, "aa" * 32, 0, 1_000_000,
-            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+            offer,
+            "aa" * 32,
+            0,
+            1_000_000,
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            1_000,
         )
         assert isinstance(result, ForfeitResult)
         assert result.tx_hex
@@ -423,16 +437,24 @@ class TestBuildForfeitTx:
     def test_forfeit_txid_is_64_hex_chars(self):
         offer = self._past_offer()
         result = build_forfeit_tx(
-            offer, "aa" * 32, 0, 1_000_000,
-            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+            offer,
+            "aa" * 32,
+            0,
+            1_000_000,
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            1_000,
         )
         assert len(result.txid) == 64
 
     def test_forfeit_output_photons_correct(self):
         offer = self._past_offer()
         result = build_forfeit_tx(
-            offer, "aa" * 32, 0, 1_000_000,
-            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+            offer,
+            "aa" * 32,
+            0,
+            1_000_000,
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            1_000,
         )
         assert result.output_photons == 999_000
         assert result.fee_sats == 1_000
@@ -441,16 +463,24 @@ class TestBuildForfeitTx:
         offer = self._past_offer()
         with pytest.raises(ValidationError, match="fee"):
             build_forfeit_tx(
-                offer, "aa" * 32, 0, 500,
-                "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+                offer,
+                "aa" * 32,
+                0,
+                500,
+                "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+                1_000,
             )
 
     def test_forfeit_locktime_equals_claim_deadline(self):
         """Last 4 bytes of the raw tx = nLockTime = claim_deadline."""
         offer = self._past_offer()
         result = build_forfeit_tx(
-            offer, "aa" * 32, 0, 1_000_000,
-            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+            offer,
+            "aa" * 32,
+            0,
+            1_000_000,
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            1_000,
         )
         raw = bytes.fromhex(result.tx_hex)
         locktime = int.from_bytes(raw[-4:], "little")
@@ -460,8 +490,12 @@ class TestBuildForfeitTx:
         """Input sequence must be 0xFFFFFFFE (< 0xFFFFFFFF) for CLTV."""
         offer = self._past_offer()
         result = build_forfeit_tx(
-            offer, "aa" * 32, 0, 1_000_000,
-            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+            offer,
+            "aa" * 32,
+            0,
+            1_000_000,
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            1_000,
         )
         raw = bytes.fromhex(result.tx_hex)
         # 0xFFFFFFFE as little-endian 4 bytes
@@ -470,8 +504,12 @@ class TestBuildForfeitTx:
     def test_forfeit_tx_version_is_2(self):
         offer = self._past_offer()
         result = build_forfeit_tx(
-            offer, "aa" * 32, 0, 1_000_000,
-            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+            offer,
+            "aa" * 32,
+            0,
+            1_000_000,
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            1_000,
         )
         raw = bytes.fromhex(result.tx_hex)
         version = int.from_bytes(raw[:4], "little")
@@ -481,8 +519,12 @@ class TestBuildForfeitTx:
         """scriptSig must start with OP_1 (0x51)."""
         offer = self._past_offer()
         result = build_forfeit_tx(
-            offer, "aa" * 32, 0, 1_000_000,
-            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+            offer,
+            "aa" * 32,
+            0,
+            1_000_000,
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            1_000,
         )
         raw = bytes.fromhex(result.tx_hex)
         # version(4) + varint(1 input)(1) + prevhash(32) + vout(4) + scriptsig_len(varint)
@@ -497,8 +539,12 @@ class TestBuildForfeitTx:
         offer = self._past_offer()
         with pytest.raises(ValidationError):
             build_forfeit_tx(
-                offer, "aa" * 32, 0, 1_000_000,
-                "not-valid!!!", 1_000,
+                offer,
+                "aa" * 32,
+                0,
+                1_000_000,
+                "not-valid!!!",
+                1_000,
             )
 
     def test_forfeit_txid_is_hash256_of_raw(self):
@@ -506,8 +552,12 @@ class TestBuildForfeitTx:
 
         offer = self._past_offer()
         result = build_forfeit_tx(
-            offer, "aa" * 32, 0, 1_000_000,
-            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH", 1_000,
+            offer,
+            "aa" * 32,
+            0,
+            1_000_000,
+            "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            1_000,
         )
         raw = bytes.fromhex(result.tx_hex)
         h1 = hashlib.sha256(raw).digest()
@@ -520,6 +570,7 @@ class TestBuildForfeitTx:
 # build_claim_tx tests (structural only — signing requires coincurve)
 # ---------------------------------------------------------------------------
 
+
 class TestBuildClaimTx:
     """
     Structural tests for build_claim_tx.
@@ -528,8 +579,7 @@ class TestBuildClaimTx:
     available.  Here we verify input validation guards.
     """
 
-    def _make_privkey(self) -> "PrivateKeyMaterial":
-        from pyrxd.security.secrets import PrivateKeyMaterial
+    def _make_privkey(self) -> PrivateKeyMaterial:
         # secp256k1 scalar = 1 (minimal valid key)
         return PrivateKeyMaterial(b"\x00" * 31 + b"\x01")
 
@@ -622,6 +672,7 @@ class TestBuildClaimTx:
 
     def test_claim_txid_is_hash256_of_raw(self):
         import hashlib
+
         from pyrxd.gravity import build_claim_tx
 
         offer = _make_gravity_offer()
@@ -671,6 +722,7 @@ class TestBuildClaimTx:
         )
         # Now tamper with claimed_redeem_hex via dataclass replace
         from dataclasses import replace as dc_replace
+
         tampered = dc_replace(offer, claimed_redeem_hex="cc" * 100)
 
         with pytest.raises(ValidationError, match="expected_code_hash_hex"):
@@ -688,6 +740,7 @@ class TestBuildClaimTx:
 # ---------------------------------------------------------------------------
 # Module import test
 # ---------------------------------------------------------------------------
+
 
 class TestGravityModuleImports:
     def test_all_public_symbols_importable(self):

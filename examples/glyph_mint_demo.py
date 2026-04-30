@@ -38,8 +38,7 @@ from pyrxd.glyph import GlyphBuilder, GlyphMetadata, GlyphProtocol
 from pyrxd.hash import sha256
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
-from pyrxd.script.type import P2PKH
-from pyrxd.script.type import to_unlock_script_template
+from pyrxd.script.type import P2PKH, to_unlock_script_template
 from pyrxd.transaction.transaction import Transaction, TransactionInput, TransactionOutput
 
 # ---------------------------------------------------------------------------
@@ -47,20 +46,18 @@ from pyrxd.transaction.transaction import Transaction, TransactionInput, Transac
 # ---------------------------------------------------------------------------
 
 DRY_RUN: bool = os.environ.get("DRY_RUN", "1") != "0"
-ELECTRUMX_URL: str = os.environ.get(
-    "ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/"
-)
+ELECTRUMX_URL: str = os.environ.get("ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/")
 GLYPH_WIF: str = os.environ.get("GLYPH_WIF", "")
 RESUME_COMMIT_TXID: str = os.environ.get("COMMIT_TXID", "")
 RESUME_COMMIT_VOUT: int = int(os.environ.get("COMMIT_VOUT", "0"))
 RESUME_COMMIT_VALUE: int = int(os.environ.get("COMMIT_VALUE", "0"))
 
 MIN_FEE_RATE = 10_000  # photons/byte
-COMMIT_SIZE = 276       # estimated commit tx bytes
-REVEAL_SIZE = 580       # conservative estimate: 250 base + 165 scriptsig suffix + padding
-COMMIT_DUST = COMMIT_SIZE * MIN_FEE_RATE         # fee to broadcast commit
+COMMIT_SIZE = 276  # estimated commit tx bytes
+REVEAL_SIZE = 580  # conservative estimate: 250 base + 165 scriptsig suffix + padding
+COMMIT_DUST = COMMIT_SIZE * MIN_FEE_RATE  # fee to broadcast commit
 REVEAL_BUDGET = REVEAL_SIZE * MIN_FEE_RATE * 12 // 10 + 546  # reveal fee (20% headroom) + min NFT output
-COMMIT_VALUE = REVEAL_BUDGET + 200_000            # commit output must cover reveal costs
+COMMIT_VALUE = REVEAL_BUDGET + 200_000  # commit output must cover reveal costs
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +70,7 @@ async def electrumx_call(method: str, params: list) -> object:
         req = json.dumps({"id": 1, "method": method, "params": params})
         await ws.send(req)
         resp = json.loads(await ws.recv())
-    if "error" in resp and resp["error"]:
+    if resp.get("error"):
         raise RuntimeError(f"ElectrumX error: {resp['error']}")
     return resp.get("result")
 
@@ -82,7 +79,7 @@ async def fetch_utxos(address: str) -> list:
     script = P2PKH().lock(address)
     script_bytes = script.serialize()
     script_hash = sha256(script_bytes).hex()
-    reversed_hash = "".join(reversed([script_hash[i:i+2] for i in range(0, len(script_hash), 2)]))
+    reversed_hash = "".join(reversed([script_hash[i : i + 2] for i in range(0, len(script_hash), 2)]))
     return await electrumx_call("blockchain.scripthash.listunspent", [reversed_hash])
 
 
@@ -109,10 +106,8 @@ def glyph_reveal_unlock(private_key: PrivateKey, scriptsig_suffix: bytes):
         pubkey: bytes = private_key.public_key().serialize()
 
         from pyrxd.script.type import encode_pushdata
-        p2pkh_part = (
-            encode_pushdata(signature + sighash.to_bytes(1, "little"))
-            + encode_pushdata(pubkey)
-        )
+
+        p2pkh_part = encode_pushdata(signature + sighash.to_bytes(1, "little")) + encode_pushdata(pubkey)
         return Script(p2pkh_part + scriptsig_suffix)
 
     def estimated_unlocking_byte_length() -> int:
@@ -149,7 +144,10 @@ def build_commit_tx(
         src_out = TransactionOutput(P2PKH().lock(address), utxo["value"])
 
         class _SrcTx:
-            def __init__(self, out): self.outputs = {utxo["tx_pos"]: out}
+            # Default-arg trick binds tx_pos at class-build time so the
+            # closure doesn't capture the loop variable.
+            def __init__(self, out, _tx_pos: int = utxo["tx_pos"]) -> None:
+                self.outputs = {_tx_pos: out}
 
         inp.source_transaction = _SrcTx(src_out)
         inp.source_output_index = utxo["tx_pos"]
@@ -171,6 +169,7 @@ def build_commit_tx(
         ],
     )
     from pyrxd.fee_models import SatoshisPerKilobyte
+
     tx.fee(SatoshisPerKilobyte(MIN_FEE_RATE * 1000))  # SatoshisPerKilobyte takes per-KB
     tx.sign()
     return tx
@@ -259,8 +258,8 @@ async def main() -> None:
     print(f"NFT name: {metadata.name}")
 
     builder = GlyphBuilder()
-    from pyrxd.security.types import Hex20
     from pyrxd.glyph.builder import CommitParams, RevealParams
+    from pyrxd.security.types import Hex20
 
     commit_result = builder.prepare_commit(
         CommitParams(
@@ -283,7 +282,9 @@ async def main() -> None:
         print(f"Resuming from commit txid: {commit_txid}:{commit_vout} ({commit_value} photons)")
         # Try to load saved CBOR from a prior commit phase
         import json as _json
+
         from pyrxd.glyph.script import build_commit_locking_script, hash_payload
+
         try:
             with open("/tmp/glyph_mint_resume.json") as f:
                 saved = _json.load(f)
@@ -292,13 +293,14 @@ async def main() -> None:
                 saved_hash = hash_payload(saved_cbor)
                 saved_script = build_commit_locking_script(saved_hash, Hex20(pkh_bytes))
                 from pyrxd.glyph.builder import CommitResult
+
                 commit_result = CommitResult(
                     commit_script=saved_script,
                     cbor_bytes=saved_cbor,
                     payload_hash=saved_hash,
                     estimated_fee=commit_result.estimated_fee,
                 )
-                print(f"Loaded saved CBOR from /tmp/glyph_mint_resume.json")
+                print("Loaded saved CBOR from /tmp/glyph_mint_resume.json")
                 print(f"Commit script (from saved CBOR): {saved_script.hex()}")
         except FileNotFoundError:
             print("No saved CBOR found — using freshly computed CBOR (MUST match commit!)")
@@ -342,12 +344,13 @@ async def main() -> None:
         }
         with open("/tmp/glyph_mint_resume.json", "w") as f:
             import json as _json
+
             _json.dump(resume_info, f)
-        print(f"Resume info saved to /tmp/glyph_mint_resume.json")
+        print("Resume info saved to /tmp/glyph_mint_resume.json")
 
         if DRY_RUN:
             print("[DRY RUN] Commit tx not broadcast. Set DRY_RUN=0 to broadcast.")
-            print(f"To resume reveal after broadcast:")
+            print("To resume reveal after broadcast:")
             print(f"  COMMIT_TXID={commit_txid} COMMIT_VOUT=0 COMMIT_VALUE={commit_value}")
             print(f"  Or: CBOR_HEX={commit_result.cbor_bytes.hex()}")
             return

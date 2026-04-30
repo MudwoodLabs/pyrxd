@@ -5,12 +5,14 @@ ASERT/linear DAA target computation, and mint-tx scriptSig assembly.
 
 Design reference: glyph-miner/docs/V2_DMINT_DESIGN.md
 """
+
 from __future__ import annotations
 
 import hashlib
 import struct
 from dataclasses import dataclass
 from enum import IntEnum
+from typing import Any
 
 from pyrxd.security.errors import ValidationError
 
@@ -28,24 +30,25 @@ MAX_SHA256D_TARGET = 0x7FFFFFFFFFFFFFFF
 MAX_V2_TARGET_256 = (1 << 256) - 1
 
 # OP_STATESEPARATOR
-_OP_STATESEPARATOR = b'\xbd'
+_OP_STATESEPARATOR = b"\xbd"
 
 
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
 
+
 class DmintAlgo(IntEnum):
     SHA256D = 0
-    BLAKE3  = 1
-    K12     = 2
+    BLAKE3 = 1
+    K12 = 2
 
 
 class DaaMode(IntEnum):
-    FIXED    = 0
-    EPOCH    = 1
-    ASERT    = 2
-    LWMA     = 3
+    FIXED = 0
+    EPOCH = 1
+    ASERT = 2
+    LWMA = 3
     SCHEDULE = 4
 
 
@@ -53,12 +56,13 @@ class DaaMode(IntEnum):
 # Minimal-push helpers (mirrors Photonic Wallet `pushMinimal` in script.ts)
 # ---------------------------------------------------------------------------
 
+
 def _push_minimal(n: int) -> bytes:
     """Encode integer n using Bitcoin script minimal push encoding."""
     if n == 0:
-        return b'\x00'         # OP_0
+        return b"\x00"  # OP_0
     if n == -1:
-        return b'\x4f'         # OP_1NEGATE
+        return b"\x4f"  # OP_1NEGATE
     if 1 <= n <= 16:
         return bytes([0x50 + n])  # OP_1 .. OP_16
     # General case: little-endian with sign bit.
@@ -75,16 +79,16 @@ def _push_minimal(n: int) -> bytes:
     payload = bytes(result)
     # Prefix with length byte (PUSHDATA1 if needed)
     length = len(payload)
-    if length < 0x4c:
+    if length < 0x4C:
         return bytes([length]) + payload
     if length <= 0xFF:
-        return b'\x4c' + bytes([length]) + payload
+        return b"\x4c" + bytes([length]) + payload
     raise ValidationError(f"pushMinimal: number too large: {n}")
 
 
 def _push_4bytes_le(n: int) -> bytes:
     """Encode n as a 4-byte little-endian push (push opcode + 4 bytes)."""
-    return b'\x04' + struct.pack('<I', n)
+    return b"\x04" + struct.pack("<I", n)
 
 
 # ---------------------------------------------------------------------------
@@ -97,49 +101,49 @@ def _push_4bytes_le(n: int) -> bytes:
 # inputOutputPickIndex = 10 + 3 = 13 → pushMinimal(13) = 0x5d (OP_13)
 # nonceRollIndex       = 10 + 4 = 14 → pushMinimal(14) = 0x5e (OP_14)
 _PART_A = bytes.fromhex(
-    '51'      # OP_1
-    '75'      # OP_DROP
-    'c8'      # OP_OUTPOINTTXHASH
-    '59'      # pushMinimal(9) = OP_9
-    '79'      # OP_PICK
-    '7e'      # OP_CAT
-    'a8'      # OP_SHA256
-    '5d'      # pushMinimal(13) = OP_13
-    '79'      # OP_PICK
-    '5d'      # pushMinimal(13) = OP_13
-    '79'      # OP_PICK
-    '7e'      # OP_CAT
-    'a8'      # OP_SHA256
-    '7e'      # OP_CAT
-    '5e'      # pushMinimal(14) = OP_14
-    '7a'      # OP_ROLL
-    '7e'      # OP_CAT
+    "51"  # OP_1
+    "75"  # OP_DROP
+    "c8"  # OP_OUTPOINTTXHASH
+    "59"  # pushMinimal(9) = OP_9
+    "79"  # OP_PICK
+    "7e"  # OP_CAT
+    "a8"  # OP_SHA256
+    "5d"  # pushMinimal(13) = OP_13
+    "79"  # OP_PICK
+    "5d"  # pushMinimal(13) = OP_13
+    "79"  # OP_PICK
+    "7e"  # OP_CAT
+    "a8"  # OP_SHA256
+    "7e"  # OP_CAT
+    "5e"  # pushMinimal(14) = OP_14
+    "7a"  # OP_ROLL
+    "7e"  # OP_CAT
 )
 
 # Part B.1: PoW hash extraction (shared by all modes)
-_PART_B1 = bytes.fromhex('bc01147f77587f040000000088817600a269')
+_PART_B1 = bytes.fromhex("bc01147f77587f040000000088817600a269")
 
 # Part B.2: target comparison (V2 preserves target for DAA)
-_PART_B2 = bytes.fromhex('51797ca269')
+_PART_B2 = bytes.fromhex("51797ca269")
 
 # Part B.4: drop 5 V2 extras (new_target, lastTime, targetTime, daaMode, algoId)
-_PART_B4 = bytes.fromhex('7575757575')
+_PART_B4 = bytes.fromhex("7575757575")
 
 # Part C: output validation (identical to V1 — code script continuity + token reward + height checks)
 _PART_C = bytes.fromhex(
-    'a269577ae500a069567ae600a06901d053797e0c'
-    'dec0e9aa76e378e4a269e69d7eaa76e47b9d547a'
-    '818b76537a9c537ade789181547ae6939d635279'
-    'cd01d853797e016a7e886778de519d547854807e'
-    'c0eb557f777e5379ec78885379eac0e9885379cc'
-    '519d75686d7551'
+    "a269577ae500a069567ae600a06901d053797e0c"
+    "dec0e9aa76e378e4a269e69d7eaa76e47b9d547a"
+    "818b76537a9c537ade789181547ae6939d635279"
+    "cd01d853797e016a7e886778de519d547854807e"
+    "c0eb557f777e5379ec78885379eac0e9885379cc"
+    "519d75686d7551"
 )
 
 # PoW hash opcodes per algorithm
 _POW_HASH_OP: dict[DmintAlgo, bytes] = {
-    DmintAlgo.SHA256D: b'\xaa',  # OP_HASH256
-    DmintAlgo.BLAKE3:  b'\xee',  # OP_BLAKE3
-    DmintAlgo.K12:     b'\xef',  # OP_K12
+    DmintAlgo.SHA256D: b"\xaa",  # OP_HASH256
+    DmintAlgo.BLAKE3: b"\xee",  # OP_BLAKE3
+    DmintAlgo.K12: b"\xef",  # OP_K12
 }
 
 
@@ -147,72 +151,71 @@ _POW_HASH_OP: dict[DmintAlgo, bytes] = {
 # DAA bytecode builders
 # ---------------------------------------------------------------------------
 
+
 def _build_asert_daa(half_life: int) -> bytes:
     """ASERT-lite DAA bytecode (§4.5). half_life embedded as constant."""
     half_life_push = _push_minimal(half_life)
     # Entry: [target, lastTime, targetTime, daaMode, ...]
     return (
         # Step 1: currentTime = OP_TXLOCKTIME
-        b'\xc5'                  # OP_TXLOCKTIME
+        b"\xc5"  # OP_TXLOCKTIME
         # Step 2: time_delta = currentTime - lastTime
-        b'\x52\x79'              # OP_2 OP_PICK
-        b'\x94'                  # OP_SUB
+        b"\x52\x79"  # OP_2 OP_PICK
+        b"\x94"  # OP_SUB
         # Step 3: excess = time_delta - targetTime
-        b'\x53\x79'              # OP_3 OP_PICK
-        b'\x94'                  # OP_SUB
-        # Step 4: drift = excess / halfLife
-        + half_life_push
-        + b'\x96'                # OP_DIV
+        b"\x53\x79"  # OP_3 OP_PICK
+        b"\x94" + half_life_push + b"\x96"  # OP_SUB
+        # Step 4: drift = excess / halfLife  # OP_DIV
         # Step 5: clamp drift to [-4, +4]
-        b'\x76\x54\xa0'          # DUP OP_4 OP_GREATERTHAN
-        b'\x63'                  # OP_IF
-        b'\x75\x54'              #   OP_DROP OP_4
-        b'\x68'                  # OP_ENDIF
-        b'\x76\x54\x81\x9f'     # DUP OP_4 OP_NEGATE OP_LESSTHAN
-        b'\x63'                  # OP_IF
-        b'\x75\x54\x81'         #   OP_DROP OP_4 OP_NEGATE
-        b'\x68'                  # OP_ENDIF
+        b"\x76\x54\xa0"  # DUP OP_4 OP_GREATERTHAN
+        b"\x63"  # OP_IF
+        b"\x75\x54"  #   OP_DROP OP_4
+        b"\x68"  # OP_ENDIF
+        b"\x76\x54\x81\x9f"  # DUP OP_4 OP_NEGATE OP_LESSTHAN
+        b"\x63"  # OP_IF
+        b"\x75\x54\x81"  #   OP_DROP OP_4 OP_NEGATE
+        b"\x68"  # OP_ENDIF
         # Step 6: apply shift
-        b'\x76\x00\xa0'          # DUP OP_0 OP_GREATERTHAN
-        b'\x63'                  # OP_IF (drift > 0 → LSHIFT)
-        b'\x98'                  #   OP_LSHIFT
-        b'\x67'                  # OP_ELSE
-        b'\x76\x00\x9f'         #   DUP OP_0 OP_LESSTHAN
-        b'\x63'                  #   OP_IF (drift < 0 → RSHIFT)
-        b'\x81\x99'              #     OP_NEGATE OP_RSHIFT
-        b'\x67'                  #   OP_ELSE (drift == 0)
-        b'\x75'                  #     OP_DROP
-        b'\x68'                  #   OP_ENDIF
-        b'\x68'                  # OP_ENDIF
+        b"\x76\x00\xa0"  # DUP OP_0 OP_GREATERTHAN
+        b"\x63"  # OP_IF (drift > 0 → LSHIFT)
+        b"\x98"  #   OP_LSHIFT
+        b"\x67"  # OP_ELSE
+        b"\x76\x00\x9f"  #   DUP OP_0 OP_LESSTHAN
+        b"\x63"  #   OP_IF (drift < 0 → RSHIFT)
+        b"\x81\x99"  #     OP_NEGATE OP_RSHIFT
+        b"\x67"  #   OP_ELSE (drift == 0)
+        b"\x75"  #     OP_DROP
+        b"\x68"  #   OP_ENDIF
+        b"\x68"  # OP_ENDIF
         # Step 7: clamp target to minimum 1
-        b'\x76\x51\x9f'         # DUP OP_1 OP_LESSTHAN
-        b'\x63'                  # OP_IF
-        b'\x75\x51'              #   OP_DROP OP_1
-        b'\x68'                  # OP_ENDIF
+        b"\x76\x51\x9f"  # DUP OP_1 OP_LESSTHAN
+        b"\x63"  # OP_IF
+        b"\x75\x51"  #   OP_DROP OP_1
+        b"\x68"  # OP_ENDIF
     )
 
 
 def _build_linear_daa() -> bytes:
     """Linear DAA bytecode (§4.6). new_target = old_target * time_delta / targetTime."""
     return (
-        b'\xc5'                  # OP_TXLOCKTIME → currentTime
-        b'\x52\x79'              # OP_2 OP_PICK lastTime
-        b'\x94'                  # OP_SUB → time_delta
-        b'\x7c'                  # OP_SWAP
-        b'\x95'                  # OP_MUL
-        b'\x53\x79'              # OP_3 OP_PICK targetTime
-        b'\x96'                  # OP_DIV → new_target
+        b"\xc5"  # OP_TXLOCKTIME → currentTime
+        b"\x52\x79"  # OP_2 OP_PICK lastTime
+        b"\x94"  # OP_SUB → time_delta
+        b"\x7c"  # OP_SWAP
+        b"\x95"  # OP_MUL
+        b"\x53\x79"  # OP_3 OP_PICK targetTime
+        b"\x96"  # OP_DIV → new_target
         # Clamp to minimum 1
-        b'\x76\x51\x9f'
-        b'\x63'
-        b'\x75\x51'
-        b'\x68'
+        b"\x76\x51\x9f"
+        b"\x63"
+        b"\x75\x51"
+        b"\x68"
     )
 
 
 def _build_part_b(daa_mode: DaaMode, half_life: int) -> bytes:
     if daa_mode == DaaMode.FIXED:
-        daa_bytes = b''  # fixed difficulty — no DAA bytecode
+        daa_bytes = b""  # fixed difficulty — no DAA bytecode
     elif daa_mode == DaaMode.ASERT:
         daa_bytes = _build_asert_daa(half_life)
     elif daa_mode == DaaMode.LWMA:
@@ -237,21 +240,22 @@ def _build_part_b(daa_mode: DaaMode, half_life: int) -> bytes:
 # State script + full contract script
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class DmintDeployParams:
     """Parameters for deploying a V2 dMint contract."""
 
-    contract_ref: GlyphRef     # singleton ref (will become contractRef in state)
-    token_ref: GlyphRef        # normal ref (will become tokenRef in state)
-    max_height: int            # maximum number of mints
-    reward: int                # photons per mint
-    difficulty: int            # initial difficulty → determines initial target
+    contract_ref: GlyphRef  # singleton ref (will become contractRef in state)
+    token_ref: GlyphRef  # normal ref (will become tokenRef in state)
+    max_height: int  # maximum number of mints
+    reward: int  # photons per mint
+    difficulty: int  # initial difficulty → determines initial target
     algo: DmintAlgo = DmintAlgo.SHA256D
     daa_mode: DaaMode = DaaMode.FIXED
-    target_time: int = 60      # seconds between mints (for DAA modes)
-    half_life: int = 3600      # ASERT half-life in seconds
-    height: int = 0            # current mint height (0 at deploy)
-    last_time: int = 0         # timestamp of last mint (0 at deploy)
+    target_time: int = 60  # seconds between mints (for DAA modes)
+    half_life: int = 3600  # ASERT half-life in seconds
+    height: int = 0  # current mint height (0 at deploy)
+    last_time: int = 0  # timestamp of last mint (0 at deploy)
 
     def __post_init__(self) -> None:
         if self.max_height < 1:
@@ -288,8 +292,10 @@ def build_dmint_state_script(params: DmintDeployParams) -> bytes:
     target = params.initial_target
     return (
         _push_4bytes_le(params.height)
-        + b'\xd8' + params.contract_ref.to_bytes()
-        + b'\xd0' + params.token_ref.to_bytes()
+        + b"\xd8"
+        + params.contract_ref.to_bytes()
+        + b"\xd0"
+        + params.token_ref.to_bytes()
         + _push_minimal(params.max_height)
         + _push_minimal(params.reward)
         + _push_minimal(int(params.algo))
@@ -309,16 +315,13 @@ def build_dmint_code_script(params: DmintDeployParams) -> bytes:
 
 def build_dmint_contract_script(params: DmintDeployParams) -> bytes:
     """Build the full V2 dMint output script: state + OP_STATESEPARATOR + code."""
-    return (
-        build_dmint_state_script(params)
-        + _OP_STATESEPARATOR
-        + build_dmint_code_script(params)
-    )
+    return build_dmint_state_script(params) + _OP_STATESEPARATOR + build_dmint_code_script(params)
 
 
 # ---------------------------------------------------------------------------
 # PoW preimage (same structure as V1 — §2.5 / Appendix B)
 # ---------------------------------------------------------------------------
+
 
 def build_pow_preimage(
     txid_le: bytes,
@@ -358,6 +361,7 @@ def build_pow_preimage(
 # Mint scriptSig builder
 # ---------------------------------------------------------------------------
 
+
 def build_mint_scriptsig(nonce: bytes, preimage: bytes) -> bytes:
     """Build the scriptSig a miner includes in the contract-spend input.
 
@@ -374,16 +378,20 @@ def build_mint_scriptsig(nonce: bytes, preimage: bytes) -> bytes:
     # Push nonce (8 bytes), then two 32-byte pushes (first/second half of preimage),
     # then OP_0 (padding for scriptSig structure).
     return (
-        b'\x08' + nonce             # PUSH 8 + nonce
-        + b'\x20' + preimage[:32]   # PUSH 32 + inputHash half
-        + b'\x20' + preimage[32:]   # PUSH 32 + outputHash half
-        + b'\x00'                   # OP_0
+        b"\x08"
+        + nonce  # PUSH 8 + nonce
+        + b"\x20"
+        + preimage[:32]  # PUSH 32 + inputHash half
+        + b"\x20"
+        + preimage[32:]  # PUSH 32 + outputHash half
+        + b"\x00"  # OP_0
     )
 
 
 # ---------------------------------------------------------------------------
 # DAA target computation (off-chain mirror of on-chain formula)
 # ---------------------------------------------------------------------------
+
 
 def compute_next_target_asert(
     current_target: int,
@@ -431,6 +439,7 @@ def compute_next_target_linear(
 # Difficulty ↔ target conversion
 # ---------------------------------------------------------------------------
 
+
 def difficulty_to_target(difficulty: int, algo: DmintAlgo = DmintAlgo.SHA256D) -> int:
     """Convert difficulty to PoW target."""
     if difficulty < 1:
@@ -453,6 +462,7 @@ def target_to_difficulty(target: int, algo: DmintAlgo = DmintAlgo.SHA256D) -> in
 # Solution verification (CPU side)
 # ---------------------------------------------------------------------------
 
+
 def verify_sha256d_solution(preimage: bytes, nonce: bytes, target: int) -> bool:
     """Verify a SHA256d PoW solution.
 
@@ -466,15 +476,16 @@ def verify_sha256d_solution(preimage: bytes, nonce: bytes, target: int) -> bool:
         return False
     effective_target = min(target, MAX_SHA256D_TARGET)
     full = hashlib.sha256(hashlib.sha256(preimage + nonce).digest()).digest()
-    if full[:4] != b'\x00\x00\x00\x00':
+    if full[:4] != b"\x00\x00\x00\x00":
         return False
-    value = int.from_bytes(full[4:12], 'big')
+    value = int.from_bytes(full[4:12], "big")
     return value < effective_target
 
 
 # ---------------------------------------------------------------------------
 # V2 state script parser (for reading on-chain UTXO state)
 # ---------------------------------------------------------------------------
+
 
 def _parse_script_int(data: bytes, pos: int) -> tuple[int, int]:
     """Parse a Bitcoin script-encoded integer at ``pos``, returning (value, new_pos).
@@ -489,26 +500,24 @@ def _parse_script_int(data: bytes, pos: int) -> tuple[int, int]:
     * ``0x4c <length> <data>``    → PUSHDATA1
     """
     if pos >= len(data):
-        raise ValidationError(
-            f"DmintState.from_script: unexpected end of script at position {pos}"
-        )
+        raise ValidationError(f"DmintState.from_script: unexpected end of script at position {pos}")
     op = data[pos]
     # OP_0
     if op == 0x00:
         return 0, pos + 1
     # OP_1NEGATE
-    if op == 0x4f:
+    if op == 0x4F:
         return -1, pos + 1
     # OP_1 .. OP_16
     if 0x51 <= op <= 0x60:
         return op - 0x50, pos + 1
     # PUSHDATA1
-    if op == 0x4c:
+    if op == 0x4C:
         if pos + 1 >= len(data):
             raise ValidationError("DmintState.from_script: PUSHDATA1 length byte missing")
         n = data[pos + 1]
         start = pos + 2
-        raw = data[start: start + n]
+        raw = data[start : start + n]
         if len(raw) != n:
             raise ValidationError(f"DmintState.from_script: PUSHDATA1 underrun: need {n}, got {len(raw)}")
         return _decode_script_le_int(raw), start + n
@@ -516,20 +525,18 @@ def _parse_script_int(data: bytes, pos: int) -> tuple[int, int]:
     if 1 <= op <= 75:
         n = op
         start = pos + 1
-        raw = data[start: start + n]
+        raw = data[start : start + n]
         if len(raw) != n:
             raise ValidationError(f"DmintState.from_script: direct push underrun: need {n}, got {len(raw)}")
         return _decode_script_le_int(raw), start + n
-    raise ValidationError(
-        f"DmintState.from_script: unrecognised opcode 0x{op:02x} at pos {pos}"
-    )
+    raise ValidationError(f"DmintState.from_script: unrecognised opcode 0x{op:02x} at pos {pos}")
 
 
 def _decode_script_le_int(raw: bytes) -> int:
     """Decode a Bitcoin script integer from little-endian bytes (with sign bit)."""
     if not raw:
         return 0
-    result = int.from_bytes(raw, 'little')
+    result = int.from_bytes(raw, "little")
     # High bit of last byte is the sign bit.
     if raw[-1] & 0x80:
         # Clear sign bit and negate.
@@ -558,7 +565,7 @@ class DmintState:
         return self.height >= self.max_height
 
     @classmethod
-    def from_script(cls, script_bytes: bytes) -> "DmintState":
+    def from_script(cls, script_bytes: bytes) -> DmintState:
         """Parse a dMint contract UTXO script into a ``DmintState``.
 
         Walks the 10 state pushes in declared order, then verifies that the
@@ -600,44 +607,31 @@ class DmintState:
         # --- Item 0: height (always _push_4bytes_le → opcode 0x04 + 4 bytes LE)
         if pos >= len(script_bytes) or script_bytes[pos] != 0x04:
             if pos >= len(script_bytes):
-                raise ValidationError(
-                    "DmintState.from_script: script too short for height"
-                )
+                raise ValidationError("DmintState.from_script: script too short for height")
             raise ValidationError(
-                f"DmintState.from_script: expected 0x04 (push-4) at pos {pos} for height, "
-                f"got 0x{script_bytes[pos]:02x}"
+                f"DmintState.from_script: expected 0x04 (push-4) at pos {pos} for height, got 0x{script_bytes[pos]:02x}"
             )
         if pos + 5 > len(script_bytes):
-            raise ValidationError(
-                "DmintState.from_script: script truncated inside height"
-            )
-        height = struct.unpack('<I', script_bytes[pos + 1: pos + 5])[0]
+            raise ValidationError("DmintState.from_script: script truncated inside height")
+        height = struct.unpack("<I", script_bytes[pos + 1 : pos + 5])[0]
         pos += 5
 
         # --- Item 1: contractRef (0xd8 + 36 bytes wire ref)
-        if pos >= len(script_bytes) or script_bytes[pos] != 0xd8:
-            raise ValidationError(
-                f"DmintState.from_script: expected 0xd8 (OP_PUSHINPUTREFSINGLETON) at pos {pos}"
-            )
+        if pos >= len(script_bytes) or script_bytes[pos] != 0xD8:
+            raise ValidationError(f"DmintState.from_script: expected 0xd8 (OP_PUSHINPUTREFSINGLETON) at pos {pos}")
         pos += 1
         if pos + 36 > len(script_bytes):
-            raise ValidationError(
-                "DmintState.from_script: script truncated inside contractRef"
-            )
-        contract_ref = GlyphRef.from_bytes(script_bytes[pos: pos + 36])
+            raise ValidationError("DmintState.from_script: script truncated inside contractRef")
+        contract_ref = GlyphRef.from_bytes(script_bytes[pos : pos + 36])
         pos += 36
 
         # --- Item 2: tokenRef (0xd0 + 36 bytes wire ref)
-        if pos >= len(script_bytes) or script_bytes[pos] != 0xd0:
-            raise ValidationError(
-                f"DmintState.from_script: expected 0xd0 (OP_PUSHINPUTREF) at pos {pos}"
-            )
+        if pos >= len(script_bytes) or script_bytes[pos] != 0xD0:
+            raise ValidationError(f"DmintState.from_script: expected 0xd0 (OP_PUSHINPUTREF) at pos {pos}")
         pos += 1
         if pos + 36 > len(script_bytes):
-            raise ValidationError(
-                "DmintState.from_script: script truncated inside tokenRef"
-            )
-        token_ref = GlyphRef.from_bytes(script_bytes[pos: pos + 36])
+            raise ValidationError("DmintState.from_script: script truncated inside tokenRef")
+        token_ref = GlyphRef.from_bytes(script_bytes[pos : pos + 36])
         pos += 36
 
         # --- Items 3–7: variable-length script integers
@@ -649,14 +643,10 @@ class DmintState:
 
         # --- Item 8: lastTime (always _push_4bytes_le → opcode 0x04 + 4 bytes LE)
         if pos >= len(script_bytes) or script_bytes[pos] != 0x04:
-            raise ValidationError(
-                f"DmintState.from_script: expected 0x04 (push-4) at pos {pos} for lastTime"
-            )
+            raise ValidationError(f"DmintState.from_script: expected 0x04 (push-4) at pos {pos} for lastTime")
         if pos + 5 > len(script_bytes):
-            raise ValidationError(
-                "DmintState.from_script: script truncated inside lastTime"
-            )
-        last_time = struct.unpack('<I', script_bytes[pos + 1: pos + 5])[0]
+            raise ValidationError("DmintState.from_script: script truncated inside lastTime")
+        last_time = struct.unpack("<I", script_bytes[pos + 1 : pos + 5])[0]
         pos += 5
 
         # --- Item 9: target (variable length — large for 256-bit algos)
@@ -669,9 +659,7 @@ class DmintState:
         # state layout first we land on the actual separator position
         # by construction.
         if pos >= len(script_bytes):
-            raise ValidationError(
-                "DmintState.from_script: script ended before OP_STATESEPARATOR"
-            )
+            raise ValidationError("DmintState.from_script: script ended before OP_STATESEPARATOR")
         if script_bytes[pos] != _OP_STATESEPARATOR[0]:
             raise ValidationError(
                 f"DmintState.from_script: expected OP_STATESEPARATOR (0xbd) "
@@ -681,15 +669,11 @@ class DmintState:
         try:
             algo = DmintAlgo(algo_id)
         except ValueError:
-            raise ValidationError(
-                f"DmintState.from_script: unknown algo id {algo_id}"
-            )
+            raise ValidationError(f"DmintState.from_script: unknown algo id {algo_id}")
         try:
             daa_mode = DaaMode(daa_id)
         except ValueError:
-            raise ValidationError(
-                f"DmintState.from_script: unknown daa_mode id {daa_id}"
-            )
+            raise ValidationError(f"DmintState.from_script: unknown daa_mode id {daa_id}")
 
         return cls(
             height=height,
@@ -709,6 +693,7 @@ class DmintState:
 # CBOR payload object — embedded in GlyphMetadata as "dmint" key (V2 spec §8)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class DmintCborPayload:
     """The ``dmint`` object embedded in Glyph V2 token metadata CBOR.
@@ -719,16 +704,16 @@ class DmintCborPayload:
     Field names mirror Photonic Wallet ``DmintPayload`` type in types.ts.
     """
 
-    algo: DmintAlgo              # 0=sha256d, 1=blake3, 2=k12
-    num_contracts: int           # number of parallel mining contract UTXOs
-    max_height: int              # total mints allowed
-    reward: int                  # photons per mint
-    premine: int                 # photons pre-minted to deployer (0 if none)
-    diff: int                    # initial difficulty (1 = easiest)
+    algo: DmintAlgo  # 0=sha256d, 1=blake3, 2=k12
+    num_contracts: int  # number of parallel mining contract UTXOs
+    max_height: int  # total mints allowed
+    reward: int  # photons per mint
+    premine: int  # photons pre-minted to deployer (0 if none)
+    diff: int  # initial difficulty (1 = easiest)
     daa_mode: DaaMode = DaaMode.FIXED
     target_block_time: int = 60  # seconds between mints (ignored for FIXED)
-    half_life: int = 0           # ASERT half-life seconds (0 = N/A)
-    window_size: int = 0         # LWMA window size (0 = N/A)
+    half_life: int = 0  # ASERT half-life seconds (0 = N/A)
+    window_size: int = 0  # LWMA window size (0 = N/A)
 
     def __post_init__(self) -> None:
         if self.num_contracts < 1:
@@ -765,7 +750,7 @@ class DmintCborPayload:
         return d
 
     @classmethod
-    def from_cbor_dict(cls, d: dict) -> "DmintCborPayload":
+    def from_cbor_dict(cls, d: dict) -> DmintCborPayload:
         """Parse the ``dmint`` CBOR value from an on-chain payload."""
         try:
             algo = DmintAlgo(int(d["algo"]))
@@ -802,6 +787,7 @@ class DmintCborPayload:
 # Contract UTXO descriptor (for build_dmint_mint_tx)
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class DmintContractUtxo:
     """Describes a live dMint contract UTXO to be spent in a mint transaction.
@@ -818,12 +804,13 @@ class DmintContractUtxo:
     vout: int
     value: int
     script: bytes
-    state: "DmintState"
+    state: DmintState
 
 
 # ---------------------------------------------------------------------------
 # dMint mint transaction builder
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class DmintMintResult:
@@ -846,8 +833,8 @@ class DmintMintResult:
        signing path.  See docstring of :func:`build_dmint_mint_tx` for details.
     """
 
-    tx: "Any"
-    updated_state: "DmintState"
+    tx: Any
+    updated_state: DmintState
     contract_script: bytes
     reward_script: bytes
     fee: int
@@ -920,9 +907,7 @@ def build_dmint_mint_tx(
     state = contract_utxo.state
 
     if state.is_exhausted:
-        raise ValidationError(
-            f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
-        )
+        raise ValidationError(f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}")
     if len(nonce) != 8:
         raise ValidationError(f"nonce must be 8 bytes, got {len(nonce)}")
     if len(miner_pkh) != 20:
@@ -971,7 +956,7 @@ def build_dmint_mint_tx(
         token_ref=state.token_ref,
         max_height=state.max_height,
         reward=state.reward,
-        difficulty=1,                # dummy — we supply target directly below
+        difficulty=1,  # dummy — we supply target directly below
         algo=state.algo,
         daa_mode=state.daa_mode,
         target_time=state.target_time,
@@ -986,8 +971,10 @@ def build_dmint_mint_tx(
     # Build updated state script directly from updated_state fields.
     new_state_script = (
         _push_4bytes_le(updated_state.height)
-        + b'\xd8' + updated_state.contract_ref.to_bytes()
-        + b'\xd0' + updated_state.token_ref.to_bytes()
+        + b"\xd8"
+        + updated_state.contract_ref.to_bytes()
+        + b"\xd0"
+        + updated_state.token_ref.to_bytes()
         + _push_minimal(updated_state.max_height)
         + _push_minimal(updated_state.reward)
         + _push_minimal(int(updated_state.algo))
@@ -999,7 +986,7 @@ def build_dmint_mint_tx(
     contract_script = new_state_script + _OP_STATESEPARATOR + code_script
 
     # --- Build reward output script (P2PKH) ---
-    reward_script = b'\x76\xa9\x14' + miner_pkh + b'\x88\xac'
+    reward_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
 
     # --- Placeholder scriptSig (nonce + dummy preimage zeros) ---
     # The real preimage requires txid + script hashes which are only available
@@ -1015,15 +1002,20 @@ def build_dmint_mint_tx(
     _reward_script_len = len(reward_script)
     _scriptsig_len = len(placeholder_scriptsig)
     estimated_size = (
-        4                         # version
-        + 1                       # vin count
-        + 36                      # outpoint (txid + vout)
-        + 4                       # sequence
-        + _varint_size(_scriptsig_len) + _scriptsig_len  # scriptsig
-        + 1                       # vout count
-        + 8 + _varint_size(_contract_script_len) + _contract_script_len  # contract out
-        + 8 + _varint_size(_reward_script_len) + _reward_script_len      # reward out
-        + 4                       # locktime
+        4  # version
+        + 1  # vin count
+        + 36  # outpoint (txid + vout)
+        + 4  # sequence
+        + _varint_size(_scriptsig_len)
+        + _scriptsig_len  # scriptsig
+        + 1  # vout count
+        + 8
+        + _varint_size(_contract_script_len)
+        + _contract_script_len  # contract out
+        + 8
+        + _varint_size(_reward_script_len)
+        + _reward_script_len  # reward out
+        + 4  # locktime
     )
     fee = estimated_size * fee_rate
 
@@ -1078,10 +1070,10 @@ def build_dmint_mint_tx(
 
 def _varint_size(n: int) -> int:
     """Return the number of bytes needed to encode ``n`` as a Bitcoin varint."""
-    if n < 0xfd:
+    if n < 0xFD:
         return 1
-    if n <= 0xffff:
+    if n <= 0xFFFF:
         return 3
-    if n <= 0xffffffff:
+    if n <= 0xFFFFFFFF:
         return 5
     return 9

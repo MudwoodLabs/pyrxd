@@ -17,6 +17,7 @@ Security notes
   and never logged.
 * Raw HTTP response bodies are never included in exception messages.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -24,8 +25,8 @@ import hashlib
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, List, Optional, Tuple
-from urllib.parse import urljoin, quote
+from typing import Any
+from urllib.parse import quote, urljoin
 
 import aiohttp
 
@@ -57,9 +58,7 @@ class BtcDataSource(ABC):
         """Return the raw 80-byte block header at *height*."""
 
     @abstractmethod
-    async def get_header_chain(
-        self, start_height: BlockHeight, count: int
-    ) -> List[bytes]:
+    async def get_header_chain(self, start_height: BlockHeight, count: int) -> list[bytes]:
         """Return *count* consecutive 80-byte headers starting at *start_height*."""
 
     @abstractmethod
@@ -67,9 +66,7 @@ class BtcDataSource(ABC):
         """Return raw transaction bytes, enforcing *min_confirmations*."""
 
     @abstractmethod
-    async def get_tx_output_script_type(
-        self, txid: Txid, output_index: int
-    ) -> str:
+    async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
         """Return the output script type: ``p2pkh``, ``p2wpkh``, ``p2sh``, ``p2tr``, or ``unknown``."""
 
     @abstractmethod
@@ -80,16 +77,14 @@ class BtcDataSource(ABC):
         """
 
     @abstractmethod
-    async def get_merkle_proof(
-        self, txid: Txid, height: BlockHeight
-    ) -> Tuple[List[str], int]:
+    async def get_merkle_proof(self, txid: Txid, height: BlockHeight) -> tuple[list[str], int]:
         """Return ``(branch_hashes_hex, leaf_position)`` for *txid* at *height*."""
 
     @abstractmethod
     async def close(self) -> None:
         """Close any underlying connections held by this source."""
 
-    async def __aenter__(self) -> "BtcDataSource":
+    async def __aenter__(self) -> BtcDataSource:
         return self
 
     async def __aexit__(self, *args: object) -> None:
@@ -117,9 +112,7 @@ async def _check_response_size(response: aiohttp.ClientResponse) -> bytes:
     return body
 
 
-async def _get_json(
-    session: aiohttp.ClientSession, url: str
-) -> Any:
+async def _get_json(session: aiohttp.ClientSession, url: str) -> Any:
     """GET *url*, parse JSON, enforce size limit, raise NetworkError on failure."""
     try:
         async with session.get(url) as resp:
@@ -128,9 +121,7 @@ async def _get_json(
                 raise NetworkError(f"HTTP request failed with status {resp.status}")
             content_type = resp.content_type or ""
             if "json" not in content_type and "text" not in content_type:
-                raise NetworkError(
-                    f"Unexpected Content-Type from server: {content_type}"
-                )
+                raise NetworkError(f"Unexpected Content-Type from server: {content_type}")
             try:
                 return json.loads(body)
             except json.JSONDecodeError:
@@ -139,9 +130,7 @@ async def _get_json(
         raise NetworkError("HTTP request failed") from exc
 
 
-async def _get_hex_bytes(
-    session: aiohttp.ClientSession, url: str, expected_len: Optional[int] = None
-) -> bytes:
+async def _get_hex_bytes(session: aiohttp.ClientSession, url: str, expected_len: int | None = None) -> bytes:
     """GET *url*, decode hex body, return raw bytes."""
     try:
         async with session.get(url) as resp:
@@ -153,9 +142,7 @@ async def _get_hex_bytes(
             except (ValueError, UnicodeDecodeError):
                 raise NetworkError("Server returned invalid hex data")
             if expected_len is not None and len(result) != expected_len:
-                raise NetworkError(
-                    f"Expected {expected_len} bytes, got {len(result)}"
-                )
+                raise NetworkError(f"Expected {expected_len} bytes, got {len(result)}")
             return result
     except aiohttp.ClientError as exc:
         raise NetworkError("HTTP request failed") from exc
@@ -175,7 +162,7 @@ class MempoolSpaceSource(BtcDataSource):
 
     def __init__(self, base_url: str = "https://mempool.space/api") -> None:
         self._base_url = base_url.rstrip("/") + "/"
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -237,19 +224,14 @@ class MempoolSpaceSource(BtcDataSource):
         url = self._url(f"block/{block_hash.hex()}/header")
         return await _get_hex_bytes(session, url, expected_len=80)
 
-    async def get_header_chain(
-        self, start_height: BlockHeight, count: int
-    ) -> List[bytes]:
+    async def get_header_chain(self, start_height: BlockHeight, count: int) -> list[bytes]:
         if not isinstance(start_height, BlockHeight):
             start_height = BlockHeight(start_height)
         if count <= 0:
             raise ValidationError("count must be a positive integer")
-        headers: List[bytes] = []
+        headers: list[bytes] = []
         # Fetch headers one at a time (mempool.space doesn't have a batch endpoint).
-        tasks = [
-            self.get_block_header_hex(BlockHeight(int(start_height) + i))
-            for i in range(count)
-        ]
+        tasks = [self.get_block_header_hex(BlockHeight(int(start_height) + i)) for i in range(count)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for res in results:
             if isinstance(res, Exception):
@@ -270,18 +252,14 @@ class MempoolSpaceSource(BtcDataSource):
         confirmed = status.get("confirmed", False)
         block_height = status.get("block_height")
         if not confirmed or block_height is None:
-            raise NetworkError(
-                f"tx has 0 confirmations, required {min_confirmations}"
-            )
+            raise NetworkError(f"tx has 0 confirmations, required {min_confirmations}")
 
         if min_confirmations > 0:
             # To check confirmations we need the tip height.
             tip = await self.get_tip_height()
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
-                raise NetworkError(
-                    f"tx has {confs} confirmations, required {min_confirmations}"
-                )
+                raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
 
         # Fetch raw hex.
         hex_url = self._url(f"tx/{_safe_txid_path(txid)}/hex")
@@ -315,9 +293,7 @@ class MempoolSpaceSource(BtcDataSource):
         except (TypeError, ValueError, ValidationError):
             raise NetworkError("Invalid block_height in tx status response")
 
-    async def get_tx_output_script_type(
-        self, txid: Txid, output_index: int
-    ) -> str:
+    async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         session = await self._get_session()
@@ -339,9 +315,7 @@ class MempoolSpaceSource(BtcDataSource):
         except (KeyError, IndexError, TypeError):
             raise NetworkError("Could not parse output script type from server response")
 
-    async def get_merkle_proof(
-        self, txid: Txid, height: BlockHeight
-    ) -> Tuple[List[str], int]:
+    async def get_merkle_proof(self, txid: Txid, height: BlockHeight) -> tuple[list[str], int]:
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         if not isinstance(height, BlockHeight):
@@ -350,7 +324,7 @@ class MempoolSpaceSource(BtcDataSource):
         url = self._url(f"tx/{_safe_txid_path(txid)}/merkleblock-proof")
         data = await _get_json(session, url)
         try:
-            merkle: List[str] = data["merkle"]
+            merkle: list[str] = data["merkle"]
             pos: int = int(data["pos"])
             return merkle, pos
         except (KeyError, TypeError, ValueError):
@@ -365,7 +339,7 @@ class BlockstreamSource(BtcDataSource):
 
     def __init__(self, base_url: str = "https://blockstream.info/api") -> None:
         self._base_url = base_url.rstrip("/") + "/"
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: aiohttp.ClientSession | None = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
@@ -424,19 +398,14 @@ class BlockstreamSource(BtcDataSource):
         url = self._url(f"block/{block_hash.hex()}/header")
         return await _get_hex_bytes(session, url, expected_len=80)
 
-    async def get_header_chain(
-        self, start_height: BlockHeight, count: int
-    ) -> List[bytes]:
+    async def get_header_chain(self, start_height: BlockHeight, count: int) -> list[bytes]:
         if not isinstance(start_height, BlockHeight):
             start_height = BlockHeight(start_height)
         if count <= 0:
             raise ValidationError("count must be a positive integer")
-        tasks = [
-            self.get_block_header_hex(BlockHeight(int(start_height) + i))
-            for i in range(count)
-        ]
+        tasks = [self.get_block_header_hex(BlockHeight(int(start_height) + i)) for i in range(count)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        headers: List[bytes] = []
+        headers: list[bytes] = []
         for res in results:
             if isinstance(res, Exception):
                 raise NetworkError("Failed to fetch header in chain") from res
@@ -455,17 +424,13 @@ class BlockstreamSource(BtcDataSource):
         confirmed = status.get("confirmed", False)
         block_height = status.get("block_height")
         if not confirmed or block_height is None:
-            raise NetworkError(
-                f"tx has 0 confirmations, required {min_confirmations}"
-            )
+            raise NetworkError(f"tx has 0 confirmations, required {min_confirmations}")
 
         if min_confirmations > 0:
             tip = await self.get_tip_height()
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
-                raise NetworkError(
-                    f"tx has {confs} confirmations, required {min_confirmations}"
-                )
+                raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
 
         hex_url = self._url(f"tx/{_safe_txid_path(txid)}/hex")
         try:
@@ -498,9 +463,7 @@ class BlockstreamSource(BtcDataSource):
         except (TypeError, ValueError, ValidationError):
             raise NetworkError("Invalid block_height in tx status response")
 
-    async def get_tx_output_script_type(
-        self, txid: Txid, output_index: int
-    ) -> str:
+    async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         session = await self._get_session()
@@ -521,9 +484,7 @@ class BlockstreamSource(BtcDataSource):
         except (KeyError, IndexError, TypeError):
             raise NetworkError("Could not parse output script type from server response")
 
-    async def get_merkle_proof(
-        self, txid: Txid, height: BlockHeight
-    ) -> Tuple[List[str], int]:
+    async def get_merkle_proof(self, txid: Txid, height: BlockHeight) -> tuple[list[str], int]:
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         if not isinstance(height, BlockHeight):
@@ -532,7 +493,7 @@ class BlockstreamSource(BtcDataSource):
         url = self._url(f"tx/{_safe_txid_path(txid)}/merkle-proof")
         data = await _get_json(session, url)
         try:
-            merkle: List[str] = data["merkle"]
+            merkle: list[str] = data["merkle"]
             pos: int = int(data["pos"])
             return merkle, pos
         except (KeyError, TypeError, ValueError):
@@ -562,7 +523,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
         self._user = user
         # Store password as SecretBytes to prevent accidental logging.
         self._password = SecretBytes(password.encode())
-        self._session: Optional[aiohttp.ClientSession] = None
+        self._session: aiohttp.ClientSession | None = None
         self._id_counter = 0
 
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -590,9 +551,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
             "params": params,
         }
         try:
-            async with session.post(
-                self._url, json=payload
-            ) as resp:
+            async with session.post(self._url, json=payload) as resp:
                 body = await _check_response_size(resp)
                 if resp.status not in (200, 500):
                     raise NetworkError(f"RPC HTTP error: {resp.status}")
@@ -642,19 +601,14 @@ class BitcoinCoreRpcSource(BtcDataSource):
             raise NetworkError(f"Block header must be 80 bytes, got {len(header)}")
         return header
 
-    async def get_header_chain(
-        self, start_height: BlockHeight, count: int
-    ) -> List[bytes]:
+    async def get_header_chain(self, start_height: BlockHeight, count: int) -> list[bytes]:
         if not isinstance(start_height, BlockHeight):
             start_height = BlockHeight(start_height)
         if count <= 0:
             raise ValidationError("count must be a positive integer")
-        tasks = [
-            self.get_block_header_hex(BlockHeight(int(start_height) + i))
-            for i in range(count)
-        ]
+        tasks = [self.get_block_header_hex(BlockHeight(int(start_height) + i)) for i in range(count)]
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        headers: List[bytes] = []
+        headers: list[bytes] = []
         for res in results:
             if isinstance(res, Exception):
                 raise NetworkError("Failed to fetch header in chain") from res
@@ -670,9 +624,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
             raise NetworkError("Unexpected raw tx response from Bitcoin Core")
         confs = data.get("confirmations", 0)
         if confs < min_confirmations:
-            raise NetworkError(
-                f"tx has {confs} confirmations, required {min_confirmations}"
-            )
+            raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
         hex_str = data.get("hex", "")
         if not isinstance(hex_str, str):
             raise NetworkError("Missing hex field in raw tx response")
@@ -696,9 +648,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
         except (TypeError, ValueError, ValidationError):
             raise NetworkError("Invalid blockheight in getrawtransaction response")
 
-    async def get_tx_output_script_type(
-        self, txid: Txid, output_index: int
-    ) -> str:
+    async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         data = await self._rpc("getrawtransaction", [str(txid), True])
@@ -715,9 +665,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
         except (KeyError, IndexError, TypeError):
             raise NetworkError("Could not parse output script type from Bitcoin Core response")
 
-    async def get_merkle_proof(
-        self, txid: Txid, height: BlockHeight
-    ) -> Tuple[List[str], int]:
+    async def get_merkle_proof(self, txid: Txid, height: BlockHeight) -> tuple[list[str], int]:
         # gettxoutproof returns a hex-encoded merkle block; parsing it fully is
         # out of scope here.  Return a stub that raises unless overridden.
         raise NetworkError(
@@ -748,9 +696,7 @@ class MultiSourceBtcDataSource(BtcDataSource):
         Minimum number of agreeing sources required (default 2).
     """
 
-    def __init__(
-        self, sources: List[BtcDataSource], quorum: int = 2
-    ) -> None:
+    def __init__(self, sources: list[BtcDataSource], quorum: int = 2) -> None:
         if not sources:
             raise ValidationError("MultiSourceBtcDataSource requires at least one source")
         self._sources = sources
@@ -763,33 +709,30 @@ class MultiSourceBtcDataSource(BtcDataSource):
 
     def _check_quorum_possible(self) -> None:
         if len(self._sources) < self._quorum:
-            raise NetworkError(
-                f"Not enough sources: have {len(self._sources)}, need quorum {self._quorum}"
-            )
+            raise NetworkError(f"Not enough sources: have {len(self._sources)}, need quorum {self._quorum}")
 
-    async def _gather_results(self, coro_factory) -> List[Any]:
+    async def _gather_results(self, coro_factory) -> list[Any]:
         """Run coro_factory(source) for all sources concurrently."""
         tasks = [coro_factory(source) for source in self._sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         return list(results)
 
-    def _require_quorum(self, results: List[Any], key_fn) -> Any:
+    def _require_quorum(self, results: list[Any], key_fn) -> Any:
         """Return value agreed on by ≥ quorum sources; raise NetworkError otherwise."""
         counts: dict = {}
         for r in results:
             if isinstance(r, Exception):
                 continue
             k = key_fn(r)
-            counts[k] = counts.get(k, []) + [r]
+            counts[k] = [*counts.get(k, []), r]
 
-        for k, group in counts.items():
+        for group in counts.values():
             if len(group) >= self._quorum:
                 return group[0]
 
         successful = sum(1 for r in results if not isinstance(r, Exception))
         raise NetworkError(
-            f"Source quorum not reached: {successful}/{len(self._sources)} "
-            f"sources responded, quorum is {self._quorum}"
+            f"Source quorum not reached: {successful}/{len(self._sources)} sources responded, quorum is {self._quorum}"
         )
 
     async def get_tip_height(self) -> BlockHeight:
@@ -811,17 +754,14 @@ class MultiSourceBtcDataSource(BtcDataSource):
         results = await self._gather_results(lambda s: s.get_block_header_hex(height))
         return self._require_quorum(results, lambda h: h)
 
-    async def get_header_chain(
-        self, start_height: BlockHeight, count: int
-    ) -> List[bytes]:
+    async def get_header_chain(self, start_height: BlockHeight, count: int) -> list[bytes]:
         if not isinstance(start_height, BlockHeight):
             start_height = BlockHeight(start_height)
         self._check_quorum_possible()
-        results = await self._gather_results(
-            lambda s: s.get_header_chain(start_height, count)
-        )
+        results = await self._gather_results(lambda s: s.get_header_chain(start_height, count))
+
         # Agreement check: compare concatenated bytes.
-        def chain_key(chain: List[bytes]) -> bytes:
+        def chain_key(chain: list[bytes]) -> bytes:
             return b"".join(chain)
 
         return self._require_quorum(results, chain_key)
@@ -830,9 +770,7 @@ class MultiSourceBtcDataSource(BtcDataSource):
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         self._check_quorum_possible()
-        results = await self._gather_results(
-            lambda s: s.get_raw_tx(txid, min_confirmations)
-        )
+        results = await self._gather_results(lambda s: s.get_raw_tx(txid, min_confirmations))
         # Agreement: compare hash256 of the raw bytes.
         return self._require_quorum(results, lambda tx: _hash256(bytes(tx)))
 
@@ -843,26 +781,18 @@ class MultiSourceBtcDataSource(BtcDataSource):
         results = await self._gather_results(lambda s: s.get_tx_block_height(txid))
         return self._require_quorum(results, int)
 
-    async def get_tx_output_script_type(
-        self, txid: Txid, output_index: int
-    ) -> str:
+    async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         self._check_quorum_possible()
-        results = await self._gather_results(
-            lambda s: s.get_tx_output_script_type(txid, output_index)
-        )
+        results = await self._gather_results(lambda s: s.get_tx_output_script_type(txid, output_index))
         return self._require_quorum(results, lambda t: t)
 
-    async def get_merkle_proof(
-        self, txid: Txid, height: BlockHeight
-    ) -> Tuple[List[str], int]:
+    async def get_merkle_proof(self, txid: Txid, height: BlockHeight) -> tuple[list[str], int]:
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         if not isinstance(height, BlockHeight):
             height = BlockHeight(height)
         self._check_quorum_possible()
-        results = await self._gather_results(
-            lambda s: s.get_merkle_proof(txid, height)
-        )
+        results = await self._gather_results(lambda s: s.get_merkle_proof(txid, height))
         return self._require_quorum(results, lambda r: (tuple(r[0]), r[1]))
