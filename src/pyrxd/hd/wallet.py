@@ -55,9 +55,16 @@ from Cryptodome.Cipher import AES
 
 from ..hd.bip32 import Xprv, bip32_derive_xprv_from_mnemonic
 from ..hd.bip39 import seed_from_mnemonic
+from ..keys import PrivateKey
 from ..network.electrumx import UtxoRecord, script_hash_for_address
+from ..script.type import P2PKH
 from ..security.errors import ValidationError
 from ..security.secrets import SecretBytes
+from ..transaction.transaction import Transaction
+from ..transaction.transaction_input import TransactionInput
+from ..transaction.transaction_output import TransactionOutput
+from ..utils import validate_address
+from ..wallet import DEFAULT_FEE_RATE, DUST_THRESHOLD
 
 if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient
@@ -450,6 +457,269 @@ class HdWallet:
                 confirmed, unconfirmed = result
                 total += int(confirmed) + int(unconfirmed)
         return total
+
+    # ------------------------------------------------------------------
+    # Spending — Cut 1A of v0.3 wallet/CLI plan.
+    #
+    # Mirrors RxdWallet.send / send_max but signs each input with the
+    # per-UTXO derived key (BIP44 m/44'/236'/account'/change/index). The
+    # fee uses the same two-pass trial→measure→rebuild pattern that
+    # RxdWallet uses; see test_preimage.py for the stale-signature
+    # pitfall that motivated the reset between passes.
+
+    def _privkey_for(self, change: int, index: int) -> PrivateKey:
+        """Return the PrivateKey at ``m/.../change/index`` from the account xprv."""
+        return self._xprv.ckd(change).ckd(index).private_key()
+
+    def _next_change_index(self) -> int:
+        """Return the next unused internal-chain index for change outputs.
+
+        Picks the lowest internal index whose ``AddressRecord.used`` is
+        False, falling back to ``internal_tip`` if all known indices are
+        used. The returned index is NOT marked used here — the wallet
+        only flips the bit after a subsequent ``refresh()`` confirms
+        chain history.
+        """
+        for idx in range(self.internal_tip + _GAP_LIMIT):
+            pkey = self._path_key(1, idx)
+            rec = self.addresses.get(pkey)
+            if rec is None or not rec.used:
+                if rec is None:
+                    addr = self._derive_address(1, idx)
+                    self.addresses[pkey] = AddressRecord(address=addr, change=1, index=idx, used=False)
+                return idx
+        # Edge case: every known internal index is used. Extend.
+        return self.internal_tip + _GAP_LIMIT
+
+    def _build_utxo_input(self, utxo: UtxoRecord, address: str, privkey: PrivateKey) -> TransactionInput:
+        """Build a signable TransactionInput for *utxo* spending *address*.
+
+        Mirrors :meth:`RxdWallet._make_input` but parameterizes the
+        signing key (different per address in HD wallets).
+        """
+        if utxo.value <= 0:
+            raise ValidationError("UTXO value must be positive")
+
+        locking = P2PKH().lock(address)
+        tx_input = TransactionInput(
+            source_txid=utxo.tx_hash,
+            source_output_index=utxo.tx_pos,
+            unlocking_script_template=P2PKH().unlock(privkey),
+        )
+        tx_input.satoshis = utxo.value
+        tx_input.locking_script = locking
+
+        # Stub source-tx so fee()/preimage() can read this output's value.
+        stub_out = TransactionOutput(locking, utxo.value)
+        vout = utxo.tx_pos
+
+        class _SrcTx:
+            outputs = {vout: stub_out}
+
+        tx_input.source_transaction = _SrcTx()
+        return tx_input
+
+    async def collect_spendable(self, client: ElectrumXClient) -> list[tuple[UtxoRecord, str, PrivateKey]]:
+        """Return ``(utxo, address, privkey)`` triples for every UTXO across known addresses.
+
+        Address→key mapping is preserved so signing works correctly per
+        UTXO. Falls back gracefully if any per-address fetch fails (the
+        failed address contributes nothing rather than crashing the whole
+        collection — the caller decides whether the resulting balance is
+        enough).
+        """
+        used = [r for r in self.addresses.values() if r.used]
+        if not used:
+            return []
+
+        # Fan out one get_utxos call per used address; preserve the
+        # address (and therefore the key derivation path) per result.
+        results = await asyncio.gather(
+            *[client.get_utxos(script_hash_for_address(r.address)) for r in used],
+            return_exceptions=True,
+        )
+
+        triples: list[tuple[UtxoRecord, str, PrivateKey]] = []
+        for rec, result in zip(used, results, strict=True):
+            if not isinstance(result, list):
+                # Network error for this one address — log via the
+                # client's own error handling, drop on the floor here.
+                continue
+            privkey = self._privkey_for(rec.change, rec.index)
+            for utxo in result:
+                triples.append((utxo, rec.address, privkey))
+        return triples
+
+    def build_send_tx(
+        self,
+        triples: list[tuple[UtxoRecord, str, PrivateKey]],
+        to_address: str,
+        photons: int,
+        *,
+        fee_rate: int = DEFAULT_FEE_RATE,
+        change_address: str | None = None,
+    ) -> Transaction:
+        """Build and sign a P2PKH transfer from HD UTXOs to *to_address*.
+
+        Pure offline operation. Mirrors :meth:`RxdWallet.build_send_tx`
+        but accepts (utxo, address, privkey) triples so each input is
+        signed by the correct HD-derived key.
+
+        ``change_address`` defaults to the next unused internal index;
+        callers can override (e.g. to keep change on the external chain
+        for a single-address-style wallet).
+        """
+        if not isinstance(photons, int) or isinstance(photons, bool):
+            raise ValidationError("photons must be int")
+        if photons <= 0:
+            raise ValidationError("photons must be > 0")
+        if photons < DUST_THRESHOLD:
+            raise ValidationError(f"photons below dust threshold ({DUST_THRESHOLD})")
+        if not validate_address(to_address):
+            raise ValidationError("to_address is not a valid P2PKH address")
+        if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
+            raise ValidationError("fee_rate must be a positive int")
+        if not triples:
+            raise ValidationError("Insufficient funds: no UTXOs supplied")
+
+        if change_address is None:
+            change_idx = self._next_change_index()
+            change_address = self._derive_address(1, change_idx)
+        elif not validate_address(change_address):
+            raise ValidationError("change_address is not a valid P2PKH address")
+
+        # Greedy descending-by-value selection.
+        sorted_triples = sorted(triples, key=lambda t: t[0].value, reverse=True)
+
+        recipient_script = P2PKH().lock(to_address)
+        change_script = P2PKH().lock(change_address)
+
+        min_input_bytes = 148
+        per_input_fee_cushion = min_input_bytes * fee_rate
+        base_fee_cushion = 80 * fee_rate
+
+        selected: list[tuple[UtxoRecord, str, PrivateKey]] = []
+        total_in = 0
+        for triple in sorted_triples:
+            selected.append(triple)
+            total_in += triple[0].value
+            target = photons + base_fee_cushion + per_input_fee_cushion * len(selected)
+            if total_in >= target:
+                break
+
+        if total_in < photons:
+            raise ValidationError("Insufficient funds for requested amount")
+
+        # Trial pass.
+        inputs = [self._build_utxo_input(u, addr, pk) for u, addr, pk in selected]
+        trial_change = max(DUST_THRESHOLD, total_in - photons - base_fee_cushion)
+        trial_outputs = [
+            TransactionOutput(recipient_script, photons),
+            TransactionOutput(change_script, trial_change),
+        ]
+        trial_tx = Transaction(tx_inputs=inputs, tx_outputs=trial_outputs)
+        trial_tx.sign()
+        trial_size = trial_tx.byte_length()
+        fee = trial_size * fee_rate
+
+        if total_in < photons + fee:
+            raise ValidationError("Insufficient funds after fee")
+
+        change_value = total_in - photons - fee
+
+        # Reset unlocking scripts so sign() rebuilds signatures over the
+        # FINAL outputs, not the trial outputs (test_preimage.py).
+        for inp in inputs:
+            inp.unlocking_script = None
+
+        final_outputs = [TransactionOutput(recipient_script, photons)]
+        if change_value >= DUST_THRESHOLD:
+            final_outputs.append(TransactionOutput(change_script, change_value))
+
+        final_tx = Transaction(tx_inputs=inputs, tx_outputs=final_outputs)
+        final_tx.sign()
+        return final_tx
+
+    def build_send_max_tx(
+        self,
+        triples: list[tuple[UtxoRecord, str, PrivateKey]],
+        to_address: str,
+        *,
+        fee_rate: int = DEFAULT_FEE_RATE,
+    ) -> Transaction:
+        """Sweep all *triples* to *to_address* minus fee. No change output."""
+        if not validate_address(to_address):
+            raise ValidationError("to_address is not a valid P2PKH address")
+        if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
+            raise ValidationError("fee_rate must be a positive int")
+        if not triples:
+            raise ValidationError("Insufficient funds: no UTXOs supplied")
+
+        total_in = sum(t[0].value for t in triples)
+        if total_in <= DUST_THRESHOLD:
+            raise ValidationError("Insufficient funds: total below dust threshold")
+
+        recipient_script = P2PKH().lock(to_address)
+        inputs = [self._build_utxo_input(u, addr, pk) for u, addr, pk in triples]
+
+        trial_tx = Transaction(
+            tx_inputs=inputs,
+            tx_outputs=[TransactionOutput(recipient_script, total_in - DUST_THRESHOLD)],
+        )
+        trial_tx.sign()
+        size = trial_tx.byte_length()
+        fee = size * fee_rate
+        out_value = total_in - fee
+        if out_value < DUST_THRESHOLD:
+            raise ValidationError("Insufficient funds to cover fee")
+
+        for inp in inputs:
+            inp.unlocking_script = None
+
+        final_tx = Transaction(
+            tx_inputs=inputs,
+            tx_outputs=[TransactionOutput(recipient_script, out_value)],
+        )
+        final_tx.sign()
+        return final_tx
+
+    async def send(
+        self,
+        client: ElectrumXClient,
+        to_address: str,
+        photons: int,
+        *,
+        fee_rate: int = DEFAULT_FEE_RATE,
+        change_address: str | None = None,
+    ) -> str:
+        """Fetch UTXOs, build, sign, broadcast. Returns broadcast txid.
+
+        Raises :class:`ValidationError` on bad inputs or insufficient
+        funds, :class:`NetworkError` on RPC failure.
+        """
+        triples = await self.collect_spendable(client)
+        tx = self.build_send_tx(
+            triples,
+            to_address,
+            photons,
+            fee_rate=fee_rate,
+            change_address=change_address,
+        )
+        txid = await client.broadcast(tx.serialize())
+        return str(txid)
+
+    async def send_max(
+        self,
+        client: ElectrumXClient,
+        to_address: str,
+        *,
+        fee_rate: int = DEFAULT_FEE_RATE,
+    ) -> str:
+        """Sweep all UTXOs to *to_address* minus fee. Returns broadcast txid."""
+        triples = await self.collect_spendable(client)
+        tx = self.build_send_max_tx(triples, to_address, fee_rate=fee_rate)
+        txid = await client.broadcast(tx.serialize())
+        return str(txid)
 
 
 def _derive_enc_key(seed: bytes, salt: bytes) -> bytes:

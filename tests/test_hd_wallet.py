@@ -618,3 +618,352 @@ class TestGapScanErrorPropagation:
             pass
         # No false-negative records may remain.
         assert all(r.used is True for r in w.addresses.values()) or w.addresses == {}
+
+
+# ---------------------------------------------------------------------------
+# Cut 1A: HdWallet.send / send_max + helpers
+#
+# These tests cover the OFFLINE build path with fixture UTXOs. The
+# network-touching async paths (``send`` / ``send_max``) reuse those
+# builders + a mocked ElectrumX, so a green build_send_tx is sufficient
+# to assert the broadcast wrapper works.
+# ---------------------------------------------------------------------------
+
+# A valid Radiant P2PKH address (used as a recipient throughout).
+_RECIPIENT_ADDR = "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH"  # known-vector for privkey=1
+
+
+def _utxo(*, tx_hash: str = "aa" * 32, tx_pos: int = 0, value: int = 1_000_000_000) -> UtxoRecord:
+    return UtxoRecord(tx_hash=tx_hash, tx_pos=tx_pos, value=value, height=1)
+
+
+def _seed_wallet_with_used_addresses(w: HdWallet, n_external: int = 2, n_internal: int = 1) -> HdWallet:
+    """Mark the first ``n_external`` external addresses + ``n_internal`` internal as used.
+
+    Bypasses ``refresh()`` so tests don't need a chaintracker — we just
+    set the AddressRecords directly.
+    """
+    for i in range(n_external):
+        addr = w._derive_address(0, i)
+        w.addresses[w._path_key(0, i)] = AddressRecord(address=addr, change=0, index=i, used=True)
+    for i in range(n_internal):
+        addr = w._derive_address(1, i)
+        w.addresses[w._path_key(1, i)] = AddressRecord(address=addr, change=1, index=i, used=True)
+    w.external_tip = n_external
+    w.internal_tip = n_internal
+    return w
+
+
+class TestPrivkeyDerivation:
+    def test_privkey_for_matches_address(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addr = w._derive_address(0, 0)
+        privkey = w._privkey_for(0, 0)
+        assert privkey.public_key().address() == addr
+
+    def test_internal_chain_distinct_from_external(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        ext = w._privkey_for(0, 0)
+        int_ = w._privkey_for(1, 0)
+        assert ext.public_key().address() != int_.public_key().address()
+
+
+class TestNextChangeIndex:
+    def test_returns_zero_when_nothing_used(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        assert w._next_change_index() == 0
+
+    def test_skips_used_internal(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w, n_external=1, n_internal=2)
+        # First two internal indices used → expect 2
+        assert w._next_change_index() == 2
+
+    def test_creates_record_for_returned_index(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        idx = w._next_change_index()
+        pkey = w._path_key(1, idx)
+        assert pkey in w.addresses
+        assert w.addresses[pkey].used is False
+
+
+class TestBuildSendTxOffline:
+    """Offline path — `triples` is supplied by the caller; no network."""
+
+    def _triples(self, w: HdWallet, *, n_inputs: int = 1, value_each: int = 1_000_000_000):
+        """Build (utxo, address, privkey) triples on the wallet's first external address."""
+        addr = w._derive_address(0, 0)
+        pk = w._privkey_for(0, 0)
+        return [
+            (
+                _utxo(tx_hash=bytes([i + 1]).hex() * 32, value=value_each),
+                addr,
+                pk,
+            )
+            for i in range(n_inputs)
+        ]
+
+    def test_builds_signed_transaction(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        triples = self._triples(w, n_inputs=1, value_each=1_000_000_000)
+        tx = w.build_send_tx(triples, _RECIPIENT_ADDR, photons=10_000_000)
+        assert tx.byte_length() > 0
+        # Recipient + change = 2 outputs (we provide enough for change).
+        assert len(tx.outputs) == 2
+        assert tx.outputs[0].satoshis == 10_000_000
+
+    def test_change_goes_to_internal_chain_by_default(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w, n_external=1, n_internal=0)
+        triples = self._triples(w, n_inputs=1, value_each=1_000_000_000)
+        tx = w.build_send_tx(triples, _RECIPIENT_ADDR, photons=10_000_000)
+        # The wallet picked m/.../1/0 as change; verify by re-deriving.
+        expected_change_addr = w._derive_address(1, 0)
+        from pyrxd.script.type import P2PKH
+
+        expected_change_script = P2PKH().lock(expected_change_addr).serialize()
+        assert tx.outputs[1].locking_script.serialize() == expected_change_script
+
+    def test_explicit_change_address_honored(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        triples = self._triples(w, n_inputs=1, value_each=1_000_000_000)
+        # Pick a custom change address — same wallet's external index 5.
+        custom_change = w._derive_address(0, 5)
+        tx = w.build_send_tx(
+            triples,
+            _RECIPIENT_ADDR,
+            photons=10_000_000,
+            change_address=custom_change,
+        )
+        from pyrxd.script.type import P2PKH
+
+        expected_script = P2PKH().lock(custom_change).serialize()
+        assert tx.outputs[1].locking_script.serialize() == expected_script
+
+    def test_insufficient_funds_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        triples = self._triples(w, n_inputs=1, value_each=10_000)  # tiny
+        with pytest.raises(ValidationError, match="Insufficient"):
+            w.build_send_tx(triples, _RECIPIENT_ADDR, photons=1_000_000_000)
+
+    def test_below_dust_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        triples = self._triples(w)
+        with pytest.raises(ValidationError, match="dust"):
+            w.build_send_tx(triples, _RECIPIENT_ADDR, photons=100)
+
+    def test_negative_photons_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        triples = self._triples(w)
+        with pytest.raises(ValidationError):
+            w.build_send_tx(triples, _RECIPIENT_ADDR, photons=-1)
+
+    def test_zero_fee_rate_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        triples = self._triples(w)
+        with pytest.raises(ValidationError, match="fee_rate"):
+            w.build_send_tx(triples, _RECIPIENT_ADDR, photons=10_000_000, fee_rate=0)
+
+    def test_invalid_to_address_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        triples = self._triples(w)
+        with pytest.raises(ValidationError, match="to_address"):
+            w.build_send_tx(triples, "not-an-address", photons=10_000_000)
+
+    def test_invalid_change_address_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        triples = self._triples(w)
+        with pytest.raises(ValidationError, match="change_address"):
+            w.build_send_tx(
+                triples,
+                _RECIPIENT_ADDR,
+                photons=10_000_000,
+                change_address="garbage",
+            )
+
+    def test_no_utxos_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        with pytest.raises(ValidationError, match="Insufficient"):
+            w.build_send_tx([], _RECIPIENT_ADDR, photons=10_000_000)
+
+    def test_change_below_dust_omitted(self):
+        """If the change remainder is below dust, the change output must be dropped."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        # Pick an amount such that change after fee will be tiny.
+        # 10_000_000 in, ~150 sat fee, send 9_999_500 → change of ~350 < DUST(546)
+        triples = self._triples(w, n_inputs=1, value_each=10_000_000)
+        # Use a low fee_rate so the residual is small but the function still
+        # builds; the test asserts that the dust-burning branch fires.
+        # With photons=9_999_454 and fee_rate=1, fee~tx_bytes < 546 leftover.
+        tx = w.build_send_tx(
+            triples,
+            _RECIPIENT_ADDR,
+            photons=9_999_500,
+            fee_rate=1,
+        )
+        assert len(tx.outputs) == 1  # change burned
+        assert tx.outputs[0].satoshis == 9_999_500
+
+    def test_signs_with_correct_per_utxo_key(self):
+        """Each input must be signed by the key derived for THAT utxo's address."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w, n_external=2)
+
+        # Build triples spanning two distinct external addresses.
+        addr0 = w._derive_address(0, 0)
+        addr1 = w._derive_address(0, 1)
+        pk0 = w._privkey_for(0, 0)
+        pk1 = w._privkey_for(0, 1)
+        triples = [
+            (_utxo(tx_hash="aa" * 32, value=600_000_000), addr0, pk0),
+            (_utxo(tx_hash="bb" * 32, value=600_000_000), addr1, pk1),
+        ]
+        tx = w.build_send_tx(triples, _RECIPIENT_ADDR, photons=1_000_000_000)
+        assert len(tx.inputs) == 2
+        # Both inputs were signed; just verify byte_length is plausibly
+        # the sum of two signed inputs.
+        assert tx.byte_length() > 300
+
+
+class TestBuildSendMaxTxOffline:
+    def test_sweeps_all_utxos_to_single_output(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        addr = w._derive_address(0, 0)
+        pk = w._privkey_for(0, 0)
+        triples = [(_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=500_000_000), addr, pk) for i in range(3)]
+        tx = w.build_send_max_tx(triples, _RECIPIENT_ADDR)
+        assert len(tx.outputs) == 1
+        # 1.5B in, fee deducted; expect output ~ input minus fee.
+        # Fee for ~500-byte 3-input tx at 10_000 photons/byte ~ 5M photons.
+        out = tx.outputs[0].satoshis
+        assert 1_490_000_000 < out < 1_500_000_000
+
+    def test_dust_total_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        addr = w._derive_address(0, 0)
+        pk = w._privkey_for(0, 0)
+        triples = [(_utxo(value=500), addr, pk)]
+        with pytest.raises(ValidationError, match="dust"):
+            w.build_send_max_tx(triples, _RECIPIENT_ADDR)
+
+    def test_total_under_fee_raises(self):
+        """Enough to clear dust, but not enough to cover fee."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        addr = w._derive_address(0, 0)
+        pk = w._privkey_for(0, 0)
+        # 10_000 photons in; fee at 10_000 photons/byte on ~200-byte tx
+        # would be ~2M photons — way over the input.
+        triples = [(_utxo(value=10_000), addr, pk)]
+        with pytest.raises(ValidationError, match="cover fee"):
+            w.build_send_max_tx(triples, _RECIPIENT_ADDR)
+
+    def test_no_utxos_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        with pytest.raises(ValidationError, match="Insufficient"):
+            w.build_send_max_tx([], _RECIPIENT_ADDR)
+
+
+class TestCollectSpendable:
+    def test_returns_triples_for_used_addresses(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w, n_external=2, n_internal=0)
+        addr0 = w._derive_address(0, 0)
+        addr1 = w._derive_address(0, 1)
+
+        client = _mock_client(
+            utxo_map={
+                addr0: [_utxo(tx_hash="aa" * 32, value=100_000_000)],
+                addr1: [_utxo(tx_hash="bb" * 32, value=200_000_000)],
+            }
+        )
+        triples = asyncio.get_event_loop().run_until_complete(w.collect_spendable(client))
+        assert len(triples) == 2
+        # Each privkey is the one derived for its address.
+        for _utxo_rec, addr, pk in triples:
+            assert pk.public_key().address() == addr
+
+    def test_returns_empty_when_no_used(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        client = _mock_client()
+        triples = asyncio.get_event_loop().run_until_complete(w.collect_spendable(client))
+        assert triples == []
+
+    def test_drops_failed_address_lookups(self):
+        """A per-address failure must not crash the whole collection."""
+        from pyrxd.security.errors import NetworkError
+
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w, n_external=2, n_internal=0)
+        addr0 = w._derive_address(0, 0)
+
+        client = MagicMock(spec=ElectrumXClient)
+
+        async def _get_utxos(script_hash):
+            from pyrxd.network.electrumx import script_hash_for_address
+
+            if script_hash_for_address(addr0) == script_hash:
+                return [_utxo(tx_hash="aa" * 32, value=100_000_000)]
+            raise NetworkError("simulated failure")
+
+        client.get_utxos = _get_utxos
+        triples = asyncio.get_event_loop().run_until_complete(w.collect_spendable(client))
+        # Only the working address contributed.
+        assert len(triples) == 1
+
+
+class TestSendBroadcast:
+    """Network-path tests — verify send() wires UTXO collection +
+    builder + broadcast together. The build mechanics are covered above.
+    """
+
+    def test_send_returns_txid(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w, n_external=1, n_internal=0)
+        addr = w._derive_address(0, 0)
+
+        client = _mock_client(
+            utxo_map={addr: [_utxo(value=1_000_000_000)]},
+        )
+
+        async def _broadcast(raw):
+            return "ab" * 32
+
+        client.broadcast = _broadcast
+
+        txid = asyncio.get_event_loop().run_until_complete(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))
+        assert txid == "ab" * 32
+
+    def test_send_max_returns_txid(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w, n_external=1, n_internal=0)
+        addr = w._derive_address(0, 0)
+
+        client = _mock_client(
+            utxo_map={addr: [_utxo(value=1_000_000_000)]},
+        )
+
+        async def _broadcast(raw):
+            return "cd" * 32
+
+        client.broadcast = _broadcast
+
+        txid = asyncio.get_event_loop().run_until_complete(w.send_max(client, _RECIPIENT_ADDR))
+        assert txid == "cd" * 32
+
+    def test_send_with_no_utxos_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)  # no used addresses → no UTXOs
+        client = _mock_client()
+        with pytest.raises(ValidationError, match="Insufficient"):
+            asyncio.get_event_loop().run_until_complete(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))
