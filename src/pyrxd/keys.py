@@ -11,8 +11,7 @@ from .constants import Network, NETWORK_ADDRESS_PREFIX_DICT, NETWORK_WIF_PREFIX_
 from .curve import Point
 from .curve import curve, curve_multiply as curve_multiply, curve_add as curve_add
 from .hash import hash160, hash256, hmac_sha256
-from .security.errors import KeyMaterialError, ValidationError
-from .security.secrets import PrivateKeyMaterial, SecretBytes
+from .security.errors import ValidationError
 from .utils import decode_wif, text_digest, stringify_ecdsa_recoverable, unstringify_ecdsa_recoverable
 from .utils import deserialize_ecdsa_recoverable, serialize_ecdsa_der
 
@@ -360,8 +359,8 @@ class PrivateKey:
             return hmac.compare_digest(self.key.secret, o.key.secret)
         return super().__eq__(o)  # pragma: no cover
 
-    def __hash__(self) -> int:
-        raise TypeError("PrivateKey is not hashable (secret leak risk)")
+    # PrivateKey is not hashable — putting secrets in dict/set risks leaking via hash collisions.
+    __hash__ = None  # type: ignore[assignment]
 
     def __reduce_ex__(self, protocol: int) -> object:
         raise TypeError("PrivateKey cannot be pickled — serializing key material defeats in-memory protection")

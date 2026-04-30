@@ -2,7 +2,6 @@ import pytest
 
 from pyrxd.keys import PrivateKey, PublicKey
 from pyrxd.security.errors import ValidationError
-from pyrxd.security.secrets import PrivateKeyMaterial
 
 # secp256k1 curve order
 _SECP256K1_N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -163,7 +162,7 @@ class TestPrivateKeySecurityAudit2026:
     def test_private_key_not_hashable(self):
         """HIGH: PrivateKey must not be hashable — key in dict/set exposes it to side-channels."""
         k = PrivateKey(0x1111111111111111111111111111111111111111111111111111111111111111)
-        with pytest.raises(TypeError, match="not hashable"):
+        with pytest.raises(TypeError, match="unhashable"):
             hash(k)
 
     def test_private_key_not_picklable(self):

@@ -18,8 +18,6 @@ from pyrxd.script.type import (
     P2PK,
     P2PKH,
     RPuzzle,
-    ScriptTemplate,
-    Unknown,
 )
 from pyrxd.transaction.transaction import InsufficientFunds, Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
@@ -522,7 +520,7 @@ class TestPrivateKeyConstructors:
 
     def test_not_hashable(self):
         pk = PrivateKey(1)
-        with pytest.raises(TypeError, match="not hashable"):
+        with pytest.raises(TypeError, match="unhashable"):
             hash(pk)
 
     def test_not_picklable(self):

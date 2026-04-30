@@ -18,8 +18,8 @@ from .errors import (
     ValidationError,
     redact,
 )
-from .rng import secure_random_bytes, secure_scalar_mod_n
-from .secrets import PrivateKeyMaterial, SecretBytes
+from .rng import secure_random_bytes
+from .secrets import PrivateKeyMaterial, SecretBytes, secure_scalar_mod_n
 from .types import (
     BlockHeight,
     Hex20,

@@ -58,7 +58,7 @@ class TestSecretBytesEquality:
         a = SecretBytes(b"\x01")
         b = SecretBytes(b"\x02")
         assert a != b
-        assert not (a == b)
+        assert (a == b) is False
         assert a != "other type"
 
 
@@ -71,12 +71,12 @@ class TestSecretBytesHash:
     def test_cannot_be_used_in_set(self) -> None:
         s = SecretBytes(b"\x01" * 32)
         with pytest.raises(TypeError):
-            {s}  # noqa: B018
+            set().add(s)
 
     def test_cannot_be_used_as_dict_key(self) -> None:
         s = SecretBytes(b"\x01" * 32)
         with pytest.raises(TypeError):
-            {s: 1}
+            {}[s] = 1
 
 
 class TestSecretBytesLen:
@@ -291,7 +291,6 @@ class TestZeroizeBufferLockFallback:
     def test_zeroize_fallback_when_memset_fails(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import ctypes
 
         from pyrxd.security import secrets as secrets_mod
 

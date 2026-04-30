@@ -48,8 +48,7 @@ class Xkey:
             return self.payload == o.payload
         return super().__eq__(o)  # pragma: no cover
 
-    def __hash__(self) -> int:
-        raise TypeError(f"{type(self).__name__} is not hashable")
+    __hash__ = None  # type: ignore[assignment]
 
     def __str__(self) -> str:
         return base58check_encode(self.payload)
@@ -67,6 +66,9 @@ class Xpub(Xkey):
         if self.payload[45:46] not in PUBLIC_KEY_COMPRESSED_PREFIX_LIST:
             raise ValidationError("invalid public key in xpub")
         self.key: PublicKey = PublicKey(self.key_bytes)
+
+    # network and key are derived from payload, so Xkey.__eq__ (compares payload) is correct.
+    __eq__ = Xkey.__eq__
 
     def ckd(self, index: Union[int, str, bytes]) -> "Xpub":
         if isinstance(index, int):

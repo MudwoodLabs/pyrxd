@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from pyrxd.security.rng import secure_random_bytes, secure_scalar_mod_n
-from pyrxd.security.secrets import PrivateKeyMaterial
+from pyrxd.security.rng import secure_random_bytes
+from pyrxd.security.secrets import PrivateKeyMaterial, secure_scalar_mod_n
 
 # secp256k1 curve order
 _N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -78,7 +78,7 @@ class TestSecureScalarModNRejectionSampling:
             return next(seq)
 
         monkeypatch.setattr(rng_mod, "secure_random_bytes", fake_srb)
-        pk = rng_mod.secure_scalar_mod_n()
+        pk = PrivateKeyMaterial(rng_mod.secure_scalar_bytes_mod_n())
         assert int.from_bytes(pk.unsafe_raw_bytes(), "big") == 42
 
     def test_rejection_sampling_rejects_zero(
@@ -94,7 +94,7 @@ class TestSecureScalarModNRejectionSampling:
             return next(seq)
 
         monkeypatch.setattr(rng_mod, "secure_random_bytes", fake_srb)
-        pk = rng_mod.secure_scalar_mod_n()
+        pk = PrivateKeyMaterial(rng_mod.secure_scalar_bytes_mod_n())
         assert int.from_bytes(pk.unsafe_raw_bytes(), "big") == 1
 
     def test_rejection_sampling_exhaustion_raises(
@@ -109,4 +109,4 @@ class TestSecureScalarModNRejectionSampling:
 
         monkeypatch.setattr(rng_mod, "secure_random_bytes", always_zero)
         with pytest.raises(RuntimeError, match="RNG"):
-            rng_mod.secure_scalar_mod_n()
+            rng_mod.secure_scalar_bytes_mod_n()

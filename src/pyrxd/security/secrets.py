@@ -22,8 +22,9 @@ import hmac
 from typing import Any, Dict, SupportsIndex
 
 from .errors import KeyMaterialError
+from .rng import secure_scalar_bytes_mod_n
 
-__all__ = ["PrivateKeyMaterial", "SecretBytes"]
+__all__ = ["PrivateKeyMaterial", "SecretBytes", "secure_scalar_mod_n"]
 
 # secp256k1 curve order
 _SECP256K1_N: int = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
@@ -105,8 +106,8 @@ class SecretBytes:
             return NotImplemented
         return not result
 
-    def __hash__(self) -> int:
-        raise TypeError("SecretBytes instances are not hashable (secret leak risk)")
+    # SecretBytes is not hashable — putting secrets in dict/set risks leaking via hash collisions.
+    __hash__ = None  # type: ignore[assignment]
 
     # ------------------------------------------------------------------ serialization guards
     def __reduce_ex__(self, protocol: SupportsIndex) -> str | tuple[Any, ...]:
@@ -175,7 +176,7 @@ class SecretBytes:
             raise KeyMaterialError("hex input must be a string")
         try:
             data = bytes.fromhex(h)
-        except ValueError as exc:
+        except ValueError:
             raise KeyMaterialError("invalid hex string for SecretBytes") from None  # noqa: B904 -- intentional chain suppression to avoid leaking h in __context__ message
         return cls(data)
 
@@ -260,7 +261,15 @@ class PrivateKeyMaterial(SecretBytes):
     @classmethod
     def generate(cls) -> "PrivateKeyMaterial":
         """Generate a fresh random private key using the secure RNG."""
-        # Lazy import: avoids a circular import during package initialization.
-        from .rng import secure_scalar_mod_n
+        return cls(secure_scalar_bytes_mod_n())
 
-        return secure_scalar_mod_n()
+
+def secure_scalar_mod_n() -> PrivateKeyMaterial:
+    """Draw a uniform random scalar in ``[1, N-1]`` and return it wrapped.
+
+    Convenience wrapper combining :func:`pyrxd.security.rng.secure_scalar_bytes_mod_n`
+    with :class:`PrivateKeyMaterial`. Lives in this module (not :mod:`.rng`)
+    so :mod:`.rng` has no dependency on :class:`PrivateKeyMaterial` —
+    that keeps the import graph acyclic.
+    """
+    return PrivateKeyMaterial(secure_scalar_bytes_mod_n())

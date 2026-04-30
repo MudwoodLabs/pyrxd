@@ -32,13 +32,9 @@ import hashlib
 from dataclasses import dataclass
 
 from pyrxd.security.errors import KeyMaterialError, ValidationError
-from pyrxd.security.rng import secure_scalar_mod_n
-from pyrxd.security.secrets import PrivateKeyMaterial
+from pyrxd.security.secrets import PrivateKeyMaterial, secure_scalar_mod_n
 
 __all__ = ["BtcKeypair", "generate_keypair", "keypair_from_wif"]
-
-# secp256k1 curve order
-_N = int("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141", 16)
 
 # bech32 / bech32m character set
 _BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
