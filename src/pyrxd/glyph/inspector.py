@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from pyrxd.security.errors import ValidationError
 
@@ -22,9 +21,9 @@ class GlyphOutput:
     """A detected Glyph in a transaction output."""
 
     vout: int
-    glyph_type: str                       # "nft" or "ft"
+    glyph_type: str  # "nft" or "ft"
     ref: GlyphRef
-    metadata: Optional[GlyphMetadata]     # None if this is a transfer (no reveal)
+    metadata: GlyphMetadata | None  # None if this is a transfer (no reveal)
     script: bytes
 
 
@@ -39,40 +38,46 @@ class GlyphInspector:
         Given list of (satoshis, script_bytes) outputs, return detected Glyphs.
         """
         results = []
-        for vout, (satoshis, script) in enumerate(tx_outputs):
+        for vout, (_satoshis, script) in enumerate(tx_outputs):
             script_hex = script.hex()
             if is_nft_script(script_hex):
                 ref = extract_ref_from_nft_script(script)
-                results.append(GlyphOutput(
-                    vout=vout,
-                    glyph_type="nft",
-                    ref=ref,
-                    metadata=None,
-                    script=script,
-                ))
+                results.append(
+                    GlyphOutput(
+                        vout=vout,
+                        glyph_type="nft",
+                        ref=ref,
+                        metadata=None,
+                        script=script,
+                    )
+                )
             elif is_ft_script(script_hex):
                 ref = extract_ref_from_ft_script(script)
-                results.append(GlyphOutput(
-                    vout=vout,
-                    glyph_type="ft",
-                    ref=ref,
-                    metadata=None,
-                    script=script,
-                ))
+                results.append(
+                    GlyphOutput(
+                        vout=vout,
+                        glyph_type="ft",
+                        ref=ref,
+                        metadata=None,
+                        script=script,
+                    )
+                )
             elif MUTABLE_NFT_SCRIPT_RE.fullmatch(script_hex):
                 parsed = parse_mutable_nft_script(script)
                 if parsed is not None:
                     ref, _ = parsed
-                    results.append(GlyphOutput(
-                        vout=vout,
-                        glyph_type="mut",
-                        ref=ref,
-                        metadata=None,
-                        script=script,
-                    ))
+                    results.append(
+                        GlyphOutput(
+                            vout=vout,
+                            glyph_type="mut",
+                            ref=ref,
+                            metadata=None,
+                            script=script,
+                        )
+                    )
         return results
 
-    def extract_reveal_metadata(self, scriptsig: bytes) -> Optional[GlyphMetadata]:
+    def extract_reveal_metadata(self, scriptsig: bytes) -> GlyphMetadata | None:
         """
         Parse a reveal TX scriptSig to extract CBOR metadata.
 
@@ -84,7 +89,7 @@ class GlyphInspector:
         except (ValidationError, Exception):
             return None
 
-    def _parse_reveal_scriptsig(self, scriptsig: bytes) -> Optional[GlyphMetadata]:
+    def _parse_reveal_scriptsig(self, scriptsig: bytes) -> GlyphMetadata | None:
         """Walk the scriptSig push-data stack to find 'gly' marker + CBOR."""
         pos = 0
         items = []
@@ -92,17 +97,17 @@ class GlyphInspector:
             opcode = scriptsig[pos]
             pos += 1
             if 1 <= opcode <= 75:
-                items.append(scriptsig[pos:pos + opcode])
+                items.append(scriptsig[pos : pos + opcode])
                 pos += opcode
-            elif opcode == 0x4c:  # OP_PUSHDATA1
+            elif opcode == 0x4C:  # OP_PUSHDATA1
                 length = scriptsig[pos]
                 pos += 1
-                items.append(scriptsig[pos:pos + length])
+                items.append(scriptsig[pos : pos + length])
                 pos += length
-            elif opcode == 0x4d:  # OP_PUSHDATA2
-                length = int.from_bytes(scriptsig[pos:pos + 2], 'little')
+            elif opcode == 0x4D:  # OP_PUSHDATA2
+                length = int.from_bytes(scriptsig[pos : pos + 2], "little")
                 pos += 2
-                items.append(scriptsig[pos:pos + length])
+                items.append(scriptsig[pos : pos + length])
                 pos += length
             else:
                 break  # non-push opcode, stop

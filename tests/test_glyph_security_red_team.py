@@ -16,6 +16,7 @@ Finding inventory:
   RT-10  Creator sig stripping detected
   RT-11  Creator sig field-tamper detected
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -43,6 +44,7 @@ TREASURY_PKH = Hex20(b"\x11" * 20)
 # RT-01: CBOR payload size bomb
 # ---------------------------------------------------------------------------
 
+
 class TestRT01CborSizeBomb:
     """decode_payload must reject oversized payloads before cbor2.loads()."""
 
@@ -51,21 +53,25 @@ class TestRT01CborSizeBomb:
         # Build a valid CBOR payload that approaches but doesn't exceed 64 KB.
         # Use a large 'desc' value (~63 KB) — within the 64-char cap after decode,
         # but the raw CBOR bytes themselves can be large.
-        cbor2.dumps({
-            "p": [1],  # FT protocol
-            "name": "Bomb Test",
-            "ticker": "BMB",
-            "desc": "x" * 900,  # within field limit
-        })
+        cbor2.dumps(
+            {
+                "p": [1],  # FT protocol
+                "name": "Bomb Test",
+                "ticker": "BMB",
+                "desc": "x" * 900,  # within field limit
+            }
+        )
         # Pad to near limit with a key that decode_payload won't choke on
         # (extra unknown keys are silently ignored)
-        big_cbor = cbor2.dumps({
-            "p": [1],
-            "name": "Bomb Test",
-            "ticker": "BMB",
-            # unknown key — ignored by decoder but still in CBOR bytes
-            "_pad": "y" * (64_000 - 50),
-        })
+        big_cbor = cbor2.dumps(
+            {
+                "p": [1],
+                "name": "Bomb Test",
+                "ticker": "BMB",
+                # unknown key — ignored by decoder but still in CBOR bytes
+                "_pad": "y" * (64_000 - 50),
+            }
+        )
         assert len(big_cbor) <= 65_536
         # Should not raise — just ignores unknown key
         meta = decode_payload(big_cbor)
@@ -87,11 +93,13 @@ class TestRT01CborSizeBomb:
 
     def test_crafted_large_attrs_rejected(self):
         """An attacker could send huge attrs entries — size limit catches it."""
-        giant = cbor2.dumps({
-            "p": [1],
-            "name": "x",
-            "attrs": {f"k{i}": "v" * 1000 for i in range(70)},
-        })
+        giant = cbor2.dumps(
+            {
+                "p": [1],
+                "name": "x",
+                "attrs": {f"k{i}": "v" * 1000 for i in range(70)},
+            }
+        )
         if len(giant) > 65_536:
             with pytest.raises(ValidationError, match="too large"):
                 decode_payload(giant)
@@ -104,6 +112,7 @@ class TestRT01CborSizeBomb:
 # ---------------------------------------------------------------------------
 # RT-02: decimals float coercion
 # ---------------------------------------------------------------------------
+
 
 class TestRT02DecimalsFloat:
     """CBOR allows floats and bools as map values. decimals must reject them."""
@@ -146,6 +155,7 @@ class TestRT02DecimalsFloat:
 # RT-03: Protocol list mutability
 # ---------------------------------------------------------------------------
 
+
 class TestRT03ProtocolImmutability:
     """After construction, protocol must be immutable — list.append() is a vector."""
 
@@ -177,6 +187,7 @@ class TestRT03ProtocolImmutability:
 # ---------------------------------------------------------------------------
 # RT-04: Royalty split sum overflow
 # ---------------------------------------------------------------------------
+
 
 class TestRT04RoyaltySplitSumOverflow:
     """Splits must not exceed the total royalty bps — otherwise enforcement is broken."""
@@ -217,6 +228,7 @@ class TestRT04RoyaltySplitSumOverflow:
 # ---------------------------------------------------------------------------
 # RT-05 & RT-06: build_mutable_scriptsig input validation
 # ---------------------------------------------------------------------------
+
 
 class TestRT05RT06MutableScriptSigValidation:
     """build_mutable_scriptsig must reject empty cbor_bytes and negative indices."""
@@ -328,6 +340,7 @@ class TestRT05RT06MutableScriptSigValidation:
 # RT-07: verify_sha256d_solution target overflow
 # ---------------------------------------------------------------------------
 
+
 class TestRT07PoWTargetOverflow:
     """verify_sha256d_solution must cap target at MAX_SHA256D_TARGET."""
 
@@ -377,24 +390,29 @@ class TestRT07PoWTargetOverflow:
 # RT-08: attrs dict DoS
 # ---------------------------------------------------------------------------
 
+
 class TestRT08AttrsDictDoS:
     """decode_payload must reject attrs maps with more than 64 entries."""
 
     def test_65_attrs_rejected(self):
-        cbor_bytes = cbor2.dumps({
-            "p": [2],
-            "name": "AttrBomb",
-            "attrs": {f"key{i}": f"val{i}" for i in range(65)},
-        })
+        cbor_bytes = cbor2.dumps(
+            {
+                "p": [2],
+                "name": "AttrBomb",
+                "attrs": {f"key{i}": f"val{i}" for i in range(65)},
+            }
+        )
         with pytest.raises(ValidationError, match="attrs.*too large"):
             decode_payload(cbor_bytes)
 
     def test_64_attrs_accepted(self):
-        cbor_bytes = cbor2.dumps({
-            "p": [2],
-            "name": "AttrBomb",
-            "attrs": {f"key{i}": f"val{i}" for i in range(64)},
-        })
+        cbor_bytes = cbor2.dumps(
+            {
+                "p": [2],
+                "name": "AttrBomb",
+                "attrs": {f"key{i}": f"val{i}" for i in range(64)},
+            }
+        )
         meta = decode_payload(cbor_bytes)
         assert len(meta.attrs) == 64
 
@@ -426,6 +444,7 @@ class TestRT09CreatorKeySubstitution:
 
     def test_key_substitution_detected(self):
         import dataclasses
+
         meta = _make_meta("Original")
         key1 = PrivateKey()
         key2 = PrivateKey()
@@ -473,14 +492,16 @@ class TestRT11CreatorSigTamper:
 
     def test_tampered_name_detected(self):
         import dataclasses
+
         meta = _make_meta("Original Name")
         signed = sign_metadata(meta, PrivateKey())
         tampered = dataclasses.replace(signed, name="Tampered Name")
-        valid, err = verify_creator_signature(tampered)
+        valid, _err = verify_creator_signature(tampered)
         assert valid is False
 
     def test_tampered_description_detected(self):
         import dataclasses
+
         meta = GlyphMetadata(
             protocol=[GlyphProtocol.NFT],
             name="Token",
@@ -488,11 +509,12 @@ class TestRT11CreatorSigTamper:
         )
         signed = sign_metadata(meta, PrivateKey())
         tampered = dataclasses.replace(signed, description="Changed desc")
-        valid, err = verify_creator_signature(tampered)
+        valid, _err = verify_creator_signature(tampered)
         assert valid is False
 
     def test_tampered_royalty_detected(self):
         import dataclasses
+
         meta = GlyphMetadata(
             protocol=[GlyphProtocol.NFT],
             name="Token",
@@ -503,12 +525,13 @@ class TestRT11CreatorSigTamper:
             signed,
             royalty=GlyphRoyalty(bps=500, address="rxd1attacker"),
         )
-        valid, err = verify_creator_signature(tampered)
+        valid, _err = verify_creator_signature(tampered)
         assert valid is False
 
     def test_sig_payload_replay_across_tokens_detected(self):
         """A sig from token A must not verify token B (different name)."""
         import dataclasses
+
         meta_a = _make_meta("Token A")
         meta_b = _make_meta("Token B")
         key = PrivateKey()

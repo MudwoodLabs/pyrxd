@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import cbor2
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any
+
+import cbor2
 
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
@@ -31,20 +32,20 @@ class CommitParams:
     """Parameters for the commit transaction."""
 
     metadata: GlyphMetadata
-    owner_pkh: Hex20          # who will own the NFT/FT after reveal
-    change_pkh: Hex20         # change output recipient
-    funding_satoshis: int     # total input satoshis available
-    dust_limit: int = 546     # minimum output value
+    owner_pkh: Hex20  # who will own the NFT/FT after reveal
+    change_pkh: Hex20  # change output recipient
+    funding_satoshis: int  # total input satoshis available
+    dust_limit: int = 546  # minimum output value
 
 
 @dataclass
 class CommitResult:
     """Output of prepare_commit — the caller broadcasts and gets a txid back."""
 
-    commit_script: bytes    # nftCommitScript for vout[0]
-    cbor_bytes: bytes       # store this — needed for reveal scriptSig
-    payload_hash: bytes     # 32-byte hash committed into the script
-    estimated_fee: int      # in photons
+    commit_script: bytes  # nftCommitScript for vout[0]
+    cbor_bytes: bytes  # store this — needed for reveal scriptSig
+    payload_hash: bytes  # 32-byte hash committed into the script
+    estimated_fee: int  # in photons
 
 
 @dataclass
@@ -60,20 +61,20 @@ class RevealParams:
     commit script's embedded PKH.
     """
 
-    commit_txid: str       # txid of confirmed commit tx
-    commit_vout: int       # which output is the commit script
-    commit_value: int      # satoshis in the commit output
-    cbor_bytes: bytes      # from CommitResult
-    owner_pkh: Hex20       # recipient PKH — can differ from commit spender PKH
-    is_nft: bool           # True = NFT, False = FT
+    commit_txid: str  # txid of confirmed commit tx
+    commit_vout: int  # which output is the commit script
+    commit_value: int  # satoshis in the commit output
+    cbor_bytes: bytes  # from CommitResult
+    owner_pkh: Hex20  # recipient PKH — can differ from commit spender PKH
+    is_nft: bool  # True = NFT, False = FT
 
 
 @dataclass
 class RevealScripts:
     """Scripts needed to build the reveal tx — caller constructs the full tx."""
 
-    locking_script: bytes      # output scriptPubKey
-    scriptsig_suffix: bytes    # the 'gly' + CBOR portion; caller prepends sig+pubkey
+    locking_script: bytes  # output scriptPubKey
+    scriptsig_suffix: bytes  # the 'gly' + CBOR portion; caller prepends sig+pubkey
 
 
 @dataclass
@@ -86,9 +87,9 @@ class FtDeployRevealScripts:
     reveal script construction is shared with non-premine FT reveals.
     """
 
-    locking_script: bytes       # 75-byte FT locking script for vout[0]
-    scriptsig_suffix: bytes     # the 'gly' + CBOR portion
-    premine_amount: int         # caller sets vout[0].value = this (1 photon = 1 FT unit)
+    locking_script: bytes  # 75-byte FT locking script for vout[0]
+    scriptsig_suffix: bytes  # the 'gly' + CBOR portion
+    premine_amount: int  # caller sets vout[0].value = this (1 photon = 1 FT unit)
 
 
 @dataclass
@@ -96,10 +97,10 @@ class MutableRevealScripts:
     """Scripts for a MUT reveal — two outputs required."""
 
     ref: GlyphRef
-    nft_script: bytes           # 63-byte NFT singleton (vout[0] typically)
-    contract_script: bytes      # 174-byte mutable contract (vout[1] typically)
-    scriptsig_suffix: bytes     # 'gly' + CBOR; caller prepends sig + pubkey
-    payload_hash: bytes         # sha256d of CBOR payload
+    nft_script: bytes  # 63-byte NFT singleton (vout[0] typically)
+    contract_script: bytes  # 174-byte mutable contract (vout[1] typically)
+    scriptsig_suffix: bytes  # 'gly' + CBOR; caller prepends sig + pubkey
+    payload_hash: bytes  # sha256d of CBOR payload
 
 
 @dataclass
@@ -107,9 +108,9 @@ class ContainerRevealScripts:
     """Scripts for a CONTAINER reveal."""
 
     ref: GlyphRef
-    locking_script: bytes       # NFT body, optionally prefixed with child ref
+    locking_script: bytes  # NFT body, optionally prefixed with child ref
     scriptsig_suffix: bytes
-    child_ref: "Optional[GlyphRef]"
+    child_ref: GlyphRef | None
 
 
 class GlyphBuilder:
@@ -178,7 +179,9 @@ class GlyphBuilder:
         cbor_bytes, payload_hash = encode_payload(params.metadata)
         is_nft = GlyphProtocol.NFT in params.metadata.protocol
         commit_script = build_commit_locking_script(
-            payload_hash, params.owner_pkh, is_nft=is_nft,
+            payload_hash,
+            params.owner_pkh,
+            is_nft=is_nft,
         )
         # Rough estimate: commit tx ~276 bytes
         estimated_fee = 276 * MIN_FEE_RATE
@@ -269,14 +272,16 @@ class GlyphBuilder:
                 f"premine_amount ({premine_amount}) is below the dust limit (546). "
                 "Use a larger supply or a different token model."
             )
-        scripts = self.prepare_reveal(RevealParams(
-            commit_txid=commit_txid,
-            commit_vout=commit_vout,
-            commit_value=commit_value,
-            cbor_bytes=cbor_bytes,
-            owner_pkh=premine_pkh,
-            is_nft=False,
-        ))
+        scripts = self.prepare_reveal(
+            RevealParams(
+                commit_txid=commit_txid,
+                commit_vout=commit_vout,
+                commit_value=commit_value,
+                cbor_bytes=cbor_bytes,
+                owner_pkh=premine_pkh,
+                is_nft=False,
+            )
+        )
         return FtDeployRevealScripts(
             locking_script=scripts.locking_script,
             scriptsig_suffix=scripts.scriptsig_suffix,
@@ -285,8 +290,8 @@ class GlyphBuilder:
 
     def prepare_dmint_deploy(
         self,
-        params: "DmintFullDeployParams",
-    ) -> "DmintDeployResult":
+        params: DmintFullDeployParams,
+    ) -> DmintDeployResult:
         """Prepare a full dMint token deploy: commit + reveal + deploy scripts.
 
         A dMint deploy requires **three** transactions in sequence:
@@ -333,7 +338,9 @@ class GlyphBuilder:
         # 2. Build commit script (FT shape — dMint tokens are FTs).
         is_nft = GlyphProtocol.NFT in params.metadata.protocol
         commit_script = build_commit_locking_script(
-            payload_hash, params.owner_pkh, is_nft=is_nft,
+            payload_hash,
+            params.owner_pkh,
+            is_nft=is_nft,
         )
         estimated_commit_fee = 276 * MIN_FEE_RATE
 
@@ -350,9 +357,7 @@ class GlyphBuilder:
         #    The caller must pass the actual commit_txid + commit_vout when
         #    constructing the reveal tx.
         if params.premine_amount is not None and params.premine_amount < 546:
-            raise ValidationError(
-                f"premine_amount ({params.premine_amount}) is below the dust limit (546)."
-            )
+            raise ValidationError(f"premine_amount ({params.premine_amount}) is below the dust limit (546).")
 
         # 4. Build the deploy contract script.
         #    The token_ref and contract_ref are only known after the reveal tx
@@ -401,7 +406,7 @@ class GlyphBuilder:
         commit_vout: int,
         cbor_bytes: bytes,
         owner_pkh: Hex20,
-    ) -> "MutableRevealScripts":
+    ) -> MutableRevealScripts:
         """Prepare scripts for a MUT (mutable NFT) reveal.
 
         Returns the two output locking scripts the caller must place in the
@@ -449,8 +454,8 @@ class GlyphBuilder:
         commit_vout: int,
         cbor_bytes: bytes,
         owner_pkh: Hex20,
-        child_ref: "Optional[GlyphRef]" = None,
-    ) -> "ContainerRevealScripts":
+        child_ref: GlyphRef | None = None,
+    ) -> ContainerRevealScripts:
         """Prepare scripts for a CONTAINER reveal.
 
         A container is an NFT with an additional ``OP_PUSHINPUTREF <child_ref>``
@@ -464,8 +469,7 @@ class GlyphBuilder:
             protocol = cbor_data.get("p", [])
             if GlyphProtocol.CONTAINER not in protocol:
                 raise ValidationError(
-                    f"CBOR protocol field {protocol!r} must include "
-                    f"GlyphProtocol.CONTAINER ({GlyphProtocol.CONTAINER})"
+                    f"CBOR protocol field {protocol!r} must include GlyphProtocol.CONTAINER ({GlyphProtocol.CONTAINER})"
                 )
         except ValidationError:
             raise
@@ -500,7 +504,7 @@ class GlyphBuilder:
         cbor_bytes: bytes,
         owner_pkh: Hex20,
         name: str,
-    ) -> "MutableRevealScripts":
+    ) -> MutableRevealScripts:
         """Prepare scripts for a WAVE (on-chain naming) reveal.
 
         WAVE extends MUT with a ``name`` field in the CBOR payload.
@@ -513,9 +517,7 @@ class GlyphBuilder:
         Protocol requirement: ``[NFT(2), MUT(5), WAVE(11)]``.
         """
         if not name or not name.isprintable() or len(name) > 255:
-            raise ValidationError(
-                "WAVE name must be non-empty printable ASCII, max 255 characters"
-            )
+            raise ValidationError("WAVE name must be non-empty printable ASCII, max 255 characters")
         try:
             cbor_data = cbor2.loads(cbor_bytes)
             protocol = cbor_data.get("p", [])
@@ -524,14 +526,10 @@ class GlyphBuilder:
                     f"CBOR protocol field {protocol!r} must include GlyphProtocol.WAVE ({GlyphProtocol.WAVE})"
                 )
             if GlyphProtocol.MUT not in protocol:
-                raise ValidationError(
-                    f"WAVE protocol must also include GlyphProtocol.MUT ({GlyphProtocol.MUT})"
-                )
+                raise ValidationError(f"WAVE protocol must also include GlyphProtocol.MUT ({GlyphProtocol.MUT})")
             cbor_name = cbor_data.get("name") or cbor_data.get("n", "")
             if cbor_name != name:
-                raise ValidationError(
-                    f"name argument {name!r} does not match CBOR name field {cbor_name!r}"
-                )
+                raise ValidationError(f"name argument {name!r} does not match CBOR name field {cbor_name!r}")
         except ValidationError:
             raise
         except Exception as exc:
@@ -556,7 +554,7 @@ class GlyphBuilder:
             return build_nft_locking_script(new_owner_pkh, ref)
         return build_ft_locking_script(new_owner_pkh, ref)
 
-    def build_nft_transfer_tx(self, params: "TransferParams") -> "TransferResult":
+    def build_nft_transfer_tx(self, params: TransferParams) -> TransferResult:
         """
         Build a signed NFT transfer transaction.
 
@@ -612,7 +610,7 @@ class GlyphBuilder:
         # Override txid so signing uses the real UTXO's txid, not the shim's hash.
         src.txid = lambda: params.nft_utxo_txid  # type: ignore[method-assign]
 
-        def _make_input() -> "TransactionInput":
+        def _make_input() -> TransactionInput:
             inp = TransactionInput(
                 source_transaction=src,
                 source_txid=params.nft_utxo_txid,
@@ -663,7 +661,7 @@ class GlyphBuilder:
             fee=fee,
         )
 
-    def build_ft_transfer_tx(self, params: "FtTransferParams") -> "FtTransferResult":
+    def build_ft_transfer_tx(self, params: FtTransferParams) -> FtTransferResult:
         """Build a signed FT transfer transaction enforcing conservation.
 
         Thin delegator to :meth:`FtUtxoSet.build_transfer_tx` — the real logic
@@ -694,7 +692,7 @@ class GlyphBuilder:
 # dMint deploy API dataclasses
 # ---------------------------------------------------------------------------
 
-from .dmint import DmintAlgo, DaaMode  # noqa: E402 (after class def — no circular dep)
+from .dmint import DaaMode, DmintAlgo  # noqa: E402 (after class def — no circular dep)
 
 
 @dataclass
@@ -732,9 +730,9 @@ class DmintFullDeployParams:
     reward_photons: int
     difficulty: int
     initial_pool_photons: int
-    premine_amount: Optional[int] = None
+    premine_amount: int | None = None
     contract_ref_placeholder: GlyphRef = None  # type: ignore[assignment]
-    token_ref_placeholder: GlyphRef = None      # type: ignore[assignment]
+    token_ref_placeholder: GlyphRef = None  # type: ignore[assignment]
     algo: DmintAlgo = DmintAlgo.SHA256D
     daa_mode: DaaMode = DaaMode.FIXED
     target_time: int = 60
@@ -742,9 +740,9 @@ class DmintFullDeployParams:
 
     def __post_init__(self) -> None:
         if self.contract_ref_placeholder is None:
-            self.contract_ref_placeholder = GlyphRef(txid='00' * 32, vout=0)
+            self.contract_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
         if self.token_ref_placeholder is None:
-            self.token_ref_placeholder = GlyphRef(txid='00' * 32, vout=0)
+            self.token_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
 
 
 @dataclass
@@ -768,7 +766,7 @@ class DmintDeployResult:
     commit_result: CommitResult
     cbor_bytes: bytes
     owner_pkh: Hex20
-    premine_amount: Optional[int]
+    premine_amount: int | None
     deploy_params_template: DmintDeployParams
     placeholder_contract_script: bytes
     initial_pool_photons: int
@@ -778,7 +776,7 @@ class DmintDeployResult:
         commit_txid: str,
         commit_vout: int,
         commit_value: int,
-    ) -> "FtDeployRevealScripts | RevealScripts":
+    ) -> FtDeployRevealScripts | RevealScripts:
         """Build reveal scripts given the confirmed commit outpoint.
 
         :param commit_txid:   txid of the confirmed commit tx.
@@ -797,14 +795,16 @@ class DmintDeployResult:
                 premine_pkh=self.owner_pkh,
                 premine_amount=self.premine_amount,
             )
-        return builder.prepare_reveal(RevealParams(
-            commit_txid=commit_txid,
-            commit_vout=commit_vout,
-            commit_value=commit_value,
-            cbor_bytes=self.cbor_bytes,
-            owner_pkh=self.owner_pkh,
-            is_nft=False,
-        ))
+        return builder.prepare_reveal(
+            RevealParams(
+                commit_txid=commit_txid,
+                commit_vout=commit_vout,
+                commit_value=commit_value,
+                cbor_bytes=self.cbor_bytes,
+                owner_pkh=self.owner_pkh,
+                is_nft=False,
+            )
+        )
 
     def build_contract_script(
         self,
@@ -836,6 +836,7 @@ class DmintDeployResult:
 # Module-level dataclasses for the transfer API. Kept at bottom so the docstring
 # in build_nft_transfer_tx can forward-reference "TransferParams" / "TransferResult"
 # without needing a TYPE_CHECKING import.
+
 
 @dataclass
 class TransferParams:

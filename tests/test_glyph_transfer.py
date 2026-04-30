@@ -1,4 +1,5 @@
 """Tests for GlyphBuilder.build_nft_transfer_tx — offline, no network calls."""
+
 from __future__ import annotations
 
 import pytest
@@ -22,13 +23,13 @@ from pyrxd.transaction.transaction import Transaction
 
 # Deterministic synthetic private key (int → bytes). Never funded, no network.
 _ALICE_KEY_INT = 0x1111111111111111111111111111111111111111111111111111111111111111
-_BOB_PKH = bytes(range(20, 40))         # 20 bytes, distinct from Alice
-_CHARLIE_PKH = bytes(range(40, 60))     # 20 bytes, distinct
+_BOB_PKH = bytes(range(20, 40))  # 20 bytes, distinct from Alice
+_CHARLIE_PKH = bytes(range(40, 60))  # 20 bytes, distinct
 
 # A synthetic NFT UTXO: txid + vout + value + locking script
-NFT_UTXO_TXID = "ab" * 32               # 64 hex chars
+NFT_UTXO_TXID = "ab" * 32  # 64 hex chars
 NFT_UTXO_VOUT = 1
-NFT_UTXO_VALUE = 5_000_000              # 5M photons — plenty for a transfer fee
+NFT_UTXO_VALUE = 5_000_000  # 5M photons — plenty for a transfer fee
 
 
 def _alice_private_key() -> PrivateKey:
@@ -66,6 +67,7 @@ def _transfer_params(
 # ---------------------------------------------------------------------------
 # Happy path / structural assertions
 # ---------------------------------------------------------------------------
+
 
 class TestHappyPath:
     def test_returns_transfer_result(self):
@@ -111,6 +113,7 @@ class TestHappyPath:
 # Ref & owner preservation / redirection
 # ---------------------------------------------------------------------------
 
+
 class TestRefAndOwner:
     def test_ref_preserved_across_transfer(self):
         existing = _existing_nft_script()
@@ -124,30 +127,25 @@ class TestRefAndOwner:
         assert result.ref.vout == input_ref.vout
 
     def test_new_owner_pkh_in_new_script(self):
-        result = GlyphBuilder().build_nft_transfer_tx(
-            _transfer_params(new_owner_pkh=_BOB_PKH)
-        )
+        result = GlyphBuilder().build_nft_transfer_tx(_transfer_params(new_owner_pkh=_BOB_PKH))
         owner_in_output = extract_owner_pkh_from_nft_script(result.new_nft_script)
         assert bytes(owner_in_output) == _BOB_PKH
 
     def test_old_owner_pkh_not_in_new_script(self):
-        result = GlyphBuilder().build_nft_transfer_tx(
-            _transfer_params(new_owner_pkh=_BOB_PKH)
-        )
+        result = GlyphBuilder().build_nft_transfer_tx(_transfer_params(new_owner_pkh=_BOB_PKH))
         owner_in_output = extract_owner_pkh_from_nft_script(result.new_nft_script)
         assert bytes(owner_in_output) != _alice_pkh()
 
     def test_transfer_to_third_owner(self):
         # Transfer to Charlie instead of Bob — different pkh, still a valid transfer.
-        result = GlyphBuilder().build_nft_transfer_tx(
-            _transfer_params(new_owner_pkh=_CHARLIE_PKH)
-        )
+        result = GlyphBuilder().build_nft_transfer_tx(_transfer_params(new_owner_pkh=_CHARLIE_PKH))
         assert bytes(extract_owner_pkh_from_nft_script(result.new_nft_script)) == _CHARLIE_PKH
 
 
 # ---------------------------------------------------------------------------
 # Fee arithmetic
 # ---------------------------------------------------------------------------
+
 
 class TestFee:
     def test_fee_deducted_from_nft_value(self):
@@ -178,6 +176,7 @@ class TestFee:
 # Dust / insufficient-value
 # ---------------------------------------------------------------------------
 
+
 class TestDust:
     def test_value_below_dust_after_fee_raises(self):
         # Tiny UTXO that can't cover fee + 546 dust.
@@ -203,6 +202,7 @@ class TestDust:
 # ---------------------------------------------------------------------------
 # Input validation
 # ---------------------------------------------------------------------------
+
 
 class TestInputValidation:
     def test_wrong_script_length_raises(self):
@@ -232,6 +232,7 @@ class TestInputValidation:
 # ---------------------------------------------------------------------------
 # Two-pass signing correctness
 # ---------------------------------------------------------------------------
+
 
 class TestTwoPassSigning:
     def test_final_signature_is_over_final_outputs(self):
@@ -273,17 +274,16 @@ class TestTwoPassSigning:
         inp.locking_script = Script(bytes(params.nft_script))
         independent = Transaction(
             tx_inputs=[inp],
-            tx_outputs=[TransactionOutput(
-                Script(result.new_nft_script),
-                params.nft_utxo_value - result.fee,
-            )],
+            tx_outputs=[
+                TransactionOutput(
+                    Script(result.new_nft_script),
+                    params.nft_utxo_value - result.fee,
+                )
+            ],
         )
         independent.sign()
 
-        assert (
-            result.tx.inputs[0].unlocking_script.serialize()
-            == independent.inputs[0].unlocking_script.serialize()
-        )
+        assert result.tx.inputs[0].unlocking_script.serialize() == independent.inputs[0].unlocking_script.serialize()
 
     def test_tx_serializes_cleanly(self):
         # Signed tx with a single input/output must serialize to valid bytes.
@@ -296,6 +296,7 @@ class TestTwoPassSigning:
 # ---------------------------------------------------------------------------
 # Misc: TransferParams defaults
 # ---------------------------------------------------------------------------
+
 
 class TestTransferParamsDefaults:
     def test_default_fee_rate_is_10_000(self):

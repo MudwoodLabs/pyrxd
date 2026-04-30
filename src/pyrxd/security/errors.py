@@ -54,9 +54,7 @@ def _looks_like_key_material(value: str) -> bool:
         return True
     # BIP-39 mnemonic heuristic: >=8 space-separated ASCII lowercase tokens.
     tokens = value.split()
-    if len(tokens) >= 8 and all(t.isascii() and t.isalpha() and t.islower() for t in tokens):
-        return True
-    return False
+    return bool(len(tokens) >= 8 and all(t.isascii() and t.isalpha() and t.islower() for t in tokens))
 
 
 def redact(value: Any) -> Any:

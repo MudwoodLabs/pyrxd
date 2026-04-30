@@ -7,6 +7,7 @@ Covers:
 - prepare_commit auto-derives refType from metadata.protocol
 - prepare_ft_deploy_reveal returns correct 75-byte FT locking script + premine amount
 """
+
 from __future__ import annotations
 
 import pytest
@@ -46,10 +47,13 @@ class TestGlyphMetadataDmintFields:
     def test_for_dmint_ft_rejects_dmint_alone_protocol_override(self):
         """[4] alone is now blocked — prepare_reveal requires FT=1."""
         import pytest
+
         from pyrxd.security.errors import ValidationError
+
         with pytest.raises(ValidationError, match="requires FT"):
             GlyphMetadata.for_dmint_ft(
-                ticker="TST", name="Test Token",
+                ticker="TST",
+                name="Test Token",
                 protocol=[GlyphProtocol.DMINT],
             )
 
@@ -80,15 +84,19 @@ class TestGlyphMetadataDmintFields:
         cbor_bytes, _ = encode_payload(meta)
         # CBOR dict should not include decimals key (encode uses `if self.decimals`)
         import cbor2
+
         d = cbor2.loads(cbor_bytes)
         assert "decimals" not in d
 
     def test_decimals_nonzero_included_in_cbor(self):
         meta = GlyphMetadata.for_dmint_ft(
-            ticker="TST", name="Test Token", decimals=8,
+            ticker="TST",
+            name="Test Token",
+            decimals=8,
         )
         cbor_bytes, _ = encode_payload(meta)
         import cbor2
+
         d = cbor2.loads(cbor_bytes)
         assert d["decimals"] == 8
 
@@ -96,6 +104,7 @@ class TestGlyphMetadataDmintFields:
         meta = GlyphMetadata.for_dmint_ft(ticker="TST", name="Test Token")
         cbor_bytes, _ = encode_payload(meta)
         import cbor2
+
         d = cbor2.loads(cbor_bytes)
         assert "image" not in d
         assert "image_ipfs" not in d
@@ -104,6 +113,7 @@ class TestGlyphMetadataDmintFields:
     def test_backward_compat_old_metadata_still_decodes(self):
         """A pre-0.2 CBOR payload (no decimals/image fields) must still decode."""
         import cbor2
+
         old_cbor = cbor2.dumps({"p": [1, 4], "name": "TST", "ticker": "TST"})
         decoded = decode_payload(old_cbor)
         assert list(decoded.protocol) == [1, 4]
@@ -142,9 +152,9 @@ class TestCommitLockingScriptFtBranch:
         diffs = [(i, a, b) for i, (a, b) in enumerate(zip(nft_script, ft_script)) if a != b]
         assert len(diffs) == 1
         offset, nft_byte, ft_byte = diffs[0]
-        assert offset == 48       # the OP_N byte (0xda at 47, OP_N at 48)
-        assert nft_byte == 0x52   # OP_2
-        assert ft_byte == 0x51    # OP_1
+        assert offset == 48  # the OP_N byte (0xda at 47, OP_N at 48)
+        assert nft_byte == 0x52  # OP_2
+        assert ft_byte == 0x51  # OP_1
 
     def test_commit_script_length_unchanged(self):
         """Both FT and NFT commits are the same fixed length — no refactor regression."""
@@ -162,24 +172,28 @@ class TestPrepareCommitRefTypeAutoDerivation:
     def test_nft_metadata_produces_nft_commit_script(self):
         builder = GlyphBuilder()
         meta = GlyphMetadata(protocol=[GlyphProtocol.NFT], name="TestNFT")
-        result = builder.prepare_commit(CommitParams(
-            metadata=meta,
-            owner_pkh=FUNDING_PKH,
-            change_pkh=FUNDING_PKH,
-            funding_satoshis=1_000_000,
-        ))
+        result = builder.prepare_commit(
+            CommitParams(
+                metadata=meta,
+                owner_pkh=FUNDING_PKH,
+                change_pkh=FUNDING_PKH,
+                funding_satoshis=1_000_000,
+            )
+        )
         # NFT commit: OP_2 at offset 46
         assert result.commit_script[48] == 0x52
 
     def test_ft_metadata_produces_ft_commit_script(self):
         builder = GlyphBuilder()
         meta = GlyphMetadata(protocol=[GlyphProtocol.FT], name="TestFT", ticker="TFT")
-        result = builder.prepare_commit(CommitParams(
-            metadata=meta,
-            owner_pkh=FUNDING_PKH,
-            change_pkh=FUNDING_PKH,
-            funding_satoshis=1_000_000,
-        ))
+        result = builder.prepare_commit(
+            CommitParams(
+                metadata=meta,
+                owner_pkh=FUNDING_PKH,
+                change_pkh=FUNDING_PKH,
+                funding_satoshis=1_000_000,
+            )
+        )
         # FT commit: OP_1 at offset 46
         assert result.commit_script[48] == 0x51
 
@@ -187,18 +201,22 @@ class TestPrepareCommitRefTypeAutoDerivation:
         """[1, 4] should produce FT commit (NORMAL refType), not NFT."""
         builder = GlyphBuilder()
         meta = GlyphMetadata.for_dmint_ft(ticker="TST", name="Test Token")
-        result = builder.prepare_commit(CommitParams(
-            metadata=meta,
-            owner_pkh=FUNDING_PKH,
-            change_pkh=FUNDING_PKH,
-            funding_satoshis=1_000_000,
-        ))
+        result = builder.prepare_commit(
+            CommitParams(
+                metadata=meta,
+                owner_pkh=FUNDING_PKH,
+                change_pkh=FUNDING_PKH,
+                funding_satoshis=1_000_000,
+            )
+        )
         assert result.commit_script[48] == 0x51
 
     def test_dmint_only_metadata_raises_at_construction(self):
         """[4] alone is blocked at GlyphMetadata construction — prepare_reveal requires FT=1."""
         import pytest
+
         from pyrxd.security.errors import ValidationError
+
         with pytest.raises(ValidationError, match="requires FT"):
             GlyphMetadata(protocol=[GlyphProtocol.DMINT], name="TST")
 
@@ -211,14 +229,19 @@ class TestPrepareCommitRefTypeAutoDerivation:
 class TestPrepareFtDeployReveal:
     def _build_commit(self, builder: GlyphBuilder, protocol: list[int]):
         meta = GlyphMetadata(
-            protocol=protocol, name="TST", ticker="TST", decimals=0,
+            protocol=protocol,
+            name="TST",
+            ticker="TST",
+            decimals=0,
         )
-        return builder.prepare_commit(CommitParams(
-            metadata=meta,
-            owner_pkh=FUNDING_PKH,
-            change_pkh=FUNDING_PKH,
-            funding_satoshis=2_000_000_000,
-        ))
+        return builder.prepare_commit(
+            CommitParams(
+                metadata=meta,
+                owner_pkh=FUNDING_PKH,
+                change_pkh=FUNDING_PKH,
+                funding_satoshis=2_000_000_000,
+            )
+        )
 
     def test_returns_75_byte_ft_locking_script(self):
         builder = GlyphBuilder()
@@ -308,8 +331,8 @@ class TestPrepareFtDeployReveal:
         [
             (544, False),  # below dust
             (545, False),  # one-photon-below dust — must reject
-            (546, True),   # exact dust limit — must accept
-            (547, True),   # one-photon-above dust — must accept
+            (546, True),  # exact dust limit — must accept
+            (547, True),  # one-photon-above dust — must accept
             (1000, True),  # well above
         ],
     )

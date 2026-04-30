@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import os
 from enum import Enum
-from typing import Dict, List
 
 NUMBER_BYTE_LENGTH: int = 32
 
@@ -53,11 +54,11 @@ class SIGHASH(int, Enum):
 #
 ADDRESS_MAINNET_PREFIX: bytes = b"\x00"
 ADDRESS_TESTNET_PREFIX: bytes = b"\x6f"
-NETWORK_ADDRESS_PREFIX_DICT: Dict[Network, bytes] = {
+NETWORK_ADDRESS_PREFIX_DICT: dict[Network, bytes] = {
     Network.MAINNET: ADDRESS_MAINNET_PREFIX,
     Network.TESTNET: ADDRESS_TESTNET_PREFIX,
 }
-ADDRESS_PREFIX_NETWORK_DICT: Dict[bytes, Network] = {
+ADDRESS_PREFIX_NETWORK_DICT: dict[bytes, Network] = {
     ADDRESS_MAINNET_PREFIX: Network.MAINNET,
     ADDRESS_TESTNET_PREFIX: Network.TESTNET,
 }
@@ -67,11 +68,11 @@ ADDRESS_PREFIX_NETWORK_DICT: Dict[bytes, Network] = {
 #
 WIF_MAINNET_PREFIX: bytes = b"\x80"
 WIF_TESTNET_PREFIX: bytes = b"\xef"
-NETWORK_WIF_PREFIX_DICT: Dict[Network, bytes] = {
+NETWORK_WIF_PREFIX_DICT: dict[Network, bytes] = {
     Network.MAINNET: WIF_MAINNET_PREFIX,
     Network.TESTNET: WIF_TESTNET_PREFIX,
 }
-WIF_PREFIX_NETWORK_DICT: Dict[bytes, Network] = {
+WIF_PREFIX_NETWORK_DICT: dict[bytes, Network] = {
     WIF_MAINNET_PREFIX: Network.MAINNET,
     WIF_TESTNET_PREFIX: Network.TESTNET,
 }
@@ -81,26 +82,26 @@ WIF_PREFIX_NETWORK_DICT: Dict[bytes, Network] = {
 #
 PUBLIC_KEY_COMPRESSED_EVEN_Y_PREFIX: bytes = b"\x02"
 PUBLIC_KEY_COMPRESSED_ODD_Y_PREFIX: bytes = b"\x03"
-PUBLIC_KEY_COMPRESSED_PREFIX_LIST: List[bytes] = [
+PUBLIC_KEY_COMPRESSED_PREFIX_LIST: list[bytes] = [
     PUBLIC_KEY_COMPRESSED_EVEN_Y_PREFIX,
     PUBLIC_KEY_COMPRESSED_ODD_Y_PREFIX,
 ]
 PUBLIC_KEY_COMPRESSED_BYTE_LENGTH: int = 33
 PUBLIC_KEY_UNCOMPRESSED_BYTE_LENGTH: int = 65
-PUBLIC_KEY_BYTE_LENGTH_LIST: List[int] = [PUBLIC_KEY_COMPRESSED_BYTE_LENGTH, PUBLIC_KEY_UNCOMPRESSED_BYTE_LENGTH]
+PUBLIC_KEY_BYTE_LENGTH_LIST: list[int] = [PUBLIC_KEY_COMPRESSED_BYTE_LENGTH, PUBLIC_KEY_UNCOMPRESSED_BYTE_LENGTH]
 PUBLIC_KEY_HASH_BYTE_LENGTH: int = 20
 
 #
 # extended private key
 #
-XPRV_MAINNET_PREFIX: bytes = b"\x04\x88\xAD\xE4"
+XPRV_MAINNET_PREFIX: bytes = b"\x04\x88\xad\xe4"
 XPRV_TESTNET_PREFX: bytes = b"\x04\x35\x83\x94"
-XPRV_PREFIX_LIST: List[bytes] = [XPRV_MAINNET_PREFIX, XPRV_TESTNET_PREFX]
-NETWORK_XPRV_PREFIX_DICT: Dict[Network, bytes] = {
+XPRV_PREFIX_LIST: list[bytes] = [XPRV_MAINNET_PREFIX, XPRV_TESTNET_PREFX]
+NETWORK_XPRV_PREFIX_DICT: dict[Network, bytes] = {
     Network.MAINNET: XPRV_MAINNET_PREFIX,
     Network.TESTNET: XPRV_TESTNET_PREFX,
 }
-XPRV_PREFIX_NETWORK_DICT: Dict[bytes, Network] = {
+XPRV_PREFIX_NETWORK_DICT: dict[bytes, Network] = {
     XPRV_MAINNET_PREFIX: Network.MAINNET,
     XPRV_TESTNET_PREFX: Network.TESTNET,
 }
@@ -108,14 +109,14 @@ XPRV_PREFIX_NETWORK_DICT: Dict[bytes, Network] = {
 #
 # extended public key
 #
-XPUB_MAINNET_PREFIX: bytes = b"\x04\x88\xB2\x1E"
-XPUB_TESTNET_PREFIX: bytes = b"\x04\x35\x87\xCF"
-XPUB_PREFIX_LIST: List[bytes] = [XPUB_MAINNET_PREFIX, XPUB_TESTNET_PREFIX]
-NETWORK_XPUB_PREFIX_DICT: Dict[Network, bytes] = {
+XPUB_MAINNET_PREFIX: bytes = b"\x04\x88\xb2\x1e"
+XPUB_TESTNET_PREFIX: bytes = b"\x04\x35\x87\xcf"
+XPUB_PREFIX_LIST: list[bytes] = [XPUB_MAINNET_PREFIX, XPUB_TESTNET_PREFIX]
+NETWORK_XPUB_PREFIX_DICT: dict[Network, bytes] = {
     Network.MAINNET: XPUB_MAINNET_PREFIX,
     Network.TESTNET: XPUB_TESTNET_PREFIX,
 }
-XPUB_PREFIX_NETWORK_DICT: Dict[bytes, Network] = {
+XPUB_PREFIX_NETWORK_DICT: dict[bytes, Network] = {
     XPUB_MAINNET_PREFIX: Network.MAINNET,
     XPUB_TESTNET_PREFIX: Network.TESTNET,
 }
@@ -124,7 +125,7 @@ XPUB_PREFIX_NETWORK_DICT: Dict[bytes, Network] = {
 # extended key
 #
 XKEY_BYTE_LENGTH: int = 78
-XKEY_PREFIX_LIST: List[bytes] = XPRV_PREFIX_LIST + XPUB_PREFIX_LIST
+XKEY_PREFIX_LIST: list[bytes] = XPRV_PREFIX_LIST + XPUB_PREFIX_LIST
 #
 # BIP32
 #
@@ -132,7 +133,7 @@ BIP32_SEED_BYTE_LENGTH: int = 64
 #
 # BIP39
 #
-BIP39_ENTROPY_BIT_LENGTH_LIST: List[int] = [128, 160, 192, 224, 256]
+BIP39_ENTROPY_BIT_LENGTH_LIST: list[int] = [128, 160, 192, 224, 256]
 
 
 class OpCode(bytes, Enum):
@@ -337,5 +338,5 @@ class OpCode(bytes, Enum):
     OP_INVALIDOPCODE = b"\xff"
 
 
-OPCODE_VALUE_NAME_DICT: Dict[bytes, str] = {item.value: item.name for item in OpCode}
+OPCODE_VALUE_NAME_DICT: dict[bytes, str] = {item.value: item.name for item in OpCode}
 OPCODE_VALUE_NAME_DICT[b"\x00"] = "OP_0"

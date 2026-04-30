@@ -288,9 +288,7 @@ class TestFromWifInternalEdges:
 class TestZeroizeBufferLockFallback:
     """Exercises the fallback path in zeroize when ctypes.memset cannot lock the buffer."""
 
-    def test_zeroize_fallback_when_memset_fails(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_zeroize_fallback_when_memset_fails(self, monkeypatch: pytest.MonkeyPatch) -> None:
 
         from pyrxd.security import secrets as secrets_mod
 
@@ -334,24 +332,28 @@ class TestPrivateKeyMaterialGenerate:
 # Pickling / copy guards — SecretBytes refuses serialization
 # ---------------------------------------------------------------------------
 
+
 class TestSecretBytesSerializationGuards:
     """Closes coverage gap: SecretBytes must refuse pickle/copy/deepcopy
     so secret material cannot leak via accidental serialization."""
 
     def test_pickle_raises_typeerror(self):
         import pickle
+
         sb = SecretBytes(b"secret-payload-do-not-leak" + b"\x00" * 6)
         with pytest.raises(TypeError, match="cannot be pickled"):
             pickle.dumps(sb)
 
     def test_copy_raises_typeerror(self):
         import copy
+
         sb = SecretBytes(b"secret-payload-do-not-leak" + b"\x00" * 6)
         with pytest.raises(TypeError, match="cannot be copied"):
             copy.copy(sb)
 
     def test_deepcopy_raises_typeerror(self):
         import copy
+
         sb = SecretBytes(b"secret-payload-do-not-leak" + b"\x00" * 6)
         with pytest.raises(TypeError, match="cannot be deep-copied"):
             copy.deepcopy(sb)

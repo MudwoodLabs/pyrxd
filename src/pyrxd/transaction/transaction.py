@@ -1,24 +1,25 @@
+from __future__ import annotations
+
 from contextlib import suppress
-from typing import List, Optional, Union, Dict, Any
+from typing import Any
+
+from ..constants import (
+    TRANSACTION_FEE_RATE,
+    TRANSACTION_LOCKTIME,
+    TRANSACTION_VERSION,
+)
 
 # from .broadcaster import Broadcaster, BroadcastResponse
 # from .broadcasters import default_broadcaster
-
 # from .chaintracker import ChainTracker
 # from .chaintrackers import default_chain_tracker
 from ..fee_models import SatoshisPerKilobyte
-from ..constants import (
-    TRANSACTION_VERSION,
-    TRANSACTION_LOCKTIME,
-    TRANSACTION_FEE_RATE,
-)
 from ..hash import hash256
 from ..merkle_path import MerklePath
+from ..utils import Reader, Writer, reverse_hex_byte_order, unsigned_to_varint
 from .transaction_input import TransactionInput
 from .transaction_output import TransactionOutput
-
 from .transaction_preimage import tx_preimage
-from ..utils import unsigned_to_varint, Reader, Writer, reverse_hex_byte_order
 
 
 class InsufficientFunds(ValueError):
@@ -28,20 +29,20 @@ class InsufficientFunds(ValueError):
 class Transaction:
     def __init__(
         self,
-        tx_inputs: Optional[List[TransactionInput]] = None,
-        tx_outputs: Optional[List[TransactionOutput]] = None,
+        tx_inputs: list[TransactionInput] | None = None,
+        tx_outputs: list[TransactionOutput] | None = None,
         version: int = TRANSACTION_VERSION,
         locktime: int = TRANSACTION_LOCKTIME,
-        merkle_path: Optional[MerklePath] = None,
+        merkle_path: MerklePath | None = None,
         **kwargs,
     ):
-        self.inputs: List[TransactionInput] = tx_inputs or []
-        self.outputs: List[TransactionOutput] = tx_outputs or []
+        self.inputs: list[TransactionInput] = tx_inputs or []
+        self.outputs: list[TransactionOutput] = tx_outputs or []
         self.version: int = version
         self.locktime: int = locktime
         self.merkle_path = merkle_path
 
-        self.kwargs: Dict[str, Any] = dict(**kwargs) or {}
+        self.kwargs: dict[str, Any] = dict(**kwargs) or {}
 
     def serialize(self) -> bytes:
         raw = self.version.to_bytes(4, "little")
@@ -54,23 +55,23 @@ class Transaction:
         raw += self.locktime.to_bytes(4, "little")
         return raw
 
-    def add_input(self, tx_input: TransactionInput) -> "Transaction":  # pragma: no cover
+    def add_input(self, tx_input: TransactionInput) -> Transaction:  # pragma: no cover
         if isinstance(tx_input, TransactionInput):
             self.inputs.append(tx_input)
         else:
             raise TypeError("unsupported transaction input type")
         return self
 
-    def add_inputs(self, tx_inputs: List[TransactionInput]) -> "Transaction":
+    def add_inputs(self, tx_inputs: list[TransactionInput]) -> Transaction:
         for tx_input in tx_inputs:
             self.add_input(tx_input)
         return self
 
-    def add_output(self, tx_output: TransactionOutput) -> "Transaction":  # pragma: no cover
+    def add_output(self, tx_output: TransactionOutput) -> Transaction:  # pragma: no cover
         self.outputs.append(tx_output)
         return self
 
-    def add_outputs(self, tx_outputs: List[TransactionOutput]) -> "Transaction":
+    def add_outputs(self, tx_outputs: list[TransactionOutput]) -> Transaction:
         for tx_output in tx_outputs:
             self.add_output(tx_output)
         return self
@@ -97,7 +98,7 @@ class Transaction:
             raise ValueError(f"index out of range [0, {len(self.inputs)})")
         return tx_preimage(index, self.inputs, self.outputs, self.version, self.locktime)
 
-    def sign(self, bypass: bool = True) -> "Transaction":  # pragma: no cover
+    def sign(self, bypass: bool = True) -> Transaction:  # pragma: no cover
         """
         :bypass: if True then ONLY sign inputs which unlocking script is None, otherwise sign all the inputs
         sign all inputs according to their script type
@@ -223,7 +224,7 @@ class Transaction:
     #     return await broadcaster.broadcast(self)
 
     @classmethod
-    def from_hex(cls, stream: Union[str, bytes, Reader]) -> Optional["Transaction"]:
+    def from_hex(cls, stream: str | bytes | Reader) -> Transaction | None:
         with suppress(Exception):
             if isinstance(stream, str):
                 return cls.from_reader(Reader(bytes.fromhex(stream)))
@@ -233,7 +234,7 @@ class Transaction:
         return None
 
     @classmethod
-    def from_beef(cls, stream: Union[str, bytes, Reader]) -> "Transaction":
+    def from_beef(cls, stream: str | bytes | Reader) -> Transaction:
         stream = (
             stream
             if isinstance(stream, Reader)
@@ -362,7 +363,7 @@ class Transaction:
         return writer.to_bytes()
 
     @classmethod
-    def from_reader(cls, reader: Reader) -> "Transaction":
+    def from_reader(cls, reader: Reader) -> Transaction:
         t = cls()
         t.version = reader.read_uint32_le()
         if t.version is None:
@@ -389,7 +390,7 @@ class Transaction:
         return t
 
     @classmethod
-    def parse_script_offsets(cls, octets: Union[bytes, str]) -> Dict[str, List[Dict[str, int]]]:
+    def parse_script_offsets(cls, octets: bytes | str) -> dict[str, list[dict[str, int]]]:
         """
         Since the validation of blockchain data is atomically transaction data validation,
         any application seeking to validate data in output scripts must store the entire transaction as well.
@@ -409,8 +410,8 @@ class Transaction:
             octets = bytes.fromhex(octets)
 
         br = Reader(octets)
-        inputs: List[Dict[str, int]] = []
-        outputs: List[Dict[str, int]] = []
+        inputs: list[dict[str, int]] = []
+        outputs: list[dict[str, int]] = []
 
         br.read(4)  # skip version
         inputs_length = br.read_var_int_num()

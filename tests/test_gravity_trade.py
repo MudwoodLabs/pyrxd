@@ -37,7 +37,6 @@ from pyrxd.security.errors import NetworkError, SpvVerificationError, Validation
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.security.types import BlockHeight, RawTx, Txid
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -49,7 +48,7 @@ TAKER_PKH = bytes.fromhex("aa" * 20)
 # Minimal valid GravityOffer with synthetic redeem scripts (not executable on
 # chain — just enough bytes to pass validation in build_claim_tx / types).
 # offer_redeem_hex: arbitrary 33 bytes (> 0, < 76 for single push)
-OFFER_REDEEM = bytes([0x51] * 33)   # OP_1 x33 — fictional script
+OFFER_REDEEM = bytes([0x51] * 33)  # OP_1 x33 — fictional script
 CLAIMED_REDEEM = bytes([0x52] * 33)  # OP_2 x33
 
 
@@ -70,9 +69,8 @@ def make_offer(**kwargs) -> GravityOffer:
     defaults.update(kwargs)
     if "expected_code_hash_hex" not in defaults:
         from pyrxd.gravity.codehash import compute_p2sh_code_hash
-        defaults["expected_code_hash_hex"] = compute_p2sh_code_hash(
-            bytes.fromhex(defaults["claimed_redeem_hex"])
-        ).hex()
+
+        defaults["expected_code_hash_hex"] = compute_p2sh_code_hash(bytes.fromhex(defaults["claimed_redeem_hex"])).hex()
     return GravityOffer(**defaults)
 
 
@@ -323,6 +321,7 @@ class TestWaitConfirmations:
         # First call (min_conf=0): tx visible in mempool
         # Second call (min_conf=1): first poll not confirmed, second poll confirmed
         call_count = {"n": 0}
+
         async def fake_get_raw_tx(txid, min_confirmations=6):
             call_count["n"] += 1
             if min_confirmations == 0:
@@ -330,6 +329,7 @@ class TestWaitConfirmations:
             if call_count["n"] <= 2:
                 raise NetworkError("not yet confirmed")
             return raw  # confirmed on 3rd overall call
+
         btc.get_raw_tx.side_effect = fake_get_raw_tx
 
         cfg = TradeConfig(min_btc_confirmations=1, poll_interval_seconds=0.01, max_poll_attempts=5)
@@ -347,6 +347,7 @@ class TestWaitConfirmations:
             if min_confirmations == 0:
                 return raw
             raise NetworkError("still waiting")
+
         btc.get_raw_tx.side_effect = fake_get_raw_tx
 
         cfg = TradeConfig(min_btc_confirmations=6, poll_interval_seconds=0.01, max_poll_attempts=2)
@@ -494,7 +495,7 @@ class TestGravityTradeFinalize:
 
     @pytest.mark.asyncio
     async def test_finalize_tx_height_before_anchor_raises(self):
-        trade, rxd, btc = self._make_trade()
+        trade, _rxd, btc = self._make_trade()
         offer = make_offer(anchor_height=200)
 
         stripped_tx = _make_stripped_p2wpkh_tx()
@@ -516,7 +517,7 @@ class TestGravityTradeFinalize:
 
     @pytest.mark.asyncio
     async def test_finalize_invalid_btc_txid_raises(self):
-        trade, rxd, btc = self._make_trade()
+        trade, _rxd, _btc = self._make_trade()
         offer = make_offer()
 
         with pytest.raises(ValidationError):
@@ -533,7 +534,7 @@ class TestGravityTradeFinalize:
 
     @pytest.mark.asyncio
     async def test_finalize_empty_header_chain_raises(self):
-        trade, rxd, btc = self._make_trade()
+        trade, _rxd, btc = self._make_trade()
         offer = make_offer()
 
         stripped_tx = _make_stripped_p2wpkh_tx()
@@ -615,9 +616,7 @@ class TestBuildFinalizeTxMinimumOutput:
                 minimum_output_photons=100_000_000,
             )
         except ValidationError as exc:
-            assert "below the covenant" not in str(exc), (
-                f"Unexpected floor ValidationError: {exc}"
-            )
+            assert "below the covenant" not in str(exc), f"Unexpected floor ValidationError: {exc}"
 
     def test_no_minimum_zero_default_skips_check(self):
         # Default minimum_output_photons=0 → no floor check (backwards compat)
@@ -635,9 +634,7 @@ class TestBuildFinalizeTxMinimumOutput:
                 minimum_output_photons=0,
             )
         except ValidationError as exc:
-            assert "below the covenant" not in str(exc), (
-                f"Floor check fired with minimum=0, should be skipped: {exc}"
-            )
+            assert "below the covenant" not in str(exc), f"Floor check fired with minimum=0, should be skipped: {exc}"
 
 
 # ---------------------------------------------------------------------------
@@ -668,7 +665,7 @@ class TestDeadlineProximityWarning:
         # anchor_height must be close to btc_tx_height to pass the sanity check
         offer = make_offer(claim_deadline=soon, anchor_height=900_000, merkle_depth=20)
 
-        trade, rxd, btc = self._make_trade_with_mocked_finalize_internals(offer)
+        trade, _rxd, btc = self._make_trade_with_mocked_finalize_internals(offer)
 
         # Stub out everything except the deadline check
         trade._resolve_btc_tx_height = AsyncMock(return_value=BlockHeight(900_010))
@@ -681,10 +678,12 @@ class TestDeadlineProximityWarning:
         mock_builder = MagicMock()
         mock_builder.build.return_value = fake_proof
 
-        with patch("pyrxd.gravity.trade.SpvProofBuilder", return_value=mock_builder), \
-             patch("pyrxd.gravity.trade.build_finalize_tx") as mock_build, \
-             patch("pyrxd.gravity.trade.strip_witness", return_value=b"\x01\x00\x00\x00" + b"\x00" * 200), \
-             patch("pyrxd.gravity.trade._find_output_zero_offset", return_value=47):
+        with (
+            patch("pyrxd.gravity.trade.SpvProofBuilder", return_value=mock_builder),
+            patch("pyrxd.gravity.trade.build_finalize_tx") as mock_build,
+            patch("pyrxd.gravity.trade.strip_witness", return_value=b"\x01\x00\x00\x00" + b"\x00" * 200),
+            patch("pyrxd.gravity.trade._find_output_zero_offset", return_value=47),
+        ):
             mock_result = MagicMock()
             mock_result.tx_hex = "aa" * 100
             mock_result.txid = "aa" * 32
@@ -695,6 +694,7 @@ class TestDeadlineProximityWarning:
             btc.get_header_chain.return_value = [b"\x00" * 80] * 10
 
             import logging
+
             with caplog.at_level(logging.WARNING, logger="pyrxd.gravity.trade"):
                 await trade.finalize(
                     btc_txid="bb" * 32,
@@ -707,8 +707,9 @@ class TestDeadlineProximityWarning:
                     btc_tx_height=900_010,
                 )
 
-        assert any("URGENT" in r.message or "deadline" in r.message.lower() for r in caplog.records), \
+        assert any("URGENT" in r.message or "deadline" in r.message.lower() for r in caplog.records), (
             f"Expected deadline warning in logs, got: {[r.message for r in caplog.records]}"
+        )
 
     @pytest.mark.asyncio
     async def test_no_warning_when_deadline_far(self, caplog):
@@ -718,7 +719,7 @@ class TestDeadlineProximityWarning:
         far = int(time.time()) + 48 * 3600
         offer = make_offer(claim_deadline=far, anchor_height=900_000, merkle_depth=20)
 
-        trade, rxd, btc = self._make_trade_with_mocked_finalize_internals(offer)
+        trade, _rxd, btc = self._make_trade_with_mocked_finalize_internals(offer)
         trade._resolve_btc_tx_height = AsyncMock(return_value=BlockHeight(900_010))
         trade._broadcast_radiant = AsyncMock(return_value="aa" * 32)
 
@@ -726,10 +727,12 @@ class TestDeadlineProximityWarning:
         mock_builder = MagicMock()
         mock_builder.build.return_value = fake_proof
 
-        with patch("pyrxd.gravity.trade.SpvProofBuilder", return_value=mock_builder), \
-             patch("pyrxd.gravity.trade.build_finalize_tx") as mock_build, \
-             patch("pyrxd.gravity.trade.strip_witness", return_value=b"\x01\x00\x00\x00" + b"\x00" * 200), \
-             patch("pyrxd.gravity.trade._find_output_zero_offset", return_value=47):
+        with (
+            patch("pyrxd.gravity.trade.SpvProofBuilder", return_value=mock_builder),
+            patch("pyrxd.gravity.trade.build_finalize_tx") as mock_build,
+            patch("pyrxd.gravity.trade.strip_witness", return_value=b"\x01\x00\x00\x00" + b"\x00" * 200),
+            patch("pyrxd.gravity.trade._find_output_zero_offset", return_value=47),
+        ):
             mock_result = MagicMock()
             mock_result.tx_hex = "aa" * 100
             mock_result.txid = "aa" * 32
@@ -740,6 +743,7 @@ class TestDeadlineProximityWarning:
             btc.get_header_chain.return_value = [b"\x00" * 80] * 10
 
             import logging
+
             with caplog.at_level(logging.WARNING, logger="pyrxd.gravity.trade"):
                 await trade.finalize(
                     btc_txid="bb" * 32,
@@ -753,7 +757,8 @@ class TestDeadlineProximityWarning:
                 )
 
         deadline_warns = [
-            r for r in caplog.records
+            r
+            for r in caplog.records
             if "URGENT" in r.message or ("deadline" in r.message.lower() and "passed" in r.message.lower())
         ]
         assert not deadline_warns, f"Unexpected deadline warnings: {[r.message for r in deadline_warns]}"
@@ -766,17 +771,19 @@ class TestDeadlineProximityWarning:
         past = int(time.time()) - 600
         offer = make_offer(claim_deadline=past, anchor_height=900_000, merkle_depth=20)
 
-        trade, rxd, btc = self._make_trade_with_mocked_finalize_internals(offer)
+        trade, _rxd, btc = self._make_trade_with_mocked_finalize_internals(offer)
         trade._resolve_btc_tx_height = AsyncMock(return_value=BlockHeight(900_010))
         trade._broadcast_radiant = AsyncMock(return_value="aa" * 32)
 
         mock_builder = MagicMock()
         mock_builder.build.return_value = MagicMock()
 
-        with patch("pyrxd.gravity.trade.SpvProofBuilder", return_value=mock_builder), \
-             patch("pyrxd.gravity.trade.build_finalize_tx") as mock_build, \
-             patch("pyrxd.gravity.trade.strip_witness", return_value=b"\x01\x00\x00\x00" + b"\x00" * 200), \
-             patch("pyrxd.gravity.trade._find_output_zero_offset", return_value=47):
+        with (
+            patch("pyrxd.gravity.trade.SpvProofBuilder", return_value=mock_builder),
+            patch("pyrxd.gravity.trade.build_finalize_tx") as mock_build,
+            patch("pyrxd.gravity.trade.strip_witness", return_value=b"\x01\x00\x00\x00" + b"\x00" * 200),
+            patch("pyrxd.gravity.trade._find_output_zero_offset", return_value=47),
+        ):
             mock_result = MagicMock()
             mock_result.tx_hex = "aa" * 100
             mock_result.txid = "aa" * 32
@@ -787,6 +794,7 @@ class TestDeadlineProximityWarning:
             btc.get_header_chain.return_value = [b"\x00" * 80] * 10
 
             import logging
+
             with caplog.at_level(logging.WARNING, logger="pyrxd.gravity.trade"):
                 await trade.finalize(
                     btc_txid="bb" * 32,
@@ -799,8 +807,9 @@ class TestDeadlineProximityWarning:
                     btc_tx_height=900_010,
                 )
 
-        assert any("passed" in r.message.lower() for r in caplog.records), \
+        assert any("passed" in r.message.lower() for r in caplog.records), (
             f"Expected 'passed' deadline warning, got: {[r.message for r in caplog.records]}"
+        )
 
     def test_deadline_warning_disabled_with_zero(self):
         # deadline_warning_seconds=0 → no validation error, check is disabled

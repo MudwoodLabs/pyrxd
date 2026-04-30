@@ -11,6 +11,7 @@ The harness is deliberately standalone — it copies the two functions it needs
 from script_utils.py rather than importing the whole RXinDexer package, so it
 runs without adding RXinDexer to pyrxd's dependencies.
 """
+
 from __future__ import annotations
 
 import cbor2
@@ -40,14 +41,20 @@ def _parse_script_chunks(script_bytes: bytes) -> list[dict]:
             i += opcode
             chunks.append({"opcodenum": opcode, "buf": buf})
         elif opcode == 0x4C:
-            n = script_bytes[i]; i += 1
-            chunks.append({"opcodenum": opcode, "buf": script_bytes[i : i + n]}); i += n
+            n = script_bytes[i]
+            i += 1
+            chunks.append({"opcodenum": opcode, "buf": script_bytes[i : i + n]})
+            i += n
         elif opcode == 0x4D:
-            n = int.from_bytes(script_bytes[i : i + 2], "little"); i += 2
-            chunks.append({"opcodenum": opcode, "buf": script_bytes[i : i + n]}); i += n
+            n = int.from_bytes(script_bytes[i : i + 2], "little")
+            i += 2
+            chunks.append({"opcodenum": opcode, "buf": script_bytes[i : i + n]})
+            i += n
         elif opcode == 0x4E:
-            n = int.from_bytes(script_bytes[i : i + 4], "little"); i += 4
-            chunks.append({"opcodenum": opcode, "buf": script_bytes[i : i + n]}); i += n
+            n = int.from_bytes(script_bytes[i : i + 4], "little")
+            i += 4
+            chunks.append({"opcodenum": opcode, "buf": script_bytes[i : i + n]})
+            i += n
         elif opcode == 0x00:
             chunks.append({"opcodenum": opcode, "buf": b""})
         else:
@@ -66,8 +73,10 @@ def _rxindexer_decode(script_bytes: bytes) -> dict | None:
         payload_buf = chunks[idx + 1].get("buf")
         if not payload_buf:
             return None
+
         def _tag_hook(decoder, tag):
             return tag.value
+
         decoded = cbor2.loads(payload_buf, tag_hook=_tag_hook)
         if not isinstance(decoded, dict) or not isinstance(decoded.get("p"), list):
             return None
@@ -83,6 +92,7 @@ def _rxindexer_decode(script_bytes: bytes) -> dict | None:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _encode_and_decode(metadata: GlyphMetadata) -> dict:
     """Encode via pyrxd, decode via RXinDexer reference. Returns payload dict."""
     cbor_bytes, _ = encode_payload(metadata)
@@ -95,6 +105,7 @@ def _encode_and_decode(metadata: GlyphMetadata) -> dict:
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
 
 class TestProtocolField:
     def test_nft_protocol_round_trips(self):
@@ -116,9 +127,7 @@ class TestProtocolField:
     def test_dmint_only_protocol_raises(self):
         # [4] alone is blocked — prepare_reveal requires FT=1 to be present.
         with pytest.raises(ValidationError):
-            GlyphMetadata.for_dmint_ft(
-                ticker="TST", name="Test Token", protocol=[GlyphProtocol.DMINT]
-            )
+            GlyphMetadata.for_dmint_ft(ticker="TST", name="Test Token", protocol=[GlyphProtocol.DMINT])
 
 
 class TestCoreFields:

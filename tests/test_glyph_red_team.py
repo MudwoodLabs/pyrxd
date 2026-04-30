@@ -7,6 +7,7 @@ LIMITATION (trusts caller-supplied data), the test DOCUMENTS and PROVES the
 limitation so the next maintainer knows what layer (node / consensus / wallet)
 is expected to catch it.
 """
+
 from __future__ import annotations
 
 import struct
@@ -47,8 +48,8 @@ from pyrxd.security.types import Hex20, Txid
 
 HONEST_TXID = "a" * 64
 ATTACKER_TXID = "b" * 64
-HONEST_PKH = Hex20(bytes(range(20)))                  # owner Alice
-ATTACKER_PKH = Hex20(bytes(range(20, 40)))            # attacker Mallory
+HONEST_PKH = Hex20(bytes(range(20)))  # owner Alice
+ATTACKER_PKH = Hex20(bytes(range(20, 40)))  # attacker Mallory
 HONEST_REF = GlyphRef(txid=Txid(HONEST_TXID), vout=0)
 
 NFT_METADATA = GlyphMetadata(
@@ -90,11 +91,7 @@ class TestPayloadHashTampering:
 
         # Flip a middle byte
         idx = len(cbor_bytes) // 2
-        tampered = (
-            cbor_bytes[:idx]
-            + bytes([cbor_bytes[idx] ^ 0xFF])
-            + cbor_bytes[idx + 1:]
-        )
+        tampered = cbor_bytes[:idx] + bytes([cbor_bytes[idx] ^ 0xFF]) + cbor_bytes[idx + 1 :]
         tampered_hash = hash_payload(tampered)
         tampered_script = build_commit_locking_script(tampered_hash, HONEST_PKH)
         assert original_script != tampered_script
@@ -105,11 +102,7 @@ class TestPayloadHashTampering:
         seen = {original_hash}
         # Flip bit 0 of bytes 0, 5, 10, ... (sampled)
         for i in range(0, len(cbor_bytes), max(1, len(cbor_bytes) // 10)):
-            tampered = (
-                cbor_bytes[:i]
-                + bytes([cbor_bytes[i] ^ 0x01])
-                + cbor_bytes[i + 1:]
-            )
+            tampered = cbor_bytes[:i] + bytes([cbor_bytes[i] ^ 0x01]) + cbor_bytes[i + 1 :]
             h = hash_payload(tampered)
             assert h not in seen, f"Hash collision at byte {i}"
             seen.add(h)
@@ -117,6 +110,7 @@ class TestPayloadHashTampering:
     def test_hash_is_sha256d(self):
         """Verify the scheme is SHA256 applied twice (standard Bitcoin hash256)."""
         import hashlib
+
         data = b"hello glyph"
         expected = hashlib.sha256(hashlib.sha256(data).digest()).digest()
         assert hash_payload(data) == expected
@@ -134,7 +128,7 @@ class TestPayloadHashTampering:
         Defense relies entirely on SHA-256 collision resistance (~2^128 work
         for a second preimage). This test documents the invariant only.
         """
-        cbor_bytes, payload_hash = encode_payload(NFT_METADATA)
+        _cbor_bytes, payload_hash = encode_payload(NFT_METADATA)
         assert len(payload_hash) == 32  # 256-bit security is all we rely on
 
 
@@ -189,8 +183,8 @@ class TestRefSpoofing:
         s1 = build_nft_locking_script(HONEST_PKH, ref1)
         assert s0 != s1
         # vout is encoded at offset 33..37 (4 bytes LE after 32-byte reversed txid)
-        assert s0[33:37] == struct.pack('<I', 0)
-        assert s1[33:37] == struct.pack('<I', 1)
+        assert s0[33:37] == struct.pack("<I", 0)
+        assert s1[33:37] == struct.pack("<I", 1)
 
     def test_ft_ref_spoofing_also_succeeds(self):
         """Same KNOWN LIMITATION applies to FT scripts."""
@@ -293,44 +287,54 @@ class TestCborInjection:
         consistent with is_nft. NFT CBOR + is_nft=False raises ValidationError.
         """
         from pyrxd.security.errors import ValidationError
+
         builder = GlyphBuilder()
-        commit_result = builder.prepare_commit(CommitParams(
-            metadata=NFT_METADATA,  # claims NFT (p=[2])
-            owner_pkh=HONEST_PKH,
-            change_pkh=HONEST_PKH,
-            funding_satoshis=1_000_000,
-        ))
-        with pytest.raises(ValidationError, match="protocol field"):
-            builder.prepare_reveal(RevealParams(
-                commit_txid=HONEST_TXID,
-                commit_vout=0,
-                commit_value=546,
-                cbor_bytes=commit_result.cbor_bytes,  # says NFT
+        commit_result = builder.prepare_commit(
+            CommitParams(
+                metadata=NFT_METADATA,  # claims NFT (p=[2])
                 owner_pkh=HONEST_PKH,
-                is_nft=False,  # mismatch — should raise
-            ))
+                change_pkh=HONEST_PKH,
+                funding_satoshis=1_000_000,
+            )
+        )
+        with pytest.raises(ValidationError, match="protocol field"):
+            builder.prepare_reveal(
+                RevealParams(
+                    commit_txid=HONEST_TXID,
+                    commit_vout=0,
+                    commit_value=546,
+                    cbor_bytes=commit_result.cbor_bytes,  # says NFT
+                    owner_pkh=HONEST_PKH,
+                    is_nft=False,  # mismatch — should raise
+                )
+            )
 
     def test_ft_cbor_with_is_nft_true_raises(self):
         """FT CBOR + is_nft=True also raises ValidationError."""
-        from pyrxd.security.errors import ValidationError
         from pyrxd.glyph.types import GlyphMetadata
+        from pyrxd.security.errors import ValidationError
+
         ft_metadata = GlyphMetadata(protocol=[GlyphProtocol.FT], name="TestFT", ticker="TFT")
         builder = GlyphBuilder()
-        commit_result = builder.prepare_commit(CommitParams(
-            metadata=ft_metadata,
-            owner_pkh=HONEST_PKH,
-            change_pkh=HONEST_PKH,
-            funding_satoshis=1_000_000,
-        ))
-        with pytest.raises(ValidationError, match="protocol field"):
-            builder.prepare_reveal(RevealParams(
-                commit_txid=HONEST_TXID,
-                commit_vout=0,
-                commit_value=546,
-                cbor_bytes=commit_result.cbor_bytes,
+        commit_result = builder.prepare_commit(
+            CommitParams(
+                metadata=ft_metadata,
                 owner_pkh=HONEST_PKH,
-                is_nft=True,  # mismatch
-            ))
+                change_pkh=HONEST_PKH,
+                funding_satoshis=1_000_000,
+            )
+        )
+        with pytest.raises(ValidationError, match="protocol field"):
+            builder.prepare_reveal(
+                RevealParams(
+                    commit_txid=HONEST_TXID,
+                    commit_vout=0,
+                    commit_value=546,
+                    cbor_bytes=commit_result.cbor_bytes,
+                    owner_pkh=HONEST_PKH,
+                    is_nft=True,  # mismatch
+                )
+            )
 
 
 # ===========================================================================
@@ -385,12 +389,14 @@ class TestDecodePayloadSecurityAudit2026:
 
     def test_valid_fields_at_limits_accepted(self):
         """Boundary: fields exactly at their limits must be accepted."""
-        cbor_bytes = cbor2.dumps({
-            "p": [2],
-            "name": "x" * 64,
-            "ticker": "x" * 16,
-            "desc": "x" * 1000,
-        })
+        cbor_bytes = cbor2.dumps(
+            {
+                "p": [2],
+                "name": "x" * 64,
+                "ticker": "x" * 16,
+                "desc": "x" * 1000,
+            }
+        )
         meta = decode_payload(cbor_bytes)
         assert meta.name == "x" * 64
         assert meta.ticker == "x" * 16
@@ -433,11 +439,16 @@ class TestScriptClassifierSecurityAudit2026:
 
     def test_commit_script_re_both_variants_match(self):
         """COMMIT_SCRIPT_RE must match both NFT (OP_2) and FT (OP_1) commit scripts."""
-        from pyrxd.glyph.script import COMMIT_SCRIPT_RE, COMMIT_SCRIPT_NFT_RE, COMMIT_SCRIPT_FT_RE
-        from pyrxd.glyph.script import build_commit_locking_script
+        from pyrxd.glyph.script import (
+            COMMIT_SCRIPT_FT_RE,
+            COMMIT_SCRIPT_NFT_RE,
+            COMMIT_SCRIPT_RE,
+            build_commit_locking_script,
+        )
+
         pkh = Hex20(bytes(range(20)))
         nft_script = build_commit_locking_script(b"\xab" * 32, pkh, is_nft=True)
-        ft_script  = build_commit_locking_script(b"\xab" * 32, pkh, is_nft=False)
+        ft_script = build_commit_locking_script(b"\xab" * 32, pkh, is_nft=False)
         assert COMMIT_SCRIPT_RE.fullmatch(nft_script.hex())
         assert COMMIT_SCRIPT_RE.fullmatch(ft_script.hex())
         assert COMMIT_SCRIPT_NFT_RE.fullmatch(nft_script.hex())
@@ -467,20 +478,24 @@ class TestMintToRecipient:
     def test_distinct_spender_and_recipient_pkh_accepted(self):
         """prepare_reveal must accept commit-spender PKH ≠ reveal-recipient PKH."""
         builder = GlyphBuilder()
-        commit = builder.prepare_commit(CommitParams(
-            metadata=NFT_METADATA,
-            owner_pkh=HONEST_PKH,       # wallet signs reveal
-            change_pkh=HONEST_PKH,
-            funding_satoshis=1_000_000,
-        ))
-        reveal = builder.prepare_reveal(RevealParams(
-            commit_txid=HONEST_TXID,
-            commit_vout=0,
-            commit_value=546,
-            cbor_bytes=commit.cbor_bytes,
-            owner_pkh=ATTACKER_PKH,     # recipient ≠ spender — legitimate
-            is_nft=True,
-        ))
+        commit = builder.prepare_commit(
+            CommitParams(
+                metadata=NFT_METADATA,
+                owner_pkh=HONEST_PKH,  # wallet signs reveal
+                change_pkh=HONEST_PKH,
+                funding_satoshis=1_000_000,
+            )
+        )
+        reveal = builder.prepare_reveal(
+            RevealParams(
+                commit_txid=HONEST_TXID,
+                commit_vout=0,
+                commit_value=546,
+                cbor_bytes=commit.cbor_bytes,
+                owner_pkh=ATTACKER_PKH,  # recipient ≠ spender — legitimate
+                is_nft=True,
+            )
+        )
         extracted = extract_owner_pkh_from_nft_script(reveal.locking_script)
         assert bytes(extracted) == bytes(ATTACKER_PKH)
 
@@ -511,13 +526,7 @@ class TestClassifierConfusion:
         """
         garbage_ref_bytes = b"\xaa" * 36
         # Hand-build an NFT-shaped script with a garbage ref
-        fake_script = (
-            b"\xd8"
-            + garbage_ref_bytes
-            + b"\x75\x76\xa9\x14"
-            + bytes(20)
-            + b"\x88\xac"
-        )
+        fake_script = b"\xd8" + garbage_ref_bytes + b"\x75\x76\xa9\x14" + bytes(20) + b"\x88\xac"
         assert len(fake_script) == 63
         assert is_nft_script(fake_script.hex())
         # And the extractor faithfully returns the garbage ref
@@ -535,11 +544,7 @@ class TestClassifierConfusion:
     def test_script_too_long_does_not_match_nft_regex(self):
         """Extra trailing byte breaks the anchored regex."""
         too_long = (
-            b"\xd8"
-            + b"\xaa" * 36
-            + b"\x75\x76\xa9\x14"
-            + bytes(20)
-            + b"\x88\xac\x00"  # trailing byte
+            b"\xd8" + b"\xaa" * 36 + b"\x75\x76\xa9\x14" + bytes(20) + b"\x88\xac\x00"  # trailing byte
         )
         assert len(too_long) == 64
         assert not is_nft_script(too_long.hex())
@@ -660,8 +665,8 @@ class TestScriptSigSuffixEncoding:
         """Exactly 76 bytes: encoded as 0x4c 0x4c + data (OP_PUSHDATA1)."""
         cbor = bytes(76)
         body = self._suffix_body(cbor)
-        assert body[0] == 0x4c         # OP_PUSHDATA1
-        assert body[1] == 76           # length
+        assert body[0] == 0x4C  # OP_PUSHDATA1
+        assert body[1] == 76  # length
         assert body[2:] == cbor
         # Total suffix: 4 + 2 + 76 = 82
         assert len(build_reveal_scriptsig_suffix(cbor)) == 82
@@ -679,7 +684,7 @@ class TestScriptSigSuffixEncoding:
     def test_255_bytes_uses_pushdata1(self):
         cbor = bytes(255)
         body = self._suffix_body(cbor)
-        assert body[0] == 0x4c
+        assert body[0] == 0x4C
         assert body[1] == 255
         assert body[2:] == cbor
         assert len(build_reveal_scriptsig_suffix(cbor)) == 4 + 2 + 255
@@ -688,7 +693,7 @@ class TestScriptSigSuffixEncoding:
         """256 bytes: encoded as 0x4d <len_le_2bytes> + data (OP_PUSHDATA2)."""
         cbor = bytes(256)
         body = self._suffix_body(cbor)
-        assert body[0] == 0x4d
+        assert body[0] == 0x4D
         assert body[1:3] == (256).to_bytes(2, "little")
         assert body[3:] == cbor
         assert len(build_reveal_scriptsig_suffix(cbor)) == 4 + 3 + 256
@@ -696,7 +701,7 @@ class TestScriptSigSuffixEncoding:
     def test_65535_bytes_uses_pushdata2_max(self):
         cbor = bytes(65535)
         body = self._suffix_body(cbor)
-        assert body[0] == 0x4d
+        assert body[0] == 0x4D
         assert body[1:3] == (65535).to_bytes(2, "little")
         assert body[3:] == cbor
 

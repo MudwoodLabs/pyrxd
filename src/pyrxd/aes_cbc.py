@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from Cryptodome.Cipher import AES
 
 

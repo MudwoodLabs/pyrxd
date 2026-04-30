@@ -21,10 +21,10 @@ from pyrxd.gravity.covenant import build_gravity_offer
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
+
 
 def _make_privkey() -> PrivateKeyMaterial:
     return PrivateKeyMaterial(b"\x12" * 32)
@@ -32,12 +32,14 @@ def _make_privkey() -> PrivateKeyMaterial:
 
 def _maker_pkh(privkey: PrivateKeyMaterial) -> bytes:
     import coincurve
+
     pub = coincurve.PrivateKey(privkey.unsafe_raw_bytes()).public_key.format(compressed=True)
     return hashlib.new("ripemd160", hashlib.sha256(pub).digest()).digest()
 
 
 def _maker_pub(privkey: PrivateKeyMaterial) -> bytes:
     import coincurve
+
     return coincurve.PrivateKey(privkey.unsafe_raw_bytes()).public_key.format(compressed=True)
 
 
@@ -46,6 +48,7 @@ def _make_offer(privkey: PrivateKeyMaterial, **kwargs) -> GravityOffer:
     pub = _maker_pub(privkey)
     taker_priv = PrivateKeyMaterial(b"\x34" * 32)
     import coincurve
+
     taker_raw = taker_priv.unsafe_raw_bytes()
     taker_pub = coincurve.PrivateKey(taker_raw).public_key.format(compressed=True)
     taker_pkh = hashlib.new("ripemd160", hashlib.sha256(taker_pub).digest()).digest()
@@ -77,6 +80,7 @@ FAKE_VOUT = 0
 # ---------------------------------------------------------------------------
 # Basic structure tests
 # ---------------------------------------------------------------------------
+
 
 class TestBuildMakerOfferTxStructure:
     def test_returns_maker_offer_result(self):
@@ -169,6 +173,7 @@ class TestBuildMakerOfferTxStructure:
 # Wire format
 # ---------------------------------------------------------------------------
 
+
 class TestMakerOfferTxWireFormat:
     def _build(self, pk=None, **kwargs):
         pk = pk or _make_privkey()
@@ -245,9 +250,11 @@ class TestMakerOfferTxWireFormat:
 # Change output
 # ---------------------------------------------------------------------------
 
+
 class TestMakerOfferTxChange:
     def _make_maker_address(self, pk: PrivateKeyMaterial) -> str:
         from pyrxd.base58 import base58check_encode
+
         pkh = _maker_pkh(pk)
         return base58check_encode(b"\x00" + pkh)
 
@@ -354,6 +361,7 @@ class TestMakerOfferTxChange:
 # Validation
 # ---------------------------------------------------------------------------
 
+
 class TestMakerOfferTxValidation:
     def test_insufficient_funding_raises(self):
         pk = _make_privkey()
@@ -387,13 +395,19 @@ class TestMakerOfferTxValidation:
         offer1 = _make_offer(pk1)
         offer2 = _make_offer(pk2)
         r1 = build_maker_offer_tx(
-            offer=offer1, funding_txid=FAKE_TXID, funding_vout=0,
-            funding_photons=offer1.photons_offered + 10_000, fee_sats=10_000,
+            offer=offer1,
+            funding_txid=FAKE_TXID,
+            funding_vout=0,
+            funding_photons=offer1.photons_offered + 10_000,
+            fee_sats=10_000,
             maker_privkey=pk1,
         )
         r2 = build_maker_offer_tx(
-            offer=offer2, funding_txid=FAKE_TXID, funding_vout=0,
-            funding_photons=offer2.photons_offered + 10_000, fee_sats=10_000,
+            offer=offer2,
+            funding_txid=FAKE_TXID,
+            funding_vout=0,
+            funding_photons=offer2.photons_offered + 10_000,
+            fee_sats=10_000,
             maker_privkey=pk2,
         )
         assert r1.tx_hex != r2.tx_hex
@@ -402,8 +416,11 @@ class TestMakerOfferTxValidation:
         pk = _make_privkey()
         offer = _make_offer(pk)
         kwargs = dict(
-            offer=offer, funding_txid=FAKE_TXID, funding_vout=0,
-            funding_photons=offer.photons_offered + 10_000, fee_sats=10_000,
+            offer=offer,
+            funding_txid=FAKE_TXID,
+            funding_vout=0,
+            funding_photons=offer.photons_offered + 10_000,
+            fee_sats=10_000,
             maker_privkey=pk,
         )
         r1 = build_maker_offer_tx(**kwargs)
@@ -414,6 +431,7 @@ class TestMakerOfferTxValidation:
 # ---------------------------------------------------------------------------
 # Integration: offer built from real covenant artifact
 # ---------------------------------------------------------------------------
+
 
 class TestMakerOfferWithRealCovenant:
     def test_offer_p2sh_is_valid_radiant_address(self):
@@ -430,6 +448,7 @@ class TestMakerOfferWithRealCovenant:
         # Address should be a base58check string starting with '3' (P2SH mainnet)
         # or any valid base58check — just verify it decodes without error
         from pyrxd.base58 import base58check_decode
+
         decoded = base58check_decode(result.offer_p2sh)
         assert len(decoded) == 21
         assert decoded[0] == 0x05  # P2SH version byte
@@ -439,13 +458,19 @@ class TestMakerOfferWithRealCovenant:
         offer1 = _make_offer(pk, btc_satoshis=100_000)
         offer2 = _make_offer(pk, btc_satoshis=200_000)
         r1 = build_maker_offer_tx(
-            offer=offer1, funding_txid=FAKE_TXID, funding_vout=0,
-            funding_photons=offer1.photons_offered + 10_000, fee_sats=10_000,
+            offer=offer1,
+            funding_txid=FAKE_TXID,
+            funding_vout=0,
+            funding_photons=offer1.photons_offered + 10_000,
+            fee_sats=10_000,
             maker_privkey=pk,
         )
         r2 = build_maker_offer_tx(
-            offer=offer2, funding_txid=FAKE_TXID, funding_vout=0,
-            funding_photons=offer2.photons_offered + 10_000, fee_sats=10_000,
+            offer=offer2,
+            funding_txid=FAKE_TXID,
+            funding_vout=0,
+            funding_photons=offer2.photons_offered + 10_000,
+            fee_sats=10_000,
             maker_privkey=pk,
         )
         # Different offer redeem → different P2SH SPK → different output → different txid

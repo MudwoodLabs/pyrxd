@@ -22,11 +22,13 @@ Public surface
 * ``ConfirmationStatus``— BTC confirmation poll result
 """
 
+from __future__ import annotations
+
 from .codehash import compute_p2sh_code_hash
 from .covenant import CovenantArtifact, build_gravity_offer, validate_claim_deadline
 from .maker import ActiveOffer, GravityMakerSession, GravityOfferParams
 from .trade import ConfirmationStatus, GravityTrade, TradeConfig
-from .transactions import build_maker_offer_tx, build_claim_tx, build_finalize_tx, build_forfeit_tx
+from .transactions import build_claim_tx, build_finalize_tx, build_forfeit_tx, build_maker_offer_tx
 from .types import (
     ClaimResult,
     FinalizeResult,
@@ -36,23 +38,23 @@ from .types import (
 )
 
 __all__ = [
-    "GravityOffer",
-    "MakerOfferResult",
+    "ActiveOffer",
     "ClaimResult",
+    "ConfirmationStatus",
+    "CovenantArtifact",
     "FinalizeResult",
     "ForfeitResult",
-    "build_maker_offer_tx",
+    "GravityMakerSession",
+    "GravityOffer",
+    "GravityOfferParams",
+    "GravityTrade",
+    "MakerOfferResult",
+    "TradeConfig",
     "build_claim_tx",
     "build_finalize_tx",
     "build_forfeit_tx",
-    "compute_p2sh_code_hash",
-    "CovenantArtifact",
     "build_gravity_offer",
+    "build_maker_offer_tx",
+    "compute_p2sh_code_hash",
     "validate_claim_deadline",
-    "GravityTrade",
-    "TradeConfig",
-    "ConfirmationStatus",
-    "GravityMakerSession",
-    "GravityOfferParams",
-    "ActiveOffer",
 ]

@@ -2,6 +2,7 @@
 
 Uses unittest.mock to avoid real network calls.
 """
+
 from __future__ import annotations
 
 import json
@@ -23,6 +24,7 @@ _VALID_RAW_HEX = _VALID_RAW.hex()
 
 
 # ── aiohttp response mock helpers ─────────────────────────────────────────────
+
 
 def _make_response(status: int, body: bytes, content_type: str = "application/json"):
     """Return a mock aiohttp response object."""
@@ -47,6 +49,7 @@ def _make_session(responses: list):
 
 # ── MempoolSpaceSource.get_raw_tx confirmation enforcement ────────────────────
 
+
 async def test_get_raw_tx_rejects_below_min_confirmations():
     """get_raw_tx with 5 confirmations when 6 required must raise NetworkError.
 
@@ -54,9 +57,7 @@ async def test_get_raw_tx_rejects_below_min_confirmations():
     """
     source = MempoolSpaceSource()
 
-    status_body = json.dumps(
-        {"confirmed": True, "block_height": 839996}
-    ).encode()
+    status_body = json.dumps({"confirmed": True, "block_height": 839996}).encode()
     tip_body = b"840000"
 
     status_resp = _make_response(200, status_body, "application/json")
@@ -77,9 +78,7 @@ async def test_get_raw_tx_accepts_exact_min_confirmations():
     source = MempoolSpaceSource()
 
     # block_height=839995, tip=840000 → 840000-839995+1 = 6 confs
-    status_body = json.dumps(
-        {"confirmed": True, "block_height": 839995}
-    ).encode()
+    status_body = json.dumps({"confirmed": True, "block_height": 839995}).encode()
     tip_body = b"840000"
     raw_body = _VALID_RAW_HEX.encode()
 
@@ -113,6 +112,7 @@ async def test_get_raw_tx_rejects_unconfirmed_tx():
 
 # ── URL / input validation ────────────────────────────────────────────────────
 
+
 async def test_path_traversal_rejected_by_txid_validation():
     """Txid validation must reject '../../../etc/passwd' before URL construction."""
     source = MempoolSpaceSource()
@@ -132,6 +132,7 @@ async def test_path_traversal_non_hex_rejected():
 
 # ── Response size limit ───────────────────────────────────────────────────────
 
+
 async def test_response_size_limit_raises_network_error():
     """A response body larger than 10 MB must raise NetworkError."""
     source = MempoolSpaceSource()
@@ -149,6 +150,7 @@ async def test_response_size_limit_raises_network_error():
 
 
 # ── MultiSourceBtcDataSource ──────────────────────────────────────────────────
+
 
 class _MockSource(MempoolSpaceSource):
     """Minimal BtcDataSource stub for multi-source tests."""

@@ -11,11 +11,11 @@ import hashlib
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
+    "compute_p2sh_address_from_redeem",
     "compute_p2sh_code_hash",
     "compute_p2sh_script_pubkey",
-    "compute_p2sh_address_from_redeem",
-    "hash256",
     "hash160",
+    "hash256",
 ]
 
 

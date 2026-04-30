@@ -1,4 +1,5 @@
 """Tests for pyrxd.glyph — Phase 1c: Glyph NFT/FT protocol support."""
+
 from __future__ import annotations
 
 import struct
@@ -33,12 +34,12 @@ from pyrxd.security.types import Hex20, Txid
 # Fixtures
 # ---------------------------------------------------------------------------
 
-KNOWN_TXID = "a" * 64                    # 64 hex chars
-KNOWN_PKH = bytes(range(20))             # 20 distinct bytes
+KNOWN_TXID = "a" * 64  # 64 hex chars
+KNOWN_PKH = bytes(range(20))  # 20 distinct bytes
 KNOWN_REF = GlyphRef(txid=Txid(KNOWN_TXID), vout=0)
 KNOWN_HEX20 = Hex20(KNOWN_PKH)
 
-SIMPLE_TXID = "01" * 32                  # 0101...01 (64 chars)
+SIMPLE_TXID = "01" * 32  # 0101...01 (64 chars)
 SIMPLE_REF = GlyphRef(txid=Txid(SIMPLE_TXID), vout=0)
 
 NFT_METADATA = GlyphMetadata(
@@ -59,6 +60,7 @@ FT_METADATA = GlyphMetadata(
 # ---------------------------------------------------------------------------
 # 1. Script construction
 # ---------------------------------------------------------------------------
+
 
 class TestScriptConstruction:
     def test_nft_script_is_63_bytes(self):
@@ -96,11 +98,11 @@ class TestScriptConstruction:
 
     def test_nft_script_starts_with_d8(self):
         script = build_nft_locking_script(KNOWN_HEX20, KNOWN_REF)
-        assert script[0] == 0xd8
+        assert script[0] == 0xD8
 
     def test_ft_script_starts_with_p2pkh(self):
         script = build_ft_locking_script(KNOWN_HEX20, KNOWN_REF)
-        assert script[:3] == b'\x76\xa9\x14'
+        assert script[:3] == b"\x76\xa9\x14"
 
     def test_ft_script_has_conservation_epilogue(self):
         script = build_ft_locking_script(KNOWN_HEX20, KNOWN_REF)
@@ -111,6 +113,7 @@ class TestScriptConstruction:
 # ---------------------------------------------------------------------------
 # 2. GlyphRef encoding / round-trip
 # ---------------------------------------------------------------------------
+
 
 class TestGlyphRefEncoding:
     def test_roundtrip(self):
@@ -124,13 +127,13 @@ class TestGlyphRefEncoding:
         ref = GlyphRef(txid=Txid(SIMPLE_TXID), vout=0)
         wire = ref.to_bytes()
         assert len(wire) == 36
-        assert wire[:32] == bytes([0x01] * 32)        # reversed txid (still all 0x01)
-        assert wire[32:] == struct.pack('<I', 0)       # vout=0 LE
+        assert wire[:32] == bytes([0x01] * 32)  # reversed txid (still all 0x01)
+        assert wire[32:] == struct.pack("<I", 0)  # vout=0 LE
 
     def test_vout_encoded_le(self):
         ref = GlyphRef(txid=Txid(SIMPLE_TXID), vout=256)
         wire = ref.to_bytes()
-        assert wire[32:] == struct.pack('<I', 256)
+        assert wire[32:] == struct.pack("<I", 256)
 
     def test_35_byte_input_raises(self):
         with pytest.raises(ValidationError):
@@ -157,6 +160,7 @@ class TestGlyphRefEncoding:
 # ---------------------------------------------------------------------------
 # 3. Script extraction
 # ---------------------------------------------------------------------------
+
 
 class TestScriptExtraction:
     def test_extract_ref_from_nft_script(self):
@@ -203,6 +207,7 @@ class TestScriptExtraction:
 # ---------------------------------------------------------------------------
 # 4. CBOR payload encode/decode
 # ---------------------------------------------------------------------------
+
 
 class TestCborPayload:
     def test_nft_roundtrip(self):
@@ -273,12 +278,13 @@ class TestCborPayload:
 # 5. ScriptSig suffix
 # ---------------------------------------------------------------------------
 
+
 class TestScriptSigSuffix:
     def test_suffix_starts_with_gly_push(self):
         cbor_bytes, _ = encode_payload(NFT_METADATA)
         suffix = build_reveal_scriptsig_suffix(cbor_bytes)
         # First 4 bytes: 03 + "gly"
-        assert suffix[:4] == b'\x03gly'
+        assert suffix[:4] == b"\x03gly"
 
     def test_suffix_small_payload_direct_push(self):
         # cbor < 76 bytes → direct length byte
@@ -295,7 +301,7 @@ class TestScriptSigSuffix:
         assert 76 <= len(cbor_bytes) <= 255
         suffix = build_reveal_scriptsig_suffix(cbor_bytes)
         # After gly push (4 bytes): OP_PUSHDATA1 (0x4c) + length byte
-        assert suffix[4] == 0x4c
+        assert suffix[4] == 0x4C
         assert suffix[5] == len(cbor_bytes)
 
     def test_oversized_payload_raises(self):
@@ -308,6 +314,7 @@ class TestScriptSigSuffix:
 # ---------------------------------------------------------------------------
 # 6. Inspector
 # ---------------------------------------------------------------------------
+
 
 class TestGlyphInspector:
     def _make_outputs(self, *scripts: bytes) -> list[tuple[int, bytes]]:
@@ -331,7 +338,7 @@ class TestGlyphInspector:
 
     def test_ignores_plain_p2pkh(self):
         # Standard P2PKH: 76 a9 14 <20 bytes> 88 ac  (25 bytes)
-        p2pkh = b'\x76\xa9\x14' + bytes(20) + b'\x88\xac'
+        p2pkh = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
         inspector = GlyphInspector()
         results = inspector.find_glyphs(self._make_outputs(p2pkh))
         assert results == []
@@ -339,7 +346,7 @@ class TestGlyphInspector:
     def test_detects_mixed_outputs(self):
         nft_script = build_nft_locking_script(KNOWN_HEX20, KNOWN_REF)
         ft_script = build_ft_locking_script(KNOWN_HEX20, KNOWN_REF)
-        p2pkh = b'\x76\xa9\x14' + bytes(20) + b'\x88\xac'
+        p2pkh = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
         inspector = GlyphInspector()
         results = inspector.find_glyphs(self._make_outputs(p2pkh, nft_script, ft_script))
         assert len(results) == 2
@@ -350,8 +357,8 @@ class TestGlyphInspector:
 
     def test_extract_reveal_returns_none_for_p2pkh_scriptsig(self):
         # Typical P2PKH scriptSig: <sig(71-73b)> <pubkey(33b)>
-        sig = bytes([0x47]) + bytes(71)      # push 71 bytes
-        pubkey = bytes([0x21]) + bytes(33)   # push 33 bytes
+        sig = bytes([0x47]) + bytes(71)  # push 71 bytes
+        pubkey = bytes([0x21]) + bytes(33)  # push 33 bytes
         scriptsig = sig + pubkey
         inspector = GlyphInspector()
         assert inspector.extract_reveal_metadata(scriptsig) is None
@@ -362,7 +369,7 @@ class TestGlyphInspector:
         suffix = build_reveal_scriptsig_suffix(cbor_bytes)
 
         # Prepend dummy sig + pubkey
-        dummy_sig = bytes([0x47]) + bytes(71)     # push 71 bytes (sig placeholder)
+        dummy_sig = bytes([0x47]) + bytes(71)  # push 71 bytes (sig placeholder)
         dummy_pubkey = bytes([0x21]) + bytes(33)  # push 33 bytes (pubkey placeholder)
         scriptsig = dummy_sig + dummy_pubkey + suffix
 
@@ -394,6 +401,7 @@ class TestGlyphInspector:
 # ---------------------------------------------------------------------------
 # 7. Builder
 # ---------------------------------------------------------------------------
+
 
 class TestGlyphBuilder:
     def _make_commit_params(self, metadata: GlyphMetadata = NFT_METADATA) -> CommitParams:
@@ -464,7 +472,7 @@ class TestGlyphBuilder:
             is_nft=True,
         )
         scripts = builder.prepare_reveal(reveal_params)
-        assert scripts.scriptsig_suffix[:4] == b'\x03gly'
+        assert scripts.scriptsig_suffix[:4] == b"\x03gly"
 
     def test_build_transfer_nft_returns_63_bytes(self):
         builder = GlyphBuilder()
@@ -490,6 +498,7 @@ class TestGlyphBuilder:
 # ---------------------------------------------------------------------------
 # 8. Security / rejection cases
 # ---------------------------------------------------------------------------
+
 
 class TestSecurityRejection:
     def test_glyph_media_data_over_100kb_raises(self):
@@ -530,12 +539,13 @@ class TestSecurityRejection:
 
     def test_invalid_txid_too_short_raises(self):
         with pytest.raises(ValidationError):
-            GlyphRef(txid=Txid("ab" * 31), vout=0)   # 62 chars, not 64
+            GlyphRef(txid=Txid("ab" * 31), vout=0)  # 62 chars, not 64
 
 
 # ---------------------------------------------------------------------------
 # 9. GlyphProtocol enum
 # ---------------------------------------------------------------------------
+
 
 class TestGlyphProtocol:
     def test_protocol_values(self):

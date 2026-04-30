@@ -10,6 +10,7 @@ source uses a controlled fake HTTP layer.  We test each source method's:
   - Invalid/malformed response path
   - NetworkError propagation
 """
+
 from __future__ import annotations
 
 import json
@@ -23,8 +24,8 @@ from pyrxd.network.bitcoin import (
     MempoolSpaceSource,
     MultiSourceBtcDataSource,
     _check_response_size,
-    _get_json,
     _get_hex_bytes,
+    _get_json,
 )
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Hex32, RawTx, Txid
@@ -64,6 +65,7 @@ def _make_session(*responses) -> MagicMock:
 # _check_response_size
 # ---------------------------------------------------------------------------
 
+
 class TestCheckResponseSize:
     @pytest.mark.asyncio
     async def test_normal_body(self):
@@ -82,6 +84,7 @@ class TestCheckResponseSize:
 # ---------------------------------------------------------------------------
 # _get_json
 # ---------------------------------------------------------------------------
+
 
 class TestGetJson:
     @pytest.mark.asyncio
@@ -119,6 +122,7 @@ class TestGetJson:
     @pytest.mark.asyncio
     async def test_client_error_raises(self):
         import aiohttp
+
         session = MagicMock()
         session.get.side_effect = aiohttp.ClientError("connection refused")
         with pytest.raises(NetworkError, match="HTTP request failed"):
@@ -128,6 +132,7 @@ class TestGetJson:
 # ---------------------------------------------------------------------------
 # _get_hex_bytes
 # ---------------------------------------------------------------------------
+
 
 class TestGetHexBytes:
     @pytest.mark.asyncio
@@ -165,6 +170,7 @@ class TestGetHexBytes:
     @pytest.mark.asyncio
     async def test_client_error_raises(self):
         import aiohttp
+
         session = MagicMock()
         session.get.side_effect = aiohttp.ClientError("reset")
         with pytest.raises(NetworkError, match="HTTP request failed"):
@@ -394,6 +400,7 @@ class TestMempoolSpaceSource:
 # BlockstreamSource (same HTTP shape as MempoolSpaceSource)
 # ---------------------------------------------------------------------------
 
+
 class TestBlockstreamSource:
     def _src(self) -> BlockstreamSource:
         return BlockstreamSource("http://blockstream.test/api")
@@ -409,6 +416,7 @@ class TestBlockstreamSource:
     @pytest.mark.asyncio
     async def test_get_tip_height_client_error(self):
         import aiohttp
+
         src = self._src()
         session = MagicMock()
         session.get.side_effect = aiohttp.ClientError("connection refused")
@@ -456,7 +464,7 @@ class TestBlockstreamSource:
         session = MagicMock()
         session.get = MagicMock(side_effect=[resp])
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            merkle, pos = await src.get_merkle_proof(TXID, BlockHeight(799000))
+            _merkle, pos = await src.get_merkle_proof(TXID, BlockHeight(799000))
         assert pos == 1
 
     @pytest.mark.asyncio
@@ -472,6 +480,7 @@ class TestBlockstreamSource:
 # ---------------------------------------------------------------------------
 # MultiSourceBtcDataSource
 # ---------------------------------------------------------------------------
+
 
 class TestMultiSourceBtcDataSource:
     def _make_source(self, tip=800000) -> MagicMock:
@@ -533,7 +542,7 @@ class TestMultiSourceBtcDataSource:
     async def test_get_merkle_proof_quorum(self):
         s1, s2 = self._make_source(), self._make_source()
         multi = MultiSourceBtcDataSource([s1, s2], quorum=2)
-        merkle, pos = await multi.get_merkle_proof(TXID, BlockHeight(799000))
+        _merkle, pos = await multi.get_merkle_proof(TXID, BlockHeight(799000))
         assert pos == 3
 
     @pytest.mark.asyncio

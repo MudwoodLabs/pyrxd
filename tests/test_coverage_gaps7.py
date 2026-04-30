@@ -9,29 +9,36 @@ Targets small gaps across multiple modules to reach 85%:
   - utils.py (89%): varint/reader edge cases, encode_int negative, from_base58 edge cases
   - spv/witness.py (90%): truncation errors inside strip_witness
 """
+
 from __future__ import annotations
 
-import pytest
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from pyrxd.script.script import Script
 from pyrxd.security.types import BlockHeight, Hex32
-from pyrxd.transaction.transaction_output import TransactionOutput
 from pyrxd.transaction.transaction_input import TransactionInput
+from pyrxd.transaction.transaction_output import TransactionOutput
 from pyrxd.utils import (
-    Reader, encode_int, from_base58, to_base58, to_bytes,
+    Reader,
+    encode_int,
+    from_base58,
+    to_base58,
+    to_bytes,
 )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # TransactionOutput.from_hex — error paths (lines 44, 47, 50)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestTransactionOutputFromHex:
     def test_from_hex_happy_path(self):
         """Serialize → from_hex round-trip."""
-        from pyrxd.script.type import P2PKH
         from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PKH
+
         priv = PrivateKey()
         lock = P2PKH().lock(priv.public_key().address())
         out = TransactionOutput(locking_script=lock, satoshis=5000)
@@ -41,8 +48,9 @@ class TestTransactionOutputFromHex:
         assert recovered.satoshis == 5000
 
     def test_from_hex_from_bytes(self):
-        from pyrxd.script.type import P2PKH
         from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PKH
+
         priv = PrivateKey()
         lock = P2PKH().lock(priv.public_key().address())
         out = TransactionOutput(locking_script=lock, satoshis=1000)
@@ -60,8 +68,9 @@ class TestTransactionOutputFromHex:
         assert result is None
 
     def test_from_hex_from_reader(self):
-        from pyrxd.script.type import P2PKH
         from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PKH
+
         priv = PrivateKey()
         lock = P2PKH().lock(priv.public_key().address())
         out = TransactionOutput(locking_script=lock, satoshis=2000)
@@ -74,6 +83,7 @@ class TestTransactionOutputFromHex:
 # ──────────────────────────────────────────────────────────────────────────────
 # TransactionInput.from_hex — error paths (lines 71, 74, 78)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestTransactionInputFromHex:
     def test_from_hex_happy_path(self):
@@ -114,6 +124,7 @@ class TestTransactionInputFromHex:
 # ChainTracker — is_valid_root / is_valid_root_for_height (lines 53, 55)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestChainTracker:
     def _make_mock_source(self, header_bytes: bytes):
         src = MagicMock()
@@ -123,6 +134,7 @@ class TestChainTracker:
     @pytest.mark.asyncio
     async def test_is_valid_root_true(self):
         from pyrxd.network.chaintracker import ChainTracker
+
         # Build a fake 80-byte header with a known merkle root at bytes 36-68
         merkle_root = bytes(range(32))  # 32 bytes, offset 36
         header = b"\x00" * 36 + merkle_root + b"\x00" * 12
@@ -134,6 +146,7 @@ class TestChainTracker:
     @pytest.mark.asyncio
     async def test_is_valid_root_false(self):
         from pyrxd.network.chaintracker import ChainTracker
+
         merkle_root = bytes(range(32))
         wrong_root = bytes([0xFF] * 32)
         header = b"\x00" * 36 + wrong_root + b"\x00" * 12
@@ -146,6 +159,7 @@ class TestChainTracker:
     async def test_is_valid_root_coerces_plain_height(self):
         """is_valid_root accepts raw int height."""
         from pyrxd.network.chaintracker import ChainTracker
+
         merkle_root = bytes(range(32))
         header = b"\x00" * 36 + merkle_root + b"\x00" * 12
         src = self._make_mock_source(header)
@@ -157,6 +171,7 @@ class TestChainTracker:
     async def test_is_valid_root_coerces_plain_hex32(self):
         """is_valid_root accepts raw bytes merkle_root."""
         from pyrxd.network.chaintracker import ChainTracker
+
         merkle_root = bytes(range(32))
         header = b"\x00" * 36 + merkle_root + b"\x00" * 12
         src = self._make_mock_source(header)
@@ -167,6 +182,7 @@ class TestChainTracker:
     @pytest.mark.asyncio
     async def test_is_valid_root_for_height_happy(self):
         from pyrxd.network.chaintracker import ChainTracker
+
         # compute_root returns display-order hex, is_valid_root_for_height reverses it
         merkle_root_le = bytes(range(32))  # little-endian (stored in header)
         header = b"\x00" * 36 + merkle_root_le + b"\x00" * 12
@@ -181,6 +197,7 @@ class TestChainTracker:
 # ──────────────────────────────────────────────────────────────────────────────
 # Script — from_asm edge cases and is_push_only (lines 56->66, 60->66, 64->66, 98, 140, 143, 147-152, 160-161)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestScriptFromAsm:
     def test_from_asm_opcode_token(self):
@@ -245,6 +262,7 @@ class TestScriptFromAsm:
 # utils.py — Reader varint branches (lines 546-565)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestReaderVarEncoding:
     def test_read_varnum_fd_prefix(self):
         """0xFD prefix: read_var_int_num reads 2 more bytes."""
@@ -298,6 +316,7 @@ class TestReaderVarEncoding:
 # utils.py — encode_int negative (line 281)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestEncodeNegativeScript:
     def test_encode_negative_one(self):
         """encode_int should handle negative numbers."""
@@ -317,6 +336,7 @@ class TestEncodeNegativeScript:
 # ──────────────────────────────────────────────────────────────────────────────
 # utils.py — from_base58 / to_base58 edge cases (lines 331-333)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestBase58EdgeCases:
     def test_from_base58_invalid_char_0(self):
@@ -358,6 +378,7 @@ class TestBase58EdgeCases:
 # spv/witness.py — truncation errors inside strip_witness body
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 def _varint(n: int) -> bytes:
     if n < 0xFD:
         return bytes([n])
@@ -370,8 +391,9 @@ class TestStripWitnessTruncationPaths:
     """Test truncation errors for the 6 uncovered lines in witness.py body."""
 
     def test_truncated_in_inputs_raises(self):
-        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import strip_witness
+
         version = b"\x01\x00\x00\x00"
         # segwit marker + flag
         marker = b"\x00\x01"
@@ -381,8 +403,9 @@ class TestStripWitnessTruncationPaths:
             strip_witness(raw)
 
     def test_truncated_in_input_script_raises(self):
-        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import strip_witness
+
         version = b"\x01\x00\x00\x00"
         marker = b"\x00\x01"
         prevout = b"\xaa" * 36  # txid(32) + vout(4)
@@ -392,8 +415,9 @@ class TestStripWitnessTruncationPaths:
             strip_witness(raw)
 
     def test_truncated_in_output_value_raises(self):
-        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import strip_witness
+
         version = b"\x01\x00\x00\x00"
         marker = b"\x00\x01"
         # 1 valid input with empty script + sequence
@@ -405,8 +429,9 @@ class TestStripWitnessTruncationPaths:
             strip_witness(raw)
 
     def test_truncated_in_output_script_raises(self):
-        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import strip_witness
+
         version = b"\x01\x00\x00\x00"
         marker = b"\x00\x01"
         prevout = b"\xaa" * 36
@@ -418,8 +443,9 @@ class TestStripWitnessTruncationPaths:
             strip_witness(raw)
 
     def test_truncated_missing_locktime_raises(self):
-        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import strip_witness
+
         version = b"\x01\x00\x00\x00"
         marker = b"\x00\x01"
         prevout = b"\xaa" * 36
@@ -435,8 +461,9 @@ class TestStripWitnessTruncationPaths:
             strip_witness(raw)
 
     def test_truncated_in_witness_item_raises(self):
-        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import strip_witness
+
         version = b"\x01\x00\x00\x00"
         marker = b"\x00\x01"
         prevout = b"\xaa" * 36

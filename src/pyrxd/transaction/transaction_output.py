@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 from contextlib import suppress
-from typing import Optional, Union
 
 from ..script.script import Script
 from ..utils import Reader
@@ -32,7 +33,7 @@ class TransactionOutput:
         return self.__str__()
 
     @classmethod
-    def from_hex(cls, stream: Union[str, bytes, Reader]) -> Optional["TransactionOutput"]:
+    def from_hex(cls, stream: str | bytes | Reader) -> TransactionOutput | None:
         with suppress(Exception):
             stream = (
                 stream

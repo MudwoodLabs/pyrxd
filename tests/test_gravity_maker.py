@@ -11,20 +11,19 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pyrxd.gravity.codehash import compute_p2sh_script_pubkey
+from pyrxd.gravity.covenant import build_gravity_offer
 from pyrxd.gravity.maker import (
     ActiveOffer,
     GravityMakerSession,
     GravityOfferParams,
     _p2sh_script_hash,
 )
-from pyrxd.gravity.codehash import compute_p2sh_script_pubkey
-from pyrxd.gravity.covenant import build_gravity_offer
 from pyrxd.gravity.types import GravityOffer, MakerOfferResult
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.transaction.transaction import Transaction
-
 
 # ---------------------------------------------------------------------------
 # Task 1: Transaction.from_hex round-trip verification
@@ -336,10 +335,12 @@ class TestWaitForClaim:
         utxo = UtxoRecord(tx_hash=offer_txid, tx_pos=0, value=500_000, height=100)
         # First poll: UTXO is present (offer just confirmed)
         # Second poll: UTXO is gone (Taker claimed it)
-        client.get_utxos = AsyncMock(side_effect=[
-            [utxo],   # poll 0: still open
-            [],        # poll 1: claimed
-        ])
+        client.get_utxos = AsyncMock(
+            side_effect=[
+                [utxo],  # poll 0: still open
+                [],  # poll 1: claimed
+            ]
+        )
 
         session = GravityMakerSession(
             rxd_client=client,
@@ -394,6 +395,7 @@ class TestWaitForClaim:
 class TestCancelOffer:
     def _maker_address(self, privkey: PrivateKeyMaterial) -> str:
         import coincurve
+
         from pyrxd.base58 import base58check_encode
 
         pub = coincurve.PrivateKey(privkey.unsafe_raw_bytes()).public_key.format(compressed=True)
@@ -478,6 +480,7 @@ class TestCheckStatus:
         )
         # Use object.__setattr__ to override frozen dataclass field
         import dataclasses
+
         dataclasses.replace(expired_offer)
         # Since GravityOffer is frozen we cannot directly mutate it.
         # Instead, patch time.time in the check_status call.
@@ -543,7 +546,9 @@ class TestGravityOfferParams:
 
 
 def test_top_level_import():
-    from pyrxd import GravityMakerSession as GMS, GravityOfferParams as GOP, ActiveOffer as AO
+    from pyrxd import ActiveOffer as AO
+    from pyrxd import GravityMakerSession as GMS
+    from pyrxd import GravityOfferParams as GOP
 
     assert GMS is GravityMakerSession
     assert GOP is GravityOfferParams

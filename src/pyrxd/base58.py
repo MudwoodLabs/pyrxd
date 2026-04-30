@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .hash import hash256
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"

@@ -18,9 +18,8 @@ Design notes
   per call (``get_balance``, ``get_utxos``, ``send``) so the websocket is
   always closed deterministically.
 """
-from __future__ import annotations
 
-from typing import List, Tuple
+from __future__ import annotations
 
 from .keys import PrivateKey
 from .network.electrumx import ElectrumXClient, UtxoRecord, script_hash_for_address
@@ -110,9 +109,7 @@ class RxdWallet:
         return script_hash_for_address(self._address)
 
     def _make_client(self) -> ElectrumXClient:
-        return ElectrumXClient(
-            [self._electrumx_url], allow_insecure=self._allow_insecure
-        )
+        return ElectrumXClient([self._electrumx_url], allow_insecure=self._allow_insecure)
 
     def _make_input(self, utxo: UtxoRecord) -> TransactionInput:
         """Convert a :class:`~pyrxd.network.electrumx.UtxoRecord` into a
@@ -151,7 +148,7 @@ class RxdWallet:
 
     def build_send_tx(
         self,
-        utxos: List[UtxoRecord],
+        utxos: list[UtxoRecord],
         to_address: str,
         photons: int,
     ) -> Transaction:
@@ -173,9 +170,7 @@ class RxdWallet:
         if photons <= 0:
             raise ValidationError("photons must be > 0")
         if photons < DUST_THRESHOLD:
-            raise ValidationError(
-                f"photons below dust threshold ({DUST_THRESHOLD})"
-            )
+            raise ValidationError(f"photons below dust threshold ({DUST_THRESHOLD})")
         if not validate_address(to_address):
             raise ValidationError("to_address is not a valid P2PKH address")
         if not utxos:
@@ -189,7 +184,7 @@ class RxdWallet:
 
         # Greedy selection: stop once we have enough for the trial output plus
         # a generous fee-plus-change buffer (re-checked after the trial pass).
-        selected: List[UtxoRecord] = []
+        selected: list[UtxoRecord] = []
         total_in = 0
         min_input_bytes = 148  # signed P2PKH input approx 148 bytes
         per_input_fee_cushion = min_input_bytes * self._fee_rate
@@ -228,9 +223,7 @@ class RxdWallet:
         for inp in inputs:
             inp.unlocking_script = None
 
-        final_outputs: List[TransactionOutput] = [
-            TransactionOutput(recipient_script, photons)
-        ]
+        final_outputs: list[TransactionOutput] = [TransactionOutput(recipient_script, photons)]
         if change_value >= DUST_THRESHOLD:
             final_outputs.append(TransactionOutput(change_script, change_value))
         # else: burn dust remainder as fee (standard practice for tiny change).
@@ -245,7 +238,7 @@ class RxdWallet:
 
     def build_send_max_tx(
         self,
-        utxos: List[UtxoRecord],
+        utxos: list[UtxoRecord],
         to_address: str,
     ) -> Transaction:
         """Build and sign a tx sweeping *all* provided UTXOs to *to_address*.
@@ -289,14 +282,14 @@ class RxdWallet:
 
     # ------------------------------------------------------------------ network
 
-    async def get_balance(self) -> Tuple[int, int]:
+    async def get_balance(self) -> tuple[int, int]:
         """Return ``(confirmed_photons, unconfirmed_photons)`` for this wallet."""
         script_hash = self._script_hash()
         async with self._make_client() as client:
             confirmed, unconfirmed = await client.get_balance(script_hash)
         return int(confirmed), int(unconfirmed)
 
-    async def get_utxos(self) -> List[UtxoRecord]:
+    async def get_utxos(self) -> list[UtxoRecord]:
         """Return typed :class:`~pyrxd.network.electrumx.UtxoRecord` list for this wallet."""
         script_hash = self._script_hash()
         async with self._make_client() as client:

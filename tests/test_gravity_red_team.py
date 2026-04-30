@@ -51,7 +51,6 @@ from pyrxd.gravity.types import MIN_CLAIM_DEADLINE
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -186,7 +185,7 @@ class TestArtifactTampering:
 
     def test_deny_list_catches_banned_name(self):
         """Each entry in _BANNED_NAMES must be rejected when loaded by name."""
-        for banned_name in _BANNED_NAMES.keys():
+        for banned_name in _BANNED_NAMES:
             fake = {
                 "version": 1,
                 "contract": banned_name,
@@ -473,12 +472,8 @@ class TestMakerOfferTxSigning:
             maker_privkey=signer,
         )
         raw = bytes.fromhex(result.tx_hex)
-        signer_pub = coincurve.PrivateKey(signer.unsafe_raw_bytes()).public_key.format(
-            compressed=True
-        )
-        offer_maker_pub = coincurve.PrivateKey(
-            offer_maker.unsafe_raw_bytes()
-        ).public_key.format(compressed=True)
+        signer_pub = coincurve.PrivateKey(signer.unsafe_raw_bytes()).public_key.format(compressed=True)
+        offer_maker_pub = coincurve.PrivateKey(offer_maker.unsafe_raw_bytes()).public_key.format(compressed=True)
         assert signer_pub in raw
         assert offer_maker_pub not in raw
 
@@ -589,9 +584,7 @@ class TestCodeHashStability:
         # Expect 0x20 (push 32 bytes) followed immediately by the hash.
         expected_push = bytes([0x20]) + code_hash
         offer_bytes = bytes.fromhex(offer.offer_redeem_hex)
-        assert expected_push in offer_bytes, (
-            "expectedClaimedCodeHash must appear as a 32-byte push in the offer redeem"
-        )
+        assert expected_push in offer_bytes, "expectedClaimedCodeHash must appear as a 32-byte push in the offer redeem"
 
     def test_offer_changes_when_claimed_changes(self):
         kwargs1 = _valid_offer_kwargs()
@@ -747,9 +740,7 @@ class TestArtifactSupplyChain:
         ]:
             art = CovenantArtifact.load(name)
             sha = hashlib.sha256(art.hex_template.encode()).hexdigest()
-            assert sha not in _BANNED_BYTECODE_SHA256, (
-                f"bundled artifact {name} has banned SHA {sha}; regenerate!"
-            )
+            assert sha not in _BANNED_BYTECODE_SHA256, f"bundled artifact {name} has banned SHA {sha}; regenerate!"
 
 
 # ===========================================================================
@@ -880,13 +871,13 @@ class TestMakerOfferTxWireBinding:
             ss_len = first
             pos += 1
         else:
-            ss_len = int.from_bytes(raw[pos + 1:pos + 3], "little")
+            ss_len = int.from_bytes(raw[pos + 1 : pos + 3], "little")
             pos += 3
         pos += ss_len + 4  # past scriptsig + sequence
         # Skip output count varint (1 byte for small counts)
         assert raw[pos] == 0x01  # single-output tx
         pos += 1
-        value = int.from_bytes(raw[pos:pos + 8], "little")
+        value = int.from_bytes(raw[pos : pos + 8], "little")
         assert value == offer.photons_offered
 
     def test_first_output_scriptpubkey_is_p2sh_of_offer_redeem(self):
@@ -913,14 +904,20 @@ class TestMakerOfferTxWireBinding:
         offer = _make_real_offer(pk1)
         pk2 = _make_privkey(0x22)
         r1 = build_maker_offer_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
             funding_photons=offer.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk1,
+            fee_sats=self.FEE,
+            maker_privkey=pk1,
         )
         r2 = build_maker_offer_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
             funding_photons=offer.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk2,
+            fee_sats=self.FEE,
+            maker_privkey=pk2,
         )
         # Different keys derive different PKHs → different P2PKH scriptCode
         # (and different pubkey in scriptSig). Tx bytes AND txid must differ.
@@ -996,9 +993,13 @@ class TestClaimTxAttacks:
 
         offer = self._offer()
         result = build_claim_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
-            funding_photons=1_000_000, fee_sats=1_000,
-            taker_privkey=self._taker(), accept_short_deadline=True,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
+            funding_photons=1_000_000,
+            fee_sats=1_000,
+            taker_privkey=self._taker(),
+            accept_short_deadline=True,
         )
         raw = bytes.fromhex(result.tx_hex)
         # Parse scriptSig
@@ -1008,16 +1009,14 @@ class TestClaimTxAttacks:
             ss_len = first
             pos += 1
         else:
-            ss_len = int.from_bytes(raw[pos + 1:pos + 3], "little")
+            ss_len = int.from_bytes(raw[pos + 1 : pos + 3], "little")
             pos += 3
-        scriptsig = raw[pos:pos + ss_len]
+        scriptsig = raw[pos : pos + ss_len]
         # scriptSig layout: <sig+hashtype> OP_1 <offer_redeem>
         # Skip the sig push — first byte is its length prefix.
         sig_len = scriptsig[0]
         # The byte IMMEDIATELY after the sig push MUST be OP_1 (0x51) — bare.
-        assert scriptsig[1 + sig_len] == 0x51, (
-            "expected OP_1 (0x51) selector as bare opcode after sig push"
-        )
+        assert scriptsig[1 + sig_len] == 0x51, "expected OP_1 (0x51) selector as bare opcode after sig push"
 
     def test_claim_output_is_p2sh_of_claimed_redeem(self):
         """Scenario 19: the claim tx's output scriptPubKey must be exactly
@@ -1027,14 +1026,16 @@ class TestClaimTxAttacks:
 
         offer = self._offer()
         result = build_claim_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
-            funding_photons=1_000_000, fee_sats=1_000,
-            taker_privkey=self._taker(), accept_short_deadline=True,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
+            funding_photons=1_000_000,
+            fee_sats=1_000,
+            taker_privkey=self._taker(),
+            accept_short_deadline=True,
         )
         raw = bytes.fromhex(result.tx_hex)
-        expected_spk = compute_p2sh_script_pubkey(
-            bytes.fromhex(offer.claimed_redeem_hex)
-        )
+        expected_spk = compute_p2sh_script_pubkey(bytes.fromhex(offer.claimed_redeem_hex))
         assert expected_spk in raw
         assert raw.count(expected_spk) == 1  # only one output
 
@@ -1121,8 +1122,11 @@ class TestForfeitTxAttacks:
         """Scenario 23: last 4 bytes of raw tx must be claim_deadline LE."""
         offer = self._past()
         result = build_forfeit_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
-            funding_photons=1_000_000, maker_address=self.MAKER_ADDR,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
+            funding_photons=1_000_000,
+            maker_address=self.MAKER_ADDR,
             fee_sats=1_000,
         )
         raw = bytes.fromhex(result.tx_hex)
@@ -1132,8 +1136,11 @@ class TestForfeitTxAttacks:
         """Scenario 24: input sequence must be 0xFFFFFFFE (required for CLTV)."""
         offer = self._past()
         result = build_forfeit_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
-            funding_photons=1_000_000, maker_address=self.MAKER_ADDR,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
+            funding_photons=1_000_000,
+            maker_address=self.MAKER_ADDR,
             fee_sats=1_000,
         )
         raw = bytes.fromhex(result.tx_hex)
@@ -1144,18 +1151,21 @@ class TestForfeitTxAttacks:
             ss_len = first
             pos += 1
         else:
-            ss_len = int.from_bytes(raw[pos + 1:pos + 3], "little")
+            ss_len = int.from_bytes(raw[pos + 1 : pos + 3], "little")
             pos += 3
         pos += ss_len
-        sequence = int.from_bytes(raw[pos:pos + 4], "little")
+        sequence = int.from_bytes(raw[pos : pos + 4], "little")
         assert sequence == 0xFFFFFFFE
 
     def test_forfeit_scriptsig_starts_with_op1(self):
         """Scenario 25: scriptSig must start with OP_1 (0x51) as selector 1."""
         offer = self._past()
         result = build_forfeit_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
-            funding_photons=1_000_000, maker_address=self.MAKER_ADDR,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
+            funding_photons=1_000_000,
+            maker_address=self.MAKER_ADDR,
             fee_sats=1_000,
         )
         raw = bytes.fromhex(result.tx_hex)
@@ -1193,14 +1203,20 @@ class TestSigningIntegrity:
         assert offer_a.offer_redeem_hex != offer_b.offer_redeem_hex
 
         r_a = build_maker_offer_tx(
-            offer=offer_a, funding_txid="aa" * 32, funding_vout=0,
+            offer=offer_a,
+            funding_txid="aa" * 32,
+            funding_vout=0,
             funding_photons=offer_a.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk,
+            fee_sats=self.FEE,
+            maker_privkey=pk,
         )
         r_b = build_maker_offer_tx(
-            offer=offer_b, funding_txid="aa" * 32, funding_vout=0,
+            offer=offer_b,
+            funding_txid="aa" * 32,
+            funding_vout=0,
             funding_photons=offer_b.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk,
+            fee_sats=self.FEE,
+            maker_privkey=pk,
         )
         # Different outputs → different preimage → different sig → different tx
         assert r_a.tx_hex != r_b.tx_hex
@@ -1213,14 +1229,20 @@ class TestSigningIntegrity:
         pk = _make_privkey()
         offer = _make_real_offer(pk)
         r1 = build_maker_offer_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
             funding_photons=offer.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk,
+            fee_sats=self.FEE,
+            maker_privkey=pk,
         )
         r2 = build_maker_offer_tx(
-            offer=offer, funding_txid="bb" * 32, funding_vout=0,
+            offer=offer,
+            funding_txid="bb" * 32,
+            funding_vout=0,
             funding_photons=offer.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk,
+            fee_sats=self.FEE,
+            maker_privkey=pk,
         )
         # Extract scriptSigs and compare signature bytes directly.
         # This is strictly stronger than comparing full tx_hex.
@@ -1232,14 +1254,20 @@ class TestSigningIntegrity:
         pk = _make_privkey()
         offer = _make_real_offer(pk)
         r1 = build_maker_offer_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
             funding_photons=offer.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk,
+            fee_sats=self.FEE,
+            maker_privkey=pk,
         )
         r2 = build_maker_offer_tx(
-            offer=offer, funding_txid="aa" * 32, funding_vout=1,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=1,
             funding_photons=offer.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk,
+            fee_sats=self.FEE,
+            maker_privkey=pk,
         )
         assert r1.tx_hex != r2.tx_hex
 
@@ -1254,15 +1282,16 @@ class TestSigningIntegrity:
         pk = _make_privkey()
         offer = _make_real_offer(pk)
         kwargs = dict(
-            offer=offer, funding_txid="aa" * 32, funding_vout=0,
+            offer=offer,
+            funding_txid="aa" * 32,
+            funding_vout=0,
             funding_photons=offer.photons_offered + self.FEE,
-            fee_sats=self.FEE, maker_privkey=pk,
+            fee_sats=self.FEE,
+            maker_privkey=pk,
         )
         r1 = build_maker_offer_tx(**kwargs)
         r2 = build_maker_offer_tx(**kwargs)
-        assert r1.tx_hex == r2.tx_hex, (
-            "non-deterministic signing detected — potential nonce-reuse risk"
-        )
+        assert r1.tx_hex == r2.tx_hex, "non-deterministic signing detected — potential nonce-reuse risk"
         assert r1.txid == r2.txid
 
 
@@ -1358,13 +1387,15 @@ class TestPrefixPlaceholderCollision:
         fake = {
             "version": 1,
             "contract": "PrefixTest",
-            "abi": [{
-                "type": "constructor",
-                "params": [
-                    {"name": "foo", "type": "int"},
-                    {"name": "fooBar", "type": "int"},
-                ],
-            }],
+            "abi": [
+                {
+                    "type": "constructor",
+                    "params": [
+                        {"name": "foo", "type": "int"},
+                        {"name": "fooBar", "type": "int"},
+                    ],
+                }
+            ],
             "hex": "aa<fooBar>bb<foo>cc",
         }
         art = CovenantArtifact.from_json(json.dumps(fake))
@@ -1378,6 +1409,7 @@ class TestPrefixPlaceholderCollision:
 # Security audit findings — regression tests (2026-04-24)
 # ---------------------------------------------------------------------------
 
+
 class TestAuditFindings2026:
     """Regression tests for findings from internal security audit (2026-04-24)."""
 
@@ -1389,6 +1421,7 @@ class TestAuditFindings2026:
         """
         from pyrxd.gravity.covenant import build_gravity_offer
         from pyrxd.security.errors import ValidationError
+
         with pytest.raises(ValidationError, match="btc_receive_type"):
             build_gravity_offer(
                 maker_pkh=b"\xaa" * 20,
@@ -1413,6 +1446,7 @@ class TestAuditFindings2026:
         enforces this at the dataclass level.
         """
         from pyrxd.spv.proof import CovenantParams, SpvProof
+
         params = CovenantParams(
             btc_receive_hash=b"\xaa" * 20,
             btc_receive_type="p2wpkh",
@@ -1440,7 +1474,7 @@ class TestAuditFindings2026:
         """
         from pyrxd.gravity.transactions import build_finalize_tx
         from pyrxd.security.errors import ValidationError
-        from pyrxd.spv.proof import CovenantParams, SpvProof, _BUILDER_TOKEN
+        from pyrxd.spv.proof import _BUILDER_TOKEN, CovenantParams, SpvProof
 
         params = CovenantParams(
             btc_receive_hash=b"\xaa" * 20,
@@ -1478,6 +1512,7 @@ class TestAuditFindings2026:
         could reconstruct the key one bit at a time. Fixed to use hmac.compare_digest.
         """
         from pyrxd.keys import PrivateKey
+
         k1 = PrivateKey(0x1111111111111111111111111111111111111111111111111111111111111111)
         k2 = PrivateKey(0x1111111111111111111111111111111111111111111111111111111111111111)
         k3 = PrivateKey(0x2222222222222222222222222222222222222222222222222222222222222222)
@@ -1495,6 +1530,7 @@ class TestAuditFindings2026:
         inside the tx builder, leaving funds permanently locked with no recovery path.
         """
         from pyrxd.gravity.types import GravityOffer
+
         with pytest.raises(ValidationError, match="uint32 max"):
             GravityOffer(
                 btc_receive_hash=b"\xaa" * 20,
@@ -1514,6 +1550,7 @@ class TestAuditFindings2026:
     def test_artifact_path_traversal_blocked(self):
         """HIGH: artifact names with '..' must be rejected before any filesystem access."""
         from pyrxd.gravity.covenant import CovenantArtifact
+
         with pytest.raises(ValidationError, match="invalid characters"):
             CovenantArtifact.load("../../etc/passwd")
 
@@ -1521,6 +1558,7 @@ class TestAuditFindings2026:
         """MEDIUM: negative fee_sats in tx builders must raise ValidationError."""
         from pyrxd.gravity.transactions import build_maker_offer_tx
         from pyrxd.gravity.types import GravityOffer
+
         offer = GravityOffer(
             btc_receive_hash=b"\xaa" * 20,
             btc_receive_type="p2pkh",
@@ -1542,5 +1580,7 @@ class TestAuditFindings2026:
                 funding_vout=0,
                 funding_photons=10_000_000,
                 fee_sats=-1,
-                maker_privkey=__import__("pyrxd.security.secrets", fromlist=["PrivateKeyMaterial"]).PrivateKeyMaterial(bytes(range(1, 33))),
+                maker_privkey=__import__("pyrxd.security.secrets", fromlist=["PrivateKeyMaterial"]).PrivateKeyMaterial(
+                    bytes(range(1, 33))
+                ),
             )

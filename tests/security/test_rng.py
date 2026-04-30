@@ -63,9 +63,7 @@ class TestSecureScalarModN:
 
 
 class TestSecureScalarModNRejectionSampling:
-    def test_rejection_sampling_handles_out_of_range(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_rejection_sampling_handles_out_of_range(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Feed one out-of-range candidate, then a valid one. The function
         # must loop past the bad draw.
         invalid = (_N).to_bytes(32, "big")  # scalar = N (invalid)
@@ -81,9 +79,7 @@ class TestSecureScalarModNRejectionSampling:
         pk = PrivateKeyMaterial(rng_mod.secure_scalar_bytes_mod_n())
         assert int.from_bytes(pk.unsafe_raw_bytes(), "big") == 42
 
-    def test_rejection_sampling_rejects_zero(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_rejection_sampling_rejects_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
         zero = b"\x00" * 32
         valid = (1).to_bytes(32, "big")
         seq = iter([zero, valid])
@@ -97,9 +93,7 @@ class TestSecureScalarModNRejectionSampling:
         pk = PrivateKeyMaterial(rng_mod.secure_scalar_bytes_mod_n())
         assert int.from_bytes(pk.unsafe_raw_bytes(), "big") == 1
 
-    def test_rejection_sampling_exhaustion_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_rejection_sampling_exhaustion_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # If every draw is invalid (broken RNG simulation), the function
         # must raise RuntimeError rather than loop forever.
         from pyrxd.security import rng as rng_mod

@@ -56,8 +56,4 @@ def secure_scalar_bytes_mod_n() -> bytes:
 
     # Unreachable under a functioning RNG. Raising RuntimeError instead of
     # looping forever keeps the process from hanging if the RNG is broken.
-    raise RuntimeError(
-        "secure_scalar_bytes_mod_n exhausted rejection attempts; RNG may be broken"
-    )
-
-
+    raise RuntimeError("secure_scalar_bytes_mod_n exhausted rejection attempts; RNG may be broken")

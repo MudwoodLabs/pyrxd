@@ -30,7 +30,6 @@ import hashlib
 import logging
 import time
 from dataclasses import dataclass
-from typing import Optional
 
 from pyrxd.network.bitcoin import BtcDataSource
 from pyrxd.network.electrumx import ElectrumXClient
@@ -42,9 +41,9 @@ from .transactions import build_cancel_tx, build_maker_offer_tx
 from .types import CancelResult, GravityOffer, MakerOfferResult
 
 __all__ = [
+    "ActiveOffer",
     "GravityMakerSession",
     "GravityOfferParams",
-    "ActiveOffer",
 ]
 
 logger = logging.getLogger(__name__)
@@ -97,7 +96,7 @@ class GravityOfferParams:
     funding_vout: int
     funding_photons: int
     fee_sats: int
-    change_address: Optional[str] = None
+    change_address: str | None = None
 
 
 @dataclass
@@ -175,7 +174,7 @@ class GravityMakerSession:
         self,
         rxd_client: ElectrumXClient,
         maker_priv: PrivateKeyMaterial,
-        btc_source: Optional[BtcDataSource] = None,
+        btc_source: BtcDataSource | None = None,
         poll_interval_seconds: int = _DEFAULT_POLL_INTERVAL,
     ) -> None:
         self._rxd = rxd_client
@@ -242,7 +241,7 @@ class GravityMakerSession:
         self,
         offer: ActiveOffer,
         timeout_seconds: int = 3600,
-    ) -> Optional[str]:
+    ) -> str | None:
         """Poll for the Taker's claim transaction.
 
         Polls ``get_utxos()`` on the MakerOffer P2SH script hash.  When the
@@ -295,10 +294,7 @@ class GravityMakerSession:
                 raise
 
             # Check if the specific offer UTXO is still unspent.
-            offer_unspent = any(
-                u.tx_hash == offer.offer_txid and u.tx_pos == offer.offer_vout
-                for u in utxos
-            )
+            offer_unspent = any(u.tx_hash == offer.offer_txid and u.tx_pos == offer.offer_vout for u in utxos)
 
             if not offer_unspent and attempt > 0:
                 # The UTXO has been spent — the Taker has claimed it.

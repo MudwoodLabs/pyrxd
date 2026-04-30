@@ -1,18 +1,19 @@
 """Coverage gap tests batch 5: BEEF format, witness stripping, RPuzzle, script type unlocks,
 tx_preimages variants."""
 
+from __future__ import annotations
+
 import pytest
 
+from pyrxd.constants import SIGHASH
+from pyrxd.hash import hash256
+from pyrxd.keys import PrivateKey
+from pyrxd.merkle_path import MerklePath
+from pyrxd.script.script import Script
+from pyrxd.script.type import P2PK, P2PKH, BareMultisig, RPuzzle
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
-from pyrxd.merkle_path import MerklePath
-from pyrxd.script.script import Script
-from pyrxd.script.type import P2PKH, P2PK, BareMultisig, RPuzzle
-from pyrxd.keys import PrivateKey
-from pyrxd.hash import hash256
-from pyrxd.constants import SIGHASH
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers for building minimal valid transactions
@@ -49,17 +50,21 @@ def _simple_merkle_path(block_height: int = 1) -> MerklePath:
     """Minimal valid MerklePath: depth-1 tree with txid at offset 0 and sibling at offset 1."""
     leaf_hash = "ab" * 32
     sibling_hash = "cd" * 32
-    return MerklePath(block_height, [
+    return MerklePath(
+        block_height,
         [
-            {"offset": 0, "hash_str": leaf_hash, "txid": True},
-            {"offset": 1, "hash_str": sibling_hash},
+            [
+                {"offset": 0, "hash_str": leaf_hash, "txid": True},
+                {"offset": 1, "hash_str": sibling_hash},
+            ],
         ],
-    ])
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # BEEF round-trip (to_beef / from_beef)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestBEEFRoundTrip:
     """Tests for Transaction.to_beef() and Transaction.from_beef()."""
@@ -112,6 +117,7 @@ class TestBEEFRoundTrip:
 
     def test_from_beef_reader(self):
         from pyrxd.utils import Reader
+
         tx = self._tx_with_merkle_path()
         beef_bytes = tx.to_beef()
         reader = Reader(beef_bytes)
@@ -189,6 +195,7 @@ class TestBEEFRoundTrip:
 # spv/witness.py – strip_witness
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestStripWitness:
     """Tests for pyrxd.spv.witness.strip_witness."""
 
@@ -196,6 +203,7 @@ class TestStripWitness:
 
     def test_legacy_tx_returned_unchanged(self):
         from pyrxd.spv.witness import strip_witness
+
         # A legacy tx starts with version(4) + non-zero varint for input count
         # Build a minimal raw legacy tx: version + 1 input + 1 output + locktime
         raw = _build_legacy_tx()
@@ -204,19 +212,22 @@ class TestStripWitness:
 
     def test_segwit_tx_stripped(self):
         from pyrxd.spv.witness import strip_witness
+
         raw, expected_stripped = _build_segwit_tx()
         result = strip_witness(raw)
         assert result == expected_stripped
 
     def test_too_short_raises(self):
-        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError as VE
+        from pyrxd.spv.witness import strip_witness
+
         with pytest.raises(VE):
             strip_witness(b"\x01\x00\x00\x00\x00")  # 5 bytes < 10
 
     def test_unexpected_flag_raises(self):
-        from pyrxd.spv.witness import strip_witness
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import strip_witness
+
         # Build bytes that start with version(4) + 0x00 (segwit marker) + 0x02 (bad flag)
         data = b"\x01\x00\x00\x00" + b"\x00\x02" + b"\x00" * 20
         with pytest.raises(ValidationError, match="unexpected segwit flag"):
@@ -224,6 +235,7 @@ class TestStripWitness:
 
     def test_varint_fd_encoding(self):
         from pyrxd.spv.witness import _read_varint
+
         # 0xFD prefix encodes 2-byte little-endian value
         data = bytes([0xFD, 0x01, 0x00])  # encodes 1
         val, pos = _read_varint(data, 0)
@@ -232,6 +244,7 @@ class TestStripWitness:
 
     def test_varint_fe_encoding(self):
         from pyrxd.spv.witness import _read_varint
+
         data = bytes([0xFE, 0x02, 0x00, 0x00, 0x00])  # encodes 2
         val, pos = _read_varint(data, 0)
         assert val == 2
@@ -239,43 +252,50 @@ class TestStripWitness:
 
     def test_varint_ff_encoding(self):
         from pyrxd.spv.witness import _read_varint
+
         data = bytes([0xFF, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])  # encodes 3
         val, pos = _read_varint(data, 0)
         assert val == 3
         assert pos == 9
 
     def test_varint_truncated_fd_raises(self):
-        from pyrxd.spv.witness import _read_varint
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import _read_varint
+
         with pytest.raises(ValidationError):
             _read_varint(bytes([0xFD, 0x01]), 0)  # only 1 byte after prefix
 
     def test_varint_truncated_fe_raises(self):
-        from pyrxd.spv.witness import _read_varint
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import _read_varint
+
         with pytest.raises(ValidationError):
             _read_varint(bytes([0xFE, 0x01, 0x00]), 0)  # only 2 bytes after prefix
 
     def test_varint_truncated_ff_raises(self):
-        from pyrxd.spv.witness import _read_varint
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import _read_varint
+
         with pytest.raises(ValidationError):
             _read_varint(bytes([0xFF, 0x01, 0x00, 0x00, 0x00]), 0)  # only 4 bytes after prefix
 
     def test_varint_at_end_raises(self):
-        from pyrxd.spv.witness import _read_varint
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import _read_varint
+
         with pytest.raises(ValidationError):
             _read_varint(b"", 0)
 
     def test_encode_varint_negative_raises(self):
-        from pyrxd.spv.witness import _encode_varint
         from pyrxd.security.errors import ValidationError
+        from pyrxd.spv.witness import _encode_varint
+
         with pytest.raises(ValidationError):
             _encode_varint(-1)
 
     def test_encode_varint_roundtrip_small(self):
         from pyrxd.spv.witness import _encode_varint, _read_varint
+
         for n in [0, 1, 0xFC]:
             encoded = _encode_varint(n)
             val, _ = _read_varint(encoded, 0)
@@ -283,6 +303,7 @@ class TestStripWitness:
 
     def test_encode_varint_roundtrip_fd(self):
         from pyrxd.spv.witness import _encode_varint, _read_varint
+
         for n in [0xFD, 0xFFFF]:
             encoded = _encode_varint(n)
             val, _ = _read_varint(encoded, 0)
@@ -290,6 +311,7 @@ class TestStripWitness:
 
     def test_encode_varint_roundtrip_fe(self):
         from pyrxd.spv.witness import _encode_varint, _read_varint
+
         n = 0x10000
         encoded = _encode_varint(n)
         val, _ = _read_varint(encoded, 0)
@@ -297,6 +319,7 @@ class TestStripWitness:
 
     def test_encode_varint_roundtrip_ff(self):
         from pyrxd.spv.witness import _encode_varint, _read_varint
+
         n = 0x1_0000_0000
         encoded = _encode_varint(n)
         val, _ = _read_varint(encoded, 0)
@@ -359,6 +382,7 @@ def _build_segwit_tx():
 # script/type.py – unlock methods (RPuzzle, P2PK, BareMultisig)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestRPuzzleUnlock:
     """Tests for RPuzzle.unlock() sign/estimate functions."""
 
@@ -370,6 +394,7 @@ class TestRPuzzleUnlock:
         )
         # Derive R-value: k*G x-coordinate (low-level via coincurve)
         import coincurve
+
         pub = coincurve.PublicKey.from_valid_secret(k.to_bytes(32, "big"))
         r_bytes = pub.format(compressed=False)[1:33]  # x coordinate
 
@@ -393,12 +418,14 @@ class TestRPuzzleUnlock:
         out_lock = P2PKH().lock(addr)
         tx.outputs.append(TransactionOutput(satoshis=4900, locking_script=out_lock))
 
-        unlock_template = rpuzzle.unlock(k=k, private_key=priv, sign_outputs=sign_outputs, anyone_can_pay=anyone_can_pay)
+        unlock_template = rpuzzle.unlock(
+            k=k, private_key=priv, sign_outputs=sign_outputs, anyone_can_pay=anyone_can_pay
+        )
         signed_script = unlock_template.sign(tx, 0)
         return signed_script, unlock_template
 
     def test_rpuzzle_sign_all(self):
-        signed, template = self._make_signed_tx_rpuzzle("all")
+        signed, _template = self._make_signed_tx_rpuzzle("all")
         assert isinstance(signed, Script)
         assert len(signed.serialize()) > 0
 
@@ -424,6 +451,7 @@ class TestRPuzzleUnlock:
 
     def test_rpuzzle_sha1_lock(self):
         import hashlib
+
         raw = b"\xab" * 20
         h = hashlib.sha1(raw).digest()
         lock = RPuzzle("SHA1").lock(h)
@@ -437,6 +465,7 @@ class TestRPuzzleUnlock:
 
     def test_rpuzzle_invalid_type_raises(self):
         from pyrxd.security.errors import ValidationError
+
         with pytest.raises(ValidationError, match="unsupported puzzle type"):
             RPuzzle("BLAKE2")
 
@@ -511,6 +540,7 @@ class TestBareMultisigUnlock:
 
     def test_multisig_bad_threshold_raises(self):
         from pyrxd.security.errors import ValidationError
+
         priv = PrivateKey()
         pk = priv.public_key().serialize()
         with pytest.raises(ValidationError):
@@ -524,6 +554,7 @@ class TestBareMultisigUnlock:
 # ──────────────────────────────────────────────────────────────────────────────
 # transaction_preimage.py – tx_preimages (all SIGHASH branches)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestTxPreimages:
     """Tests for tx_preimages() covering all sighash variant branches."""
@@ -547,14 +578,12 @@ class TestTxPreimages:
             )
             inputs.append(tx_in)
 
-        outputs = [
-            TransactionOutput(satoshis=2000, locking_script=lock)
-            for _ in range(count_out)
-        ]
+        outputs = [TransactionOutput(satoshis=2000, locking_script=lock) for _ in range(count_out)]
         return inputs, outputs
 
     def test_all_inputs_produce_preimages(self):
         from pyrxd.transaction.transaction_preimage import tx_preimages
+
         inputs, outputs = self._make_inputs_outputs()
         preimages = tx_preimages(inputs, outputs, 1, 0)
         assert len(preimages) == len(inputs)
@@ -564,6 +593,7 @@ class TestTxPreimages:
 
     def test_sighash_none_branch(self):
         from pyrxd.transaction.transaction_preimage import tx_preimages
+
         inputs, outputs = self._make_inputs_outputs()
         inputs[0].sighash = SIGHASH.NONE | SIGHASH.FORKID
         preimages = tx_preimages(inputs, outputs, 1, 0)
@@ -571,6 +601,7 @@ class TestTxPreimages:
 
     def test_sighash_single_in_range(self):
         from pyrxd.transaction.transaction_preimage import tx_preimages
+
         inputs, outputs = self._make_inputs_outputs(2, 2)
         inputs[0].sighash = SIGHASH.SINGLE | SIGHASH.FORKID
         preimages = tx_preimages(inputs, outputs, 1, 0)
@@ -579,6 +610,7 @@ class TestTxPreimages:
     def test_sighash_single_out_of_range(self):
         """SIGHASH_SINGLE with input index >= output count → zero hash_outputs."""
         from pyrxd.transaction.transaction_preimage import tx_preimages
+
         # 2 inputs, 1 output → input[1] is out of range for SINGLE
         inputs, outputs = self._make_inputs_outputs(2, 1)
         inputs[1].sighash = SIGHASH.SINGLE | SIGHASH.FORKID
@@ -587,6 +619,7 @@ class TestTxPreimages:
 
     def test_sighash_anyonecanpay(self):
         from pyrxd.transaction.transaction_preimage import tx_preimages
+
         inputs, outputs = self._make_inputs_outputs()
         inputs[0].sighash = SIGHASH.ALL | SIGHASH.FORKID | SIGHASH.ANYONECANPAY
         preimages = tx_preimages(inputs, outputs, 1, 0)
@@ -594,6 +627,7 @@ class TestTxPreimages:
 
     def test_sighash_anyonecanpay_none(self):
         from pyrxd.transaction.transaction_preimage import tx_preimages
+
         inputs, outputs = self._make_inputs_outputs()
         inputs[0].sighash = SIGHASH.NONE | SIGHASH.FORKID | SIGHASH.ANYONECANPAY
         preimages = tx_preimages(inputs, outputs, 1, 0)
@@ -601,6 +635,7 @@ class TestTxPreimages:
 
     def test_sighash_anyonecanpay_single(self):
         from pyrxd.transaction.transaction_preimage import tx_preimages
+
         inputs, outputs = self._make_inputs_outputs(2, 2)
         inputs[0].sighash = SIGHASH.SINGLE | SIGHASH.FORKID | SIGHASH.ANYONECANPAY
         preimages = tx_preimages(inputs, outputs, 1, 0)
@@ -609,6 +644,7 @@ class TestTxPreimages:
     def test_preimage_deterministic(self):
         """Same tx → same preimage bytes."""
         from pyrxd.transaction.transaction_preimage import tx_preimages
+
         inputs, outputs = self._make_inputs_outputs()
         p1 = tx_preimages(inputs, outputs, 1, 0)
         p2 = tx_preimages(inputs, outputs, 1, 0)
@@ -618,6 +654,7 @@ class TestTxPreimages:
 # ──────────────────────────────────────────────────────────────────────────────
 # script/type.py – remaining uncovered branches (lines 139-149, 179-186, 248-265)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestScriptTypeEdgeCases:
     """Edge cases in script type module not yet covered."""
@@ -634,6 +671,7 @@ class TestScriptTypeEdgeCases:
 
     def test_p2pkh_lock_wrong_length_raises(self):
         from pyrxd.security.errors import ValidationError
+
         with pytest.raises(ValidationError):
             P2PKH().lock(b"\x01" * 10)  # Not 20 bytes
 
@@ -656,6 +694,7 @@ class TestScriptTypeEdgeCases:
 
     def test_p2pk_lock_wrong_length_raises(self):
         from pyrxd.security.errors import ValidationError
+
         with pytest.raises(ValidationError):
             P2PK().lock(b"\x01" * 10)  # Not 33 or 65 bytes
 
@@ -668,6 +707,7 @@ class TestScriptTypeEdgeCases:
 
     def test_bare_multisig_threshold_too_high_raises(self):
         from pyrxd.security.errors import ValidationError
+
         priv = PrivateKey()
         pk = priv.public_key().serialize()
         with pytest.raises(ValidationError):

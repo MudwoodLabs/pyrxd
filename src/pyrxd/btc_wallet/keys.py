@@ -132,7 +132,7 @@ def generate_keypair(network: str = "bc") -> BtcKeypair:
             mainnet, ``"tb"`` for testnet/signet, ``"bcrt"`` for regtest, or
             any custom HRP.
     """
-    import coincurve  # noqa: PLC0415
+    import coincurve
 
     privkey_material = secure_scalar_mod_n()
     raw = privkey_material.unsafe_raw_bytes()
@@ -150,7 +150,7 @@ def keypair_from_wif(wif: str, network: str = "bc") -> BtcKeypair:
             Note: this controls OUTPUT address/WIF encoding only; the input WIF
             is decoded regardless of its version byte.
     """
-    import coincurve  # noqa: PLC0415
+    import coincurve
 
     privkey_material = PrivateKeyMaterial.from_wif(wif)
     raw = privkey_material.unsafe_raw_bytes()
@@ -207,7 +207,7 @@ def _taproot_tweak(x_only_pubkey: bytes) -> bytes:
 
     tagged hash = SHA256(SHA256('TapTweak') || SHA256('TapTweak') || x_only_pubkey)
     """
-    import coincurve  # noqa: PLC0415
+    import coincurve
 
     tag = b"TapTweak"
     tag_hash = hashlib.sha256(tag).digest()
@@ -295,7 +295,7 @@ def _bech32_hrp_expand(hrp: str) -> list[int]:
 def _bech32_create_checksum(hrp: str, data: list[int], spec: int) -> list[int]:
     """Compute the 6-character checksum for a bech32/bech32m string."""
     values = _bech32_hrp_expand(hrp) + data
-    polymod = _bech32_polymod(values + [0, 0, 0, 0, 0, 0]) ^ spec
+    polymod = _bech32_polymod([*values, 0, 0, 0, 0, 0, 0]) ^ spec
     return [(polymod >> (5 * (5 - i))) & 31 for i in range(6)]
 
 
@@ -325,6 +325,6 @@ def _bech32_encode(hrp: str, witness_version: int, witness_program: bytes) -> st
     """
     spec = _BECH32M_CONST if witness_version > 0 else _BECH32_CONST
     data = _convertbits(witness_program, 8, 5)
-    combined = [witness_version] + data
+    combined = [witness_version, *data]
     checksum = _bech32_create_checksum(hrp, combined, spec)
     return hrp + "1" + "".join(_BECH32_CHARSET[d] for d in combined + checksum)

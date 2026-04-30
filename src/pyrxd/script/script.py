@@ -1,7 +1,7 @@
-from typing import Union, Optional, List
+from __future__ import annotations
 
-from ..constants import OpCode, OPCODE_VALUE_NAME_DICT
-from ..utils import encode_pushdata, unsigned_to_varint, Reader
+from ..constants import OPCODE_VALUE_NAME_DICT, OpCode
+from ..utils import Reader, encode_pushdata, unsigned_to_varint
 
 
 class ScriptChunk:
@@ -10,7 +10,7 @@ class ScriptChunk:
     For push operations, the associated data to push onto the stack is also included.
     """
 
-    def __init__(self, op: bytes, data: Optional[bytes] = None):
+    def __init__(self, op: bytes, data: bytes | None = None):
         self.op = op
         self.data = data
 
@@ -24,7 +24,7 @@ class ScriptChunk:
 
 
 class Script:
-    def __init__(self, script: Union[str, bytes, None] = None):
+    def __init__(self, script: str | bytes | None = None):
         """
         Create script from hex string or bytes
         """
@@ -39,7 +39,7 @@ class Script:
         else:
             raise TypeError("unsupported script type")
         # An array of script chunks that make up the script.
-        self.chunks: List[ScriptChunk] = []
+        self.chunks: list[ScriptChunk] = []
         self._build_chunks()
 
     def _build_chunks(self):
@@ -87,10 +87,7 @@ class Script:
         Checks if the script contains only push data operations.
         :return: True if the script is push-only, otherwise false.
         """
-        for chunk in self.chunks:
-            if chunk.op > OpCode.OP_16:
-                return False
-        return True
+        return all(chunk.op <= OpCode.OP_16 for chunk in self.chunks)
 
     def __eq__(self, o: object) -> bool:
         if isinstance(o, Script):
@@ -104,7 +101,7 @@ class Script:
         return self.__str__()
 
     @classmethod
-    def from_chunks(cls, chunks: List[ScriptChunk]) -> "Script":
+    def from_chunks(cls, chunks: list[ScriptChunk]) -> Script:
         script = b""
         for chunk in chunks:
             script += encode_pushdata(chunk.data) if chunk.data is not None else chunk.op
@@ -113,15 +110,15 @@ class Script:
         return s
 
     @classmethod
-    def from_asm(cls, asm: str) -> "Script":
+    def from_asm(cls, asm: str) -> Script:
         chunks: [ScriptChunk] = []
         tokens = asm.split(" ")
         i = 0
         while i < len(tokens):
             token = tokens[i]
             token = "OP_0" if token == "OP_FALSE" else token  # nosec B105 -- comparing opcode names, not passwords
-            opcode: Optional[str] = None
-            opcode_value: Optional[bytes] = None
+            opcode: str | None = None
+            opcode_value: bytes | None = None
             if token.startswith("OP_") and token in OPCODE_VALUE_NAME_DICT.values():
                 opcode = token
                 opcode_value = OpCode[opcode].value
@@ -168,7 +165,7 @@ class Script:
         return " ".join(str(chunk) for chunk in self.chunks)
 
     @classmethod
-    def find_and_delete(cls, source: "Script", pattern: "Script") -> "Script":
+    def find_and_delete(cls, source: Script, pattern: Script) -> Script:
         chunks = []
         for chunk in source.chunks:
             if Script.from_chunks([chunk]).hex() != pattern.hex():
@@ -176,5 +173,5 @@ class Script:
         return Script.from_chunks(chunks)
 
     @classmethod
-    def write_bin(cls, octets: bytes) -> "Script":
+    def write_bin(cls, octets: bytes) -> Script:
         return Script(encode_pushdata(octets))

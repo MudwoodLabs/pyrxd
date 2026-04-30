@@ -12,10 +12,10 @@ Block 840000 header (hex, 80 bytes):
 Source: verified from multiple public Bitcoin block explorers.
 The header is the serialised 80-byte structure as broadcast on the wire.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock
-
 
 from pyrxd.network.chaintracker import ChainTracker
 from pyrxd.security.types import BlockHeight, Hex32
@@ -35,6 +35,7 @@ _WRONG_ROOT = b"\xbb" * 32
 
 
 # ── Mock BtcDataSource ────────────────────────────────────────────────────────
+
 
 class _StaticHeaderSource:
     """Minimal BtcDataSource stub that returns a fixed header."""
@@ -66,6 +67,7 @@ class _StaticHeaderSource:
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
+
 
 async def test_correct_root_returns_true():
     """is_valid_root must return True when the root matches the header."""

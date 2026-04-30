@@ -19,9 +19,7 @@ from .pow import verify_header_pow
 __all__ = ["verify_chain"]
 
 
-def verify_chain(
-    headers: list[bytes], chain_anchor: bytes | None = None
-) -> list[bytes]:
+def verify_chain(headers: list[bytes], chain_anchor: bytes | None = None) -> list[bytes]:
     """Verify a chain of N consecutive 80-byte Bitcoin block headers.
 
     Args:
@@ -52,14 +50,11 @@ def verify_chain(
         prev_hash_field = header[4:36]  # prevHash at bytes 4..36, LE
         if i == 0:
             if chain_anchor is not None and prev_hash_field != chain_anchor:
-                raise SpvVerificationError(
-                    "headers[0].prevHash does not match chain_anchor"
-                )
+                raise SpvVerificationError("headers[0].prevHash does not match chain_anchor")
         else:
             if prev_hash_field != prev_hash:
                 raise SpvVerificationError(
-                    f"chain link broken at header[{i}]: "
-                    f"prevHash does not match hash of header[{i - 1}]"
+                    f"chain link broken at header[{i}]: prevHash does not match hash of header[{i - 1}]"
                 )
 
         # PoW check (also returns the header's hash).

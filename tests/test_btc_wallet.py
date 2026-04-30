@@ -288,9 +288,7 @@ class TestBuildPaymentTx:
         """P2SH-P2WPKH input must have 23-byte scriptSig."""
         kp = generate_keypair()
         utxo = BtcUtxo(txid="aa" * 32, vout=0, value=100_000)
-        result = build_payment_tx(
-            kp, utxo, b"\xbb" * 20, P2WPKH, 50_000, 1_000, input_type="p2sh_p2wpkh"
-        )
+        result = build_payment_tx(kp, utxo, b"\xbb" * 20, P2WPKH, 50_000, 1_000, input_type="p2sh_p2wpkh")
         raw = bytes.fromhex(result.tx_hex)
         stripped = strip_witness(raw)
         # After version(4) + input_count(1) + prevout(36), scriptSig length byte
@@ -303,9 +301,7 @@ class TestBuildPaymentTx:
         """P2SH-P2WPKH tx txid should match non-witness hash."""
         kp = generate_keypair()
         utxo = BtcUtxo(txid="bb" * 32, vout=1, value=200_000)
-        result = build_payment_tx(
-            kp, utxo, b"\xcc" * 20, P2PKH, 100_000, 2_000, input_type="p2sh_p2wpkh"
-        )
+        result = build_payment_tx(kp, utxo, b"\xcc" * 20, P2PKH, 100_000, 2_000, input_type="p2sh_p2wpkh")
         raw = bytes.fromhex(result.tx_hex)
         stripped = strip_witness(raw)
         computed_txid = hash256(stripped)[::-1].hex()

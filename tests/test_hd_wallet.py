@@ -1,4 +1,5 @@
 """Tests for HdWallet — BIP44 gap scanning, persistence, and balance queries."""
+
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from pyrxd.hd.wallet import AddressRecord, HdWallet, _GAP_LIMIT
+from pyrxd.hd.wallet import _GAP_LIMIT, AddressRecord, HdWallet
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
 from pyrxd.security.errors import ValidationError
 
@@ -41,6 +42,7 @@ def _mock_client(
         # We can't match on script_hash directly — just return empty for unknown
         for addr, hist in history_map.items():
             from pyrxd.network.electrumx import script_hash_for_address
+
             if script_hash_for_address(addr) == script_hash:
                 return hist
         return []
@@ -48,6 +50,7 @@ def _mock_client(
     async def _get_utxos(script_hash):
         for addr, utxos in utxo_map.items():
             from pyrxd.network.electrumx import script_hash_for_address
+
             if script_hash_for_address(addr) == script_hash:
                 return utxos
         return []
@@ -55,6 +58,7 @@ def _mock_client(
     async def _get_balance(script_hash):
         for addr, bal in balance_map.items():
             from pyrxd.network.electrumx import script_hash_for_address
+
             if script_hash_for_address(addr) == script_hash:
                 return bal
         return (0, 0)
@@ -136,8 +140,7 @@ class TestRefreshWithUsedAddresses:
     def _wallet_with_used(self, used_indices: list[int]) -> tuple:
         w = HdWallet.from_mnemonic(MNEMONIC)
         # Pre-compute addresses at the indices that will be marked "used"
-        history_map = {w._derive_address(0, i): [{"tx_hash": "aa" * 32, "height": 100}]
-                       for i in used_indices}
+        history_map = {w._derive_address(0, i): [{"tx_hash": "aa" * 32, "height": 100}] for i in used_indices}
         client = _mock_client(history_map=history_map)
         count = asyncio.get_event_loop().run_until_complete(w.refresh(client))
         return w, count
@@ -247,9 +250,7 @@ class TestSaveLoad:
             p = Path(tmpdir) / "wallet.dat"
             w = HdWallet.from_mnemonic(MNEMONIC)
             addr = w._derive_address(0, 0)
-            w.addresses["0/0"] = AddressRecord(
-                address=addr, change=0, index=0, used=True
-            )
+            w.addresses["0/0"] = AddressRecord(address=addr, change=0, index=0, used=True)
             w.save(p)
 
             w2 = HdWallet.load(p, MNEMONIC)
@@ -305,9 +306,7 @@ class TestSaveLoad:
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "wallet.dat"
             w = HdWallet.from_mnemonic(MNEMONIC)
-            w.addresses["0/0"] = AddressRecord(
-                address="secret_address", change=0, index=0, used=True
-            )
+            w.addresses["0/0"] = AddressRecord(address="secret_address", change=0, index=0, used=True)
             w.save(p)
             raw = p.read_bytes()
             assert b"secret_address" not in raw
@@ -433,6 +432,7 @@ class TestSeedSecretBytesProtection:
 
     def test_seed_is_secret_bytes(self):
         from pyrxd.security.secrets import SecretBytes
+
         w = HdWallet.from_mnemonic(MNEMONIC)
         assert isinstance(w._seed, SecretBytes)
 
@@ -448,6 +448,7 @@ class TestSeedSecretBytesProtection:
 
     def test_seed_cannot_be_pickled(self):
         import pickle
+
         w = HdWallet.from_mnemonic(MNEMONIC)
         with pytest.raises(TypeError, match="cannot be pickled"):
             pickle.dumps(w._seed)
@@ -476,6 +477,7 @@ class TestAtomicSave:
 
     def test_fsync_is_called(self, monkeypatch):
         import os as os_mod
+
         fsync_calls = []
         real_fsync = os_mod.fsync
 

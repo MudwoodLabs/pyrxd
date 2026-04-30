@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from .satoshis_per_kilobyte import SatoshisPerKilobyte
 
 # Alias for the default fee model

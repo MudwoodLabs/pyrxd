@@ -12,6 +12,9 @@ source satoshis, which involves significant setup. These tests cover:
   3. ValidationError raised on script execution errors
   4. UnsupportedScriptError is importable and is a subclass of RxdSdkError
 """
+
+from __future__ import annotations
+
 import pytest
 
 from pyrxd.keys import PrivateKey
@@ -19,8 +22,8 @@ from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH, BareMultisig, RPuzzle
 from pyrxd.security.errors import RxdSdkError, UnsupportedScriptError, ValidationError
 
-
 # ── UnsupportedScriptError is properly defined ───────────────────────────────
+
 
 def test_unsupported_script_error_is_sdk_error():
     """UnsupportedScriptError must be a subclass of RxdSdkError."""
@@ -34,6 +37,7 @@ def test_unsupported_script_error_can_be_raised():
 
 
 # ── P2PKH locking script construction ────────────────────────────────────────
+
 
 def test_p2pkh_locking_script_from_address():
     """P2PKH.lock() from a known address must produce the canonical locking script."""
@@ -57,6 +61,7 @@ def test_p2pkh_locking_script_wrong_hash_length():
 
 # ── Script round-trip ─────────────────────────────────────────────────────────
 
+
 def test_script_hex_round_trip():
     """Script constructed from hex must serialize back to the same hex."""
     hex_str = "76a91420bb5c3bfaef0231dc05190e7f1c8e22e098991e88ac"
@@ -79,6 +84,7 @@ def test_empty_script_is_valid():
 
 # ── BareMultisig validation ───────────────────────────────────────────────────
 
+
 def test_bare_multisig_bad_threshold_raises():
     """BareMultisig.lock() must raise ValidationError for threshold > n-of-n."""
     priv = PrivateKey.from_hex("0101010101010101010101010101010101010101010101010101010101010101")
@@ -88,6 +94,7 @@ def test_bare_multisig_bad_threshold_raises():
 
 
 # ── RPuzzle validation ────────────────────────────────────────────────────────
+
 
 def test_rpuzzle_invalid_type_raises():
     """RPuzzle constructor must raise ValidationError for an unknown puzzle type."""
@@ -100,5 +107,3 @@ def test_rpuzzle_valid_types():
     for ptype in ["raw", "SHA1", "SHA256", "HASH256", "RIPEMD160", "HASH160"]:
         rp = RPuzzle(puzzle_type=ptype)
         assert rp.type == ptype
-
-

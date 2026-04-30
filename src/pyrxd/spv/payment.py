@@ -25,18 +25,18 @@ P2TR = "p2tr"
 
 # Expected script lengths by type (bytes of the scriptPubKey itself).
 _OUTPUT_SCRIPT_LENGTHS = {
-    P2PKH: 25,   # OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    P2PKH: 25,  # OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
     P2WPKH: 22,  # OP_0 <20>
-    P2SH: 23,    # OP_HASH160 <20> OP_EQUAL
-    P2TR: 34,    # OP_1 <32>
+    P2SH: 23,  # OP_HASH160 <20> OP_EQUAL
+    P2TR: 34,  # OP_1 <32>
 }
 
 # Script prefix/suffix patterns (everything except the hash bytes).
 _SCRIPT_PATTERNS = {
     P2PKH: (b"\x76\xa9\x14", b"\x88\xac"),  # 3 + 20 + 2
-    P2WPKH: (b"\x00\x14", b""),               # 2 + 20
-    P2SH: (b"\xa9\x14", b"\x87"),             # 2 + 20 + 1
-    P2TR: (b"\x51\x20", b""),                 # 2 + 32 (Taproot uses 32-byte x-only pubkey)
+    P2WPKH: (b"\x00\x14", b""),  # 2 + 20
+    P2SH: (b"\xa9\x14", b"\x87"),  # 2 + 20 + 1
+    P2TR: (b"\x51\x20", b""),  # 2 + 32 (Taproot uses 32-byte x-only pubkey)
 }
 
 
@@ -84,16 +84,13 @@ def verify_payment(
     if value == 0:
         raise SpvVerificationError("output value is 0")
     if value < min_satoshis:
-        raise SpvVerificationError(
-            f"output value {value} sats < required {min_satoshis} sats"
-        )
+        raise SpvVerificationError(f"output value {value} sats < required {min_satoshis} sats")
 
     # Parse script length (1-byte varint for standard outputs).
     script_len_byte = raw_tx[output_offset + 8]
     if script_len_byte != script_len:
         raise SpvVerificationError(
-            f"script length {script_len_byte} does not match "
-            f"expected {script_len} for {output_type}"
+            f"script length {script_len_byte} does not match expected {script_len} for {output_type}"
         )
 
     script_start = output_offset + 9

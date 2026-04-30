@@ -76,22 +76,16 @@ def build_payment_tx(
     if to_type not in (P2PKH, P2WPKH, P2SH, P2TR):
         raise ValidationError(f"unknown to_type: {to_type!r}")
     if input_type not in ("p2wpkh", "p2sh_p2wpkh"):
-        raise ValidationError(
-            f"input_type must be 'p2wpkh' or 'p2sh_p2wpkh', got {input_type!r}"
-        )
+        raise ValidationError(f"input_type must be 'p2wpkh' or 'p2sh_p2wpkh', got {input_type!r}")
 
     # Validate to_hash length
     expected_hash_len = 32 if to_type == P2TR else 20
     if len(to_hash) != expected_hash_len:
-        raise ValidationError(
-            f"{to_type} to_hash must be {expected_hash_len} bytes, got {len(to_hash)}"
-        )
+        raise ValidationError(f"{to_type} to_hash must be {expected_hash_len} bytes, got {len(to_hash)}")
 
     change_sats = utxo.value - amount_sats - fee_sats
     if change_sats < 0:
-        raise ValidationError(
-            f"insufficient funds: utxo={utxo.value}, amount={amount_sats}, fee={fee_sats}"
-        )
+        raise ValidationError(f"insufficient funds: utxo={utxo.value}, amount={amount_sats}, fee={fee_sats}")
 
     # Determine if change is above dust
     include_change = change_sats >= DUST_LIMIT
@@ -178,7 +172,7 @@ def build_payment_tx(
     # Sign
     # --------------------------------------------------------------------------
 
-    import coincurve  # noqa: PLC0415
+    import coincurve
 
     privkey_obj = coincurve.PrivateKey(keypair._privkey.unsafe_raw_bytes())
     # sign() with hasher=None takes raw 32-byte hash; returns DER-encoded sig
@@ -200,25 +194,13 @@ def build_payment_tx(
     for item in witness_items:
         witness_section += _encode_varint(len(item)) + item
 
-    segwit_tx = (
-        version
-        + segwit_marker_flag
-        + inputs_section
-        + outputs_bytes
-        + witness_section
-        + locktime
-    )
+    segwit_tx = version + segwit_marker_flag + inputs_section + outputs_bytes + witness_section + locktime
 
     # --------------------------------------------------------------------------
     # Compute txid from non-witness serialization
     # --------------------------------------------------------------------------
 
-    non_witness_tx = (
-        version
-        + inputs_section
-        + outputs_bytes
-        + locktime
-    )
+    non_witness_tx = version + inputs_section + outputs_bytes + locktime
     txid = _hash256(non_witness_tx)[::-1].hex()
 
     return BtcPaymentTx(

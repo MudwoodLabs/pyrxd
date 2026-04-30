@@ -1,19 +1,19 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Optional, TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 if TYPE_CHECKING:
     from .network.chaintracker import ChainTracker
 
 from .hash import hash256
-from .utils import Reader, Writer, to_hex, to_bytes
+from .utils import Reader, Writer, to_bytes, to_hex
 
 
 class MerkleLeaf(TypedDict, total=False):
     offset: int
-    hash_str: Optional[str]
-    txid: Optional[bool]
-    duplicate: Optional[bool]
+    hash_str: str | None
+    txid: bool | None
+    duplicate: bool | None
 
 
 class MerklePath:
@@ -38,7 +38,7 @@ class MerklePath:
         and verifying these proofs.
     """
 
-    def __init__(self, block_height: int, path: List[List[MerkleLeaf]]):
+    def __init__(self, block_height: int, path: list[list[MerkleLeaf]]):
         self.block_height = block_height
         self.path = path
 
@@ -74,7 +74,7 @@ class MerklePath:
                 raise ValueError("Mismatched roots")
 
     @staticmethod
-    def from_hex(hex_str: str) -> "MerklePath":
+    def from_hex(hex_str: str) -> MerklePath:
         """
         Creates a MerklePath instance from a hexadecimal string.
 
@@ -87,7 +87,7 @@ class MerklePath:
         return MerklePath.from_binary(to_bytes(hex_str, "hex"))
 
     @staticmethod
-    def from_reader(reader: Reader) -> "MerklePath":
+    def from_reader(reader: Reader) -> MerklePath:
         """
         Creates a MerklePath instance from a Reader object.
 
@@ -123,7 +123,7 @@ class MerklePath:
         return MerklePath(block_height, path)
 
     @staticmethod
-    def from_binary(bump: bytes) -> "MerklePath":
+    def from_binary(bump: bytes) -> MerklePath:
         """
         Creates a MerklePath instance from a bytes object.
 
@@ -175,7 +175,7 @@ class MerklePath:
         """
         return to_hex(self.to_binary())
 
-    def compute_root(self, txid: Optional[str] = None) -> str:
+    def compute_root(self, txid: str | None = None) -> str:
         """
         Computes the Merkle root from the provided transaction ID.
 
@@ -209,7 +209,7 @@ class MerklePath:
             if not isinstance(leaf, dict):
                 raise ValueError(f"Missing hash for index {index} at height {height}")
 
-            if "duplicate" in leaf and leaf["duplicate"]:
+            if leaf.get("duplicate"):
                 working_hash = hash_fn(working_hash + working_hash)
             elif offset % 2 != 0:
                 working_hash = hash_fn(leaf["hash_str"] + working_hash)
@@ -218,7 +218,7 @@ class MerklePath:
 
         return working_hash
 
-    def find_or_compute_leaf(self, height: int, offset: int) -> Optional[MerkleLeaf]:
+    def find_or_compute_leaf(self, height: int, offset: int) -> MerkleLeaf | None:
         def hash_fn(m: str) -> str:
             return to_hex(hash256(to_bytes(m, "hex")[::-1])[::-1])
 
@@ -247,7 +247,7 @@ class MerklePath:
 
         return {"offset": offset, "hash_str": working_hash}
 
-    async def verify(self, txid: str, chain_tracker: "ChainTracker") -> bool:
+    async def verify(self, txid: str, chain_tracker: ChainTracker) -> bool:
         """Verify that *txid* is included in the block at ``self.block_height``.
 
         Computes the Merkle root from *txid* and the stored proof branches, then
@@ -264,7 +264,7 @@ class MerklePath:
         root = self.compute_root(txid)
         return await chain_tracker.is_valid_root_for_height(root, self.block_height)
 
-    def combine(self, other: "MerklePath") -> None:
+    def combine(self, other: MerklePath) -> None:
         """
         Combines this MerklePath with another to create a compound proof.
 
@@ -303,17 +303,17 @@ class MerklePath:
         Leaves all levels sorted by increasing offset.
         """
 
-        def push_if_new(v: int, a: List[int]) -> None:
+        def push_if_new(v: int, a: list[int]) -> None:
             if not a or a[-1] != v:
                 a.append(v)
 
-        def drop_offsets_from_level(drop_offsets: List[int], level: int) -> None:
+        def drop_offsets_from_level(drop_offsets: list[int], level: int) -> None:
             for i in reversed(drop_offsets):
                 idx = next((j for j, n in enumerate(self.path[level]) if n["offset"] == i), None)
                 if idx is not None:
                     self.path[level].pop(idx)
 
-        def next_computed_offsets(cos: List[int]) -> List[int]:
+        def next_computed_offsets(cos: list[int]) -> list[int]:
             ncos = []
             for o in cos:
                 push_if_new(o >> 1, ncos)

@@ -8,12 +8,15 @@ merkle_path.py and will be wired in Phase 1b. These tests cover:
   - Offset validation (illegal sibling offset raises ValueError)
   - compute_root() produces the correct Merkle root for known leaf+branch
 """
+
+from __future__ import annotations
+
 import pytest
 
 from pyrxd.merkle_path import MerklePath
 
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
+
 
 def _build_simple_path(block_height: int = 1) -> MerklePath:
     """Return a minimal 2-leaf MerklePath with known hashes.
@@ -23,7 +26,7 @@ def _build_simple_path(block_height: int = 1) -> MerklePath:
       level 0: offset 0 (txid=True), offset 1 (sibling)
       level 1: root offset 0
     """
-    txid_hash = "a" * 64   # 32 hex-encoded bytes
+    txid_hash = "a" * 64  # 32 hex-encoded bytes
     sibling_hash = "b" * 64
 
     path = [
@@ -38,6 +41,7 @@ def _build_simple_path(block_height: int = 1) -> MerklePath:
 
 
 # ── Round-trip tests ─────────────────────────────────────────────────────────
+
 
 def test_merkle_path_round_trip_binary():
     """serialize → deserialize must produce an equal MerklePath."""
@@ -68,6 +72,7 @@ def test_merkle_path_round_trip_hex():
 
 
 # ── Rejection tests ──────────────────────────────────────────────────────────
+
 
 def test_from_hex_rejects_malformed():
     """from_hex must raise on input that is not valid BEEF encoding."""
@@ -107,6 +112,7 @@ def test_empty_level_zero_raises():
 
 
 # ── compute_root tests ───────────────────────────────────────────────────────
+
 
 def test_compute_root_consistency():
     """compute_root() called on different txids in the same path must agree."""

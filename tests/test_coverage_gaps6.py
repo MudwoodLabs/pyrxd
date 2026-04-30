@@ -7,6 +7,7 @@ Targets:
   - transaction_preimage.py: _get_push_refs OP_PUSHDATA variants (lines 36, 38, 40)
   - spv/witness.py: truncation error paths inside strip_witness body
 """
+
 from __future__ import annotations
 
 import json
@@ -24,10 +25,10 @@ from pyrxd.network.bitcoin import (
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Hex32, RawTx, Txid
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers (mirrors test_network_bitcoin.py helpers)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 def _fake_resp(status: int, body: bytes, content_type: str = "application/json") -> MagicMock:
     resp = MagicMock()
@@ -70,8 +71,8 @@ def _make_session(*responses) -> MagicMock:
 # BitcoinCoreRpcSource
 # ──────────────────────────────────────────────────────────────────────────────
 
-class TestBitcoinCoreRpcSource:
 
+class TestBitcoinCoreRpcSource:
     def _src(self):
         return BitcoinCoreRpcSource("http://localhost:8332/", "user", "pass")
 
@@ -87,9 +88,8 @@ class TestBitcoinCoreRpcSource:
     async def test_get_tip_height_invalid_result_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp("not-a-number"))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_tip_height()
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_tip_height()
 
     @pytest.mark.asyncio
     async def test_get_block_hash_happy(self):
@@ -104,17 +104,15 @@ class TestBitcoinCoreRpcSource:
     async def test_get_block_hash_non_dict_result_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp(12345))  # not a string
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_hash(BlockHeight(100))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_hash(BlockHeight(100))
 
     @pytest.mark.asyncio
     async def test_get_block_hash_invalid_hex_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp("not-hex!!"))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_hash(BlockHeight(100))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_hash(BlockHeight(100))
 
     @pytest.mark.asyncio
     async def test_get_block_hash_accepts_plain_height(self):
@@ -142,25 +140,22 @@ class TestBitcoinCoreRpcSource:
     async def test_get_block_header_hex_non_str_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp("cc" * 32), _rpc_resp(42))  # header not a string
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_header_hex(BlockHeight(200))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_header_hex(BlockHeight(200))
 
     @pytest.mark.asyncio
     async def test_get_block_header_hex_invalid_hex_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp("cc" * 32), _rpc_resp("not-hex!"))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_header_hex(BlockHeight(200))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_header_hex(BlockHeight(200))
 
     @pytest.mark.asyncio
     async def test_get_block_header_hex_wrong_length_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp("cc" * 32), _rpc_resp("ee" * 40))  # 40 bytes, not 80
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_header_hex(BlockHeight(200))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_header_hex(BlockHeight(200))
 
     @pytest.mark.asyncio
     async def test_get_header_chain_happy(self):
@@ -169,8 +164,10 @@ class TestBitcoinCoreRpcSource:
         header_hex = "dd" * 80
         # For count=2: 2 calls each need a hash + header = 4 total posts
         responses = [
-            _rpc_resp(block_hash), _rpc_resp(header_hex),
-            _rpc_resp(block_hash), _rpc_resp(header_hex),
+            _rpc_resp(block_hash),
+            _rpc_resp(header_hex),
+            _rpc_resp(block_hash),
+            _rpc_resp(header_hex),
         ]
         session = _make_session(*responses)
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
@@ -188,9 +185,8 @@ class TestBitcoinCoreRpcSource:
     async def test_get_header_chain_fetch_failure_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp("cc" * 32), _rpc_resp("invalid-hex"))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_header_chain(BlockHeight(100), 1)
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_header_chain(BlockHeight(100), 1)
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_happy(self):
@@ -216,27 +212,24 @@ class TestBitcoinCoreRpcSource:
     async def test_get_raw_tx_non_dict_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp("not-a-dict"))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_raw_tx(Txid("ab" * 32))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_raw_tx(Txid("ab" * 32))
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_missing_hex_field_raises(self):
         src = self._src()
         data = {"confirmations": 10, "hex": 12345}  # hex not a string
         session = _make_session(_rpc_resp(data))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_raw_tx(Txid("ab" * 32))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_raw_tx(Txid("ab" * 32))
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_invalid_hex_raises(self):
         src = self._src()
         data = {"confirmations": 10, "hex": "not-valid-hex!!!"}
         session = _make_session(_rpc_resp(data))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_raw_tx(Txid("ab" * 32))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_raw_tx(Txid("ab" * 32))
 
     @pytest.mark.asyncio
     async def test_get_tx_block_height_happy(self):
@@ -260,9 +253,8 @@ class TestBitcoinCoreRpcSource:
     async def test_get_tx_block_height_non_dict_raises(self):
         src = self._src()
         session = _make_session(_rpc_resp("oops"))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_tx_block_height(Txid("ab" * 32))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_tx_block_height(Txid("ab" * 32))
 
     @pytest.mark.asyncio
     async def test_get_tx_block_height_coerces_str_txid(self):
@@ -296,9 +288,8 @@ class TestBitcoinCoreRpcSource:
         src = self._src()
         data = {"vout": []}  # empty vout
         session = _make_session(_rpc_resp(data))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_tx_output_script_type(Txid("ab" * 32), 5)
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_tx_output_script_type(Txid("ab" * 32), 5)
 
     @pytest.mark.asyncio
     async def test_get_merkle_proof_raises(self):
@@ -361,8 +352,8 @@ class TestBitcoinCoreRpcSource:
 # BlockstreamSource — additional error branches
 # ──────────────────────────────────────────────────────────────────────────────
 
-class TestBlockstreamSourceAdditional:
 
+class TestBlockstreamSourceAdditional:
     def _src(self):
         return BlockstreamSource()
 
@@ -381,18 +372,16 @@ class TestBlockstreamSourceAdditional:
         src = self._src()
         session = MagicMock()
         session.get = MagicMock(return_value=_text_resp("not found", status=404))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_hash(BlockHeight(500))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_hash(BlockHeight(500))
 
     @pytest.mark.asyncio
     async def test_get_block_hash_bad_hex_raises(self):
         src = self._src()
         session = MagicMock()
         session.get = MagicMock(return_value=_text_resp("not-hex!!"))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_hash(BlockHeight(500))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_hash(BlockHeight(500))
 
     @pytest.mark.asyncio
     async def test_get_tx_output_script_type_unknown(self):
@@ -410,9 +399,8 @@ class TestBlockstreamSourceAdditional:
         data = {"vout": []}
         session = MagicMock()
         session.get = MagicMock(return_value=_json_resp(data))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_tx_output_script_type(Txid("ab" * 32), 99)
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_tx_output_script_type(Txid("ab" * 32), 99)
 
     @pytest.mark.asyncio
     async def test_get_merkle_proof_bad_response_raises(self):
@@ -420,9 +408,8 @@ class TestBlockstreamSourceAdditional:
         data = {"no_merkle_key": True}
         session = MagicMock()
         session.get = MagicMock(return_value=_json_resp(data))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_merkle_proof(Txid("ab" * 32), BlockHeight(100))
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_merkle_proof(Txid("ab" * 32), BlockHeight(100))
 
     @pytest.mark.asyncio
     async def test_get_header_chain_happy(self):
@@ -462,8 +449,8 @@ class TestBlockstreamSourceAdditional:
 # MempoolSpaceSource — additional error branches
 # ──────────────────────────────────────────────────────────────────────────────
 
-class TestMempoolSpaceSourceAdditional:
 
+class TestMempoolSpaceSourceAdditional:
     def _src(self):
         return MempoolSpaceSource()
 
@@ -485,30 +472,32 @@ class TestMempoolSpaceSourceAdditional:
         src = self._src()
         status_data = {"confirmed": True, "block_height": 800000}
         session = MagicMock()
-        resps = iter([
-            _json_resp(status_data),
-            _json_resp(840000),  # tip height
-            _text_resp("not valid hex!!"),
-        ])
+        resps = iter(
+            [
+                _json_resp(status_data),
+                _json_resp(840000),  # tip height
+                _text_resp("not valid hex!!"),
+            ]
+        )
         session.get = MagicMock(side_effect=lambda *a, **kw: next(resps))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_raw_tx(Txid("ab" * 32), min_confirmations=1)
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_raw_tx(Txid("ab" * 32), min_confirmations=1)
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_non200_raises(self):
         src = self._src()
         status_data = {"confirmed": True, "block_height": 800000}
         session = MagicMock()
-        resps = iter([
-            _json_resp(status_data),
-            _json_resp(840000),  # tip height
-            _text_resp("not found", status=404),
-        ])
+        resps = iter(
+            [
+                _json_resp(status_data),
+                _json_resp(840000),  # tip height
+                _text_resp("not found", status=404),
+            ]
+        )
         session.get = MagicMock(side_effect=lambda *a, **kw: next(resps))
-        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_raw_tx(Txid("ab" * 32), min_confirmations=1)
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_raw_tx(Txid("ab" * 32), min_confirmations=1)
 
     @pytest.mark.asyncio
     async def test_close_already_none(self):
@@ -521,11 +510,13 @@ class TestMempoolSpaceSourceAdditional:
 # MultiSourceBtcDataSource — remaining branches
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestMultiSourceAdditional:
     """Cover branches in MultiSourceBtcDataSource not hit by existing tests."""
 
-    def _make_mock_source(self, height=840000, block_hash="aa" * 32, raw_hex="bb" * 65,
-                          script_type="p2pkh", tx_block_height=800000):
+    def _make_mock_source(
+        self, height=840000, block_hash="aa" * 32, raw_hex="bb" * 65, script_type="p2pkh", tx_block_height=800000
+    ):
         s = MagicMock()
         s.get_tip_height = AsyncMock(return_value=BlockHeight(height))
         s.get_block_hash = AsyncMock(return_value=Hex32(bytes.fromhex(block_hash)))
@@ -619,60 +610,66 @@ class TestMultiSourceAdditional:
 # transaction_preimage.py — _get_push_refs OP_PUSHDATA variants
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestGetPushRefs:
     """Test _get_push_refs for OP_PUSHDATA1/2/4 variants (lines 36, 38, 40)."""
 
     def _make_ref(self, n=1) -> bytes:
         """36-byte push ref: OP_PUSH_REF(0xd0) + 36 bytes."""
-        return bytes([0xd0]) + bytes(range(n, n + 36))
+        return bytes([0xD0]) + bytes(range(n, n + 36))
 
     def _build_script_with_pushdata(self, opcode: int, data: bytes) -> bytes:
         """Build a script byte string with a given PUSHDATA opcode."""
         length = len(data)
-        if opcode == 0x4c:  # OP_PUSHDATA1
+        if opcode == 0x4C:  # OP_PUSHDATA1
             return bytes([opcode, length]) + data
-        elif opcode == 0x4d:  # OP_PUSHDATA2
+        elif opcode == 0x4D:  # OP_PUSHDATA2
             return bytes([opcode]) + length.to_bytes(2, "little") + data
-        elif opcode == 0x4e:  # OP_PUSHDATA4
+        elif opcode == 0x4E:  # OP_PUSHDATA4
             return bytes([opcode]) + length.to_bytes(4, "little") + data
         raise ValueError(f"Unknown opcode {opcode}")
 
     def test_pushdata1_skipped(self):
         """OP_PUSHDATA1 with non-ref data should be skipped (no refs returned)."""
         from pyrxd.transaction.transaction_preimage import _get_push_refs
+
         data = b"\xff" * 16
-        script = self._build_script_with_pushdata(0x4c, data)
+        script = self._build_script_with_pushdata(0x4C, data)
         refs = _get_push_refs(script)
         assert refs == []
 
     def test_pushdata2_skipped(self):
         from pyrxd.transaction.transaction_preimage import _get_push_refs
+
         data = b"\xff" * 100
-        script = self._build_script_with_pushdata(0x4d, data)
+        script = self._build_script_with_pushdata(0x4D, data)
         refs = _get_push_refs(script)
         assert refs == []
 
     def test_pushdata4_skipped(self):
         from pyrxd.transaction.transaction_preimage import _get_push_refs
+
         data = b"\xff" * 200
-        script = self._build_script_with_pushdata(0x4e, data)
+        script = self._build_script_with_pushdata(0x4E, data)
         refs = _get_push_refs(script)
         assert refs == []
 
     def test_push_ref_opcode_extracted(self):
         """OP_PUSH_REF (0xd0) followed by 36 bytes should be extracted."""
         from pyrxd.transaction.transaction_preimage import _get_push_refs
+
         ref_data = bytes(range(36))
-        script = bytes([0xd0]) + ref_data
+        script = bytes([0xD0]) + ref_data
         refs = _get_push_refs(script)
         assert len(refs) == 1
         assert refs[0] == ref_data  # ref is the 36 bytes after the opcode
 
     def test_mixed_script_only_refs_extracted(self):
         from pyrxd.transaction.transaction_preimage import _get_push_refs
+
         ref_data = bytes(range(36))
         # OP_PUSHDATA1 (skip) + OP_PUSH_REF (extract)
-        script = self._build_script_with_pushdata(0x4c, b"\xab" * 10) + bytes([0xd0]) + ref_data
+        script = self._build_script_with_pushdata(0x4C, b"\xab" * 10) + bytes([0xD0]) + ref_data
         refs = _get_push_refs(script)
         # The ref extracted starts from opcode + data
         assert len(refs) == 1

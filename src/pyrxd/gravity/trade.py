@@ -31,7 +31,6 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import List, Optional
 
 from pyrxd.network.bitcoin import BtcDataSource
 from pyrxd.network.electrumx import ElectrumXClient
@@ -45,9 +44,9 @@ from .transactions import build_claim_tx, build_finalize_tx
 from .types import ClaimResult, FinalizeResult, GravityOffer
 
 __all__ = [
+    "ConfirmationStatus",
     "GravityTrade",
     "TradeConfig",
-    "ConfirmationStatus",
 ]
 
 logger = logging.getLogger(__name__)
@@ -105,7 +104,7 @@ class ConfirmationStatus:
     txid: str
     confirmations: int
     confirmed: bool
-    block_height: Optional[int]
+    block_height: int | None
 
 
 class GravityTrade:
@@ -154,7 +153,7 @@ class GravityTrade:
         *,
         radiant_network: ElectrumXClient,
         bitcoin_source: BtcDataSource,
-        config: Optional[TradeConfig] = None,
+        config: TradeConfig | None = None,
     ) -> None:
         self._rxd = radiant_network
         self._btc = bitcoin_source
@@ -217,7 +216,7 @@ class GravityTrade:
     async def wait_confirmations(
         self,
         btc_txid: str,
-        min_confirmations: Optional[int] = None,
+        min_confirmations: int | None = None,
     ) -> ConfirmationStatus:
         """Poll Bitcoin until *btc_txid* reaches the required confirmations.
 
@@ -252,10 +251,7 @@ class GravityTrade:
                 if attempt + 1 < self._cfg.max_poll_attempts:
                     await asyncio.sleep(self._cfg.poll_interval_seconds)
                     continue
-                raise NetworkError(
-                    f"BTC tx {btc_txid[:16]}… not found after "
-                    f"{self._cfg.max_poll_attempts} polls"
-                )
+                raise NetworkError(f"BTC tx {btc_txid[:16]}… not found after {self._cfg.max_poll_attempts} polls")
 
             # Estimate confirmations from tip height minus tx block height.
             # BtcDataSource.get_raw_tx with min_confirmations=0 returns mempool
@@ -303,7 +299,7 @@ class GravityTrade:
         claimed_photons: int,
         taker_address: str,
         fee_sats: int,
-        btc_tx_height: Optional[int] = None,
+        btc_tx_height: int | None = None,
     ) -> FinalizeResult:
         """Fetch the BTC SPV proof, verify it, and broadcast the finalize tx.
 
@@ -369,12 +365,8 @@ class GravityTrade:
                 )
 
         # Fetch raw BTC tx and Merkle proof from the Bitcoin data source.
-        raw_tx = await self._btc.get_raw_tx(
-            validated_btc_txid, min_confirmations=self._cfg.min_btc_confirmations
-        )
-        merkle_hashes, pos = await self._btc.get_merkle_proof(
-            validated_btc_txid, height
-        )
+        raw_tx = await self._btc.get_raw_tx(validated_btc_txid, min_confirmations=self._cfg.min_btc_confirmations)
+        merkle_hashes, pos = await self._btc.get_merkle_proof(validated_btc_txid, height)
 
         # Fetch the chain of BTC block headers from anchor to tx block.
         # The anchor_height in the offer is the block *before* h1; we need
@@ -382,16 +374,12 @@ class GravityTrade:
         start_height = BlockHeight(offer.anchor_height + 1)
         count = int(height) - offer.anchor_height
         if count < 1:
-            raise ValidationError(
-                f"btc_tx_height {int(height)} must be > anchor_height {offer.anchor_height}"
-            )
+            raise ValidationError(f"btc_tx_height {int(height)} must be > anchor_height {offer.anchor_height}")
         if count > offer.merkle_depth + 100:
             # Sanity check: don't fetch an absurd number of headers.
-            raise ValidationError(
-                f"header chain too long ({count}); check anchor_height and btc_tx_height"
-            )
+            raise ValidationError(f"header chain too long ({count}); check anchor_height and btc_tx_height")
 
-        headers_raw: List[bytes] = await self._btc.get_header_chain(start_height, count)
+        headers_raw: list[bytes] = await self._btc.get_header_chain(start_height, count)
         if not headers_raw:
             raise NetworkError("BTC source returned empty header chain")
         headers_hex = [h.hex() for h in headers_raw]
@@ -451,9 +439,7 @@ class GravityTrade:
         txid = await self._rxd.broadcast(raw)
         return str(txid)
 
-    async def _resolve_btc_tx_height(
-        self, txid: Txid, provided_height: Optional[int]
-    ) -> BlockHeight:
+    async def _resolve_btc_tx_height(self, txid: Txid, provided_height: int | None) -> BlockHeight:
         """Return *provided_height* as ``BlockHeight``, or fetch it from the source."""
         if provided_height is not None:
             return BlockHeight(provided_height)
@@ -483,9 +469,7 @@ def _find_output_zero_offset(stripped_raw_tx: bytes) -> int:
     pos += 1
 
     if input_count != 1:
-        raise ValidationError(
-            f"Gravity covenant requires exactly 1 input; got {input_count}"
-        )
+        raise ValidationError(f"Gravity covenant requires exactly 1 input; got {input_count}")
 
     # outpoint (36 bytes)
     pos += 36
@@ -502,8 +486,7 @@ def _find_output_zero_offset(stripped_raw_tx: bytes) -> int:
         pos += 23
     else:
         raise ValidationError(
-            f"Unsupported scriptSig length {scriptsig_len_byte}; "
-            f"expected 0 (native segwit) or 23 (P2SH-P2WPKH)"
+            f"Unsupported scriptSig length {scriptsig_len_byte}; expected 0 (native segwit) or 23 (P2SH-P2WPKH)"
         )
 
     # sequence (4 bytes)

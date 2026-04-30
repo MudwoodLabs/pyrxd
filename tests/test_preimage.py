@@ -6,6 +6,8 @@ verified against the confirmed mainnet reveal tx
 dac1e2dfed64fbfd0f0fe6b925e144cfc32ef76803abc7a6a4058406d707b407.
 """
 
+from __future__ import annotations
+
 from pyrxd.script.script import Script
 from pyrxd.transaction.transaction_output import TransactionOutput
 from pyrxd.transaction.transaction_preimage import (
@@ -17,7 +19,7 @@ from pyrxd.transaction.transaction_preimage import (
 # Fixtures: script hex strings used across vectors
 # ---------------------------------------------------------------------------
 
-P2PKH_AA = "76a914" + "aa" * 20 + "88ac"   # standard P2PKH, no refs
+P2PKH_AA = "76a914" + "aa" * 20 + "88ac"  # standard P2PKH, no refs
 P2PKH_BB = "76a914" + "bb" * 20 + "88ac"
 # NFT singleton: OP_PUSHINPUTREFSINGLETON (0xd8) + 36-byte ref + P2PKH tail
 _REF = "b73ea8b33a8d8f15b25d25b9e6892926f893a7fdb6a97695d029732aa4ae01cd00000000"
@@ -32,6 +34,7 @@ def _out(script_hex: str, satoshis: int) -> TransactionOutput:
 # _get_push_refs
 # ---------------------------------------------------------------------------
 
+
 class TestGetPushRefs:
     def test_p2pkh_has_no_refs(self):
         assert _get_push_refs(bytes.fromhex(P2PKH_AA)) == []
@@ -44,30 +47,30 @@ class TestGetPushRefs:
     def test_pushinputref_opcode(self):
         # OP_PUSHINPUTREF (0xd0) followed by 36-byte ref
         ref = bytes(range(36))
-        script = bytes([0xd0]) + ref
+        script = bytes([0xD0]) + ref
         refs = _get_push_refs(script)
         assert len(refs) == 1
         assert refs[0] == ref
 
     def test_duplicate_refs_deduplicated(self):
         ref = bytes(range(36))
-        script = bytes([0xd8]) + ref + bytes([0xd8]) + ref
+        script = bytes([0xD8]) + ref + bytes([0xD8]) + ref
         refs = _get_push_refs(script)
         assert len(refs) == 1
 
     def test_multiple_refs_sorted(self):
         ref_a = b"\xff" + bytes(35)
         ref_b = b"\x00" + bytes(35)
-        script = bytes([0xd8]) + ref_a + bytes([0xd8]) + ref_b
+        script = bytes([0xD8]) + ref_a + bytes([0xD8]) + ref_b
         refs = _get_push_refs(script)
         assert len(refs) == 2
-        assert refs[0] == ref_b   # 00... sorts before ff...
+        assert refs[0] == ref_b  # 00... sorts before ff...
         assert refs[1] == ref_a
 
     def test_skips_data_pushes_correctly(self):
         # OP_PUSH3 'gly' then OP_PUSHINPUTREFSINGLETON + ref
         ref = bytes(range(36))
-        script = bytes([0x03, 0x67, 0x6c, 0x79]) + bytes([0xd8]) + ref
+        script = bytes([0x03, 0x67, 0x6C, 0x79]) + bytes([0xD8]) + ref
         refs = _get_push_refs(script)
         assert len(refs) == 1
         assert refs[0] == ref
@@ -79,6 +82,7 @@ class TestGetPushRefs:
 # ---------------------------------------------------------------------------
 # _compute_hash_output_hashes — known-good vectors from radiantjs
 # ---------------------------------------------------------------------------
+
 
 class TestComputeHashOutputHashes:
     def test_two_p2pkh_outputs(self):
@@ -125,6 +129,7 @@ class TestComputeHashOutputHashes:
 # ---------------------------------------------------------------------------
 # Two-pass signing: stale unlocking_script must be cleared between txs
 # ---------------------------------------------------------------------------
+
 
 class TestTwoPassSigning:
     def test_stale_signature_without_reset(self):

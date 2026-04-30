@@ -57,9 +57,7 @@ class TestRedact:
         assert redact(wif) == "<redacted>"
 
     def test_mnemonic_string_is_redacted(self) -> None:
-        mnemonic = (
-            "abandon ability able about above absent absorb abstract"
-        )
+        mnemonic = "abandon ability able about above absent absorb abstract"
         assert redact(mnemonic) == "<redacted>"
 
     def test_short_hex_not_redacted(self) -> None:
@@ -106,9 +104,7 @@ class TestRxdSdkErrorRedaction:
         assert "bad input" in str(err)
 
     def test_mnemonic_redacted_in_exception(self) -> None:
-        mnemonic = (
-            "abandon ability able about above absent absorb abstract absurd"
-        )
+        mnemonic = "abandon ability able about above absent absorb abstract absurd"
         err = KeyMaterialError(mnemonic)
         assert mnemonic not in err.args
 

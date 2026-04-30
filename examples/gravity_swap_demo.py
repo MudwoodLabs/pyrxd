@@ -44,7 +44,6 @@ import hashlib
 import os
 import sys
 import time
-from typing import Optional
 
 # ─────────────────────────────────────────────────────────────
 # Configuration (from environment variables)
@@ -53,24 +52,20 @@ from typing import Optional
 DRY_RUN: bool = os.environ.get("DRY_RUN", "1") != "0"
 
 # Radiant testnet ElectrumX — replace with a real server URL for live runs
-RXD_ELECTRUMX_URL: str = os.environ.get(
-    "RXD_ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50012"
-)
+RXD_ELECTRUMX_URL: str = os.environ.get("RXD_ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50012")
 
 # Bitcoin data source — mempool.space testnet by default
-BTC_MEMPOOL_URL: str = os.environ.get(
-    "BTC_MEMPOOL_URL", "https://mempool.space/testnet/api"
-)
+BTC_MEMPOOL_URL: str = os.environ.get("BTC_MEMPOOL_URL", "https://mempool.space/testnet/api")
 
 # Optional WIF private keys — generated fresh each dry-run if not set
-MAKER_RXD_WIF: Optional[str] = os.environ.get("MAKER_RXD_WIF")
-TAKER_RXD_WIF: Optional[str] = os.environ.get("TAKER_RXD_WIF")
-TAKER_BTC_WIF: Optional[str] = os.environ.get("TAKER_BTC_WIF")
+MAKER_RXD_WIF: str | None = os.environ.get("MAKER_RXD_WIF")
+TAKER_RXD_WIF: str | None = os.environ.get("TAKER_RXD_WIF")
+TAKER_BTC_WIF: str | None = os.environ.get("TAKER_BTC_WIF")
 
 # Trade amounts
-PHOTONS_OFFERED: int = int(os.environ.get("PHOTONS_OFFERED", "100000"))   # 0.001 RXD
-BTC_SATOSHIS: int = int(os.environ.get("BTC_SATOSHIS", "10000"))          # 0.0001 BTC
-FEE_SATS: int = int(os.environ.get("FEE_SATS", "1000"))                   # photons/sats
+PHOTONS_OFFERED: int = int(os.environ.get("PHOTONS_OFFERED", "100000"))  # 0.001 RXD
+BTC_SATOSHIS: int = int(os.environ.get("BTC_SATOSHIS", "10000"))  # 0.0001 BTC
+FEE_SATS: int = int(os.environ.get("FEE_SATS", "1000"))  # photons/sats
 
 # Deadline: 25 hours from now (audit 04-S1 requires >= 24h)
 CLAIM_DEADLINE: int = int(time.time()) + 25 * 3600
@@ -82,6 +77,7 @@ MIN_BTC_CONFIRMATIONS: int = int(os.environ.get("MIN_BTC_CONFIRMATIONS", "1"))
 # ─────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────
+
 
 def _hr(label: str) -> None:
     width = 70
@@ -113,15 +109,16 @@ def _hash256(data: bytes) -> bytes:
 # Main demo
 # ─────────────────────────────────────────────────────────────
 
+
 async def run_demo() -> None:
     # Late imports so the module is importable even without the SDK installed
-    from pyrxd.security.secrets import PrivateKeyMaterial
     from pyrxd.btc_wallet.keys import generate_keypair, keypair_from_wif
     from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
-    from pyrxd.network.electrumx import ElectrumXClient
-    from pyrxd.network.bitcoin import MempoolSpaceSource
-    from pyrxd.gravity.types import GravityOffer
     from pyrxd.gravity.transactions import build_claim_tx, build_finalize_tx
+    from pyrxd.gravity.types import GravityOffer
+    from pyrxd.network.bitcoin import MempoolSpaceSource
+    from pyrxd.network.electrumx import ElectrumXClient
+    from pyrxd.security.secrets import PrivateKeyMaterial
     from pyrxd.spv.proof import CovenantParams, SpvProofBuilder
     from pyrxd.spv.witness import strip_witness
 
@@ -157,6 +154,7 @@ async def run_demo() -> None:
 
     # Derive public key hashes
     import coincurve
+
     maker_raw = maker_privkey.unsafe_raw_bytes()
     maker_pub = coincurve.PrivateKey(maker_raw).public_key.format(compressed=True)
     maker_pkh = hashlib.new("ripemd160", hashlib.sha256(maker_pub).digest()).digest()
@@ -182,7 +180,7 @@ async def run_demo() -> None:
         btc_tip = await btc_source.get_tip_height()
         _ok(f"Bitcoin tip height: {int(btc_tip)}")
     else:
-        _info(f"DRY RUN: skipping live network checks")
+        _info("DRY RUN: skipping live network checks")
         _info(f"  Radiant ElectrumX: {RXD_ELECTRUMX_URL}")
 
     # ── Step 3: Build synthetic covenant scripts ───────────────────────────
@@ -248,10 +246,12 @@ async def run_demo() -> None:
         claimed_redeem_hex=claimed_redeem_hex,
     )
 
-    _ok(f"GravityOffer created")
+    _ok("GravityOffer created")
     _ok(f"  btc_satoshis:    {offer.btc_satoshis}")
     _ok(f"  photons_offered: {offer.photons_offered}")
-    _ok(f"  claim_deadline:  {offer.claim_deadline}  ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(offer.claim_deadline))})")
+    _ok(
+        f"  claim_deadline:  {offer.claim_deadline}  ({time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(offer.claim_deadline))})"
+    )
 
     # ── Step 6: Claim tx ──────────────────────────────────────────────────
     _hr("Step 6: Claim Tx (MakerOffer → MakerClaimed)")
@@ -289,7 +289,6 @@ async def run_demo() -> None:
     _hr("Step 7: BTC Payment Tx")
 
     # Synthetic BTC UTXO (in live mode, Taker uses a real funded P2WPKH UTXO)
-    from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
 
     btc_utxo = BtcUtxo(
         txid="bb" * 32,
@@ -330,7 +329,7 @@ async def run_demo() -> None:
         _info(f"      btc_receive_hash={offer.btc_receive_hash.hex()},")
         _info(f"      btc_receive_type={offer.btc_receive_type!r},")
         _info(f"      btc_satoshis={offer.btc_satoshis},")
-        _info(f"      chain_anchor=<32 bytes>,")
+        _info("      chain_anchor=<32 bytes>,")
         _info(f"      anchor_height={offer.anchor_height},")
         _info(f"      merkle_depth={offer.merkle_depth},")
         _info("  ))")
@@ -346,9 +345,7 @@ async def run_demo() -> None:
         _info(f"Fetching SPV data for BTC tx {btc_txid[:16]}…")
 
         height = await btc_source.get_tip_height()
-        raw_tx = await btc_source.get_raw_tx(
-            Txid(btc_txid), min_confirmations=MIN_BTC_CONFIRMATIONS
-        )
+        raw_tx = await btc_source.get_raw_tx(Txid(btc_txid), min_confirmations=MIN_BTC_CONFIRMATIONS)
         merkle_hashes, pos = await btc_source.get_merkle_proof(Txid(btc_txid), height)
 
         start_height = BlockHeight(offer.anchor_height + 1)
@@ -391,6 +388,7 @@ async def run_demo() -> None:
 
         # Derive Taker's Radiant P2PKH address from PKH
         from pyrxd.base58 import base58check_encode
+
         taker_rxd_address = base58check_encode(bytes([0x00]) + taker_rxd_pkh)
 
         finalize_result = build_finalize_tx(

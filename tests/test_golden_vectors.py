@@ -19,13 +19,13 @@ or hashing path perturbs the byte output. Updating a frozen vector
 should be a deliberate, reviewed act — not a side effect of a
 "chore: bump deps" commit.
 """
+
 from __future__ import annotations
 
 from pyrxd.glyph.dmint import DaaMode, DmintAlgo, DmintCborPayload
 from pyrxd.glyph.payload import encode_payload
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.keys import PrivateKey
-
 
 # ---------------------------------------------------------------------------
 # Frozen reference CBOR goldfile
@@ -40,9 +40,7 @@ from pyrxd.keys import PrivateKey
 # * Anyone removing ``canonical=True`` from ``encode_payload``.
 # * Quietly dropping a metadata field from the encode path.
 _FROZEN_REFERENCE_CBOR_HEX = "a961708201046176026464657363783d46726f7a656e207265666572656e636520746f6b656e207573656420746f2070696e2043424f5220656e636f64696e672064657465726d696e69736d2e646e616d65745265666572656e6365205465737420546f6b656e65646d696e74a763646161a3646d6f6465026868616c664c696665190e106f746172676574426c6f636b54696d6519025864616c676f00646469666601667265776172641864677072656d696e65192710696d61784865696768741a000f42406c6e756d436f6e7472616374730165696d616765781c68747470733a2f2f6578616d706c652e6f72672f7274742e77656270667469636b6572635254546a696d6167655f69706673782e516d5265666572656e6365496d61676548617368506c616365686f6c6465723132333435363738394162436445666c696d6167655f736861323536784030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030"
-_FROZEN_REFERENCE_PAYLOAD_HASH_HEX = (
-    "16e1432f0671fd3407c59b5c9ece6a8ab4cd735d87493a44ce07e05fa08516be"
-)
+_FROZEN_REFERENCE_PAYLOAD_HASH_HEX = "16e1432f0671fd3407c59b5c9ece6a8ab4cd735d87493a44ce07e05fa08516be"
 
 
 def _make_frozen_reference_metadata() -> GlyphMetadata:
@@ -206,7 +204,7 @@ class TestEcdsaRfc6979GoldenVector:
         r_len = sig[3]
         s_offset = 4 + r_len + 2
         s_len = sig[s_offset - 1]
-        s_bytes = sig[s_offset: s_offset + s_len]
+        s_bytes = sig[s_offset : s_offset + s_len]
         s_int = int.from_bytes(s_bytes, "big")
         assert s_int <= curve.n // 2, "frozen signature is not low-s"
 
@@ -218,9 +216,7 @@ class TestEcdsaRfc6979GoldenVector:
         priv = PrivateKey(bytes.fromhex(_GOLDEN_PRIV_HEX))
         sig = bytes.fromhex(_GOLDEN_SIG_DER_HEX)
         pub = priv.public_key()
-        assert pub.verify(sig, _GOLDEN_MSG), (
-            "frozen signature failed to verify under derived public key"
-        )
+        assert pub.verify(sig, _GOLDEN_MSG), "frozen signature failed to verify under derived public key"
 
     def test_different_message_changes_signature(self):
         """Sanity: same key + different message must produce different

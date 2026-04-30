@@ -1,9 +1,9 @@
+from __future__ import annotations
+
 from contextlib import suppress
 from io import BytesIO
-from typing import Optional, Union
 
-from ..constants import SIGHASH
-from ..constants import TRANSACTION_SEQUENCE
+from ..constants import SIGHASH, TRANSACTION_SEQUENCE
 from ..script.script import Script
 from ..script.unlocking_template import UnlockingScriptTemplate
 from ..utils import Reader
@@ -13,9 +13,9 @@ class TransactionInput:
     def __init__(
         self,
         source_transaction=None,
-        source_txid: Optional[str] = None,
+        source_txid: str | None = None,
         source_output_index: int = 0,
-        unlocking_script: Optional[Script] = None,
+        unlocking_script: Script | None = None,
         unlocking_script_template: UnlockingScriptTemplate = None,
         sequence: int = TRANSACTION_SEQUENCE,
         sighash: SIGHASH = SIGHASH.ALL_FORKID,
@@ -56,7 +56,7 @@ class TransactionInput:
         return self.__str__()
 
     @classmethod
-    def from_hex(cls, stream: Union[str, bytes, Reader]) -> Optional["TransactionInput"]:
+    def from_hex(cls, stream: str | bytes | Reader) -> TransactionInput | None:
         with suppress(Exception):
             stream = (
                 stream

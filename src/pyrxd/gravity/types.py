@@ -14,14 +14,14 @@ from dataclasses import dataclass
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
-    "GravityOffer",
-    "MakerOfferResult",
+    "MIN_CLAIM_DEADLINE",
+    "MIN_DEADLINE_FROM_NOW_HOURS",
     "CancelResult",
     "ClaimResult",
     "FinalizeResult",
     "ForfeitResult",
-    "MIN_CLAIM_DEADLINE",
-    "MIN_DEADLINE_FROM_NOW_HOURS",
+    "GravityOffer",
+    "MakerOfferResult",
 ]
 
 # Minimum claimDeadline accepted by the covenant generator: 2025-01-01 00:00:00 UTC
@@ -40,28 +40,26 @@ class GravityOffer:
     """
 
     # Bitcoin-side fields
-    btc_receive_hash: bytes   # 20 bytes (p2pkh/p2wpkh/p2sh) or 32 bytes (p2tr)
-    btc_receive_type: str     # "p2pkh" | "p2wpkh" | "p2sh" | "p2tr"
-    btc_satoshis: int         # minimum BTC payment in satoshis
-    chain_anchor: bytes       # 32-byte LE prevHash of BTC h1
-    anchor_height: int        # BTC block height of anchor
-    merkle_depth: int         # expected Merkle branch depth
+    btc_receive_hash: bytes  # 20 bytes (p2pkh/p2wpkh/p2sh) or 32 bytes (p2tr)
+    btc_receive_type: str  # "p2pkh" | "p2wpkh" | "p2sh" | "p2tr"
+    btc_satoshis: int  # minimum BTC payment in satoshis
+    chain_anchor: bytes  # 32-byte LE prevHash of BTC h1
+    anchor_height: int  # BTC block height of anchor
+    merkle_depth: int  # expected Merkle branch depth
 
     # Radiant-side fields
     taker_radiant_pkh: bytes  # 20-byte PKH of Taker's Radiant address
-    claim_deadline: int       # Unix timestamp; forfeit opens after this
-    photons_offered: int      # RXD photons locked in covenant
+    claim_deadline: int  # Unix timestamp; forfeit opens after this
+    photons_offered: int  # RXD photons locked in covenant
 
     # Covenant bytecode (hex)
-    offer_redeem_hex: str           # MakerOffer full locking script hex
-    claimed_redeem_hex: str         # MakerClaimed full locking script hex
-    expected_code_hash_hex: str     # hash256(P2SH_scriptPubKey(claimed_redeem)); enforced in build_claim_tx
+    offer_redeem_hex: str  # MakerOffer full locking script hex
+    claimed_redeem_hex: str  # MakerClaimed full locking script hex
+    expected_code_hash_hex: str  # hash256(P2SH_scriptPubKey(claimed_redeem)); enforced in build_claim_tx
 
     def __post_init__(self) -> None:
         if self.btc_receive_type not in ("p2pkh", "p2wpkh", "p2sh", "p2tr"):
-            raise ValidationError(
-                f"unknown btc_receive_type: {self.btc_receive_type!r}"
-            )
+            raise ValidationError(f"unknown btc_receive_type: {self.btc_receive_type!r}")
         if self.btc_satoshis <= 0:
             raise ValidationError("btc_satoshis must be > 0")
         if len(self.chain_anchor) != 32:
@@ -70,8 +68,7 @@ class GravityOffer:
             raise ValidationError("taker_radiant_pkh must be 20 bytes")
         if self.claim_deadline < MIN_CLAIM_DEADLINE:
             raise ValidationError(
-                f"claim_deadline {self.claim_deadline} is before minimum "
-                f"({MIN_CLAIM_DEADLINE} = 2025-01-01)"
+                f"claim_deadline {self.claim_deadline} is before minimum ({MIN_CLAIM_DEADLINE} = 2025-01-01)"
             )
         if self.claim_deadline > 0xFFFFFFFF:
             raise ValidationError(
@@ -82,9 +79,7 @@ class GravityOffer:
         if self.photons_offered <= 0:
             raise ValidationError("photons_offered must be > 0")
 
-    def validate_deadline_from_now(
-        self, accept_short_deadline: bool = False
-    ) -> None:
+    def validate_deadline_from_now(self, accept_short_deadline: bool = False) -> None:
         """Check that ``claim_deadline`` is at least ``MIN_DEADLINE_FROM_NOW_HOURS`` from now.
 
         Raises ``ValidationError`` unless *accept_short_deadline* is ``True``
@@ -108,7 +103,7 @@ class MakerOfferResult:
     tx_hex: str
     txid: str
     tx_size: int
-    offer_p2sh: str      # Radiant P2SH address of the MakerOffer UTXO
+    offer_p2sh: str  # Radiant P2SH address of the MakerOffer UTXO
     fee_sats: int
     output_photons: int  # photons locked in the MakerOffer P2SH output
 

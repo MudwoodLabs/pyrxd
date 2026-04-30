@@ -39,7 +39,6 @@ import hashlib
 import os
 import sys
 import time
-from typing import Optional
 
 # ─────────────────────────────────────────────────────────────
 # Configuration
@@ -48,18 +47,14 @@ from typing import Optional
 DRY_RUN: bool = os.environ.get("DRY_RUN", "1") != "0"
 
 # RXD mainnet ElectrumX (the only live RXD network — no testnet exists)
-RXD_ELECTRUMX_URL: str = os.environ.get(
-    "RXD_ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/"
-)
+RXD_ELECTRUMX_URL: str = os.environ.get("RXD_ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/")
 
 # BTC testnet3 — we default to blockstream.info because its /merkle-proof
 # endpoint returns JSON with the `{merkle, pos, ...}` shape the SDK's
 # MempoolSpaceSource/BlockstreamSource parsers expect.  mempool.space returns
 # a binary merkleblock at /merkleblock-proof which the SDK can't decode as
 # JSON — a known SDK gap for this endpoint variant.
-BTC_API_URL: str = os.environ.get(
-    "BTC_API_URL", "https://blockstream.info/testnet/api"
-)
+BTC_API_URL: str = os.environ.get("BTC_API_URL", "https://blockstream.info/testnet/api")
 # Which source class to use — "blockstream" or "mempool"
 BTC_SOURCE_KIND: str = os.environ.get("BTC_SOURCE_KIND", "blockstream")
 
@@ -68,13 +63,13 @@ BTC_SOURCE_KIND: str = os.environ.get("BTC_SOURCE_KIND", "blockstream")
 # living as a module-level string for the lifetime of the process.
 
 # Small amounts — the user's session constraint (< 100k photons on RXD side)
-PHOTONS_OFFERED: int = int(os.environ.get("PHOTONS_OFFERED", "10000"))   # 0.0001 RXD
-BTC_SATOSHIS: int = int(os.environ.get("BTC_SATOSHIS", "1000"))           # 1000 sats
+PHOTONS_OFFERED: int = int(os.environ.get("PHOTONS_OFFERED", "10000"))  # 0.0001 RXD
+BTC_SATOSHIS: int = int(os.environ.get("BTC_SATOSHIS", "1000"))  # 1000 sats
 FEE_SATS: int = int(os.environ.get("FEE_SATS", "1000"))
 
 # Optional real BTC testnet txid to SPV-prove. If unset, the script scans
 # recent blocks for a suitable P2WPKH payment tx.
-BTC_TX_TO_PROVE: Optional[str] = os.environ.get("BTC_TX_TO_PROVE")
+BTC_TX_TO_PROVE: str | None = os.environ.get("BTC_TX_TO_PROVE")
 
 
 def _hr(label: str) -> None:
@@ -112,9 +107,10 @@ EXPECTED_HOT_WALLET_ADDR = os.environ.get("EXPECTED_MAKER_ADDR", "")
 
 async def phase_1_key_derivation():
     """Verify WIF -> address derivation against the known hot-wallet address."""
-    from pyrxd.security.secrets import PrivateKeyMaterial
-    from pyrxd.base58 import base58check_encode
     import coincurve
+
+    from pyrxd.base58 import base58check_encode
+    from pyrxd.security.secrets import PrivateKeyMaterial
 
     _hr("Phase 1: Key derivation (offline)")
 
@@ -172,8 +168,10 @@ async def phase_2_rxd_network():
             try:
                 confirmed, unconfirmed = await rxd.get_balance(Hex32(script_hash_le))
                 balance = int(confirmed)
-                _ok(f"Maker confirmed balance: {balance} photons "
-                    f"= {balance / 1e8:.8f} RXD  (source: ElectrumX get_balance)")
+                _ok(
+                    f"Maker confirmed balance: {balance} photons "
+                    f"= {balance / 1e8:.8f} RXD  (source: ElectrumX get_balance)"
+                )
                 if unconfirmed:
                     _info(f"Maker unconfirmed: {int(unconfirmed)} photons")
             except Exception as exc:
@@ -189,8 +187,9 @@ async def _find_suitable_btc_tx(btc_source) -> tuple[str, int]:
     positions to find one with P2WPKH output[0] and native-segwit layout.
     Returns (txid, height).
     """
-    import aiohttp
     import json
+
+    import aiohttp
 
     tip = int(await btc_source.get_tip_height())
     for delta in (3, 4, 5, 6, 10, 20):
@@ -208,6 +207,7 @@ async def _find_suitable_btc_tx(btc_source) -> tuple[str, int]:
                 try:
                     from pyrxd.security.types import Txid
                     from pyrxd.spv.witness import strip_witness
+
                     raw = await btc_source.get_raw_tx(Txid(candidate), min_confirmations=1)
                     stripped = strip_witness(bytes(raw))
                     # Must be exactly 1 input (offset 4 = input count varint)
@@ -243,7 +243,10 @@ async def phase_3_btc_network_and_spv():
         if BTC_TX_TO_PROVE:
             target_txid = BTC_TX_TO_PROVE
             _info(f"Using caller-supplied txid: {target_txid}")
-            import aiohttp, json
+            import json
+
+            import aiohttp
+
             async with aiohttp.ClientSession() as s:
                 url = f"{BTC_API_URL.rstrip('/')}/tx/{target_txid}/status"
                 async with s.get(url) as r:
@@ -271,13 +274,14 @@ async def phase_3_btc_network_and_spv():
         # But we don't know input structure cleanly without a parser — use the
         # SDK's _find_output_zero_offset helper via a tiny inline re-impl:
         from pyrxd.gravity.trade import _find_output_zero_offset
+
         output_offset = _find_output_zero_offset(stripped)
         _ok(f"Output[0] offset in stripped tx: {output_offset}")
 
         # Parse output[0]: 8 bytes value + varint len + script
-        out_value = int.from_bytes(stripped[output_offset:output_offset + 8], "little")
+        out_value = int.from_bytes(stripped[output_offset : output_offset + 8], "little")
         script_len = stripped[output_offset + 8]
-        out_script = stripped[output_offset + 9:output_offset + 9 + script_len]
+        out_script = stripped[output_offset + 9 : output_offset + 9 + script_len]
         _ok(f"Output[0] value: {out_value} sats, scriptPubKey: {out_script.hex()}")
 
         # Extract the pkh from an OP_0 <20B> P2WPKH script
@@ -285,7 +289,7 @@ async def phase_3_btc_network_and_spv():
             btc_receive_hash = out_script[2:22]
             btc_receive_type = "p2wpkh"
         else:
-            _warn(f"Output[0] is not P2WPKH; SPV verification will skip")
+            _warn("Output[0] is not P2WPKH; SPV verification will skip")
             btc_receive_hash = None
             btc_receive_type = "p2wpkh"
 
@@ -322,7 +326,7 @@ async def phase_3_btc_network_and_spv():
                 pos=pos,
                 output_offset=output_offset,
             )
-            _ok(f"SpvProofBuilder.build() SUCCESS — real BTC proof verified")
+            _ok("SpvProofBuilder.build() SUCCESS — real BTC proof verified")
             _ok(f"  txid: {proof.txid[:16]}...")
             _ok(f"  headers: {len(proof.headers)}, branch: {len(proof.branch)} bytes, pos: {proof.pos}")
             return target_txid, height, chain_anchor, anchor_height, proof
@@ -341,11 +345,12 @@ async def phase_4_gravity_tx_builders(pk, pkh, chain_anchor, anchor_height):
     covenant bytecode that would actually execute on-chain (given adequate funding).
     """
     import coincurve
-    from pyrxd.security.secrets import PrivateKeyMaterial
+
     from pyrxd.btc_wallet.keys import generate_keypair
     from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
     from pyrxd.gravity.covenant import build_gravity_offer
     from pyrxd.gravity.transactions import build_claim_tx, build_maker_offer_tx
+    from pyrxd.security.secrets import PrivateKeyMaterial
 
     _hr("Phase 4: Gravity tx builders (SDK, real covenant bytecode)")
 
@@ -373,7 +378,7 @@ async def phase_4_gravity_tx_builders(pk, pkh, chain_anchor, anchor_height):
     # Current BTC difficulty — use a real mainnet nBits (2026-04-21 era)
     # This is used in the covenant for PoW verification. For a DRY_RUN,
     # any 4-byte value is fine — the covenant won't actually execute.
-    expected_nbits = bytes.fromhex("a0ee0117")   # approximate 2026 difficulty LE
+    expected_nbits = bytes.fromhex("a0ee0117")  # approximate 2026 difficulty LE
 
     claim_deadline = int(time.time()) + 25 * 3600  # 25h from now
 
@@ -396,7 +401,7 @@ async def phase_4_gravity_tx_builders(pk, pkh, chain_anchor, anchor_height):
         claim_deadline=claim_deadline,
         photons_offered=PHOTONS_OFFERED,
     )
-    _ok(f"GravityOffer built with real covenant bytecode")
+    _ok("GravityOffer built with real covenant bytecode")
     _ok(f"  offer_redeem:   {len(offer.offer_redeem_hex) // 2} bytes")
     _ok(f"  claimed_redeem: {len(offer.claimed_redeem_hex) // 2} bytes")
     _ok(f"  btc_satoshis: {offer.btc_satoshis}")
@@ -467,19 +472,18 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
             _fail("DRY_RUN=0 requires MAKER_RXD_WIF to be set.")
 
         # Fetch a real funded UTXO from the Maker's address
-        import json as _json
-        import websockets
         import hashlib as _hl
+        import json as _json
+
+        import websockets
 
         async with websockets.connect(RXD_ELECTRUMX_URL) as ws:
             pkh_hex = os.environ.get("EXPECTED_MAKER_PKH_HEX", "")
             if not pkh_hex:
-                _fail("DRY_RUN=0 requires EXPECTED_MAKER_PKH_HEX to be set "
-                      "(matching MAKER_RXD_WIF) for UTXO lookup.")
+                _fail("DRY_RUN=0 requires EXPECTED_MAKER_PKH_HEX to be set (matching MAKER_RXD_WIF) for UTXO lookup.")
             script = bytes.fromhex("76a914" + pkh_hex + "88ac")
             script_hash_le = _hl.sha256(script).digest()[::-1].hex()
-            req = _json.dumps({"id": 1, "method": "blockchain.scripthash.listunspent",
-                               "params": [script_hash_le]})
+            req = _json.dumps({"id": 1, "method": "blockchain.scripthash.listunspent", "params": [script_hash_le]})
             await ws.send(req)
             resp = _json.loads(await ws.recv())
         utxos = resp.get("result", [])
@@ -492,10 +496,13 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
         _info(f"Using UTXO: {utxo['tx_hash']}:{utxo['tx_pos']} ({utxo['value']} photons)")
         min_needed = FEE_SATS + 1  # at minimum, fee + 1 photon output
         if utxo["value"] < min_needed:
-            _fail(f"Largest UTXO ({utxo['value']} photons) is below minimum "
-                  f"needed ({min_needed} = fee {FEE_SATS} + 1 photon output).")
+            _fail(
+                f"Largest UTXO ({utxo['value']} photons) is below minimum "
+                f"needed ({min_needed} = fee {FEE_SATS} + 1 photon output)."
+            )
 
         from pyrxd.security.secrets import PrivateKeyMaterial
+
         pk_live = PrivateKeyMaterial.from_wif(_maker_wif)
         _maker_wif = None  # clear immediately after use
 
@@ -503,7 +510,9 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
         # Use the Maker's own P2WPKH as the BTC destination for this
         # self-trade test — avoids embedding an unrecoverable zero-hash address.
         import coincurve as _cc
+
         from pyrxd.btc_wallet.keys import generate_keypair as _gkp
+
         maker_raw = pk_live.unsafe_raw_bytes()
         maker_pub_live = _cc.PrivateKey(maker_raw).public_key.format(compressed=True)
         maker_pkh_live = _hl.new("ripemd160", _hl.sha256(maker_pub_live).digest()).digest()
@@ -520,6 +529,7 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
         _info(f"Live fee: {live_fee} photons ({FEE_RATE_PH_PER_BYTE} ph/byte × {ESTIMATED_TX_BYTES} bytes)")
 
         from pyrxd.gravity.covenant import build_gravity_offer as _bgo
+
         offer_live = _bgo(
             maker_pkh=maker_pkh_live,
             maker_pk=maker_pub_live,
@@ -537,6 +547,7 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
         )
 
         from pyrxd.gravity.transactions import build_maker_offer_tx as _bmot
+
         result_live = _bmot(
             offer=offer_live,
             funding_txid=utxo["tx_hash"],
@@ -550,11 +561,10 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
 
         # Broadcast
         async with websockets.connect(RXD_ELECTRUMX_URL) as ws:
-            req = _json.dumps({"id": 2, "method": "blockchain.transaction.broadcast",
-                               "params": [result_live.tx_hex]})
+            req = _json.dumps({"id": 2, "method": "blockchain.transaction.broadcast", "params": [result_live.tx_hex]})
             await ws.send(req)
             resp = _json.loads(await ws.recv())
-        if "error" in resp and resp["error"]:
+        if resp.get("error"):
             _fail(f"Broadcast failed: {resp['error']}")
         returned_txid = resp.get("result", "")
         if returned_txid == result_live.txid:
@@ -570,7 +580,7 @@ async def run() -> None:
     print(f"  Mode: DRY_RUN={DRY_RUN}")
     print("=" * 70)
 
-    pk, pkh, addr = await phase_1_key_derivation()
+    pk, pkh, _addr = await phase_1_key_derivation()
     rxd_tip, balance = await phase_2_rxd_network()
     btc_result = await phase_3_btc_network_and_spv()
     _, _, chain_anchor, anchor_height, _proof = btc_result
@@ -578,13 +588,10 @@ async def run() -> None:
     await phase_5_broadcast_guard(offer=offer, maker_offer_result=maker_offer_result)
 
     _hr("Summary")
-    _ok("Phase 1: WIF -> address derivation verified" if pk else
-        "Phase 1: skipped (no WIF)")
-    _ok(f"Phase 2: RXD tip height {rxd_tip} fetched from live ElectrumX" if rxd_tip else
-        "Phase 2: failed")
+    _ok("Phase 1: WIF -> address derivation verified" if pk else "Phase 1: skipped (no WIF)")
+    _ok(f"Phase 2: RXD tip height {rxd_tip} fetched from live ElectrumX" if rxd_tip else "Phase 2: failed")
     if balance is not None:
-        _ok(f"Phase 2: RXD hot-wallet balance {balance} photons "
-            f"({balance / 1e8:.8f} RXD) confirmed")
+        _ok(f"Phase 2: RXD hot-wallet balance {balance} photons ({balance / 1e8:.8f} RXD) confirmed")
     _ok("Phase 3: live BTC SPV proof built + verified against real tx")
     _ok("Phase 4: Gravity txs built with real covenant bytecode (CovenantArtifact)")
     _ok("  - build_maker_offer_tx: Maker funding tx (P2PKH → P2SH)")

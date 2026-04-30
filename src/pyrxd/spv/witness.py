@@ -118,10 +118,5 @@ def strip_witness(raw_tx: bytes) -> bytes:
     locktime = raw_tx[pos : pos + 4]
 
     return (
-        version
-        + _encode_varint(input_count)
-        + inputs_bytes
-        + _encode_varint(output_count)
-        + outputs_bytes
-        + locktime
+        version + _encode_varint(input_count) + inputs_bytes + _encode_varint(output_count) + outputs_bytes + locktime
     )

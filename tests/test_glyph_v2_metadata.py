@@ -1,5 +1,6 @@
 """Tests for Glyph V2 metadata sub-objects: GlyphCreator, GlyphRoyalty, GlyphPolicy,
 GlyphRights, and sign_metadata / verify_creator_signature."""
+
 from __future__ import annotations
 
 import pytest
@@ -16,7 +17,6 @@ from pyrxd.glyph.types import (
 )
 from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import ValidationError
-
 
 # ---------------------------------------------------------------------------
 # GlyphCreator
@@ -79,6 +79,7 @@ def test_creator_from_cbor_dict_string_form():
 # GlyphRoyalty
 # ---------------------------------------------------------------------------
 
+
 def test_royalty_valid():
     r = GlyphRoyalty(bps=500, address="1someaddress", enforced=True)
     assert r.bps == 500
@@ -121,7 +122,10 @@ def test_royalty_to_cbor_dict_with_splits():
 
 def test_royalty_round_trip():
     r = GlyphRoyalty(
-        bps=500, address="rxd1abc", enforced=True, minimum=100,
+        bps=500,
+        address="rxd1abc",
+        enforced=True,
+        minimum=100,
         splits=(("rxd1x", 300), ("rxd1y", 200)),
     )
     back = GlyphRoyalty.from_cbor_dict(r.to_cbor_dict())
@@ -131,6 +135,7 @@ def test_royalty_round_trip():
 # ---------------------------------------------------------------------------
 # GlyphPolicy
 # ---------------------------------------------------------------------------
+
 
 def test_policy_all_none_emits_empty_dict():
     d = GlyphPolicy().to_cbor_dict()
@@ -163,6 +168,7 @@ def test_policy_partial_round_trip():
 # GlyphRights
 # ---------------------------------------------------------------------------
 
+
 def test_rights_empty_emits_empty_dict():
     assert GlyphRights().to_cbor_dict() == {}
 
@@ -184,6 +190,7 @@ def test_rights_round_trip():
 # ---------------------------------------------------------------------------
 # GlyphMetadata — new fields in CBOR and round-trip
 # ---------------------------------------------------------------------------
+
 
 def _meta(**kw) -> GlyphMetadata:
     kw.setdefault("name", "Test NFT")
@@ -269,6 +276,7 @@ def test_metadata_full_v2_encode_decode_round_trip():
 # sign_metadata / verify_creator_signature
 # ---------------------------------------------------------------------------
 
+
 def _fresh_key() -> PrivateKey:
     return PrivateKey()
 
@@ -313,6 +321,7 @@ def test_verify_creator_signature_tampered_name():
     signed = sign_metadata(meta, key)
     # Tamper: change the name after signing
     import dataclasses
+
     tampered = dataclasses.replace(signed, name="Tampered")
     valid, err = verify_creator_signature(tampered)
     assert valid is False
@@ -340,6 +349,7 @@ def test_verify_creator_signature_wrong_key():
     signed_with_key1 = sign_metadata(meta, key1)
     # Replace pubkey with key2's pubkey — mismatch
     import dataclasses
+
     wrong_creator = dataclasses.replace(
         signed_with_key1.creator,
         pubkey=key2.public_key().serialize(compressed=True).hex(),
@@ -352,14 +362,21 @@ def test_verify_creator_signature_wrong_key():
 def test_sign_verify_round_trip_with_dmint():
     """Signing works with complex V2 metadata including dmint_params."""
     from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload
+
     dmint = DmintCborPayload(
-        algo=DmintAlgo.SHA256D, num_contracts=1, max_height=10_000,
-        reward=100, premine=0, diff=1000,
+        algo=DmintAlgo.SHA256D,
+        num_contracts=1,
+        max_height=10_000,
+        reward=100,
+        premine=0,
+        diff=1000,
     )
     meta = GlyphMetadata(
         protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
-        ticker="TST", name="Test Token",
-        v=2, dmint_params=dmint,
+        ticker="TST",
+        name="Test Token",
+        v=2,
+        dmint_params=dmint,
     )
     key = _fresh_key()
     signed = sign_metadata(meta, key)

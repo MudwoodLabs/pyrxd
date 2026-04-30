@@ -5,26 +5,26 @@ Covers:
 2. GlyphBuilder.prepare_dmint_deploy() — commit/reveal/deploy script builder
 3. build_dmint_mint_tx() — mint transaction builder
 """
-from __future__ import annotations
 
+from __future__ import annotations
 
 import pytest
 
+from pyrxd.glyph.builder import (
+    DmintDeployResult,
+    DmintFullDeployParams,
+    GlyphBuilder,
+)
 from pyrxd.glyph.dmint import (
+    MAX_SHA256D_TARGET,
+    MAX_V2_TARGET_256,
     DaaMode,
     DmintAlgo,
     DmintContractUtxo,
     DmintDeployParams,
     DmintState,
-    MAX_SHA256D_TARGET,
-    MAX_V2_TARGET_256,
     build_dmint_contract_script,
     build_dmint_mint_tx,
-)
-from pyrxd.glyph.builder import (
-    DmintDeployResult,
-    DmintFullDeployParams,
-    GlyphBuilder,
 )
 from pyrxd.glyph.types import GlyphMetadata, GlyphRef
 from pyrxd.security.errors import ValidationError
@@ -33,8 +33,8 @@ from pyrxd.security.errors import ValidationError
 # Shared test fixtures
 # ---------------------------------------------------------------------------
 
-_CONTRACT_REF = GlyphRef(txid='aa' * 32, vout=1)
-_TOKEN_REF    = GlyphRef(txid='bb' * 32, vout=2)
+_CONTRACT_REF = GlyphRef(txid="aa" * 32, vout=1)
+_TOKEN_REF = GlyphRef(txid="bb" * 32, vout=2)
 
 _BASE_PARAMS = DmintDeployParams(
     contract_ref=_CONTRACT_REF,
@@ -76,6 +76,7 @@ _LWMA_PARAMS = DmintDeployParams(
 # 1. DmintState.from_script() — round-trip tests
 # ---------------------------------------------------------------------------
 
+
 class TestDmintStateFromScript:
     """Round-trip: build_dmint_contract_script → DmintState.from_script."""
 
@@ -89,8 +90,12 @@ class TestDmintStateFromScript:
 
     def test_height_nonzero_round_trips(self):
         params = DmintDeployParams(
-            contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF,
-            max_height=100, reward=10, difficulty=5, height=999,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=100,
+            reward=10,
+            difficulty=5,
+            height=999,
         )
         state = self._round_trip(params)
         assert state.height == 999
@@ -117,16 +122,24 @@ class TestDmintStateFromScript:
 
     def test_algo_blake3_round_trips(self):
         params = DmintDeployParams(
-            contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF,
-            max_height=100, reward=10, difficulty=5, algo=DmintAlgo.BLAKE3,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=100,
+            reward=10,
+            difficulty=5,
+            algo=DmintAlgo.BLAKE3,
         )
         state = self._round_trip(params)
         assert state.algo == DmintAlgo.BLAKE3
 
     def test_algo_k12_round_trips(self):
         params = DmintDeployParams(
-            contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF,
-            max_height=100, reward=10, difficulty=5, algo=DmintAlgo.K12,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=100,
+            reward=10,
+            difficulty=5,
+            algo=DmintAlgo.K12,
         )
         state = self._round_trip(params)
         assert state.algo == DmintAlgo.K12
@@ -185,8 +198,12 @@ class TestDmintStateFromScript:
 
     def test_is_exhausted_true_when_at_max_height(self):
         params = DmintDeployParams(
-            contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF,
-            max_height=5, reward=10, difficulty=1, height=5,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=5,
+            reward=10,
+            difficulty=1,
+            height=5,
         )
         state = self._round_trip(params)
         assert state.is_exhausted
@@ -200,16 +217,19 @@ class TestDmintStateFromScript:
         a more accurate one.
         """
         with pytest.raises(ValidationError):
-            DmintState.from_script(b'\x00' * 20)
+            DmintState.from_script(b"\x00" * 20)
 
     def test_empty_script_raises(self):
         with pytest.raises(ValidationError):
-            DmintState.from_script(b'')
+            DmintState.from_script(b"")
 
     def test_large_max_height_round_trips(self):
         params = DmintDeployParams(
-            contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF,
-            max_height=2_100_000_000, reward=5_000_000_000, difficulty=10,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=2_100_000_000,
+            reward=5_000_000_000,
+            difficulty=10,
         )
         state = self._round_trip(params)
         assert state.max_height == 2_100_000_000
@@ -221,19 +241,25 @@ class TestDmintStateFromScript:
             (DmintAlgo.SHA256D, DaaMode.FIXED),
             (DmintAlgo.SHA256D, DaaMode.ASERT),
             (DmintAlgo.SHA256D, DaaMode.LWMA),
-            (DmintAlgo.BLAKE3,  DaaMode.FIXED),
-            (DmintAlgo.BLAKE3,  DaaMode.ASERT),
-            (DmintAlgo.BLAKE3,  DaaMode.LWMA),
-            (DmintAlgo.K12,     DaaMode.FIXED),
-            (DmintAlgo.K12,     DaaMode.ASERT),
-            (DmintAlgo.K12,     DaaMode.LWMA),
+            (DmintAlgo.BLAKE3, DaaMode.FIXED),
+            (DmintAlgo.BLAKE3, DaaMode.ASERT),
+            (DmintAlgo.BLAKE3, DaaMode.LWMA),
+            (DmintAlgo.K12, DaaMode.FIXED),
+            (DmintAlgo.K12, DaaMode.ASERT),
+            (DmintAlgo.K12, DaaMode.LWMA),
         ]
         for algo, daa_mode in variants:
             params = DmintDeployParams(
-                contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF,
-                max_height=10_000, reward=100, difficulty=10,
-                algo=algo, daa_mode=daa_mode,
-                target_time=60, half_life=3_600, last_time=1_700_000_000,
+                contract_ref=_CONTRACT_REF,
+                token_ref=_TOKEN_REF,
+                max_height=10_000,
+                reward=100,
+                difficulty=10,
+                algo=algo,
+                daa_mode=daa_mode,
+                target_time=60,
+                half_life=3_600,
+                last_time=1_700_000_000,
             )
             state = self._round_trip(params)
             assert state.algo == algo, f"algo mismatch for {algo},{daa_mode}"
@@ -263,23 +289,29 @@ class TestStateSeparatorN7:
         # fails on the contractRef opcode check and surfaces a misleading
         # error. Post-fix: walk consumes the 36-byte wire ref payload,
         # ignoring its content, and finds the real separator.
-        contract_ref_with_bd = GlyphRef(txid='bd' * 32, vout=1)
+        contract_ref_with_bd = GlyphRef(txid="bd" * 32, vout=1)
         params = DmintDeployParams(
-            contract_ref=contract_ref_with_bd, token_ref=_TOKEN_REF,
-            max_height=100, reward=10, difficulty=5,
+            contract_ref=contract_ref_with_bd,
+            token_ref=_TOKEN_REF,
+            max_height=100,
+            reward=10,
+            difficulty=5,
         )
         script = build_dmint_contract_script(params)
         # Sanity: 0xbd really does appear inside the ref payload.
-        assert script.count(b'\xbd') >= 33  # 32 from txid + at least 1 separator
+        assert script.count(b"\xbd") >= 33  # 32 from txid + at least 1 separator
         state = DmintState.from_script(script)
         assert state.contract_ref == contract_ref_with_bd
 
     def test_0xbd_inside_token_ref_does_not_truncate_state(self):
         """Same hazard for tokenRef (item 2)."""
-        token_ref_with_bd = GlyphRef(txid='bd' * 32, vout=7)
+        token_ref_with_bd = GlyphRef(txid="bd" * 32, vout=7)
         params = DmintDeployParams(
-            contract_ref=_CONTRACT_REF, token_ref=token_ref_with_bd,
-            max_height=100, reward=10, difficulty=5,
+            contract_ref=_CONTRACT_REF,
+            token_ref=token_ref_with_bd,
+            max_height=100,
+            reward=10,
+            difficulty=5,
         )
         script = build_dmint_contract_script(params)
         state = DmintState.from_script(script)
@@ -290,12 +322,17 @@ class TestStateSeparatorN7:
         e.g. 0x00bd0000 → bytes [00, 00, bd, 00] in LE order.
         """
         # last_time chosen so its LE encoding contains a 0xbd byte.
-        last_time = 0x12bd3456
+        last_time = 0x12BD3456
         params = DmintDeployParams(
-            contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF,
-            max_height=100, reward=10, difficulty=5,
-            algo=DmintAlgo.SHA256D, daa_mode=DaaMode.ASERT,
-            target_time=120, half_life=3_600,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=100,
+            reward=10,
+            difficulty=5,
+            algo=DmintAlgo.SHA256D,
+            daa_mode=DaaMode.ASERT,
+            target_time=120,
+            half_life=3_600,
             last_time=last_time,
         )
         script = build_dmint_contract_script(params)
@@ -307,10 +344,13 @@ class TestStateSeparatorN7:
         bytes anywhere in its 32-byte representation.
         """
         params = DmintDeployParams(
-            contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF,
-            max_height=100, reward=10,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=100,
+            reward=10,
             difficulty=189,  # 0xbd — likely to put 0xbd bytes in target
-            algo=DmintAlgo.BLAKE3, daa_mode=DaaMode.LWMA,
+            algo=DmintAlgo.BLAKE3,
+            daa_mode=DaaMode.LWMA,
             target_time=60,
         )
         script = build_dmint_contract_script(params)
@@ -336,6 +376,7 @@ class TestStateSeparatorN7:
         # other 0xbd's, but in practice for our test fixtures the
         # separator byte is what we want). Safest: re-walk and grab pos.
         from pyrxd.glyph.dmint import _OP_STATESEPARATOR
+
         # Find separator by parsing the valid script first.
         DmintState.from_script(bytes(script))  # sanity: must succeed
         # Now corrupt: change every 0xbd byte that's NOT inside push-data
@@ -344,7 +385,7 @@ class TestStateSeparatorN7:
         first_bd = bytes(script).index(_OP_STATESEPARATOR)
         # Confirm this 0xbd is the actual separator by verifying parse
         # succeeded with the original bytes; replace it with 0xff.
-        script[first_bd] = 0xff
+        script[first_bd] = 0xFF
         with pytest.raises(ValidationError, match="OP_STATESEPARATOR"):
             DmintState.from_script(bytes(script))
 
@@ -352,6 +393,7 @@ class TestStateSeparatorN7:
 # ---------------------------------------------------------------------------
 # 2. GlyphBuilder.prepare_dmint_deploy()
 # ---------------------------------------------------------------------------
+
 
 class TestPrepareDmintDeploy:
     _META = GlyphMetadata.for_dmint_ft(
@@ -362,10 +404,12 @@ class TestPrepareDmintDeploy:
     _OWNER_PKH = bytes(b"\x11" * 20)
 
     from pyrxd.security.types import Hex20 as _Hex20
+
     _OWNER_PKH_HEX = None  # lazy init below
 
     def _make_params(self, premine=None, pool=100_000):
         from pyrxd.security.types import Hex20
+
         return DmintFullDeployParams(
             metadata=self._META,
             owner_pkh=Hex20(bytes(b"\x11" * 20)),
@@ -387,6 +431,7 @@ class TestPrepareDmintDeploy:
 
     def test_cbor_bytes_round_trip(self):
         import cbor2
+
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
         d = cbor2.loads(result.cbor_bytes)
         assert d["ticker"] == "TST"
@@ -394,7 +439,7 @@ class TestPrepareDmintDeploy:
 
     def test_placeholder_contract_script_has_state_separator(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
-        assert b'\xbd' in result.placeholder_contract_script
+        assert b"\xbd" in result.placeholder_contract_script
 
     def test_initial_pool_photons_echoed(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params(pool=500_000))
@@ -419,8 +464,11 @@ class TestPrepareDmintDeploy:
     def test_build_reveal_scripts_with_premine(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=1_000_000))
         from pyrxd.glyph.builder import FtDeployRevealScripts
+
         reveal = result.build_reveal_scripts(
-            commit_txid="ab" * 32, commit_vout=0, commit_value=5_000_000,
+            commit_txid="ab" * 32,
+            commit_vout=0,
+            commit_value=5_000_000,
         )
         assert isinstance(reveal, FtDeployRevealScripts)
         assert len(reveal.locking_script) == 75
@@ -428,28 +476,31 @@ class TestPrepareDmintDeploy:
     def test_build_reveal_scripts_without_premine(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
         from pyrxd.glyph.builder import RevealScripts
+
         reveal = result.build_reveal_scripts(
-            commit_txid="ab" * 32, commit_vout=0, commit_value=5_000_000,
+            commit_txid="ab" * 32,
+            commit_vout=0,
+            commit_value=5_000_000,
         )
         assert isinstance(reveal, RevealScripts)
 
     def test_build_contract_script_with_real_refs(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
-        real_token_ref = GlyphRef(txid='cc' * 32, vout=0)
-        real_contract_ref = GlyphRef(txid='dd' * 32, vout=0)
+        real_token_ref = GlyphRef(txid="cc" * 32, vout=0)
+        real_contract_ref = GlyphRef(txid="dd" * 32, vout=0)
         script = result.build_contract_script(
             token_ref=real_token_ref,
             contract_ref=real_contract_ref,
         )
         # Should contain both ref bytes and the state separator
-        assert b'\xbd' in script
+        assert b"\xbd" in script
         assert real_token_ref.to_bytes() in script
         assert real_contract_ref.to_bytes() in script
 
     def test_contract_script_parses_back_with_real_refs(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
-        real_token_ref = GlyphRef(txid='cc' * 32, vout=0)
-        real_contract_ref = GlyphRef(txid='dd' * 32, vout=0)
+        real_token_ref = GlyphRef(txid="cc" * 32, vout=0)
+        real_contract_ref = GlyphRef(txid="dd" * 32, vout=0)
         script = result.build_contract_script(
             token_ref=real_token_ref,
             contract_ref=real_contract_ref,
@@ -464,6 +515,7 @@ class TestPrepareDmintDeploy:
 # ---------------------------------------------------------------------------
 # 3. build_dmint_mint_tx()
 # ---------------------------------------------------------------------------
+
 
 def _make_contract_utxo(height: int = 0, pool: int = 50_000_000, daa_mode=DaaMode.FIXED) -> DmintContractUtxo:
     """Build a synthetic DmintContractUtxo for testing.
@@ -504,6 +556,7 @@ class TestBuildDmintMintTx:
         utxo = _make_contract_utxo()
         result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
         from pyrxd.glyph.dmint import DmintMintResult
+
         assert isinstance(result, DmintMintResult)
 
     def test_updated_height_incremented(self):
@@ -529,7 +582,7 @@ class TestBuildDmintMintTx:
     def test_contract_script_has_state_separator(self):
         utxo = _make_contract_utxo()
         result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert b'\xbd' in result.contract_script
+        assert b"\xbd" in result.contract_script
 
     def test_contract_script_parses_back_to_updated_state(self):
         utxo = _make_contract_utxo(height=5)
@@ -543,7 +596,7 @@ class TestBuildDmintMintTx:
         utxo = _make_contract_utxo()
         result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
         # P2PKH: 76 a9 14 <20-byte PKH> 88 ac
-        assert result.reward_script == b'\x76\xa9\x14' + _MINER_PKH + b'\x88\xac'
+        assert result.reward_script == b"\x76\xa9\x14" + _MINER_PKH + b"\x88\xac"
 
     def test_tx_has_one_input_two_outputs(self):
         utxo = _make_contract_utxo()

@@ -51,44 +51,53 @@ from pathlib import Path
 GRAVITY_MODE: str = os.environ.get("GRAVITY_MODE", "offer")
 GRAVITY_STATE_FILE: str = os.environ.get("GRAVITY_STATE_FILE", "gravity_trade_state.json")
 
-RXD_ELECTRUMX_URL: str = os.environ.get(
-    "RXD_ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/"
-)
-BTC_API_URL: str = os.environ.get(
-    "BTC_API_URL", "https://blockstream.info/api"
-)
+RXD_ELECTRUMX_URL: str = os.environ.get("RXD_ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/")
+BTC_API_URL: str = os.environ.get("BTC_API_URL", "https://blockstream.info/api")
 BTC_NETWORK: str = os.environ.get("BTC_NETWORK", "bc")  # "bc" = mainnet, "tb" = testnet
 
 # Fee rate — 10,000 photons/byte
 FEE_RATE_PH_PER_BYTE = 10_000
-MAKER_OFFER_TX_BYTES = 200   # P2PKH → P2SH
-CLAIM_TX_BYTES       = 300   # P2SH unlock with offer redeem + sig
-FINALIZE_TX_BYTES    = 12_500 # sentinel artifact: ~10.2KB redeem + 12×80B headers + 20×33B branch + 113B rawTx + overhead
-RXD_FEE        = FEE_RATE_PH_PER_BYTE * MAKER_OFFER_TX_BYTES   # deducted at offer time
-CLAIM_FEE      = FEE_RATE_PH_PER_BYTE * CLAIM_TX_BYTES         # 3,000,000 photons
-FINALIZE_FEE   = FEE_RATE_PH_PER_BYTE * FINALIZE_TX_BYTES      # 55,000,000 photons
+MAKER_OFFER_TX_BYTES = 200  # P2PKH → P2SH
+CLAIM_TX_BYTES = 300  # P2SH unlock with offer redeem + sig
+FINALIZE_TX_BYTES = 12_500  # sentinel artifact: ~10.2KB redeem + 12×80B headers + 20×33B branch + 113B rawTx + overhead
+RXD_FEE = FEE_RATE_PH_PER_BYTE * MAKER_OFFER_TX_BYTES  # deducted at offer time
+CLAIM_FEE = FEE_RATE_PH_PER_BYTE * CLAIM_TX_BYTES  # 3,000,000 photons
+FINALIZE_FEE = FEE_RATE_PH_PER_BYTE * FINALIZE_TX_BYTES  # 55,000,000 photons
 
-BTC_SATOSHIS = int(os.environ.get("BTC_SATOSHIS", "1500"))   # sats to pay on BTC side
-BTC_FEE_SATS = int(os.environ.get("BTC_FEE_SATS", "500"))    # BTC tx fee
+BTC_SATOSHIS = int(os.environ.get("BTC_SATOSHIS", "1500"))  # sats to pay on BTC side
+BTC_FEE_SATS = int(os.environ.get("BTC_FEE_SATS", "500"))  # BTC tx fee
 
 EXPECTED_HOT_WALLET_ADDR = os.environ.get("EXPECTED_MAKER_ADDR", "")
 HOT_WALLET_PKH_HEX = os.environ.get("EXPECTED_MAKER_PKH_HEX", "")
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
 
+
 def _hr(label: str) -> None:
     pad = (68 - len(label) - 2) // 2
     print(f"\n{'─' * pad} {label} {'─' * pad}")
 
-def _ok(msg: str) -> None:   print(f"  [OK]  {msg}")
-def _info(msg: str) -> None: print(f"  [..]  {msg}")
-def _warn(msg: str) -> None: print(f"  [!!]  {msg}", file=sys.stderr)
+
+def _ok(msg: str) -> None:
+    print(f"  [OK]  {msg}")
+
+
+def _info(msg: str) -> None:
+    print(f"  [..]  {msg}")
+
+
+def _warn(msg: str) -> None:
+    print(f"  [!!]  {msg}", file=sys.stderr)
+
+
 def _fail(msg: str) -> None:
     print(f"  [FAIL] {msg}", file=sys.stderr)
     sys.exit(1)
 
+
 def _hash256(b: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
 
 def _load_state() -> dict:
     p = Path(GRAVITY_STATE_FILE)
@@ -96,20 +105,24 @@ def _load_state() -> dict:
         _fail(f"State file not found: {GRAVITY_STATE_FILE}. Run with GRAVITY_MODE=offer first.")
     return json.loads(p.read_text())
 
+
 def _save_state(state: dict) -> None:
     Path(GRAVITY_STATE_FILE).write_text(json.dumps(state, indent=2))
     _ok(f"Trade state saved → {GRAVITY_STATE_FILE}")
 
+
 # ─── Mode: offer ───────────────────────────────────────────────────────────────
+
 
 async def mode_offer() -> None:
     """Broadcast MakerOffer and persist all state needed for claim/forfeit."""
     import coincurve
-    from pyrxd.security.secrets import PrivateKeyMaterial
+
     from pyrxd.btc_wallet.keys import generate_keypair
     from pyrxd.gravity.covenant import build_gravity_offer
     from pyrxd.gravity.transactions import build_maker_offer_tx
     from pyrxd.network.bitcoin import BlockstreamSource
+    from pyrxd.security.secrets import PrivateKeyMaterial
     from pyrxd.security.types import BlockHeight
 
     _hr("Gravity Trade — OFFER mode")
@@ -124,6 +137,7 @@ async def mode_offer() -> None:
     maker_pub = coincurve.PrivateKey(maker_raw).public_key.format(compressed=True)
     maker_pkh = hashlib.new("ripemd160", hashlib.sha256(maker_pub).digest()).digest()
     from pyrxd.base58 import base58check_encode
+
     maker_addr = base58check_encode(b"\x00" + maker_pkh)
     if EXPECTED_HOT_WALLET_ADDR and maker_addr != EXPECTED_HOT_WALLET_ADDR:
         _fail(f"WIF derives {maker_addr}, expected {EXPECTED_HOT_WALLET_ADDR}")
@@ -152,12 +166,12 @@ async def mode_offer() -> None:
 
     # ── Fetch live UTXO ─────────────────────────────────────────────────────────
     import websockets as _ws
+
     _info("Fetching Maker UTXO from ElectrumX...")
     async with _ws.connect(RXD_ELECTRUMX_URL) as ws:
         script = bytes.fromhex("76a914" + HOT_WALLET_PKH_HEX + "88ac")
         script_hash_le = hashlib.sha256(script).digest()[::-1].hex()
-        await ws.send(json.dumps({"id": 1, "method": "blockchain.scripthash.listunspent",
-                                  "params": [script_hash_le]}))
+        await ws.send(json.dumps({"id": 1, "method": "blockchain.scripthash.listunspent", "params": [script_hash_le]}))
         resp = json.loads(await ws.recv())
     utxos = sorted(resp.get("result", []), key=lambda u: u["value"], reverse=True)
     if not utxos:
@@ -166,8 +180,10 @@ async def mode_offer() -> None:
     _ok(f"UTXO: {utxo['tx_hash']}:{utxo['tx_pos']} = {utxo['value']} photons")
     total_needed = RXD_FEE + CLAIM_FEE + FINALIZE_FEE + 10_000  # +10k min output
     if utxo["value"] < total_needed:
-        _fail(f"UTXO too small ({utxo['value']:,}) — need {total_needed:,} photons "
-              f"({total_needed/1e8:.4f} RXD) to cover all tx fees")
+        _fail(
+            f"UTXO too small ({utxo['value']:,}) — need {total_needed:,} photons "
+            f"({total_needed / 1e8:.4f} RXD) to cover all tx fees"
+        )
 
     # P2SH UTXO value = utxo - offer_fee.
     # photons_offered (covenant threshold) = P2SH value - claim_fee - finalize_fee.
@@ -201,8 +217,10 @@ async def mode_offer() -> None:
         photons_offered=photons_offered,
         covenant_artifact_name="maker_covenant_unified_p2wpkh",
     )
-    _ok(f"GravityOffer built — offer_redeem: {len(offer.offer_redeem_hex)//2}B, "
-        f"claimed_redeem: {len(offer.claimed_redeem_hex)//2}B")
+    _ok(
+        f"GravityOffer built — offer_redeem: {len(offer.offer_redeem_hex) // 2}B, "
+        f"claimed_redeem: {len(offer.claimed_redeem_hex) // 2}B"
+    )
 
     # ── Build & broadcast MakerOffer tx ─────────────────────────────────────────
     result = build_maker_offer_tx(
@@ -218,8 +236,7 @@ async def mode_offer() -> None:
     _ok(f"Photons locked: {result.output_photons}")
 
     async with _ws.connect(RXD_ELECTRUMX_URL) as ws:
-        await ws.send(json.dumps({"id": 2, "method": "blockchain.transaction.broadcast",
-                                  "params": [result.tx_hex]}))
+        await ws.send(json.dumps({"id": 2, "method": "blockchain.transaction.broadcast", "params": [result.tx_hex]}))
         resp = json.loads(await ws.recv())
     if resp.get("error"):
         _fail(f"Broadcast failed: {resp['error']}")
@@ -274,19 +291,21 @@ async def mode_offer() -> None:
 
 # ─── Mode: claim ───────────────────────────────────────────────────────────────
 
+
 async def mode_claim() -> None:
     """Build SPV proof of BTC payment and broadcast claim + finalize txs."""
     import coincurve
-    from pyrxd.security.secrets import PrivateKeyMaterial
-    from pyrxd.gravity.types import GravityOffer
+    import websockets as _ws
+
+    from pyrxd.base58 import base58check_encode
+    from pyrxd.gravity.trade import _find_output_zero_offset
     from pyrxd.gravity.transactions import build_claim_tx, build_finalize_tx
+    from pyrxd.gravity.types import GravityOffer
     from pyrxd.network.bitcoin import BlockstreamSource
+    from pyrxd.security.secrets import PrivateKeyMaterial
+    from pyrxd.security.types import BlockHeight, Txid
     from pyrxd.spv.proof import CovenantParams, SpvProofBuilder
     from pyrxd.spv.witness import strip_witness
-    from pyrxd.security.types import BlockHeight, Txid
-    from pyrxd.gravity.trade import _find_output_zero_offset
-    from pyrxd.base58 import base58check_encode
-    import websockets as _ws
 
     _hr("Gravity Trade — CLAIM mode")
     s = _load_state()
@@ -306,8 +325,10 @@ async def mode_claim() -> None:
         claimed_redeem_hex=s["claimed_redeem_hex"],
         expected_code_hash_hex=s["expected_code_hash_hex"],
     )
-    _ok(f"Loaded offer — photons: {offer.photons_offered}, deadline: "
-        f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(offer.claim_deadline))}")
+    _ok(
+        f"Loaded offer — photons: {offer.photons_offered}, deadline: "
+        f"{time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(offer.claim_deadline))}"
+    )
 
     taker_privkey = PrivateKeyMaterial(bytes.fromhex(s["taker_rxd_privkey_hex"]))
     taker_raw = taker_privkey.unsafe_raw_bytes()
@@ -321,14 +342,17 @@ async def mode_claim() -> None:
     btc = BlockstreamSource(base_url=BTC_API_URL)
     try:
         import aiohttp
+
         async with aiohttp.ClientSession() as session:
             url = f"{BTC_API_URL.rstrip('/')}/address/{s['btc_receive_address']}/txs"
             async with session.get(url) as r:
                 addr_txs = json.loads(await r.read())
 
         if not addr_txs:
-            _fail(f"No transactions found for {s['btc_receive_address']}. "
-                  f"Fund it with at least {s['btc_satoshis']} sats and wait for confirmation.")
+            _fail(
+                f"No transactions found for {s['btc_receive_address']}. "
+                f"Fund it with at least {s['btc_satoshis']} sats and wait for confirmation."
+            )
 
         # Find a confirmed tx paying to our address
         btc_txid = None
@@ -354,9 +378,9 @@ async def mode_claim() -> None:
 
         # ── Parse output[0] to find our payment ─────────────────────────────────
         output_offset = _find_output_zero_offset(stripped)
-        out_value = int.from_bytes(stripped[output_offset:output_offset+8], "little")
-        script_len = stripped[output_offset+8]
-        out_script = stripped[output_offset+9:output_offset+9+script_len]
+        out_value = int.from_bytes(stripped[output_offset : output_offset + 8], "little")
+        script_len = stripped[output_offset + 8]
+        out_script = stripped[output_offset + 9 : output_offset + 9 + script_len]
         _ok(f"Output[0]: {out_value} sats, script: {out_script.hex()}")
 
         if out_value < s["btc_satoshis"]:
@@ -367,8 +391,10 @@ async def mode_claim() -> None:
         anchor_header_bytes = await btc.get_block_header_hex(BlockHeight(anchor_height))
         chain_anchor_check = _hash256(anchor_header_bytes)
         if chain_anchor_check.hex() != s["btc_chain_anchor"]:
-            _warn("Chain anchor mismatch — anchor block may have been reorged. "
-                  "The covenant's btc_chain_anchor is baked in; proceeding anyway.")
+            _warn(
+                "Chain anchor mismatch — anchor block may have been reorged. "
+                "The covenant's btc_chain_anchor is baked in; proceeding anyway."
+            )
 
         # Covenant ABI requires exactly HEADER_SLOTS chained headers starting
         # at anchor+1. If not enough BTC blocks have mined yet past the
@@ -387,8 +413,7 @@ async def mode_claim() -> None:
             BlockHeight(anchor_height + 1),
             HEADER_SLOTS,
         )
-        _ok(f"Fetched {len(headers_raw)} BTC block headers "
-            f"({anchor_height + 1}–{anchor_height + HEADER_SLOTS})")
+        _ok(f"Fetched {len(headers_raw)} BTC block headers ({anchor_height + 1}–{anchor_height + HEADER_SLOTS})")
 
         # ── Build SPV proof ──────────────────────────────────────────────────────
         covenant_params = CovenantParams(
@@ -408,8 +433,7 @@ async def mode_claim() -> None:
             pos=pos,
             output_offset=output_offset,
         )
-        _ok(f"SPV proof verified — headers: {len(proof.headers)}, "
-            f"branch: {len(proof.branch)}B, pos: {proof.pos}")
+        _ok(f"SPV proof verified — headers: {len(proof.headers)}, branch: {len(proof.branch)}B, pos: {proof.pos}")
 
     finally:
         await btc.close()
@@ -424,9 +448,11 @@ async def mode_claim() -> None:
         # or "missing-inputs" if the prior claim already confirmed).
         _ok(f"Claim already broadcast on prior run: {s['claimed_txid']}")
         _ok(f"  claimed output photons: {s['claimed_photons']}")
+
         class _ClaimShim:
             txid = s["claimed_txid"]
             output_photons = s["claimed_photons"]
+
         claim = _ClaimShim()
     else:
         claim = build_claim_tx(
@@ -444,8 +470,7 @@ async def mode_claim() -> None:
         _ok(f"  output photons: {claim.output_photons}")
 
         async with _ws.connect(RXD_ELECTRUMX_URL) as ws:
-            await ws.send(json.dumps({"id": 3, "method": "blockchain.transaction.broadcast",
-                                      "params": [claim.tx_hex]}))
+            await ws.send(json.dumps({"id": 3, "method": "blockchain.transaction.broadcast", "params": [claim.tx_hex]}))
             resp = json.loads(await ws.recv())
         if resp.get("error"):
             _fail(f"Claim broadcast failed: {resp['error']}")
@@ -468,15 +493,14 @@ async def mode_claim() -> None:
         to_address=taker_rxd_addr,
         fee_sats=FINALIZE_FEE,
         minimum_output_photons=offer.photons_offered,
-        header_slots=12,   # covenant ABI bakes in 12 header slots
-        branch_slots=20,   # sentinel-aware artifact: fixed depth-20, pads shorter proofs
+        header_slots=12,  # covenant ABI bakes in 12 header slots
+        branch_slots=20,  # sentinel-aware artifact: fixed depth-20, pads shorter proofs
     )
     _ok(f"Finalize tx: {finalize.txid}  ({finalize.tx_size}B)")
     _ok(f"  output photons: {finalize.output_photons} → {taker_rxd_addr}")
 
     async with _ws.connect(RXD_ELECTRUMX_URL) as ws:
-        await ws.send(json.dumps({"id": 4, "method": "blockchain.transaction.broadcast",
-                                  "params": [finalize.tx_hex]}))
+        await ws.send(json.dumps({"id": 4, "method": "blockchain.transaction.broadcast", "params": [finalize.tx_hex]}))
         resp = json.loads(await ws.recv())
     if resp.get("error"):
         _fail(f"Finalize broadcast failed: {resp['error']}")
@@ -491,15 +515,17 @@ async def mode_claim() -> None:
 
 # ─── Mode: forfeit ─────────────────────────────────────────────────────────────
 
+
 async def mode_forfeit() -> None:
     """Reclaim photons after claim_deadline passes.
 
     - If claim has already run: forfeit the MakerClaimed UTXO (deadline-gated).
     - If never claimed: cancel the MakerOffer UTXO (Maker sig only, no deadline).
     """
-    from pyrxd.gravity.types import GravityOffer
-    from pyrxd.gravity.transactions import build_forfeit_tx
     import websockets as _ws
+
+    from pyrxd.gravity.transactions import build_forfeit_tx
+    from pyrxd.gravity.types import GravityOffer
 
     _hr("Gravity Trade — FORFEIT/CANCEL mode")
     s = _load_state()
@@ -523,6 +549,7 @@ async def mode_forfeit() -> None:
     if not maker_wif:
         _fail("Set MAKER_RXD_WIF to sign the forfeit/cancel tx.")
     from pyrxd.security.secrets import PrivateKeyMaterial as _PKM
+
     _PKM.from_wif(maker_wif)
     maker_wif = None
 
@@ -532,9 +559,11 @@ async def mode_forfeit() -> None:
         deadline = s["claim_deadline"]
         if deadline > now:
             remaining = deadline - now
-            _fail(f"Claim deadline not yet reached. Wait {remaining}s "
-                  f"({remaining//3600}h {(remaining%3600)//60}m). "
-                  f"Opens at {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(deadline))}")
+            _fail(
+                f"Claim deadline not yet reached. Wait {remaining}s "
+                f"({remaining // 3600}h {(remaining % 3600) // 60}m). "
+                f"Opens at {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(deadline))}"
+            )
         funding_txid = s["claimed_txid"]
         funding_vout = 0
         funding_photons = s["claimed_photons"]
@@ -565,8 +594,7 @@ async def mode_forfeit() -> None:
     _ok(f"  output photons: {result.output_photons} → {s['maker_rxd_address']}")
 
     async with _ws.connect(RXD_ELECTRUMX_URL) as ws:
-        await ws.send(json.dumps({"id": 5, "method": "blockchain.transaction.broadcast",
-                                  "params": [result.tx_hex]}))
+        await ws.send(json.dumps({"id": 5, "method": "blockchain.transaction.broadcast", "params": [result.tx_hex]}))
         resp = json.loads(await ws.recv())
     if resp.get("error"):
         _fail(f"Broadcast failed: {resp['error']}")
@@ -576,15 +604,17 @@ async def mode_forfeit() -> None:
 
 # ─── Mode: cancel ──────────────────────────────────────────────────────────────
 
+
 async def mode_cancel() -> None:
     """Reclaim a MakerOffer UTXO that was never claimed.
 
     Requires MAKER_RXD_WIF. No deadline — cancel() is gated only by Maker sig.
     Use CANCEL_FEE env var to override the default fee (offer_redeem size × rate).
     """
-    from pyrxd.gravity.types import GravityOffer
-    from pyrxd.gravity.transactions import build_cancel_tx
     import websockets as _ws
+
+    from pyrxd.gravity.transactions import build_cancel_tx
+    from pyrxd.gravity.types import GravityOffer
 
     _hr("Gravity Trade — CANCEL mode")
     s = _load_state()
@@ -611,6 +641,7 @@ async def mode_cancel() -> None:
     if not maker_wif:
         _fail("Set MAKER_RXD_WIF to sign the cancel tx.")
     from pyrxd.security.secrets import PrivateKeyMaterial as _PKM
+
     maker_pk_mat = _PKM.from_wif(maker_wif)
     maker_wif = None
 
@@ -637,8 +668,7 @@ async def mode_cancel() -> None:
     _ok(f"  output photons: {result.output_photons} → {s['maker_rxd_address']}")
 
     async with _ws.connect(RXD_ELECTRUMX_URL) as ws:
-        await ws.send(json.dumps({"id": 5, "method": "blockchain.transaction.broadcast",
-                                  "params": [result.tx_hex]}))
+        await ws.send(json.dumps({"id": 5, "method": "blockchain.transaction.broadcast", "params": [result.tx_hex]}))
         resp = json.loads(await ws.recv())
     if resp.get("error"):
         _fail(f"Broadcast failed: {resp['error']}")
@@ -647,6 +677,7 @@ async def mode_cancel() -> None:
 
 
 # ─── Entry point ───────────────────────────────────────────────────────────────
+
 
 async def run() -> None:
     print()

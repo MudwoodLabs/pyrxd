@@ -1,5 +1,8 @@
-from ..fee_model import FeeModel
+from __future__ import annotations
+
 import math
+
+from ..fee_model import FeeModel
 
 
 class SatoshisPerKilobyte(FeeModel):

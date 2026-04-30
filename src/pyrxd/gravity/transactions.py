@@ -29,7 +29,7 @@ from .codehash import (
 )
 from .types import CancelResult, ClaimResult, FinalizeResult, ForfeitResult, GravityOffer, MakerOfferResult
 
-__all__ = ["build_maker_offer_tx", "build_cancel_tx", "build_claim_tx", "build_finalize_tx", "build_forfeit_tx"]
+__all__ = ["build_cancel_tx", "build_claim_tx", "build_finalize_tx", "build_forfeit_tx", "build_maker_offer_tx"]
 
 # ---------------------------------------------------------------------------
 # Low-level serialization helpers
@@ -51,9 +51,7 @@ def _varint(n: int) -> bytes:
 def _validate_txid(txid: str) -> None:
     """Raise ValidationError if txid is not a 64-char lowercase hex string."""
     if len(txid) != 64:
-        raise ValidationError(
-            f"funding_txid must be 64 hex chars (32 bytes); got {len(txid)} chars"
-        )
+        raise ValidationError(f"funding_txid must be 64 hex chars (32 bytes); got {len(txid)} chars")
     try:
         bytes.fromhex(txid)
     except ValueError as exc:
@@ -163,7 +161,7 @@ def _sign_radiant_p2sh_input(  # nosec B107 -- no hardcoded credentials
       * ``hashOutputs  = hash256(outputs_serialized)``
       * ``hashOutputHashes`` — Radiant-specific per ``_compute_hash_output_hashes``
     """
-    import coincurve  # noqa: PLC0415 -- deferred to keep top-level imports light
+    import coincurve
 
     outpoint = bytes.fromhex(txid)[::-1] + vout.to_bytes(4, "little")
     hash_prevouts = hash256(outpoint)
@@ -202,7 +200,7 @@ def _radiant_address_to_p2pkh_script(address: str) -> bytes:
     Radiant uses the same address encoding as Bitcoin mainnet (version byte 0x00).
     Raises ``ValidationError`` on any decode / checksum / version failure.
     """
-    from pyrxd.base58 import base58check_decode  # noqa: PLC0415
+    from pyrxd.base58 import base58check_decode
 
     try:
         payload = base58check_decode(address)
@@ -233,7 +231,7 @@ def build_maker_offer_tx(
     fee_sats: int,
     maker_privkey: PrivateKeyMaterial,
     change_address: str | None = None,
-) -> "MakerOfferResult":
+) -> MakerOfferResult:
     """Build the Radiant funding tx that deploys a MakerOffer P2SH UTXO.
 
     Spends a plain P2PKH UTXO owned by the Maker and creates a P2SH output
@@ -324,19 +322,13 @@ def build_maker_offer_tx(
 
     # Build outputs
     output_parts: list[bytes] = [
-        offer_photons.to_bytes(8, "little")
-        + _varint(len(offer_p2sh_spk))
-        + offer_p2sh_spk,
+        offer_photons.to_bytes(8, "little") + _varint(len(offer_p2sh_spk)) + offer_p2sh_spk,
     ]
     n_outputs = 1
 
     if change_photons > 0 and change_address:
         change_spk = _radiant_address_to_p2pkh_script(change_address)
-        output_parts.append(
-            change_photons.to_bytes(8, "little")
-            + _varint(len(change_spk))
-            + change_spk
-        )
+        output_parts.append(change_photons.to_bytes(8, "little") + _varint(len(change_spk)) + change_spk)
         n_outputs = 2
 
     outputs_serialized = b"".join(output_parts)
@@ -380,6 +372,7 @@ def build_maker_offer_tx(
     offer_p2sh_addr = compute_p2sh_address_from_redeem(offer_redeem)
 
     from .types import MakerOfferResult
+
     return MakerOfferResult(
         tx_hex=raw_tx.hex(),
         txid=txid,
@@ -412,31 +405,35 @@ def build_cancel_tx(
     if output_photons <= 0:
         raise ValidationError("fee exceeds funding photons")
     maker_spk = _radiant_address_to_p2pkh_script(maker_address)
-    output_bytes = (
-        output_photons.to_bytes(8, "little")
-        + _varint(len(maker_spk))
-        + maker_spk
-    )
+    output_bytes = output_photons.to_bytes(8, "little") + _varint(len(maker_spk)) + maker_spk
     sig_bytes = _sign_radiant_p2sh_input(
-        privkey=maker_privkey, txid=funding_txid, vout=funding_vout,
-        input_value=funding_photons, script_code=offer_redeem,
-        outputs_serialized=output_bytes, sequence=0xFFFFFFFF, locktime=0, version=2,
+        privkey=maker_privkey,
+        txid=funding_txid,
+        vout=funding_vout,
+        input_value=funding_photons,
+        script_code=offer_redeem,
+        outputs_serialized=output_bytes,
+        sequence=0xFFFFFFFF,
+        locktime=0,
+        version=2,
     )
     sig_with_type = sig_bytes + bytes([0x41])
     script_sig = _push_data(sig_with_type) + b"\x00" + _push_data(offer_redeem)
     prevout_hash = bytes.fromhex(funding_txid)[::-1]
     input_bytes = (
-        prevout_hash + funding_vout.to_bytes(4, "little")
-        + _varint(len(script_sig)) + script_sig
+        prevout_hash
+        + funding_vout.to_bytes(4, "little")
+        + _varint(len(script_sig))
+        + script_sig
         + (0xFFFFFFFF).to_bytes(4, "little")
     )
     raw_tx = (
-        (2).to_bytes(4, "little") + _varint(1) + input_bytes
-        + _varint(1) + output_bytes + (0).to_bytes(4, "little")
+        (2).to_bytes(4, "little") + _varint(1) + input_bytes + _varint(1) + output_bytes + (0).to_bytes(4, "little")
     )
     txid = hash256(raw_tx)[::-1].hex()
-    return CancelResult(tx_hex=raw_tx.hex(), txid=txid, tx_size=len(raw_tx),
-                        fee_sats=fee_sats, output_photons=output_photons)
+    return CancelResult(
+        tx_hex=raw_tx.hex(), txid=txid, tx_size=len(raw_tx), fee_sats=fee_sats, output_photons=output_photons
+    )
 
 
 def build_claim_tx(
@@ -507,11 +504,7 @@ def build_claim_tx(
     claimed_p2sh_spk = compute_p2sh_script_pubkey(claimed_redeem)
 
     # Serialize the single output (needed before signing)
-    output_bytes = (
-        output_photons.to_bytes(8, "little")
-        + _varint(len(claimed_p2sh_spk))
-        + claimed_p2sh_spk
-    )
+    output_bytes = output_photons.to_bytes(8, "little") + _varint(len(claimed_p2sh_spk)) + claimed_p2sh_spk
 
     # Sign input 0 using the offer redeem script as scriptCode (legacy P2SH
     # BIP143 style with Radiant's hashOutputHashes extension).
@@ -548,12 +541,12 @@ def build_claim_tx(
     )
 
     raw_tx = (
-        (2).to_bytes(4, "little")           # version
+        (2).to_bytes(4, "little")  # version
         + _varint(1)
-        + input_bytes                        # 1 input
+        + input_bytes  # 1 input
         + _varint(1)
-        + output_bytes                       # 1 output
-        + (0).to_bytes(4, "little")         # locktime
+        + output_bytes  # 1 output
+        + (0).to_bytes(4, "little")  # locktime
     )
 
     txid = hash256(raw_tx)[::-1].hex()
@@ -675,9 +668,7 @@ def build_finalize_tx(
         branch_slots = 20  # default: sentinel-aware flat_12x20 artifact
     real_depth = len(spv_proof.branch) // 33
     if real_depth > branch_slots:
-        raise ValidationError(
-            f"Branch depth {real_depth} exceeds covenant branch_slots={branch_slots}."
-        )
+        raise ValidationError(f"Branch depth {real_depth} exceeds covenant branch_slots={branch_slots}.")
     sentinel_pad = bytes([0x02]) + b"\x00" * 32  # sentinel level: no-op
     padded_branch = spv_proof.branch + sentinel_pad * (branch_slots - real_depth)
 
@@ -686,7 +677,7 @@ def build_finalize_tx(
         script_sig_parts.append(_push_data(header))
     script_sig_parts.append(_push_data(padded_branch))
     script_sig_parts.append(_push_data(spv_proof.raw_tx))
-    script_sig_parts.append(b"\x00")           # OP_0 = selector 0 = finalize()
+    script_sig_parts.append(b"\x00")  # OP_0 = selector 0 = finalize()
     script_sig_parts.append(_push_data(claimed_redeem))
     script_sig = b"".join(script_sig_parts)
 
@@ -699,19 +690,10 @@ def build_finalize_tx(
         + (0xFFFFFFFF).to_bytes(4, "little")
     )
 
-    output_bytes = (
-        output_photons.to_bytes(8, "little")
-        + _varint(len(to_spk))
-        + to_spk
-    )
+    output_bytes = output_photons.to_bytes(8, "little") + _varint(len(to_spk)) + to_spk
 
     raw_tx = (
-        (2).to_bytes(4, "little")
-        + _varint(1)
-        + input_bytes
-        + _varint(1)
-        + output_bytes
-        + (0).to_bytes(4, "little")
+        (2).to_bytes(4, "little") + _varint(1) + input_bytes + _varint(1) + output_bytes + (0).to_bytes(4, "little")
     )
 
     txid = hash256(raw_tx)[::-1].hex()
@@ -793,11 +775,7 @@ def build_forfeit_tx(
         + (0xFFFFFFFE).to_bytes(4, "little")  # sequence for CLTV
     )
 
-    output_bytes = (
-        output_photons.to_bytes(8, "little")
-        + _varint(len(maker_spk))
-        + maker_spk
-    )
+    output_bytes = output_photons.to_bytes(8, "little") + _varint(len(maker_spk)) + maker_spk
 
     # nLockTime = claimDeadline so OP_CHECKLOCKTIMEVERIFY passes
     raw_tx = (

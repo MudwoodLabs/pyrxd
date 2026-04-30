@@ -19,7 +19,7 @@ from __future__ import annotations
 import ctypes
 import hashlib
 import hmac
-from typing import Any, Dict, SupportsIndex
+from typing import Any, SupportsIndex
 
 from .errors import KeyMaterialError
 from .rng import secure_scalar_bytes_mod_n
@@ -32,7 +32,7 @@ _SECP256K1_N: int = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0
 # --------------------------------------------------------------------------- base58check
 # Self-contained implementation so the security module has no heavy deps.
 _B58_ALPHABET: bytes = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_B58_INDEX: Dict[int, int] = {c: i for i, c in enumerate(_B58_ALPHABET)}
+_B58_INDEX: dict[int, int] = {c: i for i, c in enumerate(_B58_ALPHABET)}
 
 
 def _base58_decode(s: str) -> bytes:
@@ -118,10 +118,10 @@ class SecretBytes:
 
     __reduce__ = __reduce_ex__  # type: ignore[assignment]
 
-    def __copy__(self) -> "SecretBytes":
+    def __copy__(self) -> SecretBytes:
         raise TypeError(f"{type(self).__name__} cannot be copied (use explicit construction)")
 
-    def __deepcopy__(self, memo: dict[int, Any]) -> "SecretBytes":
+    def __deepcopy__(self, memo: dict[int, Any]) -> SecretBytes:
         raise TypeError(f"{type(self).__name__} cannot be deep-copied (use explicit construction)")
 
     def __len__(self) -> int:
@@ -165,7 +165,7 @@ class SecretBytes:
 
     # ------------------------------------------------------------------ factories
     @classmethod
-    def from_hex(cls, h: str) -> "SecretBytes":
+    def from_hex(cls, h: str) -> SecretBytes:
         """Construct from a hex string.
 
         The hex string itself is not embedded in any error message — an
@@ -177,7 +177,7 @@ class SecretBytes:
         try:
             data = bytes.fromhex(h)
         except ValueError:
-            raise KeyMaterialError("invalid hex string for SecretBytes") from None  # noqa: B904 -- intentional chain suppression to avoid leaking h in __context__ message
+            raise KeyMaterialError("invalid hex string for SecretBytes") from None
         return cls(data)
 
     # ------------------------------------------------------------------ lifecycle
@@ -186,7 +186,7 @@ class SecretBytes:
         # but costs nothing to attempt.
         try:
             self.zeroize()
-        except Exception:  # noqa: BLE001 -- __del__ must never raise  # nosec B110
+        except Exception:
             pass  # nosec B110
 
 
@@ -220,7 +220,7 @@ class PrivateKeyMaterial(SecretBytes):
 
     # ------------------------------------------------------------------ factories
     @classmethod
-    def from_wif(cls, wif: str) -> "PrivateKeyMaterial":
+    def from_wif(cls, wif: str) -> PrivateKeyMaterial:
         """Decode a WIF-encoded private key.
 
         On failure raises :class:`KeyMaterialError` WITHOUT embedding the
@@ -259,7 +259,7 @@ class PrivateKeyMaterial(SecretBytes):
                     decoded_arr[i] = 0
 
     @classmethod
-    def generate(cls) -> "PrivateKeyMaterial":
+    def generate(cls) -> PrivateKeyMaterial:
         """Generate a fresh random private key using the secure RNG."""
         return cls(secure_scalar_bytes_mod_n())
 

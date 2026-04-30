@@ -7,6 +7,7 @@ Targets (from 2026-04-24 coverage audit):
 - script/__init__.py                   (new public API)
 - pyrxd/__init__.py top-level imports  (new)
 """
+
 from __future__ import annotations
 
 import pytest
@@ -15,41 +16,51 @@ import pytest
 # Top-level pyrxd public API (new __init__.py)
 # ---------------------------------------------------------------------------
 
+
 class TestToplevelImports:
     def test_glyphbuilder_importable_from_pyrxd(self):
         from pyrxd import GlyphBuilder
+
         assert GlyphBuilder is not None
 
     def test_glyphmetadata_importable_from_pyrxd(self):
         from pyrxd import GlyphMetadata
+
         assert GlyphMetadata is not None
 
     def test_glyphprotocol_importable_from_pyrxd(self):
         from pyrxd import GlyphProtocol
+
         assert GlyphProtocol is not None
 
     def test_glyphref_importable_from_pyrxd(self):
         from pyrxd import GlyphRef
+
         assert GlyphRef is not None
 
     def test_gravitytrade_importable_from_pyrxd(self):
         from pyrxd import GravityTrade
+
         assert GravityTrade is not None
 
     def test_privatekey_importable_from_pyrxd(self):
         from pyrxd import PrivateKey
+
         assert PrivateKey is not None
 
     def test_rxdsdkerror_importable_from_pyrxd(self):
         from pyrxd import RxdSdkError
+
         assert issubclass(RxdSdkError, Exception)
 
     def test_validationerror_importable_from_pyrxd(self):
-        from pyrxd import ValidationError, RxdSdkError
+        from pyrxd import RxdSdkError, ValidationError
+
         assert issubclass(ValidationError, RxdSdkError)
 
     def test_version_string_present(self):
         import pyrxd as _pyrxd
+
         # Don't pin the exact version — that brittle assertion broke
         # on every release. Pin the *shape* (PEP 440 — non-empty,
         # starts with a digit) and that the symbol is exported.
@@ -59,6 +70,7 @@ class TestToplevelImports:
 
     def test_all_defines_exported_names(self):
         import pyrxd as _pyrxd
+
         assert hasattr(_pyrxd, "__all__")
         for name in _pyrxd.__all__:
             assert hasattr(_pyrxd, name), f"__all__ lists {name!r} but it's not defined"
@@ -68,38 +80,47 @@ class TestToplevelImports:
 # script/__init__.py — new curated public surface
 # ---------------------------------------------------------------------------
 
+
 class TestScriptPublicAPI:
     def test_script_importable(self):
         from pyrxd.script import Script
+
         s = Script()
         assert s is not None
 
     def test_script_chunk_importable(self):
         from pyrxd.script import ScriptChunk
+
         assert ScriptChunk is not None
 
     def test_p2pkh_importable(self):
         from pyrxd.script import P2PKH
+
         assert P2PKH is not None
 
     def test_p2pk_importable(self):
         from pyrxd.script import P2PK
+
         assert P2PK is not None
 
     def test_op_return_importable(self):
         from pyrxd.script import OpReturn
+
         assert OpReturn is not None
 
     def test_bare_multisig_importable(self):
         from pyrxd.script import BareMultisig
+
         assert BareMultisig is not None
 
     def test_script_template_importable(self):
         from pyrxd.script import ScriptTemplate
+
         assert ScriptTemplate is not None
 
     def test_all_defines_exported_names(self):
         import pyrxd.script as _script_mod
+
         assert hasattr(_script_mod, "__all__")
         for name in _script_mod.__all__:
             assert hasattr(_script_mod, name), f"script.__all__ lists {name!r} but it's not defined"
@@ -109,25 +130,31 @@ class TestScriptPublicAPI:
 # transaction/__init__.py — new curated public surface
 # ---------------------------------------------------------------------------
 
+
 class TestTransactionPublicAPI:
     def test_transaction_importable(self):
         from pyrxd.transaction import Transaction
+
         assert Transaction is not None
 
     def test_transaction_input_importable(self):
         from pyrxd.transaction import TransactionInput
+
         assert TransactionInput is not None
 
     def test_transaction_output_importable(self):
         from pyrxd.transaction import TransactionOutput
+
         assert TransactionOutput is not None
 
     def test_insufficient_funds_importable(self):
         from pyrxd.transaction import InsufficientFunds
+
         assert issubclass(InsufficientFunds, ValueError)
 
     def test_all_defines_exported_names(self):
         import pyrxd.transaction as _tx_mod
+
         assert hasattr(_tx_mod, "__all__")
         for name in _tx_mod.__all__:
             assert hasattr(_tx_mod, name), f"transaction.__all__ lists {name!r} but it's not defined"
@@ -137,11 +164,11 @@ class TestTransactionPublicAPI:
 # fee_models/satoshis_per_kilobyte.py
 # ---------------------------------------------------------------------------
 
+from pyrxd.fee_models.satoshis_per_kilobyte import SatoshisPerKilobyte
 from pyrxd.script.script import Script
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
-from pyrxd.fee_models.satoshis_per_kilobyte import SatoshisPerKilobyte
 
 
 def _make_locking() -> Script:
@@ -229,6 +256,7 @@ class TestSatoshisPerKilobyte:
 # transaction/transaction.py — additional method coverage
 # ---------------------------------------------------------------------------
 
+
 class TestTransactionMethods:
     def _hex_tx(self) -> str:
         return (
@@ -287,10 +315,8 @@ class TestTransactionMethods:
         assert result is None
 
     def test_add_inputs_multiple(self):
-        tx_in1 = TransactionInput(source_txid="aa" * 32, source_output_index=0,
-                                   unlocking_script=Script("00"))
-        tx_in2 = TransactionInput(source_txid="bb" * 32, source_output_index=1,
-                                   unlocking_script=Script("00"))
+        tx_in1 = TransactionInput(source_txid="aa" * 32, source_output_index=0, unlocking_script=Script("00"))
+        tx_in2 = TransactionInput(source_txid="bb" * 32, source_output_index=1, unlocking_script=Script("00"))
         tx = Transaction(tx_inputs=[], tx_outputs=[])
         tx.add_inputs([tx_in1, tx_in2])
         assert len(tx.inputs) == 2

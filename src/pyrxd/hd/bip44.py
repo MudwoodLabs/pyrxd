@@ -1,6 +1,7 @@
-from typing import Union, List
-from .bip32 import Xprv, Xpub, step_to_index, bip32_derive_xprv_from_mnemonic
-from ..constants import Network, BIP44_DERIVATION_PATH
+from __future__ import annotations
+
+from ..constants import BIP44_DERIVATION_PATH, Network
+from .bip32 import Xprv, Xpub, bip32_derive_xprv_from_mnemonic, step_to_index
 
 
 def bip44_derive_xprv_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spec default
@@ -22,15 +23,15 @@ def bip44_derive_xprv_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spe
 
 def bip44_derive_xprvs_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spec default
     mnemonic: str,
-    index_start: Union[str, int],
-    index_end: Union[str, int],
+    index_start: str | int,
+    index_end: str | int,
     lang: str = "en",
     passphrase: str = "",
     prefix: str = "mnemonic",
     path: str = BIP44_DERIVATION_PATH,
-    change: Union[str, int] = 0,
+    change: str | int = 0,
     network: Network = Network.MAINNET,
-) -> List[Xprv]:
+) -> list[Xprv]:
     """
     Derive a range of extended keys from a nmemonic using BIP44 format
     """
@@ -40,8 +41,8 @@ def bip44_derive_xprvs_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 sp
 
 
 def _derive_xkeys_from_xkey(
-    xkey: Union[Xprv, Xpub], index_start: Union[str, int], index_end: Union[str, int], change: Union[str, int] = 0
-) -> List[Union[Xprv, Xpub]]:
+    xkey: Xprv | Xpub, index_start: str | int, index_end: str | int, change: str | int = 0
+) -> list[Xprv | Xpub]:
     """
     this function is internal use only within bip44 module
     """
@@ -51,8 +52,8 @@ def _derive_xkeys_from_xkey(
 
 # [DEPRECATED]
 def derive_xkeys_from_xkey(
-    xkey: Union[Xprv, Xpub], index_start: Union[str, int], index_end: Union[str, int], change: Union[str, int] = 0
-) -> List[Union[Xprv, Xpub]]:
+    xkey: Xprv | Xpub, index_start: str | int, index_end: str | int, change: str | int = 0
+) -> list[Xprv | Xpub]:
     """
     [DEPRECATED] Use bip32_derive_xkeys_from_xkey instead.
       This function name is kept for backward compatibility.
@@ -81,15 +82,15 @@ def derive_xprv_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spec defa
 # [DEPRECATED]
 def derive_xprvs_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spec default
     mnemonic: str,
-    index_start: Union[str, int],
-    index_end: Union[str, int],
+    index_start: str | int,
+    index_end: str | int,
     lang: str = "en",
     passphrase: str = "",
     prefix: str = "mnemonic",
     path: str = BIP44_DERIVATION_PATH,
-    change: Union[str, int] = 0,
+    change: str | int = 0,
     network: Network = Network.MAINNET,
-) -> List[Xprv]:
+) -> list[Xprv]:
     """
     [DEPRECATED] Use bip44_derive_xprvs_from_mnemonic instead.
       This function name is kept for backward compatibility.

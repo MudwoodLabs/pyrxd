@@ -20,7 +20,7 @@ material -- the error message uses a bounded summary (length, redacted tag).
 from __future__ import annotations
 
 import re
-from typing import Any, ClassVar, FrozenSet
+from typing import Any, ClassVar
 
 from .errors import ValidationError
 
@@ -46,16 +46,14 @@ class Txid(str):
 
     __slots__ = ()
 
-    def __new__(cls, value: Any) -> "Txid":
+    def __new__(cls, value: Any) -> Txid:
         if not isinstance(value, str):
             raise ValidationError(f"Txid must be str, got {type(value).__name__}")
         if not _TXID_RE.match(value):
             # The length is not secret, and the pattern is public. We do NOT
             # include the raw value to avoid logging any id-like input that
             # an attacker might probe with.
-            raise ValidationError(
-                f"Txid must be 64 lowercase hex chars (got length {len(value)})"
-            )
+            raise ValidationError(f"Txid must be 64 lowercase hex chars (got length {len(value)})")
         return str.__new__(cls, value)
 
 
@@ -73,25 +71,19 @@ class _FixedBytes(bytes):
     _expected_len: ClassVar[int] = 0
     _name: ClassVar[str] = "_FixedBytes"
 
-    def __new__(cls, value: Any) -> "_FixedBytes":
+    def __new__(cls, value: Any) -> _FixedBytes:
         if not isinstance(value, (bytes, bytearray)):
-            raise ValidationError(
-                f"{cls._name} must be bytes, got {type(value).__name__}"
-            )
+            raise ValidationError(f"{cls._name} must be bytes, got {type(value).__name__}")
         if len(value) != cls._expected_len:
-            raise ValidationError(
-                f"{cls._name} must be {cls._expected_len} bytes, got {len(value)}"
-            )
+            raise ValidationError(f"{cls._name} must be {cls._expected_len} bytes, got {len(value)}")
         return bytes.__new__(cls, bytes(value))
 
     @classmethod
-    def from_hex(cls, value: str) -> "_FixedBytes":
+    def from_hex(cls, value: str) -> _FixedBytes:
         """Construct from a hex string. Strict: rejects 0x prefix, whitespace,
         and wrong length. Use when inputs are human-readable (config, CLI)."""
         if not isinstance(value, str):
-            raise ValidationError(
-                f"{cls._name}.from_hex requires str, got {type(value).__name__}"
-            )
+            raise ValidationError(f"{cls._name}.from_hex requires str, got {type(value).__name__}")
         try:
             raw = bytes.fromhex(value)
         except ValueError as exc:
@@ -128,12 +120,10 @@ class Satoshis(int):
     __slots__ = ()
     MAX: ClassVar[int] = _BTC_MAX_SATS
 
-    def __new__(cls, value: Any) -> "Satoshis":
+    def __new__(cls, value: Any) -> Satoshis:
         # Reject bool (which is an int subclass) and non-int types like float.
         if not isinstance(value, int) or isinstance(value, bool):
-            raise ValidationError(
-                f"Satoshis must be int, got {type(value).__name__}"
-            )
+            raise ValidationError(f"Satoshis must be int, got {type(value).__name__}")
         if value < 0:
             raise ValidationError(f"Satoshis must be >= 0, got {value}")
         if value > _BTC_MAX_SATS:
@@ -146,11 +136,9 @@ class Photons(int):
 
     __slots__ = ()
 
-    def __new__(cls, value: Any) -> "Photons":
+    def __new__(cls, value: Any) -> Photons:
         if not isinstance(value, int) or isinstance(value, bool):
-            raise ValidationError(
-                f"Photons must be int, got {type(value).__name__}"
-            )
+            raise ValidationError(f"Photons must be int, got {type(value).__name__}")
         if value < 0:
             raise ValidationError(f"Photons must be >= 0, got {value}")
         return int.__new__(cls, value)
@@ -167,17 +155,13 @@ class BlockHeight(int):
     __slots__ = ()
     MAX: ClassVar[int] = _BLOCK_HEIGHT_CEIL
 
-    def __new__(cls, value: Any) -> "BlockHeight":
+    def __new__(cls, value: Any) -> BlockHeight:
         if not isinstance(value, int) or isinstance(value, bool):
-            raise ValidationError(
-                f"BlockHeight must be int, got {type(value).__name__}"
-            )
+            raise ValidationError(f"BlockHeight must be int, got {type(value).__name__}")
         if value < 0:
             raise ValidationError(f"BlockHeight must be >= 0, got {value}")
         if value > _BLOCK_HEIGHT_CEIL:
-            raise ValidationError(
-                f"BlockHeight must be <= {_BLOCK_HEIGHT_CEIL}, got {value}"
-            )
+            raise ValidationError(f"BlockHeight must be <= {_BLOCK_HEIGHT_CEIL}, got {value}")
         return int.__new__(cls, value)
 
 
@@ -204,11 +188,9 @@ class Nbits(bytes):
 
     __slots__ = ()
 
-    def __new__(cls, value: Any) -> "Nbits":
+    def __new__(cls, value: Any) -> Nbits:
         if not isinstance(value, (bytes, bytearray)):
-            raise ValidationError(
-                f"Nbits must be bytes, got {type(value).__name__}"
-            )
+            raise ValidationError(f"Nbits must be bytes, got {type(value).__name__}")
         if len(value) != 4:
             raise ValidationError(f"Nbits must be 4 bytes, got {len(value)}")
 
@@ -219,9 +201,7 @@ class Nbits(bytes):
         mantissa = (raw[2] << 16) | (raw[1] << 8) | raw[0]
 
         if exponent > 0x1D:
-            raise ValidationError(
-                f"Nbits exponent {exponent} > 0x1d (would overflow 256-bit target)"
-            )
+            raise ValidationError(f"Nbits exponent {exponent} > 0x1d (would overflow 256-bit target)")
         # Negative-target bit: mantissa bit 23 set.
         if mantissa & 0x00800000:
             raise ValidationError("Nbits mantissa has sign bit set (negative target)")
@@ -249,15 +229,11 @@ class RawTx(bytes):
     __slots__ = ()
     MIN_SIZE: ClassVar[int] = 65  # strictly greater than 64
 
-    def __new__(cls, value: Any) -> "RawTx":
+    def __new__(cls, value: Any) -> RawTx:
         if not isinstance(value, (bytes, bytearray)):
-            raise ValidationError(
-                f"RawTx must be bytes, got {type(value).__name__}"
-            )
+            raise ValidationError(f"RawTx must be bytes, got {type(value).__name__}")
         if len(value) <= 64:
-            raise ValidationError(
-                f"RawTx must be > 64 bytes (Merkle forgery defense), got {len(value)}"
-            )
+            raise ValidationError(f"RawTx must be > 64 bytes (Merkle forgery defense), got {len(value)}")
         return bytes.__new__(cls, bytes(value))
 
 
@@ -265,9 +241,7 @@ class RawTx(bytes):
 
 
 # Allowed sighash flag values for Radiant (BCH/BSV-style FORKID variants).
-_VALID_SIGHASH_FLAGS: FrozenSet[int] = frozenset(
-    {0x41, 0x42, 0x43, 0xC1, 0xC2, 0xC3}
-)
+_VALID_SIGHASH_FLAGS: frozenset[int] = frozenset({0x41, 0x42, 0x43, 0xC1, 0xC2, 0xC3})
 
 
 class SighashFlag(int):
@@ -282,11 +256,9 @@ class SighashFlag(int):
     SIGHASH_NONE_ANYONECANPAY: ClassVar[int] = 0xC2
     SIGHASH_SINGLE_ANYONECANPAY: ClassVar[int] = 0xC3
 
-    def __new__(cls, value: Any) -> "SighashFlag":
+    def __new__(cls, value: Any) -> SighashFlag:
         if not isinstance(value, int) or isinstance(value, bool):
-            raise ValidationError(
-                f"SighashFlag must be int, got {type(value).__name__}"
-            )
+            raise ValidationError(f"SighashFlag must be int, got {type(value).__name__}")
         if value not in _VALID_SIGHASH_FLAGS:
             raise ValidationError(f"Invalid sighash flag: {hex(value)}")
         return int.__new__(cls, value)

@@ -6,6 +6,7 @@ PROVE an existing defence (SDK correctly rejects) assert the expected exception.
 Tests that document a KNOWN LIMITATION (the defence is intentionally out of
 scope for the SDK, e.g. node/consensus responsibility) say so explicitly.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -28,7 +29,6 @@ from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -62,7 +62,7 @@ def _ft_script_for(pkh: bytes, ref: GlyphRef | None = None) -> bytes:
 def _make_utxo(
     ft_amount: int,
     *,
-    txid_byte: int = 0xa0,
+    txid_byte: int = 0xA0,
     vout: int = 0,
     value: int = _DEFAULT_RXD_VALUE,
     owner_pkh: bytes | None = None,
@@ -368,9 +368,7 @@ class TestFtTwoPassSigningStale:
 
         # Reconstruct with identical final outputs; re-sign.
         padding = TransactionOutput(Script(b""), 0)
-        shim_outs = [padding] * utxo.vout + [
-            TransactionOutput(Script(bytes(utxo.ft_script)), utxo.value)
-        ]
+        shim_outs = [padding] * utxo.vout + [TransactionOutput(Script(bytes(utxo.ft_script)), utxo.value)]
         src = Transaction(tx_inputs=[], tx_outputs=shim_outs)
         src.txid = lambda: utxo.txid  # type: ignore[method-assign]
 
@@ -390,10 +388,7 @@ class TestFtTwoPassSigningStale:
         independent = Transaction(tx_inputs=[inp], tx_outputs=outs)
         independent.sign()
 
-        assert (
-            result.tx.inputs[0].unlocking_script.serialize()
-            == independent.inputs[0].unlocking_script.serialize()
-        )
+        assert result.tx.inputs[0].unlocking_script.serialize() == independent.inputs[0].unlocking_script.serialize()
 
     def test_final_sig_differs_from_trial_output_value_sig(self):
         """Strongest version: if we re-sign with the TRIAL output value
@@ -416,9 +411,7 @@ class TestFtTwoPassSigningStale:
         )
 
         padding = TransactionOutput(Script(b""), 0)
-        shim_outs = [padding] * utxo.vout + [
-            TransactionOutput(Script(bytes(utxo.ft_script)), utxo.value)
-        ]
+        shim_outs = [padding] * utxo.vout + [TransactionOutput(Script(bytes(utxo.ft_script)), utxo.value)]
         src = Transaction(tx_inputs=[], tx_outputs=shim_outs)
         src.txid = lambda: utxo.txid  # type: ignore[method-assign]
 
@@ -441,10 +434,9 @@ class TestFtTwoPassSigningStale:
         )
         stale.sign()
 
-        assert (
-            result.tx.inputs[0].unlocking_script.serialize()
-            != stale.inputs[0].unlocking_script.serialize()
-        ), "Final signature matches trial-value signature — the trial sig leaked"
+        assert result.tx.inputs[0].unlocking_script.serialize() != stale.inputs[0].unlocking_script.serialize(), (
+            "Final signature matches trial-value signature — the trial sig leaked"
+        )
 
 
 # ===========================================================================
@@ -525,9 +517,7 @@ class TestNftRefPreservation:
 
     def test_ref_bytes_identical_across_transfer(self):
         input_script = _alice_nft_script(vout=7)
-        result = GlyphBuilder().build_nft_transfer_tx(
-            _nft_transfer_params(nft_script=input_script)
-        )
+        result = GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params(nft_script=input_script))
         assert result.new_nft_script[1:37] == input_script[1:37]
 
     def test_attacker_cannot_swap_ref_mid_transfer(self):
@@ -535,11 +525,8 @@ class TestNftRefPreservation:
         must be equal — no path exists through build_nft_transfer_tx that
         produces a new script with a different ref."""
         input_script = _alice_nft_script(vout=3)
-        result = GlyphBuilder().build_nft_transfer_tx(
-            _nft_transfer_params(nft_script=input_script)
-        )
-        assert extract_ref_from_nft_script(input_script) == \
-               extract_ref_from_nft_script(result.new_nft_script)
+        result = GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params(nft_script=input_script))
+        assert extract_ref_from_nft_script(input_script) == extract_ref_from_nft_script(result.new_nft_script)
         assert extract_ref_from_nft_script(result.new_nft_script) == result.ref
 
 
@@ -550,16 +537,12 @@ class TestNftDustLimit:
         probe = GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params())
         just_under = probe.fee + 545
         with pytest.raises(ValueError, match="dust"):
-            GlyphBuilder().build_nft_transfer_tx(
-                _nft_transfer_params(nft_value=just_under)
-            )
+            GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params(nft_value=just_under))
 
     def test_value_exactly_at_dust_succeeds(self):
         probe = GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params())
         at_dust = probe.fee + 546
-        result = GlyphBuilder().build_nft_transfer_tx(
-            _nft_transfer_params(nft_value=at_dust)
-        )
+        result = GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params(nft_value=at_dust))
         assert result.tx.outputs[0].satoshis == 546
 
 
@@ -589,9 +572,7 @@ class TestNftNonBytesScript:
         """bytearray IS a valid bytes-like input — conversion happens via
         bytes(params.nft_script). Confirm it doesn't spuriously reject."""
         script_ba = bytearray(_alice_nft_script())
-        result = GlyphBuilder().build_nft_transfer_tx(
-            _nft_transfer_params(nft_script=script_ba)
-        )
+        result = GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params(nft_script=script_ba))
         assert len(result.new_nft_script) == 63
 
 
@@ -616,39 +597,47 @@ class TestPrepareRevealHardening:
     # -------- Protocol mismatch
     def test_ft_cbor_with_is_nft_true_rejected(self):
         builder = GlyphBuilder()
-        commit = builder.prepare_commit(CommitParams(
-            metadata=self._ft_metadata(),
-            owner_pkh=Hex20(_alice_pkh()),
-            change_pkh=Hex20(_alice_pkh()),
-            funding_satoshis=1_000_000,
-        ))
-        with pytest.raises(ValidationError, match="protocol field"):
-            builder.prepare_reveal(RevealParams(
-                commit_txid="ab" * 32,
-                commit_vout=0,
-                commit_value=546,
-                cbor_bytes=commit.cbor_bytes,
+        commit = builder.prepare_commit(
+            CommitParams(
+                metadata=self._ft_metadata(),
                 owner_pkh=Hex20(_alice_pkh()),
-                is_nft=True,  # says NFT, CBOR says FT
-            ))
+                change_pkh=Hex20(_alice_pkh()),
+                funding_satoshis=1_000_000,
+            )
+        )
+        with pytest.raises(ValidationError, match="protocol field"):
+            builder.prepare_reveal(
+                RevealParams(
+                    commit_txid="ab" * 32,
+                    commit_vout=0,
+                    commit_value=546,
+                    cbor_bytes=commit.cbor_bytes,
+                    owner_pkh=Hex20(_alice_pkh()),
+                    is_nft=True,  # says NFT, CBOR says FT
+                )
+            )
 
     def test_nft_cbor_with_is_nft_false_rejected(self):
         builder = GlyphBuilder()
-        commit = builder.prepare_commit(CommitParams(
-            metadata=self._nft_metadata(),
-            owner_pkh=Hex20(_alice_pkh()),
-            change_pkh=Hex20(_alice_pkh()),
-            funding_satoshis=1_000_000,
-        ))
-        with pytest.raises(ValidationError, match="protocol field"):
-            builder.prepare_reveal(RevealParams(
-                commit_txid="ab" * 32,
-                commit_vout=0,
-                commit_value=546,
-                cbor_bytes=commit.cbor_bytes,
+        commit = builder.prepare_commit(
+            CommitParams(
+                metadata=self._nft_metadata(),
                 owner_pkh=Hex20(_alice_pkh()),
-                is_nft=False,
-            ))
+                change_pkh=Hex20(_alice_pkh()),
+                funding_satoshis=1_000_000,
+            )
+        )
+        with pytest.raises(ValidationError, match="protocol field"):
+            builder.prepare_reveal(
+                RevealParams(
+                    commit_txid="ab" * 32,
+                    commit_vout=0,
+                    commit_value=546,
+                    cbor_bytes=commit.cbor_bytes,
+                    owner_pkh=Hex20(_alice_pkh()),
+                    is_nft=False,
+                )
+            )
 
     # -------- Malformed CBOR must NOT raise from prepare_reveal
     def test_malformed_cbor_raises_from_prepare_reveal(self):
@@ -657,14 +646,16 @@ class TestPrepareRevealHardening:
         Callers must supply valid CBOR from prepare_commit/encode_payload."""
         builder = GlyphBuilder()
         with pytest.raises(ValidationError, match="Could not parse CBOR"):
-            builder.prepare_reveal(RevealParams(
-                commit_txid="ab" * 32,
-                commit_vout=0,
-                commit_value=546,
-                cbor_bytes=b"not cbor",
-                owner_pkh=Hex20(_alice_pkh()),
-                is_nft=True,
-            ))
+            builder.prepare_reveal(
+                RevealParams(
+                    commit_txid="ab" * 32,
+                    commit_vout=0,
+                    commit_value=546,
+                    cbor_bytes=b"not cbor",
+                    owner_pkh=Hex20(_alice_pkh()),
+                    is_nft=True,
+                )
+            )
 
 
 # ===========================================================================
@@ -713,11 +704,11 @@ class TestScriptEncoding:
         # Layout: 76(OP_DUP) a9(HASH160) 14(push20) <pkh*20> 88(EQVERIFY)
         #         ac(CHECKSIG) bd(DROP) d0(PUSHINPUTREF) <ref*36> <tag*12>
         # Offset 26 is OP_PUSHINPUTREF.
-        assert result.new_ft_script[26] == 0xd0
-        assert result.new_ft_script[26] != 0xd8
+        assert result.new_ft_script[26] == 0xD0
+        assert result.new_ft_script[26] != 0xD8
         # And the change output (when present) likewise.
         assert result.change_ft_script is not None
-        assert result.change_ft_script[26] == 0xd0
+        assert result.change_ft_script[26] == 0xD0
 
     def test_ft_ref_extraction_roundtrip_on_change_script(self):
         """The ref in the change output must round-trip through
@@ -763,6 +754,7 @@ class TestAuditFindings2026:
         """HIGH: ft_amount=1.5 must be rejected — float silently bypasses u.ft_amount < 0 check."""
         from pyrxd.glyph.ft import FtUtxo, FtUtxoSet
         from pyrxd.glyph.script import build_ft_locking_script
+
         ref = _token_ref()
         pkh = Hex20(bytes(range(20)))
         script = build_ft_locking_script(pkh, ref)
@@ -798,13 +790,14 @@ class TestAuditFindings2026:
     def test_extract_owner_pkh_from_ft_script_rejects_corrupted_opcodes(self):
         """HIGH: extract_owner_pkh_from_ft_script must reject 75-byte scripts with wrong opcodes."""
         from pyrxd.glyph.script import extract_owner_pkh_from_ft_script
+
         # Build a valid FT script then corrupt an opcode byte
         ref = _token_ref()
         pkh = Hex20(bytes(range(20)))
         valid = build_ft_locking_script(pkh, ref)
         assert len(valid) == 75
         # Corrupt: replace first opcode (0x76 = OP_DUP) with 0x00
-        corrupted = b'\x00' + valid[1:]
+        corrupted = b"\x00" + valid[1:]
         with pytest.raises(ValidationError, match="Not a valid FT script"):
             extract_owner_pkh_from_ft_script(corrupted)
 
@@ -817,6 +810,7 @@ class TestAuditFindings2026:
         """
         from pyrxd.glyph.ft import FtUtxoSet
         from pyrxd.security.errors import ValidationError
+
         # Directly monkey-patch a manipulated utxo set where ft_in < amount
         # to reach the conservation check.  select() normally prevents this,
         # but if someone subclasses FtUtxoSet incorrectly the guard fires.

@@ -20,10 +20,12 @@ tagged @pytest.mark.unit and always run.  The testmempoolaccept check (6) is
 Run offline only:  pytest tests/test_dmint_deploy_integration.py -m unit
 Run with VPS:      pytest tests/test_dmint_deploy_integration.py -m integration
 """
+
 from __future__ import annotations
 
 import os
 import subprocess
+
 import cbor2
 import pytest
 
@@ -52,7 +54,7 @@ _GLY = b"gly"
 # Both FT and NFT commit scripts are 75 bytes; they differ only at offset 48
 # (OP_1=0x51 for FT, OP_2=0x52 for NFT — the OP_REFTYPE_OUTPUT check byte)
 _COMMIT_SCRIPT_LEN = 75
-_FT_REFTYPE_OFFSET = 48   # byte at this offset is 0x51 (OP_1) for FT, 0x52 (OP_2) for NFT
+_FT_REFTYPE_OFFSET = 48  # byte at this offset is 0x51 (OP_1) for FT, 0x52 (OP_2) for NFT
 # Standard FT locking script (OP_PUSHINPUTREF path) is 75 bytes
 _FT_LOCKING_SCRIPT_LEN = 75
 
@@ -61,18 +63,25 @@ _FT_LOCKING_SCRIPT_LEN = 75
 # Helpers — minimal port of RXinDexer reference decoder (same as cross-decoder test)
 # ---------------------------------------------------------------------------
 
+
 def _parse_chunks(script_bytes: bytes) -> list[dict]:
     chunks, i = [], 0
     while i < len(script_bytes):
-        op = script_bytes[i]; i += 1
+        op = script_bytes[i]
+        i += 1
         if 1 <= op <= 75:
-            chunks.append({"op": op, "buf": script_bytes[i:i+op]}); i += op
+            chunks.append({"op": op, "buf": script_bytes[i : i + op]})
+            i += op
         elif op == 0x4C:
-            n = script_bytes[i]; i += 1
-            chunks.append({"op": op, "buf": script_bytes[i:i+n]}); i += n
+            n = script_bytes[i]
+            i += 1
+            chunks.append({"op": op, "buf": script_bytes[i : i + n]})
+            i += n
         elif op == 0x4D:
-            n = int.from_bytes(script_bytes[i:i+2], "little"); i += 2
-            chunks.append({"op": op, "buf": script_bytes[i:i+n]}); i += n
+            n = int.from_bytes(script_bytes[i : i + 2], "little")
+            i += 2
+            chunks.append({"op": op, "buf": script_bytes[i : i + n]})
+            i += n
         else:
             chunks.append({"op": op, "buf": None})
     return chunks
@@ -91,8 +100,10 @@ def _extract_cbor_from_scriptsig(scriptsig_bytes: bytes) -> bytes | None:
 # Fixture: build the full commit + reveal tx pair offline
 # ---------------------------------------------------------------------------
 
+
 class _DeployBundle:
     """Holds the built commit + reveal tx pair and related metadata."""
+
     commit_tx: Transaction
     reveal_tx: Transaction
     commit_txid: str
@@ -119,19 +130,21 @@ def _build_deploy_bundle(supply: int = _SUPPLY) -> _DeployBundle:
     cbor_bytes, _ = encode_payload(meta)
 
     builder = GlyphBuilder()
-    commit_result = builder.prepare_commit(CommitParams(
-        metadata=meta,
-        owner_pkh=wallet_pkh,
-        change_pkh=wallet_pkh,
-        funding_satoshis=supply + 50_000_000,
-    ))
+    commit_result = builder.prepare_commit(
+        CommitParams(
+            metadata=meta,
+            owner_pkh=wallet_pkh,
+            change_pkh=wallet_pkh,
+            funding_satoshis=supply + 50_000_000,
+        )
+    )
 
     # Build a shim source tx — real tx would come from ElectrumX
-    commit_value = supply + 5_000_000   # supply + overhead
+    commit_value = supply + 5_000_000  # supply + overhead
     funding_value = commit_value + commit_result.estimated_fee + 546
     dummy_txid = "ab" * 32
 
-    p2pkh_script = bytes([0x76, 0xa9, 0x14]) + bytes(wallet_pkh) + bytes([0x88, 0xac])
+    p2pkh_script = bytes([0x76, 0xA9, 0x14]) + bytes(wallet_pkh) + bytes([0x88, 0xAC])
     shim_out = TransactionOutput(Script(p2pkh_script), funding_value)
     src_tx = Transaction(tx_inputs=[], tx_outputs=[shim_out])
     src_tx.txid = lambda: dummy_txid  # type: ignore[method-assign]
@@ -226,6 +239,7 @@ def bundle() -> _DeployBundle:
 # Structural tests (unit — no network required)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.unit
 class TestCommitTx:
     def test_commit_script_is_ft_shape(self, bundle):
@@ -314,14 +328,13 @@ class TestRevealTx:
         scriptsig = reveal_input.unlocking_script.script
         chunks = _parse_chunks(scriptsig)
         sig_push = chunks[0]["buf"] if chunks else None
-        assert sig_push is not None and sig_push[-1] == 0x41, (
-            f"Sighash byte is 0x{sig_push[-1]:02x}, expected 0x41"
-        )
+        assert sig_push is not None and sig_push[-1] == 0x41, f"Sighash byte is 0x{sig_push[-1]:02x}, expected 0x41"
 
 
 # ---------------------------------------------------------------------------
 # testmempoolaccept integration test (requires VPS SSH + funded hot wallet)
 # ---------------------------------------------------------------------------
+
 
 def _build_real_bundle() -> _DeployBundle:
     """Build a commit+reveal pair from a real mainnet UTXO.
@@ -343,22 +356,28 @@ def _build_real_bundle() -> _DeployBundle:
 
     # Fetch UTXOs from VPS node
     result = subprocess.run(
-        ["ssh", "-o", "ConnectTimeout=10", "ericadmin@89.117.20.219",
-         "sudo docker exec radiant-mainnet radiant-cli"
-         + " -datadir=/home/radiant/.radiant listunspent"],
-        capture_output=True, text=True, timeout=30,
+        [
+            "ssh",
+            "-o",
+            "ConnectTimeout=10",
+            "ericadmin@89.117.20.219",
+            "sudo docker exec radiant-mainnet radiant-cli" + " -datadir=/home/radiant/.radiant listunspent",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     assert result.returncode == 0, f"listunspent failed: {result.stderr}"
     utxos = _json.loads(result.stdout)
     # Pick smallest UTXO >= 10M photons
     MIN_PHOTONS = 10_000_000
-    candidates = [u for u in utxos if int(round(u["amount"] * 1e8)) >= MIN_PHOTONS]
+    candidates = [u for u in utxos if round(u["amount"] * 1e8) >= MIN_PHOTONS]
     assert candidates, "No eligible hot wallet UTXO >= 10M photons"
     candidates.sort(key=lambda u: u["amount"])
     u = candidates[0]
     funding_txid = u["txid"]
     funding_vout = u["vout"]
-    funding_photons = int(round(u["amount"] * 1e8))
+    funding_photons = round(u["amount"] * 1e8)
 
     supply = _SUPPLY  # 1M for test
     meta = GlyphMetadata.for_dmint_ft(
@@ -371,18 +390,20 @@ def _build_real_bundle() -> _DeployBundle:
     )
     cbor_bytes, _ = encode_payload(meta)
     builder = GlyphBuilder()
-    commit_result = builder.prepare_commit(CommitParams(
-        metadata=meta,
-        owner_pkh=hot_pkh,
-        change_pkh=hot_pkh,
-        funding_satoshis=funding_photons,
-    ))
+    commit_result = builder.prepare_commit(
+        CommitParams(
+            metadata=meta,
+            owner_pkh=hot_pkh,
+            change_pkh=hot_pkh,
+            funding_satoshis=funding_photons,
+        )
+    )
 
     commit_value = supply + 5_000_000
     change_value = funding_photons - commit_value - commit_result.estimated_fee
     assert change_value > 546, f"change too small: {change_value}"
 
-    p2pkh_script = bytes([0x76, 0xa9, 0x14]) + bytes(hot_pkh) + bytes([0x88, 0xac])
+    p2pkh_script = bytes([0x76, 0xA9, 0x14]) + bytes(hot_pkh) + bytes([0x88, 0xAC])
     shim_out = TransactionOutput(Script(p2pkh_script), funding_photons)
     src_tx = Transaction(tx_inputs=[], tx_outputs=[shim_out])
     src_tx.txid = lambda: funding_txid  # type: ignore[method-assign]
@@ -416,6 +437,7 @@ def _build_real_bundle() -> _DeployBundle:
     )
 
     from pyrxd.script.type import encode_pushdata, to_unlock_script_template
+
     scriptsig_suffix = reveal_scripts.scriptsig_suffix
 
     def _reveal_unlock(tx, input_index):
@@ -488,27 +510,33 @@ class TestTestMempoolAccept:
 
     def _rpc(self, cmd: str) -> str:
         result = subprocess.run(
-            ["ssh", "-o", "ConnectTimeout=10", "ericadmin@89.117.20.219",
-             f"sudo docker exec radiant-mainnet radiant-cli "
-             f"-datadir=/home/radiant/.radiant {cmd}"],
-            capture_output=True, text=True, timeout=30,
+            [
+                "ssh",
+                "-o",
+                "ConnectTimeout=10",
+                "ericadmin@89.117.20.219",
+                f"sudo docker exec radiant-mainnet radiant-cli -datadir=/home/radiant/.radiant {cmd}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
         )
         assert result.returncode == 0, f"RPC failed: {result.stderr}"
         return result.stdout.strip()
 
     def test_commit_tx_accepted_by_mempool(self, real_bundle):
         import json
+
         raw_hex = real_bundle.commit_tx.serialize().hex()
         result = self._rpc(f"testmempoolaccept '[\"{raw_hex}\"]'")
         accepted = json.loads(result)
-        assert accepted[0]["allowed"] is True, (
-            f"commit tx not accepted: {accepted[0].get('reject-reason', 'unknown')}"
-        )
+        assert accepted[0]["allowed"] is True, f"commit tx not accepted: {accepted[0].get('reject-reason', 'unknown')}"
 
     def test_reveal_tx_rejected_without_commit(self, real_bundle):
         # Reveal spends the commit UTXO which isn't on-chain yet — must be rejected.
         # Confirms testmempoolaccept is validating inputs, not accepting blindly.
         import json
+
         raw_hex = real_bundle.reveal_tx.serialize().hex()
         result = self._rpc(f"testmempoolaccept '[\"{raw_hex}\"]'")
         accepted = json.loads(result)

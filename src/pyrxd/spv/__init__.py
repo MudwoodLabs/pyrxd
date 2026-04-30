@@ -8,6 +8,8 @@ incorporates the 12 audit-hardening fixes called out in
 ``docs/audits/05-spv-data-integrity.md``.
 """
 
+from __future__ import annotations
+
 from .chain import verify_chain
 from .merkle import (
     build_branch,
@@ -21,11 +23,11 @@ from .proof import CovenantParams, SpvProof, SpvProofBuilder
 from .witness import strip_witness
 
 __all__ = [
-    "CovenantParams",
     "P2PKH",
     "P2SH",
     "P2TR",
     "P2WPKH",
+    "CovenantParams",
     "SpvProof",
     "SpvProofBuilder",
     "build_branch",

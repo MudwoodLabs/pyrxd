@@ -3,6 +3,7 @@
 Mirrors the shim/mock pattern in ``tests/test_glyph_transfer.py`` so the
 full signing pipeline can be exercised against synthetic UTXOs.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -31,11 +32,11 @@ from pyrxd.transaction.transaction import Transaction
 # ---------------------------------------------------------------------------
 
 _ALICE_KEY_INT = 0x1111111111111111111111111111111111111111111111111111111111111111
-_BOB_PKH = bytes(range(20, 40))         # 20 bytes, distinct from Alice
-_CHARLIE_PKH = bytes(range(40, 60))     # 20 bytes, distinct
+_BOB_PKH = bytes(range(20, 40))  # 20 bytes, distinct from Alice
+_CHARLIE_PKH = bytes(range(40, 60))  # 20 bytes, distinct
 
 # Token's minting ref (synthetic).
-_REF_TXID = "cd" * 32                   # 64 hex chars
+_REF_TXID = "cd" * 32  # 64 hex chars
 _REF_VOUT = 0
 
 # Default RXD value carried on each FT UTXO — plenty for several transfer fees.
@@ -62,7 +63,7 @@ def _ft_script_for(pkh: bytes, ref: GlyphRef | None = None) -> bytes:
 def _make_utxo(
     ft_amount: int,
     *,
-    txid_byte: int = 0xa0,
+    txid_byte: int = 0xA0,
     vout: int = 0,
     value: int = _DEFAULT_RXD_VALUE,
     owner_pkh: bytes | None = None,
@@ -81,6 +82,7 @@ def _make_utxo(
 # ---------------------------------------------------------------------------
 # FtUtxoSet.total / .select
 # ---------------------------------------------------------------------------
+
 
 class TestTotal:
     def test_total_empty(self):
@@ -155,6 +157,7 @@ class TestSelect:
 # Conservation
 # ---------------------------------------------------------------------------
 
+
 class TestConservation:
     def test_exact_amount_no_change(self):
         """Transfer exactly the full input ft_amount — no change output."""
@@ -207,6 +210,7 @@ class TestConservation:
 # Output-script structural invariants
 # ---------------------------------------------------------------------------
 
+
 class TestOutputScripts:
     def test_transfer_output_is_ft_script(self):
         utxo = _make_utxo(100)
@@ -219,7 +223,7 @@ class TestOutputScripts:
         # Classifier passes => script matches the canonical FT layout.
         assert is_ft_script(result.new_ft_script.hex())
         # 0xd0 lives at offset 26 (OP_PUSHINPUTREF) inside the 75-byte layout.
-        assert result.new_ft_script[26] == 0xd0
+        assert result.new_ft_script[26] == 0xD0
         assert len(result.new_ft_script) == 75
 
     def test_change_output_is_ft_script_when_present(self):
@@ -232,7 +236,7 @@ class TestOutputScripts:
         )
         assert result.change_ft_script is not None
         assert is_ft_script(result.change_ft_script.hex())
-        assert result.change_ft_script[26] == 0xd0
+        assert result.change_ft_script[26] == 0xD0
         assert len(result.change_ft_script) == 75
 
     def test_no_change_output_when_exact_amount(self):
@@ -287,6 +291,7 @@ class TestOutputScripts:
 # Ref preservation
 # ---------------------------------------------------------------------------
 
+
 class TestRefPreservation:
     def test_ref_preserved_in_transfer_output(self):
         utxo = _make_utxo(100)
@@ -333,6 +338,7 @@ class TestRefPreservation:
 # ---------------------------------------------------------------------------
 # Fee and RXD accounting
 # ---------------------------------------------------------------------------
+
 
 class TestFee:
     def test_fee_is_positive(self):
@@ -419,6 +425,7 @@ class TestFee:
 # Two-pass signing correctness
 # ---------------------------------------------------------------------------
 
+
 class TestTwoPassSigning:
     def test_final_signature_over_final_outputs(self):
         """Classic two-pass trap: if we leaked the trial signature, it would
@@ -441,9 +448,7 @@ class TestTwoPassSigning:
         # Rebuild an equivalent tx from scratch with the *same* final output
         # values and re-sign. Same preimage ⇒ identical unlocking_script bytes.
         padding = TransactionOutput(Script(b""), 0)
-        shim_outs = [padding] * utxo.vout + [
-            TransactionOutput(Script(bytes(utxo.ft_script)), utxo.value)
-        ]
+        shim_outs = [padding] * utxo.vout + [TransactionOutput(Script(bytes(utxo.ft_script)), utxo.value)]
         src = Transaction(tx_inputs=[], tx_outputs=shim_outs)
         src.txid = lambda: utxo.txid  # type: ignore[method-assign]
 
@@ -469,10 +474,7 @@ class TestTwoPassSigning:
         independent = Transaction(tx_inputs=[inp], tx_outputs=outs)
         independent.sign()
 
-        assert (
-            result.tx.inputs[0].unlocking_script.serialize()
-            == independent.inputs[0].unlocking_script.serialize()
-        )
+        assert result.tx.inputs[0].unlocking_script.serialize() == independent.inputs[0].unlocking_script.serialize()
 
     def test_tx_serializes_cleanly(self):
         utxo = _make_utxo(100)
@@ -490,6 +492,7 @@ class TestTwoPassSigning:
 # ---------------------------------------------------------------------------
 # Multiple-input consolidation & single-input edge cases
 # ---------------------------------------------------------------------------
+
 
 class TestMultipleInputs:
     def test_multiple_inputs_consolidated(self):
@@ -527,6 +530,7 @@ class TestMultipleInputs:
 # ---------------------------------------------------------------------------
 # GlyphBuilder delegation
 # ---------------------------------------------------------------------------
+
 
 class TestGlyphBuilderDelegates:
     def test_build_ft_transfer_tx_returns_ft_transfer_result(self):
@@ -568,6 +572,7 @@ class TestGlyphBuilderDelegates:
 # ---------------------------------------------------------------------------
 # FtTransferParams defaults
 # ---------------------------------------------------------------------------
+
 
 class TestFtTransferParamsDefaults:
     def test_default_fee_rate_is_10_000(self):

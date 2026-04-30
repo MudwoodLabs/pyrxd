@@ -1,5 +1,7 @@
 """Tests for pyrxd.gravity.covenant — artifact loading, param substitution, code hash."""
 
+from __future__ import annotations
+
 import time
 from pathlib import Path
 
@@ -52,6 +54,7 @@ def _base_claimed_params() -> dict:
 # _encode_int_push
 # ---------------------------------------------------------------------------
 
+
 class TestEncodeIntPush:
     def test_zero(self):
         assert _encode_int_push(0) == bytes([0x00])
@@ -63,14 +66,14 @@ class TestEncodeIntPush:
 
     def test_seventeen_uses_pushdata(self):
         result = _encode_int_push(17)
-        assert result[0] == 1          # 1 byte of data
+        assert result[0] == 1  # 1 byte of data
         assert result[1] == 17
 
     def test_large_int(self):
         result = _encode_int_push(100_000)
         assert len(result) > 1
         # Decode: body = result[1:1+result[0]]
-        body = result[1:1 + result[0]]
+        body = result[1 : 1 + result[0]]
         val = int.from_bytes(body, "little")
         assert val == 100_000
 
@@ -82,7 +85,7 @@ class TestEncodeIntPush:
     def test_round_trip_via_bytes(self):
         for n in [0, 1, 16, 17, 127, 128, 255, 256, 65535, 1_000_000]:
             encoded = _encode_int_push(n)
-            encoded[1:1 + encoded[0]] if encoded[0] not in range(0x51, 0x61) else bytes([encoded[0] - 0x50])
+            encoded[1 : 1 + encoded[0]] if encoded[0] not in range(0x51, 0x61) else bytes([encoded[0] - 0x50])
             # Just check no exception and length > 0
             assert len(encoded) >= 1
 
@@ -90,6 +93,7 @@ class TestEncodeIntPush:
 # ---------------------------------------------------------------------------
 # _encode_bytes_push
 # ---------------------------------------------------------------------------
+
 
 class TestEncodeBytesPush:
     def test_20_byte_push(self):
@@ -113,6 +117,7 @@ class TestEncodeBytesPush:
 # ---------------------------------------------------------------------------
 # CovenantArtifact loading
 # ---------------------------------------------------------------------------
+
 
 class TestCovenantArtifactLoad:
     def test_load_claimed_artifact(self):
@@ -161,6 +166,7 @@ class TestCovenantArtifactLoad:
 # CovenantArtifact.substitute
 # ---------------------------------------------------------------------------
 
+
 class TestSubstitute:
     def test_substitute_all_params_produces_bytes(self):
         art = CovenantArtifact.load("maker_covenant_6x12_p2wpkh")
@@ -193,12 +199,14 @@ class TestSubstitute:
         code_hash = compute_p2sh_code_hash(redeem)
 
         offer_art = CovenantArtifact.load("maker_offer")
-        offer_redeem = offer_art.substitute({
-            "makerPk": "02" + "aa" * 32,
-            "takerPk": "02" + "bb" * 32,
-            "totalPhotonsInOutput": 10_000_000,
-            "expectedClaimedCodeHash": code_hash.hex(),
-        })
+        offer_redeem = offer_art.substitute(
+            {
+                "makerPk": "02" + "aa" * 32,
+                "takerPk": "02" + "bb" * 32,
+                "totalPhotonsInOutput": 10_000_000,
+                "expectedClaimedCodeHash": code_hash.hex(),
+            }
+        )
         assert isinstance(offer_redeem, bytes)
         assert len(offer_redeem) > 50
 
@@ -213,6 +221,7 @@ class TestSubstitute:
 # ---------------------------------------------------------------------------
 # Code hash computation
 # ---------------------------------------------------------------------------
+
 
 class TestCodeHash:
     def test_code_hash_is_32_bytes(self):
@@ -234,8 +243,8 @@ class TestCodeHash:
         redeem = art.substitute(_base_claimed_params())
         spk = compute_p2sh_script_pubkey(redeem)
         assert len(spk) == 23
-        assert spk[0] == 0xa9   # OP_HASH160
-        assert spk[1] == 0x14   # PUSH20
+        assert spk[0] == 0xA9  # OP_HASH160
+        assert spk[1] == 0x14  # PUSH20
         assert spk[-1] == 0x87  # OP_EQUAL
 
     def test_p2sh_spk_hash_matches_hash160_of_redeem(self):
@@ -266,6 +275,7 @@ class TestCodeHash:
 # validate_claim_deadline
 # ---------------------------------------------------------------------------
 
+
 class TestValidateClaimDeadline:
     def test_future_deadline_ok(self):
         validate_claim_deadline(_future_deadline(48))  # should not raise
@@ -293,6 +303,7 @@ class TestValidateClaimDeadline:
 # build_gravity_offer
 # ---------------------------------------------------------------------------
 
+
 class TestBuildGravityOffer:
     def _offer_kwargs(self) -> dict:
         return dict(
@@ -314,6 +325,7 @@ class TestBuildGravityOffer:
 
     def test_returns_gravity_offer(self):
         from pyrxd.gravity.types import GravityOffer
+
         offer = build_gravity_offer(**self._offer_kwargs())
         assert isinstance(offer, GravityOffer)
 
@@ -396,12 +408,15 @@ class TestBuildGravityOffer:
     # constructor param" before the "Unfilled placeholders" fallback it
     # was watching for. The production example defaults to the unified
     # artifact, so this path must stay exercised.
-    @pytest.mark.parametrize("artifact_name", [
-        "maker_covenant_flat_6x12_p2wpkh",
-        "maker_covenant_flat_6x13_p2wpkh",
-        "maker_covenant_flat_6x10_11_12_13_14_p2wpkh",
-        "maker_covenant_unified_p2wpkh",
-    ])
+    @pytest.mark.parametrize(
+        "artifact_name",
+        [
+            "maker_covenant_flat_6x12_p2wpkh",
+            "maker_covenant_flat_6x13_p2wpkh",
+            "maker_covenant_flat_6x10_11_12_13_14_p2wpkh",
+            "maker_covenant_unified_p2wpkh",
+        ],
+    )
     def test_flat_artifact_builds_successfully(self, artifact_name):
         kwargs = dict(self._offer_kwargs(), covenant_artifact_name=artifact_name)
         offer = build_gravity_offer(**kwargs)

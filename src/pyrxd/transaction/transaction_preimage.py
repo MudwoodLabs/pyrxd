@@ -1,6 +1,7 @@
+from __future__ import annotations
+
 import struct
 from io import BytesIO
-from typing import List
 
 from ..constants import SIGHASH
 from ..hash import hash256
@@ -10,8 +11,8 @@ from .transaction_output import TransactionOutput
 _ZERO_REF = b"\x00" * 32
 
 
-_OP_PUSHINPUTREF = 0xd0           # OP_PUSHINPUTREF
-_OP_PUSHINPUTREFSINGLETON = 0xd8  # OP_PUSHINPUTREFSINGLETON
+_OP_PUSHINPUTREF = 0xD0  # OP_PUSHINPUTREF
+_OP_PUSHINPUTREFSINGLETON = 0xD8  # OP_PUSHINPUTREFSINGLETON
 
 
 def _get_push_refs(script_bytes: bytes) -> list:
@@ -37,29 +38,32 @@ def _get_push_refs(script_bytes: bytes) -> list:
     while i < n_total:
         op = script_bytes[i]
         i += 1
-        if op == _OP_PUSHINPUTREF or op == _OP_PUSHINPUTREFSINGLETON:
+        if op in (_OP_PUSHINPUTREF, _OP_PUSHINPUTREFSINGLETON):
             if i + 36 > n_total:
                 from pyrxd.security.errors import ValidationError
+
                 raise ValidationError(
-                    f"truncated pushref at offset {i - 1}: expected 36 bytes of ref data, "
-                    f"only {n_total - i} available"
+                    f"truncated pushref at offset {i - 1}: expected 36 bytes of ref data, only {n_total - i} available"
                 )
-            ref = script_bytes[i:i + 36]
+            ref = script_bytes[i : i + 36]
             i += 36
             refs[ref.hex()] = ref
-        elif 0x01 <= op <= 0x4b:
+        elif 0x01 <= op <= 0x4B:
             i += op  # direct push: skip data bytes
-        elif op == 0x4c:  # OP_PUSHDATA1
-            n = script_bytes[i]; i += 1 + n
-        elif op == 0x4d:  # OP_PUSHDATA2
-            n = int.from_bytes(script_bytes[i:i + 2], "little"); i += 2 + n
-        elif op == 0x4e:  # OP_PUSHDATA4
-            n = int.from_bytes(script_bytes[i:i + 4], "little"); i += 4 + n
+        elif op == 0x4C:  # OP_PUSHDATA1
+            n = script_bytes[i]
+            i += 1 + n
+        elif op == 0x4D:  # OP_PUSHDATA2
+            n = int.from_bytes(script_bytes[i : i + 2], "little")
+            i += 2 + n
+        elif op == 0x4E:  # OP_PUSHDATA4
+            n = int.from_bytes(script_bytes[i : i + 4], "little")
+            i += 4 + n
         # else: single-byte opcode, already advanced by 1
     return [refs[k] for k in sorted(refs.keys())]
 
 
-def _compute_hash_output_hashes(outputs: List[TransactionOutput], index: int = None) -> bytes:
+def _compute_hash_output_hashes(outputs: list[TransactionOutput], index: int = None) -> bytes:
     """Radiant-specific hashOutputHashes field in the BIP143 preimage.
 
     For each output (all outputs, or just output[index] for SIGHASH_SINGLE):
@@ -89,13 +93,13 @@ def _compute_hash_output_hashes(outputs: List[TransactionOutput], index: int = N
 
 
 def _preimage(
-        tx_input: TransactionInput,
-        tx_version: int,
-        tx_locktime: int,
-        hash_prevouts: bytes,
-        hash_sequence: bytes,
-        hash_output_hashes: bytes,
-        hash_outputs: bytes,
+    tx_input: TransactionInput,
+    tx_version: int,
+    tx_locktime: int,
+    hash_prevouts: bytes,
+    hash_sequence: bytes,
+    hash_output_hashes: bytes,
+    hash_outputs: bytes,
 ) -> bytes:
     """
     Radiant BIP-143 extension of the sighash preimage.
@@ -117,43 +121,36 @@ def _preimage(
     11. sighash type (4-byte LE)
     """
     stream = BytesIO()
-    stream.write(tx_version.to_bytes(4, "little"))      # 1
-    stream.write(hash_prevouts)                         # 2
-    stream.write(hash_sequence)                         # 3
+    stream.write(tx_version.to_bytes(4, "little"))  # 1
+    stream.write(hash_prevouts)  # 2
+    stream.write(hash_sequence)  # 3
     stream.write(bytes.fromhex(tx_input.source_txid)[::-1])  # 4
     stream.write(tx_input.source_output_index.to_bytes(4, "little"))
     stream.write(tx_input.locking_script.byte_length_varint())  # 5
     stream.write(tx_input.locking_script.serialize())
     stream.write(tx_input.satoshis.to_bytes(8, "little"))  # 6
     stream.write(tx_input.sequence.to_bytes(4, "little"))  # 7
-    stream.write(hash_output_hashes)                    # 8 Radiant extension
-    stream.write(hash_outputs)                          # 9
-    stream.write(tx_locktime.to_bytes(4, "little"))     # 10
+    stream.write(hash_output_hashes)  # 8 Radiant extension
+    stream.write(hash_outputs)  # 9
+    stream.write(tx_locktime.to_bytes(4, "little"))  # 10
     stream.write(tx_input.sighash.to_bytes(4, "little"))  # 11
     return stream.getvalue()
 
 
 def tx_preimages(
-        inputs: List[TransactionInput],
-        outputs: List[TransactionOutput],
-        tx_version: int,
-        tx_locktime: int,
-) -> List[bytes]:
+    inputs: list[TransactionInput],
+    outputs: list[TransactionOutput],
+    tx_version: int,
+    tx_locktime: int,
+) -> list[bytes]:
     """
     :returns: the preimages of unsigned transaction (one per input)
     """
     _hash_prevouts = hash256(
-        b"".join(
-            bytes.fromhex(_in.source_txid)[::-1] + _in.source_output_index.to_bytes(4, "little")
-            for _in in inputs
-        )
+        b"".join(bytes.fromhex(_in.source_txid)[::-1] + _in.source_output_index.to_bytes(4, "little") for _in in inputs)
     )
-    _hash_sequence = hash256(
-        b"".join(_in.sequence.to_bytes(4, "little") for _in in inputs)
-    )
-    _hash_outputs = hash256(
-        b"".join(tx_output.serialize() for tx_output in outputs)
-    )
+    _hash_sequence = hash256(b"".join(_in.sequence.to_bytes(4, "little") for _in in inputs))
+    _hash_outputs = hash256(b"".join(tx_output.serialize() for tx_output in outputs))
     _compute_hash_output_hashes_all = _compute_hash_output_hashes(outputs)
     digests = []
     for i in range(len(inputs)):
@@ -164,11 +161,7 @@ def tx_preimages(
         else:
             hash_prevouts = b"\x00" * 32
         # hash sequence
-        if (
-                not sighash & SIGHASH.ANYONECANPAY
-                and sighash & 0x1F != SIGHASH.SINGLE
-                and sighash & 0x1F != SIGHASH.NONE
-        ):
+        if not sighash & SIGHASH.ANYONECANPAY and sighash & 0x1F != SIGHASH.SINGLE and sighash & 0x1F != SIGHASH.NONE:
             hash_sequence = _hash_sequence
         else:
             hash_sequence = b"\x00" * 32
@@ -183,17 +176,19 @@ def tx_preimages(
             hash_outputs = b"\x00" * 32
             hash_output_hashes = b"\x00" * 32
         digests.append(
-            _preimage(inputs[i], tx_version, tx_locktime, hash_prevouts, hash_sequence, hash_output_hashes, hash_outputs)
+            _preimage(
+                inputs[i], tx_version, tx_locktime, hash_prevouts, hash_sequence, hash_output_hashes, hash_outputs
+            )
         )
     return digests
 
 
 def tx_preimage(
-        input_index: int,
-        inputs: List[TransactionInput],
-        outputs: List[TransactionOutput],
-        tx_version: int,
-        tx_locktime: int,
+    input_index: int,
+    inputs: list[TransactionInput],
+    outputs: list[TransactionOutput],
+    tx_version: int,
+    tx_locktime: int,
 ) -> bytes:
     """Calculates and returns the Radiant BIP143 preimage for a specific input index."""
     sighash = inputs[input_index].sighash
@@ -202,22 +197,15 @@ def tx_preimage(
     if not sighash & SIGHASH.ANYONECANPAY:
         hash_prevouts = hash256(
             b"".join(
-                bytes.fromhex(_in.source_txid)[::-1] + _in.source_output_index.to_bytes(4, "little")
-                for _in in inputs
+                bytes.fromhex(_in.source_txid)[::-1] + _in.source_output_index.to_bytes(4, "little") for _in in inputs
             )
         )
     else:
         hash_prevouts = b"\x00" * 32
 
     # hash sequence
-    if (
-            not sighash & SIGHASH.ANYONECANPAY
-            and sighash & 0x1F != SIGHASH.SINGLE
-            and sighash & 0x1F != SIGHASH.NONE
-    ):
-        hash_sequence = hash256(
-            b"".join(_in.sequence.to_bytes(4, "little") for _in in inputs)
-        )
+    if not sighash & SIGHASH.ANYONECANPAY and sighash & 0x1F != SIGHASH.SINGLE and sighash & 0x1F != SIGHASH.NONE:
+        hash_sequence = hash256(b"".join(_in.sequence.to_bytes(4, "little") for _in in inputs))
     else:
         hash_sequence = b"\x00" * 32
 
@@ -233,6 +221,11 @@ def tx_preimage(
         hash_output_hashes = b"\x00" * 32
 
     return _preimage(
-        inputs[input_index], tx_version, tx_locktime,
-        hash_prevouts, hash_sequence, hash_output_hashes, hash_outputs,
+        inputs[input_index],
+        tx_version,
+        tx_locktime,
+        hash_prevouts,
+        hash_sequence,
+        hash_output_hashes,
+        hash_outputs,
     )

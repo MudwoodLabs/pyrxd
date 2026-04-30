@@ -1,4 +1,5 @@
 """Tests for MUT, CONTAINER, and WAVE GlyphBuilder methods, and updated GlyphInspector."""
+
 from __future__ import annotations
 
 import pytest
@@ -38,9 +39,7 @@ def _cbor(protocol: list[int], name: str = "test") -> bytes:
 
 MUT_CBOR = _cbor([GlyphProtocol.NFT, GlyphProtocol.MUT], "mut-test")
 CONTAINER_CBOR = _cbor([GlyphProtocol.NFT, GlyphProtocol.CONTAINER], "container-test")
-WAVE_CBOR = _cbor(
-    [GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE], "myname.rxd"
-)
+WAVE_CBOR = _cbor([GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.WAVE], "myname.rxd")
 
 BUILDER = GlyphBuilder()
 INSPECTOR = GlyphInspector()
@@ -135,32 +134,22 @@ class TestPrepareContainerReveal:
         assert result.child_ref is None
 
     def test_with_child_ref_yields_100_byte_script(self):
-        result = BUILDER.prepare_container_reveal(
-            TXID, 0, CONTAINER_CBOR, PKH, child_ref=CHILD_REF
-        )
+        result = BUILDER.prepare_container_reveal(TXID, 0, CONTAINER_CBOR, PKH, child_ref=CHILD_REF)
         assert len(result.locking_script) == 100
         assert result.child_ref == CHILD_REF
 
     def test_child_ref_prefix_opcode(self):
-        result = BUILDER.prepare_container_reveal(
-            TXID, 0, CONTAINER_CBOR, PKH, child_ref=CHILD_REF
-        )
+        result = BUILDER.prepare_container_reveal(TXID, 0, CONTAINER_CBOR, PKH, child_ref=CHILD_REF)
         assert result.locking_script[0] == 0xD0  # OP_PUSHINPUTREF (non-singleton)
 
     def test_child_ref_bytes_embedded(self):
-        result = BUILDER.prepare_container_reveal(
-            TXID, 0, CONTAINER_CBOR, PKH, child_ref=CHILD_REF
-        )
+        result = BUILDER.prepare_container_reveal(TXID, 0, CONTAINER_CBOR, PKH, child_ref=CHILD_REF)
         child_wire = CHILD_REF.to_bytes()
         assert result.locking_script[1:37] == child_wire
 
     def test_nft_body_appended_after_child_ref(self):
-        result_no_child = BUILDER.prepare_container_reveal(
-            TXID, 0, CONTAINER_CBOR, PKH
-        )
-        result_with_child = BUILDER.prepare_container_reveal(
-            TXID, 0, CONTAINER_CBOR, PKH, child_ref=CHILD_REF
-        )
+        result_no_child = BUILDER.prepare_container_reveal(TXID, 0, CONTAINER_CBOR, PKH)
+        result_with_child = BUILDER.prepare_container_reveal(TXID, 0, CONTAINER_CBOR, PKH, child_ref=CHILD_REF)
         # NFT body (63 bytes) should be the suffix of the 100-byte script
         assert result_with_child.locking_script[37:] == result_no_child.locking_script
 

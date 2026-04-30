@@ -8,23 +8,24 @@ Final push to reach 85%:
   - hd/bip32.py: some edge case branches
   - network/bitcoin.py: remaining error branches
 """
+
 from __future__ import annotations
 
 import pytest
 
-from pyrxd.security.errors import ValidationError, NetworkError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.utils import (
+    decode_wif,
     deserialize_ecdsa_der,
     serialize_ecdsa_der,
-    unstringify_ecdsa_recoverable,
-    decode_wif,
     to_base58_check,
+    unstringify_ecdsa_recoverable,
 )
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # utils.py — deserialize_ecdsa_der error paths (lines 94-111)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestDeserializeDerErrors:
     def test_wrong_sequence_tag_raises(self):
@@ -34,7 +35,7 @@ class TestDeserializeDerErrors:
     def test_length_mismatch_raises(self):
         # 0x30 tag, then length byte that doesn't match actual length
         with pytest.raises(ValueError, match="length mismatch"):
-            deserialize_ecdsa_der(b"\x30\xFF\x02\x01\x01\x02\x01\x02")
+            deserialize_ecdsa_der(b"\x30\xff\x02\x01\x01\x02\x01\x02")
 
     def test_wrong_r_tag_raises(self):
         # 0x30 + correct length + 0x03 (wrong int tag for r)
@@ -58,11 +59,13 @@ class TestDeserializeDerErrors:
 # utils.py — serialize_ecdsa_der: s high-bit padding branch (line 130)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestSerializeDerSPadding:
     def test_s_with_high_bit_gets_padded(self):
         """s value with top bit set needs a 0x00 padding byte."""
         # Use a known r, and an s with high bit set: 0x80 * anything
         from pyrxd.curve import curve
+
         r = 0x1  # minimal valid r
         s = 0x80_0000_0000_0000_0000_0000_0000_0000_0000  # high bit set, well below n//2
         # Ensure s is not above n//2 (so it won't be negated)
@@ -76,6 +79,7 @@ class TestSerializeDerSPadding:
     def test_low_s_normalization(self):
         """s > n//2 should be normalized to n-s."""
         from pyrxd.curve import curve
+
         n = curve.n
         r = 2
         s = n - 1  # high s, will be normalized
@@ -87,16 +91,19 @@ class TestSerializeDerSPadding:
 # utils.py — unstringify_ecdsa_recoverable (lines 195, 198, 200-203)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestUnstringifyEcdsaRecoverable:
     from base64 import b64encode
 
     def _make_sig_str(self, prefix_byte: int) -> str:
         from base64 import b64encode
+
         payload = bytes([prefix_byte]) + b"\x00" * 64
         return b64encode(payload).decode()
 
     def test_invalid_length_raises(self):
         from base64 import b64encode
+
         bad = b64encode(b"\x1b" * 30).decode()
         with pytest.raises(ValidationError, match="invalid length"):
             unstringify_ecdsa_recoverable(bad)
@@ -120,18 +127,18 @@ class TestUnstringifyEcdsaRecoverable:
     def test_uncompressed_prefix(self):
         # prefix 27 → uncompressed
         sig = self._make_sig_str(27)
-        serialized, compressed = unstringify_ecdsa_recoverable(sig)
+        _serialized, compressed = unstringify_ecdsa_recoverable(sig)
         assert compressed is False
 
     def test_compressed_prefix(self):
         # prefix 31 → compressed (>= 31)
         sig = self._make_sig_str(31)
-        serialized, compressed = unstringify_ecdsa_recoverable(sig)
+        _serialized, compressed = unstringify_ecdsa_recoverable(sig)
         assert compressed is True
 
     def test_compressed_prefix_34(self):
         sig = self._make_sig_str(34)
-        serialized, compressed = unstringify_ecdsa_recoverable(sig)
+        _serialized, compressed = unstringify_ecdsa_recoverable(sig)
         assert compressed is True
 
 
@@ -139,10 +146,12 @@ class TestUnstringifyEcdsaRecoverable:
 # utils.py — decode_wif bad prefix (line 82)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestDecodeWifErrors:
     def test_unknown_prefix_raises(self):
         """A WIF with an unknown prefix should raise ValueError."""
         from pyrxd.base58 import base58check_encode
+
         # Manually encode: prefix 0x00 + 32 bytes
         raw = bytes([0x00]) + b"\xab" * 32
         encoded = base58check_encode(raw)
@@ -153,6 +162,7 @@ class TestDecodeWifErrors:
 # ──────────────────────────────────────────────────────────────────────────────
 # utils.py — to_base58_check with default prefix (lines 385-386)
 # ──────────────────────────────────────────────────────────────────────────────
+
 
 class TestToBase58Check:
     def test_default_prefix_none(self):
@@ -170,16 +180,19 @@ class TestToBase58Check:
 # curve.py — invalid point error paths (lines 42, 49, 58, 60, 73, 82, 90)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestCurveErrors:
     def test_curve_negative_not_on_curve_raises(self):
-        from pyrxd.curve import curve_negative, Point
+        from pyrxd.curve import Point, curve_negative
+
         bad_point = Point(1, 2)  # not on secp256k1
         with pytest.raises(ValidationError):
             curve_negative(bad_point)
 
     def test_curve_add_p_not_on_curve_raises(self):
-        from pyrxd.curve import curve_add, Point
+        from pyrxd.curve import Point, curve_add
         from pyrxd.keys import PrivateKey
+
         bad = Point(1, 2)
         priv = PrivateKey()
         valid_pub = priv.public_key()
@@ -188,8 +201,9 @@ class TestCurveErrors:
             curve_add(bad, valid_point)
 
     def test_curve_add_q_not_on_curve_raises(self):
-        from pyrxd.curve import curve_add, Point
+        from pyrxd.curve import Point, curve_add
         from pyrxd.keys import PrivateKey
+
         bad = Point(1, 2)
         priv = PrivateKey()
         valid_pub = priv.public_key()
@@ -198,7 +212,8 @@ class TestCurveErrors:
             curve_add(valid_point, bad)
 
     def test_curve_multiply_not_on_curve_raises(self):
-        from pyrxd.curve import curve_multiply, Point
+        from pyrxd.curve import Point, curve_multiply
+
         bad = Point(1, 2)
         with pytest.raises(ValidationError):
             curve_multiply(5, bad)
@@ -207,6 +222,7 @@ class TestCurveErrors:
         """p + (-p) should return None (point at infinity)."""
         from pyrxd.curve import curve_add, curve_negative
         from pyrxd.keys import PrivateKey
+
         priv = PrivateKey()
         p = priv.public_key().point()
         neg_p = curve_negative(p)
@@ -217,6 +233,7 @@ class TestCurveErrors:
         """0 + q = q."""
         from pyrxd.curve import curve_add
         from pyrxd.keys import PrivateKey
+
         priv = PrivateKey()
         q = priv.public_key().point()
         result = curve_add(None, q)
@@ -226,6 +243,7 @@ class TestCurveErrors:
         """p + 0 = p."""
         from pyrxd.curve import curve_add
         from pyrxd.keys import PrivateKey
+
         priv = PrivateKey()
         p = priv.public_key().point()
         result = curve_add(p, None)
@@ -235,6 +253,7 @@ class TestCurveErrors:
         """0 * p = point at infinity = None."""
         from pyrxd.curve import curve_multiply
         from pyrxd.keys import PrivateKey
+
         priv = PrivateKey()
         p = priv.public_key().point()
         result = curve_multiply(0, p)
@@ -244,6 +263,7 @@ class TestCurveErrors:
         """Negative scalar: k*p = (-k)*(-p)."""
         from pyrxd.curve import curve_multiply
         from pyrxd.keys import PrivateKey
+
         priv = PrivateKey()
         p = priv.public_key().point()
         result = curve_multiply(-1, p)
@@ -254,14 +274,17 @@ class TestCurveErrors:
 # fee_model.py — FeeModel abstract base (line 15-16)
 # ──────────────────────────────────────────────────────────────────────────────
 
+
 class TestFeeModel:
     def test_abstract_fee_model_cannot_be_instantiated(self):
         from pyrxd.fee_model import FeeModel
+
         with pytest.raises(TypeError):
             FeeModel()  # type: ignore
 
     def test_concrete_fee_model_works(self):
         from pyrxd.fee_model import FeeModel
+
         class MyFeeModel(FeeModel):
             def compute_fee(self, transaction) -> int:
                 return 500
@@ -275,7 +298,9 @@ class TestFeeModel:
 # ──────────────────────────────────────────────────────────────────────────────
 
 import json as _json
-from unittest.mock import AsyncMock as _AsyncMock, MagicMock as _MagicMock, patch as _patch
+from unittest.mock import AsyncMock as _AsyncMock
+from unittest.mock import MagicMock as _MagicMock
+from unittest.mock import patch as _patch
 
 
 def _fake_resp(status, body, content_type="application/json"):
@@ -299,41 +324,42 @@ def _json_resp(data, status=200):
 class TestMempoolSpaceSourceMoreBranches:
     def _src(self):
         from pyrxd.network.bitcoin import MempoolSpaceSource
+
         return MempoolSpaceSource()
 
     @pytest.mark.asyncio
     async def test_get_tip_height_client_error(self):
         """aiohttp.ClientError should become NetworkError."""
         import aiohttp
+
         src = self._src()
         session = _MagicMock()
         session.get = _MagicMock(side_effect=aiohttp.ClientError("down"))
-        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_tip_height()
+        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_tip_height()
 
     @pytest.mark.asyncio
     async def test_get_block_hash_non200_raises(self):
         src = self._src()
         session = _MagicMock()
         session.get = _MagicMock(return_value=_text_resp("error", status=404))
-        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_hash(5)
+        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_hash(5)
 
     @pytest.mark.asyncio
     async def test_get_block_hash_client_error(self):
         import aiohttp
+
         src = self._src()
         session = _MagicMock()
         session.get = _MagicMock(side_effect=aiohttp.ClientError("network error"))
-        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_block_hash(5)
+        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_block_hash(5)
 
     @pytest.mark.asyncio
     async def test_get_block_hash_coerces_plain_height(self):
         from pyrxd.security.types import Hex32
+
         src = self._src()
         hash_hex = "aa" * 32
         session = _MagicMock()
@@ -367,6 +393,7 @@ class TestMempoolSpaceSourceMoreBranches:
 class TestBlockstreamMoreBranches:
     def _src(self):
         from pyrxd.network.bitcoin import BlockstreamSource
+
         return BlockstreamSource()
 
     @pytest.mark.asyncio
@@ -374,18 +401,16 @@ class TestBlockstreamMoreBranches:
         src = self._src()
         session = _MagicMock()
         session.get = _MagicMock(return_value=_text_resp("error", status=503))
-        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_tip_height()
+        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_tip_height()
 
     @pytest.mark.asyncio
     async def test_get_tip_height_bad_body_raises(self):
         src = self._src()
         session = _MagicMock()
         session.get = _MagicMock(return_value=_text_resp("not-a-number"))
-        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_tip_height()
+        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_tip_height()
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_unconfirmed_raises(self):
@@ -393,27 +418,24 @@ class TestBlockstreamMoreBranches:
         status_data = {"confirmed": False}
         session = _MagicMock()
         session.get = _MagicMock(return_value=_json_resp(status_data))
-        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_raw_tx("ab" * 32)
+        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_raw_tx("ab" * 32)
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_non_dict_status_raises(self):
         src = self._src()
         session = _MagicMock()
         session.get = _MagicMock(return_value=_json_resp("not-a-dict"))
-        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_raw_tx("ab" * 32)
+        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_raw_tx("ab" * 32)
 
     @pytest.mark.asyncio
     async def test_get_tx_block_height_non_dict_raises(self):
         src = self._src()
         session = _MagicMock()
         session.get = _MagicMock(return_value=_json_resp("oops"))
-        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)):
-            with pytest.raises(NetworkError):
-                await src.get_tx_block_height("ab" * 32)
+        with _patch.object(src, "_get_session", _AsyncMock(return_value=session)), pytest.raises(NetworkError):
+            await src.get_tx_block_height("ab" * 32)
 
     @pytest.mark.asyncio
     async def test_get_tx_block_height_coerces_str_txid(self):

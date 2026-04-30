@@ -34,18 +34,16 @@ class CovenantParams:
     satisfies.
     """
 
-    btc_receive_hash: bytes   # 20 bytes (p2pkh/p2wpkh/p2sh) or 32 bytes (p2tr)
-    btc_receive_type: str     # one of P2PKH / P2WPKH / P2SH / P2TR
-    btc_satoshis: int         # minimum payment in satoshis, must be > 0
-    chain_anchor: bytes       # 32-byte LE prevHash of h1 (audit 05-F-3)
-    anchor_height: int        # block height of the anchor block
-    merkle_depth: int         # expected Merkle branch depth (audit 05-F-8)
+    btc_receive_hash: bytes  # 20 bytes (p2pkh/p2wpkh/p2sh) or 32 bytes (p2tr)
+    btc_receive_type: str  # one of P2PKH / P2WPKH / P2SH / P2TR
+    btc_satoshis: int  # minimum payment in satoshis, must be > 0
+    chain_anchor: bytes  # 32-byte LE prevHash of h1 (audit 05-F-3)
+    anchor_height: int  # block height of the anchor block
+    merkle_depth: int  # expected Merkle branch depth (audit 05-F-8)
 
     def __post_init__(self) -> None:
         if self.btc_receive_type not in _VALID_RECEIVE_TYPES:
-            raise ValidationError(
-                f"unknown btc_receive_type: {self.btc_receive_type!r}"
-            )
+            raise ValidationError(f"unknown btc_receive_type: {self.btc_receive_type!r}")
         if not isinstance(self.btc_satoshis, int) or isinstance(self.btc_satoshis, bool):
             raise ValidationError("btc_satoshis must be int")
         if self.btc_satoshis <= 0:
@@ -66,9 +64,7 @@ class CovenantParams:
         if not isinstance(self.btc_receive_hash, (bytes, bytearray)):
             raise ValidationError("btc_receive_hash must be bytes")
         if len(self.btc_receive_hash) != expected_hash_len:
-            raise ValidationError(
-                f"{self.btc_receive_type} receive_hash must be {expected_hash_len} bytes"
-            )
+            raise ValidationError(f"{self.btc_receive_type} receive_hash must be {expected_hash_len} bytes")
 
 
 @dataclass(frozen=True)
@@ -81,12 +77,12 @@ class SpvProof:
     proof was built for the right covenant.
     """
 
-    txid: str                    # BE hex display form
-    raw_tx: bytes                # witness-stripped bytes
-    headers: list[bytes]         # N * 80 bytes
-    branch: bytes                # N*33-byte covenant wire format
-    pos: int                     # tx position within the block (>= 1)
-    output_offset: int           # byte offset of payment output in raw_tx
+    txid: str  # BE hex display form
+    raw_tx: bytes  # witness-stripped bytes
+    headers: list[bytes]  # N * 80 bytes
+    branch: bytes  # N*33-byte covenant wire format
+    pos: int  # tx position within the block (>= 1)
+    output_offset: int  # byte offset of payment output in raw_tx
     covenant_params: CovenantParams  # binds proof to a specific covenant
 
     # Private construction guard — must be _BUILDER_TOKEN, supplied only by
@@ -138,9 +134,7 @@ class SpvProofBuilder:
         # Audit 05-F-9: fail fast on coinbase position before any expensive work.
         # (The full check is also re-asserted inside verify_tx_in_block.)
         if pos == 0:
-            raise SpvVerificationError(
-                "pos=0 is the coinbase tx - cannot be used as payment proof"
-            )
+            raise SpvVerificationError("pos=0 is the coinbase tx - cannot be used as payment proof")
         if pos < 0:
             raise ValidationError("pos must be non-negative")
 
@@ -150,9 +144,7 @@ class SpvProofBuilder:
 
         # Audit 02-F-1: 64-byte Merkle forgery defense on the stripped tx.
         if len(stripped) <= 64:
-            raise SpvVerificationError(
-                "stripped raw_tx must be > 64 bytes (Merkle forgery defense)"
-            )
+            raise SpvVerificationError("stripped raw_tx must be > 64 bytes (Merkle forgery defense)")
 
         # Step 2: verify hash256(stripped) == txid.
         computed_txid_le = hash256(stripped)
@@ -178,9 +170,7 @@ class SpvProofBuilder:
                 break
 
         if matching_header is None:
-            raise SpvVerificationError(
-                "tx Merkle root does not match any provided header"
-            )
+            raise SpvVerificationError("tx Merkle root does not match any provided header")
 
         # Run the full inclusion check (also re-asserts coinbase guard, depth
         # binding, and tx<->txid hash match).

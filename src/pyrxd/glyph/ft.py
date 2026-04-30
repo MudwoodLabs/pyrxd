@@ -22,10 +22,11 @@ Design notes
   RXD after fee lands on the transfer output. This keeps the algorithm trivial
   and deterministic — a "smarter" split buys nothing for an FT transfer.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any
 
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
@@ -33,10 +34,9 @@ from pyrxd.security.types import Hex20
 from .script import build_ft_locking_script, extract_ref_from_ft_script
 from .types import GlyphRef
 
-
 # Post-V2 relay minimum — mirrored from builder.py to avoid an import cycle.
 MIN_FEE_RATE: int = 10_000  # photons / byte
-DUST_LIMIT: int = 546       # photons, standard relay dust threshold
+DUST_LIMIT: int = 546  # photons, standard relay dust threshold
 
 
 @dataclass(frozen=True)
@@ -72,7 +72,7 @@ class FtTransferResult:
 
     tx: Any
     new_ft_script: bytes
-    change_ft_script: Optional[bytes]
+    change_ft_script: bytes | None
     ref: GlyphRef
     fee: int
 
@@ -88,7 +88,7 @@ class FtUtxoSet:
       conservation.
     """
 
-    def __init__(self, ref: GlyphRef, utxos: List[FtUtxo]) -> None:
+    def __init__(self, ref: GlyphRef, utxos: list[FtUtxo]) -> None:
         if not isinstance(ref, GlyphRef):
             raise ValidationError("ref must be a GlyphRef")
         if not isinstance(utxos, list):
@@ -97,15 +97,11 @@ class FtUtxoSet:
             if not isinstance(u, FtUtxo):
                 raise ValidationError("utxos must contain FtUtxo instances")
             if not isinstance(u.ft_amount, int) or isinstance(u.ft_amount, bool):
-                raise ValidationError(
-                    f"ft_amount must be int, got {type(u.ft_amount).__name__!r}: {u.ft_amount!r}"
-                )
+                raise ValidationError(f"ft_amount must be int, got {type(u.ft_amount).__name__!r}: {u.ft_amount!r}")
             if u.ft_amount < 0:
                 raise ValidationError("ft_amount must be >= 0")
             if not isinstance(u.value, int) or isinstance(u.value, bool):
-                raise ValidationError(
-                    f"value must be int, got {type(u.value).__name__!r}: {u.value!r}"
-                )
+                raise ValidationError(f"value must be int, got {type(u.value).__name__!r}: {u.value!r}")
             if u.value < 0:
                 raise ValidationError("value must be >= 0")
         self.ref = ref
@@ -117,7 +113,7 @@ class FtUtxoSet:
         """Return the sum of ``ft_amount`` across all UTXOs in the set."""
         return sum(u.ft_amount for u in self.utxos)
 
-    def select(self, amount: int) -> List[FtUtxo]:
+    def select(self, amount: int) -> list[FtUtxo]:
         """Greedily select the minimum number of UTXOs covering ``amount``.
 
         Strategy: sort by ``ft_amount`` descending, take until covered.
@@ -128,13 +124,11 @@ class FtUtxoSet:
         if amount <= 0:
             raise ValueError(f"amount must be > 0, got {amount}")
         if self.total() < amount:
-            raise ValueError(
-                f"Insufficient FT balance: requested {amount}, have {self.total()}"
-            )
+            raise ValueError(f"Insufficient FT balance: requested {amount}, have {self.total()}")
 
         # Descending by ft_amount, then by value as a stable tiebreaker.
         sorted_utxos = sorted(self.utxos, key=lambda u: (-u.ft_amount, -u.value))
-        selected: List[FtUtxo] = []
+        selected: list[FtUtxo] = []
         running = 0
         for u in sorted_utxos:
             selected.append(u)
@@ -151,7 +145,7 @@ class FtUtxoSet:
         new_owner_pkh: Hex20,
         private_key: Any,
         fee_rate: int = MIN_FEE_RATE,
-        change_pkh: Optional[Hex20] = None,
+        change_pkh: Hex20 | None = None,
         dust_limit: int = DUST_LIMIT,
     ) -> FtTransferResult:
         """Build a signed FT transfer transaction enforcing conservation.
@@ -229,7 +223,7 @@ class FtUtxoSet:
 
         # 5. Build output locking scripts.
         new_ft_script = build_ft_locking_script(new_owner_pkh, self.ref)
-        change_ft_script: Optional[bytes] = None
+        change_ft_script: bytes | None = None
         if ft_change > 0:
             change_ft_script = build_ft_locking_script(sender_pkh, self.ref)
 
@@ -241,18 +235,16 @@ class FtUtxoSet:
         # epilogue — see build_ft_locking_script).
         unlocking_template = P2PKH().unlock(private_key)
 
-        def _make_inputs() -> List["TransactionInput"]:
+        def _make_inputs() -> list[TransactionInput]:
             """Factory: fresh TransactionInput list for each signing pass.
 
             Reusing inputs across passes would preserve the trial signature
             and mis-commit the final tx (see build_nft_transfer_tx docstring).
             """
-            inputs: List[TransactionInput] = []
+            inputs: list[TransactionInput] = []
             for u in selected:
                 padding_output = TransactionOutput(Script(b""), 0)
-                shim_outputs = [padding_output] * u.vout + [
-                    TransactionOutput(Script(bytes(u.ft_script)), u.value)
-                ]
+                shim_outputs = [padding_output] * u.vout + [TransactionOutput(Script(bytes(u.ft_script)), u.value)]
                 src = Transaction(tx_inputs=[], tx_outputs=shim_outputs)
                 # Pin the shim's txid to the real UTXO txid so the preimage
                 # hashes commit to the real outpoint, not the shim's hash.
@@ -268,7 +260,7 @@ class FtUtxoSet:
                 inputs.append(inp)
             return inputs
 
-        def _make_outputs(transfer_value: int, change_value: Optional[int]):
+        def _make_outputs(transfer_value: int, change_value: int | None):
             outs = [TransactionOutput(Script(new_ft_script), transfer_value)]
             if change_value is not None:
                 if change_ft_script is None:

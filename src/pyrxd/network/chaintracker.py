@@ -6,6 +6,7 @@ Usage
     tracker = ChainTracker(source)
     valid = await tracker.is_valid_root(merkle_root_bytes, block_height)
 """
+
 from __future__ import annotations
 
 from ..security.types import BlockHeight, Hex32

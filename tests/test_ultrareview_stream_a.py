@@ -4,6 +4,7 @@ Each test corresponds to a finding from the eight-reviewer ultrareview at
 docs/ultrareview-2026-04-25.md. These pin the fixes so future refactors
 cannot reintroduce the bug class.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -14,7 +15,6 @@ from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction_preimage import _get_push_refs
 from pyrxd.utils import deserialize_ecdsa_der, serialize_ecdsa_der
-
 
 # ---------------------------------------------------------------------------
 # DER signature parser strictness (code-quality finding #1, critical)
@@ -27,8 +27,10 @@ class TestDerStrict:
         for r, s in [
             (1, 1),
             (0xFFFF, 0x7FFF),
-            (0x80000000_00000000_00000000_00000000_00000000_00000000_00000000_00000001,
-             0x40000000_00000000_00000000_00000000_00000000_00000000_00000000_00000001),
+            (
+                0x80000000_00000000_00000000_00000000_00000000_00000000_00000000_00000001,
+                0x40000000_00000000_00000000_00000000_00000000_00000000_00000000_00000001,
+            ),
         ]:
             sig = serialize_ecdsa_der((r, s))
             assert deserialize_ecdsa_der(sig) == (r, s)
@@ -38,7 +40,7 @@ class TestDerStrict:
         total-length now fails strict r_len + s_len + 6 == len() check."""
         sig = serialize_ecdsa_der((0xAA, 0xBB))
         # Append junk bytes — total_len byte still says original length
-        tampered = sig + b'\xCC\xDD'
+        tampered = sig + b"\xcc\xdd"
         with pytest.raises(ValueError, match="DER length mismatch"):
             deserialize_ecdsa_der(tampered)
 
@@ -88,12 +90,12 @@ class TestGetPushRefsTruncation:
         """A pushref opcode followed by fewer than 36 bytes is malformed
         and must raise rather than silently produce a short ref entry."""
         # OP_PUSHINPUTREFSINGLETON (0xd8) with only 10 bytes of "ref" data
-        truncated = bytes([0xd8]) + bytes(10)
+        truncated = bytes([0xD8]) + bytes(10)
         with pytest.raises(ValidationError, match="truncated pushref"):
             _get_push_refs(truncated)
 
     def test_truncated_pushref_normal_raises(self):
-        truncated = bytes([0xd0]) + bytes(35)  # one byte short
+        truncated = bytes([0xD0]) + bytes(35)  # one byte short
         with pytest.raises(ValidationError, match="truncated pushref"):
             _get_push_refs(truncated)
 
@@ -101,7 +103,7 @@ class TestGetPushRefsTruncation:
         """Sort + dedup is consensus-required (matches radiantjs and the
         mainnet-verified vector at tests/test_preimage.py). Pin it here."""
         ref = bytes(range(36))
-        script = bytes([0xd8]) + ref + bytes([0xd8]) + ref
+        script = bytes([0xD8]) + ref + bytes([0xD8]) + ref
         assert len(_get_push_refs(script)) == 1
 
     def test_count_invariant_matches_unique_pushref_count(self):
@@ -116,7 +118,7 @@ class TestGetPushRefsTruncation:
         # Build script with 3 copies of each ref, in shuffled order
         script = b""
         for r in refs * 3:
-            script += bytes([0xd0]) + r
+            script += bytes([0xD0]) + r
         result = _get_push_refs(script)
         assert len(result) == 5  # 5 distinct refs, dedup applied
         # Sort order is by hex(); 0x01... sorts before 0x02... etc.
@@ -205,6 +207,7 @@ class TestCborCanonical:
         # Decode and re-encode via cbor2 with canonical=True; should be
         # identical (idempotent canonical encoding).
         import cbor2
+
         d = cbor2.loads(cbor_bytes)
         re_encoded = cbor2.dumps(d, canonical=True)
         assert cbor_bytes == re_encoded
@@ -239,7 +242,9 @@ class TestTransactionFeeRemainder:
         )
         change_outputs = [
             TransactionOutput(
-                Script(b"\x76\xa9\x14" + b"\xaa" * 20 + b"\x88\xac"), 0, change=True,
+                Script(b"\x76\xa9\x14" + b"\xaa" * 20 + b"\x88\xac"),
+                0,
+                change=True,
             )
             for _ in range(n_change)
         ]
@@ -252,7 +257,7 @@ class TestTransactionFeeRemainder:
         change_outs = [out for out in tx.outputs if out.change]
         amounts = [out.satoshis for out in change_outs]
         assert sum(amounts) == 10
-        assert amounts == [4, 3, 3]   # first gets the remainder
+        assert amounts == [4, 3, 3]  # first gets the remainder
 
     def test_exact_division_unchanged(self):
         """change=9, change_count=3 → outputs [3, 3, 3] — no remainder."""

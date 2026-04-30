@@ -4,6 +4,7 @@ Targets (from 2026-04-24 coverage report):
 - merkle_path.py        (59% → target ≥ 80%)
 - network/electrumx.py  (73% → target ≥ 85%)
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -17,10 +18,10 @@ from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord, _coerce_hex32
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Hex32, Txid
 
-
 # ---------------------------------------------------------------------------
 # Helpers — build minimal MerklePaths for testing
 # ---------------------------------------------------------------------------
+
 
 def _leaf_hash(n: int) -> str:
     """Return a deterministic 64-char hex string suitable for a hash field."""
@@ -57,6 +58,7 @@ def _duplicate_path(block_height: int = 1000) -> MerklePath:
 # MerklePath — construction
 # ---------------------------------------------------------------------------
 
+
 class TestMerklePathConstruction:
     def test_simple_path(self):
         mp = _simple_path()
@@ -85,6 +87,7 @@ class TestMerklePathConstruction:
 # ---------------------------------------------------------------------------
 # MerklePath — to_binary / from_binary / to_hex / from_hex roundtrip
 # ---------------------------------------------------------------------------
+
 
 class TestMerklePathSerialization:
     def test_to_from_binary_roundtrip(self):
@@ -121,6 +124,7 @@ class TestMerklePathSerialization:
 # MerklePath — compute_root
 # ---------------------------------------------------------------------------
 
+
 class TestMerklePathComputeRoot:
     def test_compute_root_with_txid(self):
         mp = _simple_path()
@@ -155,6 +159,7 @@ class TestMerklePathComputeRoot:
 # ---------------------------------------------------------------------------
 # MerklePath — combine
 # ---------------------------------------------------------------------------
+
 
 class TestMerklePathCombine:
     def _twin_paths(self):
@@ -208,6 +213,7 @@ class TestMerklePathCombine:
 # MerklePath — trim
 # ---------------------------------------------------------------------------
 
+
 class TestMerklePathTrim:
     def test_trim_does_not_raise(self):
         mp, _ = TestMerklePathCombine()._twin_paths()
@@ -226,6 +232,7 @@ class TestMerklePathTrim:
 # MerklePath — find_or_compute_leaf
 # ---------------------------------------------------------------------------
 
+
 class TestFindOrComputeLeaf:
     def test_find_existing_leaf(self):
         mp = _simple_path()
@@ -243,6 +250,7 @@ class TestFindOrComputeLeaf:
 # ---------------------------------------------------------------------------
 # MerklePath — verify (async, mocked chain tracker)
 # ---------------------------------------------------------------------------
+
 
 class TestMerklePathVerify:
     @pytest.mark.asyncio
@@ -274,6 +282,7 @@ class TestMerklePathVerify:
 # _coerce_hex32
 # ---------------------------------------------------------------------------
 
+
 class TestCoerceHex32:
     def test_passthrough_hex32(self):
         h = Hex32(bytes.fromhex("ab" * 32))
@@ -302,6 +311,7 @@ class TestCoerceHex32:
 # ElectrumXClient — construction
 # ---------------------------------------------------------------------------
 
+
 class TestElectrumXClientConstruction:
     def test_empty_urls_raises(self):
         with pytest.raises(ValidationError, match="at least one"):
@@ -329,7 +339,7 @@ class TestElectrumXClientConstruction:
 # ---------------------------------------------------------------------------
 
 TXID_STR = "ab" * 32
-RAW_TX_HEX = "aa" * 65   # must be > 64 bytes for RawTx
+RAW_TX_HEX = "aa" * 65  # must be > 64 bytes for RawTx
 
 
 class TestElectrumXClientAPI:
@@ -488,6 +498,7 @@ class TestElectrumXClientAPI:
 # ---------------------------------------------------------------------------
 # ElectrumXClient — _call internals (response parsing)
 # ---------------------------------------------------------------------------
+
 
 class TestElectrumXCallParsing:
     def _client(self) -> ElectrumXClient:

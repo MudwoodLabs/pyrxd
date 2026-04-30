@@ -5,6 +5,7 @@
 ``pyrxd.wallet.ElectrumXClient`` with an ``AsyncMock`` so no websocket is
 opened.
 """
+
 from __future__ import annotations
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -92,9 +93,7 @@ class TestConstruction:
 
 
 class TestBuildSendTx:
-    def test_two_outputs_recipient_and_change(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_two_outputs_recipient_and_change(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         tx = wallet.build_send_tx(utxos, recipient_address, 5_000_000)
         assert len(tx.outputs) == 2
@@ -104,17 +103,13 @@ class TestBuildSendTx:
         # Output 1 is the change back to self.
         assert tx.outputs[1].locking_script == P2PKH().lock(wallet.address)
 
-    def test_change_goes_back_to_self(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_change_goes_back_to_self(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         tx = wallet.build_send_tx(utxos, recipient_address, 1_000_000)
         change_out = tx.outputs[1]
         assert change_out.locking_script == P2PKH().lock(wallet.address)
 
-    def test_fee_deducted_from_change(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_fee_deducted_from_change(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         tx = wallet.build_send_tx(utxos, recipient_address, 1_000_000)
         # total_in - total_out == fee paid
@@ -124,53 +119,39 @@ class TestBuildSendTx:
         # dropped or trial/final sizes differ by a byte).
         assert tx.get_fee() >= tx.byte_length() * wallet.fee_rate - 1_000
 
-    def test_insufficient_funds_raises(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_insufficient_funds_raises(self, wallet: RxdWallet, recipient_address: str) -> None:
         # 1M sats can't cover a 5M-photon send at any fee rate.
         utxos = [_utxo("aa" * 32, 0, 1_000_000)]
         with pytest.raises(ValidationError, match="Insufficient"):
             wallet.build_send_tx(utxos, recipient_address, 5_000_000)
 
-    def test_insufficient_funds_after_fee_raises(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_insufficient_funds_after_fee_raises(self, wallet: RxdWallet, recipient_address: str) -> None:
         # Enough to cover requested amount but not fee.
         # 225-byte tx * 10k fee_rate = 2.25M fee. Request 1M with exactly 1M in.
         utxos = [_utxo("aa" * 32, 0, 1_000_000)]
         with pytest.raises(ValidationError, match="Insufficient"):
             wallet.build_send_tx(utxos, recipient_address, 1_000_000)
 
-    def test_empty_utxo_list_raises(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_empty_utxo_list_raises(self, wallet: RxdWallet, recipient_address: str) -> None:
         with pytest.raises(ValidationError, match="Insufficient"):
             wallet.build_send_tx([], recipient_address, 1_000)
 
-    def test_zero_value_raises(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_zero_value_raises(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         with pytest.raises(ValidationError):
             wallet.build_send_tx(utxos, recipient_address, 0)
 
-    def test_negative_value_raises(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_negative_value_raises(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         with pytest.raises(ValidationError):
             wallet.build_send_tx(utxos, recipient_address, -100)
 
-    def test_dust_value_raises(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_dust_value_raises(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         with pytest.raises(ValidationError, match="dust"):
             wallet.build_send_tx(utxos, recipient_address, DUST_THRESHOLD - 1)
 
-    def test_dust_threshold_exactly_allowed(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_dust_threshold_exactly_allowed(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         tx = wallet.build_send_tx(utxos, recipient_address, DUST_THRESHOLD)
         assert tx.outputs[0].satoshis == DUST_THRESHOLD
@@ -180,9 +161,7 @@ class TestBuildSendTx:
         with pytest.raises(ValidationError, match="valid P2PKH"):
             wallet.build_send_tx(utxos, "not-an-address", 100_000)
 
-    def test_utxo_selection_picks_largest_first(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_utxo_selection_picks_largest_first(self, wallet: RxdWallet, recipient_address: str) -> None:
         """A single large UTXO should cover the amount — smaller ones are skipped."""
         utxos = [
             _utxo("aa" * 32, 0, 500_000),
@@ -195,9 +174,7 @@ class TestBuildSendTx:
         # The selected input is the 20M UTXO ("cc").
         assert tx.inputs[0].source_txid == "cc" * 32
 
-    def test_utxo_selection_accumulates_when_needed(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_utxo_selection_accumulates_when_needed(self, wallet: RxdWallet, recipient_address: str) -> None:
         """When no single UTXO suffices, multiple are combined."""
         # A 1-input tx costs ~2.25M fee at 10k/byte; adding inputs adds ~1.5M
         # each. Make each UTXO < 3M so a single input can't cover 3M + fee.
@@ -212,9 +189,7 @@ class TestBuildSendTx:
         assert len(tx.inputs) >= 2
         assert sum(int(inp.satoshis) for inp in tx.inputs) >= 3_000_000
 
-    def test_signing_is_fresh_not_trial(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_signing_is_fresh_not_trial(self, wallet: RxdWallet, recipient_address: str) -> None:
         """Final signature must commit to the FINAL outputs, not the trial outputs.
 
         The two-pass flow must reset ``unlocking_script`` between passes; see
@@ -229,9 +204,7 @@ class TestBuildSendTx:
         sig_b = tx2.inputs[0].unlocking_script.serialize()
         assert sig_a != sig_b
 
-    def test_build_send_tx_is_offline(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_build_send_tx_is_offline(self, wallet: RxdWallet, recipient_address: str) -> None:
         """build_send_tx must never open a websocket."""
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         with patch("pyrxd.wallet.ElectrumXClient") as client_cls:
@@ -243,17 +216,13 @@ class TestBuildSendTx:
 
 
 class TestBuildSendMaxTx:
-    def test_single_output_no_change(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_single_output_no_change(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         tx = wallet.build_send_max_tx(utxos, recipient_address)
         assert len(tx.outputs) == 1
         assert tx.outputs[0].locking_script == P2PKH().lock(recipient_address)
 
-    def test_output_value_is_total_minus_fee(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_output_value_is_total_minus_fee(self, wallet: RxdWallet, recipient_address: str) -> None:
         # Fee at 10k/byte for a 2-input 1-output tx is ~3.4M; use ample UTXOs.
         utxos = [
             _utxo("aa" * 32, 0, 5_000_000),
@@ -263,17 +232,13 @@ class TestBuildSendMaxTx:
         total_in = 10_000_000
         assert tx.outputs[0].satoshis == total_in - tx.get_fee()
 
-    def test_send_max_insufficient_funds(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_send_max_insufficient_funds(self, wallet: RxdWallet, recipient_address: str) -> None:
         # 1k photons total can't cover any fee.
         utxos = [_utxo("aa" * 32, 0, 1_000)]
         with pytest.raises(ValidationError):
             wallet.build_send_max_tx(utxos, recipient_address)
 
-    def test_send_max_empty_utxos(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    def test_send_max_empty_utxos(self, wallet: RxdWallet, recipient_address: str) -> None:
         with pytest.raises(ValidationError, match="Insufficient"):
             wallet.build_send_max_tx([], recipient_address)
 
@@ -301,9 +266,7 @@ def _fake_client(returns: dict) -> MagicMock:
 
 
 class TestNetworkHelpers:
-    async def test_get_balance_uses_reversed_script_hash(
-        self, wallet: RxdWallet
-    ) -> None:
+    async def test_get_balance_uses_reversed_script_hash(self, wallet: RxdWallet) -> None:
         client = _fake_client({"get_balance": (Satoshis(12_345), Satoshis(678))})
 
         with patch("pyrxd.wallet.ElectrumXClient", return_value=client) as client_cls:
@@ -312,7 +275,7 @@ class TestNetworkHelpers:
         assert conf == 12_345
         assert unconf == 678
         # Client was constructed with [url].
-        args, kwargs = client_cls.call_args
+        args, _kwargs = client_cls.call_args
         assert args[0] == ["wss://electrumx.example.com"]
         # get_balance was called with Hex32(reversed sha256(locking_script)).
         client.get_balance.assert_awaited_once()
@@ -321,9 +284,7 @@ class TestNetworkHelpers:
         assert bytes(passed_hash) == expected
         assert isinstance(passed_hash, Hex32)
 
-    async def test_get_utxos_calls_client_with_script_hash(
-        self, wallet: RxdWallet
-    ) -> None:
+    async def test_get_utxos_calls_client_with_script_hash(self, wallet: RxdWallet) -> None:
         fake_utxos = [_utxo("aa" * 32, 0, 500)]
         client = _fake_client({"get_utxos": fake_utxos})
         with patch("pyrxd.wallet.ElectrumXClient", return_value=client):
@@ -335,9 +296,7 @@ class TestNetworkHelpers:
 
 
 class TestSend:
-    async def test_send_builds_and_broadcasts(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    async def test_send_builds_and_broadcasts(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         client = _fake_client(
             {
@@ -358,19 +317,14 @@ class TestSend:
         assert len(decoded.outputs) == 2
         assert decoded.outputs[0].satoshis == 1_000_000
 
-    async def test_send_insufficient_funds_does_not_broadcast(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    async def test_send_insufficient_funds_does_not_broadcast(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 1_000)]
         client = _fake_client({"get_utxos": utxos, "broadcast": Txid("bb" * 32)})
-        with patch("pyrxd.wallet.ElectrumXClient", return_value=client):
-            with pytest.raises(ValidationError):
-                await wallet.send(recipient_address, 1_000_000)
+        with patch("pyrxd.wallet.ElectrumXClient", return_value=client), pytest.raises(ValidationError):
+            await wallet.send(recipient_address, 1_000_000)
         client.broadcast.assert_not_called()
 
-    async def test_send_max_broadcasts_single_output_tx(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    async def test_send_max_broadcasts_single_output_tx(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         client = _fake_client(
             {
@@ -387,12 +341,9 @@ class TestSend:
         assert decoded is not None
         assert len(decoded.outputs) == 1
 
-    async def test_send_network_error_propagates(
-        self, wallet: RxdWallet, recipient_address: str
-    ) -> None:
+    async def test_send_network_error_propagates(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
         client = _fake_client({"get_utxos": utxos})
         client.broadcast = AsyncMock(side_effect=NetworkError("broadcast failed"))
-        with patch("pyrxd.wallet.ElectrumXClient", return_value=client):
-            with pytest.raises(NetworkError):
-                await wallet.send(recipient_address, 1_000_000)
+        with patch("pyrxd.wallet.ElectrumXClient", return_value=client), pytest.raises(NetworkError):
+            await wallet.send(recipient_address, 1_000_000)

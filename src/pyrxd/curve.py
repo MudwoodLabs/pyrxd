@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 from collections import namedtuple
-from typing import Optional
 
 from coincurve import PublicKey as CcPublicKey
 
@@ -23,7 +24,7 @@ curve = EllipticCurve(
 )
 
 
-def on_curve(point: Optional[Point]) -> bool:
+def on_curve(point: Point | None) -> bool:
     """
     :returns: True if the given point lies on the elliptic curve
     """
@@ -34,7 +35,7 @@ def on_curve(point: Optional[Point]) -> bool:
     return (y * y - x * x * x - curve.a * x - curve.b) % curve.p == 0
 
 
-def curve_negative(point: Optional[Point]) -> Optional[Point]:
+def curve_negative(point: Point | None) -> Point | None:
     """
     :returns: -point
     """
@@ -50,7 +51,7 @@ def curve_negative(point: Optional[Point]) -> Optional[Point]:
     return r
 
 
-def curve_add(p: Optional[Point], q: Optional[Point]) -> Optional[Point]:
+def curve_add(p: Point | None, q: Point | None) -> Point | None:
     """
     :returns: the result of p + q according to the group law
     """
@@ -74,7 +75,7 @@ def curve_add(p: Optional[Point], q: Optional[Point]) -> Optional[Point]:
     return r
 
 
-def curve_multiply(scalar: int, point: Optional[Point]) -> Optional[Point]:
+def curve_multiply(scalar: int, point: Point | None) -> Point | None:
     """
     multiply the given point by a scalar
     """

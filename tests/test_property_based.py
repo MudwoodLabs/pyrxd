@@ -11,33 +11,34 @@ Coverage targets:
 Hypothesis finds counterexamples by generating random inputs and checking invariants.
 Any test marked with FINDING: in its docstring documents a real bug discovered.
 """
+
 from __future__ import annotations
 
 import pytest
-from hypothesis import assume, given, settings, HealthCheck
+from hypothesis import HealthCheck, assume, given, settings
 from hypothesis import strategies as st
 
-# ── Imports under test ───────────────────────────────────────────────────────
+from pyrxd.keys import PrivateKey
+from pyrxd.merkle_path import MerklePath
+from pyrxd.script.script import Script
+from pyrxd.security.errors import ValidationError
+from pyrxd.security.types import (
+    BlockHeight,
+    Hex32,
+    Nbits,
+    Photons,
+    RawTx,
+    Satoshis,
+    SighashFlag,
+    Txid,
+)
+from pyrxd.spv.witness import strip_witness
 
+# ── Imports under test ───────────────────────────────────────────────────────
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
-from pyrxd.merkle_path import MerklePath
-from pyrxd.script.script import Script
-from pyrxd.keys import PrivateKey
-from pyrxd.security.types import (
-    Txid,
-    BlockHeight,
-    RawTx,
-    Hex32,
-    Satoshis,
-    Photons,
-    SighashFlag,
-    Nbits,
-)
-from pyrxd.security.errors import ValidationError
-from pyrxd.utils import encode_int, deserialize_ecdsa_der, serialize_ecdsa_der
-from pyrxd.spv.witness import strip_witness
+from pyrxd.utils import deserialize_ecdsa_der, encode_int, serialize_ecdsa_der
 
 # ── Shared strategies ────────────────────────────────────────────────────────
 
@@ -60,6 +61,7 @@ _script_bytes = st.binary(min_size=0, max_size=520)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
 
 def _minimal_transaction(version: int = 1, locktime: int = 0) -> Transaction:
     """Return a valid minimal transaction with one input and one output."""
@@ -101,6 +103,7 @@ def _build_simple_merkle_path(block_height: int, txid_hash: str, sibling_hash: s
 # ═══════════════════════════════════════════════════════════════════════════════
 # 1. Transaction serialize / deserialize round-trip
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 @given(
     version=st.integers(min_value=1, max_value=0xFFFFFFFF),
@@ -174,6 +177,7 @@ def test_transaction_locking_script_roundtrip(script_data):
 # 2. Type constructors — valid inputs succeed, invalid raise ValidationError
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @given(value=_hex_64)
 @settings(max_examples=300)
 def test_txid_accepts_valid_64char_hex(value):
@@ -183,17 +187,19 @@ def test_txid_accepts_valid_64char_hex(value):
     assert len(t) == 64
 
 
-@given(value=st.one_of(
-    st.integers(),
-    st.none(),
-    st.binary(),
-    # Too short: 0–63 chars of valid hex chars
-    st.text(alphabet="0123456789abcdef", min_size=0, max_size=63),
-    # Too long: 65–128 chars of valid hex chars
-    st.text(alphabet="0123456789abcdef", min_size=65, max_size=128),
-    # Right length but contains uppercase letters (mixed, guaranteed non-lowercase)
-    st.text(alphabet="ABCDEF", min_size=64, max_size=64),   # pure uppercase A-F
-))
+@given(
+    value=st.one_of(
+        st.integers(),
+        st.none(),
+        st.binary(),
+        # Too short: 0–63 chars of valid hex chars
+        st.text(alphabet="0123456789abcdef", min_size=0, max_size=63),
+        # Too long: 65–128 chars of valid hex chars
+        st.text(alphabet="0123456789abcdef", min_size=65, max_size=128),
+        # Right length but contains uppercase letters (mixed, guaranteed non-lowercase)
+        st.text(alphabet="ABCDEF", min_size=64, max_size=64),  # pure uppercase A-F
+    )
+)
 @settings(max_examples=200)
 def test_txid_rejects_invalid(value):
     """Txid must raise ValidationError for all invalid inputs, never panic."""
@@ -209,13 +215,15 @@ def test_blockheight_accepts_valid(value):
     assert int(bh) == value
 
 
-@given(value=st.one_of(
-    st.integers(min_value=10_000_001),   # above ceiling
-    st.integers(max_value=-1),            # negative
-    st.floats(),
-    st.booleans(),
-    st.none(),
-))
+@given(
+    value=st.one_of(
+        st.integers(min_value=10_000_001),  # above ceiling
+        st.integers(max_value=-1),  # negative
+        st.floats(),
+        st.booleans(),
+        st.none(),
+    )
+)
 @settings(max_examples=200)
 def test_blockheight_rejects_invalid(value):
     """BlockHeight raises ValidationError for all invalid inputs."""
@@ -247,10 +255,12 @@ def test_hex32_accepts_exactly_32_bytes(value):
     assert bytes(h) == value
 
 
-@given(value=st.one_of(
-    st.binary(min_size=0, max_size=31),
-    st.binary(min_size=33),
-))
+@given(
+    value=st.one_of(
+        st.binary(min_size=0, max_size=31),
+        st.binary(min_size=33),
+    )
+)
 @settings(max_examples=200)
 def test_hex32_rejects_wrong_length(value):
     """Hex32 must raise ValidationError for any bytes not exactly 32 long."""
@@ -266,12 +276,14 @@ def test_satoshis_accepts_valid(value):
     assert int(s) == value
 
 
-@given(value=st.one_of(
-    st.integers(min_value=2_100_000_000_000_001),
-    st.integers(max_value=-1),
-    st.booleans(),
-    st.floats(),
-))
+@given(
+    value=st.one_of(
+        st.integers(min_value=2_100_000_000_000_001),
+        st.integers(max_value=-1),
+        st.booleans(),
+        st.floats(),
+    )
+)
 @settings(max_examples=200)
 def test_satoshis_rejects_invalid(value):
     """Satoshis raises ValidationError for out-of-range or wrong-type inputs."""
@@ -295,9 +307,7 @@ def test_sighashflag_accepts_all_valid(flag):
     assert int(sf) == flag
 
 
-@given(flag=st.integers(min_value=0, max_value=0xFF).filter(
-    lambda x: x not in {0x41, 0x42, 0x43, 0xC1, 0xC2, 0xC3}
-))
+@given(flag=st.integers(min_value=0, max_value=0xFF).filter(lambda x: x not in {0x41, 0x42, 0x43, 0xC1, 0xC2, 0xC3}))
 @settings(max_examples=200)
 def test_sighashflag_rejects_invalid(flag):
     """SighashFlag rejects every integer not in the valid set."""
@@ -308,6 +318,7 @@ def test_sighashflag_rejects_invalid(flag):
 # ═══════════════════════════════════════════════════════════════════════════════
 # 3. Cryptographic round-trips
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 @given(message=st.binary(min_size=1, max_size=256))
 @settings(max_examples=100, suppress_health_check=[HealthCheck.too_slow])
@@ -362,6 +373,7 @@ def test_wif_encode_decode_roundtrip(scalar):
 # 4. Script encode / decode
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @given(num=st.integers(min_value=-(2**31), max_value=2**31))
 @settings(max_examples=300)
 def test_encode_int_produces_valid_pushdata(num):
@@ -391,6 +403,7 @@ def test_script_byte_length_matches_data(data):
 # 5. strip_witness — must not panic; only ValidationError or success
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @given(data=st.binary(min_size=0, max_size=512))
 @settings(max_examples=300)
 def test_strip_witness_never_panics(data):
@@ -403,8 +416,7 @@ def test_strip_witness_never_panics(data):
         pass  # expected for malformed input
     except Exception as exc:
         pytest.fail(
-            f"strip_witness raised unexpected {type(exc).__name__}: {exc}\n"
-            f"  input ({len(data)} bytes): {data.hex()}"
+            f"strip_witness raised unexpected {type(exc).__name__}: {exc}\n  input ({len(data)} bytes): {data.hex()}"
         )
 
 
@@ -430,6 +442,7 @@ def test_strip_witness_rejects_too_short(data):
 # ═══════════════════════════════════════════════════════════════════════════════
 # 6. MerklePath construction — valid succeeds, invalid raises ValueError
 # ═══════════════════════════════════════════════════════════════════════════════
+
 
 @given(
     block_height=st.integers(min_value=0, max_value=900_000),
@@ -476,9 +489,7 @@ def test_merkle_path_binary_roundtrip(block_height, txid_hash, sibling_hash):
     sibling_hash=st.text(alphabet="0123456789abcdef", min_size=64, max_size=64),
 )
 @settings(max_examples=200)
-def test_merkle_path_duplicate_offset_raises_valueerror(
-    block_height, offset_a, offset_b, txid_hash, sibling_hash
-):
+def test_merkle_path_duplicate_offset_raises_valueerror(block_height, offset_a, offset_b, txid_hash, sibling_hash):
     """Duplicate offsets at the same level must raise ValueError, not panic."""
     assume(offset_a == offset_b)  # force the duplicate condition
     path = [
@@ -501,6 +512,7 @@ def test_merkle_path_empty_level_raises_valueerror():
 # 7. Nbits type constructor — valid/invalid
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
 @given(
     # exponent in [1..0x1D], mantissa: 24-bit non-zero without sign bit
     exponent=st.integers(min_value=1, max_value=0x1D),
@@ -509,12 +521,14 @@ def test_merkle_path_empty_level_raises_valueerror():
 @settings(max_examples=200)
 def test_nbits_accepts_valid(exponent, mantissa):
     """Nbits must accept a valid 4-byte little-endian encoding."""
-    raw = bytes([
-        mantissa & 0xFF,
-        (mantissa >> 8) & 0xFF,
-        (mantissa >> 16) & 0xFF,
-        exponent,
-    ])
+    raw = bytes(
+        [
+            mantissa & 0xFF,
+            (mantissa >> 8) & 0xFF,
+            (mantissa >> 16) & 0xFF,
+            exponent,
+        ]
+    )
     nb = Nbits(raw)
     assert len(nb) == 4
 

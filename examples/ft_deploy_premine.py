@@ -63,9 +63,7 @@ from pyrxd.transaction.transaction import Transaction, TransactionInput, Transac
 # ---------------------------------------------------------------------------
 
 DRY_RUN: bool = os.environ.get("DRY_RUN", "1") != "0"
-ELECTRUMX_URL: str = os.environ.get(
-    "ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/"
-)
+ELECTRUMX_URL: str = os.environ.get("ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/")
 GLYPH_WIF: str = os.environ.get("GLYPH_WIF", "")
 RESUME_COMMIT_TXID: str = os.environ.get("COMMIT_TXID", "")
 RESUME_COMMIT_VOUT: int = int(os.environ.get("COMMIT_VOUT", "0"))
@@ -74,12 +72,12 @@ TOKEN_NAME: str = os.environ.get("TOKEN_NAME", "MY-TOKEN")
 TOKEN_TICKER: str = os.environ.get("TOKEN_TICKER", "MTK")
 PREMINE_AMOUNT: int = int(os.environ.get("PREMINE_AMOUNT", "1000000"))
 
-MIN_FEE_RATE = 10_000       # photons/byte
-COMMIT_SIZE = 276            # estimated commit tx bytes
-REVEAL_SIZE = 610            # conservative: 250 base + 165 scriptsig + FT locking script
+MIN_FEE_RATE = 10_000  # photons/byte
+COMMIT_SIZE = 276  # estimated commit tx bytes
+REVEAL_SIZE = 610  # conservative: 250 base + 165 scriptsig + FT locking script
 COMMIT_DUST = COMMIT_SIZE * MIN_FEE_RATE
 REVEAL_BUDGET = REVEAL_SIZE * MIN_FEE_RATE * 12 // 10 + PREMINE_AMOUNT
-COMMIT_VALUE_TARGET = REVEAL_BUDGET + 200_000   # commit output must cover reveal + premine
+COMMIT_VALUE_TARGET = REVEAL_BUDGET + 200_000  # commit output must cover reveal + premine
 
 RESUME_FILE = "/tmp/ft_deploy_resume.json"
 
@@ -94,7 +92,7 @@ async def electrumx_call(method: str, params: list) -> object:
         req = json.dumps({"id": 1, "method": method, "params": params})
         await ws.send(req)
         resp = json.loads(await ws.recv())
-    if "error" in resp and resp["error"]:
+    if resp.get("error"):
         raise RuntimeError(f"ElectrumX error: {resp['error']}")
     return resp.get("result")
 
@@ -102,7 +100,7 @@ async def electrumx_call(method: str, params: list) -> object:
 async def fetch_utxos(address: str) -> list:
     script = P2PKH().lock(address)
     script_hash = sha256(script.serialize()).hex()
-    rev_hash = "".join(reversed([script_hash[i:i+2] for i in range(0, len(script_hash), 2)]))
+    rev_hash = "".join(reversed([script_hash[i : i + 2] for i in range(0, len(script_hash), 2)]))
     return await electrumx_call("blockchain.scripthash.listunspent", [rev_hash])
 
 
@@ -117,13 +115,12 @@ async def broadcast(tx_hex: str) -> str:
 
 def p2pkh_unlock_template(private_key: PrivateKey):
     """Standard P2PKH unlock template (sign + pubkey push)."""
+
     def sign(tx, idx) -> Script:
         sig = private_key.sign(tx.preimage(idx))
         sighash = tx.inputs[idx].sighash
         pub = private_key.public_key().serialize()
-        return Script(
-            encode_pushdata(sig + sighash.to_bytes(1, "little")) + encode_pushdata(pub)
-        )
+        return Script(encode_pushdata(sig + sighash.to_bytes(1, "little")) + encode_pushdata(pub))
 
     def estimated_len() -> int:
         return 107
@@ -133,14 +130,12 @@ def p2pkh_unlock_template(private_key: PrivateKey):
 
 def ft_reveal_unlock_template(private_key: PrivateKey, scriptsig_suffix: bytes):
     """Unlock template for the FT reveal input: P2PKH signature + Glyph suffix."""
+
     def sign(tx, idx) -> Script:
         sig = private_key.sign(tx.preimage(idx))
         sighash = tx.inputs[idx].sighash
         pub = private_key.public_key().serialize()
-        p2pkh_part = (
-            encode_pushdata(sig + sighash.to_bytes(1, "little"))
-            + encode_pushdata(pub)
-        )
+        p2pkh_part = encode_pushdata(sig + sighash.to_bytes(1, "little")) + encode_pushdata(pub)
         return Script(p2pkh_part + scriptsig_suffix)
 
     def estimated_len() -> int:
@@ -311,6 +306,7 @@ async def main() -> None:
             if saved.get("commit_txid") == commit_txid:
                 from pyrxd.glyph.builder import CommitResult
                 from pyrxd.glyph.script import build_commit_locking_script, hash_payload
+
                 saved_cbor = bytes.fromhex(saved["cbor_hex"])
                 saved_hash = hash_payload(saved_cbor)
                 saved_script = build_commit_locking_script(saved_hash, pkh)

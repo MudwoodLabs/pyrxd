@@ -38,6 +38,7 @@ Stream C/HD-hardening rationale (closes ultrareview re-review N1-N6):
   behind ``load_or_create()`` so callers opt in explicitly. A typo'd
   path no longer overwrites a real wallet on the next save.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -48,7 +49,7 @@ import secrets
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING
 
 from Cryptodome.Cipher import AES
 
@@ -73,9 +74,9 @@ _RADIANT_PATH = f"m/44'/{_COIN_TYPE}'"
 _FILE_VERSION_V2 = 2
 
 # Header layout for v2: version || salt || nonce || tag || ciphertext.
-_SALT_LEN = 16   # scrypt
+_SALT_LEN = 16  # scrypt
 _NONCE_LEN = 12  # AES-GCM standard
-_TAG_LEN = 16    # AES-GCM tag
+_TAG_LEN = 16  # AES-GCM tag
 _HEADER_LEN = 1 + _SALT_LEN + _NONCE_LEN + _TAG_LEN  # 45
 
 # scrypt parameters. Lower-cost than the signer-key scrypt because the
@@ -91,7 +92,7 @@ _SCRYPT_P = 1
 @dataclass
 class AddressRecord:
     address: str
-    change: int   # 0 = external, 1 = internal
+    change: int  # 0 = external, 1 = internal
     index: int
     used: bool
 
@@ -117,7 +118,7 @@ class HdWallet:
     account: int = 0
     external_tip: int = 0
     internal_tip: int = 0
-    addresses: Dict[str, AddressRecord] = field(default_factory=dict)
+    addresses: dict[str, AddressRecord] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Construction
@@ -128,7 +129,7 @@ class HdWallet:
         mnemonic: str,
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         account: int = 0,
-    ) -> "HdWallet":
+    ) -> HdWallet:
         """Create a fresh wallet from a BIP39 mnemonic."""
         seed = seed_from_mnemonic(mnemonic, passphrase=passphrase)
         path = f"{_RADIANT_PATH}/{account}'"
@@ -141,7 +142,7 @@ class HdWallet:
         path: Path,
         mnemonic: str,
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
-    ) -> "HdWallet":
+    ) -> HdWallet:
         """Load a previously saved wallet from *path*.
 
         The mnemonic is needed to derive the decryption key. Raises
@@ -164,7 +165,7 @@ class HdWallet:
         mnemonic: str,
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         account: int = 0,
-    ) -> "HdWallet":
+    ) -> HdWallet:
         """Load a wallet from *path*, or build a fresh one if the file is missing.
 
         Spelled separately from :meth:`load` so the create-on-missing
@@ -178,7 +179,7 @@ class HdWallet:
         return cls.from_mnemonic(mnemonic, passphrase=passphrase, account=account)
 
     @classmethod
-    def _load_existing(cls, path: Path, mnemonic: str, passphrase: str) -> "HdWallet":
+    def _load_existing(cls, path: Path, mnemonic: str, passphrase: str) -> HdWallet:
         seed = seed_from_mnemonic(mnemonic, passphrase=passphrase)
 
         raw = path.read_bytes()
@@ -193,9 +194,9 @@ class HdWallet:
                 "re-create the wallet from mnemonic and save it under the new format."
             )
 
-        salt = raw[1:1 + _SALT_LEN]
-        nonce = raw[1 + _SALT_LEN:1 + _SALT_LEN + _NONCE_LEN]
-        tag = raw[1 + _SALT_LEN + _NONCE_LEN:_HEADER_LEN]
+        salt = raw[1 : 1 + _SALT_LEN]
+        nonce = raw[1 + _SALT_LEN : 1 + _SALT_LEN + _NONCE_LEN]
+        tag = raw[1 + _SALT_LEN + _NONCE_LEN : _HEADER_LEN]
         ciphertext = raw[_HEADER_LEN:]
 
         enc_key = _derive_enc_key(seed, salt)
@@ -207,8 +208,7 @@ class HdWallet:
             # ValueError too. Surface a single static message (no
             # context-leaking detail) — closes Stream C #4 finding pattern.
             raise ValidationError(
-                "Could not decrypt wallet file — wrong mnemonic, "
-                "wrong passphrase, or ciphertext tampered."
+                "Could not decrypt wallet file — wrong mnemonic, wrong passphrase, or ciphertext tampered."
             ) from exc
 
         try:
@@ -218,9 +218,7 @@ class HdWallet:
             # have failed the tag check above. If we land here the disk
             # is corrupt or someone bypassed the AEAD layer — surface
             # explicitly, do not return a partial wallet.
-            raise ValidationError(
-                "Wallet file decrypted but contains invalid JSON — disk corruption?"
-            ) from exc
+            raise ValidationError("Wallet file decrypted but contains invalid JSON — disk corruption?") from exc
 
         account = int(data.get("account", 0))
         account_xprv = bip32_derive_xprv_from_mnemonic(
@@ -328,7 +326,7 @@ class HdWallet:
     # ------------------------------------------------------------------
     # Gap-limit scanning
 
-    async def refresh(self, client: "ElectrumXClient") -> int:
+    async def refresh(self, client: ElectrumXClient) -> int:
         """Run BIP44 gap-limit scan on both external and internal chains.
 
         Discovers which derived addresses have on-chain history.  Stops
@@ -346,7 +344,7 @@ class HdWallet:
             newly_used += await self._scan_chain(client, change)
         return newly_used
 
-    async def _scan_chain(self, client: "ElectrumXClient", change: int) -> int:
+    async def _scan_chain(self, client: ElectrumXClient, change: int) -> int:
         consecutive_unused = 0
         index = 0
         newly_used = 0
@@ -363,9 +361,7 @@ class HdWallet:
             hist = await client.get_history(script_hash_for_address(addr))
             is_used = bool(hist)
             old = self.addresses.get(pkey)
-            self.addresses[pkey] = AddressRecord(
-                address=addr, change=change, index=index, used=is_used
-            )
+            self.addresses[pkey] = AddressRecord(address=addr, change=change, index=index, used=is_used)
             if is_used:
                 consecutive_unused = 0
                 if old is None or not old.used:
@@ -375,15 +371,21 @@ class HdWallet:
             index += 1
 
         if change == 0:
-            self.external_tip = max(
-                (r.index for r in self.addresses.values() if r.change == 0 and r.used),
-                default=-1,
-            ) + 1
+            self.external_tip = (
+                max(
+                    (r.index for r in self.addresses.values() if r.change == 0 and r.used),
+                    default=-1,
+                )
+                + 1
+            )
         else:
-            self.internal_tip = max(
-                (r.index for r in self.addresses.values() if r.change == 1 and r.used),
-                default=-1,
-            ) + 1
+            self.internal_tip = (
+                max(
+                    (r.index for r in self.addresses.values() if r.change == 1 and r.used),
+                    default=-1,
+                )
+                + 1
+            )
         return newly_used
 
     # ------------------------------------------------------------------
@@ -397,30 +399,26 @@ class HdWallet:
             if rec is None or not rec.used:
                 if rec is None:
                     addr = self._derive_address(0, idx)
-                    self.addresses[pkey] = AddressRecord(
-                        address=addr, change=0, index=idx, used=False
-                    )
+                    self.addresses[pkey] = AddressRecord(address=addr, change=0, index=idx, used=False)
                 else:
                     addr = rec.address
                 return addr
         # Extend if all known addresses are used (edge case)
         idx = self.external_tip + _GAP_LIMIT
         addr = self._derive_address(0, idx)
-        self.addresses[self._path_key(0, idx)] = AddressRecord(
-            address=addr, change=0, index=idx, used=False
-        )
+        self.addresses[self._path_key(0, idx)] = AddressRecord(address=addr, change=0, index=idx, used=False)
         return addr
 
-    def known_addresses(self, *, change: Optional[int] = None) -> List[AddressRecord]:
+    def known_addresses(self, *, change: int | None = None) -> list[AddressRecord]:
         """Return all known address records, optionally filtered by chain."""
         recs = list(self.addresses.values())
         if change is not None:
             recs = [r for r in recs if r.change == change]
         return recs
 
-    async def get_utxos(self, client: "ElectrumXClient") -> List[UtxoRecord]:
+    async def get_utxos(self, client: ElectrumXClient) -> list[UtxoRecord]:
         """Return all UTXOs across all known addresses."""
-        all_utxos: List[UtxoRecord] = []
+        all_utxos: list[UtxoRecord] = []
         used = [r for r in self.addresses.values() if r.used]
         if not used:
             return []
@@ -433,7 +431,7 @@ class HdWallet:
                 all_utxos.extend(result)
         return all_utxos
 
-    async def get_balance(self, client: "ElectrumXClient") -> int:
+    async def get_balance(self, client: ElectrumXClient) -> int:
         """Return total confirmed + unconfirmed satoshis across all known addresses.
 
         Uses ``ElectrumXClient.get_balance`` per address.  Call ``refresh()``

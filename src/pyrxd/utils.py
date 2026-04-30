@@ -1,15 +1,16 @@
+from __future__ import annotations
+
 import math
 import re
 import struct
-from base64 import b64encode, b64decode
+from base64 import b64decode, b64encode
 from contextlib import suppress
 from io import BytesIO
 from secrets import randbits
-from typing import Tuple, Optional, Union, Literal, List
+from typing import Literal
 
 from .base58 import base58check_decode
-from .constants import Network, ADDRESS_PREFIX_NETWORK_DICT, WIF_PREFIX_NETWORK_DICT, NUMBER_BYTE_LENGTH
-from .constants import OpCode
+from .constants import ADDRESS_PREFIX_NETWORK_DICT, NUMBER_BYTE_LENGTH, WIF_PREFIX_NETWORK_DICT, Network, OpCode
 from .curve import curve
 from .security.errors import ValidationError
 
@@ -37,7 +38,7 @@ def unsigned_to_bytes(num: int, byteorder: Literal["big", "little"] = "big") -> 
     return num.to_bytes(math.ceil(num.bit_length() / 8) or 1, byteorder)
 
 
-def decode_address(address: str) -> Tuple[bytes, Network]:
+def decode_address(address: str) -> tuple[bytes, Network]:
     """
     :returns: tuple (public_key_hash_bytes, network)
     """
@@ -52,7 +53,7 @@ def decode_address(address: str) -> Tuple[bytes, Network]:
     return decoded[1:], network
 
 
-def validate_address(address: str, network: Optional[Network] = None) -> bool:
+def validate_address(address: str, network: Network | None = None) -> bool:
     """
     :returns: True if address is a valid bitcoin legacy address (P2PKH)
     """
@@ -71,7 +72,7 @@ def address_to_public_key_hash(address: str) -> bytes:
     return decode_address(address)[0]
 
 
-def decode_wif(wif: str) -> Tuple[bytes, bool, Network]:
+def decode_wif(wif: str) -> tuple[bytes, bool, Network]:
     """
     :returns: tuple (private_key_bytes, compressed, network)
     """
@@ -85,7 +86,7 @@ def decode_wif(wif: str) -> Tuple[bytes, bool, Network]:
     return decoded[1:], False, network
 
 
-def deserialize_ecdsa_der(signature: bytes) -> Tuple[int, int]:
+def deserialize_ecdsa_der(signature: bytes) -> tuple[int, int]:
     """
     Deserialize ECDSA signature from bitcoin strict DER to (r, s).
 
@@ -132,9 +133,7 @@ def deserialize_ecdsa_der(signature: bytes) -> Tuple[int, int]:
         s_off = r_end + 2
         s_end = s_off + s_len
         if s_end != len(signature):
-            raise ValueError(
-                "DER total length mismatch: r_len + s_len + 6 must equal len(signature)"
-            )
+            raise ValueError("DER total length mismatch: r_len + s_len + 6 must equal len(signature)")
         s = int.from_bytes(signature[s_off:s_end], "big")
 
         return r, s
@@ -144,7 +143,7 @@ def deserialize_ecdsa_der(signature: bytes) -> Tuple[int, int]:
         raise ValueError(f"invalid DER encoded {signature.hex()}")
 
 
-def serialize_ecdsa_der(signature: Tuple[int, int]) -> bytes:
+def serialize_ecdsa_der(signature: tuple[int, int]) -> bytes:
     """
     serialize ECDSA signature (r, s) to bitcoin strict DER format
     """
@@ -165,7 +164,7 @@ def serialize_ecdsa_der(signature: Tuple[int, int]) -> bytes:
     return bytes([0x30, len(serialized)]) + serialized
 
 
-def deserialize_ecdsa_recoverable(signature: bytes) -> Tuple[int, int, int]:
+def deserialize_ecdsa_recoverable(signature: bytes) -> tuple[int, int, int]:
     """
     deserialize recoverable ECDSA signature from bytes to (r, s, recovery_id)
     """
@@ -179,7 +178,7 @@ def deserialize_ecdsa_recoverable(signature: bytes) -> Tuple[int, int, int]:
     return r, s, rec_id
 
 
-def serialize_ecdsa_recoverable(signature: Tuple[int, int, int]) -> bytes:
+def serialize_ecdsa_recoverable(signature: tuple[int, int, int]) -> bytes:
     """
     serialize recoverable ECDSA signature from (r, s, recovery_id) to bytes
     """
@@ -213,13 +212,13 @@ def stringify_ecdsa_recoverable(signature: bytes, compressed: bool = True) -> st
     :param compressed: True if used compressed public key
     :returns: stringified recoverable signature formatted in base64
     """
-    r, s, recovery_id = deserialize_ecdsa_recoverable(signature)
+    _r, _s, recovery_id = deserialize_ecdsa_recoverable(signature)
     prefix: int = 27 + recovery_id + (4 if compressed else 0)
     signature: bytes = prefix.to_bytes(1, "big") + signature[:-1]
     return b64encode(signature).decode("ascii")
 
 
-def unstringify_ecdsa_recoverable(signature: str) -> Tuple[bytes, bool]:
+def unstringify_ecdsa_recoverable(signature: str) -> tuple[bytes, bool]:
     """
     :returns: (serialized_recoverable_signature, used_compressed_public_key)
     """
@@ -237,7 +236,7 @@ def unstringify_ecdsa_recoverable(signature: str) -> Tuple[bytes, bool]:
     return serialized[1:] + recovery_id.to_bytes(1, "big"), compressed
 
 
-def bytes_to_bits(octets: Union[str, bytes]) -> str:
+def bytes_to_bits(octets: str | bytes) -> str:
     """
     convert bytes to binary 0/1 string
     """
@@ -321,13 +320,13 @@ def to_hex(byte_array: bytes) -> str:
     return byte_array.hex()
 
 
-def to_bytes(msg: Union[bytes, str], enc: Optional[str] = None) -> bytes:
+def to_bytes(msg: bytes | str, enc: str | None = None) -> bytes:
     """Converts various message formats into a bytes object."""
     if isinstance(msg, bytes):
         return msg
 
     if not msg:
-        return bytes()
+        return b""
 
     if isinstance(msg, str):
         if enc == "hex":
@@ -345,12 +344,12 @@ def to_bytes(msg: Union[bytes, str], enc: Optional[str] = None) -> bytes:
     return bytes(msg)
 
 
-def to_utf8(arr: List[int]) -> str:
+def to_utf8(arr: list[int]) -> str:
     """Converts an array of numbers to a UTF-8 encoded string."""
     return bytes(arr).decode("utf-8")
 
 
-def encode(arr: List[int], enc: Optional[str] = None) -> Union[str, List[int]]:
+def encode(arr: list[int], enc: str | None = None) -> str | list[int]:
     """Encodes an array of numbers into a specified encoding ('hex' or 'utf8')."""
     if enc == "hex":
         return to_hex(bytes(arr))
@@ -359,7 +358,7 @@ def encode(arr: List[int], enc: Optional[str] = None) -> Union[str, List[int]]:
     return arr
 
 
-def to_base64(byte_array: List[int]) -> str:
+def to_base64(byte_array: list[int]) -> str:
     """Converts an array of bytes into a base64 encoded string."""
     import base64
 
@@ -369,7 +368,7 @@ def to_base64(byte_array: List[int]) -> str:
 base58chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
-def from_base58(str_: str) -> List[int]:
+def from_base58(str_: str) -> list[int]:
     """Converts a base58 string to a binary array."""
     if not str_ or not isinstance(str_, str):
         raise ValueError(f"Expected base58 string but got '{str_}'")
@@ -391,7 +390,7 @@ def from_base58(str_: str) -> List[int]:
     return [0] * psz + list(reversed(result))
 
 
-def to_base58(bin_: List[int]) -> str:
+def to_base58(bin_: list[int]) -> str:
     """Converts a binary array into a base58 string."""
     acc = 0
     for byte in bin_:
@@ -411,7 +410,7 @@ def to_base58(bin_: List[int]) -> str:
     return result
 
 
-def to_base58_check(bin_: List[int], prefix: Optional[List[int]] = None) -> str:
+def to_base58_check(bin_: list[int], prefix: list[int] | None = None) -> str:
     """Converts a binary array into a base58check string with a checksum."""
     import hashlib
 
@@ -421,7 +420,7 @@ def to_base58_check(bin_: List[int], prefix: Optional[List[int]] = None) -> str:
     return to_base58(prefix + bin_ + list(hash_[:4]))
 
 
-def from_base58_check(str_: str, enc: Optional[str] = None, prefix_length: int = 1):
+def from_base58_check(str_: str, enc: str | None = None, prefix_length: int = 1):
     """Converts a base58check string into a binary array after validating the checksum."""
     bin_ = from_base58(str_)
     prefix = bin_[:prefix_length]
@@ -445,63 +444,63 @@ class Writer(BytesIO):
     def __init__(self):
         super().__init__()
 
-    def write(self, buf: bytes) -> "Writer":
+    def write(self, buf: bytes) -> Writer:
         super().write(buf)
         return self
 
-    def write_reverse(self, buf: bytes) -> "Writer":
+    def write_reverse(self, buf: bytes) -> Writer:
         super().write(buf[::-1])
         return self
 
-    def write_uint8(self, n: int) -> "Writer":
+    def write_uint8(self, n: int) -> Writer:
         self.write(struct.pack("B", n))
         return self
 
-    def write_int8(self, n: int) -> "Writer":
+    def write_int8(self, n: int) -> Writer:
         self.write(struct.pack("b", n))
         return self
 
-    def write_uint16_be(self, n: int) -> "Writer":
+    def write_uint16_be(self, n: int) -> Writer:
         self.write(struct.pack(">H", n))
         return self
 
-    def write_int16_be(self, n: int) -> "Writer":
+    def write_int16_be(self, n: int) -> Writer:
         self.write(struct.pack(">h", n))
         return self
 
-    def write_uint16_le(self, n: int) -> "Writer":
+    def write_uint16_le(self, n: int) -> Writer:
         self.write(struct.pack("<H", n))
         return self
 
-    def write_int16_le(self, n: int) -> "Writer":
+    def write_int16_le(self, n: int) -> Writer:
         self.write(struct.pack("<h", n))
         return self
 
-    def write_uint32_be(self, n: int) -> "Writer":
+    def write_uint32_be(self, n: int) -> Writer:
         self.write(struct.pack(">I", n))
         return self
 
-    def write_int32_be(self, n: int) -> "Writer":
+    def write_int32_be(self, n: int) -> Writer:
         self.write(struct.pack(">i", n))
         return self
 
-    def write_uint32_le(self, n: int) -> "Writer":
+    def write_uint32_le(self, n: int) -> Writer:
         self.write(struct.pack("<I", n))
         return self
 
-    def write_int32_le(self, n: int) -> "Writer":
+    def write_int32_le(self, n: int) -> Writer:
         self.write(struct.pack("<i", n))
         return self
 
-    def write_uint64_be(self, n: int) -> "Writer":
+    def write_uint64_be(self, n: int) -> Writer:
         self.write(struct.pack(">Q", n))
         return self
 
-    def write_uint64_le(self, n: int) -> "Writer":
+    def write_uint64_le(self, n: int) -> Writer:
         self.write(struct.pack("<Q", n))
         return self
 
-    def write_var_int_num(self, n: int) -> "Writer":
+    def write_var_int_num(self, n: int) -> Writer:
         self.write(self.var_int_num(n))
         return self
 
@@ -528,47 +527,47 @@ class Reader(BytesIO):
         data = self.read(length)
         return data[::-1] if data else None
 
-    def read_uint8(self) -> Optional[int]:
+    def read_uint8(self) -> int | None:
         data = self.read(1)
         return data[0] if data else None
 
-    def read_int8(self) -> Optional[int]:
+    def read_int8(self) -> int | None:
         data = self.read(1)
         return int.from_bytes(data, byteorder="big", signed=True) if data else None
 
-    def read_uint16_be(self) -> Optional[int]:
+    def read_uint16_be(self) -> int | None:
         data = self.read(2)
         return int.from_bytes(data, byteorder="big") if data else None
 
-    def read_int16_be(self) -> Optional[int]:
+    def read_int16_be(self) -> int | None:
         data = self.read(2)
         return int.from_bytes(data, byteorder="big", signed=True) if data else None
 
-    def read_uint16_le(self) -> Optional[int]:
+    def read_uint16_le(self) -> int | None:
         data = self.read(2)
         return int.from_bytes(data, byteorder="little") if data else None
 
-    def read_int16_le(self) -> Optional[int]:
+    def read_int16_le(self) -> int | None:
         data = self.read(2)
         return int.from_bytes(data, byteorder="little", signed=True) if data else None
 
-    def read_uint32_be(self) -> Optional[int]:
+    def read_uint32_be(self) -> int | None:
         data = self.read(4)
         return int.from_bytes(data, byteorder="big") if data else None
 
-    def read_int32_be(self) -> Optional[int]:
+    def read_int32_be(self) -> int | None:
         data = self.read(4)
         return int.from_bytes(data, byteorder="big", signed=True) if data else None
 
-    def read_uint32_le(self) -> Optional[int]:
+    def read_uint32_le(self) -> int | None:
         data = self.read(4)
         return int.from_bytes(data, byteorder="little") if data else None
 
-    def read_int32_le(self) -> Optional[int]:
+    def read_int32_le(self) -> int | None:
         data = self.read(4)
         return int.from_bytes(data, byteorder="little", signed=True) if data else None
 
-    def read_var_int_num(self) -> Optional[int]:
+    def read_var_int_num(self) -> int | None:
         first_byte = self.read_uint8()
         if first_byte is None:
             return None
@@ -584,7 +583,7 @@ class Reader(BytesIO):
         else:
             raise ValueError("Invalid varint encoding")
 
-    def read_var_int(self) -> Optional[bytes]:
+    def read_var_int(self) -> bytes | None:
         first_byte = self.read(1)
         if not first_byte:
             return None
@@ -597,11 +596,11 @@ class Reader(BytesIO):
         else:
             return first_byte
 
-    def read_bytes(self, byte_length: Optional[int] = None) -> bytes:
+    def read_bytes(self, byte_length: int | None = None) -> bytes:
         result = self.read(byte_length)
         return result if result else b""
 
-    def read_int(self, byte_length: int, byteorder: Literal["big", "little"] = "little") -> Optional[int]:
+    def read_int(self, byte_length: int, byteorder: Literal["big", "little"] = "little") -> int | None:
         octets = self.read_bytes(byte_length)
         if not octets:
             return None

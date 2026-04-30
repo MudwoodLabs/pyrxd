@@ -12,6 +12,8 @@ validate_btc_address — validate a mainnet Bitcoin address string
 validate_satoshis    — validate a satoshi amount
 """
 
+from __future__ import annotations
+
 from .keys import BtcKeypair, generate_keypair, keypair_from_wif
 from .payment import BtcPaymentTx, BtcUtxo, build_payment_tx
 from .validate import validate_btc_address, validate_satoshis

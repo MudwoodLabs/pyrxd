@@ -46,9 +46,7 @@ def build_branch(merkle_be: list[str], pos: int) -> bytes:
     for i, sibling_be_hex in enumerate(merkle_be):
         sibling_be = bytes.fromhex(sibling_be_hex)
         if len(sibling_be) != 32:
-            raise ValidationError(
-                f"sibling[{i}] must be 32 bytes, got {len(sibling_be)}"
-            )
+            raise ValidationError(f"sibling[{i}] must be 32 bytes, got {len(sibling_be)}")
         direction = (pos >> i) & 1
         sibling_le = sibling_be[::-1]
         parts.append(bytes([direction]) + sibling_le)
@@ -71,9 +69,7 @@ def compute_root(txid_be_hex: str, branch: bytes) -> bytes:
         ValidationError: if ``branch`` is not a multiple of 33 bytes.
     """
     if len(branch) % 33 != 0:
-        raise ValidationError(
-            f"branch length {len(branch)} is not a multiple of 33"
-        )
+        raise ValidationError(f"branch length {len(branch)} is not a multiple of 33")
 
     # Start with leaf in LE (reverse BE display).
     current = bytes.fromhex(txid_be_hex)[::-1]
@@ -119,26 +115,18 @@ def verify_tx_in_block(
     """
     # Audit 02-F-1: 64-byte tx Merkle forgery defense.
     if len(raw_tx) <= 64:
-        raise SpvVerificationError(
-            "raw_tx must be > 64 bytes (64-byte Merkle forgery defense)"
-        )
+        raise SpvVerificationError("raw_tx must be > 64 bytes (64-byte Merkle forgery defense)")
 
     # Audit 05-F-9: coinbase-as-payment guard.
     if pos == 0:
-        raise SpvVerificationError(
-            "pos=0 is the coinbase tx - cannot be used as payment proof"
-        )
+        raise SpvVerificationError("pos=0 is the coinbase tx - cannot be used as payment proof")
 
     # Audit 05-F-8: Merkle branch depth binding.
     if len(branch) % 33 != 0:
-        raise ValidationError(
-            f"branch length {len(branch)} not a multiple of 33"
-        )
+        raise ValidationError(f"branch length {len(branch)} not a multiple of 33")
     branch_depth = len(branch) // 33
     if expected_depth is not None and branch_depth != expected_depth:
-        raise SpvVerificationError(
-            f"branch depth {branch_depth} does not match expected {expected_depth}"
-        )
+        raise SpvVerificationError(f"branch depth {branch_depth} does not match expected {expected_depth}")
 
     # Verify the provided raw_tx hashes to the claimed txid.
     computed_txid_le = hash256(raw_tx)

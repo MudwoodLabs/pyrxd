@@ -12,11 +12,11 @@ import pytest
 
 from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.spv import (
-    CovenantParams,
     P2PKH,
     P2SH,
     P2TR,
     P2WPKH,
+    CovenantParams,
     SpvProofBuilder,
     build_branch,
     compute_root,
@@ -49,13 +49,7 @@ BLOCK_840001 = (
 
 def _p2pkh_output(value: int, hash20: bytes) -> bytes:
     """Build a minimal P2PKH output: value(8) + len(1) + script(25)."""
-    return (
-        value.to_bytes(8, "little")
-        + bytes([25])
-        + b"\x76\xa9\x14"
-        + hash20
-        + b"\x88\xac"
-    )
+    return value.to_bytes(8, "little") + bytes([25]) + b"\x76\xa9\x14" + hash20 + b"\x88\xac"
 
 
 # --------------------------------------------------------------------------- audit findings
@@ -74,21 +68,15 @@ class TestAuditFindings:
         """Audit 02-F-1: a 64-byte 'tx' can collide with a Merkle interior node."""
         fake_tx = b"\xab" * 64
         with pytest.raises(SpvVerificationError, match="64-byte"):
-            verify_tx_in_block(
-                fake_tx, "a" * 64, b"\x00" * 33, pos=1, header=b"\x00" * 80
-            )
+            verify_tx_in_block(fake_tx, "a" * 64, b"\x00" * 33, pos=1, header=b"\x00" * 80)
 
     def test_02_f1_65byte_tx_not_rejected_by_length(self) -> None:
         """65 bytes is above the threshold — length defense does NOT fire."""
         tx_65 = b"\xab" * 65
         try:
-            verify_tx_in_block(
-                tx_65, "a" * 64, b"\x00" * 33, pos=1, header=b"\x00" * 80
-            )
+            verify_tx_in_block(tx_65, "a" * 64, b"\x00" * 33, pos=1, header=b"\x00" * 80)
         except SpvVerificationError as e:
-            assert "64-byte" not in str(
-                e
-            ), "65-byte tx should not trigger 64-byte forgery defense"
+            assert "64-byte" not in str(e), "65-byte tx should not trigger 64-byte forgery defense"
         except (ValidationError, Exception):
             # Other errors (hash mismatch, root mismatch, etc.) are expected.
             pass
@@ -146,9 +134,7 @@ class TestAuditFindings:
     def test_05_f8_merkle_depth_binding(self) -> None:
         """Audit 05-F-8: branch depth must match expected_depth."""
         raw_tx = b"\x00" * 65
-        branch_depth_2 = (
-            b"\x00" + b"\xab" * 32 + b"\x00" + b"\xcd" * 32
-        )  # 2 levels
+        branch_depth_2 = b"\x00" + b"\xab" * 32 + b"\x00" + b"\xcd" * 32  # 2 levels
         header = b"\x00" * 80
         with pytest.raises(SpvVerificationError, match="depth"):
             verify_tx_in_block(
@@ -168,9 +154,7 @@ class TestAuditFindings:
         branch = b"\x00" + b"\xab" * 32  # 1 level
         header = b"\x00" * 80
         with pytest.raises(SpvVerificationError, match="coinbase"):
-            verify_tx_in_block(
-                raw_tx, "a" * 64, branch, pos=0, header=header
-            )
+            verify_tx_in_block(raw_tx, "a" * 64, branch, pos=0, header=header)
 
     # ----- Audit 03-C2 — OP_RETURN guard -----------------------------------
 
@@ -178,16 +162,9 @@ class TestAuditFindings:
         """Audit 03-C2: OP_RETURN outputs must not be accepted as payments."""
         # 8-byte value + len=25 + script starting with 0x6a (OP_RETURN).
         op_return_script = b"\x6a\xa9\x14" + b"\x00" * 20 + b"\x88\xac"
-        raw_tx = (
-            (1000).to_bytes(8, "little")
-            + bytes([25])
-            + op_return_script
-            + b"\x00" * 35
-        )
+        raw_tx = (1000).to_bytes(8, "little") + bytes([25]) + op_return_script + b"\x00" * 35
         with pytest.raises(SpvVerificationError, match="OP_RETURN"):
-            verify_payment(
-                raw_tx, 0, b"\x00" * 20, P2PKH, min_satoshis=1000
-            )
+            verify_payment(raw_tx, 0, b"\x00" * 20, P2PKH, min_satoshis=1000)
 
     # ----- Audit 02-F-5 — value & hash validation --------------------------
 
@@ -216,9 +193,7 @@ class TestAuditFindings:
         # Only 10 bytes after offset 0 — not enough for a full P2PKH output.
         raw_tx = b"\x00" * 10
         with pytest.raises(SpvVerificationError, match="truncated"):
-            verify_payment(
-                raw_tx, 0, b"\x00" * 20, P2PKH, min_satoshis=1000
-            )
+            verify_payment(raw_tx, 0, b"\x00" * 20, P2PKH, min_satoshis=1000)
 
 
 # --------------------------------------------------------------------------- mainnet fixtures
@@ -234,14 +209,9 @@ class TestMainnetFixtures:
         assert len(hash_le) == 32
         # Known mainnet BE hash starts with many zero bytes.
         hash_be = hash_le[::-1].hex()
-        assert hash_be.startswith(
-            "000000000000000000"
-        ), f"unexpected hash: {hash_be}"
+        assert hash_be.startswith("000000000000000000"), f"unexpected hash: {hash_be}"
         # Exact match on the known hash value.
-        assert (
-            hash_be
-            == "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
-        )
+        assert hash_be == "0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5"
 
     def test_block_840000_tampered_nonce_fails(self) -> None:
         """Tampered block 840000 (zero'd nonce) must fail PoW."""
@@ -310,9 +280,7 @@ class TestChain:
 
     def test_bad_chain_anchor_length_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            verify_chain(
-                [bytes.fromhex(BLOCK_840000)], chain_anchor=b"\x00" * 31
-            )
+            verify_chain([bytes.fromhex(BLOCK_840000)], chain_anchor=b"\x00" * 31)
 
     def test_header_wrong_length_rejected(self) -> None:
         with pytest.raises(ValidationError):
@@ -412,8 +380,7 @@ class TestWitnessStripping:
             "01000000"
             "00"
             "02"  # invalid flag
-            "01"
-            + "00" * 40
+            "01" + "00" * 40
         )
         with pytest.raises(ValidationError):
             strip_witness(bad)
@@ -538,15 +505,11 @@ class TestPaymentTypes:
 
     def test_unknown_type_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            verify_payment(
-                b"\x00" * 50, 0, b"\x00" * 20, "p2xxx", min_satoshis=1000
-            )
+            verify_payment(b"\x00" * 50, 0, b"\x00" * 20, "p2xxx", min_satoshis=1000)
 
     def test_negative_offset_rejected(self) -> None:
         with pytest.raises(ValidationError):
-            verify_payment(
-                b"\x00" * 50, -1, b"\x00" * 20, P2PKH, min_satoshis=1000
-            )
+            verify_payment(b"\x00" * 50, -1, b"\x00" * 20, P2PKH, min_satoshis=1000)
 
     def test_wrong_script_len_rejected(self) -> None:
         """P2PKH with script_len byte != 25 must be rejected."""
@@ -629,18 +592,10 @@ class TestCovenantParams:
     def test_p2tr_needs_32_byte_hash(self) -> None:
         """P2TR requires 32-byte hash; passing 20-byte hash must raise."""
         with pytest.raises(ValidationError):
-            CovenantParams(
-                **self._valid_kwargs(
-                    btc_receive_type="p2tr", btc_receive_hash=b"\x00" * 20
-                )
-            )
+            CovenantParams(**self._valid_kwargs(btc_receive_type="p2tr", btc_receive_hash=b"\x00" * 20))
 
     def test_p2tr_with_32_byte_hash_accepted(self) -> None:
-        params = CovenantParams(
-            **self._valid_kwargs(
-                btc_receive_type="p2tr", btc_receive_hash=b"\x00" * 32
-            )
-        )
+        params = CovenantParams(**self._valid_kwargs(btc_receive_type="p2tr", btc_receive_hash=b"\x00" * 32))
         assert params.btc_receive_type == P2TR
 
     def test_p2pkh_with_32_byte_hash_rejected(self) -> None:
@@ -776,9 +731,7 @@ class TestSpvProofBuilder:
             )
 
     @staticmethod
-    def _grind_header(
-        version: bytes, prev: bytes, merkle_le: bytes, nbits: bytes
-    ) -> bytes:
+    def _grind_header(version: bytes, prev: bytes, merkle_le: bytes, nbits: bytes) -> bytes:
         """Grind a nonce until the resulting header's hash beats the nBits target.
 
         Uses nBits with large target (exponent 0x1d / mantissa 0x7fffff).
@@ -835,9 +788,7 @@ class TestSpvProofBuilder:
         txid_be_hex = txid_le[::-1].hex()
 
         output_offset = 4 + 1 + 41 + 1
-        assert raw_tx[output_offset : output_offset + 8] == satoshis.to_bytes(
-            8, "little"
-        )
+        assert raw_tx[output_offset : output_offset + 8] == satoshis.to_bytes(8, "little")
 
         sibling_le = b"\xab" * 32
         sibling_be_hex = sibling_le[::-1].hex()
@@ -845,9 +796,7 @@ class TestSpvProofBuilder:
 
         anchor = b"\x99" * 32
         nbits = b"\xff\xff\x7f\x1d"  # large target, exponent 0x1d
-        header = self._grind_header(
-            b"\x00\x00\x00\x20", anchor, merkle_root_le, nbits
-        )
+        header = self._grind_header(b"\x00\x00\x00\x20", anchor, merkle_root_le, nbits)
         result = (
             txid_be_hex,
             raw_tx.hex(),
@@ -900,6 +849,7 @@ class TestSpvProofBuilder:
         assert proof.covenant_params is params
         # Direct construction without _token is now rejected (sentinel guard)
         from pyrxd.spv.proof import _BUILDER_TOKEN
+
         assert proof._token is _BUILDER_TOKEN
 
     def test_builder_rejects_insufficient_payment(self) -> None:

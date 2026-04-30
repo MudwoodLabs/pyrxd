@@ -16,13 +16,14 @@ Usage
     async with ElectrumXClient(["wss://electrumx.server1.com"]) as client:
         tip = await client.get_tip_height()
 """
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, List, Optional, Tuple
+from typing import Any
 
 import websockets
 from websockets.exceptions import WebSocketException
@@ -63,7 +64,7 @@ class UtxoRecord:
 _MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
 
-def _coerce_hex32(value: "Hex32 | bytes | bytearray | str") -> Hex32:
+def _coerce_hex32(value: Hex32 | bytes | bytearray | str) -> Hex32:
     """Normalize caller-supplied script_hash to Hex32 at the SDK boundary.
 
     Accepts Hex32 (passthrough), raw bytes/bytearray of length 32, or a
@@ -76,9 +77,7 @@ def _coerce_hex32(value: "Hex32 | bytes | bytearray | str") -> Hex32:
         return Hex32(bytes(value))
     if isinstance(value, str):
         return Hex32.from_hex(value)
-    raise ValidationError(
-        f"script_hash must be Hex32, bytes, or hex str; got {type(value).__name__}"
-    )
+    raise ValidationError(f"script_hash must be Hex32, bytes, or hex str; got {type(value).__name__}")
 
 
 def script_hash_for_address(address: str) -> Hex32:
@@ -120,7 +119,7 @@ class ElectrumXClient:
 
     def __init__(
         self,
-        urls: List[str],
+        urls: list[str],
         *,
         allow_insecure: bool = False,
         timeout: float = _DEFAULT_TIMEOUT,
@@ -130,7 +129,7 @@ class ElectrumXClient:
         self._urls = urls
         self._allow_insecure = allow_insecure
         self._timeout = timeout
-        self._ws: Optional[Any] = None  # websockets.WebSocketClientProtocol
+        self._ws: Any | None = None  # websockets.WebSocketClientProtocol
         self._id_counter: int = 0
         self._id_lock: asyncio.Lock = asyncio.Lock()
         # Send must be serialized across tasks — websockets.send is not
@@ -145,7 +144,7 @@ class ElectrumXClient:
         # B's result, because recv() returns whatever message arrives next
         # rather than the one matching A's request id.
         self._pending: dict[int, asyncio.Future[Any]] = {}
-        self._reader_task: Optional[asyncio.Task[None]] = None
+        self._reader_task: asyncio.Task[None] | None = None
 
         # Validate all URLs at construction time (fast-fail).
         for url in self._urls:
@@ -153,7 +152,7 @@ class ElectrumXClient:
 
     # ---------------------------------------------------------------------- context manager
 
-    async def __aenter__(self) -> "ElectrumXClient":
+    async def __aenter__(self) -> ElectrumXClient:
         await self._ensure_connected()
         return self
 
@@ -236,15 +235,13 @@ class ElectrumXClient:
             txid = Txid(txid)
         if not isinstance(height, BlockHeight):
             height = BlockHeight(height)
-        result = await self._call(
-            "blockchain.transaction.get_merkle", [str(txid), int(height)]
-        )
+        result = await self._call("blockchain.transaction.get_merkle", [str(txid), int(height)])
         # ElectrumX returns {"block_height": N, "merkle": [...], "pos": N}
         if not isinstance(result, dict):
             raise NetworkError("Unexpected response type for transaction merkle")
         try:
             block_height = BlockHeight(int(result["block_height"]))
-            merkle_hashes: List[str] = result["merkle"]
+            merkle_hashes: list[str] = result["merkle"]
             pos: int = int(result["pos"])
         except (KeyError, TypeError, ValueError):
             raise NetworkError("Malformed merkle response from server")
@@ -253,11 +250,9 @@ class ElectrumXClient:
         # ElectrumX returns hashes in display (reversed) order; we pass the
         # txid as the leaf and build a linear proof path.
         2 ** len(merkle_hashes)
-        path: list = [
-            [{"offset": pos, "hash_str": str(txid), "txid": True}]
-        ]
+        path: list = [[{"offset": pos, "hash_str": str(txid), "txid": True}]]
         current_pos = pos
-        for h, sibling_hex in enumerate(merkle_hashes):
+        for _h, sibling_hex in enumerate(merkle_hashes):
             sibling_offset = current_pos ^ 1
             path[0].append({"offset": sibling_offset, "hash_str": sibling_hex})
             current_pos = current_pos >> 1
@@ -281,9 +276,7 @@ class ElectrumXClient:
             The transaction id returned by the server.
         """
         validated = RawTx(raw_tx)
-        result = await self._call(
-            "blockchain.transaction.broadcast", [validated.hex()]
-        )
+        result = await self._call("blockchain.transaction.broadcast", [validated.hex()])
         if not isinstance(result, str):
             raise NetworkError("Unexpected response type for broadcast result")
         try:
@@ -291,9 +284,7 @@ class ElectrumXClient:
         except ValidationError as exc:
             raise NetworkError("Server returned invalid txid after broadcast") from exc
 
-    async def get_balance(
-        self, script_hash: "Hex32 | bytes | str"
-    ) -> Tuple[Satoshis, Satoshis]:
+    async def get_balance(self, script_hash: Hex32 | bytes | str) -> tuple[Satoshis, Satoshis]:
         """Return the confirmed and unconfirmed balance for *script_hash*.
 
         The ``script_hash`` is ``sha256(locking_script)`` with bytes reversed
@@ -306,9 +297,7 @@ class ElectrumXClient:
             ``(confirmed, unconfirmed)``
         """
         script_hash = _coerce_hex32(script_hash)
-        result = await self._call(
-            "blockchain.scripthash.get_balance", [script_hash.hex()]
-        )
+        result = await self._call("blockchain.scripthash.get_balance", [script_hash.hex()])
         if not isinstance(result, dict):
             raise NetworkError("Unexpected response type for balance")
         try:
@@ -318,16 +307,14 @@ class ElectrumXClient:
             raise NetworkError("Malformed balance response from server")
         return confirmed, unconfirmed
 
-    async def get_utxos(self, script_hash: "Hex32 | bytes | str") -> List[UtxoRecord]:
+    async def get_utxos(self, script_hash: Hex32 | bytes | str) -> list[UtxoRecord]:
         """Return the list of UTXOs for *script_hash*.
 
         Accepts ``Hex32``, raw ``bytes`` (length 32), or a hex ``str``
         (length 64). Each UTXO is returned as a typed :class:`UtxoRecord`.
         """
         script_hash = _coerce_hex32(script_hash)
-        result = await self._call(
-            "blockchain.scripthash.listunspent", [script_hash.hex()]
-        )
+        result = await self._call("blockchain.scripthash.listunspent", [script_hash.hex()])
         if not isinstance(result, list):
             raise NetworkError("Unexpected response type for UTXOs")
         try:
@@ -343,25 +330,18 @@ class ElectrumXClient:
         except (KeyError, TypeError, ValueError):
             raise NetworkError("Malformed UTXO entry in server response")
 
-    async def get_history(
-        self, script_hash: "Hex32 | bytes | str"
-    ) -> List[dict]:
+    async def get_history(self, script_hash: Hex32 | bytes | str) -> list[dict]:
         """Return the transaction history for *script_hash*.
 
         Returns a list of ``{"tx_hash": str, "height": int}`` dicts.
         Unconfirmed transactions have ``height`` of 0 or negative.
         """
         script_hash = _coerce_hex32(script_hash)
-        result = await self._call(
-            "blockchain.scripthash.get_history", [script_hash.hex()]
-        )
+        result = await self._call("blockchain.scripthash.get_history", [script_hash.hex()])
         if not isinstance(result, list):
             raise NetworkError("Unexpected response type for history")
         try:
-            return [
-                {"tx_hash": str(item["tx_hash"]), "height": int(item["height"])}
-                for item in result
-            ]
+            return [{"tx_hash": str(item["tx_hash"]), "height": int(item["height"])} for item in result]
         except (KeyError, TypeError, ValueError):
             raise NetworkError("Malformed history entry in server response")
 
@@ -377,9 +357,7 @@ class ElectrumXClient:
         except ValueError:
             raise NetworkError("Server returned invalid hex for block header")
         if len(header_bytes) != 80:
-            raise NetworkError(
-                f"Block header must be 80 bytes, got {len(header_bytes)}"
-            )
+            raise NetworkError(f"Block header must be 80 bytes, got {len(header_bytes)}")
         return header_bytes
 
     async def get_tip_height(self) -> BlockHeight:
@@ -408,11 +386,9 @@ class ElectrumXClient:
     def _validate_url(self, url: str) -> None:
         """Raise NetworkError if *url* is insecure and allow_insecure is False."""
         if url.startswith("ws://") and not self._allow_insecure:
-            raise NetworkError(
-                "Insecure WebSocket URL rejected. Use wss:// or pass allow_insecure=True."
-            )
+            raise NetworkError("Insecure WebSocket URL rejected. Use wss:// or pass allow_insecure=True.")
         if not (url.startswith("wss://") or url.startswith("ws://")):
-            raise NetworkError(f"URL must start with wss:// or ws:// (got scheme)")
+            raise NetworkError("URL must start with wss:// or ws:// (got scheme)")
 
     async def _ensure_connected(self) -> None:
         """Connect to the first available server (if not already connected) and
@@ -429,9 +405,7 @@ class ElectrumXClient:
         if self._reader_task is None or self._reader_task.done():
             self._reader_task = asyncio.create_task(self._reader_loop())
 
-    async def _connect_first(
-        self, urls: List[str], timeout: float
-    ) -> Any:  # websockets.WebSocketClientProtocol
+    async def _connect_first(self, urls: list[str], timeout: float) -> Any:  # websockets.WebSocketClientProtocol
         """Race all *urls* concurrently; return the first successful WebSocket.
 
         Unlike the previous sequential loop (N18), the worst-case connect
@@ -458,8 +432,8 @@ class ElectrumXClient:
             return ws
 
         tasks = [asyncio.create_task(_try(url)) for url in urls]
-        winner_ws: Optional[Any] = None
-        last_exc: Optional[Exception] = None
+        winner_ws: Any | None = None
+        last_exc: Exception | None = None
         remaining: set[asyncio.Task[Any]] = set(tasks)
 
         try:
@@ -475,9 +449,7 @@ class ElectrumXClient:
                 )
 
                 if not done:
-                    last_exc = last_exc or asyncio.TimeoutError(
-                        f"No ElectrumX endpoint responded within {timeout}s"
-                    )
+                    last_exc = last_exc or asyncio.TimeoutError(f"No ElectrumX endpoint responded within {timeout}s")
                     break
 
                 for task in done:
@@ -545,16 +517,12 @@ class ElectrumXClient:
                         # Oversized message — the server is misbehaving;
                         # disconnect and fail all pending so callers retry
                         # against a fresh connection (or another server).
-                        self._fail_all_pending(
-                            NetworkError("ElectrumX response exceeds maximum allowed size")
-                        )
+                        self._fail_all_pending(NetworkError("ElectrumX response exceeds maximum allowed size"))
                         return
                     raw_str = raw.decode("utf-8", errors="replace")
                 else:
                     if len(raw) > _MAX_RESPONSE_BYTES:
-                        self._fail_all_pending(
-                            NetworkError("ElectrumX response exceeds maximum allowed size")
-                        )
+                        self._fail_all_pending(NetworkError("ElectrumX response exceeds maximum allowed size"))
                         return
                     raw_str = raw
 
@@ -579,9 +547,7 @@ class ElectrumXClient:
 
                 fut = self._pending.pop(req_id, None)
                 if fut is None or fut.done():
-                    logger.debug(
-                        "ElectrumX reader dropped orphan response id=%d", req_id
-                    )
+                    logger.debug("ElectrumX reader dropped orphan response id=%d", req_id)
                     continue
 
                 if "error" in data and data["error"] is not None:
@@ -660,4 +626,3 @@ class ElectrumXClient:
             # Drop the pending entry whether we got a response, errored, or
             # timed out. If the reader has already popped it, this is a no-op.
             self._pending.pop(req_id, None)
-

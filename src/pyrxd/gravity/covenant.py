@@ -39,10 +39,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from pyrxd.security.errors import ValidationError
 from pyrxd.gravity.codehash import (
     compute_p2sh_code_hash,
 )
+from pyrxd.security.errors import ValidationError
 
 __all__ = [
     "CovenantArtifact",
@@ -82,6 +82,7 @@ _MIN_DEADLINE_DELTA = 24 * 3600  # 24 hours in seconds
 # Script integer encoding (Bitcoin scriptnum / CScriptNum)
 # ---------------------------------------------------------------------------
 
+
 def _encode_int_push(n: int) -> bytes:
     """Encode an integer as a minimal Bitcoin script push."""
     if n == 0:
@@ -109,7 +110,7 @@ def _encode_bytes_push(hex_val: str) -> bytes:
     if n <= 75:
         return bytes([n]) + b
     elif n <= 255:
-        return b"\x4c" + bytes([n]) + b   # OP_PUSHDATA1
+        return b"\x4c" + bytes([n]) + b  # OP_PUSHDATA1
     elif n <= 65535:
         return b"\x4d" + n.to_bytes(2, "little") + b  # OP_PUSHDATA2
     else:
@@ -120,16 +121,17 @@ def _encode_bytes_push(hex_val: str) -> bytes:
 # CovenantArtifact
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class CovenantArtifact:
     """A loaded, pre-compiled covenant artifact with parameter substitution."""
 
     contract: str
-    hex_template: str   # bytecode with <param> placeholders
-    abi: list[dict]     # ABI entries from the artifact JSON
+    hex_template: str  # bytecode with <param> placeholders
+    abi: list[dict]  # ABI entries from the artifact JSON
 
     @classmethod
-    def load(cls, name: str, *, allow_legacy: bool = False) -> "CovenantArtifact":
+    def load(cls, name: str, *, allow_legacy: bool = False) -> CovenantArtifact:
         """
         Load a bundled artifact by stem name (without ``.artifact.json``).
 
@@ -142,6 +144,7 @@ class CovenantArtifact:
         # Reject names containing path separators or traversal sequences.
         # We also resolve and assert containment after joining, as defense-in-depth.
         import re as _re
+
         if not _re.fullmatch(r"[A-Za-z0-9_\-]+", name):
             raise ValidationError(
                 f"Artifact name {name!r} contains invalid characters. "
@@ -151,22 +154,14 @@ class CovenantArtifact:
         resolved = path.resolve()
         artifacts_resolved = _ARTIFACTS_DIR.resolve()
         if not str(resolved).startswith(str(artifacts_resolved) + "/"):
-            raise ValidationError(
-                f"Artifact name {name!r} resolves outside the bundled artifacts directory."
-            )
+            raise ValidationError(f"Artifact name {name!r} resolves outside the bundled artifacts directory.")
         if not path.exists():
-            available = sorted(
-                p.stem.removesuffix(".artifact")
-                for p in _ARTIFACTS_DIR.glob("*.artifact.json")
-            )
-            raise FileNotFoundError(
-                f"Artifact '{name}' not found in bundled artifacts. "
-                f"Available: {available}"
-            )
+            available = sorted(p.stem.removesuffix(".artifact") for p in _ARTIFACTS_DIR.glob("*.artifact.json"))
+            raise FileNotFoundError(f"Artifact '{name}' not found in bundled artifacts. Available: {available}")
         return cls.from_json(path.read_text(), allow_legacy=allow_legacy)
 
     @classmethod
-    def from_json(cls, json_text: str, *, allow_legacy: bool = False) -> "CovenantArtifact":
+    def from_json(cls, json_text: str, *, allow_legacy: bool = False) -> CovenantArtifact:
         """Load from raw artifact JSON (e.g. from a custom compiled artifact)."""
         import hashlib
 
@@ -247,9 +242,7 @@ class CovenantArtifact:
                 # Reject malformed hex early — bytes.fromhex would silently
                 # accept 'odd-length' in some paths; enforce here.
                 if len(hex_val) % 2 != 0:
-                    raise ValidationError(
-                        f"param {name!r}: hex value has odd length ({len(hex_val)} chars)"
-                    )
+                    raise ValidationError(f"param {name!r}: hex value has odd length ({len(hex_val)} chars)")
                 byte_len = len(hex_val) // 2
                 expected_len = _FIXED_LENGTHS.get(ptype)
                 if expected_len is not None and byte_len != expected_len:
@@ -277,6 +270,7 @@ class CovenantArtifact:
 # ---------------------------------------------------------------------------
 # Deadline validation (S1 guard — audit 04)
 # ---------------------------------------------------------------------------
+
 
 def validate_claim_deadline(
     claim_deadline: int,
@@ -310,25 +304,26 @@ def validate_claim_deadline(
 # High-level factory: build_gravity_offer
 # ---------------------------------------------------------------------------
 
+
 def build_gravity_offer(
-    maker_pkh: bytes,       # 20-byte Radiant PKH of the Maker
-    maker_pk: bytes,        # 33-byte compressed pubkey of the Maker
-    taker_pk: bytes,        # 33-byte compressed pubkey of the Taker
+    maker_pkh: bytes,  # 20-byte Radiant PKH of the Maker
+    maker_pk: bytes,  # 33-byte compressed pubkey of the Maker
+    taker_pk: bytes,  # 33-byte compressed pubkey of the Taker
     taker_radiant_pkh: bytes,  # 20-byte Radiant PKH of the Taker
-    btc_receive_hash: bytes,   # 20B (p2pkh/p2wpkh/p2sh) or 32B (p2tr) BTC dest
-    btc_receive_type: str,     # "p2pkh" | "p2wpkh" | "p2sh" | "p2tr"
+    btc_receive_hash: bytes,  # 20B (p2pkh/p2wpkh/p2sh) or 32B (p2tr) BTC dest
+    btc_receive_type: str,  # "p2pkh" | "p2wpkh" | "p2sh" | "p2tr"
     btc_satoshis: int,
-    btc_chain_anchor: bytes,   # 32-byte LE prevHash of BTC anchor block
-    expected_nbits: bytes,     # 4-byte LE nBits of expected BTC difficulty
+    btc_chain_anchor: bytes,  # 32-byte LE prevHash of BTC anchor block
+    expected_nbits: bytes,  # 4-byte LE nBits of expected BTC difficulty
     anchor_height: int,
     merkle_depth: int,
-    claim_deadline: int,       # Unix timestamp; must be at least 24h from now
+    claim_deadline: int,  # Unix timestamp; must be at least 24h from now
     photons_offered: int,
     expected_nbits_next: bytes | None = None,  # if None, same as expected_nbits
     accept_short_deadline: bool = False,
     covenant_artifact_name: str = "maker_covenant_flat_12x20_sentinel_all",
     offer_artifact_name: str = "maker_offer",
-) -> "Any":
+) -> Any:
     """
     Build a :class:`~pyrxd.gravity.types.GravityOffer` with real covenant
     redeem scripts generated from the bundled artifacts.
@@ -359,21 +354,13 @@ def build_gravity_offer(
     # code hash that will be rejected on-chain (wasting the Maker's funding
     # fee and burning a txid).
     if len(maker_pkh) != 20:
-        raise ValidationError(
-            f"maker_pkh must be 20 bytes (Radiant PKH); got {len(maker_pkh)}"
-        )
+        raise ValidationError(f"maker_pkh must be 20 bytes (Radiant PKH); got {len(maker_pkh)}")
     if len(maker_pk) != 33:
-        raise ValidationError(
-            f"maker_pk must be 33 bytes (compressed secp256k1 pubkey); got {len(maker_pk)}"
-        )
+        raise ValidationError(f"maker_pk must be 33 bytes (compressed secp256k1 pubkey); got {len(maker_pk)}")
     if len(taker_pk) != 33:
-        raise ValidationError(
-            f"taker_pk must be 33 bytes (compressed secp256k1 pubkey); got {len(taker_pk)}"
-        )
+        raise ValidationError(f"taker_pk must be 33 bytes (compressed secp256k1 pubkey); got {len(taker_pk)}")
     if len(taker_radiant_pkh) != 20:
-        raise ValidationError(
-            f"taker_radiant_pkh must be 20 bytes; got {len(taker_radiant_pkh)}"
-        )
+        raise ValidationError(f"taker_radiant_pkh must be 20 bytes; got {len(taker_radiant_pkh)}")
     expected_btc_hash_len = 32 if btc_receive_type == "p2tr" else 20
     if len(btc_receive_hash) != expected_btc_hash_len:
         raise ValidationError(
@@ -381,14 +368,9 @@ def build_gravity_offer(
             f"{expected_btc_hash_len} bytes; got {len(btc_receive_hash)}"
         )
     if len(btc_chain_anchor) != 32:
-        raise ValidationError(
-            f"btc_chain_anchor must be 32 bytes (BTC block hash); "
-            f"got {len(btc_chain_anchor)}"
-        )
+        raise ValidationError(f"btc_chain_anchor must be 32 bytes (BTC block hash); got {len(btc_chain_anchor)}")
     if len(expected_nbits) != 4:
-        raise ValidationError(
-            f"expected_nbits must be 4 bytes (LE nBits); got {len(expected_nbits)}"
-        )
+        raise ValidationError(f"expected_nbits must be 4 bytes (LE nBits); got {len(expected_nbits)}")
     if btc_satoshis <= 0:
         raise ValidationError(
             f"btc_satoshis must be > 0; got {btc_satoshis}. Negative or zero "
@@ -396,16 +378,12 @@ def build_gravity_offer(
             "producing a redeem that cannot be satisfied by any BTC payment."
         )
     if photons_offered <= 0:
-        raise ValidationError(
-            f"photons_offered must be > 0; got {photons_offered}"
-        )
+        raise ValidationError(f"photons_offered must be > 0; got {photons_offered}")
 
     if expected_nbits_next is None:
         expected_nbits_next = expected_nbits
     elif len(expected_nbits_next) != 4:
-        raise ValidationError(
-            f"expected_nbits_next must be 4 bytes; got {len(expected_nbits_next)}"
-        )
+        raise ValidationError(f"expected_nbits_next must be 4 bytes; got {len(expected_nbits_next)}")
 
     # 1. Substitute MakerClaimed code-section params (state params excluded —
     #    takerRadiantPkh and claimDeadline are in the state section, not the
@@ -430,8 +408,7 @@ def build_gravity_offer(
     _VALID_BTC_RECEIVE_TYPES = {"p2pkh": 0, "p2wpkh": 1, "p2sh": 2, "p2tr": 3}
     if btc_receive_type not in _VALID_BTC_RECEIVE_TYPES:
         raise ValidationError(
-            f"btc_receive_type must be one of {list(_VALID_BTC_RECEIVE_TYPES)}; "
-            f"got {btc_receive_type!r}"
+            f"btc_receive_type must be one of {list(_VALID_BTC_RECEIVE_TYPES)}; got {btc_receive_type!r}"
         )
     ctor_param_names = {p["name"] for p in claimed_artifact.constructor_params()}
     _btc_type_int = _VALID_BTC_RECEIVE_TYPES[btc_receive_type]

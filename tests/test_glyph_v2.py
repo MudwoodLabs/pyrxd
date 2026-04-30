@@ -1,25 +1,27 @@
 """Tests for Glyph V2 additions: protocol IDs 8-10, mutable NFT script, mutable scriptSig."""
+
 from __future__ import annotations
 
 import pytest
 
 from pyrxd.glyph.payload import build_mutable_scriptsig, encode_payload
 from pyrxd.glyph.script import (
-    MUTABLE_NFT_SCRIPT_SIZE,
     _MUTABLE_NFT_BODY,
+    MUTABLE_NFT_SCRIPT_SIZE,
     build_mutable_nft_script,
     parse_mutable_nft_script,
 )
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.security.errors import ValidationError
 
-_REF_A = GlyphRef(txid='aa' * 32, vout=1)
+_REF_A = GlyphRef(txid="aa" * 32, vout=1)
 _HASH32 = bytes(range(32))
 
 
 # ---------------------------------------------------------------------------
 # Protocol IDs 8 / 9 / 10
 # ---------------------------------------------------------------------------
+
 
 def test_protocol_enum_values():
     assert GlyphProtocol.ENCRYPTED == 8
@@ -64,6 +66,7 @@ def test_encrypted_requires_nft():
 # Protocol combination rules
 # ---------------------------------------------------------------------------
 
+
 def test_ft_and_nft_mutually_exclusive():
     with pytest.raises(ValidationError, match="mutually exclusive"):
         GlyphMetadata(protocol=[GlyphProtocol.FT, GlyphProtocol.NFT], name="Bad")
@@ -105,13 +108,14 @@ def test_dmint_requires_ft():
 # Mutable NFT output script
 # ---------------------------------------------------------------------------
 
+
 def test_mutable_nft_body_matches_photonic_reference():
     # Body hex derived from parseMutableScript regex in Photonic Wallet script.ts
     # with glyph magic bytes '676c79' substituted.
     REFERENCE = (
-        '7601207f818c54807e5279e2547a0124957f7701247f75887cec7b7f7701457f75'
-        '7801207ec0caa87e885279036d6f64876378eac0e98878ec01205579aa7e01757e'
-        '8867527902736c8878cd01d852797e016a7e8778da009c9b6968547a03676c79886d6d51'
+        "7601207f818c54807e5279e2547a0124957f7701247f75887cec7b7f7701457f75"
+        "7801207ec0caa87e885279036d6f64876378eac0e98878ec01205579aa7e01757e"
+        "8867527902736c8878cd01d852797e016a7e8778da009c9b6968547a03676c79886d6d51"
     )
     assert _MUTABLE_NFT_BODY.hex() == REFERENCE
     assert len(_MUTABLE_NFT_BODY) == 102
@@ -131,9 +135,9 @@ def test_mutable_nft_script_structure():
     # Byte 33: OP_DROP
     assert script[33] == 0x75
     # Byte 34: OP_STATESEPARATOR
-    assert script[34] == 0xbd
+    assert script[34] == 0xBD
     # Byte 35: OP_PUSHINPUTREFSINGLETON
-    assert script[35] == 0xd8
+    assert script[35] == 0xD8
     # Bytes 36..71: mutable ref (36 bytes)
     assert script[36:72] == _REF_A.to_bytes()
     # Bytes 72..173: fixed body
@@ -150,19 +154,20 @@ def test_mutable_nft_script_parse_round_trip():
 
 
 def test_mutable_nft_script_parse_returns_none_for_garbage():
-    assert parse_mutable_nft_script(b'\x00' * 175) is None
-    assert parse_mutable_nft_script(b'\x00' * 63) is None
-    assert parse_mutable_nft_script(b'') is None
+    assert parse_mutable_nft_script(b"\x00" * 175) is None
+    assert parse_mutable_nft_script(b"\x00" * 63) is None
+    assert parse_mutable_nft_script(b"") is None
 
 
 def test_mutable_nft_script_wrong_hash_raises():
     with pytest.raises(ValidationError, match="32 bytes"):
-        build_mutable_nft_script(_REF_A, b'\x00' * 31)
+        build_mutable_nft_script(_REF_A, b"\x00" * 31)
 
 
 # ---------------------------------------------------------------------------
 # Mutable scriptSig (mod / sl)
 # ---------------------------------------------------------------------------
+
 
 def _make_cbor() -> bytes:
     meta = GlyphMetadata(protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT], name="Test")
@@ -174,16 +179,16 @@ def test_mutable_scriptsig_mod_structure():
     cbor = _make_cbor()
     sig = build_mutable_scriptsig("mod", cbor, 0, 1, 0, 1)
     # First 4 bytes: \x03 + b'gly'
-    assert sig[:4] == b'\x03gly'
+    assert sig[:4] == b"\x03gly"
     # "mod" appears somewhere after cbor push
-    assert b'mod' in sig
+    assert b"mod" in sig
 
 
 def test_mutable_scriptsig_sl_structure():
     cbor = _make_cbor()
     sig = build_mutable_scriptsig("sl", cbor, 0, 0, 0, 0)
-    assert sig[:4] == b'\x03gly'
-    assert b'sl' in sig
+    assert sig[:4] == b"\x03gly"
+    assert b"sl" in sig
 
 
 def test_mutable_scriptsig_invalid_operation():
@@ -196,7 +201,7 @@ def test_mutable_scriptsig_indices_encoded():
     cbor = _make_cbor()
     # contract_output_index=5 → OP_5 = 0x55
     sig = build_mutable_scriptsig("mod", cbor, 5, 0, 0, 0)
-    assert b'\x55' in sig  # OP_5
+    assert b"\x55" in sig  # OP_5
 
 
 def test_mutable_scriptsig_cbor_pushed_correctly():
@@ -205,6 +210,6 @@ def test_mutable_scriptsig_cbor_pushed_correctly():
     # CBOR length prefix must appear in scriptSig (small payload ≤ 75 → 1-byte length)
     cbor_len = len(cbor)
     assert cbor_len <= 75
-    idx = sig.index(b'\x03gly') + 4
+    idx = sig.index(b"\x03gly") + 4
     assert sig[idx] == cbor_len
-    assert sig[idx + 1: idx + 1 + cbor_len] == cbor
+    assert sig[idx + 1 : idx + 1 + cbor_len] == cbor

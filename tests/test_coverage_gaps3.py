@@ -5,13 +5,15 @@ Targets (from 2026-04-24 coverage report):
 - transaction/transaction.py   (64% → target ≥ 80%): BEEF/EF, from_beef
 - transaction_preimage.py      (67% → target ≥ 80%): SIGHASH variants
 """
+
 from __future__ import annotations
 
 import pytest
 
+from pyrxd.constants import SIGHASH
+from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
-from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
@@ -44,12 +46,11 @@ from pyrxd.utils import (
     unsigned_to_varint,
     validate_address,
 )
-from pyrxd.constants import SIGHASH
-
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
 
 def _pk(n: int = 1) -> PrivateKey:
     return PrivateKey(n)
@@ -75,6 +76,7 @@ def _tx_in(pk: PrivateKey, src: Transaction, idx: int = 0) -> TransactionInput:
 # ---------------------------------------------------------------------------
 # utils.py — unsigned_to_varint
 # ---------------------------------------------------------------------------
+
 
 class TestUnsignedToVarint:
     def test_single_byte(self):
@@ -109,6 +111,7 @@ class TestUnsignedToVarint:
 # utils.py — unsigned_to_bytes
 # ---------------------------------------------------------------------------
 
+
 class TestUnsignedToBytes:
     def test_small_value(self):
         result = unsigned_to_bytes(1)
@@ -127,18 +130,19 @@ class TestUnsignedToBytes:
 # utils.py — encode_pushdata
 # ---------------------------------------------------------------------------
 
+
 class TestEncodePushdata:
     def test_empty_minimal(self):
         result = encode_pushdata(b"")
-        assert result == b"\x00"   # OP_0
+        assert result == b"\x00"  # OP_0
 
     def test_single_byte_1_to_16(self):
         result = encode_pushdata(b"\x01")
-        assert result == b"\x51"   # OP_1
+        assert result == b"\x51"  # OP_1
 
     def test_single_byte_0x81(self):
         result = encode_pushdata(b"\x81")
-        assert result == b"\x4f"   # OP_1NEGATE
+        assert result == b"\x4f"  # OP_1NEGATE
 
     def test_non_minimal_empty_raises(self):
         with pytest.raises(ValidationError):
@@ -151,18 +155,19 @@ class TestEncodePushdata:
     def test_pushdata1_range(self):
         data = b"\xab" * 80
         result = encode_pushdata(data)
-        assert result[0] == 0x4c   # OP_PUSHDATA1
+        assert result[0] == 0x4C  # OP_PUSHDATA1
         assert result[1] == 80
 
     def test_pushdata2_range(self):
         data = b"\xcd" * 300
         result = encode_pushdata(data)
-        assert result[0] == 0x4d   # OP_PUSHDATA2
+        assert result[0] == 0x4D  # OP_PUSHDATA2
 
 
 # ---------------------------------------------------------------------------
 # utils.py — get_pushdata_code
 # ---------------------------------------------------------------------------
+
 
 class TestGetPushdataCode:
     def test_direct_push(self):
@@ -189,9 +194,10 @@ class TestGetPushdataCode:
 # utils.py — encode_int
 # ---------------------------------------------------------------------------
 
+
 class TestEncodeInt:
     def test_zero(self):
-        assert encode_int(0) == b"\x00"   # OP_0
+        assert encode_int(0) == b"\x00"  # OP_0
 
     def test_positive(self):
         result = encode_int(5)
@@ -205,6 +211,7 @@ class TestEncodeInt:
 # ---------------------------------------------------------------------------
 # utils.py — deserialize_ecdsa_der / serialize_ecdsa_der
 # ---------------------------------------------------------------------------
+
 
 class TestECDSADer:
     def test_roundtrip(self):
@@ -222,10 +229,11 @@ class TestECDSADer:
 
     def test_high_s_clamped(self):
         from pyrxd.curve import curve
+
         r = 1
-        s = curve.n - 1   # high-s, should be clamped to 1
+        s = curve.n - 1  # high-s, should be clamped to 1
         reencoded = serialize_ecdsa_der((r, s))
-        r2, s2 = deserialize_ecdsa_der(reencoded)
+        _r2, s2 = deserialize_ecdsa_der(reencoded)
         assert s2 <= curve.n // 2
 
 
@@ -233,11 +241,12 @@ class TestECDSADer:
 # utils.py — recoverable ECDSA
 # ---------------------------------------------------------------------------
 
+
 class TestECDSARecoverable:
     def test_roundtrip(self):
         sig_tuple = (12345, 67890, 0)
         serialized = serialize_ecdsa_recoverable(sig_tuple)
-        r, s, rec = deserialize_ecdsa_recoverable(serialized)
+        _r, _s, rec = deserialize_ecdsa_recoverable(serialized)
         assert rec == 0
 
     def test_bad_length_raises(self):
@@ -257,6 +266,7 @@ class TestECDSARecoverable:
 # ---------------------------------------------------------------------------
 # utils.py — bytes_to_bits / bits_to_bytes
 # ---------------------------------------------------------------------------
+
 
 class TestBitConversions:
     def test_bytes_to_bits_str(self):
@@ -280,6 +290,7 @@ class TestBitConversions:
 # utils.py — randbytes
 # ---------------------------------------------------------------------------
 
+
 class TestRandbytes:
     def test_correct_length(self):
         assert len(randbytes(32)) == 32
@@ -289,6 +300,7 @@ class TestRandbytes:
 # ---------------------------------------------------------------------------
 # utils.py — to_bytes / to_hex / to_utf8 / encode
 # ---------------------------------------------------------------------------
+
 
 class TestConversionHelpers:
     def test_to_bytes_bytes(self):
@@ -305,6 +317,7 @@ class TestConversionHelpers:
 
     def test_to_bytes_base64(self):
         import base64
+
         encoded = base64.b64encode(b"hello").decode()
         assert to_bytes(encoded, "base64") == b"hello"
 
@@ -321,7 +334,7 @@ class TestConversionHelpers:
         assert to_utf8([104, 105]) == "hi"
 
     def test_encode_hex(self):
-        result = encode([0xde, 0xad], "hex")
+        result = encode([0xDE, 0xAD], "hex")
         assert result == "dead"
 
     def test_encode_utf8(self):
@@ -336,6 +349,7 @@ class TestConversionHelpers:
 # ---------------------------------------------------------------------------
 # utils.py — base58 helpers
 # ---------------------------------------------------------------------------
+
 
 class TestBase58Helpers:
     def test_from_to_base58_roundtrip(self):
@@ -378,11 +392,12 @@ class TestBase58Helpers:
 # utils.py — decode_address / validate_address
 # ---------------------------------------------------------------------------
 
+
 class TestAddressUtils:
     def test_decode_mainnet(self):
         pk = _pk(1)
         addr = pk.address()
-        pkh, network = decode_address(addr)
+        pkh, _network = decode_address(addr)
         assert len(pkh) == 20
 
     def test_decode_invalid_raises(self):
@@ -398,6 +413,7 @@ class TestAddressUtils:
 
     def test_validate_network_match(self):
         from pyrxd.constants import Network
+
         addr = _pk(1).address()
         assert validate_address(addr, Network.MAINNET) is True
 
@@ -406,10 +422,11 @@ class TestAddressUtils:
 # utils.py — serialize_text / text_digest
 # ---------------------------------------------------------------------------
 
+
 class TestTextHelpers:
     def test_serialize_text(self):
         result = serialize_text("hello")
-        assert result[0] == 5   # varint length
+        assert result[0] == 5  # varint length
         assert result[1:] == b"hello"
 
     def test_text_digest(self):
@@ -421,6 +438,7 @@ class TestTextHelpers:
 # ---------------------------------------------------------------------------
 # utils.py — Writer / Reader
 # ---------------------------------------------------------------------------
+
 
 class TestWriterReader:
     def test_write_uint8(self):
@@ -580,6 +598,7 @@ class TestWriterReader:
 # transaction/transaction.py — EF format (to_ef error paths)
 # ---------------------------------------------------------------------------
 
+
 class TestTransactionEF:
     def test_to_ef_no_source_tx_raises(self):
         pk = _pk(500)
@@ -633,6 +652,7 @@ class TestTransactionEF:
 # ---------------------------------------------------------------------------
 # transaction_preimage.py — SIGHASH variants
 # ---------------------------------------------------------------------------
+
 
 class TestPreimageSighashVariants:
     def _build_tx(self, pk: PrivateKey, satoshis: int = 50_000):

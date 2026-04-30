@@ -12,6 +12,7 @@ Signing algorithm:
 
 Verification reverses steps 1-3 and calls PublicKey.verify().
 """
+
 from __future__ import annotations
 
 import hashlib

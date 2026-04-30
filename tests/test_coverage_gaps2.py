@@ -6,6 +6,7 @@ Targets (from 2026-04-24 coverage report):
 - transaction/transaction.py  (46% → target ≥ 75%)
 - keys.py                 (61% → target ≥ 80%)
 """
+
 from __future__ import annotations
 
 import pytest
@@ -13,25 +14,25 @@ import pytest
 from pyrxd.keys import PrivateKey, PublicKey, recover_public_key, verify_signed_text
 from pyrxd.script.script import Script, ScriptChunk
 from pyrxd.script.type import (
-    BareMultisig,
-    OpReturn,
     P2PK,
     P2PKH,
+    BareMultisig,
+    OpReturn,
     RPuzzle,
 )
+from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction import InsufficientFunds, Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
-from pyrxd.security.errors import ValidationError
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture(scope="module")
 def keypair():
-    pk = PrivateKey(1)   # deterministic
+    pk = PrivateKey(1)  # deterministic
     return pk, pk.public_key()
 
 
@@ -47,6 +48,7 @@ def _p2pkh_script(addr: str) -> Script:
 # ---------------------------------------------------------------------------
 # script/type.py — P2PKH lock from bytes
 # ---------------------------------------------------------------------------
+
 
 class TestP2PKHLock:
     def test_lock_from_address(self, address):
@@ -65,12 +67,13 @@ class TestP2PKHLock:
 
     def test_lock_bad_pkh_length_raises(self):
         with pytest.raises(ValidationError):
-            P2PKH().lock(b"\xab" * 10)   # 10 bytes, not 20
+            P2PKH().lock(b"\xab" * 10)  # 10 bytes, not 20
 
 
 # ---------------------------------------------------------------------------
 # script/type.py — OpReturn
 # ---------------------------------------------------------------------------
+
 
 class TestOpReturn:
     def test_lock_bytes_pushdata(self):
@@ -88,18 +91,19 @@ class TestOpReturn:
 
     def test_empty_pushdatas(self):
         s = OpReturn().lock([])
-        assert s.byte_length() == 2   # OP_FALSE OP_RETURN only
+        assert s.byte_length() == 2  # OP_FALSE OP_RETURN only
 
 
 # ---------------------------------------------------------------------------
 # script/type.py — P2PK
 # ---------------------------------------------------------------------------
 
+
 class TestP2PK:
     def test_lock_from_bytes(self, keypair):
         pub_bytes = keypair[1].serialize()
         s = P2PK().lock(pub_bytes)
-        assert s.byte_length() == 35    # 33-byte compressed + OP_CHECKSIG + push
+        assert s.byte_length() == 35  # 33-byte compressed + OP_CHECKSIG + push
 
     def test_lock_from_hex_str(self, keypair):
         pub_hex = keypair[1].hex()
@@ -112,12 +116,13 @@ class TestP2PK:
 
     def test_lock_bad_key_length_raises(self):
         with pytest.raises(ValidationError):
-            P2PK().lock(b"\x02" + b"\xab" * 10)   # wrong length
+            P2PK().lock(b"\x02" + b"\xab" * 10)  # wrong length
 
 
 # ---------------------------------------------------------------------------
 # script/type.py — BareMultisig
 # ---------------------------------------------------------------------------
+
 
 class TestBareMultisig:
     def test_lock_2of3(self):
@@ -130,7 +135,7 @@ class TestBareMultisig:
         keys = [PrivateKey(i) for i in range(1, 3)]
         pubs = [k.public_key().hex() for k in keys]
         with pytest.raises(ValidationError):
-            BareMultisig().lock(pubs, threshold=5)   # > len(pubs)
+            BareMultisig().lock(pubs, threshold=5)  # > len(pubs)
 
     def test_lock_bad_pub_type_raises(self):
         with pytest.raises(TypeError):
@@ -150,6 +155,7 @@ class TestBareMultisig:
 # ---------------------------------------------------------------------------
 # script/type.py — RPuzzle
 # ---------------------------------------------------------------------------
+
 
 class TestRPuzzle:
     def test_invalid_type_raises(self):
@@ -192,6 +198,7 @@ class TestRPuzzle:
 # script/script.py — ScriptChunk
 # ---------------------------------------------------------------------------
 
+
 class TestScriptChunk:
     def test_str_with_data(self):
         chunk = ScriptChunk(b"\x01", b"\xab")
@@ -205,6 +212,7 @@ class TestScriptChunk:
 # ---------------------------------------------------------------------------
 # script/script.py — Script
 # ---------------------------------------------------------------------------
+
 
 class TestScript:
     def test_none_creates_empty(self):
@@ -242,7 +250,7 @@ class TestScript:
         assert s.size_varint() == s.byte_length_varint()
 
     def test_is_push_only_true(self):
-        s = Script(b"\x01\xab")   # push 1 byte
+        s = Script(b"\x01\xab")  # push 1 byte
         assert s.is_push_only() is True
 
     def test_is_push_only_false(self):
@@ -296,7 +304,7 @@ class TestScript:
 
     def test_find_and_delete(self):
         s = Script("76a914" + "ab" * 20 + "88ac")
-        pattern = Script("76")   # OP_DUP
+        pattern = Script("76")  # OP_DUP
         result = Script.find_and_delete(s, pattern)
         assert b"\x76" not in result.serialize()
 
@@ -315,6 +323,7 @@ class TestScript:
     def test_pushdata2_parsing(self):
         data = b"\xcd" * 300
         import struct
+
         script_bytes = b"\x4d" + struct.pack("<H", 300) + data
         s = Script(script_bytes)
         assert len(s.chunks) == 1
@@ -324,6 +333,7 @@ class TestScript:
 # ---------------------------------------------------------------------------
 # transaction/transaction.py — estimated_byte_length
 # ---------------------------------------------------------------------------
+
 
 class TestTransactionEstimatedLength:
     def _simple_tx(self):
@@ -476,6 +486,7 @@ class TestTransactionEstimatedLength:
 # keys.py — PrivateKey constructors and methods
 # ---------------------------------------------------------------------------
 
+
 class TestPrivateKeyConstructors:
     def test_from_int(self):
         pk = PrivateKey(1)
@@ -525,18 +536,21 @@ class TestPrivateKeyConstructors:
 
     def test_not_picklable(self):
         import pickle
+
         pk = PrivateKey(1)
         with pytest.raises(TypeError, match="cannot be pickled"):
             pickle.dumps(pk)
 
     def test_not_copyable(self):
         import copy
+
         pk = PrivateKey(1)
         with pytest.raises(TypeError, match="cannot be copied"):
             copy.copy(pk)
 
     def test_not_deep_copyable(self):
         import copy
+
         pk = PrivateKey(1)
         with pytest.raises(TypeError, match="cannot be deep-copied"):
             copy.deepcopy(pk)
@@ -561,7 +575,7 @@ class TestPrivateKeySignVerify:
         pk = PrivateKey(555)
         msg = b"recoverable test"
         sig = pk.sign_recoverable(msg)
-        assert len(sig) == 65   # r(32) + s(32) + recovery_id(1)
+        assert len(sig) == 65  # r(32) + s(32) + recovery_id(1)
 
     def test_verify_recoverable(self):
         pk = PrivateKey(555)
@@ -579,7 +593,7 @@ class TestPrivateKeySignVerify:
         pk = PrivateKey(333)
         pk2 = PrivateKey(334)
         text = "hello pyrxd"
-        addr, sig_str = pk.sign_text(text)
+        _addr, sig_str = pk.sign_text(text)
         wrong_addr = pk2.address()
         assert not verify_signed_text(text, wrong_addr, sig_str)
 
@@ -603,7 +617,7 @@ class TestPrivateKeyECIES:
         pk = PrivateKey(3333)
         # Encrypt something valid, then corrupt the magic bytes
         encrypted = pk.public_key().encrypt(b"hello")
-        bad_msg = b"XYZW" + encrypted[4:]   # replace "BIE1" with garbage
+        bad_msg = b"XYZW" + encrypted[4:]  # replace "BIE1" with garbage
         with pytest.raises(ValidationError, match="invalid magic bytes"):
             pk.decrypt(bad_msg)
 

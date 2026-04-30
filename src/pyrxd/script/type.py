@@ -1,13 +1,14 @@
-from abc import abstractmethod, ABCMeta
-from typing import Union, List, Optional
+from __future__ import annotations
 
-from .script import Script
-from .unlocking_template import UnlockingScriptTemplate
-from ..constants import OpCode, PUBLIC_KEY_HASH_BYTE_LENGTH, PUBLIC_KEY_BYTE_LENGTH_LIST, SIGHASH
+from abc import ABCMeta, abstractmethod
+
+from ..constants import PUBLIC_KEY_BYTE_LENGTH_LIST, PUBLIC_KEY_HASH_BYTE_LENGTH, SIGHASH, OpCode
+from ..hash import hash256
 from ..keys import PrivateKey
 from ..security.errors import ValidationError
-from ..utils import address_to_public_key_hash, encode_pushdata, encode_int
-from ..hash import hash256
+from ..utils import address_to_public_key_hash, encode_int, encode_pushdata
+from .script import Script
+from .unlocking_template import UnlockingScriptTemplate
 
 
 def to_unlock_script_template(sign, estimated_unlocking_byte_length):
@@ -55,7 +56,7 @@ class P2PKH(ScriptTemplate):
     def __repr__(self) -> str:  # pragma: no cover
         return self.__str__()
 
-    def lock(self, addr: Union[str, bytes]) -> Script:
+    def lock(self, addr: str | bytes) -> Script:
         """
         from address (str) or public key hash160 (bytes)
         """
@@ -96,7 +97,7 @@ class OpReturn(ScriptTemplate):
     def __repr__(self) -> str:  # pragma: no cover
         return self.__str__()
 
-    def lock(self, pushdatas: List[Union[str, bytes]]) -> Script:
+    def lock(self, pushdatas: list[str | bytes]) -> Script:
         script: bytes = OpCode.OP_FALSE + OpCode.OP_RETURN
         for pushdata in pushdatas:
             if isinstance(pushdata, str):
@@ -119,7 +120,7 @@ class P2PK(ScriptTemplate):
     def __repr__(self) -> str:  # pragma: no cover
         return self.__str__()
 
-    def lock(self, public_key: Union[str, bytes]) -> Script:
+    def lock(self, public_key: str | bytes) -> Script:
         """
         from public key in format str or bytes
         """
@@ -156,7 +157,7 @@ class BareMultisig(ScriptTemplate):
     def __repr__(self) -> str:  # pragma: no cover
         return self.__str__()
 
-    def lock(self, participants: List[Union[str, bytes]], threshold: int) -> Script:
+    def lock(self, participants: list[str | bytes], threshold: int) -> Script:
         if not (1 <= threshold <= len(participants)):
             raise ValidationError("bad threshold or number of participants")
 
@@ -174,7 +175,7 @@ class BareMultisig(ScriptTemplate):
             script += encode_pushdata(participant)
         return Script(script + encode_int(len(participants)) + OpCode.OP_CHECKMULTISIG)
 
-    def unlock(self, private_keys: List[PrivateKey]):
+    def unlock(self, private_keys: list[PrivateKey]):
         def sign(tx, input_index) -> Script:
             tx_input = tx.inputs[input_index]
             sighash = tx_input.sighash
@@ -230,7 +231,7 @@ class RPuzzle(ScriptTemplate):
     def unlock(
         self,
         k: int,
-        private_key: Optional[PrivateKey] = PrivateKey(),
+        private_key: PrivateKey | None = PrivateKey(),
         sign_outputs: str = "all",
         anyone_can_pay: bool = False,
     ):

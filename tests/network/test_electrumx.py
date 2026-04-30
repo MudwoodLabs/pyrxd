@@ -2,6 +2,7 @@
 
 Uses lightweight asyncio mocks — no real network connections.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +15,6 @@ import pytest
 from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, RawTx, Txid
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -65,12 +65,15 @@ def _patch_connect(ws_mock):
 
 def _awaitable(value):
     """Wrap a value in a coroutine so await works on it."""
+
     async def _inner(*args, **kwargs):
         return value
+
     return _inner()
 
 
 # ── TLS enforcement tests ─────────────────────────────────────────────────────
+
 
 def test_insecure_url_raises_without_flag():
     """ws:// without allow_insecure=True must raise NetworkError immediately."""
@@ -98,6 +101,7 @@ def test_invalid_scheme_raises():
 
 # ── Input validation tests ────────────────────────────────────────────────────
 
+
 async def test_txid_validated_before_network_call():
     """Non-hex txid must raise ValidationError before any network call."""
     client = ElectrumXClient(["wss://example.com"])
@@ -113,6 +117,7 @@ async def test_txid_wrong_length_raises():
 
 
 # ── Successful response tests ─────────────────────────────────────────────────
+
 
 async def test_get_transaction_returns_rawtx():
     """get_transaction with a valid hex response returns RawTx."""
@@ -157,6 +162,7 @@ async def test_get_transaction_verbose_rejects_non_dict_response():
     """A non-dict response from the server must raise NetworkError —
     don't silently coerce or return surprising types."""
     from pyrxd.security.errors import NetworkError as _NE
+
     ws = _make_ws_mock({"id": 1, "result": "not a dict"})
 
     with _patch_connect(ws):
@@ -179,11 +185,10 @@ async def test_get_tip_height_returns_block_height():
 
 # ── Error handling tests ──────────────────────────────────────────────────────
 
+
 async def test_json_rpc_error_raises_network_error():
     """A JSON-RPC error response must raise NetworkError."""
-    ws = _make_ws_mock(
-        {"id": 1, "error": {"code": -32601, "message": "Method not found"}}
-    )
+    ws = _make_ws_mock({"id": 1, "error": {"code": -32601, "message": "Method not found"}})
 
     with _patch_connect(ws):
         async with ElectrumXClient(["wss://example.com"]) as client:
@@ -205,9 +210,11 @@ async def test_timeout_raises_network_error():
     """A request that times out must raise NetworkError."""
     ws = AsyncMock()
     ws.send = AsyncMock(return_value=None)
+
     # Make recv hang to trigger timeout.
     async def _hang(*args, **kwargs):
         await asyncio.sleep(9999)
+
     ws.recv = _hang
     ws.close = AsyncMock(return_value=None)
 
@@ -222,9 +229,7 @@ async def test_timeout_raises_network_error():
 async def test_rpc_error_message_not_leaked_in_exception():
     """The raw server error response must not appear verbatim in the exception str."""
     sensitive_payload = "SECRET_SERVER_DATA_" + "x" * 100
-    ws = _make_ws_mock(
-        {"id": 1, "error": {"code": -1, "message": sensitive_payload}}
-    )
+    ws = _make_ws_mock({"id": 1, "error": {"code": -1, "message": sensitive_payload}})
 
     with _patch_connect(ws):
         async with ElectrumXClient(["wss://example.com"]) as client:
@@ -313,6 +318,7 @@ async def test_get_balance_accepts_raw_bytes():
 # broadcast() malformed-response handling — re-review N19 / P0.6
 # ---------------------------------------------------------------------------
 
+
 class TestBroadcastMalformedResponse:
     """ElectrumX servers can return malformed txids in the broadcast response
     (network corruption, buggy server, malicious proxy). Without explicit
@@ -398,6 +404,7 @@ class TestBroadcastMalformedResponse:
 # _call() invocations could swap responses. These tests prove the post-fix
 # behavior: each _call() future is resolved by the matching id.
 
+
 class TestResponseCorrelation:
     """Concurrent _call() invocations must each receive the response whose
     JSON-RPC id matches the request they sent — never another caller's.
@@ -464,12 +471,8 @@ class TestResponseCorrelation:
         client._ws = ws
 
         # Fire two concurrent calls. They will register ids 1 and 2.
-        task_a = asyncio.create_task(
-            client._call("blockchain.transaction.get", ["a" * 64, False])
-        )
-        task_b = asyncio.create_task(
-            client._call("blockchain.transaction.get", ["b" * 64, False])
-        )
+        task_a = asyncio.create_task(client._call("blockchain.transaction.get", ["a" * 64, False]))
+        task_b = asyncio.create_task(client._call("blockchain.transaction.get", ["b" * 64, False]))
         # Let both register and send.
         await asyncio.sleep(0)
         await asyncio.sleep(0)
@@ -598,9 +601,7 @@ class TestResponseCorrelation:
         client._ws = ws
 
         task_a = asyncio.create_task(client.get_tip_height())  # will time out
-        task_b = asyncio.create_task(
-            client.broadcast(_VALID_RAW_TX)
-        )
+        task_b = asyncio.create_task(client.broadcast(_VALID_RAW_TX))
         await asyncio.sleep(0)
         await asyncio.sleep(0)
         assert len(send_log) == 2
@@ -661,16 +662,11 @@ class TestResponseCorrelation:
         for _ in range(10):
             await asyncio.sleep(0)
 
-        assert max_concurrent_sends == 1, (
-            f"send_lock should serialize sends; max concurrent was "
-            f"{max_concurrent_sends}"
-        )
+        assert max_concurrent_sends == 1, f"send_lock should serialize sends; max concurrent was {max_concurrent_sends}"
 
         # Resolve all.
         for entry in send_log:
-            await outbox.put(
-                json.dumps({"id": entry["id"], "result": {"height": 1, "hex": "00" * 80}})
-            )
+            await outbox.put(json.dumps({"id": entry["id"], "result": {"height": 1, "hex": "00" * 80}}))
         await asyncio.gather(*tasks)
         await client.close()
 
@@ -704,12 +700,9 @@ class TestResponseCorrelation:
         await asyncio.sleep(0)
 
         # Push two malformed messages (no id, then string id), then the real one.
-        await outbox.put(json.dumps({"method": "blockchain.headers.subscribe",
-                                     "params": [{"height": 999}]}))
+        await outbox.put(json.dumps({"method": "blockchain.headers.subscribe", "params": [{"height": 999}]}))
         await outbox.put(json.dumps({"id": "not-an-int", "result": "bad"}))
-        await outbox.put(json.dumps(
-            {"id": send_log[0]["id"], "result": {"height": 42, "hex": "00" * 80}}
-        ))
+        await outbox.put(json.dumps({"id": send_log[0]["id"], "result": {"height": 42, "hex": "00" * 80}}))
 
         result = await task
         assert int(result) == 42
@@ -720,6 +713,7 @@ class TestResponseCorrelation:
 # ---------------------------------------------------------------------------
 # _connect_first: parallel failover race (N18)
 # ---------------------------------------------------------------------------
+
 
 class TestConnectFirstRace:
     """_connect_first races all URLs simultaneously instead of sequentially.
@@ -792,9 +786,7 @@ class TestConnectFirstRace:
         client = ElectrumXClient(["wss://a.example.com", "wss://b.example.com"])
         with patch("pyrxd.network.electrumx.websockets.connect", side_effect=_fail):
             with pytest.raises(NetworkError):
-                await client._connect_first(
-                    ["wss://a.example.com", "wss://b.example.com"], timeout=5.0
-                )
+                await client._connect_first(["wss://a.example.com", "wss://b.example.com"], timeout=5.0)
 
     async def test_winner_is_returned_only_once_on_simultaneous_success(self):
         """When two URLs succeed almost simultaneously only one winner is returned.
@@ -819,9 +811,7 @@ class TestConnectFirstRace:
 
         client = ElectrumXClient(["wss://a.example.com", "wss://b.example.com"])
         with patch("pyrxd.network.electrumx.websockets.connect", side_effect=_connect):
-            result = await client._connect_first(
-                ["wss://a.example.com", "wss://b.example.com"], timeout=5.0
-            )
+            result = await client._connect_first(["wss://a.example.com", "wss://b.example.com"], timeout=5.0)
 
         # Exactly one of the two should be the result.
         assert result is ws_a or result is ws_b
@@ -833,6 +823,7 @@ class TestConnectFirstRace:
 
     async def test_timeout_raises_network_error(self):
         """Overall timeout with all-hanging URLs must raise NetworkError promptly."""
+
         async def _hang(url):
             await asyncio.Event().wait()
 
@@ -863,9 +854,14 @@ class TestConnectFirstRace:
         """
         # Three sockets so the test catches any "off by one" in the
         # close loop — and proves the fix handles >2 endpoints.
-        sockets = {url: MagicMock(name=url) for url in (
-            "wss://a.example.com", "wss://b.example.com", "wss://c.example.com",
-        )}
+        sockets = {
+            url: MagicMock(name=url)
+            for url in (
+                "wss://a.example.com",
+                "wss://b.example.com",
+                "wss://c.example.com",
+            )
+        }
         for ws in sockets.values():
             ws.close = AsyncMock(return_value=None)
 
