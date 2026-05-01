@@ -66,7 +66,7 @@ def low_level(mnemonic: str) -> None:
     # External chain (change=0), first address (index=0).
     child = account_xprv.ckd(0).ckd(0)
     priv = child.private_key()
-    print(f"path:    m/44'/236'/0'/0/0")
+    print("path:    m/44'/236'/0'/0/0")
     print(f"WIF:     {priv.wif()}")
     print(f"address: {priv.public_key().address()}")
     print()
