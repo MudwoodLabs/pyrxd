@@ -76,6 +76,43 @@ priv = PrivateKey("L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ")
 # See examples/ for full flows.
 ```
 
+### From a BIP39 seed phrase
+
+If you already have a 12/24-word mnemonic (e.g. created by `pyrxd wallet
+new` or restored from another Radiant wallet), `HdWallet.from_mnemonic`
+gives you a full HD wallet at the correct Radiant BIP44 path
+(`m/44'/236'/<account>'`).
+
+> Radiant uses BIP44 coin type **236**, not 0 (Bitcoin). Examples written
+> for Bitcoin libraries will derive the wrong addresses — make sure any
+> derivation path you use is `m/44'/236'/...`.
+
+```python
+from pyrxd.hd import HdWallet
+
+wallet = HdWallet.from_mnemonic("word1 word2 ... word12")
+addr = wallet.next_receive_address()
+print(f"first receive address: {addr}")
+```
+
+For a one-off private key at a specific path (the equivalent of the
+short `mnemonic + bip32utils` snippet some users start from), use the
+lower-level helpers directly:
+
+```python
+from pyrxd.hd import bip44_derive_xprv_from_mnemonic
+
+# Default path is m/44'/236'/0' — the Radiant account 0 key.
+xprv = bip44_derive_xprv_from_mnemonic("word1 word2 ... word12")
+child = xprv.ckd(0).ckd(0)  # m/44'/236'/0'/0/0  (external chain, index 0)
+priv = child.private_key()
+print(f"WIF:     {priv.wif()}")
+print(f"address: {priv.public_key().address()}")
+```
+
+See [`examples/mnemonic_to_key.py`](examples/mnemonic_to_key.py) for a
+runnable version of both flows.
+
 ### Mint a Glyph NFT
 
 ```python
