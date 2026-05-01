@@ -201,3 +201,42 @@ class TestMnemonicEdgeCases:
         )
         assert result.exit_code != 0
         assert "mnemonic" in result.output.lower()
+
+
+class TestWalletExportXpub:
+    """Cut 3: account-level xpub export for watch-only use."""
+
+    def test_export_with_correct_mnemonic(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        new_result = runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        mnemonic = _extract_json(new_result.output)["mnemonic"]
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "--json", "wallet", "export-xpub"],
+            input=f"{mnemonic}\n",
+        )
+        assert result.exit_code == 0, result.output
+        payload = _extract_json(result.output)
+        assert payload["xpub"].startswith("xpub")
+        assert payload["account"] == 0
+        assert payload["path"] == "m/44'/236'/0'"
+
+    def test_export_with_wrong_mnemonic_exits_3(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        wrong = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "wallet", "export-xpub"],
+            input=f"{wrong}\n",
+        )
+        assert result.exit_code == 3
+        assert "decrypt" in result.output.lower()
+
+    def test_export_no_wallet_errors(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """If the wallet file doesn't exist, fail fast — no mnemonic prompt."""
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "wallet", "export-xpub"],
+            input="anything\n",
+        )
+        assert result.exit_code != 0
+        assert "no wallet" in result.output

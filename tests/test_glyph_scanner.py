@@ -113,42 +113,42 @@ class TestGetHistory:
 
     def test_returns_list_of_dicts(self):
         client = self._make_client([{"tx_hash": "aa" * 32, "height": 100}])
-        result = asyncio.get_event_loop().run_until_complete(client.get_history("cc" * 32))
+        result = asyncio.run(client.get_history("cc" * 32))
         assert result == [{"tx_hash": "aa" * 32, "height": 100}]
 
     def test_empty_history(self):
         client = self._make_client([])
-        result = asyncio.get_event_loop().run_until_complete(client.get_history("cc" * 32))
+        result = asyncio.run(client.get_history("cc" * 32))
         assert result == []
 
     def test_unconfirmed_height_zero(self):
         client = self._make_client([{"tx_hash": "dd" * 32, "height": 0}])
-        result = asyncio.get_event_loop().run_until_complete(client.get_history("cc" * 32))
+        result = asyncio.run(client.get_history("cc" * 32))
         assert result[0]["height"] == 0
 
     def test_unconfirmed_negative_height(self):
         client = self._make_client([{"tx_hash": "dd" * 32, "height": -1}])
-        result = asyncio.get_event_loop().run_until_complete(client.get_history("cc" * 32))
+        result = asyncio.run(client.get_history("cc" * 32))
         assert result[0]["height"] == -1
 
     def test_raises_on_non_list_response(self):
         client = self._make_client("not a list")
         with pytest.raises(NetworkError):
-            asyncio.get_event_loop().run_until_complete(client.get_history("cc" * 32))
+            asyncio.run(client.get_history("cc" * 32))
 
     def test_raises_on_malformed_entry(self):
         client = self._make_client([{"bad_key": 1}])
         with pytest.raises(NetworkError):
-            asyncio.get_event_loop().run_until_complete(client.get_history("cc" * 32))
+            asyncio.run(client.get_history("cc" * 32))
 
     def test_accepts_bytes_script_hash(self):
         client = self._make_client([])
-        result = asyncio.get_event_loop().run_until_complete(client.get_history(bytes([0xCC] * 32)))
+        result = asyncio.run(client.get_history(bytes([0xCC] * 32)))
         assert result == []
 
     def test_accepts_hex_str_script_hash(self):
         client = self._make_client([])
-        result = asyncio.get_event_loop().run_until_complete(client.get_history("cc" * 32))
+        result = asyncio.run(client.get_history("cc" * 32))
         assert result == []
 
     def test_multiple_entries(self):
@@ -157,7 +157,7 @@ class TestGetHistory:
             {"tx_hash": "bb" * 32, "height": 20},
         ]
         client = self._make_client(entries)
-        result = asyncio.get_event_loop().run_until_complete(client.get_history("cc" * 32))
+        result = asyncio.run(client.get_history("cc" * 32))
         assert len(result) == 2
         assert result[1]["height"] == 20
 
@@ -171,7 +171,7 @@ class TestGlyphScannerEmptyWallet:
     def test_empty_utxos_returns_empty(self):
         client = _mock_client(utxos=[], tx_map={})
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert result == []
 
     def test_scan_address_calls_script_hash_for_address(self):
@@ -181,7 +181,7 @@ class TestGlyphScannerEmptyWallet:
             "pyrxd.glyph.scanner.script_hash_for_address",
             return_value=bytes([0xCC] * 32),
         ):
-            result = asyncio.get_event_loop().run_until_complete(scanner.scan_address("any-address"))
+            result = asyncio.run(scanner.scan_address("any-address"))
         assert result == []
 
 
@@ -196,7 +196,7 @@ class TestGlyphScannerNftOutput:
             },
         )
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert len(result) == 1
         item = result[0]
         assert isinstance(item, GlyphNft)
@@ -210,7 +210,7 @@ class TestGlyphScannerNftOutput:
             tx_map={TXID_B: NFT_TX_HEX, TXID_A: REVEAL_TX_HEX},
         )
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert result[0].metadata is not None
         assert result[0].metadata.name == "TestNFT"
 
@@ -221,7 +221,7 @@ class TestGlyphScannerNftOutput:
             tx_map={TXID_B: NFT_TX_HEX, TXID_A: TRANSFER_TX_HEX},
         )
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert result[0].metadata is None
 
 
@@ -233,7 +233,7 @@ class TestGlyphScannerFtOutput:
             tx_map={TXID_C: FT_TX_HEX, TXID_A: TRANSFER_TX_HEX},
         )
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert len(result) == 1
         item = result[0]
         assert isinstance(item, GlyphFt)
@@ -251,7 +251,7 @@ class TestGlyphScannerVoutFiltering:
             tx_map={TXID_B: NFT_TX_HEX, TXID_A: REVEAL_TX_HEX},
         )
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert result == []
 
 
@@ -261,7 +261,7 @@ class TestGlyphScannerNetworkErrors:
         utxos = [UtxoRecord(tx_hash=TXID_B, tx_pos=0, value=546, height=100)]
         client = _mock_client(utxos=utxos, tx_map={})  # no tx for TXID_B
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert result == []
 
     def test_failed_reveal_fetch_returns_none_metadata(self):
@@ -270,7 +270,7 @@ class TestGlyphScannerNetworkErrors:
         # Only TXID_B available; TXID_A (origin) not available.
         client = _mock_client(utxos=utxos, tx_map={TXID_B: NFT_TX_HEX})
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert len(result) == 1
         assert result[0].metadata is None
 
@@ -288,7 +288,7 @@ class TestGlyphScannerMixed:
             },
         )
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         types = {type(r).__name__ for r in result}
         assert "GlyphNft" in types
         assert "GlyphFt" in types
@@ -306,8 +306,8 @@ class TestGlyphScannerMixed:
             "pyrxd.glyph.scanner.script_hash_for_address",
             return_value=bytes([0xCC] * 32),
         ):
-            result_addr = asyncio.get_event_loop().run_until_complete(scanner.scan_address("any-address"))
-        result_sh = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+            result_addr = asyncio.run(scanner.scan_address("any-address"))
+        result_sh = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert len(result_addr) == len(result_sh)
         assert type(result_addr[0]) is type(result_sh[0])
 
@@ -320,7 +320,7 @@ class TestGlyphScannerNonGlyphUtxos:
         utxos = [UtxoRecord(tx_hash=TXID_B, tx_pos=0, value=1000, height=100)]
         client = _mock_client(utxos=utxos, tx_map={TXID_B: plain_tx_hex})
         scanner = GlyphScanner(client)
-        result = asyncio.get_event_loop().run_until_complete(scanner.scan_script_hash("cc" * 32))
+        result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert result == []
 
 

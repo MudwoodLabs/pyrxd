@@ -166,6 +166,54 @@ def wallet_load(ctx: CliContext, passphrase: bool) -> None:
         click.echo(emit(payload, mode="quiet", quiet_field="account"))
 
 
+@wallet_group.command(name="export-xpub")
+@click.option("--passphrase/--no-passphrase", default=False)
+@click.pass_obj
+def wallet_export_xpub(ctx: CliContext, passphrase: bool) -> None:
+    """Print the account-level xpub for watch-only / recipient use.
+
+    The xpub at ``m/44'/236'/<account>'`` lets external tools generate
+    receive addresses for this wallet without ever seeing the seed.
+    Safe to share with watch-only services or merchant integrations.
+    No private key material is exported.
+    """
+    if not ctx.wallet_path.exists():
+        raise UserError(
+            f"no wallet at {ctx.wallet_path}",
+            cause="the file does not exist",
+            fix="run `pyrxd wallet new` to create one, or pass --wallet PATH",
+        )
+    mnemonic = prompt_mnemonic_input()
+    if not mnemonic:
+        raise UserError("mnemonic is required")
+
+    passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default
+    if passphrase:
+        passphrase_str = prompt_passphrase_input(optional=False)
+
+    try:
+        wallet = HdWallet.load(ctx.wallet_path, mnemonic, passphrase_str)
+    except (ValidationError, ValueError) as exc:
+        raise WalletDecryptError() from exc
+
+    xpub = wallet._xprv.xpub()
+    payload = {
+        "xpub": str(xpub),
+        "account": wallet.account,
+        "path": f"m/44'/236'/{wallet.account}'",
+    }
+    if ctx.output_mode == "json":
+        click.echo(emit(payload, mode="json"))
+    elif ctx.output_mode == "quiet":
+        click.echo(emit(payload, mode="quiet", quiet_field="xpub"))
+    else:
+        click.echo(f"\nxpub at m/44'/236'/{wallet.account}':")
+        click.echo(f"  {xpub}")
+        click.echo("\nThis xpub lets external tools generate receive addresses")
+        click.echo("for this wallet WITHOUT seeing the seed. Safe to share with")
+        click.echo("watch-only services. Do NOT share the mnemonic.")
+
+
 @wallet_group.command(name="info")
 @click.option(
     "--passphrase/--no-passphrase",
@@ -183,4 +231,4 @@ def wallet_info(ctx: CliContext, passphrase: bool) -> None:
 
 # Confirmation helper used by Cut 1 destructive ops outside this module.
 # Re-exported for tests + future cuts.
-__all__ = ["wallet_group", "wallet_info", "wallet_load", "wallet_new"]
+__all__ = ["wallet_export_xpub", "wallet_group", "wallet_info", "wallet_load", "wallet_new"]

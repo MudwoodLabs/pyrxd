@@ -116,19 +116,19 @@ class TestRefreshEmptyWallet:
     def test_empty_wallet_discovers_nothing(self):
         client = _mock_client()
         w = HdWallet.from_mnemonic(MNEMONIC)
-        result = asyncio.get_event_loop().run_until_complete(w.refresh(client))
+        result = asyncio.run(w.refresh(client))
         assert result == 0
 
     def test_all_addresses_recorded_as_unused(self):
         client = _mock_client()
         w = HdWallet.from_mnemonic(MNEMONIC)
-        asyncio.get_event_loop().run_until_complete(w.refresh(client))
+        asyncio.run(w.refresh(client))
         assert all(not r.used for r in w.addresses.values())
 
     def test_stops_after_gap_limit_addresses(self):
         client = _mock_client()
         w = HdWallet.from_mnemonic(MNEMONIC)
-        asyncio.get_event_loop().run_until_complete(w.refresh(client))
+        asyncio.run(w.refresh(client))
         # Should derive at least GAP_LIMIT addresses on each chain
         external = [r for r in w.addresses.values() if r.change == 0]
         internal = [r for r in w.addresses.values() if r.change == 1]
@@ -142,7 +142,7 @@ class TestRefreshWithUsedAddresses:
         # Pre-compute addresses at the indices that will be marked "used"
         history_map = {w._derive_address(0, i): [{"tx_hash": "aa" * 32, "height": 100}] for i in used_indices}
         client = _mock_client(history_map=history_map)
-        count = asyncio.get_event_loop().run_until_complete(w.refresh(client))
+        count = asyncio.run(w.refresh(client))
         return w, count
 
     def test_used_address_at_index_0(self):
@@ -174,15 +174,15 @@ class TestRefreshWithUsedAddresses:
         w = HdWallet.from_mnemonic(MNEMONIC)
         addr0 = w._derive_address(0, 0)
         client = _mock_client(history_map={addr0: [{"tx_hash": "aa" * 32, "height": 100}]})
-        asyncio.get_event_loop().run_until_complete(w.refresh(client))
-        count2 = asyncio.get_event_loop().run_until_complete(w.refresh(client))
+        asyncio.run(w.refresh(client))
+        count2 = asyncio.run(w.refresh(client))
         assert count2 == 0  # already known as used
 
     def test_internal_chain_also_scanned(self):
         w = HdWallet.from_mnemonic(MNEMONIC)
         addr_internal = w._derive_address(1, 0)
         client = _mock_client(history_map={addr_internal: [{"tx_hash": "bb" * 32, "height": 50}]})
-        asyncio.get_event_loop().run_until_complete(w.refresh(client))
+        asyncio.run(w.refresh(client))
         pkey = "1/0"
         assert w.addresses[pkey].used is True
 
@@ -401,7 +401,7 @@ class TestGetBalance:
     def test_empty_wallet_balance_is_zero(self):
         client = _mock_client()
         w = HdWallet.from_mnemonic(MNEMONIC)
-        bal = asyncio.get_event_loop().run_until_complete(w.get_balance(client))
+        bal = asyncio.run(w.get_balance(client))
         assert bal == 0
 
     def test_single_used_address_balance(self):
@@ -409,7 +409,7 @@ class TestGetBalance:
         addr0 = w._derive_address(0, 0)
         w.addresses["0/0"] = AddressRecord(address=addr0, change=0, index=0, used=True)
         client = _mock_client(balance_map={addr0: (1000, 500)})
-        bal = asyncio.get_event_loop().run_until_complete(w.get_balance(client))
+        bal = asyncio.run(w.get_balance(client))
         assert bal == 1500
 
     def test_sums_across_multiple_addresses(self):
@@ -419,7 +419,7 @@ class TestGetBalance:
         w.addresses["0/0"] = AddressRecord(address=addr0, change=0, index=0, used=True)
         w.addresses["0/1"] = AddressRecord(address=addr1, change=0, index=1, used=True)
         client = _mock_client(balance_map={addr0: (1000, 0), addr1: (2000, 0)})
-        bal = asyncio.get_event_loop().run_until_complete(w.get_balance(client))
+        bal = asyncio.run(w.get_balance(client))
         assert bal == 3000
 
     def test_unused_addresses_excluded_from_balance(self):
@@ -429,7 +429,7 @@ class TestGetBalance:
         w.addresses["0/0"] = AddressRecord(address=addr0, change=0, index=0, used=True)
         w.addresses["0/1"] = AddressRecord(address=addr1, change=0, index=1, used=False)
         client = _mock_client(balance_map={addr0: (1000, 0), addr1: (9999, 0)})
-        bal = asyncio.get_event_loop().run_until_complete(w.get_balance(client))
+        bal = asyncio.run(w.get_balance(client))
         assert bal == 1000
 
 
@@ -437,7 +437,7 @@ class TestGetUtxos:
     def test_empty_wallet_utxos_is_empty(self):
         client = _mock_client()
         w = HdWallet.from_mnemonic(MNEMONIC)
-        utxos = asyncio.get_event_loop().run_until_complete(w.get_utxos(client))
+        utxos = asyncio.run(w.get_utxos(client))
         assert utxos == []
 
     def test_returns_utxos_for_used_addresses(self):
@@ -446,7 +446,7 @@ class TestGetUtxos:
         w.addresses["0/0"] = AddressRecord(address=addr0, change=0, index=0, used=True)
         utxo = UtxoRecord(tx_hash="aa" * 32, tx_pos=0, value=546, height=100)
         client = _mock_client(utxo_map={addr0: [utxo]})
-        utxos = asyncio.get_event_loop().run_until_complete(w.get_utxos(client))
+        utxos = asyncio.run(w.get_utxos(client))
         assert len(utxos) == 1
         assert utxos[0].value == 546
 
@@ -458,7 +458,7 @@ class TestGetUtxos:
         w.addresses["0/1"] = AddressRecord(address=addr1, change=0, index=1, used=False)
         utxo = UtxoRecord(tx_hash="bb" * 32, tx_pos=0, value=1000, height=50)
         client = _mock_client(utxo_map={addr0: [utxo], addr1: [utxo]})
-        utxos = asyncio.get_event_loop().run_until_complete(w.get_utxos(client))
+        utxos = asyncio.run(w.get_utxos(client))
         # Only addr0 (used=True) is queried
         assert len(utxos) == 1
 
@@ -667,7 +667,7 @@ class TestGapScanErrorPropagation:
         client.get_history = _broken_history
         w = HdWallet.from_mnemonic(MNEMONIC)
         with pytest.raises(NetworkError):
-            asyncio.get_event_loop().run_until_complete(w.refresh(client))
+            asyncio.run(w.refresh(client))
 
     def test_network_error_does_not_mark_address_unused(self):
         """Even if the scan errors out, no address record may be left
@@ -684,7 +684,7 @@ class TestGapScanErrorPropagation:
         client.get_history = _broken_history
         w = HdWallet.from_mnemonic(MNEMONIC)
         try:
-            asyncio.get_event_loop().run_until_complete(w.refresh(client))
+            asyncio.run(w.refresh(client))
         except NetworkError:
             # Expected — verifying state is consistent after the failure below.
             pass
@@ -960,7 +960,7 @@ class TestCollectSpendable:
                 addr1: [_utxo(tx_hash="bb" * 32, value=200_000_000)],
             }
         )
-        triples = asyncio.get_event_loop().run_until_complete(w.collect_spendable(client))
+        triples = asyncio.run(w.collect_spendable(client))
         assert len(triples) == 2
         # Each privkey is the one derived for its address.
         for _utxo_rec, addr, pk in triples:
@@ -969,7 +969,7 @@ class TestCollectSpendable:
     def test_returns_empty_when_no_used(self):
         w = HdWallet.from_mnemonic(MNEMONIC)
         client = _mock_client()
-        triples = asyncio.get_event_loop().run_until_complete(w.collect_spendable(client))
+        triples = asyncio.run(w.collect_spendable(client))
         assert triples == []
 
     def test_drops_failed_address_lookups(self):
@@ -990,7 +990,7 @@ class TestCollectSpendable:
             raise NetworkError("simulated failure")
 
         client.get_utxos = _get_utxos
-        triples = asyncio.get_event_loop().run_until_complete(w.collect_spendable(client))
+        triples = asyncio.run(w.collect_spendable(client))
         # Only the working address contributed.
         assert len(triples) == 1
 
@@ -1014,7 +1014,7 @@ class TestSendBroadcast:
 
         client.broadcast = _broadcast
 
-        txid = asyncio.get_event_loop().run_until_complete(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))
+        txid = asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))
         assert txid == "ab" * 32
 
     def test_send_max_returns_txid(self):
@@ -1031,11 +1031,11 @@ class TestSendBroadcast:
 
         client.broadcast = _broadcast
 
-        txid = asyncio.get_event_loop().run_until_complete(w.send_max(client, _RECIPIENT_ADDR))
+        txid = asyncio.run(w.send_max(client, _RECIPIENT_ADDR))
         assert txid == "cd" * 32
 
     def test_send_with_no_utxos_raises(self):
         w = HdWallet.from_mnemonic(MNEMONIC)  # no used addresses → no UTXOs
         client = _mock_client()
         with pytest.raises(ValidationError, match="Insufficient"):
-            asyncio.get_event_loop().run_until_complete(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))
+            asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))

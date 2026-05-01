@@ -91,3 +91,29 @@ class TestAddressCmd:
         assert line.startswith("1")
         # No path or other annotation.
         assert "m/44" not in line
+
+
+class TestUtxosCmd:
+    """Cut 3 — read-only diagnostic. Covered with mocked ElectrumX."""
+
+    def test_no_used_addresses_returns_empty_table(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        mnemonic = _create_wallet(runner, tmp_wallet_path)
+        # Fresh wallet has no used addresses → empty result.
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "--json", "utxos"],
+            input=f"{mnemonic}\n",
+        )
+        assert result.exit_code == 0, result.output
+        # JSON output should be an empty array.
+        body = result.output[result.output.find("[") :].strip()
+        assert body == "[]"
+
+    def test_min_photons_flag_accepted(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        mnemonic = _create_wallet(runner, tmp_wallet_path)
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "--json", "utxos", "--min-photons", "1000000"],
+            input=f"{mnemonic}\n",
+        )
+        assert result.exit_code == 0, result.output

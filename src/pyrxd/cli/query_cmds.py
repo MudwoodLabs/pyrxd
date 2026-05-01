@@ -175,4 +175,54 @@ def balance_cmd(ctx: CliContext, refresh: bool, passphrase: bool) -> None:
         click.echo(emit(payload, mode="human", human_lines=lines))
 
 
-__all__ = ["address_cmd", "balance_cmd"]
+@cli.command(name="utxos")
+@click.option("--min-photons", type=int, default=0, help="Minimum value filter.")
+@click.option("--addr", default=None, help="Restrict to a single wallet address.")
+@click.option("--passphrase/--no-passphrase", default=False)
+@click.pass_obj
+def utxos_cmd(ctx: CliContext, min_photons: int, addr: str | None, passphrase: bool) -> None:
+    """List wallet UTXOs (read-only diagnostic).
+
+    Output spans every used address by default; use ``--addr`` to
+    drill into a single one. Filter by ``--min-photons`` to suppress
+    dust.
+    """
+    from .format import emit_table
+
+    wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
+
+    async def _query() -> list[dict]:
+        client = ctx.make_client()
+        async with client:
+            triples = await wallet.collect_spendable(client)
+            rows: list[dict] = []
+            for utxo, address, _pk in triples:
+                if min_photons and utxo.value < min_photons:
+                    continue
+                if addr and address != addr:
+                    continue
+                rows.append(
+                    {
+                        "txid": utxo.tx_hash,
+                        "vout": utxo.tx_pos,
+                        "value": utxo.value,
+                        "height": utxo.height,
+                        "address": address,
+                    }
+                )
+            return rows
+
+    try:
+        rows = asyncio.run(_query())
+    except NetworkError as exc:
+        raise NetworkBoundaryError(
+            "could not reach ElectrumX",
+            cause=str(exc),
+            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+        ) from exc
+
+    columns = ["txid", "vout", "value", "height", "address"]
+    click.echo(emit_table(rows, columns, mode=ctx.output_mode, quiet_field="txid"))
+
+
+__all__ = ["address_cmd", "balance_cmd", "utxos_cmd"]

@@ -166,8 +166,9 @@ def run() -> None:
 
 from . import (  # noqa: E402  -- bottom-of-file imports are intentional
     glyph_cmds,  # noqa: F401  -- registers `glyph` group (Cut 2)
-    query_cmds,  # noqa: F401  -- registers `address`, `balance`
-    wallet_cmds,  # noqa: F401  -- registers `wallet` group
+    query_cmds,  # noqa: F401  -- registers `address`, `balance`, `utxos` (Cut 3)
+    setup_cmd,  # noqa: F401  -- registers `setup` (Cut 3)
+    wallet_cmds,  # noqa: F401  -- registers `wallet` group + export-xpub (Cut 3)
 )
 
 if __name__ == "__main__":
