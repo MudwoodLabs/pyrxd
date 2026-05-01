@@ -3,7 +3,12 @@
 This file collects known limitations and follow-up work for the
 `pyrxd` CLI security model. Items here are *not* known
 vulnerabilities — they're either accepted-with-mitigations or
-deferred enhancements. Promote to a tracked issue when work begins.
+deferred enhancements.
+
+**Update 2026-05-01:** all items below were migrated to GitHub issues
+on this date. The narrative descriptions in this file remain useful
+context for anyone working on a related issue, but the **issues are
+the source of truth for status, assignment, and progress**.
 
 ## Cut 1 status (closed)
 
@@ -25,6 +30,14 @@ deferred enhancements. Promote to a tracked issue when work begins.
   stdout consumers are themselves secure.
 
 ## Open / deferred to v0.3.x
+
+| # | Topic | GitHub issue |
+|---|-------|--------------|
+| 1 | Mnemonic re-entry / agent-process unlock | [#8](https://github.com/MudwoodLabs/pyrxd/issues/8) |
+| 2 | Mnemonic in pytest result.output captures | [#9](https://github.com/MudwoodLabs/pyrxd/issues/9) |
+| 3 | `pyrxd setup` JSON-mode policy | [#12](https://github.com/MudwoodLabs/pyrxd/issues/12) |
+| 4 | Fuzz testing the CLI | [#10](https://github.com/MudwoodLabs/pyrxd/issues/10) |
+| 5 | Mnemonic clipboard hygiene | [#11](https://github.com/MudwoodLabs/pyrxd/issues/11) |
 
 ### 1. Mnemonic re-entry per command (UX → security trade)
 
