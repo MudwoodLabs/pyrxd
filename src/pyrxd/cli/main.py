@@ -18,8 +18,8 @@ Global options apply to every subcommand:
     --debug            show full tracebacks on error (default: hide)
 
 Cut 1 commands: wallet (group), address, balance.
-Cut 2 commands (deferred): glyph (group).
-Cut 3 commands (deferred): setup, utxos, wallet export-xpub.
+Cut 2 commands: glyph (group).
+Cut 3 commands: setup, utxos, wallet export-xpub.
 """
 
 from __future__ import annotations
@@ -165,6 +165,7 @@ def run() -> None:
 # `cli` group object.
 
 from . import (  # noqa: E402  -- bottom-of-file imports are intentional
+    glyph_cmds,  # noqa: F401  -- registers `glyph` group (Cut 2)
     query_cmds,  # noqa: F401  -- registers `address`, `balance`
     wallet_cmds,  # noqa: F401  -- registers `wallet` group
 )
