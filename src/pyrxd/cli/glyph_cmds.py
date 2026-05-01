@@ -315,6 +315,46 @@ def _confirm_or_abort(ctx: CliContext, sections: list[_BroadcastSummary]) -> Non
         )
 
 
+def _metadata_summary(metadata: GlyphMetadata) -> _BroadcastSummary:
+    """Surface user-readable metadata fields in the broadcast summary.
+
+    Threat model finding S7 (docs/threat-model.md): users running
+    `glyph mint-nft` from a metadata.json may not realize what
+    they're actually committing. The funding key, owner_pkh, etc. all
+    come from the wallet/CLI args (not the file), so theft via this
+    path is constrained — but the user should still see the
+    metadata-driven name, ticker, protocol, and any creator/royalty
+    fields before broadcasting. If something looks wrong (e.g., the
+    file claims a name they didn't author), they can abort.
+    """
+    proto_names = ", ".join(GlyphProtocol(p).name for p in metadata.protocol)
+    lines = [
+        f"protocol:    [{proto_names}]",
+        f"name:        {metadata.name or '(empty)'}",
+    ]
+    if metadata.ticker:
+        lines.append(f"ticker:      {metadata.ticker}")
+    if metadata.token_type:
+        lines.append(f"token_type:  {metadata.token_type}")
+    if metadata.description:
+        # Truncate long descriptions; they don't change the security
+        # posture but the summary should stay scannable.
+        desc = metadata.description if len(metadata.description) <= 80 else metadata.description[:77] + "..."
+        lines.append(f"description: {desc}")
+    if metadata.image_url:
+        lines.append(f"image_url:   {metadata.image_url}")
+    if metadata.image_sha256:
+        lines.append(f"image_hash:  {metadata.image_sha256[:16]}...{metadata.image_sha256[-8:]}")
+    if metadata.creator:
+        lines.append(f"creator:     pubkey={metadata.creator.pubkey[:16]}...")
+    if metadata.royalty:
+        lines.append(f"royalty:     {metadata.royalty.bps} bps → {metadata.royalty.address}")
+        if metadata.royalty.splits:
+            for addr, bps in metadata.royalty.splits:
+                lines.append(f"             split: {bps} bps → {addr}")
+    return _BroadcastSummary(title="Metadata", lines=lines)
+
+
 # ---------------------------------------------------------------------------
 # mint-nft
 # ---------------------------------------------------------------------------
@@ -462,12 +502,15 @@ async def _mint_nft_inner(
     commit_hex = commit_tx.serialize()
 
     sections = [
+        _metadata_summary(metadata),
         _BroadcastSummary(
             title="Commit transaction",
             lines=[
+                f"funding addr:  {funding_addr}",
                 f"funding utxo:  {funding_utxo.tx_hash}:{funding_utxo.tx_pos}",
                 f"funding value: {funding_utxo.value:,} photons",
                 f"commit value:  {commit_value:,} photons",
+                f"owner_pkh:     {funding_pkh.hex()}  (this wallet)",
                 f"network:       {ctx.network}",
             ],
         ),
@@ -698,12 +741,15 @@ async def _deploy_ft_inner(
     _confirm_or_abort(
         ctx,
         [
+            _metadata_summary(metadata),
             _BroadcastSummary(
                 title="Commit transaction",
                 lines=[
+                    f"funding addr:  {funding_addr}",
                     f"funding utxo:  {funding_utxo.tx_hash}:{funding_utxo.tx_pos}",
                     f"funding value: {funding_utxo.value:,} photons",
                     f"commit value:  {commit_value:,} photons",
+                    f"owner_pkh:     {funding_pkh.hex()}  (this wallet)",
                     f"network:       {ctx.network}",
                 ],
             ),
