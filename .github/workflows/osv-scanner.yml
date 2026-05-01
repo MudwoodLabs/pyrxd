@@ -1,0 +1,38 @@
+# OSV-Scanner — checks dependencies against Google's Open Source Vulnerability
+# database and uploads SARIF results to GitHub's code-scanning page.
+# Docs: https://google.github.io/osv-scanner/github-action/
+# Uses the canonical reusable workflows provided by google/osv-scanner-action.
+
+name: OSV Scanner
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly full scan, Mondays 08:00 UTC. Offset from Scorecard (07:00) and
+    # CodeQL (06:00) to spread runner load.
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  # Full scan on push to main and on the weekly schedule.
+  scan-scheduled:
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@v2.3.5
+
+  # PR scan — reports only new vulnerabilities introduced by the pull request.
+  scan-pr:
+    if: ${{ github.event_name == 'pull_request' }}
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@v2.3.5

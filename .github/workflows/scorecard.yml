@@ -1,0 +1,47 @@
+# OSSF Scorecard — scores this repo against OpenSSF security best practices and
+# uploads results to GitHub's code-scanning page (Security tab → Code scanning).
+# Docs: https://github.com/ossf/scorecard-action
+# Requires the repo to be public (or GitHub Advanced Security for private repos).
+
+name: Scorecard
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly re-score, Mondays 07:00 UTC. Staggered from CodeQL (06:00) to
+    # avoid competing for runner capacity at the same minute.
+    - cron: "0 7 * * 1"
+
+# Scorecard requires id-token: write to publish results to the OSSF API
+# and security-events: write to upload SARIF to GitHub code scanning.
+permissions:
+  contents: read
+
+jobs:
+  scorecard:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      id-token: write
+      contents: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Scorecard
+        uses: ossf/scorecard-action@v2.4.3
+        with:
+          results_file: scorecard-results.sarif
+          results_format: sarif
+          # Publish results to public OSSF Scorecard API (public repos only).
+          publish_results: true
+
+      - name: Upload SARIF to GitHub code scanning
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: scorecard-results.sarif
+          wait-for-processing: true
