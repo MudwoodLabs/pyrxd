@@ -81,11 +81,20 @@ priv = PrivateKey("L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ")
 If you already have a 12/24-word mnemonic (e.g. created by `pyrxd wallet
 new` or restored from another Radiant wallet), `HdWallet.from_mnemonic`
 gives you a full HD wallet at the correct Radiant BIP44 path
-(`m/44'/236'/<account>'`).
+(`m/44'/512'/<account>'`).
 
-> Radiant uses BIP44 coin type **236**, not 0 (Bitcoin). Examples written
-> for Bitcoin libraries will derive the wrong addresses — make sure any
-> derivation path you use is `m/44'/236'/...`.
+> ⚠️ **Radiant's BIP44 coin type per SLIP-0044 is 512.** Bitcoin's is 0.
+> Many Radiant-native software wallets historically used coin type 0
+> (a copy from upstream Bitcoin code) and addresses derived that way
+> are different from spec-correct addresses. Tangem (the hardware wallet
+> with Radiant integration) correctly uses coin type 512. As of pyrxd
+> 0.3, the default is coin type 512 to align with the spec and with Tangem.
+>
+> **Migrating from older pyrxd?** Earlier versions used coin type 236
+> (which is BSV's, not Radiant's). To recover funds derived at the old
+> path, set `RXD_PY_SDK_BIP44_DERIVATION_PATH=m/44'/236'/0'` before running
+> any pyrxd command. Sweep funds to a new spec-correct address, then unset
+> the env var.
 
 ```python
 from pyrxd.hd import HdWallet
@@ -102,9 +111,9 @@ lower-level helpers directly:
 ```python
 from pyrxd.hd import bip44_derive_xprv_from_mnemonic
 
-# Default path is m/44'/236'/0' — the Radiant account 0 key.
+# Default path is m/44'/512'/0' — the Radiant account 0 key (SLIP-0044).
 xprv = bip44_derive_xprv_from_mnemonic("word1 word2 ... word12")
-child = xprv.ckd(0).ckd(0)  # m/44'/236'/0'/0/0  (external chain, index 0)
+child = xprv.ckd(0).ckd(0)  # m/44'/512'/0'/0/0  (external chain, index 0)
 priv = child.private_key()
 print(f"WIF:     {priv.wif()}")
 print(f"address: {priv.public_key().address()}")

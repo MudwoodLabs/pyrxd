@@ -1,4 +1,4 @@
-"""Persistent BIP44 HD wallet with gap-limit scanning for Radiant (coin type 236).
+"""Persistent BIP44 HD wallet with gap-limit scanning for Radiant (coin type 512, per SLIP-0044).
 
 Usage
 -----
@@ -70,8 +70,46 @@ if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient
 
 _GAP_LIMIT = 20
-_COIN_TYPE = 236
-_RADIANT_PATH = f"m/44'/{_COIN_TYPE}'"
+
+# Radiant's BIP44 derivation path. Default is the SLIP-0044 spec-correct
+# coin type 512 (also what Tangem's hardware wallet uses). Earlier versions
+# of pyrxd used 236 (BSV's coin type); users with funds on the old path can
+# override via the RXD_PY_SDK_BIP44_DERIVATION_PATH env var to recover them
+# (e.g. RXD_PY_SDK_BIP44_DERIVATION_PATH="m/44'/236'/0'").
+#
+# The constant below is parsed once at import time from the central config in
+# pyrxd.constants. We strip the trailing "/0'" account suffix so the wallet
+# can append its own account number; HdWallet expects to control account
+# selection itself.
+def _parse_radiant_path() -> tuple[str, int]:
+    """Parse the configured BIP44 path into (path_without_account, coin_type).
+
+    The configured path looks like "m/44'/512'/0'" or "m/44'/236'/0'".
+    Strip the trailing account level so HdWallet can append its own account.
+    Also extract the coin type for diagnostic purposes (saved into wallet files).
+    """
+    from ..constants import BIP44_DERIVATION_PATH
+
+    parts = BIP44_DERIVATION_PATH.split("/")
+    # Expected shape: ["m", "44'", "<coin_type>'", "<account>'"]
+    if len(parts) < 3:
+        raise ValueError(
+            f"BIP44_DERIVATION_PATH={BIP44_DERIVATION_PATH!r} is malformed; "
+            "expected at least m/44'/<coin_type>'"
+        )
+    coin_type_str = parts[2].rstrip("'")
+    try:
+        coin_type = int(coin_type_str)
+    except ValueError as exc:
+        raise ValueError(
+            f"BIP44_DERIVATION_PATH={BIP44_DERIVATION_PATH!r} has non-integer "
+            f"coin type {coin_type_str!r}"
+        ) from exc
+    # Trim back to "m/44'/<coin_type>'" so HdWallet can append "/{account}'"
+    return f"m/44'/{coin_type}'", coin_type
+
+
+_RADIANT_PATH, _COIN_TYPE = _parse_radiant_path()
 
 # File-format constants. v2 changed encryption from CBC to GCM and the
 # KDF from raw hash256 to scrypt — incompatible with v1 by design (v1
@@ -491,7 +529,7 @@ class HdWallet:
     # Spending — Cut 1A of v0.3 wallet/CLI plan.
     #
     # Mirrors RxdWallet.send / send_max but signs each input with the
-    # per-UTXO derived key (BIP44 m/44'/236'/account'/change/index). The
+    # per-UTXO derived key (BIP44 m/44'/512'/account'/change/index). The
     # fee uses the same two-pass trial→measure→rebuild pattern that
     # RxdWallet uses; see test_preimage.py for the stale-signature
     # pitfall that motivated the reset between passes.
