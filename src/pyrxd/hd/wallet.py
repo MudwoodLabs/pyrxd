@@ -71,6 +71,7 @@ if TYPE_CHECKING:
 
 _GAP_LIMIT = 20
 
+
 # Radiant's BIP44 derivation path. Default is the SLIP-0044 spec-correct
 # coin type 512 (also what Tangem's hardware wallet uses). Earlier versions
 # of pyrxd used 236 (BSV's coin type); users with funds on the old path can
@@ -94,16 +95,14 @@ def _parse_radiant_path() -> tuple[str, int]:
     # Expected shape: ["m", "44'", "<coin_type>'", "<account>'"]
     if len(parts) < 3:
         raise ValueError(
-            f"BIP44_DERIVATION_PATH={BIP44_DERIVATION_PATH!r} is malformed; "
-            "expected at least m/44'/<coin_type>'"
+            f"BIP44_DERIVATION_PATH={BIP44_DERIVATION_PATH!r} is malformed; expected at least m/44'/<coin_type>'"
         )
     coin_type_str = parts[2].rstrip("'")
     try:
         coin_type = int(coin_type_str)
     except ValueError as exc:
         raise ValueError(
-            f"BIP44_DERIVATION_PATH={BIP44_DERIVATION_PATH!r} has non-integer "
-            f"coin type {coin_type_str!r}"
+            f"BIP44_DERIVATION_PATH={BIP44_DERIVATION_PATH!r} has non-integer coin type {coin_type_str!r}"
         ) from exc
     # Trim back to "m/44'/<coin_type>'" so HdWallet can append "/{account}'"
     return f"m/44'/{coin_type}'", coin_type

@@ -218,7 +218,7 @@ class TestWalletExportXpub:
         payload = _extract_json(result.output)
         assert payload["xpub"].startswith("xpub")
         assert payload["account"] == 0
-        assert payload["path"] == "m/44'/236'/0'"
+        assert payload["path"] == "m/44'/512'/0'"
 
     def test_export_with_wrong_mnemonic_exits_3(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
         runner.invoke(cli, _new_wallet_args(tmp_wallet_path))

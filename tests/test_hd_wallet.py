@@ -75,7 +75,7 @@ def _mock_client(
 
 
 class TestBip44CoinType:
-    def test_derives_account_key_on_coin_type_236_path(self):
+    def test_derives_account_key_on_coin_type_512_path(self):
         w = HdWallet.from_mnemonic(MNEMONIC)
         # The xprv depth should be 3 (purpose + coin_type + account)
         assert w._xprv.depth == 3
