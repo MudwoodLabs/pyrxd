@@ -5,7 +5,7 @@ Two flows are demonstrated, in order of how most users will want to
 approach the problem:
 
 1. ``HdWallet.from_mnemonic`` — the high-level path. Returns a full HD
-   wallet at the correct Radiant BIP44 path (``m/44'/236'/0'``) with
+   wallet at the correct Radiant BIP44 path (``m/44'/512'/0'``) with
    address tracking, gap-limit discovery, and optional encrypted
    persistence. This is the recommended entry point.
 
@@ -17,10 +17,15 @@ approach the problem:
 
 Radiant note
 ------------
-Radiant uses BIP44 coin type **236**, not 0 (Bitcoin). Code copied
-from Bitcoin examples that hardcodes ``m/44'/0'/0'/0/0`` will derive
-the wrong addresses. Both helpers here use the correct Radiant path
-by default.
+Radiant's officially registered BIP44 coin type per SLIP-0044 is **512**, not 0
+(Bitcoin). Code copied from Bitcoin examples that hardcodes
+``m/44'/0'/0'/0/0`` will derive the wrong addresses. Both helpers here use
+the correct Radiant path by default.
+
+Tangem (the hardware wallet) also uses ``m/44'/512'/0'/0/0`` for Radiant.
+Earlier versions of pyrxd (and this example) cited coin type 236, which is
+actually BSV's. Users with funds derived at the old path can override via
+``RXD_PY_SDK_BIP44_DERIVATION_PATH=m/44'/236'/0'`` to recover and sweep them.
 
 Usage
 -----
@@ -59,14 +64,14 @@ def high_level(mnemonic: str) -> None:
 
 
 def low_level(mnemonic: str) -> None:
-    """Derive a single private key at m/44'/236'/0'/0/0."""
+    """Derive a single private key at m/44'/512'/0'/0/0."""
     print("=== bip44_derive_xprv_from_mnemonic ===")
-    # Default path is m/44'/236'/0' (Radiant account 0).
+    # Default path is m/44'/512'/0' (Radiant account 0, per SLIP-0044).
     account_xprv = bip44_derive_xprv_from_mnemonic(mnemonic)
     # External chain (change=0), first address (index=0).
     child = account_xprv.ckd(0).ckd(0)
     priv = child.private_key()
-    print("path:    m/44'/236'/0'/0/0")
+    print("path:    m/44'/512'/0'/0/0")
     print(f"WIF:     {priv.wif()}")
     print(f"address: {priv.public_key().address()}")
     print()

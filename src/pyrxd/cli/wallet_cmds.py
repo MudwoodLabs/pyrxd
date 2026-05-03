@@ -172,7 +172,7 @@ def wallet_load(ctx: CliContext, passphrase: bool) -> None:
 def wallet_export_xpub(ctx: CliContext, passphrase: bool) -> None:
     """Print the account-level xpub for watch-only / recipient use.
 
-    The xpub at ``m/44'/236'/<account>'`` lets external tools generate
+    The xpub at ``m/44'/512'/<account>'`` lets external tools generate
     receive addresses for this wallet without ever seeing the seed.
     Safe to share with watch-only services or merchant integrations.
     No private key material is exported.
@@ -200,14 +200,14 @@ def wallet_export_xpub(ctx: CliContext, passphrase: bool) -> None:
     payload = {
         "xpub": str(xpub),
         "account": wallet.account,
-        "path": f"m/44'/236'/{wallet.account}'",
+        "path": f"m/44'/512'/{wallet.account}'",
     }
     if ctx.output_mode == "json":
         click.echo(emit(payload, mode="json"))
     elif ctx.output_mode == "quiet":
         click.echo(emit(payload, mode="quiet", quiet_field="xpub"))
     else:
-        click.echo(f"\nxpub at m/44'/236'/{wallet.account}':")
+        click.echo(f"\nxpub at m/44'/512'/{wallet.account}':")
         click.echo(f"  {xpub}")
         click.echo("\nThis xpub lets external tools generate receive addresses")
         click.echo("for this wallet WITHOUT seeing the seed. Safe to share with")

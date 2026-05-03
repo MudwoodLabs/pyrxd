@@ -169,3 +169,16 @@ wallet*.dat
 *.log
 *.tmp
 
+# ===== Strategic / unreleased design work =====
+# Strategic exploration, in-progress design docs, and pre-publication
+# notes live in docs/design/ and are not tracked by default. Public
+# research artifacts (like wallet derivation findings) belong in
+# docs/research/ and are tracked normally.
+#
+# To commit a single file from docs/design/ deliberately (e.g. when
+# moving it from internal to public), use:
+#   git add -f docs/design/<filename>
+# This makes the publication an explicit, deliberate act rather than
+# something that could happen via `git add .`
+docs/design/
+

@@ -44,7 +44,7 @@ class TestAddressCmd:
         assert result.exit_code == 0, result.output
         payload = _extract_json(result.output)
         assert payload["address"].startswith("1")
-        assert payload["path"] == "m/44'/236'/0'/0/0"
+        assert payload["path"] == "m/44'/512'/0'/0/0"
 
     def test_index_specific(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
         mnemonic = _create_wallet(runner, tmp_wallet_path)
@@ -55,7 +55,7 @@ class TestAddressCmd:
         )
         assert result.exit_code == 0, result.output
         payload = _extract_json(result.output)
-        assert payload["path"] == "m/44'/236'/0'/0/5"
+        assert payload["path"] == "m/44'/512'/0'/0/5"
 
     def test_change_chain(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
         mnemonic = _create_wallet(runner, tmp_wallet_path)
@@ -66,7 +66,7 @@ class TestAddressCmd:
         )
         assert result.exit_code == 0, result.output
         payload = _extract_json(result.output)
-        assert payload["path"] == "m/44'/236'/0'/1/0"
+        assert payload["path"] == "m/44'/512'/0'/1/0"
 
     def test_negative_index_errors(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
         mnemonic = _create_wallet(runner, tmp_wallet_path)
