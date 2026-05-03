@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Pre-push hook: run the full CI matrix locally before push.
+#
+# Mirrors .github/workflows/{lint,ci}.yml via the `ci` task in pyproject.toml.
+# This is the versioned source of truth — the actual hook lives at
+# .git/hooks/pre-push (per-clone), installed by scripts/install-git-hooks.sh.
+#
+# Bypass with `git push --no-verify` for emergencies (e.g. work-in-progress
+# branch pushes for backup or sharing). Don't bypass before a PR merges.
+
+set -euo pipefail
+
+say()  { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
+ok()   { printf '  \033[1;32mOK\033[0m %s\n' "$*"; }
+fail() { printf '  \033[1;31mFAIL\033[0m %s\n' "$*"; exit 1; }
+
+# Make sure we're using the project's Python environment so `task` resolves.
+if ! command -v task >/dev/null 2>&1; then
+  fail "task not found on PATH — activate the project venv (source .venv/bin/activate) and re-run, or install dev deps with: pip install -e .[dev]"
+fi
+
+say "Running local CI parity (task ci)"
+echo "  This runs lint + format-check + tests + coverage + typecheck."
+echo "  Bypass with \`git push --no-verify\` if you need to push WIP."
+echo
+
+if task ci; then
+  ok "pre-push: all CI checks passed locally"
+else
+  fail "pre-push: local CI failed — fix before pushing (or --no-verify for WIP)"
+fi

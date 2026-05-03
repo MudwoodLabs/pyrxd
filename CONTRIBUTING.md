@@ -11,12 +11,28 @@ git clone https://github.com/MudwoodLabs/pyrxd.git
 cd pyrxd
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -e ".[dev]"
-pytest -q
+poetry install --sync     # installs all groups (dev + test) — matches CI exactly
+poetry run task test      # full pytest suite, ~45 seconds
 ```
+
+If you don't have Poetry installed, `pip install -e ".[dev]"` works for
+basic development but won't pull in the full `test` group (pytest-cov,
+hypothesis, pytest-mock). Use Poetry to match the exact CI environment.
 
 The full test suite runs in under a minute on a modern laptop. If
 something is slow, that's a regression — please flag it.
+
+### Recommended: install the pre-push hook
+
+Run `task ci` (the full local-CI matrix) automatically before every push:
+
+```bash
+./scripts/install-git-hooks.sh
+```
+
+This catches the same failures CI catches, locally, in ~1-2 minutes —
+much faster than the push-fail-fix-push loop. Bypass for a specific push
+with `git push --no-verify`.
 
 ## Sign your commits (DCO)
 
@@ -71,16 +87,44 @@ runs both ruff hooks plus bandit and detect-secrets. Install hooks with
 
 ## Testing your changes
 
-Before opening a PR:
+Before opening a PR, run the full local CI matrix:
+
+```bash
+poetry run task ci  # runs everything CI runs (~3-5 min)
+```
+
+This is the canonical "is my PR likely to pass CI" check. Mirrors
+`.github/workflows/{lint,ci}.yml` exactly. If `task ci` passes locally,
+PR CI will almost always pass too.
+
+For faster iteration during a work session, run the individual tasks:
 
 ```bash
 poetry run task test                 # full pytest suite
 poetry run task lint                 # ruff check + bandit security scan
-poetry run task format               # ruff format src tests examples
-poetry run mypy src/pyrxd/security/  # type checker (security module is strict-typed)
+poetry run task format-check         # ruff format --check (no rewrites)
+poetry run task format               # ruff format src tests examples (does rewrite)
+poetry run task typecheck            # mypy on src/pyrxd/security/
+poetry run task coverage-security    # security module coverage (must be 100%)
+poetry run task coverage-overall     # overall coverage (must be ≥85%)
 ```
 
-CI runs the same checks; local feedback is faster.
+### Pre-push hook
+
+To run `task ci` automatically before every `git push`, install the
+versioned pre-push hook:
+
+```bash
+./scripts/install-git-hooks.sh
+```
+
+This symlinks `scripts/git-hooks/pre-push` into `.git/hooks/pre-push`, so
+every `git push` runs `task ci` first. Bypass for a specific push with
+`git push --no-verify` (e.g. for WIP branches you're sharing for review).
+
+The hook is **strongly recommended** if you push to PRs frequently —
+catching CI failures locally takes 3-5 minutes; finding out via a failed
+PR check takes 4-6 minutes plus another full CI run after fixing.
 
 ## Commit message style
 

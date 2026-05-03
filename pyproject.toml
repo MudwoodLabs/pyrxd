@@ -50,7 +50,15 @@ include = [
 # before pushing.
 lint = "ruff check src tests examples && bandit -r src/ -c pyproject.toml --quiet"
 format = "ruff format src tests examples"
+format-check = "ruff format --check src tests examples"
 test = "pytest"
+typecheck = "mypy src/pyrxd/security/"
+coverage-security = 'pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100'
+coverage-overall = 'pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85'
+# `task ci` runs the full set of checks GitHub Actions runs (.github/workflows/{lint,ci}.yml).
+# Run before pushing to avoid the push-fail-fix-push loop. ~3-5 min.
+# For a faster pre-commit pass, just run `task lint && task format-check && task test`.
+ci = "task lint && task format-check && task test && task coverage-security && task coverage-overall && task typecheck"
 docs = "sphinx-build -b html docs docs/_build/html"
 docs-clean = "rm -rf docs/_build"
 docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
