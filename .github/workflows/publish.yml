@@ -1,0 +1,91 @@
+name: Publish to PyPI
+
+# Triggered by GitHub Releases. The release event is a deliberate
+# "publish now" gesture — pushing a tag alone won't publish, which
+# avoids accidental releases.
+#
+# Auth uses PyPI Trusted Publishing (OIDC). No long-lived token is
+# stored in GitHub Secrets — PyPI verifies the workflow's identity
+# via the id-token claim and issues a short-lived upload credential.
+#
+# One-time PyPI setup (already-existing project):
+#   1. https://pypi.org/manage/project/pyrxd/settings/publishing/
+#   2. Add a trusted publisher with:
+#        - Owner:           MudwoodLabs
+#        - Repository:      pyrxd
+#        - Workflow:        publish.yml
+#        - Environment:     pypi
+#   3. Optional but recommended: configure the `pypi` environment in
+#      GitHub repo settings with required reviewers, so a second pair
+#      of eyes approves each publish.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build sdist + wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
+        with:
+          python-version: "3.12"
+      - name: Install Poetry
+        run: pip install poetry
+      - name: Verify version matches release tag
+        # Reject the publish if pyproject.toml's version doesn't match
+        # the tag the release was created from. This catches the
+        # "forgot to bump pyproject.toml" mistake before any artifact
+        # reaches PyPI.
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg_version=$(poetry version --short)
+          if [ "$tag" != "$pkg_version" ]; then
+            echo "::error::Release tag v$tag does not match pyproject.toml version $pkg_version"
+            exit 1
+          fi
+          echo "Version OK: $pkg_version"
+      - name: Build distributions
+        run: poetry build
+      - name: Upload distributions as workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    # The `pypi` environment is the second-factor: configure required
+    # reviewers under repo Settings → Environments → pypi to gate
+    # publishes on a manual approval click.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/pyrxd
+    permissions:
+      # id-token: write is required for PyPI Trusted Publishing OIDC.
+      # contents: read inherited from the workflow default would be
+      # dropped without re-declaring at the job level when overriding
+      # any permission, so re-declare both explicitly.
+      id-token: write
+      contents: read
+    steps:
+      - name: Download built distributions
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131  # v7.0.0
+        with:
+          name: dist
+          path: dist/
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
+        # No `with:` block: defaults publish to PyPI from ./dist using
+        # Trusted Publishing OIDC. Print the upload URL so the workflow
+        # log links straight to the new release page.
+        with:
+          print-hash: true
