@@ -52,7 +52,6 @@ from ..transaction.transaction_output import TransactionOutput
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError, WalletDecryptError
 from .format import emit, emit_table
-from .main import cli
 from .prompts import confirm_action, prompt_mnemonic_input, prompt_passphrase_input
 
 if TYPE_CHECKING:
@@ -65,7 +64,7 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-@cli.group(name="glyph")
+@click.group(name="glyph")
 def glyph_group() -> None:
     """Mint, transfer, and inspect Glyph tokens."""
 

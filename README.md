@@ -17,6 +17,13 @@ ElectrumX network client.
 Cryptographic primitives have not been independently audited. See
 [SECURITY.md](SECURITY.md) for security policy and disclosure.
 
+> ⚠️ **Use at your own risk.** pyrxd is alpha-quality software written
+> primarily by one person; cryptographic code has not been independently
+> audited. **Do not use it to handle funds you cannot afford to lose.**
+> Verify your derivation paths and transaction outputs against an
+> independent wallet before broadcasting on mainnet. If you find a bug
+> that affects funds, report it via the [security policy](SECURITY.md).
+
 **Working on mainnet today:**
 
 - RXD send / send-max, balance and UTXO queries
