@@ -3,4 +3,4 @@
 
 sphinx>=7,<9
 furo>=2024,<2026
-myst-parser>=4,<5
+myst-parser>=4.0.1,<5
