@@ -55,10 +55,15 @@ test = "pytest"
 typecheck = "mypy src/pyrxd/security/"
 coverage-security = 'pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100'
 coverage-overall = 'pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85'
-# `task ci` runs the full set of checks GitHub Actions runs (.github/workflows/{lint,ci}.yml).
-# Run before pushing to avoid the push-fail-fix-push loop. ~3-5 min.
+# `task check-private-links` ensures tracked docs (and staged additions) don't
+# link to gitignored paths. Catches leaks where a public doc references a
+# private design doc — broken links + leaked filenames in commit history.
+check-private-links = "python3 scripts/check-no-private-links.py"
+# `task ci` runs the full set of checks GitHub Actions runs (.github/workflows/{lint,ci}.yml)
+# plus local-only guardrails (private-link check). Run before pushing to avoid
+# the push-fail-fix-push loop. ~3-5 min.
 # For a faster pre-commit pass, just run `task lint && task format-check && task test`.
-ci = "task lint && task format-check && task test && task coverage-security && task coverage-overall && task typecheck"
+ci = "task lint && task format-check && task test && task coverage-security && task coverage-overall && task typecheck && task check-private-links"
 docs = "sphinx-build -b html docs docs/_build/html"
 docs-clean = "rm -rf docs/_build"
 docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
