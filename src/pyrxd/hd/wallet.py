@@ -73,39 +73,98 @@ _GAP_LIMIT = 20
 
 
 # Radiant's BIP44 derivation path. Default is the SLIP-0044 spec-correct
-# coin type 512 (also what Tangem's hardware wallet uses). Earlier versions
-# of pyrxd used 236 (BSV's coin type); users with funds on the old path can
-# override via the RXD_PY_SDK_BIP44_DERIVATION_PATH env var to recover them
-# (e.g. RXD_PY_SDK_BIP44_DERIVATION_PATH="m/44'/236'/0'").
+# coin type 512 (also what Tangem's hardware wallet uses). The most-used
+# Radiant software wallet (Photonic) uses coin type 0 (Bitcoin's, copied
+# from upstream); users restoring a Photonic mnemonic should pass
+# ``coin_type=0`` to from_mnemonic / load_or_create. Earlier pyrxd versions
+# used 236 (BSV's coin type); funds at that path are recoverable with
+# ``coin_type=236``.
 #
-# The constant below is parsed once at import time from the central config in
-# pyrxd.constants. We strip the trailing "/0'" account suffix so the wallet
-# can append its own account number; HdWallet expects to control account
-# selection itself.
-def _parse_radiant_path() -> tuple[str, int]:
-    """Parse the configured BIP44 path into (path_without_account, coin_type).
+# Resolution order, highest precedence first:
+#   1. ``coin_type=`` kwarg on HdWallet.from_mnemonic / load_or_create
+#   2. RXD_PY_SDK_BIP44_DERIVATION_PATH env var
+#   3. Module default (SLIP-0044 spec, coin type 512)
+def _parse_radiant_path(path: str | None = None) -> tuple[str, int]:
+    """Parse a BIP44 path into (path_without_account, coin_type).
 
-    The configured path looks like "m/44'/512'/0'" or "m/44'/236'/0'".
-    Strip the trailing account level so HdWallet can append its own account.
-    Also extract the coin type for diagnostic purposes (saved into wallet files).
+    With *path* None, reads the configured ``BIP44_DERIVATION_PATH`` from
+    pyrxd.constants (which itself reads the env var or falls back to the
+    SLIP-0044 default). With *path* supplied, parses that string directly
+    — used when callers thread a per-instance override through
+    HdWallet.from_mnemonic.
+
+    Either form expects "m/44'/<coin_type>'" or "m/44'/<coin_type>'/<account>'".
+    Trailing account level is stripped so HdWallet can append its own
+    account number.
     """
-    from ..constants import BIP44_DERIVATION_PATH
+    if path is None:
+        from ..constants import BIP44_DERIVATION_PATH
 
-    parts = BIP44_DERIVATION_PATH.split("/")
+        path = BIP44_DERIVATION_PATH
+
+    parts = path.split("/")
     # Expected shape: ["m", "44'", "<coin_type>'", "<account>'"]
     if len(parts) < 3:
-        raise ValueError(
-            f"BIP44_DERIVATION_PATH={BIP44_DERIVATION_PATH!r} is malformed; expected at least m/44'/<coin_type>'"
-        )
+        raise ValueError(f"derivation path {path!r} is malformed; expected at least m/44'/<coin_type>'")
     coin_type_str = parts[2].rstrip("'")
     try:
         coin_type = int(coin_type_str)
     except ValueError as exc:
-        raise ValueError(
-            f"BIP44_DERIVATION_PATH={BIP44_DERIVATION_PATH!r} has non-integer coin type {coin_type_str!r}"
-        ) from exc
+        raise ValueError(f"derivation path {path!r} has non-integer coin type {coin_type_str!r}") from exc
     # Trim back to "m/44'/<coin_type>'" so HdWallet can append "/{account}'"
     return f"m/44'/{coin_type}'", coin_type
+
+
+def _validate_coin_type(value: object, *, source: str) -> int:
+    """Validate that *value* is a non-bool int in BIP44 hardened range.
+
+    Single source of truth for coin_type validation. Called from every
+    entry point where a coin_type value enters the system: the kwarg
+    path (``_resolve_coin_type``), the load path (after reading the
+    persisted JSON), and ``__post_init__`` (after direct dataclass
+    construction). Centralizing the rule closes the SEV-1 finding from
+    the patch-on-patch review where validation only fired at one entry
+    point and persisted-file values bypassed it on load.
+
+    *source* names where the value came from, so error messages tell
+    the user which fix to apply ("kwarg" vs "wallet file" vs
+    "constructor").
+
+    Rejects:
+      - ``bool`` (subclass of int in Python; without this guard,
+        ``True`` formats into the path as the literal ``"True"``,
+        persists as JSON ``true``, reloads via ``int(True)`` as ``1``
+        — silent path-tree mismatch).
+      - non-int types (``str``, ``float``, ``None``, ``list``, etc.).
+      - negative values (BIP32 parses ``-1`` as unhardened index
+        ``0x7FFFFFFF``, colliding with the unhardened sibling).
+      - values >= ``2**31`` (collides with or exceeds the BIP32
+        hardening bit).
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{source} coin_type must be a non-bool int (got {type(value).__name__})")
+    if not 0 <= value < 2**31:
+        raise ValidationError(
+            f"{source} coin_type {value} out of BIP44 hardened range [0, 2**31). "
+            "BIP44 reserves the high bit for the hardening flag; pyrxd applies "
+            "it automatically, so the unhardened integer must fit in 31 bits."
+        )
+    return value
+
+
+def _resolve_coin_type(coin_type: int | None) -> tuple[str, int]:
+    """Resolve a coin_type kwarg to (path_without_account, coin_type).
+
+    *coin_type* None → use module default (env var or SLIP-0044). An
+    integer → use that coin type at the standard BIP44 layout
+    ``m/44'/<coin_type>'``. Validation is delegated to
+    ``_validate_coin_type``; this function only handles the
+    None-means-default fallback and path formatting.
+    """
+    if coin_type is None:
+        return _parse_radiant_path()
+    validated = _validate_coin_type(coin_type, source="kwarg")
+    return f"m/44'/{validated}'", validated
 
 
 _RADIANT_PATH, _COIN_TYPE = _parse_radiant_path()
@@ -149,6 +208,15 @@ class HdWallet:
     ----------
     account:
         BIP44 account index (usually 0).
+    coin_type:
+        BIP44 coin type (read-only property; back-store ``_coin_type``
+        is set at construction and never mutated). 512 is SLIP-0044 spec
+        for Radiant (default, also Tangem); 0 matches Photonic and
+        Electron-Radiant; 236 matches pre-#14 pyrxd. Persisted in the
+        wallet file and validated on load. Read-only because mutating
+        it post-construction would desync from the already-derived
+        ``_xprv`` and silently route subsequent addresses to a
+        different path (closes SEV-2 red-team finding).
     external_tip:
         Highest derived index on external chain (change=0).
     internal_tip:
@@ -160,9 +228,65 @@ class HdWallet:
     _xprv: Xprv = field(repr=False)
     _seed: SecretBytes = field(repr=False)
     account: int = 0
+    _coin_type: int = field(default_factory=lambda: _COIN_TYPE)
     external_tip: int = 0
     internal_tip: int = 0
     addresses: dict[str, AddressRecord] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Validate coin_type and seal it against post-construction mutation.
+
+        Closes two SEV-1 patch-on-patch findings:
+          - Direct ``HdWallet(_coin_type=-99)`` previously bypassed
+            ``_resolve_coin_type``; ``__post_init__`` re-runs the same
+            validator so every code path that constructs a wallet hits
+            it.
+          - ``wallet._coin_type = X`` and ``wallet.__dict__['_coin_type']
+            = X`` were not blocked by the read-only property because
+            they target the underscored backing field directly. The
+            ``_initialized`` sentinel flag activates the
+            ``__setattr__`` guard at the end of construction; from
+            that point on, any write to ``_coin_type`` raises.
+        """
+        _validate_coin_type(self._coin_type, source="HdWallet constructor")
+        # Seal the field. Other dataclass attributes (external_tip,
+        # internal_tip, addresses) remain mutable — gap scanning and
+        # next_receive_address need to update them. Only _coin_type
+        # is sealed.
+        object.__setattr__(self, "_initialized", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        """Block post-construction mutation of ``_coin_type``.
+
+        Raises ``AttributeError`` for ``_coin_type`` writes after
+        ``__post_init__`` has set the sentinel. All other attributes
+        remain mutable. Bypasses (``object.__setattr__``,
+        ``__dict__`` manipulation, ``dataclasses.replace``) still work
+        — this is a guardrail against honest mistakes, not a
+        sandboxing primitive.
+        """
+        if name == "_coin_type" and getattr(self, "_initialized", False):
+            raise AttributeError(
+                "HdWallet._coin_type is read-only after construction. "
+                "Mutating it would desync from the already-derived "
+                "_xprv and silently route subsequent addresses to a "
+                "different path. Construct a new wallet via "
+                "HdWallet.from_mnemonic(..., coin_type=...) instead."
+            )
+        object.__setattr__(self, name, value)
+
+    @property
+    def coin_type(self) -> int:
+        """BIP44 coin type this wallet was constructed with. Read-only.
+
+        Read-only because mutating it post-construction would desync
+        from the already-derived ``_xprv``; subsequent address
+        derivations would still happen at the original path while the
+        persisted JSON would advertise the new path. The
+        ``__setattr__`` override blocks ``wallet._coin_type = X``;
+        the property blocks ``wallet.coin_type = X``.
+        """
+        return self._coin_type
 
     # ------------------------------------------------------------------
     # Construction
@@ -173,12 +297,32 @@ class HdWallet:
         mnemonic: str,
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         account: int = 0,
+        coin_type: int | None = None,
     ) -> HdWallet:
-        """Create a fresh wallet from a BIP39 mnemonic."""
+        """Create a fresh wallet from a BIP39 mnemonic.
+
+        *coin_type* selects the BIP44 derivation path:
+          - ``None`` (default) uses the module-level configured coin type
+            (env var ``RXD_PY_SDK_BIP44_DERIVATION_PATH``, or SLIP-0044's
+            512 if unset).
+          - ``512`` is SLIP-0044 Radiant (also Tangem).
+          - ``0`` matches Photonic and Electron-Radiant — pass this when
+            restoring a mnemonic from those wallets.
+          - ``236`` matches pre-#14 pyrxd wallets.
+
+        The chosen coin type is recorded on the wallet and persisted in
+        the wallet file; subsequent :meth:`load` calls validate it.
+        """
+        radiant_path, resolved_coin_type = _resolve_coin_type(coin_type)
         seed = seed_from_mnemonic(mnemonic, passphrase=passphrase)
-        path = f"{_RADIANT_PATH}/{account}'"
+        path = f"{radiant_path}/{account}'"
         xprv = bip32_derive_xprv_from_mnemonic(mnemonic, passphrase=passphrase, path=path)
-        return cls(_xprv=xprv, _seed=SecretBytes(seed), account=account)
+        return cls(
+            _xprv=xprv,
+            _seed=SecretBytes(seed),
+            account=account,
+            _coin_type=resolved_coin_type,
+        )
 
     @classmethod
     def load(
@@ -186,6 +330,7 @@ class HdWallet:
         path: Path,
         mnemonic: str,
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
+        coin_type: int | None = None,
     ) -> HdWallet:
         """Load a previously saved wallet from *path*.
 
@@ -194,13 +339,20 @@ class HdWallet:
         path will not silently produce an empty wallet that subsequently
         overwrites a real wallet on save. Callers that explicitly want
         the create-on-missing behavior should use :meth:`load_or_create`.
+
+        *coin_type* (optional) is validated against the value persisted
+        in the wallet file. A mismatch raises :class:`ValidationError` —
+        this catches the silent-empty-wallet failure mode where a
+        default change between pyrxd versions would otherwise have the
+        loaded wallet derive at a different path than it was saved at.
+        Pass ``None`` (default) to accept whatever was persisted.
         """
         if not path.exists():
             raise FileNotFoundError(
                 f"Wallet file not found: {path}. Use HdWallet.load_or_create(...) "
                 f"if you intended to create a new wallet on this path."
             )
-        return cls._load_existing(path, mnemonic, passphrase)
+        return cls._load_existing(path, mnemonic, passphrase, coin_type)
 
     @classmethod
     def load_or_create(
@@ -209,6 +361,7 @@ class HdWallet:
         mnemonic: str,
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         account: int = 0,
+        coin_type: int | None = None,
     ) -> HdWallet:
         """Load a wallet from *path*, or build a fresh one if the file is missing.
 
@@ -217,13 +370,17 @@ class HdWallet:
         with the old single-load API was that a typo in *path* would
         produce an empty wallet that subsequently overwrote the real
         wallet on save.
+
+        *coin_type* applies to both branches: when loading, it is
+        validated against the persisted value; when creating, it is the
+        coin type the new wallet uses.
         """
         if path.exists():
-            return cls._load_existing(path, mnemonic, passphrase)
-        return cls.from_mnemonic(mnemonic, passphrase=passphrase, account=account)
+            return cls._load_existing(path, mnemonic, passphrase, coin_type)
+        return cls.from_mnemonic(mnemonic, passphrase=passphrase, account=account, coin_type=coin_type)
 
     @classmethod
-    def _load_existing(cls, path: Path, mnemonic: str, passphrase: str) -> HdWallet:
+    def _load_existing(cls, path: Path, mnemonic: str, passphrase: str, coin_type: int | None = None) -> HdWallet:
         # Mode check: refuse to load a wallet that's group/world readable.
         # ``save()`` always writes 0o600, but a user who restored from
         # backup with ``cp`` or ``rsync`` might end up with a wider
@@ -284,13 +441,55 @@ class HdWallet:
 
         try:
             account = int(data.get("account", 0))
+            # The wallet file records the coin type it was saved at. Validate the
+            # caller's expectation against it: a mismatch means the file was
+            # created at one path and the caller is trying to load it at another,
+            # which would silently derive different addresses and look like an
+            # empty wallet. Surface this loudly with a fix-it message rather
+            # than letting a default flip in a routine ``pip install -U`` change
+            # which addresses an indexer or exchange watches.
+            #
+            # A missing coin_type field is a HARD ERROR (closes SEV-1 finding
+            # from red-team review): silently falling back to the module default
+            # would re-introduce the exact silent-default-flip footgun this
+            # field was added to prevent. v2 has always written coin_type;
+            # absence means the file is corrupt, hand-edited, or from a future
+            # format that should bump _FILE_VERSION instead of dropping the
+            # field. Either way, refuse to guess.
+            if "coin_type" not in data:
+                raise ValidationError(
+                    f"Wallet file at {path} is missing required field 'coin_type'. "
+                    "v2 wallets always persist this field; absence indicates corruption "
+                    "or hand-editing. Re-create the wallet from mnemonic with an "
+                    "explicit coin_type kwarg to recover."
+                )
+            # Validate the persisted value with the same guard as the kwarg path.
+            # Closes SEV-1 from the patch-on-patch review: previously, ``int(...)``
+            # was applied without type/range checks, so a hand-edited or corrupted
+            # file with ``coin_type: -1`` (unhardened-sibling collision),
+            # ``coin_type: true`` (silent flip to 1), ``coin_type: "0"`` (string
+            # bypass), or ``coin_type: 512.0`` (silent float→int truncation) would
+            # load without complaint and silently route the wallet to the wrong
+            # path. The persisted value must pass the same gate as a fresh kwarg.
+            persisted_coin_type = _validate_coin_type(data["coin_type"], source=f"wallet file at {path}")
+            if coin_type is not None and coin_type != persisted_coin_type:
+                raise ValidationError(
+                    f"Wallet file at {path} was saved at coin type {persisted_coin_type} "
+                    f"(BIP44 path m/44'/{persisted_coin_type}'/...) but you passed "
+                    f"coin_type={coin_type}. Pass coin_type={persisted_coin_type} to load "
+                    f"this wallet, or use a different file."
+                )
+            # Derive at the persisted path, not the module default — this is
+            # what prevents a default change from silently watching the wrong
+            # addresses for already-saved wallets.
             account_xprv = bip32_derive_xprv_from_mnemonic(
-                mnemonic, passphrase=passphrase, path=f"{_RADIANT_PATH}/{account}'"
+                mnemonic, passphrase=passphrase, path=f"m/44'/{persisted_coin_type}'/{account}'"
             )
             wallet = cls(
                 _xprv=account_xprv,
                 _seed=SecretBytes(seed),
                 account=account,
+                _coin_type=persisted_coin_type,
                 external_tip=int(data.get("external_tip", 0)),
                 internal_tip=int(data.get("internal_tip", 0)),
             )
@@ -342,7 +541,11 @@ class HdWallet:
         data = {
             "version": _FILE_VERSION_V2,
             "account": self.account,
-            "coin_type": _COIN_TYPE,
+            # Persist the wallet's own coin_type, not the module-level
+            # default. A wallet built with coin_type=0 must save coin_type=0
+            # so a subsequent load validates correctly even if the env var
+            # or default has changed in the meantime.
+            "coin_type": self.coin_type,
             "external_tip": self.external_tip,
             "internal_tip": self.internal_tip,
             "addresses": {

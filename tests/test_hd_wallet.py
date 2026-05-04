@@ -108,6 +108,521 @@ class TestBip44CoinType:
 
 
 # ---------------------------------------------------------------------------
+# Per-call coin_type kwarg — the foundational fix from Phase 1 of the
+# coin-type-512 decision record. Before this kwarg existed, the only way
+# to derive at a non-default path was to set RXD_PY_SDK_BIP44_DERIVATION_PATH
+# *before* importing pyrxd, because the path was parsed once at module
+# import time. That made restoration of Photonic / Electron-Radiant
+# mnemonics undiscoverable for non-expert users.
+#
+# Vector provenance (the EXPECTED_* values below):
+#   - EXPECTED_0 (coin_type=0): VERIFIED end-to-end against Photonic
+#     Wallet on 2026-05-03 — the canonical BIP39 mnemonic
+#     "abandon abandon ... about" was restored in Photonic, and its
+#     Receive screen displayed exactly this address. So this test is a
+#     cross-wallet compatibility check, not a regression-only guard.
+#     Re-verify if Photonic ships a derivation-path change.
+#   - EXPECTED_512 (coin_type=512): captured from this SDK; matches
+#     SLIP-0044 spec for Radiant. Tangem hardware wallet uses this
+#     path but cannot import mnemonics so end-to-end verification
+#     against Tangem is not possible.
+#   - EXPECTED_236 (coin_type=236): captured from this SDK; pre-#14
+#     pyrxd default, BSV's coin type. Regression-only.
+# ---------------------------------------------------------------------------
+
+
+class TestCoinTypeKwarg:
+    EXPECTED_512 = "18qiat9Kff5niCcincht6efD8HhFfzL1AJ"  # SLIP-0044 default
+    EXPECTED_236 = "1K6LZdwpKT5XkEZo2T2kW197aMXYbYMc4f"  # legacy BSV
+    EXPECTED_0 = "1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA"  # Photonic-verified 2026-05-03
+
+    def test_coin_type_512_matches_default(self):
+        explicit = HdWallet.from_mnemonic(MNEMONIC, coin_type=512)
+        assert explicit._derive_address(0, 0) == self.EXPECTED_512
+
+    def test_coin_type_0_matches_photonic_path(self):
+        # The reason this kwarg exists. Photonic users restoring their
+        # mnemonic must be able to reach m/44'/0'/0'/0/0 without setting
+        # an env var before importing pyrxd.
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=0)
+        assert w._derive_address(0, 0) == self.EXPECTED_0
+
+    def test_coin_type_236_matches_legacy_bsv(self):
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=236)
+        assert w._derive_address(0, 0) == self.EXPECTED_236
+
+    def test_three_coin_types_yield_three_addresses(self):
+        # Belt-and-braces against the failure mode where the kwarg is
+        # silently ignored and all three calls return the default.
+        addrs = {HdWallet.from_mnemonic(MNEMONIC, coin_type=ct)._derive_address(0, 0) for ct in (0, 236, 512)}
+        assert len(addrs) == 3
+
+    def test_coin_type_persisted_on_instance(self):
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=0)
+        assert w.coin_type == 0
+
+    def test_coin_type_default_is_module_default(self):
+        # Don't hardcode 512 here — module default may be overridden
+        # via env var. The assertion is that the instance default
+        # matches whatever the module resolved at import.
+        from pyrxd.hd.wallet import _COIN_TYPE
+
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        assert w.coin_type == _COIN_TYPE
+
+    def test_account_kwarg_still_independent_of_coin_type(self):
+        # account and coin_type are orthogonal — confirm changing one
+        # doesn't perturb the other.
+        w_a0 = HdWallet.from_mnemonic(MNEMONIC, coin_type=0, account=0)
+        w_a1 = HdWallet.from_mnemonic(MNEMONIC, coin_type=0, account=1)
+        assert w_a0.coin_type == 0 == w_a1.coin_type
+        assert w_a0._derive_address(0, 0) != w_a1._derive_address(0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Load-time coin_type validation — the second foundational fix from
+# Phase 1. Without this check, a wallet saved at one coin type and
+# loaded under a different module default would silently derive
+# different addresses (the original report from Photonic users). The
+# loud-error-instead-of-silent-empty-wallet behavior is what makes any
+# future default change safe.
+# ---------------------------------------------------------------------------
+
+
+class TestCoinTypeLoadValidation:
+    def test_save_and_load_roundtrip_at_non_default_coin_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet_path = Path(tmp) / "photonic.dat"
+            saved = HdWallet.from_mnemonic(MNEMONIC, coin_type=0)
+            saved.save(wallet_path)
+
+            loaded = HdWallet.load(wallet_path, MNEMONIC, coin_type=0)
+            assert loaded.coin_type == 0
+            assert loaded._derive_address(0, 0) == saved._derive_address(0, 0)
+
+    def test_load_with_no_coin_type_kwarg_accepts_persisted_value(self):
+        # Backwards-compatible: callers who don't care about validation
+        # get the persisted coin_type without needing to know it.
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet_path = Path(tmp) / "photonic.dat"
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=0).save(wallet_path)
+
+            loaded = HdWallet.load(wallet_path, MNEMONIC)
+            assert loaded.coin_type == 0
+
+    def test_load_with_mismatched_coin_type_raises(self):
+        # The killer bug class: silent empty wallet because the wallet
+        # was saved at coin type 0 but the loader is looking at 512.
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet_path = Path(tmp) / "photonic.dat"
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=0).save(wallet_path)
+
+            with pytest.raises(ValidationError, match="coin type 0"):
+                HdWallet.load(wallet_path, MNEMONIC, coin_type=512)
+
+    def test_mismatch_error_names_both_coin_types(self):
+        # The fix-it message must tell the user what was persisted AND
+        # what they passed, so they can choose which to change.
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet_path = Path(tmp) / "legacy.dat"
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=236).save(wallet_path)
+
+            with pytest.raises(ValidationError) as exc_info:
+                HdWallet.load(wallet_path, MNEMONIC, coin_type=512)
+
+            msg = str(exc_info.value)
+            assert "236" in msg
+            assert "512" in msg
+
+    def test_load_or_create_validates_coin_type_when_file_exists(self):
+        # load_or_create must NOT silently swallow a mismatch by
+        # falling back to "create new wallet" — that would defeat the
+        # point of the validation.
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet_path = Path(tmp) / "w.dat"
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=0).save(wallet_path)
+
+            with pytest.raises(ValidationError, match="coin type 0"):
+                HdWallet.load_or_create(wallet_path, MNEMONIC, coin_type=512)
+
+    def test_load_or_create_uses_coin_type_for_fresh_wallet(self):
+        # No existing file → coin_type drives the new wallet's path.
+        with tempfile.TemporaryDirectory() as tmp:
+            wallet_path = Path(tmp) / "fresh.dat"
+            assert not wallet_path.exists()
+
+            w = HdWallet.load_or_create(wallet_path, MNEMONIC, coin_type=0)
+            assert w.coin_type == 0
+
+
+# ---------------------------------------------------------------------------
+# Red-team-driven tests — these encode SEV-1/SEV-2 findings from the
+# 2026-05-03 review of Phase 1. Each test name maps to a specific bug
+# class. If any of these regress, the underlying validation has been
+# weakened and the silent-empty-wallet failure mode is back.
+# ---------------------------------------------------------------------------
+
+
+class TestCoinTypeInputValidation:
+    """SEV-1: kwarg-boundary type/range validation.
+
+    Without these guards, ``coin_type=True`` formats into a path as the
+    string ``"True"``, persists as JSON ``true``, and reloads as the
+    integer ``1`` — silently routing the wallet to a different address
+    tree and defeating the validation kwarg.
+    """
+
+    def test_bool_true_rejected(self):
+        # bool subclasses int in Python; without the explicit bool guard
+        # this would slip through and produce path m/44'/True'.
+        with pytest.raises(ValidationError, match="non-bool int"):
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=True)
+
+    def test_bool_false_rejected(self):
+        # False == 0 numerically. Without the guard, coin_type=False
+        # would silently restore Photonic-path wallets, which is the
+        # opposite of explicit user intent.
+        with pytest.raises(ValidationError, match="non-bool int"):
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=False)
+
+    def test_string_rejected(self):
+        with pytest.raises(ValidationError, match="non-bool int"):
+            HdWallet.from_mnemonic(MNEMONIC, coin_type="0")
+
+    def test_float_rejected(self):
+        with pytest.raises(ValidationError, match="non-bool int"):
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=0.0)
+
+    def test_negative_coin_type_rejected(self):
+        # SEV-1: coin_type=-1 produces path m/44'/-1', which BIP32
+        # parses as the unhardened index 0x7FFFFFFF — funds end up at
+        # a path shared with whoever derives the unhardened sibling
+        # directly.
+        with pytest.raises(ValidationError, match="out of BIP44 hardened range"):
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=-1)
+
+    def test_oversized_coin_type_rejected(self):
+        # 2**31 collides with the hardening bit; values above are
+        # outside the 32-bit child-index domain.
+        with pytest.raises(ValidationError, match="out of BIP44 hardened range"):
+            HdWallet.from_mnemonic(MNEMONIC, coin_type=2**31)
+
+    def test_zero_accepted(self):
+        # 0 is the legitimate Photonic / Electron-Radiant value — it
+        # must NOT be a casualty of the range check.
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=0)
+        assert w.coin_type == 0
+
+    def test_intenum_subclass_accepted(self):
+        # IntEnum is a real-world int subclass that should pass. The
+        # f-string format MUST yield the underlying integer, not a
+        # custom __str__ form. (Test name avoids "_int_" because the
+        # repo's conftest auto-marks any node with that substring as
+        # an integration test and excludes it from the default run.)
+        from enum import IntEnum
+
+        class Coin(IntEnum):
+            PHOTONIC = 0
+            RADIANT = 512
+
+        ref = HdWallet.from_mnemonic(MNEMONIC, coin_type=0)._derive_address(0, 0)
+        via_enum = HdWallet.from_mnemonic(MNEMONIC, coin_type=Coin.PHOTONIC)._derive_address(0, 0)
+        assert ref == via_enum
+
+
+class TestMissingCoinTypeFieldIsHardError:
+    """SEV-1: a wallet file missing the persisted coin_type must NOT
+    silently fall back to the module default.
+
+    The fallback was the original implementation; red-team review
+    showed it re-introduced the silent-default-flip footgun the kwarg
+    was added to prevent.
+    """
+
+    def _write_wallet_blob_without_coin_type(self, p: Path) -> None:
+        """Hand-craft a v2 wallet file whose JSON omits coin_type."""
+        import hashlib
+        import json
+        import secrets
+
+        from Cryptodome.Cipher import AES
+
+        from pyrxd.hd.bip39 import seed_from_mnemonic
+        from pyrxd.hd.wallet import _FILE_VERSION_V2, _NONCE_LEN, _SALT_LEN, _SCRYPT_N, _SCRYPT_P, _SCRYPT_R
+
+        seed = seed_from_mnemonic(MNEMONIC, passphrase="")
+        salt = secrets.token_bytes(_SALT_LEN)
+        nonce = secrets.token_bytes(_NONCE_LEN)
+        enc_key = hashlib.scrypt(
+            seed, salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, maxmem=128 * 1024 * 1024, dklen=32
+        )
+        data_no_coin_type = {
+            "version": _FILE_VERSION_V2,
+            "account": 0,
+            # NO coin_type — this is the failure under test.
+            "external_tip": 0,
+            "internal_tip": 0,
+            "addresses": {},
+        }
+        cipher = AES.new(enc_key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(json.dumps(data_no_coin_type).encode())
+        blob = bytes([_FILE_VERSION_V2]) + salt + nonce + tag + ciphertext
+        p.write_bytes(blob)
+        p.chmod(0o600)
+
+    def test_load_refuses_file_without_coin_type(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "no_coin_type.dat"
+            self._write_wallet_blob_without_coin_type(p)
+            with pytest.raises(ValidationError, match="missing required field 'coin_type'"):
+                HdWallet.load(p, MNEMONIC)
+
+    def test_load_with_kwarg_still_refuses_file_without_coin_type(self):
+        # Even if the caller "knows" the path, missing-field is a hard
+        # error — the file is corrupt or hand-edited and the right
+        # answer is "re-create from mnemonic", not "trust the caller".
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "no_coin_type.dat"
+            self._write_wallet_blob_without_coin_type(p)
+            with pytest.raises(ValidationError, match="missing required field 'coin_type'"):
+                HdWallet.load(p, MNEMONIC, coin_type=512)
+
+
+class TestCoinTypeIsReadOnly:
+    """SEV-2: post-construction mutation of coin_type would desync from
+    the already-derived ``_xprv``.
+
+    A caller that does ``wallet.coin_type = 0; wallet.save()`` would
+    persist coin_type=0 in the JSON while ``_xprv`` is still rooted at
+    the original path — leading to a silent address-tree mismatch on
+    next load.
+    """
+
+    def test_setting_coin_type_attribute_raises(self):
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=512)
+        with pytest.raises(AttributeError):
+            w.coin_type = 0  # type: ignore[misc]
+
+    def test_setting_underscored_field_raises(self):
+        # The patch-on-patch review found that the property blocked the
+        # public name but the underscored backing field was still
+        # writable directly. The __setattr__ guard closes that hole.
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=512)
+        with pytest.raises(AttributeError, match="read-only"):
+            w._coin_type = 0  # type: ignore[misc]
+
+    def test_property_returns_construction_value(self):
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=0)
+        # Read multiple times — value must be stable.
+        assert w.coin_type == 0
+        assert w.coin_type == 0
+
+    def test_other_attributes_remain_mutable(self):
+        # __setattr__ guard must NOT lock down external_tip /
+        # internal_tip / addresses — gap-scan and next_receive_address
+        # legitimately mutate them.
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        w.external_tip = 5
+        w.internal_tip = 3
+        w.addresses["0/0"] = AddressRecord(address="x", change=0, index=0, used=True)
+        assert w.external_tip == 5
+        assert w.internal_tip == 3
+
+
+# ---------------------------------------------------------------------------
+# Patch-on-patch review fixes — tests for the SEV-1 issues found in the
+# 2026-05-03 review of the FIRST round of red-team patches. These hit
+# entry points the original validation missed: the load path, direct
+# dataclass construction, and underscore-bypass mutation.
+# ---------------------------------------------------------------------------
+
+
+class TestLoadPathValidatesPersistedCoinType:
+    """SEV-1: persisted coin_type values must pass the same validator as kwargs.
+
+    Before this fix, ``int(data["coin_type"])`` ran with no type/range
+    checks — so a hand-edited or corrupted file with a bool, float,
+    string, or out-of-range int would silently load and route the
+    wallet to the wrong derivation path. The load path now uses the
+    same ``_validate_coin_type`` helper that protects construction.
+    """
+
+    def _write_blob_with_coin_type(self, p: Path, raw_coin_type: object) -> None:
+        """Hand-craft a v2 wallet file with a malicious coin_type field.
+
+        The ciphertext is correctly AES-GCM-sealed (so the AEAD layer
+        passes), but the JSON inside contains *raw_coin_type*
+        verbatim — letting us probe the load-path validator
+        independent of the construction-path validator.
+        """
+        import hashlib
+        import json
+        import secrets
+
+        from Cryptodome.Cipher import AES
+
+        from pyrxd.hd.bip39 import seed_from_mnemonic
+        from pyrxd.hd.wallet import _FILE_VERSION_V2, _NONCE_LEN, _SALT_LEN, _SCRYPT_N, _SCRYPT_P, _SCRYPT_R
+
+        seed = seed_from_mnemonic(MNEMONIC, passphrase="")
+        salt = secrets.token_bytes(_SALT_LEN)
+        nonce = secrets.token_bytes(_NONCE_LEN)
+        enc_key = hashlib.scrypt(
+            seed, salt=salt, n=_SCRYPT_N, r=_SCRYPT_R, p=_SCRYPT_P, maxmem=128 * 1024 * 1024, dklen=32
+        )
+        data = {
+            "version": _FILE_VERSION_V2,
+            "account": 0,
+            "coin_type": raw_coin_type,
+            "external_tip": 0,
+            "internal_tip": 0,
+            "addresses": {},
+        }
+        cipher = AES.new(enc_key, AES.MODE_GCM, nonce=nonce)
+        ciphertext, tag = cipher.encrypt_and_digest(json.dumps(data).encode())
+        blob = bytes([_FILE_VERSION_V2]) + salt + nonce + tag + ciphertext
+        p.write_bytes(blob)
+        p.chmod(0o600)
+
+    def test_persisted_negative_coin_type_rejected(self):
+        # SEV-1 from patch-on-patch review: persisted coin_type=-1 was
+        # previously accepted via int(-1), routing the wallet to
+        # m/44'/-1'/... (unhardened-sibling collision).
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "neg.dat"
+            self._write_blob_with_coin_type(p, -1)
+            with pytest.raises(ValidationError, match="out of BIP44 hardened range"):
+                HdWallet.load(p, MNEMONIC)
+
+    def test_persisted_oversized_coin_type_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "big.dat"
+            self._write_blob_with_coin_type(p, 2**31)
+            with pytest.raises(ValidationError, match="out of BIP44 hardened range"):
+                HdWallet.load(p, MNEMONIC)
+
+    def test_persisted_bool_rejected(self):
+        # JSON ``true`` previously round-tripped to coin_type=1 via
+        # int(True). The bool guard fires before any int coercion.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "bool.dat"
+            self._write_blob_with_coin_type(p, True)
+            with pytest.raises(ValidationError, match="non-bool int"):
+                HdWallet.load(p, MNEMONIC)
+
+    def test_persisted_string_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "str.dat"
+            self._write_blob_with_coin_type(p, "0")
+            with pytest.raises(ValidationError, match="non-bool int"):
+                HdWallet.load(p, MNEMONIC)
+
+    def test_persisted_float_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "float.dat"
+            self._write_blob_with_coin_type(p, 512.0)
+            with pytest.raises(ValidationError, match="non-bool int"):
+                HdWallet.load(p, MNEMONIC)
+
+    def test_persisted_null_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "null.dat"
+            self._write_blob_with_coin_type(p, None)
+            with pytest.raises(ValidationError, match="non-bool int"):
+                HdWallet.load(p, MNEMONIC)
+
+    def test_error_message_names_wallet_file_path(self):
+        # The validator's source= argument must surface in the error
+        # message so the user knows the bad value is in the file, not
+        # in their kwarg.
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "bad.dat"
+            self._write_blob_with_coin_type(p, -1)
+            with pytest.raises(ValidationError) as exc_info:
+                HdWallet.load(p, MNEMONIC)
+            assert "wallet file" in str(exc_info.value).lower()
+            assert str(p) in str(exc_info.value)
+
+
+class TestDirectConstructionValidatesCoinType:
+    """SEV-1: ``HdWallet(_coin_type=-99)`` must NOT bypass validation.
+
+    The original docstring claimed ``_resolve_coin_type`` was "the
+    single entry point" but the dataclass auto-generated ``__init__``
+    accepted any int. ``__post_init__`` now re-runs the validator so
+    direct construction is gated.
+    """
+
+    def _make_wallet_kwargs(self, *, coin_type: object) -> dict:
+        # Build the minimum set of constructor kwargs needed to land
+        # in __post_init__ with a malicious _coin_type. The xprv/seed
+        # are real (so the test is realistic), but they're rooted at
+        # the *valid* default path — the test isn't about whether
+        # _xprv matches _coin_type, it's about whether the validator
+        # runs at all.
+        from pyrxd.hd.bip32 import bip32_derive_xprv_from_mnemonic
+        from pyrxd.hd.bip39 import seed_from_mnemonic
+        from pyrxd.security.secrets import SecretBytes
+
+        seed = seed_from_mnemonic(MNEMONIC, passphrase="")
+        xprv = bip32_derive_xprv_from_mnemonic(MNEMONIC, passphrase="", path="m/44'/512'/0'")
+        return {
+            "_xprv": xprv,
+            "_seed": SecretBytes(seed),
+            "account": 0,
+            "_coin_type": coin_type,
+        }
+
+    def test_direct_construction_with_negative_rejected(self):
+        kwargs = self._make_wallet_kwargs(coin_type=-1)
+        with pytest.raises(ValidationError, match="out of BIP44 hardened range"):
+            HdWallet(**kwargs)  # type: ignore[arg-type]
+
+    def test_direct_construction_with_bool_rejected(self):
+        kwargs = self._make_wallet_kwargs(coin_type=True)
+        with pytest.raises(ValidationError, match="non-bool int"):
+            HdWallet(**kwargs)  # type: ignore[arg-type]
+
+    def test_direct_construction_with_oversized_rejected(self):
+        kwargs = self._make_wallet_kwargs(coin_type=2**31)
+        with pytest.raises(ValidationError, match="out of BIP44 hardened range"):
+            HdWallet(**kwargs)  # type: ignore[arg-type]
+
+    def test_direct_construction_with_valid_value_succeeds(self):
+        # Positive control — the validator must not be over-eager.
+        # (Test name avoids "_int_" which the conftest auto-marks as
+        # an integration test.)
+        kwargs = self._make_wallet_kwargs(coin_type=0)
+        w = HdWallet(**kwargs)
+        assert w.coin_type == 0
+
+
+class TestUnderscoreMutationBlocked:
+    """SEV-1: writes to ``_coin_type`` post-construction must fail.
+
+    The read-only property was theater without the ``__setattr__``
+    guard — ``wallet._coin_type = X``, ``wallet.__dict__['_coin_type']
+    = X``, and ``dataclasses.replace`` were all bypasses. ``__setattr__``
+    closes the first; the others remain (Python idioms, beyond an
+    "honest mistake" guardrail) and are documented as such.
+    """
+
+    def test_direct_assignment_to_underscore_blocked(self):
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=512)
+        with pytest.raises(AttributeError, match="read-only"):
+            w._coin_type = 0  # type: ignore[misc]
+        # The original value must be unchanged.
+        assert w.coin_type == 512
+
+    def test_initialization_path_still_works(self):
+        # Sanity: __setattr__ must NOT block writes during __init__,
+        # otherwise the dataclass constructor itself would fail.
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=0)
+        assert w.coin_type == 0
+        assert w._coin_type == 0
+
+
+# ---------------------------------------------------------------------------
 # Gap-limit scanning tests
 # ---------------------------------------------------------------------------
 
@@ -332,6 +847,7 @@ class TestSaveLoad:
             bad_data = {
                 "version": _FILE_VERSION_V2,
                 "account": 0,
+                "coin_type": 512,  # required field; absence is now its own hard error
                 "external_tip": 1,
                 "internal_tip": 0,
                 # missing "address" → KeyError when reconstructing

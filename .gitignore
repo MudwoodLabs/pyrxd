@@ -155,9 +155,6 @@ wallet*.dat
 .env.*
 .pypirc
 
-# ===== Detect-secrets baseline =====
-.secrets.baseline
-
 # ===== Editor / IDE =====
 *.code-workspace
 .idea/
