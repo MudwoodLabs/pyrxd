@@ -87,9 +87,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - ruff replaces flake8 + black for lint and format.
 - Dependabot version updates landed: `actions/checkout` → 6.0.2,
   `actions/deploy-pages` → 5.0.0, `actions/upload-pages-artifact` →
-  5.0.0, `github/codeql-action` → 4.35.3, `click` → ^8.3, `websockets`
-  → ^16.0.0, `bandit` → ^1.9.4, `pre-commit` → 4.6.0, `myst-parser`
-  constraint refresh.
+  5.0.0, `github/codeql-action` → 4.35.3, `click` → ^8.3, `bandit` →
+  ^1.9.4, `pre-commit` → 4.6.0, `myst-parser` constraint refresh.
+- `websockets` constraint widened to `>=15.0.1, <17.0.0` (was
+  `^16.0.0`). pyrxd uses only stable websockets API
+  (`connect`/`send`/`recv`/`close`/`WebSocketException`) common to
+  versions 13 through 16, so the upper-bound floor was unnecessarily
+  strict and locked out coexistence with libraries pinned to
+  `websockets <=15.0.1` (e.g., `solana-py 0.36.x`).
 
 ## [0.2.0] — 2026-04-29
 
