@@ -20,7 +20,6 @@ from ..security.rng import secure_random_bytes
 from .context import CliContext
 from .errors import UserError, WalletDecryptError
 from .format import emit
-from .main import cli
 from .prompts import (
     prompt_mnemonic_input,
     prompt_passphrase_input,
@@ -28,7 +27,7 @@ from .prompts import (
 )
 
 
-@cli.group(name="wallet")
+@click.group(name="wallet")
 def wallet_group() -> None:
     """Create, load, and inspect HD wallets."""
 

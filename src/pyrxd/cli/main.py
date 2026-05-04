@@ -157,19 +157,21 @@ def run() -> None:
 
 # Subcommand registration. The wallet/address/balance commands attach
 # themselves to the `cli` group via @cli.command / @cli.group decorators.
-# Importing them here is what registers them; they have no side effects
-# beyond decorator attachment.
+# Subcommand modules are imported here and explicitly registered via
+# cli.add_command() below. They do NOT import `cli` from this module —
+# that would create an import cycle that CodeQL flags (py/cyclic-import)
+# and that breaks static analysis even though Python's import system
+# tolerates it at runtime.
 
-# Imports placed at the bottom to avoid circular imports during CLI
-# bootstrap; the subcommand modules import names from main.py via the
-# `cli` group object.
+from . import glyph_cmds, query_cmds, setup_cmd, wallet_cmds  # noqa: E402
 
-from . import (  # noqa: E402  -- bottom-of-file imports are intentional
-    glyph_cmds,  # noqa: F401  -- registers `glyph` group (Cut 2)
-    query_cmds,  # noqa: F401  -- registers `address`, `balance`, `utxos` (Cut 3)
-    setup_cmd,  # noqa: F401  -- registers `setup` (Cut 3)
-    wallet_cmds,  # noqa: F401  -- registers `wallet` group + export-xpub (Cut 3)
-)
+cli.add_command(glyph_cmds.glyph_group)
+cli.add_command(query_cmds.address_cmd)
+cli.add_command(query_cmds.balance_cmd)
+cli.add_command(query_cmds.utxos_cmd)
+cli.add_command(setup_cmd.setup_cmd)
+cli.add_command(wallet_cmds.wallet_group)
+
 
 if __name__ == "__main__":
     run()

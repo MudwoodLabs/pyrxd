@@ -20,7 +20,6 @@ import click
 from . import config as _config
 from .context import CliContext
 from .format import emit
-from .main import cli
 
 # Default Radiant Core mainnet RPC port — matches `radiantd` on
 # 127.0.0.1:7332. Used as a heuristic only; we never authenticate.
@@ -57,7 +56,7 @@ async def _probe_electrumx(url: str) -> bool:
         return False
 
 
-@cli.command(name="setup")
+@click.command(name="setup")
 @click.option(
     "--no-interactive",
     is_flag=True,

@@ -17,7 +17,6 @@ from ..security.errors import NetworkError, ValidationError
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError, WalletDecryptError
 from .format import emit, format_photons
-from .main import cli
 from .prompts import prompt_mnemonic_input, prompt_passphrase_input
 
 
@@ -50,7 +49,7 @@ def _load_wallet(ctx: CliContext, *, prompt_passphrase: bool = False) -> HdWalle
         raise WalletDecryptError() from exc
 
 
-@cli.command(name="address")
+@click.command(name="address")
 @click.option("--next", "next_unused", is_flag=True, default=True, help="Next unused external address (default).")
 @click.option("--index", type=int, default=None, help="Specific index lookup.")
 @click.option("--change", is_flag=True, help="Internal chain instead of external.")
@@ -124,7 +123,7 @@ def _path_for_address(wallet: HdWallet, address: str) -> str:
     return "?"
 
 
-@cli.command(name="balance")
+@click.command(name="balance")
 @click.option("--refresh", is_flag=True, help="Run a gap-limit scan first to discover used addresses.")
 @click.option("--passphrase/--no-passphrase", default=False, help="Prompt for the BIP39 passphrase.")
 @click.pass_obj
@@ -175,7 +174,7 @@ def balance_cmd(ctx: CliContext, refresh: bool, passphrase: bool) -> None:
         click.echo(emit(payload, mode="human", human_lines=lines))
 
 
-@cli.command(name="utxos")
+@click.command(name="utxos")
 @click.option("--min-photons", type=int, default=0, help="Minimum value filter.")
 @click.option("--addr", default=None, help="Restrict to a single wallet address.")
 @click.option("--passphrase/--no-passphrase", default=False)
