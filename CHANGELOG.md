@@ -4,6 +4,98 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-05-04
+
+### Breaking changes
+
+- **Default BIP44 coin type is now 512 (Radiant per SLIP-0044), not 236
+  (Bitcoin SV).** Wallets created with 0.2.0 derive at
+  `m/44'/236'/0'/...`; the same mnemonic in 0.3.0 derives at
+  `m/44'/512'/0'/...` and produces different addresses. To recover funds
+  from a 0.2.0 install, set
+  `RXD_PY_SDK_BIP44_DERIVATION_PATH="m/44'/236'/0'"`, or pass
+  `coin_type=236` to `HdWallet` (see new per-instance kwarg below). See
+  `docs/research/wallet-derivation-paths.md` for the full migration
+  story.
+
+### Added
+
+#### CLI
+
+- New `pyrxd` console script (`pip install pyrxd` registers it on PATH).
+- `pyrxd wallet new | load | info | export-xpub` — create, validate, and
+  inspect HD wallets; account-level xpub export for watch-only use.
+- `pyrxd address` / `pyrxd balance` / `pyrxd utxos` — bare query
+  commands for address derivation, balance, and UTXO listing.
+- `pyrxd glyph` subcommand group — Glyph protocol operations.
+- `pyrxd setup` — onboarding walkthrough; probes node + ElectrumX
+  reachability and wallet presence, writes default config.
+- Global flags: `--network`, `--electrumx`, `--wallet`, `--config`,
+  `--json`, `--quiet`, `--no-color`, `--yes`, `--debug`.
+- Typed CLI errors (`UserError`, `NetworkBoundaryError`,
+  `WalletDecryptError`) with stable exit codes and a static decrypt
+  message that never echoes user input.
+
+#### HD wallet
+
+- `HdWallet(coin_type=...)` per-instance kwarg overrides the default
+  derivation path without touching env state.
+- `HdWallet.send` / `HdWallet.send_max` — key-aware UTXO collection and
+  signed-transaction construction.
+- Load-time path validation against the wallet record's stored
+  derivation path.
+
+#### Documentation
+
+- `docs/research/wallet-derivation-paths.md` — public research doc on
+  the five-way derivation path fragmentation across the Radiant wallet
+  ecosystem with verified source links.
+- `docs/solutions/` convention established for searchable
+  problem/solution documentation.
+- README user-risk disclaimer above Status section.
+- Documentation moved from Read the Docs to GitHub Pages
+  (https://mudwoodlabs.github.io/pyrxd/).
+
+### Fixed
+
+- `HdWallet` previously ignored the
+  `RXD_PY_SDK_BIP44_DERIVATION_PATH` env override. Now respected.
+- Cyclic imports between `cli.main` and the four CLI subcommand modules
+  resolved by registering subcommands explicitly via
+  `cli.add_command()`.
+- `pyrxd glyph` broadcast summary now surfaces metadata fields.
+- BIP39 empty-passphrase defaults annotated to silence false-positive
+  bandit findings.
+
+### Security
+
+- All 16 GitHub Actions pinned to commit SHAs (no floating tags).
+- Explicit minimum `permissions` declared in CI and lint workflows.
+- OSSF Scorecard and OSV Scanner workflows added.
+- CodeQL static analysis workflow added.
+- Threat model + red-team checklist documented.
+- `--json` mnemonic exposure warning documented.
+- bandit added to `task lint` so security findings fail locally before
+  CI.
+
+### Tooling
+
+- `task ci` aggregate task + versioned pre-push git hook
+  (`scripts/git-hooks/pre-push`) + installer for local CI parity.
+- `scripts/check-no-private-links.py` — link checker that prevents
+  tracked docs from referencing gitignored design docs.
+- ruff replaces flake8 + black for lint and format.
+- Dependabot version updates landed: `actions/checkout` → 6.0.2,
+  `actions/deploy-pages` → 5.0.0, `actions/upload-pages-artifact` →
+  5.0.0, `github/codeql-action` → 4.35.3, `click` → ^8.3, `bandit` →
+  ^1.9.4, `pre-commit` → 4.6.0, `myst-parser` constraint refresh.
+- `websockets` constraint widened to `>=15.0.1, <17.0.0` (was
+  `^16.0.0`). pyrxd uses only stable websockets API
+  (`connect`/`send`/`recv`/`close`/`WebSocketException`) common to
+  versions 13 through 16, so the upper-bound floor was unnecessarily
+  strict and locked out coexistence with libraries pinned to
+  `websockets <=15.0.1` (e.g., `solana-py 0.36.x`).
+
 ## [0.2.0] — 2026-04-29
 
 Initial public release.
@@ -125,4 +217,5 @@ covenant variants in this module are experimental.
 - **No third-party security audit yet.** Use at your own risk in
   production.
 
+[0.3.0]: https://github.com/MudwoodLabs/pyrxd/releases/tag/v0.3.0
 [0.2.0]: https://github.com/MudwoodLabs/pyrxd/releases/tag/v0.2.0

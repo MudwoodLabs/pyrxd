@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "pyrxd"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python SDK for the Radiant (RXD) blockchain — transactions, HD wallets, Glyph tokens (NFT/FT/dMint), Gravity cross-chain atomic swaps, SPV, and ElectrumX."
 authors = [
     {name = "Mudwood Labs", email = "opensource@mudwoodlabs.com"}
@@ -73,7 +73,7 @@ aiohttp = ">=3.9.0"
 coincurve = "^21.0.0"
 base58 = "^2.1.1"
 pycryptodomex = "^3.22.0"
-websockets = "^16.0.0"
+websockets = ">=15.0.1,<17.0.0"
 websocket-client = "^1.8.0"
 cbor2 = "^6.0"
 click = "^8.3"
