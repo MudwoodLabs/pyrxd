@@ -43,7 +43,7 @@ from pyrxd.security import (
 )
 from pyrxd.wallet import RxdWallet
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "ActiveOffer",
