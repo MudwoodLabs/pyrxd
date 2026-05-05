@@ -96,6 +96,14 @@ class TestScriptConstruction:
         assert not is_nft_script("")
         assert not is_ft_script("")
 
+    def test_is_ft_script_requires_hex_str_not_bytes(self):
+        from pyrxd.script.script import Script
+
+        script_bytes = Script(build_ft_locking_script(KNOWN_HEX20, KNOWN_REF)).serialize()
+        assert is_ft_script(script_bytes.hex())
+        with pytest.raises(TypeError):
+            is_ft_script(script_bytes)  # type: ignore[arg-type]
+
     def test_nft_script_starts_with_d8(self):
         script = build_nft_locking_script(KNOWN_HEX20, KNOWN_REF)
         assert script[0] == 0xD8
