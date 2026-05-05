@@ -31,7 +31,7 @@ from typing import Any
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
 
-from .script import build_ft_locking_script, extract_ref_from_ft_script
+from .script import build_ft_locking_script, extract_ref_from_ft_script, is_ft_script
 from .types import GlyphRef
 
 # Post-V2 relay minimum — mirrored from builder.py to avoid an import cycle.
@@ -104,6 +104,28 @@ class FtUtxoSet:
                 raise ValidationError(f"value must be int, got {type(u.value).__name__!r}: {u.value!r}")
             if u.value < 0:
                 raise ValidationError("value must be >= 0")
+            # Reject non-FT scripts (e.g. plain P2PKH) up front. The Radiant
+            # node would later reject the broadcast with "bad-txns-inputs-
+            # outputs-invalid-transaction-reference-operations" because no
+            # input carries the ref the output materialises — fail fast with
+            # a useful error instead of a cryptic mempool rejection.
+            if not isinstance(u.ft_script, (bytes, bytearray)):
+                raise ValidationError(
+                    f"ft_script must be bytes (the 75-byte on-chain locking script of the UTXO "
+                    f"you're spending), got {type(u.ft_script).__name__!r}"
+                )
+            if not is_ft_script(bytes(u.ft_script).hex()):
+                raise ValidationError(
+                    f"UTXO {u.txid}:{u.vout} ft_script is not a valid 75-byte FT locking script. "
+                    f"FT transfers can only spend FT UTXOs (script: 76a914<pkh>88ac bdd0 <ref:36> "
+                    f"dec0e9aa76e378e4a269e69d). Spending a plain P2PKH UTXO and producing an FT "
+                    f"output violates ref conservation and will be rejected by the network."
+                )
+            input_ref = extract_ref_from_ft_script(bytes(u.ft_script))
+            if input_ref != ref:
+                raise ValidationError(
+                    f"UTXO {u.txid}:{u.vout} carries ref {input_ref} which differs from the set's ref {ref}"
+                )
         self.ref = ref
         self.utxos = list(utxos)
 
@@ -202,18 +224,7 @@ class FtUtxoSet:
                 f"out={amount}, change={ft_change} (negative change means inputs insufficient)"
             )
 
-        # 3. Validate every selected input's script matches the set's ref.
-        #    An input with a different ref would silently fund a transfer of
-        #    the wrong token — refuse loudly.
-        for u in selected:
-            input_ref = extract_ref_from_ft_script(u.ft_script)
-            if input_ref != self.ref:
-                raise ValidationError(
-                    f"Selected UTXO {u.txid}:{u.vout} carries ref "
-                    f"{input_ref} which differs from the set's ref {self.ref}"
-                )
-
-        # 4. Resolve change_pkh.
+        # 3. Resolve change_pkh.
         if change_pkh is None:
             # Derive sender's PKH from the signing key. PrivateKey.public_key()
             # .hash160() returns 20 bytes.

@@ -146,16 +146,11 @@ class TestFtMismatchedRef:
             ft_amount=100,
             ft_script=_ft_script_for(_alice_pkh(), ref=other_ref),
         )
-        s = FtUtxoSet(ref=_token_ref(), utxos=[mismatched_utxo])
         with pytest.raises(ValidationError, match="differs from the set's ref"):
-            s.build_transfer_tx(
-                amount=40,
-                new_owner_pkh=Hex20(_BOB_PKH),
-                private_key=_alice_key(),
-            )
+            FtUtxoSet(ref=_token_ref(), utxos=[mismatched_utxo])
 
     def test_mixed_refs_one_matching_one_not_rejected(self):
-        """Even if only one of the selected UTXOs carries a foreign ref, reject."""
+        """Even if only one of the UTXOs carries a foreign ref, reject the whole set."""
         other_ref = GlyphRef(txid=Txid("ff" * 32), vout=7)
         good = _make_utxo(60, txid_byte=0x01)
         bad = FtUtxo(
@@ -165,15 +160,8 @@ class TestFtMismatchedRef:
             ft_amount=50,
             ft_script=_ft_script_for(_alice_pkh(), ref=other_ref),
         )
-        # Selection is greedy-desc by ft_amount → good (60) first, then bad (50).
-        # To force BOTH to be selected, request 100.
-        s = FtUtxoSet(ref=_token_ref(), utxos=[good, bad])
         with pytest.raises(ValidationError, match="differs from the set's ref"):
-            s.build_transfer_tx(
-                amount=100,
-                new_owner_pkh=Hex20(_BOB_PKH),
-                private_key=_alice_key(),
-            )
+            FtUtxoSet(ref=_token_ref(), utxos=[good, bad])
 
 
 class TestFtAmountOverflow:
