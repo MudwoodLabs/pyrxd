@@ -165,6 +165,74 @@ class TestGlyphRefEncoding:
         assert recovered.vout == 0xFFFFFFFF
 
 
+class TestGlyphRefFromContractHex:
+    """Parsing the explorer/UI display form: txid (display order) + vout BE."""
+
+    # RBG mainnet contract id; the trailing "00000004" reads as 4 (big-endian).
+    RBG_CONTRACT = "b45dc453befb589aff8bfd76af0b994615b37eda094f48c380eb31deaf96a2a800000004"
+    RBG_TXID = "b45dc453befb589aff8bfd76af0b994615b37eda094f48c380eb31deaf96a2a8"
+    NON_PALINDROMIC_TXID = "0123456789abcdef" * 4  # 64 chars, reversal-distinct
+
+    def test_decodes_real_world_contract(self):
+        ref = GlyphRef.from_contract_hex(self.RBG_CONTRACT)
+        assert ref.txid == self.RBG_TXID
+        assert ref.vout == 4
+
+    def test_vout_is_big_endian(self):
+        # Contract tail "00000100" reads as 256 in big-endian.
+        contract = "ab" * 32 + "00000100"
+        ref = GlyphRef.from_contract_hex(contract)
+        assert ref.vout == 256
+
+    def test_vout_zero(self):
+        contract = "cd" * 32 + "00000000"
+        ref = GlyphRef.from_contract_hex(contract)
+        assert ref.vout == 0
+
+    def test_vout_max(self):
+        contract = "ef" * 32 + "ffffffff"
+        ref = GlyphRef.from_contract_hex(contract)
+        assert ref.vout == 0xFFFFFFFF
+
+    def test_round_trip(self):
+        # Build a contract string from a known ref, then recover it.
+        ref = GlyphRef(txid=Txid(self.NON_PALINDROMIC_TXID), vout=42)
+        contract = ref.txid + ref.vout.to_bytes(4, "big").hex()
+        recovered = GlyphRef.from_contract_hex(contract)
+        assert recovered == ref
+
+    def test_short_string_raises(self):
+        with pytest.raises(ValidationError, match="72 hex chars"):
+            GlyphRef.from_contract_hex("ab" * 32 + "0000")  # 68 chars
+
+    def test_long_string_raises(self):
+        with pytest.raises(ValidationError, match="72 hex chars"):
+            GlyphRef.from_contract_hex("ab" * 32 + "0000000000")  # 74 chars
+
+    def test_non_hex_in_vout_raises(self):
+        with pytest.raises(ValidationError, match="non-hex"):
+            GlyphRef.from_contract_hex("ab" * 32 + "zzzzzzzz")
+
+    def test_non_str_input_raises(self):
+        with pytest.raises(ValidationError, match="must be str"):
+            GlyphRef.from_contract_hex(b"\x00" * 36)  # type: ignore[arg-type]
+
+    def test_distinct_from_from_bytes(self):
+        """``from_contract_hex`` and ``from_bytes`` parse different formats:
+        contract uses display-order txid + big-endian vout; wire uses
+        reversed txid + little-endian vout."""
+        ref = GlyphRef(txid=Txid(self.NON_PALINDROMIC_TXID), vout=4)
+        wire_hex = ref.to_bytes().hex()  # reversed txid + vout LE
+        contract_hex = ref.txid + ref.vout.to_bytes(4, "big").hex()
+        # Same ref, different serialisations.
+        assert wire_hex != contract_hex
+        assert wire_hex[:64] != contract_hex[:64]  # txid byte order differs
+        assert wire_hex[64:] != contract_hex[64:]  # vout endianness differs (for vout=4)
+        # Both round-trip to the same ref via their respective decoders.
+        assert GlyphRef.from_bytes(bytes.fromhex(wire_hex)) == ref
+        assert GlyphRef.from_contract_hex(contract_hex) == ref
+
+
 # ---------------------------------------------------------------------------
 # 3. Script extraction
 # ---------------------------------------------------------------------------

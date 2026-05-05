@@ -42,9 +42,11 @@ Usage
 Environment
 -----------
     SENDER_WIF       WIF private key holding the FT UTXOs (required)
-    TOKEN_REF        Token ref as ``<txid>:<vout>`` — the token's deploy
-                     outpoint (required). Get it from a Radiant explorer
-                     or the CBOR metadata of the token's deploy tx.
+    TOKEN_CONTRACT   72-char contract id as shown in Radiant explorers,
+                     e.g. ``b45dc4...a2a800000004`` for RBG. Either this
+                     OR ``TOKEN_REF`` is required.
+    TOKEN_REF        Alternative form: ``<txid>:<vout>``, e.g.
+                     ``b45dc4...a2a8:4``. Use whichever is more convenient.
     RECIPIENT_ADDR   Radiant address (R…) of the recipient (required)
     AMOUNT           FT units to send (required, integer)
     DRY_RUN          Default ``1``; set to ``0`` to actually broadcast
@@ -76,6 +78,7 @@ from pyrxd.transaction.transaction import Transaction
 DRY_RUN: bool = os.environ.get("DRY_RUN", "1") != "0"
 ELECTRUMX_URL: str = os.environ.get("ELECTRUMX_URL", "wss://electrumx.radiant4people.com:50022/")
 SENDER_WIF: str = os.environ.get("SENDER_WIF", "")
+TOKEN_CONTRACT: str = os.environ.get("TOKEN_CONTRACT", "")
 TOKEN_REF: str = os.environ.get("TOKEN_REF", "")
 RECIPIENT_ADDR: str = os.environ.get("RECIPIENT_ADDR", "")
 AMOUNT: int = int(os.environ.get("AMOUNT", "0"))
@@ -187,12 +190,29 @@ def _parse_token_ref(s: str) -> GlyphRef:
     return GlyphRef(txid=Txid(txid_hex), vout=int(vout_str))
 
 
+def _resolve_token_ref() -> GlyphRef:
+    """Resolve the token ref from either TOKEN_CONTRACT or TOKEN_REF.
+
+    Both forms describe the same deploy outpoint; users supply whichever
+    is more convenient. A 72-char contract id (as shown in explorers) is
+    decoded via :meth:`GlyphRef.from_contract_hex`; a ``txid:vout`` string
+    is parsed directly. Setting both is rejected to avoid silent mismatches.
+    """
+    if TOKEN_CONTRACT and TOKEN_REF:
+        raise ValueError("set either TOKEN_CONTRACT or TOKEN_REF, not both")
+    if TOKEN_CONTRACT:
+        return GlyphRef.from_contract_hex(TOKEN_CONTRACT)
+    if TOKEN_REF:
+        return _parse_token_ref(TOKEN_REF)
+    raise ValueError("set TOKEN_CONTRACT (72-char contract id) or TOKEN_REF (txid:vout)")
+
+
 async def main() -> None:
     if not SENDER_WIF:
         print("ERROR: set SENDER_WIF to the WIF private key holding the FT UTXOs")
         sys.exit(1)
-    if not TOKEN_REF:
-        print("ERROR: set TOKEN_REF=<txid:vout> (the token's deploy outpoint)")
+    if not (TOKEN_CONTRACT or TOKEN_REF):
+        print("ERROR: set TOKEN_CONTRACT (72-char contract id) or TOKEN_REF (txid:vout)")
         sys.exit(1)
     if not RECIPIENT_ADDR:
         print("ERROR: set RECIPIENT_ADDR to the recipient's R… address")
@@ -210,7 +230,7 @@ async def main() -> None:
         sys.exit(1)
     sender_address = sender_key.public_key().address()
     recipient_pkh = address_to_pkh(RECIPIENT_ADDR)
-    token_ref = _parse_token_ref(TOKEN_REF)
+    token_ref = _resolve_token_ref()
 
     print(f"Sender:      {sender_address}")
     print(f"Recipient:   {RECIPIENT_ADDR}")

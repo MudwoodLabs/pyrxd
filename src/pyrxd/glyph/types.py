@@ -53,6 +53,47 @@ class GlyphRef:
         vout = struct.unpack("<I", data[32:])[0]
         return cls(txid=Txid(txid), vout=vout)
 
+    @classmethod
+    def from_contract_hex(cls, contract_hex: str) -> GlyphRef:
+        """Parse a 72-char contract id string as displayed in Radiant explorers.
+
+        The Glyph contract id concatenates the display-order txid (64 hex
+        chars) with the big-endian-encoded vout (8 hex chars). Both halves
+        are written in human-readable order so the whole string reads
+        naturally — the trailing ``00000004`` decodes to ``4``::
+
+            b45dc453befb589a...c380eb31deaf96a2a8 00000004
+            └────────── txid (display order) ───┘ └─ vout BE ─┘  (= 4)
+
+        Equivalent forms:
+
+        * ``from_contract_hex("b45dc4...a2a800000004")``
+        * ``GlyphRef(txid=Txid("b45dc4...a2a8"), vout=4)``
+
+        .. warning::
+
+           This is the **explorer / UI display form**, not the on-chain
+           wire form. :meth:`from_bytes` parses the wire form used inside
+           locking scripts, where the txid bytes are reversed *and* the
+           vout is encoded little-endian. If you have raw bytes pulled out
+           of a script, use :meth:`from_bytes`. Use this method only when
+           you have a contract id in the form a Radiant explorer or wallet
+           UI shows it. Mixing them will silently produce a wrong-vout ref.
+        """
+        if not isinstance(contract_hex, str):
+            raise ValidationError(f"contract_hex must be str, got {type(contract_hex).__name__!r}")
+        if len(contract_hex) != 72:
+            raise ValidationError(
+                f"contract_hex must be 72 hex chars (32-byte txid + 4-byte vout), got {len(contract_hex)}"
+            )
+        try:
+            vout_bytes = bytes.fromhex(contract_hex[64:])
+        except ValueError as exc:
+            raise ValidationError("contract_hex contains non-hex characters") from exc
+        txid = contract_hex[:64]
+        vout = int.from_bytes(vout_bytes, "big")
+        return cls(txid=Txid(txid), vout=vout)
+
 
 @dataclass(frozen=True)
 class GlyphMedia:
