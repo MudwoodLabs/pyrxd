@@ -925,7 +925,7 @@ async def _transfer_ft_inner(
             if tx is None or utxo.tx_pos >= len(tx.outputs):
                 continue
             out_script = tx.outputs[utxo.tx_pos].locking_script.serialize()
-            if not is_ft_script(out_script):
+            if not is_ft_script(out_script.hex()):
                 continue
             ref_in_script = _try_extract_ft_ref(out_script)
             if ref_in_script != ref:
