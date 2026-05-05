@@ -316,7 +316,7 @@ class TestRefPreservation:
         assert extract_ref_from_ft_script(result.change_ft_script) == _token_ref()
 
     def test_mismatched_input_ref_raises(self):
-        """A UTXO carrying a different ref in its script is refused."""
+        """A UTXO carrying a different ref in its script is refused at construction."""
         other_ref = GlyphRef(txid=Txid("ff" * 32), vout=7)
         utxo_wrong_ref = FtUtxo(
             txid="aa" * 32,
@@ -325,14 +325,36 @@ class TestRefPreservation:
             ft_amount=100,
             ft_script=_ft_script_for(_alice_pkh(), ref=other_ref),
         )
-        # The UTXO set's ref says _token_ref(), but the UTXO's script carries other_ref.
-        s = FtUtxoSet(ref=_token_ref(), utxos=[utxo_wrong_ref])
         with pytest.raises(ValidationError, match="differs from the set's ref"):
-            s.build_transfer_tx(
-                amount=40,
-                new_owner_pkh=Hex20(_BOB_PKH),
-                private_key=_alice_key(),
-            )
+            FtUtxoSet(ref=_token_ref(), utxos=[utxo_wrong_ref])
+
+    def test_p2pkh_script_rejected_at_construction(self):
+        """A plain P2PKH script (not an FT lock) must be refused — the network would
+        otherwise reject the broadcast with `bad-txns-inputs-outputs-invalid-
+        transaction-reference-operations` because the output materialises a ref that
+        no input carries."""
+        plain_p2pkh = b"\x76\xa9\x14" + _alice_pkh() + b"\x88\xac"  # 25 bytes, not FT
+        utxo = FtUtxo(
+            txid="aa" * 32,
+            vout=0,
+            value=_DEFAULT_RXD_VALUE,
+            ft_amount=100,
+            ft_script=plain_p2pkh,
+        )
+        with pytest.raises(ValidationError, match="not a valid 75-byte FT locking script"):
+            FtUtxoSet(ref=_token_ref(), utxos=[utxo])
+
+    def test_non_bytes_ft_script_rejected(self):
+        """A hex-string ft_script (instead of bytes) is rejected with a clear type error."""
+        utxo = FtUtxo(
+            txid="aa" * 32,
+            vout=0,
+            value=_DEFAULT_RXD_VALUE,
+            ft_amount=100,
+            ft_script=_ft_script_for(_alice_pkh()).hex(),  # type: ignore[arg-type]
+        )
+        with pytest.raises(ValidationError, match="ft_script must be bytes"):
+            FtUtxoSet(ref=_token_ref(), utxos=[utxo])
 
 
 # ---------------------------------------------------------------------------
