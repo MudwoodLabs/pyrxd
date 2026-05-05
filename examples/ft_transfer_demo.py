@@ -67,7 +67,7 @@ from pyrxd.glyph.script import extract_ref_from_ft_script, is_ft_script
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import ElectrumXClient, script_hash_for_address
-from pyrxd.security.errors import NetworkError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.transaction.transaction import Transaction
 
@@ -229,8 +229,16 @@ async def main() -> None:
         print("ERROR: SENDER_WIF could not be decoded as a WIF private key", file=sys.stderr)
         sys.exit(1)
     sender_address = sender_key.public_key().address()
-    recipient_pkh = address_to_pkh(RECIPIENT_ADDR)
-    token_ref = _resolve_token_ref()
+    try:
+        recipient_pkh = address_to_pkh(RECIPIENT_ADDR)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        token_ref = _resolve_token_ref()
+    except (ValueError, ValidationError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Sender:      {sender_address}")
     print(f"Recipient:   {RECIPIENT_ADDR}")
