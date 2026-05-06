@@ -70,6 +70,20 @@ intersphinx_mapping = {
 html_theme = "furo"
 html_title = f"pyrxd {version}"
 html_static_path = ["_static"]
+# ``html_extra_path`` directories have their *contents* copied verbatim
+# into the built site root without Sphinx parsing. We want the inspect
+# page to land at ``/inspect/index.html`` (not ``/index.html`` — that
+# would overwrite the docs landing page!), so the source path is
+# ``docs/inspect_static/`` and that directory contains exactly one
+# subfolder, ``inspect/``. Sphinx's contents-copy then reproduces
+# ``inspect/`` at the site root.
+#
+# The browser-hosted inspect tool lives at ``inspect_static/inspect/``
+# and loads Pyodide + imports pyrxd at runtime. The CI step that builds
+# the docs (``docs.yml``) additionally writes a wheel into
+# ``inspect_static/inspect/wheels/`` before ``sphinx-build`` runs, so
+# the page can install pyrxd-from-the-current-commit at runtime.
+html_extra_path = ["inspect_static"]
 html_theme_options = {
     "source_repository": "https://github.com/MudwoodLabs/pyrxd",
     "source_branch": "main",

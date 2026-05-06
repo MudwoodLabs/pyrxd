@@ -71,6 +71,12 @@ instance/
 # Sphinx documentation
 docs/_build/
 
+# The inspect tool's wheel + manifest are produced by docs.yml CI on every
+# build (pip wheel ... + a small JSON manifest). They're shipped as part
+# of the deployed Pages artifact but never committed — the canonical
+# source of truth is the pyrxd Python source in src/.
+docs/inspect_static/inspect/wheels/
+
 # PyBuilder
 target/
 

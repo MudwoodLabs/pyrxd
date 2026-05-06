@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="referrer" content="no-referrer" />
+
+  <!-- Content-Security-Policy
+       default-src 'none'        — deny everything not whitelisted below
+       script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net
+                                — Pyodide loads from jsdelivr CDN with SRI; runs WASM.
+                                  'unsafe-eval' is required by Pyodide internals (it
+                                  uses eval() in the Python-to-JS bridge); cost is
+                                  documented in docs/threat-model.md.
+       style-src 'self'          — only our own CSS
+       connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022
+                                — page-relative, the Pyodide CDN, and the one
+                                  ElectrumX server we trust. PR-3 wires the WS.
+       img-src 'self' data:      — favicons + inline data: URIs only
+       font-src 'self'           — bundled fonts only (none today)
+       base-uri 'none'           — block <base> tag injection
+       form-action 'none'        — no form posts
+       object-src 'none'         — no plugins
+       Note: frame-ancestors is intentionally absent — meta-tag CSP cannot
+       enforce it; documented as a known limitation. Read-only tool with no
+       keys; clickjacking has no payload to steal.
+  -->
+  <meta http-equiv="Content-Security-Policy" content="
+    default-src 'none';
+    script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net;
+    style-src 'self';
+    connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022;
+    img-src 'self' data:;
+    font-src 'self';
+    base-uri 'none';
+    form-action 'none';
+    object-src 'none';
+  " />
+
+  <title>pyrxd inspect — Glyph script & transaction inspector</title>
+  <link rel="stylesheet" href="inspect.css" />
+</head>
+<body>
+  <header>
+    <h1>pyrxd <code>inspect</code></h1>
+    <p class="tagline">
+      Read-only diagnostic for Radiant Glyph scripts, contract ids, outpoints,
+      and transactions.
+      <a href="../concepts/radiant-fts-are-on-chain.html">What can I paste here?</a>
+    </p>
+  </header>
+
+  <main>
+    <section id="loading-status" aria-live="polite">
+      <p class="status">Loading <code>pyrxd</code> (one-time ~12 MB
+        download; cached for next time)…</p>
+      <progress id="load-progress" max="100" value="0"></progress>
+    </section>
+
+    <section id="ready-content" hidden>
+      <h2>Status</h2>
+      <pre id="version-block">(loading…)</pre>
+      <p class="note">
+        This page is the PR-1 plumbing checkpoint — it loads Pyodide, imports
+        <code>pyrxd</code>, and prints the version. The classifier UI lands in
+        the next PR. See
+        <a href="https://github.com/MudwoodLabs/pyrxd/pull/46">PR #46</a>
+        for the rollout plan.
+      </p>
+    </section>
+
+    <section id="error-content" hidden>
+      <h2>Could not load</h2>
+      <pre id="error-block"></pre>
+      <p class="note">
+        If this persists, please <a href="https://github.com/MudwoodLabs/pyrxd/issues/new">open an issue</a>
+        with the error text above.
+      </p>
+    </section>
+  </main>
+
+  <footer>
+    <p>
+      <span id="build-version">build: (loading)</span> ·
+      <a href="https://github.com/MudwoodLabs/pyrxd">source</a> ·
+      <a href="https://mudwoodlabs.github.io/pyrxd/">docs</a>
+    </p>
+  </footer>
+
+  <!-- Pyodide loaded from jsdelivr with Subresource Integrity (SRI).
+       The integrity hash and version are kept in sync via scripts/refresh-pyodide.sh
+       on maintainer bumps. If a CDN compromise serves different bytes, the
+       browser refuses to execute the script. -->
+  <script
+    src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"
+    integrity="sha384-i3R37b3tF+HWudsUf1VSEOY2YxwSNMqY8DQa9Z0O3xh+NkJ9o+yjcGyIi5huj+nB"
+    crossorigin="anonymous"
+  ></script>
+  <script src="inspect.js" type="module"></script>
+</body>
+</html>
