@@ -1218,6 +1218,78 @@ _MIN_SCRIPT_HEX_LEN = 50
 # Cap accidental "paste a whole tx" before running every classifier on it.
 _MAX_SCRIPT_HEX_LEN = 20_000
 
+# --- Network-fetch (--fetch) safety bounds ---------------------------------
+# Radiant policy max for a tx is 4 MB. Anything larger is consensus-invalid
+# and either a buggy server or an attacker probing for a parser-DoS.
+#
+# Note: this is a defence-in-depth check. The websockets library's default
+# per-message ``max_size`` (~1 MiB at the time of writing) typically trips
+# first and surfaces as a NetworkError. We keep the 4 MB cap explicit anyway
+# so the inspect-side limit is documented even if the underlying transport
+# cap is lifted in a future client refactor.
+_MAX_RAW_TX_BYTES = 4_000_000
+# Per-tx structural caps. A real Radiant tx today has a few inputs/outputs;
+# 100k is generous head-room and bounds total classification work.
+_MAX_INPUT_COUNT = 100_000
+_MAX_OUTPUT_COUNT = 100_000
+# Per-string display cap in human mode for any user-controllable CBOR field.
+# JSON mode preserves the full string (still ASCII-safe via ensure_ascii).
+_HUMAN_STRING_CAP = 200
+
+
+# Unicode general categories that must NOT reach a terminal: control (Cc),
+# format (Cf — includes BOM, bidi-overrides, ZWJ/ZWNJ, tag chars), unassigned
+# (Cn), private-use (Co), line/paragraph separators (Zl/Zp), and combining
+# marks (Mn/Me — overlay glyphs onto the previous char). This subsumes the
+# explicit bidi-override / BOM allow-list the previous version maintained.
+_UNICODE_STRIP_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Zl", "Zp", "Mn", "Me"})
+
+
+def _sanitize_display_string(s: str) -> str:
+    """Strip control + invisible + combining codepoints from a string before printing.
+
+    Defense against terminal-injection / homoglyph / bidi-override attacks via
+    CBOR-sourced fields (token name, description, ticker, attrs.*, creator.pubkey,
+    etc.). A hostile token deployer can embed ANSI CSI escapes, zero-width joiners,
+    bidi-override codepoints, tag chars, or combining marks in their metadata; an
+    inspect of the deploy tx would otherwise pass them straight to the user's
+    terminal — the deployer's name could appear to flip directionality, hide
+    chars, or imitate adjacent fields.
+
+    Strips any character whose Unicode general category is one of:
+
+        Cc — ASCII / C1 control (includes \\x1b ANSI ESC, \\x07 BEL)
+        Cf — format chars (BOM, bidi overrides, ZWJ/ZWNJ, tag chars, …)
+        Cn — unassigned codepoints
+        Co — private-use area
+        Zl, Zp — line / paragraph separators (\\u2028, \\u2029)
+        Mn, Me — combining marks (overlay onto previous char)
+
+    Replaces each stripped char with a literal "?" so the user sees that
+    something was filtered.
+
+    Non-`str` input is returned unchanged (defensive — the type signature
+    forbids it but the type system doesn't enforce that at runtime).
+    """
+    import unicodedata
+
+    if not isinstance(s, str):
+        return s
+    out: list[str] = []
+    for ch in s:
+        if unicodedata.category(ch) in _UNICODE_STRIP_CATEGORIES:
+            out.append("?")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _truncate_for_human(s: str, cap: int = _HUMAN_STRING_CAP) -> str:
+    """Truncate a sanitized string for human-mode display."""
+    if len(s) <= cap:
+        return s
+    return s[: cap - 1] + "…"
+
 
 def _classify_input(s: str) -> tuple[str, str]:
     """Dispatch on input shape. Returns (form, normalised_value).
@@ -1410,11 +1482,209 @@ def _inspect_script(script_hex: str) -> dict:
     }
 
 
+async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None) -> dict:
+    """Fetch *txid_hex* via *client* and classify every output (and reveal CBOR).
+
+    Threat-model guards (deferred from PR-B's prospective review):
+
+    * Validate ``txid_hex`` via the ``Txid`` newtype before any network call.
+    * After fetch, verify ``hash256(raw)[::-1].hex() == txid_hex`` so a hostile
+      server cannot return some *other* tx.
+    * Refuse responses larger than ``_MAX_RAW_TX_BYTES`` (Radiant policy max).
+    * Refuse parsed txs with more than ``_MAX_OUTPUT_COUNT`` / ``_MAX_INPUT_COUNT``
+      entries — bounds total classification work.
+    * Wrap per-output classification in try/except so one malformed script
+      cannot abort the listing.
+    * Use ``GlyphInspector.find_reveal_metadata`` (already swallows exceptions
+      around ``decode_payload``) for input metadata extraction.
+
+    :param only_vout: if not None, restrict the outputs list to a single
+        vout — used by the ``--resolve`` outpoint flow.
+    """
+    from ..glyph.inspector import GlyphInspector
+    from ..hash import hash256
+
+    # 1. Validate locally before any network call.
+    try:
+        txid = Txid(txid_hex.lower())
+    except ValidationError as exc:
+        raise UserError("invalid txid", cause=str(exc)) from exc
+
+    # 2. Network fetch (NetworkError → caller wraps as NetworkBoundaryError).
+    raw = await client.get_transaction(txid)
+
+    # 3. Size cap.
+    if len(raw) > _MAX_RAW_TX_BYTES:
+        raise UserError(
+            "transaction is larger than the policy max",
+            cause=f"server returned {len(raw)} bytes; policy max is {_MAX_RAW_TX_BYTES}",
+            fix="confirm the txid; a tx this large is consensus-invalid",
+        )
+
+    # 4. Server-honesty check: the bytes must hash to the txid we asked for.
+    computed = hash256(bytes(raw))[::-1].hex()
+    if computed != str(txid):
+        raise UserError(
+            "server returned a transaction whose hash does not match the requested txid",
+            cause=f"requested {txid}, got {computed}",
+            fix="try a different ElectrumX server (--electrumx URL)",
+        )
+
+    # 5. Parse.
+    tx = Transaction.from_hex(bytes(raw))
+    if tx is None:
+        raise UserError(
+            "could not parse the raw transaction bytes",
+            cause="Transaction.from_hex returned None",
+            fix="the server response is malformed; try another ElectrumX server",
+        )
+
+    # 6. Structural caps.
+    if len(tx.inputs) > _MAX_INPUT_COUNT or len(tx.outputs) > _MAX_OUTPUT_COUNT:
+        raise UserError(
+            "transaction structure exceeds inspect's safety caps",
+            cause=f"inputs={len(tx.inputs)}, outputs={len(tx.outputs)}",
+            fix=f"caps are {_MAX_INPUT_COUNT}/{_MAX_OUTPUT_COUNT} — re-run on a saner tx",
+        )
+
+    # 7. Classify each output. Per-row try/except so one bad script doesn't
+    # poison the whole listing.
+    output_rows: list[dict] = []
+    enumerated = list(enumerate(tx.outputs))
+    if only_vout is not None:
+        if not (0 <= only_vout < len(tx.outputs)):
+            raise UserError(
+                f"vout {only_vout} is out of range",
+                cause=f"transaction has {len(tx.outputs)} output(s)",
+            )
+        enumerated = [(only_vout, tx.outputs[only_vout])]
+
+    for idx, out in enumerated:
+        try:
+            script_bytes = out.locking_script.serialize()
+            row = _inspect_script(script_bytes.hex())
+            row.pop("form", None)  # always "script" — redundant inside a tx listing
+            row["vout"] = idx
+            row["satoshis"] = out.satoshis
+            output_rows.append(row)
+        except Exception as exc:  # defensive: any classifier crash → unknown row
+            output_rows.append(
+                {
+                    "vout": idx,
+                    "type": "error",
+                    "error": type(exc).__name__,
+                    "satoshis": out.satoshis,
+                }
+            )
+
+    # 8. Reveal metadata (input scriptSigs).
+    #
+    # IMPORTANT: every string field surfaced into ``metadata_payload`` MUST
+    # be passed through ``_sanitize_display_string`` first. JSON mode escapes
+    # non-ASCII via ``ensure_ascii=True``, but human mode prints these strings
+    # straight to the terminal where ANSI / bidi-override / zero-width
+    # injection would land. ``protocol`` is a list of CBOR-supplied values
+    # — coerce each to ``str`` and sanitize before display, since
+    # ``str(list_of_strings)`` calls ``repr`` on each element and ``repr``
+    # does NOT escape U+202E and friends.
+    inspector = GlyphInspector()
+    scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in tx.inputs]
+    found = inspector.find_reveal_metadata(scriptsigs)
+    metadata_payload: dict | None = None
+    if found is not None:
+        input_idx, metadata = found
+        metadata_payload = {
+            "input_index": input_idx,
+            "protocol": [_sanitize_display_string(str(p)) for p in metadata.protocol],
+            "name": _sanitize_display_string(metadata.name) if metadata.name else "",
+            "ticker": _sanitize_display_string(metadata.ticker) if metadata.ticker else "",
+            "description": _sanitize_display_string(metadata.description) if metadata.description else "",
+            "decimals": metadata.decimals,
+        }
+        if metadata.main is not None:
+            from ..hash import sha256
+
+            metadata_payload["main"] = (
+                f"<media: {_sanitize_display_string(metadata.main.mime_type)}, "
+                f"{len(metadata.main.data)} bytes, "
+                f"sha256={sha256(metadata.main.data).hex()}>"
+            )
+
+    return {
+        "form": "txid",
+        "txid": str(txid),
+        "byte_length": len(raw),
+        "input_count": len(tx.inputs),
+        "output_count": len(tx.outputs),
+        "outputs": output_rows,
+        "metadata": metadata_payload,
+    }
+
+
+def _render_txid_human(payload: dict) -> str:
+    """Format a fetched-tx inspect result for human mode."""
+    lines = [
+        f"Transaction: {payload['txid']}",
+        f"  size:    {payload['byte_length']} bytes",
+        f"  inputs:  {payload['input_count']}",
+        f"  outputs: {payload['output_count']}",
+        "",
+    ]
+    rows = payload.get("outputs") or []
+    if not rows:
+        lines.append("  (no outputs)")
+    else:
+        lines.append("Outputs:")
+        for row in rows:
+            sats = row.get("satoshis", "?")
+            type_ = row.get("type", "?")
+            head = f"  vout {row['vout']:>3}  type={type_:<10}  sats={sats}"
+            lines.append(head)
+            if type_ in ("nft", "ft"):
+                lines.append(f"            ref={row.get('ref_outpoint', '')}")
+                lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
+            elif type_ == "mut":
+                lines.append(f"            ref={row.get('ref_outpoint', '')}")
+                lines.append(f"            payload_hash={row.get('payload_hash', '')}")
+            elif type_ in ("commit-nft", "commit-ft"):
+                lines.append(f"            payload_hash={row.get('payload_hash', '')}")
+                lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
+            elif type_ == "dmint":
+                lines.append(f"            contract_ref={row.get('contract_ref_outpoint', '')}")
+                lines.append(f"            token_ref={row.get('token_ref_outpoint', '')}")
+                lines.append(
+                    f"            height={row.get('height')}/{row.get('max_height')} "
+                    f"reward={row.get('reward')} algo={row.get('algo')}"
+                )
+            elif type_ == "p2pkh":
+                lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
+            elif type_ == "error":
+                lines.append(f"            (classifier error: {row.get('error')})")
+    metadata = payload.get("metadata")
+    if metadata is not None:
+        lines.append("")
+        lines.append(f"Reveal metadata (from input {metadata['input_index']}):")
+        lines.append(f"  protocol: {metadata['protocol']}")
+        if metadata.get("name"):
+            lines.append(f"  name:     {_truncate_for_human(metadata['name'])}")
+        if metadata.get("ticker"):
+            lines.append(f"  ticker:   {_truncate_for_human(metadata['ticker'])}")
+        if metadata.get("description"):
+            lines.append(f"  desc:     {_truncate_for_human(metadata['description'])}")
+        if metadata.get("decimals"):
+            lines.append(f"  decimals: {metadata['decimals']}")
+        if metadata.get("main"):
+            lines.append(f"  main:     {metadata['main']}")
+    return "\n".join(lines)
+
+
 def _render_inspect_human(payload: dict) -> str:
     """Format a single inspect result for the human output mode."""
     form = payload.get("form", "?")
     if form == "script":
         return _render_script_human(payload)
+    if form == "txid":
+        return _render_txid_human(payload)
     if form == "contract":
         lines = [
             "Contract id (explorer display form):",
@@ -1471,20 +1741,34 @@ def _render_script_human(payload: dict) -> str:
 
 @glyph_group.command(name="inspect")
 @click.argument("inspect_input", metavar="INPUT")
+@click.option(
+    "--fetch",
+    "fetch",
+    is_flag=True,
+    default=False,
+    help="Fetch the transaction from ElectrumX. Required for txid input.",
+)
+@click.option(
+    "--resolve",
+    "resolve",
+    is_flag=True,
+    default=False,
+    help="For an outpoint, fetch its source tx and classify the named vout.",
+)
 @click.pass_obj
-def inspect_cmd(ctx: CliContext, inspect_input: str) -> None:
+def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool) -> None:
     """Classify a Glyph input.
 
     INPUT can be:
 
     \b
-      • a 64-char txid              (requires --fetch — added in next release)
+      • a 64-char txid              (requires --fetch)
       • a 72-char contract id       (e.g. "b45dc4...a2a800000004")
-      • an outpoint "txid:vout"     (e.g. "b45dc4...a2a8:4")
+      • an outpoint "txid:vout"     (add --resolve to fetch its source tx)
       • a hex-encoded locking script (P2PKH / FT / NFT / mut / commit / dmint)
 
-    Read-only — no network access in this release. Pass --json for machine
-    output (auto-detects when stdout is piped).
+    Pass --json for machine output (auto-detects when stdout is piped). Read-
+    only by design — no broadcast, no wallet load, no mnemonic prompt.
 
     \b
     --json response schema (stable; new fields may be added without notice):
@@ -1498,21 +1782,44 @@ def inspect_cmd(ctx: CliContext, inspect_input: str) -> None:
         type=dmint        → contract_ref_outpoint, token_ref_outpoint,
                             height, max_height, reward, algo, daa_mode
         type=unknown      → (no extra fields)
+      txid (--fetch)   → {form, txid, byte_length, input_count, output_count,
+                          outputs[], metadata}
+        outputs[]: {vout, type, satoshis, ...same per-type fields as script form}
 
     All hex values are lowercase. Outpoints render as "txid:vout"
     (display order). Wire forms (txid reversed + vout LE) appear under
     ``wire_hex`` for contract/outpoint forms.
+
+    Network defaults (fetch path): connects to the configured ElectrumX URL
+    (override with the top-level --electrumx flag). TLS is enforced; raw
+    ws:// is rejected by the underlying client. Default timeout: 30s. Server
+    responses are bound-checked (size cap, input/output count caps) and the
+    returned tx is verified against the requested txid by sha256d roundtrip.
     """
     form, value = _classify_input(inspect_input)
 
-    if form == "txid":
+    # Forms that need a network fetch.
+    needs_fetch = (form == "txid") or (form == "outpoint" and resolve)
+
+    if form == "txid" and not fetch:
         raise UserError(
-            "txid inspection requires a network fetch",
+            "txid inspection requires --fetch",
             cause="this looks like a txid (64 hex chars)",
-            fix="--fetch will be added in the next release; for now pass a script hex, contract id, or outpoint",
+            fix="re-run with --fetch to query ElectrumX for the transaction",
+        )
+    if fetch and form not in ("txid",):
+        raise UserError(
+            "--fetch is only meaningful for txid input",
+            fix="use --resolve to fetch an outpoint's source tx",
+        )
+    if resolve and form != "outpoint":
+        raise UserError(
+            "--resolve is only meaningful for an outpoint input",
         )
 
-    if form == "contract":
+    if needs_fetch:
+        payload = _run_fetch_inspect(ctx, form=form, value=value)
+    elif form == "contract":
         payload = _inspect_contract(value)
     elif form == "outpoint":
         payload = _inspect_outpoint(value)
@@ -1525,13 +1832,47 @@ def inspect_cmd(ctx: CliContext, inspect_input: str) -> None:
     if mode == "json":
         click.echo(emit(payload, mode="json"))
     elif mode == "quiet":
-        # In quiet mode print the most useful single string: the type/outpoint.
+        # Pick the single most-useful string per form.
         if form == "script":
             click.echo(payload.get("type", ""))
+        elif form == "txid":
+            click.echo(payload.get("txid", ""))
         else:
             click.echo(payload.get("outpoint", ""))
     else:
         click.echo(_render_inspect_human(payload))
+
+
+def _run_fetch_inspect(ctx: CliContext, *, form: str, value: str) -> dict:
+    """Spin up an ElectrumX client, run _inspect_txid_inner, surface errors.
+
+    Wraps NetworkError → NetworkBoundaryError (exit code 2) so a
+    user can distinguish "wrong input" (UserError, exit 1) from
+    "network is down" (exit 2).
+    """
+
+    async def _do() -> dict:
+        client = ctx.make_client()
+        async with client:
+            if form == "txid":
+                return await _inspect_txid_inner(client, value)
+            # form == "outpoint" + resolve: parse, fetch the source, classify
+            # only the named vout.
+            outpoint_payload = _inspect_outpoint(value)
+            return await _inspect_txid_inner(
+                client,
+                outpoint_payload["txid"],
+                only_vout=outpoint_payload["vout"],
+            )
+
+    try:
+        return asyncio.run(_do())
+    except NetworkError as exc:
+        raise NetworkBoundaryError(
+            "could not reach ElectrumX",
+            cause=str(exc),
+            fix=f"check that {ctx.electrumx_url} is reachable",
+        ) from exc
 
 
 __all__ = [

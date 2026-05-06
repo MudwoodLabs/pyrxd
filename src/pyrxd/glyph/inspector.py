@@ -128,15 +128,22 @@ class GlyphInspector:
         return results
 
     def extract_reveal_metadata(self, scriptsig: bytes) -> GlyphMetadata | None:
-        """
-        Parse a reveal TX scriptSig to extract CBOR metadata.
+        """Parse a reveal TX scriptSig to extract CBOR metadata.
 
-        scriptSig format: <sig> <pubkey> <"gly"> <CBOR>
-        Returns None if this is not a reveal scriptSig.
+        scriptSig format: ``<sig> <pubkey> <"gly"> <CBOR>``.
+        Returns ``None`` if this is not a reveal scriptSig (or if the CBOR
+        is malformed / unrecognised).
+
+        Catches ``Exception`` broadly because *every* call site here crosses
+        a trust boundary: scriptSigs from network-fetched txs are attacker-
+        controlled, and the CBOR decoder + push-data walker may raise
+        anything from ``ValidationError`` to ``cbor2.CBORDecodeError`` to
+        ``IndexError`` on truncated input. Returning ``None`` is the
+        contract callers expect.
         """
         try:
             return self._parse_reveal_scriptsig(scriptsig)
-        except (ValidationError, Exception):
+        except Exception:
             return None
 
     def find_reveal_metadata(self, scriptsigs: list[bytes]) -> tuple[int, GlyphMetadata] | None:
