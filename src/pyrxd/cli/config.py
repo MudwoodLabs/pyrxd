@@ -21,7 +21,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import tomllib
+# tomllib landed in Python 3.11. pyproject.toml declares ``requires-python = ">=3.10"``
+# so 3.10 users must fall back to the ``tomli`` backport (it ships the same
+# API as ``tomllib`` and is what CPython itself adopted upstream).
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover — only fires on Python 3.10
+    import tomli as tomllib  # type: ignore[import-not-found, no-redef]
 
 DEFAULT_CONFIG_DIR = Path.home() / ".pyrxd"
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.toml"
