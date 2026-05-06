@@ -1,9 +1,10 @@
 """Pyodide-side glue between the browser UI and the ``pyrxd.glyph.inspect`` façade.
 
 This module is loaded into the Pyodide WASM runtime by ``inspect.js`` and
-exposes one entry point — :func:`run` — that the JS side calls with a
-user-pasted string. It returns a JSON-serialisable dict that the JS side
-renders without any further parsing.
+exposes two entry points — :func:`run` for offline classification of a
+user-pasted string, and :func:`inspect_txid_with_raw` for classifying a
+transaction whose raw bytes JS already fetched. Both return a
+JSON-serialisable dict that the JS side renders without further parsing.
 
 Design rules:
 
@@ -11,8 +12,8 @@ Design rules:
   ``{"ok": False, "error": ..., "form": ...}`` dict that the JS side can
   display directly. Pyodide can surface Python exceptions to JS but the
   resulting `Error` objects are awkward to inspect from the renderer.
-* **No async.** Network fetches happen in JS (see PR-C); this module is
-  pure synchronous classification.
+* **No async.** Network fetches happen in JS using the browser's native
+  WebSocket API; this module is pure synchronous classification.
 * **Sanitize once, here.** Any string that came out of CBOR or any other
   attacker-controllable source passes through ``sanitize_display_string``
   before going into the returned dict. The JS side trusts the dict;
@@ -23,6 +24,38 @@ Design rules:
 """
 
 from __future__ import annotations
+
+import sys
+
+# AES shim for Pyodide. ``pyrxd`` imports ``Cryptodome.Cipher.AES``
+# (from ``pycryptodomex``), which only ships C-extension wheels and
+# therefore can't be installed via micropip under WASM. Pyodide ships
+# the sibling package ``pycryptodome`` (no -x), which exposes the same
+# API under the ``Crypto`` namespace. Installing it via micropip and
+# aliasing ``Cryptodome`` → ``Crypto`` lets pyrxd import unchanged.
+#
+# This block is a no-op when ``Cryptodome`` is already importable
+# (i.e. native Python with pycryptodomex installed) — the import below
+# fails on Pyodide before pyrxd's import chain triggers, then we route
+# every ``Cryptodome.*`` lookup through the ``Crypto.*`` package.
+try:
+    import Cryptodome  # noqa: F401  # native pycryptodomex path
+except ImportError:
+    import Crypto
+    import Crypto.Cipher
+    import Crypto.Hash
+
+    sys.modules["Cryptodome"] = Crypto
+    sys.modules["Cryptodome.Cipher"] = Crypto.Cipher
+    sys.modules["Cryptodome.Hash"] = Crypto.Hash
+    # The two specific submodules pyrxd actually imports from. Aliasing
+    # the parent isn't enough because ``from Cryptodome.Cipher import AES``
+    # walks the dotted path and looks up ``AES`` as an attribute of
+    # ``Cryptodome.Cipher``. We populate the same namespace so the
+    # attribute exists.
+    from Crypto.Cipher import AES as _AES
+
+    sys.modules["Cryptodome.Cipher.AES"] = _AES
 
 from pyrxd.glyph import inspect as _inspect
 
@@ -116,22 +149,91 @@ def run(raw_input: str) -> dict:
 
 
 def _inspect_txid_offline(value: str) -> dict:
-    """txid form without --fetch: render a friendly placeholder.
+    """txid form before fetch: render a "press the button to fetch" stub.
 
-    PR-C wires the network fetch path. Until then a bare 64-hex paste
-    just gets a "looks like a txid; use --fetch" rendering so the user
-    knows the input was recognised but action is required.
+    The page renders this as a card with a "Fetch from network" button.
+    On click, JS uses the browser's native WebSocket to pull the raw
+    transaction from the configured ElectrumX server, then calls
+    :func:`inspect_txid_with_raw` to classify the result.
     """
     return {
         "form": "txid",
         "txid": value,
         "needs_fetch": True,
         "message": (
-            "This looks like a txid. Fetching the transaction from the "
-            "Radiant network is the next step — that path is wired in "
-            "the next release. For now, paste a script hex, contract id, "
-            "or outpoint to see classification offline."
+            "This looks like a txid. Press the button below to fetch the "
+            "raw transaction from the Radiant network and classify each "
+            "output."
         ),
+    }
+
+
+def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
+    """Classify a transaction whose raw bytes JS already fetched.
+
+    The JS side opens a WebSocket to the configured ElectrumX server,
+    sends ``blockchain.transaction.get`` for ``txid``, and hands the
+    returned hex to this function. The same threat-model guards that
+    the CLI's ``--fetch`` path applies — size cap, hash256 server-honesty
+    check, structural caps, per-output try/except, sanitised metadata —
+    run here as well, because we re-use the same ``classify_raw_tx``
+    helper the CLI uses.
+
+    Result shape mirrors :func:`run` for consistency: a top-level dict
+    with ``ok``, ``form="txid"``, ``input`` (the txid), and ``payload``
+    (the classification dict from ``classify_raw_tx``). On failure,
+    ``ok=False`` and a structured error+hint pair as elsewhere.
+    """
+    if not isinstance(txid, str) or not isinstance(raw_hex, str):
+        return _err("txid and raw_hex must both be strings", form="error")
+
+    txid = txid.strip().lower()
+    raw_hex = raw_hex.strip()
+
+    if len(txid) != 64:
+        return _err(
+            f"txid is {len(txid)} chars; expected 64",
+            form="error",
+            hint=_hint_for("contract"),
+        )
+
+    if not raw_hex:
+        return _err("raw_hex is empty", form="error")
+
+    # Length cap on the *hex string* — equivalent to twice the byte cap
+    # the CLI applies (4 MB binary = 8 MB hex). Refusing oversize input
+    # before parsing avoids spending classifier work on pathological
+    # responses from a hostile or buggy server.
+    if len(raw_hex) > 8_000_000:
+        return _err(
+            f"raw_hex too long ({len(raw_hex):,} chars); cap is 8,000,000",
+            form="error",
+        )
+
+    try:
+        raw = bytes.fromhex(raw_hex)
+    except ValueError as exc:
+        return _err(f"raw_hex is not valid hex: {_safe_error(exc)}", form="error")
+
+    try:
+        payload = _inspect.classify_raw_tx(txid, raw)
+    except Exception as exc:
+        return _err(
+            _safe_error(exc),
+            form="error",
+            hint=(
+                "If the error mentions hash mismatch, the ElectrumX server "
+                "returned the wrong transaction — try again or change "
+                "servers. Other errors usually mean the bytes are malformed."
+            ),
+        )
+
+    sanitized = _sanitize_payload_strings(payload)
+    return {
+        "ok": True,
+        "form": "txid",
+        "input": txid,
+        "payload": sanitized,
     }
 
 

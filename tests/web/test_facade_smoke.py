@@ -153,6 +153,51 @@ class TestTruncateForHuman:
         assert inspect.truncate_for_human("short") == "short"
 
 
+class TestClassifyRawTx:
+    """The façade re-exports the synchronous classify_raw_tx helper that
+    the browser-hosted inspect tool calls after fetching raw bytes via
+    its own WebSocket. The CLI side already covers the threat-model
+    guards exhaustively; here we just lock the re-export contract."""
+
+    def test_classify_raw_tx_is_exported(self):
+        from pyrxd.glyph import inspect
+
+        assert "classify_raw_tx" in inspect.__all__
+        assert callable(inspect.classify_raw_tx)
+
+    def test_returns_form_txid_dict(self):
+        """Smoke against a tiny synthetic 1-input/1-output tx so no fixture
+        bytes are needed and no network ever runs."""
+        from pyrxd.glyph import inspect
+
+        # Simplest possible raw tx structure: 4-byte version, 1 vin (with
+        # 32-byte zero-prevout-hash + 0xffffffff vout + empty script + max
+        # sequence), 1 vout (zero satoshis + empty script), 4-byte locktime.
+        raw = bytes.fromhex(
+            "01000000"  # version
+            "01"  # vin count
+            + "00" * 32  # prev txid
+            + "ffffffff"  # prev vout
+            + "00"  # scriptSig length
+            + "ffffffff"  # sequence
+            + "01"  # vout count
+            + "0000000000000000"  # satoshis (0)
+            + "00"  # scriptPubKey length
+            + "00000000"  # locktime
+        )
+
+        # Compute the txid the way the parser does.
+        from pyrxd.hash import hash256
+
+        txid = hash256(raw)[::-1].hex()
+
+        result = inspect.classify_raw_tx(txid, raw)
+        assert result["form"] == "txid"
+        assert result["txid"] == txid
+        assert result["input_count"] == 1
+        assert result["output_count"] == 1
+
+
 class TestNoDirectCliImport:
     """The browser tool must NOT reach into CLI internals.
 

@@ -63,10 +63,28 @@ const WHEELS_BASE = new URL("./wheels/", document.baseURI).toString();
 const WHEELS_MANIFEST = new URL("./manifest.json", WHEELS_BASE).toString();
 const GLUE_URL = new URL("./glue.py", document.baseURI).toString();
 
-// Module-scope handle to the Python `run` function once boot completes.
-// Keeping this on the module rather than `window` avoids polluting the
+// Module-scope handles to the Python entry points once boot completes.
+// Keeping these on the module rather than `window` avoids polluting the
 // global namespace and keeps the surface explicit.
-let pyGlue = null;
+let pyGlue = null;          // glue.run(text) -> dict
+let pyGlueFetch = null;     // glue.inspect_txid_with_raw(txid, raw_hex) -> dict
+
+// ElectrumX WebSocket endpoint. Hard-coded to the one URL the page's
+// CSP whitelists in ``connect-src``. Changing this also requires
+// updating the CSP meta-tag in index.html.
+const ELECTRUMX_WSS_URL = "wss://electrumx.radiant4people.com:50022";
+
+// Hard cap on a fetched transaction's hex length. Mirrors the cap
+// glue.py applies on the Python side (8 MB hex = 4 MB binary, the
+// Radiant policy maximum). Clipping in JS too means a hostile server
+// can't make us spend memory holding a multi-gigabyte response while
+// the Python guard rejects it.
+const MAX_FETCHED_TX_HEX_LEN = 8_000_000;
+
+// Per-fetch timeout. Real ElectrumX servers respond in <1s; 10 seconds
+// is generous and bounds the worst case where the connection succeeds
+// but the server hangs without responding.
+const FETCH_TIMEOUT_MS = 10_000;
 
 // ---------------------------------------------------------------------
 // Status / error helpers
@@ -157,12 +175,16 @@ async function boot() {
   setProgress(60);
 
   try {
-    await pyodide.loadPackage(["micropip"]);
+    // Pyodide ships ``pycryptodome`` (no -x). pyrxd imports
+    // ``Cryptodome.Cipher.AES`` via pycryptodomex which doesn't have a
+    // pure-Python wheel; glue.py shims ``Cryptodome`` -> ``Crypto`` at
+    // import time, so we install pycryptodome here BEFORE pyrxd so the
+    // shim has something to alias.
+    await pyodide.loadPackage(["micropip", "pycryptodome"]);
     const wheelURL = new URL(manifest.wheel, WHEELS_BASE).toString();
     await pyodide.runPythonAsync(`
 import micropip
 await micropip.install(${JSON.stringify(wheelURL)})
-import pyrxd
 `);
   } catch (err) {
     showError(`Could not install pyrxd from ${manifest.wheel}: ${err.message}`);
@@ -171,24 +193,12 @@ import pyrxd
 
   setProgress(85);
 
-  // Read the installed pyrxd version back through the bridge.
+  // Load the Pyodide-side glue. The glue module installs the
+  // Cryptodome→Crypto shim at import time and then imports pyrxd, so
+  // pyrxd's import chain (which references Cryptodome.Cipher.AES via
+  // aes_cbc) resolves cleanly. Both entry points come back as PyProxy
+  // references stashed on the JS module.
   let versionText;
-  try {
-    const py = pyodide.runPython(`
-import pyrxd
-import sys
-v = getattr(pyrxd, "__version__", "unknown")
-f"pyrxd {v} loaded under Python {sys.version.split()[0]}"
-`);
-    versionText = String(py);
-  } catch (err) {
-    showError(`Could not read pyrxd.__version__: ${err.message}`);
-    return;
-  }
-
-  // Load the Pyodide-side glue and grab a reference to its `run` function.
-  // We fetch the source text and execute it under a synthetic module name
-  // so any future `from pyrxd_inspect_glue import ...` would also resolve.
   try {
     const glueSrc = await fetchGlueSource();
     pyodide.FS.writeFile("/home/pyodide/glue.py", glueSrc);
@@ -196,8 +206,15 @@ f"pyrxd {v} loaded under Python {sys.version.split()[0]}"
 import sys
 sys.path.insert(0, "/home/pyodide")
 import glue as _pyrxd_glue
+import pyrxd
+_pyrxd_version_blob = (
+    f"pyrxd {getattr(pyrxd, '__version__', 'unknown')} "
+    f"loaded under Python {sys.version.split()[0]}"
+)
 `);
     pyGlue = pyodide.globals.get("_pyrxd_glue").run;
+    pyGlueFetch = pyodide.globals.get("_pyrxd_glue").inspect_txid_with_raw;
+    versionText = String(pyodide.globals.get("_pyrxd_version_blob"));
   } catch (err) {
     showError(`Could not load inspect glue: ${err.message}`);
     return;
@@ -358,7 +375,12 @@ function renderResult(result) {
 
   let card;
   if (form === "txid") {
-    card = renderTxidCard(payload);
+    // Fetched-tx payloads carry byte_length / output_count / etc.;
+    // pre-fetch placeholder payloads carry needs_fetch=true. Pick the
+    // richer card when the data's there.
+    card = (payload && payload.byte_length !== undefined)
+      ? renderFetchedTxCard(payload)
+      : renderTxidCard(payload);
   } else if (form === "contract") {
     card = renderContractCard(payload);
   } else if (form === "outpoint") {
@@ -418,12 +440,98 @@ function renderTxidCard(payload) {
   const wrapper = card("Transaction id", "txid");
   const dl = el("dl", { class: "kv-list" });
   dl.appendChild(kv("txid", payload.txid));
-  dl.appendChild(kv("status", payload.needs_fetch ? "needs --fetch" : "ready"));
+  dl.appendChild(kv("status", payload.needs_fetch ? "ready to fetch" : "loaded"));
   wrapper.appendChild(dl);
   if (payload.message) {
     const note = el("p", { class: "card-note", text: payload.message });
     wrapper.appendChild(note);
   }
+
+  if (payload.needs_fetch) {
+    const actionRow = el("div", { class: "fetch-row" });
+    const fetchBtn = el("button", {
+      class: "fetch-btn",
+      text: "Fetch from network",
+    });
+    fetchBtn.type = "button";
+    const status = el("span", { class: "fetch-status" });
+    actionRow.appendChild(fetchBtn);
+    actionRow.appendChild(status);
+    wrapper.appendChild(actionRow);
+
+    fetchBtn.addEventListener("click", () => onFetchTxid(payload.txid, fetchBtn, status));
+  }
+
+  return wrapper;
+}
+
+function renderFetchedTxCard(payload) {
+  const wrapper = card("Fetched transaction", "txid");
+  const dl = el("dl", { class: "kv-list" });
+  dl.appendChild(kv("txid", payload.txid));
+  dl.appendChild(kv("size", `${payload.byte_length} bytes`));
+  dl.appendChild(kv("inputs", payload.input_count));
+  dl.appendChild(kv("outputs", payload.output_count));
+  wrapper.appendChild(dl);
+
+  // Per-output rows.
+  const outputs = payload.outputs || [];
+  if (outputs.length > 0) {
+    wrapper.appendChild(el("h3", { class: "result-subhead", text: "Outputs" }));
+    const outList = el("div", { class: "output-rows" });
+    for (const row of outputs) {
+      outList.appendChild(renderOutputRow(row));
+    }
+    wrapper.appendChild(outList);
+  }
+
+  // Reveal metadata (if present).
+  const metadata = payload.metadata;
+  if (metadata) {
+    wrapper.appendChild(el("h3", { class: "result-subhead", text: "Reveal metadata" }));
+    const mdl = el("dl", { class: "kv-list" });
+    mdl.appendChild(kv("input index", metadata.input_index));
+    if (Array.isArray(metadata.protocol) && metadata.protocol.length > 0) {
+      mdl.appendChild(kv("protocol", metadata.protocol.join(", ")));
+    }
+    if (metadata.name) mdl.appendChild(kv("name", metadata.name));
+    if (metadata.ticker) mdl.appendChild(kv("ticker", metadata.ticker));
+    if (metadata.description) mdl.appendChild(kv("description", metadata.description));
+    if (metadata.decimals !== undefined && metadata.decimals !== null) {
+      mdl.appendChild(kv("decimals", metadata.decimals));
+    }
+    if (metadata.main) mdl.appendChild(kv("main", metadata.main));
+    wrapper.appendChild(mdl);
+  }
+
+  return wrapper;
+}
+
+function renderOutputRow(row) {
+  const type = String(row.type || "unknown").toLowerCase();
+  const wrapper = el("section", { class: "output-row" });
+  const head = el("header", { class: "output-row-head" });
+  head.appendChild(el("span", { class: "output-vout", text: `vout ${row.vout}` }));
+  head.appendChild(badge(type.toUpperCase(), scriptBadgeKind(type)));
+  head.appendChild(el("span", { class: "output-sats", text: `${row.satoshis} sats` }));
+  wrapper.appendChild(head);
+
+  const dl = el("dl", { class: "kv-list" });
+  if (row.owner_pkh) dl.appendChild(kv("owner pkh", row.owner_pkh));
+  if (row.ref_outpoint) dl.appendChild(kv("ref", row.ref_outpoint));
+  if (row.payload_hash) dl.appendChild(kv("payload hash", row.payload_hash));
+  if (row.contract_ref_outpoint) dl.appendChild(kv("contract ref", row.contract_ref_outpoint));
+  if (row.token_ref_outpoint) dl.appendChild(kv("token ref", row.token_ref_outpoint));
+  if (row.height !== undefined) dl.appendChild(kv("height", row.height));
+  if (row.max_height !== undefined) dl.appendChild(kv("max height", row.max_height));
+  if (row.reward !== undefined) dl.appendChild(kv("reward", row.reward));
+  if (row.algo) dl.appendChild(kv("algo", row.algo));
+  if (row.daa_mode) dl.appendChild(kv("daa mode", row.daa_mode));
+  if (row.version) dl.appendChild(kv("version", row.version));
+  if (type === "error") {
+    dl.appendChild(kv("error", row.error || "(unknown)"));
+  }
+  wrapper.appendChild(dl);
   return wrapper;
 }
 
@@ -567,6 +675,148 @@ function renderJsonDrawer(result) {
   });
   details.appendChild(copyBtn);
   return details;
+}
+
+// ---------------------------------------------------------------------
+// WebSocket fetch — pulls raw bytes for a txid from the configured
+// ElectrumX server. Returns a Promise<string> of the hex-encoded raw
+// transaction or rejects with an Error on any failure mode.
+//
+// Wire protocol: ElectrumX uses JSON-RPC 2.0 over WebSocket with
+// newline-delimited frames. We send one request, await the matching
+// response by id, and close. No long-lived connection — this is a
+// "fetch and forget" pattern, simpler than maintaining the kind of
+// reader loop the Python ElectrumXClient uses.
+// ---------------------------------------------------------------------
+
+function fetchRawTxFromElectrumx(txid) {
+  return new Promise((resolve, reject) => {
+    let ws;
+    try {
+      ws = new WebSocket(ELECTRUMX_WSS_URL);
+    } catch (err) {
+      reject(new Error(`could not open WebSocket: ${err.message || err}`));
+      return;
+    }
+
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch { /* already closed */ }
+      fn(value);
+    };
+
+    const timer = setTimeout(() => {
+      settle(reject, new Error(`timed out after ${FETCH_TIMEOUT_MS}ms`));
+    }, FETCH_TIMEOUT_MS);
+
+    ws.addEventListener("open", () => {
+      const req = JSON.stringify({
+        id: 1,
+        method: "blockchain.transaction.get",
+        params: [txid, false],
+      });
+      // ElectrumX expects newline-terminated frames.
+      ws.send(req + "\n");
+    });
+
+    ws.addEventListener("message", (ev) => {
+      clearTimeout(timer);
+      let frame;
+      try {
+        frame = JSON.parse(typeof ev.data === "string" ? ev.data : "");
+      } catch (err) {
+        settle(reject, new Error(`server returned non-JSON: ${err.message}`));
+        return;
+      }
+      if (frame.id !== 1) {
+        // Unexpected id — discard and keep waiting (cheap defence
+        // against a server that buffers other clients' responses).
+        return;
+      }
+      if (frame.error) {
+        const msg = (frame.error && frame.error.message) || JSON.stringify(frame.error);
+        settle(reject, new Error(`server error: ${msg}`));
+        return;
+      }
+      const result = frame.result;
+      if (typeof result !== "string") {
+        settle(reject, new Error("server returned non-string result"));
+        return;
+      }
+      if (result.length > MAX_FETCHED_TX_HEX_LEN) {
+        settle(reject, new Error(
+          `response is ${result.length.toLocaleString()} chars; cap is ` +
+          `${MAX_FETCHED_TX_HEX_LEN.toLocaleString()}`
+        ));
+        return;
+      }
+      // Light hex sanity check — Python side does the real validation.
+      if (!/^[0-9a-fA-F]*$/.test(result)) {
+        settle(reject, new Error("server returned a non-hex string"));
+        return;
+      }
+      settle(resolve, result);
+    });
+
+    ws.addEventListener("error", () => {
+      clearTimeout(timer);
+      settle(reject, new Error("WebSocket error connecting to ElectrumX"));
+    });
+
+    ws.addEventListener("close", () => {
+      clearTimeout(timer);
+      settle(reject, new Error("WebSocket closed before any response"));
+    });
+  });
+}
+
+async function onFetchTxid(txid, fetchBtn, statusEl) {
+  if (!pyGlueFetch) {
+    statusEl.textContent = "(glue not ready)";
+    return;
+  }
+  fetchBtn.disabled = true;
+  statusEl.textContent = "fetching…";
+
+  let rawHex;
+  try {
+    rawHex = await fetchRawTxFromElectrumx(txid);
+  } catch (err) {
+    fetchBtn.disabled = false;
+    statusEl.textContent = "";
+    renderResult({
+      ok: false,
+      form: "error",
+      error: `fetch failed: ${err.message || err}`,
+      hint:
+        "Try again, check that wss://electrumx.radiant4people.com:50022 is " +
+        "reachable, or use the CLI: pyrxd glyph inspect <txid> --fetch",
+    });
+    return;
+  }
+
+  statusEl.textContent = "classifying…";
+
+  let result;
+  try {
+    const pyResult = pyGlueFetch(txid, rawHex);
+    result = pyResult.toJs({ dict_converter: Object.fromEntries });
+    pyResult.destroy();
+  } catch (err) {
+    fetchBtn.disabled = false;
+    statusEl.textContent = "";
+    renderResult({
+      ok: false,
+      form: "error",
+      error: `bridge error: ${err.message || err}`,
+      hint: "",
+    });
+    return;
+  }
+
+  renderResult(result);
 }
 
 // ---------------------------------------------------------------------
