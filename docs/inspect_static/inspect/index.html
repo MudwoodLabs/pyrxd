@@ -58,15 +58,57 @@
     </section>
 
     <section id="ready-content" hidden>
-      <h2>Status</h2>
-      <pre id="version-block">(loading…)</pre>
-      <p class="note">
-        This page is the PR-1 plumbing checkpoint — it loads Pyodide, imports
-        <code>pyrxd</code>, and prints the version. The classifier UI lands in
-        the next PR. See
-        <a href="https://github.com/MudwoodLabs/pyrxd/pull/46">PR #46</a>
-        for the rollout plan.
-      </p>
+      <details class="env-details">
+        <summary>Runtime status</summary>
+        <pre id="version-block">(loading…)</pre>
+      </details>
+
+      <form id="inspect-form" class="inspect-form" autocomplete="off">
+        <label for="paste-input" class="form-label">
+          Paste a Glyph contract id, outpoint, txid, or hex script:
+        </label>
+        <textarea
+          id="paste-input"
+          rows="3"
+          spellcheck="false"
+          autocapitalize="off"
+          autocorrect="off"
+          placeholder="e.g. b45dc453…a8:0  or  76a914…88ac"
+          disabled
+        ></textarea>
+        <div class="form-actions">
+          <button type="button" id="classify-btn" disabled>Classify</button>
+          <button type="button" id="clear-btn" disabled>Clear</button>
+          <button type="button" id="share-btn" disabled>Share link</button>
+        </div>
+      </form>
+
+      <section id="onboarding" class="onboarding">
+        <h2>Try an example</h2>
+        <p class="note">
+          These are real mainnet inputs. Click one to populate the box and
+          classify.
+        </p>
+        <div class="example-row">
+          <button
+            type="button"
+            class="example-chip"
+            data-input="b45dc453befb589aff8bfd76af0b994615b37eda094f48c380eb31deaf96a2a800000000"
+          >RBG contract id</button>
+          <button
+            type="button"
+            class="example-chip"
+            data-input="b45dc453befb589aff8bfd76af0b994615b37eda094f48c380eb31deaf96a2a8:0"
+          >RBG outpoint</button>
+          <button
+            type="button"
+            class="example-chip"
+            data-input="76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+          >P2PKH script</button>
+        </div>
+      </section>
+
+      <section id="result-block" class="result-block" hidden></section>
     </section>
 
     <section id="error-content" hidden>
