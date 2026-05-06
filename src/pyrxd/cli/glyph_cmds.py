@@ -1201,10 +1201,317 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
     click.echo(emit_table(rows, columns, mode=ctx.output_mode, quiet_field="ref"))
 
 
+# ---------------------------------------------------------------------------
+# inspect — classify any Glyph input (script hex, outpoint, contract id, txid)
+# ---------------------------------------------------------------------------
+
+# Input forms recognised by `glyph inspect`. Each is unambiguous by shape:
+#   txid       — exactly 64 lowercase-hex chars
+#   contract   — exactly 72 lowercase-hex chars (txid + BE vout)
+#   outpoint   — anything containing ":"
+#   script     — any other hex string of even length (>= 50 chars / 25 bytes)
+# Everything else is a UserError.
+_TXID_HEX_LEN = 64
+_CONTRACT_HEX_LEN = 72
+# The minimum script we'd reasonably classify is plain P2PKH (25 bytes / 50 hex).
+_MIN_SCRIPT_HEX_LEN = 50
+# Cap accidental "paste a whole tx" before running every classifier on it.
+_MAX_SCRIPT_HEX_LEN = 20_000
+
+
+def _classify_input(s: str) -> tuple[str, str]:
+    """Dispatch on input shape. Returns (form, normalised_value).
+
+    form ∈ {"txid", "contract", "outpoint", "script"}.
+
+    Auto-detect rules (unambiguous by length / content):
+      * 64 hex → txid
+      * 72 hex → contract
+      * contains ":" → outpoint (validated downstream)
+      * 50–20_000 even-length hex → script
+
+    A bare 64-hex string is always treated as a txid even though it could
+    structurally also be a 32-byte payload-hash push prefix; the txid form
+    is the only one users hit in practice from a block explorer.
+    """
+    s = s.strip()
+    if not s:
+        raise UserError("inspect input is empty")
+    if ":" in s:
+        return ("outpoint", s)
+    lowered = s.lower()
+    if len(lowered) == _TXID_HEX_LEN and all(c in "0123456789abcdef" for c in lowered):
+        return ("txid", lowered)
+    if len(lowered) == _CONTRACT_HEX_LEN and all(c in "0123456789abcdef" for c in lowered):
+        return ("contract", lowered)
+    if (
+        _MIN_SCRIPT_HEX_LEN <= len(lowered) <= _MAX_SCRIPT_HEX_LEN
+        and len(lowered) % 2 == 0
+        and all(c in "0123456789abcdef" for c in lowered)
+    ):
+        return ("script", lowered)
+    raise UserError(
+        f"could not classify input (length {len(s)})",
+        cause="input is not a 64-char txid, 72-char contract id, txid:vout outpoint, or 50-20000 char hex script",
+        fix="paste a 64-char txid (with --fetch), 72-char contract id, txid:vout, or hex script",
+    )
+
+
+def _inspect_contract(contract_hex: str) -> dict:
+    """Decode a 72-char contract id. Return a flat dict for emit()."""
+    from ..glyph.types import GlyphRef
+
+    try:
+        ref = GlyphRef.from_contract_hex(contract_hex)
+    except ValidationError as exc:
+        raise UserError("contract id failed to parse", cause=str(exc)) from exc
+    return {
+        "form": "contract",
+        "txid": ref.txid,
+        "vout": ref.vout,
+        "outpoint": f"{ref.txid}:{ref.vout}",
+        "wire_hex": ref.to_bytes().hex(),
+    }
+
+
+def _inspect_outpoint(s: str) -> dict:
+    """Parse a `txid:vout` string. Returns a flat dict for emit().
+
+    Rejects malformed input loudly so the user sees a clear error rather
+    than a confusing downstream traceback.
+    """
+    from ..glyph.types import GlyphRef
+
+    if s.count(":") != 1:
+        raise UserError(f"outpoint must be exactly one 'txid:vout', got {s!r}")
+    txid_str, vout_str = s.split(":", 1)
+    try:
+        vout = int(vout_str, 10)
+    except ValueError as exc:
+        raise UserError(f"vout is not an integer: {vout_str!r}") from exc
+    try:
+        ref = GlyphRef(txid=Txid(txid_str.lower()), vout=vout)
+    except ValidationError as exc:
+        raise UserError("outpoint failed to parse", cause=str(exc)) from exc
+    return {
+        "form": "outpoint",
+        "txid": ref.txid,
+        "vout": ref.vout,
+        "outpoint": f"{ref.txid}:{ref.vout}",
+        "wire_hex": ref.to_bytes().hex(),
+    }
+
+
+def _inspect_script(script_hex: str) -> dict:
+    """Classify a single hex-encoded locking script. Returns a flat dict."""
+    from ..glyph.dmint import DmintState
+    from ..glyph.script import (
+        MUTABLE_NFT_SCRIPT_RE,
+        extract_owner_pkh_from_commit_script,
+        extract_owner_pkh_from_ft_script,
+        extract_owner_pkh_from_nft_script,
+        extract_payload_hash_from_commit_script,
+        extract_ref_from_ft_script,
+        extract_ref_from_nft_script,
+        is_commit_ft_script,
+        is_commit_nft_script,
+        is_ft_script,
+        is_nft_script,
+        parse_mutable_nft_script,
+    )
+
+    try:
+        script = bytes.fromhex(script_hex)
+    except ValueError as exc:
+        raise UserError("script is not valid hex") from exc
+
+    base = {"form": "script", "length": len(script), "hex": script_hex}
+
+    # Plain P2PKH check first (cheapest, common).
+    if len(script) == 25 and script[:3] == b"\x76\xa9\x14" and script[23:] == b"\x88\xac":
+        return {**base, "type": "p2pkh", "owner_pkh": script[3:23].hex()}
+
+    if is_nft_script(script_hex):
+        ref = extract_ref_from_nft_script(script)
+        pkh = extract_owner_pkh_from_nft_script(script)
+        return {
+            **base,
+            "type": "nft",
+            "ref_txid": ref.txid,
+            "ref_vout": ref.vout,
+            "ref_outpoint": f"{ref.txid}:{ref.vout}",
+            "owner_pkh": bytes(pkh).hex(),
+        }
+
+    if is_ft_script(script_hex):
+        ref = extract_ref_from_ft_script(script)
+        pkh = extract_owner_pkh_from_ft_script(script)
+        return {
+            **base,
+            "type": "ft",
+            "ref_txid": ref.txid,
+            "ref_vout": ref.vout,
+            "ref_outpoint": f"{ref.txid}:{ref.vout}",
+            "owner_pkh": bytes(pkh).hex(),
+        }
+
+    if MUTABLE_NFT_SCRIPT_RE.fullmatch(script_hex):
+        parsed = parse_mutable_nft_script(script)
+        if parsed is not None:
+            ref, payload_hash = parsed
+            return {
+                **base,
+                "type": "mut",
+                "ref_txid": ref.txid,
+                "ref_vout": ref.vout,
+                "ref_outpoint": f"{ref.txid}:{ref.vout}",
+                "payload_hash": payload_hash.hex(),
+            }
+
+    if is_commit_nft_script(script_hex):
+        return {
+            **base,
+            "type": "commit-nft",
+            "payload_hash": extract_payload_hash_from_commit_script(script).hex(),
+            "owner_pkh": bytes(extract_owner_pkh_from_commit_script(script)).hex(),
+        }
+
+    if is_commit_ft_script(script_hex):
+        return {
+            **base,
+            "type": "commit-ft",
+            "payload_hash": extract_payload_hash_from_commit_script(script).hex(),
+            "owner_pkh": bytes(extract_owner_pkh_from_commit_script(script)).hex(),
+        }
+
+    # dMint contract is variable-length and parser-only; try last.
+    try:
+        state = DmintState.from_script(script)
+    except ValidationError:
+        return {**base, "type": "unknown"}
+
+    return {
+        **base,
+        "type": "dmint",
+        "contract_ref_outpoint": f"{state.contract_ref.txid}:{state.contract_ref.vout}",
+        "token_ref_outpoint": f"{state.token_ref.txid}:{state.token_ref.vout}",
+        "height": state.height,
+        "max_height": state.max_height,
+        "reward": state.reward,
+        "algo": state.algo.name,
+        "daa_mode": state.daa_mode.name,
+    }
+
+
+def _render_inspect_human(payload: dict) -> str:
+    """Format a single inspect result for the human output mode."""
+    form = payload.get("form", "?")
+    if form == "script":
+        return _render_script_human(payload)
+    if form == "contract":
+        lines = [
+            "Contract id (explorer display form):",
+            f"  txid:     {payload['txid']}",
+            f"  vout:     {payload['vout']}",
+            f"  outpoint: {payload['outpoint']}",
+            "",
+            f"Wire form (inside scripts): {payload['wire_hex']}",
+        ]
+        return "\n".join(lines)
+    if form == "outpoint":
+        lines = [
+            "Outpoint:",
+            f"  txid:     {payload['txid']}",
+            f"  vout:     {payload['vout']}",
+            f"  outpoint: {payload['outpoint']}",
+            "",
+            f"Wire form (inside scripts): {payload['wire_hex']}",
+        ]
+        return "\n".join(lines)
+    return "\n".join(f"{k}: {v}" for k, v in payload.items())
+
+
+def _render_script_human(payload: dict) -> str:
+    """Pretty-print a classified script result."""
+    type_ = payload.get("type", "?")
+    head = f"type: {type_}    length: {payload['length']} bytes"
+    body: list[str] = []
+    if type_ == "p2pkh":
+        body.append(f"  owner_pkh: {payload['owner_pkh']}")
+    elif type_ in ("nft", "ft"):
+        body.append(f"  ref:       {payload['ref_outpoint']}")
+        body.append(f"  owner_pkh: {payload['owner_pkh']}")
+    elif type_ == "mut":
+        body.append(f"  ref:          {payload['ref_outpoint']}")
+        body.append(f"  payload_hash: {payload['payload_hash']}")
+    elif type_ in ("commit-nft", "commit-ft"):
+        body.append(f"  payload_hash: {payload['payload_hash']}")
+        body.append(f"  owner_pkh:    {payload['owner_pkh']}")
+    elif type_ == "dmint":
+        body.append(f"  contract_ref: {payload['contract_ref_outpoint']}")
+        body.append(f"  token_ref:    {payload['token_ref_outpoint']}")
+        body.append(f"  height:       {payload['height']} / {payload['max_height']}")
+        body.append(f"  reward:       {payload['reward']} photons")
+        body.append(f"  algo:         {payload['algo']}")
+        body.append(f"  daa_mode:     {payload['daa_mode']}")
+    elif type_ == "unknown":
+        body.append("  (script does not match any known Glyph or P2PKH layout)")
+    return "\n".join([head, *body])
+
+
+@glyph_group.command(name="inspect")
+@click.argument("inspect_input", metavar="INPUT")
+@click.pass_obj
+def inspect_cmd(ctx: CliContext, inspect_input: str) -> None:
+    """Classify a Glyph input.
+
+    INPUT can be:
+
+    \b
+      • a 64-char txid              (requires --fetch — added in next release)
+      • a 72-char contract id       (e.g. "b45dc4...a2a800000004")
+      • an outpoint "txid:vout"     (e.g. "b45dc4...a2a8:4")
+      • a hex-encoded locking script (P2PKH / FT / NFT / mut / commit / dmint)
+
+    Read-only — no network access in this release. Pass --json for machine
+    output (auto-detects when stdout is piped).
+    """
+    form, value = _classify_input(inspect_input)
+
+    if form == "txid":
+        raise UserError(
+            "txid inspection requires a network fetch",
+            cause="this looks like a txid (64 hex chars)",
+            fix="--fetch will be added in the next release; for now pass a script hex, contract id, or outpoint",
+        )
+
+    if form == "contract":
+        payload = _inspect_contract(value)
+    elif form == "outpoint":
+        payload = _inspect_outpoint(value)
+    elif form == "script":
+        payload = _inspect_script(value)
+    else:  # pragma: no cover — _classify_input never returns other values
+        raise UserError(f"internal: unknown form {form!r}")
+
+    mode = ctx.output_mode
+    if mode == "json":
+        click.echo(emit(payload, mode="json"))
+    elif mode == "quiet":
+        # In quiet mode print the most useful single string: the type/outpoint.
+        if form == "script":
+            click.echo(payload.get("type", ""))
+        else:
+            click.echo(payload.get("outpoint", ""))
+    else:
+        click.echo(_render_inspect_human(payload))
+
+
 __all__ = [
     "deploy_ft_cmd",
     "glyph_group",
     "init_metadata_cmd",
+    "inspect_cmd",
     "list_cmd",
     "mint_nft_cmd",
     "transfer_ft_cmd",
