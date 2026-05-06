@@ -1494,6 +1494,9 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
     Threat-model guards mirror the async wrapper exactly:
 
     * Validate ``txid_hex`` via the ``Txid`` newtype.
+    * Refuse ``raw`` shorter than 65 bytes (Merkle-forgery defence; the
+      ``RawTx`` newtype enforces this at its boundary, but ``raw`` here
+      is a plain ``bytes`` so we re-check explicitly).
     * Refuse ``raw`` larger than ``_MAX_RAW_TX_BYTES`` (Radiant policy max).
     * Server-honesty check: ``hash256(raw)[::-1].hex() == txid_hex`` so a
       hostile source can't return some *other* tx.
@@ -1518,19 +1521,31 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
     except ValidationError as exc:
         raise UserError("invalid txid", cause=str(exc)) from exc
 
+    # Lower-bound length sanity. ``RawTx`` enforces >64 bytes as a
+    # Merkle-forgery defence at its newtype boundary; we re-assert it
+    # here so direct callers (the browser façade is now public, see
+    # pyrxd.glyph.inspect.classify_raw_tx) get the same guarantee
+    # without needing to wrap in ``RawTx`` first.
+    if len(raw) <= 64:
+        raise UserError(
+            "raw bytes too short for a valid transaction",
+            cause=f"got {len(raw)} bytes; need >64",
+            fix="confirm the source returned a real transaction, not a header or stub",
+        )
+
     if len(raw) > _MAX_RAW_TX_BYTES:
         raise UserError(
             "transaction is larger than the policy max",
-            cause=f"got {len(raw)} bytes; policy max is {_MAX_RAW_TX_BYTES}",
+            cause=f"server returned {len(raw)} bytes; policy max is {_MAX_RAW_TX_BYTES}",
             fix="confirm the txid; a tx this large is consensus-invalid",
         )
 
     computed = hash256(bytes(raw))[::-1].hex()
     if computed != str(txid):
         raise UserError(
-            "raw bytes hash does not match the requested txid",
+            "server returned a transaction whose hash does not match the requested txid",
             cause=f"requested {txid}, got {computed}",
-            fix="the source returned the wrong tx; try a different ElectrumX server",
+            fix="try a different ElectrumX server (--electrumx URL)",
         )
 
     tx = Transaction.from_hex(bytes(raw))
@@ -1538,7 +1553,7 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
         raise UserError(
             "could not parse the raw transaction bytes",
             cause="Transaction.from_hex returned None",
-            fix="the response is malformed; try another source",
+            fix="the server response is malformed; try another ElectrumX server",
         )
 
     if len(tx.inputs) > _MAX_INPUT_COUNT or len(tx.outputs) > _MAX_OUTPUT_COUNT:
