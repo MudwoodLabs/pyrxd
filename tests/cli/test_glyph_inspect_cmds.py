@@ -71,6 +71,22 @@ def _p2pkh_script() -> bytes:
     return b"\x76\xa9\x14" + bytes(range(20)) + b"\x88\xac"
 
 
+# Real V1 dmint contract from the RBG mainnet reveal tx
+# c5c296ebff5869c6e2b208ce0cd04be479a9f10d33cf73608f0a5efc2d6b55b6 vout 0.
+# 240 bytes; SHA256D + FIXED + max_height 6.75M + reward 6200.
+# See tests/test_glyph.py::TestV1DmintParser for the parser-level tests
+# against this same fixture.
+_RBG_DMINT_V1_HEX = (
+    "0400000000d8a8a296afde31eb80c3484f09da7eb31546990baf76fd8bff9a58fbbe53c45db4"
+    "01000000d0a8a296afde31eb80c3484f09da7eb31546990baf76fd8bff9a58fbbe53c45db4"
+    "000000000330ff66023818085c8fc2f5285c8f02bd5175c0c855797ea8597959797ea87e5a7a7eaa"
+    "bc01147f77587f040000000088817600a269a269577ae500a069567ae600a06901d053797e0c"
+    "dec0e9aa76e378e4a269e69d7eaa76e47b9d547a818b76537a9c537ade789181547ae6939d"
+    "635279cd01d853797e016a7e886778de519d547854807ec0eb557f777e5379ec78885379eac0e988"
+    "5379cc519d75686d7551"
+)
+
+
 # ---------------------------------------------------------------------------
 # Dispatch — _classify_input via the CLI surface
 # ---------------------------------------------------------------------------
@@ -242,6 +258,38 @@ class TestInspectScriptHex:
         assert "contract_ref" in result.output
         assert "token_ref" in result.output
         assert "height" in result.output
+        # PR #39 added the version field — V2 builder produces V2 layout.
+        assert "version:      dMint v2" in result.output
+
+    def test_classifies_v1_dmint_contract_human(self, runner: CliRunner) -> None:
+        """A real V1 contract from the RBG mainnet reveal must classify as
+        ``dmint`` and surface ``version: dMint v1`` plus the derived total
+        supply line."""
+        result = runner.invoke(cli, ["glyph", "inspect", _RBG_DMINT_V1_HEX])
+        assert result.exit_code == 0, result.output
+        assert "type: dmint" in result.output
+        assert "version:      dMint v1" in result.output
+        # max_height (6_750_000) × reward (6_200) = 41_850_000_000
+        assert "total supply: 41,850,000,000" in result.output
+        assert "algo:         SHA256D" in result.output
+        assert "daa_mode:     FIXED" in result.output
+
+    def test_classifies_v1_dmint_contract_json(self, runner: CliRunner) -> None:
+        """JSON form must include ``version`` for V1, and the dmint-specific
+        fields must round-trip through ``ensure_ascii=True`` cleanly."""
+        result = runner.invoke(cli, ["--json", "glyph", "inspect", _RBG_DMINT_V1_HEX])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["type"] == "dmint"
+        assert payload["version"] == "v1"
+        assert payload["max_height"] == 6_750_000
+        assert payload["reward"] == 6_200
+        assert payload["algo"] == "SHA256D"
+        assert payload["daa_mode"] == "FIXED"
+        # contract_ref/token_ref outpoints are display-order strings.
+        rbg_txid = "b45dc453befb589aff8bfd76af0b994615b37eda094f48c380eb31deaf96a2a8"
+        assert payload["contract_ref_outpoint"] == f"{rbg_txid}:1"
+        assert payload["token_ref_outpoint"] == f"{rbg_txid}:0"
 
     def test_unknown_script_does_not_crash(self, runner: CliRunner) -> None:
         # 50 hex chars (25 bytes) of garbage that isn't P2PKH or any glyph form.

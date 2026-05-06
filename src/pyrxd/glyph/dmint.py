@@ -584,20 +584,24 @@ _V1_ALGO_BYTE_TO_ENUM: dict[int, DmintAlgo] = {
 }
 
 
-def _match_v1_epilogue(script: bytes, start: int) -> tuple[bool, DmintAlgo | None]:
-    """Return (matched, algo) for a V1 epilogue starting at *start*."""
+def _match_v1_epilogue(script: bytes, start: int) -> DmintAlgo | None:
+    """Return the algo enum if a V1 epilogue starts at *start*, else ``None``.
+
+    Returning ``None`` means "not a V1 epilogue at this position." Callers
+    do not need to distinguish *which* check failed (length / prefix / algo
+    byte / suffix) — only "is this a V1 contract or not."
+    """
     if start + _V1_EPILOGUE_LEN > len(script):
-        return (False, None)
+        return None
     if script[start : start + len(_V1_EPILOGUE_PREFIX)] != _V1_EPILOGUE_PREFIX:
-        return (False, None)
-    algo_byte = script[start + _V1_EPILOGUE_ALGO_OFFSET]
-    algo = _V1_ALGO_BYTE_TO_ENUM.get(algo_byte)
+        return None
+    algo = _V1_ALGO_BYTE_TO_ENUM.get(script[start + _V1_EPILOGUE_ALGO_OFFSET])
     if algo is None:
-        return (False, None)
+        return None
     suffix_start = start + _V1_EPILOGUE_ALGO_OFFSET + 1
     if script[suffix_start : suffix_start + len(_V1_EPILOGUE_SUFFIX)] != _V1_EPILOGUE_SUFFIX:
-        return (False, None)
-    return (True, algo)
+        return None
+    return algo
 
 
 @dataclass(frozen=True)
@@ -842,8 +846,8 @@ class DmintState:
         # algo selector byte; a successful fingerprint match is the
         # discriminator that proves "this is a V1 contract" (rather than
         # a script that happened to start with similar pushes).
-        matched, algo = _match_v1_epilogue(script_bytes, pos)
-        if not matched or algo is None:
+        algo = _match_v1_epilogue(script_bytes, pos)
+        if algo is None:
             raise ValidationError(f"DmintState._from_v1_script: code epilogue at pos {pos} does not match V1 template")
 
         return cls(
@@ -1078,6 +1082,19 @@ def build_dmint_mint_tx(
 
     state = contract_utxo.state
 
+    # Reject V1 contracts explicitly. The mint builder rebuilds the output
+    # via ``build_dmint_state_script`` + ``build_dmint_code_script``, both of
+    # which emit V2 covenant code. Spending a V1 contract through this path
+    # would brick it (the recreated UTXO's covenant wouldn't accept the next
+    # mint), and the loss would be irreversible. Until pyrxd ships a V1
+    # contract builder, refuse loudly.
+    if state.is_v1:
+        raise ValidationError(
+            "build_dmint_mint_tx cannot mint V1 contracts; only V2 covenant code is "
+            "currently supported. Spending a V1 contract through this path would "
+            "produce a recreated UTXO whose covenant rejects the next mint, "
+            "irreversibly orphaning the remaining contract pool."
+        )
     if state.is_exhausted:
         raise ValidationError(f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}")
     if len(nonce) != 8:

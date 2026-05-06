@@ -838,6 +838,125 @@ class TestV1DmintParser:
         assert results[0].dmint_state is not None
         assert results[0].dmint_state.is_v1 is True
 
+    def test_v1_blake3_algo_byte_decodes(self):
+        """V1 supports three algo bytes — patch the RBG fixture to BLAKE3
+        (0xee) and confirm the parser picks it up."""
+        from pyrxd.glyph.dmint import DmintAlgo, DmintState
+
+        buf = bytearray(_RBG_DMINT_V1_VOUT_0)
+        # Algo selector lives at script offset 114 (= bd-position 95 + 19).
+        assert buf[114] == 0xAA  # sanity: fixture is SHA256D
+        buf[114] = 0xEE  # OP_BLAKE3
+        state = DmintState.from_script(bytes(buf))
+        assert state.is_v1 is True
+        assert state.algo is DmintAlgo.BLAKE3
+
+    def test_v1_k12_algo_byte_decodes(self):
+        """V1 K12 algo byte (0xef) parses correctly."""
+        from pyrxd.glyph.dmint import DmintAlgo, DmintState
+
+        buf = bytearray(_RBG_DMINT_V1_VOUT_0)
+        buf[114] = 0xEF  # OP_K12
+        state = DmintState.from_script(bytes(buf))
+        assert state.algo is DmintAlgo.K12
+
+    def test_combined_error_message_names_both_versions(self):
+        """When neither V2 nor V1 matches, the error message must surface
+        both attempted-version errors so callers don't have to guess which
+        version they had."""
+        from pyrxd.glyph.dmint import DmintState
+
+        p2pkh = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+        with pytest.raises(ValidationError) as excinfo:
+            DmintState.from_script(p2pkh)
+        msg = str(excinfo.value)
+        assert "V2:" in msg
+        assert "V1:" in msg
+        assert "not a dMint contract" in msg
+
+    def test_v1_guard_in_mint_builder(self):
+        """`build_dmint_mint_tx` must refuse V1 contracts loudly. Spending a
+        V1 contract through the V2 mint builder would brick the contract
+        pool — the guard converts an invisible foot-gun into a clear error."""
+        from pyrxd.glyph.dmint import DmintContractUtxo, DmintState, build_dmint_mint_tx
+
+        v1_state = DmintState.from_script(_RBG_DMINT_V1_VOUT_0)
+        assert v1_state.is_v1 is True
+        utxo = DmintContractUtxo(
+            txid="aa" * 32,
+            vout=0,
+            value=1,
+            script=_RBG_DMINT_V1_VOUT_0,
+            state=v1_state,
+        )
+        with pytest.raises(ValidationError, match="cannot mint V1 contracts"):
+            build_dmint_mint_tx(
+                contract_utxo=utxo,
+                nonce=b"\x00" * 8,
+                miner_pkh=bytes(20),
+                current_time=1_700_000_000,
+            )
+
+
+class TestV1MatchEpilogue:
+    """Direct unit tests for the ``_match_v1_epilogue`` helper.
+
+    The helper is internal but worth pinning directly so the tests don't
+    have to construct a full state-walk to exercise its boundaries.
+    """
+
+    def test_returns_algo_on_match(self):
+        from pyrxd.glyph.dmint import DmintAlgo, _match_v1_epilogue
+
+        # The RBG fixture's epilogue starts at offset 95.
+        algo = _match_v1_epilogue(_RBG_DMINT_V1_VOUT_0, 95)
+        assert algo is DmintAlgo.SHA256D
+
+    def test_returns_none_when_start_at_end(self):
+        from pyrxd.glyph.dmint import _match_v1_epilogue
+
+        assert _match_v1_epilogue(_RBG_DMINT_V1_VOUT_0, len(_RBG_DMINT_V1_VOUT_0)) is None
+
+    def test_returns_none_when_start_just_short(self):
+        """``start`` 1 byte before the real epilogue position must reject —
+        the epilogue prefix won't match at that offset."""
+        from pyrxd.glyph.dmint import _match_v1_epilogue
+
+        assert _match_v1_epilogue(_RBG_DMINT_V1_VOUT_0, 94) is None
+
+    def test_returns_none_when_remaining_bytes_too_short(self):
+        """If fewer than ``_V1_EPILOGUE_LEN`` bytes remain after ``start``,
+        the length guard must fire before any byte comparison."""
+        from pyrxd.glyph.dmint import _match_v1_epilogue
+
+        # Take only the first 100 bytes — not enough for a 145-byte epilogue.
+        truncated = _RBG_DMINT_V1_VOUT_0[:100]
+        assert _match_v1_epilogue(truncated, 0) is None
+
+    def test_returns_none_for_invalid_algo_byte(self):
+        from pyrxd.glyph.dmint import _match_v1_epilogue
+
+        buf = bytearray(_RBG_DMINT_V1_VOUT_0)
+        buf[114] = 0xAB  # not in {0xaa, 0xee, 0xef}
+        assert _match_v1_epilogue(bytes(buf), 95) is None
+
+    def test_returns_none_when_prefix_corrupted(self):
+        """One byte off in the fixed prefix region (offsets 95-113) must reject."""
+        from pyrxd.glyph.dmint import _match_v1_epilogue
+
+        buf = bytearray(_RBG_DMINT_V1_VOUT_0)
+        buf[100] = (buf[100] + 1) & 0xFF  # mid-prefix byte
+        assert _match_v1_epilogue(bytes(buf), 95) is None
+
+    def test_returns_none_when_suffix_corrupted(self):
+        """One byte off in the fixed suffix region must reject."""
+        from pyrxd.glyph.dmint import _match_v1_epilogue
+
+        buf = bytearray(_RBG_DMINT_V1_VOUT_0)
+        # Last byte of the script — well inside the suffix region.
+        buf[-1] = (buf[-1] + 1) & 0xFF
+        assert _match_v1_epilogue(bytes(buf), 95) is None
+
 
 # ---------------------------------------------------------------------------
 # 7. Builder
