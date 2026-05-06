@@ -480,3 +480,278 @@ class TestInspectResolveOutpoint:
         result = runner.invoke(inspect_cmd, [_RBG_CONTRACT, "--resolve"], obj=_make_ctx(client))
         assert result.exit_code != 0
         assert "--resolve is only meaningful for an outpoint" in result.output
+
+
+# ---------------------------------------------------------------------------
+# CBOR string sanitizer — direct unit tests
+# ---------------------------------------------------------------------------
+
+
+from pyrxd.cli.glyph_cmds import _sanitize_display_string
+
+
+class TestSanitizeDisplayString:
+    """Lock the sanitizer's behavior against terminal-injection inputs.
+
+    The sanitizer is the trust boundary between attacker-supplied CBOR and
+    the user's terminal. These tests pin the codepoint categories it strips
+    so a future refactor can't silently regress coverage.
+    """
+
+    def test_plain_ascii_unchanged(self) -> None:
+        assert _sanitize_display_string("hello world") == "hello world"
+
+    def test_ansi_escape_stripped(self) -> None:
+        assert _sanitize_display_string("hi\x1b[31m") == "hi?[31m"
+
+    def test_nul_stripped(self) -> None:
+        assert _sanitize_display_string("a\x00b") == "a?b"
+
+    def test_zwsp_stripped(self) -> None:
+        # U+200B (zero-width space, category Cf).
+        assert _sanitize_display_string("a​b") == "a?b"
+
+    def test_zwj_stripped(self) -> None:
+        # U+200D (zero-width joiner, category Cf).
+        assert _sanitize_display_string("a‍b") == "a?b"
+
+    def test_bidi_override_rlo_stripped(self) -> None:
+        # U+202E — the headline attack: makes "gly‮bar" render
+        # right-to-left from that point and could make a token name
+        # impersonate adjacent fields.
+        assert _sanitize_display_string("gly‮bar") == "gly?bar"
+
+    def test_bidi_isolate_rli_stripped(self) -> None:
+        # U+2067 (RLI), part of the second bidi-override range.
+        assert _sanitize_display_string("a⁧b") == "a?b"
+
+    def test_line_separator_stripped(self) -> None:
+        # U+2028, category Zl.
+        assert _sanitize_display_string("a b") == "a?b"
+
+    def test_paragraph_separator_stripped(self) -> None:
+        # U+2029, category Zp.
+        assert _sanitize_display_string("a b") == "a?b"
+
+    def test_word_joiner_stripped(self) -> None:
+        # U+2060, category Cf.
+        assert _sanitize_display_string("a⁠b") == "a?b"
+
+    def test_variation_selector_stripped(self) -> None:
+        # U+FE0F, category Mn — would emoji-modify the previous char.
+        assert _sanitize_display_string("a️b") == "a?b"
+
+    def test_combining_acute_stripped(self) -> None:
+        # U+0301, category Mn — overlays an acute accent on the prior char.
+        assert _sanitize_display_string("áb") == "a?b"
+
+    def test_bom_stripped(self) -> None:
+        # U+FEFF, category Cf.
+        assert _sanitize_display_string("a﻿b") == "a?b"
+
+    def test_tag_char_stripped(self) -> None:
+        # U+E0001 (language tag), category Cf — used in spoofing attacks.
+        assert _sanitize_display_string("a\U000e0001b") == "a?b"
+
+    def test_plain_space_preserved(self) -> None:
+        # U+0020 is category Zs and must NOT be stripped.
+        assert _sanitize_display_string("hello world") == "hello world"
+
+    def test_precomposed_accent_preserved(self) -> None:
+        # U+00E9 (precomposed é, category Ll) is fine — only combining
+        # forms (Mn/Me) are stripped.
+        assert _sanitize_display_string("café") == "café"
+
+    def test_empty_string(self) -> None:
+        assert _sanitize_display_string("") == ""
+
+    def test_non_string_passthrough(self) -> None:
+        # Defensive — type signature says str but enforce runtime safety.
+        assert _sanitize_display_string(None) is None  # type: ignore[arg-type]
+        assert _sanitize_display_string(b"bytes") == b"bytes"  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Reveal metadata surfacing (fetch path with non-empty inputs)
+# ---------------------------------------------------------------------------
+
+
+from pyrxd.glyph.payload import build_reveal_scriptsig_suffix, encode_payload
+from pyrxd.glyph.types import GlyphMedia, GlyphMetadata, GlyphProtocol
+from pyrxd.transaction.transaction_input import TransactionInput
+
+
+def _build_reveal_input(metadata: GlyphMetadata, *, source_txid: str | None = None) -> TransactionInput:
+    """Build a TransactionInput whose unlocking_script carries reveal CBOR.
+
+    Mirrors the shape ``GlyphInspector._parse_reveal_scriptsig`` walks:
+    ``<sig> <pubkey> <"gly"> <CBOR>``.
+    """
+    cbor_bytes, _ = encode_payload(metadata)
+    suffix = build_reveal_scriptsig_suffix(cbor_bytes)
+    dummy_sig = bytes([0x47]) + bytes(71)
+    dummy_pubkey = bytes([0x21]) + bytes(33)
+    scriptsig = dummy_sig + dummy_pubkey + suffix
+    inp = TransactionInput(
+        source_txid=source_txid or ("aa" * 32),
+        source_output_index=0,
+        unlocking_script=Script(scriptsig),
+    )
+    return inp
+
+
+def _build_tx_with_reveal(metadata: GlyphMetadata, *, plain_inputs_before: int = 0) -> tuple[bytes, str]:
+    """Build a serialized tx with a reveal input at position *plain_inputs_before*."""
+    plain_sig = bytes([0x47]) + bytes(71)
+    plain_pubkey = bytes([0x21]) + bytes(33)
+    plain_scriptsig = plain_sig + plain_pubkey
+
+    inputs: list[TransactionInput] = []
+    for i in range(plain_inputs_before):
+        inputs.append(
+            TransactionInput(
+                source_txid=f"{i:02x}" * 32,
+                source_output_index=0,
+                unlocking_script=Script(plain_scriptsig),
+            )
+        )
+    inputs.append(_build_reveal_input(metadata))
+
+    tx = Transaction(
+        tx_inputs=inputs,
+        tx_outputs=[TransactionOutput(Script(_ft_script()), 1000)],
+    )
+    raw = bytes(tx.serialize())
+    real_txid = hash256(raw)[::-1].hex()
+    return raw, real_txid
+
+
+_FT_REVEAL_METADATA = GlyphMetadata(
+    protocol=[GlyphProtocol.FT],
+    name="TestToken",
+    ticker="TST",
+    description="A test fungible token for inspect coverage.",
+)
+
+
+class TestInspectFetchReveal:
+    def test_metadata_surfaced_from_input_zero(self, runner: CliRunner) -> None:
+        raw, real_txid = _build_tx_with_reveal(_FT_REVEAL_METADATA)
+        client = _mock_client(get_transaction_returns=RawTx(raw))
+        ctx = _make_ctx(client)
+        ctx.output_mode = "json"
+        result = runner.invoke(inspect_cmd, [real_txid, "--fetch"], obj=ctx)
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["metadata"] is not None
+        meta = payload["metadata"]
+        assert meta["input_index"] == 0
+        assert meta["name"] == "TestToken"
+        assert meta["ticker"] == "TST"
+        assert meta["description"] == "A test fungible token for inspect coverage."
+
+    def test_metadata_walked_to_input_two(self, runner: CliRunner) -> None:
+        """find_reveal_metadata walks ALL inputs — metadata at input 2 must be found."""
+        raw, real_txid = _build_tx_with_reveal(_FT_REVEAL_METADATA, plain_inputs_before=2)
+        client = _mock_client(get_transaction_returns=RawTx(raw))
+        ctx = _make_ctx(client)
+        ctx.output_mode = "json"
+        result = runner.invoke(inspect_cmd, [real_txid, "--fetch"], obj=ctx)
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["metadata"] is not None
+        assert payload["metadata"]["input_index"] == 2
+
+    def test_metadata_protocol_elements_sanitized(self, runner: CliRunner) -> None:
+        """Regression for the red-team finding: ``str(list_of_str)`` calls
+        ``repr`` on each element which does NOT escape U+202E. Each protocol
+        element must be sanitized BEFORE landing in the JSON list.
+
+        We can't easily craft a hostile ``protocol`` value through the live
+        ``GlyphMetadata`` validator (it rejects non-int entries), so this test
+        reaches in and patches ``find_reveal_metadata`` to return metadata
+        with a hostile protocol element — ensuring the sanitization layer
+        actually runs on whatever the ``decode_payload`` path produces.
+        """
+        raw, real_txid = _build_tx_with_reveal(_FT_REVEAL_METADATA)
+        client = _mock_client(get_transaction_returns=RawTx(raw))
+        ctx = _make_ctx(client)
+        ctx.output_mode = "json"
+
+        # Patch find_reveal_metadata to inject a hostile protocol value.
+        from unittest.mock import patch
+
+        hostile_meta = GlyphMetadata(
+            protocol=[GlyphProtocol.FT],  # constructor-validated; we'll
+            # mutate attributes via __setattr__ to bypass.
+            name="x",
+        )
+        # Replace the protocol with a list containing a bidi-override string
+        # via dataclass internals (frozen=True so use object.__setattr__).
+        object.__setattr__(hostile_meta, "protocol", ("gly‮bar",))
+
+        with patch(
+            "pyrxd.glyph.inspector.GlyphInspector.find_reveal_metadata",
+            return_value=(0, hostile_meta),
+        ):
+            result = runner.invoke(inspect_cmd, [real_txid, "--fetch"], obj=ctx)
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        # The U+202E must have been replaced by '?'.
+        assert payload["metadata"]["protocol"] == ["gly?bar"]
+        # And it must NOT appear unescaped in the raw output.
+        assert "‮" not in result.output
+
+    def test_metadata_human_protocol_renders_sanitized_list(self, runner: CliRunner) -> None:
+        """The human-mode protocol line should be readable, not raw repr."""
+        raw, real_txid = _build_tx_with_reveal(_FT_REVEAL_METADATA)
+        client = _mock_client(get_transaction_returns=RawTx(raw))
+        result = runner.invoke(inspect_cmd, [real_txid, "--fetch"], obj=_make_ctx(client))
+        assert result.exit_code == 0, result.output
+        # The protocol list contains string-coerced ints (e.g. ['1'] for FT).
+        # Important: there must NEVER be a raw bidi/control codepoint in
+        # the rendered output, regardless of source.
+        assert "protocol:" in result.output
+
+    def test_metadata_with_main_renders_media_tag(self, runner: CliRunner) -> None:
+        """Binary media must render as ``<media: type, N bytes, sha256=...>``,
+        never raw bytes — terminal-injection defense."""
+        from pyrxd.hash import sha256 as _sha256
+
+        meta_with_media = GlyphMetadata(
+            protocol=[GlyphProtocol.NFT],
+            name="MediaNFT",
+            main=GlyphMedia(mime_type="image/png", data=b"\x89PNG\r\n\x1a\n" + bytes(50)),
+        )
+        raw, real_txid = _build_tx_with_reveal(meta_with_media)
+        client = _mock_client(get_transaction_returns=RawTx(raw))
+        ctx = _make_ctx(client)
+        ctx.output_mode = "json"
+        result = runner.invoke(inspect_cmd, [real_txid, "--fetch"], obj=ctx)
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        media_str = payload["metadata"]["main"]
+        assert media_str.startswith("<media: image/png,")
+        assert "sha256=" in media_str
+        # Verify hash matches the real bytes.
+        expected_hash = _sha256(b"\x89PNG\r\n\x1a\n" + bytes(50)).hex()
+        assert expected_hash in media_str
+
+    def test_metadata_main_mime_type_sanitized(self, runner: CliRunner) -> None:
+        """Hostile mime_type with an ANSI escape must not reach the terminal raw."""
+        meta_hostile = GlyphMetadata(
+            protocol=[GlyphProtocol.NFT],
+            name="X",
+            main=GlyphMedia(mime_type="image/png\x1b[31m", data=b"\x00" * 10),
+        )
+        raw, real_txid = _build_tx_with_reveal(meta_hostile)
+        client = _mock_client(get_transaction_returns=RawTx(raw))
+        ctx = _make_ctx(client)
+        ctx.output_mode = "json"
+        result = runner.invoke(inspect_cmd, [real_txid, "--fetch"], obj=ctx)
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        # The ESC byte must have been replaced by '?'.
+        assert "\x1b" not in payload["metadata"]["main"]
+        assert "image/png?[31m" in payload["metadata"]["main"]

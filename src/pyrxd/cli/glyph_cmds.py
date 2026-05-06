@@ -1221,6 +1221,12 @@ _MAX_SCRIPT_HEX_LEN = 20_000
 # --- Network-fetch (--fetch) safety bounds ---------------------------------
 # Radiant policy max for a tx is 4 MB. Anything larger is consensus-invalid
 # and either a buggy server or an attacker probing for a parser-DoS.
+#
+# Note: this is a defence-in-depth check. The websockets library's default
+# per-message ``max_size`` (~1 MiB at the time of writing) typically trips
+# first and surfaces as a NetworkError. We keep the 4 MB cap explicit anyway
+# so the inspect-side limit is documented even if the underlying transport
+# cap is lifted in a future client refactor.
 _MAX_RAW_TX_BYTES = 4_000_000
 # Per-tx structural caps. A real Radiant tx today has a few inputs/outputs;
 # 100k is generous head-room and bounds total classification work.
@@ -1231,29 +1237,47 @@ _MAX_OUTPUT_COUNT = 100_000
 _HUMAN_STRING_CAP = 200
 
 
-# Bidi-override codepoints (U+202A..U+202E, U+2066..U+2069).
-_BIDI_OVERRIDE_CHARS = frozenset(chr(c) for c in (*range(0x202A, 0x202F), *range(0x2066, 0x206A)))
+# Unicode general categories that must NOT reach a terminal: control (Cc),
+# format (Cf — includes BOM, bidi-overrides, ZWJ/ZWNJ, tag chars), unassigned
+# (Cn), private-use (Co), line/paragraph separators (Zl/Zp), and combining
+# marks (Mn/Me — overlay glyphs onto the previous char). This subsumes the
+# explicit bidi-override / BOM allow-list the previous version maintained.
+_UNICODE_STRIP_CATEGORIES = frozenset({"Cc", "Cf", "Cn", "Co", "Zl", "Zp", "Mn", "Me"})
 
 
 def _sanitize_display_string(s: str) -> str:
-    """Strip control + bidi-override codepoints from a string before printing.
+    """Strip control + invisible + combining codepoints from a string before printing.
 
-    Defense against terminal-injection / homoglyph attacks via CBOR-sourced
-    fields (token name, description, ticker, attrs.*, creator.pubkey, etc.).
-    A hostile token deployer could embed ANSI CSI escapes, BOMs, or bidi-
-    override codepoints in their metadata; an inspect of the deploy tx would
-    otherwise pass them straight to the user's terminal.
+    Defense against terminal-injection / homoglyph / bidi-override attacks via
+    CBOR-sourced fields (token name, description, ticker, attrs.*, creator.pubkey,
+    etc.). A hostile token deployer can embed ANSI CSI escapes, zero-width joiners,
+    bidi-override codepoints, tag chars, or combining marks in their metadata; an
+    inspect of the deploy tx would otherwise pass them straight to the user's
+    terminal — the deployer's name could appear to flip directionality, hide
+    chars, or imitate adjacent fields.
 
-    Strips: ASCII control (\\x00..\\x1f, \\x7f), Unicode BOM (\\ufeff),
-    bidi-override codepoints (\\u202a..\\u202e, \\u2066..\\u2069). Replaces
-    each with a literal "?" so the user sees that something was filtered.
+    Strips any character whose Unicode general category is one of:
+
+        Cc — ASCII / C1 control (includes \\x1b ANSI ESC, \\x07 BEL)
+        Cf — format chars (BOM, bidi overrides, ZWJ/ZWNJ, tag chars, …)
+        Cn — unassigned codepoints
+        Co — private-use area
+        Zl, Zp — line / paragraph separators (\\u2028, \\u2029)
+        Mn, Me — combining marks (overlay onto previous char)
+
+    Replaces each stripped char with a literal "?" so the user sees that
+    something was filtered.
+
+    Non-`str` input is returned unchanged (defensive — the type signature
+    forbids it but the type system doesn't enforce that at runtime).
     """
+    import unicodedata
+
     if not isinstance(s, str):
         return s
     out: list[str] = []
     for ch in s:
-        cp = ord(ch)
-        if cp < 0x20 or cp == 0x7F or ch == "﻿" or ch in _BIDI_OVERRIDE_CHARS:
+        if unicodedata.category(ch) in _UNICODE_STRIP_CATEGORIES:
             out.append("?")
         else:
             out.append(ch)
@@ -1554,17 +1578,24 @@ async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vo
             )
 
     # 8. Reveal metadata (input scriptSigs).
+    #
+    # IMPORTANT: every string field surfaced into ``metadata_payload`` MUST
+    # be passed through ``_sanitize_display_string`` first. JSON mode escapes
+    # non-ASCII via ``ensure_ascii=True``, but human mode prints these strings
+    # straight to the terminal where ANSI / bidi-override / zero-width
+    # injection would land. ``protocol`` is a list of CBOR-supplied values
+    # — coerce each to ``str`` and sanitize before display, since
+    # ``str(list_of_strings)`` calls ``repr`` on each element and ``repr``
+    # does NOT escape U+202E and friends.
     inspector = GlyphInspector()
     scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in tx.inputs]
     found = inspector.find_reveal_metadata(scriptsigs)
     metadata_payload: dict | None = None
     if found is not None:
         input_idx, metadata = found
-        # Sanitize every user-controllable string field. JSON mode keeps the
-        # full sanitized value; human-mode rendering further truncates.
         metadata_payload = {
             "input_index": input_idx,
-            "protocol": list(metadata.protocol),
+            "protocol": [_sanitize_display_string(str(p)) for p in metadata.protocol],
             "name": _sanitize_display_string(metadata.name) if metadata.name else "",
             "ticker": _sanitize_display_string(metadata.ticker) if metadata.ticker else "",
             "description": _sanitize_display_string(metadata.description) if metadata.description else "",
