@@ -531,6 +531,119 @@ class TestInspectResolveOutpoint:
 
 
 # ---------------------------------------------------------------------------
+# Real-mainnet regression: an RBG self-transfer captured live
+# ---------------------------------------------------------------------------
+
+# Live mainnet fixture: ac7f1f705086a3a4cb2a354bf778fe2da829a90372742db076f542398cc60ae4
+# This is a real RBG (b45dc4...:0) transfer-shape tx — 2 inputs, 3 outputs:
+#   vout 0  ft  ref=b45dc4...:0  sats=1                (recipient — same wallet)
+#   vout 1  ft  ref=b45dc4...:0  sats=5,749,199        (FT change)
+#   vout 2  p2pkh                 sats=3,982,570,394,984 (RXD change)
+# All three outputs share owner_pkh d84b8c371ea11f051dfed9daae05c8dee24d9eba.
+#
+# This locks the inspect tool against a real transfer-tx shape — distinct
+# from the deploy/reveal txs we already cover. If the FT classifier ever
+# regresses for vouts > 0 in a multi-FT-output tx, this test catches it.
+_RBG_TRANSFER_TXID = "ac7f1f705086a3a4cb2a354bf778fe2da829a90372742db076f542398cc60ae4"
+_RBG_TRANSFER_OWNER_PKH = "d84b8c371ea11f051dfed9daae05c8dee24d9eba"
+_RBG_TRANSFER_RAW_HEX = (
+    "01000000029565e76c9e80570d3f9f38f961bc1719f866de2e81a73797f1da70fc77a8276300"
+    "0000006b483045022100a4635b1d89a79e5e5e2d9613ed1813b1ebdf5333bef0ad5005b743fe"
+    "d834dcff022068bd415a8157b69ca693e0a1dce77f8bb6a6aa929acfc16985c0dae557917280"
+    "4121034f4d886d85dc38da1b2a6f49d299990b57032821edc092109f0d93fd00537720ffffff"
+    "fffd432df44ff9627a0c6adb9c459a9d4e8677e54553d3e9896c2b6d0de03a93ba010000006a"
+    "47304402203faf1061260e218738834f83b05d23390d6ecb57c2c8d150642b6965ce3f719202"
+    "20226f828b994a1c3176fa52ddd6194b72b28d9949017edc782f6868adf704228f4121034f4d"
+    "886d85dc38da1b2a6f49d299990b57032821edc092109f0d93fd00537720ffffffff03010000"
+    "00000000004b76a914d84b8c371ea11f051dfed9daae05c8dee24d9eba88acbdd0a8a296afde"
+    "31eb80c3484f09da7eb31546990baf76fd8bff9a58fbbe53c45db400000000dec0e9aa76e378"
+    "e4a269e69dcfb95700000000004b76a914d84b8c371ea11f051dfed9daae05c8dee24d9eba88"
+    "acbdd0a8a296afde31eb80c3484f09da7eb31546990baf76fd8bff9a58fbbe53c45db4000000"
+    "00dec0e9aa76e378e4a269e69d6895b1439f0300001976a914d84b8c371ea11f051dfed9daae"
+    "05c8dee24d9eba88ac00000000"
+)
+
+
+class TestInspectRealRbgTransfer:
+    """Regression tests against a real RBG self-transfer captured from mainnet.
+
+    These fixtures bind ``pyrxd glyph inspect <txid> --fetch`` to live data.
+    If a future change to the parser, classifier, or render path breaks the
+    output for this real-world tx shape, these tests catch it immediately.
+    """
+
+    def _raw(self) -> bytes:
+        return bytes.fromhex(_RBG_TRANSFER_RAW_HEX)
+
+    def test_classifies_two_ft_outputs_and_p2pkh_change(self, runner: CliRunner) -> None:
+        client = _mock_client(get_transaction_returns=RawTx(self._raw()))
+        ctx = _make_ctx(client)
+        ctx.output_mode = "json"
+        result = runner.invoke(inspect_cmd, [_RBG_TRANSFER_TXID, "--fetch"], obj=ctx)
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["txid"] == _RBG_TRANSFER_TXID
+        assert payload["input_count"] == 2
+        assert payload["output_count"] == 3
+
+        outs = payload["outputs"]
+        # vout 0: 1-photon FT (the "send" output to the same wallet)
+        assert outs[0]["type"] == "ft"
+        assert outs[0]["satoshis"] == 1
+        assert outs[0]["ref_outpoint"] == "b45dc453befb589aff8bfd76af0b994615b37eda094f48c380eb31deaf96a2a8:0"
+        assert outs[0]["owner_pkh"] == _RBG_TRANSFER_OWNER_PKH
+
+        # vout 1: 5,749,199-photon FT change — same ref, same owner.
+        assert outs[1]["type"] == "ft"
+        assert outs[1]["satoshis"] == 5_749_199
+        assert outs[1]["ref_outpoint"] == outs[0]["ref_outpoint"]
+        assert outs[1]["owner_pkh"] == _RBG_TRANSFER_OWNER_PKH
+
+        # vout 2: P2PKH change for the RXD that funded the tx fees.
+        assert outs[2]["type"] == "p2pkh"
+        assert outs[2]["owner_pkh"] == _RBG_TRANSFER_OWNER_PKH
+
+    def test_human_render_lists_both_ft_outputs(self, runner: CliRunner) -> None:
+        client = _mock_client(get_transaction_returns=RawTx(self._raw()))
+        result = runner.invoke(inspect_cmd, [_RBG_TRANSFER_TXID, "--fetch"], obj=_make_ctx(client))
+        assert result.exit_code == 0, result.output
+        # Both FT vouts must appear with the canonical RBG ref.
+        assert "vout   0  type=ft" in result.output
+        assert "vout   1  type=ft" in result.output
+        assert "vout   2  type=p2pkh" in result.output
+        # Same owner pkh on every output (self-transfer).
+        assert result.output.count(_RBG_TRANSFER_OWNER_PKH) >= 3
+
+    def test_resolve_specific_ft_change_output(self, runner: CliRunner) -> None:
+        """`inspect <txid:1> --resolve` must classify only vout 1 (the
+        5.7M-photon FT change) and not the other outputs."""
+        client = _mock_client(get_transaction_returns=RawTx(self._raw()))
+        ctx = _make_ctx(client)
+        ctx.output_mode = "json"
+        result = runner.invoke(
+            inspect_cmd,
+            [f"{_RBG_TRANSFER_TXID}:1", "--resolve"],
+            obj=ctx,
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["output_count"] == 3  # full tx structure surfaces…
+        assert len(payload["outputs"]) == 1  # …but only the named vout is classified
+        assert payload["outputs"][0]["vout"] == 1
+        assert payload["outputs"][0]["type"] == "ft"
+        assert payload["outputs"][0]["satoshis"] == 5_749_199
+
+    def test_txid_roundtrip_holds_for_real_fixture(self, runner: CliRunner) -> None:
+        """Server-honesty check: hash256(raw)[::-1].hex() must equal the
+        requested txid. Locks the threat-model guard against the real bytes."""
+        from pyrxd.hash import hash256
+
+        raw = self._raw()
+        computed_txid = hash256(raw)[::-1].hex()
+        assert computed_txid == _RBG_TRANSFER_TXID
+
+
+# ---------------------------------------------------------------------------
 # CBOR string sanitizer — direct unit tests
 # ---------------------------------------------------------------------------
 
