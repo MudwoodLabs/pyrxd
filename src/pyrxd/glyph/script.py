@@ -126,9 +126,14 @@ def is_commit_ft_script(script_hex: str) -> bool:
 def is_dmint_contract_script(script: bytes) -> bool:
     """Return True if *script* is a dMint contract output script.
 
-    Thin wrapper around :func:`pyrxd.glyph.dmint.DmintState.from_script`. Returns
-    False on any layout mismatch (the parser raises ``ValidationError``); other
-    exception types are real bugs and propagate.
+    Thin wrapper around :func:`pyrxd.glyph.dmint.DmintState.from_script`. The
+    parser today raises ``ValidationError`` on every layout mismatch — every
+    ``struct.unpack`` is preceded by an explicit length check, and
+    ``GlyphRef.from_bytes`` is fed exactly 36 bytes by construction. We
+    additionally catch ``struct.error`` and ``IndexError`` here as
+    defense-in-depth: a future change that drops a length check should not
+    silently break this predicate's "parses or doesn't" contract. Any other
+    exception is a real bug and propagates.
 
     For diagnostic callers that need the parsed state, call
     ``DmintState.from_script`` directly.
@@ -136,11 +141,13 @@ def is_dmint_contract_script(script: bytes) -> bool:
     # Local import — DmintState lives in glyph/dmint.py which itself imports
     # script-construction helpers from this module. Module-level import would
     # close the cycle.
+    import struct
+
     from .dmint import DmintState
 
     try:
         DmintState.from_script(script)
-    except ValidationError:
+    except (ValidationError, struct.error, IndexError):
         return False
     return True
 

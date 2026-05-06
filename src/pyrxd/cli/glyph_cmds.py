@@ -1233,6 +1233,13 @@ def _classify_input(s: str) -> tuple[str, str]:
     A bare 64-hex string is always treated as a txid even though it could
     structurally also be a 32-byte payload-hash push prefix; the txid form
     is the only one users hit in practice from a block explorer.
+
+    Leading/trailing whitespace is stripped here (ergonomics — users paste
+    from explorers and shells often add a newline). This is BEFORE the
+    downstream ``Txid`` newtype's regex check, but ``Txid`` rejects any
+    embedded whitespace so the strip is safe. If a future change loosened
+    ``Txid`` to accept internal whitespace this would silently propagate;
+    keep the validators tight.
     """
     s = s.strip()
     if not s:
@@ -1444,9 +1451,12 @@ def _render_script_human(payload: dict) -> str:
     elif type_ == "mut":
         body.append(f"  ref:          {payload['ref_outpoint']}")
         body.append(f"  payload_hash: {payload['payload_hash']}")
+        body.append("  (payload_hash is an opaque commitment to off-chain CBOR;")
+        body.append("   resolve via the reveal tx — `inspect` cannot resolve it locally)")
     elif type_ in ("commit-nft", "commit-ft"):
         body.append(f"  payload_hash: {payload['payload_hash']}")
         body.append(f"  owner_pkh:    {payload['owner_pkh']}")
+        body.append("  (payload_hash is an opaque commitment to the reveal-tx CBOR)")
     elif type_ == "dmint":
         body.append(f"  contract_ref: {payload['contract_ref_outpoint']}")
         body.append(f"  token_ref:    {payload['token_ref_outpoint']}")
@@ -1475,6 +1485,23 @@ def inspect_cmd(ctx: CliContext, inspect_input: str) -> None:
 
     Read-only — no network access in this release. Pass --json for machine
     output (auto-detects when stdout is piped).
+
+    \b
+    --json response schema (stable; new fields may be added without notice):
+      contract  → {form, txid, vout, outpoint, wire_hex}
+      outpoint  → {form, txid, vout, outpoint, wire_hex}
+      script    → {form, length, hex, type, ...type-specific fields}
+        type=p2pkh        → owner_pkh
+        type=nft / ft     → ref_txid, ref_vout, ref_outpoint, owner_pkh
+        type=mut          → ref_txid, ref_vout, ref_outpoint, payload_hash
+        type=commit-nft / commit-ft → payload_hash, owner_pkh
+        type=dmint        → contract_ref_outpoint, token_ref_outpoint,
+                            height, max_height, reward, algo, daa_mode
+        type=unknown      → (no extra fields)
+
+    All hex values are lowercase. Outpoints render as "txid:vout"
+    (display order). Wire forms (txid reversed + vout LE) appear under
+    ``wire_hex`` for contract/outpoint forms.
     """
     form, value = _classify_input(inspect_input)
 
