@@ -7,6 +7,7 @@ and how Radiant differs from related blockchains.
 :maxdepth: 1
 
 gravity
+radiant-fts-are-on-chain
 ```
 
 ## Available now
@@ -15,6 +16,11 @@ gravity
   Gravity protocol is, what a covenant is, and the difference between
   the mainnet-proven sentinel-artifact path and the experimental
   covenant variants. Read this before integrating `pyrxd.gravity`.
+- **[Radiant FTs are on-chain (not metadata-on-P2PKH)](radiant-fts-are-on-chain.md)** —
+  the most common confusion when porting from Atomicals / Runes / SPL
+  is to assume Radiant FTs are plain UTXOs with off-chain meaning. This
+  page explains the difference and shows the 75-byte FT script layout,
+  the conservation rule, and what wallet code has to filter for.
 
 ## Adjacent reading (not yet promoted to concept docs)
 
