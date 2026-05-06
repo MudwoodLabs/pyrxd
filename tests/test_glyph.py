@@ -473,6 +473,216 @@ class TestGlyphInspector:
         assert results[0].ref.txid == KNOWN_REF.txid
         assert results[0].ref.vout == KNOWN_REF.vout
 
+    def test_find_glyphs_populates_owner_pkh_for_nft(self):
+        nft_script = build_nft_locking_script(KNOWN_HEX20, KNOWN_REF)
+        results = GlyphInspector().find_glyphs(self._make_outputs(nft_script))
+        assert results[0].owner_pkh is not None
+        assert bytes(results[0].owner_pkh) == bytes(KNOWN_HEX20)
+
+    def test_find_glyphs_populates_owner_pkh_for_ft(self):
+        ft_script = build_ft_locking_script(KNOWN_HEX20, KNOWN_REF)
+        results = GlyphInspector().find_glyphs(self._make_outputs(ft_script))
+        assert results[0].owner_pkh is not None
+        assert bytes(results[0].owner_pkh) == bytes(KNOWN_HEX20)
+
+    def test_find_glyphs_classifies_dmint_contract_output(self):
+        from pyrxd.glyph.dmint import DmintDeployParams, build_dmint_contract_script
+
+        contract_ref = GlyphRef(txid="aa" * 32, vout=1)
+        token_ref = GlyphRef(txid="bb" * 32, vout=0)
+        params = DmintDeployParams(
+            contract_ref=contract_ref,
+            token_ref=token_ref,
+            max_height=1000,
+            reward=100,
+            difficulty=10,
+        )
+        script = build_dmint_contract_script(params)
+        results = GlyphInspector().find_glyphs(self._make_outputs(script))
+        assert len(results) == 1
+        assert results[0].glyph_type == "dmint"
+        # `ref` is the contract's own outpoint (the contract UTXO's identity).
+        assert results[0].ref == contract_ref
+        # The token this contract mints lives on the parsed dmint state.
+        assert results[0].dmint_state is not None
+        assert results[0].dmint_state.token_ref == token_ref
+        # No owner_pkh on dmint contracts (they're not P2PKH-locked).
+        assert results[0].owner_pkh is None
+
+    def test_find_glyphs_does_not_misclassify_ft_as_dmint(self):
+        """Regression: an FT lock script must NOT be picked up by the dmint
+        branch — that was the original confusion. is_ft_script wins first."""
+        ft_script = build_ft_locking_script(KNOWN_HEX20, KNOWN_REF)
+        results = GlyphInspector().find_glyphs(self._make_outputs(ft_script))
+        assert len(results) == 1
+        assert results[0].glyph_type == "ft"
+
+    def test_glyph_output_extra_fields_default_none(self):
+        """Existing callers constructing GlyphOutput with the original 5
+        positional args must still work — owner_pkh and dmint_state default."""
+        nft_script = build_nft_locking_script(KNOWN_HEX20, KNOWN_REF)
+        from pyrxd.glyph.inspector import GlyphOutput
+
+        out = GlyphOutput(
+            vout=0,
+            glyph_type="nft",
+            ref=KNOWN_REF,
+            metadata=None,
+            script=nft_script,
+        )
+        assert out.owner_pkh is None
+        assert out.dmint_state is None
+
+    def test_find_reveal_metadata_walks_all_inputs(self):
+        cbor_bytes, _ = encode_payload(NFT_METADATA)
+        suffix = build_reveal_scriptsig_suffix(cbor_bytes)
+        dummy_sig = bytes([0x47]) + bytes(71)
+        dummy_pubkey = bytes([0x21]) + bytes(33)
+        reveal_scriptsig = dummy_sig + dummy_pubkey + suffix
+        plain_scriptsig = dummy_sig + dummy_pubkey
+
+        # Reveal scriptSig at input index 2 — earlier inputs are plain P2PKH.
+        scriptsigs = [plain_scriptsig, plain_scriptsig, reveal_scriptsig]
+        result = GlyphInspector().find_reveal_metadata(scriptsigs)
+        assert result is not None
+        idx, metadata = result
+        assert idx == 2
+        assert metadata.name == NFT_METADATA.name
+
+    def test_find_reveal_metadata_returns_none_when_no_metadata(self):
+        dummy_sig = bytes([0x47]) + bytes(71)
+        dummy_pubkey = bytes([0x21]) + bytes(33)
+        plain = dummy_sig + dummy_pubkey
+        assert GlyphInspector().find_reveal_metadata([plain, plain]) is None
+
+    def test_find_reveal_metadata_returns_first_match(self):
+        cbor_bytes, _ = encode_payload(NFT_METADATA)
+        suffix = build_reveal_scriptsig_suffix(cbor_bytes)
+        dummy_sig = bytes([0x47]) + bytes(71)
+        dummy_pubkey = bytes([0x21]) + bytes(33)
+        reveal = dummy_sig + dummy_pubkey + suffix
+        # Two reveal scriptsigs — first match wins (input 0).
+        result = GlyphInspector().find_reveal_metadata([reveal, reveal])
+        assert result is not None
+        assert result[0] == 0
+
+
+# ---------------------------------------------------------------------------
+# 6b. Commit-script helpers + dmint classifier
+# ---------------------------------------------------------------------------
+
+
+class TestCommitScriptHelpers:
+    PAYLOAD_HASH = bytes(range(32))
+    OWNER_PKH_BYTES = bytes(range(40, 60))
+
+    def test_is_commit_script_accepts_nft_variant(self):
+        from pyrxd.glyph.script import build_commit_locking_script, is_commit_script
+
+        s = build_commit_locking_script(self.PAYLOAD_HASH, Hex20(self.OWNER_PKH_BYTES), is_nft=True)
+        assert is_commit_script(s.hex())
+
+    def test_is_commit_script_accepts_ft_variant(self):
+        from pyrxd.glyph.script import build_commit_locking_script, is_commit_script
+
+        s = build_commit_locking_script(self.PAYLOAD_HASH, Hex20(self.OWNER_PKH_BYTES), is_nft=False)
+        assert is_commit_script(s.hex())
+
+    def test_is_commit_nft_distinguishes_from_ft(self):
+        from pyrxd.glyph.script import (
+            build_commit_locking_script,
+            is_commit_ft_script,
+            is_commit_nft_script,
+        )
+
+        nft = build_commit_locking_script(self.PAYLOAD_HASH, Hex20(self.OWNER_PKH_BYTES), is_nft=True)
+        ft = build_commit_locking_script(self.PAYLOAD_HASH, Hex20(self.OWNER_PKH_BYTES), is_nft=False)
+        assert is_commit_nft_script(nft.hex())
+        assert not is_commit_nft_script(ft.hex())
+        assert is_commit_ft_script(ft.hex())
+        assert not is_commit_ft_script(nft.hex())
+
+    def test_is_commit_script_rejects_p2pkh(self):
+        from pyrxd.glyph.script import is_commit_script
+
+        p2pkh = (b"\x76\xa9\x14" + bytes(20) + b"\x88\xac").hex()
+        assert not is_commit_script(p2pkh)
+
+    def test_extract_payload_hash_round_trips(self):
+        from pyrxd.glyph.script import (
+            build_commit_locking_script,
+            extract_payload_hash_from_commit_script,
+        )
+
+        s = build_commit_locking_script(self.PAYLOAD_HASH, Hex20(self.OWNER_PKH_BYTES), is_nft=True)
+        assert extract_payload_hash_from_commit_script(s) == self.PAYLOAD_HASH
+
+    def test_extract_owner_pkh_round_trips(self):
+        from pyrxd.glyph.script import (
+            build_commit_locking_script,
+            extract_owner_pkh_from_commit_script,
+        )
+
+        s = build_commit_locking_script(self.PAYLOAD_HASH, Hex20(self.OWNER_PKH_BYTES), is_nft=False)
+        assert bytes(extract_owner_pkh_from_commit_script(s)) == self.OWNER_PKH_BYTES
+
+    def test_extract_payload_hash_rejects_non_commit(self):
+        from pyrxd.glyph.script import (
+            build_ft_locking_script,
+            extract_payload_hash_from_commit_script,
+        )
+
+        ft = build_ft_locking_script(KNOWN_HEX20, KNOWN_REF)
+        with pytest.raises(ValidationError, match="Not a valid commit script"):
+            extract_payload_hash_from_commit_script(ft)
+
+
+class TestIsDmintContractScript:
+    def _params(self) -> object:
+        from pyrxd.glyph.dmint import DmintDeployParams
+
+        return DmintDeployParams(
+            contract_ref=GlyphRef(txid="aa" * 32, vout=1),
+            token_ref=GlyphRef(txid="bb" * 32, vout=0),
+            max_height=1000,
+            reward=100,
+            difficulty=10,
+        )
+
+    def test_true_for_built_contract_script(self):
+        from pyrxd.glyph.dmint import build_dmint_contract_script
+        from pyrxd.glyph.script import is_dmint_contract_script
+
+        s = build_dmint_contract_script(self._params())
+        assert is_dmint_contract_script(s) is True
+
+    def test_false_for_p2pkh(self):
+        from pyrxd.glyph.script import is_dmint_contract_script
+
+        p2pkh = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+        assert is_dmint_contract_script(p2pkh) is False
+
+    def test_false_for_ft_lock_script(self):
+        """REGRESSION: the original user bug — an FT lock must NOT be classified
+        as a dmint contract output. They share neither length nor layout, but
+        defensive: confirm explicitly."""
+        from pyrxd.glyph.script import build_ft_locking_script, is_dmint_contract_script
+
+        ft = build_ft_locking_script(KNOWN_HEX20, KNOWN_REF)
+        assert is_dmint_contract_script(ft) is False
+
+    def test_false_for_empty(self):
+        from pyrxd.glyph.script import is_dmint_contract_script
+
+        assert is_dmint_contract_script(b"") is False
+
+    def test_false_for_truncated_dmint_script(self):
+        from pyrxd.glyph.dmint import build_dmint_contract_script
+        from pyrxd.glyph.script import is_dmint_contract_script
+
+        full = build_dmint_contract_script(self._params())
+        assert is_dmint_contract_script(full[:50]) is False
+
 
 # ---------------------------------------------------------------------------
 # 7. Builder
