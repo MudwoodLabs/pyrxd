@@ -108,6 +108,43 @@ def is_ft_script(script_hex: str) -> bool:
     return bool(FT_SCRIPT_RE.fullmatch(script_hex.lower()))
 
 
+def is_commit_script(script_hex: str) -> bool:
+    """Return True if script_hex matches either commit pattern (NFT or FT)."""
+    return bool(COMMIT_SCRIPT_RE.fullmatch(script_hex.lower()))
+
+
+def is_commit_nft_script(script_hex: str) -> bool:
+    """Return True if script_hex matches the NFT-variant commit pattern."""
+    return bool(COMMIT_SCRIPT_NFT_RE.fullmatch(script_hex.lower()))
+
+
+def is_commit_ft_script(script_hex: str) -> bool:
+    """Return True if script_hex matches the FT-variant commit pattern."""
+    return bool(COMMIT_SCRIPT_FT_RE.fullmatch(script_hex.lower()))
+
+
+def is_dmint_contract_script(script: bytes) -> bool:
+    """Return True if *script* is a dMint contract output script.
+
+    Thin wrapper around :func:`pyrxd.glyph.dmint.DmintState.from_script`. Returns
+    False on any layout mismatch (the parser raises ``ValidationError``); other
+    exception types are real bugs and propagate.
+
+    For diagnostic callers that need the parsed state, call
+    ``DmintState.from_script`` directly.
+    """
+    # Local import — DmintState lives in glyph/dmint.py which itself imports
+    # script-construction helpers from this module. Module-level import would
+    # close the cycle.
+    from .dmint import DmintState
+
+    try:
+        DmintState.from_script(script)
+    except ValidationError:
+        return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Extraction helpers
 # ---------------------------------------------------------------------------
@@ -139,6 +176,20 @@ def extract_owner_pkh_from_ft_script(script: bytes) -> Hex20:
     if len(script) != 75 or not FT_SCRIPT_RE.match(script.hex()):
         raise ValidationError("Not a valid FT script")
     return Hex20(script[3:23])
+
+
+def extract_payload_hash_from_commit_script(script: bytes) -> bytes:
+    """Extract 32-byte payload hash from a commit script (NFT or FT variant)."""
+    if len(script) != 75 or not COMMIT_SCRIPT_RE.match(script.hex()):
+        raise ValidationError("Not a valid commit script")
+    return script[2:34]
+
+
+def extract_owner_pkh_from_commit_script(script: bytes) -> Hex20:
+    """Extract 20-byte owner PKH from a commit script (NFT or FT variant)."""
+    if len(script) != 75 or not COMMIT_SCRIPT_RE.match(script.hex()):
+        raise ValidationError("Not a valid commit script")
+    return Hex20(script[53:73])
 
 
 # ---------------------------------------------------------------------------
