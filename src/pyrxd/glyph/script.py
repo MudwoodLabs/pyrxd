@@ -1,3 +1,101 @@
+"""Glyph script construction, classification, and extraction.
+
+Mental model — Radiant FTs are FIRST-CLASS, ON-CHAIN tokens
+==============================================================
+
+A common confusion (especially when LLMs answer questions about it) is to
+treat Radiant FTs as "metadata-on-P2PKH that an off-chain indexer
+interprets" — like Atomicals on Bitcoin, or Runes, or Solana SPL tokens.
+
+**That model is wrong for Radiant.** Radiant FTs are 75-byte locking
+scripts whose token semantics are enforced by consensus (the
+``OP_PUSHINPUTREF`` family of opcodes). The script bytes ARE the token.
+No external indexer is required to know "this UTXO holds N RBG" — the
+ref is encoded in the script and conservation is enforced by the chain.
+
+::
+
+   ┌──────────────────────────────────┬──────────────────────────────────┐
+   │ ❌ NOT how Radiant FTs work      │ ✅ How Radiant FTs ACTUALLY work │
+   │ (Atomicals / Runes / SPL / ord)  │ (Glyph protocol on Radiant)      │
+   ├──────────────────────────────────┼──────────────────────────────────┤
+   │                                  │                                  │
+   │   On-chain:                      │   On-chain:                      │
+   │     plain P2PKH (25 bytes)       │     75-byte FT locking script    │
+   │     76a914<pkh>88ac              │     76a914<pkh>88ac              │
+   │                                  │     bdd0<ref:36>                 │
+   │     ↓ off-chain indexer          │     dec0e9aa76e378e4a269e69d     │
+   │       assigns FT meaning         │                                  │
+   │   Off-chain database:            │   No external indexer needed:    │
+   │     "this UTXO holds 100 FOO"    │     consensus enforces FT rules  │
+   │                                  │     directly on the script bytes.│
+   │                                  │                                  │
+   │   Indexer disagreement / loss    │   No indexer. The token IS the   │
+   │   = the token "vanishes."        │   script bytes.                  │
+   └──────────────────────────────────┴──────────────────────────────────┘
+
+The 75-byte FT layout in detail
+-------------------------------
+
+::
+
+      ┌─ standard P2PKH (25 B) ─┐  ┌─ ref ──┐  ┌── FT-CSH epilogue (12 B) ─┐
+      │                         │  │        │  │                            │
+      76 a9 14 <pkh:20> 88 ac    bd d0 <ref:36>   de c0 e9 aa 76 e3 78 e4 a2 69 e6 9d
+      ▲                         ▲       ▲             ▲
+      OP_DUP                    │       │             │
+      OP_HASH160                │       │             │
+      PUSH(20) <pkh>            │       │             │
+      OP_EQUALVERIFY            │       │             │
+      OP_CHECKSIG               │       │             │
+                                │       │             │
+                                │       │             Hashed by the dMint contract
+                                │       │             to enforce conservation:
+                                │       │             sum(input ft) == sum(output ft)
+                                │       │
+                                │       OP_PUSHINPUTREF <36-byte wire ref>
+                                │       ─ wire ref = txid_LE_reversed + vout_LE
+                                │
+                                OP_STATESEPARATOR
+
+Conservation rule
+-----------------
+
+Every ``OP_PUSHINPUTREF`` (``0xd0``) ref appearing in any OUTPUT script
+must also appear in some INPUT being spent::
+
+      INPUTS                         OUTPUTS
+      ──────                         ───────
+      [FT lock with ref=R]   ──→     [FT lock with ref=R]   ✓ ref R survives
+                                     [FT lock with ref=R]   ✓ R can split
+
+      [P2PKH only]           ──→     [FT lock with ref=R]   ✗ REJECTED
+                                                              R never came from input
+
+The Radiant node enforces this with the consensus error
+``bad-txns-inputs-outputs-invalid-transaction-reference-operations``.
+Refs cannot be conjured from thin air — only carried forward.
+
+Wallets at a single address can hold mixed UTXO shapes
+------------------------------------------------------
+
+A typical wallet address holds **both** plain P2PKH UTXOs (regular RXD
+for fees) and FT lock UTXOs (token balances). They are different shapes
+at the same address::
+
+   Address ──┬── UTXO 1: P2PKH 25 bytes,   sats=39825 RXD     (RXD for fees)
+             ├── UTXO 2: FT 75 bytes,       sats=5_749_199    (RBG balance)
+             ├── UTXO 3: P2PKH 25 bytes,    sats=1            (RXD dust)
+             └── UTXO 4: FT 75 bytes (different ref), sats=100 (a different token)
+
+When transferring an FT, code must filter to only FT-shaped UTXOs whose
+embedded ref matches the target token. Skipping the ``is_ft_script(...)``
+filter and feeding a P2PKH UTXO into ``FtUtxoSet`` produces a tx that
+violates the conservation rule and is rejected by the network.
+
+See ``examples/ft_transfer_demo.py`` for the canonical filter pattern.
+"""
+
 from __future__ import annotations
 
 import hashlib
