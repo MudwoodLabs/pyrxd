@@ -36,7 +36,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install Poetry
-        run: pip install poetry
+        # See ci.yml for why we pin the version (Scorecard PinnedDependenciesID).
+        # Keep this version in sync with ci.yml so build matches test.
+        run: pip install poetry==2.3.4
       - name: Verify version matches release tag
         # Reject the publish if pyproject.toml's version doesn't match
         # the tag the release was created from. This catches the
