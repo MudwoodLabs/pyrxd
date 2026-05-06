@@ -71,25 +71,30 @@ class TestPureMatchesHashlib:
     one-sided (pure ⊆ hashlib agreement) is intentional.
     """
 
+    @staticmethod
+    def _hashlib_or_skip(payload: bytes) -> bytes:
+        """Compute ``hashlib.new("ripemd160", payload).digest()`` or skip
+        the test entirely if OpenSSL on this host has the legacy provider
+        disabled. Centralising the skip logic here also keeps each test
+        body free of half-initialised locals."""
+        try:
+            return hashlib.new("ripemd160", payload).digest()
+        except ValueError:
+            pytest.skip("OpenSSL on this host does not expose ripemd160")
+
     @pytest.mark.parametrize("size", [0, 1, 31, 32, 55, 56, 63, 64, 65, 119, 127, 128, 1023, 1024])
     def test_random_input_at_block_boundaries(self, size):
-        try:
-            expected = hashlib.new("ripemd160", b"x" * size).digest()
-        except ValueError:
-            pytest.skip("OpenSSL on this host does not expose ripemd160")
-        assert _ripemd160_pure_python(b"x" * size) == expected
+        payload = b"x" * size
+        expected = self._hashlib_or_skip(payload)
+        assert _ripemd160_pure_python(payload) == expected
 
     def test_random_payloads(self):
-        try:
-            hashlib.new("ripemd160", b"")
-        except ValueError:
-            pytest.skip("OpenSSL on this host does not expose ripemd160")
         # 32 random samples across varied sizes — cheap, broad coverage.
         rng = os.urandom
         for _ in range(32):
             n = int.from_bytes(rng(2), "big") % 4097  # 0..4096
             payload = rng(n)
-            expected = hashlib.new("ripemd160", payload).digest()
+            expected = self._hashlib_or_skip(payload)
             assert _ripemd160_pure_python(payload) == expected, f"diverged at n={n}"
 
 
