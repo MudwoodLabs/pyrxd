@@ -1472,6 +1472,7 @@ def _inspect_script(script_hex: str) -> dict:
     return {
         **base,
         "type": "dmint",
+        "version": "v1" if state.is_v1 else "v2",
         "contract_ref_outpoint": f"{state.contract_ref.txid}:{state.contract_ref.vout}",
         "token_ref_outpoint": f"{state.token_ref.txid}:{state.token_ref.vout}",
         "height": state.height,
@@ -1728,10 +1729,15 @@ def _render_script_human(payload: dict) -> str:
         body.append(f"  owner_pkh:    {payload['owner_pkh']}")
         body.append("  (payload_hash is an opaque commitment to the reveal-tx CBOR)")
     elif type_ == "dmint":
+        version = payload.get("version", "?")
+        body.append(f"  version:      dMint {version}")
         body.append(f"  contract_ref: {payload['contract_ref_outpoint']}")
         body.append(f"  token_ref:    {payload['token_ref_outpoint']}")
         body.append(f"  height:       {payload['height']} / {payload['max_height']}")
-        body.append(f"  reward:       {payload['reward']} photons")
+        body.append(f"  reward:       {payload['reward']} photons/mint")
+        # Total minted supply if all mints succeed.
+        total = payload["max_height"] * payload["reward"]
+        body.append(f"  total supply: {total:,} photons")
         body.append(f"  algo:         {payload['algo']}")
         body.append(f"  daa_mode:     {payload['daa_mode']}")
     elif type_ == "unknown":
@@ -1779,8 +1785,9 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool)
         type=nft / ft     → ref_txid, ref_vout, ref_outpoint, owner_pkh
         type=mut          → ref_txid, ref_vout, ref_outpoint, payload_hash
         type=commit-nft / commit-ft → payload_hash, owner_pkh
-        type=dmint        → contract_ref_outpoint, token_ref_outpoint,
-                            height, max_height, reward, algo, daa_mode
+        type=dmint        → version (v1|v2), contract_ref_outpoint,
+                            token_ref_outpoint, height, max_height, reward,
+                            algo, daa_mode
         type=unknown      → (no extra fields)
       txid (--fetch)   → {form, txid, byte_length, input_count, output_count,
                           outputs[], metadata}
