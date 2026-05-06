@@ -1483,64 +1483,64 @@ def _inspect_script(script_hex: str) -> dict:
     }
 
 
-async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None) -> dict:
-    """Fetch *txid_hex* via *client* and classify every output (and reveal CBOR).
+def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None) -> dict:
+    """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
-    Threat-model guards (deferred from PR-B's prospective review):
+    This is the synchronous, network-free core extracted from
+    ``_inspect_txid_inner``. The browser-hosted inspect tool calls this
+    directly after performing its own WebSocket fetch in JS land, where
+    spinning up an ``ElectrumXClient`` under Pyodide is impractical.
 
-    * Validate ``txid_hex`` via the ``Txid`` newtype before any network call.
-    * After fetch, verify ``hash256(raw)[::-1].hex() == txid_hex`` so a hostile
-      server cannot return some *other* tx.
-    * Refuse responses larger than ``_MAX_RAW_TX_BYTES`` (Radiant policy max).
-    * Refuse parsed txs with more than ``_MAX_OUTPUT_COUNT`` / ``_MAX_INPUT_COUNT``
-      entries — bounds total classification work.
+    Threat-model guards mirror the async wrapper exactly:
+
+    * Validate ``txid_hex`` via the ``Txid`` newtype.
+    * Refuse ``raw`` larger than ``_MAX_RAW_TX_BYTES`` (Radiant policy max).
+    * Server-honesty check: ``hash256(raw)[::-1].hex() == txid_hex`` so a
+      hostile source can't return some *other* tx.
+    * Refuse parsed txs with more than ``_MAX_OUTPUT_COUNT`` /
+      ``_MAX_INPUT_COUNT`` entries — bounds total classification work.
     * Wrap per-output classification in try/except so one malformed script
       cannot abort the listing.
-    * Use ``GlyphInspector.find_reveal_metadata`` (already swallows exceptions
-      around ``decode_payload``) for input metadata extraction.
+    * Use ``GlyphInspector.find_reveal_metadata`` (already swallows
+      exceptions around ``decode_payload``) for input metadata extraction.
+    * Sanitize every CBOR-derived display string before it leaves this
+      function.
 
+    :param raw: pre-fetched raw transaction bytes (NOT hex).
     :param only_vout: if not None, restrict the outputs list to a single
         vout — used by the ``--resolve`` outpoint flow.
     """
     from ..glyph.inspector import GlyphInspector
     from ..hash import hash256
 
-    # 1. Validate locally before any network call.
     try:
         txid = Txid(txid_hex.lower())
     except ValidationError as exc:
         raise UserError("invalid txid", cause=str(exc)) from exc
 
-    # 2. Network fetch (NetworkError → caller wraps as NetworkBoundaryError).
-    raw = await client.get_transaction(txid)
-
-    # 3. Size cap.
     if len(raw) > _MAX_RAW_TX_BYTES:
         raise UserError(
             "transaction is larger than the policy max",
-            cause=f"server returned {len(raw)} bytes; policy max is {_MAX_RAW_TX_BYTES}",
+            cause=f"got {len(raw)} bytes; policy max is {_MAX_RAW_TX_BYTES}",
             fix="confirm the txid; a tx this large is consensus-invalid",
         )
 
-    # 4. Server-honesty check: the bytes must hash to the txid we asked for.
     computed = hash256(bytes(raw))[::-1].hex()
     if computed != str(txid):
         raise UserError(
-            "server returned a transaction whose hash does not match the requested txid",
+            "raw bytes hash does not match the requested txid",
             cause=f"requested {txid}, got {computed}",
-            fix="try a different ElectrumX server (--electrumx URL)",
+            fix="the source returned the wrong tx; try a different ElectrumX server",
         )
 
-    # 5. Parse.
     tx = Transaction.from_hex(bytes(raw))
     if tx is None:
         raise UserError(
             "could not parse the raw transaction bytes",
             cause="Transaction.from_hex returned None",
-            fix="the server response is malformed; try another ElectrumX server",
+            fix="the response is malformed; try another source",
         )
 
-    # 6. Structural caps.
     if len(tx.inputs) > _MAX_INPUT_COUNT or len(tx.outputs) > _MAX_OUTPUT_COUNT:
         raise UserError(
             "transaction structure exceeds inspect's safety caps",
@@ -1548,8 +1548,6 @@ async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vo
             fix=f"caps are {_MAX_INPUT_COUNT}/{_MAX_OUTPUT_COUNT} — re-run on a saner tx",
         )
 
-    # 7. Classify each output. Per-row try/except so one bad script doesn't
-    # poison the whole listing.
     output_rows: list[dict] = []
     enumerated = list(enumerate(tx.outputs))
     if only_vout is not None:
@@ -1578,8 +1576,6 @@ async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vo
                 }
             )
 
-    # 8. Reveal metadata (input scriptSigs).
-    #
     # IMPORTANT: every string field surfaced into ``metadata_payload`` MUST
     # be passed through ``_sanitize_display_string`` first. JSON mode escapes
     # non-ASCII via ``ensure_ascii=True``, but human mode prints these strings
@@ -1620,6 +1616,29 @@ async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vo
         "outputs": output_rows,
         "metadata": metadata_payload,
     }
+
+
+async def _inspect_txid_inner(client: ElectrumXClient, txid_hex: str, *, only_vout: int | None = None) -> dict:
+    """Fetch *txid_hex* via *client* and classify every output.
+
+    Thin async wrapper around :func:`_classify_raw_tx`. The split is so
+    the browser-hosted inspect tool can fetch raw bytes via its own
+    WebSocket and feed them directly into the synchronous classifier
+    without setting up an event loop or an ``ElectrumXClient`` under
+    Pyodide.
+
+    :param only_vout: if not None, restrict the outputs list to a single
+        vout — used by the ``--resolve`` outpoint flow.
+    """
+    # Validate the txid locally before any network call so a malformed
+    # input never reaches the server.
+    try:
+        txid = Txid(txid_hex.lower())
+    except ValidationError as exc:
+        raise UserError("invalid txid", cause=str(exc)) from exc
+
+    raw = await client.get_transaction(txid)
+    return _classify_raw_tx(str(txid), bytes(raw), only_vout=only_vout)
 
 
 def _render_txid_human(payload: dict) -> str:
