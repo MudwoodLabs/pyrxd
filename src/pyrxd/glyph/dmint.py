@@ -545,9 +545,76 @@ def _decode_script_le_int(raw: bytes) -> int:
     return result
 
 
+# --- V1 dMint contract fingerprinting -------------------------------------
+#
+# V1 is the only variant deployed on Radiant mainnet today. Its 145-byte code
+# epilogue (starting at OP_STATESEPARATOR / 0xbd) is byte-identical across
+# all V1 deployments EXCEPT for one byte: the algo selector at offset 19
+# inside the epilogue (script-relative byte ~115, depending on state size).
+# That byte is one of:
+#   0xaa = OP_HASH256   → SHA256D
+#   0xee = OP_BLAKE3    → BLAKE3
+#   0xef = OP_K12       → K12
+# We fingerprint the epilogue with that one byte wildcarded.
+# Sources: docs/dmint-research-mainnet.md §2.2 (byte-by-byte decode of a
+# real mainnet V1 contract), §3 ("Common template" block, offsets 79+).
+
+_V1_EPILOGUE_PREFIX = bytes.fromhex("bd5175c0c855797ea8597959797ea87e5a7a7e")
+_V1_EPILOGUE_ALGO_OFFSET = 19  # offset INSIDE the epilogue (where the algo byte lives)
+_V1_EPILOGUE_SUFFIX = bytes.fromhex(
+    "bc01147f77587f040000000088"  # post-algo header through "load 4-byte zero, OP_EQUALVERIFY"
+    "817600a269a269"
+    "577ae500a069567ae600a069"
+    "01d053797e0cdec0e9aa76e378e4a269e69d7eaa"  # FT-CSH builder + canonical fingerprint
+    "76e47b9d"
+    "547a818b"
+    "76537a9c537ade789181547ae6939d"
+    "635279cd01d853797e016a7e88"
+    "67"
+    "78de519d547854807ec0eb557f777e"
+    "5379ec78885379eac0e9885379cc519d"
+    "7568"
+    "6d7551"
+)
+_V1_EPILOGUE_LEN = len(_V1_EPILOGUE_PREFIX) + 1 + len(_V1_EPILOGUE_SUFFIX)
+_V1_ALGO_BYTE_TO_ENUM: dict[int, DmintAlgo] = {
+    0xAA: DmintAlgo.SHA256D,
+    0xEE: DmintAlgo.BLAKE3,
+    0xEF: DmintAlgo.K12,
+}
+
+
+def _match_v1_epilogue(script: bytes, start: int) -> DmintAlgo | None:
+    """Return the algo enum if a V1 epilogue starts at *start*, else ``None``.
+
+    Returning ``None`` means "not a V1 epilogue at this position." Callers
+    do not need to distinguish *which* check failed (length / prefix / algo
+    byte / suffix) — only "is this a V1 contract or not."
+    """
+    if start + _V1_EPILOGUE_LEN > len(script):
+        return None
+    if script[start : start + len(_V1_EPILOGUE_PREFIX)] != _V1_EPILOGUE_PREFIX:
+        return None
+    algo = _V1_ALGO_BYTE_TO_ENUM.get(script[start + _V1_EPILOGUE_ALGO_OFFSET])
+    if algo is None:
+        return None
+    suffix_start = start + _V1_EPILOGUE_ALGO_OFFSET + 1
+    if script[suffix_start : suffix_start + len(_V1_EPILOGUE_SUFFIX)] != _V1_EPILOGUE_SUFFIX:
+        return None
+    return algo
+
+
 @dataclass(frozen=True)
 class DmintState:
-    """Parsed V2 dMint contract state (from on-chain UTXO script)."""
+    """Parsed dMint contract state (from on-chain UTXO script).
+
+    Supports both V1 (the current Radiant mainnet format) and V2 (Photonic
+    Wallet's HEAD spec, not yet seen on mainnet). V1 has 6 state items;
+    V2 has 10. ``is_v1`` is True iff this state was parsed from V1 layout
+    — in which case ``target_time`` and ``last_time`` are not meaningful
+    on-chain values and are set to 0; ``daa_mode`` is always ``FIXED`` for
+    V1 (the V1 contract template has no DAA bytecode).
+    """
 
     height: int
     contract_ref: GlyphRef
@@ -559,6 +626,7 @@ class DmintState:
     target_time: int
     last_time: int
     target: int
+    is_v1: bool = False
 
     @property
     def is_exhausted(self) -> bool:
@@ -567,6 +635,31 @@ class DmintState:
     @classmethod
     def from_script(cls, script_bytes: bytes) -> DmintState:
         """Parse a dMint contract UTXO script into a ``DmintState``.
+
+        Tries V2 layout first (10 state items), falls back to V1 (6 items
+        + fingerprinted code epilogue). Raises ``ValidationError`` if the
+        script matches neither.
+
+        :param script_bytes: Raw script bytes from a dMint contract UTXO output.
+        :raises ValidationError: Script is malformed or matches neither V1
+            nor V2 layout.
+        """
+        # Try V2 first. If V2 raises, try V1; if V1 also raises, surface a
+        # combined error that names both attempts so callers don't have to
+        # guess which version they had.
+        try:
+            return cls._from_v2_script(script_bytes)
+        except ValidationError as v2_exc:
+            try:
+                return cls._from_v1_script(script_bytes)
+            except ValidationError as v1_exc:
+                raise ValidationError(
+                    f"DmintState.from_script: not a dMint contract (V2: {v2_exc}; V1: {v1_exc})"
+                ) from None
+
+    @classmethod
+    def _from_v2_script(cls, script_bytes: bytes) -> DmintState:
+        """Parse a V2 dMint contract (10 state items + ``bd``).
 
         Walks the 10 state pushes in declared order, then verifies that the
         next byte is ``OP_STATESEPARATOR`` (0xbd). Closes ultrareview
@@ -592,10 +685,6 @@ class DmintState:
           [9] target      — ``_push_minimal`` (may be large for 256-bit algos)
           —— OP_STATESEPARATOR (0xbd) ——
           (code section follows; not parsed here)
-
-        :param script_bytes: Raw script bytes from a dMint contract UTXO output.
-        :raises ValidationError: Script is malformed, too short, or missing
-            ``OP_STATESEPARATOR`` at the end of the 10-item state.
         """
         # Walk the full script — do NOT pre-slice on the first 0xbd. The
         # parser consumes exactly the bytes belonging to each push, so by
@@ -686,6 +775,93 @@ class DmintState:
             target_time=target_time,
             last_time=last_time,
             target=target,
+            is_v1=False,
+        )
+
+    @classmethod
+    def _from_v1_script(cls, script_bytes: bytes) -> DmintState:
+        """Parse a V1 dMint contract (the current mainnet format).
+
+        V1 has 6 state items plus a 145-byte fixed code epilogue (varying
+        only in the algo selector byte). Layout:
+
+          [0] height       — ``_push_4bytes_le`` (opcode 0x04 + 4 bytes LE)
+          [1] contractRef  — ``0xd8`` + 36-byte wire ref
+          [2] tokenRef     — ``0xd0`` + 36-byte wire ref
+          [3] maxHeight    — ``_push_minimal``
+          [4] reward       — ``_push_minimal``
+          [5] target       — full 8-byte push (``0x08`` + 8 LE bytes)
+          —— OP_STATESEPARATOR (0xbd) + 144-byte fixed code epilogue ——
+
+        ``daa_mode`` is always ``FIXED`` for V1 (V1 has no DAA bytecode).
+        ``target_time`` and ``last_time`` are V2-only and set to 0; the
+        ``is_v1`` flag is True so callers can ignore those fields.
+        """
+        pos = 0
+
+        # --- Item 0: height
+        if pos >= len(script_bytes) or script_bytes[pos] != 0x04:
+            raise ValidationError(
+                f"DmintState._from_v1_script: expected 0x04 (push-4) at pos {pos}, "
+                f"got 0x{(script_bytes[pos] if pos < len(script_bytes) else 0):02x}"
+            )
+        if pos + 5 > len(script_bytes):
+            raise ValidationError("DmintState._from_v1_script: script truncated inside height")
+        height = struct.unpack("<I", script_bytes[pos + 1 : pos + 5])[0]
+        pos += 5
+
+        # --- Item 1: contractRef
+        if pos >= len(script_bytes) or script_bytes[pos] != 0xD8:
+            raise ValidationError(f"DmintState._from_v1_script: expected 0xd8 at pos {pos}")
+        pos += 1
+        if pos + 36 > len(script_bytes):
+            raise ValidationError("DmintState._from_v1_script: script truncated inside contractRef")
+        contract_ref = GlyphRef.from_bytes(script_bytes[pos : pos + 36])
+        pos += 36
+
+        # --- Item 2: tokenRef
+        if pos >= len(script_bytes) or script_bytes[pos] != 0xD0:
+            raise ValidationError(f"DmintState._from_v1_script: expected 0xd0 at pos {pos}")
+        pos += 1
+        if pos + 36 > len(script_bytes):
+            raise ValidationError("DmintState._from_v1_script: script truncated inside tokenRef")
+        token_ref = GlyphRef.from_bytes(script_bytes[pos : pos + 36])
+        pos += 36
+
+        # --- Items 3-4: maxHeight and reward (variable-length pushes)
+        max_height, pos = _parse_script_int(script_bytes, pos)
+        reward, pos = _parse_script_int(script_bytes, pos)
+
+        # --- Item 5: target (V1 always uses an 8-byte push; never the
+        #     algoId/daaMode pushes V2 has).
+        if pos >= len(script_bytes) or script_bytes[pos] != 0x08:
+            raise ValidationError(f"DmintState._from_v1_script: expected 0x08 (push-8) for target at pos {pos}")
+        if pos + 9 > len(script_bytes):
+            raise ValidationError("DmintState._from_v1_script: script truncated inside target")
+        target = int.from_bytes(script_bytes[pos + 1 : pos + 9], "little")
+        pos += 9
+
+        # --- After 6 state items, fingerprint the V1 code epilogue. The
+        # epilogue is byte-identical across V1 deployments except for one
+        # algo selector byte; a successful fingerprint match is the
+        # discriminator that proves "this is a V1 contract" (rather than
+        # a script that happened to start with similar pushes).
+        algo = _match_v1_epilogue(script_bytes, pos)
+        if algo is None:
+            raise ValidationError(f"DmintState._from_v1_script: code epilogue at pos {pos} does not match V1 template")
+
+        return cls(
+            height=height,
+            contract_ref=contract_ref,
+            token_ref=token_ref,
+            max_height=max_height,
+            reward=reward,
+            algo=algo,
+            daa_mode=DaaMode.FIXED,  # V1 contracts have no DAA bytecode
+            target_time=0,  # not encoded in V1
+            last_time=0,  # not encoded in V1
+            target=target,
+            is_v1=True,
         )
 
 
@@ -906,6 +1082,19 @@ def build_dmint_mint_tx(
 
     state = contract_utxo.state
 
+    # Reject V1 contracts explicitly. The mint builder rebuilds the output
+    # via ``build_dmint_state_script`` + ``build_dmint_code_script``, both of
+    # which emit V2 covenant code. Spending a V1 contract through this path
+    # would brick it (the recreated UTXO's covenant wouldn't accept the next
+    # mint), and the loss would be irreversible. Until pyrxd ships a V1
+    # contract builder, refuse loudly.
+    if state.is_v1:
+        raise ValidationError(
+            "build_dmint_mint_tx cannot mint V1 contracts; only V2 covenant code is "
+            "currently supported. Spending a V1 contract through this path would "
+            "produce a recreated UTXO whose covenant rejects the next mint, "
+            "irreversibly orphaning the remaining contract pool."
+        )
     if state.is_exhausted:
         raise ValidationError(f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}")
     if len(nonce) != 8:
