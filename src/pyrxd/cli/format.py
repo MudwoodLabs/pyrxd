@@ -52,7 +52,11 @@ def emit(
         simple ``key: value`` per line over *payload*.
     """
     if mode == "json":
-        return _json.dumps(payload, separators=(",", ": "), indent=2)
+        # ensure_ascii=True (Python default, made explicit) so non-ASCII bytes
+        # in any string field are \u-escaped — defense against terminal-control
+        # / bidi-override injection through a CBOR-sourced field surfaced by a
+        # future inspect path. Don't flip this without rerunning the threat model.
+        return _json.dumps(payload, ensure_ascii=True, separators=(",", ": "), indent=2)
     if mode == "quiet":
         if quiet_field is None:
             # Caller didn't pick a field; default to printing nothing.
@@ -78,7 +82,8 @@ def emit_table(
     Quiet mode prints one *quiet_field* value per line.
     """
     if mode == "json":
-        return _json.dumps(rows, separators=(",", ": "), indent=2)
+        # See note on emit() above — ensure_ascii=True is explicit defense.
+        return _json.dumps(rows, ensure_ascii=True, separators=(",", ": "), indent=2)
     if mode == "quiet":
         if quiet_field is None:
             return ""
