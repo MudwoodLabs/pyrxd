@@ -47,38 +47,91 @@ jobs:
           pip install -r docs/requirements.txt
           pip install -e .
 
-      - name: Build pyrxd wheel for the inspect page
-        # The browser-hosted inspect page (docs/inspect/) loads pyrxd at
-        # runtime from a wheel served alongside the page. This step builds
-        # that wheel from the same commit Sphinx is rendering, so the
-        # version the page imports always matches the docs the user is
-        # reading. The wheel + a small manifest.json (filename + git SHA)
-        # are placed into docs/inspect_static/inspect/wheels/, which sphinx-build then
-        # ships verbatim via html_extra_path.
-        # Tested smoke-load happens in tests/web/test_facade_smoke.py
-        # before this step in CI.
+      - name: Build + vendor wheels for the inspect page
+        # The browser-hosted inspect page (docs/inspect/) loads pyrxd
+        # at runtime from a wheel served alongside the page, plus
+        # cbor2 (the only runtime dep the inspect path actually
+        # needs). Both wheels are SHA-256 pinned via manifest.json
+        # and verified in JS before installation — see
+        # docs/inspect_static/inspect/inspect.js.
+        #
+        # cbor2 is vendored from PyPI at this fixed version (5.4.6 —
+        # the last release with a pure-Python wheel; later versions
+        # are C-only and not micropip-installable under WASM). The
+        # SHA-256 here is the upstream PyPI hash for that file. Bump
+        # only deliberately and update the SHA at the same time.
+        #
+        # The wheels + manifest.json are placed into
+        # docs/inspect_static/inspect/wheels/, which sphinx-build
+        # ships verbatim via html_extra_path. Tested smoke-load
+        # happens in tests/web/test_facade_smoke.py before this step
+        # in CI.
         run: |
+          set -euo pipefail
           mkdir -p docs/inspect_static/inspect/wheels
-          pip wheel --wheel-dir docs/inspect_static/inspect/wheels --no-deps .
-          # Find the just-built wheel filename. There's exactly one because
-          # --no-deps was specified. The manifest tells the page which file
-          # to micropip.install at runtime.
-          wheel=$(ls docs/inspect_static/inspect/wheels/pyrxd-*.whl | head -1)
+          cd docs/inspect_static/inspect/wheels
+
+          # 1. Build the pyrxd wheel from the current source.
+          pip wheel --wheel-dir . --no-deps ../../../..
+          wheel=$(ls pyrxd-*.whl | head -1)
           if [ -z "$wheel" ]; then
             echo "::error::pip wheel produced no pyrxd wheel"
             exit 1
           fi
+
+          # 2. Vendor the cbor2 wheel from PyPI. Pin the upstream
+          #    SHA-256 here and verify; if PyPI ever serves different
+          #    bytes (compromise, yank-and-reupload), this step fails
+          #    closed before the wrong wheel reaches the deploy.
+          cbor2_url="https://files.pythonhosted.org/packages/d5/e1/af78b099196feaab7c0252108abc4f5cfd36d255ac47c4b4a695ff838bf9/cbor2-5.4.6-py3-none-any.whl"
+          cbor2_expected_sha="181ac494091d1f9c5bb373cd85514ce1eb967a8cf3ec298e8dfa8878aa823956"
+          curl -sSL -o cbor2-5.4.6-py3-none-any.whl "$cbor2_url"
+          cbor2_actual_sha=$(sha256sum cbor2-5.4.6-py3-none-any.whl | awk '{print $1}')
+          if [ "$cbor2_actual_sha" != "$cbor2_expected_sha" ]; then
+            echo "::error::cbor2 wheel SHA-256 mismatch: expected $cbor2_expected_sha, got $cbor2_actual_sha"
+            exit 1
+          fi
+
+          # 3. Compute SHA-256 of every artifact the page will fetch
+          #    + verify, and write the manifest. The page-side JS
+          #    refuses to install anything whose SHA doesn't match.
+          #
+          # The manifest is assembled via Python's ``json.dumps`` (not
+          # a shell heredoc) so any unexpected character in ``$wheel``
+          # — should ``pip wheel`` ever produce a filename with an
+          # embedded quote or backslash — is escaped properly rather
+          # than slipping into the JSON as a parser confusion. Audit
+          # finding NEW-3. The Python source lives in a tempfile so
+          # YAML doesn't try to parse the colons in the dict literal.
+          wheel_sha=$(sha256sum "$wheel" | awk '{print $1}')
+          glue_sha=$(sha256sum ../glue.py | awk '{print $1}')
           git_sha="${GITHUB_SHA:-unknown}"
-          cat > docs/inspect_static/inspect/wheels/manifest.json <<EOF
-          {
-            "wheel": "$(basename "$wheel")",
-            "git_sha": "${git_sha:0:7}",
-            "git_sha_full": "$git_sha"
+          export WHEEL="$wheel"
+          export WHEEL_SHA="$wheel_sha"
+          export CBOR2_SHA="$cbor2_expected_sha"
+          export GLUE_SHA="$glue_sha"
+          export GIT_SHA="$git_sha"
+          script=$(mktemp)
+          cat > "$script" <<'PY'
+          import json, os
+          manifest = {
+              "wheel": os.environ["WHEEL"],
+              "wheel_sha256": os.environ["WHEEL_SHA"],
+              "cbor2_wheel": "cbor2-5.4.6-py3-none-any.whl",
+              "cbor2_sha256": os.environ["CBOR2_SHA"],
+              "glue_sha256": os.environ["GLUE_SHA"],
+              "git_sha": os.environ["GIT_SHA"][:7],
+              "git_sha_full": os.environ["GIT_SHA"],
           }
-          EOF
-          echo "Wheel: $(basename "$wheel")"
+          with open("manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+          PY
+          python3 "$script"
+          rm -f "$script"
+          echo "Wheels:"
+          ls -la
           echo "Manifest:"
-          cat docs/inspect_static/inspect/wheels/manifest.json
+          cat manifest.json
 
       - name: Build HTML
         run: sphinx-build -b html docs docs/_build/html

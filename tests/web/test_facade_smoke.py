@@ -258,20 +258,107 @@ class TestStaticPagePresent:
 
 
 @pytest.mark.skipif(
-    not (lambda: __import__("pathlib").Path("docs/inspect/wheels/manifest.json").exists())(),
+    not (lambda: __import__("pathlib").Path("docs/inspect_static/inspect/wheels/manifest.json").exists())(),
     reason="wheel + manifest only built by docs.yml CI step",
 )
 class TestWheelManifest:
     """Validates the manifest.json the docs.yml CI step writes alongside
-    the pyrxd wheel. Skipped when the file isn't present (i.e. when
-    running tests locally without the CI step)."""
+    the pyrxd + cbor2 wheels. Skipped when the file isn't present (i.e.
+    when running tests locally without the CI step).
 
-    def test_manifest_has_wheel_field(self):
+    The manifest is the trust boundary: the page-side JS refuses to
+    install any wheel whose bytes don't match the SHA recorded here.
+    These tests pin the structure so a CI step that produced a
+    malformed manifest (missing fields, bad hash format, absolute
+    URLs) fails loudly at test time rather than silently shipping
+    something the JS will reject in the browser."""
+
+    @staticmethod
+    def _manifest():
         import json
         from pathlib import Path
 
-        manifest_path = Path("docs/inspect/wheels/manifest.json")
-        manifest = json.loads(manifest_path.read_text())
+        return json.loads(Path("docs/inspect_static/inspect/wheels/manifest.json").read_text())
+
+    def test_manifest_has_wheel_field(self):
+        manifest = self._manifest()
         assert "wheel" in manifest
         assert manifest["wheel"].startswith("pyrxd-")
         assert manifest["wheel"].endswith(".whl")
+
+    def test_manifest_has_pyrxd_sha256(self):
+        manifest = self._manifest()
+        assert "wheel_sha256" in manifest
+        sha = manifest["wheel_sha256"]
+        # 64 lowercase hex chars
+        assert len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)
+
+    def test_manifest_has_cbor2_wheel_field(self):
+        manifest = self._manifest()
+        assert "cbor2_wheel" in manifest
+        assert manifest["cbor2_wheel"].startswith("cbor2-")
+        assert manifest["cbor2_wheel"].endswith("-py3-none-any.whl")
+
+    def test_manifest_has_cbor2_sha256(self):
+        manifest = self._manifest()
+        assert "cbor2_sha256" in manifest
+        sha = manifest["cbor2_sha256"]
+        assert len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)
+
+    def test_manifest_has_glue_sha256(self):
+        manifest = self._manifest()
+        assert "glue_sha256" in manifest
+        sha = manifest["glue_sha256"]
+        assert len(sha) == 64 and all(c in "0123456789abcdef" for c in sha)
+
+    def test_filenames_are_bare_basenames(self):
+        """The page-side JS rejects any filename containing characters
+        that could redirect URL resolution (``/``, ``\\``, ``:``, ``?``,
+        ``#``). The CI step must produce filenames that pass."""
+        manifest = self._manifest()
+        for field in ("wheel", "cbor2_wheel"):
+            v = manifest[field]
+            assert "/" not in v, f"{field} contains slash: {v!r}"
+            assert "\\" not in v, f"{field} contains backslash: {v!r}"
+            assert ":" not in v, f"{field} contains colon: {v!r}"
+            assert "?" not in v, f"{field} contains query: {v!r}"
+            assert "#" not in v, f"{field} contains fragment: {v!r}"
+
+    def test_filenames_are_not_dot_only(self):
+        """Dot-only paths like ``.`` and ``..`` resolve to the current
+        / parent directory under ``new URL``. The page-side JS rejects
+        them explicitly so a poisoned manifest can't even fetch a
+        directory listing whose SHA happens to match. Round-2 audit
+        finding NEW-1."""
+        import re
+
+        manifest = self._manifest()
+        for field in ("wheel", "cbor2_wheel"):
+            v = manifest[field]
+            assert not re.fullmatch(r"\.+", v), f"{field} is dot-only: {v!r}"
+
+    def test_recorded_shas_match_actual_files(self):
+        """The hashes in manifest.json must match the actual bytes on
+        disk. Catches a CI step that recorded a stale hash."""
+        import hashlib
+        from pathlib import Path
+
+        manifest = self._manifest()
+        wheels_dir = Path("docs/inspect_static/inspect/wheels")
+        glue_path = Path("docs/inspect_static/inspect/glue.py")
+
+        for filename_field, sha_field in [
+            ("wheel", "wheel_sha256"),
+            ("cbor2_wheel", "cbor2_sha256"),
+        ]:
+            path = wheels_dir / manifest[filename_field]
+            assert path.exists(), f"{path} missing"
+            actual = hashlib.sha256(path.read_bytes()).hexdigest()
+            assert actual == manifest[sha_field], (
+                f"{filename_field}: manifest says {manifest[sha_field]}, file is {actual}"
+            )
+
+        actual_glue = hashlib.sha256(glue_path.read_bytes()).hexdigest()
+        assert actual_glue == manifest["glue_sha256"], (
+            f"glue.py: manifest says {manifest['glue_sha256']}, file is {actual_glue}"
+        )
