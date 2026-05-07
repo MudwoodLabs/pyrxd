@@ -507,7 +507,12 @@ class TestInspectFetchTxid:
         fake_txid = "0" * 63 + "1"
         result = runner.invoke(inspect_cmd, [fake_txid, "--fetch"], obj=_make_ctx(client))
         assert result.exit_code != 0
-        assert "does not match" in result.output
+        # The full message attributes the failure to the server and points
+        # the user at the --electrumx URL escape hatch. Locking the exact
+        # wording (not just "does not match") so a future refactor can't
+        # silently weaken the diagnostic.
+        assert "server returned a transaction whose hash does not match" in result.output
+        assert "--electrumx" in result.output
 
     def test_oversize_response_rejected(self, runner: CliRunner) -> None:
         """Threat-model guard: response > 4MB is consensus-invalid and refused."""
