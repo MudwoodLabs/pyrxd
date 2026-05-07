@@ -21,6 +21,10 @@ documented contract:
   Unicode codepoints from any string sourced from CBOR before display
 * :func:`truncate_for_human` — cap a sanitized string at the project's
   display cap
+* :func:`skeleton` — apply Unicode TR39 confusable reduction; two
+  strings that "look the same" produce identical skeletons
+* :func:`looks_confusable_with_latin` — high-level check that flags
+  Latin-impersonating spoofs (e.g. Cyrillic-letter "USDC")
 
 If you are inside the pyrxd codebase, import the underlying helpers
 directly. If you are outside (web UI, downstream tooling), import from
@@ -50,6 +54,7 @@ from ..cli.glyph_cmds import (
 from ..cli.glyph_cmds import (
     _truncate_for_human as truncate_for_human,
 )
+from .confusables import looks_confusable_with_latin, skeleton
 
 # The async ``_inspect_txid_inner`` requires an ElectrumXClient (or
 # something quacking like one) plus an event loop, neither of which is
@@ -64,6 +69,8 @@ __all__ = [
     "inspect_contract",
     "inspect_outpoint",
     "inspect_script",
+    "looks_confusable_with_latin",
     "sanitize_display_string",
+    "skeleton",
     "truncate_for_human",
 ]
