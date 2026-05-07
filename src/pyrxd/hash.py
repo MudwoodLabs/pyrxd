@@ -88,9 +88,23 @@ def _select_ripemd160() -> Callable[[bytes], bytes]:
     try:
         if _ripemd160_via_hashlib(b"") == _empty_digest:
             return _ripemd160_via_hashlib
-    except (ValueError, OSError):
-        # ValueError on OpenSSL-3 disabled-legacy-provider; OSError on
-        # exotic FIPS-mode builds. Either way: fall through.
+    except Exception:  # nosec B110 -- intentional broad catch; see comment below
+        # If ``hashlib`` is unusable for any reason, fall through to the
+        # pure-Python path. Better to be slow than to fail import:
+        # ``pyrxd.hash`` is imported during package init, so an
+        # exception here would abort every downstream caller.
+        # Concrete cases this catches:
+        #   - ValueError: OpenSSL-3 with the legacy provider unloaded
+        #     (the common case on Ubuntu 24.04 / Debian 12 / macOS
+        #     python.org installer).
+        #   - OSError: exotic FIPS-mode OpenSSL builds.
+        #   - RuntimeError / AttributeError / ImportError: degenerate
+        #     hashlib environments (vendored Python stubs, partial
+        #     namespace packages, pyodide-style platform variants).
+        # Bandit flags the bare ``except: pass`` shape (B110); annotated
+        # nosec because the failure-mode is an exhaustively-enumerated
+        # universe of "hashlib can't help us right now" — we want to
+        # gracefully degrade, not fail closed.
         pass
     return _ripemd160_pure_python
 

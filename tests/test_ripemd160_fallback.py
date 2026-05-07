@@ -106,17 +106,30 @@ class TestSelectRipemd160:
         impl = _select_ripemd160()
         assert impl(b"") == bytes.fromhex("9c1185a5c5e9fc54612808977ee8f548b2258d31")
 
-    def test_falls_back_when_hashlib_raises(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "exception_factory",
+        [
+            lambda: ValueError("simulated OpenSSL-3 disabled-legacy-provider"),
+            lambda: OSError("simulated FIPS-mode hashlib"),
+            lambda: RuntimeError("simulated degenerate hashlib"),
+            lambda: AttributeError("simulated partial namespace package"),
+            lambda: ImportError("simulated vendored hashlib stub"),
+        ],
+    )
+    def test_falls_back_when_hashlib_raises(self, monkeypatch, exception_factory):
         """Force the hashlib path to fail and verify the selector picks
-        the pure-Python implementation."""
+        the pure-Python implementation. The selector catches the broad
+        ``Exception`` so any flavour of degenerate hashlib falls through
+        rather than aborting module import. Cover every exception type
+        the comment in ``_select_ripemd160`` enumerates as a real
+        scenario."""
         from pyrxd import hash as hash_mod
 
         def _boom(_payload):
-            raise ValueError("simulated OpenSSL-3 disabled-legacy-provider")
+            raise exception_factory()
 
         monkeypatch.setattr(hash_mod, "_ripemd160_via_hashlib", _boom)
         impl = hash_mod._select_ripemd160()
-        # The selector should have noticed _boom raises and chosen the pure path.
         assert impl is hash_mod._ripemd160_pure_python
         assert impl(b"") == bytes.fromhex("9c1185a5c5e9fc54612808977ee8f548b2258d31")
 
