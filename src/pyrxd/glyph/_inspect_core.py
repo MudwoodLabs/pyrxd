@@ -235,6 +235,19 @@ def _inspect_script(script_hex: str) -> dict:
     if len(script) == 25 and script[:3] == b"\x76\xa9\x14" and script[23:] == b"\x88\xac":
         return {**base, "type": "p2pkh", "owner_pkh": script[3:23].hex()}
 
+    # OP_RETURN data output. ``\x6a`` is OP_RETURN; whatever follows is
+    # an unspendable data carrier — used by some legacy Radiant tools
+    # for protocol markers (Atomicals-shaped, non-Glyph). Surface the
+    # data hex separately from the hex field so callers don't have to
+    # re-strip the OP_RETURN byte. Length cap is the script's max
+    # (already enforced upstream via _MAX_SCRIPT_HEX_LEN).
+    if len(script) >= 1 and script[0] == 0x6A:
+        return {
+            **base,
+            "type": "op_return",
+            "data_hex": script[1:].hex(),
+        }
+
     if is_nft_script(script_hex):
         ref = extract_ref_from_nft_script(script)
         pkh = extract_owner_pkh_from_nft_script(script)
