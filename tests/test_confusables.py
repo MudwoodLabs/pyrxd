@@ -166,12 +166,15 @@ class TestLooksConfusableWithLatin:
     def test_empty_string_returns_false(self):
         assert looks_confusable_with_latin("") is False
 
-    def test_nfkc_normalisation_collapses_compat_forms(self):
-        """Full-width Latin letters look like Latin to a viewer; NFKC
-        collapses them to ASCII before the skeleton check, so a pure
-        full-width Latin string is treated as benign Latin."""
-        full_width_latin = "ＵＳＤＣ"  # "USDC" in full-width
-        assert not looks_confusable_with_latin(full_width_latin)
+    def test_fullwidth_latin_flagged_as_compat_fold(self):
+        """Pure fullwidth Latin (ＵＳＤＣ) NFKC-folds to ASCII USDC.
+        Round-1 audit (PR #57) initially treated this as benign on
+        the reasoning that it's "still Latin"; round-2 audit (F-1)
+        correctly flagged it as a styled-Latin spoof shape — visually
+        identical to USDC in most fonts, byte-different. Now caught
+        by the NFKC-compat-fold check."""
+        full_width_latin = "ＵＳＤＣ"
+        assert looks_confusable_with_latin(full_width_latin)
 
 
 class TestFacadeReExport:
@@ -222,3 +225,104 @@ class TestVendorScriptOutput:
         # U+0420 Р → P; U+0422 Т → T; U+0425 Х → X.
         for cp in [0x0410, 0x0412, 0x0421, 0x0415, 0x041D, 0x041A, 0x041C, 0x041E, 0x0420, 0x0422, 0x0425]:
             assert cp in _CONFUSABLE_MAP, f"missing critical Cyrillic→Latin mapping U+{cp:04X}"
+
+    def test_no_control_or_format_chars_in_targets(self):
+        """No mapping target may contain a Cc (control) or Cf (format)
+        codepoint. A skeleton containing an invisible separator or
+        bidi control would silently inject formatting bytes into the
+        caller's display when the caller renders the skeleton.
+        Discovered during round-1 audit; vendor Filter 3 enforces it."""
+        import unicodedata
+
+        from pyrxd.glyph._confusables import _CONFUSABLE_MAP
+
+        offenders = []
+        for cp, target in _CONFUSABLE_MAP.items():
+            for ch in target:
+                if unicodedata.category(ch) in ("Cc", "Cf"):
+                    offenders.append((cp, target))
+                    break
+        assert offenders == [], f"Cc/Cf in target: {offenders[:5]}"
+
+    def test_supplementary_plane_codepoints_emit_correctly(self):
+        """The vendor script's emit step must use ``\\UXXXXXXXX``
+        (8 hex) for codepoints above U+FFFF. The 4-hex form silently
+        truncates supplementary-plane codepoints and produces a
+        subtly wrong literal. The audit's flagged 'U+2F80D → \\u2063a'
+        was actually U+2F80D → U+2063A (a single CJK char) corrupted
+        by 4-hex emit. Lock in the fix."""
+        from pyrxd.glyph._confusables import _CONFUSABLE_MAP
+
+        # U+2F80D (CJK Compat Ideograph) maps to U+2063A — single
+        # supplementary CJK char. Verify it round-trips.
+        target = _CONFUSABLE_MAP.get(0x2F80D)
+        if target is not None:
+            assert len(target) == 1, f"U+2F80D target corrupted: {target!r}"
+            assert ord(target) == 0x2063A
+
+
+class TestAttackBypassesAddressedInRound1Audit:
+    """Round-1 audit on PR #57 found three real bypasses against the
+    initial detection logic. These tests pin the fixes:
+
+      F-1: Mathematical Alphanumeric Symbols (NFKC-fold to ASCII Latin)
+      F-2: RLO/LRO bidi reordering of pure ASCII
+      F-3: IPA / specialty Latin homoglyphs (LATIN-named non-ASCII chars)
+      F-appendage: appending non-Latin Letter to break naive whole-string check
+    """
+
+    def test_F1_mathematical_bold_flagged(self):
+        # 𝐔𝐒𝐃𝐂 = U+1D414 U+1D412 U+1D403 U+1D402 (Math Bold). NFKC-folds
+        # to ASCII "USDC". Visually: a near-perfect spoof of USDC.
+        assert looks_confusable_with_latin("𝐔𝐒𝐃𝐂")
+
+    def test_F1_mathematical_sans_serif_flagged(self):
+        assert looks_confusable_with_latin("𝗨𝗦𝗗𝗖")
+
+    def test_F1_mathematical_monospace_flagged(self):
+        # U+1D670+ Mathematical Monospace.
+        assert looks_confusable_with_latin("𝚄𝚂𝙳𝙲")
+
+    def test_F1_fullwidth_flagged(self):
+        # Pure fullwidth Latin is the same shape as Mathematical Bold:
+        # a styled-Latin block whose codepoints NFKC-fold to ASCII.
+        # Round-1 missed this; round-2 catches it via the NFKC fold.
+        assert looks_confusable_with_latin("ＵＳＤＣ")
+
+    def test_F2_RLO_prefix_flagged(self):
+        # U+202E RIGHT-TO-LEFT OVERRIDE prefix reorders rendered text.
+        # "‮CDSU" renders as USDC.
+        assert looks_confusable_with_latin("‮CDSU")
+
+    def test_F2_LRO_prefix_flagged(self):
+        assert looks_confusable_with_latin("‭ABCD")
+
+    def test_F2_RLE_flagged(self):
+        assert looks_confusable_with_latin("‫ABCD")
+
+    def test_F2_isolate_controls_flagged(self):
+        # The isolate-control set: U+2066 LRI, U+2067 RLI, U+2068 FSI,
+        # U+2069 PDI. Less commonly used but still reorder text.
+        for cp in (0x2066, 0x2067, 0x2068, 0x2069):
+            assert looks_confusable_with_latin(chr(cp) + "ABCD"), f"missed U+{cp:04X}"
+
+    def test_F3_IPA_alpha_flagged(self):
+        # ɑ (U+0251 LATIN SMALL LETTER ALPHA) → a per TR39. Is
+        # "LATIN"-named per Unicode, but visually impersonates Cyrillic
+        # а / Latin a in normal display fonts. The U+0250+ heuristic
+        # treats specialty-Latin blocks as homoglyphs, not legitimate
+        # language.
+        assert looks_confusable_with_latin("ɑpple")
+
+    def test_F3_IPA_b_with_hook_flagged(self):
+        # ɓ (U+0253) → b̔ per TR39. Same shape as F3.
+        assert looks_confusable_with_latin("ABCDɓ")
+
+    def test_appendage_bypass_does_not_disable_detection(self):
+        """Audit F1 finding: appending a non-Latin Letter (Arabic ö,
+        Greek λ) to a Cyrillic-spoofed name shouldn't disable the
+        spoof detection. Pin the fix."""
+        assert looks_confusable_with_latin("USDСö")
+        assert looks_confusable_with_latin("USDСλ")
+        assert looks_confusable_with_latin("ВТСö")
+        assert looks_confusable_with_latin("USDСöبكلام")

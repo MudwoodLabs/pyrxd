@@ -53,81 +53,197 @@ from ._confusables import skeleton
 __all__ = ["looks_confusable_with_latin", "skeleton"]
 
 
+# Bidi formatting controls. These reorder rendered text without changing
+# byte sequence, so an attacker can register "CDSU" with U+202E prepended
+# and have UIs render it as "USDC". We reject any string containing one
+# of these as a Latin-impersonation spoof regardless of the skeleton
+# reduction. Range covers RLE/LRE/PDF/RLO/LRO (U+202A–202E) and the
+# isolate set (U+2066–2069).
+_BIDI_FORMAT_CONTROLS = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+
+
 def looks_confusable_with_latin(s: str) -> bool:
-    """Return True if *s* contains non-ASCII characters that visually
-    mimic Latin letters.
+    """Return True if *s* visually impersonates Latin text.
 
-    Detection rule:
+    Detection covers four attack shapes:
 
-    1. NFKC-normalise *s* so compatibility forms (full-width letters,
-       fraction-slash) collapse to canonical form.
-    2. Apply the TR39 skeleton reduction.
-    3. If the original contained any non-Latin Letter codepoints, but
-       the skeleton is **entirely** Latin / ASCII, the original was a
-       Latin-impersonating spoof.
+    1. **Confusable substitution.** A non-Latin Letter (Cyrillic,
+       Greek, Cherokee, etc.) whose TR39 skeleton is a Latin Letter.
+       Examples: ``"USDС"`` (final char Cyrillic С), ``"ВТС"`` (pure
+       Cyrillic mimicking BTC), ``"ΟΜΓ"`` (Greek mimicking OMG).
+    2. **NFKC compatibility folds.** Compatibility codepoints that
+       fold to ASCII Latin. Mathematical Alphanumeric Symbols
+       (``"𝐔𝐒𝐃𝐂"``) and other styled-Latin blocks are visually
+       distinct from plain ASCII but renderable as a near-perfect
+       spoof.
+    3. **Specialty / phonetic Latin homoglyphs.** Codepoints in U+0250+
+       (IPA Extensions, Phonetic Extensions, Latin Extended
+       Additional, small-caps blocks) that have ``"LATIN"`` in their
+       Unicode name but visually resemble common Latin letters.
+       Examples: ``"ɑpple"`` (IPA alpha U+0251 → a), ``"ɓ"`` (Latin
+       small B with hook U+0253 → b̔). Distinct from common Latin
+       Extended (Polish Ł, ligature Œ, German ß, Polish/Czech
+       diacritics) which live in U+00C0–U+024F and are NOT flagged.
+    4. **Bidi reordering.** Strings containing RLO/LRO/RLE/LRE/PDF or
+       the isolate-control set. These reorder pure-ASCII bytes
+       visually, so ``"\\u202eCDSU"`` renders as "USDC" without
+       containing a non-ASCII letter. Flagged unconditionally.
 
-    Examples:
+    Examples flagged:
 
-    * ``"USDC"`` → ``False`` (pure Latin, skeleton equals input).
-    * ``"USDС"`` (final char Cyrillic) → ``True`` (skeleton is Latin
-      "USDC" but the original is mixed).
-    * ``"ВТС"`` (all Cyrillic; mimics "BTC") → ``True`` (skeleton is
-      Latin "BTC" but the original is non-Latin).
-    * ``"トークン"`` → ``False`` (skeleton is non-Latin Japanese; not
-      a Latin-impersonating attack).
-    * ``"Café"`` → ``False`` (Latin Extended; skeleton stays Latin
-      Extended, no spoof shape).
-    * ``"USDT1"`` → ``False`` (digit 1 is ASCII; not a confusable
-      source per our vendor filter).
+    * ``"USDС"`` (Cyrillic С) — substitution.
+    * ``"𝐔𝐒𝐃𝐂"`` (Mathematical Bold) — NFKC fold.
+    * ``"ɑpple"`` (IPA alpha) — specialty Latin homoglyph.
+    * ``"\\u202eCDSU"`` — bidi reorder.
+    * ``"USDСö"`` (Cyrillic С + Arabic ö appendage) — the per-char
+      check sees the Cyrillic spoof regardless of trailing
+      non-Latin Letters.
+
+    Examples NOT flagged:
+
+    * ``"USDC"`` — pure ASCII Latin.
+    * ``"Café"``, ``"naïve"``, ``"Łódź"``, ``"Œuf"`` — common Latin
+      Extended (U+00C0–U+024F).
+    * ``"トークン"``, ``"中文"`` — non-Latin scripts that aren't
+      impersonating Latin.
+    * ``"USDT1"``, ``"WBTC2"`` — digits are ASCII; the vendor
+      script intentionally drops ASCII-source confusables to
+      prevent false positives on legitimate digit-suffixed names.
+
+    Mixed-script branding (token names like ``"USD-Доллар"`` that
+    deliberately mix Latin and Cyrillic) IS flagged. The SDK can't
+    distinguish "intentional Russian brand" from "Latin spoof"; the
+    caller surfaces this as a warning, not a hard reject.
 
     The function is total: any non-string input returns False.
     """
     if not isinstance(s, str) or not s:
         return False
+
+    # Attack shape 4: bidi control reordering. A pure-ASCII spoof
+    # made by reversing rendered text is invisible to the skeleton
+    # reduction (no non-Latin letter to substitute). Catch it
+    # explicitly before any other check.
+    if any(ord(ch) in _BIDI_FORMAT_CONTROLS for ch in s):
+        return True
+
     normalised = unicodedata.normalize("NFKC", s)
-    skel = skeleton(normalised)
 
-    # If the skeleton equals the (NFKC-normalised) original, no
-    # confusable substitution happened — definitely not a spoof.
-    if skel == normalised:
-        return False
+    # Attack shape 2: NFKC compatibility fold. If normalisation
+    # changed s, the original used compatibility codepoints (math
+    # bold, full-width, circled letters, etc.). When the result is
+    # all-Latin-or-neutral, the original was a styled-Latin spoof.
+    if normalised != s and all(_is_latin_or_neutral(ch) for ch in normalised):
+        return True
 
-    # The skeleton differs. The relevant question now is: did the
-    # reduction produce a Latin / ASCII string from a non-Latin
-    # original? If so, it's a Latin-impersonation spoof.
-    has_non_latin_letter = any(_is_non_latin_letter(ch) for ch in normalised)
-    if not has_non_latin_letter:
-        # Original was entirely Latin Letters (or non-Letters); the
-        # skeleton change must have come from a non-Letter codepoint
-        # (e.g. punctuation reduction). Not a spoof shape.
-        return False
+    # Walk each input character and check whether its individual
+    # skeleton reduction replaced a non-Latin Letter with Latin. This
+    # is the fundamental spoof shape: a single source codepoint that
+    # is non-Latin but whose canonical visual form is Latin.
+    #
+    # Doing the check per-character (instead of comparing whole-string
+    # skeletons) sidesteps three classes of false positive that
+    # whole-string comparisons fall into:
+    #
+    #   - Decomposition. Latin Extended chars like Polish Ł reduce to
+    #     "L̸" (L + combining solidus) and Latin ligatures like Œ
+    #     reduce to "OE". Both are Latin→Latin transformations — no
+    #     non-Latin source involved — so the per-char check returns
+    #     False on those positions. ``Łódź`` and ``Œuf`` stay benign.
+    #
+    #   - Mixed-script branding. A token name like "USD-Доллар" has
+    #     Cyrillic letters whose skeletons happen to be ASCII Latin
+    #     (Cyrillic о → o, а → a, р → p). The per-char check sees a
+    #     non-Latin source mapping to Latin and would flag — which is
+    #     the right answer for the security check, but a usability
+    #     concern for legitimate Russian-language token names. We
+    #     accept that trade-off: a deployer who wants Cyrillic
+    #     branding has to accept the warning, because the SDK can't
+    #     distinguish "intentional Russian brand" from "Latin spoof".
+    #     The caller's UI surfaces this as a warning, not a hard
+    #     reject.
+    #
+    #   - Inflated targets. TR39 entries like ``ǳ → dz`` where one
+    #     non-Latin source produces multiple Latin chars. Any non-empty
+    #     skeleton counts as a Latin-substitution if all its chars are
+    #     Latin or non-Letter.
+    for ch in normalised:
+        if not unicodedata.category(ch).startswith("L"):
+            # Non-Letter (digit, punctuation, combining mark, symbol).
+            # Even if it has a TR39 mapping, it's not a Latin-letter
+            # spoof. Skip.
+            continue
+        ch_skel = skeleton(ch)
+        if ch_skel == ch:
+            # No reduction. ASCII Latin (A-Z), Latin Extended that
+            # doesn't impersonate anything (Café's é, Müller's ü,
+            # Žižek's ž), or any other letter TR39 considers visually
+            # canonical. Not a confusable source.
+            continue
+        # The skeleton differs. ch is a TR39 confusable source. Three
+        # remaining cases to distinguish:
+        #
+        #   (a) Non-Latin Letter that reduces to Latin (Cyrillic С → C,
+        #       Greek Ο → O, Cherokee letters). Always a spoof.
+        #   (b) Specialty / phonetic Latin Letter that reduces to
+        #       common Latin (IPA ɑ U+0251 → a; Latin small B with hook
+        #       ɓ U+0253 → b̔ (b + mark); Latin small capitals U+1D00+).
+        #       These have "LATIN" in their Unicode name but visually
+        #       impersonate common Latin letters in normal display
+        #       fonts. Treat as spoofs.
+        #   (c) Common-language Latin Extended (Polish Ł → L̸; ligature
+        #       Œ → OE; ß → ss). Decomposition for a real language.
+        #       Not a spoof.
+        #
+        # Range cut: codepoints U+0000–U+024F are Basic Latin + Latin-1
+        # Supplement + Latin Extended-A + Latin Extended-B (the common
+        # everyday-language ranges, where Ł, Œ, Š, ß live). Codepoints
+        # U+0250+ enter IPA Extensions, Phonetic Extensions, Latin
+        # Extended Additional, and the various small-capital / styled
+        # blocks where homoglyph attacks live.
+        if _is_latin_letter(ch) and ord(ch) < 0x0250:
+            # Common-language Latin source. Reduction is decomposition,
+            # not impersonation.
+            continue
+        # ch is either non-Latin Letter (case a) or specialty-Latin
+        # Letter ≥ U+0250 (case b). Either way, if its skeleton reads
+        # as Latin, the source impersonates Latin.
+        skel_letters = [c for c in ch_skel if unicodedata.category(c).startswith("L")]
+        if not skel_letters:
+            # Skeleton has no Letters (e.g. punctuation-only target).
+            # Not a Latin-impersonation.
+            continue
+        if all(_is_latin_letter(c) and ord(c) < 0x0250 for c in skel_letters):
+            return True
 
-    skeleton_is_latin = all(_is_latin_or_neutral(ch) for ch in skel)
-    return skeleton_is_latin
+    # No individual confusable mapped to common Latin. Not a spoof.
+    return False
 
 
-def _is_non_latin_letter(ch: str) -> bool:
-    """A Letter codepoint whose Unicode name does not start with "LATIN ".
-    Excludes Latin Extended (legitimate non-English Latin) — those are
-    Letters with names like "LATIN SMALL LETTER E WITH ACUTE"."""
+def _is_latin_letter(ch: str) -> bool:
+    """A Letter codepoint whose Unicode name starts with 'LATIN '. Used
+    by the Latin-letter sequence comparison so non-Latin Letter blocks
+    (Cyrillic, Greek, Arabic, etc.) drop out of the comparison."""
     cat = unicodedata.category(ch)
     if not cat.startswith("L"):
         return False
     try:
         name = unicodedata.name(ch)
     except ValueError:
-        # No assigned name (PUA, surrogate, unassigned). Treat as
-        # non-Latin to err on the side of flagging.
-        return True
-    return not name.startswith("LATIN ")
+        return False
+    return name.startswith("LATIN ")
 
 
 def _is_latin_or_neutral(ch: str) -> bool:
     """A char that's either a Latin Letter or a non-Letter (digit,
     punctuation, symbol). Used by ``looks_confusable_with_latin`` to
-    answer "is this skeleton entirely Latin-or-non-letter?". A
-    skeleton consisting of Latin letters and ASCII digits is "looks
-    like Latin"; one with any non-Latin Letter is not."""
+    answer "does this read as Latin?". A skeleton consisting of Latin
+    letters and ASCII digits is "looks like Latin"; one with any
+    non-Latin Letter is not.
+
+    Codepoints with no Unicode name (PUA, surrogates, unassigned)
+    return False — we conservatively treat them as non-Latin so a
+    skeleton containing one fails the "all-Latin" check."""
     cat = unicodedata.category(ch)
     if not cat.startswith("L"):
         return True

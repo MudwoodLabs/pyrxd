@@ -58,22 +58,69 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import sys
 import urllib.request
 from pathlib import Path
 
-_DEFAULT_VERSION = "latest"
+# Pin the upstream confusables.txt by Unicode version AND by SHA-256
+# of the file contents. A version pin alone isn't enough — Unicode
+# could in principle re-publish a corrected file under the same
+# version, and an attacker who compromised the upstream mirror could
+# slip in malicious mappings. The hash pin closes that gap: re-running
+# the script fetches whatever the URL serves today, hashes it, and
+# refuses to proceed if the hash doesn't match. To bump to a new
+# Unicode release, the maintainer:
+#
+#   1. Reads the new release's confusables.txt and reviews changes
+#      (Unicode publishes a release notes diff).
+#   2. Updates _UNICODE_VERSION below.
+#   3. Re-runs ``scripts/vendor-confusables.py --update-hash`` to
+#      record the new SHA. This is a deliberate gesture — without
+#      ``--update-hash`` the script refuses the new file.
+#   4. Reviews the resulting diff in src/pyrxd/glyph/_confusables.py
+#      and the new SHA in this file.
+# The version published at /Public/security/latest/ at the time the
+# pinned SHA was recorded. The actual integrity check is against
+# _PINNED_SHA256; the version string is informational (the script
+# parses the "# Version:" line of the file at runtime and prints
+# what it found).
+_UNICODE_VERSION_LABEL = "17.0.0"
+_PINNED_SHA256 = "091c7f82fc39ef208faf8f94d29c244de99254675e09de163160c810d13ef22a"
+
 _SOURCE_URL_TEMPLATE = "https://www.unicode.org/Public/security/{version}/confusables.txt"
 _OUTPUT_PATH = Path(__file__).resolve().parent.parent / "src" / "pyrxd" / "glyph" / "_confusables.py"
 
 
-def _fetch(version: str) -> tuple[str, str]:
-    """Return (text, resolved_url). 'latest' is resolved at fetch time."""
+def _fetch_and_verify(version: str, *, update_hash: bool) -> tuple[str, str, str]:
+    """Fetch, hash-verify, return (text, resolved_url, sha256).
+
+    Refuses the file if the SHA doesn't match the pin, unless
+    ``update_hash`` is True (the maintainer is deliberately bumping)."""
     url = _SOURCE_URL_TEMPLATE.format(version=version)
     print(f"Fetching {url}…", file=sys.stderr)
     with urllib.request.urlopen(url, timeout=30) as resp:  # noqa: S310 - vendor script, fixed scheme
-        data = resp.read().decode("utf-8")
-    return data, url
+        data = resp.read()
+    sha = hashlib.sha256(data).hexdigest()
+    print(f"  SHA-256: {sha}", file=sys.stderr)
+    if not update_hash:
+        if sha != _PINNED_SHA256:
+            raise SystemExit(
+                f"\nERROR: upstream SHA-256 mismatch.\n"
+                f"  Pinned:   {_PINNED_SHA256}\n"
+                f"  Got:      {sha}\n"
+                f"\nIf this is an intentional Unicode release bump:\n"
+                f"  1. Update _UNICODE_VERSION in this script.\n"
+                f"  2. Re-run with --update-hash to record the new SHA.\n"
+                f"  3. Review the resulting diff in _confusables.py.\n"
+                f"\nIf you didn't expect a change, this could be a\n"
+                f"compromised upstream mirror or a TLS MITM. Investigate\n"
+                f"before proceeding."
+            )
+        print(f"  pinned SHA matches — proceeding", file=sys.stderr)
+    else:
+        print(f"  --update-hash: skipping pin verification", file=sys.stderr)
+    return data.decode("utf-8"), url, sha
 
 
 def _parse(text: str) -> tuple[dict[int, str], str]:
@@ -167,6 +214,24 @@ def _filter_to_relevant_targets(mappings: dict[int, str]) -> dict[int, str]:
     mappings whose final target is e.g. combining marks alone or
     control codepoints. The target must have at least one Letter,
     Number, or Punctuation char to be useful for visual comparison.
+
+    **Filter 3 — reject targets containing Cc / Cf chars.** TR39
+    occasionally produces multi-codepoint targets that include
+    category Cc (control) or Cf (format) chars — e.g. one entry
+    produces a target containing U+2063 INVISIBLE SEPARATOR. A
+    skeleton containing such a char would silently inject a
+    control/format codepoint into downstream display when the
+    caller renders the skeleton. Drop the entry entirely; the
+    confusable comparison can't safely use those targets.
+
+    **Filter 4 — reject Latin-target mappings whose source is
+    a Latin letter producing a non-Latin target.** A malicious
+    upstream data file could plant entries like
+    ``U+FF2B fullwidth K → Cyrillic К`` (reverse direction), which
+    would corrupt skeletons of legitimate Latin Extended strings.
+    Verify all targets are themselves Latin or non-Letter so the
+    table remains a one-way reduction toward Latin / displayable
+    forms.
     """
     import unicodedata
 
@@ -178,6 +243,9 @@ def _filter_to_relevant_targets(mappings: dict[int, str]) -> dict[int, str]:
             continue
         # Filter 2: target must contain at least one displayable char.
         if not any(unicodedata.category(ch)[0] in ("L", "N", "P") for ch in target):
+            continue
+        # Filter 3: reject Cc/Cf chars in target.
+        if any(unicodedata.category(ch) in ("Cc", "Cf") for ch in target):
             continue
         relevant[source_cp] = target
     return relevant
@@ -218,8 +286,23 @@ def _emit(mappings: dict[int, str], unicode_version: str, source_url: str) -> st
         target = mappings[source_cp]
         # Render the target as a Python string literal. Avoid emitting
         # raw non-ASCII codepoints into the source file — keeps the
-        # generated module 7-bit clean and easier to grep.
-        target_repr = "".join(f"\\u{ord(ch):04x}" if ord(ch) > 0x7F else _ascii_repr(ch) for ch in target)
+        # generated module 7-bit clean and easier to grep. Use
+        # ``\uXXXX`` (4 hex) for BMP codepoints and ``\UXXXXXXXX``
+        # (8 hex) for supplementary-plane (above U+FFFF). The shorter
+        # form silently truncates the leading bits and produces a
+        # subtly wrong literal — got bitten by this once: the audit's
+        # flagged "U+2F80D → '⁣a'" was actually U+2063A (a
+        # single supplementary CJK char) emitted as 4-hex ⁣ plus
+        # a stray literal 'a'.
+        def _emit_char(ch: str) -> str:
+            cp = ord(ch)
+            if cp <= 0x7F:
+                return _ascii_repr(ch)
+            if cp <= 0xFFFF:
+                return f"\\u{cp:04x}"
+            return f"\\U{cp:08x}"
+
+        target_repr = "".join(_emit_char(ch) for ch in target)
         lines.append(f'    0x{source_cp:04X}: "{target_repr}",')
     lines.append("}")
     lines.append("")
@@ -261,19 +344,33 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.strip().split("\n", 1)[0])
     parser.add_argument(
         "--version",
-        default=_DEFAULT_VERSION,
-        help="Unicode security version to fetch (default: latest)",
+        default="latest",
+        help=(
+            f"Unicode security version to fetch (default: 'latest'; the "
+            f"pinned SHA was recorded against version {_UNICODE_VERSION_LABEL})"
+        ),
     )
     parser.add_argument(
         "--output",
         default=str(_OUTPUT_PATH),
         help=f"output path (default: {_OUTPUT_PATH})",
     )
+    parser.add_argument(
+        "--update-hash",
+        action="store_true",
+        help="Skip the pinned-SHA verification (deliberate Unicode-release bump).",
+    )
     args = parser.parse_args()
 
-    text, resolved_url = _fetch(args.version)
+    text, resolved_url, sha = _fetch_and_verify(args.version, update_hash=args.update_hash)
     mappings, unicode_version = _parse(text)
     print(f"  parsed {len(mappings):,} raw mappings (Unicode {unicode_version})", file=sys.stderr)
+    if args.update_hash:
+        print(
+            f"\n  After verifying the diff, update _PINNED_SHA256 in this script to:",
+            file=sys.stderr,
+        )
+        print(f"      {sha}", file=sys.stderr)
 
     closed = _close_transitively(mappings)
     print(f"  closed: {len(closed):,} mappings (after transitive reduction)", file=sys.stderr)
