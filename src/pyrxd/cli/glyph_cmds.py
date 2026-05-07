@@ -1719,15 +1719,19 @@ def _render_script_human(payload: dict) -> str:
     elif type_ in ("nft", "ft"):
         body.append(f"  ref:       {payload['ref_outpoint']}")
         body.append(f"  owner_pkh: {payload['owner_pkh']}")
+        body.append("  (structural pattern match: bytes match the FT/NFT script template;")
+        body.append("   does NOT verify the ref points to a valid Glyph contract)")
     elif type_ == "mut":
         body.append(f"  ref:          {payload['ref_outpoint']}")
         body.append(f"  payload_hash: {payload['payload_hash']}")
-        body.append("  (payload_hash is an opaque commitment to off-chain CBOR;")
-        body.append("   resolve via the reveal tx — `inspect` cannot resolve it locally)")
+        body.append("  (structural pattern match; payload_hash is an opaque commitment")
+        body.append("   to off-chain CBOR — resolve via the reveal tx; `inspect` cannot")
+        body.append("   verify provenance of the ref locally)")
     elif type_ in ("commit-nft", "commit-ft"):
         body.append(f"  payload_hash: {payload['payload_hash']}")
         body.append(f"  owner_pkh:    {payload['owner_pkh']}")
-        body.append("  (payload_hash is an opaque commitment to the reveal-tx CBOR)")
+        body.append("  (structural pattern match; payload_hash is an opaque commitment")
+        body.append("   to the reveal-tx CBOR)")
     elif type_ == "dmint":
         version = payload.get("version", "?")
         body.append(f"  version:      dMint {version}")
@@ -1740,6 +1744,8 @@ def _render_script_human(payload: dict) -> str:
         body.append(f"  total supply: {total:,} photons")
         body.append(f"  algo:         {payload['algo']}")
         body.append(f"  daa_mode:     {payload['daa_mode']}")
+        body.append("  (structural pattern match; does NOT verify the contract_ref points")
+        body.append("   to a valid mint chain or that the parameters match a deployed token)")
     elif type_ == "unknown":
         body.append("  (script does not match any known Glyph or P2PKH layout)")
     return "\n".join([head, *body])
