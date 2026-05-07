@@ -51,6 +51,15 @@ def _cbor_str(d: dict, key: str, max_len: int) -> str:
 _MAX_CBOR_PAYLOAD_BYTES = 65_536  # 64 KB hard cap — protects against DoS on decode
 _MAX_ATTRS_COUNT = 64  # unreasonable beyond this; prevents memory bombs
 
+# Per-IANA, real MIME types are short — even very obscure registered
+# values top out around 75 chars (e.g. ``application/vnd.openxmlformats-
+# officedocument.wordprocessingml.document``). 256 is generous and
+# leaves room for parameters (``; charset=…``) without ever being a
+# meaningful expansion vector. A higher cap was attacker-surface for
+# downstream display strings constructed from this field — see
+# https://github.com/MudwoodLabs/pyrxd/issues/52.
+_MAX_MIME_TYPE_CHARS = 256
+
 
 def _decode_attrs(raw: object) -> dict[str, str]:
     """Decode the 'attrs' CBOR field, enforcing count and type constraints."""
@@ -92,7 +101,12 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
     if "main" in d:
         m = d["main"]
         if isinstance(m, dict) and "t" in m and "b" in m:
-            main = GlyphMedia(mime_type=str(m["t"]), data=bytes(m["b"]))
+            mime_type = str(m["t"])
+            if len(mime_type) > _MAX_MIME_TYPE_CHARS:
+                raise ValidationError(
+                    f"CBOR field 'main.t' (mime_type) too long: {len(mime_type)} > {_MAX_MIME_TYPE_CHARS}"
+                )
+            main = GlyphMedia(mime_type=mime_type, data=bytes(m["b"]))
 
     version = d.get("v")
     if version is not None:

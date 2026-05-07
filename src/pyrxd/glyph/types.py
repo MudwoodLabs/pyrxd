@@ -100,9 +100,19 @@ class GlyphMedia:
     mime_type: str  # e.g. "image/webp"
     data: bytes  # raw binary
 
+    # Real IANA-registered MIME types top out around 75 chars; 256 is
+    # generous and leaves room for parameters (``; charset=…``) while
+    # bounding the expansion vector for display strings constructed
+    # from this field downstream. The CBOR decoder applies the same
+    # cap — this is defence-in-depth so direct constructor callers
+    # (tests, future SDK paths) get the same guarantee.
+    _MAX_MIME_TYPE_CHARS = 256
+
     def __post_init__(self) -> None:
         if not self.mime_type or "/" not in self.mime_type:
             raise ValidationError("Invalid MIME type")
+        if len(self.mime_type) > self._MAX_MIME_TYPE_CHARS:
+            raise ValidationError(f"MIME type too long: {len(self.mime_type)} > {self._MAX_MIME_TYPE_CHARS}")
         if len(self.data) > 100_000:  # 100KB limit for on-chain media
             raise ValidationError("On-chain media too large (max 100KB)")
 

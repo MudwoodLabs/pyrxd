@@ -1085,6 +1085,37 @@ class TestSecurityRejection:
         with pytest.raises(ValidationError, match="Invalid MIME type"):
             GlyphMedia(mime_type="", data=b"data")
 
+    def test_mime_type_at_256_char_boundary_is_valid(self):
+        """256 chars is the per-IANA generous cap. Real-world MIME
+        types max out around 75; this leaves headroom for parameters
+        without ever being a meaningful expansion vector."""
+        # "image/" prefix (6) + 250 chars to hit exactly 256.
+        boundary = "image/" + "x" * 250
+        assert len(boundary) == 256
+        media = GlyphMedia(mime_type=boundary, data=b"x")
+        assert len(media.mime_type) == 256
+
+    def test_mime_type_over_256_chars_raises(self):
+        """Defends downstream display callers (e.g. the browser inspect
+        tool's ``main`` summary) from a 64KB CBOR mime_type that
+        overflows render frames. See GitHub issue #52."""
+        over = "image/" + "x" * 251  # 257 chars
+        with pytest.raises(ValidationError, match="MIME type too long"):
+            GlyphMedia(mime_type=over, data=b"x")
+
+    def test_decode_payload_caps_hostile_mime_type(self):
+        """End-to-end: a CBOR payload with a giant mime_type is
+        rejected at decode time, not silently propagated to GlyphMedia
+        (where it would also be caught — we want the loud error from
+        the decoder, with the field name the reader can grep for)."""
+        import cbor2
+
+        from pyrxd.glyph.payload import decode_payload
+
+        evil = cbor2.dumps({"p": [GlyphProtocol.NFT.value], "main": {"t": "a" * 65000 + "/b", "b": b"\x00" * 10}})
+        with pytest.raises(ValidationError, match="main.t.*too long"):
+            decode_payload(evil)
+
     def test_commit_script_wrong_hash_len_raises(self):
         with pytest.raises(ValidationError, match="32 bytes"):
             build_commit_locking_script(bytes(31), KNOWN_HEX20)
