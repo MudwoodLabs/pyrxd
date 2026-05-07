@@ -112,6 +112,26 @@ class TestInspectScript:
         result = inspect.inspect_script("de" * 25)
         assert result["type"] == "unknown"
 
+    def test_classifies_op_return_with_data(self):
+        """OP_RETURN (0x6a) data carriers are surfaced with their payload
+        split out into ``data_hex`` so the UI can render the data without
+        re-stripping the leading opcode."""
+        from pyrxd.glyph import inspect
+
+        # 0x6a (OP_RETURN) followed by an arbitrary protocol marker.
+        result = inspect.inspect_script("6a" + "deadbeef")
+        assert result["type"] == "op_return"
+        assert result["data_hex"] == "deadbeef"
+
+    def test_classifies_op_return_empty(self):
+        """A bare 0x6a with no following payload is still OP_RETURN — the
+        empty data field signals an unspendable marker output."""
+        from pyrxd.glyph import inspect
+
+        result = inspect.inspect_script("6a")
+        assert result["type"] == "op_return"
+        assert result["data_hex"] == ""
+
 
 class TestSanitizeDisplayString:
     """The sanitizer is the trust boundary for any CBOR-derived string

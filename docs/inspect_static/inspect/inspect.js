@@ -713,6 +713,13 @@ function renderOutputRow(row) {
   if (row.algo) dl.appendChild(kv("algo", row.algo));
   if (row.daa_mode) dl.appendChild(kv("daa mode", row.daa_mode));
   if (row.version) dl.appendChild(kv("version", row.version));
+  if (row.data_hex !== undefined) {
+    // OP_RETURN data — show truncated for long blobs to keep the
+    // row scannable; the JSON drawer carries the full bytes.
+    const data = row.data_hex || "(empty)";
+    const truncated = data.length > 64 ? data.slice(0, 64) + "…" : data;
+    dl.appendChild(kv("data (hex)", truncated));
+  }
   if (type === "error") {
     dl.appendChild(kv("error", row.error || "(unknown)"));
   }
@@ -746,7 +753,25 @@ function _detectTxShape(payload) {
     counts[t] = (counts[t] || 0) + 1;
   }
   const has = (t) => (counts[t] || 0) > 0;
-  const total = outputs.length;
+  const dmintOutput = outputs.find((o) => String(o.type).toLowerCase() === "dmint");
+
+  // Burn — the explicit Glyph protocol marker (GlyphProtocol.BURN = 6)
+  // appearing in the reveal-metadata's protocol list. A burn tx
+  // consumes an FT/NFT input and signals "this token / NFT is
+  // permanently destroyed" via the reveal CBOR. The tx may have no
+  // ref-bearing outputs at all, or may have ones marked as burn-tagged.
+  // We rely on the explicit marker rather than absence-of-outputs
+  // because plain RXD sends also lack ref outputs.
+  const protocol = ((payload.metadata || {}).protocol || []).map(String);
+  if (protocol.includes("6") || protocol.some((p) => p.endsWith("BURN"))) {
+    return (
+      "This is a Glyph burn transaction — the deployer/holder signalled " +
+      "that an FT or NFT is permanently destroyed. Tokens consumed by " +
+      "this transaction are removed from circulation; subsequent " +
+      "transfers cannot reference the burned ref. The reveal metadata " +
+      "carries the BURN protocol marker (= 6)."
+    );
+  }
 
   // Glyph FT deploy: 1 commit-ft + 1+ ft (or p2pkh holding refs) + 1
   // commit-nft + RXD change. The commit-nft is the protocol-level
@@ -787,13 +812,28 @@ function _detectTxShape(payload) {
     );
   }
 
-  // dMint deploy.
-  if (has("dmint")) {
+  // dMint deploy vs claim. The contract's ``height`` field starts at
+  // 0 in the deploy and advances by 1 on each successful mint claim,
+  // so we can distinguish from the output alone — no need to walk
+  // inputs. The contract_ref + token_ref point to the deploy outpoint
+  // either way.
+  if (dmintOutput) {
+    if (dmintOutput.height === 0 || dmintOutput.height === "0") {
+      return (
+        "This is a dMint contract deploy — a permissionless-mint " +
+        "token whose supply is gated by proof-of-work. Subsequent " +
+        "transactions can spend this output to claim a mint, " +
+        "incrementing the height each time. Anyone can mint until " +
+        "height reaches max_height."
+      );
+    }
     return (
-      "This transaction contains a dMint contract output — a " +
-      "permissionless-mint token whose supply is gated by " +
-      "proof-of-work. Subsequent transactions that spend this output " +
-      "produce mint outputs against the contract's parameters."
+      `This is a dMint claim transaction (height ${dmintOutput.height} ` +
+      `of ${dmintOutput.max_height}) — somebody spent the contract's ` +
+      "previous output to mint themselves a token, and the contract " +
+      "continues at the new dmint output. The freshly-minted FT lives " +
+      "in a separate ft output in this same tx. Inspect the contract's " +
+      "deploy outpoint to see the original parameters."
     );
   }
 
@@ -806,11 +846,21 @@ function _detectTxShape(payload) {
     );
   }
 
-  // Mixed transfer: ft outputs without commit. Likely the kind of tx
-  // a typical user is actually looking for (one they sent or
-  // received). No special note — the per-output rows tell the story.
+  // FT-only transfer (no commit, no dmint). Common case: a token send.
   if (has("ft") && !has("commit-ft") && !has("commit-nft")) {
     return ""; // ordinary transfer; the rows speak for themselves
+  }
+
+  // NFT singleton transfer (no commit). Same shape — show no banner.
+  if (has("nft") && !has("commit-nft")) {
+    return "";
+  }
+
+  // Plain RXD transaction — only p2pkh outputs, no Glyph types. Common
+  // enough that surfacing "this is just a regular send" is reassuring,
+  // especially in contrast to deploy/claim/burn shapes above.
+  if (Object.keys(counts).every((t) => t === "p2pkh")) {
+    return ""; // plain RXD — no protocol context to add
   }
 
   return "";
@@ -841,6 +891,10 @@ function _structuralQualifierNote(type) {
     dmint: "Structural pattern match: does NOT verify the contract_ref " +
         "points to a valid mint chain or that the parameters match a " +
         "deployed token.",
+    op_return: "OP_RETURN: an unspendable data carrier. Used by some " +
+        "non-Glyph protocols (legacy Atomicals-style markers, " +
+        "third-party tooling) to embed arbitrary bytes on-chain. " +
+        "Does NOT carry value and is not part of the Glyph protocol.",
   };
   return NOTES[type] || "";
 }
@@ -887,6 +941,7 @@ function renderScriptCard(payload) {
     "commit-ft": "FT commit script",
     "commit-nft": "NFT commit script",
     p2pkh: "P2PKH locking script",
+    op_return: "OP_RETURN data output",
     unknown: "Unrecognised script",
   };
   const wrapper = card(titleMap[type] || "Locking script", scriptBadgeKind(type));
@@ -915,6 +970,11 @@ function renderScriptCard(payload) {
   if (payload.reward !== undefined) dl.appendChild(kv("reward", payload.reward));
   if (payload.algo) dl.appendChild(kv("algo", payload.algo));
   if (payload.daa_mode) dl.appendChild(kv("daa mode", payload.daa_mode));
+
+  // OP_RETURN data carrier
+  if (payload.data_hex !== undefined) {
+    dl.appendChild(kv("data (hex)", payload.data_hex || "(empty)"));
+  }
 
   wrapper.appendChild(dl);
 
