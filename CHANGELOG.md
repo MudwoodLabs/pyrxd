@@ -4,6 +4,118 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-05-07
+
+### Added
+
+#### Glyph inspect — CLI
+
+- `pyrxd glyph inspect` — offline classifier for any Glyph input
+  (script hex, txid, outpoint, contract id). Always emits a
+  "structural pattern match" qualifier so users understand the tool
+  classifies on-chain shapes, not protocol-level semantic
+  correctness.
+- `pyrxd glyph inspect --fetch` — txid lookup via the configured
+  ElectrumX server; full transaction structure with per-output
+  classification.
+- V1 dMint contract parsing — the actual mainnet format observed
+  during RBG live testing. V2 also supported for future-compat.
+- Locked against a real RBG transfer fixture so the classifier is
+  pinned to mainnet behaviour, not synthetic vectors.
+
+#### Glyph inspect — browser-hosted (GitHub Pages)
+
+- New static tool at `docs/inspect_static/inspect/` (live at the
+  Pages site under `/inspect/`). Loads pyrxd via Pyodide and runs
+  the inspect classifier entirely in-browser — no server, no key
+  material, no transaction broadcast.
+- Inputs: raw script hex, txid (auto-fetches via ElectrumX
+  WebSocket), outpoint, contract id.
+- Tx-shape banner explaining what kind of transaction the user is
+  looking at: FT deploy, NFT deploy, dMint contract deploy, dMint
+  claim (with height / max_height), Glyph burn, mutable contract
+  update. Plain RXD sends and ordinary transfers render with no
+  banner.
+- Per-output structural-match qualifier on every classified script
+  type (ft, nft, mut, dmint, commit-ft, commit-nft, op_return)
+  spelling out exactly what the pattern match does **not**
+  verify — never claims semantic correctness.
+- OP_RETURN data carriers classified explicitly with `data_hex`
+  split out from the leading opcode.
+
+#### Glyph protocol
+
+- `GlyphRef.from_contract_hex` — parse explorer-style contract ids
+  in the standard hex form.
+- `is_dmint_script` / `extract_*_from_dmint_script` — first-class
+  dMint contract recognition alongside the existing FT/NFT/MUT
+  helpers.
+- TR39 confusables / homoglyph detector
+  (`pyrxd.glyph.confusables`) — flags Latin-spoofed token names and
+  symbols against the Unicode TR39 confusables data. Skeleton +
+  `is_latin_lookalike` helpers for inspecting hostile glyph
+  metadata.
+
+#### Hash
+
+- Pure-Python RIPEMD160 fallback. OpenSSL 3 distros (and Pyodide)
+  ship without a built-in RIPEMD160 provider; the fallback keeps
+  pyrxd working out of the box on those environments. Selected at
+  import time; OpenSSL is preferred when available.
+
+### Security
+
+- All browser-hosted inspect install artifacts (Pyodide loader,
+  pyrxd wheel, micropip wheels, vendored cbor2 wheel) verified by
+  SHA-256 before `micropip.install`. Loader uses Subresource
+  Integrity. Mismatch aborts install loudly rather than falling
+  through.
+- Vendored `cbor2==5.4.6` wheel served same-origin. cbor2 6.x
+  ships C-only; pinning to the last pure-Python release closes a
+  Pyodide install path that depended on PyPI staying reachable
+  and unchanged.
+- `micropip.install(..., deps=False)` for pyrxd to avoid
+  transitive metadata fetches during browser bootstrap.
+- `pyrxd/__init__.py`, `pyrxd/glyph/__init__.py`, and
+  `pyrxd/curve.py` rewritten to use lazy PEP 562 `__getattr__`
+  re-exports. Importing `pyrxd.glyph.inspect` no longer drags in
+  `coincurve`, `aiohttp`, or `websockets` — both a Pyodide
+  enabler and a startup-cost win for narrow callers.
+- Manifest filename validated as a bare basename (rejects path
+  traversal, dot-only names, and URL-encoded separators) before
+  use. CSP no longer allows PyPI as a script source. CLI outpoint
+  rendering sanitized against terminal control-character
+  injection. Manifest emit hardened against shell heredoc
+  injection.
+- CBOR `mime_type` field capped at 256 chars at parse time —
+  bounds an otherwise-unbounded user-controlled string before it
+  reaches metadata renderers.
+
+### Fixed
+
+- `pyrxd glyph inspect transfer-ft` previously passed bytes where
+  hex string was expected; corrected.
+- Python 3.10 compatibility for the CLI: `tomli` fallback for
+  `tomllib` (3.11+).
+- `_select_ripemd160` exception handling widened so OpenSSL
+  variants raising `ValueError` (not just the documented
+  `UnsupportedDigestmodError`) fall through to the pure-Python
+  implementation cleanly.
+
+### Documentation
+
+- `docs/solutions/runtime-errors/dmint-v1-classifier-gap.md`
+  written from the live RBG test that surfaced the V1/V2 split.
+- `docs/research/glyphs-on-radiant.md` — explains why Radiant FTs
+  are on-chain (not just metadata), with fuzzing strategy.
+
+### Tooling
+
+- Poetry version pinned in CI workflows.
+- OSSF Scorecard residual-risk decisions documented.
+- PyPI publishing automated via Trusted Publishing (no long-lived
+  tokens).
+
 ## [0.3.0] — 2026-05-04
 
 ### Breaking changes
