@@ -398,6 +398,33 @@ textarea#paste-input:disabled {
 .badge-outpoint { background: var(--color-commit); }
 .badge-script   { background: var(--color-p2pkh); }
 
+/* --- Homoglyph / display warnings --------------------------------- */
+
+.warning-banner {
+  margin-top: 1rem;
+  margin-bottom: 0;
+  padding: 0.75rem 1rem;
+  background: var(--error-bg);
+  color: var(--error-fg);
+  border: 1px solid var(--error-border);
+  border-radius: 6px;
+  font-size: 0.9rem;
+  line-height: 1.4;
+}
+
+.kv-warning {
+  /* The value text itself is unchanged — colour cue only. */
+  color: var(--error-fg);
+}
+
+.kv-warning-note {
+  margin-top: 0.2rem;
+  font-size: 0.8rem;
+  font-style: italic;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  color: var(--error-fg);
+}
+
 /* --- Fetch button (txid card) -------------------------------------- */
 
 .fetch-row {

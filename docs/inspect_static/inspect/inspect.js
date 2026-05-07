@@ -417,6 +417,25 @@ function kv(label, value, valueClass) {
   return row;
 }
 
+// Render a kv pair where the value carries a per-field warning (e.g.
+// "mixed scripts (possible homoglyph)"). The value text remains
+// unmodified — sanitisation already happened on the Python side and
+// truncation on the recursive walker — but we attach a visible warning
+// label and a CSS class so the user can't miss the suspicion.
+function kvWithWarning(label, value, warningText) {
+  const row = el("div", { class: "kv-row" });
+  row.appendChild(el("dt", { class: "kv-label", text: label }));
+  const dd = el("dd", { class: warningText ? "kv-value kv-warning" : "kv-value" });
+  dd.textContent = value === null || value === undefined ? "—" : String(value);
+  if (warningText) {
+    const warning = el("div", { class: "kv-warning-note" });
+    warning.textContent = `⚠ ${warningText}`;
+    dd.appendChild(warning);
+  }
+  row.appendChild(dd);
+  return row;
+}
+
 function badge(label, kind) {
   // Type badge (FT, NFT, MUT, DMINT, COMMIT, P2PKH, UNKNOWN). The CSS
   // class controls colour from the Okabe-Ito palette.
@@ -490,18 +509,34 @@ function renderFetchedTxCard(payload) {
   if (metadata) {
     wrapper.appendChild(el("h3", { class: "result-subhead", text: "Reveal metadata" }));
     const mdl = el("dl", { class: "kv-list" });
+    const warnings = (metadata && metadata.display_warnings) || {};
     mdl.appendChild(kv("input index", metadata.input_index));
     if (Array.isArray(metadata.protocol) && metadata.protocol.length > 0) {
       mdl.appendChild(kv("protocol", metadata.protocol.join(", ")));
     }
-    if (metadata.name) mdl.appendChild(kv("name", metadata.name));
-    if (metadata.ticker) mdl.appendChild(kv("ticker", metadata.ticker));
-    if (metadata.description) mdl.appendChild(kv("description", metadata.description));
+    if (metadata.name) mdl.appendChild(kvWithWarning("name", metadata.name, warnings.name));
+    if (metadata.ticker) mdl.appendChild(kvWithWarning("ticker", metadata.ticker, warnings.ticker));
+    if (metadata.description) mdl.appendChild(kvWithWarning("description", metadata.description, warnings.description));
     if (metadata.decimals !== undefined && metadata.decimals !== null) {
       mdl.appendChild(kv("decimals", metadata.decimals));
     }
     if (metadata.main) mdl.appendChild(kv("main", metadata.main));
     wrapper.appendChild(mdl);
+
+    // Top-level warning banner if any field tripped a homoglyph flag.
+    // The Python side sets metadata.display_warnings as a {field: reason}
+    // dict; we surface it visibly so a user reading "USDC" can tell at a
+    // glance whether the string is what it looks like.
+    if (Object.keys(warnings).length > 0) {
+      const banner = el("p", { class: "warning-banner" });
+      banner.textContent =
+        "⚠ This token's metadata contains characters that visually mimic other " +
+        "scripts. Treat the displayed name/ticker/description with care — " +
+        "characters that look like Latin letters may actually be from another " +
+        "alphabet (e.g. Cyrillic 'а' instead of Latin 'a'). Verify the txid, " +
+        "not the name, before trusting this token.";
+      wrapper.appendChild(banner);
+    }
   }
 
   return wrapper;
@@ -700,14 +735,16 @@ function fetchRawTxFromElectrumx(txid) {
     }
 
     let settled = false;
+    let timer = null;
     const settle = (fn, value) => {
       if (settled) return;
       settled = true;
+      if (timer !== null) clearTimeout(timer);
       try { ws.close(); } catch { /* already closed */ }
       fn(value);
     };
 
-    const timer = setTimeout(() => {
+    timer = setTimeout(() => {
       settle(reject, new Error(`timed out after ${FETCH_TIMEOUT_MS}ms`));
     }, FETCH_TIMEOUT_MS);
 
@@ -722,10 +759,24 @@ function fetchRawTxFromElectrumx(txid) {
     });
 
     ws.addEventListener("message", (ev) => {
-      clearTimeout(timer);
+      // Cap raw frame size BEFORE JSON.parse so a hostile server
+      // can't make us allocate a multi-GB string in the parser. The
+      // hex cap below is a downstream sanity check on the parsed
+      // result; this one is the actual memory guard.
+      const data = typeof ev.data === "string" ? ev.data : "";
+      if (data.length > MAX_FETCHED_TX_HEX_LEN + 4096) {
+        settle(reject, new Error(
+          `frame is ${data.length.toLocaleString()} chars; over the hex cap`
+        ));
+        return;
+      }
+
+      // NOTE: do not clearTimeout here. Mismatched-id frames are
+      // silently discarded (see below), so we must keep the timer
+      // armed until we actually settle. settle() clears the timer.
       let frame;
       try {
-        frame = JSON.parse(typeof ev.data === "string" ? ev.data : "");
+        frame = JSON.parse(data);
       } catch (err) {
         settle(reject, new Error(`server returned non-JSON: ${err.message}`));
         return;
@@ -733,11 +784,13 @@ function fetchRawTxFromElectrumx(txid) {
       if (frame.id !== 1) {
         // Unexpected id — discard and keep waiting (cheap defence
         // against a server that buffers other clients' responses).
+        // The 10s timer keeps running, so an attacker drip-feeding
+        // mismatched-id frames cannot hold the connection forever.
         return;
       }
       if (frame.error) {
-        const msg = (frame.error && frame.error.message) || JSON.stringify(frame.error);
-        settle(reject, new Error(`server error: ${msg}`));
+        const rawMsg = (frame.error && frame.error.message) || JSON.stringify(frame.error);
+        settle(reject, new Error(`server error: ${stripControlChars(rawMsg)}`));
         return;
       }
       const result = frame.result;
@@ -761,15 +814,28 @@ function fetchRawTxFromElectrumx(txid) {
     });
 
     ws.addEventListener("error", () => {
-      clearTimeout(timer);
       settle(reject, new Error("WebSocket error connecting to ElectrumX"));
     });
 
     ws.addEventListener("close", () => {
-      clearTimeout(timer);
       settle(reject, new Error("WebSocket closed before any response"));
     });
   });
+}
+
+// Strip control / format codepoints from server-supplied strings
+// before they reach the DOM. textContent makes XSS impossible, but
+// a hostile ElectrumX server could still embed bidi overrides or
+// zero-width characters into an error message that would render
+// visually misleading text inside the error card. Mirrors the
+// Python side's _sanitize_display_string for messages that don't
+// cross the bridge.
+function stripControlChars(s) {
+  if (typeof s !== "string") return String(s);
+  // \p{C} = control + format + surrogate + private + unassigned.
+  // \p{M} = combining marks. Both trimmed for parity with the
+  // Python side's category list.
+  return s.replace(/[\p{C}\p{M}]/gu, "?");
 }
 
 async function onFetchTxid(txid, fetchBtn, statusEl) {

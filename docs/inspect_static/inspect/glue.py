@@ -26,6 +26,7 @@ Design rules:
 from __future__ import annotations
 
 import sys
+import unicodedata
 
 # AES shim for Pyodide. ``pyrxd`` imports ``Cryptodome.Cipher.AES``
 # (from ``pycryptodomex``), which only ships C-extension wheels and
@@ -228,6 +229,24 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
             ),
         )
 
+    # Annotate metadata strings with homoglyph / script-mixing warnings.
+    # The control-byte sanitizer runs in the next step, but it doesn't
+    # catch a token deployer who names their token "USDC" using a
+    # Cyrillic 'U' (U+0405) and a Cyrillic 'С' (U+0421) — visually
+    # identical to Latin, but a different token. We compute a per-field
+    # "looks_suspicious" bool and surface it so the JS renderer can
+    # mark the field with a warning glyph.
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    if isinstance(metadata, dict):
+        warnings = {}
+        for field_name in ("name", "ticker", "description"):
+            field_value = metadata.get(field_name)
+            if isinstance(field_value, str) and field_value:
+                if _looks_suspicious(field_value):
+                    warnings[field_name] = "mixed scripts (possible homoglyph)"
+        if warnings:
+            metadata["display_warnings"] = warnings
+
     sanitized = _sanitize_payload_strings(payload)
     return {
         "ok": True,
@@ -235,6 +254,55 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
         "input": txid,
         "payload": sanitized,
     }
+
+
+# Unicode script blocks we treat as "the user probably meant Latin".
+# A string containing characters from any *other* script alongside Latin
+# ASCII letters is flagged as suspicious — that's the classic homoglyph
+# attack shape (Cyrillic 'а' inside an otherwise-Latin token name).
+_LATIN_SCRIPT_RANGES = (
+    (0x0041, 0x005A),  # A-Z
+    (0x0061, 0x007A),  # a-z
+)
+
+
+def _is_latin_letter(cp: int) -> bool:
+    return any(lo <= cp <= hi for lo, hi in _LATIN_SCRIPT_RANGES)
+
+
+def _looks_suspicious(s: str) -> bool:
+    """Return True if *s* mixes Latin ASCII letters with letters from
+    another script — the canonical homoglyph-spoofing shape (e.g.
+    "USDC" with a Cyrillic 'U' / 'С').
+
+    NFKC-normalise first so compatibility forms (full-width letters,
+    fraction-slash, etc.) collapse to their canonical form before we
+    check categories. A pure-Latin or pure-Cyrillic string is fine
+    — only mixed scripts trip the flag, because that's the attack shape.
+
+    Pure-non-letter strings (digits, punctuation, emoji) are not
+    flagged. Combining marks alone are sanitized away upstream.
+    """
+    if not isinstance(s, str) or not s:
+        return False
+    normalised = unicodedata.normalize("NFKC", s)
+    has_latin = False
+    has_other_letter = False
+    for ch in normalised:
+        cp = ord(ch)
+        cat = unicodedata.category(ch)
+        # Only Letter categories matter for confusables. (Lu / Ll / Lt /
+        # Lm / Lo). Symbols, punctuation, digits, and marks don't carry
+        # script identity for this check.
+        if not cat.startswith("L"):
+            continue
+        if _is_latin_letter(cp):
+            has_latin = True
+        else:
+            has_other_letter = True
+        if has_latin and has_other_letter:
+            return True
+    return False
 
 
 def _hint_for(form: str) -> str:
@@ -285,25 +353,56 @@ def _truncate(s: str, cap: int = _HUMAN_STRING_CAP) -> str:
     return _inspect.truncate_for_human(s, cap=cap) if isinstance(s, str) else s
 
 
-def _sanitize_payload_strings(value):
-    """Recursively walk a dict/list payload and sanitize every string.
+# Hex-shaped fields don't get truncated — txids, refs, payload hashes,
+# and addresses are full-fidelity primary keys; chopping them visually
+# misleads the user into thinking a different identifier is in use.
+# Field names enumerated explicitly so a future field doesn't sneak
+# past the cap by being unexpectedly hex-shaped.
+_HEX_FIELDS_NEVER_TRUNCATED = frozenset(
+    {
+        "txid",
+        "ref_txid",
+        "ref_outpoint",
+        "contract_ref_outpoint",
+        "token_ref_outpoint",
+        "outpoint",
+        "owner_pkh",
+        "payload_hash",
+        "wire_hex",
+        "input",
+        "main",  # already an opaque "<media: …>" summary string with embedded sha256
+    }
+)
 
-    Leaves non-strings alone. Used as the final step before the result
-    dict crosses the bridge: any string the JS side will eventually
-    write to the DOM has already had control / format / combining
-    codepoints stripped.
 
-    This is paranoid — today's offline forms don't carry CBOR strings —
-    but threading the sanitizer through a single point now means PR-C
-    can't accidentally regress when it adds ``main``, ``name``,
-    ``description``, ``ticker``, etc. to the payload.
+def _sanitize_payload_strings(value, *, key=None):
+    """Recursively walk a dict/list payload, sanitize and length-cap
+    every string.
+
+    Two transforms are applied:
+
+    1. ``sanitize_display_string`` strips control / format / combining
+       codepoints — defends against bidi overrides, ANSI escapes, ZWJ
+       fakery in CBOR-derived names/tickers/descriptions.
+    2. ``truncate_for_human`` caps the result at ``_HUMAN_STRING_CAP``
+       (200 chars) — defends against attacker descriptions that would
+       overflow the card and dominate the visual frame. Hex-shaped
+       primary keys (txid, refs, owner_pkh, etc.) are NEVER truncated;
+       chopping them visually misleads the user into thinking a
+       different identifier is in use.
+
+    The ``key`` keyword propagates the parent dict key down so the
+    truncation rule can opt out for known hex fields.
     """
     if isinstance(value, str):
-        return _inspect.sanitize_display_string(value)
+        sanitized = _inspect.sanitize_display_string(value)
+        if key in _HEX_FIELDS_NEVER_TRUNCATED:
+            return sanitized
+        return _truncate(sanitized)
     if isinstance(value, dict):
-        return {k: _sanitize_payload_strings(v) for k, v in value.items()}
+        return {k: _sanitize_payload_strings(v, key=k) for k, v in value.items()}
     if isinstance(value, list):
-        return [_sanitize_payload_strings(v) for v in value]
+        return [_sanitize_payload_strings(v, key=key) for v in value]
     if isinstance(value, tuple):
-        return tuple(_sanitize_payload_strings(v) for v in value)
+        return tuple(_sanitize_payload_strings(v, key=key) for v in value)
     return value

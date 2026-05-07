@@ -167,12 +167,15 @@ class TestClassifyRawTx:
 
     def test_returns_form_txid_dict(self):
         """Smoke against a tiny synthetic 1-input/1-output tx so no fixture
-        bytes are needed and no network ever runs."""
+        bytes are needed and no network ever runs.
+
+        The classifier rejects raw bytes <= 64 (Merkle-forgery defence
+        inherited from the ``RawTx`` newtype invariant), so the synthetic
+        tx must be at least 65 bytes. We give the output a real 25-byte
+        P2PKH locking script, which puts the total at ~85 bytes."""
         from pyrxd.glyph import inspect
 
-        # Simplest possible raw tx structure: 4-byte version, 1 vin (with
-        # 32-byte zero-prevout-hash + 0xffffffff vout + empty script + max
-        # sequence), 1 vout (zero satoshis + empty script), 4-byte locktime.
+        p2pkh_script = "76a914" + "aa" * 20 + "88ac"  # 25 bytes / 50 hex
         raw = bytes.fromhex(
             "01000000"  # version
             "01"  # vin count
@@ -182,7 +185,8 @@ class TestClassifyRawTx:
             + "ffffffff"  # sequence
             + "01"  # vout count
             + "0000000000000000"  # satoshis (0)
-            + "00"  # scriptPubKey length
+            + "19"  # scriptPubKey length (25 bytes)
+            + p2pkh_script
             + "00000000"  # locktime
         )
 
@@ -196,6 +200,7 @@ class TestClassifyRawTx:
         assert result["txid"] == txid
         assert result["input_count"] == 1
         assert result["output_count"] == 1
+        assert result["outputs"][0]["type"] == "p2pkh"
 
 
 class TestNoDirectCliImport:

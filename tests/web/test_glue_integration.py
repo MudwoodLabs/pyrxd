@@ -313,3 +313,89 @@ class TestInspectTxidWithRaw:
         result = glue.inspect_txid_with_raw(_RBG_TRANSFER_TXID, _RBG_TRANSFER_RAW_HEX)
         assert result["ok"] is True
         assert "‮" not in result["payload"]["metadata"]["name"]
+
+
+class TestHomoglyphDetection:
+    """A token deployer can put any CBOR string into name/ticker/desc.
+    The Python-side `_looks_suspicious` flags strings that mix Latin ASCII
+    letters with letters from another script — the canonical homoglyph
+    spoofing shape (e.g. "USDC" with a Cyrillic 'U' / 'С'). The flag is
+    surfaced as `metadata.display_warnings` so the JS side can render a
+    visible banner on the card."""
+
+    def test_pure_latin_not_flagged(self, glue):
+        assert glue._looks_suspicious("USDC") is False
+        assert glue._looks_suspicious("MyToken") is False
+
+    def test_pure_cyrillic_not_flagged(self, glue):
+        # All-Cyrillic is fine — it's only a problem when MIXED with Latin.
+        assert glue._looks_suspicious("УСДС") is False
+
+    def test_mixed_latin_cyrillic_flagged(self, glue):
+        # "USDC" with Cyrillic "С" (U+0421) instead of Latin "C".
+        spoofed = "USDС"  # ends in Cyrillic Es
+        assert glue._looks_suspicious(spoofed) is True
+
+    def test_latin_with_digits_not_flagged(self, glue):
+        # Digits and punctuation aren't Letters — they don't trip the flag.
+        assert glue._looks_suspicious("TOKEN123") is False
+        assert glue._looks_suspicious("A.B.C-1") is False
+
+    def test_latin_with_emoji_not_flagged(self, glue):
+        # Emoji are not Letter category; legitimate token names can contain them.
+        assert glue._looks_suspicious("TOKEN \U0001f680") is False
+
+    def test_empty_or_none_not_flagged(self, glue):
+        assert glue._looks_suspicious("") is False
+        assert glue._looks_suspicious(None) is False
+
+    def test_nfkc_normalisation_applied(self, glue):
+        # Full-width Latin letters look like Latin to a viewer; NFKC
+        # collapses them so the script-mixing check operates on the
+        # canonical form. A pure-fullwidth string should not be flagged
+        # (it's still all "Latin" after normalisation).
+        full_width_latin = "ＵＳＤＣ"  # "USDC" in full-width
+        assert glue._looks_suspicious(full_width_latin) is False
+
+
+class TestPayloadTruncation:
+    """The recursive sanitiser caps free-form strings at the human-display
+    limit so an attacker description can't overflow the card. Hex-shaped
+    primary keys (txid, refs, owner_pkh) MUST be passed through unchanged
+    — chopping a txid visually misleads the user about which transaction
+    they're inspecting."""
+
+    def test_long_description_truncated(self, glue):
+        long = "x" * 500
+        walked = glue._sanitize_payload_strings({"metadata": {"description": long}})
+        assert len(walked["metadata"]["description"]) <= 200
+
+    def test_long_name_truncated(self, glue):
+        long = "y" * 500
+        walked = glue._sanitize_payload_strings({"metadata": {"name": long}})
+        assert len(walked["metadata"]["name"]) <= 200
+
+    def test_full_length_txid_preserved(self, glue):
+        txid = "a" * 64
+        walked = glue._sanitize_payload_strings({"txid": txid})
+        assert walked["txid"] == txid
+
+    def test_owner_pkh_preserved_in_nested_output_row(self, glue):
+        pkh = "d" * 40
+        walked = glue._sanitize_payload_strings({"outputs": [{"owner_pkh": pkh, "type": "p2pkh"}]})
+        assert walked["outputs"][0]["owner_pkh"] == pkh
+
+    def test_ref_outpoint_preserved(self, glue):
+        ref = "b45dc453befb589aff8bfd76af0b994615b37eda094f48c380eb31deaf96a2a8:0"
+        walked = glue._sanitize_payload_strings({"ref_outpoint": ref})
+        assert walked["ref_outpoint"] == ref
+
+    def test_real_rbg_fixture_owner_pkh_untruncated_end_to_end(self, glue):
+        """End-to-end: even after going through inspect_txid_with_raw +
+        the recursive sanitiser, every output row's owner_pkh is full
+        40-char fidelity. Locks against a future change that
+        accidentally adds 'owner_pkh' to the truncate list."""
+        result = glue.inspect_txid_with_raw(_RBG_TRANSFER_TXID, _RBG_TRANSFER_RAW_HEX)
+        assert result["ok"] is True
+        for row in result["payload"]["outputs"]:
+            assert len(row["owner_pkh"]) == 40, row
