@@ -2,10 +2,16 @@ from __future__ import annotations
 
 from collections import namedtuple
 
-from coincurve import PublicKey as CcPublicKey
-
 from .constants import NUMBER_BYTE_LENGTH
 from .security.errors import ValidationError
+
+# coincurve (libsecp256k1 bindings) is imported lazily inside the
+# functions that need it. This keeps the ``curve`` namedtuple constant
+# at module top-level importable from ``pyrxd.utils`` without dragging
+# in coincurve — which has no pure-Python wheel and so can't install
+# under Pyodide. The browser-hosted inspect tool imports
+# ``pyrxd.utils.encode_int`` etc. but never touches the elliptic-curve
+# arithmetic paths below.
 
 Point = namedtuple("Point", "x y")
 
@@ -69,6 +75,8 @@ def curve_add(p: Point | None, q: Point | None) -> Point | None:
         # p == -q
         return None
     # p != -q
+    from coincurve import PublicKey as CcPublicKey  # lazy: see module docstring
+
     r = Point(*CcPublicKey.from_point(*p).combine([CcPublicKey.from_point(*q)]).point())
     if not on_curve(r):
         raise ValidationError("computed sum point is not on the curve")
@@ -86,6 +94,8 @@ def curve_multiply(scalar: int, point: Point | None) -> Point | None:
     if scalar < 0:
         # k * point = -k * (-point)
         return curve_multiply(-scalar, curve_negative(point))
+    from coincurve import PublicKey as CcPublicKey  # lazy: see module docstring
+
     r = Point(*CcPublicKey.from_point(*point).multiply((scalar % curve.n).to_bytes(NUMBER_BYTE_LENGTH, "big")).point())
     if not on_curve(r):
         raise ValidationError("computed product point is not on the curve")

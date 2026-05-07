@@ -1,23 +1,22 @@
 """Public façade for the Glyph inspect surface.
 
-The CLI command ``pyrxd glyph inspect`` is implemented as a set of
-``_``-prefixed helpers inside :mod:`pyrxd.cli.glyph_cmds`. The web UI
-hosted at ``docs/inspect/`` (loaded into a browser via Pyodide) needs
-the same surface, but **must not** import from CLI internals — that
-couples a public-facing tool to private implementation details that can
-churn freely.
+The CLI command ``pyrxd glyph inspect`` and the browser-hosted inspect
+tool (loaded via Pyodide at ``docs/inspect_static/inspect/``) share a
+common set of pure-Python helpers. Those helpers live in
+:mod:`pyrxd.glyph._inspect_core` so they're decoupled from the CLI's
+infrastructure (``click``, ``HdWallet``, signing, network clients). The
+browser tool imports through this façade, which simply re-exports the
+core helpers under public names (no underscore prefix).
 
-This module re-exports the inspect helpers as a stable public API so
-external callers (the web UI today, future SDK users tomorrow) have a
-documented contract:
+Public surface:
 
 * :func:`classify_input` — dispatch a raw string to its form
   (``"txid" | "contract" | "outpoint" | "script"``)
 * :func:`classify_raw_tx` — classify every output (and reveal CBOR) for
   a pre-fetched raw transaction. Synchronous; takes pre-fetched bytes
-  rather than an ElectrumXClient, so the web UI can fetch via the
-  browser's native WebSocket and feed bytes straight into the same
-  classifier the CLI uses
+  rather than an ElectrumXClient, so the browser tool can fetch via the
+  native WebSocket API and feed bytes straight into the same classifier
+  the CLI uses
 * :func:`inspect_contract` — decode a 72-char Glyph contract id
 * :func:`inspect_outpoint` — decode a ``txid:vout`` outpoint
 * :func:`inspect_script` — classify a hex-encoded locking script and
@@ -31,35 +30,44 @@ documented contract:
 * :func:`looks_confusable_with_latin` — high-level check that flags
   Latin-impersonating spoofs (e.g. Cyrillic-letter "USDC")
 
+Errors: every helper here raises
+:class:`pyrxd.security.errors.ValidationError` on invalid input. The
+CLI layer translates these into ``UserError`` with cause/fix
+decorations. External callers should ``except ValidationError`` and
+display the message string directly.
+
 If you are inside the pyrxd codebase, import the underlying helpers
-directly. If you are outside (web UI, downstream tooling), import from
-this module — it commits to a stable signature and shape.
+directly from ``pyrxd.glyph._inspect_core``. If you are outside (web
+UI, downstream tooling), import from this module — it commits to a
+stable signature and shape.
 """
 
 from __future__ import annotations
 
-# Re-export from the CLI module. The aliasing renames drop the leading
-# underscore so callers don't have to reach into a `_`-prefixed name —
-# that's the entire point of this façade.
-from ..cli.glyph_cmds import (
+# Re-export the SDK-level helpers under public names. These come
+# directly from the pure-Python core module — NOT from the CLI module
+# — so importing this façade doesn't transitively pull click, HdWallet,
+# coincurve, aiohttp, websockets, or Cryptodome.Cipher. That property
+# is asserted by ``tests/web/test_inspect_imports_pyodide_clean.py``.
+from ._inspect_core import (
     _classify_input as classify_input,
 )
-from ..cli.glyph_cmds import (
+from ._inspect_core import (
     _classify_raw_tx as classify_raw_tx,
 )
-from ..cli.glyph_cmds import (
+from ._inspect_core import (
     _inspect_contract as inspect_contract,
 )
-from ..cli.glyph_cmds import (
+from ._inspect_core import (
     _inspect_outpoint as inspect_outpoint,
 )
-from ..cli.glyph_cmds import (
+from ._inspect_core import (
     _inspect_script as inspect_script,
 )
-from ..cli.glyph_cmds import (
+from ._inspect_core import (
     _sanitize_display_string as sanitize_display_string,
 )
-from ..cli.glyph_cmds import (
+from ._inspect_core import (
     _truncate_for_human as truncate_for_human,
 )
 from .confusables import looks_confusable_with_latin, skeleton
