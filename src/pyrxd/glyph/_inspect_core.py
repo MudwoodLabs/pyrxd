@@ -181,12 +181,21 @@ def _inspect_outpoint(s: str) -> dict:
     from .types import GlyphRef
 
     if s.count(":") != 1:
-        raise ValidationError(f"outpoint must be exactly one 'txid:vout', got {s!r}")
+        # Don't echo the raw input back — a CLI user who pasted bytes
+        # containing ANSI escapes or bidi-overrides would otherwise see
+        # those rendered to their terminal verbatim. The bare error
+        # tells them what was wrong; they already know what they pasted.
+        raise ValidationError("outpoint must be exactly one 'txid:vout'")
     txid_str, vout_str = s.split(":", 1)
     try:
         vout = int(vout_str, 10)
     except ValueError as exc:
-        raise ValidationError(f"vout is not an integer: {vout_str!r}") from exc
+        # Same defence: ``vout_str`` is whatever the user pasted after
+        # the colon. Sanitise before embedding so attacker bytes can't
+        # reach the terminal. The sanitiser strips control / format /
+        # combining codepoints — exactly the surface that terminal
+        # injection exploits.
+        raise ValidationError(f"vout is not an integer: {_sanitize_display_string(vout_str)!r}") from exc
     ref = GlyphRef(txid=Txid(txid_str.lower()), vout=vout)
     return {
         "form": "outpoint",

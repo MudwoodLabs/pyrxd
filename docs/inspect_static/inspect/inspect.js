@@ -118,28 +118,101 @@ function setProgress(pct) {
 // Boot
 // ---------------------------------------------------------------------
 
+// Validate a filename field from manifest.json is a bare basename
+// — not an absolute URL, not a path traversal, not a scheme. Defends
+// against an attacker-poisoned manifest redirecting wheel installs
+// to a CSP-allowed origin (e.g. PyPI hosts) where they've staged a
+// hostile wheel. Audit finding HIGH-1.
+function _assertSafeBasename(value, fieldName) {
+  if (typeof value !== "string" || !value) {
+    throw new Error(`manifest.${fieldName} missing or empty`);
+  }
+  // Reject any character that could change URL resolution: ``/`` and
+  // ``\\`` for path traversal, ``:`` to defeat scheme prefixes (e.g.
+  // ``data:``, ``https:``), ``?`` and ``#`` for query / fragment
+  // tricks. Allowed alphabet matches the wheel-filename convention
+  // (``pyrxd-0.3.0-py3-none-any.whl``: alphanumerics, ``.``, ``-``,
+  // ``_``).
+  if (!/^[A-Za-z0-9._-]+$/.test(value)) {
+    throw new Error(
+      `manifest.${fieldName}=${JSON.stringify(value)} is not a bare ` +
+      `filename (allowed: alphanumerics, '.', '-', '_'). This is a ` +
+      `defence against a poisoned manifest redirecting installs ` +
+      `off-origin.`
+    );
+  }
+}
+
+// Validate a SHA-256 field from manifest.json is exactly 64 lowercase
+// hex characters. Anything else is a deploy bug — better to fail loud
+// than silently accept and skip the verify step downstream.
+function _assertHexSha256(value, fieldName) {
+  if (typeof value !== "string" || !/^[0-9a-f]{64}$/.test(value)) {
+    throw new Error(
+      `manifest.${fieldName} must be 64 lowercase hex chars (SHA-256), ` +
+      `got ${JSON.stringify(value)}`
+    );
+  }
+}
+
 async function loadManifest() {
   setProgress(5);
+  let manifest;
   try {
     const resp = await fetch(WHEELS_MANIFEST, { cache: "no-cache" });
     if (!resp.ok) {
       throw new Error(`manifest HTTP ${resp.status}`);
     }
-    return await resp.json();
+    manifest = await resp.json();
   } catch (err) {
     throw new Error(
       `Could not load wheel manifest from ${WHEELS_MANIFEST}: ${err.message}. ` +
       `This usually means the docs CI step that builds the wheel failed.`
     );
   }
+  // Validate the manifest fields the boot path will trust. If the
+  // deploy ever produces a malformed or hostile manifest, fail closed
+  // here rather than at the Python install step (where the failure
+  // mode is harder to diagnose).
+  _assertSafeBasename(manifest.wheel, "wheel");
+  _assertHexSha256(manifest.wheel_sha256, "wheel_sha256");
+  _assertSafeBasename(manifest.cbor2_wheel, "cbor2_wheel");
+  _assertHexSha256(manifest.cbor2_sha256, "cbor2_sha256");
+  _assertHexSha256(manifest.glue_sha256, "glue_sha256");
+  return manifest;
 }
 
-async function fetchGlueSource() {
-  const resp = await fetch(GLUE_URL, { cache: "no-cache" });
+// Fetch a same-origin URL, verify its SHA-256 against the expected
+// hex digest, return the bytes. The hash is the trust boundary —
+// even if the GitHub Pages deploy is compromised, a mismatch fails
+// closed before any wheel byte reaches the Pyodide interpreter.
+async function fetchAndVerify(url, expectedSha256, label) {
+  const resp = await fetch(url, { cache: "no-cache" });
   if (!resp.ok) {
-    throw new Error(`glue.py HTTP ${resp.status}`);
+    throw new Error(`${label} HTTP ${resp.status}`);
   }
-  return await resp.text();
+  const buffer = await resp.arrayBuffer();
+  const hashBuffer = await crypto.subtle.digest("SHA-256", buffer);
+  // Convert to lowercase hex.
+  const hashArr = new Uint8Array(hashBuffer);
+  let hashHex = "";
+  for (const b of hashArr) {
+    hashHex += b.toString(16).padStart(2, "0");
+  }
+  if (hashHex !== expectedSha256) {
+    throw new Error(
+      `${label} SHA-256 mismatch — expected ${expectedSha256}, ` +
+      `got ${hashHex}. The deployed bytes don't match the manifest. ` +
+      `This is the integrity check refusing to proceed; do NOT ` +
+      `install the wheel by other means.`
+    );
+  }
+  return buffer;
+}
+
+async function fetchGlueSource(expectedSha256) {
+  const buffer = await fetchAndVerify(GLUE_URL, expectedSha256, "glue.py");
+  return new TextDecoder("utf-8").decode(buffer);
 }
 
 async function boot() {
@@ -176,7 +249,7 @@ async function boot() {
 
   try {
     // Load Pyodide-bundled support packages first.
-    //   - ``micropip`` — for installing the same-origin pyrxd wheel.
+    //   - ``micropip`` — for installing the vendored wheels from FS.
     //   - ``pycryptodome`` — pyrxd imports ``Cryptodome.Cipher.AES`` in
     //     the encrypted-wallet path. The inspect tool doesn't actually
     //     reach that path, but the lazy ``__getattr__``s in pyrxd's
@@ -185,27 +258,40 @@ async function boot() {
     //     ``Cryptodome`` → ``Crypto`` so the import resolves).
     await pyodide.loadPackage(["micropip", "pycryptodome"]);
 
-    // Install ``cbor2`` from PyPI. The latest cbor2 (6.x) is C-only —
-    // no pure-Python wheel exists, so micropip can't install it under
-    // WASM. cbor2 5.4.6 was the last release with a ``py3-none-any``
-    // wheel (pure-Python). Pin to that. If a newer cbor2 ever ships
-    // a pure-Python or pyodide-tagged wheel, lift the pin.
+    // Both wheels are vendored same-origin (under /inspect/wheels/)
+    // and SHA-256 pinned in manifest.json. Fetch each, verify the
+    // hash with crypto.subtle.digest, write the bytes to Pyodide FS,
+    // and install from there. This:
+    //   - Closes the supply-chain gap from PyPI fetches (audit
+    //     finding HIGH-1, MEDIUM-2, MEDIUM-3): no off-origin install
+    //     paths remain, and CSP can drop ``pypi.org`` /
+    //     ``files.pythonhosted.org``.
+    //   - Defends against a poisoned manifest redirecting wheel
+    //     installs to attacker-staged URLs: ``loadManifest`` already
+    //     validates ``wheel`` / ``cbor2_wheel`` are bare basenames.
+    //   - Defends against a compromised GitHub Pages deploy: even
+    //     same-origin bytes are SHA-checked before micropip sees them.
     //
-    // Then install the same-origin pyrxd wheel with ``deps=False``.
-    // The pyrxd wheel's METADATA declares five runtime deps
-    // (aiohttp, coincurve, base58, pycryptodomex, websockets) for the
-    // full SDK surface. Most don't have pure-Python wheels and would
-    // fail under micropip. The inspect tool needs none of them —
-    // see ``pyrxd.glyph.inspect``'s import-graph contract test in
-    // ``tests/web/test_inspect_imports_pyodide_clean.py``.
-    const wheelURL = new URL(manifest.wheel, WHEELS_BASE).toString();
+    // We use ``deps=False`` for the pyrxd wheel because its METADATA
+    // declares five runtime deps (aiohttp, coincurve, base58,
+    // pycryptodomex, websockets) for the full SDK surface; most have
+    // no pure-Python wheels. The inspect tool needs none of them —
+    // see ``tests/web/test_inspect_imports_pyodide_clean.py``.
+    const cbor2URL = new URL(manifest.cbor2_wheel, WHEELS_BASE).toString();
+    const cbor2Bytes = await fetchAndVerify(cbor2URL, manifest.cbor2_sha256, "cbor2 wheel");
+    pyodide.FS.writeFile("/tmp/" + manifest.cbor2_wheel, new Uint8Array(cbor2Bytes));
+
+    const pyrxdURL = new URL(manifest.wheel, WHEELS_BASE).toString();
+    const pyrxdBytes = await fetchAndVerify(pyrxdURL, manifest.wheel_sha256, "pyrxd wheel");
+    pyodide.FS.writeFile("/tmp/" + manifest.wheel, new Uint8Array(pyrxdBytes));
+
     await pyodide.runPythonAsync(`
 import micropip
-await micropip.install("cbor2==5.4.6")
-await micropip.install(${JSON.stringify(wheelURL)}, deps=False)
+await micropip.install("emfs:/tmp/${manifest.cbor2_wheel}")
+await micropip.install("emfs:/tmp/${manifest.wheel}", deps=False)
 `);
   } catch (err) {
-    showError(`Could not install pyrxd from ${manifest.wheel}: ${err.message}`);
+    showError(`Could not install pyrxd: ${err.message}`);
     return;
   }
 
@@ -218,7 +304,7 @@ await micropip.install(${JSON.stringify(wheelURL)}, deps=False)
   // references stashed on the JS module.
   let versionText;
   try {
-    const glueSrc = await fetchGlueSource();
+    const glueSrc = await fetchGlueSource(manifest.glue_sha256);
     pyodide.FS.writeFile("/home/pyodide/glue.py", glueSrc);
     pyodide.runPython(`
 import sys
