@@ -175,16 +175,34 @@ async function boot() {
   setProgress(60);
 
   try {
-    // Pyodide ships ``pycryptodome`` (no -x). pyrxd imports
-    // ``Cryptodome.Cipher.AES`` via pycryptodomex which doesn't have a
-    // pure-Python wheel; glue.py shims ``Cryptodome`` -> ``Crypto`` at
-    // import time, so we install pycryptodome here BEFORE pyrxd so the
-    // shim has something to alias.
+    // Load Pyodide-bundled support packages first.
+    //   - ``micropip`` — for installing the same-origin pyrxd wheel.
+    //   - ``pycryptodome`` — pyrxd imports ``Cryptodome.Cipher.AES`` in
+    //     the encrypted-wallet path. The inspect tool doesn't actually
+    //     reach that path, but the lazy ``__getattr__``s in pyrxd's
+    //     package ``__init__``s might if a downstream caller touches
+    //     it. Cheap to load preemptively (the glue.py shim aliases
+    //     ``Cryptodome`` → ``Crypto`` so the import resolves).
     await pyodide.loadPackage(["micropip", "pycryptodome"]);
+
+    // Install ``cbor2`` from PyPI. The latest cbor2 (6.x) is C-only —
+    // no pure-Python wheel exists, so micropip can't install it under
+    // WASM. cbor2 5.4.6 was the last release with a ``py3-none-any``
+    // wheel (pure-Python). Pin to that. If a newer cbor2 ever ships
+    // a pure-Python or pyodide-tagged wheel, lift the pin.
+    //
+    // Then install the same-origin pyrxd wheel with ``deps=False``.
+    // The pyrxd wheel's METADATA declares five runtime deps
+    // (aiohttp, coincurve, base58, pycryptodomex, websockets) for the
+    // full SDK surface. Most don't have pure-Python wheels and would
+    // fail under micropip. The inspect tool needs none of them —
+    // see ``pyrxd.glyph.inspect``'s import-graph contract test in
+    // ``tests/web/test_inspect_imports_pyodide_clean.py``.
     const wheelURL = new URL(manifest.wheel, WHEELS_BASE).toString();
     await pyodide.runPythonAsync(`
 import micropip
-await micropip.install(${JSON.stringify(wheelURL)})
+await micropip.install("cbor2==5.4.6")
+await micropip.install(${JSON.stringify(wheelURL)}, deps=False)
 `);
   } catch (err) {
     showError(`Could not install pyrxd from ${manifest.wheel}: ${err.message}`);
