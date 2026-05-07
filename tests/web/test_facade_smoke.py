@@ -324,6 +324,19 @@ class TestWheelManifest:
             assert "?" not in v, f"{field} contains query: {v!r}"
             assert "#" not in v, f"{field} contains fragment: {v!r}"
 
+    def test_filenames_are_not_dot_only(self):
+        """Dot-only paths like ``.`` and ``..`` resolve to the current
+        / parent directory under ``new URL``. The page-side JS rejects
+        them explicitly so a poisoned manifest can't even fetch a
+        directory listing whose SHA happens to match. Round-2 audit
+        finding NEW-1."""
+        import re
+
+        manifest = self._manifest()
+        for field in ("wheel", "cbor2_wheel"):
+            v = manifest[field]
+            assert not re.fullmatch(r"\.+", v), f"{field} is dot-only: {v!r}"
+
     def test_recorded_shas_match_actual_files(self):
         """The hashes in manifest.json must match the actual bytes on
         disk. Catches a CI step that recorded a stale hash."""
