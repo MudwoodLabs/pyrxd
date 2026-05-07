@@ -13,15 +13,14 @@
                                   uses eval() in the Python-to-JS bridge); cost is
                                   documented in docs/threat-model.md.
        style-src 'self'          — only our own CSS
-       connect-src 'self' https://cdn.jsdelivr.net https://pypi.org
-                    https://files.pythonhosted.org
-                    wss://electrumx.radiant4people.com:50022
-                                — page-relative, the Pyodide CDN, PyPI metadata
-                                  + wheel mirror (micropip fetches the cbor2
-                                  pure-Python wheel from there), and the one
-                                  ElectrumX server we trust. The PyPI hosts
-                                  serve only static immutable wheel data;
-                                  micropip is read-only.
+       connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022
+                                — page-relative (for vendored wheels in
+                                  /inspect/wheels/), the Pyodide CDN, and the
+                                  one ElectrumX server we trust. PyPI hosts
+                                  are intentionally NOT whitelisted — the
+                                  cbor2 wheel is vendored same-origin and
+                                  SHA-256 verified via manifest.json so the
+                                  install path has no off-origin trust.
        img-src 'self' data:      — favicons + inline data: URIs only
        font-src 'self'           — bundled fonts only (none today)
        base-uri 'none'           — block <base> tag injection
@@ -35,7 +34,7 @@
     default-src 'none';
     script-src 'self' 'wasm-unsafe-eval' 'unsafe-eval' https://cdn.jsdelivr.net;
     style-src 'self';
-    connect-src 'self' https://cdn.jsdelivr.net https://pypi.org https://files.pythonhosted.org wss://electrumx.radiant4people.com:50022;
+    connect-src 'self' https://cdn.jsdelivr.net wss://electrumx.radiant4people.com:50022;
     img-src 'self' data:;
     font-src 'self';
     base-uri 'none';
