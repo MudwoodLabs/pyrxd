@@ -122,23 +122,43 @@ function setProgress(pct) {
 // — not an absolute URL, not a path traversal, not a scheme. Defends
 // against an attacker-poisoned manifest redirecting wheel installs
 // to a CSP-allowed origin (e.g. PyPI hosts) where they've staged a
-// hostile wheel. Audit finding HIGH-1.
+// hostile wheel.
+//
+// LOAD-BEARING INVARIANT: this function's regex is also the only
+// guard between manifest.{wheel,cbor2_wheel} and:
+//   - ``new URL(value, WHEELS_BASE)``  — absolute-URL escape
+//   - ``"/tmp/" + value``              — Pyodide FS path-traversal escape
+//   - ``"emfs:/tmp/" + value``         — Python-string interpolation
+//     into ``runPythonAsync(`...`)``
+// If the alphabet is ever widened to include ``/`` ``\`` ``:`` ``"`` ``\``
+// ``$``, EACH of those sinks becomes a vulnerability simultaneously.
+// Audit findings HIGH-1, NEW-1, NEW-2, NEW-5.
 function _assertSafeBasename(value, fieldName) {
   if (typeof value !== "string" || !value) {
     throw new Error(`manifest.${fieldName} missing or empty`);
   }
-  // Reject any character that could change URL resolution: ``/`` and
-  // ``\\`` for path traversal, ``:`` to defeat scheme prefixes (e.g.
-  // ``data:``, ``https:``), ``?`` and ``#`` for query / fragment
-  // tricks. Allowed alphabet matches the wheel-filename convention
-  // (``pyrxd-0.3.0-py3-none-any.whl``: alphanumerics, ``.``, ``-``,
-  // ``_``).
+  // Reject any character that could change URL resolution or escape
+  // a string-concatenated path: ``/`` and ``\\`` for path traversal,
+  // ``:`` to defeat scheme prefixes (``data:``, ``https:``), ``?``
+  // and ``#`` for query / fragment tricks, ``"`` and ``\\`` to escape
+  // Python-string interpolation. Allowed alphabet matches the
+  // wheel-filename convention: ``pyrxd-0.3.0-py3-none-any.whl``.
   if (!/^[A-Za-z0-9._-]+$/.test(value)) {
     throw new Error(
       `manifest.${fieldName}=${JSON.stringify(value)} is not a bare ` +
       `filename (allowed: alphanumerics, '.', '-', '_'). This is a ` +
       `defence against a poisoned manifest redirecting installs ` +
       `off-origin.`
+    );
+  }
+  // Explicit reject of dot-only names: ``.`` resolves to the current
+  // directory under ``new URL`` and ``..`` to the parent. Fail-closed
+  // here rather than relying on the downstream SHA-256 check to catch
+  // a directory-listing fetch — defence in depth, audit finding NEW-1.
+  if (/^\.+$/.test(value)) {
+    throw new Error(
+      `manifest.${fieldName}=${JSON.stringify(value)} is a dot-only ` +
+      `path; rejecting to prevent directory traversal.`
     );
   }
 }
@@ -277,6 +297,14 @@ async function boot() {
     // pycryptodomex, websockets) for the full SDK surface; most have
     // no pure-Python wheels. The inspect tool needs none of them —
     // see ``tests/web/test_inspect_imports_pyodide_clean.py``.
+    // Re-assert the basename invariant at the install site. ``loadManifest``
+    // already validates these, but the FS path concat (``/tmp/${name}``)
+    // and Python-string interpolation (``emfs:/tmp/${name}``) below are
+    // load-bearing on the regex's alphabet — explicit defence in depth
+    // against a future refactor that bypasses ``loadManifest``.
+    _assertSafeBasename(manifest.cbor2_wheel, "cbor2_wheel");
+    _assertSafeBasename(manifest.wheel, "wheel");
+
     const cbor2URL = new URL(manifest.cbor2_wheel, WHEELS_BASE).toString();
     const cbor2Bytes = await fetchAndVerify(cbor2URL, manifest.cbor2_sha256, "cbor2 wheel");
     pyodide.FS.writeFile("/tmp/" + manifest.cbor2_wheel, new Uint8Array(cbor2Bytes));

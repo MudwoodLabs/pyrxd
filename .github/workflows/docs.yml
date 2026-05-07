@@ -95,20 +95,39 @@ jobs:
           # 3. Compute SHA-256 of every artifact the page will fetch
           #    + verify, and write the manifest. The page-side JS
           #    refuses to install anything whose SHA doesn't match.
+          #
+          # The manifest is assembled via Python's ``json.dumps`` (not
+          # a shell heredoc) so any unexpected character in ``$wheel``
+          # — should ``pip wheel`` ever produce a filename with an
+          # embedded quote or backslash — is escaped properly rather
+          # than slipping into the JSON as a parser confusion. Audit
+          # finding NEW-3. The Python source lives in a tempfile so
+          # YAML doesn't try to parse the colons in the dict literal.
           wheel_sha=$(sha256sum "$wheel" | awk '{print $1}')
           glue_sha=$(sha256sum ../glue.py | awk '{print $1}')
           git_sha="${GITHUB_SHA:-unknown}"
-          cat > manifest.json <<EOF
-          {
-            "wheel": "$wheel",
-            "wheel_sha256": "$wheel_sha",
-            "cbor2_wheel": "cbor2-5.4.6-py3-none-any.whl",
-            "cbor2_sha256": "$cbor2_expected_sha",
-            "glue_sha256": "$glue_sha",
-            "git_sha": "${git_sha:0:7}",
-            "git_sha_full": "$git_sha"
+          export WHEEL="$wheel"
+          export WHEEL_SHA="$wheel_sha"
+          export CBOR2_SHA="$cbor2_expected_sha"
+          export GLUE_SHA="$glue_sha"
+          export GIT_SHA="$git_sha"
+          script=$(mktemp)
+          cat > "$script" <<'PY'
+          import json, os
+          manifest = {
+              "wheel": os.environ["WHEEL"],
+              "wheel_sha256": os.environ["WHEEL_SHA"],
+              "cbor2_wheel": "cbor2-5.4.6-py3-none-any.whl",
+              "cbor2_sha256": os.environ["CBOR2_SHA"],
+              "glue_sha256": os.environ["GLUE_SHA"],
+              "git_sha": os.environ["GIT_SHA"][:7],
+              "git_sha_full": os.environ["GIT_SHA"],
           }
-          EOF
+          with open("manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+          PY
+          python3 "$script"
+          rm -f "$script"
           echo "Wheels:"
           ls -la
           echo "Manifest:"
