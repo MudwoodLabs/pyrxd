@@ -317,45 +317,132 @@ class TestInspectTxidWithRaw:
 
 class TestHomoglyphDetection:
     """A token deployer can put any CBOR string into name/ticker/desc.
-    The Python-side `_looks_suspicious` flags strings that mix Latin ASCII
-    letters with letters from another script — the canonical homoglyph
-    spoofing shape (e.g. "USDC" with a Cyrillic 'U' / 'С'). The flag is
-    surfaced as `metadata.display_warnings` so the JS side can render a
-    visible banner on the card."""
+    Two attack shapes are flagged:
 
-    def test_pure_latin_not_flagged(self, glue):
-        assert glue._looks_suspicious("USDC") is False
-        assert glue._looks_suspicious("MyToken") is False
+    - **mixed scripts** — Latin ASCII letters mixed with letters from
+      another script. Per-character substitution (USDC with Cyrillic С).
+    - **non-Latin script** — every Letter codepoint is non-Latin.
+      Whole-word substitution (Cyrillic ВТС mimicking Latin BTC).
 
-    def test_pure_cyrillic_not_flagged(self, glue):
-        # All-Cyrillic is fine — it's only a problem when MIXED with Latin.
-        assert glue._looks_suspicious("УСДС") is False
+    The flag is surfaced as ``metadata.display_warnings[<field>]`` so the
+    JS side can render a banner + per-field warning. ``_suspicious_reason``
+    returns the reason string; ``_looks_suspicious`` is a backwards-
+    compat boolean wrapper.
+    """
 
-    def test_mixed_latin_cyrillic_flagged(self, glue):
-        # "USDC" with Cyrillic "С" (U+0421) instead of Latin "C".
-        spoofed = "USDС"  # ends in Cyrillic Es
-        assert glue._looks_suspicious(spoofed) is True
+    def test_pure_latin_ascii_not_flagged(self, glue):
+        assert glue._suspicious_reason("USDC") == ""
+        assert glue._suspicious_reason("MyToken") == ""
+        assert glue._suspicious_reason("BNB") == ""
+
+    def test_legit_latin_extended_not_flagged(self, glue):
+        """Real-world token names use accented Latin letters routinely.
+        Café / naïve / Zürich must NOT trip the flag — that would
+        damage trust in the legitimate non-English token namespace."""
+        for name in ["Café", "naïve", "Zürich", "piñata", "résumé"]:
+            assert glue._suspicious_reason(name) == "", f"false positive: {name!r}"
+
+    def test_mixed_latin_cyrillic_flagged_as_mixed(self, glue):
+        spoofed = "USDС"  # final char is Cyrillic С (U+0421)
+        assert glue._suspicious_reason(spoofed) == "mixed scripts (possible homoglyph)"
+
+    def test_pure_cyrillic_flagged_as_non_latin(self, glue):
+        """Pure-non-Latin token names that visually mimic Latin (the
+        classic ВТС-mimicking-BTC attack) must trip the flag too —
+        a Latin-default reader sees "BTC" but the token is something
+        else entirely."""
+        for name in ["ВТС", "ΟΜΓ", "аррӏе"]:
+            reason = glue._suspicious_reason(name)
+            assert reason == "non-Latin script (verify by txid, not by visual name)", (
+                f"unexpected reason for {name!r}: {reason!r}"
+            )
 
     def test_latin_with_digits_not_flagged(self, glue):
         # Digits and punctuation aren't Letters — they don't trip the flag.
-        assert glue._looks_suspicious("TOKEN123") is False
-        assert glue._looks_suspicious("A.B.C-1") is False
+        assert glue._suspicious_reason("TOKEN123") == ""
+        assert glue._suspicious_reason("A.B.C-1") == ""
 
     def test_latin_with_emoji_not_flagged(self, glue):
         # Emoji are not Letter category; legitimate token names can contain them.
-        assert glue._looks_suspicious("TOKEN \U0001f680") is False
+        assert glue._suspicious_reason("TOKEN \U0001f680") == ""
 
     def test_empty_or_none_not_flagged(self, glue):
-        assert glue._looks_suspicious("") is False
-        assert glue._looks_suspicious(None) is False
+        assert glue._suspicious_reason("") == ""
+        assert glue._suspicious_reason(None) == ""
 
     def test_nfkc_normalisation_applied(self, glue):
         # Full-width Latin letters look like Latin to a viewer; NFKC
         # collapses them so the script-mixing check operates on the
-        # canonical form. A pure-fullwidth string should not be flagged
-        # (it's still all "Latin" after normalisation).
+        # canonical form. A pure-fullwidth Latin string is still Latin
+        # after normalisation — must not be flagged.
         full_width_latin = "ＵＳＤＣ"  # "USDC" in full-width
-        assert glue._looks_suspicious(full_width_latin) is False
+        assert glue._suspicious_reason(full_width_latin) == ""
+
+    def test_bool_wrapper_still_works(self, glue):
+        """``_looks_suspicious`` kept as a boolean adapter for callers
+        that don't care about the reason."""
+        assert glue._looks_suspicious("USDC") is False
+        assert glue._looks_suspicious("USDС") is True  # mixed
+        assert glue._looks_suspicious("ВТС") is True  # pure non-Latin
+
+
+class TestProtocolFieldHomoglyphCoverage:
+    """The homoglyph check walks ``metadata.protocol`` array entries, not
+    just name/ticker/description. An attacker who puts a homoglyph in
+    the protocol field gets it surfaced via display_warnings the same
+    way."""
+
+    def test_protocol_with_mixed_script_entry_flagged(self, glue, monkeypatch):
+        from pyrxd.glyph import inspect as facade
+
+        def _evil(_txid, _raw):
+            return {
+                "form": "txid",
+                "txid": _txid,
+                "byte_length": 100,
+                "input_count": 1,
+                "output_count": 1,
+                "outputs": [],
+                "metadata": {
+                    "input_index": 0,
+                    "protocol": ["gly", "rxd", "USDС"],  # final entry mixed
+                    "name": "",
+                    "ticker": "",
+                    "description": "",
+                },
+            }
+
+        monkeypatch.setattr(facade, "classify_raw_tx", _evil)
+        result = glue.inspect_txid_with_raw(_RBG_TRANSFER_TXID, _RBG_TRANSFER_RAW_HEX)
+        warnings = result["payload"]["metadata"]["display_warnings"]
+        assert "protocol" in warnings
+        assert warnings["protocol"] == "mixed scripts (possible homoglyph)"
+
+    def test_benign_protocol_not_flagged(self, glue, monkeypatch):
+        from pyrxd.glyph import inspect as facade
+
+        def _benign(_txid, _raw):
+            return {
+                "form": "txid",
+                "txid": _txid,
+                "byte_length": 100,
+                "input_count": 1,
+                "output_count": 1,
+                "outputs": [],
+                "metadata": {
+                    "input_index": 0,
+                    "protocol": ["gly", "rxd"],
+                    "name": "",
+                    "ticker": "",
+                    "description": "",
+                },
+            }
+
+        monkeypatch.setattr(facade, "classify_raw_tx", _benign)
+        result = glue.inspect_txid_with_raw(_RBG_TRANSFER_TXID, _RBG_TRANSFER_RAW_HEX)
+        # display_warnings should be entirely absent (or have no protocol key).
+        warnings = result["payload"]["metadata"].get("display_warnings", {})
+        assert "protocol" not in warnings
 
 
 class TestPayloadTruncation:
@@ -399,3 +486,13 @@ class TestPayloadTruncation:
         assert result["ok"] is True
         for row in result["payload"]["outputs"]:
             assert len(row["owner_pkh"]) == 40, row
+
+    def test_main_field_is_truncated(self, glue):
+        """``main`` is constructed by Python as ``<media: {mime}, {N}
+        bytes, sha256={hex}>`` but the CBOR-supplied mime_type has no
+        upstream length cap, so an attacker mime_type of 64KB makes the
+        constructed string overflow the card. ``main`` is therefore
+        NOT in the never-truncate allowlist — must be capped at 200."""
+        long_main = "<media: " + "x" * 1000 + ">"
+        walked = glue._sanitize_payload_strings({"metadata": {"main": long_main}})
+        assert len(walked["metadata"]["main"]) <= 200

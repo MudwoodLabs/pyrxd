@@ -25,6 +25,7 @@ Design rules:
 
 from __future__ import annotations
 
+import functools
 import sys
 import unicodedata
 
@@ -233,17 +234,40 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
     # The control-byte sanitizer runs in the next step, but it doesn't
     # catch a token deployer who names their token "USDC" using a
     # Cyrillic 'U' (U+0405) and a Cyrillic 'С' (U+0421) — visually
-    # identical to Latin, but a different token. We compute a per-field
-    # "looks_suspicious" bool and surface it so the JS renderer can
-    # mark the field with a warning glyph.
+    # identical to Latin, but a different token.
+    #
+    # Two attack shapes get flagged:
+    #
+    #   - "mixed scripts" — Latin ASCII letters mixed with letters from
+    #     another script. Classic per-character substitution attack.
+    #   - "non-Latin script" — every Letter codepoint comes from a
+    #     non-Latin script. Whole-word substitution: pure-Cyrillic
+    #     "ВNВ" mimicking Latin "BNB". Doesn't mix scripts but still
+    #     visually impersonates Latin to a Latin-default reader.
+    #
+    # Both surface as ``metadata.display_warnings[<field>]`` so the JS
+    # renderer paints a warning band on the affected card.
     metadata = payload.get("metadata") if isinstance(payload, dict) else None
     if isinstance(metadata, dict):
         warnings = {}
         for field_name in ("name", "ticker", "description"):
             field_value = metadata.get(field_name)
             if isinstance(field_value, str) and field_value:
-                if _looks_suspicious(field_value):
-                    warnings[field_name] = "mixed scripts (possible homoglyph)"
+                reason = _suspicious_reason(field_value)
+                if reason:
+                    warnings[field_name] = reason
+        # ``protocol`` is a list of CBOR-supplied values rendered to the
+        # user as a comma-joined string. An attacker can put a homoglyph
+        # in any element. Walk the list and flag the field if any entry
+        # is suspicious.
+        protocol = metadata.get("protocol")
+        if isinstance(protocol, list):
+            for entry in protocol:
+                if isinstance(entry, str) and entry:
+                    reason = _suspicious_reason(entry)
+                    if reason:
+                        warnings["protocol"] = reason
+                        break
         if warnings:
             metadata["display_warnings"] = warnings
 
@@ -256,35 +280,46 @@ def inspect_txid_with_raw(txid: str, raw_hex: str) -> dict:
     }
 
 
-# Unicode script blocks we treat as "the user probably meant Latin".
-# A string containing characters from any *other* script alongside Latin
-# ASCII letters is flagged as suspicious — that's the classic homoglyph
-# attack shape (Cyrillic 'а' inside an otherwise-Latin token name).
-_LATIN_SCRIPT_RANGES = (
-    (0x0041, 0x005A),  # A-Z
-    (0x0061, 0x007A),  # a-z
-)
-
-
+# Whether a Letter codepoint is Latin-script (A-Z, a-z, plus Latin
+# Extended ranges that legitimately occur in user-facing names like
+# "Café", "naïve", "Zürich"). Python's stdlib doesn't expose the
+# Unicode "script" property directly, but ``unicodedata.name()``
+# returns a name string that always starts with the script's English
+# label ("LATIN ...", "CYRILLIC ...", "GREEK ...", etc.) — we use that
+# prefix as the script identifier. Cached per codepoint to amortise
+# the name-lookup cost across long strings.
+@functools.lru_cache(maxsize=4096)
 def _is_latin_letter(cp: int) -> bool:
-    return any(lo <= cp <= hi for lo, hi in _LATIN_SCRIPT_RANGES)
+    try:
+        name = unicodedata.name(chr(cp))
+    except ValueError:
+        return False
+    return name.startswith("LATIN ")
 
 
-def _looks_suspicious(s: str) -> bool:
-    """Return True if *s* mixes Latin ASCII letters with letters from
-    another script — the canonical homoglyph-spoofing shape (e.g.
-    "USDC" with a Cyrillic 'U' / 'С').
+def _suspicious_reason(s: str) -> str:
+    """Return a short reason string if *s* might be a homoglyph spoof,
+    or empty string if the input is benign.
 
     NFKC-normalise first so compatibility forms (full-width letters,
     fraction-slash, etc.) collapse to their canonical form before we
-    check categories. A pure-Latin or pure-Cyrillic string is fine
-    — only mixed scripts trip the flag, because that's the attack shape.
+    check categories.
 
-    Pure-non-letter strings (digits, punctuation, emoji) are not
-    flagged. Combining marks alone are sanitized away upstream.
+    Two attack shapes are caught:
+
+    - **mixed scripts** — Latin ASCII letters alongside letters from
+      another script. Per-character substitution: "USDC" with a
+      Cyrillic 'U'.
+    - **non-Latin script** — every Letter codepoint is non-Latin.
+      Whole-word substitution: "ВNВ" mimicking Latin "BNB".
+
+    Pure-Latin strings, pure-non-letter strings (digits / punctuation /
+    emoji), and the empty string return "" (benign). Combining marks
+    alone are sanitised away upstream by ``sanitize_display_string``;
+    we only inspect Letter codepoints here.
     """
     if not isinstance(s, str) or not s:
-        return False
+        return ""
     normalised = unicodedata.normalize("NFKC", s)
     has_latin = False
     has_other_letter = False
@@ -301,8 +336,18 @@ def _looks_suspicious(s: str) -> bool:
         else:
             has_other_letter = True
         if has_latin and has_other_letter:
-            return True
-    return False
+            return "mixed scripts (possible homoglyph)"
+    if has_other_letter and not has_latin:
+        return "non-Latin script (verify by txid, not by visual name)"
+    return ""
+
+
+def _looks_suspicious(s: str) -> bool:
+    """Backwards-compatible boolean wrapper around
+    :func:`_suspicious_reason`. Kept for the existing test suite; new
+    code should prefer ``_suspicious_reason`` so the actual reason
+    surfaces to the user."""
+    return bool(_suspicious_reason(s))
 
 
 def _hint_for(form: str) -> str:
@@ -358,6 +403,14 @@ def _truncate(s: str, cap: int = _HUMAN_STRING_CAP) -> str:
 # misleads the user into thinking a different identifier is in use.
 # Field names enumerated explicitly so a future field doesn't sneak
 # past the cap by being unexpectedly hex-shaped.
+#
+# Note: ``main`` is NOT in this list even though the Python side
+# constructs it as a ``<media: {mime_type}, {N} bytes, sha256={hex}>``
+# summary. The CBOR-supplied ``mime_type`` has no length cap upstream
+# (``decode_payload`` doesn't constrain ``m["t"]``), so an attacker
+# could put 64KB of mime_type into the constructed string. The
+# embedded sha256 is fine to truncate at 200 chars — the user can read
+# the full hash via the JSON drawer if needed.
 _HEX_FIELDS_NEVER_TRUNCATED = frozenset(
     {
         "txid",
@@ -370,7 +423,6 @@ _HEX_FIELDS_NEVER_TRUNCATED = frozenset(
         "payload_hash",
         "wire_hex",
         "input",
-        "main",  # already an opaque "<media: …>" summary string with embedded sha256
     }
 )
 

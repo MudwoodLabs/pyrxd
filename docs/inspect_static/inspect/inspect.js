@@ -512,7 +512,7 @@ function renderFetchedTxCard(payload) {
     const warnings = (metadata && metadata.display_warnings) || {};
     mdl.appendChild(kv("input index", metadata.input_index));
     if (Array.isArray(metadata.protocol) && metadata.protocol.length > 0) {
-      mdl.appendChild(kv("protocol", metadata.protocol.join(", ")));
+      mdl.appendChild(kvWithWarning("protocol", metadata.protocol.join(", "), warnings.protocol));
     }
     if (metadata.name) mdl.appendChild(kvWithWarning("name", metadata.name, warnings.name));
     if (metadata.ticker) mdl.appendChild(kvWithWarning("ticker", metadata.ticker, warnings.ticker));
@@ -526,15 +526,20 @@ function renderFetchedTxCard(payload) {
     // Top-level warning banner if any field tripped a homoglyph flag.
     // The Python side sets metadata.display_warnings as a {field: reason}
     // dict; we surface it visibly so a user reading "USDC" can tell at a
-    // glance whether the string is what it looks like.
+    // glance whether the string is what it looks like. Two reason
+    // shapes today: "mixed scripts" (per-character substitution like
+    // Latin "USDC" with Cyrillic "С") and "non-Latin script"
+    // (whole-word substitution like Cyrillic "ВТС" mimicking Latin
+    // "BTC"). Both warrant a banner; the body text covers both shapes.
     if (Object.keys(warnings).length > 0) {
       const banner = el("p", { class: "warning-banner" });
       banner.textContent =
-        "⚠ This token's metadata contains characters that visually mimic other " +
-        "scripts. Treat the displayed name/ticker/description with care — " +
-        "characters that look like Latin letters may actually be from another " +
-        "alphabet (e.g. Cyrillic 'а' instead of Latin 'a'). Verify the txid, " +
-        "not the name, before trusting this token.";
+        "⚠ This token's metadata contains characters that visually mimic " +
+        "Latin letters. Treat the displayed name, ticker, description, " +
+        "and protocol fields with care — they may use letters from a " +
+        "different alphabet (e.g. Cyrillic 'а' looks identical to Latin " +
+        "'a'). The only reliable identifier for this token is the txid " +
+        "above; verify by txid, not by visual name.";
       wrapper.appendChild(banner);
     }
   }
