@@ -359,6 +359,34 @@ textarea#paste-input:disabled {
   padding-left: 0.6rem;
 }
 
+/* Tx-shape explainer at the top of a fetched-tx card. Calls out
+   "this is a deploy tx, not a transfer" cases the user is likely
+   confused about. Slightly more prominent than .card-note. */
+.tx-shape-note {
+  margin-top: 0.75rem;
+  margin-bottom: 0.5rem;
+  padding: 0.6rem 0.75rem;
+  font-size: 0.88rem;
+  background: var(--code-bg);
+  color: var(--fg);
+  border-left: 3px solid var(--link);
+  border-radius: 4px;
+  line-height: 1.5;
+}
+
+/* Structural-match qualifier on per-output rows + standalone script
+   cards. Smaller and grayer than the shape note — reminds the reader
+   that classification is bytewise pattern-matching, not provenance
+   verification, without dominating the row. */
+.structural-note {
+  margin-top: 0.4rem;
+  margin-bottom: 0;
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-style: italic;
+  line-height: 1.4;
+}
+
 .error-message {
   margin: 0 0 0.5rem 0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Liberation Mono",

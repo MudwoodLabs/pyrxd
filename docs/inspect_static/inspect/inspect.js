@@ -625,6 +625,19 @@ function renderFetchedTxCard(payload) {
   dl.appendChild(kv("outputs", payload.output_count));
   wrapper.appendChild(dl);
 
+  // Tx-shape note. A user pasting an FT contract id (the canonical
+  // identifier they'd see in a block explorer or wallet) often
+  // expects to see "their transfer" but actually fetches the FT's
+  // *deploy* tx — which has a distinctive shape (commit-ft + N
+  // p2pkh + commit-nft + change). Recognising that shape and
+  // surfacing what it is heads off the "wait, why did I mint an
+  // NFT?" confusion. Same logic applies to NFT singletons,
+  // mutable contracts, and dmint deploys.
+  const shapeNote = _detectTxShape(payload);
+  if (shapeNote) {
+    wrapper.appendChild(el("p", { class: "tx-shape-note", text: shapeNote }));
+  }
+
   // Per-output rows.
   const outputs = payload.outputs || [];
   if (outputs.length > 0) {
@@ -704,7 +717,132 @@ function renderOutputRow(row) {
     dl.appendChild(kv("error", row.error || "(unknown)"));
   }
   wrapper.appendChild(dl);
+
+  // Structural-match qualifier — parity with the CLI human renderer
+  // (issue #53 / PR #58). The script classifier matches by hex
+  // pattern, not by cryptographic provenance — a custom locking
+  // script whose bytes happen to fit one of these templates would
+  // also classify as ft/nft/mut/dmint/commit. The qualifier nudges
+  // the user to verify by ref / outpoint, not by the type badge
+  // alone.
+  const qualifier = _structuralQualifierNote(type);
+  if (qualifier) {
+    wrapper.appendChild(el("p", { class: "structural-note", text: qualifier }));
+  }
   return wrapper;
+}
+
+// Recognise common Glyph transaction shapes by their output type
+// distribution and produce a one-paragraph explanation. Returns ""
+// for shapes we don't have a specific story for (e.g. arbitrary
+// mixed transfers). The goal is to head off "wait, why is there an
+// NFT in my transfer?"-style confusion when a user pastes an FT
+// contract id and gets the deploy tx back.
+function _detectTxShape(payload) {
+  const outputs = payload.outputs || [];
+  const counts = {};
+  for (const o of outputs) {
+    const t = String(o.type || "").toLowerCase();
+    counts[t] = (counts[t] || 0) + 1;
+  }
+  const has = (t) => (counts[t] || 0) > 0;
+  const total = outputs.length;
+
+  // Glyph FT deploy: 1 commit-ft + 1+ ft (or p2pkh holding refs) + 1
+  // commit-nft + RXD change. The commit-nft is the protocol-level
+  // singleton that every FT deploy carries — NOT a separately-
+  // mintable collectible.
+  if (has("commit-ft") && has("commit-nft")) {
+    return (
+      "This is a Glyph FT deploy transaction — the on-chain event " +
+      "that creates a new fungible token. The commit-ft output " +
+      "anchors the token's metadata (name, ticker, supply); the " +
+      "commit-nft output is the protocol-level singleton that every " +
+      "Glyph FT deploy carries (it's the metadata authority, not a " +
+      "separately-mintable NFT). The remaining outputs are the " +
+      "initial token holders + RXD change to the deployer. To inspect " +
+      "your own transfer of this token, paste your transfer txid — " +
+      "not the FT contract id."
+    );
+  }
+
+  // Glyph FT deploy without paired NFT (older / unusual): commit-ft
+  // alone.
+  if (has("commit-ft") && !has("commit-nft")) {
+    return (
+      "This transaction contains a commit-ft output — the on-chain " +
+      "anchor for a Glyph FT's metadata. Most modern FT deploys also " +
+      "carry a commit-nft singleton; this one does not. The remaining " +
+      "outputs are the initial token holders + change."
+    );
+  }
+
+  // Glyph NFT deploy: commit-nft without commit-ft.
+  if (!has("commit-ft") && has("commit-nft")) {
+    return (
+      "This transaction contains a commit-nft output — the on-chain " +
+      "anchor for a Glyph NFT or mutable contract. Use the inspect " +
+      "tool's outpoint form on the singleton's outpoint to walk the " +
+      "ref chain."
+    );
+  }
+
+  // dMint deploy.
+  if (has("dmint")) {
+    return (
+      "This transaction contains a dMint contract output — a " +
+      "permissionless-mint token whose supply is gated by " +
+      "proof-of-work. Subsequent transactions that spend this output " +
+      "produce mint outputs against the contract's parameters."
+    );
+  }
+
+  // Mutable-contract update.
+  if (has("mut")) {
+    return (
+      "This transaction contains a mutable contract output — a Glyph " +
+      "NFT whose metadata can be rotated by spending this output with " +
+      "a 'mod' or 'sl' operation."
+    );
+  }
+
+  // Mixed transfer: ft outputs without commit. Likely the kind of tx
+  // a typical user is actually looking for (one they sent or
+  // received). No special note — the per-output rows tell the story.
+  if (has("ft") && !has("commit-ft") && !has("commit-nft")) {
+    return ""; // ordinary transfer; the rows speak for themselves
+  }
+
+  return "";
+}
+
+// Return the structural-match qualifier for a script type, or empty
+// string if none applies. Used by both ``renderOutputRow`` (per-output
+// in a fetched-tx card) and ``renderScriptCard`` (when the user pastes
+// a standalone script). Wording matches the CLI's
+// ``_render_script_human`` for cross-tool consistency.
+function _structuralQualifierNote(type) {
+  const NOTES = {
+    ft: "Structural pattern match: bytes match the FT script template; " +
+        "does NOT verify the ref points to a valid Glyph contract.",
+    nft: "Structural pattern match: bytes match the NFT script template; " +
+        "does NOT verify the ref points to a valid Glyph contract.",
+    mut: "Structural pattern match. The payload_hash is an opaque " +
+        "commitment to off-chain CBOR — resolve via the reveal tx; the " +
+        "tool cannot verify provenance of the ref locally.",
+    "commit-ft": "Structural pattern match. The payload_hash is an opaque " +
+        "commitment to the reveal-tx CBOR. A commit-ft output is the " +
+        "FT contract's metadata anchor — present in every Glyph FT deploy.",
+    "commit-nft": "Structural pattern match. The payload_hash is an opaque " +
+        "commitment to the reveal-tx CBOR. A commit-nft output is the " +
+        "NFT singleton anchor that every Glyph FT deploy carries " +
+        "alongside its FT outputs — it's a protocol artifact, not a " +
+        "separately-mintable collectible.",
+    dmint: "Structural pattern match: does NOT verify the contract_ref " +
+        "points to a valid mint chain or that the parameters match a " +
+        "deployed token.",
+  };
+  return NOTES[type] || "";
 }
 
 function renderContractCard(payload) {
@@ -786,6 +924,13 @@ function renderScriptCard(payload) {
       text: "This doesn't match any known Glyph or P2PKH script template. " +
             "It may be a custom contract, a different protocol, or malformed bytes.",
     }));
+  }
+
+  // Structural-match qualifier (issue #53 / PR #58). Same wording the
+  // CLI's _render_script_human emits.
+  const qualifier = _structuralQualifierNote(type);
+  if (qualifier) {
+    wrapper.appendChild(el("p", { class: "structural-note", text: qualifier }));
   }
 
   return wrapper;
