@@ -153,6 +153,56 @@ class TestTruncateForHuman:
         assert inspect.truncate_for_human("short") == "short"
 
 
+class TestClassifyRawTx:
+    """The façade re-exports the synchronous classify_raw_tx helper that
+    the browser-hosted inspect tool calls after fetching raw bytes via
+    its own WebSocket. The CLI side already covers the threat-model
+    guards exhaustively; here we just lock the re-export contract."""
+
+    def test_classify_raw_tx_is_exported(self):
+        from pyrxd.glyph import inspect
+
+        assert "classify_raw_tx" in inspect.__all__
+        assert callable(inspect.classify_raw_tx)
+
+    def test_returns_form_txid_dict(self):
+        """Smoke against a tiny synthetic 1-input/1-output tx so no fixture
+        bytes are needed and no network ever runs.
+
+        The classifier rejects raw bytes <= 64 (Merkle-forgery defence
+        inherited from the ``RawTx`` newtype invariant), so the synthetic
+        tx must be at least 65 bytes. We give the output a real 25-byte
+        P2PKH locking script, which puts the total at ~85 bytes."""
+        from pyrxd.glyph import inspect
+
+        p2pkh_script = "76a914" + "aa" * 20 + "88ac"  # 25 bytes / 50 hex
+        raw = bytes.fromhex(
+            "01000000"  # version
+            "01"  # vin count
+            + "00" * 32  # prev txid
+            + "ffffffff"  # prev vout
+            + "00"  # scriptSig length
+            + "ffffffff"  # sequence
+            + "01"  # vout count
+            + "0000000000000000"  # satoshis (0)
+            + "19"  # scriptPubKey length (25 bytes)
+            + p2pkh_script
+            + "00000000"  # locktime
+        )
+
+        # Compute the txid the way the parser does.
+        from pyrxd.hash import hash256
+
+        txid = hash256(raw)[::-1].hex()
+
+        result = inspect.classify_raw_tx(txid, raw)
+        assert result["form"] == "txid"
+        assert result["txid"] == txid
+        assert result["input_count"] == 1
+        assert result["output_count"] == 1
+        assert result["outputs"][0]["type"] == "p2pkh"
+
+
 class TestNoDirectCliImport:
     """The browser tool must NOT reach into CLI internals.
 

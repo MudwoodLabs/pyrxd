@@ -13,6 +13,11 @@ documented contract:
 
 * :func:`classify_input` — dispatch a raw string to its form
   (``"txid" | "contract" | "outpoint" | "script"``)
+* :func:`classify_raw_tx` — classify every output (and reveal CBOR) for
+  a pre-fetched raw transaction. Synchronous; takes pre-fetched bytes
+  rather than an ElectrumXClient, so the web UI can fetch via the
+  browser's native WebSocket and feed bytes straight into the same
+  classifier the CLI uses
 * :func:`inspect_contract` — decode a 72-char Glyph contract id
 * :func:`inspect_outpoint` — decode a ``txid:vout`` outpoint
 * :func:`inspect_script` — classify a hex-encoded locking script and
@@ -40,6 +45,9 @@ from ..cli.glyph_cmds import (
     _classify_input as classify_input,
 )
 from ..cli.glyph_cmds import (
+    _classify_raw_tx as classify_raw_tx,
+)
+from ..cli.glyph_cmds import (
     _inspect_contract as inspect_contract,
 )
 from ..cli.glyph_cmds import (
@@ -60,12 +68,14 @@ from .confusables import looks_confusable_with_latin, skeleton
 # something quacking like one) plus an event loop, neither of which is
 # straightforward to set up under Pyodide's WASM runtime. The web UI
 # fetches the raw bytes via the browser's native ``WebSocket`` API and
-# hands the bytes to this module's ``inspect_script`` per-output instead.
-# We deliberately do not re-export ``_inspect_txid_inner`` here — that
-# coupling stays inside the CLI for now.
+# hands them to ``classify_raw_tx`` instead — that helper does the same
+# threat-model checks the CLI's --fetch path applies, just without the
+# coroutine + client coupling. We deliberately do not re-export
+# ``_inspect_txid_inner`` here.
 
 __all__ = [
     "classify_input",
+    "classify_raw_tx",
     "inspect_contract",
     "inspect_outpoint",
     "inspect_script",
