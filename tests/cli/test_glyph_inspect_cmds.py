@@ -278,6 +278,55 @@ class TestInspectScriptHex:
         assert "algo:         SHA256D" in result.output
         assert "daa_mode:     FIXED" in result.output
 
+
+class TestStructuralMatchQualifier:
+    """The script classifier matches by hex pattern, not by cryptographic
+    verification — it can't tell whether the ref points to a valid
+    Glyph contract or whether the dMint params match a deployed token.
+    The human-mode renderer must qualify FT/NFT/MUT/dMint outputs with
+    a "structural pattern match" note so a user reading the card
+    doesn't conclude the classification is provenance-verified.
+
+    See GitHub issue #53.
+    """
+
+    def test_ft_carries_structural_match_qualifier(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["glyph", "inspect", _ft_script().hex()])
+        assert result.exit_code == 0
+        assert "type: ft" in result.output
+        assert "structural pattern match" in result.output
+        assert "does NOT verify the ref" in result.output
+
+    def test_nft_carries_structural_match_qualifier(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["glyph", "inspect", _nft_script().hex()])
+        assert result.exit_code == 0
+        assert "type: nft" in result.output
+        assert "structural pattern match" in result.output
+
+    def test_mut_carries_structural_match_qualifier(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["glyph", "inspect", _mutable_script().hex()])
+        assert result.exit_code == 0
+        assert "type: mut" in result.output
+        assert "structural pattern match" in result.output
+        # The wording is split across two lines in the human renderer;
+        # check both halves so the test survives if line breaks shift.
+        assert "verify provenance" in result.output
+
+    def test_dmint_carries_structural_match_qualifier(self, runner: CliRunner) -> None:
+        result = runner.invoke(cli, ["glyph", "inspect", _dmint_contract_script().hex()])
+        assert result.exit_code == 0
+        assert "type: dmint" in result.output
+        assert "structural pattern match" in result.output
+        assert "does NOT verify the contract_ref" in result.output
+
+    def test_p2pkh_does_NOT_carry_structural_qualifier(self, runner: CliRunner) -> None:
+        """P2PKH classification is exact (3-byte prefix + 20-byte pkh + 2-byte
+        suffix), not structural. The qualifier would be misleading."""
+        result = runner.invoke(cli, ["glyph", "inspect", _p2pkh_script().hex()])
+        assert result.exit_code == 0
+        assert "type: p2pkh" in result.output
+        assert "structural pattern match" not in result.output
+
     def test_classifies_v1_dmint_contract_json(self, runner: CliRunner) -> None:
         """JSON form must include ``version`` for V1, and the dmint-specific
         fields must round-trip through ``ensure_ascii=True`` cleanly."""
