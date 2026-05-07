@@ -36,7 +36,7 @@ see the same names with no behaviour change.
 
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 # Map of public-name → (module, attr) pairs. Resolved lazily on first
 # attribute access. Order is alphabetical by name to make additions
