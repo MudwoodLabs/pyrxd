@@ -326,3 +326,101 @@ class TestAttackBypassesAddressedInRound1Audit:
         assert looks_confusable_with_latin("USDСλ")
         assert looks_confusable_with_latin("ВТСö")
         assert looks_confusable_with_latin("USDСöبكلام")
+
+
+class TestNFKCAppendageBypassFix:
+    """Round-2 audit found an appendage bypass against the NFKC-fold
+    path. Original detection ran "NFKC changed s AND result is all
+    Latin-or-neutral" as a whole-string check, which an attacker could
+    defeat by appending one non-Latin Letter to a styled-Latin spoof:
+
+      "𝐔𝐒𝐃𝐂" → flagged (Math Bold; whole NFKC is "USDC")
+      "𝐔𝐒𝐃𝐂א" → MISSED in round-2 (Math Bold + Hebrew; whole NFKC
+                  is "USDCא"; the Hebrew aleph is non-Latin so the
+                  "all Latin-or-neutral" check returned False)
+
+    Round-3 fix: move the NFKC check inside the per-character loop.
+    Each char is evaluated independently, so an unrelated trailing
+    char no longer disables the detection.
+    """
+
+    @pytest.mark.parametrize(
+        "spoof",
+        [
+            "𝐔𝐒𝐃𝐂א",  # Math Bold + Hebrew aleph
+            "𝐔𝐒𝐃𝐂一",  # Math Bold + CJK
+            "𝐔𝐒𝐃𝐂क",  # Math Bold + Devanagari
+            "𝐔𝐒𝐃𝐂ω",  # Math Bold + Greek omega
+            "ＵＳＤＣא",  # fullwidth + Hebrew
+            "ⓊⓈⒹⒸא",  # circled + Hebrew
+            "Հ𝐔𝐒𝐃𝐂",  # Armenian prefix + Math Bold
+            "𝐔𝐒𝐃𝐂ज़",  # Math Bold + Devanagari with nukta
+        ],
+    )
+    def test_styled_latin_with_non_latin_appendage_flagged(self, spoof):
+        """Each individual styled-Latin char should be flagged on its
+        own merits, regardless of trailing non-Latin chars."""
+        assert looks_confusable_with_latin(spoof), f"missed: {spoof!r}"
+
+    @pytest.mark.parametrize(
+        "spoof",
+        [
+            "𝐔𝐒𝐃𝐂",  # Math Bold
+            "𝗨𝗦𝗗𝗖",  # Math Sans
+            "𝚄𝚂𝙳𝙲",  # Math Mono
+            "ＵＳＤＣ",  # fullwidth
+            "ⓊⓈⒹⒸ",  # circled
+            "Ⅸ",  # Roman numeral
+            "ﬁle",  # ligature
+        ],
+    )
+    def test_styled_latin_alone_still_flagged(self, spoof):
+        """Sanity: pure styled-Latin (no appendage) was caught
+        before round-3 and must still be caught after."""
+        assert looks_confusable_with_latin(spoof), f"missed: {spoof!r}"
+
+    def test_round_2_audit_false_positive_sweep_intact(self):
+        """The round-3 fix must not re-introduce false positives the
+        round-2 sweep verified safe. Test the full suite."""
+        legit_cases = [
+            # Latin Extended Additional (Vietnamese, etc.)
+            "Việt",
+            "Hà Nội",
+            "Đông",
+            "phở",
+            "Tiếng Việt",
+            "ạ",
+            "ậ",
+            # European
+            "España",
+            "señor",
+            "Århus",
+            "Æro",
+            "Søren",
+            "Bjørn",
+            "Łódź",
+            "żaba",
+            "Wrocław",
+            "čeština",
+            "Žižek",
+            "můj",
+            "Müller",
+            "Größe",
+            "Zürich",
+            "İstanbul",
+            "Türkçe",
+            "Iași",
+            "Țăndărei",
+            "ľad",
+            "ďakujem",
+            # East Asian (not impersonating Latin)
+            "トークン",
+            "中文",
+            "한국어",
+            "ハナ",
+            # Emoji + ASCII
+            "🚀TOKEN",
+            "100M Token",
+        ]
+        for s in legit_cases:
+            assert not looks_confusable_with_latin(s), f"false positive: {s!r}"

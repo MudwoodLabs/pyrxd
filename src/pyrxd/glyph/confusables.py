@@ -127,47 +127,62 @@ def looks_confusable_with_latin(s: str) -> bool:
     if any(ord(ch) in _BIDI_FORMAT_CONTROLS for ch in s):
         return True
 
-    normalised = unicodedata.normalize("NFKC", s)
+    # Walk the *original* string char by char and check each one for
+    # spoof shapes. Doing it per-character (rather than comparing
+    # whole-string normalised forms) prevents the appendage-bypass
+    # attack: an attacker can't append one non-Latin Letter
+    # to a Math-Bold spoof and get back below the radar.
+    #
+    # Per-char detection covers three spoof shapes plus the bidi
+    # check above:
+    #
+    #   - NFKC compatibility fold: char NFKC-folds from non-ASCII to
+    #     ASCII Latin (Math Bold 𝐔→U; fullwidth Ｕ→U; circled Ⓤ→U;
+    #     Roman numeral Ⅸ→IX; ligature ﬁ→fi).
+    #   - TR39 confusable substitution: char's skeleton is Latin
+    #     (Cyrillic С→C; Greek Ο→O; Cherokee letters; IPA ɑ→a).
+    #   - Mixed source/target: the per-char approach handles the
+    #     "USDСö" appendage-bypass automatically because each char
+    #     is checked on its own merits.
+    #
+    # Three classes of false positive that this approach side-steps:
+    #
+    #   - Decomposition of common Latin Extended (Polish Ł reduces
+    #     under TR39 to "L̸"; ligature Œ to "OE"; German ß to "ss").
+    #     Both source and target are Latin — not impersonation. The
+    #     U+0250 cutoff distinguishes common-language Latin (legit)
+    #     from specialty/phonetic Latin (homoglyphs).
+    #   - Pure-ASCII Latin: every char skeleton == char and NFKC-
+    #     normalisation is a no-op. The loop short-circuits.
+    #   - Pure-non-Latin scripts (Japanese トークン, Chinese 中文):
+    #     no char NFKC-folds to Latin and no char's TR39 skeleton
+    #     is Latin, so nothing flags.
+    #
+    # Mixed-script branding ("USD-Доллар") IS flagged. The SDK can't
+    # distinguish "intentional Russian brand" from "Latin spoof"; the
+    # caller surfaces this as a warning, not a hard reject.
+    for ch in s:
+        # Per-char NFKC fold check. If this character alone NFKC-
+        # decomposes to a string that is all-Latin-or-neutral AND
+        # different from the source, the source is a styled-Latin
+        # codepoint (Math Alphanumerics, fullwidth, circled, Roman
+        # numerals, ligatures). Catches Math Bold 𝐔, fullwidth Ｕ,
+        # circled Ⓤ, etc. — and survives any subsequent appendage
+        # of unrelated non-Latin chars because we look at each
+        # character independently.
+        if ord(ch) > 0x7F:
+            ch_nfkc = unicodedata.normalize("NFKC", ch)
+            # ch folds to all-Latin AND at least one codepoint in the
+            # fold is a Latin Letter — so a fold like ﹙ → ( doesn't
+            # false-positive on punctuation-only NFKC reductions.
+            if (
+                ch_nfkc != ch
+                and ch_nfkc
+                and all(_is_latin_or_neutral(c) for c in ch_nfkc)
+                and any(unicodedata.category(c).startswith("L") for c in ch_nfkc)
+            ):
+                return True
 
-    # Attack shape 2: NFKC compatibility fold. If normalisation
-    # changed s, the original used compatibility codepoints (math
-    # bold, full-width, circled letters, etc.). When the result is
-    # all-Latin-or-neutral, the original was a styled-Latin spoof.
-    if normalised != s and all(_is_latin_or_neutral(ch) for ch in normalised):
-        return True
-
-    # Walk each input character and check whether its individual
-    # skeleton reduction replaced a non-Latin Letter with Latin. This
-    # is the fundamental spoof shape: a single source codepoint that
-    # is non-Latin but whose canonical visual form is Latin.
-    #
-    # Doing the check per-character (instead of comparing whole-string
-    # skeletons) sidesteps three classes of false positive that
-    # whole-string comparisons fall into:
-    #
-    #   - Decomposition. Latin Extended chars like Polish Ł reduce to
-    #     "L̸" (L + combining solidus) and Latin ligatures like Œ
-    #     reduce to "OE". Both are Latin→Latin transformations — no
-    #     non-Latin source involved — so the per-char check returns
-    #     False on those positions. ``Łódź`` and ``Œuf`` stay benign.
-    #
-    #   - Mixed-script branding. A token name like "USD-Доллар" has
-    #     Cyrillic letters whose skeletons happen to be ASCII Latin
-    #     (Cyrillic о → o, а → a, р → p). The per-char check sees a
-    #     non-Latin source mapping to Latin and would flag — which is
-    #     the right answer for the security check, but a usability
-    #     concern for legitimate Russian-language token names. We
-    #     accept that trade-off: a deployer who wants Cyrillic
-    #     branding has to accept the warning, because the SDK can't
-    #     distinguish "intentional Russian brand" from "Latin spoof".
-    #     The caller's UI surfaces this as a warning, not a hard
-    #     reject.
-    #
-    #   - Inflated targets. TR39 entries like ``ǳ → dz`` where one
-    #     non-Latin source produces multiple Latin chars. Any non-empty
-    #     skeleton counts as a Latin-substitution if all its chars are
-    #     Latin or non-Letter.
-    for ch in normalised:
         if not unicodedata.category(ch).startswith("L"):
             # Non-Letter (digit, punctuation, combining mark, symbol).
             # Even if it has a TR39 mapping, it's not a Latin-letter
