@@ -444,7 +444,7 @@ difficulty without explicit opt-in.
 - [x] `mine_solution` raises `MaxAttemptsError` (with `attempts` and `elapsed_s` attributes) when `max_attempts` is reached without a solution
 - [x] `mine_solution` raises `ValidationError` at runtime when `nonce_width not in (4, 8)` (Literal is type-checker-only)
 - [x] An optional slow brute-force test (skipped on no-find, mirrors existing `test_brute_force_finds_valid` shape) confirms search loop integration with real `hashlib`
-- [ ] `examples/dmint_claim_demo.py` raises `InvalidFundingUtxoError` when funding-UTXO scan finds no plain-RXD candidates (FT/dMint UTXOs are filtered out) — *deferred to Session C; demo script not in this session's scope*
+- [x] `examples/dmint_claim_demo.py` raises `InvalidFundingUtxoError` when funding-UTXO scan finds no plain-RXD candidates (FT/dMint UTXOs are filtered out via `_funding_script_is_token_bearing`)
 - [x] `build_dmint_mint_tx` raises `ContractExhaustedError` when `height >= max_height`
 - [x] `build_dmint_mint_tx` raises `PoolTooSmallError` when contract pool can't cover reward + fee + dust
 - [x] **NEW**: `mine_solution_external(preimage, target, miner_argv, nonce_width)` delegates nonce search to a subprocess (e.g. glyph-miner), re-verifies the returned nonce locally, and raises `ValidationError` on miner-returned bad nonces. Added during implementation when user surfaced the GPU-mining use case as a real near-term need.
@@ -468,7 +468,12 @@ difficulty without explicit opt-in.
 
 - [x] `mine_solution` docstring includes a worked hex example
   (preimage in → nonce out → verifier passes)
-- [ ] `examples/dmint_claim_demo.py` exists, env-var driven, `DRY_RUN=1` default — *deferred to Session C*
+- [x] `examples/dmint_claim_demo.py` exists, env-var driven, `DRY_RUN=1` default. Includes:
+  - Funding-UTXO scan that excludes token-bearing UTXOs via the library's opcode-stream walker
+  - Three-key handshake on broadcast (`DRY_RUN=0` requires `I_UNDERSTAND_THIS_IS_REAL=yes`)
+  - Per-attempt support for an external miner via the `EXTERNAL_MINER` env var (delegates to glyph-miner via `mine_solution_external`)
+  - `OP_RETURN_MSG=NONE` escape hatch for users who want to test without the Photonic msg marker
+  - Stale-state recovery: print failure + reason on broadcast rejection, exit non-zero so the user re-runs (no automatic retry — mining a new preimage is required because the contractRef-bound preimage goes stale on chain advance)
 - [ ] `docs/dmint-followup.md` gets an "out of date — see code" warning
   at the top (full rewrite lands in Milestone 2) — *deferred to Session D*
 - [x] `prepare_dmint_deploy` carries both a docstring warning AND a
