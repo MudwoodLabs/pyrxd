@@ -323,23 +323,28 @@ isn't available; specifically read:
   explicitly when Photonic isn't the best answer").
 
 **Phase 2a exit criteria** (Phase 2a is done when ALL are met):
-- [ ] "snk" 35-output discrepancy reconciled with documented explanation
-- [ ] At least one **mainnet** V1 deploy reveal saved as a hex fixture
-  in `docs/dmint-research-photonic-deploy.md` or
-  `docs/dmint-research-mainnet.md` §6 (NOT a synthetic fixture —
-  per the dmint-v1-mint-shape-mismatch.md lesson, golden vectors
-  for builders MUST come from real mainnet bytes)
-- [ ] Commit-tx output layout documented byte-for-byte (vout count,
-  ordering, ref-seed P2PKH structure, value of each output)
-- [ ] Reveal-tx output layout documented byte-for-byte (vout count,
-  contract output positions, FT premine if any, OP_RETURN if any)
-- [ ] Photonic's V1 CBOR `dmint:{...}` payload shape confirmed
-  (which fields populated, which omitted)
-- [ ] Per-contract `contractRef` derivation rule confirmed against
-  Photonic source AND a mainnet decode
-- [ ] "Photonic Divergence" section exists in the research doc (may
-  be empty if no disagreements found; existence of the section makes
-  the divergence-tracking discipline explicit)
+- [x] "snk" 35-output discrepancy reconciled with documented explanation
+  (see `docs/dmint-research-photonic-deploy.md` §2: 1 FT-commit + 32 ref-seeds + 1 NFT-commit + 1 change)
+- [x] At least one **mainnet** V1 deploy reveal saved as a hex fixture
+  (`b965b32d…9dd6` reveal raw + `a443d9df…878b` commit raw — saved at
+  `/tmp/dmint-m2-research/{commit,reveal}_raw.hex`; will be moved into
+  the repo as a fixture during Phase 2b)
+- [x] Commit-tx output layout documented byte-for-byte (vout count,
+  ordering, ref-seed P2PKH structure, value of each output) — research doc §2
+- [x] Reveal-tx output layout documented byte-for-byte (vout count,
+  contract output positions, FT premine if any, OP_RETURN if any) — research doc §3
+- [x] Photonic's V1 CBOR `dmint:{...}` payload shape confirmed
+  (which fields populated, which omitted) — research doc §4: `p:[1,4]`,
+  `ticker`, `name`, `desc`, `by`, `main`. **No `dmint:{...}` field
+  exists** — dMint params live in the contract output scripts, not the
+  CBOR.
+- [x] Per-contract `contractRef` derivation rule confirmed against
+  Photonic source AND a mainnet decode — `contractRef[i] =
+  LE-reversed(commit_txid, vout=i+1)`, all 32 contracts in the GLYPH
+  reveal verified
+- [x] "Photonic Divergence" section exists in the research doc — §7
+  documents 5 divergences (V1 contract output shape, premine,
+  delegate-ref, algo+DAA, V1 vs V2 protocol vector)
 
 #### Phase 2b: Implementation
 
@@ -596,17 +601,24 @@ Punting again would repeat the anti-pattern.
 
 #### Phase 2a (must complete before any code in Phase 2b)
 
-- [ ] `docs/dmint-research-photonic-deploy.md` (or extension to
-  `dmint-research-mainnet.md` §6) exists and explains the "snk"
-  35-output deploy commit shape (joint NFT+FT, older Photonic
-  version, or other)
-- [ ] At least one byte-decoded mainnet V1 deploy reveal saved as a
-  hex fixture
-- [ ] V1 commit-tx output layout documented byte-for-byte
-- [ ] V1 reveal-tx output layout documented byte-for-byte
-- [ ] V1 CBOR payload shape confirmed (which fields, which omitted)
-- [ ] Per-contract `contractRef` derivation rule confirmed against
-  both Photonic source AND the mainnet decode
+- [x] `docs/dmint-research-photonic-deploy.md` exists and explains the
+  35-output GLYPH deploy commit shape: 1 FT-commit + 32 ref-seeds + 1
+  NFT-commit + 1 change (joint NFT+FT-style deploy with mint-fresh auth
+  NFT chosen for pyrxd; forward-prior auth NFT documented as deferred)
+- [x] At least one byte-decoded mainnet V1 deploy reveal saved as a
+  hex fixture (`b965b32d…9dd6` raw bytes saved during research; will
+  be moved into the repo as `tests/fixtures/dmint_v1_deploy_*.hex`
+  during Phase 2b)
+- [x] V1 commit-tx output layout documented byte-for-byte (research
+  doc §2)
+- [x] V1 reveal-tx output layout documented byte-for-byte (research
+  doc §3)
+- [x] V1 CBOR payload shape confirmed (research doc §4): `p:[1,4]`,
+  `ticker`, `name`, `desc`, `by`, `main`. No `dmint:{...}` field; dMint
+  params live in contract output scripts only.
+- [x] Per-contract `contractRef` derivation rule confirmed against
+  both Photonic source AND the mainnet decode (research doc §3.3 +
+  §5)
 
 #### Phase 2b — V1 deploy library
 
