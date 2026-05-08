@@ -1545,7 +1545,7 @@ class DmintMinerFundingUtxo:
 _FUNDING_REF_OPCODE_RANGE = range(0xD0, 0xD9)
 
 
-def _funding_script_is_token_bearing(script: bytes) -> bool:
+def is_token_bearing_script(script: bytes) -> bool:
     """Return True if ``script`` uses any OP_PUSHINPUTREF-family opcode.
 
     Walks the script as an opcode stream: push opcodes (0x01..0x4e) consume
@@ -1965,7 +1965,7 @@ def _build_dmint_v1_mint_tx(
         raise ValidationError(f"fee_rate must be >= 1, got {fee_rate}")
 
     # Reject token-bearing funding UTXOs to prevent silent token-burn.
-    if _funding_script_is_token_bearing(funding_utxo.script):
+    if is_token_bearing_script(funding_utxo.script):
         raise InvalidFundingUtxoError(
             f"funding_utxo at {funding_utxo.txid}:{funding_utxo.vout} carries an "
             f"OP_PUSHINPUTREF-family opcode (token envelope) and cannot be spent "
@@ -2023,68 +2023,24 @@ def _build_dmint_v1_mint_tx(
             data_push = b"\x4c" + bytes([len(op_return_msg)]) + op_return_msg
         op_return_script = b"\x6a" + msg_marker + data_push
 
-    # --- Placeholder scriptSig.
-    # The placeholder preimage uses 0xff bytes (rather than zeros) as a
-    # visibly-invalid sentinel: anyone who broadcasts before the miner-loop
-    # patches in the real preimage gets a fast network rejection rather than
-    # a "passes structural checks but covenant rejects" silent failure.
+    # --- Placeholder scriptSigs.
+    # Contract input: nonce-bearing scriptSig with sentinel 0xff*64 preimage.
+    # The 0xff bytes are visibly-invalid: a miner that forgets to replace
+    # them gets fast network rejection rather than a covenant-fail silent
+    # bug. Mining replaces this whole scriptSig.
     placeholder_preimage = b"\xff" * 64
-    placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage, nonce_width=4)
+    placeholder_contract_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage, nonce_width=4)
+    # Funding input: zero bytes of the right length (~107) so the
+    # serialized tx size used for fee calculation matches what the
+    # signed tx will weigh. The caller replaces this with a real
+    # signature post-build via _sign_p2pkh_input or equivalent.
+    _P2PKH_SCRIPTSIG_ESTIMATED_LEN = 107
+    placeholder_funding_scriptsig = b"\x00" * _P2PKH_SCRIPTSIG_ESTIMATED_LEN
 
-    # --- Fee estimation ---
-    # Two inputs (contract + funding), three or four outputs.
-    contract_scriptsig_len = len(placeholder_scriptsig)
-    # P2PKH funding scriptSig: ~107 bytes (sig 71-72 + pubkey 33-34 + push opcodes).
-    funding_scriptsig_estimated_len = 107
-    contract_script_len = len(contract_script)
-    reward_script_len = len(reward_script)
-    change_script_len = len(change_script)
-    op_return_script_len = len(op_return_script) if op_return_script else 0
-
-    estimated_size = (
-        4  # version
-        + 1  # vin count
-        # vin[0]: contract input
-        + 36
-        + 4
-        + _varint_size(contract_scriptsig_len)
-        + contract_scriptsig_len
-        # vin[1]: funding input
-        + 36
-        + 4
-        + _varint_size(funding_scriptsig_estimated_len)
-        + funding_scriptsig_estimated_len
-        + 1  # vout count
-        # vout[0]: contract recreate
-        + 8
-        + _varint_size(contract_script_len)
-        + contract_script_len
-        # vout[1]: FT-wrapped reward
-        + 8
-        + _varint_size(reward_script_len)
-        + reward_script_len
-    )
-    if op_return_script:
-        estimated_size += 8 + _varint_size(op_return_script_len) + op_return_script_len
-    estimated_size += 8 + _varint_size(change_script_len) + change_script_len  # vout: change
-    estimated_size += 4  # locktime
-
-    fee = estimated_size * fee_rate
-
-    # The funding input pays:
-    #   - the FT reward output's photons (state.reward, which becomes the
-    #     FT carrier value on vout[1])
-    #   - the tx fee
-    #   - the change output (returned to miner_pkh)
-    change_value = funding_utxo.value - state.reward - fee
-    if change_value < 546:
-        raise PoolTooSmallError(
-            f"funding_utxo ({funding_utxo.value} photons) too small to cover "
-            f"reward ({state.reward}) + fee ({fee}): change would be "
-            f"{change_value} photons, below 546 dust limit."
-        )
-
-    # --- Assemble unsigned tx ---
+    # --- Assemble unsigned tx with both placeholder scriptSigs attached so
+    # `len(tx.serialize())` reflects the final on-wire size. Cleaner than
+    # hand-rolling varint accounting and avoids drift between the fee
+    # estimate and the actual tx bytes.
     padding_output = TransactionOutput(Script(b""), 0)
 
     contract_src_outputs = [padding_output] * contract_utxo.vout + [
@@ -2107,7 +2063,7 @@ def _build_dmint_v1_mint_tx(
     )
     contract_input.satoshis = contract_utxo.value
     contract_input.locking_script = Script(contract_utxo.script)
-    contract_input.unlocking_script = Script(placeholder_scriptsig)
+    contract_input.unlocking_script = Script(placeholder_contract_scriptsig)
 
     funding_input = TransactionInput(
         source_transaction=funding_src_tx,
@@ -2117,20 +2073,44 @@ def _build_dmint_v1_mint_tx(
     )
     funding_input.satoshis = funding_utxo.value
     funding_input.locking_script = Script(funding_utxo.script)
-    # funding scriptSig is left None for the caller to sign post-build.
+    # Attach a same-size placeholder so len(tx.serialize()) below reflects
+    # the post-signing size. Caller replaces with the real signature.
+    funding_input.unlocking_script = Script(placeholder_funding_scriptsig)
 
-    outputs = [
+    # Trial-assemble outputs with a placeholder change value of 0 so we
+    # can serialize the tx, measure its byte length, compute the real
+    # fee, then patch the change output to its final value. The
+    # serialized size doesn't depend on the change-output *value* (the
+    # 8-byte satoshi field is fixed-width regardless), only on its
+    # script length — so the trial measurement matches the final size
+    # exactly.
+    trial_outputs = [
         TransactionOutput(Script(contract_script), contract_utxo.value),
         TransactionOutput(Script(reward_script), state.reward),
     ]
     if op_return_script:
-        outputs.append(TransactionOutput(Script(op_return_script), 0))
-    outputs.append(TransactionOutput(Script(change_script), change_value))
+        trial_outputs.append(TransactionOutput(Script(op_return_script), 0))
+    change_output = TransactionOutput(Script(change_script), 0)  # value patched below
+    trial_outputs.append(change_output)
 
     tx = Transaction(
         tx_inputs=[contract_input, funding_input],
-        tx_outputs=outputs,
+        tx_outputs=trial_outputs,
     )
+
+    # The funding input pays:
+    #   - the FT reward output's photons (state.reward, FT carrier value on vout[1])
+    #   - the tx fee (size × fee_rate)
+    #   - the change output back to miner_pkh
+    fee = len(tx.serialize()) * fee_rate
+    change_value = funding_utxo.value - state.reward - fee
+    if change_value < 546:
+        raise PoolTooSmallError(
+            f"funding_utxo ({funding_utxo.value} photons) too small to cover "
+            f"reward ({state.reward}) + fee ({fee}): change would be "
+            f"{change_value} photons, below 546 dust limit."
+        )
+    change_output.satoshis = change_value
 
     return DmintMintResult(
         tx=tx,
@@ -2150,3 +2130,142 @@ def _varint_size(n: int) -> int:
     if n <= 0xFFFFFFFF:
         return 5
     return 9
+
+
+# ---------------------------------------------------------------------------
+# Chain-touching helpers (network-side; require an ElectrumXClient)
+# ---------------------------------------------------------------------------
+#
+# These functions touch the network — they live here rather than in
+# pyrxd.network because the protocol logic (token-burn defense,
+# preimage construction binding) is dMint-specific and shouldn't leak
+# into the network layer. Imports are lazy so dmint.py stays
+# light-import for callers that only need the pure builders/parsers.
+
+
+async def find_dmint_funding_utxo(
+    client: Any,
+    miner_address: str,
+    needed: int,
+) -> DmintMinerFundingUtxo:
+    """Scan ``miner_address`` for a plain-RXD UTXO that funds a V1 mint.
+
+    Excludes token-bearing UTXOs (FT, NFT, dMint covenant scripts)
+    using :func:`is_token_bearing_script` — the same opcode-aware
+    walker the V1 mint builder enforces. Returns the largest qualifying
+    candidate to minimise change-output dust risk.
+
+    A plain-RXD funding input is what the V1 covenant requires (V1
+    contracts are singletons; reward + fee come from a separate input).
+    Spending an FT/NFT/dMint UTXO as fee silently destroys the token —
+    this scan is the load-bearing defense.
+
+    :param client:         An already-connected ``pyrxd.network.electrumx.ElectrumXClient``.
+    :param miner_address:  Radiant address (R…) of the wallet to scan.
+    :param needed:         Minimum photons the candidate must hold.
+    :returns:              The largest qualifying funding UTXO.
+    :raises InvalidFundingUtxoError:
+        No plain-RXD UTXO at ``miner_address`` covers ``needed``. The
+        error message reports counts of (a) token-bearing UTXOs skipped
+        and (b) plain-RXD UTXOs that were too small, so the caller can
+        diagnose why the wallet failed the scan.
+    """
+    # Lazy imports so callers that only use the pure builders/parsers
+    # don't pay the import cost of the network and transaction modules.
+    from pyrxd.network.electrumx import script_hash_for_address
+    from pyrxd.security.errors import NetworkError
+    from pyrxd.security.types import Txid
+    from pyrxd.transaction.transaction import Transaction
+
+    raw = await client.get_utxos(script_hash_for_address(miner_address))
+    candidates: list[DmintMinerFundingUtxo] = []
+    skipped_tokens = 0
+    skipped_too_small = 0
+
+    for u in raw:
+        try:
+            tx_bytes = await client.get_transaction(Txid(u.tx_hash))
+        except NetworkError:
+            continue
+        tx = Transaction.from_hex(bytes(tx_bytes))
+        if tx is None or u.tx_pos >= len(tx.outputs):
+            continue
+        script = tx.outputs[u.tx_pos].locking_script.serialize()
+        if is_token_bearing_script(script):
+            skipped_tokens += 1
+            continue
+        if u.value < needed:
+            skipped_too_small += 1
+            continue
+        candidates.append(
+            DmintMinerFundingUtxo(
+                txid=u.tx_hash,
+                vout=u.tx_pos,
+                value=u.value,
+                script=script,
+            )
+        )
+
+    if not candidates:
+        raise InvalidFundingUtxoError(
+            f"no plain-RXD funding UTXO at {miner_address} covers {needed} "
+            f"photons (skipped {skipped_tokens} token-bearing, "
+            f"{skipped_too_small} too small)"
+        )
+    # Largest-first: minimises change-output dust risk.
+    candidates.sort(key=lambda u: u.value, reverse=True)
+    return candidates[0]
+
+
+def build_dmint_v1_mint_preimage(
+    contract_utxo: DmintContractUtxo,
+    funding_utxo: DmintMinerFundingUtxo,
+    unsigned_tx: Any,
+) -> bytes:
+    """Build the 64-byte V1 mining preimage for an unsigned mint tx.
+
+    The V1 covenant binds the PoW preimage to:
+
+    1. The contract input's outpoint txid + the contract ref
+       (so a nonce mined for one contract slot can't be replayed
+       against another)
+    2. The miner's funding-input locking script
+       (so the miner cannot substitute a different funding source
+       after finding a nonce)
+    3. The OP_RETURN msg output script at vout[2]
+       (Photonic's mainnet-canonical layout; the covenant computes
+       outputHash = SHA256d(this script))
+
+    Layout (matches :func:`build_pow_preimage`)::
+
+        SHA256(txid_LE || contractRef) ||
+        SHA256(SHA256d(input_script) || SHA256d(output_script))
+
+    :param contract_utxo:  The V1 contract UTXO being spent.
+    :param funding_utxo:   The plain-RXD UTXO providing reward + fee.
+    :param unsigned_tx:    The unsigned :class:`Transaction` from
+                           :func:`build_dmint_mint_tx` — vout[2] is
+                           required to be the OP_RETURN msg output
+                           (mainnet-canonical 4-output shape).
+    :returns:              64 bytes ready to feed into :func:`mine_solution`
+                           or :func:`mine_solution_external`.
+    :raises ValidationError:
+        ``unsigned_tx`` has fewer than 4 outputs (no OP_RETURN msg
+        output at vout[2]). Build the tx with ``op_return_msg`` set to
+        a non-empty bytes value before computing the preimage.
+    """
+    if len(unsigned_tx.outputs) < 4:
+        raise ValidationError(
+            "V1 mint preimage construction expects an OP_RETURN msg "
+            "output at vout[2] (mainnet-canonical shape). Build the tx "
+            "with op_return_msg set to a non-empty bytes value before "
+            "computing the preimage."
+        )
+    txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
+    output_script = unsigned_tx.outputs[2].locking_script.serialize()
+    return build_pow_preimage(
+        txid_le=txid_le,
+        contract_ref_bytes=contract_utxo.state.contract_ref.to_bytes(),
+        input_script=funding_utxo.script,
+        output_script=output_script,
+    )

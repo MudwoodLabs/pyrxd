@@ -96,17 +96,16 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from pyrxd.glyph.dmint import (
     DEFAULT_MAX_ATTEMPTS,
     DmintContractUtxo,
-    DmintMinerFundingUtxo,
     DmintState,
-    _funding_script_is_token_bearing,
     build_dmint_mint_tx,
+    build_dmint_v1_mint_preimage,
     build_mint_scriptsig,
-    build_pow_preimage,
+    find_dmint_funding_utxo,
     mine_solution,
     mine_solution_external,
 )
 from pyrxd.keys import PrivateKey
-from pyrxd.network.electrumx import ElectrumXClient, script_hash_for_address
+from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.script.script import Script
 from pyrxd.script.type import encode_pushdata
 from pyrxd.security.errors import (
@@ -137,63 +136,6 @@ EXTERNAL_MINER: str = os.environ.get("EXTERNAL_MINER", "")
 
 # Standard relay-policy dust floor (matches build_dmint_mint_tx's check).
 _DUST_LIMIT = 546
-
-
-# ---------------------------------------------------------------------------
-# Funding-UTXO scan
-# ---------------------------------------------------------------------------
-
-
-async def _find_funding_utxo(
-    client: ElectrumXClient,
-    miner_address: str,
-    needed: int,
-) -> DmintMinerFundingUtxo:
-    """Scan the miner's wallet, excluding token-bearing UTXOs, return the
-    largest plain-RXD candidate that covers ``needed`` photons.
-
-    The token-burn defense uses the same opcode-aware walker that
-    ``build_dmint_mint_tx`` enforces — keeping the demo's selection
-    consistent with the library's typed error.
-    """
-    raw = await client.get_utxos(script_hash_for_address(miner_address))
-    candidates: list[DmintMinerFundingUtxo] = []
-    skipped_tokens = 0
-    skipped_too_small = 0
-
-    for u in raw:
-        try:
-            tx_bytes = await client.get_transaction(Txid(u.tx_hash))
-        except NetworkError:
-            continue
-        tx = Transaction.from_hex(bytes(tx_bytes))
-        if tx is None or u.tx_pos >= len(tx.outputs):
-            continue
-        script = tx.outputs[u.tx_pos].locking_script.serialize()
-        if _funding_script_is_token_bearing(script):
-            skipped_tokens += 1
-            continue
-        if u.value < needed:
-            skipped_too_small += 1
-            continue
-        candidates.append(
-            DmintMinerFundingUtxo(
-                txid=u.tx_hash,
-                vout=u.tx_pos,
-                value=u.value,
-                script=script,
-            )
-        )
-
-    if not candidates:
-        raise InvalidFundingUtxoError(
-            f"no plain-RXD funding UTXO at {miner_address} "
-            f"covers {needed} photons (skipped {skipped_tokens} token-bearing, "
-            f"{skipped_too_small} too small)"
-        )
-    # Largest-first: minimises change-output dust risk.
-    candidates.sort(key=lambda u: u.value, reverse=True)
-    return candidates[0]
 
 
 # ---------------------------------------------------------------------------
@@ -243,57 +185,6 @@ def _sign_p2pkh_input(tx: Transaction, input_index: int, private_key: PrivateKey
     pub = private_key.public_key().serialize()
     unlock = encode_pushdata(sig + sighash.to_bytes(1, "little")) + encode_pushdata(pub)
     tx.inputs[input_index].unlocking_script = Script(unlock)
-
-
-# ---------------------------------------------------------------------------
-# Real preimage construction
-# ---------------------------------------------------------------------------
-
-
-def _real_preimage(
-    contract_utxo: DmintContractUtxo,
-    funding_utxo: DmintMinerFundingUtxo,
-    tx: Transaction,
-) -> bytes:
-    """Compute the actual 64-byte mining preimage for the unsigned tx.
-
-    The placeholder preimage in the unsigned tx is sentinel 0xff bytes;
-    the real preimage binds the nonce to the specific contract input
-    plus the input/output script hashes the V1 covenant computes.
-
-    Layout (per ``build_pow_preimage``):
-        SHA256(txid_LE || contractRef) ||
-        SHA256(SHA256d(input_script) || SHA256d(output_script))
-
-    where ``input_script`` is the funding input's locking script (the
-    miner's address that the V1 covenant binds to via the input-hash
-    push) and ``output_script`` is the OP_RETURN msg output script
-    (the miner's "outpoint" binding via the output-hash push) — per
-    docs/dmint-research-mainnet.md §4 vin[0]/vout[2] trace.
-    """
-    # txid_LE is the 32-byte raw txid in little-endian (internal order).
-    txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
-    # The input-binding script the covenant hashes: in the live mainnet
-    # trace this is the funding input's locking script.
-    input_script = funding_utxo.script
-    # The output-binding script: per glyph-miner's reference impl
-    # (`packages/lib/src/script.ts` L29-33) and the mainnet trace at
-    # docs/dmint-research-mainnet.md §4 vout[2], the V1 covenant binds
-    # outputHash to the OP_RETURN msg script. The script defaults to
-    # always emitting that output at vout[2], matching mainnet shape.
-    if len(tx.outputs) < 4:
-        raise ValidationError(
-            "V1 mint preimage construction expects an OP_RETURN msg output at "
-            "vout[2] (mainnet-canonical shape). Build the tx with op_return_msg "
-            "set to a non-empty bytes value before computing the preimage."
-        )
-    output_script = tx.outputs[2].locking_script.serialize()
-    return build_pow_preimage(
-        txid_le=txid_le,
-        contract_ref_bytes=contract_utxo.state.contract_ref.to_bytes(),
-        input_script=input_script,
-        output_script=output_script,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -414,7 +305,7 @@ async def main() -> None:
         needed = state.reward + 10_000_000 + _DUST_LIMIT
         print(f"\nScanning {miner_address} for plain-RXD funding UTXO (≥ {needed:,} photons)...")
         try:
-            funding_utxo = await _find_funding_utxo(client, miner_address, needed)
+            funding_utxo = await find_dmint_funding_utxo(client, miner_address, needed)
         except InvalidFundingUtxoError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(2)
@@ -442,7 +333,7 @@ async def main() -> None:
         )
 
         # 4. Compute real preimage from the now-finalised tx outputs.
-        preimage = _real_preimage(contract_utxo, funding_utxo, result.tx)
+        preimage = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, result.tx)
 
         # 5. Mine.
         try:

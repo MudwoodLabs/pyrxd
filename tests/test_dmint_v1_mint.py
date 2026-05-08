@@ -39,8 +39,10 @@ from pyrxd.glyph.dmint import (
     build_dmint_v1_code_script,
     build_dmint_v1_contract_script,
     build_dmint_v1_ft_output_script,
+    build_dmint_v1_mint_preimage,
     build_dmint_v1_state_script,
     build_mint_scriptsig,
+    is_token_bearing_script,
     mine_solution,
     mine_solution_external,
     verify_sha256d_solution,
@@ -981,7 +983,122 @@ class TestMineSolutionExternal:
 
 
 # ---------------------------------------------------------------------------
-# 7. prepare_dmint_deploy — V2 footgun warning
+# 7. is_token_bearing_script — public token-detection classifier
+# ---------------------------------------------------------------------------
+
+
+class TestIsTokenBearingScript:
+    """Public API equivalent of the M1 hardening's funding-UTXO check.
+
+    The function walks the script's opcode stream and only flags
+    OP_PUSHINPUTREF-family opcodes (0xd0–0xd8) when they appear as
+    *opcodes* — not as bytes inside push-data payloads. The full
+    behavior is exercised by the V1 mint funding tests; these tests
+    document the public contract.
+    """
+
+    def test_plain_p2pkh_with_zero_hash(self):
+        # 76 a9 14 <pkh:20> 88 ac
+        script = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+        assert is_token_bearing_script(script) is False
+
+    def test_p2pkh_with_d_byte_in_hash(self):
+        # 0xd2 inside push-payload, not opcode position
+        script = b"\x76\xa9\x14" + bytes([0xD2] * 20) + b"\x88\xac"
+        assert is_token_bearing_script(script) is False
+
+    def test_ft_envelope_flagged(self):
+        # 0xd0 OP_PUSHINPUTREF as opcode
+        script = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac\xbd\xd0" + bytes(36) + b"\x00" * 12
+        assert is_token_bearing_script(script) is True
+
+    def test_dmint_singleton_flagged(self):
+        # 0xd8 OP_PUSHINPUTREFSINGLETON as opcode
+        script = b"\xd8" + bytes(36) + b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+        assert is_token_bearing_script(script) is True
+
+    def test_truncated_pushdata_treated_as_token_bearing(self):
+        # Malformed: PUSHDATA1 declares length 0x10 but only 5 bytes follow
+        truncated = b"\x4c\x10\x01\x02\x03\x04\x05"
+        assert is_token_bearing_script(truncated) is True
+
+    def test_empty_script(self):
+        assert is_token_bearing_script(b"") is False
+
+
+# ---------------------------------------------------------------------------
+# 8. build_dmint_v1_mint_preimage — V1 covenant binding
+# ---------------------------------------------------------------------------
+
+
+class TestBuildDmintV1MintPreimage:
+    """The library helper that the demo uses to compute the real preimage
+    after building the unsigned tx with sentinel placeholders. The function
+    binds the nonce to (a) the contract input's outpoint+ref, (b) the
+    funding input's locking script, (c) the OP_RETURN msg output script."""
+
+    def _build_for_test(self, *, op_return_msg=b"test"):
+        utxo = _make_v1_contract_utxo()
+        funding = _make_funding_utxo()
+        result = build_dmint_mint_tx(
+            contract_utxo=utxo,
+            nonce=_NONCE_V1,
+            miner_pkh=_MINER_PKH,
+            current_time=0,
+            funding_utxo=funding,
+            op_return_msg=op_return_msg,
+        )
+        return utxo, funding, result.tx
+
+    def test_returns_64_bytes(self):
+        utxo, funding, tx = self._build_for_test()
+        preimage = build_dmint_v1_mint_preimage(utxo, funding, tx)
+        assert len(preimage) == 64
+
+    def test_preimage_changes_with_funding_script(self):
+        """Different funding scripts produce different preimages — the
+        covenant binds the nonce to the funding input."""
+        utxo, funding_a, tx_a = self._build_for_test()
+        # Build with a different funding UTXO whose script differs
+        funding_b = DmintMinerFundingUtxo(
+            txid="ee" * 32,
+            vout=0,
+            value=_FUNDING_VALUE,
+            script=b"\x76\xa9\x14" + bytes([0x42] * 20) + b"\x88\xac",
+        )
+        utxo, _, tx_b = self._build_for_test()
+        pre_a = build_dmint_v1_mint_preimage(utxo, funding_a, tx_a)
+        pre_b = build_dmint_v1_mint_preimage(utxo, funding_b, tx_b)
+        assert pre_a != pre_b
+
+    def test_preimage_changes_with_op_return_msg(self):
+        """Different OP_RETURN msgs produce different preimages — the
+        covenant binds outputHash to vout[2]'s script."""
+        utxo, funding, tx_a = self._build_for_test(op_return_msg=b"alpha")
+        _, _, tx_b = self._build_for_test(op_return_msg=b"beta")
+        pre_a = build_dmint_v1_mint_preimage(utxo, funding, tx_a)
+        pre_b = build_dmint_v1_mint_preimage(utxo, funding, tx_b)
+        assert pre_a != pre_b
+
+    def test_refuses_tx_without_op_return_at_vout2(self):
+        """Building a tx without op_return_msg only yields 3 outputs;
+        the preimage helper requires the mainnet-canonical 4-output shape."""
+        utxo = _make_v1_contract_utxo()
+        funding = _make_funding_utxo()
+        result = build_dmint_mint_tx(
+            contract_utxo=utxo,
+            nonce=_NONCE_V1,
+            miner_pkh=_MINER_PKH,
+            current_time=0,
+            funding_utxo=funding,
+            op_return_msg=None,  # no OP_RETURN → 3 outputs
+        )
+        with pytest.raises(ValidationError, match="OP_RETURN msg"):
+            build_dmint_v1_mint_preimage(utxo, funding, result.tx)
+
+
+# ---------------------------------------------------------------------------
+# 9. prepare_dmint_deploy — V2 footgun warning
 # ---------------------------------------------------------------------------
 
 

@@ -174,12 +174,64 @@ pattern-recognition-specialist reviewers. Findings applied:
 
 Findings deferred to coding-time (noted but not blocking):
 - V1 branch should early-return rather than fall through V2's DAA
-  update path
-- `find_dmint_contract_utxo` library helper deferred to M2 when there's
-  a second caller
+  update path — done in `_build_dmint_v1_mint_tx`
+- ~~`find_dmint_contract_utxo` library helper deferred to M2~~ — Pulled
+  forward into M1 closeout (post-technical-review round 3, see
+  "Architectural promotions" below). Two helpers now public:
+  `find_dmint_funding_utxo` and `build_dmint_v1_mint_preimage`.
+  `find_dmint_contract_utxo` itself still M2 (the demo accepts the
+  contract outpoint via env var).
 - Naming choice `build_dmint_v1_code_script` vs
   `build_dmint_code_script_v1` — both have precedent; pick at coding
   time
+
+### Architectural Promotions (post-technical-review round 3)
+
+After the demo and supporting infrastructure landed, a third
+technical-review pass (kieran-python-reviewer + code-simplicity-reviewer
++ architecture-strategist) found one cluster of issues all three
+flagged: the demo was importing a `_`-prefixed library symbol, and
+key protocol logic (preimage construction, funding-UTXO scanning)
+lived in the demo rather than the library. Both signals indicated
+missing public API. Fixed by promoting:
+
+1. **`is_token_bearing_script(script: bytes) -> bool`** — was
+   `_funding_script_is_token_bearing` (private). Used by
+   `build_dmint_mint_tx`, `find_dmint_funding_utxo`, and any future
+   "is this UTXO safe to spend as fee?" caller. Public name reflects
+   that it's a generic Glyph-protocol classifier, not a V1-mint-specific
+   helper.
+
+2. **`find_dmint_funding_utxo(client, miner_address, needed)`** —
+   library helper that scans a wallet for plain-RXD UTXOs covering a
+   minimum value, excluding token-bearing UTXOs. Was a private helper
+   in the demo. Promoted because (a) M2's V1-deploy code will need it,
+   (b) it implements the library invariant that the typed
+   `InvalidFundingUtxoError` enforces, (c) the library is the right
+   home for "scan a wallet" logic that touches `ElectrumXClient`.
+
+3. **`build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, unsigned_tx)`** —
+   library helper that computes the V1 mint PoW preimage. Was a
+   private helper in the demo with 40 lines of comments explaining
+   the V1 covenant binding. Promoted because the V1 covenant binding
+   is protocol logic, not example glue: it documents which input/output
+   the covenant hashes, which output binding (vout[2] OP_RETURN msg)
+   the mainnet shape uses, and the SHA256d structure. Examples should
+   glue typed primitives, not encode protocol.
+
+4. **Fee estimation simplified.** `_build_dmint_v1_mint_tx` previously
+   hand-rolled ~30 lines of varint accounting; replaced with
+   `len(tx.serialize())` against a trial-assembled tx. The trial
+   includes same-size placeholder scriptSigs on both inputs (sentinel
+   0xff*64 preimage on the contract input; 107 zero-bytes on the
+   funding input matching the post-signing P2PKH size), so the
+   measured size matches the final on-wire size. Eliminates drift
+   between fee estimate and actual tx weight.
+
+10 new public-API tests landed (`TestIsTokenBearingScript`,
+`TestBuildDmintV1MintPreimage`). Demo dropped ~80 lines (private
+helper functions removed) and now uses only the public library API.
+Full suite: 2629 passed, 10 skipped.
 
 ## Overview
 
