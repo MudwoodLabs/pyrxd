@@ -2030,12 +2030,22 @@ def _build_dmint_v1_mint_tx(
     # bug. Mining replaces this whole scriptSig.
     placeholder_preimage = b"\xff" * 64
     placeholder_contract_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage, nonce_width=4)
-    # Funding input: zero bytes of the right length (~107) so the
-    # serialized tx size used for fee calculation matches what the
-    # signed tx will weigh. The caller replaces this with a real
-    # signature post-build via _sign_p2pkh_input or equivalent.
-    _P2PKH_SCRIPTSIG_ESTIMATED_LEN = 107
-    placeholder_funding_scriptsig = b"\x00" * _P2PKH_SCRIPTSIG_ESTIMATED_LEN
+    # Funding input: 108 zero bytes — the WORST-CASE size of a signed P2PKH
+    # scriptSig. A real signed scriptSig is 106-108 bytes:
+    #   <push-len 0x47..0x49> <DER sig 70-72 bytes + sighash 1 byte>
+    #   <push-len 0x21> <compressed pubkey 33 bytes>
+    # Low-S DER signatures distribute roughly 25/50/25% over 70/71/72 bytes,
+    # so ~25% of real scriptSigs will be 108 bytes. We pad to 108 — over-
+    # estimation by ≤2 bytes is harmless (slight fee over-payment), but
+    # under-estimation causes ~25% of broadcasts to fall under the relay
+    # min-fee floor (fee/size < 10000 photons/byte) and get rejected.
+    # Asymmetric over-padding is the only safe direction.
+    #
+    # Assumes compressed pubkeys (every signing path in pyrxd uses them).
+    # An uncompressed pubkey would push this to ~140 bytes; if a future
+    # caller signs uncompressed, fix the placeholder and this comment.
+    _P2PKH_SCRIPTSIG_MAX_LEN = 108
+    placeholder_funding_scriptsig = b"\x00" * _P2PKH_SCRIPTSIG_MAX_LEN
 
     # --- Assemble unsigned tx with both placeholder scriptSigs attached so
     # `len(tx.serialize())` reflects the final on-wire size. Cleaner than
@@ -2147,6 +2157,8 @@ async def find_dmint_funding_utxo(
     client: Any,
     miner_address: str,
     needed: int,
+    *,
+    require_confirmed: bool = True,
 ) -> DmintMinerFundingUtxo:
     """Scan ``miner_address`` for a plain-RXD UTXO that funds a V1 mint.
 
@@ -2160,15 +2172,22 @@ async def find_dmint_funding_utxo(
     Spending an FT/NFT/dMint UTXO as fee silently destroys the token —
     this scan is the load-bearing defense.
 
-    :param client:         An already-connected ``pyrxd.network.electrumx.ElectrumXClient``.
-    :param miner_address:  Radiant address (R…) of the wallet to scan.
-    :param needed:         Minimum photons the candidate must hold.
-    :returns:              The largest qualifying funding UTXO.
+    :param client:             An already-connected ``pyrxd.network.electrumx.ElectrumXClient``.
+    :param miner_address:      Radiant address (R…) of the wallet to scan.
+    :param needed:             Minimum photons the candidate must hold.
+    :param require_confirmed:  Default ``True``. Skip UTXOs with
+        ``height == 0`` (unconfirmed). Picking an unconfirmed UTXO can
+        cause "missing inputs" rejection when the parent tx hasn't
+        propagated to all relays, or leave a dangling tx if the parent
+        gets evicted from mempool. Set ``False`` only if you're
+        deliberately funding from a same-tx chain.
+    :returns:                  The largest qualifying funding UTXO.
     :raises InvalidFundingUtxoError:
         No plain-RXD UTXO at ``miner_address`` covers ``needed``. The
-        error message reports counts of (a) token-bearing UTXOs skipped
-        and (b) plain-RXD UTXOs that were too small, so the caller can
-        diagnose why the wallet failed the scan.
+        error message reports counts of (a) token-bearing skipped,
+        (b) too-small skipped, (c) unconfirmed skipped (when
+        ``require_confirmed=True``), and (d) network-error skipped, so
+        the caller can diagnose why the wallet failed the scan.
     """
     # Lazy imports so callers that only use the pure builders/parsers
     # don't pay the import cost of the network and transaction modules.
@@ -2181,11 +2200,17 @@ async def find_dmint_funding_utxo(
     candidates: list[DmintMinerFundingUtxo] = []
     skipped_tokens = 0
     skipped_too_small = 0
+    skipped_unconfirmed = 0
+    skipped_network_error = 0
 
     for u in raw:
+        if require_confirmed and u.height == 0:
+            skipped_unconfirmed += 1
+            continue
         try:
             tx_bytes = await client.get_transaction(Txid(u.tx_hash))
         except NetworkError:
+            skipped_network_error += 1
             continue
         tx = Transaction.from_hex(bytes(tx_bytes))
         if tx is None or u.tx_pos >= len(tx.outputs):
@@ -2207,10 +2232,13 @@ async def find_dmint_funding_utxo(
         )
 
     if not candidates:
+        parts = [f"{skipped_tokens} token-bearing", f"{skipped_too_small} too small"]
+        if require_confirmed and skipped_unconfirmed:
+            parts.append(f"{skipped_unconfirmed} unconfirmed")
+        if skipped_network_error:
+            parts.append(f"{skipped_network_error} network-error")
         raise InvalidFundingUtxoError(
-            f"no plain-RXD funding UTXO at {miner_address} covers {needed} "
-            f"photons (skipped {skipped_tokens} token-bearing, "
-            f"{skipped_too_small} too small)"
+            f"no plain-RXD funding UTXO at {miner_address} covers {needed} photons (skipped: {', '.join(parts)})"
         )
     # Largest-first: minimises change-output dust risk.
     candidates.sort(key=lambda u: u.value, reverse=True)
@@ -2250,9 +2278,13 @@ def build_dmint_v1_mint_preimage(
     :returns:              64 bytes ready to feed into :func:`mine_solution`
                            or :func:`mine_solution_external`.
     :raises ValidationError:
-        ``unsigned_tx`` has fewer than 4 outputs (no OP_RETURN msg
-        output at vout[2]). Build the tx with ``op_return_msg`` set to
-        a non-empty bytes value before computing the preimage.
+        ``unsigned_tx`` has fewer than 4 outputs (no OP_RETURN at vout[2])
+        OR vout[2] is not actually an OP_RETURN script. Build the tx via
+        :func:`build_dmint_mint_tx` with a non-empty ``op_return_msg``;
+        skipping that produces a 3-output tx, and hand-building a 4-output
+        tx with a different vout[2] would silently bind the preimage to
+        wrong bytes (the on-chain covenant would then reject after a
+        successful mine — wasting the mining work).
     """
     if len(unsigned_tx.outputs) < 4:
         raise ValidationError(
@@ -2261,8 +2293,15 @@ def build_dmint_v1_mint_preimage(
             "with op_return_msg set to a non-empty bytes value before "
             "computing the preimage."
         )
-    txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
     output_script = unsigned_tx.outputs[2].locking_script.serialize()
+    if not output_script or output_script[0] != 0x6A:
+        raise ValidationError(
+            "V1 mint preimage requires vout[2] to be an OP_RETURN script "
+            "(starts with 0x6a). The on-chain covenant binds outputHash "
+            "to vout[2]; a non-OP_RETURN at this position would produce "
+            "a preimage that fails the covenant check after mining."
+        )
+    txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
     return build_pow_preimage(
         txid_le=txid_le,
         contract_ref_bytes=contract_utxo.state.contract_ref.to_bytes(),

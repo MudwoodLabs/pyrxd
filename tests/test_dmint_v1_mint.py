@@ -42,6 +42,7 @@ from pyrxd.glyph.dmint import (
     build_dmint_v1_mint_preimage,
     build_dmint_v1_state_script,
     build_mint_scriptsig,
+    find_dmint_funding_utxo,
     is_token_bearing_script,
     mine_solution,
     mine_solution_external,
@@ -76,6 +77,11 @@ _V1_SINGLETON_VALUE = 1
 # 10k photons/byte) + dust change. Specific value not load-bearing for
 # most tests; use a smaller value when boundary-testing PoolTooSmallError.
 _FUNDING_VALUE = 100_000_000
+# A syntactically-valid mainnet address for tests that need to call
+# script_hash_for_address (used by find_dmint_funding_utxo). The tests
+# never actually broadcast — the address just has to satisfy the
+# base58-validation regex in pyrxd.utils.decode_address.
+_TEST_MINER_ADDRESS = "11gECtvDapMj5ZuwpvnP6Wv9MTRGxnFRs"
 
 
 def _make_funding_utxo(value: int = _FUNDING_VALUE) -> DmintMinerFundingUtxo:
@@ -1095,6 +1101,202 @@ class TestBuildDmintV1MintPreimage:
         )
         with pytest.raises(ValidationError, match="OP_RETURN msg"):
             build_dmint_v1_mint_preimage(utxo, funding, result.tx)
+
+    def test_refuses_tx_with_non_op_return_at_vout2(self):
+        """A 4-output tx where vout[2] is something other than OP_RETURN
+        must be refused. Without this guard a confused caller would mine
+        a nonce against wrong bytes; the on-chain covenant would reject
+        the broadcast and the mining work is wasted (red-team F3)."""
+        from pyrxd.script.script import Script
+        from pyrxd.transaction.transaction import Transaction
+        from pyrxd.transaction.transaction_output import TransactionOutput
+
+        utxo, funding, _ = self._build_for_test()
+        # Hand-build a 4-output tx where vout[2] is plain P2PKH instead of OP_RETURN
+        bad_tx = Transaction(
+            tx_inputs=[],
+            tx_outputs=[
+                TransactionOutput(Script(b"\x00"), 1),
+                TransactionOutput(Script(b"\x00"), 50_000),
+                TransactionOutput(Script(b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"), 0),  # P2PKH, not OP_RETURN
+                TransactionOutput(Script(b"\x00"), 1_000_000),
+            ],
+        )
+        with pytest.raises(ValidationError, match="OP_RETURN"):
+            build_dmint_v1_mint_preimage(utxo, funding, bad_tx)
+
+    def test_byte_equal_against_independent_pow_preimage_call(self):
+        """Golden-vector test: the helper's output must equal a hand-rolled
+        build_pow_preimage call with the exact same field bindings.
+
+        Pins WHICH fields go into the preimage and in WHICH order:
+          - txid_LE = reversed contract_utxo.txid
+          - contract_ref_bytes = state.contract_ref.to_bytes()
+          - input_script = funding_utxo.script
+          - output_script = unsigned_tx.outputs[2].locking_script (OP_RETURN msg)
+
+        A "preimage changes when funding_script changes" test would also
+        pass if the function hashed the wrong field — this golden-vector
+        approach pins the binding exactly. (red-team F6)"""
+        from pyrxd.glyph.dmint import build_pow_preimage
+
+        utxo, funding, tx = self._build_for_test(op_return_msg=b"goldentest")
+        actual = build_dmint_v1_mint_preimage(utxo, funding, tx)
+        expected = build_pow_preimage(
+            txid_le=bytes.fromhex(utxo.txid)[::-1],
+            contract_ref_bytes=utxo.state.contract_ref.to_bytes(),
+            input_script=funding.script,
+            output_script=tx.outputs[2].locking_script.serialize(),
+        )
+        assert actual == expected
+
+
+# ---------------------------------------------------------------------------
+# 8b. find_dmint_funding_utxo — wallet-side token-burn defense
+# ---------------------------------------------------------------------------
+
+
+class _MockElectrumXClient:
+    """Minimal stand-in for ElectrumXClient to drive find_dmint_funding_utxo
+    in unit tests without spinning up a real server. Each test constructs
+    one with a list of (UtxoRecord, raw_tx_bytes) pairs and a set of txids
+    that should raise NetworkError on get_transaction."""
+
+    def __init__(self, utxos, tx_bytes_by_txid, network_error_txids=None):
+        self.utxos = utxos
+        self.tx_bytes_by_txid = tx_bytes_by_txid
+        self.network_error_txids = network_error_txids or set()
+
+    async def get_utxos(self, _script_hash):
+        return list(self.utxos)
+
+    async def get_transaction(self, txid):
+        from pyrxd.security.errors import NetworkError
+
+        s = str(txid)
+        if s in self.network_error_txids:
+            raise NetworkError(f"simulated network error for {s}")
+        return self.tx_bytes_by_txid[s]
+
+
+def _make_utxo_record(tx_hash, tx_pos=0, value=10_000_000, height=100):
+    """Build a UtxoRecord. Default height=100 (confirmed) — pass 0 for unconfirmed."""
+    from pyrxd.network.electrumx import UtxoRecord
+
+    return UtxoRecord(tx_hash=tx_hash, tx_pos=tx_pos, value=value, height=height)
+
+
+def _wrap_in_tx(script: bytes, value: int, vout_index: int = 0) -> bytes:
+    """Build a minimal raw tx whose vout[vout_index] holds (script, value)."""
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    padding = TransactionOutput(Script(b""), 0)
+    outputs = [padding] * vout_index + [TransactionOutput(Script(script), value)]
+    tx = Transaction(tx_inputs=[], tx_outputs=outputs)
+    return bytes(tx.serialize())
+
+
+class TestFindDmintFundingUtxo:
+    """The public funding-UTXO scanner used by V1 mint demos and (M2) deploy.
+
+    Walks the wallet, classifies each UTXO via is_token_bearing_script,
+    and returns the largest plain-RXD candidate. Tests use a mock
+    ElectrumX client to drive each rejection path.
+    """
+
+    _PLAIN_P2PKH = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+    _FT_SCRIPT = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac\xbd\xd0" + bytes(36) + b"\x00" * 12
+
+    @pytest.mark.asyncio
+    async def test_returns_largest_plain_rxd(self):
+        """Given two plain-RXD candidates of different sizes, return the larger."""
+        small = _make_utxo_record("aa" * 32, value=2_000_000)
+        large = _make_utxo_record("bb" * 32, value=10_000_000)
+        client = _MockElectrumXClient(
+            utxos=[small, large],
+            tx_bytes_by_txid={
+                "aa" * 32: _wrap_in_tx(self._PLAIN_P2PKH, 2_000_000),
+                "bb" * 32: _wrap_in_tx(self._PLAIN_P2PKH, 10_000_000),
+            },
+        )
+        result = await find_dmint_funding_utxo(client, _TEST_MINER_ADDRESS, needed=1_000_000)
+        assert result.txid == "bb" * 32
+        assert result.value == 10_000_000
+
+    @pytest.mark.asyncio
+    async def test_skips_token_bearing(self):
+        """An FT-bearing UTXO must never be returned as funding."""
+        ft_utxo = _make_utxo_record("cc" * 32, value=10_000_000)
+        plain_utxo = _make_utxo_record("dd" * 32, value=2_000_000)
+        client = _MockElectrumXClient(
+            utxos=[ft_utxo, plain_utxo],
+            tx_bytes_by_txid={
+                "cc" * 32: _wrap_in_tx(self._FT_SCRIPT, 10_000_000),
+                "dd" * 32: _wrap_in_tx(self._PLAIN_P2PKH, 2_000_000),
+            },
+        )
+        result = await find_dmint_funding_utxo(client, _TEST_MINER_ADDRESS, needed=1_000_000)
+        # Plain RXD is selected even though the FT is much larger
+        assert result.txid == "dd" * 32
+
+    @pytest.mark.asyncio
+    async def test_skips_unconfirmed_by_default(self):
+        """Unconfirmed (height=0) UTXOs are skipped unless require_confirmed=False."""
+        unconfirmed = _make_utxo_record("ee" * 32, value=10_000_000, height=0)
+        confirmed = _make_utxo_record("ff" * 32, value=2_000_000, height=100)
+        client = _MockElectrumXClient(
+            utxos=[unconfirmed, confirmed],
+            tx_bytes_by_txid={
+                "ee" * 32: _wrap_in_tx(self._PLAIN_P2PKH, 10_000_000),
+                "ff" * 32: _wrap_in_tx(self._PLAIN_P2PKH, 2_000_000),
+            },
+        )
+        result = await find_dmint_funding_utxo(client, _TEST_MINER_ADDRESS, needed=1_000_000)
+        # Confirmed is selected even though unconfirmed is much larger
+        assert result.txid == "ff" * 32
+        # Opting in: returns unconfirmed if it's the only/largest
+        result_unconfirmed = await find_dmint_funding_utxo(
+            client, _TEST_MINER_ADDRESS, needed=1_000_000, require_confirmed=False
+        )
+        assert result_unconfirmed.txid == "ee" * 32
+
+    @pytest.mark.asyncio
+    async def test_raises_when_no_candidates(self):
+        """All-token wallet → InvalidFundingUtxoError with skip-counts."""
+        ft_utxo = _make_utxo_record("aa" * 32, value=10_000_000)
+        small_utxo = _make_utxo_record("bb" * 32, value=100)
+        unconfirmed = _make_utxo_record("cc" * 32, value=10_000_000, height=0)
+        client = _MockElectrumXClient(
+            utxos=[ft_utxo, small_utxo, unconfirmed],
+            tx_bytes_by_txid={
+                "aa" * 32: _wrap_in_tx(self._FT_SCRIPT, 10_000_000),
+                "bb" * 32: _wrap_in_tx(self._PLAIN_P2PKH, 100),
+                "cc" * 32: _wrap_in_tx(self._PLAIN_P2PKH, 10_000_000),
+            },
+        )
+        with pytest.raises(InvalidFundingUtxoError) as exc_info:
+            await find_dmint_funding_utxo(client, _TEST_MINER_ADDRESS, needed=1_000_000)
+        msg = str(exc_info.value)
+        assert "1 token-bearing" in msg
+        assert "1 too small" in msg
+        assert "1 unconfirmed" in msg
+
+    @pytest.mark.asyncio
+    async def test_network_error_counted_in_skip_message(self):
+        """Per-UTXO NetworkError is silent in the loop but tracked and
+        reported in the no-candidates error so a flaky connection isn't
+        misdiagnosed as 'wallet empty'."""
+        flaky = _make_utxo_record("aa" * 32, value=10_000_000)
+        client = _MockElectrumXClient(
+            utxos=[flaky],
+            tx_bytes_by_txid={},  # nothing to fetch
+            network_error_txids={"aa" * 32},
+        )
+        with pytest.raises(InvalidFundingUtxoError) as exc_info:
+            await find_dmint_funding_utxo(client, _TEST_MINER_ADDRESS, needed=1_000_000)
+        assert "1 network-error" in str(exc_info.value)
 
 
 # ---------------------------------------------------------------------------
