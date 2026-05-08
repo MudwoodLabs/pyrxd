@@ -1502,25 +1502,76 @@ class DmintMinerFundingUtxo:
 
 
 # Opcodes in the OP_PUSHINPUTREF family — any of these in a candidate
-# funding script is grounds for refusing to spend it as fee.
+# funding script (as an *opcode*, not as push-data payload) is grounds
+# for refusing to spend it as fee.
 # 0xd0 OP_PUSHINPUTREF, 0xd1 OP_REQUIREINPUTREF, 0xd2 OP_DISALLOWPUSHINPUTREF,
 # 0xd3 OP_DISALLOWPUSHINPUTREFSIBLING, 0xd4–0xd7 reserved/related,
 # 0xd8 OP_PUSHINPUTREFSINGLETON.
-# We deny-list the entire 0xd0..0xd8 range to be safe — anything in this
-# range marks the script as a token-bearing covenant.
 _FUNDING_REF_OPCODE_RANGE = range(0xD0, 0xD9)
 
 
 def _funding_script_is_token_bearing(script: bytes) -> bool:
-    """Return True if ``script`` contains any OP_PUSHINPUTREF-family opcode.
+    """Return True if ``script`` uses any OP_PUSHINPUTREF-family opcode.
 
-    Allow-by-omission is safer than allow-by-shape here: the live ecosystem
-    has plain P2PKH (0x76 0xa9 ...), P2SH (0xa9 ... 0x87), and bare
-    multisig — any of those without a 0xd0–0xd8 byte is fine. A future
-    Glyph variant we don't recognize that still uses 0xd0–0xd8 will be
-    correctly rejected.
+    Walks the script as an opcode stream: push opcodes (0x01..0x4e) consume
+    their payload, and only the *opcode position* bytes are checked against
+    the deny-list. A naive bare-byte scan would falsely flag any P2PKH
+    whose 20-byte hash contains a 0xd0–0xd8 byte (~51% of random
+    addresses), denying about half of honest miners.
+
+    Push opcode encoding (Bitcoin/Radiant script):
+
+    - ``0x01..0x4b``: push the next N bytes (N == opcode value)
+    - ``0x4c`` PUSHDATA1: next 1 byte is length, then push that many
+    - ``0x4d`` PUSHDATA2: next 2 bytes (LE) are length, then push
+    - ``0x4e`` PUSHDATA4: next 4 bytes (LE) are length, then push
+    - everything else: opcode with no payload (advance by 1)
+
+    Truncated push fields are treated as token-bearing — a malformed
+    script of ambiguous length should not be accepted as funding.
     """
-    return any(byte in _FUNDING_REF_OPCODE_RANGE for byte in script)
+    pos = 0
+    n = len(script)
+    while pos < n:
+        op = script[pos]
+        if op in _FUNDING_REF_OPCODE_RANGE:
+            return True
+        # Direct push: 1..0x4b bytes follow.
+        if 0x01 <= op <= 0x4B:
+            new_pos = 1 + pos + op
+            if new_pos > n:
+                return True  # truncated push: refuse the funding UTXO
+            pos = new_pos
+            continue
+        if op == 0x4C:  # PUSHDATA1
+            if pos + 1 >= n:
+                return True
+            length = script[pos + 1]
+            new_pos = pos + 2 + length
+            if new_pos > n:
+                return True
+            pos = new_pos
+            continue
+        if op == 0x4D:  # PUSHDATA2
+            if pos + 2 >= n:
+                return True
+            length = int.from_bytes(script[pos + 1 : pos + 3], "little")
+            new_pos = pos + 3 + length
+            if new_pos > n:
+                return True
+            pos = new_pos
+            continue
+        if op == 0x4E:  # PUSHDATA4
+            if pos + 4 >= n:
+                return True
+            length = int.from_bytes(script[pos + 1 : pos + 5], "little")
+            new_pos = pos + 5 + length
+            if new_pos > n:
+                return True
+            pos = new_pos
+            continue
+        pos += 1
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1918,12 +1969,20 @@ def _build_dmint_v1_mint_tx(
     change_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
     op_return_script: bytes | None = None
     if op_return_msg is not None:
-        # OP_RETURN <push-len> <data>
+        # Photonic-Wallet convention (docs/dmint-research-mainnet.md §4 vout[2]):
+        # OP_RETURN PUSH3 "msg" <push-len> <message>
+        # The "msg" marker push is what wallet/explorer parsers key on to
+        # surface the message; without it, the OP_RETURN is just opaque
+        # bytes from the indexer's perspective. The covenant doesn't enforce
+        # this — but we want byte-equivalence with mainnet for ecosystem
+        # compatibility.
+        msg_marker = b"\x03msg"
         if len(op_return_msg) <= 0x4B:
-            op_return_script = b"\x6a" + bytes([len(op_return_msg)]) + op_return_msg
+            data_push = bytes([len(op_return_msg)]) + op_return_msg
         else:
-            # OP_PUSHDATA1
-            op_return_script = b"\x6a\x4c" + bytes([len(op_return_msg)]) + op_return_msg
+            # PUSHDATA1
+            data_push = b"\x4c" + bytes([len(op_return_msg)]) + op_return_msg
+        op_return_script = b"\x6a" + msg_marker + data_push
 
     # --- Placeholder scriptSig.
     # The placeholder preimage uses 0xff bytes (rather than zeros) as a

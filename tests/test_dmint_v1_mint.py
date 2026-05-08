@@ -378,6 +378,25 @@ class TestBuildDmintMintTxV1:
         op_return_script = result.tx.outputs[2].locking_script.script
         assert op_return_script[0] == 0x6A  # OP_RETURN
 
+    def test_op_return_msg_byte_equal_to_mainnet(self):
+        """The OP_RETURN encoding must include the Photonic-Wallet 'msg'
+        marker push so wallet/explorer parsers can surface the message.
+
+        Mainnet `146a4d68…f3c` vout[2] is `6a 03 6d7367 09 'snk [r2w]'`:
+            OP_RETURN PUSH3 'msg' PUSH9 'snk [r2w]'
+        Without the 'msg' marker, the OP_RETURN is just opaque bytes from
+        the indexer's perspective. (red-team N3 / hardening-2)"""
+        utxo = _make_v1_contract_utxo()
+        result = self._mint(utxo, op_return_msg=b"snk [r2w]")
+        op_return_script = result.tx.outputs[2].locking_script.script
+        expected = (
+            b"\x6a"  # OP_RETURN
+            + b"\x03msg"  # PUSH3 'msg' marker
+            + b"\x09"  # PUSH9
+            + b"snk [r2w]"  # message data
+        )
+        assert op_return_script == expected
+
     def test_op_return_msg_too_long_raises(self):
         utxo = _make_v1_contract_utxo()
         with pytest.raises(ValidationError, match="op_return_msg"):
@@ -474,6 +493,63 @@ class TestBuildDmintMintTxV1:
         )
         with pytest.raises(InvalidFundingUtxoError, match="OP_PUSHINPUTREF"):
             self._mint(utxo, funding_utxo=bad_funding)
+
+    def test_p2pkh_with_d_byte_in_hash_is_accepted(self):
+        """A plain P2PKH whose 20-byte pkh contains a byte in 0xd0-0xd8 is
+        a legitimate plain-RXD UTXO and must not be flagged as token-bearing.
+
+        The previous byte-scan implementation would flag any P2PKH where any
+        of the 20 hash bytes happened to fall in 0xd0-0xd8 — a ~51% false-
+        positive rate against random P2PKH addresses. Real ecosystem miners
+        would have been DoS'd from minting (red-team N1 / hardening-2)."""
+        utxo = _make_v1_contract_utxo()
+        # Construct a P2PKH where every payload byte is in the deny range —
+        # a worst-case stress test.
+        hash_with_d_bytes = bytes([0xD0, 0xD1, 0xD2, 0xD3, 0xD4, 0xD5, 0xD6, 0xD7, 0xD8] * 3)[:20]
+        p2pkh = b"\x76\xa9\x14" + hash_with_d_bytes + b"\x88\xac"
+        funding = DmintMinerFundingUtxo(
+            txid="ff" * 32,
+            vout=0,
+            value=_FUNDING_VALUE,
+            script=p2pkh,
+        )
+        # Must succeed: opcode-stream-aware walker correctly identifies the
+        # 0xd0-0xd8 bytes as PUSH(20) payload, not as opcodes.
+        result = self._mint(utxo, funding_utxo=funding)
+        assert isinstance(result, DmintMintResult)
+
+    def test_p2sh_funding_utxo_is_accepted(self):
+        """Standard P2SH script: OP_HASH160 PUSH20 <hash> OP_EQUAL — even with
+        deny-range bytes inside the hash, this must be accepted."""
+        utxo = _make_v1_contract_utxo()
+        # OP_HASH160 = 0xa9; OP_EQUAL = 0x87
+        # Hash again chosen to include deny-range bytes in payload position
+        hash_payload = bytes([0xD2] * 20)
+        p2sh = b"\xa9\x14" + hash_payload + b"\x87"
+        funding = DmintMinerFundingUtxo(
+            txid="ff" * 32,
+            vout=0,
+            value=_FUNDING_VALUE,
+            script=p2sh,
+        )
+        result = self._mint(utxo, funding_utxo=funding)
+        assert isinstance(result, DmintMintResult)
+
+    def test_truncated_pushdata_funding_is_rejected(self):
+        """A malformed funding script with a truncated push field is treated
+        as token-bearing and refused. A script of ambiguous length cannot be
+        safely classified as plain RXD."""
+        utxo = _make_v1_contract_utxo()
+        # PUSHDATA1 declares length 0x10 but only 5 bytes follow
+        truncated = b"\x4c\x10\x01\x02\x03\x04\x05"
+        funding = DmintMinerFundingUtxo(
+            txid="ff" * 32,
+            vout=0,
+            value=_FUNDING_VALUE,
+            script=truncated,
+        )
+        with pytest.raises(InvalidFundingUtxoError):
+            self._mint(utxo, funding_utxo=funding)
 
     def test_missing_funding_utxo_raises(self):
         """V1 mint without a funding_utxo cannot be built."""
@@ -861,6 +937,21 @@ class TestPrepareDmintDeployV2Refusal:
         builder = GlyphBuilder()
         result = builder.prepare_dmint_deploy(self._params(), allow_v2_deploy=True)
         assert isinstance(result, DmintDeployResult)
+
+    def test_allow_v2_deploy_default_is_false(self):
+        """Mechanical regression check: a future refactor must not flip the
+        ``allow_v2_deploy`` default from False to True. (red-team N5 /
+        hardening-2)"""
+        import inspect
+
+        from pyrxd.glyph.builder import GlyphBuilder
+
+        sig = inspect.signature(GlyphBuilder.prepare_dmint_deploy)
+        param = sig.parameters["allow_v2_deploy"]
+        assert param.default is False
+        # Also assert it's keyword-only — passing it positionally would
+        # let a refactor accidentally make it the second positional arg.
+        assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
 
 # ---------------------------------------------------------------------------
