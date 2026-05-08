@@ -893,7 +893,7 @@ def mine_solution_external(
     :raises FileNotFoundError: ``miner_argv[0]`` is not on PATH.
     """
     import json
-    import subprocess
+    import subprocess  # nosec B404 — used to invoke a caller-supplied external miner; see docstring supply-chain warning
 
     if len(preimage) != 64:
         raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
@@ -925,7 +925,7 @@ def mine_solution_external(
         # the timeout fires. Loss of debug info is an acceptable trade for
         # the bounded-memory guarantee. The subprocess's stdin/stdout
         # protocol is the only contract; stderr is implementation chatter.
-        completed = subprocess.run(  # noqa: S603
+        completed = subprocess.run(  # noqa: S603 # nosec B603 — see comment + docstring supply-chain warning
             miner_argv,
             input=request.encode("utf-8"),
             stdout=subprocess.PIPE,
