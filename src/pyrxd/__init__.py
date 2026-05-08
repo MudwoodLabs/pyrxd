@@ -36,6 +36,8 @@ see the same names with no behaviour change.
 
 from __future__ import annotations
 
+from typing import Any
+
 __version__ = "0.4.0"
 
 # Map of public-name → (module, attr) pairs. Resolved lazily on first
@@ -83,7 +85,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
 __all__ = sorted([*_LAZY_EXPORTS.keys(), "__version__"])
 
 
-def __getattr__(name: str):
+def __getattr__(name: str) -> Any:
     """PEP 562 lazy attribute access for public re-exports.
 
     Imports the underlying module on first access, caches the resolved
