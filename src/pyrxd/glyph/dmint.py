@@ -9,6 +9,7 @@ Design reference: glyph-miner/docs/V2_DMINT_DESIGN.md
 from __future__ import annotations
 
 import hashlib
+import math
 import struct
 import time
 from dataclasses import dataclass
@@ -336,14 +337,16 @@ def build_dmint_contract_script(params: DmintDeployParams) -> bytes:
 # (common template). The V1 parser (DmintState._from_v1_script) and
 # fingerprint helpers (_match_v1_epilogue) are the inverse of these.
 
-# Inverse of _V1_ALGO_BYTE_TO_ENUM (defined later in this module). Built
-# eagerly so V1 builders can reference it; the parser-side mapping is the
-# source of truth for which byte means which algorithm.
-_V1_ENUM_TO_ALGO_BYTE: dict[DmintAlgo, int] = {
-    DmintAlgo.SHA256D: 0xAA,  # OP_HASH256
-    DmintAlgo.BLAKE3: 0xEE,  # OP_BLAKE3
-    DmintAlgo.K12: 0xEF,  # OP_K12
+_V1_ALGO_BYTE_TO_ENUM: dict[int, DmintAlgo] = {
+    0xAA: DmintAlgo.SHA256D,  # OP_HASH256
+    0xEE: DmintAlgo.BLAKE3,  # OP_BLAKE3
+    0xEF: DmintAlgo.K12,  # OP_K12
 }
+# Inverse derived from the source-of-truth mapping above. Building the
+# inverse mechanically prevents drift: a future contributor adding e.g.
+# DmintAlgo.SCRYPT only needs to extend the byte→enum map, and the
+# enum→byte direction follows automatically.
+_V1_ENUM_TO_ALGO_BYTE: dict[DmintAlgo, int] = {enum: byte for byte, enum in _V1_ALGO_BYTE_TO_ENUM.items()}
 
 
 def build_dmint_v1_state_script(
@@ -853,12 +856,33 @@ def mine_solution_external(
     3. Write one JSON object to stdout: ``{"nonce_hex", "attempts", "elapsed_s"}``
     4. Exit cleanly
 
+    .. warning::
+       **Supply-chain risk: pyrxd does NOT pin or verify the miner binary.**
+       ``miner_argv[0]`` is resolved by the OS at exec time, so a malicious
+       binary earlier in ``$PATH`` can intercept calls. The local nonce
+       re-verification (below) defends against the miner returning a *wrong*
+       nonce, but cannot detect side-channel exfiltration: a malicious
+       miner sees the preimage (which encodes the contract ref + miner
+       binding) and can leak it out-of-band over the network.
+
+       Mitigations the caller should consider:
+
+       - Invoke with an absolute path (``["/usr/local/bin/glyph-miner", ...]``)
+         rather than a bare name to bypass ``$PATH`` resolution.
+       - Verify the binary's checksum against the upstream release before
+         first use.
+       - Run pyrxd in an environment where ``$PATH`` is controlled (e.g.
+         a dedicated user account, sandbox, or container).
+
+       For testing and trusted environments the bare-name form is fine.
+
     :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
     :param target:       The PoW target.
     :param miner_argv:   argv passed to :func:`subprocess.run` (e.g.
                          ``["glyph-miner", "--stdin"]``). The first element
                          must be a binary or shell-resolvable name; pyrxd
-                         does not pin a specific miner.
+                         does not pin a specific miner. See the supply-chain
+                         warning above.
     :param nonce_width:  4 for V1, 8 for V2.
     :param timeout_s:    Hard timeout. The subprocess is killed and
                          :class:`MaxAttemptsError` raised on expiry.
@@ -956,12 +980,25 @@ def mine_solution_external(
 
     elapsed = time.monotonic() - started
     # Trust the miner's self-reported metrics if present, else fall back.
-    attempts = response.get("attempts", 0)
-    if not isinstance(attempts, int) or attempts < 0:
+    # Defense-in-depth against malicious/buggy miner responses:
+    # - attempts capped at 2**40 to prevent log poisoning / aggregator overflow
+    # - elapsed_s rejected if NaN, inf, or negative (json.loads accepts
+    #   "NaN" / "Infinity" via parse_constant; both pass isinstance(_, float))
+    raw_attempts = response.get("attempts", 0)
+    if not isinstance(raw_attempts, int) or raw_attempts < 0 or raw_attempts > (1 << 40):
         attempts = 0
-    miner_elapsed = response.get("elapsed_s", elapsed)
-    if not isinstance(miner_elapsed, (int, float)) or miner_elapsed < 0:
+    else:
+        attempts = raw_attempts
+    raw_elapsed = response.get("elapsed_s", elapsed)
+    if (
+        not isinstance(raw_elapsed, (int, float))
+        or isinstance(raw_elapsed, bool)  # bools are int subclass — reject explicitly
+        or not math.isfinite(raw_elapsed)
+        or raw_elapsed < 0
+    ):
         miner_elapsed = elapsed
+    else:
+        miner_elapsed = raw_elapsed
 
     return DmintMineResult(
         nonce=nonce,
@@ -1065,11 +1102,9 @@ _V1_EPILOGUE_SUFFIX = bytes.fromhex(
     "6d7551"
 )
 _V1_EPILOGUE_LEN = len(_V1_EPILOGUE_PREFIX) + 1 + len(_V1_EPILOGUE_SUFFIX)
-_V1_ALGO_BYTE_TO_ENUM: dict[int, DmintAlgo] = {
-    0xAA: DmintAlgo.SHA256D,
-    0xEE: DmintAlgo.BLAKE3,
-    0xEF: DmintAlgo.K12,
-}
+# _V1_ALGO_BYTE_TO_ENUM and its inverse _V1_ENUM_TO_ALGO_BYTE are defined
+# earlier in the module (around the V1 builders) so the V1 builder helpers
+# can reference the inverse mapping. Single source of truth: byte→enum.
 
 
 def _match_v1_epilogue(script: bytes, start: int) -> DmintAlgo | None:
@@ -1794,11 +1829,15 @@ def build_dmint_mint_tx(
     # --- Build reward output script (P2PKH) ---
     reward_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
 
-    # --- Placeholder scriptSig (nonce + dummy preimage zeros) ---
-    # The real preimage requires txid + script hashes which are only available
-    # once outputs are finalised (see docstring). Preimage bytes here are zeros;
-    # a miner loop MUST replace this before broadcast.
-    placeholder_preimage = bytes(64)
+    # --- Placeholder scriptSig (nonce + sentinel preimage 0xff*64) ---
+    # The real preimage requires txid + script hashes which are only
+    # available once outputs are finalised (see docstring). The
+    # placeholder uses 0xff bytes (rather than zeros) as a visibly-invalid
+    # sentinel: a miner loop that forgets to replace it produces a tx
+    # whose covenant rejects fast on the network rather than silently
+    # passing structural checks. Same sentinel used in the V1 path
+    # (see _build_dmint_v1_mint_tx).
+    placeholder_preimage = b"\xff" * 64
     placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage)
 
     # --- Estimate tx size for fee ---

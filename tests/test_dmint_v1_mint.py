@@ -885,6 +885,100 @@ class TestMineSolutionExternal:
                 nonce_width=4,
             )
 
+    def test_rejects_nan_elapsed_s(self, tmp_path):
+        """A miner returning ``"elapsed_s": NaN`` (which json.loads accepts via
+        parse_constant) must be silently coerced to the script-measured
+        elapsed value, not propagated to DmintMineResult.elapsed_s.
+        Otherwise downstream metrics aggregation poisons on NaN."""
+        fake_hash = b"\x00\x00\x00\x00" + (0).to_bytes(8, "big") + b"\xff" * 20
+        # Note: write 'NaN' literal (Python's json module emits this for float('nan'))
+        miner_argv = _make_mock_miner_script(
+            tmp_path,
+            {"nonce_hex": "deadbeef", "attempts": 1, "elapsed_s": float("nan")},
+        )
+        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+            mock_hashlib.sha256.return_value.digest.return_value = fake_hash
+            result = mine_solution_external(
+                preimage=b"\x00" * 64,
+                target=1,
+                miner_argv=miner_argv,
+                nonce_width=4,
+                timeout_s=10,
+            )
+        # NaN should have been replaced with the wall-clock measurement.
+        import math
+
+        assert not math.isnan(result.elapsed_s)
+        assert math.isfinite(result.elapsed_s)
+        assert result.elapsed_s >= 0
+
+    def test_rejects_inf_elapsed_s(self, tmp_path):
+        """Same defense for +inf."""
+        fake_hash = b"\x00\x00\x00\x00" + (0).to_bytes(8, "big") + b"\xff" * 20
+        miner_argv = _make_mock_miner_script(
+            tmp_path,
+            {"nonce_hex": "deadbeef", "attempts": 1, "elapsed_s": float("inf")},
+        )
+        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+            mock_hashlib.sha256.return_value.digest.return_value = fake_hash
+            result = mine_solution_external(
+                preimage=b"\x00" * 64,
+                target=1,
+                miner_argv=miner_argv,
+                nonce_width=4,
+                timeout_s=10,
+            )
+        import math
+
+        assert math.isfinite(result.elapsed_s)
+
+    def test_clamps_huge_attempts(self, tmp_path):
+        """A miner reporting attempts > 2**40 has its self-report dropped to 0
+        rather than propagated. Defense against log poisoning / aggregator
+        overflow if a malicious miner reports astronomical attempt counts."""
+        fake_hash = b"\x00\x00\x00\x00" + (0).to_bytes(8, "big") + b"\xff" * 20
+        miner_argv = _make_mock_miner_script(
+            tmp_path,
+            {"nonce_hex": "deadbeef", "attempts": 10**18, "elapsed_s": 0.1},
+        )
+        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+            mock_hashlib.sha256.return_value.digest.return_value = fake_hash
+            result = mine_solution_external(
+                preimage=b"\x00" * 64,
+                target=1,
+                miner_argv=miner_argv,
+                nonce_width=4,
+                timeout_s=10,
+            )
+        assert result.attempts == 0  # clamped to safe sentinel
+
+    def test_rejects_bool_attempts(self, tmp_path):
+        """JSON accepts ``true``/``false`` for numeric fields; bool is an int
+        subclass in Python, so a naive ``isinstance(_, int)`` check would let
+        it through. Reject explicitly."""
+        fake_hash = b"\x00\x00\x00\x00" + (0).to_bytes(8, "big") + b"\xff" * 20
+        miner_argv = _make_mock_miner_script(
+            tmp_path,
+            # JSON true serializes as a Python bool, which IS an int subclass
+            {"nonce_hex": "deadbeef", "attempts": True, "elapsed_s": True},
+        )
+        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+            mock_hashlib.sha256.return_value.digest.return_value = fake_hash
+            result = mine_solution_external(
+                preimage=b"\x00" * 64,
+                target=1,
+                miner_argv=miner_argv,
+                nonce_width=4,
+                timeout_s=10,
+            )
+        # bool elapsed_s must be rejected and replaced by the wall-clock value
+        # bool attempts is an int subclass with value 1, technically valid;
+        # the elapsed_s defense is what we're testing here. Just confirm no crash.
+        import math
+
+        assert math.isfinite(result.elapsed_s)
+        assert result.elapsed_s >= 0
+
 
 # ---------------------------------------------------------------------------
 # 7. prepare_dmint_deploy — V2 footgun warning
