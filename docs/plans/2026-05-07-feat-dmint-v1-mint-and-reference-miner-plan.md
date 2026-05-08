@@ -474,8 +474,11 @@ difficulty without explicit opt-in.
   - Per-attempt support for an external miner via the `EXTERNAL_MINER` env var (delegates to glyph-miner via `mine_solution_external`)
   - `OP_RETURN_MSG=NONE` escape hatch for users who want to test without the Photonic msg marker
   - Stale-state recovery: print failure + reason on broadcast rejection, exit non-zero so the user re-runs (no automatic retry — mining a new preimage is required because the contractRef-bound preimage goes stale on chain advance)
-- [ ] `docs/dmint-followup.md` gets an "out of date — see code" warning
-  at the top (full rewrite lands in Milestone 2) — *deferred to Session D*
+- [x] `docs/dmint-followup.md` gets an "out of date — see code" warning
+  at the top (full rewrite lands in Milestone 2). Banner cites the
+  authoritative current sources (`dmint.py`, `builder.py`,
+  `examples/dmint_claim_demo.py`, the plan itself) and lists what's
+  still genuinely future work.
 - [x] `prepare_dmint_deploy` carries both a docstring warning AND a
   runtime `DeprecationWarning` for the V2-deploy footgun (see
   "Deploy-footgun mitigation in M1" below)

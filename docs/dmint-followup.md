@@ -1,5 +1,47 @@
 # dMint Follow-up: PoW Distributed Mint (Future Work)
 
+> ⚠️ **This document is out of date — see code instead.**
+>
+> Written when pyrxd shipped only the premine-at-deploy path. Since
+> then pyrxd has gained **full V2 deploy** support and **V1 mint**
+> support against live mainnet contracts (RBG and other live V1
+> deploys). The "what is NOT implemented" sections below are wrong:
+> the V2 contract builder, ASERT/LWMA difficulty bytecode, V1+V2
+> parsers, V1+V2 mint tx builders, an external-miner shim, and a
+> reference Python miner all ship today.
+>
+> **Authoritative sources for current dMint capability:**
+>
+> - [`src/pyrxd/glyph/dmint.py`](../src/pyrxd/glyph/dmint.py) —
+>   builders, parsers, miner, verifier
+> - [`src/pyrxd/glyph/builder.py`](../src/pyrxd/glyph/builder.py) —
+>   `prepare_dmint_deploy` (V2; refuses to run without
+>   `allow_v2_deploy=True` opt-in until V1 deploy lands in M2)
+> - [`examples/dmint_claim_demo.py`](../examples/dmint_claim_demo.py) —
+>   manual real-mainnet V1 mint runner
+> - [`docs/plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md`](plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md) —
+>   current dMint roadmap (M1 V1 mint shipped; M2 V1 deploy; M3 V2
+>   deploy proof, deferred)
+>
+> **What's still genuinely future work:**
+>
+> - V1 deploy builder (M2 — `prepare_dmint_deploy` still emits V2;
+>   needs a `version="v1"` opt-in path)
+> - Live-mainnet V2 deploy proof (M3, deferred indefinitely — no
+>   ecosystem demand)
+> - EPOCH and SCHEDULE DAA modes (raise `NotImplementedError`; no
+>   observed contract uses them)
+> - Native fast miner — pyrxd ships a slow Python reference; users
+>   wanting GPU/multi-core go through the external-miner shim to
+>   `glyph-miner`
+>
+> Full rewrite of this doc lands when M2 closes.
+
+---
+
+**(Original document — historically accurate at writing time, no
+longer reflects the current code. Retained for context.)**
+
 pyrxd 0.2.x implements the **premine-at-deploy** FT path. This document
 captures what a future PoW-capable SDK would need to implement Photonic's
 full dMint protocol, and why most consumers do not require it.
