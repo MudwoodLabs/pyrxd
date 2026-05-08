@@ -17,6 +17,7 @@ from typing import Any, Literal
 
 from pyrxd.security.errors import (
     ContractExhaustedError,
+    InvalidFundingUtxoError,
     MaxAttemptsError,
     PoolTooSmallError,
     ValidationError,
@@ -366,17 +367,34 @@ def build_dmint_v1_state_script(
     time: V2's item 5 is ``algoId`` via ``_push_minimal``, never an
     8-byte push.
 
-    :raises ValidationError: ``height`` or ``last_time`` < 0; ``max_height``
-        or ``reward`` < 1; ``target`` not in [1, 2**64).
+    :raises ValidationError: ``height < 0``; ``max_height < 1``;
+        ``height >= max_height`` (born-exhausted contract); ``reward < 1``;
+        ``target`` not in ``[1, MAX_SHA256D_TARGET]``. The upper target
+        bound is ``MAX_SHA256D_TARGET = 0x7fff...ff`` rather than ``2**64``
+        because Bitcoin script integers are signed: pushing a value with
+        the high bit set produces a negative number on the stack, and the
+        on-chain target comparison would behave wrongly. Photonic Wallet's
+        ``dMintDiffToTarget`` formula always produces a value in this
+        signed-positive range.
     """
     if height < 0:
         raise ValidationError("height must be >= 0")
     if max_height < 1:
         raise ValidationError("max_height must be >= 1")
+    if height >= max_height:
+        raise ValidationError(
+            f"height ({height}) must be < max_height ({max_height}); "
+            f"a contract built with height >= max_height is born-exhausted "
+            f"and pool funds would be locked at deploy time"
+        )
     if reward < 1:
         raise ValidationError("reward must be >= 1 photon")
-    if not 1 <= target < (1 << 64):
-        raise ValidationError(f"target must fit in 8 unsigned bytes, got {target}")
+    if not 1 <= target <= MAX_SHA256D_TARGET:
+        raise ValidationError(
+            f"target must be in [1, MAX_SHA256D_TARGET=0x{MAX_SHA256D_TARGET:x}], "
+            f"got {target} (top-bit-set values are negative in Bitcoin script "
+            f"semantics and the on-chain comparison would behave wrongly)"
+        )
 
     return (
         _push_4bytes_le(height)
@@ -408,6 +426,47 @@ def build_dmint_v1_code_script(algo: DmintAlgo) -> bytes:
     except KeyError as exc:
         raise ValidationError(f"unsupported V1 algo: {algo!r}") from exc
     return _V1_EPILOGUE_PREFIX + bytes([algo_byte]) + _V1_EPILOGUE_SUFFIX
+
+
+# 12-byte fingerprint baked into the V1 covenant at offset 148 of the code
+# epilogue. The covenant builds the expected FT-output codescript hash by
+# prepending 0xd0 + tokenRef and appending these 12 bytes, then HASH256s it
+# (`_V1_EPILOGUE_SUFFIX` opcodes 01 d0 53 79 7e 0c <12 bytes> 7e aa). The
+# miner's reward output script must end with these exact bytes so that
+# the FT-conservation check passes.
+# Source: docs/dmint-research-mainnet.md §2.2 offset 148, §4 vout[1] hex.
+_V1_FT_OUTPUT_EPILOGUE = bytes.fromhex("dec0e9aa76e378e4a269e69d")
+
+
+def build_dmint_v1_ft_output_script(
+    miner_pkh: bytes,
+    token_ref: GlyphRef,
+) -> bytes:
+    """Build the 75-byte P2PKH-wrapped FT output that a V1 mint produces.
+
+    Layout (docs/dmint-research-mainnet.md §4 vout[1])::
+
+        76 a9 14 <pkh:20>     OP_DUP OP_HASH160 PUSH20 pkh
+        88 ac                 OP_EQUALVERIFY OP_CHECKSIG    (25-byte P2PKH prologue)
+        bd                    OP_STATESEPARATOR
+        d0 <tokenRef:36>      OP_PUSHINPUTREF tokenRef       (37 bytes)
+        de c0 e9 aa 76 e3     12-byte covenant fingerprint   (`_V1_FT_OUTPUT_EPILOGUE`)
+        78 e4 a2 69 e6 9d
+        ──────────────────────
+        Total: 75 bytes
+
+    This is the **FT-bearing** reward output — the V1 contract's
+    ``OP_CODESCRIPTHASHVALUESUM_OUTPUTS OP_NUMEQUALVERIFY`` at epilogue
+    offset 168 sums photons under this codescript and requires the total
+    to equal the contract's ``reward`` field. Producing a plain P2PKH
+    instead breaks FT conservation and the network rejects the mint.
+
+    :raises ValidationError: ``miner_pkh`` is not 20 bytes.
+    """
+    if len(miner_pkh) != 20:
+        raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
+    p2pkh_prologue = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+    return p2pkh_prologue + _OP_STATESEPARATOR + b"\xd0" + token_ref.to_bytes() + _V1_FT_OUTPUT_EPILOGUE
 
 
 def build_dmint_v1_contract_script(
@@ -836,11 +895,17 @@ def mine_solution_external(
         # which binary to invoke." Local re-verification of the returned
         # nonce below is the load-bearing safety check, not subprocess
         # argv sanitization.
+        #
+        # stderr is discarded rather than captured: a misbehaving miner
+        # writing gigabytes to stderr would otherwise OOM the parent before
+        # the timeout fires. Loss of debug info is an acceptable trade for
+        # the bounded-memory guarantee. The subprocess's stdin/stdout
+        # protocol is the only contract; stderr is implementation chatter.
         completed = subprocess.run(  # noqa: S603
             miner_argv,
-            input=request,
-            capture_output=True,
-            text=True,
+            input=request.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
             timeout=timeout_s,
             check=False,
         )
@@ -853,15 +918,14 @@ def mine_solution_external(
         ) from exc
 
     if completed.returncode != 0:
-        # Don't echo arbitrary stderr to the exception (could be megabytes,
-        # and an aggressive truncate beats a memory blow-up).
-        stderr_tail = (completed.stderr or "")[-500:]
-        raise ValidationError(
-            f"external miner {miner_argv[0]!r} exited with code {completed.returncode}: {stderr_tail!r}"
-        )
+        raise ValidationError(f"external miner {miner_argv[0]!r} exited with code {completed.returncode}")
 
-    # Parse the response. Cap stdout size to defend against a runaway miner.
-    stdout = completed.stdout or ""
+    # Decode stdout. A miner returning malformed UTF-8 is a malformed
+    # response, not an exception that should escape.
+    try:
+        stdout = (completed.stdout or b"").decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValidationError(f"external miner {miner_argv[0]!r} returned non-UTF-8 stdout") from exc
     if len(stdout) > 4096:
         raise ValidationError(f"external miner produced {len(stdout)} bytes of stdout; expected one short JSON line")
     try:
@@ -1394,7 +1458,10 @@ class DmintContractUtxo:
 
     :param txid:         txid of the UTXO (hex, not reversed)
     :param vout:         output index
-    :param value:        photon value locked in the UTXO (reward pool balance)
+    :param value:        photon value locked in the UTXO. For V1 contracts
+                         this is the singleton carrier (1 photon on the live
+                         RBG-class deploys). For V2 it is the running reward
+                         pool that decrements per mint.
     :param script:       full output script bytes (state + OP_STATESEPARATOR + code)
     :param state:        parsed :class:`DmintState` — caller can obtain via
                          ``DmintState.from_script(script)``
@@ -1405,6 +1472,55 @@ class DmintContractUtxo:
     value: int
     script: bytes
     state: DmintState
+
+
+@dataclass(frozen=True)
+class DmintMinerFundingUtxo:
+    """A plain RXD UTXO supplied by the miner to fund a V1 mint.
+
+    The V1 covenant takes its FT output value (``reward`` photons) and the
+    miner's tx fee from a separate plain-RXD input — the contract output is
+    a singleton and never funds the mint. This dataclass describes that
+    funding input.
+
+    The locking script must be a plain script with NO Glyph/FT/dMint
+    ref pushes (``OP_PUSHINPUTREF*``, opcodes 0xd0–0xd8). Spending a
+    token-bearing UTXO as fee silently destroys the token; the V1 mint
+    builder validates this and raises :class:`InvalidFundingUtxoError`
+    if the funding script carries any ref envelope.
+
+    :param txid:    txid of the UTXO (hex, not reversed)
+    :param vout:    output index
+    :param value:   photons locked in the UTXO
+    :param script:  full locking script bytes (typically 25-byte P2PKH)
+    """
+
+    txid: str
+    vout: int
+    value: int
+    script: bytes
+
+
+# Opcodes in the OP_PUSHINPUTREF family — any of these in a candidate
+# funding script is grounds for refusing to spend it as fee.
+# 0xd0 OP_PUSHINPUTREF, 0xd1 OP_REQUIREINPUTREF, 0xd2 OP_DISALLOWPUSHINPUTREF,
+# 0xd3 OP_DISALLOWPUSHINPUTREFSIBLING, 0xd4–0xd7 reserved/related,
+# 0xd8 OP_PUSHINPUTREFSINGLETON.
+# We deny-list the entire 0xd0..0xd8 range to be safe — anything in this
+# range marks the script as a token-bearing covenant.
+_FUNDING_REF_OPCODE_RANGE = range(0xD0, 0xD9)
+
+
+def _funding_script_is_token_bearing(script: bytes) -> bool:
+    """Return True if ``script`` contains any OP_PUSHINPUTREF-family opcode.
+
+    Allow-by-omission is safer than allow-by-shape here: the live ecosystem
+    has plain P2PKH (0x76 0xa9 ...), P2SH (0xa9 ... 0x87), and bare
+    multisig — any of those without a 0xd0–0xd8 byte is fine. A future
+    Glyph variant we don't recognize that still uses 0xd0–0xd8 will be
+    correctly rejected.
+    """
+    return any(byte in _FUNDING_REF_OPCODE_RANGE for byte in script)
 
 
 # ---------------------------------------------------------------------------
@@ -1446,6 +1562,9 @@ def build_dmint_mint_tx(
     miner_pkh: bytes,
     current_time: int,
     fee_rate: int = 10_000,
+    *,
+    funding_utxo: DmintMinerFundingUtxo | None = None,
+    op_return_msg: bytes | None = None,
 ) -> DmintMintResult:
     """Build an unsigned dMint mint transaction.
 
@@ -1504,6 +1623,9 @@ def build_dmint_mint_tx(
     from pyrxd.transaction.transaction_input import TransactionInput
     from pyrxd.transaction.transaction_output import TransactionOutput
 
+    if fee_rate < 1:
+        raise ValidationError(f"fee_rate must be >= 1, got {fee_rate}")
+
     state = contract_utxo.state
 
     # V1 dispatch: V1 contracts have a different state layout, scriptSig
@@ -1511,13 +1633,32 @@ def build_dmint_mint_tx(
     # path completely separate from V2's DAA-target-update flow rather than
     # threading conditionals through the V2 logic below.
     if state.is_v1:
+        if funding_utxo is None:
+            raise ValidationError(
+                "V1 mint requires a funding_utxo: V1 contracts are singletons "
+                "(typically 1 photon) and the FT reward + tx fee come from a "
+                "separate plain-RXD input. Pass funding_utxo=DmintMinerFundingUtxo(...) "
+                "as a keyword argument."
+            )
+        if current_time != 0:
+            raise ValidationError(
+                "current_time must be 0 for V1 mints — V1 has no DAA and the "
+                "value would be silently ignored. Pass current_time=0 to make "
+                "the no-op explicit."
+            )
         return _build_dmint_v1_mint_tx(
             contract_utxo=contract_utxo,
             nonce=nonce,
             miner_pkh=miner_pkh,
             fee_rate=fee_rate,
+            funding_utxo=funding_utxo,
+            op_return_msg=op_return_msg,
         )
 
+    if op_return_msg is not None:
+        raise ValidationError(
+            "op_return_msg is V1-only — V2 mints do not include the Photonic 'msg' OP_RETURN convention by default."
+        )
     if state.is_exhausted:
         raise ContractExhaustedError(
             f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
@@ -1687,20 +1828,33 @@ def _build_dmint_v1_mint_tx(
     nonce: bytes,
     miner_pkh: bytes,
     fee_rate: int,
+    funding_utxo: DmintMinerFundingUtxo,
+    op_return_msg: bytes | None = None,
 ) -> DmintMintResult:
     """Build a V1 dMint mint tx. Internal — dispatched from build_dmint_mint_tx
     when state.is_v1.
 
-    V1 differs from V2 in three ways that matter here:
+    Mainnet V1 mint transaction shape (docs/dmint-research-mainnet.md §4)::
 
-    1. **State layout**: 6 items (no algoId/daaMode/targetTime/lastTime).
-       Built via :func:`build_dmint_v1_state_script`.
-    2. **Code script**: V1 fixed epilogue. Built via
-       :func:`build_dmint_v1_code_script`.
-    3. **ScriptSig nonce width**: 4 bytes, not 8. Built via
-       :func:`build_mint_scriptsig` with ``nonce_width=4``.
+        vin[0]  contract UTXO          unlocked by build_mint_scriptsig(nonce_4b, preimage)
+        vin[1]  funding UTXO           plain-RXD P2PKH paying reward + fee + change
+        vout[0] recreated contract     value = contract_utxo.value (singleton, no fee taken)
+        vout[1] FT-wrapped reward      75-byte P2PKH+tokenRef, value = state.reward
+        vout[2] OP_RETURN msg          (optional; Photonic-Wallet convention)
+        vout[3] miner change           plain P2PKH, value = funding − reward − fee
 
-    V1 has no DAA — ``new_target == state.target`` always.
+    The contract output value is **preserved across mints** — the V1 covenant
+    enforces a singleton, not a value pool. The miner's funding input pays
+    the reward (which lands in the FT carrier output) plus the tx fee, and
+    receives change.
+
+    :raises InvalidFundingUtxoError: ``funding_utxo.script`` contains any
+        OP_PUSHINPUTREF-family opcode (0xd0–0xd8). Spending a token-bearing
+        UTXO as fee silently destroys the token; this is the load-bearing
+        defense against that mistake.
+    :raises ContractExhaustedError: ``state.height >= state.max_height``.
+    :raises PoolTooSmallError:      funding UTXO can't cover reward + fee + change dust.
+    :raises ValidationError:        nonce/miner_pkh length wrong, fee_rate < 1.
     """
     from pyrxd.script.script import Script
     from pyrxd.transaction.transaction import Transaction
@@ -1717,6 +1871,20 @@ def _build_dmint_v1_mint_tx(
         raise ValidationError(f"V1 nonce must be 4 bytes, got {len(nonce)}")
     if len(miner_pkh) != 20:
         raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
+    if fee_rate < 1:
+        raise ValidationError(f"fee_rate must be >= 1, got {fee_rate}")
+
+    # Reject token-bearing funding UTXOs to prevent silent token-burn.
+    if _funding_script_is_token_bearing(funding_utxo.script):
+        raise InvalidFundingUtxoError(
+            f"funding_utxo at {funding_utxo.txid}:{funding_utxo.vout} carries an "
+            f"OP_PUSHINPUTREF-family opcode (token envelope) and cannot be spent "
+            f"as fee — that would silently destroy the token. Use a plain RXD UTXO."
+        )
+
+    if op_return_msg is not None and len(op_return_msg) > 80:
+        # Standardness limit: most node policies cap OP_RETURN data at 80 bytes.
+        raise ValidationError(f"op_return_msg too long ({len(op_return_msg)} bytes); standardness limit is 80 bytes")
 
     # --- Compute updated state. V1 has no DAA, so target is unchanged. ---
     new_height = state.height + 1
@@ -1734,7 +1902,7 @@ def _build_dmint_v1_mint_tx(
         is_v1=True,
     )
 
-    # --- Build the updated V1 contract script ---
+    # --- Output scripts ---
     contract_script = build_dmint_v1_contract_script(
         height=new_height,
         contract_ref=state.contract_ref,
@@ -1744,55 +1912,97 @@ def _build_dmint_v1_mint_tx(
         target=state.target,
         algo=state.algo,
     )
+    # The 75-byte FT-wrapped reward — load-bearing for the V1 covenant's
+    # OP_CODESCRIPTHASHVALUESUM_OUTPUTS conservation check.
+    reward_script = build_dmint_v1_ft_output_script(miner_pkh, state.token_ref)
+    change_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+    op_return_script: bytes | None = None
+    if op_return_msg is not None:
+        # OP_RETURN <push-len> <data>
+        if len(op_return_msg) <= 0x4B:
+            op_return_script = b"\x6a" + bytes([len(op_return_msg)]) + op_return_msg
+        else:
+            # OP_PUSHDATA1
+            op_return_script = b"\x6a\x4c" + bytes([len(op_return_msg)]) + op_return_msg
 
-    # --- Build reward output script (P2PKH) ---
-    reward_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
-
-    # --- Placeholder scriptSig (V1: 4-byte nonce, 64-byte preimage placeholder).
-    # The miner loop replaces this once the real preimage is known. ---
-    placeholder_preimage = bytes(64)
+    # --- Placeholder scriptSig.
+    # The placeholder preimage uses 0xff bytes (rather than zeros) as a
+    # visibly-invalid sentinel: anyone who broadcasts before the miner-loop
+    # patches in the real preimage gets a fast network rejection rather than
+    # a "passes structural checks but covenant rejects" silent failure.
+    placeholder_preimage = b"\xff" * 64
     placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage, nonce_width=4)
 
-    # --- Estimate tx size for fee ---
-    _contract_script_len = len(contract_script)
-    _reward_script_len = len(reward_script)
-    _scriptsig_len = len(placeholder_scriptsig)
+    # --- Fee estimation ---
+    # Two inputs (contract + funding), three or four outputs.
+    contract_scriptsig_len = len(placeholder_scriptsig)
+    # P2PKH funding scriptSig: ~107 bytes (sig 71-72 + pubkey 33-34 + push opcodes).
+    funding_scriptsig_estimated_len = 107
+    contract_script_len = len(contract_script)
+    reward_script_len = len(reward_script)
+    change_script_len = len(change_script)
+    op_return_script_len = len(op_return_script) if op_return_script else 0
+
     estimated_size = (
         4  # version
         + 1  # vin count
-        + 36  # outpoint
-        + 4  # sequence
-        + _varint_size(_scriptsig_len)
-        + _scriptsig_len
+        # vin[0]: contract input
+        + 36
+        + 4
+        + _varint_size(contract_scriptsig_len)
+        + contract_scriptsig_len
+        # vin[1]: funding input
+        + 36
+        + 4
+        + _varint_size(funding_scriptsig_estimated_len)
+        + funding_scriptsig_estimated_len
         + 1  # vout count
+        # vout[0]: contract recreate
         + 8
-        + _varint_size(_contract_script_len)
-        + _contract_script_len  # contract output
+        + _varint_size(contract_script_len)
+        + contract_script_len
+        # vout[1]: FT-wrapped reward
         + 8
-        + _varint_size(_reward_script_len)
-        + _reward_script_len  # reward output
-        + 4  # locktime
+        + _varint_size(reward_script_len)
+        + reward_script_len
     )
+    if op_return_script:
+        estimated_size += 8 + _varint_size(op_return_script_len) + op_return_script_len
+    estimated_size += 8 + _varint_size(change_script_len) + change_script_len  # vout: change
+    estimated_size += 4  # locktime
+
     fee = estimated_size * fee_rate
 
-    contract_out_value = contract_utxo.value - state.reward - fee
-    if contract_out_value < 546:
+    # The funding input pays:
+    #   - the FT reward output's photons (state.reward, which becomes the
+    #     FT carrier value on vout[1])
+    #   - the tx fee
+    #   - the change output (returned to miner_pkh)
+    change_value = funding_utxo.value - state.reward - fee
+    if change_value < 546:
         raise PoolTooSmallError(
-            f"V1 contract UTXO value ({contract_utxo.value}) too small to cover "
-            f"reward ({state.reward}) + fee ({fee}): contract output would be "
-            f"{contract_out_value} photons, below 546 dust limit."
+            f"funding_utxo ({funding_utxo.value} photons) too small to cover "
+            f"reward ({state.reward}) + fee ({fee}): change would be "
+            f"{change_value} photons, below 546 dust limit."
         )
 
     # --- Assemble unsigned tx ---
     padding_output = TransactionOutput(Script(b""), 0)
-    shim_outputs = [padding_output] * contract_utxo.vout + [
+
+    contract_src_outputs = [padding_output] * contract_utxo.vout + [
         TransactionOutput(Script(contract_utxo.script), contract_utxo.value)
     ]
-    src_tx = Transaction(tx_inputs=[], tx_outputs=shim_outputs)
-    src_tx.txid = lambda: contract_utxo.txid  # type: ignore[method-assign]
+    contract_src_tx = Transaction(tx_inputs=[], tx_outputs=contract_src_outputs)
+    contract_src_tx.txid = lambda: contract_utxo.txid  # type: ignore[method-assign]
+
+    funding_src_outputs = [padding_output] * funding_utxo.vout + [
+        TransactionOutput(Script(funding_utxo.script), funding_utxo.value)
+    ]
+    funding_src_tx = Transaction(tx_inputs=[], tx_outputs=funding_src_outputs)
+    funding_src_tx.txid = lambda: funding_utxo.txid  # type: ignore[method-assign]
 
     contract_input = TransactionInput(
-        source_transaction=src_tx,
+        source_transaction=contract_src_tx,
         source_txid=contract_utxo.txid,
         source_output_index=contract_utxo.vout,
         unlocking_script_template=None,
@@ -1801,12 +2011,27 @@ def _build_dmint_v1_mint_tx(
     contract_input.locking_script = Script(contract_utxo.script)
     contract_input.unlocking_script = Script(placeholder_scriptsig)
 
+    funding_input = TransactionInput(
+        source_transaction=funding_src_tx,
+        source_txid=funding_utxo.txid,
+        source_output_index=funding_utxo.vout,
+        unlocking_script_template=None,
+    )
+    funding_input.satoshis = funding_utxo.value
+    funding_input.locking_script = Script(funding_utxo.script)
+    # funding scriptSig is left None for the caller to sign post-build.
+
+    outputs = [
+        TransactionOutput(Script(contract_script), contract_utxo.value),
+        TransactionOutput(Script(reward_script), state.reward),
+    ]
+    if op_return_script:
+        outputs.append(TransactionOutput(Script(op_return_script), 0))
+    outputs.append(TransactionOutput(Script(change_script), change_value))
+
     tx = Transaction(
-        tx_inputs=[contract_input],
-        tx_outputs=[
-            TransactionOutput(Script(contract_script), contract_out_value),
-            TransactionOutput(Script(reward_script), state.reward),
-        ],
+        tx_inputs=[contract_input, funding_input],
+        tx_outputs=outputs,
     )
 
     return DmintMintResult(

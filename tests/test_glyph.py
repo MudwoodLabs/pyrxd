@@ -877,16 +877,14 @@ class TestV1DmintParser:
     def test_v1_dispatch_in_mint_builder(self):
         """``build_dmint_mint_tx`` dispatches V1 contracts to the V1 mint path.
 
-        Until M1 of the dMint integration plan, this guard *rejected* V1
-        contracts because only V2 covenant code shipped. Now that the V1
-        builder lands (``build_dmint_v1_contract_script`` and the V1 branch
-        in ``build_dmint_mint_tx``), V1 dispatch is tested directly: passing
-        a V1 contract with a 4-byte nonce produces a valid V1 mint tx.
-        Passing a V1 contract with a V2-width nonce now raises a typed
-        ``ValidationError`` instead of the old "cannot mint V1" guard.
+        V1 mint requires a funding_utxo (V1 contracts are singletons; the
+        miner pays reward + fee from a separate plain-RXD input). V1 also
+        requires ``current_time=0`` since V1 has no DAA. A V2-width nonce
+        against a V1 contract is rejected with a typed ``ValidationError``.
         """
         from pyrxd.glyph.dmint import (
             DmintContractUtxo,
+            DmintMinerFundingUtxo,
             DmintState,
             build_dmint_mint_tx,
         )
@@ -894,13 +892,20 @@ class TestV1DmintParser:
         v1_state = DmintState.from_script(_RBG_DMINT_V1_VOUT_0)
         assert v1_state.is_v1 is True
 
-        # Pool large enough to cover reward + fee for a V1 mint
+        # Live RBG-style contract: singleton with 1 photon
         utxo = DmintContractUtxo(
             txid="aa" * 32,
             vout=0,
-            value=100_000_000,
+            value=1,
             script=_RBG_DMINT_V1_VOUT_0,
             state=v1_state,
+        )
+        # Funding UTXO covers reward + fee
+        funding = DmintMinerFundingUtxo(
+            txid="ee" * 32,
+            vout=0,
+            value=100_000_000,
+            script=b"\x76\xa9\x14" + bytes(20) + b"\x88\xac",
         )
 
         # V1 nonce width is 4 bytes; passing 4 bytes must succeed.
@@ -908,7 +913,8 @@ class TestV1DmintParser:
             contract_utxo=utxo,
             nonce=b"\x00" * 4,
             miner_pkh=bytes(20),
-            current_time=1_700_000_000,
+            current_time=0,
+            funding_utxo=funding,
         )
         assert result.updated_state.is_v1 is True
         assert result.updated_state.height == v1_state.height + 1
@@ -919,7 +925,8 @@ class TestV1DmintParser:
                 contract_utxo=utxo,
                 nonce=b"\x00" * 8,
                 miner_pkh=bytes(20),
-                current_time=1_700_000_000,
+                current_time=0,
+                funding_utxo=funding,
             )
 
 

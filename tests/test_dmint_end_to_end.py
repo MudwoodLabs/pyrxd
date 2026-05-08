@@ -421,48 +421,48 @@ class TestPrepareDmintDeploy:
         )
 
     def test_returns_dmint_deploy_result(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         assert isinstance(result, DmintDeployResult)
 
     def test_commit_result_has_ft_shape(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         # FT commit: OP_1 (0x51) at offset 48
         assert result.commit_result.commit_script[48] == 0x51
 
     def test_cbor_bytes_round_trip(self):
         import cbor2
 
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         d = cbor2.loads(result.cbor_bytes)
         assert d["ticker"] == "TST"
         assert d["name"] == "Test Token"
 
     def test_placeholder_contract_script_has_state_separator(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         assert b"\xbd" in result.placeholder_contract_script
 
     def test_initial_pool_photons_echoed(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(pool=500_000))
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(pool=500_000), allow_v2_deploy=True)
         assert result.initial_pool_photons == 500_000
 
     def test_premine_amount_none_when_not_set(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         assert result.premine_amount is None
 
     def test_premine_amount_echoed_when_set(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=10_000))
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=10_000), allow_v2_deploy=True)
         assert result.premine_amount == 10_000
 
     def test_rejects_premine_below_dust(self):
         with pytest.raises(ValidationError, match="dust"):
-            GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=100))
+            GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=100), allow_v2_deploy=True)
 
     def test_rejects_pool_less_than_reward(self):
         with pytest.raises(ValidationError, match="initial_pool_photons"):
-            GlyphBuilder().prepare_dmint_deploy(self._make_params(pool=500))  # reward=1000
+            GlyphBuilder().prepare_dmint_deploy(self._make_params(pool=500), allow_v2_deploy=True)  # reward=1000
 
     def test_build_reveal_scripts_with_premine(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=1_000_000))
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=1_000_000), allow_v2_deploy=True)
         from pyrxd.glyph.builder import FtDeployRevealScripts
 
         reveal = result.build_reveal_scripts(
@@ -474,7 +474,7 @@ class TestPrepareDmintDeploy:
         assert len(reveal.locking_script) == 75
 
     def test_build_reveal_scripts_without_premine(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         from pyrxd.glyph.builder import RevealScripts
 
         reveal = result.build_reveal_scripts(
@@ -485,7 +485,7 @@ class TestPrepareDmintDeploy:
         assert isinstance(reveal, RevealScripts)
 
     def test_build_contract_script_with_real_refs(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         real_token_ref = GlyphRef(txid="cc" * 32, vout=0)
         real_contract_ref = GlyphRef(txid="dd" * 32, vout=0)
         script = result.build_contract_script(
@@ -498,7 +498,7 @@ class TestPrepareDmintDeploy:
         assert real_contract_ref.to_bytes() in script
 
     def test_contract_script_parses_back_with_real_refs(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         real_token_ref = GlyphRef(txid="cc" * 32, vout=0)
         real_contract_ref = GlyphRef(txid="dd" * 32, vout=0)
         script = result.build_contract_script(

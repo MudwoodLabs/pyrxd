@@ -52,6 +52,77 @@ performance-oracle, code-simplicity-reviewer, learnings-researcher
   `DmintError` lives (`security/errors.py` vs `glyph/dmint_errors.py`)
   is a coding-time decision, not a plan-time one.
 
+### Post-Review Hardening Pass (2026-05-08)
+
+After the initial M1 implementation landed, security-sentinel and
+red-team review caught **two structural show-stoppers** that synthetic
+round-trip tests had missed because the parser is in the same module
+as the builder. Both fixes ship in this hardening pass:
+
+1. **Wrong mint-tx output shape.** The first implementation produced
+   2 outputs (contract recreate + plain P2PKH reward) with the contract
+   value decremented by `reward + fee` per mint. The mainnet V1 covenant
+   trace (docs/dmint-research-mainnet.md §4) shows the actual shape:
+   - 4 outputs: contract recreate, **75-byte P2PKH-wrapped FT** reward
+     carrying the tokenRef, optional OP_RETURN msg, miner change
+   - 2 inputs: contract UTXO + **separate plain-RXD funding input**
+     that pays reward + fee
+   - Contract output value is **preserved across mints** (V1 is a
+     singleton, not a value pool — the live RBG contracts carry exactly
+     1 photon)
+
+   Fix: new `build_dmint_v1_ft_output_script(miner_pkh, token_ref)` that
+   produces the 75-byte FT shape byte-equal to mainnet vout[1];
+   `build_dmint_mint_tx` gains `funding_utxo: DmintMinerFundingUtxo`
+   keyword arg required on the V1 path; rewritten `_build_dmint_v1_mint_tx`
+   produces the correct 3- or 4-output tx with optional `op_return_msg`.
+
+2. **`DeprecationWarning` is too soft.** Python filters
+   `DeprecationWarning` by default outside `__main__`. A library user
+   calling `prepare_dmint_deploy` from their own script saw nothing
+   and got a deployable V2 result — the footgun was wide open.
+
+   Fix: `prepare_dmint_deploy` now raises `DmintError` unless the
+   caller passes `allow_v2_deploy=True`. SDK-internal V2 self-tests
+   pass the flag; consumer code must opt in explicitly.
+
+### Other hardening from same review pass
+
+3. **Token-burn defense (security-sentinel C1, red-team A).** V1 mint
+   refuses `funding_utxo.script` containing any
+   OP_PUSHINPUTREF-family opcode (0xd0–0xd8). Spending an FT/dMint
+   UTXO as fee silently destroys the token; the deny-list-by-opcode
+   filter is the load-bearing defense. Raises `InvalidFundingUtxoError`.
+
+4. **Golden-vector cross-check (security-sentinel C3).** Added
+   `TestBuildDmintV1FtOutputScript::test_byte_equal_to_mainnet_vout1`
+   which asserts byte-for-byte equality with the live mainnet
+   `146a4d68…f3c` vout[1] decoded in §4. This is the first test in
+   pyrxd that compares output bytes against captured mainnet data
+   (rather than round-tripping pyrxd's own builder through pyrxd's own
+   parser).
+
+5. **Sentinel placeholder preimage (security-sentinel H1).** The
+   placeholder preimage in unsigned mint txs is now `0xff * 64`
+   instead of zeros. A user who broadcasts before the miner-loop
+   patches in the real preimage gets fast network rejection rather
+   than a covenant-fail silent bug.
+
+6. **Validation tightening (red-team #3, #4, #12, #15):**
+   - `fee_rate < 1` raises `ValidationError`
+   - `current_time != 0` on V1 path raises (V1 has no DAA)
+   - V1 target range tightened to `[1, MAX_SHA256D_TARGET]` (top-bit-set
+     values decode as negative under Bitcoin script signed-int
+     semantics)
+   - V1 state-script builder rejects `height >= max_height`
+     (born-exhausted contracts)
+
+7. **Subprocess shim hardening (security-sentinel C2):**
+   - `stderr=subprocess.DEVNULL` to bound parent memory if the miner
+     misbehaves
+   - UTF-8 decode errors wrapped as `ValidationError` rather than
+     escaping uncaught
+
 ### Reviewer Conflicts Resolved
 
 - **Kieran (richer API) vs Simplicity (cut surface).** Resolved by

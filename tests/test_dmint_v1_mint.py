@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import json
 import sys
-import warnings
 from unittest.mock import patch
 
 import pytest
@@ -33,11 +32,13 @@ from pyrxd.glyph.dmint import (
     DmintAlgo,
     DmintContractUtxo,
     DmintMineResult,
+    DmintMinerFundingUtxo,
     DmintMintResult,
     DmintState,
     build_dmint_mint_tx,
     build_dmint_v1_code_script,
     build_dmint_v1_contract_script,
+    build_dmint_v1_ft_output_script,
     build_dmint_v1_state_script,
     build_mint_scriptsig,
     mine_solution,
@@ -47,6 +48,8 @@ from pyrxd.glyph.dmint import (
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.security.errors import (
     ContractExhaustedError,
+    DmintError,
+    InvalidFundingUtxoError,
     MaxAttemptsError,
     PoolTooSmallError,
     ValidationError,
@@ -63,11 +66,33 @@ _RBG_REWARD = 50_000
 _RBG_MAX_HEIGHT = 628_328
 _MINER_PKH = bytes(b"\x33" * 20)
 _NONCE_V1 = bytes(4)
+# The V1 contract is a singleton — default value matches the live mainnet
+# RBG-class contracts, which carry exactly 1 photon. The miner pays reward
+# + fee from the funding input, not from the contract output.
+_V1_SINGLETON_VALUE = 1
+# Generous funding pool covers reward (50k) + fee (~10M for ~600B tx at
+# 10k photons/byte) + dust change. Specific value not load-bearing for
+# most tests; use a smaller value when boundary-testing PoolTooSmallError.
+_FUNDING_VALUE = 100_000_000
+
+
+def _make_funding_utxo(value: int = _FUNDING_VALUE) -> DmintMinerFundingUtxo:
+    """Plain P2PKH funding UTXO. Standard `OP_DUP OP_HASH160 <pkh> OP_EQUALVERIFY OP_CHECKSIG`."""
+    script = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+    return DmintMinerFundingUtxo(
+        txid="ee" * 32,
+        vout=0,
+        value=value,
+        script=script,
+    )
+
+
+_FUNDING_UTXO = _make_funding_utxo()
 
 
 def _make_v1_contract_utxo(
     height: int = 0,
-    pool: int = 100_000_000,
+    value: int = _V1_SINGLETON_VALUE,
     target: int = _RBG_TARGET,
     max_height: int = _RBG_MAX_HEIGHT,
     reward: int = _RBG_REWARD,
@@ -75,8 +100,9 @@ def _make_v1_contract_utxo(
 ) -> DmintContractUtxo:
     """Synthesize a V1 dMint contract UTXO with mainnet-like parameters.
 
-    Default pool of 100M photons covers reward (50k) + fee (~4M ph for a
-    ~407-byte V1 mint tx at 10k photons/byte) with headroom.
+    The contract output is a singleton (default 1 photon, mirroring the
+    live RBG contracts). The reward + fee come from a funding input —
+    callers pass ``funding_utxo=`` to ``build_dmint_mint_tx``.
     """
     script = build_dmint_v1_contract_script(
         height=height,
@@ -91,7 +117,7 @@ def _make_v1_contract_utxo(
     return DmintContractUtxo(
         txid="cc" * 32,
         vout=0,
-        value=pool,
+        value=value,
         script=script,
         state=state,
     )
@@ -178,6 +204,34 @@ class TestBuildDmintV1ContractScript:
                 target=1 << 64,  # too large for 8-byte LE push
             )
 
+    def test_state_script_target_top_bit_set_raises(self):
+        """Targets in [2**63, 2**64) decode as negative under Bitcoin script
+        signed-int semantics — the on-chain target comparison would behave
+        wrongly. Builder must refuse them up front."""
+        with pytest.raises(ValidationError, match="MAX_SHA256D_TARGET"):
+            build_dmint_v1_state_script(
+                height=0,
+                contract_ref=_CONTRACT_REF,
+                token_ref=_TOKEN_REF,
+                max_height=100,
+                reward=1000,
+                target=0x8000000000000000,  # top bit set → negative in script
+            )
+
+    def test_state_script_height_at_max_raises(self):
+        """A V1 state with height == max_height is born-exhausted. Reject up
+        front so the deployer doesn't lock pool funds in a contract no miner
+        can advance."""
+        with pytest.raises(ValidationError, match="born-exhausted"):
+            build_dmint_v1_state_script(
+                height=100,
+                contract_ref=_CONTRACT_REF,
+                token_ref=_TOKEN_REF,
+                max_height=100,
+                reward=1000,
+                target=1,
+            )
+
     def test_code_script_length(self):
         # The V1 code epilogue starts with 0xbd (OP_STATESEPARATOR — part of
         # the epilogue itself, not a separator emitted by the contract builder)
@@ -188,107 +242,295 @@ class TestBuildDmintV1ContractScript:
             assert code[0] == 0xBD
 
 
+class TestBuildDmintV1FtOutputScript:
+    """Golden-vector tests for the V1 mint reward output (75-byte FT shape).
+
+    The bytes here come from a real Radiant mainnet mint tx
+    (`146a4d68…f3c`, vout[1]) decoded in docs/dmint-research-mainnet.md §4.
+    The V1 covenant's ``OP_CODESCRIPTHASHVALUESUM_OUTPUTS`` step at offset
+    168 of the contract epilogue hashes the prefix 0xd0 + tokenRef + the
+    12-byte fingerprint and requires the FT output's codescript-hash to
+    match — getting a single byte wrong here means every V1 mint pyrxd
+    builds is rejected by the network.
+    """
+
+    # Mainnet `146a4d68…f3c` vout[1] decoded at docs/dmint-research-mainnet.md:226-228
+    _MAINNET_PKH = bytes.fromhex("e9aa4adbe3a3f07887d67d9cedae324711f053ef")
+    _MAINNET_TOKEN_REF = GlyphRef.from_bytes(
+        bytes.fromhex("8b87c3c771b1a9f5015a4f26bfd80979ed196b5366257a6f30929646dfd943a4" + "00000000")
+    )
+    _MAINNET_VOUT1_BYTES = bytes.fromhex(
+        "76a914e9aa4adbe3a3f07887d67d9cedae324711f053ef88ac"  # 25-byte P2PKH prologue
+        + "bd"  # OP_STATESEPARATOR
+        + "d08b87c3c771b1a9f5015a4f26bfd80979ed196b5366257a6f30929646dfd943a400000000"  # OP_PUSHINPUTREF + 36-byte tokenRef
+        + "dec0e9aa76e378e4a269e69d"  # 12-byte covenant fingerprint
+    )
+
+    def test_byte_equal_to_mainnet_vout1(self):
+        """Byte-for-byte equal to the live mainnet RBG-class FT reward output.
+        This is the load-bearing cross-check that pyrxd's builder matches the
+        on-chain spec."""
+        script = build_dmint_v1_ft_output_script(self._MAINNET_PKH, self._MAINNET_TOKEN_REF)
+        assert script == self._MAINNET_VOUT1_BYTES
+
+    def test_length_is_75(self):
+        script = build_dmint_v1_ft_output_script(_MINER_PKH, _TOKEN_REF)
+        assert len(script) == 75
+
+    def test_wrong_pkh_length_raises(self):
+        with pytest.raises(ValidationError, match="miner_pkh"):
+            build_dmint_v1_ft_output_script(bytes(19), _TOKEN_REF)
+
+
 # ---------------------------------------------------------------------------
 # 2. build_dmint_mint_tx — V1 path
 # ---------------------------------------------------------------------------
 
 
 class TestBuildDmintMintTxV1:
+    """V1 mint dispatch tests against the corrected on-chain shape:
+    2 inputs (contract + funding), 3-4 outputs (contract recreate +
+    FT reward + optional OP_RETURN + change). Contract output value is
+    preserved across mints; reward + fee come from the funding input.
+    """
+
+    def _mint(self, utxo, **kwargs):
+        """Default-args helper: contract is V1 singleton, funding is plain RXD."""
+        kwargs.setdefault("current_time", 0)
+        kwargs.setdefault("funding_utxo", _FUNDING_UTXO)
+        return build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, **kwargs)
+
     def test_returns_dmint_mint_result(self):
         utxo = _make_v1_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
-        assert isinstance(result, DmintMintResult)
+        assert isinstance(self._mint(utxo), DmintMintResult)
 
     def test_updated_height_incremented(self):
         utxo = _make_v1_contract_utxo(height=42)
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
-        assert result.updated_state.height == 43
+        assert self._mint(utxo).updated_state.height == 43
 
     def test_updated_state_target_unchanged_v1_no_daa(self):
-        # V1 has no DAA — target must always equal the input contract's target,
-        # regardless of current_time.
+        # V1 has no DAA — target is always preserved across mints.
         utxo = _make_v1_contract_utxo(height=10)
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=999_999)
-        assert result.updated_state.target == utxo.state.target
+        assert self._mint(utxo).updated_state.target == utxo.state.target
 
     def test_updated_state_is_v1_preserved(self):
         utxo = _make_v1_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
+        result = self._mint(utxo)
         assert result.updated_state.is_v1 is True
         assert result.updated_state.daa_mode == DaaMode.FIXED
 
     def test_contract_script_reparses_as_v1(self):
         utxo = _make_v1_contract_utxo(height=5)
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
+        result = self._mint(utxo)
         reparsed = DmintState.from_script(result.contract_script)
         assert reparsed.is_v1 is True
         assert reparsed.height == 6
         assert reparsed.target == utxo.state.target
 
-    def test_contract_script_is_241_bytes(self):
+    def test_contract_script_is_241_bytes_with_rbg_params(self):
+        # 241 bytes is the mainnet RBG byte-count when maxHeight=628_328
+        # and reward=50_000 (both encode as 4-byte minimal pushes). This
+        # test pins the byte-count for the canonical mainnet parameter
+        # set; arbitrary maxHeight/reward values would shift the length.
         utxo = _make_v1_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
-        assert len(result.contract_script) == 241
+        assert len(self._mint(utxo).contract_script) == 241
 
     def test_scriptsig_is_72_bytes_with_4byte_nonce(self):
         """V1 scriptSig: <0x04 nonce(4)> <0x20 inputHash(32)> <0x20 outputHash(32)> <0x00>"""
         utxo = _make_v1_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
+        result = self._mint(utxo)
+        # Contract input is vin[0]; vin[1] is the funding input (no scriptSig
+        # set yet — caller signs it post-build).
         sig = result.tx.inputs[0].unlocking_script.script
         assert len(sig) == 72
         assert sig[0] == 0x04  # 4-byte push opcode (V1's nonce width)
-        assert sig[5] == 0x20  # 32-byte push for inputHash
-        assert sig[38] == 0x20  # 32-byte push for outputHash
-        assert sig[71] == 0x00  # trailing OP_0
+        assert sig[5] == 0x20
+        assert sig[38] == 0x20
+        assert sig[71] == 0x00
 
-    def test_reward_script_is_p2pkh(self):
+    def test_reward_script_is_75_byte_ft_wrapped(self):
+        """The V1 reward output must be the 75-byte P2PKH-wrapped FT shape,
+        not a plain 25-byte P2PKH. This is the load-bearing covenant
+        invariant — mistaken output shape causes every V1 mint to be
+        rejected by the network."""
         utxo = _make_v1_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
-        assert result.reward_script == b"\x76\xa9\x14" + _MINER_PKH + b"\x88\xac"
+        result = self._mint(utxo)
+        assert len(result.reward_script) == 75
+        # Must equal the FT output for our token_ref + miner_pkh pair.
+        expected = build_dmint_v1_ft_output_script(_MINER_PKH, _TOKEN_REF)
+        assert result.reward_script == expected
 
-    def test_tx_has_one_input_two_outputs(self):
+    def test_tx_has_two_inputs(self):
+        # vin[0] = contract, vin[1] = funding.
         utxo = _make_v1_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
-        assert len(result.tx.inputs) == 1
-        assert len(result.tx.outputs) == 2
+        assert len(self._mint(utxo).tx.inputs) == 2
 
-    def test_tx_output_1_value_equals_reward(self):
+    def test_tx_default_has_three_outputs(self):
+        # Without op_return_msg: contract recreate + FT reward + change.
         utxo = _make_v1_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
+        assert len(self._mint(utxo).tx.outputs) == 3
+
+    def test_tx_with_op_return_has_four_outputs(self):
+        utxo = _make_v1_contract_utxo()
+        result = self._mint(utxo, op_return_msg=b"snk [r2w]")
+        assert len(result.tx.outputs) == 4
+        # vout[2] is the OP_RETURN
+        op_return_script = result.tx.outputs[2].locking_script.script
+        assert op_return_script[0] == 0x6A  # OP_RETURN
+
+    def test_op_return_msg_too_long_raises(self):
+        utxo = _make_v1_contract_utxo()
+        with pytest.raises(ValidationError, match="op_return_msg"):
+            self._mint(utxo, op_return_msg=b"x" * 81)
+
+    def test_contract_output_value_is_preserved(self):
+        """Contract output value never decreases — V1 is a singleton, the
+        miner's funding input pays the reward + fee. (red-team finding #2)"""
+        utxo = _make_v1_contract_utxo(value=1)  # singleton
+        result = self._mint(utxo)
+        assert result.tx.outputs[0].satoshis == 1
+
+    def test_reward_output_value_equals_state_reward(self):
+        utxo = _make_v1_contract_utxo()
+        result = self._mint(utxo)
         assert result.tx.outputs[1].satoshis == utxo.state.reward
+
+    def test_change_output_balances_funding(self):
+        """Change = funding − reward − fee. Tx is balanced."""
+        utxo = _make_v1_contract_utxo(value=1)
+        result = self._mint(utxo)
+        # Last output is change.
+        change_value = result.tx.outputs[-1].satoshis
+        # contract_value (1) + funding = contract_out (1) + reward + fee + change
+        # ⇒ funding = reward + fee + change
+        assert _FUNDING_UTXO.value == utxo.state.reward + result.fee + change_value
 
     def test_fee_is_positive(self):
         utxo = _make_v1_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
-        assert result.fee > 0
+        assert self._mint(utxo).fee > 0
 
     def test_exhausted_contract_raises_typed_error(self):
-        # height >= max_height
-        utxo = _make_v1_contract_utxo(height=_RBG_MAX_HEIGHT)
+        # height >= max_height → contract is exhausted at mint time
+        utxo = _make_v1_contract_utxo(height=_RBG_MAX_HEIGHT - 1)
+        # Build directly because _make_v1_contract_utxo with height=max
+        # would fail in the state-script builder (born-exhausted check).
+        # Instead bump height to max via the parser pretending to advance.
+        state = DmintState(
+            height=utxo.state.max_height,
+            contract_ref=utxo.state.contract_ref,
+            token_ref=utxo.state.token_ref,
+            max_height=utxo.state.max_height,
+            reward=utxo.state.reward,
+            algo=utxo.state.algo,
+            daa_mode=DaaMode.FIXED,
+            target_time=0,
+            last_time=0,
+            target=utxo.state.target,
+            is_v1=True,
+        )
+        exhausted_utxo = DmintContractUtxo(
+            txid=utxo.txid,
+            vout=utxo.vout,
+            value=utxo.value,
+            script=utxo.script,
+            state=state,
+        )
         with pytest.raises(ContractExhaustedError, match="exhausted"):
-            build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
+            self._mint(exhausted_utxo)
 
     def test_pool_too_small_raises_typed_error(self):
-        # Pool = 10_000 < reward (50_000) + fee (~4M)
-        utxo = _make_v1_contract_utxo(pool=10_000)
+        # Funding input below reward + fee + dust → PoolTooSmallError
+        utxo = _make_v1_contract_utxo()
+        small_funding = _make_funding_utxo(value=10_000)
         with pytest.raises(PoolTooSmallError, match="too small"):
+            self._mint(utxo, funding_utxo=small_funding)
+
+    def test_token_bearing_funding_utxo_raises(self):
+        """Spending an FT/dMint UTXO as fee silently destroys the token.
+        Builder must refuse — defense against the highest-impact misuse
+        (red-team finding, security-sentinel C1)."""
+        utxo = _make_v1_contract_utxo()
+        # An FT-bearing locking script: contains 0xd0 OP_PUSHINPUTREF
+        ft_script = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac" + b"\xbd" + b"\xd0" + bytes(36) + b"\x00" * 12
+        bad_funding = DmintMinerFundingUtxo(
+            txid="ff" * 32,
+            vout=0,
+            value=_FUNDING_VALUE,
+            script=ft_script,
+        )
+        with pytest.raises(InvalidFundingUtxoError, match="OP_PUSHINPUTREF"):
+            self._mint(utxo, funding_utxo=bad_funding)
+
+    def test_dmint_singleton_funding_utxo_raises(self):
+        """A dMint contract UTXO (uses 0xd8 OP_PUSHINPUTREFSINGLETON) must
+        also be refused as funding."""
+        utxo = _make_v1_contract_utxo()
+        dmint_script = b"\xd8" + bytes(36) + b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+        bad_funding = DmintMinerFundingUtxo(
+            txid="ff" * 32,
+            vout=0,
+            value=_FUNDING_VALUE,
+            script=dmint_script,
+        )
+        with pytest.raises(InvalidFundingUtxoError, match="OP_PUSHINPUTREF"):
+            self._mint(utxo, funding_utxo=bad_funding)
+
+    def test_missing_funding_utxo_raises(self):
+        """V1 mint without a funding_utxo cannot be built."""
+        utxo = _make_v1_contract_utxo()
+        with pytest.raises(ValidationError, match="V1 mint requires a funding_utxo"):
             build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
 
+    def test_v1_with_nonzero_current_time_raises(self):
+        """V1 has no DAA — current_time would be silently ignored. Refuse."""
+        utxo = _make_v1_contract_utxo()
+        with pytest.raises(ValidationError, match="current_time must be 0"):
+            self._mint(utxo, current_time=1_700_000_000)
+
+    def test_negative_fee_rate_raises(self):
+        utxo = _make_v1_contract_utxo()
+        with pytest.raises(ValidationError, match="fee_rate"):
+            self._mint(utxo, fee_rate=-1000)
+
+    def test_zero_fee_rate_raises(self):
+        utxo = _make_v1_contract_utxo()
+        with pytest.raises(ValidationError, match="fee_rate"):
+            self._mint(utxo, fee_rate=0)
+
     def test_wrong_nonce_width_raises(self):
-        # Caller passing a V2-width (8-byte) nonce against a V1 contract is an error.
         utxo = _make_v1_contract_utxo()
         with pytest.raises(ValidationError, match="V1 nonce"):
-            build_dmint_mint_tx(utxo, bytes(8), _MINER_PKH, current_time=0)
+            build_dmint_mint_tx(utxo, bytes(8), _MINER_PKH, current_time=0, funding_utxo=_FUNDING_UTXO)
 
     def test_wrong_pkh_length_raises(self):
         utxo = _make_v1_contract_utxo()
         with pytest.raises(ValidationError, match="miner_pkh"):
-            build_dmint_mint_tx(utxo, _NONCE_V1, bytes(19), current_time=0)
+            build_dmint_mint_tx(utxo, _NONCE_V1, bytes(19), current_time=0, funding_utxo=_FUNDING_UTXO)
+
+    def test_placeholder_preimage_is_invalid_sentinel(self):
+        """The placeholder preimage in the unsigned tx is 0xff bytes (not zeros).
+        A user who broadcasts before the miner replaces it gets fast network
+        rejection rather than a silent covenant failure."""
+        utxo = _make_v1_contract_utxo()
+        result = self._mint(utxo)
+        sig = result.tx.inputs[0].unlocking_script.script
+        # bytes [6:38] are inputHash (first half of preimage)
+        # bytes [39:71] are outputHash (second half)
+        first_half = sig[6:38]
+        second_half = sig[39:71]
+        assert first_half == b"\xff" * 32, "inputHash placeholder should be all-0xff"
+        assert second_half == b"\xff" * 32, "outputHash placeholder should be all-0xff"
 
     def test_consecutive_mints_chain_state(self):
-        """The contract script from V1 mint N feeds V1 mint N+1."""
+        """The contract output of V1 mint N feeds V1 mint N+1.
+        Verifies (a) height advances, (b) target preserved (V1 has no DAA),
+        (c) contract output value preserved (singleton) — the red-team
+        finding #13 covenant invariant.
+        """
         utxo = _make_v1_contract_utxo(height=0)
-        r1 = build_dmint_mint_tx(utxo, _NONCE_V1, _MINER_PKH, current_time=0)
+        r1 = self._mint(utxo)
+        # The contract output must keep the same value across mints (V1 singleton).
+        assert r1.tx.outputs[0].satoshis == utxo.value
 
         utxo2 = DmintContractUtxo(
             txid="dd" * 32,
@@ -297,10 +539,11 @@ class TestBuildDmintMintTxV1:
             script=r1.contract_script,
             state=r1.updated_state,
         )
-        r2 = build_dmint_mint_tx(utxo2, _NONCE_V1, _MINER_PKH, current_time=0)
+        r2 = self._mint(utxo2)
         assert r2.updated_state.height == 2
         assert r2.updated_state.is_v1
-        assert r2.updated_state.target == utxo.state.target  # still no DAA
+        assert r2.updated_state.target == utxo.state.target  # no DAA
+        assert r2.tx.outputs[0].satoshis == utxo.value  # singleton preserved
 
 
 # ---------------------------------------------------------------------------
@@ -572,14 +815,23 @@ class TestMineSolutionExternal:
 # ---------------------------------------------------------------------------
 
 
-class TestPrepareDmintDeployV2Warning:
-    def test_emits_deprecation_warning(self):
-        from pyrxd.glyph.builder import DmintFullDeployParams, GlyphBuilder
+class TestPrepareDmintDeployV2Refusal:
+    """V2 deploy is refused unless the caller passes `allow_v2_deploy=True`.
+
+    A `DeprecationWarning` is too soft because Python filters
+    DeprecationWarning by default outside `__main__` — a library user calling
+    `prepare_dmint_deploy` from their own script sees nothing and gets a
+    deployable result, accidentally shipping a token no ecosystem miner
+    can claim. The hard refusal is the load-bearing footgun guard.
+    """
+
+    @staticmethod
+    def _params():
+        from pyrxd.glyph.builder import DmintFullDeployParams
         from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
         from pyrxd.security.types import Hex20
 
-        builder = GlyphBuilder()
-        params = DmintFullDeployParams(
+        return DmintFullDeployParams(
             metadata=GlyphMetadata(
                 protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
                 name="TEST",
@@ -593,14 +845,22 @@ class TestPrepareDmintDeployV2Warning:
             contract_ref_placeholder=_CONTRACT_REF,
             token_ref_placeholder=_TOKEN_REF,
         )
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            builder.prepare_dmint_deploy(params)
-        deprecation_warnings = [w for w in caught if issubclass(w.category, DeprecationWarning)]
-        assert len(deprecation_warnings) >= 1
-        msg = str(deprecation_warnings[0].message)
-        assert "V2" in msg
-        assert "M2" in msg or "Milestone 2" in msg
+
+    def test_default_call_raises_dmint_error(self):
+        from pyrxd.glyph.builder import GlyphBuilder
+
+        builder = GlyphBuilder()
+        with pytest.raises(DmintError, match="allow_v2_deploy"):
+            builder.prepare_dmint_deploy(self._params())
+
+    def test_explicit_opt_in_succeeds(self):
+        """allow_v2_deploy=True bypasses the guard so SDK-internal V2 tests
+        and explicit V2 deployers can still build the artifacts."""
+        from pyrxd.glyph.builder import DmintDeployResult, GlyphBuilder
+
+        builder = GlyphBuilder()
+        result = builder.prepare_dmint_deploy(self._params(), allow_v2_deploy=True)
+        assert isinstance(result, DmintDeployResult)
 
 
 # ---------------------------------------------------------------------------
