@@ -365,24 +365,26 @@ difficulty without explicit opt-in.
 
 ### Functional
 
-- [ ] `build_dmint_mint_tx` accepts V1 contract states without raising
-- [ ] V1 path produces a 72-byte scriptSig (4B nonce + 32B inputHash + 32B outputHash + OP_0)
-- [ ] V1 mint tx parses back as `is_v1=True` via `DmintState.from_script`
-- [ ] Two consecutive V1 mints chain correctly (contract output of mint 1 is the contract input of mint 2)
-- [ ] `mine_solution(preimage, target, nonce_width=4)` returns a valid `DmintMineResult` for low-difficulty target within ≤5 seconds median in pure Python
-- [ ] `mine_solution` raises `MaxAttemptsError` (with `attempts` and `elapsed_s` attributes) when `max_attempts` is reached without a solution
-- [ ] `mine_solution` raises `ValidationError` at runtime when `nonce_width not in (4, 8)` (Literal is type-checker-only)
-- [ ] `examples/dmint_claim_demo.py` raises `InvalidFundingUtxoError` when funding-UTXO scan finds no plain-RXD candidates (FT/dMint UTXOs are filtered out)
-- [ ] `build_dmint_mint_tx` raises `ContractExhaustedError` when `height >= max_height`
-- [ ] `build_dmint_mint_tx` raises `PoolTooSmallError` when contract pool can't cover reward + fee + dust
+- [x] `build_dmint_mint_tx` accepts V1 contract states without raising
+- [x] V1 path produces a 72-byte scriptSig (4B nonce + 32B inputHash + 32B outputHash + OP_0)
+- [x] V1 mint tx parses back as `is_v1=True` via `DmintState.from_script`
+- [x] Two consecutive V1 mints chain correctly (contract output of mint 1 is the contract input of mint 2)
+- [x] `mine_solution(preimage, target, nonce_width=4)` returns a `DmintMineResult` whose nonce passes `verify_sha256d_solution`. **Tested via `hashlib.sha256` monkey-patch** — same pattern as `test_clamp_invariant_via_construction` in the existing V2 module tests. Discovered during implementation: dMint has a hard 32-bit leading-zero floor (`hash[0..4] == 0x00000000` is required regardless of `target`), so even the easiest possible dMint contract requires ~4B hash attempts to mine. End-to-end search in unit tests is impractical — would either skip or take ≈30 min single-core pure Python.
+- [x] `mine_solution` raises `MaxAttemptsError` (with `attempts` and `elapsed_s` attributes) when `max_attempts` is reached without a solution
+- [x] `mine_solution` raises `ValidationError` at runtime when `nonce_width not in (4, 8)` (Literal is type-checker-only)
+- [x] An optional slow brute-force test (skipped on no-find, mirrors existing `test_brute_force_finds_valid` shape) confirms search loop integration with real `hashlib`
+- [ ] `examples/dmint_claim_demo.py` raises `InvalidFundingUtxoError` when funding-UTXO scan finds no plain-RXD candidates (FT/dMint UTXOs are filtered out) — *deferred to Session C; demo script not in this session's scope*
+- [x] `build_dmint_mint_tx` raises `ContractExhaustedError` when `height >= max_height`
+- [x] `build_dmint_mint_tx` raises `PoolTooSmallError` when contract pool can't cover reward + fee + dust
+- [x] **NEW**: `mine_solution_external(preimage, target, miner_argv, nonce_width)` delegates nonce search to a subprocess (e.g. glyph-miner), re-verifies the returned nonce locally, and raises `ValidationError` on miner-returned bad nonces. Added during implementation when user surfaced the GPU-mining use case as a real near-term need.
 
 ### Test requirements
 
-- [ ] New file `tests/test_dmint_v1_mint.py` with `TestBuildDmintMintTxV1` class
-- [ ] All synthetic V1 mint tests pass under `pytest -m unit`
+- [x] New file `tests/test_dmint_v1_mint.py` with `TestBuildDmintMintTxV1` class (49 tests covering V1 builders, V1 mint dispatch, mine_solution, mine_solution_external, deploy DeprecationWarning)
+- [x] All synthetic V1 mint tests pass under `pytest -m unit` — full suite 2592 passed, 10 skipped, 0 failed
 - [ ] Optional `pytest -m integration` path pushes V1 mint tx via SSH to VPS `testmempoolaccept` (gated by `RADIANT_INTEGRATION` env var, same pattern as
-  [test_dmint_deploy_integration.py:488](../../tests/test_dmint_deploy_integration.py#L488))
-- [ ] No regressions in V2 mint path — existing `TestBuildDmintMintTx` continues to pass
+  [test_dmint_deploy_integration.py:488](../../tests/test_dmint_deploy_integration.py#L488)) — *deferred to Session C/D*
+- [x] No regressions in V2 mint path — existing `TestBuildDmintMintTx` continues to pass; updated `test_exhausted_contract_raises` and `test_pool_too_small_raises` to match the new typed-error class names (the V2 path now raises `ContractExhaustedError`/`PoolTooSmallError` for parity with V1)
 
 ### Manual acceptance (gate before declaring milestone shipped)
 
@@ -393,15 +395,15 @@ difficulty without explicit opt-in.
 
 ### Documentation
 
-- [ ] `mine_solution` docstring includes a worked hex example
+- [x] `mine_solution` docstring includes a worked hex example
   (preimage in → nonce out → verifier passes)
-- [ ] `examples/dmint_claim_demo.py` exists, env-var driven, `DRY_RUN=1` default
+- [ ] `examples/dmint_claim_demo.py` exists, env-var driven, `DRY_RUN=1` default — *deferred to Session C*
 - [ ] `docs/dmint-followup.md` gets an "out of date — see code" warning
-  at the top (full rewrite lands in Milestone 2)
-- [ ] `prepare_dmint_deploy` carries both a docstring warning AND a
+  at the top (full rewrite lands in Milestone 2) — *deferred to Session D*
+- [x] `prepare_dmint_deploy` carries both a docstring warning AND a
   runtime `DeprecationWarning` for the V2-deploy footgun (see
   "Deploy-footgun mitigation in M1" below)
-- [ ] Test confirms the `DeprecationWarning` fires on
+- [x] Test confirms the `DeprecationWarning` fires on
   `prepare_dmint_deploy` calls
 
 ## Success Metrics

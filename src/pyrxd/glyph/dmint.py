@@ -10,11 +10,17 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import time
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any
+from typing import Any, Literal
 
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import (
+    ContractExhaustedError,
+    MaxAttemptsError,
+    PoolTooSmallError,
+    ValidationError,
+)
 
 from .types import GlyphRef
 
@@ -319,6 +325,124 @@ def build_dmint_contract_script(params: DmintDeployParams) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# V1 dMint builders
+# ---------------------------------------------------------------------------
+#
+# V1 is the only dMint contract format observed on Radiant mainnet. It has 6
+# state items (height, contractRef, tokenRef, maxHeight, reward, target) and
+# a 145-byte fixed code epilogue with one selector byte for the algorithm.
+# Documented in docs/dmint-research-mainnet.md §2.2 (byte-by-byte) and §3
+# (common template). The V1 parser (DmintState._from_v1_script) and
+# fingerprint helpers (_match_v1_epilogue) are the inverse of these.
+
+# Inverse of _V1_ALGO_BYTE_TO_ENUM (defined later in this module). Built
+# eagerly so V1 builders can reference it; the parser-side mapping is the
+# source of truth for which byte means which algorithm.
+_V1_ENUM_TO_ALGO_BYTE: dict[DmintAlgo, int] = {
+    DmintAlgo.SHA256D: 0xAA,  # OP_HASH256
+    DmintAlgo.BLAKE3: 0xEE,  # OP_BLAKE3
+    DmintAlgo.K12: 0xEF,  # OP_K12
+}
+
+
+def build_dmint_v1_state_script(
+    height: int,
+    contract_ref: GlyphRef,
+    token_ref: GlyphRef,
+    max_height: int,
+    reward: int,
+    target: int,
+) -> bytes:
+    """Build the 6-item V1 dMint state script (before OP_STATESEPARATOR).
+
+    Layout (docs/dmint-research-mainnet.md §2.2 offsets 0–94)::
+
+        height(4B LE) | d8 contractRef(36B) | d0 tokenRef(36B) |
+        maxHeight | reward | target(0x08 + 8B LE)
+
+    The target is always pushed as a fixed 8-byte little-endian value
+    (push opcode 0x08, then 8 bytes of payload). This is what
+    distinguishes V1 from V2 in the state-script discriminator at parse
+    time: V2's item 5 is ``algoId`` via ``_push_minimal``, never an
+    8-byte push.
+
+    :raises ValidationError: ``height`` or ``last_time`` < 0; ``max_height``
+        or ``reward`` < 1; ``target`` not in [1, 2**64).
+    """
+    if height < 0:
+        raise ValidationError("height must be >= 0")
+    if max_height < 1:
+        raise ValidationError("max_height must be >= 1")
+    if reward < 1:
+        raise ValidationError("reward must be >= 1 photon")
+    if not 1 <= target < (1 << 64):
+        raise ValidationError(f"target must fit in 8 unsigned bytes, got {target}")
+
+    return (
+        _push_4bytes_le(height)
+        + b"\xd8"
+        + contract_ref.to_bytes()
+        + b"\xd0"
+        + token_ref.to_bytes()
+        + _push_minimal(max_height)
+        + _push_minimal(reward)
+        + b"\x08"
+        + struct.pack("<Q", target)
+    )
+
+
+def build_dmint_v1_code_script(algo: DmintAlgo) -> bytes:
+    """Build the V1 dMint code epilogue (the 145 bytes after OP_STATESEPARATOR).
+
+    Returns ``_V1_EPILOGUE_PREFIX + <algo_byte> + _V1_EPILOGUE_SUFFIX`` where
+    ``algo_byte`` is the on-chain hash opcode for the requested algorithm
+    (0xaa SHA256D, 0xee BLAKE3, 0xef K12). The byte sequence matches every
+    V1 contract decoded from mainnet; ``_match_v1_epilogue`` is the inverse.
+
+    :raises ValidationError: ``algo`` is not a recognized :class:`DmintAlgo`
+        value (which would be a programming bug — the enum class enforces
+        membership).
+    """
+    try:
+        algo_byte = _V1_ENUM_TO_ALGO_BYTE[algo]
+    except KeyError as exc:
+        raise ValidationError(f"unsupported V1 algo: {algo!r}") from exc
+    return _V1_EPILOGUE_PREFIX + bytes([algo_byte]) + _V1_EPILOGUE_SUFFIX
+
+
+def build_dmint_v1_contract_script(
+    height: int,
+    contract_ref: GlyphRef,
+    token_ref: GlyphRef,
+    max_height: int,
+    reward: int,
+    target: int,
+    algo: DmintAlgo = DmintAlgo.SHA256D,
+) -> bytes:
+    """Build a full V1 dMint output script: state followed by V1 code epilogue.
+
+    Note: V1's code epilogue begins with the OP_STATESEPARATOR byte (0xbd) —
+    see ``_V1_EPILOGUE_PREFIX``. Unlike the V2 builder (which interpolates a
+    separate ``_OP_STATESEPARATOR``), this function concatenates state and
+    epilogue directly. Total length is 241 bytes for typical mainnet
+    parameters (96-byte state + 145-byte epilogue), matching the byte-by-byte
+    decode in docs/dmint-research-mainnet.md §2.2.
+
+    The output of this function round-trips through
+    :meth:`DmintState.from_script` with ``is_v1=True``.
+    """
+    state = build_dmint_v1_state_script(
+        height=height,
+        contract_ref=contract_ref,
+        token_ref=token_ref,
+        max_height=max_height,
+        reward=reward,
+        target=target,
+    )
+    return state + build_dmint_v1_code_script(algo)
+
+
+# ---------------------------------------------------------------------------
 # PoW preimage (same structure as V1 — §2.5 / Appendix B)
 # ---------------------------------------------------------------------------
 
@@ -362,24 +486,39 @@ def build_pow_preimage(
 # ---------------------------------------------------------------------------
 
 
-def build_mint_scriptsig(nonce: bytes, preimage: bytes) -> bytes:
+def build_mint_scriptsig(
+    nonce: bytes,
+    preimage: bytes,
+    *,
+    nonce_width: Literal[4, 8] = 8,
+) -> bytes:
     """Build the scriptSig a miner includes in the contract-spend input.
 
-    Format (SHA256d): <nonce:8B> 20 <inputHash:32B> 20 <outputHash:32B> 00
-    The nonce is 8 bytes (two u32 values concatenated, as in V1).
+    Format (SHA256d):
+        V2 (nonce_width=8): ``<0x08> <nonce:8B> <0x20> <inputHash:32B> <0x20> <outputHash:32B> <0x00>`` → 76 bytes
+        V1 (nonce_width=4): ``<0x04> <nonce:4B> <0x20> <inputHash:32B> <0x20> <outputHash:32B> <0x00>`` → 72 bytes
 
-    :param nonce:    8-byte nonce (found during GPU/CPU mining)
-    :param preimage: 64-byte preimage from build_pow_preimage()
+    The V1 layout is documented in docs/dmint-research-mainnet.md §4 (vin[0]
+    of the mainnet mint trace at ``146a4d68…f3c``). Same shape as V2,
+    differing only in nonce width and corresponding push opcode.
+
+    :param nonce:        nonce_width-bytes nonce (found during mining).
+    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param nonce_width:  4 for V1 contracts, 8 for V2. Keyword-only and
+                         ``Literal[4, 8]`` so a stray positional value is a
+                         type error rather than a silent V1/V2 confusion.
+                         Default 8 preserves pre-V1-support behavior.
     """
-    if len(nonce) != 8:
-        raise ValidationError(f"nonce must be 8 bytes, got {len(nonce)}")
+    if nonce_width not in (4, 8):
+        raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
+    if len(nonce) != nonce_width:
+        raise ValidationError(f"nonce must be {nonce_width} bytes, got {len(nonce)}")
     if len(preimage) != 64:
         raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
-    # Push nonce (8 bytes), then two 32-byte pushes (first/second half of preimage),
-    # then OP_0 (padding for scriptSig structure).
+    # Push opcode = nonce length (works for both 4 and 8 since both are < 0x4C).
     return (
-        b"\x08"
-        + nonce  # PUSH 8 + nonce
+        bytes([nonce_width])
+        + nonce  # PUSH nonce_width + nonce
         + b"\x20"
         + preimage[:32]  # PUSH 32 + inputHash half
         + b"\x20"
@@ -463,7 +602,13 @@ def target_to_difficulty(target: int, algo: DmintAlgo = DmintAlgo.SHA256D) -> in
 # ---------------------------------------------------------------------------
 
 
-def verify_sha256d_solution(preimage: bytes, nonce: bytes, target: int) -> bool:
+def verify_sha256d_solution(
+    preimage: bytes,
+    nonce: bytes,
+    target: int,
+    *,
+    nonce_width: Literal[4, 8] = 8,
+) -> bool:
     """Verify a SHA256d PoW solution.
 
     Valid if: hash[0..4] == 0x00000000 AND int.from_bytes(hash[4..12], 'big') < target
@@ -471,7 +616,15 @@ def verify_sha256d_solution(preimage: bytes, nonce: bytes, target: int) -> bool:
     target is clamped to MAX_SHA256D_TARGET before comparison — a caller-supplied
     target above the maximum would make the check trivially pass for any hash
     that starts with four zero bytes.
+
+    :param nonce_width: 4 for V1 contracts, 8 for V2. Default 8 preserves the
+        pre-V1-support behavior. Passed as keyword-only so a stray positional
+        ``4`` vs ``8`` is a type error rather than a silent V1/V2 confusion.
     """
+    if nonce_width not in (4, 8):
+        raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
+    if len(nonce) != nonce_width:
+        raise ValidationError(f"nonce must be {nonce_width} bytes, got {len(nonce)}")
     if target <= 0:
         return False
     effective_target = min(target, MAX_SHA256D_TARGET)
@@ -480,6 +633,277 @@ def verify_sha256d_solution(preimage: bytes, nonce: bytes, target: int) -> bool:
         return False
     value = int.from_bytes(full[4:12], "big")
     return value < effective_target
+
+
+# ---------------------------------------------------------------------------
+# Reference miner — slow but correct CPU-side nonce search.
+# ---------------------------------------------------------------------------
+#
+# Production miners (glyph-miner with WebGPU, custom C/CUDA) live outside
+# pyrxd. This loop is "slow but correct": it exists so tests can mine a
+# low-difficulty contract end-to-end, and so a determined user can mine a
+# real contract overnight without external tooling.
+#
+# The reference miner calls verify_sha256d_solution per candidate rather than
+# inlining its own hash check. That single source of truth prevents the
+# mining-check-vs-verifier-check drift that would let pyrxd produce a tx
+# whose nonce passes locally but fails on-chain (or vice versa) — the same
+# class of bug as the V1 classifier gap (docs/solutions/logic-errors/
+# dmint-v1-classifier-gap.md). The performance cost of one extra Python
+# call per attempt is negligible compared to the SHA-256d itself.
+
+# Default: ≈minutes single-core at the SHA256d rate of ~1-2M h/s observed on
+# modern x86. A naive `mine_solution()` call against a real-mainnet target
+# would otherwise wedge for hours; callers who want unbounded mining can
+# raise this explicitly.
+DEFAULT_MAX_ATTEMPTS = 600_000_000
+
+
+@dataclass(frozen=True)
+class DmintMineResult:
+    """The output of a successful :func:`mine_solution` call.
+
+    :param nonce:     The nonce bytes (4B for V1, 8B for V2) that satisfy the target.
+    :param attempts:  Number of nonce candidates tried before finding the solution.
+    :param elapsed_s: Wall-clock seconds spent searching.
+    """
+
+    nonce: bytes
+    attempts: int
+    elapsed_s: float
+
+
+def mine_solution(
+    preimage: bytes,
+    target: int,
+    *,
+    algo: DmintAlgo = DmintAlgo.SHA256D,
+    nonce_width: Literal[4, 8] = 4,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> DmintMineResult:
+    """Search for a nonce satisfying the V1/V2 dMint PoW target.
+
+    Sequential nonce sweep starting at 0. The nonce is encoded as a
+    little-endian unsigned integer of the requested width (4 bytes for
+    V1, 8 bytes for V2 — matches glyph-miner's ``nonceBytesForContracts``).
+
+    Calls :func:`verify_sha256d_solution` per candidate; that's the single
+    source of truth for "does this hash satisfy the target." Drift between
+    the mining check and the verifier check would let pyrxd produce a
+    nonce that passes locally but fails on-chain (or vice versa).
+
+    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param target:       8-byte 64-bit target (the V1/V2 contract's ``target`` state field).
+    :param algo:         Hash algorithm. Only SHA256D is implemented; BLAKE3 and K12
+                         raise :class:`NotImplementedError`.
+    :param nonce_width:  4 for V1, 8 for V2. Keyword-only and ``Literal[4, 8]``
+                         so a stray positional value is a type error rather than
+                         a silent V1/V2 confusion.
+    :param max_attempts: Upper bound on iterations before raising
+                         :class:`MaxAttemptsError`. Defaults to ≈minutes
+                         single-core at typical CPython hashlib speeds.
+    :raises ValidationError:   ``preimage`` is not 64 bytes, ``target`` is not positive,
+                               ``nonce_width`` is not 4 or 8, or ``max_attempts`` is < 1.
+    :raises NotImplementedError: ``algo`` is BLAKE3 or K12.
+    :raises MaxAttemptsError:  No solution found within ``max_attempts`` iterations.
+                               The exception's ``attempts`` and ``elapsed_s``
+                               attributes carry telemetry.
+
+    Worked example (small target chosen so the loop completes in ms)::
+
+        >>> from pyrxd.glyph.dmint import (
+        ...     mine_solution, verify_sha256d_solution, MAX_SHA256D_TARGET,
+        ... )
+        >>> preimage = b"\\x00" * 64
+        >>> target = MAX_SHA256D_TARGET >> 8  # easy: ~1 in 256 expected
+        >>> result = mine_solution(preimage, target, nonce_width=4)
+        >>> verify_sha256d_solution(preimage, result.nonce, target, nonce_width=4)
+        True
+    """
+    if len(preimage) != 64:
+        raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
+    if target <= 0:
+        raise ValidationError(f"target must be positive, got {target}")
+    if nonce_width not in (4, 8):
+        raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
+    if max_attempts < 1:
+        raise ValidationError(f"max_attempts must be >= 1, got {max_attempts}")
+    if algo != DmintAlgo.SHA256D:
+        raise NotImplementedError(f"mine_solution: algo {algo.name} not implemented in M1; only SHA256D ships")
+
+    started = time.monotonic()
+    for n in range(max_attempts):
+        nonce = n.to_bytes(nonce_width, "little")
+        if verify_sha256d_solution(preimage, nonce, target, nonce_width=nonce_width):
+            return DmintMineResult(
+                nonce=nonce,
+                attempts=n + 1,
+                elapsed_s=time.monotonic() - started,
+            )
+
+    elapsed = time.monotonic() - started
+    raise MaxAttemptsError(
+        f"no SHA256d solution found in {max_attempts} attempts ({elapsed:.1f}s) for nonce_width={nonce_width}",
+        attempts=max_attempts,
+        elapsed_s=elapsed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# External miner shim
+# ---------------------------------------------------------------------------
+#
+# pyrxd's reference miner is correct but slow (~minutes pure-Python for one
+# real-mainnet RBG claim, vs seconds for a GPU miner). The shim lets users
+# delegate the nonce search to any external process — glyph-miner being the
+# canonical example — without coupling pyrxd to GPU/CUDA/WebGPU dependencies.
+#
+# Wire protocol:
+#   stdin  (one JSON line):  {"preimage_hex": "...", "target_hex": "...",
+#                             "nonce_width": 4 | 8}
+#   stdout (one JSON line):  {"nonce_hex": "...", "attempts": N, "elapsed_s": F}
+#
+# Whatever nonce the external process returns is RE-VERIFIED locally before
+# being returned to the caller. A buggy or malicious miner that returns a
+# wrong nonce raises ValidationError rather than letting pyrxd build a tx
+# the network would reject.
+
+EXTERNAL_MINER_TIMEOUT_S = 600.0  # 10 minutes — generous default for slow contracts
+
+
+def mine_solution_external(
+    preimage: bytes,
+    target: int,
+    *,
+    miner_argv: list[str],
+    nonce_width: Literal[4, 8] = 4,
+    timeout_s: float = EXTERNAL_MINER_TIMEOUT_S,
+) -> DmintMineResult:
+    """Delegate nonce search to an external miner via JSON-over-subprocess.
+
+    Spawns ``miner_argv`` as a subprocess, writes one JSON line to its stdin,
+    reads one JSON line from its stdout, and re-verifies the returned nonce
+    locally. The local re-verification is the load-bearing safety check —
+    a wrong nonce from the external process raises rather than getting
+    silently embedded in a transaction.
+
+    The miner is expected to:
+
+    1. Read one JSON object from stdin: ``{"preimage_hex", "target_hex", "nonce_width"}``
+    2. Search for a valid nonce
+    3. Write one JSON object to stdout: ``{"nonce_hex", "attempts", "elapsed_s"}``
+    4. Exit cleanly
+
+    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param target:       The PoW target.
+    :param miner_argv:   argv passed to :func:`subprocess.run` (e.g.
+                         ``["glyph-miner", "--stdin"]``). The first element
+                         must be a binary or shell-resolvable name; pyrxd
+                         does not pin a specific miner.
+    :param nonce_width:  4 for V1, 8 for V2.
+    :param timeout_s:    Hard timeout. The subprocess is killed and
+                         :class:`MaxAttemptsError` raised on expiry.
+    :raises ValidationError:   The miner returned a malformed JSON response,
+                               a nonce of wrong width, or a nonce that fails
+                               local verification.
+    :raises MaxAttemptsError:  The miner exceeded ``timeout_s``.
+    :raises FileNotFoundError: ``miner_argv[0]`` is not on PATH.
+    """
+    import json
+    import subprocess
+
+    if len(preimage) != 64:
+        raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
+    if target <= 0:
+        raise ValidationError(f"target must be positive, got {target}")
+    if nonce_width not in (4, 8):
+        raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
+    if not miner_argv:
+        raise ValidationError("miner_argv must not be empty")
+
+    request = json.dumps(
+        {
+            "preimage_hex": preimage.hex(),
+            "target_hex": f"{target:016x}",
+            "nonce_width": nonce_width,
+        }
+    )
+
+    started = time.monotonic()
+    try:
+        # miner_argv is caller-controlled by design (this is a plug-in
+        # protocol for external miners); the contract is "you tell pyrxd
+        # which binary to invoke." Local re-verification of the returned
+        # nonce below is the load-bearing safety check, not subprocess
+        # argv sanitization.
+        completed = subprocess.run(  # noqa: S603
+            miner_argv,
+            input=request,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        raise MaxAttemptsError(
+            f"external miner {miner_argv[0]!r} did not return a solution within {timeout_s}s",
+            attempts=0,
+            elapsed_s=elapsed,
+        ) from exc
+
+    if completed.returncode != 0:
+        # Don't echo arbitrary stderr to the exception (could be megabytes,
+        # and an aggressive truncate beats a memory blow-up).
+        stderr_tail = (completed.stderr or "")[-500:]
+        raise ValidationError(
+            f"external miner {miner_argv[0]!r} exited with code {completed.returncode}: {stderr_tail!r}"
+        )
+
+    # Parse the response. Cap stdout size to defend against a runaway miner.
+    stdout = completed.stdout or ""
+    if len(stdout) > 4096:
+        raise ValidationError(f"external miner produced {len(stdout)} bytes of stdout; expected one short JSON line")
+    try:
+        response = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"external miner returned non-JSON stdout: {stdout!r}") from exc
+
+    if not isinstance(response, dict):
+        raise ValidationError(f"external miner response must be a JSON object, got {type(response).__name__}")
+    nonce_hex = response.get("nonce_hex")
+    if not isinstance(nonce_hex, str):
+        raise ValidationError(f"external miner response missing or non-string nonce_hex: {response!r}")
+    try:
+        nonce = bytes.fromhex(nonce_hex)
+    except ValueError as exc:
+        raise ValidationError(f"external miner returned non-hex nonce: {nonce_hex!r}") from exc
+    if len(nonce) != nonce_width:
+        raise ValidationError(
+            f"external miner returned nonce of wrong width: got {len(nonce)} bytes, expected {nonce_width}"
+        )
+
+    # Local re-verification: defense against a buggy or malicious miner.
+    if not verify_sha256d_solution(preimage, nonce, target, nonce_width=nonce_width):
+        raise ValidationError(
+            f"external miner returned nonce {nonce.hex()} that fails local SHA256d verification "
+            f"against target {target:#x} — refusing to use it"
+        )
+
+    elapsed = time.monotonic() - started
+    # Trust the miner's self-reported metrics if present, else fall back.
+    attempts = response.get("attempts", 0)
+    if not isinstance(attempts, int) or attempts < 0:
+        attempts = 0
+    miner_elapsed = response.get("elapsed_s", elapsed)
+    if not isinstance(miner_elapsed, (int, float)) or miner_elapsed < 0:
+        miner_elapsed = elapsed
+
+    return DmintMineResult(
+        nonce=nonce,
+        attempts=attempts,
+        elapsed_s=float(miner_elapsed),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1082,21 +1506,22 @@ def build_dmint_mint_tx(
 
     state = contract_utxo.state
 
-    # Reject V1 contracts explicitly. The mint builder rebuilds the output
-    # via ``build_dmint_state_script`` + ``build_dmint_code_script``, both of
-    # which emit V2 covenant code. Spending a V1 contract through this path
-    # would brick it (the recreated UTXO's covenant wouldn't accept the next
-    # mint), and the loss would be irreversible. Until pyrxd ships a V1
-    # contract builder, refuse loudly.
+    # V1 dispatch: V1 contracts have a different state layout, scriptSig
+    # nonce width (4B vs 8B), and no DAA. Branch early-return to keep the V1
+    # path completely separate from V2's DAA-target-update flow rather than
+    # threading conditionals through the V2 logic below.
     if state.is_v1:
-        raise ValidationError(
-            "build_dmint_mint_tx cannot mint V1 contracts; only V2 covenant code is "
-            "currently supported. Spending a V1 contract through this path would "
-            "produce a recreated UTXO whose covenant rejects the next mint, "
-            "irreversibly orphaning the remaining contract pool."
+        return _build_dmint_v1_mint_tx(
+            contract_utxo=contract_utxo,
+            nonce=nonce,
+            miner_pkh=miner_pkh,
+            fee_rate=fee_rate,
         )
+
     if state.is_exhausted:
-        raise ValidationError(f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}")
+        raise ContractExhaustedError(
+            f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
+        )
     if len(nonce) != 8:
         raise ValidationError(f"nonce must be 8 bytes, got {len(nonce)}")
     if len(miner_pkh) != 20:
@@ -1212,7 +1637,7 @@ def build_dmint_mint_tx(
     contract_out_value = contract_utxo.value - state.reward - fee
 
     if contract_out_value < 546:
-        raise ValidationError(
+        raise PoolTooSmallError(
             f"Contract UTXO value ({contract_utxo.value}) too small to cover "
             f"reward ({state.reward}) + fee ({fee}): contract output would be "
             f"{contract_out_value} photons, below 546 dust limit."
@@ -1238,6 +1663,142 @@ def build_dmint_mint_tx(
     contract_input.satoshis = contract_utxo.value
     contract_input.locking_script = Script(contract_utxo.script)
     # Attach the placeholder scriptSig so callers can inspect the tx structure.
+    contract_input.unlocking_script = Script(placeholder_scriptsig)
+
+    tx = Transaction(
+        tx_inputs=[contract_input],
+        tx_outputs=[
+            TransactionOutput(Script(contract_script), contract_out_value),
+            TransactionOutput(Script(reward_script), state.reward),
+        ],
+    )
+
+    return DmintMintResult(
+        tx=tx,
+        updated_state=updated_state,
+        contract_script=contract_script,
+        reward_script=reward_script,
+        fee=fee,
+    )
+
+
+def _build_dmint_v1_mint_tx(
+    contract_utxo: DmintContractUtxo,
+    nonce: bytes,
+    miner_pkh: bytes,
+    fee_rate: int,
+) -> DmintMintResult:
+    """Build a V1 dMint mint tx. Internal — dispatched from build_dmint_mint_tx
+    when state.is_v1.
+
+    V1 differs from V2 in three ways that matter here:
+
+    1. **State layout**: 6 items (no algoId/daaMode/targetTime/lastTime).
+       Built via :func:`build_dmint_v1_state_script`.
+    2. **Code script**: V1 fixed epilogue. Built via
+       :func:`build_dmint_v1_code_script`.
+    3. **ScriptSig nonce width**: 4 bytes, not 8. Built via
+       :func:`build_mint_scriptsig` with ``nonce_width=4``.
+
+    V1 has no DAA — ``new_target == state.target`` always.
+    """
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    state = contract_utxo.state
+
+    if state.is_exhausted:
+        raise ContractExhaustedError(
+            f"V1 dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
+        )
+    if len(nonce) != 4:
+        raise ValidationError(f"V1 nonce must be 4 bytes, got {len(nonce)}")
+    if len(miner_pkh) != 20:
+        raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
+
+    # --- Compute updated state. V1 has no DAA, so target is unchanged. ---
+    new_height = state.height + 1
+    updated_state = DmintState(
+        height=new_height,
+        contract_ref=state.contract_ref,
+        token_ref=state.token_ref,
+        max_height=state.max_height,
+        reward=state.reward,
+        algo=state.algo,
+        daa_mode=DaaMode.FIXED,
+        target_time=0,
+        last_time=0,
+        target=state.target,
+        is_v1=True,
+    )
+
+    # --- Build the updated V1 contract script ---
+    contract_script = build_dmint_v1_contract_script(
+        height=new_height,
+        contract_ref=state.contract_ref,
+        token_ref=state.token_ref,
+        max_height=state.max_height,
+        reward=state.reward,
+        target=state.target,
+        algo=state.algo,
+    )
+
+    # --- Build reward output script (P2PKH) ---
+    reward_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+
+    # --- Placeholder scriptSig (V1: 4-byte nonce, 64-byte preimage placeholder).
+    # The miner loop replaces this once the real preimage is known. ---
+    placeholder_preimage = bytes(64)
+    placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage, nonce_width=4)
+
+    # --- Estimate tx size for fee ---
+    _contract_script_len = len(contract_script)
+    _reward_script_len = len(reward_script)
+    _scriptsig_len = len(placeholder_scriptsig)
+    estimated_size = (
+        4  # version
+        + 1  # vin count
+        + 36  # outpoint
+        + 4  # sequence
+        + _varint_size(_scriptsig_len)
+        + _scriptsig_len
+        + 1  # vout count
+        + 8
+        + _varint_size(_contract_script_len)
+        + _contract_script_len  # contract output
+        + 8
+        + _varint_size(_reward_script_len)
+        + _reward_script_len  # reward output
+        + 4  # locktime
+    )
+    fee = estimated_size * fee_rate
+
+    contract_out_value = contract_utxo.value - state.reward - fee
+    if contract_out_value < 546:
+        raise PoolTooSmallError(
+            f"V1 contract UTXO value ({contract_utxo.value}) too small to cover "
+            f"reward ({state.reward}) + fee ({fee}): contract output would be "
+            f"{contract_out_value} photons, below 546 dust limit."
+        )
+
+    # --- Assemble unsigned tx ---
+    padding_output = TransactionOutput(Script(b""), 0)
+    shim_outputs = [padding_output] * contract_utxo.vout + [
+        TransactionOutput(Script(contract_utxo.script), contract_utxo.value)
+    ]
+    src_tx = Transaction(tx_inputs=[], tx_outputs=shim_outputs)
+    src_tx.txid = lambda: contract_utxo.txid  # type: ignore[method-assign]
+
+    contract_input = TransactionInput(
+        source_transaction=src_tx,
+        source_txid=contract_utxo.txid,
+        source_output_index=contract_utxo.vout,
+        unlocking_script_template=None,
+    )
+    contract_input.satoshis = contract_utxo.value
+    contract_input.locking_script = Script(contract_utxo.script)
     contract_input.unlocking_script = Script(placeholder_scriptsig)
 
     tx = Transaction(

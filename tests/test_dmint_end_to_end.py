@@ -620,8 +620,10 @@ class TestBuildDmintMintTx:
         assert result.fee > 0
 
     def test_exhausted_contract_raises(self):
+        from pyrxd.security.errors import ContractExhaustedError
+
         utxo = _make_contract_utxo(height=100)  # max_height=100
-        with pytest.raises(ValidationError, match="exhausted"):
+        with pytest.raises(ContractExhaustedError, match="exhausted"):
             build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
 
     def test_wrong_nonce_length_raises(self):
@@ -636,8 +638,10 @@ class TestBuildDmintMintTx:
 
     def test_pool_too_small_raises(self):
         # Pool much smaller than fee → contract output would be negative.
+        from pyrxd.security.errors import PoolTooSmallError
+
         utxo = _make_contract_utxo(pool=10_000)  # fee ~4.3M, pool=10k → far too small
-        with pytest.raises(ValidationError, match="too small"):
+        with pytest.raises(PoolTooSmallError, match="too small"):
             build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
 
     def test_asert_daa_updates_target(self):

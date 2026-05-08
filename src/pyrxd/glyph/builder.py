@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Any
 
@@ -294,6 +295,19 @@ class GlyphBuilder:
     ) -> DmintDeployResult:
         """Prepare a full dMint token deploy: commit + reveal + deploy scripts.
 
+        .. warning::
+           **This currently emits a V2 dMint contract.** No live mainnet
+           contracts are V2; the entire ecosystem (glyph-miner, RXinDexer,
+           Photonic explorer) was built around the V1 format. Deploying a
+           token via this function today produces a contract that **no
+           external miner can claim** without bespoke tooling, and indexer
+           behavior on V2 deploys is empirically unknown. **V1 deploy
+           support lands in Milestone 2** of the dMint integration plan
+           (``docs/plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md``);
+           when ``version="v1"`` becomes the default, this warning will
+           be removed. Until then, calling this raises
+           :class:`DeprecationWarning` so you don't deploy by accident.
+
         A dMint deploy requires **three** transactions in sequence:
 
         1. **Commit tx** — commits the token metadata payload hash on-chain
@@ -332,6 +346,14 @@ class GlyphBuilder:
         :raises ValidationError: ``params.premine_amount < 546`` (dust limit);
             metadata protocol does not include FT; reward pool too small.
         """
+        warnings.warn(
+            "prepare_dmint_deploy currently emits V2 dMint contracts; no ecosystem "
+            "miner targets V2. V1 deploy lands in Milestone 2. See "
+            "docs/plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md "
+            "section 'Deploy-footgun mitigation in M1'.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         # 1. Encode the token metadata payload.
         cbor_bytes, payload_hash = encode_payload(params.metadata)
 
