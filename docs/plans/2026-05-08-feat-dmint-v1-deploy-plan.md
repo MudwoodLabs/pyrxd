@@ -433,15 +433,58 @@ Three coordinated changes in `src/pyrxd/glyph/builder.py`:
 
 In `src/pyrxd/glyph/dmint.py`:
 
-4. **`find_dmint_contract_utxos(client, *, token_ref, limit=None, min_confirmations=1) -> list[DmintContractUtxo]`** — public.
-   - Computes codescript-hash inline (`Hex32(sha256(codescript)[::-1])` —
-     no `script_hash_for_script` helper; the call is two lines and used
-     in one place)
-   - Queries `client.get_utxos(scripthash)`, filters by `is_v1=True`
-   - **Per security S2**: for each candidate, fetches the source tx
-     and verifies `tx.txid() == u.tx_hash` AND verifies the script
-     at `tx.outputs[u.tx_pos]` byte-equals the expected codescript.
-     Mirrors M1 round-4's defense in `find_dmint_funding_utxo`.
+4. **`find_dmint_contract_utxos(client, *, token_ref, initial_state=None, limit=None, min_confirmations=1) -> list[DmintContractUtxo]`** — public.
+
+   **Why dual-call-shape:** Phase 2a research confirmed public ElectrumX
+   (`electrumx.radiant4people.com:50022`) exposes neither `dmint.get_contracts`
+   nor any `blockchain.ref.listunspent`-style RPC. The plan's original
+   "compute codescript-hash inline, query directly" approach therefore
+   only works when the caller already knows every state-item value (so
+   the codescript can be reconstructed deterministically). Two distinct
+   use cases need this helper:
+   - **Just-deployed verification**: caller has the deploy params in
+     hand, wants to confirm all N initial contract UTXOs exist on chain.
+     Fast: one `get_utxos(scripthash)` per contract.
+   - **Live-token discovery**: caller has only `token_ref` (e.g. the
+     M1 mint demo wants to mine GLYPH). Slow path: walk from reveal,
+     enumerate its contract outputs.
+
+   The function picks the path based on whether `initial_state` is
+   supplied:
+
+   - **Shape A — fast path** (`initial_state: DmintV1ContractInitialState`
+     supplied): for each `i in range(initial_state.num_contracts)`,
+     compute `contractRef[i] = LE-reversed(commit_txid, i+1)` from
+     `token_ref`'s txid component, build the contract codescript via
+     M1's `build_dmint_v1_contract_script(...)`, compute its scripthash
+     inline (`hashlib.sha256(codescript).digest()[::-1].hex()`),
+     query `client.get_utxos(scripthash)`, and apply S2 cross-check.
+
+   - **Shape B — fallback** (`initial_state` is `None`): parse
+     `token_ref` to get `commit_txid`. Fetch the commit tx; compute
+     scripthash of its `vout[0]` (the FT-commit hashlock). Call
+     `client.get_history(scripthash)` — exactly two entries (commit
+     + reveal). Take the second; that's the reveal txid. Fetch the
+     reveal; for each output try `DmintState.from_script(script)`;
+     if it parses as V1 AND `state.token_ref == token_ref`, build a
+     `DmintContractUtxo`. Verify each is currently unspent via a
+     scripthash-level `get_utxos` lookup. (Skip mined-from contracts
+     in the first cut — the spend chain walk to find current heads
+     is filed as deferred work; the M1 mint demo only needs fresh
+     contracts, and the fresh state is what's directly on the reveal.)
+
+   - **Per security S2 (BOTH shapes)**: for each candidate UTXO,
+     fetch its source tx and verify `tx.txid() == u.tx_hash` AND
+     `tx.outputs[u.tx_pos].locking_script.serialize() == script`.
+     Mirrors M1 round-4's defense in `find_dmint_funding_utxo`. This
+     defends against malicious / buggy ElectrumX servers.
+
+   - `DmintV1ContractInitialState` is a small frozen dataclass with
+     fields `num_contracts: int`, `reward_sats: int`, `max_height:
+     int`, `target: int` — exactly the dMint params needed to rebuild
+     a fresh-state contract script. Constructible directly or
+     extractable via `.to_initial_state()` from
+     `DmintV1DeployParams` / `DmintV1DeployResult`.
 
 **V2 self-test inventory step (Security S1)**: BEFORE merging the
 default-flip change, audit `tests/test_dmint_end_to_end.py` and
