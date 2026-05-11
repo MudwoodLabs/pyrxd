@@ -1345,11 +1345,14 @@ class TestPrepareDmintDeployV2Refusal:
     def test_explicit_opt_in_succeeds(self):
         """allow_v2_deploy=True bypasses the guard so SDK-internal V2 tests
         and explicit V2 deployers can still build the artifacts."""
-        from pyrxd.glyph.builder import DmintDeployResult, GlyphBuilder
+        from pyrxd.glyph.builder import DmintV2DeployResult, GlyphBuilder
 
         builder = GlyphBuilder()
         result = builder.prepare_dmint_deploy(self._params(), allow_v2_deploy=True)
-        assert isinstance(result, DmintDeployResult)
+        # Dispatcher returns the concrete V2 result. The legacy
+        # DmintDeployResult alias is only emitted when a caller constructs
+        # it explicitly — see TestDeprecationAliases.
+        assert isinstance(result, DmintV2DeployResult)
 
     def test_allow_v2_deploy_default_is_false(self):
         """Mechanical regression check: a future refactor must not flip the

@@ -33,10 +33,10 @@ deployment.
 | Token description | `The first of its kind` | CBOR `desc` field, vin 0 of reveal |
 | Protocol version | `p:[1,4]` | CBOR `p` field, vin 0 of reveal |
 | numContracts | 32 | count of 241-byte contract outputs in reveal |
-| reward (sats) | 625,000 | bytes 80..82 of reveal vout 0 contract state |
-| maxHeight | 50,000 | bytes 84..86 of reveal vout 0 contract state |
+| maxHeight | 625,000 | bytes 80..82 of reveal vout 0 contract state (first 3-byte push after tokenRef) |
+| reward (sats) | 50,000 | bytes 84..86 of reveal vout 0 contract state (second 3-byte push) |
 | target (8 bytes BE) | `0x00da740da740da74` | bytes 88..95 of reveal vout 0 contract state |
-| Total supply | 32 × 50,000 × 625,000 = 1,000,000,000,000 sats (10,000 GLYPH @ 8 decimals) | computed from above |
+| Total supply | 32 × 625,000 × 50,000 = 1,000,000,000,000 sats (10,000 GLYPH @ 8 decimals) | computed from above |
 | Algorithm | sha256d (`OP_HASH256` / 0xaa) | epilogue PoW-hash opcode in vout 0 |
 | DAA mode | none (jumps straight to cleanup) | epilogue body shape |
 
@@ -128,8 +128,8 @@ Verified byte-for-byte from chain. The 96-byte state portion decomposes as:
            53 66 25 7a 6f 30 92 96 46 df d9 43 a4  01 00 00 00                       d8 + contractRef = a443d9df:1   (LE-reversed 32-byte txid + LE-4 vout)
 [42.. 78]  d0 8b 87 c3 c7 71 b1 a9 f5 01 5a 4f 26 bf d8 09 79 ed 19 6b
            53 66 25 7a 6f 30 92 96 46 df d9 43 a4  00 00 00 00                       d0 + tokenRef    = a443d9df:0
-[79.. 82]  03 68 89 09                                                               reward = 625,000  (LE-3 push)
-[83.. 86]  03 50 c3 00                                                               maxHeight = 50,000  (LE-3 push)
+[79.. 82]  03 68 89 09                                                               maxHeight = 625,000  (LE-3 push)
+[83.. 86]  03 50 c3 00                                                               reward = 50,000  (LE-3 push)
 [87.. 95]  08 74 da 40 a7 0d 74 da 00                                                target = 0x00da740da740da74  (LE-8 push)
 ```
 
