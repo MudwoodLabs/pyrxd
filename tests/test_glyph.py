@@ -471,12 +471,14 @@ class TestGlyphInspector:
         deploy. Regression test pinned by mainnet GLYPH (b965b32d…9dd6
         vin 0)."""
         # Build a 70 KB CBOR body — large enough to require OP_PUSHDATA4.
+        # The bulk lives in main.b (the embedded media slot), which has no
+        # per-field length cap apart from the overall payload size.
         large_body = cbor2.dumps(
             {
                 "p": [1, 4],
                 "ticker": "GLYPH",
                 "name": "Glyph Protocol",
-                "desc": "x" * (70_000 - 100),  # pad to >65535 bytes
+                "main": {"t": "image/png", "b": cbor2.CBORTag(64, b"x" * 70_000)},
             }
         )
         assert len(large_body) > 65_535
