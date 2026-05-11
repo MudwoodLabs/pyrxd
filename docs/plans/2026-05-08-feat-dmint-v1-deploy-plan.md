@@ -665,63 +665,49 @@ Punting again would repeat the anti-pattern.
 
 #### Phase 2b — V1 deploy library
 
-- [ ] `DmintV1DeployParams` (`@dataclass(frozen=True)`) public; V1-only
-  fields (`num_contracts: int = 1`, optional `op_return_msg: bytes | None = None`);
-  shared fields with `DmintV2DeployParams`
-- [ ] `DmintV2DeployParams` (`@dataclass(frozen=True)`) renamed from
-  `DmintFullDeployParams`; V2-only fields
-- [ ] `DmintFullDeployParams` retained as a **subclass** of
-  `DmintV2DeployParams` whose `__init__` calls `warnings.warn("...",
-  DeprecationWarning, stacklevel=2)` then delegates to `super().__init__`.
-  **Bare alias would not warn**; subclass-with-warner is required.
-  Alias removes in M2.1 (target v0.6).
-- [ ] `num_contracts` validated `[1, 250]` at construction time via
-  `__post_init__`; out-of-range raises `ValidationError`. 250 is the
-  standardness ceiling for V1 deploy reveal tx size.
-- [ ] `prepare_dmint_deploy(params)` uses structural pattern matching
-  with `typing.assert_never` on default arm:
-  - `DmintV1DeployParams` → V1 path, succeeds without opt-in
-  - `DmintV2DeployParams` (or legacy `DmintFullDeployParams`) → V2
-    path, requires `allow_v2_deploy=True`, raises `DmintError`
-    otherwise (legacy subclass also emits `DeprecationWarning` on
-    construction)
-- [ ] **`@overload` stubs** declare:
-  `prepare_dmint_deploy(DmintV1DeployParams, ...) -> DmintV1DeployResult`
-  and `prepare_dmint_deploy(DmintV2DeployParams, ...) -> DmintV2DeployResult`.
-  Without these, mypy strict gives the call-site a union return type,
-  forcing a runtime `isinstance` check just to use V1 fields.
-- [ ] `DmintV1DeployResult` and `DmintV2DeployResult` (renamed from
-  `DmintDeployResult`) sibling **frozen** dataclasses;
-  `placeholder_contract_scripts: tuple[bytes, ...]` (immutable;
-  matches `DmintMineResult`/`DmintState`/`DmintContractUtxo` precedent
-  at `dmint.py:724,1130,1490`)
-- [ ] `DmintDeployResult` retained as a `DeprecationWarning`-emitting
-  subclass alias of `DmintV2DeployResult` for the same one-release
-  deprecation window. Both renames need both aliases — a public
-  caller doing `isinstance(result, DmintDeployResult)` would
-  otherwise break silently.
-- [ ] **Method-name divergence resolved**:
-  `DmintV1DeployResult.build_reveal_outputs(commit_txid) -> DmintV1RevealScripts`
-  (no `commit_vout`/`commit_value` — V1 commit layout is fixed: vout 0
-  is FT-commit, vouts 1..N are 1-photon ref-seeds; values derive
-  from these protocol constants).
-  `DmintV2DeployResult.build_reveal_scripts(commit_txid, commit_vout, commit_value)`
-  unchanged. Different names, honest signatures — better than same
-  name with different arity.
-- [ ] `DmintV1RevealScripts` (`@dataclass(frozen=True)`) public:
-  `contract_scripts: tuple[bytes, ...]` (length = `num_contracts`),
-  `contract_value: int = 1`, `premine_script: bytes | None`,
-  `premine_amount: int | None`, `op_return_script: bytes | None`.
-  Mirrors `FtDeployRevealScripts` shape at `builder.py:80-92`.
-- [ ] V1 commit-tx output layout byte-equal against Phase 2a mainnet
-  fixtures
-- [ ] V1 reveal-tx output layout byte-equal against Phase 2a mainnet
-  fixtures (per-contract bytes; premine bytes if present)
-- [ ] CBOR payload byte-equal against Phase 2a fixture (`p: [1, 4]`,
-  no `v` field, ticker/name present)
-- [ ] **Pin test**: `assert "v" not in DmintCborPayload(...).to_cbor_dict()`
-  for V1 (independent of byte-equal fixture; catches a future refactor
-  that re-introduces `v`)
+- [x] `DmintV1DeployParams` (`@dataclass(frozen=True)`) public; V1-only
+  fields (`num_contracts`, optional `op_return_msg`); validation in
+  `__post_init__`.
+- [x] `DmintV2DeployParams` renamed from `DmintFullDeployParams`.
+- [x] `DmintFullDeployParams` retained as a subclass-with-warner (NOT
+  a bare alias) so construction emits `DeprecationWarning`. Subclass
+  pattern pinned by `TestDeprecationAliases.test_subclass_pattern_not_bare_alias`.
+- [x] `num_contracts` validated `[1, 250]` at construction time via
+  `__post_init__`; out-of-range raises `ValidationError`. Plus
+  `max_height` and `reward_photons` validated against their 3-byte
+  protocol ceilings; non-SHA256d algo rejected.
+- [x] `prepare_dmint_deploy(params)` dispatches via `isinstance` with
+  `typing.assert_never` on default arm (mypy exhaustiveness). V1 path
+  succeeds without opt-in; V2 path retains the `allow_v2_deploy=True`
+  guard.
+- [x] **`@overload` stubs** declare V1→V1result, V2→V2result. Plain
+  `mypy` confirmed call-site narrowing.
+- [x] `DmintV1DeployResult` and `DmintV2DeployResult` (renamed from
+  `DmintDeployResult`). V1 result is `frozen=True` per the
+  `DmintMineResult` / `DmintState` / `DmintContractUtxo` precedent;
+  carries `placeholder_contract_scripts: tuple[bytes, ...]`.
+- [x] `DmintDeployResult` retained as a `DeprecationWarning`-emitting
+  subclass of `DmintV2DeployResult`. Both warner aliases scheduled
+  for removal in v0.6.
+- [x] **Method-name divergence resolved**:
+  `DmintV1DeployResult.build_reveal_outputs(commit_txid)` exists.
+  Distinct from V2's `build_reveal_scripts(commit_txid, commit_vout,
+  commit_value)`.
+- [x] `DmintV1RevealScripts` (`@dataclass(frozen=True)`) public:
+  `contract_scripts: tuple[bytes, ...]`, `contract_value=1`,
+  `cbor_bytes`, `scriptsig_suffix`, optional `premine_script`,
+  `premine_amount`, `op_return_script`.
+- [x] V1 commit-tx FT-commit script byte-equal against GLYPH chain
+  truth (exercised transitively by the golden-vector test below).
+- [x] V1 reveal contract output byte-equal against GLYPH mainnet
+  reveal vout 0 (the entire 241-byte contract script matches —
+  `TestV1GoldenVectorGlyphPattern::test_v1_contract_script_byte_equals_glyph_vout_0`).
+  Caught a Phase 2a research-doc field-label swap (max_height vs
+  reward) that synthetic round-trip tests had missed.
+- [x] CBOR payload shape pinned: `p:[1,4]` enforced; `v` field
+  forbidden; `dmint` sub-dict forbidden (V1 stores params in scripts).
+- [x] **Pin test**: `assert "v" not in cbor2.loads(result.cbor_bytes)`
+  in `TestV1CborShape::test_no_v_field_in_cbor`.
 - [ ] **Defensive runtime assertion**: `_prepare_dmint_v1_deploy`
   refuses to emit a reveal tx whose vout count differs from
   `num_contracts + (1 if premine else 0) + (1 if change else 0)`
