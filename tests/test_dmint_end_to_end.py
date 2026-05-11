@@ -11,8 +11,9 @@ from __future__ import annotations
 import pytest
 
 from pyrxd.glyph.builder import (
-    DmintDeployResult,
     DmintFullDeployParams,
+    DmintV2DeployParams,
+    DmintV2DeployResult,
     GlyphBuilder,
 )
 from pyrxd.glyph.dmint import (
@@ -410,7 +411,11 @@ class TestPrepareDmintDeploy:
     def _make_params(self, premine=None, pool=100_000):
         from pyrxd.security.types import Hex20
 
-        return DmintFullDeployParams(
+        # Migrated from DmintFullDeployParams (deprecated alias) to
+        # DmintV2DeployParams as part of the V1/V2 sibling-dataclass
+        # refactor. The deprecation warning is exercised separately in
+        # ``TestDmintFullDeployParamsDeprecation`` below.
+        return DmintV2DeployParams(
             metadata=self._META,
             owner_pkh=Hex20(bytes(b"\x11" * 20)),
             max_height=1_000,
@@ -422,7 +427,7 @@ class TestPrepareDmintDeploy:
 
     def test_returns_dmint_deploy_result(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
-        assert isinstance(result, DmintDeployResult)
+        assert isinstance(result, DmintV2DeployResult)
 
     def test_commit_result_has_ft_shape(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
