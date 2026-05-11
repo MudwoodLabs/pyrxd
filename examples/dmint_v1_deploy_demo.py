@@ -315,11 +315,17 @@ def _build_commit_tx(
 
     inputs: list[TransactionInput] = []
     total_in = 0
-    # Commit needs: 1 (FT-commit) + num_contracts × 1 (ref-seeds) + change.
-    # Reveal will then consume the FT-commit + each ref-seed plus a
-    # funding input for the reveal fee. Conservative estimate: keep
-    # 500K photons over the commit-out minimum to cover reveal fees.
-    target_value = 1 + num_contracts + 500_000
+    # Commit needs to cover, conservatively:
+    #   - 1 photon for the FT-commit hashlock output (vout 0)
+    #   - 1 photon × num_contracts for the ref-seeds (vouts 1..N)
+    #   - commit-tx fee (~300 bytes × 10K photons/byte ≈ 3M photons)
+    #   - reveal-tx fee + funding for the reveal's external input
+    #     (~700 bytes × 10K photons/byte ≈ 7M photons for small N)
+    #   - dust-margin so the commit's change output isn't < 546 photons
+    #     (pyrxd's fee model drops sub-dust change to miners)
+    # Use 20M photons of headroom — cheap insurance against an under-sized
+    # wallet. Operator can override by setting funding bigger than this.
+    target_value = 1 + num_contracts + 20_000_000
     for u in utxos:
         src_out = TransactionOutput(p2pkh_lock, u["value"])
 
@@ -366,8 +372,8 @@ def _build_commit_tx(
 
 def _build_reveal_tx(
     commit_txid: str,
+    commit_script: bytes,
     num_contracts: int,
-    cbor_bytes: bytes,
     scriptsig_suffix: bytes,
     contract_scripts: tuple[bytes, ...],
     op_return_script: bytes | None,
@@ -388,24 +394,30 @@ def _build_reveal_tx(
     * vout N:         optional OP_RETURN (omitted if not set)
     * vout N | N+1:   P2PKH change to deployer
 
-    All inputs except vin 0 are P2PKH; vin 0 carries the Glyph reveal
-    payload via ``scriptsig_suffix``. Signing is delegated to
-    ``tx.sign()`` (which invokes the unlock templates above) — same
-    pattern as ``examples/ft_deploy_premine.py``.
+    Signing is delegated to ``tx.sign()`` which invokes the unlock
+    templates. Each input's ``locking_script`` MUST be the actual
+    on-chain script of the UTXO being spent — the BIP143 sighash
+    preimage hashes ``tx_input.locking_script`` (Radiant
+    transaction_preimage.py line 130), so a wrong value here
+    produces a signature the validator will reject.
+
+    The two distinct locking-script shapes:
+
+    * vin 0:  the 75-byte FT-commit hashlock (``commit_script`` arg)
+    * vins 1..N + funding: standard 25-byte P2PKH
     """
     p2pkh_lock = P2PKH().lock(address)
+    commit_lock = Script(commit_script)
 
     class _SrcTx:
         def __init__(self, outs):
             self.outputs = outs
 
-    # Reconstruct the commit's outputs (vout 0 = FT-commit, vouts 1..N = ref-seeds)
-    # so each TransactionInput can resolve satoshis + locking_script.
-    # We don't have the actual commit_script here (the caller passed
-    # `scriptsig_suffix` derived from CBOR, but the FT-commit locking
-    # script is the standard 75-byte shape; in DRY_RUN mode we just need
-    # SOMETHING that round-trips through .preimage()).
-    commit_outs = {0: TransactionOutput(p2pkh_lock, 1)}
+    # Reconstruct the commit's outputs so each TransactionInput can resolve
+    # satoshis + locking_script for sighash preimage construction. The
+    # commit script for vout 0 MUST be the actual 75-byte FT-commit
+    # hashlock; vouts 1..N are 1-photon P2PKH ref-seeds.
+    commit_outs = {0: TransactionOutput(commit_lock, 1)}
     for i in range(1, num_contracts + 1):
         commit_outs[i] = TransactionOutput(p2pkh_lock, 1)
     src_commit = _SrcTx(commit_outs)
@@ -419,11 +431,11 @@ def _build_reveal_tx(
         unlocking_script_template=_reveal_input_unlock_template(private_key, scriptsig_suffix),
     )
     inp0.satoshis = 1
-    inp0.locking_script = p2pkh_lock
+    inp0.locking_script = commit_lock  # the actual 75-byte FT-commit hashlock
     inp0.source_transaction = src_commit
     inputs.append(inp0)
 
-    # vins 1..N: ref-seed P2PKHs.
+    # vins 1..N: ref-seed P2PKHs at the deployer's PKH.
     for i in range(1, num_contracts + 1):
         inp = TransactionInput(
             source_txid=commit_txid,
@@ -435,15 +447,19 @@ def _build_reveal_tx(
         inp.source_transaction = src_commit
         inputs.append(inp)
 
-    # vin N+1: external funding for reveal fees.
-    funding_src = _SrcTx({funding_utxo["tx_pos"]: TransactionOutput(Script(funding_pkh_lock), funding_utxo["value"])})
+    # vin N+1: external plain-RXD funding input for the reveal's fee.
+    # Note: funding_pkh_lock comes from the deployer's own address (we
+    # currently assume single-key deploys); for a multi-key deployer
+    # the funding key would be separate.
+    funding_lock = Script(funding_pkh_lock)
+    funding_src = _SrcTx({funding_utxo["tx_pos"]: TransactionOutput(funding_lock, funding_utxo["value"])})
     fund = TransactionInput(
         source_txid=funding_utxo["tx_hash"],
         source_output_index=funding_utxo["tx_pos"],
         unlocking_script_template=_p2pkh_unlock_template(private_key),
     )
     fund.satoshis = funding_utxo["value"]
-    fund.locking_script = Script(funding_pkh_lock)
+    fund.locking_script = funding_lock
     fund.source_transaction = funding_src
     inputs.append(fund)
 
@@ -481,15 +497,28 @@ async def main() -> None:
     pkh = Hex20(pub.hash160())
 
     total_supply = NUM_CONTRACTS * MAX_HEIGHT * REWARD_PHOTONS
-    print(f"Deployer wallet: {address}")
-    print(f"Token name:      {TOKEN_NAME}")
-    print(f"Ticker:          {TOKEN_TICKER}")
-    print(f"num_contracts:   {NUM_CONTRACTS}")
-    print(f"max_height:      {MAX_HEIGHT}")
-    print(f"reward_photons:  {REWARD_PHOTONS}")
-    print(f"difficulty:      {DIFFICULTY}")
-    print(f"Total supply:    {total_supply:,} photons ({NUM_CONTRACTS} × {MAX_HEIGHT} × {REWARD_PHOTONS})")
-    print(f"DRY_RUN:         {DRY_RUN}")
+    # Conservative cost estimate. Real fees depend on tx serialized size,
+    # which varies with NUM_CONTRACTS (more contracts → bigger reveal).
+    # At MIN_FEE_RATE=10K photons/byte and the demo's typical sizes:
+    #   - commit: ~300 bytes → ~3M photons fee
+    #   - reveal: (250 bytes per contract + ~200 bytes overhead) × 10K
+    estimated_commit_fee = 3_000_000
+    estimated_reveal_fee = (NUM_CONTRACTS * 250 + 200) * MIN_FEE_RATE
+    print(f"Deployer wallet:    {address}")
+    print(f"Token name:         {TOKEN_NAME}")
+    print(f"Ticker:             {TOKEN_TICKER}")
+    print(f"num_contracts:      {NUM_CONTRACTS}")
+    print(f"max_height:         {MAX_HEIGHT}")
+    print(f"reward_photons:     {REWARD_PHOTONS}")
+    print(f"difficulty:         {DIFFICULTY}")
+    print(f"Total supply:       {total_supply:,} photons ({NUM_CONTRACTS} × {MAX_HEIGHT} × {REWARD_PHOTONS})")
+    print(f"Commit fee (est):   ~{estimated_commit_fee:,} photons")
+    print(f"Reveal fee (est):   ~{estimated_reveal_fee:,} photons")
+    print(
+        f"Total cost (est):   ~{estimated_commit_fee + estimated_reveal_fee + NUM_CONTRACTS + 1:,} photons "
+        f"(plus dust margin for change)"
+    )
+    print(f"DRY_RUN:            {DRY_RUN}")
     print()
 
     metadata = GlyphMetadata(
@@ -518,6 +547,43 @@ async def main() -> None:
     if RESUME_COMMIT_TXID:
         commit_txid = RESUME_COMMIT_TXID
         print(f"Resuming from commit {commit_txid} (vout {RESUME_COMMIT_VOUT}, {RESUME_COMMIT_VALUE:,} photons)")
+        # Param-drift guard: if a resume file exists, verify the env-derived
+        # params reproduce the same commit script. A mismatch means the user
+        # changed TOKEN_NAME / NUM_CONTRACTS / etc. between commit and resume
+        # — the reveal would build against the wrong commit script and the
+        # signed sighash would be wrong on every input.
+        try:
+            with open(RESUME_FILE) as f:
+                saved = json.load(f)
+        except FileNotFoundError:
+            print(
+                f"  ⚠️  No resume file at {RESUME_FILE} — cannot verify env "
+                f"params match the on-chain commit. Proceed only if you are "
+                f"sure none of TOKEN_NAME, TOKEN_TICKER, NUM_CONTRACTS, "
+                f"MAX_HEIGHT, REWARD_PHOTONS, DIFFICULTY changed since commit."
+            )
+        else:
+            saved_script_hex = saved.get("commit_script_hex")
+            current_script_hex = result.commit_result.commit_script.hex()
+            if saved_script_hex and saved_script_hex != current_script_hex:
+                print(
+                    "ERROR: resume-file commit script does not match the "
+                    "script the current env vars would build. One of the "
+                    "deploy params changed since the commit was broadcast. "
+                    "The reveal would fail on chain (sighash mismatch).",
+                    file=sys.stderr,
+                )
+                print(f"  saved:   {saved_script_hex[:60]}...", file=sys.stderr)
+                print(f"  current: {current_script_hex[:60]}...", file=sys.stderr)
+                sys.exit(1)
+            elif saved.get("commit_txid") != commit_txid:
+                print(
+                    f"  ⚠️  Resume file's commit_txid ({saved.get('commit_txid')}) "
+                    f"differs from COMMIT_TXID env ({commit_txid}). Proceeding "
+                    f"with env-supplied txid."
+                )
+            else:
+                print("  ✓ Resume file matches current env params.")
     else:
         print("Fetching UTXOs and filtering token-bearing...")
         utxos = await fetch_utxos(address)
@@ -549,6 +615,9 @@ async def main() -> None:
             "commit_txid": commit_txid,
             "num_contracts": NUM_CONTRACTS,
             "cbor_hex": result.cbor_bytes.hex(),
+            # Save the commit script so the resume path can verify nothing
+            # drifted between commit and reveal. See param-drift guard above.
+            "commit_script_hex": result.commit_result.commit_script.hex(),
         }
         with open(RESUME_FILE, "w") as f:
             json.dump(resume_info, f)
@@ -589,8 +658,8 @@ async def main() -> None:
 
     reveal_tx = _build_reveal_tx(
         commit_txid=commit_txid,
+        commit_script=result.commit_result.commit_script,
         num_contracts=NUM_CONTRACTS,
-        cbor_bytes=reveal_scripts.cbor_bytes,
         scriptsig_suffix=reveal_scripts.scriptsig_suffix,
         contract_scripts=reveal_scripts.contract_scripts,
         op_return_script=reveal_scripts.op_return_script,
