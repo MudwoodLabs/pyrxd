@@ -3,30 +3,40 @@
 > ⚠️ **This document is out of date — see code instead.**
 >
 > Written when pyrxd shipped only the premine-at-deploy path. Since
-> then pyrxd has gained **full V2 deploy** support and **V1 mint**
-> support against live mainnet contracts (RBG and other live V1
-> deploys). The "what is NOT implemented" sections below are wrong:
-> the V2 contract builder, ASERT/LWMA difficulty bytecode, V1+V2
-> parsers, V1+V2 mint tx builders, an external-miner shim, and a
-> reference Python miner all ship today.
+> then pyrxd has gained **full V2 deploy** support, **V1 mint**
+> support against live mainnet contracts (M1), and **V1 deploy**
+> support with byte-equal golden vectors against the live Radiant
+> Glyph Protocol deploy (M2). The "what is NOT implemented" sections
+> below are wrong: the V2 contract builder, ASERT/LWMA difficulty
+> bytecode, V1+V2 parsers, V1+V2 mint tx builders, an external-miner
+> shim, a reference Python miner, AND a V1 deploy builder all ship
+> today.
 >
 > **Authoritative sources for current dMint capability:**
 >
+> - [`docs/concepts/dmint-v1-deploy.md`](concepts/dmint-v1-deploy.md) —
+>   the V1 deploy story end-to-end (multi-contract structure, CBOR
+>   shape, Photonic divergences, footguns)
+> - [`docs/dmint-research-photonic-deploy.md`](dmint-research-photonic-deploy.md) —
+>   M2 byte-by-byte decode of the GLYPH mainnet deploy
 > - [`src/pyrxd/glyph/dmint.py`](../src/pyrxd/glyph/dmint.py) —
->   builders, parsers, miner, verifier
+>   builders, parsers, miner, verifier, chain helpers
 > - [`src/pyrxd/glyph/builder.py`](../src/pyrxd/glyph/builder.py) —
->   `prepare_dmint_deploy` (V2; refuses to run without
->   `allow_v2_deploy=True` opt-in until V1 deploy lands in M2)
+>   `prepare_dmint_deploy` (V1 default; V2 behind `allow_v2_deploy=True`
+>   footgun guard); `DmintV1DeployParams` / `DmintV2DeployParams`
+> - [`examples/dmint_v1_deploy_demo.py`](../examples/dmint_v1_deploy_demo.py) —
+>   manual real-mainnet V1 deploy runner (DRY_RUN by default)
 > - [`examples/dmint_claim_demo.py`](../examples/dmint_claim_demo.py) —
 >   manual real-mainnet V1 mint runner
-> - [`docs/plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md`](plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md) —
->   current dMint roadmap (M1 V1 mint shipped; M2 V1 deploy; M3 V2
->   deploy proof, deferred)
+> - [`docs/plans/2026-05-08-feat-dmint-v1-deploy-plan.md`](plans/2026-05-08-feat-dmint-v1-deploy-plan.md) —
+>   M2 plan (V1 deploy; merged)
 >
 > **What's still genuinely future work:**
 >
-> - V1 deploy builder (M2 — `prepare_dmint_deploy` still emits V2;
->   needs a `version="v1"` opt-in path)
+> - Auth NFT in the V1 deploy reveal (M2 demo omits this; GLYPH has it)
+> - Premine FT output on V1 deploy (deferred per Photonic divergence #2)
+> - Walking forward through mined-from contracts in
+>   `find_dmint_contract_utxos` (current impl returns fresh contracts only)
 > - Live-mainnet V2 deploy proof (M3, deferred indefinitely — no
 >   ecosystem demand)
 > - EPOCH and SCHEDULE DAA modes (raise `NotImplementedError`; no
@@ -35,7 +45,7 @@
 >   wanting GPU/multi-core go through the external-miner shim to
 >   `glyph-miner`
 >
-> Full rewrite of this doc lands when M2 closes.
+> Full rewrite of this doc lands as a separate PR after M2 merges.
 
 ---
 

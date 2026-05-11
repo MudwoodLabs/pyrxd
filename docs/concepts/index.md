@@ -8,6 +8,7 @@ and how Radiant differs from related blockchains.
 
 gravity
 radiant-fts-are-on-chain
+dmint-v1-deploy
 ```
 
 ## Available now
@@ -21,6 +22,11 @@ radiant-fts-are-on-chain
   is to assume Radiant FTs are plain UTXOs with off-chain meaning. This
   page explains the difference and shows the 75-byte FT script layout,
   the conservation rule, and what wallet code has to filter for.
+- **[V1 dMint deploys: N parallel singleton contracts in one reveal](dmint-v1-deploy.md)** —
+  what the deploy commit + reveal shapes look like on mainnet (anchored
+  to Radiant Glyph Protocol), why pyrxd refuses to emit V2 by default,
+  and the five Photonic divergences pyrxd ships with. Read this before
+  using `prepare_dmint_deploy` with `DmintV1DeployParams`.
 
 ## Adjacent reading (not yet promoted to concept docs)
 
