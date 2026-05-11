@@ -874,14 +874,25 @@ class TestV1DmintParser:
         assert "V1:" in msg
         assert "not a dMint contract" in msg
 
-    def test_v1_guard_in_mint_builder(self):
-        """`build_dmint_mint_tx` must refuse V1 contracts loudly. Spending a
-        V1 contract through the V2 mint builder would brick the contract
-        pool — the guard converts an invisible foot-gun into a clear error."""
-        from pyrxd.glyph.dmint import DmintContractUtxo, DmintState, build_dmint_mint_tx
+    def test_v1_dispatch_in_mint_builder(self):
+        """``build_dmint_mint_tx`` dispatches V1 contracts to the V1 mint path.
+
+        V1 mint requires a funding_utxo (V1 contracts are singletons; the
+        miner pays reward + fee from a separate plain-RXD input). V1 also
+        requires ``current_time=0`` since V1 has no DAA. A V2-width nonce
+        against a V1 contract is rejected with a typed ``ValidationError``.
+        """
+        from pyrxd.glyph.dmint import (
+            DmintContractUtxo,
+            DmintMinerFundingUtxo,
+            DmintState,
+            build_dmint_mint_tx,
+        )
 
         v1_state = DmintState.from_script(_RBG_DMINT_V1_VOUT_0)
         assert v1_state.is_v1 is True
+
+        # Live RBG-style contract: singleton with 1 photon
         utxo = DmintContractUtxo(
             txid="aa" * 32,
             vout=0,
@@ -889,12 +900,33 @@ class TestV1DmintParser:
             script=_RBG_DMINT_V1_VOUT_0,
             state=v1_state,
         )
-        with pytest.raises(ValidationError, match="cannot mint V1 contracts"):
+        # Funding UTXO covers reward + fee
+        funding = DmintMinerFundingUtxo(
+            txid="ee" * 32,
+            vout=0,
+            value=100_000_000,
+            script=b"\x76\xa9\x14" + bytes(20) + b"\x88\xac",
+        )
+
+        # V1 nonce width is 4 bytes; passing 4 bytes must succeed.
+        result = build_dmint_mint_tx(
+            contract_utxo=utxo,
+            nonce=b"\x00" * 4,
+            miner_pkh=bytes(20),
+            current_time=0,
+            funding_utxo=funding,
+        )
+        assert result.updated_state.is_v1 is True
+        assert result.updated_state.height == v1_state.height + 1
+
+        # A V2-width nonce against a V1 contract is an error.
+        with pytest.raises(ValidationError, match="V1 nonce"):
             build_dmint_mint_tx(
                 contract_utxo=utxo,
                 nonce=b"\x00" * 8,
                 miner_pkh=bytes(20),
-                current_time=1_700_000_000,
+                current_time=0,
+                funding_utxo=funding,
             )
 
 

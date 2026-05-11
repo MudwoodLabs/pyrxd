@@ -5,9 +5,14 @@ from __future__ import annotations
 import pytest
 
 from pyrxd.security.errors import (
+    ContractExhaustedError,
     CovenantError,
+    DmintError,
+    InvalidFundingUtxoError,
     KeyMaterialError,
+    MaxAttemptsError,
     NetworkError,
+    PoolTooSmallError,
     RxdSdkError,
     SpvVerificationError,
     ValidationError,
@@ -128,3 +133,41 @@ class TestRxdSdkErrorRedaction:
         ):
             err = exc_cls(sensitive)
             assert sensitive not in err.args, f"{exc_cls.__name__} leaked args"
+
+
+class TestDmintErrors:
+    """The DmintError hierarchy added for V1 mint support (M1)."""
+
+    def test_dmint_error_inherits_from_rxd_sdk_error(self) -> None:
+        assert issubclass(DmintError, RxdSdkError)
+
+    def test_subclasses_inherit_from_dmint_error(self) -> None:
+        for exc_cls in (
+            ContractExhaustedError,
+            PoolTooSmallError,
+            InvalidFundingUtxoError,
+            MaxAttemptsError,
+        ):
+            assert issubclass(exc_cls, DmintError)
+            assert issubclass(exc_cls, RxdSdkError)
+
+    def test_max_attempts_error_carries_telemetry(self) -> None:
+        err = MaxAttemptsError("exhausted", attempts=42, elapsed_s=1.5)
+        assert err.attempts == 42
+        assert err.elapsed_s == 1.5
+
+    def test_max_attempts_error_default_attributes(self) -> None:
+        # Default values let callers raise without telemetry args.
+        err = MaxAttemptsError("exhausted")
+        assert err.attempts == 0
+        assert err.elapsed_s == 0.0
+
+    def test_dmint_errors_can_be_caught_via_dmint_error(self) -> None:
+        for exc_cls in (
+            ContractExhaustedError,
+            PoolTooSmallError,
+            InvalidFundingUtxoError,
+            MaxAttemptsError,
+        ):
+            with pytest.raises(DmintError):
+                raise exc_cls("test")

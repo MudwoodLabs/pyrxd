@@ -347,13 +347,19 @@ class TestRT07PoWTargetOverflow:
     def _hash_bytes(self, preimage: bytes, nonce: bytes) -> bytes:
         return hashlib.sha256(hashlib.sha256(preimage + nonce).digest()).digest()
 
+    # Nonce values fixed at the V2 default (8 bytes) to satisfy the post-V1
+    # strict length check; the actual nonce content is irrelevant to these
+    # tests, which exercise *target* boundary behavior in isolation.
+    _NONCE = b"\x00" * 8
+    _PREIMAGE = b"\x00" * 64
+
     def test_zero_target_always_false(self):
         """target=0 means impossible — must not accept any solution."""
-        assert verify_sha256d_solution(b"pre", b"nonce", 0) is False
+        assert verify_sha256d_solution(self._PREIMAGE, self._NONCE, 0) is False
 
     def test_negative_target_always_false(self):
         """Negative target is nonsensical — must not wrap around."""
-        assert verify_sha256d_solution(b"pre", b"nonce", -1) is False
+        assert verify_sha256d_solution(self._PREIMAGE, self._NONCE, -1) is False
 
     def test_target_above_max_capped_at_max(self):
         """An attacker passing target > MAX must not bypass difficulty enforcement.
@@ -364,7 +370,7 @@ class TestRT07PoWTargetOverflow:
         """
         # Passing an astronomical target must not make verification trivially true
         # for a garbage nonce (no valid PoW).
-        result = verify_sha256d_solution(b"garbage_preimage", b"bad_nonce", 2**64 - 1)
+        result = verify_sha256d_solution(b"\xff" * 64, self._NONCE, 2**64 - 1)
         # The result depends on whether the hash happens to meet MAX — the point
         # is it doesn't silently accept anything by wrapping max to 0 or accepting negative.
         # We just confirm it returns bool without raising.
@@ -376,13 +382,13 @@ class TestRT07PoWTargetOverflow:
 
     def test_target_equal_to_max_accepted_as_valid_range(self):
         """target == MAX_SHA256D_TARGET is the easiest legal difficulty."""
-        result = verify_sha256d_solution(b"pre", b"nonce", MAX_SHA256D_TARGET)
+        result = verify_sha256d_solution(self._PREIMAGE, self._NONCE, MAX_SHA256D_TARGET)
         assert isinstance(result, bool)
 
     def test_target_one_above_max_clamped_not_wrapped(self):
         """target = MAX + 1 must behave identically to MAX (clamped), not wrap."""
-        r1 = verify_sha256d_solution(b"pre", b"nonce", MAX_SHA256D_TARGET)
-        r2 = verify_sha256d_solution(b"pre", b"nonce", MAX_SHA256D_TARGET + 1)
+        r1 = verify_sha256d_solution(self._PREIMAGE, self._NONCE, MAX_SHA256D_TARGET)
+        r2 = verify_sha256d_solution(self._PREIMAGE, self._NONCE, MAX_SHA256D_TARGET + 1)
         assert r1 == r2, "target > MAX must be clamped to MAX, not wrapped"
 
 

@@ -5,7 +5,7 @@ from typing import Any
 
 import cbor2
 
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import DmintError, ValidationError
 from pyrxd.security.types import Hex20
 
 from .dmint import (
@@ -291,8 +291,26 @@ class GlyphBuilder:
     def prepare_dmint_deploy(
         self,
         params: DmintFullDeployParams,
+        *,
+        allow_v2_deploy: bool = False,
     ) -> DmintDeployResult:
         """Prepare a full dMint token deploy: commit + reveal + deploy scripts.
+
+        .. warning::
+           **This currently emits a V2 dMint contract.** No live mainnet
+           contracts are V2; the entire ecosystem (glyph-miner, RXinDexer,
+           Photonic explorer) was built around the V1 format. Deploying a
+           token via this function today produces a contract that **no
+           external miner can claim** without bespoke tooling, and indexer
+           behavior on V2 deploys is empirically unknown. **V1 deploy
+           support lands in Milestone 2** of the dMint integration plan
+           (``docs/plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md``).
+
+           This function therefore **refuses to run** unless the caller
+           explicitly passes ``allow_v2_deploy=True`` to acknowledge that
+           they are deploying a non-standard contract on purpose (e.g. for
+           SDK-internal testing of the V2 builder, or a future deployer who
+           genuinely wants V2's dynamic-difficulty features).
 
         A dMint deploy requires **three** transactions in sequence:
 
@@ -332,6 +350,18 @@ class GlyphBuilder:
         :raises ValidationError: ``params.premine_amount < 546`` (dust limit);
             metadata protocol does not include FT; reward pool too small.
         """
+        if not allow_v2_deploy:
+            raise DmintError(
+                "prepare_dmint_deploy currently emits V2 dMint contracts; no "
+                "ecosystem miner (glyph-miner, etc.) targets V2 and indexer "
+                "behavior on V2 deploys is empirically unknown. Refusing to "
+                "build a token nobody can mine. V1 deploy lands in Milestone 2 "
+                "of the dMint integration plan; until then, pass "
+                "allow_v2_deploy=True if you understand the consequences "
+                "(e.g. SDK-internal testing). See "
+                "docs/plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md "
+                "'Deploy-footgun mitigation in M1'."
+            )
         # 1. Encode the token metadata payload.
         cbor_bytes, payload_hash = encode_payload(params.metadata)
 

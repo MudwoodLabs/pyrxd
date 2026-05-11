@@ -9,12 +9,20 @@ Design reference: glyph-miner/docs/V2_DMINT_DESIGN.md
 from __future__ import annotations
 
 import hashlib
+import math
 import struct
+import time
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any
+from typing import Any, Literal
 
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import (
+    ContractExhaustedError,
+    InvalidFundingUtxoError,
+    MaxAttemptsError,
+    PoolTooSmallError,
+    ValidationError,
+)
 
 from .types import GlyphRef
 
@@ -319,6 +327,184 @@ def build_dmint_contract_script(params: DmintDeployParams) -> bytes:
 
 
 # ---------------------------------------------------------------------------
+# V1 dMint builders
+# ---------------------------------------------------------------------------
+#
+# V1 is the only dMint contract format observed on Radiant mainnet. It has 6
+# state items (height, contractRef, tokenRef, maxHeight, reward, target) and
+# a 145-byte fixed code epilogue with one selector byte for the algorithm.
+# Documented in docs/dmint-research-mainnet.md §2.2 (byte-by-byte) and §3
+# (common template). The V1 parser (DmintState._from_v1_script) and
+# fingerprint helpers (_match_v1_epilogue) are the inverse of these.
+
+_V1_ALGO_BYTE_TO_ENUM: dict[int, DmintAlgo] = {
+    0xAA: DmintAlgo.SHA256D,  # OP_HASH256
+    0xEE: DmintAlgo.BLAKE3,  # OP_BLAKE3
+    0xEF: DmintAlgo.K12,  # OP_K12
+}
+# Inverse derived from the source-of-truth mapping above. Building the
+# inverse mechanically prevents drift: a future contributor adding e.g.
+# DmintAlgo.SCRYPT only needs to extend the byte→enum map, and the
+# enum→byte direction follows automatically.
+_V1_ENUM_TO_ALGO_BYTE: dict[DmintAlgo, int] = {enum: byte for byte, enum in _V1_ALGO_BYTE_TO_ENUM.items()}
+
+
+def build_dmint_v1_state_script(
+    height: int,
+    contract_ref: GlyphRef,
+    token_ref: GlyphRef,
+    max_height: int,
+    reward: int,
+    target: int,
+) -> bytes:
+    """Build the 6-item V1 dMint state script (before OP_STATESEPARATOR).
+
+    Layout (docs/dmint-research-mainnet.md §2.2 offsets 0–94)::
+
+        height(4B LE) | d8 contractRef(36B) | d0 tokenRef(36B) |
+        maxHeight | reward | target(0x08 + 8B LE)
+
+    The target is always pushed as a fixed 8-byte little-endian value
+    (push opcode 0x08, then 8 bytes of payload). This is what
+    distinguishes V1 from V2 in the state-script discriminator at parse
+    time: V2's item 5 is ``algoId`` via ``_push_minimal``, never an
+    8-byte push.
+
+    :raises ValidationError: ``height < 0``; ``max_height < 1``;
+        ``height >= max_height`` (born-exhausted contract); ``reward < 1``;
+        ``target`` not in ``[1, MAX_SHA256D_TARGET]``. The upper target
+        bound is ``MAX_SHA256D_TARGET = 0x7fff...ff`` rather than ``2**64``
+        because Bitcoin script integers are signed: pushing a value with
+        the high bit set produces a negative number on the stack, and the
+        on-chain target comparison would behave wrongly. Photonic Wallet's
+        ``dMintDiffToTarget`` formula always produces a value in this
+        signed-positive range.
+    """
+    if height < 0:
+        raise ValidationError("height must be >= 0")
+    if max_height < 1:
+        raise ValidationError("max_height must be >= 1")
+    if height >= max_height:
+        raise ValidationError(
+            f"height ({height}) must be < max_height ({max_height}); "
+            f"a contract built with height >= max_height is born-exhausted "
+            f"and pool funds would be locked at deploy time"
+        )
+    if reward < 1:
+        raise ValidationError("reward must be >= 1 photon")
+    if not 1 <= target <= MAX_SHA256D_TARGET:
+        raise ValidationError(
+            f"target must be in [1, MAX_SHA256D_TARGET=0x{MAX_SHA256D_TARGET:x}], "
+            f"got {target} (top-bit-set values are negative in Bitcoin script "
+            f"semantics and the on-chain comparison would behave wrongly)"
+        )
+
+    return (
+        _push_4bytes_le(height)
+        + b"\xd8"
+        + contract_ref.to_bytes()
+        + b"\xd0"
+        + token_ref.to_bytes()
+        + _push_minimal(max_height)
+        + _push_minimal(reward)
+        + b"\x08"
+        + struct.pack("<Q", target)
+    )
+
+
+def build_dmint_v1_code_script(algo: DmintAlgo) -> bytes:
+    """Build the V1 dMint code epilogue (the 145 bytes after OP_STATESEPARATOR).
+
+    Returns ``_V1_EPILOGUE_PREFIX + <algo_byte> + _V1_EPILOGUE_SUFFIX`` where
+    ``algo_byte`` is the on-chain hash opcode for the requested algorithm
+    (0xaa SHA256D, 0xee BLAKE3, 0xef K12). The byte sequence matches every
+    V1 contract decoded from mainnet; ``_match_v1_epilogue`` is the inverse.
+
+    :raises ValidationError: ``algo`` is not a recognized :class:`DmintAlgo`
+        value (which would be a programming bug — the enum class enforces
+        membership).
+    """
+    try:
+        algo_byte = _V1_ENUM_TO_ALGO_BYTE[algo]
+    except KeyError as exc:
+        raise ValidationError(f"unsupported V1 algo: {algo!r}") from exc
+    return _V1_EPILOGUE_PREFIX + bytes([algo_byte]) + _V1_EPILOGUE_SUFFIX
+
+
+# 12-byte fingerprint baked into the V1 covenant at offset 148 of the code
+# epilogue. The covenant builds the expected FT-output codescript hash by
+# prepending 0xd0 + tokenRef and appending these 12 bytes, then HASH256s it
+# (`_V1_EPILOGUE_SUFFIX` opcodes 01 d0 53 79 7e 0c <12 bytes> 7e aa). The
+# miner's reward output script must end with these exact bytes so that
+# the FT-conservation check passes.
+# Source: docs/dmint-research-mainnet.md §2.2 offset 148, §4 vout[1] hex.
+_V1_FT_OUTPUT_EPILOGUE = bytes.fromhex("dec0e9aa76e378e4a269e69d")
+
+
+def build_dmint_v1_ft_output_script(
+    miner_pkh: bytes,
+    token_ref: GlyphRef,
+) -> bytes:
+    """Build the 75-byte P2PKH-wrapped FT output that a V1 mint produces.
+
+    Layout (docs/dmint-research-mainnet.md §4 vout[1])::
+
+        76 a9 14 <pkh:20>     OP_DUP OP_HASH160 PUSH20 pkh
+        88 ac                 OP_EQUALVERIFY OP_CHECKSIG    (25-byte P2PKH prologue)
+        bd                    OP_STATESEPARATOR
+        d0 <tokenRef:36>      OP_PUSHINPUTREF tokenRef       (37 bytes)
+        de c0 e9 aa 76 e3     12-byte covenant fingerprint   (`_V1_FT_OUTPUT_EPILOGUE`)
+        78 e4 a2 69 e6 9d
+        ──────────────────────
+        Total: 75 bytes
+
+    This is the **FT-bearing** reward output — the V1 contract's
+    ``OP_CODESCRIPTHASHVALUESUM_OUTPUTS OP_NUMEQUALVERIFY`` at epilogue
+    offset 168 sums photons under this codescript and requires the total
+    to equal the contract's ``reward`` field. Producing a plain P2PKH
+    instead breaks FT conservation and the network rejects the mint.
+
+    :raises ValidationError: ``miner_pkh`` is not 20 bytes.
+    """
+    if len(miner_pkh) != 20:
+        raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
+    p2pkh_prologue = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+    return p2pkh_prologue + _OP_STATESEPARATOR + b"\xd0" + token_ref.to_bytes() + _V1_FT_OUTPUT_EPILOGUE
+
+
+def build_dmint_v1_contract_script(
+    height: int,
+    contract_ref: GlyphRef,
+    token_ref: GlyphRef,
+    max_height: int,
+    reward: int,
+    target: int,
+    algo: DmintAlgo = DmintAlgo.SHA256D,
+) -> bytes:
+    """Build a full V1 dMint output script: state followed by V1 code epilogue.
+
+    Note: V1's code epilogue begins with the OP_STATESEPARATOR byte (0xbd) —
+    see ``_V1_EPILOGUE_PREFIX``. Unlike the V2 builder (which interpolates a
+    separate ``_OP_STATESEPARATOR``), this function concatenates state and
+    epilogue directly. Total length is 241 bytes for typical mainnet
+    parameters (96-byte state + 145-byte epilogue), matching the byte-by-byte
+    decode in docs/dmint-research-mainnet.md §2.2.
+
+    The output of this function round-trips through
+    :meth:`DmintState.from_script` with ``is_v1=True``.
+    """
+    state = build_dmint_v1_state_script(
+        height=height,
+        contract_ref=contract_ref,
+        token_ref=token_ref,
+        max_height=max_height,
+        reward=reward,
+        target=target,
+    )
+    return state + build_dmint_v1_code_script(algo)
+
+
+# ---------------------------------------------------------------------------
 # PoW preimage (same structure as V1 — §2.5 / Appendix B)
 # ---------------------------------------------------------------------------
 
@@ -362,24 +548,39 @@ def build_pow_preimage(
 # ---------------------------------------------------------------------------
 
 
-def build_mint_scriptsig(nonce: bytes, preimage: bytes) -> bytes:
+def build_mint_scriptsig(
+    nonce: bytes,
+    preimage: bytes,
+    *,
+    nonce_width: Literal[4, 8] = 8,
+) -> bytes:
     """Build the scriptSig a miner includes in the contract-spend input.
 
-    Format (SHA256d): <nonce:8B> 20 <inputHash:32B> 20 <outputHash:32B> 00
-    The nonce is 8 bytes (two u32 values concatenated, as in V1).
+    Format (SHA256d):
+        V2 (nonce_width=8): ``<0x08> <nonce:8B> <0x20> <inputHash:32B> <0x20> <outputHash:32B> <0x00>`` → 76 bytes
+        V1 (nonce_width=4): ``<0x04> <nonce:4B> <0x20> <inputHash:32B> <0x20> <outputHash:32B> <0x00>`` → 72 bytes
 
-    :param nonce:    8-byte nonce (found during GPU/CPU mining)
-    :param preimage: 64-byte preimage from build_pow_preimage()
+    The V1 layout is documented in docs/dmint-research-mainnet.md §4 (vin[0]
+    of the mainnet mint trace at ``146a4d68…f3c``). Same shape as V2,
+    differing only in nonce width and corresponding push opcode.
+
+    :param nonce:        nonce_width-bytes nonce (found during mining).
+    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param nonce_width:  4 for V1 contracts, 8 for V2. Keyword-only and
+                         ``Literal[4, 8]`` so a stray positional value is a
+                         type error rather than a silent V1/V2 confusion.
+                         Default 8 preserves pre-V1-support behavior.
     """
-    if len(nonce) != 8:
-        raise ValidationError(f"nonce must be 8 bytes, got {len(nonce)}")
+    if nonce_width not in (4, 8):
+        raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
+    if len(nonce) != nonce_width:
+        raise ValidationError(f"nonce must be {nonce_width} bytes, got {len(nonce)}")
     if len(preimage) != 64:
         raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
-    # Push nonce (8 bytes), then two 32-byte pushes (first/second half of preimage),
-    # then OP_0 (padding for scriptSig structure).
+    # Push opcode = nonce length (works for both 4 and 8 since both are < 0x4C).
     return (
-        b"\x08"
-        + nonce  # PUSH 8 + nonce
+        bytes([nonce_width])
+        + nonce  # PUSH nonce_width + nonce
         + b"\x20"
         + preimage[:32]  # PUSH 32 + inputHash half
         + b"\x20"
@@ -463,7 +664,13 @@ def target_to_difficulty(target: int, algo: DmintAlgo = DmintAlgo.SHA256D) -> in
 # ---------------------------------------------------------------------------
 
 
-def verify_sha256d_solution(preimage: bytes, nonce: bytes, target: int) -> bool:
+def verify_sha256d_solution(
+    preimage: bytes,
+    nonce: bytes,
+    target: int,
+    *,
+    nonce_width: Literal[4, 8] = 8,
+) -> bool:
     """Verify a SHA256d PoW solution.
 
     Valid if: hash[0..4] == 0x00000000 AND int.from_bytes(hash[4..12], 'big') < target
@@ -471,7 +678,15 @@ def verify_sha256d_solution(preimage: bytes, nonce: bytes, target: int) -> bool:
     target is clamped to MAX_SHA256D_TARGET before comparison — a caller-supplied
     target above the maximum would make the check trivially pass for any hash
     that starts with four zero bytes.
+
+    :param nonce_width: 4 for V1 contracts, 8 for V2. Default 8 preserves the
+        pre-V1-support behavior. Passed as keyword-only so a stray positional
+        ``4`` vs ``8`` is a type error rather than a silent V1/V2 confusion.
     """
+    if nonce_width not in (4, 8):
+        raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
+    if len(nonce) != nonce_width:
+        raise ValidationError(f"nonce must be {nonce_width} bytes, got {len(nonce)}")
     if target <= 0:
         return False
     effective_target = min(target, MAX_SHA256D_TARGET)
@@ -480,6 +695,316 @@ def verify_sha256d_solution(preimage: bytes, nonce: bytes, target: int) -> bool:
         return False
     value = int.from_bytes(full[4:12], "big")
     return value < effective_target
+
+
+# ---------------------------------------------------------------------------
+# Reference miner — slow but correct CPU-side nonce search.
+# ---------------------------------------------------------------------------
+#
+# Production miners (glyph-miner with WebGPU, custom C/CUDA) live outside
+# pyrxd. This loop is "slow but correct": it exists so tests can mine a
+# low-difficulty contract end-to-end, and so a determined user can mine a
+# real contract overnight without external tooling.
+#
+# The reference miner calls verify_sha256d_solution per candidate rather than
+# inlining its own hash check. That single source of truth prevents the
+# mining-check-vs-verifier-check drift that would let pyrxd produce a tx
+# whose nonce passes locally but fails on-chain (or vice versa) — the same
+# class of bug as the V1 classifier gap (docs/solutions/logic-errors/
+# dmint-v1-classifier-gap.md). The performance cost of one extra Python
+# call per attempt is negligible compared to the SHA-256d itself.
+
+# Default: ≈minutes single-core at the SHA256d rate of ~1-2M h/s observed on
+# modern x86. A naive `mine_solution()` call against a real-mainnet target
+# would otherwise wedge for hours; callers who want unbounded mining can
+# raise this explicitly.
+DEFAULT_MAX_ATTEMPTS = 600_000_000
+
+
+@dataclass(frozen=True)
+class DmintMineResult:
+    """The output of a successful :func:`mine_solution` call.
+
+    :param nonce:     The nonce bytes (4B for V1, 8B for V2) that satisfy the target.
+    :param attempts:  Number of nonce candidates tried before finding the solution.
+    :param elapsed_s: Wall-clock seconds spent searching.
+    """
+
+    nonce: bytes
+    attempts: int
+    elapsed_s: float
+
+
+def mine_solution(
+    preimage: bytes,
+    target: int,
+    *,
+    algo: DmintAlgo = DmintAlgo.SHA256D,
+    nonce_width: Literal[4, 8] = 4,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+) -> DmintMineResult:
+    """Search for a nonce satisfying the V1/V2 dMint PoW target.
+
+    Sequential nonce sweep starting at 0. The nonce is encoded as a
+    little-endian unsigned integer of the requested width (4 bytes for
+    V1, 8 bytes for V2 — matches glyph-miner's ``nonceBytesForContracts``).
+
+    Calls :func:`verify_sha256d_solution` per candidate; that's the single
+    source of truth for "does this hash satisfy the target." Drift between
+    the mining check and the verifier check would let pyrxd produce a
+    nonce that passes locally but fails on-chain (or vice versa).
+
+    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param target:       8-byte 64-bit target (the V1/V2 contract's ``target`` state field).
+    :param algo:         Hash algorithm. Only SHA256D is implemented; BLAKE3 and K12
+                         raise :class:`NotImplementedError`.
+    :param nonce_width:  4 for V1, 8 for V2. Keyword-only and ``Literal[4, 8]``
+                         so a stray positional value is a type error rather than
+                         a silent V1/V2 confusion.
+    :param max_attempts: Upper bound on iterations before raising
+                         :class:`MaxAttemptsError`. Defaults to ≈minutes
+                         single-core at typical CPython hashlib speeds.
+    :raises ValidationError:   ``preimage`` is not 64 bytes, ``target`` is not positive,
+                               ``nonce_width`` is not 4 or 8, or ``max_attempts`` is < 1.
+    :raises NotImplementedError: ``algo`` is BLAKE3 or K12.
+    :raises MaxAttemptsError:  No solution found within ``max_attempts`` iterations.
+                               The exception's ``attempts`` and ``elapsed_s``
+                               attributes carry telemetry.
+
+    Worked example (small target chosen so the loop completes in ms)::
+
+        >>> from pyrxd.glyph.dmint import (
+        ...     mine_solution, verify_sha256d_solution, MAX_SHA256D_TARGET,
+        ... )
+        >>> preimage = b"\\x00" * 64
+        >>> target = MAX_SHA256D_TARGET >> 8  # easy: ~1 in 256 expected
+        >>> result = mine_solution(preimage, target, nonce_width=4)
+        >>> verify_sha256d_solution(preimage, result.nonce, target, nonce_width=4)
+        True
+    """
+    if len(preimage) != 64:
+        raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
+    if target <= 0:
+        raise ValidationError(f"target must be positive, got {target}")
+    if nonce_width not in (4, 8):
+        raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
+    if max_attempts < 1:
+        raise ValidationError(f"max_attempts must be >= 1, got {max_attempts}")
+    if algo != DmintAlgo.SHA256D:
+        raise NotImplementedError(f"mine_solution: algo {algo.name} not implemented in M1; only SHA256D ships")
+
+    started = time.monotonic()
+    for n in range(max_attempts):
+        nonce = n.to_bytes(nonce_width, "little")
+        if verify_sha256d_solution(preimage, nonce, target, nonce_width=nonce_width):
+            return DmintMineResult(
+                nonce=nonce,
+                attempts=n + 1,
+                elapsed_s=time.monotonic() - started,
+            )
+
+    elapsed = time.monotonic() - started
+    raise MaxAttemptsError(
+        f"no SHA256d solution found in {max_attempts} attempts ({elapsed:.1f}s) for nonce_width={nonce_width}",
+        attempts=max_attempts,
+        elapsed_s=elapsed,
+    )
+
+
+# ---------------------------------------------------------------------------
+# External miner shim
+# ---------------------------------------------------------------------------
+#
+# pyrxd's reference miner is correct but slow (~minutes pure-Python for one
+# real-mainnet RBG claim, vs seconds for a GPU miner). The shim lets users
+# delegate the nonce search to any external process — glyph-miner being the
+# canonical example — without coupling pyrxd to GPU/CUDA/WebGPU dependencies.
+#
+# Wire protocol:
+#   stdin  (one JSON line):  {"preimage_hex": "...", "target_hex": "...",
+#                             "nonce_width": 4 | 8}
+#   stdout (one JSON line):  {"nonce_hex": "...", "attempts": N, "elapsed_s": F}
+#
+# Whatever nonce the external process returns is RE-VERIFIED locally before
+# being returned to the caller. A buggy or malicious miner that returns a
+# wrong nonce raises ValidationError rather than letting pyrxd build a tx
+# the network would reject.
+
+EXTERNAL_MINER_TIMEOUT_S = 600.0  # 10 minutes — generous default for slow contracts
+
+
+def mine_solution_external(
+    preimage: bytes,
+    target: int,
+    *,
+    miner_argv: list[str],
+    nonce_width: Literal[4, 8] = 4,
+    timeout_s: float = EXTERNAL_MINER_TIMEOUT_S,
+) -> DmintMineResult:
+    """Delegate nonce search to an external miner via JSON-over-subprocess.
+
+    Spawns ``miner_argv`` as a subprocess, writes one JSON line to its stdin,
+    reads one JSON line from its stdout, and re-verifies the returned nonce
+    locally. The local re-verification is the load-bearing safety check —
+    a wrong nonce from the external process raises rather than getting
+    silently embedded in a transaction.
+
+    The miner is expected to:
+
+    1. Read one JSON object from stdin: ``{"preimage_hex", "target_hex", "nonce_width"}``
+    2. Search for a valid nonce
+    3. Write one JSON object to stdout: ``{"nonce_hex", "attempts", "elapsed_s"}``
+    4. Exit cleanly
+
+    .. warning::
+       **Supply-chain risk: pyrxd does NOT pin or verify the miner binary.**
+       ``miner_argv[0]`` is resolved by the OS at exec time, so a malicious
+       binary earlier in ``$PATH`` can intercept calls. The local nonce
+       re-verification (below) defends against the miner returning a *wrong*
+       nonce, but cannot detect side-channel exfiltration: a malicious
+       miner sees the preimage (which encodes the contract ref + miner
+       binding) and can leak it out-of-band over the network.
+
+       Mitigations the caller should consider:
+
+       - Invoke with an absolute path (``["/usr/local/bin/glyph-miner", ...]``)
+         rather than a bare name to bypass ``$PATH`` resolution.
+       - Verify the binary's checksum against the upstream release before
+         first use.
+       - Run pyrxd in an environment where ``$PATH`` is controlled (e.g.
+         a dedicated user account, sandbox, or container).
+
+       For testing and trusted environments the bare-name form is fine.
+
+    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param target:       The PoW target.
+    :param miner_argv:   argv passed to :func:`subprocess.run` (e.g.
+                         ``["glyph-miner", "--stdin"]``). The first element
+                         must be a binary or shell-resolvable name; pyrxd
+                         does not pin a specific miner. See the supply-chain
+                         warning above.
+    :param nonce_width:  4 for V1, 8 for V2.
+    :param timeout_s:    Hard timeout. The subprocess is killed and
+                         :class:`MaxAttemptsError` raised on expiry.
+    :raises ValidationError:   The miner returned a malformed JSON response,
+                               a nonce of wrong width, or a nonce that fails
+                               local verification.
+    :raises MaxAttemptsError:  The miner exceeded ``timeout_s``.
+    :raises FileNotFoundError: ``miner_argv[0]`` is not on PATH.
+    """
+    import json
+    import subprocess  # nosec B404 — used to invoke a caller-supplied external miner; see docstring supply-chain warning
+
+    if len(preimage) != 64:
+        raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
+    if target <= 0:
+        raise ValidationError(f"target must be positive, got {target}")
+    if nonce_width not in (4, 8):
+        raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
+    if not miner_argv:
+        raise ValidationError("miner_argv must not be empty")
+
+    request = json.dumps(
+        {
+            "preimage_hex": preimage.hex(),
+            "target_hex": f"{target:016x}",
+            "nonce_width": nonce_width,
+        }
+    )
+
+    started = time.monotonic()
+    try:
+        # miner_argv is caller-controlled by design (this is a plug-in
+        # protocol for external miners); the contract is "you tell pyrxd
+        # which binary to invoke." Local re-verification of the returned
+        # nonce below is the load-bearing safety check, not subprocess
+        # argv sanitization.
+        #
+        # stderr is discarded rather than captured: a misbehaving miner
+        # writing gigabytes to stderr would otherwise OOM the parent before
+        # the timeout fires. Loss of debug info is an acceptable trade for
+        # the bounded-memory guarantee. The subprocess's stdin/stdout
+        # protocol is the only contract; stderr is implementation chatter.
+        completed = subprocess.run(  # noqa: S603 # nosec B603 — see comment + docstring supply-chain warning
+            miner_argv,
+            input=request.encode("utf-8"),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_s,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - started
+        raise MaxAttemptsError(
+            f"external miner {miner_argv[0]!r} did not return a solution within {timeout_s}s",
+            attempts=0,
+            elapsed_s=elapsed,
+        ) from exc
+
+    if completed.returncode != 0:
+        raise ValidationError(f"external miner {miner_argv[0]!r} exited with code {completed.returncode}")
+
+    # Decode stdout. A miner returning malformed UTF-8 is a malformed
+    # response, not an exception that should escape.
+    try:
+        stdout = (completed.stdout or b"").decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValidationError(f"external miner {miner_argv[0]!r} returned non-UTF-8 stdout") from exc
+    if len(stdout) > 4096:
+        raise ValidationError(f"external miner produced {len(stdout)} bytes of stdout; expected one short JSON line")
+    try:
+        response = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"external miner returned non-JSON stdout: {stdout!r}") from exc
+
+    if not isinstance(response, dict):
+        raise ValidationError(f"external miner response must be a JSON object, got {type(response).__name__}")
+    nonce_hex = response.get("nonce_hex")
+    if not isinstance(nonce_hex, str):
+        raise ValidationError(f"external miner response missing or non-string nonce_hex: {response!r}")
+    try:
+        nonce = bytes.fromhex(nonce_hex)
+    except ValueError as exc:
+        raise ValidationError(f"external miner returned non-hex nonce: {nonce_hex!r}") from exc
+    if len(nonce) != nonce_width:
+        raise ValidationError(
+            f"external miner returned nonce of wrong width: got {len(nonce)} bytes, expected {nonce_width}"
+        )
+
+    # Local re-verification: defense against a buggy or malicious miner.
+    if not verify_sha256d_solution(preimage, nonce, target, nonce_width=nonce_width):
+        raise ValidationError(
+            f"external miner returned nonce {nonce.hex()} that fails local SHA256d verification "
+            f"against target {target:#x} — refusing to use it"
+        )
+
+    elapsed = time.monotonic() - started
+    # Trust the miner's self-reported metrics if present, else fall back.
+    # Defense-in-depth against malicious/buggy miner responses:
+    # - attempts capped at 2**40 to prevent log poisoning / aggregator overflow
+    # - elapsed_s rejected if NaN, inf, or negative (json.loads accepts
+    #   "NaN" / "Infinity" via parse_constant; both pass isinstance(_, float))
+    raw_attempts = response.get("attempts", 0)
+    if not isinstance(raw_attempts, int) or raw_attempts < 0 or raw_attempts > (1 << 40):
+        attempts = 0
+    else:
+        attempts = raw_attempts
+    raw_elapsed = response.get("elapsed_s", elapsed)
+    if (
+        not isinstance(raw_elapsed, (int, float))
+        or isinstance(raw_elapsed, bool)  # bools are int subclass — reject explicitly
+        or not math.isfinite(raw_elapsed)
+        or raw_elapsed < 0
+    ):
+        miner_elapsed = elapsed
+    else:
+        miner_elapsed = raw_elapsed
+
+    return DmintMineResult(
+        nonce=nonce,
+        attempts=attempts,
+        elapsed_s=float(miner_elapsed),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -577,11 +1102,9 @@ _V1_EPILOGUE_SUFFIX = bytes.fromhex(
     "6d7551"
 )
 _V1_EPILOGUE_LEN = len(_V1_EPILOGUE_PREFIX) + 1 + len(_V1_EPILOGUE_SUFFIX)
-_V1_ALGO_BYTE_TO_ENUM: dict[int, DmintAlgo] = {
-    0xAA: DmintAlgo.SHA256D,
-    0xEE: DmintAlgo.BLAKE3,
-    0xEF: DmintAlgo.K12,
-}
+# _V1_ALGO_BYTE_TO_ENUM and its inverse _V1_ENUM_TO_ALGO_BYTE are defined
+# earlier in the module (around the V1 builders) so the V1 builder helpers
+# can reference the inverse mapping. Single source of truth: byte→enum.
 
 
 def _match_v1_epilogue(script: bytes, start: int) -> DmintAlgo | None:
@@ -970,7 +1493,10 @@ class DmintContractUtxo:
 
     :param txid:         txid of the UTXO (hex, not reversed)
     :param vout:         output index
-    :param value:        photon value locked in the UTXO (reward pool balance)
+    :param value:        photon value locked in the UTXO. For V1 contracts
+                         this is the singleton carrier (1 photon on the live
+                         RBG-class deploys). For V2 it is the running reward
+                         pool that decrements per mint.
     :param script:       full output script bytes (state + OP_STATESEPARATOR + code)
     :param state:        parsed :class:`DmintState` — caller can obtain via
                          ``DmintState.from_script(script)``
@@ -981,6 +1507,106 @@ class DmintContractUtxo:
     value: int
     script: bytes
     state: DmintState
+
+
+@dataclass(frozen=True)
+class DmintMinerFundingUtxo:
+    """A plain RXD UTXO supplied by the miner to fund a V1 mint.
+
+    The V1 covenant takes its FT output value (``reward`` photons) and the
+    miner's tx fee from a separate plain-RXD input — the contract output is
+    a singleton and never funds the mint. This dataclass describes that
+    funding input.
+
+    The locking script must be a plain script with NO Glyph/FT/dMint
+    ref pushes (``OP_PUSHINPUTREF*``, opcodes 0xd0–0xd8). Spending a
+    token-bearing UTXO as fee silently destroys the token; the V1 mint
+    builder validates this and raises :class:`InvalidFundingUtxoError`
+    if the funding script carries any ref envelope.
+
+    :param txid:    txid of the UTXO (hex, not reversed)
+    :param vout:    output index
+    :param value:   photons locked in the UTXO
+    :param script:  full locking script bytes (typically 25-byte P2PKH)
+    """
+
+    txid: str
+    vout: int
+    value: int
+    script: bytes
+
+
+# Opcodes in the OP_PUSHINPUTREF family — any of these in a candidate
+# funding script (as an *opcode*, not as push-data payload) is grounds
+# for refusing to spend it as fee.
+# 0xd0 OP_PUSHINPUTREF, 0xd1 OP_REQUIREINPUTREF, 0xd2 OP_DISALLOWPUSHINPUTREF,
+# 0xd3 OP_DISALLOWPUSHINPUTREFSIBLING, 0xd4–0xd7 reserved/related,
+# 0xd8 OP_PUSHINPUTREFSINGLETON.
+_FUNDING_REF_OPCODE_RANGE = range(0xD0, 0xD9)
+
+
+def is_token_bearing_script(script: bytes) -> bool:
+    """Return True if ``script`` uses any OP_PUSHINPUTREF-family opcode.
+
+    Walks the script as an opcode stream: push opcodes (0x01..0x4e) consume
+    their payload, and only the *opcode position* bytes are checked against
+    the deny-list. A naive bare-byte scan would falsely flag any P2PKH
+    whose 20-byte hash contains a 0xd0–0xd8 byte (~51% of random
+    addresses), denying about half of honest miners.
+
+    Push opcode encoding (Bitcoin/Radiant script):
+
+    - ``0x01..0x4b``: push the next N bytes (N == opcode value)
+    - ``0x4c`` PUSHDATA1: next 1 byte is length, then push that many
+    - ``0x4d`` PUSHDATA2: next 2 bytes (LE) are length, then push
+    - ``0x4e`` PUSHDATA4: next 4 bytes (LE) are length, then push
+    - everything else: opcode with no payload (advance by 1)
+
+    Truncated push fields are treated as token-bearing — a malformed
+    script of ambiguous length should not be accepted as funding.
+    """
+    pos = 0
+    n = len(script)
+    while pos < n:
+        op = script[pos]
+        if op in _FUNDING_REF_OPCODE_RANGE:
+            return True
+        # Direct push: 1..0x4b bytes follow.
+        if 0x01 <= op <= 0x4B:
+            new_pos = 1 + pos + op
+            if new_pos > n:
+                return True  # truncated push: refuse the funding UTXO
+            pos = new_pos
+            continue
+        if op == 0x4C:  # PUSHDATA1
+            if pos + 1 >= n:
+                return True
+            length = script[pos + 1]
+            new_pos = pos + 2 + length
+            if new_pos > n:
+                return True
+            pos = new_pos
+            continue
+        if op == 0x4D:  # PUSHDATA2
+            if pos + 2 >= n:
+                return True
+            length = int.from_bytes(script[pos + 1 : pos + 3], "little")
+            new_pos = pos + 3 + length
+            if new_pos > n:
+                return True
+            pos = new_pos
+            continue
+        if op == 0x4E:  # PUSHDATA4
+            if pos + 4 >= n:
+                return True
+            length = int.from_bytes(script[pos + 1 : pos + 5], "little")
+            new_pos = pos + 5 + length
+            if new_pos > n:
+                return True
+            pos = new_pos
+            continue
+        pos += 1
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1648,9 @@ def build_dmint_mint_tx(
     miner_pkh: bytes,
     current_time: int,
     fee_rate: int = 10_000,
+    *,
+    funding_utxo: DmintMinerFundingUtxo | None = None,
+    op_return_msg: bytes | None = None,
 ) -> DmintMintResult:
     """Build an unsigned dMint mint transaction.
 
@@ -1080,23 +1709,46 @@ def build_dmint_mint_tx(
     from pyrxd.transaction.transaction_input import TransactionInput
     from pyrxd.transaction.transaction_output import TransactionOutput
 
+    if fee_rate < 1:
+        raise ValidationError(f"fee_rate must be >= 1, got {fee_rate}")
+
     state = contract_utxo.state
 
-    # Reject V1 contracts explicitly. The mint builder rebuilds the output
-    # via ``build_dmint_state_script`` + ``build_dmint_code_script``, both of
-    # which emit V2 covenant code. Spending a V1 contract through this path
-    # would brick it (the recreated UTXO's covenant wouldn't accept the next
-    # mint), and the loss would be irreversible. Until pyrxd ships a V1
-    # contract builder, refuse loudly.
+    # V1 dispatch: V1 contracts have a different state layout, scriptSig
+    # nonce width (4B vs 8B), and no DAA. Branch early-return to keep the V1
+    # path completely separate from V2's DAA-target-update flow rather than
+    # threading conditionals through the V2 logic below.
     if state.is_v1:
+        if funding_utxo is None:
+            raise ValidationError(
+                "V1 mint requires a funding_utxo: V1 contracts are singletons "
+                "(typically 1 photon) and the FT reward + tx fee come from a "
+                "separate plain-RXD input. Pass funding_utxo=DmintMinerFundingUtxo(...) "
+                "as a keyword argument."
+            )
+        if current_time != 0:
+            raise ValidationError(
+                "current_time must be 0 for V1 mints — V1 has no DAA and the "
+                "value would be silently ignored. Pass current_time=0 to make "
+                "the no-op explicit."
+            )
+        return _build_dmint_v1_mint_tx(
+            contract_utxo=contract_utxo,
+            nonce=nonce,
+            miner_pkh=miner_pkh,
+            fee_rate=fee_rate,
+            funding_utxo=funding_utxo,
+            op_return_msg=op_return_msg,
+        )
+
+    if op_return_msg is not None:
         raise ValidationError(
-            "build_dmint_mint_tx cannot mint V1 contracts; only V2 covenant code is "
-            "currently supported. Spending a V1 contract through this path would "
-            "produce a recreated UTXO whose covenant rejects the next mint, "
-            "irreversibly orphaning the remaining contract pool."
+            "op_return_msg is V1-only — V2 mints do not include the Photonic 'msg' OP_RETURN convention by default."
         )
     if state.is_exhausted:
-        raise ValidationError(f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}")
+        raise ContractExhaustedError(
+            f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
+        )
     if len(nonce) != 8:
         raise ValidationError(f"nonce must be 8 bytes, got {len(nonce)}")
     if len(miner_pkh) != 20:
@@ -1177,11 +1829,15 @@ def build_dmint_mint_tx(
     # --- Build reward output script (P2PKH) ---
     reward_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
 
-    # --- Placeholder scriptSig (nonce + dummy preimage zeros) ---
-    # The real preimage requires txid + script hashes which are only available
-    # once outputs are finalised (see docstring). Preimage bytes here are zeros;
-    # a miner loop MUST replace this before broadcast.
-    placeholder_preimage = bytes(64)
+    # --- Placeholder scriptSig (nonce + sentinel preimage 0xff*64) ---
+    # The real preimage requires txid + script hashes which are only
+    # available once outputs are finalised (see docstring). The
+    # placeholder uses 0xff bytes (rather than zeros) as a visibly-invalid
+    # sentinel: a miner loop that forgets to replace it produces a tx
+    # whose covenant rejects fast on the network rather than silently
+    # passing structural checks. Same sentinel used in the V1 path
+    # (see _build_dmint_v1_mint_tx).
+    placeholder_preimage = b"\xff" * 64
     placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage)
 
     # --- Estimate tx size for fee ---
@@ -1212,7 +1868,7 @@ def build_dmint_mint_tx(
     contract_out_value = contract_utxo.value - state.reward - fee
 
     if contract_out_value < 546:
-        raise ValidationError(
+        raise PoolTooSmallError(
             f"Contract UTXO value ({contract_utxo.value}) too small to cover "
             f"reward ({state.reward}) + fee ({fee}): contract output would be "
             f"{contract_out_value} photons, below 546 dust limit."
@@ -1257,6 +1913,224 @@ def build_dmint_mint_tx(
     )
 
 
+def _build_dmint_v1_mint_tx(
+    contract_utxo: DmintContractUtxo,
+    nonce: bytes,
+    miner_pkh: bytes,
+    fee_rate: int,
+    funding_utxo: DmintMinerFundingUtxo,
+    op_return_msg: bytes | None = None,
+) -> DmintMintResult:
+    """Build a V1 dMint mint tx. Internal — dispatched from build_dmint_mint_tx
+    when state.is_v1.
+
+    Mainnet V1 mint transaction shape (docs/dmint-research-mainnet.md §4)::
+
+        vin[0]  contract UTXO          unlocked by build_mint_scriptsig(nonce_4b, preimage)
+        vin[1]  funding UTXO           plain-RXD P2PKH paying reward + fee + change
+        vout[0] recreated contract     value = contract_utxo.value (singleton, no fee taken)
+        vout[1] FT-wrapped reward      75-byte P2PKH+tokenRef, value = state.reward
+        vout[2] OP_RETURN msg          (optional; Photonic-Wallet convention)
+        vout[3] miner change           plain P2PKH, value = funding − reward − fee
+
+    The contract output value is **preserved across mints** — the V1 covenant
+    enforces a singleton, not a value pool. The miner's funding input pays
+    the reward (which lands in the FT carrier output) plus the tx fee, and
+    receives change.
+
+    :raises InvalidFundingUtxoError: ``funding_utxo.script`` contains any
+        OP_PUSHINPUTREF-family opcode (0xd0–0xd8). Spending a token-bearing
+        UTXO as fee silently destroys the token; this is the load-bearing
+        defense against that mistake.
+    :raises ContractExhaustedError: ``state.height >= state.max_height``.
+    :raises PoolTooSmallError:      funding UTXO can't cover reward + fee + change dust.
+    :raises ValidationError:        nonce/miner_pkh length wrong, fee_rate < 1.
+    """
+    from pyrxd.script.script import Script
+    from pyrxd.transaction.transaction import Transaction
+    from pyrxd.transaction.transaction_input import TransactionInput
+    from pyrxd.transaction.transaction_output import TransactionOutput
+
+    state = contract_utxo.state
+
+    if state.is_exhausted:
+        raise ContractExhaustedError(
+            f"V1 dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
+        )
+    if len(nonce) != 4:
+        raise ValidationError(f"V1 nonce must be 4 bytes, got {len(nonce)}")
+    if len(miner_pkh) != 20:
+        raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
+    if fee_rate < 1:
+        raise ValidationError(f"fee_rate must be >= 1, got {fee_rate}")
+
+    # Reject token-bearing funding UTXOs to prevent silent token-burn.
+    if is_token_bearing_script(funding_utxo.script):
+        raise InvalidFundingUtxoError(
+            f"funding_utxo at {funding_utxo.txid}:{funding_utxo.vout} carries an "
+            f"OP_PUSHINPUTREF-family opcode (token envelope) and cannot be spent "
+            f"as fee — that would silently destroy the token. Use a plain RXD UTXO."
+        )
+
+    if op_return_msg is not None and len(op_return_msg) > 80:
+        # Standardness limit: most node policies cap OP_RETURN data at 80 bytes.
+        raise ValidationError(f"op_return_msg too long ({len(op_return_msg)} bytes); standardness limit is 80 bytes")
+
+    # --- Compute updated state. V1 has no DAA, so target is unchanged. ---
+    new_height = state.height + 1
+    updated_state = DmintState(
+        height=new_height,
+        contract_ref=state.contract_ref,
+        token_ref=state.token_ref,
+        max_height=state.max_height,
+        reward=state.reward,
+        algo=state.algo,
+        daa_mode=DaaMode.FIXED,
+        target_time=0,
+        last_time=0,
+        target=state.target,
+        is_v1=True,
+    )
+
+    # --- Output scripts ---
+    contract_script = build_dmint_v1_contract_script(
+        height=new_height,
+        contract_ref=state.contract_ref,
+        token_ref=state.token_ref,
+        max_height=state.max_height,
+        reward=state.reward,
+        target=state.target,
+        algo=state.algo,
+    )
+    # The 75-byte FT-wrapped reward — load-bearing for the V1 covenant's
+    # OP_CODESCRIPTHASHVALUESUM_OUTPUTS conservation check.
+    reward_script = build_dmint_v1_ft_output_script(miner_pkh, state.token_ref)
+    change_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+    op_return_script: bytes | None = None
+    if op_return_msg is not None:
+        # Photonic-Wallet convention (docs/dmint-research-mainnet.md §4 vout[2]):
+        # OP_RETURN PUSH3 "msg" <push-len> <message>
+        # The "msg" marker push is what wallet/explorer parsers key on to
+        # surface the message; without it, the OP_RETURN is just opaque
+        # bytes from the indexer's perspective. The covenant doesn't enforce
+        # this — but we want byte-equivalence with mainnet for ecosystem
+        # compatibility.
+        msg_marker = b"\x03msg"
+        if len(op_return_msg) <= 0x4B:
+            data_push = bytes([len(op_return_msg)]) + op_return_msg
+        else:
+            # PUSHDATA1
+            data_push = b"\x4c" + bytes([len(op_return_msg)]) + op_return_msg
+        op_return_script = b"\x6a" + msg_marker + data_push
+
+    # --- Placeholder scriptSigs.
+    # Contract input: nonce-bearing scriptSig with sentinel 0xff*64 preimage.
+    # The 0xff bytes are visibly-invalid: a miner that forgets to replace
+    # them gets fast network rejection rather than a covenant-fail silent
+    # bug. Mining replaces this whole scriptSig.
+    placeholder_preimage = b"\xff" * 64
+    placeholder_contract_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage, nonce_width=4)
+    # Funding input: 108 zero bytes — the WORST-CASE size of a signed P2PKH
+    # scriptSig. A real signed scriptSig is 106-108 bytes:
+    #   <push-len 0x47..0x49> <DER sig 70-72 bytes + sighash 1 byte>
+    #   <push-len 0x21> <compressed pubkey 33 bytes>
+    # Low-S DER signatures distribute roughly 25/50/25% over 70/71/72 bytes,
+    # so ~25% of real scriptSigs will be 108 bytes. We pad to 108 — over-
+    # estimation by ≤2 bytes is harmless (slight fee over-payment), but
+    # under-estimation causes ~25% of broadcasts to fall under the relay
+    # min-fee floor (fee/size < 10000 photons/byte) and get rejected.
+    # Asymmetric over-padding is the only safe direction.
+    #
+    # Assumes compressed pubkeys (every signing path in pyrxd uses them).
+    # An uncompressed pubkey would push this to ~140 bytes; if a future
+    # caller signs uncompressed, fix the placeholder and this comment.
+    _P2PKH_SCRIPTSIG_MAX_LEN = 108
+    placeholder_funding_scriptsig = b"\x00" * _P2PKH_SCRIPTSIG_MAX_LEN
+
+    # --- Assemble unsigned tx with both placeholder scriptSigs attached so
+    # `len(tx.serialize())` reflects the final on-wire size. Cleaner than
+    # hand-rolling varint accounting and avoids drift between the fee
+    # estimate and the actual tx bytes.
+    padding_output = TransactionOutput(Script(b""), 0)
+
+    contract_src_outputs = [padding_output] * contract_utxo.vout + [
+        TransactionOutput(Script(contract_utxo.script), contract_utxo.value)
+    ]
+    contract_src_tx = Transaction(tx_inputs=[], tx_outputs=contract_src_outputs)
+    contract_src_tx.txid = lambda: contract_utxo.txid  # type: ignore[method-assign]
+
+    funding_src_outputs = [padding_output] * funding_utxo.vout + [
+        TransactionOutput(Script(funding_utxo.script), funding_utxo.value)
+    ]
+    funding_src_tx = Transaction(tx_inputs=[], tx_outputs=funding_src_outputs)
+    funding_src_tx.txid = lambda: funding_utxo.txid  # type: ignore[method-assign]
+
+    contract_input = TransactionInput(
+        source_transaction=contract_src_tx,
+        source_txid=contract_utxo.txid,
+        source_output_index=contract_utxo.vout,
+        unlocking_script_template=None,
+    )
+    contract_input.satoshis = contract_utxo.value
+    contract_input.locking_script = Script(contract_utxo.script)
+    contract_input.unlocking_script = Script(placeholder_contract_scriptsig)
+
+    funding_input = TransactionInput(
+        source_transaction=funding_src_tx,
+        source_txid=funding_utxo.txid,
+        source_output_index=funding_utxo.vout,
+        unlocking_script_template=None,
+    )
+    funding_input.satoshis = funding_utxo.value
+    funding_input.locking_script = Script(funding_utxo.script)
+    # Attach a same-size placeholder so len(tx.serialize()) below reflects
+    # the post-signing size. Caller replaces with the real signature.
+    funding_input.unlocking_script = Script(placeholder_funding_scriptsig)
+
+    # Trial-assemble outputs with a placeholder change value of 0 so we
+    # can serialize the tx, measure its byte length, compute the real
+    # fee, then patch the change output to its final value. The
+    # serialized size doesn't depend on the change-output *value* (the
+    # 8-byte satoshi field is fixed-width regardless), only on its
+    # script length — so the trial measurement matches the final size
+    # exactly.
+    trial_outputs = [
+        TransactionOutput(Script(contract_script), contract_utxo.value),
+        TransactionOutput(Script(reward_script), state.reward),
+    ]
+    if op_return_script:
+        trial_outputs.append(TransactionOutput(Script(op_return_script), 0))
+    change_output = TransactionOutput(Script(change_script), 0)  # value patched below
+    trial_outputs.append(change_output)
+
+    tx = Transaction(
+        tx_inputs=[contract_input, funding_input],
+        tx_outputs=trial_outputs,
+    )
+
+    # The funding input pays:
+    #   - the FT reward output's photons (state.reward, FT carrier value on vout[1])
+    #   - the tx fee (size × fee_rate)
+    #   - the change output back to miner_pkh
+    fee = len(tx.serialize()) * fee_rate
+    change_value = funding_utxo.value - state.reward - fee
+    if change_value < 546:
+        raise PoolTooSmallError(
+            f"funding_utxo ({funding_utxo.value} photons) too small to cover "
+            f"reward ({state.reward}) + fee ({fee}): change would be "
+            f"{change_value} photons, below 546 dust limit."
+        )
+    change_output.satoshis = change_value
+
+    return DmintMintResult(
+        tx=tx,
+        updated_state=updated_state,
+        contract_script=contract_script,
+        reward_script=reward_script,
+        fee=fee,
+    )
+
+
 def _varint_size(n: int) -> int:
     """Return the number of bytes needed to encode ``n`` as a Bitcoin varint."""
     if n < 0xFD:
@@ -1266,3 +2140,171 @@ def _varint_size(n: int) -> int:
     if n <= 0xFFFFFFFF:
         return 5
     return 9
+
+
+# ---------------------------------------------------------------------------
+# Chain-touching helpers (network-side; require an ElectrumXClient)
+# ---------------------------------------------------------------------------
+#
+# These functions touch the network — they live here rather than in
+# pyrxd.network because the protocol logic (token-burn defense,
+# preimage construction binding) is dMint-specific and shouldn't leak
+# into the network layer. Imports are lazy so dmint.py stays
+# light-import for callers that only need the pure builders/parsers.
+
+
+async def find_dmint_funding_utxo(
+    client: Any,
+    miner_address: str,
+    needed: int,
+    *,
+    require_confirmed: bool = True,
+) -> DmintMinerFundingUtxo:
+    """Scan ``miner_address`` for a plain-RXD UTXO that funds a V1 mint.
+
+    Excludes token-bearing UTXOs (FT, NFT, dMint covenant scripts)
+    using :func:`is_token_bearing_script` — the same opcode-aware
+    walker the V1 mint builder enforces. Returns the largest qualifying
+    candidate to minimise change-output dust risk.
+
+    A plain-RXD funding input is what the V1 covenant requires (V1
+    contracts are singletons; reward + fee come from a separate input).
+    Spending an FT/NFT/dMint UTXO as fee silently destroys the token —
+    this scan is the load-bearing defense.
+
+    :param client:             An already-connected ``pyrxd.network.electrumx.ElectrumXClient``.
+    :param miner_address:      Radiant address (R…) of the wallet to scan.
+    :param needed:             Minimum photons the candidate must hold.
+    :param require_confirmed:  Default ``True``. Skip UTXOs with
+        ``height == 0`` (unconfirmed). Picking an unconfirmed UTXO can
+        cause "missing inputs" rejection when the parent tx hasn't
+        propagated to all relays, or leave a dangling tx if the parent
+        gets evicted from mempool. Set ``False`` only if you're
+        deliberately funding from a same-tx chain.
+    :returns:                  The largest qualifying funding UTXO.
+    :raises InvalidFundingUtxoError:
+        No plain-RXD UTXO at ``miner_address`` covers ``needed``. The
+        error message reports counts of (a) token-bearing skipped,
+        (b) too-small skipped, (c) unconfirmed skipped (when
+        ``require_confirmed=True``), and (d) network-error skipped, so
+        the caller can diagnose why the wallet failed the scan.
+    """
+    # Lazy imports so callers that only use the pure builders/parsers
+    # don't pay the import cost of the network and transaction modules.
+    from pyrxd.network.electrumx import script_hash_for_address
+    from pyrxd.security.errors import NetworkError
+    from pyrxd.security.types import Txid
+    from pyrxd.transaction.transaction import Transaction
+
+    raw = await client.get_utxos(script_hash_for_address(miner_address))
+    candidates: list[DmintMinerFundingUtxo] = []
+    skipped_tokens = 0
+    skipped_too_small = 0
+    skipped_unconfirmed = 0
+    skipped_network_error = 0
+
+    for u in raw:
+        if require_confirmed and u.height == 0:
+            skipped_unconfirmed += 1
+            continue
+        try:
+            tx_bytes = await client.get_transaction(Txid(u.tx_hash))
+        except NetworkError:
+            skipped_network_error += 1
+            continue
+        tx = Transaction.from_hex(bytes(tx_bytes))
+        if tx is None or u.tx_pos >= len(tx.outputs):
+            continue
+        script = tx.outputs[u.tx_pos].locking_script.serialize()
+        if is_token_bearing_script(script):
+            skipped_tokens += 1
+            continue
+        if u.value < needed:
+            skipped_too_small += 1
+            continue
+        candidates.append(
+            DmintMinerFundingUtxo(
+                txid=u.tx_hash,
+                vout=u.tx_pos,
+                value=u.value,
+                script=script,
+            )
+        )
+
+    if not candidates:
+        parts = [f"{skipped_tokens} token-bearing", f"{skipped_too_small} too small"]
+        if require_confirmed and skipped_unconfirmed:
+            parts.append(f"{skipped_unconfirmed} unconfirmed")
+        if skipped_network_error:
+            parts.append(f"{skipped_network_error} network-error")
+        raise InvalidFundingUtxoError(
+            f"no plain-RXD funding UTXO at {miner_address} covers {needed} photons (skipped: {', '.join(parts)})"
+        )
+    # Largest-first: minimises change-output dust risk.
+    candidates.sort(key=lambda u: u.value, reverse=True)
+    return candidates[0]
+
+
+def build_dmint_v1_mint_preimage(
+    contract_utxo: DmintContractUtxo,
+    funding_utxo: DmintMinerFundingUtxo,
+    unsigned_tx: Any,
+) -> bytes:
+    """Build the 64-byte V1 mining preimage for an unsigned mint tx.
+
+    The V1 covenant binds the PoW preimage to:
+
+    1. The contract input's outpoint txid + the contract ref
+       (so a nonce mined for one contract slot can't be replayed
+       against another)
+    2. The miner's funding-input locking script
+       (so the miner cannot substitute a different funding source
+       after finding a nonce)
+    3. The OP_RETURN msg output script at vout[2]
+       (Photonic's mainnet-canonical layout; the covenant computes
+       outputHash = SHA256d(this script))
+
+    Layout (matches :func:`build_pow_preimage`)::
+
+        SHA256(txid_LE || contractRef) ||
+        SHA256(SHA256d(input_script) || SHA256d(output_script))
+
+    :param contract_utxo:  The V1 contract UTXO being spent.
+    :param funding_utxo:   The plain-RXD UTXO providing reward + fee.
+    :param unsigned_tx:    The unsigned :class:`Transaction` from
+                           :func:`build_dmint_mint_tx` — vout[2] is
+                           required to be the OP_RETURN msg output
+                           (mainnet-canonical 4-output shape).
+    :returns:              64 bytes ready to feed into :func:`mine_solution`
+                           or :func:`mine_solution_external`.
+    :raises ValidationError:
+        ``unsigned_tx`` has fewer than 4 outputs (no OP_RETURN at vout[2])
+        OR vout[2] is not actually an OP_RETURN script. Build the tx via
+        :func:`build_dmint_mint_tx` with a non-empty ``op_return_msg``;
+        skipping that produces a 3-output tx, and hand-building a 4-output
+        tx with a different vout[2] would silently bind the preimage to
+        wrong bytes (the on-chain covenant would then reject after a
+        successful mine — wasting the mining work).
+    """
+    if len(unsigned_tx.outputs) < 4:
+        raise ValidationError(
+            "V1 mint preimage construction expects an OP_RETURN msg "
+            "output at vout[2] (mainnet-canonical shape). Build the tx "
+            "with op_return_msg set to a non-empty bytes value before "
+            "computing the preimage."
+        )
+    output_script = unsigned_tx.outputs[2].locking_script.serialize()
+    if not output_script or output_script[0] != 0x6A:
+        raise ValidationError(
+            "V1 mint preimage requires vout[2] to be an OP_RETURN script "
+            "(starts with 0x6a). The on-chain covenant binds outputHash "
+            "to vout[2]; a non-OP_RETURN at this position would produce "
+            "a preimage that fails the covenant check after mining."
+        )
+    txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
+    return build_pow_preimage(
+        txid_le=txid_le,
+        contract_ref_bytes=contract_utxo.state.contract_ref.to_bytes(),
+        input_script=funding_utxo.script,
+        output_script=output_script,
+    )

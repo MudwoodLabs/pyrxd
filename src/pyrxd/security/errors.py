@@ -26,9 +26,14 @@ import re
 from typing import Any
 
 __all__ = [
+    "ContractExhaustedError",
     "CovenantError",
+    "DmintError",
+    "InvalidFundingUtxoError",
     "KeyMaterialError",
+    "MaxAttemptsError",
     "NetworkError",
+    "PoolTooSmallError",
     "RxdSdkError",
     "SpvVerificationError",
     "UnsupportedScriptError",
@@ -118,3 +123,37 @@ class UnsupportedScriptError(RxdSdkError):
     Callers should treat this as a hard failure — silently returning "valid"
     for an unrecognised script is a security vulnerability.
     """
+
+
+class DmintError(RxdSdkError):
+    """Base class for dMint-specific errors (mint, deploy, mining)."""
+
+
+class ContractExhaustedError(DmintError):
+    """Raised when a dMint contract has reached its max_height and cannot be minted."""
+
+
+class PoolTooSmallError(DmintError):
+    """Raised when a dMint contract's pool cannot cover reward + fee + dust."""
+
+
+class InvalidFundingUtxoError(DmintError):
+    """Raised when a candidate funding UTXO is itself a token-bearing UTXO.
+
+    Spending an FT or dMint UTXO as fee silently destroys the token. Callers
+    assembling miner inputs must filter out token UTXOs and surface this
+    error if no plain-RXD candidates remain.
+    """
+
+
+class MaxAttemptsError(DmintError):
+    """Raised by ``mine_solution`` when ``max_attempts`` is reached without a solution.
+
+    Carries ``attempts`` and ``elapsed_s`` attributes for telemetry; callers
+    can either widen ``max_attempts`` or escalate to an external miner.
+    """
+
+    def __init__(self, *args: Any, attempts: int = 0, elapsed_s: float = 0.0) -> None:
+        super().__init__(*args)
+        self.attempts = attempts
+        self.elapsed_s = elapsed_s
