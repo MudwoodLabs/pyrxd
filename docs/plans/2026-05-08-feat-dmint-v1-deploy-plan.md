@@ -734,23 +734,35 @@ already-shipped `is_v1=True` parser from M1, and its security-S2
 cross-check mirrors `find_dmint_funding_utxo`'s pattern byte-for-byte.
 It can be implemented in parallel with Phase 2a research.
 
-- [ ] `find_dmint_contract_utxos(client: ElectrumXClient, *, token_ref: GlyphRef, limit: int | None = None, min_confirmations: int = 1) -> list[DmintContractUtxo]`
-  exists in `pyrxd.glyph.dmint`, public. **Type the `client` param
-  properly** (import `ElectrumXClient` under `if TYPE_CHECKING:`,
-  matching the existing M1 wart in `find_dmint_funding_utxo` is
-  acceptable but breaking the `Any`-propagation chain here is
-  preferred).
-- [ ] `limit is None or limit >= 1` validated; `limit=0` rejected
+- [x] `find_dmint_contract_utxos(client, *, token_ref: GlyphRef, initial_state=None, limit=None, min_confirmations=1) -> list[DmintContractUtxo]`
+  exists in `pyrxd.glyph.dmint`, public. Final signature added an
+  `initial_state` kwarg for the fast-path overload (see §2b.1 above
+  for the dual-call-shape rationale). The `client` param is typed
+  `Any` to match the M1 wart in `find_dmint_funding_utxo` — the helper
+  uses lazy imports of `ElectrumXClient`-shape methods, so a
+  `if TYPE_CHECKING` protocol would add ceremony without value here.
+- [x] `limit is None or limit >= 1` validated; `limit=0` rejected
   (avoids confusion with "no limit")
-- [ ] Filters out non-V1 contracts (parsed state where `is_v1=False`)
-- [ ] Empty list returned when no contracts found (not an exception)
-- [ ] **Per security S2**: for each candidate UTXO, verifies
+- [x] Filters out non-V1 contracts in the walk path (parsed state where
+  `is_v1=False`); the fast path only emits V1 contracts by construction
+- [x] Empty list returned when no contracts found (not an exception)
+- [x] **Per security S2**: for each candidate UTXO, verifies
   `tx.txid() == u.tx_hash` AND verifies `tx.outputs[u.tx_pos].locking_script.serialize()`
   byte-equals the expected codescript. Mirrors the M1 round-4 defense
-  in `find_dmint_funding_utxo`.
-- [ ] Covered by mock-client test (token-bearing skip, height filter,
-  `limit` cap, `tx.txid()` cross-check fails on spoofed txid,
-  empty list on no candidates)
+  in `find_dmint_funding_utxo`. Raises `CovenantError` on mismatch.
+- [x] **Hashlock-reuse disambiguation** (surfaced by live-chain smoke
+  test): the walk path filters scripthash-history candidates by
+  "spends `commit_txid:0`" because the same FT-commit hashlock can
+  appear in multiple unrelated txs by the same deployer. See
+  `docs/solutions/logic-errors/dmint-deploy-reveal-hashlock-reuse.md`.
+- [x] Covered by 15 tests in `tests/test_dmint_v1_deploy.py`:
+  input validation, fast path (count, unconfirmed filter, empty,
+  limit), walk path (success, no reveal, wrong token_ref filter,
+  hashlock-reuse disambiguation), S2 (script mismatch, missing
+  vout, honest server).
+- [x] Verified live against GLYPH on public ElectrumX (returns 0
+  unspent fresh contracts — correct because all 32 GLYPH contracts
+  have advanced past initial state).
 
 #### Phase 2b — Multi-input signing
 
