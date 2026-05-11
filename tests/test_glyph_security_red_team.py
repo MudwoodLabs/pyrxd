@@ -26,7 +26,11 @@ import pytest
 
 from pyrxd.glyph.creator import sign_metadata, verify_creator_signature
 from pyrxd.glyph.dmint import MAX_SHA256D_TARGET, verify_sha256d_solution
-from pyrxd.glyph.payload import build_mutable_scriptsig, decode_payload
+from pyrxd.glyph.payload import (
+    _MAX_CBOR_PAYLOAD_BYTES,
+    build_mutable_scriptsig,
+    decode_payload,
+)
 from pyrxd.glyph.types import (
     GlyphCreator,
     GlyphMetadata,
@@ -49,50 +53,45 @@ class TestRT01CborSizeBomb:
     """decode_payload must reject oversized payloads before cbor2.loads()."""
 
     def test_exactly_at_limit_is_accepted(self):
-        """A 64 KB payload that is valid CBOR should decode without error."""
-        # Build a valid CBOR payload that approaches but doesn't exceed 64 KB.
-        # Use a large 'desc' value (~63 KB) — within the 64-char cap after decode,
-        # but the raw CBOR bytes themselves can be large.
-        cbor2.dumps(
-            {
-                "p": [1],  # FT protocol
-                "name": "Bomb Test",
-                "ticker": "BMB",
-                "desc": "x" * 900,  # within field limit
-            }
-        )
-        # Pad to near limit with a key that decode_payload won't choke on
-        # (extra unknown keys are silently ignored)
+        """A payload just under the cap should decode without error.
+
+        The cap is sourced from ``_MAX_CBOR_PAYLOAD_BYTES`` so it tracks
+        any future tuning. Previously hardcoded 64 KB — bumped to 256 KB
+        in M2 to accommodate V1 dMint deploys that embed media (see
+        docs/dmint-research-photonic-deploy.md §4)."""
+        # Pad to near limit with an unknown key that decode_payload ignores.
         big_cbor = cbor2.dumps(
             {
                 "p": [1],
                 "name": "Bomb Test",
                 "ticker": "BMB",
-                # unknown key — ignored by decoder but still in CBOR bytes
-                "_pad": "y" * (64_000 - 50),
+                "_pad": "y" * (_MAX_CBOR_PAYLOAD_BYTES - 100),
             }
         )
-        assert len(big_cbor) <= 65_536
+        assert len(big_cbor) <= _MAX_CBOR_PAYLOAD_BYTES
         # Should not raise — just ignores unknown key
         meta = decode_payload(big_cbor)
         assert meta.name == "Bomb Test"
 
     def test_oversized_payload_raises_before_parse(self):
-        """A payload > 64 KB must be rejected immediately."""
-        oversized = b"\x00" * 65_537
+        """A payload over the cap must be rejected immediately."""
+        oversized = b"\x00" * (_MAX_CBOR_PAYLOAD_BYTES + 1)
         with pytest.raises(ValidationError, match="too large"):
             decode_payload(oversized)
 
     def test_exact_limit_plus_one_rejected(self):
-        # Build a CBOR blob that is definitely > 65536 bytes by using raw bytes directly.
-        # Prepend a minimal valid CBOR map header — the size check fires before cbor2.loads().
-        bomb = b"\xa1" + b"x" * 65_537  # 1-entry CBOR map header + 65537 filler bytes
-        assert len(bomb) > 65_536
+        # Build a CBOR blob that is definitely above the cap. Prepend a
+        # minimal valid CBOR map header — the size check fires before
+        # cbor2.loads() so the contents don't matter.
+        bomb = b"\xa1" + b"x" * (_MAX_CBOR_PAYLOAD_BYTES + 1)
+        assert len(bomb) > _MAX_CBOR_PAYLOAD_BYTES
         with pytest.raises(ValidationError, match="too large"):
             decode_payload(bomb)
 
     def test_crafted_large_attrs_rejected(self):
-        """An attacker could send huge attrs entries — size limit catches it."""
+        """An attacker could send huge attrs entries — size limit catches
+        it (either the payload cap or the attrs-count cap, depending on
+        encoded size)."""
         giant = cbor2.dumps(
             {
                 "p": [1],
@@ -100,7 +99,7 @@ class TestRT01CborSizeBomb:
                 "attrs": {f"k{i}": "v" * 1000 for i in range(70)},
             }
         )
-        if len(giant) > 65_536:
+        if len(giant) > _MAX_CBOR_PAYLOAD_BYTES:
             with pytest.raises(ValidationError, match="too large"):
                 decode_payload(giant)
         else:
