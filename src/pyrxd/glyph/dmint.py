@@ -2421,9 +2421,7 @@ async def find_dmint_contract_utxos(
     from pyrxd.transaction.transaction import Transaction
 
     if token_ref.vout != 0:
-        raise ValidationError(
-            f"token_ref must point at vout=0 of the deploy commit; got vout={token_ref.vout}"
-        )
+        raise ValidationError(f"token_ref must point at vout=0 of the deploy commit; got vout={token_ref.vout}")
     if limit is not None and limit < 1:
         raise ValidationError(f"limit must be >= 1 if supplied, got {limit}")
     if min_confirmations < 0:
@@ -2433,9 +2431,7 @@ async def find_dmint_contract_utxos(
 
     if initial_state is not None:
         if initial_state.num_contracts < 1 or initial_state.num_contracts > 255:
-            raise ValidationError(
-                f"num_contracts must be in [1, 255], got {initial_state.num_contracts}"
-            )
+            raise ValidationError(f"num_contracts must be in [1, 255], got {initial_state.num_contracts}")
         candidates = await _find_v1_contract_utxos_fast(
             client,
             token_ref=token_ref,
@@ -2452,9 +2448,7 @@ async def find_dmint_contract_utxos(
         )
 
     # Security S2 cross-check applied uniformly to whichever shape ran.
-    verified = await _s2_verify_contract_utxos(
-        client, candidates, Txid=Txid, Transaction=Transaction
-    )
+    verified = await _s2_verify_contract_utxos(client, candidates, Txid=Txid, Transaction=Transaction)
 
     if limit is not None:
         verified = verified[:limit]
@@ -2525,9 +2519,7 @@ async def _find_v1_contract_utxos_walk(
     commit_raw = await client.get_transaction(Txid(commit_txid))
     commit_tx = Transaction.from_hex(bytes(commit_raw))
     if commit_tx is None or len(commit_tx.outputs) == 0:
-        raise ValidationError(
-            f"deploy commit {commit_txid} has no outputs or did not parse"
-        )
+        raise ValidationError(f"deploy commit {commit_txid} has no outputs or did not parse")
     commit_vout0_script = commit_tx.outputs[0].locking_script.serialize()
 
     # 2. Find the reveal via scripthash history, then disambiguate by
@@ -2550,8 +2542,7 @@ async def _find_v1_contract_utxos_walk(
         if cand_tx is None:
             continue
         spends_commit_vout0 = any(
-            ti.source_txid == commit_txid and ti.source_output_index == 0
-            for ti in cand_tx.inputs
+            ti.source_txid == commit_txid and ti.source_output_index == 0 for ti in cand_tx.inputs
         )
         if spends_commit_vout0:
             reveal_txid = h_txid
@@ -2617,13 +2608,9 @@ async def _s2_verify_contract_utxos(
         raw = await client.get_transaction(Txid(c.txid))
         tx = Transaction.from_hex(bytes(raw))
         if tx is None:
-            raise CovenantError(
-                f"S2 cross-check: source tx {c.txid} did not parse"
-            )
+            raise CovenantError(f"S2 cross-check: source tx {c.txid} did not parse")
         if tx.txid() != c.txid:
-            raise CovenantError(
-                f"S2 cross-check: server reported txid {c.txid} but tx parses as {tx.txid()}"
-            )
+            raise CovenantError(f"S2 cross-check: server reported txid {c.txid} but tx parses as {tx.txid()}")
         if c.vout >= len(tx.outputs):
             raise CovenantError(
                 f"S2 cross-check: tx {c.txid} has only {len(tx.outputs)} outputs but server claimed vout={c.vout}"

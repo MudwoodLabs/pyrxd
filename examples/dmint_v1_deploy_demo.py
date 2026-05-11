@@ -74,7 +74,6 @@ import asyncio
 import json
 import os
 import sys
-import time
 
 import websockets
 
@@ -93,13 +92,9 @@ from pyrxd.transaction.transaction import Transaction, TransactionInput, Transac
 # Config
 # ---------------------------------------------------------------------------
 
-ELECTRUMX_WS_URL = os.environ.get(
-    "PYRXD_ELECTRUMX", "wss://electrumx.radiant4people.com:50022/"
-)
+ELECTRUMX_WS_URL = os.environ.get("PYRXD_ELECTRUMX", "wss://electrumx.radiant4people.com:50022/")
 DRY_RUN: bool = os.environ.get("DRY_RUN", "1") != "0"
-I_UNDERSTAND: bool = (
-    os.environ.get("I_UNDERSTAND_THIS_IS_REAL", "").strip().lower() == "yes"
-)
+I_UNDERSTAND: bool = os.environ.get("I_UNDERSTAND_THIS_IS_REAL", "").strip().lower() == "yes"
 
 GLYPH_WIF: str = os.environ.get("GLYPH_WIF", "")
 TOKEN_NAME = os.environ.get("TOKEN_NAME", "pyrxd V1 demo")
@@ -452,9 +447,7 @@ def _build_reveal_tx(
     fund.source_transaction = funding_src
     inputs.append(fund)
 
-    outputs: list[TransactionOutput] = [
-        TransactionOutput(Script(s), 1) for s in contract_scripts
-    ]
+    outputs: list[TransactionOutput] = [TransactionOutput(Script(s), 1) for s in contract_scripts]
     if op_return_script is not None:
         outputs.append(TransactionOutput(Script(op_return_script), 0))
     outputs.append(TransactionOutput(p2pkh_lock, change=True))
@@ -477,8 +470,7 @@ async def main() -> None:
 
     if not DRY_RUN and not I_UNDERSTAND:
         print(
-            "ERROR: DRY_RUN=0 requires I_UNDERSTAND_THIS_IS_REAL=yes "
-            "(broadcasts a real mainnet tx).",
+            "ERROR: DRY_RUN=0 requires I_UNDERSTAND_THIS_IS_REAL=yes (broadcasts a real mainnet tx).",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -496,8 +488,7 @@ async def main() -> None:
     print(f"max_height:      {MAX_HEIGHT}")
     print(f"reward_photons:  {REWARD_PHOTONS}")
     print(f"difficulty:      {DIFFICULTY}")
-    print(f"Total supply:    {total_supply:,} photons "
-          f"({NUM_CONTRACTS} × {MAX_HEIGHT} × {REWARD_PHOTONS})")
+    print(f"Total supply:    {total_supply:,} photons ({NUM_CONTRACTS} × {MAX_HEIGHT} × {REWARD_PHOTONS})")
     print(f"DRY_RUN:         {DRY_RUN}")
     print()
 
@@ -526,8 +517,7 @@ async def main() -> None:
     # Commit phase.
     if RESUME_COMMIT_TXID:
         commit_txid = RESUME_COMMIT_TXID
-        print(f"Resuming from commit {commit_txid} (vout {RESUME_COMMIT_VOUT}, "
-              f"{RESUME_COMMIT_VALUE:,} photons)")
+        print(f"Resuming from commit {commit_txid} (vout {RESUME_COMMIT_VOUT}, {RESUME_COMMIT_VALUE:,} photons)")
     else:
         print("Fetching UTXOs and filtering token-bearing...")
         utxos = await fetch_utxos(address)
@@ -578,8 +568,10 @@ async def main() -> None:
 
     # Reveal phase — rebuild contract scripts with the real commit txid.
     reveal_scripts = result.build_reveal_outputs(commit_txid)
-    print(f"Contract scripts built (N={len(reveal_scripts.contract_scripts)}, "
-          f"each {len(reveal_scripts.contract_scripts[0])} bytes)")
+    print(
+        f"Contract scripts built (N={len(reveal_scripts.contract_scripts)}, "
+        f"each {len(reveal_scripts.contract_scripts[0])} bytes)"
+    )
 
     # Need a separate plain funding UTXO for reveal fees (the commit
     # already consumed its inputs; the ref-seeds + FT-commit are all
@@ -620,10 +612,9 @@ async def main() -> None:
     rev_txid = await broadcast(reveal_tx.hex())
     print(f"Broadcast: {rev_txid}")
     print()
-    print(f"Token deployed!")
+    print("Token deployed!")
     print(f"  Token ref:   {commit_txid}:0")
-    print(f"  Contracts:   {NUM_CONTRACTS} parallel UTXOs at "
-          f"{rev_txid}:0..{NUM_CONTRACTS-1}")
+    print(f"  Contracts:   {NUM_CONTRACTS} parallel UTXOs at {rev_txid}:0..{NUM_CONTRACTS - 1}")
     print(f"  Total supply: {total_supply:,} photons")
 
 
