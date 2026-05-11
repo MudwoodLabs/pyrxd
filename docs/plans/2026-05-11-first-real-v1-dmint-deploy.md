@@ -2,11 +2,49 @@
 title: First real-mainnet V1 dMint deploy via pyrxd
 type: plan
 date: 2026-05-11
+status: SHIPPED — deploy confirmed on chain
 ---
 
 # First real-mainnet V1 dMint deploy via pyrxd
 
-## Overview
+## Status: ✅ Shipped 2026-05-11
+
+PXD token (a synthetic test token deployed from a throwaway wallet)
+is the first real V1 dMint deploy via pyrxd. End-to-end verified
+against the live Radiant mainnet.
+
+| Artifact | Value |
+|---|---|
+| **Commit txid** | `1acbb42abce7a508612a8fed8a14ccb5d1f59a3e69434b7df37fb95944de8df5` |
+| **Reveal txid** | `8eeb333943771991c2752abc78038365ecd76b1a24426f7a3212eea71b6a6564` |
+| **Token ref** | `1acbb42a…8df5:0` |
+| **Deployer** | `1MUamwwnkbqcry2kKJW21tFtYAEGLFXke3` (throwaway test wallet) |
+| **Ticker / name / desc** | `PXD` / `pyrxd V1 demo` / `V1 dMint demo deploy via pyrxd` |
+| **Protocol vector** | `p: [1, 4]` (no `v` field, no `dmint:{...}` sub-dict) |
+| **num_contracts** | 4 |
+| **max_height** | 100 |
+| **reward_photons** | 1,000 |
+| **difficulty** | 1 |
+| **Total supply** | 400,000 photons (4 × 100 × 1,000) |
+| **Total cost** | ~24.1M photons (commit 4.12M + reveal 19.98M) |
+
+**Contracts at**: `8eeb3339…6564:0..3`, each at `height=0` (never mined).
+
+**Demo bugs caught + fixed pre-deploy** (PR #66 commit `5b228a3`):
+
+1. vin 0 locking_script was P2PKH instead of the 75-byte FT-commit
+   hashlock — every live broadcast would have failed sighash
+2. `commit_script` not threaded through `_build_reveal_tx`
+3. `target_value` for commit funding was 500K photons (too small —
+   would drop change to dust)
+4. Resume path had no drift detection (changing env vars between
+   commit and resume would silently produce an invalid reveal)
+
+All four caught by code-audit + integration thinking BEFORE any
+broadcast. Regression-locked by 4 new tests in
+`tests/test_dmint_v1_deploy.py::TestDeployDemoRevealWiring`.
+
+## Overview (historical — pre-deploy plan)
 
 M2 (PR #66) shipped byte-equal validation of pyrxd's V1 deploy library
 against the live GLYPH deploy (`a443d9df…878b` / `b965b32d…9dd6`). The
@@ -190,17 +228,24 @@ Once both confirm:
 
 ## Acceptance Criteria
 
-- [ ] Bug 1 + Bug 2 fixed in `examples/dmint_v1_deploy_demo.py`
-- [ ] DRY_RUN output inspected and matches expected shape
-- [ ] Commit tx broadcasts and confirms
-- [ ] Reveal tx broadcasts and confirms
-- [ ] `pyrxd glyph inspect <reveal_txid> --fetch` parses everything
-      cleanly
-- [ ] `find_dmint_contract_utxos(token_ref=...)` returns N
-      unspent contracts (Shape B)
-- [ ] RXinDexer recognises the deploy
+- [x] Bug 1 + Bug 2 fixed in `examples/dmint_v1_deploy_demo.py`
+      (PR #66 commit `5b228a3`; 4 regression tests added)
+- [x] DRY_RUN output inspected and matches expected shape (1 commit-ft
+      + 5 P2PKH, 411 bytes commit tx)
+- [x] Commit tx broadcasts and confirms (`1acbb42a…8df5`, h=428049)
+- [x] Reveal tx broadcasts and confirms (`8eeb3339…6564`, same block)
+- [x] Inspect tool parses both txs end-to-end: 1× commit-ft + 5× p2pkh
+      on commit; 4× dmint + 1× p2pkh on reveal; metadata `p:[1,4]`,
+      ticker=PXD, name="pyrxd V1 demo", desc correct
+- [x] `find_dmint_contract_utxos(token_ref=...)` returns 4 contracts
+      (Shape B walk-from-reveal) — all at `height=0`, each with the
+      right `contractRef[i]` and shared `tokenRef`
+- [ ] RXinDexer recognises the deploy (out-of-band — depends on
+      indexer ingest timing; not required for pyrxd-side acceptance)
 - [ ] M1 mint demo successfully mints from one of the contracts
-- [ ] Token shows up on a block explorer
+      (in progress — Python CPU miner running, ~40 min expected)
+- [ ] Token shows up on a block explorer (out-of-band — explorer
+      ingest timing)
 
 ## Failure modes & contingencies
 
