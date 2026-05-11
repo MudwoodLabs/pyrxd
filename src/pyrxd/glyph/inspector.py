@@ -162,7 +162,14 @@ class GlyphInspector:
         return None
 
     def _parse_reveal_scriptsig(self, scriptsig: bytes) -> GlyphMetadata | None:
-        """Walk the scriptSig push-data stack to find 'gly' marker + CBOR."""
+        """Walk the scriptSig push-data stack to find 'gly' marker + CBOR.
+
+        Handles all four push-data opcodes including OP_PUSHDATA4 (0x4e):
+        V1 dMint deploy reveals on Radiant mainnet carry CBOR bodies > 65535
+        bytes (the GLYPH deploy's body is 65,569 bytes including a PNG), which
+        forces OP_PUSHDATA4. Without 0x4e support the walker bails out
+        before reaching the 'gly' marker that follows it.
+        """
         pos = 0
         items = []
         while pos < len(scriptsig):
@@ -179,6 +186,11 @@ class GlyphInspector:
             elif opcode == 0x4D:  # OP_PUSHDATA2
                 length = int.from_bytes(scriptsig[pos : pos + 2], "little")
                 pos += 2
+                items.append(scriptsig[pos : pos + length])
+                pos += length
+            elif opcode == 0x4E:  # OP_PUSHDATA4
+                length = int.from_bytes(scriptsig[pos : pos + 4], "little")
+                pos += 4
                 items.append(scriptsig[pos : pos + length])
                 pos += length
             else:

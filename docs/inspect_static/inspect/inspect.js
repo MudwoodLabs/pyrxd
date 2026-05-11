@@ -773,6 +773,31 @@ function _detectTxShape(payload) {
     );
   }
 
+  // V1 dMint deploy COMMIT: 1 commit-ft + 1 commit-nft + N ref-seed
+  // P2PKHs (one per parallel contract) + 1 P2PKH change. The mainnet
+  // Glyph Protocol deploy (a443d9df…878b) had 1+1+32+1 = 35 outputs;
+  // the GLYPH reveal (b965b32d…9dd6) consumed every ref-seed to create
+  // 32 parallel dMint contract UTXOs. Heuristic: commit-ft + commit-nft
+  // + at least 3 P2PKHs (a plain Glyph FT deploy normally has at most
+  // 1–2 P2PKH outputs — change + maybe one initial-holder). The N
+  // ref-seeds are 1-photon outputs but we don't have satoshis info per
+  // type, so use count as the discriminator. See
+  // docs/dmint-research-photonic-deploy.md §2 for the byte-by-byte
+  // chain truth.
+  if (has("commit-ft") && has("commit-nft") && (counts["p2pkh"] || 0) >= 3) {
+    const refSeeds = (counts["p2pkh"] || 0) - 1; // subtract the 1 change
+    return (
+      `This is a V1 dMint deploy commit — the first half of a two-step ` +
+      `permissionless-token deployment. The commit-ft output is the ` +
+      `FT-hashlock for the token's metadata reveal; commit-nft is the ` +
+      `auth-NFT hashlock; the remaining ${refSeeds} P2PKH outputs are ` +
+      `1-photon ref-seeds, one per parallel dMint contract. The deploy ` +
+      `reveal that follows will spend all of these to create the same ` +
+      `number of parallel V1 dMint contract UTXOs. See ` +
+      `docs/dmint-research-photonic-deploy.md for the on-chain shape.`
+    );
+  }
+
   // Glyph FT deploy: 1 commit-ft + 1+ ft (or p2pkh holding refs) + 1
   // commit-nft + RXD change. The commit-nft is the protocol-level
   // singleton that every FT deploy carries — NOT a separately-
@@ -818,13 +843,24 @@ function _detectTxShape(payload) {
   // inputs. The contract_ref + token_ref point to the deploy outpoint
   // either way.
   if (dmintOutput) {
+    const dmintCount = counts["dmint"] || 0;
     if (dmintOutput.height === 0 || dmintOutput.height === "0") {
+      // V1 deploy reveal: typically ships N parallel contracts in one
+      // tx (mainnet GLYPH had 32). One-contract deploys are also valid;
+      // distinguish in the banner so callers don't confuse a multi-
+      // contract V1 deploy with a V2 single-contract deploy.
+      const parallel =
+        dmintCount > 1
+          ? `${dmintCount} parallel dMint contract UTXOs, all sharing the ` +
+            `same token_ref. Each contract can be mined from independently, ` +
+            `so claims race in parallel — total supply is reward × ` +
+            `max_height × ${dmintCount}. `
+          : `a single dMint contract UTXO. `;
       return (
-        "This is a dMint contract deploy — a permissionless-mint " +
-        "token whose supply is gated by proof-of-work. Subsequent " +
-        "transactions can spend this output to claim a mint, " +
-        "incrementing the height each time. Anyone can mint until " +
-        "height reaches max_height."
+        `This is a dMint deploy reveal — creates ${parallel}` +
+        `Subsequent transactions can spend any of these to claim a mint, ` +
+        `incrementing that contract's height by 1. Anyone can mint until ` +
+        `the contract reaches max_height.`
       );
     }
     return (
