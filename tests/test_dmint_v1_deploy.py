@@ -1096,3 +1096,244 @@ class TestV1GoldenVectorGlyphPattern:
             state = _State.from_script(s)
             assert state.token_ref.txid == self._COMMIT_TXID
             assert state.contract_ref.vout == i + 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 2b.5: deploy demo regression — locking-script wiring
+# ---------------------------------------------------------------------------
+
+
+class TestDeployDemoRevealWiring:
+    """Regression: ``examples/dmint_v1_deploy_demo.py::_build_reveal_tx``
+    must set every ``TransactionInput.locking_script`` to the actual
+    on-chain script of the UTXO being spent.
+
+    BIP143 sighash computation (Radiant
+    ``src/pyrxd/transaction/transaction_preimage.py`` line 130) hashes
+    ``tx_input.locking_script`` into the preimage. If the demo wires
+    vin 0 (which spends the 75-byte FT-commit hashlock) with a plain
+    25-byte P2PKH locking script, the signature is computed over the
+    wrong preimage and broadcast will fail. This caught a real bug in
+    the M2 demo before any live mainnet broadcast.
+    """
+
+    def _params(self):
+        from pyrxd.glyph.builder import DmintV1DeployParams
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+        from pyrxd.security.types import Hex20
+
+        return DmintV1DeployParams(
+            metadata=GlyphMetadata(
+                protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
+                name="Demo Wiring Test",
+                ticker="DWT",
+            ),
+            owner_pkh=Hex20(b"\x11" * 20),
+            num_contracts=2,
+            max_height=10,
+            reward_photons=1_000,
+            difficulty=1,
+        )
+
+    def _import_demo(self):
+        """The demo imports websockets (and other example-only deps) at
+        module load time. Wrap the import so missing optional deps don't
+        break the test discovery phase."""
+        import importlib
+        import os
+        import sys
+
+        demo_dir = os.path.join(os.path.dirname(__file__), "..", "examples")
+        sys.path.insert(0, demo_dir)
+        try:
+            return importlib.import_module("dmint_v1_deploy_demo")
+        finally:
+            sys.path.pop(0)
+
+    def test_vin_0_locking_script_is_the_commit_hashlock(self):
+        """The most load-bearing assertion: vin 0's locking_script MUST
+        be the 75-byte FT-commit hashlock, NOT a 25-byte P2PKH. A wrong
+        value here makes every signature in the reveal invalid (sighash
+        depends on locking_script)."""
+        from pyrxd.glyph.builder import GlyphBuilder
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PKH
+
+        demo = self._import_demo()
+
+        # Fresh deterministic test key. Address derived from the key.
+        priv = PrivateKey(0xC0DE_C0DE_C0DE_C0DE_C0DE_C0DE_C0DE_C0DE)
+        addr = priv.public_key().address()
+
+        result = GlyphBuilder().prepare_dmint_deploy(self._params())
+        commit_txid = "aa" * 32
+        reveal_scripts = result.build_reveal_outputs(commit_txid)
+
+        # Synthetic funding UTXO — a plain-RXD UTXO at the deployer's address.
+        funding = {
+            "tx_hash": "bb" * 32,
+            "tx_pos": 0,
+            "value": 10_000_000,
+            "height": 1000,
+        }
+        funding_pkh_lock = bytes(P2PKH().lock(addr).serialize())
+
+        reveal_tx = demo._build_reveal_tx(
+            commit_txid=commit_txid,
+            commit_script=result.commit_result.commit_script,
+            num_contracts=2,
+            scriptsig_suffix=reveal_scripts.scriptsig_suffix,
+            contract_scripts=reveal_scripts.contract_scripts,
+            op_return_script=None,
+            funding_utxo=funding,
+            funding_pkh_lock=funding_pkh_lock,
+            private_key=priv,
+            address=addr,
+        )
+
+        # The load-bearing assertion: vin 0 must have the FT-commit
+        # hashlock as its locking_script.
+        commit_script = result.commit_result.commit_script
+        assert reveal_tx.inputs[0].locking_script.serialize() == commit_script
+        # Sanity: the commit script is the 75-byte gly hashlock shape.
+        assert len(commit_script) == 75
+        assert commit_script[:2] == b"\xaa\x20"  # OP_HASH256 + push-32
+
+    def test_ref_seed_and_funding_inputs_use_p2pkh_locking_script(self):
+        """vins 1..N are ref-seed P2PKH spends; vin N+1 is the funding
+        P2PKH. All must have the 25-byte P2PKH locking_script. The
+        deployer address embeds the test key's PKH — both should match."""
+        from pyrxd.glyph.builder import GlyphBuilder
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PKH
+
+        demo = self._import_demo()
+
+        priv = PrivateKey(0xB16_B00B_B16_B00B_B16_B00B_B16_B00B)
+        addr = priv.public_key().address()
+        expected_p2pkh = bytes(P2PKH().lock(addr).serialize())
+
+        result = GlyphBuilder().prepare_dmint_deploy(self._params())
+        commit_txid = "cd" * 32
+        reveal_scripts = result.build_reveal_outputs(commit_txid)
+
+        funding = {
+            "tx_hash": "ef" * 32,
+            "tx_pos": 1,
+            "value": 5_000_000,
+            "height": 1000,
+        }
+
+        reveal_tx = demo._build_reveal_tx(
+            commit_txid=commit_txid,
+            commit_script=result.commit_result.commit_script,
+            num_contracts=2,
+            scriptsig_suffix=reveal_scripts.scriptsig_suffix,
+            contract_scripts=reveal_scripts.contract_scripts,
+            op_return_script=None,
+            funding_utxo=funding,
+            funding_pkh_lock=expected_p2pkh,
+            private_key=priv,
+            address=addr,
+        )
+
+        # vins 1, 2 are ref-seeds; vin 3 is funding. All P2PKH.
+        for i in (1, 2, 3):
+            assert reveal_tx.inputs[i].locking_script.serialize() == expected_p2pkh
+            assert reveal_tx.inputs[i].satoshis is not None
+
+        # vin 0 satoshi value must be 1 (single-photon FT-commit).
+        assert reveal_tx.inputs[0].satoshis == 1
+        # vins 1..N (ref-seeds) are also 1-photon.
+        assert reveal_tx.inputs[1].satoshis == 1
+        assert reveal_tx.inputs[2].satoshis == 1
+        # vin 3 (funding) carries the real photons.
+        assert reveal_tx.inputs[3].satoshis == funding["value"]
+
+    def test_output_count_matches_num_contracts_plus_change(self):
+        """The reveal must have N contract outputs + 1 change output,
+        no extras. (The auth NFT is deferred work — see
+        ``docs/concepts/dmint-v1-deploy.md`` "Deferred work" section.)"""
+        from pyrxd.glyph.builder import GlyphBuilder
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PKH
+
+        demo = self._import_demo()
+
+        priv = PrivateKey(0xDEADBEEF_DEADBEEF_DEADBEEF_DEADBEEF)
+        addr = priv.public_key().address()
+
+        result = GlyphBuilder().prepare_dmint_deploy(self._params())
+        commit_txid = "11" * 32
+        reveal_scripts = result.build_reveal_outputs(commit_txid)
+
+        # Funding value MUST exceed the reveal-tx fee; pyrxd's fee model
+        # drops the change output rather than producing a negative-value
+        # one. At ~10K photons/byte the reveal tx for 2 contracts is well
+        # under 1KB → fee ~10M photons. Use 100M for clear headroom.
+        funding = {"tx_hash": "22" * 32, "tx_pos": 0, "value": 100_000_000, "height": 1000}
+
+        reveal_tx = demo._build_reveal_tx(
+            commit_txid=commit_txid,
+            commit_script=result.commit_result.commit_script,
+            num_contracts=2,
+            scriptsig_suffix=reveal_scripts.scriptsig_suffix,
+            contract_scripts=reveal_scripts.contract_scripts,
+            op_return_script=None,
+            funding_utxo=funding,
+            funding_pkh_lock=bytes(P2PKH().lock(addr).serialize()),
+            private_key=priv,
+            address=addr,
+        )
+
+        # 2 contracts + 1 change = 3 outputs.
+        assert len(reveal_tx.outputs) == 3
+        # Each contract output carries 1 photon. Script length depends on
+        # the push-encoding of reward / max_height / target — 241 bytes for
+        # GLYPH-class params (3-byte pushes), shorter for smaller numbers.
+        for i in range(2):
+            assert reveal_tx.outputs[i].satoshis == 1
+            assert 200 <= len(reveal_tx.outputs[i].locking_script.serialize()) <= 260
+
+    def test_reveal_signs_without_raising(self):
+        """End-to-end: the full reveal tx must construct + sign without
+        any signing failure. Catches integration bugs the per-field
+        assertions above miss (e.g. fee underflow, output ordering)."""
+        from pyrxd.glyph.builder import GlyphBuilder
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PKH
+
+        demo = self._import_demo()
+
+        priv = PrivateKey(0x1234_5678_9ABC_DEF0)
+        addr = priv.public_key().address()
+
+        result = GlyphBuilder().prepare_dmint_deploy(self._params())
+        commit_txid = "33" * 32
+        reveal_scripts = result.build_reveal_outputs(commit_txid)
+
+        funding = {"tx_hash": "44" * 32, "tx_pos": 2, "value": 10_000_000, "height": 1000}
+
+        # If this raises, the demo is broken. The _build_reveal_tx
+        # already calls tx.sign() internally, so any sighash or
+        # signing failure surfaces here.
+        reveal_tx = demo._build_reveal_tx(
+            commit_txid=commit_txid,
+            commit_script=result.commit_result.commit_script,
+            num_contracts=2,
+            scriptsig_suffix=reveal_scripts.scriptsig_suffix,
+            contract_scripts=reveal_scripts.contract_scripts,
+            op_return_script=None,
+            funding_utxo=funding,
+            funding_pkh_lock=bytes(P2PKH().lock(addr).serialize()),
+            private_key=priv,
+            address=addr,
+        )
+
+        # Sanity: every input has a non-empty unlocking script after signing.
+        for i, inp in enumerate(reveal_tx.inputs):
+            us = inp.unlocking_script
+            assert us is not None and len(us.serialize()) > 0, f"vin {i} unlocking script empty after tx.sign()"
+        # Tx serializes without raising.
+        raw = bytes(reveal_tx.serialize())
+        assert len(raw) > 100  # smoke check on serialized size
