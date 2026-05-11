@@ -34,7 +34,6 @@ from pyrxd.glyph.types import GlyphRef
 from pyrxd.security.errors import CovenantError, ValidationError
 from pyrxd.security.types import Txid
 
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -89,8 +88,7 @@ def _wrap_in_tx_with_outputs(
     from pyrxd.transaction.transaction_output import TransactionOutput
 
     tx_inputs = [
-        TransactionInput(source_txid=src_txid, source_output_index=src_idx)
-        for src_txid, src_idx in (inputs or [])
+        TransactionInput(source_txid=src_txid, source_output_index=src_idx) for src_txid, src_idx in (inputs or [])
     ]
     outputs = [TransactionOutput(Script(s), v) for s, v in scripts_with_values]
     tx = Transaction(tx_inputs=tx_inputs, tx_outputs=outputs)
@@ -171,20 +169,14 @@ class TestInputValidation:
     async def test_min_confirmations_must_be_non_negative(self):
         client = _MockElectrumXClient()
         with pytest.raises(ValidationError, match="min_confirmations"):
-            await find_dmint_contract_utxos(
-                client, token_ref=_TOKEN_REF, min_confirmations=-1
-            )
+            await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, min_confirmations=-1)
 
     @pytest.mark.asyncio
     async def test_num_contracts_out_of_range(self):
-        bad_state = DmintV1ContractInitialState(
-            num_contracts=0, reward_sats=1, max_height=1, target=1
-        )
+        bad_state = DmintV1ContractInitialState(num_contracts=0, reward_sats=1, max_height=1, target=1)
         client = _MockElectrumXClient()
         with pytest.raises(ValidationError, match="num_contracts"):
-            await find_dmint_contract_utxos(
-                client, token_ref=_TOKEN_REF, initial_state=bad_state
-            )
+            await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, initial_state=bad_state)
 
 
 # ---------------------------------------------------------------------------
@@ -205,12 +197,8 @@ class TestFastPath:
             txid, raw = _wrap_in_tx_with_outputs([(b"", 0)] * i + [(s, 1)])
             utxos[sh] = [_make_utxo_record(txid, tx_pos=i)]
             tx_bytes[txid] = raw
-        client = _MockElectrumXClient(
-            utxos_by_scripthash=utxos, tx_bytes_by_txid=tx_bytes
-        )
-        result = await find_dmint_contract_utxos(
-            client, token_ref=_TOKEN_REF, initial_state=state
-        )
+        client = _MockElectrumXClient(utxos_by_scripthash=utxos, tx_bytes_by_txid=tx_bytes)
+        result = await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, initial_state=state)
         assert len(result) == 3
         # Each result's state.token_ref must equal our token_ref.
         for r in result:
@@ -230,13 +218,9 @@ class TestFastPath:
             sh1: [_make_utxo_record(txid1, height=100)],  # confirmed
         }
         tx_bytes = {txid0: raw0, txid1: raw1}
-        client = _MockElectrumXClient(
-            utxos_by_scripthash=utxos, tx_bytes_by_txid=tx_bytes
-        )
+        client = _MockElectrumXClient(utxos_by_scripthash=utxos, tx_bytes_by_txid=tx_bytes)
         # Default min_confirmations=1: unconfirmed is skipped.
-        result = await find_dmint_contract_utxos(
-            client, token_ref=_TOKEN_REF, initial_state=state
-        )
+        result = await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, initial_state=state)
         assert len(result) == 1
         assert result[0].txid == txid1
 
@@ -251,9 +235,7 @@ class TestFastPath:
         """No UTXOs at any expected scripthash → empty list, no error."""
         state = _initial_state(num=2)
         client = _MockElectrumXClient()  # no canned utxos
-        result = await find_dmint_contract_utxos(
-            client, token_ref=_TOKEN_REF, initial_state=state
-        )
+        result = await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, initial_state=state)
         assert result == []
 
     @pytest.mark.asyncio
@@ -267,12 +249,8 @@ class TestFastPath:
             txid, raw = _wrap_in_tx_with_outputs([(b"", 0)] * i + [(s, 1)])
             utxos[sh] = [_make_utxo_record(txid, tx_pos=i)]
             tx_bytes[txid] = raw
-        client = _MockElectrumXClient(
-            utxos_by_scripthash=utxos, tx_bytes_by_txid=tx_bytes
-        )
-        result = await find_dmint_contract_utxos(
-            client, token_ref=_TOKEN_REF, initial_state=state, limit=2
-        )
+        client = _MockElectrumXClient(utxos_by_scripthash=utxos, tx_bytes_by_txid=tx_bytes)
+        result = await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, initial_state=state, limit=2)
         assert len(result) == 2
 
 
@@ -288,9 +266,7 @@ class TestWalkFromReveal:
         the helper finds both contract UTXOs without being told the params."""
         # Build a "commit" with a synthetic vout 0 (just any non-empty script).
         commit_vout0_script = bytes.fromhex("aa20" + "00" * 32 + "88")  # short, non-V1
-        commit_txid_real, commit_raw = _wrap_in_tx_with_outputs(
-            [(commit_vout0_script, 1)]
-        )
+        commit_txid_real, commit_raw = _wrap_in_tx_with_outputs([(commit_vout0_script, 1)])
         # Token ref must point at this synthetic commit's vout 0.
         token_ref = GlyphRef(txid=Txid(commit_txid_real), vout=0)
         commit_sh = _scripthash_hex(commit_vout0_script)
@@ -347,16 +323,12 @@ class TestWalkFromReveal:
     async def test_returns_empty_when_reveal_not_yet_broadcast(self):
         """Commit exists; history has only the commit; no reveal yet."""
         commit_vout0_script = bytes.fromhex("aa2000" + "00" * 32)
-        commit_txid_real, commit_raw = _wrap_in_tx_with_outputs(
-            [(commit_vout0_script, 1)]
-        )
+        commit_txid_real, commit_raw = _wrap_in_tx_with_outputs([(commit_vout0_script, 1)])
         token_ref = GlyphRef(txid=Txid(commit_txid_real), vout=0)
         commit_sh = _scripthash_hex(commit_vout0_script)
         client = _MockElectrumXClient(
             tx_bytes_by_txid={commit_txid_real: commit_raw},
-            history_by_scripthash={
-                commit_sh: [{"tx_hash": commit_txid_real, "height": 100}]
-            },
+            history_by_scripthash={commit_sh: [{"tx_hash": commit_txid_real, "height": 100}]},
         )
         result = await find_dmint_contract_utxos(client, token_ref=token_ref)
         assert result == []
@@ -422,9 +394,7 @@ class TestWalkFromReveal:
             ],
         }
         utxos = {
-            _scripthash_hex(contract_script): [
-                _make_utxo_record(real_reveal_txid, tx_pos=0)
-            ],
+            _scripthash_hex(contract_script): [_make_utxo_record(real_reveal_txid, tx_pos=0)],
         }
         tx_bytes = {
             failed_attempt_txid: failed_raw,
@@ -448,9 +418,7 @@ class TestWalkFromReveal:
         """A reveal that contains a V1 contract for a *different* token must
         be filtered out — token_ref mismatch."""
         commit_vout0_script = bytes.fromhex("aa2001" + "00" * 32)
-        commit_txid_real, commit_raw = _wrap_in_tx_with_outputs(
-            [(commit_vout0_script, 1)]
-        )
+        commit_txid_real, commit_raw = _wrap_in_tx_with_outputs([(commit_vout0_script, 1)])
         token_ref = GlyphRef(txid=Txid(commit_txid_real), vout=0)
         commit_sh = _scripthash_hex(commit_vout0_script)
 
@@ -479,14 +447,10 @@ class TestWalkFromReveal:
         )
 
         utxos = {
-            _scripthash_hex(good_script): [
-                _make_utxo_record(reveal_txid_real, tx_pos=0)
-            ],
+            _scripthash_hex(good_script): [_make_utxo_record(reveal_txid_real, tx_pos=0)],
             # other_script's UTXO would also be unspent, but it shouldn't
             # be returned — the helper filters by token_ref.
-            _scripthash_hex(other_script): [
-                _make_utxo_record(reveal_txid_real, tx_pos=1)
-            ],
+            _scripthash_hex(other_script): [_make_utxo_record(reveal_txid_real, tx_pos=1)],
         }
         history = {
             commit_sh: [
@@ -536,9 +500,7 @@ class TestSecurityS2:
             tx_bytes_by_txid={bogus_txid: bogus_raw},
         )
         with pytest.raises(CovenantError, match="script mismatch"):
-            await find_dmint_contract_utxos(
-                client, token_ref=_TOKEN_REF, initial_state=state
-            )
+            await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, initial_state=state)
 
     @pytest.mark.asyncio
     async def test_raises_on_missing_vout(self):
@@ -552,9 +514,7 @@ class TestSecurityS2:
             tx_bytes_by_txid={txid: raw},
         )
         with pytest.raises(CovenantError, match="vout"):
-            await find_dmint_contract_utxos(
-                client, token_ref=_TOKEN_REF, initial_state=state
-            )
+            await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, initial_state=state)
 
     @pytest.mark.asyncio
     async def test_passes_when_source_tx_matches(self):
@@ -568,9 +528,7 @@ class TestSecurityS2:
             utxos_by_scripthash={sh: [_make_utxo_record(txid, tx_pos=0)]},
             tx_bytes_by_txid={txid: raw},
         )
-        result = await find_dmint_contract_utxos(
-            client, token_ref=_TOKEN_REF, initial_state=state
-        )
+        result = await find_dmint_contract_utxos(client, token_ref=_TOKEN_REF, initial_state=state)
         assert len(result) == 1
         # The returned DmintContractUtxo's script must round-trip parse to V1.
         parsed = DmintState.from_script(result[0].script)
@@ -759,9 +717,7 @@ class TestPrepareDmintDeployDispatch:
             GlyphBuilder,
         )
 
-        result = GlyphBuilder().prepare_dmint_deploy(
-            self._v2_params(), allow_v2_deploy=True
-        )
+        result = GlyphBuilder().prepare_dmint_deploy(self._v2_params(), allow_v2_deploy=True)
         assert isinstance(result, DmintV2DeployResult)
         assert not isinstance(result, DmintV1DeployResult)
 
@@ -872,9 +828,7 @@ class TestDmintV1DeployResult:
     def test_op_return_msg_emitted_when_set(self):
         from pyrxd.glyph.builder import GlyphBuilder
 
-        result = GlyphBuilder().prepare_dmint_deploy(
-            self._params(op_return_msg=b"hello")
-        )
+        result = GlyphBuilder().prepare_dmint_deploy(self._params(op_return_msg=b"hello"))
         reveal = result.build_reveal_outputs("00" * 32)
         assert reveal.op_return_script is not None
         # OP_RETURN 0x6a + 1-byte push opcode (0x05) + "hello"
@@ -927,7 +881,8 @@ class TestDeprecationAliases:
             DmintDeployResult,
             DmintV2DeployResult,
         )
-        from pyrxd.glyph.dmint import DmintAlgo as _Algo, DmintDeployParams, DaaMode
+        from pyrxd.glyph.dmint import DaaMode, DmintDeployParams
+        from pyrxd.glyph.dmint import DmintAlgo as _Algo
         from pyrxd.glyph.types import GlyphRef
         from pyrxd.security.types import Hex20
 
@@ -1057,8 +1012,12 @@ class TestV1GoldenVectorGlyphPattern:
     # state[87..95] = 08 74da40a70d74da00  (target LE = 0x00da740da740da74)
     _GLYPH_CONTRACT_0_HEX = (
         "0400000000"
-        "d8" "8b87c3c771b1a9f5015a4f26bfd80979ed196b5366257a6f30929646dfd943a4" "01000000"
-        "d0" "8b87c3c771b1a9f5015a4f26bfd80979ed196b5366257a6f30929646dfd943a4" "00000000"
+        "d8"
+        "8b87c3c771b1a9f5015a4f26bfd80979ed196b5366257a6f30929646dfd943a4"
+        "01000000"
+        "d0"
+        "8b87c3c771b1a9f5015a4f26bfd80979ed196b5366257a6f30929646dfd943a4"
+        "00000000"
         "036889090350c3000874da40a70d74da00"
         "bd5175c0c855797ea8597959797ea87e5a7a7eaabc01147f77587f040000000088817600a269a269577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7eaa76e47b9d547a818b76537a9c537ade789181547ae6939d635279cd01d853797e016a7e886778de519d547854807ec0eb557f777e5379ec78885379eac0e9885379cc519d75686d7551"
     )
@@ -1069,6 +1028,8 @@ class TestV1GoldenVectorGlyphPattern:
         This is the strongest possible test: real chain truth as oracle."""
         from pyrxd.glyph.dmint import (
             DmintAlgo as _Algo,
+        )
+        from pyrxd.glyph.dmint import (
             build_dmint_v1_contract_script,
         )
         from pyrxd.glyph.types import GlyphRef
@@ -1097,12 +1058,12 @@ class TestV1GoldenVectorGlyphPattern:
         build_reveal_outputs with GLYPH-equivalent params produces a
         reveal vout 0 byte-equal to the on-chain reveal."""
         from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
-        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
-        from pyrxd.security.types import Hex20
 
         # difficulty maps to target via difficulty_to_target — for the
         # exact on-chain GLYPH target we need to reverse the conversion.
         from pyrxd.glyph.dmint import MAX_SHA256D_TARGET
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+        from pyrxd.security.types import Hex20
 
         difficulty = MAX_SHA256D_TARGET // self._TARGET
 

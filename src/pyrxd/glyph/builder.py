@@ -345,9 +345,7 @@ class GlyphBuilder:
 
         assert_never(params)
 
-    def _prepare_dmint_v1_deploy(
-        self, params: DmintV1DeployParams
-    ) -> DmintV1DeployResult:
+    def _prepare_dmint_v1_deploy(self, params: DmintV1DeployParams) -> DmintV1DeployResult:
         """Build the V1 deploy commit + placeholder contract scripts.
 
         Mirrors the on-chain shape decoded in
@@ -397,8 +395,7 @@ class GlyphBuilder:
         decoded = cbor2.loads(cbor_bytes)
         if "p" not in decoded or 1 not in decoded["p"] or 4 not in decoded["p"]:
             raise ValidationError(
-                f"V1 dMint CBOR 'p' field must include both 1 (FT) and 4 "
-                f"(DMINT); got p={decoded.get('p')!r}"
+                f"V1 dMint CBOR 'p' field must include both 1 (FT) and 4 (DMINT); got p={decoded.get('p')!r}"
             )
 
         # 2. Build the FT-commit hashlock (75-byte script — exactly the
@@ -883,21 +880,16 @@ class DmintV1DeployParams:
         if self.max_height < 1:
             raise ValidationError(f"max_height must be >= 1, got {self.max_height}")
         if self.max_height > 0xFFFFFF:
-            raise ValidationError(
-                f"max_height ({self.max_height}) exceeds V1's 3-byte ceiling (0xFFFFFF)"
-            )
+            raise ValidationError(f"max_height ({self.max_height}) exceeds V1's 3-byte ceiling (0xFFFFFF)")
         if self.reward_photons < 1:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
         if self.reward_photons > 0xFFFFFF:
-            raise ValidationError(
-                f"reward_photons ({self.reward_photons}) exceeds V1's 3-byte ceiling (0xFFFFFF)"
-            )
+            raise ValidationError(f"reward_photons ({self.reward_photons}) exceeds V1's 3-byte ceiling (0xFFFFFF)")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
         if self.algo != DmintAlgo.SHA256D:
             raise ValidationError(
-                f"V1 dMint only supports SHA256d; got {self.algo}. "
-                f"Use DmintV2DeployParams for blake3/k12."
+                f"V1 dMint only supports SHA256d; got {self.algo}. Use DmintV2DeployParams for blake3/k12."
             )
 
 
@@ -1120,13 +1112,9 @@ class DmintV1DeployResult:
             if len(msg) <= 75:
                 op_return_script = bytes([0x6A, len(msg)]) + msg
             elif len(msg) <= 255:
-                op_return_script = (
-                    bytes([0x6A, 0x4C, len(msg)]) + msg
-                )  # OP_RETURN OP_PUSHDATA1 <len> <msg>
+                op_return_script = bytes([0x6A, 0x4C, len(msg)]) + msg  # OP_RETURN OP_PUSHDATA1 <len> <msg>
             else:
-                raise ValidationError(
-                    f"op_return_msg too long: {len(msg)} bytes (cap at 255 for now)"
-                )
+                raise ValidationError(f"op_return_msg too long: {len(msg)} bytes (cap at 255 for now)")
 
         return DmintV1RevealScripts(
             contract_scripts=contract_scripts,

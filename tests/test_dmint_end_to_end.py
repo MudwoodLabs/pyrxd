@@ -11,7 +11,6 @@ from __future__ import annotations
 import pytest
 
 from pyrxd.glyph.builder import (
-    DmintFullDeployParams,
     DmintV2DeployParams,
     DmintV2DeployResult,
     GlyphBuilder,
