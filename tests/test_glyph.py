@@ -381,10 +381,19 @@ class TestScriptSigSuffix:
         assert suffix[5] == len(cbor_bytes)
 
     def test_oversized_payload_raises(self):
-        # 65536+ bytes cbor payload
-        huge_cbor = bytes(65536)
+        # The hard cap moved from 65535 (PUSHDATA2) to 262144 (PUSHDATA4)
+        # in 0.5.0 per red-team finding R3 — mainnet GLYPH reveals exceed
+        # the old PUSHDATA2 limit. 65536 is now accepted; only > 262144
+        # raises.
+        too_big = bytes(262_145)
         with pytest.raises(ValidationError, match="too large"):
-            build_reveal_scriptsig_suffix(huge_cbor)
+            build_reveal_scriptsig_suffix(too_big)
+
+    def test_payload_at_pushdata4_boundary_accepted(self):
+        """65 536 bytes — first byte of PUSHDATA4 territory — is accepted."""
+        boundary_cbor = bytes(65536)
+        suffix = build_reveal_scriptsig_suffix(boundary_cbor)
+        assert suffix[4] == 0x4E  # OP_PUSHDATA4
 
 
 # ---------------------------------------------------------------------------

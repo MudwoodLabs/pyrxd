@@ -421,6 +421,15 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
     inspector = GlyphInspector()
     scriptsigs = [bytes(inp.unlocking_script.serialize()) for inp in tx.inputs]
     found = inspector.find_reveal_metadata(scriptsigs)
+
+    # dMint mint-claim scriptSig: if vin[0] is a dMint mint claim (4 canonical
+    # pushes — nonce, inputHash, outputHash, OP_0), decode it for display.
+    # NOT raised; returns None for non-mint inputs (P2PKH funding inputs,
+    # plain RXD spends, reveal scriptSigs, etc.). The V1/V2 distinction
+    # falls out of the nonce push width (4 vs 8 bytes).
+    mint_scriptsig: dict | None = None
+    if scriptsigs:
+        mint_scriptsig = inspector.parse_mint_scriptsig(scriptsigs[0])
     metadata_payload: dict | None = None
     if found is not None:
         input_idx, metadata = found
@@ -449,4 +458,5 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
         "output_count": len(tx.outputs),
         "outputs": output_rows,
         "metadata": metadata_payload,
+        "mint_scriptsig": mint_scriptsig,
     }
