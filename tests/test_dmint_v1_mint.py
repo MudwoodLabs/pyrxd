@@ -638,30 +638,32 @@ class TestBuildDmintMintTxV1:
 class TestBuildMintScriptsigV1:
     def test_v1_scriptsig_layout(self):
         nonce = bytes.fromhex("01020304")
-        preimage = b"\xaa" * 64
-        sig = build_mint_scriptsig(nonce, preimage, nonce_width=4)
+        input_hash = b"\xaa" * 32
+        output_hash = b"\xbb" * 32
+        sig = build_mint_scriptsig(nonce, input_hash, output_hash, nonce_width=4)
         assert len(sig) == 72
         assert sig[0:5] == b"\x04" + nonce
         assert sig[5] == 0x20
-        assert sig[6:38] == preimage[:32]
+        assert sig[6:38] == input_hash
         assert sig[38] == 0x20
-        assert sig[39:71] == preimage[32:]
+        assert sig[39:71] == output_hash
         assert sig[71] == 0x00
 
     def test_v2_default_scriptsig_layout(self):
         nonce = bytes.fromhex("0102030405060708")
-        preimage = b"\xbb" * 64
-        sig = build_mint_scriptsig(nonce, preimage)  # default nonce_width=8
+        input_hash = b"\xcc" * 32
+        output_hash = b"\xdd" * 32
+        sig = build_mint_scriptsig(nonce, input_hash, output_hash)  # default nonce_width=8
         assert len(sig) == 76
         assert sig[0:9] == b"\x08" + nonce
 
     def test_wrong_nonce_width_raises(self):
         with pytest.raises(ValidationError, match="nonce_width"):
-            build_mint_scriptsig(b"\x00" * 4, b"\x00" * 64, nonce_width=6)  # type: ignore[arg-type]
+            build_mint_scriptsig(b"\x00" * 4, b"\x00" * 32, b"\x00" * 32, nonce_width=6)  # type: ignore[arg-type]
 
     def test_nonce_length_mismatch_raises(self):
         with pytest.raises(ValidationError, match="nonce must be"):
-            build_mint_scriptsig(b"\x00" * 8, b"\x00" * 64, nonce_width=4)
+            build_mint_scriptsig(b"\x00" * 8, b"\x00" * 32, b"\x00" * 32, nonce_width=4)
 
 
 # ---------------------------------------------------------------------------
@@ -1056,10 +1058,34 @@ class TestBuildDmintV1MintPreimage:
         )
         return utxo, funding, result.tx
 
-    def test_returns_64_bytes(self):
+    def test_returns_pow_preimage_result(self):
         utxo, funding, tx = self._build_for_test()
-        preimage = build_dmint_v1_mint_preimage(utxo, funding, tx)
-        assert len(preimage) == 64
+        result = build_dmint_v1_mint_preimage(utxo, funding, tx)
+        assert len(result.preimage) == 64
+        assert len(result.input_hash) == 32
+        assert len(result.output_hash) == 32
+
+    def test_input_hash_is_sha256d_of_funding_script(self):
+        """The covenant pulls inputHash from the scriptSig push and expects
+        it to equal SHA256d(funding_script). Verified against mainnet mint
+        ``146a4d68…f3c``."""
+        import hashlib
+
+        utxo, funding, tx = self._build_for_test()
+        result = build_dmint_v1_mint_preimage(utxo, funding, tx)
+        expected = hashlib.sha256(hashlib.sha256(funding.script).digest()).digest()
+        assert result.input_hash == expected
+
+    def test_output_hash_is_sha256d_of_vout2_script(self):
+        """The covenant pulls outputHash from the scriptSig push and expects
+        it to equal SHA256d(vout[2] OP_RETURN script)."""
+        import hashlib
+
+        utxo, funding, tx = self._build_for_test(op_return_msg=b"witness")
+        result = build_dmint_v1_mint_preimage(utxo, funding, tx)
+        vout2_script = tx.outputs[2].locking_script.serialize()
+        expected = hashlib.sha256(hashlib.sha256(vout2_script).digest()).digest()
+        assert result.output_hash == expected
 
     def test_preimage_changes_with_funding_script(self):
         """Different funding scripts produce different preimages — the
@@ -1075,7 +1101,7 @@ class TestBuildDmintV1MintPreimage:
         utxo, _, tx_b = self._build_for_test()
         pre_a = build_dmint_v1_mint_preimage(utxo, funding_a, tx_a)
         pre_b = build_dmint_v1_mint_preimage(utxo, funding_b, tx_b)
-        assert pre_a != pre_b
+        assert pre_a.preimage != pre_b.preimage
 
     def test_preimage_changes_with_op_return_msg(self):
         """Different OP_RETURN msgs produce different preimages — the
@@ -1084,7 +1110,7 @@ class TestBuildDmintV1MintPreimage:
         _, _, tx_b = self._build_for_test(op_return_msg=b"beta")
         pre_a = build_dmint_v1_mint_preimage(utxo, funding, tx_a)
         pre_b = build_dmint_v1_mint_preimage(utxo, funding, tx_b)
-        assert pre_a != pre_b
+        assert pre_a.preimage != pre_b.preimage
 
     def test_refuses_tx_without_op_return_at_vout2(self):
         """Building a tx without op_return_msg only yields 3 outputs;
@@ -1148,7 +1174,214 @@ class TestBuildDmintV1MintPreimage:
             input_script=funding.script,
             output_script=tx.outputs[2].locking_script.serialize(),
         )
-        assert actual == expected
+        assert actual.preimage == expected.preimage
+        assert actual.input_hash == expected.input_hash
+        assert actual.output_hash == expected.output_hash
+
+
+# ---------------------------------------------------------------------------
+# 8a. Covenant-shape regression: scriptSig pushes match preimage halves
+# ---------------------------------------------------------------------------
+
+
+class TestCovenantShape:
+    """The V1 covenant pulls inputHash/outputHash from the scriptSig
+    pushes and recomputes ``H2 = SHA256(input_push || output_push)``,
+    then hashes ``H1 || H2 || nonce`` to check PoW. If the scriptSig
+    pushes don't match what the miner folded into the preimage, the
+    chain rejects the mint with ``mandatory-script-verify-flag-failed
+    (OP_EQUALVERIFY)`` AFTER the miner has done the work.
+
+    The shipped M1 implementation (before this fix) pushed the preimage
+    halves themselves into the scriptSig instead of the raw script
+    hashes, so the covenant computed
+    ``H2_covenant = SHA256(preimage[0..32] || preimage[32..64])`` which
+    is NOT equal to ``preimage[32..64]``. Every successful mine got
+    rejected.
+
+    This test pins the convention against future regression by simulating
+    exactly what the covenant computes from the scriptSig bytes alone
+    and asserting it matches the preimage the miner solved.
+    """
+
+    def test_covenant_recomputes_h2_from_scriptsig_pushes_equals_preimage_half2(self):
+        import hashlib
+
+        from pyrxd.glyph.dmint import build_mint_scriptsig, build_pow_preimage
+
+        # Fixed test vector — exact bytes are arbitrary, but the
+        # round-trip property must hold for ANY scripts.
+        txid_le = bytes.fromhex("ab" * 32)
+        contract_ref_bytes = bytes.fromhex("cd" * 36)
+        input_script = bytes.fromhex("76a914" + "ef" * 20 + "88ac")  # P2PKH
+        output_script = bytes.fromhex("6a03") + b"msg" + b"\x05hello"  # OP_RETURN
+        nonce = bytes.fromhex("01020304")
+
+        result = build_pow_preimage(txid_le, contract_ref_bytes, input_script, output_script)
+        scriptsig = build_mint_scriptsig(nonce, result.input_hash, result.output_hash, nonce_width=4)
+
+        # Parse the two 32-byte hashes back out of the scriptSig exactly as
+        # the on-chain interpreter would (it pushes them onto the stack).
+        # Layout: 0x04 <nonce:4> 0x20 <inputHash:32> 0x20 <outputHash:32> 0x00
+        assert scriptsig[0] == 0x04
+        assert scriptsig[1:5] == nonce
+        assert scriptsig[5] == 0x20
+        scriptsig_input_hash = scriptsig[6:38]
+        assert scriptsig[38] == 0x20
+        scriptsig_output_hash = scriptsig[39:71]
+        assert scriptsig[71] == 0x00
+
+        # The covenant's OP_CAT + OP_SHA256 sequence at offsets 109–111
+        # of the V1 epilogue computes this:
+        h2_covenant = hashlib.sha256(scriptsig_input_hash + scriptsig_output_hash).digest()
+
+        # That must equal preimage[32:64] — the second half the miner
+        # folded into ``sha256d(preimage + nonce)``. If they diverge,
+        # the chain rejects after a successful mine.
+        assert h2_covenant == result.preimage[32:64]
+
+    def test_scriptsig_bytes_reproduce_miner_preimage(self):
+        """Recover the miner's PoW preimage from the scriptSig + outpoint
+        + contractRef alone, exactly as the on-chain interpreter does.
+        The result must equal the bytes that ``verify_sha256d_solution``
+        hashes against.
+
+        This is the round-trip property the covenant relies on: the
+        chain has the scriptSig pushes (inputHash, outputHash, nonce)
+        and the input's outpoint + contractRef-from-state, and it
+        rebuilds the same preimage the miner solved. If reconstruction
+        diverges, the chain rejects.
+
+        Uses an arbitrary nonce — the covenant's leading-zeros check
+        is verified separately by the mainnet-trace test below.
+        """
+        import hashlib
+
+        from pyrxd.glyph.dmint import build_mint_scriptsig, build_pow_preimage
+
+        txid_le = bytes.fromhex("11" * 32)
+        contract_ref_bytes = bytes.fromhex("22" * 36)
+        input_script = bytes.fromhex("76a914" + "33" * 20 + "88ac")
+        output_script = bytes.fromhex("6a035858580548")
+        nonce = bytes.fromhex("deadbeef")
+
+        pow_result = build_pow_preimage(txid_le, contract_ref_bytes, input_script, output_script)
+        scriptsig = build_mint_scriptsig(nonce, pow_result.input_hash, pow_result.output_hash, nonce_width=4)
+
+        # Parse scriptSig pushes (what the on-chain interpreter sees).
+        push_nonce = scriptsig[1:5]
+        push_input_hash = scriptsig[6:38]
+        push_output_hash = scriptsig[39:71]
+
+        # Covenant rebuilds the preimage from those pushes + outpoint + ref.
+        h1 = hashlib.sha256(txid_le + contract_ref_bytes).digest()
+        h2 = hashlib.sha256(push_input_hash + push_output_hash).digest()
+        on_chain_preimage_bytes = h1 + h2 + push_nonce
+
+        # What the miner hashed (with the same nonce).
+        miner_preimage_bytes = pow_result.preimage + nonce
+
+        assert on_chain_preimage_bytes == miner_preimage_bytes, (
+            "Covenant-reconstructed preimage diverges from miner preimage — "
+            "chain would reject the mint with OP_EQUALVERIFY"
+        )
+
+    def test_mainnet_mint_scriptsig_pushes_match_published_values(self):
+        """Pin the scriptSig push convention against the canonical
+        mainnet mint ``146a4d68…f3c`` (block 422,865, snk token).
+
+        The actual on-chain scriptSig pushes are
+        ``inputHash  = 09b5b22a…0a2`` and
+        ``outputHash = 4c3a73d7…1a6``, and on-chain inspection shows
+        those equal ``SHA256d(funding_P2PKH)`` and
+        ``SHA256d(OP_RETURN_script)`` respectively.
+
+        Reproducing those values from ``build_pow_preimage`` proves the
+        pyrxd convention is byte-equivalent to mainnet — the bug we
+        shipped in M1 (pushing preimage halves instead of script
+        hashes) would fail this test."""
+        import hashlib
+
+        from pyrxd.glyph.dmint import build_pow_preimage
+
+        # vin[1] of 146a4d68…f3c spends 8d318fba…fac5 vout[3] — a P2PKH
+        # to pkh 800d0414e758f790a48ad0f2960d566ef56cd5bf.
+        funding_script = bytes.fromhex("76a914800d0414e758f790a48ad0f2960d566ef56cd5bf88ac")
+        # vout[2] of 146a4d68…f3c: OP_RETURN PUSH3 "msg" PUSH9 "snk [r2w]"
+        op_return_script = bytes.fromhex("6a") + bytes([0x03]) + b"msg" + bytes([0x09]) + b"snk [r2w]"
+
+        # The outpoint + contractRef values are irrelevant for the
+        # hash assertions — those affect only H1, not the scriptSig
+        # pushes. Use any well-formed values.
+        result = build_pow_preimage(
+            txid_le=b"\x00" * 32,
+            contract_ref_bytes=b"\x00" * 36,
+            input_script=funding_script,
+            output_script=op_return_script,
+        )
+
+        expected_input_hash = bytes.fromhex("09b5b22a7f268ac5985a58231e80c00e0c67ee1ffec002d4fa0bda15de6f50a2")
+        expected_output_hash = bytes.fromhex("4c3a73d7a7daf3f7906a2b9e05707242241d14724b403c6ce2a860ffd5c521a6")
+        assert result.input_hash == expected_input_hash, (
+            "input_hash diverges from mainnet mint 146a4d68…f3c — the "
+            "scriptSig push convention is NOT byte-equivalent to live tokens"
+        )
+        assert result.output_hash == expected_output_hash
+        # Sanity: the SHA256d invariant we relied on for the assertion.
+        assert hashlib.sha256(hashlib.sha256(funding_script).digest()).digest() == expected_input_hash
+
+    def test_pyrxd_first_live_mint_scriptsig_pushes_match_chain(self):
+        """Second mainnet golden vector — pyrxd's own first successful
+        mint at ``c9fdcd3488f3e396bec3ce0b766bb8070963e7e75bb513b8820b6663e469e530``
+        (2026-05-11, PXD token).
+
+        This is the broadcast that proved the M1 fix on chain. Pinning
+        the scriptSig pushes from this tx provides a second, fully
+        independent golden vector against a different token (PXD vs
+        the snk token from the first golden) and a different
+        funding-script PKH. Two mainnet vectors at different timestamps
+        is meaningfully stronger than one.
+
+        On-chain values (raw tx hex saved in /tmp/m2-mint-postfix-attempt-4.log):
+          vin[0] scriptSig push 1: 0x04 nonce(4)
+          vin[0] scriptSig push 2: 0x20 inputHash(32) = SHA256d(funding_script)
+          vin[0] scriptSig push 3: 0x20 outputHash(32) = SHA256d(op_return_script)
+          vin[0] scriptSig push 4: 0x00
+
+        Funding input is vin[1] which spends the change output of the
+        deploy reveal — a P2PKH to PKH e099f0c83e518b38708453adc142f779f5270811.
+        OP_RETURN payload: "msg" + "postfix-attempt-4".
+        """
+        import hashlib
+
+        from pyrxd.glyph.dmint import build_pow_preimage
+
+        # vin[1] funding: P2PKH to e099f0c83e518b38708453adc142f779f5270811
+        funding_script = bytes.fromhex("76a914e099f0c83e518b38708453adc142f779f527081188ac")
+        # vout[2]: OP_RETURN PUSH3 "msg" PUSH17 "postfix-attempt-4"
+        op_return_script = bytes.fromhex("6a") + bytes([0x03]) + b"msg" + bytes([0x11]) + b"postfix-attempt-4"
+
+        result = build_pow_preimage(
+            txid_le=b"\x00" * 32,  # irrelevant — pin only H2 / scriptSig pushes
+            contract_ref_bytes=b"\x00" * 36,
+            input_script=funding_script,
+            output_script=op_return_script,
+        )
+
+        # Cross-checked from the raw broadcast hex of c9fdcd34…e530:
+        # scriptSig push at offsets 6..38 = inputHash; offsets 39..71 = outputHash.
+        # Raw hex (from /tmp/m2-mint-postfix-attempt-4.log line "Raw tx hex"):
+        #   ...480465e55b1c20<inputHash:32>20<outputHash:32>00...
+        expected_input_hash = bytes.fromhex("2e5ca2f0c747d467b7dd820e2f65737329113cb469b362fa943b1251a087dd23")
+        expected_output_hash = bytes.fromhex("47e9367da310d18757ec64e7ceceaa12658ef485674a8803784a9616ba53d72c")
+
+        assert result.input_hash == expected_input_hash, (
+            "input_hash diverges from pyrxd's own first live mint c9fdcd34…e530 — convention drifted since 2026-05-11"
+        )
+        assert result.output_hash == expected_output_hash
+        # Sanity check both invariants explicitly.
+        assert hashlib.sha256(hashlib.sha256(funding_script).digest()).digest() == expected_input_hash
+        assert hashlib.sha256(hashlib.sha256(op_return_script).digest()).digest() == expected_output_hash
 
 
 # ---------------------------------------------------------------------------
@@ -1345,11 +1578,14 @@ class TestPrepareDmintDeployV2Refusal:
     def test_explicit_opt_in_succeeds(self):
         """allow_v2_deploy=True bypasses the guard so SDK-internal V2 tests
         and explicit V2 deployers can still build the artifacts."""
-        from pyrxd.glyph.builder import DmintDeployResult, GlyphBuilder
+        from pyrxd.glyph.builder import DmintV2DeployResult, GlyphBuilder
 
         builder = GlyphBuilder()
         result = builder.prepare_dmint_deploy(self._params(), allow_v2_deploy=True)
-        assert isinstance(result, DmintDeployResult)
+        # Dispatcher returns the concrete V2 result. The legacy
+        # DmintDeployResult alias is only emitted when a caller constructs
+        # it explicitly — see TestDeprecationAliases.
+        assert isinstance(result, DmintV2DeployResult)
 
     def test_allow_v2_deploy_default_is_false(self):
         """Mechanical regression check: a future refactor must not flip the

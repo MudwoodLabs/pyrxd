@@ -161,8 +161,131 @@ class GlyphInspector:
                 return idx, metadata
         return None
 
+    def parse_mint_scriptsig(self, scriptsig: bytes) -> dict | None:
+        """Decode a dMint mint-claim scriptSig into its 4 canonical pushes.
+
+        A V1/V2 dMint mint claim spends the contract UTXO with a scriptSig
+        of the form::
+
+            V1 (nonce_width=4): <0x04 nonce(4)> <0x20 inputHash(32)> <0x20 outputHash(32)> <OP_0>  → 72 bytes
+            V2 (nonce_width=8): <0x08 nonce(8)> <0x20 inputHash(32)> <0x20 outputHash(32)> <OP_0>  → 76 bytes
+
+        Where:
+
+        * ``nonce`` — little-endian PoW nonce found by the miner.
+        * ``inputHash`` — ``SHA256d(funding_input_locking_script)``. NOT a
+          preimage half; the on-chain covenant recomputes
+          ``SHA256(inputHash || outputHash)`` from these literal pushes.
+        * ``outputHash`` — ``SHA256d(OP_RETURN_msg_script at vout[2])``.
+        * ``OP_0`` — the sentinel push the V1/V2 covenant requires.
+
+        Verified against mainnet V1 mint ``146a4d68…f3c`` and the V1 mint
+        ``c9fdcd34…e530``.
+
+        Returns a dict with ``nonce_hex``, ``input_hash``, ``output_hash``,
+        ``version_hint`` (``"v1"`` | ``"v2"`` | ``None``), and
+        ``scriptsig_length`` — or ``None`` if the scriptSig doesn't match
+        the canonical 4-push shape.
+
+        Catches ``Exception`` broadly because every call site crosses a
+        trust boundary: scriptSigs from network-fetched txs are attacker-
+        controlled. Non-mint inputs (P2PKH funding inputs, plain RXD
+        spends, etc.) return ``None``.
+        """
+        try:
+            items = self._scriptsig_pushes(scriptsig)
+        except Exception:
+            return None
+        if items is None or len(items) != 4:
+            return None
+        nonce, input_hash, output_hash, sentinel = items
+        if len(nonce) not in (4, 8):
+            return None
+        if len(input_hash) != 32 or len(output_hash) != 32:
+            return None
+        # The sentinel is ``OP_0`` which pushes the empty byte string.
+        if sentinel != b"":
+            return None
+        version_hint = "v1" if len(nonce) == 4 else "v2"
+        return {
+            "nonce_hex": nonce.hex(),
+            "input_hash": input_hash.hex(),
+            "output_hash": output_hash.hex(),
+            "version_hint": version_hint,
+            "scriptsig_length": len(scriptsig),
+        }
+
+    @staticmethod
+    def _scriptsig_pushes(scriptsig: bytes) -> list[bytes] | None:
+        """Walk push-data opcodes and return the pushed items.
+
+        Recognises ``OP_0`` (0x00) as an empty push, the direct push range
+        (0x01–0x4b), and the three PUSHDATA opcodes. Returns ``None`` on
+        any non-push opcode in the middle of the script — mint scriptSigs
+        are pure-push.
+        """
+        pos = 0
+        items: list[bytes] = []
+        n = len(scriptsig)
+        while pos < n:
+            op = scriptsig[pos]
+            pos += 1
+            if op == 0x00:  # OP_0 — push empty
+                items.append(b"")
+                continue
+            if 1 <= op <= 75:
+                end = pos + op
+                if end > n:
+                    return None
+                items.append(scriptsig[pos:end])
+                pos = end
+                continue
+            if op == 0x4C:  # OP_PUSHDATA1
+                if pos + 1 > n:
+                    return None
+                length = scriptsig[pos]
+                pos += 1
+                end = pos + length
+                if end > n:
+                    return None
+                items.append(scriptsig[pos:end])
+                pos = end
+                continue
+            if op == 0x4D:  # OP_PUSHDATA2
+                if pos + 2 > n:
+                    return None
+                length = int.from_bytes(scriptsig[pos : pos + 2], "little")
+                pos += 2
+                end = pos + length
+                if end > n:
+                    return None
+                items.append(scriptsig[pos:end])
+                pos = end
+                continue
+            if op == 0x4E:  # OP_PUSHDATA4
+                if pos + 4 > n:
+                    return None
+                length = int.from_bytes(scriptsig[pos : pos + 4], "little")
+                pos += 4
+                end = pos + length
+                if end > n:
+                    return None
+                items.append(scriptsig[pos:end])
+                pos = end
+                continue
+            # Non-push opcode in a context that should be pure-push: bail.
+            return None
+        return items
+
     def _parse_reveal_scriptsig(self, scriptsig: bytes) -> GlyphMetadata | None:
-        """Walk the scriptSig push-data stack to find 'gly' marker + CBOR."""
+        """Walk the scriptSig push-data stack to find 'gly' marker + CBOR.
+
+        Handles all four push-data opcodes including OP_PUSHDATA4 (0x4e):
+        V1 dMint deploy reveals on Radiant mainnet carry CBOR bodies > 65535
+        bytes (the GLYPH deploy's body is 65,569 bytes including a PNG), which
+        forces OP_PUSHDATA4. Without 0x4e support the walker bails out
+        before reaching the 'gly' marker that follows it.
+        """
         pos = 0
         items = []
         while pos < len(scriptsig):
@@ -179,6 +302,11 @@ class GlyphInspector:
             elif opcode == 0x4D:  # OP_PUSHDATA2
                 length = int.from_bytes(scriptsig[pos : pos + 2], "little")
                 pos += 2
+                items.append(scriptsig[pos : pos + length])
+                pos += length
+            elif opcode == 0x4E:  # OP_PUSHDATA4
+                length = int.from_bytes(scriptsig[pos : pos + 4], "little")
+                pos += 4
                 items.append(scriptsig[pos : pos + length])
                 pos += length
             else:

@@ -649,6 +649,36 @@ function renderFetchedTxCard(payload) {
     wrapper.appendChild(outList);
   }
 
+  // dMint mint-claim scriptSig (if present at vin[0]). Surfaces the four
+  // canonical pushes — nonce, inputHash, outputHash, OP_0 sentinel —
+  // and the V1/V2 hint that falls out of the nonce push width.
+  const mintScriptsig = payload.mint_scriptsig;
+  if (mintScriptsig) {
+    wrapper.appendChild(el("h3", { class: "result-subhead", text: "dMint mint scriptSig (vin 0)" }));
+    const mdl = el("dl", { class: "kv-list" });
+    mdl.appendChild(kv("version (by nonce width)", mintScriptsig.version_hint || "?"));
+    mdl.appendChild(kv("scriptSig length", `${mintScriptsig.scriptsig_length} bytes`));
+    mdl.appendChild(kv("nonce (LE)", mintScriptsig.nonce_hex));
+    mdl.appendChild(kv("input hash (SHA256d funding script)", mintScriptsig.input_hash));
+    mdl.appendChild(kv("output hash (SHA256d OP_RETURN script)", mintScriptsig.output_hash));
+    wrapper.appendChild(mdl);
+    wrapper.appendChild(el("p", {
+      class: "card-note",
+      text: "The mint scriptSig pushes four items: the PoW nonce, the literal " +
+            "SHA256d of the funding-input locking script, the literal SHA256d " +
+            "of the OP_RETURN message script (at vout[2] in the canonical V1 " +
+            "mint shape), and an OP_0 sentinel. The covenant recomputes " +
+            "SHA256(inputHash || outputHash) from these literal pushes — they " +
+            "are not preimage halves. V1 uses a 4-byte nonce (72-byte " +
+            "scriptSig); V2 uses 8 bytes (76 bytes). V1 is verified on " +
+            "Radiant mainnet against two pinned golden vectors (the public " +
+            "snk-token mint 146a4d68…f3c and pyrxd's first successful mint " +
+            "c9fdcd34…e530 of the PXD token, 2026-05-11); no V2 contract " +
+            "has been observed on chain yet, so the V2 decode here is " +
+            "structurally correct by construction but not field-verified.",
+    }));
+  }
+
   // Reveal metadata (if present).
   const metadata = payload.metadata;
   if (metadata) {
@@ -773,6 +803,31 @@ function _detectTxShape(payload) {
     );
   }
 
+  // V1 dMint deploy COMMIT: 1 commit-ft + 1 commit-nft + N ref-seed
+  // P2PKHs (one per parallel contract) + 1 P2PKH change. The mainnet
+  // Glyph Protocol deploy (a443d9df…878b) had 1+1+32+1 = 35 outputs;
+  // the GLYPH reveal (b965b32d…9dd6) consumed every ref-seed to create
+  // 32 parallel dMint contract UTXOs. Heuristic: commit-ft + commit-nft
+  // + at least 3 P2PKHs (a plain Glyph FT deploy normally has at most
+  // 1–2 P2PKH outputs — change + maybe one initial-holder). The N
+  // ref-seeds are 1-photon outputs but we don't have satoshis info per
+  // type, so use count as the discriminator. See
+  // docs/dmint-research-photonic-deploy.md §2 for the byte-by-byte
+  // chain truth.
+  if (has("commit-ft") && has("commit-nft") && (counts["p2pkh"] || 0) >= 3) {
+    const refSeeds = (counts["p2pkh"] || 0) - 1; // subtract the 1 change
+    return (
+      `This is a V1 dMint deploy commit — the first half of a two-step ` +
+      `permissionless-token deployment. The commit-ft output is the ` +
+      `FT-hashlock for the token's metadata reveal; commit-nft is the ` +
+      `auth-NFT hashlock; the remaining ${refSeeds} P2PKH outputs are ` +
+      `1-photon ref-seeds, one per parallel dMint contract. The deploy ` +
+      `reveal that follows will spend all of these to create the same ` +
+      `number of parallel V1 dMint contract UTXOs. See ` +
+      `docs/dmint-research-photonic-deploy.md for the on-chain shape.`
+    );
+  }
+
   // Glyph FT deploy: 1 commit-ft + 1+ ft (or p2pkh holding refs) + 1
   // commit-nft + RXD change. The commit-nft is the protocol-level
   // singleton that every FT deploy carries — NOT a separately-
@@ -818,22 +873,57 @@ function _detectTxShape(payload) {
   // inputs. The contract_ref + token_ref point to the deploy outpoint
   // either way.
   if (dmintOutput) {
+    const dmintCount = counts["dmint"] || 0;
     if (dmintOutput.height === 0 || dmintOutput.height === "0") {
+      // V1 deploy reveal: typically ships N parallel contracts in one
+      // tx (mainnet GLYPH had 32). One-contract deploys are also valid;
+      // distinguish in the banner so callers don't confuse a multi-
+      // contract V1 deploy with a V2 single-contract deploy.
+      const parallel =
+        dmintCount > 1
+          ? `${dmintCount} parallel dMint contract UTXOs, all sharing the ` +
+            `same token_ref. Each contract can be mined from independently, ` +
+            `so claims race in parallel — total supply is reward × ` +
+            `max_height × ${dmintCount}. `
+          : `a single dMint contract UTXO. `;
       return (
-        "This is a dMint contract deploy — a permissionless-mint " +
-        "token whose supply is gated by proof-of-work. Subsequent " +
-        "transactions can spend this output to claim a mint, " +
-        "incrementing the height each time. Anyone can mint until " +
-        "height reaches max_height."
+        `This is a dMint deploy reveal — creates ${parallel}` +
+        `Subsequent transactions can spend any of these to claim a mint, ` +
+        `incrementing that contract's height by 1. Anyone can mint until ` +
+        `the contract reaches max_height.`
       );
     }
+    // Canonical mint-tx shape (V1 and V2 — byte-identical post-R1
+    // fix, 2026-05-11): 4 outputs — [0] dMint continuation, [1] minted
+    // FT reward (75-byte FT-wrapped locking script, NOT plain P2PKH:
+    //   bytes 0-24  P2PKH prologue  76 a9 14 <pkh:20> 88 ac
+    //   byte    25  OP_STATESEPARATOR (bd)
+    //   byte    26  OP_PUSHINPUTREF  (d0)
+    //   bytes 27-62 tokenRef (36 bytes)
+    //   bytes 63-74 covenant fingerprint dec0e9aa76e378e4a269e69d
+    // ), [2] OP_RETURN message (the script whose SHA256d is pushed as
+    // outputHash), [3] P2PKH change. V2 originally shipped a 25-byte
+    // plain-P2PKH reward — fixed pre-mainnet-V2-deploy so V1 and V2
+    // are byte-identical at vout[1]. The mint scriptSig at vin[0] is
+    // decoded separately under "dMint mint scriptSig (vin 0)" above;
+    // the V1/V2 distinction is the nonce-push width there (4 vs 8 B),
+    // not the output layout here.
+    const versionHint = (payload.mint_scriptsig || {}).version_hint;
+    const versionNote = versionHint
+      ? ` Mint scriptSig at vin[0] is ${versionHint} shape (${versionHint === "v1" ? "4-byte nonce, 72 bytes" : "8-byte nonce, 76 bytes"}); the 4-output shape is identical across V1 and V2 by construction, but only V1 has been observed on Radiant mainnet (no V2 contract has been deployed yet).`
+      : "";
     return (
       `This is a dMint claim transaction (height ${dmintOutput.height} ` +
       `of ${dmintOutput.max_height}) — somebody spent the contract's ` +
       "previous output to mint themselves a token, and the contract " +
       "continues at the new dmint output. The freshly-minted FT lives " +
-      "in a separate ft output in this same tx. Inspect the contract's " +
-      "deploy outpoint to see the original parameters."
+      "in a separate ft output in this same tx; the canonical mint tx " +
+      "has 4 outputs: [0] dMint continuation, [1] 75-byte FT-wrapped " +
+      "reward, [2] OP_RETURN message, [3] P2PKH change. V1 is verified " +
+      "on mainnet against pinned golden vectors; V2 is byte-identical " +
+      "by construction (R1 fix) but untested on chain. Inspect the " +
+      "contract's deploy outpoint to see the original parameters." +
+      versionNote
     );
   }
 

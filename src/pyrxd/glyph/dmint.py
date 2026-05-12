@@ -18,6 +18,7 @@ from typing import Any, Literal
 
 from pyrxd.security.errors import (
     ContractExhaustedError,
+    CovenantError,
     InvalidFundingUtxoError,
     MaxAttemptsError,
     PoolTooSmallError,
@@ -509,21 +510,52 @@ def build_dmint_v1_contract_script(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class PowPreimageResult:
+    """The 64-byte PoW preimage plus the two script hashes a miner must push.
+
+    The covenant binds the PoW hash AND the scriptSig pushes together: it
+    recomputes ``H2 = SHA256(scriptSig_inputHash || scriptSig_outputHash)``
+    and folds that into the same hash the miner solved. Diverging the
+    preimage from the scriptSig pushes is a silent on-chain rejection —
+    see ``docs/solutions/runtime-errors/dmint-v1-mint-scriptsig-shape.md``
+    for the prior incident that motivated returning all three values from
+    a single helper.
+
+    :param preimage:    64-byte SHA256d PoW preimage; feeds ``mine_solution``.
+    :param input_hash:  ``SHA256d(input_script)`` — push as ``scriptSig_inputHash``.
+    :param output_hash: ``SHA256d(output_script)`` — push as ``scriptSig_outputHash``.
+    """
+
+    preimage: bytes
+    input_hash: bytes
+    output_hash: bytes
+
+
 def build_pow_preimage(
     txid_le: bytes,
     contract_ref_bytes: bytes,
     input_script: bytes,
     output_script: bytes,
-) -> bytes:
-    """Build the 64-byte PoW preimage.
+) -> PowPreimageResult:
+    """Build the PoW preimage AND the two script hashes the scriptSig must push.
 
     preimage[0..32] = SHA256(txid_LE || contractRef)
     preimage[32..64] = SHA256(SHA256d(inputScript) || SHA256d(outputScript))
+
+    The covenant pulls ``inputHash`` and ``outputHash`` from the scriptSig
+    pushes (not from the preimage halves) and recomputes the second SHA256
+    on-chain. Returning all three values here forces callers to feed both
+    sites from the same source — splitting the helper into "preimage
+    builder" and "scriptSig builder" with independently-recomputed hashes
+    is what produced the M1 covenant-rejection bug.
 
     :param txid_le:            32-byte txid in little-endian (internal byte order)
     :param contract_ref_bytes: 36-byte contract ref (wire format)
     :param input_script:       miner's input locking script (e.g. P2PKH)
     :param output_script:      miner's output script (e.g. OP_RETURN message)
+    :returns: :class:`PowPreimageResult` with ``preimage``, ``input_hash``,
+              ``output_hash``.
     """
     if len(txid_le) != 32:
         raise ValidationError("txid_le must be 32 bytes")
@@ -540,7 +572,7 @@ def build_pow_preimage(
     input_csh = sha256d(input_script)
     output_csh = sha256d(output_script)
     half2 = sha256(input_csh + output_csh)
-    return half1 + half2
+    return PowPreimageResult(preimage=half1 + half2, input_hash=input_csh, output_hash=output_csh)
 
 
 # ---------------------------------------------------------------------------
@@ -550,7 +582,8 @@ def build_pow_preimage(
 
 def build_mint_scriptsig(
     nonce: bytes,
-    preimage: bytes,
+    input_hash: bytes,
+    output_hash: bytes,
     *,
     nonce_width: Literal[4, 8] = 8,
 ) -> bytes:
@@ -564,8 +597,17 @@ def build_mint_scriptsig(
     of the mainnet mint trace at ``146a4d68…f3c``). Same shape as V2,
     differing only in nonce width and corresponding push opcode.
 
+    The hashes pushed here MUST equal :class:`PowPreimageResult.input_hash`
+    and ``output_hash`` from the same :func:`build_pow_preimage` call that
+    produced the preimage the miner solved. The on-chain covenant
+    recomputes ``SHA256(input_hash || output_hash)`` from these pushes and
+    folds that into the PoW hash — diverging them silently produces a
+    ``mandatory-script-verify-flag-failed`` rejection after a successful
+    mine.
+
     :param nonce:        nonce_width-bytes nonce (found during mining).
-    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param input_hash:   32-byte ``SHA256d(input_script)`` from :class:`PowPreimageResult`.
+    :param output_hash:  32-byte ``SHA256d(output_script)`` from :class:`PowPreimageResult`.
     :param nonce_width:  4 for V1 contracts, 8 for V2. Keyword-only and
                          ``Literal[4, 8]`` so a stray positional value is a
                          type error rather than a silent V1/V2 confusion.
@@ -575,16 +617,18 @@ def build_mint_scriptsig(
         raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
     if len(nonce) != nonce_width:
         raise ValidationError(f"nonce must be {nonce_width} bytes, got {len(nonce)}")
-    if len(preimage) != 64:
-        raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
+    if len(input_hash) != 32:
+        raise ValidationError(f"input_hash must be 32 bytes, got {len(input_hash)}")
+    if len(output_hash) != 32:
+        raise ValidationError(f"output_hash must be 32 bytes, got {len(output_hash)}")
     # Push opcode = nonce length (works for both 4 and 8 since both are < 0x4C).
     return (
         bytes([nonce_width])
         + nonce  # PUSH nonce_width + nonce
         + b"\x20"
-        + preimage[:32]  # PUSH 32 + inputHash half
+        + input_hash  # PUSH 32 + inputHash
         + b"\x20"
-        + preimage[32:]  # PUSH 32 + outputHash half
+        + output_hash  # PUSH 32 + outputHash
         + b"\x00"  # OP_0
     )
 
@@ -1661,8 +1705,9 @@ def build_dmint_mint_tx(
     Transaction structure
     ---------------------
     **Inputs**
-      * Input 0: contract UTXO — unlocked by ``build_mint_scriptsig(nonce, preimage)``
-        where ``preimage = build_pow_preimage(txid_le, contract_ref, miner_input_script, miner_output_script)``
+      * Input 0: contract UTXO — unlocked by
+        ``build_mint_scriptsig(nonce, pow.input_hash, pow.output_hash)``
+        where ``pow = build_pow_preimage(txid_le, contract_ref, miner_input_script, miner_output_script)``
 
     **Outputs**
       * Output 0: recreated contract UTXO (updated DmintState + same code section)
@@ -1677,13 +1722,17 @@ def build_dmint_mint_tx(
        time.  A production miner loop must:
 
        1. Build the unsigned tx shell via this function.
-       2. Compute the real ``preimage`` using ``build_pow_preimage`` once the
-          tx's txid and script hashes are stable (they are stable once outputs
-          are finalised — the txid doesn't depend on the unlocking script in
-          Radiant/Bitcoin sighash).
+       2. Compute the real preimage AND scriptSig hashes via
+          ``build_pow_preimage`` once the tx's txid and script hashes are
+          stable (they are stable once outputs are finalised — the txid
+          doesn't depend on the unlocking script in Radiant/Bitcoin sighash).
        3. Mine for a valid ``nonce`` via ``verify_sha256d_solution`` (or the
           relevant algo).
-       4. Replace input 0's unlocking script with ``build_mint_scriptsig(nonce, preimage)``.
+       4. Replace input 0's unlocking script with
+          ``build_mint_scriptsig(nonce, pow.input_hash, pow.output_hash)``.
+          The two hashes MUST come from the same ``build_pow_preimage`` call
+          that produced the preimage the miner solved — splitting the
+          sources is a silent on-chain rejection.
        5. Broadcast.
 
        Steps 2–5 are deliberately out of scope here — they require a live node
@@ -1826,19 +1875,36 @@ def build_dmint_mint_tx(
     )
     contract_script = new_state_script + _OP_STATESEPARATOR + code_script
 
-    # --- Build reward output script (P2PKH) ---
-    reward_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+    # --- Build reward output script (75-byte FT-wrapped) ---
+    # The V2 covenant's FT-conservation check at _PART_C (offset 168 in the
+    # V1 layout, equivalent position in V2) sums photons under the FT
+    # codescript and requires the total to equal state.reward. A plain
+    # P2PKH carries no FT codescript, so its sum is zero and the
+    # NUMEQUALVERIFY would fail — the network would reject every V2 mint.
+    #
+    # The V2 fingerprint at _PART_C[20:32] (`dec0e9aa76e378e4a269e69d`) is
+    # byte-identical to V1's `_V1_FT_OUTPUT_EPILOGUE`; stronger, the entire
+    # _PART_C (107 bytes) equals _V1_EPILOGUE_SUFFIX[18:], so V2's whole
+    # output-validation block is V1's tail. The same 75-byte FT output
+    # builder works for both versions. The two invariants this relies on
+    # are pinned by TestFtLockingScriptBuilderCrossEquality (in
+    # tests/test_dmint_module.py) and TestBuildDmintMintTx (the V2 e2e
+    # path in tests/test_dmint_end_to_end.py).
+    #
+    # Discovered by red-team audit 2026-05-11 — the prior implementation
+    # used a 25-byte P2PKH which would have been rejected by any live V2
+    # contract (none exist on chain yet, so the bug stayed silent).
+    reward_script = build_dmint_v1_ft_output_script(miner_pkh, state.token_ref)
 
-    # --- Placeholder scriptSig (nonce + sentinel preimage 0xff*64) ---
-    # The real preimage requires txid + script hashes which are only
-    # available once outputs are finalised (see docstring). The
-    # placeholder uses 0xff bytes (rather than zeros) as a visibly-invalid
-    # sentinel: a miner loop that forgets to replace it produces a tx
-    # whose covenant rejects fast on the network rather than silently
-    # passing structural checks. Same sentinel used in the V1 path
-    # (see _build_dmint_v1_mint_tx).
-    placeholder_preimage = b"\xff" * 64
-    placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage)
+    # --- Placeholder scriptSig (nonce + two sentinel 0xff*32 hashes) ---
+    # The real hashes require txid + script bytes which are only available
+    # once outputs are finalised (see docstring). The placeholder uses
+    # 0xff bytes (rather than zeros) as a visibly-invalid sentinel: a
+    # miner loop that forgets to replace it produces a tx whose covenant
+    # rejects fast on the network rather than silently passing structural
+    # checks. Same sentinel used in the V1 path (see _build_dmint_v1_mint_tx).
+    placeholder_hash = b"\xff" * 32
+    placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_hash, placeholder_hash, nonce_width=8)
 
     # --- Estimate tx size for fee ---
     # Approximate: 4 (ver) + 1 (in count) + 41 (outpoint+seq) + 1 (len) + len(scriptsig)
@@ -1926,7 +1992,7 @@ def _build_dmint_v1_mint_tx(
 
     Mainnet V1 mint transaction shape (docs/dmint-research-mainnet.md §4)::
 
-        vin[0]  contract UTXO          unlocked by build_mint_scriptsig(nonce_4b, preimage)
+        vin[0]  contract UTXO          unlocked by build_mint_scriptsig(nonce_4b, input_hash, output_hash)
         vin[1]  funding UTXO           plain-RXD P2PKH paying reward + fee + change
         vout[0] recreated contract     value = contract_utxo.value (singleton, no fee taken)
         vout[1] FT-wrapped reward      75-byte P2PKH+tokenRef, value = state.reward
@@ -2024,12 +2090,12 @@ def _build_dmint_v1_mint_tx(
         op_return_script = b"\x6a" + msg_marker + data_push
 
     # --- Placeholder scriptSigs.
-    # Contract input: nonce-bearing scriptSig with sentinel 0xff*64 preimage.
+    # Contract input: nonce-bearing scriptSig with two sentinel 0xff*32 hashes.
     # The 0xff bytes are visibly-invalid: a miner that forgets to replace
     # them gets fast network rejection rather than a covenant-fail silent
     # bug. Mining replaces this whole scriptSig.
-    placeholder_preimage = b"\xff" * 64
-    placeholder_contract_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage, nonce_width=4)
+    placeholder_hash = b"\xff" * 32
+    placeholder_contract_scriptsig = build_mint_scriptsig(nonce, placeholder_hash, placeholder_hash, nonce_width=4)
     # Funding input: 108 zero bytes — the WORST-CASE size of a signed P2PKH
     # scriptSig. A real signed scriptSig is 106-108 bytes:
     #   <push-len 0x47..0x49> <DER sig 70-72 bytes + sighash 1 byte>
@@ -2249,8 +2315,8 @@ def build_dmint_v1_mint_preimage(
     contract_utxo: DmintContractUtxo,
     funding_utxo: DmintMinerFundingUtxo,
     unsigned_tx: Any,
-) -> bytes:
-    """Build the 64-byte V1 mining preimage for an unsigned mint tx.
+) -> PowPreimageResult:
+    """Build the V1 mining preimage AND scriptSig hashes for an unsigned mint tx.
 
     The V1 covenant binds the PoW preimage to:
 
@@ -2266,8 +2332,13 @@ def build_dmint_v1_mint_preimage(
 
     Layout (matches :func:`build_pow_preimage`)::
 
-        SHA256(txid_LE || contractRef) ||
-        SHA256(SHA256d(input_script) || SHA256d(output_script))
+        preimage    = SHA256(txid_LE || contractRef) ||
+                      SHA256(SHA256d(input_script) || SHA256d(output_script))
+        input_hash  = SHA256d(input_script)    ← scriptSig push
+        output_hash = SHA256d(output_script)   ← scriptSig push
+
+    Callers feed ``preimage`` to :func:`mine_solution` and pass
+    ``input_hash`` + ``output_hash`` to :func:`build_mint_scriptsig`.
 
     :param contract_utxo:  The V1 contract UTXO being spent.
     :param funding_utxo:   The plain-RXD UTXO providing reward + fee.
@@ -2275,8 +2346,9 @@ def build_dmint_v1_mint_preimage(
                            :func:`build_dmint_mint_tx` — vout[2] is
                            required to be the OP_RETURN msg output
                            (mainnet-canonical 4-output shape).
-    :returns:              64 bytes ready to feed into :func:`mine_solution`
-                           or :func:`mine_solution_external`.
+    :returns:              :class:`PowPreimageResult` carrying the preimage
+                           and the two script hashes that the scriptSig
+                           must push for the covenant to accept the mint.
     :raises ValidationError:
         ``unsigned_tx`` has fewer than 4 outputs (no OP_RETURN at vout[2])
         OR vout[2] is not actually an OP_RETURN script. Build the tx via
@@ -2308,3 +2380,317 @@ def build_dmint_v1_mint_preimage(
         input_script=funding_utxo.script,
         output_script=output_script,
     )
+
+
+# ---------------------------------------------------------------------------
+# Live V1 contract UTXO discovery (M2 chain helper)
+# ---------------------------------------------------------------------------
+#
+# Shipped here, alongside ``find_dmint_funding_utxo``, because both are
+# protocol-aware ElectrumX consumers that the network layer should not have
+# to know about. The helper supports two distinct call shapes — see plan
+# §2b.1 (`docs/plans/2026-05-08-feat-dmint-v1-deploy-plan.md`) for the
+# rationale (TL;DR: public ElectrumX has no ref-listing RPC, so callers
+# without the deploy params must walk forward from the deploy reveal).
+
+
+@dataclass(frozen=True)
+class DmintV1ContractInitialState:
+    """Just-deployed state of a V1 dMint contract template.
+
+    Carries exactly the parameters needed to reconstruct the initial
+    (height=0) contract codescript for *every* contract of a given
+    deploy. Used by :func:`find_dmint_contract_utxos`'s fast path,
+    where the caller already knows the deploy params.
+
+    :param num_contracts: Count of parallel contracts the deploy created
+        (1..255 for V1; mainnet GLYPH used 32).
+    :param reward_sats: Photons emitted per successful mint (must fit in
+        3 bytes — V1 protocol constant).
+    :param max_height: Maximum mints per contract (3-byte ceiling).
+    :param target: 8-byte SHA256d PoW target.
+    :param algo: PoW algorithm. Defaults to ``DmintAlgo.SHA256D``,
+        which is the only algorithm seen on V1 mainnet.
+    """
+
+    num_contracts: int
+    reward_sats: int
+    max_height: int
+    target: int
+    algo: DmintAlgo = DmintAlgo.SHA256D
+
+
+def _scripthash_for_script(script: bytes) -> str:
+    """Return the ElectrumX scripthash for *script* (sha256, then reversed).
+
+    Inline two-line helper rather than a module-level export — used in
+    exactly one place (the fast path below). ElectrumX's reverse step
+    matches the display-byte-order convention used elsewhere in the
+    codebase (see :func:`script_hash_for_address`).
+    """
+    return hashlib.sha256(script).digest()[::-1].hex()
+
+
+async def find_dmint_contract_utxos(
+    client: Any,
+    *,
+    token_ref: GlyphRef,
+    initial_state: DmintV1ContractInitialState | None = None,
+    limit: int | None = None,
+    min_confirmations: int = 1,
+) -> list[DmintContractUtxo]:
+    """Discover live V1 dMint contract UTXOs for a given ``token_ref``.
+
+    Two call shapes:
+
+    - **Fast path** — pass ``initial_state``. The function rebuilds each
+      contract's expected initial codescript locally
+      (``contractRef[i] = (commit_txid, i+1)``, ``tokenRef = token_ref``),
+      computes its scripthash inline, and asks the server for the UTXO
+      at that scripthash. One ``get_utxos`` call per contract. Use this
+      shape immediately after deploy to verify all N contracts went
+      live, or any time the caller has the deploy params handy.
+
+    - **Walk-from-reveal fallback** — omit ``initial_state``. The
+      function fetches the deploy commit, derives the FT-commit
+      hashlock's scripthash, queries history for the reveal txid, then
+      fetches the reveal and extracts every fresh V1 contract output
+      whose ``tokenRef`` matches. Slower (3+ extra round-trips) but
+      works on any live token where you only know the ``token_ref``.
+
+    Both shapes apply the same security S2 cross-check: for each
+    candidate UTXO returned, the source transaction is fetched and
+    verified to have ``txid()`` matching the server's ``tx_hash``, and
+    its output script byte-equal to the script the server claimed.
+    Defends against a malicious or buggy ElectrumX serving altered
+    bytes (mirrors :func:`find_dmint_funding_utxo`'s round-4 defense).
+
+    The fallback path returns *fresh* contracts only — UTXOs that have
+    been mined from at least once are skipped (their state advanced and
+    their scripthash drifted; following the spend chain forward to
+    locate the current head is filed as deferred work).
+
+    :param client:             An open ``pyrxd.network.electrumx.ElectrumXClient``.
+    :param token_ref:          The token's permanent 36-byte ref (the
+        deploy commit's vout-0 outpoint, LE-reversed). Equivalently:
+        ``GlyphRef(txid=commit_txid, vout=0)``.
+    :param initial_state:      If supplied, fast-path. If ``None``, walk
+        from the deploy reveal.
+    :param limit:              If supplied, cap the result list at this
+        many contracts. ``None`` returns all available.
+    :param min_confirmations:  Skip UTXOs younger than this many blocks.
+        Default 1 (require at least 1 confirmation).
+    :returns:                  A list of :class:`DmintContractUtxo` for
+        each currently-unspent contract whose script verified S2.
+    :raises ValidationError:   Inputs malformed (token_ref must point at
+        ``vout=0``); or initial_state has out-of-range fields.
+    :raises NetworkError:      Propagated from the ElectrumX client.
+    """
+    # Lazy imports — keeping dmint.py light for callers that don't touch
+    # the network (the inspect tool in particular).
+    from pyrxd.security.types import Txid
+    from pyrxd.transaction.transaction import Transaction
+
+    if token_ref.vout != 0:
+        raise ValidationError(f"token_ref must point at vout=0 of the deploy commit; got vout={token_ref.vout}")
+    if limit is not None and limit < 1:
+        raise ValidationError(f"limit must be >= 1 if supplied, got {limit}")
+    if min_confirmations < 0:
+        raise ValidationError(f"min_confirmations must be >= 0, got {min_confirmations}")
+
+    commit_txid = token_ref.txid
+
+    if initial_state is not None:
+        if initial_state.num_contracts < 1 or initial_state.num_contracts > 255:
+            raise ValidationError(f"num_contracts must be in [1, 255], got {initial_state.num_contracts}")
+        candidates = await _find_v1_contract_utxos_fast(
+            client,
+            token_ref=token_ref,
+            commit_txid=commit_txid,
+            initial_state=initial_state,
+            min_confirmations=min_confirmations,
+        )
+    else:
+        candidates = await _find_v1_contract_utxos_walk(
+            client,
+            token_ref=token_ref,
+            commit_txid=commit_txid,
+            min_confirmations=min_confirmations,
+        )
+
+    # Security S2 cross-check applied uniformly to whichever shape ran.
+    verified = await _s2_verify_contract_utxos(client, candidates, Txid=Txid, Transaction=Transaction)
+
+    if limit is not None:
+        verified = verified[:limit]
+    return verified
+
+
+async def _find_v1_contract_utxos_fast(
+    client: Any,
+    *,
+    token_ref: GlyphRef,
+    commit_txid: str,
+    initial_state: DmintV1ContractInitialState,
+    min_confirmations: int,
+) -> list[DmintContractUtxo]:
+    """Shape A: the caller knows the deploy params, so we can rebuild
+    each expected initial codescript and query its scripthash directly.
+    """
+    from pyrxd.security.types import Txid
+
+    out: list[DmintContractUtxo] = []
+    for i in range(initial_state.num_contracts):
+        contract_ref = GlyphRef(txid=Txid(commit_txid), vout=i + 1)
+        codescript = build_dmint_v1_contract_script(
+            height=0,
+            contract_ref=contract_ref,
+            token_ref=token_ref,
+            max_height=initial_state.max_height,
+            reward=initial_state.reward_sats,
+            target=initial_state.target,
+            algo=initial_state.algo,
+        )
+        sh = _scripthash_for_script(codescript)
+        utxos = await client.get_utxos(sh)
+        for u in utxos:
+            if u.height == 0 and min_confirmations > 0:
+                continue
+            # State is a known-initial state: we just built the
+            # script, so DmintState.from_script(codescript) is the
+            # ground truth here. Avoids re-parsing per UTXO.
+            state = DmintState.from_script(codescript)
+            out.append(
+                DmintContractUtxo(
+                    txid=u.tx_hash,
+                    vout=u.tx_pos,
+                    value=u.value,
+                    script=codescript,
+                    state=state,
+                )
+            )
+    return out
+
+
+async def _find_v1_contract_utxos_walk(
+    client: Any,
+    *,
+    token_ref: GlyphRef,
+    commit_txid: str,
+    min_confirmations: int,
+) -> list[DmintContractUtxo]:
+    """Shape B: the caller has only ``token_ref``. Walk from the deploy
+    commit's vout 0 history to locate the reveal, then enumerate the
+    reveal's V1 dMint contract outputs and verify each is unspent.
+    """
+    from pyrxd.security.types import Txid
+    from pyrxd.transaction.transaction import Transaction
+
+    # 1. Fetch the commit; extract vout 0's locking script.
+    commit_raw = await client.get_transaction(Txid(commit_txid))
+    commit_tx = Transaction.from_hex(bytes(commit_raw))
+    if commit_tx is None or len(commit_tx.outputs) == 0:
+        raise ValidationError(f"deploy commit {commit_txid} has no outputs or did not parse")
+    commit_vout0_script = commit_tx.outputs[0].locking_script.serialize()
+
+    # 2. Find the reveal via scripthash history, then disambiguate by
+    # input. The FT-commit hashlock script may have been reused across
+    # several txs by the same deployer (e.g. failed earlier attempts at
+    # the same deploy share the same payload-hash and therefore the same
+    # 75-byte hashlock script). The scripthash alone is not unique to
+    # this commit instance — we must filter by "spends commit_txid:0".
+    sh = _scripthash_for_script(commit_vout0_script)
+    history = await client.get_history(sh)
+    reveal_txid: str | None = None
+    reveal_tx = None
+    for entry in history:
+        h_txid = entry.get("tx_hash") if isinstance(entry, dict) else None
+        if not h_txid or h_txid == commit_txid:
+            continue
+        # Confirm this candidate actually spends commit_txid:0.
+        cand_raw = await client.get_transaction(Txid(h_txid))
+        cand_tx = Transaction.from_hex(bytes(cand_raw))
+        if cand_tx is None:
+            continue
+        spends_commit_vout0 = any(
+            ti.source_txid == commit_txid and ti.source_output_index == 0 for ti in cand_tx.inputs
+        )
+        if spends_commit_vout0:
+            reveal_txid = h_txid
+            reveal_tx = cand_tx
+            break
+    if reveal_txid is None or reveal_tx is None:
+        # Commit unspent (deploy never revealed) or server returned only
+        # txs that share the scripthash by hashlock-reuse, none of which
+        # actually spend the deploy commit.
+        return []
+
+    out: list[DmintContractUtxo] = []
+    for vout_i, output in enumerate(reveal_tx.outputs):
+        script = output.locking_script.serialize()
+        try:
+            state = DmintState.from_script(script)
+        except ValidationError:
+            continue
+        if not state.is_v1:
+            continue
+        if state.token_ref.to_bytes() != token_ref.to_bytes():
+            continue
+
+        # 4. Confirm UTXO is currently unspent (skip mined-from contracts —
+        # see docstring deferred-work note).
+        out_sh = _scripthash_for_script(script)
+        utxos = await client.get_utxos(out_sh)
+        match = next(
+            (u for u in utxos if u.tx_hash == reveal_txid and u.tx_pos == vout_i),
+            None,
+        )
+        if match is None:
+            continue
+        if match.height == 0 and min_confirmations > 0:
+            continue
+        out.append(
+            DmintContractUtxo(
+                txid=match.tx_hash,
+                vout=match.tx_pos,
+                value=match.value,
+                script=script,
+                state=state,
+            )
+        )
+    return out
+
+
+async def _s2_verify_contract_utxos(
+    client: Any,
+    candidates: list[DmintContractUtxo],
+    *,
+    Txid: Any,
+    Transaction: Any,
+) -> list[DmintContractUtxo]:
+    """Apply security S2: re-fetch each candidate's source tx, confirm
+    txid matches and the output script is byte-equal to what the server
+    returned. Rejects altered scripts before they reach the caller.
+
+    Mirrors the round-4 defense in :func:`find_dmint_funding_utxo`.
+    """
+    verified: list[DmintContractUtxo] = []
+    for c in candidates:
+        raw = await client.get_transaction(Txid(c.txid))
+        tx = Transaction.from_hex(bytes(raw))
+        if tx is None:
+            raise CovenantError(f"S2 cross-check: source tx {c.txid} did not parse")
+        if tx.txid() != c.txid:
+            raise CovenantError(f"S2 cross-check: server reported txid {c.txid} but tx parses as {tx.txid()}")
+        if c.vout >= len(tx.outputs):
+            raise CovenantError(
+                f"S2 cross-check: tx {c.txid} has only {len(tx.outputs)} outputs but server claimed vout={c.vout}"
+            )
+        on_chain_script = tx.outputs[c.vout].locking_script.serialize()
+        if on_chain_script != c.script:
+            raise CovenantError(
+                f"S2 cross-check: script mismatch at {c.txid}:{c.vout} "
+                f"(server returned {len(c.script)} bytes; on-chain is {len(on_chain_script)} bytes)"
+            )
+        verified.append(c)
+    return verified

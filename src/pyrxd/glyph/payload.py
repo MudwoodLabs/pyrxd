@@ -48,7 +48,13 @@ def _cbor_str(d: dict, key: str, max_len: int) -> str:
     return v
 
 
-_MAX_CBOR_PAYLOAD_BYTES = 65_536  # 64 KB hard cap — protects against DoS on decode
+_MAX_CBOR_PAYLOAD_BYTES = 262_144  # 256 KB hard cap — protects against DoS on decode
+# Why 256 KB and not 64 KB: real V1 dMint deploys carry embedded media in the
+# CBOR `main` field. The Radiant Glyph Protocol deploy
+# (a443d9df…878b commit / b965b32d…9dd6 reveal) has a 65,569-byte CBOR body
+# including a logo PNG — just above the prior 64 KB cap. 256 KB is still
+# orders of magnitude smaller than _MAX_RAW_TX_BYTES (4 MB) and leaves headroom
+# for higher-resolution embedded media without re-litigating the cap each time.
 _MAX_ATTRS_COUNT = 64  # unreasonable beyond this; prevents memory bombs
 
 # Per-IANA, real MIME types are short — even very obscure registered
@@ -106,7 +112,14 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
                 raise ValidationError(
                     f"CBOR field 'main.t' (mime_type) too long: {len(mime_type)} > {_MAX_MIME_TYPE_CHARS}"
                 )
-            main = GlyphMedia(mime_type=mime_type, data=bytes(m["b"]))
+            # Photonic Wallet wraps embedded binary blobs in CBOR tag 64
+            # (uint8-array), so v1 dMint deploys like RBG's GLYPH carry
+            # ``main.b = CBORTag(64, <png bytes>)``. Tag-aware unwrap is
+            # required — calling ``bytes()`` on a CBORTag raises TypeError.
+            blob = m["b"]
+            if isinstance(blob, cbor2.CBORTag):
+                blob = blob.value
+            main = GlyphMedia(mime_type=mime_type, data=bytes(blob))
 
     version = d.get("v")
     if version is not None:
@@ -182,6 +195,14 @@ def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
 
     The full scriptSig is: <sig> <pubkey> <this suffix>
     Caller is responsible for prepending sig + pubkey push-data.
+
+    Push opcode is selected from the CBOR payload length:
+    direct push (≤75 B), OP_PUSHDATA1 (≤255 B), OP_PUSHDATA2 (≤65535 B),
+    or OP_PUSHDATA4 (≤``_MAX_CBOR_PAYLOAD_BYTES``). The mainnet GLYPH
+    reveal at ``b965b32d…9dd6`` used a 65,569-byte payload via PUSHDATA4
+    — capping at PUSHDATA2 would have left pyrxd unable to build the
+    same shape the live Radiant indexers parse without complaint.
+    Added 2026-05-11 per red-team finding R3.
     """
     # Push 'gly' marker (3 bytes)
     gly_push = b"\x03" + GLY_MARKER
@@ -193,8 +214,10 @@ def build_reveal_scriptsig_suffix(cbor_bytes: bytes) -> bytes:
         cbor_push = b"\x4c" + bytes([cbor_len]) + cbor_bytes  # OP_PUSHDATA1
     elif cbor_len <= 65535:
         cbor_push = b"\x4d" + cbor_len.to_bytes(2, "little") + cbor_bytes  # OP_PUSHDATA2
+    elif cbor_len <= _MAX_CBOR_PAYLOAD_BYTES:
+        cbor_push = b"\x4e" + cbor_len.to_bytes(4, "little") + cbor_bytes  # OP_PUSHDATA4
     else:
-        raise ValidationError("CBOR payload too large for script")
+        raise ValidationError(f"CBOR payload too large for script: {cbor_len} > {_MAX_CBOR_PAYLOAD_BYTES}")
     return gly_push + cbor_push
 
 

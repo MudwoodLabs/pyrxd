@@ -381,10 +381,19 @@ class TestScriptSigSuffix:
         assert suffix[5] == len(cbor_bytes)
 
     def test_oversized_payload_raises(self):
-        # 65536+ bytes cbor payload
-        huge_cbor = bytes(65536)
+        # The hard cap moved from 65535 (PUSHDATA2) to 262144 (PUSHDATA4)
+        # in 0.5.0 per red-team finding R3 — mainnet GLYPH reveals exceed
+        # the old PUSHDATA2 limit. 65536 is now accepted; only > 262144
+        # raises.
+        too_big = bytes(262_145)
         with pytest.raises(ValidationError, match="too large"):
-            build_reveal_scriptsig_suffix(huge_cbor)
+            build_reveal_scriptsig_suffix(too_big)
+
+    def test_payload_at_pushdata4_boundary_accepted(self):
+        """65 536 bytes — first byte of PUSHDATA4 territory — is accepted."""
+        boundary_cbor = bytes(65536)
+        suffix = build_reveal_scriptsig_suffix(boundary_cbor)
+        assert suffix[4] == 0x4E  # OP_PUSHDATA4
 
 
 # ---------------------------------------------------------------------------
@@ -458,6 +467,69 @@ class TestGlyphInspector:
     def test_extract_reveal_empty_scriptsig_returns_none(self):
         inspector = GlyphInspector()
         assert inspector.extract_reveal_metadata(b"") is None
+
+    def test_extract_reveal_handles_op_pushdata4(self):
+        """V1 dMint deploys carry CBOR bodies larger than 65,535 bytes
+        (the RBG GLYPH deploy embeds a 65,430-byte PNG, total CBOR body
+        65,569 bytes). The reveal scriptSig serialises that with
+        OP_PUSHDATA4 (0x4e) because OP_PUSHDATA2's max is 65535.
+
+        Before this fix the walker hit OP_PUSHDATA4 and bailed out
+        before finding the 'gly' marker — the metadata silently
+        disappeared from the inspect tool's output on every real V1
+        deploy. Regression test pinned by mainnet GLYPH (b965b32d…9dd6
+        vin 0)."""
+        # Build a 70 KB CBOR body — large enough to require OP_PUSHDATA4.
+        # The bulk lives in main.b (the embedded media slot), which has no
+        # per-field length cap apart from the overall payload size.
+        large_body = cbor2.dumps(
+            {
+                "p": [1, 4],
+                "ticker": "GLYPH",
+                "name": "Glyph Protocol",
+                "main": {"t": "image/png", "b": cbor2.CBORTag(64, b"x" * 70_000)},
+            }
+        )
+        assert len(large_body) > 65_535
+        # OP_PUSHDATA4: 0x4e + 4-byte LE length + payload
+        push_data4 = bytes([0x4E]) + len(large_body).to_bytes(4, "little") + large_body
+        # 'gly' marker: 3-byte direct push of b"gly"
+        gly_marker = bytes([0x03]) + b"gly"
+        dummy_sig = bytes([0x47]) + bytes(71)
+        dummy_pubkey = bytes([0x21]) + bytes(33)
+        scriptsig = dummy_sig + dummy_pubkey + gly_marker + push_data4
+
+        inspector = GlyphInspector()
+        result = inspector.extract_reveal_metadata(scriptsig)
+        assert result is not None
+        assert result.ticker == "GLYPH"
+        assert result.name == "Glyph Protocol"
+
+    def test_decode_payload_unwraps_cbor_tag_64_for_main_blob(self):
+        """Photonic Wallet wraps embedded media in CBOR tag 64 (uint8-array).
+        Real V1 dMint deploys (e.g. GLYPH) carry ``main.b = CBORTag(64,
+        <png bytes>)``. Before this fix ``decode_payload`` raised
+        TypeError on ``bytes(CBORTag)`` and the entire reveal metadata
+        was discarded."""
+        from pyrxd.glyph.payload import decode_payload
+
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100  # 108 bytes synthetic PNG
+        body = cbor2.dumps(
+            {
+                "p": [1, 4],
+                "ticker": "TAG64",
+                "name": "Tag64 Token",
+                "main": {
+                    "t": "image/png",
+                    "b": cbor2.CBORTag(64, png_bytes),
+                },
+            }
+        )
+        meta = decode_payload(body)
+        assert meta.ticker == "TAG64"
+        assert meta.main is not None
+        assert meta.main.mime_type == "image/png"
+        assert meta.main.data == png_bytes
 
     def test_find_glyphs_nft_ref_matches(self):
         nft_script = build_nft_locking_script(KNOWN_HEX20, KNOWN_REF)

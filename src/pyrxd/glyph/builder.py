@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, overload
 
 import cbor2
 
@@ -288,79 +288,183 @@ class GlyphBuilder:
             premine_amount=premine_amount,
         )
 
+    @overload
     def prepare_dmint_deploy(
         self,
-        params: DmintFullDeployParams,
+        params: DmintV1DeployParams,
+        *,
+        allow_v2_deploy: bool = ...,
+    ) -> DmintV1DeployResult: ...
+    @overload
+    def prepare_dmint_deploy(
+        self,
+        params: DmintV2DeployParams,
+        *,
+        allow_v2_deploy: bool = ...,
+    ) -> DmintV2DeployResult: ...
+    def prepare_dmint_deploy(
+        self,
+        params: DmintV1DeployParams | DmintV2DeployParams,
         *,
         allow_v2_deploy: bool = False,
-    ) -> DmintDeployResult:
-        """Prepare a full dMint token deploy: commit + reveal + deploy scripts.
+    ) -> DmintV1DeployResult | DmintV2DeployResult:
+        """Prepare a dMint token deploy.
 
-        .. warning::
-           **This currently emits a V2 dMint contract.** No live mainnet
-           contracts are V2; the entire ecosystem (glyph-miner, RXinDexer,
-           Photonic explorer) was built around the V1 format. Deploying a
-           token via this function today produces a contract that **no
-           external miner can claim** without bespoke tooling, and indexer
-           behavior on V2 deploys is empirically unknown. **V1 deploy
-           support lands in Milestone 2** of the dMint integration plan
-           (``docs/plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md``).
+        Dispatches on the type of ``params``:
 
-           This function therefore **refuses to run** unless the caller
-           explicitly passes ``allow_v2_deploy=True`` to acknowledge that
-           they are deploying a non-standard contract on purpose (e.g. for
-           SDK-internal testing of the V2 builder, or a future deployer who
-           genuinely wants V2's dynamic-difficulty features).
+        * :class:`DmintV1DeployParams` → returns :class:`DmintV1DeployResult`.
+          V1 is the only format on Radiant mainnet today (see GLYPH at
+          a443d9df…878b). Two-tx deploy: commit + reveal (the reveal
+          directly creates ``params.num_contracts`` parallel contract UTXOs).
 
-        A dMint deploy requires **three** transactions in sequence:
+        * :class:`DmintV2DeployParams` → returns :class:`DmintV2DeployResult`,
+          but only if the caller passes ``allow_v2_deploy=True``. V2 has
+          no live mainnet contracts; no ecosystem miner (glyph-miner,
+          RXinDexer, Photonic explorer) targets V2. Refusing by default
+          prevents deploying tokens nobody can mine.
 
-        1. **Commit tx** — commits the token metadata payload hash on-chain
-           (standard Glyph commit, same as :meth:`prepare_commit`).
-
-        2. **Reveal tx** — spends the commit, creates the **token ref UTXO**
-           (a 75-byte FT locking script — same shape as :meth:`prepare_ft_deploy_reveal`).
-           The token ref outpoint is the permanent identifier of the FT token.
-
-        3. **Deploy tx** — creates the singleton **contract UTXO**, funded with
-           the initial reward pool.  Its output script is a full
-           ``build_dmint_contract_script()`` — state prefix + OP_STATESEPARATOR
-           + covenant code.
-
-        Usage
-        -----
-        ::
-
-            builder = GlyphBuilder()
-            result = builder.prepare_dmint_deploy(DmintFullDeployParams(...))
-
-            # Step 1: build, sign, broadcast commit tx using result.commit_result
-            # Step 2: wait for confirmation, get commit_txid
-            # Step 3: build reveal tx using result.reveal_scripts
-            # Step 4: broadcast reveal, get reveal_txid + reveal_vout
-            # Step 5: build deploy tx using result.deploy_contract_script
-            #         (the contract input refs the token ref at reveal outpoint)
-
-        The caller is responsible for constructing and signing actual
-        :class:`Transaction` objects using the scripts returned here, following
-        the same pattern as the integration test in
-        ``tests/test_dmint_deploy_integration.py``.
-
-        :param params: :class:`DmintFullDeployParams` — all deploy configuration.
-        :returns: :class:`DmintDeployResult` with commit, reveal, and deploy artefacts.
-        :raises ValidationError: ``params.premine_amount < 546`` (dust limit);
-            metadata protocol does not include FT; reward pool too small.
+        :param params: Either :class:`DmintV1DeployParams` (V1 deploy) or
+            :class:`DmintV2DeployParams` (V2 deploy, requires
+            ``allow_v2_deploy=True``). The deprecated
+            :class:`DmintFullDeployParams` is accepted (it's a subclass of
+            ``DmintV2DeployParams``) but emits a ``DeprecationWarning`` at
+            construction time.
+        :param allow_v2_deploy: Must be ``True`` to deploy V2. Ignored for V1.
+        :returns: V1 or V2 result, matching the param type via ``@overload``.
+        :raises DmintError: V2 path without ``allow_v2_deploy=True``.
+        :raises ValidationError: Various per-version invariants — see
+            :meth:`_prepare_dmint_v1_deploy` and the V2 implementation
+            below for specifics.
         """
+        if isinstance(params, DmintV1DeployParams):
+            return self._prepare_dmint_v1_deploy(params)
+        if isinstance(params, DmintV2DeployParams):
+            return self._prepare_dmint_v2_deploy(params, allow_v2_deploy=allow_v2_deploy)
+        # Unreachable per the type union — exhaustive-narrowing for mypy strict.
+        from typing import assert_never
+
+        assert_never(params)
+
+    def _prepare_dmint_v1_deploy(self, params: DmintV1DeployParams) -> DmintV1DeployResult:
+        """Build the V1 deploy commit + placeholder contract scripts.
+
+        Mirrors the on-chain shape decoded in
+        ``docs/dmint-research-photonic-deploy.md`` §2 and §3:
+
+        * Commit tx: 1 FT-commit hashlock + ``num_contracts`` ref-seed
+          P2PKHs + 1 NFT-commit hashlock + change. (This method builds
+          only the FT-commit script; the caller composes the full
+          commit-tx outputs using the supplied ref-seed PKH and the
+          NFT-commit pattern from the existing builder API.)
+        * Reveal tx: spends the commit, emits ``num_contracts`` V1
+          dMint contract UTXOs + FT-NFT singleton + auth NFT + change.
+          The reveal-output script bytes are built by
+          :meth:`DmintV1DeployResult.build_reveal_outputs` once the
+          caller has the commit txid.
+
+        The placeholder contract scripts (built with the all-zero commit
+        txid) let the caller estimate the reveal-tx fee before broadcasting
+        the commit. Their byte length is exactly the final length — only
+        the txid component of ``contractRef`` / ``tokenRef`` changes.
+        """
+        from .dmint import (
+            build_dmint_v1_contract_script,
+            difficulty_to_target,
+        )
+
+        if params.premine_amount is not None:
+            raise ValidationError(
+                "V1 deploy with premine is deferred work — see "
+                "docs/dmint-research-photonic-deploy.md §7.2. Set "
+                "premine_amount=None for now."
+            )
+
+        # 1. Encode the CBOR token body.
+        cbor_bytes, payload_hash = encode_payload(params.metadata)
+
+        # Defensive cross-check: V1 must NOT emit a 'v' field (V2 marker).
+        # encode_payload draws 'v' from metadata.version; if the caller
+        # forgot to leave it at the V1 default, the resulting CBOR would
+        # be classified as V2 by RXinDexer.
+        if b"\x61v" in cbor2.dumps({"v": 1}) and b"\x61v" in cbor_bytes:
+            raise ValidationError(
+                "V1 dMint CBOR must NOT include a 'v' field; got one in the "
+                "encoded body. Set GlyphMetadata(version=None) or omit it."
+            )
+        # Belt-and-braces: also re-decode and pin the 'p' field shape.
+        decoded = cbor2.loads(cbor_bytes)
+        if "p" not in decoded or 1 not in decoded["p"] or 4 not in decoded["p"]:
+            raise ValidationError(
+                f"V1 dMint CBOR 'p' field must include both 1 (FT) and 4 (DMINT); got p={decoded.get('p')!r}"
+            )
+
+        # 2. Build the FT-commit hashlock (75-byte script — exactly the
+        # Photonic ftCommitScript shape; the existing helper produces it).
+        commit_script = build_commit_locking_script(
+            payload_hash,
+            params.owner_pkh,
+            is_nft=False,
+        )
+        # Reveal payload is the bulk; a few hundred bytes for the rest
+        # of the commit tx. Round-trip safe for any sane commit size.
+        estimated_commit_fee = 276 * MIN_FEE_RATE
+        commit_result = CommitResult(
+            commit_script=commit_script,
+            cbor_bytes=cbor_bytes,
+            payload_hash=payload_hash,
+            estimated_fee=estimated_commit_fee,
+        )
+
+        # 3. Pre-build placeholder contract scripts so the caller can
+        # estimate fees before broadcasting the commit. Each is the
+        # full 241-byte V1 layout (state + epilogue); only the txid
+        # component of contractRef/tokenRef changes at reveal time.
+        placeholder_txid = "00" * 32
+        placeholder_token_ref = GlyphRef(txid=placeholder_txid, vout=0)
+        target = difficulty_to_target(params.difficulty, params.algo)
+        placeholder_contract_scripts = tuple(
+            build_dmint_v1_contract_script(
+                height=0,
+                contract_ref=GlyphRef(txid=placeholder_txid, vout=i + 1),
+                token_ref=placeholder_token_ref,
+                max_height=params.max_height,
+                reward=params.reward_photons,
+                target=target,
+                algo=params.algo,
+            )
+            for i in range(params.num_contracts)
+        )
+
+        return DmintV1DeployResult(
+            commit_result=commit_result,
+            cbor_bytes=cbor_bytes,
+            owner_pkh=params.owner_pkh,
+            premine_amount=params.premine_amount,
+            num_contracts=params.num_contracts,
+            placeholder_contract_scripts=placeholder_contract_scripts,
+            max_height=params.max_height,
+            reward_photons=params.reward_photons,
+            difficulty=params.difficulty,
+            algo=params.algo,
+            op_return_msg=params.op_return_msg,
+        )
+
+    def _prepare_dmint_v2_deploy(
+        self,
+        params: DmintV2DeployParams,
+        *,
+        allow_v2_deploy: bool,
+    ) -> DmintV2DeployResult:
+        """Original V2 deploy implementation, gated on ``allow_v2_deploy``."""
         if not allow_v2_deploy:
             raise DmintError(
-                "prepare_dmint_deploy currently emits V2 dMint contracts; no "
-                "ecosystem miner (glyph-miner, etc.) targets V2 and indexer "
-                "behavior on V2 deploys is empirically unknown. Refusing to "
-                "build a token nobody can mine. V1 deploy lands in Milestone 2 "
-                "of the dMint integration plan; until then, pass "
-                "allow_v2_deploy=True if you understand the consequences "
-                "(e.g. SDK-internal testing). See "
-                "docs/plans/2026-05-07-feat-dmint-v1-mint-and-reference-miner-plan.md "
-                "'Deploy-footgun mitigation in M1'."
+                "prepare_dmint_deploy with DmintV2DeployParams emits V2 dMint "
+                "contracts; no ecosystem miner (glyph-miner, etc.) targets V2 "
+                "and indexer behavior on V2 deploys is empirically unknown. "
+                "Refusing to build a token nobody can mine. For V1 (the only "
+                "live mainnet format), pass DmintV1DeployParams instead. To "
+                "deploy V2 anyway (e.g. SDK-internal testing), pass "
+                "allow_v2_deploy=True."
             )
         # 1. Encode the token metadata payload.
         cbor_bytes, payload_hash = encode_payload(params.metadata)
@@ -382,19 +486,10 @@ class GlyphBuilder:
         )
 
         # 3. Build the reveal scripts (token ref UTXO — 75-byte FT locking script).
-        #    The reveal txid and vout are not known until broadcast; they become
-        #    the token ref.  We return the scripts for the caller to assemble.
-        #    The caller must pass the actual commit_txid + commit_vout when
-        #    constructing the reveal tx.
         if params.premine_amount is not None and params.premine_amount < 546:
             raise ValidationError(f"premine_amount ({params.premine_amount}) is below the dust limit (546).")
 
         # 4. Build the deploy contract script.
-        #    The token_ref and contract_ref are only known after the reveal tx
-        #    is confirmed (the reveal outpoint becomes token_ref; the deploy
-        #    outpoint becomes contract_ref).  We return the DmintDeployParams
-        #    template — the caller substitutes actual refs before calling
-        #    build_dmint_contract_script.
         deploy_params_template = DmintDeployParams(
             contract_ref=params.contract_ref_placeholder,
             token_ref=params.token_ref_placeholder,
@@ -417,7 +512,7 @@ class GlyphBuilder:
                 f"reward_photons ({params.reward_photons}) for at least one mint."
             )
 
-        return DmintDeployResult(
+        return DmintV2DeployResult(
             commit_result=commit_result,
             cbor_bytes=cbor_bytes,
             owner_pkh=params.owner_pkh,
@@ -725,9 +820,85 @@ class GlyphBuilder:
 from .dmint import DaaMode, DmintAlgo  # noqa: E402 (after class def — no circular dep)
 
 
+@dataclass(frozen=True)
+class DmintV1DeployParams:
+    """Parameters for a V1 dMint deploy (2-tx: commit + reveal).
+
+    V1 is the only dMint format on Radiant mainnet today. Unlike V2 (which
+    uses a separate deploy tx with a reward pool), V1 emits ``num_contracts``
+    parallel singleton contract UTXOs directly in the reveal — each is the
+    full state+epilogue codescript at height=0. Mining works by spending
+    a contract UTXO and re-creating it at height+1 with the same script
+    template; the reward is paid from a miner-supplied funding input.
+
+    See ``docs/dmint-research-photonic-deploy.md`` for the byte-by-byte
+    chain shape this dataclass drives. Live mainnet example: Radiant
+    Glyph Protocol (GLYPH) at commit a443d9df…878b → reveal b965b32d…9dd6.
+
+    :param metadata:           :class:`GlyphMetadata` for the token. Must
+        include protocol ``[GlyphProtocol.FT, GlyphProtocol.DMINT]`` ([1, 4])
+        and NOT include a ``v`` version field (V2 uses ``v``; V1 omits it).
+    :param owner_pkh:          20-byte PKH of the key that signs commit and
+        all ref-seed P2PKH inputs in the reveal.
+    :param num_contracts:      Count of parallel V1 dMint contract UTXOs to
+        emit. Total supply = ``reward_photons * max_height * num_contracts``.
+        Validated to ``[1, 250]`` at construction. The 250 ceiling is the
+        standardness limit for tx size at typical V1 contract bytes
+        (≈ 241 bytes/contract output + overhead → 250 contracts fits in
+        a ~64 KB reveal before the embedded media body).
+    :param max_height:         Maximum mints per contract (3-byte ceiling).
+    :param reward_photons:     Photons paid per successful mint (3-byte
+        ceiling — see V1 contract state layout).
+    :param difficulty:         Initial PoW difficulty (1 = easiest).
+        Translated to 8-byte target via :func:`difficulty_to_target`.
+    :param premine_amount:     Photons to send to ``owner_pkh`` on the
+        reveal tx as an optional premine FT output. ``None`` = no premine.
+        Filed as deferred work in M2 (`docs/dmint-research-photonic-deploy.md` §7.2);
+        accepted in the dataclass but rejected at build time for now.
+    :param op_return_msg:      Optional OP_RETURN data carrier (raw bytes
+        after the 0x6a prefix). ``None`` = no OP_RETURN output.
+    :param algo:               PoW algorithm. Defaults to ``DmintAlgo.SHA256D``
+        (the only algorithm on V1 mainnet today).
+    """
+
+    metadata: GlyphMetadata
+    owner_pkh: Hex20
+    num_contracts: int
+    max_height: int
+    reward_photons: int
+    difficulty: int
+    premine_amount: int | None = None
+    op_return_msg: bytes | None = None
+    algo: DmintAlgo = DmintAlgo.SHA256D
+
+    def __post_init__(self) -> None:
+        if not (1 <= self.num_contracts <= 250):
+            raise ValidationError(
+                f"num_contracts must be in [1, 250], got {self.num_contracts} "
+                f"(250 is the standardness ceiling for V1 deploy reveal size)"
+            )
+        if self.max_height < 1:
+            raise ValidationError(f"max_height must be >= 1, got {self.max_height}")
+        if self.max_height > 0xFFFFFF:
+            raise ValidationError(f"max_height ({self.max_height}) exceeds V1's 3-byte ceiling (0xFFFFFF)")
+        if self.reward_photons < 1:
+            raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
+        if self.reward_photons > 0xFFFFFF:
+            raise ValidationError(f"reward_photons ({self.reward_photons}) exceeds V1's 3-byte ceiling (0xFFFFFF)")
+        if self.difficulty < 1:
+            raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
+        if self.algo != DmintAlgo.SHA256D:
+            raise ValidationError(
+                f"V1 dMint only supports SHA256d; got {self.algo}. Use DmintV2DeployParams for blake3/k12."
+            )
+
+
 @dataclass
-class DmintFullDeployParams:
-    """Parameters for a full dMint token deploy (commit + reveal + deploy).
+class DmintV2DeployParams:
+    """Parameters for a V2 dMint token deploy (commit + reveal + deploy).
+
+    V2 has no live mainnet deploys; only `prepare_dmint_deploy(..., allow_v2_deploy=True)`
+    will accept it. The ecosystem (glyph-miner, RXinDexer) targets V1 only.
 
     :param metadata:                  :class:`GlyphMetadata` for the token
                                       (must include ``GlyphProtocol.FT`` and
@@ -775,9 +946,190 @@ class DmintFullDeployParams:
             self.token_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
 
 
+class DmintFullDeployParams(DmintV2DeployParams):
+    """Deprecated alias for :class:`DmintV2DeployParams`.
+
+    Kept as a real subclass (NOT a bare type alias) so ``__init__``
+    emits a ``DeprecationWarning`` at construction time — a bare alias
+    would only warn if callers introspect the class. Scheduled for
+    removal in pyrxd v0.6.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        import warnings
+
+        warnings.warn(
+            "DmintFullDeployParams is deprecated; use DmintV2DeployParams "
+            "(or the new DmintV1DeployParams for V1 deploys, which is what "
+            "every live mainnet token uses). DmintFullDeployParams will be "
+            "removed in pyrxd v0.6.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
+
+
+@dataclass(frozen=True)
+class DmintV1RevealScripts:
+    """Output scripts for the V1 dMint deploy reveal tx.
+
+    Mirrors the shape of :class:`FtDeployRevealScripts` (a flat
+    locking-script + scriptsig-suffix bag), but with V1's distinctive
+    multi-output structure: N contract scripts + optional premine FT
+    + optional OP_RETURN. The caller composes these into a transaction
+    in declared order, signs each input, and broadcasts.
+
+    :param contract_scripts:  Tuple of full V1 dMint contract output
+        scripts (state + epilogue), one per parallel contract. Length
+        equals the deploy's ``num_contracts``. Each is the 241-byte
+        layout at height=0 with ``contractRef[i] = (commit_txid, i+1)``
+        and ``tokenRef = (commit_txid, 0)``.
+    :param contract_value:    Photons per contract output. Always 1
+        (V1 contracts are singletons — the photon value stays at 1
+        as the contract advances).
+    :param cbor_bytes:        Encoded CBOR token body. Caller pushes
+        this in the reveal's vin[0] scriptSig (after sig + pubkey),
+        preceded by the ``gly`` magic bytes push.
+    :param scriptsig_suffix:  The push sequence ``<gly> <CBOR>`` ready
+        to append after ``<sig> <pubkey>`` for vin[0]. Mirrors the
+        :class:`FtDeployRevealScripts.scriptsig_suffix` convention.
+    :param premine_script:    Locking script for an optional premine
+        FT output (``None`` = no premine). Deferred work in M2 — the
+        builder currently raises if ``premine_amount`` is set.
+    :param premine_amount:    Photons for the premine output (``None``
+        if no premine).
+    :param op_return_script:  Locking script for an optional OP_RETURN
+        data carrier (``None`` if no OP_RETURN).
+    """
+
+    contract_scripts: tuple[bytes, ...]
+    contract_value: int
+    cbor_bytes: bytes
+    scriptsig_suffix: bytes
+    premine_script: bytes | None
+    premine_amount: int | None
+    op_return_script: bytes | None
+
+
+@dataclass(frozen=True)
+class DmintV1DeployResult:
+    """Output of :meth:`GlyphBuilder.prepare_dmint_deploy` for V1 deploys.
+
+    Carries everything the caller needs to broadcast a V1 deploy:
+    the commit-tx script + CBOR body, plus a deferred-builder method
+    that produces the reveal-tx outputs once the commit confirms.
+
+    V1 differs from V2 in that there is no separate deploy tx — the
+    reveal directly creates the parallel contract UTXOs. So this
+    result has no ``deploy_params_template`` / ``initial_pool_photons``
+    / ``placeholder_contract_script`` fields; instead it carries
+    ``placeholder_contract_scripts`` (one per parallel contract) for
+    fee estimation before the commit txid is known.
+
+    :param commit_result:                 :class:`CommitResult` — commit-tx
+        script + fee. Same shape as the V2 result's field.
+    :param cbor_bytes:                    Encoded CBOR token body.
+    :param owner_pkh:                     20-byte PKH of the deploy key.
+    :param premine_amount:                Photons for optional premine
+        output, or ``None``. Deferred work in M2 — must be ``None``.
+    :param num_contracts:                 Count of parallel V1 contracts.
+    :param placeholder_contract_scripts:  Tuple of N contract scripts built
+        with the placeholder commit txid (00…00). Each is the same byte
+        length as the final contract script — the only difference is the
+        ``contractRef`` / ``tokenRef`` txid component. Use the length
+        for fee estimation.
+    :param max_height:                    Echoed from params for
+        ``build_reveal_outputs`` access.
+    :param reward_photons:                Echoed from params.
+    :param difficulty:                    Echoed from params.
+    :param algo:                          Echoed from params.
+    :param op_return_msg:                 Echoed from params.
+    """
+
+    commit_result: CommitResult
+    cbor_bytes: bytes
+    owner_pkh: Hex20
+    premine_amount: int | None
+    num_contracts: int
+    placeholder_contract_scripts: tuple[bytes, ...]
+    max_height: int
+    reward_photons: int
+    difficulty: int
+    algo: DmintAlgo
+    op_return_msg: bytes | None
+
+    def build_reveal_outputs(self, commit_txid: str) -> DmintV1RevealScripts:
+        """Build reveal-tx output scripts given the confirmed commit txid.
+
+        The V1 reveal:
+        * spends commit vouts 0 + 1..N + (N+1 NFT-commit) + (N+2 change)
+        * emits N parallel dMint contract UTXOs at vouts 0..N-1
+        * emits the FT NFT singleton + auth NFT singleton + change
+
+        The method name is ``build_reveal_outputs`` (not
+        ``build_reveal_scripts`` as in V2) because V1's reveal directly
+        creates the *output* contract UTXOs — there is no separate
+        deploy tx. The arity also differs from V2's (no commit_vout /
+        commit_value needed: V1 input values are protocol constants).
+        Distinct names prevent silent polymorphic-call TypeErrors.
+
+        :param commit_txid:  txid of the confirmed commit tx.
+        :returns:            :class:`DmintV1RevealScripts` ready to be
+            placed into the reveal tx's outputs.
+        """
+        from .dmint import (
+            build_dmint_v1_contract_script,
+            difficulty_to_target,
+        )
+
+        if self.premine_amount is not None:
+            raise NotImplementedError(
+                "V1 deploy with premine is deferred work — see "
+                "docs/dmint-research-photonic-deploy.md §7.2. Set "
+                "premine_amount=None for now."
+            )
+
+        token_ref = GlyphRef(txid=commit_txid, vout=0)
+        target = difficulty_to_target(self.difficulty, self.algo)
+        contract_scripts = tuple(
+            build_dmint_v1_contract_script(
+                height=0,
+                contract_ref=GlyphRef(txid=commit_txid, vout=i + 1),
+                token_ref=token_ref,
+                max_height=self.max_height,
+                reward=self.reward_photons,
+                target=target,
+                algo=self.algo,
+            )
+            for i in range(self.num_contracts)
+        )
+        scriptsig_suffix = build_reveal_scriptsig_suffix(self.cbor_bytes)
+
+        op_return_script: bytes | None = None
+        if self.op_return_msg is not None:
+            # OP_RETURN <push msg>. Use direct push when len <= 75.
+            msg = self.op_return_msg
+            if len(msg) <= 75:
+                op_return_script = bytes([0x6A, len(msg)]) + msg
+            elif len(msg) <= 255:
+                op_return_script = bytes([0x6A, 0x4C, len(msg)]) + msg  # OP_RETURN OP_PUSHDATA1 <len> <msg>
+            else:
+                raise ValidationError(f"op_return_msg too long: {len(msg)} bytes (cap at 255 for now)")
+
+        return DmintV1RevealScripts(
+            contract_scripts=contract_scripts,
+            contract_value=1,
+            cbor_bytes=self.cbor_bytes,
+            scriptsig_suffix=scriptsig_suffix,
+            premine_script=None,
+            premine_amount=None,
+            op_return_script=op_return_script,
+        )
+
+
 @dataclass
-class DmintDeployResult:
-    """Output of :meth:`GlyphBuilder.prepare_dmint_deploy`.
+class DmintV2DeployResult:
+    """Output of :meth:`GlyphBuilder.prepare_dmint_deploy` for V2 deploys.
 
     :param commit_result:               :class:`CommitResult` — scripts + fee for the
                                         commit tx (same as :meth:`prepare_commit` output).
@@ -861,6 +1213,33 @@ class DmintDeployResult:
             half_life=self.deploy_params_template.half_life,
         )
         return build_dmint_contract_script(real_params)
+
+
+class DmintDeployResult(DmintV2DeployResult):
+    """Deprecated alias for :class:`DmintV2DeployResult`.
+
+    Mirrors the params-side ``DmintFullDeployParams`` deprecation alias.
+    Kept as a real subclass (NOT a bare type alias) so ``__init__``
+    emits a ``DeprecationWarning`` at construction time. Scheduled for
+    removal in pyrxd v0.6.
+
+    Callers receiving an instance of this class today are talking to the
+    V2 path; the only way to get one is to construct it directly, since
+    the dispatcher always returns the concrete V1/V2 result. Tests that
+    held the legacy reference type need to be migrated.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        import warnings
+
+        warnings.warn(
+            "DmintDeployResult is deprecated; use DmintV2DeployResult "
+            "(or DmintV1DeployResult for V1 deploys). DmintDeployResult "
+            "will be removed in pyrxd v0.6.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        super().__init__(*args, **kwargs)
 
 
 # Module-level dataclasses for the transfer API. Kept at bottom so the docstring

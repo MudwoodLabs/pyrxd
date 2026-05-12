@@ -204,21 +204,52 @@ class TestCborInjection:
     """CBOR decoding must reject malformed / unexpected inputs."""
 
     def test_cbor_oversize_raises(self):
-        """>65535 bytes is rejected by build_reveal_scriptsig_suffix."""
-        oversize = bytes(65536)
+        """Above the hard cap (262 KB), build_reveal_scriptsig_suffix rejects.
+
+        Previously the cap was 65,535 bytes (OP_PUSHDATA2 max). The mainnet
+        GLYPH reveal at b965b32d…9dd6 used a 65,569-byte payload via
+        OP_PUSHDATA4, proving real tokens exceed the PUSHDATA2 boundary.
+        Cap raised to _MAX_CBOR_PAYLOAD_BYTES (262144) on 2026-05-11 per
+        red-team finding R3.
+        """
+        oversize = bytes(262_145)  # 1 past the 256 KB cap
         with pytest.raises(ValidationError, match="too large"):
             build_reveal_scriptsig_suffix(oversize)
 
     def test_cbor_just_past_limit_raises(self):
-        """Exactly 65536 bytes is one past the OP_PUSHDATA2 limit."""
+        """Exactly 262 145 bytes is one past the _MAX_CBOR_PAYLOAD_BYTES cap."""
         with pytest.raises(ValidationError):
-            build_reveal_scriptsig_suffix(bytes(65536))
+            build_reveal_scriptsig_suffix(bytes(262_145))
 
     def test_cbor_at_pushdata2_max_is_accepted(self):
-        """65535 bytes is the largest accepted size."""
+        """65535 bytes is the largest size encoded with OP_PUSHDATA2."""
         suffix = build_reveal_scriptsig_suffix(bytes(65535))
         # gly push(4) + 0x4d + 2 length bytes + 65535 payload
         assert len(suffix) == 4 + 1 + 2 + 65535
+        # First byte after gly push is 0x4d (OP_PUSHDATA2)
+        assert suffix[4] == 0x4D
+
+    def test_cbor_pushdata4_at_65536_is_accepted(self):
+        """At 65536 bytes the encoder switches to OP_PUSHDATA4.
+
+        Pinned against the mainnet GLYPH reveal b965b32d…9dd6 which used
+        a 65 569-byte payload encoded with PUSHDATA4. Without PUSHDATA4
+        support pyrxd could not build the byte shape live Radiant
+        indexers parse.
+        """
+        suffix = build_reveal_scriptsig_suffix(bytes(65536))
+        # gly push(4) + 0x4e + 4 length bytes + 65536 payload
+        assert len(suffix) == 4 + 1 + 4 + 65536
+        assert suffix[4] == 0x4E  # OP_PUSHDATA4
+        # Little-endian length should decode to 65536
+        assert int.from_bytes(suffix[5:9], "little") == 65536
+
+    def test_cbor_at_262144_pushdata4_max_is_accepted(self):
+        """The hard cap (256 KB / 262144 bytes) is the largest accepted size."""
+        suffix = build_reveal_scriptsig_suffix(bytes(262_144))
+        assert len(suffix) == 4 + 1 + 4 + 262_144
+        assert suffix[4] == 0x4E
+        assert int.from_bytes(suffix[5:9], "little") == 262_144
 
     def test_cbor_with_unknown_keys_is_silently_ignored(self):
         """
@@ -705,9 +736,24 @@ class TestScriptSigSuffixEncoding:
         assert body[1:3] == (65535).to_bytes(2, "little")
         assert body[3:] == cbor
 
-    def test_65536_bytes_rejected(self):
+    def test_65536_bytes_switches_to_pushdata4(self):
+        """65 536 bytes: encoded as 0x4e <len_le_4bytes> + data (OP_PUSHDATA4).
+
+        Per 2026-05-11 red-team finding R3 the cap moved from PUSHDATA2
+        (65 535 B) to a 256 KB hard cap via PUSHDATA4. Pinned against the
+        mainnet GLYPH reveal b965b32d…9dd6 which used a 65 569-byte
+        CBOR body in PUSHDATA4 form.
+        """
+        cbor = bytes(65536)
+        body = self._suffix_body(cbor)
+        assert body[0] == 0x4E
+        assert body[1:5] == (65536).to_bytes(4, "little")
+        assert body[5:] == cbor
+        assert len(build_reveal_scriptsig_suffix(cbor)) == 4 + 5 + 65536
+
+    def test_oversize_above_hard_cap_rejected(self):
         with pytest.raises(ValidationError, match="too large"):
-            build_reveal_scriptsig_suffix(bytes(65536))
+            build_reveal_scriptsig_suffix(bytes(262_145))
 
     def test_inspector_parses_every_boundary(self):
         """
@@ -729,6 +775,49 @@ class TestScriptSigSuffixEncoding:
             scriptsig = dummy_sig + dummy_pk + suffix
             decoded = inspector.extract_reveal_metadata(scriptsig)
             assert decoded is not None, f"Inspector failed at size {len(cbor_bytes)}"
+            assert list(decoded.protocol) == [2]
+
+    def test_inspector_parses_pushdata4_payload_sizes(self):
+        """Round-trip exercise of the PUSHDATA4 size range (≥65 536 bytes).
+
+        ``test_inspector_parses_every_boundary`` above caps at 300 bytes
+        because GlyphMetadata.description is bounded at 1000 chars and
+        can't drive the encoder into PUSHDATA4 territory. This test
+        builds CBOR payloads large enough to force the PUSHDATA4
+        encoding and round-trips them through the production
+        ``inspector.extract_reveal_metadata`` path to confirm the
+        parser reads ``0x4e`` push opcodes correctly.
+
+        Added 2026-05-11 to close the round-trip coverage gap surfaced
+        by the R3 re-audit (builder writes ``cbor_len.to_bytes(4,
+        'little')``; parser reads ``int.from_bytes(scriptsig[pos:
+        pos+4], 'little')`` — byte-symmetric by inspection but not
+        exercised end-to-end at scale until now).
+        """
+        inspector = GlyphInspector()
+        for size_hint in (65535, 65536, 65569, 100_000):
+            # Build a valid GlyphMetadata-shaped CBOR map with arbitrary
+            # padding under an unknown key so the encoder hits the target
+            # size. Unknown keys are silently dropped on decode (documented
+            # in test_cbor_with_unknown_keys_is_silently_ignored above),
+            # which is fine — we only care that the parser walks the
+            # PUSHDATA4 envelope correctly.
+            base = cbor2.dumps({"p": [2]})
+            pad_bytes = max(0, size_hint - len(base) - 6)  # 6 = overhead for "_x" key + bytes header
+            payload = {"p": [2], "_x": b"\x00" * pad_bytes}
+            cbor_bytes = cbor2.dumps(payload)
+            suffix = build_reveal_scriptsig_suffix(cbor_bytes)
+            if len(cbor_bytes) <= 65535:
+                assert suffix[4] == 0x4D, f"expected PUSHDATA2 at cbor_len={len(cbor_bytes)}"
+            else:
+                assert suffix[4] == 0x4E, f"expected PUSHDATA4 at cbor_len={len(cbor_bytes)}"
+            dummy_sig = bytes([0x47]) + bytes(71)
+            dummy_pk = bytes([0x21]) + bytes(33)
+            scriptsig = dummy_sig + dummy_pk + suffix
+            decoded = inspector.extract_reveal_metadata(scriptsig)
+            assert decoded is not None, (
+                f"Inspector failed at cbor_len={len(cbor_bytes)} (push opcode 0x{suffix[4]:02x})"
+            )
             assert list(decoded.protocol) == [2]
 
 
