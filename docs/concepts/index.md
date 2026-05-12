@@ -9,6 +9,7 @@ and how Radiant differs from related blockchains.
 gravity
 radiant-fts-are-on-chain
 dmint-v1-deploy
+v1-mint-mechanics
 ```
 
 ## Available now
@@ -27,6 +28,12 @@ dmint-v1-deploy
   to Radiant Glyph Protocol), why pyrxd refuses to emit V2 by default,
   and the five Photonic divergences pyrxd ships with. Read this before
   using `prepare_dmint_deploy` with `DmintV1DeployParams`.
+- **[V1 dMint mint mechanics: claiming a contract UTXO](v1-mint-mechanics.md)** —
+  the canonical 4-output mint tx, the 72-byte scriptSig push
+  convention, the 64-byte PoW preimage layout, and the
+  FT-conservation check the V1 covenant enforces on the reward
+  output. Anchored to two mainnet golden vectors (snk `146a4d68…f3c`
+  and pyrxd's PXD `c9fdcd34…e530`).
 
 ## Adjacent reading (not yet promoted to concept docs)
 
