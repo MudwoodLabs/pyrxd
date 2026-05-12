@@ -9,6 +9,7 @@ and how Radiant differs from related blockchains.
 gravity
 radiant-fts-are-on-chain
 dmint-v1-deploy
+glyph-inspect-tool
 ```
 
 ## Available now
@@ -27,6 +28,12 @@ dmint-v1-deploy
   to Radiant Glyph Protocol), why pyrxd refuses to emit V2 by default,
   and the five Photonic divergences pyrxd ships with. Read this before
   using `prepare_dmint_deploy` with `DmintV1DeployParams`.
+- **[Glyph inspect tool: structural match, not semantic correctness](glyph-inspect-tool.md)** —
+  what `pyrxd glyph inspect` (CLI) and the browser-hosted Pyodide
+  inspector at `/inspect/` actually classify, the structural-match
+  qualifier on every output, the tx-shape banner (FT/NFT/dMint
+  deploy/claim, burn, mutable update), V1-vs-V2 mint scriptSig decode,
+  and the SHA-256 install-time integrity model of the browser variant.
 
 ## Adjacent reading (not yet promoted to concept docs)
 
