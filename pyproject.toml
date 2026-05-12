@@ -76,7 +76,6 @@ coincurve = "^21.0.0"
 base58 = "^2.1.1"
 pycryptodomex = "^3.22.0"
 websockets = ">=15.0.1,<17.0.0"
-websocket-client = "^1.9.0"
 cbor2 = "^6.0"
 click = "^8.3"
 # tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
