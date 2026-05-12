@@ -1421,6 +1421,22 @@ def _render_txid_human(payload: dict) -> str:
             lines.append(f"  decimals: {metadata['decimals']}")
         if metadata.get("main"):
             lines.append(f"  main:     {metadata['main']}")
+    # dMint mint-claim scriptSig (vin[0] only). 4 canonical pushes:
+    # nonce, SHA256d(funding_script), SHA256d(OP_RETURN_script), OP_0.
+    # V1 = 4-byte nonce / 72-byte scriptSig; V2 = 8-byte / 76-byte.
+    mint_scriptsig = payload.get("mint_scriptsig")
+    if mint_scriptsig is not None:
+        lines.append("")
+        lines.append("dMint mint scriptSig (vin 0):")
+        lines.append(f"  version (by nonce width): {mint_scriptsig.get('version_hint', '?')}")
+        lines.append(f"  scriptSig length:         {mint_scriptsig.get('scriptsig_length')} bytes")
+        lines.append(f"  nonce (LE):               {mint_scriptsig.get('nonce_hex')}")
+        lines.append(f"  input  hash (SHA256d):    {mint_scriptsig.get('input_hash')}")
+        lines.append(f"  output hash (SHA256d):    {mint_scriptsig.get('output_hash')}")
+        lines.append("  (input  hash = SHA256d of the funding-input locking script;")
+        lines.append("   output hash = SHA256d of the OP_RETURN message script at vout[2];")
+        lines.append("   these are literal SHA256d pushes, not preimage halves —")
+        lines.append("   the covenant recomputes SHA256(input_hash || output_hash))")
     return "\n".join(lines)
 
 
@@ -1541,8 +1557,11 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool)
                             algo, daa_mode
         type=unknown      → (no extra fields)
       txid (--fetch)   → {form, txid, byte_length, input_count, output_count,
-                          outputs[], metadata}
+                          outputs[], metadata, mint_scriptsig}
         outputs[]: {vout, type, satoshis, ...same per-type fields as script form}
+        mint_scriptsig: null OR {nonce_hex, input_hash, output_hash,
+                          version_hint ("v1"|"v2"), scriptsig_length} —
+                          present when vin[0] is a dMint V1/V2 mint claim
 
     All hex values are lowercase. Outpoints render as "txid:vout"
     (display order). Wire forms (txid reversed + vout LE) appear under

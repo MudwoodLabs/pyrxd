@@ -170,7 +170,13 @@ async def _filter_plain_funding_utxos(utxos: list, address: str) -> list:
     for u in utxos:
         try:
             raw = await fetch_raw_tx(u["tx_hash"])
-        except Exception as e:
+        except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as e:
+            # Narrow set of failure modes from the local _ws_call shim:
+            # OSError covers connection drops, ValueError covers protocol
+            # decode failures, RuntimeError covers ElectrumX RPC errors,
+            # JSONDecodeError covers malformed responses. A broader catch
+            # would mask programming errors (e.g. a typo'd attribute on
+            # the response shape) that should crash loudly.
             print(f"  [skip] could not fetch source tx for {u['tx_hash']}: {e}")
             continue
         tx = Transaction.from_hex(raw)

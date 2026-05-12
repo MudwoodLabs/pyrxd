@@ -423,6 +423,11 @@ _HEX_FIELDS_NEVER_TRUNCATED = frozenset(
         "payload_hash",
         "wire_hex",
         "input",
+        # dMint mint-claim scriptSig pushes — exact bytes are load-bearing
+        # for verifying a covenant push against an off-chain re-derivation.
+        "nonce_hex",
+        "input_hash",
+        "output_hash",
     }
 )
 
