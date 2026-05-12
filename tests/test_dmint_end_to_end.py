@@ -22,6 +22,7 @@ from pyrxd.glyph.dmint import (
     DmintAlgo,
     DmintContractUtxo,
     DmintDeployParams,
+    DmintMinerFundingUtxo,
     DmintState,
     build_dmint_contract_script,
     build_dmint_mint_tx,
@@ -699,3 +700,186 @@ class TestBuildDmintMintTx:
         result2 = build_dmint_mint_tx(utxo2, _NONCE, _MINER_PKH, _CURRENT_TIME + 60)
         assert result2.updated_state.height == 2
         assert result2.updated_state.last_time == _CURRENT_TIME + 60
+
+
+# ---------------------------------------------------------------------------
+# build_dmint_v2_mint_preimage — V2 analog of the V1 helper
+# ---------------------------------------------------------------------------
+#
+# Added 2026-05-12 to close the security audit's H1 finding: V2 had no
+# preimage helper that pulled the input/output scripts from the unsigned
+# tx, so a V2 caller could reproduce the M1-class bug by feeding wrong
+# scripts to `build_pow_preimage` directly. The V2 helper mirrors V1
+# byte-for-byte (the preimage shape doesn't differ between versions;
+# only the nonce width does, and that's a parameter of
+# `build_mint_scriptsig`, not this helper).
+#
+# Every test below uses synthetic V2 fixtures because no V2 contract
+# exists on chain to validate against. The helper itself emits
+# V2UnvalidatedWarning to make the "untested on chain" status visible
+# at runtime; tests suppress the warning where it would otherwise
+# create test-output noise.
+
+
+_FUNDING_VALUE = 500_000_000  # 5 RXD, plenty for fee + reward + change
+
+
+def _make_funding_utxo(value: int = _FUNDING_VALUE) -> DmintMinerFundingUtxo:
+    """Synthetic plain-RXD funding UTXO for V2 preimage tests."""
+    return DmintMinerFundingUtxo(
+        txid="aa" * 32,
+        vout=0,
+        value=value,
+        script=b"\x76\xa9\x14" + bytes(20) + b"\x88\xac",  # P2PKH to zero-PKH
+    )
+
+
+class TestBuildDmintV2MintPreimage:
+    """The library helper that closes audit finding security-H1.
+
+    V2 callers must use this helper instead of calling `build_pow_preimage`
+    directly with caller-chosen scripts — otherwise they reproduce the
+    M1-class footgun where mismatched scripts produce a preimage that
+    fails the covenant check after mining.
+
+    Unlike the V1 helper (which infers ``output_script`` from
+    ``unsigned_tx.outputs[2]`` per Photonic-Wallet convention), the V2
+    helper takes ``output_script`` as an explicit argument. V2 has no
+    canonical output-layout convention — the covenant binds outputHash
+    to whatever bytes the caller pushes, so V2 callers must commit to
+    a specific output script themselves.
+    """
+
+    # A synthetic V2 "output script" for tests. The actual byte content
+    # is arbitrary — the covenant only cares that the SAME bytes get
+    # hashed on both miner and chain sides.
+    _SYNTH_OUTPUT_SCRIPT = bytes.fromhex("6a045465737400")  # OP_RETURN "Test\x00"
+
+    def test_returns_pow_preimage_result(self):
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_v2_mint_preimage
+
+        utxo = _make_contract_utxo()
+        funding = _make_funding_utxo()
+        with pytest.warns(V2UnvalidatedWarning):
+            result = build_dmint_v2_mint_preimage(utxo, funding, self._SYNTH_OUTPUT_SCRIPT)
+        assert len(result.preimage) == 64
+        assert len(result.input_hash) == 32
+        assert len(result.output_hash) == 32
+
+    def test_input_hash_is_sha256d_of_funding_script(self):
+        """The covenant pulls inputHash from the scriptSig push and
+        expects it to equal SHA256d(funding_script). Same convention
+        as V1 — and the same invariant the M1 bug violated."""
+        import hashlib
+        import warnings
+
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_v2_mint_preimage
+
+        utxo = _make_contract_utxo()
+        funding = _make_funding_utxo()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", V2UnvalidatedWarning)
+            result = build_dmint_v2_mint_preimage(utxo, funding, self._SYNTH_OUTPUT_SCRIPT)
+        expected = hashlib.sha256(hashlib.sha256(funding.script).digest()).digest()
+        assert result.input_hash == expected
+
+    def test_output_hash_is_sha256d_of_caller_supplied_output_script(self):
+        """The covenant pulls outputHash from the scriptSig push and
+        expects it to equal SHA256d(caller's output_script)."""
+        import hashlib
+        import warnings
+
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_v2_mint_preimage
+
+        utxo = _make_contract_utxo()
+        funding = _make_funding_utxo()
+        custom_script = bytes.fromhex("6a065769746e657373")  # OP_RETURN "Witness"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", V2UnvalidatedWarning)
+            result = build_dmint_v2_mint_preimage(utxo, funding, custom_script)
+        expected = hashlib.sha256(hashlib.sha256(custom_script).digest()).digest()
+        assert result.output_hash == expected
+
+    def test_preimage_byte_identical_to_direct_build_pow_preimage(self):
+        """The V2 helper must be byte-equivalent to a hand-built
+        `build_pow_preimage` call with the exact same field bindings —
+        same property the V1 helper has."""
+        import warnings
+
+        from pyrxd.glyph.dmint import (
+            V2UnvalidatedWarning,
+            build_dmint_v2_mint_preimage,
+            build_pow_preimage,
+        )
+
+        utxo = _make_contract_utxo()
+        funding = _make_funding_utxo()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", V2UnvalidatedWarning)
+            actual = build_dmint_v2_mint_preimage(utxo, funding, self._SYNTH_OUTPUT_SCRIPT)
+        expected = build_pow_preimage(
+            txid_le=bytes.fromhex(utxo.txid)[::-1],
+            contract_ref_bytes=utxo.state.contract_ref.to_bytes(),
+            input_script=funding.script,
+            output_script=self._SYNTH_OUTPUT_SCRIPT,
+        )
+        assert actual.preimage == expected.preimage
+        assert actual.input_hash == expected.input_hash
+        assert actual.output_hash == expected.output_hash
+
+    def test_refuses_v1_contract_utxo(self):
+        """Passing a V1 contract UTXO to the V2 helper is a programming
+        error — must raise immediately rather than silently produce a
+        preimage with the wrong nonce-width binding downstream."""
+        import warnings
+
+        from pyrxd.glyph.dmint import (
+            DmintContractUtxo,
+            DmintState,
+            V2UnvalidatedWarning,
+            build_dmint_v1_contract_script,
+            build_dmint_v2_mint_preimage,
+        )
+        from pyrxd.security.errors import ValidationError
+
+        v1_script = build_dmint_v1_contract_script(
+            height=0,
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=10,
+            reward=1000,
+            target=0x7FFFFFFFFFFFFFFF,
+        )
+        v1_state = DmintState.from_script(v1_script)
+        assert v1_state.is_v1  # sanity check
+        v1_utxo = DmintContractUtxo(txid="cc" * 32, vout=0, value=1, script=v1_script, state=v1_state)
+        funding = _make_funding_utxo()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", V2UnvalidatedWarning)
+            with pytest.raises(ValidationError, match="V1 contract UTXO"):
+                build_dmint_v2_mint_preimage(v1_utxo, funding, self._SYNTH_OUTPUT_SCRIPT)
+
+    def test_refuses_empty_output_script(self):
+        """Empty output_script would produce a degenerate preimage —
+        rejected at the boundary rather than silently allowed."""
+        import warnings
+
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_v2_mint_preimage
+        from pyrxd.security.errors import ValidationError
+
+        utxo = _make_contract_utxo()
+        funding = _make_funding_utxo()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", V2UnvalidatedWarning)
+            with pytest.raises(ValidationError, match="output_script must be non-empty"):
+                build_dmint_v2_mint_preimage(utxo, funding, b"")
+
+    def test_emits_v2_unvalidated_warning(self):
+        """The helper itself emits V2UnvalidatedWarning (audit H1's
+        "make untested status visible at runtime" requirement)."""
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_v2_mint_preimage
+
+        utxo = _make_contract_utxo()
+        funding = _make_funding_utxo()
+        with pytest.warns(V2UnvalidatedWarning, match="V2 dMint code path"):
+            build_dmint_v2_mint_preimage(utxo, funding, self._SYNTH_OUTPUT_SCRIPT)

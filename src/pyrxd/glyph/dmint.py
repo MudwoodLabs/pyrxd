@@ -12,6 +12,7 @@ import hashlib
 import math
 import struct
 import time
+import warnings
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Literal
@@ -26,6 +27,61 @@ from pyrxd.security.errors import (
 )
 
 from .types import GlyphRef
+
+# ---------------------------------------------------------------------------
+# V2 quarantine marker
+# ---------------------------------------------------------------------------
+#
+# V2 dMint is implemented per spec but **has never been validated against
+# on-chain bytes** — no V2 contract exists on Radiant mainnet as of pyrxd
+# 0.5.1. Every protocol-level claim in the V2 path is byte-derived from
+# the V1 covenant (where the two share bytecode, e.g. ``_PART_C``) or
+# from the V2 design doc; nothing is cross-validated against live
+# transactions. This is the same anti-pattern that produced the M1
+# mint-shape bug (docs/solutions/logic-errors/dmint-v1-mint-shape-mismatch.md)
+# and the V2 reward-shape bug caught by the 0.5.0 red-team audit. The
+# quarantine warning below is the smallest reversible signal we can put
+# on every V2 entry point to make the "this path has never run on chain"
+# status visible at runtime.
+
+
+class V2UnvalidatedWarning(UserWarning):
+    """Warning category for V2 dMint code paths that have not been
+    validated against on-chain bytes.
+
+    Distinct from ``DeprecationWarning`` because V2 isn't going away —
+    it's just not field-tested yet. Distinct from a bare ``UserWarning``
+    because callers should be able to filter it specifically (e.g.
+    ``warnings.simplefilter("error", V2UnvalidatedWarning)`` to make CI
+    fail hard on V2 use, or ``warnings.simplefilter("ignore",
+    V2UnvalidatedWarning)`` once a V2 contract is live and the warning
+    becomes noise).
+
+    Will be removed (or reclassified) when V2 has its first mainnet
+    deploy + mint + several blocks of confirmed activity.
+    """
+
+
+_V2_QUARANTINE_TEXT = (
+    "V2 dMint code path: pyrxd's V2 implementation is BYTE-EQUIVALENT "
+    "BY CONSTRUCTION to V1 where they share bytecode, but no V2 contract "
+    "exists on Radiant mainnet as of 0.5.1 — this path has never been "
+    "exercised against live consensus. Use V1 (DmintV1DeployParams) "
+    "unless you have a specific reason to test V2. To silence: "
+    "warnings.simplefilter('ignore', V2UnvalidatedWarning); to fail "
+    "loud: warnings.simplefilter('error', V2UnvalidatedWarning)."
+)
+
+
+def _warn_v2_unvalidated(stacklevel: int = 3) -> None:
+    """Emit the one-time V2 quarantine warning.
+
+    ``stacklevel=3`` so the warning points at the caller's call site, not
+    at this helper or the V2 entry-point function that called it. Adjust
+    if the call chain deepens.
+    """
+    warnings.warn(_V2_QUARANTINE_TEXT, V2UnvalidatedWarning, stacklevel=stacklevel)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -297,7 +353,14 @@ def build_dmint_state_script(params: DmintDeployParams) -> bytes:
         height(4B LE) | d8:contractRef(36B) | d0:tokenRef(36B) |
         maxHeight | reward | algoId | daaMode | targetTime |
         lastTime(4B LE) | target
+
+    .. warning::
+       V2 has never been validated on Radiant mainnet (no V2 contract
+       exists as of pyrxd 0.5.1). Emits :class:`V2UnvalidatedWarning`
+       once per call site. Use V1 (``build_dmint_v1_state_script``)
+       unless you have a specific reason to test V2.
     """
+    _warn_v2_unvalidated()
     target = params.initial_target
     return (
         _push_4bytes_le(params.height)
@@ -316,15 +379,32 @@ def build_dmint_state_script(params: DmintDeployParams) -> bytes:
 
 
 def build_dmint_code_script(params: DmintDeployParams) -> bytes:
-    """Build the V2 dMint code bytecode (Part A + powHashOp + Part B + Part C)."""
+    """Build the V2 dMint code bytecode (Part A + powHashOp + Part B + Part C).
+
+    .. warning::
+       V2-only. See :class:`V2UnvalidatedWarning`.
+    """
+    _warn_v2_unvalidated()
     pow_op = _POW_HASH_OP[params.algo]
     part_b = _build_part_b(params.daa_mode, params.half_life)
     return _PART_A + pow_op + part_b + _PART_C
 
 
 def build_dmint_contract_script(params: DmintDeployParams) -> bytes:
-    """Build the full V2 dMint output script: state + OP_STATESEPARATOR + code."""
-    return build_dmint_state_script(params) + _OP_STATESEPARATOR + build_dmint_code_script(params)
+    """Build the full V2 dMint output script: state + OP_STATESEPARATOR + code.
+
+    .. warning::
+       V2-only. See :class:`V2UnvalidatedWarning`.
+    """
+    # Don't double-warn: the two helpers we delegate to already warn.
+    # Suppress here so a caller sees exactly one warning per
+    # build_dmint_contract_script call (not three).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", V2UnvalidatedWarning)
+        state = build_dmint_state_script(params)
+        code = build_dmint_code_script(params)
+    _warn_v2_unvalidated()
+    return state + _OP_STATESEPARATOR + code
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +732,13 @@ def compute_next_target_asert(
     drift > 0 → target <<= drift (easier)
     drift < 0 → target >>= |drift| (harder)
     Minimum target is 1.
+
+    .. warning::
+       V2-only DAA. V1 has no DAA (fixed difficulty). Emits
+       :class:`V2UnvalidatedWarning` — no V2 contract has run this
+       formula on chain.
     """
+    _warn_v2_unvalidated()
     time_delta = current_time - last_time
     excess = time_delta - target_time
     drift = excess // half_life
@@ -674,7 +760,12 @@ def compute_next_target_linear(
     current_time: int,
     target_time: int,
 ) -> int:
-    """Compute next linear DAA target: new_target = old_target * time_delta / target_time."""
+    """Compute next linear DAA target: new_target = old_target * time_delta / target_time.
+
+    .. warning::
+       V2-only DAA. See :class:`V2UnvalidatedWarning`.
+    """
+    _warn_v2_unvalidated()
     time_delta = current_time - last_time
     new_target = current_target * time_delta // target_time
     return max(1, new_target)
@@ -2374,6 +2465,83 @@ def build_dmint_v1_mint_preimage(
             "a preimage that fails the covenant check after mining."
         )
     txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
+    return build_pow_preimage(
+        txid_le=txid_le,
+        contract_ref_bytes=contract_utxo.state.contract_ref.to_bytes(),
+        input_script=funding_utxo.script,
+        output_script=output_script,
+    )
+
+
+def build_dmint_v2_mint_preimage(
+    contract_utxo: DmintContractUtxo,
+    funding_utxo: DmintMinerFundingUtxo,
+    output_script: bytes,
+) -> PowPreimageResult:
+    """Build the V2 mining preimage AND scriptSig hashes.
+
+    V2 analog of :func:`build_dmint_v1_mint_preimage`. The preimage
+    shape (and the on-chain covenant's H1/H2 binding logic) is identical
+    to V1 — V2 inherits the output-validation block via ``_PART_C`` =
+    ``_V1_EPILOGUE_SUFFIX[18:]``. The only V1/V2 differences at the
+    mint-tx level are the nonce width (8 bytes for V2 vs 4 for V1, a
+    parameter of :func:`build_mint_scriptsig`) and the absence of the
+    Photonic-Wallet ``op_return_msg`` convention in V2.
+
+    Layout (matches :func:`build_pow_preimage`)::
+
+        preimage    = SHA256(txid_LE || contractRef) ||
+                      SHA256(SHA256d(input_script) || SHA256d(output_script))
+        input_hash  = SHA256d(input_script)    ← scriptSig push
+        output_hash = SHA256d(output_script)   ← scriptSig push
+
+    Unlike the V1 helper, this function takes ``output_script`` as an
+    **explicit argument**. V2 has no canonical "OP_RETURN msg at vout[2]"
+    convention (that's Photonic-Wallet's V1 layout); the V2 covenant
+    binds outputHash to whatever bytes the caller chooses to push.
+    Callers selecting ``output_script`` should pick one of the actual
+    transaction outputs and document the binding in their own code.
+
+    .. warning::
+       V2 has never been validated on Radiant mainnet. Emits
+       :class:`V2UnvalidatedWarning`. This helper exists to close the
+       audit's security-H1 finding (no V2 analog of
+       ``build_dmint_v1_mint_preimage`` left V2 callers one careless
+       script-mismatch away from reproducing the M1 bug pattern), but
+       no live V2 contract has accepted the preimages this function
+       returns. Use V1 unless you have a specific reason to test V2.
+
+    :param contract_utxo:  The V2 contract UTXO being spent. Its
+                           ``state.is_v1`` MUST be ``False`` — passing
+                           a V1 UTXO is a bug.
+    :param funding_utxo:   The plain-RXD UTXO providing reward + fee.
+    :param output_script:  The output-script bytes to bind into the
+                           preimage. V2 has no canonical convention;
+                           pick a transaction output the caller cares
+                           about (e.g. an OP_RETURN identifier, or
+                           the reward output's locking script).
+    :returns:              :class:`PowPreimageResult` with the preimage
+                           and the two script hashes the scriptSig
+                           must push.
+    :raises ValidationError: V1 contract UTXO passed by mistake, or an
+                           empty ``output_script``.
+    """
+    _warn_v2_unvalidated()
+    if contract_utxo.state.is_v1:
+        raise ValidationError(
+            "build_dmint_v2_mint_preimage called with a V1 contract UTXO "
+            "(state.is_v1 is True). Use build_dmint_v1_mint_preimage instead."
+        )
+    if not output_script:
+        raise ValidationError(
+            "output_script must be non-empty bytes — the V2 covenant binds "
+            "outputHash to SHA256d(output_script); empty bytes would produce "
+            "a degenerate preimage."
+        )
+    txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
+    # The inner build_pow_preimage call doesn't emit V2 warnings — it's
+    # shared with V1. The single warning at the top of this function is
+    # the right granularity (one per V2-preimage-build call site).
     return build_pow_preimage(
         txid_le=txid_le,
         contract_ref_bytes=contract_utxo.state.contract_ref.to_bytes(),
