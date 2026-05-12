@@ -4,6 +4,137 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] — 2026-05-11
+
+### Added
+
+#### dMint V1 deploy (M2)
+
+- `prepare_dmint_deploy_v1` — full V1 dMint deploy support. Builds the
+  commit + reveal scripts for the mainnet-canonical "one reveal,
+  many parallel contract UTXOs" shape that every live dMint token
+  (RBG, snk, etc.) uses. Pinned against Photonic-Wallet's reference
+  layout (`docs/dmint-research-photonic-deploy.md` §2/§3).
+- `DmintV1DeployParams` / `DmintV1DeployResult` / `DmintV1ContractInitialState`
+  — typed inputs/outputs for the V1 deploy flow.
+- `find_dmint_contract_utxos` — chain helper that walks ElectrumX to
+  enumerate the N unspent contract UTXOs from a V1 deploy reveal txid.
+- `examples/dmint_v1_deploy_demo.py` — end-to-end runnable V1 deploy
+  demo with resume support, commit/reveal atomic signing, and
+  param-drift defense on the resume file.
+- Live-validation: deploy reveal at
+  `8eeb333943771991c2752abc78038365ecd76b1a24426f7a3212eea71b6a6564`
+  (2026-05-11) produced 4 unspent contracts and was classified
+  correctly by the inspect tool.
+
+#### dMint V1 mint scriptSig — golden-vector pinning
+
+- `PowPreimageResult` dataclass — frozen record of
+  `(preimage, input_hash, output_hash)` returned by
+  `build_pow_preimage`. Forces miners + scriptSig assembly to feed
+  from a single byte source, structurally preventing the recurring
+  builder-vs-covenant divergence pattern.
+- `TestCovenantShape` regression suite — pins the V1 mint scriptSig
+  convention against the mainnet snk token mint
+  `146a4d688ba3fc1ea9588e406cc6104be2c9321738ea093d6db8e1b83581af3c`
+  AND pyrxd's own first successful mint
+  `c9fdcd3488f3e396bec3ce0b766bb8070963e7e75bb513b8820b6663e469e530`.
+  Two independent mainnet golden vectors.
+- `TestFtLockingScriptBuilderCrossEquality` — byte-equality test
+  between the two FT-output builders in `pyrxd.glyph.script` and
+  `pyrxd.glyph.dmint` (red-team finding R2 from the 0.5.0 pre-release
+  audit).
+
+#### CBOR reveal scriptSig
+
+- `build_reveal_scriptsig_suffix` now supports `OP_PUSHDATA4` for
+  payloads above 65,535 bytes (up to a 256 KB hard cap). The mainnet
+  GLYPH reveal at `b965b32d…9dd6` used 65,569 bytes via PUSHDATA4 —
+  pyrxd would have refused to build that shape under the previous
+  PUSHDATA2-only cap. Red-team finding R3.
+
+#### Inspect tool
+
+- V1 mint scriptSig parsing — decode + display the 4 canonical
+  pushes (nonce, inputHash, outputHash, OP_0). V1 vs V2 distinguished
+  by nonce width (4 vs 8 bytes).
+- V1 deploy commit/reveal shape detection in the browser inspector.
+
+#### Public-API exports (`pyrxd.glyph`)
+
+- `PowPreimageResult`, `build_dmint_v1_mint_preimage`,
+  `build_dmint_v1_ft_output_script` now exported from `pyrxd.glyph`
+  for direct import and type annotation.
+
+### Changed (breaking)
+
+- **`build_pow_preimage(...)`** now returns
+  `PowPreimageResult(preimage, input_hash, output_hash)` instead of
+  the raw 64-byte preimage. Migration:
+  ```python
+  # before (0.4.0):
+  preimage = build_pow_preimage(txid_le, ref, in_script, out_script)
+  # after (0.5.0):
+  result = build_pow_preimage(txid_le, ref, in_script, out_script)
+  preimage = result.preimage  # if you only need the bytes
+  ```
+- **`build_mint_scriptsig(nonce, preimage, *, nonce_width)`** is now
+  `build_mint_scriptsig(nonce, input_hash, output_hash, *, nonce_width)`.
+  The two 32-byte hashes MUST come from the same `build_pow_preimage`
+  call that produced the mined preimage. Splitting the sources caused
+  the M1 covenant-rejection incident — see
+  `docs/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.md`.
+- **`build_dmint_v1_mint_preimage(...)`** now returns
+  `PowPreimageResult` instead of bytes. Callers feed `.preimage` to
+  the miner and `.input_hash`/`.output_hash` to `build_mint_scriptsig`.
+- No backward-compatible shim — the old signature could silently
+  produce on-chain-rejected transactions, so a hard break with loud
+  `TypeError` / `ValidationError` is safer than a deprecation path.
+
+### Fixed
+
+- **CRITICAL (latent): V2 mint reward output was emitting a 25-byte
+  plain P2PKH; the V2 covenant requires a 75-byte FT-wrapped reward.**
+  Every V2 mint would have been rejected by the network with
+  `mandatory-script-verify-flag-failed` once a V2 contract existed on
+  chain. No V2 contracts exist yet, so the bug was caught pre-mainnet
+  during the 0.5.0 red-team audit (finding R1). V2 reward now uses
+  the same `build_dmint_v1_ft_output_script` as V1 — the
+  FT-conservation fingerprint `dec0e9aa76e378e4a269e69d` is shared
+  via `_PART_C` between V1 and V2.
+- **CRITICAL (M1 follow-up): V1 mint scriptSig pushed the wrong
+  values.** The original M1 (shipped in 0.4.0 via PR #65) had
+  `build_mint_scriptsig` pushing the PoW preimage halves into the
+  scriptSig instead of the raw `SHA256d(funding_script)` and
+  `SHA256d(OP_RETURN_script)` the covenant expects. Every successful
+  mine was rejected by the on-chain covenant; M1 had never
+  successfully spent a contract. Fix verified on Radiant mainnet at
+  txid `c9fdcd3488f3e396bec3ce0b766bb8070963e7e75bb513b8820b6663e469e530`.
+  See `docs/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.md`.
+
+### Security
+
+- The 0.5.0 pre-release audit was run by 8 independent specialised
+  reviewers (security, red-team chain-conformance, data-integrity,
+  Python code-quality, simplicity, architecture, performance,
+  pattern-recognition). Two CRITICAL findings (R1 + the M1 scriptSig
+  bug) and two HIGH findings (R2 cross-builder drift risk, R3
+  PUSHDATA4 capability gap) were addressed pre-tag. Medium/low
+  findings tracked for 0.5.1.
+
+### Migration notes
+
+Public API consumers must update three call sites:
+1. `build_pow_preimage(...)` — use `.preimage` attribute on the
+   returned `PowPreimageResult` if you only need the 64 bytes.
+2. `build_mint_scriptsig(nonce, preimage, ...)` →
+   `build_mint_scriptsig(nonce, result.input_hash, result.output_hash, ...)`.
+3. `build_dmint_v1_mint_preimage(...)` — same `.preimage` pattern.
+
+The library raises loud `TypeError` / `ValidationError` immediately
+on old-style calls — there is no silent-failure migration path.
+
+
 ## [0.4.0] — 2026-05-07
 
 ### Added
