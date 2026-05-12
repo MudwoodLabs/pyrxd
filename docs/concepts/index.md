@@ -9,6 +9,7 @@ and how Radiant differs from related blockchains.
 gravity
 radiant-fts-are-on-chain
 dmint-v1-deploy
+parallel-mining
 ```
 
 ## Available now
@@ -27,6 +28,10 @@ dmint-v1-deploy
   to Radiant Glyph Protocol), why pyrxd refuses to emit V2 by default,
   and the five Photonic divergences pyrxd ships with. Read this before
   using `prepare_dmint_deploy` with `DmintV1DeployParams`.
+- **[Parallel mining and the external-miner protocol](parallel-mining.md)** —
+  the JSON-over-stdio protocol pyrxd uses to delegate nonce search to
+  external miners, the bundled `pyrxd.contrib.miner` reference
+  implementation, and why pure-Python is the safer default for V1.
 
 ## Adjacent reading (not yet promoted to concept docs)
 

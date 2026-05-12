@@ -35,6 +35,7 @@ Changelog = "https://github.com/MudwoodLabs/pyrxd/blob/main/CHANGELOG.md"
 
 [project.scripts]
 pyrxd = "pyrxd.cli.main:run"
+pyrxd-miner = "pyrxd.contrib.miner.cli:main"
 
 [tool.poetry]
 packages = [{include = "pyrxd", from = "src"}]
@@ -42,6 +43,7 @@ include = [
     { path = "src/pyrxd/gravity/artifacts/*.json", format = ["sdist", "wheel"] },
     { path = "src/pyrxd/hd/wordlist/*.txt",        format = ["sdist", "wheel"] },
     { path = "src/pyrxd/py.typed",                 format = ["sdist", "wheel"] },
+    { path = "src/pyrxd/contrib/miner/README.md",  format = ["sdist", "wheel"] },
 ]
 
 [tool.taskipy.tasks]

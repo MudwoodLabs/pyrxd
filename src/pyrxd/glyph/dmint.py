@@ -897,8 +897,17 @@ def mine_solution_external(
 
     1. Read one JSON object from stdin: ``{"preimage_hex", "target_hex", "nonce_width"}``
     2. Search for a valid nonce
-    3. Write one JSON object to stdout: ``{"nonce_hex", "attempts", "elapsed_s"}``
-    4. Exit cleanly
+    3. Write one JSON object to stdout:
+       - On hit (exit 0): ``{"nonce_hex", "attempts", "elapsed_s"}``
+       - On nonce-space exhaustion (exit 2, added in 0.5.1): ``{"exhausted": true}``
+         — pyrxd raises :class:`MaxAttemptsError` immediately rather than
+         waiting for the parent timeout to fire.
+
+    A bundled reference implementation ships at :mod:`pyrxd.contrib.miner`
+    (added in 0.5.1) — see :doc:`/concepts/parallel-mining` for the full
+    protocol spec and operational notes. Invoke it via::
+
+        miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"]
 
     .. warning::
        **Supply-chain risk: pyrxd does NOT pin or verify the miner binary.**
@@ -985,9 +994,6 @@ def mine_solution_external(
             elapsed_s=elapsed,
         ) from exc
 
-    if completed.returncode != 0:
-        raise ValidationError(f"external miner {miner_argv[0]!r} exited with code {completed.returncode}")
-
     # Decode stdout. A miner returning malformed UTF-8 is a malformed
     # response, not an exception that should escape.
     try:
@@ -996,6 +1002,29 @@ def mine_solution_external(
         raise ValidationError(f"external miner {miner_argv[0]!r} returned non-UTF-8 stdout") from exc
     if len(stdout) > 4096:
         raise ValidationError(f"external miner produced {len(stdout)} bytes of stdout; expected one short JSON line")
+
+    # Protocol-level exhaustion signal (added 0.5.1): a miner that
+    # finishes its sweep without finding a hit may exit 2 with
+    # ``{"exhausted": true}`` on stdout. Raise MaxAttemptsError
+    # immediately so callers don't have to wait for the parent timeout.
+    # Older miners that don't know this convention fall through to the
+    # generic rc != 0 path below (or are SIGKILLed by the parent timeout).
+    if completed.returncode == 2 and stdout.strip():
+        try:
+            maybe_exhausted = json.loads(stdout)
+        except json.JSONDecodeError:
+            maybe_exhausted = None
+        if isinstance(maybe_exhausted, dict) and maybe_exhausted.get("exhausted") is True:
+            elapsed = time.monotonic() - started
+            raise MaxAttemptsError(
+                f"external miner {miner_argv[0]!r} exhausted the nonce space without finding a solution",
+                attempts=0,
+                elapsed_s=elapsed,
+            )
+
+    if completed.returncode != 0:
+        raise ValidationError(f"external miner {miner_argv[0]!r} exited with code {completed.returncode}")
+
     try:
         response = json.loads(stdout)
     except json.JSONDecodeError as exc:
