@@ -66,10 +66,14 @@ Environment
     OP_RETURN_MSG          optional ASCII msg to embed in vout[2] (≤80 bytes)
     MAX_ATTEMPTS           cap on the Python miner's nonce sweep
                            (default: pyrxd.glyph.dmint.DEFAULT_MAX_ATTEMPTS)
-    EXTERNAL_MINER         optional argv (space-separated) for a subprocess miner
-                           e.g. ``glyph-miner --stdin`` — receives JSON on stdin
-                           with preimage_hex/target_hex/nonce_width and returns
-                           ``{"nonce_hex": "..."}`` on stdout
+    EXTERNAL_MINER         optional argv (space-separated) for a subprocess miner.
+                           Recommended: ``"$(which python) -m pyrxd.contrib.miner"``
+                           — the bundled parallel pure-Python miner shipped in
+                           pyrxd 0.5.1. See docs/concepts/parallel-mining.md.
+                           Other miners (e.g. glyph-miner) work if they
+                           satisfy the same JSON-over-stdio protocol: receive
+                           ``{"preimage_hex", "target_hex", "nonce_width"}`` on
+                           stdin and return ``{"nonce_hex": ...}`` on stdout.
 
 Funding-UTXO selection
 ----------------------

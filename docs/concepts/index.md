@@ -10,6 +10,7 @@ gravity
 radiant-fts-are-on-chain
 dmint-v1-deploy
 glyph-inspect-tool
+parallel-mining
 ```
 
 ## Available now
@@ -34,6 +35,10 @@ glyph-inspect-tool
   qualifier on every output, the tx-shape banner (FT/NFT/dMint
   deploy/claim, burn, mutable update), V1-vs-V2 mint scriptSig decode,
   and the SHA-256 install-time integrity model of the browser variant.
+- **[Parallel mining and the external-miner protocol](parallel-mining.md)** —
+  the JSON-over-stdio protocol pyrxd uses to delegate nonce search to
+  external miners, the bundled `pyrxd.contrib.miner` reference
+  implementation, and why pure-Python is the safer default for V1.
 
 ## Adjacent reading (not yet promoted to concept docs)
 
