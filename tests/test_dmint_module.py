@@ -215,23 +215,36 @@ class TestBuildPowPreimage:
     _IN_SCR = bytes.fromhex("76a914" + "00" * 20 + "88ac")
     _OUT_SCR = bytes.fromhex("6a")
 
-    def test_64_bytes(self):
-        pre = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
-        assert len(pre) == 64
+    def test_preimage_64_bytes(self):
+        result = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
+        assert len(result.preimage) == 64
+
+    def test_input_hash_is_sha256d_of_input_script(self):
+        """The scriptSig pushes SHA256d(input_script) — not the preimage half.
+
+        The covenant recomputes ``H2 = SHA256(scriptSig_inputHash ||
+        scriptSig_outputHash)`` from the pushes and folds it into the PoW
+        hash. Verified against mainnet mint ``146a4d68…f3c``:
+        SHA256d(funding P2PKH) = 09b5b22a…0a2 = the scriptSig push.
+        """
+        result = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
+        expected = hashlib.sha256(hashlib.sha256(self._IN_SCR).digest()).digest()
+        assert result.input_hash == expected
+
+    def test_output_hash_is_sha256d_of_output_script(self):
+        result = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
+        expected = hashlib.sha256(hashlib.sha256(self._OUT_SCR).digest()).digest()
+        assert result.output_hash == expected
 
     def test_first_half(self):
-        pre = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
+        result = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
         expected = hashlib.sha256(self._TXID_LE + self._CREF).digest()
-        assert pre[:32] == expected
+        assert result.preimage[:32] == expected
 
-    def test_second_half(self):
-        pre = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
-
-        def sha256d(d):
-            return hashlib.sha256(hashlib.sha256(d).digest()).digest()
-
-        expected = hashlib.sha256(sha256d(self._IN_SCR) + sha256d(self._OUT_SCR)).digest()
-        assert pre[32:] == expected
+    def test_second_half_is_sha256_of_input_hash_concat_output_hash(self):
+        result = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
+        expected = hashlib.sha256(result.input_hash + result.output_hash).digest()
+        assert result.preimage[32:] == expected
 
     def test_short_txid_raises(self):
         with pytest.raises(ValidationError, match="txid_le"):
@@ -244,33 +257,40 @@ class TestBuildPowPreimage:
     def test_deterministic(self):
         p1 = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
         p2 = build_pow_preimage(self._TXID_LE, self._CREF, self._IN_SCR, self._OUT_SCR)
-        assert p1 == p2
+        assert p1.preimage == p2.preimage
+        assert p1.input_hash == p2.input_hash
+        assert p1.output_hash == p2.output_hash
 
 
 class TestBuildMintScriptSig:
     _NONCE = b"\xab" * 8
-    _PREIMAGE = b"\xcc" * 64
+    _INPUT_HASH = b"\xcc" * 32
+    _OUTPUT_HASH = b"\xdd" * 32
 
     def test_structure(self):
-        sig = build_mint_scriptsig(self._NONCE, self._PREIMAGE)
+        sig = build_mint_scriptsig(self._NONCE, self._INPUT_HASH, self._OUTPUT_HASH)
         assert sig[0] == 0x08
         assert sig[1:9] == self._NONCE
         assert sig[9] == 0x20
-        assert sig[10:42] == self._PREIMAGE[:32]
+        assert sig[10:42] == self._INPUT_HASH
         assert sig[42] == 0x20
-        assert sig[43:75] == self._PREIMAGE[32:]
+        assert sig[43:75] == self._OUTPUT_HASH
         assert sig[75] == 0x00
 
     def test_length(self):
-        assert len(build_mint_scriptsig(self._NONCE, self._PREIMAGE)) == 76
+        assert len(build_mint_scriptsig(self._NONCE, self._INPUT_HASH, self._OUTPUT_HASH)) == 76
 
     def test_short_nonce_raises(self):
         with pytest.raises(ValidationError, match="nonce"):
-            build_mint_scriptsig(b"\x00" * 7, self._PREIMAGE)
+            build_mint_scriptsig(b"\x00" * 7, self._INPUT_HASH, self._OUTPUT_HASH)
 
-    def test_short_preimage_raises(self):
-        with pytest.raises(ValidationError, match="preimage"):
-            build_mint_scriptsig(self._NONCE, b"\x00" * 63)
+    def test_short_input_hash_raises(self):
+        with pytest.raises(ValidationError, match="input_hash"):
+            build_mint_scriptsig(self._NONCE, b"\x00" * 31, self._OUTPUT_HASH)
+
+    def test_short_output_hash_raises(self):
+        with pytest.raises(ValidationError, match="output_hash"):
+            build_mint_scriptsig(self._NONCE, self._INPUT_HASH, b"\x00" * 31)
 
 
 class TestComputeNextTargetAsert:
@@ -527,6 +547,59 @@ def test_last_time_in_state():
     state = build_dmint_state_script(p)
     needle = b"\x04" + struct.pack("<I", ts)
     assert needle in state
+
+
+# ---------------------------------------------------------------------------
+# Cross-equality: two FT-locking-script builders MUST stay byte-identical
+# ---------------------------------------------------------------------------
+
+
+class TestFtLockingScriptBuilderCrossEquality:
+    """Two builders in the codebase produce the same 75-byte FT-wrapped
+    output: ``pyrxd.glyph.script.build_ft_locking_script`` (used by FT
+    transfer / NFT flows) and ``pyrxd.glyph.dmint.build_dmint_v1_ft_output_script``
+    (used by V1 + V2 dMint mint rewards after the R1 red-team fix on
+    2026-05-11).
+
+    Both are independent assemblers of the same on-chain shape. They
+    currently produce identical bytes; this test fires the second one
+    drifts from the other. Catches the exact failure mode the red-team
+    audit flagged as recurring-pattern risk #R2: a future contributor
+    "modernizes" one builder and silently breaks dMint mint rewards
+    (or NFT/FT transfers).
+    """
+
+    def test_byte_identical_for_random_pkh_and_ref(self):
+        from pyrxd.glyph.dmint import build_dmint_v1_ft_output_script
+        from pyrxd.glyph.script import build_ft_locking_script
+
+        pkh = bytes(range(20))
+        ref = _TOKEN_REF
+        assert build_ft_locking_script(pkh, ref) == build_dmint_v1_ft_output_script(pkh, ref)
+
+    def test_byte_identical_for_all_zero_pkh(self):
+        from pyrxd.glyph.dmint import build_dmint_v1_ft_output_script
+        from pyrxd.glyph.script import build_ft_locking_script
+
+        pkh = b"\x00" * 20
+        ref = _TOKEN_REF
+        assert build_ft_locking_script(pkh, ref) == build_dmint_v1_ft_output_script(pkh, ref)
+
+    def test_byte_identical_byte_pattern(self):
+        """The 75-byte shape: P2PKH(25) || OP_STATESEPARATOR(1) ||
+        OP_PUSHINPUTREF tokenRef(37) || 12-byte FT fingerprint."""
+        from pyrxd.glyph.dmint import build_dmint_v1_ft_output_script
+
+        pkh = bytes(range(20))
+        result = build_dmint_v1_ft_output_script(pkh, _TOKEN_REF)
+        assert len(result) == 75
+        assert result[:3] == b"\x76\xa9\x14"  # OP_DUP OP_HASH160 PUSH20
+        assert result[3:23] == pkh
+        assert result[23:25] == b"\x88\xac"  # OP_EQUALVERIFY OP_CHECKSIG
+        assert result[25:26] == b"\xbd"  # OP_STATESEPARATOR
+        assert result[26:27] == b"\xd0"  # OP_PUSHINPUTREF
+        assert result[27:63] == _TOKEN_REF.to_bytes()  # 36-byte ref
+        assert result[63:] == bytes.fromhex("dec0e9aa76e378e4a269e69d")  # 12-byte fingerprint
 
 
 # ---------------------------------------------------------------------------
