@@ -197,12 +197,19 @@ def _mine(preimage: bytes, target: int, nonce_width: int) -> bytes:
     ``EXTERNAL_MINER`` is set, otherwise the slow Python reference."""
     if EXTERNAL_MINER:
         argv = shlex.split(EXTERNAL_MINER)
-        print(f"Mining via external miner: {argv[0]}")
+        # Optional tighter timeout so a no-hit sweep falls through to
+        # MaxAttemptsError quickly (the retry-wrapper changes
+        # OP_RETURN_MSG and re-runs). Default upstream is 600s, but for
+        # difficulty=1 a parallel miner sweeps the full 4-byte space in
+        # ~2-3 minutes; waiting 10 min on a no-hit wastes most of it.
+        timeout_s = float(os.environ.get("EXTERNAL_MINER_TIMEOUT_S", "600"))
+        print(f"Mining via external miner: {argv[0]} (timeout {timeout_s}s)")
         result = mine_solution_external(
             preimage=preimage,
             target=target,
             miner_argv=argv,
             nonce_width=nonce_width,  # type: ignore[arg-type]
+            timeout_s=timeout_s,
         )
     else:
         print(
@@ -332,12 +339,15 @@ async def main() -> None:
             f"{len(result.tx.inputs)} inputs, {len(result.tx.outputs)} outputs)"
         )
 
-        # 4. Compute real preimage from the now-finalised tx outputs.
-        preimage = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, result.tx)
+        # 4. Compute real preimage AND the scriptSig hashes from the now-finalised
+        #    tx outputs. The covenant pulls inputHash/outputHash from the scriptSig
+        #    pushes and recomputes the second SHA256 on-chain — both sites must
+        #    derive from the same source. The combined helper enforces that.
+        pow_result = build_dmint_v1_mint_preimage(contract_utxo, funding_utxo, result.tx)
 
         # 5. Mine.
         try:
-            nonce = _mine(preimage, state.target, nonce_width=4)
+            nonce = _mine(pow_result.preimage, state.target, nonce_width=4)
         except MaxAttemptsError as exc:
             print(
                 f"\nERROR: miner exhausted {exc.attempts:,} attempts in {exc.elapsed_s:.1f}s "
@@ -347,8 +357,11 @@ async def main() -> None:
             )
             sys.exit(2)
 
-        # 6. Splice the real nonce + real preimage into the contract input's scriptSig.
-        real_scriptsig = build_mint_scriptsig(nonce, preimage, nonce_width=4)
+        # 6. Splice the real nonce + the two scriptSig hashes into the contract
+        #    input's scriptSig. inputHash = SHA256d(funding_script),
+        #    outputHash = SHA256d(OP_RETURN script) — same values folded into
+        #    the preimage the miner just solved.
+        real_scriptsig = build_mint_scriptsig(nonce, pow_result.input_hash, pow_result.output_hash, nonce_width=4)
         result.tx.inputs[0].unlocking_script = Script(real_scriptsig)
 
         # 7. Sign the funding input.
@@ -365,21 +378,32 @@ async def main() -> None:
             print(f"    [{i}] {out.satoshis:>15,} photons  ({kind})")
         print()
 
+        # ALWAYS print the raw tx hex before attempting broadcast.
+        # If broadcast fails (e.g. ElectrumX dropped the connection
+        # during the 15+ min mining loop), the operator can re-broadcast
+        # the hex via any other path (radiant-cli, another ElectrumX
+        # server, etc.). Without this print, a connection-lost error
+        # discards 10+ minutes of mining work.
+        print(f"\nRaw tx hex (save this before broadcast in case of network drop):\n{result.tx.hex()}\n")
+
         if DRY_RUN:
             print("[DRY RUN] Tx not broadcast. Set DRY_RUN=0 (with I_UNDERSTAND_THIS_IS_REAL=yes) to broadcast.")
-            print()
-            print(f"Raw tx hex:\n{result.tx.hex()}")
             return
 
-        print("Broadcasting...")
+        print("Broadcasting (with fresh WebSocket to avoid the long-idle drop)...")
+        # The `client` opened at the start of main() has been idle through
+        # the 15+ min mining loop and may have been closed by the server.
+        # Open a fresh client just for the broadcast call.
         try:
-            txid = await client.broadcast(result.tx.serialize())
+            async with ElectrumXClient([ELECTRUMX_URL]) as bcast_client:
+                txid = await bcast_client.broadcast(result.tx.serialize())
         except NetworkError as exc:
             print(f"\nBROADCAST FAILED: {exc}", file=sys.stderr)
             print(
                 "\nMost likely the contract advanced under you (someone else claimed "
-                "this height first). Re-run the script — it will fetch the new contract "
-                "tip and re-mine.",
+                "this height first), OR the ElectrumX server dropped the connection. "
+                "The signed tx hex was printed above — re-broadcast it via another path "
+                "or re-run the script (will fetch the new contract tip and re-mine).",
                 file=sys.stderr,
             )
             sys.exit(3)

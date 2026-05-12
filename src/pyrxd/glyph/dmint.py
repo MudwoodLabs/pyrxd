@@ -510,21 +510,52 @@ def build_dmint_v1_contract_script(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class PowPreimageResult:
+    """The 64-byte PoW preimage plus the two script hashes a miner must push.
+
+    The covenant binds the PoW hash AND the scriptSig pushes together: it
+    recomputes ``H2 = SHA256(scriptSig_inputHash || scriptSig_outputHash)``
+    and folds that into the same hash the miner solved. Diverging the
+    preimage from the scriptSig pushes is a silent on-chain rejection —
+    see ``docs/solutions/runtime-errors/dmint-v1-mint-scriptsig-shape.md``
+    for the prior incident that motivated returning all three values from
+    a single helper.
+
+    :param preimage:    64-byte SHA256d PoW preimage; feeds ``mine_solution``.
+    :param input_hash:  ``SHA256d(input_script)`` — push as ``scriptSig_inputHash``.
+    :param output_hash: ``SHA256d(output_script)`` — push as ``scriptSig_outputHash``.
+    """
+
+    preimage: bytes
+    input_hash: bytes
+    output_hash: bytes
+
+
 def build_pow_preimage(
     txid_le: bytes,
     contract_ref_bytes: bytes,
     input_script: bytes,
     output_script: bytes,
-) -> bytes:
-    """Build the 64-byte PoW preimage.
+) -> PowPreimageResult:
+    """Build the PoW preimage AND the two script hashes the scriptSig must push.
 
     preimage[0..32] = SHA256(txid_LE || contractRef)
     preimage[32..64] = SHA256(SHA256d(inputScript) || SHA256d(outputScript))
+
+    The covenant pulls ``inputHash`` and ``outputHash`` from the scriptSig
+    pushes (not from the preimage halves) and recomputes the second SHA256
+    on-chain. Returning all three values here forces callers to feed both
+    sites from the same source — splitting the helper into "preimage
+    builder" and "scriptSig builder" with independently-recomputed hashes
+    is what produced the M1 covenant-rejection bug.
 
     :param txid_le:            32-byte txid in little-endian (internal byte order)
     :param contract_ref_bytes: 36-byte contract ref (wire format)
     :param input_script:       miner's input locking script (e.g. P2PKH)
     :param output_script:      miner's output script (e.g. OP_RETURN message)
+    :returns: :class:`PowPreimageResult` with ``preimage``, ``input_hash``,
+              ``output_hash``.
     """
     if len(txid_le) != 32:
         raise ValidationError("txid_le must be 32 bytes")
@@ -541,7 +572,7 @@ def build_pow_preimage(
     input_csh = sha256d(input_script)
     output_csh = sha256d(output_script)
     half2 = sha256(input_csh + output_csh)
-    return half1 + half2
+    return PowPreimageResult(preimage=half1 + half2, input_hash=input_csh, output_hash=output_csh)
 
 
 # ---------------------------------------------------------------------------
@@ -551,7 +582,8 @@ def build_pow_preimage(
 
 def build_mint_scriptsig(
     nonce: bytes,
-    preimage: bytes,
+    input_hash: bytes,
+    output_hash: bytes,
     *,
     nonce_width: Literal[4, 8] = 8,
 ) -> bytes:
@@ -565,8 +597,17 @@ def build_mint_scriptsig(
     of the mainnet mint trace at ``146a4d68…f3c``). Same shape as V2,
     differing only in nonce width and corresponding push opcode.
 
+    The hashes pushed here MUST equal :class:`PowPreimageResult.input_hash`
+    and ``output_hash`` from the same :func:`build_pow_preimage` call that
+    produced the preimage the miner solved. The on-chain covenant
+    recomputes ``SHA256(input_hash || output_hash)`` from these pushes and
+    folds that into the PoW hash — diverging them silently produces a
+    ``mandatory-script-verify-flag-failed`` rejection after a successful
+    mine.
+
     :param nonce:        nonce_width-bytes nonce (found during mining).
-    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param input_hash:   32-byte ``SHA256d(input_script)`` from :class:`PowPreimageResult`.
+    :param output_hash:  32-byte ``SHA256d(output_script)`` from :class:`PowPreimageResult`.
     :param nonce_width:  4 for V1 contracts, 8 for V2. Keyword-only and
                          ``Literal[4, 8]`` so a stray positional value is a
                          type error rather than a silent V1/V2 confusion.
@@ -576,16 +617,18 @@ def build_mint_scriptsig(
         raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
     if len(nonce) != nonce_width:
         raise ValidationError(f"nonce must be {nonce_width} bytes, got {len(nonce)}")
-    if len(preimage) != 64:
-        raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
+    if len(input_hash) != 32:
+        raise ValidationError(f"input_hash must be 32 bytes, got {len(input_hash)}")
+    if len(output_hash) != 32:
+        raise ValidationError(f"output_hash must be 32 bytes, got {len(output_hash)}")
     # Push opcode = nonce length (works for both 4 and 8 since both are < 0x4C).
     return (
         bytes([nonce_width])
         + nonce  # PUSH nonce_width + nonce
         + b"\x20"
-        + preimage[:32]  # PUSH 32 + inputHash half
+        + input_hash  # PUSH 32 + inputHash
         + b"\x20"
-        + preimage[32:]  # PUSH 32 + outputHash half
+        + output_hash  # PUSH 32 + outputHash
         + b"\x00"  # OP_0
     )
 
@@ -1662,8 +1705,9 @@ def build_dmint_mint_tx(
     Transaction structure
     ---------------------
     **Inputs**
-      * Input 0: contract UTXO — unlocked by ``build_mint_scriptsig(nonce, preimage)``
-        where ``preimage = build_pow_preimage(txid_le, contract_ref, miner_input_script, miner_output_script)``
+      * Input 0: contract UTXO — unlocked by
+        ``build_mint_scriptsig(nonce, pow.input_hash, pow.output_hash)``
+        where ``pow = build_pow_preimage(txid_le, contract_ref, miner_input_script, miner_output_script)``
 
     **Outputs**
       * Output 0: recreated contract UTXO (updated DmintState + same code section)
@@ -1678,13 +1722,17 @@ def build_dmint_mint_tx(
        time.  A production miner loop must:
 
        1. Build the unsigned tx shell via this function.
-       2. Compute the real ``preimage`` using ``build_pow_preimage`` once the
-          tx's txid and script hashes are stable (they are stable once outputs
-          are finalised — the txid doesn't depend on the unlocking script in
-          Radiant/Bitcoin sighash).
+       2. Compute the real preimage AND scriptSig hashes via
+          ``build_pow_preimage`` once the tx's txid and script hashes are
+          stable (they are stable once outputs are finalised — the txid
+          doesn't depend on the unlocking script in Radiant/Bitcoin sighash).
        3. Mine for a valid ``nonce`` via ``verify_sha256d_solution`` (or the
           relevant algo).
-       4. Replace input 0's unlocking script with ``build_mint_scriptsig(nonce, preimage)``.
+       4. Replace input 0's unlocking script with
+          ``build_mint_scriptsig(nonce, pow.input_hash, pow.output_hash)``.
+          The two hashes MUST come from the same ``build_pow_preimage`` call
+          that produced the preimage the miner solved — splitting the
+          sources is a silent on-chain rejection.
        5. Broadcast.
 
        Steps 2–5 are deliberately out of scope here — they require a live node
@@ -1827,19 +1875,36 @@ def build_dmint_mint_tx(
     )
     contract_script = new_state_script + _OP_STATESEPARATOR + code_script
 
-    # --- Build reward output script (P2PKH) ---
-    reward_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+    # --- Build reward output script (75-byte FT-wrapped) ---
+    # The V2 covenant's FT-conservation check at _PART_C (offset 168 in the
+    # V1 layout, equivalent position in V2) sums photons under the FT
+    # codescript and requires the total to equal state.reward. A plain
+    # P2PKH carries no FT codescript, so its sum is zero and the
+    # NUMEQUALVERIFY would fail — the network would reject every V2 mint.
+    #
+    # The V2 fingerprint at _PART_C[20:32] (`dec0e9aa76e378e4a269e69d`) is
+    # byte-identical to V1's `_V1_FT_OUTPUT_EPILOGUE`; stronger, the entire
+    # _PART_C (107 bytes) equals _V1_EPILOGUE_SUFFIX[18:], so V2's whole
+    # output-validation block is V1's tail. The same 75-byte FT output
+    # builder works for both versions. The two invariants this relies on
+    # are pinned by TestFtLockingScriptBuilderCrossEquality (in
+    # tests/test_dmint_module.py) and TestBuildDmintMintTx (the V2 e2e
+    # path in tests/test_dmint_end_to_end.py).
+    #
+    # Discovered by red-team audit 2026-05-11 — the prior implementation
+    # used a 25-byte P2PKH which would have been rejected by any live V2
+    # contract (none exist on chain yet, so the bug stayed silent).
+    reward_script = build_dmint_v1_ft_output_script(miner_pkh, state.token_ref)
 
-    # --- Placeholder scriptSig (nonce + sentinel preimage 0xff*64) ---
-    # The real preimage requires txid + script hashes which are only
-    # available once outputs are finalised (see docstring). The
-    # placeholder uses 0xff bytes (rather than zeros) as a visibly-invalid
-    # sentinel: a miner loop that forgets to replace it produces a tx
-    # whose covenant rejects fast on the network rather than silently
-    # passing structural checks. Same sentinel used in the V1 path
-    # (see _build_dmint_v1_mint_tx).
-    placeholder_preimage = b"\xff" * 64
-    placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage)
+    # --- Placeholder scriptSig (nonce + two sentinel 0xff*32 hashes) ---
+    # The real hashes require txid + script bytes which are only available
+    # once outputs are finalised (see docstring). The placeholder uses
+    # 0xff bytes (rather than zeros) as a visibly-invalid sentinel: a
+    # miner loop that forgets to replace it produces a tx whose covenant
+    # rejects fast on the network rather than silently passing structural
+    # checks. Same sentinel used in the V1 path (see _build_dmint_v1_mint_tx).
+    placeholder_hash = b"\xff" * 32
+    placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_hash, placeholder_hash, nonce_width=8)
 
     # --- Estimate tx size for fee ---
     # Approximate: 4 (ver) + 1 (in count) + 41 (outpoint+seq) + 1 (len) + len(scriptsig)
@@ -1927,7 +1992,7 @@ def _build_dmint_v1_mint_tx(
 
     Mainnet V1 mint transaction shape (docs/dmint-research-mainnet.md §4)::
 
-        vin[0]  contract UTXO          unlocked by build_mint_scriptsig(nonce_4b, preimage)
+        vin[0]  contract UTXO          unlocked by build_mint_scriptsig(nonce_4b, input_hash, output_hash)
         vin[1]  funding UTXO           plain-RXD P2PKH paying reward + fee + change
         vout[0] recreated contract     value = contract_utxo.value (singleton, no fee taken)
         vout[1] FT-wrapped reward      75-byte P2PKH+tokenRef, value = state.reward
@@ -2025,12 +2090,12 @@ def _build_dmint_v1_mint_tx(
         op_return_script = b"\x6a" + msg_marker + data_push
 
     # --- Placeholder scriptSigs.
-    # Contract input: nonce-bearing scriptSig with sentinel 0xff*64 preimage.
+    # Contract input: nonce-bearing scriptSig with two sentinel 0xff*32 hashes.
     # The 0xff bytes are visibly-invalid: a miner that forgets to replace
     # them gets fast network rejection rather than a covenant-fail silent
     # bug. Mining replaces this whole scriptSig.
-    placeholder_preimage = b"\xff" * 64
-    placeholder_contract_scriptsig = build_mint_scriptsig(nonce, placeholder_preimage, nonce_width=4)
+    placeholder_hash = b"\xff" * 32
+    placeholder_contract_scriptsig = build_mint_scriptsig(nonce, placeholder_hash, placeholder_hash, nonce_width=4)
     # Funding input: 108 zero bytes — the WORST-CASE size of a signed P2PKH
     # scriptSig. A real signed scriptSig is 106-108 bytes:
     #   <push-len 0x47..0x49> <DER sig 70-72 bytes + sighash 1 byte>
@@ -2250,8 +2315,8 @@ def build_dmint_v1_mint_preimage(
     contract_utxo: DmintContractUtxo,
     funding_utxo: DmintMinerFundingUtxo,
     unsigned_tx: Any,
-) -> bytes:
-    """Build the 64-byte V1 mining preimage for an unsigned mint tx.
+) -> PowPreimageResult:
+    """Build the V1 mining preimage AND scriptSig hashes for an unsigned mint tx.
 
     The V1 covenant binds the PoW preimage to:
 
@@ -2267,8 +2332,13 @@ def build_dmint_v1_mint_preimage(
 
     Layout (matches :func:`build_pow_preimage`)::
 
-        SHA256(txid_LE || contractRef) ||
-        SHA256(SHA256d(input_script) || SHA256d(output_script))
+        preimage    = SHA256(txid_LE || contractRef) ||
+                      SHA256(SHA256d(input_script) || SHA256d(output_script))
+        input_hash  = SHA256d(input_script)    ← scriptSig push
+        output_hash = SHA256d(output_script)   ← scriptSig push
+
+    Callers feed ``preimage`` to :func:`mine_solution` and pass
+    ``input_hash`` + ``output_hash`` to :func:`build_mint_scriptsig`.
 
     :param contract_utxo:  The V1 contract UTXO being spent.
     :param funding_utxo:   The plain-RXD UTXO providing reward + fee.
@@ -2276,8 +2346,9 @@ def build_dmint_v1_mint_preimage(
                            :func:`build_dmint_mint_tx` — vout[2] is
                            required to be the OP_RETURN msg output
                            (mainnet-canonical 4-output shape).
-    :returns:              64 bytes ready to feed into :func:`mine_solution`
-                           or :func:`mine_solution_external`.
+    :returns:              :class:`PowPreimageResult` carrying the preimage
+                           and the two script hashes that the scriptSig
+                           must push for the covenant to accept the mint.
     :raises ValidationError:
         ``unsigned_tx`` has fewer than 4 outputs (no OP_RETURN at vout[2])
         OR vout[2] is not actually an OP_RETURN script. Build the tx via

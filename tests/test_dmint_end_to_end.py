@@ -596,11 +596,37 @@ class TestBuildDmintMintTx:
         assert reparsed.last_time == result.updated_state.last_time
         assert reparsed.target == result.updated_state.target
 
-    def test_reward_script_is_p2pkh(self):
+    def test_reward_script_is_ft_wrapped_75_bytes(self):
+        """V2 reward output must be FT-wrapped, not bare P2PKH.
+
+        The V2 covenant's FT-conservation check at `_PART_C` (the
+        ``OP_CODESCRIPTHASHVALUESUM_OUTPUTS OP_NUMEQUALVERIFY`` sequence)
+        sums photons under the FT codescript and requires the total to
+        equal ``state.reward``. A bare P2PKH carries no FT codescript so
+        the sum is zero and every V2 mint would be rejected. See the
+        red-team finding R1 (2026-05-11) — the prior implementation
+        emitted a 25-byte P2PKH which would have failed on the first
+        live V2 contract.
+
+        The 75-byte shape: ``P2PKH(25) || OP_STATESEPARATOR(1) ||
+        OP_PUSHINPUTREF tokenRef(37) || 12-byte FT fingerprint`` —
+        byte-identical to V1's ``build_dmint_v1_ft_output_script``.
+        """
+        from pyrxd.glyph.dmint import build_dmint_v1_ft_output_script
+
         utxo = _make_contract_utxo()
         result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        # P2PKH: 76 a9 14 <20-byte PKH> 88 ac
-        assert result.reward_script == b"\x76\xa9\x14" + _MINER_PKH + b"\x88\xac"
+        expected = build_dmint_v1_ft_output_script(_MINER_PKH, utxo.state.token_ref)
+        assert result.reward_script == expected
+        assert len(result.reward_script) == 75
+        # P2PKH prologue.
+        assert result.reward_script[:3] == b"\x76\xa9\x14"
+        assert result.reward_script[3:23] == _MINER_PKH
+        assert result.reward_script[23:25] == b"\x88\xac"
+        # OP_STATESEPARATOR + OP_PUSHINPUTREF + tokenRef + 12-byte fingerprint.
+        assert result.reward_script[25:26] == b"\xbd"
+        assert result.reward_script[26:27] == b"\xd0"
+        assert result.reward_script[63:] == bytes.fromhex("dec0e9aa76e378e4a269e69d")
 
     def test_tx_has_one_input_two_outputs(self):
         utxo = _make_contract_utxo()
