@@ -87,7 +87,7 @@ bandit = {version = "^1.9.4", extras = ["toml"]}
 pip-audit = "^2.7.3"
 detect-secrets = "^1.5.0"
 mypy = "^1.8.0"
-ruff = "^0.15.0"
+ruff = "^0.15.12"
 hypothesis = "^6.98.0"
 pytest-asyncio = ">=1.3.0"
 
