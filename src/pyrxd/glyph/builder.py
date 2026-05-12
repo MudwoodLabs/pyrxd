@@ -944,6 +944,13 @@ class DmintV2DeployParams:
             self.contract_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
         if self.token_ref_placeholder is None:
             self.token_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
+        # V2 quarantine marker — see V2UnvalidatedWarning in pyrxd.glyph.dmint.
+        # Subclasses suppress this (DmintFullDeployParams's deprecation warning
+        # is the higher-priority signal there).
+        if type(self) is DmintV2DeployParams:
+            from .dmint import _warn_v2_unvalidated
+
+            _warn_v2_unvalidated()
 
 
 class DmintFullDeployParams(DmintV2DeployParams):

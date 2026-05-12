@@ -603,6 +603,228 @@ class TestFtLockingScriptBuilderCrossEquality:
 
 
 # ---------------------------------------------------------------------------
+# Mainnet golden vector — FT locking script byte-equal vs real RBG transfer
+# ---------------------------------------------------------------------------
+
+
+class TestFtLockingScriptMainnetGolden:
+    """Pin ``build_ft_locking_script`` against a real RBG transfer on
+    Radiant mainnet. If the encoder ever drifts from the on-chain shape,
+    this test fires immediately.
+
+    Source: mainnet tx
+    ``ac7f1f705086a3a4cb2a354bf778fe2da829a90372742db076f542398cc60ae4``
+    vout[0] (RBG self-transfer; also documented in
+    ``tests/cli/test_glyph_inspect_cmds.py::_RBG_TRANSFER_RAW_HEX``).
+
+    Closes the pattern-recognition audit's #R7 followup recommendation:
+    every wire-format builder gets one ``test_byte_equal_to_<chain_ref>``
+    assertion before merge.
+    """
+
+    # PKH from the mainnet transfer (same as RBG_TRANSFER_OWNER_PKH).
+    _RBG_OWNER_PKH = bytes.fromhex("d84b8c371ea11f051dfed9daae05c8dee24d9eba")
+
+    # Token ref: 32-byte commit_txid_le (reversed) + 4-byte vout LE.
+    # From the on-chain vout[0]/[1] script (offsets 27..62, 36 bytes):
+    # `a8a296afde31eb80c3484f09da7eb31546990baf76fd8bff9a58fbbe53c45db4 00000000`
+    _RBG_REF_BYTES = bytes.fromhex("a8a296afde31eb80c3484f09da7eb31546990baf76fd8bff9a58fbbe53c45db400000000")
+
+    # vout[0] locking script (75 bytes) extracted from the on-chain raw tx.
+    _RBG_VOUT0_FT_SCRIPT = bytes.fromhex(
+        "76a914d84b8c371ea11f051dfed9daae05c8dee24d9eba"
+        "88ac"
+        "bd"
+        "d0a8a296afde31eb80c3484f09da7eb31546990baf76fd8bff9a58fbbe53c45db400000000"
+        "dec0e9aa76e378e4a269e69d"
+    )
+
+    def test_pyrxd_ft_builder_matches_mainnet_byte_for_byte(self):
+        """``build_ft_locking_script(pkh, ref)`` produces the exact bytes
+        observed in the live RBG transfer's vout[0]. If this fails, the
+        builder has drifted from the on-chain shape — and every FT
+        emitted by pyrxd is silently wrong."""
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Txid
+
+        # Reconstruct the GlyphRef from the on-chain ref bytes. txid is
+        # the first 32 bytes (little-endian on the wire → reverse to BE
+        # for the GlyphRef.txid hex), vout is the last 4 bytes (LE).
+        ref_txid_le = self._RBG_REF_BYTES[:32]
+        ref_vout_le = self._RBG_REF_BYTES[32:36]
+        ref = GlyphRef(
+            txid=Txid(ref_txid_le[::-1].hex()),
+            vout=int.from_bytes(ref_vout_le, "little"),
+        )
+
+        # Round-trip check: builder bytes must equal on-chain bytes.
+        rebuilt = build_ft_locking_script(self._RBG_OWNER_PKH, ref)
+        assert rebuilt == self._RBG_VOUT0_FT_SCRIPT, (
+            f"FT builder drifted from mainnet:\n"
+            f"  expected: {self._RBG_VOUT0_FT_SCRIPT.hex()}\n"
+            f"  got:      {rebuilt.hex()}"
+        )
+
+    def test_dmint_v1_ft_builder_matches_mainnet_byte_for_byte(self):
+        """The dMint V1 reward output uses the SAME 75-byte FT shape.
+        Cross-validates that ``build_dmint_v1_ft_output_script`` also
+        byte-equals the live RBG transfer's FT vout. Closes the bug class
+        where the dmint reward builder drifts from the FT spec while the
+        FT builder stays correct (or vice versa)."""
+        from pyrxd.glyph.dmint import build_dmint_v1_ft_output_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Txid
+
+        ref = GlyphRef(
+            txid=Txid(self._RBG_REF_BYTES[:32][::-1].hex()),
+            vout=int.from_bytes(self._RBG_REF_BYTES[32:36], "little"),
+        )
+        rebuilt = build_dmint_v1_ft_output_script(self._RBG_OWNER_PKH, ref)
+        assert rebuilt == self._RBG_VOUT0_FT_SCRIPT
+
+
+# ---------------------------------------------------------------------------
+# V2 quarantine — V2UnvalidatedWarning fires on every V2 entry point
+# ---------------------------------------------------------------------------
+
+
+class TestV2QuarantineWarning:
+    """Every V2 dMint entry point emits ``V2UnvalidatedWarning`` because no
+    V2 contract exists on Radiant mainnet as of pyrxd 0.5.1. Users can
+    silence the warning (``simplefilter('ignore', V2UnvalidatedWarning)``)
+    once they accept the risk, or escalate it (``simplefilter('error', ...)``)
+    in CI to forbid V2 use until it's field-validated.
+
+    The pattern protects against the recurring "builder + verifier
+    round-trips fine, but the bytes have never run on chain" anti-pattern
+    that produced the M1 mint-shape bug and the 0.5.0 R1 V2 reward-shape
+    bug. See docs/solutions/logic-errors/dmint-v1-mint-shape-mismatch.md.
+    """
+
+    def _params(self) -> DmintDeployParams:
+        return DmintDeployParams(
+            contract_ref=_CONTRACT_REF,
+            token_ref=_TOKEN_REF,
+            max_height=10,
+            reward=1000,
+            difficulty=1,
+        )
+
+    def test_build_dmint_state_script_warns(self):
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_state_script
+
+        with pytest.warns(V2UnvalidatedWarning, match="V2 dMint code path"):
+            build_dmint_state_script(self._params())
+
+    def test_build_dmint_code_script_warns(self):
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_code_script
+
+        with pytest.warns(V2UnvalidatedWarning):
+            build_dmint_code_script(self._params())
+
+    def test_build_dmint_contract_script_warns_exactly_once(self):
+        """``build_dmint_contract_script`` calls ``build_dmint_state_script``
+        and ``build_dmint_code_script`` internally; without de-duplication
+        a single user call would emit 3 warnings. The implementation
+        suppresses the inner two so the user sees exactly one warning per
+        call site."""
+        import warnings
+
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_contract_script
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", V2UnvalidatedWarning)
+            build_dmint_contract_script(self._params())
+        v2_warnings = [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)]
+        assert len(v2_warnings) == 1, f"expected exactly 1 V2UnvalidatedWarning, got {len(v2_warnings)}"
+
+    def test_compute_next_target_asert_warns(self):
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, compute_next_target_asert
+
+        with pytest.warns(V2UnvalidatedWarning):
+            compute_next_target_asert(
+                current_target=1_000_000,
+                last_time=0,
+                current_time=60,
+                target_time=60,
+                half_life=3600,
+            )
+
+    def test_compute_next_target_linear_warns(self):
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, compute_next_target_linear
+
+        with pytest.warns(V2UnvalidatedWarning):
+            compute_next_target_linear(
+                current_target=1_000_000,
+                last_time=0,
+                current_time=60,
+                target_time=60,
+            )
+
+    def test_warning_can_be_silenced(self):
+        """Production users who've audited V2 themselves can silence the
+        warning class without affecting other warnings."""
+        import warnings
+
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_state_script
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("ignore", V2UnvalidatedWarning)
+            build_dmint_state_script(self._params())
+        v2_warnings = [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)]
+        assert v2_warnings == []
+
+    def test_warning_can_be_made_fatal(self):
+        """CI environments that forbid V2 use can escalate the warning to
+        an exception."""
+        import warnings
+
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_state_script
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", V2UnvalidatedWarning)
+            with pytest.raises(V2UnvalidatedWarning, match="V2 dMint code path"):
+                build_dmint_state_script(self._params())
+
+    def test_v1_builders_do_not_warn(self):
+        """The V1 dMint builders (``build_dmint_v1_state_script``, etc.) are
+        field-validated against mainnet and must NOT emit the V2 quarantine
+        warning. Regression guard: a future refactor must not accidentally
+        mark V1 paths as untested."""
+        import warnings
+
+        from pyrxd.glyph.dmint import (
+            V2UnvalidatedWarning,
+            build_dmint_v1_contract_script,
+            build_dmint_v1_ft_output_script,
+        )
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", V2UnvalidatedWarning)
+            build_dmint_v1_contract_script(
+                height=0,
+                contract_ref=_CONTRACT_REF,
+                token_ref=_TOKEN_REF,
+                max_height=10,
+                reward=1000,
+                target=MAX_SHA256D_TARGET,
+            )
+            build_dmint_v1_ft_output_script(b"\x00" * 20, _TOKEN_REF)
+        v2_warnings = [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)]
+        assert v2_warnings == [], "V1 path emitted V2 quarantine warning — regression"
+
+    def test_warning_class_is_subclass_of_user_warning(self):
+        """``V2UnvalidatedWarning`` inherits from ``UserWarning`` (not
+        ``DeprecationWarning``) so it doesn't get filtered with the
+        general "ignore deprecations" rules many projects set up."""
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning
+
+        assert issubclass(V2UnvalidatedWarning, UserWarning)
+        assert not issubclass(V2UnvalidatedWarning, DeprecationWarning)
+
+
+# ---------------------------------------------------------------------------
 # DmintCborPayload — CBOR encode / decode
 # ---------------------------------------------------------------------------
 
