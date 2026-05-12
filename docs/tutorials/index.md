@@ -7,12 +7,20 @@ fungible token, run a Gravity swap.
 ```{toctree}
 :maxdepth: 1
 
+your-first-radiant-transaction
 mint-a-glyph-nft
 mint-a-glyph-ft
 ```
 
 ## Available now
 
+- **[Your first Radiant transaction](your-first-radiant-transaction.md)** —
+  fresh `pip install` to a built, signed RXD send. Walks through
+  `pyrxd wallet new`, `pyrxd address`, `pyrxd balance --refresh`,
+  `pyrxd utxos`, and a short Python script using
+  `HdWallet.build_send_tx(...)`. Broadcast is gated behind a
+  `DRY_RUN=0 I_UNDERSTAND_THIS_IS_REAL=yes` env-var pair so dry-run
+  is always the default.
 - **[Mint a Glyph NFT](mint-a-glyph-nft.md)** — author CBOR metadata,
   build a commit transaction, wait for confirmation, build the reveal,
   and broadcast. Uses a synthetic key by default so you can run every
@@ -23,9 +31,9 @@ mint-a-glyph-ft
   broadcast a single 75-byte FT output carrying the full premine
   supply. DRY_RUN by default; opt in to broadcast.
 
-## Coming soon
+## Planned tutorials
 
-More tutorials are being written as the v0.5.x line stabilises. In the
+Tutorials are being written as the v0.5.x line stabilises. In the
 meantime, the runnable end-to-end demos in
 [`examples/`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples) are
 the closest thing — they exercise the same flows that the future tutorials
