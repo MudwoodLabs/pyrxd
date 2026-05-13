@@ -76,11 +76,19 @@ class TestPureMatchesHashlib:
         """Compute ``hashlib.new("ripemd160", payload).digest()`` or skip
         the test entirely if OpenSSL on this host has the legacy provider
         disabled. Centralising the skip logic here also keeps each test
-        body free of half-initialised locals."""
+        body free of half-initialised locals.
+
+        ``pytest.skip`` raises ``Skipped`` (a BaseException subclass) so
+        control never returns past it; the ``raise`` after the skip call
+        is unreachable but makes that fact visible to static analysis
+        (CodeQL's py/mixed-returns otherwise flags the apparent
+        explicit-return-mixed-with-implicit-None pattern).
+        """
         try:
             return hashlib.new("ripemd160", payload).digest()
         except ValueError:
             pytest.skip("OpenSSL on this host does not expose ripemd160")
+            raise AssertionError("unreachable: pytest.skip raises")  # pragma: no cover
 
     @pytest.mark.parametrize("size", [0, 1, 31, 32, 55, 56, 63, 64, 65, 119, 127, 128, 1023, 1024])
     def test_random_input_at_block_boundaries(self, size):

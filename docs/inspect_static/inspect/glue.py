@@ -41,7 +41,15 @@ import unicodedata
 # fails on Pyodide before pyrxd's import chain triggers, then we route
 # every ``Cryptodome.*`` lookup through the ``Crypto.*`` package.
 try:
-    import Cryptodome  # noqa: F401  # native pycryptodomex path
+    # Availability probe — we don't reference the import binding,
+    # we're only catching ImportError to drive the Pyodide alias setup
+    # below. Using importlib.util.find_spec to make the intent loud
+    # to both readers and code-scanning tools (CodeQL's py/unused-import
+    # flags the plain `import Cryptodome` form even with a noqa).
+    import importlib.util
+
+    if importlib.util.find_spec("Cryptodome") is None:
+        raise ImportError("Cryptodome not available (likely Pyodide)")
 except ImportError:
     import Crypto
     import Crypto.Cipher
