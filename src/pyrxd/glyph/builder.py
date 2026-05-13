@@ -1298,7 +1298,13 @@ class TransferResult:
 # ft.py uses build_ft_locking_script / extract_ref_from_ft_script from
 # script.py directly).
 
-from .ft import FtTransferResult, FtUtxo  # noqa: E402,F401 (re-export)
+# PEP 484 explicit re-export pattern (``X as X``). Satisfies CodeQL's
+# py/unused-import alert — which does not honour the F401 suppression
+# pragma the way ruff does — and makes the re-export intent obvious to
+# readers. One real consumer is examples/ft_transfer_demo.py, which
+# imports FtUtxo from this module for back-compat with pre-0.4 layouts.
+from .ft import FtTransferResult as FtTransferResult  # noqa: E402
+from .ft import FtUtxo as FtUtxo  # noqa: E402
 
 
 @dataclass

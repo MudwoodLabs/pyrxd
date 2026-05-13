@@ -1224,16 +1224,20 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
 # Plain re-exports (no wrapping needed — these don't raise). Existing
 # tests + the human-mode renderer import these names from
 # ``pyrxd.cli.glyph_cmds`` directly, so the surface stays compatible.
-from ..glyph._inspect_core import (  # noqa: E402
-    _HUMAN_STRING_CAP,  # noqa: F401
-    _sanitize_display_string,  # noqa: F401
-    _truncate_for_human,
-)
+# PEP 484 explicit re-export pattern (``X as X``) for the two private
+# constants — satisfies both ruff's F401 (unused import) and CodeQL's
+# py/unused-import alert (CodeQL does not honour the F401 suppression
+# pragma the way ruff does). Existing tests + the human-mode renderer
+# import these names from ``pyrxd.cli.glyph_cmds`` directly, so the
+# surface stays compatible.
+from ..glyph._inspect_core import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP  # noqa: E402
 from ..glyph._inspect_core import _classify_input as _classify_input_core  # noqa: E402
 from ..glyph._inspect_core import _classify_raw_tx as _classify_raw_tx_core  # noqa: E402
 from ..glyph._inspect_core import _inspect_contract as _inspect_contract_core  # noqa: E402
 from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core  # noqa: E402
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core  # noqa: E402
+from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string  # noqa: E402
+from ..glyph._inspect_core import _truncate_for_human  # noqa: E402
 
 
 def _classify_input(s: str) -> tuple[str, str]:
