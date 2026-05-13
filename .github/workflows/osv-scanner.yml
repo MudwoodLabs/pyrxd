@@ -15,6 +15,11 @@ on:
     # CodeQL (06:00) to spread runner load.
     - cron: "0 8 * * 1"
 
+# Cancel old runs when a new push lands on the same branch/PR. See ci.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
