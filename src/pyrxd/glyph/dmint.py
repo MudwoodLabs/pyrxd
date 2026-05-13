@@ -1172,6 +1172,90 @@ def mine_solution_external(
 
 
 # ---------------------------------------------------------------------------
+# Dispatch helper — pick in-process vs external based on miner_argv
+# ---------------------------------------------------------------------------
+
+
+def mine_solution_dispatch(
+    preimage: bytes,
+    target: int,
+    *,
+    nonce_width: Literal[4, 8] = 4,
+    algo: DmintAlgo = DmintAlgo.SHA256D,
+    miner_argv: list[str] | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    timeout_s: float = EXTERNAL_MINER_TIMEOUT_S,
+) -> DmintMineResult:
+    """Mine a nonce — picks the in-process or subprocess miner from one entrypoint.
+
+    Most callers want this helper rather than calling
+    :func:`mine_solution` or :func:`mine_solution_external` directly.
+    The two paths share semantics — both return a :class:`DmintMineResult`
+    with a nonce that satisfies the target — but have disjoint parameter
+    sets (``max_attempts`` vs ``timeout_s``, no-argv vs argv). Picking
+    between them was a 30-line wrapper that every demo and operator
+    script ended up rewriting; this function is that wrapper, with the
+    branch in one place.
+
+    Dispatch rule:
+
+    * ``miner_argv is None`` (default): run :func:`mine_solution` in
+      this process. Slow but correct. Use for tests, small examples,
+      and contracts where mining takes < a minute.
+    * ``miner_argv is not None``: invoke :func:`mine_solution_external`
+      with the supplied argv. The external miner (e.g.
+      ``pyrxd.contrib.miner``, a custom binary, or ``glyph-miner``)
+      runs as a subprocess and returns a verified nonce via the
+      JSON-over-stdio protocol. The local re-verification in
+      ``mine_solution_external`` is the load-bearing safety check
+      against a buggy or malicious miner.
+
+    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param target:       The PoW target.
+    :param nonce_width:  4 for V1 contracts, 8 for V2.
+    :param algo:         Hash algorithm. Currently only SHA256D is implemented;
+                         BLAKE3 and K12 raise from :func:`mine_solution`.
+                         Ignored on the external-miner path (the protocol
+                         doesn't carry an algo field; external miners
+                         are assumed SHA256D until the protocol is
+                         extended).
+    :param miner_argv:   ``None`` → in-process; otherwise an argv list
+                         passed to :func:`subprocess.run` for the
+                         external miner. Use
+                         ``[sys.executable, "-m", "pyrxd.contrib.miner"]``
+                         for the bundled parallel miner.
+    :param max_attempts: Iteration cap on the in-process path. Ignored
+                         on the external-miner path (the external miner
+                         caps via ``timeout_s`` instead).
+    :param timeout_s:    Subprocess timeout on the external-miner path.
+                         Ignored in-process (use ``max_attempts`` there).
+
+    :returns: :class:`DmintMineResult` with the verified nonce.
+    :raises MaxAttemptsError:  in-process exhausted ``max_attempts``,
+                               or external miner exceeded ``timeout_s``
+                               / explicitly signalled exhaustion.
+    :raises ValidationError:   external miner returned a malformed
+                               response or a nonce that fails local
+                               verification.
+    """
+    if miner_argv is None:
+        return mine_solution(
+            preimage=preimage,
+            target=target,
+            algo=algo,
+            nonce_width=nonce_width,
+            max_attempts=max_attempts,
+        )
+    return mine_solution_external(
+        preimage=preimage,
+        target=target,
+        miner_argv=miner_argv,
+        nonce_width=nonce_width,
+        timeout_s=timeout_s,
+    )
+
+
+# ---------------------------------------------------------------------------
 # V2 state script parser (for reading on-chain UTXO state)
 # ---------------------------------------------------------------------------
 
