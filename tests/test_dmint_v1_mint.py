@@ -991,6 +991,125 @@ class TestMineSolutionExternal:
 
 
 # ---------------------------------------------------------------------------
+# 6b. mine_solution_dispatch — unified entrypoint for in-process + external
+# ---------------------------------------------------------------------------
+
+
+class TestMineSolutionDispatch:
+    """Promotes the demo's ``_mine`` wrapper into the library.
+
+    The dispatch helper picks ``mine_solution`` (in-process) when
+    ``miner_argv is None``, otherwise ``mine_solution_external``. Tests
+    use ``unittest.mock.patch`` to verify dispatch without actually
+    running either underlying miner — the real miners have their own
+    tests in ``TestMineSolution`` and ``TestMineSolutionExternal``.
+    """
+
+    _PREIMAGE = bytes.fromhex("ab" * 64)
+    _TARGET = 0x7FFFFFFFFFFFFFFF
+
+    def _stub_result(self) -> DmintMineResult:
+        """A fake successful mining result — what either underlying
+        miner would return."""
+        return DmintMineResult(nonce=b"\x01\x02\x03\x04", attempts=42, elapsed_s=0.5)
+
+    def test_no_argv_dispatches_to_in_process(self, mocker):
+        """``miner_argv=None`` calls ``mine_solution``, NOT ``mine_solution_external``."""
+        from pyrxd.glyph.dmint import mine_solution_dispatch
+
+        in_process = mocker.patch("pyrxd.glyph.dmint.mine_solution", return_value=self._stub_result())
+        external = mocker.patch("pyrxd.glyph.dmint.mine_solution_external")
+
+        result = mine_solution_dispatch(self._PREIMAGE, self._TARGET, nonce_width=4)
+
+        in_process.assert_called_once()
+        external.assert_not_called()
+        assert result.nonce == b"\x01\x02\x03\x04"
+
+    def test_argv_dispatches_to_external(self, mocker):
+        """A non-None ``miner_argv`` calls ``mine_solution_external``,
+        NOT ``mine_solution``."""
+        from pyrxd.glyph.dmint import mine_solution_dispatch
+
+        in_process = mocker.patch("pyrxd.glyph.dmint.mine_solution")
+        external = mocker.patch("pyrxd.glyph.dmint.mine_solution_external", return_value=self._stub_result())
+
+        result = mine_solution_dispatch(
+            self._PREIMAGE,
+            self._TARGET,
+            nonce_width=4,
+            miner_argv=["python", "-m", "pyrxd.contrib.miner"],
+        )
+
+        in_process.assert_not_called()
+        external.assert_called_once()
+        assert result.nonce == b"\x01\x02\x03\x04"
+
+    def test_in_process_path_passes_max_attempts(self, mocker):
+        """``max_attempts`` flows through to ``mine_solution`` on the
+        in-process path, NOT to ``mine_solution_external``."""
+        from pyrxd.glyph.dmint import mine_solution_dispatch
+
+        in_process = mocker.patch("pyrxd.glyph.dmint.mine_solution", return_value=self._stub_result())
+        mocker.patch("pyrxd.glyph.dmint.mine_solution_external")
+
+        mine_solution_dispatch(self._PREIMAGE, self._TARGET, nonce_width=4, max_attempts=1_000_000)
+
+        call_kwargs = in_process.call_args.kwargs
+        assert call_kwargs["max_attempts"] == 1_000_000
+
+    def test_external_path_passes_timeout(self, mocker):
+        """``timeout_s`` flows through to ``mine_solution_external`` on
+        the external path."""
+        from pyrxd.glyph.dmint import mine_solution_dispatch
+
+        external = mocker.patch("pyrxd.glyph.dmint.mine_solution_external", return_value=self._stub_result())
+        mocker.patch("pyrxd.glyph.dmint.mine_solution")
+
+        mine_solution_dispatch(
+            self._PREIMAGE,
+            self._TARGET,
+            nonce_width=4,
+            miner_argv=["python", "-m", "pyrxd.contrib.miner"],
+            timeout_s=120.0,
+        )
+
+        call_kwargs = external.call_args.kwargs
+        assert call_kwargs["timeout_s"] == 120.0
+
+    def test_in_process_path_actually_returns_verified_nonce(self):
+        """End-to-end on the in-process path with a small max_attempts —
+        the helper composes correctly with the real ``mine_solution``."""
+        from pyrxd.glyph.dmint import mine_solution_dispatch
+
+        # 256 attempts almost certainly won't find a valid nonce against
+        # MAX target (P(hit) per attempt ≈ 2^-32). We expect MaxAttemptsError,
+        # which is the correct passthrough behaviour.
+        from pyrxd.security.errors import MaxAttemptsError
+
+        with pytest.raises(MaxAttemptsError):
+            mine_solution_dispatch(
+                self._PREIMAGE,
+                self._TARGET,
+                nonce_width=4,
+                max_attempts=256,
+            )
+
+    def test_algo_passed_to_in_process_path(self, mocker):
+        """The ``algo`` parameter flows through to the in-process miner
+        (where the algo dispatch matters); on the external path it's
+        ignored because the JSON protocol has no algo field yet."""
+        from pyrxd.glyph.dmint import DmintAlgo, mine_solution_dispatch
+
+        in_process = mocker.patch("pyrxd.glyph.dmint.mine_solution", return_value=self._stub_result())
+        mocker.patch("pyrxd.glyph.dmint.mine_solution_external")
+
+        mine_solution_dispatch(self._PREIMAGE, self._TARGET, nonce_width=4, algo=DmintAlgo.SHA256D)
+
+        assert in_process.call_args.kwargs["algo"] == DmintAlgo.SHA256D
+
+
+# ---------------------------------------------------------------------------
 # 7. is_token_bearing_script — public token-detection classifier
 # ---------------------------------------------------------------------------
 

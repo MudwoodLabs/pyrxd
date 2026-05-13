@@ -105,8 +105,7 @@ from pyrxd.glyph.dmint import (
     build_dmint_v1_mint_preimage,
     build_mint_scriptsig,
     find_dmint_funding_utxo,
-    mine_solution,
-    mine_solution_external,
+    mine_solution_dispatch,
 )
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import ElectrumXClient
@@ -197,8 +196,14 @@ def _sign_p2pkh_input(tx: Transaction, input_index: int, private_key: PrivateKey
 
 
 def _mine(preimage: bytes, target: int, nonce_width: int) -> bytes:
-    """Find a nonce satisfying the target. Uses an external miner if
-    ``EXTERNAL_MINER`` is set, otherwise the slow Python reference."""
+    """Find a nonce satisfying the target.
+
+    Thin wrapper around :func:`pyrxd.glyph.dmint.mine_solution_dispatch`
+    that adds demo-level logging — pyrxd itself doesn't print to stdout
+    so demos / operator scripts handle that themselves. Set
+    ``EXTERNAL_MINER`` to invoke a subprocess miner; leave unset to use
+    the in-process reference miner.
+    """
     if EXTERNAL_MINER:
         argv = shlex.split(EXTERNAL_MINER)
         # Optional tighter timeout so a no-hit sweep falls through to
@@ -208,11 +213,11 @@ def _mine(preimage: bytes, target: int, nonce_width: int) -> bytes:
         # ~2-3 minutes; waiting 10 min on a no-hit wastes most of it.
         timeout_s = float(os.environ.get("EXTERNAL_MINER_TIMEOUT_S", "600"))
         print(f"Mining via external miner: {argv[0]} (timeout {timeout_s}s)")
-        result = mine_solution_external(
+        result = mine_solution_dispatch(
             preimage=preimage,
             target=target,
-            miner_argv=argv,
             nonce_width=nonce_width,  # type: ignore[arg-type]
+            miner_argv=argv,
             timeout_s=timeout_s,
         )
     else:
@@ -220,7 +225,7 @@ def _mine(preimage: bytes, target: int, nonce_width: int) -> bytes:
             f"Mining in pure Python (slow). MAX_ATTEMPTS={MAX_ATTEMPTS:_}. "
             f"Set EXTERNAL_MINER to use a fast external miner."
         )
-        result = mine_solution(
+        result = mine_solution_dispatch(
             preimage=preimage,
             target=target,
             nonce_width=nonce_width,  # type: ignore[arg-type]
