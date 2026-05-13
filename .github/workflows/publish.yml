@@ -36,9 +36,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install Poetry
-        # See ci.yml for why we pin the version (Scorecard PinnedDependenciesID).
-        # Keep this version in sync with ci.yml so build matches test.
-        run: pip install poetry==2.3.4
+        # Hash-pinned via ci/poetry-pin.txt (shared with ci.yml). Closes the
+        # OpenSSF Scorecard / CodeQL PinnedDependenciesID alert.
+        run: pip install -r ci/poetry-pin.txt --require-hashes
       - name: Verify version matches release tag
         # Reject the publish if pyproject.toml's version doesn't match
         # the tag the release was created from. This catches the
