@@ -6,6 +6,14 @@ on:
   pull_request:
     branches: [main, dev]
 
+# Cancel any in-flight CI run for the same branch / PR when a new push lands.
+# Dependabot rebases and force-pushes used to fan out wasted runs per chore PR;
+# this collapses that to one in-flight run per ref. Different branches / PRs
+# don't cancel each other (the group key includes ref / PR number).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

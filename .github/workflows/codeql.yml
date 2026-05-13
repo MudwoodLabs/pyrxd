@@ -10,6 +10,13 @@ on:
     # CodeQL's queries after our last code change.
     - cron: "0 6 * * 1"
 
+# Cancel old runs when a new push lands on the same branch/PR. See ci.yml.
+# Scheduled runs use refs/heads/main as their ref; they don't normally
+# overlap with push/PR events so concurrency cancellation is safe.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
