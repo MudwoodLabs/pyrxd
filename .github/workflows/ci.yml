@@ -35,13 +35,10 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install Poetry
-        # Pin poetry to a specific version. Closes the OpenSSF Scorecard
-        # PinnedDependenciesID alert ("pipCommand not pinned by hash") with
-        # the practical compromise: hash-pinning poetry itself would require
-        # a separate requirements-with-hashes file maintained alongside
-        # pyproject.toml. Version-pinning catches the "poetry-X.Y.Z released
-        # a breaking change overnight" failure mode at near-zero cost.
-        run: pip install poetry==2.3.4
+        # Hash-pinned via ci/poetry-pin.txt. Closes the OpenSSF Scorecard
+        # / CodeQL PinnedDependenciesID alert. See ci/README.md for how
+        # to bump the pin.
+        run: pip install -r ci/poetry-pin.txt --require-hashes
       - name: Install dependencies
         run: poetry install --sync --no-interaction
       - name: Run tests

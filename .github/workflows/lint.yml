@@ -23,7 +23,9 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install ruff
-        run: pip install ruff==0.15.12
+        # Hash-pinned via ci/ruff-pin.txt. Closes the OpenSSF Scorecard
+        # / CodeQL PinnedDependenciesID alert. See ci/README.md.
+        run: pip install -r ci/ruff-pin.txt --require-hashes
       - name: ruff check (lint)
         run: ruff check src tests examples
       - name: ruff format (check only — no rewrites)
