@@ -14,7 +14,7 @@ without decoding the token's reveal CBOR payload.
 
 ## 1. Discovery method
 
-- **MCP tool list** (`/home/eric/apps/radiant-mcp-server/src/index.ts`,
+- **MCP tool list** (`radiant-mcp-server`, `src/index.ts`
   lines 486–547): the MCP exposes `radiant_get_dmint_contracts` /
   `radiant_get_dmint_contract`, which call ElectrumX RPC methods
   `dmint.get_contracts` etc. Probing the public server
@@ -266,7 +266,7 @@ contract's lifetime.
   human-readable token name and the declared `diff`/`numContracts`. Not
   blocking for Python builder validation but would be nice to pull.
 - **Cannot distinguish V1 vs V2 encoding from the guide alone.** The
-  guide (`/home/eric/apps/radiant-glyph-guide/README.md` §dMint) and
+  guide (`radiant-glyph-guide` README §dMint) and
   photonic-wallet (`dMintScript` in `packages/lib/src/script.ts`) ship
   the **V2** 10-state-item layout. The live contracts here are the
   **V1** 3-state-item layout. A Python builder needs both code paths
@@ -293,13 +293,13 @@ contract's lifetime.
 
 ## Files referenced in this report
 
-- Full node on VPS: `ssh ericadmin@89.117.20.219 -- sudo docker exec
-  radiant-mainnet radiant-cli …` at tip = block 422,868.
-- Photonic-wallet reference: `/tmp/photonic-wallet/packages/lib/src/script.ts`
-  (lines 440–766) and `.../lib/src/mint.ts` (lines 388–460).
-- MCP tool surface: `/home/eric/apps/radiant-mcp-server/src/index.ts`
+- Full node on a private VPS: `radiant-cli` queries against a
+  self-hosted Radiant Core mainnet node, at tip = block 422,868.
+- Photonic-wallet reference: `packages/lib/src/script.ts`
+  (lines 440–766) and `packages/lib/src/mint.ts` (lines 388–460).
+- MCP tool surface: `radiant-mcp-server`, `src/index.ts`
   (lines 486–547).
-- Glyph v2 guide (protocol context): `/home/eric/apps/radiant-glyph-guide/README.md`
+- Glyph v2 guide (protocol context): `radiant-glyph-guide` README
   (lines 1310–1330 for protocol-ID table, 2820–2845 for V2 notes).
 - Local helper scripts used to pull the data: `/tmp/decode_script.py`
   (byte decoder), `/tmp/fetch_scripts.py`, `/tmp/trace_mint.py`,
