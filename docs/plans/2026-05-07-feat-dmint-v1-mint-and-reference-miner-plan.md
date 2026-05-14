@@ -346,8 +346,8 @@ yet — adding it before someone asks is YAGNI.
 Generalize [`verify_sha256d_solution` at dmint.py:466](../../src/pyrxd/glyph/dmint.py#L466)
 to take a keyword-only `nonce_width: Literal[4, 8] = 8` (preserves V2
 default; new V1 callers pass `nonce_width=4`). Confirmed equivalence
-with glyph-miner reference at
-`/home/eric/apps/Pinball/glyph-miner/src/miner.ts:494-508`: target check
+with the glyph-miner reference at
+`glyph-miner` `src/miner.ts:494-508`: target check
 is `hash[0..4] == 0x00000000 AND be_u64(hash[4..12]) < target`.
 
 ### C. Synthetic-then-real acceptance proof
@@ -479,7 +479,7 @@ difficulty without explicit opt-in.
 - **Mining is offline.** No network calls inside `mine_solution`. The
   preimage-target shim protocol is local-only (subprocess stdin/stdout),
   not a network endpoint.
-- **License attribution.** glyph-miner is MIT (`/home/eric/apps/Pinball/glyph-miner/LICENSE`).
+- **License attribution.** glyph-miner is MIT (see its `LICENSE`).
   pyrxd is Apache 2.0. Compatible. If specific algorithm code is ported
   (e.g. midstate-precompute pattern), preserve the MIT header per file
   or add to NOTICE. Not a legal opinion.
@@ -550,9 +550,9 @@ difficulty without explicit opt-in.
 
 ### Dependencies
 
-- VPS Radiant node at `89.117.20.219` for `testmempoolaccept`
+- A self-hosted Radiant full node for `testmempoolaccept`
   (existing — already used by deploy-integration tests).
-- `glyph-miner` project at `/home/eric/apps/Pinball/glyph-miner` for
+- the `glyph-miner` project for
   the optional fast-mining path. Not a hard dependency for shipping
   M1, but a cross-check during real-mint testing.
 
@@ -669,7 +669,7 @@ Acceptance: both guards in place. Test confirms the
 
 ### External references
 
-- `/home/eric/apps/Pinball/glyph-miner/` (MIT) — authoritative V1 mining algorithm
+- `glyph-miner` (MIT) — authoritative V1 mining algorithm
   - `src/pow.ts` L11–18 — preimage construction
   - `src/miner.ts` L283–311 — midstate precompute
   - `src/miner.ts` L494–508 — target check (BE)
