@@ -83,6 +83,7 @@ def test_decode_payload_only_validation_error(data):
     try:
         decode_payload(data)
     except ValidationError:
+        # expected: parser converted a malformed input cleanly
         pass
     except Exception as exc:
         _fail_unexpected("decode_payload", exc, data)
@@ -114,6 +115,7 @@ def test_dmint_from_script_only_validation_error(data):
     try:
         DmintState.from_script(data)
     except ValidationError:
+        # expected: parser converted a malformed input cleanly
         pass
     except Exception as exc:
         _fail_unexpected("DmintState.from_script", exc, data)
@@ -133,6 +135,7 @@ def test_dmint_from_script_v2_prefix_only_validation_error(height_push, tail):
     try:
         DmintState.from_script(data)
     except ValidationError:
+        # expected: parser converted a malformed input cleanly
         pass
     except Exception as exc:
         _fail_unexpected("DmintState.from_script (v2-prefix)", exc, data)
@@ -204,6 +207,7 @@ def test_find_glyphs_never_raises_on_arbitrary_scripts(outputs):
             f"find_glyphs raised ValidationError (should be silently skipped) "
             f"on inputs {[(s, b.hex()) for s, b in outputs]}\n  joined={joined.hex()}"
         )
+        return  # unreachable (pytest.fail raises) — proves `result` is bound below
     except Exception as exc:
         joined = b"".join(s for _, s in outputs)
         _fail_unexpected("find_glyphs", exc, joined)
@@ -258,6 +262,7 @@ def test_inspect_script_rejects_bad_hex_with_validation_error(bad_hex):
     try:
         _inspect_script(bad_hex)
     except ValidationError:
+        # expected: parser rejected malformed hex at the boundary
         pass
     except Exception as exc:
         # Allow successful classification if Hypothesis happens to produce
@@ -305,6 +310,7 @@ def test_glyphref_from_bytes_only_validation_error(data):
     try:
         GlyphRef.from_bytes(data)
     except ValidationError:
+        # expected: parser rejected malformed ref bytes at the boundary
         pass
     except Exception as exc:
         _fail_unexpected("GlyphRef.from_bytes", exc, data)
@@ -319,6 +325,7 @@ def test_glyphref_from_contract_hex_only_validation_error(s):
     try:
         GlyphRef.from_contract_hex(s)
     except ValidationError:
+        # expected: parser rejected malformed contract hex at the boundary
         pass
     except Exception as exc:
         _fail_unexpected("GlyphRef.from_contract_hex", exc, s)

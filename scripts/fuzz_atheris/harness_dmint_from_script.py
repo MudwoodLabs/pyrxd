@@ -29,7 +29,7 @@ def TestOneInput(data: bytes) -> None:
     try:
         DmintState.from_script(data)
     except ValidationError:
-        pass
+        pass  # expected: parser converted a malformed input cleanly
 
 
 def main() -> None:

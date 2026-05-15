@@ -42,7 +42,7 @@ def TestOneInput(data: bytes) -> None:
     try:
         _inspect_script(hex_in)
     except ValidationError:
-        pass
+        pass  # expected: inspector rejected malformed hex at the boundary
 
 
 def main() -> None:

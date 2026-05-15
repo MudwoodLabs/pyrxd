@@ -31,7 +31,7 @@ def TestOneInput(data: bytes) -> None:
     try:
         _classify_input(s)
     except ValidationError:
-        pass
+        pass  # expected: classifier rejected malformed input cleanly
 
 
 def main() -> None:
