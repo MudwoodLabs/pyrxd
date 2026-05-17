@@ -67,6 +67,19 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "target_to_difficulty": ("pyrxd.glyph.dmint", "target_to_difficulty"),
     "verify_creator_signature": ("pyrxd.glyph.creator", "verify_creator_signature"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
+    "RxinDexerClient": ("pyrxd.network.rxindexer", "RxinDexerClient"),
+    "RxinDexerError": ("pyrxd.network.rxindexer", "RxinDexerError"),
+    "RxinDexerNotFound": ("pyrxd.network.rxindexer", "RxinDexerNotFound"),
+    "WaveAttrs": ("pyrxd.glyph.wave", "WaveAttrs"),
+    "WaveNameNotFound": ("pyrxd.glyph.wave", "WaveNameNotFound"),
+    "WaveRecord": ("pyrxd.glyph.wave", "WaveRecord"),
+    "WaveResolver": ("pyrxd.glyph.wave", "WaveResolver"),
+    "WaveResolverError": ("pyrxd.glyph.wave", "WaveResolverError"),
+    "build_wave_metadata": ("pyrxd.glyph.wave", "build_wave_metadata"),
+    "classify_glyph_metadata": ("pyrxd.glyph.wave", "classify_glyph_metadata"),
+    "extract_wave_attrs": ("pyrxd.glyph.wave", "extract_wave_attrs"),
+    "split_qualified_name": ("pyrxd.glyph.wave", "split_qualified_name"),
+    "wave_attrs_from_metadata": ("pyrxd.glyph.wave", "wave_attrs_from_metadata"),
 }
 
 __all__ = sorted(_LAZY_EXPORTS.keys())
