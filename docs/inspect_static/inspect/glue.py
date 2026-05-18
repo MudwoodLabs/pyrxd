@@ -362,13 +362,9 @@ def _hint_for(form: str) -> str:
     """A one-line follow-up hint per failed-form."""
     return {
         "contract": (
-            "Glyph contract ids are 72 hex characters: "
-            "<32-byte txid in display order><4-byte vout in big endian>"
+            "Glyph contract ids are 72 hex characters: <32-byte txid in display order><4-byte vout in big endian>"
         ),
-        "outpoint": (
-            "Outpoints look like '<64-char-txid>:<vout-int>' "
-            "— check your colon and length"
-        ),
+        "outpoint": ("Outpoints look like '<64-char-txid>:<vout-int>' — check your colon and length"),
         "script": (
             "Scripts are hex-encoded locking-script bytes. "
             "P2PKH is 25 bytes (50 hex chars); FT is 75 bytes (150 hex chars)."

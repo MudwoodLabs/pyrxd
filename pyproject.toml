@@ -162,6 +162,10 @@ ignore = [
     "S",      # examples use test keys / hardcoded WIFs intentionally
     "E402",   # examples may reorder imports for narrative clarity
 ]
+"scripts/**" = [
+    "S603",   # subprocess call with non-shell args: dev scripts trust their own argv
+    "S607",   # partial executable path: `git`, `python3` etc. resolved via PATH at dev time
+]
 "docs/conf.py" = ["E", "F", "I"]
 
 [tool.ruff.lint.isort]
