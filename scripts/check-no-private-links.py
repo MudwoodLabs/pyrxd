@@ -158,9 +158,7 @@ def check_ignored(repo_root: Path, paths: list[Path]) -> set[Path]:
         check=False,  # exit 1 is normal (means "no ignored files in input")
     )
     if result.returncode not in (0, 1):
-        raise RuntimeError(
-            f"git check-ignore failed with exit code {result.returncode}: {result.stderr}"
-        )
+        raise RuntimeError(f"git check-ignore failed with exit code {result.returncode}: {result.stderr}")
     return {Path(line) for line in result.stdout.splitlines() if line}
 
 
