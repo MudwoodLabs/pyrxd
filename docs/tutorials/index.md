@@ -8,8 +8,10 @@ fungible token, run a Gravity swap.
 :maxdepth: 1
 
 your-first-radiant-transaction
+inspect-a-radiant-transaction
 mint-a-glyph-nft
 mint-a-glyph-ft
+mint-from-a-dmint-contract
 ```
 
 ## Available now
@@ -21,6 +23,12 @@ mint-a-glyph-ft
   `HdWallet.build_send_tx(...)`. Broadcast is gated behind a
   `DRY_RUN=0 I_UNDERSTAND_THIS_IS_REAL=yes` env-var pair so dry-run
   is always the default.
+- **[Inspect a Radiant transaction in the browser](inspect-a-radiant-transaction.md)** —
+  the gentlest first-contact with pyrxd. No install, no wallet, no
+  funded UTXOs. Open the browser-hosted inspect tool, paste real
+  mainnet txids, and decode an FT transfer, a dMint mint claim, a
+  Glyph deploy reveal, and a plain RXD send. Start here if you're
+  new to Radiant or pyrxd.
 - **[Mint a Glyph NFT](mint-a-glyph-nft.md)** — author CBOR metadata,
   build a commit transaction, wait for confirmation, build the reveal,
   and broadcast. Uses a synthetic key by default so you can run every
@@ -30,6 +38,13 @@ mint-a-glyph-ft
   `GlyphBuilder.prepare_commit` and `prepare_ft_deploy_reveal`, and
   broadcast a single 75-byte FT output carrying the full premine
   supply. DRY_RUN by default; opt in to broadcast.
+- **[Mint from a V1 dMint contract on Radiant mainnet](mint-from-a-dmint-contract.md)** —
+  end-to-end walkthrough of mining and claiming one mint from a live
+  V1 dMint contract (anchored to Glyph Protocol / GLYPH). Covers
+  `find_dmint_contract_utxos`, the `EXTERNAL_MINER` JSON-over-stdio
+  miner protocol, the four-output mint-tx shape, and the broadcast
+  handshake. This is the most advanced tutorial in the set — it touches
+  the network, costs real RXD, and is irreversible.
 
 ## Planned tutorials
 
