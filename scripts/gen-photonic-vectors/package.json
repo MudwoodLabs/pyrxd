@@ -1,0 +1,20 @@
+{
+  "name": "gen-photonic-vectors",
+  "version": "0.1.0",
+  "private": true,
+  "description": "One-off bridge script that calls Photonic Wallet's encryption/timelock primitives with fixed inputs and dumps a JSON fixture file used by pyrxd's TIMELOCK interop tests.",
+  "type": "module",
+  "scripts": {
+    "gen": "tsx gen-vectors.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "^1.0.0",
+    "@noble/curves": "^1.6.0",
+    "@noble/hashes": "^1.5.0",
+    "cbor-x": "^1.6.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.0.0"
+  }
+}

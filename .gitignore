@@ -185,3 +185,17 @@ wallet*.dat
 # something that could happen via `git add .`
 docs/design/
 
+# ===== Local-only dev environment =====
+# Machine-local tooling state and generated output. None of this is
+# portable or meaningful to another contributor; keeping it untracked
+# leaves `git status` clean for everyone.
+#
+# .claude/      — Claude Code per-machine config
+# .worktrees/   — git worktree checkouts (local-only by definition)
+# logs/         — fuzz / diagnostic run output (scripts/fuzz_*.sh)
+# poetry.lock   — library project; deps resolve from pyproject.toml
+.claude/
+.worktrees/
+logs/
+poetry.lock
+

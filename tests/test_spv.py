@@ -738,7 +738,10 @@ class TestSpvProofBuilder:
         target_BE = 0x000000_7fffff_00..00 — hash_BE first 3 bytes must be 0
         (equivalently hash_LE last 3 bytes must be 0), so probability 1/2^24.
         Fast-path: hash directly with hashlib and only call the full verifier
-        on matches. This finishes within ~5 seconds on CPython.
+        on matches. This finishes within ~5-30s on CPython, so the test class
+        loads pre-mined headers from a fixture file (see :meth:`_load_pow_fixture`)
+        and only falls back to this grinder if the fixture is missing or no
+        longer satisfies the verifier.
         """
         time_field = b"\x00\x00\x00\x00"
         base = version + prev + merkle_le + time_field + nbits
@@ -755,8 +758,47 @@ class TestSpvProofBuilder:
                     continue
         raise RuntimeError("could not grind header in 100M tries")
 
+    @staticmethod
+    def _load_pow_fixture(satoshis: int, hash20: bytes) -> bytes | None:
+        """Return a pre-mined header for (satoshis, hash20) if available.
+
+        Loads from ``tests/fixtures/spv_synthetic_headers.json`` (generated
+        by ``scripts/gen-spv-test-fixtures.py``). Each fixture entry is
+        re-verified against the current PoW verifier before use — if the
+        verifier semantics changed, the fixture is silently ignored and
+        the caller falls back to in-process grinding.
+
+        Returns ``None`` if no fixture exists for the requested inputs OR
+        if the fixture header no longer satisfies the verifier.
+        """
+        import json
+        from pathlib import Path
+
+        fixture_path = Path(__file__).parent / "fixtures" / "spv_synthetic_headers.json"
+        if not fixture_path.exists():
+            return None
+        try:
+            data = json.loads(fixture_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return None
+
+        hash20_hex = hash20.hex()
+        for entry in data.get("fixtures", []):
+            if entry.get("satoshis") == satoshis and entry.get("hash20_hex") == hash20_hex:
+                header = bytes.fromhex(entry["header_hex"])
+                # Re-verify against the current verifier — if PoW semantics
+                # changed since the fixture was generated, fall through to
+                # grinding so the test still runs (just slowly).
+                try:
+                    verify_header_pow(header)
+                    return header
+                except SpvVerificationError:
+                    return None
+        return None
+
     # Class-level cache of ground synthetic headers, keyed by (satoshis, hash20).
-    # Each grind takes ~5s on CPython; cache avoids repeat work across tests.
+    # In normal use this stays empty — the fixture loader catches everything.
+    # Cache + grinder are kept as a fallback for inputs not in the fixture.
     _synthetic_cache: dict = {}
 
     def _build_synthetic_proof_inputs(
@@ -796,7 +838,20 @@ class TestSpvProofBuilder:
 
         anchor = b"\x99" * 32
         nbits = b"\xff\xff\x7f\x1d"  # large target, exponent 0x1d
-        header = self._grind_header(b"\x00\x00\x00\x20", anchor, merkle_root_le, nbits)
+        # Prefer the pre-mined fixture (saves ~33s per test run); fall back
+        # to in-process grinding if no fixture matches these inputs.
+        header = self._load_pow_fixture(satoshis, hash20)
+        if header is None:
+            import warnings
+
+            warnings.warn(
+                f"no pre-mined PoW header for (satoshis={satoshis}, "
+                f"hash20={hash20.hex()}) — falling back to in-process grind "
+                f"(~5-30s). Regenerate fixture via "
+                f"`python scripts/gen-spv-test-fixtures.py`.",
+                stacklevel=2,
+            )
+            header = self._grind_header(b"\x00\x00\x00\x20", anchor, merkle_root_le, nbits)
         result = (
             txid_be_hex,
             raw_tx.hex(),
