@@ -1,0 +1,32 @@
+{
+  "_meta": {
+    "generated_by": "scripts/gen-spv-test-fixtures.py",
+    "purpose": "Pre-mined PoW headers for tests/test_spv.py synthetic-block tests. Saves ~33s on every test run. Regenerate if SPV protocol or verifier semantics change.",
+    "header_params": {
+      "version_le_hex": "00000020",
+      "anchor_hex": "9999999999999999999999999999999999999999999999999999999999999999",
+      "nbits_le_hex": "ffff7f1d",
+      "time_le_hex": "00000000",
+      "merkle_sibling_le_hex": "abababababababababababababababababababababababababababababababab"
+    },
+    "fixture_count": 2
+  },
+  "fixtures": [
+    {
+      "satoshis": 5000,
+      "hash20_hex": "7777777777777777777777777777777777777777",
+      "nonce": 28660750,
+      "header_hex": "0000002099999999999999999999999999999999999999999999999999999999999999995293517966b2cf8713ece2f0ab446007bac9afd5cfd7b7a25bec699f6b3da60c00000000ffff7f1d0e54b501",
+      "header_hash256_le_hex": "40aadadf6a3cb26c71f4e054fb6f93b386a38e1a0c94ca3222b9c8497c000000",
+      "grind_seconds": 14.78
+    },
+    {
+      "satoshis": 500,
+      "hash20_hex": "7777777777777777777777777777777777777777",
+      "nonce": 6392320,
+      "header_hex": "0000002099999999999999999999999999999999999999999999999999999999999999999addc2307316820425c1c7bebe0e78b378db321d0a6b9fbef63cced37c90980a00000000ffff7f1d008a6100",
+      "header_hash256_le_hex": "1b30e65480f537973771b8e059e62b38666ecd54879ec2bc3ff62e014d000000",
+      "grind_seconds": 3.42
+    }
+  ]
+}
