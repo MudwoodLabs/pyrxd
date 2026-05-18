@@ -7,6 +7,7 @@ fungible token, run a Gravity swap.
 ```{toctree}
 :maxdepth: 1
 
+your-first-radiant-transaction
 inspect-a-radiant-transaction
 mint-a-glyph-nft
 mint-a-glyph-ft
@@ -15,6 +16,13 @@ mint-from-a-dmint-contract
 
 ## Available now
 
+- **[Your first Radiant transaction](your-first-radiant-transaction.md)** —
+  fresh `pip install` to a built, signed RXD send. Walks through
+  `pyrxd wallet new`, `pyrxd address`, `pyrxd balance --refresh`,
+  `pyrxd utxos`, and a short Python script using
+  `HdWallet.build_send_tx(...)`. Broadcast is gated behind a
+  `DRY_RUN=0 I_UNDERSTAND_THIS_IS_REAL=yes` env-var pair so dry-run
+  is always the default.
 - **[Inspect a Radiant transaction in the browser](inspect-a-radiant-transaction.md)** —
   the gentlest first-contact with pyrxd. No install, no wallet, no
   funded UTXOs. Open the browser-hosted inspect tool, paste real
@@ -38,9 +46,9 @@ mint-from-a-dmint-contract
   handshake. This is the most advanced tutorial in the set — it touches
   the network, costs real RXD, and is irreversible.
 
-## Coming soon
+## Planned tutorials
 
-More tutorials are being written as the v0.5.x line stabilises. In the
+Tutorials are being written as the v0.5.x line stabilises. In the
 meantime, the runnable end-to-end demos in
 [`examples/`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples) are
 the closest thing — they exercise the same flows that the future tutorials
