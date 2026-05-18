@@ -10,6 +10,7 @@ fungible token, run a Gravity swap.
 inspect-a-radiant-transaction
 mint-a-glyph-nft
 mint-a-glyph-ft
+mint-from-a-dmint-contract
 ```
 
 ## Available now
@@ -29,6 +30,13 @@ mint-a-glyph-ft
   `GlyphBuilder.prepare_commit` and `prepare_ft_deploy_reveal`, and
   broadcast a single 75-byte FT output carrying the full premine
   supply. DRY_RUN by default; opt in to broadcast.
+- **[Mint from a V1 dMint contract on Radiant mainnet](mint-from-a-dmint-contract.md)** —
+  end-to-end walkthrough of mining and claiming one mint from a live
+  V1 dMint contract (anchored to Glyph Protocol / GLYPH). Covers
+  `find_dmint_contract_utxos`, the `EXTERNAL_MINER` JSON-over-stdio
+  miner protocol, the four-output mint-tx shape, and the broadcast
+  handshake. This is the most advanced tutorial in the set — it touches
+  the network, costs real RXD, and is irreversible.
 
 ## Coming soon
 
