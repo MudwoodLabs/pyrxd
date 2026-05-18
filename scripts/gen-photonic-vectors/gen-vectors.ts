@@ -98,6 +98,8 @@ interface Vectors {
     notes: string;
   };
   xchacha20_poly1305: object;
+  chunked_aead_small: object;
+  chunked_aead_large: object;
   hkdf_sha256: object;
   x25519: object;
   hash_content: object;
@@ -140,6 +142,44 @@ const vectors: Vectors = {
       },
     };
   })(),
+
+  // ----- 1b. Chunked AEAD (chunked-aead-v1 scheme) — Photonic encrypts with
+  //          random per-chunk nonces; pyrxd test asserts it can DECRYPT and
+  //          recover the original plaintext byte-for-byte. -----
+  ...(((): { chunked_aead_small: object; chunked_aead_large: object; chunked_aead_multi: object } => {
+    const PT_MULTI = new Uint8Array(80 * 1024); // 80 KB → ceil(80/32) = 3 chunks
+    for (let i = 0; i < PT_MULTI.length; i++) PT_MULTI[i] = (i * 23 + 11) & 0xff;
+    const smallChunked = enc.encryptChunked(PT_SMALL, CEK);
+    const largeChunked = enc.encryptChunked(PT_LARGE, CEK);
+    const multiChunked = enc.encryptChunked(PT_MULTI, CEK);
+    const serializeChunks = (c: { chunks: Array<{ ciphertext: Uint8Array; nonce: Uint8Array }> }) =>
+      c.chunks.map((ch) => ({
+        nonce: hex(u8(ch.nonce)),
+        ciphertext: hex(u8(ch.ciphertext)),
+      }));
+    return {
+      chunked_aead_small: {
+        key: hex(CEK),
+        plaintext: hex(PT_SMALL),
+        plaintext_hash: hex(u8(smallChunked.plaintextHash)),
+        chunks: serializeChunks(smallChunked),
+      },
+      chunked_aead_large: {
+        key: hex(CEK),
+        plaintext_sha256: hex(sha256(PT_LARGE)),
+        plaintext_length: PT_LARGE.length,
+        plaintext_hash: hex(u8(largeChunked.plaintextHash)),
+        chunks: serializeChunks(largeChunked),
+      },
+      chunked_aead_multi: {
+        key: hex(CEK),
+        plaintext_sha256: hex(sha256(PT_MULTI)),
+        plaintext_length: PT_MULTI.length,
+        plaintext_hash: hex(u8(multiChunked.plaintextHash)),
+        chunks: serializeChunks(multiChunked),
+      },
+    };
+  })()),
 
   // ----- 2. HKDF-SHA256 derivation -----
   hkdf_sha256: {
