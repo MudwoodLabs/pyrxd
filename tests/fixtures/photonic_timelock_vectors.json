@@ -1,0 +1,179 @@
+{
+  "meta": {
+    "generated_by": "pyrxd-timelock bridge script (Photonic interop)",
+    "photonic_lib_path": "/home/eric/apps/Photonic-Wallet/packages/lib",
+    "generated_at": "2026-05-18T04:25:33.919Z",
+    "notes": "All vectors produced by calling Photonic's actual source files (not a re-implementation). Inputs are deterministic; outputs are recorded for pyrxd to assert byte-equality. Regenerate when Photonic's spec changes."
+  },
+  "xchacha20_poly1305": {
+    "key": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+    "nonce": "0726456483a2c1e0ff1e3d5c7b9ab9d8f71635547392b1d0",
+    "aad": "70686f746f6e69632d6161642d7631",
+    "small": {
+      "plaintext": "68656c6c6f2c2070686f746f6e69632074696d656c6f636b20696e7465726f70",
+      "ciphertext": "88385d1ea1ae10d23f2a0e51a3a2de2ed2357962b500e7c78c9404557aac77ab9d61d1bf4d01e714c36e07aecf323c7f"
+    },
+    "large": {
+      "plaintext_sha256": "b14e7cf486708691e4801fd0d78ffbb35b61a1b74d113b247b1f663a9cddb99a",
+      "plaintext_length": 8192,
+      "ciphertext_sha256": "04ae8e89fa5d4ff91b13afeb64e4f6254de0d88f111b8ecdb2bbe3e068847dd7",
+      "ciphertext_length": 8208
+    }
+  },
+  "hkdf_sha256": {
+    "ikm": "02070c11161b20252a2f34393e43484d52575c61666b70757a7f84898e93989da2a7acb1b6bbc0c5cacfd4d9dee3e8ed",
+    "salt": "70686f746f6e69632d686b64662d73616c742d7631",
+    "info": "70686f746f6e69632d686b64662d696e666f2d7631",
+    "output_length": 32,
+    "derived": "7951a192a28f94b2350dc6585c22027c56744fb5b84ee2fdd0b1a31b16ec508c"
+  },
+  "x25519": {
+    "sk_a": "0d141b222930373e454c535a61686f767d848b9299a0a7aeb5bcc3cad1d8dfe6",
+    "pk_a": "9f55403a4e8a3fea6bad890add88d6a222e9fcc8009c638091bd81ab20704263",
+    "sk_b": "05101b26313c47525d68737e89949faab5c0cbd6e1ecf7020d18232e39444f5a",
+    "pk_b": "14ee0e07f34e3a17030c6eecf66d3705e80d1e153f7a0ca5b345e83ce9d62643",
+    "shared_secret_a_to_b": "21603c730b0410cd4816c4a090e99ce62db3ecdf3c2b6bef879235508db2af33"
+  },
+  "hash_content": {
+    "input": "68656c6c6f2c2070686f746f6e69632074696d656c6f636b20696e7465726f70",
+    "output": "37a262db5e7f4810feaca04ba122537f9047bd922bda5527f7867d719be35d57"
+  },
+  "cek_hash_commitment": {
+    "cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+    "cek_hash_bytes": "8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+    "cek_hash_string": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7"
+  },
+  "timelock_metadata_block_mode": {
+    "input_stub_protocols": [
+      2,
+      8
+    ],
+    "unlock_at": 425046,
+    "mode": "block",
+    "output_metadata": {
+      "p": [
+        2,
+        8,
+        9
+      ],
+      "type": "image/png",
+      "name": "Sealed Test #1",
+      "main": {
+        "type": "image/png",
+        "hash": "sha256:37a262db5e7f4810feaca04ba122537f9047bd922bda5527f7867d719be35d57",
+        "enc": "xchacha20poly1305",
+        "size": 32,
+        "chunks": 1,
+        "scheme": "chunked-aead-v1"
+      },
+      "crypto": {
+        "mode": "encrypted",
+        "key_format": "wrapped",
+        "cek_hash": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+        "timelock": {
+          "mode": "block",
+          "unlock_at": 425046,
+          "cek_hash": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7"
+        }
+      }
+    },
+    "output_commitment": {
+      "cekHash": "8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+      "mode": "block",
+      "unlockAt": 425046
+    }
+  },
+  "timelock_metadata_time_mode": {
+    "input_stub_protocols": [
+      2,
+      8
+    ],
+    "unlock_at": 1700000000,
+    "mode": "time",
+    "hint": "demo hint string",
+    "output_metadata": {
+      "p": [
+        2,
+        8,
+        9
+      ],
+      "type": "application/octet-stream",
+      "name": "Sealed Test #2",
+      "main": {
+        "type": "application/octet-stream",
+        "hash": "sha256:b14e7cf486708691e4801fd0d78ffbb35b61a1b74d113b247b1f663a9cddb99a",
+        "enc": "xchacha20poly1305",
+        "size": 8192,
+        "chunks": 1,
+        "scheme": "chunked-aead-v1"
+      },
+      "crypto": {
+        "mode": "encrypted",
+        "key_format": "wrapped",
+        "cek_hash": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+        "timelock": {
+          "mode": "time",
+          "unlock_at": 1700000000,
+          "cek_hash": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+          "hint": "demo hint string"
+        }
+      }
+    },
+    "output_commitment": {
+      "cekHash": "8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+      "mode": "time",
+      "unlockAt": 1700000000,
+      "hint": "demo hint string"
+    }
+  },
+  "reveal_proof_block_mode": {
+    "token_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+    "cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+    "proof": {
+      "v": 2,
+      "p": [
+        9
+      ],
+      "action": "reveal",
+      "token_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+      "cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+      "cek_hash": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7"
+    },
+    "op_return_script_hex": "6a03676c79010201094cfeb900066176026170810966616374696f6e6672657665616c69746f6b656e5f7265667842616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161613a306363656b7840303131323233333434353536363737383839396161626263636464656566303031313232333334343535363637373838393961616262636364646565666631306863656b5f6861736878477368613235363a38633530376537303263376638303562313562353730376538636431336237313939643839663631336131313938396466353533316232613264353130626237"
+  },
+  "reveal_proof_time_mode": {
+    "token_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+    "cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+    "hint": "demo hint string",
+    "proof": {
+      "v": 2,
+      "p": [
+        9
+      ],
+      "action": "reveal",
+      "token_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+      "cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+      "cek_hash": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+      "hint": "demo hint string"
+    },
+    "op_return_script_hex": "6a03676c79010201094d1401b900076176026170810966616374696f6e6672657665616c69746f6b656e5f7265667842616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161613a306363656b7840303131323233333434353536363737383839396161626263636464656566303031313232333334343535363637373838393961616262636364646565666631306863656b5f6861736878477368613235363a386335303765373032633766383035623135623537303765386364313362373139396438396636313361313139383964663535333162326132643531306262376468696e747064656d6f2068696e7420737472696e67"
+  },
+  "reveal_proof_with_hint": {
+    "token_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+    "cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+    "hint": "demo hint string",
+    "cek_hash_override": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+    "proof": {
+      "v": 2,
+      "p": [
+        9
+      ],
+      "action": "reveal",
+      "token_ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:0",
+      "cek": "0112233445566778899aabbccddeef00112233445566778899aabbccddeeff10",
+      "cek_hash": "sha256:8c507e702c7f805b15b5707e8cd13b7199d89f613a11989df5531b2a2d510bb7",
+      "hint": "demo hint string"
+    },
+    "op_return_script_hex": "6a03676c79010201094d1401b900076176026170810966616374696f6e6672657665616c69746f6b656e5f7265667842616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161616161613a306363656b7840303131323233333434353536363737383839396161626263636464656566303031313232333334343535363637373838393961616262636364646565666631306863656b5f6861736878477368613235363a386335303765373032633766383035623135623537303765386364313362373139396438396636313361313139383964663535333162326132643531306262376468696e747064656d6f2068696e7420737472696e67"
+  }
+}
