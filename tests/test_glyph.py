@@ -119,6 +119,80 @@ class TestScriptConstruction:
 
 
 # ---------------------------------------------------------------------------
+# Mainnet golden vector — NFT locking script byte-equal vs real Glyph NFT
+# ---------------------------------------------------------------------------
+
+
+class TestNftLockingScriptMainnetGolden:
+    """Pin ``build_nft_locking_script`` against a real Glyph NFT reveal on
+    Radiant mainnet. If the encoder ever drifts from the on-chain shape,
+    this test fires immediately.
+
+    Source: mainnet tx
+    ``27390efab1e3168c05301b18f6cdfd553a6d122a41496d0f5e104e79a918be7e``
+    vout[0] (Glyph NFT reveal with on-chain thumbnail; referenced in the
+    Radiant Glyph Guide as the canonical NFT-with-image example).
+
+    Pairs with ``TestFtLockingScriptMainnetGolden`` in
+    ``tests/test_dmint_module.py`` to close the pattern-recognition audit's
+    #R7 followup: every wire-format builder gets one
+    ``test_byte_equal_to_<chain_ref>`` assertion before merge.
+    """
+
+    # PKH from the on-chain NFT singleton's P2PKH tail (offsets 41..61).
+    _OWNER_PKH = bytes.fromhex("cd2f89a318ff02653eaed3ab70f7f15637d71598")
+
+    # NFT ref: 32-byte commit_txid_le (reversed) + 4-byte vout LE.
+    # Extracted from on-chain vout[0] script offsets 1..37 (36 bytes):
+    # `ffe5593ff6507a98323818bc266ed7905500a04334441181fee4e0a46ae38eb3 00000000`
+    _REF_BYTES = bytes.fromhex("ffe5593ff6507a98323818bc266ed7905500a04334441181fee4e0a46ae38eb300000000")
+
+    # vout[0] locking script (63 bytes) extracted from the on-chain raw tx.
+    _VOUT0_NFT_SCRIPT = bytes.fromhex(
+        "d8"
+        "ffe5593ff6507a98323818bc266ed7905500a04334441181fee4e0a46ae38eb300000000"
+        "75"
+        "76a914"
+        "cd2f89a318ff02653eaed3ab70f7f15637d71598"
+        "88ac"
+    )
+
+    def test_pyrxd_nft_builder_matches_mainnet_byte_for_byte(self):
+        """``build_nft_locking_script(pkh, ref)`` produces the exact bytes
+        observed in the live Glyph NFT reveal's vout[0]. If this fails,
+        the builder has drifted from the on-chain shape — and every NFT
+        emitted by pyrxd is silently wrong."""
+        ref_txid_le = self._REF_BYTES[:32]
+        ref_vout_le = self._REF_BYTES[32:36]
+        ref = GlyphRef(
+            txid=Txid(ref_txid_le[::-1].hex()),
+            vout=int.from_bytes(ref_vout_le, "little"),
+        )
+
+        rebuilt = build_nft_locking_script(Hex20(self._OWNER_PKH), ref)
+        assert rebuilt == self._VOUT0_NFT_SCRIPT, (
+            f"NFT builder drifted from mainnet:\n"
+            f"  expected: {self._VOUT0_NFT_SCRIPT.hex()}\n"
+            f"  got:      {rebuilt.hex()}"
+        )
+
+    def test_mainnet_nft_script_passes_classifier(self):
+        """The on-chain bytes pass ``is_nft_script`` — confirms classifier
+        and builder agree on the same shape."""
+        assert is_nft_script(self._VOUT0_NFT_SCRIPT.hex())
+
+    def test_mainnet_nft_script_round_trips_through_extractors(self):
+        """``extract_owner_pkh_from_nft_script`` and
+        ``extract_ref_from_nft_script`` recover the inputs that
+        ``build_nft_locking_script`` would have consumed."""
+        recovered_pkh = extract_owner_pkh_from_nft_script(self._VOUT0_NFT_SCRIPT)
+        assert bytes(recovered_pkh) == self._OWNER_PKH
+
+        recovered_ref = extract_ref_from_nft_script(self._VOUT0_NFT_SCRIPT)
+        assert recovered_ref.to_bytes() == self._REF_BYTES
+
+
+# ---------------------------------------------------------------------------
 # 2. GlyphRef encoding / round-trip
 # ---------------------------------------------------------------------------
 
@@ -348,6 +422,103 @@ class TestCborPayload:
     def test_encode_payload_returns_32_byte_hash(self):
         _, payload_hash = encode_payload(NFT_METADATA)
         assert len(payload_hash) == 32
+
+
+# ---------------------------------------------------------------------------
+# Mainnet golden vector — CBOR payload from real GLYPH deploy reveal
+# ---------------------------------------------------------------------------
+
+
+class TestCborPayloadMainnetGolden:
+    """Pin ``decode_payload`` and ``build_reveal_scriptsig_suffix`` against
+    the on-chain GLYPH deploy reveal at mainnet txid
+    ``b965b32dba8628c339bc39a3369d0c46d645a77828aeb941904c77323bb99dd6``.
+
+    The CBOR body is 65,569 bytes (carrying an embedded PNG via CBOR tag
+    64) — checked in as a binary fixture under ``tests/fixtures/``. Pinning
+    the real bytes catches three classes of drift:
+
+    1. Hash linkage: ``sha256d(cbor)`` must equal the commit's
+       ``payload_hash`` (offset 2..34 of the FT commit at vout 0 of the
+       deploy commit ``a443d9df…878b``). If pyrxd's hashing diverged, the
+       reveal would never satisfy the commit's covenant.
+    2. Decoder shape: ``decode_payload(cbor)`` must surface the expected
+       metadata. If the schema decoder drifted (e.g. silently dropping
+       fields), pyrxd consumers would see a different token than indexers.
+    3. ScriptSig framing: ``build_reveal_scriptsig_suffix(cbor)`` must
+       produce the same ``03 67 6c 79 4e <len LE>`` prefix the live
+       Radiant indexers consume. This validates pyrxd's OP_PUSHDATA4
+       branch — the one used only for payloads >65,535 bytes.
+
+    Closes the final of four golden-vector items recommended by the
+    pattern-recognition audit (#R7).
+    """
+
+    # sha256d of the CBOR body — matches the FT commit's payload_hash
+    # (vout 0 of deploy commit a443d9df…878b, offsets 2..34).
+    _EXPECTED_PAYLOAD_HASH = bytes.fromhex("68d8f755ac95f399b3ea9d54978ebe20d71bfce50a2a8bc2771621de7c1af2ca")
+
+    @staticmethod
+    def _load_cbor() -> bytes:
+        from pathlib import Path
+
+        fixture = Path(__file__).parent / "fixtures" / "glyph_reveal_cbor.bin"
+        return fixture.read_bytes()
+
+    def test_fixture_sha256d_matches_on_chain_commit_payload_hash(self):
+        """If this fails, the fixture was corrupted — the hash linkage
+        from deploy commit → deploy reveal would not have validated on
+        chain in the first place, so the fixture is wrong."""
+        import hashlib
+
+        cbor = self._load_cbor()
+        sha256d = hashlib.sha256(hashlib.sha256(cbor).digest()).digest()
+        assert sha256d == self._EXPECTED_PAYLOAD_HASH
+
+    def test_decode_payload_recovers_glyph_metadata(self):
+        """The on-chain GLYPH deploy carries ``p: [1, 4]`` (FT + DMINT)
+        per Photonic's encoder. pyrxd's decoder must surface the same."""
+        cbor = self._load_cbor()
+        meta = decode_payload(cbor)
+        assert tuple(meta.protocol) == (1, 4)  # FT + DMINT
+        assert meta.name == "Glyph Protocol"
+        assert meta.ticker == "GLYPH"
+        # Description is non-empty; full text is in the on-chain bytes.
+        assert meta.description.startswith("The first of its kind")
+
+    def test_decoded_payload_carries_embedded_image(self):
+        """The deploy carries an embedded PNG logo wrapped in CBOR tag 64
+        (``main.b = CBORTag(64, <png bytes>)``). The decoder unwraps the
+        tag; ``main.data`` should be raw bytes with a PNG signature."""
+        cbor = self._load_cbor()
+        meta = decode_payload(cbor)
+        assert meta.main is not None
+        assert meta.main.mime_type.startswith("image/")
+        # PNG magic: 89 50 4e 47 0d 0a 1a 0a
+        assert meta.main.data.startswith(b"\x89PNG")
+        # Body is large — at least 60 KB, since the CBOR body is ~65 KB
+        # and the non-image fields are small.
+        assert len(meta.main.data) > 60_000
+
+    def test_scriptsig_suffix_matches_on_chain_framing(self):
+        """``build_reveal_scriptsig_suffix(cbor)`` must produce the same
+        ``03 'gly' 4e <len LE>`` framing observed on chain. The live
+        scriptSig at ``b965b32d…9dd6`` vin 0 (offset 108) contains:
+        ``03 67 6c 79 4e 21 00 01 00 <CBOR>``.
+
+        This pins the OP_PUSHDATA4 branch of the builder — the one only
+        exercised by payloads >65,535 bytes."""
+        cbor = self._load_cbor()
+        suffix = build_reveal_scriptsig_suffix(cbor)
+        # 4 bytes "gly push" + 5 bytes OP_PUSHDATA4 framing + CBOR body.
+        assert len(suffix) == 4 + 5 + len(cbor)
+        # 03 67 6c 79 = PUSH 3 + "gly"
+        assert suffix[:4] == b"\x03gly"
+        # 4e = OP_PUSHDATA4, then 4-byte LE length = 65,569 = 0x00010021
+        assert suffix[4] == 0x4E
+        assert int.from_bytes(suffix[5:9], "little") == 65_569
+        # Then the CBOR body exactly as on chain.
+        assert suffix[9:] == cbor
 
 
 # ---------------------------------------------------------------------------

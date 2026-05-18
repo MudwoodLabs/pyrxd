@@ -3,6 +3,7 @@
 Builds the public-facing docs at https://pyrxd.readthedocs.io. Favours
 clarity and zero-warning builds over feature breadth.
 """
+
 from __future__ import annotations
 
 import os
@@ -19,7 +20,7 @@ author = "Mudwood Labs"
 copyright = f"{datetime.now().year}, {author}"
 
 # Read the version from the package itself so docs and code never drift.
-from pyrxd import __version__ as _pyrxd_version  # noqa: E402
+from pyrxd import __version__ as _pyrxd_version
 
 version = _pyrxd_version
 release = _pyrxd_version
