@@ -26,7 +26,7 @@ from pyrxd.security.errors import (
     ValidationError,
 )
 
-from .types import GlyphRef
+from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types (one level up — file is now inside the dmint/ subpackage)
 
 # ---------------------------------------------------------------------------
 # V2 quarantine marker

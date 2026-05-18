@@ -1,0 +1,189 @@
+"""dMint protocol implementation — subpackage split from the original
+``dmint.py`` per the plan at
+``docs/plans/2026-05-18-refactor-dmint-py-subpackage-split-plan.md``.
+
+The subpackage layers as ``types ← builders ← chain ← miner`` (one-way
+dependency). The ``__init__.py`` uses PEP 562 lazy ``__getattr__`` to
+re-export every public symbol — plus 9 underscore-private symbols that
+existing tests import directly — at their original
+``pyrxd.glyph.dmint`` path. This matches the convention used by
+``pyrxd/__init__.py``, ``pyrxd/glyph/__init__.py``, and
+``pyrxd/script/__init__.py``.
+
+During the migration each entry in ``_LAZY_EXPORTS`` initially points
+at ``_legacy``; entries flip to the new submodule as symbols move.
+After Phase 3 ``_legacy`` is deleted entirely.
+"""
+
+from __future__ import annotations
+
+# Map of public + shimmed-private symbol name → (module_path, attr_name).
+# Resolved on first attribute access via __getattr__ below.
+#
+# During Phase 2 each entry's module_path migrates from
+# "pyrxd.glyph.dmint._legacy" to the appropriate submodule
+# (types / builders / chain / miner). After Phase 3 _legacy is gone.
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    # Public — types bucket
+    "DaaMode": ("pyrxd.glyph.dmint._legacy", "DaaMode"),
+    "DmintAlgo": ("pyrxd.glyph.dmint._legacy", "DmintAlgo"),
+    "DmintCborPayload": ("pyrxd.glyph.dmint._legacy", "DmintCborPayload"),
+    "DmintDeployParams": ("pyrxd.glyph.dmint._legacy", "DmintDeployParams"),
+    "DmintMintResult": ("pyrxd.glyph.dmint._legacy", "DmintMintResult"),
+    "DmintV1ContractInitialState": (
+        "pyrxd.glyph.dmint._legacy",
+        "DmintV1ContractInitialState",
+    ),
+    "MAX_SHA256D_TARGET": ("pyrxd.glyph.dmint._legacy", "MAX_SHA256D_TARGET"),
+    "MAX_V2_TARGET_256": ("pyrxd.glyph.dmint._legacy", "MAX_V2_TARGET_256"),
+    "V2UnvalidatedWarning": ("pyrxd.glyph.dmint._legacy", "V2UnvalidatedWarning"),
+    # Public — builders bucket
+    "build_dmint_code_script": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_code_script",
+    ),
+    "build_dmint_contract_script": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_contract_script",
+    ),
+    "build_dmint_state_script": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_state_script",
+    ),
+    "build_dmint_v1_code_script": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_v1_code_script",
+    ),
+    "build_dmint_v1_contract_script": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_v1_contract_script",
+    ),
+    "build_dmint_v1_ft_output_script": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_v1_ft_output_script",
+    ),
+    "build_dmint_v1_state_script": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_v1_state_script",
+    ),
+    # Public — chain bucket
+    "DmintContractUtxo": ("pyrxd.glyph.dmint._legacy", "DmintContractUtxo"),
+    "DmintMinerFundingUtxo": (
+        "pyrxd.glyph.dmint._legacy",
+        "DmintMinerFundingUtxo",
+    ),
+    "DmintState": ("pyrxd.glyph.dmint._legacy", "DmintState"),
+    "find_dmint_contract_utxos": (
+        "pyrxd.glyph.dmint._legacy",
+        "find_dmint_contract_utxos",
+    ),
+    "find_dmint_funding_utxo": (
+        "pyrxd.glyph.dmint._legacy",
+        "find_dmint_funding_utxo",
+    ),
+    "is_token_bearing_script": (
+        "pyrxd.glyph.dmint._legacy",
+        "is_token_bearing_script",
+    ),
+    # Public — miner bucket
+    "DEFAULT_MAX_ATTEMPTS": (
+        "pyrxd.glyph.dmint._legacy",
+        "DEFAULT_MAX_ATTEMPTS",
+    ),
+    "DmintMineResult": ("pyrxd.glyph.dmint._legacy", "DmintMineResult"),
+    "EXTERNAL_MINER_TIMEOUT_S": (
+        "pyrxd.glyph.dmint._legacy",
+        "EXTERNAL_MINER_TIMEOUT_S",
+    ),
+    "PowPreimageResult": ("pyrxd.glyph.dmint._legacy", "PowPreimageResult"),
+    "build_dmint_mint_tx": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_mint_tx",
+    ),
+    "build_dmint_v1_mint_preimage": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_v1_mint_preimage",
+    ),
+    "build_dmint_v2_mint_preimage": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_dmint_v2_mint_preimage",
+    ),
+    "build_mint_scriptsig": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_mint_scriptsig",
+    ),
+    "build_pow_preimage": (
+        "pyrxd.glyph.dmint._legacy",
+        "build_pow_preimage",
+    ),
+    "compute_next_target_asert": (
+        "pyrxd.glyph.dmint._legacy",
+        "compute_next_target_asert",
+    ),
+    "compute_next_target_linear": (
+        "pyrxd.glyph.dmint._legacy",
+        "compute_next_target_linear",
+    ),
+    "difficulty_to_target": (
+        "pyrxd.glyph.dmint._legacy",
+        "difficulty_to_target",
+    ),
+    "mine_solution": ("pyrxd.glyph.dmint._legacy", "mine_solution"),
+    "mine_solution_dispatch": (
+        "pyrxd.glyph.dmint._legacy",
+        "mine_solution_dispatch",
+    ),
+    "mine_solution_external": (
+        "pyrxd.glyph.dmint._legacy",
+        "mine_solution_external",
+    ),
+    "target_to_difficulty": (
+        "pyrxd.glyph.dmint._legacy",
+        "target_to_difficulty",
+    ),
+    "verify_sha256d_solution": (
+        "pyrxd.glyph.dmint._legacy",
+        "verify_sha256d_solution",
+    ),
+    # Underscore-private shims — re-exported here so existing test
+    # imports like `from pyrxd.glyph.dmint import _match_v1_epilogue`
+    # keep working unchanged. Per the brainstorm's PR #49 facade
+    # precedent: re-exported under their original underscore names,
+    # not promoted to public.
+    "_OP_STATESEPARATOR": ("pyrxd.glyph.dmint._legacy", "_OP_STATESEPARATOR"),
+    "_PART_B1": ("pyrxd.glyph.dmint._legacy", "_PART_B1"),
+    "_PART_B2": ("pyrxd.glyph.dmint._legacy", "_PART_B2"),
+    "_PART_B4": ("pyrxd.glyph.dmint._legacy", "_PART_B4"),
+    "_PART_C": ("pyrxd.glyph.dmint._legacy", "_PART_C"),
+    "_build_part_b": ("pyrxd.glyph.dmint._legacy", "_build_part_b"),
+    "_match_v1_epilogue": ("pyrxd.glyph.dmint._legacy", "_match_v1_epilogue"),
+    "_push_4bytes_le": ("pyrxd.glyph.dmint._legacy", "_push_4bytes_le"),
+    "_push_minimal": ("pyrxd.glyph.dmint._legacy", "_push_minimal"),
+    # Used internally by pyrxd.glyph.builder (V2 deploy warning path).
+    "_warn_v2_unvalidated": (
+        "pyrxd.glyph.dmint._legacy",
+        "_warn_v2_unvalidated",
+    ),
+}
+
+# Only public symbols (no leading underscore) appear in __all__ /
+# __dir__, matching how pyrxd/glyph/__init__.py treats its own
+# lazy-export map. Shimmed underscore-private symbols are still
+# resolvable via __getattr__ but not advertised.
+__all__ = sorted(name for name in _LAZY_EXPORTS if not name.startswith("_"))
+
+
+def __getattr__(name: str):
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module 'pyrxd.glyph.dmint' has no attribute {name!r}")
+    module_path, attr = target
+    import importlib
+
+    obj = getattr(importlib.import_module(module_path), attr)
+    globals()[name] = obj
+    return obj
+
+
+def __dir__() -> list[str]:
+    return __all__
