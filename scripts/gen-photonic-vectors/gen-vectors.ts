@@ -102,6 +102,7 @@ interface Vectors {
   chunked_aead_large: object;
   hkdf_sha256: object;
   x25519: object;
+  wrap_cek_x25519: object;
   hash_content: object;
   cek_hash_commitment: object;
   timelock_metadata_block_mode: object;
@@ -207,6 +208,34 @@ const vectors: Vectors = {
       sk_b: hex(X25519_SK2),
       pk_b: hex(pk2),
       shared_secret_a_to_b: hex(shared),
+    };
+  })(),
+
+  // ----- 3b. Full wrapCEK (single-recipient X25519, no PQ) -----
+  //          Pyrxd test asserts it can UNWRAP and recover the original CEK.
+  //          Wrap output contains random ephemeral key + nonce; not byte-deterministic.
+  ...((): { wrap_cek_x25519: object } => {
+    // Recipient identity = the (sk_a, pk_a) keypair from the x25519 section.
+    const recipientPk = x25519.getPublicKey(X25519_SK);
+    const aad = new TextEncoder().encode("photonic-wrap-aad-test");
+    const { wrappedCEK, ephemeral } = enc.wrapCEK(
+      CEK,
+      { x25519: recipientPk },
+      aad,
+    );
+    return {
+      wrap_cek_x25519: {
+        notes:
+          "Photonic-generated wrap. Pyrxd test unwraps with recipient_sk and " +
+          "asserts the recovered CEK matches the original input. Wrap output " +
+          "is not byte-deterministic (random ephemeral key + nonce).",
+        recipient_sk: hex(X25519_SK),
+        recipient_pk: hex(recipientPk),
+        aad: hex(aad),
+        original_cek: hex(CEK),
+        wrapped_cek: hex(u8(wrappedCEK)),
+        ephemeral_x25519_pub: hex(u8(ephemeral.x25519EphemeralPublicKey)),
+      },
     };
   })(),
 

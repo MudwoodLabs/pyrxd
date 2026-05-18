@@ -75,6 +75,10 @@ aiohttp = ">=3.9.0"
 coincurve = "^21.0.0"
 base58 = "^2.1.1"
 pycryptodomex = "^3.22.0"
+# Required for X25519 ECDH + HKDF-SHA256 used by Glyph TIMELOCK / ENCRYPTED
+# (pyrxd.crypto.kem). OpenSSL-backed, well-audited, typically already a
+# transitive dep in most environments.
+cryptography = ">=42.0"
 websockets = ">=15.0.1,<17.0.0"
 cbor2 = "^6.0"
 click = "^8.3"
