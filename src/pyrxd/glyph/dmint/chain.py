@@ -63,19 +63,19 @@ from .builders import (
     build_dmint_v1_contract_script,
 )
 from .types import (
+    _OP_STATESEPARATOR,
     DaaMode,
     DmintAlgo,
     DmintV1ContractInitialState,
-    _OP_STATESEPARATOR,
 )
 
 # Re-export so they are importable from chain as the plan specifies
 __all__ = [
     "_OP_STATESEPARATOR",
-    "_V1_EPILOGUE_PREFIX",
     "_V1_EPILOGUE_ALGO_OFFSET",
-    "_V1_EPILOGUE_SUFFIX",
     "_V1_EPILOGUE_LEN",
+    "_V1_EPILOGUE_PREFIX",
+    "_V1_EPILOGUE_SUFFIX",
 ]
 
 

@@ -40,20 +40,18 @@ from pyrxd.security.errors import ValidationError
 
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 from .types import (
-    DaaMode,
-    DmintAlgo,
-    DmintDeployParams,
-    MAX_SHA256D_TARGET,
-    MAX_V2_TARGET_256,
-    V2UnvalidatedWarning,
     _OP_STATESEPARATOR,
     _PART_B1,
     _PART_B2,
     _PART_B4,
     _PART_C,
+    MAX_SHA256D_TARGET,
+    DaaMode,
+    DmintAlgo,
+    DmintDeployParams,
+    V2UnvalidatedWarning,
     _warn_v2_unvalidated,
 )
-
 
 # ---------------------------------------------------------------------------
 # Minimal-push helpers (mirrors Photonic Wallet `pushMinimal` in script.ts)

@@ -25,7 +25,6 @@ from pyrxd.security.errors import ValidationError
 
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 
-
 # ---------------------------------------------------------------------------
 # V2 quarantine marker
 # ---------------------------------------------------------------------------

@@ -679,7 +679,7 @@ class TestVerifySha256dSolutionNonceWidth:
 
     def test_nonce_width_4_for_v1(self):
         # 4-byte nonce works with nonce_width=4
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = b"\x00\x00\x00\x00" + b"\x00" * 28
             assert verify_sha256d_solution(b"\x00" * 64, b"\x00" * 4, 1, nonce_width=4)
 
@@ -702,7 +702,7 @@ class TestMineSolution:
         verify the search/verify integration without paying that cost.
         """
         fake_hash = b"\x00\x00\x00\x00" + (0).to_bytes(8, "big") + b"\xff" * 20
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             result = mine_solution(b"\x00" * 64, target=1, nonce_width=4)
         assert isinstance(result, DmintMineResult)
@@ -713,7 +713,7 @@ class TestMineSolution:
 
     def test_v2_nonce_width(self):
         fake_hash = b"\x00\x00\x00\x00" + (0).to_bytes(8, "big") + b"\xff" * 20
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             result = mine_solution(b"\x00" * 64, target=1, nonce_width=8)
         assert len(result.nonce) == 8
@@ -723,7 +723,7 @@ class TestMineSolution:
         # No nonce satisfies the impossibly-tight target=1 with random preimage,
         # but the mock returns a hash that's too small to satisfy `value < target`.
         non_winning = b"\x00\x00\x00\x00" + (5).to_bytes(8, "big") + b"\xff" * 20
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = non_winning
             with pytest.raises(MaxAttemptsError) as exc_info:
                 mine_solution(b"\x00" * 64, target=1, nonce_width=4, max_attempts=10)
@@ -785,7 +785,7 @@ class TestMineSolutionExternal:
             tmp_path,
             {"nonce_hex": "deadbeef", "attempts": 12345, "elapsed_s": 0.5},
         )
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             result = mine_solution_external(
                 preimage=b"\x00" * 64,
@@ -906,7 +906,7 @@ class TestMineSolutionExternal:
             tmp_path,
             {"nonce_hex": "deadbeef", "attempts": 1, "elapsed_s": float("nan")},
         )
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             result = mine_solution_external(
                 preimage=b"\x00" * 64,
@@ -929,7 +929,7 @@ class TestMineSolutionExternal:
             tmp_path,
             {"nonce_hex": "deadbeef", "attempts": 1, "elapsed_s": float("inf")},
         )
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             result = mine_solution_external(
                 preimage=b"\x00" * 64,
@@ -951,7 +951,7 @@ class TestMineSolutionExternal:
             tmp_path,
             {"nonce_hex": "deadbeef", "attempts": 10**18, "elapsed_s": 0.1},
         )
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             result = mine_solution_external(
                 preimage=b"\x00" * 64,
@@ -972,7 +972,7 @@ class TestMineSolutionExternal:
             # JSON true serializes as a Python bool, which IS an int subclass
             {"nonce_hex": "deadbeef", "attempts": True, "elapsed_s": True},
         )
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             result = mine_solution_external(
                 preimage=b"\x00" * 64,
@@ -1017,8 +1017,8 @@ class TestMineSolutionDispatch:
         """``miner_argv=None`` calls ``mine_solution``, NOT ``mine_solution_external``."""
         from pyrxd.glyph.dmint import mine_solution_dispatch
 
-        in_process = mocker.patch("pyrxd.glyph.dmint.mine_solution", return_value=self._stub_result())
-        external = mocker.patch("pyrxd.glyph.dmint.mine_solution_external")
+        in_process = mocker.patch("pyrxd.glyph.dmint.miner.mine_solution", return_value=self._stub_result())
+        external = mocker.patch("pyrxd.glyph.dmint.miner.mine_solution_external")
 
         result = mine_solution_dispatch(self._PREIMAGE, self._TARGET, nonce_width=4)
 
@@ -1031,8 +1031,8 @@ class TestMineSolutionDispatch:
         NOT ``mine_solution``."""
         from pyrxd.glyph.dmint import mine_solution_dispatch
 
-        in_process = mocker.patch("pyrxd.glyph.dmint.mine_solution")
-        external = mocker.patch("pyrxd.glyph.dmint.mine_solution_external", return_value=self._stub_result())
+        in_process = mocker.patch("pyrxd.glyph.dmint.miner.mine_solution")
+        external = mocker.patch("pyrxd.glyph.dmint.miner.mine_solution_external", return_value=self._stub_result())
 
         result = mine_solution_dispatch(
             self._PREIMAGE,
@@ -1050,8 +1050,8 @@ class TestMineSolutionDispatch:
         in-process path, NOT to ``mine_solution_external``."""
         from pyrxd.glyph.dmint import mine_solution_dispatch
 
-        in_process = mocker.patch("pyrxd.glyph.dmint.mine_solution", return_value=self._stub_result())
-        mocker.patch("pyrxd.glyph.dmint.mine_solution_external")
+        in_process = mocker.patch("pyrxd.glyph.dmint.miner.mine_solution", return_value=self._stub_result())
+        mocker.patch("pyrxd.glyph.dmint.miner.mine_solution_external")
 
         mine_solution_dispatch(self._PREIMAGE, self._TARGET, nonce_width=4, max_attempts=1_000_000)
 
@@ -1063,8 +1063,8 @@ class TestMineSolutionDispatch:
         the external path."""
         from pyrxd.glyph.dmint import mine_solution_dispatch
 
-        external = mocker.patch("pyrxd.glyph.dmint.mine_solution_external", return_value=self._stub_result())
-        mocker.patch("pyrxd.glyph.dmint.mine_solution")
+        external = mocker.patch("pyrxd.glyph.dmint.miner.mine_solution_external", return_value=self._stub_result())
+        mocker.patch("pyrxd.glyph.dmint.miner.mine_solution")
 
         mine_solution_dispatch(
             self._PREIMAGE,
@@ -1101,8 +1101,8 @@ class TestMineSolutionDispatch:
         ignored because the JSON protocol has no algo field yet."""
         from pyrxd.glyph.dmint import DmintAlgo, mine_solution_dispatch
 
-        in_process = mocker.patch("pyrxd.glyph.dmint.mine_solution", return_value=self._stub_result())
-        mocker.patch("pyrxd.glyph.dmint.mine_solution_external")
+        in_process = mocker.patch("pyrxd.glyph.dmint.miner.mine_solution", return_value=self._stub_result())
+        mocker.patch("pyrxd.glyph.dmint.miner.mine_solution_external")
 
         mine_solution_dispatch(self._PREIMAGE, self._TARGET, nonce_width=4, algo=DmintAlgo.SHA256D)
 

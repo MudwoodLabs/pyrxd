@@ -50,17 +50,15 @@ from .chain import (
     is_token_bearing_script,
 )
 from .types import (
+    _OP_STATESEPARATOR,
+    MAX_SHA256D_TARGET,
+    MAX_V2_TARGET_256,
     DaaMode,
     DmintAlgo,
     DmintDeployParams,
     DmintMintResult,
-    MAX_SHA256D_TARGET,
-    MAX_V2_TARGET_256,
-    V2UnvalidatedWarning,
-    _OP_STATESEPARATOR,
     _warn_v2_unvalidated,
 )
-
 
 # ---------------------------------------------------------------------------
 # PoW preimage (same structure as V1 — §2.5 / Appendix B)
