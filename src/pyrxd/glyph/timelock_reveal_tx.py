@@ -47,7 +47,7 @@ import cbor2
 
 from ..constants import OpCode
 from ..utils import encode_pushdata
-from .timelock import compute_cek_hash, format_cek_hash, parse_cek_hash
+from .timelock import compute_cek_hash, parse_cek_hash
 
 #: Magic bytes prefix on every Glyph OP_RETURN output. "gly" in ASCII.
 GLYPH_MAGIC_BYTES = bytes.fromhex("676c79")
@@ -69,12 +69,12 @@ _TOKEN_REF_RE = re.compile(r"^[0-9a-fA-F]{64}:[0-9]+$")
 class RevealProof:
     """Parsed reveal proof, mirroring Photonic's ``RevealProof`` type."""
 
-    v: int                  # always REVEAL_VERSION = 2
-    p: list[int]            # always [REVEAL_MARKER] = [9]
-    action: str             # always "reveal"
-    token_ref: str          # "txid:vout"
-    cek: str                # 64-hex
-    cek_hash: str           # "sha256:<hex>"
+    v: int  # always REVEAL_VERSION = 2
+    p: list[int]  # always [REVEAL_MARKER] = [9]
+    action: str  # always "reveal"
+    token_ref: str  # "txid:vout"
+    cek: str  # 64-hex
+    cek_hash: str  # "sha256:<hex>"
     hint: str = ""
 
     def to_dict(self) -> dict:
@@ -91,7 +91,7 @@ class RevealProof:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> "RevealProof":
+    def from_dict(cls, d: dict) -> RevealProof:
         return cls(
             v=int(d["v"]),
             p=[int(x) for x in d["p"]],
@@ -136,9 +136,7 @@ def create_reveal_proof(
     if len(cek) != 32:
         raise ValueError(f"CEK must be 32 bytes, got {len(cek)}")
     if not _TOKEN_REF_RE.fullmatch(token_ref):
-        raise ValueError(
-            f"token_ref must be 'txid:vout' (64 hex + ':' + decimal), got {token_ref!r}"
-        )
+        raise ValueError(f"token_ref must be 'txid:vout' (64 hex + ':' + decimal), got {token_ref!r}")
 
     cek_hex = cek.hex()
     computed_hash_hex = compute_cek_hash(cek).hex()
@@ -146,11 +144,9 @@ def create_reveal_proof(
         normalized = cek_hash_override.replace("sha256:", "").replace("SHA256:", "").lower()
         if normalized != computed_hash_hex:
             raise ValueError(
-                f"CEK does not match provided cek_hash_override (expected "
-                f"{normalized!r}, got {computed_hash_hex!r})"
+                f"CEK does not match provided cek_hash_override (expected {normalized!r}, got {computed_hash_hex!r})"
             )
-        cek_hash_str = cek_hash_override if cek_hash_override.lower().startswith("sha256:") \
-            else f"sha256:{normalized}"
+        cek_hash_str = cek_hash_override if cek_hash_override.lower().startswith("sha256:") else f"sha256:{normalized}"
     else:
         cek_hash_str = f"sha256:{computed_hash_hex}"
 
@@ -221,7 +217,7 @@ def _walk_pushdata(script: bytes) -> list[bytes]:
         if op == 0x4D:  # PUSHDATA2
             if pos + 2 > n:
                 return []
-            length = int.from_bytes(script[pos:pos + 2], "little")
+            length = int.from_bytes(script[pos : pos + 2], "little")
             pos += 2
             end = pos + length
             if end > n:
@@ -232,7 +228,7 @@ def _walk_pushdata(script: bytes) -> list[bytes]:
         if op == 0x4E:  # PUSHDATA4
             if pos + 4 > n:
                 return []
-            length = int.from_bytes(script[pos:pos + 4], "little")
+            length = int.from_bytes(script[pos : pos + 4], "little")
             pos += 4
             end = pos + length
             if end > n:
@@ -353,13 +349,15 @@ def validate_reveal_proof(
         claimed_hash_bytes = parse_cek_hash(proof.cek_hash)
     except ValueError as exc:
         return RevealValidation(
-            valid=False, error=f"cek_hash malformed: {exc}", proof=proof,
+            valid=False,
+            error=f"cek_hash malformed: {exc}",
+            proof=proof,
         )
     if actual_hash_hex != claimed_hash_bytes.hex():
         return RevealValidation(
             valid=False,
             error=f"cek_hash self-consistency failed: sha256(cek)={actual_hash_hex} "
-                  f"but proof.cek_hash claims {claimed_hash_bytes.hex()}",
+            f"but proof.cek_hash claims {claimed_hash_bytes.hex()}",
             proof=proof,
         )
 
@@ -369,13 +367,14 @@ def validate_reveal_proof(
             expected_bytes = parse_cek_hash(expected_cek_hash)
         except ValueError as exc:
             return RevealValidation(
-                valid=False, error=f"expected_cek_hash malformed: {exc}", proof=proof,
+                valid=False,
+                error=f"expected_cek_hash malformed: {exc}",
+                proof=proof,
             )
         if actual_hash_hex != expected_bytes.hex():
             return RevealValidation(
                 valid=False,
-                error=f"cek does not match on-chain commitment: "
-                      f"expected {expected_bytes.hex()}, got {actual_hash_hex}",
+                error=f"cek does not match on-chain commitment: expected {expected_bytes.hex()}, got {actual_hash_hex}",
                 proof=proof,
             )
 

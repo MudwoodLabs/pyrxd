@@ -49,7 +49,7 @@ are two ways to validate that:
 # 1. Confirm Photonic-Wallet is checked out at the expected location
 #    (defaults to ../../../../Photonic-Wallet/packages/lib relative to
 #    this script — adjust via PHOTONIC_LIB env var)
-ls /home/eric/apps/Photonic-Wallet/packages/lib/src/encryption.ts
+ls ~/path/to/Photonic-Wallet/packages/lib/src/encryption.ts
 
 # 2. Install deps (one-time)
 cd scripts/gen-photonic-vectors

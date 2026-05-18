@@ -33,10 +33,7 @@ from pyrxd.crypto.aead import (
     encrypt_xchacha20_poly1305,
 )
 
-
-FIXTURES_PATH = (
-    Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
-)
+FIXTURES_PATH = Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
 
 
 @pytest.fixture(scope="module")
@@ -58,13 +55,8 @@ class TestRfcVectors:
             "637265656e20776f756c642062652069742e"
         )
         aad = bytes.fromhex("50515253c0c1c2c3c4c5c6c7")
-        key = bytes.fromhex(
-            "808182838485868788898a8b8c8d8e8f"
-            "909192939495969798999a9b9c9d9e9f"
-        )
-        nonce = bytes.fromhex(
-            "404142434445464748494a4b4c4d4e4f5051525354555657"
-        )
+        key = bytes.fromhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f")
+        nonce = bytes.fromhex("404142434445464748494a4b4c4d4e4f5051525354555657")
         expected_ct_with_tag = bytes.fromhex(
             "bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb"
             "731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b452"
@@ -110,7 +102,7 @@ class TestPhotonicInterop:
         nonce = bytes.fromhex(v["nonce"])
         aad = bytes.fromhex(v["aad"])
         # Reconstruct PT_LARGE per the bridge script's algorithm
-        pt_large = bytes((i * 13 + 3) & 0xff for i in range(8192))
+        pt_large = bytes((i * 13 + 3) & 0xFF for i in range(8192))
         assert hashlib.sha256(pt_large).hexdigest() == v["large"]["plaintext_sha256"]
         result = encrypt_xchacha20_poly1305(pt_large, key, nonce, aad)
         assert hashlib.sha256(result).hexdigest() == v["large"]["ciphertext_sha256"]
@@ -249,8 +241,6 @@ class TestFootguns:
             EncryptedChunk(ciphertext=bytes(bad), nonce=chunked.chunks[0].nonce),
             *chunked.chunks[1:],
         ]
-        bad_chunked = ChunkedCiphertext(
-            chunks=chunks_tampered, plaintext_hash=chunked.plaintext_hash
-        )
+        bad_chunked = ChunkedCiphertext(chunks=chunks_tampered, plaintext_hash=chunked.plaintext_hash)
         with pytest.raises(ValueError):
             decrypt_chunked(bad_chunked, key, chunked.plaintext_hash)

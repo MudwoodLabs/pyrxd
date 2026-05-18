@@ -19,15 +19,14 @@ from pathlib import Path
 import pytest
 
 from pyrxd.glyph.encrypted_content import (
+    KEY_FORMAT_WRAPPED,
+    SCHEME_CHUNKED_AEAD_V1,
     CryptoMetadata,
     EncryptedContentStub,
     EncryptionMetadata,
-    KEY_FORMAT_WRAPPED,
-    SCHEME_CHUNKED_AEAD_V1,
     TimelockSpec,
 )
 from pyrxd.glyph.timelock import (
-    SHA256_PREFIX,
     TimelockParams,
     add_timelock_to_metadata,
     compute_cek_hash,
@@ -40,10 +39,7 @@ from pyrxd.glyph.timelock import (
 from pyrxd.glyph.types import GlyphProtocol
 from pyrxd.security.errors import ValidationError
 
-
-FIXTURES_PATH = (
-    Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
-)
+FIXTURES_PATH = Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
 
 
 @pytest.fixture(scope="module")
@@ -53,7 +49,7 @@ def photonic_vectors() -> dict:
 
 def _bridge_cek() -> bytes:
     """The CEK used by the bridge script: ``(i*17+1) & 0xff`` for i in 0..31."""
-    return bytes((i * 17 + 1) & 0xff for i in range(32))
+    return bytes((i * 17 + 1) & 0xFF for i in range(32))
 
 
 def _bridge_stub_for_block_mode() -> EncryptedContentStub:
@@ -84,7 +80,7 @@ def _bridge_stub_for_time_mode() -> EncryptedContentStub:
     """Reconstruct the time-mode input stub (PT_LARGE plaintext)."""
     cek = _bridge_cek()
     cek_hash = format_cek_hash(compute_cek_hash(cek))
-    pt_large = bytes((i * 13 + 3) & 0xff for i in range(8192))
+    pt_large = bytes((i * 13 + 3) & 0xFF for i in range(8192))
     return EncryptedContentStub(
         p=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED],
         type="application/octet-stream",
@@ -169,7 +165,8 @@ class TestPhotonicInteropBuilder:
         cek = _bridge_cek()
         stub = _bridge_stub_for_block_mode()
         result = add_timelock_to_metadata(
-            stub, cek,
+            stub,
+            cek,
             TimelockParams(mode="block", unlock_at=v["unlock_at"]),
         )
         pyrxd_dict = result.metadata.to_dict()
@@ -184,7 +181,8 @@ class TestPhotonicInteropBuilder:
         cek = _bridge_cek()
         stub = _bridge_stub_for_time_mode()
         result = add_timelock_to_metadata(
-            stub, cek,
+            stub,
+            cek,
             TimelockParams(mode="time", unlock_at=v["unlock_at"], hint=v["hint"]),
         )
         pyrxd_dict = result.metadata.to_dict()
@@ -196,12 +194,15 @@ class TestPhotonicInteropBuilder:
         cek = _bridge_cek()
         stub = _bridge_stub_for_block_mode()
         result = add_timelock_to_metadata(
-            stub, cek,
+            stub,
+            cek,
             TimelockParams(mode="block", unlock_at=v["unlock_at"]),
         )
         assert result.metadata.crypto.timelock is not None
-        assert result.metadata.crypto.timelock.cek_hash == v["output_commitment"]["cekHash"].lower() or \
-               result.metadata.crypto.timelock.cek_hash == f"sha256:{v['output_commitment']['cekHash'].lower()}"
+        assert (
+            result.metadata.crypto.timelock.cek_hash == v["output_commitment"]["cekHash"].lower()
+            or result.metadata.crypto.timelock.cek_hash == f"sha256:{v['output_commitment']['cekHash'].lower()}"
+        )
 
 
 # ────────────────────────────────────────────── builder semantics ──
@@ -215,7 +216,8 @@ class TestBuilderSemantics:
             type="text/plain",
             name="test",
             main=EncryptionMetadata(
-                type="text/plain", hash=format_cek_hash(b"\x00" * 32),
+                type="text/plain",
+                hash=format_cek_hash(b"\x00" * 32),
             ),
             crypto=CryptoMetadata(cek_hash=format_cek_hash(compute_cek_hash(cek))),
         )
@@ -224,7 +226,9 @@ class TestBuilderSemantics:
         stub = self._make_encrypted_stub()
         cek = b"k" * 32
         result = add_timelock_to_metadata(
-            stub, cek, TimelockParams(mode="block", unlock_at=100),
+            stub,
+            cek,
+            TimelockParams(mode="block", unlock_at=100),
         )
         assert GlyphProtocol.TIMELOCK in result.metadata.p
         assert GlyphProtocol.ENCRYPTED in result.metadata.p
@@ -235,11 +239,16 @@ class TestBuilderSemantics:
         # Pre-stuff TIMELOCK into the protocol list — should not double-add
         stub_with_tl = EncryptedContentStub(
             p=[*stub.p, GlyphProtocol.TIMELOCK],
-            type=stub.type, name=stub.name, main=stub.main, crypto=stub.crypto,
+            type=stub.type,
+            name=stub.name,
+            main=stub.main,
+            crypto=stub.crypto,
         )
         cek = b"k" * 32
         result = add_timelock_to_metadata(
-            stub_with_tl, cek, TimelockParams(mode="block", unlock_at=100),
+            stub_with_tl,
+            cek,
+            TimelockParams(mode="block", unlock_at=100),
         )
         assert result.metadata.p.count(GlyphProtocol.TIMELOCK) == 1
 
@@ -247,33 +256,41 @@ class TestBuilderSemantics:
         cek = b"k" * 32
         stub_no_enc = EncryptedContentStub(
             p=[GlyphProtocol.NFT],
-            type="text/plain", name="t",
+            type="text/plain",
+            name="t",
             main=EncryptionMetadata(type="text/plain", hash=format_cek_hash(b"\x00" * 32)),
             crypto=CryptoMetadata(cek_hash=format_cek_hash(compute_cek_hash(cek))),
         )
         with pytest.raises(ValidationError, match="ENCRYPTED"):
             add_timelock_to_metadata(
-                stub_no_enc, cek, TimelockParams(mode="block", unlock_at=100),
+                stub_no_enc,
+                cek,
+                TimelockParams(mode="block", unlock_at=100),
             )
 
     def test_rejects_wrong_cek_size(self):
         stub = self._make_encrypted_stub()
         with pytest.raises(ValueError, match="32 bytes"):
             add_timelock_to_metadata(
-                stub, b"\x00" * 31, TimelockParams(mode="block", unlock_at=100),
+                stub,
+                b"\x00" * 31,
+                TimelockParams(mode="block", unlock_at=100),
             )
 
     def test_rejects_invalid_mode(self):
         stub = self._make_encrypted_stub()
         with pytest.raises(ValueError, match="mode must be"):
             add_timelock_to_metadata(
-                stub, b"k" * 32, TimelockParams(mode="ridiculous", unlock_at=100),  # type: ignore[arg-type]
+                stub,
+                b"k" * 32,
+                TimelockParams(mode="ridiculous", unlock_at=100),  # type: ignore[arg-type]
             )
 
     def test_hint_propagates(self):
         stub = self._make_encrypted_stub()
         result = add_timelock_to_metadata(
-            stub, b"k" * 32,
+            stub,
+            b"k" * 32,
             TimelockParams(mode="time", unlock_at=1_700_000_000, hint="see-me-later"),
         )
         assert result.metadata.crypto.timelock is not None
@@ -283,7 +300,9 @@ class TestBuilderSemantics:
         stub = self._make_encrypted_stub()
         cek = b"k" * 32
         result = add_timelock_to_metadata(
-            stub, cek, TimelockParams(mode="block", unlock_at=100),
+            stub,
+            cek,
+            TimelockParams(mode="block", unlock_at=100),
         )
         assert result.cek_for_caller_to_store == cek
 
@@ -296,12 +315,14 @@ class TestStateHelpers:
         cek = b"k" * 32
         return EncryptedContentStub(
             p=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED, GlyphProtocol.TIMELOCK],
-            type="text/plain", name="t",
+            type="text/plain",
+            name="t",
             main=EncryptionMetadata(type="text/plain", hash=format_cek_hash(b"\x00" * 32)),
             crypto=CryptoMetadata(
                 cek_hash=format_cek_hash(compute_cek_hash(cek)),
                 timelock=TimelockSpec(
-                    mode="block", unlock_at=unlock_at,
+                    mode="block",
+                    unlock_at=unlock_at,
                     cek_hash=format_cek_hash(compute_cek_hash(cek)),
                 ),
             ),
@@ -311,12 +332,14 @@ class TestStateHelpers:
         cek = b"k" * 32
         return EncryptedContentStub(
             p=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED, GlyphProtocol.TIMELOCK],
-            type="text/plain", name="t",
+            type="text/plain",
+            name="t",
             main=EncryptionMetadata(type="text/plain", hash=format_cek_hash(b"\x00" * 32)),
             crypto=CryptoMetadata(
                 cek_hash=format_cek_hash(compute_cek_hash(cek)),
                 timelock=TimelockSpec(
-                    mode="time", unlock_at=unlock_at,
+                    mode="time",
+                    unlock_at=unlock_at,
                     cek_hash=format_cek_hash(compute_cek_hash(cek)),
                 ),
             ),
@@ -326,7 +349,8 @@ class TestStateHelpers:
         cek = b"k" * 32
         stub = EncryptedContentStub(
             p=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED],
-            type="text/plain", name="t",
+            type="text/plain",
+            name="t",
             main=EncryptionMetadata(type="text/plain", hash=format_cek_hash(b"\x00" * 32)),
             crypto=CryptoMetadata(cek_hash=format_cek_hash(compute_cek_hash(cek))),
         )

@@ -8,7 +8,6 @@ both spec-valid).
 
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -26,10 +25,7 @@ from pyrxd.glyph.timelock_reveal_tx import (
     validate_reveal_proof,
 )
 
-
-FIXTURES_PATH = (
-    Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
-)
+FIXTURES_PATH = Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
 
 
 @pytest.fixture(scope="module")
@@ -38,7 +34,7 @@ def photonic_vectors() -> dict:
 
 
 def _bridge_cek() -> bytes:
-    return bytes((i * 17 + 1) & 0xff for i in range(32))
+    return bytes((i * 17 + 1) & 0xFF for i in range(32))
 
 
 # ────────────────────────────────────────────── Photonic interop ──
@@ -47,11 +43,14 @@ def _bridge_cek() -> bytes:
 class TestPhotonicInteropParse:
     """The critical gate: pyrxd parses Photonic's emitted OP_RETURN scripts."""
 
-    @pytest.mark.parametrize("vector_key", [
-        "reveal_proof_block_mode",
-        "reveal_proof_time_mode",
-        "reveal_proof_with_hint",
-    ])
+    @pytest.mark.parametrize(
+        "vector_key",
+        [
+            "reveal_proof_block_mode",
+            "reveal_proof_time_mode",
+            "reveal_proof_with_hint",
+        ],
+    )
     def test_parse_photonic_reveal_script(self, photonic_vectors, vector_key):
         v = photonic_vectors[vector_key]
         script = bytes.fromhex(v["op_return_script_hex"])
@@ -215,7 +214,8 @@ class TestValidateRevealProof:
     def test_valid_proof_accepts(self):
         proof, cek = self._good_proof()
         result = validate_reveal_proof(
-            proof, expected_token_ref="a" * 64 + ":0",
+            proof,
+            expected_token_ref="a" * 64 + ":0",
             expected_cek_hash=format_cek_hash(compute_cek_hash(cek)),
         )
         assert result.valid
@@ -236,7 +236,8 @@ class TestValidateRevealProof:
         proof, _cek = self._good_proof()
         wrong_commit = format_cek_hash(b"\x00" * 32)
         result = validate_reveal_proof(
-            proof, expected_token_ref="a" * 64 + ":0",
+            proof,
+            expected_token_ref="a" * 64 + ":0",
             expected_cek_hash=wrong_commit,
         )
         assert not result.valid
@@ -246,10 +247,12 @@ class TestValidateRevealProof:
         proof, _cek = self._good_proof()
         # Construct a tampered proof where cek hex doesn't hash to cek_hash
         bad_proof = RevealProof(
-            v=proof.v, p=proof.p, action=proof.action,
+            v=proof.v,
+            p=proof.p,
+            action=proof.action,
             token_ref=proof.token_ref,
-            cek="ff" * 32,                # different CEK
-            cek_hash=proof.cek_hash,      # but unchanged hash
+            cek="ff" * 32,  # different CEK
+            cek_hash=proof.cek_hash,  # but unchanged hash
         )
         result = validate_reveal_proof(bad_proof, expected_token_ref="a" * 64 + ":0")
         assert not result.valid
@@ -258,19 +261,24 @@ class TestValidateRevealProof:
     def test_malformed_cek_hex_rejected(self):
         proof, _cek = self._good_proof()
         bad = RevealProof(
-            v=proof.v, p=proof.p, action=proof.action,
+            v=proof.v,
+            p=proof.p,
+            action=proof.action,
             token_ref=proof.token_ref,
-            cek="not hex!" * 8,           # 64 chars but not hex
+            cek="not hex!" * 8,  # 64 chars but not hex
             cek_hash=proof.cek_hash,
         )
         result = validate_reveal_proof(bad, expected_token_ref="a" * 64 + ":0")
         assert not result.valid
 
     def test_malformed_cek_hash_rejected(self):
-        proof, cek = self._good_proof()
+        proof, _cek = self._good_proof()
         bad = RevealProof(
-            v=proof.v, p=proof.p, action=proof.action,
-            token_ref=proof.token_ref, cek=proof.cek,
+            v=proof.v,
+            p=proof.p,
+            action=proof.action,
+            token_ref=proof.token_ref,
+            cek=proof.cek,
             cek_hash="not-a-valid-format",
         )
         result = validate_reveal_proof(bad, expected_token_ref="a" * 64 + ":0")

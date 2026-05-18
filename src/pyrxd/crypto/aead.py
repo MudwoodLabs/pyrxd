@@ -90,9 +90,7 @@ def decrypt_xchacha20_poly1305(
     if len(nonce) != XCHACHA20_NONCE_SIZE:
         raise ValueError(f"nonce must be {XCHACHA20_NONCE_SIZE} bytes, got {len(nonce)}")
     if len(ciphertext_with_tag) < POLY1305_TAG_SIZE:
-        raise ValueError(
-            f"ciphertext too short — need at least {POLY1305_TAG_SIZE} tag bytes"
-        )
+        raise ValueError(f"ciphertext too short — need at least {POLY1305_TAG_SIZE} tag bytes")
 
     ciphertext = ciphertext_with_tag[:-POLY1305_TAG_SIZE]
     tag = ciphertext_with_tag[-POLY1305_TAG_SIZE:]
@@ -195,9 +193,7 @@ def decrypt_chunked(
     decrypted: list[bytes] = []
     for i, chunk in enumerate(chunked.chunks):
         aad = plaintext_hash + i.to_bytes(4, "big")
-        chunk_plaintext = decrypt_xchacha20_poly1305(
-            chunk.ciphertext, key, chunk.nonce, aad
-        )
+        chunk_plaintext = decrypt_xchacha20_poly1305(chunk.ciphertext, key, chunk.nonce, aad)
         decrypted.append(chunk_plaintext)
 
     plaintext = b"".join(decrypted)
@@ -210,13 +206,13 @@ def decrypt_chunked(
 
 
 __all__ = [
-    "CHUNK_SIZE",
     "CHUNKED_AEAD_V1",
-    "ChunkedCiphertext",
-    "EncryptedChunk",
+    "CHUNK_SIZE",
     "POLY1305_TAG_SIZE",
     "XCHACHA20_KEY_SIZE",
     "XCHACHA20_NONCE_SIZE",
+    "ChunkedCiphertext",
+    "EncryptedChunk",
     "decrypt_chunked",
     "decrypt_xchacha20_poly1305",
     "encrypt_chunked",

@@ -17,7 +17,6 @@ from pathlib import Path
 import pytest
 
 from pyrxd.crypto.kem import (
-    KEK_DERIVATION_INFO,
     WRAPPED_CEK_SIZE,
     X25519_KEY_SIZE,
     hkdf_sha256,
@@ -27,10 +26,7 @@ from pyrxd.crypto.kem import (
     x25519_public_key,
 )
 
-
-FIXTURES_PATH = (
-    Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
-)
+FIXTURES_PATH = Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
 
 
 @pytest.fixture(scope="module")
@@ -100,9 +96,7 @@ class TestRoundTrip:
         aad = b"some-aad"
 
         wrapped = wrap_cek_x25519(cek, recipient_pk, aad)
-        recovered = unwrap_cek_x25519(
-            wrapped.wrapped_cek, wrapped.ephemeral_pubkey, recipient_sk, aad
-        )
+        recovered = unwrap_cek_x25519(wrapped.wrapped_cek, wrapped.ephemeral_pubkey, recipient_sk, aad)
         assert recovered == cek
 
     def test_wrap_with_empty_aad(self):
@@ -111,9 +105,7 @@ class TestRoundTrip:
         recipient_pk = x25519_public_key(recipient_sk)
 
         wrapped = wrap_cek_x25519(cek, recipient_pk)
-        recovered = unwrap_cek_x25519(
-            wrapped.wrapped_cek, wrapped.ephemeral_pubkey, recipient_sk
-        )
+        recovered = unwrap_cek_x25519(wrapped.wrapped_cek, wrapped.ephemeral_pubkey, recipient_sk)
         assert recovered == cek
 
     def test_wrapped_size_invariant(self):
@@ -155,9 +147,7 @@ class TestFootguns:
     def test_unwrap_with_wrong_aad_fails(self):
         _cek, sk, wrapped = self._make_wrap(aad=b"good-aad")
         with pytest.raises(ValueError, match="AEAD decryption failed"):
-            unwrap_cek_x25519(
-                wrapped.wrapped_cek, wrapped.ephemeral_pubkey, sk, b"bad-aad"
-            )
+            unwrap_cek_x25519(wrapped.wrapped_cek, wrapped.ephemeral_pubkey, sk, b"bad-aad")
 
     def test_unwrap_tampered_ciphertext_fails(self):
         _cek, sk, wrapped = self._make_wrap()

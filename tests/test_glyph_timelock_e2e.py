@@ -16,7 +16,6 @@ from __future__ import annotations
 import hashlib
 import json
 import secrets
-import time
 from pathlib import Path
 
 import pytest
@@ -24,9 +23,7 @@ import pytest
 from pyrxd.crypto.aead import (
     XCHACHA20_KEY_SIZE,
     decrypt_chunked,
-    decrypt_xchacha20_poly1305,
     encrypt_chunked,
-    encrypt_xchacha20_poly1305,
 )
 from pyrxd.crypto.kem import (
     unwrap_cek_x25519,
@@ -34,13 +31,12 @@ from pyrxd.crypto.kem import (
     x25519_public_key,
 )
 from pyrxd.glyph.encrypted_content import (
+    SCHEME_CHUNKED_AEAD_V1,
+    WRAP_ALG_X25519,
     CryptoMetadata,
+    CryptoRecipient,
     EncryptedContentStub,
     EncryptionMetadata,
-    KEY_FORMAT_WRAPPED,
-    SCHEME_CHUNKED_AEAD_V1,
-    CryptoRecipient,
-    WRAP_ALG_X25519,
 )
 from pyrxd.glyph.timelock import (
     TimelockParams,
@@ -57,10 +53,7 @@ from pyrxd.glyph.timelock_reveal_tx import (
 )
 from pyrxd.glyph.types import GlyphProtocol
 
-
-FIXTURES_PATH = (
-    Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
-)
+FIXTURES_PATH = Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
 
 
 @pytest.fixture(scope="module")
@@ -110,18 +103,22 @@ class TestFullLifecycleSelfContained:
             ),
             crypto=CryptoMetadata(
                 cek_hash=cek_hash_str,
-                recipients=[CryptoRecipient(
-                    kid="auctioneer-key-1",
-                    alg=WRAP_ALG_X25519,
-                    wrapped_cek=wrapped.wrapped_cek,
-                    epk=wrapped.ephemeral_pubkey,
-                )],
+                recipients=[
+                    CryptoRecipient(
+                        kid="auctioneer-key-1",
+                        alg=WRAP_ALG_X25519,
+                        wrapped_cek=wrapped.wrapped_cek,
+                        epk=wrapped.ephemeral_pubkey,
+                    )
+                ],
             ),
         )
 
         # Add TIMELOCK to gate visibility until block 1000
         result = add_timelock_to_metadata(
-            stub, cek, TimelockParams(mode="block", unlock_at=1000),
+            stub,
+            cek,
+            TimelockParams(mode="block", unlock_at=1000),
         )
         mint_metadata = result.metadata
         stored_cek = result.cek_for_caller_to_store
@@ -141,7 +138,9 @@ class TestFullLifecycleSelfContained:
         # `create_reveal_proof` produces.
         token_ref = "ab" * 32 + ":0"  # the original mint outpoint
         reveal_script, _proof = create_reveal_proof(
-            token_ref, stored_cek, hint="Auction close, block 1000",
+            token_ref,
+            stored_cek,
+            hint="Auction close, block 1000",
         )
 
         # ─── RECIPIENT'S DECRYPTION FLOW ─────────────────────────────
@@ -171,7 +170,10 @@ class TestFullLifecycleSelfContained:
         unwrap_aad = compute_cek_hash(revealed_cek)
         wrapped_data = mint_metadata.crypto.recipients[0]
         unwrapped_cek = unwrap_cek_x25519(
-            wrapped_data.wrapped_cek, wrapped_data.epk, recipient_sk, unwrap_aad,
+            wrapped_data.wrapped_cek,
+            wrapped_data.epk,
+            recipient_sk,
+            unwrap_aad,
         )
         assert unwrapped_cek == cek
 
@@ -207,6 +209,7 @@ class TestPhotonicInteropEndToEnd:
 
         # 3. Decrypt the Photonic-chunked payload using the unwrapped CEK
         from pyrxd.crypto.aead import ChunkedCiphertext, EncryptedChunk
+
         chunked = ChunkedCiphertext(
             chunks=[
                 EncryptedChunk(
@@ -240,6 +243,7 @@ class TestPhotonicInteropEndToEnd:
 
         # 4. Decrypt the Photonic-chunked payload using the revealed CEK
         from pyrxd.crypto.aead import ChunkedCiphertext, EncryptedChunk
+
         chunked = ChunkedCiphertext(
             chunks=[
                 EncryptedChunk(
@@ -260,7 +264,7 @@ class TestPhotonicInteropEndToEnd:
         photonic_dict = v["output_metadata"]
 
         # Reconstruct inputs the bridge fed in
-        cek = bytes((i * 17 + 1) & 0xff for i in range(32))
+        cek = bytes((i * 17 + 1) & 0xFF for i in range(32))
         pt_small = b"hello, photonic timelock interop"
         cek_hash_str = format_cek_hash(compute_cek_hash(cek))
         stub_input = EncryptedContentStub(
@@ -277,7 +281,9 @@ class TestPhotonicInteropEndToEnd:
             crypto=CryptoMetadata(cek_hash=cek_hash_str),
         )
         result = add_timelock_to_metadata(
-            stub_input, cek, TimelockParams(mode="block", unlock_at=v["unlock_at"]),
+            stub_input,
+            cek,
+            TimelockParams(mode="block", unlock_at=v["unlock_at"]),
         )
         # The pyrxd-emitted metadata dict equals the Photonic-emitted one.
         assert result.metadata.to_dict() == photonic_dict

@@ -49,7 +49,7 @@ WRAP_ALG_X25519_MLKEM768 = "x25519mlkem768-hkdf-xchacha20poly1305"
 # (scrypt-based key derivation from a user password) is recognized for
 # decoding but not yet a write-path option.
 KEY_FORMAT_WRAPPED = "wrapped"
-KEY_FORMAT_PASSPHRASE = "passphrase"
+KEY_FORMAT_PASSPHRASE = "passphrase"  # nosec B105 — wire-format constant name from REP-3006, not a credential
 
 
 def _sha256_prefix(hex_or_prefixed: str) -> str:
@@ -68,8 +68,8 @@ class EncryptionMetadata:
     AEAD algorithm, chunked-AEAD scheme version.
     """
 
-    type: str                              # MIME type of the plaintext content
-    hash: str                              # "sha256:<hex>" of the plaintext
+    type: str  # MIME type of the plaintext content
+    hash: str  # "sha256:<hex>" of the plaintext
     enc: Literal["xchacha20poly1305"] = ENC_XCHACHA20POLY1305
     size: int = 0
     chunks: int = 1
@@ -86,7 +86,7 @@ class EncryptionMetadata:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "EncryptionMetadata":
+    def from_dict(cls, d: dict) -> EncryptionMetadata:
         return cls(
             type=str(d["type"]),
             hash=str(d["hash"]),
@@ -108,9 +108,9 @@ class CryptoRecipient:
     """
 
     kid: str
-    alg: str                    # WRAP_ALG_X25519 or WRAP_ALG_X25519_MLKEM768
-    wrapped_cek: bytes          # 72 bytes for X25519-only
-    epk: bytes                  # 32-byte X25519 ephemeral pubkey
+    alg: str  # WRAP_ALG_X25519 or WRAP_ALG_X25519_MLKEM768
+    wrapped_cek: bytes  # 72 bytes for X25519-only
+    epk: bytes  # 32-byte X25519 ephemeral pubkey
     mlkem_ct: bytes | None = None  # only present for PQ hybrid
 
     def to_dict(self) -> dict:
@@ -127,11 +127,11 @@ class CryptoRecipient:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> "CryptoRecipient":
+    def from_dict(cls, d: dict) -> CryptoRecipient:
         import base64
 
         mlkem_ct = None
-        if "mlkem_ct" in d and d["mlkem_ct"]:
+        if d.get("mlkem_ct"):
             mlkem_ct = base64.b64decode(d["mlkem_ct"])
         return cls(
             kid=str(d["kid"]),
@@ -153,7 +153,7 @@ class TimelockSpec:
 
     mode: Literal["block", "time"]
     unlock_at: int
-    cek_hash: str           # "sha256:<hex>" — must match the reveal CEK
+    cek_hash: str  # "sha256:<hex>" — must match the reveal CEK
     hint: str = ""
 
     def to_dict(self) -> dict:
@@ -167,7 +167,7 @@ class TimelockSpec:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> "TimelockSpec":
+    def from_dict(cls, d: dict) -> TimelockSpec:
         return cls(
             mode=str(d["mode"]),  # type: ignore[arg-type]
             unlock_at=int(d["unlock_at"]),
@@ -188,7 +188,7 @@ class CryptoMetadata:
 
     mode: Literal["encrypted"] = "encrypted"
     key_format: Literal["wrapped", "passphrase"] = KEY_FORMAT_WRAPPED
-    cek_hash: str = ""                       # "sha256:<hex>"
+    cek_hash: str = ""  # "sha256:<hex>"
     locator: str | None = None
     locator_hash: str | None = None
     recipients: list[CryptoRecipient] = field(default_factory=list)
@@ -211,7 +211,7 @@ class CryptoMetadata:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> "CryptoMetadata":
+    def from_dict(cls, d: dict) -> CryptoMetadata:
         recipients = [CryptoRecipient.from_dict(r) for r in d.get("recipients", [])]
         timelock = TimelockSpec.from_dict(d["timelock"]) if "timelock" in d else None
         return cls(
@@ -238,7 +238,7 @@ class EncryptedContentStub:
     so the cek_hash + main.hash invariants are enforced.
     """
 
-    p: list[int]                          # protocol markers
+    p: list[int]  # protocol markers
     type: str
     name: str
     main: EncryptionMetadata
@@ -254,7 +254,7 @@ class EncryptedContentStub:
         }
 
     @classmethod
-    def from_dict(cls, d: dict) -> "EncryptedContentStub":
+    def from_dict(cls, d: dict) -> EncryptedContentStub:
         return cls(
             p=[int(x) for x in d["p"]],
             type=str(d["type"]),
@@ -265,15 +265,15 @@ class EncryptedContentStub:
 
 
 __all__ = [
-    "CryptoMetadata",
-    "CryptoRecipient",
     "ENC_XCHACHA20POLY1305",
-    "EncryptedContentStub",
-    "EncryptionMetadata",
     "KEY_FORMAT_PASSPHRASE",
     "KEY_FORMAT_WRAPPED",
     "SCHEME_CHUNKED_AEAD_V1",
-    "TimelockSpec",
     "WRAP_ALG_X25519",
     "WRAP_ALG_X25519_MLKEM768",
+    "CryptoMetadata",
+    "CryptoRecipient",
+    "EncryptedContentStub",
+    "EncryptionMetadata",
+    "TimelockSpec",
 ]

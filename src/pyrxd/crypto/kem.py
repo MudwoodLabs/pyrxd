@@ -90,6 +90,7 @@ def x25519_public_key(privkey: bytes) -> bytes:
         Encoding,
         PublicFormat,
     )
+
     return sk.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
 
 
@@ -144,9 +145,7 @@ def wrap_cek_x25519(
     if len(cek) != XCHACHA20_KEY_SIZE:
         raise ValueError(f"cek must be {XCHACHA20_KEY_SIZE} bytes, got {len(cek)}")
     if len(recipient_pubkey) != X25519_KEY_SIZE:
-        raise ValueError(
-            f"recipient_pubkey must be {X25519_KEY_SIZE} bytes, got {len(recipient_pubkey)}"
-        )
+        raise ValueError(f"recipient_pubkey must be {X25519_KEY_SIZE} bytes, got {len(recipient_pubkey)}")
 
     ephemeral_priv = secrets.token_bytes(X25519_KEY_SIZE)
     ephemeral_pub = x25519_public_key(ephemeral_priv)
@@ -158,9 +157,7 @@ def wrap_cek_x25519(
 
     wrapped = nonce + ciphertext_with_tag
     if len(wrapped) != WRAPPED_CEK_SIZE:
-        raise RuntimeError(
-            f"wrapped CEK length invariant violated: got {len(wrapped)}, expected {WRAPPED_CEK_SIZE}"
-        )
+        raise RuntimeError(f"wrapped CEK length invariant violated: got {len(wrapped)}, expected {WRAPPED_CEK_SIZE}")
     return WrappedCEK(wrapped_cek=wrapped, ephemeral_pubkey=ephemeral_pub)
 
 
@@ -179,17 +176,12 @@ def unwrap_cek_x25519(
     """
     if len(wrapped_cek) != WRAPPED_CEK_SIZE:
         raise ValueError(
-            f"wrapped_cek must be {WRAPPED_CEK_SIZE} bytes "
-            f"(24 nonce + 32 cek + 16 tag), got {len(wrapped_cek)}"
+            f"wrapped_cek must be {WRAPPED_CEK_SIZE} bytes (24 nonce + 32 cek + 16 tag), got {len(wrapped_cek)}"
         )
     if len(ephemeral_pubkey) != X25519_KEY_SIZE:
-        raise ValueError(
-            f"ephemeral_pubkey must be {X25519_KEY_SIZE} bytes, got {len(ephemeral_pubkey)}"
-        )
+        raise ValueError(f"ephemeral_pubkey must be {X25519_KEY_SIZE} bytes, got {len(ephemeral_pubkey)}")
     if len(recipient_privkey) != X25519_KEY_SIZE:
-        raise ValueError(
-            f"recipient_privkey must be {X25519_KEY_SIZE} bytes, got {len(recipient_privkey)}"
-        )
+        raise ValueError(f"recipient_privkey must be {X25519_KEY_SIZE} bytes, got {len(recipient_privkey)}")
 
     shared = x25519_ecdh(recipient_privkey, ephemeral_pubkey)
     kek = hkdf_sha256(shared, salt=None, info=KEK_DERIVATION_INFO, length=XCHACHA20_KEY_SIZE)
@@ -198,17 +190,15 @@ def unwrap_cek_x25519(
     ciphertext_with_tag = wrapped_cek[XCHACHA20_NONCE_SIZE:]
     cek = decrypt_xchacha20_poly1305(ciphertext_with_tag, kek, nonce, aad)
     if len(cek) != XCHACHA20_KEY_SIZE:
-        raise ValueError(
-            f"unwrapped CEK is the wrong size: got {len(cek)}, expected {XCHACHA20_KEY_SIZE}"
-        )
+        raise ValueError(f"unwrapped CEK is the wrong size: got {len(cek)}, expected {XCHACHA20_KEY_SIZE}")
     return cek
 
 
 __all__ = [
     "KEK_DERIVATION_INFO",
     "WRAPPED_CEK_SIZE",
-    "WrappedCEK",
     "X25519_KEY_SIZE",
+    "WrappedCEK",
     "hkdf_sha256",
     "unwrap_cek_x25519",
     "wrap_cek_x25519",

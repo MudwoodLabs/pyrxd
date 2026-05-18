@@ -17,20 +17,15 @@ from pathlib import Path
 import pytest
 
 from pyrxd.glyph.encrypted_content import (
+    WRAP_ALG_X25519,
     CryptoMetadata,
     CryptoRecipient,
     EncryptedContentStub,
     EncryptionMetadata,
-    KEY_FORMAT_WRAPPED,
-    SCHEME_CHUNKED_AEAD_V1,
     TimelockSpec,
-    WRAP_ALG_X25519,
 )
 
-
-FIXTURES_PATH = (
-    Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
-)
+FIXTURES_PATH = Path(__file__).parent / "fixtures" / "photonic_timelock_vectors.json"
 
 
 @pytest.fixture(scope="module")
@@ -67,9 +62,7 @@ class TestPhotonicInteropMetadata:
         photonic_metadata = v["output_metadata"]
         stub = EncryptedContentStub.from_dict(photonic_metadata)
         re_emitted = stub.to_dict()
-        assert re_emitted == photonic_metadata, (
-            "round-trip changed the metadata — pyrxd and Photonic disagree on shape"
-        )
+        assert re_emitted == photonic_metadata, "round-trip changed the metadata — pyrxd and Photonic disagree on shape"
 
     def test_round_trip_byte_identical_time(self, photonic_vectors):
         v = photonic_vectors["timelock_metadata_time_mode"]
@@ -151,8 +144,10 @@ class TestCryptoMetadata:
             cek_hash="sha256:" + "ab" * 32,
             recipients=[
                 CryptoRecipient(
-                    kid="k1", alg=WRAP_ALG_X25519,
-                    wrapped_cek=b"\x00" * 72, epk=b"\x11" * 32,
+                    kid="k1",
+                    alg=WRAP_ALG_X25519,
+                    wrapped_cek=b"\x00" * 72,
+                    epk=b"\x11" * 32,
                 ),
             ],
         )
@@ -177,7 +172,9 @@ class TestEncryptedContentStub:
             crypto=CryptoMetadata(
                 cek_hash="sha256:" + "ab" * 32,
                 timelock=TimelockSpec(
-                    mode="block", unlock_at=10, cek_hash="sha256:" + "ab" * 32,
+                    mode="block",
+                    unlock_at=10,
+                    cek_hash="sha256:" + "ab" * 32,
                 ),
             ),
         )

@@ -91,11 +91,9 @@ def parse_cek_hash(formatted: str) -> bytes:
     s = formatted.strip()
     if not s.lower().startswith(SHA256_PREFIX):
         raise ValueError(f"expected sha256: prefix, got {formatted!r}")
-    hex_part = s[len(SHA256_PREFIX):]
+    hex_part = s[len(SHA256_PREFIX) :]
     if len(hex_part) != 64:
-        raise ValueError(
-            f"sha256 hash must be 32 bytes (64 hex chars), got {len(hex_part)} chars"
-        )
+        raise ValueError(f"sha256 hash must be 32 bytes (64 hex chars), got {len(hex_part)} chars")
     return bytes.fromhex(hex_part)
 
 
@@ -114,6 +112,7 @@ def verify_cek_reveal(cek: bytes, commitment: str | bytes) -> bool:
     # constant-time in CPython for str==str via memcmp-like dispatch, but
     # using hmac.compare_digest is the conservative spec match.
     import hmac
+
     return hmac.compare_digest(actual, expected)
 
 
