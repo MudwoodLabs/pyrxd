@@ -7,6 +7,7 @@ and how Radiant differs from related blockchains.
 :maxdepth: 1
 
 gravity
+glyph-structures-and-terminology
 radiant-fts-are-on-chain
 dmint-v1-deploy
 external-miner-protocol
@@ -18,6 +19,13 @@ external-miner-protocol
   Gravity protocol is, what a covenant is, and the difference between
   the mainnet-proven sentinel-artifact path and the experimental
   covenant variants. Read this before integrating `pyrxd.gravity`.
+- **[Understanding Glyph structures and terminology](glyph-structures-and-terminology.md)** —
+  the difference between a `txid`, an `outpoint`, a `GlyphRef`, and a
+  `contract_id`; what each `ft` / `nft` / `mut` / `commit-*` / `dmint`
+  output type actually means; and which identifier to paste where in
+  the inspect tool. Read this first if you've ever been confused by
+  why pasting a "contract id" shows you the *deploy* transaction
+  instead of your *transfer*.
 - **[Radiant FTs are on-chain (not metadata-on-P2PKH)](radiant-fts-are-on-chain.md)** —
   the most common confusion when porting from Atomicals / Runes / SPL
   is to assume Radiant FTs are plain UTXOs with off-chain meaning. This
