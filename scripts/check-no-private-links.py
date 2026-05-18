@@ -76,15 +76,22 @@ _RST_TARGET_RE = re.compile(r"^\.\.\s+_[^:]+:\s+(\S+)", re.MULTILINE)
 # `](path)` form; this catches the rest. A ``file://`` prefix is
 # matched too, so ``file:///home/alice/...`` is caught.
 #
-# Matches: /home/<user>/..., /Users/<user>/...
+# Matches: /home/<concrete-user>/..., /Users/<concrete-user>/...
+# where the username segment is constrained to characters POSIX
+# usernames actually use ([a-zA-Z0-9._-]).
 #
 # Deliberately does NOT match:
+#   - Documentation placeholders: /home/<user>/..., /home/$USER/...
+#     — the angle-bracket / shell-var glyphs aren't valid POSIX
+#     usernames, so the narrowed character class skips them. Security
+#     playbooks describing the leak pattern itself can therefore use
+#     ``/home/<user>/...`` freely without tripping the checker.
 #   - ~/... (tilde-home) — username-agnostic; the *correct* way to
 #     document a home-relative path like ``~/.pyrxd/config.toml``
 #   - /root/... — no username embedded; rare and not a personal leak
 #   - /tmp/... — scratch paths carry no username and are a normal way
 #     to describe a throwaway clone or fixture dump
-_HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/[^/\s]+/[^\s`)\"'<>]+")
+_HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/[a-zA-Z0-9._-]+/[^\s`)\"'<>]+")
 
 
 def git_ls_files(repo_root: Path) -> list[Path]:
