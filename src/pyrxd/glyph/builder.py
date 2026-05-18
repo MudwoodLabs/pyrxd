@@ -637,7 +637,27 @@ class GlyphBuilder:
 
         ``name`` must be non-empty printable ASCII, max 255 characters.
         The name is validated here but must already be embedded in
-        ``cbor_bytes`` by the caller via ``GlyphMetadata(name=...)``.
+        ``cbor_bytes`` by the caller via either ``attrs["name"]`` (the
+        Photonic-compatible canonical shape — required for resolution against
+        RXinDexer and other indexers) or top-level ``name`` (legacy pyrxd
+        shape, accepted for backwards compatibility but not indexer-visible).
+
+        Photonic-compatible CBOR shape (canonical, see Photonic Wallet
+        ``packages/lib/src/wave.ts``)::
+
+            {
+                "p": [2, 5, 11],
+                "attrs": {
+                    "name": "alice.rxd",
+                    "domain": "rxd",
+                    "target": "<radiant_address>",
+                    "target_type": "address"
+                }
+            }
+
+        Use :meth:`build_wave_attrs` (or :func:`pyrxd.glyph.wave.build_wave_metadata`)
+        to construct the canonical shape; passing a top-level ``name`` field
+        still works but emits a token RXinDexer will not index.
 
         Protocol requirement: ``[NFT(2), MUT(5), WAVE(11)]``.
         """
@@ -652,9 +672,19 @@ class GlyphBuilder:
                 )
             if GlyphProtocol.MUT not in protocol:
                 raise ValidationError(f"WAVE protocol must also include GlyphProtocol.MUT ({GlyphProtocol.MUT})")
-            cbor_name = cbor_data.get("name") or cbor_data.get("n", "")
+            # Prefer the Photonic-compatible attrs.name; fall back to top-level
+            # name/n for backwards compatibility with pre-Photonic-shape pyrxd
+            # tokens. Tokens minted without attrs.name will not resolve against
+            # RXinDexer — see the docstring above.
+            attrs = cbor_data.get("attrs") or {}
+            cbor_name = attrs.get("name") if isinstance(attrs, dict) else None
+            if not cbor_name:
+                cbor_name = cbor_data.get("name") or cbor_data.get("n", "")
             if cbor_name != name:
-                raise ValidationError(f"name argument {name!r} does not match CBOR name field {cbor_name!r}")
+                raise ValidationError(
+                    f"name argument {name!r} does not match CBOR name field {cbor_name!r}. "
+                    f"Checked attrs.name then top-level name/n."
+                )
         except ValidationError:
             raise
         except Exception as exc:
@@ -944,6 +974,13 @@ class DmintV2DeployParams:
             self.contract_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
         if self.token_ref_placeholder is None:
             self.token_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
+        # V2 quarantine marker — see V2UnvalidatedWarning in pyrxd.glyph.dmint.
+        # Subclasses suppress this (DmintFullDeployParams's deprecation warning
+        # is the higher-priority signal there).
+        if type(self) is DmintV2DeployParams:
+            from .dmint import _warn_v2_unvalidated
+
+            _warn_v2_unvalidated()
 
 
 class DmintFullDeployParams(DmintV2DeployParams):
@@ -1291,7 +1328,13 @@ class TransferResult:
 # ft.py uses build_ft_locking_script / extract_ref_from_ft_script from
 # script.py directly).
 
-from .ft import FtTransferResult, FtUtxo  # noqa: E402,F401 (re-export)
+# PEP 484 explicit re-export pattern (``X as X``). Satisfies CodeQL's
+# py/unused-import alert — which does not honour the F401 suppression
+# pragma the way ruff does — and makes the re-export intent obvious to
+# readers. One real consumer is examples/ft_transfer_demo.py, which
+# imports FtUtxo from this module for back-compat with pre-0.4 layouts.
+from .ft import FtTransferResult as FtTransferResult  # noqa: E402
+from .ft import FtUtxo as FtUtxo  # noqa: E402
 
 
 @dataclass

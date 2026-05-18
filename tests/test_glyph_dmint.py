@@ -164,6 +164,85 @@ class TestCommitLockingScriptFtBranch:
 
 
 # --------------------------------------------------------------------------
+# Mainnet golden vectors — commit script byte-equal vs real GLYPH deploy
+# --------------------------------------------------------------------------
+
+
+class TestCommitLockingScriptMainnetGolden:
+    """Pin ``build_commit_locking_script`` against the on-chain GLYPH deploy
+    commit at txid
+    ``a443d9df469692306f7a2566536b19ed7909d8bf264f5a01f5a9b171c7c3878b``.
+
+    This commit emitted BOTH commit shapes in one transaction:
+
+    * **vout 0** — FT commit (``OP_1`` ref-check, payload hash for the FT
+      reveal that carries the dMint-marked CBOR body)
+    * **vout 33** — NFT commit (``OP_2`` ref-check, payload hash for the
+      NFT singleton)
+
+    Pinning both shapes against the same on-chain tx closes the
+    pattern-recognition audit's #R7 followup for commit scripts.
+    See ``docs/dmint-research-photonic-deploy.md`` for full context.
+    """
+
+    # Owner PKH appears in both vout 0 and vout 33 (same deployer).
+    _OWNER_PKH = Hex20(bytes.fromhex("7d6c507735322c6bac9398317a65b4597072f0a6"))
+
+    # vout 0: FT commit — OP_1 (0x51) ref-check
+    _FT_COMMIT_PAYLOAD_HASH = bytes.fromhex("68d8f755ac95f399b3ea9d54978ebe20d71bfce50a2a8bc2771621de7c1af2ca")
+    _FT_COMMIT_SCRIPT = bytes.fromhex(
+        "aa20"
+        "68d8f755ac95f399b3ea9d54978ebe20d71bfce50a2a8bc2771621de7c1af2ca"
+        "8803676c7988c0c8c0c954807eda519d"
+        "76a9147d6c507735322c6bac9398317a65b4597072f0a688ac"
+    )
+
+    # vout 33: NFT commit — OP_2 (0x52) ref-check
+    _NFT_COMMIT_PAYLOAD_HASH = bytes.fromhex("ab4fed5bedc8864371751d6b8e04d2ac32c1495c25807a97c8537969626fcdcc")
+    _NFT_COMMIT_SCRIPT = bytes.fromhex(
+        "aa20"
+        "ab4fed5bedc8864371751d6b8e04d2ac32c1495c25807a97c8537969626fcdcc"
+        "8803676c7988c0c8c0c954807eda529d"
+        "76a9147d6c507735322c6bac9398317a65b4597072f0a688ac"
+    )
+
+    def test_ft_commit_byte_equals_glyph_vout_0(self):
+        """``build_commit_locking_script(hash, pkh, is_nft=False)`` produces
+        the exact 75 bytes observed at the GLYPH FT-commit vout 0."""
+        rebuilt = build_commit_locking_script(self._FT_COMMIT_PAYLOAD_HASH, self._OWNER_PKH, is_nft=False)
+        assert rebuilt == self._FT_COMMIT_SCRIPT, (
+            f"FT commit script drifted from mainnet:\n"
+            f"  expected: {self._FT_COMMIT_SCRIPT.hex()}\n"
+            f"  got:      {rebuilt.hex()}"
+        )
+
+    def test_nft_commit_byte_equals_glyph_vout_33(self):
+        """``build_commit_locking_script(hash, pkh, is_nft=True)`` produces
+        the exact 75 bytes observed at the GLYPH NFT-commit vout 33."""
+        rebuilt = build_commit_locking_script(self._NFT_COMMIT_PAYLOAD_HASH, self._OWNER_PKH, is_nft=True)
+        assert rebuilt == self._NFT_COMMIT_SCRIPT, (
+            f"NFT commit script drifted from mainnet:\n"
+            f"  expected: {self._NFT_COMMIT_SCRIPT.hex()}\n"
+            f"  got:      {rebuilt.hex()}"
+        )
+
+    def test_ft_and_nft_mainnet_commits_differ_only_at_op_n_byte(self):
+        """The on-chain FT and NFT commits from the same deploy share
+        the same length and the same owner-PKH tail; they differ at the
+        OP_N ref-type byte (offset 48) and at the payload hash (offsets
+        2..34). This pins the FT-vs-NFT toggle that pyrxd 0.2.0 fixed."""
+        ft = self._FT_COMMIT_SCRIPT
+        nft = self._NFT_COMMIT_SCRIPT
+
+        assert len(ft) == len(nft) == 75
+        assert ft[48] == 0x51  # OP_1 (NORMAL, FT)
+        assert nft[48] == 0x52  # OP_2 (SINGLETON, NFT)
+        # Last 25 bytes are the P2PKH tail (OP_DUP OP_HASH160 PUSH20 PKH
+        # OP_EQUALVERIFY OP_CHECKSIG) — same deployer, same tail.
+        assert ft[-25:] == nft[-25:]
+
+
+# --------------------------------------------------------------------------
 # prepare_commit: auto-derives is_nft from metadata.protocol
 # --------------------------------------------------------------------------
 
