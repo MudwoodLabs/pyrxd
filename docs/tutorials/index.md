@@ -7,12 +7,19 @@ fungible token, run a Gravity swap.
 ```{toctree}
 :maxdepth: 1
 
+inspect-a-radiant-transaction
 mint-a-glyph-nft
 mint-a-glyph-ft
 ```
 
 ## Available now
 
+- **[Inspect a Radiant transaction in the browser](inspect-a-radiant-transaction.md)** —
+  the gentlest first-contact with pyrxd. No install, no wallet, no
+  funded UTXOs. Open the browser-hosted inspect tool, paste real
+  mainnet txids, and decode an FT transfer, a dMint mint claim, a
+  Glyph deploy reveal, and a plain RXD send. Start here if you're
+  new to Radiant or pyrxd.
 - **[Mint a Glyph NFT](mint-a-glyph-nft.md)** — author CBOR metadata,
   build a commit transaction, wait for confirmation, build the reveal,
   and broadcast. Uses a synthetic key by default so you can run every
