@@ -98,9 +98,10 @@ against captured mainnet bytes**.
 V1 deploy is the most byte-intricate part of the protocol (multi-
 output commit, ref-seed derivation, parallel contract reveal, CBOR
 metadata). It's exactly the surface most likely to bite us if we
-infer instead of read. Photonic's TS source is the canonical
-authority for "what does the live ecosystem expect" (per memory:
-`feedback_photonic_canonical_reference.md`).
+infer instead of read. Per the project convention, Photonic's TS
+source is the default reference for "what does the live ecosystem
+expect" — deviate explicitly, with a documented reason, only when
+Photonic is wrong.
 
 Rejected:
 - **Approach 2 (Implement-first)**: violates the M1 lesson. Almost

@@ -9,6 +9,7 @@ and how Radiant differs from related blockchains.
 gravity
 radiant-fts-are-on-chain
 dmint-v1-deploy
+external-miner-protocol
 ```
 
 ## Available now
@@ -27,6 +28,13 @@ dmint-v1-deploy
   to Radiant Glyph Protocol), why pyrxd refuses to emit V2 by default,
   and the five Photonic divergences pyrxd ships with. Read this before
   using `prepare_dmint_deploy` with `DmintV1DeployParams`.
+- **[External miner protocol: JSON-over-stdio subprocess contract](external-miner-protocol.md)** —
+  the wire protocol `mine_solution_external` uses to drive a fast
+  external miner binary as a child process. Documents the request /
+  response JSON shapes, exit-code handling, the `EXTERNAL_MINER` /
+  `EXTERNAL_MINER_TIMEOUT_S` env vars used by the dMint claim demo,
+  what the library re-verifies before trusting a returned nonce, and
+  a 20-line reference miner that fits the contract.
 
 ## Adjacent reading (not yet promoted to concept docs)
 

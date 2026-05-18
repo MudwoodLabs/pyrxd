@@ -186,6 +186,21 @@ class ElectrumXClient:
 
     # ---------------------------------------------------------------------- public API
 
+    async def call_extension(self, method: str, params: list | None = None) -> Any:
+        """Call an arbitrary JSON-RPC method on the connected server.
+
+        Use this for indexer-extension RPCs that aren't part of the base
+        ElectrumX surface — e.g. RXinDexer's ``wave.resolve``,
+        ``glyph.get_token``, ``swap.get_unconfirmed_orders``. The
+        underlying transport (connection, id correlation, error handling)
+        is identical to the built-in methods.
+
+        Returns the raw ``result`` field from the JSON-RPC response. Server
+        errors raise :class:`NetworkError`. The caller is responsible for
+        validating the result shape.
+        """
+        return await self._call(method, params or [])
+
     async def get_transaction(self, txid: Txid) -> RawTx:
         """Fetch the raw transaction bytes for *txid*.
 

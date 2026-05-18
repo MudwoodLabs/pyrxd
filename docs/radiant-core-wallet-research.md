@@ -10,7 +10,7 @@ already cover what users need? Specifically: can someone running a node use
 
 ## Method
 
-Live queries against the mainnet full node at `89.117.20.219` (Radiant Core, version 200300, tip 424872 at time of probe). All queries were read-only RPC calls. No funds moved, no wallet state changed.
+Live queries against a self-hosted Radiant Core mainnet full node (version 200300, tip 424872 at time of probe). All queries were read-only RPC calls. No funds moved, no wallet state changed.
 
 ## Findings
 

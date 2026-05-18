@@ -12,6 +12,7 @@ import hashlib
 import math
 import struct
 import time
+import warnings
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Literal
@@ -26,6 +27,61 @@ from pyrxd.security.errors import (
 )
 
 from .types import GlyphRef
+
+# ---------------------------------------------------------------------------
+# V2 quarantine marker
+# ---------------------------------------------------------------------------
+#
+# V2 dMint is implemented per spec but **has never been validated against
+# on-chain bytes** — no V2 contract exists on Radiant mainnet as of pyrxd
+# 0.5.1. Every protocol-level claim in the V2 path is byte-derived from
+# the V1 covenant (where the two share bytecode, e.g. ``_PART_C``) or
+# from the V2 design doc; nothing is cross-validated against live
+# transactions. This is the same anti-pattern that produced the M1
+# mint-shape bug (docs/solutions/logic-errors/dmint-v1-mint-shape-mismatch.md)
+# and the V2 reward-shape bug caught by the 0.5.0 red-team audit. The
+# quarantine warning below is the smallest reversible signal we can put
+# on every V2 entry point to make the "this path has never run on chain"
+# status visible at runtime.
+
+
+class V2UnvalidatedWarning(UserWarning):
+    """Warning category for V2 dMint code paths that have not been
+    validated against on-chain bytes.
+
+    Distinct from ``DeprecationWarning`` because V2 isn't going away —
+    it's just not field-tested yet. Distinct from a bare ``UserWarning``
+    because callers should be able to filter it specifically (e.g.
+    ``warnings.simplefilter("error", V2UnvalidatedWarning)`` to make CI
+    fail hard on V2 use, or ``warnings.simplefilter("ignore",
+    V2UnvalidatedWarning)`` once a V2 contract is live and the warning
+    becomes noise).
+
+    Will be removed (or reclassified) when V2 has its first mainnet
+    deploy + mint + several blocks of confirmed activity.
+    """
+
+
+_V2_QUARANTINE_TEXT = (
+    "V2 dMint code path: pyrxd's V2 implementation is BYTE-EQUIVALENT "
+    "BY CONSTRUCTION to V1 where they share bytecode, but no V2 contract "
+    "exists on Radiant mainnet as of 0.5.1 — this path has never been "
+    "exercised against live consensus. Use V1 (DmintV1DeployParams) "
+    "unless you have a specific reason to test V2. To silence: "
+    "warnings.simplefilter('ignore', V2UnvalidatedWarning); to fail "
+    "loud: warnings.simplefilter('error', V2UnvalidatedWarning)."
+)
+
+
+def _warn_v2_unvalidated(stacklevel: int = 3) -> None:
+    """Emit the one-time V2 quarantine warning.
+
+    ``stacklevel=3`` so the warning points at the caller's call site, not
+    at this helper or the V2 entry-point function that called it. Adjust
+    if the call chain deepens.
+    """
+    warnings.warn(_V2_QUARANTINE_TEXT, V2UnvalidatedWarning, stacklevel=stacklevel)
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -297,7 +353,14 @@ def build_dmint_state_script(params: DmintDeployParams) -> bytes:
         height(4B LE) | d8:contractRef(36B) | d0:tokenRef(36B) |
         maxHeight | reward | algoId | daaMode | targetTime |
         lastTime(4B LE) | target
+
+    .. warning::
+       V2 has never been validated on Radiant mainnet (no V2 contract
+       exists as of pyrxd 0.5.1). Emits :class:`V2UnvalidatedWarning`
+       once per call site. Use V1 (``build_dmint_v1_state_script``)
+       unless you have a specific reason to test V2.
     """
+    _warn_v2_unvalidated()
     target = params.initial_target
     return (
         _push_4bytes_le(params.height)
@@ -316,15 +379,32 @@ def build_dmint_state_script(params: DmintDeployParams) -> bytes:
 
 
 def build_dmint_code_script(params: DmintDeployParams) -> bytes:
-    """Build the V2 dMint code bytecode (Part A + powHashOp + Part B + Part C)."""
+    """Build the V2 dMint code bytecode (Part A + powHashOp + Part B + Part C).
+
+    .. warning::
+       V2-only. See :class:`V2UnvalidatedWarning`.
+    """
+    _warn_v2_unvalidated()
     pow_op = _POW_HASH_OP[params.algo]
     part_b = _build_part_b(params.daa_mode, params.half_life)
     return _PART_A + pow_op + part_b + _PART_C
 
 
 def build_dmint_contract_script(params: DmintDeployParams) -> bytes:
-    """Build the full V2 dMint output script: state + OP_STATESEPARATOR + code."""
-    return build_dmint_state_script(params) + _OP_STATESEPARATOR + build_dmint_code_script(params)
+    """Build the full V2 dMint output script: state + OP_STATESEPARATOR + code.
+
+    .. warning::
+       V2-only. See :class:`V2UnvalidatedWarning`.
+    """
+    # Don't double-warn: the two helpers we delegate to already warn.
+    # Suppress here so a caller sees exactly one warning per
+    # build_dmint_contract_script call (not three).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", V2UnvalidatedWarning)
+        state = build_dmint_state_script(params)
+        code = build_dmint_code_script(params)
+    _warn_v2_unvalidated()
+    return state + _OP_STATESEPARATOR + code
 
 
 # ---------------------------------------------------------------------------
@@ -652,7 +732,13 @@ def compute_next_target_asert(
     drift > 0 → target <<= drift (easier)
     drift < 0 → target >>= |drift| (harder)
     Minimum target is 1.
+
+    .. warning::
+       V2-only DAA. V1 has no DAA (fixed difficulty). Emits
+       :class:`V2UnvalidatedWarning` — no V2 contract has run this
+       formula on chain.
     """
+    _warn_v2_unvalidated()
     time_delta = current_time - last_time
     excess = time_delta - target_time
     drift = excess // half_life
@@ -674,7 +760,12 @@ def compute_next_target_linear(
     current_time: int,
     target_time: int,
 ) -> int:
-    """Compute next linear DAA target: new_target = old_target * time_delta / target_time."""
+    """Compute next linear DAA target: new_target = old_target * time_delta / target_time.
+
+    .. warning::
+       V2-only DAA. See :class:`V2UnvalidatedWarning`.
+    """
+    _warn_v2_unvalidated()
     time_delta = current_time - last_time
     new_target = current_target * time_delta // target_time
     return max(1, new_target)
@@ -897,8 +988,17 @@ def mine_solution_external(
 
     1. Read one JSON object from stdin: ``{"preimage_hex", "target_hex", "nonce_width"}``
     2. Search for a valid nonce
-    3. Write one JSON object to stdout: ``{"nonce_hex", "attempts", "elapsed_s"}``
-    4. Exit cleanly
+    3. Write one JSON object to stdout:
+       - On hit (exit 0): ``{"nonce_hex", "attempts", "elapsed_s"}``
+       - On nonce-space exhaustion (exit 2, added in 0.5.1): ``{"exhausted": true}``
+         — pyrxd raises :class:`MaxAttemptsError` immediately rather than
+         waiting for the parent timeout to fire.
+
+    A bundled reference implementation ships at :mod:`pyrxd.contrib.miner`
+    (added in 0.5.1) — see :doc:`/concepts/parallel-mining` for the full
+    protocol spec and operational notes. Invoke it via::
+
+        miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"]
 
     .. warning::
        **Supply-chain risk: pyrxd does NOT pin or verify the miner binary.**
@@ -985,9 +1085,6 @@ def mine_solution_external(
             elapsed_s=elapsed,
         ) from exc
 
-    if completed.returncode != 0:
-        raise ValidationError(f"external miner {miner_argv[0]!r} exited with code {completed.returncode}")
-
     # Decode stdout. A miner returning malformed UTF-8 is a malformed
     # response, not an exception that should escape.
     try:
@@ -996,6 +1093,29 @@ def mine_solution_external(
         raise ValidationError(f"external miner {miner_argv[0]!r} returned non-UTF-8 stdout") from exc
     if len(stdout) > 4096:
         raise ValidationError(f"external miner produced {len(stdout)} bytes of stdout; expected one short JSON line")
+
+    # Protocol-level exhaustion signal (added 0.5.1): a miner that
+    # finishes its sweep without finding a hit may exit 2 with
+    # ``{"exhausted": true}`` on stdout. Raise MaxAttemptsError
+    # immediately so callers don't have to wait for the parent timeout.
+    # Older miners that don't know this convention fall through to the
+    # generic rc != 0 path below (or are SIGKILLed by the parent timeout).
+    if completed.returncode == 2 and stdout.strip():
+        try:
+            maybe_exhausted = json.loads(stdout)
+        except json.JSONDecodeError:
+            maybe_exhausted = None
+        if isinstance(maybe_exhausted, dict) and maybe_exhausted.get("exhausted") is True:
+            elapsed = time.monotonic() - started
+            raise MaxAttemptsError(
+                f"external miner {miner_argv[0]!r} exhausted the nonce space without finding a solution",
+                attempts=0,
+                elapsed_s=elapsed,
+            )
+
+    if completed.returncode != 0:
+        raise ValidationError(f"external miner {miner_argv[0]!r} exited with code {completed.returncode}")
+
     try:
         response = json.loads(stdout)
     except json.JSONDecodeError as exc:
@@ -1048,6 +1168,90 @@ def mine_solution_external(
         nonce=nonce,
         attempts=attempts,
         elapsed_s=float(miner_elapsed),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Dispatch helper — pick in-process vs external based on miner_argv
+# ---------------------------------------------------------------------------
+
+
+def mine_solution_dispatch(
+    preimage: bytes,
+    target: int,
+    *,
+    nonce_width: Literal[4, 8] = 4,
+    algo: DmintAlgo = DmintAlgo.SHA256D,
+    miner_argv: list[str] | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    timeout_s: float = EXTERNAL_MINER_TIMEOUT_S,
+) -> DmintMineResult:
+    """Mine a nonce — picks the in-process or subprocess miner from one entrypoint.
+
+    Most callers want this helper rather than calling
+    :func:`mine_solution` or :func:`mine_solution_external` directly.
+    The two paths share semantics — both return a :class:`DmintMineResult`
+    with a nonce that satisfies the target — but have disjoint parameter
+    sets (``max_attempts`` vs ``timeout_s``, no-argv vs argv). Picking
+    between them was a 30-line wrapper that every demo and operator
+    script ended up rewriting; this function is that wrapper, with the
+    branch in one place.
+
+    Dispatch rule:
+
+    * ``miner_argv is None`` (default): run :func:`mine_solution` in
+      this process. Slow but correct. Use for tests, small examples,
+      and contracts where mining takes < a minute.
+    * ``miner_argv is not None``: invoke :func:`mine_solution_external`
+      with the supplied argv. The external miner (e.g.
+      ``pyrxd.contrib.miner``, a custom binary, or ``glyph-miner``)
+      runs as a subprocess and returns a verified nonce via the
+      JSON-over-stdio protocol. The local re-verification in
+      ``mine_solution_external`` is the load-bearing safety check
+      against a buggy or malicious miner.
+
+    :param preimage:     64-byte preimage from :func:`build_pow_preimage`.
+    :param target:       The PoW target.
+    :param nonce_width:  4 for V1 contracts, 8 for V2.
+    :param algo:         Hash algorithm. Currently only SHA256D is implemented;
+                         BLAKE3 and K12 raise from :func:`mine_solution`.
+                         Ignored on the external-miner path (the protocol
+                         doesn't carry an algo field; external miners
+                         are assumed SHA256D until the protocol is
+                         extended).
+    :param miner_argv:   ``None`` → in-process; otherwise an argv list
+                         passed to :func:`subprocess.run` for the
+                         external miner. Use
+                         ``[sys.executable, "-m", "pyrxd.contrib.miner"]``
+                         for the bundled parallel miner.
+    :param max_attempts: Iteration cap on the in-process path. Ignored
+                         on the external-miner path (the external miner
+                         caps via ``timeout_s`` instead).
+    :param timeout_s:    Subprocess timeout on the external-miner path.
+                         Ignored in-process (use ``max_attempts`` there).
+
+    :returns: :class:`DmintMineResult` with the verified nonce.
+    :raises MaxAttemptsError:  in-process exhausted ``max_attempts``,
+                               or external miner exceeded ``timeout_s``
+                               / explicitly signalled exhaustion.
+    :raises ValidationError:   external miner returned a malformed
+                               response or a nonce that fails local
+                               verification.
+    """
+    if miner_argv is None:
+        return mine_solution(
+            preimage=preimage,
+            target=target,
+            algo=algo,
+            nonce_width=nonce_width,
+            max_attempts=max_attempts,
+        )
+    return mine_solution_external(
+        preimage=preimage,
+        target=target,
+        miner_argv=miner_argv,
+        nonce_width=nonce_width,
+        timeout_s=timeout_s,
     )
 
 
@@ -2374,6 +2578,83 @@ def build_dmint_v1_mint_preimage(
             "a preimage that fails the covenant check after mining."
         )
     txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
+    return build_pow_preimage(
+        txid_le=txid_le,
+        contract_ref_bytes=contract_utxo.state.contract_ref.to_bytes(),
+        input_script=funding_utxo.script,
+        output_script=output_script,
+    )
+
+
+def build_dmint_v2_mint_preimage(
+    contract_utxo: DmintContractUtxo,
+    funding_utxo: DmintMinerFundingUtxo,
+    output_script: bytes,
+) -> PowPreimageResult:
+    """Build the V2 mining preimage AND scriptSig hashes.
+
+    V2 analog of :func:`build_dmint_v1_mint_preimage`. The preimage
+    shape (and the on-chain covenant's H1/H2 binding logic) is identical
+    to V1 — V2 inherits the output-validation block via ``_PART_C`` =
+    ``_V1_EPILOGUE_SUFFIX[18:]``. The only V1/V2 differences at the
+    mint-tx level are the nonce width (8 bytes for V2 vs 4 for V1, a
+    parameter of :func:`build_mint_scriptsig`) and the absence of the
+    Photonic-Wallet ``op_return_msg`` convention in V2.
+
+    Layout (matches :func:`build_pow_preimage`)::
+
+        preimage    = SHA256(txid_LE || contractRef) ||
+                      SHA256(SHA256d(input_script) || SHA256d(output_script))
+        input_hash  = SHA256d(input_script)    ← scriptSig push
+        output_hash = SHA256d(output_script)   ← scriptSig push
+
+    Unlike the V1 helper, this function takes ``output_script`` as an
+    **explicit argument**. V2 has no canonical "OP_RETURN msg at vout[2]"
+    convention (that's Photonic-Wallet's V1 layout); the V2 covenant
+    binds outputHash to whatever bytes the caller chooses to push.
+    Callers selecting ``output_script`` should pick one of the actual
+    transaction outputs and document the binding in their own code.
+
+    .. warning::
+       V2 has never been validated on Radiant mainnet. Emits
+       :class:`V2UnvalidatedWarning`. This helper exists to close the
+       audit's security-H1 finding (no V2 analog of
+       ``build_dmint_v1_mint_preimage`` left V2 callers one careless
+       script-mismatch away from reproducing the M1 bug pattern), but
+       no live V2 contract has accepted the preimages this function
+       returns. Use V1 unless you have a specific reason to test V2.
+
+    :param contract_utxo:  The V2 contract UTXO being spent. Its
+                           ``state.is_v1`` MUST be ``False`` — passing
+                           a V1 UTXO is a bug.
+    :param funding_utxo:   The plain-RXD UTXO providing reward + fee.
+    :param output_script:  The output-script bytes to bind into the
+                           preimage. V2 has no canonical convention;
+                           pick a transaction output the caller cares
+                           about (e.g. an OP_RETURN identifier, or
+                           the reward output's locking script).
+    :returns:              :class:`PowPreimageResult` with the preimage
+                           and the two script hashes the scriptSig
+                           must push.
+    :raises ValidationError: V1 contract UTXO passed by mistake, or an
+                           empty ``output_script``.
+    """
+    _warn_v2_unvalidated()
+    if contract_utxo.state.is_v1:
+        raise ValidationError(
+            "build_dmint_v2_mint_preimage called with a V1 contract UTXO "
+            "(state.is_v1 is True). Use build_dmint_v1_mint_preimage instead."
+        )
+    if not output_script:
+        raise ValidationError(
+            "output_script must be non-empty bytes — the V2 covenant binds "
+            "outputHash to SHA256d(output_script); empty bytes would produce "
+            "a degenerate preimage."
+        )
+    txid_le = bytes.fromhex(contract_utxo.txid)[::-1]
+    # The inner build_pow_preimage call doesn't emit V2 warnings — it's
+    # shared with V1. The single warning at the top of this function is
+    # the right granularity (one per V2-preimage-build call site).
     return build_pow_preimage(
         txid_le=txid_le,
         contract_ref_bytes=contract_utxo.state.contract_ref.to_bytes(),
