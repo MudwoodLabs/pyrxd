@@ -1,0 +1,66 @@
+# gitleaks — defense-in-depth secret scanner.
+#
+# pyrxd has `detect-secrets` as a pre-commit hook (per #17), but a
+# contributor without pre-commit installed — or one who runs
+# `--no-verify` — bypasses local checks entirely. CI is the only
+# enforcement point we can trust for outside contributors and for
+# our own moments of haste. See issue #21 for the full rationale.
+#
+# Config lives in `.gitleaks.toml` at repo root: `useDefault = true`
+# plus a small scoped allowlist for well-known published test
+# vectors (BIP-32, secp256k1 RFC-6979) that the default ruleset
+# misclassifies as generic API keys. Do NOT extend that allowlist
+# without reviewing each rule.
+
+name: Gitleaks
+
+on:
+  # PR-scan: every PR gets a fresh secret scan against its diff +
+  # whatever's in the worktree. Blocks merge if a secret is found.
+  pull_request:
+    branches: [main]
+  # Push-scan: catches anything that lands on main directly (admin
+  # override of branch protection, etc.).
+  push:
+    branches: [main]
+  # Weekly full-history audit. The PR/push scans only cover the
+  # current head; a scheduled run re-scans the whole git history,
+  # catching anything that slipped in before this workflow existed
+  # or before a new rule was added to the default ruleset.
+  # Staggered from CodeQL (06:00) and Scorecard (07:00) to avoid
+  # competing for runner capacity.
+  schedule:
+    - cron: "0 8 * * 1"
+
+permissions:
+  contents: read
+
+# Cancel in-flight runs when a new commit lands on the same branch/PR.
+# Matches the cancellation policy in ci.yml / codeql.yml / lint.yml /
+# osv-scanner.yml (per #89). Free Actions minutes are not free.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Scan for leaked secrets
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Full history for the weekly scheduled scan; the PR/push
+          # scans don't strictly need it but the action handles
+          # incremental scans efficiently either way.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Gitleaks scan
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2.3.9
+        env:
+          # The action publishes Gitleaks ORG-tier license info to
+          # GITLEAKS_LICENSE; we don't have one (free OSS use) and
+          # the action runs without it for public repos. No secret
+          # required for our use case.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
