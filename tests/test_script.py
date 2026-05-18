@@ -40,11 +40,14 @@ def test_unsupported_script_error_can_be_raised():
 
 
 def test_p2pkh_locking_script_from_address():
-    """P2PKH.lock() from a known address must produce the canonical locking script."""
-    # Known BTC mainnet address and its P2PKH locking script bytes.
-    address = "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf Na"  # noqa — not used, use hardcoded below
+    """P2PKH.lock() from a known address must produce the canonical locking script.
 
-    # Use a known pubkey hash directly to avoid address-decode complexity.
+    The pubkey hash below is the HASH160 of the Genesis-block-style
+    BTC mainnet address ``1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa``. Using
+    the hash directly avoids pulling base58 / bech32 decode into this
+    test — those paths are exercised elsewhere.
+    """
+    # Known pubkey hash for 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa.
     pubkey_hash = bytes.fromhex("20bb5c3bfaef0231dc05190e7f1c8e22e098991e")
     script = P2PKH().lock(pubkey_hash)
 

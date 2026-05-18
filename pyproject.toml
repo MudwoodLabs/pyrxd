@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [project]
 name = "pyrxd"
-version = "0.5.0"
+version = "0.5.1"
 description = "Python SDK for the Radiant (RXD) blockchain — transactions, HD wallets, Glyph tokens (NFT/FT/dMint), Gravity cross-chain atomic swaps, SPV, and ElectrumX."
 authors = [
     {name = "Mudwood Labs", email = "opensource@mudwoodlabs.com"}
@@ -35,6 +35,7 @@ Changelog = "https://github.com/MudwoodLabs/pyrxd/blob/main/CHANGELOG.md"
 
 [project.scripts]
 pyrxd = "pyrxd.cli.main:run"
+pyrxd-miner = "pyrxd.contrib.miner.cli:main"
 
 [tool.poetry]
 packages = [{include = "pyrxd", from = "src"}]
@@ -42,6 +43,7 @@ include = [
     { path = "src/pyrxd/gravity/artifacts/*.json", format = ["sdist", "wheel"] },
     { path = "src/pyrxd/hd/wordlist/*.txt",        format = ["sdist", "wheel"] },
     { path = "src/pyrxd/py.typed",                 format = ["sdist", "wheel"] },
+    { path = "src/pyrxd/contrib/miner/README.md",  format = ["sdist", "wheel"] },
 ]
 
 [tool.taskipy.tasks]
@@ -74,7 +76,6 @@ coincurve = "^21.0.0"
 base58 = "^2.1.1"
 pycryptodomex = "^3.22.0"
 websockets = ">=15.0.1,<17.0.0"
-websocket-client = "^1.9.0"
 cbor2 = "^6.0"
 click = "^8.3"
 # tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
@@ -87,7 +88,7 @@ bandit = {version = "^1.9.4", extras = ["toml"]}
 pip-audit = "^2.7.3"
 detect-secrets = "^1.5.0"
 mypy = "^1.8.0"
-ruff = "^0.15.0"
+ruff = "^0.15.12"
 hypothesis = "^6.98.0"
 pytest-asyncio = ">=1.3.0"
 
@@ -160,6 +161,10 @@ ignore = [
 "examples/**" = [
     "S",      # examples use test keys / hardcoded WIFs intentionally
     "E402",   # examples may reorder imports for narrative clarity
+]
+"scripts/**" = [
+    "S603",   # subprocess call with non-shell args: dev scripts trust their own argv
+    "S607",   # partial executable path: `git`, `python3` etc. resolved via PATH at dev time
 ]
 "docs/conf.py" = ["E", "F", "I"]
 

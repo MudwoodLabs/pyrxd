@@ -117,9 +117,9 @@ def _fetch_and_verify(version: str, *, update_hash: bool) -> tuple[str, str, str
                 f"compromised upstream mirror or a TLS MITM. Investigate\n"
                 f"before proceeding."
             )
-        print(f"  pinned SHA matches — proceeding", file=sys.stderr)
+        print("  pinned SHA matches — proceeding", file=sys.stderr)
     else:
-        print(f"  --update-hash: skipping pin verification", file=sys.stderr)
+        print("  --update-hash: skipping pin verification", file=sys.stderr)
     return data.decode("utf-8"), url, sha
 
 
@@ -284,6 +284,7 @@ def _emit(mappings: dict[int, str], unicode_version: str, source_url: str) -> st
     ]
     for source_cp in sorted(mappings.keys()):
         target = mappings[source_cp]
+
         # Render the target as a Python string literal. Avoid emitting
         # raw non-ASCII codepoints into the source file — keeps the
         # generated module 7-bit clean and easier to grep. Use
@@ -367,7 +368,7 @@ def main() -> int:
     print(f"  parsed {len(mappings):,} raw mappings (Unicode {unicode_version})", file=sys.stderr)
     if args.update_hash:
         print(
-            f"\n  After verifying the diff, update _PINNED_SHA256 in this script to:",
+            "\n  After verifying the diff, update _PINNED_SHA256 in this script to:",
             file=sys.stderr,
         )
         print(f"      {sha}", file=sys.stderr)

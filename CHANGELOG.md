@@ -4,6 +4,136 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-05-13
+
+Audit follow-ups + new SDK primitives. No breaking changes; everything
+new is additive. Closes the four golden-vector recommendations from
+the 0.5.0 pattern-recognition audit and ships the time-lock builders
++ parallel miner that were deferred at 0.5.0 cut.
+
+### Added
+
+#### Time-lock script primitives
+
+- `pyrxd.script.timelock` — new module with canonical Bitcoin/Radiant
+  time-lock locking scripts:
+  - `build_p2pkh_with_cltv_script(pkh, locktime)` — P2PKH gated by
+    absolute time-lock (BIP-65 `OP_CHECKLOCKTIMEVERIFY`).
+  - `build_p2pkh_with_csv_script(pkh, sequence)` — P2PKH gated by
+    relative time-lock (BIP-112 `OP_CHECKSEQUENCEVERIFY`).
+  - `build_csv_sequence(units, kind)` — encodes a (blocks |
+    512-second intervals) pair into the BIP-112 stack/`nSequence`
+    integer form.
+  - `CsvKind.BLOCKS` / `CsvKind.TIME_512_SECONDS` — kind enum.
+  - `LOCKTIME_THRESHOLD = 500_000_000` — height-vs-Unix-time boundary.
+- Validation rejects out-of-range locktime/sequence, the BIP-112
+  disable bit (would silently make the lock a no-op), and wrong-size
+  PKH. 20 tests cover minimal-int push behaviour, sign-pad edge cases,
+  bit-22 encoding, and the cross-invariant that CLTV and CSV shapes
+  differ only at the verify opcode.
+- **Scope: locking scripts only.** Threading `nLockTime` /
+  `nSequence` through transaction construction (and the unlocking
+  `ScriptTemplate` that consumes signatures) is deferred until a
+  concrete pyrxd consumer needs it.
+
+#### Unified miner entrypoint
+
+- `mine_solution_dispatch(preimage, target, *, miner_argv=None, ...)`
+  — single entrypoint that routes to in-process `mine_solution`
+  when `miner_argv is None`, otherwise to `mine_solution_external`
+  for a subprocess miner. Callers no longer have to branch on miner
+  availability themselves. Exported from `pyrxd.glyph`.
+
+#### Parallel pure-Python miner
+
+- `pyrxd.contrib.miner` — multi-process parallel miner that scales
+  the existing pure-Python mining loop across CPU cores using the
+  JSON-over-stdio external-miner protocol. No compiled extensions;
+  useful when a faster C/Rust miner isn't available.
+
+#### Mainnet golden-vector test infrastructure
+
+- Four new test classes pin every wire-format builder against real
+  on-chain bytes — the strongest interop assertion an SDK can carry:
+  - `TestFtLockingScriptMainnetGolden` (`tests/test_dmint_module.py`)
+    — 75-byte FT script vs RBG transfer `ac7f1f70…0ae4`.
+  - `TestNftLockingScriptMainnetGolden` (`tests/test_glyph.py`)
+    — 63-byte NFT singleton vs Glyph NFT `27390efa…be7e`.
+  - `TestCommitLockingScriptMainnetGolden`
+    (`tests/test_glyph_dmint.py`) — 75-byte commit script, both FT
+    and NFT branches, vs the GLYPH deploy `a443d9df…878b`.
+  - `TestCborPayloadMainnetGolden` (`tests/test_glyph.py`) — full
+    65,569-byte CBOR reveal payload incl. embedded PNG, vs GLYPH
+    reveal `b965b32d…9dd6` (fixture:
+    `tests/fixtures/glyph_reveal_cbor.bin`). Pins
+    `sha256d(payload) == commit_hash` linkage, decoder shape, and
+    `OP_PUSHDATA4` framing for payloads >65,535 bytes.
+
+#### V2 quarantine markers
+
+- `V2UnvalidatedWarning` — new `UserWarning` subclass; emitted by
+  every V2 dMint entry point. Silenceable with
+  `warnings.simplefilter("ignore", V2UnvalidatedWarning)`; escalable
+  to error with `warnings.simplefilter("error",
+  V2UnvalidatedWarning)` in CI. No V2 dMint contract has been
+  deployed to Radiant mainnet as of 0.5.1; the V2 code paths are
+  byte-equivalent-by-construction to V1 where they share bytecode
+  but have never been exercised against live consensus.
+- `build_dmint_v2_mint_preimage(...)` — V2 PoW preimage helper that
+  mirrors the V1 helper. Carries `V2UnvalidatedWarning`.
+
+#### Documentation
+
+- Migration guide: `docs/how-to/migrate-0.4-to-0.5.md`.
+- New tutorials: mint a Glyph NFT, mint a Glyph FT, mint from a V1
+  dMint contract on Radiant mainnet, inspect any Radiant transaction
+  in the browser, your first Radiant transaction.
+- New how-tos: scan an address for Glyphs, broadcast a Radiant
+  transaction, handle Radiant's BIP143 sighash quirks, verify an SPV
+  proof.
+- New concepts pages: V1 dMint mint mechanics, V1 dMint deploy,
+  external miner protocol (JSON-over-stdio subprocess contract),
+  Glyph inspect tool (structural match, not semantic correctness).
+- Design decision:
+  `docs/solutions/design-decisions/wave-protocol-deferred-until-consumer.md`
+  — WAVE name-claim protocol deferred until a concrete pyrxd
+  consumer needs it.
+
+### Changed
+
+- CI: cancel in-flight runs on push to the same branch / PR. Roughly
+  halves per-PR Actions minute spend.
+- CI: hash-pin `poetry==2.3.4` and `ruff==0.15.12` via
+  `pip-compile --generate-hashes` lock files under `ci/`. Each
+  workflow that previously ran `pip install poetry==2.3.4` now runs
+  `pip install -r ci/poetry-pin.txt --require-hashes`. Closes 3 of
+  the 5 open OpenSSF Scorecard / CodeQL `PinnedDependenciesID`
+  alerts (the remaining 2 are on the docs build's editable
+  `pip install -e .`, which physically cannot be hash-pinned).
+  See `ci/README.md` for the bump workflow.
+
+### Fixed
+
+- CodeQL note-severity alerts cleared: replaced the bare `import`
+  availability probe in `docs/inspect_static/inspect/glue.py` with
+  `importlib.util.find_spec` (closes `py/unused-import`); switched
+  internal re-exports in `src/pyrxd/glyph/builder.py` and
+  `src/pyrxd/cli/glyph_cmds.py` to PEP 484 explicit `X as X` form
+  (CodeQL doesn't honour `# noqa: F401` on those — the explicit
+  re-export form does close the alert); added unreachable
+  `raise AssertionError("unreachable: pytest.skip raises")` after
+  `pytest.skip` in `tests/test_ripemd160_fallback.py` (closes
+  `py/mixed-returns`).
+
+### Security
+
+- The 0.5.0 pre-release multi-reviewer audit's deferred items
+  (V2 quarantine, mainnet golden vectors for FT/NFT/commit/CBOR,
+  CodeQL note cleanup) are closed by this release. No new formal
+  audit was run for 0.5.1; changes are additive on top of audited
+  0.5.0 code and each touches a single area (script primitives,
+  test fixtures, CI config) with high in-PR review coverage.
+
 ## [0.5.0] — 2026-05-11
 
 ### Added

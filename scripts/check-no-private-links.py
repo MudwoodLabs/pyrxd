@@ -1,10 +1,22 @@
 #!/usr/bin/env python3
-"""Check that tracked markdown/rst files don't link to gitignored paths.
+"""Check that tracked markdown/rst files don't leak private paths.
 
-Catches the failure mode where AI-generated documentation (or careless
-manual edits) reference files in private directories like ``docs/design/``.
-Such links would be broken in any clone of the repo and leak the
-existence of private files via the link text.
+Two checks, both run on every invocation:
+
+1. **Private-path links** — a markdown/RST link whose target resolves
+   to a ``.gitignore``-matched path (e.g. ``docs/design/``). Such links
+   break in any clone and leak the existence of private files via the
+   link text.
+2. **Bare home-directory paths** — an absolute ``/home/<user>/`` or
+   ``/Users/<user>/`` path *anywhere* in the doc body: link, prose, or
+   code block. These leak the author's username and local layout,
+   break in every other clone, and — when they point into a sibling
+   project — leak that project's existence. Username-agnostic forms
+   like ``~/.pyrxd/config.toml`` are NOT flagged: that's the correct
+   way to document a home-relative path.
+
+Both catch the same failure mode: AI-generated documentation (or
+careless manual edits) referencing local-only paths.
 
 Usage
 -----
@@ -14,7 +26,7 @@ Usage
 Exit codes
 ----------
     0  no leaks found (or no tracked files to check)
-    1  one or more tracked files link to a gitignored path
+    1  one or more tracked files leak a private path (either check)
     2  invocation error (not in a git repo, dependencies missing, etc.)
 
 Design notes
@@ -32,6 +44,11 @@ Design notes
   ``[text](path)`` and bare ``](path)`` forms. URLs (``http://``,
   ``https://``, ``mailto:``) are skipped — only relative/absolute
   filesystem paths are checked
+- The home-path check deliberately does NOT flag ``~/...`` (tilde-home,
+  username-agnostic), ``/root/...`` (no username embedded), or
+  ``/tmp/...`` (scratch paths carry no username and are a normal way to
+  describe a throwaway clone or fixture dump). Only paths with a
+  concrete username — ``/home/<user>/`` or ``/Users/<user>/`` — leak
 """
 
 from __future__ import annotations
@@ -50,6 +67,24 @@ _REFERENCE_LINK_RE = re.compile(r"^\s*\[[^\]]+\]:\s+(\S+)", re.MULTILINE)
 # Match RST hyperlinks: `text <target>`_ and .. _name: target
 _RST_INLINE_RE = re.compile(r"`[^`]+\s+<([^>]+)>`_")
 _RST_TARGET_RE = re.compile(r"^\.\.\s+_[^:]+:\s+(\S+)", re.MULTILINE)
+
+# Match absolute home-directory paths with a *concrete username baked
+# in* — anywhere in prose, not just inside link syntax. These leak the
+# author's username and local directory layout, break in every other
+# clone, and (when they point into a sibling private project) leak that
+# project's existence. The link-target checks above only catch the
+# `](path)` form; this catches the rest. A ``file://`` prefix is
+# matched too, so ``file:///home/alice/...`` is caught.
+#
+# Matches: /home/<user>/..., /Users/<user>/...
+#
+# Deliberately does NOT match:
+#   - ~/... (tilde-home) — username-agnostic; the *correct* way to
+#     document a home-relative path like ``~/.pyrxd/config.toml``
+#   - /root/... — no username embedded; rare and not a personal leak
+#   - /tmp/... — scratch paths carry no username and are a normal way
+#     to describe a throwaway clone or fixture dump
+_HOME_PATH_RE = re.compile(r"(?:file://)?/(?:home|Users)/[^/\s]+/[^\s`)\"'<>]+")
 
 
 def git_ls_files(repo_root: Path) -> list[Path]:
@@ -106,6 +141,21 @@ def extract_links(content: str, suffix: str) -> list[str]:
     return links
 
 
+def find_home_paths(content: str) -> list[str]:
+    """Find absolute home-directory paths with a baked-in username.
+
+    Returns the matched path strings (with any ``file://`` prefix
+    intact, so the report shows exactly what's in the file). Unlike
+    the link-target checks, this scans the *whole* document body — a
+    leak in a fenced code block or a plain prose mention counts.
+
+    Only ``/home/<user>/`` and ``/Users/<user>/`` match; ``~/``,
+    ``/root/`` and ``/tmp/`` are intentionally not flagged (see the
+    module docstring for why).
+    """
+    return _HOME_PATH_RE.findall(content)
+
+
 def looks_like_url(target: str) -> bool:
     """Skip http/https/mailto/data/git URLs — only filesystem paths matter."""
     return target.startswith(("http://", "https://", "mailto:", "data:", "git@", "ftp://"))
@@ -158,9 +208,7 @@ def check_ignored(repo_root: Path, paths: list[Path]) -> set[Path]:
         check=False,  # exit 1 is normal (means "no ignored files in input")
     )
     if result.returncode not in (0, 1):
-        raise RuntimeError(
-            f"git check-ignore failed with exit code {result.returncode}: {result.stderr}"
-        )
+        raise RuntimeError(f"git check-ignore failed with exit code {result.returncode}: {result.stderr}")
     return {Path(line) for line in result.stdout.splitlines() if line}
 
 
@@ -199,6 +247,7 @@ def main() -> int:
         print(f"Scanning {len(docs)} tracked doc files for private-path links...")
 
     leaks: list[tuple[Path, str, Path]] = []  # (source_file, raw_target, resolved_path)
+    home_path_leaks: list[tuple[Path, str]] = []  # (source_file, matched_path)
 
     for doc in docs:
         full_path = repo_root / doc
@@ -208,6 +257,11 @@ def main() -> int:
             if args.verbose:
                 print(f"  skip {doc}: {exc}")
             continue
+
+        # Check 2: bare home-directory paths anywhere in the doc body.
+        # Runs regardless of whether the doc has any link syntax.
+        for matched in find_home_paths(content):
+            home_path_leaks.append((doc, matched))
 
         targets = extract_links(content, doc.suffix)
         if not targets:
@@ -233,7 +287,10 @@ def main() -> int:
             if resolved in ignored:
                 leaks.append((doc, raw_target, resolved))
 
+    failed = False
+
     if leaks:
+        failed = True
         print("error: tracked docs link to gitignored (private) paths:", file=sys.stderr)
         print("", file=sys.stderr)
         for source, target, resolved in leaks:
@@ -247,10 +304,34 @@ def main() -> int:
             "link. See docs/CONTRIBUTING.md for the docs-publication convention.",
             file=sys.stderr,
         )
+
+    if home_path_leaks:
+        failed = True
+        if leaks:
+            print("", file=sys.stderr)
+        print(
+            "error: tracked docs contain bare home-directory paths:",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        for source, matched in home_path_leaks:
+            print(f"  {source}", file=sys.stderr)
+            print(f"    path: {matched}", file=sys.stderr)
+            print("", file=sys.stderr)
+        print(
+            "An absolute /home/<user>/ or /Users/<user>/ path leaks the author's\n"
+            "username and local layout, breaks in every other clone, and if it\n"
+            "points into a sibling project leaks that project's existence.\n"
+            "Rewrite as a repo-relative path, a bare project/file reference, or a\n"
+            "username-agnostic ~/ path. See docs/CONTRIBUTING.md.",
+            file=sys.stderr,
+        )
+
+    if failed:
         return 1
 
     if args.verbose:
-        print(f"OK — {len(docs)} tracked doc files, no leaks to private paths.")
+        print(f"OK — {len(docs)} tracked doc files, no private-path links and no bare home-directory paths.")
     return 0
 
 

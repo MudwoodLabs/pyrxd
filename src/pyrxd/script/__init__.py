@@ -12,6 +12,8 @@ from __future__ import annotations
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "BareMultisig": ("pyrxd.script.type", "BareMultisig"),
+    "CsvKind": ("pyrxd.script.timelock", "CsvKind"),
+    "LOCKTIME_THRESHOLD": ("pyrxd.script.timelock", "LOCKTIME_THRESHOLD"),
     "OpReturn": ("pyrxd.script.type", "OpReturn"),
     "P2PK": ("pyrxd.script.type", "P2PK"),
     "P2PKH": ("pyrxd.script.type", "P2PKH"),
@@ -19,6 +21,15 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "ScriptChunk": ("pyrxd.script.script", "ScriptChunk"),
     "ScriptTemplate": ("pyrxd.script.type", "ScriptTemplate"),
     "Unknown": ("pyrxd.script.type", "Unknown"),
+    "build_csv_sequence": ("pyrxd.script.timelock", "build_csv_sequence"),
+    "build_p2pkh_with_cltv_script": (
+        "pyrxd.script.timelock",
+        "build_p2pkh_with_cltv_script",
+    ),
+    "build_p2pkh_with_csv_script": (
+        "pyrxd.script.timelock",
+        "build_p2pkh_with_csv_script",
+    ),
 }
 
 __all__ = sorted(_LAZY_EXPORTS.keys())
