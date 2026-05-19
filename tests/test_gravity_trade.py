@@ -837,3 +837,192 @@ class TestResolveBtcTxHeight:
         assert int(height) == 12345
         btc.get_tip_height.assert_not_awaited()
         btc.get_raw_tx.assert_not_awaited()
+
+
+# ---------------------------------------------------------------------------
+# End-to-end P2PKH integration: real SPV proof + finalize tx assembly
+#
+# These tests close the loop on P2PKH support by exercising the *real*
+# SpvProofBuilder pipeline (no mocking the verifier) against a synthetic
+# P2PKH-paying BTC transaction, then running build_finalize_tx on the
+# resulting verified proof. Together they demonstrate the full
+# Maker-locks-RXD -> Taker-pays-BTC-to-P2PKH -> finalize-on-Radiant flow
+# works end-to-end with the shipping sentinel covenant artifact.
+#
+# Pre-mined PoW headers are loaded from tests/fixtures/spv_synthetic_headers.json
+# (the same fixture pre-mined for TestSpvProofBuilder in test_spv.py).
+# ---------------------------------------------------------------------------
+
+
+def _p2pkh_output_bytes(value_sats: int, hash160: bytes) -> bytes:
+    """Build a serialized P2PKH output: value(8 LE) + len(1) + script(25)."""
+    assert len(hash160) == 20
+    script = b"\x76\xa9\x14" + hash160 + b"\x88\xac"  # OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
+    return value_sats.to_bytes(8, "little") + bytes([len(script)]) + script
+
+
+def _build_p2pkh_spv_proof(hash160: bytes, satoshis: int):
+    """Build a fully-verified SpvProof for a synthetic P2PKH payment.
+
+    Reuses the pre-mined PoW headers from
+    tests/fixtures/spv_synthetic_headers.json (the test_spv.py fixture).
+    Returns the verified SpvProof.
+    """
+    from pyrxd.spv.proof import CovenantParams, SpvProofBuilder
+    from pyrxd.spv.pow import hash256
+
+    # Minimal raw tx: 1 input (any prevout, empty scriptSig), 1 P2PKH output.
+    payment_output = _p2pkh_output_bytes(satoshis, hash160)
+    raw_tx = (
+        b"\x01\x00\x00\x00"      # version 1
+        + b"\x01"                 # 1 input
+        + b"\x00" * 32            # prev txid (any)
+        + b"\xff\xff\xff\xff"     # prev vout
+        + b"\x00"                 # empty scriptSig
+        + b"\xff\xff\xff\xff"     # sequence
+        + b"\x01"                 # 1 output
+        + payment_output
+        + b"\x00\x00\x00\x00"     # locktime
+    )
+    assert len(raw_tx) > 64, "raw_tx must be > 64 bytes (Merkle forgery defense)"
+
+    txid_le = hash256(raw_tx)
+    txid_be_hex = txid_le[::-1].hex()
+    # Output is at: 4(version) + 1(input count) + 36(prevout) + 1(scriptSig len) + 0(scriptSig) + 4(sequence) + 1(output count)
+    output_offset = 4 + 1 + 36 + 1 + 0 + 4 + 1
+    assert raw_tx[output_offset : output_offset + 8] == satoshis.to_bytes(8, "little")
+
+    # Synthetic Merkle proof: tx at position 1, single sibling (coinbase at pos 0).
+    sibling_le = b"\xab" * 32
+    sibling_be_hex = sibling_le[::-1].hex()
+    merkle_root_le = hash256(sibling_le + txid_le)
+
+    anchor = b"\x99" * 32
+    # Load the pre-mined header for (satoshis, hash160) from the shared fixture.
+    import json
+    from pathlib import Path
+
+    fixture_path = Path(__file__).parent / "fixtures" / "spv_synthetic_headers.json"
+    fixture = json.loads(fixture_path.read_text())
+    header_hex: str | None = None
+    for entry in fixture.get("fixtures", []):
+        if entry.get("satoshis") == satoshis and entry.get("hash20_hex") == hash160.hex():
+            header_hex = entry["header_hex"]
+            break
+    if header_hex is None:
+        pytest.skip(
+            f"No pre-mined PoW header in fixture for satoshis={satoshis}, "
+            f"hash160={hash160.hex()}. Regenerate via "
+            f"scripts/gen-spv-test-fixtures.py."
+        )
+
+    # Sanity: the fixture header's merkle root must match our synthetic tx.
+    header = bytes.fromhex(header_hex)
+    assert header[36:68] == merkle_root_le, (
+        "fixture header merkle root does not match synthetic tx — fixture is stale"
+    )
+
+    params = CovenantParams(
+        btc_receive_hash=hash160,
+        btc_receive_type="p2pkh",
+        btc_satoshis=satoshis,
+        chain_anchor=anchor,
+        anchor_height=100_000,
+        merkle_depth=1,
+    )
+    builder = SpvProofBuilder(params)
+    proof = builder.build(
+        txid_be=txid_be_hex,
+        raw_tx_hex=raw_tx.hex(),
+        headers_hex=[header_hex],
+        merkle_be=[sibling_be_hex],
+        pos=1,
+        output_offset=output_offset,
+    )
+    return proof
+
+
+class TestGravityTradeP2PKH:
+    """End-to-end P2PKH path: real SPV proof + finalize tx assembly.
+
+    Closes the loop on the spike finding in
+    docs/brainstorms/2026-05-19-gravity-p2pkh-spike-findings.md — the
+    shipping sentinel covenant supports all four BTC output types via
+    in-script dispatch on btcReceiveType, but the only path previously
+    exercised end-to-end (real SPV builder + real finalize-tx build) was
+    P2WPKH. These tests demonstrate P2PKH works end-to-end on the same
+    code path.
+    """
+
+    HASH160 = b"\x77" * 20  # matches the pre-mined fixture entries
+    SATOSHIS = 5000
+
+    def test_real_spv_proof_p2pkh_builds(self):
+        """SpvProofBuilder.build() produces a valid SpvProof for a P2PKH payment."""
+        proof = _build_p2pkh_spv_proof(self.HASH160, self.SATOSHIS)
+        assert proof.covenant_params.btc_receive_type == "p2pkh"
+        assert proof.covenant_params.btc_receive_hash == self.HASH160
+        assert proof.covenant_params.btc_satoshis == self.SATOSHIS
+        # The proof's raw_tx should be the witness-stripped form (here: identical,
+        # since the synthetic tx is legacy-only with no segwit marker).
+        assert b"\x76\xa9\x14" + self.HASH160 + b"\x88\xac" in proof.raw_tx
+
+    def test_real_p2pkh_proof_drives_finalize_tx(self):
+        """build_finalize_tx accepts a real P2PKH SpvProof and produces a valid tx."""
+        proof = _build_p2pkh_spv_proof(self.HASH160, self.SATOSHIS)
+
+        # Use the same synthetic claimed_redeem_hex pattern as the existing
+        # P2WPKH tests in test_gravity.py::TestBuildFinalizeTx — the redeem
+        # script bytes are not exercised by finalize-tx assembly (only the
+        # length is used for serialization), so the same fake works here.
+        result = build_finalize_tx(
+            spv_proof=proof,
+            claimed_redeem_hex="ab" * 50,
+            funding_txid="cd" * 32,
+            funding_vout=0,
+            funding_photons=1_000_000,
+            to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            fee_sats=1_000,
+        )
+
+        # Functional assertions
+        assert isinstance(result, FinalizeResult)
+        assert result.tx_hex
+        bytes.fromhex(result.tx_hex)  # valid hex
+        assert len(result.txid) == 64
+        assert result.output_photons == 999_000
+        assert result.fee_sats == 1_000
+
+    def test_real_p2pkh_finalize_scriptsig_contains_p2pkh_evidence(self):
+        """The serialized finalize tx must embed the P2PKH-shape raw_tx in scriptSig.
+
+        The covenant's on-chain verification will parse the rawTx push from the
+        scriptSig and re-check the output type. This test confirms the raw_tx
+        bytes carrying a P2PKH script (76 a9 14 <hash> 88 ac) survive into the
+        finalize tx unchanged.
+        """
+        proof = _build_p2pkh_spv_proof(self.HASH160, self.SATOSHIS)
+        result = build_finalize_tx(
+            spv_proof=proof,
+            claimed_redeem_hex="ab" * 50,
+            funding_txid="cd" * 32,
+            funding_vout=0,
+            funding_photons=1_000_000,
+            to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+            fee_sats=1_000,
+        )
+        raw = bytes.fromhex(result.tx_hex)
+        # The P2PKH script prefix + hash160 + suffix must appear verbatim in
+        # the serialized finalize tx (it's part of the raw_tx push in scriptSig).
+        p2pkh_script = b"\x76\xa9\x14" + self.HASH160 + b"\x88\xac"
+        assert p2pkh_script in raw
+
+    def test_p2pkh_offer_carries_correct_receive_type(self):
+        """A GravityOffer built with btc_receive_type='p2pkh' round-trips correctly.
+
+        Demonstrates the Python factory path documented as missing in the
+        stale gravity.md Axis 2 table is in fact working.
+        """
+        offer = make_offer(btc_receive_type="p2pkh", btc_receive_hash=self.HASH160)
+        assert offer.btc_receive_type == "p2pkh"
+        assert offer.btc_receive_hash == self.HASH160
