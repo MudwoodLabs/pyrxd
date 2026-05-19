@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
+import pyrxd.constants
+import pyrxd.hd.wallet
 from pyrxd.hd.wallet import _GAP_LIMIT, AddressRecord, HdWallet
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
 from pyrxd.security.errors import ValidationError
@@ -177,6 +180,94 @@ class TestCoinTypeKwarg:
         w_a1 = HdWallet.from_mnemonic(MNEMONIC, coin_type=0, account=1)
         assert w_a0.coin_type == 0 == w_a1.coin_type
         assert w_a0._derive_address(0, 0) != w_a1._derive_address(0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Env-var override (RXD_PY_SDK_BIP44_DERIVATION_PATH) — the pre-kwarg
+# mechanism. The kwarg added by #17 is the preferred API but the env
+# var still exists in pyrxd.constants and is parsed at module import
+# in pyrxd.hd.wallet._RADIANT_PATH. These tests pin the override
+# semantics so a silent regression in the env-var path (which Photonic
+# users may still set in their shell rc) is caught before release.
+#
+# Vector provenance: addresses captured from this SDK on 2026-05-03,
+# verified against the same set used by TestCoinTypeKwarg. The 0/512
+# vectors match those tests' EXPECTED_0 / EXPECTED_512 by design.
+# ---------------------------------------------------------------------------
+
+
+def _reload_wallet_with_path(path: str) -> type[HdWallet]:
+    """Reload pyrxd.hd.wallet under a fresh BIP44 path env var.
+
+    _RADIANT_PATH is parsed at import time, so changing the env var
+    after import is a no-op without an explicit reimport. Tests that
+    exercise overrides must reload both modules in this exact order:
+    constants first (re-reads os.environ), then hd.wallet (re-runs
+    _parse_radiant_path).
+    """
+    import os
+
+    os.environ["RXD_PY_SDK_BIP44_DERIVATION_PATH"] = path
+    importlib.reload(pyrxd.constants)
+    importlib.reload(pyrxd.hd.wallet)
+    return pyrxd.hd.wallet.HdWallet
+
+
+class TestBip44PathOverride:
+    LEGACY_236_EXTERNAL_0 = "1K6LZdwpKT5XkEZo2T2kW197aMXYbYMc4f"  # BSV coin type
+    LEGACY_0_EXTERNAL_0 = "1LqBGSKuX5yYUonjxT5qGfpUsXKYYWeabA"  # Photonic-verified
+
+    @pytest.fixture(autouse=True)
+    def _restore_default_path(self):
+        # Snapshot, run the test, restore. Other tests in this file
+        # depend on the 512' default — leaking a 236' override across
+        # tests would silently break them.
+        import os
+
+        prior = os.environ.get("RXD_PY_SDK_BIP44_DERIVATION_PATH")
+        yield
+        if prior is None:
+            os.environ.pop("RXD_PY_SDK_BIP44_DERIVATION_PATH", None)
+        else:
+            os.environ["RXD_PY_SDK_BIP44_DERIVATION_PATH"] = prior
+        importlib.reload(pyrxd.constants)
+        importlib.reload(pyrxd.hd.wallet)
+
+    def test_override_to_legacy_bsv_coin_type_changes_address(self):
+        cls = _reload_wallet_with_path("m/44'/236'/0'")
+        w = cls.from_mnemonic(MNEMONIC)
+        assert w._derive_address(0, 0) == self.LEGACY_236_EXTERNAL_0
+
+    def test_override_to_rxdpy_path_changes_address(self):
+        cls = _reload_wallet_with_path("m/44'/0'/0'")
+        w = cls.from_mnemonic(MNEMONIC)
+        assert w._derive_address(0, 0) == self.LEGACY_0_EXTERNAL_0
+
+    def test_override_paths_produce_distinct_addresses(self):
+        # Belt-and-braces against the failure mode where override is
+        # silently ignored — if 512/236/0 all yielded the same address
+        # the kwarg golden-vector tests above could still pass under a
+        # buggy parser that hardcoded one path.
+        defaults = HdWallet.from_mnemonic(MNEMONIC)._derive_address(0, 0)
+        bsv = _reload_wallet_with_path("m/44'/236'/0'").from_mnemonic(MNEMONIC)._derive_address(0, 0)
+        rxdpy = _reload_wallet_with_path("m/44'/0'/0'").from_mnemonic(MNEMONIC)._derive_address(0, 0)
+        assert len({defaults, bsv, rxdpy}) == 3
+
+    def test_malformed_override_path_raises(self):
+        import os
+
+        os.environ["RXD_PY_SDK_BIP44_DERIVATION_PATH"] = "garbage"
+        importlib.reload(pyrxd.constants)
+        with pytest.raises(ValueError, match="malformed"):
+            importlib.reload(pyrxd.hd.wallet)
+
+    def test_non_integer_coin_type_raises(self):
+        import os
+
+        os.environ["RXD_PY_SDK_BIP44_DERIVATION_PATH"] = "m/44'/notanumber'/0'"
+        importlib.reload(pyrxd.constants)
+        with pytest.raises(ValueError, match="non-integer coin type"):
+            importlib.reload(pyrxd.hd.wallet)
 
 
 # ---------------------------------------------------------------------------
