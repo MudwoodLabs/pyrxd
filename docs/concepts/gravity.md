@@ -1,8 +1,11 @@
 # Gravity: cross-chain atomic swaps
 
-**Audience:** developers integrating cross-chain BTC↔RXD swaps via
-`pyrxd.gravity`, and anyone who's seen the phrase "sentinel-artifact
-path mainnet-proven" and wondered what it actually means.
+**Audience:** developers integrating cross-chain swaps via
+`pyrxd.gravity` between RXD and a SHA-256d UTXO chain (BTC is
+mainnet-proven; BCH is supported; see § Supported counterparty
+chains for the full picture), and anyone who's seen the phrase
+"sentinel-artifact path mainnet-proven" and wondered what it
+actually means.
 
 **Status:** sentinel-path swaps proven on mainnet. Other covenant
 variants are experimental and not yet validated for real funds.
@@ -32,6 +35,53 @@ The conceptual lineage runs through Bitcoin's HTLCs (Lightning), the
 Decred / Litecoin atomic swap work, and SPV-anchored DeFi
 constructions on Bitcoin Cash. Gravity is the Radiant-specific
 expression of that pattern.
+
+## Supported counterparty chains
+
+Gravity's SPV verifier is chain-agnostic for **SHA-256d UTXO chains**
+by deliberate design. The verifier checks proof-of-work as
+`hash < target` against the header's own nBits — it does not compute
+or validate difficulty algorithm transitions. As long as the maker
+commits to the right `expected_nbits` at offer time, the verifier
+accepts any chain of headers satisfying those nBits.
+
+| Chain | Counterparty role | Status |
+|---|---|---|
+| **Bitcoin (BTC)** | proven on mainnet | ✅ shipping |
+| **Bitcoin Cash (BCH)** | verifier accepts real mainnet headers | ✅ ready; integration tests in `tests/test_spv.py::TestBchMainnetFixtures` |
+| **Bitcoin SV (BSV)** | same SHA-256d format | ⚠️ untested; should work with no code changes |
+| Other SHA-256d UTXO chains | same SHA-256d format | ⚠️ untested |
+
+What "ready" means for BCH:
+
+- Real BCH mainnet block headers (840000 + 840001) pass the
+  unmodified `verify_header_pow` and `verify_chain` (with
+  `chain_anchor` binding).
+- The shipping `maker_covenant_flat_12x20_sentinel_all` covenant
+  supports BCH-style payments (P2PKH is the primary type since BCH
+  has no segwit; P2SH is the secondary type for multisig flows).
+- The `MempoolSpaceSource` data-source class accepts a configurable
+  `base_url`, so a caller can construct
+  `MempoolSpaceSource(base_url="https://mempool.cash/api")` or a
+  similar BCH-side explorer endpoint without code changes. Live API
+  compatibility has not been verified end-to-end.
+- BCH cashaddr encoding is wallet-side, not Gravity-side. The maker
+  provides raw `hash160` bytes; address-format handling stays at
+  the wallet layer.
+
+What's **not** supported, and would require more than a parameter
+change:
+
+- **Non-SHA-256d chains** (Litecoin/Dogecoin use Scrypt; Zcash uses
+  Equihash; Monero uses RandomX). The SPV verifier's PoW check
+  hardcodes SHA-256d. Verifying these chains' PoW on Radiant would
+  require new RadiantScript opcodes (a consensus extension) or a
+  different cross-chain protocol altogether (such as HTLC + adaptor
+  signatures, which doesn't require on-chain PoW verification).
+
+The asymmetric design of Gravity (counterparty chain doesn't need to
+know Gravity exists; only Radiant verifies the proof) is preserved
+for all supported chains.
 
 ## What a covenant is
 
