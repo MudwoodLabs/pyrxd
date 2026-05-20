@@ -64,7 +64,7 @@ fee_in.locking_script = Script(bytes.fromhex(FEE_SPK_HEX))
 
 # --- outputs: covenant (FT_AMOUNT, carries ref) + change -------------------
 # covenant output value MUST equal FT_AMOUNT (1 photon = 1 FT unit).
-FEE = 5_000_000  # generous, ~10k/byte for a ~400B tx
+FEE = 8_000_000  # ~15.5k/byte for the ~514B tx; effective relay rate is 10k/byte
 change_val = (FT_AMOUNT + FEE_AMT) - FT_AMOUNT - FEE
 assert change_val > 546, f"change too small: {change_val}"
 change_spk = b"\x76\xa9\x14" + pkh + b"\x88\xac"

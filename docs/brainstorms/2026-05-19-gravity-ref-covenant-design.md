@@ -338,6 +338,130 @@ determine whether ANY P2SH-wrapped FT covenant can conserve, OR whether
 the swap.ts "pre-signed atomic, FT stays FT-shaped" model is the only
 viable one. The covenant design depends entirely on which is true.
 
+## ✅ RESOLVED (2026-05-20) — read the consensus source; the DEEPER finding's diagnosis was WRONG
+
+Read Radiant Core's actual induction-rule algorithm (local source
+`~/apps/Radiant-Core`, v3.0.0):
+
+- `ReferenceParser::validateTransactionReferenceOperations`
+  (`src/validation.h:991`)
+- `CScript::GetPushRefs` (`src/script/script.cpp:555`)
+
+**What the rule actually does:** it extracts refs by *linearly scanning
+the raw scriptPubKey bytes* for the ref opcodes (0xd0 PUSHINPUTREF,
+0xd1 REQUIREINPUTREF, 0xd2/0xd3 DISALLOW…, 0xd8 PUSHINPUTREFSINGLETON),
+skipping pushdata operands but otherwise **purely syntactic** — it does
+NOT understand the semantics of the script. The conservation rule
+(`validatePushRefRule`, validation.h:919): every push/require ref in any
+OUTPUT must appear in some INPUT (set_difference outputs−inputs must be
+empty); singleton refs are checked separately against the input
+singleton set (validation.h:1063). The FT *amount* conservation
+(`codeScriptValueSum`) is a SEPARATE, interpreter-side check
+(introspection opcodes) — it is **not** what emits this reject string.
+
+**The actual root cause (verified by walking the 264-byte covenant spk
+the same way GetPushRefs does):** the covenant embeds the literal
+FT-epilogue bytes (`…dec0e9aa76e378e4a269e69d`) twice as
+`OP_OUTPUTBYTECODE` comparison data. A `0xd8` byte at **offset 224**,
+sitting inside that embedded template data, gets parsed as a real
+`OP_PUSHINPUTREFSINGLETON` consuming the next 36 bytes as a **phantom
+ref** `343c4872…269e69d7e00`. That phantom singleton is in no input →
+`singletonRefSatisfied = false` → reject. The legitimate
+`OP_PUSHINPUTREF <REF>` at offset 0 (matching the FT input) is fine; the
+phantom is the killer.
+
+Re-confirmed live: `testmempoolaccept` on the recorded
+`.funding_info.json` hex against the mainnet node (`ssh tr`, v2.3.0,
+block 430721) reproduced the exact reject string.
+
+**Corrections to the DEEPER finding above:**
+- It is NOT a `codeScriptValueSum` / FT-code-script-welding problem.
+  That diagnosis was a plausible-sounding guess; the source disproves it.
+- It is NOT P2SH-vs-bare. The failing tx was BARE (spk starts `d0`,
+  264 bytes — verified). The brief's "P2SH-wrapped" framing was wrong.
+- The Photonic `vault.ts` "unresolved contradiction" is moot for our
+  purposes: their P2SH funding hides ALL ref opcodes from the parser
+  (so a P2SH FT vault funds with zero output refs and would itself fail
+  conservation differently) — but our bare covenant's problem is the
+  phantom ref, which is fixable.
+
+**Why this is good news:** the blocker is a **script-encoding** problem,
+not an architecture dead-end. An FT *can* be held in a bare ref-bearing
+covenant — provided the covenant scriptPubKey contains **no byte
+sequence that the linear parser will mis-read as a ref opcode followed
+by 36 consumable bytes** at any position its pushdata-skipping actually
+reaches.
+
+**Mitigations to evaluate next (in order of preference):**
+1. **Build the embedded expected-bytecode via `OP_CAT` from fragments**
+   so that no `0xd0`/`0xd8` (and `0xd1`–`0xd3`) byte ever lands on a
+   scan boundary as a bare opcode — i.e. keep every such byte *inside* a
+   pushdata operand the parser skips. This is the surgical fix; the
+   phantom at offset 224 is in raw script position, not behind a push.
+2. Restructure the comparison so the FT epilogue is never present as
+   raw script bytes (e.g. compare a hash of expected bytecode rather
+   than the bytecode itself, if introspection allows
+   `OP_OUTPUTBYTECODE OP_HASH256 <h> OP_EQUAL`).
+3. Only if 1–2 fail: reconsider whether the settlement output must be
+   epilogue-shaped inside the covenant at all.
+
+**Next concrete step:** rebuild `build_covenant.py` so the embedded
+template bytes are emitted as push-wrapped data, re-scan the resulting
+spk with the GetPushRefs walk (must show exactly ONE ref = the FT ref),
+then re-run the funding `testmempoolaccept`. Caveat to close first:
+local source is v3.0.0 but the live node is v2.3.0 — confirm
+ReferenceParser is unchanged between the two tags before trusting the
+walk as ground truth.
+
+## ✅✅ ON-CHAIN CONFIRMATION (2026-05-20) — TWO layers, both now understood
+
+After the layer-1 fix (hash-compare covenant, no embedded epilogue bytes
+→ phantom ref gone), I re-ran the funding `testmempoolaccept` on the
+mainnet node. Two more facts surfaced, both verified:
+
+1. **The spike used the wrong ref.** A Radiant FT's ref is its **genesis
+   outpoint** (the commit/mint origin), which persists across transfers
+   — NOT the current UTXO's txid. The on-chain FT at `57296874…:0`
+   carries ref `1d5cc8…098c:0` = the commit tx `8c09738386d84132…:0`,
+   not `57296874…`. The covenant must declare the genesis ref. Fixed.
+
+2. **There is a SECOND gate, and it is the real architectural one.** With
+   the correct ref and a fee above 10k photons/byte, the reject advanced
+   from `…reference-operations` → `min relay fee not met` → finally
+   `mandatory-script-verify-flag-failed (Script failed an
+   OP_NUMEQUALVERIFY operation)`. That last failure is the **FT's own
+   conservation epilogue executing at spend time** — `…dec0e9aa76e378…`
+   contains `OP_CODESCRIPTHASHVALUESUM_UTXOS` (`e3`) /
+   `OP_CODESCRIPTHASHVALUESUM_OUTPUTS` (`e4`) and a final
+   `OP_NUMEQUALVERIFY`. Per `interpreter.cpp:2215`
+   (`getCodeScriptHashValueSumOutputs`), it sums photons of **outputs
+   whose code-script HASH matches the FT's**. Moving the FT into a
+   covenant output (whose code-script ≠ the FT epilogue) yields
+   outputs-sum 0 ≠ inputs-sum 100,000 → fail.
+
+**So the DEEPER finding's conclusion was right after all** (the FT is
+welded to its code-script) — it was just attributed to the wrong reject
+string. The reference-induction rule (layer 1) and the
+`codeScriptHashValueSum` epilogue (layer 2) are **independent gates**.
+Fixing layer 1 was necessary but not sufficient.
+
+**What this means for the design (the inversion is now mandatory, not
+optional):** you cannot hold an FT inside a foreign swap covenant. The
+settlement output must itself be **FT-code-script-shaped** so the FT's
+epilogue conserves. The swap condition has to be expressed either:
+- as a covenant that gates the *spend path* of a normal FT UTXO (the
+  covenant key/condition is what the FT's P2PKH-prefix checks), re-emitting
+  the exact FT code-script on settlement; or
+- via the pre-signed-atomic model (Photonic `swap.ts`): the FT stays
+  FT-shaped at a swap sub-address, atomicity from SIGHASH partial sigs —
+  no holding covenant at all.
+
+This needs a genuine redesign + fresh divergent-review pass before any
+bytecode. The hash-compare covenant and the phantom-ref/genesis-ref fixes
+are committed on `feat/gravity-ref-ft-covenant-spike`; they remain useful
+as the *output-validation* half of the inverted design. The test FT
+(`57296874…:0`, 100k units) is UNSPENT — every probe was a dry-run.
+
 ---
 
 **Single review question this doc must survive:** *what does shipping

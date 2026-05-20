@@ -1,61 +1,44 @@
 pragma radiantscript ^0.1.0;
 
-// GravityFtReleaseSpike — Radiant-side-only spike of the ref-bearing
-// Gravity swap covenant. NO BTC/SPV half yet. Proves the three panel-
-// mandated hardening constraints compile and enforce on a real spend:
-//   1. output-count clamp        (no extra attacker-controlled outputs)
-//   2. exact FT amount to dest   (no value-splitting / short-change)
-//   3. single-ref pass-through   (no multi-ref smuggling)
+// GravityFtReleaseSpike v2 — phantom-ref-free covenant.
+// The expected FT release output is verified by comparing hash256 of the
+// output's lockingBytecode against a precomputed hash, NOT by embedding the
+// expected script (which would splice the ref's 0xd8 byte into the covenant
+// scriptPubKey and be misparsed by consensus as OP_PUSHINPUTREFSINGLETON —
+// a phantom ref that fails token conservation). The ref appears ONLY as the
+// OP_PUSHINPUTREF operand; the expected-script bytes live only inside a hash.
 //
-// Structure follows the rxdc ^0.1.0 grammar: a main function body holds
-// the shared preamble + hardening; the return{} block holds the two
-// spend branches (settle -> taker, forfeit -> maker).
+//   settle  -> release FT to taker  (EXPECTED_TAKER_FT_HASH)
+//   forfeit -> maker reclaims after DEADLINE (EXPECTED_MAKER_FT_HASH)
 //
-// Compiled with the local rxdc (stamps "rxdc 0.1.0"). NOT validated
-// on-chain yet — the testmempoolaccept negative-case proofs gate that.
+// Maker computes each hash once per offer:
+//   EXPECTED_*_FT_HASH = hash256( build_ft_locking_script(dest_pkh, REF) )
 
 contract GravityFtReleaseSpike(
-    bytes36 REF,            // FT ref being sold (36B wire form)
-    int AMOUNT,             // exact FT units (== photons) to deliver
-    bytes20 TAKER_PKH,      // taker's P2PKH hash (settle destination)
-    bytes20 MAKER_PKH,      // maker's P2PKH hash (forfeit destination)
-    int DEADLINE            // locktime after which forfeit is allowed
+    bytes36 constant $REF,          // FT ref being sold (raw OP_PUSHINPUTREF operand)
+    int AMOUNT,                     // exact FT units (== photons) to deliver
+    bytes32 EXPECTED_TAKER_FT_HASH, // hash256 of the taker-destination FT script
+    bytes20 MAKER_PKH,              // maker key (forfeit auth)
+    bytes32 EXPECTED_MAKER_FT_HASH, // hash256 of the maker-destination FT script
+    int DEADLINE                    // locktime after which forfeit is allowed
 )
 function () {
-    // Shared preamble: the locked ref must flow through this spend, and
-    // the hardening that is identical for both branches.
-    bytes36 ref = pushInputRef(REF);
-
-    // Fix 1: exactly one output — no attacker-controlled siblings.
-    require(tx.outputs.length == 1);
-    // Fix 3: the sold ref lands on exactly one output.
-    require(tx.outputs.refOutputCount(ref) == 1);
-    // Fix 2: exact FT value out under this ref == the locked amount.
-    require(tx.outputs.refValueSum(ref) == AMOUNT);
+    // Shared hardening (identical for both branches):
+    bytes36 ref = pushInputRef($REF);
+    require(tx.outputs.length == 1);                 // output-count clamp
+    require(tx.outputs.refOutputCount(ref) == 1);    // single ref
+    require(tx.outputs.refValueSum(ref) == AMOUNT);  // exact FT amount
 
     return {
-        // Settlement: release the FT to the taker. (BTC-payment proof
-        // gate is added in the full covenant; the sig keeps the spike
-        // tx well-formed.)
         settle(sig s, pubkey pk) {
             require(checkSig(s, pk));
-            bytes ftScript =
-                0x76a914 + TAKER_PKH + 0x88ac
-                + 0xbdd0 + REF
-                + 0xdec0e9aa76e378e4a269e69d;
-            require(tx.outputs[0].lockingBytecode == ftScript);
+            require(hash256(tx.outputs[0].lockingBytecode) == EXPECTED_TAKER_FT_HASH);
         },
-
-        // Forfeit: maker reclaims after the deadline.
         forfeit(sig makerSig, pubkey makerPk) {
             require(hash160(makerPk) == MAKER_PKH);
             require(checkSig(makerSig, makerPk));
             require(tx.time >= DEADLINE);
-            bytes ftScript =
-                0x76a914 + MAKER_PKH + 0x88ac
-                + 0xbdd0 + REF
-                + 0xdec0e9aa76e378e4a269e69d;
-            require(tx.outputs[0].lockingBytecode == ftScript);
+            require(hash256(tx.outputs[0].lockingBytecode) == EXPECTED_MAKER_FT_HASH);
         }
-    }
+    };
 }
