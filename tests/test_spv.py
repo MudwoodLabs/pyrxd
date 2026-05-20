@@ -245,6 +245,137 @@ class TestMainnetFixtures:
         assert root == header[36:68]
 
 
+# --------------------------------------------------------------------------- BCH mainnet fixtures
+
+# Real BCH mainnet block 840000 + 840001 headers, sourced from haskoin.com/bch
+# API on 2026-05-19. BCH headers are byte-identical in format to BTC headers
+# (80 bytes: version + prevhash + merkleroot + time + bits + nonce, all LE
+# except hashes which are BE-display reversed to LE on the wire) — and use
+# the same SHA-256d PoW. These fixtures demonstrate the existing SPV verifier
+# accepts real BCH mainnet headers without modification, closing out the
+# Phase 2.1 spike finding (the verifier is chain-agnostic for SHA-256d UTXO
+# chains).
+#
+# BCH 840000 BE hash: 000000000000000000b3cfd73dbd87c5e6cae26d89a5956ee78193733f61340e
+# BCH 840001 BE hash: 000000000000000000e782c9c56bfb1d4f03c44374215a3729338cb9fe60bb21
+BCH_BLOCK_840000 = (
+    "00e0012094e6544f1722e1334febbdc91ef3f72e9589970b527da300000000000000"
+    "00000d63386da1b39df5f4e962dcbc1b2bd105b2da298313ba621f7e1834d28d9246f"
+    "bdb0d66fb980118afb88c0e"
+)
+BCH_BLOCK_840001 = (
+    "000000200e34613f739381e76e95a5896de2cae6c587bd3dd7cfb3000000000000000"
+    "000567d79f4090127afb6b0b58e471cf4217f0ebf52650adb20e3e17f3a13044f367b"
+    "de0d66ea9a01186abe35f6"
+)
+
+
+class TestBchMainnetFixtures:
+    """Byte-for-byte tests against real BCH mainnet blocks 840000 and 840001.
+
+    These tests close out the Phase 2.1 spike finding documented in
+    docs/brainstorms/2026-05-19-gravity-bch-spike-findings.md: the existing
+    SPV verifier and Gravity covenant are already chain-agnostic for
+    SHA-256d UTXO chains. BCH and BTC headers share the exact same 80-byte
+    structure and SHA-256d PoW; the verifier doesn't compute or validate
+    difficulty (it only confirms hash < target derived from the header's
+    own nBits), so BCH's aserti3-2d DAA vs. BTC's epoch retargeting makes
+    no difference to it.
+
+    Notably, BCH 840000 and BTC 840000 are unrelated blocks at the same
+    height on different chains, with different version bits, nBits, and
+    merkleroots — yet both pass the same verifier with no changes.
+    """
+
+    BCH_840000_BE_HASH = "000000000000000000b3cfd73dbd87c5e6cae26d89a5956ee78193733f61340e"
+    BCH_840001_BE_HASH = "000000000000000000e782c9c56bfb1d4f03c44374215a3729338cb9fe60bb21"
+    BCH_839999_BE_HASH = "000000000000000000a37d520b9789952ef7f31ec9bdeb4f33e122174f54e694"
+
+    def test_bch_block_840000_pow_valid(self) -> None:
+        """Real BCH mainnet block 840000 must pass the SPV verifier's PoW check unmodified."""
+        header = bytes.fromhex(BCH_BLOCK_840000)
+        hash_le = verify_header_pow(header)
+        assert len(hash_le) == 32
+        hash_be = hash_le[::-1].hex()
+        assert hash_be == self.BCH_840000_BE_HASH
+
+    def test_bch_block_840001_pow_valid(self) -> None:
+        """Real BCH mainnet block 840001 must pass the SPV verifier's PoW check unmodified."""
+        header = bytes.fromhex(BCH_BLOCK_840001)
+        hash_le = verify_header_pow(header)
+        hash_be = hash_le[::-1].hex()
+        assert hash_be == self.BCH_840001_BE_HASH
+
+    def test_bch_block_840000_tampered_nonce_fails(self) -> None:
+        """Tampered BCH 840000 (zero'd nonce) must fail PoW. Sanity check that the
+        verifier isn't just accepting anything BCH-shaped."""
+        tampered = bytes.fromhex(BCH_BLOCK_840000[:-8] + "00000000")
+        with pytest.raises(SpvVerificationError):
+            verify_header_pow(tampered)
+
+    def test_bch_chain_840000_to_840001_valid(self) -> None:
+        """Consecutive BCH mainnet chain must verify against the unmodified verify_chain."""
+        headers = [bytes.fromhex(BCH_BLOCK_840000), bytes.fromhex(BCH_BLOCK_840001)]
+        hashes = verify_chain(headers)
+        assert len(hashes) == 2
+        # Hashes returned in LE; check the BE-reversed matches the known mainnet values.
+        assert hashes[0][::-1].hex() == self.BCH_840000_BE_HASH
+        assert hashes[1][::-1].hex() == self.BCH_840001_BE_HASH
+
+    def test_bch_chain_with_anchor_to_839999_valid(self) -> None:
+        """BCH chain verifies with a chain_anchor binding to block 839999's hash.
+
+        This is the audit 05-F-3 defense exercise applied to BCH: the maker
+        commits to a specific BCH anchor block (839999 in this case) and the
+        verifier rejects any chain whose first header doesn't link to it.
+        """
+        headers = [bytes.fromhex(BCH_BLOCK_840000), bytes.fromhex(BCH_BLOCK_840001)]
+        chain_anchor = bytes.fromhex(self.BCH_839999_BE_HASH)[::-1]  # LE
+        hashes = verify_chain(headers, chain_anchor=chain_anchor)
+        assert len(hashes) == 2
+
+    def test_bch_chain_wrong_anchor_rejected(self) -> None:
+        """Wrong chain_anchor must reject a BCH chain (same defense as BTC)."""
+        headers = [bytes.fromhex(BCH_BLOCK_840000), bytes.fromhex(BCH_BLOCK_840001)]
+        wrong_anchor = b"\x00" * 32
+        with pytest.raises(SpvVerificationError, match="anchor"):
+            verify_chain(headers, chain_anchor=wrong_anchor)
+
+    def test_bch_chain_840001_before_840000_fails(self) -> None:
+        """Out-of-order BCH chain must fail (link broken)."""
+        headers = [bytes.fromhex(BCH_BLOCK_840001), bytes.fromhex(BCH_BLOCK_840000)]
+        with pytest.raises(SpvVerificationError):
+            verify_chain(headers)
+
+    def test_bch_block_840000_nbits_value(self) -> None:
+        """Document and check the actual BCH 840000 nBits value.
+
+        BCH 840000 nBits == 0x180198fb (BE) — different from BTC 840000's
+        nBits at the same height because the chains have evolved
+        independently since the 2017 fork. This is the value a Maker would
+        need to commit to expected_nbits when offering a BCH-side payment
+        proof anchored at height 840000.
+        """
+        header = bytes.fromhex(BCH_BLOCK_840000)
+        # nBits at bytes 72..76, LE on the wire
+        nbits_le = header[72:76]
+        assert nbits_le.hex() == "fb980118"  # LE encoding of 0x180198fb
+
+    def test_bch_block_840000_distinct_from_btc_block_840000(self) -> None:
+        """BCH 840000 and BTC 840000 are different chains' blocks at the same height.
+
+        Confirms these tests are exercising the BCH chain, not accidentally
+        re-running BTC tests. The block hashes differ because the chains
+        diverged at the 2017 fork.
+        """
+        bch_header = bytes.fromhex(BCH_BLOCK_840000)
+        btc_header = bytes.fromhex(BLOCK_840000)
+        assert bch_header != btc_header
+        # Both pass their respective PoW checks against the same unmodified verifier.
+        verify_header_pow(bch_header)
+        verify_header_pow(btc_header)
+
+
 # --------------------------------------------------------------------------- PoW details
 
 
