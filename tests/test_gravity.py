@@ -754,3 +754,69 @@ class TestGravityModuleImports:
             build_forfeit_tx,
             compute_p2sh_code_hash,
         )
+
+
+def _ser_output(value: int, script: bytes) -> bytes:
+    """Wire-serialize one output: value(8 LE) + 1-byte len + script."""
+    return value.to_bytes(8, "little") + bytes([len(script)]) + script
+
+
+_P2PKH_AA = bytes.fromhex("76a914" + "aa" * 20 + "88ac")
+_P2PKH_BB = bytes.fromhex("76a914" + "bb" * 20 + "88ac")
+# FT locking script shape: P2PKH + OP_STATESEPARATOR OP_PUSHINPUTREF <36B ref> <12B FT fingerprint>
+_FT_OUTPUT = (
+    bytes.fromhex("76a914" + "cc" * 20 + "88ac") + b"\xbd\xd0" + bytes(36) + bytes.fromhex("dec0e9aa76e378e4a269e69d")
+)
+
+
+class TestSighashBackcompat:
+    """Regression guard for the Phase-1 de-duplication of
+    ``_compute_hash_output_hashes``.
+
+    The Gravity-specific copy (which hard-coded ``totalRefs = 0``) was deleted
+    in favor of the canonical ref-aware implementation in
+    ``pyrxd.transaction.transaction_preimage``. These golden vectors were
+    captured from the OLD implementation *before* the refactor; the de-dup must
+    reproduce them byte-for-byte for the ``totalRefs = 0`` path that plain-RXD
+    Gravity uses today. See
+    docs/plans/2026-05-19-feat-gravity-ref-bearing-covenant-plan.md (Phase 1).
+    """
+
+    # Golden vectors captured from the pre-refactor _compute_hash_output_hashes.
+    GOLDEN = {
+        "single_p2pkh": (
+            _ser_output(546, _P2PKH_AA),
+            "42053adc8c31d4299864f45101c180c7397471cd13b2ac0451217754649b33cf",
+        ),
+        "two_p2pkh": (
+            _ser_output(1000, _P2PKH_AA) + _ser_output(2000, _P2PKH_BB),
+            "0aec905422816fe9325e8fa82f37f2ef0a8dd78fde9a9f5518ba34c315dbe0d8",
+        ),
+    }
+
+    @pytest.mark.parametrize("scenario", list(GOLDEN.keys()))
+    def test_totalrefs0_byte_identical_to_pre_refactor(self, scenario):
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        outputs_serialized, expected = self.GOLDEN[scenario]
+        assert _compute_hash_output_hashes(outputs_serialized).hex() == expected
+
+    def test_ft_output_now_computes_real_refshash(self):
+        """The whole point of the de-dup: a ref-bearing output must NOT hash as
+        totalRefs=0. The old Gravity copy produced a wrong (zeros) refsHash for
+        FT outputs; the canonical impl walks OP_PUSHINPUTREF and computes the
+        real one. Assert the FT result differs from the equivalent plain-P2PKH
+        result (i.e. the ref is actually accounted for)."""
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        ft = _compute_hash_output_hashes(_ser_output(546, _FT_OUTPUT))
+        # A plain output of the same value but no ref must hash differently.
+        plain = _compute_hash_output_hashes(_ser_output(546, _P2PKH_AA))
+        assert ft != plain
+
+    def test_malformed_trailing_bytes_rejected(self):
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        blob = _ser_output(546, _P2PKH_AA) + b"\xff\xff"  # garbage tail
+        with pytest.raises(ValidationError):
+            _compute_hash_output_hashes(blob)

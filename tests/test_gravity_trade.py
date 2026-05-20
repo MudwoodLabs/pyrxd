@@ -868,21 +868,21 @@ def _build_p2pkh_spv_proof(hash160: bytes, satoshis: int):
     tests/fixtures/spv_synthetic_headers.json (the test_spv.py fixture).
     Returns the verified SpvProof.
     """
-    from pyrxd.spv.proof import CovenantParams, SpvProofBuilder
     from pyrxd.spv.pow import hash256
+    from pyrxd.spv.proof import CovenantParams, SpvProofBuilder
 
     # Minimal raw tx: 1 input (any prevout, empty scriptSig), 1 P2PKH output.
     payment_output = _p2pkh_output_bytes(satoshis, hash160)
     raw_tx = (
-        b"\x01\x00\x00\x00"      # version 1
-        + b"\x01"                 # 1 input
-        + b"\x00" * 32            # prev txid (any)
-        + b"\xff\xff\xff\xff"     # prev vout
-        + b"\x00"                 # empty scriptSig
-        + b"\xff\xff\xff\xff"     # sequence
-        + b"\x01"                 # 1 output
+        b"\x01\x00\x00\x00"  # version 1
+        + b"\x01"  # 1 input
+        + b"\x00" * 32  # prev txid (any)
+        + b"\xff\xff\xff\xff"  # prev vout
+        + b"\x00"  # empty scriptSig
+        + b"\xff\xff\xff\xff"  # sequence
+        + b"\x01"  # 1 output
         + payment_output
-        + b"\x00\x00\x00\x00"     # locktime
+        + b"\x00\x00\x00\x00"  # locktime
     )
     assert len(raw_tx) > 64, "raw_tx must be > 64 bytes (Merkle forgery defense)"
 
@@ -918,9 +918,7 @@ def _build_p2pkh_spv_proof(hash160: bytes, satoshis: int):
 
     # Sanity: the fixture header's merkle root must match our synthetic tx.
     header = bytes.fromhex(header_hex)
-    assert header[36:68] == merkle_root_le, (
-        "fixture header merkle root does not match synthetic tx — fixture is stale"
-    )
+    assert header[36:68] == merkle_root_le, "fixture header merkle root does not match synthetic tx — fixture is stale"
 
     params = CovenantParams(
         btc_receive_hash=hash160,
