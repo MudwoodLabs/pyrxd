@@ -201,6 +201,46 @@ amount) + output count, and assert the exact FT output script. This
 sidesteps codegen drift entirely — the epilogue is a literal, not a
 compiled artifact.
 
+## ⚠️ CRITICAL deployment-model finding (2026-05-20) — bare script, NOT P2SH
+
+While funding a real minted FT into the compiled covenant on mainnet,
+hit the load-bearing constraint the design (and the shipped Gravity
+covenant) got wrong:
+
+**A ref-bearing covenant cannot be P2SH-wrapped.** Radiant
+ref-conservation requires the ref opcode (`OP_PUSHINPUTREF` `0xd0`) to
+appear **in the output scriptPubKey**. A P2SH output is `a914<hash>87`
+— it shows no ref. So funding a covenant as plain P2SH would *burn*
+the ref (conservation violation → tx rejected). Confirmed against a
+live glyph UTXO: its scriptPubKey starts with `d8...` (bare ref
+opcode), **not** `a914` (P2SH). Photonic's covenants and the dMint
+contract UTXO are all **bare scripts** too.
+
+**The contrast with shipped Gravity is real and explains the gap:**
+- Plain-RXD Gravity covenant → P2SH-wrapped. Fine — no ref to expose.
+- Ref-bearing FT/NFT covenant → **must be a bare script**: the full
+  covenant logic lives in the scriptPubKey, prefixed/structured so the
+  ref opcode is visible for conservation.
+
+**Impact on the design:**
+- The `compute_p2sh_*` machinery the spike reused does NOT apply to the
+  ref-bearing variant. The covenant deploys as a bare ref-bearing
+  scriptPubKey; "funding" = an FT transfer whose output IS that bare
+  covenant script (carrying the ref → conservation satisfied).
+- The covenant script must itself begin with (or contain)
+  `OP_PUSHINPUTREF <REF>` so the locked UTXO's scriptPubKey exposes the
+  ref. The compiled spike already does `pushInputRef(REF)` in its
+  preamble — need to confirm that places the ref opcode in the
+  *locking* script (deploy form), not only in the *spending* path.
+- This is exactly the deploy-model divergence the dMint incidents warn
+  about; caught at the funding step *before* burning the real FT.
+
+**Status:** the FT is minted and held safe (ref
+`57296874…:0`, 100k units); covenant compiles; but the
+bare-vs-P2SH deploy model must be resolved before funding. This is the
+next concrete step — recompute the covenant as a bare ref-bearing
+scriptPubKey, then fund + run the attack-rejection proofs.
+
 ---
 
 **Single review question this doc must survive:** *what does shipping

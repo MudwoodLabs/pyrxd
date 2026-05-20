@@ -199,3 +199,6 @@ docs/design/
 logs/
 poetry.lock
 
+
+# gravity-ref spike: local keys + ephemeral tx state (never commit)
+docs/brainstorms/gravity-ref-spike/.*
