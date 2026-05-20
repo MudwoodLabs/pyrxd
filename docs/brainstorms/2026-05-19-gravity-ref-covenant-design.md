@@ -104,6 +104,44 @@ asserted equal to the input value).
 The body below is the original draft, retained for the construction
 detail; read it through the lens of the mandates above.
 
+## Spike results (2026-05-20) — opcodes confirmed, FT-amount question RESOLVED
+
+Read-only spike against pyrxd source + the live mainnet node on `tr`,
+before writing any bytecode:
+
+1. **All required opcodes exist** ([constants.py:285-320](../../src/pyrxd/constants.py#L285)):
+   `OP_TXOUTPUTCOUNT` (`0xc4`), `OP_OUTPUTVALUE` (`0xcc`),
+   `OP_OUTPUTBYTECODE` (`0xcd`), and the full ref family —
+   `OP_REFVALUESUM_OUTPUTS` (`0xdc`), `OP_REFOUTPUTCOUNT_OUTPUTS`
+   (`0xde`), `OP_REFDATASUMMARY_OUTPUT` (`0xe2`), etc. The three
+   mandated fixes are all expressible.
+
+2. **FT amount == photon value (1 photon = 1 FT unit).** This resolves
+   the load-bearing open question and *confirms* the mandated fix #3
+   uses the right opcode. Evidence:
+   [glyph_cmds.py:933](../../src/pyrxd/cli/glyph_cmds.py#L933) —
+   `ft_amount = utxo.value  # 1 photon = 1 FT unit`. The FT-CSH
+   conservation epilogue (`dec0e9aa76e378e4a269e69d`) sums **photon
+   values** across ref-bearing outputs sharing the ref.
+
+   ⚠️ **Misleading docstring corrected:** `ft.py:15-17` calls
+   `ft_amount` and `value` "orthogonal." They are distinct *dataclass
+   fields* but the SAME on-chain quantity — the FT carrier's photon
+   value IS its token amount. So `OP_0 OP_OUTPUTVALUE <lockedUnits>
+   OP_NUMEQUALVERIFY` (fix #3) **is correct** — `OP_OUTPUTVALUE`
+   returns the photon value, which equals the FT amount. (Briefly
+   looked wrong mid-spike because of that docstring; the code at
+   glyph_cmds.py:933 is authoritative.)
+
+   Consequence: `lockedFtUnits` = the locked covenant UTXO's photon
+   value. The Taker's settlement output[0] must have **exactly** that
+   photon value, and `OP_TXOUTPUTCOUNT` must clamp so no sibling FT
+   output siphons the rest.
+
+3. **`testmempoolaccept` path confirmed available** on `tr` (node
+   synced, wallet funded ~180 RXD) for the negative-case-rejection
+   proofs the mandates require.
+
 ---
 
 **Single review question this doc must survive:** *what does shipping
