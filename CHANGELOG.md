@@ -418,6 +418,14 @@ on old-style calls — there is no silent-failure migration path.
 - Load-time path validation against the wallet record's stored
   derivation path.
 
+> ⚠️ **Downgrade hazard introduced here.** Once 0.3.0 writes a wallet
+> file with a `coin_type` annotation, downgrading to a pre-0.3.0 version
+> and re-saving the wallet corrupts the stored `coin_type` while leaving
+> derived keys unchanged. A subsequent upgrade will fail `load()` validation.
+> Funds are recoverable from the mnemonic but require manual re-creation
+> of the wallet file. **Pin all machines to the same pyrxd version.**
+> See the README "Upgrading" section for details.
+
 #### Documentation
 
 - `docs/research/wallet-derivation-paths.md` — public research doc on

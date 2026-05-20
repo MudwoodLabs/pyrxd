@@ -71,6 +71,25 @@ class TestWalletNew:
         assert result.exit_code != 0
         assert "--yes" in result.output
 
+    def test_clipboard_warning_shown_by_default(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "wallet", "new"],
+            input="\n",
+            env={"PYRXD_NO_CLIPBOARD_WARNING": ""},
+        )
+        assert result.exit_code == 0, result.output
+        assert "clipboard managers" in result.output
+
+    def test_clipboard_warning_suppressed_by_flag(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "wallet", "new", "--no-clipboard-warning"],
+            input="\n",
+        )
+        assert result.exit_code == 0, result.output
+        assert "clipboard managers" not in result.output
+
 
 class TestWalletLoad:
     def test_load_missing_file_errors(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
