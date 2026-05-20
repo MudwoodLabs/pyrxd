@@ -1,8 +1,11 @@
 # Gravity: cross-chain atomic swaps
 
-**Audience:** developers integrating cross-chain BTC↔RXD swaps via
-`pyrxd.gravity`, and anyone who's seen the phrase "sentinel-artifact
-path mainnet-proven" and wondered what it actually means.
+**Audience:** developers integrating cross-chain swaps via
+`pyrxd.gravity` between RXD and a SHA-256d UTXO chain (BTC is
+mainnet-proven; BCH is supported; see § Supported counterparty
+chains for the full picture), and anyone who's seen the phrase
+"sentinel-artifact path mainnet-proven" and wondered what it
+actually means.
 
 **Status:** sentinel-path swaps proven on mainnet. Other covenant
 variants are experimental and not yet validated for real funds.
@@ -32,6 +35,53 @@ The conceptual lineage runs through Bitcoin's HTLCs (Lightning), the
 Decred / Litecoin atomic swap work, and SPV-anchored DeFi
 constructions on Bitcoin Cash. Gravity is the Radiant-specific
 expression of that pattern.
+
+## Supported counterparty chains
+
+Gravity's SPV verifier is chain-agnostic for **SHA-256d UTXO chains**
+by deliberate design. The verifier checks proof-of-work as
+`hash < target` against the header's own nBits — it does not compute
+or validate difficulty algorithm transitions. As long as the maker
+commits to the right `expected_nbits` at offer time, the verifier
+accepts any chain of headers satisfying those nBits.
+
+| Chain | Counterparty role | Status |
+|---|---|---|
+| **Bitcoin (BTC)** | proven on mainnet | ✅ shipping |
+| **Bitcoin Cash (BCH)** | verifier accepts real mainnet headers | ✅ ready; integration tests in `tests/test_spv.py::TestBchMainnetFixtures` |
+| **Bitcoin SV (BSV)** | same SHA-256d format | ⚠️ untested; should work with no code changes |
+| Other SHA-256d UTXO chains | same SHA-256d format | ⚠️ untested |
+
+What "ready" means for BCH:
+
+- Real BCH mainnet block headers (840000 + 840001) pass the
+  unmodified `verify_header_pow` and `verify_chain` (with
+  `chain_anchor` binding).
+- The shipping `maker_covenant_flat_12x20_sentinel_all` covenant
+  supports BCH-style payments (P2PKH is the primary type since BCH
+  has no segwit; P2SH is the secondary type for multisig flows).
+- The `MempoolSpaceSource` data-source class accepts a configurable
+  `base_url`, so a caller can construct
+  `MempoolSpaceSource(base_url="https://mempool.cash/api")` or a
+  similar BCH-side explorer endpoint without code changes. Live API
+  compatibility has not been verified end-to-end.
+- BCH cashaddr encoding is wallet-side, not Gravity-side. The maker
+  provides raw `hash160` bytes; address-format handling stays at
+  the wallet layer.
+
+What's **not** supported, and would require more than a parameter
+change:
+
+- **Non-SHA-256d chains** (Litecoin/Dogecoin use Scrypt; Zcash uses
+  Equihash; Monero uses RandomX). The SPV verifier's PoW check
+  hardcodes SHA-256d. Verifying these chains' PoW on Radiant would
+  require new RadiantScript opcodes (a consensus extension) or a
+  different cross-chain protocol altogether (such as HTLC + adaptor
+  signatures, which doesn't require on-chain PoW verification).
+
+The asymmetric design of Gravity (counterparty chain doesn't need to
+know Gravity exists; only Radiant verifies the proof) is preserved
+for all supported chains.
 
 ## What a covenant is
 
@@ -110,25 +160,57 @@ depth from 12 through 20 now works with one covenant.
 
 ### Axis 2: Bitcoin output type
 
-The `_p2wpkh` variants only accept payment to native-segwit BTC
-addresses (the `bc1q...` ones). A complete Gravity rollout would
-also support:
+The older `_p2wpkh`-suffixed covenant variants (visible in the
+artifacts directory) only accepted payment to native-segwit BTC
+addresses. **The shipping `maker_covenant_flat_12x20_sentinel_all`
+covenant unified the dispatch** and accepts all four standard
+Bitcoin output types via in-script branching on a `btcReceiveType`
+parameter (0=P2PKH, 1=P2WPKH, 2=P2SH, 3=P2TR). The covenant compares
+the BTC tx's output script bytes against the type-specific expected
+pattern (e.g. `76 a9 14 <hash> 88 ac` for P2PKH, `00 14 <hash>` for
+P2WPKH, etc.), with the hash supplied as `btcReceiveHash` and the
+type supplied as `btcReceiveType`.
 
-| Output type | Address prefix | Status |
-|---|---|---|
-| **P2WPKH** (native segwit) | `bc1q...` | ✅ shipped |
-| **P2PKH** (legacy) | `1...` | ❌ no covenant compiled yet |
-| **P2SH** (wrapped segwit) | `3...` | ❌ no covenant compiled yet |
-| **P2TR** (taproot) | `bc1p...` | ❌ no covenant compiled yet |
+| Output type | Address prefix | Covenant support | End-to-end test |
+|---|---|---|---|
+| **P2WPKH** (native segwit) | `bc1q...` | ✅ shipped | ✅ mainnet-proven |
+| **P2PKH** (legacy) | `1...` | ✅ shipped | ✅ synthetic (`TestGravityTradeP2PKH`) |
+| **P2SH** (wrapped segwit) | `3...` | ✅ shipped | ⚠️ unit-level only |
+| **P2TR** (taproot) | `bc1p...` | ✅ shipped | ⚠️ unit-level only |
 
-The SDK's API in `pyrxd/gravity/covenant.py` already declares
-``_VALID_BTC_RECEIVE_TYPES = {"p2pkh": 0, "p2wpkh": 1, "p2sh": 2,
-"p2tr": 3}`` — but only `p2wpkh` has a deployable covenant in the
-artifacts directory. If a maker wants to receive BTC at a taproot
-address, the SDK currently has no covenant to use.
+What "covenant support ✅ shipped" means concretely:
+- The Python factory in `pyrxd/gravity/covenant.py` substitutes the
+  type integer into the covenant template via
+  `_VALID_BTC_RECEIVE_TYPES = {"p2pkh": 0, "p2wpkh": 1, "p2sh": 2, "p2tr": 3}`.
+- `tests/test_gravity.py::TestGravityOffer::test_all_btc_receive_types_accepted`
+  asserts `build_gravity_offer` produces a valid offer for all four
+  types.
+- The SPV verifier in `pyrxd/spv/payment.py` parses all four output
+  script formats; `tests/test_spv.py` exercises each at the unit
+  level.
 
-This is one of the main directions covenant work needs to go: extend
-the audited+sentinel pattern to the other three output types.
+What "end-to-end test ⚠️ unit-level only" means for P2SH and P2TR:
+- The covenant artifact, factory, and SPV verifier all handle these
+  types correctly at the unit level.
+- A full Maker-locks → Taker-pays → finalize integration test using
+  the real `SpvProofBuilder.build()` pipeline against a synthetic
+  P2SH-paying or P2TR-paying BTC transaction has not yet been
+  written. The P2PKH analogue
+  (`tests/test_gravity_trade.py::TestGravityTradeP2PKH`) is the
+  pattern to copy when adding them.
+- A small-amount mainnet exercise against a real P2PKH / P2SH / P2TR
+  payment has not yet been performed for these types. Mainnet-proven
+  status applies only to P2WPKH today.
+
+### History note: why the docs previously said otherwise
+
+An earlier version of this document claimed only P2WPKH was
+supported. That was accurate relative to the older single-type
+covenant variants (`maker_covenant_unified_p2wpkh`, the experimental
+`flat_*_p2wpkh` lineage) but became stale when the sentinel-all
+covenant landed and unified the dispatch. The `_p2wpkh` suffix on
+older artifacts is a historical naming artifact, not a current
+limitation of the shipping covenant.
 
 ### Axis 3: Security upgrades over time
 
@@ -178,8 +260,12 @@ versions:
 1. **Audit + ship the depth-branched variants.** Smaller covenants
    mean lower fees on each spend; might be useful for high-frequency
    makers.
-2. **Compile P2PKH / P2SH / P2TR variants.** Each new output type is
-   a separate sentinel-style covenant; the pattern carries over.
+2. **End-to-end integration tests + mainnet exercise for P2SH / P2TR.**
+   The shipping sentinel covenant already supports all four output
+   types via in-script dispatch (see Axis 2 above); what's missing is
+   integration test coverage and a small-amount mainnet exercise for
+   the two output types still marked ⚠️ unit-level only. P2PKH was
+   closed out in this category in 2026-05; P2SH and P2TR remain.
 3. **Independent security audit of the entire Gravity surface.**
    Self-audit found and fixed the issues in the deny-list above; an
    external audit is the next step before any Gravity claims should

@@ -160,9 +160,9 @@ Token metadata:
 ### Phase 4 — dry-run
 
 ```bash
-cd /home/eric/apps/pyrxd/.worktrees/feat/dmint-v1-deploy
+# from the repo root (or the relevant worktree)
 DRY_RUN=1 GLYPH_WIF=<test-wif> \
-  /home/eric/apps/pyrxd/.venv/bin/python examples/dmint_v1_deploy_demo.py
+  .venv/bin/python examples/dmint_v1_deploy_demo.py
 ```
 
 Expected output:
@@ -183,7 +183,7 @@ to verify:
 ```bash
 DRY_RUN=0 I_UNDERSTAND_THIS_IS_REAL=yes \
   GLYPH_WIF=<test-wif> \
-  /home/eric/apps/pyrxd/.venv/bin/python examples/dmint_v1_deploy_demo.py
+  .venv/bin/python examples/dmint_v1_deploy_demo.py
 ```
 
 Demo:

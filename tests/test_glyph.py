@@ -119,6 +119,80 @@ class TestScriptConstruction:
 
 
 # ---------------------------------------------------------------------------
+# Mainnet golden vector — NFT locking script byte-equal vs real Glyph NFT
+# ---------------------------------------------------------------------------
+
+
+class TestNftLockingScriptMainnetGolden:
+    """Pin ``build_nft_locking_script`` against a real Glyph NFT reveal on
+    Radiant mainnet. If the encoder ever drifts from the on-chain shape,
+    this test fires immediately.
+
+    Source: mainnet tx
+    ``27390efab1e3168c05301b18f6cdfd553a6d122a41496d0f5e104e79a918be7e``
+    vout[0] (Glyph NFT reveal with on-chain thumbnail; referenced in the
+    Radiant Glyph Guide as the canonical NFT-with-image example).
+
+    Pairs with ``TestFtLockingScriptMainnetGolden`` in
+    ``tests/test_dmint_module.py`` to close the pattern-recognition audit's
+    #R7 followup: every wire-format builder gets one
+    ``test_byte_equal_to_<chain_ref>`` assertion before merge.
+    """
+
+    # PKH from the on-chain NFT singleton's P2PKH tail (offsets 41..61).
+    _OWNER_PKH = bytes.fromhex("cd2f89a318ff02653eaed3ab70f7f15637d71598")
+
+    # NFT ref: 32-byte commit_txid_le (reversed) + 4-byte vout LE.
+    # Extracted from on-chain vout[0] script offsets 1..37 (36 bytes):
+    # `ffe5593ff6507a98323818bc266ed7905500a04334441181fee4e0a46ae38eb3 00000000`
+    _REF_BYTES = bytes.fromhex("ffe5593ff6507a98323818bc266ed7905500a04334441181fee4e0a46ae38eb300000000")
+
+    # vout[0] locking script (63 bytes) extracted from the on-chain raw tx.
+    _VOUT0_NFT_SCRIPT = bytes.fromhex(
+        "d8"
+        "ffe5593ff6507a98323818bc266ed7905500a04334441181fee4e0a46ae38eb300000000"
+        "75"
+        "76a914"
+        "cd2f89a318ff02653eaed3ab70f7f15637d71598"
+        "88ac"
+    )
+
+    def test_pyrxd_nft_builder_matches_mainnet_byte_for_byte(self):
+        """``build_nft_locking_script(pkh, ref)`` produces the exact bytes
+        observed in the live Glyph NFT reveal's vout[0]. If this fails,
+        the builder has drifted from the on-chain shape — and every NFT
+        emitted by pyrxd is silently wrong."""
+        ref_txid_le = self._REF_BYTES[:32]
+        ref_vout_le = self._REF_BYTES[32:36]
+        ref = GlyphRef(
+            txid=Txid(ref_txid_le[::-1].hex()),
+            vout=int.from_bytes(ref_vout_le, "little"),
+        )
+
+        rebuilt = build_nft_locking_script(Hex20(self._OWNER_PKH), ref)
+        assert rebuilt == self._VOUT0_NFT_SCRIPT, (
+            f"NFT builder drifted from mainnet:\n"
+            f"  expected: {self._VOUT0_NFT_SCRIPT.hex()}\n"
+            f"  got:      {rebuilt.hex()}"
+        )
+
+    def test_mainnet_nft_script_passes_classifier(self):
+        """The on-chain bytes pass ``is_nft_script`` — confirms classifier
+        and builder agree on the same shape."""
+        assert is_nft_script(self._VOUT0_NFT_SCRIPT.hex())
+
+    def test_mainnet_nft_script_round_trips_through_extractors(self):
+        """``extract_owner_pkh_from_nft_script`` and
+        ``extract_ref_from_nft_script`` recover the inputs that
+        ``build_nft_locking_script`` would have consumed."""
+        recovered_pkh = extract_owner_pkh_from_nft_script(self._VOUT0_NFT_SCRIPT)
+        assert bytes(recovered_pkh) == self._OWNER_PKH
+
+        recovered_ref = extract_ref_from_nft_script(self._VOUT0_NFT_SCRIPT)
+        assert recovered_ref.to_bytes() == self._REF_BYTES
+
+
+# ---------------------------------------------------------------------------
 # 2. GlyphRef encoding / round-trip
 # ---------------------------------------------------------------------------
 

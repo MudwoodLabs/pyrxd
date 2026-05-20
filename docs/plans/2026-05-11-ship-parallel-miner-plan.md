@@ -365,7 +365,7 @@ tests pass, the miner cannot embed a wrong nonce.
   template for new contrib tests.
 
 ### External
-- `glyph-miner` at `/home/eric/apps/Pinball/glyph-miner/` — the
+- the `glyph-miner` project — the
   fast-but-divergence-risk alternative.
 
 ### Files to be created

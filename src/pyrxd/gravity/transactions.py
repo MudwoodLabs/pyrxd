@@ -20,6 +20,9 @@ import time
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.spv.proof import SpvProof
+from pyrxd.transaction.transaction_output import TransactionOutput
+from pyrxd.transaction.transaction_preimage import _compute_hash_output_hashes as _general_hash_output_hashes
+from pyrxd.utils import Reader
 
 from .codehash import (
     compute_p2sh_address_from_redeem,
@@ -93,45 +96,30 @@ def _push_data(data: bytes) -> bytes:
 def _compute_hash_output_hashes(outputs_serialized: bytes) -> bytes:
     """Compute Radiant's ``hashOutputHashes`` from serialized outputs.
 
-    For each output:
-        summary = value(8 LE) + hash256(scriptPubKey)(32) + totalRefs(4 LE) + refsHash(32)
+    Parses the wire-serialized outputs (``value(8 LE) + varint(len) + script``
+    repeated) into :class:`TransactionOutput` objects and delegates to the
+    canonical, ref-aware implementation in
+    :func:`pyrxd.transaction.transaction_preimage._compute_hash_output_hashes`.
 
-    For plain P2PKH / P2SH outputs (no ``OP_PUSHINPUTREF``):
-        totalRefs = 0, refsHash = b'\x00' * 32  (32 zero bytes — per Radiant source, NOT hash256(b''))
-
-    ``hashOutputHashes = hash256(concatenated summaries)``
+    This module previously carried its own copy that hard-coded
+    ``totalRefs = 0`` for every output. That was correct only for the
+    plain-RXD covenant outputs Gravity produced at the time, but would
+    silently sign the wrong sighash for any ref-bearing (FT/NFT) output
+    — the exact divergence the ref-bearing covenant work needs fixed. The
+    general implementation walks the script for ``OP_PUSHINPUTREF`` /
+    ``OP_PUSHINPUTREFSINGLETON`` and computes the real ``refsHash``; it is
+    pinned against a confirmed mainnet reveal tx in ``tests/test_preimage.py``
+    and produces byte-identical output to the old copy for the
+    ``totalRefs = 0`` case (see ``tests/test_gravity.py::TestSighashBackcompat``).
     """
-    ZERO_REFS_HASH = b"\x00" * 32  # uint256 zero — used when totalRefs == 0 (per Radiant source)
-
-    pos = 0
-    summaries: list[bytes] = []
-    while pos < len(outputs_serialized):
-        value = int.from_bytes(outputs_serialized[pos : pos + 8], "little")
-        pos += 8
-        # Read varint for script length
-        first = outputs_serialized[pos]
-        if first < 0xFD:
-            script_len = first
-            pos += 1
-        elif first == 0xFD:
-            script_len = int.from_bytes(outputs_serialized[pos + 1 : pos + 3], "little")
-            pos += 3
-        else:
-            raise ValidationError("output script too large for hashOutputHashes")
-        if pos + script_len > len(outputs_serialized):
-            raise ValidationError("outputs_serialized truncated reading script")
-        script = outputs_serialized[pos : pos + script_len]
-        pos += script_len
-
-        summary = (
-            value.to_bytes(8, "little")
-            + hash256(script)
-            + (0).to_bytes(4, "little")  # totalRefs = 0 (no glyph refs in covenant outputs)
-            + ZERO_REFS_HASH
-        )
-        summaries.append(summary)
-
-    return hash256(b"".join(summaries))
+    reader = Reader(outputs_serialized)
+    outputs: list[TransactionOutput] = []
+    while not reader.eof():
+        output = TransactionOutput.from_hex(reader)
+        if output is None:  # malformed / truncated output record
+            raise ValidationError("outputs_serialized is truncated or malformed")
+        outputs.append(output)
+    return _general_hash_output_hashes(outputs)
 
 
 def _sign_radiant_p2sh_input(  # nosec B107 -- no hardcoded credentials

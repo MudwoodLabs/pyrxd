@@ -106,7 +106,11 @@ def _preimage(
 
     Identical to Bitcoin SV BIP143 except field 8 (hashOutputHashes) is
     inserted before hashOutputs. This extra field hashes each output's value,
-    script hash, and ref count (always 0 for standard P2PKH/FT/NFT outputs).
+    script hash, ref count, and (when refs are present) the hash of the
+    sorted+deduplicated refs. The ref count is 0 only for plain outputs
+    (e.g. P2PKH); FT outputs carry one ``OP_PUSHINPUTREF`` and NFT singletons
+    one ``OP_PUSHINPUTREFSINGLETON``, so their ref count is >= 1 — see
+    ``_compute_hash_output_hashes`` / ``_get_push_refs`` above.
 
      1. nVersion (4-byte LE)
      2. hashPrevouts (32-byte hash)

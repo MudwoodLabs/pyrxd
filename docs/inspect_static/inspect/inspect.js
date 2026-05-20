@@ -803,6 +803,78 @@ function _detectTxShape(payload) {
     );
   }
 
+  // Rarer Glyph protocol markers — detected from reveal-metadata protocol
+  // list, not from output shapes (the locking scripts are ordinary NFT/MUT
+  // shapes; the marker is purely a CBOR metadata flag). These are structural
+  // pattern matches only; semantic correctness is not verified.
+
+  // CONTAINER (7) — an NFT that groups other tokens/NFTs into a collection.
+  if (protocol.includes("7") || protocol.some((p) => p.endsWith("CONTAINER"))) {
+    return (
+      "This transaction carries the Glyph CONTAINER marker (protocol = 7). " +
+      "A CONTAINER is an NFT that acts as a collection envelope — other tokens " +
+      "or NFTs reference it to signal membership in the collection. The locking " +
+      "script is an ordinary Glyph NFT singleton; the CONTAINER role is " +
+      "declared only in the reveal metadata."
+    );
+  }
+
+  // ENCRYPTED (8) — an NFT whose payload is encrypted; requires companion key NFT.
+  if (protocol.includes("8") || protocol.some((p) => p.endsWith("ENCRYPTED"))) {
+    return (
+      "This transaction carries the Glyph ENCRYPTED marker (protocol = 8). " +
+      "The payload embedded in this NFT's reveal metadata is encrypted. " +
+      "Decrypting it typically requires a companion key NFT held by the " +
+      "intended recipient. The on-chain shape is an ordinary Glyph NFT; " +
+      "the encryption is a metadata-layer convention, not enforced by script."
+    );
+  }
+
+  // TIMELOCK (9) — a timelocked reveal; requires ENCRYPTED per the protocol spec.
+  if (protocol.includes("9") || protocol.some((p) => p.endsWith("TIMELOCK"))) {
+    return (
+      "This transaction carries the Glyph TIMELOCK marker (protocol = 9). " +
+      "A TIMELOCK signals that the reveal or transfer is subject to a " +
+      "time-based condition encoded in the metadata. Per the Glyph protocol " +
+      "spec, TIMELOCK requires ENCRYPTED to also be present. " +
+      "The on-chain locking script is an ordinary Glyph NFT; " +
+      "the time condition is a metadata-layer convention."
+    );
+  }
+
+  // AUTHORITY (10) — an issuer authority NFT; grants permission to modify/issue tokens.
+  if (protocol.includes("10") || protocol.some((p) => p.endsWith("AUTHORITY"))) {
+    return (
+      "This transaction carries the Glyph AUTHORITY marker (protocol = 10). " +
+      "An AUTHORITY is a special NFT that confers issuer rights — the holder " +
+      "can authorize operations (such as additional mints or metadata updates) " +
+      "on a related token family. The on-chain script is an ordinary Glyph NFT; " +
+      "the authority role is declared in the reveal metadata."
+    );
+  }
+
+  // WAVE (11) — an on-chain name-claim NFT (requires NFT + MUT per spec).
+  if (protocol.includes("11") || protocol.some((p) => p.endsWith("WAVE"))) {
+    return (
+      "This transaction carries the Glyph WAVE marker (protocol = 11). " +
+      "WAVE is the Glyph on-chain naming protocol — this NFT claims a " +
+      "human-readable name on Radiant. The name can be updated by spending " +
+      "this output (it requires NFT + MUT per the protocol spec). " +
+      "Note: WAVE support in pyrxd is currently deferred; this banner is " +
+      "informational only."
+    );
+  }
+
+  // DAT (3) — a data-storage NFT (raw data anchored on-chain).
+  if (protocol.includes("3") || protocol.some((p) => p.endsWith("DAT"))) {
+    return (
+      "This transaction carries the Glyph DAT marker (protocol = 3). " +
+      "DAT anchors arbitrary data on-chain inside a Glyph NFT's reveal " +
+      "payload. The data blob is embedded in the CBOR metadata; the " +
+      "locking script is an ordinary Glyph NFT singleton."
+    );
+  }
+
   // V1 dMint deploy COMMIT: 1 commit-ft + 1 commit-nft + N ref-seed
   // P2PKHs (one per parallel contract) + 1 P2PKH change. The mainnet
   // Glyph Protocol deploy (a443d9df…878b) had 1+1+32+1 = 35 outputs;

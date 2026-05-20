@@ -10,6 +10,13 @@ on:
     # CodeQL's queries after our last code change.
     - cron: "0 6 * * 1"
 
+# Cancel old runs when a new push lands on the same branch/PR. See ci.yml.
+# Scheduled runs use refs/heads/main as their ref; they don't normally
+# overlap with push/PR events so concurrency cancellation is safe.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -26,7 +33,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@68bde559dea0fdcac2102bfdf6230c5f70eb485e  # v4.35.4
+        uses: github/codeql-action/init@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4.35.5
         with:
           languages: python
           # security-and-quality includes the security-extended ruleset plus
@@ -34,6 +41,6 @@ jobs:
           queries: security-and-quality
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@68bde559dea0fdcac2102bfdf6230c5f70eb485e  # v4.35.4
+        uses: github/codeql-action/analyze@9e0d7b8d25671d64c341c19c0152d693099fb5ba  # v4.35.5
         with:
           category: "/language:python"
