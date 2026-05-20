@@ -754,3 +754,114 @@ class TestGravityModuleImports:
             build_forfeit_tx,
             compute_p2sh_code_hash,
         )
+
+
+def _ser_output(value: int, script: bytes) -> bytes:
+    """Wire-serialize one output: value(8 LE) + 1-byte len + script."""
+    return value.to_bytes(8, "little") + bytes([len(script)]) + script
+
+
+_P2PKH_AA = bytes.fromhex("76a914" + "aa" * 20 + "88ac")
+_P2PKH_BB = bytes.fromhex("76a914" + "bb" * 20 + "88ac")
+# FT locking script shape: P2PKH + OP_STATESEPARATOR OP_PUSHINPUTREF <36B ref> <12B FT fingerprint>
+_FT_OUTPUT = (
+    bytes.fromhex("76a914" + "cc" * 20 + "88ac") + b"\xbd\xd0" + bytes(36) + bytes.fromhex("dec0e9aa76e378e4a269e69d")
+)
+
+
+class TestSighashBackcompat:
+    """Regression guard for the Phase-1 de-duplication of
+    ``_compute_hash_output_hashes``.
+
+    The Gravity-specific copy (which hard-coded ``totalRefs = 0``) was deleted
+    in favor of the canonical ref-aware implementation in
+    ``pyrxd.transaction.transaction_preimage``. These golden vectors were
+    captured from the OLD implementation *before* the refactor; the de-dup must
+    reproduce them byte-for-byte for the ``totalRefs = 0`` path that plain-RXD
+    Gravity uses today. See
+    docs/plans/2026-05-19-feat-gravity-ref-bearing-covenant-plan.md (Phase 1).
+    """
+
+    # Golden vectors captured from the pre-refactor _compute_hash_output_hashes.
+    GOLDEN = {
+        "single_p2pkh": (
+            _ser_output(546, _P2PKH_AA),
+            "42053adc8c31d4299864f45101c180c7397471cd13b2ac0451217754649b33cf",
+        ),
+        "two_p2pkh": (
+            _ser_output(1000, _P2PKH_AA) + _ser_output(2000, _P2PKH_BB),
+            "0aec905422816fe9325e8fa82f37f2ef0a8dd78fde9a9f5518ba34c315dbe0d8",
+        ),
+    }
+
+    @pytest.mark.parametrize("scenario", list(GOLDEN.keys()))
+    def test_totalrefs0_byte_identical_to_pre_refactor(self, scenario):
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        outputs_serialized, expected = self.GOLDEN[scenario]
+        assert _compute_hash_output_hashes(outputs_serialized).hex() == expected
+
+    def test_ft_output_computes_real_refshash_golden(self):
+        """The point of the de-dup: a ref-bearing output must hash with the REAL
+        refsHash, not the old hard-coded zeros. Pin the FT result to a golden
+        value captured from the canonical (ref-aware) impl. A bare ``ft != plain``
+        check is too weak — two different scripts differ in the script-hash term
+        regardless of refsHash, so it could pass even if refsHash were still
+        zeroed. This golden pins the ref accounting itself."""
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        result = _compute_hash_output_hashes(_ser_output(546, _FT_OUTPUT)).hex()
+        assert result == "c1e66ffcb9c4ced99641614ff23ccb185cbe1c721ebded2eeb9cc2b622609605"
+
+    def test_large_script_0xfd_varint_boundary(self):
+        """A script >= 0xFD bytes uses a 2-byte varint length prefix. Golden
+        captured from the canonical impl — locks the varint-boundary path the
+        old hand-rolled parser handled explicitly."""
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        big_script = b"\x6a" + b"\x4c\xfa" + bytes(250)  # OP_RETURN OP_PUSHDATA1 250 <250> = 253 bytes
+        blob = (546).to_bytes(8, "little") + b"\xfd" + len(big_script).to_bytes(2, "little") + big_script
+        assert (
+            _compute_hash_output_hashes(blob).hex()
+            == "98ba70b21fcac18a6e6ef8c7232b945856455b028e6e62b8ad845f8f7dd86600"
+        )
+
+    def test_empty_outputs_blob(self):
+        """Empty input must not crash (no IndexError on the empty-list path)."""
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        # hash256(b"") — the well-defined hash of zero outputs.
+        assert _compute_hash_output_hashes(b"").hex() == (
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456"
+        )
+
+    def test_trailing_garbage_rejected(self):
+        """A trailing fragment that can't form a full output record must raise,
+        not be silently ignored."""
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        blob = _ser_output(546, _P2PKH_AA) + b"\xff\xff"  # 2 trailing bytes
+        with pytest.raises(ValidationError):
+            _compute_hash_output_hashes(blob)
+
+    def test_overlong_script_length_rejected(self):
+        """An output whose script-length varint OVER-CLAIMS must raise — not
+        produce a hash over a silently truncated script. This is the signing-path
+        regression guard: the old hand-rolled parser caught it explicitly and the
+        from_hex-based adapter must too."""
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        # Claims a 25-byte script but provides only 13 bytes.
+        blob = (546).to_bytes(8, "little") + bytes([25]) + bytes.fromhex("76a914" + "aa" * 10)
+        with pytest.raises(ValidationError):
+            _compute_hash_output_hashes(blob)
+
+    def test_midstream_truncation_rejected(self):
+        """A valid first output followed by a truncated second output must raise,
+        not hash only the first and silently drop the corrupt tail."""
+        from pyrxd.gravity.transactions import _compute_hash_output_hashes
+
+        truncated_second = (1000).to_bytes(8, "little") + bytes([25]) + bytes.fromhex("76a914aa")
+        blob = _ser_output(546, _P2PKH_AA) + truncated_second
+        with pytest.raises(ValidationError):
+            _compute_hash_output_hashes(blob)

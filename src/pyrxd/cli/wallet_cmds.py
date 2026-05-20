@@ -44,8 +44,15 @@ def wallet_group() -> None:
     default=False,
     help="Prompt for an optional BIP39 passphrase.",
 )
+@click.option(
+    "--no-clipboard-warning",
+    is_flag=True,
+    default=False,
+    envvar="PYRXD_NO_CLIPBOARD_WARNING",
+    help="Skip the clipboard hygiene prompt (also: PYRXD_NO_CLIPBOARD_WARNING=1).",
+)
 @click.pass_obj
-def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool) -> None:
+def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool, no_clipboard_warning: bool) -> None:
     """Generate a fresh BIP39 mnemonic + HdWallet."""
     ok, why = ctx.is_destructive_mode_safe()
     if not ok:
@@ -85,6 +92,14 @@ def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool) -> None:
         return
 
     show_mnemonic(mnemonic.split(), ctx=ctx)
+    if not no_clipboard_warning:
+        click.echo("")
+        click.echo(
+            "  Some clipboard managers retain copy/paste history. If you copied\n"
+            "  the mnemonic to your clipboard, clear your clipboard manager now.\n"
+            "  (KDE Klipper, GNOME clipboard, etc.)"
+        )
+        click.pause("  Press Enter to continue, or Ctrl-C to abort.")
     passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default, not a hardcoded secret
     if passphrase:
         passphrase_str = prompt_passphrase_input(optional=True)

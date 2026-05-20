@@ -253,7 +253,7 @@ Three hard constraints from cross-tool research:
 1. **Contracts MUST live at consecutive vouts** of the reveal tx
    (vout[0..N-1]). glyph-miner discovers parallel contracts by
    incrementing vout from `firstRef`; non-consecutive layout
-   silently undercounts ([glyph-miner deployments.ts:207-219](file:///home/eric/apps/Pinball/glyph-miner/src/deployments.ts)).
+   silently undercounts (glyph-miner `src/deployments.ts:207-219`).
 
 2. **CBOR `p` must equal `[1, 4]`** (FT + DMINT markers); CBOR `v`
    field must be **omitted** for V1 (emitting `v: 2` would mis-
@@ -318,9 +318,9 @@ isn't available; specifically read:
   "Photonic Divergence" section of the research doc, naming which
   Photonic file/line and value differ from mainnet, and the reason
   pyrxd will prefer mainnet. This prevents future review rounds from
-  re-litigating the same discrepancies (per the
-  feedback_photonic_canonical_reference.md memory: "deviate
-  explicitly when Photonic isn't the best answer").
+  re-litigating the same discrepancies — the project convention is to
+  treat Photonic as the default reference but deviate explicitly,
+  with a documented reason, when Photonic isn't the best answer.
 
 **Phase 2a exit criteria** (Phase 2a is done when ALL are met):
 - [x] "snk" 35-output discrepancy reconciled with documented explanation
@@ -828,14 +828,12 @@ bugs found here are fixed in M2.1.
 
 ## Dependencies & Prerequisites
 
-- VPS Radiant node at `89.117.20.219` (existing, used by M1 deploy
+- A self-hosted Radiant full node (existing, used by M1 deploy
   integration tests)
 - ElectrumX mainnet endpoint for chain walking in Phase 2a
-- Photonic Wallet TS source (re-clone if `/tmp/photonic-wallet/` is
-  no longer cached)
-- glyph-miner at `/home/eric/apps/Pinball/glyph-miner/` (already
-  present from M1)
-- RXinDexer at `/home/eric/apps/Pinball/RXinDexer/` (already present)
+- Photonic Wallet TS source (clone locally if not already cached)
+- glyph-miner (already cloned locally from M1)
+- RXinDexer (already cloned locally)
 
 ## Risk Analysis & Mitigation
 
@@ -852,7 +850,7 @@ bugs found here are fixed in M2.1.
 - **R2: glyph-miner refuses to mine pyrxd-deployed contracts** for a
   shape reason we missed. Manual acceptance gate fails.
   - *Mitigation*: Phase 2a includes reading glyph-miner's
-    `parseDmintScript` ([glyph.ts:277-322](file:///home/eric/apps/Pinball/glyph-miner/src/glyph.ts))
+    `parseDmintScript` (glyph-miner `src/glyph.ts:277-322`)
     and asserting our contract output script byte-for-byte matches
     `V1_BYTECODE_PART_B`. Plus the consecutive-vouts requirement is
     a hard test gate.
@@ -966,17 +964,20 @@ Every critical gap from the SpecFlow analysis is addressed:
 - [`src/pyrxd/glyph/dmint.py:352-504`](../../src/pyrxd/glyph/dmint.py#L352) — M1 V1 builders
 - [`src/pyrxd/glyph/dmint.py:2156`](../../src/pyrxd/glyph/dmint.py#L2156) — `find_dmint_funding_utxo` (pattern to mirror)
 - [`tests/test_dmint_deploy_integration.py:355-545`](../../tests/test_dmint_deploy_integration.py#L355) — VPS testmempoolaccept harness
-- [Memory: Photonic is the canonical reference](file:///home/eric/.claude/projects/-home-eric-apps-pyrxd/memory/feedback_photonic_canonical_reference.md)
+- Project convention — Photonic's TypeScript source is the default
+  reference for protocol questions, but pyrxd deviates explicitly
+  (with a documented reason) when Photonic is buggy, outdated, or
+  worse-engineered than the alternative.
 
 ### External
 
-- glyph-miner (MIT) at `/home/eric/apps/Pinball/glyph-miner/`:
+- glyph-miner (MIT):
   - `src/dmint-api.ts:309-342` — RXinDexer-driven discovery
   - `src/deployments.ts:90-98, 207-219` — fallback URL + per-token
     enumeration via consecutive vouts
   - `src/glyph.ts:103-105, 265, 277-322, 391-441` — V1 contract-script
     parser (the "what bytes glyph-miner actually checks")
-- RXinDexer at `/home/eric/apps/Pinball/RXinDexer/`:
+- RXinDexer:
   - `indexer/parser.py:540-542` — auto-discovery via
     `detect_token_from_script`
   - `indexer/script_utils.py:262-373` — V1+V2 dMint contract parser

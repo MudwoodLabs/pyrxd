@@ -257,3 +257,243 @@ class TestDefaultNWorkers:
         """Some sandboxed environments make os.cpu_count() return None.
         The helper must still produce a usable integer ≥ 1."""
         assert default_n_workers() >= 1
+
+
+# ---------------------------------------------------------------------------
+# Orphan-prevention regression tests
+#
+# Historical bug (saved in pyrxd memory as
+# `project_orphan_workers_diagnostic`): pytest crashes or timeouts during
+# mine() left up to N worker processes orphaned, each grinding to nonce_max
+# at 99.9% CPU until they finished naturally. Fix: mine() now uses
+# _ensure_workers_terminated to guarantee cleanup on any exit path.
+#
+# These tests spawn mine() in a SEPARATE subprocess so we can simulate
+# interruption mid-mine and then assert that no grandchildren survived.
+# ---------------------------------------------------------------------------
+
+
+def _run_long_mine_in_subprocess() -> None:
+    """Entry point used by the orphan-prevention tests.
+
+    Starts mine() with a huge nonce_max so it WOULD run for a long time.
+    The parent kills this subprocess; the orphan-prevention machinery in
+    mine() must terminate all workers before this process dies.
+    """
+    from pyrxd.contrib.miner.parallel import MineParams, mine
+
+    mine(
+        MineParams(
+            preimage=bytes.fromhex("ab" * 64),
+            target=1,  # impossibly tight → workers will grind to nonce_max
+            nonce_width=8,
+            n_workers=2,
+            # 2^40 nonces × 2 workers — would take hours without cleanup.
+            nonce_max=2**40,
+        )
+    )
+
+
+def _run_short_mine_in_subprocess() -> None:
+    """Entry point: mine() that exhausts naturally in milliseconds.
+
+    Used by the baseline orphan test to verify that even a clean,
+    non-interrupted mine() reaps its workers before returning.
+    """
+    from pyrxd.contrib.miner.parallel import MineParams, mine
+
+    mine(
+        MineParams(
+            preimage=bytes.fromhex("ab" * 64),
+            target=0x7FFFFFFFFFFFFFFF,
+            nonce_width=4,
+            n_workers=2,
+            nonce_max=256,
+        )
+    )
+
+
+class TestOrphanPrevention:
+    """Regression tests for the parallel-miner orphan-worker leak.
+
+    Pattern: spawn a python subprocess that runs mine() with an impossible
+    target + huge nonce_max. Send the subprocess a signal (SIGTERM /
+    SIGINT). After the subprocess exits, confirm no grandchild Python
+    processes remain.
+    """
+
+    @staticmethod
+    def _spawn_mine_subprocess() -> mp.process.BaseProcess:
+        """Spawn _run_long_mine_in_subprocess in a fresh process."""
+        ctx = mp.get_context("spawn")
+        p = ctx.Process(target=_run_long_mine_in_subprocess)
+        p.start()
+        return p
+
+    @staticmethod
+    def _wait_for_workers_to_start(parent_pid: int, want: int = 2, timeout_s: float = 5.0) -> None:
+        """Block until ``parent_pid`` has at least ``want`` python children."""
+        import time
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            n = TestOrphanPrevention._count_python_children(parent_pid)
+            if n >= want:
+                return
+            time.sleep(0.05)
+        raise AssertionError(f"timed out waiting for {want} workers under PID {parent_pid}")
+
+    @staticmethod
+    def _count_python_children(parent_pid: int) -> int:
+        """Count direct children of parent_pid via /proc.
+
+        Uses /proc/<pid>/task/<pid>/children which is a file (not a dir)
+        containing space-separated child PIDs.
+        """
+        try:
+            with open(f"/proc/{parent_pid}/task/{parent_pid}/children") as f:
+                content = f.read().strip()
+        except (FileNotFoundError, PermissionError):
+            return 0
+        if not content:
+            return 0
+        return len(content.split())
+
+    @staticmethod
+    def _direct_children(parent_pid: int) -> list[int]:
+        """Return the direct child PIDs of parent_pid."""
+        try:
+            with open(f"/proc/{parent_pid}/task/{parent_pid}/children") as f:
+                content = f.read().strip()
+        except (FileNotFoundError, PermissionError):
+            return []
+        if not content:
+            return []
+        return [int(s) for s in content.split()]
+
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """True iff /proc/<pid> exists AND the process is not a zombie.
+
+        Zombies still show in /proc until reaped, but they're not consuming
+        CPU. Treat them as dead for the orphan-detection purpose: the
+        original bug was workers eating 99.9% CPU, which zombies don't.
+        """
+        try:
+            with open(f"/proc/{pid}/status") as f:
+                status = f.read()
+        except (FileNotFoundError, PermissionError):
+            return False
+        state_line = next((ln for ln in status.split("\n") if ln.startswith("State:")), "")
+        if not state_line:
+            return False
+        # 'Z' = zombie. Anything else (R, S, D, T, t, X) we treat as alive.
+        return "Z" not in state_line.split(":", 1)[1]
+
+    def test_normal_completion_leaves_no_orphans(self):
+        """Sanity baseline: a tiny mine() that exhausts naturally leaves
+        no orphans after the subprocess exits.
+
+        Why a subprocess and not an in-process mine()? Running mine()
+        in-process makes the workers direct children of the pytest
+        runner, which also spawns its own helpers (xdist, coverage,
+        plugin processes). Diffing /proc children before/after picks
+        up those unrelated helpers as false positives. A subprocess
+        gives us a clean parent boundary.
+        """
+        import time
+
+        ctx = mp.get_context("spawn")
+        p = ctx.Process(target=_run_short_mine_in_subprocess)
+        p.start()
+        worker_pids: list[int] = []
+        try:
+            # Workers appear, then the tiny nonce_max=256 sweep exhausts
+            # in <100ms. Race: workers may have already exited by the
+            # time we read /proc/<p.pid>/task/.../children. That's fine
+            # — if worker_pids is empty we just have nothing to check.
+            self._wait_for_workers_to_start(p.pid, want=1, timeout_s=5.0)
+            worker_pids = self._direct_children(p.pid)
+        except AssertionError:
+            # Workers came and went before we could observe them — that
+            # IS the happy path for natural completion. Fall through and
+            # let p.join() confirm clean exit.
+            pass
+
+        p.join(timeout=10.0)
+        assert not p.is_alive(), "mine() subprocess did not exit cleanly"
+        assert p.exitcode == 0, f"subprocess exit code {p.exitcode}"
+
+        time.sleep(0.25)
+        survivors = [pid for pid in worker_pids if self._pid_alive(pid)]
+        assert not survivors, f"normal mine() leaked workers: {sorted(survivors)}"
+
+    def test_sigterm_terminates_all_workers(self):
+        """The regression test for the original bug.
+
+        Pattern: capture the worker PIDs while the parent is still alive
+        (so /proc/<parent>/task/<parent>/children is still readable), THEN
+        send SIGTERM to the parent. After the parent exits, the workers
+        get re-parented to init (PID 1) — we can't find them by walking
+        from the dead parent, so we have to remember who they were.
+        """
+        import os
+        import signal as signal_mod
+        import time
+
+        p = self._spawn_mine_subprocess()
+        worker_pids: list[int] = []
+        try:
+            self._wait_for_workers_to_start(p.pid, want=2, timeout_s=5.0)
+            worker_pids = self._direct_children(p.pid)
+            assert len(worker_pids) >= 2, f"expected ≥2 workers under parent {p.pid}, got {worker_pids}"
+
+            os.kill(p.pid, signal_mod.SIGTERM)
+            p.join(timeout=5.0)
+            assert not p.is_alive(), "mine() subprocess did not exit within 5s of SIGTERM"
+
+            # Give the OS up to 1s to fully reap children.
+            time.sleep(1.0)
+            survivors = [pid for pid in worker_pids if self._pid_alive(pid)]
+            assert not survivors, f"SIGTERM left {len(survivors)} orphan workers behind: {survivors}"
+        finally:
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2.0)
+            for orphan in worker_pids:
+                if self._pid_alive(orphan):
+                    try:
+                        os.kill(orphan, signal_mod.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+    def test_keyboard_interrupt_terminates_all_workers(self):
+        """Same as SIGTERM but via SIGINT (Ctrl-C / KeyboardInterrupt)."""
+        import os
+        import signal as signal_mod
+        import time
+
+        p = self._spawn_mine_subprocess()
+        worker_pids: list[int] = []
+        try:
+            self._wait_for_workers_to_start(p.pid, want=2, timeout_s=5.0)
+            worker_pids = self._direct_children(p.pid)
+            assert len(worker_pids) >= 2
+
+            os.kill(p.pid, signal_mod.SIGINT)
+            p.join(timeout=5.0)
+            assert not p.is_alive()
+
+            time.sleep(1.0)
+            survivors = [pid for pid in worker_pids if self._pid_alive(pid)]
+            assert not survivors, f"SIGINT left {len(survivors)} orphan workers behind: {survivors}"
+        finally:
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2.0)
+            for orphan in worker_pids:
+                if self._pid_alive(orphan):
+                    try:
+                        os.kill(orphan, signal_mod.SIGKILL)
+                    except ProcessLookupError:
+                        pass

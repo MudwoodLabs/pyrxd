@@ -126,6 +126,37 @@ The hook is **strongly recommended** if you push to PRs frequently —
 catching CI failures locally takes 3-5 minutes; finding out via a failed
 PR check takes 4-6 minutes plus another full CI run after fixing.
 
+### Test fixtures and secrets
+
+Test fixtures that exercise wallet, signing, or key-derivation paths
+generate **disposable per-run mnemonics** via
+`HdWallet.from_mnemonic(secrets.SystemRandom().choice(...))` or
+equivalent. The mnemonic exists only inside the test process and
+never leaves it.
+
+Two rules follow from this:
+
+1. **Never commit a snapshot file or test fixture containing a real
+   BIP39 mnemonic** — yours or anyone else's. Even a published "test
+   vector" mnemonic (e.g. the `abandon abandon ... about` canonical
+   BIP39 vector) should only be referenced by name in source, not
+   embedded in a file the test compares against by string-equality
+   under an assertion that could regress and serialize it into a
+   traceback. If you find yourself reaching for snapshot testing
+   (`syrupy`, etc.), open an issue first so we can decide on a
+   pre-commit hook that scans snapshot files for BIP39-shaped
+   strings.
+
+2. **`result.output` from `CliRunner` captures contain the
+   mnemonic in JSON-mode tests** (per #9). pytest's assertion
+   introspection may include `result.output` in a traceback if a
+   downstream assertion fails. This is low-risk in practice —
+   mnemonics are random per-run, CI logs are private — but worth
+   knowing. If you need to assert on output that doesn't need the
+   mnemonic itself, extract the specific field you're checking
+   (e.g. `_extract_json(result.output)["address"]`) rather than
+   asserting on the whole output blob.
+
 ## Commit message style
 
 Conventional Commits with a scope:
