@@ -26,7 +26,10 @@ from __future__ import annotations
 import hashlib
 import multiprocessing as mp
 import os
+import signal
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .protocol import MAX_SHA256D_TARGET, MineExhausted, MineSuccess
@@ -133,28 +136,35 @@ def mine(params: MineParams) -> MineSuccess | MineExhausted:
     # attempts_counter: aggregate across workers. "Q" same rationale.
     attempts_counter = ctx.Value("Q", 0)
 
-    procs = []
+    procs: list[mp.process.BaseProcess] = []
     started = time.monotonic()
-    for worker_id in range(params.n_workers):
-        p = ctx.Process(
-            target=_worker,
-            args=(
-                params.preimage,
-                params.target,
-                params.nonce_width,
-                worker_id,  # start
-                params.nonce_max,  # stop
-                params.n_workers,  # stride
-                found_event,
-                found_value,
-                attempts_counter,
-            ),
-        )
-        p.start()
-        procs.append(p)
+    # All worker management runs under _ensure_workers_terminated so that
+    # any exit path — normal return, exception, SIGTERM, SIGINT, KeyboardInterrupt —
+    # leaves no orphaned worker processes consuming CPU after this function returns.
+    # Historically (pre-2026-05) this code only used `p.join()`; a pytest crash
+    # or timeout during mine() would orphan up to N workers that continued
+    # grinding until they hit nonce_max, eating cores indefinitely.
+    with _ensure_workers_terminated(procs):
+        for worker_id in range(params.n_workers):
+            p = ctx.Process(
+                target=_worker,
+                args=(
+                    params.preimage,
+                    params.target,
+                    params.nonce_width,
+                    worker_id,  # start
+                    params.nonce_max,  # stop
+                    params.n_workers,  # stride
+                    found_event,
+                    found_value,
+                    attempts_counter,
+                ),
+            )
+            p.start()
+            procs.append(p)
 
-    for p in procs:
-        p.join()
+        for p in procs:
+            p.join()
 
     elapsed = time.monotonic() - started
 
@@ -168,6 +178,62 @@ def mine(params: MineParams) -> MineSuccess | MineExhausted:
         attempts=attempts_counter.value,
         elapsed_s=elapsed,
     )
+
+
+# Grace period for cooperative shutdown after found_event is set.
+# Workers poll the event every `check_interval` hashes (~256 hashes in
+# the current impl), so this should be near-instantaneous in practice.
+_WORKER_TERMINATE_GRACE_S = 1.0
+# Hard kill grace after SIGTERM. If a worker is in a tight C loop and
+# ignores SIGTERM, SIGKILL after this.
+_WORKER_KILL_GRACE_S = 0.5
+
+
+@contextmanager
+def _ensure_workers_terminated(
+    procs: list[mp.process.BaseProcess],
+) -> Iterator[None]:
+    """Guarantee every spawned worker is reaped before this context exits.
+
+    Catches every interrupt path that can leak workers:
+
+    1. Normal completion — procs already joined; terminate() is a no-op.
+    2. Unhandled exception inside the with-block — terminate + join all.
+    3. KeyboardInterrupt (Ctrl-C) — same as above.
+    4. SIGTERM delivered to the parent (pytest --timeout, OOM killer,
+       `kill <pid>`) — restored signal handler triggers cleanup via
+       a raised KeyboardInterrupt-style interrupt, then we cascade
+       terminate() to children.
+
+    The SIGTERM handler is installed only for the duration of the
+    context and is restored afterward, so we don't pollute callers'
+    signal handling.
+    """
+
+    # Install a SIGTERM handler that cascades to children. SIGINT
+    # (Ctrl-C) already raises KeyboardInterrupt which the finally
+    # block catches; SIGTERM by default just kills the process
+    # without finally running, so we explicitly handle it.
+    def _sigterm_to_keyboard_interrupt(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt("SIGTERM received — terminating mine() workers")
+
+    previous_handler = signal.signal(signal.SIGTERM, _sigterm_to_keyboard_interrupt)
+    try:
+        yield
+    finally:
+        # Restore the caller's SIGTERM handler before doing the cleanup
+        # work itself, so a second SIGTERM during cleanup behaves
+        # normally rather than recursing.
+        signal.signal(signal.SIGTERM, previous_handler)
+        for p in procs:
+            if p.is_alive():
+                p.terminate()
+        for p in procs:
+            p.join(_WORKER_TERMINATE_GRACE_S)
+            if p.is_alive():
+                # Worker ignored SIGTERM — escalate to SIGKILL.
+                p.kill()
+                p.join(_WORKER_KILL_GRACE_S)
 
 
 def default_n_workers() -> int:

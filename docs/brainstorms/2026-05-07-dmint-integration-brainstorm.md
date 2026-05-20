@@ -206,4 +206,4 @@ future. No chain query needed to confirm.
 - [`docs/dmint-research-mainnet.md`](../dmint-research-mainnet.md) — live V1 contract decode + mint trace
 - [`src/pyrxd/glyph/dmint.py`](../../src/pyrxd/glyph/dmint.py) — current implementation
 - [`src/pyrxd/glyph/builder.py:291`](../../src/pyrxd/glyph/builder.py#L291) — `prepare_dmint_deploy`
-- External: `/home/eric/apps/Pinball/glyph-miner` — fast miner project (not pyrxd)
+- External: the `glyph-miner` project — fast miner reference (not pyrxd)

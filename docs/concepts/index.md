@@ -7,10 +7,10 @@ and how Radiant differs from related blockchains.
 :maxdepth: 1
 
 gravity
+glyph-structures-and-terminology
 radiant-fts-are-on-chain
 dmint-v1-deploy
-glyph-inspect-tool
-parallel-mining
+external-miner-protocol
 ```
 
 ## Available now
@@ -19,6 +19,13 @@ parallel-mining
   Gravity protocol is, what a covenant is, and the difference between
   the mainnet-proven sentinel-artifact path and the experimental
   covenant variants. Read this before integrating `pyrxd.gravity`.
+- **[Understanding Glyph structures and terminology](glyph-structures-and-terminology.md)** —
+  the difference between a `txid`, an `outpoint`, a `GlyphRef`, and a
+  `contract_id`; what each `ft` / `nft` / `mut` / `commit-*` / `dmint`
+  output type actually means; and which identifier to paste where in
+  the inspect tool. Read this first if you've ever been confused by
+  why pasting a "contract id" shows you the *deploy* transaction
+  instead of your *transfer*.
 - **[Radiant FTs are on-chain (not metadata-on-P2PKH)](radiant-fts-are-on-chain.md)** —
   the most common confusion when porting from Atomicals / Runes / SPL
   is to assume Radiant FTs are plain UTXOs with off-chain meaning. This
@@ -29,16 +36,13 @@ parallel-mining
   to Radiant Glyph Protocol), why pyrxd refuses to emit V2 by default,
   and the five Photonic divergences pyrxd ships with. Read this before
   using `prepare_dmint_deploy` with `DmintV1DeployParams`.
-- **[Glyph inspect tool: structural match, not semantic correctness](glyph-inspect-tool.md)** —
-  what `pyrxd glyph inspect` (CLI) and the browser-hosted Pyodide
-  inspector at `/inspect/` actually classify, the structural-match
-  qualifier on every output, the tx-shape banner (FT/NFT/dMint
-  deploy/claim, burn, mutable update), V1-vs-V2 mint scriptSig decode,
-  and the SHA-256 install-time integrity model of the browser variant.
-- **[Parallel mining and the external-miner protocol](parallel-mining.md)** —
-  the JSON-over-stdio protocol pyrxd uses to delegate nonce search to
-  external miners, the bundled `pyrxd.contrib.miner` reference
-  implementation, and why pure-Python is the safer default for V1.
+- **[External miner protocol: JSON-over-stdio subprocess contract](external-miner-protocol.md)** —
+  the wire protocol `mine_solution_external` uses to drive a fast
+  external miner binary as a child process. Documents the request /
+  response JSON shapes, exit-code handling, the `EXTERNAL_MINER` /
+  `EXTERNAL_MINER_TIMEOUT_S` env vars used by the dMint claim demo,
+  what the library re-verifies before trusting a returned nonce, and
+  a 20-line reference miner that fits the contract.
 
 ## Adjacent reading (not yet promoted to concept docs)
 

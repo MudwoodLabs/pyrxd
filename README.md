@@ -41,6 +41,32 @@ Cryptographic primitives have not been independently audited. See
   full PoW mint covenant is documented in `docs/dmint-followup.md` as future
   work.
 
+## Upgrading
+
+Pin pyrxd to a specific version in production and move versions deliberately.
+Between minor versions before 1.0, APIs can change in breaking ways
+(see [CHANGELOG](CHANGELOG.md)).
+
+**Do not downgrade after creating a wallet with a non-default `coin_type`.**
+Since 0.3.0, `HdWallet` stores the derivation `coin_type` in the wallet
+file and validates it on load. If you:
+
+1. Create a wallet at `coin_type=0` (e.g. for Photonic recovery)
+2. Downgrade to a pre-0.3.0 pyrxd
+3. Save the wallet under the old code
+
+…the old code will overwrite the stored `coin_type` with its hardcoded
+default (512) while the derived keys remain rooted at `m/44'/0'/…`.
+A subsequent upgrade and `load(..., coin_type=0)` will fail validation
+against the now-corrupted `512` value, locking you out of the friendly
+recovery path. The underlying funds are still recoverable from the
+mnemonic, but you will need to re-create the wallet file explicitly with
+`coin_type=0`.
+
+**Mitigation:** pin all machines accessing the same wallet to the same
+pyrxd version. Downgrading is unsupported once 0.3.0 has written a
+`coin_type`-annotated wallet file.
+
 ## Installation
 
 ```bash

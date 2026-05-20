@@ -426,7 +426,7 @@ class TestVerifySha256dSolution:
         # Need to mock the second sha256 call (sha256d = sha256(sha256(x)))
         # Both calls go through hashlib.sha256(...).digest() — patch the
         # final returned hash.
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             # value = 0x100, so:
             # target = 0x101 → value (0x100) < target (0x101) → True
@@ -449,7 +449,7 @@ class TestVerifySha256dSolution:
         # value = MAX_SHA256D_TARGET + 1 — would exceed even after clamp
         fake_value = MAX_SHA256D_TARGET + 1
         fake_hash = b"\x00\x00\x00\x00" + fake_value.to_bytes(8, "big") + b"\xff" * 20
-        with patch("pyrxd.glyph.dmint.hashlib") as mock_hashlib:
+        with patch("pyrxd.glyph.dmint.miner.hashlib") as mock_hashlib:
             mock_hashlib.sha256.return_value.digest.return_value = fake_hash
             # MAX target: value > MAX, must reject
             assert not verify_sha256d_solution(b"\x00" * 64, b"\x00" * 8, MAX_SHA256D_TARGET)

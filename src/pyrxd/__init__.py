@@ -38,7 +38,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # Map of public-name → (module, attr) pairs. Resolved lazily on first
 # attribute access. Order is alphabetical by name to make additions

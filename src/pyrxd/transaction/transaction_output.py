@@ -47,5 +47,14 @@ class TransactionOutput:
             if script_length is None:
                 raise ValueError("failed to read script length")
             locking_script_bytes = stream.read_bytes(script_length)
+            # read_bytes returns however many bytes are left at EOF, not an error.
+            # A varint that over-claims the script length must NOT yield a valid
+            # output with a silently truncated script — that would corrupt any
+            # hash computed over these bytes (e.g. Radiant's hashOutputHashes).
+            if len(locking_script_bytes) != script_length:
+                raise ValueError(
+                    f"truncated output script: varint claims {script_length} bytes, "
+                    f"only {len(locking_script_bytes)} available"
+                )
             return TransactionOutput(locking_script=Script(locking_script_bytes), satoshis=satoshis)
         return None

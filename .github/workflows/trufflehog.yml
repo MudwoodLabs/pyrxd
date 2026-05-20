@@ -1,0 +1,75 @@
+# trufflehog — defense-in-depth secret scanner.
+#
+# pyrxd has `detect-secrets` as a pre-commit hook (per #17), but a
+# contributor without pre-commit installed — or one who runs
+# `--no-verify` — bypasses local checks entirely. CI is the only
+# enforcement point we can trust for outside contributors and for
+# our own moments of haste. See issue #21 for the full rationale.
+#
+# Why trufflehog and not gitleaks: gitleaks-action@v2 requires a paid
+# license key (`GITLEAKS_LICENSE`) for any repository owned by a
+# GitHub *organization*, including ours. The gitleaks CLI is MIT but
+# the official action wrapper is paywalled for orgs. trufflehog
+# (trufflesecurity/trufflehog) has equivalent scanning, fully OSS,
+# no license requirement, and is already used by sibling repos in
+# the MudwoodLabs org (e.g. radiant-glyph-guide).
+#
+# The `.gitleaks.toml` config at repo root remains in place because
+# pre-commit's local `detect-secrets` + `gitleaks` hooks still read
+# it. trufflehog has its own ruleset baked into the binary and
+# does not require a config file for the defense-in-depth use case.
+
+name: trufflehog
+
+on:
+  # PR-scan: every PR gets a fresh secret scan against its diff +
+  # whatever's in the worktree. Blocks merge if a secret is found.
+  pull_request:
+    branches: [main]
+  # Push-scan: catches anything that lands on main directly (admin
+  # override of branch protection, etc.).
+  push:
+    branches: [main]
+  # Weekly full-history audit. The PR/push scans only cover the
+  # current head; a scheduled run re-scans the whole git history,
+  # catching anything that slipped in before this workflow existed
+  # or before a new rule was added to trufflehog's default ruleset.
+  # Staggered from CodeQL (06:00) and Scorecard (07:00) to avoid
+  # competing for runner capacity.
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel in-flight runs when a new commit lands on the same branch/PR.
+# Matches the cancellation policy in ci.yml / codeql.yml / lint.yml /
+# osv-scanner.yml (per #89). Free Actions minutes are not free.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Scan for leaked secrets
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          # Full history for the weekly scheduled scan. The PR/push
+          # scans don't strictly need it but trufflehog handles
+          # incremental scans efficiently either way.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Trufflehog scan
+        uses: trufflesecurity/trufflehog@37b77001d0174ebec2fcca2bd83ff83a6d45a3ab  # v3.95.3
+        with:
+          # --results=verified,unknown — flag verified leaks (real
+          # credentials confirmed by the issuer's API) and unknown
+          # matches (pattern matches that couldn't be auto-verified).
+          # Skips unverified because that bucket is mostly noise from
+          # documentation examples and test vectors.
+          extra_args: --results=verified,unknown

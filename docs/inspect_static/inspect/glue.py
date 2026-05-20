@@ -41,7 +41,15 @@ import unicodedata
 # fails on Pyodide before pyrxd's import chain triggers, then we route
 # every ``Cryptodome.*`` lookup through the ``Crypto.*`` package.
 try:
-    import Cryptodome  # noqa: F401  # native pycryptodomex path
+    # Availability probe — we don't reference the import binding,
+    # we're only catching ImportError to drive the Pyodide alias setup
+    # below. Using importlib.util.find_spec to make the intent loud
+    # to both readers and code-scanning tools (CodeQL's py/unused-import
+    # flags the plain `import Cryptodome` form even with a noqa).
+    import importlib.util
+
+    if importlib.util.find_spec("Cryptodome") is None:
+        raise ImportError("Cryptodome not available (likely Pyodide)")
 except ImportError:
     import Crypto
     import Crypto.Cipher
@@ -354,13 +362,9 @@ def _hint_for(form: str) -> str:
     """A one-line follow-up hint per failed-form."""
     return {
         "contract": (
-            "Glyph contract ids are 72 hex characters: "
-            "<32-byte txid in display order><4-byte vout in big endian>"
+            "Glyph contract ids are 72 hex characters: <32-byte txid in display order><4-byte vout in big endian>"
         ),
-        "outpoint": (
-            "Outpoints look like '<64-char-txid>:<vout-int>' "
-            "— check your colon and length"
-        ),
+        "outpoint": ("Outpoints look like '<64-char-txid>:<vout-int>' — check your colon and length"),
         "script": (
             "Scripts are hex-encoded locking-script bytes. "
             "P2PKH is 25 bytes (50 hex chars); FT is 75 bytes (150 hex chars)."
