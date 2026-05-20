@@ -2,8 +2,20 @@
 title: Ref-bearing Gravity covenant — atomic Glyph FT/NFT ↔ BTC swaps
 type: feat
 date: 2026-05-19
-status: draft
+status: SUPERSEDED (2026-05-20) — core architecture falsified on-chain
+superseded_by: docs/plans/2026-05-20-feat-gravity-ft-covenant-spend-path-plan.md
 ---
+
+> **⚠️ SUPERSEDED 2026-05-20.** This plan's central model — *lock the
+> ref-bearing FT UTXO **into** the covenant* — was **falsified on-chain**:
+> an FT's `codeScriptHashValueSum` epilogue rejects a foreign-code-script
+> output, so an FT cannot be held in a foreign covenant. The corrected
+> architecture (covenant gates the FT's **spend-path**; FT-shaped
+> settlement output; hash-compare not embedded bytes; FT ref = genesis
+> outpoint) and an FT-only v1 scope live in
+> [2026-05-20-feat-gravity-ft-covenant-spend-path-plan.md](2026-05-20-feat-gravity-ft-covenant-spend-path-plan.md).
+> Phase 1 (sighash de-dup) here was completed and merged (PR #124) and is
+> carried forward. Read the new plan for everything else.
 
 # Ref-bearing Gravity covenant — atomic Glyph FT/NFT ↔ BTC swaps
 
