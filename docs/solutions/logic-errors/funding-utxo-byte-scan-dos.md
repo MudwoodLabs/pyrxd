@@ -16,6 +16,7 @@ related_files:
   - tests/test_dmint_v1_mint.py
 related_solutions:
   - docs/solutions/logic-errors/dmint-v1-mint-shape-mismatch.md
+  - docs/solutions/logic-errors/ft-in-covenant-two-consensus-gates.md
 ---
 
 ## Symptom
