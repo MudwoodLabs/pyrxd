@@ -872,3 +872,28 @@ keep everything else. Generate, compile with `rxdc 0.1.0`, run the two static
 guards, THEN the on-chain legs (fund FT into the fused covenant; finalize with
 a real SPV proof; forfeit; negatives). Reuse `build_finalize_tx`'s SPV-proof
 scriptSig assembly from pyrxd `gravity/transactions.py`.
+
+### Phase 4 — fusion compiles + passes both static guards (2026-05-20)
+
+The fused FT covenant is built (`fuse_ft_covenant.py` applies the 4 deltas to
+a generated `gen_maker_covenant.js 6 12 --flat --btc-type p2wpkh` covenant)
+and compiled: `GravityFtCovenant.rxd` / `.artifact.json`, `rxdc 0.1.0`,
+**4819-byte** prologue (full SPV half + FT hardening + hash-compare routes).
+
+**The novel Phase-4 risk is retired.** With realistic substituted params +
+the appended `bd d0 <ref> dec0…` epilogue (full script 4936 B), both static
+guards PASS:
+- **Guard 1 (codeScriptHash boundary):** exactly one opcode-position `0xbd`,
+  at offset 4886 = the epilogue separator. The entire SPV block — full of
+  `split`/byte-literals — contains no bare `OP_STATESEPARATOR`, so the FT
+  conserves exactly as the Phase-2 prologue did.
+- **Guard 2 (phantom-free):** `count_input_refs` == `{genesis_ref: 2}` (the
+  prologue push + epilogue push of the same ref dedup to one distinct ref).
+  No `0xd0`–`0xd8` byte in the ~4.9KB SPV block was mis-parsed as a ref.
+
+So the SPV+FT fusion is byte-valid by construction. Remaining Phase-4 work is
+mechanical relative to this: the H1 per-offer `btcReceiveHash` binding, the
+tx builders (reusing `build_finalize_tx`'s SPV scriptSig assembly), and the
+on-chain legs (fund → finalize-with-real-SPV-proof → forfeit → negatives).
+NOT yet proven on-chain — the guards are static; the spend still needs a
+real SPV proof + `testmempoolaccept`.
