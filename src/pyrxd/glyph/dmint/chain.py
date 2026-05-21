@@ -33,7 +33,6 @@ Symbols (19):
     _V1_EPILOGUE_LEN (re-export from builders),
     _match_v1_epilogue,
     DmintState, DmintContractUtxo, DmintMinerFundingUtxo,
-    _FUNDING_REF_OPCODE_RANGE,
     is_token_bearing_script, find_dmint_funding_utxo,
     _scripthash_for_script, find_dmint_contract_utxos,
     _find_v1_contract_utxos_fast, _find_v1_contract_utxos_walk,
@@ -53,6 +52,7 @@ from pyrxd.security.errors import (
     ValidationError,
 )
 
+from ..script import TruncatedScriptError, iter_input_refs
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 from .builders import (
     _V1_ALGO_BYTE_TO_ENUM,
@@ -482,76 +482,27 @@ class DmintMinerFundingUtxo:
     script: bytes
 
 
-# Opcodes in the OP_PUSHINPUTREF family — any of these in a candidate
-# funding script (as an *opcode*, not as push-data payload) is grounds
-# for refusing to spend it as fee.
-# 0xd0 OP_PUSHINPUTREF, 0xd1 OP_REQUIREINPUTREF, 0xd2 OP_DISALLOWPUSHINPUTREF,
-# 0xd3 OP_DISALLOWPUSHINPUTREFSIBLING, 0xd4–0xd7 reserved/related,
-# 0xd8 OP_PUSHINPUTREFSINGLETON.
-_FUNDING_REF_OPCODE_RANGE = range(0xD0, 0xD9)
-
-
 def is_token_bearing_script(script: bytes) -> bool:
     """Return True if ``script`` uses any OP_PUSHINPUTREF-family opcode.
 
-    Walks the script as an opcode stream: push opcodes (0x01..0x4e) consume
-    their payload, and only the *opcode position* bytes are checked against
-    the deny-list. A naive bare-byte scan would falsely flag any P2PKH
-    whose 20-byte hash contains a 0xd0–0xd8 byte (~51% of random
-    addresses), denying about half of honest miners.
+    Walks the script as an opcode stream so that only *opcode position* bytes
+    are checked against the ref-opcode range — a naive bare-byte scan would
+    falsely flag any P2PKH whose 20-byte hash contains a 0xd0–0xd8 byte (~51%
+    of random addresses), denying about half of honest miners.
 
-    Push opcode encoding (Bitcoin/Radiant script):
+    Truncated push fields are treated as token-bearing — a malformed script of
+    ambiguous length should not be accepted as funding.
 
-    - ``0x01..0x4b``: push the next N bytes (N == opcode value)
-    - ``0x4c`` PUSHDATA1: next 1 byte is length, then push that many
-    - ``0x4d`` PUSHDATA2: next 2 bytes (LE) are length, then push
-    - ``0x4e`` PUSHDATA4: next 4 bytes (LE) are length, then push
-    - everything else: opcode with no payload (advance by 1)
-
-    Truncated push fields are treated as token-bearing — a malformed
-    script of ambiguous length should not be accepted as funding.
+    Built on the shared opcode walker
+    :func:`pyrxd.glyph.script.iter_input_refs` (single source of truth for
+    ref detection; see also ``count_input_refs`` for the
+    exactly-which-refs covenant guard).
     """
-    pos = 0
-    n = len(script)
-    while pos < n:
-        op = script[pos]
-        if op in _FUNDING_REF_OPCODE_RANGE:
-            return True
-        # Direct push: 1..0x4b bytes follow.
-        if 0x01 <= op <= 0x4B:
-            new_pos = 1 + pos + op
-            if new_pos > n:
-                return True  # truncated push: refuse the funding UTXO
-            pos = new_pos
-            continue
-        if op == 0x4C:  # PUSHDATA1
-            if pos + 1 >= n:
-                return True
-            length = script[pos + 1]
-            new_pos = pos + 2 + length
-            if new_pos > n:
-                return True
-            pos = new_pos
-            continue
-        if op == 0x4D:  # PUSHDATA2
-            if pos + 2 >= n:
-                return True
-            length = int.from_bytes(script[pos + 1 : pos + 3], "little")
-            new_pos = pos + 3 + length
-            if new_pos > n:
-                return True
-            pos = new_pos
-            continue
-        if op == 0x4E:  # PUSHDATA4
-            if pos + 4 >= n:
-                return True
-            length = int.from_bytes(script[pos + 1 : pos + 5], "little")
-            new_pos = pos + 5 + length
-            if new_pos > n:
-                return True
-            pos = new_pos
-            continue
-        pos += 1
+    try:
+        for _op, _operand in iter_input_refs(script):
+            return True  # found an OP_PUSHINPUTREF-family opcode
+    except TruncatedScriptError:
+        return True  # malformed / ambiguous length: refuse the funding UTXO
     return False
 
 

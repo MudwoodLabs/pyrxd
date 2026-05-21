@@ -15,9 +15,11 @@ from pyrxd.glyph.payload import (
     encode_payload,
 )
 from pyrxd.glyph.script import (
+    TruncatedScriptError,
     build_commit_locking_script,
     build_ft_locking_script,
     build_nft_locking_script,
+    count_input_refs,
     extract_owner_pkh_from_ft_script,
     extract_owner_pkh_from_nft_script,
     extract_ref_from_ft_script,
@@ -25,6 +27,7 @@ from pyrxd.glyph.script import (
     hash_payload,
     is_ft_script,
     is_nft_script,
+    iter_input_refs,
 )
 from pyrxd.glyph.types import GlyphMedia, GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.security.errors import ValidationError
@@ -1427,3 +1430,67 @@ class TestGlyphProtocol:
     def test_protocol_in_metadata(self):
         meta = GlyphMetadata(protocol=[GlyphProtocol.NFT])
         assert list(meta.protocol) == [2]
+
+
+class TestInputRefWalker:
+    """The shared opcode-aware ref walker (iter_input_refs / count_input_refs).
+
+    Single source of truth for ref detection — is_token_bearing_script and the
+    covenant phantom-ref guard both build on it. The contract: ref-range bytes
+    (0xd0..0xd8) count only in *opcode position*, never inside push-data; a
+    truncated push/operand raises TruncatedScriptError.
+    """
+
+    _REF = bytes.fromhex("1d5cc83b4a450a8587044838d933c8cf445bfb0cfe87a9a83241d8868373098c00000000")
+
+    def _ft(self, pkh: bytes = bytes(20)) -> bytes:
+        return b"\x76\xa9\x14" + pkh + b"\x88\xac\xbd\xd0" + self._REF + bytes.fromhex("dec0e9aa76e378e4a269e69d")
+
+    def test_plain_p2pkh_has_no_refs(self):
+        assert count_input_refs(b"\x76\xa9\x14" + bytes(20) + b"\x88\xac") == {}
+
+    def test_ref_byte_in_payload_is_not_a_ref(self):
+        # 0xd0..0xd8 bytes inside the 20-byte pubkey-hash payload must NOT count.
+        spk = b"\x76\xa9\x14" + bytes([0xD0, 0xD8] * 10) + b"\x88\xac"
+        assert count_input_refs(spk) == {}
+
+    def test_standard_ft_has_exactly_one_ref(self):
+        assert count_input_refs(self._ft()) == {self._REF: 1}
+
+    def test_covenant_prologue_ft_dedups_to_one_distinct_ref(self):
+        # prologue OP_PUSHINPUTREF <ref> ... + epilogue bd d0 <ref> dec0..:
+        # two pushes of the SAME ref -> one distinct key, count 2.
+        prologue = b"\xd0" + self._REF + b"\x51"  # PUSHINPUTREF <ref> OP_1
+        full = prologue + b"\xbd\xd0" + self._REF + bytes.fromhex("dec0e9aa76e378e4a269e69d")
+        counts = count_input_refs(full)
+        assert counts == {self._REF: 2}
+        assert set(counts) == {self._REF}  # exactly one distinct ref
+
+    def test_phantom_ref_detected(self):
+        # A 0xd8 in opcode position followed by 36 bytes that are NOT the
+        # intended ref -> a phantom ref the guard must catch.
+        phantom = bytes(range(36))
+        spk = b"\xd0" + self._REF + b"\xd8" + phantom
+        counts = count_input_refs(spk)
+        assert counts == {self._REF: 1, phantom: 1}
+
+    def test_pushdata1_payload_skipped(self):
+        # OP_PUSHDATA1 0x28(40) <40 bytes incl. 0xd0/0xd8> -> no refs counted.
+        payload = bytes([0xD0, 0xD8]) + bytes(38)
+        spk = b"\x4c\x28" + payload
+        assert count_input_refs(spk) == {}
+
+    def test_truncated_ref_operand_raises(self):
+        with pytest.raises(TruncatedScriptError):
+            list(iter_input_refs(b"\xd0\x01\x02\x03"))  # < 36 bytes after 0xd0
+
+    def test_truncated_pushdata_raises(self):
+        with pytest.raises(TruncatedScriptError):
+            list(iter_input_refs(b"\x4c\x10\x01\x02\x03"))  # PUSHDATA1 len 16, 3 follow
+
+    def test_empty_script(self):
+        assert count_input_refs(b"") == {}
+
+    def test_iter_yields_opcode_and_operand(self):
+        spk = b"\xd0" + self._REF
+        assert list(iter_input_refs(spk)) == [(0xD0, self._REF)]

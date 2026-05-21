@@ -33,6 +33,7 @@ __all__ = [
     "KeyMaterialError",
     "MaxAttemptsError",
     "NetworkError",
+    "PolicyRejection",
     "PoolTooSmallError",
     "RxdSdkError",
     "SpvVerificationError",
@@ -114,6 +115,18 @@ class NetworkError(RxdSdkError):
 
 class CovenantError(RxdSdkError):
     """Raised for covenant construction or verification failures."""
+
+
+class PolicyRejection(CovenantError):
+    """Raised when a node rejects a covenant spend on a consensus/policy rule
+    (e.g. ``mandatory-script-verify-flag-failed``, an ElectrumX ``code 1``).
+
+    A subclass of :class:`CovenantError` so existing ``except CovenantError``
+    handlers catch it. Surface this distinctly rather than letting a node
+    rejection be reclassified as :class:`NetworkError` — that masking hid a
+    critical dMint covenant-rejection bug for weeks (see
+    docs/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.md).
+    """
 
 
 class UnsupportedScriptError(RxdSdkError):

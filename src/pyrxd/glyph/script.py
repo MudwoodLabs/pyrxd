@@ -375,3 +375,97 @@ def parse_mutable_nft_script(script: bytes) -> tuple[GlyphRef, bytes] | None:
     payload_hash = script[1:33]
     mutable_ref = GlyphRef.from_bytes(script[36:72])
     return mutable_ref, payload_hash
+
+
+# ---------------------------------------------------------------------------
+# Input-ref opcode walker (shared primitive)
+# ---------------------------------------------------------------------------
+# The OP_PUSHINPUTREF family. Each of these opcodes, when it appears in an
+# *opcode position* (not inside push-data), is followed by a 36-byte ref
+# operand — matching Radiant consensus ``CScript::GetPushRefs``
+# (Radiant-Core/src/script/script.cpp). A bare-byte scan cannot tell an
+# opcode-position ref byte from a 0xd0–0xd8 byte sitting inside a pushed
+# payload (e.g. ~51% of random P2PKH pubkey-hashes contain one); only an
+# opcode-aware walk is correct. See
+# docs/solutions/logic-errors/funding-utxo-byte-scan-dos.md and
+# docs/solutions/logic-errors/ft-in-covenant-two-consensus-gates.md.
+REF_OPCODES = frozenset(range(0xD0, 0xD9))  # 0xd0..0xd8 inclusive
+
+
+class TruncatedScriptError(ValidationError):
+    """A script ends mid-push or mid-ref-operand — its length is ambiguous.
+
+    Raised by :func:`iter_input_refs`. Callers deciding whether a script is
+    safe to spend/accept should treat this as token-bearing / refuse it (a
+    malformed script of ambiguous length must not be admitted as funding).
+    """
+
+
+def iter_input_refs(script: bytes):
+    """Yield ``(opcode, ref_operand)`` for each OP_PUSHINPUTREF-family opcode
+    in *script*, walking it as an opcode stream the way Radiant consensus does
+    (``CScript::GetPushRefs``).
+
+    Push opcodes consume their payload, so a ref-range byte inside push-data is
+    never mistaken for an opcode. Each ``ref_operand`` is the 36 bytes
+    following the opcode.
+
+    Raises :class:`TruncatedScriptError` if the script ends mid-push or a ref
+    opcode's 36-byte operand is truncated — the script's structure is
+    ambiguous and callers should refuse it.
+
+    Push opcode encoding (Bitcoin/Radiant script):
+
+    - ``0x01..0x4b``: push the next N bytes (N == opcode value)
+    - ``0x4c`` PUSHDATA1 / ``0x4d`` PUSHDATA2 / ``0x4e`` PUSHDATA4
+    - everything else: opcode with no payload
+
+    This is the single source of truth for ref detection; build
+    :func:`count_input_refs` and ``is_token_bearing_script`` on it rather than
+    re-implementing the walk.
+    """
+    pos = 0
+    n = len(script)
+    while pos < n:
+        op = script[pos]
+        if op in REF_OPCODES:
+            operand = script[pos + 1 : pos + 37]
+            if len(operand) != 36:
+                raise TruncatedScriptError("ref opcode operand truncated (< 36 bytes)")
+            yield op, operand
+            pos += 37
+            continue
+        if 0x01 <= op <= 0x4B:
+            new_pos = 1 + pos + op
+        elif op == 0x4C:  # PUSHDATA1
+            if pos + 1 >= n:
+                raise TruncatedScriptError("PUSHDATA1 length byte truncated")
+            new_pos = pos + 2 + script[pos + 1]
+        elif op == 0x4D:  # PUSHDATA2
+            if pos + 2 >= n:
+                raise TruncatedScriptError("PUSHDATA2 length truncated")
+            new_pos = pos + 3 + int.from_bytes(script[pos + 1 : pos + 3], "little")
+        elif op == 0x4E:  # PUSHDATA4
+            if pos + 4 >= n:
+                raise TruncatedScriptError("PUSHDATA4 length truncated")
+            new_pos = pos + 5 + int.from_bytes(script[pos + 1 : pos + 5], "little")
+        else:
+            new_pos = pos + 1
+        if new_pos > n:
+            raise TruncatedScriptError("push operand truncated")
+        pos = new_pos
+
+
+def count_input_refs(script: bytes) -> dict[bytes, int]:
+    """Return a map of ``ref_operand -> count`` for every OP_PUSHINPUTREF-family
+    opcode in *script* (opcode-aware; see :func:`iter_input_refs`).
+
+    Use this to assert a covenant scriptPubKey carries *exactly* the refs you
+    intend before broadcasting — a phantom ref (a 0xd0/0xd8 byte mis-parsed
+    from embedded data) shows up here as an unexpected key. Raises
+    :class:`TruncatedScriptError` on a malformed script.
+    """
+    counts: dict[bytes, int] = {}
+    for _op, operand in iter_input_refs(script):
+        counts[operand] = counts.get(operand, 0) + 1
+    return counts
