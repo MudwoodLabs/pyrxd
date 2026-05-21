@@ -445,6 +445,23 @@ measured.
 check is the mirror of the Maker funding pre-flight — same outpoint/ref/
 amount logic, opposite actor; no separate phase or async module for v1.)*
 
+**Started 2026-05-20 (the artifact-independent pieces, no rework when
+Phase 4 reshapes the covenant):**
+- [x] **Shared `count_input_refs` / `iter_input_refs` walker** extracted
+  into `glyph/script.py`; `is_token_bearing_script` rewired onto it
+  (−65 lines of duplicate walker); `TruncatedScriptError` for fail-closed
+  malformed scripts. The covenant phantom-ref guard is
+  `count_input_refs(spk) == {genesis_ref: n}`. 10 unit tests; 412
+  affected-suite tests green; ruff clean. (commit `bebc1ea`)
+- [x] **`PolicyRejection(CovenantError)`** added to `security/errors.py`
+  (so node policy/consensus rejections aren't reclassified as
+  `NetworkError`). (commit `bebc1ea`)
+
+**Remaining (best done after Phase 4 produces the final artifact):**
+the `GravityFTOffer` type, `build_gravity_ft_offer` factory,
+`_validate_ft_funding_input`, and the thin Taker check — these target the
+final covenant artifact's param list, which Phase 4 reshapes.
+
 **Type design (review cuts applied):**
 - [ ] `gravity/types.py`: add `GravityFTOffer` as
   `@dataclass(frozen=True)` — **match `GravityOffer`'s shape**
