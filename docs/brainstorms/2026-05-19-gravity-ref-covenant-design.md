@@ -1052,3 +1052,83 @@ on-chain by construction. Since each offer's per-offer-derived
 `btcReceiveHash` produces a distinct covenant that only honors a payment
 to its own committed address, one BTC payment cannot drain two concurrent
 offers. This was the last security-critical on-chain proof.
+
+---
+
+## Any-wallet BTC payment — design note (2026-05-20)
+
+**Problem.** The current covenant's BTC-payment check requires a
+**single-input** tx with the payment at a **fixed output offset** (47 for
+native segwit, 70 for P2SH-P2WPKH; `maker_covenant_trade.rxd:45-67`). Most
+real wallets draw from **multiple UTXOs** and place change anywhere, so a
+normal "send to this address" payment is **rejected — and there is no BTC
+refund path** (`gravity-rxd-prototype/docs/SEGWIT_SUPPORT.md`). For a usable
+FT↔BTC swap the taker must be able to pay from any standard wallet.
+
+**Why the redesign is SAFE (the load-bearing fact).** The covenant binds
+the BTC tx by hashing it as the Merkle leaf: `current = hash256(rawTx)`
+(`maker_covenant_trade.rxd:337`), then folds the branch up to a real,
+PoW-verified header's merkle root. **So `rawTx` is cryptographically pinned
+to a real Bitcoin block — an attacker cannot supply a forged tx.** Given a
+pinned tx, the covenant may parse its bytes any way it likes.
+
+The audit-03-C2 finding was NOT "parsing is unsafe" — it was specifically
+that an **attacker-supplied `outputOffset` unlocking arg** could point the
+payment check at arbitrary bytes (forging a payment from unrelated tx
+data). The fix removed that arg and hard-coded the offset, at the cost of
+wallet compatibility. **The correct any-wallet fix preserves C2's intent
+even better: the covenant computes every offset ITSELF from the pinned tx —
+no attacker-supplied offsets anywhere.**
+
+**Design — on-chain parse of the pinned `rawTx`:**
+
+1. **Strip is already handled** (the proof carries the witness-stripped tx;
+   `hash256(stripped) == txid` is enforced upstream in the verifier and the
+   leaf binding makes the covenant parse the same bytes).
+2. **Skip version (4B).**
+3. **Read input-count varint** at offset 4. Support the 1-byte form
+   (`< 0xfd`, i.e. ≤252 inputs — covers every real tx); reject `0xfd/fe/ff`
+   (absurd input counts) to avoid multi-byte varint handling. This is a
+   *covenant-chosen* bound on the pinned tx, not an attacker offset.
+4. **Skip N inputs.** Each input = 36B outpoint + scriptSig-len varint +
+   scriptSig + 4B sequence. After witness-strip, scriptSig is empty for
+   native segwit (`00`) and fixed-23B for P2SH-P2WPKH. To support arbitrary
+   single-sig segwit inputs the loop reads each input's scriptSig-len varint
+   (1-byte form) and skips that many bytes — a bounded per-input walk,
+   unrolled up to a max-input cap (e.g. 4–8 inputs, the common case;
+   document the cap like the Merkle-depth cap).
+5. **Read output-count varint**, then **scan each output** (8B value +
+   scriptPubKey-len varint + scriptPubKey): for the one whose scriptPubKey
+   == the expected `btcReceiveType`/`btcReceiveHash` shape, require its
+   value ≥ `btcSatoshis`. Scanning (vs. fixed index) is what lets change sit
+   anywhere. The scan is over the *pinned* tx, so it's forgery-proof.
+6. **Everything else unchanged:** the 6-header PoW chain, the Merkle fold,
+   and (for the FT covenant) the FT hardening + hash-compare output routing.
+
+**Caps to document (analogous to Merkle-depth sentinel padding):**
+- max inputs skipped (script size grows ~linearly; pick 4–8, unrolled).
+- max outputs scanned (same).
+A tx exceeding the caps is rejected — a *liveness* limit (taker consolidates
+or trims change), never a *safety* hole.
+
+**Cost.** GRAVITY_ANALYSIS.md estimated ~200–400 extra script bytes for the
+input-skip + output-scan; with input/output caps unrolled it is larger but
+bounded. The fused FT covenant is already ~4.9KB; this adds to funding fee
+(already ~0.5 RXD). Acceptable for the capability.
+
+**Re-prove plan (this is a security-critical SPV-parsing change):**
+1. Implement as a generator mode (extends `gen_maker_covenant.js`); keep the
+   single-input fast path or replace it.
+2. Static guards on the compiled artifact (no bare `0xbd`; single ref).
+3. On-chain finalize proof with a **multi-input, change-first** synthetic
+   tx (the shape the old covenant rejected) → must ACCEPT; plus the negative
+   cases (no payment to `btcReceiveHash` → reject; value < `btcSatoshis` →
+   reject; payment present but to wrong hash → reject).
+4. **External audit of the new parsing path is a hard gate** — it is the
+   most security-critical code in the covenant (it decides "did the BTC
+   payment really happen?"). Do not announce an any-wallet swap as
+   production-ready before that audit.
+
+**Status:** designed, not built. The existing constrained covenant remains
+the proven one (single-input P2WPKH/P2TR/P2SH-P2WPKH). The live FT offer
+`85ae317e…:0` uses the constrained covenant and is forfeitable.
