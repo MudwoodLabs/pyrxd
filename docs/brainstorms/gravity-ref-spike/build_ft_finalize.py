@@ -26,7 +26,7 @@ FEE_TXID = sys.argv[8]
 FEE_VOUT = int(sys.argv[9])
 FEE_AMT = int(sys.argv[10])
 FEE_SPK_HEX = sys.argv[11]
-BRANCH_SLOTS = 12
+BRANCH_SLOTS = 20
 
 fee_key = PrivateKey(FEE_WIF)
 fee_pub = fee_key.public_key().serialize()
