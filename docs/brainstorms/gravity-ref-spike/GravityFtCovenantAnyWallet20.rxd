@@ -16,14 +16,14 @@ contract GravityFtCovenantAnyWalletFlat12x20_p2wpkh(
     bytes32 expectedMakerFtHash,
     bytes36 REF
 ) {
-    // claimDeadline floor, baked at generator time (2026-04-22T15:47:18.000Z).
+    // claimDeadline floor, baked at generator time (2026-04-22T23:36:56.000Z).
     // 0 (or any small value) would make forfeit() immediately spendable
     // alongside finalize(), letting the Maker race-snipe the Taker's claim
     // — see audit 04 finding S1. This is a static check against a
     // generation-time constant; Makers must regenerate the covenant
     // periodically (at least monthly) and set claimDeadline to a real
     // future timestamp (recommended: now + 24h).
-    require(claimDeadline >= 1776872838);
+    require(claimDeadline >= 1776901016);
 
     // --- FT hardening (runs on both branches); see Phase-2 proof ---
     bytes36 ref = pushInputRef(REF);
@@ -814,30 +814,44 @@ contract GravityFtCovenantAnyWalletFlat12x20_p2wpkh(
             bytes root12 = h12.split(36)[1].split(32)[0];
             require(current == root1 || current == root2 || current == root3 || current == root4 || current == root5 || current == root6 || current == root7 || current == root8 || current == root9 || current == root10 || current == root11 || current == root12);
 
-            // --- Any-wallet output scan: find a P2WPKH payment >= btcSatoshis ---
-            // Each output: value(8) + scriptLen varint(1) + script(scriptLen).
-            // Payment may sit at ANY output index (change anywhere).
+            // --- Any-wallet output scan: find the maker payment >= btcSatoshis ---
+            // Matches all 4 BTC output types (P2WPKH/P2PKH/P2SH/P2TR) at ANY
+            // output index (change anywhere). Each output: value(8) + scriptLen
+            // varint(1) + script(scriptLen). btcReceiveHash = maker's committed
+            // hash (20B for the first three, 32B for P2TR).
             bool found = false;
             int v1 = int(rawTx.split(pos)[1].split(8)[0]);
             int sl1 = int(rawTx.split(pos + 8)[1].split(1)[0]);
             if (sl1 == 22) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x0014) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (v1 >= btcSatoshis) { found = true; } } } }
+            if (sl1 == 25) { if (rawTx.split(pos + 9)[1].split(3)[0] == 0x76a914) { if (rawTx.split(pos + 12)[1].split(20)[0] == btcReceiveHash) { if (rawTx.split(pos + 32)[1].split(2)[0] == 0x88ac) { if (v1 >= btcSatoshis) { found = true; } } } } }
+            if (sl1 == 23) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0xa914) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (rawTx.split(pos + 31)[1].split(1)[0] == 0x87) { if (v1 >= btcSatoshis) { found = true; } } } } }
+            if (sl1 == 34) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x5120) { if (rawTx.split(pos + 11)[1].split(32)[0] == btcReceiveHash) { if (v1 >= btcSatoshis) { found = true; } } } }
             pos = pos + 9 + sl1;
             if (nOut >= 2) {
-                int v2 = int(rawTx.split(pos)[1].split(8)[0]);
-                int sl2 = int(rawTx.split(pos + 8)[1].split(1)[0]);
-                if (sl2 == 22) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x0014) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (v2 >= btcSatoshis) { found = true; } } } }
+            int v2 = int(rawTx.split(pos)[1].split(8)[0]);
+            int sl2 = int(rawTx.split(pos + 8)[1].split(1)[0]);
+            if (sl2 == 22) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x0014) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (v2 >= btcSatoshis) { found = true; } } } }
+            if (sl2 == 25) { if (rawTx.split(pos + 9)[1].split(3)[0] == 0x76a914) { if (rawTx.split(pos + 12)[1].split(20)[0] == btcReceiveHash) { if (rawTx.split(pos + 32)[1].split(2)[0] == 0x88ac) { if (v2 >= btcSatoshis) { found = true; } } } } }
+            if (sl2 == 23) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0xa914) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (rawTx.split(pos + 31)[1].split(1)[0] == 0x87) { if (v2 >= btcSatoshis) { found = true; } } } } }
+            if (sl2 == 34) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x5120) { if (rawTx.split(pos + 11)[1].split(32)[0] == btcReceiveHash) { if (v2 >= btcSatoshis) { found = true; } } } }
                 pos = pos + 9 + sl2;
             }
             if (nOut >= 3) {
-                int v3 = int(rawTx.split(pos)[1].split(8)[0]);
-                int sl3 = int(rawTx.split(pos + 8)[1].split(1)[0]);
-                if (sl3 == 22) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x0014) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (v3 >= btcSatoshis) { found = true; } } } }
+            int v3 = int(rawTx.split(pos)[1].split(8)[0]);
+            int sl3 = int(rawTx.split(pos + 8)[1].split(1)[0]);
+            if (sl3 == 22) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x0014) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (v3 >= btcSatoshis) { found = true; } } } }
+            if (sl3 == 25) { if (rawTx.split(pos + 9)[1].split(3)[0] == 0x76a914) { if (rawTx.split(pos + 12)[1].split(20)[0] == btcReceiveHash) { if (rawTx.split(pos + 32)[1].split(2)[0] == 0x88ac) { if (v3 >= btcSatoshis) { found = true; } } } } }
+            if (sl3 == 23) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0xa914) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (rawTx.split(pos + 31)[1].split(1)[0] == 0x87) { if (v3 >= btcSatoshis) { found = true; } } } } }
+            if (sl3 == 34) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x5120) { if (rawTx.split(pos + 11)[1].split(32)[0] == btcReceiveHash) { if (v3 >= btcSatoshis) { found = true; } } } }
                 pos = pos + 9 + sl3;
             }
             if (nOut >= 4) {
-                int v4 = int(rawTx.split(pos)[1].split(8)[0]);
-                int sl4 = int(rawTx.split(pos + 8)[1].split(1)[0]);
-                if (sl4 == 22) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x0014) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (v4 >= btcSatoshis) { found = true; } } } }
+            int v4 = int(rawTx.split(pos)[1].split(8)[0]);
+            int sl4 = int(rawTx.split(pos + 8)[1].split(1)[0]);
+            if (sl4 == 22) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x0014) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (v4 >= btcSatoshis) { found = true; } } } }
+            if (sl4 == 25) { if (rawTx.split(pos + 9)[1].split(3)[0] == 0x76a914) { if (rawTx.split(pos + 12)[1].split(20)[0] == btcReceiveHash) { if (rawTx.split(pos + 32)[1].split(2)[0] == 0x88ac) { if (v4 >= btcSatoshis) { found = true; } } } } }
+            if (sl4 == 23) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0xa914) { if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) { if (rawTx.split(pos + 31)[1].split(1)[0] == 0x87) { if (v4 >= btcSatoshis) { found = true; } } } } }
+            if (sl4 == 34) { if (rawTx.split(pos + 9)[1].split(2)[0] == 0x5120) { if (rawTx.split(pos + 11)[1].split(32)[0] == btcReceiveHash) { if (v4 >= btcSatoshis) { found = true; } } } }
             }
             require(found);
 
