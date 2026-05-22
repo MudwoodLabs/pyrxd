@@ -64,3 +64,41 @@ the covenant alone gates the release on proof of the Bitcoin payment.
   (mainnet blocks routinely exceed depth 12). Use the sentinel M=20 variant.
 - The wide-window covenant is ~10 KB, so funding it costs ~1 RXD — a real
   per-swap cost to weigh in production parameter choice.
+
+---
+
+## Any-wallet variant — multi-input BTC payment PROVEN on mainnet (2026-05-22)
+
+The single-input limitation above is now lifted by the **any-wallet covenant**
+(on-chain varint input-skip + output-scan), proven end-to-end on mainnet with
+a **real multi-input Bitcoin payment** — the exact tx shape the single-input
+covenant rejects.
+
+**Positive (settled):**
+- FT: **GSWAPAW** (1,000 units, genesis `537c86b69b039d87f2f4023806948d1fe01f945955289296087f0ee3b03e7858:0`)
+- Multi-input BTC payment (**2 inputs**, output[0]=10,000 sats to the maker,
+  output[1]=change): `0ae8365496f1eb20b4e1c82f115326b85133099854f1aa3839de2087a141dc6a`
+  (block 950,541).
+- Any-wallet covenant (N=12 headers, M=20 sentinel merkle, varint parser),
+  anchor=block 950,540, funded `922f080f8f09515870ce6fc78e6122ae4e6b52b6e5ac2c7287072e047c21035e`.
+- **Settlement (finalize over the multi-input proof):**
+  `53ee763148f85c843f82b628706480395028522701e408ef4722a61ca5ad4616` — the
+  covenant parsed a 2-input BTC tx, scanned its outputs, found the payment,
+  and released the FT. A taker can pay from a normal multi-input wallet.
+
+**Negative (rejected on-chain):** a real, in-block, Merkle-provable multi-input
+tx that does NOT pay the maker, submitted as the proof, was **rejected** with
+`mandatory-script-verify-flag-failed (OP_VERIFY)` — the parser's `require(found)`
+fails because the output-scan finds no output paying `btcReceiveHash`. So the
+parser verifies the payment is actually present, not merely that the tx parses.
+(`validate_anywallet_parse.py` additionally covers wrong-hash and
+insufficient-value rejection in the offset-logic mirror.)
+
+**Still required before production:** generalize the output-type match to all
+`btcReceiveType` (the current scan matches P2WPKH only), and an **external
+audit of the BTC-tx parser** (the most security-critical covenant code) — the
+hard gate. The any-wallet covenant is ~10.4 KB, so funding it costs ~1.05 RXD;
+this size/fee is the cost of on-chain wallet-agnostic payment parsing.
+
+**Both-chain artifacts (any-wallet swap):** Bitcoin payment `0ae83654…` (block
+950,541); Radiant settlement `53ee7631…`. User BTC swept back (`ce90a7f9…`).
