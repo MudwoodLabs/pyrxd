@@ -1,0 +1,851 @@
+pragma radiantscript ^0.1.0;
+
+// Gravity Maker covenant — State 2 (Claimed) with full SPV integration
+// Auto-generated: N=12 headers, M=20 Merkle depth
+// Do not edit by hand; regenerate with gen_maker_covenant.js.
+
+contract GravityFtCovenantFlat12x20_p2wpkh(
+    bytes btcReceiveHash,
+    int btcSatoshis,
+    bytes32 btcChainAnchor,     // hash256 of a known mainnet block; h1.prevHash must equal this
+    bytes4 expectedNBits,       // current Bitcoin difficulty (LE); every header must match this OR expectedNBitsNext
+    bytes4 expectedNBitsNext,   // next-retarget difficulty; set == expectedNBits when far from retarget
+    int claimDeadline,
+    int amount,
+    bytes32 expectedTakerFtHash,
+    bytes32 expectedMakerFtHash,
+    bytes36 REF
+) {
+    // claimDeadline floor, baked at generator time (2026-04-22T05:26:16.000Z).
+    // 0 (or any small value) would make forfeit() immediately spendable
+    // alongside finalize(), letting the Maker race-snipe the Taker's claim
+    // — see audit 04 finding S1. This is a static check against a
+    // generation-time constant; Makers must regenerate the covenant
+    // periodically (at least monthly) and set claimDeadline to a real
+    // future timestamp (recommended: now + 24h).
+    require(claimDeadline >= 1776835576);
+
+    // --- FT hardening (runs on both branches); see Phase-2 proof ---
+    bytes36 ref = pushInputRef(REF);
+    require(tx.outputs.length == 1);
+    require(tx.outputs.refOutputCount(ref) == 1);
+    require(tx.outputs.refValueSum(ref) == amount);
+
+    return {
+        finalize(bytes h1, bytes h2, bytes h3, bytes h4, bytes h5, bytes h6, bytes h7, bytes h8, bytes h9, bytes h10, bytes h11, bytes h12, bytes branch, bytes rawTx) {
+            // --- Chain-identity anchor: h1 must extend from a known mainnet block ---
+            bytes h1Prev = h1.split(4)[1].split(32)[0];
+            require(h1Prev == btcChainAnchor);
+
+            // --- Tx-structure constraint (forces known output offset) ---
+            // Accepts two Taker-input shapes:
+            //   (a) Native segwit (P2WPKH / P2TR): empty scriptSig, output[0] at byte 47.
+            //       Byte layout: [0..4)=version [4]=0x01 [5..41)=outpoint
+            //       [41]=0x00 [42..46)=sequence [46]=outputCount [47..)=output[0].
+            //   (b) Wrapped segwit (P2SH-P2WPKH): scriptSig = 0x16 0x00 0x14 <20B pkh>
+            //       (23 bytes), output[0] at byte 70.
+            //       [41]=0x17 [42]=0x16 [43]=0x00 [44]=0x14 [45..65)=pkh
+            //       [65..69)=sequence [69]=outputCount [70..)=output[0].
+            // Legacy P2PKH and multi-input txs are rejected: scriptSigLen varies and
+            // would need a varint parser. See docs/SEGWIT_SUPPORT.md.
+
+            require(rawTx.length > 64);
+            require(rawTx.split(4)[1].split(1)[0] == 0x01);
+            bytes scriptSigLen = rawTx.split(41)[1].split(1)[0];
+            int outputOffset = 47;
+            int outputCountByte = 46;
+            if (scriptSigLen == 0x00) {
+                // Native segwit path. outputOffset stays 47.
+            } else {
+                // P2SH-P2WPKH path. Validate the fixed-shape scriptSig.
+                require(scriptSigLen == 0x17);
+                require(rawTx.split(42)[1].split(1)[0] == 0x16);
+                require(rawTx.split(43)[1].split(1)[0] == 0x00);
+                require(rawTx.split(44)[1].split(1)[0] == 0x14);
+                outputOffset = 70;
+                outputCountByte = 69;
+            }
+            // outputCount must be in [0x01, 0xfc] so output[0] actually exists and
+            // is the value the payment check reads.
+            bytes outputCountByteVal = rawTx.split(outputCountByte)[1].split(1)[0];
+            require(outputCountByteVal != 0x00);
+            require(outputCountByteVal != 0xfd);
+            require(outputCountByteVal != 0xfe);
+            require(outputCountByteVal != 0xff);
+
+            // --- PoW check: h1 ---
+            bytes n1 = h1.split(72)[1].split(4)[0];
+            require(n1 == expectedNBits || n1 == expectedNBitsNext);
+            bytes m1 = n1.split(3)[0];
+            int e1 = int(n1.split(3)[1]);
+            require(e1 >= 3);
+            require(e1 <= 32);
+            bytes t1 = bytes(0, e1 - 3) + m1 + bytes(0, 32 - e1);
+
+            bytes32 hash1 = hash256(h1);
+            bytes hBE1 = hash1.reverse();
+            bytes tBE1 = t1.reverse();
+
+            int h1c0 = int(hBE1.split(4)[0].reverse() + 0x00);
+            int h1c1 = int(hBE1.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h1c2 = int(hBE1.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h1c3 = int(hBE1.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h1c4 = int(hBE1.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h1c5 = int(hBE1.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h1c6 = int(hBE1.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h1c7 = int(hBE1.split(28)[1].reverse() + 0x00);
+            int t1c0 = int(tBE1.split(4)[0].reverse() + 0x00);
+            int t1c1 = int(tBE1.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t1c2 = int(tBE1.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t1c3 = int(tBE1.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t1c4 = int(tBE1.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t1c5 = int(tBE1.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t1c6 = int(tBE1.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t1c7 = int(tBE1.split(28)[1].reverse() + 0x00);
+
+            bool pow1 =
+                (h1c0 < t1c0) ||
+                ((h1c0 == t1c0) && (h1c1 < t1c1)) ||
+                ((h1c0 == t1c0) && (h1c1 == t1c1) && (h1c2 < t1c2)) ||
+                ((h1c0 == t1c0) && (h1c1 == t1c1) && (h1c2 == t1c2) && (h1c3 < t1c3)) ||
+                ((h1c0 == t1c0) && (h1c1 == t1c1) && (h1c2 == t1c2) && (h1c3 == t1c3) && (h1c4 < t1c4)) ||
+                ((h1c0 == t1c0) && (h1c1 == t1c1) && (h1c2 == t1c2) && (h1c3 == t1c3) && (h1c4 == t1c4) && (h1c5 < t1c5)) ||
+                ((h1c0 == t1c0) && (h1c1 == t1c1) && (h1c2 == t1c2) && (h1c3 == t1c3) && (h1c4 == t1c4) && (h1c5 == t1c5) && (h1c6 < t1c6)) ||
+                ((h1c0 == t1c0) && (h1c1 == t1c1) && (h1c2 == t1c2) && (h1c3 == t1c3) && (h1c4 == t1c4) && (h1c5 == t1c5) && (h1c6 == t1c6) && (h1c7 < t1c7));
+            require(pow1);
+
+            // --- Chain link: h2.prevHash == hash1 ---
+            bytes prev2 = h2.split(4)[1].split(32)[0];
+            require(prev2 == hash1);
+
+            // --- PoW check: h2 ---
+            bytes n2 = h2.split(72)[1].split(4)[0];
+            require(n2 == expectedNBits || n2 == expectedNBitsNext);
+            bytes m2 = n2.split(3)[0];
+            int e2 = int(n2.split(3)[1]);
+            require(e2 >= 3);
+            require(e2 <= 32);
+            bytes t2 = bytes(0, e2 - 3) + m2 + bytes(0, 32 - e2);
+
+            bytes32 hash2 = hash256(h2);
+            bytes hBE2 = hash2.reverse();
+            bytes tBE2 = t2.reverse();
+
+            int h2c0 = int(hBE2.split(4)[0].reverse() + 0x00);
+            int h2c1 = int(hBE2.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h2c2 = int(hBE2.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h2c3 = int(hBE2.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h2c4 = int(hBE2.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h2c5 = int(hBE2.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h2c6 = int(hBE2.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h2c7 = int(hBE2.split(28)[1].reverse() + 0x00);
+            int t2c0 = int(tBE2.split(4)[0].reverse() + 0x00);
+            int t2c1 = int(tBE2.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t2c2 = int(tBE2.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t2c3 = int(tBE2.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t2c4 = int(tBE2.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t2c5 = int(tBE2.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t2c6 = int(tBE2.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t2c7 = int(tBE2.split(28)[1].reverse() + 0x00);
+
+            bool pow2 =
+                (h2c0 < t2c0) ||
+                ((h2c0 == t2c0) && (h2c1 < t2c1)) ||
+                ((h2c0 == t2c0) && (h2c1 == t2c1) && (h2c2 < t2c2)) ||
+                ((h2c0 == t2c0) && (h2c1 == t2c1) && (h2c2 == t2c2) && (h2c3 < t2c3)) ||
+                ((h2c0 == t2c0) && (h2c1 == t2c1) && (h2c2 == t2c2) && (h2c3 == t2c3) && (h2c4 < t2c4)) ||
+                ((h2c0 == t2c0) && (h2c1 == t2c1) && (h2c2 == t2c2) && (h2c3 == t2c3) && (h2c4 == t2c4) && (h2c5 < t2c5)) ||
+                ((h2c0 == t2c0) && (h2c1 == t2c1) && (h2c2 == t2c2) && (h2c3 == t2c3) && (h2c4 == t2c4) && (h2c5 == t2c5) && (h2c6 < t2c6)) ||
+                ((h2c0 == t2c0) && (h2c1 == t2c1) && (h2c2 == t2c2) && (h2c3 == t2c3) && (h2c4 == t2c4) && (h2c5 == t2c5) && (h2c6 == t2c6) && (h2c7 < t2c7));
+            require(pow2);
+
+            // --- Chain link: h3.prevHash == hash2 ---
+            bytes prev3 = h3.split(4)[1].split(32)[0];
+            require(prev3 == hash2);
+
+            // --- PoW check: h3 ---
+            bytes n3 = h3.split(72)[1].split(4)[0];
+            require(n3 == expectedNBits || n3 == expectedNBitsNext);
+            bytes m3 = n3.split(3)[0];
+            int e3 = int(n3.split(3)[1]);
+            require(e3 >= 3);
+            require(e3 <= 32);
+            bytes t3 = bytes(0, e3 - 3) + m3 + bytes(0, 32 - e3);
+
+            bytes32 hash3 = hash256(h3);
+            bytes hBE3 = hash3.reverse();
+            bytes tBE3 = t3.reverse();
+
+            int h3c0 = int(hBE3.split(4)[0].reverse() + 0x00);
+            int h3c1 = int(hBE3.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h3c2 = int(hBE3.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h3c3 = int(hBE3.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h3c4 = int(hBE3.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h3c5 = int(hBE3.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h3c6 = int(hBE3.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h3c7 = int(hBE3.split(28)[1].reverse() + 0x00);
+            int t3c0 = int(tBE3.split(4)[0].reverse() + 0x00);
+            int t3c1 = int(tBE3.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t3c2 = int(tBE3.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t3c3 = int(tBE3.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t3c4 = int(tBE3.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t3c5 = int(tBE3.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t3c6 = int(tBE3.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t3c7 = int(tBE3.split(28)[1].reverse() + 0x00);
+
+            bool pow3 =
+                (h3c0 < t3c0) ||
+                ((h3c0 == t3c0) && (h3c1 < t3c1)) ||
+                ((h3c0 == t3c0) && (h3c1 == t3c1) && (h3c2 < t3c2)) ||
+                ((h3c0 == t3c0) && (h3c1 == t3c1) && (h3c2 == t3c2) && (h3c3 < t3c3)) ||
+                ((h3c0 == t3c0) && (h3c1 == t3c1) && (h3c2 == t3c2) && (h3c3 == t3c3) && (h3c4 < t3c4)) ||
+                ((h3c0 == t3c0) && (h3c1 == t3c1) && (h3c2 == t3c2) && (h3c3 == t3c3) && (h3c4 == t3c4) && (h3c5 < t3c5)) ||
+                ((h3c0 == t3c0) && (h3c1 == t3c1) && (h3c2 == t3c2) && (h3c3 == t3c3) && (h3c4 == t3c4) && (h3c5 == t3c5) && (h3c6 < t3c6)) ||
+                ((h3c0 == t3c0) && (h3c1 == t3c1) && (h3c2 == t3c2) && (h3c3 == t3c3) && (h3c4 == t3c4) && (h3c5 == t3c5) && (h3c6 == t3c6) && (h3c7 < t3c7));
+            require(pow3);
+
+            // --- Chain link: h4.prevHash == hash3 ---
+            bytes prev4 = h4.split(4)[1].split(32)[0];
+            require(prev4 == hash3);
+
+            // --- PoW check: h4 ---
+            bytes n4 = h4.split(72)[1].split(4)[0];
+            require(n4 == expectedNBits || n4 == expectedNBitsNext);
+            bytes m4 = n4.split(3)[0];
+            int e4 = int(n4.split(3)[1]);
+            require(e4 >= 3);
+            require(e4 <= 32);
+            bytes t4 = bytes(0, e4 - 3) + m4 + bytes(0, 32 - e4);
+
+            bytes32 hash4 = hash256(h4);
+            bytes hBE4 = hash4.reverse();
+            bytes tBE4 = t4.reverse();
+
+            int h4c0 = int(hBE4.split(4)[0].reverse() + 0x00);
+            int h4c1 = int(hBE4.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h4c2 = int(hBE4.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h4c3 = int(hBE4.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h4c4 = int(hBE4.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h4c5 = int(hBE4.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h4c6 = int(hBE4.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h4c7 = int(hBE4.split(28)[1].reverse() + 0x00);
+            int t4c0 = int(tBE4.split(4)[0].reverse() + 0x00);
+            int t4c1 = int(tBE4.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t4c2 = int(tBE4.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t4c3 = int(tBE4.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t4c4 = int(tBE4.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t4c5 = int(tBE4.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t4c6 = int(tBE4.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t4c7 = int(tBE4.split(28)[1].reverse() + 0x00);
+
+            bool pow4 =
+                (h4c0 < t4c0) ||
+                ((h4c0 == t4c0) && (h4c1 < t4c1)) ||
+                ((h4c0 == t4c0) && (h4c1 == t4c1) && (h4c2 < t4c2)) ||
+                ((h4c0 == t4c0) && (h4c1 == t4c1) && (h4c2 == t4c2) && (h4c3 < t4c3)) ||
+                ((h4c0 == t4c0) && (h4c1 == t4c1) && (h4c2 == t4c2) && (h4c3 == t4c3) && (h4c4 < t4c4)) ||
+                ((h4c0 == t4c0) && (h4c1 == t4c1) && (h4c2 == t4c2) && (h4c3 == t4c3) && (h4c4 == t4c4) && (h4c5 < t4c5)) ||
+                ((h4c0 == t4c0) && (h4c1 == t4c1) && (h4c2 == t4c2) && (h4c3 == t4c3) && (h4c4 == t4c4) && (h4c5 == t4c5) && (h4c6 < t4c6)) ||
+                ((h4c0 == t4c0) && (h4c1 == t4c1) && (h4c2 == t4c2) && (h4c3 == t4c3) && (h4c4 == t4c4) && (h4c5 == t4c5) && (h4c6 == t4c6) && (h4c7 < t4c7));
+            require(pow4);
+
+            // --- Chain link: h5.prevHash == hash4 ---
+            bytes prev5 = h5.split(4)[1].split(32)[0];
+            require(prev5 == hash4);
+
+            // --- PoW check: h5 ---
+            bytes n5 = h5.split(72)[1].split(4)[0];
+            require(n5 == expectedNBits || n5 == expectedNBitsNext);
+            bytes m5 = n5.split(3)[0];
+            int e5 = int(n5.split(3)[1]);
+            require(e5 >= 3);
+            require(e5 <= 32);
+            bytes t5 = bytes(0, e5 - 3) + m5 + bytes(0, 32 - e5);
+
+            bytes32 hash5 = hash256(h5);
+            bytes hBE5 = hash5.reverse();
+            bytes tBE5 = t5.reverse();
+
+            int h5c0 = int(hBE5.split(4)[0].reverse() + 0x00);
+            int h5c1 = int(hBE5.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h5c2 = int(hBE5.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h5c3 = int(hBE5.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h5c4 = int(hBE5.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h5c5 = int(hBE5.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h5c6 = int(hBE5.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h5c7 = int(hBE5.split(28)[1].reverse() + 0x00);
+            int t5c0 = int(tBE5.split(4)[0].reverse() + 0x00);
+            int t5c1 = int(tBE5.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t5c2 = int(tBE5.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t5c3 = int(tBE5.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t5c4 = int(tBE5.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t5c5 = int(tBE5.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t5c6 = int(tBE5.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t5c7 = int(tBE5.split(28)[1].reverse() + 0x00);
+
+            bool pow5 =
+                (h5c0 < t5c0) ||
+                ((h5c0 == t5c0) && (h5c1 < t5c1)) ||
+                ((h5c0 == t5c0) && (h5c1 == t5c1) && (h5c2 < t5c2)) ||
+                ((h5c0 == t5c0) && (h5c1 == t5c1) && (h5c2 == t5c2) && (h5c3 < t5c3)) ||
+                ((h5c0 == t5c0) && (h5c1 == t5c1) && (h5c2 == t5c2) && (h5c3 == t5c3) && (h5c4 < t5c4)) ||
+                ((h5c0 == t5c0) && (h5c1 == t5c1) && (h5c2 == t5c2) && (h5c3 == t5c3) && (h5c4 == t5c4) && (h5c5 < t5c5)) ||
+                ((h5c0 == t5c0) && (h5c1 == t5c1) && (h5c2 == t5c2) && (h5c3 == t5c3) && (h5c4 == t5c4) && (h5c5 == t5c5) && (h5c6 < t5c6)) ||
+                ((h5c0 == t5c0) && (h5c1 == t5c1) && (h5c2 == t5c2) && (h5c3 == t5c3) && (h5c4 == t5c4) && (h5c5 == t5c5) && (h5c6 == t5c6) && (h5c7 < t5c7));
+            require(pow5);
+
+            // --- Chain link: h6.prevHash == hash5 ---
+            bytes prev6 = h6.split(4)[1].split(32)[0];
+            require(prev6 == hash5);
+
+            // --- PoW check: h6 ---
+            bytes n6 = h6.split(72)[1].split(4)[0];
+            require(n6 == expectedNBits || n6 == expectedNBitsNext);
+            bytes m6 = n6.split(3)[0];
+            int e6 = int(n6.split(3)[1]);
+            require(e6 >= 3);
+            require(e6 <= 32);
+            bytes t6 = bytes(0, e6 - 3) + m6 + bytes(0, 32 - e6);
+
+            bytes32 hash6 = hash256(h6);
+            bytes hBE6 = hash6.reverse();
+            bytes tBE6 = t6.reverse();
+
+            int h6c0 = int(hBE6.split(4)[0].reverse() + 0x00);
+            int h6c1 = int(hBE6.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h6c2 = int(hBE6.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h6c3 = int(hBE6.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h6c4 = int(hBE6.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h6c5 = int(hBE6.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h6c6 = int(hBE6.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h6c7 = int(hBE6.split(28)[1].reverse() + 0x00);
+            int t6c0 = int(tBE6.split(4)[0].reverse() + 0x00);
+            int t6c1 = int(tBE6.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t6c2 = int(tBE6.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t6c3 = int(tBE6.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t6c4 = int(tBE6.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t6c5 = int(tBE6.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t6c6 = int(tBE6.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t6c7 = int(tBE6.split(28)[1].reverse() + 0x00);
+
+            bool pow6 =
+                (h6c0 < t6c0) ||
+                ((h6c0 == t6c0) && (h6c1 < t6c1)) ||
+                ((h6c0 == t6c0) && (h6c1 == t6c1) && (h6c2 < t6c2)) ||
+                ((h6c0 == t6c0) && (h6c1 == t6c1) && (h6c2 == t6c2) && (h6c3 < t6c3)) ||
+                ((h6c0 == t6c0) && (h6c1 == t6c1) && (h6c2 == t6c2) && (h6c3 == t6c3) && (h6c4 < t6c4)) ||
+                ((h6c0 == t6c0) && (h6c1 == t6c1) && (h6c2 == t6c2) && (h6c3 == t6c3) && (h6c4 == t6c4) && (h6c5 < t6c5)) ||
+                ((h6c0 == t6c0) && (h6c1 == t6c1) && (h6c2 == t6c2) && (h6c3 == t6c3) && (h6c4 == t6c4) && (h6c5 == t6c5) && (h6c6 < t6c6)) ||
+                ((h6c0 == t6c0) && (h6c1 == t6c1) && (h6c2 == t6c2) && (h6c3 == t6c3) && (h6c4 == t6c4) && (h6c5 == t6c5) && (h6c6 == t6c6) && (h6c7 < t6c7));
+            require(pow6);
+
+            // --- Chain link: h7.prevHash == hash6 ---
+            bytes prev7 = h7.split(4)[1].split(32)[0];
+            require(prev7 == hash6);
+
+            // --- PoW check: h7 ---
+            bytes n7 = h7.split(72)[1].split(4)[0];
+            require(n7 == expectedNBits || n7 == expectedNBitsNext);
+            bytes m7 = n7.split(3)[0];
+            int e7 = int(n7.split(3)[1]);
+            require(e7 >= 3);
+            require(e7 <= 32);
+            bytes t7 = bytes(0, e7 - 3) + m7 + bytes(0, 32 - e7);
+
+            bytes32 hash7 = hash256(h7);
+            bytes hBE7 = hash7.reverse();
+            bytes tBE7 = t7.reverse();
+
+            int h7c0 = int(hBE7.split(4)[0].reverse() + 0x00);
+            int h7c1 = int(hBE7.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h7c2 = int(hBE7.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h7c3 = int(hBE7.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h7c4 = int(hBE7.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h7c5 = int(hBE7.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h7c6 = int(hBE7.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h7c7 = int(hBE7.split(28)[1].reverse() + 0x00);
+            int t7c0 = int(tBE7.split(4)[0].reverse() + 0x00);
+            int t7c1 = int(tBE7.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t7c2 = int(tBE7.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t7c3 = int(tBE7.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t7c4 = int(tBE7.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t7c5 = int(tBE7.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t7c6 = int(tBE7.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t7c7 = int(tBE7.split(28)[1].reverse() + 0x00);
+
+            bool pow7 =
+                (h7c0 < t7c0) ||
+                ((h7c0 == t7c0) && (h7c1 < t7c1)) ||
+                ((h7c0 == t7c0) && (h7c1 == t7c1) && (h7c2 < t7c2)) ||
+                ((h7c0 == t7c0) && (h7c1 == t7c1) && (h7c2 == t7c2) && (h7c3 < t7c3)) ||
+                ((h7c0 == t7c0) && (h7c1 == t7c1) && (h7c2 == t7c2) && (h7c3 == t7c3) && (h7c4 < t7c4)) ||
+                ((h7c0 == t7c0) && (h7c1 == t7c1) && (h7c2 == t7c2) && (h7c3 == t7c3) && (h7c4 == t7c4) && (h7c5 < t7c5)) ||
+                ((h7c0 == t7c0) && (h7c1 == t7c1) && (h7c2 == t7c2) && (h7c3 == t7c3) && (h7c4 == t7c4) && (h7c5 == t7c5) && (h7c6 < t7c6)) ||
+                ((h7c0 == t7c0) && (h7c1 == t7c1) && (h7c2 == t7c2) && (h7c3 == t7c3) && (h7c4 == t7c4) && (h7c5 == t7c5) && (h7c6 == t7c6) && (h7c7 < t7c7));
+            require(pow7);
+
+            // --- Chain link: h8.prevHash == hash7 ---
+            bytes prev8 = h8.split(4)[1].split(32)[0];
+            require(prev8 == hash7);
+
+            // --- PoW check: h8 ---
+            bytes n8 = h8.split(72)[1].split(4)[0];
+            require(n8 == expectedNBits || n8 == expectedNBitsNext);
+            bytes m8 = n8.split(3)[0];
+            int e8 = int(n8.split(3)[1]);
+            require(e8 >= 3);
+            require(e8 <= 32);
+            bytes t8 = bytes(0, e8 - 3) + m8 + bytes(0, 32 - e8);
+
+            bytes32 hash8 = hash256(h8);
+            bytes hBE8 = hash8.reverse();
+            bytes tBE8 = t8.reverse();
+
+            int h8c0 = int(hBE8.split(4)[0].reverse() + 0x00);
+            int h8c1 = int(hBE8.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h8c2 = int(hBE8.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h8c3 = int(hBE8.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h8c4 = int(hBE8.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h8c5 = int(hBE8.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h8c6 = int(hBE8.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h8c7 = int(hBE8.split(28)[1].reverse() + 0x00);
+            int t8c0 = int(tBE8.split(4)[0].reverse() + 0x00);
+            int t8c1 = int(tBE8.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t8c2 = int(tBE8.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t8c3 = int(tBE8.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t8c4 = int(tBE8.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t8c5 = int(tBE8.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t8c6 = int(tBE8.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t8c7 = int(tBE8.split(28)[1].reverse() + 0x00);
+
+            bool pow8 =
+                (h8c0 < t8c0) ||
+                ((h8c0 == t8c0) && (h8c1 < t8c1)) ||
+                ((h8c0 == t8c0) && (h8c1 == t8c1) && (h8c2 < t8c2)) ||
+                ((h8c0 == t8c0) && (h8c1 == t8c1) && (h8c2 == t8c2) && (h8c3 < t8c3)) ||
+                ((h8c0 == t8c0) && (h8c1 == t8c1) && (h8c2 == t8c2) && (h8c3 == t8c3) && (h8c4 < t8c4)) ||
+                ((h8c0 == t8c0) && (h8c1 == t8c1) && (h8c2 == t8c2) && (h8c3 == t8c3) && (h8c4 == t8c4) && (h8c5 < t8c5)) ||
+                ((h8c0 == t8c0) && (h8c1 == t8c1) && (h8c2 == t8c2) && (h8c3 == t8c3) && (h8c4 == t8c4) && (h8c5 == t8c5) && (h8c6 < t8c6)) ||
+                ((h8c0 == t8c0) && (h8c1 == t8c1) && (h8c2 == t8c2) && (h8c3 == t8c3) && (h8c4 == t8c4) && (h8c5 == t8c5) && (h8c6 == t8c6) && (h8c7 < t8c7));
+            require(pow8);
+
+            // --- Chain link: h9.prevHash == hash8 ---
+            bytes prev9 = h9.split(4)[1].split(32)[0];
+            require(prev9 == hash8);
+
+            // --- PoW check: h9 ---
+            bytes n9 = h9.split(72)[1].split(4)[0];
+            require(n9 == expectedNBits || n9 == expectedNBitsNext);
+            bytes m9 = n9.split(3)[0];
+            int e9 = int(n9.split(3)[1]);
+            require(e9 >= 3);
+            require(e9 <= 32);
+            bytes t9 = bytes(0, e9 - 3) + m9 + bytes(0, 32 - e9);
+
+            bytes32 hash9 = hash256(h9);
+            bytes hBE9 = hash9.reverse();
+            bytes tBE9 = t9.reverse();
+
+            int h9c0 = int(hBE9.split(4)[0].reverse() + 0x00);
+            int h9c1 = int(hBE9.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h9c2 = int(hBE9.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h9c3 = int(hBE9.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h9c4 = int(hBE9.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h9c5 = int(hBE9.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h9c6 = int(hBE9.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h9c7 = int(hBE9.split(28)[1].reverse() + 0x00);
+            int t9c0 = int(tBE9.split(4)[0].reverse() + 0x00);
+            int t9c1 = int(tBE9.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t9c2 = int(tBE9.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t9c3 = int(tBE9.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t9c4 = int(tBE9.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t9c5 = int(tBE9.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t9c6 = int(tBE9.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t9c7 = int(tBE9.split(28)[1].reverse() + 0x00);
+
+            bool pow9 =
+                (h9c0 < t9c0) ||
+                ((h9c0 == t9c0) && (h9c1 < t9c1)) ||
+                ((h9c0 == t9c0) && (h9c1 == t9c1) && (h9c2 < t9c2)) ||
+                ((h9c0 == t9c0) && (h9c1 == t9c1) && (h9c2 == t9c2) && (h9c3 < t9c3)) ||
+                ((h9c0 == t9c0) && (h9c1 == t9c1) && (h9c2 == t9c2) && (h9c3 == t9c3) && (h9c4 < t9c4)) ||
+                ((h9c0 == t9c0) && (h9c1 == t9c1) && (h9c2 == t9c2) && (h9c3 == t9c3) && (h9c4 == t9c4) && (h9c5 < t9c5)) ||
+                ((h9c0 == t9c0) && (h9c1 == t9c1) && (h9c2 == t9c2) && (h9c3 == t9c3) && (h9c4 == t9c4) && (h9c5 == t9c5) && (h9c6 < t9c6)) ||
+                ((h9c0 == t9c0) && (h9c1 == t9c1) && (h9c2 == t9c2) && (h9c3 == t9c3) && (h9c4 == t9c4) && (h9c5 == t9c5) && (h9c6 == t9c6) && (h9c7 < t9c7));
+            require(pow9);
+
+            // --- Chain link: h10.prevHash == hash9 ---
+            bytes prev10 = h10.split(4)[1].split(32)[0];
+            require(prev10 == hash9);
+
+            // --- PoW check: h10 ---
+            bytes n10 = h10.split(72)[1].split(4)[0];
+            require(n10 == expectedNBits || n10 == expectedNBitsNext);
+            bytes m10 = n10.split(3)[0];
+            int e10 = int(n10.split(3)[1]);
+            require(e10 >= 3);
+            require(e10 <= 32);
+            bytes t10 = bytes(0, e10 - 3) + m10 + bytes(0, 32 - e10);
+
+            bytes32 hash10 = hash256(h10);
+            bytes hBE10 = hash10.reverse();
+            bytes tBE10 = t10.reverse();
+
+            int h10c0 = int(hBE10.split(4)[0].reverse() + 0x00);
+            int h10c1 = int(hBE10.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h10c2 = int(hBE10.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h10c3 = int(hBE10.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h10c4 = int(hBE10.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h10c5 = int(hBE10.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h10c6 = int(hBE10.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h10c7 = int(hBE10.split(28)[1].reverse() + 0x00);
+            int t10c0 = int(tBE10.split(4)[0].reverse() + 0x00);
+            int t10c1 = int(tBE10.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t10c2 = int(tBE10.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t10c3 = int(tBE10.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t10c4 = int(tBE10.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t10c5 = int(tBE10.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t10c6 = int(tBE10.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t10c7 = int(tBE10.split(28)[1].reverse() + 0x00);
+
+            bool pow10 =
+                (h10c0 < t10c0) ||
+                ((h10c0 == t10c0) && (h10c1 < t10c1)) ||
+                ((h10c0 == t10c0) && (h10c1 == t10c1) && (h10c2 < t10c2)) ||
+                ((h10c0 == t10c0) && (h10c1 == t10c1) && (h10c2 == t10c2) && (h10c3 < t10c3)) ||
+                ((h10c0 == t10c0) && (h10c1 == t10c1) && (h10c2 == t10c2) && (h10c3 == t10c3) && (h10c4 < t10c4)) ||
+                ((h10c0 == t10c0) && (h10c1 == t10c1) && (h10c2 == t10c2) && (h10c3 == t10c3) && (h10c4 == t10c4) && (h10c5 < t10c5)) ||
+                ((h10c0 == t10c0) && (h10c1 == t10c1) && (h10c2 == t10c2) && (h10c3 == t10c3) && (h10c4 == t10c4) && (h10c5 == t10c5) && (h10c6 < t10c6)) ||
+                ((h10c0 == t10c0) && (h10c1 == t10c1) && (h10c2 == t10c2) && (h10c3 == t10c3) && (h10c4 == t10c4) && (h10c5 == t10c5) && (h10c6 == t10c6) && (h10c7 < t10c7));
+            require(pow10);
+
+            // --- Chain link: h11.prevHash == hash10 ---
+            bytes prev11 = h11.split(4)[1].split(32)[0];
+            require(prev11 == hash10);
+
+            // --- PoW check: h11 ---
+            bytes n11 = h11.split(72)[1].split(4)[0];
+            require(n11 == expectedNBits || n11 == expectedNBitsNext);
+            bytes m11 = n11.split(3)[0];
+            int e11 = int(n11.split(3)[1]);
+            require(e11 >= 3);
+            require(e11 <= 32);
+            bytes t11 = bytes(0, e11 - 3) + m11 + bytes(0, 32 - e11);
+
+            bytes32 hash11 = hash256(h11);
+            bytes hBE11 = hash11.reverse();
+            bytes tBE11 = t11.reverse();
+
+            int h11c0 = int(hBE11.split(4)[0].reverse() + 0x00);
+            int h11c1 = int(hBE11.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h11c2 = int(hBE11.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h11c3 = int(hBE11.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h11c4 = int(hBE11.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h11c5 = int(hBE11.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h11c6 = int(hBE11.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h11c7 = int(hBE11.split(28)[1].reverse() + 0x00);
+            int t11c0 = int(tBE11.split(4)[0].reverse() + 0x00);
+            int t11c1 = int(tBE11.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t11c2 = int(tBE11.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t11c3 = int(tBE11.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t11c4 = int(tBE11.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t11c5 = int(tBE11.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t11c6 = int(tBE11.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t11c7 = int(tBE11.split(28)[1].reverse() + 0x00);
+
+            bool pow11 =
+                (h11c0 < t11c0) ||
+                ((h11c0 == t11c0) && (h11c1 < t11c1)) ||
+                ((h11c0 == t11c0) && (h11c1 == t11c1) && (h11c2 < t11c2)) ||
+                ((h11c0 == t11c0) && (h11c1 == t11c1) && (h11c2 == t11c2) && (h11c3 < t11c3)) ||
+                ((h11c0 == t11c0) && (h11c1 == t11c1) && (h11c2 == t11c2) && (h11c3 == t11c3) && (h11c4 < t11c4)) ||
+                ((h11c0 == t11c0) && (h11c1 == t11c1) && (h11c2 == t11c2) && (h11c3 == t11c3) && (h11c4 == t11c4) && (h11c5 < t11c5)) ||
+                ((h11c0 == t11c0) && (h11c1 == t11c1) && (h11c2 == t11c2) && (h11c3 == t11c3) && (h11c4 == t11c4) && (h11c5 == t11c5) && (h11c6 < t11c6)) ||
+                ((h11c0 == t11c0) && (h11c1 == t11c1) && (h11c2 == t11c2) && (h11c3 == t11c3) && (h11c4 == t11c4) && (h11c5 == t11c5) && (h11c6 == t11c6) && (h11c7 < t11c7));
+            require(pow11);
+
+            // --- Chain link: h12.prevHash == hash11 ---
+            bytes prev12 = h12.split(4)[1].split(32)[0];
+            require(prev12 == hash11);
+
+            // --- PoW check: h12 ---
+            bytes n12 = h12.split(72)[1].split(4)[0];
+            require(n12 == expectedNBits || n12 == expectedNBitsNext);
+            bytes m12 = n12.split(3)[0];
+            int e12 = int(n12.split(3)[1]);
+            require(e12 >= 3);
+            require(e12 <= 32);
+            bytes t12 = bytes(0, e12 - 3) + m12 + bytes(0, 32 - e12);
+
+            bytes32 hash12 = hash256(h12);
+            bytes hBE12 = hash12.reverse();
+            bytes tBE12 = t12.reverse();
+
+            int h12c0 = int(hBE12.split(4)[0].reverse() + 0x00);
+            int h12c1 = int(hBE12.split(4)[1].split(4)[0].reverse() + 0x00);
+            int h12c2 = int(hBE12.split(8)[1].split(4)[0].reverse() + 0x00);
+            int h12c3 = int(hBE12.split(12)[1].split(4)[0].reverse() + 0x00);
+            int h12c4 = int(hBE12.split(16)[1].split(4)[0].reverse() + 0x00);
+            int h12c5 = int(hBE12.split(20)[1].split(4)[0].reverse() + 0x00);
+            int h12c6 = int(hBE12.split(24)[1].split(4)[0].reverse() + 0x00);
+            int h12c7 = int(hBE12.split(28)[1].reverse() + 0x00);
+            int t12c0 = int(tBE12.split(4)[0].reverse() + 0x00);
+            int t12c1 = int(tBE12.split(4)[1].split(4)[0].reverse() + 0x00);
+            int t12c2 = int(tBE12.split(8)[1].split(4)[0].reverse() + 0x00);
+            int t12c3 = int(tBE12.split(12)[1].split(4)[0].reverse() + 0x00);
+            int t12c4 = int(tBE12.split(16)[1].split(4)[0].reverse() + 0x00);
+            int t12c5 = int(tBE12.split(20)[1].split(4)[0].reverse() + 0x00);
+            int t12c6 = int(tBE12.split(24)[1].split(4)[0].reverse() + 0x00);
+            int t12c7 = int(tBE12.split(28)[1].reverse() + 0x00);
+
+            bool pow12 =
+                (h12c0 < t12c0) ||
+                ((h12c0 == t12c0) && (h12c1 < t12c1)) ||
+                ((h12c0 == t12c0) && (h12c1 == t12c1) && (h12c2 < t12c2)) ||
+                ((h12c0 == t12c0) && (h12c1 == t12c1) && (h12c2 == t12c2) && (h12c3 < t12c3)) ||
+                ((h12c0 == t12c0) && (h12c1 == t12c1) && (h12c2 == t12c2) && (h12c3 == t12c3) && (h12c4 < t12c4)) ||
+                ((h12c0 == t12c0) && (h12c1 == t12c1) && (h12c2 == t12c2) && (h12c3 == t12c3) && (h12c4 == t12c4) && (h12c5 < t12c5)) ||
+                ((h12c0 == t12c0) && (h12c1 == t12c1) && (h12c2 == t12c2) && (h12c3 == t12c3) && (h12c4 == t12c4) && (h12c5 == t12c5) && (h12c6 < t12c6)) ||
+                ((h12c0 == t12c0) && (h12c1 == t12c1) && (h12c2 == t12c2) && (h12c3 == t12c3) && (h12c4 == t12c4) && (h12c5 == t12c5) && (h12c6 == t12c6) && (h12c7 < t12c7));
+            require(pow12);
+
+            // --- Merkle branch verification ---
+            // Anchor: hash of rawTx must chain up to ONE OF h1..h12's merkleRoot.
+            bytes32 current = hash256(rawTx);
+            // Fixed depth 20
+            // level 0
+            bytes lvl0 = branch.split(33)[0];
+            bytes dir0 = lvl0.split(1)[0];
+            bytes sib0 = lvl0.split(1)[1];
+            if (dir0 == 0x00) {
+                current = hash256(current + sib0);
+            } else if (dir0 == 0x01) {
+                current = hash256(sib0 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 1
+            bytes lvl1 = branch.split(33)[1].split(33)[0];
+            bytes dir1 = lvl1.split(1)[0];
+            bytes sib1 = lvl1.split(1)[1];
+            if (dir1 == 0x00) {
+                current = hash256(current + sib1);
+            } else if (dir1 == 0x01) {
+                current = hash256(sib1 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 2
+            bytes lvl2 = branch.split(66)[1].split(33)[0];
+            bytes dir2 = lvl2.split(1)[0];
+            bytes sib2 = lvl2.split(1)[1];
+            if (dir2 == 0x00) {
+                current = hash256(current + sib2);
+            } else if (dir2 == 0x01) {
+                current = hash256(sib2 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 3
+            bytes lvl3 = branch.split(99)[1].split(33)[0];
+            bytes dir3 = lvl3.split(1)[0];
+            bytes sib3 = lvl3.split(1)[1];
+            if (dir3 == 0x00) {
+                current = hash256(current + sib3);
+            } else if (dir3 == 0x01) {
+                current = hash256(sib3 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 4
+            bytes lvl4 = branch.split(132)[1].split(33)[0];
+            bytes dir4 = lvl4.split(1)[0];
+            bytes sib4 = lvl4.split(1)[1];
+            if (dir4 == 0x00) {
+                current = hash256(current + sib4);
+            } else if (dir4 == 0x01) {
+                current = hash256(sib4 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 5
+            bytes lvl5 = branch.split(165)[1].split(33)[0];
+            bytes dir5 = lvl5.split(1)[0];
+            bytes sib5 = lvl5.split(1)[1];
+            if (dir5 == 0x00) {
+                current = hash256(current + sib5);
+            } else if (dir5 == 0x01) {
+                current = hash256(sib5 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 6
+            bytes lvl6 = branch.split(198)[1].split(33)[0];
+            bytes dir6 = lvl6.split(1)[0];
+            bytes sib6 = lvl6.split(1)[1];
+            if (dir6 == 0x00) {
+                current = hash256(current + sib6);
+            } else if (dir6 == 0x01) {
+                current = hash256(sib6 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 7
+            bytes lvl7 = branch.split(231)[1].split(33)[0];
+            bytes dir7 = lvl7.split(1)[0];
+            bytes sib7 = lvl7.split(1)[1];
+            if (dir7 == 0x00) {
+                current = hash256(current + sib7);
+            } else if (dir7 == 0x01) {
+                current = hash256(sib7 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 8
+            bytes lvl8 = branch.split(264)[1].split(33)[0];
+            bytes dir8 = lvl8.split(1)[0];
+            bytes sib8 = lvl8.split(1)[1];
+            if (dir8 == 0x00) {
+                current = hash256(current + sib8);
+            } else if (dir8 == 0x01) {
+                current = hash256(sib8 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 9
+            bytes lvl9 = branch.split(297)[1].split(33)[0];
+            bytes dir9 = lvl9.split(1)[0];
+            bytes sib9 = lvl9.split(1)[1];
+            if (dir9 == 0x00) {
+                current = hash256(current + sib9);
+            } else if (dir9 == 0x01) {
+                current = hash256(sib9 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 10
+            bytes lvl10 = branch.split(330)[1].split(33)[0];
+            bytes dir10 = lvl10.split(1)[0];
+            bytes sib10 = lvl10.split(1)[1];
+            if (dir10 == 0x00) {
+                current = hash256(current + sib10);
+            } else if (dir10 == 0x01) {
+                current = hash256(sib10 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 11
+            bytes lvl11 = branch.split(363)[1].split(33)[0];
+            bytes dir11 = lvl11.split(1)[0];
+            bytes sib11 = lvl11.split(1)[1];
+            if (dir11 == 0x00) {
+                current = hash256(current + sib11);
+            } else if (dir11 == 0x01) {
+                current = hash256(sib11 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 12
+            bytes lvl12 = branch.split(396)[1].split(33)[0];
+            bytes dir12 = lvl12.split(1)[0];
+            bytes sib12 = lvl12.split(1)[1];
+            if (dir12 == 0x00) {
+                current = hash256(current + sib12);
+            } else if (dir12 == 0x01) {
+                current = hash256(sib12 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 13
+            bytes lvl13 = branch.split(429)[1].split(33)[0];
+            bytes dir13 = lvl13.split(1)[0];
+            bytes sib13 = lvl13.split(1)[1];
+            if (dir13 == 0x00) {
+                current = hash256(current + sib13);
+            } else if (dir13 == 0x01) {
+                current = hash256(sib13 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 14
+            bytes lvl14 = branch.split(462)[1].split(33)[0];
+            bytes dir14 = lvl14.split(1)[0];
+            bytes sib14 = lvl14.split(1)[1];
+            if (dir14 == 0x00) {
+                current = hash256(current + sib14);
+            } else if (dir14 == 0x01) {
+                current = hash256(sib14 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 15
+            bytes lvl15 = branch.split(495)[1].split(33)[0];
+            bytes dir15 = lvl15.split(1)[0];
+            bytes sib15 = lvl15.split(1)[1];
+            if (dir15 == 0x00) {
+                current = hash256(current + sib15);
+            } else if (dir15 == 0x01) {
+                current = hash256(sib15 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 16
+            bytes lvl16 = branch.split(528)[1].split(33)[0];
+            bytes dir16 = lvl16.split(1)[0];
+            bytes sib16 = lvl16.split(1)[1];
+            if (dir16 == 0x00) {
+                current = hash256(current + sib16);
+            } else if (dir16 == 0x01) {
+                current = hash256(sib16 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 17
+            bytes lvl17 = branch.split(561)[1].split(33)[0];
+            bytes dir17 = lvl17.split(1)[0];
+            bytes sib17 = lvl17.split(1)[1];
+            if (dir17 == 0x00) {
+                current = hash256(current + sib17);
+            } else if (dir17 == 0x01) {
+                current = hash256(sib17 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 18
+            bytes lvl18 = branch.split(594)[1].split(33)[0];
+            bytes dir18 = lvl18.split(1)[0];
+            bytes sib18 = lvl18.split(1)[1];
+            if (dir18 == 0x00) {
+                current = hash256(current + sib18);
+            } else if (dir18 == 0x01) {
+                current = hash256(sib18 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // level 19
+            bytes lvl19 = branch.split(627)[1].split(33)[0];
+            bytes dir19 = lvl19.split(1)[0];
+            bytes sib19 = lvl19.split(1)[1];
+            if (dir19 == 0x00) {
+                current = hash256(current + sib19);
+            } else if (dir19 == 0x01) {
+                current = hash256(sib19 + current);
+            }
+            // else: sentinel 0x02 — padding level, current passes through unchanged
+            // Extract merkleRoot from each header
+            bytes root1 = h1.split(36)[1].split(32)[0];
+            bytes root2 = h2.split(36)[1].split(32)[0];
+            bytes root3 = h3.split(36)[1].split(32)[0];
+            bytes root4 = h4.split(36)[1].split(32)[0];
+            bytes root5 = h5.split(36)[1].split(32)[0];
+            bytes root6 = h6.split(36)[1].split(32)[0];
+            bytes root7 = h7.split(36)[1].split(32)[0];
+            bytes root8 = h8.split(36)[1].split(32)[0];
+            bytes root9 = h9.split(36)[1].split(32)[0];
+            bytes root10 = h10.split(36)[1].split(32)[0];
+            bytes root11 = h11.split(36)[1].split(32)[0];
+            bytes root12 = h12.split(36)[1].split(32)[0];
+            require(current == root1 || current == root2 || current == root3 || current == root4 || current == root5 || current == root6 || current == root7 || current == root8 || current == root9 || current == root10 || current == root11 || current == root12);
+
+            // --- BTC payment verification (P2WPKH) ---
+            // P2WPKH: 31-byte output
+            bytes output = rawTx.split(outputOffset)[1].split(31)[0];
+            int value = int(output.split(8)[0]);
+            require(value >= btcSatoshis);
+            bytes scriptSection = output.split(8)[1];
+            bytes prefix = scriptSection.split(3)[0];
+            require(prefix == 0x160014);
+            bytes hash = scriptSection.split(3)[1];
+            require(hash == btcReceiveHash);
+
+            // --- Route to Taker FT (exact FT code-script via hash-compare) ---
+            require(hash256(tx.outputs[0].lockingBytecode) == expectedTakerFtHash);
+        },
+
+        forfeit() {
+            require(tx.time >= claimDeadline);
+            require(hash256(tx.outputs[0].lockingBytecode) == expectedMakerFtHash);
+        }
+    };
+}
