@@ -83,3 +83,37 @@ dominant risk — bigger than the parser bugs already fixed. The honest options 
 client-margin hardening AND document plainly that one-sided BTC loss on a
 pathological tail remains possible because the BTC leg has no refund. Maker-sig
 forfeit and bonds are not real fixes.
+
+## Capability spike (2026-05-24, Radiant-Core + RadiantScript source) — corrects the panel
+
+All source-cited (interpreter.cpp / transaction.h / tx_verify.cpp / policy.h /
+RadiantScript Globals.ts + utils.ts + CashScript.g4):
+
+- **CSV / relative timelock: SUPPORTED, first-class.** RadiantScript `tx.age`
+  compiles to `OP_CHECKSEQUENCEVERIFY` (utils.ts:17); CSV is a real enabled
+  opcode (interpreter.cpp:398), BIP68 enforced (tx_verify.cpp:65, v2 tx). Shipped
+  examples exist. **The CSV-relative-forfeit leg needs NO asm.**
+- **`tx.time` = CLTV vs spending-tx nLockTime** (Globals.ts:52, utils.ts:14).
+  `>=` only (grammar CashScript.g4:89). `OP_TXLOCKTIME` exposes the raw value.
+- **Schnorr + checkSig/checkDataSig: SUPPORTED** (interpreter.cpp:2710, 1162;
+  language utils.ts:38,40). Adaptor swaps are buildable in the standard sense —
+  the chain only verifies ordinary Schnorr sigs; the adaptor secret-leak is
+  off-chain/wallet-side, exactly as on Bitcoin. No on-chain adaptor primitive
+  (no EC point/scalar opcode), but none is needed.
+- **CORRECTION to the panel's "naive hashlock HTLC is broken":** WRONG. Radiant
+  has plain Bitcoin-compatible `OP_SHA256` (interpreter.cpp:1084) and
+  RadiantScript `sha256`→`[OP_SHA256]` (utils.ts:45). A standard SHA256 hashlock
+  matching a Bitcoin HTLC's `OP_SHA256(x)` IS expressible on the Radiant side.
+  The SHA512/256d in project memory is Radiant's PoW/ref hashing, NOT a covenant
+  constraint. So a plain hashlock HTLC works cross-chain; adaptor sigs are an
+  optimization, not a requirement. This makes the atomic swap SIMPLER than feared.
+- **CORRECTION on "work maturity":** a true cumulative-PoW *work* threshold is
+  NOT natively expressible — script arithmetic is 64-bit-capped with
+  overflow-reject (interpreter.cpp:276,945), no 256-bit math, no chainwork
+  opcode. Maturity must be **confirmation-DEPTH** (chain-linked header count),
+  not summed work. Reading a header's 4-byte timestamp via split+BIN2NUM works
+  (signed-BIN2NUM caveat for post-2038 / high-bit timestamps).
+
+**Both fix options are BUILDABLE.** (A) hashlock/adaptor atomic swap; (B)
+confirmation-depth maturity + `tx.age` CSV forfeit. The CSV leg of (B) is the
+cleanest asm-free piece on the platform.
