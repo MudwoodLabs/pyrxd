@@ -22,10 +22,22 @@ below shows the NFT case is actually **simpler** than FT.
 
 **The load-bearing difference:** FT is welded to its *code-script* (you cannot
 hold it in a foreign covenant — that was the whole FT blocker). The NFT is
-welded only to its *singleton ref* — the consensus rule just requires that ref
-to land on exactly one output of **any** shape that carries
-`OP_PUSHINPUTREFSINGLETON <ref>`. So an NFT **can be held directly in a
+welded only to its *singleton ref*. So an NFT **can be held directly in a
 covenant**, which an FT cannot.
+
+> **CORRECTION (divergent review 2026-05-23, verified against
+> `validation.h:919-968`):** an earlier version of this note said consensus
+> requires the singleton "to land on **exactly one** output." That is WRONG.
+> `validatePushRefRule` only enforces **outputs ⊆ inputs** (a singleton on an
+> output must trace to an input), and `validateDisallowedSiblingsRefRule` only
+> forbids the ref on a *different*-than-allowed output. **Consensus does NOT
+> require the singleton to appear on any output — it permits BURNING the NFT
+> (zero output copies), and never welds it to a code-script.** Therefore
+> "exactly one output" is enforced **solely by the covenant** (`outputs.length
+> == 1` + `refOutputCount(ref) == 1`) — there is no consensus backstop. For an
+> irreversible one-of-one this is the dominant security fact: the covenant body
+> is the sole guarantor of conservation. See the plan for the full threat-model
+> consequences.
 
 ## NFT execution → where covenant logic attaches
 
