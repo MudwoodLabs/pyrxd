@@ -106,7 +106,7 @@ def mock_btc_source() -> AsyncMock:
 class TestTradeConfig:
     def test_defaults_are_valid(self):
         cfg = TradeConfig()
-        assert cfg.min_btc_confirmations == 6
+        assert cfg.min_btc_confirmations == 6  # must equal covenant N (default N=6, audit 2026-05-24)
         assert cfg.poll_interval_seconds == 60
         assert cfg.max_poll_attempts == 120
 

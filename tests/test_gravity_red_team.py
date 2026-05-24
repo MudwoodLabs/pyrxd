@@ -1648,3 +1648,50 @@ class TestSpvOutputOffsetForgery:
         bad = b"\x02\x00\x00\x00" + b"\x01" + b"\x00" * 20  # truncated
         with pytest.raises(SpvVerificationError):
             _output_offsets(bad)
+
+
+class TestUsedBtcReceiveHashGuard:
+    """AUDIT 2026-05-24 C-ECON-1 mitigation: build_gravity_offer rejects a
+    btc_receive_hash already used by a live offer, and tolerates bytes/bytearray."""
+
+    def _kwargs(self, **over):
+        base = dict(
+            maker_pkh=b"\x11" * 20,
+            maker_pk=b"\x02" + b"\x33" * 32,
+            taker_pk=b"\x03" + b"\x44" * 32,
+            taker_radiant_pkh=b"\x55" * 20,
+            btc_receive_hash=b"\x66" * 20,
+            btc_receive_type="p2wpkh",
+            btc_satoshis=10000,
+            btc_chain_anchor=b"\x77" * 32,
+            expected_nbits=b"\xff\xff\x7f\x1d",
+            anchor_height=1,
+            merkle_depth=20,
+            claim_deadline=4102444800,  # 2100 — well past any floor
+            photons_offered=1000,
+        )
+        base.update(over)
+        return base
+
+    def test_rejects_reused_hash_bytes(self):
+        import pytest
+
+        from pyrxd.gravity.covenant import build_gravity_offer
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError, match="already in use"):
+            build_gravity_offer(used_btc_receive_hashes={b"\x66" * 20}, **self._kwargs())
+
+    def test_reused_hash_check_tolerates_bytearray(self):
+        import pytest
+
+        from pyrxd.gravity.covenant import build_gravity_offer
+        from pyrxd.security.errors import ValidationError
+
+        # A bytearray receive-hash (which the SPV layer tolerates) must still be
+        # detected as reuse without a TypeError. The tracked container is a list
+        # of bytearrays — the guard normalizes both sides to bytes.
+        kw = self._kwargs()
+        kw["btc_receive_hash"] = bytearray(b"\x66" * 20)
+        with pytest.raises(ValidationError, match="already in use"):
+            build_gravity_offer(used_btc_receive_hashes=[bytearray(b"\x66" * 20)], **kw)

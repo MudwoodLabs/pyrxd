@@ -96,8 +96,10 @@ the same construction for NFT. **Chosen: this converged form.**
 Spend paths (BTC half **reused verbatim** from the FT any-wallet covenant):
 - **finalize(SPV proof):** verify the BTC payment (anchor + N=12 headers PoW +
   M=20 sentinel Merkle; the 4-way output-type scan P2WPKH/P2PKH/P2SH/P2TR; the
-  varint multi-input parser; the per-offer-derived `btcReceiveHash` H1
-  binding), then `require(hash256(tx.outputs[0].lockingBytecode) ==
+  varint multi-input parser; `btcReceiveHash` match — NOTE: the "per-offer
+  derived H1 binding" was NEVER implemented, see C-ECON-1; payment is bound only
+  by receiveHash+satoshis+anchor), then
+  `require(hash256(tx.outputs[0].lockingBytecode) ==
   EXPECTED_TAKER_NFT_HASH)`.
 - **forfeit(CLTV):** after the deadline,
   `require(hash256(tx.outputs[0].lockingBytecode) == EXPECTED_MAKER_NFT_HASH)`.
@@ -243,8 +245,9 @@ deadline** (now + a few hours, so test assets are recoverable).
     (`OP_VERIFY` / `require(found)`).
   - wrong destination: settlement output is an NFT to the *wrong* pkh → reject
     (hash-compare).
-  - **SPV-proof cross-offer replay:** a proof valid for one offer replayed
-    against a second covenant → reject (per-offer `btcReceiveHash` binding).
+  - **SPV-proof cross-offer replay:** ⚠️ only rejects when offers use DIFFERENT
+    `btcReceiveHash` (trivial). Same-address reuse → one proof finalizes both
+    (C-ECON-1, UNMITIGATED; the "per-offer binding" was never built).
 - [ ] **Re-run the any-wallet parser negatives** (wrong-hash, insufficient-
   value) against the NFT-fused artifact — the parser now runs inside a
   structurally different script; don't assume "verbatim reuse" transfers
@@ -320,7 +323,7 @@ trio); both-chain txids recorded; BTC swept back.
 | **Honest single-output finalize unconstructable** → NFT stranded | Med | High | Pin `outputs[0].value == NFT_CARRIER_VALUE`; prove constructability on-chain |
 | Phantom ref from body bytes (no `bd` boundary) | Med | High | Upgraded guard: parser-equivalence + offset-0 positional anchor; hash-compare keeps NFT bytes out |
 | Anchor-timing / Merkle-depth mismatch (the 2 FT stumbles) | Med | Med | Apply both lessons up front: anchor=payment_block−1 just-in-time, M=20, wide N=12, near deadline |
-| SPV-proof cross-offer replay | Low | High | Per-offer `btcReceiveHash` binding; prove the replay negative rejects on-chain |
+| SPV-proof cross-offer replay | **Med** | High | ⚠️ UNMITIGATED (C-ECON-1) — per-offer binding never built; mitigated only by maker using a fresh BTC addr per offer. Real fix = offer-committed derived address or OP_RETURN tag |
 | NFT irreversibility magnifies any parser/covenant bug | — | High | External audit is a hard gate; this is the dominant reason it matters more than FT |
 | Funding the ~11 KB covenant is expensive (~1 RXD) | High | Low | Known cost (same as FT M=20); recover via settle/forfeit |
 

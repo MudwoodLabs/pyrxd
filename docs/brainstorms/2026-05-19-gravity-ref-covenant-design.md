@@ -1029,29 +1029,36 @@ rejection test (fund two covenants with different derived `btcReceiveHash`,
 one proof → A accepts / B rejects); production builders + golden vectors;
 `--ft` generator mode; then external audit before mainnet activation.
 
-### Phase 4 — H1 SPV-proof-reuse PROVEN closed on-chain (2026-05-20)
+### Phase 4 — H1 SPV-proof-reuse: what was ACTUALLY proven (2026-05-20)
 
-The per-offer-derived `btcReceiveHash` binding is now empirically validated
-on the live mainnet node, with both controls:
+> **CORRECTION (audit 2026-05-24 C-ECON-1).** This section originally claimed
+> the SPV-proof-reuse attack was "PROVEN closed on-chain by construction." That
+> was WRONG — it rested on a conflation. The on-chain test below proves only
+> that *different* `btcReceiveHash` values yield *different* covenants that
+> reject each other's proofs (true, but trivial). It says NOTHING about the
+> actual attack: a maker who reuses the **same** `btcReceiveHash` (+ amount +
+> anchor window) across two offers, where **one** BTC payment + **one** SPV
+> proof finalizes BOTH. There is no per-offer derivation in code
+> (`build_gravity_offer` takes `btc_receive_hash` as a raw arg), so cross-offer
+> replay is UNMITIGATED — it depends entirely on the maker using a fresh BTC
+> address per offer. See AUDIT_REDTEAM_2026-05-24.md C-ECON-1.
+
+What the on-chain test below actually demonstrates (a real but narrow control):
 
 - **Distinct covenants:** covenant A (`btcReceiveHash` = `25db43…`) and
   covenant B (`btcReceiveHash` = `140b40…`) compile to **different**
-  scriptPubKeys → different covenant addresses (the binding is structural,
-  not entropy-based).
-- **Negative (the security property):** funded covenant B (`eeae386a…`),
-  attempted `finalize` with the SPV proof that pays **A** → REJECTED with
-  `mandatory-script-verify-flag-failed (OP_EQUALVERIFY)`, exactly at the
-  covenant's `require(hash == btcReceiveHash)` payment check. **A payment
-  to offer A's address cannot settle offer B.**
-- **Positive control:** a freshly-mined proof paying **B** → covenant B
-  `finalize` ACCEPTED (`2d5c332d…`, broadcast). So the rejection is
-  specifically the address mismatch, not an incidental failure.
+  scriptPubKeys → different covenant addresses.
+- **Cross-rejection:** funded covenant B (`eeae386a…`), attempted `finalize`
+  with the SPV proof that pays **A** → REJECTED at
+  `require(hash == btcReceiveHash)`. A payment to A's address cannot settle B.
+- **Positive control:** a proof paying **B** → covenant B `finalize` ACCEPTED
+  (`2d5c332d…`).
 
-**Conclusion:** the SPV-proof-reuse attack (security review H1) is closed
-on-chain by construction. Since each offer's per-offer-derived
-`btcReceiveHash` produces a distinct covenant that only honors a payment
-to its own committed address, one BTC payment cannot drain two concurrent
-offers. This was the last security-critical on-chain proof.
+**What this does NOT prove:** that one payment can't settle two offers SHARING a
+receive address. That replay remains open; closing it requires a per-offer
+derived receive address committed in the offer, or an `OP_RETURN` offer-tag the
+covenant parses (audit follow-up #2). This was NOT the "last security-critical
+proof" — the 2026-05-24 red-team found four CRITICALs after it.
 
 ---
 

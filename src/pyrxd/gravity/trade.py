@@ -64,7 +64,14 @@ class TradeConfig:
     Attributes
     ----------
     min_btc_confirmations:
-        Minimum on-chain BTC confirmations before finalizing. Default 6.
+        Minimum on-chain BTC confirmations before finalizing. MUST equal the
+        covenant's header-depth N (the finalize path verifies exactly N
+        consecutive headers from the anchor; a proof with fewer is rejected).
+        Default 6 — matches the default N=6 covenant and Bitcoin's standard
+        finality convention (~1h). N is a per-offer MAKER knob: raise it (e.g.
+        12) for high-value/irreversible assets to roughly double the reorg cost,
+        at the price of a longer wait. When using a covenant built with a
+        different N, set this to that N (audit 2026-05-24: the two must match).
     poll_interval_seconds:
         Seconds between confirmation polls. Default 60.
     max_poll_attempts:
@@ -80,7 +87,7 @@ class TradeConfig:
         04-S1 forfeit race).
     """
 
-    min_btc_confirmations: int = 6
+    min_btc_confirmations: int = 6  # MUST equal the covenant's header-depth N (default N=6)
     poll_interval_seconds: float = _DEFAULT_POLL_INTERVAL
     max_poll_attempts: int = _DEFAULT_MAX_POLLS
     accept_short_deadline: bool = False
