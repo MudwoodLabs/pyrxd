@@ -21,9 +21,18 @@ FT vs NFT (the consensus-gate difference):
   NFT funded SPK = the substituted covenant VERBATIM (no epilogue, no weld;
        the singleton ref d8<ref> is inside the compiled body).
 
+RXD variant (Phase 3 addition — NO ref machinery):
+  GravityHtlcCovenantRxd takes (hashlock, refundCsv, amount, expectedTakerHash,
+  expectedMakerHash). The asset is native RXD, so there is NO genesis ref, NO
+  d0/d8 prologue, NO FT epilogue weld. expected{Taker,Maker}Hash = hash256 of the
+  25-byte P2PKH holder script (76a914<pkh>88ac). The funded SPK is the substituted
+  compiled body VERBATIM. GUARD 1 (bare-0xbd) must find NONE (no ref ops at all);
+  GUARD 2 (count_input_refs) must find NONE.
+
 Usage:
   build_htlc_covenant_spk.py ft  <genesis_txid> <vout> <amount>          <taker_wif> <maker_wif> <hashlock_hex> <refund_csv>
   build_htlc_covenant_spk.py nft <genesis_txid> <vout> <nft_carrier_val> <taker_wif> <maker_wif> <hashlock_hex> <refund_csv>
+  build_htlc_covenant_spk.py rxd <amount> <taker_wif> <maker_wif> <hashlock_hex> <refund_csv>
 """
 import hashlib
 import json
@@ -123,8 +132,68 @@ def nft_holder_script(pkh: bytes, ref_wire: bytes) -> bytes:
     return b"\xd8" + ref_wire + b"\x75\x76\xa9\x14" + pkh + b"\x88\xac"
 
 
+def rxd_holder_script(pkh: bytes) -> bytes:
+    """The native-RXD holder script is a plain 25-byte P2PKH (no ref, no weld)."""
+    return b"\x76\xa9\x14" + pkh + b"\x88\xac"
+
+
+def _build_rxd() -> None:
+    """RXD variant: no ref/genesis args. argv: amount taker_wif maker_wif hashlock_hex refund_csv."""
+    amount = int(sys.argv[2])
+    taker_wif, maker_wif = sys.argv[3], sys.argv[4]
+    hashlock = bytes.fromhex(sys.argv[5])
+    refund_csv = int(sys.argv[6])
+    assert len(hashlock) == 32, f"hashlock must be 32 bytes, got {len(hashlock)}"
+
+    taker_pkh = bytes(Hex20(PrivateKey(taker_wif).public_key().hash160()))
+    maker_pkh = bytes(Hex20(PrivateKey(maker_wif).public_key().hash160()))
+    expected_taker = hash256(rxd_holder_script(taker_pkh))
+    expected_maker = hash256(rxd_holder_script(maker_pkh))
+
+    artifact = f"{ART_DIR}/GravityHtlcCovenantRxd.artifact.json"
+    subs = {
+        "hashlock": push(hashlock).hex(),
+        "refundCsv": minimal_num_push(refund_csv).hex(),
+        "amount": push(scriptnum(amount)).hex(),
+        "expectedTakerHash": push(expected_taker).hex(),
+        "expectedMakerHash": push(expected_maker).hex(),
+    }
+    spk_hex = json.load(open(artifact))["hex"]
+    for name, val in subs.items():
+        spk_hex = spk_hex.replace(f"<{name}>", val)
+    assert "<" not in spk_hex, f"unfilled placeholder: {spk_hex[spk_hex.index('<'):][:40]}"
+    fused = bytes.fromhex(spk_hex)
+
+    # GUARD 1: native RXD has NO ref op and NO FT epilogue — there must be NO bare 0xbd.
+    bds = _opcode_bd_positions(fused)
+    assert bds == [], f"GUARD 1 FAIL (RXD): unexpected bare 0xbd at {bds}"
+    # GUARD 2: there must be NO input refs at all (no genesis ref to bind).
+    refs = count_input_refs(fused)
+    assert list(refs) == [], f"GUARD 2 FAIL (RXD): unexpected refs {[r.hex() for r in refs]}"
+
+    print(json.dumps({
+        "variant": "rxd",
+        "fused_spk_hex": fused.hex(),
+        "len": len(fused),
+        "prologue_len": len(fused),
+        "hashlock_hex": hashlock.hex(),
+        "refund_csv": refund_csv,
+        "amount": amount,
+        "expected_taker_hash": expected_taker.hex(),
+        "expected_maker_hash": expected_maker.hex(),
+        "taker_script": rxd_holder_script(taker_pkh).hex(),
+        "maker_script": rxd_holder_script(maker_pkh).hex(),
+        "taker_pkh": taker_pkh.hex(),
+        "maker_pkh": maker_pkh.hex(),
+    }))
+
+
 def main() -> None:
     variant = sys.argv[1]
+    if variant == "rxd":
+        _build_rxd()
+        return
+
     genesis_txid = sys.argv[2]
     genesis_vout = int(sys.argv[3])
     value_param = int(sys.argv[4])  # FT amount OR nft carrier value
@@ -132,7 +201,7 @@ def main() -> None:
     hashlock_hex = sys.argv[7]
     refund_csv = int(sys.argv[8])
 
-    assert variant in ("ft", "nft"), "variant must be ft|nft"
+    assert variant in ("ft", "nft"), "variant must be ft|nft|rxd"
     hashlock = bytes.fromhex(hashlock_hex)
     assert len(hashlock) == 32, f"hashlock must be 32 bytes, got {len(hashlock)}"
 
