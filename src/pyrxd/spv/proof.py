@@ -25,6 +25,60 @@ _BUILDER_TOKEN = object()  # unforgeable sentinel; SpvProof.__post_init__ checks
 _VALID_RECEIVE_TYPES = frozenset({P2PKH, P2WPKH, P2SH, P2TR})
 
 
+def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
+    """Read a Bitcoin CompactSize varint at ``pos``; return (value, next_pos)."""
+    if pos >= len(buf):
+        raise SpvVerificationError("varint read past end of tx")
+    first = buf[pos]
+    if first < 0xFD:
+        return first, pos + 1
+    if first == 0xFD:
+        if pos + 3 > len(buf):
+            raise SpvVerificationError("truncated 2-byte varint")
+        return int.from_bytes(buf[pos + 1 : pos + 3], "little"), pos + 3
+    if first == 0xFE:
+        if pos + 5 > len(buf):
+            raise SpvVerificationError("truncated 4-byte varint")
+        return int.from_bytes(buf[pos + 1 : pos + 5], "little"), pos + 5
+    if pos + 9 > len(buf):
+        raise SpvVerificationError("truncated 8-byte varint")
+    return int.from_bytes(buf[pos + 1 : pos + 9], "little"), pos + 9
+
+
+def _output_offsets(stripped_tx: bytes) -> set[int]:
+    """Parse a witness-stripped tx and return the byte offset of every output.
+
+    AUDIT 2026-05-24 C-PARSER-2 fix: ``verify_payment`` validates only the bytes
+    at a caller-supplied ``output_offset`` and never confirms that offset is a
+    real output boundary. A caller could point it into an input scriptSig holding
+    a forged payment-shaped blob. This walk lets ``build()`` require the offset to
+    be the genuine start of one of the tx's outputs.
+    """
+    pos = 4  # skip version
+    n_in, pos = _read_varint(stripped_tx, pos)
+    for _ in range(n_in):
+        pos += 36  # prevout (txid 32 + vout 4)
+        script_len, pos = _read_varint(stripped_tx, pos)
+        pos += script_len + 4  # scriptSig + sequence
+        if pos > len(stripped_tx):
+            raise SpvVerificationError("input parse ran past end of tx")
+    n_out, pos = _read_varint(stripped_tx, pos)
+    offsets: set[int] = set()
+    for _ in range(n_out):
+        offsets.add(pos)
+        pos += 8  # value
+        script_len, pos = _read_varint(stripped_tx, pos)
+        pos += script_len
+        if pos > len(stripped_tx):
+            raise SpvVerificationError("output parse ran past end of tx")
+    # pos must now sit exactly on the 4-byte nLockTime trailer.
+    if pos != len(stripped_tx) - 4:
+        raise SpvVerificationError(
+            f"tx structure parse ended at {pos}, expected {len(stripped_tx) - 4} (len-4)"
+        )
+    return offsets
+
+
 @dataclass(frozen=True)
 class CovenantParams:
     """Full parameter set committed by the Maker into the covenant.
@@ -184,6 +238,13 @@ class SpvProofBuilder:
         )
 
         # Step 5: verify payment output.
+        # AUDIT 2026-05-24 C-PARSER-2 fix: confirm output_offset is the genuine
+        # start of one of the tx's outputs before trusting verify_payment's
+        # structural check there (defeats a forged payment planted in a scriptSig).
+        if output_offset not in _output_offsets(stripped):
+            raise SpvVerificationError(
+                f"output_offset {output_offset} is not a real output boundary"
+            )
         verify_payment(
             raw_tx=stripped,
             output_offset=output_offset,

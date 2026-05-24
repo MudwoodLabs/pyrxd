@@ -115,7 +115,7 @@ embedded bytes) avoids the phantom-ref hazard, exactly as in FT.
 | BTC SPV half (anchor, N=12 PoW, M=20 sentinel Merkle) | **Reuse verbatim** | FT any-wallet covenant `GravityFtCovenantAnyWallet20.rxd` |
 | 4-way output-type scan (P2WPKH/P2PKH/P2SH/P2TR) | **Reuse verbatim** | `fuse_anywallet.py` `_scan_one` |
 | Varint multi-input parser + caps | **Reuse verbatim** | `fuse_anywallet.py` input-skip |
-| H1 per-offer `btcReceiveHash` binding | **Reuse verbatim** | BIP32 child derivation (FT) |
+| H1 per-offer `btcReceiveHash` binding | ⚠️ **NOT IMPLEMENTED** (audit 2026-05-24 C-ECON-1) | claimed BIP32 derivation does not exist; cross-offer replay unmitigated — use a fresh BTC addr per offer |
 | Anchor-just-in-time + wide-N/M operational lessons | **Reuse** | [feedback_gravity_anchor_timing] (memory) |
 | `count_input_refs` phantom-ref guard | **Reuse** | `glyph/script.py` |
 | NFT prologue `d8<ref>75` (NEW) | **New** | replaces FT `P2PKH + bd + d0<ref> + epilogue` |

@@ -1584,3 +1584,67 @@ class TestAuditFindings2026:
                     bytes(range(1, 33))
                 ),
             )
+
+
+class TestSpvOutputOffsetForgery:
+    """AUDIT 2026-05-24 C-PARSER-2: SpvProofBuilder.build() must reject an
+    output_offset that points anywhere other than a genuine output boundary
+    (e.g. into an input scriptSig holding a forged payment-shaped blob)."""
+
+    def _params_and_tx(self):
+        import struct
+
+        from pyrxd.spv.proof import CovenantParams
+
+        maker = bytes.fromhex("5038ef03c06fe5b1ed135e8beb020b2b48262f70")
+        # 1-input, 2-output tx: input scriptSig holds a forged P2WPKH-to-maker
+        # blob; outputs pay the attacker only.
+        plant = struct.pack("<Q", 10000) + bytes.fromhex("160014") + maker  # 31B
+        ss = plant + b"\x00" * 9  # 40-byte scriptSig
+        inp = b"\xbb" * 32 + b"\x00\x00\x00\x00" + bytes([len(ss)]) + ss + b"\xff\xff\xff\xff"
+        out0 = struct.pack("<Q", 1) + bytes([22]) + b"\x00\x14" + b"\x11" * 20
+        out1 = struct.pack("<Q", 500) + bytes([22]) + b"\x00\x14" + b"\x22" * 20
+        raw = b"\x02\x00\x00\x00" + b"\x01" + inp + b"\x02" + out0 + out1 + b"\x00\x00\x00\x00"
+        params = CovenantParams(
+            btc_receive_hash=maker,
+            btc_receive_type="p2wpkh",
+            btc_satoshis=10000,
+            chain_anchor=b"\x00" * 32,
+            anchor_height=1,
+            merkle_depth=1,
+        )
+        return params, raw
+
+    def test_output_offsets_finds_real_boundaries(self):
+        from pyrxd.spv.proof import _output_offsets
+
+        _params, raw = self._params_and_tx()
+        offs = _output_offsets(raw)
+        # 4 (version) + 1 (nIn) + 32+4+1+40+4 (input) + 1 (nOut) = 87 -> out0
+        assert 87 in offs
+        # the scriptSig plant lives at offset 5+36+1 = 42, which must NOT be an output
+        assert 42 not in offs
+
+    def test_offset_into_scriptsig_is_rejected(self):
+        import pytest
+
+        from pyrxd.security.errors import SpvVerificationError
+        from pyrxd.spv.proof import _output_offsets
+
+        _params, raw = self._params_and_tx()
+        # The forged payment sits at offset 42 (inside the scriptSig). Confirm
+        # the output-boundary check would reject it.
+        offs = _output_offsets(raw)
+        assert 42 not in offs  # the guard build() applies: `if offset not in offsets: reject`
+
+    def test_output_offsets_rejects_malformed_structure(self):
+        import pytest
+
+        from pyrxd.security.errors import SpvVerificationError
+        from pyrxd.spv.proof import _output_offsets
+
+        # A tx whose declared output count overruns the buffer must raise, not
+        # silently return a bogus offset set.
+        bad = b"\x02\x00\x00\x00" + b"\x01" + b"\x00" * 20  # truncated
+        with pytest.raises(SpvVerificationError):
+            _output_offsets(bad)

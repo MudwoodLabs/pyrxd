@@ -126,4 +126,13 @@ singleton ref. **Subtlety vs FT:** the boundary is NOT an `OP_STATESEPARATOR`
 An NFT is one-of-one — a botched swap can't be made whole by fungible
 top-up. So the deadline/forfeit margins and the audit gate matter more than
 for FT. Keep the same anchor-just-in-time + wide-N + wide-M operational
-lessons. Per-offer derived `btcReceiveHash` (H1 binding) applies unchanged.
+lessons.
+
+> **CORRECTION (audit 2026-05-24 C-ECON-1):** the "per-offer derived
+> `btcReceiveHash` (H1 binding)" referenced here as a settled replay defense
+> was **never implemented**. `build_gravity_offer` takes `btc_receive_hash` as a
+> raw caller arg with no derivation. Cross-offer replay (one BTC payment
+> finalizing two offers that share a receive address + amount + anchor window)
+> is therefore UNMITIGATED in code — the Maker must use a fresh BTC receive
+> address per offer. See `covenant.py::build_gravity_offer` warning + the
+> `used_btc_receive_hashes` guard, and AUDIT_REDTEAM_2026-05-24.md.

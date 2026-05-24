@@ -37,11 +37,18 @@ new_input_skip = """            // --- Any-wallet input skip (any-wallet design 
             int pos = 5;
             // Skip each input: 36 outpoint + scriptSigLen varint(1) + scriptSig + 4 seq.
             // Handles native-segwit/P2TR (scriptSig 0x00) and P2SH-P2WPKH (0x16..).
+            // AUDIT 2026-05-24 C-PARSER-1 fix: scriptSigLen is read via
+            // int()=OP_BIN2NUM (SIGNED). A scriptSig >= 128 bytes (a legal,
+            // relay-standard large P2SH redeem) would decode NEGATIVE and
+            // rewind `pos`. Reject negatives so the skip is always forward.
+            // (Lengths > 252 are a pre-existing 1-byte-varint liveness limit,
+            // not a safety hole — such txs simply can't be used as proofs.)
             int ssl1 = int(rawTx.split(pos + 36)[1].split(1)[0]);
+            require(ssl1 >= 0); require(ssl1 <= 252);
             pos = pos + 36 + 1 + ssl1 + 4;
-            if (nIn >= 2) { int ssl2 = int(rawTx.split(pos + 36)[1].split(1)[0]); pos = pos + 36 + 1 + ssl2 + 4; }
-            if (nIn >= 3) { int ssl3 = int(rawTx.split(pos + 36)[1].split(1)[0]); pos = pos + 36 + 1 + ssl3 + 4; }
-            if (nIn >= 4) { int ssl4 = int(rawTx.split(pos + 36)[1].split(1)[0]); pos = pos + 36 + 1 + ssl4 + 4; }
+            if (nIn >= 2) { int ssl2 = int(rawTx.split(pos + 36)[1].split(1)[0]); require(ssl2 >= 0); require(ssl2 <= 252); pos = pos + 36 + 1 + ssl2 + 4; }
+            if (nIn >= 3) { int ssl3 = int(rawTx.split(pos + 36)[1].split(1)[0]); require(ssl3 >= 0); require(ssl3 <= 252); pos = pos + 36 + 1 + ssl3 + 4; }
+            if (nIn >= 4) { int ssl4 = int(rawTx.split(pos + 36)[1].split(1)[0]); require(ssl4 >= 0); require(ssl4 <= 252); pos = pos + 36 + 1 + ssl4 + 4; }
             // pos now -> output-count varint.
             int nOut = int(rawTx.split(pos)[1].split(1)[0]);
             require(nOut >= 1);
@@ -68,6 +75,14 @@ def _scan_one(vn: str, sln: str) -> str:
     return (
         f"            int {vn} = int(rawTx.split(pos)[1].split(8)[0]);\n"
         f"            int {sln} = int(rawTx.split(pos + 8)[1].split(1)[0]);\n"
+        # AUDIT 2026-05-24 C-PARSER-1 fix: scriptLen is read via int()=OP_BIN2NUM
+        # which is SIGNED. A script-length byte >= 0x80 (a 128-252 byte output
+        # script) decodes NEGATIVE and rewinds `pos` on the advance below,
+        # letting the scan match a forged payment planted earlier in the tx.
+        # Reject any negative length (and >0xfc, which would also be a non-1-byte
+        # varint we don't handle) so the advance is always strictly forward.
+        f"            require({sln} >= 0);\n"
+        f"            require({sln} <= 252);\n"
         # P2WPKH: 0x0014 + 20B hash
         f"            if ({sln} == 22) {{ if (rawTx.split(pos + 9)[1].split(2)[0] == 0x0014) {{ if (rawTx.split(pos + 11)[1].split(20)[0] == btcReceiveHash) {{ if ({vn} >= btcSatoshis) {{ found = true; }} }} }} }}\n"
         # P2PKH: 0x76a914 + 20B hash + 0x88ac
@@ -89,8 +104,14 @@ NEW_SCAN = (
     + "            pos = pos + 9 + sl1;\n"
     + "            if (nOut >= 2) {\n" + _scan_one("v2", "sl2") + "                pos = pos + 9 + sl2;\n            }\n"
     + "            if (nOut >= 3) {\n" + _scan_one("v3", "sl3") + "                pos = pos + 9 + sl3;\n            }\n"
-    + "            if (nOut >= 4) {\n" + _scan_one("v4", "sl4") + "            }\n"
-    + "            require(found);"
+    + "            if (nOut >= 4) {\n" + _scan_one("v4", "sl4") + "                pos = pos + 9 + sl4;\n            }\n"
+    + "            require(found);\n"
+    # AUDIT 2026-05-24 C-PARSER-1 fix (terminal check): after scanning all
+    # outputs, `pos` MUST land exactly on the 4-byte nLockTime trailer. This
+    # forbids any walk that overlapped/rewound/short-counted the outputs (a
+    # forged tx whose declared nOut or scriptLens don't match its real layout
+    # can no longer make the scan match attacker-controlled bytes).
+    + "            require(pos == rawTx.length - 4);"
 )
 assert OLD_PAY in src, "fixed-offset payment block not found verbatim"
 src = src.replace(OLD_PAY, NEW_SCAN, 1)

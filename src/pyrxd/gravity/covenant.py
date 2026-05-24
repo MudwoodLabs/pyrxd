@@ -323,6 +323,7 @@ def build_gravity_offer(
     accept_short_deadline: bool = False,
     covenant_artifact_name: str = "maker_covenant_flat_12x20_sentinel_all",
     offer_artifact_name: str = "maker_offer",
+    used_btc_receive_hashes: set[bytes] | None = None,
 ) -> Any:
     """
     Build a :class:`~pyrxd.gravity.types.GravityOffer` with real covenant
@@ -343,11 +344,39 @@ def build_gravity_offer(
         only for test harnesses you control — never because a counterparty asks.
     :param covenant_artifact_name: Override the MakerClaimed artifact stem.
     :param offer_artifact_name: Override the MakerOffer artifact stem.
+    :param used_btc_receive_hashes: Optional set of ``btc_receive_hash`` values
+        already committed to other LIVE offers by this Maker. If the new
+        ``btc_receive_hash`` is in this set, the call is rejected.
+
+    .. warning::
+        **CROSS-OFFER REPLAY (audit 2026-05-24 C-ECON-1).** A Bitcoin payment
+        cannot reference a Radiant offer, so the covenant binds the payment only
+        by ``btc_receive_hash`` + ``btc_satoshis`` + ``btc_chain_anchor``. If the
+        same ``btc_receive_hash`` (BTC receive address) + amount is reused across
+        two offers with overlapping anchor windows, **one BTC payment + one SPV
+        proof can finalize BOTH offers** — a taker pays once and takes two
+        assets. There is NO on-chain or automatic defense; the earlier
+        "per-offer-derived btcReceiveHash (H1)" control described in the design
+        notes was **never implemented**. The Maker MUST use a fresh, unique BTC
+        receive address per offer. Pass ``used_btc_receive_hashes`` to have this
+        function reject reuse it can see; offers built by separate processes are
+        the caller's responsibility.
     """
     from pyrxd.gravity.types import GravityOffer
 
     # Validate deadline (S1 guard)
     validate_claim_deadline(claim_deadline, bypass=accept_short_deadline)
+
+    # Cross-offer replay guard (audit 2026-05-24 C-ECON-1): reject a
+    # btc_receive_hash already committed to another live offer the caller knows
+    # about. This is best-effort (the caller must supply the live set); the only
+    # real defense is one fresh BTC receive address per offer.
+    if used_btc_receive_hashes is not None and btc_receive_hash in used_btc_receive_hashes:
+        raise ValidationError(
+            "btc_receive_hash is already in use by a live offer — reusing it "
+            "lets one BTC payment finalize multiple offers (cross-offer replay). "
+            "Derive a fresh BTC receive address per offer."
+        )
 
     # Structural param validation — catch wrong-length bytes early, before we
     # silently embed corrupted pushes into the redeem script and compute a

@@ -81,7 +81,35 @@ def main() -> None:
     assert refs and all(op == 0xD8 for op, _ in refs), (
         f"ref must be a singleton (0xd8), got {[hex(o) for o, _ in refs]}"
     )
-    print(f"NFT covenant static guard PASS: {len(full)}-B script, exactly one singleton ref (0xd8), no phantom.")
+
+    # AUDIT 2026-05-24 M-FUSE-2: opcode-level HARDENING assertions over the
+    # compiled ASM. The ref-parse checks above do NOT verify the covenant
+    # actually enforces conservation/destination — a trivially-weak `d8<ref>
+    # OP_1` stub would pass them. Assert every hardening primitive is present in
+    # the compiled bytecode so a drifted/unhardened covenant (M-FUSE-1) cannot
+    # silently ship.
+    asm = art["asm"]
+    required_ops = {
+        "singleton prologue": "OP_PUSHINPUTREFSINGLETON",
+        "output-count clamp": "OP_TXOUTPUTCOUNT",
+        "singleton conservation": "OP_REFOUTPUTCOUNT_OUTPUTS",
+        "carrier-value pin": "OP_OUTPUTVALUE",
+        "destination hash-compare": "OP_HASH256",
+        "CLTV deadline": "OP_CHECKLOCKTIMEVERIFY",
+        # C-PARSER-1 fix: the terminal pos == rawTx.length - 4 check.
+        "parser terminal length check": "OP_SIZE",
+    }
+    for label, op in required_ops.items():
+        assert op in asm, f"HARDENING MISSING: {label} ({op}) absent from compiled covenant"
+    # Both expected-hash params must be referenced (taker finalize + maker forfeit).
+    assert asm.count("OP_HASH256") >= 2, "expected >=2 OP_HASH256 (taker + maker hash-compares + merkle)"
+    # C-PARSER-1: a signed-scriptLen guard must bound the output/input lengths.
+    assert "OP_LESSTHANOREQUAL" in asm, "C-PARSER-1 sl/ssl <= 252 guard missing from compiled covenant"
+
+    print(
+        f"NFT covenant static guard PASS: {len(full)}-B script, exactly one singleton ref (0xd8), "
+        f"no phantom; all hardening opcodes present (incl. C-PARSER-1 length guard + terminal check)."
+    )
 
 
 if __name__ == "__main__":

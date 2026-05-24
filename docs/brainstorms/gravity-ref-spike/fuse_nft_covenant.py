@@ -93,4 +93,26 @@ assert "pushInputRefSingleton(REF)" in src
 assert "expectedTakerNftHash" in src and "expectedMakerNftHash" in src
 assert "refValueSum" not in src, "NFT must NOT have an amount/refValueSum check"
 
+# AUDIT 2026-05-24 M-FUSE-1: ROUTE-FIRED post-asserts. The Delta-3/4 route
+# replacements above are literal `src.replace()` calls — if the upstream
+# generator's indentation or wording drifts, `.replace` silently NO-OPs and we
+# emit a covenant whose taker/maker hash-compare was never installed (it would
+# still compile, and the old token-only asserts above pass vacuously because the
+# hash NAMES exist as constructor params regardless). These asserts confirm the
+# route BODIES were actually rewritten — fail-closed on drift.
+assert "hash256(tx.outputs[0].lockingBytecode) == expectedTakerNftHash" in src, (
+    "Delta-3 finalize route did NOT fire — taker hash-compare missing "
+    "(generator drift?). Refusing to emit an unhardened covenant."
+)
+assert "hash256(tx.outputs[0].lockingBytecode) == expectedMakerNftHash" in src, (
+    "Delta-4 forfeit route did NOT fire — maker hash-compare missing "
+    "(generator drift?). Refusing to emit an unhardened covenant."
+)
+assert "takerLock" not in src and "makerLock" not in src, (
+    "old P2PKH route variables survived — a route replacement did not fully fire"
+)
+assert "require(tx.outputs.refOutputCount(ref) == 1)" in src, "singleton conservation guard missing"
+assert "require(tx.outputs.length == 1)" in src, "output-count clamp missing"
+assert "require(tx.outputs[0].value == nftCarrierValue)" in src, "carrier-value pin missing"
+
 sys.stdout.write(src)

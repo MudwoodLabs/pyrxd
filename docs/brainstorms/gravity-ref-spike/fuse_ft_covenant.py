@@ -78,4 +78,18 @@ assert "LockingBytecodeP2PKH" not in src, "P2PKH route not fully replaced"
 assert "expectedTakerFtHash" in src and "expectedMakerFtHash" in src
 assert "pushInputRef(REF)" in src
 
+# AUDIT 2026-05-24 M-FUSE-1: ROUTE-FIRED post-asserts — confirm the Delta-3/4
+# route BODIES were actually rewritten (the hash-compares installed), not just
+# that the new param NAMES exist. A silent `.replace` no-op on generator drift
+# would otherwise ship an unhardened route that still compiles.
+assert "hash256(tx.outputs[0].lockingBytecode) == expectedTakerFtHash" in src, (
+    "Delta-3 finalize route did NOT fire — taker hash-compare missing (generator drift?)"
+)
+assert "hash256(tx.outputs[0].lockingBytecode) == expectedMakerFtHash" in src, (
+    "Delta-4 forfeit route did NOT fire — maker hash-compare missing (generator drift?)"
+)
+assert "takerLock" not in src and "makerLock" not in src, (
+    "old P2PKH route variables survived — a route replacement did not fully fire"
+)
+
 sys.stdout.write(src)
