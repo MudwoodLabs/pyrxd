@@ -64,7 +64,7 @@ fee_in = TransactionInput(source_transaction=fee_src, source_txid=FEE_TXID, sour
 fee_in.satoshis = FEE_AMT
 fee_in.locking_script = Script(bytes.fromhex(FEE_SPK_HEX))
 
-FEE = 108_000_000  # >10k/byte for the ~10.7KB any-wallet M=20 funding tx
+FEE = 8_000_000  # FT funding tx ~600B
 change_val = FEE_AMT - FEE
 assert change_val > 546, f"change too small: {change_val}"
 change_spk = b"\x76\xa9\x14" + fee_pkh + b"\x88\xac"

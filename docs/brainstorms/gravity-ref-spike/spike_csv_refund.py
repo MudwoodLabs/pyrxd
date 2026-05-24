@@ -116,7 +116,7 @@ elif cmd == "fund":
                            unlocking_script_template=to_unlock_script_template(_unlock, lambda: 110))
     fin.satoshis = fee_amt
     fin.locking_script = Script(bytes.fromhex(fee_spk_hex))
-    FEE = 3_000_000
+    FEE = 5_000_000
     change = fee_amt - carrier - FEE
     assert change > 546, f"change {change}"
     change_spk = b"\x76\xa9\x14" + pkh + b"\x88\xac"
@@ -182,7 +182,7 @@ elif cmd == "refund":
     # output[0] must be the owner P2PKH (covenant checks this); send carrier there.
     owner_lock = b"\x76\xa9\x14" + owner_pkh + b"\x88\xac"
     # Refund tx ~268B; node effective 0.10 RXD/kB ceil -> ~2.68M min. 3M = headroom.
-    FEE = 3_000_000
+    FEE = 5_000_000
     out0_val = carrier
     fee_change = fee_amt - FEE
     assert fee_change > 546
