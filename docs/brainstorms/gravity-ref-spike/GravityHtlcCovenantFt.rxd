@@ -1,0 +1,59 @@
+pragma radiantscript ^0.1.0;
+
+// Gravity Taproot-HTLC atomic-swap — Radiant FT-asset leg (Phase 2).
+//
+// AUTHORED DIRECTLY (not fused from the SPV base). See fuse_htlc_covenant.py:
+// the SPV maker covenant is ~92% header/Merkle/rawTx verification, and the
+// HTLC route signatures (claim(bytes preimage) / refund()) replace finalize(
+// h1..h6, branch, rawTx) / forfeit() wholesale — fusing would delete the
+// entire SPV body and rewrite both route signatures, which IS authoring. The
+// reused parts (the route-tail hardening + hash-compare destination pin) are
+// reproduced BYTE-IDENTICAL from fuse_ft_covenant.py so the audited primitives
+// are unchanged; only the gate opcodes differ (sha256 hashlock / tx.age CSV
+// instead of SPV proof / CLTV).
+//
+// Role: MAKER_SECRET_TAKER_LOCKS_BTC_FIRST. The maker locks the FT asset here
+// AFTER the taker has locked BTC. claim() releases the FT to the taker on the
+// SHA256 preimage; refund() returns it to the maker after the relative
+// timelock. The two legs are bound by one secret p; H = sha256(p) = hashlock.
+//
+// FT consensus gates (docs/solutions/logic-errors/ft-in-covenant-two-consensus-gates.md):
+//   L1 — the genesis ref must be present on exactly one output (pushInputRef +
+//        refOutputCount==1).
+//   L2 — codeScriptHashValueSum conservation: the FT can ONLY settle to its
+//        EXACT code-script (bd d0 <genesisRef> dec0e9aa...). Enforced here by
+//        hash-comparing output[0]'s lockingBytecode to expectedTaker/MakerFtHash
+//        (= hash256 of the 75-byte FT holder script). refValueSum(ref)==amount
+//        conserves the fungible amount.
+
+contract GravityHtlcCovenantFt(
+    bytes32 hashlock,           // H = sha256(p); the maker's per-swap secret commitment
+    int refundCsv,              // relative timelock (BIP68 block count) for the maker refund leg
+    int amount,                 // exact FT amount held in the covenant (L1+L2 conservation)
+    bytes32 expectedTakerFtHash, // hash256 of the taker's 75-byte FT holder script
+    bytes32 expectedMakerFtHash, // hash256 of the maker's 75-byte FT holder script
+    bytes36 REF                 // genesis ref (txid||vout) — bound as the FT identity
+) {
+    // --- FT hardening (runs on both branches); byte-identical to fuse_ft_covenant.py ---
+    bytes36 ref = pushInputRef(REF);
+    require(tx.outputs.length == 1);
+    require(tx.outputs.refOutputCount(ref) == 1);
+    require(tx.outputs.refValueSum(ref) == amount);
+
+    return {
+        // index 0 — scriptSig selector OP_0. Taker claims the FT by revealing p.
+        claim(bytes preimage) {
+            require(sha256(preimage) == hashlock);
+            // --- Route to Taker FT (exact FT code-script via hash-compare) ---
+            require(hash256(tx.outputs[0].lockingBytecode) == expectedTakerFtHash);
+        },
+
+        // index 1 — scriptSig selector OP_1. Maker refunds after the relative
+        // timelock. tx.age -> OP_CHECKSEQUENCEVERIFY OP_DROP; BIP68 requires the
+        // SPEND tx be v2 with nSequence=refundCsv (tx-builder's job, Phase 3).
+        refund() {
+            require(tx.age >= refundCsv);
+            require(hash256(tx.outputs[0].lockingBytecode) == expectedMakerFtHash);
+        }
+    };
+}

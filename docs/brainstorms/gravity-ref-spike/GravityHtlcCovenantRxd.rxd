@@ -1,0 +1,52 @@
+pragma radiantscript ^0.1.0;
+
+// Gravity Taproot-HTLC atomic-swap — Radiant native-RXD leg (Phase 2).
+//
+// AUTHORED DIRECTLY. Same HTLC machinery as GravityHtlcCovenant{Ft,Nft}.rxd —
+// sha256(preimage)==hashlock claim, tx.age CSV refund, selector dispatch,
+// hash-compare destination pin — but the asset is NATIVE RXD, which has NO
+// Glyph ref. So ALL ref/conservation hardening is dropped: no pushInputRef /
+// pushInputRefSingleton, no refOutputCount, no refValueSum, no FT code-script
+// weld. This is the thinnest of the three variants.
+//
+// Role: MAKER_SECRET_TAKER_LOCKS_BTC_FIRST. The maker locks RXD here AFTER the
+// taker locks BTC. claim() releases the RXD to the taker on the SHA256 preimage;
+// refund() returns it to the maker after the relative timelock. Bound to the BTC
+// leg by one secret p; H = sha256(p) = hashlock.
+//
+// Conservation: native RXD has no ref to conserve. The covenant pins WHERE the
+// value goes (output[0] hash-compare to the taker/maker P2PKH) and HOW MUCH
+// (outputs[0].value >= amount). outputs.length==1 forbids a covenant-controlled
+// change output (the spender supplies fee from a separate input, like the FT/NFT
+// variants). NOTE: unlike FT/NFT there is no consensus conservation backstop at
+// all here — the covenant body is the SOLE guarantor of correct release, so the
+// value pin and the destination hash-compare are load-bearing.
+
+contract GravityHtlcCovenantRxd(
+    bytes32 hashlock,            // H = sha256(p)
+    int refundCsv,               // relative timelock (BIP68 block count) for the maker refund leg
+    int amount,                  // exact RXD photons that must flow to output[0]
+    bytes32 expectedTakerHash,   // hash256 of the taker's 25-byte P2PKH script
+    bytes32 expectedMakerHash    // hash256 of the maker's 25-byte P2PKH script
+) {
+    // --- shared hardening (runs on both branches); no ref machinery (native RXD) ---
+    require(tx.outputs.length == 1);
+
+    return {
+        // index 0 — scriptSig selector OP_0. Taker claims the RXD by revealing p.
+        claim(bytes preimage) {
+            require(sha256(preimage) == hashlock);
+            require(tx.outputs[0].value >= amount);
+            require(hash256(tx.outputs[0].lockingBytecode) == expectedTakerHash);
+        },
+
+        // index 1 — scriptSig selector OP_1. Maker refunds after the relative
+        // timelock. tx.age -> OP_CHECKSEQUENCEVERIFY OP_DROP; BIP68 requires the
+        // SPEND tx be v2 with nSequence=refundCsv (tx-builder's job, Phase 3).
+        refund() {
+            require(tx.age >= refundCsv);
+            require(tx.outputs[0].value >= amount);
+            require(hash256(tx.outputs[0].lockingBytecode) == expectedMakerHash);
+        }
+    };
+}

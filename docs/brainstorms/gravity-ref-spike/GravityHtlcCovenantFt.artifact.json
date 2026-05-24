@@ -1,0 +1,55 @@
+{
+  "version": 9,
+  "compilerVersion": "rxdc 0.1.0",
+  "contract": "GravityHtlcCovenantFt",
+  "abi": [
+    {
+      "type": "function",
+      "name": "claim",
+      "index": 0,
+      "params": [
+        {
+          "name": "preimage",
+          "type": "bytes"
+        }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "refund",
+      "index": 1,
+      "params": []
+    },
+    {
+      "type": "constructor",
+      "params": [
+        {
+          "name": "hashlock",
+          "type": "Sha256"
+        },
+        {
+          "name": "refundCsv",
+          "type": "int"
+        },
+        {
+          "name": "amount",
+          "type": "int"
+        },
+        {
+          "name": "expectedTakerFtHash",
+          "type": "Sha256"
+        },
+        {
+          "name": "expectedMakerFtHash",
+          "type": "Sha256"
+        },
+        {
+          "name": "REF",
+          "type": "bytes"
+        }
+      ]
+    }
+  ],
+  "asm": "OP_PUSHINPUTREF $REF OP_TXOUTPUTCOUNT OP_1 OP_NUMEQUALVERIFY OP_DUP OP_REFOUTPUTCOUNT_OUTPUTS OP_1 OP_NUMEQUALVERIFY OP_REFVALUESUM_OUTPUTS $amount OP_NUMEQUALVERIFY OP_DUP OP_0 OP_NUMEQUAL OP_IF OP_SWAP OP_SHA256 $hashlock OP_EQUALVERIFY OP_0 OP_OUTPUTBYTECODE OP_HASH256 $expectedTakerFtHash OP_EQUAL OP_NIP OP_ELSE OP_1 OP_NUMEQUALVERIFY $refundCsv OP_CHECKSEQUENCEVERIFY OP_DROP OP_0 OP_OUTPUTBYTECODE OP_HASH256 $expectedMakerFtHash OP_EQUAL OP_ENDIF",
+  "hex": "d0<REF>c4519d76de519ddc<amount>9d76009c637ca8<hashlock>8800cdaa<expectedTakerFtHash>877767519d<refundCsv>b27500cdaa<expectedMakerFtHash>8768"
+}

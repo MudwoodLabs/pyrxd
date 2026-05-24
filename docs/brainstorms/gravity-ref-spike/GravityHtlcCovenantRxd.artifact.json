@@ -1,0 +1,51 @@
+{
+  "version": 9,
+  "compilerVersion": "rxdc 0.1.0",
+  "contract": "GravityHtlcCovenantRxd",
+  "abi": [
+    {
+      "type": "function",
+      "name": "claim",
+      "index": 0,
+      "params": [
+        {
+          "name": "preimage",
+          "type": "bytes"
+        }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "refund",
+      "index": 1,
+      "params": []
+    },
+    {
+      "type": "constructor",
+      "params": [
+        {
+          "name": "hashlock",
+          "type": "Sha256"
+        },
+        {
+          "name": "refundCsv",
+          "type": "int"
+        },
+        {
+          "name": "amount",
+          "type": "int"
+        },
+        {
+          "name": "expectedTakerHash",
+          "type": "Sha256"
+        },
+        {
+          "name": "expectedMakerHash",
+          "type": "Sha256"
+        }
+      ]
+    }
+  ],
+  "asm": "OP_TXOUTPUTCOUNT OP_1 OP_NUMEQUALVERIFY OP_DUP OP_0 OP_NUMEQUAL OP_IF OP_SWAP OP_SHA256 $hashlock OP_EQUALVERIFY OP_0 OP_OUTPUTVALUE $amount OP_GREATERTHANOREQUAL OP_VERIFY OP_0 OP_OUTPUTBYTECODE OP_HASH256 $expectedTakerHash OP_EQUAL OP_NIP OP_ELSE OP_1 OP_NUMEQUALVERIFY $refundCsv OP_CHECKSEQUENCEVERIFY OP_DROP OP_0 OP_OUTPUTVALUE $amount OP_GREATERTHANOREQUAL OP_VERIFY OP_0 OP_OUTPUTBYTECODE OP_HASH256 $expectedMakerHash OP_EQUAL OP_ENDIF",
+  "hex": "c4519d76009c637ca8<hashlock>8800cc<amount>a26900cdaa<expectedTakerHash>877767519d<refundCsv>b27500cc<amount>a26900cdaa<expectedMakerHash>8768"
+}

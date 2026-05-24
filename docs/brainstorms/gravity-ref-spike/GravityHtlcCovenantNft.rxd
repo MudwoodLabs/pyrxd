@@ -1,0 +1,55 @@
+pragma radiantscript ^0.1.0;
+
+// Gravity Taproot-HTLC atomic-swap — Radiant NFT-asset (singleton) leg (Phase 2).
+//
+// AUTHORED DIRECTLY (not fused). Same rationale as GravityHtlcCovenantFt.rxd:
+// the SPV body is deleted wholesale and the route signatures change, so this is
+// authoring. The NFT hardening + hash-compare destination are reproduced
+// byte-identical from fuse_nft_covenant.py.
+//
+// Role: MAKER_SECRET_TAKER_LOCKS_BTC_FIRST (see the FT variant).
+//
+// NFT consensus gate — LAYER-1 ONLY (project_nft_singleton_conservation):
+//   The singleton is HELD in the covenant via pushInputRefSingleton(REF). The
+//   covenant UTXO is `d8<ref><body>`; there is NO codeScriptHashValueSum
+//   epilogue (that is FT-only), so the FT exact-code-script L2 rule is NOT
+//   applied here. refOutputCount(ref)==1 is the SOLE consensus-adjacent guard
+//   against burn/clone (Radiant CONSENSUS PERMITS burning a singleton onto 0
+//   outputs — "exactly one output" is enforced solely by THIS covenant, no
+//   consensus backstop). value pin replaces the FT amount conservation. The
+//   hash-compare to the 63-byte NFT script still pins the destination.
+
+contract GravityHtlcCovenantNft(
+    bytes32 hashlock,            // H = sha256(p)
+    int refundCsv,               // relative timelock (BIP68 block count) for the maker refund leg
+    int nftCarrierValue,         // exact carrier photons on the singleton output (constructability pin)
+    bytes32 expectedTakerNftHash, // hash256 of the taker's 63-byte NFT script
+    bytes32 expectedMakerNftHash, // hash256 of the maker's 63-byte NFT script
+    bytes36 REF                  // genesis singleton ref (txid||vout)
+) {
+    // --- NFT hardening (runs on both branches). The singleton is HELD in the
+    // covenant via pushInputRefSingleton(REF). refOutputCount==1 is the SOLE
+    // guard against burning/cloning the NFT (consensus permits a burn).
+    // NO refValueSum (singleton has no amount). Byte-identical to fuse_nft_covenant.py.
+    bytes36 ref = pushInputRefSingleton(REF);
+    require(tx.outputs.length == 1);
+    require(tx.outputs.refOutputCount(ref) == 1);
+    require(tx.outputs[0].value == nftCarrierValue);
+
+    return {
+        // index 0 — scriptSig selector OP_0. Taker claims the NFT by revealing p.
+        claim(bytes preimage) {
+            require(sha256(preimage) == hashlock);
+            // --- Route to Taker NFT (exact 63-B NFT script via hash-compare) ---
+            require(hash256(tx.outputs[0].lockingBytecode) == expectedTakerNftHash);
+        },
+
+        // index 1 — scriptSig selector OP_1. Maker refunds after the relative
+        // timelock. tx.age -> OP_CHECKSEQUENCEVERIFY OP_DROP; SPEND tx must be v2
+        // with nSequence=refundCsv (tx-builder, Phase 3).
+        refund() {
+            require(tx.age >= refundCsv);
+            require(hash256(tx.outputs[0].lockingBytecode) == expectedMakerNftHash);
+        }
+    };
+}
