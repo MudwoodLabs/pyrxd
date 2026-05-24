@@ -102,3 +102,114 @@ this size/fee is the cost of on-chain wallet-agnostic payment parsing.
 
 **Both-chain artifacts (any-wallet swap):** Bitcoin payment `0ae83654…` (block
 950,541); Radiant settlement `53ee7631…`. User BTC swept back (`ce90a7f9…`).
+
+---
+
+## NFT↔BTC variant — first NFT swap settled on mainnet (2026-05-23)
+
+The covenant design extends from fungible tokens to **one-of-one Glyph NFTs**.
+An NFT was minted, locked into an NFT swap covenant, and released to a taker
+against a **real Bitcoin payment verified by SPV** — then the forfeit (reclaim)
+path and a full set of negatives were proven.
+
+### Why NFT ≠ FT (and why it's actually simpler)
+
+An FT holder is welded to its *code-script* (the `codeScriptHashValueSum`
+epilogue) — it cannot be moved into a foreign covenant; that was the original
+FT blocker. An NFT is welded only to its *singleton ref*
+(`OP_PUSHINPUTREFSINGLETON`, `0xd8`), so it **can be held directly in a
+covenant**. The funded UTXO is the covenant bytecode itself, carrying
+`d8<ref>` inside its body.
+
+**The dominant security fact (verified from Radiant-Core source,
+`validation.h:919-968`):** consensus only enforces *singleton-outputs ⊆
+singleton-inputs* — it **permits burning the NFT** (zero output copies) and
+never requires it to land on any particular output. So "exactly one output, to
+the right destination" is enforced **solely by the covenant body**
+(`outputs.length==1` + `refOutputCount(ref)==1` + a value pin +
+hash-compare). There is no consensus backstop. For an irreversible one-of-one,
+the covenant is the sole guarantor of conservation — strictly more load-bearing
+than FT. (An earlier draft wrongly claimed consensus requires the singleton on
+exactly one output; a security-focused divergent review caught it.)
+
+### Verifiable transactions
+
+**Radiant (NFT side):**
+- NFT genesis (commit): `ff5c20f6c4445584a261764eefdeada0228bda632d704367c4b04659c58ee940:0`
+  (reveal `217fca8405e4c925b79121741ef65fb328aa87b7762d9cbc3abeb4f9169fd263`)
+- NFT funded into the swap covenant:
+  `e10798b3c10b85c6f8c6b18fcd647481ad5b5abb333e2f224d2cea1708bde09f`
+  (`testmempoolaccept` then broadcast — the first on-chain proof that an NFT
+  singleton can be held in a covenant and its conservation accepted by
+  consensus)
+- **Settlement (finalize, SPV-gated):**
+  `cb3f6d9cc0df2c6b179a26088a26b3aea6929ef0b2e72ab1a9166507255538cc`
+  — releases the NFT to the taker.
+
+**Bitcoin (payment side):**
+- Payment to the maker (11,000 sats, P2WPKH):
+  `092b331d0e352d1bad80c9cc1776d038bf29cd4a77809541d78b4a116249b388`,
+  confirmed in block **950,763**.
+- Covenant `btcChainAnchor` = block **950,762** (payment block − 1, set
+  just-in-time per the operational lessons).
+
+### What the covenant verified on-chain
+
+1. Real-headers SPV proof: anchor (h1.prev == block 950,762), 12 real BTC
+   headers (950,763–950,774) with valid PoW + chain-linking, Merkle inclusion
+   of the payment (**real depth 13**, sentinel-padded to the covenant's M=20
+   capacity — the depth that broke an earlier M=12 attempt).
+2. The any-wallet BTC-tx parser (the payment was a 1-input / 2-output P2WPKH tx).
+3. NFT singleton conservation: the ref carried from the covenant input to the
+   taker NFT output.
+4. NFT hardening: `outputs.length==1`, `refOutputCount(ref)==1`,
+   `outputs[0].value == nftCarrierValue`, and a hash-compare pinning the NFT to
+   the taker's standard 63-byte NFT script.
+
+### Forfeit + negatives (a second NFT)
+
+A second NFT (genesis `c6e0e6d9…:0`) was minted and locked into a covenant with
+a past deadline.
+
+- **Forfeit success (CLTV reclaim → maker):**
+  `60d7cedd58720a50befc3c652b7760e95296b0942fe7c04f4e8f3e353fd1ca12`.
+- **Five negatives — all rejected by consensus** (`testmempoolaccept`
+  allowed=false), each for the precise reason:
+  | Case | Rejection |
+  |---|---|
+  | burn (output not NFT-shaped) | `OP_NUMEQUALVERIFY` — `refOutputCount(ref)==1` (**covenant-only** guard) |
+  | clone (two NFT outputs) | consensus `invalid-transaction-reference-operations` (singleton can't duplicate — consensus + covenant) |
+  | wrong destination | false top stack — `hash256(output[0]) != expectedMakerNftHash` (**covenant-only**) |
+  | wrong carrier value | `OP_NUMEQUALVERIFY` — `outputs[0].value != nftCarrierValue` |
+  | pre-deadline reclaim | Locktime requirement not satisfied (CLTV) |
+
+  The **burn** and **wrong-destination** cases are caught *only by the covenant
+  body* — empirical confirmation that the covenant-only conservation holds with
+  no consensus backstop.
+
+### Honest scope (NFT)
+
+- **Real, not synthetic.** Real BTC moved on Bitcoin mainnet; the SPV proof
+  used real headers/Merkle, verified by Radiant consensus.
+- **Proven on-chain:** the NFT prologue + singleton-conservation interaction,
+  the finalize and forfeit paths, and the covenant-only negatives.
+- **Not yet audited.** NFT irreversibility (no fungible make-whole) raises the
+  bar: external audit of the SPV/BTC-tx parser is a hard gate before any
+  production/mainnet-product claim, weightier than for FT because conservation
+  is covenant-only.
+
+### Incident: weak test key — real BTC lost (operator error, not the covenant)
+
+During setup the maker/taker keys were hand-generated with
+`PrivateKey(b'\x03'*31 + bytes([secrets.randbelow(255)+1]))` — only **254
+possible private keys** (the maker BTC key was `0303…03ee`). A weak-key watcher
+bot brute-forced it and **swept the 11,000-sat payment in the same block
+(950,763)** it confirmed, to `bc1qfmkwac2g0e5aqv4j28jjjrf0485cs3rpp9ke7f` (not
+ours). The funds are unrecoverable. The theft tx's witness pubkey matched the
+maker key, confirming brute-force — **not** a covenant bug.
+
+This was operator error in a throwaway command, fully orthogonal to the swap
+mechanism (which performed exactly as designed). Production key generation
+(`pyrxd.btc_wallet.keys.generate_keypair()`, CSPRNG + rejection sampling) was
+never involved. Lesson recorded: never hand-write key material for any address
+that will receive funds; always use the CSPRNG generator.
