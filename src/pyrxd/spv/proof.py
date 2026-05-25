@@ -77,6 +77,30 @@ def _output_offsets(stripped_tx: bytes) -> set[int]:
     return offsets
 
 
+# The any-wallet covenant reads each input's scriptSig length as a SINGLE byte
+# and decodes it with OP_BIN2NUM (signed CScriptNum). A length >= 0x80 (128)
+# decodes NEGATIVE, so the covenant's `require(ssl >= 0)` guard ScriptFails on
+# ANY funding tx with an input scriptSig of 128..252 bytes (rigorous audit R2,
+# 2026-05-24). Native-segwit inputs have an EMPTY scriptSig and legacy P2PKH is
+# ~107 B, so those are safe; P2SH multisig (~250 B) / inscription reveals are not.
+_COVENANT_MAX_INPUT_SCRIPTSIG_LEN = 127
+
+
+def _max_input_scriptsig_len(stripped_tx: bytes) -> int:
+    """Return the largest input scriptSig length in a witness-stripped tx."""
+    pos = 4  # skip version
+    n_in, pos = _read_varint(stripped_tx, pos)
+    longest = 0
+    for _ in range(n_in):
+        pos += 36  # prevout
+        script_len, pos = _read_varint(stripped_tx, pos)
+        longest = max(longest, script_len)
+        pos += script_len + 4  # scriptSig + sequence
+        if pos > len(stripped_tx):
+            raise SpvVerificationError("input parse ran past end of tx")
+    return longest
+
+
 @dataclass(frozen=True)
 class CovenantParams:
     """Full parameter set committed by the Maker into the covenant.
@@ -203,6 +227,27 @@ class SpvProofBuilder:
         claimed_txid_le = bytes.fromhex(txid_be)[::-1]
         if computed_txid_le != claimed_txid_le:
             raise SpvVerificationError("hash256(raw_tx) does not match txid")
+
+        # Rigorous audit R2 (2026-05-24): the any-wallet covenant rejects a funding
+        # tx whose any input scriptSig is >= 128 B (its single-byte signed length
+        # read decodes negative -> the covenant's `ssl >= 0` guard ScriptFails).
+        # Refuse to build a proof the covenant would reject on-chain — otherwise
+        # the taker broadcasts BTC against a proof that can never settle and, on the
+        # no-refund SPV-oracle path, can LOSE the BTC. Run AFTER the txid match so a
+        # genuine tx is being parsed; a structurally odd tx that still matched its
+        # txid will be caught by the output-boundary walk below, so we only raise
+        # here for the specific scriptSig-too-long reason.
+        try:
+            longest_ss = _max_input_scriptsig_len(stripped)
+        except SpvVerificationError:
+            longest_ss = 0  # leave structural rejection to _output_offsets (step 5)
+        if longest_ss > _COVENANT_MAX_INPUT_SCRIPTSIG_LEN:
+            raise SpvVerificationError(
+                f"funding tx has an input scriptSig of {longest_ss} bytes; the any-wallet "
+                f"covenant only accepts inputs with scriptSig <= {_COVENANT_MAX_INPUT_SCRIPTSIG_LEN} bytes "
+                "(signed single-byte length read). Pay from a native-segwit (empty scriptSig) "
+                "or legacy P2PKH input, not P2SH/multisig, or the covenant will reject the proof."
+            )
 
         # Step 3: parse and verify headers + chain anchor.
         headers = [bytes.fromhex(h) for h in headers_hex]

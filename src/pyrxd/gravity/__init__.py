@@ -33,6 +33,7 @@ from .covenant import (
 )
 from .maker import ActiveOffer, GravityMakerSession, GravityOfferParams
 from .receive import OfferReceive, derive_offer_btc_receive
+from .ref_authenticity import RefAuthenticityIndexer, verify_ref_authenticity
 from .trade import ConfirmationStatus, GravityTrade, TradeConfig
 from .transactions import build_claim_tx, build_finalize_tx, build_forfeit_tx, build_maker_offer_tx
 from .types import (
@@ -56,6 +57,7 @@ __all__ = [
     "GravityTrade",
     "MakerOfferResult",
     "OfferReceive",
+    "RefAuthenticityIndexer",
     "TradeConfig",
     "build_claim_tx",
     "build_finalize_tx",
@@ -66,4 +68,5 @@ __all__ = [
     "compute_p2sh_code_hash",
     "derive_offer_btc_receive",
     "validate_claim_deadline",
+    "verify_ref_authenticity",
 ]
