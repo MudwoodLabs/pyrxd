@@ -74,7 +74,7 @@ fee_in = TransactionInput(source_transaction=fee_src, source_txid=FEE_TXID, sour
 fee_in.satoshis = FEE_AMT
 fee_in.locking_script = Script(bytes.fromhex(FEE_SPK_HEX))
 
-FEE = 130_000_000  # ~11.8KB funding tx; >10k/byte with headroom
+FEE = 8_000_000  # ~600B NFT-into-HTLC-covenant funding tx at 0.10 RXD/kB
 # The NFT carrier value comes from the NFT input; the fee input covers FEE + change.
 change_val = (NFT_VALUE + FEE_AMT) - CARRIER_VALUE - FEE
 assert change_val > 546, f"change too small: {change_val}"

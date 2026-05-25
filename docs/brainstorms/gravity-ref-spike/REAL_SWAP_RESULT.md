@@ -213,3 +213,68 @@ mechanism (which performed exactly as designed). Production key generation
 (`pyrxd.btc_wallet.keys.generate_keypair()`, CSPRNG + rejection sampling) was
 never involved. Lesson recorded: never hand-write key material for any address
 that will receive funds; always use the CSPRNG generator.
+
+---
+
+## Taproot-HTLC atomic swap — Radiant leg proven on mainnet (2026-05-24)
+
+The atomic-swap redesign (the secure replacement for the SPV-oracle swap; see
+DEADLINE_RACE_PANEL_2026-05-24.md + the plan 2026-05-24-feat-gravity-taproot-htlc-atomic-swap-plan.md).
+This proves the **Radiant leg** — the hashlock `claim(preimage)` release and the
+`tx.age` CSV `refund()` — on mainnet for all three swap asset types. The BTC-side
+Taproot HTLC module (src/pyrxd/btc_wallet/taproot.py) is BIP341-vector-validated
+but the **full cross-chain BTC↔RXD atomic swap (real BTC HTLC + secret-scrape)
+is Phase 4 and NOT yet done.**
+
+Shared secret: `H = sha256(p)` = the covenant hashlock; `claim(preimage)` reveals
+`p` on-chain in the scriptSig (the cross-chain reveal channel). `refund()` is the
+maker's `tx.age >= refundCsv` (BIP68) reclaim. Covenants: GravityHtlcCovenant
+{Ft 222B, Nft 171B, Rxd 141B} — selector dispatch (claim=OP_0 / refund=OP_1),
+OP_0 OP_OUTPUTBYTECODE OP_HASH256 destination pin.
+
+### Verifiable transactions (Radiant mainnet)
+
+**RXD↔BTC HTLC — 4/4 proven:**
+- claim (correct preimage) → `428b14018342f65267a34c7a3cd26fe4eba5c97e66d6da633eb8446b992f1187`
+- wrong-preimage claim → REJECTED `OP_EQUALVERIFY` (sha256(preimage)==hashlock)
+- premature refund → REJECTED `Locktime requirement not satisfied` (CSV gate)
+- matured refund (after 2 confs) → `9f008f50a00f8e5791c761cc0dd67e69d22d21dde1fbf6a36c8cd5dc07756ec9`
+
+**FT↔BTC HTLC:**
+- FT minted (genesis `678e3907…:0`, 1,000,000 units), funded into the covenant,
+  claim (preimage) → `e75f4d8dd4303bb90fd0b94c26be19f00eef24bb2bc34b39fd6369a922cacda8`
+  (FT released to taker; FT L1 ref-conservation + L2 codeScriptHashValueSum intact).
+
+**NFT↔BTC HTLC:**
+- NFT minted (genesis `5624089236…:0`), funded into the covenant,
+  claim (preimage) → `8333e80bf3d36e728fb2c3bbddfdd937d0d70d999909ecb66facba98387ff318`
+  (NFT released to taker; singleton conserved through the covenant).
+- wrong-preimage claim → REJECTED `OP_EQUALVERIFY`.
+
+### Honest scope of the FT/NFT refund
+
+The FT and NFT **refund** routes (`tx.age` CSV + maker hash-compare) are present
+and static-guard-verified in their compiled covenants, and are the **byte-identical
+CSV mechanism proven on-chain by the RXD matured refund** (`9f008f50…`). They were
+NOT separately broadcast: each would require minting a fresh 2nd asset (the first
+mint is consumed by the claim covenant) to prove a mechanism that is identical to
+the already-proven RXD refund. The premature-refund negative is proven (RXD). This
+is a deliberate, recorded scope decision, not an omission.
+
+### What this does and does NOT show
+
+- **Proven on mainnet:** the Radiant leg of all 3 swap types — hashlock claim
+  (with the preimage revealed on-chain) + CSV refund + the wrong-preimage and
+  premature-refund negatives. The HTLC covenant machinery works under live consensus.
+- **NOT done:** the full cross-chain atomic swap — a real Bitcoin Taproot HTLC
+  funded on BTC mainnet, the secret revealed on one chain and scraped to claim the
+  other, with the timelock-ordering margin enforced (Phase 4: coordinator + state
+  machine + watchtower).
+- **Hard gate:** external audit of the cross-chain atomicity + the parser/SPV path +
+  the covenants — before any production/mainnet-product claim. NFT/RXD have no
+  consensus conservation backstop (RXD especially), so the covenant body is the sole
+  guarantor there.
+
+Operational lessons applied: per-kB relay fee (0.10 RXD/kB on the tr node, size×rate);
+minimal-pushed CSV operands; multi-function selector dispatch; hash-compare output pin;
+CSPRNG keys only (no hand-written keys, per the prior weak-key incident).
