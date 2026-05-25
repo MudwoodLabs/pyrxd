@@ -285,16 +285,24 @@ def claim_leaf_script(hashlock: bytes, claim_pubkey_xonly: bytes) -> bytes:
 
 
 def refund_leaf_script(refund_pubkey_xonly: bytes, timeout: Timelock) -> bytes:
-    """Build the refund leaf: ``<refundPk> OP_CHECKSIGVERIFY <timeout> OP_CSV OP_DROP``.
+    """Build the refund leaf: ``<timeout> OP_CSV OP_DROP <refundPk> OP_CHECKSIG``.
 
-    CSV (relative timelock) matches the Radiant ``tx.age`` side. The trailing
-    OP_DROP removes the timeout operand left on the stack by OP_CSV so the script
-    ends with a clean true/false (the signature check already gated via CHECKSIGVERIFY).
+    The timelock gate runs FIRST: OP_CHECKSEQUENCEVERIFY (BIP112) is verify-but-
+    don't-pop (like OP_CLTV), so OP_DROP clears the operand it leaves behind. Then
+    a value-leaving OP_CHECKSIG terminates the script with exactly one truthy item
+    — the BIP342 cleanstack rule requires the tapscript to end with a single true.
+
+    The earlier ordering (``<pk> OP_CHECKSIGVERIFY <timeout> OP_CSV OP_DROP``) was
+    broken: CHECKSIGVERIFY drains the stack, then OP_DROP empties it, so the script
+    ends with ZERO items and every spend fails "Stack size must be exactly one after
+    execution". This is the canonical BOLT-3 / Boltz refund ordering (timelock first,
+    OP_CHECKSIG last). NOTE: changing this leaf changes the taptree → the HTLC
+    address; HTLCs built before this fix are refund-unspendable (claim-only).
     """
     pk = _as_bytes(refund_pubkey_xonly, name="refund_pubkey_xonly", length=32)
     if not isinstance(timeout, Timelock):
         raise ValidationError("timeout must be a Timelock")
-    return _push_data(pk) + _OP_CHECKSIGVERIFY + _push_minimal_int(timeout.csv_script_operand()) + _OP_CSV + _OP_DROP
+    return _push_minimal_int(timeout.csv_script_operand()) + _OP_CSV + _OP_DROP + _push_data(pk) + _OP_CHECKSIG
 
 
 def tapleaf_hash(script: bytes, leaf_version: int = LEAF_VERSION_TAPSCRIPT) -> bytes:
