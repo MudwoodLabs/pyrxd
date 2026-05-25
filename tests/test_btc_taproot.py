@@ -266,11 +266,26 @@ def test_claim_leaf_commits_to_preimage_directly():
 
 
 def test_refund_leaf_uses_csv():
-    pk = os.urandom(32)
+    # Canonical ordering: <timeout> OP_CSV OP_DROP <refundPk> OP_CHECKSIG.
+    # Timelock gate FIRST, value-leaving OP_CHECKSIG LAST so the tapscript ends
+    # with exactly one truthy element (BIP342 cleanstack). The earlier ordering
+    # (<pk> OP_CHECKSIGVERIFY <timeout> OP_CSV OP_DROP) ended with an EMPTY stack
+    # and every refund spend was rejected "Stack size must be exactly one".
+    # Fixed (non-random) pk so byte-level assertions are deterministic: a random
+    # pk can contain 0xad/0xb2/0x75 by chance, which would make a naive substring
+    # search over the whole script flaky.
+    pk = bytes(range(32))
     script = t.refund_leaf_script(pk, t.Timelock(144, t.TimeUnit.BLOCKS))
-    assert script[0] == 32 and script[1:33] == pk
-    assert script[33:34] == b"\xad"  # OP_CHECKSIGVERIFY
-    assert b"\xb2" in script  # OP_CSV present
+    # the pubkey push + OP_CHECKSIG terminate the script
+    assert script.endswith(b"\x20" + pk + b"\xac")  # PUSH32 <pk> OP_CHECKSIG
+    # Examine ONLY the opcode bytes that precede the <PUSH32 pk> terminal — the
+    # 34-byte push is data, not opcodes, so searching it for opcode values is wrong.
+    opcode_prefix = script[: -(1 + 32 + 1)]  # drop 0x20 || pk(32) || OP_CHECKSIG
+    assert b"\xb2" in opcode_prefix  # OP_CSV present
+    csv_idx = opcode_prefix.index(b"\xb2")
+    assert opcode_prefix[csv_idx + 1 : csv_idx + 2] == b"\x75"  # OP_DROP immediately after OP_CSV
+    assert csv_idx >= 1  # a timeout operand precedes OP_CSV
+    assert b"\xad" not in opcode_prefix  # NO OP_CHECKSIGVERIFY (the buggy terminal)
 
 
 def test_leaf_builders_accept_bytearray():
