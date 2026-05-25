@@ -379,9 +379,7 @@ def build_gravity_offer(
     # btc_receive_hash already committed to another live offer the caller knows
     # about. This is best-effort (the caller must supply the live set); the only
     # real defense is one fresh BTC receive address per offer.
-    if used_btc_receive_hashes is not None and bytes(btc_receive_hash) in {
-        bytes(h) for h in used_btc_receive_hashes
-    }:
+    if used_btc_receive_hashes is not None and bytes(btc_receive_hash) in {bytes(h) for h in used_btc_receive_hashes}:
         raise ValidationError(
             "btc_receive_hash is already in use by a live offer — reusing it "
             "lets one BTC payment finalize multiple offers (cross-offer replay). "

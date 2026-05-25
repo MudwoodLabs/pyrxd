@@ -15,6 +15,7 @@ Claim scriptSig (settled): <preimage push> <OP_0>  — preimage FIRST, selector 
   the selector on the stack). selector is the LAST push, on top.
 Refund scriptSig (settled): <OP_1>  — selector only, no preimage, no sig (CSV-gated).
 """
+
 from __future__ import annotations
 
 import hashlib
@@ -134,6 +135,7 @@ def _build_covenant(variant: str, taker: PrivateKey, maker: PrivateKey) -> Cov:
         out0 = AMOUNT
     else:
         from pyrxd.glyph.types import GlyphRef
+
         ref_wire = GlyphRef(txid=GENESIS_TXID, vout=0).to_bytes()
         if variant == "ft":
             taker_script = SPK.ft_holder_script(taker_pkh, ref_wire)
@@ -166,15 +168,13 @@ def _build_covenant(variant: str, taker: PrivateKey, maker: PrivateKey) -> Cov:
             for n, v in subs.items():
                 spk_hex = spk_hex.replace(f"<{n}>", v)
             cov = bytes.fromhex(spk_hex) + b"\xbd\xd0" + ref_wire + SPK.FT_EPILOGUE
-            return Cov(cov, taker_script, maker_script,
-                       SPK.hash256(taker_script), SPK.hash256(maker_script), out0)
+            return Cov(cov, taker_script, maker_script, SPK.hash256(taker_script), SPK.hash256(maker_script), out0)
 
     for n, v in subs.items():
         spk_hex = spk_hex.replace(f"<{n}>", v)
     assert "<" not in spk_hex, spk_hex
     cov = bytes.fromhex(spk_hex)
-    return Cov(cov, taker_script, maker_script,
-               SPK.hash256(taker_script), SPK.hash256(maker_script), out0)
+    return Cov(cov, taker_script, maker_script, SPK.hash256(taker_script), SPK.hash256(maker_script), out0)
 
 
 def _parse_pushes(script: bytes):
@@ -209,14 +209,25 @@ VARIANTS = ["ft", "nft", "rxd"]
 
 # --- tests -----------------------------------------------------------------
 
+
 @pytest.mark.parametrize("variant", VARIANTS)
 def test_claim_scriptsig_layout(variant):
     taker, maker, fee = _keys()
     c = _build_covenant(variant, taker, maker)
 
     tx = CLAIM.build_claim_tx(
-        variant, PREIMAGE, c.spk, COV_TXID, 0, c.out0, c.taker_script,
-        fee.wif(), FEE_TXID, 0, FEE_AMT, _fee_spk(fee),
+        variant,
+        PREIMAGE,
+        c.spk,
+        COV_TXID,
+        0,
+        c.out0,
+        c.taker_script,
+        fee.wif(),
+        FEE_TXID,
+        0,
+        FEE_AMT,
+        _fee_spk(fee),
     )
 
     # Covenant input scriptSig = <preimage push> <OP_0 selector>. Preimage FIRST.
@@ -243,8 +254,18 @@ def test_refund_scriptsig_and_bip68(variant):
     c = _build_covenant(variant, taker, maker)
 
     tx = REFUND.build_refund_tx(
-        variant, REFUND_CSV, c.spk, COV_TXID, 0, c.out0, c.maker_script,
-        fee.wif(), FEE_TXID, 0, FEE_AMT, _fee_spk(fee),
+        variant,
+        REFUND_CSV,
+        c.spk,
+        COV_TXID,
+        0,
+        c.out0,
+        c.maker_script,
+        fee.wif(),
+        FEE_TXID,
+        0,
+        FEE_AMT,
+        _fee_spk(fee),
     )
 
     # Refund scriptSig = OP_1 selector only.
@@ -267,8 +288,18 @@ def test_claim_decode_roundtrip(variant):
     taker, maker, fee = _keys()
     c = _build_covenant(variant, taker, maker)
     tx = CLAIM.build_claim_tx(
-        variant, PREIMAGE, c.spk, COV_TXID, 0, c.out0, c.taker_script,
-        fee.wif(), FEE_TXID, 0, FEE_AMT, _fee_spk(fee),
+        variant,
+        PREIMAGE,
+        c.spk,
+        COV_TXID,
+        0,
+        c.out0,
+        c.taker_script,
+        fee.wif(),
+        FEE_TXID,
+        0,
+        FEE_AMT,
+        _fee_spk(fee),
     )
     raw = tx.serialize().hex()
     back = Transaction.from_hex(raw)
@@ -287,8 +318,18 @@ def test_refund_decode_roundtrip(variant):
     taker, maker, fee = _keys()
     c = _build_covenant(variant, taker, maker)
     tx = REFUND.build_refund_tx(
-        variant, REFUND_CSV, c.spk, COV_TXID, 0, c.out0, c.maker_script,
-        fee.wif(), FEE_TXID, 0, FEE_AMT, _fee_spk(fee),
+        variant,
+        REFUND_CSV,
+        c.spk,
+        COV_TXID,
+        0,
+        c.out0,
+        c.maker_script,
+        fee.wif(),
+        FEE_TXID,
+        0,
+        FEE_AMT,
+        _fee_spk(fee),
     )
     raw = tx.serialize().hex()
     back = Transaction.from_hex(raw)
@@ -307,12 +348,32 @@ def test_wrong_preimage_changes_scriptsig(variant):
     taker, maker, fee = _keys()
     c = _build_covenant(variant, taker, maker)
     good = CLAIM.build_claim_tx(
-        variant, PREIMAGE, c.spk, COV_TXID, 0, c.out0, c.taker_script,
-        fee.wif(), FEE_TXID, 0, FEE_AMT, _fee_spk(fee),
+        variant,
+        PREIMAGE,
+        c.spk,
+        COV_TXID,
+        0,
+        c.out0,
+        c.taker_script,
+        fee.wif(),
+        FEE_TXID,
+        0,
+        FEE_AMT,
+        _fee_spk(fee),
     )
     wrong = CLAIM.build_claim_tx(
-        variant, os.urandom(32), c.spk, COV_TXID, 0, c.out0, c.taker_script,
-        fee.wif(), FEE_TXID, 0, FEE_AMT, _fee_spk(fee),
+        variant,
+        os.urandom(32),
+        c.spk,
+        COV_TXID,
+        0,
+        c.out0,
+        c.taker_script,
+        fee.wif(),
+        FEE_TXID,
+        0,
+        FEE_AMT,
+        _fee_spk(fee),
     )
     good_sig = good.inputs[0].unlocking_script.serialize()
     wrong_sig = wrong.inputs[0].unlocking_script.serialize()
@@ -328,8 +389,19 @@ def test_premature_refund_is_v1_and_seq_zero(variant):
     taker, maker, fee = _keys()
     c = _build_covenant(variant, taker, maker)
     tx = REFUND.build_refund_tx(
-        variant, REFUND_CSV, c.spk, COV_TXID, 0, c.out0, c.maker_script,
-        fee.wif(), FEE_TXID, 0, FEE_AMT, _fee_spk(fee), premature=True,
+        variant,
+        REFUND_CSV,
+        c.spk,
+        COV_TXID,
+        0,
+        c.out0,
+        c.maker_script,
+        fee.wif(),
+        FEE_TXID,
+        0,
+        FEE_AMT,
+        _fee_spk(fee),
+        premature=True,
     )
     assert tx.version == 1
     assert tx.inputs[0].sequence == 0
@@ -340,6 +412,7 @@ def test_covenant_spk_guards_pass_all_variants():
     for all three variants — exercised by _build_covenant for ft/nft; rxd's guards
     run inside _build_rxd, so assert the rxd body carries NO ref op and NO 0xbd."""
     from pyrxd.glyph.script import count_input_refs
+
     taker, maker, _ = _keys()
     cov_rxd = _build_covenant("rxd", taker, maker).spk
     assert SPK._opcode_bd_positions(cov_rxd) == []

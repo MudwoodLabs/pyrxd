@@ -73,9 +73,7 @@ def _output_offsets(stripped_tx: bytes) -> set[int]:
             raise SpvVerificationError("output parse ran past end of tx")
     # pos must now sit exactly on the 4-byte nLockTime trailer.
     if pos != len(stripped_tx) - 4:
-        raise SpvVerificationError(
-            f"tx structure parse ended at {pos}, expected {len(stripped_tx) - 4} (len-4)"
-        )
+        raise SpvVerificationError(f"tx structure parse ended at {pos}, expected {len(stripped_tx) - 4} (len-4)")
     return offsets
 
 
@@ -242,9 +240,7 @@ class SpvProofBuilder:
         # start of one of the tx's outputs before trusting verify_payment's
         # structural check there (defeats a forged payment planted in a scriptSig).
         if output_offset not in _output_offsets(stripped):
-            raise SpvVerificationError(
-                f"output_offset {output_offset} is not a real output boundary"
-            )
+            raise SpvVerificationError(f"output_offset {output_offset} is not a real output boundary")
         verify_payment(
             raw_tx=stripped,
             output_offset=output_offset,
