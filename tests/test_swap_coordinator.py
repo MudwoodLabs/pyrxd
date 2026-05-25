@@ -62,8 +62,11 @@ class FakeBtcLeg:
     builds a real witness embedding p, so ``scrape_secret`` works for real.
     """
 
-    def __init__(self, *, tamper_promised_spk: bool = False) -> None:
+    def __init__(self, *, tamper_promised_spk: bool = False, fund_amount_delta: int = 0) -> None:
         self.tamper_promised_spk = tamper_promised_spk
+        # Simulate a buggy/malicious leg (or a mutated `terms`) that funds the HTLC
+        # with a value != the negotiated btc_sats. Positive = overfund, negative = under.
+        self.fund_amount_delta = fund_amount_delta
         self.calls: list[str] = []
         self.last_locator: t.BtcHtlcLocator | None = None
         self.claimed_with: bytes | None = None
@@ -88,7 +91,8 @@ class FakeBtcLeg:
 
     def fund(self, terms: NegotiatedTerms) -> t.BtcHtlcLocator:
         self.calls.append("fund")
-        loc = self._htlc(terms).with_funding(t.BtcOutpoint("ab" * 32, 0), terms.btc_sats)
+        amount = terms.btc_sats + self.fund_amount_delta
+        loc = self._htlc(terms).with_funding(t.BtcOutpoint("ab" * 32, 0), amount)
         self.last_locator = loc
         return loc
 
@@ -233,6 +237,36 @@ def test_role_invariant_constant_spelled_out():
 # ---------------------------------------------------------------------------
 # Margin check (C2/C3)
 # ---------------------------------------------------------------------------
+
+
+def test_taker_funds_btc_rejects_amount_mismatch():
+    """Regression (2026-05-24 panel): taker_funds_btc must bind the funded amount
+    to the negotiated btc_sats. A P2TR scriptPubKey commits to the taptree, not the
+    output value, so the pre-lock SPK check cannot catch a wrong amount — this Python
+    assert is the only layer that can. Overfunding is a one-sided taker loss (the
+    maker claims the whole output via the preimage); we reject both directions.
+    """
+    terms = _terms()
+
+    # Overfund: leg locks more than negotiated -> reject, do not advance, do not mark seen.
+    over_leg = FakeBtcLeg(fund_amount_delta=50_000)
+    seen = FakeSeenStore()
+    coord = _coordinator(terms=terms, btc_leg=over_leg, seen_store=seen)
+    with pytest.raises(ValidationError, match="funded BTC amount"):
+        coord.taker_funds_btc(terms)
+    assert coord.record.state is SwapState.NEGOTIATED  # never advanced
+    assert not seen.has_seen(terms.hashlock)  # H not consumed on a refused fund
+
+    # Underfund: also rejected (self-correcting in practice, but fail-closed here).
+    under_leg = FakeBtcLeg(fund_amount_delta=-1)
+    coord2 = _coordinator(terms=terms, btc_leg=under_leg)
+    with pytest.raises(ValidationError, match="funded BTC amount"):
+        coord2.taker_funds_btc(terms)
+
+    # Exact match still funds and advances.
+    ok_coord = _coordinator(terms=terms, btc_leg=FakeBtcLeg())
+    rec = ok_coord.taker_funds_btc(terms)
+    assert rec.state is SwapState.BTC_LOCKED
 
 
 def test_margin_rejects_btc_not_greater_than_rxd():

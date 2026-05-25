@@ -421,6 +421,18 @@ class SwapCoordinator:
         locator = self.btc_leg.fund(terms)
         if not isinstance(locator, BtcHtlcLocator):
             raise ValidationError("btc_leg.fund must return a BtcHtlcLocator (full durable retained state)")
+        # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits
+        # to the taptree, NOT the output value, so the funding SPK check in
+        # pre_btc_lock_check (step 4) cannot catch a wrong amount — this is the only
+        # layer that can. An OVER-funded HTLC is a one-sided taker loss: the maker
+        # claims the whole output via the preimage (the claim leaf does not cap value).
+        # Under-funding is self-correcting (the maker won't reveal), but we reject both
+        # so a mutated `terms` or a buggy leg fails closed before the BTC is locked.
+        if locator.amount_sats != terms.btc_sats:
+            raise ValidationError(
+                f"funded BTC amount {locator.amount_sats} != negotiated btc_sats {terms.btc_sats}; "
+                "refusing to lock a mis-valued HTLC"
+            )
         # Record H freshness only after a successful gate + fund.
         self.seen_store.mark_seen(terms.hashlock)
         self.record = self.record.with_btc_lock(locator)

@@ -203,9 +203,21 @@ def _hash160(data: bytes) -> bytes:
 
 
 def _taproot_tweak(x_only_pubkey: bytes) -> bytes:
-    """BIP341 key-path tweak: tagged hash then add tweak*G to pubkey.
+    """BIP341 key-path tweak: Q = lift_x(P) + tweak*G, returned x-only.
 
     tagged hash = SHA256(SHA256('TapTweak') || SHA256('TapTweak') || x_only_pubkey)
+
+    The internal point is the BIP341 ``lift_x`` of the x-coordinate, which is
+    DEFINED as the even-Y point — so the ``b"\\x02"`` prefix is the lift, not an
+    "even parity" guess: BIP341 discards the original pubkey's parity byte by
+    design. A wallet holding the matching secret stays able to sign because its
+    tweaked secret is ``(d_even + t) mod n`` where ``d_even = n - d`` when the
+    original pubkey had odd Y (the standard BIP340/341 negation). Verified
+    spendable across both parities — see test_taproot_tweak_is_spendable_both_parities.
+
+    This is key-path-only and never builds a control block, so the OUTPUT-key
+    parity bit is irrelevant here; the script-spend path in ``taproot.py`` computes
+    that bit explicitly (it must not be assumed) via ``_taproot_tweak_point``.
     """
     import coincurve
 
@@ -213,10 +225,10 @@ def _taproot_tweak(x_only_pubkey: bytes) -> bytes:
     tag_hash = hashlib.sha256(tag).digest()
     tweak = hashlib.sha256(tag_hash + tag_hash + x_only_pubkey).digest()
 
-    # Reconstruct compressed pubkey (assume even parity = 0x02 prefix)
+    # lift_x: the BIP341 internal point is always the even-Y lift of the x-coord.
     compressed = b"\x02" + x_only_pubkey
     pub = coincurve.PublicKey(compressed)
-    # tweaked = pubkey + tweak*G; raises on scalar overflow (prob ~2^-128)
+    # tweaked = lift_x(P) + tweak*G; raises on scalar overflow (prob ~2^-128)
     tweaked = pub.add(tweak)
     tweaked_bytes = tweaked.format(compressed=True)
     return tweaked_bytes[1:]  # x-only (32 bytes)

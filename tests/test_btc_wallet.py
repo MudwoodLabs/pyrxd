@@ -80,6 +80,46 @@ class TestKeygen:
         assert kp2.p2sh_p2wpkh_address == kp.p2sh_p2wpkh_address
         assert kp2.p2tr_address == kp.p2tr_address
 
+    def test_taproot_tweak_is_spendable_both_parities(self):
+        """The P2TR output key must be spendable regardless of pubkey Y-parity.
+
+        Regression for a 2026-05-24 panel finding that read ``_taproot_tweak``'s
+        ``b"\\x02" + x_only`` as an "assume even parity" bug. It is not: BIP341's
+        ``lift_x`` is *defined* as the even-Y point, so the prefix is the lift, and
+        a holder of an odd-Y key stays able to sign because its tweaked secret uses
+        the negated lift secret ``d_even = n - d``. We prove spendability directly:
+        reconstruct the BIP341 tweaked SECRET and assert its public x-coordinate
+        equals the stored ``p2tr_output_key`` — for BOTH parities. If the tweak had
+        actually assumed even-Y, the odd-Y case would fail here.
+        """
+        import hashlib
+
+        import coincurve
+
+        n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+        tag_hash = hashlib.sha256(b"TapTweak").digest()
+
+        def tweaked_pubkey_x_from_secret(kp) -> bytes:
+            d = int.from_bytes(kp._privkey.unsafe_raw_bytes(), "big")
+            # lift_x secret: negate if the pubkey has odd Y (BIP340/341).
+            d_even = d if kp.pubkey_bytes[0] == 0x02 else (n - d)
+            x_only = kp.pubkey_bytes[1:]
+            t = int.from_bytes(hashlib.sha256(tag_hash + tag_hash + x_only).digest(), "big")
+            d_tweaked = (d_even + t) % n
+            sk = coincurve.PrivateKey(d_tweaked.to_bytes(32, "big"))
+            return sk.public_key.format(compressed=True)[1:]
+
+        seen_parities = set()
+        for _ in range(40):  # ~1 - 2^-40 chance of hitting both parities
+            kp = generate_keypair()
+            seen_parities.add(kp.pubkey_bytes[0])
+            assert tweaked_pubkey_x_from_secret(kp) == kp.p2tr_output_key, (
+                f"P2TR output key not spendable for parity {kp.pubkey_bytes[0]:#x}"
+            )
+            if seen_parities >= {0x02, 0x03}:
+                break
+        assert seen_parities >= {0x02, 0x03}, "did not exercise both Y-parities"
+
 
 class TestAddressFormats:
     """Known-vector tests for address generation.

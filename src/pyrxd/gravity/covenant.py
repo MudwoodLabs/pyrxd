@@ -47,6 +47,7 @@ from pyrxd.security.errors import ValidationError
 __all__ = [
     "CovenantArtifact",
     "build_gravity_offer",
+    "build_gravity_offer_derived",
     "validate_claim_deadline",
 ]
 
@@ -361,6 +362,13 @@ def build_gravity_offer(
         receive address per offer. Pass ``used_btc_receive_hashes`` to have this
         function reject reuse it can see; offers built by separate processes are
         the caller's responsibility.
+
+        **PREFER** :func:`build_gravity_offer_derived`, which derives a distinct
+        receive address per offer from the maker's account xpub — that is the
+        structural fix (distinct address ⇒ distinct code hash ⇒ replay impossible)
+        and needs no caller-side live-set tracking. This raw-hash entry point
+        remains for callers that manage receive addresses themselves; the
+        ``used_btc_receive_hashes`` guard is only best-effort.
     """
     from pyrxd.gravity.types import GravityOffer
 
@@ -481,3 +489,67 @@ def build_gravity_offer(
         claimed_redeem_hex=claimed_redeem.hex(),
         expected_code_hash_hex=expected_code_hash.hex(),
     )
+
+
+def build_gravity_offer_derived(
+    account_xpub: Any,  # str | bytes | pyrxd.hd.bip32.Xpub
+    offer_index: int,
+    *,
+    maker_pkh: bytes,
+    maker_pk: bytes,
+    taker_pk: bytes,
+    taker_radiant_pkh: bytes,
+    btc_satoshis: int,
+    btc_chain_anchor: bytes,
+    expected_nbits: bytes,
+    anchor_height: int,
+    merkle_depth: int,
+    claim_deadline: int,
+    photons_offered: int,
+    expected_nbits_next: bytes | None = None,
+    accept_short_deadline: bool = False,
+    covenant_artifact_name: str = "maker_covenant_flat_12x20_sentinel_all",
+    offer_artifact_name: str = "maker_offer",
+) -> tuple[Any, Any]:
+    """Build an offer whose BTC receive address is DERIVED per-offer (replay-safe).
+
+    This is the structural fix for the cross-offer replay (C-ECON-1 / "H1"): the
+    receive hash is derived from ``account_xpub`` at ``offer_index`` via
+    :func:`pyrxd.gravity.receive.derive_offer_btc_receive`, so every offer commits
+    to a DISTINCT BTC address. A payment to one offer's address cannot satisfy
+    another offer's covenant (different ``btcReceiveHash`` ⇒ different code hash),
+    so one BTC payment can finalize at most one offer — no caller-supplied
+    live-set bookkeeping required.
+
+    Prefer this over passing a raw ``btc_receive_hash`` to :func:`build_gravity_offer`.
+    The caller MUST allocate a fresh, never-reused ``offer_index`` per offer (a
+    persistent monotonic counter per account) and hold the matching xprv to spend
+    received BTC.
+
+    Returns:
+        ``(GravityOffer, OfferReceive)`` — persist ``OfferReceive.offer_index`` with
+        the offer so the maker can later spend the received BTC and never reuse it.
+    """
+    from pyrxd.gravity.receive import derive_offer_btc_receive
+
+    recv = derive_offer_btc_receive(account_xpub, offer_index)
+    offer = build_gravity_offer(
+        maker_pkh=maker_pkh,
+        maker_pk=maker_pk,
+        taker_pk=taker_pk,
+        taker_radiant_pkh=taker_radiant_pkh,
+        btc_receive_hash=recv.btc_receive_hash,
+        btc_receive_type=recv.btc_receive_type,
+        btc_satoshis=btc_satoshis,
+        btc_chain_anchor=btc_chain_anchor,
+        expected_nbits=expected_nbits,
+        anchor_height=anchor_height,
+        merkle_depth=merkle_depth,
+        claim_deadline=claim_deadline,
+        photons_offered=photons_offered,
+        expected_nbits_next=expected_nbits_next,
+        accept_short_deadline=accept_short_deadline,
+        covenant_artifact_name=covenant_artifact_name,
+        offer_artifact_name=offer_artifact_name,
+    )
+    return offer, recv

@@ -1695,3 +1695,103 @@ class TestUsedBtcReceiveHashGuard:
         kw["btc_receive_hash"] = bytearray(b"\x66" * 20)
         with pytest.raises(ValidationError, match="already in use"):
             build_gravity_offer(used_btc_receive_hashes=[bytearray(b"\x66" * 20)], **kw)
+
+
+class TestPerOfferReceiveDerivation:
+    """AUDIT 2026-05-24 C-ECON-1 STRUCTURAL fix: per-offer derived BTC receive
+    addresses make cross-offer replay impossible at the covenant level.
+
+    The exploit (proven 2026-05-24): two offers sharing btc_receive_hash +
+    btc_satoshis + btc_chain_anchor compile to a BYTE-IDENTICAL MakerClaimed
+    redeem script, so ONE BTC payment + ONE SPV proof finalizes BOTH. The fix
+    derives a distinct receive address per offer from the maker's account xpub,
+    so distinct offers => distinct btcReceiveHash => distinct code hash => no
+    replay, with no caller-supplied live-set bookkeeping.
+    """
+
+    # BIP39 'abandon abandon ... about' (well-known test seed); account m/84'/0'/0'.
+    _SEED_HEX = (
+        "5eb00bbddcf069084889a8ab9155568165f5c453ccb85e70811aaed6f6da5fc1"
+        "9a5ac40b389cd370d086206dec8aa6c43daea6690f20ad3d8d48b2d2ce9e38e4"
+    )
+
+    def _account_xpub(self):
+        from pyrxd.hd.bip32 import Xprv, ckd
+
+        return ckd(Xprv.from_seed(self._SEED_HEX), "m/84'/0'/0'").xpub()
+
+    def _common(self):
+        return dict(
+            maker_pkh=b"\xaa" * 20,
+            maker_pk=b"\x02" + b"\xbb" * 32,
+            taker_pk=b"\x02" + b"\xcc" * 32,
+            taker_radiant_pkh=b"\xdd" * 20,
+            btc_satoshis=100_000,
+            btc_chain_anchor=b"\x11" * 32,
+            expected_nbits=bytes.fromhex("ffff001d"),
+            anchor_height=800_000,
+            merkle_depth=12,
+            claim_deadline=_future_deadline(48),
+            photons_offered=10_000_000,
+            covenant_artifact_name="maker_covenant_6x12_p2wpkh",
+        )
+
+    def test_distinct_indices_yield_distinct_covenants(self):
+        """The core replay fix: two offers (same price/anchor/maker) at different
+        indices have DISTINCT code hashes — one BTC payment cannot satisfy both."""
+        from pyrxd.gravity.covenant import build_gravity_offer_derived
+
+        xpub = self._account_xpub()
+        offer0, recv0 = build_gravity_offer_derived(xpub, 0, **self._common())
+        offer1, recv1 = build_gravity_offer_derived(xpub, 1, **self._common())
+
+        assert recv0.btc_receive_hash != recv1.btc_receive_hash
+        assert recv0.btc_receive_type == "p2wpkh"
+        # The MakerClaimed code hash is what determines on-chain identity for the
+        # finalize/SPV check. Distinct => the same SPV proof can't finalize both.
+        assert offer0.expected_code_hash_hex != offer1.expected_code_hash_hex
+        assert offer0.claimed_redeem_hex != offer1.claimed_redeem_hex
+
+    def test_derivation_is_deterministic_and_reproducible_from_xpub(self):
+        """Same index re-derives the same hash (maker finds funds + must not reuse);
+        derivable from the xpub alone (no private key needed to publish an offer)."""
+        from pyrxd.gravity.receive import derive_offer_btc_receive
+
+        xpub = self._account_xpub()
+        a = derive_offer_btc_receive(xpub, 7)
+        b = derive_offer_btc_receive(xpub, 7)
+        assert a == b
+        assert a.offer_index == 7
+        assert len(a.btc_receive_hash) == 20
+        # bytes/str/Xpub all accepted and equivalent.
+        assert derive_offer_btc_receive(str(xpub), 7).btc_receive_hash == a.btc_receive_hash
+        assert derive_offer_btc_receive(xpub.payload, 7).btc_receive_hash == a.btc_receive_hash
+
+    def test_rejects_hardened_or_out_of_range_index(self):
+        from pyrxd.gravity.receive import (
+            BIP32_MAX_NONHARDENED_INDEX,
+            derive_offer_btc_receive,
+        )
+
+        xpub = self._account_xpub()
+        with pytest.raises(ValidationError, match="non-hardened"):
+            derive_offer_btc_receive(xpub, BIP32_MAX_NONHARDENED_INDEX + 1)  # hardened
+        with pytest.raises(ValidationError, match="non-hardened"):
+            derive_offer_btc_receive(xpub, -1)
+        with pytest.raises(ValidationError, match="must be an int"):
+            derive_offer_btc_receive(xpub, True)  # bool is not a valid index
+
+    def test_matches_bip84_standard_receive_path(self):
+        """The derived hash equals HASH160 of the standard m/84'/0'/0'/0/i child,
+        so an off-the-shelf wallet restored from the seed can spend received BTC."""
+        from pyrxd.hd.bip32 import Xprv, ckd
+
+        master = Xprv.from_seed(self._SEED_HEX)
+        # Standard BIP84 external receive key m/84'/0'/0'/0/3
+        child = ckd(master, "m/84'/0'/0'/0/3")
+        expected = child.xpub().public_key().hash160()
+
+        from pyrxd.gravity.receive import derive_offer_btc_receive
+
+        got = derive_offer_btc_receive(self._account_xpub(), 3)
+        assert got.btc_receive_hash == expected
