@@ -50,6 +50,10 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
+# Atheris libFuzzer crash reproducers (ad-hoc harness runs drop these in cwd;
+# the overnight script writes them under logs/).
+crash-*
+
 
 # Translations
 *.mo
