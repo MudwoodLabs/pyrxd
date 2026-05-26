@@ -31,9 +31,11 @@ Design rules (house style)
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from pyrxd.btc_wallet.taproot import (
@@ -44,6 +46,7 @@ from pyrxd.btc_wallet.taproot import (
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import SecretBytes
 
+from .ref_authenticity import verify_ref_authenticity
 from .swap_state import (
     NegotiatedTerms,
     SwapEvent,
@@ -51,6 +54,11 @@ from .swap_state import (
     SwapState,
     advance,
 )
+
+# A durable-persist hook: ``await persist(record)`` writes the record so a crash
+# between an awaited broadcast and the in-memory state advance cannot strand
+# funds. Injected (None in tests that do not exercise crash-atomicity).
+PersistHook = Callable[[SwapRecord], Awaitable[None]]
 
 __all__ = [
     "ESTIMATED_DEFAULT_MARGIN_BLOCKS",
@@ -271,12 +279,14 @@ def should_taker_refund_proactively(
 # enforce a Protocol — the failure semantics (indexer-unavailable => fail-closed)
 # are what matter, and they live in the gate functions below.
 #
-#   RefIndexer:
-#     verify_ref(genesis_ref: bytes) -> bool
-#       True iff the genesis ref is a real, well-formed Glyph genesis (genesis
-#       txid:vout + payload hash + 'gly' marker checked by the indexer). MUST raise
-#       (any exception) when the indexer is unavailable/lagging — the gate converts
-#       that to a fail-closed rejection, never an optimistic pass.
+#   RefAuthenticityIndexer (gravity.ref_authenticity):
+#     async resolve_ref(genesis_ref: bytes) -> ResolvedRef | None
+#       Resolves the genesis ref to its on-chain reveal (genesis outpoint, `gly`
+#       marker, payload hash, confirmations). The pre-lock gate routes this through
+#       ``verify_ref_authenticity`` (async), which binds the resolved reveal to the
+#       advertised asset and fails closed on None / missing field / shallow genesis
+#       / indexer error — never an optimistic pass. It is async because a SYNC gate
+#       calling the async indexer would leak a truthy un-awaited coroutine = fail-OPEN.
 #
 #   SeenStore (persistent H-freshness):
 #     has_seen(hashlock: bytes) -> bool
@@ -306,6 +316,10 @@ class CoordinatorConfig:
     margin_policy: MarginPolicy
     # N: how many blocks before t_RXD maturity the taker proactively refunds (C1).
     maker_stall_safety_window_blocks: int = 6
+    # Min confirmations the advertised asset's GENESIS tx must have before the taker
+    # funds (ref-authenticity binding (e) — a shallow genesis can be reorged out
+    # after payment, voiding the provenance the taker relied on).
+    min_ref_confirmations: int = 6
 
     def __post_init__(self) -> None:
         if not isinstance(self.margin_policy, MarginPolicy):
@@ -313,6 +327,9 @@ class CoordinatorConfig:
         w = self.maker_stall_safety_window_blocks
         if not isinstance(w, int) or isinstance(w, bool) or w < 0:
             raise ValidationError("maker_stall_safety_window_blocks must be a non-negative int")
+        c = self.min_ref_confirmations
+        if not isinstance(c, int) or isinstance(c, bool) or c < 0:
+            raise ValidationError("min_ref_confirmations must be a non-negative int")
 
 
 class SwapCoordinator:
@@ -334,51 +351,96 @@ class SwapCoordinator:
         Duck-typed ``SeenStore`` (``has_seen``/``mark_seen``) — persistent H freshness.
     config:
         :class:`CoordinatorConfig` (margin policy + maker-stall window).
+    persist:
+        Optional ``async (SwapRecord) -> None`` durable-write hook. When supplied,
+        the coordinator persists the *intent* record BEFORE an awaited broadcast and
+        ``asyncio.shield()``-s the post-broadcast persist, so a task cancelled
+        between "BTC is locked on-chain" and "record advanced" cannot double-fund on
+        retry (kieran-python HIGH). ``None`` disables durability (tests that do not
+        exercise crash-atomicity); the in-memory record still advances.
     """
 
-    def __init__(self, *, record, btc_leg, radiant_leg, indexer, seen_store, config: CoordinatorConfig) -> None:
+    def __init__(
+        self,
+        *,
+        record,
+        btc_leg,
+        radiant_leg,
+        indexer,
+        seen_store,
+        config: CoordinatorConfig,
+        persist: PersistHook | None = None,
+    ) -> None:
         if not isinstance(record, SwapRecord):
             raise ValidationError("record must be a SwapRecord")
         if not isinstance(config, CoordinatorConfig):
             raise ValidationError("config must be a CoordinatorConfig")
+        if persist is not None and not callable(persist):
+            raise ValidationError("persist must be an async callable or None")
         self.record = record
         self.btc_leg = btc_leg
         self.radiant_leg = radiant_leg
         self.indexer = indexer
         self.seen_store = seen_store
         self.config = config
+        self._persist = persist
 
     # -- internal: advance + persist-shape ----------------------------------
     def _advance(self, event: SwapEvent) -> SwapState:
-        """Validate the transition via the pure FSM and update ``self.record``."""
+        """Validate the transition via the pure FSM and update ``self.record`` (pure)."""
         new_state = advance(self.record.state, event)
         self.record = self.record.with_state(new_state)
         return new_state
 
+    async def _persist_record(self, record: SwapRecord, *, shield: bool = False) -> None:
+        """Durably write ``record`` via the injected hook (no-op if none).
+
+        Set ``shield=True`` for the post-broadcast persist so a cancellation
+        between an on-chain broadcast and the durable write cannot tear it: losing
+        that write strands/duplicates funds. The pre-broadcast intent persist is
+        NOT shielded — cancelling before the broadcast is safe (nothing happened).
+        """
+        if self._persist is None:
+            return
+        if shield:
+            await asyncio.shield(self._persist(record))
+        else:
+            await self._persist(record)
+
     # -- pre-BTC-lock gate (H4 a) -------------------------------------------
-    def pre_btc_lock_check(self, terms: NegotiatedTerms) -> PreBtcLockGate:
+    async def pre_btc_lock_check(self, terms: NegotiatedTerms) -> PreBtcLockGate:
         """Validate everything the taker can check BEFORE funding BTC (fail-closed).
 
         Checks, in order (any failure => do NOT fund):
-          1. REF authenticity via the indexer (indexer-unavailable => fail-closed).
+          1. REF authenticity via ``verify_ref_authenticity`` — the resolved reveal
+             must bind to the ADVERTISED asset (genesis-outpoint==ref, `gly` marker,
+             optional payload hash, ≥ ``min_ref_confirmations``). Indexer
+             unavailable / shallow genesis / wrong asset => fail-closed.
           2. H freshness against the persistent seen-store (reused H => reject).
           3. The cross-chain margin ordering (``t_btc - t_rxd >= margin``).
           4. Maker-*promised* params match the locally re-derived BTC funding SPK
              (the on-chain re-validation happens later in
              :meth:`post_asset_lock_revalidate`).
+
+        Async because binding (1) awaits the async indexer adapter (a sync gate
+        would leak a truthy un-awaited coroutine = fail-OPEN, T7 plan D2).
         """
         if not isinstance(terms, NegotiatedTerms):
             raise ValidationError("pre_btc_lock_check requires NegotiatedTerms")
 
-        # 1. REF authenticity (only FT/NFT carry a genesis ref).
-        if terms.asset_variant in ("ft", "nft"):
-            try:
-                authentic = self.indexer.verify_ref(terms.genesis_ref)
-            except Exception as exc:
-                # Indexer unavailable/lagging => fail-closed. Never optimistic-pass.
-                return PreBtcLockGate(ok=False, reason=f"indexer unavailable; fail-closed ({exc})")
-            if not authentic:
-                return PreBtcLockGate(ok=False, reason="genesis REF failed indexer authenticity check")
+        # 1. REF authenticity bound to the ADVERTISED asset (FT/NFT carry a ref;
+        #    rxd is a no-op inside the gate). verify_ref_authenticity RAISES on any
+        #    uncertain outcome (None / missing field / shallow / indexer error) —
+        #    we convert that to a fail-closed gate result, never an optimistic pass.
+        try:
+            await verify_ref_authenticity(
+                self.indexer,
+                terms.genesis_ref,
+                asset_variant=terms.asset_variant,
+                min_confirmations=self.config.min_ref_confirmations,
+            )
+        except ValidationError as exc:
+            return PreBtcLockGate(ok=False, reason=f"REF authenticity failed; fail-closed ({exc})")
 
         # 2. H freshness (persistent seen-store). Reject reuse for BOTH reasons.
         try:
@@ -405,20 +467,34 @@ class SwapCoordinator:
         return PreBtcLockGate(ok=True)
 
     # -- taker funds BTC first (the role invariant's step 2) ----------------
-    def taker_funds_btc(self, terms: NegotiatedTerms) -> SwapRecord:
+    async def taker_funds_btc(self, terms: NegotiatedTerms) -> SwapRecord:
         """Run the pre-lock gate, fund the BTC HTLC, record the locator, advance.
 
         Refuses (raises) if the pre-lock gate fails — the taker NEVER funds against a
         failed gate. On success the seen-store records H (freshness for future swaps)
         and the durable record carries the full :class:`BtcHtlcLocator`.
+
+        Atomicity (kieran-python HIGH): ``btc_leg.fund`` broadcasts on-chain, so a
+        cancellation between the broadcast and the in-memory state advance would
+        leave BTC locked but the record at NEGOTIATED → a retry double-funds. We
+        persist an INTENT record (terms + derived funding SPK, enough to recover the
+        address) BEFORE the awaited fund, and ``asyncio.shield()`` the post-broadcast
+        persist of the funded record. ``fund`` itself must be idempotent (treat
+        "already in mempool" as success) so a retry after an intent-only crash does
+        not lock twice. Persistence is a no-op when no ``persist`` hook is injected.
         """
         if self.record.state is not SwapState.NEGOTIATED:
             raise ValidationError(f"taker_funds_btc only valid from NEGOTIATED, not {self.record.state.value}")
-        gate = self.pre_btc_lock_check(terms)
+        gate = await self.pre_btc_lock_check(terms)
         if not gate.ok:
             raise ValidationError(f"pre-BTC-lock gate refused funding: {gate.reason}")
 
-        locator = self.btc_leg.fund(terms)
+        # Persist intent BEFORE broadcasting: the SPK is derivable pre-fund, so a
+        # crash after this write but before/within the broadcast leaves a record
+        # that knows WHERE the HTLC address is (recoverable), not a silent gap.
+        await self._persist_record(self.record)
+
+        locator = await self.btc_leg.fund(terms)
         if not isinstance(locator, BtcHtlcLocator):
             raise ValidationError("btc_leg.fund must return a BtcHtlcLocator (full durable retained state)")
         # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits
@@ -437,10 +513,13 @@ class SwapCoordinator:
         self.seen_store.mark_seen(terms.hashlock)
         self.record = self.record.with_btc_lock(locator)
         self._advance(SwapEvent.TAKER_FUNDS_BTC)
+        # Shielded: the BTC is locked on-chain now; losing this write would
+        # double-fund on retry, so it must complete even under cancellation.
+        await self._persist_record(self.record, shield=True)
         return self.record
 
     # -- post-asset-lock re-validation (H4 b) -------------------------------
-    def post_asset_lock_revalidate(self, observed_covenant_spk: bytes) -> SwapRecord:
+    async def post_asset_lock_revalidate(self, observed_covenant_spk: bytes) -> SwapRecord:
         """Re-check the on-chain covenant SPK == expected-from-terms+H.
 
         Called when the maker locks the asset. The expected SPK is recomputed from
@@ -448,6 +527,9 @@ class SwapCoordinator:
         amount/dest-hashes/REF into the covenant bytecode). On match => BOTH_LOCKED.
         On mismatch => PARAMS_MISMATCH; the caller then refunds the BTC via the
         timelock leg (see :meth:`taker_refund_btc`).
+
+        Async because the Radiant leg reads chain state (expected-SPK derivation +
+        covenant outpoint lookup) over the async indexer/node.
         """
         if self.record.state is not SwapState.BTC_LOCKED:
             raise ValidationError(
@@ -455,29 +537,36 @@ class SwapCoordinator:
             )
         observed = bytes(observed_covenant_spk)
         try:
-            expected = self.radiant_leg.expected_covenant_scriptpubkey(self.record.terms)
+            expected = await self.radiant_leg.expected_covenant_scriptpubkey(self.record.terms)
         except Exception as exc:
             # Cannot recompute the expected SPK => treat as mismatch (fail-closed):
             # the taker has BTC locked and must be able to recover.
             self.record = self.record.with_radiant_lock("<unverifiable>", observed.hex())
             self._advance(SwapEvent.MAKER_LOCKS_WRONG_PARAMS)
+            await self._persist_record(self.record, shield=True)
             raise ValidationError(f"could not recompute expected covenant SPK; PARAMS_MISMATCH ({exc})") from exc
 
-        outpoint = self.radiant_leg.covenant_outpoint(self.record.terms)
+        outpoint = await self.radiant_leg.covenant_outpoint(self.record.terms)
         self.record = self.record.with_radiant_lock(outpoint, observed.hex())
         if observed != bytes(expected):
             self._advance(SwapEvent.MAKER_LOCKS_WRONG_PARAMS)
+            await self._persist_record(self.record, shield=True)
             return self.record
         self._advance(SwapEvent.MAKER_LOCKS_ASSET)
+        await self._persist_record(self.record, shield=True)
         return self.record
 
     # -- maker claims BTC, revealing p (role invariant step 4) --------------
-    def maker_claims_btc(self, preimage: SecretBytes) -> SwapRecord:
+    async def maker_claims_btc(self, preimage: SecretBytes) -> SwapRecord:
         """Maker spends the BTC claim leaf with ``p`` (revealing it), then zeroizes p.
 
         Re-verifies ``sha256(p) == H`` before broadcasting (defends a swapped/garbled
         secret). The maker holds ``p`` only as :class:`SecretBytes`; it is zeroized
         immediately after the claim is handed to the BTC leg.
+
+        ``p`` zeroization in ``finally`` runs on the cancel path too. If the awaited
+        claim raises AFTER the tx hit the mempool, ``p`` is wiped from memory but is
+        now public on-chain — recovery re-scrapes it from the chain, never memory.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(f"maker_claims_btc only valid from BOTH_LOCKED, not {self.record.state.value}")
@@ -489,19 +578,23 @@ class SwapCoordinator:
         if hashlib.sha256(raw).digest() != self.record.terms.hashlock:
             raise ValidationError("preimage does not hash to the negotiated H; refusing to broadcast")
         try:
-            self.btc_leg.claim(self.record.btc_locator, raw)
+            await self.btc_leg.claim(self.record.btc_locator, raw)
         finally:
             preimage.zeroize()
         self._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
+        await self._persist_record(self.record, shield=True)
         return self.record
 
     # -- taker scrapes p from the claim tx and claims the asset (step 5) ----
-    def taker_scrape_and_claim_asset(self, maker_claim_tx_bytes: bytes) -> SwapRecord:
+    async def taker_scrape_and_claim_asset(self, maker_claim_tx_bytes: bytes) -> SwapRecord:
         """Scrape ``p`` from the maker's BTC claim tx and claim the Radiant asset.
 
         Scraping is by ``sha256(candidate) == H`` over the witness pushes (never by
         offset). The coordinator RE-verifies ``sha256(p) == H`` before firing the
         Radiant claim — a scraped value that does not open H is rejected.
+
+        ``scrape_secret`` is a pure byte-parse (sync). The Radiant claim broadcasts,
+        so it is awaited and the COMPLETED state persisted under shield.
         """
         if self.record.state is not SwapState.SECRET_REVEALED:
             raise ValidationError(
@@ -510,18 +603,20 @@ class SwapCoordinator:
         p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
-        self.radiant_leg.claim_asset(self.record, bytes(p))
+        await self.radiant_leg.claim_asset(self.record, bytes(p))
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
+        await self._persist_record(self.record, shield=True)
         return self.record
 
     # -- maker-stall proactive asset refund (C1) ----------------------------
-    def maybe_refund_asset_on_maker_stall(
+    async def maybe_refund_asset_on_maker_stall(
         self, *, now_block_height: int, asset_locked_at_height: int, maker_has_claimed_btc: bool
     ) -> SwapRecord:
         """If the maker is stalling near ``t_RXD - N``, refund the asset proactively.
 
         Drives BOTH_LOCKED -> MAKER_STALLS -> ASSET_REFUNDED_TAKER_ACTS. A no-op
-        (returns the unchanged record) when the trigger has not fired yet.
+        (returns the unchanged record) when the trigger has not fired yet. Async
+        because the asset refund broadcasts a Radiant covenant spend.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(
@@ -538,43 +633,49 @@ class SwapCoordinator:
         if not trigger:
             return self.record
         self._advance(SwapEvent.MAKER_STALL_DETECTED)
+        await self._persist_record(self.record, shield=True)
         # The taker refunds the asset rather than wait (NEVER waits).
-        self.radiant_leg.refund_asset(self.record)
+        await self.radiant_leg.refund_asset(self.record)
         self._advance(SwapEvent.TAKER_REFUNDS_ASSET_PROACTIVELY)
+        await self._persist_record(self.record, shield=True)
         return self.record
 
     # -- taker refunds BTC (ABORT paths: maker never locks, or PARAMS_MISMATCH)
-    def taker_refund_btc(self) -> SwapRecord:
+    async def taker_refund_btc(self) -> SwapRecord:
         """Refund the BTC via the timelock leg, ending in ABORTED.
 
         Valid from BTC_LOCKED (maker never locked, t_btc elapsed) or PARAMS_MISMATCH
         (maker locked the wrong covenant). The refund needs the FULL locator
-        (Tapscript tree + control block) — recovered from the durable record.
+        (Tapscript tree + control block) — recovered from the durable record. Async
+        because the refund broadcasts the BTC timelock spend.
         """
         state = self.record.state
         if state not in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
             raise ValidationError(f"taker_refund_btc not valid from {state.value}")
         if self.record.btc_locator is None:
             raise ValidationError("no BTC locator on record; cannot refund (state was lost)")
-        self.btc_leg.refund(self.record.btc_locator, self.record.terms.t_btc)
+        await self.btc_leg.refund(self.record.btc_locator, self.record.terms.t_btc)
         if state is SwapState.BTC_LOCKED:
             self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
         else:
             self._advance(SwapEvent.TAKER_REFUNDS_BTC)
+        await self._persist_record(self.record, shield=True)
         return self.record
 
     # -- safe failure: both timeouts elapse, both refund (MUTUAL_REFUND) -----
-    def mutual_refund(self) -> SwapRecord:
+    async def mutual_refund(self) -> SwapRecord:
         """Both legs refund after both timeouts elapse — the guaranteed-safe failure.
 
         Valid from BOTH_LOCKED. The taker refunds BTC, the maker refunds the asset;
-        neither suffers one-sided loss. Requires the full locator be retained.
+        neither suffers one-sided loss. Requires the full locator be retained. Async
+        because both refunds broadcast on their chains.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(f"mutual_refund only valid from BOTH_LOCKED, not {self.record.state.value}")
         if self.record.btc_locator is None:
             raise ValidationError("no BTC locator on record; BTC would strand (state was lost)")
-        self.btc_leg.refund(self.record.btc_locator, self.record.terms.t_btc)
-        self.radiant_leg.refund_asset(self.record)
+        await self.btc_leg.refund(self.record.btc_locator, self.record.terms.t_btc)
+        await self.radiant_leg.refund_asset(self.record)
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
+        await self._persist_record(self.record, shield=True)
         return self.record

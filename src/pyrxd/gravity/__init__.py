@@ -33,7 +33,7 @@ from .covenant import (
 )
 from .maker import ActiveOffer, GravityMakerSession, GravityOfferParams
 from .receive import OfferReceive, derive_offer_btc_receive
-from .ref_authenticity import RefAuthenticityIndexer, verify_ref_authenticity
+from .ref_authenticity import RefAuthenticityIndexer, ResolvedRef, verify_ref_authenticity
 from .trade import ConfirmationStatus, GravityTrade, TradeConfig
 from .transactions import build_claim_tx, build_finalize_tx, build_forfeit_tx, build_maker_offer_tx
 from .types import (
@@ -58,6 +58,7 @@ __all__ = [
     "MakerOfferResult",
     "OfferReceive",
     "RefAuthenticityIndexer",
+    "ResolvedRef",
     "TradeConfig",
     "build_claim_tx",
     "build_finalize_tx",
