@@ -31,6 +31,12 @@ from .covenant import (
     build_gravity_offer_derived,
     validate_claim_deadline,
 )
+from .htlc_covenant import (
+    HtlcCovenant,
+    build_htlc_covenant_ft,
+    build_htlc_covenant_nft,
+    build_htlc_covenant_rxd,
+)
 from .maker import ActiveOffer, GravityMakerSession, GravityOfferParams
 from .receive import OfferReceive, derive_offer_btc_receive
 from .ref_authenticity import RefAuthenticityIndexer, ResolvedRef, verify_ref_authenticity
@@ -55,6 +61,7 @@ __all__ = [
     "GravityOffer",
     "GravityOfferParams",
     "GravityTrade",
+    "HtlcCovenant",
     "MakerOfferResult",
     "OfferReceive",
     "RefAuthenticityIndexer",
@@ -65,6 +72,9 @@ __all__ = [
     "build_forfeit_tx",
     "build_gravity_offer",
     "build_gravity_offer_derived",
+    "build_htlc_covenant_ft",
+    "build_htlc_covenant_nft",
+    "build_htlc_covenant_rxd",
     "build_maker_offer_tx",
     "compute_p2sh_code_hash",
     "derive_offer_btc_receive",
