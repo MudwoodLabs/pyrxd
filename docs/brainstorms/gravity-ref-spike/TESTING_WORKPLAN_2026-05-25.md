@@ -49,28 +49,55 @@ provenance upgrade it buys. Ordered by leverage (value ÷ effort ÷ risk).
 
 ### T4. Full any-wallet covenant deploy + spend-test on regtest
 - **Proves ON REAL CONSENSUS:** R2 (scriptSig≥128B rejection) and the
-  forged-payment-in-scriptsig defense — currently proven-in-sim + by-source +
-  differential-fuzz, but NOT yet spent against a live covenant UTXO.
-- **How:** isolated regtest (radiant-core:v2.3.0 image, the same harness used for
-  R1). Deploy the compiled `GravityNftCovenantAnyWallet20.rxd` (artifact already
-  present — no recompile), fund it, then attempt (a) a legit finalize, (b) a
-  scriptSig≥128B finalize, (c) a forged-payment finalize. `testmempoolaccept`
-  each.
-- **Effort:** ~3–5h. The spike builders (`fund_fused.py` etc.) are CLI-arg
-  driven, NOT network-hardcoded — adaptable to regtest — but assume a funded
-  FT/NFT input, so the funding plumbing (mint a regtest singleton → fund covenant
-  → build finalize) is the real work. The `.rxd` artifact exists.
-- **Risk:** none (isolated regtest). **Provenance buy:** R2 + forged-payment
-  "proven-in-sim" → "proven-on-consensus" — the strongest evidence class.
+  forged-payment-in-scriptsig defense.
+- **STATUS: DROPPED — won't-fix.** Per
+  [`spv-swap-deprecated-primitive-retained.md`](../../solutions/design-decisions/spv-swap-deprecated-primitive-retained.md),
+  the SPV-oracle SWAP is deprecated (HTLC dominates it). R2 + forged-payment live
+  ONLY on that retired swap covenant, so spend-testing them hardens a path we're
+  leaving. Documented, not fixed. (The SPV *primitive* — merkle/pow/verify_payment —
+  is retained for bridge-in/oracle use and stays lightly maintained, but its
+  *swap* covenant is not worth regtest effort.)
 
-### T5. Two-wallet adversarial swaps on regtest (HTLC path)
-- **Proves:** the deadline-race and mutual-refund FSM transitions behave on real
-  consensus with two independent parties; the CSV refund actually matures and
-  spends; a malicious-maker fake-singleton settles to a worthless asset
-  end-to-end (the R1 *impact*, not just the consensus rule).
-- **Blocker:** requires the concrete HTLC legs (T7) to exist — today they're
-  test fakes. **Sequence T7 before T5.**
-- **Effort:** ~4–6h once T7 lands. **Risk:** none (regtest).
+> **The atomic swap is the HTLC path. Tier 2 effort goes there.** The bottleneck
+> is that the HTLC swap cannot run end-to-end yet — the coordinator's legs are
+> test fakes. Build them (T7), then the adversarial regtest tests (T5) unblock.
+
+### T7. Build the concrete HTLC swap legs (THE Tier-2 starting point)
+- **Why first:** `SwapCoordinator` takes `btc_leg`, `radiant_leg`, `indexer`,
+  `seen_store` as injected objects; only test fakes exist, so the swap cannot
+  move value or be exercised end-to-end. Everything HTLC-path is blocked on this.
+- **The interface is fully defined** by the coordinator call-sites + the fakes
+  (`tests/test_swap_coordinator.py`) — this is wrapping EXISTING primitives, not
+  new crypto:
+  - `BtcLeg`: `derive_funding_scriptpubkey`, `promised_funding_scriptpubkey`,
+    `fund`, `claim`, `refund`, `scrape_secret` — wrap `btc_wallet/taproot.py`
+    (`build_htlc`, `build_claim_tx`, `build_refund_tx`, `scrape_secret`) + a
+    BTC broadcast / UTXO-tracking layer.
+  - `RadiantLeg`: `expected_covenant_scriptpubkey`, `covenant_outpoint`,
+    `claim_asset`, `refund_asset` — wrap `gravity/transactions.py` covenant
+    builders + Radiant broadcast.
+  - `Indexer`: `verify_ref` — the R1 gate dependency (resolve a genesis ref to a
+    real Glyph reveal via RXinDexer).
+  - `SeenStore`: `has_seen` / `mark_seen` — a persistent set (H-freshness).
+- **Effort:** the primitives exist, so this is wrapper + broadcast/UTXO plumbing
+  + a leg-conformance test suite. Estimate deferred to a spike read of the
+  broadcast/UTXO layer (don't trust this number until the actual path is read —
+  doc-derived estimates here have run high).
+- **Gate:** this is implementation, ideally after (or alongside) the external
+  audit, since it's the code that will move real value. Design-review the leg
+  boundary before building — run a DIVERGENT review panel (architecture +
+  simplicity + kieran-python + security, writing independently) on the leg
+  interface design before coding, and spike-read the BTC/Radiant broadcast +
+  UTXO-tracking layer to get a real effort estimate (do not trust a doc number).
+- **Risk:** none to write; the risk is in what it later enables (real swaps).
+
+### T5. Two-wallet adversarial HTLC swaps on regtest (unblocked by T7)
+- **Proves ON REAL CONSENSUS:** the happy-path claim (preimage reveal) and the
+  CSV refund both spend; the deadline-race and mutual-refund FSM transitions
+  behave with two independent parties; the R1 *impact* end-to-end (a
+  malicious-maker fake-singleton settles to a worthless asset — the regtest R1
+  PoC proved the consensus rule; this proves the swap-level consequence).
+- **Effort:** ~4–6h once T7 lands. **Risk:** none (isolated regtest, two wallets).
 
 ---
 
