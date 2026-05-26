@@ -39,6 +39,12 @@ from .htlc_covenant import (
 )
 from .htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from .maker import ActiveOffer, GravityMakerSession, GravityOfferParams
+from .radiant_leg import (
+    RadiantChainIO,
+    RadiantCovenantLeg,
+    RxinDexerRefAdapter,
+    SeenStore,
+)
 from .receive import OfferReceive, derive_offer_btc_receive
 from .ref_authenticity import RefAuthenticityIndexer, ResolvedRef, verify_ref_authenticity
 from .trade import ConfirmationStatus, GravityTrade, TradeConfig
@@ -66,8 +72,12 @@ __all__ = [
     "HtlcCovenant",
     "MakerOfferResult",
     "OfferReceive",
+    "RadiantChainIO",
+    "RadiantCovenantLeg",
     "RefAuthenticityIndexer",
     "ResolvedRef",
+    "RxinDexerRefAdapter",
+    "SeenStore",
     "TradeConfig",
     "build_claim_tx",
     "build_finalize_tx",
