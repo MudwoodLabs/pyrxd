@@ -69,6 +69,24 @@ declare -a names=()
 pids+=($!)
 names+=("hypothesis")
 
+# --- Lane 1b: differential fuzz (Python SPV parser vs covenant ASM) ---
+# Not driven by the Hypothesis multiplier — it has its own DIFF_FUZZ_N knob.
+# Profile picks the case count: quick=200k, deep=2M, overnight=20M.
+case "$hypothesis_profile" in
+    quick) diff_n=200000 ;;
+    overnight) diff_n=20000000 ;;
+    *) diff_n=2000000 ;;
+esac
+(
+    DIFF_FUZZ_N="$diff_n" \
+        python3 -m pytest tests/test_spv_covenant_differential.py::test_differential_fuzz_no_novel_divergence \
+        --no-cov -p no:cacheprovider -v --tb=short -o addopts= \
+        > "$run_dir/differential.log" 2>&1
+    echo "$?" > "$run_dir/differential.exit"
+) &
+pids+=($!)
+names+=("differential")
+
 # --- Lanes 2..N: one per atheris harness ---
 for harness in scripts/fuzz_atheris/harness_*.py; do
     name="$(basename "$harness" .py)"

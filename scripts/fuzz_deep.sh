@@ -64,6 +64,7 @@ PYTHONUNBUFFERED=1 \
   python3 -m pytest \
     tests/test_fuzz_parsers.py \
     tests/test_property_based.py \
+    tests/test_fuzz_spv_parsers.py \
     --no-cov \
     -p no:cacheprovider \
     -v \
