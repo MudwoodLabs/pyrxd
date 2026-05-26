@@ -14,6 +14,13 @@ validate_satoshis    — validate a satoshi amount
 
 from __future__ import annotations
 
+from .htlc_leg import (
+    BitcoinCoreBroadcaster,
+    BitcoinTaprootLeg,
+    BtcBroadcaster,
+    BtcFundingReader,
+    require_audit_cleared,
+)
 from .keys import BtcKeypair, generate_keypair, keypair_from_wif
 from .payment import BtcPaymentTx, BtcUtxo, build_payment_tx
 from .taproot import (
@@ -31,6 +38,10 @@ from .taproot import (
 from .validate import validate_btc_address, validate_satoshis
 
 __all__ = [
+    "BitcoinCoreBroadcaster",
+    "BitcoinTaprootLeg",
+    "BtcBroadcaster",
+    "BtcFundingReader",
     "BtcHtlc",
     "BtcHtlcLocator",
     "BtcKeypair",
@@ -46,6 +57,7 @@ __all__ = [
     "build_refund_tx",
     "generate_keypair",
     "keypair_from_wif",
+    "require_audit_cleared",
     "scrape_secret",
     "validate_btc_address",
     "validate_satoshis",
