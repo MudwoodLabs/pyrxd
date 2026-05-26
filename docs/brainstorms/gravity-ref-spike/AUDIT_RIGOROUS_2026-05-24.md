@@ -159,6 +159,38 @@ New tests (all green, lint+format clean):
 - `tests/test_spv_covenant_differential.py` — 16 differential cases incl. the
   pinned scriptSig≥128 B divergence + the exact-128 boundary.
 
+## Expanded-testing follow-up (2026-05-25)
+
+Cheap, repeatable hardening on top of the audit:
+
+- **Differential fuzzing — 2,000,000 random adversarial txs, ZERO novel
+  divergences.** Python SPV parser vs covenant ASM (`rxd_sim`) agree on
+  payment-validity on every input except the known scriptSig≥128 B class
+  (445k hits — the single divergence class, heavily exercised). No
+  Python-REJECT/covenant-ACCEPT (the theft direction) found. Landed as a
+  CI-budgeted regression (`test_differential_fuzz_no_novel_divergence`,
+  scale with `DIFF_FUZZ_N`).
+  - *Method note:* the known-class filter MUST use the production varint
+    parser (`_max_input_scriptsig_len`). A naive single-byte read mis-classifies
+    a ≥253 B scriptSig (multi-byte `0xfd` varint) and would hide a known-class
+    case as "novel" — caught and fixed during this pass.
+- **Atheris coverage-guided fuzz — 200,000 runs, 0 crashes** on the previously
+  unfuzzed `_max_input_scriptsig_len` (R2 helper) and `verify_ref_authenticity`
+  (R1 gate). Neither leaks a non-ValidationError past its trust boundary.
+- **R1 re-confirmed on a fresh regtest node** via `testmempoolaccept`
+  (`allowed: true`) — a fake-singleton whose REF is a plain wallet UTXO.
+- **Mainnet free-check ruled out (method finding):** `testmempoolaccept` on the
+  mainnet node short-circuits with `missing-inputs` BEFORE evaluating the
+  singleton-ref / script rules, because the referenced input must already exist
+  on-chain. So no covenant-spend or fake-singleton attack can be consensus-checked
+  on mainnet without spending a real signed UTXO. Regtest (where we control real
+  UTXOs and can deploy covenants freely) is the correct, zero-risk tool — and is
+  strictly stronger than a mainnet `testmempoolaccept` for these classes.
+- **R2 / forged-payment** remain proven-in-sim + by-source (CScriptNum) +
+  now-backed by the 2M-case differential fuzz. A full any-wallet covenant deploy
+  on regtest to spend-test them was judged disproportionate (the `rxd_sim` model
+  mirrors the compiled ASM, and the fuzz exercises the same logic at scale).
+
 ## Honest limitations of THIS audit
 
 - The REF-authenticity proof used a hand-built singleton tx, not the full fused
