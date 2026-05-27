@@ -108,15 +108,28 @@ class BtcBroadcaster(Protocol):
 
 @runtime_checkable
 class BtcFundingReader(Protocol):
-    """Read an HTLC funding output's on-chain amount + confirmation depth.
+    """Read BTC chain state the HTLC leg needs: funding amount, confirmation depth,
+    and the canonical txid of a raw tx.
 
     Duck-typed over a ``BtcDataSource``-like object. ``read_output_amount_sats``
     returns the value of ``(txid, vout)`` as committed on-chain (NOT a self-report),
     enforcing ``min_confirmations`` (raise/fail-closed if shallower).
+    ``confirmations`` is the symmetric confirmation-depth reader (mirrors
+    ``RadiantChainIO.confirmations``) the reorg gate consumes. ``txid_of`` resolves a
+    raw tx's canonical txid VIA THE NODE — never a local segwit parse (see the reorg
+    gate plan; the gated txid must be that of the exact bytes ``p`` was scraped from).
     """
 
     async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
         """Return the on-chain satoshi value of ``(txid, vout)`` at >= min_confirmations."""
+        ...
+
+    async def confirmations(self, txid: str) -> int:
+        """Return the confirmation depth of ``txid`` (0 if unconfirmed/unknown)."""
+        ...
+
+    async def txid_of(self, raw_tx: bytes) -> str:
+        """Resolve ``raw_tx``'s canonical txid via the node (NOT a local parse)."""
         ...
 
 
@@ -271,6 +284,23 @@ class BitcoinTaprootLeg:
     def scrape_secret(self, claim_tx_bytes: bytes, hashlock: bytes) -> bytes:
         """Scrape ``p`` from the maker's claim tx witness (pure; by sha256==H)."""
         return t.scrape_secret(claim_tx_bytes, hashlock)
+
+    # -- reorg gate: confirmation depth of the maker's claim (async) --------
+    async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
+        """Confirmation depth of the maker's BTC claim tx (the reorg gate's input).
+
+        The txid is resolved VIA THE NODE from the exact ``claim_tx_bytes`` ``p`` was
+        scraped from (never a local segwit parse) — so an attacker can't reveal ``p``
+        in a shallow tx while pointing the gate at a deep unrelated tx. Fail-closed:
+        any read/derivation error propagates (the coordinator then refuses to claim).
+        """
+        if not isinstance(claim_tx_bytes, (bytes, bytearray)) or len(claim_tx_bytes) == 0:
+            raise ValidationError("claim_tx_bytes must be non-empty bytes")
+        txid = await self.funding_reader.txid_of(bytes(claim_tx_bytes))
+        confs = await self.funding_reader.confirmations(txid)
+        if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
+            raise NetworkError("confirmations reader returned a non-negative-int depth; fail-closed")
+        return confs
 
     # -- chain-touching (async) ---------------------------------------------
     async def fund(self, terms) -> t.BtcHtlcLocator:

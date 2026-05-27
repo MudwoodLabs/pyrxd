@@ -30,10 +30,12 @@ from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_coordinator import (
     ESTIMATED_DEFAULT_MARGIN_BLOCKS,
     MAKER_SECRET_TAKER_LOCKS_BTC_FIRST,
+    ClaimFinality,
     CoordinatorConfig,
     MarginPolicy,
     SwapCoordinator,
     assert_timelock_margin,
+    assess_claim_finality,
     generate_secret,
     should_taker_refund_proactively,
 )
@@ -64,11 +66,15 @@ class FakeBtcLeg:
     builds a real witness embedding p, so ``scrape_secret`` works for real.
     """
 
-    def __init__(self, *, tamper_promised_spk: bool = False, fund_amount_delta: int = 0) -> None:
+    def __init__(
+        self, *, tamper_promised_spk: bool = False, fund_amount_delta: int = 0, claim_confs: int = 100
+    ) -> None:
         self.tamper_promised_spk = tamper_promised_spk
         # Simulate a buggy/malicious leg (or a mutated `terms`) that funds the HTLC
         # with a value != the negotiated btc_sats. Positive = overfund, negative = under.
         self.fund_amount_delta = fund_amount_delta
+        # Reorg gate: confirmation depth confirmations_of_claim reports. Default deep.
+        self.claim_confs = claim_confs
         self.calls: list[str] = []
         self.last_locator: t.BtcHtlcLocator | None = None
         self.claimed_with: bytes | None = None
@@ -112,6 +118,11 @@ class FakeBtcLeg:
     # Sync: pure byte-parse of the claim tx witness (no chain access).
     def scrape_secret(self, claim_tx_bytes: bytes, hashlock: bytes) -> bytes:
         return t.scrape_secret(claim_tx_bytes, hashlock)
+
+    async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
+        # Reorg gate input: default to a deep, reorg-safe claim. Tests that exercise
+        # WAIT/SQUEEZED set `claim_confs` to a shallow value.
+        return self.claim_confs
 
 
 class FakeRadiantLeg:
@@ -522,9 +533,11 @@ async def test_e2e_happy_path_completed():
     with pytest.raises(Exception):
         p_secret.unsafe_raw_bytes()  # zeroized
 
-    # 4. Taker scrapes p from the maker's real claim tx and claims the asset.
+    # 4. Taker scrapes p from the maker's real claim tx and claims the asset. The
+    # maker's BTC claim is deep (FakeBtcLeg.claim_confs default) and the t_rxd window
+    # has room, so the reorg gate returns SAFE.
     claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
-    rec = await coord.taker_scrape_and_claim_asset(claim_tx)
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
     assert rec.state is SwapState.COMPLETED
 
     # Right party ends whole: maker got the BTC (claim called), taker got the asset.
@@ -771,3 +784,184 @@ def test_config_rejects_bad_min_ref_confirmations():
         CoordinatorConfig(margin_policy=MarginPolicy.estimated(), min_ref_confirmations=-1)
     with pytest.raises(ValidationError):
         CoordinatorConfig(margin_policy=MarginPolicy.estimated(), min_ref_confirmations=True)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Reorg-finality gate (plan 2026-05-26, security-HIGH)
+# ---------------------------------------------------------------------------
+
+
+def test_margin_policy_rejects_zero_reorg_depth():
+    """A 0 reorg depth defeats the gate — rejected at construction."""
+    with pytest.raises(ValidationError, match="btc_claim_reorg_depth must be > 0"):
+        MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            btc_claim_reorg_depth=t.Timelock(0, t.TimeUnit.BLOCKS),
+        )
+    with pytest.raises(ValidationError, match="rxd_claim_burial must be > 0"):
+        MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            rxd_claim_burial=t.Timelock(0, t.TimeUnit.BLOCKS),
+        )
+
+
+def _policy(*, btc_depth=6, rxd_burial=6):
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        btc_claim_reorg_depth=t.Timelock(btc_depth, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(rxd_burial, t.TimeUnit.BLOCKS),
+    )
+
+
+def test_assess_claim_finality_safe():
+    # Deep BTC claim (10 >= 6) + roomy window: locked@1000, t_rxd=72 -> opens@1072,
+    # now=1000 -> 72 blocks left >= rxd_burial 6 -> SAFE.
+    out = assess_claim_finality(
+        btc_claim_confirmations=10,
+        now_rxd_height=1000,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+        policy=_policy(),
+    )
+    assert out is ClaimFinality.SAFE
+
+
+def test_assess_claim_finality_wait():
+    # Shallow BTC claim (1 < 6) but ample window: after waiting the remaining BTC
+    # depth there is still room to bury -> WAIT.
+    out = assess_claim_finality(
+        btc_claim_confirmations=1,
+        now_rxd_height=1000,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+        policy=_policy(),
+    )
+    assert out is ClaimFinality.WAIT
+
+
+def test_assess_claim_finality_squeezed_shallow_closing_window():
+    # Shallow claim AND window closing: locked@1000, t_rxd=10 -> opens@1010, now=1006
+    # -> 4 blocks left; after waiting btc depth there's no room to bury -> SQUEEZED.
+    out = assess_claim_finality(
+        btc_claim_confirmations=1,
+        now_rxd_height=1006,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(10, t.TimeUnit.BLOCKS),
+        policy=_policy(),
+    )
+    assert out is ClaimFinality.SQUEEZED
+
+
+def test_assess_claim_finality_squeezed_deep_but_no_room():
+    # Deep BTC claim but the window can't even fit our own burial -> SQUEEZED (don't
+    # claim into a window that closes before we bury).
+    out = assess_claim_finality(
+        btc_claim_confirmations=10,
+        now_rxd_height=1008,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(10, t.TimeUnit.BLOCKS),
+        policy=_policy(),
+    )
+    assert out is ClaimFinality.SQUEEZED
+
+
+def test_assess_claim_finality_fail_closed_on_bad_inputs():
+    for bad in (dict(btc_claim_confirmations=-1), dict(now_rxd_height=-1), dict(asset_locked_at_height=-1)):
+        kw = dict(
+            btc_claim_confirmations=10,
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=_policy(),
+        )
+        kw.update(bad)
+        with pytest.raises(ValidationError):
+            assess_claim_finality(**kw)
+    with pytest.raises(ValidationError):
+        assess_claim_finality(
+            btc_claim_confirmations=10, now_rxd_height=1000, asset_locked_at_height=1000, t_rxd=72, policy=_policy()
+        )  # type: ignore[arg-type]
+
+
+async def test_gate_safe_claims_asset():
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=10)
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with is not None  # asset actually claimed
+
+
+async def test_gate_wait_does_not_claim_and_stays_secret_revealed():
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=1)  # shallow
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
+    # FAIL-OPEN REGRESSION: a shallow BTC claim must NOT settle the asset.
+    assert rec.state is SwapState.SECRET_REVEALED
+    assert rxd.claimed_with is None  # asset NOT claimed
+
+
+async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=10, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=1)  # shallow
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    # Window closing (now near t_rxd maturity) + shallow -> SQUEEZED -> ASSET_VULNERABLE.
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1006, asset_locked_at_height=1000)
+    assert rec.state is SwapState.ASSET_VULNERABLE
+    assert rxd.claimed_with is None  # not auto-claimed
+    # The deliberate winner-take-all claim is a separate, explicit decision.
+    rec = await coord.taker_claim_asset_from_vulnerable(claim_tx)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with is not None
+
+
+async def test_gate_fail_closed_on_confs_read_error():
+    class ErrLeg(FakeBtcLeg):
+        async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
+            raise RuntimeError("node unreachable")
+
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = ErrLeg()
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    with pytest.raises(RuntimeError):  # propagates fail-closed; no claim
+        await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rxd.claimed_with is None
+
+
+async def test_claim_from_vulnerable_rejects_wrong_state():
+    _p, h = generate_secret()
+    terms = _terms(variant="rxd", hashlock=h)
+    coord = _coordinator(terms=terms)  # state NEGOTIATED, not ASSET_VULNERABLE
+    with pytest.raises(ValidationError, match="only valid from ASSET_VULNERABLE"):
+        await coord.taker_claim_asset_from_vulnerable(b"\x00")

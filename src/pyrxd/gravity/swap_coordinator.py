@@ -36,7 +36,8 @@ import hashlib
 import logging
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 
 from pyrxd.btc_wallet.taproot import (
     BtcHtlcLocator,
@@ -61,11 +62,15 @@ from .swap_state import (
 PersistHook = Callable[[SwapRecord], Awaitable[None]]
 
 __all__ = [
+    "ESTIMATED_BTC_CLAIM_REORG_DEPTH_BLOCKS",
     "ESTIMATED_DEFAULT_MARGIN_BLOCKS",
+    "ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS",
     "MAKER_SECRET_TAKER_LOCKS_BTC_FIRST",
+    "ClaimFinality",
     "MarginPolicy",
     "SwapCoordinator",
     "assert_timelock_margin",
+    "assess_claim_finality",
     "generate_secret",
     "should_taker_refund_proactively",
 ]
@@ -113,6 +118,18 @@ MAKER_SECRET_TAKER_LOCKS_BTC_FIRST = (  # nosec B105 — a role-invariant doc st
 # chains plus a stated reorg depth. DO NOT treat this as a finding.
 ESTIMATED_DEFAULT_MARGIN_BLOCKS = 36
 
+# ESTIMATED placeholder (test-only) for the BTC-claim reorg-finality depth: how many
+# confirmations the maker's BTC claim must reach before the taker relies on the
+# revealed ``p`` (reorg gate, plan 2026-05-26-feat-gravity-reorg-gate-plan.md). 6 is
+# the conventional Bitcoin reorg-safety depth; the real number is a measured policy
+# input. DO NOT treat this as a finding — a measured swap MUST supply its own.
+ESTIMATED_BTC_CLAIM_REORG_DEPTH_BLOCKS = 6
+
+# ESTIMATED placeholder (test-only) for the Radiant-claim burial depth: how many
+# confirmations the taker's OWN asset claim must reach to be reorg-safe, and the slack
+# for it to get included — both consumed by the squeeze check below.
+ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS = 6
+
 
 @dataclass(frozen=True)
 class MarginPolicy:
@@ -139,6 +156,17 @@ class MarginPolicy:
     block_interval_s: float
     is_measured: bool
     require_measured: bool = False
+    # Reorg gate (plan 2026-05-26). The maker's BTC claim must reach this depth before
+    # the taker relies on the revealed p; the taker's own Radiant claim must then bury
+    # ``rxd_claim_burial`` deep — both BEFORE t_rxd opens. Unit-tagged so the squeeze
+    # check normalises them alongside the margin. A measured policy MUST supply these
+    # (require_measured rejects the estimated defaults) and they must be > 0.
+    btc_claim_reorg_depth: Timelock = field(
+        default_factory=lambda: Timelock(ESTIMATED_BTC_CLAIM_REORG_DEPTH_BLOCKS, TimeUnit.BLOCKS)
+    )
+    rxd_claim_burial: Timelock = field(
+        default_factory=lambda: Timelock(ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS, TimeUnit.BLOCKS)
+    )
 
     def __post_init__(self) -> None:
         if not isinstance(self.margin, Timelock):
@@ -149,6 +177,14 @@ class MarginPolicy:
             raise ValidationError("MarginPolicy.is_measured must be bool")
         if not isinstance(self.require_measured, bool):
             raise ValidationError("MarginPolicy.require_measured must be bool")
+        for label, depth in (
+            ("btc_claim_reorg_depth", self.btc_claim_reorg_depth),
+            ("rxd_claim_burial", self.rxd_claim_burial),
+        ):
+            if not isinstance(depth, Timelock):
+                raise ValidationError(f"MarginPolicy.{label} must be a Timelock")
+            if depth.value <= 0:
+                raise ValidationError(f"MarginPolicy.{label} must be > 0 (a 0 reorg depth defeats the gate)")
         if self.require_measured and not self.is_measured:
             raise ValidationError(
                 "real-value mode (require_measured=True) requires a MEASURED margin; "
@@ -166,9 +202,32 @@ class MarginPolicy:
         )
 
     @classmethod
-    def measured(cls, *, margin: Timelock, block_interval_s: float) -> MarginPolicy:
-        """A measured policy for real-value mainnet swaps."""
-        return cls(margin=margin, block_interval_s=block_interval_s, is_measured=True, require_measured=True)
+    def measured(
+        cls,
+        *,
+        margin: Timelock,
+        block_interval_s: float,
+        btc_claim_reorg_depth: Timelock | None = None,
+        rxd_claim_burial: Timelock | None = None,
+    ) -> MarginPolicy:
+        """A measured policy for real-value mainnet swaps.
+
+        ``btc_claim_reorg_depth`` / ``rxd_claim_burial`` are the reorg gate's measured
+        inputs; if omitted they fall back to the ESTIMATED defaults (acceptable only
+        because a measured policy still carries the estimated reorg depths — supply
+        measured values for a real mainnet swap).
+        """
+        kwargs: dict = {
+            "margin": margin,
+            "block_interval_s": block_interval_s,
+            "is_measured": True,
+            "require_measured": True,
+        }
+        if btc_claim_reorg_depth is not None:
+            kwargs["btc_claim_reorg_depth"] = btc_claim_reorg_depth
+        if rxd_claim_burial is not None:
+            kwargs["rxd_claim_burial"] = rxd_claim_burial
+        return cls(**kwargs)
 
 
 def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolicy) -> None:
@@ -268,6 +327,101 @@ def should_taker_refund_proactively(
     # Act once we are within `safety_window_blocks` of that maturity.
     maturity = asset_locked_at_height + rxd_blocks
     return now_block_height >= (maturity - safety_window_blocks)
+
+
+# ---------------------------------------------------------------------------
+# Reorg-finality gate on the taker's asset claim (plan 2026-05-26, security-HIGH)
+# ---------------------------------------------------------------------------
+
+
+class ClaimFinality(Enum):
+    """The decision for whether the taker may claim the asset off the maker's BTC claim.
+
+    * ``SAFE`` — the maker's BTC claim is reorg-deep AND the remaining ``t_rxd``
+      window still admits the taker's own claim burying reorg-deep. Claim now.
+    * ``WAIT`` — the BTC claim is not yet deep enough, but the window has room to keep
+      waiting. Do NOT claim; retry later (the record stays SECRET_REVEALED).
+    * ``SQUEEZED`` — the BTC claim is shallow and the ``t_rxd`` window is closing: there
+      is no longer room to wait for a safe claim. This is the danger zone — the FSM
+      goes ASSET_VULNERABLE and a deliberate policy (best-effort winner-take-all claim
+      vs abandon) takes over. Never a silent claim.
+    """
+
+    SAFE = "safe"
+    WAIT = "wait"
+    SQUEEZED = "squeezed"
+
+
+def assess_claim_finality(
+    *,
+    btc_claim_confirmations: int,
+    now_rxd_height: int,
+    asset_locked_at_height: int,
+    t_rxd: Timelock,
+    policy: MarginPolicy,
+) -> ClaimFinality:
+    """Decide SAFE / WAIT / SQUEEZED for the taker's asset claim — fail-closed, pure.
+
+    Two serial finality requirements share the ``t_rxd`` deadline (security review):
+      1. the maker's BTC claim must reach ``policy.btc_claim_reorg_depth`` (so ``p`` is
+         reorg-safe), THEN
+      2. the taker's own Radiant claim must bury ``policy.rxd_claim_burial`` deep,
+      both BEFORE ``t_rxd`` (the maker's CSV refund) opens at
+      ``asset_locked_at_height + t_rxd``.
+
+    A bare depth gate without the deadline check is a NET REGRESSION: it can force the
+    taker to choose between an unsafe early claim and losing the asset to the maker's
+    refund. So this returns WAIT only while there is genuinely room to wait, and
+    SQUEEZED (→ ASSET_VULNERABLE) once there is not.
+
+    Raises ``ValidationError`` on any un-evaluable input (never assumes "plenty of
+    time"). All depths normalised to Radiant BLOCKS via ``policy.block_interval_s``.
+    """
+    if not isinstance(policy, MarginPolicy):
+        raise ValidationError("assess_claim_finality requires a MarginPolicy")
+    for label, val in (
+        ("btc_claim_confirmations", btc_claim_confirmations),
+        ("now_rxd_height", now_rxd_height),
+        ("asset_locked_at_height", asset_locked_at_height),
+    ):
+        if not isinstance(val, int) or isinstance(val, bool) or val < 0:
+            raise ValidationError(f"{label} must be a non-negative int (fail-closed)")
+    if not isinstance(t_rxd, Timelock):
+        raise ValidationError("assess_claim_finality requires a Timelock t_rxd")
+    try:
+        rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
+        btc_depth_rxd = policy.btc_claim_reorg_depth.normalize_to(
+            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
+        ).value
+        rxd_burial = policy.rxd_claim_burial.normalize_to(
+            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
+        ).value
+        btc_depth_confs = policy.btc_claim_reorg_depth.normalize_to(
+            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
+        ).value
+    except ValidationError:
+        raise
+    except Exception as exc:  # pragma: no cover - normalize_to only raises ValidationError
+        raise ValidationError(f"could not normalise reorg depths to blocks: {exc}") from exc
+
+    # The maker's CSV refund opens here (Radiant blocks).
+    refund_opens_at = asset_locked_at_height + rxd_blocks
+    # To claim SAFELY from now we still need: bury our own claim rxd_burial deep,
+    # which (if the BTC claim weren't yet deep) would also require waiting out the
+    # remaining BTC depth first. The binding deadline is refund_opens_at.
+    blocks_left = refund_opens_at - now_rxd_height
+
+    if btc_claim_confirmations >= btc_depth_confs:
+        # BTC claim is reorg-safe. We may claim iff our own burial still fits the window.
+        if blocks_left >= rxd_burial:
+            return ClaimFinality.SAFE
+        return ClaimFinality.SQUEEZED
+    # BTC claim still shallow. We can WAIT only if, after the remaining BTC depth
+    # elapses, there is STILL room to bury our claim before the refund opens.
+    btc_blocks_remaining = btc_depth_confs - btc_claim_confirmations
+    if blocks_left - btc_depth_rxd >= rxd_burial and btc_blocks_remaining > 0:
+        return ClaimFinality.WAIT
+    return ClaimFinality.SQUEEZED
 
 
 # ---------------------------------------------------------------------------
@@ -586,19 +740,96 @@ class SwapCoordinator:
         return self.record
 
     # -- taker scrapes p from the claim tx and claims the asset (step 5) ----
-    async def taker_scrape_and_claim_asset(self, maker_claim_tx_bytes: bytes) -> SwapRecord:
-        """Scrape ``p`` from the maker's BTC claim tx and claim the Radiant asset.
+    async def taker_scrape_and_claim_asset(
+        self,
+        maker_claim_tx_bytes: bytes,
+        *,
+        now_rxd_height: int,
+        asset_locked_at_height: int,
+    ) -> SwapRecord:
+        """Scrape ``p`` and claim the asset — gated on the maker's BTC-claim finality.
 
         Scraping is by ``sha256(candidate) == H`` over the witness pushes (never by
-        offset). The coordinator RE-verifies ``sha256(p) == H`` before firing the
-        Radiant claim — a scraped value that does not open H is rejected.
+        offset); the coordinator RE-verifies ``sha256(p) == H`` first — a scraped
+        value that does not open H is rejected.
 
-        ``scrape_secret`` is a pure byte-parse (sync). The Radiant claim broadcasts,
-        so it is awaited and the COMPLETED state persisted under shield.
+        **Reorg gate (security-HIGH, plan 2026-05-26).** The taker must NOT claim the
+        asset off a not-yet-final BTC claim: a reorg of that claim after ``p`` is
+        public reintroduces one-sided loss. Before firing the Radiant claim we read
+        the maker's BTC-claim confirmation depth and run the ``t_rxd``-squeeze
+        assessment (:func:`assess_claim_finality`). Three outcomes:
+
+        * **SAFE** — claim now; advance to COMPLETED (the happy path).
+        * **WAIT** — the BTC claim is too shallow but the window has room: do NOT
+          claim, do NOT advance; the record stays SECRET_REVEALED and the caller
+          retries later. (No state is stranded — the gate is before any advance.)
+        * **SQUEEZED** — shallow claim AND the ``t_rxd`` window is closing: advance to
+          ASSET_VULNERABLE (logged loudly) and STOP. The caller's policy then decides
+          a best-effort winner-take-all claim via
+          :meth:`taker_claim_asset_from_vulnerable` vs abandoning — never a silent
+          claim off a shallow reveal.
+
+        ``now_rxd_height`` / ``asset_locked_at_height`` feed the squeeze (the Radiant
+        clock; ``asset_locked_at_height`` is where the maker locked the covenant).
+        ``scrape_secret`` is sync; the depth read + Radiant claim are awaited.
         """
         if self.record.state is not SwapState.SECRET_REVEALED:
             raise ValidationError(
                 f"taker_scrape_and_claim_asset only valid from SECRET_REVEALED, not {self.record.state.value}"
+            )
+        # Cheap, no-network checks first: a tx that doesn't even contain p is rejected
+        # before any RPC round-trip.
+        p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
+        if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+            raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
+
+        # Reorg gate: read the maker's BTC-claim depth (fail-closed on any error) and
+        # assess against the t_rxd window.
+        btc_confs = await self.btc_leg.confirmations_of_claim(maker_claim_tx_bytes)
+        finality = assess_claim_finality(
+            btc_claim_confirmations=btc_confs,
+            now_rxd_height=now_rxd_height,
+            asset_locked_at_height=asset_locked_at_height,
+            t_rxd=self.record.terms.t_rxd,
+            policy=self.config.margin_policy,
+        )
+        if finality is ClaimFinality.WAIT:
+            logger.info(
+                "reorg gate WAIT: maker BTC claim at %d confs (< required reorg depth); "
+                "window still has room — not claiming yet, retry later",
+                btc_confs,
+            )
+            return self.record  # unchanged; stays SECRET_REVEALED
+        if finality is ClaimFinality.SQUEEZED:
+            logger.warning(
+                "reorg gate SQUEEZED: maker BTC claim at %d confs and t_rxd window closing — "
+                "advancing to ASSET_VULNERABLE; a winner-take-all claim is now a deliberate "
+                "policy decision (taker_claim_asset_from_vulnerable), not automatic",
+                btc_confs,
+            )
+            self._advance(SwapEvent.TAKER_OFFLINE_OR_PINNED)
+            await self._persist_record(self.record, shield=True)
+            return self.record
+
+        # SAFE: the BTC claim is reorg-deep and our own burial still fits the window.
+        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
+    # -- deliberate winner-take-all claim from the SQUEEZED/ASSET_VULNERABLE state --
+    async def taker_claim_asset_from_vulnerable(self, maker_claim_tx_bytes: bytes) -> SwapRecord:
+        """Best-effort asset claim from ASSET_VULNERABLE — an EXPLICIT policy decision.
+
+        Only valid from ASSET_VULNERABLE (reached when the reorg gate found the swap
+        SQUEEZED). This is winner-take-all: the taker races to claim the asset before
+        the maker's ``t_rxd`` CSV refund lands, accepting the residual reorg risk that
+        the gate flagged. It is a CONSCIOUS choice the caller makes after the gate
+        refused the automatic SAFE claim — never invoked silently.
+        """
+        if self.record.state is not SwapState.ASSET_VULNERABLE:
+            raise ValidationError(
+                f"taker_claim_asset_from_vulnerable only valid from ASSET_VULNERABLE, not {self.record.state.value}"
             )
         p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:

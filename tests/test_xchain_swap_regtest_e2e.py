@@ -280,6 +280,15 @@ class _BtcFundingReader:
             raise NetworkError("insufficient confirmations")
         return round(info["vout"][vout]["value"] * 1e8)
 
+    async def confirmations(self, txid) -> int:
+        info = self._n.btc("getrawtransaction", str(txid), "true")
+        return int(info.get("confirmations", 0) or 0)
+
+    async def txid_of(self, raw_tx: bytes) -> str:
+        # Node-authoritative txid (never a local segwit parse).
+        decoded = self._n.btc("decoderawtransaction", bytes(raw_tx).hex())
+        return str(decoded["txid"])
+
 
 # --------------------------------------------------------------------------- RXD tx helpers
 
@@ -373,17 +382,20 @@ class _LockedSwap:
         self.rxd_locked_at = rxd_locked_at
 
 
-async def _setup_locked_swap(nodes: _Nodes) -> _LockedSwap:
+async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _LockedSwap:
     """Fund the BTC HTLC + the RXD covenant and drive the coordinator to BOTH_LOCKED.
 
-    Shared by the happy path and the failure paths — all four terminal scenarios
-    branch from the same locked state.
+    Shared by the happy path and the failure paths — all terminal scenarios branch
+    from the same locked state. ``t_rxd_blocks`` is per-scenario (see below).
     """
     p_secret = SecretBytes(os.urandom(32))
     h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
     btc_sats = rxd_photons = 100_000
-    t_btc = bt.Timelock(40, bt.TimeUnit.BLOCKS)  # t_btc - t_rxd >= 36 (ESTIMATED margin)
-    t_rxd = bt.Timelock(3, bt.TimeUnit.BLOCKS)
+    # t_rxd_blocks varies by scenario: small (fast CSV maturity) for the refund paths,
+    # large (window survives the reorg-gate wait + mined harness blocks) for the happy
+    # path. t_btc keeps the >= 36-block ESTIMATED margin above t_rxd in either case.
+    t_rxd = bt.Timelock(t_rxd_blocks, bt.TimeUnit.BLOCKS)
+    t_btc = bt.Timelock(t_rxd_blocks + 40, bt.TimeUnit.BLOCKS)
 
     maker_btc = coincurve.PrivateKey(os.urandom(32))
     taker_btc_kp = generate_keypair("bcrt")
@@ -489,7 +501,9 @@ async def _setup_locked_swap(nodes: _Nodes) -> _LockedSwap:
 class TestCrossChainSwap:
     async def test_happy_path_completes(self, nodes):
         """Maker claims BTC (reveals p), taker scrapes p and claims the RXD asset."""
-        s = await _setup_locked_swap(nodes)
+        # Large t_rxd so the reorg-gate wait (bury the BTC claim) + the harness's own
+        # mined RXD blocks still leave the t_rxd window open -> the gate returns SAFE.
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=60)
         coord = s.coord
 
         # 3. Maker claims the BTC, revealing p on the Bitcoin chain.
@@ -497,14 +511,54 @@ class TestCrossChainSwap:
         assert rec.state is SwapState.SECRET_REVEALED
         claim_raw = list(s.broadcaster.last_raw.values())[-1]
 
-        # 4. Taker scrapes p from the BTC claim and claims the RXD asset.
-        rec = await coord.taker_scrape_and_claim_asset(claim_raw)
+        # Reorg gate: bury the maker's BTC claim to the policy's reorg-safe depth
+        # before the taker relies on the revealed p (t_rxd window has ample room).
+        nodes.btc_mine(coord.config.margin_policy.btc_claim_reorg_depth.value)
+
+        # 4. Taker scrapes p from the BTC claim and claims the RXD asset (SAFE).
+        now = int(nodes.rxd("getblockcount"))
+        rec = await coord.taker_scrape_and_claim_asset(
+            claim_raw, now_rxd_height=now, asset_locked_at_height=s.rxd_locked_at
+        )
         assert rec.state is SwapState.COMPLETED
 
         cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
         assert nodes.rxd("gettxout", cov_txid, "0") in (None, ""), (
             "RXD covenant should be spent after the taker's claim"
         )
+
+    async def test_reorg_gate_waits_for_shallow_btc_claim_then_claims_when_deep(self, nodes):
+        """Reorg gate on real nodes: a shallow maker BTC claim returns WAIT (no asset
+        claim, state unchanged); burying it to the reorg-safe depth flips it to SAFE
+        and the asset settles. This is the D4 protection against a BTC-claim reorg
+        after p is public."""
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=60)
+        coord = s.coord
+        depth = coord.config.margin_policy.btc_claim_reorg_depth.value
+
+        # Maker claims BTC. The broadcaster mines 1 block, so the claim is ~1 conf —
+        # shallower than the reorg-safe depth.
+        rec = await coord.maker_claims_btc(s.p_secret)
+        assert rec.state is SwapState.SECRET_REVEALED
+        claim_raw = list(s.broadcaster.last_raw.values())[-1]
+
+        # WAIT: shallow claim, but the t_rxd window still has room -> do NOT claim;
+        # the record stays SECRET_REVEALED (retryable).
+        now = int(nodes.rxd("getblockcount"))
+        rec = await coord.taker_scrape_and_claim_asset(
+            claim_raw, now_rxd_height=now, asset_locked_at_height=s.rxd_locked_at
+        )
+        assert rec.state is SwapState.SECRET_REVEALED, "shallow BTC claim must not settle the asset"
+
+        # Bury the BTC claim to the reorg-safe depth; now the gate returns SAFE.
+        nodes.btc_mine(depth)
+        now = int(nodes.rxd("getblockcount"))
+        rec = await coord.taker_scrape_and_claim_asset(
+            claim_raw, now_rxd_height=now, asset_locked_at_height=s.rxd_locked_at
+        )
+        assert rec.state is SwapState.COMPLETED
+        cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
+        assert nodes.rxd("gettxout", cov_txid, "0") in (None, ""), "asset should settle once the BTC claim is deep"
 
     async def test_mutual_refund_when_maker_never_claims(self, nodes):
         """The guaranteed-safe failure: maker never claims, both timeouts elapse, both

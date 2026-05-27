@@ -75,9 +75,10 @@ class FakeBroadcaster:
 class FakeFundingReader:
     """Returns a configured on-chain amount; records the conf threshold it was asked for."""
 
-    def __init__(self, *, amount_sats: int = 100_000, raise_shallow: bool = False) -> None:
+    def __init__(self, *, amount_sats: int = 100_000, raise_shallow: bool = False, claim_confs: int = 100) -> None:
         self.amount_sats = amount_sats
         self.raise_shallow = raise_shallow
+        self.claim_confs = claim_confs
         self.asked_min_confs: int | None = None
 
     async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
@@ -85,6 +86,13 @@ class FakeFundingReader:
         if self.raise_shallow:
             raise NetworkError(f"output has 0 confirmations, required {min_confirmations}")
         return self.amount_sats
+
+    async def confirmations(self, txid: str) -> int:
+        return self.claim_confs
+
+    async def txid_of(self, raw_tx: bytes) -> str:
+        # Node-authoritative txid; the fake just hashes deterministically.
+        return hashlib.sha256(bytes(raw_tx)).hexdigest()
 
 
 def _leg(
@@ -465,3 +473,31 @@ def test_scrape_secret_passthrough():
         aux_rand=os.urandom(32),
     )
     assert leg.scrape_secret(claim_tx, h) == p
+
+
+# --------------------------------------------------------------------------- reorg gate: confirmations_of_claim
+
+
+async def test_confirmations_of_claim_returns_depth():
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    reader = FakeFundingReader(claim_confs=7)
+    leg = _leg(taker_kp=taker, maker_kp=maker, reader=reader)
+    assert await leg.confirmations_of_claim(b"\x02\x00rawclaimtx") == 7
+
+
+async def test_confirmations_of_claim_rejects_empty_bytes():
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    leg = _leg(taker_kp=taker, maker_kp=maker)
+    with pytest.raises(ValidationError, match="non-empty bytes"):
+        await leg.confirmations_of_claim(b"")
+
+
+async def test_confirmations_of_claim_fail_closed_on_bad_depth():
+    class BadReader(FakeFundingReader):
+        async def confirmations(self, txid: str) -> int:
+            return -1  # nonsense depth
+
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    leg = _leg(taker_kp=taker, maker_kp=maker, reader=BadReader())
+    with pytest.raises(NetworkError, match="non-negative-int depth"):
+        await leg.confirmations_of_claim(b"\x02\x00rawclaimtx")
