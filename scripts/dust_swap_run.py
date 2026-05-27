@@ -352,7 +352,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--btc-refund-payout", default="", help="scriptPubKey hex the taker's BTC refund pays out to")
     ap.add_argument("--t-rxd-blocks", type=int, default=20)
     ap.add_argument("--rxd-network", default="bc", help="RXD audit-gate network tag")
-    ap.add_argument("--rxd-wallet", default="gravity")
+    ap.add_argument("--rxd-wallet", default="", help="RXD wallet name on tr; empty = the single loaded wallet")
     ap.add_argument("--margin-sample-blocks", type=int, default=144)
     ap.add_argument("--btc-tail-percentile", type=float, default=90.0)
     ap.add_argument("--btc-claim-reorg-depth", type=int, default=2)

@@ -134,11 +134,9 @@ class SshTrRadiantClient:
         this ever lands on a hot async path, wrap it in asyncio.to_thread like _run).
         Mirrors the regtest _FeeSource: pick the biggest wallet UTXO, dumpprivkey it,
         build+sign a 1-in/2-out tx (fee output + change) with the repo Transaction
-        builder, broadcast, return the fee output as input 0. Requires a wallet
-        (rpcwallet set) with spendable funds.
+        builder, broadcast, return the fee output as input 0. Targets the wallet named
+        by rpcwallet, or the single loaded (often unnamed) wallet if rpcwallet is empty.
         """
-        if not self._rpcwallet:
-            raise RuntimeError("carve_fee_input requires rpcwallet set on the client")
         from pyrxd.gravity.htlc_spend import FeeInput
         from pyrxd.keys import PrivateKey
         from pyrxd.script.script import Script
