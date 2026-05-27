@@ -124,3 +124,68 @@ class SshTrRadiantClient:
                 UtxoRecord(tx_hash=u["txid"], tx_pos=int(u["vout"]), value=round(u["amount"] * 1e8), height=confs)
             )
         return out
+
+    # -- fee-UTXO carving (the RXD covenant spend needs a separate plain fee input) ---
+    def carve_fee_input(self, amount_photons: int, fee_photons: int = 2_000_000):
+        """Carve a plain-P2PKH fee UTXO from the wallet -> a gravity.htlc_spend.FeeInput.
+
+        SYNCHRONOUS (called from FeeSource.next_fee_input, which the leg invokes inside
+        an awaited spend — the ssh calls block, but the carve is a quick wallet op; if
+        this ever lands on a hot async path, wrap it in asyncio.to_thread like _run).
+        Mirrors the regtest _FeeSource: pick the biggest wallet UTXO, dumpprivkey it,
+        build+sign a 1-in/2-out tx (fee output + change) with the repo Transaction
+        builder, broadcast, return the fee output as input 0. Requires a wallet
+        (rpcwallet set) with spendable funds.
+        """
+        if not self._rpcwallet:
+            raise RuntimeError("carve_fee_input requires rpcwallet set on the client")
+        from pyrxd.gravity.htlc_spend import FeeInput
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.script import Script
+        from pyrxd.script.type import encode_pushdata, to_unlock_script_template
+        from pyrxd.security.types import Hex20
+        from pyrxd.transaction.transaction import Transaction
+        from pyrxd.transaction.transaction_input import TransactionInput
+        from pyrxd.transaction.transaction_output import TransactionOutput
+
+        utxos = self._run_sync("listunspent", "1", "9999999")
+        if not isinstance(utxos, list) or not utxos:
+            raise RuntimeError("no spendable wallet UTXOs to carve a fee input")
+        u = max(utxos, key=lambda x: x["amount"])
+        wif = str(self._run_sync("dumpprivkey", u["address"]))
+        key = PrivateKey(wif)
+        pkh = bytes(Hex20(key.public_key().hash160()))
+        spk = bytes.fromhex(u["scriptPubKey"])
+        in_sats = round(u["amount"] * 1e8)
+        change = in_sats - amount_photons - fee_photons
+        if change <= 546:
+            raise RuntimeError(f"selected UTXO too small to carve {amount_photons} + fee {fee_photons}")
+
+        def _src(txid, vout, s, v):
+            outs = [TransactionOutput(Script(b"\x00"), 0) for _ in range(vout)]
+            outs.append(TransactionOutput(Script(s), v))
+            tx = Transaction(tx_inputs=[], tx_outputs=outs)
+            tx.txid = lambda: txid  # type: ignore[method-assign]
+            return tx
+
+        def _unlock(tx, idx):
+            inp = tx.inputs[idx]
+            sig = key.sign(tx.preimage(idx))
+            return Script(encode_pushdata(sig + inp.sighash.to_bytes(1, "little")) + encode_pushdata(key.public_key().serialize()))
+
+        fin = TransactionInput(
+            source_transaction=_src(u["txid"], u["vout"], spk, in_sats), source_txid=u["txid"],
+            source_output_index=u["vout"], unlocking_script_template=to_unlock_script_template(_unlock, lambda: 110),
+        )
+        fin.satoshis = in_sats
+        fin.locking_script = Script(spk)
+        out_spk = b"\x76\xa9\x14" + pkh + b"\x88\xac"
+        tx = Transaction(
+            tx_inputs=[fin],
+            tx_outputs=[TransactionOutput(Script(out_spk), amount_photons), TransactionOutput(Script(out_spk), change)],
+        )
+        tx.sign()
+        txid = self._run_sync("sendrawtransaction", tx.serialize().hex())
+        if not isinstance(txid, str):
+            raise RuntimeError("fee carve broadcast did not return a txid")
+        return FeeInput(txid=txid, vout=0, value=amount_photons, scriptpubkey=out_spk, wif=wif)
