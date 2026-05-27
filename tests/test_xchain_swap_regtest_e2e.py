@@ -1,15 +1,23 @@
 """Coordinator-driven cross-chain HTLC swap on TWO real regtest nodes (T7 capstone).
 
 The end-to-end proof that the production :class:`SwapCoordinator` drives a complete
-BTC<->RXD atomic swap across REAL consensus on both chains — not fakes:
+BTC<->RXD atomic swap across REAL consensus on both chains — not fakes. All paths
+branch from the same BOTH_LOCKED state (``_setup_locked_swap``):
 
   taker_funds_btc            -> NEGOTIATED -> BTC_LOCKED   (BtcLeg funds P2TR HTLC)
   post_asset_lock_revalidate -> BOTH_LOCKED                (maker locks RXD covenant;
                                                             RadiantLeg locates it,
                                                             coordinator re-validates SPK)
-  maker_claims_btc           -> SECRET_REVEALED            (maker claims BTC, reveals p)
-  taker_scrape_and_claim_asset -> COMPLETED                (taker scrapes p from the BTC
-                                                            claim, claims the RXD covenant)
+
+* HAPPY PATH: maker_claims_btc -> SECRET_REVEALED (reveals p); then
+  taker_scrape_and_claim_asset -> COMPLETED (scrapes p, claims the RXD covenant).
+* MUTUAL REFUND (maker never claims): both CSV timeouts elapse -> mutual_refund
+  refunds BOTH legs -> MUTUAL_REFUND. No one-sided loss.
+* MAKER STALL: taker proactively refunds the RXD asset via CSV before relying on the
+  swap -> ASSET_REFUNDED_TAKER_ACTS. Taker never loses both.
+
+These prove the swap is safe whether it completes OR fails — the FSM's terminal
+paths all settle correctly on real consensus.
 
 Both legs hit real nodes via thin shims (the production legs are unchanged):
 * BtcLeg -> bitcoind regtest (BtcCliBroadcaster + BtcCliFundingReader).
@@ -349,114 +357,189 @@ class _Seen:
         self._s.add(bytes(h))
 
 
-# --------------------------------------------------------------------------- the swap
+# --------------------------------------------------------------------------- swap setup
+
+
+class _LockedSwap:
+    """A swap driven to BOTH_LOCKED on both real chains, ready for any terminal path."""
+
+    def __init__(self, *, coord, cov, p_secret, broadcaster, t_btc, t_rxd, rxd_locked_at):
+        self.coord = coord
+        self.cov = cov
+        self.p_secret = p_secret
+        self.broadcaster = broadcaster
+        self.t_btc = t_btc
+        self.t_rxd = t_rxd
+        self.rxd_locked_at = rxd_locked_at
+
+
+async def _setup_locked_swap(nodes: _Nodes) -> _LockedSwap:
+    """Fund the BTC HTLC + the RXD covenant and drive the coordinator to BOTH_LOCKED.
+
+    Shared by the happy path and the failure paths — all four terminal scenarios
+    branch from the same locked state.
+    """
+    p_secret = SecretBytes(os.urandom(32))
+    h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
+    btc_sats = rxd_photons = 100_000
+    t_btc = bt.Timelock(40, bt.TimeUnit.BLOCKS)  # t_btc - t_rxd >= 36 (ESTIMATED margin)
+    t_rxd = bt.Timelock(3, bt.TimeUnit.BLOCKS)
+
+    maker_btc = coincurve.PrivateKey(os.urandom(32))
+    taker_btc_kp = generate_keypair("bcrt")
+    claim_xo = coincurve.PublicKeyXOnly.from_secret(maker_btc.secret).format()
+    refund_xo = coincurve.PublicKeyXOnly.from_secret(bytes(taker_btc_kp._privkey.unsafe_raw_bytes())).format()
+
+    taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
+    taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
+    maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
+    cov = build_htlc_covenant_rxd(
+        amount=rxd_photons, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
+    )
+
+    terms = NegotiatedTerms(
+        hashlock=h,
+        btc_sats=btc_sats,
+        radiant_amount=rxd_photons,
+        t_btc=t_btc,
+        t_rxd=t_rxd,
+        asset_variant="rxd",
+        genesis_ref=b"",
+        taker_dest_hash=cov.expected_taker_hash,
+        maker_dest_hash=cov.expected_maker_hash,
+        btc_claim_pubkey_xonly=claim_xo,
+        btc_refund_pubkey_xonly=refund_xo,
+    )
+
+    # Fund the taker's BTC p2wpkh from the bitcoind wallet (no dumpprivkey needed).
+    nodes.btc("sendtoaddress", taker_btc_kp.p2wpkh_address, "0.01", wallet="btcw")
+    nodes.btc_mine(1)
+    bu = nodes.btc("scantxoutset", "start", json.dumps([{"desc": f"addr({taker_btc_kp.p2wpkh_address})"}]))["unspents"][
+        0
+    ]
+    funding_utxo = BtcUtxo(txid=bu["txid"], vout=int(bu["vout"]), value=round(bu["amount"] * 1e8))
+
+    broadcaster = _BtcBroadcaster(nodes)
+    maker_payout = bytes.fromhex(
+        nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
+    )
+    taker_payout = bytes.fromhex(
+        nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
+    )
+    btc_leg = BitcoinTaprootLeg(
+        network="bcrt",
+        taker_keypair=taker_btc_kp,
+        funding_utxo=funding_utxo,
+        maker_claim_pubkey_xonly=claim_xo,
+        broadcaster=broadcaster,
+        funding_reader=_BtcFundingReader(nodes),
+        refund_to_scriptpubkey=taker_payout,
+        claim_to_scriptpubkey=maker_payout,
+        fee_sats=2_000,
+        min_confirmations=1,
+        funding_input_type="p2wpkh",
+        maker_claim_privkey=maker_btc.secret,
+    )
+
+    rxd_client = _RadiantCliClient(nodes)
+    rxd_client.register_spk(cov.funded_spk)
+    rxd_leg = RadiantCovenantLeg(
+        network="bcrt",
+        taker_pkh=taker_pkh,
+        maker_pkh=maker_pkh,
+        chain_io=RadiantChainIO(rxd_client),
+        fee_source=_FeeSource(nodes),
+        min_confirmations=1,
+    )
+
+    coord = SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        btc_leg=btc_leg,
+        radiant_leg=rxd_leg,
+        indexer=None,
+        seen_store=_Seen(),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated()),
+    )
+
+    # 1. Taker funds the BTC HTLC.
+    rec = await coord.taker_funds_btc(terms)
+    assert rec.state is SwapState.BTC_LOCKED
+    assert rec.btc_locator.amount_sats == btc_sats
+
+    # 2. Maker locks the RXD asset; taker re-validates the on-chain covenant SPK.
+    rxd_locked_at = int(nodes.rxd("getblockcount"))
+    _rxd_pay(nodes, cov.funded_spk, rxd_photons)
+    rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
+    assert rec.state is SwapState.BOTH_LOCKED
+
+    return _LockedSwap(
+        coord=coord,
+        cov=cov,
+        p_secret=p_secret,
+        broadcaster=broadcaster,
+        t_btc=t_btc,
+        t_rxd=t_rxd,
+        rxd_locked_at=rxd_locked_at,
+    )
+
+
+# --------------------------------------------------------------------------- the swaps
 
 
 class TestCrossChainSwap:
-    async def test_coordinator_drives_full_btc_rxd_swap_to_completed(self, nodes):
-        p_secret = SecretBytes(os.urandom(32))
-        p = p_secret.unsafe_raw_bytes()
-        h = hashlib.sha256(p).digest()
-        btc_sats = rxd_photons = 100_000
-        t_btc = bt.Timelock(40, bt.TimeUnit.BLOCKS)  # t_btc - t_rxd >= 36 (ESTIMATED margin)
-        t_rxd = bt.Timelock(3, bt.TimeUnit.BLOCKS)
-
-        maker_btc = coincurve.PrivateKey(os.urandom(32))
-        taker_btc_kp = generate_keypair("bcrt")
-        claim_xo = coincurve.PublicKeyXOnly.from_secret(maker_btc.secret).format()
-        refund_xo = coincurve.PublicKeyXOnly.from_secret(bytes(taker_btc_kp._privkey.unsafe_raw_bytes())).format()
-
-        taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
-        taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
-        maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
-        cov = build_htlc_covenant_rxd(
-            amount=rxd_photons, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
-        )
-
-        terms = NegotiatedTerms(
-            hashlock=h,
-            btc_sats=btc_sats,
-            radiant_amount=rxd_photons,
-            t_btc=t_btc,
-            t_rxd=t_rxd,
-            asset_variant="rxd",
-            genesis_ref=b"",
-            taker_dest_hash=cov.expected_taker_hash,
-            maker_dest_hash=cov.expected_maker_hash,
-            btc_claim_pubkey_xonly=claim_xo,
-            btc_refund_pubkey_xonly=refund_xo,
-        )
-
-        # Fund the taker's BTC p2wpkh from the bitcoind wallet (no dumpprivkey needed).
-        nodes.btc("sendtoaddress", taker_btc_kp.p2wpkh_address, "0.01", wallet="btcw")
-        nodes.btc_mine(1)
-        scan = nodes.btc("scantxoutset", "start", json.dumps([{"desc": f"addr({taker_btc_kp.p2wpkh_address})"}]))
-        bu = scan["unspents"][0]
-        funding_utxo = BtcUtxo(txid=bu["txid"], vout=int(bu["vout"]), value=round(bu["amount"] * 1e8))
-
-        broadcaster = _BtcBroadcaster(nodes)
-        maker_payout = bytes.fromhex(
-            nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
-        )
-        taker_payout = bytes.fromhex(
-            nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
-        )
-        btc_leg = BitcoinTaprootLeg(
-            network="bcrt",
-            taker_keypair=taker_btc_kp,
-            funding_utxo=funding_utxo,
-            maker_claim_pubkey_xonly=claim_xo,
-            broadcaster=broadcaster,
-            funding_reader=_BtcFundingReader(nodes),
-            refund_to_scriptpubkey=taker_payout,
-            claim_to_scriptpubkey=maker_payout,
-            fee_sats=2_000,
-            min_confirmations=1,
-            funding_input_type="p2wpkh",
-            maker_claim_privkey=maker_btc.secret,
-        )
-
-        rxd_client = _RadiantCliClient(nodes)
-        rxd_client.register_spk(cov.funded_spk)
-        rxd_leg = RadiantCovenantLeg(
-            network="bcrt",
-            taker_pkh=taker_pkh,
-            maker_pkh=maker_pkh,
-            chain_io=RadiantChainIO(rxd_client),
-            fee_source=_FeeSource(nodes),
-            min_confirmations=1,
-        )
-
-        coord = SwapCoordinator(
-            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
-            btc_leg=btc_leg,
-            radiant_leg=rxd_leg,
-            indexer=None,
-            seen_store=_Seen(),
-            config=CoordinatorConfig(margin_policy=MarginPolicy.estimated()),
-        )
-
-        # 1. Taker funds the BTC HTLC.
-        rec = await coord.taker_funds_btc(terms)
-        assert rec.state is SwapState.BTC_LOCKED
-        assert rec.btc_locator.amount_sats == btc_sats
-
-        # 2. Maker locks the RXD asset; taker re-validates the on-chain covenant SPK.
-        _rxd_pay(nodes, cov.funded_spk, rxd_photons)
-        rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
-        assert rec.state is SwapState.BOTH_LOCKED
+    async def test_happy_path_completes(self, nodes):
+        """Maker claims BTC (reveals p), taker scrapes p and claims the RXD asset."""
+        s = await _setup_locked_swap(nodes)
+        coord = s.coord
 
         # 3. Maker claims the BTC, revealing p on the Bitcoin chain.
-        rec = await coord.maker_claims_btc(p_secret)
+        rec = await coord.maker_claims_btc(s.p_secret)
         assert rec.state is SwapState.SECRET_REVEALED
-        claim_raw = list(broadcaster.last_raw.values())[-1]
+        claim_raw = list(s.broadcaster.last_raw.values())[-1]
 
         # 4. Taker scrapes p from the BTC claim and claims the RXD asset.
         rec = await coord.taker_scrape_and_claim_asset(claim_raw)
         assert rec.state is SwapState.COMPLETED
 
-        # The Radiant covenant UTXO is spent — the swap settled on both chains.
         cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
         assert nodes.rxd("gettxout", cov_txid, "0") in (None, ""), (
             "RXD covenant should be spent after the taker's claim"
         )
+
+    async def test_mutual_refund_when_maker_never_claims(self, nodes):
+        """The guaranteed-safe failure: maker never claims, both timeouts elapse, both
+        legs refund via CSV — neither party suffers one-sided loss."""
+        s = await _setup_locked_swap(nodes)
+        coord = s.coord
+        loc = coord.record.btc_locator
+
+        # Maker never claims. Mature BOTH relative timelocks (BTC t_btc, RXD t_rxd).
+        nodes.btc_mine(s.t_btc.value)
+        nodes.rxd_mine(s.t_rxd.value)
+
+        rec = await coord.mutual_refund()
+        assert rec.state is SwapState.MUTUAL_REFUND
+
+        # Both locked UTXOs are now spent (refunded) on their chains.
+        btc_spent = nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout))
+        rxd_spent = nodes.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
+        assert btc_spent in (None, ""), "BTC HTLC should be refunded (spent)"
+        assert rxd_spent in (None, ""), "RXD covenant should be refunded (spent)"
+
+    async def test_maker_stall_taker_refunds_asset_proactively(self, nodes):
+        """Maker locks the asset but stalls (never claims BTC). As t_rxd nears, the
+        taker proactively refunds the RXD asset rather than wait — never loses both."""
+        s = await _setup_locked_swap(nodes)
+        coord = s.coord
+
+        # Mature the RXD CSV so the proactive asset refund is spendable.
+        nodes.rxd_mine(s.t_rxd.value)
+        now = int(nodes.rxd("getblockcount"))
+
+        rec = await coord.maybe_refund_asset_on_maker_stall(
+            now_block_height=now, asset_locked_at_height=s.rxd_locked_at, maker_has_claimed_btc=False
+        )
+        assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
+
+        rxd_spent = nodes.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
+        assert rxd_spent in (None, ""), "taker should have recovered the RXD asset (covenant spent)"
