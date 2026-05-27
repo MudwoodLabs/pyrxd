@@ -2,7 +2,7 @@
 title: Gravity HTLC reorg-finality gate — confirmation-depth + timelock-squeeze gate on the asset claim
 type: feat
 date: 2026-05-26
-status: plan — 4-reviewer panel folded in (security/architecture/kieran-python/simplicity); NOT yet implemented; value-moving security-HIGH path
+status: IMPLEMENTED (commit 0d04c77, 2026-05-26) — gate + assess_claim_finality (SAFE/WAIT/SQUEEZED) + taker_claim_asset_from_vulnerable; reorg depths on MarginPolicy; live regtest shallow->WAIT/bury->SAFE proven; task ci green. Config home RESOLVED = MarginPolicy. 4-reviewer panel folded in (security/architecture/kieran-python/simplicity).
 parent: docs/plans/2026-05-25-feat-gravity-htlc-concrete-legs-plan.md
 ---
 
