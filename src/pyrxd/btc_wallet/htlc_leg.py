@@ -296,7 +296,12 @@ class BitcoinTaprootLeg:
         """
         if not isinstance(claim_tx_bytes, (bytes, bytearray)) or len(claim_tx_bytes) == 0:
             raise ValidationError("claim_tx_bytes must be non-empty bytes")
-        txid = await self.funding_reader.txid_of(bytes(claim_tx_bytes))
+        # Derive the txid LOCALLY from the exact bytes p was scraped from (serialize,
+        # don't trust): the reorg gate must read confs of THIS tx, never a
+        # counterparty-supplied id (a maker could reveal p in a shallow tx and point a
+        # trusted txid at a deep unrelated one — fail-OPEN). btc_txid_from_raw is
+        # fail-closed; a mis-derived txid reads 0 confs at the gate, never a false depth.
+        txid = t.btc_txid_from_raw(bytes(claim_tx_bytes))
         confs = await self.funding_reader.confirmations(txid)
         if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
             raise NetworkError("confirmations reader returned a non-negative-int depth; fail-closed")

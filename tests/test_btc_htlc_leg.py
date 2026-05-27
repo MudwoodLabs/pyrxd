@@ -478,11 +478,38 @@ def test_scrape_secret_passthrough():
 # --------------------------------------------------------------------------- reorg gate: confirmations_of_claim
 
 
+def _real_claim_tx(taker, maker) -> bytes:
+    """A real maker claim tx (so the leg's LOCAL btc_txid_from_raw can derive its txid).
+
+    The preimage must open the HTLC hashlock for build_claim_tx to accept it, so the
+    HTLC is bound to sha256(p) for a fixed p.
+    """
+    p = b"\x11" * 32
+    htlc = t.build_htlc(
+        hashlock=hashlib.sha256(p).digest(),
+        claim_pubkey_xonly=_xonly_of(maker),
+        refund_pubkey_xonly=_xonly_of(taker),
+        timeout=t.Timelock(144, t.TimeUnit.BLOCKS),
+        network="bcrt",
+    )
+    loc = htlc.with_funding(t.BtcOutpoint("cd" * 32, 0), 100_000)
+    return t.build_claim_tx(
+        locator=loc,
+        preimage=p,
+        claim_privkey=maker._privkey.unsafe_raw_bytes(),
+        to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+        fee_sats=500,
+        aux_rand=os.urandom(32),
+    )
+
+
 async def test_confirmations_of_claim_returns_depth():
     taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
     reader = FakeFundingReader(claim_confs=7)
     leg = _leg(taker_kp=taker, maker_kp=maker, reader=reader)
-    assert await leg.confirmations_of_claim(b"\x02\x00rawclaimtx") == 7
+    # The leg derives the txid LOCALLY from these bytes (btc_txid_from_raw), so the tx
+    # must be a real, well-formed claim tx — a non-tx byte string would fail-close.
+    assert await leg.confirmations_of_claim(_real_claim_tx(taker, maker)) == 7
 
 
 async def test_confirmations_of_claim_rejects_empty_bytes():
@@ -490,6 +517,15 @@ async def test_confirmations_of_claim_rejects_empty_bytes():
     leg = _leg(taker_kp=taker, maker_kp=maker)
     with pytest.raises(ValidationError, match="non-empty bytes"):
         await leg.confirmations_of_claim(b"")
+
+
+async def test_confirmations_of_claim_fail_closed_on_malformed_tx():
+    """A non-tx byte string fails closed in the LOCAL txid derivation (never reads a
+    bogus depth)."""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    leg = _leg(taker_kp=taker, maker_kp=maker)
+    with pytest.raises(ValidationError):  # btc_txid_from_raw rejects the garbage bytes
+        await leg.confirmations_of_claim(b"\x02\x00rawclaimtx")
 
 
 async def test_confirmations_of_claim_fail_closed_on_bad_depth():
@@ -500,4 +536,4 @@ async def test_confirmations_of_claim_fail_closed_on_bad_depth():
     taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
     leg = _leg(taker_kp=taker, maker_kp=maker, reader=BadReader())
     with pytest.raises(NetworkError, match="non-negative-int depth"):
-        await leg.confirmations_of_claim(b"\x02\x00rawclaimtx")
+        await leg.confirmations_of_claim(_real_claim_tx(taker, maker))

@@ -37,6 +37,7 @@ from pyrxd.gravity.swap_coordinator import (
     assert_timelock_margin,
     assess_claim_finality,
     generate_secret,
+    measure_margin_from_btc_block_times,
     should_taker_refund_proactively,
 )
 from pyrxd.gravity.swap_state import (
@@ -791,21 +792,43 @@ def test_config_rejects_bad_min_ref_confirmations():
 # ---------------------------------------------------------------------------
 
 
-def test_margin_policy_rejects_zero_reorg_depth():
-    """A 0 reorg depth defeats the gate — rejected at construction."""
-    with pytest.raises(ValidationError, match="btc_claim_reorg_depth must be > 0"):
+def test_margin_policy_rejects_reorg_depth_below_floor():
+    """A 0 OR 1 block reorg depth defeats the gate — rejected at construction (floor >= 2).
+    A 1-block depth is materially unsafe on a real chain (single-block reorgs happen);
+    dust bounds the loss, not the reorg probability."""
+    for bad in (0, 1):
+        with pytest.raises(ValidationError, match="btc_claim_reorg_depth"):
+            MarginPolicy(
+                margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+                block_interval_s=600.0,
+                is_measured=False,
+                btc_claim_reorg_depth=t.Timelock(bad, t.TimeUnit.BLOCKS),
+            )
+        with pytest.raises(ValidationError, match="rxd_claim_burial"):
+            MarginPolicy(
+                margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+                block_interval_s=600.0,
+                is_measured=False,
+                rxd_claim_burial=t.Timelock(bad, t.TimeUnit.BLOCKS),
+            )
+    # The floor (2) itself is accepted — a defensible chosen dust value.
+    ok = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        btc_claim_reorg_depth=t.Timelock(2, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(2, t.TimeUnit.BLOCKS),
+    )
+    assert ok.btc_claim_reorg_depth.value == 2
+
+    # A seconds-tagged depth is floored in BLOCK terms too: 1 BTC block ~600s, so 60s
+    # normalises to < 1 block -> below the 2-block floor -> rejected.
+    with pytest.raises(ValidationError, match="btc_claim_reorg_depth"):
         MarginPolicy(
             margin=t.Timelock(36, t.TimeUnit.BLOCKS),
             block_interval_s=600.0,
             is_measured=False,
-            btc_claim_reorg_depth=t.Timelock(0, t.TimeUnit.BLOCKS),
-        )
-    with pytest.raises(ValidationError, match="rxd_claim_burial must be > 0"):
-        MarginPolicy(
-            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
-            block_interval_s=600.0,
-            is_measured=False,
-            rxd_claim_burial=t.Timelock(0, t.TimeUnit.BLOCKS),
+            btc_claim_reorg_depth=t.Timelock(60, t.TimeUnit.SECONDS),
         )
 
 
@@ -965,3 +988,86 @@ async def test_claim_from_vulnerable_rejects_wrong_state():
     coord = _coordinator(terms=terms)  # state NEGOTIATED, not ASSET_VULNERABLE
     with pytest.raises(ValidationError, match="only valid from ASSET_VULNERABLE"):
         await coord.taker_claim_asset_from_vulnerable(b"\x00")
+
+
+# ---------------------------------------------------------------------------
+# Measured MarginPolicy from BTC block times (P-SAFE-1b)
+# ---------------------------------------------------------------------------
+
+
+def test_measure_margin_from_btc_block_times_basic():
+    # 11 timestamps -> 10 gaps, all multiples of 600 so percentile picks are exact.
+    # gaps sorted: [600]*8, 1200, 1800. Median (index 5) = 600 -> interval 600.
+    base = 1_700_000_000
+    ts = [base]
+    for gap in (600, 600, 600, 600, 1200, 600, 1800, 600, 600, 600):
+        ts.append(ts[-1] + gap)
+    policy, prov = measure_margin_from_btc_block_times(
+        btc_block_timestamps=ts,
+        btc_tail_percentile=99.9,  # nearest-rank over 10 gaps -> the max
+        btc_claim_reorg_depth_blocks=3,
+        rxd_claim_burial_blocks=3,
+        rxd_block_interval_s=300.0,
+    )
+    assert policy.is_measured and policy.require_measured
+    assert policy.btc_claim_reorg_depth.value == 3
+    assert prov["measured"]["btc_block_interval_s_median"] == 600
+    # 99.9th-pct tail = max gap 1800s -> ceil(1800/600) = 3-block margin.
+    assert prov["measured"]["btc_tail_gap_s"] == 1800
+    assert policy.margin.value == 3
+    assert prov["chosen"]["min_reorg_depth_floor_blocks"] == 2
+    assert "MEASURED" in prov["note"] and "CHOSEN" in prov["note"]
+
+
+def test_measure_margin_handles_unordered_and_equal_timestamps():
+    base = 1_700_000_000
+    ts = [base + 1200, base, base + 600, base + 600, base + 1800]  # unordered + a duplicate
+    policy, prov = measure_margin_from_btc_block_times(
+        btc_block_timestamps=ts,
+        btc_tail_percentile=75.0,
+        btc_claim_reorg_depth_blocks=2,
+        rxd_claim_burial_blocks=2,
+        rxd_block_interval_s=300.0,
+    )
+    assert policy.margin.value >= 1  # never below a block
+    assert prov["measured"]["btc_samples"] == 5
+
+
+def test_measure_margin_rejects_thin_or_bad_inputs():
+    with pytest.raises(ValidationError, match=">= 3 BTC block timestamps"):
+        measure_margin_from_btc_block_times(
+            btc_block_timestamps=[1, 2],
+            btc_tail_percentile=90.0,
+            btc_claim_reorg_depth_blocks=3,
+            rxd_claim_burial_blocks=3,
+            rxd_block_interval_s=300.0,
+        )
+    with pytest.raises(ValidationError, match="btc_tail_percentile"):
+        measure_margin_from_btc_block_times(
+            btc_block_timestamps=[1, 2, 3, 4],
+            btc_tail_percentile=10.0,
+            btc_claim_reorg_depth_blocks=3,
+            rxd_claim_burial_blocks=3,
+            rxd_block_interval_s=300.0,
+        )
+    with pytest.raises(ValidationError, match="must all be ints"):
+        measure_margin_from_btc_block_times(
+            btc_block_timestamps=[1, 2.5, 3],
+            btc_tail_percentile=90.0,  # type: ignore[list-item]
+            btc_claim_reorg_depth_blocks=3,
+            rxd_claim_burial_blocks=3,
+            rxd_block_interval_s=300.0,
+        )
+
+
+def test_measure_margin_inherits_reorg_depth_floor():
+    # A chosen depth below the floor must be rejected by MarginPolicy even via the helper.
+    ts = [1_700_000_000 + i * 600 for i in range(6)]
+    with pytest.raises(ValidationError, match="btc_claim_reorg_depth"):
+        measure_margin_from_btc_block_times(
+            btc_block_timestamps=ts,
+            btc_tail_percentile=90.0,
+            btc_claim_reorg_depth_blocks=1,
+            rxd_claim_burial_blocks=3,
+            rxd_block_interval_s=300.0,
+        )

@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -72,6 +73,7 @@ __all__ = [
     "assert_timelock_margin",
     "assess_claim_finality",
     "generate_secret",
+    "measure_margin_from_btc_block_times",
     "should_taker_refund_proactively",
 ]
 
@@ -130,6 +132,12 @@ ESTIMATED_BTC_CLAIM_REORG_DEPTH_BLOCKS = 6
 # for it to get included — both consumed by the squeeze check below.
 ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS = 6
 
+# Hard safety floor (in BLOCKS) for any reorg depth, enforced at MarginPolicy
+# construction. A 1-block depth is materially unsafe on a real chain (natural
+# single-block reorgs happen; "dust" bounds the loss, not the reorg probability), so
+# even a dust run must use >= 2. NOT a configurable knob — it is the fail-closed floor.
+_MIN_REORG_DEPTH_BLOCKS = 2
+
 
 @dataclass(frozen=True)
 class MarginPolicy:
@@ -183,8 +191,18 @@ class MarginPolicy:
         ):
             if not isinstance(depth, Timelock):
                 raise ValidationError(f"MarginPolicy.{label} must be a Timelock")
-            if depth.value <= 0:
-                raise ValidationError(f"MarginPolicy.{label} must be > 0 (a 0 reorg depth defeats the gate)")
+            # Floor in BLOCK terms (normalise so a seconds-tagged depth is floored too).
+            # A 1-block reorg depth is materially unsafe on a real chain — natural
+            # single-block reorgs happen, and "dust" bounds the LOSS, not the reorg
+            # PROBABILITY. Require >= 2 (reorg-gate plan, security review). The
+            # conventional value is 6; a chosen dust value of 2-3 is defensible if
+            # recorded as below-conventional. 0/1 are rejected fail-closed.
+            depth_blocks = depth.normalize_to(TimeUnit.BLOCKS, block_interval_s=self.block_interval_s).value
+            if depth_blocks < _MIN_REORG_DEPTH_BLOCKS:
+                raise ValidationError(
+                    f"MarginPolicy.{label} = {depth_blocks} blk < safety floor {_MIN_REORG_DEPTH_BLOCKS}; "
+                    "a 0/1-block reorg depth defeats the gate (single-block reorgs occur on real chains)"
+                )
         if self.require_measured and not self.is_measured:
             raise ValidationError(
                 "real-value mode (require_measured=True) requires a MEASURED margin; "
@@ -228,6 +246,97 @@ class MarginPolicy:
         if rxd_claim_burial is not None:
             kwargs["rxd_claim_burial"] = rxd_claim_burial
         return cls(**kwargs)
+
+
+def measure_margin_from_btc_block_times(
+    *,
+    btc_block_timestamps: list[int],
+    btc_tail_percentile: float,
+    btc_claim_reorg_depth_blocks: int,
+    rxd_claim_burial_blocks: int,
+    rxd_block_interval_s: float,
+) -> tuple[MarginPolicy, dict]:
+    """Build a MEASURED MarginPolicy from real mainnet BTC inter-block data (pure).
+
+    PURE by design: it does NOT fetch anything. The caller supplies real, observed BTC
+    block timestamps (e.g. parsed from headers fetched via MempoolSpaceSource — the
+    4-byte LE field at header bytes 68:72) so the measurement is deterministic,
+    testable, and cannot fabricate data it was not given (global honesty rules).
+
+    What is MEASURED vs CHOSEN (separated in the returned provenance dict):
+    * MEASURED — ``block_interval_s`` (median observed BTC inter-block gap) and the
+      ``margin`` (the inter-block tail at ``btc_tail_percentile``, expressed in BTC
+      blocks, capturing "how long the maker's claim might take to confirm").
+    * CHOSEN — ``btc_claim_reorg_depth`` / ``rxd_claim_burial`` (operator policy, not
+      derivable from block timing) and ``rxd_block_interval_s`` (Radiant's interval,
+      recorded for the squeeze conversion).
+
+    Returns ``(MarginPolicy.measured(...), provenance)``. The policy is real-value
+    (``require_measured=True``); the floor + unit checks in ``MarginPolicy`` still apply
+    (a < 2-block reorg depth is rejected). The provenance dict is the first report
+    artifact — emit it verbatim so the run records exactly what was measured.
+
+    Raises ``ValidationError`` on too-few samples or a nonsensical percentile (never
+    guess a margin from thin data).
+    """
+    if not isinstance(btc_block_timestamps, list) or len(btc_block_timestamps) < 3:
+        raise ValidationError("need >= 3 BTC block timestamps to measure inter-block intervals")
+    if any(not isinstance(ts, int) or isinstance(ts, bool) for ts in btc_block_timestamps):
+        raise ValidationError("btc_block_timestamps must all be ints (unix seconds)")
+    if not isinstance(btc_tail_percentile, (int, float)) or not (50.0 <= btc_tail_percentile <= 99.9):
+        raise ValidationError("btc_tail_percentile must be in [50, 99.9] (a tail, not the median or an extreme)")
+    if not isinstance(rxd_block_interval_s, (int, float)) or rxd_block_interval_s <= 0:
+        raise ValidationError("rxd_block_interval_s must be > 0")
+
+    # Inter-block gaps (seconds). Sort timestamps first — headers may arrive unordered;
+    # a negative gap (out-of-order/equal-time blocks happen on real chains) is clamped
+    # to 0 so it can't shrink the measured interval below reality.
+    ordered = sorted(int(ts) for ts in btc_block_timestamps)
+    gaps = [max(0, ordered[i + 1] - ordered[i]) for i in range(len(ordered) - 1)]
+    if not gaps:
+        raise ValidationError("could not derive any inter-block gaps")
+
+    sorted_gaps = sorted(gaps)
+    median_gap = sorted_gaps[len(sorted_gaps) // 2]
+    # Nearest-rank percentile (no interpolation — conservative, no fabricated precision).
+    rank = max(1, math.ceil(btc_tail_percentile / 100.0 * len(sorted_gaps)))
+    tail_gap_s = sorted_gaps[rank - 1]
+    measured_block_interval_s = float(median_gap) if median_gap > 0 else 600.0
+
+    # Margin = the BTC inter-block tail expressed in BTC blocks (ceil), >= 1 block. This
+    # is the "maker's claim confirmation tail" term; the reorg depths are added on top
+    # by the squeeze check, so the margin itself is the timing slack, not the depth.
+    margin_blocks = max(1, math.ceil(tail_gap_s / measured_block_interval_s))
+
+    policy = MarginPolicy.measured(
+        margin=Timelock(margin_blocks, TimeUnit.BLOCKS),
+        block_interval_s=measured_block_interval_s,
+        btc_claim_reorg_depth=Timelock(btc_claim_reorg_depth_blocks, TimeUnit.BLOCKS),
+        rxd_claim_burial=Timelock(rxd_claim_burial_blocks, TimeUnit.BLOCKS),
+    )
+    provenance = {
+        "measured": {
+            "btc_block_interval_s_median": median_gap,
+            "btc_tail_gap_s": tail_gap_s,
+            "btc_tail_percentile": btc_tail_percentile,
+            "btc_samples": len(btc_block_timestamps),
+            "margin_blocks": margin_blocks,
+            "block_interval_s_used": measured_block_interval_s,
+        },
+        "chosen": {
+            "btc_claim_reorg_depth_blocks": btc_claim_reorg_depth_blocks,
+            "rxd_claim_burial_blocks": rxd_claim_burial_blocks,
+            "rxd_block_interval_s": rxd_block_interval_s,
+            "min_reorg_depth_floor_blocks": _MIN_REORG_DEPTH_BLOCKS,
+        },
+        "note": (
+            "margin + block_interval_s are MEASURED from observed BTC block timestamps; "
+            "reorg depths are CHOSEN operator policy. The squeeze normalises all via "
+            "block_interval_s — a single-clock approximation across BTC/RXD; the depths "
+            "carry slack to absorb it (reorg-gate plan)."
+        ),
+    }
+    return policy, provenance
 
 
 def assert_timelock_margin(t_btc: Timelock, t_rxd: Timelock, policy: MarginPolicy) -> None:
