@@ -284,6 +284,11 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     print(f"  -> {rec.state.value} (HTLC funded: {rec.btc_locator.funding_outpoint.txid})")
 
     # 2. Maker locks the RXD covenant (operator pays the SPK), taker re-validates.
+    # Capture the RXD height at/just-before the asset lock — the t_rxd refund window is
+    # measured from here, so a conservative (slightly-low) value is safe (it can only make
+    # the reorg-gate squeeze MORE cautious, never less). The covenant is funded at-or-after
+    # this height. Mirrors the regtest harness's rxd_locked_at = getblockcount()-before-fund.
+    rxd_locked_at = int(json.loads(_rxd_blockcount(rxd_client)))
     _confirm("you have funded the RXD covenant SPK on mainnet and it has >= 1 conf", auto_yes=args.yes)
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
     report.step(name="post_asset_lock_revalidate", chain="rxd", state=rec.state.value,
@@ -312,7 +317,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         claim_raw = await btc_chain_reader.get_raw_tx(btc_claim_txid, min_confirmations=0)
         now_rxd = int(json.loads(_rxd_blockcount(rxd_client)))
         rec = await coord.taker_scrape_and_claim_asset(
-            bytes(claim_raw), now_rxd_height=now_rxd, asset_locked_at_height=now_rxd,  # operator: pass real lock height
+            bytes(claim_raw), now_rxd_height=now_rxd, asset_locked_at_height=rxd_locked_at,
         )
         if rec.state is SwapState.COMPLETED:
             report.step(name="taker_scrape_and_claim_asset", chain="rxd", state=rec.state.value,
