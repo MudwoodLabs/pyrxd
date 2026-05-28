@@ -113,6 +113,27 @@ class NetworkError(RxdSdkError):
     """Raised for transport / RPC / network failures."""
 
 
+class InsufficientConfirmationsError(NetworkError):
+    """A tx exists but has fewer confirmations than the caller required.
+
+    Subclass of :class:`NetworkError` so existing handlers still catch it, but
+    catchable as a distinct class for ``wait-for-conf`` retry loops that need to
+    discriminate "tx is just shallow, retry later" from "real transport error,
+    fail fast". The legacy substring match (``"confirmations, required" in
+    str(exc)``) was fragile across reader implementations — this class is the
+    typed replacement.
+
+    Args:
+        have: observed confirmation depth at read time (0 if unconfirmed).
+        required: the caller-supplied ``min_confirmations`` threshold.
+    """
+
+    def __init__(self, *, have: int, required: int) -> None:
+        super().__init__(f"tx has {have} confirmations, required {required}")
+        self.have = have
+        self.required = required
+
+
 class CovenantError(RxdSdkError):
     """Raised for covenant construction or verification failures."""
 

@@ -30,13 +30,16 @@ Design (T7 plan D4/D5/D6, reviewed)
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
+from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from pyrxd.btc_wallet import taproot as t
 from pyrxd.btc_wallet.keys import BtcKeypair
 from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from pyrxd.security.types import Txid
 
 __all__ = [
@@ -45,8 +48,42 @@ __all__ = [
     "BitcoinTaprootLeg",
     "BtcBroadcaster",
     "BtcFundingReader",
+    "FundingPolicy",
     "require_audit_cleared",
 ]
+
+
+@dataclass(frozen=True)
+class FundingPolicy:
+    """Operational policy knobs for :class:`BitcoinTaprootLeg.fund` and its readback.
+
+    Pulled into a dataclass after review of cbd5fc0 — the leg's ctor accumulated
+    fifteen kwargs and the timing/fee-policy fields are the obvious cluster.
+    Today both the loose kwargs AND ``policy=FundingPolicy(...)`` are accepted on
+    the ctor (loose kwargs are legacy-compatible); new callers should pass
+    ``policy=`` for clarity, and the kwarg-form may eventually warn-then-error in
+    a follow-up.
+
+    Attributes:
+        fee_sats: BTC fee paid by funding / claim / refund builds.
+        min_confirmations: depth required before the on-chain funded amount is
+            trusted (D4: read-back from chain, never self-report).
+        funding_input_type: shape of the taker's funding UTXO ("p2wpkh" default;
+            ``build_payment_tx`` accepts the same set).
+        fund_confirm_poll_s: poll interval on the post-broadcast readback when
+            the chain can't be mined on demand. ``0`` disables polling (regtest
+            default — tests mine a block between broadcast and read).
+        fund_confirm_timeout_s: deadline for the poll loop. MUST be ``> 0`` when
+            ``fund_confirm_poll_s > 0`` (a zero-budget poll is a footgun, not a
+            feature — the ctor refuses that combination).
+    """
+
+    fee_sats: int = 500
+    min_confirmations: int = 1
+    funding_input_type: str = "p2wpkh"
+    fund_confirm_poll_s: float = 0.0
+    fund_confirm_timeout_s: float = 0.0
+
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +238,8 @@ class BitcoinTaprootLeg:
         :func:`require_audit_cleared`). Ignored for isolated test chains.
     """
 
+    _POLICY_SENTINEL: object = object()
+
     def __init__(
         self,
         *,
@@ -212,14 +251,46 @@ class BitcoinTaprootLeg:
         funding_reader: BtcFundingReader,
         refund_to_scriptpubkey: bytes,
         claim_to_scriptpubkey: bytes,
-        fee_sats: int = 500,
-        min_confirmations: int = 1,
-        funding_input_type: str = "p2wpkh",
+        policy: FundingPolicy | None = None,
         maker_claim_privkey: bytes | None = None,
         audit_cleared: bool = False,
-        fund_confirm_poll_s: float = 0.0,
-        fund_confirm_timeout_s: float = 0.0,
+        # Legacy loose-kwarg form. Pass policy=FundingPolicy(...) instead. Mixing
+        # ``policy=`` with any of these raises (one source of truth). Kept default
+        # to preserve every existing call site (tests + regtest e2e).
+        fee_sats: int | object = _POLICY_SENTINEL,
+        min_confirmations: int | object = _POLICY_SENTINEL,
+        funding_input_type: str | object = _POLICY_SENTINEL,
+        fund_confirm_poll_s: float | object = _POLICY_SENTINEL,
+        fund_confirm_timeout_s: float | object = _POLICY_SENTINEL,
     ) -> None:
+        # Reconcile the new dataclass form against the legacy kwargs. Either path
+        # works; mixing rejects loudly so future readers don't have to guess which
+        # one "wins".
+        legacy_kwargs = {
+            "fee_sats": fee_sats,
+            "min_confirmations": min_confirmations,
+            "funding_input_type": funding_input_type,
+            "fund_confirm_poll_s": fund_confirm_poll_s,
+            "fund_confirm_timeout_s": fund_confirm_timeout_s,
+        }
+        legacy_provided = {k: v for k, v in legacy_kwargs.items() if v is not self._POLICY_SENTINEL}
+        if policy is not None and legacy_provided:
+            raise ValidationError(
+                f"pass policy=FundingPolicy(...) OR the legacy kwargs ({sorted(legacy_provided)}), not both"
+            )
+        if policy is None:
+            # Build a FundingPolicy from the legacy kwargs (or its defaults).
+            defaults = FundingPolicy()
+            policy = FundingPolicy(
+                fee_sats=legacy_provided.get("fee_sats", defaults.fee_sats),
+                min_confirmations=legacy_provided.get("min_confirmations", defaults.min_confirmations),
+                funding_input_type=legacy_provided.get("funding_input_type", defaults.funding_input_type),
+                fund_confirm_poll_s=legacy_provided.get("fund_confirm_poll_s", defaults.fund_confirm_poll_s),
+                fund_confirm_timeout_s=legacy_provided.get("fund_confirm_timeout_s", defaults.fund_confirm_timeout_s),
+            )
+        if not isinstance(policy, FundingPolicy):
+            raise ValidationError("policy must be a FundingPolicy instance")
+
         require_audit_cleared(network, audit_cleared=audit_cleared)
         if not isinstance(taker_keypair, BtcKeypair):
             raise ValidationError("taker_keypair must be a BtcKeypair")
@@ -229,12 +300,24 @@ class BitcoinTaprootLeg:
             raise ValidationError("broadcaster must implement BtcBroadcaster.broadcast")
         if not isinstance(funding_reader, BtcFundingReader):
             raise ValidationError("funding_reader must implement BtcFundingReader.read_output_amount_sats")
-        if not isinstance(fee_sats, int) or isinstance(fee_sats, bool) or fee_sats <= 0:
+        if not isinstance(policy.fee_sats, int) or isinstance(policy.fee_sats, bool) or policy.fee_sats <= 0:
             raise ValidationError("fee_sats must be a positive int")
-        if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 0:
+        if (
+            not isinstance(policy.min_confirmations, int)
+            or isinstance(policy.min_confirmations, bool)
+            or policy.min_confirmations < 0
+        ):
             raise ValidationError("min_confirmations must be a non-negative int")
-        if fund_confirm_poll_s < 0 or fund_confirm_timeout_s < 0:
+        if policy.fund_confirm_poll_s < 0 or policy.fund_confirm_timeout_s < 0:
             raise ValidationError("fund_confirm_poll_s/fund_confirm_timeout_s must be non-negative")
+        if policy.fund_confirm_poll_s > 0 and policy.fund_confirm_timeout_s <= 0:
+            # Without this, the poll loop times out on the FIRST retry — "poll forever"
+            # is not the actual behaviour, but the kwargs read that way. Fail-closed at
+            # ctor time so the operator gets a loud error, not a silent zero-budget loop.
+            raise ValidationError(
+                "fund_confirm_poll_s > 0 requires fund_confirm_timeout_s > 0 (use poll_s=0 to disable polling entirely)"
+            )
+
         self.network = network
         self.taker_keypair = taker_keypair
         self.funding_utxo = funding_utxo
@@ -245,16 +328,14 @@ class BitcoinTaprootLeg:
         self.funding_reader = funding_reader
         self.refund_to_scriptpubkey = bytes(refund_to_scriptpubkey)
         self.claim_to_scriptpubkey = bytes(claim_to_scriptpubkey)
-        self.fee_sats = fee_sats
-        self.min_confirmations = min_confirmations
-        self.funding_input_type = funding_input_type
-        # When the funding tx is broadcast by THIS leg (mainnet has no on-demand
-        # mining), the post-broadcast on-chain readback can't be satisfied for ~1
-        # block. If a poll interval is set, fund() waits up to the timeout for the tx
-        # to reach min_confirmations instead of failing instantly. 0 = no poll (the
-        # historical regtest behaviour, where the test mines between broadcast/read).
-        self.fund_confirm_poll_s = float(fund_confirm_poll_s)
-        self.fund_confirm_timeout_s = float(fund_confirm_timeout_s)
+        self.policy = policy
+        # Mirror policy fields onto the leg for backward-compat reads (tests + the
+        # _read_funded_amount_sats helper read self.fee_sats etc. directly).
+        self.fee_sats = policy.fee_sats
+        self.min_confirmations = policy.min_confirmations
+        self.funding_input_type = policy.funding_input_type
+        self.fund_confirm_poll_s = float(policy.fund_confirm_poll_s)
+        self.fund_confirm_timeout_s = float(policy.fund_confirm_timeout_s)
         # Optional: only a MAKER-role leg holds the claim key. Held in-memory only,
         # never persisted (it is the maker's spending key for the claim leaf).
         self._maker_claim_privkey = (
@@ -359,37 +440,34 @@ class BitcoinTaprootLeg:
     async def _read_funded_amount_sats(self, funding_txid: str, vout: int) -> int:
         """Read the on-chain funded amount, polling for min_confirmations if configured.
 
-        ``read_output_amount_sats`` is fail-closed: it RAISES until the tx reaches
-        min_confirmations. On regtest a block is mined between broadcast and read, so a
-        single call works. On a chain without on-demand mining the just-broadcast tx is
-        0-conf, so when ``fund_confirm_poll_s`` is set this retries on that specific
-        "needs N confs" NetworkError until the deadline, then gives up (still
-        fail-closed — it re-raises the last error rather than returning an unconfirmed
-        amount). Any OTHER error (bad vout, malformed tx) propagates immediately.
+        ``read_output_amount_sats`` is fail-closed: it raises
+        :class:`InsufficientConfirmationsError` (a :class:`NetworkError` subclass) until
+        the tx reaches ``min_confirmations``. On regtest a block is mined between
+        broadcast and read, so a single call works. On a chain without on-demand mining
+        the just-broadcast tx is 0-conf, so when ``fund_confirm_poll_s`` is set this
+        retries on that specific typed exception until the deadline, then re-raises
+        (still fail-closed — never returns an unconfirmed amount). Any OTHER
+        ``NetworkError`` (bad vout, malformed tx, transport failure) propagates
+        immediately. The previous substring match was replaced with a typed exception
+        in the cbd5fc0 fix-up (the contract was previously a free-text message).
         """
-        import asyncio
-        import time as _time
-
         if self.fund_confirm_poll_s <= 0:
             return await self.funding_reader.read_output_amount_sats(
                 funding_txid, vout, min_confirmations=self.min_confirmations
             )
-        deadline = _time.monotonic() + self.fund_confirm_timeout_s
+        deadline = time.monotonic() + self.fund_confirm_timeout_s
         while True:
             try:
                 return await self.funding_reader.read_output_amount_sats(
                     funding_txid, vout, min_confirmations=self.min_confirmations
                 )
-            except NetworkError as exc:
-                # Only retry the "not enough confirmations yet" case; everything else
-                # (OOB vout, malformed value) is a real fault — fail closed now.
-                if "confirmations, required" not in str(exc):
+            except InsufficientConfirmationsError as exc:
+                if time.monotonic() >= deadline:
                     raise
-                if _time.monotonic() >= deadline:
-                    raise
-                logging.getLogger(__name__).info(
-                    "fund(): %s — waiting %.0fs for funding tx to confirm",
-                    exc,
+                logger.info(
+                    "fund(): tx has %d/%d confirmations — waiting %.0fs",
+                    exc.have,
+                    exc.required,
                     self.fund_confirm_poll_s,
                 )
                 await asyncio.sleep(self.fund_confirm_poll_s)

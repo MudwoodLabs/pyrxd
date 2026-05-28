@@ -21,12 +21,13 @@ import asyncio
 import hashlib
 import json
 import sys
+import time
 from pathlib import Path
 
 import coincurve
 
 from pyrxd.btc_wallet import taproot as bt
-from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg
+from pyrxd.btc_wallet.htlc_leg import BitcoinTaprootLeg, FundingPolicy
 from pyrxd.btc_wallet.keys import keypair_from_wif
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
@@ -34,7 +35,6 @@ from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.swap_coordinator import (
     CoordinatorConfig,
     SwapCoordinator,
-    measure_margin_from_btc_block_times,
 )
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
@@ -43,82 +43,22 @@ from pyrxd.network.bitcoin import (
     MempoolSpaceFundingReader,
     MempoolSpaceSource,
 )
+from pyrxd.security.errors import InsufficientConfirmationsError
 from pyrxd.security.secrets import SecretBytes
 from pyrxd.security.types import Hex20, Txid
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from _dust_swap_shared import (
+    CapturingBroadcaster,
+    InMemSeen,
+    SshTrFeeSource,
+    confirm,
+    measured_margin_from_mainnet,
+    rxd_blockcount,
+)
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 _MAINNET_BTC_API = "https://mempool.space/api"
-
-
-def _confirm(prompt: str, *, auto_yes: bool) -> None:
-    print(f"\n  >>> IRREVERSIBLE: {prompt}")
-    if auto_yes:
-        print("  >>> (--yes) proceeding")
-        return
-    if input("  >>> type 'broadcast' to proceed, anything else ABORTS: ").strip() != "broadcast":
-        raise SystemExit("operator aborted before broadcast")
-
-
-class _CapturingBroadcaster:
-    def __init__(self, inner) -> None:
-        self._inner = inner
-        self.last_raw: bytes | None = None
-
-    async def broadcast(self, raw_tx: bytes) -> str:
-        # Assign last_raw AFTER the await succeeds: a transport failure (HTTP 4xx/5xx)
-        # propagates the exception, but if we set last_raw first the downstream guard
-        # (`if last_raw is None`) passes on bytes that never landed on-chain, and the
-        # WAIT-for-conf loop polls a phantom txid forever. Found by review of cbd5fc0.
-        txid = await self._inner.broadcast(raw_tx)
-        self.last_raw = bytes(raw_tx)
-        return txid
-
-
-class _InMemSeen:
-    def __init__(self) -> None:
-        self._s: set[bytes] = set()
-
-    def has_seen(self, hsh: bytes) -> bool:
-        return bytes(hsh) in self._s
-
-    def mark_seen(self, hsh: bytes) -> None:
-        self._s.add(bytes(hsh))
-
-
-class _SshTrFeeSource:
-    def __init__(self, client: SshTrRadiantClient, fee_amount_photons: int) -> None:
-        self._client = client
-        self._amount = fee_amount_photons
-
-    def next_fee_input(self):
-        return self._client.carve_fee_input(self._amount)
-
-
-def _rxd_blockcount(client: SshTrRadiantClient) -> int:
-    return int(json.loads(json.dumps(client._run_sync("getblockcount"))))
-
-
-async def _measured_margin(args):
-    src = MempoolSpaceSource(base_url=_MAINNET_BTC_API)
-    try:
-        tip = int(await src.get_tip_height())
-        timestamps = []
-        for h in range(tip - args.margin_sample_blocks + 1, tip + 1):
-            header = await src.get_block_header_hex(h)  # type: ignore[arg-type]
-            import struct
-
-            timestamps.append(struct.unpack("<I", header[68:72])[0])
-    finally:
-        await src.close()
-    return measure_margin_from_btc_block_times(
-        btc_block_timestamps=timestamps,
-        btc_tail_percentile=args.btc_tail_percentile,
-        btc_claim_reorg_depth_blocks=args.btc_claim_reorg_depth,
-        rxd_claim_burial_blocks=args.rxd_claim_burial,
-        rxd_block_interval_s=args.rxd_block_interval_s,
-    )
 
 
 async def resume(args) -> None:
@@ -159,7 +99,7 @@ async def resume(args) -> None:
     # produce different values and silently mismatch the on-chain refund leaf).
     # Resume MUST use the keys-file timelocks; we sample margin for the reorg-gate
     # policy and the report, but NEVER recompute t_btc from it.
-    policy, provenance = await _measured_margin(args)
+    policy, provenance = await measured_margin_from_mainnet(args)
     print(f"  measured margin (informational): {json.dumps(provenance)}")
     if "t_btc_blocks" not in keys or "t_rxd_blocks" not in keys or "btc_htlc_address" not in keys:
         raise SystemExit(
@@ -195,7 +135,7 @@ async def resume(args) -> None:
     # ---- transports ----
     btc_reader = MempoolSpaceFundingReader(base_url=_MAINNET_BTC_API)
     _btc_bcast = MempoolSpaceBroadcaster(base_url=_MAINNET_BTC_API)
-    btc_broadcaster = _CapturingBroadcaster(_btc_bcast)
+    btc_broadcaster = CapturingBroadcaster(_btc_bcast)
     btc_chain_reader = MempoolSpaceSource(base_url=_MAINNET_BTC_API)
     rxd_client = SshTrRadiantClient(rpcwallet=keys.get("rxd_wallet", ""))
     rxd_client.register_spk(cov.funded_spk)
@@ -241,9 +181,11 @@ async def resume(args) -> None:
         funding_reader=btc_reader,
         refund_to_scriptpubkey=btc_refund_payout,
         claim_to_scriptpubkey=btc_claim_payout,
-        fee_sats=args.btc_fee_sats,
-        min_confirmations=1,
-        funding_input_type="p2wpkh",
+        # Resume never calls fund() (BTC HTLC is already on-chain), so the poll
+        # knobs stay at defaults — no broadcast→readback timing knot to manage here.
+        policy=FundingPolicy(
+            fee_sats=args.btc_fee_sats, min_confirmations=1, funding_input_type="p2wpkh"
+        ),
         maker_claim_privkey=maker_btc.secret,
         audit_cleared=audit_cleared,
     )
@@ -252,7 +194,7 @@ async def resume(args) -> None:
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         chain_io=RadiantChainIO(rxd_client),
-        fee_source=_SshTrFeeSource(rxd_client, args.rxd_fee_photons),
+        fee_source=SshTrFeeSource(rxd_client, args.rxd_fee_photons),
         min_confirmations=1,
         audit_cleared=audit_cleared,
     )
@@ -262,62 +204,79 @@ async def resume(args) -> None:
         btc_leg=btc_leg,
         radiant_leg=rxd_leg,
         indexer=None,
-        seen_store=_InMemSeen(),
+        seen_store=InMemSeen(),
         config=CoordinatorConfig(margin_policy=policy),
     )
     print(f"  coordinator seeded at {coord.record.state.value}")
 
-    # ---- step: post_asset_lock_revalidate -> BOTH_LOCKED ----
-    rxd_locked_at = _rxd_blockcount(rxd_client)
-    rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
-    print(f"  post_asset_lock_revalidate -> {rec.state.value}")
-    if rec.state is not SwapState.BOTH_LOCKED:
-        raise SystemExit(f"covenant mismatch -> {rec.state.value}; refund both legs after their timelocks")
+    # All transports + the WAIT loop run inside try/finally so a mid-flight exception
+    # never leaks aiohttp sessions (an unclosed-connector warning during a value-moving
+    # decision is exactly when an operator needs CLEAN output, not noise).
+    try:
+        # ---- step: post_asset_lock_revalidate -> BOTH_LOCKED ----
+        rxd_locked_at = rxd_blockcount(rxd_client)
+        rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
+        print(f"  post_asset_lock_revalidate -> {rec.state.value}")
+        if rec.state is not SwapState.BOTH_LOCKED:
+            raise SystemExit(f"covenant mismatch -> {rec.state.value}; refund both legs after their timelocks")
 
-    print("\n  *** BOTH_LOCKED. Proceeding to maker_claims_btc (reveals p on-chain). ***")
+        print("\n  *** BOTH_LOCKED. Proceeding to maker_claims_btc (reveals p on-chain). ***")
 
-    # ---- step: maker claims BTC, revealing p ----
-    _confirm("maker_claims_btc: broadcast the BTC claim (reveals p on-chain)", auto_yes=args.yes)
-    rec = await coord.maker_claims_btc(p_secret)
-    if btc_broadcaster.last_raw is None:
-        raise SystemExit("did not capture the BTC claim bytes; cannot proceed")
-    btc_claim_txid = Txid(bt.btc_txid_from_raw(btc_broadcaster.last_raw))
-    print(f"  -> {rec.state.value} (BTC claim txid {btc_claim_txid})")
+        # ---- step: maker claims BTC, revealing p ----
+        confirm("maker_claims_btc: broadcast the BTC claim (reveals p on-chain)", auto_yes=args.yes)
+        rec = await coord.maker_claims_btc(p_secret)
+        if btc_broadcaster.last_raw is None:
+            raise SystemExit("did not capture the BTC claim bytes; cannot proceed")
+        btc_claim_txid = Txid(bt.btc_txid_from_raw(btc_broadcaster.last_raw))
+        print(f"  -> {rec.state.value} (BTC claim txid {btc_claim_txid})")
 
-    # ---- step: taker reorg-gated claim of the RXD covenant ----
-    print(f"\n  Waiting for the BTC claim to bury to {policy.btc_claim_reorg_depth.value} confs (reorg gate).")
-    from pyrxd.security.errors import NetworkError
-
-    while True:
-        # get_raw_tx fail-closes on an UNCONFIRMED tx (won't return a 0-conf mempool tx
-        # even at min_confirmations=0). The just-broadcast claim is 0-conf; that's the
-        # same as the reorg gate's WAIT — sleep and retry until it confirms.
-        try:
-            claim_raw = await btc_chain_reader.get_raw_tx(btc_claim_txid, min_confirmations=0)
-        except NetworkError as exc:
-            if "confirmations" not in str(exc):
-                raise
-            print(f"  BTC claim still unconfirmed; retrying in {args.poll_interval_s}s...")
+        # ---- step: taker reorg-gated claim of the RXD covenant ----
+        # Bounded by args.resume_deadline_s — the unbounded `while True` was a red-team
+        # finding: past maker_claims_btc, p is public, and a hostile/flaky mempool
+        # source could stall the loop past t_rxd → asset forfeit in any counterparty
+        # deployment. Default deadline is conservative (½ × t_rxd window).
+        print(f"\n  Waiting for the BTC claim to bury to {policy.btc_claim_reorg_depth.value} confs (reorg gate).")
+        deadline = time.monotonic() + args.resume_deadline_s
+        while True:
+            if time.monotonic() >= deadline:
+                raise SystemExit(
+                    f"resume deadline ({args.resume_deadline_s:.0f}s) exceeded — operator must intervene "
+                    f"(p is public on-chain; covenant claim still pending). claim txid {btc_claim_txid}"
+                )
+            # get_raw_tx fail-closes on an UNCONFIRMED tx (won't return a 0-conf mempool
+            # tx even at min_confirmations=0). The just-broadcast claim is 0-conf;
+            # that's the same as the reorg gate's WAIT — sleep and retry until it
+            # confirms. Catch InsufficientConfirmationsError (the typed exception)
+            # instead of substring-matching.
+            try:
+                claim_raw = await btc_chain_reader.get_raw_tx(btc_claim_txid, min_confirmations=0)
+            except InsufficientConfirmationsError:
+                print(f"  BTC claim still unconfirmed; retrying in {args.poll_interval_s}s...")
+                await asyncio.sleep(args.poll_interval_s)
+                continue
+            now_rxd = rxd_blockcount(rxd_client)
+            rec = await coord.taker_scrape_and_claim_asset(
+                bytes(claim_raw),
+                now_rxd_height=now_rxd,
+                asset_locked_at_height=rxd_locked_at,
+            )
+            if rec.state is SwapState.COMPLETED:
+                print(f"  -> {rec.state.value} — CROSS-CHAIN SWAP COMPLETE")
+                break
+            print(
+                f"  reorg gate: WAIT (BTC claim not yet {policy.btc_claim_reorg_depth.value}-deep); "
+                f"retrying in {args.poll_interval_s}s..."
+            )
             await asyncio.sleep(args.poll_interval_s)
-            continue
-        now_rxd = _rxd_blockcount(rxd_client)
-        rec = await coord.taker_scrape_and_claim_asset(
-            bytes(claim_raw),
-            now_rxd_height=now_rxd,
-            asset_locked_at_height=rxd_locked_at,
-        )
-        if rec.state is SwapState.COMPLETED:
-            print(f"  -> {rec.state.value} — CROSS-CHAIN SWAP COMPLETE")
-            break
-        print(
-            f"  reorg gate: WAIT (BTC claim not yet {policy.btc_claim_reorg_depth.value}-deep); retrying in {args.poll_interval_s}s..."
-        )
-        await asyncio.sleep(args.poll_interval_s)
 
-    await btc_reader.close()
-    await _btc_bcast._http.close()
-    await btc_chain_reader.close()
-    print("\n  DONE.")
+        print("\n  DONE.")
+    finally:
+        # close() on every transport unconditionally — exceptions in the run shouldn't
+        # leak aiohttp sessions. MempoolSpaceBroadcaster grew a public close() in the
+        # post-cbd5fc0 fix-up; both readers already had one.
+        await btc_reader.close()
+        await _btc_bcast.close()
+        await btc_chain_reader.close()
 
 
 def _parse_args(argv):
@@ -348,6 +307,16 @@ def _parse_args(argv):
     ap.add_argument("--rxd-claim-burial", type=int, default=2)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
     ap.add_argument("--poll-interval-s", type=float, default=30.0)
+    ap.add_argument(
+        "--resume-deadline-s",
+        type=float,
+        default=4 * 60 * 60,  # 4 hours
+        help="hard upper bound on the WAIT-for-claim-confirmation loop. After this many "
+        "seconds the resume raises SystemExit and the operator must intervene. Past "
+        "maker_claims_btc, p is public — a hostile/flaky mempool source MUST NOT stall "
+        "the loop past t_rxd (red-team finding 2B). Default 4h is conservative for a "
+        "20-block t_rxd at ~5min/RXD-block + a few-block reorg-gate margin.",
+    )
     return ap.parse_args(argv)
 
 

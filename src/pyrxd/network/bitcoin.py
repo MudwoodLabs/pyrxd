@@ -30,7 +30,7 @@ from urllib.parse import quote, urljoin
 
 import aiohttp
 
-from ..security.errors import NetworkError, ValidationError
+from ..security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
 from ..security.types import BlockHeight, Hex32, RawTx, Txid
 
@@ -252,14 +252,14 @@ class MempoolSpaceSource(BtcDataSource):
         confirmed = status.get("confirmed", False)
         block_height = status.get("block_height")
         if not confirmed or block_height is None:
-            raise NetworkError(f"tx has 0 confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=0, required=min_confirmations)
 
         if min_confirmations > 0:
             # To check confirmations we need the tip height.
             tip = await self.get_tip_height()
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
-                raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
+                raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
 
         # Fetch raw hex.
         hex_url = self._url(f"tx/{_safe_txid_path(txid)}/hex")
@@ -424,13 +424,13 @@ class BlockstreamSource(BtcDataSource):
         confirmed = status.get("confirmed", False)
         block_height = status.get("block_height")
         if not confirmed or block_height is None:
-            raise NetworkError(f"tx has 0 confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=0, required=min_confirmations)
 
         if min_confirmations > 0:
             tip = await self.get_tip_height()
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
-                raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
+                raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
 
         hex_url = self._url(f"tx/{_safe_txid_path(txid)}/hex")
         try:
@@ -624,7 +624,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
             raise NetworkError("Unexpected raw tx response from Bitcoin Core")
         confs = data.get("confirmations", 0)
         if confs < min_confirmations:
-            raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=int(confs), required=min_confirmations)
         hex_str = data.get("hex", "")
         if not isinstance(hex_str, str):
             raise NetworkError("Missing hex field in raw tx response")
@@ -907,6 +907,15 @@ class MempoolSpaceBroadcaster:
         except aiohttp.ClientError as exc:
             raise NetworkError("broadcast HTTP request failed") from exc
 
+    async def close(self) -> None:
+        """Release the shared HTTP client. Idempotent; mirrors :meth:`MempoolSpaceFundingReader.close`.
+
+        Without this method every caller had to reach into ``_http`` directly to clean
+        up — flagged by the post-cbd5fc0 review as a library-API gap that leaked
+        through scripts.
+        """
+        await self._http.close()
+
 
 class MempoolSpaceFundingReader:
     """``BtcFundingReader`` over mempool.space (single-source; fail-closed).
@@ -936,7 +945,7 @@ class MempoolSpaceFundingReader:
         tx = txid if isinstance(txid, Txid) else Txid(txid)
         confs = await self.confirmations(tx)
         if confs < min_confirmations:
-            raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
         data = await self._http.tx_json(tx)
         try:
             return int(data["vout"][vout]["value"])  # mempool.space vout value is in sats

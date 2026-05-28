@@ -21,12 +21,13 @@ from pyrxd.btc_wallet.htlc_leg import (
     AUDIT_CLEARED_NETWORKS,
     BitcoinCoreBroadcaster,
     BitcoinTaprootLeg,
+    FundingPolicy,
     require_audit_cleared,
 )
 from pyrxd.btc_wallet.keys import BtcKeypair, generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.gravity.swap_state import NegotiatedTerms
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 
 # --------------------------------------------------------------------------- helpers
 
@@ -84,7 +85,7 @@ class FakeFundingReader:
     async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
         self.asked_min_confs = min_confirmations
         if self.raise_shallow:
-            raise NetworkError(f"output has 0 confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=0, required=min_confirmations)
         return self.amount_sats
 
     async def confirmations(self, txid: str) -> int:
@@ -250,7 +251,8 @@ async def test_fund_fail_closed_on_shallow_funding():
 class _ShallowThenConfirmReader(FakeFundingReader):
     """Raises the 'not enough confs' NetworkError ``shallow_calls`` times, then returns
     the amount — models a just-broadcast tx that confirms after a few polls. The message
-    matches the substring fund()'s retry-guard keys on."""
+    raises InsufficientConfirmationsError — the typed exception fund()'s retry-guard
+    catches by class, not by substring."""
 
     def __init__(self, *, shallow_calls: int, amount_sats: int = 100_000) -> None:
         super().__init__(amount_sats=amount_sats)
@@ -261,7 +263,7 @@ class _ShallowThenConfirmReader(FakeFundingReader):
         self.read_calls += 1
         if self._remaining > 0:
             self._remaining -= 1
-            raise NetworkError(f"tx has 0 confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=0, required=min_confirmations)
         return self.amount_sats
 
 
@@ -317,8 +319,10 @@ async def test_fund_polls_for_confirmation_when_configured():
 
 
 async def test_fund_poll_times_out_still_fail_closed():
-    """If the funding tx never confirms within the timeout, fund() re-raises the conf
-    error rather than returning an unconfirmed amount (still fail-closed)."""
+    """If the funding tx never confirms within the timeout, fund() re-raises the typed
+    InsufficientConfirmationsError rather than returning an unconfirmed amount
+    (still fail-closed). Uses a tiny but non-zero timeout — the cbd5fc0 fix-up ctor
+    validation rejects ``poll_s > 0 and timeout_s == 0`` (silent zero-budget loop)."""
     taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
     terms = _terms(maker_kp=maker, taker_kp=taker)
     bc = FakeBroadcaster()
@@ -334,12 +338,14 @@ async def test_fund_poll_times_out_still_fail_closed():
         claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
         fee_sats=500,
         min_confirmations=1,
-        fund_confirm_poll_s=0.01,
-        fund_confirm_timeout_s=0.0,
+        fund_confirm_poll_s=0.005,
+        fund_confirm_timeout_s=0.05,  # one or two retries then timeout
     )
     bc._txid = _fund_built_txid(terms, leg, taker)
-    with pytest.raises(NetworkError, match="confirmations, required"):
+    with pytest.raises(InsufficientConfirmationsError) as ei:
         await leg.fund(terms)
+    assert ei.value.have == 0
+    assert ei.value.required == 1
 
 
 async def test_fund_poll_does_not_swallow_other_errors():
@@ -370,6 +376,84 @@ async def test_fund_poll_does_not_swallow_other_errors():
     bc._txid = _fund_built_txid(terms, leg, taker)
     with pytest.raises(NetworkError, match="could not read output value"):
         await leg.fund(terms)
+
+
+def test_leg_ctor_accepts_funding_policy_dataclass():
+    """The new policy=FundingPolicy(...) form mirrors the legacy loose kwargs and
+    produces a leg with the same observable shape."""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    leg = BitcoinTaprootLeg(
+        network="bcrt",
+        taker_keypair=taker,
+        funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+        maker_claim_pubkey_xonly=_xonly_of(maker),
+        broadcaster=FakeBroadcaster(),
+        funding_reader=FakeFundingReader(),
+        refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+        claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+        policy=FundingPolicy(fee_sats=750, min_confirmations=3, funding_input_type="p2wpkh"),
+    )
+    assert isinstance(leg.policy, FundingPolicy)
+    assert leg.fee_sats == 750
+    assert leg.min_confirmations == 3
+    assert leg.funding_input_type == "p2wpkh"
+
+
+def test_leg_ctor_rejects_policy_and_legacy_kwargs_mixed():
+    """``policy=`` and the legacy loose kwargs are mutually exclusive — passing both
+    raises so the source-of-truth is never ambiguous."""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    with pytest.raises(ValidationError, match="policy=FundingPolicy"):
+        BitcoinTaprootLeg(
+            network="bcrt",
+            taker_keypair=taker,
+            funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+            maker_claim_pubkey_xonly=_xonly_of(maker),
+            broadcaster=FakeBroadcaster(),
+            funding_reader=FakeFundingReader(),
+            refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+            claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+            policy=FundingPolicy(fee_sats=500),
+            fee_sats=999,  # mixing
+        )
+
+
+def test_leg_ctor_rejects_non_funding_policy_object():
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    with pytest.raises(ValidationError, match="policy must be a FundingPolicy"):
+        BitcoinTaprootLeg(
+            network="bcrt",
+            taker_keypair=taker,
+            funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+            maker_claim_pubkey_xonly=_xonly_of(maker),
+            broadcaster=FakeBroadcaster(),
+            funding_reader=FakeFundingReader(),
+            refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+            claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+            policy={"fee_sats": 500},  # type: ignore[arg-type]
+        )
+
+
+def test_leg_ctor_rejects_poll_without_timeout():
+    """Footgun: ``fund_confirm_poll_s>0`` with ``fund_confirm_timeout_s<=0`` reads as
+    "poll forever" but actually times out on the first retry (deadline = now + 0).
+    The ctor must reject this combination loudly (security-sentinel L1)."""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    with pytest.raises(ValidationError, match="fund_confirm_poll_s > 0 requires"):
+        BitcoinTaprootLeg(
+            network="bcrt",
+            taker_keypair=taker,
+            funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+            maker_claim_pubkey_xonly=_xonly_of(maker),
+            broadcaster=FakeBroadcaster(),
+            funding_reader=FakeFundingReader(),
+            refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+            claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+            fee_sats=500,
+            min_confirmations=1,
+            fund_confirm_poll_s=0.1,
+            fund_confirm_timeout_s=0.0,
+        )
 
 
 # --------------------------------------------------------------------------- claim / refund

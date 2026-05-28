@@ -21,7 +21,7 @@ from pyrxd.network.bitcoin import (
     MempoolSpaceFundingReader,
     _MempoolHttpClient,
 )
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 
 _SPIKE = _Path(__file__).resolve().parent.parent / "docs" / "brainstorms" / "gravity-ref-spike"
 
@@ -137,8 +137,10 @@ async def test_read_output_amount_below_min_confs_fail_closed():
     r = MempoolSpaceFundingReader()
     r._http.tx_status = AsyncMock(return_value={"confirmed": True, "block_height": 800_000})
     r._http.tip_height = AsyncMock(return_value=800_001)  # only 2 confs
-    with pytest.raises(NetworkError, match="confirmations, required"):
+    with pytest.raises(InsufficientConfirmationsError) as ei:
         await r.read_output_amount_sats("ab" * 32, 0, min_confirmations=6)
+    assert ei.value.have == 2
+    assert ei.value.required == 6
 
 
 async def test_read_output_amount_bad_vout_fail_closed():

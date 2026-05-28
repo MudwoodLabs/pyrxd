@@ -8,6 +8,7 @@ from pyrxd.security.errors import (
     ContractExhaustedError,
     CovenantError,
     DmintError,
+    InsufficientConfirmationsError,
     InvalidFundingUtxoError,
     KeyMaterialError,
     MaxAttemptsError,
@@ -44,6 +45,35 @@ class TestExceptionHierarchy:
         # KeyMaterialError and ValidationError must be distinguishable.
         assert not issubclass(KeyMaterialError, ValidationError)
         assert not issubclass(ValidationError, KeyMaterialError)
+
+
+class TestInsufficientConfirmationsError:
+    """Tests for the typed retry-eligible subclass introduced post-cbd5fc0."""
+
+    def test_is_subclass_of_network_error(self) -> None:
+        # Existing handlers catching NetworkError still catch this.
+        assert issubclass(InsufficientConfirmationsError, NetworkError)
+        assert issubclass(InsufficientConfirmationsError, RxdSdkError)
+
+    def test_message_format_and_attrs(self) -> None:
+        exc = InsufficientConfirmationsError(have=2, required=6)
+        assert exc.have == 2
+        assert exc.required == 6
+        # Message preserves the substring older callers may still match on.
+        assert "confirmations, required" in str(exc)
+        assert "2" in str(exc) and "6" in str(exc)
+
+    def test_catchable_as_network_error(self) -> None:
+        with pytest.raises(NetworkError):
+            raise InsufficientConfirmationsError(have=0, required=1)
+
+    def test_catchable_as_specific_class(self) -> None:
+        # The point of the class: a retry guard can discriminate this from generic
+        # NetworkError without substring-matching the message.
+        with pytest.raises(InsufficientConfirmationsError) as ei:
+            raise InsufficientConfirmationsError(have=0, required=1)
+        assert ei.value.have == 0
+        assert ei.value.required == 1
 
 
 class TestRedact:
