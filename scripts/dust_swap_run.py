@@ -99,6 +99,31 @@ class StepReport:
         print(f"\nReport -> {path}")
 
 
+def _atomic_write_mode_600(path: Path, content: str) -> None:
+    """Write ``content`` to ``path`` atomically at mode 0o600.
+
+    The previous ``write_text`` + ``chmod`` was non-atomic: the file existed at
+    umask-default mode (typically 0o664 on multi-user boxes) for the microseconds
+    between create and chmod. A same-group reader (plex, clamav, any backup daemon)
+    with inotify could read every key during that window. ``O_CREAT|O_EXCL`` with
+    explicit mode at open() avoids the race and also rejects a pre-placed symlink.
+    Found by red-team review of cbd5fc0.
+    """
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        # Re-raise after best-effort cleanup so we don't leave a half-written file.
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def _confirm(prompt: str, *, auto_yes: bool) -> None:
     """Block on operator confirmation before an irreversible broadcast.
 
@@ -167,8 +192,12 @@ class _CapturingBroadcaster:
         self.last_raw: bytes | None = None
 
     async def broadcast(self, raw_tx: bytes) -> str:
+        # Assign last_raw AFTER the await succeeds: a transport failure would otherwise
+        # leave stale bytes that the downstream `if last_raw is None` guard would
+        # mistake for a successful broadcast. Found by review of cbd5fc0.
+        txid = await self._inner.broadcast(raw_tx)
         self.last_raw = bytes(raw_tx)
-        return await self._inner.broadcast(raw_tx)
+        return txid
 
 
 class _InMemSeen:
@@ -220,12 +249,33 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     cov = build_htlc_covenant_rxd(
         amount=args.rxd_photons, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
     )
+    # Build the BTC HTLC up-front so we can persist its address (resume must reconstruct
+    # the same taproot output key; persisting it lets resume detect a margin-drift bug
+    # that would otherwise silently swap the refund leaf for a non-matching one).
+    terms = NegotiatedTerms(
+        hashlock=h,
+        btc_sats=args.btc_sats,
+        radiant_amount=args.rxd_photons,
+        t_btc=t_btc,
+        t_rxd=t_rxd,
+        asset_variant="rxd",
+        genesis_ref=b"",
+        taker_dest_hash=cov.expected_taker_hash,
+        maker_dest_hash=cov.expected_maker_hash,
+        btc_claim_pubkey_xonly=claim_xo,
+        btc_refund_pubkey_xonly=refund_xo,
+    )
+    htlc = bt.build_htlc(
+        hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=t_btc, network=btc_network
+    )
 
     # PERSIST ALL RUN STATE NOW (before any address is printed/funded). On a real run
     # these hold real value: the taker BTC key receives your funding + signs the refund;
     # the maker BTC key signs the claim; the RXD keys + covenant SPK locate/spend the
     # RXD leg. A crash after you fund but before completion would STRAND the value
-    # without these WIFs. Written mode-600.
+    # without these WIFs. Written mode-600 ATOMICALLY (O_EXCL avoids a write-then-chmod
+    # race that would expose the file at umask-default mode for a few microseconds —
+    # a window plex/clamav/any same-group reader could win).
     #
     # The preimage p IS persisted here — in a SINGLE-OPERATOR run this file already
     # holds maker_btc_wif (the claim key) and every key that can move every output, so
@@ -234,40 +284,56 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     # on-chain would otherwise lose it permanently, forcing a timelock refund — exactly
     # the failure we hit on the first run). p stays out of the report and the logs; this
     # mode-600 recovery file is its only on-disk home. Delete the whole file after sweep.
-    keys_path = Path(args.keys_out).expanduser()
-    keys_path.write_text(json.dumps({
-        "created_unix": int(time.time()), "stage": args.stage, "btc_network": btc_network,
+    keys_payload = {
+        "created_unix": int(time.time()),
+        "stage": args.stage,
+        "btc_network": btc_network,
         "hashlock_H": h.hex(),
         "preimage_p_hex": p.hex(),  # recovery only; same trust domain as the WIFs below
-        "taker_btc_wif": taker_btc_kp.unsafe_wif(), "taker_btc_p2wpkh": taker_btc_kp.p2wpkh_address,
+        "taker_btc_wif": taker_btc_kp.unsafe_wif(),
+        "taker_btc_p2wpkh": taker_btc_kp.p2wpkh_address,
         "maker_btc_wif_raw_hex": maker_btc.secret.hex(),
-        "taker_rxd_wif": taker_rxd.wif(), "maker_rxd_wif": maker_rxd.wif(),
+        "taker_rxd_wif": taker_rxd.wif(),
+        "maker_rxd_wif": maker_rxd.wif(),
         "rxd_covenant_spk": cov.funded_spk.hex(),
-        "btc_claim_payout_spk": args.btc_claim_payout, "btc_refund_payout_spk": args.btc_refund_payout,
+        "btc_claim_payout_spk": args.btc_claim_payout,
+        "btc_refund_payout_spk": args.btc_refund_payout,
+        # Persist the SCALARS the resume needs to rebuild the SAME taproot output key
+        # (and assert the rebuild matches). Without these, resume re-measures the margin
+        # and could derive a different t_btc -> different refund leaf -> taproot key
+        # that doesn't match the on-chain HTLC. Found by review of cbd5fc0.
+        "t_btc_blocks": t_btc.value,
+        "t_rxd_blocks": t_rxd.value,
+        "margin_blocks": margin_blocks,
+        "btc_htlc_address": htlc.address,
         "note": "ALL run state for recovery/sweep incl preimage p. Single point of total "
-                "compromise — mode 600, delete after sweep.",
-    }, indent=2))
-    keys_path.chmod(0o600)
+        "compromise — mode 600, delete after sweep.",
+    }
+    keys_path = Path(args.keys_out).expanduser()
+    _atomic_write_mode_600(keys_path, json.dumps(keys_payload, indent=2))
     print(f"  run keys persisted -> {keys_path} (mode 600) — for recovery/sweep")
-    terms = NegotiatedTerms(
-        hashlock=h, btc_sats=args.btc_sats, radiant_amount=args.rxd_photons, t_btc=t_btc, t_rxd=t_rxd,
-        asset_variant="rxd", genesis_ref=b"", taker_dest_hash=cov.expected_taker_hash,
-        maker_dest_hash=cov.expected_maker_hash, btc_claim_pubkey_xonly=claim_xo, btc_refund_pubkey_xonly=refund_xo,
+    print(
+        f"  terms: btc_sats={args.btc_sats} rxd_photons={args.rxd_photons} "
+        f"t_btc={t_btc.value} t_rxd={t_rxd.value} margin={margin_blocks}"
     )
-    htlc = bt.build_htlc(hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo,
-                         timeout=t_btc, network=btc_network)
-    print(f"  terms: btc_sats={args.btc_sats} rxd_photons={args.rxd_photons} "
-          f"t_btc={t_btc.value} t_rxd={t_rxd.value} margin={margin_blocks}")
     print(f"  BTC HTLC funding address ({btc_network}): {htlc.address}")
     print(f"  RXD covenant SPK (fund this as the maker): {cov.funded_spk.hex()}")
 
     if not do_broadcast:
         # dry-run: build the txs, report the addresses/terms, stop before any broadcast.
-        report.step(name="dry_run_built", chain="both", btc_htlc_address=htlc.address,
-                    rxd_covenant_spk=cov.funded_spk.hex(), t_btc=t_btc.value, t_rxd=t_rxd.value)
+        report.step(
+            name="dry_run_built",
+            chain="both",
+            btc_htlc_address=htlc.address,
+            rxd_covenant_spk=cov.funded_spk.hex(),
+            t_btc=t_btc.value,
+            t_rxd=t_rxd.value,
+        )
         report.dump(args.report_out)
-        print("\n  DRY-RUN complete: real txs are buildable; nothing broadcast. "
-              "Next: SIGNET stage for the first real BTC consensus check.")
+        print(
+            "\n  DRY-RUN complete: real txs are buildable; nothing broadcast. "
+            "Next: SIGNET stage for the first real BTC consensus check."
+        )
         return
 
     # ---- transports (broadcast stages) ----
@@ -290,31 +356,53 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     funding_utxo = BtcUtxo(txid=fu["txid"], vout=fu["vout"], value=fu["value_sats"])
 
     btc_leg = BitcoinTaprootLeg(
-        network=btc_network, taker_keypair=taker_btc_kp, funding_utxo=funding_utxo,
-        maker_claim_pubkey_xonly=claim_xo, broadcaster=btc_broadcaster, funding_reader=btc_reader,
-        refund_to_scriptpubkey=btc_refund_payout, claim_to_scriptpubkey=btc_claim_payout,
-        fee_sats=args.btc_fee_sats, min_confirmations=1, funding_input_type="p2wpkh",
-        maker_claim_privkey=maker_btc.secret, audit_cleared=audit_cleared,
+        network=btc_network,
+        taker_keypair=taker_btc_kp,
+        funding_utxo=funding_utxo,
+        maker_claim_pubkey_xonly=claim_xo,
+        broadcaster=btc_broadcaster,
+        funding_reader=btc_reader,
+        refund_to_scriptpubkey=btc_refund_payout,
+        claim_to_scriptpubkey=btc_claim_payout,
+        fee_sats=args.btc_fee_sats,
+        min_confirmations=1,
+        funding_input_type="p2wpkh",
+        maker_claim_privkey=maker_btc.secret,
+        audit_cleared=audit_cleared,
         # On mainnet/signet there is no on-demand mining, so the just-broadcast HTLC
         # funding tx is 0-conf when fund() reads its amount back. Poll for the conf
         # instead of failing instantly (the bug that stranded the first run).
-        fund_confirm_poll_s=args.poll_interval_s, fund_confirm_timeout_s=args.fund_confirm_timeout_s,
+        fund_confirm_poll_s=args.poll_interval_s,
+        fund_confirm_timeout_s=args.fund_confirm_timeout_s,
     )
     rxd_leg = RadiantCovenantLeg(
-        network=args.rxd_network, taker_pkh=taker_pkh, maker_pkh=maker_pkh,
-        chain_io=RadiantChainIO(rxd_client), fee_source=_SshTrFeeSource(rxd_client, args.rxd_fee_photons),
-        min_confirmations=1, audit_cleared=audit_cleared,
+        network=args.rxd_network,
+        taker_pkh=taker_pkh,
+        maker_pkh=maker_pkh,
+        chain_io=RadiantChainIO(rxd_client),
+        fee_source=_SshTrFeeSource(rxd_client, args.rxd_fee_photons),
+        min_confirmations=1,
+        audit_cleared=audit_cleared,
     )
     coord = SwapCoordinator(
-        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms), btc_leg=btc_leg, radiant_leg=rxd_leg,
-        indexer=None, seen_store=_InMemSeen(), config=CoordinatorConfig(margin_policy=policy),
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        btc_leg=btc_leg,
+        radiant_leg=rxd_leg,
+        indexer=None,
+        seen_store=_InMemSeen(),
+        config=CoordinatorConfig(margin_policy=policy),
     )
 
     # 1. Taker funds the BTC HTLC.
     _confirm(f"taker_funds_btc: broadcast the {btc_network} P2TR HTLC funding tx", auto_yes=args.yes)
     rec = await coord.taker_funds_btc(terms)
-    report.step(name="taker_funds_btc", chain="btc", state=rec.state.value,
-                txid=rec.btc_locator.funding_outpoint.txid, amount_sats=rec.btc_locator.amount_sats)
+    report.step(
+        name="taker_funds_btc",
+        chain="btc",
+        state=rec.state.value,
+        txid=rec.btc_locator.funding_outpoint.txid,
+        amount_sats=rec.btc_locator.amount_sats,
+    )
     print(f"  -> {rec.state.value} (HTLC funded: {rec.btc_locator.funding_outpoint.txid})")
 
     # 2. Maker locks the RXD covenant (operator pays the SPK), taker re-validates.
@@ -325,15 +413,21 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     rxd_locked_at = int(json.loads(_rxd_blockcount(rxd_client)))
     _confirm("you have funded the RXD covenant SPK on mainnet and it has >= 1 conf", auto_yes=args.yes)
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
-    report.step(name="post_asset_lock_revalidate", chain="rxd", state=rec.state.value,
-                covenant_outpoint=rec.radiant_covenant_outpoint)
+    report.step(
+        name="post_asset_lock_revalidate",
+        chain="rxd",
+        state=rec.state.value,
+        covenant_outpoint=rec.radiant_covenant_outpoint,
+    )
     print(f"  -> {rec.state.value}")
     if rec.state is not SwapState.BOTH_LOCKED:
         report.dump(args.report_out)
         raise SystemExit(f"covenant mismatch -> {rec.state.value}; refund the BTC HTLC after t_btc (taker_refund_btc)")
 
-    print("\n  *** MONITORING WINDOW (BOTH_LOCKED): poll maybe_refund_asset_on_maker_stall well inside "
-          "maker_stall_safety_window_blocks. Do NOT walk away — the maker-stall steal is the real loss path. ***")
+    print(
+        "\n  *** MONITORING WINDOW (BOTH_LOCKED): poll maybe_refund_asset_on_maker_stall well inside "
+        "maker_stall_safety_window_blocks. Do NOT walk away — the maker-stall steal is the real loss path. ***"
+    )
 
     # 3. Maker claims BTC, revealing p.
     _confirm("maker_claims_btc: broadcast the BTC claim (reveals p on-chain)", auto_yes=args.yes)
@@ -345,17 +439,26 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     print(f"  -> {rec.state.value} (BTC claim txid {btc_claim_txid})")
 
     # 4. Taker reads the maker's claim off the BTC chain, runs the REORG GATE, claims RXD.
-    print(f"\n  Waiting for the BTC claim to bury to {policy.btc_claim_reorg_depth.value} confs "
-          "before the reorg gate returns SAFE (poll loop).")
+    print(
+        f"\n  Waiting for the BTC claim to bury to {policy.btc_claim_reorg_depth.value} confs "
+        "before the reorg gate returns SAFE (poll loop)."
+    )
     while True:
         claim_raw = await btc_chain_reader.get_raw_tx(btc_claim_txid, min_confirmations=0)
         now_rxd = int(json.loads(_rxd_blockcount(rxd_client)))
         rec = await coord.taker_scrape_and_claim_asset(
-            bytes(claim_raw), now_rxd_height=now_rxd, asset_locked_at_height=rxd_locked_at,
+            bytes(claim_raw),
+            now_rxd_height=now_rxd,
+            asset_locked_at_height=rxd_locked_at,
         )
         if rec.state is SwapState.COMPLETED:
-            report.step(name="taker_scrape_and_claim_asset", chain="rxd", state=rec.state.value,
-                        covenant_outpoint=rec.radiant_covenant_outpoint, btc_claim_txid=str(btc_claim_txid))
+            report.step(
+                name="taker_scrape_and_claim_asset",
+                chain="rxd",
+                state=rec.state.value,
+                covenant_outpoint=rec.radiant_covenant_outpoint,
+                btc_claim_txid=str(btc_claim_txid),
+            )
             print(f"  -> {rec.state.value} — CROSS-CHAIN SWAP COMPLETE")
             break
         # WAIT (still SECRET_REVEALED): the claim isn't deep enough yet. Poll again.
@@ -393,11 +496,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--rxd-claim-burial", type=int, default=2)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
-    ap.add_argument("--fund-confirm-timeout-s", type=float, default=7200.0,
-                    help="max wait for the HTLC funding tx to reach 1 conf before fund() gives up (default 2h)")
+    ap.add_argument(
+        "--fund-confirm-timeout-s",
+        type=float,
+        default=7200.0,
+        help="max wait for the HTLC funding tx to reach 1 conf before fund() gives up (default 2h)",
+    )
     ap.add_argument("--report-out", default="dust_swap_report.json")
-    ap.add_argument("--keys-out", default="dust_run_keys.json",
-                    help="mode-600 file holding all run keys for recovery/sweep (NEVER the preimage)")
+    ap.add_argument(
+        "--keys-out",
+        default="~/.gravity_dust_run_keys.json",
+        help="mode-600 file holding ALL run state INCLUDING preimage p — single point of "
+        "total compromise. Default lives in $HOME (mode-700 dir). Delete after sweep.",
+    )
     args = ap.parse_args(argv)
     if _STAGES[args.stage]["broadcast"] and (not args.btc_claim_payout or not args.btc_refund_payout):
         ap.error("--btc-claim-payout and --btc-refund-payout (scriptPubKey hex) are required for broadcast stages")
