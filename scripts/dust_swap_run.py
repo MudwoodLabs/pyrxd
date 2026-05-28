@@ -216,9 +216,39 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
+
     cov = build_htlc_covenant_rxd(
         amount=args.rxd_photons, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
     )
+
+    # PERSIST ALL RUN STATE NOW (before any address is printed/funded). On a real run
+    # these hold real value: the taker BTC key receives your funding + signs the refund;
+    # the maker BTC key signs the claim; the RXD keys + covenant SPK locate/spend the
+    # RXD leg. A crash after you fund but before completion would STRAND the value
+    # without these WIFs. Written mode-600.
+    #
+    # The preimage p IS persisted here — in a SINGLE-OPERATOR run this file already
+    # holds maker_btc_wif (the claim key) and every key that can move every output, so
+    # it is already the single point of total compromise; withholding p from the SAME
+    # file buys no secrecy yet costs crash-resilience (a crash before p is revealed
+    # on-chain would otherwise lose it permanently, forcing a timelock refund — exactly
+    # the failure we hit on the first run). p stays out of the report and the logs; this
+    # mode-600 recovery file is its only on-disk home. Delete the whole file after sweep.
+    keys_path = Path(args.keys_out).expanduser()
+    keys_path.write_text(json.dumps({
+        "created_unix": int(time.time()), "stage": args.stage, "btc_network": btc_network,
+        "hashlock_H": h.hex(),
+        "preimage_p_hex": p.hex(),  # recovery only; same trust domain as the WIFs below
+        "taker_btc_wif": taker_btc_kp.unsafe_wif(), "taker_btc_p2wpkh": taker_btc_kp.p2wpkh_address,
+        "maker_btc_wif_raw_hex": maker_btc.secret.hex(),
+        "taker_rxd_wif": taker_rxd.wif(), "maker_rxd_wif": maker_rxd.wif(),
+        "rxd_covenant_spk": cov.funded_spk.hex(),
+        "btc_claim_payout_spk": args.btc_claim_payout, "btc_refund_payout_spk": args.btc_refund_payout,
+        "note": "ALL run state for recovery/sweep incl preimage p. Single point of total "
+                "compromise — mode 600, delete after sweep.",
+    }, indent=2))
+    keys_path.chmod(0o600)
+    print(f"  run keys persisted -> {keys_path} (mode 600) — for recovery/sweep")
     terms = NegotiatedTerms(
         hashlock=h, btc_sats=args.btc_sats, radiant_amount=args.rxd_photons, t_btc=t_btc, t_rxd=t_rxd,
         asset_variant="rxd", genesis_ref=b"", taker_dest_hash=cov.expected_taker_hash,
@@ -265,6 +295,10 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         refund_to_scriptpubkey=btc_refund_payout, claim_to_scriptpubkey=btc_claim_payout,
         fee_sats=args.btc_fee_sats, min_confirmations=1, funding_input_type="p2wpkh",
         maker_claim_privkey=maker_btc.secret, audit_cleared=audit_cleared,
+        # On mainnet/signet there is no on-demand mining, so the just-broadcast HTLC
+        # funding tx is 0-conf when fund() reads its amount back. Poll for the conf
+        # instead of failing instantly (the bug that stranded the first run).
+        fund_confirm_poll_s=args.poll_interval_s, fund_confirm_timeout_s=args.fund_confirm_timeout_s,
     )
     rxd_leg = RadiantCovenantLeg(
         network=args.rxd_network, taker_pkh=taker_pkh, maker_pkh=maker_pkh,
@@ -359,7 +393,11 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--rxd-claim-burial", type=int, default=2)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
     ap.add_argument("--poll-interval-s", type=float, default=60.0)
+    ap.add_argument("--fund-confirm-timeout-s", type=float, default=7200.0,
+                    help="max wait for the HTLC funding tx to reach 1 conf before fund() gives up (default 2h)")
     ap.add_argument("--report-out", default="dust_swap_report.json")
+    ap.add_argument("--keys-out", default="dust_run_keys.json",
+                    help="mode-600 file holding all run keys for recovery/sweep (NEVER the preimage)")
     args = ap.parse_args(argv)
     if _STAGES[args.stage]["broadcast"] and (not args.btc_claim_payout or not args.btc_refund_payout):
         ap.error("--btc-claim-payout and --btc-refund-payout (scriptPubKey hex) are required for broadcast stages")

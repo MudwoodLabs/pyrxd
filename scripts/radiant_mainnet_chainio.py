@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shlex
 import subprocess
 
 from pyrxd.network.electrumx import UtxoRecord
@@ -70,16 +71,23 @@ class SshTrRadiantClient:
 
     # -- transport ----------------------------------------------------------
     def _cli_argv(self, *cli_args: str) -> list[str]:
-        """Build the argv (NO shell). Every cli_arg is a discrete list element."""
-        inner = ["radiant-cli"]
+        """Build the ssh argv.
+
+        ssh ALWAYS joins the remote command words with spaces into a single string and
+        hands that to the remote login SHELL, which re-parses it. So a remote arg with
+        spaces or shell-special chars (the scantxoutset descriptor JSON: spaces, quotes,
+        ``[]{}``) is mangled unless we quote it for the REMOTE shell. We shlex.quote each
+        remote token so the remote shell reconstructs exactly the argv we intend. (The
+        prior version relied on a bare space-join and silently corrupted JSON args — the
+        scantxoutset failure that stalled the dust run.) Inputs are still our own
+        hex/ints/known-method-names + the descriptor we build, never untrusted strings.
+        """
+        inner = ["docker", "exec", self._container, "radiant-cli"]
         if self._rpcwallet:
             inner.append(f"-rpcwallet={self._rpcwallet}")
         inner += list(cli_args)
-        # ssh runs `docker exec <container> radiant-cli …`. Passed as one remote
-        # command list; ssh joins them with spaces, but since WE control the argv and
-        # never interpolate untrusted strings into a shell string, there is no
-        # injection surface (the args are hex/ints/known method names).
-        return ["ssh", "-o", "ConnectTimeout=10", self._ssh_host, "docker", "exec", self._container, *inner]
+        remote = " ".join(shlex.quote(tok) for tok in inner)
+        return ["ssh", "-o", "ConnectTimeout=10", self._ssh_host, remote]
 
     def _run_sync(self, *cli_args: str) -> object:
         r = subprocess.run(self._cli_argv(*cli_args), capture_output=True, text=True, timeout=self._timeout)
@@ -109,9 +117,12 @@ class SshTrRadiantClient:
         spk = self._spk_by_hash.get(bytes(script_hash))
         if spk is None:
             return []  # unregistered SPK -> no UTXOs (the leg fail-closes on empty)
-        # scantxoutset descriptor "raw(<spk hex>)" — the hex is a discrete argv element
-        # inside a JSON array string; no shell, no interpolation into a command line.
-        desc = json.dumps([{"desc": f"raw({spk.hex()})"}])
+        # scantxoutset descriptor "raw(<spk hex>)". ssh joins the remote argv with
+        # SPACES into one shell command string, so the descriptor JSON must contain NO
+        # spaces or the remote shell word-splits it (e.g. '[{"desc": "raw(..)"}]' splits
+        # at the space after the colon -> scantxoutset rejects a malformed action). Use
+        # compact separators so the whole descriptor stays a single shell token.
+        desc = json.dumps([{"desc": f"raw({spk.hex()})"}], separators=(",", ":"))
         res = await self._run("scantxoutset", "start", desc)
         if not isinstance(res, dict):
             raise RuntimeError("scantxoutset did not return a dict")
@@ -126,7 +137,7 @@ class SshTrRadiantClient:
         return out
 
     # -- fee-UTXO carving (the RXD covenant spend needs a separate plain fee input) ---
-    def carve_fee_input(self, amount_photons: int, fee_photons: int = 2_000_000):
+    def carve_fee_input(self, amount_photons: int, fee_photons: int = 4_000_000):
         """Carve a plain-P2PKH fee UTXO from the wallet -> a gravity.htlc_spend.FeeInput.
 
         SYNCHRONOUS (called from FeeSource.next_fee_input, which the leg invokes inside
@@ -136,6 +147,12 @@ class SshTrRadiantClient:
         build+sign a 1-in/2-out tx (fee output + change) with the repo Transaction
         builder, broadcast, return the fee output as input 0. Targets the wallet named
         by rpcwallet, or the single loaded (often unnamed) wallet if rpcwallet is empty.
+
+        Default ``fee_photons`` covers the carve tx's OWN relay fee (the tr mainnet
+        node runs relayfee 0.10 RXD/kB; a ~340-byte carve needs >= 3.4M photons).
+        ``amount_photons`` is what the carved UTXO holds — that becomes the fee paid
+        BY the covenant spend, which is far larger (~11 KB) and needs ~100M+ photons
+        at the same rate. Caller picks both.
         """
         from pyrxd.gravity.htlc_spend import FeeInput
         from pyrxd.keys import PrivateKey

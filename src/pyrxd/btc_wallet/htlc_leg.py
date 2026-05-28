@@ -217,6 +217,8 @@ class BitcoinTaprootLeg:
         funding_input_type: str = "p2wpkh",
         maker_claim_privkey: bytes | None = None,
         audit_cleared: bool = False,
+        fund_confirm_poll_s: float = 0.0,
+        fund_confirm_timeout_s: float = 0.0,
     ) -> None:
         require_audit_cleared(network, audit_cleared=audit_cleared)
         if not isinstance(taker_keypair, BtcKeypair):
@@ -231,6 +233,8 @@ class BitcoinTaprootLeg:
             raise ValidationError("fee_sats must be a positive int")
         if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 0:
             raise ValidationError("min_confirmations must be a non-negative int")
+        if fund_confirm_poll_s < 0 or fund_confirm_timeout_s < 0:
+            raise ValidationError("fund_confirm_poll_s/fund_confirm_timeout_s must be non-negative")
         self.network = network
         self.taker_keypair = taker_keypair
         self.funding_utxo = funding_utxo
@@ -244,6 +248,13 @@ class BitcoinTaprootLeg:
         self.fee_sats = fee_sats
         self.min_confirmations = min_confirmations
         self.funding_input_type = funding_input_type
+        # When the funding tx is broadcast by THIS leg (mainnet has no on-demand
+        # mining), the post-broadcast on-chain readback can't be satisfied for ~1
+        # block. If a poll interval is set, fund() waits up to the timeout for the tx
+        # to reach min_confirmations instead of failing instantly. 0 = no poll (the
+        # historical regtest behaviour, where the test mines between broadcast/read).
+        self.fund_confirm_poll_s = float(fund_confirm_poll_s)
+        self.fund_confirm_timeout_s = float(fund_confirm_timeout_s)
         # Optional: only a MAKER-role leg holds the claim key. Held in-memory only,
         # never persisted (it is the maker's spending key for the claim leaf).
         self._maker_claim_privkey = (
@@ -337,12 +348,51 @@ class BitcoinTaprootLeg:
             )
         outpoint = t.BtcOutpoint(txid=str(funding_txid), vout=0)
         # D4: read the funded amount from the on-chain output, not the builder.
-        on_chain_amount = await self.funding_reader.read_output_amount_sats(
-            str(funding_txid), 0, min_confirmations=self.min_confirmations
-        )
+        # On a chain we can't mine on demand (mainnet/signet), the just-broadcast tx
+        # has 0 confs, so poll for min_confirmations when configured; otherwise read
+        # once (regtest mines between broadcast and read).
+        on_chain_amount = await self._read_funded_amount_sats(str(funding_txid), 0)
         if not isinstance(on_chain_amount, int) or isinstance(on_chain_amount, bool) or on_chain_amount <= 0:
             raise NetworkError("funding reader returned a non-positive on-chain amount; fail-closed")
         return htlc.with_funding(outpoint, on_chain_amount)
+
+    async def _read_funded_amount_sats(self, funding_txid: str, vout: int) -> int:
+        """Read the on-chain funded amount, polling for min_confirmations if configured.
+
+        ``read_output_amount_sats`` is fail-closed: it RAISES until the tx reaches
+        min_confirmations. On regtest a block is mined between broadcast and read, so a
+        single call works. On a chain without on-demand mining the just-broadcast tx is
+        0-conf, so when ``fund_confirm_poll_s`` is set this retries on that specific
+        "needs N confs" NetworkError until the deadline, then gives up (still
+        fail-closed — it re-raises the last error rather than returning an unconfirmed
+        amount). Any OTHER error (bad vout, malformed tx) propagates immediately.
+        """
+        import asyncio
+        import time as _time
+
+        if self.fund_confirm_poll_s <= 0:
+            return await self.funding_reader.read_output_amount_sats(
+                funding_txid, vout, min_confirmations=self.min_confirmations
+            )
+        deadline = _time.monotonic() + self.fund_confirm_timeout_s
+        while True:
+            try:
+                return await self.funding_reader.read_output_amount_sats(
+                    funding_txid, vout, min_confirmations=self.min_confirmations
+                )
+            except NetworkError as exc:
+                # Only retry the "not enough confirmations yet" case; everything else
+                # (OOB vout, malformed value) is a real fault — fail closed now.
+                if "confirmations, required" not in str(exc):
+                    raise
+                if _time.monotonic() >= deadline:
+                    raise
+                logging.getLogger(__name__).info(
+                    "fund(): %s — waiting %.0fs for funding tx to confirm",
+                    exc,
+                    self.fund_confirm_poll_s,
+                )
+                await asyncio.sleep(self.fund_confirm_poll_s)
 
     async def claim(self, locator: t.BtcHtlcLocator, preimage: bytes) -> str:
         """Build + idempotently broadcast the maker's claim tx (reveals ``p``).

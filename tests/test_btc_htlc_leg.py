@@ -247,6 +247,131 @@ async def test_fund_fail_closed_on_shallow_funding():
         await leg.fund(terms)
 
 
+class _ShallowThenConfirmReader(FakeFundingReader):
+    """Raises the 'not enough confs' NetworkError ``shallow_calls`` times, then returns
+    the amount — models a just-broadcast tx that confirms after a few polls. The message
+    matches the substring fund()'s retry-guard keys on."""
+
+    def __init__(self, *, shallow_calls: int, amount_sats: int = 100_000) -> None:
+        super().__init__(amount_sats=amount_sats)
+        self._remaining = shallow_calls
+        self.read_calls = 0
+
+    async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
+        self.read_calls += 1
+        if self._remaining > 0:
+            self._remaining -= 1
+            raise NetworkError(f"tx has 0 confirmations, required {min_confirmations}")
+        return self.amount_sats
+
+
+def _fund_built_txid(terms, leg, taker):
+    from pyrxd.btc_wallet.payment import build_payment_tx
+
+    htlc = t.build_htlc(
+        hashlock=terms.hashlock,
+        claim_pubkey_xonly=terms.btc_claim_pubkey_xonly,
+        refund_pubkey_xonly=terms.btc_refund_pubkey_xonly,
+        timeout=terms.t_btc,
+        network="bcrt",
+    )
+    built = build_payment_tx(
+        taker,
+        leg.funding_utxo,
+        to_hash=htlc.output_key,
+        to_type="p2tr",
+        amount_sats=terms.btc_sats,
+        fee_sats=500,
+        input_type="p2wpkh",
+    )
+    return built.txid
+
+
+async def test_fund_polls_for_confirmation_when_configured():
+    """Regression for the first-mainnet-run bug: fund() broadcasts then reads the amount
+    back, but on a chain without on-demand mining the tx is 0-conf for ~1 block. With a
+    poll interval set, fund() retries the 'needs confs' error until the tx confirms
+    instead of failing instantly. (poll_s tiny so the test is fast.)"""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    terms = _terms(maker_kp=maker, taker_kp=taker)
+    bc = FakeBroadcaster()
+    reader = _ShallowThenConfirmReader(shallow_calls=2, amount_sats=terms.btc_sats)
+    leg = BitcoinTaprootLeg(
+        network="bcrt",
+        taker_keypair=taker,
+        funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+        maker_claim_pubkey_xonly=_xonly_of(maker),
+        broadcaster=bc,
+        funding_reader=reader,
+        refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+        claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+        fee_sats=500,
+        min_confirmations=1,
+        fund_confirm_poll_s=0.01,
+        fund_confirm_timeout_s=30.0,
+    )
+    bc._txid = _fund_built_txid(terms, leg, taker)
+    locator = await leg.fund(terms)
+    assert locator.amount_sats == terms.btc_sats
+    assert reader.read_calls == 3  # 2 shallow + 1 success
+
+
+async def test_fund_poll_times_out_still_fail_closed():
+    """If the funding tx never confirms within the timeout, fund() re-raises the conf
+    error rather than returning an unconfirmed amount (still fail-closed)."""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    terms = _terms(maker_kp=maker, taker_kp=taker)
+    bc = FakeBroadcaster()
+    reader = _ShallowThenConfirmReader(shallow_calls=10**9)  # never confirms
+    leg = BitcoinTaprootLeg(
+        network="bcrt",
+        taker_keypair=taker,
+        funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+        maker_claim_pubkey_xonly=_xonly_of(maker),
+        broadcaster=bc,
+        funding_reader=reader,
+        refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+        claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+        fee_sats=500,
+        min_confirmations=1,
+        fund_confirm_poll_s=0.01,
+        fund_confirm_timeout_s=0.0,
+    )
+    bc._txid = _fund_built_txid(terms, leg, taker)
+    with pytest.raises(NetworkError, match="confirmations, required"):
+        await leg.fund(terms)
+
+
+async def test_fund_poll_does_not_swallow_other_errors():
+    """A non-confirmation NetworkError (e.g. bad vout) must NOT be retried — it
+    propagates immediately even with polling enabled."""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    terms = _terms(maker_kp=maker, taker_kp=taker)
+    bc = FakeBroadcaster()
+
+    class _BadVoutReader(FakeFundingReader):
+        async def read_output_amount_sats(self, txid, vout, *, min_confirmations):
+            raise NetworkError("could not read output value for deadbeef…:0")
+
+    leg = BitcoinTaprootLeg(
+        network="bcrt",
+        taker_keypair=taker,
+        funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+        maker_claim_pubkey_xonly=_xonly_of(maker),
+        broadcaster=bc,
+        funding_reader=_BadVoutReader(),
+        refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+        claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+        fee_sats=500,
+        min_confirmations=1,
+        fund_confirm_poll_s=0.01,
+        fund_confirm_timeout_s=30.0,
+    )
+    bc._txid = _fund_built_txid(terms, leg, taker)
+    with pytest.raises(NetworkError, match="could not read output value"):
+        await leg.fund(terms)
+
+
 # --------------------------------------------------------------------------- claim / refund
 
 
