@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import os
 import struct
 import time
@@ -27,6 +28,13 @@ from pyrxd.gravity.swap_coordinator import measure_margin_from_btc_block_times
 from pyrxd.network.bitcoin import MempoolSpaceSource
 
 _MAINNET_BTC_API = "https://mempool.space/api"
+
+# HTTP request timeout for mempool.space — caps the worst-case stall on any single call
+# so a hostile/flaky endpoint can't push wall-clock far past the resume_deadline check.
+# Tuned conservatively: each call is a few KB at most, 30s is enough headroom even on a
+# slow link. Without this, aiohttp's default 5-min per-request timeout would let a single
+# stuck request blow through the deadline by minutes. (Red-team finding NEW #7 on 44707a3.)
+HTTP_REQUEST_TIMEOUT_S = 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +143,48 @@ def atomic_write_mode_600(path: Path, content: str) -> None:
         raise
 
 
+def validated_resume_deadline_s(
+    *,
+    operator_value: float | None,
+    t_rxd_blocks: int,
+    rxd_block_interval_s: float,
+    safety_factor: float = 0.5,
+    floor_s: float = 600.0,
+) -> float:
+    """Return a safe deadline (seconds) for the post-claim WAIT loop.
+
+    The deadline exists so a hostile or flaky chain reader can't stall the loop past
+    ``t_rxd`` (after which the maker can refund the asset and the taker has forfeited).
+    Best-practice bound is ``safety_factor × t_rxd_seconds`` — past that, the operator
+    has already lost on every counterparty-honest analysis.
+
+    * Rejects ``inf`` / ``nan`` / ``<= 0`` (footgun: ``--resume-deadline-s inf`` re-opens
+      the unbounded-loop attack the deadline was meant to close).
+    * Caps any operator-supplied value at ``safety_factor × t_rxd × interval`` to keep
+      the operator from accidentally setting a deadline LONGER than t_rxd.
+    * Floor at ``floor_s`` so a tiny ``t_rxd`` (test config) still gets a sane minimum.
+
+    Found by sec-sentinel + red-team review of 44707a3 (the prior default 4h exceeded
+    the default ~1.67h t_rxd — bound was strictly above the window it was meant to fit
+    inside).
+    """
+    t_rxd_seconds = float(t_rxd_blocks) * float(rxd_block_interval_s)
+    upper_bound = max(safety_factor * t_rxd_seconds, floor_s)
+    if operator_value is None:
+        return upper_bound
+    if not math.isfinite(operator_value) or operator_value <= 0:
+        raise SystemExit(f"--resume-deadline-s must be a finite positive number, got {operator_value!r}")
+    if operator_value > upper_bound:
+        print(
+            f"  WARN: --resume-deadline-s={operator_value:.0f}s exceeds the safe "
+            f"upper bound ({upper_bound:.0f}s = {safety_factor:.1f} × t_rxd of "
+            f"{t_rxd_seconds:.0f}s). Capping to the upper bound to keep the deadline "
+            "INSIDE the t_rxd window."
+        )
+        return upper_bound
+    return operator_value
+
+
 def rxd_blockcount(client) -> int:
     """``getblockcount`` over the ssh-tr shim, normalised to ``int``.
 
@@ -203,11 +253,26 @@ class StepReport:
         print(f"  [report] {json.dumps(entry)}")
 
     def dump(self, path: str) -> None:
-        Path(path).write_text(json.dumps(self.doc, indent=2))
-        print(f"\nReport -> {path}")
+        """Write the report at mode 0o600.
+
+        The report contains the BTC funding txid, HTLC address, measured margin policy,
+        and step timings — enough to link operator identity to a real on-chain HTLC
+        (red-team finding NEW #2 on 44707a3). The keys file is already mode-600; the
+        report living alongside at default umask was an inconsistency. Replaces the
+        file if it exists (unlike the keys file's O_EXCL guard — reports are operator
+        artifacts that may be rewritten across runs).
+        """
+        p = Path(path).expanduser()
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+        atomic_write_mode_600(p, json.dumps(self.doc, indent=2))
+        print(f"\nReport -> {p}")
 
 
 __all__ = [
+    "HTTP_REQUEST_TIMEOUT_S",
     "CapturingBroadcaster",
     "InMemSeen",
     "SshTrFeeSource",
@@ -216,6 +281,7 @@ __all__ = [
     "confirm",
     "measured_margin_from_mainnet",
     "rxd_blockcount",
+    "validated_resume_deadline_s",
 ]
 
 

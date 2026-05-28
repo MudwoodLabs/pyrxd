@@ -55,6 +55,7 @@ from _dust_swap_shared import (
     confirm,
     measured_margin_from_mainnet,
     rxd_blockcount,
+    validated_resume_deadline_s,
 )
 from radiant_mainnet_chainio import SshTrRadiantClient
 
@@ -75,7 +76,15 @@ async def resume(args) -> None:
     # file is a one-up-arrow bypass. We pass audit_cleared through to BOTH legs
     # explicitly instead of hardcoding True.
     _AUDIT_CLEARED_NETWORKS = ("bcrt", "regtest", "tb", "signet")
-    rxd_network = keys.get("rxd_network", "bc")
+    # rxd_network MUST be in the keys file — red-team finding NEW #3 on 44707a3.
+    # A silent default of "bc" would let a keys file written before this fix bypass
+    # any check that depends on the actual network in use.
+    if "rxd_network" not in keys:
+        raise SystemExit(
+            "keys file is missing rxd_network — was it written by a pre-fixup forward "
+            "runner? Re-run forward with the current dust_swap_run.py"
+        )
+    rxd_network = keys["rxd_network"]
     needs_audit_optin = (btc_network not in _AUDIT_CLEARED_NETWORKS) or (rxd_network not in _AUDIT_CLEARED_NETWORKS)
     if needs_audit_optin and not args.i_accept_dust_loss:
         raise SystemExit(
@@ -183,9 +192,7 @@ async def resume(args) -> None:
         claim_to_scriptpubkey=btc_claim_payout,
         # Resume never calls fund() (BTC HTLC is already on-chain), so the poll
         # knobs stay at defaults — no broadcast→readback timing knot to manage here.
-        policy=FundingPolicy(
-            fee_sats=args.btc_fee_sats, min_confirmations=1, funding_input_type="p2wpkh"
-        ),
+        policy=FundingPolicy(fee_sats=args.btc_fee_sats, min_confirmations=1, funding_input_type="p2wpkh"),
         maker_claim_privkey=maker_btc.secret,
         audit_cleared=audit_cleared,
     )
@@ -231,16 +238,24 @@ async def resume(args) -> None:
         print(f"  -> {rec.state.value} (BTC claim txid {btc_claim_txid})")
 
         # ---- step: taker reorg-gated claim of the RXD covenant ----
-        # Bounded by args.resume_deadline_s — the unbounded `while True` was a red-team
-        # finding: past maker_claims_btc, p is public, and a hostile/flaky mempool
-        # source could stall the loop past t_rxd → asset forfeit in any counterparty
-        # deployment. Default deadline is conservative (½ × t_rxd window).
-        print(f"\n  Waiting for the BTC claim to bury to {policy.btc_claim_reorg_depth.value} confs (reorg gate).")
-        deadline = time.monotonic() + args.resume_deadline_s
+        # Bounded by a SAFE deadline derived from t_rxd: a deadline LONGER than t_rxd
+        # would let the loop stall past the refund window and forfeit the asset. The
+        # validator enforces 0 < deadline <= 0.5 × t_rxd_seconds (sec-sentinel H-1 +
+        # red-team #3 residual on 44707a3) and rejects non-finite operator inputs.
+        deadline_s = validated_resume_deadline_s(
+            operator_value=args.resume_deadline_s,
+            t_rxd_blocks=t_rxd.value,
+            rxd_block_interval_s=args.rxd_block_interval_s,
+        )
+        print(
+            f"\n  Waiting for the BTC claim to bury to {policy.btc_claim_reorg_depth.value} confs "
+            f"(reorg gate); deadline {deadline_s:.0f}s."
+        )
+        deadline = time.monotonic() + deadline_s
         while True:
             if time.monotonic() >= deadline:
                 raise SystemExit(
-                    f"resume deadline ({args.resume_deadline_s:.0f}s) exceeded — operator must intervene "
+                    f"resume deadline ({deadline_s:.0f}s) exceeded — operator must intervene "
                     f"(p is public on-chain; covenant claim still pending). claim txid {btc_claim_txid}"
                 )
             # get_raw_tx fail-closes on an UNCONFIRMED tx (won't return a 0-conf mempool
@@ -310,12 +325,13 @@ def _parse_args(argv):
     ap.add_argument(
         "--resume-deadline-s",
         type=float,
-        default=4 * 60 * 60,  # 4 hours
-        help="hard upper bound on the WAIT-for-claim-confirmation loop. After this many "
-        "seconds the resume raises SystemExit and the operator must intervene. Past "
+        default=None,
+        help="hard upper bound on the WAIT-for-claim-confirmation loop. If omitted the "
+        "value is auto-computed from the loaded t_rxd (0.5 × t_rxd × rxd_block_interval_s, "
+        "floored at 600s) so the deadline always sits INSIDE the refund window. Past "
         "maker_claims_btc, p is public — a hostile/flaky mempool source MUST NOT stall "
-        "the loop past t_rxd (red-team finding 2B). Default 4h is conservative for a "
-        "20-block t_rxd at ~5min/RXD-block + a few-block reorg-gate margin.",
+        "the loop past t_rxd (red-team finding 2B). Operator-supplied values are capped "
+        "to the same upper bound and must be finite + positive (no inf/nan footgun).",
     )
     return ap.parse_args(argv)
 

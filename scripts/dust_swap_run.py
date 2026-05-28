@@ -71,6 +71,7 @@ from _dust_swap_shared import (
     confirm,
     measured_margin_from_mainnet,
     rxd_blockcount,
+    validated_resume_deadline_s,
 )
 from radiant_mainnet_chainio import SshTrRadiantClient
 
@@ -166,6 +167,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         "created_unix": int(time.time()),
         "stage": args.stage,
         "btc_network": btc_network,
+        "rxd_network": args.rxd_network,
         "hashlock_H": h.hex(),
         "preimage_p_hex": p.hex(),  # recovery only; same trust domain as the WIFs below
         "taker_btc_wif": taker_btc_kp.unsafe_wif(),
@@ -322,19 +324,23 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         print(f"  -> {rec.state.value} (BTC claim txid {btc_claim_txid})")
 
         # 4. Taker reads the maker's claim off the BTC chain, runs the REORG GATE, claims RXD.
-        # Bounded by args.resume_deadline_s — past maker_claims_btc, p is public, and a
-        # hostile/flaky mempool source must NOT stall the loop past t_rxd. The unconfirmed
-        # case (just-broadcast claim, 0 confs) raises InsufficientConfirmationsError from
-        # get_raw_tx; catch it as WAIT, sleep, retry. Same fix the resume script got.
+        # Bounded by a SAFE deadline derived from t_rxd (validator rejects inf/nan and
+        # caps any operator value at 0.5 × t_rxd_seconds — a deadline LONGER than t_rxd
+        # would let the loop forfeit the asset). Past maker_claims_btc, p is public.
+        deadline_s = validated_resume_deadline_s(
+            operator_value=args.resume_deadline_s,
+            t_rxd_blocks=t_rxd.value,
+            rxd_block_interval_s=args.rxd_block_interval_s,
+        )
         print(
             f"\n  Waiting for the BTC claim to bury to {policy.btc_claim_reorg_depth.value} confs "
-            "before the reorg gate returns SAFE (poll loop)."
+            f"(reorg gate); deadline {deadline_s:.0f}s."
         )
-        deadline = time.monotonic() + args.resume_deadline_s
+        deadline = time.monotonic() + deadline_s
         while True:
             if time.monotonic() >= deadline:
                 raise SystemExit(
-                    f"deadline ({args.resume_deadline_s:.0f}s) exceeded — operator must intervene "
+                    f"deadline ({deadline_s:.0f}s) exceeded — operator must intervene "
                     f"(p is public on-chain; covenant claim still pending). claim txid {btc_claim_txid}"
                 )
             try:
@@ -397,11 +403,12 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument(
         "--resume-deadline-s",
         type=float,
-        default=4 * 60 * 60,
+        default=None,
         help="hard upper bound on the taker WAIT-for-claim-confirmation loop after the maker "
-        "reveals p on-chain. After this many seconds the script raises SystemExit and the "
-        "operator must intervene — a hostile/flaky mempool source must not be allowed to "
-        "stall past t_rxd. Default 4h.",
+        "reveals p on-chain. If omitted the value is auto-computed from t_rxd (0.5 × t_rxd "
+        "× rxd_block_interval_s, floored at 600s) so the deadline always sits INSIDE the "
+        "refund window. Operator-supplied values are capped to the same upper bound and "
+        "must be finite + positive (no inf/nan footgun).",
     )
     ap.add_argument(
         "--fund-confirm-timeout-s",

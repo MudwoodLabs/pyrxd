@@ -820,15 +820,24 @@ class _MempoolHttpClient:
     A thin session + URL helper mirroring MempoolSpaceSource, so the broadcaster and
     funding reader don't each re-implement it. TLS validation stays on (aiohttp
     default) — do NOT disable it; a MITM'd endpoint defeats the reorg gate.
+
+    Sessions carry an EXPLICIT total request timeout. Without one, aiohttp's default
+    is "no timeout" — a stalled mempool.space endpoint can hang a request indefinitely,
+    blowing through the resume_deadline check at the loop top by minutes per call.
+    30s is conservative for the small JSON / hex blobs the adapters fetch.
+    (Red-team finding NEW #7 on 44707a3.)
     """
 
-    def __init__(self, base_url: str = "https://mempool.space/api") -> None:
+    DEFAULT_TIMEOUT_S: float = 30.0
+
+    def __init__(self, base_url: str = "https://mempool.space/api", *, timeout_s: float | None = None) -> None:
         self._base_url = base_url.rstrip("/") + "/"
         self._session: aiohttp.ClientSession | None = None
+        self._timeout_s = self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
 
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout_s))
         return self._session
 
     async def close(self) -> None:
