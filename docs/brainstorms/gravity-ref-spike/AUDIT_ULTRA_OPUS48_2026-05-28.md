@@ -3,7 +3,7 @@
 **Author:** Claude Opus 4.8 (1M context), lead author
 **Date:** 2026-05-28
 **Branch:** `feat/gravity-ref-ft-covenant-spike`
-**Scope:** the value-moving BTC↔RXD HTLC atomic-swap engine (`src/pyrxd/gravity/*`, `src/pyrxd/btc_wallet/*`, `src/pyrxd/network/bitcoin.py`, `src/pyrxd/spv/*`) and the mainnet run harness (`scripts/dust_swap_run.py`, `dust_swap_resume.py`, `_dust_swap_shared.py`, `radiant_mainnet_chainio.py`). Consensus claims checked against `/home/eric/apps/Radiant-Core/src/*` and reproduced where stated on the local `radiant-core:v2.3.0` regtest image (`testmempoolaccept` only — the mainnet `tr` node was never touched).
+**Scope:** the value-moving BTC↔RXD HTLC atomic-swap engine (`src/pyrxd/gravity/*`, `src/pyrxd/btc_wallet/*`, `src/pyrxd/network/bitcoin.py`, `src/pyrxd/spv/*`) and the mainnet run harness (`scripts/dust_swap_run.py`, `dust_swap_resume.py`, `_dust_swap_shared.py`, `radiant_mainnet_chainio.py`). Consensus claims checked against the Radiant Core node source (`Radiant-Core/src/*`) and reproduced where stated on the local `radiant-core:v2.3.0` regtest image (`testmempoolaccept` only — the mainnet `tr` node was never touched).
 
 ---
 
