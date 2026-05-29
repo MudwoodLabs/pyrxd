@@ -29,9 +29,13 @@ pins ``hash256(holder script)``):
 * NFT → 63-byte NFT singleton ``d8 <ref> 75 + p2pkh``
 * RXD → 25-byte plain P2PKH
 
-``refundCsv`` MUST be minimal-pushed (``OP_1..OP_16`` for 1..16) — a non-minimal
-push trips MANDATORY ``MINIMALDATA`` and bricks the covenant (spike
-``.csv_spike.json`` finding).
+``refundCsv`` AND the asset value param (``amount`` / ``nftCarrierValue``) MUST be
+minimal-pushed (``OP_1..OP_16`` for 1..16) — a non-minimal push trips MANDATORY
+``MINIMALDATA`` and bricks the covenant on BOTH the claim and refund branches
+(spike ``.csv_spike.json`` for ``refundCsv``; round-5 finding F-001 for the value
+param). The build-time ``_assert_minimal_pushes`` guard re-checks EVERY push in the
+assembled funded SPK fail-closed, so a future non-minimal push fails at build time
+rather than silently on-chain.
 """
 
 from __future__ import annotations
@@ -237,6 +241,74 @@ def _guard_refs(funded_spk: bytes, *, expected_ref: bytes | None, variant: str) 
         )
 
 
+def _assert_minimal_pushes(spk: bytes, *, variant: str) -> None:
+    """GUARD 3: fail-closed if any data push in ``spk`` violates MANDATORY ``MINIMALDATA``.
+
+    Radiant/Bitcoin enforce ``CheckMinimalPush`` on every executed push: a
+    non-minimal push of a small value — e.g. a 1-byte ``0x05`` instead of ``OP_5``
+    — trips 'Data push larger than necessary' and PERMANENTLY bricks the covenant
+    on BOTH the claim and refund branches (round-5 finding F-001: the value param
+    ``amount`` / ``nftCarrierValue`` was pushed non-minimally for values 1..16).
+    This walks the WHOLE assembled funded SPK — not just one operand — so any
+    non-minimal push fails at build time instead of silently on-chain. Mirrors
+    Radiant-Core ``script.cpp`` ``CheckMinimalPush``. Ref operands (``d0/d8`` etc.)
+    are 36-byte ref payloads, not data pushes, and are skipped.
+    """
+    i = 0
+    n = len(spk)
+    while i < n:
+        op = spk[i]
+        if op in _REF_OPS:
+            i += 37  # ref opcode + 36-byte ref operand (not a data push)
+            continue
+        if 0x01 <= op <= 0x4B:  # direct push of `op` bytes
+            if i + 1 + op > n:
+                raise ValidationError(f"GUARD 3 FAIL ({variant}): truncated direct push at offset {i}")
+            if op == 1:
+                b0 = spk[i + 1]
+                if 1 <= b0 <= 16 or b0 == 0x81:
+                    raise ValidationError(
+                        f"GUARD 3 FAIL ({variant}): non-minimal 1-byte push 0x{b0:02x} at offset {i} "
+                        "(must be OP_1..OP_16 / OP_1NEGATE) — would brick the covenant (MINIMALDATA)"
+                    )
+            i += 1 + op
+            continue
+        if op == 0x4C:  # OP_PUSHDATA1
+            if i + 1 >= n:
+                raise ValidationError(f"GUARD 3 FAIL ({variant}): truncated PUSHDATA1 at offset {i}")
+            size = spk[i + 1]
+            if size <= 75:
+                raise ValidationError(
+                    f"GUARD 3 FAIL ({variant}): PUSHDATA1 of {size} bytes at offset {i} "
+                    "(<=75 must be a direct push) — non-minimal (MINIMALDATA)"
+                )
+            i += 2 + size
+            continue
+        if op == 0x4D:  # OP_PUSHDATA2
+            if i + 2 >= n:
+                raise ValidationError(f"GUARD 3 FAIL ({variant}): truncated PUSHDATA2 at offset {i}")
+            size = spk[i + 1] | (spk[i + 2] << 8)
+            if size <= 255:
+                raise ValidationError(
+                    f"GUARD 3 FAIL ({variant}): PUSHDATA2 of {size} bytes at offset {i} "
+                    "(<=255 must be OP_PUSHDATA1) — non-minimal (MINIMALDATA)"
+                )
+            i += 3 + size
+            continue
+        if op == 0x4E:  # OP_PUSHDATA4
+            if i + 4 >= n:
+                raise ValidationError(f"GUARD 3 FAIL ({variant}): truncated PUSHDATA4 at offset {i}")
+            size = int.from_bytes(spk[i + 1 : i + 5], "little")
+            if size <= 0xFFFF:
+                raise ValidationError(
+                    f"GUARD 3 FAIL ({variant}): PUSHDATA4 of {size} bytes at offset {i} "
+                    "(<=65535 must be OP_PUSHDATA2) — non-minimal (MINIMALDATA)"
+                )
+            i += 5 + size
+            continue
+        i += 1
+
+
 # --------------------------------------------------------------------------- artifact loading
 
 
@@ -274,6 +346,12 @@ def _validate_common(
         raise ValidationError("hashlock must be 32 bytes (H = SHA256(p))")
     if not isinstance(refund_csv, int) or isinstance(refund_csv, bool) or refund_csv < 1:
         raise ValidationError("refund_csv must be a positive int (a 0 CSV is a no-op timelock)")
+    # F-002: refund_csv is the BIP68 relative-BLOCK count — it is both the covenant
+    # CSV operand and the refund spend's nSequence (low 16 bits). A value > 0xFFFF
+    # would not round-trip through nSequence (the block count is masked to 16 bits),
+    # silently producing a different on-chain timelock than the covenant pins.
+    if refund_csv > 0xFFFF:
+        raise ValidationError("refund_csv must fit in 16 bits (BIP68 block count <= 0xFFFF)")
     tp = bytes(Hex20(taker_pkh))
     mp = bytes(Hex20(maker_pkh))
     return bytes(hashlock), tp, mp
@@ -310,7 +388,7 @@ def build_htlc_covenant_ft(
             "REF": ref,
             "hashlock": _push(h),
             "refundCsv": _minimal_num_push(refund_csv),
-            "amount": _push(_scriptnum(amount)),
+            "amount": _minimal_num_push(amount),
             "expectedTakerFtHash": _push(et),
             "expectedMakerFtHash": _push(em),
         },
@@ -319,6 +397,7 @@ def build_htlc_covenant_ft(
     funded = prologue + b"\xbd\xd0" + ref + FT_EPILOGUE
     _guard_bd(funded, expected=[len(prologue)], variant="ft")
     _guard_refs(funded, expected_ref=ref, variant="ft")
+    _assert_minimal_pushes(funded, variant="ft")
     return HtlcCovenant(
         variant="ft",
         funded_spk=funded,
@@ -357,7 +436,7 @@ def build_htlc_covenant_nft(
             "REF": ref,
             "hashlock": _push(h),
             "refundCsv": _minimal_num_push(refund_csv),
-            "nftCarrierValue": _push(_scriptnum(nft_carrier_value)),
+            "nftCarrierValue": _minimal_num_push(nft_carrier_value),
             "expectedTakerNftHash": _push(et),
             "expectedMakerNftHash": _push(em),
         },
@@ -366,6 +445,7 @@ def build_htlc_covenant_nft(
     # NFT funded UTXO IS the compiled script verbatim — no FT epilogue, no bare 0xbd.
     _guard_bd(funded, expected=[], variant="nft")
     _guard_refs(funded, expected_ref=ref, variant="nft")
+    _assert_minimal_pushes(funded, variant="nft")
     return HtlcCovenant(
         variant="nft",
         funded_spk=funded,
@@ -400,7 +480,7 @@ def build_htlc_covenant_rxd(
         {
             "hashlock": _push(h),
             "refundCsv": _minimal_num_push(refund_csv),
-            "amount": _push(_scriptnum(amount)),
+            "amount": _minimal_num_push(amount),
             "expectedTakerHash": _push(et),
             "expectedMakerHash": _push(em),
         },
@@ -409,6 +489,7 @@ def build_htlc_covenant_rxd(
     # Native RXD: NO ref op and NO FT epilogue — there must be NO bare 0xbd and NO refs.
     _guard_bd(funded, expected=[], variant="rxd")
     _guard_refs(funded, expected_ref=None, variant="rxd")
+    _assert_minimal_pushes(funded, variant="rxd")
     return HtlcCovenant(
         variant="rxd",
         funded_spk=funded,

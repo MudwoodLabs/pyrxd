@@ -5,6 +5,7 @@ Uses unittest.mock to avoid real network calls.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from unittest.mock import AsyncMock, MagicMock
 
@@ -17,10 +18,25 @@ from pyrxd.network.bitcoin import (
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, RawTx, Txid
 
-_VALID_TXID = "b" * 64
-# Minimal valid raw tx (65+ bytes).
-_VALID_RAW = bytes(range(65))
+# A real, parseable legacy tx + its locally-derived txid, so get_raw_tx's F-004
+# txid-binding (returned bytes must hash to the requested txid) is satisfied.
+_VALID_RAW = (
+    bytes.fromhex("02000000")  # version
+    + b"\x01"  # 1 input
+    + b"\x00" * 32  # prevout txid
+    + b"\x00\x00\x00\x00"  # prevout vout
+    + b"\x00"  # empty scriptSig
+    + b"\xff\xff\xff\xff"  # sequence
+    + b"\x01"  # 1 output
+    + b"\x00" * 8  # value 0
+    + b"\x19"  # script len 25
+    + b"\x76\xa9\x14"
+    + b"\x00" * 20
+    + b"\x88\xac"  # P2PKH (>64-byte tx for RawTx)
+    + bytes.fromhex("00000000")  # locktime
+)
 _VALID_RAW_HEX = _VALID_RAW.hex()
+_VALID_TXID = hashlib.sha256(hashlib.sha256(_VALID_RAW).digest()).digest()[::-1].hex()
 
 
 # ── aiohttp response mock helpers ─────────────────────────────────────────────

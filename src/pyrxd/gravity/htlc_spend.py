@@ -34,7 +34,7 @@ OP_1 OP_NUMEQUALVERIFY <refund>``):
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from pyrxd.constants import SIGHASH
 from pyrxd.gravity.htlc_covenant import HtlcCovenant
@@ -68,7 +68,9 @@ class FeeInput:
     vout: int
     value: int
     scriptpubkey: bytes
-    wif: str
+    # repr-suppressed: the WIF is a private key — keep it out of logs/reprs/tracebacks
+    # (F-019). Mirrors the secret-field discipline in hd/wallet.py.
+    wif: str = field(repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.txid, str) or len(self.txid) != 64:

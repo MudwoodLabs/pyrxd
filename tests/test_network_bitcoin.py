@@ -13,6 +13,7 @@ source uses a controlled fake HTTP layer.  We test each source method's:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -183,6 +184,25 @@ class TestGetHexBytes:
 
 TXID = Txid("ab" * 32)
 TXID_STR = "ab" * 32
+
+# A real, parseable legacy tx + its locally-derived txid, for the F-004 txid-binding
+# check in get_raw_tx (returned bytes must hash to the requested txid).
+_REAL_TX = (
+    bytes.fromhex("02000000")  # version
+    + b"\x01"  # 1 input
+    + b"\x00" * 32  # prevout txid
+    + b"\x00\x00\x00\x00"  # prevout vout
+    + b"\x00"  # empty scriptSig
+    + b"\xff\xff\xff\xff"  # sequence
+    + b"\x01"  # 1 output
+    + b"\x00" * 8  # value 0
+    + b"\x19"  # script len 25
+    + b"\x76\xa9\x14"
+    + b"\x00" * 20
+    + b"\x88\xac"  # P2PKH (>64-byte tx for RawTx)
+    + bytes.fromhex("00000000")  # locktime
+)
+_REAL_TXID = Txid(hashlib.sha256(hashlib.sha256(_REAL_TX).digest()).digest()[::-1].hex())
 HEADER_80 = bytes.fromhex("ff" * 80)
 BLOCK_HASH = bytes.fromhex("cd" * 32)
 
@@ -237,14 +257,14 @@ class TestMempoolSpaceSource:
     async def test_get_raw_tx_happy(self):
         src = self._src()
         status_resp = _json_resp({"confirmed": True, "block_height": 799000})
-        hex_resp = _text_resp("aa" * 65)
+        hex_resp = _text_resp(_REAL_TX.hex())
         # get_raw_tx also calls get_tip_height
         tip_resp = _text_resp("800000")
         session = MagicMock()
         session.get = MagicMock(side_effect=[status_resp, tip_resp, hex_resp])
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            raw = await src.get_raw_tx(TXID, min_confirmations=1)
-        assert bytes(raw) == bytes.fromhex("aa" * 65)
+            raw = await src.get_raw_tx(_REAL_TXID, min_confirmations=1)
+        assert bytes(raw) == _REAL_TX
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_unconfirmed_raises(self):
@@ -449,12 +469,12 @@ class TestBlockstreamSource:
         src = self._src()
         status_resp = _json_resp({"confirmed": True, "block_height": 799000})
         tip_resp = _text_resp("800000")
-        hex_resp = _text_resp("bb" * 65)
+        hex_resp = _text_resp(_REAL_TX.hex())
         session = MagicMock()
         session.get = MagicMock(side_effect=[status_resp, tip_resp, hex_resp])
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            raw = await src.get_raw_tx(TXID, min_confirmations=1)
-        assert bytes(raw) == bytes.fromhex("bb" * 65)
+            raw = await src.get_raw_tx(_REAL_TXID, min_confirmations=1)
+        assert bytes(raw) == _REAL_TX
 
     @pytest.mark.asyncio
     async def test_get_merkle_proof_happy(self):
@@ -487,7 +507,7 @@ class TestMultiSourceBtcDataSource:
         src = AsyncMock()
         src.get_tip_height = AsyncMock(return_value=BlockHeight(tip))
         src.get_block_hash = AsyncMock(return_value=Hex32(bytes.fromhex("cd" * 32)))
-        src.get_raw_tx = AsyncMock(return_value=RawTx(bytes.fromhex("aa" * 65)))
+        src.get_raw_tx = AsyncMock(return_value=RawTx(_REAL_TX))
         src.get_tx_block_height = AsyncMock(return_value=BlockHeight(799000))
         src.get_tx_output_script_type = AsyncMock(return_value="p2pkh")
         src.get_merkle_proof = AsyncMock(return_value=(["aa" * 32], 3))
@@ -514,8 +534,8 @@ class TestMultiSourceBtcDataSource:
     async def test_get_raw_tx_quorum(self):
         s1, s2 = self._make_source(), self._make_source()
         multi = MultiSourceBtcDataSource([s1, s2], quorum=2)
-        raw = await multi.get_raw_tx(TXID, min_confirmations=1)
-        assert bytes(raw) == bytes.fromhex("aa" * 65)
+        raw = await multi.get_raw_tx(_REAL_TXID, min_confirmations=1)
+        assert bytes(raw) == _REAL_TX
 
     @pytest.mark.asyncio
     async def test_get_tx_block_height_quorum(self):

@@ -497,6 +497,14 @@ def assess_claim_finality(
             raise ValidationError(f"{label} must be a non-negative int (fail-closed)")
     if not isinstance(t_rxd, Timelock):
         raise ValidationError("assess_claim_finality requires a Timelock t_rxd")
+    # F-013: the current Radiant height can never be BELOW where the covenant was
+    # mined. A now < lock reading means a lagging or lying node — fail-closed
+    # (refuse to assess) rather than computing an optimistic SAFE off bad data.
+    if now_rxd_height < asset_locked_at_height:
+        raise ValidationError(
+            f"now_rxd_height ({now_rxd_height}) < asset_locked_at_height ({asset_locked_at_height}) "
+            "is impossible on an honest chain (lagging/lying node); fail-closed"
+        )
     try:
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
         btc_depth_rxd = policy.btc_claim_reorg_depth.normalize_to(

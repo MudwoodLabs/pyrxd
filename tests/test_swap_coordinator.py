@@ -912,6 +912,20 @@ def test_assess_claim_finality_fail_closed_on_bad_inputs():
         )  # type: ignore[arg-type]
 
 
+def test_assess_claim_finality_rejects_now_below_lock_f013():
+    # F-013: now_rxd_height < asset_locked_at_height is impossible on an honest chain
+    # (a lagging/lying node). Fail-closed rather than computing an optimistic SAFE off
+    # an inflated refund_opens_at.
+    with pytest.raises(ValidationError, match="impossible on an honest chain"):
+        assess_claim_finality(
+            btc_claim_confirmations=10,
+            now_rxd_height=999,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=_policy(),
+        )
+
+
 async def test_gate_safe_claims_asset():
     p_secret, h = generate_secret()
     terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)

@@ -43,6 +43,7 @@ import logging
 from typing import Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
+from pyrxd.btc_wallet.taproot import TimeUnit
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
@@ -325,6 +326,12 @@ class RadiantCovenantLeg:
     def _build_covenant(self, terms: NegotiatedTerms) -> HtlcCovenant:
         if not isinstance(terms, NegotiatedTerms):
             raise ValidationError("terms must be a NegotiatedTerms")
+        # F-002 (belt-and-suspenders; NegotiatedTerms already enforces this): the
+        # covenant CSV operand is a BIP68 BLOCK count with no SECONDS path on this
+        # leg, so terms.t_rxd.value is used raw as refund_csv. Refuse a non-BLOCKS
+        # t_rxd fail-closed rather than silently coercing it.
+        if terms.t_rxd.unit is not TimeUnit.BLOCKS:
+            raise ValidationError("Radiant leg requires a BLOCKS t_rxd (no SECONDS CSV encoding); fail-closed")
         variant = terms.asset_variant
         if variant == "rxd":
             cov = build_htlc_covenant_rxd(

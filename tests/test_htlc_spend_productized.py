@@ -43,6 +43,14 @@ def _fee(value: int = 10_000_000) -> FeeInput:
     return FeeInput(txid="ab" * 32, vout=0, value=value, scriptpubkey=spk, wif=key.wif())
 
 
+def test_fee_input_repr_does_not_leak_wif_f019():
+    # F-019: the WIF is a private key — it must not appear in repr/logs/tracebacks.
+    fee = _fee()
+    r = repr(fee)
+    assert "wif=" not in r
+    assert fee.wif not in r
+
+
 def _rxd_cov(csv: int = 6):
     return build_htlc_covenant_rxd(
         amount=100_000, taker_pkh=b"\x11" * 20, maker_pkh=b"\x22" * 20, hashlock=_H, refund_csv=csv

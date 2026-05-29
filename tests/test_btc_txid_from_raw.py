@@ -95,6 +95,30 @@ def test_legacy_nonsegwit_tx_txid():
     assert t.btc_txid_from_raw(raw) == expected
 
 
+def test_verify_raw_matches_txid_binds_returned_bytes_f004():
+    # F-004: the transport must reject tx bytes whose locally-derived txid != the
+    # requested txid (a MITM'd source returning a *different* tx than asked for, which
+    # would let the reorg gate measure the wrong tx's depth).
+    from pyrxd.network.bitcoin import _verify_raw_matches_txid
+    from pyrxd.security.errors import NetworkError
+    from pyrxd.security.types import Txid
+
+    raw = (
+        bytes.fromhex("02000000")
+        + b"\x01"
+        + b"\x00" * 32
+        + b"\x00\x00\x00\x00"
+        + b"\x00"
+        + b"\xff\xff\xff\xff"
+        + b"\x00"
+        + bytes.fromhex("00000000")
+    )
+    real = t.btc_txid_from_raw(raw)
+    _verify_raw_matches_txid(raw, Txid(real))  # exact match -> no raise
+    with pytest.raises(NetworkError, match="do not match the requested txid"):
+        _verify_raw_matches_txid(raw, Txid("11" * 32))
+
+
 # --------------------------------------------------------------------------- fail-closed on malformed input
 
 

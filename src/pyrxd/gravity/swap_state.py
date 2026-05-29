@@ -249,6 +249,16 @@ class NegotiatedTerms:
             raise ValidationError("t_btc must be a Timelock")
         if not isinstance(self.t_rxd, Timelock):
             raise ValidationError("t_rxd must be a Timelock")
+        # F-002: the Radiant HTLC covenant CSV operand (and the refund spend's
+        # nSequence) is a BIP68 BLOCK count — there is NO SECONDS (type-flag)
+        # encoding path on the Radiant leg. A SECONDS-tagged t_rxd would be used
+        # raw and desync the on-chain refund window from every off-chain safety
+        # gate (which normalise to blocks). Reject it at the source, fail-closed.
+        if self.t_rxd.unit is not TimeUnit.BLOCKS:
+            raise ValidationError(
+                f"t_rxd must be a BLOCKS timelock (the Radiant CSV has no SECONDS encoding); "
+                f"got {self.t_rxd.unit.value}"
+            )
         if self.asset_variant not in ASSET_VARIANTS:
             raise ValidationError(f"asset_variant must be one of {sorted(ASSET_VARIANTS)}")
         object.__setattr__(self, "genesis_ref", _bany(self.genesis_ref, "genesis_ref"))

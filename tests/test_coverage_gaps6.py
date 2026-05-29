@@ -10,6 +10,7 @@ Targets:
 
 from __future__ import annotations
 
+import hashlib
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -24,6 +25,25 @@ from pyrxd.network.bitcoin import (
 )
 from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Hex32, RawTx, Txid
+
+# A real, parseable legacy tx (>64 bytes for RawTx) + its locally-derived txid, so
+# get_raw_tx's F-004 binding (returned bytes must hash to the requested txid) holds.
+_REAL_TX = (
+    bytes.fromhex("02000000")
+    + b"\x01"
+    + b"\x00" * 32
+    + b"\x00\x00\x00\x00"
+    + b"\x00"
+    + b"\xff\xff\xff\xff"
+    + b"\x01"
+    + b"\x00" * 8
+    + b"\x19"
+    + b"\x76\xa9\x14"
+    + b"\x00" * 20
+    + b"\x88\xac"
+    + bytes.fromhex("00000000")
+)
+_REAL_TXID = Txid(hashlib.sha256(hashlib.sha256(_REAL_TX).digest()).digest()[::-1].hex())
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Helpers (mirrors test_network_bitcoin.py helpers)
@@ -191,12 +211,12 @@ class TestBitcoinCoreRpcSource:
     @pytest.mark.asyncio
     async def test_get_raw_tx_happy(self):
         src = self._src()
-        raw_hex = "aa" * 65
+        raw_hex = _REAL_TX.hex()
         data = {"confirmations": 10, "hex": raw_hex}
         session = _make_session(_rpc_resp(data))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            result = await src.get_raw_tx(Txid("ab" * 32), min_confirmations=6)
-        assert bytes(result) == bytes.fromhex(raw_hex)
+            result = await src.get_raw_tx(_REAL_TXID, min_confirmations=6)
+        assert bytes(result) == _REAL_TX
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_insufficient_confs_raises(self):
@@ -436,13 +456,13 @@ class TestBlockstreamSourceAdditional:
         """min_confirmations=0 should skip the tip fetch."""
         src = self._src()
         status_data = {"confirmed": True, "block_height": 800000}
-        raw_hex = "aa" * 65
+        raw_hex = _REAL_TX.hex()
         session = MagicMock()
         resps = iter([_json_resp(status_data), _text_resp(raw_hex)])
         session.get = MagicMock(side_effect=lambda *a, **kw: next(resps))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            result = await src.get_raw_tx(Txid("ab" * 32), min_confirmations=0)
-        assert bytes(result) == bytes.fromhex(raw_hex)
+            result = await src.get_raw_tx(_REAL_TXID, min_confirmations=0)
+        assert bytes(result) == _REAL_TX
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -459,13 +479,13 @@ class TestMempoolSpaceSourceAdditional:
         """min_confirmations=0 should skip the tip fetch."""
         src = self._src()
         status_data = {"confirmed": True, "block_height": 800000}
-        raw_hex = "aa" * 65
+        raw_hex = _REAL_TX.hex()
         session = MagicMock()
         resps = iter([_json_resp(status_data), _text_resp(raw_hex)])
         session.get = MagicMock(side_effect=lambda *a, **kw: next(resps))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
-            result = await src.get_raw_tx(Txid("ab" * 32), min_confirmations=0)
-        assert bytes(result) == bytes.fromhex(raw_hex)
+            result = await src.get_raw_tx(_REAL_TXID, min_confirmations=0)
+        assert bytes(result) == _REAL_TX
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_invalid_hex_raises(self):

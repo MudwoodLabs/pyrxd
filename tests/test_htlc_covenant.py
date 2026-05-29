@@ -130,6 +130,78 @@ def test_refund_csv_minimal_push_for_small_ints():
     assert _minimal_num_push(17) == b"\x01\x11"
 
 
+# --------------------------------------------------------------------------- F-001: value-param MINIMALDATA
+
+
+_FT_NFT_BASE = dict(
+    genesis_txid="ab" * 32,
+    genesis_vout=0,
+    taker_pkh=b"\x11" * 20,
+    maker_pkh=b"\x22" * 20,
+    hashlock=b"\xaa" * 32,
+    refund_csv=6,
+)
+
+
+@pytest.mark.parametrize("value", [1, 5, 16, 17, 1000])
+def test_value_param_minimal_push_builds_for_all_variants_f001(value):
+    """F-001 regression: an asset value in 1..16 must build (GUARD 3 accepts it),
+    proving OP_N minimal encoding — NOT the non-minimal 1-byte data push that trips
+    MANDATORY MINIMALDATA and bricks the covenant on BOTH the claim and refund
+    branches. Pre-fix the value param used ``_push(_scriptnum(v))``, which for v in
+    1..16 produced e.g. ``0105`` instead of ``OP_5``. Boundary 17 + 1000 confirm the
+    >16 path is unchanged.
+    """
+    build_htlc_covenant_rxd(**_rxd_args(amount=value))
+    build_htlc_covenant_ft(amount=value, **_FT_NFT_BASE)
+    build_htlc_covenant_nft(nft_carrier_value=value, **_FT_NFT_BASE)
+
+
+def test_value_param_emits_op_n_not_non_minimal_push_f001():
+    """The funded SPK for a small value carries the OP_N opcode and NOT the bricking
+    non-minimal 1-byte push form. Fixed (no-0x01-byte) hashlock/pkhs keep the byte
+    search free of false positives."""
+    cov = build_htlc_covenant_rxd(
+        amount=5, taker_pkh=b"\x22" * 20, maker_pkh=b"\x33" * 20, hashlock=b"\xaa" * 32, refund_csv=6
+    )
+    assert b"\x55" in cov.funded_spk  # OP_5
+    assert b"\x01\x05" not in cov.funded_spk  # the F-001 brick (push 1 byte 0x05)
+    # >16 is byte-identical to the prior encoder (preserves mainnet golden vectors).
+    from pyrxd.gravity.htlc_covenant import _push, _scriptnum
+
+    cov17 = build_htlc_covenant_rxd(
+        amount=17, taker_pkh=b"\x22" * 20, maker_pkh=b"\x33" * 20, hashlock=b"\xaa" * 32, refund_csv=6
+    )
+    assert _push(_scriptnum(17)) in cov17.funded_spk
+
+
+def test_assert_minimal_pushes_guard_matches_checkminimalpush():
+    """GUARD 3 mirrors Radiant-Core CheckMinimalPush: accept minimal forms, reject
+    every non-minimal push class (the layer that would have caught F-001 at build
+    time even if the encoder regressed)."""
+    from pyrxd.gravity.htlc_covenant import _assert_minimal_pushes
+
+    # minimal forms pass
+    _assert_minimal_pushes(b"\x55", variant="t")  # OP_5
+    _assert_minimal_pushes(b"\x60\x00", variant="t")  # OP_16, OP_0
+    _assert_minimal_pushes(b"\x20" + b"\xaa" * 32, variant="t")  # 32-byte direct push
+    _assert_minimal_pushes(b"\x01\x00", variant="t")  # 1-byte 0x00 IS minimal (data, not OP_0)
+    _assert_minimal_pushes(b"\xd8" + b"\x05" * 36, variant="t")  # ref operand skipped, not parsed as pushes
+    _assert_minimal_pushes(b"\x4c\x50" + b"\xbb" * 80, variant="t")  # PUSHDATA1 of 80 bytes (>75) is minimal
+
+    # non-minimal classes raise
+    for bad in (
+        b"\x01\x05",  # 1-byte push of 5 -> must be OP_5
+        b"\x01\x01",  # -> OP_1
+        b"\x01\x10",  # -> OP_16
+        b"\x01\x81",  # -> OP_1NEGATE
+        b"\x4c\x02\xaa\xbb",  # PUSHDATA1 of 2 bytes (<=75 must be direct)
+        b"\x4d\x10\x00" + b"\xaa" * 16,  # PUSHDATA2 of 16 bytes (<=255 must be PUSHDATA1)
+    ):
+        with pytest.raises(ValidationError, match="GUARD 3 FAIL"):
+            _assert_minimal_pushes(bad, variant="t")
+
+
 # --------------------------------------------------------------------------- parameter validation
 
 
@@ -146,6 +218,16 @@ def test_refund_csv_minimal_push_for_small_ints():
 def test_rxd_param_validation_fail_closed(over, match):
     with pytest.raises(ValidationError, match=match):
         build_htlc_covenant_rxd(**_rxd_args(**over))
+
+
+def test_refund_csv_must_fit_16_bits_f002():
+    # F-002: refund_csv is the BIP68 relative-BLOCK count used both as the covenant
+    # operand and the refund spend's nSequence (masked to 16 bits). > 0xFFFF would not
+    # round-trip and would silently produce a different on-chain timelock — reject it.
+    with pytest.raises(ValidationError, match="16 bits"):
+        build_htlc_covenant_rxd(**_rxd_args(refund_csv=0x10000))
+    # the 16-bit boundary itself is accepted.
+    build_htlc_covenant_rxd(**_rxd_args(refund_csv=0xFFFF))
 
 
 def test_nft_carrier_value_must_be_positive():

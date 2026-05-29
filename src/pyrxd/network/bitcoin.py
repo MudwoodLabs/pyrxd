@@ -272,6 +272,7 @@ class MempoolSpaceSource(BtcDataSource):
                     raw = bytes.fromhex(body.decode("ascii").strip())
                 except (ValueError, UnicodeDecodeError):
                     raise NetworkError("Server returned invalid hex for transaction")
+                _verify_raw_matches_txid(raw, txid)
                 return RawTx(raw)
         except aiohttp.ClientError as exc:
             raise NetworkError("HTTP request failed") from exc
@@ -442,6 +443,7 @@ class BlockstreamSource(BtcDataSource):
                     raw = bytes.fromhex(body.decode("ascii").strip())
                 except (ValueError, UnicodeDecodeError):
                     raise NetworkError("Server returned invalid hex for transaction")
+                _verify_raw_matches_txid(raw, txid)
                 return RawTx(raw)
         except aiohttp.ClientError as exc:
             raise NetworkError("HTTP request failed") from exc
@@ -632,6 +634,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
             raw = bytes.fromhex(hex_str)
         except ValueError:
             raise NetworkError("Invalid hex in raw tx response from Bitcoin Core")
+        _verify_raw_matches_txid(raw, txid)
         return RawTx(raw)
 
     async def get_tx_block_height(self, txid: Txid) -> BlockHeight:
@@ -679,6 +682,26 @@ class BitcoinCoreRpcSource(BtcDataSource):
 
 def _hash256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+def _verify_raw_matches_txid(raw: bytes, txid: Txid) -> None:
+    """Bind server-returned tx bytes to the REQUESTED txid (fail-closed) — F-004.
+
+    A source (or a MITM'd endpoint) can return a *different* transaction than the
+    one asked for — e.g. a same-preimage claim with a different txid that happens to
+    be buried deeper — and the reorg/claim path would then measure the wrong tx's
+    depth, firing an irreversible asset claim off a still-reorgable BTC claim. We
+    recompute the txid locally from the returned bytes (witness-stripped, the same
+    derivation the BTC leg already trusts) and reject any mismatch.
+    """
+    from pyrxd.btc_wallet.taproot import btc_txid_from_raw
+
+    try:
+        derived = btc_txid_from_raw(bytes(raw))
+    except Exception as exc:
+        raise NetworkError("could not derive a txid from the returned tx bytes; fail-closed") from exc
+    if derived.lower() != str(txid).lower():
+        raise NetworkError(f"returned tx bytes do not match the requested txid {str(txid)[:16]}…; fail-closed")
 
 
 class MultiSourceBtcDataSource(BtcDataSource):
@@ -772,7 +795,10 @@ class MultiSourceBtcDataSource(BtcDataSource):
         self._check_quorum_possible()
         results = await self._gather_results(lambda s: s.get_raw_tx(txid, min_confirmations))
         # Agreement: compare hash256 of the raw bytes.
-        return self._require_quorum(results, lambda tx: _hash256(bytes(tx)))
+        agreed = self._require_quorum(results, lambda tx: _hash256(bytes(tx)))
+        # F-004: even with quorum agreement, bind the agreed bytes to the requested txid.
+        _verify_raw_matches_txid(bytes(agreed), txid)
+        return agreed
 
     async def get_tx_block_height(self, txid: Txid) -> BlockHeight:
         if not isinstance(txid, Txid):

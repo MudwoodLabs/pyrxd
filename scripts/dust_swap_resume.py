@@ -221,7 +221,19 @@ async def resume(args) -> None:
     # decision is exactly when an operator needs CLEAN output, not noise).
     try:
         # ---- step: post_asset_lock_revalidate -> BOTH_LOCKED ----
-        rxd_locked_at = rxd_blockcount(rxd_client)
+        # F-008: the reorg-finality gate needs the covenant's ACTUAL fund height, not
+        # the current tip. Using the tip makes refund_opens_at = tip + t_rxd, hiding
+        # however much of the t_rxd window already elapsed since the covenant confirmed
+        # — silently neutralising the gate on every crash-recovery. Derive the true
+        # fund height from the covenant UTXO's on-chain confirmation depth instead
+        # (the shim reports confs in UtxoRecord.height): fund_height = tip - confs + 1.
+        _cov_op, _cov_val, cov_confs = await rxd_leg.chain_io.find_covenant_utxo(
+            cov.funded_spk, expected_value=args.rxd_photons
+        )
+        if cov_confs < 1:
+            raise SystemExit("covenant UTXO has 0 confirmations; cannot derive its fund height (fail-closed)")
+        rxd_locked_at = rxd_blockcount(rxd_client) - cov_confs + 1
+        print(f"  covenant fund height = {rxd_locked_at} (derived from {cov_confs} on-chain confs)")
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
         print(f"  post_asset_lock_revalidate -> {rec.state.value}")
         if rec.state is not SwapState.BOTH_LOCKED:
