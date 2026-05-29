@@ -56,7 +56,7 @@ Bitcoin-side script** — a one-directional oracle. Use cases with no party to
 HTLC against:
 
 - **Bridge-in / mint-against-deposit** — BTC sent to an address ⇒ Radiant
-  mints/releases. No counterparty locks an RXD leg. (This is the gBTC mint-side
+  mints/releases. No counterparty locks an RXD leg. (This is the BTC-peg mint-side
   direction; mint-side is reusable SPV code by design.)
 - **Paywall / gated release / faucet** — "prove you paid, get the thing."
   Non-atomicity is the *intended* pay-or-nothing semantics, not a bug.

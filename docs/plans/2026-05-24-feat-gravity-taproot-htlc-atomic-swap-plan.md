@@ -257,7 +257,7 @@ raising `ValidationError`, byte-length asserts). Pin these, don't leave them as 
 
 **RETAINED but decoupled:** `src/pyrxd/spv/*` is no longer on the swap path (the
 preimage replaces the SPV proof) but is kept in-tree (mainnet-proven; may anchor the
-separate gBTC peg work). Remove the `trade.py:40` SPV import from the swap path.
+separate BTC-peg work). Remove the `trade.py:40` SPV import from the swap path.
 
 ### Implementation Phases
 
@@ -369,7 +369,7 @@ separate gBTC peg work). Remove the `trade.py:40` SPV import from the swap path.
   SHA256 hashlock suffices. Adaptor sigs are an optional later optimization (privacy).
 - **Keep the SPV-oracle as the swap** — it is not atomic and cannot be made so (BTC
   has no refund path for a plain-address payment). Retained only as decoupled,
-  not-for-production reference (and for the separate gBTC peg work).
+  not-for-production reference (and for the separate BTC-peg work).
 
 ## Acceptance Criteria
 
