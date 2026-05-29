@@ -57,6 +57,7 @@ __all__ = [
     "ScriptTree",
     "TimeUnit",
     "Timelock",
+    "btc_input_outpoints_from_raw",
     "btc_txid_from_raw",
     "build_claim_tx",
     "build_htlc",
@@ -995,6 +996,54 @@ def btc_txid_from_raw(raw_tx: bytes) -> str:
 
     non_witness = version + bytes(vin) + bytes(vout) + locktime
     return _hash256(non_witness)[::-1].hex()
+
+
+def btc_input_outpoints_from_raw(raw_tx: bytes) -> list[bytes]:
+    """Return the 36-byte wire prevout (txid LE || vout LE) of every input.
+
+    Provenance check for a scraped preimage: the caller verifies the claim tx it
+    scraped ``p`` from actually spends THIS swap's funding outpoint
+    (compare against :meth:`BtcOutpoint.prevout_bytes`), so a counterparty-supplied
+    tx for a DIFFERENT swap — even one that happens to share ``H`` — cannot be used
+    to claim this swap's asset. Matches by exact 36-byte prevout, never by offset.
+
+    Parses ONLY the input section (all that the prevouts need); fail-closed on any
+    structural problem, the same SERIALIZE-don't-trust discipline as
+    :func:`btc_txid_from_raw`. Handles legacy and segwit txs.
+    """
+    b = bytes(raw_tx)
+    n = len(b)
+    pos = 0
+
+    def take(k: int) -> bytes:
+        nonlocal pos
+        if k < 0 or pos + k > n:
+            raise ValidationError("btc_input_outpoints_from_raw: truncated transaction")
+        out = b[pos : pos + k]
+        pos += k
+        return out
+
+    def take_compact() -> int:
+        first = take(1)[0]
+        if first < 0xFD:
+            return first
+        return int.from_bytes(take({0xFD: 2, 0xFE: 4, 0xFF: 8}[first]), "little")
+
+    take(4)  # version
+    if pos + 2 <= n and b[pos] == 0x00 and b[pos + 1] == 0x01:
+        take(2)  # segwit marker+flag
+    n_in = take_compact()
+    if n_in == 0 or n_in > 100_000:
+        raise ValidationError("btc_input_outpoints_from_raw: bad input count")
+    prevouts: list[bytes] = []
+    for _ in range(n_in):
+        prevouts.append(take(36))  # prevout: txid (LE) + vout (LE)
+        slen = take_compact()
+        if slen > n:
+            raise ValidationError("btc_input_outpoints_from_raw: scriptSig length out of range")
+        take(slen)
+        take(4)  # sequence
+    return prevouts
 
 
 def _iter_witness_stack(claim_tx_bytes: bytes) -> list[list[bytes]]:

@@ -273,3 +273,60 @@ def test_fail_closed_on_oversize_witness_item_count():
     )
     with pytest.raises(ValidationError, match="bad witness item count"):
         t.btc_txid_from_raw(raw)
+
+
+# --------------------------------------------------------------------------- btc_input_outpoints_from_raw (claim-tx provenance gate)
+
+
+def test_input_outpoints_round_trip_with_prevout_bytes():
+    """The extracted 36-byte prevout equals ``BtcOutpoint.prevout_bytes()`` of the funded
+    outpoint — the exact equality the coordinator's claim-tx provenance gate relies on."""
+    maker = coincurve.PrivateKey(os.urandom(32))
+    taker = coincurve.PrivateKey(os.urandom(32))
+    p = os.urandom(32)
+    h = hashlib.sha256(p).digest()
+    htlc = t.build_htlc(
+        hashlock=h,
+        claim_pubkey_xonly=coincurve.PublicKeyXOnly.from_secret(maker.secret).format(),
+        refund_pubkey_xonly=coincurve.PublicKeyXOnly.from_secret(taker.secret).format(),
+        timeout=t.Timelock(3, t.TimeUnit.BLOCKS),
+        network="bcrt",
+    )
+    funding = t.BtcOutpoint("ab" * 32, 0)
+    loc = htlc.with_funding(funding, 100_000)
+    raw = t.build_claim_tx(
+        locator=loc,
+        preimage=p,
+        claim_privkey=maker.secret,
+        to_scriptpubkey=b"\x00\x14" + b"\x11" * 20,
+        fee_sats=500,
+        aux_rand=os.urandom(32),
+    )
+    assert funding.prevout_bytes() in t.btc_input_outpoints_from_raw(raw)
+
+
+def test_input_outpoints_legacy_null_prevout():
+    raw = (
+        bytes.fromhex("02000000")
+        + b"\x01"
+        + b"\x00" * 32
+        + b"\x00\x00\x00\x00"
+        + b"\x00"
+        + b"\xff\xff\xff\xff"  # 1 input, null prevout, empty scriptSig
+        + b"\x00"  # 0 outputs
+        + bytes.fromhex("00000000")
+    )
+    assert t.btc_input_outpoints_from_raw(raw) == [b"\x00" * 36]
+
+
+def test_input_outpoints_mainnet_claim_spends_funding():
+    v = _vector(".live_swap_nft.json")
+    prevouts = t.btc_input_outpoints_from_raw(bytes.fromhex(v["btc_claim_tx_hex"]))
+    funding_txid_le = bytes.fromhex(v["btc_funding_txid"])[::-1]
+    assert any(po[:32] == funding_txid_le for po in prevouts)
+
+
+@pytest.mark.parametrize("raw", [b"", b"\x02\x00\x00", bytes.fromhex("0200000000")])
+def test_input_outpoints_fail_closed_on_malformed(raw):
+    with pytest.raises(ValidationError):
+        t.btc_input_outpoints_from_raw(raw)

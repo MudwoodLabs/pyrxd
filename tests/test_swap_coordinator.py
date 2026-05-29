@@ -18,6 +18,7 @@ real legs would. This exercises:
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -1136,6 +1137,68 @@ async def test_gate_wait_does_not_claim_and_stays_secret_revealed():
     # FAIL-OPEN REGRESSION: a shallow BTC claim must NOT settle the asset.
     assert rec.state is SwapState.SECRET_REVEALED
     assert rxd.claimed_with is None  # asset NOT claimed
+
+
+async def test_serialized_step_concurrent_duplicate_step_acts_once():
+    """@_serialized_step (#2b): two concurrent invocations of the SAME step on ONE
+    coordinator do not interleave — exactly one acts, the other gets a clean FSM-state
+    rejection, NOT a double broadcast. A slow Radiant claim forces the interleave
+    attempt; without the per-instance lock both would pass the SECRET_REVEALED check
+    and both claim the asset.
+    """
+
+    class SlowClaimRxd(FakeRadiantLeg):
+        async def claim_asset(self, record, preimage):
+            await asyncio.sleep(0.02)
+            return await super().claim_asset(record, preimage)
+
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=10)
+    rxd = SlowClaimRxd()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+
+    results = await asyncio.gather(
+        coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000),
+        coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000),
+        return_exceptions=True,
+    )
+    completed = [r for r in results if isinstance(r, SwapRecord)]
+    rejected = [r for r in results if isinstance(r, ValidationError)]
+    assert len(completed) == 1 and completed[0].state is SwapState.COMPLETED
+    assert len(rejected) == 1 and "only valid from SECRET_REVEALED" in str(rejected[0])
+    assert rxd.calls.count("claim_asset") == 1  # serialized: asset claimed exactly once
+
+
+async def test_scrape_rejects_claim_tx_for_foreign_funding_outpoint():
+    """Provenance gate (#3): a claim tx that reveals the right p but spends a DIFFERENT
+    funding outpoint (a wrong / cross-swap claim tx) is refused before any asset claim.
+    """
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=10)
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+
+    # A claim tx revealing the SAME p but spending a different outpoint than our HTLC.
+    foreign = dataclasses.replace(rec.btc_locator, funding_outpoint=t.BtcOutpoint("cd" * 32, 1))
+    foreign_claim = _real_maker_claim_tx(foreign, btc.claimed_with)
+    with pytest.raises(ValidationError, match="does not spend this swap"):
+        await coord.taker_scrape_and_claim_asset(foreign_claim, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rxd.claimed_with is None  # asset NOT claimed off a foreign claim tx
+    assert coord.record.state is SwapState.SECRET_REVEALED  # no advance on a refused scrape
+
+    # Sanity: the LEGIT claim tx (spending our outpoint) still settles.
+    legit = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    rec2 = await coord.taker_scrape_and_claim_asset(legit, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec2.state is SwapState.COMPLETED
 
 
 async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():

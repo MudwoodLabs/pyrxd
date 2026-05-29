@@ -32,6 +32,7 @@ Design rules (house style)
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import logging
 import math
@@ -45,6 +46,7 @@ from pyrxd.btc_wallet.taproot import (
     BtcHtlcLocator,
     Timelock,
     TimeUnit,
+    btc_input_outpoints_from_raw,
 )
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import SecretBytes
@@ -636,6 +638,31 @@ class CoordinatorConfig:
             raise ValidationError("accept_nondurable_seen must be a bool")
 
 
+def _serialized_step(method):
+    """Serialize an FSM-advancing coordinator step under the per-instance lock.
+
+    Defense-in-depth for a future concurrent driver (orderbook / watchtower / batch
+    runner): one coordinator instance processes ONE swap step at a time, so a driver
+    that fires two steps on the same instance concurrently cannot interleave a
+    check-then-advance across an ``await``. The dangerous same-H double-fund is
+    already closed by the atomic pre-broadcast ``reserve()``; this additionally
+    serializes the consensus-backstopped sibling steps (claim / refund) so a buggy
+    concurrent caller gets clean sequential execution instead of redundant
+    broadcasts + a spurious FSM-transition error. The lock is per-instance, so it
+    does NOT serialize independent swaps (each has its own coordinator). Read-only
+    gates (``pre_btc_lock_check``) are intentionally NOT wrapped — they hold no lock
+    and may be called from within a wrapped method (a reentrant acquire would
+    deadlock).
+    """
+
+    @functools.wraps(method)
+    async def _wrapper(self, *args, **kwargs):
+        async with self._step_lock:
+            return await method(self, *args, **kwargs)
+
+    return _wrapper
+
+
 def _leg_is_value_bearing(leg: object) -> bool:
     """True if a chain leg is tagged for a value-bearing network.
 
@@ -711,6 +738,10 @@ class SwapCoordinator:
                 "CoordinatorConfig(accept_nondurable_seen=True) to consciously accept "
                 "non-durability for a single-process, single-shot, fresh-H-per-run runbook."
             )
+        # One coordinator instance = one swap. This lock serializes the FSM-advancing
+        # steps (see @_serialized_step) so a future concurrent driver cannot interleave
+        # a check-then-advance across an await on a single instance.
+        self._step_lock = asyncio.Lock()
         self.record = record
         self.btc_leg = btc_leg
         self.radiant_leg = radiant_leg
@@ -804,6 +835,7 @@ class SwapCoordinator:
         return PreBtcLockGate(ok=True)
 
     # -- taker funds BTC first (the role invariant's step 2) ----------------
+    @_serialized_step
     async def taker_funds_btc(self, terms: NegotiatedTerms) -> SwapRecord:
         """Run the pre-lock gate, fund the BTC HTLC, record the locator, advance.
 
@@ -870,6 +902,7 @@ class SwapCoordinator:
         return self.record
 
     # -- post-asset-lock re-validation (H4 b) -------------------------------
+    @_serialized_step
     async def post_asset_lock_revalidate(self, observed_covenant_spk: bytes) -> SwapRecord:
         """Re-check the on-chain covenant SPK == expected-from-terms+H.
 
@@ -908,6 +941,7 @@ class SwapCoordinator:
         return self.record
 
     # -- maker claims BTC, revealing p (role invariant step 4) --------------
+    @_serialized_step
     async def maker_claims_btc(self, preimage: SecretBytes) -> SwapRecord:
         """Maker spends the BTC claim leaf with ``p`` (revealing it), then zeroizes p.
 
@@ -936,7 +970,32 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
+    def _assert_claim_tx_spends_our_htlc(self, maker_claim_tx_bytes: bytes) -> None:
+        """Provenance gate: the supplied claim tx MUST spend OUR BTC HTLC funding outpoint.
+
+        ``scrape_secret`` matches ``p`` by ``sha256(p)==H`` over the witness pushes — it
+        trusts that the caller-supplied tx belongs to THIS swap. We verify that here: a
+        counterparty-supplied claim tx for a DIFFERENT swap (even one that shares ``H``)
+        does not spend our funding outpoint, so we refuse to scrape/claim from it. This
+        is the witness-side cross-swap-replay defence that complements the admission-side
+        seen-store. Fail-closed on a missing locator or an unparseable tx.
+        """
+        locator = self.record.btc_locator
+        if locator is None:
+            raise ValidationError("no BTC locator on record; cannot verify claim-tx provenance")
+        expected = locator.funding_outpoint.prevout_bytes()
+        try:
+            prevouts = btc_input_outpoints_from_raw(maker_claim_tx_bytes)
+        except ValidationError as exc:
+            raise ValidationError(f"could not parse claim tx inputs; fail-closed ({exc})") from exc
+        if expected not in prevouts:
+            raise ValidationError(
+                "supplied claim tx does not spend this swap's BTC HTLC funding outpoint; "
+                "refusing to scrape p (wrong or cross-swap claim tx)"
+            )
+
     # -- taker scrapes p from the claim tx and claims the asset (step 5) ----
+    @_serialized_step
     async def taker_scrape_and_claim_asset(
         self,
         maker_claim_tx_bytes: bytes,
@@ -979,6 +1038,9 @@ class SwapCoordinator:
         p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
+        # Provenance: the tx we scraped p from must spend OUR funding outpoint (defends
+        # cross-swap replay even if H is reused via a path the seen-store does not cover).
+        self._assert_claim_tx_spends_our_htlc(maker_claim_tx_bytes)
 
         # Reorg gate: read the maker's BTC-claim depth (fail-closed on any error) and
         # assess against the t_rxd window.
@@ -1015,6 +1077,7 @@ class SwapCoordinator:
         return self.record
 
     # -- deliberate winner-take-all claim from the SQUEEZED/ASSET_VULNERABLE state --
+    @_serialized_step
     async def taker_claim_asset_from_vulnerable(self, maker_claim_tx_bytes: bytes) -> SwapRecord:
         """Best-effort asset claim from ASSET_VULNERABLE — an EXPLICIT policy decision.
 
@@ -1031,12 +1094,14 @@ class SwapCoordinator:
         p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
+        self._assert_claim_tx_spends_our_htlc(maker_claim_tx_bytes)
         await self.radiant_leg.claim_asset(self.record, bytes(p))
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record
 
     # -- maker-stall proactive asset refund (C1) ----------------------------
+    @_serialized_step
     async def maybe_refund_asset_on_maker_stall(
         self, *, now_block_height: int, asset_locked_at_height: int, maker_has_claimed_btc: bool
     ) -> SwapRecord:
@@ -1069,6 +1134,7 @@ class SwapCoordinator:
         return self.record
 
     # -- taker refunds BTC (ABORT paths: maker never locks, or PARAMS_MISMATCH)
+    @_serialized_step
     async def taker_refund_btc(self) -> SwapRecord:
         """Refund the BTC via the timelock leg, ending in ABORTED.
 
@@ -1091,6 +1157,7 @@ class SwapCoordinator:
         return self.record
 
     # -- safe failure: both timeouts elapse, both refund (MUTUAL_REFUND) -----
+    @_serialized_step
     async def mutual_refund(self) -> SwapRecord:
         """Both legs refund after both timeouts elapse — the guaranteed-safe failure.
 
