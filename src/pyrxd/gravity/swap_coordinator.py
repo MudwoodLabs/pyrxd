@@ -40,6 +40,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 
+from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import (
     BtcHtlcLocator,
     Timelock,
@@ -572,12 +573,22 @@ def assess_claim_finality(
 #       / indexer error — never an optimistic pass. It is async because a SYNC gate
 #       calling the async indexer would leak a truthy un-awaited coroutine = fail-OPEN.
 #
-#   SeenStore (persistent H-freshness):
+#   SeenStore (H-freshness; replay / free-option defence):
+#     reserve(hashlock: bytes) -> bool
+#       ATOMIC test-and-set: record H and return True if unseen, else return False.
+#       The coordinator's authoritative consume — called PRE-broadcast in
+#       taker_funds_btc so a concurrent/repeat funder of the same H is refused
+#       before any BTC moves (TOCTOU-1). A reused H is rejected for BOTH reasons:
+#       economic (free-option replay) and collision/cross-swap preimage replay.
 #     has_seen(hashlock: bytes) -> bool
-#     mark_seen(hashlock: bytes) -> None
-#       A DURABLE store of every H ever accepted. Reused H is rejected for BOTH
-#       reasons: economic (free-option replay) and collision/cross-swap preimage
-#       replay. Persistent so freshness survives a restart.
+#       Read-only advisory probe (the pre-lock gate's cheap early-reject); NEVER the
+#       binding decision. A future durable impl declares ``durable = True`` and MUST
+#       stay non-blocking (asyncio.to_thread behind an async reserve) and fsync the
+#       reservation BEFORE the broadcast. The wired in-memory store is NON-durable
+#       (durable = False) — freshness does NOT survive a restart or a second process;
+#       the coordinator refuses it on a value-bearing network unless
+#       CoordinatorConfig(accept_nondurable_seen=True) is set (single-process,
+#       fresh-H-per-run runbooks only).
 
 
 @dataclass(frozen=True)
@@ -604,6 +615,13 @@ class CoordinatorConfig:
     # funds (ref-authenticity binding (e) — a shallow genesis can be reorged out
     # after payment, voiding the provenance the taker relied on).
     min_ref_confirmations: int = 6
+    # Explicit opt-in to run a value-bearing swap with a NON-durable (in-process)
+    # seen-store. A non-durable store loses H-freshness on a restart / second process
+    # (SEEN-1), so the coordinator refuses one on a value-bearing network unless this
+    # is set. Acceptable only for a single-process, single-shot, fresh-H-per-run
+    # runbook (the dust harness); a long-lived / multi-process deployment needs a
+    # durable store (audit track), not this flag.
+    accept_nondurable_seen: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.margin_policy, MarginPolicy):
@@ -614,6 +632,20 @@ class CoordinatorConfig:
         c = self.min_ref_confirmations
         if not isinstance(c, int) or isinstance(c, bool) or c < 0:
             raise ValidationError("min_ref_confirmations must be a non-negative int")
+        if not isinstance(self.accept_nondurable_seen, bool):
+            raise ValidationError("accept_nondurable_seen must be a bool")
+
+
+def _leg_is_value_bearing(leg: object) -> bool:
+    """True if a chain leg is tagged for a value-bearing network.
+
+    Reuses the SAME definition as the leg audit gate
+    (:data:`pyrxd.btc_wallet.htlc_leg.AUDIT_CLEARED_NETWORKS`): a non-empty
+    ``network`` tag NOT in that set moves real value. A leg with no ``network``
+    attribute (e.g. a test fake) is treated as non-value-bearing.
+    """
+    net = getattr(leg, "network", None)
+    return isinstance(net, str) and bool(net) and net not in AUDIT_CLEARED_NETWORKS
 
 
 class SwapCoordinator:
@@ -632,7 +664,9 @@ class SwapCoordinator:
     indexer:
         Duck-typed ``RefIndexer`` (``verify_ref``). Indexer-unavailable => fail-closed.
     seen_store:
-        Duck-typed ``SeenStore`` (``has_seen``/``mark_seen``) — persistent H freshness.
+        Duck-typed ``SeenStore`` (``reserve``/``has_seen``) — H-freshness replay
+        defence. A non-durable (in-process) store is refused on a value-bearing
+        network unless ``config.accept_nondurable_seen`` is set.
     config:
         :class:`CoordinatorConfig` (margin policy + maker-stall window).
     persist:
@@ -661,6 +695,22 @@ class SwapCoordinator:
             raise ValidationError("config must be a CoordinatorConfig")
         if persist is not None and not callable(persist):
             raise ValidationError("persist must be an async callable or None")
+        # SEEN-1 guard: refuse a NON-durable (in-process) seen-store on a
+        # value-bearing network unless the operator explicitly accepts it. A
+        # non-durable store loses H-freshness on a restart / second process, so a
+        # long-lived or multi-process value-moving deployment would silently
+        # re-open the replay / free-option window. ``durable`` defaults False for
+        # any store that does not declare itself durable (fail-closed).
+        store_durable = bool(getattr(seen_store, "durable", False))
+        value_bearing = _leg_is_value_bearing(btc_leg) or _leg_is_value_bearing(radiant_leg)
+        if value_bearing and not store_durable and not config.accept_nondurable_seen:
+            raise ValidationError(
+                "seen-store is NON-durable (in-process only) but the coordinator is wired to a "
+                "value-bearing network: a restart or a second process resurrects the H-replay / "
+                "free-option window (SEEN-1). Use a durable SeenStore (durable=True), or pass "
+                "CoordinatorConfig(accept_nondurable_seen=True) to consciously accept "
+                "non-durability for a single-process, single-shot, fresh-H-per-run runbook."
+            )
         self.record = record
         self.btc_leg = btc_leg
         self.radiant_leg = radiant_leg
@@ -700,7 +750,9 @@ class SwapCoordinator:
              must bind to the ADVERTISED asset (genesis-outpoint==ref, `gly` marker,
              optional payload hash, ≥ ``min_ref_confirmations``). Indexer
              unavailable / shallow genesis / wrong asset => fail-closed.
-          2. H freshness against the persistent seen-store (reused H => reject).
+          2. H freshness — a read-only advisory probe of the seen-store (reused H
+             => reject early). The authoritative atomic reserve happens later, in
+             :meth:`taker_funds_btc`, immediately before the broadcast.
           3. The cross-chain margin ordering (``t_btc - t_rxd >= margin``).
           4. Maker-*promised* params match the locally re-derived BTC funding SPK
              (the on-chain re-validation happens later in
@@ -726,7 +778,8 @@ class SwapCoordinator:
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"REF authenticity failed; fail-closed ({exc})")
 
-        # 2. H freshness (persistent seen-store). Reject reuse for BOTH reasons.
+        # 2. H freshness — advisory read-only probe for a clean early reject; the
+        #    authoritative atomic reserve is in taker_funds_btc, pre-broadcast.
         try:
             if self.seen_store.has_seen(terms.hashlock):
                 return PreBtcLockGate(ok=False, reason="hashlock H reused (free-option / preimage-replay risk)")
@@ -755,8 +808,9 @@ class SwapCoordinator:
         """Run the pre-lock gate, fund the BTC HTLC, record the locator, advance.
 
         Refuses (raises) if the pre-lock gate fails — the taker NEVER funds against a
-        failed gate. On success the seen-store records H (freshness for future swaps)
-        and the durable record carries the full :class:`BtcHtlcLocator`.
+        failed gate. H is ATOMICALLY reserved in the seen-store PRE-broadcast (so a
+        concurrent or repeat funder of the same H is refused before any BTC moves;
+        TOCTOU-1), and the durable record carries the full :class:`BtcHtlcLocator`.
 
         Atomicity (kieran-python HIGH): ``btc_leg.fund`` broadcasts on-chain, so a
         cancellation between the broadcast and the in-memory state advance would
@@ -778,6 +832,20 @@ class SwapCoordinator:
         # that knows WHERE the HTLC address is (recoverable), not a silent gap.
         await self._persist_record(self.record)
 
+        # Reserve H ATOMICALLY and PRE-broadcast (TOCTOU-1 fix). The check-and-mark
+        # is one indivisible step strictly before the only on-chain effect below, so
+        # two concurrent funders of the same H race here and exactly one wins — the
+        # other is refused with nothing broadcast. A raising store fails CLOSED
+        # (refuse to fund), never open. H is consumed at this COMMIT point, not after
+        # fund() succeeds: an on-chain-locked HTLC has used its H, and a transient
+        # post-fund failure must not re-open the free-option / preimage-replay window.
+        try:
+            reserved = self.seen_store.reserve(terms.hashlock)
+        except Exception as exc:
+            raise ValidationError(f"seen-store unavailable; fail-closed ({exc})") from exc
+        if not reserved:
+            raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
+
         locator = await self.btc_leg.fund(terms)
         if not isinstance(locator, BtcHtlcLocator):
             raise ValidationError("btc_leg.fund must return a BtcHtlcLocator (full durable retained state)")
@@ -793,8 +861,7 @@ class SwapCoordinator:
                 f"funded BTC amount {locator.amount_sats} != negotiated btc_sats {terms.btc_sats}; "
                 "refusing to lock a mis-valued HTLC"
             )
-        # Record H freshness only after a successful gate + fund.
-        self.seen_store.mark_seen(terms.hashlock)
+        # (H was already reserved atomically pre-broadcast above — no post-fund mark.)
         self.record = self.record.with_btc_lock(locator)
         self._advance(SwapEvent.TAKER_FUNDS_BTC)
         # Shielded: the BTC is locked on-chain now; losing this write would

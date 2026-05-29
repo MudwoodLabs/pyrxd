@@ -359,6 +359,13 @@ class _Seen:
     def __init__(self) -> None:
         self._s: set[bytes] = set()
 
+    def reserve(self, h) -> bool:
+        b = bytes(h)
+        if b in self._s:
+            return False
+        self._s.add(b)
+        return True
+
     def has_seen(self, h) -> bool:
         return bytes(h) in self._s
 

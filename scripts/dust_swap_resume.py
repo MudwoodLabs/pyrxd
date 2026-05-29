@@ -212,7 +212,11 @@ async def resume(args) -> None:
         radiant_leg=rxd_leg,
         indexer=None,
         seen_store=InMemSeen(),
-        config=CoordinatorConfig(margin_policy=policy),
+        # Single-process, single-shot, fresh-H-per-run: consciously accept the
+        # non-durable in-memory seen-store on this value-bearing network (SEEN-1).
+        # (Resume enters at BTC_LOCKED and never calls taker_funds_btc, so it neither
+        # reserves nor needs H — the guard still fires at construction, hence the opt-in.)
+        config=CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True),
     )
     print(f"  coordinator seeded at {coord.record.state.value}")
 

@@ -73,22 +73,50 @@ logger = logging.getLogger(__name__)
 
 
 class SeenStore:
-    """In-memory H-freshness store (the coordinator's ``has_seen``/``mark_seen``).
+    """In-memory H-freshness store (the coordinator's ``reserve``/``has_seen``).
 
-    A DURABLE store of every hashlock H ever accepted, so a reused H is rejected
-    (free-option replay + cross-swap preimage replay). This milestone uses a plain
-    ``set`` — durability across restarts (SQLite) is deferred to the audit-gated
-    track; a blocking ``sqlite3`` call would stall the async coordinator loop. The
-    method shape is duck-compatible so a durable store drops in unchanged.
+    Records every hashlock H the coordinator has committed to funding, so a reused
+    H is rejected for BOTH reasons: economic (free-option replay) and cross-swap
+    preimage replay. ``reserve(H)`` is the authoritative atomic test-and-set the
+    coordinator calls PRE-broadcast; ``has_seen`` is a read-only advisory probe
+    (the pre-lock gate's cheap early-reject), never the binding decision.
+
+    NON-DURABLE (``durable = False``): a plain ``set``, so freshness does NOT
+    survive a restart or a second process. That is acceptable only for a
+    single-process, single-shot run that mints a fresh H per swap (the dust
+    runbook); the coordinator's construct-time guard refuses this store on a
+    value-bearing network unless the operator passes
+    ``CoordinatorConfig(accept_nondurable_seen=True)``. A durable replacement
+    (SQLite ``INSERT OR IGNORE`` keyed on H, declaring ``durable = True``) is
+    deferred to the external-audit track; it MUST stay non-blocking
+    (``asyncio.to_thread`` behind an async ``reserve``) and fsync the reservation
+    BEFORE the BTC broadcast. The method shape is duck-compatible so that durable
+    store drops in unchanged.
     """
+
+    durable = False
 
     def __init__(self) -> None:
         self._seen: set[bytes] = set()
+
+    def reserve(self, hashlock: bytes) -> bool:
+        """Atomically record H if unseen; True if freshly reserved, else False.
+
+        Atomic on the single-threaded event loop precisely because there is no
+        ``await`` between the membership test and the add.
+        """
+        h = bytes(hashlock)
+        if h in self._seen:
+            return False
+        self._seen.add(h)
+        return True
 
     def has_seen(self, hashlock: bytes) -> bool:
         return bytes(hashlock) in self._seen
 
     def mark_seen(self, hashlock: bytes) -> None:
+        # Retained as an unused primitive for the roundtrip test + back-compat; the
+        # coordinator's authoritative consume is reserve() (atomic, pre-broadcast).
         self._seen.add(bytes(hashlock))
 
 

@@ -66,15 +66,30 @@ class CapturingBroadcaster:
 
 
 class InMemSeen:
-    """In-memory ``SeenStore`` for the coordinator (single-process, no persistence).
+    """In-memory ``SeenStore`` for the coordinator (single-process, NON-durable).
 
-    Durable replay-defence belongs to a SQLite-backed store in production; the dust
-    runner is single-process and crashes are recovered by re-broadcasting the same
-    txs (idempotent), so an in-memory set is sufficient.
+    ``reserve(H)`` is the authoritative atomic test-and-set the coordinator calls
+    pre-broadcast; ``has_seen`` is the gate's read-only advisory probe. Durable
+    replay-defence belongs to a SQLite-backed store (``durable = True``) in
+    production; the dust runner is single-process, single-shot and mints a fresh H
+    per run, and crashes are recovered by re-broadcasting the same txs (idempotent),
+    so an in-memory set is sufficient HERE — but the coordinator's construct-time
+    guard requires the operator to pass ``accept_nondurable_seen=True`` to use it on
+    a value-bearing network, which the dust scripts do consciously.
     """
+
+    durable = False
 
     def __init__(self) -> None:
         self._s: set[bytes] = set()
+
+    def reserve(self, hsh: bytes) -> bool:
+        # Atomic on the single-threaded loop: no await between the test and the add.
+        h = bytes(hsh)
+        if h in self._s:
+            return False
+        self._s.add(h)
+        return True
 
     def has_seen(self, hsh: bytes) -> bool:
         return bytes(hsh) in self._s

@@ -160,6 +160,15 @@ def test_seen_store_roundtrip():
     assert not s.has_seen(b"\x02" * 32)
 
 
+def test_seen_store_reserve_is_atomic_test_and_set():
+    s = SeenStore()
+    h = b"\x03" * 32
+    assert s.reserve(h) is True  # freshly reserved
+    assert s.reserve(h) is False  # already reserved => refused
+    assert s.has_seen(h) is True
+    assert s.durable is False  # the wired store is honestly non-durable
+
+
 # --------------------------------------------------------------------------- audit gate
 
 

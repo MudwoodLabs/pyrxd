@@ -285,7 +285,9 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         radiant_leg=rxd_leg,
         indexer=None,
         seen_store=InMemSeen(),
-        config=CoordinatorConfig(margin_policy=policy),
+        # Single-process, single-shot, fresh-H-per-run: consciously accept the
+        # non-durable in-memory seen-store on this value-bearing network (SEEN-1).
+        config=CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True),
     )
 
     try:

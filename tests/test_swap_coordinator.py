@@ -209,6 +209,13 @@ class FakeSeenStore:
     def __init__(self) -> None:
         self._seen: set[bytes] = set()
 
+    def reserve(self, hashlock: bytes) -> bool:
+        h = bytes(hashlock)
+        if h in self._seen:
+            return False
+        self._seen.add(h)
+        return True
+
     def has_seen(self, hashlock: bytes) -> bool:
         return bytes(hashlock) in self._seen
 
@@ -296,14 +303,19 @@ async def test_taker_funds_btc_rejects_amount_mismatch():
     """
     terms = _terms()
 
-    # Overfund: leg locks more than negotiated -> reject, do not advance, do not mark seen.
+    # Overfund: leg locks more than negotiated -> reject, do not advance.
     over_leg = FakeBtcLeg(fund_amount_delta=50_000)
     seen = FakeSeenStore()
     coord = _coordinator(terms=terms, btc_leg=over_leg, seen_store=seen)
     with pytest.raises(ValidationError, match="funded BTC amount"):
         await coord.taker_funds_btc(terms)
     assert coord.record.state is SwapState.NEGOTIATED  # never advanced
-    assert not seen.has_seen(terms.hashlock)  # H not consumed on a refused fund
+    # H IS consumed here, NOT a regression: reserve() commits PRE-broadcast, and the
+    # amount check runs AFTER fund() has already broadcast (a P2TR SPK cannot pin the
+    # value, so the over-fund is only catchable post-lock). The BTC is locked on-chain
+    # at this point, so the option is genuinely spent — burning the per-swap H is the
+    # correct fail-closed posture (a fresh H is minted for any new swap).
+    assert seen.has_seen(terms.hashlock)
 
     # Underfund: also rejected (self-correcting in practice, but fail-closed here).
     under_leg = FakeBtcLeg(fund_amount_delta=-1)
@@ -399,13 +411,154 @@ async def test_reused_hashlock_rejected():
     assert not gate.ok and "reused" in gate.reason
 
 
-async def test_seen_store_marks_only_after_successful_fund():
+async def test_seen_store_reserves_before_fund():
+    """H is reserved when the swap COMMITS to broadcasting, not after fund success.
+
+    (Renamed from test_seen_store_marks_only_after_successful_fund: under the
+    TOCTOU-1 fix the consume is an atomic reserve() PRE-broadcast, so the old
+    "only after success" promise no longer holds. Happy path still leaves H seen.)
+    """
     store = FakeSeenStore()
     terms = _terms()
     coord = _coordinator(terms=terms, seen_store=store)
     assert not store.has_seen(terms.hashlock)
     await coord.taker_funds_btc(terms)
     assert store.has_seen(terms.hashlock)
+
+
+def test_reserve_is_atomic_idempotent():
+    """The contract that makes TOCTOU-1 closeable: reserve is a one-shot test-and-set."""
+    store = FakeSeenStore()
+    h = hashlib.sha256(os.urandom(32)).digest()
+    assert store.reserve(h) is True  # first wins
+    assert store.reserve(h) is False  # second is refused
+    assert store.has_seen(h) is True
+
+
+async def test_taker_funds_btc_reserves_before_broadcast_fail_closed():
+    """A seen-store whose reserve() raises must fail CLOSED: refuse, never broadcast.
+
+    Also pins the ORDER (reserve precedes fund): the leg's fund() must never be
+    called when the reservation cannot be taken.
+    """
+
+    class RaisingReserveStore:
+        def reserve(self, hashlock):
+            raise RuntimeError("store backend down")
+
+        def has_seen(self, hashlock):  # advisory probe used by the gate
+            return False
+
+    terms = _terms()
+    leg = FakeBtcLeg()
+    coord = _coordinator(terms=terms, btc_leg=leg, seen_store=RaisingReserveStore())
+    with pytest.raises(ValidationError, match="seen-store unavailable; fail-closed"):
+        await coord.taker_funds_btc(terms)
+    assert "fund" not in leg.calls  # never broadcast
+    assert coord.record.state is SwapState.NEGOTIATED  # never advanced
+
+
+async def test_concurrent_funders_same_H_exactly_one_wins():
+    """TOCTOU-1 regression: two coordinators sharing one seen-store + one H race to
+    fund. The atomic pre-broadcast reserve() must let EXACTLY ONE broadcast; the other
+    is refused (with nothing funded). Pre-fix, both passed the has_seen gate and both
+    funded — a double-lock of the same H.
+
+    To exercise the actual TOCTOU window we force a yield BETWEEN the gate's advisory
+    has_seen probe and the reserve, via a slow persist hook (the intent-persist sits
+    exactly there). Both tasks therefore clear the gate before EITHER reserves, so the
+    loser must be caught by reserve() itself — proving the reserve, not the advisory
+    gate, is the load-bearing guard. (Without the yield the gate would catch the loser
+    first and the test would not touch the reserve path at all.)
+    """
+
+    async def slow_persist(_rec):
+        await asyncio.sleep(0.02)
+
+    terms = _terms()
+    shared = FakeSeenStore()
+    leg_a, leg_b = FakeBtcLeg(), FakeBtcLeg()
+
+    def _coord(leg):
+        return SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            btc_leg=leg,
+            radiant_leg=FakeRadiantLeg(),
+            indexer=FakeIndexer(),
+            seen_store=shared,
+            config=CoordinatorConfig(margin_policy=MarginPolicy.estimated()),
+            persist=slow_persist,
+        )
+
+    coord_a, coord_b = _coord(leg_a), _coord(leg_b)
+    results = await asyncio.gather(
+        coord_a.taker_funds_btc(terms),
+        coord_b.taker_funds_btc(terms),
+        return_exceptions=True,
+    )
+    funded = [r for r in results if isinstance(r, SwapRecord)]
+    refused = [r for r in results if isinstance(r, ValidationError)]
+    assert len(funded) == 1, f"exactly one should fund, got {results!r}"
+    # The loser is caught by the RESERVE (post-gate), not the advisory has_seen gate.
+    assert len(refused) == 1 and "already reserved" in str(refused[0]), str(refused)
+    # Exactly one leg broadcast; the refused coordinator never advanced.
+    assert ("fund" in leg_a.calls) ^ ("fund" in leg_b.calls)
+    states = {coord_a.record.state, coord_b.record.state}
+    assert states == {SwapState.BTC_LOCKED, SwapState.NEGOTIATED}
+
+
+def test_coordinator_refuses_nondurable_seen_on_value_bearing_network():
+    """SEEN-1 guard: a value-bearing network + non-durable store + no opt-in => refuse.
+
+    Mirrors RadiantCovenantLeg's require_audit_cleared gate so a long-lived /
+    multi-process value-moving deployment cannot silently inherit the in-memory set.
+    """
+    terms = _terms()
+    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    value_leg = FakeBtcLeg()
+    value_leg.network = "bc"  # mainnet => value-bearing
+    cfg = CoordinatorConfig(margin_policy=MarginPolicy.estimated())
+
+    with pytest.raises(ValidationError, match="NON-durable"):
+        SwapCoordinator(
+            record=rec,
+            btc_leg=value_leg,
+            radiant_leg=FakeRadiantLeg(),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),  # durable defaults False
+            config=cfg,
+        )
+
+    # Explicit opt-in constructs fine (the conscious single-process dust posture).
+    ok = SwapCoordinator(
+        record=rec,
+        btc_leg=value_leg,
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(), accept_nondurable_seen=True),
+    )
+    assert ok.seen_store is not None
+
+    # A store declaring durability constructs fine even without the opt-in.
+    class DurableStub:
+        durable = True
+
+        def reserve(self, h):
+            return True
+
+        def has_seen(self, h):
+            return False
+
+    durable_ok = SwapCoordinator(
+        record=rec,
+        btc_leg=value_leg,
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=DurableStub(),
+        config=cfg,
+    )
+    assert durable_ok.seen_store.durable is True
 
 
 # ---------------------------------------------------------------------------
