@@ -17,6 +17,8 @@ real legs would. This exercises:
 
 from __future__ import annotations
 
+import asyncio
+import dataclasses
 import hashlib
 import json
 import os
@@ -25,14 +27,18 @@ import pickle
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_coordinator import (
     ESTIMATED_DEFAULT_MARGIN_BLOCKS,
     MAKER_SECRET_TAKER_LOCKS_BTC_FIRST,
+    ClaimFinality,
     CoordinatorConfig,
     MarginPolicy,
     SwapCoordinator,
     assert_timelock_margin,
+    assess_claim_finality,
     generate_secret,
+    measure_margin_from_btc_block_times,
     should_taker_refund_proactively,
 )
 from pyrxd.gravity.swap_state import (
@@ -62,11 +68,15 @@ class FakeBtcLeg:
     builds a real witness embedding p, so ``scrape_secret`` works for real.
     """
 
-    def __init__(self, *, tamper_promised_spk: bool = False, fund_amount_delta: int = 0) -> None:
+    def __init__(
+        self, *, tamper_promised_spk: bool = False, fund_amount_delta: int = 0, claim_confs: int = 100
+    ) -> None:
         self.tamper_promised_spk = tamper_promised_spk
         # Simulate a buggy/malicious leg (or a mutated `terms`) that funds the HTLC
         # with a value != the negotiated btc_sats. Positive = overfund, negative = under.
         self.fund_amount_delta = fund_amount_delta
+        # Reorg gate: confirmation depth confirmations_of_claim reports. Default deep.
+        self.claim_confs = claim_confs
         self.calls: list[str] = []
         self.last_locator: t.BtcHtlcLocator | None = None
         self.claimed_with: bytes | None = None
@@ -80,6 +90,7 @@ class FakeBtcLeg:
             timeout=terms.t_btc,
         )
 
+    # Sync: pure SPK derivation, no chain access.
     def derive_funding_scriptpubkey(self, terms: NegotiatedTerms) -> bytes:
         return self._htlc(terms).scriptpubkey
 
@@ -89,24 +100,31 @@ class FakeBtcLeg:
             return spk[:-1] + bytes([spk[-1] ^ 0x01])
         return spk
 
-    def fund(self, terms: NegotiatedTerms) -> t.BtcHtlcLocator:
+    # Async: the real leg broadcasts/reads chain here.
+    async def fund(self, terms: NegotiatedTerms) -> t.BtcHtlcLocator:
         self.calls.append("fund")
         amount = terms.btc_sats + self.fund_amount_delta
         loc = self._htlc(terms).with_funding(t.BtcOutpoint("ab" * 32, 0), amount)
         self.last_locator = loc
         return loc
 
-    def claim(self, locator: t.BtcHtlcLocator, preimage: bytes) -> None:
+    async def claim(self, locator: t.BtcHtlcLocator, preimage: bytes) -> None:
         # Real claim tx so scrape_secret has something to scrape.
         self.calls.append("claim")
         self.claimed_with = bytes(preimage)
 
-    def refund(self, locator: t.BtcHtlcLocator, timeout: t.Timelock) -> None:
+    async def refund(self, locator: t.BtcHtlcLocator, timeout: t.Timelock) -> None:
         self.calls.append("refund")
         self.refunded = True
 
+    # Sync: pure byte-parse of the claim tx witness (no chain access).
     def scrape_secret(self, claim_tx_bytes: bytes, hashlock: bytes) -> bytes:
         return t.scrape_secret(claim_tx_bytes, hashlock)
+
+    async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
+        # Reorg gate input: default to a deep, reorg-safe claim. Tests that exercise
+        # WAIT/SQUEEZED set `claim_confs` to a shallow value.
+        return self.claim_confs
 
 
 class FakeRadiantLeg:
@@ -122,7 +140,7 @@ class FakeRadiantLeg:
         self.claimed_with: bytes | None = None
         self.refunded = False
 
-    def expected_covenant_scriptpubkey(self, terms: NegotiatedTerms) -> bytes:
+    async def expected_covenant_scriptpubkey(self, terms: NegotiatedTerms) -> bytes:
         # Deterministic stand-in for the fused covenant SPK.
         body = (
             terms.hashlock
@@ -134,32 +152,70 @@ class FakeRadiantLeg:
         )
         return b"\x76\xa9" + hashlib.sha256(body).digest()
 
-    def covenant_outpoint(self, terms: NegotiatedTerms) -> str:
+    async def covenant_outpoint(self, terms: NegotiatedTerms) -> str:
         return "ef" * 32 + ":0"
 
-    def claim_asset(self, record: SwapRecord, preimage: bytes) -> None:
+    async def claim_asset(self, record: SwapRecord, preimage: bytes) -> None:
         self.calls.append("claim_asset")
         self.claimed_with = bytes(preimage)
 
-    def refund_asset(self, record: SwapRecord) -> None:
+    async def refund_asset(self, record: SwapRecord) -> None:
         self.calls.append("refund_asset")
         self.refunded = True
 
 
 class FakeIndexer:
-    def __init__(self, *, authentic: bool = True, raise_unavailable: bool = False) -> None:
+    """Async ``RefAuthenticityIndexer`` fake — resolves a ref to a ResolvedRef.
+
+    ``authentic=True`` returns a ResolvedRef whose genesis_outpoint == the queried
+    ref, with a gly marker and deep confirmations (passes every binding). The knobs
+    drive each fail-closed path: ``raise_unavailable`` (indexer error),
+    ``returns_none`` (unknown token), ``wrong_genesis`` (binding a/d),
+    ``no_marker`` (binding b), ``confirmations`` (binding e).
+    """
+
+    def __init__(
+        self,
+        *,
+        authentic: bool = True,
+        raise_unavailable: bool = False,
+        returns_none: bool = False,
+        wrong_genesis: bool = False,
+        no_marker: bool = False,
+        confirmations: int = 100,
+        payload_hash: bytes = b"\x99" * 32,
+    ) -> None:
         self.authentic = authentic
         self.raise_unavailable = raise_unavailable
+        self.returns_none = returns_none
+        self.wrong_genesis = wrong_genesis
+        self.no_marker = no_marker
+        self.confirmations = confirmations
+        self.payload_hash = payload_hash
 
-    def verify_ref(self, genesis_ref: bytes) -> bool:
+    async def resolve_ref(self, genesis_ref: bytes) -> ResolvedRef | None:
         if self.raise_unavailable:
             raise RuntimeError("indexer unreachable")
-        return self.authentic
+        if self.returns_none or not self.authentic:
+            return None
+        return ResolvedRef(
+            genesis_outpoint=(b"\xcc" * 36) if self.wrong_genesis else bytes(genesis_ref),
+            has_gly_marker=not self.no_marker,
+            payload_hash=self.payload_hash,
+            confirmations=self.confirmations,
+        )
 
 
 class FakeSeenStore:
     def __init__(self) -> None:
         self._seen: set[bytes] = set()
+
+    def reserve(self, hashlock: bytes) -> bool:
+        h = bytes(hashlock)
+        if h in self._seen:
+            return False
+        self._seen.add(h)
+        return True
 
     def has_seen(self, hashlock: bytes) -> bool:
         return bytes(hashlock) in self._seen
@@ -239,7 +295,7 @@ def test_role_invariant_constant_spelled_out():
 # ---------------------------------------------------------------------------
 
 
-def test_taker_funds_btc_rejects_amount_mismatch():
+async def test_taker_funds_btc_rejects_amount_mismatch():
     """Regression (2026-05-24 panel): taker_funds_btc must bind the funded amount
     to the negotiated btc_sats. A P2TR scriptPubKey commits to the taptree, not the
     output value, so the pre-lock SPK check cannot catch a wrong amount — this Python
@@ -248,24 +304,29 @@ def test_taker_funds_btc_rejects_amount_mismatch():
     """
     terms = _terms()
 
-    # Overfund: leg locks more than negotiated -> reject, do not advance, do not mark seen.
+    # Overfund: leg locks more than negotiated -> reject, do not advance.
     over_leg = FakeBtcLeg(fund_amount_delta=50_000)
     seen = FakeSeenStore()
     coord = _coordinator(terms=terms, btc_leg=over_leg, seen_store=seen)
     with pytest.raises(ValidationError, match="funded BTC amount"):
-        coord.taker_funds_btc(terms)
+        await coord.taker_funds_btc(terms)
     assert coord.record.state is SwapState.NEGOTIATED  # never advanced
-    assert not seen.has_seen(terms.hashlock)  # H not consumed on a refused fund
+    # H IS consumed here, NOT a regression: reserve() commits PRE-broadcast, and the
+    # amount check runs AFTER fund() has already broadcast (a P2TR SPK cannot pin the
+    # value, so the over-fund is only catchable post-lock). The BTC is locked on-chain
+    # at this point, so the option is genuinely spent — burning the per-swap H is the
+    # correct fail-closed posture (a fresh H is minted for any new swap).
+    assert seen.has_seen(terms.hashlock)
 
     # Underfund: also rejected (self-correcting in practice, but fail-closed here).
     under_leg = FakeBtcLeg(fund_amount_delta=-1)
     coord2 = _coordinator(terms=terms, btc_leg=under_leg)
     with pytest.raises(ValidationError, match="funded BTC amount"):
-        coord2.taker_funds_btc(terms)
+        await coord2.taker_funds_btc(terms)
 
     # Exact match still funds and advances.
     ok_coord = _coordinator(terms=terms, btc_leg=FakeBtcLeg())
-    rec = ok_coord.taker_funds_btc(terms)
+    rec = await ok_coord.taker_funds_btc(terms)
     assert rec.state is SwapState.BTC_LOCKED
 
 
@@ -341,23 +402,164 @@ def test_secret_is_unpicklable():
 # ---------------------------------------------------------------------------
 
 
-def test_reused_hashlock_rejected():
+async def test_reused_hashlock_rejected():
     store = FakeSeenStore()
     h = hashlib.sha256(os.urandom(32)).digest()
     store.mark_seen(h)  # already used in a prior swap
     terms = _terms(hashlock=h)
     coord = _coordinator(terms=terms, seen_store=store)
-    gate = coord.pre_btc_lock_check(terms)
+    gate = await coord.pre_btc_lock_check(terms)
     assert not gate.ok and "reused" in gate.reason
 
 
-def test_seen_store_marks_only_after_successful_fund():
+async def test_seen_store_reserves_before_fund():
+    """H is reserved when the swap COMMITS to broadcasting, not after fund success.
+
+    (Renamed from test_seen_store_marks_only_after_successful_fund: under the
+    TOCTOU-1 fix the consume is an atomic reserve() PRE-broadcast, so the old
+    "only after success" promise no longer holds. Happy path still leaves H seen.)
+    """
     store = FakeSeenStore()
     terms = _terms()
     coord = _coordinator(terms=terms, seen_store=store)
     assert not store.has_seen(terms.hashlock)
-    coord.taker_funds_btc(terms)
+    await coord.taker_funds_btc(terms)
     assert store.has_seen(terms.hashlock)
+
+
+def test_reserve_is_atomic_idempotent():
+    """The contract that makes TOCTOU-1 closeable: reserve is a one-shot test-and-set."""
+    store = FakeSeenStore()
+    h = hashlib.sha256(os.urandom(32)).digest()
+    assert store.reserve(h) is True  # first wins
+    assert store.reserve(h) is False  # second is refused
+    assert store.has_seen(h) is True
+
+
+async def test_taker_funds_btc_reserves_before_broadcast_fail_closed():
+    """A seen-store whose reserve() raises must fail CLOSED: refuse, never broadcast.
+
+    Also pins the ORDER (reserve precedes fund): the leg's fund() must never be
+    called when the reservation cannot be taken.
+    """
+
+    class RaisingReserveStore:
+        def reserve(self, hashlock):
+            raise RuntimeError("store backend down")
+
+        def has_seen(self, hashlock):  # advisory probe used by the gate
+            return False
+
+    terms = _terms()
+    leg = FakeBtcLeg()
+    coord = _coordinator(terms=terms, btc_leg=leg, seen_store=RaisingReserveStore())
+    with pytest.raises(ValidationError, match="seen-store unavailable; fail-closed"):
+        await coord.taker_funds_btc(terms)
+    assert "fund" not in leg.calls  # never broadcast
+    assert coord.record.state is SwapState.NEGOTIATED  # never advanced
+
+
+async def test_concurrent_funders_same_H_exactly_one_wins():
+    """TOCTOU-1 regression: two coordinators sharing one seen-store + one H race to
+    fund. The atomic pre-broadcast reserve() must let EXACTLY ONE broadcast; the other
+    is refused (with nothing funded). Pre-fix, both passed the has_seen gate and both
+    funded — a double-lock of the same H.
+
+    To exercise the actual TOCTOU window we force a yield BETWEEN the gate's advisory
+    has_seen probe and the reserve, via a slow persist hook (the intent-persist sits
+    exactly there). Both tasks therefore clear the gate before EITHER reserves, so the
+    loser must be caught by reserve() itself — proving the reserve, not the advisory
+    gate, is the load-bearing guard. (Without the yield the gate would catch the loser
+    first and the test would not touch the reserve path at all.)
+    """
+
+    async def slow_persist(_rec):
+        await asyncio.sleep(0.02)
+
+    terms = _terms()
+    shared = FakeSeenStore()
+    leg_a, leg_b = FakeBtcLeg(), FakeBtcLeg()
+
+    def _coord(leg):
+        return SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            btc_leg=leg,
+            radiant_leg=FakeRadiantLeg(),
+            indexer=FakeIndexer(),
+            seen_store=shared,
+            config=CoordinatorConfig(margin_policy=MarginPolicy.estimated()),
+            persist=slow_persist,
+        )
+
+    coord_a, coord_b = _coord(leg_a), _coord(leg_b)
+    results = await asyncio.gather(
+        coord_a.taker_funds_btc(terms),
+        coord_b.taker_funds_btc(terms),
+        return_exceptions=True,
+    )
+    funded = [r for r in results if isinstance(r, SwapRecord)]
+    refused = [r for r in results if isinstance(r, ValidationError)]
+    assert len(funded) == 1, f"exactly one should fund, got {results!r}"
+    # The loser is caught by the RESERVE (post-gate), not the advisory has_seen gate.
+    assert len(refused) == 1 and "already reserved" in str(refused[0]), str(refused)
+    # Exactly one leg broadcast; the refused coordinator never advanced.
+    assert ("fund" in leg_a.calls) ^ ("fund" in leg_b.calls)
+    states = {coord_a.record.state, coord_b.record.state}
+    assert states == {SwapState.BTC_LOCKED, SwapState.NEGOTIATED}
+
+
+def test_coordinator_refuses_nondurable_seen_on_value_bearing_network():
+    """SEEN-1 guard: a value-bearing network + non-durable store + no opt-in => refuse.
+
+    Mirrors RadiantCovenantLeg's require_audit_cleared gate so a long-lived /
+    multi-process value-moving deployment cannot silently inherit the in-memory set.
+    """
+    terms = _terms()
+    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    value_leg = FakeBtcLeg()
+    value_leg.network = "bc"  # mainnet => value-bearing
+    cfg = CoordinatorConfig(margin_policy=MarginPolicy.estimated())
+
+    with pytest.raises(ValidationError, match="NON-durable"):
+        SwapCoordinator(
+            record=rec,
+            btc_leg=value_leg,
+            radiant_leg=FakeRadiantLeg(),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),  # durable defaults False
+            config=cfg,
+        )
+
+    # Explicit opt-in constructs fine (the conscious single-process dust posture).
+    ok = SwapCoordinator(
+        record=rec,
+        btc_leg=value_leg,
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(), accept_nondurable_seen=True),
+    )
+    assert ok.seen_store is not None
+
+    # A store declaring durability constructs fine even without the opt-in.
+    class DurableStub:
+        durable = True
+
+        def reserve(self, h):
+            return True
+
+        def has_seen(self, h):
+            return False
+
+    durable_ok = SwapCoordinator(
+        record=rec,
+        btc_leg=value_leg,
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=DurableStub(),
+        config=cfg,
+    )
+    assert durable_ok.seen_store.durable is True
 
 
 # ---------------------------------------------------------------------------
@@ -365,32 +567,59 @@ def test_seen_store_marks_only_after_successful_fund():
 # ---------------------------------------------------------------------------
 
 
-def test_pre_lock_indexer_unavailable_fail_closed():
+async def test_pre_lock_indexer_unavailable_fail_closed():
     terms = _terms(variant="ft")
     coord = _coordinator(terms=terms, indexer=FakeIndexer(raise_unavailable=True))
-    gate = coord.pre_btc_lock_check(terms)
+    gate = await coord.pre_btc_lock_check(terms)
     assert not gate.ok and "fail-closed" in gate.reason
 
 
-def test_pre_lock_indexer_says_inauthentic():
+async def test_pre_lock_indexer_says_inauthentic():
     terms = _terms(variant="nft")
     coord = _coordinator(terms=terms, indexer=FakeIndexer(authentic=False))
-    gate = coord.pre_btc_lock_check(terms)
-    assert not gate.ok and "authenticity" in gate.reason
+    gate = await coord.pre_btc_lock_check(terms)
+    assert not gate.ok and "REF authenticity failed" in gate.reason
 
 
-def test_pre_lock_maker_promised_params_mismatch():
+async def test_pre_lock_ref_wrong_genesis_fail_closed():
+    """Binding (a)/(d): a genuine glyph whose genesis outpoint != the advertised
+    ref is the wrong asset — reject (the ref IS the asset identity)."""
+    terms = _terms(variant="nft")
+    coord = _coordinator(terms=terms, indexer=FakeIndexer(wrong_genesis=True))
+    gate = await coord.pre_btc_lock_check(terms)
+    assert not gate.ok and "REF authenticity failed" in gate.reason
+
+
+async def test_pre_lock_ref_no_gly_marker_fail_closed():
+    """Binding (b): a bare singleton with no `gly` envelope (the exact R1 forgery)
+    is rejected even if the outpoint matches."""
+    terms = _terms(variant="ft")
+    coord = _coordinator(terms=terms, indexer=FakeIndexer(no_marker=True))
+    gate = await coord.pre_btc_lock_check(terms)
+    assert not gate.ok and "REF authenticity failed" in gate.reason
+
+
+async def test_pre_lock_ref_shallow_genesis_fail_closed():
+    """Binding (e): a genesis shallower than min_ref_confirmations can be reorged
+    out after payment — reject."""
+    terms = _terms(variant="nft")
+    coord = _coordinator(terms=terms, indexer=FakeIndexer(confirmations=2))  # < default 6
+    gate = await coord.pre_btc_lock_check(terms)
+    assert not gate.ok and "REF authenticity failed" in gate.reason
+
+
+async def test_pre_lock_maker_promised_params_mismatch():
     terms = _terms()
     coord = _coordinator(terms=terms, btc_leg=FakeBtcLeg(tamper_promised_spk=True))
-    gate = coord.pre_btc_lock_check(terms)
+    gate = await coord.pre_btc_lock_check(terms)
     assert not gate.ok and "promised" in gate.reason
 
 
-def test_taker_refuses_to_fund_on_failed_gate():
+async def test_taker_refuses_to_fund_on_failed_gate():
     terms = _terms()
     coord = _coordinator(terms=terms, indexer=FakeIndexer(authentic=False))
     with pytest.raises(ValidationError):
-        coord.taker_funds_btc(terms)
+        await coord.taker_funds_btc(terms)
 
 
 # ---------------------------------------------------------------------------
@@ -433,7 +662,7 @@ def test_should_not_refund_if_maker_already_claimed():
 # ---------------------------------------------------------------------------
 
 
-def test_e2e_happy_path_completed():
+async def test_e2e_happy_path_completed():
     # Maker generates p; only H goes into the terms.
     p_secret, h = generate_secret()
     terms = _terms(hashlock=h)
@@ -443,25 +672,27 @@ def test_e2e_happy_path_completed():
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
 
     # 1. Taker locks BTC first (gate passes, locator persisted).
-    rec = coord.taker_funds_btc(terms)
+    rec = await coord.taker_funds_btc(terms)
     assert rec.state is SwapState.BTC_LOCKED
     assert rec.btc_locator is not None
 
     # 2. Maker locks the asset; on-chain SPK matches expected => BOTH_LOCKED.
-    expected_spk = rxd.expected_covenant_scriptpubkey(terms)
-    rec = coord.post_asset_lock_revalidate(expected_spk)
+    expected_spk = await rxd.expected_covenant_scriptpubkey(terms)
+    rec = await coord.post_asset_lock_revalidate(expected_spk)
     assert rec.state is SwapState.BOTH_LOCKED
 
     # 3. Maker claims BTC, revealing p; p is zeroized after.
-    rec = coord.maker_claims_btc(p_secret)
+    rec = await coord.maker_claims_btc(p_secret)
     assert rec.state is SwapState.SECRET_REVEALED
     assert btc.claimed_with is not None and hashlib.sha256(btc.claimed_with).digest() == h
     with pytest.raises(Exception):
         p_secret.unsafe_raw_bytes()  # zeroized
 
-    # 4. Taker scrapes p from the maker's real claim tx and claims the asset.
+    # 4. Taker scrapes p from the maker's real claim tx and claims the asset. The
+    # maker's BTC claim is deep (FakeBtcLeg.claim_confs default) and the t_rxd window
+    # has room, so the reorg gate returns SAFE.
     claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
-    rec = coord.taker_scrape_and_claim_asset(claim_tx)
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
     assert rec.state is SwapState.COMPLETED
 
     # Right party ends whole: maker got the BTC (claim called), taker got the asset.
@@ -477,19 +708,19 @@ def test_e2e_happy_path_completed():
 # ---------------------------------------------------------------------------
 
 
-def test_e2e_mutual_refund_both_whole():
+async def test_e2e_mutual_refund_both_whole():
     _p, h = generate_secret()
     terms = _terms(hashlock=h)
     btc = FakeBtcLeg()
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
 
-    coord.taker_funds_btc(terms)
-    coord.post_asset_lock_revalidate(rxd.expected_covenant_scriptpubkey(terms))
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
     assert coord.record.state is SwapState.BOTH_LOCKED
 
     # Maker never claims; both timeouts elapse; both refund.
-    rec = coord.mutual_refund()
+    rec = await coord.mutual_refund()
     assert rec.state is SwapState.MUTUAL_REFUND
     # Both parties recovered their own assets — no one-sided loss.
     assert btc.refunded and rxd.refunded
@@ -500,22 +731,22 @@ def test_e2e_mutual_refund_both_whole():
 # ---------------------------------------------------------------------------
 
 
-def test_e2e_params_mismatch_taker_refunds_btc():
+async def test_e2e_params_mismatch_taker_refunds_btc():
     _p, h = generate_secret()
     terms = _terms(hashlock=h)
     btc = FakeBtcLeg()
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
 
-    coord.taker_funds_btc(terms)
+    await coord.taker_funds_btc(terms)
 
     # Maker locks the asset, but the on-chain covenant SPK is WRONG (tampered).
     wrong_spk = b"\xde\xad" + b"\x00" * 32
-    rec = coord.post_asset_lock_revalidate(wrong_spk)
+    rec = await coord.post_asset_lock_revalidate(wrong_spk)
     assert rec.state is SwapState.PARAMS_MISMATCH
 
     # Taker refunds the BTC via the timelock leg -> ABORTED.
-    rec = coord.taker_refund_btc()
+    rec = await coord.taker_refund_btc()
     assert rec.state is SwapState.ABORTED
     assert btc.refunded
     # Taker is whole (got BTC back); maker never received BTC.
@@ -527,20 +758,20 @@ def test_e2e_params_mismatch_taker_refunds_btc():
 # ---------------------------------------------------------------------------
 
 
-def test_e2e_maker_stalls_taker_refunds_asset():
+async def test_e2e_maker_stalls_taker_refunds_asset():
     _p, h = generate_secret()
     terms = _terms(hashlock=h, t_rxd_blocks=72)
     btc = FakeBtcLeg()
     rxd = FakeRadiantLeg()
     coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd, window=6)
 
-    coord.taker_funds_btc(terms)
-    coord.post_asset_lock_revalidate(rxd.expected_covenant_scriptpubkey(terms))
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
     assert coord.record.state is SwapState.BOTH_LOCKED
 
     # Maker stalls: hasn't claimed and we are within N of t_RXD maturity.
     # locked at 1000; maturity = 1072; act at >= 1066.
-    rec = coord.maybe_refund_asset_on_maker_stall(
+    rec = await coord.maybe_refund_asset_on_maker_stall(
         now_block_height=1066, asset_locked_at_height=1000, maker_has_claimed_btc=False
     )
     assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
@@ -548,14 +779,14 @@ def test_e2e_maker_stalls_taker_refunds_asset():
     # Taker is whole on the asset side; never lost both.
 
 
-def test_maker_stall_noop_before_window():
+async def test_maker_stall_noop_before_window():
     _p, h = generate_secret()
     terms = _terms(hashlock=h, t_rxd_blocks=72)
     coord = _coordinator(terms=terms)
-    coord.taker_funds_btc(terms)
-    coord.post_asset_lock_revalidate(coord.radiant_leg.expected_covenant_scriptpubkey(terms))
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await coord.radiant_leg.expected_covenant_scriptpubkey(terms))
     # Far from maturity -> no-op, stays BOTH_LOCKED.
-    rec = coord.maybe_refund_asset_on_maker_stall(
+    rec = await coord.maybe_refund_asset_on_maker_stall(
         now_block_height=1000, asset_locked_at_height=1000, maker_has_claimed_btc=False
     )
     assert rec.state is SwapState.BOTH_LOCKED
@@ -566,11 +797,11 @@ def test_maker_stall_noop_before_window():
 # ---------------------------------------------------------------------------
 
 
-def test_crash_recovery_refund_from_persisted_record():
+async def test_crash_recovery_refund_from_persisted_record():
     _p, h = generate_secret()
     terms = _terms(hashlock=h)
     coord = _coordinator(terms=terms)
-    coord.taker_funds_btc(terms)
+    await coord.taker_funds_btc(terms)
 
     # Simulate a crash: serialise the record, lose all in-memory state, reload.
     blob = json.dumps(coord.record.to_dict())
@@ -589,18 +820,512 @@ def test_crash_recovery_refund_from_persisted_record():
         seen_store=FakeSeenStore(),
         config=CoordinatorConfig(margin_policy=MarginPolicy.estimated()),
     )
-    rec = coord2.taker_refund_btc()
+    rec = await coord2.taker_refund_btc()
     assert rec.state is SwapState.ABORTED
     assert btc2.refunded
 
 
-def test_maker_claims_rejects_wrong_preimage():
+async def test_maker_claims_rejects_wrong_preimage():
     _p, h = generate_secret()
     terms = _terms(hashlock=h)
     coord = _coordinator(terms=terms)
-    coord.taker_funds_btc(terms)
-    coord.post_asset_lock_revalidate(coord.radiant_leg.expected_covenant_scriptpubkey(terms))
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await coord.radiant_leg.expected_covenant_scriptpubkey(terms))
     # A different secret that does not hash to H must be refused before broadcast.
     wrong = SecretBytes(os.urandom(32))
     with pytest.raises(ValidationError):
-        coord.maker_claims_btc(wrong)
+        await coord.maker_claims_btc(wrong)
+
+
+# ---------------------------------------------------------------------------
+# T7 D2: a SYNC gate over the async indexer fails OPEN — must be impossible
+# ---------------------------------------------------------------------------
+
+
+async def test_async_indexer_resolve_ref_is_actually_awaited():
+    """Regression for the fail-OPEN catastrophe (T7 plan D2): if the gate were sync
+    and merely *called* ``resolve_ref`` without awaiting, it would hold a truthy
+    coroutine object and pass. Here we drive the real (async) gate and prove a
+    counterfeit ref (resolve_ref returns None) is REJECTED — i.e. the gate awaits
+    the coroutine and inspects its result, never a bare coroutine object.
+    """
+    terms = _terms(variant="nft")
+    coord = _coordinator(terms=terms, indexer=FakeIndexer(returns_none=True))
+    gate = await coord.pre_btc_lock_check(terms)
+    assert not gate.ok and "REF authenticity failed" in gate.reason
+    # And funding is refused on that failed gate.
+    with pytest.raises(ValidationError):
+        await coord.taker_funds_btc(terms)
+
+
+# ---------------------------------------------------------------------------
+# T7 D1: persist-before-broadcast + asyncio.shield atomicity
+# ---------------------------------------------------------------------------
+
+
+class RecordingPersist:
+    """An async persist hook that records the (state, has_locator) of every write."""
+
+    def __init__(self) -> None:
+        self.writes: list[tuple[SwapState, bool]] = []
+
+    async def __call__(self, record: SwapRecord) -> None:
+        self.writes.append((record.state, record.btc_locator is not None))
+
+
+async def test_persist_intent_before_broadcast_then_shielded_after():
+    """The intent record is persisted BEFORE the awaited fund/broadcast (so a crash
+    leaves a recoverable record), and the funded record is persisted AFTER. Order:
+    first write is still NEGOTIATED (pre-broadcast intent), the next is BTC_LOCKED
+    with the locator (post-broadcast, shielded)."""
+    terms = _terms()
+    persist = RecordingPersist()
+    coord = SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        btc_leg=FakeBtcLeg(),
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated()),
+        persist=persist,
+    )
+    await coord.taker_funds_btc(terms)
+    assert persist.writes[0] == (SwapState.NEGOTIATED, False)  # intent, pre-broadcast
+    assert persist.writes[-1] == (SwapState.BTC_LOCKED, True)  # funded, post-broadcast
+
+
+async def test_post_broadcast_persist_survives_cancellation():
+    """The shielded post-broadcast persist must complete even if the awaiting task is
+    cancelled right after the broadcast — otherwise the BTC is locked on-chain but
+    the record never advanced (double-fund on retry, kieran-python HIGH)."""
+    terms = _terms()
+    completed: list[SwapState] = []
+
+    async def slow_persist(record: SwapRecord) -> None:
+        # Intent (pre-broadcast) write is fast; the post-broadcast BTC_LOCKED write is
+        # slow + shielded, so the cancellation below lands squarely inside it.
+        if record.state is SwapState.BTC_LOCKED:
+            await asyncio.sleep(0.03)
+        completed.append(record.state)
+
+    coord = SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+        btc_leg=FakeBtcLeg(),
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated()),
+        persist=slow_persist,
+    )
+    task = asyncio.ensure_future(coord.taker_funds_btc(terms))
+    await asyncio.sleep(0.01)  # let it broadcast + enter the shielded persist
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # asyncio.shield detaches the inner persist; the outer await is cancelled but the
+    # shielded write keeps running. Give it time to finish, then assert it completed.
+    await asyncio.sleep(0.05)
+    # The shielded BTC_LOCKED persist still completed despite the cancellation.
+    assert SwapState.BTC_LOCKED in completed
+
+
+# ---------------------------------------------------------------------------
+# CoordinatorConfig: min_ref_confirmations validation
+# ---------------------------------------------------------------------------
+
+
+def test_config_rejects_bad_min_ref_confirmations():
+    with pytest.raises(ValidationError):
+        CoordinatorConfig(margin_policy=MarginPolicy.estimated(), min_ref_confirmations=-1)
+    with pytest.raises(ValidationError):
+        CoordinatorConfig(margin_policy=MarginPolicy.estimated(), min_ref_confirmations=True)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Reorg-finality gate (plan 2026-05-26, security-HIGH)
+# ---------------------------------------------------------------------------
+
+
+def test_margin_policy_rejects_reorg_depth_below_floor():
+    """A 0 OR 1 block reorg depth defeats the gate — rejected at construction (floor >= 2).
+    A 1-block depth is materially unsafe on a real chain (single-block reorgs happen);
+    dust bounds the loss, not the reorg probability."""
+    for bad in (0, 1):
+        with pytest.raises(ValidationError, match="btc_claim_reorg_depth"):
+            MarginPolicy(
+                margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+                block_interval_s=600.0,
+                is_measured=False,
+                btc_claim_reorg_depth=t.Timelock(bad, t.TimeUnit.BLOCKS),
+            )
+        with pytest.raises(ValidationError, match="rxd_claim_burial"):
+            MarginPolicy(
+                margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+                block_interval_s=600.0,
+                is_measured=False,
+                rxd_claim_burial=t.Timelock(bad, t.TimeUnit.BLOCKS),
+            )
+    # The floor (2) itself is accepted — a defensible chosen dust value.
+    ok = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        btc_claim_reorg_depth=t.Timelock(2, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(2, t.TimeUnit.BLOCKS),
+    )
+    assert ok.btc_claim_reorg_depth.value == 2
+
+    # A seconds-tagged depth is floored in BLOCK terms too: 1 BTC block ~600s, so 60s
+    # normalises to < 1 block -> below the 2-block floor -> rejected.
+    with pytest.raises(ValidationError, match="btc_claim_reorg_depth"):
+        MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            btc_claim_reorg_depth=t.Timelock(60, t.TimeUnit.SECONDS),
+        )
+
+
+def _policy(*, btc_depth=6, rxd_burial=6):
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        btc_claim_reorg_depth=t.Timelock(btc_depth, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(rxd_burial, t.TimeUnit.BLOCKS),
+    )
+
+
+def test_assess_claim_finality_safe():
+    # Deep BTC claim (10 >= 6) + roomy window: locked@1000, t_rxd=72 -> opens@1072,
+    # now=1000 -> 72 blocks left >= rxd_burial 6 -> SAFE.
+    out = assess_claim_finality(
+        btc_claim_confirmations=10,
+        now_rxd_height=1000,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+        policy=_policy(),
+    )
+    assert out is ClaimFinality.SAFE
+
+
+def test_assess_claim_finality_wait():
+    # Shallow BTC claim (1 < 6) but ample window: after waiting the remaining BTC
+    # depth there is still room to bury -> WAIT.
+    out = assess_claim_finality(
+        btc_claim_confirmations=1,
+        now_rxd_height=1000,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+        policy=_policy(),
+    )
+    assert out is ClaimFinality.WAIT
+
+
+def test_assess_claim_finality_squeezed_shallow_closing_window():
+    # Shallow claim AND window closing: locked@1000, t_rxd=10 -> opens@1010, now=1006
+    # -> 4 blocks left; after waiting btc depth there's no room to bury -> SQUEEZED.
+    out = assess_claim_finality(
+        btc_claim_confirmations=1,
+        now_rxd_height=1006,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(10, t.TimeUnit.BLOCKS),
+        policy=_policy(),
+    )
+    assert out is ClaimFinality.SQUEEZED
+
+
+def test_assess_claim_finality_squeezed_deep_but_no_room():
+    # Deep BTC claim but the window can't even fit our own burial -> SQUEEZED (don't
+    # claim into a window that closes before we bury).
+    out = assess_claim_finality(
+        btc_claim_confirmations=10,
+        now_rxd_height=1008,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(10, t.TimeUnit.BLOCKS),
+        policy=_policy(),
+    )
+    assert out is ClaimFinality.SQUEEZED
+
+
+def test_assess_claim_finality_fail_closed_on_bad_inputs():
+    for bad in (dict(btc_claim_confirmations=-1), dict(now_rxd_height=-1), dict(asset_locked_at_height=-1)):
+        kw = dict(
+            btc_claim_confirmations=10,
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=_policy(),
+        )
+        kw.update(bad)
+        with pytest.raises(ValidationError):
+            assess_claim_finality(**kw)
+    with pytest.raises(ValidationError):
+        assess_claim_finality(
+            btc_claim_confirmations=10, now_rxd_height=1000, asset_locked_at_height=1000, t_rxd=72, policy=_policy()
+        )  # type: ignore[arg-type]
+
+
+def test_assess_claim_finality_rejects_now_below_lock_f013():
+    # F-013: now_rxd_height < asset_locked_at_height is impossible on an honest chain
+    # (a lagging/lying node). Fail-closed rather than computing an optimistic SAFE off
+    # an inflated refund_opens_at.
+    with pytest.raises(ValidationError, match="impossible on an honest chain"):
+        assess_claim_finality(
+            btc_claim_confirmations=10,
+            now_rxd_height=999,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=_policy(),
+        )
+
+
+def test_assess_claim_finality_f007_rxd_interval_scaling():
+    # F-007: the BTC reorg depth must be converted from BTC blocks to RXD blocks before
+    # subtracting from the RXD window. With btc=600s / rxd=300s (ratio 2), a 6-BTC-block
+    # depth consumes 12 RXD blocks, not 6. A 14-RXD-block window looks safe-to-WAIT under
+    # the old 1:1 conflation but is actually SQUEEZED.
+    base = dict(
+        btc_claim_confirmations=1,  # shallow
+        now_rxd_height=1006,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(20, t.TimeUnit.BLOCKS),  # opens@1020 -> 14 blocks left
+    )
+
+    def _p(rxd_interval):
+        return MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            rxd_block_interval_s=rxd_interval,
+            btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+            rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        )
+
+    # ratio 2: 14 - ceil(6 * 600/300)=12 -> 2 < burial 6 -> SQUEEZED (correct)
+    assert assess_claim_finality(**base, policy=_p(300.0)) is ClaimFinality.SQUEEZED
+    # ratio 1 (same interval) reproduces the old 1:1 behaviour: 14 - 6 = 8 >= 6 -> WAIT
+    assert assess_claim_finality(**base, policy=_p(600.0)) is ClaimFinality.WAIT
+
+
+async def test_gate_safe_claims_asset():
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=10)
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with is not None  # asset actually claimed
+
+
+async def test_gate_wait_does_not_claim_and_stays_secret_revealed():
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=1)  # shallow
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
+    # FAIL-OPEN REGRESSION: a shallow BTC claim must NOT settle the asset.
+    assert rec.state is SwapState.SECRET_REVEALED
+    assert rxd.claimed_with is None  # asset NOT claimed
+
+
+async def test_serialized_step_concurrent_duplicate_step_acts_once():
+    """@_serialized_step (#2b): two concurrent invocations of the SAME step on ONE
+    coordinator do not interleave — exactly one acts, the other gets a clean FSM-state
+    rejection, NOT a double broadcast. A slow Radiant claim forces the interleave
+    attempt; without the per-instance lock both would pass the SECRET_REVEALED check
+    and both claim the asset.
+    """
+
+    class SlowClaimRxd(FakeRadiantLeg):
+        async def claim_asset(self, record, preimage):
+            await asyncio.sleep(0.02)
+            return await super().claim_asset(record, preimage)
+
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=10)
+    rxd = SlowClaimRxd()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+
+    results = await asyncio.gather(
+        coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000),
+        coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000),
+        return_exceptions=True,
+    )
+    completed = [r for r in results if isinstance(r, SwapRecord)]
+    rejected = [r for r in results if isinstance(r, ValidationError)]
+    assert len(completed) == 1 and completed[0].state is SwapState.COMPLETED
+    assert len(rejected) == 1 and "only valid from SECRET_REVEALED" in str(rejected[0])
+    assert rxd.calls.count("claim_asset") == 1  # serialized: asset claimed exactly once
+
+
+async def test_scrape_rejects_claim_tx_for_foreign_funding_outpoint():
+    """Provenance gate (#3): a claim tx that reveals the right p but spends a DIFFERENT
+    funding outpoint (a wrong / cross-swap claim tx) is refused before any asset claim.
+    """
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=10)
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+
+    # A claim tx revealing the SAME p but spending a different outpoint than our HTLC.
+    foreign = dataclasses.replace(rec.btc_locator, funding_outpoint=t.BtcOutpoint("cd" * 32, 1))
+    foreign_claim = _real_maker_claim_tx(foreign, btc.claimed_with)
+    with pytest.raises(ValidationError, match="does not spend this swap"):
+        await coord.taker_scrape_and_claim_asset(foreign_claim, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rxd.claimed_with is None  # asset NOT claimed off a foreign claim tx
+    assert coord.record.state is SwapState.SECRET_REVEALED  # no advance on a refused scrape
+
+    # Sanity: the LEGIT claim tx (spending our outpoint) still settles.
+    legit = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    rec2 = await coord.taker_scrape_and_claim_asset(legit, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec2.state is SwapState.COMPLETED
+
+
+async def test_gate_squeezed_goes_vulnerable_then_explicit_claim():
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=10, hashlock=h)
+    btc = FakeBtcLeg(claim_confs=1)  # shallow
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    # Window closing (now near t_rxd maturity) + shallow -> SQUEEZED -> ASSET_VULNERABLE.
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1006, asset_locked_at_height=1000)
+    assert rec.state is SwapState.ASSET_VULNERABLE
+    assert rxd.claimed_with is None  # not auto-claimed
+    # The deliberate winner-take-all claim is a separate, explicit decision.
+    rec = await coord.taker_claim_asset_from_vulnerable(claim_tx)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with is not None
+
+
+async def test_gate_fail_closed_on_confs_read_error():
+    class ErrLeg(FakeBtcLeg):
+        async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
+            raise RuntimeError("node unreachable")
+
+    p_secret, h = generate_secret()
+    terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)
+    btc = ErrLeg()
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.maker_claims_btc(p_secret)
+    claim_tx = _real_maker_claim_tx(rec.btc_locator, btc.claimed_with)
+    with pytest.raises(RuntimeError):  # propagates fail-closed; no claim
+        await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rxd.claimed_with is None
+
+
+async def test_claim_from_vulnerable_rejects_wrong_state():
+    _p, h = generate_secret()
+    terms = _terms(variant="rxd", hashlock=h)
+    coord = _coordinator(terms=terms)  # state NEGOTIATED, not ASSET_VULNERABLE
+    with pytest.raises(ValidationError, match="only valid from ASSET_VULNERABLE"):
+        await coord.taker_claim_asset_from_vulnerable(b"\x00")
+
+
+# ---------------------------------------------------------------------------
+# Measured MarginPolicy from BTC block times (P-SAFE-1b)
+# ---------------------------------------------------------------------------
+
+
+def test_measure_margin_from_btc_block_times_basic():
+    # 11 timestamps -> 10 gaps, all multiples of 600 so percentile picks are exact.
+    # gaps sorted: [600]*8, 1200, 1800. Median (index 5) = 600 -> interval 600.
+    base = 1_700_000_000
+    ts = [base]
+    for gap in (600, 600, 600, 600, 1200, 600, 1800, 600, 600, 600):
+        ts.append(ts[-1] + gap)
+    policy, prov = measure_margin_from_btc_block_times(
+        btc_block_timestamps=ts,
+        btc_tail_percentile=99.9,  # nearest-rank over 10 gaps -> the max
+        btc_claim_reorg_depth_blocks=3,
+        rxd_claim_burial_blocks=3,
+        rxd_block_interval_s=300.0,
+    )
+    assert policy.is_measured and policy.require_measured
+    assert policy.btc_claim_reorg_depth.value == 3
+    assert prov["measured"]["btc_block_interval_s_median"] == 600
+    # 99.9th-pct tail = max gap 1800s -> ceil(1800/600) = 3-block margin.
+    assert prov["measured"]["btc_tail_gap_s"] == 1800
+    assert policy.margin.value == 3
+    assert prov["chosen"]["min_reorg_depth_floor_blocks"] == 2
+    assert "MEASURED" in prov["note"] and "CHOSEN" in prov["note"]
+
+
+def test_measure_margin_handles_unordered_and_equal_timestamps():
+    base = 1_700_000_000
+    ts = [base + 1200, base, base + 600, base + 600, base + 1800]  # unordered + a duplicate
+    policy, prov = measure_margin_from_btc_block_times(
+        btc_block_timestamps=ts,
+        btc_tail_percentile=75.0,
+        btc_claim_reorg_depth_blocks=2,
+        rxd_claim_burial_blocks=2,
+        rxd_block_interval_s=300.0,
+    )
+    assert policy.margin.value >= 1  # never below a block
+    assert prov["measured"]["btc_samples"] == 5
+
+
+def test_measure_margin_rejects_thin_or_bad_inputs():
+    with pytest.raises(ValidationError, match=">= 3 BTC block timestamps"):
+        measure_margin_from_btc_block_times(
+            btc_block_timestamps=[1, 2],
+            btc_tail_percentile=90.0,
+            btc_claim_reorg_depth_blocks=3,
+            rxd_claim_burial_blocks=3,
+            rxd_block_interval_s=300.0,
+        )
+    with pytest.raises(ValidationError, match="btc_tail_percentile"):
+        measure_margin_from_btc_block_times(
+            btc_block_timestamps=[1, 2, 3, 4],
+            btc_tail_percentile=10.0,
+            btc_claim_reorg_depth_blocks=3,
+            rxd_claim_burial_blocks=3,
+            rxd_block_interval_s=300.0,
+        )
+    with pytest.raises(ValidationError, match="must all be ints"):
+        measure_margin_from_btc_block_times(
+            btc_block_timestamps=[1, 2.5, 3],
+            btc_tail_percentile=90.0,  # type: ignore[list-item]
+            btc_claim_reorg_depth_blocks=3,
+            rxd_claim_burial_blocks=3,
+            rxd_block_interval_s=300.0,
+        )
+
+
+def test_measure_margin_inherits_reorg_depth_floor():
+    # A chosen depth below the floor must be rejected by MarginPolicy even via the helper.
+    ts = [1_700_000_000 + i * 600 for i in range(6)]
+    with pytest.raises(ValidationError, match="btc_claim_reorg_depth"):
+        measure_margin_from_btc_block_times(
+            btc_block_timestamps=ts,
+            btc_tail_percentile=90.0,
+            btc_claim_reorg_depth_blocks=1,
+            rxd_claim_burial_blocks=3,
+            rxd_block_interval_s=300.0,
+        )

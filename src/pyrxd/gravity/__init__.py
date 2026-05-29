@@ -31,9 +31,22 @@ from .covenant import (
     build_gravity_offer_derived,
     validate_claim_deadline,
 )
+from .htlc_covenant import (
+    HtlcCovenant,
+    build_htlc_covenant_ft,
+    build_htlc_covenant_nft,
+    build_htlc_covenant_rxd,
+)
+from .htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from .maker import ActiveOffer, GravityMakerSession, GravityOfferParams
+from .radiant_leg import (
+    RadiantChainIO,
+    RadiantCovenantLeg,
+    RxinDexerRefAdapter,
+    SeenStore,
+)
 from .receive import OfferReceive, derive_offer_btc_receive
-from .ref_authenticity import RefAuthenticityIndexer, verify_ref_authenticity
+from .ref_authenticity import RefAuthenticityIndexer, ResolvedRef, verify_ref_authenticity
 from .trade import ConfirmationStatus, GravityTrade, TradeConfig
 from .transactions import build_claim_tx, build_finalize_tx, build_forfeit_tx, build_maker_offer_tx
 from .types import (
@@ -49,21 +62,33 @@ __all__ = [
     "ClaimResult",
     "ConfirmationStatus",
     "CovenantArtifact",
+    "FeeInput",
     "FinalizeResult",
     "ForfeitResult",
     "GravityMakerSession",
     "GravityOffer",
     "GravityOfferParams",
     "GravityTrade",
+    "HtlcCovenant",
     "MakerOfferResult",
     "OfferReceive",
+    "RadiantChainIO",
+    "RadiantCovenantLeg",
     "RefAuthenticityIndexer",
+    "ResolvedRef",
+    "RxinDexerRefAdapter",
+    "SeenStore",
     "TradeConfig",
     "build_claim_tx",
     "build_finalize_tx",
     "build_forfeit_tx",
     "build_gravity_offer",
     "build_gravity_offer_derived",
+    "build_htlc_claim_tx",
+    "build_htlc_covenant_ft",
+    "build_htlc_covenant_nft",
+    "build_htlc_covenant_rxd",
+    "build_htlc_refund_tx",
     "build_maker_offer_tx",
     "compute_p2sh_code_hash",
     "derive_offer_btc_receive",

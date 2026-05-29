@@ -543,6 +543,26 @@ class TestMerkle:
         assert branch[0] == 0x00
         assert branch[33] == 0x01
 
+    # Regression: Atheris (2026-05-25) found build_branch / compute_root leaking a
+    # raw ValueError from bytes.fromhex on non-hex / wrong-length input, violating
+    # their documented "raises ValidationError" contract at a public boundary.
+
+    def test_build_branch_rejects_non_hex_sibling(self) -> None:
+        with pytest.raises(ValidationError, match="sibling"):
+            build_branch(["zz" * 32], pos=0)
+
+    def test_build_branch_rejects_wrong_length_sibling(self) -> None:
+        with pytest.raises(ValidationError, match="sibling"):
+            build_branch(["aa" * 16], pos=0)  # 32 hex chars = 16 bytes, not 32
+
+    def test_compute_root_rejects_non_hex_txid(self) -> None:
+        with pytest.raises(ValidationError, match="txid"):
+            compute_root("zz" * 32, b"")
+
+    def test_compute_root_rejects_wrong_length_txid(self) -> None:
+        with pytest.raises(ValidationError, match="txid"):
+            compute_root("aa" * 16, b"")  # 32 hex chars, not 64
+
     def test_build_branch_sibling_reversed(self) -> None:
         """Sibling hex (BE display) is stored reversed (LE) in the branch."""
         siblings = ["01" + "00" * 31]  # first byte 0x01 in BE

@@ -15,11 +15,18 @@ A miner that produces a wrong nonce fails the assertion immediately.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
+import signal
+import sys
+import textwrap
+import time
 
 import pytest
 
 from pyrxd.contrib.miner.parallel import (
     MineParams,
+    _install_parent_death_signal,
+    _parent_is_gone,
     default_n_workers,
     mine,
 )
@@ -497,3 +504,84 @@ class TestOrphanPrevention:
                         os.kill(orphan, signal_mod.SIGKILL)
                     except ProcessLookupError:
                         pass
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG is Linux-only")
+    def test_sigkill_parent_does_not_orphan_workers(self):
+        """The path the in-parent cleanup CANNOT cover: a parent ``kill -9``.
+
+        SIGKILL is untrappable, so mine()'s _ensure_workers_terminated finally
+        never runs — without PR_SET_PDEATHSIG the workers reparent to init and
+        grind nonces forever (the exact orphan-at-99.9%-CPU symptom observed in
+        the field). With the death signal armed first thing in each worker, the
+        kernel SIGKILLs them when the parent dies. This proves it.
+        """
+        p = self._spawn_mine_subprocess()
+        worker_pids: list[int] = []
+        try:
+            self._wait_for_workers_to_start(p.pid, want=2, timeout_s=5.0)
+            worker_pids = self._direct_children(p.pid)
+            assert len(worker_pids) >= 2, f"expected ≥2 workers under parent {p.pid}, got {worker_pids}"
+
+            # SIGKILL the parent: its cleanup finally does NOT run. Only the
+            # kernel-armed parent-death signal can reap the workers now.
+            os.kill(p.pid, signal.SIGKILL)
+            p.join(timeout=5.0)
+            assert not p.is_alive(), "parent did not die under SIGKILL"
+
+            # The kernel delivers PDEATHSIG promptly; allow a moment for each
+            # worker to receive SIGKILL and be reaped.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if not any(self._pid_alive(pid) for pid in worker_pids):
+                    break
+                time.sleep(0.1)
+            survivors = [pid for pid in worker_pids if self._pid_alive(pid)]
+            assert not survivors, (
+                f"parent SIGKILL left {len(survivors)} orphan workers grinding: {survivors} "
+                "(PR_SET_PDEATHSIG did not fire)"
+            )
+        finally:
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2.0)
+            for orphan in worker_pids:
+                if self._pid_alive(orphan):
+                    try:
+                        os.kill(orphan, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+
+class TestParentDeathSignal:
+    """Unit tests for the _install_parent_death_signal helper itself."""
+
+    def test_is_a_noop_and_never_raises(self):
+        # Called in-process with the REAL current parent, which is alive, so the
+        # TOCTOU re-check does not fire and it simply arms (Linux) or no-ops. Must
+        # never raise.
+        _install_parent_death_signal(os.getppid())
+
+    def test_parent_is_gone_detects_reparenting(self):
+        # Our actual parent is alive -> not gone.
+        assert _parent_is_gone(os.getppid()) is False
+        # A bogus "original" ppid that we were never under -> looks reparented.
+        assert _parent_is_gone(os.getppid() + 999_999) is True
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="prctl is Linux-only")
+    def test_arms_pdeathsig_in_a_child_without_crashing(self):
+        """In a fresh interpreter, arming PDEATHSIG must succeed (or no-op) and
+        exit cleanly — proving the libc.prctl + reparent-check path does not crash
+        a real worker."""
+        import subprocess
+
+        code = textwrap.dedent(
+            """
+            import os
+            from pyrxd.contrib.miner.parallel import _install_parent_death_signal
+            _install_parent_death_signal(os.getppid())
+            import sys
+            sys.exit(0)
+            """
+        )
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=15)
+        assert result.returncode == 0, f"child crashed arming PDEATHSIG: {result.stderr.decode()}"

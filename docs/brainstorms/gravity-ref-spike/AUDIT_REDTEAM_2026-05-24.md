@@ -3,7 +3,7 @@
 Four parallel adversarial agents, each owning a surface, each required to prove
 exploits (not theorize). Findings below were **independently re-verified by me**
 against the production code and/or the Radiant-Core consensus source
-(`/home/eric/apps/Radiant-Core/src/script/interpreter.cpp`,
+(Radiant-Core `src/script/interpreter.cpp`,
 `src/validation.h`) — provenance noted per finding. "Proven-in-analysis" means
 the mechanism is confirmed against source/compiled opcodes but was NOT executed
 against a live covenant UTXO (the settled-swap UTXOs are spent; a live

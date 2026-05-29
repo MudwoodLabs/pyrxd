@@ -44,9 +44,14 @@ def build_branch(merkle_be: list[str], pos: int) -> bytes:
 
     parts: list[bytes] = []
     for i, sibling_be_hex in enumerate(merkle_be):
-        sibling_be = bytes.fromhex(sibling_be_hex)
-        if len(sibling_be) != 32:
-            raise ValidationError(f"sibling[{i}] must be 32 bytes, got {len(sibling_be)}")
+        # Validate before fromhex: a non-hex / odd-length sibling must raise the
+        # documented ValidationError, not leak a raw ValueError past the boundary.
+        if not isinstance(sibling_be_hex, str) or len(sibling_be_hex) != 64:
+            raise ValidationError(f"sibling[{i}] must be a 64-char hex string (32-byte hash)")
+        try:
+            sibling_be = bytes.fromhex(sibling_be_hex)
+        except ValueError as exc:
+            raise ValidationError(f"sibling[{i}] is not valid hex: {exc}") from exc
         direction = (pos >> i) & 1
         sibling_le = sibling_be[::-1]
         parts.append(bytes([direction]) + sibling_le)
@@ -71,8 +76,17 @@ def compute_root(txid_be_hex: str, branch: bytes) -> bytes:
     if len(branch) % 33 != 0:
         raise ValidationError(f"branch length {len(branch)} is not a multiple of 33")
 
-    # Start with leaf in LE (reverse BE display).
-    current = bytes.fromhex(txid_be_hex)[::-1]
+    # Start with leaf in LE (reverse BE display). Validate the txid is real 32-byte
+    # hex BEFORE fromhex — a public boundary function must raise ValidationError
+    # (its documented contract), not leak ValueError on a non-hex/odd-length string
+    # or silently compute a garbage root from a wrong-length-but-hex one.
+    if not isinstance(txid_be_hex, str) or len(txid_be_hex) != 64:
+        raise ValidationError("txid_be_hex must be a 64-char hex string (32-byte txid)")
+    try:
+        leaf_be = bytes.fromhex(txid_be_hex)
+    except ValueError as exc:
+        raise ValidationError(f"txid_be_hex is not valid hex: {exc}") from exc
+    current = leaf_be[::-1]
 
     depth = len(branch) // 33
     for i in range(depth):

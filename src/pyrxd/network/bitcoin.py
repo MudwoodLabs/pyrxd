@@ -30,7 +30,7 @@ from urllib.parse import quote, urljoin
 
 import aiohttp
 
-from ..security.errors import NetworkError, ValidationError
+from ..security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
 from ..security.types import BlockHeight, Hex32, RawTx, Txid
 
@@ -252,14 +252,14 @@ class MempoolSpaceSource(BtcDataSource):
         confirmed = status.get("confirmed", False)
         block_height = status.get("block_height")
         if not confirmed or block_height is None:
-            raise NetworkError(f"tx has 0 confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=0, required=min_confirmations)
 
         if min_confirmations > 0:
             # To check confirmations we need the tip height.
             tip = await self.get_tip_height()
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
-                raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
+                raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
 
         # Fetch raw hex.
         hex_url = self._url(f"tx/{_safe_txid_path(txid)}/hex")
@@ -272,6 +272,7 @@ class MempoolSpaceSource(BtcDataSource):
                     raw = bytes.fromhex(body.decode("ascii").strip())
                 except (ValueError, UnicodeDecodeError):
                     raise NetworkError("Server returned invalid hex for transaction")
+                _verify_raw_matches_txid(raw, txid)
                 return RawTx(raw)
         except aiohttp.ClientError as exc:
             raise NetworkError("HTTP request failed") from exc
@@ -424,13 +425,13 @@ class BlockstreamSource(BtcDataSource):
         confirmed = status.get("confirmed", False)
         block_height = status.get("block_height")
         if not confirmed or block_height is None:
-            raise NetworkError(f"tx has 0 confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=0, required=min_confirmations)
 
         if min_confirmations > 0:
             tip = await self.get_tip_height()
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
-                raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
+                raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
 
         hex_url = self._url(f"tx/{_safe_txid_path(txid)}/hex")
         try:
@@ -442,6 +443,7 @@ class BlockstreamSource(BtcDataSource):
                     raw = bytes.fromhex(body.decode("ascii").strip())
                 except (ValueError, UnicodeDecodeError):
                     raise NetworkError("Server returned invalid hex for transaction")
+                _verify_raw_matches_txid(raw, txid)
                 return RawTx(raw)
         except aiohttp.ClientError as exc:
             raise NetworkError("HTTP request failed") from exc
@@ -624,7 +626,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
             raise NetworkError("Unexpected raw tx response from Bitcoin Core")
         confs = data.get("confirmations", 0)
         if confs < min_confirmations:
-            raise NetworkError(f"tx has {confs} confirmations, required {min_confirmations}")
+            raise InsufficientConfirmationsError(have=int(confs), required=min_confirmations)
         hex_str = data.get("hex", "")
         if not isinstance(hex_str, str):
             raise NetworkError("Missing hex field in raw tx response")
@@ -632,6 +634,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
             raw = bytes.fromhex(hex_str)
         except ValueError:
             raise NetworkError("Invalid hex in raw tx response from Bitcoin Core")
+        _verify_raw_matches_txid(raw, txid)
         return RawTx(raw)
 
     async def get_tx_block_height(self, txid: Txid) -> BlockHeight:
@@ -679,6 +682,26 @@ class BitcoinCoreRpcSource(BtcDataSource):
 
 def _hash256(data: bytes) -> bytes:
     return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+
+
+def _verify_raw_matches_txid(raw: bytes, txid: Txid) -> None:
+    """Bind server-returned tx bytes to the REQUESTED txid (fail-closed) — F-004.
+
+    A source (or a MITM'd endpoint) can return a *different* transaction than the
+    one asked for — e.g. a same-preimage claim with a different txid that happens to
+    be buried deeper — and the reorg/claim path would then measure the wrong tx's
+    depth, firing an irreversible asset claim off a still-reorgable BTC claim. We
+    recompute the txid locally from the returned bytes (witness-stripped, the same
+    derivation the BTC leg already trusts) and reject any mismatch.
+    """
+    from pyrxd.btc_wallet.taproot import btc_txid_from_raw
+
+    try:
+        derived = btc_txid_from_raw(bytes(raw))
+    except Exception as exc:
+        raise NetworkError("could not derive a txid from the returned tx bytes; fail-closed") from exc
+    if derived.lower() != str(txid).lower():
+        raise NetworkError(f"returned tx bytes do not match the requested txid {str(txid)[:16]}…; fail-closed")
 
 
 class MultiSourceBtcDataSource(BtcDataSource):
@@ -772,7 +795,10 @@ class MultiSourceBtcDataSource(BtcDataSource):
         self._check_quorum_possible()
         results = await self._gather_results(lambda s: s.get_raw_tx(txid, min_confirmations))
         # Agreement: compare hash256 of the raw bytes.
-        return self._require_quorum(results, lambda tx: _hash256(bytes(tx)))
+        agreed = self._require_quorum(results, lambda tx: _hash256(bytes(tx)))
+        # F-004: even with quorum agreement, bind the agreed bytes to the requested txid.
+        _verify_raw_matches_txid(bytes(agreed), txid)
+        return agreed
 
     async def get_tx_block_height(self, txid: Txid) -> BlockHeight:
         if not isinstance(txid, Txid):
@@ -796,3 +822,216 @@ class MultiSourceBtcDataSource(BtcDataSource):
         self._check_quorum_possible()
         results = await self._gather_results(lambda s: s.get_merkle_proof(txid, height))
         return self._require_quorum(results, lambda r: (tuple(r[0]), r[1]))
+
+
+# ─────────────────────────────────────────── mempool.space value-moving adapters
+#
+# The HTLC BtcLeg injects a BtcBroadcaster (POST /api/tx) and a BtcFundingReader
+# (read confs/amount). On mainnet there is no Bitcoin node — mempool.space HTTP is
+# the proven path. These satisfy the leg's duck-typed Protocols (htlc_leg.py).
+# Broadcast is kept OFF the read-only BtcDataSource ABC (a deliberate split): these
+# are the value-moving edge and get their own auditable classes.
+#
+# DECISION (dust-mainnet plan, panel): a single mempool.space endpoint reporting a
+# false confirmation depth DEFEATS the reorg gate. For dust this is accepted with an
+# explicit SPOF acknowledgement + operator corroboration; for any above-dust value the
+# conf reader MUST be backed by a multi-source quorum. The reader below is the
+# single-source dust adapter; it is fail-closed (unknown/unconfirmed => 0 => raise),
+# never "assume confirmed".
+
+
+class _MempoolHttpClient:
+    """Shared HTTP plumbing for the mempool.space value-moving adapters.
+
+    A thin session + URL helper mirroring MempoolSpaceSource, so the broadcaster and
+    funding reader don't each re-implement it. TLS validation stays on (aiohttp
+    default) — do NOT disable it; a MITM'd endpoint defeats the reorg gate.
+
+    Sessions carry an EXPLICIT total request timeout. Without one, aiohttp's default
+    is "no timeout" — a stalled mempool.space endpoint can hang a request indefinitely,
+    blowing through the resume_deadline check at the loop top by minutes per call.
+    30s is conservative for the small JSON / hex blobs the adapters fetch.
+    (Red-team finding NEW #7 on 44707a3.)
+    """
+
+    DEFAULT_TIMEOUT_S: float = 30.0
+
+    def __init__(self, base_url: str = "https://mempool.space/api", *, timeout_s: float | None = None) -> None:
+        self._base_url = base_url.rstrip("/") + "/"
+        self._session: aiohttp.ClientSession | None = None
+        self._timeout_s = self.DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
+
+    async def session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=self._timeout_s))
+        return self._session
+
+    async def close(self) -> None:
+        if self._session and not self._session.closed:
+            await self._session.close()
+            self._session = None
+
+    def url(self, *parts: str) -> str:
+        result = self._base_url
+        for part in parts:
+            result = urljoin(result, part)
+        return result
+
+    async def tip_height(self) -> int:
+        s = await self.session()
+        try:
+            async with s.get(self.url("blocks/tip/height")) as resp:
+                body = await _check_response_size(resp)
+                if resp.status != 200:
+                    raise NetworkError(f"HTTP {resp.status} fetching tip height")
+                return int(body.strip())
+        except (aiohttp.ClientError, ValueError) as exc:
+            raise NetworkError("could not fetch tip height") from exc
+
+    async def tx_status(self, txid: Txid) -> dict:
+        """``/tx/{txid}/status`` -> dict (confirmed, block_height) or fail-closed."""
+        s = await self.session()
+        status = await _get_json(s, self.url(f"tx/{_safe_txid_path(txid)}/status"))
+        if not isinstance(status, dict):
+            raise NetworkError("unexpected tx status response")
+        return status
+
+    async def tx_json(self, txid: Txid) -> dict:
+        s = await self.session()
+        data = await _get_json(s, self.url(f"tx/{_safe_txid_path(txid)}"))
+        if not isinstance(data, dict):
+            raise NetworkError("unexpected tx json response")
+        return data
+
+
+class MempoolSpaceBroadcaster:
+    """``BtcBroadcaster`` over mempool.space ``POST /api/tx`` (the value-moving edge).
+
+    Idempotent: a node that already has the tx ("already in mempool" / "txn-already-
+    known" / "already in block chain") is SUCCESS — the txid is derived LOCALLY from
+    the raw bytes (no node decode on mainnet), consistent with the reorg gate's
+    serialize-don't-trust discipline. Any other error is a fail-closed ``NetworkError``.
+    """
+
+    def __init__(
+        self, client: _MempoolHttpClient | None = None, *, base_url: str = "https://mempool.space/api"
+    ) -> None:
+        self._http = client or _MempoolHttpClient(base_url)
+
+    async def broadcast(self, raw_tx: bytes) -> str:
+        from ..btc_wallet.taproot import btc_txid_from_raw
+
+        if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
+            raise ValidationError("raw_tx must be non-empty bytes")
+        raw = bytes(raw_tx)
+        s = await self._http.session()
+        try:
+            async with s.post(self._http.url("tx"), data=raw.hex()) as resp:
+                body = (await _check_response_size(resp)).decode("ascii", "replace").strip()
+                if resp.status == 200:
+                    # mempool.space returns the txid as the body on success.
+                    try:
+                        return str(Txid(body))
+                    except ValidationError:
+                        raise NetworkError("broadcast returned a non-txid body")
+                low = body.lower()
+                if any(m in low for m in ("already", "txn-already-known", "in block chain", "in mempool")):
+                    # Idempotent success — derive the txid locally (no node on mainnet).
+                    return btc_txid_from_raw(raw)
+                raise NetworkError(f"broadcast rejected (HTTP {resp.status})")
+        except aiohttp.ClientError as exc:
+            raise NetworkError("broadcast HTTP request failed") from exc
+
+    async def close(self) -> None:
+        """Release the shared HTTP client. Idempotent; mirrors :meth:`MempoolSpaceFundingReader.close`.
+
+        Without this method every caller had to reach into ``_http`` directly to clean
+        up — flagged by the post-cbd5fc0 review as a library-API gap that leaked
+        through scripts.
+        """
+        await self._http.close()
+
+
+class MempoolSpaceFundingReader:
+    """``BtcFundingReader`` over mempool.space (single-source; fail-closed).
+
+    Satisfies the leg's reader Protocol: ``read_output_amount_sats`` (funding read-back,
+    D4), ``confirmations`` (the reorg gate's depth oracle — SPOF for dust, see module
+    note), and ``txid_of`` (local, node-free; the gate derives its own txid but the
+    Protocol method exists for non-gate callers). EVERY uncertain outcome reads 0/raises
+    — never "assume confirmed".
+    """
+
+    def __init__(
+        self, client: _MempoolHttpClient | None = None, *, base_url: str = "https://mempool.space/api"
+    ) -> None:
+        self._http = client or _MempoolHttpClient(base_url)
+
+    async def confirmations(self, txid: str) -> int:
+        tx = txid if isinstance(txid, Txid) else Txid(txid)
+        status = await self._http.tx_status(tx)
+        if not status.get("confirmed", False) or status.get("block_height") is None:
+            return 0  # unconfirmed / unknown -> 0 (the gate's >= N check fails closed)
+        tip = await self._http.tip_height()
+        block_height = int(status["block_height"])
+        # F-005: internal consistency check. A tx cannot be in a block above the tip, and
+        # a real confirmed tx sits at height >= 1. An inverted/garbage response is a
+        # confused or lying source — fail-closed LOUD (raise) rather than silently
+        # computing a depth from it. NOTE: over-reporting via a plausible-but-false LOW
+        # height is NOT detectable from a single source; above-dust value MUST corroborate
+        # across independent sources / SPV header burial (see the module DECISION note).
+        if block_height < 1 or block_height > int(tip):
+            raise NetworkError(
+                f"inconsistent confirmation data for {str(tx)[:16]}…: block_height={block_height}, tip={int(tip)}; "
+                "fail-closed"
+            )
+        confs = int(tip) - block_height + 1
+        return confs if confs > 0 else 0
+
+    async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
+        tx = txid if isinstance(txid, Txid) else Txid(txid)
+        confs = await self.confirmations(tx)
+        if confs < min_confirmations:
+            raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
+        data = await self._http.tx_json(tx)
+        try:
+            return int(data["vout"][vout]["value"])  # mempool.space vout value is in sats
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise NetworkError(f"could not read output value for {str(tx)[:16]}…:{vout}") from exc
+
+    async def txid_of(self, raw_tx: bytes) -> str:
+        from ..btc_wallet.taproot import btc_txid_from_raw
+
+        return btc_txid_from_raw(bytes(raw_tx))
+
+    async def list_address_utxos(self, address: str) -> list[dict]:
+        """``/address/{addr}/utxo`` -> [{txid, vout, value_sats, confirmed, height}].
+
+        The operator uses this (no node on mainnet) to find the funding UTXO to hand the
+        BtcLeg. Returns confirmed+unconfirmed; the caller filters/conf-gates as needed.
+        """
+        if not isinstance(address, str) or not address:
+            raise ValidationError("address must be a non-empty string")
+        s = await self._http.session()
+        data = await _get_json(s, self._http.url(f"address/{quote(address, safe='')}/utxo"))
+        if not isinstance(data, list):
+            raise NetworkError("unexpected address utxo response")
+        out: list[dict] = []
+        for u in data:
+            try:
+                st = u.get("status", {}) if isinstance(u, dict) else {}
+                out.append(
+                    {
+                        "txid": str(Txid(u["txid"])),
+                        "vout": int(u["vout"]),
+                        "value_sats": int(u["value"]),
+                        "confirmed": bool(st.get("confirmed", False)),
+                        "height": int(st["block_height"]) if st.get("block_height") is not None else None,
+                    }
+                )
+            except (KeyError, TypeError, ValueError, ValidationError) as exc:
+                raise NetworkError("malformed address utxo entry") from exc
+        return out
+
+    async def close(self) -> None:
+        await self._http.close()

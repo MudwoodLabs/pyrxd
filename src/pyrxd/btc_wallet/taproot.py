@@ -57,6 +57,8 @@ __all__ = [
     "ScriptTree",
     "TimeUnit",
     "Timelock",
+    "btc_input_outpoints_from_raw",
+    "btc_txid_from_raw",
     "build_claim_tx",
     "build_htlc",
     "build_refund_tx",
@@ -905,6 +907,143 @@ def build_refund_tx(
 # Secret scraping (swap-semantics; lives here per the plan's note that it can
 # sit in a separate function — kept module-local but logically swap-layer)
 # ---------------------------------------------------------------------------
+
+
+def btc_txid_from_raw(raw_tx: bytes) -> str:
+    """Compute a BTC transaction's canonical txid (big-endian hex) from raw bytes.
+
+    The txid is ``hash256(non-witness serialization)[::-1]`` — i.e. the tx WITHOUT the
+    segwit marker/flag and witness section. This is the reorg gate's
+    ``txid_of``: on mainnet there is no node to ``decoderawtransaction``, so the taker
+    must derive the txid of the exact bytes ``p`` was scraped from. SERIALIZE, don't
+    trust — the gated txid must be that of THIS tx, never a counterparty-supplied id.
+
+    FAIL-CLOSED: raises :class:`ValidationError` on ANY structural problem. A wrong
+    txid that doesn't exist on-chain reads 0 confs (fail-closed at the gate); a SILENT
+    wrong txid from a partial parse is the danger, so we never return a half-parsed
+    result. Handles both legacy (no marker/flag) and segwit txs.
+    """
+    b = bytes(raw_tx)
+    n = len(b)
+    pos = 0
+
+    def take(k: int) -> bytes:
+        nonlocal pos
+        if k < 0 or pos + k > n:
+            raise ValidationError("btc_txid_from_raw: truncated transaction")
+        out = b[pos : pos + k]
+        pos += k
+        return out
+
+    def take_compact() -> tuple[int, bytes]:
+        """Read a CompactSize; return (value, the exact bytes consumed)."""
+        first = take(1)
+        v = first[0]
+        if v < 0xFD:
+            return v, first
+        size = {0xFD: 2, 0xFE: 4, 0xFF: 8}[v]
+        rest = take(size)
+        return int.from_bytes(rest, "little"), first + rest
+
+    version = take(4)
+    # Segwit marker/flag? Peek; only 0x00 0x01 is the segwit signal.
+    is_segwit = pos + 2 <= n and b[pos] == 0x00 and b[pos + 1] == 0x01
+    if is_segwit:
+        take(2)  # consume marker+flag (excluded from the txid)
+
+    # --- inputs section (re-serialised verbatim into the txid preimage) ---
+    n_in, n_in_b = take_compact()
+    if n_in == 0 or n_in > 100_000:
+        raise ValidationError("btc_txid_from_raw: bad input count")
+    vin = bytearray(n_in_b)
+    for _ in range(n_in):
+        vin += take(36)  # prevout (txid + vout)
+        slen, slen_b = take_compact()
+        vin += slen_b
+        if slen > n:
+            raise ValidationError("btc_txid_from_raw: scriptSig length out of range")
+        vin += take(slen)
+        vin += take(4)  # sequence
+
+    # --- outputs section ---
+    n_out, n_out_b = take_compact()
+    if n_out > 100_000:
+        raise ValidationError("btc_txid_from_raw: bad output count")
+    vout = bytearray(n_out_b)
+    for _ in range(n_out):
+        vout += take(8)  # value
+        slen, slen_b = take_compact()
+        vout += slen_b
+        if slen > n:
+            raise ValidationError("btc_txid_from_raw: scriptPubKey length out of range")
+        vout += take(slen)
+
+    # --- witness section (parsed only to SKIP it; excluded from the txid) ---
+    if is_segwit:
+        for _ in range(n_in):
+            n_items, _ = take_compact()
+            if n_items > 100_000:
+                raise ValidationError("btc_txid_from_raw: bad witness item count")
+            for _ in range(n_items):
+                ilen, _ = take_compact()
+                if ilen > n:
+                    raise ValidationError("btc_txid_from_raw: witness item length out of range")
+                take(ilen)
+
+    locktime = take(4)
+    if pos != n:
+        raise ValidationError("btc_txid_from_raw: trailing bytes after locktime")
+
+    non_witness = version + bytes(vin) + bytes(vout) + locktime
+    return _hash256(non_witness)[::-1].hex()
+
+
+def btc_input_outpoints_from_raw(raw_tx: bytes) -> list[bytes]:
+    """Return the 36-byte wire prevout (txid LE || vout LE) of every input.
+
+    Provenance check for a scraped preimage: the caller verifies the claim tx it
+    scraped ``p`` from actually spends THIS swap's funding outpoint
+    (compare against :meth:`BtcOutpoint.prevout_bytes`), so a counterparty-supplied
+    tx for a DIFFERENT swap — even one that happens to share ``H`` — cannot be used
+    to claim this swap's asset. Matches by exact 36-byte prevout, never by offset.
+
+    Parses ONLY the input section (all that the prevouts need); fail-closed on any
+    structural problem, the same SERIALIZE-don't-trust discipline as
+    :func:`btc_txid_from_raw`. Handles legacy and segwit txs.
+    """
+    b = bytes(raw_tx)
+    n = len(b)
+    pos = 0
+
+    def take(k: int) -> bytes:
+        nonlocal pos
+        if k < 0 or pos + k > n:
+            raise ValidationError("btc_input_outpoints_from_raw: truncated transaction")
+        out = b[pos : pos + k]
+        pos += k
+        return out
+
+    def take_compact() -> int:
+        first = take(1)[0]
+        if first < 0xFD:
+            return first
+        return int.from_bytes(take({0xFD: 2, 0xFE: 4, 0xFF: 8}[first]), "little")
+
+    take(4)  # version
+    if pos + 2 <= n and b[pos] == 0x00 and b[pos + 1] == 0x01:
+        take(2)  # segwit marker+flag
+    n_in = take_compact()
+    if n_in == 0 or n_in > 100_000:
+        raise ValidationError("btc_input_outpoints_from_raw: bad input count")
+    prevouts: list[bytes] = []
+    for _ in range(n_in):
+        prevouts.append(take(36))  # prevout: txid (LE) + vout (LE)
+        slen = take_compact()
+        if slen > n:
+            raise ValidationError("btc_input_outpoints_from_raw: scriptSig length out of range")
+        take(slen)
+        take(4)  # sequence
+    return prevouts
 
 
 def _iter_witness_stack(claim_tx_bytes: bytes) -> list[list[bytes]]:

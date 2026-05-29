@@ -1,0 +1,55 @@
+{
+  "version": 9,
+  "compilerVersion": "rxdc 0.1.0",
+  "contract": "GravityHtlcCovenantNft",
+  "abi": [
+    {
+      "type": "function",
+      "name": "claim",
+      "index": 0,
+      "params": [
+        {
+          "name": "preimage",
+          "type": "bytes"
+        }
+      ]
+    },
+    {
+      "type": "function",
+      "name": "refund",
+      "index": 1,
+      "params": []
+    },
+    {
+      "type": "constructor",
+      "params": [
+        {
+          "name": "hashlock",
+          "type": "Sha256"
+        },
+        {
+          "name": "refundCsv",
+          "type": "int"
+        },
+        {
+          "name": "nftCarrierValue",
+          "type": "int"
+        },
+        {
+          "name": "expectedTakerNftHash",
+          "type": "Sha256"
+        },
+        {
+          "name": "expectedMakerNftHash",
+          "type": "Sha256"
+        },
+        {
+          "name": "REF",
+          "type": "bytes"
+        }
+      ]
+    }
+  ],
+  "asm": "OP_PUSHINPUTREFSINGLETON $REF OP_TXOUTPUTCOUNT OP_1 OP_NUMEQUALVERIFY OP_REFOUTPUTCOUNT_OUTPUTS OP_1 OP_NUMEQUALVERIFY OP_0 OP_OUTPUTVALUE $nftCarrierValue OP_NUMEQUALVERIFY OP_DUP OP_0 OP_NUMEQUAL OP_IF OP_SWAP OP_SHA256 $hashlock OP_EQUALVERIFY OP_0 OP_OUTPUTBYTECODE OP_HASH256 $expectedTakerNftHash OP_EQUAL OP_NIP OP_ELSE OP_1 OP_NUMEQUALVERIFY $refundCsv OP_CHECKSEQUENCEVERIFY OP_DROP OP_0 OP_OUTPUTBYTECODE OP_HASH256 $expectedMakerNftHash OP_EQUAL OP_ENDIF",
+  "hex": "d8<REF>c4519dde519d00cc<nftCarrierValue>9d76009c637ca8<hashlock>8800cdaa<expectedTakerNftHash>877767519d<refundCsv>b27500cdaa<expectedMakerNftHash>8768"
+}

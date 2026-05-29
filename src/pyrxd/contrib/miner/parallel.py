@@ -23,16 +23,72 @@ errors during dev, so we force ``spawn`` everywhere for determinism.
 
 from __future__ import annotations
 
+import ctypes
 import hashlib
 import multiprocessing as mp
 import os
 import signal
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .protocol import MAX_SHA256D_TARGET, MineExhausted, MineSuccess
+
+# Linux prctl option: deliver a signal to THIS process when its parent dies.
+# (asm-generic/prctl.h — stable kernel ABI value.) This is the ONE defense that
+# survives a parent ``kill -9`` / hard crash, which no in-parent handler can catch
+# (SIGKILL is untrappable, so mine()'s finally-cleanup never runs). Belt-and-
+# suspenders with _ensure_workers_terminated: that handles every CATCHABLE exit;
+# this handles the uncatchable one.
+_PR_SET_PDEATHSIG = 1
+
+
+def _parent_is_gone(parent_pid: int) -> bool:
+    """True iff this process's spawning parent died (so it should stop grinding).
+
+    A reaped parent reparents the child — to PID 1 on a bare init, but to a
+    SUBREAPER (e.g. ``systemd --user``) in a desktop session, so "ppid == 1" is the
+    WRONG test (it almost never trips under systemd — the orphans observed in the
+    field sat under ``systemd --user``). The robust signal is "my ppid is no longer
+    my spawning parent": any change means that parent exited and I was reparented.
+    ``parent_pid`` is the spawning process's pid (passed down by mine()), NOT a
+    value read here via getppid() — see :func:`_worker` for why that distinction is
+    load-bearing under the ``spawn`` start method.
+    """
+    return os.getppid() != parent_pid
+
+
+def _install_parent_death_signal(parent_pid: int) -> None:
+    """Best-effort: ask the kernel to SIGKILL this worker when its parent dies.
+
+    Linux-only (``prctl(PR_SET_PDEATHSIG, SIGKILL)``); a no-op elsewhere. NEVER
+    raises — this is opportunistic hardening, and a miner must still run if prctl
+    is unavailable (the in-parent cleanup + the in-loop orphan poll still cover it).
+
+    Closes the orphan-worker race for a parent ``kill -9``/crash: without it, the
+    worker is reparented (to init OR a subreaper like ``systemd --user``) and keeps
+    grinding nonces forever with nowhere to report. There is a TOCTOU window — under
+    ``spawn`` the parent can die between fork and this call, before PDEATHSIG arms —
+    so we re-check against ``parent_pid`` afterward and exit if already reparented.
+    The in-loop poll (:func:`_parent_is_gone`) is the deterministic backstop for the
+    rest of that window.
+    """
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        # prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0)
+        libc.prctl(_PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0)
+        # TOCTOU: if the parent already exited before prctl armed, we are already
+        # reparented — exit hard rather than orphan-grind.
+        if _parent_is_gone(parent_pid):
+            os._exit(0)
+    except Exception:
+        # ctypes/libc unavailable or prctl rejected: fall back to the in-parent
+        # cleanup + the in-loop orphan poll. Do not let hardening break the miner.
+        return
 
 
 @dataclass(frozen=True)
@@ -47,6 +103,7 @@ class MineParams:
 
 
 def _worker(
+    parent_pid: int,
     preimage: bytes,
     target: int,
     nonce_width: int,
@@ -73,6 +130,18 @@ def _worker(
     Must be a module-level function (not a closure or method) so the
     ``spawn`` start method can pickle it.
     """
+    # FIRST action: arm the parent-death signal so a parent kill -9 / crash can't
+    # leave this worker orphaned and grinding (the one path mine()'s finally cannot
+    # cover — SIGKILL is untrappable). Best-effort.
+    #
+    # ``parent_pid`` is the spawning process's pid, passed in by mine() — NOT read
+    # here via getppid(). Under ``spawn`` the parent can die during the worker's
+    # interpreter-init/import window (before this line); by then getppid() would
+    # already return the reparent target, so a locally-read "original" ppid would be
+    # WRONG and the orphan check would never trip. The parent's true pid is the only
+    # reliable reference.
+    _install_parent_death_signal(parent_pid)
+
     sha256 = hashlib.sha256
     effective_target = min(target, MAX_SHA256D_TARGET)
     local_attempts = 0
@@ -90,8 +159,17 @@ def _worker(
                         found_value.value = n
                         found_event.set()
                 break
-        if (local_attempts & (check_interval - 1)) == 0 and found_event.is_set():
-            break
+        if (local_attempts & (check_interval - 1)) == 0:
+            if found_event.is_set():
+                break
+            # Orphan self-check (the deterministic backstop for PR_SET_PDEATHSIG's
+            # spawn-window race): PDEATHSIG fires instantly WHEN armed in time, but
+            # `spawn` has a fork→re-exec→import→unpickle window before it is armed; a
+            # parent kill -9 inside that window leaves it un-armed. If the original
+            # parent has since died (we got reparented — to init OR a subreaper like
+            # systemd --user), stop grinding and exit. Cross-platform (plain getppid).
+            if _parent_is_gone(parent_pid):
+                os._exit(0)
 
     with attempts_counter.get_lock():
         attempts_counter.value += local_attempts
@@ -138,6 +216,10 @@ def mine(params: MineParams) -> MineSuccess | MineExhausted:
 
     procs: list[mp.process.BaseProcess] = []
     started = time.monotonic()
+    # The spawning process's pid — passed to each worker so it can detect being
+    # orphaned (reparented away from us) even if a parent kill -9 lands during the
+    # worker's spawn/import window, before it could read its own ppid reliably.
+    parent_pid = os.getpid()
     # All worker management runs under _ensure_workers_terminated so that
     # any exit path — normal return, exception, SIGTERM, SIGINT, KeyboardInterrupt —
     # leaves no orphaned worker processes consuming CPU after this function returns.
@@ -149,6 +231,7 @@ def mine(params: MineParams) -> MineSuccess | MineExhausted:
             p = ctx.Process(
                 target=_worker,
                 args=(
+                    parent_pid,
                     params.preimage,
                     params.target,
                     params.nonce_width,

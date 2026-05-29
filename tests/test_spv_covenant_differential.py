@@ -24,6 +24,8 @@ agreement on a corpus AND pins the ONE known, characterized divergence:
 from __future__ import annotations
 
 import importlib.util
+import os
+import random
 import struct
 from pathlib import Path
 
@@ -31,7 +33,7 @@ import pytest
 
 from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.spv.payment import P2PKH, P2SH, P2TR, P2WPKH, verify_payment
-from pyrxd.spv.proof import _output_offsets
+from pyrxd.spv.proof import _max_input_scriptsig_len, _output_offsets
 
 _SIM_PATH = Path(__file__).resolve().parents[1] / "docs/brainstorms/gravity-ref-spike/rxd_sim.py"
 
@@ -136,3 +138,55 @@ def test_scriptsig_boundary_is_exactly_128():
     """Covenant accepts scriptSig <= 127B and rejects >= 128B (the CScriptNum sign bit)."""
     assert _covenant_accepts(_build([b"\x01" * 127], [(SATS, _P2WPKH)])) is True
     assert _covenant_accepts(_build([b"\x01" * 128], [(SATS, _P2WPKH)])) is False
+
+
+def _longest_scriptsig(raw: bytes) -> int:
+    """Largest input scriptSig length, via the PRODUCTION varint parser (handles
+    multi-byte 0xfd/0xfe lengths — a naive single-byte read mis-classifies a
+    >=253 B scriptSig and would hide a known-class divergence as 'novel')."""
+    try:
+        return _max_input_scriptsig_len(raw)
+    except (SpvVerificationError, ValidationError):
+        return 0
+
+
+def test_differential_fuzz_no_novel_divergence():
+    """Randomized differential fuzz: across many adversarial txs the Python SDK and
+    the covenant ASM model must agree on payment-validity, EXCEPT the one known
+    class (input scriptSig >= 128 B). A Python-REJECT / covenant-ACCEPT divergence
+    would be a covenant releasing on a payment the SDK rejects — a theft vector.
+
+    Backs the 2026-05-24 rigorous-audit finding (2,000,000 cases offline -> 0 novel
+    divergences). Default CI budget is small; scale with DIFF_FUZZ_N.
+    """
+    n = int(os.environ.get("DIFF_FUZZ_N", "20000"))
+    rng = random.Random(0xC0FFEE)
+    makers = [_P2WPKH, b"\x76\xa9\x14" + MAKER20 + b"\x88\xac", b"\xa9\x14" + MAKER20 + b"\x87", b"\x51\x20" + MAKER32]
+    for _ in range(n):
+        n_in = rng.randint(1, 4)
+        n_out = rng.randint(1, 4)
+        scriptsigs = [
+            bytes(rng.getrandbits(8) for _ in range(rng.choice([0, rng.randint(0, 260)]))) for _ in range(n_in)
+        ]
+        outs = []
+        for _ in range(n_out):
+            val = rng.choice([SATS, SATS - 1, SATS + 1, rng.randint(0, 2**40)])
+            spk = rng.choice(
+                [
+                    *makers,
+                    b"\x00\x14" + bytes(rng.getrandbits(8) for _ in range(20)),
+                    bytes(rng.getrandbits(8) for _ in range(rng.randint(0, 36))),
+                ]
+            )
+            outs.append((val, spk))
+        raw = _build(scriptsigs, outs)
+        pa = _python_accepts(raw)
+        # covenant configured with either 20B or 32B receive hash (per-swap).
+        ca = _covenant_accepts(raw, MAKER20) or _covenant_accepts(raw, MAKER32)
+        if pa == ca:
+            continue
+        # The ONLY tolerated divergence: SDK accepts, covenant rejects, due to a
+        # >=128 B input scriptSig (the known functional limitation, audit R2).
+        assert pa and not ca and _longest_scriptsig(raw) >= 128, (
+            f"NOVEL parser divergence (pa={pa}, ca={ca}) — investigate: {raw.hex()}"
+        )

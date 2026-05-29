@@ -245,6 +245,26 @@ def test_terms_rejects_same_unit_bad_ordering():
         _terms(t_btc_blocks=50, t_rxd_blocks=72)
 
 
+def test_terms_rejects_seconds_t_rxd_f002():
+    # F-002: the Radiant HTLC covenant CSV operand has no SECONDS (BIP68 type-flag)
+    # encoding path, so a SECONDS-tagged t_rxd would be used raw and desync the
+    # on-chain refund window from every off-chain safety gate. Reject at construction.
+    with pytest.raises(ValidationError, match="t_rxd must be a BLOCKS timelock"):
+        NegotiatedTerms(
+            hashlock=hashlib.sha256(b"x").digest(),
+            btc_sats=100_000,
+            radiant_amount=1_000,
+            t_btc=t.Timelock(200_000, t.TimeUnit.SECONDS),
+            t_rxd=t.Timelock(100_000, t.TimeUnit.SECONDS),
+            asset_variant="rxd",
+            genesis_ref=b"",
+            taker_dest_hash=b"\x11" * 32,
+            maker_dest_hash=b"\x22" * 32,
+            btc_claim_pubkey_xonly=_xonly(),
+            btc_refund_pubkey_xonly=_xonly(),
+        )
+
+
 def test_terms_rejects_short_hashlock():
     with pytest.raises(ValidationError):
         NegotiatedTerms(
