@@ -101,6 +101,18 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
     print(f"=== Gravity DUST swap runner — stage={args.stage} broadcast={do_broadcast} ===")
     if args.stage == "dust" and not audit_cleared:
         raise SystemExit("stage=dust requires --i-accept-dust-loss (you are moving REAL mainnet value)")
+    # F-010: the RXD transport (SshTrRadiantClient) ALWAYS targets the mainnet node, so the
+    # RXD audit-gate network is mainnet regardless of the CLI flag. A free --rxd-network
+    # (e.g. 'bcrt') would disable require_audit_cleared while still broadcasting real value
+    # to mainnet. Pin it to the transport's true network; reject any mismatch fail-closed.
+    # (Because RXD is always mainnet, require_audit_cleared on the RXD leg now enforces the
+    # opt-in for EVERY broadcast stage — signet included, since its RXD covenant is real.)
+    rxd_network = SshTrRadiantClient.NETWORK
+    if args.rxd_network != rxd_network:
+        raise SystemExit(
+            f"--rxd-network={args.rxd_network!r} cannot override the RXD transport's network "
+            f"({rxd_network!r}, mainnet); the SshTr shim only targets the mainnet node — use --rxd-network bc"
+        )
     btc_claim_payout = bytes.fromhex(args.btc_claim_payout)
     btc_refund_payout = bytes.fromhex(args.btc_refund_payout)
 
@@ -167,7 +179,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         "created_unix": int(time.time()),
         "stage": args.stage,
         "btc_network": btc_network,
-        "rxd_network": args.rxd_network,
+        "rxd_network": rxd_network,
         "hashlock_H": h.hex(),
         "preimage_p_hex": p.hex(),  # recovery only; same trust domain as the WIFs below
         "taker_btc_wif": taker_btc_kp.unsafe_wif(),
@@ -259,7 +271,7 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         audit_cleared=audit_cleared,
     )
     rxd_leg = RadiantCovenantLeg(
-        network=args.rxd_network,
+        network=rxd_network,
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         chain_io=RadiantChainIO(rxd_client),
@@ -366,10 +378,39 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
                 )
                 print(f"  -> {rec.state.value} — CROSS-CHAIN SWAP COMPLETE")
                 break
-            # WAIT (still SECRET_REVEALED): the claim isn't deep enough yet. Poll again.
-            print(f"  reorg gate: WAIT (BTC claim not yet {policy.btc_claim_reorg_depth.value}-deep); retrying...")
-            report.step(name="reorg_gate_wait", chain="btc", state=rec.state.value)
-            await asyncio.sleep(args.poll_interval_s)
+            if rec.state is SwapState.SECRET_REVEALED:
+                # reorg gate WAIT: the BTC claim isn't deep enough yet. Poll again.
+                print(f"  reorg gate: WAIT (BTC claim not yet {policy.btc_claim_reorg_depth.value}-deep); retrying...")
+                report.step(name="reorg_gate_wait", chain="btc", state=rec.state.value)
+                await asyncio.sleep(args.poll_interval_s)
+                continue
+            if rec.state is SwapState.ASSET_VULNERABLE:
+                # F-006: reorg gate SQUEEZED -> ASSET_VULNERABLE. p is already public and the
+                # maker's CSV refund window is closing; the gate refused the automatic SAFE
+                # claim. Winner-take-all is now an EXPLICIT decision: attempt the asset claim
+                # anyway, accepting the residual reorg risk. NEVER re-enter the SECRET_REVEALED-
+                # only method (that would crash) and NEVER silently treat this as WAIT.
+                print("  reorg gate SQUEEZED -> ASSET_VULNERABLE; p is public and the t_rxd window is closing.")
+                report.step(name="reorg_gate_squeezed", chain="rxd", state=rec.state.value)
+                confirm(
+                    "taker_claim_asset_from_vulnerable: best-effort winner-take-all asset claim "
+                    "(accepts the residual reorg risk the gate flagged)",
+                    auto_yes=args.yes,
+                )
+                rec = await coord.taker_claim_asset_from_vulnerable(bytes(claim_raw))
+                report.step(
+                    name="taker_claim_asset_from_vulnerable",
+                    chain="rxd",
+                    state=rec.state.value,
+                    btc_claim_txid=str(btc_claim_txid),
+                )
+                print(f"  -> {rec.state.value} (winner-take-all claim attempted; residual reorg risk accepted)")
+                break
+            # Any other state on a value-moving FSM loop: stop LOUD — never a catch-all WAIT.
+            raise SystemExit(
+                f"unexpected state {rec.state.value} from the reorg-gated claim — operator must "
+                f"intervene (p is public on-chain; claim txid {btc_claim_txid})"
+            )
     finally:
         # ALWAYS dump the report + close transports, even on exception — operator needs
         # the partial state. MempoolSpaceBroadcaster grew a public close() in the

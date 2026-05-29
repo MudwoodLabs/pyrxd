@@ -926,6 +926,34 @@ def test_assess_claim_finality_rejects_now_below_lock_f013():
         )
 
 
+def test_assess_claim_finality_f007_rxd_interval_scaling():
+    # F-007: the BTC reorg depth must be converted from BTC blocks to RXD blocks before
+    # subtracting from the RXD window. With btc=600s / rxd=300s (ratio 2), a 6-BTC-block
+    # depth consumes 12 RXD blocks, not 6. A 14-RXD-block window looks safe-to-WAIT under
+    # the old 1:1 conflation but is actually SQUEEZED.
+    base = dict(
+        btc_claim_confirmations=1,  # shallow
+        now_rxd_height=1006,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(20, t.TimeUnit.BLOCKS),  # opens@1020 -> 14 blocks left
+    )
+
+    def _p(rxd_interval):
+        return MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            rxd_block_interval_s=rxd_interval,
+            btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+            rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        )
+
+    # ratio 2: 14 - ceil(6 * 600/300)=12 -> 2 < burial 6 -> SQUEEZED (correct)
+    assert assess_claim_finality(**base, policy=_p(300.0)) is ClaimFinality.SQUEEZED
+    # ratio 1 (same interval) reproduces the old 1:1 behaviour: 14 - 6 = 8 >= 6 -> WAIT
+    assert assess_claim_finality(**base, policy=_p(600.0)) is ClaimFinality.WAIT
+
+
 async def test_gate_safe_claims_asset():
     p_secret, h = generate_secret()
     terms = _terms(variant="rxd", t_rxd_blocks=72, hashlock=h)

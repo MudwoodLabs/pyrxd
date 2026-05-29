@@ -51,6 +51,12 @@ class SshTrRadiantClient:
         Per-call timeout for the ssh subprocess.
     """
 
+    # F-010: this shim ONLY targets the mainnet node (container 'radiant-mainnet'); the
+    # RXD audit-gate network is therefore always mainnet — never a free CLI choice. The
+    # runner pins the leg/keys network to this so a --rxd-network flag cannot disable
+    # require_audit_cleared while still broadcasting real value to mainnet.
+    NETWORK: str = "bc"
+
     def __init__(
         self,
         *,
@@ -186,11 +192,15 @@ class SshTrRadiantClient:
         def _unlock(tx, idx):
             inp = tx.inputs[idx]
             sig = key.sign(tx.preimage(idx))
-            return Script(encode_pushdata(sig + inp.sighash.to_bytes(1, "little")) + encode_pushdata(key.public_key().serialize()))
+            return Script(
+                encode_pushdata(sig + inp.sighash.to_bytes(1, "little")) + encode_pushdata(key.public_key().serialize())
+            )
 
         fin = TransactionInput(
-            source_transaction=_src(u["txid"], u["vout"], spk, in_sats), source_txid=u["txid"],
-            source_output_index=u["vout"], unlocking_script_template=to_unlock_script_template(_unlock, lambda: 110),
+            source_transaction=_src(u["txid"], u["vout"], spk, in_sats),
+            source_txid=u["txid"],
+            source_output_index=u["vout"],
+            unlocking_script_template=to_unlock_script_template(_unlock, lambda: 110),
         )
         fin.satoshis = in_sats
         fin.locking_script = Script(spk)

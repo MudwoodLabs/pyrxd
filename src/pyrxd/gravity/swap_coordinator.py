@@ -164,6 +164,11 @@ class MarginPolicy:
     block_interval_s: float
     is_measured: bool
     require_measured: bool = False
+    # F-007: Radiant's block interval (seconds). The squeeze check converts the BTC
+    # reorg depth (BTC blocks) into RXD blocks via block_interval_s / rxd_block_interval_s,
+    # because BTC and RXD block rates differ — treating BTC blocks 1:1 as RXD blocks
+    # under-counts the RXD window the BTC burial consumes. Defaults to ~300s (Radiant).
+    rxd_block_interval_s: float = 300.0
     # Reorg gate (plan 2026-05-26). The maker's BTC claim must reach this depth before
     # the taker relies on the revealed p; the taker's own Radiant claim must then bury
     # ``rxd_claim_burial`` deep — both BEFORE t_rxd opens. Unit-tagged so the squeeze
@@ -181,6 +186,8 @@ class MarginPolicy:
             raise ValidationError("MarginPolicy.margin must be a Timelock")
         if not isinstance(self.block_interval_s, (int, float)) or self.block_interval_s <= 0:
             raise ValidationError("MarginPolicy.block_interval_s must be > 0")
+        if not isinstance(self.rxd_block_interval_s, (int, float)) or self.rxd_block_interval_s <= 0:
+            raise ValidationError("MarginPolicy.rxd_block_interval_s must be > 0")
         if not isinstance(self.is_measured, bool):
             raise ValidationError("MarginPolicy.is_measured must be bool")
         if not isinstance(self.require_measured, bool):
@@ -227,6 +234,7 @@ class MarginPolicy:
         block_interval_s: float,
         btc_claim_reorg_depth: Timelock | None = None,
         rxd_claim_burial: Timelock | None = None,
+        rxd_block_interval_s: float | None = None,
     ) -> MarginPolicy:
         """A measured policy for real-value mainnet swaps.
 
@@ -245,6 +253,8 @@ class MarginPolicy:
             kwargs["btc_claim_reorg_depth"] = btc_claim_reorg_depth
         if rxd_claim_burial is not None:
             kwargs["rxd_claim_burial"] = rxd_claim_burial
+        if rxd_block_interval_s is not None:
+            kwargs["rxd_block_interval_s"] = rxd_block_interval_s
         return cls(**kwargs)
 
 
@@ -313,6 +323,7 @@ def measure_margin_from_btc_block_times(
         block_interval_s=measured_block_interval_s,
         btc_claim_reorg_depth=Timelock(btc_claim_reorg_depth_blocks, TimeUnit.BLOCKS),
         rxd_claim_burial=Timelock(rxd_claim_burial_blocks, TimeUnit.BLOCKS),
+        rxd_block_interval_s=float(rxd_block_interval_s),  # F-007: stored for the squeeze conversion
     )
     provenance = {
         "measured": {
@@ -507,9 +518,6 @@ def assess_claim_finality(
         )
     try:
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
-        btc_depth_rxd = policy.btc_claim_reorg_depth.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
-        ).value
         rxd_burial = policy.rxd_claim_burial.normalize_to(
             TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
         ).value
@@ -533,10 +541,15 @@ def assess_claim_finality(
         if blocks_left >= rxd_burial:
             return ClaimFinality.SAFE
         return ClaimFinality.SQUEEZED
-    # BTC claim still shallow. We can WAIT only if, after the remaining BTC depth
-    # elapses, there is STILL room to bury our claim before the refund opens.
+    # BTC claim still shallow. We can WAIT only if, after the BTC depth elapses, there
+    # is STILL room to bury our claim before the refund opens.
+    # F-007: the BTC reorg depth is in BTC blocks; convert the wall-clock it represents
+    # into RXD blocks (the unit of blocks_left) before subtracting. BTC and RXD block
+    # rates differ, so treating BTC blocks 1:1 as RXD blocks under-counts the RXD window
+    # the BTC burial consumes and biases WAIT optimistic. Round UP (conservative).
     btc_blocks_remaining = btc_depth_confs - btc_claim_confirmations
-    if blocks_left - btc_depth_rxd >= rxd_burial and btc_blocks_remaining > 0:
+    btc_depth_in_rxd = math.ceil(btc_depth_confs * policy.block_interval_s / policy.rxd_block_interval_s)
+    if blocks_left - btc_depth_in_rxd >= rxd_burial and btc_blocks_remaining > 0:
         return ClaimFinality.WAIT
     return ClaimFinality.SQUEEZED
 

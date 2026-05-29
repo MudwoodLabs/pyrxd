@@ -122,6 +122,24 @@ async def test_confirmations_missing_height_is_zero():
     assert await r.confirmations("ab" * 32) == 0
 
 
+async def test_confirmations_block_above_tip_fails_closed_f005():
+    # F-005: a tx cannot be in a block above the tip — an inverted/garbage response is a
+    # confused/lying source and must fail-closed LOUD, not silently compute a depth.
+    r = MempoolSpaceFundingReader()
+    r._http.tx_status = AsyncMock(return_value={"confirmed": True, "block_height": 800_010})
+    r._http.tip_height = AsyncMock(return_value=800_005)  # block_height > tip
+    with pytest.raises(NetworkError, match="inconsistent confirmation data"):
+        await r.confirmations("ab" * 32)
+
+
+async def test_confirmations_block_height_below_one_fails_closed_f005():
+    r = MempoolSpaceFundingReader()
+    r._http.tx_status = AsyncMock(return_value={"confirmed": True, "block_height": 0})
+    r._http.tip_height = AsyncMock(return_value=800_005)
+    with pytest.raises(NetworkError, match="inconsistent confirmation data"):
+        await r.confirmations("ab" * 32)
+
+
 # --------------------------------------------------------------------------- funding reader: amount read-back
 
 

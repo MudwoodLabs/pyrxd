@@ -63,6 +63,16 @@ These are fail-closed assertions / trust-boundary bindings. Low risk, high payof
 
 ## P2 — robustness & operational safety (harness + chain-data trust)
 
+**STATUS (2026-05-28): 4 of 5 DONE; SEEN-1/TOCTOU-1 pending a design decision.**
+✅ F-006 (explicit ASSET_VULNERABLE winner-take-all branch in both run+resume loops; no
+catch-all WAIT crash — the maker-stall background monitor is deferred, see below),
+✅ F-005 (reader block_height≤tip consistency check, fail-closed; quorum noted as the
+above-dust follow-up), ✅ F-010 (RXD audit-gate network pinned to the transport's true
+mainnet, free `--rxd-network` bypass rejected), ✅ F-007 (rxd_block_interval_s wired into
+MarginPolicy; WAIT branch converts BTC reorg depth → RXD blocks). Each with tests; full
+suite green. ⏳ SEEN-1+TOCTOU-1 needs a decision (durable-store backend + sync-atomic vs
+async-durable reserve + the H-consumed-pre-fund semantic change) — see its entry below.
+
 ### F-006 (HIGH) — SQUEEZED outcome strands the asset: harness treats `ASSET_VULNERABLE` as a catch-all WAIT, re-calls a SECRET_REVEALED-only method, and crashes; the #1 maker-stall loss path is un-automated
 - **Surface:** `scripts/dust_swap_run.py:340-372` (and the resume loop).
 - **Fix:** branch explicitly on `rec.state`: on `ASSET_VULNERABLE` call `taker_claim_asset_from_vulnerable(claim_raw)` (winner-take-all); on any unexpected/terminal state stop with a loud operator alert — never a catch-all `else => WAIT` on a value-moving FSM. Wire `maybe_refund_asset_on_maker_stall` into a background `asyncio.create_task` monitor that polls inside `maker_stall_safety_window_blocks` during BOTH_LOCKED.

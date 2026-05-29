@@ -973,7 +973,19 @@ class MempoolSpaceFundingReader:
         if not status.get("confirmed", False) or status.get("block_height") is None:
             return 0  # unconfirmed / unknown -> 0 (the gate's >= N check fails closed)
         tip = await self._http.tip_height()
-        confs = tip - int(status["block_height"]) + 1
+        block_height = int(status["block_height"])
+        # F-005: internal consistency check. A tx cannot be in a block above the tip, and
+        # a real confirmed tx sits at height >= 1. An inverted/garbage response is a
+        # confused or lying source — fail-closed LOUD (raise) rather than silently
+        # computing a depth from it. NOTE: over-reporting via a plausible-but-false LOW
+        # height is NOT detectable from a single source; above-dust value MUST corroborate
+        # across independent sources / SPV header burial (see the module DECISION note).
+        if block_height < 1 or block_height > int(tip):
+            raise NetworkError(
+                f"inconsistent confirmation data for {str(tx)[:16]}…: block_height={block_height}, tip={int(tip)}; "
+                "fail-closed"
+            )
+        confs = int(tip) - block_height + 1
         return confs if confs > 0 else 0
 
     async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:

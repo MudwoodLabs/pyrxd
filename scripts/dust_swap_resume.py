@@ -290,11 +290,30 @@ async def resume(args) -> None:
             if rec.state is SwapState.COMPLETED:
                 print(f"  -> {rec.state.value} — CROSS-CHAIN SWAP COMPLETE")
                 break
-            print(
-                f"  reorg gate: WAIT (BTC claim not yet {policy.btc_claim_reorg_depth.value}-deep); "
-                f"retrying in {args.poll_interval_s}s..."
+            if rec.state is SwapState.SECRET_REVEALED:
+                print(
+                    f"  reorg gate: WAIT (BTC claim not yet {policy.btc_claim_reorg_depth.value}-deep); "
+                    f"retrying in {args.poll_interval_s}s..."
+                )
+                await asyncio.sleep(args.poll_interval_s)
+                continue
+            if rec.state is SwapState.ASSET_VULNERABLE:
+                # F-006: SQUEEZED -> ASSET_VULNERABLE. p is public; winner-take-all is an
+                # explicit decision. Never re-enter the SECRET_REVEALED-only method (crash)
+                # and never silently treat this as WAIT.
+                print("  reorg gate SQUEEZED -> ASSET_VULNERABLE; attempting winner-take-all claim ...")
+                confirm(
+                    "taker_claim_asset_from_vulnerable: best-effort winner-take-all asset claim "
+                    "(accepts the residual reorg risk the gate flagged)",
+                    auto_yes=args.yes,
+                )
+                rec = await coord.taker_claim_asset_from_vulnerable(bytes(claim_raw))
+                print(f"  -> {rec.state.value} (winner-take-all claim attempted; residual reorg risk accepted)")
+                break
+            raise SystemExit(
+                f"unexpected state {rec.state.value} from the reorg-gated claim — operator must "
+                f"intervene (p is public on-chain; claim txid {btc_claim_txid})"
             )
-            await asyncio.sleep(args.poll_interval_s)
 
         print("\n  DONE.")
     finally:
