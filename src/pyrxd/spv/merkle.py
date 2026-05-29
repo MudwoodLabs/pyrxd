@@ -39,8 +39,22 @@ def build_branch(merkle_be: list[str], pos: int) -> bytes:
     Raises:
         ValidationError: if ``pos`` is negative or any sibling is not 32 bytes.
     """
+    if not isinstance(pos, int) or isinstance(pos, bool):
+        raise ValidationError("pos must be an int")
     if pos < 0:
         raise ValidationError("pos must be non-negative")
+
+    # Audit 2026-05-29 F-04/F-05: pos must fit within the branch depth. Each
+    # direction bit is derived from only the low ``len(merkle_be)`` bits of pos
+    # (``(pos >> i) & 1``), so any pos with higher bits set ALIASES a smaller
+    # pos — in particular ``pos = k * 2**depth`` reproduces the coinbase's
+    # all-left branch (pos=0) and would slip past the ``pos == 0`` coinbase
+    # guard. Reject out-of-range pos at construction.
+    if pos >> len(merkle_be) != 0:
+        raise ValidationError(
+            f"pos {pos} has bits beyond branch depth {len(merkle_be)} "
+            "(pos must be < 2**depth; an out-of-range pos aliases another leaf's branch)"
+        )
 
     parts: list[bytes] = []
     for i, sibling_be_hex in enumerate(merkle_be):
@@ -139,6 +153,14 @@ def verify_tx_in_block(
     if len(branch) % 33 != 0:
         raise ValidationError(f"branch length {len(branch)} not a multiple of 33")
     branch_depth = len(branch) // 33
+    # Audit 2026-05-29 F-04/F-05: reject pos with bits beyond the branch depth.
+    # Otherwise pos = k*2**depth reproduces the coinbase's all-left branch and
+    # bypasses the pos==0 guard above (verified bypass: build() returned a valid
+    # SpvProof for pos=2 at depth 1 before this check).
+    if pos >> branch_depth != 0:
+        raise SpvVerificationError(
+            f"pos {pos} has bits beyond branch depth {branch_depth} (out-of-range; aliases another leaf's branch)"
+        )
     if expected_depth is not None and branch_depth != expected_depth:
         raise SpvVerificationError(f"branch depth {branch_depth} does not match expected {expected_depth}")
 

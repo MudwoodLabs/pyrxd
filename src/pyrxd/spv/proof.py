@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from pyrxd.security.errors import SpvVerificationError, ValidationError
+from pyrxd.security.types import Nbits
 
 from .chain import verify_chain
 from .merkle import build_branch, compute_root, extract_merkle_root, verify_tx_in_block
@@ -32,17 +33,29 @@ def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
     first = buf[pos]
     if first < 0xFD:
         return first, pos + 1
+    # Audit 2026-05-29 F-15: reject non-canonical (overlong) CompactSize — these
+    # are rejected by Bitcoin consensus at deserialization and read as a single
+    # byte by the covenant; accepting them diverges from both.
     if first == 0xFD:
         if pos + 3 > len(buf):
             raise SpvVerificationError("truncated 2-byte varint")
-        return int.from_bytes(buf[pos + 1 : pos + 3], "little"), pos + 3
+        value = int.from_bytes(buf[pos + 1 : pos + 3], "little")
+        if value < 0xFD:
+            raise SpvVerificationError(f"non-canonical varint: 0xFD prefix encodes {value} (< 0xFD)")
+        return value, pos + 3
     if first == 0xFE:
         if pos + 5 > len(buf):
             raise SpvVerificationError("truncated 4-byte varint")
-        return int.from_bytes(buf[pos + 1 : pos + 5], "little"), pos + 5
+        value = int.from_bytes(buf[pos + 1 : pos + 5], "little")
+        if value <= 0xFFFF:
+            raise SpvVerificationError(f"non-canonical varint: 0xFE prefix encodes {value} (<= 0xFFFF)")
+        return value, pos + 5
     if pos + 9 > len(buf):
         raise SpvVerificationError("truncated 8-byte varint")
-    return int.from_bytes(buf[pos + 1 : pos + 9], "little"), pos + 9
+    value = int.from_bytes(buf[pos + 1 : pos + 9], "little")
+    if value <= 0xFFFFFFFF:
+        raise SpvVerificationError(f"non-canonical varint: 0xFF prefix encodes {value} (<= 0xFFFFFFFF)")
+    return value, pos + 9
 
 
 def _output_offsets(stripped_tx: bytes) -> set[int]:
@@ -86,6 +99,25 @@ def _output_offsets(stripped_tx: bytes) -> set[int]:
 _COVENANT_MAX_INPUT_SCRIPTSIG_LEN = 127
 
 
+def _first_input_is_null_outpoint(stripped_tx: bytes) -> bool:
+    """Return True if the tx's first input spends the null outpoint.
+
+    A coinbase tx's sole input has prevout txid == 32 zero bytes and
+    vout == 0xFFFFFFFF. AUDIT 2026-05-29 F-04: the ``pos == 0`` coinbase guard
+    was bypassable via pos aliasing (``pos = k * 2**depth`` reproduces the
+    coinbase branch). This structural check rejects the coinbase regardless of
+    the claimed ``pos``. Non-raising: returns False on any parse problem and
+    lets the canonical structural walk (``_output_offsets``) report the error.
+    """
+    try:
+        _, p = _read_varint(stripped_tx, 4)  # skip version, read n_in -> p at input[0]
+    except SpvVerificationError:
+        return False
+    if p + 36 > len(stripped_tx):
+        return False
+    return stripped_tx[p : p + 32] == b"\x00" * 32 and stripped_tx[p + 32 : p + 36] == b"\xff\xff\xff\xff"
+
+
 def _max_input_scriptsig_len(stripped_tx: bytes) -> int:
     """Return the largest input scriptSig length in a witness-stripped tx."""
     pos = 4  # skip version
@@ -116,6 +148,13 @@ class CovenantParams:
     chain_anchor: bytes  # 32-byte LE prevHash of h1 (audit 05-F-3)
     anchor_height: int  # block height of the anchor block
     merkle_depth: int  # expected Merkle branch depth (audit 05-F-8)
+    # Audit 2026-05-29 F-01/F-03: the wire nBits the covenant pins. When set,
+    # build() enforces every header's nBits matches (mirrors the covenant's
+    # nBits ∈ {expectedNBits, expectedNBitsNext} check). None disables the check
+    # — UNSAFE for any sole-authority (covenant-less) use; the deprecated swap is
+    # protected only by the on-chain covenant's own pin.
+    expected_nbits: bytes | None = None  # 4-byte wire nBits, or None
+    expected_nbits_next: bytes | None = None  # optional 2nd accepted value (retarget window)
 
     def __post_init__(self) -> None:
         if self.btc_receive_type not in _VALID_RECEIVE_TYPES:
@@ -141,6 +180,29 @@ class CovenantParams:
             raise ValidationError("btc_receive_hash must be bytes")
         if len(self.btc_receive_hash) != expected_hash_len:
             raise ValidationError(f"{self.btc_receive_type} receive_hash must be {expected_hash_len} bytes")
+        # Audit 2026-05-29 F-01/F-03/F-27: validate the optional nBits pin. Run it
+        # through the Nbits trust-boundary type so a malformed/easier-than-0x1d
+        # value is rejected here (the covenant tolerates exponent up to 0x20; we
+        # cap at 0x1d so Python never honors a target the covenant accepts but
+        # that is easier than well-formed difficulty-1).
+        for label, nb in (("expected_nbits", self.expected_nbits), ("expected_nbits_next", self.expected_nbits_next)):
+            if nb is None:
+                continue
+            if not isinstance(nb, (bytes, bytearray)):
+                raise ValidationError(f"{label} must be bytes")
+            if len(nb) != 4:
+                raise ValidationError(f"{label} must be 4 bytes (wire nBits)")
+            Nbits(bytes(nb))  # raises ValidationError on malformed nBits
+        if self.expected_nbits_next is not None and self.expected_nbits is None:
+            raise ValidationError("expected_nbits_next set without expected_nbits")
+        # Audit 2026-05-29 F-24: store immutable copies so a caller mutating a
+        # passed-in bytearray after construction cannot alter the frozen params.
+        object.__setattr__(self, "btc_receive_hash", bytes(self.btc_receive_hash))
+        object.__setattr__(self, "chain_anchor", bytes(self.chain_anchor))
+        if self.expected_nbits is not None:
+            object.__setattr__(self, "expected_nbits", bytes(self.expected_nbits))
+        if self.expected_nbits_next is not None:
+            object.__setattr__(self, "expected_nbits_next", bytes(self.expected_nbits_next))
 
 
 @dataclass(frozen=True)
@@ -228,6 +290,13 @@ class SpvProofBuilder:
         if computed_txid_le != claimed_txid_le:
             raise SpvVerificationError("hash256(raw_tx) does not match txid")
 
+        # Audit 2026-05-29 F-04: structural coinbase reject, independent of pos.
+        # The pos==0 guard alone was bypassable (pos = k*2**depth aliases the
+        # coinbase branch); a coinbase is identifiable by its null-outpoint first
+        # input regardless of the claimed position.
+        if _first_input_is_null_outpoint(stripped):
+            raise SpvVerificationError("coinbase tx (null prevout) cannot be used as payment proof")
+
         # Rigorous audit R2 (2026-05-24): the any-wallet covenant rejects a funding
         # tx whose any input scriptSig is >= 128 B (its single-byte signed length
         # read decodes negative -> the covenant's `ssl >= 0` guard ScriptFails).
@@ -249,9 +318,14 @@ class SpvProofBuilder:
                 "or legacy P2PKH input, not P2SH/multisig, or the covenant will reject the proof."
             )
 
-        # Step 3: parse and verify headers + chain anchor.
+        # Step 3: parse and verify headers + chain anchor + committed nBits pin.
         headers = [bytes.fromhex(h) for h in headers_hex]
-        verify_chain(headers, chain_anchor=params.chain_anchor)
+        verify_chain(
+            headers,
+            chain_anchor=params.chain_anchor,
+            expected_nbits=params.expected_nbits,
+            expected_nbits_next=params.expected_nbits_next,
+        )
 
         # Step 4: build branch and verify Merkle inclusion.
         branch = build_branch(merkle_be, pos)
