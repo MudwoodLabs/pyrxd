@@ -587,17 +587,15 @@ def test_header_nbits_exponent_ceiling_divergence_needs_regtest():
 # =========================================================================== MERKLE walk
 
 
+# Expensive: grinds a ~24-bit-target block header in pure Python (~13s/call).
+# Every caller passes identical args, so memoize to grind once per
+# (payment_spk, n_levels) instead of once per test. Returns only immutable
+# bytes/str, so sharing one cached tuple across tests is safe.
 @cache
 def _grind_tx_into_block(payment_spk: bytes, n_levels: int = 1):
     """Build a single-input/single-output tx and a relaxed-target block whose
     merkle root commits it at pos=1 with ``n_levels`` siblings. Returns
-    (txid_be_hex, stripped_raw, branch, pos, header, anchor).
-
-    Memoized (CI-slowness fix): the pure-Python PoW grind below costs ~13s, and
-    every caller passes the same payment_spk — so without the cache the suite mined
-    the identical header 3-4x (~64% of raw runtime). Deterministic inputs, read-only
-    result, so the cache is safe.
-    """
+    (txid_be_hex, stripped_raw, branch, pos, header, anchor)."""
     raw_tx = _build([b""], [(SATS, payment_spk)])
     txid_le = hash256(raw_tx)
     txid_be_hex = txid_le[::-1].hex()
