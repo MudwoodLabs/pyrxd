@@ -22,6 +22,7 @@ from pyrxd.spv import (
     compute_root,
     extract_merkle_root,
     hash256,
+    require_spv_sole_authority_cleared,
     strip_witness,
     verify_chain,
     verify_header_pow,
@@ -1262,6 +1263,59 @@ class TestSpvProofBuilder:
                 output_offset=output_offset,
             )
 
+    # ----- Audit 2026-05-29 F-18 — merkle proof bound to height-identified header -----
+
+    def test_builder_binds_merkle_to_height_identified_header(self) -> None:
+        """F-18: with tx_block_height supplied, the Merkle root is pinned to the
+        header at index (height - anchor_height - 1) — not any matching header. The
+        correct height verifies; a height mapping outside the fetched headers rejects."""
+        hash20 = b"\x77" * 20
+        (txid_be_hex, raw_tx_hex, headers_hex, merkle_be, pos, output_offset, anchor) = (
+            self._build_synthetic_proof_inputs(hash20, satoshis=5000)
+        )
+        params = CovenantParams(
+            btc_receive_hash=hash20,
+            btc_receive_type=P2PKH,
+            btc_satoshis=1000,
+            chain_anchor=anchor,
+            anchor_height=100_000,
+            merkle_depth=1,
+        )
+        builder = SpvProofBuilder(params)
+        # Correct height: the single fetched header is block anchor_height+1 = 100_001.
+        proof = builder.build(
+            txid_be=txid_be_hex,
+            raw_tx_hex=raw_tx_hex,
+            headers_hex=headers_hex,
+            merkle_be=merkle_be,
+            pos=pos,
+            output_offset=output_offset,
+            tx_block_height=100_001,
+        )
+        assert proof.txid == txid_be_hex
+        # Height mapping to header index 1 — out of range (only 1 header fetched).
+        with pytest.raises(SpvVerificationError, match="out of range"):
+            builder.build(
+                txid_be=txid_be_hex,
+                raw_tx_hex=raw_tx_hex,
+                headers_hex=headers_hex,
+                merkle_be=merkle_be,
+                pos=pos,
+                output_offset=output_offset,
+                tx_block_height=100_002,
+            )
+        # Height at/below the anchor maps to a negative index — also rejected.
+        with pytest.raises(SpvVerificationError, match="out of range"):
+            builder.build(
+                txid_be=txid_be_hex,
+                raw_tx_hex=raw_tx_hex,
+                headers_hex=headers_hex,
+                merkle_be=merkle_be,
+                pos=pos,
+                output_offset=output_offset,
+                tx_block_height=100_000,  # == anchor_height -> index -1
+            )
+
 
 def _valid_cp(**over: object) -> CovenantParams:
     base = dict(
@@ -1278,6 +1332,29 @@ def _valid_cp(**over: object) -> CovenantParams:
 
 class TestAudit20260529Fixes:
     """Regression tests for the 2026-05-29 SPV-primitive red-team fixes."""
+
+    # F-01 / item #1: sole-authority audit gate.
+    def test_sole_authority_gate_allows_test_chains(self) -> None:
+        for net in ("regtest", "testnet", "testnet3", "signet"):
+            require_spv_sole_authority_cleared(net, audit_cleared=False)  # no raise
+
+    def test_sole_authority_gate_blocks_mainnet_without_optin(self) -> None:
+        with pytest.raises(ValidationError, match="SOLE release authority"):
+            require_spv_sole_authority_cleared("mainnet", audit_cleared=False)
+
+    def test_sole_authority_gate_allows_mainnet_with_optin(self) -> None:
+        require_spv_sole_authority_cleared("mainnet", audit_cleared=True)  # no raise
+
+    def test_for_sole_authority_factory_gated(self) -> None:
+        params = _valid_cp()
+        with pytest.raises(ValidationError, match="SOLE release authority"):
+            SpvProofBuilder.for_sole_authority(params, network="mainnet")
+        # explicit opt-in returns a usable builder
+        assert isinstance(
+            SpvProofBuilder.for_sole_authority(params, network="mainnet", audit_cleared=True), SpvProofBuilder
+        )
+        # test chain returns a builder without opt-in
+        assert isinstance(SpvProofBuilder.for_sole_authority(params, network="regtest"), SpvProofBuilder)
 
     # F-05: build_branch / verify_tx_in_block reject pos beyond the branch depth.
     def test_build_branch_rejects_pos_beyond_depth(self) -> None:

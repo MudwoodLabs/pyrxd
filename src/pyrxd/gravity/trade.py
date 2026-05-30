@@ -438,6 +438,10 @@ class GravityTrade:
             merkle_be=merkle_hashes,
             pos=pos,
             output_offset=output_offset,
+            # Audit 2026-05-29 F-18: pin the Merkle proof to the header at this
+            # resolved height (the proof + headers were fetched for this block),
+            # not just "any" fetched header.
+            tx_block_height=int(height),
         )
 
         # Build and broadcast the finalize tx.

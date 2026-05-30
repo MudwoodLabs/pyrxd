@@ -19,11 +19,57 @@ from .payment import P2PKH, P2SH, P2TR, P2WPKH, verify_payment
 from .pow import hash256
 from .witness import strip_witness
 
-__all__ = ["CovenantParams", "SpvProof", "SpvProofBuilder"]
+__all__ = [
+    "CovenantParams",
+    "SpvProof",
+    "SpvProofBuilder",
+    "require_spv_sole_authority_cleared",
+]
 
 _BUILDER_TOKEN = object()  # unforgeable sentinel; SpvProof.__post_init__ checks for it
 
 _VALID_RECEIVE_TYPES = frozenset({P2PKH, P2WPKH, P2SH, P2TR})
+
+# Isolated test chains carry no real value, so the SPV primitive may run as a sole
+# release authority on them without an audit opt-in.
+_SPV_AUDIT_CLEARED_NETWORKS = frozenset({"regtest", "testnet", "testnet3", "testnet4", "signet"})
+
+
+def require_spv_sole_authority_cleared(network: str, *, audit_cleared: bool) -> None:
+    """Fail-closed gate for using the SPV primitive as the SOLE release authority.
+
+    Audit 2026-05-29 F-01 / report item #1. The Python SPV verifier MIRRORS an
+    on-chain RadiantScript covenant. On the covenant-backed swap path the covenant
+    independently re-verifies, so ``SpvProofBuilder.build()`` is a client-side check
+    and needs no gate — use the plain constructor there. But a covenant-LESS
+    retained use (bridge-in / oracle / payment-gate) that releases value on
+    ``build()`` alone makes Python the SOLE difficulty authority, and the primitive
+    does NOT yet enforce network difficulty or most-cumulative-work selection: a
+    forged minimum-difficulty header chain off a real anchor would pass for ~$0.
+
+    Such a use MUST route through this gate (e.g. via
+    :meth:`SpvProofBuilder.for_sole_authority`). Isolated test chains
+    (:data:`_SPV_AUDIT_CLEARED_NETWORKS`) are always allowed; any value-bearing
+    network RAISES unless ``audit_cleared=True`` is explicitly passed — which an
+    operator may set only after an independent external audit clears the standalone
+    SPV trust boundary AND the difficulty-floor / most-work work lands.
+
+    Raises:
+        ValidationError: for a value-bearing network without the explicit opt-in.
+    """
+    if not isinstance(network, str) or not network:
+        raise ValidationError("network must be a non-empty string")
+    if network in _SPV_AUDIT_CLEARED_NETWORKS:
+        return
+    if audit_cleared is not True:
+        raise ValidationError(
+            f"network {network!r} is value-bearing and the SPV primitive is NOT cleared to be the "
+            "SOLE release authority on it: it does not yet enforce network difficulty / most-"
+            "cumulative-work (audit F-01), so a forged min-difficulty chain off a real anchor would "
+            "pass. Run the primitive ONLY behind an on-chain covenant that pins nBits, or pass "
+            "audit_cleared=True after an independent external audit clears the standalone SPV "
+            "trust boundary (report item #1 AUDIT GATE)."
+        )
 
 
 def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
@@ -246,6 +292,26 @@ class SpvProofBuilder:
     def __init__(self, covenant_params: CovenantParams) -> None:
         self._params = covenant_params
 
+    @classmethod
+    def for_sole_authority(
+        cls,
+        covenant_params: CovenantParams,
+        *,
+        network: str,
+        audit_cleared: bool = False,
+    ) -> SpvProofBuilder:
+        """Construct a builder for a covenant-LESS sole-authority use, gated.
+
+        Audit 2026-05-29 F-01 / report item #1. Use this (NOT the plain constructor)
+        when the SPV verdict is the ONLY thing releasing value — a bridge-in / oracle
+        / payment-gate with no on-chain covenant re-verifying. It runs
+        :func:`require_spv_sole_authority_cleared`, which fails closed on a
+        value-bearing network unless ``audit_cleared=True``. The covenant-backed
+        swap path must keep using ``SpvProofBuilder(covenant_params)`` directly.
+        """
+        require_spv_sole_authority_cleared(network, audit_cleared=audit_cleared)
+        return cls(covenant_params)
+
     def build(
         self,
         txid_be: str,
@@ -254,6 +320,7 @@ class SpvProofBuilder:
         merkle_be: list[str],
         pos: int,
         output_offset: int,
+        tx_block_height: int | None = None,
     ) -> SpvProof:
         """Verify every SPV-proof component and return an ``SpvProof``.
 
@@ -263,6 +330,17 @@ class SpvProofBuilder:
             3. PoW + chain link for every header (anchor-bound).
             4. Merkle inclusion (with depth binding + coinbase guard).
             5. Payment output correct (hash + type + value threshold).
+
+        Args:
+            tx_block_height: Optional Bitcoin block height of the tx. When provided
+                (audit 2026-05-29 F-18), the Merkle root is pinned to the SPECIFIC
+                header at index ``tx_block_height - anchor_height - 1`` in the
+                anchor-chained sequence, instead of accepting a root that matches
+                ANY fetched header. Production ``finalize()`` always supplies it;
+                this binds the Merkle proof's block to the resolved height so a
+                malicious data source cannot route a proof for one block against an
+                unrelated header it also supplied. ``None`` keeps the weaker
+                flexible-anchor search (tx may land in any of h1..hN).
 
         Raises:
             SpvVerificationError: on any failure. Never returns a partial proof.
@@ -329,19 +407,37 @@ class SpvProofBuilder:
 
         # Step 4: build branch and verify Merkle inclusion.
         branch = build_branch(merkle_be, pos)
+        computed_root = compute_root(txid_be, branch)
 
-        # Find which header in the chain contains the tx (flexible anchor:
-        # tx may land anywhere in h1..hN).
+        # Audit 2026-05-29 F-18: bind the Merkle proof to the SPECIFIC height-
+        # identified header rather than accepting a root that matches ANY fetched
+        # header. verify_chain has already proven headers[0].prevHash == chain_anchor
+        # and the contiguous linkage, so header index i is block anchor_height+1+i.
         matching_header: bytes | None = None
-        for header in headers:
-            root = extract_merkle_root(header)
-            computed = compute_root(txid_be, branch)
-            if computed == root:
-                matching_header = header
-                break
-
-        if matching_header is None:
-            raise SpvVerificationError("tx Merkle root does not match any provided header")
+        if tx_block_height is not None:
+            expected_index = tx_block_height - params.anchor_height - 1
+            if not (0 <= expected_index < len(headers)):
+                raise SpvVerificationError(
+                    f"tx_block_height {tx_block_height} maps to header index {expected_index}, "
+                    f"out of range for the {len(headers)} anchored headers "
+                    f"(anchor_height {params.anchor_height})"
+                )
+            matching_header = headers[expected_index]
+            if computed_root != extract_merkle_root(matching_header):
+                raise SpvVerificationError(
+                    f"Merkle root does not match the header at the claimed block height {tx_block_height} "
+                    "(merkle proof not bound to the resolved block)"
+                )
+        else:
+            # Flexible-anchor fallback (no height supplied): find which header in the
+            # chain contains the tx. WEAKER — accepts a root matching any fetched
+            # header. Production finalize() always supplies tx_block_height (F-18).
+            for header in headers:
+                if computed_root == extract_merkle_root(header):
+                    matching_header = header
+                    break
+            if matching_header is None:
+                raise SpvVerificationError("tx Merkle root does not match any provided header")
 
         # Run the full inclusion check (also re-asserts coinbase guard, depth
         # binding, and tx<->txid hash match).
