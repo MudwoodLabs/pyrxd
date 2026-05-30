@@ -1,0 +1,134 @@
+{
+  "M-1_padded_depth1": {
+    "allowed": true,
+    "direction": "agreement",
+    "note": "19 trailing 0x02 sentinels NO-OP",
+    "reject_reason": null
+  },
+  "M-1neg_corrupt_sentinel": {
+    "allowed": false,
+    "direction": "agreement",
+    "note": "0x00 pad dir mutates root -> reject",
+    "reject_reason": "16: mandatory-script-verify-flag-failed (Script failed an OP_VERIFY operation)"
+  },
+  "M-2_full_20_levels": {
+    "allowed": true,
+    "direction": "agreement",
+    "note": "20 genuine levels verify",
+    "reject_reason": null
+  },
+  "M-3_misplaced_sentinel": {
+    "allowed": false,
+    "direction": "agreement",
+    "note": "0x02 on a real level skips sibling -> reject",
+    "reject_reason": "16: mandatory-script-verify-flag-failed (Script failed an OP_VERIFY operation)"
+  },
+  "NB-1_exp0x1e": {
+    "allowed": true,
+    "direction": "B",
+    "note": "exp 0x1e tolerated (Python Nbits rejects > 0x1d)",
+    "reject_reason": null
+  },
+  "NB-2a_exp0x1f": {
+    "allowed": true,
+    "direction": "B",
+    "note": "exp 0x1f tolerated",
+    "reject_reason": null
+  },
+  "NB-2b_exp0x20": {
+    "allowed": true,
+    "direction": "B",
+    "note": "exp 0x20 = ceiling, tolerated",
+    "reject_reason": null
+  },
+  "NB-2c_exp0x21": {
+    "allowed": false,
+    "direction": "agreement",
+    "note": "exp 0x21 > ceiling => OP_LESSTHANOREQUAL OP_VERIFY reject",
+    "reject_reason": "16: mandatory-script-verify-flag-failed (Script failed an OP_VERIFY operation)"
+  },
+  "S-1_baseline": {
+    "allowed": true,
+    "direction": "agreement",
+    "note": "canonical empty-scriptSig P2WPKH finalize",
+    "reject_reason": null
+  },
+  "S-2_multi_output": {
+    "allowed": true,
+    "direction": "B",
+    "note": "index-0-only introspection; no arity guard",
+    "reject_reason": null
+  },
+  "S-2_multi_output_control": {
+    "allowed": false,
+    "direction": "agreement",
+    "note": "output0 < floor with 2 outputs => reject (proves output-0 binds; can't route to output1)",
+    "reject_reason": "16: mandatory-script-verify-flag-failed (Script failed an OP_VERIFY operation)"
+  },
+  "S-3_at_floor": {
+    "allowed": true,
+    "direction": "agreement",
+    "note": "deadline == 1774427796 (>= inclusive) accepts",
+    "reject_reason": null
+  },
+  "S-3_below_floor": {
+    "allowed": false,
+    "direction": "A",
+    "note": "deadline < 1774427796 bricks finalize",
+    "reject_reason": "16: mandatory-script-verify-flag-failed (Script failed an OP_VERIFY operation)"
+  },
+  "S-3_forfeit": {
+    "allowed": true,
+    "direction": "agreement",
+    "note": "forfeit reclaim after mature deadline",
+    "reject_reason": null
+  },
+  "V-1_5byte_2pow32": {
+    "allowed": true,
+    "direction": "A?",
+    "note": "5 sig bytes (2^32); accept iff 64-bit numeric",
+    "reject_reason": null
+  },
+  "V-2a_maxmoney_3bythreshold": {
+    "allowed": true,
+    "direction": "A?",
+    "note": "7-byte value (MAX_MONEY), 3-byte threshold",
+    "reject_reason": null
+  },
+  "V-2b_maxmoney_7bythreshold": {
+    "allowed": true,
+    "direction": "A?",
+    "note": "both operands 7-byte",
+    "reject_reason": null
+  },
+  "V-3a_7byte_3bythreshold": {
+    "allowed": true,
+    "direction": "A?",
+    "note": "7-byte value, 3-byte threshold",
+    "reject_reason": null
+  },
+  "V-3b_7byte_7bythreshold": {
+    "allowed": true,
+    "direction": "A?",
+    "note": "value == 7-byte threshold (>= inclusive)",
+    "reject_reason": null
+  },
+  "V-4_8byte_bit63clear": {
+    "allowed": true,
+    "direction": "parity",
+    "note": "8 sig bytes, max positive int64",
+    "reject_reason": null
+  },
+  "V-4ctrl_bit63set": {
+    "allowed": false,
+    "direction": "control",
+    "note": "bit-63 set => signed-negative decode < threshold (control)",
+    "reject_reason": "16: mandatory-script-verify-flag-failed (Script failed an OP_VERIFY operation)"
+  },
+  "V-5_7byte_below_threshold": {
+    "allowed": false,
+    "direction": "control",
+    "note": "7-byte value < 7-byte threshold => reject",
+    "reject_reason": "16: mandatory-script-verify-flag-failed (Script failed an OP_VERIFY operation)"
+  }
+}

@@ -162,6 +162,10 @@ ignore = [
     "B017",   # assert raises Exception: tests intentionally check broad failure modes
     "E402",   # module-level imports below other code: tests group imports near related test classes
 ]
+"tests/test_spv_covenant_differential_regtest.py" = [
+    "F811",   # reuses the shared `node` regtest fixture from test_htlc_regtest_e2e; pytest's
+              # fixture-injection (each test's `node` param) reads as a redefinition to ruff
+]
 "examples/**" = [
     "S",      # examples use test keys / hardcoded WIFs intentionally
     "E402",   # examples may reorder imports for narrative clarity
