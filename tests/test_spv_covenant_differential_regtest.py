@@ -44,6 +44,24 @@ import struct
 
 import pytest
 
+# Reuse the isolated-regtest harness wholesale (node fixture spins up + tears down
+# a throwaway radiant-core:v2.3.0 container; accepts() == testmempoolaccept).
+# Bare module names (NOT ``tests.X``): pytest's default prepend import mode puts the
+# ``tests/`` dir on sys.path, and there is no ``tests/__init__.py``, so ``tests`` is not
+# an importable package under ``pytest tests/ -o "addopts="`` (the coverage-overall step).
+from test_htlc_regtest_e2e import _pay_to_spk, _RegtestNode, node  # noqa: F401  (node = fixture)
+
+# Reuse the PROVEN, model-faithful BTC-tx builder + helpers + constants so the
+# funding-tx shape exactly matches the covenant model the deployed test diffs against.
+from test_spv_covenant_differential_deployed import (
+    _SPK,
+    MAKER20,
+    SATS,
+    _build,
+    _output0_offset,
+    _vi,
+)
+
 from pyrxd.gravity.codehash import compute_p2sh_code_hash, compute_p2sh_script_pubkey
 from pyrxd.gravity.covenant import CovenantArtifact, build_gravity_offer
 from pyrxd.gravity.transactions import build_finalize_tx, build_forfeit_tx
@@ -53,21 +71,6 @@ from pyrxd.spv.merkle import build_branch, compute_root
 from pyrxd.spv.payment import P2WPKH
 from pyrxd.spv.pow import hash256
 from pyrxd.spv.proof import _BUILDER_TOKEN, CovenantParams, SpvProof, _read_varint
-
-# Reuse the isolated-regtest harness wholesale (node fixture spins up + tears down
-# a throwaway radiant-core:v2.3.0 container; accepts() == testmempoolaccept).
-from tests.test_htlc_regtest_e2e import _pay_to_spk, _RegtestNode, node  # noqa: F401  (node = fixture)
-
-# Reuse the PROVEN, model-faithful BTC-tx builder + helpers + constants so the
-# funding-tx shape exactly matches the covenant model the deployed test diffs against.
-from tests.test_spv_covenant_differential_deployed import (
-    _SPK,
-    MAKER20,
-    SATS,
-    _build,
-    _output0_offset,
-    _vi,
-)
 
 pytestmark = pytest.mark.integration
 
