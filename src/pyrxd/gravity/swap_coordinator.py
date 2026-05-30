@@ -51,6 +51,7 @@ from pyrxd.btc_wallet.taproot import (
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import SecretBytes
 
+from .finality import CounterClaimFinality, CounterClaimState
 from .ref_authenticity import verify_ref_authenticity
 from .swap_state import (
     NegotiatedTerms,
@@ -477,7 +478,7 @@ class ClaimFinality(Enum):
 
 def assess_claim_finality(
     *,
-    btc_claim_confirmations: int,
+    counter_claim_finality: CounterClaimFinality,
     now_rxd_height: int,
     asset_locked_at_height: int,
     t_rxd: Timelock,
@@ -486,8 +487,9 @@ def assess_claim_finality(
     """Decide SAFE / WAIT / SQUEEZED for the taker's asset claim — fail-closed, pure.
 
     Two serial finality requirements share the ``t_rxd`` deadline (security review):
-      1. the maker's BTC claim must reach ``policy.btc_claim_reorg_depth`` (so ``p`` is
-         reorg-safe), THEN
+      1. the maker's COUNTER-LEG claim must be FINAL (PoW: ``policy.btc_claim_reorg_depth``
+         confirmations deep so ``p`` is reorg-safe; PoS: past the ``finalized`` checkpoint),
+         supplied as a :class:`CounterClaimFinality` verdict, THEN
       2. the taker's own Radiant claim must bury ``policy.rxd_claim_burial`` deep,
       both BEFORE ``t_rxd`` (the maker's CSV refund) opens at
       ``asset_locked_at_height + t_rxd``.
@@ -495,15 +497,17 @@ def assess_claim_finality(
     A bare depth gate without the deadline check is a NET REGRESSION: it can force the
     taker to choose between an unsafe early claim and losing the asset to the maker's
     refund. So this returns WAIT only while there is genuinely room to wait, and
-    SQUEEZED (→ ASSET_VULNERABLE) once there is not.
+    SQUEEZED (→ ASSET_VULNERABLE) once there is not. A counter chain that is not
+    finalizing (verdict ``COUNTER_CHAIN_NOT_FINALIZING``) SQUEEZES — never WAIT.
 
     Raises ``ValidationError`` on any un-evaluable input (never assumes "plenty of
     time"). All depths normalised to Radiant BLOCKS via ``policy.block_interval_s``.
     """
     if not isinstance(policy, MarginPolicy):
         raise ValidationError("assess_claim_finality requires a MarginPolicy")
+    if not isinstance(counter_claim_finality, CounterClaimFinality):
+        raise ValidationError("assess_claim_finality requires a CounterClaimFinality verdict")
     for label, val in (
-        ("btc_claim_confirmations", btc_claim_confirmations),
         ("now_rxd_height", now_rxd_height),
         ("asset_locked_at_height", asset_locked_at_height),
     ):
@@ -524,7 +528,7 @@ def assess_claim_finality(
         rxd_burial = policy.rxd_claim_burial.normalize_to(
             TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
         ).value
-        btc_depth_confs = policy.btc_claim_reorg_depth.normalize_to(
+        required_depth_blocks = policy.btc_claim_reorg_depth.normalize_to(
             TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
         ).value
     except ValidationError:
@@ -535,24 +539,28 @@ def assess_claim_finality(
     # The maker's CSV refund opens here (Radiant blocks).
     refund_opens_at = asset_locked_at_height + rxd_blocks
     # To claim SAFELY from now we still need: bury our own claim rxd_burial deep,
-    # which (if the BTC claim weren't yet deep) would also require waiting out the
-    # remaining BTC depth first. The binding deadline is refund_opens_at.
+    # which (if the counter-leg claim weren't yet final) would also require waiting out
+    # the remaining counter-chain depth first. The binding deadline is refund_opens_at.
     blocks_left = refund_opens_at - now_rxd_height
 
-    if btc_claim_confirmations >= btc_depth_confs:
-        # BTC claim is reorg-safe. We may claim iff our own burial still fits the window.
+    state = counter_claim_finality.state
+    if state is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING:
+        # RF-06: the counter chain is not advancing finalization — never WAIT on a stall.
+        return ClaimFinality.SQUEEZED
+    if state is CounterClaimState.FINAL:
+        # Counter-leg claim is final/reorg-safe. Claim iff our own burial still fits.
         if blocks_left >= rxd_burial:
             return ClaimFinality.SAFE
         return ClaimFinality.SQUEEZED
-    # BTC claim still shallow. We can WAIT only if, after the BTC depth elapses, there
-    # is STILL room to bury our claim before the refund opens.
-    # F-007: the BTC reorg depth is in BTC blocks; convert the wall-clock it represents
-    # into RXD blocks (the unit of blocks_left) before subtracting. BTC and RXD block
-    # rates differ, so treating BTC blocks 1:1 as RXD blocks under-counts the RXD window
-    # the BTC burial consumes and biases WAIT optimistic. Round UP (conservative).
-    btc_blocks_remaining = btc_depth_confs - btc_claim_confirmations
-    btc_depth_in_rxd = math.ceil(btc_depth_confs * policy.block_interval_s / policy.rxd_block_interval_s)
-    if blocks_left - btc_depth_in_rxd >= rxd_burial and btc_blocks_remaining > 0:
+    # NOT_YET_FINAL_LIVE: the counter-leg claim is still shallow. We can WAIT only if,
+    # after the counter-chain depth elapses, there is STILL room to bury our claim before
+    # the refund opens.
+    # F-007: the counter-chain reorg depth is in counter-chain blocks; convert the
+    # wall-clock it represents into RXD blocks (the unit of blocks_left) before
+    # subtracting. The two block rates differ, so treating them 1:1 under-counts the RXD
+    # window the burial consumes and biases WAIT optimistic. Round UP (conservative).
+    counter_depth_in_rxd = math.ceil(required_depth_blocks * policy.block_interval_s / policy.rxd_block_interval_s)
+    if blocks_left - counter_depth_in_rxd >= rxd_burial and counter_claim_finality.remaining_positive:
         return ClaimFinality.WAIT
     return ClaimFinality.SQUEEZED
 
@@ -1045,12 +1053,17 @@ class SwapCoordinator:
         # Reorg gate: read the maker's BTC-claim depth (fail-closed on any error) and
         # assess against the t_rxd window.
         btc_confs = await self.btc_leg.confirmations_of_claim(maker_claim_tx_bytes)
+        policy = self.config.margin_policy
+        required_depth = policy.btc_claim_reorg_depth.normalize_to(
+            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
+        ).value
+        verdict = CounterClaimFinality.from_btc_depth(btc_confs, required_depth)
         finality = assess_claim_finality(
-            btc_claim_confirmations=btc_confs,
+            counter_claim_finality=verdict,
             now_rxd_height=now_rxd_height,
             asset_locked_at_height=asset_locked_at_height,
             t_rxd=self.record.terms.t_rxd,
-            policy=self.config.margin_policy,
+            policy=policy,
         )
         if finality is ClaimFinality.WAIT:
             logger.info(
