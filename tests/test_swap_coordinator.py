@@ -1542,9 +1542,9 @@ class FakeEthLeg:
         self.calls.append("scrape")
         return self._p
 
-    async def assert_claim_provenance(self, tx_hash, *, contract_address, hashlock) -> None:
+    async def assert_claim_provenance(self, tx_hash, *, contract_address, preimage) -> None:
         self.calls.append("provenance")
-        self.provenance_args = {"tx_hash": tx_hash, "contract_address": contract_address, "hashlock": hashlock}
+        self.provenance_args = {"tx_hash": tx_hash, "contract_address": contract_address, "preimage": preimage}
         if not self.provenance_ok:
             raise ValidationError("claim tx 'to' is not this swap's HTLC contract address")
 
@@ -1619,7 +1619,7 @@ async def test_eth_claim_safe_settles_and_runs_provenance():
     # Gate order: scrape, then provenance, then verdict — provenance BEFORE the verdict/claim.
     assert leg.calls == ["fetch", "scrape", "provenance", "verdict"]
     assert leg.provenance_args["contract_address"] == "0x" + "ab" * 20
-    assert leg.provenance_args["hashlock"] == h
+    assert leg.provenance_args["preimage"] == p.unsafe_raw_bytes()  # binds the SECRET p, not H
 
 
 async def test_eth_claim_rejects_failed_provenance_no_claim():

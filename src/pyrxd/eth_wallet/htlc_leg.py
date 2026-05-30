@@ -338,33 +338,38 @@ class EthHtlcContractLeg:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
         return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
 
-    async def assert_claim_provenance(self, tx_hash: str, *, contract_address: str, hashlock: bytes) -> None:
+    async def assert_claim_provenance(self, tx_hash: str, *, contract_address: str, preimage: bytes) -> None:
         """Provenance gate (R6): the maker's claim tx MUST target THIS swap's HTLC contract
-        instance and bind OUR ``H`` on-chain — the ETH analogue of the BTC
+        instance AND emit the revealed secret ``p`` from it — the ETH analogue of the BTC
         "claim tx spends our funding outpoint" check (``_assert_claim_tx_spends_our_htlc``).
 
         Each swap deploys a FRESH HTLC contract at a unique CREATE address (recorded in the
         locator after :meth:`verify_funded`), so the contract address is per-swap-unique
-        exactly like a BTC funding outpoint. ``recover_secret`` matches ``sha256(p)==H`` over
-        the supplied tx's calldata + logs but TRUSTS that the tx belongs to this swap; we
+        exactly like a BTC funding outpoint. The contract's claim path emits
+        ``Claimed(bytes32 preimage)`` with the SECRET ``p`` in the (non-indexed) log data
+        (see ``EthHtlc.sol`` / ``HashedTimelock.sol``). ``recover_secret`` matches
+        ``sha256(p)==H`` over the supplied tx but TRUSTS that the tx belongs to this swap; we
         verify that here, fail-closed:
 
           * ``tx.to == contract_address`` — the claim called OUR contract instance (not a
             different swap's, even one that reused ``H``);
           * ``receipt.status == 1`` — the claim actually succeeded (the ETH moved; a reverted
             tx never paid the maker even if ``p`` sits in its calldata);
-          * a log emitted BY ``contract_address`` whose topics+data contain ``H`` — an
-            on-chain binding of the hashlock to this contract instance WITHOUT decoding the
-            event ABI (``H``'s 32 bytes appear in the claim event whether the param is indexed
-            (a topic) or in the data). This binds ``H`` to the contract the deployer audited,
-            not just to the scraped preimage.
+          * a log emitted BY ``contract_address`` whose data carries the SECRET ``p`` — the
+            on-chain ``Claimed(p)`` event. We bind to ``p``, NOT the public hashlock ``H``:
+            ``H`` is negotiated openly and reused on both legs (so an ``H``-match adds no
+            authenticity), and the deployed contract NEVER re-emits ``H`` (it is a constructor
+            immutable) — an ``H``-in-log gate would reject every legitimate claim. ``p`` is
+            secret until the maker reveals it, so ``p`` appearing in a log from our unique
+            contract is a genuine, swap-specific proof of a real claim on it.
 
-        Any RPC error propagates and aborts the claim — also fail-closed. The redundant
-        receipt read vs :meth:`fetch_claim_artifacts` is deliberate (correctness over a saved
-        round-trip); a future driver may thread one receipt through both.
+        ``preimage`` is the value the coordinator already recovered via ``scrape_secret`` and
+        re-verified ``sha256(p)==H``, so passing it here adds no trust assumption. Any RPC
+        error propagates and aborts the claim — also fail-closed. The redundant receipt read
+        vs :meth:`fetch_claim_artifacts` is deliberate (correctness over a saved round-trip).
         """
         want = _addr(contract_address)
-        h = self._h32(hashlock)
+        p = self._p32(preimage)
         tx = await self._rpc.get_transaction(tx_hash)
         if _addr(tx.get("to")) != want:
             raise ValidationError(
@@ -378,18 +383,18 @@ class EthHtlcContractLeg:
             if _addr(log.get("address")) != want:
                 continue
             blob = b"".join(_b(topic) for topic in log.get("topics", [])) + _b(log.get("data"))
-            if h in blob:
+            if p in blob:
                 return
         raise ValidationError(
-            "no event from this swap's HTLC contract binds H on-chain; "
+            "no Claimed(p) event from this swap's HTLC contract carries the revealed preimage; "
             "refusing to scrape p (wrong or cross-swap claim tx)"
         )
 
     @staticmethod
-    def _h32(hashlock: bytes) -> bytes:
-        if not isinstance(hashlock, (bytes, bytearray)) or len(hashlock) != 32:
-            raise ValidationError("hashlock must be 32 bytes")
-        return bytes(hashlock)
+    def _p32(preimage: bytes) -> bytes:
+        if not isinstance(preimage, (bytes, bytearray)) or len(preimage) != 32:
+            raise ValidationError("preimage must be 32 bytes")
+        return bytes(preimage)
 
 
 # Register as a virtual subclass of the CounterChainLeg ABC: the leg realises the full

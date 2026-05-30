@@ -1171,11 +1171,12 @@ class SwapCoordinator:
         p = self.counter_leg.scrape_secret(artifacts, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
-        # Provenance (R6): the claim tx must target OUR HTLC contract instance and bind H
-        # on-chain — defends cross-swap replay even if H is reused via a path the seen-store
-        # does not cover (the ETH analogue of _assert_claim_tx_spends_our_htlc).
+        # Provenance (R6): the claim tx must target OUR HTLC contract instance and emit the
+        # revealed secret p (the Claimed(p) event) from it — defends cross-swap replay even if
+        # H is reused via a path the seen-store does not cover (the ETH analogue of
+        # _assert_claim_tx_spends_our_htlc). Binds the SECRET p, not the public H.
         await self.counter_leg.assert_claim_provenance(
-            claim_tx_hash, contract_address=locator.contract_address, hashlock=self.record.terms.hashlock
+            claim_tx_hash, contract_address=locator.contract_address, preimage=bytes(p)
         )
         # Reorg gate: the ETH finalized-checkpoint verdict (no depth) feeds the t_rxd squeeze.
         verdict = await self.counter_leg.claim_finality_verdict(claim_tx_hash)
@@ -1253,7 +1254,7 @@ class SwapCoordinator:
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
         await self.counter_leg.assert_claim_provenance(
-            claim_tx_hash, contract_address=locator.contract_address, hashlock=self.record.terms.hashlock
+            claim_tx_hash, contract_address=locator.contract_address, preimage=bytes(p)
         )
         await self.radiant_leg.claim_asset(self.record, bytes(p))
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
