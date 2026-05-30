@@ -182,6 +182,13 @@ line-ending = "lf"
 
 [tool.coverage.run]
 branch = true
+omit = [
+    # ETH counter-chain leg: network I/O (web3-backed RPC + on-chain HTLC calls) + the
+    # CounterChainLeg ABC. Exercised by the Phase-4 Anvil/Sepolia integration suite, not
+    # offline unit tests. REMOVE this omit when that suite lands so the 85% gate covers it.
+    "src/pyrxd/eth_wallet/*",
+    "src/pyrxd/gravity/counter_chain_leg.py",
+]
 
 [tool.coverage.report]
 fail_under = 85
