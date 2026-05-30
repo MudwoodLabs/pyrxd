@@ -41,6 +41,7 @@ Python path are always driven with the SAME committed type.
 from __future__ import annotations
 
 import struct
+from functools import cache
 
 import pytest
 
@@ -586,6 +587,11 @@ def test_header_nbits_exponent_ceiling_divergence_needs_regtest():
 # =========================================================================== MERKLE walk
 
 
+# Expensive: grinds a ~24-bit-target block header in pure Python (~13s/call).
+# Every caller passes identical args, so memoize to grind once per
+# (payment_spk, n_levels) instead of once per test. Returns only immutable
+# bytes/str, so sharing one cached tuple across tests is safe.
+@cache
 def _grind_tx_into_block(payment_spk: bytes, n_levels: int = 1):
     """Build a single-input/single-output tx and a relaxed-target block whose
     merkle root commits it at pos=1 with ``n_levels`` siblings. Returns
