@@ -1428,3 +1428,82 @@ def test_measure_margin_inherits_reorg_depth_floor():
             rxd_claim_burial_blocks=3,
             rxd_block_interval_s=300.0,
         )
+
+
+# --------------------------------------------------------------------------- C2a: §9 ETH reserve
+
+
+def _eth_finality_policy(*, window_s=768):
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+        btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        eth_finalization_window_s=window_s,
+    )
+
+
+def _eth_not_final():
+    # ETH verdict: no depth -> remaining_positive True, reserve from eth_finalization_window_s
+    return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+
+def test_eth_not_yet_final_uses_finalization_window():
+    policy = _eth_finality_policy(window_s=768)  # 768s / 300 = ceil 3 RXD blocks
+    # roomy: opens@1072, now=1000 -> 72 left; 72 - 3 >= 6 -> WAIT
+    assert (
+        assess_claim_finality(
+            counter_claim_finality=_eth_not_final(),
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=policy,
+        )
+        is ClaimFinality.WAIT
+    )
+    # closing: opens@1010, now=1006 -> 4 left; 4 - 3 = 1 < 6 -> SQUEEZED
+    assert (
+        assess_claim_finality(
+            counter_claim_finality=_eth_not_final(),
+            now_rxd_height=1006,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(10, t.TimeUnit.BLOCKS),
+            policy=policy,
+        )
+        is ClaimFinality.SQUEEZED
+    )
+
+
+def test_eth_verdict_without_finalization_window_fail_closed():
+    policy = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+        btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+    )  # eth_finalization_window_s defaults None
+    with pytest.raises(ValidationError, match="eth_finalization_window_s"):
+        assess_claim_finality(
+            counter_claim_finality=_eth_not_final(),
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=policy,
+        )
+
+
+def test_dual_source_reorg_depth_divergence_fail_closed():
+    # §9 #2: a PoW verdict whose required_depth disagrees with the policy depth is refused.
+    policy = _policy()
+    diverging = CounterClaimFinality.from_btc_depth(1, 100)  # required_depth 100 != policy depth
+    with pytest.raises(ValidationError, match="divergent reserve"):
+        assess_claim_finality(
+            counter_claim_finality=diverging,
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=policy,
+        )

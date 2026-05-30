@@ -185,6 +185,13 @@ class MarginPolicy:
     rxd_claim_burial: Timelock = field(
         default_factory=lambda: Timelock(ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS, TimeUnit.BLOCKS)
     )
+    # Finalized-checkpoint (ETH/PoS) counter-leg finalization window, in SECONDS (re-audit §9
+    # #3). For a depth-based (BTC/PoW) leg this stays None and the reorg gate uses
+    # btc_claim_reorg_depth. For an ETH leg — whose finality is a TIME checkpoint, not a block
+    # depth — the gate reserves ceil(eth_finalization_window_s / rxd_block_interval_s) RXD
+    # blocks in the WAIT branch instead. CHOSEN/ESTIMATED (post-Merge ~2 epochs ≈ 12.8 min);
+    # required (non-None) for an ETH (no-depth) finality verdict.
+    eth_finalization_window_s: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.margin, Timelock):
@@ -220,6 +227,12 @@ class MarginPolicy:
                 "real-value mode (require_measured=True) requires a MEASURED margin; "
                 "the ESTIMATED default is test-only — supply measured block data + reorg depth"
             )
+        if self.eth_finalization_window_s is not None and (
+            not isinstance(self.eth_finalization_window_s, int)
+            or isinstance(self.eth_finalization_window_s, bool)
+            or self.eth_finalization_window_s <= 0
+        ):
+            raise ValidationError("MarginPolicy.eth_finalization_window_s must be a positive int or None")
 
     @classmethod
     def estimated(cls, *, block_interval_s: float = 600.0, require_measured: bool = False) -> MarginPolicy:
@@ -553,15 +566,30 @@ def assess_claim_finality(
         if blocks_left >= rxd_burial:
             return ClaimFinality.SAFE
         return ClaimFinality.SQUEEZED
-    # NOT_YET_FINAL_LIVE: the counter-leg claim is still shallow. We can WAIT only if,
-    # after the counter-chain depth elapses, there is STILL room to bury our claim before
-    # the refund opens.
-    # F-007: the counter-chain reorg depth is in counter-chain blocks; convert the
-    # wall-clock it represents into RXD blocks (the unit of blocks_left) before
-    # subtracting. The two block rates differ, so treating them 1:1 under-counts the RXD
-    # window the burial consumes and biases WAIT optimistic. Round UP (conservative).
-    counter_depth_in_rxd = math.ceil(required_depth_blocks * policy.block_interval_s / policy.rxd_block_interval_s)
-    if blocks_left - counter_depth_in_rxd >= rxd_burial and counter_claim_finality.remaining_positive:
+    # NOT_YET_FINAL_LIVE: the counter-leg claim is not yet final. We can WAIT only if, after
+    # the counter leg finalizes, there is STILL room to bury our own claim before the refund
+    # opens. The RXD-block reserve that finalization consumes is chain-specific:
+    if counter_claim_finality.required_depth is not None:
+        # PoW (depth-based) leg. §9 #2: the verdict's depth MUST equal the policy depth, so the
+        # FINAL decision (driven by the verdict) and this reserve (from the policy) cannot
+        # diverge — fail-closed on a mismatch. The F-007 conversion is otherwise unchanged.
+        if counter_claim_finality.required_depth != required_depth_blocks:
+            raise ValidationError(
+                f"finality verdict required_depth ({counter_claim_finality.required_depth}) != policy "
+                f"reorg depth ({required_depth_blocks}) — refusing to assess on a divergent reserve"
+            )
+        # F-007: the reorg depth is in counter-chain blocks; convert the wall-clock it
+        # represents into RXD blocks before subtracting (the rates differ; round UP).
+        counter_reserve_rxd = math.ceil(required_depth_blocks * policy.block_interval_s / policy.rxd_block_interval_s)
+    else:
+        # Finalized-checkpoint (ETH) leg: finality is a TIME window, not a block depth (§9 #3).
+        if policy.eth_finalization_window_s is None:
+            raise ValidationError(
+                "a finalized-checkpoint (no-depth) finality verdict requires "
+                "policy.eth_finalization_window_s (the counter-chain finalization window)"
+            )
+        counter_reserve_rxd = math.ceil(policy.eth_finalization_window_s / policy.rxd_block_interval_s)
+    if blocks_left - counter_reserve_rxd >= rxd_burial and counter_claim_finality.remaining_positive:
         return ClaimFinality.WAIT
     return ClaimFinality.SQUEEZED
 
