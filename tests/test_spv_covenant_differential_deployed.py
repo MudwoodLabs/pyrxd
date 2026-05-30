@@ -478,6 +478,23 @@ def test_op_return_output0_rejected_both_paths():
     assert _model_accepts(raw, MAKER20, P2SH, SATS) is False
 
 
+def test_cparser2_forged_payment_blob_in_scriptsig_rejected():
+    """C-PARSER-2 / F-09 (ported from the retired any-wallet differential test): a
+    payment-shaped blob planted in the input scriptSig must NOT be mistaken for the
+    payment output. Deployed covenant: the 31-byte scriptSig is not in {0x00,0x17}
+    -> REJECT. Python: the blob's byte offset is NOT a member of _output_offsets (the
+    genuine output boundaries), so build()'s ``output_offset not in _output_offsets``
+    gate rejects it; and output 0 pays OTHER (tiny value), so verify_payment rejects."""
+    blob = struct.pack("<Q", SATS) + b"\x16" + _SPK[P2WPKH](MAKER20)  # value(8)+pushlen(1)+spk(22)=31
+    raw = _build([blob], [(50, _SPK[P2WPKH](OTHER20))])  # real output pays OTHER, tiny value
+    stripped = strip_witness(raw)
+    offsets = _output_offsets(stripped)
+    # blob start = version(4) + n_in(1) + prevout(36) + scriptSig-len byte(1) = 42.
+    assert 42 not in offsets, "forged scriptSig blob offset must not be a real output boundary"
+    assert _model_accepts(raw, MAKER20, P2WPKH, SATS) is False
+    assert _python_struct_and_payment_accepts(raw, MAKER20, P2WPKH, SATS) is False
+
+
 # =========================================================================== VARINT (CompactSize)
 
 
