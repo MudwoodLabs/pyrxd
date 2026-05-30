@@ -1162,3 +1162,28 @@ class MultiSourceBtcFundingReader:
 
     async def close(self) -> None:
         await asyncio.gather(*(r.close() for r in self._readers if hasattr(r, "close")), return_exceptions=True)
+
+
+def choose_funding_reader(value_sats: int, *, single, multi, dust_cap_sats: int = 10_000):
+    """Route a funding-reader choice by swap value (audit 2026-05-29 F-17).
+
+    Returns the SINGLE-source reader for a value at/below ``dust_cap_sats`` (the
+    documented dust posture — a deliberate single-source SPOF the operator accepts
+    for trivial value) and the MULTI-source quorum reader ABOVE it (fail-closed
+    corroboration; see :class:`MultiSourceBtcFundingReader`). Inject the result as
+    a :class:`~pyrxd.btc_wallet.htlc_leg.BtcLeg`'s ``funding_reader``.
+
+    ``single`` and ``multi`` may each be a reader INSTANCE or a zero-argument
+    FACTORY — a factory is invoked only for the chosen reader, so the unused one
+    (e.g. the quorum reader's three HTTP sessions on a dust swap) is never built.
+
+    Use network-appropriate readers: the quorum reader's ``default_mainnet()``
+    endpoints are mainnet-only, so a signet/testnet above-dust path must supply its
+    own endpoint set.
+    """
+    if int(value_sats) < 0:
+        raise ValidationError("value_sats must be >= 0")
+    if int(dust_cap_sats) < 0:
+        raise ValidationError("dust_cap_sats must be >= 0")
+    chosen = single if int(value_sats) <= int(dust_cap_sats) else multi
+    return chosen() if callable(chosen) else chosen

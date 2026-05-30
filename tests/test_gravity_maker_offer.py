@@ -68,6 +68,7 @@ def _make_offer(privkey: PrivateKeyMaterial, **kwargs) -> GravityOffer:
         claim_deadline=int(time.time()) + 48 * 3600,
         photons_offered=500_000,
         accept_short_deadline=False,
+        reject_low_difficulty=False,  # regtest offer uses difficulty-1 ffff001d (F-02 opt-out)
     )
     defaults.update(kwargs)
     return build_gravity_offer(**defaults)

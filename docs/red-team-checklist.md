@@ -248,6 +248,37 @@ For each claim in README.md, confirm the actual command behaves as advertised:
 
 ---
 
+## 10. SPV / Gravity data-source trust (45-60 min)
+
+The SPV primitive is the highest-risk client-side layer — a forged proof releases RXD. The *why* behind each check lives in [`docs/how-to/spv-verification-pitfalls.md`](how-to/spv-verification-pitfalls.md); this section is the hands-on attack list. (Covenant *correctness* is still audit territory — see below.) Drive these directly against `pyrxd.spv` / `pyrxd.gravity.covenant` / `pyrxd.network.bitcoin`.
+
+### 10.1 Difficulty / header forgery (pitfalls §1, §12)
+
+- [ ] Build a `CovenantParams(expected_nbits=…)`, then feed `SpvProofBuilder.build()` a header whose nBits (bytes 72:76) differs from the committed value. Confirm "does not match the committed" — and that it fires *before* the PoW check.
+- [ ] Confirm `build_gravity_offer(..., reject_low_difficulty=True)` rejects a difficulty-1-class `expected_nbits` (`ffff001d`), and rejects a low-mantissa exp-0x1c target once `min_difficulty_nbits` is supplied.
+- [ ] Confirm `require_spv_sole_authority_cleared("mainnet", audit_cleared=False)` raises, and `SpvProofBuilder.for_sole_authority(..., network="mainnet")` raises without the opt-in.
+
+### 10.2 Merkle / coinbase (pitfalls §3, §6, §7)
+
+- [ ] Feed `build()` a `pos` beyond the branch depth (`pos=2` at depth 1) → confirm "beyond branch depth" (the coinbase pos-aliasing bypass).
+- [ ] Feed a null-outpoint (coinbase-shaped) tx → confirm the structural reject regardless of pos.
+- [ ] Supply a `tx_block_height` that maps outside the fetched headers → confirm rejection (proof not bound to the resolved block).
+
+### 10.3 Data source / confirmations (pitfalls §2, §9)
+
+- [ ] Use `MultiSourceBtcFundingReader` for an above-dust value with only one source responding → confirm it fails closed (quorum required), not a silent single-source read.
+- [ ] Mock a source reporting `block_height > tip` → confirm `get_raw_tx` raises "inconsistent confirmation data" (the `[1,tip]` floor).
+- [ ] Mock one source OVER-reporting confirmations → confirm the conservative-minimum overrides it.
+
+### 10.4 Parser parity (pitfalls §10, §11)
+
+- [ ] Feed a non-canonical CompactSize varint (`0xfd 0x01 0x00`) → confirm rejection.
+- [ ] Feed an output value with bit 63 set → confirm rejection.
+
+**File issues for:** any of these that does NOT fail closed. Difficulty/forgery findings are CRITICAL-class — escalate immediately.
+
+---
+
 ## After the session
 
 - [ ] Total issues filed: count them. Aim for at least 5; if you have zero, you didn't look hard enough.

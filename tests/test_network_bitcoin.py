@@ -28,6 +28,7 @@ from pyrxd.network.bitcoin import (
     _check_response_size,
     _get_hex_bytes,
     _get_json,
+    choose_funding_reader,
 )
 from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Hex32, RawTx, Txid
@@ -736,3 +737,41 @@ class TestMultiSourceBtcFundingReader:
         )
         with pytest.raises(InsufficientConfirmationsError):
             await reader.read_output_amount_sats(self.TXID, 0, min_confirmations=6)
+
+
+# ---------------------------------------------------------------------------
+# choose_funding_reader (F-17 value routing)
+# ---------------------------------------------------------------------------
+
+
+class TestChooseFundingReader:
+    def test_at_or_below_dust_cap_picks_single(self):
+        single, multi = object(), object()
+        assert choose_funding_reader(10_000, single=single, multi=multi, dust_cap_sats=10_000) is single
+        assert choose_funding_reader(1, single=single, multi=multi, dust_cap_sats=10_000) is single
+
+    def test_above_dust_cap_picks_multi(self):
+        single, multi = object(), object()
+        assert choose_funding_reader(10_001, single=single, multi=multi, dust_cap_sats=10_000) is multi
+
+    def test_factories_are_lazy(self):
+        calls = {"single": 0, "multi": 0}
+
+        def mk_single():
+            calls["single"] += 1
+            return "SINGLE"
+
+        def mk_multi():
+            calls["multi"] += 1
+            return "MULTI"
+
+        # Above cap -> only the multi factory runs.
+        assert choose_funding_reader(50_000, single=mk_single, multi=mk_multi) == "MULTI"
+        assert calls == {"single": 0, "multi": 1}
+        # Below cap -> only the single factory runs.
+        assert choose_funding_reader(500, single=mk_single, multi=mk_multi) == "SINGLE"
+        assert calls == {"single": 1, "multi": 1}
+
+    def test_negative_value_rejected(self):
+        with pytest.raises(ValidationError):
+            choose_funding_reader(-1, single=object(), multi=object())

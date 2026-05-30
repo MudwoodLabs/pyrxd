@@ -15,7 +15,10 @@ import struct
 
 from pyrxd.security.errors import SpvVerificationError, ValidationError
 
-__all__ = ["P2PKH", "P2SH", "P2TR", "P2WPKH", "verify_payment"]
+# verify_payment is intentionally NOT exported (audit F-09): it is not safe as a
+# standalone value gate — use SpvProofBuilder.build(). Still importable explicitly
+# from this module for the verifier internals and differential tests.
+__all__ = ["P2PKH", "P2SH", "P2TR", "P2WPKH"]
 
 # Output type constants.
 P2PKH = "p2pkh"
@@ -59,6 +62,15 @@ def verify_payment(
     Raises:
         ValidationError: on bad arguments (unknown type, wrong hash length, etc.).
         SpvVerificationError: on any verification failure.
+
+    .. warning::
+        **Not safe-by-default; not a standalone value gate (audit F-09).** This
+        validates ONLY the bytes at ``output_offset``; it does NOT confirm that
+        offset is a real output boundary — a caller could point it into an input
+        scriptSig holding a payment-shaped blob. The boundary/membership check
+        lives in :meth:`pyrxd.spv.SpvProofBuilder.build` (the supported entry
+        point), which is why this function is intentionally not exported from the
+        ``pyrxd.spv`` package namespace. Use ``SpvProofBuilder.build`` to gate value.
     """
     if output_type not in _SCRIPT_PATTERNS:
         raise ValidationError(f"unknown output_type: {output_type!r}")
