@@ -278,3 +278,216 @@ is a deliberate, recorded scope decision, not an omission.
 Operational lessons applied: per-kB relay fee (0.10 RXD/kB on the tr node, size×rate);
 minimal-pushed CSV operands; multi-function selector dispatch; hash-compare output pin;
 CSPRNG keys only (no hand-written keys, per the prior weak-key incident).
+
+---
+
+## Phase 4b — FIRST FULL CROSS-CHAIN BTC↔RXD ATOMIC SWAP (mainnet, 2026-05-24)
+
+This is the milestone Phases 1–3 could not show: **the two legs bound by one secret,
+settled end-to-end on real chains.** Bitcoin **mainnet** Taproot HTLC ↔ Radiant
+**mainnet** RXD covenant. The preimage revealed on the BTC chain was scraped from the
+on-chain witness and used to claim the Radiant asset — atomicity demonstrated live.
+
+Shared secret: `H = sha256(p)` = `e2caff98248059dc566c7ea10a32208132fefc984d0e80880a162ef509f1d21c`
+(fresh CSPRNG; `p = f683f50e…e3d854c2`). Role: MAKER_SECRET_TAKER_LOCKS_BTC_FIRST.
+
+### Happy path — COMPLETED (verifiable on both mainnets)
+
+1. **Taker locks BTC** (P2TR HTLC, claim leaf `OP_SHA256 <H> OP_EQUALVERIFY <makerX> OP_CHECKSIG`,
+   refund leaf `<takerX> OP_CHECKSIGVERIFY <6> OP_CSV`):
+   funding tx **`30310df9375884bba726019008078731377ce18e6a75348934e769b76f28ffc3`** (vout 0, 2500 sats)
+   → HTLC addr `bc1p78e72e5gazcklekwtyy9j50cqv36mp43phcq9s9nu2xlsqxl84fq9vlh8d`.
+2. **Maker locks the RXD asset** in the 141-byte HTLC covenant (amount=100000 pin, selector
+   dispatch, hash-compare dest pin): funding **`c4882a6eaecd7abacf2cb0125f7b619f2414618da63cd4f57f44f580b248451b`**
+   (vout 0, 500000 photons carrier).
+3. **Maker claims BTC** revealing `p` in the witness:
+   BTC claim **`0e2ba620073b5bd08ddfa6d418912eff7705eaab947afdbe56040a833e8ef6e3`** (confirmed).
+4. **Taker scrapes `p`** from the on-chain BTC claim witness (`taproot.scrape_secret`,
+   matched by `sha256(p)==H` over every witness push — fetched from the network, not local)
+   and **claims the RXD asset**:
+   RXD claim **`d9f8dee91ba7a1f874b4003e44898beddc4fac00ea670920990ed4589a8f67db`** —
+   covenant scriptSig = `20<p>00` (preimage + OP_0 selector), 0.055 RXD → taker
+   `1GYMMrSqtjuybUQZZ35MwwWQa9yRM221bt`. The preimage in the RXD scriptSig is BYTE-IDENTICAL
+   to the one in the BTC claim witness: the cross-chain binding, proven.
+
+### Refund safety net (the atomicity guarantee for MUTUAL_REFUND / MAKER_STALLS)
+
+The BTC CSV-refund leaf is what makes this atomic (vs the old non-atomic SPV-oracle swap):
+- **Premature BTC refund → REJECTED `non-BIP68-final`** (mainnet mempool, consensus-enforced):
+  refund-test HTLC funding `d0c32b60ebb72b9503eaa4a82dc720b1c96451d95cf45ff03a8fa3e8594ee759`
+  (1500 sats); the v2/nSequence=6 refund tx is valid but rejected before the 6-block relative
+  timelock matures. This is the consensus gate that lets the taker reclaim BTC if the maker
+  never claims — and forbids reclaiming early.
+- **Matured BTC refund → ACCEPTED on mainnet (with the FIXED leaf):**
+  `e29e9b310baa829370780e40e8336bcc9b689f3af42a0b0a4f411e9199a48ffd`. The original
+  refund leaf (`<pk> OP_CHECKSIGVERIFY <timeout> OP_CSV OP_DROP`) was BROKEN — it ended
+  with an empty stack and every refund was rejected `Stack size must be exactly one
+  after execution`. The fixed leaf (`<timeout> OP_CSV OP_DROP <pk> OP_CHECKSIG`) was
+  funded into a fresh HTLC (`74f4a8f7ea4be98ddb7e826345f305763ae8e2c5fe4b88816e84d220a08cdac4:0`,
+  600 sats), the premature refund was again rejected `non-BIP68-final`, and after the
+  6-block CSV matured (funding block 950900 → tip 950906) the refund spent the HTLC via
+  the refund leaf (v2, nSequence=6, witness = sig + script + control-block), paying 450
+  sats to the taker. **The BTC refund path is now proven BOTH WAYS on mainnet:
+  premature → rejected, matured → accepted.**
+- The Radiant `tx.age`/CSV refund leg is byte-identical to the already-proven RXD matured
+  refund `9f008f50a00f8e5791c761cc0dd67e69d22d21dde1fbf6a36c8cd5dc07756ec9` (Phase 3).
+
+### Honest scope
+
+- **PROVEN end-to-end on mainnet:** the full cross-chain atomic swap happy path (both legs,
+  one secret, scrape-from-chain) + the BTC premature-refund consensus rejection.
+- **A bug found + corrected mid-run (recorded for honesty):** the first covenant was built with
+  `amount=50000000` but funded with only 100000 photons → `OP_OUTPUTVALUE >= 50M` made BOTH
+  claim and refund unsatisfiable; 100000 photons (0.001 RXD) stranded at
+  `7df1e7ef80c76710b11b8cbc977592b68948f51faef15651db4cd7d82e62e535:0`. Lesson: the covenant
+  `amount` pin MUST equal (or be ≤) the actual funded carrier. The v2 covenant used a matching
+  pin and claimed cleanly. **A working demo is not an audit; the amount/carrier coupling is
+  exactly the kind of thing the external audit must cover.**
+- **NOT yet shown:** the matured BTC refund broadcast (pending block maturity); a watchtower
+  (Phase 5). External audit remains the HARD GATE before any production claim.
+
+---
+
+## Phase 4b (cont.) — ALL THREE asset types swapped cross-chain on mainnet + refund-leaf bug
+
+Following the RXD swap above, the full cross-chain HTLC swap (real BTC Taproot HTLC ↔
+Radiant covenant, preimage scraped off the BTC witness and used on Radiant) was proven
+end-to-end on mainnet for **FT and NFT** as well — reusing the FT/NFT assets minted in
+Phase 3 (re-funded from their prior-claim holder UTXOs into fresh HTLC covenants).
+
+### Full cross-chain swaps — 3/3 happy paths (verifiable on both chains)
+
+| Asset | BTC HTLC fund | BTC claim (reveals p) | Radiant asset claim (uses p) |
+|---|---|---|---|
+| **RXD** | `30310df9…f28ffc3:0` | `0e2ba620…3e8ef6e3` | `d9f8dee9…9a8f67db` |
+| **FT** (1,000,000 units) | `67b205e2…3b7364bd:0` | `7f1bf6cd…4350bdc4` | `2e0a7ba9…eff79702` |
+| **NFT** (singleton) | `e7f02c40…d2dc28dc:0` | `df970ff0…de9adc6c` | `a311de73…40e0842b` |
+
+For each: the preimage `p` pushed in the Radiant claim scriptSig is **byte-identical**
+to the `p` revealed in that swap's Bitcoin claim witness (independently scraped from the
+network copy via `taproot.scrape_secret`, matched by `sha256(p)==H`). FT conservation
+(L1 ref + L2 codeScriptHash) and NFT singleton conservation held through their covenants.
+
+### BUG FOUND + FIXED: the BTC refund leaf was unspendable
+
+The matured-refund proof (the *other* half of atomicity) surfaced a real bug. The BTC
+refund leaf was built as `<refundPk> OP_CHECKSIGVERIFY <timeout> OP_CSV OP_DROP`. Tracing
+the stack with witness `[sig]`: CHECKSIGVERIFY drains the stack to empty, then OP_CSV
+(verify-don't-pop) + OP_DROP leaves it **empty** — so every refund spend is rejected by
+Bitcoin consensus:
+
+```
+mempool-script-verify-flag-failed (Stack size must be exactly one after execution)
+```
+
+This is NOT a timelock failure — the CSV maturity gate *passed* (tip 950899 > the
+6-block maturity of funding `d0c32b60…` at block 950892); the earlier `non-BIP68-final`
+rejection had only proven the *timelock* gate, never that the leaf *executes*. The fix
+(canonical BOLT-3 / Boltz ordering — timelock first, value-leaving OP_CHECKSIG last):
+
+```
+<timeout> OP_CSV OP_DROP <refundPk> OP_CHECKSIG     # ends with exactly one truthy item
+```
+
+Fixed in `src/pyrxd/btc_wallet/taproot.py::refund_leaf_script`. **This changes the
+taptree → the HTLC address**, so HTLCs built before the fix are refund-unspendable
+(claim-only) — but the swap HTLCs above were all *claimed*, so no funds were lost.
+
+**Test-gap lesson:** the taproot suite asserted address-derivation (BIP341 vectors) and
+signature crypto, but **never executed either leaf through an interpreter or broadcast** —
+so this stack-discipline bug was invisible. The matured-refund on-chain test is what
+caught it. A fresh HTLC `74f4a8f7…a08cdac4:0` was funded with the FIXED leaf to re-prove
+the matured refund on-chain.
+
+### Honest refund status (do NOT overclaim)
+- **Radiant-side refund (tx.age/CSV):** PROVEN on mainnet (`9f008f50…`, Phase 3).
+- **BTC-side premature refund:** REJECTED `non-BIP68-final` (timelock gate proven).
+- **BTC-side matured refund:** PROVEN on mainnet with the FIXED leaf —
+  `e29e9b310baa829370780e40e8336bcc9b689f3af42a0b0a4f411e9199a48ffd` (450 sats to the
+  taker after the 6-block CSV). The original leaf was broken (empty-stack); the fix
+  (`<timeout> OP_CSV OP_DROP <pk> OP_CHECKSIG`) settles. **The BTC refund path is now
+  proven both ways (premature rejected, matured accepted).** External audit remains the
+  hard gate before real value.
+
+---
+
+## ETH↔RXD atomic swap — FIRST cross-chain swap on a SECOND counter-chain (2026-05-25)
+
+The Gravity atomic-swap primitive generalized beyond Bitcoin: the **first ETH↔RXD
+cross-chain atomic swap**, Ethereum **Sepolia** testnet ↔ Radiant **mainnet**, settled
+end-to-end. Same one-secret mechanism as BTC↔RXD; the counter-chain leg is a Solidity
+HTLC instead of a Taproot tapscript. The Radiant covenant was UNCHANGED (it is
+counterparty-chain-agnostic: `sha256(preimage)==H` + `tx.age` CSV).
+
+Shared secret: `H = sha256(p)` = `0x7c5801e95fa158046651bed20abfd6dc0bc3f3fb2f62203c81e6e8fc33dc4aab`
+(fresh CSPRNG; `p = daa041bf…81be0db8`). Role: MAKER_SECRET_TAKER_LOCKS_COUNTERCHAIN_FIRST.
+
+### Happy path — COMPLETED (verifiable on both chains)
+
+1. **Taker locks ETH FIRST** — deploys + funds the native-ETH HTLC contract on Sepolia
+   (`EthHtlc.sol`: sha256-precompile hashlock, claim(preimage)/refund-after-timeout,
+   CEI+settled, EOA-only recipients): contract
+   **`0x35d07083A967c24B90873f3366BEf90dc3c46Caa`**, deploy tx
+   **`0x5f1a8ca3817937d98ec134fd00ccf93aa6d0bc7d02a235bcaaeb6f61d3c90c85`** (0.001 ETH).
+2. **Pre-RXD-lock gate PASSED** — the taker verified the on-chain contract's runtime
+   logic (immutable slots masked) == the committed artifact AND the immutables read back
+   via getters (hashlock/claimant/refundee/timeout) == the negotiated terms AND the
+   funded balance == 0.001 ETH, before the maker locked RXD.
+3. **Maker locks the RXD asset SECOND** — 141-byte RXD HTLC covenant (amount pin 5M ≤
+   carrier 5.5M), funded **`12f93d6e4fe14983cf3a8ae17ce1144cfdc835f05b7babe93054280882965059:0`**
+   (5,500,000 photons) on Radiant mainnet.
+4. **Maker claims the ETH** revealing `p` in calldata + a `Claimed(p)` event:
+   Sepolia claim **`0x30d06fe783054c98f25b4cb010e83e9b2d66ae22c069b4f9be802e24a0b2961e`**.
+5. **Taker scrapes `p`** from the Sepolia claim (calldata + event-log data, matched by
+   `sha256(candidate)==H` over every 32-byte window — the C-PARSER discipline; no offset
+   parsing) and **claims the RXD asset**:
+   RXD claim **`3704227cadcc3b4cf9ee1cd6ceb62219a9a1cc9a5cce9b7cb52bc709c91e26c8`** —
+   covenant scriptSig = `20<p>00`, 0.105 RXD → taker `16bxKGPGq8dqpwwEGmt1F3wPHrFtkXcNPs`.
+   The `p` in the RXD scriptSig is BYTE-IDENTICAL to the `p` revealed in the Sepolia ETH
+   claim — the two legs welded across Ethereum and Radiant by one secret.
+
+### What this shows / honest scope
+
+- **PROVEN end-to-end:** the cross-chain atomic-swap primitive works on a SECOND
+  counter-chain (Ethereum) with no change to the Radiant side — the same secret settles
+  an EVM contract leg and the Radiant covenant leg. ETH was easier than BTC in the
+  expected ways (sha256 precompile, `p` trivially read from calldata/event, no
+  witness-scraping), and the new surface (a fund-custodying contract) carries the
+  expected new risk.
+- **NOT yet shown:** the ETH-side matured refund on-chain (the absolute-`block.timestamp`
+  timeout + the relative-RXD-CSV ordering, with the `D` RXD-lock-deadline term, is
+  designed in the plan; a deliberate MUTUAL_REFUND is the next exercise) and the
+  reverted-but-mined `p`-leak path (covered by the pure tests, not yet on-chain).
+- **Cross-net caveat:** this was Sepolia (resettable, weak finality) ↔ Radiant mainnet.
+  Margins for any real-value ETH swap must come from MAINNET ETH finality (≥2 epochs),
+  not Sepolia timing — the Phase-4a margin model (`require_measured=True`) enforces this.
+- **HARD GATE:** external audit of `EthHtlc.sol` + the cross-chain atomicity before any
+  real-value (mainnet ETH) use. A Sepolia proof-of-mechanism is not an audit.
+
+Software: `contracts/EthHtlc.sol` (+ committed artifact), `src/pyrxd/eth_wallet/`
+(secret/locator/keys/rpc/htlc_leg), harness `eth_sepolia_swap.py`. Per-leg margin-model
+fix (ETH 12s vs RXD interval) landed first. Full suite 3208 green.
+
+### ETH refund — proven BOTH WAYS on Sepolia (the MUTUAL_REFUND safety net)
+
+A fresh HTLC (`0xE00B4d1E0597716B2380fDE648AbdC353D764d40`, 0.001 ETH, short +180s
+timeout) where the maker deliberately never claims — proving the taker reclaims:
+
+- **Premature refund → REVERTED on-chain** (status 0, contract `NotYetExpired`): tx
+  `0x95058c3210d6f97b0aa9ec30167f045f21d113fd33aa9426b4547ea88324d0bd`, mined at block
+  ts 1779694200 < timeout 1779694243. The `require(block.timestamp >= timeout)` gate
+  forbids early reclaim.
+- **Matured refund → SUCCEEDED** (status 1): tx
+  `0xe45155220ba4663e22db773fd1cbb0e6fdc4182272135dfa39fb7e17b3262c43`, mined at block
+  ts 1779694272 >= timeout; the HTLC contract balance dropped to 0 (drained to the taker
+  `refundee`). Taker-unilateral — no maker signature.
+
+So the ETH leg's atomicity safety net is proven: worst case is "both refund," never
+one-sided loss. Combined with the happy path above, the ETH↔RXD swap is proven on both
+the claim and refund branches (Sepolia), mirroring the BTC↔RXD both-ways proof.
+
+**Lesson surfaced (recorded, not yet fixed):** the leg broadcast the premature refund
+without an `eth_call` preflight, so it wasted gas on a guaranteed revert. Add a preflight
+`eth_call` (or `estimate_gas`, which reverts on a would-fail tx) before broadcasting
+claim/refund, to fail fast off-chain instead of burning gas on-chain. Not a safety bug
+(the contract correctly rejected it); a gas-efficiency + UX fix for the leg.
