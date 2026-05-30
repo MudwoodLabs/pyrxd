@@ -24,11 +24,12 @@ from pyrxd.network.bitcoin import (
     BlockstreamSource,
     MempoolSpaceSource,
     MultiSourceBtcDataSource,
+    MultiSourceBtcFundingReader,
     _check_response_size,
     _get_hex_bytes,
     _get_json,
 )
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from pyrxd.security.types import BlockHeight, Hex32, RawTx, Txid
 
 # ---------------------------------------------------------------------------
@@ -286,6 +287,31 @@ class TestMempoolSpaceSource:
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
             with pytest.raises(NetworkError, match="11 confirmations"):
                 await src.get_raw_tx(TXID, min_confirmations=100)
+
+    @pytest.mark.asyncio
+    async def test_get_raw_tx_block_height_above_tip_rejected(self):
+        """F-17: a source reporting block_height > tip is inconsistent — reject
+        rather than compute garbage confirmations from an under-reported height."""
+        src = self._src()
+        status_resp = _json_resp({"confirmed": True, "block_height": 800001})
+        tip_resp = _text_resp("800000")  # block_height > tip
+        session = MagicMock()
+        session.get = MagicMock(side_effect=[status_resp, tip_resp])
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
+            with pytest.raises(NetworkError, match="inconsistent confirmation data"):
+                await src.get_raw_tx(TXID, min_confirmations=1)
+
+    @pytest.mark.asyncio
+    async def test_get_raw_tx_block_height_below_one_rejected(self):
+        """F-17: block_height < 1 is inconsistent — reject."""
+        src = self._src()
+        status_resp = _json_resp({"confirmed": True, "block_height": 0})
+        tip_resp = _text_resp("800000")
+        session = MagicMock()
+        session.get = MagicMock(side_effect=[status_resp, tip_resp])
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
+            with pytest.raises(NetworkError, match="inconsistent confirmation data"):
+                await src.get_raw_tx(TXID, min_confirmations=1)
 
     @pytest.mark.asyncio
     async def test_get_tx_block_height_happy(self):
@@ -599,3 +625,114 @@ class TestMultiSourceBtcDataSource:
         multi = MultiSourceBtcDataSource([s1, s2], quorum=1)
         h = await multi.get_tip_height()
         assert int(h) == 800000
+
+
+# ---------------------------------------------------------------------------
+# MultiSourceBtcFundingReader (audit 2026-05-29 F-17 quorum reader)
+# ---------------------------------------------------------------------------
+
+
+def _fake_reader(*, confs=None, amount=None, confs_exc=None, amount_exc=None):
+    """A duck-typed funding reader whose confirmations / amount are scriptable."""
+    r = MagicMock()
+    r.confirmations = AsyncMock(return_value=confs, side_effect=confs_exc)
+    r.read_output_amount_sats = AsyncMock(return_value=amount, side_effect=amount_exc)
+    return r
+
+
+class TestMultiSourceBtcFundingReader:
+    TXID = "ab" * 32
+
+    def test_constructor_rejects_too_few_readers_for_quorum(self):
+        with pytest.raises(ValidationError, match="quorum"):
+            MultiSourceBtcFundingReader([_fake_reader(confs=3)], quorum=2)
+
+    def test_default_mainnet_wires_three_endpoints(self):
+        reader = MultiSourceBtcFundingReader.default_mainnet()
+        assert len(reader._readers) == 3
+        assert reader._quorum == 2
+        assert reader._dust_cap_sats == 10_000
+
+    @pytest.mark.asyncio
+    async def test_confirmations_returns_minimum_across_sources(self):
+        # All three respond with different depths -> the conservative MINIMUM is used.
+        reader = MultiSourceBtcFundingReader(
+            [_fake_reader(confs=5), _fake_reader(confs=3), _fake_reader(confs=4)], quorum=2
+        )
+        assert await reader.confirmations(self.TXID) == 3
+
+    @pytest.mark.asyncio
+    async def test_confirmations_defends_against_over_reporter(self):
+        # One source OVER-reports depth (10); the honest two say 3 -> min 3 (F-17 attack defeated).
+        reader = MultiSourceBtcFundingReader(
+            [_fake_reader(confs=10), _fake_reader(confs=3), _fake_reader(confs=3)], quorum=2
+        )
+        assert await reader.confirmations(self.TXID) == 3
+
+    @pytest.mark.asyncio
+    async def test_confirmations_above_dust_fails_closed_without_quorum(self):
+        # Only one source responds; default value_sats=None -> quorum required -> raise.
+        reader = MultiSourceBtcFundingReader(
+            [
+                _fake_reader(confs=6),
+                _fake_reader(confs_exc=NetworkError("down")),
+                _fake_reader(confs_exc=NetworkError("down")),
+            ],
+            quorum=2,
+        )
+        with pytest.raises(NetworkError, match="quorum"):
+            await reader.confirmations(self.TXID)
+
+    @pytest.mark.asyncio
+    async def test_confirmations_below_dust_accepts_single_source(self):
+        # value_sats below the cap -> a single responding source is acceptable.
+        reader = MultiSourceBtcFundingReader(
+            [
+                _fake_reader(confs=6),
+                _fake_reader(confs_exc=NetworkError("down")),
+                _fake_reader(confs_exc=NetworkError("down")),
+            ],
+            quorum=2,
+            dust_cap_sats=10_000,
+        )
+        assert await reader.confirmations(self.TXID, value_sats=1_000) == 6
+
+    @pytest.mark.asyncio
+    async def test_read_amount_above_dust_requires_quorum_agreement(self):
+        # Above-cap amount agreed by 2 of 3 -> returned; conf depth quorum'd separately.
+        reader = MultiSourceBtcFundingReader(
+            [
+                _fake_reader(confs=6, amount=50_000),
+                _fake_reader(confs=6, amount=50_000),
+                _fake_reader(confs=6, amount=50_000),
+            ],
+            quorum=2,
+        )
+        assert await reader.read_output_amount_sats(self.TXID, 0, min_confirmations=6) == 50_000
+
+    @pytest.mark.asyncio
+    async def test_read_amount_above_dust_disagreement_fails_closed(self):
+        # Above-cap amount: each source reports a DIFFERENT value -> no quorum -> raise.
+        reader = MultiSourceBtcFundingReader(
+            [
+                _fake_reader(confs=6, amount=50_000),
+                _fake_reader(confs=6, amount=49_999),
+                _fake_reader(confs=6, amount=51_000),
+            ],
+            quorum=2,
+        )
+        with pytest.raises(NetworkError, match="corroborated by only"):
+            await reader.read_output_amount_sats(self.TXID, 0, min_confirmations=6)
+
+    @pytest.mark.asyncio
+    async def test_read_amount_insufficient_confs_raises(self):
+        reader = MultiSourceBtcFundingReader(
+            [
+                _fake_reader(confs=2, amount=50_000),
+                _fake_reader(confs=2, amount=50_000),
+                _fake_reader(confs=3, amount=50_000),
+            ],
+            quorum=2,
+        )
+        with pytest.raises(InsufficientConfirmationsError):
+            await reader.read_output_amount_sats(self.TXID, 0, min_confirmations=6)

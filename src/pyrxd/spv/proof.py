@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from pyrxd.security.errors import SpvVerificationError, ValidationError
+from pyrxd.security.types import Nbits
 
 from .chain import verify_chain
 from .merkle import build_branch, compute_root, extract_merkle_root, verify_tx_in_block
@@ -18,11 +19,57 @@ from .payment import P2PKH, P2SH, P2TR, P2WPKH, verify_payment
 from .pow import hash256
 from .witness import strip_witness
 
-__all__ = ["CovenantParams", "SpvProof", "SpvProofBuilder"]
+__all__ = [
+    "CovenantParams",
+    "SpvProof",
+    "SpvProofBuilder",
+    "require_spv_sole_authority_cleared",
+]
 
 _BUILDER_TOKEN = object()  # unforgeable sentinel; SpvProof.__post_init__ checks for it
 
 _VALID_RECEIVE_TYPES = frozenset({P2PKH, P2WPKH, P2SH, P2TR})
+
+# Isolated test chains carry no real value, so the SPV primitive may run as a sole
+# release authority on them without an audit opt-in.
+_SPV_AUDIT_CLEARED_NETWORKS = frozenset({"regtest", "testnet", "testnet3", "testnet4", "signet"})
+
+
+def require_spv_sole_authority_cleared(network: str, *, audit_cleared: bool) -> None:
+    """Fail-closed gate for using the SPV primitive as the SOLE release authority.
+
+    Audit 2026-05-29 F-01 / report item #1. The Python SPV verifier MIRRORS an
+    on-chain RadiantScript covenant. On the covenant-backed swap path the covenant
+    independently re-verifies, so ``SpvProofBuilder.build()`` is a client-side check
+    and needs no gate — use the plain constructor there. But a covenant-LESS
+    retained use (bridge-in / oracle / payment-gate) that releases value on
+    ``build()`` alone makes Python the SOLE difficulty authority, and the primitive
+    does NOT yet enforce network difficulty or most-cumulative-work selection: a
+    forged minimum-difficulty header chain off a real anchor would pass for ~$0.
+
+    Such a use MUST route through this gate (e.g. via
+    :meth:`SpvProofBuilder.for_sole_authority`). Isolated test chains
+    (:data:`_SPV_AUDIT_CLEARED_NETWORKS`) are always allowed; any value-bearing
+    network RAISES unless ``audit_cleared=True`` is explicitly passed — which an
+    operator may set only after an independent external audit clears the standalone
+    SPV trust boundary AND the difficulty-floor / most-work work lands.
+
+    Raises:
+        ValidationError: for a value-bearing network without the explicit opt-in.
+    """
+    if not isinstance(network, str) or not network:
+        raise ValidationError("network must be a non-empty string")
+    if network in _SPV_AUDIT_CLEARED_NETWORKS:
+        return
+    if audit_cleared is not True:
+        raise ValidationError(
+            f"network {network!r} is value-bearing and the SPV primitive is NOT cleared to be the "
+            "SOLE release authority on it: it does not yet enforce network difficulty / most-"
+            "cumulative-work (audit F-01), so a forged min-difficulty chain off a real anchor would "
+            "pass. Run the primitive ONLY behind an on-chain covenant that pins nBits, or pass "
+            "audit_cleared=True after an independent external audit clears the standalone SPV "
+            "trust boundary (report item #1 AUDIT GATE)."
+        )
 
 
 def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
@@ -32,17 +79,29 @@ def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
     first = buf[pos]
     if first < 0xFD:
         return first, pos + 1
+    # Audit 2026-05-29 F-15: reject non-canonical (overlong) CompactSize — these
+    # are rejected by Bitcoin consensus at deserialization and read as a single
+    # byte by the covenant; accepting them diverges from both.
     if first == 0xFD:
         if pos + 3 > len(buf):
             raise SpvVerificationError("truncated 2-byte varint")
-        return int.from_bytes(buf[pos + 1 : pos + 3], "little"), pos + 3
+        value = int.from_bytes(buf[pos + 1 : pos + 3], "little")
+        if value < 0xFD:
+            raise SpvVerificationError(f"non-canonical varint: 0xFD prefix encodes {value} (< 0xFD)")
+        return value, pos + 3
     if first == 0xFE:
         if pos + 5 > len(buf):
             raise SpvVerificationError("truncated 4-byte varint")
-        return int.from_bytes(buf[pos + 1 : pos + 5], "little"), pos + 5
+        value = int.from_bytes(buf[pos + 1 : pos + 5], "little")
+        if value <= 0xFFFF:
+            raise SpvVerificationError(f"non-canonical varint: 0xFE prefix encodes {value} (<= 0xFFFF)")
+        return value, pos + 5
     if pos + 9 > len(buf):
         raise SpvVerificationError("truncated 8-byte varint")
-    return int.from_bytes(buf[pos + 1 : pos + 9], "little"), pos + 9
+    value = int.from_bytes(buf[pos + 1 : pos + 9], "little")
+    if value <= 0xFFFFFFFF:
+        raise SpvVerificationError(f"non-canonical varint: 0xFF prefix encodes {value} (<= 0xFFFFFFFF)")
+    return value, pos + 9
 
 
 def _output_offsets(stripped_tx: bytes) -> set[int]:
@@ -86,6 +145,25 @@ def _output_offsets(stripped_tx: bytes) -> set[int]:
 _COVENANT_MAX_INPUT_SCRIPTSIG_LEN = 127
 
 
+def _first_input_is_null_outpoint(stripped_tx: bytes) -> bool:
+    """Return True if the tx's first input spends the null outpoint.
+
+    A coinbase tx's sole input has prevout txid == 32 zero bytes and
+    vout == 0xFFFFFFFF. AUDIT 2026-05-29 F-04: the ``pos == 0`` coinbase guard
+    was bypassable via pos aliasing (``pos = k * 2**depth`` reproduces the
+    coinbase branch). This structural check rejects the coinbase regardless of
+    the claimed ``pos``. Non-raising: returns False on any parse problem and
+    lets the canonical structural walk (``_output_offsets``) report the error.
+    """
+    try:
+        _, p = _read_varint(stripped_tx, 4)  # skip version, read n_in -> p at input[0]
+    except SpvVerificationError:
+        return False
+    if p + 36 > len(stripped_tx):
+        return False
+    return stripped_tx[p : p + 32] == b"\x00" * 32 and stripped_tx[p + 32 : p + 36] == b"\xff\xff\xff\xff"
+
+
 def _max_input_scriptsig_len(stripped_tx: bytes) -> int:
     """Return the largest input scriptSig length in a witness-stripped tx."""
     pos = 4  # skip version
@@ -116,6 +194,13 @@ class CovenantParams:
     chain_anchor: bytes  # 32-byte LE prevHash of h1 (audit 05-F-3)
     anchor_height: int  # block height of the anchor block
     merkle_depth: int  # expected Merkle branch depth (audit 05-F-8)
+    # Audit 2026-05-29 F-01/F-03: the wire nBits the covenant pins. When set,
+    # build() enforces every header's nBits matches (mirrors the covenant's
+    # nBits ∈ {expectedNBits, expectedNBitsNext} check). None disables the check
+    # — UNSAFE for any sole-authority (covenant-less) use; the deprecated swap is
+    # protected only by the on-chain covenant's own pin.
+    expected_nbits: bytes | None = None  # 4-byte wire nBits, or None
+    expected_nbits_next: bytes | None = None  # optional 2nd accepted value (retarget window)
 
     def __post_init__(self) -> None:
         if self.btc_receive_type not in _VALID_RECEIVE_TYPES:
@@ -141,6 +226,29 @@ class CovenantParams:
             raise ValidationError("btc_receive_hash must be bytes")
         if len(self.btc_receive_hash) != expected_hash_len:
             raise ValidationError(f"{self.btc_receive_type} receive_hash must be {expected_hash_len} bytes")
+        # Audit 2026-05-29 F-01/F-03/F-27: validate the optional nBits pin. Run it
+        # through the Nbits trust-boundary type so a malformed/easier-than-0x1d
+        # value is rejected here (the covenant tolerates exponent up to 0x20; we
+        # cap at 0x1d so Python never honors a target the covenant accepts but
+        # that is easier than well-formed difficulty-1).
+        for label, nb in (("expected_nbits", self.expected_nbits), ("expected_nbits_next", self.expected_nbits_next)):
+            if nb is None:
+                continue
+            if not isinstance(nb, (bytes, bytearray)):
+                raise ValidationError(f"{label} must be bytes")
+            if len(nb) != 4:
+                raise ValidationError(f"{label} must be 4 bytes (wire nBits)")
+            Nbits(bytes(nb))  # raises ValidationError on malformed nBits
+        if self.expected_nbits_next is not None and self.expected_nbits is None:
+            raise ValidationError("expected_nbits_next set without expected_nbits")
+        # Audit 2026-05-29 F-24: store immutable copies so a caller mutating a
+        # passed-in bytearray after construction cannot alter the frozen params.
+        object.__setattr__(self, "btc_receive_hash", bytes(self.btc_receive_hash))
+        object.__setattr__(self, "chain_anchor", bytes(self.chain_anchor))
+        if self.expected_nbits is not None:
+            object.__setattr__(self, "expected_nbits", bytes(self.expected_nbits))
+        if self.expected_nbits_next is not None:
+            object.__setattr__(self, "expected_nbits_next", bytes(self.expected_nbits_next))
 
 
 @dataclass(frozen=True)
@@ -184,6 +292,26 @@ class SpvProofBuilder:
     def __init__(self, covenant_params: CovenantParams) -> None:
         self._params = covenant_params
 
+    @classmethod
+    def for_sole_authority(
+        cls,
+        covenant_params: CovenantParams,
+        *,
+        network: str,
+        audit_cleared: bool = False,
+    ) -> SpvProofBuilder:
+        """Construct a builder for a covenant-LESS sole-authority use, gated.
+
+        Audit 2026-05-29 F-01 / report item #1. Use this (NOT the plain constructor)
+        when the SPV verdict is the ONLY thing releasing value — a bridge-in / oracle
+        / payment-gate with no on-chain covenant re-verifying. It runs
+        :func:`require_spv_sole_authority_cleared`, which fails closed on a
+        value-bearing network unless ``audit_cleared=True``. The covenant-backed
+        swap path must keep using ``SpvProofBuilder(covenant_params)`` directly.
+        """
+        require_spv_sole_authority_cleared(network, audit_cleared=audit_cleared)
+        return cls(covenant_params)
+
     def build(
         self,
         txid_be: str,
@@ -192,6 +320,7 @@ class SpvProofBuilder:
         merkle_be: list[str],
         pos: int,
         output_offset: int,
+        tx_block_height: int | None = None,
     ) -> SpvProof:
         """Verify every SPV-proof component and return an ``SpvProof``.
 
@@ -201,6 +330,17 @@ class SpvProofBuilder:
             3. PoW + chain link for every header (anchor-bound).
             4. Merkle inclusion (with depth binding + coinbase guard).
             5. Payment output correct (hash + type + value threshold).
+
+        Args:
+            tx_block_height: Optional Bitcoin block height of the tx. When provided
+                (audit 2026-05-29 F-18), the Merkle root is pinned to the SPECIFIC
+                header at index ``tx_block_height - anchor_height - 1`` in the
+                anchor-chained sequence, instead of accepting a root that matches
+                ANY fetched header. Production ``finalize()`` always supplies it;
+                this binds the Merkle proof's block to the resolved height so a
+                malicious data source cannot route a proof for one block against an
+                unrelated header it also supplied. ``None`` keeps the weaker
+                flexible-anchor search (tx may land in any of h1..hN).
 
         Raises:
             SpvVerificationError: on any failure. Never returns a partial proof.
@@ -228,6 +368,13 @@ class SpvProofBuilder:
         if computed_txid_le != claimed_txid_le:
             raise SpvVerificationError("hash256(raw_tx) does not match txid")
 
+        # Audit 2026-05-29 F-04: structural coinbase reject, independent of pos.
+        # The pos==0 guard alone was bypassable (pos = k*2**depth aliases the
+        # coinbase branch); a coinbase is identifiable by its null-outpoint first
+        # input regardless of the claimed position.
+        if _first_input_is_null_outpoint(stripped):
+            raise SpvVerificationError("coinbase tx (null prevout) cannot be used as payment proof")
+
         # Rigorous audit R2 (2026-05-24): the any-wallet covenant rejects a funding
         # tx whose any input scriptSig is >= 128 B (its single-byte signed length
         # read decodes negative -> the covenant's `ssl >= 0` guard ScriptFails).
@@ -249,25 +396,48 @@ class SpvProofBuilder:
                 "or legacy P2PKH input, not P2SH/multisig, or the covenant will reject the proof."
             )
 
-        # Step 3: parse and verify headers + chain anchor.
+        # Step 3: parse and verify headers + chain anchor + committed nBits pin.
         headers = [bytes.fromhex(h) for h in headers_hex]
-        verify_chain(headers, chain_anchor=params.chain_anchor)
+        verify_chain(
+            headers,
+            chain_anchor=params.chain_anchor,
+            expected_nbits=params.expected_nbits,
+            expected_nbits_next=params.expected_nbits_next,
+        )
 
         # Step 4: build branch and verify Merkle inclusion.
         branch = build_branch(merkle_be, pos)
+        computed_root = compute_root(txid_be, branch)
 
-        # Find which header in the chain contains the tx (flexible anchor:
-        # tx may land anywhere in h1..hN).
+        # Audit 2026-05-29 F-18: bind the Merkle proof to the SPECIFIC height-
+        # identified header rather than accepting a root that matches ANY fetched
+        # header. verify_chain has already proven headers[0].prevHash == chain_anchor
+        # and the contiguous linkage, so header index i is block anchor_height+1+i.
         matching_header: bytes | None = None
-        for header in headers:
-            root = extract_merkle_root(header)
-            computed = compute_root(txid_be, branch)
-            if computed == root:
-                matching_header = header
-                break
-
-        if matching_header is None:
-            raise SpvVerificationError("tx Merkle root does not match any provided header")
+        if tx_block_height is not None:
+            expected_index = tx_block_height - params.anchor_height - 1
+            if not (0 <= expected_index < len(headers)):
+                raise SpvVerificationError(
+                    f"tx_block_height {tx_block_height} maps to header index {expected_index}, "
+                    f"out of range for the {len(headers)} anchored headers "
+                    f"(anchor_height {params.anchor_height})"
+                )
+            matching_header = headers[expected_index]
+            if computed_root != extract_merkle_root(matching_header):
+                raise SpvVerificationError(
+                    f"Merkle root does not match the header at the claimed block height {tx_block_height} "
+                    "(merkle proof not bound to the resolved block)"
+                )
+        else:
+            # Flexible-anchor fallback (no height supplied): find which header in the
+            # chain contains the tx. WEAKER — accepts a root matching any fetched
+            # header. Production finalize() always supplies tx_block_height (F-18).
+            for header in headers:
+                if computed_root == extract_merkle_root(header):
+                    matching_header = header
+                    break
+            if matching_header is None:
+                raise SpvVerificationError("tx Merkle root does not match any provided header")
 
         # Run the full inclusion check (also re-asserts coinbase guard, depth
         # binding, and tx<->txid hash match).

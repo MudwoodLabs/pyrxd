@@ -20,18 +20,30 @@ def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
     first = data[pos]
     if first < 0xFD:
         return first, pos + 1
+    # Audit 2026-05-29 F-15: reject non-canonical (overlong) CompactSize. Bitcoin
+    # consensus rejects these at deserialization, and the covenant reads counts
+    # as a single byte — accepting an overlong encoding here diverges from both.
     if first == 0xFD:
         if pos + 3 > len(data):
             raise ValidationError("truncated 2-byte varint")
-        return int.from_bytes(data[pos + 1 : pos + 3], "little"), pos + 3
+        value = int.from_bytes(data[pos + 1 : pos + 3], "little")
+        if value < 0xFD:
+            raise ValidationError(f"non-canonical varint: 0xFD prefix encodes {value} (< 0xFD)")
+        return value, pos + 3
     if first == 0xFE:
         if pos + 5 > len(data):
             raise ValidationError("truncated 4-byte varint")
-        return int.from_bytes(data[pos + 1 : pos + 5], "little"), pos + 5
+        value = int.from_bytes(data[pos + 1 : pos + 5], "little")
+        if value <= 0xFFFF:
+            raise ValidationError(f"non-canonical varint: 0xFE prefix encodes {value} (<= 0xFFFF)")
+        return value, pos + 5
     # 0xFF
     if pos + 9 > len(data):
         raise ValidationError("truncated 8-byte varint")
-    return int.from_bytes(data[pos + 1 : pos + 9], "little"), pos + 9
+    value = int.from_bytes(data[pos + 1 : pos + 9], "little")
+    if value <= 0xFFFFFFFF:
+        raise ValidationError(f"non-canonical varint: 0xFF prefix encodes {value} (<= 0xFFFFFFFF)")
+    return value, pos + 9
 
 
 def _encode_varint(n: int) -> bytes:

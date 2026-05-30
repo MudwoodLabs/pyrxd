@@ -67,7 +67,7 @@ def build_raw_tx(satoshis: int, hash20: bytes) -> tuple[bytes, bytes]:
     raw_tx = (
         b"\x01\x00\x00\x00"  # version
         + b"\x01"  # 1 input
-        + b"\x00" * 32  # prev txid
+        + b"\xaa" * 32  # prev txid (non-null; the null outpoint is coinbase-only, audit F-04)
         + b"\xff\xff\xff\xff"  # prev vout
         + b"\x00"  # empty scriptSig
         + b"\xff\xff\xff\xff"  # sequence

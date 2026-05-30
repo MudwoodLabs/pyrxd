@@ -80,6 +80,18 @@ def verify_payment(
     # Parse 8-byte LE value.
     value = struct.unpack_from("<Q", raw_tx, output_offset)[0]
 
+    # Audit 2026-05-29 F-25: Python reads the value UNSIGNED; the covenant reads
+    # it as a signed CScriptNum (OP_BIN2NUM). A value with bit 63 set decodes
+    # NEGATIVE in the covenant and would diverge. No real confirmed tx can set
+    # bit 63 (Bitcoin caps total supply ~4392x below 2**63), so this is the safe
+    # direction, but reject it for byte-for-byte parity and to refuse a value the
+    # covenant would treat as negative.
+    if value >= (1 << 63):
+        raise SpvVerificationError(
+            f"output value {value} has bit 63 set (>= 2**63); decodes negative as a signed "
+            "CScriptNum in the covenant and exceeds any valid Bitcoin amount"
+        )
+
     # Audit 02-F-5: value must be > 0 and >= min_satoshis.
     if value == 0:
         raise SpvVerificationError("output value is 0")

@@ -22,6 +22,7 @@ from pyrxd.spv import (
     compute_root,
     extract_merkle_root,
     hash256,
+    require_spv_sole_authority_cleared,
     strip_witness,
     verify_chain,
     verify_header_pow,
@@ -968,7 +969,7 @@ class TestSpvProofBuilder:
         raw_tx = (
             b"\x01\x00\x00\x00"  # version
             + b"\x01"  # 1 input
-            + b"\x00" * 32
+            + b"\xaa" * 32  # prev txid (non-null; null outpoint = coinbase, audit F-04)
             + b"\xff\xff\xff\xff"
             + b"\x00"
             + b"\xff\xff\xff\xff"
@@ -1153,3 +1154,273 @@ class TestSpvProofBuilder:
                 pos=pos,
                 output_offset=output_offset,
             )
+
+    # ----- Audit 2026-05-29 F-04/F-05 — coinbase guard bypass --------------
+
+    def test_builder_rejects_coinbase_pos_alias(self) -> None:
+        """F-04/F-05: pos = k*2**depth (e.g. pos=2 at depth 1) reproduces the
+        coinbase's all-left branch and previously slipped past the pos==0 guard
+        (verified bypass: build() returned a valid SpvProof for pos=2). It must
+        now be rejected as out-of-range."""
+        hash20 = b"\x77" * 20
+        (txid_be_hex, raw_tx_hex, headers_hex, merkle_be, _pos, output_offset, anchor) = (
+            self._build_synthetic_proof_inputs(hash20, satoshis=5000)
+        )
+        params = CovenantParams(
+            btc_receive_hash=hash20,
+            btc_receive_type=P2PKH,
+            btc_satoshis=1000,
+            chain_anchor=anchor,
+            anchor_height=100_000,
+            merkle_depth=1,
+        )
+        builder = SpvProofBuilder(params)
+        with pytest.raises((SpvVerificationError, ValidationError), match="beyond branch depth"):
+            builder.build(
+                txid_be=txid_be_hex,
+                raw_tx_hex=raw_tx_hex,
+                headers_hex=headers_hex,
+                merkle_be=merkle_be,
+                pos=2,  # depth 1 -> aliases coinbase (pos 0)
+                output_offset=output_offset,
+            )
+
+    def test_builder_rejects_structural_coinbase(self) -> None:
+        """F-04: a tx whose first input spends the null outpoint is a coinbase
+        and is rejected regardless of the claimed pos."""
+        payment_output = _p2pkh_output(5000, b"\x77" * 20)
+        raw_tx = (
+            b"\x01\x00\x00\x00"
+            + b"\x01"
+            + b"\x00" * 32  # null prevout txid
+            + b"\xff\xff\xff\xff"  # null prevout vout -> coinbase signature
+            + b"\x00"
+            + b"\xff\xff\xff\xff"
+            + b"\x01"
+            + payment_output
+            + b"\x00\x00\x00\x00"
+        )
+        txid_be = hash256(raw_tx)[::-1].hex()
+        builder = SpvProofBuilder(self._params())
+        with pytest.raises(SpvVerificationError, match="coinbase"):
+            builder.build(
+                txid_be=txid_be,
+                raw_tx_hex=raw_tx.hex(),
+                headers_hex=[BLOCK_840000],
+                merkle_be=["ab" * 32],
+                pos=1,  # non-zero pos: only the structural check catches this
+                output_offset=4 + 1 + 41 + 1,
+            )
+
+    # ----- Audit 2026-05-29 F-01/F-03 — committed nBits enforcement --------
+
+    def test_builder_enforces_committed_nbits(self) -> None:
+        """F-01/F-03: when CovenantParams pins expected_nbits, build() accepts a
+        matching header and rejects a header at any other (well-formed) nBits —
+        mirroring the on-chain covenant's pin so Python no longer accepts a proof
+        the covenant would reject."""
+        hash20 = b"\x77" * 20
+        (txid_be_hex, raw_tx_hex, headers_hex, merkle_be, pos, output_offset, anchor) = (
+            self._build_synthetic_proof_inputs(hash20, satoshis=5000)
+        )
+        # The synthetic header's nBits is ff ff 7f 1d.
+        match_params = CovenantParams(
+            btc_receive_hash=hash20,
+            btc_receive_type=P2PKH,
+            btc_satoshis=1000,
+            chain_anchor=anchor,
+            anchor_height=100_000,
+            merkle_depth=1,
+            expected_nbits=b"\xff\xff\x7f\x1d",
+        )
+        proof = SpvProofBuilder(match_params).build(
+            txid_be=txid_be_hex,
+            raw_tx_hex=raw_tx_hex,
+            headers_hex=headers_hex,
+            merkle_be=merkle_be,
+            pos=pos,
+            output_offset=output_offset,
+        )
+        assert proof.covenant_params.expected_nbits == b"\xff\xff\x7f\x1d"
+
+        # A different, well-formed committed nBits must reject the same header.
+        mismatch_params = CovenantParams(
+            btc_receive_hash=hash20,
+            btc_receive_type=P2PKH,
+            btc_satoshis=1000,
+            chain_anchor=anchor,
+            anchor_height=100_000,
+            merkle_depth=1,
+            expected_nbits=b"\xff\xff\x00\x1d",  # valid Nbits, != the header's
+        )
+        with pytest.raises(SpvVerificationError, match="does not match the committed"):
+            SpvProofBuilder(mismatch_params).build(
+                txid_be=txid_be_hex,
+                raw_tx_hex=raw_tx_hex,
+                headers_hex=headers_hex,
+                merkle_be=merkle_be,
+                pos=pos,
+                output_offset=output_offset,
+            )
+
+    # ----- Audit 2026-05-29 F-18 — merkle proof bound to height-identified header -----
+
+    def test_builder_binds_merkle_to_height_identified_header(self) -> None:
+        """F-18: with tx_block_height supplied, the Merkle root is pinned to the
+        header at index (height - anchor_height - 1) — not any matching header. The
+        correct height verifies; a height mapping outside the fetched headers rejects."""
+        hash20 = b"\x77" * 20
+        (txid_be_hex, raw_tx_hex, headers_hex, merkle_be, pos, output_offset, anchor) = (
+            self._build_synthetic_proof_inputs(hash20, satoshis=5000)
+        )
+        params = CovenantParams(
+            btc_receive_hash=hash20,
+            btc_receive_type=P2PKH,
+            btc_satoshis=1000,
+            chain_anchor=anchor,
+            anchor_height=100_000,
+            merkle_depth=1,
+        )
+        builder = SpvProofBuilder(params)
+        # Correct height: the single fetched header is block anchor_height+1 = 100_001.
+        proof = builder.build(
+            txid_be=txid_be_hex,
+            raw_tx_hex=raw_tx_hex,
+            headers_hex=headers_hex,
+            merkle_be=merkle_be,
+            pos=pos,
+            output_offset=output_offset,
+            tx_block_height=100_001,
+        )
+        assert proof.txid == txid_be_hex
+        # Height mapping to header index 1 — out of range (only 1 header fetched).
+        with pytest.raises(SpvVerificationError, match="out of range"):
+            builder.build(
+                txid_be=txid_be_hex,
+                raw_tx_hex=raw_tx_hex,
+                headers_hex=headers_hex,
+                merkle_be=merkle_be,
+                pos=pos,
+                output_offset=output_offset,
+                tx_block_height=100_002,
+            )
+        # Height at/below the anchor maps to a negative index — also rejected.
+        with pytest.raises(SpvVerificationError, match="out of range"):
+            builder.build(
+                txid_be=txid_be_hex,
+                raw_tx_hex=raw_tx_hex,
+                headers_hex=headers_hex,
+                merkle_be=merkle_be,
+                pos=pos,
+                output_offset=output_offset,
+                tx_block_height=100_000,  # == anchor_height -> index -1
+            )
+
+
+def _valid_cp(**over: object) -> CovenantParams:
+    base = dict(
+        btc_receive_hash=b"\x77" * 20,
+        btc_receive_type=P2PKH,
+        btc_satoshis=1000,
+        chain_anchor=b"\x99" * 32,
+        anchor_height=1,
+        merkle_depth=1,
+    )
+    base.update(over)
+    return CovenantParams(**base)  # type: ignore[arg-type]
+
+
+class TestAudit20260529Fixes:
+    """Regression tests for the 2026-05-29 SPV-primitive red-team fixes."""
+
+    # F-01 / item #1: sole-authority audit gate.
+    def test_sole_authority_gate_allows_test_chains(self) -> None:
+        for net in ("regtest", "testnet", "testnet3", "signet"):
+            require_spv_sole_authority_cleared(net, audit_cleared=False)  # no raise
+
+    def test_sole_authority_gate_blocks_mainnet_without_optin(self) -> None:
+        with pytest.raises(ValidationError, match="SOLE release authority"):
+            require_spv_sole_authority_cleared("mainnet", audit_cleared=False)
+
+    def test_sole_authority_gate_allows_mainnet_with_optin(self) -> None:
+        require_spv_sole_authority_cleared("mainnet", audit_cleared=True)  # no raise
+
+    def test_for_sole_authority_factory_gated(self) -> None:
+        params = _valid_cp()
+        with pytest.raises(ValidationError, match="SOLE release authority"):
+            SpvProofBuilder.for_sole_authority(params, network="mainnet")
+        # explicit opt-in returns a usable builder
+        assert isinstance(
+            SpvProofBuilder.for_sole_authority(params, network="mainnet", audit_cleared=True), SpvProofBuilder
+        )
+        # test chain returns a builder without opt-in
+        assert isinstance(SpvProofBuilder.for_sole_authority(params, network="regtest"), SpvProofBuilder)
+
+    # F-05: build_branch / verify_tx_in_block reject pos beyond the branch depth.
+    def test_build_branch_rejects_pos_beyond_depth(self) -> None:
+        with pytest.raises(ValidationError, match="beyond branch depth"):
+            build_branch(["aa" * 32], pos=2)  # depth 1, pos 2 = 0b10
+
+    def test_build_branch_accepts_max_in_range_pos(self) -> None:
+        # depth 2 -> valid pos are 0..3; pos=3 must still be accepted.
+        assert len(build_branch(["aa" * 32, "bb" * 32], pos=3)) == 66
+
+    def test_verify_tx_in_block_rejects_pos_beyond_depth(self) -> None:
+        raw_tx = b"\xaa" * 80
+        branch = b"\x00" + b"\xab" * 32  # 1 level
+        header = b"\x00" * 80
+        with pytest.raises(SpvVerificationError, match="beyond branch depth"):
+            verify_tx_in_block(raw_tx, "a" * 64, branch, pos=2, header=header)
+
+    # F-01/F-03: verify_chain enforces the committed nBits pin.
+    def test_verify_chain_accepts_matching_nbits(self) -> None:
+        header = bytes.fromhex(BLOCK_840000)
+        hashes = verify_chain([header], expected_nbits=bytes.fromhex("19420317"))
+        assert len(hashes) == 1
+
+    def test_verify_chain_rejects_mismatched_nbits(self) -> None:
+        header = bytes.fromhex(BLOCK_840000)  # real nBits 19420317
+        with pytest.raises(SpvVerificationError, match="does not match the committed"):
+            verify_chain([header], expected_nbits=bytes.fromhex("ffff001d"))
+
+    # F-25: verify_payment rejects an output value with bit 63 set.
+    def test_verify_payment_rejects_bit63_value(self) -> None:
+        value = (1 << 63).to_bytes(8, "little")
+        script = b"\x76\xa9\x14" + b"\x77" * 20 + b"\x88\xac"
+        raw = value + bytes([len(script)]) + script
+        with pytest.raises(SpvVerificationError, match="bit 63"):
+            verify_payment(raw, output_offset=0, expected_hash=b"\x77" * 20, output_type=P2PKH, min_satoshis=1)
+
+    # F-27 / F-24: CovenantParams nBits validation + bytearray immutability.
+    def test_covenant_params_rejects_zero_mantissa_nbits(self) -> None:
+        with pytest.raises(ValidationError):
+            _valid_cp(expected_nbits=b"\x00\x00\x00\x1d")  # mantissa 0 -> Nbits rejects
+
+    def test_covenant_params_rejects_oversized_exponent_nbits(self) -> None:
+        with pytest.raises(ValidationError):
+            _valid_cp(expected_nbits=b"\xff\xff\x00\x1e")  # exponent 0x1e > 0x1d
+
+    def test_covenant_params_rejects_wrong_length_nbits(self) -> None:
+        with pytest.raises(ValidationError, match="expected_nbits"):
+            _valid_cp(expected_nbits=b"\x00\x00\x00")
+
+    def test_covenant_params_copies_bytearray(self) -> None:
+        ba = bytearray(b"\x77" * 20)
+        params = _valid_cp(btc_receive_hash=ba)
+        ba[0] = 0x00  # mutate the original after construction
+        assert params.btc_receive_hash == b"\x77" * 20
+        assert isinstance(params.btc_receive_hash, bytes)
+        assert not isinstance(params.btc_receive_hash, bytearray)
+
+    # F-15: both varint parsers reject non-canonical (overlong) CompactSize.
+    def test_proof_read_varint_rejects_non_canonical(self) -> None:
+        from pyrxd.spv.proof import _read_varint as proof_read_varint
+
+        with pytest.raises(SpvVerificationError, match="non-canonical"):
+            proof_read_varint(bytes([0xFD, 0x01, 0x00]), 0)  # 0xFD encodes 1 (< 0xFD)
+
+    def test_witness_read_varint_rejects_non_canonical(self) -> None:
+        from pyrxd.spv.witness import _read_varint as witness_read_varint
+
+        with pytest.raises(ValidationError, match="non-canonical"):
+            witness_read_varint(bytes([0xFE, 0x01, 0x00, 0x00, 0x00]), 0)  # 0xFE encodes 1

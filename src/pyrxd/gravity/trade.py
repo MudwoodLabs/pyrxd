@@ -397,6 +397,22 @@ class GravityTrade:
         stripped = strip_witness(bytes(raw_tx))
         output_offset = _find_output_zero_offset(stripped)
 
+        # Audit 2026-05-29 F-03 (verification follow-up): fail CLOSED — the offer
+        # MUST carry the committed nBits. A None here would silently disable the
+        # Python difficulty pin (verify_chain falls back to PoW-only), re-opening
+        # the Direction-A gap: Python would accept a wrong-difficulty header the
+        # covenant rejects, and the taker strands BTC on the no-refund path.
+        # build_gravity_offer always populates this; a None means the offer was
+        # hand-built or deserialized without restoring the field — refuse rather
+        # than verify with the pin off.
+        if offer.expected_nbits is None:
+            raise ValidationError(
+                "offer.expected_nbits is None — the committed BTC difficulty pin is missing, so the "
+                "Python SPV verifier cannot mirror the covenant's nBits check. Rebuild the offer via "
+                "build_gravity_offer (which always sets it) or restore expected_nbits/expected_nbits_next "
+                "when deserializing a persisted offer. finalize() refuses to run with the pin disabled."
+            )
+
         # Build CovenantParams from the offer fields (these are the values the
         # Maker committed to in the covenant; the proof must match them exactly).
         covenant_params = CovenantParams(
@@ -406,6 +422,11 @@ class GravityTrade:
             chain_anchor=offer.chain_anchor,
             anchor_height=offer.anchor_height,
             merkle_depth=offer.merkle_depth,
+            # Audit 2026-05-29 F-03: mirror the covenant's nBits pin in the Python
+            # verifier so build() rejects (before broadcasting the finalize tx) a
+            # header chain whose difficulty the covenant would reject on-chain.
+            expected_nbits=offer.expected_nbits,
+            expected_nbits_next=offer.expected_nbits_next,
         )
 
         # Run full SPV verification — this is the mandatory gate.
@@ -417,6 +438,10 @@ class GravityTrade:
             merkle_be=merkle_hashes,
             pos=pos,
             output_offset=output_offset,
+            # Audit 2026-05-29 F-18: pin the Merkle proof to the header at this
+            # resolved height (the proof + headers were fetched for this block),
+            # not just "any" fetched header.
+            tx_block_height=int(height),
         )
 
         # Build and broadcast the finalize tx.

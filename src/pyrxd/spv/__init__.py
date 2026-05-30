@@ -19,7 +19,12 @@ from .merkle import (
 )
 from .payment import P2PKH, P2SH, P2TR, P2WPKH, verify_payment
 from .pow import hash256, verify_header_pow
-from .proof import CovenantParams, SpvProof, SpvProofBuilder
+from .proof import (
+    CovenantParams,
+    SpvProof,
+    SpvProofBuilder,
+    require_spv_sole_authority_cleared,
+)
 from .witness import strip_witness
 
 __all__ = [
@@ -34,6 +39,7 @@ __all__ = [
     "compute_root",
     "extract_merkle_root",
     "hash256",
+    "require_spv_sole_authority_cleared",
     "strip_witness",
     "verify_chain",
     "verify_header_pow",

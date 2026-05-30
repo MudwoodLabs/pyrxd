@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 from abc import ABC, abstractmethod
+from collections import Counter
 from typing import Any
 from urllib.parse import quote, urljoin
 
@@ -257,6 +258,15 @@ class MempoolSpaceSource(BtcDataSource):
         if min_confirmations > 0:
             # To check confirmations we need the tip height.
             tip = await self.get_tip_height()
+            # Audit 2026-05-29 F-17: floor block_height to [1, tip]. A source that
+            # under-reports block_height inflates confs (an unburied/reorgable tx
+            # looks final); a height above tip is inconsistent. Reject either rather
+            # than trust the arithmetic (mirrors MempoolSpaceFundingReader.confirmations).
+            if int(block_height) < 1 or int(block_height) > int(tip):
+                raise NetworkError(
+                    f"inconsistent confirmation data: block_height={block_height}, tip={int(tip)} "
+                    "(expected 1 <= block_height <= tip)"
+                )
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
                 raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
@@ -429,6 +439,12 @@ class BlockstreamSource(BtcDataSource):
 
         if min_confirmations > 0:
             tip = await self.get_tip_height()
+            # Audit 2026-05-29 F-17: floor block_height to [1, tip] (see above).
+            if int(block_height) < 1 or int(block_height) > int(tip):
+                raise NetworkError(
+                    f"inconsistent confirmation data: block_height={block_height}, tip={int(tip)} "
+                    "(expected 1 <= block_height <= tip)"
+                )
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
                 raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
@@ -1035,3 +1051,114 @@ class MempoolSpaceFundingReader:
 
     async def close(self) -> None:
         await self._http.close()
+
+
+class MultiSourceBtcFundingReader:
+    """Quorum ``BtcFundingReader`` over N independent Esplora-style providers.
+
+    Audit 2026-05-29 F-17: mitigates the single-source confirmation-depth SPOF — a
+    lone compromised/MITM'd source that OVER-reports depth (under-reports
+    ``block_height``) can make an unburied/reorgable tx look final and trigger a
+    premature release.
+
+    Operator policy (decided 2026-05-29):
+      * ``quorum`` = 2 of 3 providers (majority): tolerates one source down or lying.
+      * ``dust_cap_sats`` = 10_000: at/below the cap a single successful read is
+        accepted (the documented dust posture); ABOVE it the quorum is REQUIRED
+        (fail-closed).
+      * :meth:`confirmations` returns the MINIMUM depth across responding sources — a
+        tx is only as buried as the most-pessimistic source, defeating an over-reporter.
+      * :meth:`read_output_amount_sats` requires >= ``quorum`` sources to agree on the
+        EXACT amount (a deterministic value; disagreement fails closed).
+
+    Satisfies the same duck-typed reader Protocol as :class:`MempoolSpaceFundingReader`,
+    so it is a drop-in for the reorg gate / funding read-back on above-dust swaps. A
+    failing source is simply dropped from the quorum (never fails the whole read).
+    """
+
+    #: Default independent mainnet Esplora endpoints (distinct operators).
+    DEFAULT_MAINNET_ENDPOINTS = (
+        "https://mempool.space/api",
+        "https://blockstream.info/api",
+        "https://mempool.emzy.de/api",
+    )
+
+    def __init__(self, readers: list, *, quorum: int = 2, dust_cap_sats: int = 10_000) -> None:
+        readers = list(readers)
+        if quorum < 1:
+            raise ValidationError("quorum must be >= 1")
+        if len(readers) < quorum:
+            raise ValidationError(f"need at least quorum={quorum} readers, got {len(readers)}")
+        if dust_cap_sats < 0:
+            raise ValidationError("dust_cap_sats must be >= 0")
+        self._readers = readers
+        self._quorum = quorum
+        self._dust_cap_sats = dust_cap_sats
+
+    @classmethod
+    def default_mainnet(cls, *, quorum: int = 2, dust_cap_sats: int = 10_000) -> MultiSourceBtcFundingReader:
+        """Wire the three default independent mainnet Esplora endpoints (2-of-3)."""
+        readers = [MempoolSpaceFundingReader(base_url=u) for u in cls.DEFAULT_MAINNET_ENDPOINTS]
+        return cls(readers, quorum=quorum, dust_cap_sats=dust_cap_sats)
+
+    async def _gather(self, coro_fn) -> list:
+        """Run ``coro_fn`` on every reader; return only the successful (non-Exception)
+        results. A failing source is dropped — it never fails the whole read."""
+        results = await asyncio.gather(*(coro_fn(r) for r in self._readers), return_exceptions=True)
+        return [x for x in results if not isinstance(x, Exception)]
+
+    async def confirmations(self, txid: str, *, value_sats: int | None = None) -> int:
+        """Quorum'd confirmation depth, returning the conservative MINIMUM.
+
+        ``value_sats`` selects the dust gate: ``None`` (the default, used by the
+        reorg gate) or any value above ``dust_cap_sats`` REQUIRES the quorum and
+        fails closed otherwise; a value at/below the cap accepts a single source.
+        """
+        oks = [int(c) for c in await self._gather(lambda r: r.confirmations(txid))]
+        require_quorum = value_sats is None or int(value_sats) > self._dust_cap_sats
+        if require_quorum and len(oks) < self._quorum:
+            raise NetworkError(
+                f"confirmation depth corroborated by only {len(oks)} source(s); above-dust reads "
+                f"require quorum={self._quorum} of {len(self._readers)} (F-17). Fail-closed."
+            )
+        if not oks:
+            return 0  # below-dust, no source responded -> 0 (the gate's >= N check fails closed)
+        return min(oks)  # a tx is only as buried as the most-pessimistic source
+
+    async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
+        """Quorum'd output-amount read-back. Above the dust cap the exact amount must
+        be corroborated by >= ``quorum`` sources; the conf depth is quorum'd separately."""
+        # Read amounts WITHOUT each reader's own conf gate (min_confirmations=0); a
+        # single quorum'd conf check is applied below.
+        amounts = [
+            int(a) for a in await self._gather(lambda r: r.read_output_amount_sats(txid, vout, min_confirmations=0))
+        ]
+        if not amounts:
+            raise NetworkError("no source returned the output amount (F-17 fail-closed)")
+        agreed, count = Counter(amounts).most_common(1)[0]
+        if agreed > self._dust_cap_sats and count < self._quorum:
+            raise NetworkError(
+                f"above-dust output amount {agreed} sats corroborated by only {count} source(s); "
+                f"need quorum={self._quorum} (sources disagree). Fail-closed."
+            )
+        confs = await self.confirmations(txid, value_sats=agreed)
+        if confs < min_confirmations:
+            raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
+        return agreed
+
+    async def txid_of(self, raw_tx: bytes) -> str:
+        from ..btc_wallet.taproot import btc_txid_from_raw
+
+        return btc_txid_from_raw(bytes(raw_tx))
+
+    async def list_address_utxos(self, address: str) -> list[dict]:
+        """UTXO discovery (not a value gate): return the first source that responds."""
+        for r in self._readers:
+            try:
+                return await r.list_address_utxos(address)
+            except NetworkError:
+                continue
+        raise NetworkError("no source returned address utxos")
+
+    async def close(self) -> None:
+        await asyncio.gather(*(r.close() for r in self._readers if hasattr(r, "close")), return_exceptions=True)

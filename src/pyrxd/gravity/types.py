@@ -57,6 +57,15 @@ class GravityOffer:
     claimed_redeem_hex: str  # MakerClaimed full locking script hex
     expected_code_hash_hex: str  # hash256(P2SH_scriptPubKey(claimed_redeem)); enforced in build_claim_tx
 
+    # Audit 2026-05-29 F-02/F-03: the wire nBits the covenant pins. Logically a
+    # Bitcoin-side field, but placed last to satisfy dataclass default ordering
+    # (the fields above have no defaults). ``build_gravity_offer`` always
+    # populates these; ``finalize()`` threads them into ``CovenantParams`` so the
+    # Python SPV verifier mirrors the covenant's nBits pin and refuses a proof the
+    # covenant would reject (Direction-A fund-stranding on the no-refund path).
+    expected_nbits: bytes | None = None  # 4-byte wire nBits, or None (legacy offers)
+    expected_nbits_next: bytes | None = None  # optional 2nd accepted value (retarget window)
+
     def __post_init__(self) -> None:
         if self.btc_receive_type not in ("p2pkh", "p2wpkh", "p2sh", "p2tr"):
             raise ValidationError(f"unknown btc_receive_type: {self.btc_receive_type!r}")
@@ -78,6 +87,17 @@ class GravityOffer:
             )
         if self.photons_offered <= 0:
             raise ValidationError("photons_offered must be > 0")
+        for label, nb in (("expected_nbits", self.expected_nbits), ("expected_nbits_next", self.expected_nbits_next)):
+            if nb is None:
+                continue
+            if len(nb) != 4:
+                raise ValidationError(f"{label} must be 4 bytes (wire nBits); got {len(nb)}")
+            # Audit 2026-05-29 F-27: validate well-formedness on the data carrier
+            # too (not only at build/verify) so a hand-built offer can't carry a
+            # malformed / easier-than-0x1d nBits the covenant would reject.
+            from pyrxd.security.types import Nbits
+
+            Nbits(bytes(nb))
 
     def validate_deadline_from_now(self, accept_short_deadline: bool = False) -> None:
         """Check that ``claim_deadline`` is at least ``MIN_DEADLINE_FROM_NOW_HOURS`` from now.

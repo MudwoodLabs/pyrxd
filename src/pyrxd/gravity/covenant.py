@@ -306,6 +306,25 @@ def validate_claim_deadline(
 # ---------------------------------------------------------------------------
 
 
+def _nbits_to_target(nb: bytes) -> int:
+    """Decode 4-byte wire nBits (LE) to its integer PoW target.
+
+    ``target = mantissa * 256**(exponent - 3)`` (audit 2026-05-29 F-02): a bigger
+    exponent/mantissa means a bigger target means an EASIER block. Used to compare
+    a committed difficulty against a floor by decoded target, not by exponent class.
+    """
+    exponent = nb[3]
+    mantissa = (nb[2] << 16) | (nb[1] << 8) | nb[0]
+    if exponent <= 3:
+        return mantissa >> (8 * (3 - exponent))
+    return mantissa << (8 * (exponent - 3))
+
+
+# Difficulty-1 (ffff001d) target — the easiest well-formed target; the default
+# reject_low_difficulty floor when no anchor-sourced min_difficulty_nbits is given.
+_DIFFICULTY_1_TARGET = _nbits_to_target(b"\xff\xff\x00\x1d")
+
+
 def build_gravity_offer(
     maker_pkh: bytes,  # 20-byte Radiant PKH of the Maker
     maker_pk: bytes,  # 33-byte compressed pubkey of the Maker
@@ -325,6 +344,8 @@ def build_gravity_offer(
     covenant_artifact_name: str = "maker_covenant_flat_12x20_sentinel_all",
     offer_artifact_name: str = "maker_offer",
     used_btc_receive_hashes: set[bytes] | None = None,
+    reject_low_difficulty: bool = False,
+    min_difficulty_nbits: bytes | None = None,
 ) -> Any:
     """
     Build a :class:`~pyrxd.gravity.types.GravityOffer` with real covenant
@@ -348,6 +369,19 @@ def build_gravity_offer(
     :param used_btc_receive_hashes: Optional set of ``btc_receive_hash`` values
         already committed to other LIVE offers by this Maker. If the new
         ``btc_receive_hash`` is in this set, the call is rejected.
+    :param reject_low_difficulty: Enforce a difficulty FLOOR on the committed
+        nBits (audit 2026-05-29 F-02). The covenant only pins ``nBits == committed``,
+        so a min-difficulty commit (e.g. the ``ffff001d`` footgun) lets an attacker
+        mine a fake SPV header chain off the real anchor for ~$0. With this True the
+        committed target must be strictly harder than the floor. **Covenant-less
+        retained uses (bridge-in / oracle / gate) MUST set this True** — and SHOULD
+        also pass ``min_difficulty_nbits``, because the default floor (difficulty-1)
+        only blocks the difficulty-1 class, not a target merely easier than mainnet.
+        Defaults False to preserve regtest/test behavior.
+    :param min_difficulty_nbits: Optional 4-byte wire nBits defining the difficulty
+        floor used when ``reject_low_difficulty`` is True. Source this from the live
+        block header at ``anchor_height`` for a real network-difficulty floor; if
+        omitted, the floor defaults to difficulty-1 (a coarse footgun guard only).
 
     .. warning::
         **CROSS-OFFER REPLAY (audit 2026-05-24 C-ECON-1).** A Bitcoin payment
@@ -422,6 +456,47 @@ def build_gravity_offer(
     elif len(expected_nbits_next) != 4:
         raise ValidationError(f"expected_nbits_next must be 4 bytes; got {len(expected_nbits_next)}")
 
+    # Audit 2026-05-29 F-02/F-27 (+ verification follow-up): the covenant pins
+    # "nBits == committed", so the COMMITTED value is the entire difficulty
+    # defense. Always validate well-formedness (Nbits rejects malformed / exponent
+    # > 0x1d / sign bit / zero mantissa). When reject_low_difficulty is set, also
+    # enforce a difficulty FLOOR by decoding to the integer PoW target and
+    # rejecting any target at/above the floor (an easier-or-equal target). The
+    # floor is the DECODED target of ``min_difficulty_nbits`` when supplied
+    # (the verification pass showed an exponent-only check let exp-0x1c low-mantissa
+    # targets — ~2x difficulty-1, still laptop-mineable — slip through), otherwise
+    # it defaults to the difficulty-1 target (ffff001d), which blocks only the
+    # difficulty-1-class footgun. ffff001d is the genesis/regtest min difficulty
+    # and the default in older examples; a min-difficulty commit lets an attacker
+    # mine a fake header chain off the real anchor for ~$0.
+    # NOTE: reject_low_difficulty defaults to False to preserve regtest/test
+    # behavior. Any covenant-LESS retained use (bridge-in/oracle/gate) MUST pass
+    # reject_low_difficulty=True AND min_difficulty_nbits sourced from the live
+    # anchor-height network header — the default (difficulty-1) floor is only a
+    # footgun guard, not a meaningful network-difficulty enforcement (audit F-01
+    # remains: this is a build-time guard, not a difficulty oracle).
+    from pyrxd.security.types import Nbits as _Nbits
+
+    if min_difficulty_nbits is not None and len(min_difficulty_nbits) != 4:
+        raise ValidationError(f"min_difficulty_nbits must be 4 bytes (wire nBits); got {len(min_difficulty_nbits)}")
+    _floor_target = (
+        _nbits_to_target(bytes(min_difficulty_nbits)) if min_difficulty_nbits is not None else _DIFFICULTY_1_TARGET
+    )
+    for _label, _nb in (("expected_nbits", expected_nbits), ("expected_nbits_next", expected_nbits_next)):
+        _Nbits(bytes(_nb))  # well-formedness: rejects exponent > 0x1d, sign bit, zero mantissa
+        if reject_low_difficulty and _nbits_to_target(bytes(_nb)) >= _floor_target:
+            _floor_desc = (
+                f"the supplied min_difficulty_nbits ({bytes(min_difficulty_nbits).hex()})"
+                if min_difficulty_nbits is not None
+                else "difficulty-1 (ffff001d)"
+            )
+            raise ValidationError(
+                f"{_label} {bytes(_nb).hex()} decodes to a target at or above the floor ({_floor_desc}): "
+                "a target this easy lets an attacker mine a fake SPV header chain off the real anchor "
+                "cheaply. Source min_difficulty_nbits from the live anchor block header, or omit "
+                "reject_low_difficulty for regtest."
+            )
+
     # 1. Substitute MakerClaimed code-section params (state params excluded —
     #    takerRadiantPkh and claimDeadline are in the state section, not the
     #    code section, so the code hash is the same for all takers).
@@ -486,6 +561,11 @@ def build_gravity_offer(
         offer_redeem_hex=offer_redeem.hex(),
         claimed_redeem_hex=claimed_redeem.hex(),
         expected_code_hash_hex=expected_code_hash.hex(),
+        # Audit 2026-05-29 F-03: carry the committed nBits so finalize() can
+        # thread it into CovenantParams and the Python SPV verifier mirrors the
+        # covenant's pin (no longer silently dropped between layers).
+        expected_nbits=bytes(expected_nbits),
+        expected_nbits_next=bytes(expected_nbits_next),
     )
 
 
@@ -508,6 +588,8 @@ def build_gravity_offer_derived(
     accept_short_deadline: bool = False,
     covenant_artifact_name: str = "maker_covenant_flat_12x20_sentinel_all",
     offer_artifact_name: str = "maker_offer",
+    reject_low_difficulty: bool = False,
+    min_difficulty_nbits: bytes | None = None,
 ) -> tuple[Any, Any]:
     """Build an offer whose BTC receive address is DERIVED per-offer (replay-safe).
 
@@ -549,5 +631,7 @@ def build_gravity_offer_derived(
         accept_short_deadline=accept_short_deadline,
         covenant_artifact_name=covenant_artifact_name,
         offer_artifact_name=offer_artifact_name,
+        reject_low_difficulty=reject_low_difficulty,
+        min_difficulty_nbits=min_difficulty_nbits,
     )
     return offer, recv

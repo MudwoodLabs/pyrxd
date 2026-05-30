@@ -65,6 +65,11 @@ def make_offer(**kwargs) -> GravityOffer:
         photons_offered=10_000_000,
         offer_redeem_hex=OFFER_REDEEM.hex(),
         claimed_redeem_hex=CLAIMED_REDEEM.hex(),
+        # Audit 2026-05-29 F-03: finalize() fails closed if this is None, so a
+        # realistic offer must carry the committed nBits (build_gravity_offer
+        # always sets it). Value is arbitrary here — finalize tests mock the builder.
+        expected_nbits=bytes.fromhex("ffff7f1d"),
+        expected_nbits_next=bytes.fromhex("ffff7f1d"),
     )
     defaults.update(kwargs)
     if "expected_code_hash_hex" not in defaults:
@@ -494,6 +499,34 @@ class TestGravityTradeFinalize:
         rxd.broadcast.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_finalize_fails_closed_without_expected_nbits(self):
+        """Audit 2026-05-29 F-03 (verification follow-up): finalize() must REFUSE an
+        offer with expected_nbits=None rather than silently verify with the Python
+        difficulty pin disabled (which would re-open the Direction-A fund-stranding
+        gap). Guards against an offer hand-built or deserialized without the field."""
+        trade, rxd, btc = self._make_trade()
+        offer = make_offer(expected_nbits=None, expected_nbits_next=None)
+
+        stripped_tx = _make_stripped_p2wpkh_tx()
+        btc.get_raw_tx.return_value = RawTx(stripped_tx)
+        btc.get_merkle_proof.return_value = (["cd" * 32], 1)
+        btc.get_header_chain.return_value = [b"\x00" * 80]
+
+        with patch("pyrxd.gravity.trade.strip_witness", return_value=stripped_tx):
+            with pytest.raises(ValidationError, match="expected_nbits is None"):
+                await trade.finalize(
+                    btc_txid=self.VALID_BTC_TXID,
+                    offer=offer,
+                    claimed_txid="cc" * 32,
+                    claimed_vout=0,
+                    claimed_photons=9_000_000,
+                    taker_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+                    fee_sats=1000,
+                    btc_tx_height=101,
+                )
+        rxd.broadcast.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_finalize_tx_height_before_anchor_raises(self):
         trade, _rxd, btc = self._make_trade()
         offer = make_offer(anchor_height=200)
@@ -876,7 +909,7 @@ def _build_p2pkh_spv_proof(hash160: bytes, satoshis: int):
     raw_tx = (
         b"\x01\x00\x00\x00"  # version 1
         + b"\x01"  # 1 input
-        + b"\x00" * 32  # prev txid (any)
+        + b"\xaa" * 32  # prev txid (non-null; null outpoint = coinbase, audit F-04)
         + b"\xff\xff\xff\xff"  # prev vout
         + b"\x00"  # empty scriptSig
         + b"\xff\xff\xff\xff"  # sequence

@@ -234,29 +234,41 @@ class TestStripWitness:
             strip_witness(data)
 
     def test_varint_fd_encoding(self):
+        from pyrxd.security.errors import ValidationError
         from pyrxd.spv.witness import _read_varint
 
-        # 0xFD prefix encodes 2-byte little-endian value
-        data = bytes([0xFD, 0x01, 0x00])  # encodes 1
+        # 0xFD prefix encodes a CANONICAL 2-byte little-endian value (>= 0xFD).
+        data = bytes([0xFD, 0xFD, 0x00])  # encodes 253
         val, pos = _read_varint(data, 0)
-        assert val == 1
+        assert val == 253
         assert pos == 3
+        # Audit 2026-05-29 F-15: a non-canonical 0xFD encoding (value < 0xFD) is
+        # rejected — Bitcoin consensus forbids overlong CompactSize and the
+        # covenant reads counts as a single byte.
+        with pytest.raises(ValidationError, match="non-canonical"):
+            _read_varint(bytes([0xFD, 0x01, 0x00]), 0)  # would encode 1
 
     def test_varint_fe_encoding(self):
+        from pyrxd.security.errors import ValidationError
         from pyrxd.spv.witness import _read_varint
 
-        data = bytes([0xFE, 0x02, 0x00, 0x00, 0x00])  # encodes 2
+        data = bytes([0xFE, 0x00, 0x00, 0x01, 0x00])  # canonical: encodes 0x10000
         val, pos = _read_varint(data, 0)
-        assert val == 2
+        assert val == 0x10000
         assert pos == 5
+        with pytest.raises(ValidationError, match="non-canonical"):
+            _read_varint(bytes([0xFE, 0x02, 0x00, 0x00, 0x00]), 0)  # would encode 2 (<= 0xFFFF)
 
     def test_varint_ff_encoding(self):
+        from pyrxd.security.errors import ValidationError
         from pyrxd.spv.witness import _read_varint
 
-        data = bytes([0xFF, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])  # encodes 3
+        data = bytes([0xFF, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00])  # canonical: 0x100000000
         val, pos = _read_varint(data, 0)
-        assert val == 3
+        assert val == 0x100000000
         assert pos == 9
+        with pytest.raises(ValidationError, match="non-canonical"):
+            _read_varint(bytes([0xFF, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]), 0)  # encodes 3
 
     def test_varint_truncated_fd_raises(self):
         from pyrxd.security.errors import ValidationError

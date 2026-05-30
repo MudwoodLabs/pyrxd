@@ -324,6 +324,11 @@ async def mode_claim() -> None:
         offer_redeem_hex=s["offer_redeem_hex"],
         claimed_redeem_hex=s["claimed_redeem_hex"],
         expected_code_hash_hex=s["expected_code_hash_hex"],
+        # Audit 2026-05-29 F-03: CLAIM mode feeds finalize(), which fails closed
+        # without the committed nBits. Restore it (dropping it silently disabled
+        # the Python SPV difficulty pin).
+        expected_nbits=bytes.fromhex(s["expected_nbits"]),
+        expected_nbits_next=bytes.fromhex(s.get("expected_nbits_next") or s["expected_nbits"]),
     )
     _ok(
         f"Loaded offer — photons: {offer.photons_offered}, deadline: "
