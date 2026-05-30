@@ -225,10 +225,20 @@ frozen dataclass and can only be constructed via `build()` — direct
 dataclass instantiation is rejected at runtime. This is the proof type
 you hand to downstream covenant builders.
 
+> **Building your own SPV verifier?** A valid Merkle proof against a
+> header proves nothing if the header itself isn't trustworthy. Before
+> you rely on any of this, read
+> [SPV verification pitfalls](spv-verification-pitfalls.md) — the
+> non-obvious failures (missing difficulty floor, spoofable confirmation
+> depth, the 64-byte and coinbase-position forgeries) that survive a
+> naive "we check Merkle proofs now."
+
 ---
 
 ## References
 
+- [SPV verification pitfalls](spv-verification-pitfalls.md) — the security
+  failure modes this recipe's defenses exist to block
 - [`pyrxd.spv` API reference](../api/spv.rst)
 - [Gravity (cross-chain atomic swap concept)](../concepts/gravity.md)
 - Source: [`src/pyrxd/spv/merkle.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/src/pyrxd/spv/merkle.py),
