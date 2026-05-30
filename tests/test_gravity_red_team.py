@@ -86,6 +86,7 @@ def _valid_offer_kwargs() -> dict[str, Any]:
         merkle_depth=12,
         claim_deadline=_future_deadline(48),
         photons_offered=10_000_000,
+        reject_low_difficulty=False,  # regtest offer uses difficulty-1 ffff001d (F-02 opt-out)
     )
 
 
@@ -130,6 +131,7 @@ def _make_real_offer(priv: PrivateKeyMaterial, **overrides: Any) -> GravityOffer
         merkle_depth=12,
         claim_deadline=_future_deadline(48),
         photons_offered=500_000,
+        reject_low_difficulty=False,  # regtest offer uses difficulty-1 ffff001d (F-02 opt-out)
     )
     defaults.update(overrides)
     return build_gravity_offer(**defaults)
@@ -1327,6 +1329,7 @@ class TestTakerIndependentClaimedRedeem:
                 merkle_depth=12,
                 claim_deadline=_future_deadline(48),
                 photons_offered=500_000,
+                reject_low_difficulty=False,  # regtest ffff001d (F-02 opt-out)
             )
 
         o1 = _build(t1)
@@ -1356,6 +1359,7 @@ class TestTakerIndependentClaimedRedeem:
                 merkle_depth=12,
                 claim_deadline=deadline,
                 photons_offered=500_000,
+                reject_low_difficulty=False,  # regtest ffff001d (F-02 opt-out)
             )
 
         o1 = _build(_future_deadline(48))
@@ -1437,6 +1441,7 @@ class TestAuditFindings2026:
                 merkle_depth=12,
                 claim_deadline=int(time.time()) + 90_000,
                 photons_offered=1_000_000,
+                reject_low_difficulty=False,  # reach the type check, not the F-02 floor (regtest ffff001d)
             )
 
     def test_spv_proof_direct_construction_rejected(self):
@@ -1731,6 +1736,7 @@ class TestPerOfferReceiveDerivation:
             claim_deadline=_future_deadline(48),
             photons_offered=10_000_000,
             covenant_artifact_name="maker_covenant_6x12_p2wpkh",
+            reject_low_difficulty=False,  # regtest ffff001d (F-02 opt-out)
         )
 
     def test_distinct_indices_yield_distinct_covenants(self):
