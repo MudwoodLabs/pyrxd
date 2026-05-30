@@ -377,6 +377,11 @@ class BitcoinTaprootLeg:
         """Scrape ``p`` from the maker's claim tx witness (pure; by sha256==H)."""
         return t.scrape_secret(claim_tx_bytes, hashlock)
 
+    def locked_amount(self, locator) -> int:
+        """The funded amount the coordinator binds to ``terms.value_amount`` — sats for BTC
+        (the chain-neutral seam; an ETH leg returns wei)."""
+        return locator.amount_sats
+
     # -- reorg gate: confirmation depth of the maker's claim (async) --------
     async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:
         """Confirmation depth of the maker's BTC claim tx (the reorg gate's input).

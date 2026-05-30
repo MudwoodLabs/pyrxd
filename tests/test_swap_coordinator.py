@@ -21,12 +21,14 @@ import asyncio
 import dataclasses
 import hashlib
 import json
+import math
 import os
 import pickle
 
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_coordinator import (
     ESTIMATED_DEFAULT_MARGIN_BLOCKS,
@@ -48,6 +50,13 @@ from pyrxd.gravity.swap_state import (
 )
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import SecretBytes
+
+
+def _verdict(confs: int, policy: MarginPolicy) -> CounterClaimFinality:
+    """The PoW counter-claim verdict the coordinator builds inline from a depth read."""
+    depth = policy.btc_claim_reorg_depth.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
+    return CounterClaimFinality.from_btc_depth(confs, depth)
+
 
 # ---------------------------------------------------------------------------
 # Mock chain legs + indexer + seen-store (duck-typed fakes; no Protocol)
@@ -116,6 +125,9 @@ class FakeBtcLeg:
     async def refund(self, locator: t.BtcHtlcLocator, timeout: t.Timelock) -> None:
         self.calls.append("refund")
         self.refunded = True
+
+    def locked_amount(self, locator) -> int:
+        return locator.amount_sats
 
     # Sync: pure byte-parse of the claim tx witness (no chain access).
     def scrape_secret(self, claim_tx_bytes: bytes, hashlock: bytes) -> bytes:
@@ -308,7 +320,7 @@ async def test_taker_funds_btc_rejects_amount_mismatch():
     over_leg = FakeBtcLeg(fund_amount_delta=50_000)
     seen = FakeSeenStore()
     coord = _coordinator(terms=terms, btc_leg=over_leg, seen_store=seen)
-    with pytest.raises(ValidationError, match="funded BTC amount"):
+    with pytest.raises(ValidationError, match="funded counter-leg amount"):
         await coord.taker_funds_btc(terms)
     assert coord.record.state is SwapState.NEGOTIATED  # never advanced
     # H IS consumed here, NOT a regression: reserve() commits PRE-broadcast, and the
@@ -321,7 +333,7 @@ async def test_taker_funds_btc_rejects_amount_mismatch():
     # Underfund: also rejected (self-correcting in practice, but fail-closed here).
     under_leg = FakeBtcLeg(fund_amount_delta=-1)
     coord2 = _coordinator(terms=terms, btc_leg=under_leg)
-    with pytest.raises(ValidationError, match="funded BTC amount"):
+    with pytest.raises(ValidationError, match="funded counter-leg amount"):
         await coord2.taker_funds_btc(terms)
 
     # Exact match still funds and advances.
@@ -1000,7 +1012,7 @@ def test_assess_claim_finality_safe():
     # Deep BTC claim (10 >= 6) + roomy window: locked@1000, t_rxd=72 -> opens@1072,
     # now=1000 -> 72 blocks left >= rxd_burial 6 -> SAFE.
     out = assess_claim_finality(
-        btc_claim_confirmations=10,
+        counter_claim_finality=_verdict(10, _policy()),
         now_rxd_height=1000,
         asset_locked_at_height=1000,
         t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
@@ -1013,7 +1025,7 @@ def test_assess_claim_finality_wait():
     # Shallow BTC claim (1 < 6) but ample window: after waiting the remaining BTC
     # depth there is still room to bury -> WAIT.
     out = assess_claim_finality(
-        btc_claim_confirmations=1,
+        counter_claim_finality=_verdict(1, _policy()),
         now_rxd_height=1000,
         asset_locked_at_height=1000,
         t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
@@ -1026,7 +1038,7 @@ def test_assess_claim_finality_squeezed_shallow_closing_window():
     # Shallow claim AND window closing: locked@1000, t_rxd=10 -> opens@1010, now=1006
     # -> 4 blocks left; after waiting btc depth there's no room to bury -> SQUEEZED.
     out = assess_claim_finality(
-        btc_claim_confirmations=1,
+        counter_claim_finality=_verdict(1, _policy()),
         now_rxd_height=1006,
         asset_locked_at_height=1000,
         t_rxd=t.Timelock(10, t.TimeUnit.BLOCKS),
@@ -1039,7 +1051,7 @@ def test_assess_claim_finality_squeezed_deep_but_no_room():
     # Deep BTC claim but the window can't even fit our own burial -> SQUEEZED (don't
     # claim into a window that closes before we bury).
     out = assess_claim_finality(
-        btc_claim_confirmations=10,
+        counter_claim_finality=_verdict(10, _policy()),
         now_rxd_height=1008,
         asset_locked_at_height=1000,
         t_rxd=t.Timelock(10, t.TimeUnit.BLOCKS),
@@ -1049,20 +1061,39 @@ def test_assess_claim_finality_squeezed_deep_but_no_room():
 
 
 def test_assess_claim_finality_fail_closed_on_bad_inputs():
-    for bad in (dict(btc_claim_confirmations=-1), dict(now_rxd_height=-1), dict(asset_locked_at_height=-1)):
+    policy = _policy()
+    # Negative confirmations now fail-closed at the verdict adapter, not the gate.
+    with pytest.raises(ValidationError):
+        CounterClaimFinality.from_btc_depth(-1, 6)
+    # Bad Radiant heights still fail-closed at the gate.
+    for bad in (dict(now_rxd_height=-1), dict(asset_locked_at_height=-1)):
         kw = dict(
-            btc_claim_confirmations=10,
+            counter_claim_finality=_verdict(10, policy),
             now_rxd_height=1000,
             asset_locked_at_height=1000,
             t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
-            policy=_policy(),
+            policy=policy,
         )
         kw.update(bad)
         with pytest.raises(ValidationError):
             assess_claim_finality(**kw)
+    # Wrong t_rxd type.
     with pytest.raises(ValidationError):
         assess_claim_finality(
-            btc_claim_confirmations=10, now_rxd_height=1000, asset_locked_at_height=1000, t_rxd=72, policy=_policy()
+            counter_claim_finality=_verdict(10, policy),
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=72,
+            policy=policy,
+        )  # type: ignore[arg-type]
+    # A non-verdict input is rejected (no silent fail-open).
+    with pytest.raises(ValidationError):
+        assess_claim_finality(
+            counter_claim_finality=10,
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=policy,
         )  # type: ignore[arg-type]
 
 
@@ -1072,7 +1103,7 @@ def test_assess_claim_finality_rejects_now_below_lock_f013():
     # an inflated refund_opens_at.
     with pytest.raises(ValidationError, match="impossible on an honest chain"):
         assess_claim_finality(
-            btc_claim_confirmations=10,
+            counter_claim_finality=_verdict(10, _policy()),
             now_rxd_height=999,
             asset_locked_at_height=1000,
             t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
@@ -1086,7 +1117,6 @@ def test_assess_claim_finality_f007_rxd_interval_scaling():
     # depth consumes 12 RXD blocks, not 6. A 14-RXD-block window looks safe-to-WAIT under
     # the old 1:1 conflation but is actually SQUEEZED.
     base = dict(
-        btc_claim_confirmations=1,  # shallow
         now_rxd_height=1006,
         asset_locked_at_height=1000,
         t_rxd=t.Timelock(20, t.TimeUnit.BLOCKS),  # opens@1020 -> 14 blocks left
@@ -1102,10 +1132,79 @@ def test_assess_claim_finality_f007_rxd_interval_scaling():
             rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
         )
 
+    # shallow counter-claim (1 < depth 6).
     # ratio 2: 14 - ceil(6 * 600/300)=12 -> 2 < burial 6 -> SQUEEZED (correct)
-    assert assess_claim_finality(**base, policy=_p(300.0)) is ClaimFinality.SQUEEZED
+    p2 = _p(300.0)
+    assert assess_claim_finality(counter_claim_finality=_verdict(1, p2), **base, policy=p2) is ClaimFinality.SQUEEZED
     # ratio 1 (same interval) reproduces the old 1:1 behaviour: 14 - 6 = 8 >= 6 -> WAIT
-    assert assess_claim_finality(**base, policy=_p(600.0)) is ClaimFinality.WAIT
+    p1 = _p(600.0)
+    assert assess_claim_finality(counter_claim_finality=_verdict(1, p1), **base, policy=p1) is ClaimFinality.WAIT
+
+
+def test_assess_claim_finality_parity_sweep_byte_equivalent():
+    """Auditor-grade regression: the verdict refactor reproduces the OLD int-based
+    SAFE/WAIT/SQUEEZED decision byte-for-byte. Sweeps confs in 0..2*depth across several
+    (now, t_rxd, policy) configs and asserts old-formula == new-verdict for every cell.
+    """
+
+    def _old(confs, now, locked, t_rxd, policy):
+        bi, rbi = policy.block_interval_s, policy.rxd_block_interval_s
+        rxd_blocks = t_rxd.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
+        rxd_burial = policy.rxd_claim_burial.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
+        depth = policy.btc_claim_reorg_depth.normalize_to(t.TimeUnit.BLOCKS, block_interval_s=bi).value
+        blocks_left = (locked + rxd_blocks) - now
+        if confs >= depth:
+            return ClaimFinality.SAFE if blocks_left >= rxd_burial else ClaimFinality.SQUEEZED
+        depth_in_rxd = math.ceil(depth * bi / rbi)
+        remaining = depth - confs
+        if blocks_left - depth_in_rxd >= rxd_burial and remaining > 0:
+            return ClaimFinality.WAIT
+        return ClaimFinality.SQUEEZED
+
+    policies = [
+        _policy(),
+        MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            rxd_block_interval_s=300.0,  # ratio 2 exercises the F-007 scaling
+            btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+            rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        ),
+    ]
+    locked = 1000
+    for policy in policies:
+        depth = policy.btc_claim_reorg_depth.normalize_to(
+            t.TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
+        ).value
+        for t_rxd_blocks in (10, 20, 36, 72):
+            t_rxd = t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS)
+            for now in range(locked, locked + t_rxd_blocks + 1):
+                for confs in range(0, 2 * depth + 1):
+                    expected = _old(confs, now, locked, t_rxd, policy)
+                    got = assess_claim_finality(
+                        counter_claim_finality=CounterClaimFinality.from_btc_depth(confs, depth),
+                        now_rxd_height=now,
+                        asset_locked_at_height=locked,
+                        t_rxd=t_rxd,
+                        policy=policy,
+                    )
+                    assert got is expected, (confs, now, t_rxd_blocks, policy.rxd_block_interval_s, got, expected)
+
+
+def test_assess_claim_finality_eth_stall_squeezes():
+    # RF-06: a COUNTER_CHAIN_NOT_FINALIZING verdict (ETH non-finality stall) SQUEEZES even
+    # in a roomy window where a FINAL verdict would be SAFE.
+    policy = _policy()
+    roomy = dict(
+        now_rxd_height=1000,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+        policy=policy,
+    )
+    assert assess_claim_finality(counter_claim_finality=_verdict(10, policy), **roomy) is ClaimFinality.SAFE
+    stalled = CounterClaimFinality(state=CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING)
+    assert assess_claim_finality(counter_claim_finality=stalled, **roomy) is ClaimFinality.SQUEEZED
 
 
 async def test_gate_safe_claims_asset():
@@ -1328,4 +1427,83 @@ def test_measure_margin_inherits_reorg_depth_floor():
             btc_claim_reorg_depth_blocks=1,
             rxd_claim_burial_blocks=3,
             rxd_block_interval_s=300.0,
+        )
+
+
+# --------------------------------------------------------------------------- C2a: §9 ETH reserve
+
+
+def _eth_finality_policy(*, window_s=768):
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+        btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        eth_finalization_window_s=window_s,
+    )
+
+
+def _eth_not_final():
+    # ETH verdict: no depth -> remaining_positive True, reserve from eth_finalization_window_s
+    return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+
+def test_eth_not_yet_final_uses_finalization_window():
+    policy = _eth_finality_policy(window_s=768)  # 768s / 300 = ceil 3 RXD blocks
+    # roomy: opens@1072, now=1000 -> 72 left; 72 - 3 >= 6 -> WAIT
+    assert (
+        assess_claim_finality(
+            counter_claim_finality=_eth_not_final(),
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=policy,
+        )
+        is ClaimFinality.WAIT
+    )
+    # closing: opens@1010, now=1006 -> 4 left; 4 - 3 = 1 < 6 -> SQUEEZED
+    assert (
+        assess_claim_finality(
+            counter_claim_finality=_eth_not_final(),
+            now_rxd_height=1006,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(10, t.TimeUnit.BLOCKS),
+            policy=policy,
+        )
+        is ClaimFinality.SQUEEZED
+    )
+
+
+def test_eth_verdict_without_finalization_window_fail_closed():
+    policy = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+        btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+    )  # eth_finalization_window_s defaults None
+    with pytest.raises(ValidationError, match="eth_finalization_window_s"):
+        assess_claim_finality(
+            counter_claim_finality=_eth_not_final(),
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=policy,
+        )
+
+
+def test_dual_source_reorg_depth_divergence_fail_closed():
+    # §9 #2: a PoW verdict whose required_depth disagrees with the policy depth is refused.
+    policy = _policy()
+    diverging = CounterClaimFinality.from_btc_depth(1, 100)  # required_depth 100 != policy depth
+    with pytest.raises(ValidationError, match="divergent reserve"):
+        assess_claim_finality(
+            counter_claim_finality=diverging,
+            now_rxd_height=1000,
+            asset_locked_at_height=1000,
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            policy=policy,
         )
