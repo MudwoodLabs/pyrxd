@@ -111,7 +111,7 @@ Control surfaces target the upper rows; A6 is intentionally exportable; A10 is u
 
 **Goals:** Forge a "BTC was sent" proof that fools the RXD-side covenant into releasing funds.
 
-**Reach:** Limited by `MultiSourceBtcDataSource` quorum check (Gravity uses k-of-n agreement) plus on-chain SPV verification of the proof itself. Single-source mode is documented as weaker.
+**Reach:** A self-consistent forged chain is byte-identical from every source, so `MultiSourceBtcDataSource` quorum — which only detects *disagreement* between sources — does **not** catch it. The actual forgery defense is the on-chain covenant's `expectedNBits` pin, now mirrored in the Python verifier (`verify_chain` enforces the nBits pin *before* PoW, audit F-01/F-03), with the Merkle-proof↔header binding (`build(tx_block_height=…)`, F-18) and an offer-time difficulty floor (`reject_low_difficulty`/`min_difficulty_nbits`, F-02). For confirmation depth, a single source under-reporting `block_height` inflates burial; the `[1,tip]` floor on `get_raw_tx` plus the above-dust `MultiSourceBtcFundingReader` quorum (F-17) mitigate it. The primitive must **not** be the sole release authority on a value-bearing chain without a covenant pinning nBits — enforced by `require_spv_sole_authority_cleared`. Full pitfall catalogue: [`docs/how-to/spv-verification-pitfalls.md`](how-to/spv-verification-pitfalls.md).
 
 ### TA7: Hostile metadata file author
 
@@ -314,7 +314,11 @@ Cross-reference of controls and the threats they address:
 | Library N5 fix: re-raise NetworkError on scan | S9 | `src/pyrxd/hd/wallet.py:_scan_chain` |
 | Library N6 fix: load() raises FileNotFoundError | TA2 (no silent overwrite) | `src/pyrxd/hd/wallet.py:load` |
 | Two-pass fee with unlock-script reset | S6 | `src/pyrxd/wallet.py`, `src/pyrxd/hd/wallet.py:build_send_tx` |
-| Multi-source BtcDataSource quorum | TA6 | `src/pyrxd/network/bitcoin.py:MultiSourceBtcDataSource` |
+| Multi-source data quorum (detects source *disagreement*, NOT a self-consistent forgery) | TA6 | `src/pyrxd/network/bitcoin.py:MultiSourceBtcDataSource` |
+| Committed nBits pin enforced in the SPV verifier (the actual forgery defense) | TA6 | `src/pyrxd/spv/chain.py:verify_chain`, `proof.py:CovenantParams.expected_nbits` |
+| Merkle proof bound to the height-identified header | TA6 | `src/pyrxd/spv/proof.py:build(tx_block_height=…)` |
+| Confirmation-depth `[1,tip]` floor + above-dust funding quorum | TA6 | `src/pyrxd/network/bitcoin.py:get_raw_tx`, `MultiSourceBtcFundingReader` |
+| Sole-authority audit gate (covenant-less use fails closed) | TA6 | `src/pyrxd/spv/proof.py:require_spv_sole_authority_cleared` |
 | SPV verification (Gravity) | TA6, TA8 | `src/pyrxd/spv/`, `src/pyrxd/gravity/` |
 | Gravity red-team test suite | TA8 | `tests/test_gravity_red_team.py` (1500+ lines) |
 | CodeQL on every push | static analysis | `.github/workflows/codeql.yml` |
@@ -341,6 +345,7 @@ Honest list. These are not vulnerabilities; they're places where pyrxd's defense
 
 6. **Single ElectrumX endpoint by default.** TA5 has unmitigated reach for plain RXD operations. Multi-source ElectrumX is not implemented; only Bitcoin data sources have quorum.
 7. **No certificate pinning for ElectrumX TLS.** A CA compromise enables TA4. We rely on system trust store.
+8. **The SPV primitive is not a self-sufficient sole authority.** It enforces the committed nBits pin and per-header PoW but does **not** do most-cumulative-work selection or independent network-difficulty oracling (audit F-01). It is safe only behind an on-chain covenant pinning nBits; any covenant-less use (bridge-in/oracle/gate) fails closed via `require_spv_sole_authority_cleared` pending external audit. See [`docs/how-to/spv-verification-pitfalls.md`](how-to/spv-verification-pitfalls.md).
 
 ### CLI
 
