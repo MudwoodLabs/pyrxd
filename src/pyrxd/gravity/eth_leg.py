@@ -141,6 +141,13 @@ class EthLeg:
         :meth:`scrape_secret`. Works on a reverted-but-mined claim too."""
         return await self._leg.fetch_claim_artifacts(tx_hash)
 
+    async def assert_claim_provenance(self, tx_hash: str, *, contract_address: str, hashlock: bytes) -> None:
+        """Provenance gate (R6) — the ETH analogue of the BTC funding-outpoint check: the
+        claim tx must target THIS swap's HTLC contract instance and bind ``H`` on-chain
+        (``tx.to`` + a successful receipt + an H-bound log from the contract). Fail-closed;
+        see :meth:`EthHtlcContractLeg.assert_claim_provenance`."""
+        await self._leg.assert_claim_provenance(tx_hash, contract_address=contract_address, hashlock=hashlock)
+
     async def claim_finality_verdict(self, tx_hash: str) -> CounterClaimFinality:
         """The point-in-time ETH finality verdict (FINAL once at/under the ``finalized``
         checkpoint, else NOT_YET_FINAL_LIVE) the reorg gate consumes."""

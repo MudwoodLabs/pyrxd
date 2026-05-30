@@ -180,3 +180,102 @@ async def test_claim_refund_fetch_verdict_delegate(monkeypatch):
     assert seen["fetch"] == "0xtx"
     v = await leg.claim_finality_verdict("0xtx")
     assert v.state is CounterClaimState.FINAL and seen["verdict"] == "0xtx"
+
+
+# -- R6 provenance gate (real EthHtlcContractLeg logic, injected fake rpc) -------------
+
+import hashlib as _hashlib
+
+from pyrxd.eth_wallet.htlc_leg import _addr, _b
+
+_CONTRACT = "0x" + "ab" * 20
+
+
+class _FakeRpc:
+    def __init__(self, *, to, status=1, logs=None):
+        self._to = to
+        self._status = status
+        self._logs = logs if logs is not None else []
+
+    async def get_transaction(self, tx_hash):
+        return {"to": self._to, "input": "0x"}
+
+    async def wait_receipt(self, tx_hash):
+        return {"status": self._status, "blockNumber": 10, "logs": self._logs}
+
+
+def _leg_with_rpc(rpc) -> EthHtlcContractLeg:
+    return EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=11155111, artifact=_ART)
+
+
+def _h() -> bytes:
+    return _hashlib.sha256(b"r6").digest()
+
+
+def _log_with_H_topic(h, *, address=_CONTRACT):
+    return {"address": address, "topics": ["0x" + "00" * 31 + "01", "0x" + h.hex()], "data": "0x"}
+
+
+async def test_provenance_accepts_targeted_claim_with_H_bound_log():
+    h = _h()
+    leg = _leg_with_rpc(_FakeRpc(to=_CONTRACT, logs=[_log_with_H_topic(h)]))
+    await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, hashlock=h)  # no raise
+
+
+async def test_provenance_accepts_H_in_log_data_not_topic():
+    h = _h()
+    log = {"address": _CONTRACT, "topics": ["0x" + "ab" * 32], "data": "0x" + "00" * 4 + h.hex()}
+    leg = _leg_with_rpc(_FakeRpc(to=_CONTRACT, logs=[log]))
+    await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, hashlock=h)  # no raise
+
+
+async def test_provenance_rejects_wrong_to():
+    h = _h()
+    leg = _leg_with_rpc(_FakeRpc(to="0x" + "cd" * 20, logs=[_log_with_H_topic(h)]))
+    with pytest.raises(ValidationError, match="not this swap's HTLC contract"):
+        await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, hashlock=h)
+
+
+async def test_provenance_rejects_failed_status():
+    h = _h()
+    leg = _leg_with_rpc(_FakeRpc(to=_CONTRACT, status=0, logs=[_log_with_H_topic(h)]))
+    with pytest.raises(ValidationError, match="did not succeed"):
+        await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, hashlock=h)
+
+
+async def test_provenance_rejects_no_H_bound_log():
+    h = _h()
+    # A log from our contract but WITHOUT H, and an H-bound log from a FOREIGN contract.
+    logs = [
+        {"address": _CONTRACT, "topics": ["0x" + "11" * 32], "data": "0x"},
+        {"address": "0x" + "ee" * 20, "topics": ["0x" + h.hex()], "data": "0x"},
+    ]
+    leg = _leg_with_rpc(_FakeRpc(to=_CONTRACT, logs=logs))
+    with pytest.raises(ValidationError, match="binds H"):
+        await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, hashlock=h)
+
+
+async def test_provenance_rejects_bad_hashlock_len():
+    leg = _leg_with_rpc(_FakeRpc(to=_CONTRACT))
+    with pytest.raises(ValidationError, match="32 bytes"):
+        await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, hashlock=b"\x01" * 31)
+
+
+def test_helpers_b_and_addr():
+    assert _b(None) == b"" and _b("0x0a0b") == b"\x0a\x0b" and _b(b"\x01") == b"\x01"
+    assert _b("0a0b") == b"\x0a\x0b"  # bare hex (no 0x)
+    assert _addr(None) == "" and _addr("0xAbCd") == "0xabcd"
+
+
+async def test_eth_leg_delegates_provenance(monkeypatch):
+    cl = _contract_leg()
+    seen = {}
+
+    async def fake_prov(tx_hash, *, contract_address, hashlock):
+        seen["args"] = (tx_hash, contract_address, hashlock)
+
+    monkeypatch.setattr(cl, "assert_claim_provenance", fake_prov)
+    leg = _eth_leg(cl)
+    h = _h()
+    await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, hashlock=h)
+    assert seen["args"] == ("0xtx", _CONTRACT, h)

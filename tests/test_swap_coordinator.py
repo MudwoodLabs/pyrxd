@@ -28,6 +28,7 @@ import pickle
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_coordinator import (
@@ -1507,3 +1508,155 @@ def test_dual_source_reorg_depth_divergence_fail_closed():
             t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
             policy=policy,
         )
+
+
+# --------------------------------------------------------------------------- C2b + R6: ETH claim flow
+#
+# The coordinator's BTC↔RXD claim path is exercised end-to-end above via the FSM. The ETH
+# variant shares the RXD leg + FSM + reorg gate; only the COUNTER-leg differs (tx-hash claim
+# ref, calldata/log scrape, finalized-checkpoint verdict, contract-address provenance). These
+# tests drive a record straight to SECRET_REVEALED with an EthHtlcLocator (the ETH funding
+# path is a separate concern, proven on Anvil in Phase 4) and assert the dispatch + gate order.
+
+
+class FakeEthLeg:
+    """Duck-typed stand-in for EthLeg, from SECRET_REVEALED onward.
+
+    Returns the known preimage from scrape (the coordinator re-verifies sha256==H), a
+    configurable finality verdict, and a provenance gate that records its args and can be
+    flipped to fail-closed. No ``network`` attr → the value-bearing/durable gate stays off.
+    """
+
+    def __init__(self, *, preimage, verdict: CounterClaimFinality, provenance_ok: bool = True) -> None:
+        self._p = preimage.unsafe_raw_bytes() if isinstance(preimage, SecretBytes) else bytes(preimage)
+        self._verdict = verdict
+        self.provenance_ok = provenance_ok
+        self.calls: list[str] = []
+        self.provenance_args: dict | None = None
+
+    async def fetch_claim_artifacts(self, tx_hash) -> list[bytes]:
+        self.calls.append("fetch")
+        return [b"\x00\x00\x00\x00" + self._p]  # p after a 4-byte selector
+
+    def scrape_secret(self, artifacts, hashlock) -> bytes:
+        self.calls.append("scrape")
+        return self._p
+
+    async def assert_claim_provenance(self, tx_hash, *, contract_address, hashlock) -> None:
+        self.calls.append("provenance")
+        self.provenance_args = {"tx_hash": tx_hash, "contract_address": contract_address, "hashlock": hashlock}
+        if not self.provenance_ok:
+            raise ValidationError("claim tx 'to' is not this swap's HTLC contract address")
+
+    async def claim_finality_verdict(self, tx_hash) -> CounterClaimFinality:
+        self.calls.append("verdict")
+        return self._verdict
+
+
+def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 72):
+    return NegotiatedTerms(
+        hashlock=hashlock,
+        btc_sats=100_000,
+        radiant_amount=1_000,
+        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
+        asset_variant="rxd",
+        genesis_ref=b"",
+        taker_dest_hash=b"\x11" * 32,
+        maker_dest_hash=b"\x22" * 32,
+        btc_claim_pubkey_xonly=b"\x00" * 32,  # eth: x-only fields are the _ZERO32 placeholder
+        btc_refund_pubkey_xonly=b"\x00" * 32,
+        counter_chain="eth",
+        value_amount=10**15,
+    )
+
+
+def _eth_locator(hashlock: bytes) -> EthHtlcLocator:
+    return EthHtlcLocator(
+        chain_id=11155111,
+        contract_address="0x" + "ab" * 20,
+        deploy_tx_hash="0x" + "cd" * 32,
+        hashlock="0x" + hashlock.hex(),
+        claimant="0x" + "11" * 20,
+        refundee="0x" + "22" * 20,
+        timeout=1779710245,
+        amount_wei=10**15,
+    )
+
+
+def _eth_coord_at_secret_revealed(*, eth_leg, terms, radiant_leg=None, policy=None):
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, counterchain_locator=_eth_locator(terms.hashlock))
+    return SwapCoordinator(
+        record=rec,
+        counter_leg=eth_leg,
+        radiant_leg=radiant_leg or FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(
+            margin_policy=policy or _eth_finality_policy(window_s=768),
+            maker_stall_safety_window_blocks=6,
+        ),
+    )
+
+
+def _final():
+    return CounterClaimFinality(state=CounterClaimState.FINAL)
+
+
+def _eth_not_final_verdict():
+    return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+
+async def test_eth_claim_safe_settles_and_runs_provenance():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h)
+    leg = FakeEthLeg(preimage=p, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    rec = await coord.taker_scrape_and_claim_asset("0xclaim", now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with == p.unsafe_raw_bytes()  # asset claimed with the scraped p
+    # Gate order: scrape, then provenance, then verdict — provenance BEFORE the verdict/claim.
+    assert leg.calls == ["fetch", "scrape", "provenance", "verdict"]
+    assert leg.provenance_args["contract_address"] == "0x" + "ab" * 20
+    assert leg.provenance_args["hashlock"] == h
+
+
+async def test_eth_claim_rejects_failed_provenance_no_claim():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h)
+    leg = FakeEthLeg(preimage=p, verdict=_final(), provenance_ok=False)
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    with pytest.raises(ValidationError, match="not this swap's HTLC contract"):
+        await coord.taker_scrape_and_claim_asset("0xforeign", now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rxd.claimed_with is None  # never claimed off a foreign claim tx
+    assert coord.record.state is SwapState.SECRET_REVEALED  # no advance
+    assert "verdict" not in leg.calls  # fail-closed BEFORE the finality read/claim
+
+
+async def test_eth_claim_wait_stays_secret_revealed():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h, t_rxd_blocks=72)  # roomy
+    leg = FakeEthLeg(preimage=p, verdict=_eth_not_final_verdict())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    rec = await coord.taker_scrape_and_claim_asset("0xclaim", now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.SECRET_REVEALED  # not-yet-final + room → WAIT, no claim
+    assert rxd.claimed_with is None
+
+
+async def test_eth_claim_squeezed_then_explicit_vulnerable_claim():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h, t_rxd_blocks=10)  # window closing
+    leg = FakeEthLeg(preimage=p, verdict=_eth_not_final_verdict())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    # not-yet-final + closing window → SQUEEZED → ASSET_VULNERABLE, no auto-claim
+    rec = await coord.taker_scrape_and_claim_asset("0xclaim", now_rxd_height=1006, asset_locked_at_height=1000)
+    assert rec.state is SwapState.ASSET_VULNERABLE
+    assert rxd.claimed_with is None
+    # The deliberate winner-take-all claim (ETH path) runs scrape + provenance and settles.
+    rec = await coord.taker_claim_asset_from_vulnerable("0xclaim")
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with == p.unsafe_raw_bytes()

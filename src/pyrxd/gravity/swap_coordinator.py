@@ -1082,7 +1082,17 @@ class SwapCoordinator:
         ``now_rxd_height`` / ``asset_locked_at_height`` feed the squeeze (the Radiant
         clock; ``asset_locked_at_height`` is where the maker locked the covenant).
         ``scrape_secret`` is sync; the depth read + Radiant claim are awaited.
+
+        **ETH counter leg.** For an ETH↔RXD swap the maker's claim is referenced by a tx
+        HASH (carried in ``maker_claim_tx_bytes``), not raw witness bytes: the flow
+        dispatches to :meth:`_taker_scrape_and_claim_eth`, which fetches calldata+logs,
+        scrapes ``p``, runs the ETH provenance gate (R6) and the finalized-checkpoint reorg
+        gate. The BTC body below is unchanged and byte-for-byte identical to its proven form.
         """
+        if self.record.terms.counter_chain != "btc":
+            return await self._taker_scrape_and_claim_eth(
+                maker_claim_tx_bytes, now_rxd_height=now_rxd_height, asset_locked_at_height=asset_locked_at_height
+            )
         if self.record.state is not SwapState.SECRET_REVEALED:
             raise ValidationError(
                 f"taker_scrape_and_claim_asset only valid from SECRET_REVEALED, not {self.record.state.value}"
@@ -1135,6 +1145,69 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
+    async def _taker_scrape_and_claim_eth(
+        self, claim_tx_hash, *, now_rxd_height: int, asset_locked_at_height: int
+    ) -> SwapRecord:
+        """ETH variant of :meth:`taker_scrape_and_claim_asset` (called within the held step
+        lock, so NOT itself ``@_serialized_step``). The maker's claim is an on-chain ETH tx
+        referenced by ``claim_tx_hash``; the secret lives in its calldata/logs, its finality is
+        the post-Merge ``finalized`` checkpoint (no confirmation depth), and provenance is the
+        per-swap-unique HTLC contract address (R6), the ETH analogue of the BTC funding outpoint.
+
+        Same gate ORDER and SAFE/WAIT/SQUEEZED semantics as the BTC path: scrape ``p`` and
+        RE-verify ``sha256(p)==H``; run the provenance gate; then the ``t_rxd``-squeeze
+        assessment over the ETH finality verdict. The Radiant claim only fires on SAFE.
+        """
+        if self.record.state is not SwapState.SECRET_REVEALED:
+            raise ValidationError(
+                f"taker_scrape_and_claim_asset only valid from SECRET_REVEALED, not {self.record.state.value}"
+            )
+        locator = self.record.counterchain_locator
+        if not isinstance(locator, EthHtlcLocator):
+            raise ValidationError("ETH claim flow requires an EthHtlcLocator on the record")
+        # Fetch the candidate blobs (calldata + log data) and scrape p by sha256==H (never by
+        # offset); the coordinator RE-verifies sha256(p)==H — a value that does not open H is rejected.
+        artifacts = await self.counter_leg.fetch_claim_artifacts(claim_tx_hash)
+        p = self.counter_leg.scrape_secret(artifacts, self.record.terms.hashlock)
+        if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+            raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
+        # Provenance (R6): the claim tx must target OUR HTLC contract instance and bind H
+        # on-chain — defends cross-swap replay even if H is reused via a path the seen-store
+        # does not cover (the ETH analogue of _assert_claim_tx_spends_our_htlc).
+        await self.counter_leg.assert_claim_provenance(
+            claim_tx_hash, contract_address=locator.contract_address, hashlock=self.record.terms.hashlock
+        )
+        # Reorg gate: the ETH finalized-checkpoint verdict (no depth) feeds the t_rxd squeeze.
+        verdict = await self.counter_leg.claim_finality_verdict(claim_tx_hash)
+        finality = assess_claim_finality(
+            counter_claim_finality=verdict,
+            now_rxd_height=now_rxd_height,
+            asset_locked_at_height=asset_locked_at_height,
+            t_rxd=self.record.terms.t_rxd,
+            policy=self.config.margin_policy,
+        )
+        if finality is ClaimFinality.WAIT:
+            logger.info(
+                "reorg gate WAIT: maker ETH claim not yet finalized but t_rxd window has room — "
+                "not claiming yet, retry later"
+            )
+            return self.record  # unchanged; stays SECRET_REVEALED
+        if finality is ClaimFinality.SQUEEZED:
+            logger.warning(
+                "reorg gate SQUEEZED: maker ETH claim not finalized and t_rxd window closing — "
+                "advancing to ASSET_VULNERABLE; a winner-take-all claim is now a deliberate "
+                "policy decision (taker_claim_asset_from_vulnerable), not automatic"
+            )
+            self._advance(SwapEvent.TAKER_OFFLINE_OR_PINNED)
+            await self._persist_record(self.record, shield=True)
+            return self.record
+
+        # SAFE: the ETH claim is finalized and our own RXD burial still fits the window.
+        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
     # -- deliberate winner-take-all claim from the SQUEEZED/ASSET_VULNERABLE state --
     @_serialized_step
     async def taker_claim_asset_from_vulnerable(self, maker_claim_tx_bytes: bytes) -> SwapRecord:
@@ -1145,7 +1218,13 @@ class SwapCoordinator:
         the maker's ``t_rxd`` CSV refund lands, accepting the residual reorg risk that
         the gate flagged. It is a CONSCIOUS choice the caller makes after the gate
         refused the automatic SAFE claim — never invoked silently.
+
+        For an ETH counter leg ``maker_claim_tx_bytes`` carries the maker's ETH claim tx
+        hash; the scrape + provenance gate dispatch to the ETH path. The BTC body below is
+        byte-for-byte unchanged.
         """
+        if self.record.terms.counter_chain != "btc":
+            return await self._taker_claim_eth_from_vulnerable(maker_claim_tx_bytes)
         if self.record.state is not SwapState.ASSET_VULNERABLE:
             raise ValidationError(
                 f"taker_claim_asset_from_vulnerable only valid from ASSET_VULNERABLE, not {self.record.state.value}"
@@ -1154,6 +1233,28 @@ class SwapCoordinator:
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
         self._assert_claim_tx_spends_our_htlc(maker_claim_tx_bytes)
+        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
+    async def _taker_claim_eth_from_vulnerable(self, claim_tx_hash) -> SwapRecord:
+        """ETH variant of the deliberate winner-take-all claim (within the held step lock).
+        Same explicit ASSET_VULNERABLE-only gate; fetch+scrape p, provenance gate (R6), claim."""
+        if self.record.state is not SwapState.ASSET_VULNERABLE:
+            raise ValidationError(
+                f"taker_claim_asset_from_vulnerable only valid from ASSET_VULNERABLE, not {self.record.state.value}"
+            )
+        locator = self.record.counterchain_locator
+        if not isinstance(locator, EthHtlcLocator):
+            raise ValidationError("ETH claim flow requires an EthHtlcLocator on the record")
+        artifacts = await self.counter_leg.fetch_claim_artifacts(claim_tx_hash)
+        p = self.counter_leg.scrape_secret(artifacts, self.record.terms.hashlock)
+        if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+            raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
+        await self.counter_leg.assert_claim_provenance(
+            claim_tx_hash, contract_address=locator.contract_address, hashlock=self.record.terms.hashlock
+        )
         await self.radiant_leg.claim_asset(self.record, bytes(p))
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)

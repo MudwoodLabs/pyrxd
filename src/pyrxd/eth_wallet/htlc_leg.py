@@ -41,6 +41,21 @@ __all__ = ["EthHtlcContractLeg", "load_artifact"]
 _REQUIRED_ARTIFACT_KEYS = ("runtime_bytecode", "abi", "bytecode")
 
 
+def _b(v: Any) -> bytes:
+    """Coerce a hex string ('0x..' or '..') or bytes-like to bytes; None/'' -> b''."""
+    if v is None:
+        return b""
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v)
+    s = str(v)
+    return bytes.fromhex(s[2:] if s.startswith("0x") else s)
+
+
+def _addr(v: Any) -> str:
+    """Normalise an address-ish value to a lowercase hex string for comparison."""
+    return str(v or "").lower()
+
+
 def load_artifact(path: str | os.PathLike) -> dict:
     """Load an EthHtlc artifact (ABI + bytecode + runtime_bytecode) from ``path``.
 
@@ -322,6 +337,59 @@ class EthHtlcContractLeg:
         if tx_block <= finalized:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
         return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+    async def assert_claim_provenance(self, tx_hash: str, *, contract_address: str, hashlock: bytes) -> None:
+        """Provenance gate (R6): the maker's claim tx MUST target THIS swap's HTLC contract
+        instance and bind OUR ``H`` on-chain — the ETH analogue of the BTC
+        "claim tx spends our funding outpoint" check (``_assert_claim_tx_spends_our_htlc``).
+
+        Each swap deploys a FRESH HTLC contract at a unique CREATE address (recorded in the
+        locator after :meth:`verify_funded`), so the contract address is per-swap-unique
+        exactly like a BTC funding outpoint. ``recover_secret`` matches ``sha256(p)==H`` over
+        the supplied tx's calldata + logs but TRUSTS that the tx belongs to this swap; we
+        verify that here, fail-closed:
+
+          * ``tx.to == contract_address`` — the claim called OUR contract instance (not a
+            different swap's, even one that reused ``H``);
+          * ``receipt.status == 1`` — the claim actually succeeded (the ETH moved; a reverted
+            tx never paid the maker even if ``p`` sits in its calldata);
+          * a log emitted BY ``contract_address`` whose topics+data contain ``H`` — an
+            on-chain binding of the hashlock to this contract instance WITHOUT decoding the
+            event ABI (``H``'s 32 bytes appear in the claim event whether the param is indexed
+            (a topic) or in the data). This binds ``H`` to the contract the deployer audited,
+            not just to the scraped preimage.
+
+        Any RPC error propagates and aborts the claim — also fail-closed. The redundant
+        receipt read vs :meth:`fetch_claim_artifacts` is deliberate (correctness over a saved
+        round-trip); a future driver may thread one receipt through both.
+        """
+        want = _addr(contract_address)
+        h = self._h32(hashlock)
+        tx = await self._rpc.get_transaction(tx_hash)
+        if _addr(tx.get("to")) != want:
+            raise ValidationError(
+                "claim tx 'to' is not this swap's HTLC contract address; "
+                "refusing to scrape p (wrong or cross-swap claim tx)"
+            )
+        receipt = await self._rpc.wait_receipt(tx_hash)
+        if int(receipt.get("status", 0)) != 1:
+            raise ValidationError("claim tx did not succeed (status != 1); refusing to treat it as a valid claim")
+        for log in receipt.get("logs", []):
+            if _addr(log.get("address")) != want:
+                continue
+            blob = b"".join(_b(topic) for topic in log.get("topics", [])) + _b(log.get("data"))
+            if h in blob:
+                return
+        raise ValidationError(
+            "no event from this swap's HTLC contract binds H on-chain; "
+            "refusing to scrape p (wrong or cross-swap claim tx)"
+        )
+
+    @staticmethod
+    def _h32(hashlock: bytes) -> bytes:
+        if not isinstance(hashlock, (bytes, bytearray)) or len(hashlock) != 32:
+            raise ValidationError("hashlock must be 32 bytes")
+        return bytes(hashlock)
 
 
 # Register as a virtual subclass of the CounterChainLeg ABC: the leg realises the full
