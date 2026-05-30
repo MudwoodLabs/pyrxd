@@ -82,18 +82,16 @@ async def test_eth_verdict_reverted_is_not_final():
     assert (await leg.claim_finality_verdict("0xabc")).state is CounterClaimState.NOT_YET_FINAL_LIVE
 
 
-async def test_eth_verdict_not_yet_final_live_without_prev():
-    leg = _leg(_FakeRpc(status=1, block=200, finalized=120))  # block > finalized, no prev
+async def test_eth_verdict_not_yet_final():
+    leg = _leg(_FakeRpc(status=1, block=200, finalized=120))  # block > finalized
     assert (await leg.claim_finality_verdict("0xabc")).state is CounterClaimState.NOT_YET_FINAL_LIVE
 
 
-async def test_eth_verdict_stall_when_finalized_not_advancing():
-    leg = _leg(_FakeRpc(status=1, block=200, finalized=120))  # not final AND finalized stuck
-    v = await leg.claim_finality_verdict("0xabc", prev_finalized=120)
-    assert v.state is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING
-
-
-async def test_eth_verdict_live_when_finalized_advances():
-    leg = _leg(_FakeRpc(status=1, block=200, finalized=130))  # finalized advanced 120 -> 130
-    v = await leg.claim_finality_verdict("0xabc", prev_finalized=120)
+async def test_eth_verdict_point_in_time_never_emits_stall():
+    # The point-in-time producer never returns COUNTER_CHAIN_NOT_FINALIZING: a non-advancing
+    # `finalized` over a single observation is normal (post-Merge finalizes at epoch
+    # boundaries, ~6.4 min), not a stall. Detecting a genuine non-finality stall — finalized
+    # stuck for >= a patience window — is the coordinator polling loop's job (Phase-3 wiring).
+    leg = _leg(_FakeRpc(status=1, block=200, finalized=120))  # not final; finalized "stuck"
+    v = await leg.claim_finality_verdict("0xabc")
     assert v.state is CounterClaimState.NOT_YET_FINAL_LIVE

@@ -296,21 +296,23 @@ class EthHtlcContractLeg:
         tx_block = int(receipt["blockNumber"])
         return tx_block <= await self._rpc.finalized_block_number()
 
-    async def claim_finality_verdict(self, tx_hash: str, *, prev_finalized: int | None = None) -> CounterClaimFinality:
-        """The counter-leg finality verdict for the maker's ETH claim, from the post-Merge
-        ``finalized`` checkpoint (NOT a confirmation depth — see :class:`CounterClaimFinality`):
+    async def claim_finality_verdict(self, tx_hash: str) -> CounterClaimFinality:
+        """The POINT-IN-TIME counter-leg finality verdict for the maker's ETH claim, from the
+        post-Merge ``finalized`` checkpoint (NOT a confirmation depth — see
+        :class:`CounterClaimFinality`):
 
-          * reverted / dropped (``status != 1``) → ``NOT_YET_FINAL_LIVE``;
           * the claim's block is at/under ``finalized`` → ``FINAL``;
-          * not yet finalized but the ``finalized`` checkpoint has NOT advanced since
-            ``prev_finalized`` (an ETH consensus non-finality stall, RF-06) →
-            ``COUNTER_CHAIN_NOT_FINALIZING`` (the reorg gate then SQUEEZES, never waits
-            forever); otherwise → ``NOT_YET_FINAL_LIVE``.
+          * otherwise (not yet finalized, OR reverted/dropped ``status != 1``) →
+            ``NOT_YET_FINAL_LIVE``.
 
-        ETH finality is not a depth, so the verdict carries no ``confirmations`` /
-        ``required_depth``. ``prev_finalized`` is threaded explicitly (no hidden leg state)
-        so the verdict is pure-testable — the caller passes the ``finalized`` height it last
-        observed after its patience window.
+        This is a stateless single observation: it never emits ``COUNTER_CHAIN_NOT_FINALIZING``.
+        That verdict means the chain is *not advancing* finalization, which can only be judged
+        across time (post-Merge ``finalized`` advances at epoch boundaries, ~6.4 min, so a
+        single non-advance is normal, not a stall). Detecting a genuine non-finality stall —
+        finalized stuck for ≥ a patience window of epochs — is the coordinator's polling-loop
+        responsibility (Phase-3 wiring), not this point-in-time producer, which would otherwise
+        false-positive on any fast poll. ETH finality is not a depth, so the verdict carries no
+        ``confirmations`` / ``required_depth``.
         """
         receipt = await self._rpc.wait_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
@@ -319,8 +321,6 @@ class EthHtlcContractLeg:
         finalized = await self._rpc.finalized_block_number()
         if tx_block <= finalized:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
-        if prev_finalized is not None and finalized <= prev_finalized:
-            return CounterClaimFinality(state=CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING)
         return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
 
 
