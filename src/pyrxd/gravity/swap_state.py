@@ -208,6 +208,14 @@ def advance(state: SwapState, event: SwapEvent) -> SwapState:
 
 ASSET_VARIANTS: frozenset[str] = frozenset({"rxd", "ft", "nft"})
 
+# The counter leg (the non-Radiant side the taker locks first / longer): a PoW chain
+# ("btc") or a post-Merge finalized-checkpoint chain ("eth"). The Radiant asset leg is RXD.
+COUNTER_CHAINS: frozenset[str] = frozenset({"btc", "eth"})
+
+# The 32-byte placeholder for the BTC x-only key fields on a non-BTC (ETH) swap, where the
+# Taproot keys are unused — the ETH leg binds claimant/refundee in its locator instead.
+_ZERO32: bytes = b"\x00" * 32
+
 
 @dataclass(frozen=True)
 class NegotiatedTerms:
@@ -238,6 +246,10 @@ class NegotiatedTerms:
     # BTC HTLC params the taker uses to (re)derive the funding SPK independently.
     btc_claim_pubkey_xonly: bytes  # maker's x-only key (claim leaf)
     btc_refund_pubkey_xonly: bytes  # taker's x-only key (refund leaf)
+    # Counter-chain selector + chain-neutral counter-leg amount. Defaulted so every existing
+    # (BTC) construction is unchanged: counter_chain "btc"; value_amount 0 => mirror btc_sats.
+    counter_chain: str = "btc"  # "btc" | "eth"
+    value_amount: int = 0  # counter-leg amount: sats (btc) | wei (eth); 0 sentinel => btc_sats
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "hashlock", _b32(self.hashlock, "hashlock"))
@@ -245,6 +257,13 @@ class NegotiatedTerms:
             raise ValidationError("btc_sats must be a positive int")
         if not _pos_int(self.radiant_amount):
             raise ValidationError("radiant_amount must be a positive int")
+        if self.counter_chain not in COUNTER_CHAINS:
+            raise ValidationError(f"counter_chain must be one of {sorted(COUNTER_CHAINS)}")
+        # value_amount defaults to btc_sats (the BTC counter-leg amount) when left 0.
+        if self.value_amount == 0:
+            object.__setattr__(self, "value_amount", self.btc_sats)
+        if not _pos_int(self.value_amount):
+            raise ValidationError("value_amount must be a positive int")
         if not isinstance(self.t_btc, Timelock):
             raise ValidationError("t_btc must be a Timelock")
         if not isinstance(self.t_rxd, Timelock):
@@ -266,10 +285,21 @@ class NegotiatedTerms:
             raise ValidationError(f"{self.asset_variant} requires a non-empty genesis_ref")
         object.__setattr__(self, "taker_dest_hash", _b32(self.taker_dest_hash, "taker_dest_hash"))
         object.__setattr__(self, "maker_dest_hash", _b32(self.maker_dest_hash, "maker_dest_hash"))
-        object.__setattr__(self, "btc_claim_pubkey_xonly", _b32(self.btc_claim_pubkey_xonly, "btc_claim_pubkey_xonly"))
-        object.__setattr__(
-            self, "btc_refund_pubkey_xonly", _b32(self.btc_refund_pubkey_xonly, "btc_refund_pubkey_xonly")
-        )
+        if self.counter_chain == "btc":
+            object.__setattr__(
+                self, "btc_claim_pubkey_xonly", _b32(self.btc_claim_pubkey_xonly, "btc_claim_pubkey_xonly")
+            )
+            object.__setattr__(
+                self, "btc_refund_pubkey_xonly", _b32(self.btc_refund_pubkey_xonly, "btc_refund_pubkey_xonly")
+            )
+        else:
+            # ETH counter leg: the Taproot x-only keys are unused. Require the documented
+            # 32-byte zero placeholder so a real BTC key can never silently ride an ETH swap.
+            for _name in ("btc_claim_pubkey_xonly", "btc_refund_pubkey_xonly"):
+                _val = _b32(getattr(self, _name), _name)
+                if _val != _ZERO32:
+                    raise ValidationError(f"{_name} must be the 32-byte zero placeholder on an ETH swap")
+                object.__setattr__(self, _name, _val)
         # Cheap same-unit ordering guard (the full margin check is fail-closed in
         # the coordinator and handles cross-unit normalisation).
         if self.t_btc.unit is self.t_rxd.unit and self.t_btc.value <= self.t_rxd.value:
@@ -280,7 +310,7 @@ class NegotiatedTerms:
 
     def to_dict(self) -> dict:
         """Canonical JSON/hex wire form. NEVER contains the preimage ``p``."""
-        return {
+        d = {
             "hashlock": self.hashlock.hex(),
             "btc_sats": self.btc_sats,
             "radiant_amount": self.radiant_amount,
@@ -293,6 +323,13 @@ class NegotiatedTerms:
             "btc_claim_pubkey_xonly": self.btc_claim_pubkey_xonly.hex(),
             "btc_refund_pubkey_xonly": self.btc_refund_pubkey_xonly.hex(),
         }
+        # Emit the ETH-additive fields only when they differ from the BTC defaults, so an
+        # all-BTC terms wire form is byte-for-byte identical to the pre-ETH schema.
+        if self.counter_chain != "btc":
+            d["counter_chain"] = self.counter_chain
+        if self.value_amount != self.btc_sats:
+            d["value_amount"] = self.value_amount
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> NegotiatedTerms:
@@ -308,6 +345,8 @@ class NegotiatedTerms:
             maker_dest_hash=bytes.fromhex(d["maker_dest_hash"]),
             btc_claim_pubkey_xonly=bytes.fromhex(d["btc_claim_pubkey_xonly"]),
             btc_refund_pubkey_xonly=bytes.fromhex(d["btc_refund_pubkey_xonly"]),
+            counter_chain=str(d.get("counter_chain", "btc")),  # legacy records → btc
+            value_amount=int(d.get("value_amount", 0)),  # 0 sentinel → __post_init__ = btc_sats
         )
 
 

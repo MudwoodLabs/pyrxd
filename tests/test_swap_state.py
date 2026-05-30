@@ -344,3 +344,89 @@ def test_record_serialized_form_excludes_secret():
 def test_record_rejects_bad_spk_hex():
     with pytest.raises(ValidationError):
         SwapRecord(state=SwapState.BOTH_LOCKED, terms=_terms(), radiant_covenant_spk_hex="nothex!!")
+
+
+# --------------------------------------------------------------------------- R3: ETH counter-leg terms
+
+_ZERO = b"\x00" * 32
+
+
+def _eth_terms(*, value_wei: int = 10**15) -> NegotiatedTerms:
+    return NegotiatedTerms(
+        hashlock=hashlib.sha256(os.urandom(32)).digest(),
+        btc_sats=100_000,
+        radiant_amount=1_000,
+        t_btc=t.Timelock(7200, t.TimeUnit.SECONDS),  # ETH refund duration; skips same-unit guard
+        t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+        asset_variant="rxd",
+        genesis_ref=b"",
+        taker_dest_hash=b"\x11" * 32,
+        maker_dest_hash=b"\x22" * 32,
+        btc_claim_pubkey_xonly=_ZERO,
+        btc_refund_pubkey_xonly=_ZERO,
+        counter_chain="eth",
+        value_amount=value_wei,
+    )
+
+
+def test_btc_terms_default_counter_chain_and_byte_identical_to_dict():
+    terms = _terms(variant="rxd")
+    assert terms.counter_chain == "btc"
+    assert terms.value_amount == terms.btc_sats  # 0 sentinel -> btc_sats
+    d = terms.to_dict()
+    assert "counter_chain" not in d and "value_amount" not in d  # pre-ETH wire form unchanged
+    assert NegotiatedTerms.from_dict(d) == terms
+
+
+def test_eth_terms_construct_and_roundtrip():
+    terms = _eth_terms(value_wei=10**15)
+    assert terms.counter_chain == "eth"
+    assert terms.value_amount == 10**15  # wei, independent of btc_sats
+    d = terms.to_dict()
+    assert d["counter_chain"] == "eth" and d["value_amount"] == 10**15
+    assert NegotiatedTerms.from_dict(d) == terms
+
+
+def test_eth_terms_reject_nonzero_btc_xonly():
+    with pytest.raises(ValidationError, match="zero placeholder"):
+        NegotiatedTerms(
+            hashlock=hashlib.sha256(os.urandom(32)).digest(),
+            btc_sats=100_000,
+            radiant_amount=1_000,
+            t_btc=t.Timelock(7200, t.TimeUnit.SECONDS),
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            asset_variant="rxd",
+            genesis_ref=b"",
+            taker_dest_hash=b"\x11" * 32,
+            maker_dest_hash=b"\x22" * 32,
+            btc_claim_pubkey_xonly=b"\x03" * 32,  # a real key on an ETH swap
+            btc_refund_pubkey_xonly=_ZERO,
+            counter_chain="eth",
+            value_amount=10**15,
+        )
+
+
+def test_legacy_terms_from_dict_defaults_to_btc():
+    d = _terms(variant="ft").to_dict()
+    assert "counter_chain" not in d  # legacy wire form (no ETH fields)
+    terms = NegotiatedTerms.from_dict(d)
+    assert terms.counter_chain == "btc"
+    assert terms.value_amount == terms.btc_sats
+
+
+def test_bad_counter_chain_rejected():
+    with pytest.raises(ValidationError, match="counter_chain"):
+        NegotiatedTerms(
+            hashlock=hashlib.sha256(os.urandom(32)).digest(),
+            btc_sats=1_000,
+            radiant_amount=1,
+            t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+            t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
+            asset_variant="rxd",
+            genesis_ref=b"",
+            taker_dest_hash=b"\x11" * 32,
+            maker_dest_hash=b"\x22" * 32,
+            btc_claim_pubkey_xonly=_xonly(),
+            btc_refund_pubkey_xonly=_xonly(),
+            counter_chain="ltc",
+        )
