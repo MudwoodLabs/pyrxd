@@ -71,7 +71,7 @@ docs-clean = "rm -rf docs/_build"
 docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
 
 [tool.poetry.dependencies]
-aiohttp = ">=3.9.0"
+aiohttp = ">=3.13.5"
 coincurve = "^21.0.0"
 base58 = "^2.1.1"
 pycryptodomex = "^3.22.0"
