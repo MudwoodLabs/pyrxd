@@ -1051,8 +1051,42 @@ class SwapCoordinator:
         return self.record
 
     # -- post-asset-lock re-validation (H4 b) -------------------------------
+    def _assert_eth_lock_timing_still_safe(self, *, now_unix_s: int | None) -> None:
+        """Post-confirm cross-clock recheck (audit re-verify HIGH) — the bridge's prescribed
+        SECOND run (:func:`assert_covenant_confirms_before_eth_deadline` docstring).
+
+        The pre-fund ordering gate (:meth:`_assert_eth_timelock_ordering`) projects where the
+        RXD CSV refund opens from the TAKER's fund time. But the MAKER locks the covenant at a
+        maker-controlled time and can STALL the broadcast — pushing the ACTUAL rxd-refund-open
+        (covenant_mining_time + t_rxd) past that projection and collapsing the cross-clock
+        margin. We re-run the gate here at the ACTUAL lock time with
+        ``max_covenant_confirm_wait_s = 0`` (the covenant is confirmed now). If the margin no
+        longer holds we refuse to advance to BOTH_LOCKED — the taker must refund the counter
+        leg rather than proceed into the reopened one-sided-loss window. Fail-closed.
+        """
+        policy = self.config.margin_policy
+        terms = self.record.terms
+        if now_unix_s is None:
+            raise ValidationError(
+                "an ETH swap requires now_unix_s at covenant-lock revalidation (post-confirm cross-clock recheck)"
+            )
+        if terms.eth_timeout_unix_s is None:
+            raise ValidationError("ETH swap missing eth_timeout_unix_s (the absolute refund deadline)")
+        if policy.cross_clock_margin is None:
+            raise ValidationError("ETH swap requires MarginPolicy.cross_clock_margin for the post-confirm recheck")
+        assert_covenant_confirms_before_eth_deadline(
+            now_unix_s=now_unix_s,
+            eth_timeout_unix_s=terms.eth_timeout_unix_s,
+            margin=policy.cross_clock_margin,
+            t_rxd=terms.t_rxd,
+            rxd_block_interval_s=policy.rxd_block_interval_s,
+            max_covenant_confirm_wait_s=0,  # the covenant is CONFIRMED now — no future wait budget
+        )
+
     @_serialized_step
-    async def post_asset_lock_revalidate(self, observed_covenant_spk: bytes) -> SwapRecord:
+    async def post_asset_lock_revalidate(
+        self, observed_covenant_spk: bytes, *, now_unix_s: int | None = None
+    ) -> SwapRecord:
         """Re-check the on-chain covenant SPK == expected-from-terms+H.
 
         Called when the maker locks the asset. The expected SPK is recomputed from
@@ -1060,6 +1094,11 @@ class SwapCoordinator:
         amount/dest-hashes/REF into the covenant bytecode). On match => BOTH_LOCKED.
         On mismatch => PARAMS_MISMATCH; the caller then refunds the BTC via the
         timelock leg (see :meth:`taker_refund_btc`).
+
+        ``now_unix_s`` is the caller's wall-clock at the moment the covenant lock is observed —
+        REQUIRED for an ETH swap (the post-confirm cross-clock recheck against a stalled maker
+        lock; audit re-verify HIGH), ignored for BTC. On an ETH timing failure this refuses to
+        advance to BOTH_LOCKED (raises) so the taker refunds the counter leg.
 
         Async because the Radiant leg reads chain state (expected-SPK derivation +
         covenant outpoint lookup) over the async indexer/node.
@@ -1085,6 +1124,17 @@ class SwapCoordinator:
             self._advance(SwapEvent.MAKER_LOCKS_WRONG_PARAMS)
             await self._persist_record(self.record, shield=True)
             return self.record
+        # ETH post-confirm cross-clock recheck (audit re-verify HIGH): the SPK is right, but a
+        # maker who DELAYED the covenant broadcast may have collapsed the cross-clock margin
+        # the pre-fund gate projected. Re-validate against the ACTUAL lock time; if it fails,
+        # do NOT enter BOTH_LOCKED — persist the observed lock for recovery and refuse, so the
+        # taker refunds the counter leg instead of proceeding into the one-sided-loss window.
+        if self.record.terms.counter_chain != "btc":
+            try:
+                self._assert_eth_lock_timing_still_safe(now_unix_s=now_unix_s)
+            except ValidationError:
+                await self._persist_record(self.record, shield=True)
+                raise
         self._advance(SwapEvent.MAKER_LOCKS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record

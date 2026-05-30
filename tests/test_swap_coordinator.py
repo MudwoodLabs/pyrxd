@@ -1903,7 +1903,9 @@ async def test_eth_full_lifecycle_negotiated_to_completed():
     rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
     assert rec.state is SwapState.BTC_LOCKED and "fund" in leg.calls
     assert isinstance(rec.counterchain_locator, EthHtlcLocator)  # wei locator recorded
-    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    # ETH revalidation now requires now_unix_s (the post-confirm cross-clock recheck); an
+    # on-time lock at _NOW passes.
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
     assert rec.state is SwapState.BOTH_LOCKED
     p_bytes = secret.unsafe_raw_bytes()  # capture BEFORE maker_claims_btc zeroizes the secret
     rec = await coord.maker_claims_btc(secret)
@@ -1940,3 +1942,54 @@ async def test_eth_deploy_then_verify_inversion_strands_recoverably():
     assert coord.record.state is SwapState.NEGOTIATED  # no advance
     assert seen.has_seen(h)  # H consumed (on-chain value committed at the pre-broadcast reserve)
     assert leg.last_locator is not None  # the deployed contract address is retained → refundable
+
+
+# ----------------------------------------------------- re-verify HIGH: maker-delay second run
+
+
+async def _eth_to_btc_locked(*, leg, terms, rxd, now_unix_s):
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms, now_unix_s=now_unix_s)
+    assert coord.record.state is SwapState.BTC_LOCKED
+    return coord
+
+
+async def test_eth_post_confirm_recheck_accepts_on_time_lock():
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    rxd = FakeRadiantLeg()
+    coord = await _eth_to_btc_locked(
+        leg=FakeEthLeg(preimage=secret, verdict=_final()), terms=terms, rxd=rxd, now_unix_s=_NOW
+    )
+    # Maker locks promptly (now ~ _NOW): projected rxd_open _NOW+21600 < deadline _NOW+36532 -> OK.
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED
+
+
+async def test_eth_post_confirm_recheck_refuses_stalled_maker_lock():
+    # THE re-verify HIGH: a maker who STALLS the covenant broadcast (locks late) collapses the
+    # cross-clock margin the pre-fund gate projected. The second run catches it and refuses to
+    # enter BOTH_LOCKED — the taker must refund the counter leg, not proceed.
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    rxd = FakeRadiantLeg()
+    coord = await _eth_to_btc_locked(
+        leg=FakeEthLeg(preimage=secret, verdict=_final()), terms=terms, rxd=rxd, now_unix_s=_NOW
+    )
+    # Maker delays the lock to _NOW+30000: actual rxd_open _NOW+30000+21600 > deadline _NOW+36532.
+    with pytest.raises(ValidationError, match="confirm too late"):
+        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW + 30000)
+    assert coord.record.state is SwapState.BTC_LOCKED  # did NOT advance to BOTH_LOCKED
+    assert rxd.claimed_with is None
+
+
+async def test_eth_post_confirm_recheck_requires_now_unix_s():
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    rxd = FakeRadiantLeg()
+    coord = await _eth_to_btc_locked(
+        leg=FakeEthLeg(preimage=secret, verdict=_final()), terms=terms, rxd=rxd, now_unix_s=_NOW
+    )
+    with pytest.raises(ValidationError, match="now_unix_s"):
+        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))  # ETH: now required
+    assert coord.record.state is SwapState.BTC_LOCKED

@@ -277,6 +277,13 @@ class NegotiatedTerms:
         if self.counter_chain == "btc":
             if self.value_amount == 0:
                 object.__setattr__(self, "value_amount", self.btc_sats)
+            elif self.value_amount != self.btc_sats:
+                # For BTC the counter-leg amount IS btc_sats; a divergent explicit value_amount
+                # is a misconfiguration — reject at construction (fail-closed) instead of
+                # deferring to a refused fund at lock time (audit re-verify LOW hardening).
+                raise ValidationError(
+                    f"for a BTC swap value_amount ({self.value_amount}) must equal btc_sats ({self.btc_sats})"
+                )
         elif self.value_amount == 0:
             raise ValidationError(
                 "value_amount (wei) must be explicitly set for an ETH swap — the 0=>btc_sats "

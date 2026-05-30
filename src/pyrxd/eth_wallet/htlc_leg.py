@@ -364,8 +364,15 @@ class EthHtlcContractLeg:
         Each swap deploys a FRESH HTLC contract at a unique CREATE address (recorded in the
         locator after :meth:`verify_funded`), so the contract address is per-swap-unique
         exactly like a BTC funding outpoint. The contract's claim path emits
-        ``Claimed(bytes32 preimage)`` with the SECRET ``p`` in the (non-indexed) log data
-        (see ``EthHtlc.sol`` / ``HashedTimelock.sol``). ``recover_secret`` matches
+        ``Claimed(bytes32 preimage)`` with the SECRET ``p`` in the (non-indexed) log data. This
+        leg targets the PER-SWAP-deploy ``EthHtlc.sol`` model (one fresh contract per swap,
+        ``claim(bytes32 preimage)`` + immutable hashlock/claimant/refundee/timeout getters that
+        :meth:`verify_funded` reads back). NB the sibling repo's canonical ``HashedTimelock.sol``
+        is a DIFFERENT shared-multi-swap model (``claim(bytes32 swapId, bytes32 preimage)``, no
+        per-swap immutables) NOT compatible with this leg — Phase 4 must inject an
+        ``EthHtlc.sol``-shaped artifact and reconcile/pin the exact event selector
+        (``keccak('Claimed(bytes32)')``) rather than the current ABI-free p-in-log match.
+        ``recover_secret`` matches
         ``sha256(p)==H`` over the supplied tx but TRUSTS that the tx belongs to this swap; we
         verify that here, fail-closed:
 
