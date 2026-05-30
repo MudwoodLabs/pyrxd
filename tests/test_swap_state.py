@@ -352,7 +352,7 @@ def test_record_rejects_bad_spk_hex():
 _ZERO = b"\x00" * 32
 
 
-def _eth_terms(*, value_wei: int = 10**15) -> NegotiatedTerms:
+def _eth_terms(*, value_wei: int = 10**15, eth_timeout_unix_s: int = 1779710245) -> NegotiatedTerms:
     return NegotiatedTerms(
         hashlock=hashlib.sha256(os.urandom(32)).digest(),
         btc_sats=100_000,
@@ -367,6 +367,7 @@ def _eth_terms(*, value_wei: int = 10**15) -> NegotiatedTerms:
         btc_refund_pubkey_xonly=_ZERO,
         counter_chain="eth",
         value_amount=value_wei,
+        eth_timeout_unix_s=eth_timeout_unix_s,
     )
 
 
@@ -404,6 +405,7 @@ def test_eth_terms_reject_nonzero_btc_xonly():
             btc_refund_pubkey_xonly=_ZERO,
             counter_chain="eth",
             value_amount=10**15,
+            eth_timeout_unix_s=1779710245,
         )
 
 
@@ -507,3 +509,24 @@ def test_eth_value_amount_zero_rejected_no_sats_coercion():
     # BTC keeps the 0 -> btc_sats sentinel (byte-equivalent).
     btc = _terms(variant="rxd")
     assert btc.value_amount == btc.btc_sats
+
+
+def test_eth_timeout_unix_s_required_for_eth_and_forbidden_for_btc():
+    # ETH requires the absolute deadline (audit HIGH-1: it is the real counter-leg deadline).
+    with pytest.raises(ValidationError, match="requires eth_timeout_unix_s"):
+        _eth_terms(eth_timeout_unix_s=0)  # 0 is not a positive deadline
+    # BTC must NOT carry it (so it can never be confused with the relative t_btc).
+    base = _terms(variant="rxd")
+    import dataclasses
+
+    with pytest.raises(ValidationError, match="only valid on an ETH swap"):
+        dataclasses.replace(base, eth_timeout_unix_s=1779710245)
+
+
+def test_eth_timeout_unix_s_roundtrips_in_wire_form():
+    terms = _eth_terms(eth_timeout_unix_s=1779710245)
+    d = terms.to_dict()
+    assert d["eth_timeout_unix_s"] == 1779710245
+    assert NegotiatedTerms.from_dict(d) == terms
+    # BTC wire form never carries it.
+    assert "eth_timeout_unix_s" not in _terms(variant="rxd").to_dict()

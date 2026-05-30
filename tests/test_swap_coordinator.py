@@ -1553,7 +1553,7 @@ class FakeEthLeg:
         return self._verdict
 
 
-def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 72):
+def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 72, eth_timeout_unix_s: int = 1779710245):
     return NegotiatedTerms(
         hashlock=hashlock,
         btc_sats=100_000,
@@ -1568,6 +1568,7 @@ def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 72):
         btc_refund_pubkey_xonly=b"\x00" * 32,
         counter_chain="eth",
         value_amount=10**15,
+        eth_timeout_unix_s=eth_timeout_unix_s,
     )
 
 
@@ -1713,3 +1714,106 @@ def test_reserve_to_blocks_rounds_up_for_seconds():
     assert _reserve_to_blocks(t.Timelock(6, t.TimeUnit.BLOCKS), 600.0) == 6  # identity for BLOCKS
     # ceil(1300/600)=3, NOT floor 2 — a reserve must round UP (the safe direction).
     assert _reserve_to_blocks(t.Timelock(1300, t.TimeUnit.SECONDS), 600.0) == 3
+
+
+# --------------------------------------------------------------------------- Wave C: HIGH-1 ordering
+
+from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+
+_NOW = 1_700_000_000
+
+
+def _xmargin():
+    # total = 768 + 1800 + 600 + 300 = 3468s
+    return CrossClockMargin(
+        eth_reorg_finality_s=768, rxd_claim_burial_s=1800, rxd_confirm_slack_s=600, rounding_slack_s=300
+    )
+
+
+def _eth_fund_policy(**kw):
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+        eth_finalization_window_s=768,
+        cross_clock_margin=kw.get("cross_clock_margin", _xmargin()),
+        max_covenant_confirm_wait_s=kw.get("max_covenant_confirm_wait_s", 3600),
+    )
+
+
+def _eth_coord_negotiated(*, terms, policy=None):
+    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    p_dummy = b"\x01" * 32
+    return SwapCoordinator(
+        record=rec,
+        counter_leg=FakeEthLeg(preimage=p_dummy, verdict=_final()),
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=policy or _eth_fund_policy(), maker_stall_safety_window_blocks=6),
+    )
+
+
+# projected_rxd_open = now + max_confirm_wait(3600) + t_rxd(72)*rxd_interval(300)=21600 = now+25200
+# deadline = eth_timeout - margin.total(3468). Need now+25200 < eth_timeout-3468 -> eth_timeout > now+28668.
+
+
+def test_eth_timelock_ordering_accepts_safe_deadline():
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    coord = _eth_coord_negotiated(terms=terms)
+    coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)  # no raise (40000 > 28668)
+
+
+def test_eth_timelock_ordering_rejects_deadline_too_close():
+    # HIGH-1 core: an eth_timeout that does NOT clear the RXD window + margin is refused —
+    # a maker cannot set a deadline that lets it refund both legs.
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 10000)  # 10000 < 28668
+    coord = _eth_coord_negotiated(terms=terms)
+    with pytest.raises(ValidationError, match="confirm too late"):
+        coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)
+
+
+def test_eth_timelock_ordering_rejects_expired_deadline():
+    # The now-vs-timeout grief (completeness finding): an already-expired ETH HTLC is refused.
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW - 100)
+    coord = _eth_coord_negotiated(terms=terms)
+    with pytest.raises(ValidationError, match="confirm too late"):
+        coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)
+
+
+def test_eth_timelock_ordering_requires_now_and_margin():
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    coord = _eth_coord_negotiated(terms=terms)
+    with pytest.raises(ValidationError, match="now_unix_s"):
+        coord._assert_eth_timelock_ordering(terms, now_unix_s=None)
+    bare = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+        eth_finalization_window_s=768,
+    )  # no cross_clock_margin / max_covenant_confirm_wait_s
+    coord2 = _eth_coord_negotiated(terms=terms, policy=bare)
+    with pytest.raises(ValidationError, match="cross_clock_margin"):
+        coord2._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)
+
+
+async def test_pre_lock_dispatches_eth_ordering_gate():
+    # Integration: pre_btc_lock_check step 3 routes an ETH swap to the cross-clock gate.
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 10000)  # too close
+    coord = _eth_coord_negotiated(terms=terms)
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert not gate.ok and "margin check failed" in gate.reason
+    # A safe deadline PASSES the ordering step (step 3). The minimal FakeEthLeg has no
+    # fund-path SPK methods, so the gate may still stop at step 4 — but never at the margin
+    # check, which is what this asserts (step-3 isolation).
+    terms_ok = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    coord_ok = _eth_coord_negotiated(terms=terms_ok)
+    gate_ok = await coord_ok.pre_btc_lock_check(terms_ok, now_unix_s=_NOW)
+    assert "margin check failed" not in (gate_ok.reason or "")

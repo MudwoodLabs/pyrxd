@@ -110,6 +110,15 @@ class EthLeg:
         """Deploy + fund the ETH HTLC from the negotiated terms, then run the post-deploy
         binding gate (verify_funded) BEFORE returning — so the coordinator never tells the
         maker to lock RXD against a wrong/attacker/under-funded contract."""
+        # Consistency (audit HIGH-1): the leg's absolute deadline MUST equal the negotiated
+        # term the coordinator's cross-clock ordering gate validated — otherwise the leg could
+        # deploy a contract with a deadline the gate never checked. Fail closed on a mismatch.
+        terms_timeout = getattr(terms, "eth_timeout_unix_s", None)
+        if terms_timeout is not None and int(terms_timeout) != self._eth_timeout_unix_s:
+            raise ValidationError(
+                f"terms.eth_timeout_unix_s ({terms_timeout}) != this leg's eth_timeout_unix_s "
+                f"({self._eth_timeout_unix_s}); the validated deadline and the deployed deadline must agree"
+            )
         locator = await self._leg.fund(
             hashlock=bytes(terms.hashlock),
             claimant=self._claim_to,

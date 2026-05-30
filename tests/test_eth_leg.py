@@ -295,3 +295,27 @@ async def test_eth_leg_delegates_provenance(monkeypatch):
     p = _p()
     await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=p)
     assert seen["args"] == ("0xtx", _CONTRACT, p)
+
+
+async def test_fund_rejects_timeout_mismatch_with_terms(monkeypatch):
+    # Wave C consistency: the leg's absolute deadline must equal the negotiated term the
+    # coordinator's ordering gate validated.
+    cl = _contract_leg()
+
+    async def fake_fund(**kw):
+        return _locator()
+
+    async def fake_verify(locator, *, expected_amount_wei):
+        pass
+
+    monkeypatch.setattr(cl, "fund", fake_fund)
+    monkeypatch.setattr(cl, "verify_funded", fake_verify)
+    leg = _eth_leg(cl)  # leg eth_timeout = _TIMEOUT (1779710245)
+
+    class _TermsMismatch:
+        hashlock = hashlib.sha256(b"x").digest()
+        value_amount = 10**15
+        eth_timeout_unix_s = 999  # != leg's _TIMEOUT
+
+    with pytest.raises(ValidationError, match="must agree"):
+        await leg.fund(_TermsMismatch())

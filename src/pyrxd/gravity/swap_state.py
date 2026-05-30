@@ -256,6 +256,11 @@ class NegotiatedTerms:
     # (BTC) construction is unchanged: counter_chain "btc"; value_amount 0 => mirror btc_sats.
     counter_chain: str = "btc"  # "btc" | "eth"
     value_amount: int = 0  # counter-leg amount: sats (btc) | wei (eth); 0 sentinel => btc_sats
+    # ETH counter leg: the ABSOLUTE unix-second refund deadline (the contract immutable
+    # ``timeout``). This is the REAL counter-leg deadline for an ETH swap — first-class and
+    # validated so the coordinator's cross-clock ordering gate checks the actual on-chain
+    # deadline, not the relative ``t_btc`` placeholder (audit HIGH-1). None for a BTC swap.
+    eth_timeout_unix_s: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "hashlock", _b32(self.hashlock, "hashlock"))
@@ -279,6 +284,14 @@ class NegotiatedTerms:
             )
         if not _pos_int(self.value_amount):
             raise ValidationError("value_amount must be a positive int")
+        # ETH absolute refund deadline: first-class for an ETH swap (the real counter-leg
+        # deadline the coordinator's cross-clock ordering gate validates); forbidden for BTC
+        # (whose deadline is the relative t_btc) so the two can never be silently confused.
+        if self.counter_chain == "eth":
+            if not _pos_int(self.eth_timeout_unix_s):
+                raise ValidationError("an ETH swap requires eth_timeout_unix_s (a positive absolute unix deadline)")
+        elif self.eth_timeout_unix_s is not None:
+            raise ValidationError("eth_timeout_unix_s is only valid on an ETH swap (BTC uses the relative t_btc)")
         if not isinstance(self.t_btc, Timelock):
             raise ValidationError("t_btc must be a Timelock")
         if not isinstance(self.t_rxd, Timelock):
@@ -344,6 +357,8 @@ class NegotiatedTerms:
             d["counter_chain"] = self.counter_chain
         if self.value_amount != self.btc_sats:
             d["value_amount"] = self.value_amount
+        if self.eth_timeout_unix_s is not None:
+            d["eth_timeout_unix_s"] = self.eth_timeout_unix_s
         return d
 
     @classmethod
@@ -362,6 +377,7 @@ class NegotiatedTerms:
             btc_refund_pubkey_xonly=bytes.fromhex(d["btc_refund_pubkey_xonly"]),
             counter_chain=str(d.get("counter_chain", "btc")),  # legacy records → btc
             value_amount=int(d.get("value_amount", 0)),  # 0 sentinel → __post_init__ = btc_sats
+            eth_timeout_unix_s=(int(d["eth_timeout_unix_s"]) if d.get("eth_timeout_unix_s") is not None else None),
         )
 
 
