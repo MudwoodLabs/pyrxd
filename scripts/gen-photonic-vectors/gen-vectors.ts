@@ -115,7 +115,13 @@ interface Vectors {
 const vectors: Vectors = {
   meta: {
     generated_by: "pyrxd-timelock bridge script (Photonic interop)",
-    photonic_lib_path: PHOTONIC_LIB,
+    // Record a username-agnostic, relative provenance path (never the absolute local
+    // checkout path) so regenerated vectors don't leak a developer's home directory.
+    photonic_lib_path:
+      (PHOTONIC_LIB.match(/Photonic-Wallet[/\\].*/)?.[0] ?? path.basename(PHOTONIC_LIB)).replace(
+        /\\/g,
+        "/",
+      ),
     generated_at: new Date().toISOString(),
     notes:
       "All vectors produced by calling Photonic's actual source files (not a " +
