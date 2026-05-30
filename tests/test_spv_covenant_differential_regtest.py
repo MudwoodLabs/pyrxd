@@ -445,9 +445,33 @@ def test_m4_over_depth_rejected_at_construction():
     This is a BUILDER-side guard, NOT an on-chain one: the covenant indexes 20 FIXED
     slot offsets and would silently ignore a 21st slot's trailing bytes (it never reads
     past slot 19). So the over-depth defense must live in the builder — which is exactly
-    why this asserts the builder raises rather than asserting a node reject."""
+    why this asserts the builder raises rather than asserting a node reject.
+
+    Unlike the rest of the matrix this needs no node — so it must also need no /tmp chain
+    cache (it runs un-skipped under ``coverage-overall``, which drops the integration
+    filter but has no RADIANT_REGTEST/grind). Build a minimal proof inline: 12 dummy
+    headers satisfy build_finalize_tx's header-count check, which runs BEFORE the branch-
+    depth check that this test exercises."""
     over = (b"\x00" + b"\x11" * 32) * 21  # 21 levels
-    spv = _proof(SATS, n_levels=1, branch=over)
+    raw = _build([b""], [(SATS, _SPK[P2WPKH](MAKER20))])
+    spv = SpvProof(
+        txid=hash256(raw)[::-1].hex(),
+        raw_tx=raw,
+        headers=[b"\x00" * 80] * _HEADER_SLOTS,  # dummy: count check passes before the depth check
+        branch=over,
+        pos=1,
+        output_offset=_output0_offset(raw),
+        covenant_params=CovenantParams(
+            btc_receive_hash=MAKER20,
+            btc_receive_type=P2WPKH,
+            btc_satoshis=SATS,
+            chain_anchor=_ANCHOR,
+            anchor_height=_ANCHOR_HEIGHT,
+            merkle_depth=1,
+            expected_nbits=None,
+        ),
+        _token=_BUILDER_TOKEN,
+    )
     with pytest.raises(ValidationError, match="exceeds covenant branch_slots"):
         build_finalize_tx(
             spv_proof=spv,
