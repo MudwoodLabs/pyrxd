@@ -17,6 +17,7 @@ import os
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.swap_state import (
     TERMINAL_STATES,
     TRANSITIONS,
@@ -430,3 +431,68 @@ def test_bad_counter_chain_rejected():
             btc_refund_pubkey_xonly=_xonly(),
             counter_chain="ltc",
         )
+
+
+# --------------------------------------------------------------------------- R3b: SwapRecord locator
+
+
+def _eth_locator() -> EthHtlcLocator:
+    return EthHtlcLocator(
+        chain_id=11155111,
+        contract_address="0x" + "ab" * 20,
+        deploy_tx_hash="0x" + "cd" * 32,
+        hashlock="0x" + "ef" * 32,
+        claimant="0x" + "11" * 20,
+        refundee="0x" + "22" * 20,
+        timeout=1779710245,
+        amount_wei=10**15,
+    )
+
+
+def test_btc_record_to_dict_is_v1_byte_identical():
+    rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=_terms()).with_btc_lock(_locator())
+    d = rec.to_dict()
+    assert "btc_locator" in d  # v1 bare key
+    assert "schema_version" not in d and "counterchain_locator" not in d
+    assert SwapRecord.from_dict(d) == rec
+    assert rec.btc_locator is not None and rec.counterchain_locator is rec.btc_locator
+
+
+def test_eth_record_roundtrip_v2_tagged():
+    terms = _eth_terms()
+    rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=terms).with_counter_lock(_eth_locator())
+    d = rec.to_dict()
+    assert d["schema_version"] == 2
+    assert d["counterchain_locator"]["chain"] == "eth"
+    assert "btc_locator" not in d
+    back = SwapRecord.from_dict(d)
+    assert back == rec
+    assert isinstance(back.counterchain_locator, EthHtlcLocator)
+    assert back.btc_locator is None  # the BTC-only alias is None for an ETH locator
+
+
+def test_legacy_v1_record_from_dict_reads_btc_locator():
+    # a pre-ETH persisted record: bare btc_locator, no schema_version/counter_chain
+    rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=_terms()).with_btc_lock(_locator())
+    v1 = rec.to_dict()
+    assert set(v1).isdisjoint({"schema_version", "counterchain_locator"})
+    back = SwapRecord.from_dict(v1)
+    assert isinstance(back.counterchain_locator, type(_locator()))
+    assert back.terms.counter_chain == "btc"
+
+
+def test_record_rejects_locator_chain_mismatch():
+    # a BTC locator on an ETH swap, and vice-versa, are fail-closed
+    with pytest.raises(ValidationError, match="counter_chain == 'eth'"):
+        SwapRecord(state=SwapState.BTC_LOCKED, terms=_terms(), counterchain_locator=_eth_locator())
+    with pytest.raises(ValidationError, match="counter_chain == 'btc'"):
+        SwapRecord(state=SwapState.BTC_LOCKED, terms=_eth_terms(), counterchain_locator=_locator())
+
+
+def test_eth_record_prefund_roundtrips_via_terms():
+    # ETH swap before the counter-leg lock: no locator yet; ETH-ness preserved via terms
+    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=_eth_terms())
+    d = rec.to_dict()
+    assert "btc_locator" in d and d["btc_locator"] is None  # v1 form, no locator
+    back = SwapRecord.from_dict(d)
+    assert back.terms.counter_chain == "eth" and back.counterchain_locator is None

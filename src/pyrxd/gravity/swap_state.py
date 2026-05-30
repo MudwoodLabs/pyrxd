@@ -30,7 +30,13 @@ from pyrxd.btc_wallet.taproot import (
     Timelock,
     TimeUnit,
 )
+from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.security.errors import ValidationError
+
+# SwapRecord wire schema version. v1 (absent) is the BTC-only form (bare ``btc_locator``);
+# v2 adds the chain-tagged ``counterchain_locator`` for an ETH counter leg. A BTC swap still
+# serialises in the v1 form (byte-identical), so the bump only appears for ETH swaps.
+SWAP_RECORD_SCHEMA_VERSION = 2
 
 __all__ = [
     "ASSET_VARIANTS",
@@ -366,7 +372,9 @@ class SwapRecord:
     re-scrapes it from chain).
 
     Optional on-chain handles (filled in as locks land):
-    * ``btc_locator`` — the funded BTC HTLC (after BTC_LOCKED).
+    * ``counterchain_locator`` — the funded counter-leg HTLC, a :class:`BtcHtlcLocator`
+      (BTC swap) or :class:`EthHtlcLocator` (ETH swap), after the counter-leg lock. The
+      ``btc_locator`` property is a transitional BTC-only alias for it.
     * ``radiant_covenant_outpoint`` — "txid:vout" of the funded Radiant covenant
       (after BOTH_LOCKED).
     * ``radiant_covenant_spk_hex`` — the observed on-chain covenant scriptPubKey,
@@ -375,7 +383,7 @@ class SwapRecord:
 
     state: SwapState
     terms: NegotiatedTerms
-    btc_locator: BtcHtlcLocator | None = None
+    counterchain_locator: BtcHtlcLocator | EthHtlcLocator | None = None
     radiant_covenant_outpoint: str | None = None
     radiant_covenant_spk_hex: str | None = None
 
@@ -384,8 +392,16 @@ class SwapRecord:
             raise ValidationError("SwapRecord.state must be a SwapState")
         if not isinstance(self.terms, NegotiatedTerms):
             raise ValidationError("SwapRecord.terms must be a NegotiatedTerms")
-        if self.btc_locator is not None and not isinstance(self.btc_locator, BtcHtlcLocator):
-            raise ValidationError("btc_locator must be a BtcHtlcLocator or None")
+        loc = self.counterchain_locator
+        if loc is not None:
+            if not isinstance(loc, (BtcHtlcLocator, EthHtlcLocator)):
+                raise ValidationError("counterchain_locator must be a Btc/Eth HtlcLocator or None")
+            # The locator chain must match the negotiated counter chain (fail-closed: a BTC
+            # locator can never ride an ETH swap or vice-versa).
+            if isinstance(loc, BtcHtlcLocator) and self.terms.counter_chain != "btc":
+                raise ValidationError("a BtcHtlcLocator requires counter_chain == 'btc'")
+            if isinstance(loc, EthHtlcLocator) and self.terms.counter_chain != "eth":
+                raise ValidationError("an EthHtlcLocator requires counter_chain == 'eth'")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -396,53 +412,88 @@ class SwapRecord:
             except ValueError:
                 raise ValidationError("radiant_covenant_spk_hex must be hex") from None
 
+    @property
+    def btc_locator(self) -> BtcHtlcLocator | None:
+        """Transitional BTC-only alias for ``counterchain_locator`` — returns it iff it is a
+        :class:`BtcHtlcLocator` (else None). Lets BTC reader sites keep using ``.btc_locator``
+        until they migrate to the chain-neutral ``counterchain_locator``."""
+        return self.counterchain_locator if isinstance(self.counterchain_locator, BtcHtlcLocator) else None
+
     def with_state(self, state: SwapState) -> SwapRecord:
         """Return a copy advanced to ``state`` (transition not re-validated here;
         the coordinator validates via :func:`advance` before persisting)."""
         return SwapRecord(
             state=state,
             terms=self.terms,
-            btc_locator=self.btc_locator,
+            counterchain_locator=self.counterchain_locator,
+            radiant_covenant_outpoint=self.radiant_covenant_outpoint,
+            radiant_covenant_spk_hex=self.radiant_covenant_spk_hex,
+        )
+
+    def with_counter_lock(self, locator: BtcHtlcLocator | EthHtlcLocator) -> SwapRecord:
+        """Attach the funded counter-leg locator (BTC or ETH)."""
+        return SwapRecord(
+            state=self.state,
+            terms=self.terms,
+            counterchain_locator=locator,
             radiant_covenant_outpoint=self.radiant_covenant_outpoint,
             radiant_covenant_spk_hex=self.radiant_covenant_spk_hex,
         )
 
     def with_btc_lock(self, locator: BtcHtlcLocator) -> SwapRecord:
-        return SwapRecord(
-            state=self.state,
-            terms=self.terms,
-            btc_locator=locator,
-            radiant_covenant_outpoint=self.radiant_covenant_outpoint,
-            radiant_covenant_spk_hex=self.radiant_covenant_spk_hex,
-        )
+        """Transitional alias for :meth:`with_counter_lock` (BTC reader sites)."""
+        return self.with_counter_lock(locator)
 
     def with_radiant_lock(self, outpoint: str, spk_hex: str) -> SwapRecord:
         return SwapRecord(
             state=self.state,
             terms=self.terms,
-            btc_locator=self.btc_locator,
+            counterchain_locator=self.counterchain_locator,
             radiant_covenant_outpoint=outpoint,
             radiant_covenant_spk_hex=spk_hex,
         )
 
     def to_dict(self) -> dict:
-        """JSON-serialisable form. The preimage ``p`` is NOT a field and is never
-        written — serialising the record can never leak the secret to disk."""
-        return {
+        """JSON-serialisable form. The preimage ``p`` is NOT a field and is never written —
+        serialising the record can never leak the secret to disk.
+
+        A BTC swap serialises in the v1 form (bare ``btc_locator``, no ``schema_version``),
+        byte-for-byte identical to the pre-ETH schema; a swap whose counter-leg locator is an
+        :class:`EthHtlcLocator` serialises the v2 chain-tagged ``counterchain_locator`` +
+        ``schema_version``."""
+        d: dict = {
             "state": self.state.value,
             "terms": self.terms.to_dict(),
-            "btc_locator": self.btc_locator.to_dict() if self.btc_locator is not None else None,
             "radiant_covenant_outpoint": self.radiant_covenant_outpoint,
             "radiant_covenant_spk_hex": self.radiant_covenant_spk_hex,
         }
+        loc = self.counterchain_locator
+        if isinstance(loc, EthHtlcLocator):
+            d["schema_version"] = SWAP_RECORD_SCHEMA_VERSION
+            d["counterchain_locator"] = {"chain": "eth", "locator": loc.to_dict()}
+        else:
+            # BtcHtlcLocator or None → v1 wire form (byte-identical to the pre-ETH schema).
+            d["btc_locator"] = loc.to_dict() if loc is not None else None
+        return d
 
     @classmethod
     def from_dict(cls, d: dict) -> SwapRecord:
-        loc = d.get("btc_locator")
+        if "counterchain_locator" in d:  # v2 chain-tagged form
+            cc = d["counterchain_locator"]
+            chain, locd = cc.get("chain"), cc.get("locator")
+            if chain == "eth":
+                loc: BtcHtlcLocator | EthHtlcLocator | None = EthHtlcLocator.from_dict(locd)
+            elif chain == "btc":
+                loc = BtcHtlcLocator.from_dict(locd)
+            else:
+                raise ValidationError(f"unknown counterchain_locator chain: {chain!r}")
+        else:  # v1 / legacy form (bare btc_locator)
+            bloc = d.get("btc_locator")
+            loc = BtcHtlcLocator.from_dict(bloc) if bloc is not None else None
         return cls(
             state=SwapState(d["state"]),
             terms=NegotiatedTerms.from_dict(d["terms"]),
-            btc_locator=BtcHtlcLocator.from_dict(loc) if loc is not None else None,
+            counterchain_locator=loc,
             radiant_covenant_outpoint=d.get("radiant_covenant_outpoint"),
             radiant_covenant_spk_hex=d.get("radiant_covenant_spk_hex"),
         )
