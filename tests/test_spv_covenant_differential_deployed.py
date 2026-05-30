@@ -28,7 +28,10 @@ Anything the spec flags as UNCERTAIN (needs live-regtest) is NOT asserted as
 agreement: it is skipped or xfailed with a clear marker. In particular the
 8-byte OP_BIN2NUM >4-byte-element numeric behaviour, the compile-time
 claimDeadline clamp, OP_OUTPUTVALUE arity, and the exact tolerated branch length
-are NOT modelled as accept/reject decisions.
+are NOT modelled as accept/reject decisions here. All four are now CONFIRMED on
+live radiant-core:v2.3.0 regtest consensus in
+``tests/test_spv_covenant_differential_regtest.py`` (groups V / S-3 / S-2 / M); see
+``docs/brainstorms/gravity-ref-spike/REGTEST_COVENANT_SEMANTICS_RESULTS.json``.
 
 The deployed-covenant model here covers ONLY the funding-tx structure + payment
 parse (spec sections B/C) and the header/nBits/PoW/merkle gates (sections D/E/F)
@@ -141,12 +144,14 @@ def deployed_covenant_accepts(
     separately (see ``model_*`` helpers) since the Python path verifies those in
     dedicated functions.
 
-    NOT modelled (spec UNCERTAIN — never asserted as accept/reject here):
-      * the 8-byte OP_BIN2NUM >4-byte numeric-overflow behaviour for the value read
-        (we only model the bit-63-negative case the spec pins);
-      * whether a multi-output RXD finalize is accepted (introspection arity);
-      * the empty-scriptSig live-acceptance question;
-      * the compile-time claimDeadline clamp.
+    NOT modelled (spec UNCERTAIN — never asserted as accept/reject here; all four are
+    CONFIRMED live in test_spv_covenant_differential_regtest.py, see that file's
+    REGTEST_COVENANT_SEMANTICS_RESULTS.json):
+      * the 8-byte OP_BIN2NUM >4-byte numeric behaviour for the value read — covenant
+        is 64-bit numeric (regtest group V); we only model the bit-63-negative case here;
+      * whether a multi-output RXD finalize is accepted — index-0-only, ACCEPTS (S-2);
+      * the empty-scriptSig live-acceptance question — ACCEPTS (S-1 baseline);
+      * the compile-time claimDeadline clamp — floor 1774427796 enforced (S-3).
     """
 
     def split(b: bytes, n: int) -> tuple[bytes, bytes]:
@@ -575,10 +580,13 @@ def test_header_chain_anchor_differential():
 
 
 @pytest.mark.skip(
-    reason="needs live-regtest: nBits exponent ceiling 0x20 vs Python's 0x1d cap "
-    "(pow.py/Nbits reject exp>0x1d; covenant tolerates up to 0x20). Asserting "
-    "agreement on exp 0x1e..0x20 would require a real header the covenant accepts "
-    "but Python rejects — a real Direction divergence to confirm on-chain, not guess."
+    reason="RESOLVED live in tests/test_spv_covenant_differential_regtest.py::"
+    "test_header_nbits_exponent_ceiling (NB-1..NB-2c): on radiant-core:v2.3.0 regtest "
+    "the covenant ACCEPTS nBits exponent 0x1e/0x1f/0x20 (which Python's Nbits rejects "
+    "as > 0x1d) and REJECTS 0x21 — a confirmed Direction-B accept-band [0x1e..0x20]. "
+    "Corroborates F-02 (reject_low_difficulty mandatory for any covenant-less SPV use). "
+    "Evidence: docs/brainstorms/gravity-ref-spike/REGTEST_COVENANT_SEMANTICS_RESULTS.json. "
+    "This placeholder stays skipped; the live integration test is the evidence."
 )
 def test_header_nbits_exponent_ceiling_divergence_needs_regtest():
     raise AssertionError("unreachable: skipped")
@@ -720,11 +728,13 @@ def test_coinbase_pos_aliasing_rejected_differential():
 
 
 @pytest.mark.skip(
-    reason="needs live-regtest: the 8-byte OP_BIN2NUM numeric behaviour for a "
-    "value with 5..8 significant bytes (Radiant CScriptNum element-size limit). "
-    "rxd_sim flags this unmodeled; the deployed model only pins the bit-63-negative "
-    "case. Must be confirmed by testmempoolaccept of a real >4-significant-byte "
-    "value, not asserted from a guess."
+    reason="RESOLVED live in tests/test_spv_covenant_differential_regtest.py::"
+    "test_value_bin2num_significant_bytes (V-1..V-5): on radiant-core:v2.3.0 regtest the "
+    "covenant reads output-0 value as a full 64-bit signed CScriptNum — 5/7/8-significant-"
+    "byte values ACCEPT (>= threshold incl. a 7-byte value vs a 7-byte threshold), a "
+    "bit-63-set value decodes NEGATIVE and REJECTS, and a 7-byte value just below a 7-byte "
+    "threshold REJECTS. No Direction-A divergence (the covenant is genuinely 64-bit "
+    "numeric). Evidence: docs/brainstorms/gravity-ref-spike/REGTEST_COVENANT_SEMANTICS_RESULTS.json."
 )
 def test_value_5_to_8_byte_bin2num_needs_regtest():
     raise AssertionError("unreachable: skipped")
