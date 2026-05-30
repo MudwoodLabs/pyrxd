@@ -48,6 +48,7 @@ from pyrxd.btc_wallet.taproot import (
     TimeUnit,
     btc_input_outpoints_from_raw,
 )
+from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import SecretBytes
 
@@ -717,7 +718,8 @@ class SwapCoordinator:
         self,
         *,
         record,
-        btc_leg,
+        counter_leg=None,
+        btc_leg=None,
         radiant_leg,
         indexer,
         seen_store,
@@ -730,6 +732,14 @@ class SwapCoordinator:
             raise ValidationError("config must be a CoordinatorConfig")
         if persist is not None and not callable(persist):
             raise ValidationError("persist must be an async callable or None")
+        # Counter leg: the chain-neutral ``counter_leg`` (preferred) OR the legacy
+        # ``btc_leg`` (transitional alias) — exactly one. The BTC path may pass either;
+        # an ETH swap passes ``counter_leg=EthLeg``.
+        if counter_leg is not None and btc_leg is not None:
+            raise ValidationError("pass counter_leg OR btc_leg, not both")
+        leg = counter_leg if counter_leg is not None else btc_leg
+        if leg is None:
+            raise ValidationError("a counter_leg (or btc_leg) is required")
         # SEEN-1 guard: refuse a NON-durable (in-process) seen-store on a
         # value-bearing network unless the operator explicitly accepts it. A
         # non-durable store loses H-freshness on a restart / second process, so a
@@ -737,7 +747,7 @@ class SwapCoordinator:
         # re-open the replay / free-option window. ``durable`` defaults False for
         # any store that does not declare itself durable (fail-closed).
         store_durable = bool(getattr(seen_store, "durable", False))
-        value_bearing = _leg_is_value_bearing(btc_leg) or _leg_is_value_bearing(radiant_leg)
+        value_bearing = _leg_is_value_bearing(leg) or _leg_is_value_bearing(radiant_leg)
         if value_bearing and not store_durable and not config.accept_nondurable_seen:
             raise ValidationError(
                 "seen-store is NON-durable (in-process only) but the coordinator is wired to a "
@@ -751,12 +761,17 @@ class SwapCoordinator:
         # a check-then-advance across an await on a single instance.
         self._step_lock = asyncio.Lock()
         self.record = record
-        self.btc_leg = btc_leg
+        self.counter_leg = leg
         self.radiant_leg = radiant_leg
         self.indexer = indexer
         self.seen_store = seen_store
         self.config = config
         self._persist = persist
+
+    @property
+    def btc_leg(self):
+        """Transitional alias for ``counter_leg`` (the chain-neutral counter leg)."""
+        return self.counter_leg
 
     # -- internal: advance + persist-shape ----------------------------------
     def _advance(self, event: SwapEvent) -> SwapState:
@@ -833,8 +848,8 @@ class SwapCoordinator:
 
         # 4. Maker-promised BTC params match locally re-derived funding SPK.
         try:
-            expected_spk = self.btc_leg.derive_funding_scriptpubkey(terms)
-            promised_spk = self.btc_leg.promised_funding_scriptpubkey(terms)
+            expected_spk = self.counter_leg.derive_funding_scriptpubkey(terms)
+            promised_spk = self.counter_leg.promised_funding_scriptpubkey(terms)
         except Exception as exc:
             return PreBtcLockGate(ok=False, reason=f"could not derive BTC funding SPK; fail-closed ({exc})")
         if expected_spk != promised_spk:
@@ -886,23 +901,26 @@ class SwapCoordinator:
         if not reserved:
             raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
 
-        locator = await self.btc_leg.fund(terms)
-        if not isinstance(locator, BtcHtlcLocator):
-            raise ValidationError("btc_leg.fund must return a BtcHtlcLocator (full durable retained state)")
-        # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits
-        # to the taptree, NOT the output value, so the funding SPK check in
-        # pre_btc_lock_check (step 4) cannot catch a wrong amount — this is the only
-        # layer that can. An OVER-funded HTLC is a one-sided taker loss: the maker
-        # claims the whole output via the preimage (the claim leaf does not cap value).
-        # Under-funding is self-correcting (the maker won't reveal), but we reject both
-        # so a mutated `terms` or a buggy leg fails closed before the BTC is locked.
-        if locator.amount_sats != terms.btc_sats:
+        locator = await self.counter_leg.fund(terms)
+        if not isinstance(locator, (BtcHtlcLocator, EthHtlcLocator)):
+            raise ValidationError("counter_leg.fund must return a Btc/Eth HtlcLocator (full durable retained state)")
+        # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits to
+        # the taptree, NOT the output value (and an ETH HTLC contract address commits to
+        # immutables, not the funded balance), so the funding-target check in
+        # pre_btc_lock_check (step 4) cannot catch a wrong amount — this is the only layer
+        # that can. An OVER-funded HTLC is a one-sided taker loss: the maker claims the
+        # whole output via the preimage (the claim leaf does not cap value). Under-funding
+        # is self-correcting (the maker won't reveal), but we reject both so a mutated
+        # `terms` or a buggy leg fails closed before the counter leg is locked. The leg
+        # reports the funded amount in its own unit (sats / wei) via ``locked_amount``.
+        funded = self.counter_leg.locked_amount(locator)
+        if funded != terms.value_amount:
             raise ValidationError(
-                f"funded BTC amount {locator.amount_sats} != negotiated btc_sats {terms.btc_sats}; "
+                f"funded counter-leg amount {funded} != negotiated value_amount {terms.value_amount}; "
                 "refusing to lock a mis-valued HTLC"
             )
         # (H was already reserved atomically pre-broadcast above — no post-fund mark.)
-        self.record = self.record.with_btc_lock(locator)
+        self.record = self.record.with_counter_lock(locator)
         self._advance(SwapEvent.TAKER_FUNDS_BTC)
         # Shielded: the BTC is locked on-chain now; losing this write would
         # double-fund on retry, so it must complete even under cancellation.
@@ -965,13 +983,13 @@ class SwapCoordinator:
             raise ValidationError(f"maker_claims_btc only valid from BOTH_LOCKED, not {self.record.state.value}")
         if not isinstance(preimage, SecretBytes):
             raise ValidationError("preimage must be SecretBytes (in-memory only; never persisted)")
-        if self.record.btc_locator is None:
+        if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; cannot claim")
         raw = preimage.unsafe_raw_bytes()
         if hashlib.sha256(raw).digest() != self.record.terms.hashlock:
             raise ValidationError("preimage does not hash to the negotiated H; refusing to broadcast")
         try:
-            await self.btc_leg.claim(self.record.btc_locator, raw)
+            await self.counter_leg.claim(self.record.counterchain_locator, raw)
         finally:
             preimage.zeroize()
         self._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
@@ -988,7 +1006,7 @@ class SwapCoordinator:
         is the witness-side cross-swap-replay defence that complements the admission-side
         seen-store. Fail-closed on a missing locator or an unparseable tx.
         """
-        locator = self.record.btc_locator
+        locator = self.record.counterchain_locator
         if locator is None:
             raise ValidationError("no BTC locator on record; cannot verify claim-tx provenance")
         expected = locator.funding_outpoint.prevout_bytes()
@@ -1043,7 +1061,7 @@ class SwapCoordinator:
             )
         # Cheap, no-network checks first: a tx that doesn't even contain p is rejected
         # before any RPC round-trip.
-        p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
+        p = self.counter_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
         # Provenance: the tx we scraped p from must spend OUR funding outpoint (defends
@@ -1052,7 +1070,7 @@ class SwapCoordinator:
 
         # Reorg gate: read the maker's BTC-claim depth (fail-closed on any error) and
         # assess against the t_rxd window.
-        btc_confs = await self.btc_leg.confirmations_of_claim(maker_claim_tx_bytes)
+        btc_confs = await self.counter_leg.confirmations_of_claim(maker_claim_tx_bytes)
         policy = self.config.margin_policy
         required_depth = policy.btc_claim_reorg_depth.normalize_to(
             TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
@@ -1104,7 +1122,7 @@ class SwapCoordinator:
             raise ValidationError(
                 f"taker_claim_asset_from_vulnerable only valid from ASSET_VULNERABLE, not {self.record.state.value}"
             )
-        p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
+        p = self.counter_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
         self._assert_claim_tx_spends_our_htlc(maker_claim_tx_bytes)
@@ -1159,9 +1177,9 @@ class SwapCoordinator:
         state = self.record.state
         if state not in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
             raise ValidationError(f"taker_refund_btc not valid from {state.value}")
-        if self.record.btc_locator is None:
+        if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; cannot refund (state was lost)")
-        await self.btc_leg.refund(self.record.btc_locator, self.record.terms.t_btc)
+        await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
         if state is SwapState.BTC_LOCKED:
             self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
         else:
@@ -1180,9 +1198,9 @@ class SwapCoordinator:
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(f"mutual_refund only valid from BOTH_LOCKED, not {self.record.state.value}")
-        if self.record.btc_locator is None:
+        if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; BTC would strand (state was lost)")
-        await self.btc_leg.refund(self.record.btc_locator, self.record.terms.t_btc)
+        await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
         await self.radiant_leg.refund_asset(self.record)
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
         await self._persist_record(self.record, shield=True)

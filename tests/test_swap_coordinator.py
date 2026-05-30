@@ -126,6 +126,9 @@ class FakeBtcLeg:
         self.calls.append("refund")
         self.refunded = True
 
+    def locked_amount(self, locator) -> int:
+        return locator.amount_sats
+
     # Sync: pure byte-parse of the claim tx witness (no chain access).
     def scrape_secret(self, claim_tx_bytes: bytes, hashlock: bytes) -> bytes:
         return t.scrape_secret(claim_tx_bytes, hashlock)
@@ -317,7 +320,7 @@ async def test_taker_funds_btc_rejects_amount_mismatch():
     over_leg = FakeBtcLeg(fund_amount_delta=50_000)
     seen = FakeSeenStore()
     coord = _coordinator(terms=terms, btc_leg=over_leg, seen_store=seen)
-    with pytest.raises(ValidationError, match="funded BTC amount"):
+    with pytest.raises(ValidationError, match="funded counter-leg amount"):
         await coord.taker_funds_btc(terms)
     assert coord.record.state is SwapState.NEGOTIATED  # never advanced
     # H IS consumed here, NOT a regression: reserve() commits PRE-broadcast, and the
@@ -330,7 +333,7 @@ async def test_taker_funds_btc_rejects_amount_mismatch():
     # Underfund: also rejected (self-correcting in practice, but fail-closed here).
     under_leg = FakeBtcLeg(fund_amount_delta=-1)
     coord2 = _coordinator(terms=terms, btc_leg=under_leg)
-    with pytest.raises(ValidationError, match="funded BTC amount"):
+    with pytest.raises(ValidationError, match="funded counter-leg amount"):
         await coord2.taker_funds_btc(terms)
 
     # Exact match still funds and advances.
