@@ -496,3 +496,14 @@ def test_eth_record_prefund_roundtrips_via_terms():
     assert "btc_locator" in d and d["btc_locator"] is None  # v1 form, no locator
     back = SwapRecord.from_dict(d)
     assert back.terms.counter_chain == "eth" and back.counterchain_locator is None
+
+
+def test_eth_value_amount_zero_rejected_no_sats_coercion():
+    # ETH value_amount is WEI; the 0=>btc_sats sentinel must NOT cross the sats↔wei boundary
+    # (audit fail_closed). A forgotten wei value fails closed instead of silently funding at
+    # the sats scale.
+    with pytest.raises(ValidationError, match="explicitly set for an ETH swap"):
+        _eth_terms(value_wei=0)
+    # BTC keeps the 0 -> btc_sats sentinel (byte-equivalent).
+    btc = _terms(variant="rxd")
+    assert btc.value_amount == btc.btc_sats

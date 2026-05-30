@@ -1660,3 +1660,56 @@ async def test_eth_claim_squeezed_then_explicit_vulnerable_claim():
     rec = await coord.taker_claim_asset_from_vulnerable("0xclaim")
     assert rec.state is SwapState.COMPLETED
     assert rxd.claimed_with == p.unsafe_raw_bytes()
+
+
+# --------------------------------------------------------------------------- Wave B (audit fixes)
+
+
+def test_eth_finalization_window_floor_enforced():
+    # Below the ~2-epoch (768s) floor -> rejected at MarginPolicy construction.
+    with pytest.raises(ValidationError, match="safety floor"):
+        MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            eth_finalization_window_s=300,
+        )
+    ok = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        eth_finalization_window_s=768,
+    )
+    assert ok.eth_finalization_window_s == 768
+
+
+def test_eth_coordinator_requires_finalization_window_at_setup():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h)
+    bad_policy = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+    )  # no eth_finalization_window_s
+    with pytest.raises(ValidationError, match="eth_finalization_window_s"):
+        SwapCoordinator(
+            record=SwapRecord(
+                state=SwapState.SECRET_REVEALED,
+                terms=terms,
+                counterchain_locator=_eth_locator(terms.hashlock),
+            ),
+            counter_leg=FakeEthLeg(preimage=p, verdict=_final()),
+            radiant_leg=FakeRadiantLeg(),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),
+            config=CoordinatorConfig(margin_policy=bad_policy, maker_stall_safety_window_blocks=6),
+        )
+
+
+def test_reserve_to_blocks_rounds_up_for_seconds():
+    from pyrxd.gravity.swap_coordinator import _reserve_to_blocks
+
+    assert _reserve_to_blocks(t.Timelock(6, t.TimeUnit.BLOCKS), 600.0) == 6  # identity for BLOCKS
+    # ceil(1300/600)=3, NOT floor 2 — a reserve must round UP (the safe direction).
+    assert _reserve_to_blocks(t.Timelock(1300, t.TimeUnit.SECONDS), 600.0) == 3

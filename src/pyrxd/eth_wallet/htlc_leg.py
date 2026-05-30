@@ -134,14 +134,23 @@ class EthHtlcContractLeg:
     # offline unit tests (which cover the pure layer above). Each documents its contract.
 
     def _runtime_code_matches(self, on_chain: bytes) -> bool:
-        """Compare on-chain runtime to the committed artifact, IGNORING immutable slots.
+        """Compare on-chain runtime to the committed artifact, masking committed-zero bytes.
 
         Solidity splices ``immutable`` values (hashlock/claimant/refundee/timeout)
         directly into the runtime bytecode at deploy time; the committed ``bin-runtime``
         carries zero-placeholders there, so a byte-exact compare always fails. We require
-        the same length and a byte-match everywhere the committed code is NON-zero (the
-        actual program logic). The immutables themselves are then checked by value via
-        the getters in :meth:`verify_funded` — which is the meaningful check anyway.
+        the same length and a byte-match everywhere the committed code is NON-zero.
+
+        HONESTY / LIMITATION (audit eth_leg_web3 LOW): this masks EVERY committed-zero
+        position, which is a SUPERSET of the immutable slots — legitimate zero logic bytes
+        (STOP, PUSH1 0x00, leading-zero PUSH operands, metadata padding) are therefore NOT
+        verified, so this gate alone does not fully prove "no modified logic". The meaningful
+        binding is the immutables-checked-by-getter step in :meth:`verify_funded`; a precise
+        compare that masks ONLY the artifact's ``immutableReferences`` offset ranges (and
+        byte-matches every other position, zeros included) is a hardening follow-up that
+        requires the injected artifact to carry ``immutableReferences``. Not exploitable in
+        the current self-deploy wiring (the taker deploys its own contract), but the advertised
+        "no attacker contract" strength is bounded by this until the slot-accurate compare lands.
         """
         expected = self.expected_runtime_code
         if len(on_chain) != len(expected):
@@ -160,7 +169,10 @@ class EthHtlcContractLeg:
              the getters == the negotiated terms in the locator (the meaningful binding
              check — proves the contract releases on the right secret to the right party
              at the right time);
-          4. funded balance == expected amount (no underfunded contract).
+          4. claimant and refundee are EOAs (empty code) — a contract recipient that
+             reverts on ``receive`` would brick claim/refund via the contract's
+             ``require(ok)``;
+          5. funded balance == expected amount (no underfunded contract).
         """
         await self._rpc.assert_chain()
         code = await self._rpc.get_code(locator.contract_address)
@@ -181,6 +193,12 @@ class EthHtlcContractLeg:
             raise ValidationError("on-chain refundee != negotiated taker")
         if on_timeout != locator.timeout:
             raise ValidationError("on-chain timeout != negotiated timeout")
+        # EOA-only claimant/refundee: empty code == EOA. A contract recipient that reverts on
+        # receive would lock the funds via the HTLC's require(ok) on the ETH transfer.
+        if await self._rpc.get_code(locator.claimant):
+            raise ValidationError("claimant has contract code (not an EOA); a reverting recipient could lock funds")
+        if await self._rpc.get_code(locator.refundee):
+            raise ValidationError("refundee has contract code (not an EOA); a reverting recipient could lock funds")
         bal = await self._rpc.get_balance(locator.contract_address)
         if bal != expected_amount_wei:
             raise ValidationError(f"funded balance {bal} wei != negotiated {expected_amount_wei} wei")

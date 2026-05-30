@@ -265,9 +265,18 @@ class NegotiatedTerms:
             raise ValidationError("radiant_amount must be a positive int")
         if self.counter_chain not in COUNTER_CHAINS:
             raise ValidationError(f"counter_chain must be one of {sorted(COUNTER_CHAINS)}")
-        # value_amount defaults to btc_sats (the BTC counter-leg amount) when left 0.
-        if self.value_amount == 0:
-            object.__setattr__(self, "value_amount", self.btc_sats)
+        # value_amount: for a BTC swap the 0 sentinel mirrors btc_sats (same sats unit); for an
+        # ETH swap value_amount is WEI (a different unit) and MUST be given explicitly — a
+        # forgotten wei value must never silently inherit a sats number (audit fail_closed:
+        # cross-unit mis-scale by ~1e10 that would still pass the funded-amount bind).
+        if self.counter_chain == "btc":
+            if self.value_amount == 0:
+                object.__setattr__(self, "value_amount", self.btc_sats)
+        elif self.value_amount == 0:
+            raise ValidationError(
+                "value_amount (wei) must be explicitly set for an ETH swap — the 0=>btc_sats "
+                "sentinel does not cross the sats↔wei unit boundary"
+            )
         if not _pos_int(self.value_amount):
             raise ValidationError("value_amount must be a positive int")
         if not isinstance(self.t_btc, Timelock):

@@ -143,6 +143,13 @@ ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS = 6
 # even a dust run must use >= 2. NOT a configurable knob — it is the fail-closed floor.
 _MIN_REORG_DEPTH_BLOCKS = 2
 
+# Hard safety floor (SECONDS) for the ETH/PoS finalization window. Post-Merge finality is two
+# epochs (2 * 32 slots * 12 s = 768 s) in the steady state; a smaller window collapses the
+# reorg-gate's finalization reserve toward zero. Enforced at MarginPolicy construction whenever
+# eth_finalization_window_s is set (the ETH-swap PRESENCE of the field is enforced fail-closed
+# at SwapCoordinator construction, where the counter chain is known).
+_MIN_ETH_FINALIZATION_WINDOW_S = 768
+
 
 @dataclass(frozen=True)
 class MarginPolicy:
@@ -227,12 +234,19 @@ class MarginPolicy:
                 "real-value mode (require_measured=True) requires a MEASURED margin; "
                 "the ESTIMATED default is test-only — supply measured block data + reorg depth"
             )
-        if self.eth_finalization_window_s is not None and (
-            not isinstance(self.eth_finalization_window_s, int)
-            or isinstance(self.eth_finalization_window_s, bool)
-            or self.eth_finalization_window_s <= 0
-        ):
-            raise ValidationError("MarginPolicy.eth_finalization_window_s must be a positive int or None")
+        if self.eth_finalization_window_s is not None:
+            if (
+                not isinstance(self.eth_finalization_window_s, int)
+                or isinstance(self.eth_finalization_window_s, bool)
+                or self.eth_finalization_window_s <= 0
+            ):
+                raise ValidationError("MarginPolicy.eth_finalization_window_s must be a positive int or None")
+            if self.eth_finalization_window_s < _MIN_ETH_FINALIZATION_WINDOW_S:
+                raise ValidationError(
+                    f"MarginPolicy.eth_finalization_window_s = {self.eth_finalization_window_s}s < safety floor "
+                    f"{_MIN_ETH_FINALIZATION_WINDOW_S}s (~2 post-Merge epochs); a smaller window collapses the "
+                    "finalization reserve in the reorg gate"
+                )
 
     @classmethod
     def estimated(cls, *, block_interval_s: float = 600.0, require_measured: bool = False) -> MarginPolicy:
@@ -490,6 +504,18 @@ class ClaimFinality(Enum):
     SQUEEZED = "squeezed"
 
 
+def _reserve_to_blocks(reserve: Timelock, block_interval_s: float) -> int:
+    """Convert a REQUIREMENT/reserve Timelock to BLOCKS, rounding UP for a seconds-tagged value.
+
+    A reserve (claim burial, reorg depth) must round UP: flooring it under-counts the reserve —
+    the UNSAFE direction (audit finality INFO). Identity for a BLOCKS-tagged value. Contrast a
+    DEADLINE like ``t_rxd``, where flooring is safe because it only shrinks the available window.
+    """
+    if reserve.unit is TimeUnit.BLOCKS:
+        return reserve.value
+    return math.ceil(reserve.value / block_interval_s)
+
+
 def assess_claim_finality(
     *,
     counter_claim_finality: CounterClaimFinality,
@@ -539,12 +565,10 @@ def assess_claim_finality(
         )
     try:
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
-        rxd_burial = policy.rxd_claim_burial.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
-        ).value
-        required_depth_blocks = policy.btc_claim_reorg_depth.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
-        ).value
+        # Reserves round UP when seconds-tagged (flooring under-counts a reserve — unsafe);
+        # t_rxd above floors, which is safe for a deadline (only shrinks the window).
+        rxd_burial = _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
+        required_depth_blocks = _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
     except ValidationError:
         raise
     except Exception as exc:  # pragma: no cover - normalize_to only raises ValidationError
@@ -783,6 +807,16 @@ class SwapCoordinator:
                 "free-option window (SEEN-1). Use a durable SeenStore (durable=True), or pass "
                 "CoordinatorConfig(accept_nondurable_seen=True) to consciously accept "
                 "non-durability for a single-process, single-shot, fresh-H-per-run runbook."
+            )
+        # ETH (finalized-checkpoint) counter leg requires a finalization window on the policy
+        # (audit finality/fsm fail-closed-at-setup): the reorg gate's no-depth WAIT-branch
+        # reserve is derived from eth_finalization_window_s. Without it the gate can only fail
+        # at claim time — the worst moment. The counter chain is known here, so refuse now.
+        if record.terms.counter_chain != "btc" and config.margin_policy.eth_finalization_window_s is None:
+            raise ValidationError(
+                f"counter_chain={record.terms.counter_chain!r} (finalized-checkpoint leg) requires "
+                "MarginPolicy.eth_finalization_window_s to be set; the reorg gate's finalization reserve "
+                "depends on it — refusing to construct a coordinator that can only fail at claim time"
             )
         # One coordinator instance = one swap. This lock serializes the FSM-advancing
         # steps (see @_serialized_step) so a future concurrent driver cannot interleave
@@ -1179,6 +1213,11 @@ class SwapCoordinator:
             claim_tx_hash, contract_address=locator.contract_address, preimage=bytes(p)
         )
         # Reorg gate: the ETH finalized-checkpoint verdict (no depth) feeds the t_rxd squeeze.
+        # NOTE (RF-06): this point-in-time producer only ever returns FINAL or NOT_YET_FINAL_LIVE
+        # — never COUNTER_CHAIN_NOT_FINALIZING — so an actual ETH finalization STALL degrades to
+        # WAIT-until-the-window-closes (still SAFE: never claims off a non-final reveal), not an
+        # early SQUEEZE. Timely stall handling needs the deferred polling driver to inject the
+        # stall verdict; the assess_claim_finality stall branch is unreachable via this path alone.
         verdict = await self.counter_leg.claim_finality_verdict(claim_tx_hash)
         finality = assess_claim_finality(
             counter_claim_finality=verdict,
