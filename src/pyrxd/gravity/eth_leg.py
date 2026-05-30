@@ -78,6 +78,9 @@ class EthLeg:
         self._claim_to = claim_to
         self._refund_to = refund_to
         self._eth_timeout_unix_s = int(eth_timeout_unix_s)
+        # Set the instant a contract is deployed (BEFORE verify_funded) so a post-deploy verify
+        # failure still leaves the stranded contract address recoverable for a timelock refund.
+        self.last_funded_locator: EthHtlcLocator | None = None
 
     # -- funding target (the coordinator's pre-lock derive==promised gate) --------------
     #
@@ -109,7 +112,19 @@ class EthLeg:
     async def fund(self, terms) -> EthHtlcLocator:
         """Deploy + fund the ETH HTLC from the negotiated terms, then run the post-deploy
         binding gate (verify_funded) BEFORE returning — so the coordinator never tells the
-        maker to lock RXD against a wrong/attacker/under-funded contract."""
+        maker to lock RXD against a wrong/attacker/under-funded contract.
+
+        DEPLOY-THEN-VERIFY ATOMICITY (audit completeness): unlike the BTC P2TR path (whose
+        funding address is pre-derived and verified BEFORE any broadcast), an ETH HTLC contract
+        does not exist until it is deployed, so ``verify_funded`` necessarily runs AFTER the
+        deploy+fund has already put value on-chain. If verify fails (wrong immutables, balance
+        mismatch, attacker logic), the ETH is locked in a contract the coordinator rejects. The
+        loss is BOUNDED and RECOVERABLE: the contract pays its immutable ``refundee`` (the
+        taker) via ``refund()`` after ``timeout``. To make the stranded deploy recoverable
+        WITHOUT a chain rescan, we stash the deployed locator on ``self.last_funded_locator``
+        BEFORE verify — so a caller that sees ``fund`` raise still has the contract address to
+        drive the timelock refund. (A full coordinator-record-level recovery is a Phase-4 item.)
+        """
         # Consistency (audit HIGH-1): the leg's absolute deadline MUST equal the negotiated
         # term the coordinator's cross-clock ordering gate validated — otherwise the leg could
         # deploy a contract with a deadline the gate never checked. Fail closed on a mismatch.
@@ -126,6 +141,9 @@ class EthLeg:
             timeout=self._eth_timeout_unix_s,
             amount_wei=int(terms.value_amount),
         )
+        # The contract is now live on-chain — stash the address so a verify failure below still
+        # leaves the deploy recoverable (refundable) instead of lost.
+        self.last_funded_locator = locator
         await self._leg.verify_funded(locator, expected_amount_wei=int(terms.value_amount))
         return locator
 

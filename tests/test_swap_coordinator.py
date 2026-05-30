@@ -1527,12 +1527,69 @@ class FakeEthLeg:
     flipped to fail-closed. No ``network`` attr → the value-bearing/durable gate stays off.
     """
 
-    def __init__(self, *, preimage, verdict: CounterClaimFinality, provenance_ok: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        preimage,
+        verdict: CounterClaimFinality,
+        provenance_ok: bool = True,
+        fund_amount_delta: int = 0,
+        verify_raises: bool = False,
+    ) -> None:
         self._p = preimage.unsafe_raw_bytes() if isinstance(preimage, SecretBytes) else bytes(preimage)
         self._verdict = verdict
         self.provenance_ok = provenance_ok
+        self.fund_amount_delta = fund_amount_delta  # simulate a mis-funded (over/under) contract
+        self.verify_raises = verify_raises  # simulate verify_funded failing AFTER deploy (atomicity inversion)
         self.calls: list[str] = []
         self.provenance_args: dict | None = None
+        self.last_locator: EthHtlcLocator | None = None
+        self.claimed_with: bytes | None = None
+        self.refunded = False
+
+    # -- fund-path (full lifecycle) ----------------------------------------------------
+    def _commitment(self, terms) -> bytes:
+        return hashlib.sha256(
+            b"fake-eth-commit" + terms.hashlock + int(terms.value_amount).to_bytes(32, "big")
+        ).digest()
+
+    def derive_funding_scriptpubkey(self, terms) -> bytes:
+        return self._commitment(terms)
+
+    def promised_funding_scriptpubkey(self, terms) -> bytes:
+        return self._commitment(terms)
+
+    def locked_amount(self, locator) -> int:
+        return locator.amount_wei
+
+    async def fund(self, terms) -> EthHtlcLocator:
+        # Deploy+fund THEN verify (the ETH ordering the audit flagged): if verify_raises, the
+        # contract is already deployed on-chain when we raise — the atomicity inversion.
+        self.calls.append("fund")
+        loc = EthHtlcLocator(
+            chain_id=11155111,
+            contract_address="0x" + "ab" * 20,
+            deploy_tx_hash="0x" + "cd" * 32,
+            hashlock="0x" + terms.hashlock.hex(),
+            claimant="0x" + "11" * 20,
+            refundee="0x" + "22" * 20,
+            timeout=terms.eth_timeout_unix_s,
+            amount_wei=int(terms.value_amount) + self.fund_amount_delta,
+        )
+        self.last_locator = loc
+        if self.verify_raises:
+            raise ValidationError("verify_funded failed AFTER deploy (contract is live on-chain)")
+        return loc
+
+    async def claim(self, locator, preimage) -> str:
+        self.calls.append("claim")
+        self.claimed_with = bytes(preimage)
+        return "0xethclaim"
+
+    async def refund(self, locator, timeout=None) -> str:
+        self.calls.append("refund")
+        self.refunded = True
+        return "0xethrefund"
 
     async def fetch_claim_artifacts(self, tx_hash) -> list[bytes]:
         self.calls.append("fetch")
@@ -1817,3 +1874,69 @@ async def test_pre_lock_dispatches_eth_ordering_gate():
     coord_ok = _eth_coord_negotiated(terms=terms_ok)
     gate_ok = await coord_ok.pre_btc_lock_check(terms_ok, now_unix_s=_NOW)
     assert "margin check failed" not in (gate_ok.reason or "")
+
+
+# --------------------------------------------------------------------------- ETH full lifecycle
+
+
+def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy=None):
+    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    return SwapCoordinator(
+        record=rec,
+        counter_leg=eth_leg,
+        radiant_leg=radiant_leg or FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=seen_store or FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=policy or _eth_fund_policy(), maker_stall_safety_window_blocks=6),
+    )
+
+
+async def test_eth_full_lifecycle_negotiated_to_completed():
+    # Drives a whole ETH↔RXD swap through the REAL coordinator (closes the structural coverage
+    # hole: the Wave-C fund path — now_unix_s, ordering gate, wei amount bind — never ran e2e).
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd)
+
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED and "fund" in leg.calls
+    assert isinstance(rec.counterchain_locator, EthHtlcLocator)  # wei locator recorded
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    assert rec.state is SwapState.BOTH_LOCKED
+    p_bytes = secret.unsafe_raw_bytes()  # capture BEFORE maker_claims_btc zeroizes the secret
+    rec = await coord.maker_claims_btc(secret)
+    # the maker reveals p (not h) to the ETH contract via the counter leg
+    assert rec.state is SwapState.SECRET_REVEALED and leg.claimed_with == p_bytes and "claim" in leg.calls
+    rec = await coord.taker_scrape_and_claim_asset("0xethclaim", now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with == p_bytes  # RXD asset claimed with the scraped p
+
+
+async def test_eth_fund_rejects_wrong_wei_amount():
+    # The funded-amount bind runs in the ETH wei unit (mirrors the BTC sats bind).
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final(), fund_amount_delta=10**9)  # overfund
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    with pytest.raises(ValidationError, match="funded counter-leg amount"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert coord.record.state is SwapState.NEGOTIATED  # never advanced
+
+
+async def test_eth_deploy_then_verify_inversion_strands_recoverably():
+    # Audit completeness finding (deploy-then-verify atomicity inversion): an ETH verify failure
+    # raises AFTER the contract is on-chain. Documents the actual behavior: H burned, record
+    # stays NEGOTIATED, and the deployed locator is retained on the leg (recoverable for refund),
+    # NOT silently lost.
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final(), verify_raises=True)
+    seen = FakeSeenStore()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, seen_store=seen)
+    with pytest.raises(ValidationError, match="verify_funded failed"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert coord.record.state is SwapState.NEGOTIATED  # no advance
+    assert seen.has_seen(h)  # H consumed (on-chain value committed at the pre-broadcast reserve)
+    assert leg.last_locator is not None  # the deployed contract address is retained → refundable
