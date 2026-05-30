@@ -17,7 +17,11 @@ from .merkle import (
     extract_merkle_root,
     verify_tx_in_block,
 )
-from .payment import P2PKH, P2SH, P2TR, P2WPKH, verify_payment
+
+# verify_payment is intentionally NOT re-exported (audit F-09): not safe as a
+# standalone value gate — use SpvProofBuilder.build(). Import it explicitly from
+# pyrxd.spv.payment if you need the low-level helper.
+from .payment import P2PKH, P2SH, P2TR, P2WPKH
 from .pow import hash256, verify_header_pow
 from .proof import (
     CovenantParams,
@@ -43,6 +47,5 @@ __all__ = [
     "strip_witness",
     "verify_chain",
     "verify_header_pow",
-    "verify_payment",
     "verify_tx_in_block",
 ]
