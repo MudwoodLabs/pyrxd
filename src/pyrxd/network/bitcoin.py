@@ -257,6 +257,15 @@ class MempoolSpaceSource(BtcDataSource):
         if min_confirmations > 0:
             # To check confirmations we need the tip height.
             tip = await self.get_tip_height()
+            # Audit 2026-05-29 F-17: floor block_height to [1, tip]. A source that
+            # under-reports block_height inflates confs (an unburied/reorgable tx
+            # looks final); a height above tip is inconsistent. Reject either rather
+            # than trust the arithmetic (mirrors MempoolSpaceFundingReader.confirmations).
+            if int(block_height) < 1 or int(block_height) > int(tip):
+                raise NetworkError(
+                    f"inconsistent confirmation data: block_height={block_height}, tip={int(tip)} "
+                    "(expected 1 <= block_height <= tip)"
+                )
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
                 raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
@@ -429,6 +438,12 @@ class BlockstreamSource(BtcDataSource):
 
         if min_confirmations > 0:
             tip = await self.get_tip_height()
+            # Audit 2026-05-29 F-17: floor block_height to [1, tip] (see above).
+            if int(block_height) < 1 or int(block_height) > int(tip):
+                raise NetworkError(
+                    f"inconsistent confirmation data: block_height={block_height}, tip={int(tip)} "
+                    "(expected 1 <= block_height <= tip)"
+                )
             confs = int(tip) - int(block_height) + 1
             if confs < min_confirmations:
                 raise InsufficientConfirmationsError(have=confs, required=min_confirmations)

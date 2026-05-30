@@ -288,6 +288,31 @@ class TestMempoolSpaceSource:
                 await src.get_raw_tx(TXID, min_confirmations=100)
 
     @pytest.mark.asyncio
+    async def test_get_raw_tx_block_height_above_tip_rejected(self):
+        """F-17: a source reporting block_height > tip is inconsistent — reject
+        rather than compute garbage confirmations from an under-reported height."""
+        src = self._src()
+        status_resp = _json_resp({"confirmed": True, "block_height": 800001})
+        tip_resp = _text_resp("800000")  # block_height > tip
+        session = MagicMock()
+        session.get = MagicMock(side_effect=[status_resp, tip_resp])
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
+            with pytest.raises(NetworkError, match="inconsistent confirmation data"):
+                await src.get_raw_tx(TXID, min_confirmations=1)
+
+    @pytest.mark.asyncio
+    async def test_get_raw_tx_block_height_below_one_rejected(self):
+        """F-17: block_height < 1 is inconsistent — reject."""
+        src = self._src()
+        status_resp = _json_resp({"confirmed": True, "block_height": 0})
+        tip_resp = _text_resp("800000")
+        session = MagicMock()
+        session.get = MagicMock(side_effect=[status_resp, tip_resp])
+        with patch.object(src, "_get_session", AsyncMock(return_value=session)):
+            with pytest.raises(NetworkError, match="inconsistent confirmation data"):
+                await src.get_raw_tx(TXID, min_confirmations=1)
+
+    @pytest.mark.asyncio
     async def test_get_tx_block_height_happy(self):
         src = self._src()
         status_resp = _json_resp({"confirmed": True, "block_height": 799000})
