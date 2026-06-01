@@ -258,7 +258,11 @@ class EthHtlcContractLeg:
             web3.Web3.to_checksum_address(refundee),
             int(timeout),
         )
-        tx = await self._base_tx(gas=400_000)
+        # Deploy gas: the contract's runtime CODE DEPOSIT alone is 200 gas/byte (EthHtlc's
+        # ~2.1 KB runtime ≈ 418k) + constructor + base tx ≈ 510k measured on Anvil. 400k
+        # out-of-gas-reverted the deploy (Phase-4 finding); 800k gives comfortable margin (you
+        # pay gasUsed, not the limit). A per-artifact eth_estimateGas is the robust follow-up.
+        tx = await self._base_tx(gas=800_000)
         tx["value"] = int(amount_wei)
         built = await ctor.build_transaction(tx)
         # No eth_call preflight for a deploy (no `to`); the status==1 check below is the gate.
