@@ -10,8 +10,15 @@ operator opts into non-durability (SEEN-1). This store persists reservations in 
 
 Same duck-typed interface (``reserve`` / ``has_seen`` / ``mark_seen`` + ``durable``) as the
 in-process store — a drop-in for the coordinator's ``seen_store`` parameter. ``reserve`` is
-sync (matching the in-process store); the SQLite write commits before it returns, so a crash
-after ``reserve`` but before the broadcast cannot resurrect the replay window.
+sync (matching the in-process store); the SQLite write is committed AND fsync'd
+(``synchronous=FULL``) before it returns, so even a power/OS crash after ``reserve`` but
+before the broadcast cannot resurrect the replay window.
+
+Durability note (audit replay-LOW): WAL with ``synchronous=NORMAL`` does NOT fsync the WAL on
+each commit — committed rows are durable only as of the last checkpoint, so a power loss can
+roll back a reservation. Because a reservation is one tiny row per fund (not throughput
+sensitive), we use ``synchronous=FULL`` to fsync on commit and buy true power-loss durability,
+which is exactly the SEEN-1 guarantee the coordinator relies on for a value-bearing network.
 """
 
 from __future__ import annotations
@@ -40,7 +47,10 @@ class DurableSeenStore:
         # INSERT OR IGNORE is itself atomic via the primary-key constraint).
         self._conn = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA synchronous=NORMAL")
+        # synchronous=FULL (not NORMAL): fsync the WAL on every commit so a reservation survives
+        # a power/OS crash, not just a process crash. A single-row reserve per fund is not
+        # throughput-sensitive, so the extra fsync is negligible and buys real SEEN-1 durability.
+        self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute(_SCHEMA)
         try:
             os.chmod(path, 0o600)  # H-keyed reservation metadata; keep perms tight

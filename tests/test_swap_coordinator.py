@@ -28,6 +28,7 @@ import pickle
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_coordinator import (
@@ -1507,3 +1508,488 @@ def test_dual_source_reorg_depth_divergence_fail_closed():
             t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
             policy=policy,
         )
+
+
+# --------------------------------------------------------------------------- C2b + R6: ETH claim flow
+#
+# The coordinator's BTC↔RXD claim path is exercised end-to-end above via the FSM. The ETH
+# variant shares the RXD leg + FSM + reorg gate; only the COUNTER-leg differs (tx-hash claim
+# ref, calldata/log scrape, finalized-checkpoint verdict, contract-address provenance). These
+# tests drive a record straight to SECRET_REVEALED with an EthHtlcLocator (the ETH funding
+# path is a separate concern, proven on Anvil in Phase 4) and assert the dispatch + gate order.
+
+
+class FakeEthLeg:
+    """Duck-typed stand-in for EthLeg, from SECRET_REVEALED onward.
+
+    Returns the known preimage from scrape (the coordinator re-verifies sha256==H), a
+    configurable finality verdict, and a provenance gate that records its args and can be
+    flipped to fail-closed. No ``network`` attr → the value-bearing/durable gate stays off.
+    """
+
+    def __init__(
+        self,
+        *,
+        preimage,
+        verdict: CounterClaimFinality,
+        provenance_ok: bool = True,
+        fund_amount_delta: int = 0,
+        verify_raises: bool = False,
+    ) -> None:
+        self._p = preimage.unsafe_raw_bytes() if isinstance(preimage, SecretBytes) else bytes(preimage)
+        self._verdict = verdict
+        self.provenance_ok = provenance_ok
+        self.fund_amount_delta = fund_amount_delta  # simulate a mis-funded (over/under) contract
+        self.verify_raises = verify_raises  # simulate verify_funded failing AFTER deploy (atomicity inversion)
+        self.calls: list[str] = []
+        self.provenance_args: dict | None = None
+        self.last_locator: EthHtlcLocator | None = None
+        self.claimed_with: bytes | None = None
+        self.refunded = False
+
+    # -- fund-path (full lifecycle) ----------------------------------------------------
+    def _commitment(self, terms) -> bytes:
+        return hashlib.sha256(
+            b"fake-eth-commit" + terms.hashlock + int(terms.value_amount).to_bytes(32, "big")
+        ).digest()
+
+    def derive_funding_scriptpubkey(self, terms) -> bytes:
+        return self._commitment(terms)
+
+    def promised_funding_scriptpubkey(self, terms) -> bytes:
+        return self._commitment(terms)
+
+    def locked_amount(self, locator) -> int:
+        return locator.amount_wei
+
+    async def fund(self, terms) -> EthHtlcLocator:
+        # Deploy+fund THEN verify (the ETH ordering the audit flagged): if verify_raises, the
+        # contract is already deployed on-chain when we raise — the atomicity inversion.
+        self.calls.append("fund")
+        loc = EthHtlcLocator(
+            chain_id=11155111,
+            contract_address="0x" + "ab" * 20,
+            deploy_tx_hash="0x" + "cd" * 32,
+            hashlock="0x" + terms.hashlock.hex(),
+            claimant="0x" + "11" * 20,
+            refundee="0x" + "22" * 20,
+            timeout=terms.eth_timeout_unix_s,
+            amount_wei=int(terms.value_amount) + self.fund_amount_delta,
+        )
+        self.last_locator = loc
+        if self.verify_raises:
+            raise ValidationError("verify_funded failed AFTER deploy (contract is live on-chain)")
+        return loc
+
+    async def claim(self, locator, preimage) -> str:
+        self.calls.append("claim")
+        self.claimed_with = bytes(preimage)
+        return "0xethclaim"
+
+    async def refund(self, locator, timeout=None) -> str:
+        self.calls.append("refund")
+        self.refunded = True
+        return "0xethrefund"
+
+    async def fetch_claim_artifacts(self, tx_hash) -> list[bytes]:
+        self.calls.append("fetch")
+        return [b"\x00\x00\x00\x00" + self._p]  # p after a 4-byte selector
+
+    def scrape_secret(self, artifacts, hashlock) -> bytes:
+        self.calls.append("scrape")
+        return self._p
+
+    async def assert_claim_provenance(self, tx_hash, *, contract_address, preimage) -> None:
+        self.calls.append("provenance")
+        self.provenance_args = {"tx_hash": tx_hash, "contract_address": contract_address, "preimage": preimage}
+        if not self.provenance_ok:
+            raise ValidationError("claim tx 'to' is not this swap's HTLC contract address")
+
+    async def claim_finality_verdict(self, tx_hash) -> CounterClaimFinality:
+        self.calls.append("verdict")
+        return self._verdict
+
+
+def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 72, eth_timeout_unix_s: int = 1779710245):
+    return NegotiatedTerms(
+        hashlock=hashlock,
+        btc_sats=100_000,
+        radiant_amount=1_000,
+        t_btc=t.Timelock(144, t.TimeUnit.BLOCKS),
+        t_rxd=t.Timelock(t_rxd_blocks, t.TimeUnit.BLOCKS),
+        asset_variant="rxd",
+        genesis_ref=b"",
+        taker_dest_hash=b"\x11" * 32,
+        maker_dest_hash=b"\x22" * 32,
+        btc_claim_pubkey_xonly=b"\x00" * 32,  # eth: x-only fields are the _ZERO32 placeholder
+        btc_refund_pubkey_xonly=b"\x00" * 32,
+        counter_chain="eth",
+        value_amount=10**15,
+        eth_timeout_unix_s=eth_timeout_unix_s,
+    )
+
+
+def _eth_locator(hashlock: bytes) -> EthHtlcLocator:
+    return EthHtlcLocator(
+        chain_id=11155111,
+        contract_address="0x" + "ab" * 20,
+        deploy_tx_hash="0x" + "cd" * 32,
+        hashlock="0x" + hashlock.hex(),
+        claimant="0x" + "11" * 20,
+        refundee="0x" + "22" * 20,
+        timeout=1779710245,
+        amount_wei=10**15,
+    )
+
+
+def _eth_coord_at_secret_revealed(*, eth_leg, terms, radiant_leg=None, policy=None):
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, counterchain_locator=_eth_locator(terms.hashlock))
+    return SwapCoordinator(
+        record=rec,
+        counter_leg=eth_leg,
+        radiant_leg=radiant_leg or FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(
+            margin_policy=policy or _eth_finality_policy(window_s=768),
+            maker_stall_safety_window_blocks=6,
+        ),
+    )
+
+
+def _final():
+    return CounterClaimFinality(state=CounterClaimState.FINAL)
+
+
+def _eth_not_final_verdict():
+    return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+
+async def test_eth_claim_safe_settles_and_runs_provenance():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h)
+    leg = FakeEthLeg(preimage=p, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    rec = await coord.taker_scrape_and_claim_asset("0xclaim", now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with == p.unsafe_raw_bytes()  # asset claimed with the scraped p
+    # Gate order: scrape, then provenance, then verdict — provenance BEFORE the verdict/claim.
+    assert leg.calls == ["fetch", "scrape", "provenance", "verdict"]
+    assert leg.provenance_args["contract_address"] == "0x" + "ab" * 20
+    assert leg.provenance_args["preimage"] == p.unsafe_raw_bytes()  # binds the SECRET p, not H
+
+
+async def test_eth_claim_rejects_failed_provenance_no_claim():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h)
+    leg = FakeEthLeg(preimage=p, verdict=_final(), provenance_ok=False)
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    with pytest.raises(ValidationError, match="not this swap's HTLC contract"):
+        await coord.taker_scrape_and_claim_asset("0xforeign", now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rxd.claimed_with is None  # never claimed off a foreign claim tx
+    assert coord.record.state is SwapState.SECRET_REVEALED  # no advance
+    assert "verdict" not in leg.calls  # fail-closed BEFORE the finality read/claim
+
+
+async def test_eth_claim_wait_stays_secret_revealed():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h, t_rxd_blocks=72)  # roomy
+    leg = FakeEthLeg(preimage=p, verdict=_eth_not_final_verdict())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    rec = await coord.taker_scrape_and_claim_asset("0xclaim", now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.SECRET_REVEALED  # not-yet-final + room → WAIT, no claim
+    assert rxd.claimed_with is None
+
+
+async def test_eth_claim_squeezed_then_explicit_vulnerable_claim():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h, t_rxd_blocks=10)  # window closing
+    leg = FakeEthLeg(preimage=p, verdict=_eth_not_final_verdict())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    # not-yet-final + closing window → SQUEEZED → ASSET_VULNERABLE, no auto-claim
+    rec = await coord.taker_scrape_and_claim_asset("0xclaim", now_rxd_height=1006, asset_locked_at_height=1000)
+    assert rec.state is SwapState.ASSET_VULNERABLE
+    assert rxd.claimed_with is None
+    # The deliberate winner-take-all claim (ETH path) runs scrape + provenance and settles.
+    rec = await coord.taker_claim_asset_from_vulnerable("0xclaim")
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with == p.unsafe_raw_bytes()
+
+
+# --------------------------------------------------------------------------- Wave B (audit fixes)
+
+
+def test_eth_finalization_window_floor_enforced():
+    # Below the ~2-epoch (768s) floor -> rejected at MarginPolicy construction.
+    with pytest.raises(ValidationError, match="safety floor"):
+        MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            eth_finalization_window_s=300,
+        )
+    ok = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        eth_finalization_window_s=768,
+    )
+    assert ok.eth_finalization_window_s == 768
+
+
+def test_eth_coordinator_requires_finalization_window_at_setup():
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h)
+    bad_policy = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+    )  # no eth_finalization_window_s
+    with pytest.raises(ValidationError, match="eth_finalization_window_s"):
+        SwapCoordinator(
+            record=SwapRecord(
+                state=SwapState.SECRET_REVEALED,
+                terms=terms,
+                counterchain_locator=_eth_locator(terms.hashlock),
+            ),
+            counter_leg=FakeEthLeg(preimage=p, verdict=_final()),
+            radiant_leg=FakeRadiantLeg(),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),
+            config=CoordinatorConfig(margin_policy=bad_policy, maker_stall_safety_window_blocks=6),
+        )
+
+
+def test_reserve_to_blocks_rounds_up_for_seconds():
+    from pyrxd.gravity.swap_coordinator import _reserve_to_blocks
+
+    assert _reserve_to_blocks(t.Timelock(6, t.TimeUnit.BLOCKS), 600.0) == 6  # identity for BLOCKS
+    # ceil(1300/600)=3, NOT floor 2 — a reserve must round UP (the safe direction).
+    assert _reserve_to_blocks(t.Timelock(1300, t.TimeUnit.SECONDS), 600.0) == 3
+
+
+# --------------------------------------------------------------------------- Wave C: HIGH-1 ordering
+
+from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+
+_NOW = 1_700_000_000
+
+
+def _xmargin():
+    # total = 768 + 1800 + 600 + 300 = 3468s
+    return CrossClockMargin(
+        eth_reorg_finality_s=768, rxd_claim_burial_s=1800, rxd_confirm_slack_s=600, rounding_slack_s=300
+    )
+
+
+def _eth_fund_policy(**kw):
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+        eth_finalization_window_s=768,
+        cross_clock_margin=kw.get("cross_clock_margin", _xmargin()),
+        max_covenant_confirm_wait_s=kw.get("max_covenant_confirm_wait_s", 3600),
+    )
+
+
+def _eth_coord_negotiated(*, terms, policy=None):
+    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    p_dummy = b"\x01" * 32
+    return SwapCoordinator(
+        record=rec,
+        counter_leg=FakeEthLeg(preimage=p_dummy, verdict=_final()),
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=policy or _eth_fund_policy(), maker_stall_safety_window_blocks=6),
+    )
+
+
+# projected_rxd_open = now + max_confirm_wait(3600) + t_rxd(72)*rxd_interval(300)=21600 = now+25200
+# deadline = eth_timeout - margin.total(3468). Need now+25200 < eth_timeout-3468 -> eth_timeout > now+28668.
+
+
+def test_eth_timelock_ordering_accepts_safe_deadline():
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    coord = _eth_coord_negotiated(terms=terms)
+    coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)  # no raise (40000 > 28668)
+
+
+def test_eth_timelock_ordering_rejects_deadline_too_close():
+    # HIGH-1 core: an eth_timeout that does NOT clear the RXD window + margin is refused —
+    # a maker cannot set a deadline that lets it refund both legs.
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 10000)  # 10000 < 28668
+    coord = _eth_coord_negotiated(terms=terms)
+    with pytest.raises(ValidationError, match="confirm too late"):
+        coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)
+
+
+def test_eth_timelock_ordering_rejects_expired_deadline():
+    # The now-vs-timeout grief (completeness finding): an already-expired ETH HTLC is refused.
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW - 100)
+    coord = _eth_coord_negotiated(terms=terms)
+    with pytest.raises(ValidationError, match="confirm too late"):
+        coord._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)
+
+
+def test_eth_timelock_ordering_requires_now_and_margin():
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    coord = _eth_coord_negotiated(terms=terms)
+    with pytest.raises(ValidationError, match="now_unix_s"):
+        coord._assert_eth_timelock_ordering(terms, now_unix_s=None)
+    bare = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        rxd_block_interval_s=300.0,
+        eth_finalization_window_s=768,
+    )  # no cross_clock_margin / max_covenant_confirm_wait_s
+    coord2 = _eth_coord_negotiated(terms=terms, policy=bare)
+    with pytest.raises(ValidationError, match="cross_clock_margin"):
+        coord2._assert_eth_timelock_ordering(terms, now_unix_s=_NOW)
+
+
+async def test_pre_lock_dispatches_eth_ordering_gate():
+    # Integration: pre_btc_lock_check step 3 routes an ETH swap to the cross-clock gate.
+    _, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 10000)  # too close
+    coord = _eth_coord_negotiated(terms=terms)
+    gate = await coord.pre_btc_lock_check(terms, now_unix_s=_NOW)
+    assert not gate.ok and "margin check failed" in gate.reason
+    # A safe deadline PASSES the ordering step (step 3). The minimal FakeEthLeg has no
+    # fund-path SPK methods, so the gate may still stop at step 4 — but never at the margin
+    # check, which is what this asserts (step-3 isolation).
+    terms_ok = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    coord_ok = _eth_coord_negotiated(terms=terms_ok)
+    gate_ok = await coord_ok.pre_btc_lock_check(terms_ok, now_unix_s=_NOW)
+    assert "margin check failed" not in (gate_ok.reason or "")
+
+
+# --------------------------------------------------------------------------- ETH full lifecycle
+
+
+def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy=None):
+    rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    return SwapCoordinator(
+        record=rec,
+        counter_leg=eth_leg,
+        radiant_leg=radiant_leg or FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=seen_store or FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=policy or _eth_fund_policy(), maker_stall_safety_window_blocks=6),
+    )
+
+
+async def test_eth_full_lifecycle_negotiated_to_completed():
+    # Drives a whole ETH↔RXD swap through the REAL coordinator (closes the structural coverage
+    # hole: the Wave-C fund path — now_unix_s, ordering gate, wei amount bind — never ran e2e).
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    rxd = FakeRadiantLeg()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd)
+
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert rec.state is SwapState.BTC_LOCKED and "fund" in leg.calls
+    assert isinstance(rec.counterchain_locator, EthHtlcLocator)  # wei locator recorded
+    # ETH revalidation now requires now_unix_s (the post-confirm cross-clock recheck); an
+    # on-time lock at _NOW passes.
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED
+    p_bytes = secret.unsafe_raw_bytes()  # capture BEFORE maker_claims_btc zeroizes the secret
+    rec = await coord.maker_claims_btc(secret)
+    # the maker reveals p (not h) to the ETH contract via the counter leg
+    assert rec.state is SwapState.SECRET_REVEALED and leg.claimed_with == p_bytes and "claim" in leg.calls
+    rec = await coord.taker_scrape_and_claim_asset("0xethclaim", now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with == p_bytes  # RXD asset claimed with the scraped p
+
+
+async def test_eth_fund_rejects_wrong_wei_amount():
+    # The funded-amount bind runs in the ETH wei unit (mirrors the BTC sats bind).
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final(), fund_amount_delta=10**9)  # overfund
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    with pytest.raises(ValidationError, match="funded counter-leg amount"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert coord.record.state is SwapState.NEGOTIATED  # never advanced
+
+
+async def test_eth_deploy_then_verify_inversion_strands_recoverably():
+    # Audit completeness finding (deploy-then-verify atomicity inversion): an ETH verify failure
+    # raises AFTER the contract is on-chain. Documents the actual behavior: H burned, record
+    # stays NEGOTIATED, and the deployed locator is retained on the leg (recoverable for refund),
+    # NOT silently lost.
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final(), verify_raises=True)
+    seen = FakeSeenStore()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, seen_store=seen)
+    with pytest.raises(ValidationError, match="verify_funded failed"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert coord.record.state is SwapState.NEGOTIATED  # no advance
+    assert seen.has_seen(h)  # H consumed (on-chain value committed at the pre-broadcast reserve)
+    assert leg.last_locator is not None  # the deployed contract address is retained → refundable
+
+
+# ----------------------------------------------------- re-verify HIGH: maker-delay second run
+
+
+async def _eth_to_btc_locked(*, leg, terms, rxd, now_unix_s):
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms, now_unix_s=now_unix_s)
+    assert coord.record.state is SwapState.BTC_LOCKED
+    return coord
+
+
+async def test_eth_post_confirm_recheck_accepts_on_time_lock():
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    rxd = FakeRadiantLeg()
+    coord = await _eth_to_btc_locked(
+        leg=FakeEthLeg(preimage=secret, verdict=_final()), terms=terms, rxd=rxd, now_unix_s=_NOW
+    )
+    # Maker locks promptly (now ~ _NOW): projected rxd_open _NOW+21600 < deadline _NOW+36532 -> OK.
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED
+
+
+async def test_eth_post_confirm_recheck_refuses_stalled_maker_lock():
+    # THE re-verify HIGH: a maker who STALLS the covenant broadcast (locks late) collapses the
+    # cross-clock margin the pre-fund gate projected. The second run catches it and refuses to
+    # enter BOTH_LOCKED — the taker must refund the counter leg, not proceed.
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    rxd = FakeRadiantLeg()
+    coord = await _eth_to_btc_locked(
+        leg=FakeEthLeg(preimage=secret, verdict=_final()), terms=terms, rxd=rxd, now_unix_s=_NOW
+    )
+    # Maker delays the lock to _NOW+30000: actual rxd_open _NOW+30000+21600 > deadline _NOW+36532.
+    with pytest.raises(ValidationError, match="confirm too late"):
+        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW + 30000)
+    assert coord.record.state is SwapState.BTC_LOCKED  # did NOT advance to BOTH_LOCKED
+    assert rxd.claimed_with is None
+
+
+async def test_eth_post_confirm_recheck_requires_now_unix_s():
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    rxd = FakeRadiantLeg()
+    coord = await _eth_to_btc_locked(
+        leg=FakeEthLeg(preimage=secret, verdict=_final()), terms=terms, rxd=rxd, now_unix_s=_NOW
+    )
+    with pytest.raises(ValidationError, match="now_unix_s"):
+        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))  # ETH: now required
+    assert coord.record.state is SwapState.BTC_LOCKED

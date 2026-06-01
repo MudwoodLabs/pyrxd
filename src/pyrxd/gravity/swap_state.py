@@ -256,6 +256,11 @@ class NegotiatedTerms:
     # (BTC) construction is unchanged: counter_chain "btc"; value_amount 0 => mirror btc_sats.
     counter_chain: str = "btc"  # "btc" | "eth"
     value_amount: int = 0  # counter-leg amount: sats (btc) | wei (eth); 0 sentinel => btc_sats
+    # ETH counter leg: the ABSOLUTE unix-second refund deadline (the contract immutable
+    # ``timeout``). This is the REAL counter-leg deadline for an ETH swap — first-class and
+    # validated so the coordinator's cross-clock ordering gate checks the actual on-chain
+    # deadline, not the relative ``t_btc`` placeholder (audit HIGH-1). None for a BTC swap.
+    eth_timeout_unix_s: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "hashlock", _b32(self.hashlock, "hashlock"))
@@ -265,11 +270,35 @@ class NegotiatedTerms:
             raise ValidationError("radiant_amount must be a positive int")
         if self.counter_chain not in COUNTER_CHAINS:
             raise ValidationError(f"counter_chain must be one of {sorted(COUNTER_CHAINS)}")
-        # value_amount defaults to btc_sats (the BTC counter-leg amount) when left 0.
-        if self.value_amount == 0:
-            object.__setattr__(self, "value_amount", self.btc_sats)
+        # value_amount: for a BTC swap the 0 sentinel mirrors btc_sats (same sats unit); for an
+        # ETH swap value_amount is WEI (a different unit) and MUST be given explicitly — a
+        # forgotten wei value must never silently inherit a sats number (audit fail_closed:
+        # cross-unit mis-scale by ~1e10 that would still pass the funded-amount bind).
+        if self.counter_chain == "btc":
+            if self.value_amount == 0:
+                object.__setattr__(self, "value_amount", self.btc_sats)
+            elif self.value_amount != self.btc_sats:
+                # For BTC the counter-leg amount IS btc_sats; a divergent explicit value_amount
+                # is a misconfiguration — reject at construction (fail-closed) instead of
+                # deferring to a refused fund at lock time (audit re-verify LOW hardening).
+                raise ValidationError(
+                    f"for a BTC swap value_amount ({self.value_amount}) must equal btc_sats ({self.btc_sats})"
+                )
+        elif self.value_amount == 0:
+            raise ValidationError(
+                "value_amount (wei) must be explicitly set for an ETH swap — the 0=>btc_sats "
+                "sentinel does not cross the sats↔wei unit boundary"
+            )
         if not _pos_int(self.value_amount):
             raise ValidationError("value_amount must be a positive int")
+        # ETH absolute refund deadline: first-class for an ETH swap (the real counter-leg
+        # deadline the coordinator's cross-clock ordering gate validates); forbidden for BTC
+        # (whose deadline is the relative t_btc) so the two can never be silently confused.
+        if self.counter_chain == "eth":
+            if not _pos_int(self.eth_timeout_unix_s):
+                raise ValidationError("an ETH swap requires eth_timeout_unix_s (a positive absolute unix deadline)")
+        elif self.eth_timeout_unix_s is not None:
+            raise ValidationError("eth_timeout_unix_s is only valid on an ETH swap (BTC uses the relative t_btc)")
         if not isinstance(self.t_btc, Timelock):
             raise ValidationError("t_btc must be a Timelock")
         if not isinstance(self.t_rxd, Timelock):
@@ -335,6 +364,8 @@ class NegotiatedTerms:
             d["counter_chain"] = self.counter_chain
         if self.value_amount != self.btc_sats:
             d["value_amount"] = self.value_amount
+        if self.eth_timeout_unix_s is not None:
+            d["eth_timeout_unix_s"] = self.eth_timeout_unix_s
         return d
 
     @classmethod
@@ -353,6 +384,7 @@ class NegotiatedTerms:
             btc_refund_pubkey_xonly=bytes.fromhex(d["btc_refund_pubkey_xonly"]),
             counter_chain=str(d.get("counter_chain", "btc")),  # legacy records → btc
             value_amount=int(d.get("value_amount", 0)),  # 0 sentinel → __post_init__ = btc_sats
+            eth_timeout_unix_s=(int(d["eth_timeout_unix_s"]) if d.get("eth_timeout_unix_s") is not None else None),
         )
 
 

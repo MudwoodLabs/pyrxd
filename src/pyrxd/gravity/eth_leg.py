@@ -78,6 +78,9 @@ class EthLeg:
         self._claim_to = claim_to
         self._refund_to = refund_to
         self._eth_timeout_unix_s = int(eth_timeout_unix_s)
+        # Set the instant a contract is deployed (BEFORE verify_funded) so a post-deploy verify
+        # failure still leaves the stranded contract address recoverable for a timelock refund.
+        self.last_funded_locator: EthHtlcLocator | None = None
 
     # -- funding target (the coordinator's pre-lock derive==promised gate) --------------
     #
@@ -109,7 +112,28 @@ class EthLeg:
     async def fund(self, terms) -> EthHtlcLocator:
         """Deploy + fund the ETH HTLC from the negotiated terms, then run the post-deploy
         binding gate (verify_funded) BEFORE returning — so the coordinator never tells the
-        maker to lock RXD against a wrong/attacker/under-funded contract."""
+        maker to lock RXD against a wrong/attacker/under-funded contract.
+
+        DEPLOY-THEN-VERIFY ATOMICITY (audit completeness): unlike the BTC P2TR path (whose
+        funding address is pre-derived and verified BEFORE any broadcast), an ETH HTLC contract
+        does not exist until it is deployed, so ``verify_funded`` necessarily runs AFTER the
+        deploy+fund has already put value on-chain. If verify fails (wrong immutables, balance
+        mismatch, attacker logic), the ETH is locked in a contract the coordinator rejects. The
+        loss is BOUNDED and RECOVERABLE: the contract pays its immutable ``refundee`` (the
+        taker) via ``refund()`` after ``timeout``. To make the stranded deploy recoverable
+        WITHOUT a chain rescan, we stash the deployed locator on ``self.last_funded_locator``
+        BEFORE verify — so a caller that sees ``fund`` raise still has the contract address to
+        drive the timelock refund. (A full coordinator-record-level recovery is a Phase-4 item.)
+        """
+        # Consistency (audit HIGH-1): the leg's absolute deadline MUST equal the negotiated
+        # term the coordinator's cross-clock ordering gate validated — otherwise the leg could
+        # deploy a contract with a deadline the gate never checked. Fail closed on a mismatch.
+        terms_timeout = getattr(terms, "eth_timeout_unix_s", None)
+        if terms_timeout is not None and int(terms_timeout) != self._eth_timeout_unix_s:
+            raise ValidationError(
+                f"terms.eth_timeout_unix_s ({terms_timeout}) != this leg's eth_timeout_unix_s "
+                f"({self._eth_timeout_unix_s}); the validated deadline and the deployed deadline must agree"
+            )
         locator = await self._leg.fund(
             hashlock=bytes(terms.hashlock),
             claimant=self._claim_to,
@@ -117,6 +141,9 @@ class EthLeg:
             timeout=self._eth_timeout_unix_s,
             amount_wei=int(terms.value_amount),
         )
+        # The contract is now live on-chain — stash the address so a verify failure below still
+        # leaves the deploy recoverable (refundable) instead of lost.
+        self.last_funded_locator = locator
         await self._leg.verify_funded(locator, expected_amount_wei=int(terms.value_amount))
         return locator
 
@@ -140,6 +167,14 @@ class EthLeg:
         """Fetch the candidate byte blobs (claim calldata + receipt log data) for
         :meth:`scrape_secret`. Works on a reverted-but-mined claim too."""
         return await self._leg.fetch_claim_artifacts(tx_hash)
+
+    async def assert_claim_provenance(self, tx_hash: str, *, contract_address: str, preimage: bytes) -> None:
+        """Provenance gate (R6) — the ETH analogue of the BTC funding-outpoint check: the
+        claim tx must target THIS swap's HTLC contract instance and emit the revealed secret
+        ``p`` from it (``tx.to`` + a successful receipt + a ``Claimed(p)`` log from the
+        contract). Binds the SECRET ``p``, not the public ``H``. Fail-closed; see
+        :meth:`EthHtlcContractLeg.assert_claim_provenance`."""
+        await self._leg.assert_claim_provenance(tx_hash, contract_address=contract_address, preimage=preimage)
 
     async def claim_finality_verdict(self, tx_hash: str) -> CounterClaimFinality:
         """The point-in-time ETH finality verdict (FINAL once at/under the ``finalized``

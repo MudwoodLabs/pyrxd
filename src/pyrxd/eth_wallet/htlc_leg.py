@@ -41,6 +41,21 @@ __all__ = ["EthHtlcContractLeg", "load_artifact"]
 _REQUIRED_ARTIFACT_KEYS = ("runtime_bytecode", "abi", "bytecode")
 
 
+def _b(v: Any) -> bytes:
+    """Coerce a hex string ('0x..' or '..') or bytes-like to bytes; None/'' -> b''."""
+    if v is None:
+        return b""
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v)
+    s = str(v)
+    return bytes.fromhex(s[2:] if s.startswith("0x") else s)
+
+
+def _addr(v: Any) -> str:
+    """Normalise an address-ish value to a lowercase hex string for comparison."""
+    return str(v or "").lower()
+
+
 def load_artifact(path: str | os.PathLike) -> dict:
     """Load an EthHtlc artifact (ABI + bytecode + runtime_bytecode) from ``path``.
 
@@ -119,14 +134,23 @@ class EthHtlcContractLeg:
     # offline unit tests (which cover the pure layer above). Each documents its contract.
 
     def _runtime_code_matches(self, on_chain: bytes) -> bool:
-        """Compare on-chain runtime to the committed artifact, IGNORING immutable slots.
+        """Compare on-chain runtime to the committed artifact, masking committed-zero bytes.
 
         Solidity splices ``immutable`` values (hashlock/claimant/refundee/timeout)
         directly into the runtime bytecode at deploy time; the committed ``bin-runtime``
         carries zero-placeholders there, so a byte-exact compare always fails. We require
-        the same length and a byte-match everywhere the committed code is NON-zero (the
-        actual program logic). The immutables themselves are then checked by value via
-        the getters in :meth:`verify_funded` — which is the meaningful check anyway.
+        the same length and a byte-match everywhere the committed code is NON-zero.
+
+        HONESTY / LIMITATION (audit eth_leg_web3 LOW): this masks EVERY committed-zero
+        position, which is a SUPERSET of the immutable slots — legitimate zero logic bytes
+        (STOP, PUSH1 0x00, leading-zero PUSH operands, metadata padding) are therefore NOT
+        verified, so this gate alone does not fully prove "no modified logic". The meaningful
+        binding is the immutables-checked-by-getter step in :meth:`verify_funded`; a precise
+        compare that masks ONLY the artifact's ``immutableReferences`` offset ranges (and
+        byte-matches every other position, zeros included) is a hardening follow-up that
+        requires the injected artifact to carry ``immutableReferences``. Not exploitable in
+        the current self-deploy wiring (the taker deploys its own contract), but the advertised
+        "no attacker contract" strength is bounded by this until the slot-accurate compare lands.
         """
         expected = self.expected_runtime_code
         if len(on_chain) != len(expected):
@@ -145,7 +169,10 @@ class EthHtlcContractLeg:
              the getters == the negotiated terms in the locator (the meaningful binding
              check — proves the contract releases on the right secret to the right party
              at the right time);
-          4. funded balance == expected amount (no underfunded contract).
+          4. claimant and refundee are EOAs (empty code) — a contract recipient that
+             reverts on ``receive`` would brick claim/refund via the contract's
+             ``require(ok)``;
+          5. funded balance == expected amount (no underfunded contract).
         """
         await self._rpc.assert_chain()
         code = await self._rpc.get_code(locator.contract_address)
@@ -166,6 +193,12 @@ class EthHtlcContractLeg:
             raise ValidationError("on-chain refundee != negotiated taker")
         if on_timeout != locator.timeout:
             raise ValidationError("on-chain timeout != negotiated timeout")
+        # EOA-only claimant/refundee: empty code == EOA. A contract recipient that reverts on
+        # receive would lock the funds via the HTLC's require(ok) on the ETH transfer.
+        if await self._rpc.get_code(locator.claimant):
+            raise ValidationError("claimant has contract code (not an EOA); a reverting recipient could lock funds")
+        if await self._rpc.get_code(locator.refundee):
+            raise ValidationError("refundee has contract code (not an EOA); a reverting recipient could lock funds")
         bal = await self._rpc.get_balance(locator.contract_address)
         if bal != expected_amount_wei:
             raise ValidationError(f"funded balance {bal} wei != negotiated {expected_amount_wei} wei")
@@ -225,7 +258,11 @@ class EthHtlcContractLeg:
             web3.Web3.to_checksum_address(refundee),
             int(timeout),
         )
-        tx = await self._base_tx(gas=400_000)
+        # Deploy gas: the contract's runtime CODE DEPOSIT alone is 200 gas/byte (EthHtlc's
+        # ~2.1 KB runtime ≈ 418k) + constructor + base tx ≈ 510k measured on Anvil. 400k
+        # out-of-gas-reverted the deploy (Phase-4 finding); 800k gives comfortable margin (you
+        # pay gasUsed, not the limit). A per-artifact eth_estimateGas is the robust follow-up.
+        tx = await self._base_tx(gas=800_000)
         tx["value"] = int(amount_wei)
         built = await ctor.build_transaction(tx)
         # No eth_call preflight for a deploy (no `to`); the status==1 check below is the gate.
@@ -322,6 +359,71 @@ class EthHtlcContractLeg:
         if tx_block <= finalized:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
         return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+    async def assert_claim_provenance(self, tx_hash: str, *, contract_address: str, preimage: bytes) -> None:
+        """Provenance gate (R6): the maker's claim tx MUST target THIS swap's HTLC contract
+        instance AND emit the revealed secret ``p`` from it — the ETH analogue of the BTC
+        "claim tx spends our funding outpoint" check (``_assert_claim_tx_spends_our_htlc``).
+
+        Each swap deploys a FRESH HTLC contract at a unique CREATE address (recorded in the
+        locator after :meth:`verify_funded`), so the contract address is per-swap-unique
+        exactly like a BTC funding outpoint. The contract's claim path emits
+        ``Claimed(bytes32 preimage)`` with the SECRET ``p`` in the (non-indexed) log data. This
+        leg targets the PER-SWAP-deploy ``EthHtlc.sol`` model (one fresh contract per swap,
+        ``claim(bytes32 preimage)`` + immutable hashlock/claimant/refundee/timeout getters that
+        :meth:`verify_funded` reads back). NB the sibling repo's canonical ``HashedTimelock.sol``
+        is a DIFFERENT shared-multi-swap model (``claim(bytes32 swapId, bytes32 preimage)``, no
+        per-swap immutables) NOT compatible with this leg — Phase 4 must inject an
+        ``EthHtlc.sol``-shaped artifact and reconcile/pin the exact event selector
+        (``keccak('Claimed(bytes32)')``) rather than the current ABI-free p-in-log match.
+        ``recover_secret`` matches
+        ``sha256(p)==H`` over the supplied tx but TRUSTS that the tx belongs to this swap; we
+        verify that here, fail-closed:
+
+          * ``tx.to == contract_address`` — the claim called OUR contract instance (not a
+            different swap's, even one that reused ``H``);
+          * ``receipt.status == 1`` — the claim actually succeeded (the ETH moved; a reverted
+            tx never paid the maker even if ``p`` sits in its calldata);
+          * a log emitted BY ``contract_address`` whose data carries the SECRET ``p`` — the
+            on-chain ``Claimed(p)`` event. We bind to ``p``, NOT the public hashlock ``H``:
+            ``H`` is negotiated openly and reused on both legs (so an ``H``-match adds no
+            authenticity), and the deployed contract NEVER re-emits ``H`` (it is a constructor
+            immutable) — an ``H``-in-log gate would reject every legitimate claim. ``p`` is
+            secret until the maker reveals it, so ``p`` appearing in a log from our unique
+            contract is a genuine, swap-specific proof of a real claim on it.
+
+        ``preimage`` is the value the coordinator already recovered via ``scrape_secret`` and
+        re-verified ``sha256(p)==H``, so passing it here adds no trust assumption. Any RPC
+        error propagates and aborts the claim — also fail-closed. The redundant receipt read
+        vs :meth:`fetch_claim_artifacts` is deliberate (correctness over a saved round-trip).
+        """
+        want = _addr(contract_address)
+        p = self._p32(preimage)
+        tx = await self._rpc.get_transaction(tx_hash)
+        if _addr(tx.get("to")) != want:
+            raise ValidationError(
+                "claim tx 'to' is not this swap's HTLC contract address; "
+                "refusing to scrape p (wrong or cross-swap claim tx)"
+            )
+        receipt = await self._rpc.wait_receipt(tx_hash)
+        if int(receipt.get("status", 0)) != 1:
+            raise ValidationError("claim tx did not succeed (status != 1); refusing to treat it as a valid claim")
+        for log in receipt.get("logs", []):
+            if _addr(log.get("address")) != want:
+                continue
+            blob = b"".join(_b(topic) for topic in log.get("topics", [])) + _b(log.get("data"))
+            if p in blob:
+                return
+        raise ValidationError(
+            "no Claimed(p) event from this swap's HTLC contract carries the revealed preimage; "
+            "refusing to scrape p (wrong or cross-swap claim tx)"
+        )
+
+    @staticmethod
+    def _p32(preimage: bytes) -> bytes:
+        if not isinstance(preimage, (bytes, bytearray)) or len(preimage) != 32:
+            raise ValidationError("preimage must be 32 bytes")
+        return bytes(preimage)
 
 
 # Register as a virtual subclass of the CounterChainLeg ABC: the leg realises the full

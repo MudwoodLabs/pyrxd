@@ -9,8 +9,13 @@ only starts counting once the covenant is MINED. This module bridges the two:
 * :func:`eth_absolute_to_rxd_relative_blocks` converts the absolute ETH deadline into the
   relative RXD-block window the maker should lock the covenant for, with conservative
   (floor) rounding + a fail-closed safety floor, so the canonical HTLC ordering invariant
-  (the asset/RXD leg's refund opens only AFTER the counter/ETH leg's deadline, minus the
-  margin) holds across the unit + anchor boundary.
+  holds across the unit + anchor boundary: the asset/RXD leg (claimed SECOND, by the taker)
+  opens its refund strictly BEFORE the counter/ETH leg's deadline by at least the margin —
+  i.e. the counter/ETH leg, claimed FIRST by the maker, holds the LONGER deadline (the
+  cross-clock analog of the BTC ``t_BTC > t_RXD`` invariant). The inherent risk this ordering
+  creates (a maker withholding its claim until past the RXD refund, then claiming AND
+  refunding) is defended by the proactive asset-refund, not by the timelock alone — see
+  :func:`pyrxd.gravity.swap_coordinator.should_taker_refund_proactively`.
 
 * :func:`assert_covenant_confirms_before_eth_deadline` is the funding-confirmation gate
   that closes the NEW mixed-clock race (re-audit SC-3/TLK-1): because the RXD CSV clock
@@ -49,7 +54,8 @@ class CrossClockMargin:
 
     Each component is a deliberate, documented seconds budget; the converter subtracts
     their sum from the ETH deadline before sizing the RXD window, so the RXD refund opens
-    strictly after the ETH deadline by at least this much wall-clock.
+    strictly BEFORE the ETH deadline by at least this much wall-clock (the RXD/asset leg,
+    claimed second, holds the SHORTER deadline; the ETH/counter leg the longer).
 
     ``eth_reorg_finality_s`` is CHOSEN/ESTIMATED (post-Merge ETH has variable finalization
     lag, ~2 epochs ≈ 12.8 min in the steady state); ``rounding_slack_s`` MUST be at least
@@ -90,8 +96,10 @@ def eth_absolute_to_rxd_relative_blocks(
     """Size the RXD covenant's RELATIVE CSV window (in BLOCKS) from the ETH ABSOLUTE deadline.
 
     The RXD refund — relative, anchored at covenant mining ≈ ``expected_rxd_lock_time_unix_s``
-    — must open only after the ETH deadline minus the full margin. So the available
-    wall-clock budget for the RXD window is::
+    — must open strictly BEFORE the ETH deadline minus the full margin (the RXD/asset leg
+    holds the SHORTER deadline; the ETH/counter leg the longer). The window is sized as large
+    as that allows (rxd-refund pushed up to, but not past, ``eth_timeout - margin``, maximising
+    the taker's claim window). So the available wall-clock budget for the RXD window is::
 
         budget_s = eth_timeout_unix_s - margin.total_s() - expected_rxd_lock_time_unix_s
 
