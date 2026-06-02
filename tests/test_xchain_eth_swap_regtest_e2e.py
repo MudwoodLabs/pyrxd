@@ -36,16 +36,36 @@ pytest.importorskip("web3")
 pytest.importorskip("eth_keys")
 
 from pyrxd.btc_wallet import taproot as bt
+from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
-from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
+from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
+from pyrxd.keys import PrivateKey
+from pyrxd.script.script import Script
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
+from pyrxd.security.types import Hex20
+from pyrxd.transaction.transaction import Transaction
+from pyrxd.transaction.transaction_input import TransactionInput
+from pyrxd.transaction.transaction_output import TransactionOutput
+
+# A fake ref-authenticity indexer (resolves a genesis ref to a clean ResolvedRef — gly marker,
+# deep confs, genesis-outpoint == ref). For FT/NFT the coordinator's pre-lock gate requires one;
+# a REAL RXinDexer is the separate production-integration gap. (NB the on-chain covenant uses a
+# fake singleton per R1: consensus enforces ref UNIQUENESS, not mint PROVENANCE.)
+from tests.test_swap_coordinator import FakeIndexer
 
 # Reuse the BTC e2e's Radiant-side helpers (no value moved; one source of truth).
-from tests.test_xchain_swap_regtest_e2e import _FeeSource, _RadiantCliClient, _rxd_pay
+from tests.test_xchain_swap_regtest_e2e import (
+    _RXD_RELAY_FEE,
+    _FeeSource,
+    _p2pkh_unlock,
+    _RadiantCliClient,
+    _rxd_pay,
+    _src,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -245,33 +265,97 @@ def _eth_policy():
     )
 
 
-def _build(node, url, *, t_rxd_blocks):
-    """Build the covenant, the real legs, and the coordinator for an ETH↔RXD swap."""
+def _fund_spending_ref(node, dest_spk: bytes, amount: int, ref_utxo: dict) -> str:
+    """Fund ``dest_spk`` by spending EXACTLY ``ref_utxo`` (so its outpoint enters the input-ref
+    set — the R1 mechanism that makes consensus accept the FT/NFT singleton; consensus enforces
+    ref UNIQUENESS, not mint PROVENANCE)."""
+    u = ref_utxo
+    key = PrivateKey(str(node.rxd("dumpprivkey", u["address"], wallet="gravity")))
+    pkh = bytes(Hex20(key.public_key().hash160()))
+    spk = bytes.fromhex(u["scriptPubKey"])
+    in_sats = round(u["amount"] * 1e8)
+    fin = TransactionInput(
+        source_transaction=_src(u["txid"], int(u["vout"]), spk, in_sats),
+        source_txid=u["txid"],
+        source_output_index=int(u["vout"]),
+        unlocking_script_template=_p2pkh_unlock(key),
+    )
+    fin.satoshis = in_sats
+    fin.locking_script = Script(spk)
+    change_spk = b"\x76\xa9\x14" + pkh + b"\x88\xac"
+    tx = Transaction(
+        tx_inputs=[fin],
+        tx_outputs=[
+            TransactionOutput(Script(dest_spk), amount),
+            TransactionOutput(Script(change_spk), in_sats - amount - _RXD_RELAY_FEE),
+        ],
+    )
+    tx.sign()
+    txid = node.rxd("sendrawtransaction", tx.serialize().hex())
+    node.rxd_mine(1)
+    return str(txid)
+
+
+def _build(node, url, *, t_rxd_blocks, asset_variant="rxd"):
+    """Build the covenant, the real legs, and the coordinator for an ETH↔(RXD|FT-glyph|NFT-glyph)
+    swap. Returns (coord, cov, p_secret, eth_leg, rpc, ref_utxo) — ref_utxo is None for rxd, else
+    the wallet UTXO that funds the singleton (the maker spends it to lock the asset)."""
     p_secret = SecretBytes(os.urandom(32))
     h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
-    rxd_photons = 100_000
+    # rxd swaps the photons; ft/nft swap a small token carrier (the singleton/FT amount).
+    carrier = 100_000 if asset_variant == "rxd" else 1000
     t_rxd = bt.Timelock(t_rxd_blocks, bt.TimeUnit.BLOCKS)
     t_btc = bt.Timelock(t_rxd_blocks + 40, bt.TimeUnit.BLOCKS)  # decorative for ETH; kept > t_rxd
     eth_timeout = _anvil_now(url) + 50_000  # clears the cross-clock projection; future for claim()
 
-    from pyrxd.keys import PrivateKey
-    from pyrxd.security.types import Hex20
-
     taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
-    cov = build_htlc_covenant_rxd(
-        amount=rxd_photons, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
-    )
+
+    ref_utxo = None
+    genesis_ref = b""
+    indexer = None
+    if asset_variant == "rxd":
+        cov = build_htlc_covenant_rxd(
+            amount=carrier, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
+        )
+    else:
+        # A plain wallet UTXO as the genesis ref (a "fake singleton" — R1). A real swap binds a
+        # genuinely-minted Glyph + a real RXinDexer; the off-chain ref-authenticity gate (the
+        # FakeIndexer here) is the only mint-provenance check, so this proves the SWAP MECHANISM.
+        ref_utxo = max(node.rxd("listunspent", "1", "9999999", wallet="gravity"), key=lambda x: x["amount"])
+        ref_txid, ref_vout = ref_utxo["txid"], int(ref_utxo["vout"])
+        if asset_variant == "nft":
+            cov = build_htlc_covenant_nft(
+                genesis_txid=ref_txid,
+                genesis_vout=ref_vout,
+                nft_carrier_value=carrier,
+                taker_pkh=taker_pkh,
+                maker_pkh=maker_pkh,
+                hashlock=h,
+                refund_csv=t_rxd.value,
+            )
+        else:  # ft
+            cov = build_htlc_covenant_ft(
+                genesis_txid=ref_txid,
+                genesis_vout=ref_vout,
+                amount=carrier,
+                taker_pkh=taker_pkh,
+                maker_pkh=maker_pkh,
+                hashlock=h,
+                refund_csv=t_rxd.value,
+            )
+        genesis_ref = GlyphRef(txid=ref_txid, vout=ref_vout).to_bytes()
+        indexer = FakeIndexer()  # resolves the ref to a clean ResolvedRef (gly marker, deep confs)
 
     terms = NegotiatedTerms(
         hashlock=h,
-        btc_sats=rxd_photons,
-        radiant_amount=rxd_photons,
+        btc_sats=100_000,
+        radiant_amount=carrier,
         t_btc=t_btc,
         t_rxd=t_rxd,
-        asset_variant="rxd",
-        genesis_ref=b"",
+        asset_variant=asset_variant,
+        genesis_ref=genesis_ref,
         taker_dest_hash=cov.expected_taker_hash,
         maker_dest_hash=cov.expected_maker_hash,
         btc_claim_pubkey_xonly=b"\x00" * 32,
@@ -314,19 +398,22 @@ def _build(node, url, *, t_rxd_blocks):
         record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=eth_leg,
         radiant_leg=rxd_leg,
-        indexer=None,
+        indexer=indexer,
         seen_store=_MemSeen(),
         # anvil is treated as value-bearing (it can fork mainnet); accept the in-process seen
         # store for this single-process, single-shot, fresh-H-per-run e2e (the documented hatch).
         config=CoordinatorConfig(margin_policy=_eth_policy(), accept_nondurable_seen=True),
     )
-    return coord, cov, p_secret, eth_leg, rpc
+    return coord, cov, p_secret, eth_leg, rpc, ref_utxo
 
 
 class TestEthRxdSwap:
-    async def test_happy_path_completes(self, env):
+    @pytest.mark.parametrize("asset_variant", ["rxd", "nft", "ft"])
+    async def test_happy_path_completes(self, env, asset_variant):
+        """ETH↔(RXD | NFT-glyph | FT-glyph) settles end-to-end. The NFT/FT cases bind a Glyph
+        token (genesis ref) into the covenant — proving the swap of a Glyph asset, not just RXD."""
         node, url = env
-        coord, cov, p_secret, eth_leg, rpc = _build(node, url, t_rxd_blocks=60)
+        coord, cov, p_secret, eth_leg, rpc, ref_utxo = _build(node, url, t_rxd_blocks=60, asset_variant=asset_variant)
         terms = coord.record.terms
         now_unix = _anvil_now(url)
 
@@ -335,9 +422,12 @@ class TestEthRxdSwap:
         assert rec.state is SwapState.BTC_LOCKED
         assert rec.counterchain_locator.amount_wei == _ETH_AMOUNT_WEI
 
-        # 2. Maker locks the RXD covenant on regtest; taker re-validates SPK + cross-clock timing.
+        # 2. Maker locks the asset covenant on regtest; taker re-validates SPK + ref + cross-clock.
         asset_locked_at = int(node.rxd("getblockcount"))
-        _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+        if ref_utxo is None:  # rxd: native photons
+            _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+        else:  # nft/ft: spend the genesis-ref UTXO into the covenant (the singleton)
+            _fund_spending_ref(node, cov.funded_spk, terms.radiant_amount, ref_utxo)
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
         assert rec.state is SwapState.BOTH_LOCKED
 
@@ -358,12 +448,14 @@ class TestEthRxdSwap:
         assert rec.state is SwapState.COMPLETED
 
         cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
-        assert node.rxd("gettxout", cov_txid, "0") in (None, ""), "RXD covenant should be spent after the taker's claim"
+        assert node.rxd("gettxout", cov_txid, "0") in (None, ""), (
+            f"{asset_variant} asset covenant should be spent after the taker's claim"
+        )
         await rpc.close()
 
     async def test_mutual_refund_when_maker_never_claims(self, env):
         node, url = env
-        coord, cov, _p_secret, _eth_leg, rpc = _build(node, url, t_rxd_blocks=3)
+        coord, cov, _p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=3)
         terms = coord.record.terms
         now_unix = _anvil_now(url)
 
