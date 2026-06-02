@@ -50,7 +50,7 @@ from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
-from pyrxd.gravity.htlc_covenant import build_htlc_covenant_nft
+from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
@@ -166,9 +166,24 @@ def _largest_utxo(node, min_sats):
     return max(utxos, key=lambda x: x["amount"])
 
 
-def _mint_nft_glyph(node):
-    """Mint a genuine NFT Glyph (commit→reveal) and return (genesis_ref_str, reveal_txid, owner_key,
-    reveal_locking_script, reveal_value). The genesis ref is ``reveal_txid:0`` — the NFT singleton."""
+class _Minted:
+    """A genuinely-minted Glyph: genesis ref (``reveal_txid:0``) + the owner key + reveal output."""
+
+    def __init__(self, ref_str, reveal_txid, owner_key, locking_script, reveal_value, is_nft):
+        self.ref_str = ref_str
+        self.reveal_txid = reveal_txid
+        self.owner_key = owner_key
+        self.locking_script = locking_script
+        self.reveal_value = reveal_value
+        self.is_nft = is_nft
+
+
+def _mint_glyph(node, *, is_nft: bool) -> _Minted:
+    """Mint a genuine NFT or FT Glyph (commit→reveal). The genesis ref is ``reveal_txid:0``.
+
+    NFT: the reveal output is the ``d8 <ref> OP_DROP <p2pkh>`` singleton (small carrier value).
+    FT:  the reveal output is the ``p2pkh + <conservation epilogue>`` holder; its photon value IS
+         the FT amount (1 photon = 1 unit), so the whole reveal value is the fungible supply."""
     builder = GlyphBuilder()
     u = _largest_utxo(node, _COMMIT_VALUE + 3 * _RXD_RELAY_FEE)
     key = PrivateKey(str(node.rxd("dumpprivkey", u["address"])))
@@ -176,7 +191,10 @@ def _mint_nft_glyph(node):
     spk = bytes.fromhex(u["scriptPubKey"])
     in_sats = round(u["amount"] * 1e8)
 
-    meta = GlyphMetadata(protocol=[GlyphProtocol.NFT], name="ETH-RXD-REAL-GLYPH", token_type="object")
+    if is_nft:
+        meta = GlyphMetadata(protocol=[GlyphProtocol.NFT], name="ETH-RXD-REAL-NFT", token_type="object")
+    else:
+        meta = GlyphMetadata(protocol=[GlyphProtocol.FT], name="ETH-RXD-REAL-FT", ticker="ERFT", decimals=0)
     commit = builder.prepare_commit(
         CommitParams(metadata=meta, owner_pkh=pkh, change_pkh=pkh, funding_satoshis=in_sats)
     )
@@ -207,7 +225,7 @@ def _mint_nft_glyph(node):
             commit_value=_COMMIT_VALUE,
             cbor_bytes=commit.cbor_bytes,
             owner_pkh=pkh,
-            is_nft=True,
+            is_nft=is_nft,
         )
     )
     rin = TransactionInput(
@@ -223,7 +241,7 @@ def _mint_nft_glyph(node):
     reveal_tx.sign()
     reveal_txid = str(node.rxd("sendrawtransaction", reveal_tx.serialize().hex()))
     node.rxd_mine(2)
-    return f"{reveal_txid}:0", reveal_txid, key, rev.locking_script, reveal_value
+    return _Minted(f"{reveal_txid}:0", reveal_txid, key, rev.locking_script, reveal_value, is_nft)
 
 
 async def _wait_indexed(ws_url, ref, attempts=30):
@@ -247,22 +265,47 @@ async def _wait_indexed(ws_url, ref, attempts=30):
     raise RuntimeError(f"RXinDexer never indexed {ref}")
 
 
-def _spend_singleton_into_covenant(node, dest_spk, amount, *, reveal_txid, owner_key, locking_script, reveal_value):
-    """Spend the REAL NFT singleton (``reveal_txid:0``) into the covenant — so the genuine genesis
+def _spend_singleton_into_covenant(node, dest_spk, dest_value, *, minted: _Minted):
+    """Spend the REAL minted singleton (``reveal_txid:0``) into the covenant — so the genuine genesis
     outpoint enters the covenant's input-ref set (the covenant binds genesis_txid=reveal_txid).
 
-    The NFT reveal locking script is ``d8 <ref> OP_DROP <p2pkh(owner_pkh)>`` (see
-    ``build_nft_locking_script``): the ref-push + OP_DROP run first and consume themselves, leaving
-    a plain P2PKH that the owner key's sig+pubkey satisfies — so a P2PKH unlock is correct here."""
+    Both the NFT (``d8 <ref> OP_DROP <p2pkh>``) and the FT (``p2pkh + <conservation epilogue>``)
+    holder scripts start with a P2PKH that the owner key's sig+pubkey satisfies — the ref/epilogue
+    opcodes self-consume during validation — so a P2PKH unlock is correct for both.
+
+    NFT: a single input (singleton -> covenant carrier) suffices; fee comes out of the value delta.
+    FT:  the conservation epilogue requires the covenant output to carry the FULL FT amount
+         (``dest_value == reveal_value``), so the relay fee must come from a SEPARATE RXD input
+         (proven via testmempoolaccept 2026-06-01: same-value FT spend with no fee input is rejected
+         only for "min relay fee not met"; adding a fee input + change is accepted)."""
     rin = TransactionInput(
-        source_transaction=_src(reveal_txid, 0, locking_script, reveal_value),
-        source_txid=reveal_txid,
+        source_transaction=_src(minted.reveal_txid, 0, minted.locking_script, minted.reveal_value),
+        source_txid=minted.reveal_txid,
         source_output_index=0,
-        unlocking_script_template=_p2pkh_unlock(owner_key),
+        unlocking_script_template=_p2pkh_unlock(minted.owner_key),
     )
-    rin.satoshis = reveal_value
-    rin.locking_script = Script(locking_script)
-    tx = Transaction(tx_inputs=[rin], tx_outputs=[TransactionOutput(Script(dest_spk), amount)])
+    rin.satoshis = minted.reveal_value
+    rin.locking_script = Script(minted.locking_script)
+    outs = [TransactionOutput(Script(dest_spk), dest_value)]
+    inputs = [rin]
+    if not minted.is_nft:
+        # FT: pull a separate fee input + send change back to a fresh wallet address.
+        f = _largest_utxo(node, 3 * _RXD_RELAY_FEE)
+        fkey = PrivateKey(str(node.rxd("dumpprivkey", f["address"])))
+        fspk = bytes.fromhex(f["scriptPubKey"])
+        fval = round(f["amount"] * 1e8)
+        feein = TransactionInput(
+            source_transaction=_src(f["txid"], int(f["vout"]), fspk, fval),
+            source_txid=f["txid"],
+            source_output_index=int(f["vout"]),
+            unlocking_script_template=_p2pkh_unlock(fkey),
+        )
+        feein.satoshis = fval
+        feein.locking_script = Script(fspk)
+        inputs.append(feein)
+        change_spk = b"\x76\xa9\x14" + bytes(Hex20(fkey.public_key().hash160())) + b"\x88\xac"
+        outs.append(TransactionOutput(Script(change_spk), fval - _RXD_RELAY_FEE))
+    tx = Transaction(tx_inputs=inputs, tx_outputs=outs)
     tx.sign()
     txid = str(node.rxd("sendrawtransaction", tx.serialize().hex()))
     node.rxd_mine(1)
@@ -318,25 +361,33 @@ def env():
 
 
 class TestEthRealGlyphSwap:
-    async def test_happy_path_with_real_minted_glyph_and_rxindexer(self, env):
-        """ETH↔(real NFT Glyph) settles end-to-end with the REAL RxinDexerRefAdapter as the
-        pre-lock authenticity oracle — not the FakeIndexer, not a fake singleton."""
-        node, url, ws_url = env
+    @pytest.mark.parametrize("asset_variant", ["nft", "ft"])
+    async def test_happy_path_with_real_minted_glyph_and_rxindexer(self, env, asset_variant):
+        """ETH↔(real NFT|FT Glyph) settles end-to-end with the REAL RxinDexerRefAdapter as the
+        pre-lock authenticity oracle — not the FakeIndexer, not a fake singleton.
 
-        # 0. Mint a genuine NFT Glyph; wait for the real RXinDexer to index it.
-        genesis_ref_str, reveal_txid, owner_key, locking_script, reveal_value = _mint_nft_glyph(node)
+        The FT case additionally exercises the on-chain conservation epilogue: the genuine FT
+        singleton is spent into the FT covenant with the full FT amount conserved (covenant value ==
+        reveal value) + a separate RXD fee input."""
+        node, url, ws_url = env
+        is_nft = asset_variant == "nft"
+
+        # 0. Mint a genuine Glyph; wait for the real RXinDexer to index it.
+        minted = _mint_glyph(node, is_nft=is_nft)
         # Bury the genesis >=6 deep: the REAL adapter reads live confs and the pre-lock REF gate
         # fails closed on a shallow genesis (it can be reorged out after payment). The FakeIndexer
         # always reported deep confs, so this real-world burial requirement was never exercised.
         node.rxd_mine(6)
-        await _wait_indexed(ws_url, genesis_ref_str)
-        ref_txid, ref_vout = genesis_ref_str.split(":")
+        await _wait_indexed(ws_url, minted.ref_str)
+        ref_txid, ref_vout = minted.ref_str.split(":")
         genesis_ref = GlyphRef(txid=ref_txid, vout=int(ref_vout)).to_bytes()
 
-        # 1. Build the NFT covenant bound to the GENUINE genesis ref.
+        # 1. Build the covenant bound to the GENUINE genesis ref.
+        #    NFT: a small fixed carrier value. FT: the covenant must carry the FULL minted FT amount
+        #    (1 photon = 1 unit) for the conservation epilogue to be satisfied on the lock spend.
         p_secret = SecretBytes(os.urandom(32))
         h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
-        carrier = 1000
+        carrier = 1000 if is_nft else minted.reveal_value
         t_rxd = bt.Timelock(60, bt.TimeUnit.BLOCKS)
         t_btc = bt.Timelock(100, bt.TimeUnit.BLOCKS)
         eth_timeout = _anvil_now(url) + 50_000
@@ -345,15 +396,26 @@ class TestEthRealGlyphSwap:
         taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
         maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
 
-        cov = build_htlc_covenant_nft(
-            genesis_txid=ref_txid,
-            genesis_vout=int(ref_vout),
-            nft_carrier_value=carrier,
-            taker_pkh=taker_pkh,
-            maker_pkh=maker_pkh,
-            hashlock=h,
-            refund_csv=t_rxd.value,
-        )
+        if is_nft:
+            cov = build_htlc_covenant_nft(
+                genesis_txid=ref_txid,
+                genesis_vout=int(ref_vout),
+                nft_carrier_value=carrier,
+                taker_pkh=taker_pkh,
+                maker_pkh=maker_pkh,
+                hashlock=h,
+                refund_csv=t_rxd.value,
+            )
+        else:
+            cov = build_htlc_covenant_ft(
+                genesis_txid=ref_txid,
+                genesis_vout=int(ref_vout),
+                amount=carrier,
+                taker_pkh=taker_pkh,
+                maker_pkh=maker_pkh,
+                hashlock=h,
+                refund_csv=t_rxd.value,
+            )
 
         # 2. The REAL authenticity oracle: RxinDexerRefAdapter over ws:// + the node for confs.
         rxd_client = _RadiantCliClient(node)
@@ -368,7 +430,7 @@ class TestEthRealGlyphSwap:
             radiant_amount=carrier,
             t_btc=t_btc,
             t_rxd=t_rxd,
-            asset_variant="nft",
+            asset_variant=asset_variant,
             genesis_ref=genesis_ref,
             taker_dest_hash=cov.expected_taker_hash,
             maker_dest_hash=cov.expected_maker_hash,
@@ -418,22 +480,14 @@ class TestEthRealGlyphSwap:
         rec = await coord.taker_funds_btc(terms, now_unix_s=now_unix)
         assert rec.state is SwapState.BTC_LOCKED
 
-        # 4. Maker locks the REAL NFT singleton into the covenant; taker re-validates SPK + REF
+        # 4. Maker locks the REAL minted singleton into the covenant; taker re-validates SPK + REF
         #    (through the REAL RXinDexer) + cross-clock.
         asset_locked_at = int(node.rxd("getblockcount"))
-        _spend_singleton_into_covenant(
-            node,
-            cov.funded_spk,
-            carrier,
-            reveal_txid=reveal_txid,
-            owner_key=owner_key,
-            locking_script=locking_script,
-            reveal_value=reveal_value,
-        )
+        _spend_singleton_into_covenant(node, cov.funded_spk, carrier, minted=minted)
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
         assert rec.state is SwapState.BOTH_LOCKED
 
-        # 5. Maker claims the ETH (reveals p), taker scrapes + claims the NFT (FINAL → SAFE).
+        # 5. Maker claims the ETH (reveals p), taker scrapes + claims the asset (FINAL → SAFE).
         rec = await coord.maker_claims_btc(p_secret)
         assert rec.state is SwapState.SECRET_REVEALED
         claim_tx = eth_leg.last_claim_tx
