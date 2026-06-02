@@ -253,11 +253,38 @@ class RxinDexerRefAdapter:
     def _genesis_outpoint(token: dict, queried: GlyphRef) -> bytes:
         """Re-encode the token's reported genesis outpoint to the 36-byte wire ref.
 
-        Prefers an explicit ``ref_outpoint`` (``txid:vout``); falls back to
-        ``ref_txid``+``ref_vout``. If the indexer reports neither, we cannot bind
-        provenance -> return a value that will NOT equal the advertised ref, so the
-        gate's genesis-outpoint==ref binding fails closed.
+        RXinDexer's ``glyph.get_token`` reports the genesis outpoint under
+        ``glyph_id`` (``txid:vout``), alongside ``txid``+``vout`` and an
+        ``is_reveal`` flag (verified against a live regtest RXinDexer 2026-06-01:
+        a genuine reveal resolves with ``glyph_id == queried`` and
+        ``is_reveal=True``; the commit outpoint and bare wallet UTXOs resolve to
+        ``None``). We also accept the legacy ``ref_outpoint`` / ``ref_txid`` +
+        ``ref_vout`` field names as fallbacks for other indexer builds.
+
+        The token must be a genesis REVEAL for the outpoint to be a genesis: a
+        transfer UTXO would report the genesis under ``glyph_id`` but is itself a
+        different outpoint than ``queried``, so the gate's
+        ``genesis_outpoint == advertised_ref`` binding would (correctly) reject it.
+        If the indexer reports no resolvable outpoint, we return a value that will
+        NOT equal the advertised ref, so the binding fails closed.
         """
+        # RXinDexer native: glyph_id == "txid:vout" of the genesis reveal.
+        glyph_id = token.get("glyph_id")
+        if isinstance(glyph_id, str) and glyph_id.count(":") == 1:
+            txid, vout_s = glyph_id.split(":")
+            try:
+                return GlyphRef(txid=txid, vout=int(vout_s)).to_bytes()
+            except (ValidationError, ValueError):
+                return b"\x00" * 36
+        # RXinDexer native: separate txid + vout fields.
+        txid = token.get("txid")
+        vout = token.get("vout")
+        if isinstance(txid, str) and isinstance(vout, int) and not isinstance(vout, bool):
+            try:
+                return GlyphRef(txid=txid, vout=vout).to_bytes()
+            except (ValidationError, ValueError):
+                return b"\x00" * 36
+        # Legacy/alternate indexer field names.
         outpoint = token.get("ref_outpoint")
         if isinstance(outpoint, str) and outpoint.count(":") == 1:
             txid, vout_s = outpoint.split(":")
@@ -265,11 +292,11 @@ class RxinDexerRefAdapter:
                 return GlyphRef(txid=txid, vout=int(vout_s)).to_bytes()
             except (ValidationError, ValueError):
                 return b"\x00" * 36
-        txid = token.get("ref_txid")
-        vout = token.get("ref_vout")
-        if isinstance(txid, str) and isinstance(vout, int):
+        rtxid = token.get("ref_txid")
+        rvout = token.get("ref_vout")
+        if isinstance(rtxid, str) and isinstance(rvout, int) and not isinstance(rvout, bool):
             try:
-                return GlyphRef(txid=txid, vout=vout).to_bytes()
+                return GlyphRef(txid=rtxid, vout=rvout).to_bytes()
             except (ValidationError, ValueError):
                 return b"\x00" * 36
         # No outpoint reported -> cannot confirm it equals the advertised ref.

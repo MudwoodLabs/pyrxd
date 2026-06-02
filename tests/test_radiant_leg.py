@@ -355,6 +355,48 @@ async def test_ref_adapter_ref_txid_vout_fallback():
     assert resolved.genesis_outpoint == ref
 
 
+async def test_ref_adapter_real_rxindexer_glyph_id_shape():
+    """The REAL RXinDexer reports the genesis outpoint under ``glyph_id`` /
+    ``txid`` + ``vout`` (NOT ``ref_outpoint`` / ``ref_txid``).
+
+    Pinned to a live regtest RXinDexer capture (2026-06-01) of a genuinely
+    minted NFT Glyph. The original adapter only read ``ref_outpoint`` /
+    ``ref_txid``, so against the real indexer ``_genesis_outpoint`` fell through
+    to the all-zero placeholder and the gate failed closed on EVERY real Glyph.
+    The fake (which returns those legacy field names) never caught this; only an
+    e2e against the real indexer did.
+    """
+    real_token = {  # verbatim glyph.get_token() shape from rxindexer-electrumx
+        "glyph_id": f"{_REF_TXID}:0",
+        "txid": _REF_TXID,
+        "vout": 0,
+        "value": 4_000_000,
+        "envelope_source": "input:0",
+        "version": 1,
+        "is_reveal": True,
+        "token_type": "NFT",
+        "metadata": {"protocols": [2], "version": 1, "name": "X", "ticker": None, "decimals": 0},
+    }
+    ref = GlyphRef(txid=_REF_TXID, vout=0).to_bytes()
+    io = RadiantChainIO(FakeClient(confirmations=10))
+    adapter = RxinDexerRefAdapter(FakeIndexer(real_token), io)
+    resolved = await adapter.resolve_ref(ref)
+    assert resolved is not None
+    assert resolved.genesis_outpoint == ref  # was all-zero before the fix
+    assert resolved.has_gly_marker is True
+    # And the gate accepts it.
+    await verify_ref_authenticity(adapter, ref, asset_variant="nft", min_confirmations=6)
+
+
+async def test_ref_adapter_real_shape_txid_vout_without_glyph_id():
+    """Fallback within the real-indexer shape: txid + vout when glyph_id absent."""
+    ref = GlyphRef(txid=_REF_TXID, vout=3).to_bytes()
+    io = RadiantChainIO(FakeClient(confirmations=10))
+    adapter = RxinDexerRefAdapter(FakeIndexer({"txid": _REF_TXID, "vout": 3}), io)
+    resolved = await adapter.resolve_ref(ref)
+    assert resolved.genesis_outpoint == ref
+
+
 async def test_ref_adapter_no_outpoint_field_fails_binding():
     """A token dict with no outpoint field -> placeholder genesis -> gate rejects."""
     ref = GlyphRef(txid=_REF_TXID, vout=0).to_bytes()
