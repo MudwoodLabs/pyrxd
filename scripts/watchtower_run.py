@@ -20,7 +20,7 @@ Example:
         --rxd-electrumx-url wss://electrumx.radiant4people.com:50022 \
         --poll-interval-s 30
 
-This is operational glue; the tested logic lives in ``pyrxd.gravity.watch`` (68 unit
+This is operational glue; the tested logic lives in ``pyrxd.gravity.watch`` (88 unit
 tests). Verify it end-to-end against your own endpoints before relying on it.
 """
 
@@ -38,12 +38,16 @@ from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.watch import (
     ChainObserver,
+    CompositeAlertChannel,
     DedupAlerter,
     ElectrumRxdChainSource,
+    FileHeartbeat,
     JsonDirRecordStore,
     LoggingAlertChannel,
     OutspendBtcClaimSource,
     Reconciler,
+    WebhookAlertChannel,
+    combine_heartbeats,
     default_heartbeat,
     mempool_space_outspend,
     run_loop,
@@ -131,7 +135,27 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--measured", action="store_true", help="use a measured MarginPolicy (recommended)")
     p.add_argument("--once", action="store_true", help="run a single tick and exit")
     p.add_argument("--allow-insecure", action="store_true", help="allow non-TLS ElectrumX")
+    # #1 notification channel (in addition to the always-on log)
+    p.add_argument("--webhook-url", help="POST pages to this webhook (ntfy/Pushover/Slack/custom)")
+    p.add_argument("--webhook-auth-header", help="optional 'Header: value' sent with the webhook (e.g. a bearer token)")
+    p.add_argument("--webhook-secret", help="optional HMAC-SHA256 secret -> X-Watchtower-Signature header")
+    # #2 dead-man's switch: write a liveness file each tick (watched by watchtower_deadman.py)
+    p.add_argument("--heartbeat-file", help="write a liveness heartbeat here each tick")
     return p.parse_args(argv)
+
+
+def _build_alert_channel(args: argparse.Namespace, session):
+    """Always log; additionally POST to an authenticated webhook if configured."""
+    channels = [LoggingAlertChannel()]
+    if args.webhook_url:
+        auth = None
+        if args.webhook_auth_header:
+            key, _, val = args.webhook_auth_header.partition(":")
+            auth = {key.strip(): val.strip()}
+        channels.append(
+            WebhookAlertChannel(args.webhook_url, session=session, auth_header=auth, hmac_secret=args.webhook_secret)
+        )
+    return channels[0] if len(channels) == 1 else CompositeAlertChannel(*channels)
 
 
 async def _amain(argv=None) -> int:
@@ -157,8 +181,11 @@ async def _amain(argv=None) -> int:
             mempool_base_url=args.mempool_base_url,
             policy=policy,
             safety_window_blocks=args.safety_window_blocks,
-            alert_channel=LoggingAlertChannel(),
+            alert_channel=_build_alert_channel(args, http_session),
         )
+        heartbeat = default_heartbeat(logger)
+        if args.heartbeat_file:
+            heartbeat = combine_heartbeats(heartbeat, FileHeartbeat(args.heartbeat_file))
         rxd_desc = (
             args.rxd_electrumx_url
             if args.rxd_backend == "electrumx"
@@ -175,7 +202,7 @@ async def _amain(argv=None) -> int:
             reconciler,
             interval_s=args.poll_interval_s,
             stop=stop,
-            on_heartbeat=default_heartbeat(logger),
+            on_heartbeat=heartbeat,
             max_iterations=1 if args.once else None,
         )
     with contextlib.suppress(Exception):

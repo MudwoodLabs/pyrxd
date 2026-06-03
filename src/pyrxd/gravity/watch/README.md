@@ -59,7 +59,7 @@ while True:                                  # ← the shell's loop, not the bra
 
 ## Scope boundary
 
-- **v1 (this package):** alert-only, BTC. No broadcast, no keys, no `p`, outside the autonomy audit gate.
+- **v1 (this package):** alert-only, BTC. No broadcast, no keys, no `p`, outside the autonomy audit gate. Operability: an authenticated `WebhookAlertChannel` (HMAC-signed) so an *offline* operator is actually paged, and a cross-process dead-man's switch (`FileHeartbeat` + `DeadMansSwitch`, run via `scripts/watchtower_deadman.py`) that pages if the tower's heartbeat stops. Entrypoints: `scripts/watchtower_run.py` (tower) + `scripts/watchtower_deadman.py` (monitor).
 - **v2 (autonomous BTC):** broadcasts. Adds the custody seam (capped fee key in `RadiantLeg.fee_source`; pre-signed BTC refund bypassing the live-key methods), a structural AUTONOMOUS gate bound to `audit_cleared`, the dead-man's-switch, and the **external audit gate**. RXD multi-source quorum is a hard blocker.
 - **v3 (ETH):** the ETH counter-leg watcher + key authority + `MultiSourceEthRpc` + `FinalityStallTracker` wiring.
 

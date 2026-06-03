@@ -8,8 +8,8 @@ no key and moves no value — see
 
 Layering: this subpackage is the "brain" + thin transports/loop helper. It imports
 downward only (``gravity`` → ``btc_wallet``/``network``), never the reverse. The
-operational entrypoint (arg parsing, real-client construction) lives in
-``scripts/watchtower_run.py``.
+operational entrypoints live in ``scripts/watchtower_run.py`` (the tower) and
+``scripts/watchtower_deadman.py`` (the independent dead-man's-switch monitor).
 
 The decision core (:func:`decide`) CONSUMES the audited gate functions
 ``assess_claim_finality`` and ``should_taker_refund_proactively`` from
@@ -21,11 +21,14 @@ from __future__ import annotations
 
 from pyrxd.gravity.watch.adapters import (
     CallbackAlertChannel,
+    CompositeAlertChannel,
     ElectrumRxdChainSource,
     JsonDirRecordStore,
     LoggingAlertChannel,
     OutspendBtcClaimSource,
+    WebhookAlertChannel,
     mempool_space_outspend,
+    page_to_dict,
 )
 from pyrxd.gravity.watch.alerts import (
     AlertChannel,
@@ -33,12 +36,19 @@ from pyrxd.gravity.watch.alerts import (
     Page,
     Severity,
 )
-from pyrxd.gravity.watch.daemon import default_heartbeat, run_loop
+from pyrxd.gravity.watch.daemon import combine_heartbeats, default_heartbeat, run_loop
 from pyrxd.gravity.watch.decide import (
     Decision,
     Intent,
     Observations,
     decide,
+)
+from pyrxd.gravity.watch.heartbeat import (
+    DeadMansSwitch,
+    DeadManVerdict,
+    FileHeartbeat,
+    heartbeat_age_s,
+    run_monitor,
 )
 from pyrxd.gravity.watch.quorum import (
     BtcClaimSource,
@@ -61,9 +71,13 @@ __all__ = [
     "BtcClaimStatus",
     "CallbackAlertChannel",
     "ChainObserver",
+    "CompositeAlertChannel",
+    "DeadManVerdict",
+    "DeadMansSwitch",
     "Decision",
     "DedupAlerter",
     "ElectrumRxdChainSource",
+    "FileHeartbeat",
     "Intent",
     "JsonDirRecordStore",
     "LoggingAlertChannel",
@@ -76,8 +90,13 @@ __all__ = [
     "RecordStore",
     "RxdChainSource",
     "Severity",
+    "WebhookAlertChannel",
+    "combine_heartbeats",
     "decide",
     "default_heartbeat",
+    "heartbeat_age_s",
     "mempool_space_outspend",
+    "page_to_dict",
     "run_loop",
+    "run_monitor",
 ]

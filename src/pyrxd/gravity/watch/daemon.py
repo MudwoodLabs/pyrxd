@@ -19,10 +19,20 @@ from pyrxd.security.errors import ValidationError
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["default_heartbeat", "run_loop"]
+__all__ = ["combine_heartbeats", "default_heartbeat", "run_loop"]
 
 # heartbeat(iteration, results) — called after each tick (the liveness signal).
 Heartbeat = Callable[[int, list[ReconcileResult]], None]
+
+
+def combine_heartbeats(*heartbeats: Heartbeat) -> Heartbeat:
+    """Fan the heartbeat out to several sinks (e.g. log line + cross-process file)."""
+
+    def _hb(iteration: int, results: list[ReconcileResult]) -> None:
+        for hb in heartbeats:
+            hb(iteration, results)
+
+    return _hb
 
 
 def default_heartbeat(log: logging.Logger | None = None) -> Heartbeat:

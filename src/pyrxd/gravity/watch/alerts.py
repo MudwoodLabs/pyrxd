@@ -47,10 +47,11 @@ _SEVERITY: dict[Intent, Severity] = {
 @dataclass(frozen=True)
 class Page:
     """A single operator notification. ``message`` is human-readable; the structured
-    fields let a richer channel render/route it."""
+    fields let a richer channel render/route it. ``intent`` is ``None`` for a *system*
+    page not tied to a swap action (e.g. the dead-man's-switch liveness alert)."""
 
     swap_id: str
-    intent: Intent
+    intent: Intent | None
     severity: Severity
     message: str
     recommended_action: str | None

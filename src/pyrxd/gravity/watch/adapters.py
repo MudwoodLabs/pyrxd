@@ -21,6 +21,8 @@ operational entrypoint (arg parsing, real-client construction, the poll loop) st
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -35,12 +37,28 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "CallbackAlertChannel",
+    "CompositeAlertChannel",
     "ElectrumRxdChainSource",
     "JsonDirRecordStore",
     "LoggingAlertChannel",
     "OutspendBtcClaimSource",
+    "WebhookAlertChannel",
     "mempool_space_outspend",
+    "page_to_dict",
 ]
+
+
+def page_to_dict(page: Page) -> dict:
+    """Stable JSON shape for a :class:`Page` (the webhook body / dead-man payload)."""
+    return {
+        "swap_id": page.swap_id,
+        "intent": page.intent.value if page.intent is not None else None,
+        "severity": page.severity.value,
+        "message": page.message,
+        "recommended_action": page.recommended_action,
+        "deadline_rxd_height": page.deadline_rxd_height,
+        "low_corroboration": page.low_corroboration,
+    }
 
 
 class JsonDirRecordStore:
@@ -163,3 +181,76 @@ class CallbackAlertChannel:
 
     async def send(self, page: Page) -> None:
         await self._fn(page)
+
+
+class WebhookAlertChannel:
+    """POSTs each page as JSON to a webhook (ntfy / Pushover / Slack / custom).
+
+    Authenticity / tamper-evidence: an optional ``auth_header`` (e.g. a bearer token)
+    and/or an HMAC-SHA256 signature over the exact body bytes (``hmac_secret``), sent as
+    ``X-Watchtower-Signature: sha256=<hex>`` so the receiver can verify the page came
+    from the tower and was not altered. A non-2xx response raises (the
+    :class:`~pyrxd.gravity.watch.alerts.DedupAlerter` then retries next tick — dedup
+    advances only on a successful send). ``session`` is an injected aiohttp ClientSession.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        session,
+        auth_header: dict[str, str] | None = None,
+        hmac_secret: bytes | str | None = None,
+        timeout_s: float = 10.0,
+    ) -> None:
+        if not isinstance(url, str) or not url:
+            raise ValidationError("WebhookAlertChannel requires a non-empty url")
+        self._url = url
+        self._session = session
+        self._headers = dict(auth_header or {})
+        self._secret = hmac_secret.encode() if isinstance(hmac_secret, str) else hmac_secret
+        self._timeout_s = timeout_s
+
+    async def send(self, page: Page) -> None:
+        body = json.dumps(page_to_dict(page), separators=(",", ":")).encode()
+        headers = {"Content-Type": "application/json", **self._headers}
+        if self._secret:
+            sig = hmac.new(self._secret, body, hashlib.sha256).hexdigest()
+            headers["X-Watchtower-Signature"] = f"sha256={sig}"
+        timeout = aiohttp_timeout(self._timeout_s)
+        async with self._session.post(self._url, data=body, headers=headers, timeout=timeout) as resp:
+            resp.raise_for_status()
+
+
+def aiohttp_timeout(seconds: float):
+    """A ClientTimeout if aiohttp is importable, else the bare number (so the channel is
+    importable/testable without aiohttp installed; the real session interprets either)."""
+    try:
+        import aiohttp
+
+        return aiohttp.ClientTimeout(total=seconds)
+    except Exception:  # pragma: no cover - aiohttp is a dep in practice
+        return seconds
+
+
+class CompositeAlertChannel:
+    """Fan a page out to several channels (e.g. log + webhook). Sends to ALL, then raises
+    the first error if any failed — so a webhook outage still logs locally, and the
+    DedupAlerter retries (re-sending to all; a duplicate log line is the only cost)."""
+
+    def __init__(self, *channels) -> None:
+        if not channels:
+            raise ValidationError("CompositeAlertChannel requires at least one channel")
+        self._channels = channels
+
+    async def send(self, page: Page) -> None:
+        first_error: Exception | None = None
+        for ch in self._channels:
+            try:
+                await ch.send(page)
+            except Exception as exc:
+                logger.warning("alert channel %s failed: %r", type(ch).__name__, exc)
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
