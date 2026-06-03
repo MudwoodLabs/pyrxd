@@ -393,7 +393,9 @@ class TestBuildGravityOffer:
         kwargs2 = self._offer_kwargs()
         kwargs2["expected_nbits"] = easy
         with pytest.raises(ValidationError, match="at or above the floor"):
-            build_gravity_offer(**{**kwargs2, "reject_low_difficulty": True}, min_difficulty_nbits=bytes.fromhex("19420317"))
+            build_gravity_offer(
+                **{**kwargs2, "reject_low_difficulty": True}, min_difficulty_nbits=bytes.fromhex("19420317")
+            )
 
     def test_malformed_nbits_rejected(self):
         """F-27: an nBits exponent above 0x1d (covenant tolerates up to 0x20) is

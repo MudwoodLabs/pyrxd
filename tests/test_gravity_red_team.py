@@ -1325,7 +1325,7 @@ class TestTakerIndependentClaimedRedeem:
                 btc_satoshis=100_000,
                 btc_chain_anchor=bytes([0xDD]) * 32,
                 expected_nbits=bytes.fromhex("ffff001d"),
-        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
+                reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
                 anchor_height=800_000,
                 merkle_depth=12,
                 claim_deadline=_future_deadline(48),
@@ -1355,7 +1355,7 @@ class TestTakerIndependentClaimedRedeem:
                 btc_satoshis=100_000,
                 btc_chain_anchor=bytes([0xDD]) * 32,
                 expected_nbits=bytes.fromhex("ffff001d"),
-        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
+                reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
                 anchor_height=800_000,
                 merkle_depth=12,
                 claim_deadline=deadline,
@@ -1731,7 +1731,7 @@ class TestPerOfferReceiveDerivation:
             btc_satoshis=100_000,
             btc_chain_anchor=b"\x11" * 32,
             expected_nbits=bytes.fromhex("ffff001d"),
-        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
+            reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
             anchor_height=800_000,
             merkle_depth=12,
             claim_deadline=_future_deadline(48),
