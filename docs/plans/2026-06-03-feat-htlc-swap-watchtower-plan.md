@@ -221,7 +221,7 @@ All four phases built on `feat/htlc-watchtower-v1`; **68 unit tests green** (`te
 **Done (verified by unit tests):** never pages CLAIM against a WAIT/SQUEEZED verdict; BTC depth via `MultiSourceBtcFundingReader` (conservative min, depth-inflation → no premature page); RXD pages flagged low-corroboration; dedup + structured payload {action, swap-id, deadline, why}; restart re-reads the store; no broadcast/keys/`p` anywhere.
 
 **NOT yet done (needs a live run — honestly unverified):**
-- End-to-end against a real chain (the runner targets ElectrumX; the operator's ssh-tr RXD backend needs a thin shim exposing `get_tip_height` + `get_transaction_verbose`). No live swap has been watched.
+- End-to-end against a real chain — **no live swap has been watched yet**. The ssh-tr RXD backend now exists (`scripts/watchtower_sshtr.py`, read-only / no broadcast surface; `--rxd-backend ssh-tr`), unit-tested with a patched `subprocess`, but **not exercised against the real `tr` node**.
 - The reconciler Intent-sequence test against the **regtest e2e** harness (needs the regtest nodes running).
 - `task ci` full suite (only the watch tests + targeted lint were run locally).
 - "Authenticated" alert channel + human-reaction-latency in the admission/`MarginPolicy` window — the `CallbackAlertChannel` is the auth seam; the latency budget is a v2 admission concern.

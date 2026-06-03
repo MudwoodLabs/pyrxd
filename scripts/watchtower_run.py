@@ -84,6 +84,20 @@ def build_reconciler(
     )
 
 
+async def _build_rxd_client(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
+    """The RXD chain source. ssh-tr is read-only (no broadcast surface); ElectrumX is
+    context-managed so the stack closes its websocket on exit."""
+    if args.rxd_backend == "ssh-tr":
+        from watchtower_sshtr import SshTrRxdReader  # scripts/ sibling, only needed for this backend
+
+        return SshTrRxdReader(ssh_host=args.ssh_host, container=args.ssh_container)
+    if not args.rxd_electrumx_url:
+        raise SystemExit("--rxd-electrumx-url is required for --rxd-backend electrumx")
+    return await stack.enter_async_context(
+        ElectrumXClient([args.rxd_electrumx_url], allow_insecure=args.allow_insecure)
+    )
+
+
 def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     if args.measured:
         return MarginPolicy.measured(
@@ -101,7 +115,10 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HTLC swap watchtower (v1 alert-only, BTC)")
     p.add_argument("--records-dir", required=True, help="dir of SwapRecord JSON files to watch")
-    p.add_argument("--rxd-electrumx-url", required=True, help="RXD ElectrumX ws/wss URL")
+    p.add_argument("--rxd-backend", choices=("electrumx", "ssh-tr"), default="electrumx", help="RXD chain source")
+    p.add_argument("--rxd-electrumx-url", help="RXD ElectrumX ws/wss URL (required for --rxd-backend electrumx)")
+    p.add_argument("--ssh-host", default="tr", help="ssh host for --rxd-backend ssh-tr")
+    p.add_argument("--ssh-container", default="radiant-mainnet", help="radiant docker container for ssh-tr")
     p.add_argument("--mempool-base-url", default="https://mempool.space", help="Esplora/mempool.space base URL")
     p.add_argument("--poll-interval-s", type=float, default=30.0)
     p.add_argument("--safety-window-blocks", type=int, default=6)
@@ -129,32 +146,38 @@ async def _amain(argv=None) -> int:
             loop.add_signal_handler(sig, stop.set)
 
     reader = MultiSourceBtcFundingReader.default_mainnet(quorum=args.quorum)
-    async with aiohttp.ClientSession() as http_session:
-        async with ElectrumXClient([args.rxd_electrumx_url], allow_insecure=args.allow_insecure) as rxd_client:
-            reconciler = build_reconciler(
-                records_dir=args.records_dir,
-                rxd_client=rxd_client,
-                btc_funding_reader=reader,
-                http_session=http_session,
-                mempool_base_url=args.mempool_base_url,
-                policy=policy,
-                safety_window_blocks=args.safety_window_blocks,
-                alert_channel=LoggingAlertChannel(),
-            )
-            logger.info(
-                "watchtower started: records=%s rxd=%s mempool=%s poll=%.0fs (ALERT-ONLY — broadcasts nothing)",
-                args.records_dir,
-                args.rxd_electrumx_url,
-                args.mempool_base_url,
-                args.poll_interval_s,
-            )
-            ticks = await run_loop(
-                reconciler,
-                interval_s=args.poll_interval_s,
-                stop=stop,
-                on_heartbeat=default_heartbeat(logger),
-                max_iterations=1 if args.once else None,
-            )
+    async with contextlib.AsyncExitStack() as stack:
+        http_session = await stack.enter_async_context(aiohttp.ClientSession())
+        rxd_client = await _build_rxd_client(args, stack)
+        reconciler = build_reconciler(
+            records_dir=args.records_dir,
+            rxd_client=rxd_client,
+            btc_funding_reader=reader,
+            http_session=http_session,
+            mempool_base_url=args.mempool_base_url,
+            policy=policy,
+            safety_window_blocks=args.safety_window_blocks,
+            alert_channel=LoggingAlertChannel(),
+        )
+        rxd_desc = (
+            args.rxd_electrumx_url
+            if args.rxd_backend == "electrumx"
+            else f"ssh-tr:{args.ssh_host}/{args.ssh_container}"
+        )
+        logger.info(
+            "watchtower started: records=%s rxd=%s mempool=%s poll=%.0fs (ALERT-ONLY — broadcasts nothing)",
+            args.records_dir,
+            rxd_desc,
+            args.mempool_base_url,
+            args.poll_interval_s,
+        )
+        ticks = await run_loop(
+            reconciler,
+            interval_s=args.poll_interval_s,
+            stop=stop,
+            on_heartbeat=default_heartbeat(logger),
+            max_iterations=1 if args.once else None,
+        )
     with contextlib.suppress(Exception):
         await reader.close()
     logger.info("watchtower stopped after %d tick(s)", ticks)
