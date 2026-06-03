@@ -133,6 +133,10 @@ class EthHtlcContractLeg:
     # -- pure helpers (no network) -----------------------------------------------------
 
     @property
+    def chain_id(self) -> int:
+        return self._chain_id
+
+    @property
     def expected_runtime_code(self) -> bytes:
         return bytes.fromhex(self._artifact["runtime_bytecode"][2:])
 
@@ -376,12 +380,29 @@ class EthHtlcContractLeg:
         responsibility (Phase-3 wiring), not this point-in-time producer, which would otherwise
         false-positive on any fast poll. ETH finality is not a depth, so the verdict carries no
         ``confirmations`` / ``required_depth``.
+
+        MALICIOUS-RPC HARDENING (red-team HIGH, single-source finality): ``finalized_block_number``
+        rejects a finalized > head over-report, and we bind the receipt's ``blockHash`` to the
+        CANONICAL block at ``blockNumber`` (a fabricated receipt height is caught when its hash !=
+        the canonical hash) — so a naive lying RPC cannot make a non-final claim read FINAL. This
+        does NOT defend a fully-consistent malicious provider (one that lies coherently about the
+        whole chain): a real-value path MUST use a multi-source finality quorum (≥2 independent
+        providers must agree the claim is final). That quorum is DEFERRED to the audit-gated
+        real-value track; the dust/pre-audit path accepts a single trusted provider.
         """
         receipt = await self._rpc.wait_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
         tx_block = int(receipt["blockNumber"])
-        finalized = await self._rpc.finalized_block_number()
+        # Bind the receipt to the canonical chain: a lying receipt blockNumber is caught when its
+        # blockHash != the canonical hash at that height (else `tx_block <= finalized` is trivial).
+        receipt_hash = receipt.get("blockHash")
+        if receipt_hash is not None:
+            canonical = await self._rpc.canonical_block_hash(tx_block)
+            if canonical and bytes(receipt_hash) != canonical:
+                # The claim is not in the canonical chain at the height it claims → not final/live.
+                return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+        finalized = await self._rpc.finalized_block_number()  # rejects finalized > head (fail-closed)
         if tx_block <= finalized:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
         return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)

@@ -834,6 +834,26 @@ class SwapCoordinator:
                 "MarginPolicy.eth_finalization_window_s to be set; the reorg gate's finalization reserve "
                 "depends on it — refusing to construct a coordinator that can only fail at claim time"
             )
+        # ETH proactive-refund window must DOMINATE the finality+burial reserve (red-team HIGH: a maker
+        # can time its reveal into a SQUEEZE window the taker cannot safely act in if the C1 window N is
+        # decoupled from the ETH finality reserve). N must give the taker enough RXD blocks to (a) wait
+        # out ETH finalization AND (b) bury its own RXD claim reorg-deep before t_rxd matures — else the
+        # proactive-refund decision and the reorg-gate squeeze disagree. Enforced fail-closed for a
+        # REAL-VALUE config (is_measured); an estimated/test config (is_measured=False) is an explicit
+        # placeholder whose margin magnitudes are operator-accepted-risk (same discipline as the margin
+        # itself), so the floor is advisory there — a real-value swap MUST be is_measured=True.
+        if record.terms.counter_chain != "btc" and config.margin_policy.is_measured:
+            mp = config.margin_policy
+            fin_reserve_blocks = math.ceil(mp.eth_finalization_window_s / mp.rxd_block_interval_s)
+            min_n = fin_reserve_blocks + ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS - 1
+            if config.maker_stall_safety_window_blocks < min_n:
+                raise ValidationError(
+                    f"maker_stall_safety_window_blocks={config.maker_stall_safety_window_blocks} is below the "
+                    f"ETH finality+burial reserve floor {min_n} (= ceil(eth_finalization_window_s "
+                    f"{mp.eth_finalization_window_s}/rxd_block_interval_s {mp.rxd_block_interval_s})={fin_reserve_blocks} "
+                    f"+ burial {ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS} - 1); a maker could time its reveal into a "
+                    "SQUEEZE window the taker cannot safely act in — raise N or shrink the window"
+                )
         # One coordinator instance = one swap. This lock serializes the FSM-advancing
         # steps (see @_serialized_step) so a future concurrent driver cannot interleave
         # a check-then-advance across an await on a single instance.
@@ -1139,8 +1159,44 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
-    # -- maker claims BTC, revealing p (role invariant step 4) --------------
+    # -- maker verifies the taker's counter-leg HTLC before locking the asset (red-team CRITICAL) --
     @_serialized_step
+    async def maker_verify_counter_funding(self, counter_contract_address: str) -> SwapRecord:
+        """MAKER-side fail-closed gate (red-team CRITICAL fix): the maker MUST verify the
+        TAKER-deployed counter-leg HTLC binds to the negotiated terms + the maker's own payout
+        config BEFORE the maker locks the asset (funds the RXD covenant). Returns on success
+        (recording the verified locator on the record so :meth:`maker_claims_btc` can claim it);
+        RAISES on any mismatch — the maker MUST NOT lock the asset if this raises.
+
+        WHY THIS EXISTS: the runbook is TAKER-funds-counter-FIRST, MAKER-locks-asset-SECOND. For a
+        BTC counter leg the funding target is a pure function of terms, so the coordinator's
+        ``derive==promised`` pre-fund gate + the funding reader already bind it. For an ETH counter
+        leg there is NO pre-fund commitment — the contract does not exist until the taker deploys it
+        — so ``EthHtlcContractLeg.verify_funded`` is the ONLY thing binding the taker's contract to
+        terms, and it previously ran ONLY inside the taker's own ``fund()``. Without this maker-side
+        call a hostile taker deploys ``claimant=self`` (or underfunds / sets a bad timeout) and the
+        honest maker locks the asset for nothing — a one-sided maker loss reachable in the intended
+        two-party flow. The maker passes ONLY the contract ADDRESS (the one untrusted input from the
+        taker); the leg builds the EXPECTED locator from the maker's own config and verifies the
+        chain matches it.
+
+        ``counter_contract_address`` is the address the taker advertises for its deployed HTLC."""
+        terms = self.record.terms
+        if terms.counter_chain != "eth":
+            raise ValidationError(
+                "maker_verify_counter_funding is for an ETH counter leg; a BTC counter leg's funding "
+                "target is pre-derivable and bound by the derive==promised gate"
+            )
+        verify = getattr(self.counter_leg, "verify_counterparty_funded", None)
+        if verify is None:
+            raise ValidationError("counter_leg does not implement verify_counterparty_funded; fail-closed")
+        # Raises on any mismatch (wrong claimant/refundee/H/timeout/amount/logic). The maker MUST NOT
+        # lock the asset if this raises.
+        locator = await verify(counter_contract_address, terms)
+        self.record = self.record.with_counter_lock(locator)
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
     async def maker_claims_btc(self, preimage: SecretBytes) -> SwapRecord:
         """Maker spends the BTC claim leaf with ``p`` (revealing it), then zeroizes p.
 

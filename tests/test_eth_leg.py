@@ -144,6 +144,56 @@ async def test_fund_derives_kwargs_and_runs_verify(monkeypatch):
     assert calls["verify"] == (loc, 10**15)  # post-deploy binding gate ran
 
 
+def test_expected_locator_built_from_own_config():
+    """The maker's expected_locator binds the contract to the MAKER's OWN payout config + terms —
+    NOT a counterparty-supplied locator (red-team CRITICAL maker-verify gate)."""
+    leg = _eth_leg()
+    h = hashlib.sha256(os.urandom(32)).digest()
+    exp = leg.expected_locator(_Terms(h, 10**15), contract_address="0x" + "99" * 20)
+    assert exp.claimant.lower() == _MAKER.lower()  # the maker MUST be paid on claim
+    assert exp.refundee.lower() == _TAKER.lower()
+    assert exp.hashlock_bytes == h
+    assert exp.amount_wei == 10**15
+    assert exp.timeout == _TIMEOUT
+    assert exp.chain_id == 11155111
+    assert exp.contract_address.lower() == ("0x" + "99" * 20).lower()
+
+
+async def test_verify_counterparty_funded_uses_expected_locator(monkeypatch):
+    """verify_counterparty_funded calls verify_funded with the MAKER's expected locator (built from
+    own config), so a contract whose on-chain claimant != the maker is caught by verify_funded."""
+    cl = _contract_leg()
+    seen = {}
+
+    async def fake_verify(locator, *, expected_amount_wei):
+        seen["locator"] = locator
+        seen["amount"] = expected_amount_wei
+
+    monkeypatch.setattr(cl, "verify_funded", fake_verify)
+    leg = _eth_leg(cl)
+    h = hashlib.sha256(os.urandom(32)).digest()
+    out = await leg.verify_counterparty_funded("0x" + "99" * 20, _Terms(h, 10**15))
+    # the locator handed to verify_funded carries the MAKER's expected claimant, at the taker address
+    assert seen["locator"].claimant.lower() == _MAKER.lower()
+    assert seen["locator"].contract_address.lower() == ("0x" + "99" * 20).lower()
+    assert seen["amount"] == 10**15
+    assert out is seen["locator"]
+
+
+async def test_verify_counterparty_funded_propagates_mismatch(monkeypatch):
+    """A hostile taker's contract (claimant != maker / underfunded) makes verify_funded raise; the
+    maker-side gate propagates it fail-closed so the maker never locks the asset."""
+    cl = _contract_leg()
+
+    async def fake_verify(locator, *, expected_amount_wei):
+        raise ValidationError("on-chain claimant != negotiated maker")
+
+    monkeypatch.setattr(cl, "verify_funded", fake_verify)
+    leg = _eth_leg(cl)
+    with pytest.raises(ValidationError, match="claimant"):
+        await leg.verify_counterparty_funded("0x" + "99" * 20, _Terms(hashlib.sha256(b"x").digest(), 10**15))
+
+
 async def test_claim_refund_fetch_verdict_delegate(monkeypatch):
     cl = _contract_leg()
     loc = _locator()

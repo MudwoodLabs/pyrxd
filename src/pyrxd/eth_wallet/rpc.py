@@ -139,12 +139,35 @@ class EthRpc:
             raise NetworkError(f"eth_getTransactionByHash failed: {exc}") from exc
 
     async def finalized_block_number(self) -> int:
-        """Block number of the `finalized` consensus checkpoint (the reorg-safe tip)."""
+        """Block number of the `finalized` consensus checkpoint (the reorg-safe tip).
+
+        SANITY-BOUNDED (red-team HIGH: single-source finality): a finalized value that exceeds the
+        `latest` head from the SAME provider is incoherent (finalized is always <= head) and is
+        rejected fail-closed — this catches a naive lying RPC that over-reports finalized to make a
+        non-final claim look FINAL. It does NOT defend a fully-consistent malicious provider that
+        lies about BOTH finalized and the canonical chain: for a real-value path a multi-source
+        finality quorum is required (deferred; documented in claim_finality_verdict)."""
         try:
-            blk = await self._w3.eth.get_block("finalized")
+            fin = int((await self._w3.eth.get_block("finalized"))["number"])
+            head = int((await self._w3.eth.get_block("latest"))["number"])
         except Exception as exc:
-            raise NetworkError(f"eth_getBlock(finalized) failed: {exc}") from exc
-        return int(blk["number"])
+            raise NetworkError(f"eth_getBlock(finalized/latest) failed: {exc}") from exc
+        if fin < 0 or fin > head:
+            raise NetworkError(f"incoherent finalized={fin} > latest head={head}; refusing (fail-closed)")
+        return fin
+
+    async def canonical_block_hash(self, block_number: int) -> bytes:
+        """The canonical block hash at ``block_number`` (eth_getBlockByNumber). Used to bind a
+        receipt's claimed blockNumber to the canonical chain (red-team HIGH: receipt blockNumber on
+        faith) — a fabricated receipt height is caught when its blockHash != the canonical hash."""
+        if not isinstance(block_number, int) or isinstance(block_number, bool) or block_number < 0:
+            raise NetworkError("block_number must be a non-negative int")
+        try:
+            blk = await self._w3.eth.get_block(block_number)
+        except Exception as exc:
+            raise NetworkError(f"eth_getBlockByNumber({block_number}) failed: {exc}") from exc
+        h = blk.get("hash")
+        return bytes(h) if h is not None else b""
 
     async def close(self) -> None:
         """Close the underlying provider session if it exposes one."""

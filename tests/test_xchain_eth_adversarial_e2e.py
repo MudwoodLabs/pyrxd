@@ -48,6 +48,11 @@ from pyrxd.security.errors import NetworkError, ValidationError
 
 # Reuse the real chain harness from the happy-path e2e (one source of truth for the node/anvil/legs).
 from tests.test_xchain_eth_swap_regtest_e2e import (
+    _ADDR_MAKER,
+    _ADDR_TAKER,
+    _ARTIFACT,
+    _CHAIN_ID,
+    _KEY,
     _anvil_mine,
     _anvil_now,
     _anvil_rpc,
@@ -343,6 +348,70 @@ class TestEthAdversarial:
             # refundable.
             assert coord.record.state is not SwapState.BOTH_LOCKED
         finally:
+            await rpc.close()
+
+    async def test_S7_maker_refuses_hostile_taker_eth_contract(self, env):
+        """S7 (red-team CRITICAL fix): a hostile TAKER deploys an ETH HTLC that does NOT pay the
+        maker on claim (claimant=attacker), or underfunds it. The honest maker's
+        coordinator.maker_verify_counter_funding MUST fail closed against the maker's OWN expected
+        terms (built from the maker's payout config, not a taker-supplied locator) — so the maker
+        never locks RXD against a contract that wouldn't pay it. Drives the maker through the
+        COORDINATOR (not eth_leg._inner._leg), the gap the prior single-operator flows masked."""
+        node, url = env
+        # An honest maker coordinator: its counter_leg pays the MAKER (claim_to=_ADDR_MAKER) on claim.
+        coord, _cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        terms = coord.record.terms
+
+        from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+        from pyrxd.eth_wallet.rpc import EthRpc
+        from pyrxd.gravity.eth_leg import EthLeg
+        from pyrxd.security.secrets import PrivateKeyMaterial
+
+        attacker_rpc = EthRpc(url, expected_chain_id=_CHAIN_ID)
+        try:
+            # The TAKER deploys the REAL EthHtlc bytecode (so the code-match passes) but with
+            # claimant=ATTACKER (_ADDR_TAKER) — the ETH would go to the taker, not the maker.
+            attacker_leg = EthLeg(
+                contract_leg=EthHtlcContractLeg(
+                    rpc=attacker_rpc,
+                    signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY)),
+                    chain_id=_CHAIN_ID,
+                    artifact=_ARTIFACT,
+                ),
+                network="anvil",
+                claim_to=_ADDR_TAKER,
+                refund_to=_ADDR_TAKER,  # claimant=attacker
+                eth_timeout_unix_s=terms.eth_timeout_unix_s,
+                audit_cleared=True,
+            )
+            malicious = await attacker_leg.fund(terms)  # real on-chain deploy, claimant=taker
+
+            # The honest maker verifies the taker's contract through the COORDINATOR → must RAISE
+            # (the maker's expected claimant is _ADDR_MAKER; the on-chain claimant is the attacker).
+            with pytest.raises(ValidationError, match="claimant"):
+                await coord.maker_verify_counter_funding(malicious.contract_address)
+
+            # And the maker NEVER advanced to a locked state — its asset is untouched.
+            assert coord.record.state is SwapState.BTC_LOCKED
+
+            # Sanity: an HONEST contract (claimant=maker) passes the same gate.
+            honest_leg = EthLeg(
+                contract_leg=EthHtlcContractLeg(
+                    rpc=attacker_rpc,
+                    signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY)),
+                    chain_id=_CHAIN_ID,
+                    artifact=_ARTIFACT,
+                ),
+                network="anvil",
+                claim_to=_ADDR_MAKER,
+                refund_to=_ADDR_TAKER,
+                eth_timeout_unix_s=terms.eth_timeout_unix_s,
+                audit_cleared=True,
+            )
+            honest = await honest_leg.fund(terms)
+            await coord.maker_verify_counter_funding(honest.contract_address)  # no raise
+        finally:
+            await attacker_rpc.close()
             await rpc.close()
 
 

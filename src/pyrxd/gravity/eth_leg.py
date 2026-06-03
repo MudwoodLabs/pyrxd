@@ -147,6 +147,41 @@ class EthLeg:
         await self._leg.verify_funded(locator, expected_amount_wei=int(terms.value_amount))
         return locator
 
+    def expected_locator(self, terms, *, contract_address: str, deploy_tx_hash: str | None = None) -> EthHtlcLocator:
+        """The locator the MAKER expects for a correctly-funded counter HTLC at ``contract_address``.
+
+        Built entirely from the maker's OWN payout config (``claim_to``/``refund_to``/
+        ``eth_timeout_unix_s``) + the negotiated ``terms`` (hashlock, value_amount, chain id) — it
+        does NOT trust any counterparty-supplied locator. :meth:`verify_counterparty_funded` checks
+        the on-chain contract at ``contract_address`` matches THIS expected locator, which is what
+        binds the taker-deployed contract to 'pays the maker on claim, refunds the taker, on the
+        agreed H/amount/deadline'. ``deploy_tx_hash`` is informational (not bound on-chain)."""
+        return EthHtlcLocator(
+            chain_id=self._leg.chain_id,
+            contract_address=contract_address,
+            deploy_tx_hash=deploy_tx_hash if (deploy_tx_hash and deploy_tx_hash.startswith("0x")) else "0x" + "00" * 32,
+            hashlock="0x" + bytes(terms.hashlock).hex(),
+            claimant=self._claim_to,
+            refundee=self._refund_to,
+            timeout=self._eth_timeout_unix_s,
+            amount_wei=int(terms.value_amount),
+        )
+
+    async def verify_counterparty_funded(self, contract_address: str, terms) -> EthHtlcLocator:
+        """MAKER-side fail-closed gate (red-team CRITICAL fix): verify the TAKER-deployed ETH HTLC
+        at ``contract_address`` binds to the maker's EXPECTED terms BEFORE the maker locks the asset.
+
+        The taker deploys the ETH HTLC FIRST and the maker locks RXD SECOND, so the maker MUST
+        independently verify the on-chain contract (claimant==maker, refundee==taker, hashlock==H,
+        timeout, funded balance==amount) — otherwise a hostile taker deploys ``claimant=self`` or
+        underfunds and the honest maker locks the asset for nothing (one-sided maker loss). We build
+        the EXPECTED locator from the maker's own config (NOT a taker-supplied one) and run
+        :meth:`EthHtlcContractLeg.verify_funded` against the contract at ``contract_address`` — any
+        mismatch raises. Returns the verified locator (for the maker's subsequent claim)."""
+        expected = self.expected_locator(terms, contract_address=contract_address)
+        await self._leg.verify_funded(expected, expected_amount_wei=int(terms.value_amount))
+        return expected
+
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
         return await self._leg.claim(locator, preimage)
 

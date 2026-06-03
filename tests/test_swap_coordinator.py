@@ -1434,12 +1434,12 @@ def test_measure_margin_inherits_reorg_depth_floor():
 # --------------------------------------------------------------------------- C2a: §9 ETH reserve
 
 
-def _eth_finality_policy(*, window_s=768):
+def _eth_finality_policy(*, window_s=768, is_measured=False, rxd_block_interval_s=300.0):
     return MarginPolicy(
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
         block_interval_s=600.0,
-        is_measured=False,
-        rxd_block_interval_s=300.0,
+        is_measured=is_measured,
+        rxd_block_interval_s=rxd_block_interval_s,
         btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
         rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
         eth_finalization_window_s=window_s,
@@ -1546,6 +1546,7 @@ class FakeEthLeg:
         self.last_locator: EthHtlcLocator | None = None
         self.claimed_with: bytes | None = None
         self.refunded = False
+        self.counterparty_verify_raises = False  # simulate a hostile-taker contract (claimant!=maker)
 
     # -- fund-path (full lifecycle) ----------------------------------------------------
     def _commitment(self, terms) -> bytes:
@@ -1609,6 +1610,24 @@ class FakeEthLeg:
         self.calls.append("verdict")
         return self._verdict
 
+    async def verify_counterparty_funded(self, contract_address, terms):
+        """MAKER-side gate stand-in: records the call, raises if configured hostile, else returns a
+        locator bound to the contract address (the real EthLeg builds it from the maker's config)."""
+        self.calls.append("verify_counterparty")
+        self.last_locator = EthHtlcLocator(
+            chain_id=11155111,
+            contract_address=contract_address,
+            deploy_tx_hash="0x" + "00" * 32,
+            hashlock="0x" + bytes(terms.hashlock).hex(),
+            claimant="0x" + "11" * 20,
+            refundee="0x" + "22" * 20,
+            timeout=terms.eth_timeout_unix_s,
+            amount_wei=int(terms.value_amount),
+        )
+        if self.counterparty_verify_raises:
+            raise ValidationError("on-chain claimant != negotiated maker (hostile taker contract)")
+        return self.last_locator
+
 
 def _eth_terms(*, hashlock: bytes, t_rxd_blocks: int = 72, eth_timeout_unix_s: int = 1779710245):
     return NegotiatedTerms(
@@ -1663,6 +1682,94 @@ def _final():
 
 def _eth_not_final_verdict():
     return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+
+def _eth_coord_at_btc_locked(*, eth_leg, terms, policy=None, n=6):
+    rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=terms)
+    return SwapCoordinator(
+        record=rec,
+        counter_leg=eth_leg,
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(
+            margin_policy=policy or _eth_finality_policy(window_s=768),
+            maker_stall_safety_window_blocks=n,
+        ),
+    )
+
+
+# -- red-team CRITICAL: maker-side counter-funding verification gate -------------------
+
+
+async def test_maker_verify_counter_funding_refuses_hostile_taker_contract():
+    """The honest maker's coordinator gate fails closed when the taker-deployed ETH HTLC does not
+    bind to terms (claimant!=maker) — so the maker never locks the asset (red-team CRITICAL)."""
+    p, h = generate_secret()
+    leg = FakeEthLeg(preimage=p, verdict=_final())
+    leg.counterparty_verify_raises = True  # hostile taker contract
+    coord = _eth_coord_at_btc_locked(eth_leg=leg, terms=_eth_terms(hashlock=h))
+    with pytest.raises(ValidationError, match="claimant"):
+        await coord.maker_verify_counter_funding("0x" + "99" * 20)
+    assert "verify_counterparty" in leg.calls
+    # The maker never advanced past BTC_LOCKED (asset untouched).
+    assert coord.record.state is SwapState.BTC_LOCKED
+
+
+async def test_maker_verify_counter_funding_records_locator_on_success():
+    """On a well-funded taker contract the gate returns, recording the verified locator so the
+    maker's subsequent claim has the contract address."""
+    p, h = generate_secret()
+    leg = FakeEthLeg(preimage=p, verdict=_final())
+    coord = _eth_coord_at_btc_locked(eth_leg=leg, terms=_eth_terms(hashlock=h))
+    rec = await coord.maker_verify_counter_funding("0x" + "99" * 20)
+    assert rec.counterchain_locator is not None
+    assert rec.counterchain_locator.contract_address.lower() == ("0x" + "99" * 20).lower()
+
+
+async def test_maker_verify_counter_funding_rejects_btc_leg():
+    """The gate is ETH-specific (BTC funding target is pre-derivable + bound by derive==promised)."""
+    _p, h = generate_secret()
+    btc_terms = _terms(hashlock=h)  # counter_chain defaults to btc
+    coord = SwapCoordinator(
+        record=SwapRecord(state=SwapState.BTC_LOCKED, terms=btc_terms),
+        counter_leg=FakeBtcLeg(),
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=_policy()),
+    )
+    with pytest.raises(ValidationError, match="ETH counter leg"):
+        await coord.maker_verify_counter_funding("0x" + "99" * 20)
+
+
+# -- red-team HIGH: proactive-refund N coupled to the ETH finality reserve -------------
+
+
+def test_eth_config_rejects_small_N_below_finality_reserve_when_measured():
+    """A REAL-VALUE (is_measured) ETH config with N below the finality+burial reserve floor is
+    refused at construction — a maker could otherwise time its reveal into a SQUEEZE window."""
+    p, h = generate_secret()
+    measured = _eth_finality_policy(window_s=768, is_measured=True, rxd_block_interval_s=300.0)
+    # floor = ceil(768/300)=3 + burial 6 - 1 = 8; N=6 < 8 -> reject
+    with pytest.raises(ValidationError, match="finality\\+burial reserve floor"):
+        SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=_eth_terms(hashlock=h)),
+            counter_leg=FakeEthLeg(preimage=p, verdict=_final()),
+            radiant_leg=FakeRadiantLeg(),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),
+            config=CoordinatorConfig(margin_policy=measured, maker_stall_safety_window_blocks=6),
+        )
+    # N=8 satisfies the floor -> constructs fine
+    SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_eth_terms(hashlock=h)),
+        counter_leg=FakeEthLeg(preimage=p, verdict=_final()),
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=measured, maker_stall_safety_window_blocks=8),
+    )
 
 
 async def test_eth_claim_safe_settles_and_runs_provenance():
