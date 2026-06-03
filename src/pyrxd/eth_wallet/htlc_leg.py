@@ -105,15 +105,30 @@ class EthHtlcContractLeg:
         its own.
     """
 
-    def __init__(self, *, rpc: Any, signing_key: PrivateKeyMaterial, chain_id: int, artifact: dict) -> None:
+    def __init__(
+        self,
+        *,
+        rpc: Any,
+        signing_key: PrivateKeyMaterial,
+        chain_id: int,
+        artifact: dict,
+        private_submitter: Any = None,
+    ) -> None:
         if not isinstance(signing_key, PrivateKeyMaterial):
             raise ValidationError("signing_key must be PrivateKeyMaterial (never a plaintext LocalAccount)")
         if not isinstance(chain_id, int) or chain_id <= 0:
             raise ValidationError("chain_id must be a positive int")
+        if private_submitter is not None and not hasattr(private_submitter, "submit_raw"):
+            raise ValidationError("private_submitter must provide submit_raw(raw_tx)->tx_hash")
         self._rpc = rpc
         self._key = signing_key
         self._chain_id = chain_id
         self._artifact = _validate_artifact(artifact)
+        # OPTIONAL private-inclusion transport (e.g. Flashbots). When set, the CLAIM — the one tx
+        # that reveals the secret p — is submitted privately so the public mempool can't expose p
+        # before it mines (a maker on mainnet SHOULD set this; see claim()). All other txs (deploy,
+        # fund, refund) use the public path: they carry no secret and need normal mempool inclusion.
+        self._private_submitter = private_submitter
 
     # -- pure helpers (no network) -----------------------------------------------------
 
@@ -209,13 +224,18 @@ class EthHtlcContractLeg:
 
         return derive_address(self._key)
 
-    async def _sign_and_send(self, tx: dict, *, preflight: bool = True) -> str:
+    async def _sign_and_send(self, tx: dict, *, preflight: bool = True, private: bool = False) -> str:
         """Sign ``tx`` with the held key's RAW bytes (call-site only) and broadcast.
 
         Preflights via ``eth_call`` first (unless ``preflight=False``, e.g. a contract
         deploy where there is no ``to``): a tx that would revert (premature refund, bad
         preimage, already-settled) fails fast off-chain with a :class:`ValidationError`
         instead of burning gas on an on-chain revert.
+
+        ``private=True`` routes the signed tx through the injected ``private_submitter`` (e.g.
+        Flashbots) instead of the public mempool — used ONLY for the claim, which reveals ``p``.
+        If no submitter is injected, ``private`` falls back to the public path (the privacy
+        property is then NOT provided — the caller opted out by not supplying a submitter).
         """
         if preflight:
             await self._rpc.preflight(tx)
@@ -225,6 +245,8 @@ class EthHtlcContractLeg:
             signed = web3.Account.sign_transaction(tx, raw)
         finally:
             del raw
+        if private and self._private_submitter is not None:
+            return str(await self._private_submitter.submit_raw(signed.raw_transaction))
         return await self._rpc.send_raw(signed.raw_transaction)
 
     async def _base_tx(self, *, gas: int) -> dict:
@@ -285,13 +307,17 @@ class EthHtlcContractLeg:
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
         """Maker: call claim(preimage); returns the tx hash. On MAINNET the maker SHOULD
         use private inclusion (Flashbots) — the public mempool exposes p before mining,
-        letting the taker claim RXD while this ETH claim is still reorg-able."""
+        letting the taker claim RXD while this ETH claim is still reorg-able.
+
+        Routed through the injected ``private_submitter`` when one is supplied (``private=True``);
+        otherwise it goes to the public mempool (the privacy property is then NOT provided — the
+        operator opted out by not injecting a submitter)."""
         if not isinstance(preimage, (bytes, bytearray)) or len(preimage) != 32:
             raise ValidationError("preimage must be 32 bytes")
         await self._rpc.assert_chain()
         c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
         built = await c.functions.claim(bytes(preimage)).build_transaction(await self._base_tx(gas=120_000))
-        return await self._sign_and_send(built)
+        return await self._sign_and_send(built, private=True)
 
     async def refund(self, locator: EthHtlcLocator) -> str:
         """Taker: call refund() after timeout; returns the tx hash. Taker-unilateral
