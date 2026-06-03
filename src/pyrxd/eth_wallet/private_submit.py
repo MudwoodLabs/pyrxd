@@ -87,22 +87,43 @@ class FlashbotsSubmitter:
         self._timeout_s = float(timeout_s)
 
     def _sign_header(self, body: str) -> str:
-        """``X-Flashbots-Signature: <addr>:<EIP-191 personal_sign(keccak(body))>``."""
+        """``X-Flashbots-Signature: <addr>:<EIP-191 personal_sign(keccak256(body) hex)>``.
+
+        Flashbots authenticates on the 0x-PREFIXED hex string of keccak256(body) (red-team MEDIUM:
+        ``Web3.keccak(...).hex()`` is UNPREFIXED on this web3, so the prior header signed the wrong
+        message and a real relay rejected every private claim — silently disabling the anti-front-run
+        defense). We also derive the signer address via the project's own ``derive_address`` rather
+        than materializing a plaintext ``eth_account`` LocalAccount (keys.py forbids that escape)."""
+        from pyrxd.eth_wallet.keys import derive_address
+
         Account, encode_defunct = _require_eth_account()
         from web3 import Web3  # type: ignore
 
-        digest = Web3.keccak(text=body).hex()
+        kh = Web3.keccak(text=body).hex()
+        digest = kh if kh.startswith("0x") else "0x" + kh  # Flashbots signs the 0x-prefixed hex
+        addr = derive_address(self._auth_key)  # no plaintext LocalAccount
         raw = self._auth_key.unsafe_raw_bytes()
         try:
-            acct = Account.from_key(raw)
             signed = Account.sign_message(encode_defunct(text=digest), raw)
         finally:
-            del raw
+            del raw  # best-effort: drops OUR reference only. `raw` is an immutable `bytes`, so this
+            # does NOT zeroize the key buffer (CPython cannot mutate it in place, and eth_account
+            # may have copied it internally) — it just lets the GC reclaim it sooner. True
+            # zeroization would need a mutable bytearray + an explicit wipe end-to-end; this is the
+            # auth/identity key (not the tx key) and never holds funds, so reference-drop is the
+            # accepted hygiene here (red-team INFO).
         sig = signed.signature.hex()
         sig = sig if sig.startswith("0x") else "0x" + sig
-        return f"{acct.address}:{sig}"
+        return f"{addr}:{sig}"
 
     async def submit_raw(self, raw_tx: bytes) -> str:
+        """Submit ``raw_tx`` privately; return its tx hash.
+
+        NOTE (red-team MEDIUM): a successful submit is NOT inclusion — a relay can ACK and drop the
+        tx. The caller MUST drive maker-side confirmation (wait_receipt / finality) before treating
+        the reveal as durable; do not infer 'p is on-chain' from this returning. We DO verify the
+        relay-returned hash equals keccak256(raw_tx) locally (catches a buggy/wrong-hash relay,
+        matching the public ``send_raw`` guarantee that the node computes the hash from the bytes)."""
         if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
             raise ValidationError("raw_tx must be non-empty bytes")
         aiohttp = _require_aiohttp()
@@ -131,4 +152,10 @@ class FlashbotsSubmitter:
         tx_hash = data.get("result")
         if not isinstance(tx_hash, str) or not tx_hash.startswith("0x"):
             raise NetworkError(f"flashbots relay returned no tx hash: {data!r}")
+        # Bind the returned hash to the bytes we signed (catches a wrong-hash relay).
+        from web3 import Web3  # type: ignore
+
+        expected = "0x" + bytes(Web3.keccak(bytes(raw_tx))).hex().removeprefix("0x")
+        if tx_hash.lower() != expected.lower():
+            raise NetworkError(f"flashbots relay returned hash {tx_hash} != keccak256(raw_tx) {expected}")
         return tx_hash

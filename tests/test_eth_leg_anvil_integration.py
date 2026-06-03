@@ -178,7 +178,9 @@ async def test_provenance_rejects_foreign_contract_claim(anvil_url):
         assert loc_a.contract_address != loc_b.contract_address  # fresh CREATE per swap
         claim_a = await maker.claim(loc_a, p)
         await taker.assert_claim_provenance(claim_a, contract_address=loc_a.contract_address, preimage=p)  # ok
-        with pytest.raises(ValidationError, match="not this swap's HTLC contract"):
+        # Provenance now binds on the LOG EMITTER (red-team MEDIUM: tx.to dropped). claim_a's logs are
+        # emitted by loc_a, so no log from loc_b carries p -> fail-closed with the cross-swap message.
+        with pytest.raises(ValidationError, match="cross-swap claim tx"):
             await taker.assert_claim_provenance(claim_a, contract_address=loc_b.contract_address, preimage=p)
     finally:
         await rpc.close()

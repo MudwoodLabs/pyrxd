@@ -295,10 +295,22 @@ async def test_provenance_rejects_H_only_log_not_p():
         await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=p)
 
 
-async def test_provenance_rejects_wrong_to():
+async def test_provenance_accepts_smart_contract_wallet_claim_diff_to():
+    """A claim routed through a smart-contract wallet / multicall has tx.to != our HTLC, but the
+    INNER call still emits Claimed(p) FROM our contract — must be ACCEPTED (red-team MEDIUM: the
+    old tx.to== check wrongly rejected this). The log-emitter binding is what pins the swap."""
     p = _p()
-    leg = _leg_with_rpc(_FakeRpc(to="0x" + "cd" * 20, logs=[_claimed_log_with_p(p)]))
-    with pytest.raises(ValidationError, match="not this swap's HTLC contract"):
+    leg = _leg_with_rpc(_FakeRpc(to="0x" + "cd" * 20, logs=[_claimed_log_with_p(p)]))  # to = the wallet, not our HTLC
+    await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=p)  # no raise
+
+
+async def test_provenance_rejects_cross_swap_log_from_other_contract():
+    """A Claimed(p) log emitted by a DIFFERENT contract (a cross-swap claim, even one reusing H)
+    is REJECTED — only a log FROM our per-swap contract counts."""
+    p = _p()
+    other = "0x" + "cd" * 20
+    leg = _leg_with_rpc(_FakeRpc(to=other, logs=[_claimed_log_with_p(p, address=other)]))
+    with pytest.raises(ValidationError, match="no Claimed"):
         await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=p)
 
 

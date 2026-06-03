@@ -98,23 +98,29 @@ class EthRpc:
         node will mine-and-revert (e.g. a premature refund, a bad preimage, an
         already-settled HTLC). A transport failure is a :class:`NetworkError`. Strips
         gas/fee fields the node would reject in an eth_call.
+
+        CONSERVATIVE CLASSIFICATION (red-team): a definite revert is recognised ONLY from
+        web3's TYPED contract-exception classes — an honest node raises ContractLogicError /
+        ContractCustomError / ContractPanicError for a real revert (custom errors arrive as a
+        4-byte selector, e.g. NotYetExpired() -> 0x59912c06). We deliberately do NOT substring-
+        match the error text: that string is RPC-controlled, so a lying node could stuff
+        "revert" into a transport error to make us classify the HONEST taker refund (the only
+        exit path) as a permanent ValidationError and abort it. An untyped failure is therefore
+        treated as a retryable NetworkError — preflight is a gas-saving optimisation, not a
+        safety gate, so under uncertainty we retry rather than permanently block the exit. A
+        genuinely premature refund still reverts typed (NotYetExpired) on any honest node.
         """
         call_tx = {k: v for k, v in tx.items() if k in ("from", "to", "value", "data", "input")}
         web3 = _require_web3()
         try:
             await self._w3.eth.call(call_tx)
         except Exception as exc:
-            # A revert (require/custom error) means the tx WOULD fail on-chain — a
-            # ValidationError, not a transport problem. web3 surfaces these as
-            # ContractLogicError / ContractCustomError (custom errors arrive as a 4-byte
-            # selector, e.g. NotYetExpired() -> 0x59912c06). Everything else is transport.
             contract_errors = tuple(
                 getattr(web3.exceptions, n)
                 for n in ("ContractLogicError", "ContractCustomError", "ContractPanicError")
                 if hasattr(web3.exceptions, n)
             )
-            s = str(exc).lower()
-            if (contract_errors and isinstance(exc, contract_errors)) or "revert" in s or "execution reverted" in s:
+            if contract_errors and isinstance(exc, contract_errors):
                 raise ValidationError(f"tx would revert (preflight eth_call): {exc}") from exc
             raise NetworkError(f"preflight eth_call failed: {exc}") from exc
 

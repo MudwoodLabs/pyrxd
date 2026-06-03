@@ -39,6 +39,11 @@ from pyrxd.security.secrets import PrivateKeyMaterial
 __all__ = ["EthHtlcContractLeg", "load_artifact"]
 
 _REQUIRED_ARTIFACT_KEYS = ("runtime_bytecode", "abi", "bytecode")
+# Claim-artifact size caps (red-team LOW DoS): a legit claim(bytes32) calldata + Claimed(bytes32)
+# log are ~tens of bytes; cap each blob + the aggregate well above that, fail closed past it so a
+# malicious RPC cannot feed recover_secret's O(n) scan an unbounded blob.
+_MAX_ARTIFACT_BYTES = 64 * 1024
+_MAX_ARTIFACT_TOTAL_BYTES = 256 * 1024
 
 
 def _b(v: Any) -> bytes:
@@ -219,8 +224,13 @@ class EthHtlcContractLeg:
         if await self._rpc.get_code(locator.refundee):
             raise ValidationError("refundee has contract code (not an EOA); a reverting recipient could lock funds")
         bal = await self._rpc.get_balance(locator.contract_address)
-        if bal != expected_amount_wei:
-            raise ValidationError(f"funded balance {bal} wei != negotiated {expected_amount_wei} wei")
+        # Lower bound, not exact-equal (red-team LOW): an attacker can force-send 1 wei (selfdestruct
+        # / coinbase) to a contract, so an `== expected` check is griefable into a permanent verify
+        # failure. Reject UNDER-funding; tolerate dust over-funding (any extra ETH is paid to whoever
+        # wins the swap — a deliberate, documented policy). The HTLC claim/refund still moves the
+        # full balance, so over-funding only ever benefits the eventual recipient.
+        if bal < expected_amount_wei:
+            raise ValidationError(f"funded balance {bal} wei < negotiated {expected_amount_wei} wei (under-funded)")
 
     def _account_address(self) -> str:
         """Derive this leg's sender address from the held key (no plaintext persisted)."""
@@ -315,13 +325,22 @@ class EthHtlcContractLeg:
 
         Routed through the injected ``private_submitter`` when one is supplied (``private=True``);
         otherwise it goes to the public mempool (the privacy property is then NOT provided — the
-        operator opted out by not injecting a submitter)."""
+        operator opted out by not injecting a submitter).
+
+        PREIMAGE-LEAK FIX (red-team MEDIUM): the off-chain ``eth_call`` preflight sends the claim
+        calldata — which CONTAINS p — to the (public) RPC, defeating private inclusion before the
+        private submit even runs. So when a private submitter IS injected we SKIP the preflight
+        (the whole point is that p must not touch the public RPC); the on-chain revert protection
+        the preflight gave is traded for p-privacy, which is the correct trade for the reveal tx.
+        On the public-fallback path (no submitter) p goes public anyway, so the preflight stays."""
         if not isinstance(preimage, (bytes, bytearray)) or len(preimage) != 32:
             raise ValidationError("preimage must be 32 bytes")
         await self._rpc.assert_chain()
         c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
         built = await c.functions.claim(bytes(preimage)).build_transaction(await self._base_tx(gas=120_000))
-        return await self._sign_and_send(built, private=True)
+        # Skip the p-leaking preflight when going private (submitter present).
+        preflight = self._private_submitter is None
+        return await self._sign_and_send(built, preflight=preflight, private=True)
 
     async def refund(self, locator: EthHtlcLocator) -> str:
         """Taker: call refund() after timeout; returns the tx hash. Taker-unilateral
@@ -334,23 +353,34 @@ class EthHtlcContractLeg:
     async def fetch_claim_artifacts(self, tx_hash: str) -> list[bytes]:
         """Fetch the candidate byte blobs for recover_secret: the tx INPUT calldata + the
         DATA of every log in the receipt. Works on a reverted-but-mined tx too (calldata
-        is still present). Pure recover_secret(...) then matches by sha256==H."""
+        is still present). Pure recover_secret(...) then matches by sha256==H.
+
+        SIZE-BOUNDED (red-team LOW): recover_secret does an O(n) sliding-window sha256 scan, so a
+        malicious RPC returning attacker-sized calldata/log data is a CPU/memory DoS. A legitimate
+        ``claim(bytes32)`` calldata + ``Claimed(bytes32)`` log are ~tens of bytes; we cap each blob
+        and the aggregate well above that and fail closed past the cap rather than scan unbounded."""
         tx = await self._rpc.get_transaction(tx_hash)
         artifacts: list[bytes] = []
+        total = 0
+
+        def _add(raw) -> None:
+            nonlocal total
+            b = bytes(raw) if not isinstance(raw, str) else bytes.fromhex(raw[2:] if raw.startswith("0x") else raw)
+            if len(b) > _MAX_ARTIFACT_BYTES:
+                raise NetworkError(f"claim artifact blob {len(b)} B exceeds cap {_MAX_ARTIFACT_BYTES}")
+            total += len(b)
+            if total > _MAX_ARTIFACT_TOTAL_BYTES:
+                raise NetworkError(f"claim artifacts total {total} B exceeds cap {_MAX_ARTIFACT_TOTAL_BYTES}")
+            artifacts.append(b)
+
         inp = tx.get("input")
         if inp is not None:
-            artifacts.append(
-                bytes(inp) if not isinstance(inp, str) else bytes.fromhex(inp[2:] if inp.startswith("0x") else inp)
-            )
+            _add(inp)
         receipt = await self._rpc.wait_receipt(tx_hash)
         for log in receipt.get("logs", []):
             data = log.get("data")
             if data:
-                artifacts.append(
-                    bytes(data)
-                    if not isinstance(data, str)
-                    else bytes.fromhex(data[2:] if data.startswith("0x") else data)
-                )
+                _add(data)
         return artifacts
 
     async def is_final(self, tx_hash: str) -> bool:
@@ -425,10 +455,10 @@ class EthHtlcContractLeg:
         (``keccak('Claimed(bytes32)')``) rather than the current ABI-free p-in-log match.
         ``recover_secret`` matches
         ``sha256(p)==H`` over the supplied tx but TRUSTS that the tx belongs to this swap; we
-        verify that here, fail-closed:
+        verify that here, fail-closed (NOT via ``tx.to`` — that rejected legitimate claims routed
+        through a smart-contract wallet / multicall, red-team MEDIUM — but via the strictly-stronger
+        log-emitter binding):
 
-          * ``tx.to == contract_address`` — the claim called OUR contract instance (not a
-            different swap's, even one that reused ``H``);
           * ``receipt.status == 1`` — the claim actually succeeded (the ETH moved; a reverted
             tx never paid the maker even if ``p`` sits in its calldata);
           * a log emitted BY ``contract_address`` whose data carries the SECRET ``p`` — the
@@ -446,18 +476,19 @@ class EthHtlcContractLeg:
         """
         want = _addr(contract_address)
         p = self._p32(preimage)
-        tx = await self._rpc.get_transaction(tx_hash)
-        if _addr(tx.get("to")) != want:
-            raise ValidationError(
-                "claim tx 'to' is not this swap's HTLC contract address; "
-                "refusing to scrape p (wrong or cross-swap claim tx)"
-            )
+        # The BINDING is: a successful tx that EMITS a Claimed(p)-style log FROM our per-swap-unique
+        # contract carrying the secret p. We do NOT require tx.to == our contract (red-team MEDIUM):
+        # that rejected a legitimate claim routed through a smart-contract wallet / ERC-4337 / a
+        # multicall (tx.to is the wallet/entrypoint, but the INNER call to our HTLC still emits
+        # Claimed(p) FROM our contract). The log-emitter==our-contract + p-in-log check is strictly
+        # stronger and already pins the swap: a cross-swap claim (even one reusing H) emits from a
+        # DIFFERENT contract address, so no log from `want` carries p and the gate fails closed.
         receipt = await self._rpc.wait_receipt(tx_hash)
         if int(receipt.get("status", 0)) != 1:
             raise ValidationError("claim tx did not succeed (status != 1); refusing to treat it as a valid claim")
         for log in receipt.get("logs", []):
             if _addr(log.get("address")) != want:
-                continue
+                continue  # only logs EMITTED BY our per-swap contract count
             blob = b"".join(_b(topic) for topic in log.get("topics", [])) + _b(log.get("data"))
             if p in blob:
                 return
