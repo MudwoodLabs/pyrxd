@@ -203,3 +203,27 @@ Extend the BTC regtest e2e (`tests/test_xchain_swap_regtest_e2e.py:474`) with In
 - LN watchtowers BOLT-13 https://github.com/sr-gi/bolt13/blob/master/13-watchtowers.md · replacement cycling https://bitcoinmagazine.com/technical/postmortem-on-the-lightning-replacement-cycling-attack · ephemeral anchors https://bitcoinops.org/en/topics/ephemeral-anchors/ · EIP-7702 https://www.openfort.io/blog/eip-7702 · light clients https://a16zcrypto.com/posts/article/an-introduction-to-light-clients/
 
 > Verification caveat: external field-level details are from WebFetch summaries — confirm against live specs before encoding in v2/v3 code.
+
+---
+
+## Build status (2026-06-03) — v1 COMPLETE (alert-only, BTC)
+
+All four phases built on `feat/htlc-watchtower-v1`; **68 unit tests green** (`tests/test_watch_*.py`), ruff + format clean. Nothing broadcasts; no keys, no `p`.
+
+| Phase | Delivered | Tested |
+|---|---|---|
+| 0 | F-01/F-04 verified fixed (c91b1e7); decide() shape pinned; RXD single-source confirmed | n/a (verification note) |
+| 1 | `decide.py` (pure, consumes the gate, chain-truth-dominates, fail-closed) + `reconciler.py` (single-flight, per-swap fail-closed) | 29 unit |
+| 2 | `quorum.py` `ChainObserver` + ports (BTC depth quorum point; RXD corroboration flag; bogus-source guard) | + observe→decide integration |
+| 3 | `alerts.py` `DedupAlerter` + `Page`/`Severity` + package `README.md` | severity/dedup/retry |
+| 4 | `adapters.py` (JsonDir store, Electrum RXD source, mempool outspend claim source, logging/callback channels) + `daemon.py` (`run_loop` + heartbeat) + `scripts/watchtower_run.py` | adapters + loop unit-tested; runner `--help` smoke |
+
+**Done (verified by unit tests):** never pages CLAIM against a WAIT/SQUEEZED verdict; BTC depth via `MultiSourceBtcFundingReader` (conservative min, depth-inflation → no premature page); RXD pages flagged low-corroboration; dedup + structured payload {action, swap-id, deadline, why}; restart re-reads the store; no broadcast/keys/`p` anywhere.
+
+**NOT yet done (needs a live run — honestly unverified):**
+- End-to-end against a real chain (the runner targets ElectrumX; the operator's ssh-tr RXD backend needs a thin shim exposing `get_tip_height` + `get_transaction_verbose`). No live swap has been watched.
+- The reconciler Intent-sequence test against the **regtest e2e** harness (needs the regtest nodes running).
+- `task ci` full suite (only the watch tests + targeted lint were run locally).
+- "Authenticated" alert channel + human-reaction-latency in the admission/`MarginPolicy` window — the `CallbackAlertChannel` is the auth seam; the latency budget is a v2 admission concern.
+
+v2 (autonomous BTC) and v3 (ETH) remain as specified above, carrying the divergent-panel corrections.
