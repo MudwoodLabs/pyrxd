@@ -80,7 +80,7 @@ pycryptodomex = "^3.22.0"
 # transitive dep in most environments.
 cryptography = ">=42.0"
 websockets = ">=15.0.1,<17.0.0"
-cbor2 = "^6.0"
+cbor2 = "^6.1"
 click = "^8.4"
 # tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
 # pyrxd.cli.config falls back to this when running on 3.10.
