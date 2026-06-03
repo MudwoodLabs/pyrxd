@@ -321,6 +321,7 @@ class TestBuildGravityOffer:
             claim_deadline=_future_deadline(48),
             photons_offered=10_000_000,
             accept_short_deadline=False,
+            reject_low_difficulty=False,  # regtest ffff001d; F-02 secure default is True (overridden below)
         )
 
     def test_returns_gravity_offer(self):
@@ -367,13 +368,13 @@ class TestBuildGravityOffer:
         (the ffff001d footgun) is rejected at offer construction by the default floor."""
         kwargs = self._offer_kwargs()  # expected_nbits is ffff001d (difficulty-1 target)
         with pytest.raises(ValidationError, match="at or above the floor"):
-            build_gravity_offer(**kwargs, reject_low_difficulty=True)
+            build_gravity_offer(**{**kwargs, "reject_low_difficulty": True})
 
     def test_reject_low_difficulty_allows_real_nbits(self):
         """F-02: a real mainnet-difficulty nBits passes the floor."""
         kwargs = self._offer_kwargs()
         kwargs["expected_nbits"] = bytes.fromhex("19420317")  # real block-840000 nBits (exp 0x17)
-        offer = build_gravity_offer(**kwargs, reject_low_difficulty=True)
+        offer = build_gravity_offer(**{**kwargs, "reject_low_difficulty": True})
         assert offer.expected_nbits == bytes.fromhex("19420317")
 
     def test_min_difficulty_nbits_floor_decodes_target_not_exponent(self):
@@ -386,13 +387,13 @@ class TestBuildGravityOffer:
         # Default floor (difficulty-1) is coarse: it accepts this (documents the gap).
         kwargs = self._offer_kwargs()
         kwargs["expected_nbits"] = easy
-        offer = build_gravity_offer(**kwargs, reject_low_difficulty=True)
+        offer = build_gravity_offer(**{**kwargs, "reject_low_difficulty": True})
         assert offer.expected_nbits == easy
         # A real anchor-sourced floor rejects it (target easier-or-equal than the floor).
         kwargs2 = self._offer_kwargs()
         kwargs2["expected_nbits"] = easy
         with pytest.raises(ValidationError, match="at or above the floor"):
-            build_gravity_offer(**kwargs2, reject_low_difficulty=True, min_difficulty_nbits=bytes.fromhex("19420317"))
+            build_gravity_offer(**{**kwargs2, "reject_low_difficulty": True}, min_difficulty_nbits=bytes.fromhex("19420317"))
 
     def test_malformed_nbits_rejected(self):
         """F-27: an nBits exponent above 0x1d (covenant tolerates up to 0x20) is

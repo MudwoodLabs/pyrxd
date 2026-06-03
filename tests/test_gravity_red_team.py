@@ -82,6 +82,7 @@ def _valid_offer_kwargs() -> dict[str, Any]:
         btc_satoshis=100_000,
         btc_chain_anchor=bytes(32),
         expected_nbits=bytes.fromhex("ffff001d"),
+        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
         anchor_height=800_000,
         merkle_depth=12,
         claim_deadline=_future_deadline(48),
@@ -126,6 +127,7 @@ def _make_real_offer(priv: PrivateKeyMaterial, **overrides: Any) -> GravityOffer
         btc_satoshis=100_000,
         btc_chain_anchor=bytes([0xDD]) * 32,
         expected_nbits=bytes.fromhex("ffff001d"),
+        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
         anchor_height=800_000,
         merkle_depth=12,
         claim_deadline=_future_deadline(48),
@@ -1323,6 +1325,7 @@ class TestTakerIndependentClaimedRedeem:
                 btc_satoshis=100_000,
                 btc_chain_anchor=bytes([0xDD]) * 32,
                 expected_nbits=bytes.fromhex("ffff001d"),
+        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
                 anchor_height=800_000,
                 merkle_depth=12,
                 claim_deadline=_future_deadline(48),
@@ -1352,6 +1355,7 @@ class TestTakerIndependentClaimedRedeem:
                 btc_satoshis=100_000,
                 btc_chain_anchor=bytes([0xDD]) * 32,
                 expected_nbits=bytes.fromhex("ffff001d"),
+        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
                 anchor_height=800_000,
                 merkle_depth=12,
                 claim_deadline=deadline,
@@ -1433,6 +1437,7 @@ class TestAuditFindings2026:
                 btc_satoshis=100_000,
                 btc_chain_anchor=b"\x00" * 32,
                 expected_nbits=b"\xff\xff\x00\x1d",
+                reject_low_difficulty=False,  # regtest nbits; this test targets btc_receive_type, not F-02
                 anchor_height=840_000,
                 merkle_depth=12,
                 claim_deadline=int(time.time()) + 90_000,
@@ -1726,6 +1731,7 @@ class TestPerOfferReceiveDerivation:
             btc_satoshis=100_000,
             btc_chain_anchor=b"\x11" * 32,
             expected_nbits=bytes.fromhex("ffff001d"),
+        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
             anchor_height=800_000,
             merkle_depth=12,
             claim_deadline=_future_deadline(48),

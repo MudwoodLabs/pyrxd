@@ -344,7 +344,7 @@ def build_gravity_offer(
     covenant_artifact_name: str = "maker_covenant_flat_12x20_sentinel_all",
     offer_artifact_name: str = "maker_offer",
     used_btc_receive_hashes: set[bytes] | None = None,
-    reject_low_difficulty: bool = False,
+    reject_low_difficulty: bool = True,
     min_difficulty_nbits: bytes | None = None,
 ) -> Any:
     """
@@ -469,9 +469,11 @@ def build_gravity_offer(
     # difficulty-1-class footgun. ffff001d is the genesis/regtest min difficulty
     # and the default in older examples; a min-difficulty commit lets an attacker
     # mine a fake header chain off the real anchor for ~$0.
-    # NOTE: reject_low_difficulty defaults to False to preserve regtest/test
-    # behavior. Any covenant-LESS retained use (bridge-in/oracle/gate) MUST pass
-    # reject_low_difficulty=True AND min_difficulty_nbits sourced from the live
+    # NOTE: reject_low_difficulty defaults to TRUE (secure-by-default, F-02 follow-up;
+    # restored after a branch regression flipped it to False). regtest/test offers that
+    # commit difficulty-1 nBits (ffff001d) must pass reject_low_difficulty=False
+    # explicitly. Any covenant-LESS retained use (bridge-in/oracle/gate) MUST keep
+    # reject_low_difficulty=True AND source min_difficulty_nbits from the live
     # anchor-height network header — the default (difficulty-1) floor is only a
     # footgun guard, not a meaningful network-difficulty enforcement (audit F-01
     # remains: this is a build-time guard, not a difficulty oracle).

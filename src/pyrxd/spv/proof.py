@@ -372,12 +372,21 @@ class SpvProofBuilder:
         # The pos==0 guard alone was bypassable (pos = k*2**depth aliases the
         # coinbase branch); a coinbase is identifiable by its null-outpoint first
         # input regardless of the claimed position.
+        # NOTE (audit F-26): this coinbase exclusion is PYTHON-ONLY — the deployed
+        # covenant has no in-script coinbase guard, so it is NOT consensus-enforced.
+        # It is the safe direction (Python stricter than the covenant): a coinbase
+        # paying the covenant's btcReceiveHash is not a realistic taker flow.
         if _first_input_is_null_outpoint(stripped):
             raise SpvVerificationError("coinbase tx (null prevout) cannot be used as payment proof")
 
         # Rigorous audit R2 (2026-05-24): the any-wallet covenant rejects a funding
         # tx whose any input scriptSig is >= 128 B (its single-byte signed length
         # read decodes negative -> the covenant's `ssl >= 0` guard ScriptFails).
+        # NOTE (audit F-12): the 127-byte limit models the ANY-WALLET covenant.
+        # The deployed default (MakerCovenantFlat12x20) is NARROWER — it accepts a
+        # scriptSig length of only {0, 23} — and the production finalize path enforces
+        # that via gravity/trade.py::_find_output_zero_offset, not this guard. This
+        # check is the conservative superset for a covenant-bound reusable caller.
         # Refuse to build a proof the covenant would reject on-chain — otherwise
         # the taker broadcasts BTC against a proof that can never settle and, on the
         # no-refund SPV-oracle path, can LOSE the BTC. Run AFTER the txid match so a
