@@ -39,6 +39,8 @@ jobs:
           # security-and-quality includes the security-extended ruleset plus
           # additional code-quality queries. Worth the extra 30s on a small lib.
           queries: security-and-quality
+          # Excludes non-shipped spike/demo dirs from scanning (see config).
+          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@7211b7c8077ea37d8641b6271f6a365a22a5fbfa  # v4.36.0
