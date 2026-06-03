@@ -341,8 +341,13 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             raise SystemExit(f"covenant/timing mismatch -> {rec.state.value}; refund the ETH HTLC after the timeout")
 
         print(
-            "\n  *** MONITORING WINDOW (BOTH_LOCKED): a maker stall near t_RXD is the real loss path — "
-            "poll maybe_refund_asset_on_maker_stall; do NOT walk away. ***"
+            "\n  *** MONITORING WINDOW (BOTH_LOCKED): a maker stall (maker never claims the ETH, so p "
+            "is never revealed) is the real loss path. Recovery in THIS runbook is coord.mutual_refund() "
+            "AFTER BOTH timeouts elapse (t_eth -> taker's ETH HTLC; t_rxd/CSV -> maker's RXD covenant); "
+            "it refunds BOTH legs, so neither side takes one-sided loss. Do NOT use "
+            "maybe_refund_asset_on_maker_stall here — that is the BTC<->RXD runbook's proactive path where "
+            "the TAKER owns the RXD covenant; here the MAKER owns it (CLAIM->taker, CSV-refund->maker). "
+            "Do NOT walk away before both refunds confirm. ***"
         )
 
         # 3. Maker claims the ETH, revealing p on Ethereum.

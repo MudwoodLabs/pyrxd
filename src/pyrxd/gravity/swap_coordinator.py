@@ -628,6 +628,9 @@ def assess_claim_finality(
                 "a finalized-checkpoint (no-depth) finality verdict requires "
                 "policy.eth_finalization_window_s (the counter-chain finalization window)"
             )
+        # Convert the finalization TIME window into RXD blocks; round UP (ceil) — this is a RESERVE,
+        # so flooring would under-count it and let the gate say WAIT with too little margin. Same
+        # direction as the depth branch above and reserve_to_blocks(); never floor a reserve.
         counter_reserve_rxd = math.ceil(policy.eth_finalization_window_s / policy.rxd_block_interval_s)
     if blocks_left - counter_reserve_rxd >= rxd_burial and counter_claim_finality.remaining_positive:
         return ClaimFinality.WAIT
@@ -1477,6 +1480,13 @@ class SwapCoordinator:
         Drives BOTH_LOCKED -> MAKER_STALLS -> ASSET_REFUNDED_TAKER_ACTS. A no-op
         (returns the unchanged record) when the trigger has not fired yet. Async
         because the asset refund broadcasts a Radiant covenant spend.
+
+        RUNBOOK SCOPE (red-team MEDIUM): this is the BTC<->RXD proactive path, where the TAKER
+        owns the RXD covenant and reclaims it before the maker can grief. It refunds ONLY the
+        RXD asset leg. In the ETH<->RXD runbook the MAKER owns the covenant (CLAIM pays the
+        taker, the CSV refund pays the maker) and the taker's value sits in the ETH HTLC, so the
+        correct stall recovery there is :meth:`mutual_refund` (refunds BOTH legs after both
+        timeouts) — NOT this method. Do not wire this into the ETH harness's stall path.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(
@@ -1492,10 +1502,13 @@ class SwapCoordinator:
         )
         if not trigger:
             return self.record
-        self._advance(SwapEvent.MAKER_STALL_DETECTED)
-        await self._persist_record(self.record, shield=True)
-        # The taker refunds the asset rather than wait (NEVER waits).
+        # BROADCAST-THEN-ADVANCE (red-team LOW): advancing to MAKER_STALLS before the on-chain
+        # refund broadcast wedges the swap there (maybe_refund is only valid from BOTH_LOCKED) if
+        # the broadcast transiently fails. Broadcast FIRST — a raising refund leaves the record at
+        # BOTH_LOCKED and the call is safely retryable — then advance both FSM steps + persist once
+        # (matches taker_refund_btc / mutual_refund). The taker refunds rather than wait (NEVER waits).
         await self.radiant_leg.refund_asset(self.record)
+        self._advance(SwapEvent.MAKER_STALL_DETECTED)
         self._advance(SwapEvent.TAKER_REFUNDS_ASSET_PROACTIVELY)
         await self._persist_record(self.record, shield=True)
         return self.record

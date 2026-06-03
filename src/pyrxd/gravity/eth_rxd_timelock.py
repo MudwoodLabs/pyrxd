@@ -14,8 +14,26 @@ only starts counting once the covenant is MINED. This module bridges the two:
   i.e. the counter/ETH leg, claimed FIRST by the maker, holds the LONGER deadline (the
   cross-clock analog of the BTC ``t_BTC > t_RXD`` invariant). The inherent risk this ordering
   creates (a maker withholding its claim until past the RXD refund, then claiming AND
-  refunding) is defended by the proactive asset-refund, not by the timelock alone — see
+  refunding) is mitigated by the proactive asset-refund + the cross-clock margin coupling, not
+  by the timelock alone — see
   :func:`pyrxd.gravity.swap_coordinator.should_taker_refund_proactively`.
+
+  RESIDUAL FREE-OPTION (red-team HIGH, NOT fully closed pre-audit). The reveal-on-the-long-leg
+  free-option is INHERENT to this swap shape and is only BOUNDED here, not eliminated. Honest
+  caveats: (1) the proactive asset-refund returns the covenant to the MAKER (it owns the asset;
+  p is not yet public), so it does NOT recover value for the ETH TAKER — the taker's value sits
+  in the ETH HTLC, refundable only after ``eth_timeout`` via ``mutual_refund``. (2) A maker that
+  reveals at ``eth_timeout - epsilon`` (genuinely FINAL, not a stall) after the ``t_rxd`` window
+  has closed can race its own CSV refund; the coordinator's reorg gate then SQUEEZES the taker to
+  ``ASSET_VULNERABLE`` and a winner-take-all claim can lose to the already-landed CSV refund —
+  the FSM-modeled ``ASSET_VULNERABLE -> ONE_SIDED_LOSS_TAKER`` residual. The defenses that BOUND
+  it: the cross-clock margin (this module) sizes ``t_rxd`` to open strictly before the ETH
+  deadline minus the full finality-stall-tolerant margin, and the coordinator couples the
+  proactive-refund window ``N`` to the finality+burial reserve so a reveal cannot be timed into a
+  squeeze the taker could otherwise have acted in. This residual is an ACCEPTED, documented,
+  pre-external-audit property (same as the BTC<->RXD direction), surfaced loudly (never a silent
+  COMPLETED) and gated behind the external audit + the test
+  ``test_eth_late_reveal_races_csv_taker_squeezed_then_cannot_claim_spent_covenant``.
 
 * :func:`assert_covenant_confirms_before_eth_deadline` is the funding-confirmation gate
   that closes the NEW mixed-clock race (re-audit SC-3/TLK-1): because the RXD CSV clock

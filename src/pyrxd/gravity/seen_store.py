@@ -52,10 +52,15 @@ class DurableSeenStore:
         # throughput-sensitive, so the extra fsync is negligible and buys real SEEN-1 durability.
         self._conn.execute("PRAGMA synchronous=FULL")
         self._conn.execute(_SCHEMA)
-        try:
-            os.chmod(path, 0o600)  # H-keyed reservation metadata; keep perms tight
-        except OSError:
-            pass  # e.g. ":memory:" or a backend without chmod
+        # Keep perms tight on the DB AND its WAL/SHM sidecars (red-team INFO): under WAL +
+        # autocommit the committed reservation rows live in the -wal sidecar, which sqlite created
+        # at the umask default (often 0644). chmod all three so a same-group reader can't see the
+        # H-keyed reservation metadata. (H is public, so this is hygiene, not a secret leak.)
+        for suffix in ("", "-wal", "-shm"):
+            try:
+                os.chmod(f"{path}{suffix}", 0o600)
+            except OSError:
+                pass  # e.g. ":memory:", a backend without chmod, or a sidecar not yet created
 
     @staticmethod
     def _h(hashlock: bytes) -> bytes:

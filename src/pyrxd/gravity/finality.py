@@ -90,6 +90,15 @@ class CounterClaimFinality:
 class FinalityStallTracker:
     """RF-06 across-time stall detector for a finalized-checkpoint (PoS) counter leg.
 
+    ⚠️ NOT WIRED INTO THE LIVE SWAP PATH (Phase-3 deferred — red-team). This class is built and
+    unit-tested (tests/test_finality_verdict.py) but the production ``SwapCoordinator`` does NOT
+    yet feed it samples: the running ETH↔RXD swap relies on the point-in-time
+    ``claim_finality_verdict`` only, so a sustained PoS finality stall ("finalized" frozen while
+    the head advances) is NOT currently auto-detected end-to-end. Do not assume across-time
+    stall protection is active. Wiring = a poll-loop that calls ``observe(...)`` each sample and
+    routes ``COUNTER_CHAIN_NOT_FINALIZING`` into the coordinator's SQUEEZE path; tracked as a
+    Phase-4 follow-up, NOT part of the current merge. Keep this banner until it is wired.
+
     ``claim_finality_verdict`` is deliberately a single POINT-IN-TIME observation and never
     emits ``COUNTER_CHAIN_NOT_FINALIZING`` (a single non-advance of ``finalized`` is normal —
     it only moves at epoch boundaries). A genuine stall — ``finalized`` frozen while the head

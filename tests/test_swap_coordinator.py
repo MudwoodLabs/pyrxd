@@ -49,7 +49,7 @@ from pyrxd.gravity.swap_state import (
     SwapRecord,
     SwapState,
 )
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import SecretBytes
 
 
@@ -1825,6 +1825,50 @@ async def test_eth_claim_squeezed_then_explicit_vulnerable_claim():
     rec = await coord.taker_claim_asset_from_vulnerable("0xclaim")
     assert rec.state is SwapState.COMPLETED
     assert rxd.claimed_with == p.unsafe_raw_bytes()
+
+
+async def test_eth_late_reveal_races_csv_taker_squeezed_then_cannot_claim_spent_covenant():
+    """HIGH #2 (red-team) — the reveal-on-the-LONG-leg FREE-OPTION, late-reveal-races-CSV variant.
+
+    The inherent reactor-unsafe ordering: the maker (secret holder) reveals p on the LONG (ETH) leg
+    while the honest taker must react on the SHORT (RXD) leg. A malicious maker waits until the t_rxd
+    window has all but closed before revealing (claiming ETH — so the reveal is genuinely FINAL, not
+    a stall), then races its own covenant CSV refund (which pays the maker, needs no preimage). This
+    closes the test gap the red-team verifier flagged: S1 is a full stall, S2 is the premature-claim
+    race, S4 is a bare not-yet-final squeeze — none drive a FINAL-but-too-late reveal against an
+    ALREADY-CSV-REFUNDED covenant. The safety assertion is that the honest taker is NEVER silently
+    driven to COMPLETED: the reorg gate SQUEEZES the late FINAL reveal to ASSET_VULNERABLE, and the
+    deliberate winner-take-all claim then FAILS against the spent covenant, leaving the documented
+    ONE_SIDED_LOSS residual (FSM ASSET_VULNERABLE -> ONE_SIDED_LOSS_TAKER) — an accepted, pre-audit
+    inherent HTLC property, surfaced loudly, not a false success. (See eth_rxd_timelock.py: this is
+    why the cross-clock margin couples N to the finality+burial reserve, and why it is audit-gated.)"""
+    p, h = generate_secret()
+    terms = _eth_terms(hashlock=h, t_rxd_blocks=72)
+    leg = FakeEthLeg(preimage=p, verdict=_final())  # the ETH claim IS final — maker revealed at t_eth-epsilon
+
+    # Maker already CSV-refunded the covenant to itself: the taker's Radiant claim must fail closed
+    # (the UTXO is gone). This is the on-chain reality the winner-take-all race loses.
+    class _SpentCovenantRadiantLeg(FakeRadiantLeg):
+        async def claim_asset(self, record, preimage):
+            self.calls.append("claim_asset")
+            raise NetworkError("covenant UTXO already spent (maker CSV-refunded the asset)")
+
+    rxd = _SpentCovenantRadiantLeg()
+    coord = _eth_coord_at_secret_revealed(eth_leg=leg, terms=terms, radiant_leg=rxd)
+    # refund opens @ 1000+72=1072; the maker revealed only as it closed: now=1070 -> 2 blocks left <
+    # rxd_burial(6). FINAL verdict + a window that no longer fits our own burial -> SQUEEZED, NOT an
+    # automatic claim (the gate refuses to claim off a window it cannot safely bury in).
+    rec = await coord.taker_scrape_and_claim_asset("0xlateclaim", now_rxd_height=1070, asset_locked_at_height=1000)
+    assert rec.state is SwapState.ASSET_VULNERABLE, (
+        f"a FINAL but too-late reveal must SQUEEZE to ASSET_VULNERABLE, got {rec.state.value}"
+    )
+    assert rxd.claimed_with is None  # no automatic claim happened
+    # The deliberate winner-take-all race against the already-spent covenant fails closed; the honest
+    # taker stays in the documented ONE_SIDED_LOSS residual — it is NEVER advanced to COMPLETED.
+    with pytest.raises(NetworkError, match="already spent"):
+        await coord.taker_claim_asset_from_vulnerable("0xlateclaim")
+    assert coord.record.state is SwapState.ASSET_VULNERABLE  # not COMPLETED
+    assert "claim_asset" in rxd.calls  # it really attempted (and lost) the race
 
 
 # --------------------------------------------------------------------------- Wave B (audit fixes)
