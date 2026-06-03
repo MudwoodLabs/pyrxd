@@ -57,16 +57,29 @@ class CrossClockMargin:
     strictly BEFORE the ETH deadline by at least this much wall-clock (the RXD/asset leg,
     claimed second, holds the SHORTER deadline; the ETH/counter leg the longer).
 
-    ``eth_reorg_finality_s`` is CHOSEN/ESTIMATED (post-Merge ETH has variable finalization
-    lag, ~2 epochs ≈ 12.8 min in the steady state); ``rounding_slack_s`` MUST be at least
-    one ``rxd_block_interval_s`` to absorb the converter's floor rounding plus a cross-chain
-    clock-skew budget.
+    ``eth_reorg_finality_s`` is the post-Merge ETH finalized-checkpoint lag in the STEADY
+    STATE (~2 epochs ≈ 768 s ≈ 12.8 min — formally specified, ethereum.org/eth2book).
+
+    ``eth_finality_stall_tolerance_s`` is the ADDITIONAL budget for an ETH FINALITY STALL —
+    the checkpoint freezing while blocks keep being produced (observed on Sepolia 2026-06-01,
+    ~20 min; the May-2023 MAINNET incident reached ~9 epochs ≈ 1 hr; an inactivity-leak worst
+    case is unbounded — Jump Crypto). This is the single most important safety addition: the
+    taker waits for ETH FINALITY before claiming RXD (the trust-minimised choice per the
+    ethresear.ch "rational finality stalls" analysis — do NOT downgrade to a block count during
+    a stall), so the RXD refund must NOT open until the taker has had a stall-tolerant window.
+    Sizing this against happy-path finality (~13 min) is the exact bug a stall triggers. Set it
+    to AT LEAST a May-2023-class hour for a mainnet ETH leg; larger is safer (the cost is only
+    the maker's asset being locked longer, a liveness cost, never a safety one).
+
+    ``rounding_slack_s`` MUST be at least one ``rxd_block_interval_s`` to absorb the converter's
+    floor rounding plus a cross-chain clock-skew budget.
     """
 
-    eth_reorg_finality_s: int  # ETH finalized-checkpoint lag (CHOSEN/ESTIMATED)
+    eth_reorg_finality_s: int  # ETH finalized-checkpoint STEADY-STATE lag (~2 epochs, specified)
     rxd_claim_burial_s: int  # time for the taker's RXD claim to bury reorg-deep
     rxd_confirm_slack_s: int  # slack for the RXD claim tx to propagate + confirm
     rounding_slack_s: int  # block-rounding (>= one block) + cross-chain clock-skew budget
+    eth_finality_stall_tolerance_s: int = 0  # ADDITIONAL budget for an ETH finality STALL (see docstring)
 
     def __post_init__(self) -> None:
         for name in (
@@ -74,6 +87,7 @@ class CrossClockMargin:
             "rxd_claim_burial_s",
             "rxd_confirm_slack_s",
             "rounding_slack_s",
+            "eth_finality_stall_tolerance_s",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool):
@@ -82,7 +96,13 @@ class CrossClockMargin:
                 raise ValidationError(f"CrossClockMargin.{name} must be >= 0")
 
     def total_s(self) -> int:
-        return self.eth_reorg_finality_s + self.rxd_claim_burial_s + self.rxd_confirm_slack_s + self.rounding_slack_s
+        return (
+            self.eth_reorg_finality_s
+            + self.rxd_claim_burial_s
+            + self.rxd_confirm_slack_s
+            + self.rounding_slack_s
+            + self.eth_finality_stall_tolerance_s
+        )
 
 
 def eth_absolute_to_rxd_relative_blocks(
@@ -107,13 +127,27 @@ def eth_absolute_to_rxd_relative_blocks(
     maker reclaim the asset no later than computed (never longer); the sub-block remainder
     is covered by ``margin.rounding_slack_s``. Fail-closed ``ValidationError`` if the budget
     is non-positive, below the safety floor, or beyond the BIP68 16-bit cap.
+
+    ``rxd_block_interval_s`` MUST be a conservative FAST-TAIL percentile of the RXD inter-block
+    distribution (e.g. p10), NOT the mean. Rationale (the attacker-benefits-when-RXD-runs-fast
+    rule): ``t_rxd = floor(budget_s / interval)`` picks the block count whose EXPECTED wall-clock
+    is ``budget_s``; if RXD then mines FASTER than ``interval`` assumed, those ``t_rxd`` blocks
+    elapse SOONER than ``budget_s`` and the refund opens EARLY — shrinking (in the worst case
+    eliminating) the taker's claim window. A smaller (fast-tail) ``interval`` yields MORE blocks
+    for the same budget, so the refund opens later in the fast case — the safe direction. Using
+    the mean UNDERESTIMATES how fast the window can open. Measured RXD mainnet 2026-06-02 (150
+    blocks): min 9 s, p10 43 s, median 229 s, mean 330 s — the p10/min, not the mean, is the
+    load-bearing number. A slow RXD only lengthens the maker's lock (a liveness, not safety, cost).
     """
     _require_int(eth_timeout_unix_s, "eth_timeout_unix_s")
     _require_int(expected_rxd_lock_time_unix_s, "expected_rxd_lock_time_unix_s")
     if not isinstance(floor_blocks, int) or isinstance(floor_blocks, bool) or floor_blocks < 1:
         raise ValidationError("floor_blocks must be a positive int")
     if rxd_block_interval_s <= 0:
-        raise ValidationError("rxd_block_interval_s must be > 0 (use a MEASURED value on mainnet)")
+        raise ValidationError(
+            "rxd_block_interval_s must be > 0 (use a MEASURED conservative FAST-TAIL percentile "
+            "on mainnet, e.g. p10 — NOT the mean; see docstring)"
+        )
 
     budget_s = eth_timeout_unix_s - margin.total_s() - expected_rxd_lock_time_unix_s
     if budget_s <= 0:

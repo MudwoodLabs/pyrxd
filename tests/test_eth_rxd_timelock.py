@@ -38,6 +38,75 @@ def test_margin_total_and_validation():
         CrossClockMargin(eth_reorg_finality_s=0, rxd_claim_burial_s=0, rxd_confirm_slack_s=0, rounding_slack_s=True)
 
 
+def test_stall_tolerance_defaults_zero_and_is_additive():
+    # Back-compat: omitting the new field leaves total_s unchanged (defaults to 0).
+    assert _margin(1, 2, 3, 4).total_s() == 10
+    # Set it and it adds to the total (a May-2023-class ~1hr stall budget).
+    m = CrossClockMargin(
+        eth_reorg_finality_s=768,  # ~2 epochs steady-state finality
+        rxd_claim_burial_s=600,
+        rxd_confirm_slack_s=300,
+        rounding_slack_s=300,
+        eth_finality_stall_tolerance_s=3600,  # +1hr for a finality stall
+    )
+    assert m.total_s() == 768 + 600 + 300 + 300 + 3600
+    # And it is validated like the others.
+    with pytest.raises(ValidationError):
+        CrossClockMargin(
+            eth_reorg_finality_s=0,
+            rxd_claim_burial_s=0,
+            rxd_confirm_slack_s=0,
+            rounding_slack_s=0,
+            eth_finality_stall_tolerance_s=-1,
+        )
+
+
+def test_stall_tolerance_shrinks_the_rxd_budget():
+    # Same inputs, but the stall tolerance eats into the RXD window: the refund must open
+    # EARLIER (fewer blocks) so the taker still has its stall-tolerant claim window.
+    base = CrossClockMargin(
+        eth_reorg_finality_s=768, rxd_claim_burial_s=600, rxd_confirm_slack_s=300, rounding_slack_s=300
+    )
+    with_stall = CrossClockMargin(
+        eth_reorg_finality_s=768,
+        rxd_claim_burial_s=600,
+        rxd_confirm_slack_s=300,
+        rounding_slack_s=300,
+        eth_finality_stall_tolerance_s=3600,
+    )
+    kw = dict(eth_timeout_unix_s=100_000, expected_rxd_lock_time_unix_s=0, rxd_block_interval_s=43.0)
+    t_base = eth_absolute_to_rxd_relative_blocks(margin=base, **kw)
+    t_stall = eth_absolute_to_rxd_relative_blocks(margin=with_stall, **kw)
+    assert t_stall.value < t_base.value  # stall budget strictly shrinks the RXD window
+
+
+def test_stall_tolerance_can_force_failclosed():
+    # A stall tolerance larger than the remaining ETH→RXD gap leaves no budget → refuse to lock.
+    huge_stall = CrossClockMargin(
+        eth_reorg_finality_s=768,
+        rxd_claim_burial_s=600,
+        rxd_confirm_slack_s=300,
+        rounding_slack_s=300,
+        eth_finality_stall_tolerance_s=100_000,
+    )
+    with pytest.raises(ValidationError, match="no RXD timelock budget"):
+        eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=10_000,
+            expected_rxd_lock_time_unix_s=0,
+            margin=huge_stall,
+            rxd_block_interval_s=43.0,
+        )
+
+
+def test_fast_interval_yields_more_blocks_than_mean():
+    # The fast-tail (p10=43s) interval yields MORE blocks than the mean (330s) for the same
+    # budget — the refund opens LATER in the fast case, which is the safe direction.
+    kw = dict(eth_timeout_unix_s=100_000, expected_rxd_lock_time_unix_s=0, margin=_margin())
+    t_fast = eth_absolute_to_rxd_relative_blocks(rxd_block_interval_s=43.0, **kw)
+    t_mean = eth_absolute_to_rxd_relative_blocks(rxd_block_interval_s=330.0, **kw)
+    assert t_fast.value > t_mean.value
+
+
 # ─────────────────────────────────────────────────────── converter (D1) ──
 
 
