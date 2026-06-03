@@ -1,0 +1,123 @@
+# Combine PRs — manually merge several open Dependabot PRs into one combined
+# PR, so a batch of updates costs a single CI run + a single merge instead of
+# one (plus a strict-mode rebase) per PR.
+#
+# This is a self-contained workflow: it uses the pre-installed `gh` CLI rather
+# than a third-party action, so there's no extra supply-chain surface to pin.
+#
+# Trigger it from the Actions tab ("Combine PRs" > Run workflow). It:
+#   1. creates a branch off `base`,
+#   2. merges each open PR (from `author`, optionally filtered by `label`)
+#      whose checks are green, skipping any that conflict,
+#   3. opens one combined PR listing what was folded in (and what was skipped).
+#
+# NOTE ON CI: PRs opened with the default GITHUB_TOKEN do NOT trigger other
+# workflows (GitHub blocks recursive runs). To have CI run on the combined PR,
+# add a repo secret COMBINE_PRS_TOKEN containing a fine-grained PAT with
+# contents:write + pull-requests:write; this workflow uses it when present and
+# falls back to GITHUB_TOKEN (no CI on the combined PR) otherwise.
+
+name: Combine PRs
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base branch to combine onto"
+        default: "main"
+      author:
+        description: "Only combine PRs opened by this author"
+        default: "app/dependabot"
+      label:
+        description: "Optional: only PRs carrying this label (blank = any)"
+        default: ""
+      require_green:
+        description: "Only combine PRs whose checks are all passing"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: combine-prs
+  cancel-in-progress: false
+
+jobs:
+  combine:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.COMBINE_PRS_TOKEN || github.token }}
+
+      - name: Combine open PRs
+        env:
+          GH_TOKEN: ${{ secrets.COMBINE_PRS_TOKEN || github.token }}
+          BASE: ${{ inputs.base }}
+          AUTHOR: ${{ inputs.author }}
+          LABEL: ${{ inputs.label }}
+          REQUIRE_GREEN: ${{ inputs.require_green }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git fetch --quiet origin "$BASE"
+          combined_branch="combined-prs/${GITHUB_RUN_ID}"
+          git switch -c "$combined_branch" "origin/$BASE"
+
+          numbers=$(gh pr list --state open --base "$BASE" --author "$AUTHOR" \
+            ${LABEL:+--label "$LABEL"} --json number --jq '.[].number')
+
+          if [ -z "$numbers" ]; then
+            echo "No open PRs match author='$AUTHOR'${LABEL:+ label='$LABEL'} on base '$BASE'."
+            exit 0
+          fi
+
+          combined=()
+          skipped=()
+          for n in $numbers; do
+            head=$(gh pr view "$n" --json headRefName --jq '.headRefName')
+            title=$(gh pr view "$n" --json title --jq '.title')
+
+            if [ "$REQUIRE_GREEN" = "true" ] && ! gh pr checks "$n" >/dev/null 2>&1; then
+              echo "skip #$n ($head): checks not all green"
+              skipped+=("#$n $title — checks not green")
+              continue
+            fi
+
+            git fetch --quiet origin "$head"
+            if git merge --no-edit --no-ff "origin/$head" >/dev/null 2>&1; then
+              echo "merged #$n ($head)"
+              combined+=("#$n $title")
+            else
+              echo "skip #$n ($head): merge conflict"
+              git merge --abort || true
+              skipped+=("#$n $title — merge conflict")
+            fi
+          done
+
+          if [ "${#combined[@]}" -lt 2 ]; then
+            echo "Fewer than 2 PRs combined — nothing worth opening. Exiting."
+            exit 0
+          fi
+
+          git push --force-with-lease origin "$combined_branch"
+
+          body=$'Combined the following PRs into one, to save CI runs and avoid the strict-mode rebase cascade:\n\n'
+          for c in "${combined[@]}"; do body+="- $c"$'\n'; done
+          if [ "${#skipped[@]}" -gt 0 ]; then
+            body+=$'\nSkipped (resolve/merge these on their own):\n'
+            for s in "${skipped[@]}"; do body+="- $s"$'\n'; done
+          fi
+          body+=$'\n_Opened by the Combine PRs workflow. Close the superseded PRs above once this merges._'
+
+          gh pr create --base "$BASE" --head "$combined_branch" \
+            --title "chore(deps): combined Dependabot updates" \
+            --body "$body"
+
+          echo "Opened combined PR for ${#combined[@]} update(s)."
