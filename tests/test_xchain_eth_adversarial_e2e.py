@@ -37,13 +37,19 @@ pytest.importorskip("eth_keys")
 # tests.* import path (conftest adds the repo root; see test_xchain_eth_glyph_real_rxindexer_e2e).
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import hashlib
+import os
+
+from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.swap_coordinator import should_taker_refund_proactively
 from pyrxd.gravity.swap_state import SwapState
+from pyrxd.security.errors import NetworkError, ValidationError
 
 # Reuse the real chain harness from the happy-path e2e (one source of truth for the node/anvil/legs).
 from tests.test_xchain_eth_swap_regtest_e2e import (
     _anvil_mine,
     _anvil_now,
+    _anvil_rpc,
     _build,
     _rxd_pay,
     env,  # the module-scoped fixture (radiant regtest node + anvil)
@@ -199,3 +205,147 @@ class TestEthAdversarial:
             )
         finally:
             await rpc.close()
+
+    async def test_S3_hostile_maker_wrong_covenant_taker_fails_closed(self, env):
+        """S3: a hostile maker funds a covenant with the WRONG parameters (a different hashlock → a
+        different SPK than the negotiated terms imply) instead of the agreed one. The honest taker
+        re-derives the EXPECTED SPK from terms and looks for THAT on-chain; the agreed covenant was
+        never funded, so the lookup fails closed — the taker never advances to BOTH_LOCKED and its
+        ETH stays refundable. (The narrower PARAMS_MISMATCH state is for an expected-SPK-funded-but-
+        mismatched lock; either way the safety invariant is: the taker does NOT enter BOTH_LOCKED.)"""
+        node, url = env
+        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        terms = coord.record.terms
+
+        try:
+            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BTC_LOCKED
+
+            # The hostile maker funds a DIFFERENT covenant (a fresh hashlock → a different SPK), NOT
+            # the agreed one. The agreed-terms SPK (cov.funded_spk) is therefore never funded.
+            wrong_h = hashlib.sha256(os.urandom(32)).digest()
+            wrong_cov = build_htlc_covenant_rxd(
+                amount=terms.radiant_amount,
+                taker_pkh=_throwaway_pkh(),
+                maker_pkh=_throwaway_pkh(),
+                hashlock=wrong_h,
+                refund_csv=terms.t_rxd.value,
+            )
+            assert wrong_cov.funded_spk != cov.funded_spk
+            _rxd_pay(node, wrong_cov.funded_spk, terms.radiant_amount)
+
+            # The honest taker validates against the AGREED terms (it re-derives the expected SPK and
+            # looks for it on-chain). The agreed covenant was never funded → fail closed.
+            with pytest.raises((ValidationError, NetworkError)):
+                await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
+
+            # SAFETY: the taker never reached BOTH_LOCKED. Its ETH HTLC is refundable once the ETH
+            # timeout passes (the refund is timelocked — the decision to abort is immediate, the
+            # refund SPEND lands after the timeout, same maturity pattern as the RXD CSV in S1).
+            assert coord.record.state is not SwapState.BOTH_LOCKED
+            _anvil_rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
+            _anvil_mine(url, 1)
+            rec = await coord.taker_refund_btc()
+            assert rec.state is SwapState.ABORTED
+        finally:
+            await rpc.close()
+
+    async def test_S4_reveal_without_finality_squeeze_goes_vulnerable(self, env):
+        """S4: the maker reveals p by claiming ETH, but the ETH claim is NOT final AND the t_rxd
+        window has nearly closed. The reorg gate must SQUEEZE (→ ASSET_VULNERABLE), never silently
+        claim and never indefinitely WAIT — the danger zone is surfaced as an explicit decision."""
+        node, url = env
+        # Tight t_rxd so the window can close while the ETH claim stays non-final.
+        coord, cov, p_secret, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        terms = coord.record.terms
+
+        try:
+            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BTC_LOCKED
+            asset_locked_at = int(node.rxd("getblockcount"))
+            _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+            rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BOTH_LOCKED
+
+            # Maker claims ETH (reveals p) but we do NOT mine anvil → the claim is NOT final.
+            rec = await coord.maker_claims_btc(p_secret)
+            assert rec.state is SwapState.SECRET_REVEALED
+            claim_tx = eth_leg.last_claim_tx
+
+            # Drive RXD to the edge of t_rxd maturity while the ETH claim stays non-final: the gate
+            # has no room left to WAIT for finality → SQUEEZED → ASSET_VULNERABLE (a deliberate
+            # danger-zone decision, not a silent claim).
+            node.rxd_mine(terms.t_rxd.value - 1)
+            now_rxd = int(node.rxd("getblockcount"))
+            rec = await coord.taker_scrape_and_claim_asset(
+                claim_tx, now_rxd_height=now_rxd, asset_locked_at_height=asset_locked_at
+            )
+            assert rec.state is SwapState.ASSET_VULNERABLE, (
+                f"a non-final ETH claim with a closing t_rxd must SQUEEZE to ASSET_VULNERABLE, got {rec.state.value}"
+            )
+        finally:
+            await rpc.close()
+
+    async def test_S5_hostile_taker_bad_eth_htlc_maker_refuses_to_lock(self, env):
+        """S5 (roles flipped — honest MAKER): a hostile taker funds an ETH HTLC that does NOT match
+        the negotiated terms (here: an underfunded balance). The honest maker's verify_funded gate
+        must RAISE, so the maker never locks the RXD asset against a bad/absent ETH leg."""
+        node, url = env
+        coord, _cov, _p, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        terms = coord.record.terms
+
+        try:
+            # The taker funds the ETH HTLC for real (deploy+verify against the true terms).
+            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BTC_LOCKED
+            locator = eth_leg.last_funded_locator
+            assert locator is not None
+            # verify_funded lives on the inner EthHtlcContractLeg (EthLeg wraps it as ._leg; the
+            # recorder wraps EthLeg as ._inner). The honest MAKER calls it to independently re-verify
+            # the taker's on-chain HTLC before locking RXD.
+            contract_leg = eth_leg._inner._leg
+
+            # Against the TRUE expected amount it passes (the contract is correctly funded)...
+            await contract_leg.verify_funded(locator, expected_amount_wei=terms.value_amount)
+            # ...but if the maker's negotiated amount were HIGHER than what the taker actually funded
+            # (a hostile/underfunding taker), verify_funded must FAIL CLOSED — the maker refuses.
+            with pytest.raises(ValidationError):
+                await contract_leg.verify_funded(locator, expected_amount_wei=terms.value_amount + 1)
+            # SAFETY: an honest maker keyed to the higher amount would have refused to lock RXD here,
+            # so its asset is never put at risk against an underfunded ETH leg.
+        finally:
+            await rpc.close()
+
+    async def test_S6_lying_counterparty_caught_by_own_chain_read(self, env):
+        """S6: the counterparty LIES about on-chain state — it claims the RXD asset is locked, but
+        reports a fabricated covenant SPK that was never funded. The honest taker re-reads the chain
+        ITSELF (never trusts the peer's word): the unfunded SPK has no covenant outpoint, so the
+        revalidate fails closed rather than advancing to BOTH_LOCKED."""
+        node, url = env
+        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        terms = coord.record.terms
+
+        try:
+            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BTC_LOCKED
+
+            # The maker LIES: it never funds anything, but tells the taker "I locked it at <this SPK>".
+            # The honest taker observes the REAL chain for that SPK. The correct SPK was never funded,
+            # so there is no covenant outpoint → fail closed (the taker does NOT enter BOTH_LOCKED).
+            with pytest.raises((ValidationError, Exception)):
+                rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
+                # If it returned instead of raising, it must NOT be BOTH_LOCKED.
+                assert rec.state is not SwapState.BOTH_LOCKED
+            # SAFETY: the taker never advanced to BOTH_LOCKED on a fabricated lock; its ETH stays
+            # refundable.
+            assert coord.record.state is not SwapState.BOTH_LOCKED
+        finally:
+            await rpc.close()
+
+
+def _throwaway_pkh():
+    """A fresh random pkh for the S3 wrong-covenant (the wrong hashlock alone changes the SPK)."""
+    from pyrxd.keys import PrivateKey
+    from pyrxd.security.types import Hex20
+
+    return bytes(Hex20(PrivateKey(os.urandom(32)).public_key().hash160()))
