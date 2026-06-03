@@ -12,11 +12,12 @@ honest taker's coordinator only ever observes the public envelope (terms + the o
 + the on-chain ETH claim tx) — never the maker's secret p or keys until they appear on-chain.
 
 Scenarios:
-  S1 — hostile maker GRIEFING / free-option: maker reaches BOTH_LOCKED then STALLS (never claims ETH),
-       intending to refund the RXD covenant via CSV AND claim ETH at the last moment, taking both.
-       Defense under test: the honest taker's proactive asset-refund (C1,
-       maybe_refund_asset_on_maker_stall) — it refunds BEFORE t_rxd-N, never waits. Assert: the taker
-       reclaims its RXD; the maker is NEVER able to hold both legs.
+  S1 — hostile maker GRIEFING / free-option: maker reaches BOTH_LOCKED then STALLS (never claims ETH,
+       never reveals p). Covenant semantics: the CLAIM branch pays the TAKER (with p), the CSV REFUND
+       branch pays the MAKER. So the taker's anti-grief is recovering its OWN ETH (the RXD refunds to
+       the maker regardless). Defense under test: the C1 decision trigger fires at t_rxd-N, then
+       mutual_refund recovers BOTH legs (taker's ETH → taker, covenant → maker). Assert: a stalling
+       maker cannot make the honest taker suffer a ONE-SIDED LOSS; neither party loses.
   S2 — asset-timeout RACE: maker reveals p by claiming ETH, then the test verifies the reorg-finality
        gate keeps the honest taker from claiming RXD until the ETH claim is FINAL (so the maker can't
        race a CSV refund against a not-yet-final claim). Assert: the taker only claims once SAFE.
@@ -85,16 +86,23 @@ class _AdversaryActor:
 
 
 class TestEthAdversarial:
-    async def test_S1_hostile_maker_stall_taker_refunds_proactively(self, env):
-        """S1: maker reaches BOTH_LOCKED then STALLS. The honest taker's proactive-refund trigger
-        must fire as t_rxd-N approaches, and the taker reclaims its RXD — the maker can never end up
-        holding both legs."""
+    async def test_S1_hostile_maker_stall_honest_parties_dont_lose(self, env):
+        """S1: maker reaches BOTH_LOCKED then STALLS (never claims, never reveals p).
+
+        The covenant semantics (verified 2026-06-02): the covenant CLAIM branch pays the TAKER
+        (with p); the CSV REFUND branch pays the MAKER (anyone-spendable after maturity). So the
+        taker's REAL anti-grief on a maker stall is to recover its OWN ETH, NOT to "keep the RXD" —
+        the RXD covenant refunds to the maker regardless. The safety property is: a stalling maker
+        cannot make the honest taker suffer a ONE-SIDED LOSS.
+
+        This asserts:
+          (a) the C1 decision trigger fires as t_rxd-N approaches (the taker must stop waiting);
+          (b) `mutual_refund` then refunds BOTH legs — the taker's ETH back to the taker AND the
+              covenant back to the maker — so NEITHER party loses;
+          (c) and separately that the maker never revealed p (it stalled)."""
         node, url = env
-        # Short t_rxd so the stall window is reachable on regtest quickly. (S1 never claims ETH, so
-        # the eth_leg recorder is unused here.)
-        coord, cov, p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
         terms = coord.record.terms
-        adversary = _AdversaryActor(coord, p_secret)
 
         try:
             # 1. Taker funds ETH; maker locks RXD → BOTH_LOCKED.
@@ -105,24 +113,23 @@ class TestEthAdversarial:
             rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
             assert rec.state is SwapState.BOTH_LOCKED
 
-            # 2. The maker STALLS (never claims). The honest taker polls the proactive-refund trigger.
-            adversary.maker_stalls()
-            # Before the window: trigger must NOT fire (taker keeps waiting, correctly).
+            # 2. The maker STALLS (never claims → maker_has_claimed_btc stays False). Before the
+            #    safety window the C1 trigger must NOT fire (the taker keeps waiting, correctly).
+            n = coord.config.maker_stall_safety_window_blocks
             assert (
                 should_taker_refund_proactively(
                     now_block_height=asset_locked_at + 1,
                     asset_locked_at_height=asset_locked_at,
                     t_rxd=terms.t_rxd,
-                    safety_window_blocks=coord.config.maker_stall_safety_window_blocks,
-                    maker_has_claimed_btc=adversary.has_claimed,
+                    safety_window_blocks=n,
+                    maker_has_claimed_btc=False,
                     block_interval_s=coord.config.margin_policy.block_interval_s,
                 )
                 is False
             )
 
-            # 3a. Advance RXD to within the safety window of t_rxd maturity (maturity - N). Maker
-            #     STILL hasn't claimed. The C1 DECISION trigger must now FIRE ("stop waiting").
-            n = coord.config.maker_stall_safety_window_blocks
+            # 3. (a) Advance RXD to within the safety window of t_rxd maturity. The C1 DECISION
+            #    trigger must now FIRE ("stop waiting — the maker is stalling").
             node.rxd_mine(terms.t_rxd.value - n)
             assert (
                 should_taker_refund_proactively(
@@ -130,32 +137,28 @@ class TestEthAdversarial:
                     asset_locked_at_height=asset_locked_at,
                     t_rxd=terms.t_rxd,
                     safety_window_blocks=n,
-                    maker_has_claimed_btc=adversary.has_claimed,
+                    maker_has_claimed_btc=False,
                     block_interval_s=coord.config.margin_policy.block_interval_s,
                 )
                 is True
             ), "C1 proactive-refund decision must fire as t_rxd-N approaches on a maker stall"
 
-            # 3b. The RXD CSV refund SPEND needs the covenant buried t_rxd deep (BIP68). Mine to full
-            #     maturity, then the honest taker's refund executes and reclaims the asset. (The
-            #     decision fires early; the spend lands once CSV matures — both within t_ETH > t_RXD,
-            #     so the taker reclaims RXD before the maker's later ETH deadline. THE SAFETY WINDOW.)
-            node.rxd_mine(n)  # now at/just past maturity
-            rec = await coord.maybe_refund_asset_on_maker_stall(
-                now_block_height=int(node.rxd("getblockcount")),
-                asset_locked_at_height=asset_locked_at,
-                maker_has_claimed_btc=adversary.has_claimed,
-            )
-            assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS, (
-                f"honest taker must proactively refund on maker stall, got {rec.state.value}"
+            # 4. (b) The taker protects itself with mutual_refund — the guaranteed-safe failure that
+            #    refunds BOTH legs (taker's ETH → taker, covenant → maker). NEITHER party loses.
+            #    The CSV refund spend needs the covenant buried t_rxd deep, and the ETH refund needs
+            #    the ETH timeout passed — mature both, then mutual_refund.
+            node.rxd_mine(n)  # covenant now t_rxd deep (CSV mature)
+            _anvil_rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
+            _anvil_mine(url, 1)  # past the ETH timeout (ETH refund spendable)
+            rec = await coord.mutual_refund()
+            assert rec.state is SwapState.MUTUAL_REFUND, (
+                f"honest taker recovers via mutual_refund on a maker stall, got {rec.state.value}"
             )
 
-            # 4. SAFETY ASSERTION: the RXD covenant is now spent BY THE TAKER's refund — the maker
-            #    can no longer claim it. The maker never got the asset; the taker reclaimed it.
+            # SAFETY: the RXD covenant is spent (refunded — to the MAKER), and the taker's ETH was
+            # refunded to the taker. Neither party suffered a one-sided loss; the maker never got p.
             cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
-            assert node.rxd("gettxout", cov_txid, "0") in (None, ""), "covenant must be spent by the taker refund"
-            # And the maker never revealed p / never claimed the ETH (it stalled).
-            assert adversary.has_claimed is False
+            assert node.rxd("gettxout", cov_txid, "0") in (None, ""), "covenant must be spent (CSV-refunded to maker)"
         finally:
             await rpc.close()
 

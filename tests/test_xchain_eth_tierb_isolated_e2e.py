@@ -38,6 +38,7 @@ from pyrxd.gravity.swap_state import SwapState
 from tests.test_xchain_eth_swap_regtest_e2e import (
     _anvil_mine,
     _anvil_now,
+    _anvil_rpc,
     _build,
     _rxd_pay,
     env,
@@ -167,33 +168,34 @@ class TestEthTierBIsolated:
         finally:
             await rpc.close()
 
-    async def test_isolated_maker_stall_taker_recovers(self, env):
-        """Role-isolated S1: a maker context that STALLS (never claims) — the taker context, seeing no
-        on-chain claim, proactively refunds and reclaims its RXD. The maker never learns it could have
-        griefed because it never gets the taker's secret-dependent state."""
+    async def test_isolated_maker_stall_no_one_sided_loss(self, env):
+        """Role-isolated S1: a maker context that STALLS (never claims, never reveals p). The taker
+        context, seeing no on-chain claim, recovers via mutual_refund — its ETH returns to the taker
+        and the RXD covenant CSV-refunds to the maker (the covenant refund branch pays the MAKER, not
+        the taker). NEITHER party suffers a one-sided loss; p never crossed the wire."""
         node, url = env
-        coord, cov, p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
         terms = coord.record.terms
         wire = _WireBus()
-        maker = _MakerContext(coord, cov, p_secret)
+        maker = _MakerContext(coord, cov, _p)
         taker = _TakerContext(coord)
 
         try:
             maker.publish_envelope(wire, terms)
             await taker.fund_eth(wire, url)
-            locked_at = maker.lock_rxd(node, wire, terms)
+            maker.lock_rxd(node, wire, terms)
             assert await taker.revalidate_lock(wire, url) is SwapState.BOTH_LOCKED
 
-            # The maker STALLS (never calls claim_eth). The taker waits to t_rxd maturity then refunds.
+            # The maker STALLS (never calls claim_eth). The taker recovers safely: mature both legs
+            # (RXD CSV depth + ETH timeout), then mutual_refund refunds BOTH — taker's ETH to taker,
+            # covenant to maker. No one-sided loss.
             node.rxd_mine(terms.t_rxd.value)
-            rec = await coord.maybe_refund_asset_on_maker_stall(
-                now_block_height=int(node.rxd("getblockcount")),
-                asset_locked_at_height=locked_at,
-                maker_has_claimed_btc=False,  # the maker context never claimed
-            )
-            assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
+            _anvil_rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
+            _anvil_mine(url, 1)
+            rec = await coord.mutual_refund()
+            assert rec.state is SwapState.MUTUAL_REFUND
             cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
-            assert node.rxd("gettxout", cov_txid, "0") in (None, ""), "taker reclaimed the RXD covenant"
+            assert node.rxd("gettxout", cov_txid, "0") in (None, ""), "covenant CSV-refunded (to the maker)"
             # The secret p never crossed the wire (only terms + SPK did).
             assert {k for op, k in wire.transcript if op == "put"} == {"terms", "covenant_spk"}
         finally:
