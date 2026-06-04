@@ -7,6 +7,7 @@ you already know the basics and want a focused answer to "how do I X."
 :maxdepth: 1
 
 broadcast-a-transaction
+recover-funds-across-wallet-paths
 migrate-0.4-to-0.5
 verify-an-spv-proof
 spv-verification-pitfalls
@@ -19,6 +20,11 @@ spv-verification-pitfalls
   four common rejection symptoms (`bad-txns-inputs-missingorspent`,
   `txn-mempool-conflict`, `min relay fee not met`,
   `mandatory-script-verify-flag-failed`), and poll for confirmation.
+- **[Recover funds across wallet paths](recover-funds-across-wallet-paths.md)** —
+  when a restored seed shows a zero balance but the explorer shows funds, scan
+  the BIP44 coin-type/account paths (Photonic, Chainbow, Electron, Tangem) to
+  find which derivation actually holds the money. Read-only; `pyrxd wallet
+  recover --scan` or the `pyrxd.hd.discover` API.
 - **[Migrate from pyrxd 0.4.x to 0.5.0](migrate-0.4-to-0.5.md)** — three
   breaking signature changes on the V1 dMint mint path, with
   before/after snippets. Read this first if you upgraded from a 0.4.x
