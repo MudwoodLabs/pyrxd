@@ -11,20 +11,46 @@ Cut 3 (deferred):
 
 from __future__ import annotations
 
+import asyncio
+
 import click
 
 from ..hd.bip39 import mnemonic_from_entropy
+from ..hd.discovery import DEFAULT_ACCOUNTS, DEFAULT_COIN_TYPES, coin_type_label, discover
 from ..hd.wallet import HdWallet
-from ..security.errors import ValidationError
+from ..security.errors import NetworkError, ValidationError
 from ..security.rng import secure_random_bytes
 from .context import CliContext
-from .errors import UserError, WalletDecryptError
-from .format import emit
+from .errors import NetworkBoundaryError, UserError, WalletDecryptError
+from .format import emit, format_photons
 from .prompts import (
     prompt_mnemonic_input,
     prompt_passphrase_input,
     show_mnemonic,
 )
+
+
+def _parse_int_csv(value: str, *, flag: str) -> list[int]:
+    """Parse a comma-separated list of non-negative ints (e.g. ``0,512,236``)."""
+    out: list[int] = []
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError as exc:
+            raise UserError(
+                f"invalid {flag} value {part!r}",
+                cause="expected a comma-separated list of integers",
+                fix=f"e.g. {flag} 0,512,236",
+            ) from exc
+        if n < 0:
+            raise UserError(f"{flag} values must be non-negative (got {n})")
+        out.append(n)
+    if not out:
+        raise UserError(f"{flag} must contain at least one value")
+    return out
 
 
 @click.group(name="wallet")
@@ -243,6 +269,154 @@ def wallet_info(ctx: CliContext, passphrase: bool) -> None:
     ctx_obj.invoke(wallet_load, passphrase=passphrase)
 
 
+@wallet_group.command(name="recover")
+@click.option(
+    "--scan",
+    is_flag=True,
+    default=False,
+    help="Scan multiple BIP44 paths for on-chain history (required; reserved for future modes).",
+)
+@click.option(
+    "--coin-types",
+    default=",".join(str(c) for c in DEFAULT_COIN_TYPES),
+    show_default=True,
+    help="Comma-separated SLIP-0044 coin types to scan (0=legacy/Photonic≤v2/Chainbow, 512=SLIP-0044, 236=old pyrxd).",
+)
+@click.option(
+    "--accounts",
+    default=",".join(str(a) for a in DEFAULT_ACCOUNTS),
+    show_default=True,
+    help="Comma-separated BIP44 account indices to scan.",
+)
+@click.option(
+    "--passphrase/--no-passphrase",
+    default=False,
+    help="Prompt for the BIP39 passphrase if the seed was created with one.",
+)
+@click.pass_obj
+def wallet_recover(ctx: CliContext, scan: bool, coin_types: str, accounts: str, passphrase: bool) -> None:
+    """Find funds across BIP44 derivation paths for a mnemonic (read-only).
+
+    Different Radiant wallets (Photonic, Chainbow, Electron, Tangem) and even
+    different versions of the same wallet derive different addresses from one
+    seed, so a balance can be visible on the explorer yet invisible in a wallet
+    that derives the wrong path. This scans every ``coin_type × account`` pair
+    over both BIP44 chains and reports which derived addresses hold funds.
+
+    Read-only: it never signs or broadcasts. Once it reports a path, sweep with
+    your own wallet, or a separate explicit send.
+    """
+    if not scan:
+        raise UserError(
+            "recover currently supports only --scan mode",
+            cause="the flag was omitted",
+            fix="run `pyrxd wallet recover --scan`",
+        )
+
+    coin_type_list = _parse_int_csv(coin_types, flag="--coin-types")
+    account_list = _parse_int_csv(accounts, flag="--accounts")
+
+    mnemonic = prompt_mnemonic_input()
+    if not mnemonic:
+        raise UserError(
+            "mnemonic is required",
+            cause="no input received",
+            fix="enter the BIP39 mnemonic to recover",
+        )
+    passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default, not a hardcoded secret
+    if passphrase:
+        passphrase_str = prompt_passphrase_input(optional=False)
+
+    # Validate the mnemonic up front so an obvious typo fails fast with a
+    # clean message instead of mid-scan. We never echo the user's input.
+    try:
+        HdWallet.from_mnemonic(mnemonic, passphrase=passphrase_str, coin_type=coin_type_list[0])
+    except (ValidationError, ValueError) as exc:
+        raise WalletDecryptError() from exc
+
+    async def _scan() -> object:
+        client = ctx.make_client()
+        async with client:
+            return await discover(
+                client,
+                mnemonic,
+                passphrase=passphrase_str,
+                coin_types=coin_type_list,
+                accounts=account_list,
+            )
+
+    try:
+        report = asyncio.run(_scan())
+    except NetworkError as exc:
+        raise NetworkBoundaryError(
+            "could not reach ElectrumX during recovery scan",
+            cause=str(exc),
+            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+        ) from exc
+
+    payload = {
+        "network": ctx.network,
+        "found": report.found,  # type: ignore[attr-defined]
+        "total_confirmed_photons": report.total_confirmed,  # type: ignore[attr-defined]
+        "total_unconfirmed_photons": report.total_unconfirmed,  # type: ignore[attr-defined]
+        "scanned": [list(pair) for pair in report.scanned],  # type: ignore[attr-defined]
+        "hits": [
+            {
+                "path": h.path,
+                "coin_type": h.coin_type,
+                "coin_type_label": coin_type_label(h.coin_type),
+                "account": h.account,
+                "change": h.change,
+                "index": h.index,
+                "address": h.address,
+                "confirmed_photons": h.confirmed,
+                "unconfirmed_photons": h.unconfirmed,
+            }
+            for h in report.hits  # type: ignore[attr-defined]
+        ],
+    }
+
+    if ctx.output_mode == "json":
+        click.echo(emit(payload, mode="json"))
+        return
+    if ctx.output_mode == "quiet":
+        click.echo(emit(payload, mode="quiet", quiet_field="total_confirmed_photons"))
+        return
+
+    if not report.found:  # type: ignore[attr-defined]
+        scanned_desc = ", ".join(f"coin {c}/acct {a}" for c, a in report.scanned)  # type: ignore[attr-defined]
+        lines = [
+            "No on-chain history found at any scanned path.",
+            f"  scanned: {scanned_desc}",
+            "",
+            "Next steps:",
+            "  - widen the search: --coin-types 0,512,236 --accounts 0,1,2,3",
+            "  - confirm the funded address on an explorer and check it matches one of these paths",
+            "  - double-check the mnemonic words and order",
+        ]
+        click.echo(emit(payload, mode="human", human_lines=lines))
+        return
+
+    lines = ["Found funds. Recover with the wallet that derives the matching path:", ""]
+    for h in report.hits:  # type: ignore[attr-defined]
+        flag = "" if h.total else "  (history only — 0 balance)"
+        lines.append(f"  {format_photons(h.confirmed)}  {h.path}{flag}")
+        lines.append(f"      coin type {h.coin_type} — {coin_type_label(h.coin_type)}")
+        lines.append(f"      {h.address}")
+    lines.append("")
+    lines.append(f"Total confirmed   {format_photons(report.total_confirmed)}")  # type: ignore[attr-defined]
+    if report.total_unconfirmed:  # type: ignore[attr-defined]
+        lines.append(f"Total pending     {format_photons(report.total_unconfirmed)}")  # type: ignore[attr-defined]
+    click.echo(emit(payload, mode="human", human_lines=lines))
+
+
 # Confirmation helper used by Cut 1 destructive ops outside this module.
 # Re-exported for tests + future cuts.
-__all__ = ["wallet_export_xpub", "wallet_group", "wallet_info", "wallet_load", "wallet_new"]
+__all__ = [
+    "wallet_export_xpub",
+    "wallet_group",
+    "wallet_info",
+    "wallet_load",
+    "wallet_new",
+    "wallet_recover",
+]

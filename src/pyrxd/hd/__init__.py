@@ -19,11 +19,24 @@ from .bip44 import (
     derive_xprv_from_mnemonic,
     derive_xprvs_from_mnemonic,
 )
+from .discovery import (
+    DEFAULT_ACCOUNTS,
+    DEFAULT_COIN_TYPES,
+    DiscoveryHit,
+    DiscoveryReport,
+    coin_type_label,
+    discover,
+)
 from .wallet import AddressRecord, HdWallet
 
 __all__ = [
+    # discovery (multi-path recovery)
+    "DEFAULT_ACCOUNTS",
+    "DEFAULT_COIN_TYPES",
     # wallet
     "AddressRecord",
+    "DiscoveryHit",
+    "DiscoveryReport",
     "HdWallet",
     # bip39
     "WordList",
@@ -37,10 +50,12 @@ __all__ = [
     "bip44_derive_xprv_from_mnemonic",
     "bip44_derive_xprvs_from_mnemonic",
     "ckd",
+    "coin_type_label",
     # bip44
     "derive_xkeys_from_xkey",
     "derive_xprv_from_mnemonic",
     "derive_xprvs_from_mnemonic",
+    "discover",
     "master_xprv_from_seed",
     "mnemonic_from_entropy",
     "seed_from_mnemonic",
