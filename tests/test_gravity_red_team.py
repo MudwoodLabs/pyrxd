@@ -1437,11 +1437,11 @@ class TestAuditFindings2026:
                 btc_satoshis=100_000,
                 btc_chain_anchor=b"\x00" * 32,
                 expected_nbits=b"\xff\xff\x00\x1d",
+                reject_low_difficulty=False,  # regtest nbits; this test targets btc_receive_type, not F-02
                 anchor_height=840_000,
                 merkle_depth=12,
                 claim_deadline=int(time.time()) + 90_000,
                 photons_offered=1_000_000,
-                reject_low_difficulty=False,  # reach the type check, not the F-02 floor (regtest ffff001d)
             )
 
     def test_spv_proof_direct_construction_rejected(self):

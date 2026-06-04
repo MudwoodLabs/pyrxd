@@ -11,9 +11,21 @@ In VSCode, Code Coverage is recorded in config.xml. Delete this file to reset re
 from __future__ import annotations
 
 import os
+import pathlib
+import sys
 
 import pytest
 from _pytest.nodes import Item
+
+# Make ``from tests.X import ...`` resolvable for the integration e2e files that share helpers
+# across test modules. pytest's console-script entrypoint only puts ``src`` on sys.path (pyproject
+# ``pythonpath=["src"]``) and there is no ``tests/__init__.py``, so without this those modules fail
+# to COLLECT under plain ``pytest`` (even though they are deselected as integration) — only
+# ``python -m pytest`` worked, because it adds the CWD. conftest is imported before any test module,
+# so adding the repo root here fixes collection for the whole suite regardless of file order.
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 # Hypothesis profiles for fuzz tests. The default `max_examples` is set per
 # test (via @settings) and aimed at fast CI feedback. The "deep" profile

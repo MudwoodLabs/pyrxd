@@ -206,3 +206,8 @@ poetry.lock
 
 # gravity-ref spike: local keys + ephemeral tx state (never commit)
 docs/brainstorms/gravity-ref-spike/.*
+
+# Private working-space docs (ETH↔RXD HTLC re-audit + Tier-1 plan) — reference the
+# private downstream project; must NOT be committed to public pyrxd.
+docs/brainstorms/2026-05-29-eth-rxd-htlc-reuse-aware-reaudit.md
+docs/plans/2026-05-29-feat-eth-rxd-htlc-tier1-reuse-refactor-plan.md

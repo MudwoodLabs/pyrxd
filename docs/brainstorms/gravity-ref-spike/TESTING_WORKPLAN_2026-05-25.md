@@ -79,10 +79,22 @@ provenance upgrade it buys. Ordered by leverage (value ÷ effort ÷ risk).
   - `Indexer`: `verify_ref` — the R1 gate dependency (resolve a genesis ref to a
     real Glyph reveal via RXinDexer).
   - `SeenStore`: `has_seen` / `mark_seen` — a persistent set (H-freshness).
-- **Effort:** the primitives exist, so this is wrapper + broadcast/UTXO plumbing
-  + a leg-conformance test suite. Estimate deferred to a spike read of the
-  broadcast/UTXO layer (don't trust this number until the actual path is read —
-  doc-derived estimates here have run high).
+- **Effort (spike-grounded 2026-05-25):** SMALL. The spike (read of the network
+  layer) confirmed every dependency already exists and is proven:
+  - `RadiantLeg` → wraps `network/electrumx.py ElectrumXClient` (`broadcast`,
+    `get_utxos`, `get_transaction`, `get_block_header`) + `gravity/transactions.py`
+    covenant builders. `GravityTrade._broadcast_radiant` already shows the pattern.
+  - `BtcLeg` → wraps `btc_wallet/taproot.py` builders + `network/bitcoin.py
+    BtcDataSource` (read: `get_raw_tx`/`get_merkle_proof`/headers). **One gap:**
+    `BtcDataSource` has NO broadcast (read-only mempool.space) — so `BtcLeg`
+    needs a small broadcast adapter (regtest: local Bitcoin node `sendrawtransaction`
+    RPC; mainnet: mempool.space `POST /api/tx` or a node). Thin add, not a blocker.
+  - `Indexer.verify_ref` → `network/rxindexer.py RxinDexerClient.glyph_get_token(ref)`
+    returns the token for a `txid:vout` ref or `None` — exactly the R1 check.
+  - `SeenStore` → trivial persistent set; no infra.
+  So T7 = thin async adapter classes + a SeenStore + a small BTC-broadcast adapter.
+  No new crypto, no new network client. The "legs don't exist" framing made it
+  SOUND large; the hard parts are all already built.
 - **Gate:** this is implementation, ideally after (or alongside) the external
   audit, since it's the code that will move real value. Design-review the leg
   boundary before building — run a DIVERGENT review panel (architecture +

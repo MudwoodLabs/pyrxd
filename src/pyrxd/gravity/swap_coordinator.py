@@ -48,9 +48,12 @@ from pyrxd.btc_wallet.taproot import (
     TimeUnit,
     btc_input_outpoints_from_raw,
 )
+from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import SecretBytes
 
+from .eth_rxd_timelock import CrossClockMargin, assert_covenant_confirms_before_eth_deadline
+from .finality import CounterClaimFinality, CounterClaimState
 from .ref_authenticity import verify_ref_authenticity
 from .swap_state import (
     NegotiatedTerms,
@@ -141,6 +144,13 @@ ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS = 6
 # even a dust run must use >= 2. NOT a configurable knob — it is the fail-closed floor.
 _MIN_REORG_DEPTH_BLOCKS = 2
 
+# Hard safety floor (SECONDS) for the ETH/PoS finalization window. Post-Merge finality is two
+# epochs (2 * 32 slots * 12 s = 768 s) in the steady state; a smaller window collapses the
+# reorg-gate's finalization reserve toward zero. Enforced at MarginPolicy construction whenever
+# eth_finalization_window_s is set (the ETH-swap PRESENCE of the field is enforced fail-closed
+# at SwapCoordinator construction, where the counter chain is known).
+_MIN_ETH_FINALIZATION_WINDOW_S = 768
+
 
 @dataclass(frozen=True)
 class MarginPolicy:
@@ -183,6 +193,20 @@ class MarginPolicy:
     rxd_claim_burial: Timelock = field(
         default_factory=lambda: Timelock(ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS, TimeUnit.BLOCKS)
     )
+    # Finalized-checkpoint (ETH/PoS) counter-leg finalization window, in SECONDS (re-audit §9
+    # #3). For a depth-based (BTC/PoW) leg this stays None and the reorg gate uses
+    # btc_claim_reorg_depth. For an ETH leg — whose finality is a TIME checkpoint, not a block
+    # depth — the gate reserves ceil(eth_finalization_window_s / rxd_block_interval_s) RXD
+    # blocks in the WAIT branch instead. CHOSEN/ESTIMATED (post-Merge ~2 epochs ≈ 12.8 min);
+    # required (non-None) for an ETH (no-depth) finality verdict.
+    eth_finalization_window_s: int | None = None
+    # ETH cross-clock ordering (audit HIGH-1). The pre-fund ordering gate for an ETH swap
+    # validates the ABSOLUTE eth_timeout_unix_s against the RELATIVE t_rxd window via the
+    # cross-clock bridge; it needs the seconds margin budget + the worst-case covenant-
+    # confirmation wait. Required (non-None) for an ETH swap at fund time; None for BTC (which
+    # uses assert_timelock_margin on the same-clock t_btc/t_rxd).
+    cross_clock_margin: CrossClockMargin | None = None
+    max_covenant_confirm_wait_s: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.margin, Timelock):
@@ -218,6 +242,27 @@ class MarginPolicy:
                 "real-value mode (require_measured=True) requires a MEASURED margin; "
                 "the ESTIMATED default is test-only — supply measured block data + reorg depth"
             )
+        if self.eth_finalization_window_s is not None:
+            if (
+                not isinstance(self.eth_finalization_window_s, int)
+                or isinstance(self.eth_finalization_window_s, bool)
+                or self.eth_finalization_window_s <= 0
+            ):
+                raise ValidationError("MarginPolicy.eth_finalization_window_s must be a positive int or None")
+            if self.eth_finalization_window_s < _MIN_ETH_FINALIZATION_WINDOW_S:
+                raise ValidationError(
+                    f"MarginPolicy.eth_finalization_window_s = {self.eth_finalization_window_s}s < safety floor "
+                    f"{_MIN_ETH_FINALIZATION_WINDOW_S}s (~2 post-Merge epochs); a smaller window collapses the "
+                    "finalization reserve in the reorg gate"
+                )
+        if self.cross_clock_margin is not None and not isinstance(self.cross_clock_margin, CrossClockMargin):
+            raise ValidationError("MarginPolicy.cross_clock_margin must be a CrossClockMargin or None")
+        if self.max_covenant_confirm_wait_s is not None and (
+            not isinstance(self.max_covenant_confirm_wait_s, int)
+            or isinstance(self.max_covenant_confirm_wait_s, bool)
+            or self.max_covenant_confirm_wait_s < 0
+        ):
+            raise ValidationError("MarginPolicy.max_covenant_confirm_wait_s must be a non-negative int or None")
 
     @classmethod
     def estimated(cls, *, block_interval_s: float = 600.0, require_measured: bool = False) -> MarginPolicy:
@@ -475,9 +520,21 @@ class ClaimFinality(Enum):
     SQUEEZED = "squeezed"
 
 
+def _reserve_to_blocks(reserve: Timelock, block_interval_s: float) -> int:
+    """Convert a REQUIREMENT/reserve Timelock to BLOCKS, rounding UP for a seconds-tagged value.
+
+    A reserve (claim burial, reorg depth) must round UP: flooring it under-counts the reserve —
+    the UNSAFE direction (audit finality INFO). Identity for a BLOCKS-tagged value. Contrast a
+    DEADLINE like ``t_rxd``, where flooring is safe because it only shrinks the available window.
+    """
+    if reserve.unit is TimeUnit.BLOCKS:
+        return reserve.value
+    return math.ceil(reserve.value / block_interval_s)
+
+
 def assess_claim_finality(
     *,
-    btc_claim_confirmations: int,
+    counter_claim_finality: CounterClaimFinality,
     now_rxd_height: int,
     asset_locked_at_height: int,
     t_rxd: Timelock,
@@ -486,8 +543,9 @@ def assess_claim_finality(
     """Decide SAFE / WAIT / SQUEEZED for the taker's asset claim — fail-closed, pure.
 
     Two serial finality requirements share the ``t_rxd`` deadline (security review):
-      1. the maker's BTC claim must reach ``policy.btc_claim_reorg_depth`` (so ``p`` is
-         reorg-safe), THEN
+      1. the maker's COUNTER-LEG claim must be FINAL (PoW: ``policy.btc_claim_reorg_depth``
+         confirmations deep so ``p`` is reorg-safe; PoS: past the ``finalized`` checkpoint),
+         supplied as a :class:`CounterClaimFinality` verdict, THEN
       2. the taker's own Radiant claim must bury ``policy.rxd_claim_burial`` deep,
       both BEFORE ``t_rxd`` (the maker's CSV refund) opens at
       ``asset_locked_at_height + t_rxd``.
@@ -495,15 +553,17 @@ def assess_claim_finality(
     A bare depth gate without the deadline check is a NET REGRESSION: it can force the
     taker to choose between an unsafe early claim and losing the asset to the maker's
     refund. So this returns WAIT only while there is genuinely room to wait, and
-    SQUEEZED (→ ASSET_VULNERABLE) once there is not.
+    SQUEEZED (→ ASSET_VULNERABLE) once there is not. A counter chain that is not
+    finalizing (verdict ``COUNTER_CHAIN_NOT_FINALIZING``) SQUEEZES — never WAIT.
 
     Raises ``ValidationError`` on any un-evaluable input (never assumes "plenty of
     time"). All depths normalised to Radiant BLOCKS via ``policy.block_interval_s``.
     """
     if not isinstance(policy, MarginPolicy):
         raise ValidationError("assess_claim_finality requires a MarginPolicy")
+    if not isinstance(counter_claim_finality, CounterClaimFinality):
+        raise ValidationError("assess_claim_finality requires a CounterClaimFinality verdict")
     for label, val in (
-        ("btc_claim_confirmations", btc_claim_confirmations),
         ("now_rxd_height", now_rxd_height),
         ("asset_locked_at_height", asset_locked_at_height),
     ):
@@ -521,12 +581,10 @@ def assess_claim_finality(
         )
     try:
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
-        rxd_burial = policy.rxd_claim_burial.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
-        ).value
-        btc_depth_confs = policy.btc_claim_reorg_depth.normalize_to(
-            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
-        ).value
+        # Reserves round UP when seconds-tagged (flooring under-counts a reserve — unsafe);
+        # t_rxd above floors, which is safe for a deadline (only shrinks the window).
+        rxd_burial = _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
+        required_depth_blocks = _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
     except ValidationError:
         raise
     except Exception as exc:  # pragma: no cover - normalize_to only raises ValidationError
@@ -535,24 +593,46 @@ def assess_claim_finality(
     # The maker's CSV refund opens here (Radiant blocks).
     refund_opens_at = asset_locked_at_height + rxd_blocks
     # To claim SAFELY from now we still need: bury our own claim rxd_burial deep,
-    # which (if the BTC claim weren't yet deep) would also require waiting out the
-    # remaining BTC depth first. The binding deadline is refund_opens_at.
+    # which (if the counter-leg claim weren't yet final) would also require waiting out
+    # the remaining counter-chain depth first. The binding deadline is refund_opens_at.
     blocks_left = refund_opens_at - now_rxd_height
 
-    if btc_claim_confirmations >= btc_depth_confs:
-        # BTC claim is reorg-safe. We may claim iff our own burial still fits the window.
+    state = counter_claim_finality.state
+    if state is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING:
+        # RF-06: the counter chain is not advancing finalization — never WAIT on a stall.
+        return ClaimFinality.SQUEEZED
+    if state is CounterClaimState.FINAL:
+        # Counter-leg claim is final/reorg-safe. Claim iff our own burial still fits.
         if blocks_left >= rxd_burial:
             return ClaimFinality.SAFE
         return ClaimFinality.SQUEEZED
-    # BTC claim still shallow. We can WAIT only if, after the BTC depth elapses, there
-    # is STILL room to bury our claim before the refund opens.
-    # F-007: the BTC reorg depth is in BTC blocks; convert the wall-clock it represents
-    # into RXD blocks (the unit of blocks_left) before subtracting. BTC and RXD block
-    # rates differ, so treating BTC blocks 1:1 as RXD blocks under-counts the RXD window
-    # the BTC burial consumes and biases WAIT optimistic. Round UP (conservative).
-    btc_blocks_remaining = btc_depth_confs - btc_claim_confirmations
-    btc_depth_in_rxd = math.ceil(btc_depth_confs * policy.block_interval_s / policy.rxd_block_interval_s)
-    if blocks_left - btc_depth_in_rxd >= rxd_burial and btc_blocks_remaining > 0:
+    # NOT_YET_FINAL_LIVE: the counter-leg claim is not yet final. We can WAIT only if, after
+    # the counter leg finalizes, there is STILL room to bury our own claim before the refund
+    # opens. The RXD-block reserve that finalization consumes is chain-specific:
+    if counter_claim_finality.required_depth is not None:
+        # PoW (depth-based) leg. §9 #2: the verdict's depth MUST equal the policy depth, so the
+        # FINAL decision (driven by the verdict) and this reserve (from the policy) cannot
+        # diverge — fail-closed on a mismatch. The F-007 conversion is otherwise unchanged.
+        if counter_claim_finality.required_depth != required_depth_blocks:
+            raise ValidationError(
+                f"finality verdict required_depth ({counter_claim_finality.required_depth}) != policy "
+                f"reorg depth ({required_depth_blocks}) — refusing to assess on a divergent reserve"
+            )
+        # F-007: the reorg depth is in counter-chain blocks; convert the wall-clock it
+        # represents into RXD blocks before subtracting (the rates differ; round UP).
+        counter_reserve_rxd = math.ceil(required_depth_blocks * policy.block_interval_s / policy.rxd_block_interval_s)
+    else:
+        # Finalized-checkpoint (ETH) leg: finality is a TIME window, not a block depth (§9 #3).
+        if policy.eth_finalization_window_s is None:
+            raise ValidationError(
+                "a finalized-checkpoint (no-depth) finality verdict requires "
+                "policy.eth_finalization_window_s (the counter-chain finalization window)"
+            )
+        # Convert the finalization TIME window into RXD blocks; round UP (ceil) — this is a RESERVE,
+        # so flooring would under-count it and let the gate say WAIT with too little margin. Same
+        # direction as the depth branch above and reserve_to_blocks(); never floor a reserve.
+        counter_reserve_rxd = math.ceil(policy.eth_finalization_window_s / policy.rxd_block_interval_s)
+    if blocks_left - counter_reserve_rxd >= rxd_burial and counter_claim_finality.remaining_positive:
         return ClaimFinality.WAIT
     return ClaimFinality.SQUEEZED
 
@@ -709,7 +789,8 @@ class SwapCoordinator:
         self,
         *,
         record,
-        btc_leg,
+        counter_leg=None,
+        btc_leg=None,
         radiant_leg,
         indexer,
         seen_store,
@@ -722,6 +803,14 @@ class SwapCoordinator:
             raise ValidationError("config must be a CoordinatorConfig")
         if persist is not None and not callable(persist):
             raise ValidationError("persist must be an async callable or None")
+        # Counter leg: the chain-neutral ``counter_leg`` (preferred) OR the legacy
+        # ``btc_leg`` (transitional alias) — exactly one. The BTC path may pass either;
+        # an ETH swap passes ``counter_leg=EthLeg``.
+        if counter_leg is not None and btc_leg is not None:
+            raise ValidationError("pass counter_leg OR btc_leg, not both")
+        leg = counter_leg if counter_leg is not None else btc_leg
+        if leg is None:
+            raise ValidationError("a counter_leg (or btc_leg) is required")
         # SEEN-1 guard: refuse a NON-durable (in-process) seen-store on a
         # value-bearing network unless the operator explicitly accepts it. A
         # non-durable store loses H-freshness on a restart / second process, so a
@@ -729,7 +818,7 @@ class SwapCoordinator:
         # re-open the replay / free-option window. ``durable`` defaults False for
         # any store that does not declare itself durable (fail-closed).
         store_durable = bool(getattr(seen_store, "durable", False))
-        value_bearing = _leg_is_value_bearing(btc_leg) or _leg_is_value_bearing(radiant_leg)
+        value_bearing = _leg_is_value_bearing(leg) or _leg_is_value_bearing(radiant_leg)
         if value_bearing and not store_durable and not config.accept_nondurable_seen:
             raise ValidationError(
                 "seen-store is NON-durable (in-process only) but the coordinator is wired to a "
@@ -738,17 +827,57 @@ class SwapCoordinator:
                 "CoordinatorConfig(accept_nondurable_seen=True) to consciously accept "
                 "non-durability for a single-process, single-shot, fresh-H-per-run runbook."
             )
+        # ETH (finalized-checkpoint) counter leg requires a finalization window on the policy
+        # (audit finality/fsm fail-closed-at-setup): the reorg gate's no-depth WAIT-branch
+        # reserve is derived from eth_finalization_window_s. Without it the gate can only fail
+        # at claim time — the worst moment. The counter chain is known here, so refuse now.
+        if record.terms.counter_chain != "btc" and config.margin_policy.eth_finalization_window_s is None:
+            raise ValidationError(
+                f"counter_chain={record.terms.counter_chain!r} (finalized-checkpoint leg) requires "
+                "MarginPolicy.eth_finalization_window_s to be set; the reorg gate's finalization reserve "
+                "depends on it — refusing to construct a coordinator that can only fail at claim time"
+            )
+        # ETH proactive-refund window must DOMINATE the finality+burial reserve (red-team HIGH: a maker
+        # can time its reveal into a SQUEEZE window the taker cannot safely act in if the C1 window N is
+        # decoupled from the ETH finality reserve). N must give the taker enough RXD blocks to (a) wait
+        # out ETH finalization AND (b) bury its own RXD claim reorg-deep before t_rxd matures — else the
+        # proactive-refund decision and the reorg-gate squeeze disagree. Enforced fail-closed for a
+        # REAL-VALUE config (is_measured); an estimated/test config (is_measured=False) is an explicit
+        # placeholder whose margin magnitudes are operator-accepted-risk (same discipline as the margin
+        # itself), so the floor is advisory there — a real-value swap MUST be is_measured=True.
+        if record.terms.counter_chain != "btc" and config.margin_policy.is_measured:
+            mp = config.margin_policy
+            fin_reserve_blocks = math.ceil(mp.eth_finalization_window_s / mp.rxd_block_interval_s)
+            # Use the SAME burial reserve the reorg gate uses (assess_claim_finality:
+            # _reserve_to_blocks(policy.rxd_claim_burial, ...)) — NOT the hardcoded estimate (red-team
+            # LOW): an operator who measures a burial != 6 would otherwise get a floor that blesses an
+            # N the gate's actual (larger) squeeze reserve makes insufficient — false assurance.
+            burial_blocks = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
+            min_n = fin_reserve_blocks + burial_blocks - 1
+            if config.maker_stall_safety_window_blocks < min_n:
+                raise ValidationError(
+                    f"maker_stall_safety_window_blocks={config.maker_stall_safety_window_blocks} is below the "
+                    f"ETH finality+burial reserve floor {min_n} (= ceil(eth_finalization_window_s "
+                    f"{mp.eth_finalization_window_s}/rxd_block_interval_s {mp.rxd_block_interval_s})={fin_reserve_blocks} "
+                    f"+ burial {burial_blocks} - 1); a maker could time its reveal into a "
+                    "SQUEEZE window the taker cannot safely act in — raise N or shrink the window"
+                )
         # One coordinator instance = one swap. This lock serializes the FSM-advancing
         # steps (see @_serialized_step) so a future concurrent driver cannot interleave
         # a check-then-advance across an await on a single instance.
         self._step_lock = asyncio.Lock()
         self.record = record
-        self.btc_leg = btc_leg
+        self.counter_leg = leg
         self.radiant_leg = radiant_leg
         self.indexer = indexer
         self.seen_store = seen_store
         self.config = config
         self._persist = persist
+
+    @property
+    def btc_leg(self):
+        """Transitional alias for ``counter_leg`` (the chain-neutral counter leg)."""
+        return self.counter_leg
 
     # -- internal: advance + persist-shape ----------------------------------
     def _advance(self, event: SwapEvent) -> SwapState:
@@ -773,8 +902,8 @@ class SwapCoordinator:
             await self._persist(record)
 
     # -- pre-BTC-lock gate (H4 a) -------------------------------------------
-    async def pre_btc_lock_check(self, terms: NegotiatedTerms) -> PreBtcLockGate:
-        """Validate everything the taker can check BEFORE funding BTC (fail-closed).
+    async def pre_btc_lock_check(self, terms: NegotiatedTerms, *, now_unix_s: int | None = None) -> PreBtcLockGate:
+        """Validate everything the taker can check BEFORE funding the counter leg (fail-closed).
 
         Checks, in order (any failure => do NOT fund):
           1. REF authenticity via ``verify_ref_authenticity`` — the resolved reveal
@@ -784,13 +913,18 @@ class SwapCoordinator:
           2. H freshness — a read-only advisory probe of the seen-store (reused H
              => reject early). The authoritative atomic reserve happens later, in
              :meth:`taker_funds_btc`, immediately before the broadcast.
-          3. The cross-chain margin ordering (``t_btc - t_rxd >= margin``).
+          3. The cross-chain timelock ordering. BTC: the same-clock margin
+             ``t_btc - t_rxd >= margin``. ETH: the cross-clock gate that validates the
+             ABSOLUTE ``eth_timeout_unix_s`` leaves room for the RELATIVE ``t_rxd`` window
+             (needs ``now_unix_s``; audit HIGH-1). The orphaned bridge is wired here.
           4. Maker-*promised* params match the locally re-derived BTC funding SPK
              (the on-chain re-validation happens later in
              :meth:`post_asset_lock_revalidate`).
 
-        Async because binding (1) awaits the async indexer adapter (a sync gate
-        would leak a truthy un-awaited coroutine = fail-OPEN, T7 plan D2).
+        ``now_unix_s`` is the caller's wall-clock (the ``now_rxd_height`` precedent: the
+        coordinator takes clocks as params, never reads them) — REQUIRED for an ETH swap,
+        ignored for BTC. Async because binding (1) awaits the async indexer adapter (a sync
+        gate would leak a truthy un-awaited coroutine = fail-OPEN, T7 plan D2).
         """
         if not isinstance(terms, NegotiatedTerms):
             raise ValidationError("pre_btc_lock_check requires NegotiatedTerms")
@@ -817,16 +951,20 @@ class SwapCoordinator:
         except Exception as exc:
             return PreBtcLockGate(ok=False, reason=f"seen-store unavailable; fail-closed ({exc})")
 
-        # 3. Margin / ordering (fail-closed; raises on un-normalisable units).
+        # 3. Cross-chain timelock ordering (fail-closed). BTC: same-clock margin. ETH: the
+        #    cross-clock gate against the ABSOLUTE eth_timeout_unix_s (audit HIGH-1).
         try:
-            assert_timelock_margin(terms.t_btc, terms.t_rxd, self.config.margin_policy)
+            if terms.counter_chain == "btc":
+                assert_timelock_margin(terms.t_btc, terms.t_rxd, self.config.margin_policy)
+            else:
+                self._assert_eth_timelock_ordering(terms, now_unix_s=now_unix_s)
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"margin check failed: {exc}")
 
         # 4. Maker-promised BTC params match locally re-derived funding SPK.
         try:
-            expected_spk = self.btc_leg.derive_funding_scriptpubkey(terms)
-            promised_spk = self.btc_leg.promised_funding_scriptpubkey(terms)
+            expected_spk = self.counter_leg.derive_funding_scriptpubkey(terms)
+            promised_spk = self.counter_leg.promised_funding_scriptpubkey(terms)
         except Exception as exc:
             return PreBtcLockGate(ok=False, reason=f"could not derive BTC funding SPK; fail-closed ({exc})")
         if expected_spk != promised_spk:
@@ -834,19 +972,55 @@ class SwapCoordinator:
 
         return PreBtcLockGate(ok=True)
 
-    # -- taker funds BTC first (the role invariant's step 2) ----------------
+    def _assert_eth_timelock_ordering(self, terms: NegotiatedTerms, *, now_unix_s: int | None) -> None:
+        """ETH cross-clock ordering gate (audit HIGH-1) — wires the previously-orphaned
+        :mod:`pyrxd.gravity.eth_rxd_timelock` bridge into the live pre-fund path.
+
+        The HTLC ordering invariant requires the counter-leg (ETH) refund to open strictly
+        AFTER the asset (RXD) refund, minus the cross-clock margin. For ETH the real deadline
+        is the ABSOLUTE ``terms.eth_timeout_unix_s`` (a contract immutable), NOT the relative
+        ``t_btc`` placeholder — so the BTC-shaped ``assert_timelock_margin(t_btc, t_rxd)`` is
+        the WRONG gate here. We instead project where the RXD CSV refund opens (covenant mines
+        ~``now + max_covenant_confirm_wait`` then counts ``t_rxd`` blocks) and refuse unless it
+        lands before ``eth_timeout - margin``. This also closes the now-vs-timeout grief: an
+        already-expired or near-expiry ``eth_timeout_unix_s`` makes the projected open exceed
+        the deadline, so the gate refuses to fund. Fail-closed on any missing input.
+        """
+        policy = self.config.margin_policy
+        if now_unix_s is None:
+            raise ValidationError("an ETH swap requires now_unix_s (wall-clock) to validate cross-clock ordering")
+        if terms.eth_timeout_unix_s is None:
+            raise ValidationError("ETH swap missing eth_timeout_unix_s (the absolute refund deadline)")
+        if policy.cross_clock_margin is None or policy.max_covenant_confirm_wait_s is None:
+            raise ValidationError(
+                "ETH swap requires MarginPolicy.cross_clock_margin and max_covenant_confirm_wait_s "
+                "for the cross-clock ordering gate"
+            )
+        assert_covenant_confirms_before_eth_deadline(
+            now_unix_s=now_unix_s,
+            eth_timeout_unix_s=terms.eth_timeout_unix_s,
+            margin=policy.cross_clock_margin,
+            t_rxd=terms.t_rxd,
+            rxd_block_interval_s=policy.rxd_block_interval_s,
+            max_covenant_confirm_wait_s=policy.max_covenant_confirm_wait_s,
+        )
+
+    # -- taker funds the counter leg first (the role invariant's step 2) ----------------
     @_serialized_step
-    async def taker_funds_btc(self, terms: NegotiatedTerms) -> SwapRecord:
-        """Run the pre-lock gate, fund the BTC HTLC, record the locator, advance.
+    async def taker_funds_btc(self, terms: NegotiatedTerms, *, now_unix_s: int | None = None) -> SwapRecord:
+        """Run the pre-lock gate, fund the counter-leg HTLC, record the locator, advance.
 
         Refuses (raises) if the pre-lock gate fails — the taker NEVER funds against a
         failed gate. H is ATOMICALLY reserved in the seen-store PRE-broadcast (so a
-        concurrent or repeat funder of the same H is refused before any BTC moves;
-        TOCTOU-1), and the durable record carries the full :class:`BtcHtlcLocator`.
+        concurrent or repeat funder of the same H is refused before any value moves;
+        TOCTOU-1), and the durable record carries the full counter-leg locator.
 
-        Atomicity (kieran-python HIGH): ``btc_leg.fund`` broadcasts on-chain, so a
+        ``now_unix_s`` is the caller's wall-clock — REQUIRED for an ETH swap (the cross-clock
+        timelock-ordering gate, audit HIGH-1), ignored for BTC (byte-equivalent).
+
+        Atomicity (kieran-python HIGH): ``counter_leg.fund`` broadcasts on-chain, so a
         cancellation between the broadcast and the in-memory state advance would
-        leave BTC locked but the record at NEGOTIATED → a retry double-funds. We
+        leave value locked but the record at NEGOTIATED → a retry double-funds. We
         persist an INTENT record (terms + derived funding SPK, enough to recover the
         address) BEFORE the awaited fund, and ``asyncio.shield()`` the post-broadcast
         persist of the funded record. ``fund`` itself must be idempotent (treat
@@ -855,7 +1029,7 @@ class SwapCoordinator:
         """
         if self.record.state is not SwapState.NEGOTIATED:
             raise ValidationError(f"taker_funds_btc only valid from NEGOTIATED, not {self.record.state.value}")
-        gate = await self.pre_btc_lock_check(terms)
+        gate = await self.pre_btc_lock_check(terms, now_unix_s=now_unix_s)
         if not gate.ok:
             raise ValidationError(f"pre-BTC-lock gate refused funding: {gate.reason}")
 
@@ -878,23 +1052,26 @@ class SwapCoordinator:
         if not reserved:
             raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
 
-        locator = await self.btc_leg.fund(terms)
-        if not isinstance(locator, BtcHtlcLocator):
-            raise ValidationError("btc_leg.fund must return a BtcHtlcLocator (full durable retained state)")
-        # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits
-        # to the taptree, NOT the output value, so the funding SPK check in
-        # pre_btc_lock_check (step 4) cannot catch a wrong amount — this is the only
-        # layer that can. An OVER-funded HTLC is a one-sided taker loss: the maker
-        # claims the whole output via the preimage (the claim leaf does not cap value).
-        # Under-funding is self-correcting (the maker won't reveal), but we reject both
-        # so a mutated `terms` or a buggy leg fails closed before the BTC is locked.
-        if locator.amount_sats != terms.btc_sats:
+        locator = await self.counter_leg.fund(terms)
+        if not isinstance(locator, (BtcHtlcLocator, EthHtlcLocator)):
+            raise ValidationError("counter_leg.fund must return a Btc/Eth HtlcLocator (full durable retained state)")
+        # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits to
+        # the taptree, NOT the output value (and an ETH HTLC contract address commits to
+        # immutables, not the funded balance), so the funding-target check in
+        # pre_btc_lock_check (step 4) cannot catch a wrong amount — this is the only layer
+        # that can. An OVER-funded HTLC is a one-sided taker loss: the maker claims the
+        # whole output via the preimage (the claim leaf does not cap value). Under-funding
+        # is self-correcting (the maker won't reveal), but we reject both so a mutated
+        # `terms` or a buggy leg fails closed before the counter leg is locked. The leg
+        # reports the funded amount in its own unit (sats / wei) via ``locked_amount``.
+        funded = self.counter_leg.locked_amount(locator)
+        if funded != terms.value_amount:
             raise ValidationError(
-                f"funded BTC amount {locator.amount_sats} != negotiated btc_sats {terms.btc_sats}; "
+                f"funded counter-leg amount {funded} != negotiated value_amount {terms.value_amount}; "
                 "refusing to lock a mis-valued HTLC"
             )
         # (H was already reserved atomically pre-broadcast above — no post-fund mark.)
-        self.record = self.record.with_btc_lock(locator)
+        self.record = self.record.with_counter_lock(locator)
         self._advance(SwapEvent.TAKER_FUNDS_BTC)
         # Shielded: the BTC is locked on-chain now; losing this write would
         # double-fund on retry, so it must complete even under cancellation.
@@ -902,8 +1079,42 @@ class SwapCoordinator:
         return self.record
 
     # -- post-asset-lock re-validation (H4 b) -------------------------------
+    def _assert_eth_lock_timing_still_safe(self, *, now_unix_s: int | None) -> None:
+        """Post-confirm cross-clock recheck (audit re-verify HIGH) — the bridge's prescribed
+        SECOND run (:func:`assert_covenant_confirms_before_eth_deadline` docstring).
+
+        The pre-fund ordering gate (:meth:`_assert_eth_timelock_ordering`) projects where the
+        RXD CSV refund opens from the TAKER's fund time. But the MAKER locks the covenant at a
+        maker-controlled time and can STALL the broadcast — pushing the ACTUAL rxd-refund-open
+        (covenant_mining_time + t_rxd) past that projection and collapsing the cross-clock
+        margin. We re-run the gate here at the ACTUAL lock time with
+        ``max_covenant_confirm_wait_s = 0`` (the covenant is confirmed now). If the margin no
+        longer holds we refuse to advance to BOTH_LOCKED — the taker must refund the counter
+        leg rather than proceed into the reopened one-sided-loss window. Fail-closed.
+        """
+        policy = self.config.margin_policy
+        terms = self.record.terms
+        if now_unix_s is None:
+            raise ValidationError(
+                "an ETH swap requires now_unix_s at covenant-lock revalidation (post-confirm cross-clock recheck)"
+            )
+        if terms.eth_timeout_unix_s is None:
+            raise ValidationError("ETH swap missing eth_timeout_unix_s (the absolute refund deadline)")
+        if policy.cross_clock_margin is None:
+            raise ValidationError("ETH swap requires MarginPolicy.cross_clock_margin for the post-confirm recheck")
+        assert_covenant_confirms_before_eth_deadline(
+            now_unix_s=now_unix_s,
+            eth_timeout_unix_s=terms.eth_timeout_unix_s,
+            margin=policy.cross_clock_margin,
+            t_rxd=terms.t_rxd,
+            rxd_block_interval_s=policy.rxd_block_interval_s,
+            max_covenant_confirm_wait_s=0,  # the covenant is CONFIRMED now — no future wait budget
+        )
+
     @_serialized_step
-    async def post_asset_lock_revalidate(self, observed_covenant_spk: bytes) -> SwapRecord:
+    async def post_asset_lock_revalidate(
+        self, observed_covenant_spk: bytes, *, now_unix_s: int | None = None
+    ) -> SwapRecord:
         """Re-check the on-chain covenant SPK == expected-from-terms+H.
 
         Called when the maker locks the asset. The expected SPK is recomputed from
@@ -911,6 +1122,11 @@ class SwapCoordinator:
         amount/dest-hashes/REF into the covenant bytecode). On match => BOTH_LOCKED.
         On mismatch => PARAMS_MISMATCH; the caller then refunds the BTC via the
         timelock leg (see :meth:`taker_refund_btc`).
+
+        ``now_unix_s`` is the caller's wall-clock at the moment the covenant lock is observed —
+        REQUIRED for an ETH swap (the post-confirm cross-clock recheck against a stalled maker
+        lock; audit re-verify HIGH), ignored for BTC. On an ETH timing failure this refuses to
+        advance to BOTH_LOCKED (raises) so the taker refunds the counter leg.
 
         Async because the Radiant leg reads chain state (expected-SPK derivation +
         covenant outpoint lookup) over the async indexer/node.
@@ -936,12 +1152,90 @@ class SwapCoordinator:
             self._advance(SwapEvent.MAKER_LOCKS_WRONG_PARAMS)
             await self._persist_record(self.record, shield=True)
             return self.record
+        # ETH post-confirm gate (audit re-verify HIGH + red-team HIGH): the SPK is right, but for an
+        # ETH counter leg two more things must hold before BOTH_LOCKED — which is the precondition
+        # for maker_claims_btc (the p-reveal). (1) The maker's counter-funding verification MUST have
+        # run and must STILL hold, re-checked here pinned to finality so a reorg cannot have replaced
+        # the taker's deploy after it was verified (the TOCTOU). (2) A maker who DELAYED the covenant
+        # broadcast may have collapsed the cross-clock margin the pre-fund gate projected. Either
+        # failure refuses BOTH_LOCKED (persist for recovery + raise) so the maker never reveals p
+        # against an unverified/reorg-replaced or timing-collapsed counter leg — it refunds the
+        # covenant via CSV instead of entering the one-sided-loss window.
+        if self.record.terms.counter_chain != "btc":
+            await self._assert_eth_counter_funding_verified(now_unix_s=now_unix_s)
         self._advance(SwapEvent.MAKER_LOCKS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record
 
-    # -- maker claims BTC, revealing p (role invariant step 4) --------------
+    async def _assert_eth_counter_funding_verified(self, *, now_unix_s: int | None) -> None:
+        """ETH-leg precondition for BOTH_LOCKED (red-team HIGH): the maker-side counter-funding gate
+        must be enforced, not optional. We REQUIRE a verified EthHtlcLocator on the record (so
+        ``maker_verify_counter_funding`` cannot be skipped on the two-party maker path — advancing to
+        the reveal-enabling BOTH_LOCKED without it is impossible) and RE-RUN the verification here,
+        pinned to the ``finalized`` checkpoint for a real-value (``is_measured``) swap, so a reorg
+        cannot have re-deployed a DIFFERENT contract at the same CREATE address between the maker's
+        verify and this RXD lock (the verify->lock TOCTOU; an estimated/test config re-binds at
+        'latest', same is_measured discipline as the N-floor + cross-clock margin). Finally re-check
+        the cross-clock timing. Any failure persists for recovery and raises (fail-closed)."""
+        locator = self.record.counterchain_locator
+        if not isinstance(locator, EthHtlcLocator):
+            await self._persist_record(self.record, shield=True)
+            raise ValidationError(
+                "ETH counter-funding was never verified (no EthHtlcLocator on record); "
+                "maker_verify_counter_funding MUST run before locking RXD — refusing BOTH_LOCKED "
+                "(the maker should refund the covenant via CSV)"
+            )
+        verify = getattr(self.counter_leg, "verify_counterparty_funded", None)
+        if verify is None:
+            await self._persist_record(self.record, shield=True)
+            raise ValidationError("counter_leg does not implement verify_counterparty_funded; fail-closed")
+        block_id = "finalized" if self.config.margin_policy.is_measured else None
+        try:
+            reverified = await verify(locator.contract_address, self.record.terms, block_identifier=block_id)
+            self.record = self.record.with_counter_lock(reverified)
+            self._assert_eth_lock_timing_still_safe(now_unix_s=now_unix_s)
+        except ValidationError:
+            await self._persist_record(self.record, shield=True)
+            raise
+
+    # -- maker verifies the taker's counter-leg HTLC before locking the asset (red-team CRITICAL) --
     @_serialized_step
+    async def maker_verify_counter_funding(self, counter_contract_address: str) -> SwapRecord:
+        """MAKER-side fail-closed gate (red-team CRITICAL fix): the maker MUST verify the
+        TAKER-deployed counter-leg HTLC binds to the negotiated terms + the maker's own payout
+        config BEFORE the maker locks the asset (funds the RXD covenant). Returns on success
+        (recording the verified locator on the record so :meth:`maker_claims_btc` can claim it);
+        RAISES on any mismatch — the maker MUST NOT lock the asset if this raises.
+
+        WHY THIS EXISTS: the runbook is TAKER-funds-counter-FIRST, MAKER-locks-asset-SECOND. For a
+        BTC counter leg the funding target is a pure function of terms, so the coordinator's
+        ``derive==promised`` pre-fund gate + the funding reader already bind it. For an ETH counter
+        leg there is NO pre-fund commitment — the contract does not exist until the taker deploys it
+        — so ``EthHtlcContractLeg.verify_funded`` is the ONLY thing binding the taker's contract to
+        terms, and it previously ran ONLY inside the taker's own ``fund()``. Without this maker-side
+        call a hostile taker deploys ``claimant=self`` (or underfunds / sets a bad timeout) and the
+        honest maker locks the asset for nothing — a one-sided maker loss reachable in the intended
+        two-party flow. The maker passes ONLY the contract ADDRESS (the one untrusted input from the
+        taker); the leg builds the EXPECTED locator from the maker's own config and verifies the
+        chain matches it.
+
+        ``counter_contract_address`` is the address the taker advertises for its deployed HTLC."""
+        terms = self.record.terms
+        if terms.counter_chain != "eth":
+            raise ValidationError(
+                "maker_verify_counter_funding is for an ETH counter leg; a BTC counter leg's funding "
+                "target is pre-derivable and bound by the derive==promised gate"
+            )
+        verify = getattr(self.counter_leg, "verify_counterparty_funded", None)
+        if verify is None:
+            raise ValidationError("counter_leg does not implement verify_counterparty_funded; fail-closed")
+        # Raises on any mismatch (wrong claimant/refundee/H/timeout/amount/logic). The maker MUST NOT
+        # lock the asset if this raises.
+        locator = await verify(counter_contract_address, terms)
+        self.record = self.record.with_counter_lock(locator)
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
     async def maker_claims_btc(self, preimage: SecretBytes) -> SwapRecord:
         """Maker spends the BTC claim leaf with ``p`` (revealing it), then zeroizes p.
 
@@ -957,13 +1251,13 @@ class SwapCoordinator:
             raise ValidationError(f"maker_claims_btc only valid from BOTH_LOCKED, not {self.record.state.value}")
         if not isinstance(preimage, SecretBytes):
             raise ValidationError("preimage must be SecretBytes (in-memory only; never persisted)")
-        if self.record.btc_locator is None:
+        if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; cannot claim")
         raw = preimage.unsafe_raw_bytes()
         if hashlib.sha256(raw).digest() != self.record.terms.hashlock:
             raise ValidationError("preimage does not hash to the negotiated H; refusing to broadcast")
         try:
-            await self.btc_leg.claim(self.record.btc_locator, raw)
+            await self.counter_leg.claim(self.record.counterchain_locator, raw)
         finally:
             preimage.zeroize()
         self._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
@@ -980,7 +1274,7 @@ class SwapCoordinator:
         is the witness-side cross-swap-replay defence that complements the admission-side
         seen-store. Fail-closed on a missing locator or an unparseable tx.
         """
-        locator = self.record.btc_locator
+        locator = self.record.counterchain_locator
         if locator is None:
             raise ValidationError("no BTC locator on record; cannot verify claim-tx provenance")
         expected = locator.funding_outpoint.prevout_bytes()
@@ -1028,14 +1322,24 @@ class SwapCoordinator:
         ``now_rxd_height`` / ``asset_locked_at_height`` feed the squeeze (the Radiant
         clock; ``asset_locked_at_height`` is where the maker locked the covenant).
         ``scrape_secret`` is sync; the depth read + Radiant claim are awaited.
+
+        **ETH counter leg.** For an ETH↔RXD swap the maker's claim is referenced by a tx
+        HASH (carried in ``maker_claim_tx_bytes``), not raw witness bytes: the flow
+        dispatches to :meth:`_taker_scrape_and_claim_eth`, which fetches calldata+logs,
+        scrapes ``p``, runs the ETH provenance gate (R6) and the finalized-checkpoint reorg
+        gate. The BTC body below is unchanged and byte-for-byte identical to its proven form.
         """
+        if self.record.terms.counter_chain != "btc":
+            return await self._taker_scrape_and_claim_eth(
+                maker_claim_tx_bytes, now_rxd_height=now_rxd_height, asset_locked_at_height=asset_locked_at_height
+            )
         if self.record.state is not SwapState.SECRET_REVEALED:
             raise ValidationError(
                 f"taker_scrape_and_claim_asset only valid from SECRET_REVEALED, not {self.record.state.value}"
             )
         # Cheap, no-network checks first: a tx that doesn't even contain p is rejected
         # before any RPC round-trip.
-        p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
+        p = self.counter_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
         # Provenance: the tx we scraped p from must spend OUR funding outpoint (defends
@@ -1044,13 +1348,18 @@ class SwapCoordinator:
 
         # Reorg gate: read the maker's BTC-claim depth (fail-closed on any error) and
         # assess against the t_rxd window.
-        btc_confs = await self.btc_leg.confirmations_of_claim(maker_claim_tx_bytes)
+        btc_confs = await self.counter_leg.confirmations_of_claim(maker_claim_tx_bytes)
+        policy = self.config.margin_policy
+        required_depth = policy.btc_claim_reorg_depth.normalize_to(
+            TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s
+        ).value
+        verdict = CounterClaimFinality.from_btc_depth(btc_confs, required_depth)
         finality = assess_claim_finality(
-            btc_claim_confirmations=btc_confs,
+            counter_claim_finality=verdict,
             now_rxd_height=now_rxd_height,
             asset_locked_at_height=asset_locked_at_height,
             t_rxd=self.record.terms.t_rxd,
-            policy=self.config.margin_policy,
+            policy=policy,
         )
         if finality is ClaimFinality.WAIT:
             logger.info(
@@ -1076,6 +1385,75 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
+    async def _taker_scrape_and_claim_eth(
+        self, claim_tx_hash, *, now_rxd_height: int, asset_locked_at_height: int
+    ) -> SwapRecord:
+        """ETH variant of :meth:`taker_scrape_and_claim_asset` (called within the held step
+        lock, so NOT itself ``@_serialized_step``). The maker's claim is an on-chain ETH tx
+        referenced by ``claim_tx_hash``; the secret lives in its calldata/logs, its finality is
+        the post-Merge ``finalized`` checkpoint (no confirmation depth), and provenance is the
+        per-swap-unique HTLC contract address (R6), the ETH analogue of the BTC funding outpoint.
+
+        Same gate ORDER and SAFE/WAIT/SQUEEZED semantics as the BTC path: scrape ``p`` and
+        RE-verify ``sha256(p)==H``; run the provenance gate; then the ``t_rxd``-squeeze
+        assessment over the ETH finality verdict. The Radiant claim only fires on SAFE.
+        """
+        if self.record.state is not SwapState.SECRET_REVEALED:
+            raise ValidationError(
+                f"taker_scrape_and_claim_asset only valid from SECRET_REVEALED, not {self.record.state.value}"
+            )
+        locator = self.record.counterchain_locator
+        if not isinstance(locator, EthHtlcLocator):
+            raise ValidationError("ETH claim flow requires an EthHtlcLocator on the record")
+        # Fetch the candidate blobs (calldata + log data) and scrape p by sha256==H (never by
+        # offset); the coordinator RE-verifies sha256(p)==H — a value that does not open H is rejected.
+        artifacts = await self.counter_leg.fetch_claim_artifacts(claim_tx_hash)
+        p = self.counter_leg.scrape_secret(artifacts, self.record.terms.hashlock)
+        if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+            raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
+        # Provenance (R6): the claim tx must target OUR HTLC contract instance and emit the
+        # revealed secret p (the Claimed(p) event) from it — defends cross-swap replay even if
+        # H is reused via a path the seen-store does not cover (the ETH analogue of
+        # _assert_claim_tx_spends_our_htlc). Binds the SECRET p, not the public H.
+        await self.counter_leg.assert_claim_provenance(
+            claim_tx_hash, contract_address=locator.contract_address, preimage=bytes(p)
+        )
+        # Reorg gate: the ETH finalized-checkpoint verdict (no depth) feeds the t_rxd squeeze.
+        # NOTE (RF-06): this point-in-time producer only ever returns FINAL or NOT_YET_FINAL_LIVE
+        # — never COUNTER_CHAIN_NOT_FINALIZING — so an actual ETH finalization STALL degrades to
+        # WAIT-until-the-window-closes (still SAFE: never claims off a non-final reveal), not an
+        # early SQUEEZE. Timely stall handling needs the deferred polling driver to inject the
+        # stall verdict; the assess_claim_finality stall branch is unreachable via this path alone.
+        verdict = await self.counter_leg.claim_finality_verdict(claim_tx_hash)
+        finality = assess_claim_finality(
+            counter_claim_finality=verdict,
+            now_rxd_height=now_rxd_height,
+            asset_locked_at_height=asset_locked_at_height,
+            t_rxd=self.record.terms.t_rxd,
+            policy=self.config.margin_policy,
+        )
+        if finality is ClaimFinality.WAIT:
+            logger.info(
+                "reorg gate WAIT: maker ETH claim not yet finalized but t_rxd window has room — "
+                "not claiming yet, retry later"
+            )
+            return self.record  # unchanged; stays SECRET_REVEALED
+        if finality is ClaimFinality.SQUEEZED:
+            logger.warning(
+                "reorg gate SQUEEZED: maker ETH claim not finalized and t_rxd window closing — "
+                "advancing to ASSET_VULNERABLE; a winner-take-all claim is now a deliberate "
+                "policy decision (taker_claim_asset_from_vulnerable), not automatic"
+            )
+            self._advance(SwapEvent.TAKER_OFFLINE_OR_PINNED)
+            await self._persist_record(self.record, shield=True)
+            return self.record
+
+        # SAFE: the ETH claim is finalized and our own RXD burial still fits the window.
+        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
     # -- deliberate winner-take-all claim from the SQUEEZED/ASSET_VULNERABLE state --
     @_serialized_step
     async def taker_claim_asset_from_vulnerable(self, maker_claim_tx_bytes: bytes) -> SwapRecord:
@@ -1086,15 +1464,43 @@ class SwapCoordinator:
         the maker's ``t_rxd`` CSV refund lands, accepting the residual reorg risk that
         the gate flagged. It is a CONSCIOUS choice the caller makes after the gate
         refused the automatic SAFE claim — never invoked silently.
+
+        For an ETH counter leg ``maker_claim_tx_bytes`` carries the maker's ETH claim tx
+        hash; the scrape + provenance gate dispatch to the ETH path. The BTC body below is
+        byte-for-byte unchanged.
         """
+        if self.record.terms.counter_chain != "btc":
+            return await self._taker_claim_eth_from_vulnerable(maker_claim_tx_bytes)
         if self.record.state is not SwapState.ASSET_VULNERABLE:
             raise ValidationError(
                 f"taker_claim_asset_from_vulnerable only valid from ASSET_VULNERABLE, not {self.record.state.value}"
             )
-        p = self.btc_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
+        p = self.counter_leg.scrape_secret(maker_claim_tx_bytes, self.record.terms.hashlock)
         if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
             raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
         self._assert_claim_tx_spends_our_htlc(maker_claim_tx_bytes)
+        await self.radiant_leg.claim_asset(self.record, bytes(p))
+        self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
+    async def _taker_claim_eth_from_vulnerable(self, claim_tx_hash) -> SwapRecord:
+        """ETH variant of the deliberate winner-take-all claim (within the held step lock).
+        Same explicit ASSET_VULNERABLE-only gate; fetch+scrape p, provenance gate (R6), claim."""
+        if self.record.state is not SwapState.ASSET_VULNERABLE:
+            raise ValidationError(
+                f"taker_claim_asset_from_vulnerable only valid from ASSET_VULNERABLE, not {self.record.state.value}"
+            )
+        locator = self.record.counterchain_locator
+        if not isinstance(locator, EthHtlcLocator):
+            raise ValidationError("ETH claim flow requires an EthHtlcLocator on the record")
+        artifacts = await self.counter_leg.fetch_claim_artifacts(claim_tx_hash)
+        p = self.counter_leg.scrape_secret(artifacts, self.record.terms.hashlock)
+        if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+            raise ValidationError("scraped preimage does not hash to H; refusing Radiant claim")
+        await self.counter_leg.assert_claim_provenance(
+            claim_tx_hash, contract_address=locator.contract_address, preimage=bytes(p)
+        )
         await self.radiant_leg.claim_asset(self.record, bytes(p))
         self._advance(SwapEvent.TAKER_SCRAPES_P_CLAIMS_ASSET)
         await self._persist_record(self.record, shield=True)
@@ -1110,6 +1516,15 @@ class SwapCoordinator:
         Drives BOTH_LOCKED -> MAKER_STALLS -> ASSET_REFUNDED_TAKER_ACTS. A no-op
         (returns the unchanged record) when the trigger has not fired yet. Async
         because the asset refund broadcasts a Radiant covenant spend.
+
+        RUNBOOK SCOPE (red-team MEDIUM): this refunds ONLY the RXD covenant, whose CSV refund pays
+        the MAKER in BOTH directions (the maker owns the asset leg; p is not yet public) — it is NOT
+        a "taker reclaims the covenant" action (an earlier note wrongly said the taker owns it; the
+        covenant CLAIM pays the taker, the CSV REFUND pays the maker, same as eth_rxd_timelock.py).
+        It is sufficient stall recovery only when the OTHER party's value is independently
+        recoverable on its own leg. In the ETH<->RXD runbook the taker's value sits in the ETH HTLC,
+        which this method does NOT touch, so the correct ETH stall recovery is :meth:`mutual_refund`
+        (refunds BOTH legs after both timeouts) — NOT this method. Do not wire it into the ETH stall path.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(
@@ -1125,10 +1540,13 @@ class SwapCoordinator:
         )
         if not trigger:
             return self.record
-        self._advance(SwapEvent.MAKER_STALL_DETECTED)
-        await self._persist_record(self.record, shield=True)
-        # The taker refunds the asset rather than wait (NEVER waits).
+        # BROADCAST-THEN-ADVANCE (red-team LOW): advancing to MAKER_STALLS before the on-chain
+        # refund broadcast wedges the swap there (maybe_refund is only valid from BOTH_LOCKED) if
+        # the broadcast transiently fails. Broadcast FIRST — a raising refund leaves the record at
+        # BOTH_LOCKED and the call is safely retryable — then advance both FSM steps + persist once
+        # (matches taker_refund_btc / mutual_refund). The taker refunds rather than wait (NEVER waits).
         await self.radiant_leg.refund_asset(self.record)
+        self._advance(SwapEvent.MAKER_STALL_DETECTED)
         self._advance(SwapEvent.TAKER_REFUNDS_ASSET_PROACTIVELY)
         await self._persist_record(self.record, shield=True)
         return self.record
@@ -1146,9 +1564,9 @@ class SwapCoordinator:
         state = self.record.state
         if state not in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
             raise ValidationError(f"taker_refund_btc not valid from {state.value}")
-        if self.record.btc_locator is None:
+        if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; cannot refund (state was lost)")
-        await self.btc_leg.refund(self.record.btc_locator, self.record.terms.t_btc)
+        await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
         if state is SwapState.BTC_LOCKED:
             self._advance(SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT)
         else:
@@ -1167,9 +1585,9 @@ class SwapCoordinator:
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(f"mutual_refund only valid from BOTH_LOCKED, not {self.record.state.value}")
-        if self.record.btc_locator is None:
+        if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; BTC would strand (state was lost)")
-        await self.btc_leg.refund(self.record.btc_locator, self.record.terms.t_btc)
+        await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
         await self.radiant_leg.refund_asset(self.record)
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
         await self._persist_record(self.record, shield=True)

@@ -1,7 +1,7 @@
 {
   "meta": {
     "generated_by": "pyrxd-timelock bridge script (Photonic interop)",
-    "photonic_lib_path": "/home/eric/apps/Photonic-Wallet/packages/lib",
+    "photonic_lib_path": "Photonic-Wallet/packages/lib",
     "generated_at": "2026-05-18T04:35:37.104Z",
     "notes": "All vectors produced by calling Photonic's actual source files (not a re-implementation). Inputs are deterministic; outputs are recorded for pyrxd to assert byte-equality. Regenerate when Photonic's spec changes."
   },

@@ -7,21 +7,26 @@ chains for the full picture), and anyone who's seen the phrase
 "sentinel-artifact path mainnet-proven" and wondered what it
 actually means.
 
-**Status:** sentinel-path swaps proven on mainnet. Other covenant
-variants are experimental and not yet validated for real funds.
+**Status:** Gravity has two cross-chain constructions. The
+**SPV-oracle** path (sentinel-artifact covenant) is proven on mainnet
+but is **payment-verified, not atomic** — see the honest limitation
+below. The **HTLC** path (hashlock + relative-timelock) is the
+atomic construction; its full cross-chain flow has been demonstrated
+end-to-end on mainnet as a **proof-of-mechanism with test-size funds,
+and is NOT yet audited or production-ready** (external audit of
+cross-chain atomicity is a hard gate before any real-value use).
 
 ## What Gravity is
 
-Gravity is a cross-chain atomic swap protocol. It lets two parties
-trade RXD on Radiant for BTC on Bitcoin (or vice versa) without a
-centralized exchange, without trusting each other, and without one
-party being able to run off with the other's coins.
+Gravity is a cross-chain swap protocol. It lets two parties trade RXD
+on Radiant for BTC on Bitcoin (or vice versa) without a centralized
+exchange and without custody. There are two designs, and they differ
+in one crucial property — whether the BTC leg has a refund path.
 
-Mechanics in plain terms:
+### Path A — SPV-oracle (payment-verified, NOT atomic)
 
 1. Alice has RXD, wants BTC. Bob has BTC, wants RXD.
-2. Alice locks her RXD into a special on-chain contract on Radiant
-   (a "covenant" — see below).
+2. Alice locks her RXD into a covenant on Radiant.
 3. The covenant releases Alice's RXD to Bob **only when Bob proves on
    the Radiant chain that he has paid the agreed BTC** to Alice's
    address on Bitcoin. The proof is an SPV (Simplified Payment
@@ -29,14 +34,50 @@ Mechanics in plain terms:
    inclusion.
 4. If Bob never delivers the BTC, Alice can reclaim her RXD after a
    timeout via the covenant's `forfeit` path.
-5. No exchange. No custody. No KYC. The chain itself is the escrow.
+
+**Honest limitation (load-bearing):** Bob's BTC payment goes to a
+**plain address with no refund path**. The SPV proof is a
+one-directional oracle ("did this payment happen?"), so this is
+**payment-verified, not atomic**: if Bob's payment is mined late or
+Alice set a tight deadline, Bob can lose the BTC *and* get no RXD (the
+deadline-race). No Radiant-side change can give Bob recourse, because
+the irreversibility is on the Bitcoin side. The SPV machinery is
+sound; the *swap built on a plain-address payment* is not atomic.
+
+### Path B — HTLC (atomic)
+
+The BTC goes into a **script-controlled Taproot output** with two
+spend paths — claim-with-preimage and refund-after-timeout — and both
+legs are bound by **one secret** (`H = sha256(p)`, using Radiant's
+Bitcoin-compatible `OP_SHA256`; no adaptor signatures needed). The
+asset is released on preimage reveal; each side can refund via a
+relative timelock (`tx.age` / CSV on Radiant, CSV on Bitcoin) if the
+other never proceeds. **Worst case is "both refund and walk away
+whole" — never one-sided loss.** Its cost is a retained-state
+obligation: the refunding party (or a watchtower) must keep the
+refund key + script and broadcast the refund if the happy path
+stalls, and the client must verify the timelock ordering (BTC refund
+timeout > Radiant claim deadline) before funding.
 
 The conceptual lineage runs through Bitcoin's HTLCs (Lightning), the
 Decred / Litecoin atomic swap work, and SPV-anchored DeFi
-constructions on Bitcoin Cash. Gravity is the Radiant-specific
-expression of that pattern.
+constructions on Bitcoin Cash.
 
 ## Supported counterparty chains
+
+> **Note — this section is about the SPV-oracle path (Path A).** Chain
+> support there is governed by the SPV verifier's PoW check (SHA-256d).
+> The **HTLC path (Path B) has a different gate: it requires the
+> counterparty chain to support tapscript HTLC outputs (BIP341
+> Taproot).** As built, `btc_wallet/taproot.py` always emits a P2TR
+> (`bc1p…` bech32m) HTLC output, so the atomic path works on **Bitcoin**
+> (Taproot active since 2021) and any BIP341-capable chain — but **not**
+> on chains without Taproot (e.g. BCH), which would need a P2SH/P2WSH
+> HTLC variant instead. So a chain can be SPV-path-supported yet not
+> HTLC-path-supported, and vice versa. (Funding the HTLC and receiving
+> claim/refund are *not* Taproot-restricted — any wallet can send to a
+> `bc1p` address, and destinations may be P2PKH/P2WPKH/P2SH/P2TR; only
+> the HTLC contract output itself is Taproot.)
 
 Gravity's SPV verifier is chain-agnostic for **SHA-256d UTXO chains**
 by deliberate design. The verifier checks proof-of-work as

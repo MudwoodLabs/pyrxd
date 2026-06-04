@@ -476,8 +476,9 @@ def build_gravity_offer(
     # A real mainnet nBits passes the default difficulty-1 floor; only a
     # difficulty-1-class commit (ffff001d) is rejected, so regtest/test offers using
     # ffff001d must pass reject_low_difficulty=False. Any covenant-LESS retained use
-    # (bridge-in/oracle/gate) should ALSO pass min_difficulty_nbits sourced from the
-    # live anchor-height network header — the default (difficulty-1) floor is only a
+    # (bridge-in/oracle/gate) MUST keep reject_low_difficulty=True AND source
+    # min_difficulty_nbits from the live anchor-height network header — the default
+    # (difficulty-1) floor is only a
     # footgun guard, not a meaningful network-difficulty enforcement (audit F-01
     # remains: this is a build-time guard, not a difficulty oracle).
     from pyrxd.security.types import Nbits as _Nbits
