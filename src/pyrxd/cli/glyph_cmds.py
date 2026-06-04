@@ -171,18 +171,6 @@ def _read_metadata_file(path: Path) -> GlyphMetadata:
         ) from exc
 
 
-def _broadcast_or_explain(ctx: CliContext, client: ElectrumXClient, raw: bytes) -> str:
-    """Broadcast *raw* via *client*, surface NetworkError as exit-code-2."""
-    try:
-        return str(asyncio.get_event_loop().run_until_complete(client.broadcast(raw)) if False else "")
-    except NetworkError as exc:
-        raise NetworkBoundaryError(
-            "broadcast failed",
-            cause=str(exc),
-            fix=f"check that {ctx.electrumx_url} is reachable and try again",
-        ) from exc
-
-
 def _select_funding_utxo(wallet: HdWallet, client: ElectrumXClient, min_photons: int) -> tuple[FtUtxo, str, PrivateKey]:
     """Pick the smallest UTXO across the wallet that's >= min_photons.
 
