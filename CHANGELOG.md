@@ -4,6 +4,115 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] — 2026-06-04
+
+First release since 0.5.1 — 108 commits. The headline is **multi-path HD
+wallet recovery**; alongside it ship WAVE + RXinDexer support, a
+Photonic-compatible TIMELOCK protocol, a dmint subpackage refactor, and
+broad SPV/parser hardening. This release also includes **experimental,
+pre-audit cross-chain HTLC atomic-swap engines** (BTC↔RXD, ETH↔RXD) and a
+swap watchtower — see the dedicated section below; these are not for
+production use until externally audited.
+
+No breaking changes to the stable public API: everything is additive, and
+the dmint subpackage split preserved existing `pyrxd.glyph` /
+`pyrxd.glyph.dmint` import paths.
+
+### Added
+
+#### HD wallet — multi-path recovery / account discovery
+
+- `pyrxd wallet recover --scan` — read a BIP39 mnemonic and scan every
+  `coin_type × account` pair across both BIP44 chains, reporting which
+  derived addresses actually hold on-chain history and balance. Solves the
+  "balance shows on the explorer but my wallet says empty" problem that
+  arises because different wallets derive different addresses from the same
+  seed — coin type `0` (legacy / Photonic ≤ v2 / Chainbow), `512`
+  (SLIP-0044), `236` (older pyrxd). Read-only by design: it never signs or
+  broadcasts; the mnemonic is prompted with hidden input and is never
+  echoed, stored, or transmitted — only derived addresses (as scripthashes)
+  reach the network. `--coin-types` and `--accounts` widen or narrow the
+  search; `--json` for machine output.
+- `pyrxd.hd.discovery` — public `discover()`, `DiscoveryReport`,
+  `DiscoveryHit`, and `coin_type_label`, with `DEFAULT_COIN_TYPES =
+  (0, 512, 236)` and `DEFAULT_ACCOUNTS = (0, 1, 2)` as the single source of
+  truth for the default search space.
+
+#### Glyph — WAVE + RXinDexer client
+
+- `pyrxd.glyph.wave` — Photonic-compatible WAVE CBOR encoding plus
+  `RxinDexerClient` for indexer-backed queries (#102).
+
+#### Glyph — Photonic-compatible TIMELOCK protocol (REP-3009)
+
+- TIMELOCK token-protocol support (`pyrxd.glyph.timelock`,
+  `timelock_reveal_tx`) compatible with Photonic's REP-3009 (#106).
+
+#### Glyph — mainnet golden vectors
+
+- Wire-format builders pinned to real on-chain bytes: CBOR payload (#125),
+  commit-script FT + NFT (#126), NFT locking script (#127).
+
+### Changed
+
+- `pyrxd.glyph.dmint` is now a four-submodule subpackage, split from the
+  former monolithic `dmint.py` (#109). Public import paths are unchanged.
+- Glyph parsing: extracted a shared input-ref opcode walker and added
+  `PolicyRejection` (#107); de-duplicated `hashOutputHashes` and hardened
+  output parsing (#124).
+
+### Fixed
+
+- Miner: parallel-miner workers are now terminated on every exit path,
+  fixing orphaned multiprocessing workers left behind on early exit (#116).
+
+### Security
+
+- SPV primitives: red-team hardening plus swap-coordinator / data-source
+  follow-ups (#138); secure-by-default and further hardening covering
+  findings F-02/F-09/F-12/F-16/F-17/F-26 (#142); live-regtest consensus
+  validation of deployed covenant semantics across the V/NB/M/S matrix
+  (#143).
+- Fixed a transitive `idna` DoS via a batched dependency update (#144).
+- Defense-in-depth secret scanning (trufflehog, #118) and tightened CI
+  token scopes + CodeQL security-extended (#157).
+
+### Performance
+
+- ~52× faster SPV-related tests by pre-mining synthetic-block PoW headers
+  (#108); halved the CI test job via header-grind memoization and
+  dependency caching (#140).
+
+### Experimental — pre-audit, NOT for production
+
+These components ship for testing and integration only. The cross-chain
+atomic-swap and watchtower code has **not** cleared an external security
+audit. Do not use it to move real value beyond throwaway amounts.
+
+- **Gravity BTC↔RXD HTLC atomic-swap engine** — async coordinator, BTC and
+  Radiant legs, a five-binding REF gate, and a reorg-finality gate;
+  exercised on regtest and a dust mainnet run (#137).
+- **ETH↔RXD HTLC atomic swap** — ETH leg and coordinator integration;
+  red-team-fixed but pre-audit (#155).
+- **HTLC swap watchtower v1** — alert-only, BTC-first; holds no keys and
+  never broadcasts (#156).
+
+### Dependencies & tooling
+
+- Batched Dependabot updates across the cycle (#144, #146, #150, #153, and
+  others); dev tooling moved to mypy `^2.1.0` (#150) and sphinx `^8`
+  (#115). Added a manual Combine-PRs workflow (#154). Python support is
+  unchanged: `>=3.10,<4.0`.
+
+### Docs
+
+- New tutorials (your first transaction #87, mint from a V1 dMint contract
+  #85, inspect a transaction in the browser #82), how-to guides (broadcast
+  a transaction #83, scan an address for Glyphs #84, BIP143 sighash quirks
+  #86, verify an SPV proof #88, SPV verification pitfalls #139), and
+  concept explainers (Glyph structures #121, V1 dMint mechanics #77,
+  external miner protocol #78).
+
 ## [0.5.1] — 2026-05-13
 
 Audit follow-ups + new SDK primitives. No breaking changes; everything
