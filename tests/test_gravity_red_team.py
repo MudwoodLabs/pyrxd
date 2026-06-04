@@ -82,11 +82,11 @@ def _valid_offer_kwargs() -> dict[str, Any]:
         btc_satoshis=100_000,
         btc_chain_anchor=bytes(32),
         expected_nbits=bytes.fromhex("ffff001d"),
-        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
         anchor_height=800_000,
         merkle_depth=12,
         claim_deadline=_future_deadline(48),
         photons_offered=10_000_000,
+        reject_low_difficulty=False,  # regtest offer uses difficulty-1 ffff001d (F-02 opt-out)
     )
 
 
@@ -127,11 +127,11 @@ def _make_real_offer(priv: PrivateKeyMaterial, **overrides: Any) -> GravityOffer
         btc_satoshis=100_000,
         btc_chain_anchor=bytes([0xDD]) * 32,
         expected_nbits=bytes.fromhex("ffff001d"),
-        reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
         anchor_height=800_000,
         merkle_depth=12,
         claim_deadline=_future_deadline(48),
         photons_offered=500_000,
+        reject_low_difficulty=False,  # regtest offer uses difficulty-1 ffff001d (F-02 opt-out)
     )
     defaults.update(overrides)
     return build_gravity_offer(**defaults)
@@ -1325,11 +1325,11 @@ class TestTakerIndependentClaimedRedeem:
                 btc_satoshis=100_000,
                 btc_chain_anchor=bytes([0xDD]) * 32,
                 expected_nbits=bytes.fromhex("ffff001d"),
-                reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
                 anchor_height=800_000,
                 merkle_depth=12,
                 claim_deadline=_future_deadline(48),
                 photons_offered=500_000,
+                reject_low_difficulty=False,  # regtest ffff001d (F-02 opt-out)
             )
 
         o1 = _build(t1)
@@ -1355,11 +1355,11 @@ class TestTakerIndependentClaimedRedeem:
                 btc_satoshis=100_000,
                 btc_chain_anchor=bytes([0xDD]) * 32,
                 expected_nbits=bytes.fromhex("ffff001d"),
-                reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
                 anchor_height=800_000,
                 merkle_depth=12,
                 claim_deadline=deadline,
                 photons_offered=500_000,
+                reject_low_difficulty=False,  # regtest ffff001d (F-02 opt-out)
             )
 
         o1 = _build(_future_deadline(48))
@@ -1731,12 +1731,12 @@ class TestPerOfferReceiveDerivation:
             btc_satoshis=100_000,
             btc_chain_anchor=b"\x11" * 32,
             expected_nbits=bytes.fromhex("ffff001d"),
-            reject_low_difficulty=False,  # regtest difficulty-1 nBits (F-02 secure default is True)
             anchor_height=800_000,
             merkle_depth=12,
             claim_deadline=_future_deadline(48),
             photons_offered=10_000_000,
             covenant_artifact_name="maker_covenant_6x12_p2wpkh",
+            reject_low_difficulty=False,  # regtest ffff001d (F-02 opt-out)
         )
 
     def test_distinct_indices_yield_distinct_covenants(self):

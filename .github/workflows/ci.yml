@@ -30,10 +30,20 @@ jobs:
         # versions back to this matrix.
         python-version: ["3.12"]
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
         with:
           python-version: ${{ matrix.python-version }}
+      # Cache Poetry's downloads + resolved virtualenv, keyed on the lock file,
+      # so `poetry install --sync` skips re-downloading/rebuilding native wheels
+      # on every run. A cache miss just falls back to a normal cold install.
+      - name: Cache Poetry packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-py${{ matrix.python-version }}-
       - name: Install Poetry
         # Hash-pinned via ci/poetry-pin.txt. Closes the OpenSSF Scorecard
         # / CodeQL PinnedDependenciesID alert. See ci/README.md for how
@@ -41,12 +51,13 @@ jobs:
         run: pip install -r ci/poetry-pin.txt --require-hashes
       - name: Install dependencies
         run: poetry install --sync --no-interaction
-      - name: Run tests
-        run: poetry run pytest tests/ -v --tb=short
+      # The full-suite coverage run below is the canonical pass/fail gate. A
+      # separate non-coverage `pytest tests/` run was redundant (same tests) and
+      # re-ran the slowest tests a second time, so it was dropped.
       - name: Security module coverage (must be 100%)
         run: poetry run pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100
-      - name: Overall coverage (must be 85%)
-        run: poetry run pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85
+      - name: Tests + overall coverage (must be 85%)
+        run: poetry run pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85 --tb=short
       - name: Bandit security scan
         run: poetry run bandit -r src/ -c pyproject.toml
       - name: Type check

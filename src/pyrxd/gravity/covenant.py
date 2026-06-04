@@ -377,7 +377,10 @@ def build_gravity_offer(
         retained uses (bridge-in / oracle / gate) MUST set this True** — and SHOULD
         also pass ``min_difficulty_nbits``, because the default floor (difficulty-1)
         only blocks the difficulty-1 class, not a target merely easier than mainnet.
-        Defaults False to preserve regtest/test behavior.
+        Defaults **True** (secure-by-default, audit 2026-05-29 F-02 follow-up): a real
+        mainnet nBits is far harder than difficulty-1 so it passes the default floor;
+        only a difficulty-1-class commit (``ffff001d``) is rejected. Pass
+        ``reject_low_difficulty=False`` for regtest/test offers that use ``ffff001d``.
     :param min_difficulty_nbits: Optional 4-byte wire nBits defining the difficulty
         floor used when ``reject_low_difficulty`` is True. Source this from the live
         block header at ``anchor_height`` for a real network-difficulty floor; if
@@ -469,12 +472,13 @@ def build_gravity_offer(
     # difficulty-1-class footgun. ffff001d is the genesis/regtest min difficulty
     # and the default in older examples; a min-difficulty commit lets an attacker
     # mine a fake header chain off the real anchor for ~$0.
-    # NOTE: reject_low_difficulty defaults to TRUE (secure-by-default, F-02 follow-up;
-    # restored after a branch regression flipped it to False). regtest/test offers that
-    # commit difficulty-1 nBits (ffff001d) must pass reject_low_difficulty=False
-    # explicitly. Any covenant-LESS retained use (bridge-in/oracle/gate) MUST keep
-    # reject_low_difficulty=True AND source min_difficulty_nbits from the live
-    # anchor-height network header — the default (difficulty-1) floor is only a
+    # NOTE: reject_low_difficulty defaults to TRUE (secure-by-default, F-02 follow-up).
+    # A real mainnet nBits passes the default difficulty-1 floor; only a
+    # difficulty-1-class commit (ffff001d) is rejected, so regtest/test offers using
+    # ffff001d must pass reject_low_difficulty=False. Any covenant-LESS retained use
+    # (bridge-in/oracle/gate) MUST keep reject_low_difficulty=True AND source
+    # min_difficulty_nbits from the live anchor-height network header — the default
+    # (difficulty-1) floor is only a
     # footgun guard, not a meaningful network-difficulty enforcement (audit F-01
     # remains: this is a build-time guard, not a difficulty oracle).
     from pyrxd.security.types import Nbits as _Nbits
@@ -590,7 +594,7 @@ def build_gravity_offer_derived(
     accept_short_deadline: bool = False,
     covenant_artifact_name: str = "maker_covenant_flat_12x20_sentinel_all",
     offer_artifact_name: str = "maker_offer",
-    reject_low_difficulty: bool = False,
+    reject_low_difficulty: bool = True,
     min_difficulty_nbits: bytes | None = None,
 ) -> tuple[Any, Any]:
     """Build an offer whose BTC receive address is DERIVED per-offer (replay-safe).

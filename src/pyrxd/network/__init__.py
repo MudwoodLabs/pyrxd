@@ -14,6 +14,7 @@ from .bitcoin import (
     MempoolSpaceSource,
     MultiSourceBtcDataSource,
     MultiSourceBtcFundingReader,
+    choose_funding_reader,
 )
 from .chaintracker import ChainTracker
 from .electrumx import ElectrumXClient
@@ -27,4 +28,5 @@ __all__ = [
     "MempoolSpaceSource",
     "MultiSourceBtcDataSource",
     "MultiSourceBtcFundingReader",
+    "choose_funding_reader",
 ]

@@ -9,6 +9,7 @@ you already know the basics and want a focused answer to "how do I X."
 broadcast-a-transaction
 migrate-0.4-to-0.5
 verify-an-spv-proof
+spv-verification-pitfalls
 ```
 
 ## Available now
@@ -28,6 +29,12 @@ verify-an-spv-proof
   Covers the raise-on-failure `verify_tx_in_block` recipe, fetching a
   proof from ElectrumX / mempool.space, common failure modes, and the
   covenant-bound `SpvProofBuilder` flow.
+- **[SPV verification pitfalls](spv-verification-pitfalls.md)** — the
+  non-obvious ways an SPV verifier stays insecure *even after* it
+  "checks the Merkle proof": the missing difficulty floor, confirmation
+  depth from a reported height, the 64-byte node and coinbase-position
+  forgeries, quorum-is-not-a-forgery-defense, and what to differential-test.
+  Implementation-agnostic; the companion *why* to the *how* above.
 
 ## Coming soon
 

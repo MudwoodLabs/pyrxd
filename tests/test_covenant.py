@@ -321,7 +321,7 @@ class TestBuildGravityOffer:
             claim_deadline=_future_deadline(48),
             photons_offered=10_000_000,
             accept_short_deadline=False,
-            reject_low_difficulty=False,  # regtest ffff001d; F-02 secure default is True (overridden below)
+            reject_low_difficulty=False,  # regtest offer uses difficulty-1 ffff001d (F-02 opt-out)
         )
 
     def test_returns_gravity_offer(self):
@@ -363,19 +363,27 @@ class TestBuildGravityOffer:
         # expected_nbits_next defaults to expected_nbits when not supplied.
         assert offer.expected_nbits_next == kwargs["expected_nbits"]
 
-    def test_reject_low_difficulty_rejects_min_diff(self):
-        """F-02: with reject_low_difficulty=True, a difficulty-1-class nBits
-        (the ffff001d footgun) is rejected at offer construction by the default floor."""
+    def test_reject_low_difficulty_default_rejects_min_diff(self):
+        """F-02 follow-up: reject_low_difficulty now defaults TRUE, so a difficulty-1-
+        class nBits (the ffff001d footgun) is rejected WITHOUT an explicit flag."""
         kwargs = self._offer_kwargs()  # expected_nbits is ffff001d (difficulty-1 target)
+        del kwargs["reject_low_difficulty"]  # exercise the secure default (True)
         with pytest.raises(ValidationError, match="at or above the floor"):
-            build_gravity_offer(**{**kwargs, "reject_low_difficulty": True})
+            build_gravity_offer(**kwargs)
 
     def test_reject_low_difficulty_allows_real_nbits(self):
-        """F-02: a real mainnet-difficulty nBits passes the floor."""
+        """F-02: a real mainnet-difficulty nBits passes the floor (under the default)."""
         kwargs = self._offer_kwargs()
+        del kwargs["reject_low_difficulty"]  # default True
         kwargs["expected_nbits"] = bytes.fromhex("19420317")  # real block-840000 nBits (exp 0x17)
-        offer = build_gravity_offer(**{**kwargs, "reject_low_difficulty": True})
+        offer = build_gravity_offer(**kwargs)
         assert offer.expected_nbits == bytes.fromhex("19420317")
+
+    def test_opt_out_allows_min_diff(self):
+        """F-02: reject_low_difficulty=False (the regtest opt-out) accepts ffff001d."""
+        kwargs = self._offer_kwargs()  # already sets reject_low_difficulty=False
+        offer = build_gravity_offer(**kwargs)
+        assert offer.expected_nbits == bytes.fromhex("ffff001d")
 
     def test_min_difficulty_nbits_floor_decodes_target_not_exponent(self):
         """F-02 (verification follow-up): the floor is a DECODED-TARGET comparison,
@@ -386,16 +394,16 @@ class TestBuildGravityOffer:
         easy = bytes.fromhex("ffff7f1c")  # exp 0x1c, mantissa 0x7fffff — harder than diff-1 but still easy
         # Default floor (difficulty-1) is coarse: it accepts this (documents the gap).
         kwargs = self._offer_kwargs()
+        del kwargs["reject_low_difficulty"]  # default True
         kwargs["expected_nbits"] = easy
-        offer = build_gravity_offer(**{**kwargs, "reject_low_difficulty": True})
+        offer = build_gravity_offer(**kwargs)
         assert offer.expected_nbits == easy
         # A real anchor-sourced floor rejects it (target easier-or-equal than the floor).
         kwargs2 = self._offer_kwargs()
+        del kwargs2["reject_low_difficulty"]
         kwargs2["expected_nbits"] = easy
         with pytest.raises(ValidationError, match="at or above the floor"):
-            build_gravity_offer(
-                **{**kwargs2, "reject_low_difficulty": True}, min_difficulty_nbits=bytes.fromhex("19420317")
-            )
+            build_gravity_offer(**kwargs2, min_difficulty_nbits=bytes.fromhex("19420317"))
 
     def test_malformed_nbits_rejected(self):
         """F-27: an nBits exponent above 0x1d (covenant tolerates up to 0x20) is

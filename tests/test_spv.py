@@ -26,9 +26,9 @@ from pyrxd.spv import (
     strip_witness,
     verify_chain,
     verify_header_pow,
-    verify_payment,
     verify_tx_in_block,
 )
+from pyrxd.spv.payment import verify_payment  # demoted from the package namespace (F-09)
 
 # --------------------------------------------------------------------------- fixtures
 
