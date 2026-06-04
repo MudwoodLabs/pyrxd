@@ -1,10 +1,9 @@
 # CodeQL scan configuration for pyrxd.
 #
-# codeql.yml runs the 'security-and-quality' suite, which adds code-quality
-# queries on top of the security ones. Those quality queries generate a lot of
-# low-value noise on throwaway spike scripts and demo code that is not part of
-# the shipped library/CLI. Exclude those non-shipped paths so the Security tab
-# reflects code that actually runs in production, tests, and operational scripts.
+# codeql.yml runs the 'security-extended' suite (security only — the code-quality
+# queries are intentionally NOT used; ruff/mypy/bandit own quality/style and run
+# pre-merge). These path excludes keep the Security tab focused on code that
+# actually runs in production, tests, and operational scripts.
 #
 # Still scanned: src/, tests/, scripts/ (the latter includes real-value run
 # harnesses worth auditing).

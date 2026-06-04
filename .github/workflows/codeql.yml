@@ -36,9 +36,14 @@ jobs:
         uses: github/codeql-action/init@87557b9c84dde89fdd9b10e88954ac2f4248e463  # v4.36.1
         with:
           languages: python
-          # security-and-quality includes the security-extended ruleset plus
-          # additional code-quality queries. Worth the extra 30s on a small lib.
-          queries: security-and-quality
+          # security-extended (NOT security-and-quality): the full security ruleset
+          # WITHOUT the code-quality queries. ruff (B/SIM/F families), mypy and bandit
+          # already own the quality/style space and run in `task ci` + the pre-push hook,
+          # so the quality queries are redundant — they only re-surface, POST-merge, the
+          # residue ruff can't model (idiomatic `...` Protocol stubs, pytest.raises,
+          # deliberately `# noqa`'d code) as recurring false-positive noise. Keep security
+          # coverage here; catch quality issues pre-merge where they belong.
+          queries: security-extended
           # Excludes non-shipped spike/demo dirs from scanning (see config).
           config-file: ./.github/codeql/codeql-config.yml
 
