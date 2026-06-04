@@ -325,6 +325,17 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         )
         print(f"  -> {rec.state.value} (ETH HTLC: {rec.counterchain_locator.contract_address})")
 
+        # 1b. MAKER verifies the taker-deployed ETH HTLC binds to terms BEFORE locking RXD
+        #     (red-team CRITICAL/HIGH). In a real TWO-PARTY flow this is the maker's go/no-go gate —
+        #     it fails closed if the taker deployed claimant=self / underfunded / bad timeout, so the
+        #     maker never locks RXD for nothing. (Here, single-operator, taker_funds_btc already set
+        #     the locator and post_asset_lock_revalidate re-verifies pinned to finality as a backstop;
+        #     we still run it explicitly to exercise the gate and document the two-party step.)
+        confirm("maker_verify_counter_funding: verify the on-chain ETH HTLC pays the maker", auto_yes=args.yes)
+        rec = await coord.maker_verify_counter_funding(rec.counterchain_locator.contract_address)
+        report.step(name="maker_verify_counter_funding", chain="eth", state=rec.state.value)
+        print(f"  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
+
         # 2. Maker locks the RXD covenant on MAINNET (operator pays the SPK); taker re-validates.
         print(f"\n  Fund the RXD covenant SPK on MAINNET as the maker (>= 1 conf):\n    {cov.funded_spk.hex()}")
         rxd_locked_at = rxd_blockcount(rxd_client)

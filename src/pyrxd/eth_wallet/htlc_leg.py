@@ -47,13 +47,19 @@ _MAX_ARTIFACT_TOTAL_BYTES = 256 * 1024
 
 
 def _b(v: Any) -> bytes:
-    """Coerce a hex string ('0x..' or '..') or bytes-like to bytes; None/'' -> b''."""
+    """Coerce a hex string ('0x..' or '..') or bytes-like to bytes; None/'' -> b''.
+
+    A non-hex string raises a TYPED NetworkError (red-team LOW: these values come from RPC-returned
+    log topics/data, so bytes.fromhex's bare ValueError is an untyped-error-contract gap)."""
     if v is None:
         return b""
     if isinstance(v, (bytes, bytearray)):
         return bytes(v)
     s = str(v)
-    return bytes.fromhex(s[2:] if s.startswith("0x") else s)
+    try:
+        return bytes.fromhex(s[2:] if s.startswith("0x") else s)
+    except ValueError as exc:
+        raise NetworkError(f"RPC returned a non-hex log field: {s[:34]!r}") from exc
 
 
 def _addr(v: Any) -> str:
@@ -181,7 +187,9 @@ class EthHtlcContractLeg:
             return False
         return all(e == o for e, o in zip(expected, on_chain) if e != 0)
 
-    async def verify_funded(self, locator: EthHtlcLocator, *, expected_amount_wei: int) -> None:
+    async def verify_funded(
+        self, locator: EthHtlcLocator, *, expected_amount_wei: int, block_identifier: str | int | None = None
+    ) -> None:
         """Pre-RXD-lock gate: the on-chain contract matches the negotiated terms.
 
         Fail-closed checks (any mismatch raises; the taker does NOT tell the maker to
@@ -197,18 +205,25 @@ class EthHtlcContractLeg:
              reverts on ``receive`` would brick claim/refund via the contract's
              ``require(ok)``;
           5. funded balance == expected amount (no underfunded contract).
+
+        ``block_identifier`` (red-team HIGH TOCTOU): pin EVERY read to one block. The taker's
+        fund-time self-verify reads 'latest' (None). The MAKER's pre-lock re-verify passes
+        ``'finalized'`` so a reorg cannot re-deploy a DIFFERENT contract at the same CREATE
+        address (EVM addresses are (deployer,nonce)-derived) between verify and the RXD lock —
+        a finalized deploy is non-reorgable. All getters + get_code + get_balance honour it.
         """
         await self._rpc.assert_chain()
-        code = await self._rpc.get_code(locator.contract_address)
+        code = await self._rpc.get_code(locator.contract_address, block_identifier)
         if not self._runtime_code_matches(code):
             raise ValidationError("on-chain runtime logic != committed EthHtlc artifact (wrong/attacker contract)")
         # Read immutables back by value and bind them to the negotiated terms.
         web3 = _require_web3()
         c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
-        on_h = bytes(await c.functions.hashlock().call())
-        on_claimant = await c.functions.claimant().call()
-        on_refundee = await c.functions.refundee().call()
-        on_timeout = int(await c.functions.timeout().call())
+        _bid = "latest" if block_identifier is None else block_identifier
+        on_h = bytes(await c.functions.hashlock().call(block_identifier=_bid))
+        on_claimant = await c.functions.claimant().call(block_identifier=_bid)
+        on_refundee = await c.functions.refundee().call(block_identifier=_bid)
+        on_timeout = int(await c.functions.timeout().call(block_identifier=_bid))
         if on_h != locator.hashlock_bytes:
             raise ValidationError("on-chain hashlock != negotiated H")
         if web3.Web3.to_checksum_address(on_claimant) != web3.Web3.to_checksum_address(locator.claimant):
@@ -424,14 +439,21 @@ class EthHtlcContractLeg:
         if int(receipt.get("status", 0)) != 1:
             return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
         tx_block = int(receipt["blockNumber"])
-        # Bind the receipt to the canonical chain: a lying receipt blockNumber is caught when its
-        # blockHash != the canonical hash at that height (else `tx_block <= finalized` is trivial).
+        # Bind the receipt to the canonical chain, FAIL-CLOSED (red-team MEDIUM): a lying receipt
+        # blockNumber is caught when its blockHash != the canonical hash at that height. The binding
+        # inputs MUST be present — an honest mined receipt always carries blockHash and the canonical
+        # block at a real height always has a hash. A MISSING receipt blockHash or an EMPTY canonical
+        # hash therefore means "cannot prove canonicality" => NOT_YET_FINAL_LIVE, NEVER FINAL.
+        # (Previously these two cases skipped the binding and fell through to the trivial
+        # `tx_block <= finalized`, so a naive lying RPC could make a non-final claim read FINAL just
+        # by OMITTING blockHash — a strictly lazier attack than the coherent-MITM residual below.)
         receipt_hash = receipt.get("blockHash")
-        if receipt_hash is not None:
-            canonical = await self._rpc.canonical_block_hash(tx_block)
-            if canonical and bytes(receipt_hash) != canonical:
-                # The claim is not in the canonical chain at the height it claims → not final/live.
-                return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+        if receipt_hash is None:
+            return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+        canonical = await self._rpc.canonical_block_hash(tx_block)
+        if not canonical or bytes(receipt_hash) != canonical:
+            # Not bound to the canonical chain at the height it claims → not final/live.
+            return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
         finalized = await self._rpc.finalized_block_number()  # rejects finalized > head (fail-closed)
         if tx_block <= finalized:
             return CounterClaimFinality(state=CounterClaimState.FINAL)
@@ -489,7 +511,12 @@ class EthHtlcContractLeg:
         for log in receipt.get("logs", []):
             if _addr(log.get("address")) != want:
                 continue  # only logs EMITTED BY our per-swap contract count
-            blob = b"".join(_b(topic) for topic in log.get("topics", [])) + _b(log.get("data"))
+            try:
+                blob = b"".join(_b(topic) for topic in log.get("topics", [])) + _b(log.get("data"))
+            except NetworkError:
+                # A malformed (non-hex) topic/data from the RPC must NOT abort the whole scan and
+                # hide a legitimate Claimed(p) in another log (red-team LOW). Skip this entry.
+                continue
             if p in blob:
                 return
         raise ValidationError(

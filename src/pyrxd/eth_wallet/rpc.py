@@ -58,9 +58,16 @@ class EthRpc:
         if cid != self._expected_chain_id:
             raise ValidationError(f"RPC chain_id {cid} != expected {self._expected_chain_id} (wrong network)")
 
-    async def get_code(self, address: str) -> bytes:
+    async def get_code(self, address: str, block_identifier: str | int | None = None) -> bytes:
+        # block_identifier pins the read to a specific (e.g. 'finalized') block so a reorg cannot
+        # swap the deployed code out from under a maker re-verifying before it locks (red-team HIGH
+        # TOCTOU). None == the web3 default ('latest').
         try:
-            code = await self._w3.eth.get_code(address)
+            code = (
+                await self._w3.eth.get_code(address)
+                if block_identifier is None
+                else await self._w3.eth.get_code(address, block_identifier)
+            )
         except Exception as exc:
             raise NetworkError(f"eth_getCode failed: {exc}") from exc
         b = bytes(code)
@@ -68,9 +75,13 @@ class EthRpc:
             raise NetworkError("eth_getCode response exceeds size cap")
         return b
 
-    async def get_balance(self, address: str) -> int:
+    async def get_balance(self, address: str, block_identifier: str | int | None = None) -> int:
         try:
-            return int(await self._w3.eth.get_balance(address))
+            return int(
+                await self._w3.eth.get_balance(address)
+                if block_identifier is None
+                else await self._w3.eth.get_balance(address, block_identifier)
+            )
         except Exception as exc:
             raise NetworkError(f"eth_getBalance failed: {exc}") from exc
 

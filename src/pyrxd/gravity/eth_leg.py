@@ -167,7 +167,9 @@ class EthLeg:
             amount_wei=int(terms.value_amount),
         )
 
-    async def verify_counterparty_funded(self, contract_address: str, terms) -> EthHtlcLocator:
+    async def verify_counterparty_funded(
+        self, contract_address: str, terms, *, block_identifier: str | int | None = None
+    ) -> EthHtlcLocator:
         """MAKER-side fail-closed gate (red-team CRITICAL fix): verify the TAKER-deployed ETH HTLC
         at ``contract_address`` binds to the maker's EXPECTED terms BEFORE the maker locks the asset.
 
@@ -177,9 +179,15 @@ class EthLeg:
         underfunds and the honest maker locks the asset for nothing (one-sided maker loss). We build
         the EXPECTED locator from the maker's own config (NOT a taker-supplied one) and run
         :meth:`EthHtlcContractLeg.verify_funded` against the contract at ``contract_address`` — any
-        mismatch raises. Returns the verified locator (for the maker's subsequent claim)."""
+        mismatch raises. Returns the verified locator (for the maker's subsequent claim).
+
+        ``block_identifier`` (red-team HIGH TOCTOU): the coordinator re-runs this at RXD-lock time
+        pinned to ``'finalized'`` so a reorg cannot replace the taker's deploy after the maker
+        verified it; see :meth:`SwapCoordinator.post_asset_lock_revalidate`."""
         expected = self.expected_locator(terms, contract_address=contract_address)
-        await self._leg.verify_funded(expected, expected_amount_wei=int(terms.value_amount))
+        await self._leg.verify_funded(
+            expected, expected_amount_wei=int(terms.value_amount), block_identifier=block_identifier
+        )
         return expected
 
     async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:

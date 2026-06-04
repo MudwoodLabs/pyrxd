@@ -1610,10 +1610,12 @@ class FakeEthLeg:
         self.calls.append("verdict")
         return self._verdict
 
-    async def verify_counterparty_funded(self, contract_address, terms):
+    async def verify_counterparty_funded(self, contract_address, terms, *, block_identifier=None):
         """MAKER-side gate stand-in: records the call, raises if configured hostile, else returns a
-        locator bound to the contract address (the real EthLeg builds it from the maker's config)."""
+        locator bound to the contract address (the real EthLeg builds it from the maker's config).
+        ``block_identifier`` ('finalized' on the real-value re-verify) is recorded for assertions."""
         self.calls.append("verify_counterparty")
+        self.last_verify_block_identifier = block_identifier
         self.last_locator = EthHtlcLocator(
             chain_id=11155111,
             contract_address=contract_address,
@@ -2144,3 +2146,53 @@ async def test_eth_post_confirm_recheck_requires_now_unix_s():
     with pytest.raises(ValidationError, match="now_unix_s"):
         await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))  # ETH: now required
     assert coord.record.state is SwapState.BTC_LOCKED
+
+
+async def test_eth_post_confirm_refuses_unverified_counter_funding():
+    """Re-verify HIGH #1 (red-team): the maker-side counter-funding gate is FSM-ENFORCED, not
+    optional. An ETH leg with NO verified EthHtlcLocator on the record (maker never ran
+    maker_verify_counter_funding) must FAIL CLOSED at post_asset_lock_revalidate — advancing to the
+    reveal-enabling BOTH_LOCKED without the verification is impossible. Models the two-party maker
+    path (the maker's coordinator never runs taker_funds_btc, so the locator is only set by the
+    verify gate)."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    # BTC_LOCKED with terms but NO counterchain_locator (verify never ran).
+    coord = _eth_coord_at_btc_locked(eth_leg=leg, terms=terms)
+    with pytest.raises(ValidationError, match="never verified"):
+        await coord.post_asset_lock_revalidate(
+            await coord.radiant_leg.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW
+        )
+    assert coord.record.state is SwapState.BTC_LOCKED  # did NOT advance to BOTH_LOCKED
+
+
+async def test_eth_post_confirm_reverifies_counter_funding_at_lock_time():
+    """Re-verify HIGH #1+#2 (red-team): on the success path post_asset_lock_revalidate RE-RUNS the
+    counter-funding verification (a fresh re-bind that closes the verify->lock TOCTOU), and for a
+    test/estimated (is_measured=False) config it pins to 'latest' (None)."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    rxd = FakeRadiantLeg()
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = await _eth_to_btc_locked(leg=leg, terms=terms, rxd=rxd, now_unix_s=_NOW)
+    leg.calls.clear()
+    rec = await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert rec.state is SwapState.BOTH_LOCKED
+    assert leg.calls.count("verify_counterparty") == 1  # re-verified at lock time
+    assert leg.last_verify_block_identifier is None  # is_measured=False -> 'latest'
+
+
+async def test_eth_post_confirm_reverify_failure_refuses_both_locked():
+    """Re-verify HIGH #2 (red-team): if the lock-time re-verification fails (e.g. a reorg replaced the
+    taker's deploy), post_asset_lock_revalidate refuses BOTH_LOCKED — the maker never reveals p."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    rxd = FakeRadiantLeg()
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = await _eth_to_btc_locked(leg=leg, terms=terms, rxd=rxd, now_unix_s=_NOW)
+    leg.counterparty_verify_raises = True  # the re-verify now fails (deploy replaced / mismatch)
+    with pytest.raises(ValidationError, match="claimant"):
+        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
+    assert coord.record.state is SwapState.BTC_LOCKED  # did NOT advance
+    assert rxd.claimed_with is None

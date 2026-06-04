@@ -53,11 +53,21 @@ def test_verdict_rejects_bad_fields():
 
 
 class _FakeRpc:
-    def __init__(self, *, status=1, block=None, finalized=0):
+    # Models an HONEST RPC: the receipt carries blockHash and canonical_block_hash returns the
+    # matching hash, so the fail-closed canonical binding (red-team MEDIUM) passes and the verdict
+    # is driven by tx_block vs finalized. (The fail-open skip paths are covered in test_eth_leg.py.)
+    def __init__(self, *, status=1, block=None, finalized=0, block_hash=b"\x11" * 32, canonical="match"):
         self._status, self._block, self._finalized = status, block, finalized
+        self._bh, self._canonical = block_hash, canonical
 
     async def wait_receipt(self, tx_hash):
-        return {"status": self._status, "blockNumber": self._block}
+        r = {"status": self._status, "blockNumber": self._block}
+        if self._bh is not None:
+            r["blockHash"] = self._bh
+        return r
+
+    async def canonical_block_hash(self, n):
+        return self._bh if self._canonical == "match" else (self._canonical or b"")
 
     async def finalized_block_number(self):
         return self._finalized

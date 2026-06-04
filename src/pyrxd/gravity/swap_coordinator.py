@@ -848,13 +848,18 @@ class SwapCoordinator:
         if record.terms.counter_chain != "btc" and config.margin_policy.is_measured:
             mp = config.margin_policy
             fin_reserve_blocks = math.ceil(mp.eth_finalization_window_s / mp.rxd_block_interval_s)
-            min_n = fin_reserve_blocks + ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS - 1
+            # Use the SAME burial reserve the reorg gate uses (assess_claim_finality:
+            # _reserve_to_blocks(policy.rxd_claim_burial, ...)) — NOT the hardcoded estimate (red-team
+            # LOW): an operator who measures a burial != 6 would otherwise get a floor that blesses an
+            # N the gate's actual (larger) squeeze reserve makes insufficient — false assurance.
+            burial_blocks = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
+            min_n = fin_reserve_blocks + burial_blocks - 1
             if config.maker_stall_safety_window_blocks < min_n:
                 raise ValidationError(
                     f"maker_stall_safety_window_blocks={config.maker_stall_safety_window_blocks} is below the "
                     f"ETH finality+burial reserve floor {min_n} (= ceil(eth_finalization_window_s "
                     f"{mp.eth_finalization_window_s}/rxd_block_interval_s {mp.rxd_block_interval_s})={fin_reserve_blocks} "
-                    f"+ burial {ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS} - 1); a maker could time its reveal into a "
+                    f"+ burial {burial_blocks} - 1); a maker could time its reveal into a "
                     "SQUEEZE window the taker cannot safely act in — raise N or shrink the window"
                 )
         # One coordinator instance = one swap. This lock serializes the FSM-advancing
@@ -1147,20 +1152,51 @@ class SwapCoordinator:
             self._advance(SwapEvent.MAKER_LOCKS_WRONG_PARAMS)
             await self._persist_record(self.record, shield=True)
             return self.record
-        # ETH post-confirm cross-clock recheck (audit re-verify HIGH): the SPK is right, but a
-        # maker who DELAYED the covenant broadcast may have collapsed the cross-clock margin
-        # the pre-fund gate projected. Re-validate against the ACTUAL lock time; if it fails,
-        # do NOT enter BOTH_LOCKED — persist the observed lock for recovery and refuse, so the
-        # taker refunds the counter leg instead of proceeding into the one-sided-loss window.
+        # ETH post-confirm gate (audit re-verify HIGH + red-team HIGH): the SPK is right, but for an
+        # ETH counter leg two more things must hold before BOTH_LOCKED — which is the precondition
+        # for maker_claims_btc (the p-reveal). (1) The maker's counter-funding verification MUST have
+        # run and must STILL hold, re-checked here pinned to finality so a reorg cannot have replaced
+        # the taker's deploy after it was verified (the TOCTOU). (2) A maker who DELAYED the covenant
+        # broadcast may have collapsed the cross-clock margin the pre-fund gate projected. Either
+        # failure refuses BOTH_LOCKED (persist for recovery + raise) so the maker never reveals p
+        # against an unverified/reorg-replaced or timing-collapsed counter leg — it refunds the
+        # covenant via CSV instead of entering the one-sided-loss window.
         if self.record.terms.counter_chain != "btc":
-            try:
-                self._assert_eth_lock_timing_still_safe(now_unix_s=now_unix_s)
-            except ValidationError:
-                await self._persist_record(self.record, shield=True)
-                raise
+            await self._assert_eth_counter_funding_verified(now_unix_s=now_unix_s)
         self._advance(SwapEvent.MAKER_LOCKS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record
+
+    async def _assert_eth_counter_funding_verified(self, *, now_unix_s: int | None) -> None:
+        """ETH-leg precondition for BOTH_LOCKED (red-team HIGH): the maker-side counter-funding gate
+        must be enforced, not optional. We REQUIRE a verified EthHtlcLocator on the record (so
+        ``maker_verify_counter_funding`` cannot be skipped on the two-party maker path — advancing to
+        the reveal-enabling BOTH_LOCKED without it is impossible) and RE-RUN the verification here,
+        pinned to the ``finalized`` checkpoint for a real-value (``is_measured``) swap, so a reorg
+        cannot have re-deployed a DIFFERENT contract at the same CREATE address between the maker's
+        verify and this RXD lock (the verify->lock TOCTOU; an estimated/test config re-binds at
+        'latest', same is_measured discipline as the N-floor + cross-clock margin). Finally re-check
+        the cross-clock timing. Any failure persists for recovery and raises (fail-closed)."""
+        locator = self.record.counterchain_locator
+        if not isinstance(locator, EthHtlcLocator):
+            await self._persist_record(self.record, shield=True)
+            raise ValidationError(
+                "ETH counter-funding was never verified (no EthHtlcLocator on record); "
+                "maker_verify_counter_funding MUST run before locking RXD — refusing BOTH_LOCKED "
+                "(the maker should refund the covenant via CSV)"
+            )
+        verify = getattr(self.counter_leg, "verify_counterparty_funded", None)
+        if verify is None:
+            await self._persist_record(self.record, shield=True)
+            raise ValidationError("counter_leg does not implement verify_counterparty_funded; fail-closed")
+        block_id = "finalized" if self.config.margin_policy.is_measured else None
+        try:
+            reverified = await verify(locator.contract_address, self.record.terms, block_identifier=block_id)
+            self.record = self.record.with_counter_lock(reverified)
+            self._assert_eth_lock_timing_still_safe(now_unix_s=now_unix_s)
+        except ValidationError:
+            await self._persist_record(self.record, shield=True)
+            raise
 
     # -- maker verifies the taker's counter-leg HTLC before locking the asset (red-team CRITICAL) --
     @_serialized_step
@@ -1481,12 +1517,14 @@ class SwapCoordinator:
         (returns the unchanged record) when the trigger has not fired yet. Async
         because the asset refund broadcasts a Radiant covenant spend.
 
-        RUNBOOK SCOPE (red-team MEDIUM): this is the BTC<->RXD proactive path, where the TAKER
-        owns the RXD covenant and reclaims it before the maker can grief. It refunds ONLY the
-        RXD asset leg. In the ETH<->RXD runbook the MAKER owns the covenant (CLAIM pays the
-        taker, the CSV refund pays the maker) and the taker's value sits in the ETH HTLC, so the
-        correct stall recovery there is :meth:`mutual_refund` (refunds BOTH legs after both
-        timeouts) — NOT this method. Do not wire this into the ETH harness's stall path.
+        RUNBOOK SCOPE (red-team MEDIUM): this refunds ONLY the RXD covenant, whose CSV refund pays
+        the MAKER in BOTH directions (the maker owns the asset leg; p is not yet public) — it is NOT
+        a "taker reclaims the covenant" action (an earlier note wrongly said the taker owns it; the
+        covenant CLAIM pays the taker, the CSV REFUND pays the maker, same as eth_rxd_timelock.py).
+        It is sufficient stall recovery only when the OTHER party's value is independently
+        recoverable on its own leg. In the ETH<->RXD runbook the taker's value sits in the ETH HTLC,
+        which this method does NOT touch, so the correct ETH stall recovery is :meth:`mutual_refund`
+        (refunds BOTH legs after both timeouts) — NOT this method. Do not wire it into the ETH stall path.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(

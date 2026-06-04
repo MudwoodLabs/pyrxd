@@ -124,7 +124,7 @@ async def test_fund_derives_kwargs_and_runs_verify(monkeypatch):
         calls["fund"] = kw
         return loc
 
-    async def fake_verify(locator, *, expected_amount_wei):
+    async def fake_verify(locator, *, expected_amount_wei, block_identifier=None):
         calls["verify"] = (locator, expected_amount_wei)
 
     monkeypatch.setattr(cl, "fund", fake_fund)
@@ -165,7 +165,7 @@ async def test_verify_counterparty_funded_uses_expected_locator(monkeypatch):
     cl = _contract_leg()
     seen = {}
 
-    async def fake_verify(locator, *, expected_amount_wei):
+    async def fake_verify(locator, *, expected_amount_wei, block_identifier=None):
         seen["locator"] = locator
         seen["amount"] = expected_amount_wei
 
@@ -185,7 +185,7 @@ async def test_verify_counterparty_funded_propagates_mismatch(monkeypatch):
     maker-side gate propagates it fail-closed so the maker never locks the asset."""
     cl = _contract_leg()
 
-    async def fake_verify(locator, *, expected_amount_wei):
+    async def fake_verify(locator, *, expected_amount_wei, block_identifier=None):
         raise ValidationError("on-chain claimant != negotiated maker")
 
     monkeypatch.setattr(cl, "verify_funded", fake_verify)
@@ -314,6 +314,68 @@ async def test_provenance_rejects_cross_swap_log_from_other_contract():
         await leg.assert_claim_provenance("0xtx", contract_address=_CONTRACT, preimage=p)
 
 
+# -- claim_finality_verdict canonical-hash binding FAILS CLOSED (red-team MEDIUM) ------
+
+
+class _FakeFinalityRpc:
+    """Fake RPC for claim_finality_verdict: a receipt whose blockHash can be omitted, a canonical
+    hash that can be empty/mismatched, and a finalized height — to drive the fail-closed binding."""
+
+    def __init__(self, *, block_number=10, block_hash=b"\xaa" * 32, canonical=b"\xaa" * 32, finalized=20, status=1):
+        self._bn, self._bh, self._canon, self._fin, self._status = (
+            block_number,
+            block_hash,
+            canonical,
+            finalized,
+            status,
+        )
+
+    async def wait_receipt(self, tx_hash):
+        r = {"status": self._status, "blockNumber": self._bn, "logs": []}
+        if self._bh is not None:  # None => simulate an RPC that OMITS blockHash
+            r["blockHash"] = self._bh
+        return r
+
+    async def canonical_block_hash(self, n):
+        return self._canon
+
+    async def finalized_block_number(self):
+        return self._fin
+
+
+def _finality_leg(rpc) -> EthHtlcContractLeg:
+    return EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=11155111, artifact=_ART)
+
+
+async def test_finality_verdict_final_when_canonical_binds_and_buried():
+    # blockHash == canonical AND tx_block(10) <= finalized(20) -> the only path to FINAL.
+    v = await _finality_leg(
+        _FakeFinalityRpc(block_hash=b"\xaa" * 32, canonical=b"\xaa" * 32, finalized=20)
+    ).claim_finality_verdict("0xtx")
+    assert v.state is CounterClaimState.FINAL
+
+
+async def test_finality_verdict_fails_closed_on_missing_blockhash():
+    # red-team MEDIUM: a lying RPC OMITS receipt.blockHash. tx_block <= finalized would have read
+    # FINAL, but with no hash to bind we cannot prove canonicality -> NOT_YET_FINAL_LIVE.
+    v = await _finality_leg(_FakeFinalityRpc(block_hash=None, finalized=20)).claim_finality_verdict("0xtx")
+    assert v.state is CounterClaimState.NOT_YET_FINAL_LIVE
+
+
+async def test_finality_verdict_fails_closed_on_empty_canonical_hash():
+    # red-team MEDIUM: canonical_block_hash returns b"" (no hash at the claimed height) -> cannot bind.
+    v = await _finality_leg(_FakeFinalityRpc(canonical=b"", finalized=20)).claim_finality_verdict("0xtx")
+    assert v.state is CounterClaimState.NOT_YET_FINAL_LIVE
+
+
+async def test_finality_verdict_not_final_on_canonical_hash_mismatch():
+    # A fabricated receipt height whose blockHash != the canonical hash -> not in the canonical chain.
+    v = await _finality_leg(
+        _FakeFinalityRpc(block_hash=b"\xaa" * 32, canonical=b"\xbb" * 32, finalized=20)
+    ).claim_finality_verdict("0xtx")
+    assert v.state is CounterClaimState.NOT_YET_FINAL_LIVE
+
+
 async def test_provenance_rejects_failed_status():
     p = _p()
     leg = _leg_with_rpc(_FakeRpc(to=_CONTRACT, status=0, logs=[_claimed_log_with_p(p)]))
@@ -367,7 +429,7 @@ async def test_fund_rejects_timeout_mismatch_with_terms(monkeypatch):
     async def fake_fund(**kw):
         return _locator()
 
-    async def fake_verify(locator, *, expected_amount_wei):
+    async def fake_verify(locator, *, expected_amount_wei, block_identifier=None):
         pass
 
     monkeypatch.setattr(cl, "fund", fake_fund)
