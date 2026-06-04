@@ -4,6 +4,20 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-06-04
+
+Patch release. Fixes the package version reported by the CLI and the
+`pyrxd.__version__` attribute.
+
+### Fixed
+
+- `pyrxd --version` and `pyrxd.__version__` now report the actual installed
+  version. `__version__` was a hardcoded string in `pyrxd/__init__.py` that
+  was separate from `pyproject.toml`; it went stale and the 0.6.0 wheel
+  shipped reporting `0.5.1`. `__version__` is now derived from the installed
+  package metadata (`importlib.metadata.version`), so it tracks
+  `pyproject.toml` automatically and cannot drift again.
+
 ## [0.6.0] — 2026-06-04
 
 First release since 0.5.1 — 108 commits. The headline is **multi-path HD

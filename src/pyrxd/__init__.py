@@ -36,9 +36,18 @@ see the same names with no behaviour change.
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError, version
 from typing import Any
 
-__version__ = "0.5.1"
+# Single source of truth for the version is pyproject.toml. Derive __version__
+# from the installed package metadata so the CLI's --version can never drift
+# from what was published — a hardcoded string here went stale and shipped a
+# 0.6.0 wheel that reported "0.5.1". The fallback covers a raw source checkout
+# with no installed dist metadata (and Pyodide, where pyrxd may load without it).
+try:
+    __version__ = version("pyrxd")
+except PackageNotFoundError:  # pragma: no cover - source checkout without install
+    __version__ = "0.0.0+unknown"
 
 # Map of public-name → (module, attr) pairs. Resolved lazily on first
 # attribute access. Order is alphabetical by name to make additions
