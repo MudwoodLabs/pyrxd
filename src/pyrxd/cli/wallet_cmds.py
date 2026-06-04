@@ -399,8 +399,18 @@ def wallet_recover(ctx: CliContext, scan: bool, coin_types: str, accounts: str, 
 
     lines = ["Found funds. Recover with the wallet that derives the matching path:", ""]
     for h in report.hits:  # type: ignore[attr-defined]
-        flag = "" if h.total else "  (history only — 0 balance)"
-        lines.append(f"  {format_photons(h.confirmed)}  {h.path}{flag}")
+        # Show the TOTAL (confirmed + pending), not just confirmed — recovered
+        # or just-received funds are often still unconfirmed, and showing only
+        # h.confirmed would print "0" next to a path that actually holds money.
+        if h.total == 0:
+            amount = f"{format_photons(0)}  (history only — 0 balance)"
+        elif h.confirmed == 0:
+            amount = f"{format_photons(h.unconfirmed)}  (pending)"
+        elif h.unconfirmed:
+            amount = f"{format_photons(h.total)}  (incl. {format_photons(h.unconfirmed)} pending)"
+        else:
+            amount = format_photons(h.confirmed)
+        lines.append(f"  {amount}  {h.path}")
         lines.append(f"      coin type {h.coin_type} — {coin_type_label(h.coin_type)}")
         lines.append(f"      {h.address}")
     lines.append("")

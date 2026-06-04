@@ -109,6 +109,22 @@ class TestRecoverScan:
         assert payload["hits"][0]["path"] == "m/44'/0'/0'/0/0"
         assert payload["hits"][0]["coin_type"] == 0
 
+    def test_pending_only_balance_is_shown_not_zero(self, runner: CliRunner) -> None:
+        # Regression: an unconfirmed-only balance must show the amount next to
+        # the path, not "0". Caught by a live mainnet test where freshly-sent
+        # dust was still pending and the per-hit line printed only h.confirmed.
+        funded = _addr(512, 0, 0, 0)
+        client = _scripthash_client(
+            history={funded: [{"tx_hash": "ab" * 32, "height": 0}]},
+            balance={funded: (0, 1_000_000)},  # all unconfirmed
+        )
+        result = _invoke(runner, _ctx(client), ["recover", "--scan"])
+        assert result.exit_code == 0, result.output
+        assert "0.01000000 RXD" in result.output  # the pending amount, on the hit line
+        assert "pending" in result.output
+        # The hit line must NOT read as an empty/history-only address.
+        assert "history only" not in result.output
+
     def test_no_hits_message(self, runner: CliRunner) -> None:
         client = _scripthash_client()  # nothing funded
         result = _invoke(runner, _ctx(client), ["recover", "--scan"])
