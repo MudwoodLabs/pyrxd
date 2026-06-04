@@ -64,7 +64,7 @@ def build_reconciler(
     rxd_client,
     btc_funding_reader,
     http_session,
-    mempool_base_url: str,
+    mempool_base_urls,
     policy: MarginPolicy,
     safety_window_blocks: int,
     alert_channel,
@@ -73,10 +73,16 @@ def build_reconciler(
     store = JsonDirRecordStore(records_dir)
     rxd_source = ElectrumRxdChainSource(rxd_client)
 
-    async def _outspend(funding_txid: str, vout: int):
-        return await mempool_space_outspend(http_session, mempool_base_url, funding_txid, vout)
+    # Multi-source claim DETECTION (red-team MEDIUM): one /outspend fn per independent Esplora so a
+    # single lagging/lying source cannot suppress the PAGE_CLAIM (detection fails toward paging).
+    def _make_outspend(base_url: str):
+        async def _outspend(funding_txid: str, vout: int):
+            return await mempool_space_outspend(http_session, base_url, funding_txid, vout)
 
-    btc_source = OutspendBtcClaimSource(outspend_fn=_outspend, funding_reader=btc_funding_reader)
+        return _outspend
+
+    outspend_fns = [_make_outspend(u) for u in mempool_base_urls]
+    btc_source = OutspendBtcClaimSource(outspend_fns=outspend_fns, funding_reader=btc_funding_reader)
     observer = ChainObserver(btc=btc_source, rxd=rxd_source, rxd_corroborated=False)  # v1: RXD single-source
     alerter = DedupAlerter(channel=alert_channel)
     return Reconciler(
@@ -123,7 +129,20 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--rxd-electrumx-url", help="RXD ElectrumX ws/wss URL (required for --rxd-backend electrumx)")
     p.add_argument("--ssh-host", default="tr", help="ssh host for --rxd-backend ssh-tr")
     p.add_argument("--ssh-container", default="radiant-mainnet", help="radiant docker container for ssh-tr")
-    p.add_argument("--mempool-base-url", default="https://mempool.space", help="Esplora/mempool.space base URL")
+    p.add_argument("--mempool-base-url", default="https://mempool.space", help="primary Esplora/mempool.space base URL")
+    p.add_argument(
+        "--esplora-url",
+        action="append",
+        help="additional INDEPENDENT Esplora base URL for claim-detection corroboration (repeatable); "
+        "defaults to adding blockstream.info when none given (red-team: multi-source detection)",
+    )
+    p.add_argument(
+        "--tick-timeout-s",
+        type=float,
+        default=None,
+        help="per-tick watchdog budget; a tick exceeding it emits a degraded heartbeat instead of "
+        "blocking past the dead-man's-switch window (defaults to 4x poll interval)",
+    )
     p.add_argument("--poll-interval-s", type=float, default=30.0)
     p.add_argument("--safety-window-blocks", type=int, default=6)
     p.add_argument("--quorum", type=int, default=2, help="BTC funding-reader quorum (of 3 Esplora sources)")
@@ -169,6 +188,23 @@ async def _amain(argv=None) -> int:
         with contextlib.suppress(NotImplementedError):  # Windows / restricted envs
             loop.add_signal_handler(sig, stop.set)
 
+    # Independent Esplora set for multi-source claim DETECTION (dedup, preserve order). Default a
+    # free second source so corroboration is ON out of the box (red-team MEDIUM).
+    esploras = [args.mempool_base_url, *(args.esplora_url or [])]
+    if len(esploras) == 1 and "blockstream.info" not in args.mempool_base_url:
+        esploras.append("https://blockstream.info")
+    _seen: set[str] = set()
+    esploras = [u for u in esploras if not (u in _seen or _seen.add(u))]
+
+    # Anti-silent-failure defaults (red-team MEDIUM): without a webhook AND a heartbeat file, paging
+    # is log-only and the cross-process dead-man's-switch is DISABLED. Warn loudly at startup.
+    if not args.webhook_url and not args.heartbeat_file:
+        logger.critical(
+            "WATCHTOWER RUNNING DEGRADED: no --webhook-url (paging is LOG-ONLY) and no --heartbeat-file "
+            "(the dead-man's-switch is DISABLED — a crash/wedge will NOT be detected). Configure at least "
+            "one before relying on this tower."
+        )
+
     reader = MultiSourceBtcFundingReader.default_mainnet(quorum=args.quorum)
     async with contextlib.AsyncExitStack() as stack:
         http_session = await stack.enter_async_context(aiohttp.ClientSession())
@@ -178,7 +214,7 @@ async def _amain(argv=None) -> int:
             rxd_client=rxd_client,
             btc_funding_reader=reader,
             http_session=http_session,
-            mempool_base_url=args.mempool_base_url,
+            mempool_base_urls=esploras,
             policy=policy,
             safety_window_blocks=args.safety_window_blocks,
             alert_channel=_build_alert_channel(args, http_session),
@@ -186,6 +222,7 @@ async def _amain(argv=None) -> int:
         heartbeat = default_heartbeat(logger)
         if args.heartbeat_file:
             heartbeat = combine_heartbeats(heartbeat, FileHeartbeat(args.heartbeat_file))
+        tick_budget = args.tick_timeout_s if args.tick_timeout_s is not None else max(4.0 * args.poll_interval_s, 30.0)
         rxd_desc = (
             args.rxd_electrumx_url
             if args.rxd_backend == "electrumx"
@@ -204,6 +241,7 @@ async def _amain(argv=None) -> int:
             stop=stop,
             on_heartbeat=heartbeat,
             max_iterations=1 if args.once else None,
+            tick_timeout_s=tick_budget,
         )
     with contextlib.suppress(Exception):
         await reader.close()

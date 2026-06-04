@@ -15,6 +15,7 @@ wall-clock flakiness.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -26,12 +27,20 @@ from pyrxd.security.errors import ValidationError
 
 __all__ = ["DeadManVerdict", "DeadMansSwitch", "FileHeartbeat", "heartbeat_age_s", "run_monitor"]
 
+logger = logging.getLogger(__name__)
+
 _WATCHTOWER = "<watchtower>"
+
+# A heartbeat timestamp AHEAD of the monitor's clock by more than this is treated as a fault
+# (fail-closed clock-skew guard) rather than as fresh liveness — red-team LOW.
+_CLOCK_SKEW_TOLERANCE_S = 60.0
 
 
 class FileHeartbeat:
-    """A heartbeat sink that atomically writes ``{ts, tick, swaps, paged}`` to a file each
-    tick — the cross-process liveness signal the :class:`DeadMansSwitch` watches."""
+    """A heartbeat sink that atomically writes ``{ts, tick, swaps, paged, undelivered}`` to a file
+    each tick — the cross-process liveness signal the :class:`DeadMansSwitch` watches. ``undelivered``
+    (red-team MEDIUM) is the count of pages the alerter FAILED to deliver this tick, so a monitor /
+    operator can detect 'alive but dropping CRITICAL pages' rather than seeing a healthy-looking beat."""
 
     def __init__(self, path: str | Path, *, clock: Callable[[], float] = time.time) -> None:
         self._path = Path(path)
@@ -39,7 +48,14 @@ class FileHeartbeat:
 
     def __call__(self, iteration: int, results) -> None:
         paged = sum(1 for r in results if r.decision.intent.value.startswith("page_"))
-        data = {"ts": self._clock(), "tick": iteration, "swaps": len(results), "paged": paged}
+        undelivered = sum(1 for r in results if getattr(r, "alert_delivered", None) is False)
+        data = {
+            "ts": self._clock(),
+            "tick": iteration,
+            "swaps": len(results),
+            "paged": paged,
+            "undelivered": undelivered,
+        }
         tmp = self._path.with_name(self._path.name + ".tmp")
         tmp.write_text(json.dumps(data))
         os.replace(tmp, self._path)  # atomic on the same filesystem
@@ -88,18 +104,37 @@ class DeadMansSwitch:
     async def check(self, *, now: float | None = None) -> DeadManVerdict:
         now = self._clock() if now is None else now
         age = heartbeat_age_s(self._path, now=now)
-        stale = age is None or age > self._max
+        # Fail-closed on clock skew (red-team LOW): a heartbeat ts AHEAD of the monitor's clock
+        # yields a NEGATIVE age; without the `age < -tolerance` guard `age > max` is False and a
+        # future-dated (stuck/forged/skewed) heartbeat would read ALIVE until wall-clock catches up,
+        # extending the blind window by the skew. A ts implausibly in the future is a fault, not
+        # liveness.
+        stale = age is None or age > self._max or age < -_CLOCK_SKEW_TOLERANCE_S
         verdict = DeadManVerdict(alive=not stale, age_s=age)
-        if stale and not self._fired:
-            await self._channel.send(self._stale_page(age))
+        # The page send MUST NOT crash the monitor (red-team MEDIUM): the dead-man's-switch is the
+        # liveness backstop — if its OWN channel transiently fails we log and RETRY next interval
+        # (leave _fired unchanged so the same transition re-fires), never propagate out of the loop.
+        if stale and not self._fired and await self._try_send(self._stale_page(age)):
             self._fired = True
-        elif not stale and self._fired:
-            await self._channel.send(self._recovered_page(age))
+        elif not stale and self._fired and await self._try_send(self._recovered_page(age)):
             self._fired = False
         return verdict
 
+    async def _try_send(self, page: Page) -> bool:
+        try:
+            await self._channel.send(page)
+            return True
+        except Exception as exc:  # a channel error must never crash the liveness backstop
+            logger.error("dead-man's-switch alert delivery FAILED (will retry next interval): %s", exc)
+            return False
+
     def _stale_page(self, age: float | None) -> Page:
-        where = "absent" if age is None else f"stale (age {age:.0f}s > max {self._max:.0f}s)"
+        if age is None:
+            where = "absent"
+        elif age < 0:
+            where = f"future-dated (age {age:.0f}s — clock skew or a stuck/forged heartbeat)"
+        else:
+            where = f"stale (age {age:.0f}s > max {self._max:.0f}s)"
         return Page(
             swap_id=_WATCHTOWER,
             intent=None,

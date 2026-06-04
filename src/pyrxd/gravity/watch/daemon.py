@@ -26,22 +26,38 @@ Heartbeat = Callable[[int, list[ReconcileResult]], None]
 
 
 def combine_heartbeats(*heartbeats: Heartbeat) -> Heartbeat:
-    """Fan the heartbeat out to several sinks (e.g. log line + cross-process file)."""
+    """Fan the heartbeat out to several sinks (e.g. log line + cross-process file).
+
+    Per-sink isolation (red-team LOW): one failing sink (e.g. a heartbeat-FILE write hitting
+    ENOSPC/EROFS) must NOT prevent the others from firing or crash the loop — log and continue."""
 
     def _hb(iteration: int, results: list[ReconcileResult]) -> None:
         for hb in heartbeats:
-            hb(iteration, results)
+            try:
+                hb(iteration, results)
+            except Exception:  # a heartbeat sink failure must not crash the loop
+                logger.exception("heartbeat sink %r failed (continuing)", getattr(hb, "__name__", hb))
 
     return _hb
 
 
 def default_heartbeat(log: logging.Logger | None = None) -> Heartbeat:
-    """A heartbeat that logs tick count + how many swaps were paged this tick."""
+    """A heartbeat that logs tick count, swaps watched, pages decided, and UNDELIVERED pages."""
     log = log or logger
 
     def _hb(iteration: int, results: list[ReconcileResult]) -> None:
         paged = sum(1 for r in results if r.decision.intent.value.startswith("page_"))
-        log.info("watchtower heartbeat: tick=%d swaps=%d paged=%d", iteration, len(results), paged)
+        undelivered = sum(1 for r in results if r.alert_delivered is False)
+        # An undelivered CRITICAL page must be LOUD, not buried in a healthy-looking INFO tick.
+        level = logging.ERROR if undelivered else logging.INFO
+        log.log(
+            level,
+            "watchtower heartbeat: tick=%d swaps=%d paged=%d undelivered=%d",
+            iteration,
+            len(results),
+            paged,
+            undelivered,
+        )
 
     return _hb
 
@@ -54,11 +70,17 @@ async def run_loop(
     on_heartbeat: Heartbeat | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     max_iterations: int | None = None,
+    tick_timeout_s: float | None = None,
 ) -> int:
     """Tick the reconciler on ``interval_s`` until ``stop`` is set (or ``max_iterations``).
 
-    Returns the number of ticks run. ``reconciler.tick()`` never raises for a per-swap
-    failure (it fails closed to a page), so the loop is robust by construction.
+    Returns the number of ticks run. ``reconciler.tick()`` never raises (it fails closed to a
+    page for a per-swap OR store fault), so the loop is robust by construction. Two further
+    backstops (red-team): (1) a watchdog — ``tick_timeout_s`` bounds a single tick so one slow
+    source can't outlast the dead-man's-switch window and trip a false "tower DOWN"; on timeout we
+    emit an alive (degraded) heartbeat and move on. (2) ``on_heartbeat`` is GUARDED — a
+    heartbeat-sink failure degrades to a stale heartbeat (which the dead-man's-switch then reports),
+    never a crash.
     """
     if not isinstance(reconciler, Reconciler):
         raise ValidationError("run_loop requires a Reconciler")
@@ -66,15 +88,33 @@ async def run_loop(
         raise ValidationError("run_loop interval_s must be >= 0")
     if max_iterations is not None and (not isinstance(max_iterations, int) or max_iterations < 0):
         raise ValidationError("run_loop max_iterations must be a non-negative int or None")
+    if tick_timeout_s is not None and (not isinstance(tick_timeout_s, (int, float)) or tick_timeout_s <= 0):
+        raise ValidationError("run_loop tick_timeout_s must be > 0 or None")
 
     iterations = 0
     while not (stop is not None and stop.is_set()):
         if max_iterations is not None and iterations >= max_iterations:
             break
-        results = await reconciler.tick()
+        try:
+            if tick_timeout_s is None:
+                results = await reconciler.tick()
+            else:
+                results = await asyncio.wait_for(reconciler.tick(), timeout=tick_timeout_s)
+        except (asyncio.TimeoutError, TimeoutError):
+            logger.error(
+                "watchtower tick %d exceeded %.0fs budget (slow source?) — degraded; emitting alive heartbeat",
+                iterations + 1,
+                tick_timeout_s,
+            )
+            results = []
         iterations += 1
         if on_heartbeat is not None:
-            on_heartbeat(iterations, results)
+            try:
+                on_heartbeat(iterations, results)
+            except Exception:  # a heartbeat-sink failure must not crash the reconcile loop
+                logger.exception(
+                    "on_heartbeat failed at tick %d (continuing; deadman will see a stale beat)", iterations
+                )
         if (stop is not None and stop.is_set()) or (max_iterations is not None and iterations >= max_iterations):
             break
         await sleep(interval_s)

@@ -140,7 +140,13 @@ def test_file_heartbeat_writes_atomically(tmp_path):
         ReconcileResult("b", Decision(Intent.WATCH, reason="y")),
     ]
     hb(5, results)
-    assert json.loads((tmp_path / "hb.json").read_text()) == {"ts": 1000.0, "tick": 5, "swaps": 2, "paged": 1}
+    assert json.loads((tmp_path / "hb.json").read_text()) == {
+        "ts": 1000.0,
+        "tick": 5,
+        "swaps": 2,
+        "paged": 1,
+        "undelivered": 0,
+    }
 
 
 def test_heartbeat_age(tmp_path):
@@ -193,6 +199,33 @@ async def test_deadman_missing_file_is_stale(tmp_path):
     sw = DeadMansSwitch(heartbeat_path=tmp_path / "none.json", max_silence_s=60, channel=ch)
     v = await sw.check(now=100.0)
     assert v.alive is False and v.age_s is None
+    assert len(ch.pages) == 1 and ch.pages[0].severity is Severity.CRITICAL
+
+
+async def test_deadman_channel_failure_does_not_crash_and_retries(tmp_path):
+    # red-team #1: the dead-man's-switch is the liveness backstop — a transient channel send failure
+    # must NOT crash the monitor; it logs and RETRIES (re-fires) next interval rather than going blind.
+    p = tmp_path / "hb.json"
+    p.write_text(json.dumps({"ts": 1000.0}))
+    ch = RecChannel(fail=True)
+    sw = DeadMansSwitch(heartbeat_path=p, max_silence_s=60, channel=ch)
+    v = await sw.check(now=1100.0)  # stale + channel raises → no crash
+    assert v.alive is False
+    assert len(ch.pages) == 1  # attempted once
+    v2 = await sw.check(now=1200.0)  # still stale; previous send FAILED so _fired stayed unset → retry
+    assert v2.alive is False
+    assert len(ch.pages) == 2  # re-attempted (delivery failure is not edge-suppressed)
+
+
+async def test_deadman_future_dated_heartbeat_is_stale(tmp_path):
+    # red-team #10: a heartbeat ts AHEAD of the monitor's clock (skew / stuck-future / forged) gives a
+    # NEGATIVE age — must fail CLOSED to stale, not read as fresh-and-alive.
+    p = tmp_path / "hb.json"
+    p.write_text(json.dumps({"ts": 5000.0}))
+    ch = RecChannel()
+    sw = DeadMansSwitch(heartbeat_path=p, max_silence_s=60, channel=ch)
+    v = await sw.check(now=1000.0)  # age = -4000s → stale (fail-closed)
+    assert v.alive is False
     assert len(ch.pages) == 1 and ch.pages[0].severity is Severity.CRITICAL
 
 

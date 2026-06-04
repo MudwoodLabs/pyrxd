@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["Alerter", "Observer", "ReconcileResult", "Reconciler", "RecordStore"]
 
+# swap_id used for tower-level pages not tied to one swap (store unreadable, etc.).
+_STORE = "<records-store>"
+
 # Intents that the alerter is told about: the actionable pages + the terminal RETIRE
 # (so it can emit an INFO "done" and clear its dedup state). WATCH/NOOP are silent.
 _ROUTED_INTENTS = frozenset({Intent.PAGE_CLAIM, Intent.PAGE_REFUND, Intent.PAGE_SQUEEZED, Intent.RETIRE})
@@ -64,11 +67,16 @@ class Alerter(Protocol):
 
 @dataclass(frozen=True)
 class ReconcileResult:
-    """The outcome for one swap, this tick (for observability + tests)."""
+    """The outcome for one swap, this tick (for observability + tests).
+
+    ``alert_delivered`` is ``None`` when no page was routed (WATCH/NOOP), ``True`` when the
+    alerter delivered it, ``False`` when delivery FAILED (red-team MEDIUM: a swallowed delivery
+    failure must be visible to the heartbeat, not look healthy)."""
 
     swap_id: str
     decision: Decision
     error: str | None = None
+    alert_delivered: bool | None = None
 
 
 class Reconciler:
@@ -99,8 +107,21 @@ class Reconciler:
         self._inflight: set[str] = set()
 
     async def tick(self) -> list[ReconcileResult]:
-        """Reconcile every in-flight swap once. Never raises for a per-swap failure."""
-        active = await self._store.list_active()
+        """Reconcile every in-flight swap once. NEVER raises (red-team LOW: a directory-level store
+        I/O fault — missing/typo'd/unmounted dir, EACCES/ESTALE/EIO, or every record unreadable —
+        must become a PAGE, not crash the daemon and stop the heartbeat)."""
+        try:
+            active = await self._store.list_active()
+        except Exception as exc:
+            err = f"{type(exc).__name__}: {exc}"
+            logger.exception("watchtower records store unreadable")
+            decision = Decision(
+                Intent.PAGE_SQUEEZED,
+                reason=f"records store unreadable — the tower may be watching NOTHING (investigate): {err}",
+                recommended_action="check the records dir exists/is mounted/readable; manually watch in-flight swaps",
+            )
+            delivered = await self._safe_handle(_STORE, decision)
+            return [ReconcileResult(_STORE, decision, error=err, alert_delivered=delivered)]
         results: list[ReconcileResult] = []
         for swap_id, record in active:
             results.append(await self._reconcile_one(swap_id, record))
@@ -130,19 +151,26 @@ class Reconciler:
                     reason=f"reconcile error, fail-closed (investigate manually): {err}",
                     recommended_action="investigate",
                 )
-                await self._safe_handle(swap_id, decision)
-                return ReconcileResult(swap_id, decision, error=err)
+                delivered = await self._safe_handle(swap_id, decision)
+                return ReconcileResult(swap_id, decision, error=err, alert_delivered=delivered)
             if decision.intent in _ROUTED_INTENTS:
-                await self._safe_handle(swap_id, decision)
-            else:
-                logger.debug("swap %s: %s (%s)", swap_id, decision.intent.value, decision.reason)
+                delivered = await self._safe_handle(swap_id, decision)
+                return ReconcileResult(swap_id, decision, alert_delivered=delivered)
+            logger.debug("swap %s: %s (%s)", swap_id, decision.intent.value, decision.reason)
             return ReconcileResult(swap_id, decision)
         finally:
             self._inflight.discard(swap_id)
 
-    async def _safe_handle(self, swap_id: str, decision: Decision) -> None:
-        """Route to the alerter; an alert-channel failure must not crash the loop."""
+    async def _safe_handle(self, swap_id: str, decision: Decision) -> bool:
+        """Route to the alerter; an alert-channel failure must not crash the loop. Returns True iff
+        the page was delivered — a FALSE is surfaced on the ReconcileResult (red-team MEDIUM) so the
+        heartbeat counts DELIVERED pages, not merely DECIDED ones, and a persistently-failing channel
+        cannot look healthy while dropping CRITICAL pages."""
         try:
             await self._alerter.handle(swap_id, decision)
+            return True
         except Exception:
-            logger.exception("alerter.handle failed for swap %s (intent=%s)", swap_id, decision.intent.value)
+            logger.exception(
+                "alerter.handle FAILED to DELIVER page for swap %s (intent=%s)", swap_id, decision.intent.value
+            )
+            return False

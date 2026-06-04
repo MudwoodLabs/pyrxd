@@ -31,7 +31,7 @@ from pathlib import Path
 from pyrxd.gravity.swap_state import SwapRecord, is_terminal
 from pyrxd.gravity.watch.alerts import Page, Severity
 from pyrxd.gravity.watch.quorum import BtcClaimStatus
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -64,28 +64,39 @@ def page_to_dict(page: Page) -> dict:
 class JsonDirRecordStore:
     """``RecordStore`` over a directory of ``SwapRecord`` JSON files (``<swap_id>.json``).
 
-    The swap id is the file stem. Terminal swaps and unreadable/invalid files are
-    skipped (the latter logged) — one corrupt file must not blind the tower to the rest.
-    Read-only: v1 never writes.
+    The swap id is the file stem. ONE corrupt file is skipped (logged) — it must not blind the
+    tower to the rest. But two BLIND conditions RAISE (red-team MEDIUM — the reconciler turns a
+    raise into a PAGE, so "watching nothing" can never masquerade as a healthy swaps=0 tick):
+      * the records dir does not exist (typo / unmounted / wrong path);
+      * files are present but EVERY one is unreadable (we can read none of them).
+    A genuinely empty existing dir returns ``[]`` (0 swaps, healthy). Read-only: v1 never writes.
     """
 
     def __init__(self, records_dir: str | Path) -> None:
         self._dir = Path(records_dir)
 
     async def list_active(self) -> list[tuple[str, SwapRecord]]:
-        out: list[tuple[str, SwapRecord]] = []
         if not self._dir.is_dir():
-            logger.warning("watchtower records dir %s does not exist", self._dir)
-            return out
-        for path in sorted(self._dir.glob("*.json")):
+            raise NetworkError(
+                f"watchtower records dir {self._dir} does not exist (typo/unmounted?) — refusing to "
+                "report 0 swaps as healthy"
+            )
+        out: list[tuple[str, SwapRecord]] = []
+        paths = sorted(self._dir.glob("*.json"))
+        failed = 0
+        for path in paths:
             try:
                 rec = SwapRecord.from_dict(json.loads(path.read_text()))
             except Exception:
+                failed += 1
                 logger.warning("skipping unreadable swap record %s", path, exc_info=True)
                 continue
             if is_terminal(rec.state):
                 continue
             out.append((path.stem, rec))
+        if failed and failed == len(paths):
+            # Every record present failed to parse → we are BLIND, not "0 active". Page.
+            raise NetworkError(f"all {failed} record(s) in {self._dir} are unreadable — the tower is watching nothing")
         return out
 
 
@@ -122,31 +133,59 @@ OutspendFn = Callable[[str, int], Awaitable[tuple[bool, "str | None"]]]
 
 
 class OutspendBtcClaimSource:
-    """``BtcClaimSource`` = an injected outspend backend (claim detection) + a
-    ``BtcFundingReader`` for the quorum-agreed depth (wire ``MultiSourceBtcFundingReader``)."""
+    """``BtcClaimSource`` = injected outspend backend(s) (claim DETECTION) + a ``BtcFundingReader``
+    for the quorum-agreed depth (wire ``MultiSourceBtcFundingReader``).
 
-    def __init__(self, *, outspend_fn: OutspendFn, funding_reader) -> None:
-        self._outspend = outspend_fn
+    Multi-source detection (red-team MEDIUM): the maker-claim DETECTION boolean is the trigger that
+    arms the whole claim-race assessment, so a SINGLE lagging/lying/MITM'd ``/outspend`` source that
+    reports "unspent" silently SUPPRESSES the PAGE_CLAIM — the worst failure for an alert-only tower.
+    Pass several INDEPENDENT outspend backends (the same Esplora set used for depth): detection then
+    fails TOWARD paging — if ANY source sees the outpoint spent (with a txid) we treat it as claimed
+    (a missed claim is the real harm; a false page is cheap — the operator just verifies, and the
+    DEPTH read below is still the conservative quorum-min, so a single lying "spent" cannot fake
+    reorg-safety into a SAFE auto-claim). If EVERY detection source errors we fail closed (raise →
+    the reconciler pages a decision-required), never a silent "unspent". One source still works
+    (degrades to v1 behaviour)."""
+
+    def __init__(self, *, outspend_fn: OutspendFn | None = None, outspend_fns=None, funding_reader) -> None:
+        fns = list(outspend_fns) if outspend_fns is not None else ([outspend_fn] if outspend_fn is not None else [])
+        if not fns:
+            raise ValidationError("OutspendBtcClaimSource requires outspend_fn or a non-empty outspend_fns")
+        self._outspends = fns
         self._reader = funding_reader
 
     async def claim_status(self, funding_txid: str, funding_vout: int) -> BtcClaimStatus:
-        spent, spender = await self._outspend(funding_txid, funding_vout)
-        if spent and spender:
-            return BtcClaimStatus(claimed=True, claim_txid=spender)
+        errors: list[Exception] = []
+        for outspend in self._outspends:
+            try:
+                spent, spender = await outspend(funding_txid, funding_vout)
+            except Exception as exc:  # one source down must not blind detection
+                errors.append(exc)
+                logger.warning("claim-detection source failed for %s:%d: %r", funding_txid, funding_vout, exc)
+                continue
+            if spent and spender:
+                return BtcClaimStatus(claimed=True, claim_txid=spender)
+        if errors and len(errors) == len(self._outspends):
+            # Every independent detection source failed → blind to the claim. Fail-closed.
+            raise NetworkError(f"all {len(errors)} claim-detection source(s) failed: {errors[0]!r}")
         return BtcClaimStatus(claimed=False)
 
     async def confirmations(self, claim_txid: str) -> int:
         return int(await self._reader.confirmations(claim_txid))
 
 
-async def mempool_space_outspend(session, base_url: str, funding_txid: str, vout: int) -> tuple[bool, str | None]:
-    """Query mempool.space ``/api/tx/{txid}/outspend/{vout}`` → ``(spent, spending_txid)``.
+async def mempool_space_outspend(
+    session, base_url: str, funding_txid: str, vout: int, *, timeout_s: float = 15.0
+) -> tuple[bool, str | None]:
+    """Query an Esplora/mempool.space ``/api/tx/{txid}/outspend/{vout}`` → ``(spent, spending_txid)``.
 
-    ``session`` is an aiohttp ``ClientSession``. Returns the spending txid only when the
-    outpoint is spent and the server reports a 64-char txid.
+    ``session`` is an aiohttp ``ClientSession``. Returns the spending txid only when the outpoint is
+    spent and the server reports a 64-char txid. An explicit per-REQUEST ``timeout_s`` (red-team LOW)
+    bounds a slow source: without it the call inherits aiohttp's 300s session default, so one slow
+    Esplora can outlast the dead-man's-switch window and trip a false "tower DOWN" page.
     """
     url = f"{base_url.rstrip('/')}/api/tx/{funding_txid}/outspend/{vout}"
-    async with session.get(url) as resp:
+    async with session.get(url, timeout=aiohttp_timeout(timeout_s)) as resp:
         resp.raise_for_status()
         data = await resp.json()
     spent = bool(data.get("spent"))

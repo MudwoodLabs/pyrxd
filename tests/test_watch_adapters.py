@@ -21,7 +21,7 @@ from pyrxd.gravity.watch import (
     Severity,
     mempool_space_outspend,
 )
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 
 
 def _xonly() -> bytes:
@@ -59,8 +59,24 @@ async def test_record_store_lists_only_active(tmp_path):
     assert active[0][1].state is SwapState.BOTH_LOCKED
 
 
-async def test_record_store_missing_dir_is_empty(tmp_path):
-    assert await JsonDirRecordStore(tmp_path / "nope").list_active() == []
+async def test_record_store_missing_dir_raises(tmp_path):
+    # red-team MEDIUM: a missing/typo'd/unmounted records dir must NOT read as a healthy 0-swap
+    # tick — it RAISES so the reconciler pages "watching nothing" instead of looking healthy.
+    with pytest.raises(NetworkError, match="does not exist"):
+        await JsonDirRecordStore(tmp_path / "nope").list_active()
+
+
+async def test_record_store_all_unreadable_raises(tmp_path):
+    # Files present but EVERY one unreadable => blind, not "0 active" => raise.
+    (tmp_path / "a.json").write_text("{ not json")
+    (tmp_path / "b.json").write_text("also not json")
+    with pytest.raises(NetworkError, match="unreadable"):
+        await JsonDirRecordStore(tmp_path).list_active()
+
+
+async def test_record_store_empty_existing_dir_is_ok(tmp_path):
+    # A genuinely empty existing dir is healthy (0 swaps), not an error.
+    assert await JsonDirRecordStore(tmp_path).list_active() == []
 
 
 # --- ElectrumRxdChainSource -----------------------------------------------
@@ -130,6 +146,44 @@ async def test_claim_source_unspent():
     assert status.claim_txid is None
 
 
+async def _unspent(txid, vout):
+    return False, None
+
+
+async def _spent(txid, vout):
+    return True, "ef" * 32
+
+
+async def _boom(txid, vout):
+    raise RuntimeError("esplora 503")
+
+
+async def test_claim_source_multi_any_spent_detects():
+    # red-team #2: detection fails TOWARD paging — ANY source seeing the outpoint spent → claimed,
+    # so a single lagging/lying source can no longer suppress the claim page.
+    src = OutspendBtcClaimSource(outspend_fns=[_unspent, _spent], funding_reader=FakeReader(7))
+    status = await src.claim_status("cd" * 32, 1)
+    assert status.claimed is True and status.claim_txid == "ef" * 32
+
+
+async def test_claim_source_multi_all_unspent_is_unspent():
+    src = OutspendBtcClaimSource(outspend_fns=[_unspent, _unspent], funding_reader=FakeReader(0))
+    assert (await src.claim_status("cd" * 32, 1)).claimed is False
+
+
+async def test_claim_source_one_source_down_other_decides():
+    # One source erroring must not blind detection; the surviving source decides.
+    src = OutspendBtcClaimSource(outspend_fns=[_boom, _spent], funding_reader=FakeReader(7))
+    assert (await src.claim_status("cd" * 32, 1)).claimed is True
+
+
+async def test_claim_source_all_sources_down_fails_closed():
+    # red-team #2: EVERY detection source failing → blind → fail CLOSED (raise), never silent unspent.
+    src = OutspendBtcClaimSource(outspend_fns=[_boom, _boom], funding_reader=FakeReader(0))
+    with pytest.raises(NetworkError, match="claim-detection source"):
+        await src.claim_status("cd" * 32, 1)
+
+
 # --- mempool_space_outspend -----------------------------------------------
 
 
@@ -155,8 +209,9 @@ class _FakeSession:
         self._data = data
         self.urls: list[str] = []
 
-    def get(self, url):
+    def get(self, url, timeout=None):  # timeout: the per-request ClientTimeout the adapter now sets
         self.urls.append(url)
+        self.last_timeout = timeout
         return _FakeResp(self._data)
 
 
@@ -171,6 +226,13 @@ async def test_mempool_outspend_spent():
 async def test_mempool_outspend_unspent():
     spent, spender = await mempool_space_outspend(_FakeSession({"spent": False}), "https://mempool.space", "cd" * 32, 0)
     assert (spent, spender) == (False, None)
+
+
+async def test_mempool_outspend_sets_per_request_timeout():
+    # red-team #8: an explicit per-request timeout is passed (not aiohttp's 300s session default).
+    sess = _FakeSession({"spent": False})
+    await mempool_space_outspend(sess, "https://m", "cd" * 32, 0, timeout_s=7.0)
+    assert sess.last_timeout is not None
 
 
 async def test_mempool_outspend_bad_spender_txid_dropped():

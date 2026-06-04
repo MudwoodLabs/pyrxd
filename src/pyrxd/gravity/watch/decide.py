@@ -176,10 +176,12 @@ def decide(
             Intent.NOOP, reason=f"counter_chain={terms.counter_chain} deferred to v3", low_corroboration=corr
         )
 
-    # 2. Claim race. Chain truth dominates the record: a maker counter-leg claim
-    #    observed on-chain means p is (becoming) public — assess the asset claim
-    #    regardless of whether record.state has caught up (Gap 2/7).
-    if obs.maker_has_claimed_btc:
+    # 2. Claim race. p is (becoming) public if EITHER the chain shows the maker's counter-leg claim
+    #    (obs.maker_has_claimed_btc) OR the RECORD already advanced to SECRET_REVEALED — OR'd so a
+    #    suppressed single-source claim DETECTION cannot drop a known-revealed swap into the silent
+    #    WATCH catch-all (red-team LOW: record-truth and chain-truth are independent; whichever
+    #    indicates the reveal arms the gate). Assess regardless of whether record.state caught up.
+    if obs.maker_has_claimed_btc or state is SwapState.SECRET_REVEALED:
         if obs.btc_claim_confirmations is None or obs.asset_locked_at_height is None:
             # Cannot assess finality — fail closed to a decision-required page.
             return Decision(

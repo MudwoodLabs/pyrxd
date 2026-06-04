@@ -14,6 +14,12 @@ Example (alongside the tower writing /run/wt/hb.json every 30s):
 
 Use a DIFFERENT alert channel/endpoint from the tower where possible — a shared
 channel that is itself down would hide both signals.
+
+Run it under a supervisor with ``Restart=on-failure`` (systemd) or equivalent: the
+monitor IS the liveness backstop, so it must come back if it ever exits. The page
+send inside ``DeadMansSwitch.check`` is now guarded (a transient channel error logs +
+retries next interval rather than crashing the monitor), but a supervisor still covers
+an unexpected exit / OOM.
 """
 
 from __future__ import annotations

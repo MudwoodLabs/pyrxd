@@ -142,6 +142,35 @@ async def test_alerter_failure_does_not_crash_loop():
     assert results[0].decision.intent is Intent.PAGE_CLAIM
 
 
+async def test_store_unreadable_pages_and_does_not_crash():
+    # red-team #6: a directory-level store fault (missing dir / ESTALE / EIO) must become a PAGE,
+    # never crash tick() and stop the heartbeat.
+    class _RaisingStore:
+        async def list_active(self):
+            raise OSError("ESTALE: stale NFS handle")
+
+    alerter = FakeAlerter()
+    results = await _reconciler(_RaisingStore(), FakeObserver({}), alerter).tick()
+    assert len(results) == 1
+    assert results[0].decision.intent is Intent.PAGE_SQUEEZED
+    assert "records store unreadable" in results[0].decision.reason
+    assert results[0].alert_delivered is True
+    assert alerter.pages and alerter.pages[0][1] is Intent.PAGE_SQUEEZED
+
+
+async def test_alert_delivery_failure_surfaced_on_result():
+    # red-team #5: a swallowed delivery failure must be VISIBLE (alert_delivered=False) so the
+    # heartbeat counts UNDELIVERED pages instead of looking healthy while dropping CRITICALs.
+    obs = Observations(
+        maker_has_claimed_btc=True, now_rxd_height=150, asset_locked_at_height=100, btc_claim_confirmations=6
+    )
+    store = FakeStore([("claim", _rec(SwapState.SECRET_REVEALED))])
+    ok = await _reconciler(store, FakeObserver({"claim": obs}), FakeAlerter(fail=False)).tick()
+    assert ok[0].alert_delivered is True
+    bad = await _reconciler(store, FakeObserver({"claim": obs}), FakeAlerter(fail=True)).tick()
+    assert bad[0].alert_delivered is False  # delivery failed, surfaced (not swallowed-and-healthy)
+
+
 async def test_single_flight_skips_concurrent_reconcile():
     class BlockingObserver:
         def __init__(self, obs):

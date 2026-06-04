@@ -137,6 +137,17 @@ def test_claim_safe_pages_claim():
     assert d.deadline_rxd_height == REFUND_OPENS
 
 
+def test_secret_revealed_record_arms_gate_even_if_detection_suppressed():
+    # red-team #7: a record at SECRET_REVEALED is INDEPENDENT evidence p is public. Even if the
+    # single-source chain DETECTION is suppressed (maker_has_claimed_btc=False), the swap must NOT
+    # fall to the silent WATCH catch-all — the record alone arms the claim-finality assessment, which
+    # with no claim depth available fails CLOSED to a decision-required page (never a silent all-clear).
+    obs = Observations(maker_has_claimed_btc=False, now_rxd_height=150, asset_locked_at_height=LOCK)
+    d = _decide(_record(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert "un-assessable" in d.reason
+
+
 def test_claim_wait_keeps_watching():
     # NOT_YET_FINAL (3 conf) but window has room → WAIT → WATCH (no page).
     obs = Observations(

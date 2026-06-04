@@ -71,6 +71,8 @@ async def test_run_loop_validates_args():
         await run_loop("not a reconciler", interval_s=1)
     with pytest.raises(ValidationError):
         await run_loop(_reconciler(), interval_s=-1)
+    with pytest.raises(ValidationError):
+        await run_loop(_reconciler(), interval_s=1, tick_timeout_s=0, max_iterations=1)
 
 
 def test_default_heartbeat_logs_paged_count(caplog):
@@ -82,3 +84,46 @@ def test_default_heartbeat_logs_paged_count(caplog):
         default_heartbeat()(7, results)
     rec = next(r for r in caplog.records if "heartbeat" in r.message)
     assert "tick=7" in rec.message and "swaps=2" in rec.message and "paged=1" in rec.message
+
+
+def test_default_heartbeat_warns_on_undelivered(caplog):
+    # red-team #5: an UNDELIVERED page must log at ERROR (loud), not blend into a healthy INFO beat.
+    results = [ReconcileResult("a", Decision(Intent.PAGE_CLAIM, reason="x"), alert_delivered=False)]
+    with caplog.at_level(logging.INFO, logger="pyrxd.gravity.watch.daemon"):
+        default_heartbeat()(1, results)
+    rec = next(r for r in caplog.records if "heartbeat" in r.message)
+    assert "undelivered=1" in rec.message and rec.levelno == logging.ERROR
+
+
+async def test_run_loop_heartbeat_sink_failure_does_not_crash():
+    # red-team #11: a heartbeat-sink failure (e.g. ENOSPC writing the heartbeat file) must degrade to
+    # a stale beat the deadman catches, NOT crash the reconcile loop.
+    def _boom(i, res):
+        raise OSError("ENOSPC")
+
+    n = await run_loop(_reconciler(), interval_s=0, on_heartbeat=_boom, sleep=_noop_sleep, max_iterations=2)
+    assert n == 2  # loop survived despite the sink raising every tick
+
+
+async def test_run_loop_tick_timeout_emits_degraded_heartbeat():
+    # red-team #8: a tick that exceeds the watchdog budget must not block past the deadman window;
+    # the loop times it out, emits an alive (empty) heartbeat, and continues.
+    class _SlowStore:
+        async def list_active(self):
+            await asyncio.sleep(10)  # longer than the tick budget
+            return []  # pragma: no cover - cancelled by wait_for
+
+    slow = Reconciler(
+        store=_SlowStore(), observer=_Null(), alerter=_Null(), policy=MarginPolicy.estimated(), safety_window_blocks=6
+    )
+    beats: list[int] = []
+    n = await run_loop(
+        slow,
+        interval_s=0,
+        on_heartbeat=lambda i, res: beats.append(len(res)),
+        sleep=_noop_sleep,
+        max_iterations=1,
+        tick_timeout_s=0.01,
+    )
+    assert n == 1
+    assert beats == [0]  # degraded (empty) but ALIVE heartbeat still emitted
