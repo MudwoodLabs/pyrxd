@@ -48,6 +48,7 @@ from _dust_swap_shared import (
     rxd_blockcount,
 )
 from _glyph_mainnet import (  # scripts/ sibling (NFT + FT paths)
+    load_minted_ft,
     load_minted_nft,
     lock_ft_into_covenant,
     lock_singleton_into_covenant,
@@ -332,16 +333,22 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             )
         print(f"  minted NFT genesis ref: {minted.ref_str}")
     elif args.asset_variant == "ft":
-        print("\n  --- FT path: minting a fresh throwaway Glyph FT on RXD MAINNET (commit→reveal premine) ---")
-        minted = mint_ft_inline(
-            rxd_client,
-            name=args.ft_name,
-            ticker=args.ft_ticker,
-            premine_amount=args.ft_premine_photons,
-            fee_photons=args.rxd_mint_fee_photons,
-            confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
-            poll_s=args.confirm_poll_s,
-        )
+        if args.ft_reuse_reveal_txid:
+            if not args.ft_owner_wif:
+                raise SystemExit("--ft-reuse-reveal-txid requires --ft-owner-wif (to spend the FT)")
+            print(f"\n  --- FT path: REUSING already-minted FT at reveal {args.ft_reuse_reveal_txid} (no mint) ---")
+            minted = load_minted_ft(rxd_client, reveal_txid=args.ft_reuse_reveal_txid, owner_wif=args.ft_owner_wif)
+        else:
+            print("\n  --- FT path: minting a fresh throwaway Glyph FT on RXD MAINNET (commit→reveal premine) ---")
+            minted = mint_ft_inline(
+                rxd_client,
+                name=args.ft_name,
+                ticker=args.ft_ticker,
+                premine_amount=args.ft_premine_photons,
+                fee_photons=args.rxd_mint_fee_photons,
+                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
+                poll_s=args.confirm_poll_s,
+            )
         print(f"  minted FT genesis ref: {minted.ref_str}  ({minted.ft_amount} units)")
     # eth_timeout starts AFTER the (slow, multi-block) mint, so the full window is available for the swap.
     eth_timeout = int(time.time()) + args.eth_timeout_s
@@ -402,12 +409,12 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         min_confirmations=1,
         audit_cleared=True,
     )
-    # NFT: the REAL RXinDexer is the genesis-ref authenticity oracle (R1 fake-singleton defense).
-    # Plain RXD has no ref → no indexer needed. Default to the REST adapter over ssh-tr (the mainnet
-    # deployment runs only the HTTP api, no glyph electrumx ws); use the electrumx-ws adapter only
-    # when a --rxd-indexer-ws is explicitly given (e.g. a glyph-enabled electrumx).
+    # NFT/FT both carry a genesis ref → the REAL RXinDexer is the genesis-ref authenticity oracle
+    # (R1 fake-singleton defense). Plain RXD has no ref → no indexer needed. Default to the REST
+    # adapter over ssh-tr (the mainnet deployment runs only the HTTP api, no glyph electrumx ws);
+    # use the electrumx-ws adapter only when a --rxd-indexer-ws is explicitly given.
     indexer = None
-    if args.asset_variant == "nft":
+    if args.asset_variant in ("nft", "ft"):
         chain_io = RadiantChainIO(rxd_client)
         if args.rxd_indexer_ws:
             ex = ElectrumXClient(urls=[args.rxd_indexer_ws], allow_insecure=args.rxd_indexer_insecure)
@@ -583,6 +590,8 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--ft-name", default="ETH-RXD-REAL-FT")
     ap.add_argument("--ft-ticker", default="ERFT")
     ap.add_argument("--ft-premine-photons", type=int, default=10_000_000)  # FT supply = covenant-locked amount (1 photon = 1 unit)
+    ap.add_argument("--ft-reuse-reveal-txid", default="", help="reuse an already-minted FT at this reveal txid (skip minting)")
+    ap.add_argument("--ft-owner-wif", default="", help="owner WIF for --ft-reuse-reveal-txid (spends the FT into the covenant)")
     ap.add_argument("--rxd-indexer-ws", default="", help="OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api over ssh-tr")
     ap.add_argument("--rxd-indexer-insecure", action="store_true", help="allow a non-TLS RXinDexer ws")
     ap.add_argument("--rxd-ssh-host", default="tr", help="ssh host for the RXinDexer REST REF gate (default tr)")

@@ -424,6 +424,35 @@ def mint_ft_inline(
     )
 
 
+def load_minted_ft(rxd_client, *, reveal_txid: str, owner_wif: str) -> MintedFt:
+    """Reconstruct a :class:`MintedFt` for an ALREADY-minted FT (skip the mint), e.g. to resume a run
+    that aborted after minting. Fetches the reveal tx on-chain for the FT holder script + amount,
+    parses the genesis ref from the holder's ``bd d0 <ref>``, and binds the owner key.
+
+    Safety: asserts the owner key's hash160 equals the p2pkh inside the FT holder — i.e. this key can
+    actually spend the FT into the covenant."""
+    v = _cli(rxd_client, "getrawtransaction", reveal_txid, "1")
+    if not isinstance(v, dict) or not v.get("vout"):
+        raise RuntimeError(f"reuse: FT reveal tx {reveal_txid} not found / has no outputs")
+    out0 = v["vout"][0]
+    ft_script = bytes.fromhex(out0["scriptPubKey"]["hex"])
+    ft_amount = round(float(out0["value"]) * 1e8)
+    g_txid, g_vout = _genesis_ref_from_ft_script(ft_script)
+    key = PrivateKey(str(owner_wif))
+    # FT holder = 76 a9 14 <pkh:20> 88 ac ... -> pkh at offset 3:23
+    if ft_script[3:23] != bytes(key.public_key().hash160()):
+        raise RuntimeError("reuse: owner WIF does not match the FT holder's p2pkh — wrong key, cannot spend the FT")
+    return MintedFt(
+        ref_str=f"{g_txid}:{g_vout}",
+        reveal_txid=reveal_txid,
+        genesis_txid=g_txid,
+        genesis_vout=g_vout,
+        owner_key=key,
+        ft_script=ft_script,
+        ft_amount=ft_amount,
+    )
+
+
 def lock_ft_into_covenant(
     rxd_client,
     *,
