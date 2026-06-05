@@ -125,6 +125,11 @@ Type or paste your seed phrase and press Enter.
 > looking at your screen can read them. It's working even though nothing shows.
 > (On Windows Command Prompt, right-click to paste.)
 
+> ⏳ **This is not instant.** The search checks a lot of addresses across several
+> possible paths, so give it **a couple of minutes**. If the screen sits there
+> with no output for a while, that's normal — it's working, not frozen. Don't
+> close it.
+
 The tool checks the likely addresses and tells you where your coins are. A
 successful result looks like this:
 

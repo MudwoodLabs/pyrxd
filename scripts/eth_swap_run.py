@@ -47,18 +47,28 @@ from _dust_swap_shared import (
     confirm,
     rxd_blockcount,
 )
+from _glyph_mainnet import (  # scripts/ sibling (NFT path)
+    load_minted_nft,
+    lock_singleton_into_covenant,
+    mint_nft_inline,
+    wait_genesis_mature,
+)
+from _glyph_ref_http import SshTrHttpRefAdapter  # scripts/ sibling (mainnet REST REF gate)
 from radiant_mainnet_chainio import SshTrRadiantClient
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
 from pyrxd.eth_wallet.rpc import EthRpc
+from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
-from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
-from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.htlc_covenant import build_htlc_covenant_nft, build_htlc_covenant_rxd
+from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
+from pyrxd.network.electrumx import ElectrumXClient
+from pyrxd.network.rxindexer import RxinDexerClient
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
 
@@ -120,7 +130,9 @@ def _free_port() -> int:
     return port
 
 
-def _build_terms_and_covenant(args, *, eth_timeout: int):
+def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None):
+    """Build the HTLC covenant + negotiated terms. ``minted`` (a MintedNft) is REQUIRED for the
+    NFT variant — the covenant binds the genesis ref ``reveal_txid:0`` of the freshly-minted NFT."""
     p_secret = SecretBytes(os.urandom(32))
     h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
     t_rxd = bt.Timelock(args.t_rxd_blocks, bt.TimeUnit.BLOCKS)
@@ -128,17 +140,37 @@ def _build_terms_and_covenant(args, *, eth_timeout: int):
     taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
-    cov = build_htlc_covenant_rxd(
-        amount=args.rxd_photons, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
-    )
+    if args.asset_variant == "nft":
+        if minted is None:
+            raise SystemExit("internal: the NFT path must mint the singleton before building the covenant")
+        # Bind the covenant to the TRUE genesis ref the singleton carries (the commit outpoint,
+        # parsed from its d8<ref>) — NOT reveal_txid:0 (the singleton's current location). Binding the
+        # wrong ref makes the covenant require a singleton that does not exist -> NFT permanently stranded.
+        cov = build_htlc_covenant_nft(
+            genesis_txid=minted.genesis_txid,
+            genesis_vout=minted.genesis_vout,
+            nft_carrier_value=args.nft_carrier_photons,
+            taker_pkh=taker_pkh,
+            maker_pkh=maker_pkh,
+            hashlock=h,
+            refund_csv=t_rxd.value,
+        )
+        asset_variant = "nft"
+        genesis_ref = GlyphRef(txid=minted.genesis_txid, vout=minted.genesis_vout).to_bytes()
+        radiant_amount = args.nft_carrier_photons
+    else:
+        cov = build_htlc_covenant_rxd(
+            amount=args.rxd_photons, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
+        )
+        asset_variant, genesis_ref, radiant_amount = "rxd", b"", args.rxd_photons
     terms = NegotiatedTerms(
         hashlock=h,
-        btc_sats=args.rxd_photons,
-        radiant_amount=args.rxd_photons,
+        btc_sats=radiant_amount,
+        radiant_amount=radiant_amount,
         t_btc=t_btc,
         t_rxd=t_rxd,
-        asset_variant="rxd",
-        genesis_ref=b"",
+        asset_variant=asset_variant,
+        genesis_ref=genesis_ref,
         taker_dest_hash=cov.expected_taker_hash,
         maker_dest_hash=cov.expected_maker_hash,
         btc_claim_pubkey_xonly=b"\x00" * 32,
@@ -236,6 +268,14 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     for req in ("eth_rpc_url", "eth_key_hex", "eth_claim_to", "eth_refund_to"):
         if not getattr(args, req):
             raise SystemExit(f"stage=sepolia-dust requires --{req.replace('_', '-')}")
+    # Pre-flight: refuse BEFORE minting if the recovery file already exists (atomic_write_mode_600 is
+    # O_EXCL). A leftover file from a prior/aborted run would otherwise crash the keys-persist step
+    # AFTER the (real-value) mint — wasting the mint. Fail cheap, up front.
+    if Path(args.keys_out).expanduser().exists():
+        raise SystemExit(
+            f"recovery file already exists: {Path(args.keys_out).expanduser()} — move/delete it or pass a "
+            f"fresh --keys-out before a new run (refusing to mint over a stale recovery file)"
+        )
     # Pin the RXD network to the transport's true network (mainnet) — fail-closed like dust_swap_run.
     rxd_network = SshTrRadiantClient.NETWORK
     print(f"=== ETH↔RXD DUST swap — stage=sepolia-dust  (ETH=sepolia, RXD={rxd_network} mainnet) ===")
@@ -251,8 +291,30 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     }
     report = StepReport("sepolia-dust", provenance)
 
+    rxd_client = SshTrRadiantClient(rpcwallet=args.rxd_wallet)
+    minted = None
+    if args.asset_variant == "nft":
+        if args.nft_reuse_reveal_txid:
+            if not args.nft_owner_wif:
+                raise SystemExit("--nft-reuse-reveal-txid requires --nft-owner-wif (to spend the singleton)")
+            print(f"\n  --- NFT path: REUSING already-minted NFT at reveal {args.nft_reuse_reveal_txid} (no mint) ---")
+            minted = load_minted_nft(
+                rxd_client, reveal_txid=args.nft_reuse_reveal_txid, owner_wif=args.nft_owner_wif
+            )
+        else:
+            print("\n  --- NFT path: minting a fresh throwaway NFT on RXD MAINNET (commit→reveal, real-value) ---")
+            minted = mint_nft_inline(
+                rxd_client,
+                name=args.nft_name,
+                commit_photons=args.nft_commit_photons,
+                fee_photons=args.rxd_mint_fee_photons,
+                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
+                poll_s=args.confirm_poll_s,
+            )
+        print(f"  minted NFT genesis ref: {minted.ref_str}")
+    # eth_timeout starts AFTER the (slow, multi-block) mint, so the full window is available for the swap.
     eth_timeout = int(time.time()) + args.eth_timeout_s
-    terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(args, eth_timeout=eth_timeout)
+    terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(args, eth_timeout=eth_timeout, minted=minted)
 
     # Persist ALL run state (mode 600) BEFORE any broadcast — recovery/sweep. Holds the preimage p
     # + the ETH signing key + the RXD keys + the covenant SPK; single point of total compromise.
@@ -276,6 +338,10 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 "maker_rxd_wif": _rkeys[1].wif(),
                 "rxd_covenant_spk": cov.funded_spk.hex(),
                 "t_rxd_blocks": terms.t_rxd.value,
+                "asset_variant": args.asset_variant,
+                "nft_genesis_ref": minted.ref_str if minted else None,
+                "nft_owner_wif": minted.owner_key.wif() if minted else None,
+                "nft_reveal_value": minted.reveal_value if minted else None,
                 "note": "ALL run state for recovery/sweep incl preimage p. mode 600 — delete after sweep.",
             },
             indent=2,
@@ -293,7 +359,6 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         eth_timeout=eth_timeout,
         network="sepolia",
     )
-    rxd_client = SshTrRadiantClient(rpcwallet=args.rxd_wallet)
     rxd_client.register_spk(cov.funded_spk)
     rxd_leg = RadiantCovenantLeg(
         network=rxd_network,
@@ -304,14 +369,36 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         min_confirmations=1,
         audit_cleared=True,
     )
+    # NFT: the REAL RXinDexer is the genesis-ref authenticity oracle (R1 fake-singleton defense).
+    # Plain RXD has no ref → no indexer needed. Default to the REST adapter over ssh-tr (the mainnet
+    # deployment runs only the HTTP api, no glyph electrumx ws); use the electrumx-ws adapter only
+    # when a --rxd-indexer-ws is explicitly given (e.g. a glyph-enabled electrumx).
+    indexer = None
+    if args.asset_variant == "nft":
+        chain_io = RadiantChainIO(rxd_client)
+        if args.rxd_indexer_ws:
+            ex = ElectrumXClient(urls=[args.rxd_indexer_ws], allow_insecure=args.rxd_indexer_insecure)
+            indexer = RxinDexerRefAdapter(RxinDexerClient(ex), chain_io)
+            print(f"  REF gate: electrumx-ws RxinDexerRefAdapter @ {args.rxd_indexer_ws}")
+        else:
+            indexer = SshTrHttpRefAdapter(chain_io=chain_io, ssh_host=args.rxd_ssh_host, api_base=args.rxd_api_base)
+            print(f"  REF gate: REST SshTrHttpRefAdapter via ssh {args.rxd_ssh_host} -> {args.rxd_api_base}")
+    cfg = CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True)
     coord = SwapCoordinator(
         record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=eth_leg,
         radiant_leg=rxd_leg,
-        indexer=None,
+        indexer=indexer,
         seen_store=InMemSeen(),
-        config=CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True),
+        config=cfg,
     )
+
+    # Before funding the counter-leg, wait for the NFT genesis to reach the REF-gate reorg depth
+    # (the pre-lock gate fails CLOSED on a shallow genesis). No-op for plain RXD (no genesis ref).
+    if minted is not None:
+        wait_genesis_mature(
+            rxd_client, minted.genesis_txid, need_confs=cfg.min_ref_confirmations, poll_s=args.confirm_poll_s
+        )
 
     try:
         # 1. Taker deploys + funds the ETH HTLC on Sepolia.
@@ -334,12 +421,25 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         confirm("maker_verify_counter_funding: verify the on-chain ETH HTLC pays the maker", auto_yes=args.yes)
         rec = await coord.maker_verify_counter_funding(rec.counterchain_locator.contract_address)
         report.step(name="maker_verify_counter_funding", chain="eth", state=rec.state.value)
-        print(f"  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
+        print("  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
 
-        # 2. Maker locks the RXD covenant on MAINNET (operator pays the SPK); taker re-validates.
-        print(f"\n  Fund the RXD covenant SPK on MAINNET as the maker (>= 1 conf):\n    {cov.funded_spk.hex()}")
+        # 2. Maker locks the ASSET on MAINNET, then the taker re-validates (incl. the genesis-ref
+        #    authenticity gate for an NFT). NFT: spend the minted singleton INTO the covenant SPK
+        #    (harness-driven, confirm-each). RXD: the operator funds the SPK out-of-band.
         rxd_locked_at = rxd_blockcount(rxd_client)
-        confirm("you have funded the RXD covenant SPK on mainnet and it has >= 1 conf", auto_yes=args.yes)
+        if args.asset_variant == "nft":
+            lock_singleton_into_covenant(
+                rxd_client,
+                minted=minted,
+                covenant_spk=cov.funded_spk,
+                carrier_photons=args.nft_carrier_photons,
+                fee_photons=args.rxd_mint_fee_photons,
+                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
+                poll_s=args.confirm_poll_s,
+            )
+        else:
+            print(f"\n  Fund the RXD covenant SPK on MAINNET as the maker (>= 1 conf):\n    {cov.funded_spk.hex()}")
+            confirm("you have funded the RXD covenant SPK on mainnet and it has >= 1 conf", auto_yes=args.yes)
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=int(time.time()))
         report.step(
             name="post_asset_lock_revalidate",
@@ -436,6 +536,19 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--rxd-fee-photons", type=int, default=5_000_000)
     ap.add_argument("--rxd-wallet", default="")
     ap.add_argument("--t-rxd-blocks", type=int, default=60)
+    # asset: plain RXD (default) or a freshly-minted NFT Glyph (Glyph↔ETH).
+    ap.add_argument("--asset-variant", choices=("rxd", "nft"), default="rxd")
+    ap.add_argument("--rxd-indexer-ws", default="", help="OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api over ssh-tr")
+    ap.add_argument("--rxd-indexer-insecure", action="store_true", help="allow a non-TLS RXinDexer ws")
+    ap.add_argument("--rxd-ssh-host", default="tr", help="ssh host for the RXinDexer REST REF gate (default tr)")
+    ap.add_argument("--rxd-api-base", default="http://127.0.0.1:8000", help="RXinDexer REST api base on the ssh host")
+    ap.add_argument("--nft-reuse-reveal-txid", default="", help="reuse an already-minted NFT at this reveal txid (skip minting)")
+    ap.add_argument("--nft-owner-wif", default="", help="owner WIF for --nft-reuse-reveal-txid (spends the singleton into the covenant)")
+    ap.add_argument("--nft-name", default="ETH-RXD-REAL-NFT")
+    ap.add_argument("--nft-carrier-photons", type=int, default=1_000_000)  # carrier the covenant pins
+    ap.add_argument("--nft-commit-photons", type=int, default=20_000_000)  # mint commit funding
+    ap.add_argument("--rxd-mint-fee-photons", type=int, default=5_000_000)  # per mint/lock tx (mainnet 0.10 RXD/kB)
+    ap.add_argument("--confirm-poll-s", type=float, default=30.0, help="mainnet confirmation poll interval")
     # margin / cross-clock
     ap.add_argument("--margin-blocks", type=int, default=36)
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
