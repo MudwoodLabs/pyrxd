@@ -13,40 +13,11 @@ import asyncio
 import click
 
 from ..hd.wallet import HdWallet
-from ..security.errors import NetworkError, ValidationError
+from ..security.errors import NetworkError
 from .context import CliContext
-from .errors import NetworkBoundaryError, UserError, WalletDecryptError
+from .errors import NetworkBoundaryError, UserError
 from .format import emit, format_photons
-from .prompts import prompt_mnemonic_input, prompt_passphrase_input
-
-
-def _load_wallet(ctx: CliContext, *, prompt_passphrase: bool = False) -> HdWallet:
-    """Open the wallet referenced by *ctx*. Used by every query command."""
-    if not ctx.wallet_path.exists():
-        raise UserError(
-            f"no wallet at {ctx.wallet_path}",
-            cause="the file does not exist",
-            fix="run `pyrxd wallet new` to create one, or pass --wallet PATH",
-        )
-    mnemonic = prompt_mnemonic_input()
-    if not mnemonic:
-        raise UserError(
-            "mnemonic is required",
-            cause="no input received",
-            fix="enter the BIP39 mnemonic the wallet was created with",
-        )
-    passphrase = ""  # nosec B105 — empty string is the BIP39 spec default (no passphrase), not a hardcoded secret
-    if prompt_passphrase:
-        passphrase = prompt_passphrase_input(optional=False)
-    try:
-        return HdWallet.load(ctx.wallet_path, mnemonic, passphrase)
-    except (ValidationError, ValueError) as exc:
-        # ValidationError: library's "Could not decrypt" surface.
-        # ValueError:      bip39.validate_mnemonic on a non-wordlist word.
-        # Both collapse to a single decrypt-failed exit code — we never
-        # echo the user's input back, so distinguishing them would only
-        # leak information about which guess was closer.
-        raise WalletDecryptError() from exc
+from .prompts import _load_wallet
 
 
 @click.command(name="address")
