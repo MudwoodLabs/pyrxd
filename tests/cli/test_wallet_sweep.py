@@ -147,6 +147,30 @@ class TestWalletSweep:
         assert "mnemonic is required" in result.output
         client.broadcast.assert_not_awaited()
 
+    def test_testnet_address_rejected_on_mainnet(self, runner: CliRunner) -> None:
+        # MEDIUM-1 fix: a testnet-prefixed --to must be rejected on a mainnet
+        # config, or the sweep would pay a script no mainnet key can spend.
+        testnet_dest = "mipcBbFg9gMiCh81Kj8tqqdgoZub1ZJRfn"  # valid testnet P2PKH
+        client = _funded_client(_addr(0, 0, 0, 0))
+        result = _invoke(runner, _ctx(client), ["sweep", "--coin-type", "0", "--to", testnet_dest])
+        assert result.exit_code != 0
+        assert "invalid --to" in result.output
+        client.broadcast.assert_not_awaited()
+
+    def test_zero_fee_rate_rejected_before_seed_prompt(self, runner: CliRunner) -> None:
+        # LOW-2 fix: bad --fee-rate fails before the mnemonic is requested.
+        client = _funded_client(_addr(0, 0, 0, 0))
+        result = runner.invoke(
+            wallet_group,
+            ["sweep", "--coin-type", "0", "--to", DEST, "--fee-rate", "0"],
+            obj=_ctx(client),
+            input="",  # no mnemonic provided — must fail before needing it
+        )
+        assert result.exit_code != 0
+        assert "--fee-rate" in result.output
+        assert "Mnemonic" not in result.output  # never reached the seed prompt
+        client.broadcast.assert_not_awaited()
+
     def test_negative_coin_type_rejected(self, runner: CliRunner) -> None:
         client = _funded_client(None)
         result = _invoke(runner, _ctx(client), ["sweep", "--coin-type", "-1", "--to", DEST])

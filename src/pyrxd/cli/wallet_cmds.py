@@ -16,6 +16,7 @@ from typing import cast
 
 import click
 
+from ..constants import Network
 from ..hd.bip39 import mnemonic_from_entropy
 from ..hd.discovery import DEFAULT_ACCOUNTS, DEFAULT_COIN_TYPES, coin_type_label, discover
 from ..hd.wallet import HdWallet
@@ -472,15 +473,22 @@ def wallet_sweep(
     """
     if coin_type < 0 or account < 0:
         raise UserError("--coin-type and --account must be non-negative")
+    if fee_rate <= 0:
+        # Validate before the mnemonic prompt so a bad invocation fails
+        # without the user first typing their seed.
+        raise UserError("--fee-rate must be a positive integer (photons per kB)")
     # Block --json without --yes early (a broadcast must not auto-confirm).
     ok, why = ctx.is_destructive_mode_safe()
     if not ok:
         raise UserError(why or "destructive op without --yes in --json mode")
-    if not validate_address(to_address):
+    # Pin the destination to the ACTIVE network. Without this, a testnet-prefixed
+    # address (m.../n...) passes validation on mainnet, and the sweep pays a
+    # script no mainnet key can spend — an unrecoverable loss from a paste error.
+    if not validate_address(to_address, network=Network(ctx.network)):
         raise UserError(
             "invalid --to address",
-            cause="not a valid Radiant P2PKH address",
-            fix="pass an address you control (starts with 1)",
+            cause=f"not a valid {ctx.network} Radiant P2PKH address",
+            fix=f"pass a {ctx.network} address you control" + (" (starts with 1)" if ctx.network == "mainnet" else ""),
         )
 
     mnemonic = prompt_mnemonic_input()
