@@ -156,8 +156,8 @@ When autonomy is built, these panel findings are the blueprint (do **not** redis
 
 ## Acceptance Criteria (v1)
 ### Functional
-- [ ] Reconciler emits the correct Intent sequence for happy / maker-stall / reorg-WAIT / SQUEEZED (BTC), driven by the existing regtest e2e.
-- [ ] Never pages `PAGE_CLAIM` against a WAIT/SQUEEZED gate verdict; SQUEEZED → `PAGE_SQUEEZED` (decision-required).
+- [x] Reconciler emits the correct Intent sequence for happy / maker-stall / reorg-WAIT / SQUEEZED (BTC), driven by the existing regtest e2e. (`tests/test_xchain_swap_regtest_e2e.py::TestWatchtowerIntentSequence`, 3 tests green on real radiantd+bitcoind regtest, 2026-06-04.)
+- [x] Never pages `PAGE_CLAIM` against a WAIT/SQUEEZED gate verdict; SQUEEZED → `PAGE_SQUEEZED` (decision-required). (Asserted live: shallow BTC claim → WATCH, no page; closing window → PAGE_SQUEEZED.)
 - [ ] BTC depth via `MultiSourceBtcFundingReader`; depth-inflation never yields a premature page.
 - [ ] RXD-derived pages carry a low-corroboration flag (single-source reality).
 - [ ] Pages are authenticated, deduped, and carry {action, swap-id, deadline, why}; human-latency-aware deadline.
@@ -222,7 +222,7 @@ All four phases built on `feat/htlc-watchtower-v1`; **88 unit tests green** (`te
 
 **NOT yet done (needs a live run — honestly unverified):**
 - **End-to-end wiring is LIVE-VERIFIED** (2026-06-03) against the real `tr` node + mempool.space/esplora. A synthetic `SwapRecord` (block-170 BTC tx as the spent funding outpoint → real claim detected; a real RXD coinbase as the covenant) driven through `watchtower_run.py --once --rxd-backend ssh-tr` exercised the whole stack: JSON store → ssh-tr RXD reads (`get_tip_height` + `get_transaction_verbose`) → mempool.space outspend (claim detect) → `MultiSourceBtcFundingReader` quorum depth (860006 conf) → `decide()` → logged a CRITICAL **PAGE_CLAIM** (`taker_scrape_and_claim_asset` by RXD height 434828, low-corroboration flagged), **broadcasting nothing**. STILL unexercised: a **real** in-flight swap (the record was synthetic), and the maker-stall / WAIT / SQUEEZED branches against live data.
-- The reconciler Intent-sequence test against the **regtest e2e** harness (needs the regtest nodes running).
+- ~~The reconciler Intent-sequence test against the **regtest e2e** harness (needs the regtest nodes running).~~ — **DONE** (2026-06-04, branch `test/watchtower-regtest-e2e`): `tests/test_xchain_swap_regtest_e2e.py::TestWatchtowerIntentSequence` drives the alert-only tower over the coordinator's own BTC↔RXD regtest swap on two real nodes and asserts the Intent SEQUENCE on real consensus — happy (WATCH→WAIT→PAGE_CLAIM+dedup), maker-stall (WATCH→PAGE_REFUND), closing-window (WATCH→PAGE_SQUEEZED). The production `decide()`/`ChainObserver`/`DedupAlerter` run UNCHANGED behind thin read-only regtest chain sources; the tower broadcasts nothing. Full file green (7/7 integration). **Still unexercised:** a **real mainnet/testnet** in-flight swap (regtest is deterministic but synthetic timing).
 - `task ci` full suite (only the watch tests + targeted lint were run locally).
 - ~~"Authenticated" alert channel + dead-man's switch~~ — **DONE** (`WebhookAlertChannel` HMAC-signed + `DeadMansSwitch`/`scripts/watchtower_deadman.py`, unit-tested + live-smoked). Still open: **human-reaction-latency** folded into the admission/`MarginPolicy` window (a v2 admission concern), and using a *different* alert endpoint for the dead-man's switch than the tower (operator config).
 
