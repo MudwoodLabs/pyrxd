@@ -561,11 +561,15 @@ def wallet_sweep(
             fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
         ) from exc
     except ValidationError as exc:
-        # build_send_max_tx raises ValidationError on insufficient-funds / dust.
+        # build_send_max_tx raises ValidationError when the balance is at or
+        # below the network fee (dust). Lead with the honest framing — these
+        # coins are simply too small to move; lowering --fee-rate only helps if
+        # the user raised it above the default in the first place.
         raise UserError(
             "could not build the sweep transaction",
             cause=str(exc),
-            fix="the funds may not exceed the network fee; try a lower --fee-rate or a different path",
+            fix="this balance is too small to move — it does not exceed the network fee (dust). "
+            "Lower --fee-rate only if you raised it above the default; otherwise these coins cannot be swept.",
         ) from exc
 
     if ctx.output_mode == "json":
