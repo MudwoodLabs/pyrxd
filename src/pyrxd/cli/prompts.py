@@ -21,7 +21,10 @@ from collections.abc import Iterable
 
 import click
 
+from ..hd.wallet import HdWallet
+from ..security.errors import ValidationError
 from .context import CliContext
+from .errors import UserError, WalletDecryptError
 
 _MNEMONIC_BOX_TOP = "╔════════════════════════════════════════════════════════════╗"
 _MNEMONIC_BOX_MID = "║ Recovery mnemonic — write this down, then never share it.  ║"
@@ -115,3 +118,37 @@ def confirm_action(
     for line in summary:
         click.echo(line)
     return click.confirm(prompt_text, default=False)
+
+
+def _load_wallet(ctx: CliContext, *, prompt_passphrase: bool = False) -> HdWallet:
+    """Open the wallet referenced by *ctx*. Shared by the query + glyph commands.
+
+    Prompts for the mnemonic (and optional passphrase), then decrypts the
+    wallet at ``ctx.wallet_path``. The single canonical copy lives here so the
+    query and glyph command modules don't carry drifting duplicates.
+    """
+    if not ctx.wallet_path.exists():
+        raise UserError(
+            f"no wallet at {ctx.wallet_path}",
+            cause="the file does not exist",
+            fix="run `pyrxd wallet new` to create one, or pass --wallet PATH",
+        )
+    mnemonic = prompt_mnemonic_input()
+    if not mnemonic:
+        raise UserError(
+            "mnemonic is required",
+            cause="no input received",
+            fix="enter the BIP39 mnemonic the wallet was created with",
+        )
+    passphrase = ""  # nosec B105 — empty string is the BIP39 spec default (no passphrase), not a hardcoded secret
+    if prompt_passphrase:
+        passphrase = prompt_passphrase_input(optional=False)
+    try:
+        return HdWallet.load(ctx.wallet_path, mnemonic, passphrase)
+    except (ValidationError, ValueError) as exc:
+        # ValidationError: library's "Could not decrypt" surface.
+        # ValueError:      bip39.validate_mnemonic on a non-wordlist word.
+        # Both collapse to a single decrypt-failed exit code — we never
+        # echo the user's input back, so distinguishing them would only
+        # leak information about which guess was closer.
+        raise WalletDecryptError() from exc
