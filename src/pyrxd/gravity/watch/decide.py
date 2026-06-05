@@ -1,4 +1,4 @@
-"""Pure decision core for the alert-only watchtower (v1, BTC direction).
+"""Pure decision core for the alert-only watchtower (BTC + ETH counter-legs).
 
 ``decide(record, observations, policy, safety_window_blocks)`` returns a
 :class:`Decision` — an :class:`Intent` plus a human-actionable reason, the
@@ -77,10 +77,13 @@ class Observations:
 
     All heights are Radiant (RXD) block heights except where the field name says
     otherwise. ``btc_claim_confirmations`` is the quorum-agreed depth of the
-    maker's BTC counter-leg claim (``None`` until/unless a claim is observed).
-    ``low_corroboration`` flags an RXD read that could not be cross-checked against
-    an independent source (v1 RXD is single-source — a false read here causes a
-    false *page*, never a false broadcast).
+    maker's BTC counter-leg claim (``None`` until/unless a claim is observed). The ETH
+    counter-leg fields ``eth_claim_detected`` / ``eth_claim_finality`` are the
+    checkpoint-not-depth analogue (the maker's ETH claim + its ``finalized``-checkpoint
+    verdict state), populated only for an ETH swap — see the inline note below.
+    ``low_corroboration`` flags an RXD (or single-source ETH RPC) read that could not be
+    cross-checked against an independent source — a false read here causes a false *page*,
+    never a false broadcast.
     """
 
     maker_has_claimed_btc: bool
@@ -189,6 +192,7 @@ def decide(
     # a structurally parallel branch that consumes the SAME audited gate via a depth-less verdict.
     if terms.counter_chain == "eth":
         return _decide_eth(record=record, observations=obs, policy=policy, safety_window_blocks=safety_window_blocks)
+    # Defensive fail-safe: unreachable under NegotiatedTerms validation (counter_chain ∈ {btc, eth}).
     if terms.counter_chain != "btc":
         return Decision(
             Intent.NOOP, reason=f"counter_chain={terms.counter_chain} not supported", low_corroboration=corr
@@ -417,24 +421,32 @@ def _decide_eth(
             low_corroboration=corr,
         )
     if state is SwapState.PARAMS_MISMATCH:
+        # The maker locked the wrong covenant; the taker only needs to recover its own ETH HTLC.
+        # `taker_refund_btc` is the state-valid step (coordinator allows it from PARAMS_MISMATCH and it
+        # services the counter-leg refund — the ETH HTLC here); `mutual_refund` is BOTH_LOCKED-only and
+        # would also touch the maker's covenant. Mirror the BTC branch's action.
         return Decision(
             Intent.PAGE_REFUND,
-            reason="covenant params mismatch on the ETH swap — refund both legs once their timeouts elapse",
-            recommended_action="mutual_refund",
+            reason="covenant params mismatch on the ETH swap — refund the ETH counter-leg HTLC (taker_refund_btc)",
+            recommended_action="taker_refund_btc",
             low_corroboration=corr,
         )
-    if state in (SwapState.BOTH_LOCKED, SwapState.MAKER_STALLS):
+    if state is SwapState.MAKER_STALLS:
+        # Unreachable on the coordinator-driven ETH path (the only entry to MAKER_STALLS is
+        # maybe_refund_asset_on_maker_stall, which is forbidden for ETH — it refunds ONLY the RXD
+        # covenant and strands the taker's ETH). If observed anyway, NO clean coordinator step applies
+        # (mutual_refund is BOTH_LOCKED-only; taker_refund_btc is not valid from MAKER_STALLS) → fail
+        # closed to a decision-required page rather than name a step the coordinator rejects.
+        return Decision(
+            Intent.PAGE_SQUEEZED,
+            reason="unexpected MAKER_STALLS on an ETH swap — no clean coordinator refund from here; recover the ETH HTLC manually",
+            recommended_action="investigate (mutual_refund is only valid from BOTH_LOCKED)",
+            low_corroboration=corr,
+        )
+    if state is SwapState.BOTH_LOCKED:
         if obs.asset_locked_at_height is None:
             return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
         deadline = _refund_opens_at(policy, terms, obs.asset_locked_at_height)
-        if state is SwapState.MAKER_STALLS:
-            return Decision(
-                Intent.PAGE_REFUND,
-                reason="maker stalling (MAKER_STALLS) on the ETH swap — refund both legs (mutual_refund) once their timeouts elapse",
-                recommended_action="mutual_refund",
-                deadline_rxd_height=deadline,
-                low_corroboration=corr,
-            )
         try:
             refund_due = should_taker_refund_proactively(
                 now_block_height=obs.now_rxd_height,

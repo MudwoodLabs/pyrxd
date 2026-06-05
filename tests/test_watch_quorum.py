@@ -329,3 +329,23 @@ async def test_eth_observe_then_decide_not_final_waits():
     obs = await ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51)).observe("s", rec)  # locked at 100
     d = decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6)
     assert d.intent is Intent.WATCH  # awaiting the finalized checkpoint, window has room
+
+
+async def test_eth_observe_propagates_not_finalizing_to_squeeze():
+    # The observer must propagate a COUNTER_CHAIN_NOT_FINALIZING verdict straight to decide(), which
+    # SQUEEZES even with an ample window (RF-06: a non-finalizing counter chain is never WAITed out).
+    eth = FakeEth(
+        EthClaimStatus(claimed=True, claim_tx_hash="0x" + "12" * 32),
+        finality=CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING,
+    )
+    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    obs = await ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51)).observe("s", rec)
+    assert obs.eth_claim_finality is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING
+    d = decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6)
+    assert d.intent is Intent.PAGE_SQUEEZED
+
+
+def test_eth_claim_status_claimed_requires_hash():
+    # The dead-branch invariant the observer relies on: a claimed status MUST carry the tx hash.
+    with pytest.raises(ValidationError):
+        EthClaimStatus(claimed=True)
