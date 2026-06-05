@@ -13,6 +13,8 @@ Backends:
               ``get_transaction_verbose(txid)`` via :func:`build_reconciler`.
 * BTC depth — ``MultiSourceBtcFundingReader`` (2-of-3 Esplora, conservative min depth).
 * BTC claim — mempool.space ``/outspend`` (detect the maker's claim of the HTLC outpoint).
+* ETH       — optional ``--eth-rpc-url`` (+ ``--eth-chain-id``): a keyless, read-only RPC to watch
+              RXD<->ETH swaps (detect the maker's ``Claimed`` event, finalized-checkpoint verdict).
 
 Example:
     python scripts/watchtower_run.py \
@@ -46,6 +48,7 @@ from pyrxd.gravity.watch import (
     LoggingAlertChannel,
     OutspendBtcClaimSource,
     Reconciler,
+    RpcEthChainSource,
     WebhookAlertChannel,
     combine_heartbeats,
     default_heartbeat,
@@ -68,8 +71,13 @@ def build_reconciler(
     policy: MarginPolicy,
     safety_window_blocks: int,
     alert_channel,
+    eth_source=None,
 ) -> Reconciler:
-    """Compose the real ports into a Reconciler (pure wiring — no network at call time)."""
+    """Compose the real ports into a Reconciler (pure wiring — no network at call time).
+
+    ``eth_source`` (an :class:`RpcEthChainSource`, optional) adds the ETH counter-leg watch path so a
+    records dir holding RXD↔ETH swaps is observed too. When ``None``, ETH-direction swaps fail closed
+    (the ChainObserver pages "no EthChainSource for an ETH swap" rather than silently skipping them)."""
     store = JsonDirRecordStore(records_dir)
     rxd_source = ElectrumRxdChainSource(rxd_client)
 
@@ -83,7 +91,8 @@ def build_reconciler(
 
     outspend_fns = [_make_outspend(u) for u in mempool_base_urls]
     btc_source = OutspendBtcClaimSource(outspend_fns=outspend_fns, funding_reader=btc_funding_reader)
-    observer = ChainObserver(btc=btc_source, rxd=rxd_source, rxd_corroborated=False)  # v1: RXD single-source
+    # v1/v3: RXD (and the single ETH RPC, if any) are single-source → every page is low-corroboration.
+    observer = ChainObserver(btc=btc_source, eth=eth_source, rxd=rxd_source, rxd_corroborated=False)
     alerter = DedupAlerter(channel=alert_channel)
     return Reconciler(
         store=store,
@@ -106,6 +115,28 @@ async def _build_rxd_client(args: argparse.Namespace, stack: contextlib.AsyncExi
     return await stack.enter_async_context(
         ElectrumXClient([args.rxd_electrumx_url], allow_insecure=args.allow_insecure)
     )
+
+
+async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
+    """Optional ETH counter-leg source (alert-only v3): a keyless, read-only ``RpcEthChainSource``
+    over ``EthRpc``. Returns ``None`` when ``--eth-rpc-url`` is unset (a BTC-only tower). Fails closed
+    on a wrong network (``assert_chain``) so the tower never watches the wrong chain, and registers
+    the RPC's ``close()`` on the exit stack. No key, no broadcast — read-only observation only."""
+    if not args.eth_rpc_url:
+        return None
+    if not args.eth_chain_id:
+        raise SystemExit("--eth-chain-id is required with --eth-rpc-url")
+    from pyrxd.eth_wallet.rpc import EthRpc
+
+    rpc = EthRpc(args.eth_rpc_url, expected_chain_id=args.eth_chain_id)
+    stack.push_async_callback(rpc.close)
+    await rpc.assert_chain()  # fail closed if the endpoint is not the negotiated chain
+    logger.info(
+        "ETH counter-leg watch ENABLED: rpc=%s chain_id=%d (read-only, no key, single-source → low-corroboration)",
+        args.eth_rpc_url,
+        args.eth_chain_id,
+    )
+    return RpcEthChainSource(rpc)
 
 
 def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
@@ -160,6 +191,18 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--webhook-secret", help="optional HMAC-SHA256 secret -> X-Watchtower-Signature header")
     # #2 dead-man's switch: write a liveness file each tick (watched by watchtower_deadman.py)
     p.add_argument("--heartbeat-file", help="write a liveness heartbeat here each tick")
+    # ETH counter-leg (alert-only v3): watch RXD↔ETH swaps too. Read-only, no key, never touches p.
+    p.add_argument(
+        "--eth-rpc-url",
+        help="Ethereum RPC URL to watch RXD<->ETH swaps (read-only; enables the ETH counter-leg source). "
+        "Single-source in v1 → ETH pages are low-corroboration. Requires --eth-chain-id.",
+    )
+    p.add_argument(
+        "--eth-chain-id",
+        type=int,
+        help="expected EIP-155 chain id for --eth-rpc-url (e.g. 1 mainnet, 11155111 Sepolia); "
+        "the tower fails closed if the endpoint reports a different chain",
+    )
     return p.parse_args(argv)
 
 
@@ -209,6 +252,7 @@ async def _amain(argv=None) -> int:
     async with contextlib.AsyncExitStack() as stack:
         http_session = await stack.enter_async_context(aiohttp.ClientSession())
         rxd_client = await _build_rxd_client(args, stack)
+        eth_source = await _build_eth_source(args, stack)
         reconciler = build_reconciler(
             records_dir=args.records_dir,
             rxd_client=rxd_client,
@@ -218,6 +262,7 @@ async def _amain(argv=None) -> int:
             policy=policy,
             safety_window_blocks=args.safety_window_blocks,
             alert_channel=_build_alert_channel(args, http_session),
+            eth_source=eth_source,
         )
         heartbeat = default_heartbeat(logger)
         if args.heartbeat_file:

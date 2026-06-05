@@ -43,6 +43,7 @@ from pyrxd.gravity.watch.decide import (
     Observations,
     decide,
 )
+from pyrxd.gravity.watch.eth_adapters import RpcEthChainSource
 from pyrxd.gravity.watch.heartbeat import (
     DeadMansSwitch,
     DeadManVerdict,
@@ -92,6 +93,7 @@ __all__ = [
     "ReconcileResult",
     "Reconciler",
     "RecordStore",
+    "RpcEthChainSource",
     "RxdChainSource",
     "Severity",
     "WebhookAlertChannel",
