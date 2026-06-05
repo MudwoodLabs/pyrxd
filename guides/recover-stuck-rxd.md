@@ -150,8 +150,13 @@ it in the next step. (If yours says `512`, use `512`.)
 
 ## Step 3 — Move your coins to safety
 
-First, you need a **destination** — a receive address from a wallet you control
-and trust. The easiest options:
+Now that Step 2 told you the **coin type** and **path**, you can move the coins.
+There are two ways — pick whichever you're more comfortable with. **Both are
+fine; Option B may feel safer because the actual sending happens in a long-
+established graphical wallet.**
+
+First, either way, you need a **destination** — a receive address from a wallet
+you control and trust:
 
 - Create a fresh wallet in a current Radiant wallet app and copy its **receive
   address**, or
@@ -160,8 +165,10 @@ and trust. The easiest options:
 A Radiant address starts with `1` and looks like
 `1FzegoRZEXAPKztjVSkiX9VfK7s2ecwMGM`.
 
-Then run this, replacing the coin type with what Step 2 told you, and the
-address with your destination:
+### Option A — move them with this tool (command line)
+
+Run this, replacing the coin type with what Step 2 told you and the address with
+your destination:
 
 ```
 pyrxd wallet sweep --coin-type 0 --to YOUR_DESTINATION_ADDRESS
@@ -196,6 +203,35 @@ transaction ID into a block explorer to watch it confirm.
 > A small **network fee** is taken out (paid to miners, not to anyone else) —
 > that's normal for any blockchain transaction. If your balance is *very* small
 > (smaller than the fee), the tool will refuse rather than waste it.
+
+### Option B — move them with Electron-Wallet (graphical wallet)
+
+If you'd rather use a normal wallet window than the command line, the
+**Electron-Wallet** lets you enter a custom derivation path. Once you tell it the
+path Step 2 found, it shows your coins and you send them like any normal
+transaction.
+
+> 🔒 **Get the right build, and check it.** Use the **maintained** wallet at
+> <https://github.com/Radiant-Core/Electron-Wallet> — **not** the old archived
+> "RadiantBlockchain/electron-radiant". Fake copies of Electrum-style wallets are
+> a common way people get their seed stolen, so download only from that official
+> releases page, and **verify the SHA256 checksum** they publish with the
+> download before you run it. If you can't verify it, use Option A instead.
+
+1. Install the official Electron-Wallet (verified as above) and start a **restore
+   from seed**.
+2. When it asks for the **derivation path**, match it to Step 2:
+   - Step 2 said **coin type 512** → choose the **"Radiant Standard"** preset
+     (`m/44'/512'/0'`).
+   - Step 2 said **coin type 0** → choose the **"Legacy"** preset (`m/44'/0'/0'`).
+   - If Step 2's path had a non-zero account (e.g. `m/44'/0'/1'/0/0`), type the
+     path **up to the third apostrophe** yourself — for that example,
+     `m/44'/0'/1'`.
+3. Finish the restore. Electron will scan and show your balance.
+4. Send it to your destination address like a normal transaction.
+
+> Your seed only ever goes into the wallet app on your own computer — never into
+> a website or to a person. Same rule as everywhere in this guide.
 
 ---
 
