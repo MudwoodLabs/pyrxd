@@ -12,18 +12,23 @@ Cut 3 (deferred):
 from __future__ import annotations
 
 import asyncio
+from typing import cast
 
 import click
 
+from ..constants import Network
 from ..hd.bip39 import mnemonic_from_entropy
 from ..hd.discovery import DEFAULT_ACCOUNTS, DEFAULT_COIN_TYPES, coin_type_label, discover
 from ..hd.wallet import HdWallet
 from ..security.errors import NetworkError, ValidationError
 from ..security.rng import secure_random_bytes
+from ..utils import validate_address
+from ..wallet import DEFAULT_FEE_RATE
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError, WalletDecryptError
 from .format import emit, format_photons
 from .prompts import (
+    confirm_action,
     prompt_mnemonic_input,
     prompt_passphrase_input,
     show_mnemonic,
@@ -420,6 +425,162 @@ def wallet_recover(ctx: CliContext, scan: bool, coin_types: str, accounts: str, 
     click.echo(emit(payload, mode="human", human_lines=lines))
 
 
+@wallet_group.command(name="sweep")
+@click.option(
+    "--coin-type",
+    type=int,
+    required=True,
+    help="SLIP-0044 coin type the funds are on (e.g. 0 or 512). Use `wallet recover --scan` to find it.",
+)
+@click.option(
+    "--account",
+    type=int,
+    default=0,
+    show_default=True,
+    help="BIP44 account index the funds are on.",
+)
+@click.option(
+    "--to",
+    "to_address",
+    required=True,
+    help="Destination address to send everything to (an address you control).",
+)
+@click.option(
+    "--fee-rate",
+    type=int,
+    default=DEFAULT_FEE_RATE,
+    show_default=True,
+    help="Fee rate in photons per kB.",
+)
+@click.option(
+    "--passphrase/--no-passphrase",
+    default=False,
+    help="Prompt for the BIP39 passphrase if the seed was created with one.",
+)
+@click.pass_obj
+def wallet_sweep(
+    ctx: CliContext, coin_type: int, account: int, to_address: str, fee_rate: int, passphrase: bool
+) -> None:
+    """Move ALL funds from a derived path to an address you control.
+
+    Sweeps every spendable UTXO under ``m/44'/<coin-type>'/<account>'`` to --to,
+    minus the network fee. Use this to rescue funds that `wallet recover --scan`
+    found at a derivation path no GUI wallet can reach (a non-zero account, or a
+    higher address index).
+
+    This signs and broadcasts a real transaction. You are shown the amount,
+    fee, and destination, and asked to confirm before anything is broadcast.
+    """
+    if coin_type < 0 or account < 0:
+        raise UserError("--coin-type and --account must be non-negative")
+    if fee_rate <= 0:
+        # Validate before the mnemonic prompt so a bad invocation fails
+        # without the user first typing their seed.
+        raise UserError("--fee-rate must be a positive integer (photons per kB)")
+    # Block --json without --yes early (a broadcast must not auto-confirm).
+    ok, why = ctx.is_destructive_mode_safe()
+    if not ok:
+        raise UserError(why or "destructive op without --yes in --json mode")
+    # Pin the destination to the ACTIVE network. Without this, a testnet-prefixed
+    # address (m.../n...) passes validation on mainnet, and the sweep pays a
+    # script no mainnet key can spend — an unrecoverable loss from a paste error.
+    if not validate_address(to_address, network=Network(ctx.network)):
+        raise UserError(
+            "invalid --to address",
+            cause=f"not a valid {ctx.network} Radiant P2PKH address",
+            fix=f"pass a {ctx.network} address you control" + (" (starts with 1)" if ctx.network == "mainnet" else ""),
+        )
+
+    mnemonic = prompt_mnemonic_input()
+    if not mnemonic:
+        raise UserError(
+            "mnemonic is required",
+            cause="no input received",
+            fix="enter the BIP39 mnemonic for the wallet holding the funds",
+        )
+    passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default, not a hardcoded secret
+    if passphrase:
+        passphrase_str = prompt_passphrase_input(optional=False)
+
+    try:
+        wallet = HdWallet.from_mnemonic(mnemonic, passphrase=passphrase_str, account=account, coin_type=coin_type)
+    except (ValidationError, ValueError) as exc:
+        raise WalletDecryptError() from exc
+
+    path = f"m/44'/{coin_type}'/{account}'"
+
+    async def _sweep() -> dict[str, object]:
+        client = ctx.make_client()
+        async with client:
+            await wallet.refresh(client)
+            triples = await wallet.collect_spendable(client)
+            if not triples:
+                raise UserError(
+                    f"no spendable funds at {path}",
+                    cause="the scan found no UTXOs on this coin type / account",
+                    fix="double-check --coin-type and --account (run `wallet recover --scan` first)",
+                )
+            tx = wallet.build_send_max_tx(triples, to_address, fee_rate=fee_rate)
+            total_in = sum(t[0].value for t in triples)
+            out_value = tx.outputs[0].satoshis
+            fee = total_in - out_value
+
+            summary = [
+                "\n  Sweep:",
+                f"    from path:   {path} ({coin_type_label(coin_type)})",
+                f"    inputs:      {len(triples)} UTXO(s)",
+                f"    total found: {format_photons(total_in)}",
+                f"    network fee: {format_photons(fee)}",
+                f"    you receive: {format_photons(out_value)}",
+                f"    to address:  {to_address}",
+                "",
+            ]
+            if not confirm_action(summary, ctx=ctx, prompt_text="Broadcast this sweep?"):
+                raise UserError(
+                    "aborted by user",
+                    cause="confirmation declined",
+                    fix="re-run when you are ready to broadcast",
+                )
+
+            txid = await client.broadcast(tx.serialize())
+            return {
+                "txid": str(txid),
+                "from_path": path,
+                "to": to_address,
+                "swept_photons": out_value,
+                "fee_photons": fee,
+                "inputs": len(triples),
+            }
+
+    try:
+        result = asyncio.run(_sweep())
+    except NetworkError as exc:
+        raise NetworkBoundaryError(
+            "could not reach ElectrumX",
+            cause=str(exc),
+            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+        ) from exc
+    except ValidationError as exc:
+        # build_send_max_tx raises ValidationError when the balance is at or
+        # below the network fee (dust). Lead with the honest framing — these
+        # coins are simply too small to move; lowering --fee-rate only helps if
+        # the user raised it above the default in the first place.
+        raise UserError(
+            "could not build the sweep transaction",
+            cause=str(exc),
+            fix="this balance is too small to move — it does not exceed the network fee (dust). "
+            "Lower --fee-rate only if you raised it above the default; otherwise these coins cannot be swept.",
+        ) from exc
+
+    if ctx.output_mode == "json":
+        click.echo(emit(result, mode="json"))
+    elif ctx.output_mode == "quiet":
+        click.echo(emit(result, mode="quiet", quiet_field="txid"))
+    else:
+        click.echo(f"\nSwept {format_photons(cast(int, result['swept_photons']))} to {to_address}")
+        click.echo(f"Transaction: {result['txid']}")
+
+
 # Confirmation helper used by Cut 1 destructive ops outside this module.
 # Re-exported for tests + future cuts.
 __all__ = [
@@ -429,4 +590,5 @@ __all__ = [
     "wallet_load",
     "wallet_new",
     "wallet_recover",
+    "wallet_sweep",
 ]
