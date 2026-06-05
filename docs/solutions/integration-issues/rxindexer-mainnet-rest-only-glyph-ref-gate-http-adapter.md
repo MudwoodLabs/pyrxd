@@ -125,7 +125,7 @@ response. This was confirmed empirically, not assumed.
 ### Source-vs-deployment skew — a load-bearing caveat
 
 The **live endpoint is authoritative**, and there is measurable skew between the deployed mainnet api
-and the local RXinDexer source checkout (`/home/eric/apps/RXinDexer`):
+and the local RXinDexer source checkout (`~/apps/RXinDexer`):
 
 - The deployed `/tokens/{ref}` route returns a JSON object whose **`token_id`** field equals the
   72-hex internal wire ref (this is what the live test bound against and what the adapter checks).
