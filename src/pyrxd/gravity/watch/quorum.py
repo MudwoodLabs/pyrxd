@@ -21,12 +21,21 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Observations
 from pyrxd.gravity.watch.reconciler import Observer
 from pyrxd.security.errors import ValidationError
 
-__all__ = ["BtcClaimSource", "BtcClaimStatus", "ChainObserver", "RxdChainSource"]
+__all__ = [
+    "BtcClaimSource",
+    "BtcClaimStatus",
+    "ChainObserver",
+    "EthChainSource",
+    "EthClaimStatus",
+    "RxdChainSource",
+]
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,46 @@ class BtcClaimSource(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class EthClaimStatus:
+    """Whether the maker's ETH HTLC has been claimed (revealing ``p``), and the claim tx hash
+    (needed for the finalized-checkpoint verdict). ``claimed=False`` means no claim observed yet."""
+
+    claimed: bool
+    claim_tx_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.claimed, bool):
+            raise ValidationError("EthClaimStatus.claimed must be bool")
+        if self.claim_tx_hash is not None and (
+            not isinstance(self.claim_tx_hash, str) or not self.claim_tx_hash.startswith("0x")
+        ):
+            raise ValidationError("EthClaimStatus.claim_tx_hash must be a 0x-prefixed hex hash or None")
+        if self.claimed and self.claim_tx_hash is None:
+            raise ValidationError("a claimed EthClaimStatus must carry the claim_tx_hash")
+
+
+@runtime_checkable
+class EthChainSource(Protocol):
+    """Detects the maker's ETH counter-leg claim and reads its finalized-checkpoint finality verdict.
+
+    Unlike BTC (a PoW confirmation DEPTH), ETH finality is the post-Merge ``finalized`` CHECKPOINT:
+    ``claim_finality_verdict`` returns a *depth-less* :class:`CounterClaimFinality`
+    (``confirmations``/``required_depth`` both ``None``). The shell satisfies it with the audited
+    ``EthHtlcContractLeg.claim_finality_verdict`` (which binds the receipt to the canonical chain and
+    rejects a ``finalized > head`` over-report). Single-source RPC in v1 — flagged low-corroboration
+    via the RXD flag; a false read causes a false *page*, never a false broadcast (multi-source ETH
+    finality quorum is an audit-gated, real-value requirement)."""
+
+    async def claim_status(self, contract_address: str, deploy_tx_hash: str) -> EthClaimStatus:
+        """Has the maker claimed this per-swap HTLC instance (revealing ``p``)? If so, by what tx?"""
+        ...
+
+    async def claim_finality_verdict(self, claim_tx_hash: str) -> CounterClaimFinality:
+        """The point-in-time finalized-checkpoint verdict for the maker's ETH claim tx."""
+        ...
+
+
 @runtime_checkable
 class RxdChainSource(Protocol):
     """Radiant chain reads. Single-source in v1 (flagged low-corroboration)."""
@@ -82,38 +131,37 @@ class RxdChainSource(Protocol):
 
 
 class ChainObserver(Observer):
-    """Composes a :class:`BtcClaimSource` + a :class:`RxdChainSource` into the
-    :class:`Observations` that :func:`decide` consumes.
+    """Composes the counter-leg source (:class:`BtcClaimSource` and/or :class:`EthChainSource`) with
+    a :class:`RxdChainSource` into the :class:`Observations` that :func:`decide` consumes, routing by
+    ``record.terms.counter_chain``. The RXD asset-lock derivation is shared across both directions.
 
-    ``rxd_corroborated`` is False in v1 (single RXD source) → every observation is
-    flagged ``low_corroboration``. Pass True only once a real ≥2-source RXD quorum
-    exists (a v2 deliverable).
+    ``rxd_corroborated`` is False in v1 (single RXD source) → every observation is flagged
+    ``low_corroboration``. Pass True only once a real ≥2-source RXD quorum exists (a v2 deliverable).
+    A swap is observed only if the source for its counter-chain was injected; otherwise ``observe``
+    fails closed (the reconciler turns the error into a decision-required page, never a silent miss).
     """
 
-    def __init__(self, *, btc: BtcClaimSource, rxd: RxdChainSource, rxd_corroborated: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        rxd: RxdChainSource,
+        btc: BtcClaimSource | None = None,
+        eth: EthChainSource | None = None,
+        rxd_corroborated: bool = False,
+    ) -> None:
         if not isinstance(rxd_corroborated, bool):
             raise ValidationError("ChainObserver.rxd_corroborated must be bool")
+        if btc is None and eth is None:
+            raise ValidationError("ChainObserver requires at least one counter-leg source (btc and/or eth)")
         self._btc = btc
+        self._eth = eth
         self._rxd = rxd
         self._rxd_corroborated = rxd_corroborated
 
     async def observe(self, swap_id: str, record: SwapRecord) -> Observations:
         tip = await self._rxd.tip_height()
-
-        # Maker claim detection (BTC counter-leg). record.btc_locator is None until
-        # the BTC leg is funded, and for an ETH swap (decide() short-circuits ETH to
-        # NOOP, so a benign all-False observation is fine there).
-        maker_claimed = False
-        btc_confs: int | None = None
-        locator = record.btc_locator
-        if locator is not None:
-            status = await self._btc.claim_status(locator.funding_outpoint.txid, locator.funding_outpoint.vout)
-            maker_claimed = status.claimed
-            if maker_claimed and status.claim_txid is not None:
-                btc_confs = await self._btc.confirmations(status.claim_txid)
-
-        # Asset-lock height from the covenant's confirmation depth: tip - confs + 1.
-        # Out-of-range (bogus/lying source) → None so the gate sees "un-assessable" and
+        # Asset-lock height from the covenant's confirmation depth: tip - confs + 1. Shared by both
+        # directions. Out-of-range (bogus/lying source) → None so the gate sees "un-assessable" and
         # decide() fails closed, rather than feeding a nonsensical height to the gate.
         asset_locked: int | None = None
         if record.radiant_covenant_outpoint is not None:
@@ -122,11 +170,50 @@ class ChainObserver(Observer):
                 candidate = tip - cov_confs + 1
                 if 0 <= candidate <= tip:
                     asset_locked = candidate
+        low_corr = not self._rxd_corroborated
 
+        if record.terms.counter_chain == "eth":
+            eth_detected, eth_finality = await self._observe_eth_claim(record)
+            return Observations(
+                maker_has_claimed_btc=False,
+                now_rxd_height=tip,
+                asset_locked_at_height=asset_locked,
+                eth_claim_detected=eth_detected,
+                eth_claim_finality=eth_finality,
+                low_corroboration=low_corr,
+            )
+
+        # BTC counter-leg (default). record.btc_locator is None until the BTC leg is funded.
+        if self._btc is None:
+            raise ValidationError("ChainObserver has no BtcClaimSource for a BTC swap")
+        maker_claimed = False
+        btc_confs: int | None = None
+        locator = record.btc_locator
+        if locator is not None:
+            status = await self._btc.claim_status(locator.funding_outpoint.txid, locator.funding_outpoint.vout)
+            maker_claimed = status.claimed
+            if maker_claimed and status.claim_txid is not None:
+                btc_confs = await self._btc.confirmations(status.claim_txid)
         return Observations(
             maker_has_claimed_btc=maker_claimed,
             now_rxd_height=tip,
             asset_locked_at_height=asset_locked,
             btc_claim_confirmations=btc_confs,
-            low_corroboration=not self._rxd_corroborated,
+            low_corroboration=low_corr,
         )
+
+    async def _observe_eth_claim(self, record: SwapRecord) -> tuple[bool, CounterClaimState | None]:
+        """Detect the maker's ETH claim + its finalized-checkpoint verdict STATE. Returns
+        ``(detected, finality_state)``. ``(False, None)`` when no ETH locator is present yet
+        (pre-fund) or the contract is unclaimed; fails closed (raises) if no ETH source was injected
+        — the reconciler turns that into a decision-required page rather than a silent all-clear."""
+        if self._eth is None:
+            raise ValidationError("ChainObserver has no EthChainSource for an ETH swap")
+        locator = record.counterchain_locator
+        if not isinstance(locator, EthHtlcLocator):
+            return False, None  # ETH swap not yet funded → nothing claimed
+        status = await self._eth.claim_status(locator.contract_address, locator.deploy_tx_hash)
+        if not status.claimed or status.claim_tx_hash is None:
+            return False, None
+        verdict = await self._eth.claim_finality_verdict(status.claim_tx_hash)
+        return True, verdict.state

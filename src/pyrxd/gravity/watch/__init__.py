@@ -54,6 +54,8 @@ from pyrxd.gravity.watch.quorum import (
     BtcClaimSource,
     BtcClaimStatus,
     ChainObserver,
+    EthChainSource,
+    EthClaimStatus,
     RxdChainSource,
 )
 from pyrxd.gravity.watch.reconciler import (
@@ -77,6 +79,8 @@ __all__ = [
     "Decision",
     "DedupAlerter",
     "ElectrumRxdChainSource",
+    "EthChainSource",
+    "EthClaimStatus",
     "FileHeartbeat",
     "Intent",
     "JsonDirRecordStore",
