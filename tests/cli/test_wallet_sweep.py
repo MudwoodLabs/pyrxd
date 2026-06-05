@@ -99,6 +99,17 @@ class TestWalletSweep:
         assert "no spendable funds" in result.output
         client.broadcast.assert_not_awaited()
 
+    def test_sub_fee_balance_refused_without_broadcast(self, runner: CliRunner) -> None:
+        # A balance at/below the network fee (dust) must be refused cleanly,
+        # before any broadcast. Mirrors the real mainnet 0.01-RXD case.
+        funded = _addr(512, 0, 0, 0)
+        client = _funded_client(funded, value=1_000)  # far below the per-tx fee
+        result = _invoke(runner, _ctx(client), ["sweep", "--coin-type", "512", "--to", DEST], confirm="y")
+        assert result.exit_code != 0
+        assert "could not build the sweep transaction" in result.output
+        assert "too small to move" in result.output  # honest dust framing
+        client.broadcast.assert_not_awaited()
+
     def test_invalid_destination_rejected(self, runner: CliRunner) -> None:
         client = _funded_client(None)
         result = _invoke(runner, _ctx(client), ["sweep", "--coin-type", "0", "--to", "not-an-address"])
