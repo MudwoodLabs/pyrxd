@@ -64,18 +64,40 @@ the coins to a wallet you control.
    ```
    Wait for it to finish (a page of text will scroll by — that's normal).
 
-### On Mac or Linux
+### On Mac or Linux (Ubuntu, etc.)
 
-Open the **Terminal** app and run:
-```
-pip3 install pyrxd
-```
-(Most Macs and Linux machines already have Python. If `pip3` isn't found,
-install Python from <https://www.python.org/downloads/> first.)
+Recent Mac and Linux systems protect the built-in Python, so a plain
+`pip install` may stop with a message like **"externally-managed-environment."**
+That's normal and expected — the clean fix is a small tool called **pipx**,
+which installs `pyrxd` in its own tidy space and still lets you run it like any
+normal command.
+
+Open the **Terminal** app and run these one at a time:
+
+- **Ubuntu / Debian / most Linux:**
+  ```
+  sudo apt install pipx
+  pipx ensurepath
+  pipx install pyrxd
+  ```
+- **Mac (with Homebrew):**
+  ```
+  brew install pipx
+  pipx ensurepath
+  pipx install pyrxd
+  ```
+
+After `pipx ensurepath`, **close the terminal and open a new one** so the
+`pyrxd` command is found.
+
+> Don't have `apt`/`brew`, or prefer not to use them? See
+> "The 'externally-managed-environment' error" under Troubleshooting below for a
+> plain-Python alternative.
 
 > **Check it worked:** type `pyrxd --help` and press Enter. If you see a list of
 > commands, you're ready. If it says "command not found," close and reopen the
-> terminal, or re-run the Python installer with "Add Python to PATH" ticked.
+> terminal (pipx needs a fresh terminal after `ensurepath`), or on Windows
+> re-run the Python installer with "Add Python to PATH" ticked.
 
 The official package lives at <https://pypi.org/project/pyrxd/> and the source
 code is public at <https://github.com/MudwoodLabs/pyrxd>. Don't install anything
@@ -191,7 +213,33 @@ transaction ID into a block explorer to watch it confirm.
 
 ---
 
-## Still stuck?
+## Trouble installing?
+
+**"error: externally-managed-environment"** (common on Ubuntu/Debian, and on Mac
+with Homebrew Python). Your system is protecting its built-in Python. Use **pipx**
+as shown in Step 1 — that's the clean fix. If you can't install pipx, you can
+instead put pyrxd in its own folder ("virtual environment"):
+
+```
+python3 -m venv ~/pyrxd-tool
+source ~/pyrxd-tool/bin/activate
+pip install pyrxd
+```
+
+With this approach you must run that **`source ~/pyrxd-tool/bin/activate`** line
+**again every time you open a new terminal**, before using `pyrxd`. (This is why
+pipx is easier — it doesn't need the activate step.)
+
+**"pyrxd: command not found"** — close the terminal and open a fresh one (pipx
+adds `pyrxd` to your PATH only after `pipx ensurepath` *and* a new terminal). On
+Windows, re-run the Python installer and tick **"Add Python to PATH."**
+
+**"pip / python3: command not found"** — install Python first from
+<https://www.python.org/downloads/>, then try again.
+
+---
+
+## Still stuck (the scan finds nothing)?
 
 If Step 2 finds nothing even though the explorer shows your balance:
 
