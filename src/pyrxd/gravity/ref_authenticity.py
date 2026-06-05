@@ -136,7 +136,7 @@ async def verify_ref_authenticity(
 
     Raises:
         ValidationError: if the ref is not provably the advertised authentic
-            asset. The caller MUST NOT pay BTC when this raises.
+            asset. The caller MUST NOT pay the counter-leg (BTC or ETH) when this raises.
     """
     if asset_variant not in ("rxd", "ft", "nft"):
         raise ValidationError(f"unknown asset_variant {asset_variant!r}")
@@ -160,7 +160,7 @@ async def verify_ref_authenticity(
         resolved = await indexer.resolve_ref(ref)
     except Exception as exc:  # indexer unreachable/lagging/error => fail-closed.
         raise ValidationError(
-            f"indexer could not resolve REF ({exc}); fail-closed — do NOT pay BTC. "
+            f"indexer could not resolve REF ({exc}); fail-closed — do NOT pay the counter-leg. "
             "Consensus does NOT enforce mint provenance (rigorous audit R1)."
         ) from exc
 
@@ -170,7 +170,7 @@ async def verify_ref_authenticity(
     if resolved is None:
         raise ValidationError(
             "indexer returned no token for REF — it does not resolve to a minted asset. "
-            "The covenant's singleton may be a forged/self-crafted ref (rigorous audit R1). Do NOT pay BTC."
+            "The covenant's singleton may be a forged/self-crafted ref (rigorous audit R1). Do NOT pay the counter-leg."
         )
     if not isinstance(resolved, ResolvedRef):
         raise ValidationError(
@@ -183,14 +183,14 @@ async def verify_ref_authenticity(
     if not isinstance(resolved.genesis_outpoint, (bytes, bytearray)) or bytes(resolved.genesis_outpoint) != ref:
         raise ValidationError(
             "resolved token's genesis outpoint does not equal the advertised REF — wrong/forged asset. "
-            "(REF is the genesis outpoint, NOT the reveal txid.) Do NOT pay BTC."
+            "(REF is the genesis outpoint, NOT the reveal txid.) Do NOT pay the counter-leg."
         )
 
     # Binding (b): a real Glyph reveal carries a `gly` envelope marker.
     if resolved.has_gly_marker is not True:
         raise ValidationError(
             "resolved REF carries no `gly` envelope marker — it is a bare singleton, not a minted Glyph "
-            "(the exact R1 forgery). Do NOT pay BTC."
+            "(the exact R1 forgery). Do NOT pay the counter-leg."
         )
 
     # Binding (c): payload commitment, when the taker agreed to a specific one.
@@ -199,7 +199,7 @@ async def verify_ref_authenticity(
         or bytes(resolved.payload_hash) != bytes(expected_payload_hash)
     ):
         raise ValidationError(
-            "resolved REF payload hash does not match the advertised payload — wrong asset content. Do NOT pay BTC."
+            "resolved REF payload hash does not match the advertised payload — wrong asset content. Do NOT pay the counter-leg."
         )
 
     # Binding (e): the genesis must be deep enough that a reorg cannot void it.
@@ -207,5 +207,5 @@ async def verify_ref_authenticity(
     if not isinstance(confs, int) or isinstance(confs, bool) or confs < min_confirmations:
         raise ValidationError(
             f"genesis tx has {confs} confirmations < required {min_confirmations}; a shallow genesis can be "
-            "reorged out after payment, voiding provenance. Do NOT pay BTC."
+            "reorged out after payment, voiding provenance. Do NOT pay the counter-leg."
         )
