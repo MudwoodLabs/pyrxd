@@ -492,13 +492,24 @@ def lock_ft_into_covenant(
     )
     feein.satoshis = fee_in_sats
     feein.locking_script = Script(fspk)
-    outs = [TransactionOutput(Script(covenant_spk), minted.ft_amount)]  # covenant carries the WHOLE FT amount
-    change = fee_in_sats - fee_photons
-    if change > 0:
-        outs.append(TransactionOutput(Script(_p2pkh_spk(fkey.public_key().hash160())), change))
-    tx = Transaction(tx_inputs=[fin, feein], tx_outputs=outs)
-    tx.sign()
-    confirm_fn(f"lock the FT ({minted.ft_amount} units) into the covenant SPK on mainnet (fee from a separate input)")
+    # Two-pass fee: the 2-input lock with a ~224B covenant output is ~600B — well above the sub-kB
+    # mint txs — so a flat fee can fall UNDER the mainnet min-relay (0.10 RXD/kB = 10_000 photons/B).
+    # Measure the signed size and pay >= size * rate with margin (the FT value flows whole regardless;
+    # only the separate fee input + change absorb the fee).
+    def _build(fee: int) -> Transaction:
+        outs = [TransactionOutput(Script(covenant_spk), minted.ft_amount)]  # covenant carries the WHOLE FT amount
+        ch = fee_in_sats - fee
+        if ch > 0:
+            outs.append(TransactionOutput(Script(_p2pkh_spk(fkey.public_key().hash160())), ch))
+        fin.unlocking_script = None
+        feein.unlocking_script = None
+        t = Transaction(tx_inputs=[fin, feein], tx_outputs=outs)
+        t.sign()
+        return t
+
+    fee = max(fee_photons, _build(fee_photons).byte_length() * 15_000)  # 1.5x the 10_000 photons/B relay floor
+    tx = _build(fee)
+    confirm_fn(f"lock the FT ({minted.ft_amount} units) into the covenant SPK on mainnet (fee {fee / 1e8:.4f} RXD from a separate input)")
     txid = str(_cli(rxd_client, "sendrawtransaction", tx.serialize().hex()))
     log(f"    FT asset lock -> {txid}")
     _wait_confirmed(rxd_client, txid, label="asset-lock", poll_s=poll_s, log=log)
