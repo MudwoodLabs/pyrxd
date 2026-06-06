@@ -665,6 +665,10 @@ class _RegtestBtcClaimSource:
         info = self._n.btc("getrawtransaction", claim_txid, "true")
         return int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else 0
 
+    async def funding_confirmations(self, funding_txid: str) -> int | None:
+        info = self._n.btc("getrawtransaction", funding_txid, "true")
+        return int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else None
+
 
 class _RegtestRxdChainSource:
     """``RxdChainSource`` backed by the regtest radiantd (single-source → low-corroboration in v1)."""
@@ -823,3 +827,76 @@ class TestWatchtowerIntentSequence:
         assert channel.pages[0].intent is Intent.PAGE_SQUEEZED
         assert channel.pages[0].severity is Severity.CRITICAL
         assert channel.pages[0].low_corroboration is True
+
+
+# ---------------------------------------------------------------------------------------------------
+# v2 AUTONOMOUS refund (capped, keyless, dormant-by-construction) — REAL bitcoind consensus.
+#
+# Proves the two facts the pure/property suite cannot: (1) the production RefundExecutor broadcasts an
+# operator-PRE-SIGNED refund that actually SPENDS the funding outpoint on real consensus once the CSV
+# matures; (2) an EARLY broadcast is REJECTED by BIP68 (the consensus backstop the design relies on).
+# Through the real executor; it holds no key, never rebuilds, broadcasts only the stored bytes.
+# ---------------------------------------------------------------------------------------------------
+
+
+class TestWatchtowerAutonomousRefundRegtest:
+    async def test_auto_refund_spends_outpoint_after_maturity_and_early_is_rejected(self, nodes, tmp_path):
+        from pyrxd.gravity.watch import Decision, ExecOutcome, PresignedRefund, RefundExecutor
+
+        t_btc = bt.Timelock(6, bt.TimeUnit.BLOCKS)
+        t_rxd = bt.Timelock(3, bt.TimeUnit.BLOCKS)
+        h = hashlib.sha256(os.urandom(32)).digest()
+        maker_btc = coincurve.PrivateKey(os.urandom(32))
+        taker_kp = generate_keypair("bcrt")
+        refund_priv = bytes(taker_kp._privkey.unsafe_raw_bytes())
+        refund_xo = coincurve.PublicKeyXOnly.from_secret(refund_priv).format()
+        claim_xo = coincurve.PublicKeyXOnly.from_secret(maker_btc.secret).format()
+        htlc = bt.build_htlc(
+            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=t_btc, network="bcrt"
+        )
+
+        # Fund the HTLC address on bitcoind regtest, find the funding outpoint.
+        btc_sats = 200_000
+        nodes.btc("sendtoaddress", htlc.address, f"{btc_sats / 1e8:.8f}", wallet="btcw")
+        nodes.btc_mine(1)
+        scan = nodes.btc("scantxoutset", "start", json.dumps([{"desc": f"raw({htlc.scriptpubkey.hex()})"}]))
+        u = scan["unspents"][0]
+        loc = htlc.with_funding(bt.BtcOutpoint(u["txid"], int(u["vout"])), round(u["amount"] * 1e8))
+
+        # Operator pre-signs the refund (ONCE, online) to a fresh payout address; tower will pin this SPK.
+        dest = bytes.fromhex(
+            nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
+        )
+        raw = bt.build_refund_tx(
+            locator=loc, refund_privkey=refund_priv, timeout=t_btc, to_scriptpubkey=dest, fee_sats=2_000, aux_rand=os.urandom(32)
+        )
+        blob = PresignedRefund(raw_tx=raw, swap_id="auto1")
+        (tmp_path / "auto1.refund.json").write_text(json.dumps(blob.to_dict()))
+
+        # (1) NEGATIVE — broadcasting BEFORE the CSV matures is rejected by BIP68 (consensus backstop).
+        with pytest.raises(RuntimeError) as ei:
+            nodes.btc("sendrawtransaction", raw.hex())
+        assert "non-BIP68-final" in str(ei.value) or "non-final" in str(ei.value)
+
+        # Mature the relative CSV: the funding now has >= t_btc confirmations.
+        nodes.btc_mine(t_btc.value)
+
+        # (2) POSITIVE — the production executor broadcasts the stored bytes; the outpoint is spent.
+        terms = NegotiatedTerms(
+            hashlock=h, btc_sats=btc_sats, radiant_amount=1, t_btc=t_btc, t_rxd=t_rxd, asset_variant="rxd",
+            genesis_ref=b"", taker_dest_hash=b"\x11" * 32, maker_dest_hash=b"\x22" * 32,
+            btc_claim_pubkey_xonly=claim_xo, btc_refund_pubkey_xonly=refund_xo,
+        )
+        rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=terms, counterchain_locator=loc)
+        ex = RefundExecutor(
+            broadcaster=_BtcBroadcaster(nodes), blobs_dir=tmp_path, network="bcrt",
+            cap_sats=btc_sats, refund_spk=dest, accept_single_source=True,
+        )
+        dec = Decision(
+            Intent.PAGE_REFUND, reason="matured BTC refund due", recommended_action="taker_refund_btc",
+            autonomous_btc_refund=True, low_corroboration=True,
+        )
+        out = await ex.execute("auto1", rec, dec)
+        assert out is ExecOutcome.BROADCAST
+        spent = nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout))
+        assert spent in (None, ""), "funding outpoint must be SPENT by the auto-broadcast refund on real consensus"
