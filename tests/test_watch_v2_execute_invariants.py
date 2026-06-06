@@ -484,6 +484,20 @@ def test_records_store_ignores_refund_sidecars(tmp_path):
     assert active == []  # the refund sidecar is ignored, not a phantom/unreadable "record"
 
 
+def test_funding_reader_is_network_aware():
+    # The runner's BTC funding reader must follow --network: mainnet → 3 default 2-of-3 Esplora; signet →
+    # the configured signet Esplora (NOT mainnet), quorum clamped to the single source. A mainnet reader
+    # on a signet run would never find the funding (fail-closed WATCH), so this wiring is load-bearing.
+    from watchtower_run import _build_funding_reader
+
+    mainnet = _build_funding_reader("bc", ["https://mempool.space"], 2)
+    assert mainnet._quorum == 2 and len(mainnet._readers) == 3
+
+    signet = _build_funding_reader("signet", ["https://mempool.space/signet"], 2)
+    assert len(signet._readers) == 1 and signet._quorum == 1  # clamped to the single signet source
+    assert "signet/api" in signet._readers[0]._http._base_url  # signet Esplora API base, not mainnet
+
+
 def test_executor_module_is_keyless():
     src = Path(__file__).resolve().parent.parent / "src" / "pyrxd" / "gravity" / "watch" / "executor.py"
     text = src.read_text()
