@@ -59,7 +59,7 @@ from pyrxd.gravity.watch import (
     mempool_space_outspend,
     run_loop,
 )
-from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
+from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MempoolSpaceFundingReader, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
 
 logger = logging.getLogger("pyrxd.watchtower")
@@ -160,6 +160,20 @@ def _build_executor(args: argparse.Namespace, stack: contextlib.AsyncExitStack) 
             "autonomous refund DORMANT on %s (not audit-cleared) — ALERT-ONLY, broadcasts nothing", args.network
         )
     return executor
+
+
+def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> MultiSourceBtcFundingReader:
+    """The BTC funding-depth + claim-depth reader, NETWORK-AWARE. Mainnet uses the three default 2-of-3
+    Esplora endpoints. Any other network (signet/testnet) builds from the configured --mempool-base-url /
+    --esplora-url, which MUST be that network's Esplora (e.g. ``https://mempool.space/signet``): the
+    funding-reader API base is that base + ``/api`` (the outspend path appends ``/api/tx/...`` to the bare
+    base). A single-source network clamps the quorum to the source count (signet is typically 1-of-1).
+    A wrong/mainnet base on a signet run reads the wrong chain → the funding is never found → the maturity
+    gate stays WATCH (fail-closed, never a wrongful broadcast)."""
+    if network == "bc":
+        return MultiSourceBtcFundingReader.default_mainnet(quorum=quorum)
+    readers = [MempoolSpaceFundingReader(base_url=u.rstrip("/") + "/api") for u in esploras]
+    return MultiSourceBtcFundingReader(readers, quorum=min(quorum, len(readers)), dust_cap_sats=10_000)
 
 
 async def _build_rxd_client(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
@@ -327,7 +341,9 @@ async def _amain(argv=None) -> int:
     # Independent Esplora set for multi-source claim DETECTION (dedup, preserve order). Default a
     # free second source so corroboration is ON out of the box (red-team MEDIUM).
     esploras = [args.mempool_base_url, *(args.esplora_url or [])]
-    if len(esploras) == 1 and "blockstream.info" not in args.mempool_base_url:
+    # blockstream.info is a MAINNET endpoint — only auto-add it on mainnet (a signet/testnet run must
+    # point --mempool-base-url at that network's Esplora, e.g. https://mempool.space/signet).
+    if args.network == "bc" and len(esploras) == 1 and "blockstream.info" not in args.mempool_base_url:
         esploras.append("https://blockstream.info")
     _seen: set[str] = set()
     esploras = [u for u in esploras if not (u in _seen or _seen.add(u))]
@@ -341,7 +357,7 @@ async def _amain(argv=None) -> int:
             "one before relying on this tower."
         )
 
-    reader = MultiSourceBtcFundingReader.default_mainnet(quorum=args.quorum)
+    reader = _build_funding_reader(args.network, esploras, args.quorum)
     async with contextlib.AsyncExitStack() as stack:
         http_session = await stack.enter_async_context(aiohttp.ClientSession())
         rxd_client = await _build_rxd_client(args, stack)

@@ -263,3 +263,49 @@ the audit at real amounts.
 - [ ] `decide()` pure & fail-closed; new branch never refunds when the asset is observed locked or maturity
       is unreadable; `decide()`/SwapRecord/coordinator/legs untouched; `executor=None` ⇒ v1 byte-identical.
 - [ ] Two-party regtest run auto-refunds on real consensus once `t_btc` matures; rejected if broadcast early.
+
+## Signet dust-run runbook (operator-driven)
+
+Signet is the mandatory step between regtest and mainnet-dust. Unlike regtest (self-managed docker,
+instant), signet needs **faucet coins** and **real block-time maturity** (~10-min blocks → `t_btc`
+maturity is tens of minutes to hours), so the operator drives it. The runner is now signet-capable
+(`_build_funding_reader` is network-aware; `--network`/`--mempool-base-url`/`--btc-broadcast-url`).
+
+**Network strings (important):** signet addresses use the **`tb`** HRP (shared with testnet), so build
+the HTLC and arm the tower with `--network tb`; the **endpoint** flags disambiguate signet from testnet.
+`tb` is in `AUDIT_CLEARED_NETWORKS`, so no `--audit-cleared` and no dust ceiling (it is a test network).
+
+1. **Get signet coins** — a signet faucet (e.g. `https://signetfaucet.com`, captcha-gated) to a P2WPKH
+   address you control. This is the one manual, external step.
+2. **Drive a swap to `BTC_LOCKED` on signet** — fund the HTLC address (the taker leg) and persist the
+   `SwapRecord` JSON (state `BTC_LOCKED`, `counter_chain="btc"`, a funded `btc_locator` with `network="tb"`).
+   For the maker-never-locks refund, leave the maker side unlocked (no covenant). Use a SMALL `t_btc`
+   (e.g. 2–6 blocks) so maturity is ~20 min–1 hr, and a dust `btc_sats`.
+3. **Pre-sign the refund** (online, with your key — never in the tower):
+   ```
+   python scripts/presign_refund.py --record <dir>/<swap_id>.json \
+       --refund-key-file <taker_refund_key.hex> \
+       --to-scriptpubkey <hex SPK of YOUR signet refund address> \
+       --fee-sats <fee> --out-dir <blobs-dir>
+   ```
+4. **Arm the tower for signet** (it stays ALERT-ONLY without `--refund-spk`):
+   ```
+   python scripts/watchtower_run.py \
+       --records-dir <dir> --refund-blobs-dir <blobs-dir> \
+       --network tb \
+       --mempool-base-url https://mempool.space/signet \   # signet Esplora: reads + claim detection
+       --btc-broadcast-url https://mempool.space/signet/api \  # signet broadcast endpoint
+       --quorum 1 --accept-single-source \                 # signet is single-source Esplora
+       --refund-spk <hex SPK of YOUR signet refund address> \  # MUST equal step 3's --to-scriptpubkey
+       --autonomous-refund-cap-sats <>= the funded btc_sats> \
+       --rxd-backend <your RXD source> \                   # ChainObserver reads rxd tip each tick
+       --measured --block-interval-s 600 --webhook-url <yours> --heartbeat-file <path>
+   ```
+   Wrong/mainnet `--mempool-base-url` on a signet run reads the wrong chain → funding never found →
+   the maturity gate stays WATCH (fail-closed, never a wrongful broadcast).
+5. **Wait for `t_btc` maturity**, then the tower auto-broadcasts the pre-signed refund. Verify the
+   funding outpoint is spent on `https://mempool.space/signet`. The operator page fires regardless
+   (the refund is also recoverable manually if the autonomous broadcast is declined for any bind).
+
+A signet run proves the operational plumbing on a real network; it is NOT a security proof, and the
+external audit remains the gate before any non-dust mainnet use.
