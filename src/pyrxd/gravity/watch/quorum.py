@@ -23,7 +23,7 @@ from typing import Protocol, runtime_checkable
 
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
-from pyrxd.gravity.swap_state import SwapRecord
+from pyrxd.gravity.swap_state import SwapRecord, SwapState
 from pyrxd.gravity.watch.decide import Observations
 from pyrxd.gravity.watch.reconciler import Observer
 from pyrxd.security.errors import ValidationError
@@ -71,6 +71,13 @@ class BtcClaimSource(Protocol):
 
     async def confirmations(self, claim_txid: str) -> int:
         """Quorum-agreed confirmation depth of the maker's claim tx."""
+        ...
+
+    async def funding_confirmations(self, funding_txid: str) -> int | None:
+        """Quorum-agreed confirmation depth of the taker's BTC FUNDING tx — the relative-CSV refund
+        maturity input — or ``None`` if unread/unmined. Same conservative-``min`` quorum as
+        :meth:`confirmations` (a forged over-report still fails consensus BIP68; an under-report only
+        delays the refund)."""
         ...
 
 
@@ -188,17 +195,24 @@ class ChainObserver(Observer):
             raise ValidationError("ChainObserver has no BtcClaimSource for a BTC swap")
         maker_claimed = False
         btc_confs: int | None = None
+        funding_confs: int | None = None
         locator = record.btc_locator
         if locator is not None:
             status = await self._btc.claim_status(locator.funding_outpoint.txid, locator.funding_outpoint.vout)
             maker_claimed = status.claimed
             if maker_claimed and status.claim_txid is not None:
                 btc_confs = await self._btc.confirmations(status.claim_txid)
+            # BTC-refund maturity: read the FUNDING outpoint depth ONLY when heading toward a BTC refund
+            # (avoids a per-tick quorum round-trip for every swap on every tick). decide() gates the
+            # autonomous refund on funding >= t_btc; a None here keeps decide() fail-closed.
+            if record.state in (SwapState.BTC_LOCKED, SwapState.PARAMS_MISMATCH):
+                funding_confs = await self._btc.funding_confirmations(locator.funding_outpoint.txid)
         return Observations(
             maker_has_claimed_btc=maker_claimed,
             now_rxd_height=tip,
             asset_locked_at_height=asset_locked,
             btc_claim_confirmations=btc_confs,
+            btc_funding_confirmations=funding_confs,
             low_corroboration=low_corr,
         )
 

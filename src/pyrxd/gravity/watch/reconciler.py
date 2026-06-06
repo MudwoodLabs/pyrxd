@@ -28,6 +28,7 @@ from typing import Protocol, runtime_checkable
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent, Observations, decide
+from pyrxd.gravity.watch.executor import ExecOutcome, Executor, NullExecutor
 from pyrxd.security.errors import ValidationError
 
 logger = logging.getLogger(__name__)
@@ -77,6 +78,10 @@ class ReconcileResult:
     decision: Decision
     error: str | None = None
     alert_delivered: bool | None = None
+    # The autonomous-execution outcome (v2). ``None`` = nothing attempted (no executor / not a refund);
+    # otherwise BROADCAST / DECLINED / FAILED — surfaced so the heartbeat counts BROADCAST/FAILED and a
+    # swallowed broadcast failure cannot look healthy (same discipline as ``alert_delivered``).
+    executed: ExecOutcome | None = None
 
 
 class Reconciler:
@@ -90,6 +95,7 @@ class Reconciler:
         alerter: Alerter,
         policy: MarginPolicy,
         safety_window_blocks: int,
+        executor: Executor | None = None,
     ) -> None:
         if not isinstance(policy, MarginPolicy):
             raise ValidationError("Reconciler requires a MarginPolicy")
@@ -102,6 +108,8 @@ class Reconciler:
         self._store = store
         self._observer = observer
         self._alerter = alerter
+        # Default = NullExecutor → no autonomy, alert-only wiring byte-identical (broadcasts nothing).
+        self._executor: Executor = executor if executor is not None else NullExecutor()
         self._policy = policy
         self._safety = safety_window_blocks
         self._inflight: set[str] = set()
@@ -154,12 +162,28 @@ class Reconciler:
                 delivered = await self._safe_handle(swap_id, decision)
                 return ReconcileResult(swap_id, decision, error=err, alert_delivered=delivered)
             if decision.intent in _ROUTED_INTENTS:
+                # Autonomy (v2) runs FIRST but is ADDITIVE — the alerter ALWAYS still fires, so a
+                # dormant/declined/failed broadcast never silences the operator.
+                executed = await self._safe_execute(swap_id, record, decision)
                 delivered = await self._safe_handle(swap_id, decision)
-                return ReconcileResult(swap_id, decision, alert_delivered=delivered)
+                return ReconcileResult(swap_id, decision, alert_delivered=delivered, executed=executed)
             logger.debug("swap %s: %s (%s)", swap_id, decision.intent.value, decision.reason)
             return ReconcileResult(swap_id, decision)
         finally:
             self._inflight.discard(swap_id)
+
+    async def _safe_execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
+        """Run the autonomous executor for a refund decision. A broadcast failure must NOT crash the
+        loop and must NOT silence the operator — it is recorded as ``FAILED`` and the alerter still
+        pages. Only ``PAGE_REFUND`` is autonomy-eligible; every other routed intent is observed-only.
+        With the default :class:`NullExecutor` this is always a no-op (returns ``None``)."""
+        if decision.intent is not Intent.PAGE_REFUND:
+            return None
+        try:
+            return await self._executor.execute(swap_id, record, decision)
+        except Exception:
+            logger.exception("autonomous executor FAILED for swap %s — alerter will still page", swap_id)
+            return ExecOutcome.FAILED
 
     async def _safe_handle(self, swap_id: str, decision: Decision) -> bool:
         """Route to the alerter; an alert-channel failure must not crash the loop. Returns True iff
