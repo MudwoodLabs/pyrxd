@@ -36,6 +36,7 @@ import signal
 
 import aiohttp
 
+from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.watch import (
@@ -43,19 +44,22 @@ from pyrxd.gravity.watch import (
     CompositeAlertChannel,
     DedupAlerter,
     ElectrumRxdChainSource,
+    Executor,
     FileHeartbeat,
     JsonDirRecordStore,
     LoggingAlertChannel,
     OutspendBtcClaimSource,
     Reconciler,
+    RefundExecutor,
     RpcEthChainSource,
     WebhookAlertChannel,
     combine_heartbeats,
     default_heartbeat,
+    make_refund_broadcaster,
     mempool_space_outspend,
     run_loop,
 )
-from pyrxd.network.bitcoin import MultiSourceBtcFundingReader
+from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
 
 logger = logging.getLogger("pyrxd.watchtower")
@@ -72,12 +76,14 @@ def build_reconciler(
     safety_window_blocks: int,
     alert_channel,
     eth_source=None,
+    executor: Executor | None = None,
 ) -> Reconciler:
     """Compose the real ports into a Reconciler (pure wiring — no network at call time).
 
     ``eth_source`` (an :class:`RpcEthChainSource`, optional) adds the ETH counter-leg watch path so a
-    records dir holding RXD↔ETH swaps is observed too. When ``None``, ETH-direction swaps fail closed
-    (the ChainObserver pages "no EthChainSource for an ETH swap" rather than silently skipping them)."""
+    records dir holding RXD↔ETH swaps is observed too (``None`` → ETH swaps fail closed, paging).
+    ``executor`` (an :class:`RefundExecutor`, optional) adds the v2 autonomous-refund path; ``None`` →
+    a no-op ``NullExecutor`` → ALERT-ONLY, byte-identical to v1."""
     store = JsonDirRecordStore(records_dir)
     rxd_source = ElectrumRxdChainSource(rxd_client)
 
@@ -100,7 +106,57 @@ def build_reconciler(
         alerter=alerter,
         policy=policy,
         safety_window_blocks=safety_window_blocks,
+        executor=executor,
     )
+
+
+# mempool.space POST bases per network (the value-moving edge for an armed dust run). regtest/custom
+# nodes pass --btc-broadcast-url. Constructed ONLY inside the cleared branch (no eager live wire).
+_MEMPOOL_BASE = {
+    "bc": "https://mempool.space/api",
+    "signet": "https://mempool.space/signet/api",
+    "tb": "https://mempool.space/testnet/api",
+}
+
+
+def _build_executor(args: argparse.Namespace) -> Executor | None:
+    """The optional v2 autonomous-refund executor. Returns ``None`` (→ ALERT-ONLY) unless ``--refund-spk``
+    is given. DORMANT-by-construction on a value-bearing network without ``--audit-cleared``: the broadcast
+    sink is built ONLY in the cleared branch, and :func:`make_refund_broadcaster` returns ``None`` otherwise,
+    so the executor declines + pages (broadcasts nothing)."""
+    if not args.refund_spk:
+        return None
+    try:
+        refund_spk = bytes.fromhex(args.refund_spk.removeprefix("0x"))
+    except ValueError as exc:
+        raise SystemExit("--refund-spk must be hex (the operator's pinned refund scriptPubKey)") from exc
+    cleared = args.network in AUDIT_CLEARED_NETWORKS or args.audit_cleared
+    sink = None
+    if cleared:  # construct the live wire ONLY when this network is (or is opted-in as) cleared
+        base = args.btc_broadcast_url or _MEMPOOL_BASE.get(args.network)
+        if not base:
+            raise SystemExit(f"--btc-broadcast-url is required to arm autonomy on network {args.network!r}")
+        sink = MempoolSpaceBroadcaster(base_url=base)
+    broadcaster = make_refund_broadcaster(args.network, audit_cleared=args.audit_cleared, broadcaster=sink)
+    executor = RefundExecutor(
+        broadcaster=broadcaster,
+        blobs_dir=args.refund_blobs_dir or args.records_dir,
+        network=args.network,
+        cap_sats=args.autonomous_refund_cap_sats,
+        refund_spk=refund_spk,
+        accept_single_source=args.accept_single_source,
+    )
+    if broadcaster is not None:
+        logger.warning(
+            "AUTONOMOUS REFUND ARMED on %s (cap=%d sats, dust-capped%s) — will BROADCAST operator-pre-signed "
+            "refunds; external audit is the gate before any non-dust use",
+            args.network,
+            args.autonomous_refund_cap_sats,
+            ", single-source accepted" if args.accept_single_source else "",
+        )
+    else:
+        logger.info("autonomous refund DORMANT on %s (not audit-cleared) — ALERT-ONLY, broadcasts nothing", args.network)
+    return executor
 
 
 async def _build_rxd_client(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
@@ -203,6 +259,36 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help="expected EIP-155 chain id for --eth-rpc-url (e.g. 1 mainnet, 11155111 Sepolia); "
         "the tower fails closed if the endpoint reports a different chain",
     )
+    # v2 AUTONOMOUS refund (opt-in; DORMANT on a value-bearing network without --audit-cleared). Without
+    # --refund-spk the tower is ALERT-ONLY (broadcasts nothing), byte-identical to v1.
+    p.add_argument(
+        "--network", default="bc", help="BTC network the tower acts on (bc/signet/tb/bcrt); autonomy is DORMANT on a value-bearing network without --audit-cleared"
+    )
+    p.add_argument(
+        "--refund-spk",
+        help="hex scriptPubKey of YOUR refund address — REQUIRED to arm autonomous refunds; every pre-signed "
+        "refund's output must pay exactly this (a tampered on-disk blob paying elsewhere is refused)",
+    )
+    p.add_argument(
+        "--audit-cleared",
+        action="store_true",
+        help="explicit opt-in to arm autonomy on a value-bearing network (a deliberate, dust-capped run; an "
+        "external audit is the gate for any non-dust use)",
+    )
+    p.add_argument(
+        "--autonomous-refund-cap-sats",
+        type=int,
+        default=10_000,
+        help="max per-swap sats to auto-refund (hard-bound to the dust ceiling on a value-bearing network)",
+    )
+    p.add_argument("--refund-blobs-dir", help="dir of <swap_id>.refund.json pre-signed refund blobs (default: --records-dir)")
+    p.add_argument("--btc-broadcast-url", help="mempool.space-style POST base for the armed broadcast (regtest/custom)")
+    p.add_argument(
+        "--accept-single-source",
+        action="store_true",
+        help="permit an autonomous refund on a single-source (low-corroboration) read — required for a dust run "
+        "until a multi-source RXD quorum lands",
+    )
     return p.parse_args(argv)
 
 
@@ -253,6 +339,7 @@ async def _amain(argv=None) -> int:
         http_session = await stack.enter_async_context(aiohttp.ClientSession())
         rxd_client = await _build_rxd_client(args, stack)
         eth_source = await _build_eth_source(args, stack)
+        executor = _build_executor(args)  # None → ALERT-ONLY; armed only on a cleared network
         reconciler = build_reconciler(
             records_dir=args.records_dir,
             rxd_client=rxd_client,
@@ -263,6 +350,7 @@ async def _amain(argv=None) -> int:
             safety_window_blocks=args.safety_window_blocks,
             alert_channel=_build_alert_channel(args, http_session),
             eth_source=eth_source,
+            executor=executor,
         )
         heartbeat = default_heartbeat(logger)
         if args.heartbeat_file:
@@ -273,12 +361,15 @@ async def _amain(argv=None) -> int:
             if args.rxd_backend == "electrumx"
             else f"ssh-tr:{args.ssh_host}/{args.ssh_container}"
         )
+        mode = "autonomy configured (armed/dormant per the status line above)" if executor is not None else "ALERT-ONLY (broadcasts nothing)"
         logger.info(
-            "watchtower started: records=%s rxd=%s mempool=%s poll=%.0fs (ALERT-ONLY — broadcasts nothing)",
+            "watchtower started: records=%s rxd=%s mempool=%s poll=%.0fs network=%s — %s",
             args.records_dir,
             rxd_desc,
             args.mempool_base_url,
             args.poll_interval_s,
+            args.network,
+            mode,
         )
         ticks = await run_loop(
             reconciler,

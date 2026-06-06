@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 
 import coincurve
@@ -401,6 +402,45 @@ def test_params_mismatch_autonomous_only_when_matured():
 
 
 # ─────────────────────────────────────────── keyless invariant ──
+
+
+_SCRIPTS = str(Path(__file__).resolve().parent.parent / "scripts")
+if _SCRIPTS not in sys.path:
+    sys.path.insert(0, _SCRIPTS)
+
+
+def _swap_with_key(*, network="bcrt", btc_sats=5_000, fee_sats=500):
+    """Like ``_swap`` but returns the refund private key + dest SPK so the online presign step can sign."""
+    taker_sk = coincurve.PrivateKey(os.urandom(32))
+    maker_sk = coincurve.PrivateKey(os.urandom(32))
+    timeout = t.Timelock(144, t.TimeUnit.BLOCKS)
+    htlc = t.build_htlc(
+        hashlock=_H, claim_pubkey_xonly=_xonly(maker_sk), refund_pubkey_xonly=_xonly(taker_sk), timeout=timeout, network=network
+    )
+    loc = htlc.with_funding(t.BtcOutpoint(_FUND_TXID, 0), btc_sats)
+    rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=_terms(btc_sats=btc_sats, t_btc=timeout), counterchain_locator=loc, radiant_covenant_outpoint=_COV)
+    return rec, taker_sk.secret
+
+
+async def test_presign_step_arms_an_executor_acceptable_blob(tmp_path):
+    # The online setup step rebuilds the refund from the PERSISTED record (locator round-trip), signs
+    # once with the operator's key, and writes the sidecar the keyless tower later broadcasts.
+    from presign_refund import presign_refund  # scripts/ sibling (key used here, NEVER in the tower)
+
+    rec, refund_privkey = _swap_with_key(network="bcrt", btc_sats=5_000, fee_sats=500)
+    (tmp_path / "swap1.json").write_text(json.dumps(rec.to_dict()))  # as the coordinator persists it
+    dest = presign_refund(
+        record_path=tmp_path / "swap1.json",
+        refund_privkey=refund_privkey,
+        to_scriptpubkey=_REFUND_SPK,
+        fee_sats=500,
+        out_dir=tmp_path,
+    )
+    assert dest.name == "swap1.refund.json"
+    # the tower loads + accepts it (arming with the SAME pinned refund SPK) → BROADCAST
+    b = _FakeBroadcaster()
+    out = await _armed(tmp_path, b).execute("swap1", rec, _refund_decision())
+    assert out is ExecOutcome.BROADCAST and len(b.calls) == 1
 
 
 def test_executor_module_is_keyless():
