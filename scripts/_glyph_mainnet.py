@@ -305,3 +305,212 @@ def lock_singleton_into_covenant(
     log(f"    asset lock -> {txid}")
     _wait_confirmed(rxd_client, txid, label="asset-lock", poll_s=poll_s, log=log)
     return txid
+
+
+# --------------------------------------------------------------------------- FT (fungible token)
+
+
+@dataclass(frozen=True)
+class MintedFt:
+    """A genuinely-minted Glyph FT (full premine in one holder UTXO).
+
+    Like the NFT, the FT's identity is its IMMUTABLE genesis ref — the COMMIT outpoint carried in the
+    holder script's ``bd d0 <ref>`` (NOT the reveal txid). ``ft_amount`` photons = FT units (consensus:
+    1 photon = 1 unit). ``reveal_txid`` is where the premine holder currently sits (the lock spends it)."""
+
+    ref_str: str  # "<genesis_txid>:<genesis_vout>" — the true genesis ref (commit outpoint)
+    reveal_txid: str  # where the FT premine holder currently sits (the lock spends reveal_txid:0)
+    genesis_txid: str
+    genesis_vout: int
+    owner_key: PrivateKey
+    ft_script: bytes  # the 75-byte FT holder script (p2pkh + bd d0 <ref> + epilogue)
+    ft_amount: int  # premine photons == FT units
+
+
+def _genesis_ref_from_ft_script(ft_script: bytes) -> tuple[str, int]:
+    """Parse the genesis ref an FT holder script carries (ground truth, not assumed).
+
+    FT holder = ``76a914<pkh:20>88ac bd d0 <ref:36> <epilogue:12>`` (75 bytes). The ref (= the COMMIT
+    outpoint the FT was minted at, persists across transfers) sits at offset 27, after the 25-byte
+    p2pkh prologue + ``bd d0``."""
+    if len(ft_script) != 75 or ft_script[25] != 0xBD or ft_script[26] != 0xD0:
+        raise RuntimeError(f"not a 75-byte FT holder script (expect bd d0 at 25): {ft_script[:8].hex()}")
+    ref = ft_script[27:63]
+    return ref[:32][::-1].hex(), int.from_bytes(ref[32:36], "little")
+
+
+def mint_ft_inline(
+    rxd_client,
+    *,
+    name: str,
+    ticker: str = "",
+    premine_amount: int,
+    fee_photons: int = DEFAULT_FEE_PHOTONS,
+    confirm_fn: Callable[[str], None],
+    poll_s: float = 30.0,
+    log: Callable[[str], None] = print,
+) -> MintedFt:
+    """Mint a throwaway Glyph FT on Radiant mainnet (commit→reveal premine). Genesis ref = the COMMIT
+    outpoint the holder's ``bd d0 <ref>`` carries. The reveal output holds ``premine_amount`` photons
+    (= FT units). Pauses for operator confirmation before EACH broadcast + waits for confirmation."""
+    if premine_amount <= 0:
+        raise RuntimeError("premine_amount must be positive")
+    # commit funds the reveal: the reveal spends the commit -> ONE FT output (premine), leftover = fee.
+    commit_photons = premine_amount + fee_photons
+    builder = GlyphBuilder()
+    u = _largest_wallet_utxo(rxd_client, commit_photons + 2 * fee_photons)
+    key = PrivateKey(str(_cli(rxd_client, "dumpprivkey", u["address"])))
+    pkh = Hex20(key.public_key().hash160())
+    spk = bytes.fromhex(u["scriptPubKey"])
+    in_sats = round(u["amount"] * 1e8)
+
+    meta = GlyphMetadata(protocol=[GlyphProtocol.FT], name=name, ticker=ticker)
+    commit = builder.prepare_commit(CommitParams(metadata=meta, owner_pkh=pkh, change_pkh=pkh, funding_satoshis=in_sats))
+    fin = TransactionInput(
+        source_transaction=_src(u["txid"], int(u["vout"]), spk, in_sats),
+        source_txid=u["txid"],
+        source_output_index=int(u["vout"]),
+        unlocking_script_template=_p2pkh_unlock(key),
+    )
+    fin.satoshis = in_sats
+    fin.locking_script = Script(spk)
+    commit_tx = Transaction(
+        tx_inputs=[fin],
+        tx_outputs=[
+            TransactionOutput(Script(commit.commit_script), commit_photons),
+            TransactionOutput(Script(_p2pkh_spk(pkh)), in_sats - commit_photons - fee_photons),
+        ],
+    )
+    commit_tx.sign()
+    confirm_fn(f"FT mint step 1/2: broadcast the COMMIT tx on mainnet ({commit_photons / 1e8:.4f} RXD into the commit output)")
+    commit_txid = str(_cli(rxd_client, "sendrawtransaction", commit_tx.serialize().hex()))
+    log(f"    commit -> {commit_txid}")
+    _wait_confirmed(rxd_client, commit_txid, label="commit", poll_s=poll_s, log=log)
+
+    rev = builder.prepare_ft_deploy_reveal(
+        commit_txid=commit_txid,
+        commit_vout=0,
+        commit_value=commit_photons,
+        cbor_bytes=commit.cbor_bytes,
+        premine_pkh=pkh,
+        premine_amount=premine_amount,
+    )
+    rin = TransactionInput(
+        source_transaction=_src(commit_txid, 0, commit.commit_script, commit_photons),
+        source_txid=commit_txid,
+        source_output_index=0,
+        unlocking_script_template=_glyph_unlock(key, rev.scriptsig_suffix),
+    )
+    rin.satoshis = commit_photons
+    rin.locking_script = Script(commit.commit_script)
+    # ONE FT output (premine); the commit leftover (commit_photons - premine = fee_photons) is the fee.
+    reveal_tx = Transaction(
+        tx_inputs=[rin], tx_outputs=[TransactionOutput(Script(rev.locking_script), premine_amount)]
+    )
+    reveal_tx.sign()
+    g_txid, g_vout = _genesis_ref_from_ft_script(rev.locking_script)
+    confirm_fn(f"FT mint step 2/2: broadcast the REVEAL tx (premines {premine_amount} FT units at reveal:0)")
+    reveal_txid = str(_cli(rxd_client, "sendrawtransaction", reveal_tx.serialize().hex()))
+    log(f"    reveal -> {reveal_txid}  (FT premine at reveal:0; genesis ref = {g_txid}:{g_vout} [the commit outpoint])")
+    _wait_confirmed(rxd_client, reveal_txid, label="reveal", poll_s=poll_s, log=log)
+    return MintedFt(
+        ref_str=f"{g_txid}:{g_vout}",
+        reveal_txid=reveal_txid,
+        genesis_txid=g_txid,
+        genesis_vout=g_vout,
+        owner_key=key,
+        ft_script=rev.locking_script,
+        ft_amount=premine_amount,
+    )
+
+
+def load_minted_ft(rxd_client, *, reveal_txid: str, owner_wif: str) -> MintedFt:
+    """Reconstruct a :class:`MintedFt` for an ALREADY-minted FT (skip the mint), e.g. to resume a run
+    that aborted after minting. Fetches the reveal tx on-chain for the FT holder script + amount,
+    parses the genesis ref from the holder's ``bd d0 <ref>``, and binds the owner key.
+
+    Safety: asserts the owner key's hash160 equals the p2pkh inside the FT holder — i.e. this key can
+    actually spend the FT into the covenant."""
+    v = _cli(rxd_client, "getrawtransaction", reveal_txid, "1")
+    if not isinstance(v, dict) or not v.get("vout"):
+        raise RuntimeError(f"reuse: FT reveal tx {reveal_txid} not found / has no outputs")
+    out0 = v["vout"][0]
+    ft_script = bytes.fromhex(out0["scriptPubKey"]["hex"])
+    ft_amount = round(float(out0["value"]) * 1e8)
+    g_txid, g_vout = _genesis_ref_from_ft_script(ft_script)
+    key = PrivateKey(str(owner_wif))
+    # FT holder = 76 a9 14 <pkh:20> 88 ac ... -> pkh at offset 3:23
+    if ft_script[3:23] != bytes(key.public_key().hash160()):
+        raise RuntimeError("reuse: owner WIF does not match the FT holder's p2pkh — wrong key, cannot spend the FT")
+    return MintedFt(
+        ref_str=f"{g_txid}:{g_vout}",
+        reveal_txid=reveal_txid,
+        genesis_txid=g_txid,
+        genesis_vout=g_vout,
+        owner_key=key,
+        ft_script=ft_script,
+        ft_amount=ft_amount,
+    )
+
+
+def lock_ft_into_covenant(
+    rxd_client,
+    *,
+    minted: MintedFt,
+    covenant_spk: bytes,
+    fee_photons: int = DEFAULT_FEE_PHOTONS,
+    confirm_fn: Callable[[str], None],
+    poll_s: float = 30.0,
+    log: Callable[[str], None] = print,
+) -> str:
+    """Lock the minted FT into the covenant SPK — the maker's 'lock the asset' step.
+
+    FT conservation: the FT photons (= amount) must flow WHOLE into the covenant output, which shares
+    the FT's ``codeScriptHash`` (same ``bd d0 <ref> epilogue``), so ``covenant out value == FT amount``.
+    The miner fee CANNOT be skimmed off the FT value — it comes from a SEPARATE plain-RXD wallet input,
+    with change back to the wallet. Confirms before broadcast + waits for confirmation."""
+    # FT input (the premine holder) — spent via the owner's p2pkh prologue; the epilogue enforces
+    # conservation against the covenant output at consensus time.
+    fin = TransactionInput(
+        source_transaction=_src(minted.reveal_txid, 0, minted.ft_script, minted.ft_amount),
+        source_txid=minted.reveal_txid,
+        source_output_index=0,
+        unlocking_script_template=_p2pkh_unlock(minted.owner_key),
+    )
+    fin.satoshis = minted.ft_amount
+    fin.locking_script = Script(minted.ft_script)
+    # Separate plain-RXD fee input from the wallet (its surplus over the fee returns as change).
+    fu = _largest_wallet_utxo(rxd_client, 2 * fee_photons)
+    fkey = PrivateKey(str(_cli(rxd_client, "dumpprivkey", fu["address"])))
+    fspk = bytes.fromhex(fu["scriptPubKey"])
+    fee_in_sats = round(fu["amount"] * 1e8)
+    feein = TransactionInput(
+        source_transaction=_src(fu["txid"], int(fu["vout"]), fspk, fee_in_sats),
+        source_txid=fu["txid"],
+        source_output_index=int(fu["vout"]),
+        unlocking_script_template=_p2pkh_unlock(fkey),
+    )
+    feein.satoshis = fee_in_sats
+    feein.locking_script = Script(fspk)
+    # Two-pass fee: the 2-input lock with a ~224B covenant output is ~600B — well above the sub-kB
+    # mint txs — so a flat fee can fall UNDER the mainnet min-relay (0.10 RXD/kB = 10_000 photons/B).
+    # Measure the signed size and pay >= size * rate with margin (the FT value flows whole regardless;
+    # only the separate fee input + change absorb the fee).
+    def _build(fee: int) -> Transaction:
+        outs = [TransactionOutput(Script(covenant_spk), minted.ft_amount)]  # covenant carries the WHOLE FT amount
+        ch = fee_in_sats - fee
+        if ch > 0:
+            outs.append(TransactionOutput(Script(_p2pkh_spk(fkey.public_key().hash160())), ch))
+        fin.unlocking_script = None
+        feein.unlocking_script = None
+        t = Transaction(tx_inputs=[fin, feein], tx_outputs=outs)
+        t.sign()
+        return t
+
+    fee = max(fee_photons, _build(fee_photons).byte_length() * 15_000)  # 1.5x the 10_000 photons/B relay floor
+    tx = _build(fee)
+    confirm_fn(f"lock the FT ({minted.ft_amount} units) into the covenant SPK on mainnet (fee {fee / 1e8:.4f} RXD from a separate input)")
+    txid = str(_cli(rxd_client, "sendrawtransaction", tx.serialize().hex()))
+    log(f"    FT asset lock -> {txid}")
+    _wait_confirmed(rxd_client, txid, label="asset-lock", poll_s=poll_s, log=log)
+    return txid

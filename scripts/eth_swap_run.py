@@ -47,9 +47,12 @@ from _dust_swap_shared import (
     confirm,
     rxd_blockcount,
 )
-from _glyph_mainnet import (  # scripts/ sibling (NFT path)
+from _glyph_mainnet import (  # scripts/ sibling (NFT + FT paths)
+    load_minted_ft,
     load_minted_nft,
+    lock_ft_into_covenant,
     lock_singleton_into_covenant,
+    mint_ft_inline,
     mint_nft_inline,
     wait_genesis_mature,
 )
@@ -62,7 +65,7 @@ from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
-from pyrxd.gravity.htlc_covenant import build_htlc_covenant_nft, build_htlc_covenant_rxd
+from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
@@ -158,6 +161,23 @@ def _build_terms_and_covenant(args, *, eth_timeout: int, minted=None):
         asset_variant = "nft"
         genesis_ref = GlyphRef(txid=minted.genesis_txid, vout=minted.genesis_vout).to_bytes()
         radiant_amount = args.nft_carrier_photons
+    elif args.asset_variant == "ft":
+        if minted is None:
+            raise SystemExit("internal: the FT path must mint the FT before building the covenant")
+        # FT covenant: the FT VALUE flows whole into the covenant (conservation), so radiant_amount ==
+        # the minted FT amount — NOT an independent carrier. Genesis ref = the commit outpoint.
+        cov = build_htlc_covenant_ft(
+            genesis_txid=minted.genesis_txid,
+            genesis_vout=minted.genesis_vout,
+            amount=minted.ft_amount,
+            taker_pkh=taker_pkh,
+            maker_pkh=maker_pkh,
+            hashlock=h,
+            refund_csv=t_rxd.value,
+        )
+        asset_variant = "ft"
+        genesis_ref = GlyphRef(txid=minted.genesis_txid, vout=minted.genesis_vout).to_bytes()
+        radiant_amount = minted.ft_amount
     else:
         cov = build_htlc_covenant_rxd(
             amount=args.rxd_photons, taker_pkh=taker_pkh, maker_pkh=maker_pkh, hashlock=h, refund_csv=t_rxd.value
@@ -312,6 +332,24 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 poll_s=args.confirm_poll_s,
             )
         print(f"  minted NFT genesis ref: {minted.ref_str}")
+    elif args.asset_variant == "ft":
+        if args.ft_reuse_reveal_txid:
+            if not args.ft_owner_wif:
+                raise SystemExit("--ft-reuse-reveal-txid requires --ft-owner-wif (to spend the FT)")
+            print(f"\n  --- FT path: REUSING already-minted FT at reveal {args.ft_reuse_reveal_txid} (no mint) ---")
+            minted = load_minted_ft(rxd_client, reveal_txid=args.ft_reuse_reveal_txid, owner_wif=args.ft_owner_wif)
+        else:
+            print("\n  --- FT path: minting a fresh throwaway Glyph FT on RXD MAINNET (commit→reveal premine) ---")
+            minted = mint_ft_inline(
+                rxd_client,
+                name=args.ft_name,
+                ticker=args.ft_ticker,
+                premine_amount=args.ft_premine_photons,
+                fee_photons=args.rxd_mint_fee_photons,
+                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
+                poll_s=args.confirm_poll_s,
+            )
+        print(f"  minted FT genesis ref: {minted.ref_str}  ({minted.ft_amount} units)")
     # eth_timeout starts AFTER the (slow, multi-block) mint, so the full window is available for the swap.
     eth_timeout = int(time.time()) + args.eth_timeout_s
     terms, cov, p_secret, h, _rkeys = _build_terms_and_covenant(args, eth_timeout=eth_timeout, minted=minted)
@@ -339,9 +377,11 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 "rxd_covenant_spk": cov.funded_spk.hex(),
                 "t_rxd_blocks": terms.t_rxd.value,
                 "asset_variant": args.asset_variant,
-                "nft_genesis_ref": minted.ref_str if minted else None,
-                "nft_owner_wif": minted.owner_key.wif() if minted else None,
-                "nft_reveal_value": minted.reveal_value if minted else None,
+                "asset_genesis_ref": minted.ref_str if minted else None,
+                "asset_owner_wif": minted.owner_key.wif() if minted else None,
+                # NFT carries reveal_value; FT carries ft_amount — persist whichever the mint produced.
+                "asset_reveal_value": getattr(minted, "reveal_value", None) if minted else None,
+                "asset_ft_amount": getattr(minted, "ft_amount", None) if minted else None,
                 "note": "ALL run state for recovery/sweep incl preimage p. mode 600 — delete after sweep.",
             },
             indent=2,
@@ -369,12 +409,12 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         min_confirmations=1,
         audit_cleared=True,
     )
-    # NFT: the REAL RXinDexer is the genesis-ref authenticity oracle (R1 fake-singleton defense).
-    # Plain RXD has no ref → no indexer needed. Default to the REST adapter over ssh-tr (the mainnet
-    # deployment runs only the HTTP api, no glyph electrumx ws); use the electrumx-ws adapter only
-    # when a --rxd-indexer-ws is explicitly given (e.g. a glyph-enabled electrumx).
+    # NFT/FT both carry a genesis ref → the REAL RXinDexer is the genesis-ref authenticity oracle
+    # (R1 fake-singleton defense). Plain RXD has no ref → no indexer needed. Default to the REST
+    # adapter over ssh-tr (the mainnet deployment runs only the HTTP api, no glyph electrumx ws);
+    # use the electrumx-ws adapter only when a --rxd-indexer-ws is explicitly given.
     indexer = None
-    if args.asset_variant == "nft":
+    if args.asset_variant in ("nft", "ft"):
         chain_io = RadiantChainIO(rxd_client)
         if args.rxd_indexer_ws:
             ex = ElectrumXClient(urls=[args.rxd_indexer_ws], allow_insecure=args.rxd_indexer_insecure)
@@ -433,6 +473,15 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 minted=minted,
                 covenant_spk=cov.funded_spk,
                 carrier_photons=args.nft_carrier_photons,
+                fee_photons=args.rxd_mint_fee_photons,
+                confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
+                poll_s=args.confirm_poll_s,
+            )
+        elif args.asset_variant == "ft":
+            lock_ft_into_covenant(
+                rxd_client,
+                minted=minted,
+                covenant_spk=cov.funded_spk,
                 fee_photons=args.rxd_mint_fee_photons,
                 confirm_fn=lambda m: confirm(m, auto_yes=args.yes),
                 poll_s=args.confirm_poll_s,
@@ -537,7 +586,12 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--rxd-wallet", default="")
     ap.add_argument("--t-rxd-blocks", type=int, default=60)
     # asset: plain RXD (default) or a freshly-minted NFT Glyph (Glyph↔ETH).
-    ap.add_argument("--asset-variant", choices=("rxd", "nft"), default="rxd")
+    ap.add_argument("--asset-variant", choices=("rxd", "nft", "ft"), default="rxd")
+    ap.add_argument("--ft-name", default="ETH-RXD-REAL-FT")
+    ap.add_argument("--ft-ticker", default="ERFT")
+    ap.add_argument("--ft-premine-photons", type=int, default=10_000_000)  # FT supply = covenant-locked amount (1 photon = 1 unit)
+    ap.add_argument("--ft-reuse-reveal-txid", default="", help="reuse an already-minted FT at this reveal txid (skip minting)")
+    ap.add_argument("--ft-owner-wif", default="", help="owner WIF for --ft-reuse-reveal-txid (spends the FT into the covenant)")
     ap.add_argument("--rxd-indexer-ws", default="", help="OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api over ssh-tr")
     ap.add_argument("--rxd-indexer-insecure", action="store_true", help="allow a non-TLS RXinDexer ws")
     ap.add_argument("--rxd-ssh-host", default="tr", help="ssh host for the RXinDexer REST REF gate (default tr)")
