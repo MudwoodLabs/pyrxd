@@ -90,6 +90,11 @@ class Observations:
     now_rxd_height: int
     asset_locked_at_height: int | None = None
     btc_claim_confirmations: int | None = None
+    # Quorum-agreed depth of the taker's BTC FUNDING outpoint (distinct from btc_claim_confirmations,
+    # which is the maker's CLAIM-tx depth). Read only when heading toward a BTC refund (state
+    # BTC_LOCKED / PARAMS_MISMATCH); gates the relative-CSV maturity (funding buried >= t_btc) for an
+    # autonomous refund. ``None`` until/unless read — the refund branch fails closed on None.
+    btc_funding_confirmations: int | None = None
     # ETH counter-leg (v3). ``eth_claim_detected`` = the maker's ETH claim tx was observed on-chain;
     # ``eth_claim_finality`` = its point-in-time finalized-checkpoint verdict STATE (FINAL /
     # NOT_YET_FINAL_LIVE / COUNTER_CHAIN_NOT_FINALIZING), ``None`` until/unless a claim is observed.
@@ -108,6 +113,7 @@ class Observations:
         for label, val in (
             ("asset_locked_at_height", self.asset_locked_at_height),
             ("btc_claim_confirmations", self.btc_claim_confirmations),
+            ("btc_funding_confirmations", self.btc_funding_confirmations),
         ):
             if val is not None and (not isinstance(val, int) or isinstance(val, bool) or val < 0):
                 raise ValidationError(f"Observations.{label} must be a non-negative int or None")
@@ -135,12 +141,21 @@ class Decision:
     recommended_action: str | None = None
     deadline_rxd_height: int | None = None
     low_corroboration: bool = False
+    # TYPED autonomy discriminator. True ONLY on a BTC keyless-pre-signed-refund decision whose BTC CSV
+    # has MATURED — the v2 autonomous executor keys on THIS, never on the ``recommended_action`` display
+    # string (the ETH PARAMS_MISMATCH branch also emits "taker_refund_btc", so a string match would
+    # wrongly arm on an ETH swap). Always False for every claim/squeeze/ETH/immature-refund decision.
+    autonomous_btc_refund: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, Intent):
             raise ValidationError("Decision.intent must be an Intent")
         if not isinstance(self.reason, str) or not self.reason:
             raise ValidationError("Decision.reason must be a non-empty str")
+        if not isinstance(self.autonomous_btc_refund, bool):
+            raise ValidationError("Decision.autonomous_btc_refund must be bool")
+        if self.autonomous_btc_refund and self.intent is not Intent.PAGE_REFUND:
+            raise ValidationError("autonomous_btc_refund is only valid on a PAGE_REFUND decision")
 
 
 def _required_btc_depth_blocks(policy: MarginPolicy) -> int:
@@ -155,6 +170,23 @@ def _refund_opens_at(policy: MarginPolicy, terms, asset_locked_at_height: int) -
     """RXD height at which the maker's CSV refund opens (the claim deadline)."""
     t_rxd_blocks = terms.t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
     return asset_locked_at_height + t_rxd_blocks
+
+
+def _btc_refund_matured(terms, obs: Observations) -> bool:
+    """True iff the taker's BTC CSV refund leaf has PROVABLY matured — the gate for an *autonomous*
+    refund (an alert-only page still goes out regardless; this only decides ``autonomous_btc_refund``).
+
+    Two fail-closed conditions: (1) ``t_btc`` is a BLOCKS relative lock — a SECONDS/MTP lock cannot be
+    proven mature from a confirmation count, so we never auto-act on one; (2) the funding outpoint is
+    buried ``>= t_btc`` blocks. The funding-depth read shares the dust-path single-source posture, but
+    unlike the RXD *trigger* it is consensus-backstopped: a forged OVER-report still fails BIP68 (the
+    real outpoint is not mature → the node rejects the spend) and an under-report only DELAYS.
+    """
+    return (
+        terms.t_btc.unit is TimeUnit.BLOCKS
+        and obs.btc_funding_confirmations is not None
+        and obs.btc_funding_confirmations >= terms.t_btc.value
+    )
 
 
 def decide(
@@ -264,12 +296,15 @@ def decide(
             recommended_action="taker_claim_asset_from_vulnerable vs accept loss",
             low_corroboration=corr,
         )
-    # 3b. Maker locked the asset with wrong params — refund the BTC counter-leg.
+    # 3b. Maker locked the asset with wrong params — refund the BTC counter-leg. The page ALWAYS goes
+    #     out (the swap is definitively broken); autonomous IFF the CSV refund has matured (else the
+    #     operator refunds manually once it does — never an autonomous broadcast of an immature refund).
     if state is SwapState.PARAMS_MISMATCH:
         return Decision(
             Intent.PAGE_REFUND,
             reason="covenant params mismatch — refund the BTC counter-leg via the timelock leg",
             recommended_action="taker_refund_btc",
+            autonomous_btc_refund=_btc_refund_matured(terms, obs),
             low_corroboration=corr,
         )
     # 3c. Asset-leg proactive refund on maker stall (BOTH_LOCKED / MAKER_STALLS).
@@ -319,9 +354,36 @@ def decide(
             low_corroboration=corr,
         )
 
-    # 3d. Pre-lock states (NEGOTIATED, BTC_LOCKED): nothing time-critical for v1.
-    #     (The "maker never locks the asset → refund BTC after t_btc" stranded-BTC
-    #     watch is a v1.1 add — it is recoverable, not a race, so v1 only watches.)
+    # 3d. Maker never locks the asset → the taker's stranded BTC becomes refundable once the BTC
+    #     funding buries past t_btc (the relative-CSV refund leaf opens). We only page (and only then
+    #     auto-act) once the refund is actually DUE — until then the maker may still lock, so we watch.
+    #     Fail-closed: never refund when the asset IS observed locked on-chain (a stale BTC_LOCKED
+    #     record → the maker did lock), and never auto-act on an unread/seconds-unit maturity.
+    if state is SwapState.BTC_LOCKED:
+        if obs.asset_locked_at_height is not None:
+            return Decision(
+                Intent.WATCH,
+                reason="asset lock observed on-chain despite a BTC_LOCKED record — the maker locked; not refunding",
+                low_corroboration=corr,
+            )
+        if _btc_refund_matured(terms, obs):
+            return Decision(
+                Intent.PAGE_REFUND,
+                reason=(
+                    f"maker never locked the asset; BTC funding buried {obs.btc_funding_confirmations} "
+                    f">= t_btc {terms.t_btc.value} blocks — refund the BTC counter-leg via the timelock leg"
+                ),
+                recommended_action="taker_refund_btc",
+                autonomous_btc_refund=True,
+                low_corroboration=corr,
+            )
+        return Decision(
+            Intent.WATCH,
+            reason=f"BTC_LOCKED; awaiting t_btc maturity (funding {obs.btc_funding_confirmations} conf) or an asset lock",
+            low_corroboration=corr,
+        )
+
+    # 3e. Other pre-lock states (NEGOTIATED): nothing time-critical.
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)
 
 

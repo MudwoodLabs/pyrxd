@@ -173,6 +173,16 @@ class OutspendBtcClaimSource:
     async def confirmations(self, claim_txid: str) -> int:
         return int(await self._reader.confirmations(claim_txid))
 
+    async def funding_confirmations(self, funding_txid: str) -> int | None:
+        """Funding-tx depth via the SAME quorum reader (conservative min). Returns ``None`` if the read
+        fails (down/unknown) so decide() fails closed (no autonomous refund) instead of guessing — a
+        genuine 0 (unconfirmed) is returned as 0 and the maturity gate keeps watching."""
+        try:
+            return int(await self._reader.confirmations(funding_txid))
+        except Exception:
+            logger.debug("funding-depth read failed for %s", funding_txid, exc_info=True)
+            return None
+
 
 async def mempool_space_outspend(
     session, base_url: str, funding_txid: str, vout: int, *, timeout_s: float = 15.0
