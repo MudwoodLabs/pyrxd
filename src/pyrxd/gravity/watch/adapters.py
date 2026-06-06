@@ -82,7 +82,11 @@ class JsonDirRecordStore:
                 "report 0 swaps as healthy"
             )
         out: list[tuple[str, SwapRecord]] = []
-        paths = sorted(self._dir.glob("*.json"))
+        # Exclude v2 pre-signed-refund sidecars (``<swap_id>.refund.json``): they live beside the
+        # records (the default --refund-blobs-dir) and are NOT SwapRecords, so counting them here would
+        # spam per-tick "unreadable record" warnings and could trip the all-unreadable "watching nothing"
+        # page. They are loaded separately, keyed by swap_id, in the executor.
+        paths = [p for p in sorted(self._dir.glob("*.json")) if not p.name.endswith(".refund.json")]
         failed = 0
         for path in paths:
             try:

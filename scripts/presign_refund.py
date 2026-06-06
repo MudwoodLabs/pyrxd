@@ -54,7 +54,9 @@ def presign_refund(
     swap_id = record_path.stem  # the JsonDirRecordStore keys swaps by the file stem
     record = SwapRecord.from_dict(json.loads(record_path.read_text()))
     if record.terms.counter_chain != "btc":
-        raise ValidationError(f"{record_path} is a {record.terms.counter_chain!r} swap — only BTC refunds are pre-signable")
+        raise ValidationError(
+            f"{record_path} is a {record.terms.counter_chain!r} swap — only BTC refunds are pre-signable"
+        )
     locator = record.btc_locator
     if locator is None:
         raise ValidationError(f"{record_path} has no funded BTC locator yet — fund the BTC leg before pre-signing")
@@ -76,7 +78,9 @@ def presign_refund(
     if blob.output_spk != to_scriptpubkey:
         raise ValidationError("built refund output != --to-scriptpubkey")
     if not (0 < blob.output_value_sats < locator.amount_sats):
-        raise ValidationError(f"refund value {blob.output_value_sats} not in (0, funded {locator.amount_sats}) — bad fee")
+        raise ValidationError(
+            f"refund value {blob.output_value_sats} not in (0, funded {locator.amount_sats}) — bad fee"
+        )
     out = Path(out_dir) if out_dir is not None else record_path.parent
     dest = out / f"{swap_id}.refund.json"
     # Write LAST (the record already exists) so a partial setup never yields an armed-but-mismatched pair.
@@ -97,7 +101,9 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Pre-sign a BTC HTLC refund for the autonomous watchtower")
     p.add_argument("--record", required=True, help="path to the SwapRecord JSON (its stem is the swap_id)")
     p.add_argument("--refund-key-file", required=True, help="file containing your 32-byte hex refund private key")
-    p.add_argument("--to-scriptpubkey", required=True, help="hex scriptPubKey of YOUR refund address (== the tower's --refund-spk)")
+    p.add_argument(
+        "--to-scriptpubkey", required=True, help="hex scriptPubKey of YOUR refund address (== the tower's --refund-spk)"
+    )
     p.add_argument("--fee-sats", type=int, required=True, help="absolute fee baked into the (unbumpable) refund tx")
     p.add_argument("--out-dir", help="where to write <swap_id>.refund.json (default: the record's dir)")
     args = p.parse_args(argv)

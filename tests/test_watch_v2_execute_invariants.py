@@ -415,10 +415,19 @@ def _swap_with_key(*, network="bcrt", btc_sats=5_000, fee_sats=500):
     maker_sk = coincurve.PrivateKey(os.urandom(32))
     timeout = t.Timelock(144, t.TimeUnit.BLOCKS)
     htlc = t.build_htlc(
-        hashlock=_H, claim_pubkey_xonly=_xonly(maker_sk), refund_pubkey_xonly=_xonly(taker_sk), timeout=timeout, network=network
+        hashlock=_H,
+        claim_pubkey_xonly=_xonly(maker_sk),
+        refund_pubkey_xonly=_xonly(taker_sk),
+        timeout=timeout,
+        network=network,
     )
     loc = htlc.with_funding(t.BtcOutpoint(_FUND_TXID, 0), btc_sats)
-    rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=_terms(btc_sats=btc_sats, t_btc=timeout), counterchain_locator=loc, radiant_covenant_outpoint=_COV)
+    rec = SwapRecord(
+        state=SwapState.BTC_LOCKED,
+        terms=_terms(btc_sats=btc_sats, t_btc=timeout),
+        counterchain_locator=loc,
+        radiant_covenant_outpoint=_COV,
+    )
     return rec, taker_sk.secret
 
 
@@ -441,6 +450,38 @@ async def test_presign_step_arms_an_executor_acceptable_blob(tmp_path):
     b = _FakeBroadcaster()
     out = await _armed(tmp_path, b).execute("swap1", rec, _refund_decision())
     assert out is ExecOutcome.BROADCAST and len(b.calls) == 1
+
+
+def test_spend_fields_parser_fail_closed_and_differential():
+    # The new hardened parser must NEVER half-parse: it agrees with btc_txid_from_raw (both succeed on a
+    # valid segwit refund, both raise on garbage), and rejects truncation / trailing bytes fail-closed.
+    _, blob = _swap()
+    raw = blob.raw_tx
+    fields = t.btc_spend_fields_from_raw(raw)
+    assert len(fields.input_prevouts) == 1 and len(fields.outputs) == 1
+    assert t.btc_txid_from_raw(raw)  # the sibling hardened parser succeeds on the same bytes
+    with pytest.raises(ValidationError):
+        t.btc_spend_fields_from_raw(raw[:-1])  # truncated
+    with pytest.raises(ValidationError):
+        t.btc_spend_fields_from_raw(raw + b"\x00")  # trailing bytes after locktime
+    for bad in (b"", b"\x00\x01\x02", b"\x02\x00\x00\x00"):  # garbage / version-only
+        with pytest.raises(ValidationError):
+            t.btc_spend_fields_from_raw(bad)
+        with pytest.raises(ValidationError):
+            t.btc_txid_from_raw(bad)  # differential: neither hardened parser ever half-parses
+
+
+def test_records_store_ignores_refund_sidecars(tmp_path):
+    # The default --refund-blobs-dir == --records-dir; the sidecar must NOT be parsed as a SwapRecord
+    # (which would spam per-tick warnings / trip the all-unreadable "watching nothing" page).
+    import asyncio
+
+    from pyrxd.gravity.watch import JsonDirRecordStore
+
+    _, blob = _swap()
+    _write(tmp_path, blob)  # writes <swap1>.refund.json beside where records live
+    active = asyncio.run(JsonDirRecordStore(tmp_path).list_active())
+    assert active == []  # the refund sidecar is ignored, not a phantom/unreadable "record"
 
 
 def test_executor_module_is_keyless():

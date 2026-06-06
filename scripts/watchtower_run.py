@@ -119,7 +119,7 @@ _MEMPOOL_BASE = {
 }
 
 
-def _build_executor(args: argparse.Namespace) -> Executor | None:
+def _build_executor(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> Executor | None:
     """The optional v2 autonomous-refund executor. Returns ``None`` (→ ALERT-ONLY) unless ``--refund-spk``
     is given. DORMANT-by-construction on a value-bearing network without ``--audit-cleared``: the broadcast
     sink is built ONLY in the cleared branch, and :func:`make_refund_broadcaster` returns ``None`` otherwise,
@@ -137,6 +137,7 @@ def _build_executor(args: argparse.Namespace) -> Executor | None:
         if not base:
             raise SystemExit(f"--btc-broadcast-url is required to arm autonomy on network {args.network!r}")
         sink = MempoolSpaceBroadcaster(base_url=base)
+        stack.push_async_callback(sink.close)  # close the lazily-opened aiohttp session on exit
     broadcaster = make_refund_broadcaster(args.network, audit_cleared=args.audit_cleared, broadcaster=sink)
     executor = RefundExecutor(
         broadcaster=broadcaster,
@@ -155,7 +156,9 @@ def _build_executor(args: argparse.Namespace) -> Executor | None:
             ", single-source accepted" if args.accept_single_source else "",
         )
     else:
-        logger.info("autonomous refund DORMANT on %s (not audit-cleared) — ALERT-ONLY, broadcasts nothing", args.network)
+        logger.info(
+            "autonomous refund DORMANT on %s (not audit-cleared) — ALERT-ONLY, broadcasts nothing", args.network
+        )
     return executor
 
 
@@ -262,7 +265,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
     # v2 AUTONOMOUS refund (opt-in; DORMANT on a value-bearing network without --audit-cleared). Without
     # --refund-spk the tower is ALERT-ONLY (broadcasts nothing), byte-identical to v1.
     p.add_argument(
-        "--network", default="bc", help="BTC network the tower acts on (bc/signet/tb/bcrt); autonomy is DORMANT on a value-bearing network without --audit-cleared"
+        "--network",
+        default="bc",
+        help="BTC network the tower acts on (bc/signet/tb/bcrt); autonomy is DORMANT on a value-bearing network without --audit-cleared",
     )
     p.add_argument(
         "--refund-spk",
@@ -281,7 +286,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
         default=10_000,
         help="max per-swap sats to auto-refund (hard-bound to the dust ceiling on a value-bearing network)",
     )
-    p.add_argument("--refund-blobs-dir", help="dir of <swap_id>.refund.json pre-signed refund blobs (default: --records-dir)")
+    p.add_argument(
+        "--refund-blobs-dir", help="dir of <swap_id>.refund.json pre-signed refund blobs (default: --records-dir)"
+    )
     p.add_argument("--btc-broadcast-url", help="mempool.space-style POST base for the armed broadcast (regtest/custom)")
     p.add_argument(
         "--accept-single-source",
@@ -339,7 +346,7 @@ async def _amain(argv=None) -> int:
         http_session = await stack.enter_async_context(aiohttp.ClientSession())
         rxd_client = await _build_rxd_client(args, stack)
         eth_source = await _build_eth_source(args, stack)
-        executor = _build_executor(args)  # None → ALERT-ONLY; armed only on a cleared network
+        executor = _build_executor(args, stack)  # None → ALERT-ONLY; armed only on a cleared network
         reconciler = build_reconciler(
             records_dir=args.records_dir,
             rxd_client=rxd_client,
@@ -361,7 +368,11 @@ async def _amain(argv=None) -> int:
             if args.rxd_backend == "electrumx"
             else f"ssh-tr:{args.ssh_host}/{args.ssh_container}"
         )
-        mode = "autonomy configured (armed/dormant per the status line above)" if executor is not None else "ALERT-ONLY (broadcasts nothing)"
+        mode = (
+            "autonomy configured (armed/dormant per the status line above)"
+            if executor is not None
+            else "ALERT-ONLY (broadcasts nothing)"
+        )
         logger.info(
             "watchtower started: records=%s rxd=%s mempool=%s poll=%.0fs network=%s — %s",
             args.records_dir,

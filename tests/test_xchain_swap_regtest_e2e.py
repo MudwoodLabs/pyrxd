@@ -868,7 +868,12 @@ class TestWatchtowerAutonomousRefundRegtest:
             nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
         )
         raw = bt.build_refund_tx(
-            locator=loc, refund_privkey=refund_priv, timeout=t_btc, to_scriptpubkey=dest, fee_sats=2_000, aux_rand=os.urandom(32)
+            locator=loc,
+            refund_privkey=refund_priv,
+            timeout=t_btc,
+            to_scriptpubkey=dest,
+            fee_sats=2_000,
+            aux_rand=os.urandom(32),
         )
         blob = PresignedRefund(raw_tx=raw, swap_id="auto1")
         (tmp_path / "auto1.refund.json").write_text(json.dumps(blob.to_dict()))
@@ -878,23 +883,41 @@ class TestWatchtowerAutonomousRefundRegtest:
             nodes.btc("sendrawtransaction", raw.hex())
         assert "non-BIP68-final" in str(ei.value) or "non-final" in str(ei.value)
 
-        # Mature the relative CSV: the funding now has >= t_btc confirmations.
-        nodes.btc_mine(t_btc.value)
+        # Mature the relative CSV to EXACTLY t_btc confirmations (the empirically-verified BIP68 boundary:
+        # bitcoind accepts the relative-N refund at confs == N, rejects at N-1). Funding is at 1 conf, so
+        # mine t_btc.value - 1 more → confs == t_btc.value. This pins decide()'s `confs >= N` gate as correct.
+        nodes.btc_mine(t_btc.value - 1)
+        assert int(nodes.btc("getrawtransaction", loc.funding_outpoint.txid, "true")["confirmations"]) == t_btc.value
 
         # (2) POSITIVE — the production executor broadcasts the stored bytes; the outpoint is spent.
         terms = NegotiatedTerms(
-            hashlock=h, btc_sats=btc_sats, radiant_amount=1, t_btc=t_btc, t_rxd=t_rxd, asset_variant="rxd",
-            genesis_ref=b"", taker_dest_hash=b"\x11" * 32, maker_dest_hash=b"\x22" * 32,
-            btc_claim_pubkey_xonly=claim_xo, btc_refund_pubkey_xonly=refund_xo,
+            hashlock=h,
+            btc_sats=btc_sats,
+            radiant_amount=1,
+            t_btc=t_btc,
+            t_rxd=t_rxd,
+            asset_variant="rxd",
+            genesis_ref=b"",
+            taker_dest_hash=b"\x11" * 32,
+            maker_dest_hash=b"\x22" * 32,
+            btc_claim_pubkey_xonly=claim_xo,
+            btc_refund_pubkey_xonly=refund_xo,
         )
         rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=terms, counterchain_locator=loc)
         ex = RefundExecutor(
-            broadcaster=_BtcBroadcaster(nodes), blobs_dir=tmp_path, network="bcrt",
-            cap_sats=btc_sats, refund_spk=dest, accept_single_source=True,
+            broadcaster=_BtcBroadcaster(nodes),
+            blobs_dir=tmp_path,
+            network="bcrt",
+            cap_sats=btc_sats,
+            refund_spk=dest,
+            accept_single_source=True,
         )
         dec = Decision(
-            Intent.PAGE_REFUND, reason="matured BTC refund due", recommended_action="taker_refund_btc",
-            autonomous_btc_refund=True, low_corroboration=True,
+            Intent.PAGE_REFUND,
+            reason="matured BTC refund due",
+            recommended_action="taker_refund_btc",
+            autonomous_btc_refund=True,
+            low_corroboration=True,
         )
         out = await ex.execute("auto1", rec, dec)
         assert out is ExecOutcome.BROADCAST
