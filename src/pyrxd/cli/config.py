@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..security.errors import ValidationError
+
 # tomllib landed in Python 3.11. pyproject.toml declares ``requires-python = ">=3.10"``
 # so 3.10 users must fall back to the ``tomli`` backport (it ships the same
 # API as ``tomllib`` and is what CPython itself adopted upstream).
@@ -95,7 +97,15 @@ def load(path: Path | None = None) -> Config:
 
     if target.exists():
         with target.open("rb") as f:
-            file_data = tomllib.load(f)
+            try:
+                file_data = tomllib.load(f)
+            except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+                # A malformed config file is a user/operator error, not a bug.
+                # Surface it as ValidationError so callers (and the CLI
+                # boundary) get a clean, typed failure instead of a raw
+                # traceback. UnicodeDecodeError fires when the file isn't
+                # valid UTF-8 (tomllib decodes the bytes before parsing).
+                raise ValidationError(f"config file at {target} is not valid TOML: {exc}") from exc
         source_path = target
 
     network = os.environ.get("PYRXD_NETWORK") or file_data.get("network") or _DEFAULTS["network"]
@@ -115,12 +125,26 @@ def load(path: Path | None = None) -> Config:
     return Config(
         network=str(network),
         electrumx=str(electrumx),
-        fee_rate=int(fee_rate_raw),
+        fee_rate=_as_int(fee_rate_raw, "fee_rate"),
         wallet_path=Path(str(wallet_path)).expanduser(),
-        coin_type=int(coin_type_raw),
+        coin_type=_as_int(coin_type_raw, "coin_type"),
         networks=networks,
         source_path=source_path,
     )
+
+
+def _as_int(value: Any, key: str) -> int:
+    """Coerce a config/env value to int, raising ValidationError on garbage.
+
+    A non-numeric ``fee_rate``/``coin_type`` (e.g. a string, list, or table
+    in the TOML, or a bad ``PYRXD_*`` env var) must fail as a typed,
+    user-facing error — not leak a raw ``ValueError``/``TypeError`` from
+    ``int()`` past the config boundary.
+    """
+    try:
+        return int(value)
+    except (ValueError, TypeError) as exc:
+        raise ValidationError(f"config value for {key!r} is not an integer: {value!r}") from exc
 
 
 def write_default(path: Path | None = None, *, coin_type: int | None = None) -> Path:
