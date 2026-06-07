@@ -4,6 +4,72 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-06-07
+
+Feature release on top of 0.6.x — 15 commits. The user-facing headline is a
+**`wallet sweep`** command and **`setup --coin-type`**. Alongside, the
+**experimental, pre-audit** cross-chain swap + watchtower stack advances:
+ETH counter-leg watching (alert-only), FT/NFT↔ETH swap coverage, and a
+**dormant, capped, keyless autonomous BTC refund** with a Go-gated dust-run
+harness — see the dedicated section below; this code is still **not** for
+production use until externally audited.
+
+No breaking changes — everything is additive; existing public import paths
+and CLI commands are unchanged.
+
+### Added
+
+- `pyrxd wallet sweep` — move the full balance from any single derived path
+  to a destination address, for consolidating funds a recovery scan turned
+  up on a non-default derivation (#161).
+- `pyrxd setup --coin-type` — choose the HD derivation coin type at wallet
+  init (e.g. `0` for Photonic/Chainbow compatibility) instead of the
+  default; and `pyrxd inspect` now classifies rarer Glyph types (#174).
+
+### Changed
+
+- Internal: split the monolithic `glyph_cmds.py` (extracted `inspect` and
+  shared helpers, de-duplicated `_load_wallet`). Public CLI unchanged (#167).
+
+### Fixed
+
+- `wallet sweep` now reports a clear, actionable error when the balance is
+  dust (below the fee) instead of failing opaquely (#163).
+
+### Tests
+
+- Added a fuzz suite over the user-facing CLI surface, hardening argument
+  parsing and command dispatch against malformed input (#175).
+
+### Experimental — pre-audit, NOT for production
+
+These components ship for testing and integration only. The cross-chain
+atomic-swap and watchtower code has **not** cleared an external security
+audit. Do not use it to move real value beyond throwaway amounts.
+
+- **Watchtower — ETH counter-leg watching (alert-only v3)** — the watchtower
+  now also watches RXD/Glyph↔ETH swaps via a production keyless
+  `RpcEthChainSource` over a read-only ETH RPC, with a regtest end-to-end
+  harness. It holds no keys and broadcasts nothing (#168, #170).
+- **ETH↔RXD swap coverage** — FT (fungible-token)↔ETH and Glyph(NFT)↔ETH
+  atomic-swap harnesses, with a mainnet REST REF-authenticity gate (#166,
+  #169).
+- **Watchtower v2 — dormant, capped, keyless autonomous BTC refund** — the
+  first autonomous watchtower action: it broadcasts an operator-pre-signed
+  BTC CSV refund when one is due and the operator is offline. Keyless (the
+  daemon never holds a key — it re-sends pre-signed bytes), refund-only, and
+  **dormant-by-construction** on a value-bearing network (no autonomy without
+  an explicit, dust-capped opt-in). Adds a signet/testnet-capable runner and
+  a Go-gated dust-run harness whose `setup` refuses to emit a funding address
+  unless the refund provably reconstructs from on-disk state. Exercised on
+  regtest and a mainnet dust run (#171, #172, #173).
+
+### Docs
+
+- Stuck-RXD recovery guide: pipx/venv install guidance (#162), an
+  Electron-Wallet move option (#164), and a note that `recover --scan` takes
+  a couple of minutes rather than hanging (#165).
+
 ## [0.6.1] — 2026-06-04
 
 Patch release. Fixes the package version reported by the CLI and the
