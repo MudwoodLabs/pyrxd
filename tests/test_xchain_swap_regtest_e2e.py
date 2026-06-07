@@ -923,3 +923,132 @@ class TestWatchtowerAutonomousRefundRegtest:
         assert out is ExecOutcome.BROADCAST
         spent = nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout))
         assert spent in (None, ""), "funding outpoint must be SPENT by the auto-broadcast refund on real consensus"
+
+
+# scripts/ on path for the operator dust-run harness (used by the proof below).
+import sys as _sys
+from pathlib import Path as _Path
+
+_HARNESS_SCRIPTS = str(_Path(__file__).resolve().parent.parent / "scripts")
+if _HARNESS_SCRIPTS not in _sys.path:
+    _sys.path.insert(0, _HARNESS_SCRIPTS)
+
+
+class TestWatchtowerDustHarnessRegtest:
+    """Prove the GO-GATED dust harness (scripts/watchtower_dust_run.py) end-to-end on real bitcoind: its
+    setup→record→presign artifacts, loaded FROM DISK by the keyless production executor, broadcast a
+    refund that real consensus accepts and that lands the dust at the operator's pinned refund
+    scriptPubKey. This is the consensus backstop for the stranded-dust fix — it proves the funded HTLC
+    is refundable from the persisted state ALONE (no in-memory carry-over, no key in the tower)."""
+
+    async def test_harness_artifacts_drive_a_real_keyless_refund_to_the_pinned_spk(self, nodes, tmp_path):
+        import watchtower_dust_run as harness
+
+        from pyrxd.gravity.watch import Decision, ExecOutcome, PresignedRefund, RefundExecutor
+
+        records = tmp_path / "records"
+        records.mkdir()
+        state_file = tmp_path / "run.state.json"
+        swap_id, btc_sats, t_btc, t_rxd, fee = "dust1", 50_000, 6, 3, 2_000
+
+        # The operator's pinned refund address (a fresh node address) → its scriptPubKey.
+        dest = bytes.fromhex(
+            nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
+        )
+
+        # STEP setup — the harness self-tests reconstruction-from-disk BEFORE printing the funding address.
+        assert (
+            harness.main(
+                [
+                    "setup",
+                    "--state-file",
+                    str(state_file),
+                    "--swap-id",
+                    swap_id,
+                    "--network",
+                    "bcrt",
+                    "--btc-sats",
+                    str(btc_sats),
+                    "--t-btc",
+                    str(t_btc),
+                    "--t-rxd",
+                    str(t_rxd),
+                    "--refund-spk",
+                    dest.hex(),
+                ]
+            )
+            == 0
+        )
+        s = json.loads(state_file.read_text())
+        fund_address, fund_spk = s["htlc_address"], s["htlc_spk"]
+
+        # Fund the address the harness emitted; locate the outpoint.
+        nodes.btc("sendtoaddress", fund_address, f"{btc_sats / 1e8:.8f}", wallet="btcw")
+        nodes.btc_mine(1)
+        u = nodes.btc("scantxoutset", "start", json.dumps([{"desc": f"raw({fund_spk})"}]))["unspents"][0]
+        ftxid, fvout, fsats = u["txid"], int(u["vout"]), round(u["amount"] * 1e8)
+        assert fsats == btc_sats
+
+        # STEP record + STEP presign — produce the production SwapRecord + keyless sidecar on disk.
+        assert (
+            harness.main(
+                [
+                    "record",
+                    "--state-file",
+                    str(state_file),
+                    "--funding-txid",
+                    ftxid,
+                    "--funding-vout",
+                    str(fvout),
+                    "--funding-sats",
+                    str(fsats),
+                    "--records-dir",
+                    str(records),
+                ]
+            )
+            == 0
+        )
+        assert (
+            harness.main(
+                ["presign", "--state-file", str(state_file), "--records-dir", str(records), "--fee-sats", str(fee)]
+            )
+            == 0
+        )
+
+        # ---- From here ONLY the on-disk artifacts are used (no key, no in-memory HTLC). ----
+        rec = SwapRecord.from_dict(json.loads((records / f"{swap_id}.json").read_text()))
+        loc = rec.btc_locator
+        sidecar = PresignedRefund.from_dict(json.loads((records / f"{swap_id}.refund.json").read_text()))
+
+        # NEGATIVE — broadcasting before the CSV matures is BIP68-rejected (consensus backstop).
+        with pytest.raises(RuntimeError) as ei:
+            nodes.btc("sendrawtransaction", sidecar.raw_tx.hex())
+        assert "non-BIP68-final" in str(ei.value) or "non-final" in str(ei.value)
+
+        # Mature to EXACTLY t_btc confs (funding at 1 conf → mine t_btc - 1 more).
+        nodes.btc_mine(t_btc - 1)
+        assert int(nodes.btc("getrawtransaction", loc.funding_outpoint.txid, "true")["confirmations"]) == t_btc
+
+        # POSITIVE — the keyless production executor reads the SAME records dir, binds, and broadcasts.
+        ex = RefundExecutor(
+            broadcaster=_BtcBroadcaster(nodes),
+            blobs_dir=records,
+            network="bcrt",
+            cap_sats=btc_sats,
+            refund_spk=dest,
+            accept_single_source=True,
+        )
+        dec = Decision(
+            Intent.PAGE_REFUND,
+            reason="matured BTC refund due (maker never locked)",
+            recommended_action="taker_refund_btc",
+            autonomous_btc_refund=True,
+            low_corroboration=True,
+        )
+        assert await ex.execute(swap_id, rec, dec) is ExecOutcome.BROADCAST
+
+        # The funding outpoint is SPENT and the dust LANDS at the pinned refund SPK (refundability proven).
+        assert nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout)) in (None, "")
+        decoded = nodes.btc("getrawtransaction", sidecar.txid, "true")
+        assert bytes.fromhex(decoded["vout"][0]["scriptPubKey"]["hex"]) == dest
+        assert round(decoded["vout"][0]["value"] * 1e8) == btc_sats - fee
