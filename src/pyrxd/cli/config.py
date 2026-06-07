@@ -9,6 +9,7 @@ Schema:
   electrumx = "wss://..."
   fee_rate = 10000                  # photons per byte
   wallet_path = "~/.pyrxd/wallet.dat"
+  coin_type = 512                   # SLIP-0044 coin type for `wallet new` derivation
 
   [networks.testnet]
   electrumx = "wss://..."
@@ -39,6 +40,9 @@ _DEFAULTS: dict[str, Any] = {
     "electrumx": "wss://electrumx.radiant4people.com:50022/",
     "fee_rate": 10_000,
     "wallet_path": str(DEFAULT_WALLET_PATH),
+    # SLIP-0044 coin type used when `wallet new` derives a fresh wallet.
+    # 512 = Radiant Standard (SLIP-0044). `setup --coin-type` writes this.
+    "coin_type": 512,
 }
 
 
@@ -50,6 +54,7 @@ class Config:
     electrumx: str = _DEFAULTS["electrumx"]
     fee_rate: int = 10_000
     wallet_path: Path = field(default_factory=lambda: DEFAULT_WALLET_PATH)
+    coin_type: int = 512
     networks: dict[str, dict[str, Any]] = field(default_factory=dict)
     source_path: Path | None = None  # which file (if any) was read
 
@@ -61,6 +66,7 @@ class Config:
                 electrumx=self.electrumx,
                 fee_rate=self.fee_rate,
                 wallet_path=self.wallet_path,
+                coin_type=self.coin_type,
                 networks=self.networks,
                 source_path=self.source_path,
             )
@@ -70,6 +76,7 @@ class Config:
             electrumx=overrides.get("electrumx", self.electrumx),
             fee_rate=int(overrides.get("fee_rate", self.fee_rate)),
             wallet_path=Path(overrides.get("wallet_path", self.wallet_path)).expanduser(),
+            coin_type=int(overrides.get("coin_type", self.coin_type)),
             networks=self.networks,
             source_path=self.source_path,
         )
@@ -95,6 +102,11 @@ def load(path: Path | None = None) -> Config:
     electrumx = os.environ.get("PYRXD_ELECTRUMX") or file_data.get("electrumx") or _DEFAULTS["electrumx"]
     fee_rate_raw = os.environ.get("PYRXD_FEE_RATE") or file_data.get("fee_rate") or _DEFAULTS["fee_rate"]
     wallet_path = os.environ.get("PYRXD_WALLET_PATH") or file_data.get("wallet_path") or _DEFAULTS["wallet_path"]
+    # ``or`` short-circuits on a falsy 0 — coin_type 0 (legacy Bitcoin-compatible)
+    # is a valid value, so fall through explicitly instead of treating 0 as unset.
+    coin_type_raw = os.environ.get("PYRXD_COIN_TYPE")
+    if coin_type_raw is None:
+        coin_type_raw = file_data.get("coin_type", _DEFAULTS["coin_type"])
 
     networks = file_data.get("networks", {})
     if not isinstance(networks, dict):
@@ -105,27 +117,60 @@ def load(path: Path | None = None) -> Config:
         electrumx=str(electrumx),
         fee_rate=int(fee_rate_raw),
         wallet_path=Path(str(wallet_path)).expanduser(),
+        coin_type=int(coin_type_raw),
         networks=networks,
         source_path=source_path,
     )
 
 
-def write_default(path: Path | None = None) -> Path:
+def write_default(path: Path | None = None, *, coin_type: int | None = None) -> Path:
     """Write the built-in defaults to *path*. Used by ``pyrxd setup``.
 
     Creates ``~/.pyrxd/`` with mode 0700 and writes the file with mode
     0600 (parent permissions matter because wallet.dat sits alongside).
-    Returns the resolved path.
+    *coin_type* overrides the SLIP-0044 coin type written for the
+    ``wallet new`` derivation path (default 512). Returns the resolved
+    path.
     """
     target = path or DEFAULT_CONFIG_PATH
     parent = target.parent
     parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    resolved_coin_type = _DEFAULTS["coin_type"] if coin_type is None else coin_type
     body = (
         f'network = "{_DEFAULTS["network"]}"\n'
         f'electrumx = "{_DEFAULTS["electrumx"]}"\n'
         f"fee_rate = {_DEFAULTS['fee_rate']}\n"
         f'wallet_path = "{_DEFAULTS["wallet_path"]}"\n'
+        f"coin_type = {resolved_coin_type}\n"
     )
     target.write_text(body)
+    target.chmod(0o600)
+    return target
+
+
+def set_coin_type(coin_type: int, path: Path | None = None) -> Path:
+    """Persist *coin_type* into the config at *path*, preserving other keys.
+
+    Used by ``pyrxd setup --coin-type``. If the file does not exist it is
+    created from the built-in defaults with the chosen coin type. If it
+    exists, only the ``coin_type`` key is updated (other lines are kept
+    verbatim so hand-edits survive). Returns the resolved path.
+    """
+    target = path or DEFAULT_CONFIG_PATH
+    if not target.exists():
+        return write_default(target, coin_type=coin_type)
+
+    lines = target.read_text().splitlines()
+    out: list[str] = []
+    replaced = False
+    for line in lines:
+        if line.lstrip().startswith("coin_type") and "=" in line.split("#", 1)[0]:
+            out.append(f"coin_type = {coin_type}")
+            replaced = True
+        else:
+            out.append(line)
+    if not replaced:
+        out.append(f"coin_type = {coin_type}")
+    target.write_text("\n".join(out) + "\n")
     target.chmod(0o600)
     return target

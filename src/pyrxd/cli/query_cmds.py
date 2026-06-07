@@ -50,7 +50,7 @@ def address_cmd(
                 fix="pass a non-negative integer to --index",
             )
         addr = wallet._derive_address(chain, index)
-        path = f"m/44'/512'/{wallet.account}'/{chain}/{index}"
+        path = f"m/44'/{wallet.coin_type}'/{wallet.account}'/{chain}/{index}"
     else:
         # `--next` — walks the wallet's known addresses.
         addr = wallet.next_receive_address() if not change else _next_internal_address(wallet)
@@ -90,7 +90,7 @@ def _next_internal_address(wallet: HdWallet) -> str:
 def _path_for_address(wallet: HdWallet, address: str) -> str:
     for rec in wallet.addresses.values():
         if rec.address == address:
-            return f"m/44'/512'/{wallet.account}'/{rec.change}/{rec.index}"
+            return f"m/44'/{wallet.coin_type}'/{wallet.account}'/{rec.change}/{rec.index}"
     return "?"
 
 
