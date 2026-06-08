@@ -7,6 +7,7 @@ and how Radiant differs from related blockchains.
 :maxdepth: 1
 
 gravity
+partial-tx-swaps
 glyph-structures-and-terminology
 radiant-fts-are-on-chain
 dmint-v1-deploy
@@ -19,6 +20,12 @@ external-miner-protocol
   Gravity protocol is, what a covenant is, and the difference between
   the mainnet-proven sentinel-artifact path and the experimental
   covenant variants. Read this before integrating `pyrxd.gravity`.
+- **[Same-chain partial-transaction swaps](partial-tx-swaps.md)** — the
+  `pyrxd.swap` offer/accept API for trading RXD and Glyph FTs in one
+  transaction via `SIGHASH_SINGLE | ANYONECANPAY`, how its safety rests
+  on the maker's signature (not the declared terms), and when to use it
+  instead of cross-chain Gravity. Read this before integrating
+  `pyrxd.swap`.
 - **[Understanding Glyph structures and terminology](glyph-structures-and-terminology.md)** —
   the difference between a `txid`, an `outpoint`, a `GlyphRef`, and a
   `contract_id`; what each `ft` / `nft` / `mut` / `commit-*` / `dmint`
