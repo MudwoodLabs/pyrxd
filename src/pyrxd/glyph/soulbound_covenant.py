@@ -147,8 +147,7 @@ def _assert_no_nonminimal_push(spk: bytes) -> None:
             continue
         if op in (0x4C, 0x4D, 0x4E):
             raise ValidationError(
-                f"unexpected PUSHDATA opcode 0x{op:02x} at offset {i} "
-                "(soulbound covenant uses only direct pushes)"
+                f"unexpected PUSHDATA opcode 0x{op:02x} at offset {i} (soulbound covenant uses only direct pushes)"
             )
         i += 1
 
@@ -211,17 +210,14 @@ def build_soulbound_nft_covenant(genesis_ref: GlyphRef, owner_pkh: bytes) -> Sou
     if refs != {ref}:
         got = sorted(r.hex() for r in refs)
         raise ValidationError(
-            f"GUARD FAIL: input refs {got} != expected [{ref.hex()}] "
-            "(exactly the genesis singleton ref must bind)"
+            f"GUARD FAIL: input refs {got} != expected [{ref.hex()}] (exactly the genesis singleton ref must bind)"
         )
     _assert_no_nonminimal_push(spk)
 
     return SoulboundNftCovenant(funded_spk=spk, genesis_ref=ref, owner_pkh=bytes(owner_pkh))
 
 
-def build_composable_soulbound_nft_covenant(
-    genesis_ref: GlyphRef, owner_pkh: bytes
-) -> SoulboundNftCovenant:
+def build_composable_soulbound_nft_covenant(genesis_ref: GlyphRef, owner_pkh: bytes) -> SoulboundNftCovenant:
     """Build a soulbound covenant that recurs to a clone at ANY output index.
 
     Same soulbound guarantee as :func:`build_soulbound_nft_covenant` (recur into a
@@ -294,8 +290,7 @@ def build_composable_soulbound_nft_covenant(
     if refs != {ref}:
         got = sorted(r.hex() for r in refs)
         raise ValidationError(
-            f"GUARD FAIL: input refs {got} != expected [{ref.hex()}] "
-            "(exactly the genesis singleton ref must bind)"
+            f"GUARD FAIL: input refs {got} != expected [{ref.hex()}] (exactly the genesis singleton ref must bind)"
         )
     _assert_no_nonminimal_push(spk)
 

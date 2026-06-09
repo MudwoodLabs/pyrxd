@@ -962,11 +962,15 @@ class SwapCoordinator:
         #     it defeats both resale and rental without co-spending. Fail-closed.
         if terms.credential_ref:
             if self._credential_resolver is None:
-                return PreBtcLockGate(ok=False, reason="swap is credential-gated but no credential_resolver is wired; fail-closed")
+                return PreBtcLockGate(
+                    ok=False, reason="swap is credential-gated but no credential_resolver is wired; fail-closed"
+                )
             try:
                 cred = await self._credential_resolver.resolve_credential(terms.credential_ref)
                 if cred is None:
-                    return PreBtcLockGate(ok=False, reason="credential ref did not resolve (unknown/spent); fail-closed")
+                    return PreBtcLockGate(
+                        ok=False, reason="credential ref did not resolve (unknown/spent); fail-closed"
+                    )
                 owner = assert_soulbound_credential(
                     cred,
                     min_confirmations=self.config.min_credential_confirmations,

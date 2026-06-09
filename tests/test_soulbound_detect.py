@@ -42,9 +42,7 @@ def test_deployed_token_is_consensus_soulbound():
     assert c.has_burn_branch
     # binds the genesis singleton ref 7e0d…0e02:0
     assert c.bound_ref is not None
-    assert GlyphRef.from_bytes(c.bound_ref).txid == (
-        "7e0d6b3fd702532c3a71c7b89a88820887eb44da1831293712e38d1029ab0e02"
-    )
+    assert GlyphRef.from_bytes(c.bound_ref).txid == ("7e0d6b3fd702532c3a71c7b89a88820887eb44da1831293712e38d1029ab0e02")
 
 
 # --------------------------------------------------------------------------- my prototype

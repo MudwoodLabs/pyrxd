@@ -192,16 +192,12 @@ def assert_soulbound_credential(
     # (3) the specific negotiated credential, if pinned.
     if expected_credential_ref is not None and cls.bound_ref != expected_credential_ref:
         got = cls.bound_ref.hex() if cls.bound_ref else None
-        raise CredentialBindingError(
-            f"credential binds ref {got}, expected {expected_credential_ref.hex()}"
-        )
+        raise CredentialBindingError(f"credential binds ref {got}, expected {expected_credential_ref.hex()}")
 
     # (2) reorg safety.
     conf = credential.confirmations
     if not isinstance(conf, int) or isinstance(conf, bool) or conf < min_confirmations:
-        raise CredentialBindingError(
-            f"credential has {conf} confirmations, need >= {min_confirmations}"
-        )
+        raise CredentialBindingError(f"credential has {conf} confirmations, need >= {min_confirmations}")
 
     owner = extract_owner_pkh(credential.current_spk)
     if owner is None:

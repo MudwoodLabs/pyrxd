@@ -5,10 +5,10 @@ the *non-transferability invariant holds at the script level*: any "transfer"
 (a clone with a different owner) is a different script and so cannot satisfy the
 recur ``OP_EQUALVERIFY``.
 
-The consensus behaviour (does the Radiant VM actually accept/reject these spends?)
-is UNVERIFIED — the ``test_regtest_*`` scaffolds at the bottom document the three
-cases that must pass on ``radiant-core:v2.3.0`` before this covenant can be
-trusted with real value. They are skipped unless a regtest node is wired in.
+The consensus behaviour (does the Radiant VM accept/reject these spends?) is
+validated separately on a real ``radiant-core:v2.3.0`` regtest node in
+``tests/test_soulbound_covenant_regtest.py`` (recur-to-self ACCEPTED,
+transfer-to-other REJECTED, burn ACCEPTED).
 """
 
 from __future__ import annotations
@@ -92,9 +92,7 @@ def test_transfer_to_different_owner_is_a_different_script():
     theirs = _cov(_OTHER)
     assert mine.funded_spk != theirs.funded_spk
     # The only difference is the 20-byte owner pkh field.
-    assert mine.funded_spk.replace(_OWNER, b"\x00" * 20) == theirs.funded_spk.replace(
-        _OTHER, b"\x00" * 20
-    )
+    assert mine.funded_spk.replace(_OWNER, b"\x00" * 20) == theirs.funded_spk.replace(_OTHER, b"\x00" * 20)
 
 
 def test_different_genesis_ref_changes_binding():

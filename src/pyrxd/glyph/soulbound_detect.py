@@ -186,9 +186,7 @@ def classify_soulbound(script: bytes) -> SoulboundClassification:
         # without a self-replication constraint) is freely transferable.
         # If it has stray introspection opcodes we can't reason about, say UNKNOWN.
         introspection = op_set & (_OUTPUT_BYTECODE_OPS | _SELF_BYTECODE_OPS | _CODESCRIPTHASH_COUNT_OPS)
-        transferability = (
-            Transferability.UNKNOWN if introspection else Transferability.TRANSFERABLE_NFT
-        )
+        transferability = Transferability.UNKNOWN if introspection else Transferability.TRANSFERABLE_NFT
 
     return SoulboundClassification(
         transferability=transferability,

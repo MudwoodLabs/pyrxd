@@ -69,9 +69,14 @@ def _deployed_soulbound_spk(ref_wire: bytes, pkh: bytes) -> bytes:
     """
     owner = b"\x76\xa9\x14" + pkh + b"\x88\xad"  # DUP HASH160 <pkh> EQUALVERIFY CHECKSIGVERIFY
     return (
-        b"\xd8" + ref_wire
-        + b"\x7c\x63\x75" + owner + b"\x00\xea\xc0\xe9\x87"
-        + b"\x67\xde\x00\x9c\x69" + owner + b"\x51\x68"
+        b"\xd8"
+        + ref_wire
+        + b"\x7c\x63\x75"
+        + owner
+        + b"\x00\xea\xc0\xe9\x87"
+        + b"\x67\xde\x00\x9c\x69"
+        + owner
+        + b"\x51\x68"
     )
 
 
@@ -219,7 +224,10 @@ class TestSoulboundConsensus:
 
         # recur to output[1], output[0] = an unrelated p2pkh -> ACCEPTED (composability)
         recur = _build_spend_multi(
-            node, cov_spk, cov_txid, _p2pkh_unlock(owner_key),
+            node,
+            cov_spk,
+            cov_txid,
+            _p2pkh_unlock(owner_key),
             [(_p2pkh(pkh), 600), (cov_spk, _CARRIER)],
         )
         assert node.accepts(recur)["allowed"] is True, node.accepts(recur)
@@ -227,7 +235,10 @@ class TestSoulboundConsensus:
         # transfer (clone with a different owner, at output[1]) -> REJECTED
         other = build(cov_spk[1:37], _other_pkh(pkh))
         xfer = _build_spend_multi(
-            node, cov_spk, cov_txid, _p2pkh_unlock(owner_key),
+            node,
+            cov_spk,
+            cov_txid,
+            _p2pkh_unlock(owner_key),
             [(_p2pkh(pkh), 600), (other, _CARRIER)],
         )
         assert node.accepts(xfer)["allowed"] is False, node.accepts(xfer)
