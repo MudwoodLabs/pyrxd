@@ -297,3 +297,32 @@ def test_idle_autolock_fires(tmp_path) -> None:
         time.sleep(0.05)
     t.join(timeout=3)
     assert daemon.locked is True
+
+
+def test_concurrent_clients_all_get_valid_responses(tmp_path) -> None:
+    """The serial accept loop must service many simultaneous clients correctly
+    (each connection one request/response) — none dropped or cross-talked."""
+    sock_path = tmp_path / "agent.sock"
+    daemon = AgentDaemon(_wallet(), socket_path=sock_path, confirm=_ACCEPT, harden=False)
+    t = _start(daemon)
+    try:
+        expected_xpub = str(Xpub.from_xprv(_wallet()._xprv))
+        results: list[str] = []
+        errors: list[Exception] = []
+
+        def _query() -> None:
+            try:
+                results.append(AgentClient(sock_path).account_xpub())
+            except Exception as exc:  # record for the assertion
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_query) for _ in range(8)]
+        for th in threads:
+            th.start()
+        for th in threads:
+            th.join(timeout=5)
+        assert not errors, errors
+        assert results == [expected_xpub] * 8
+    finally:
+        daemon.lock()
+        t.join(timeout=3)

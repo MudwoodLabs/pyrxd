@@ -116,7 +116,7 @@ class AgentDaemon:
         wallet, self._wallet, self._signer = self._wallet, None, None
         try:
             wallet._seed.zeroize()
-        except Exception:
+        except Exception:  # nosec B110 — best-effort scrub; locking must succeed even if zeroize raises
             pass
         self._close_socket()
 

@@ -60,6 +60,7 @@ Ranked roughly by value to an attacker:
 | A8 | A signed transaction in flight | bytes | Transient; sent over wss to ElectrumX |
 | A9 | UTXO ownership info | tuples (txid, vout, value, owner) | In-memory after `collect_spendable()`; on disk in `addresses` dict of wallet.dat |
 | A10 | Network metadata (which addresses, balances, history) | observable on-chain | Public, but linkability matters for privacy |
+| A11 | Unlocked wallet held by the signing agent | in-memory `HdWallet` (seed in `SecretBytes`) | The `pyrxd agent` daemon process, for the unlock window only; reachable via a `0600` Unix socket |
 
 Control surfaces target the upper rows; A6 is intentionally exportable; A10 is unavoidable on a public chain.
 
@@ -282,6 +283,20 @@ Each scenario lists actor → action → asset → control(s) → residual risk.
 - **Control:** Tests use disposable mnemonics. CI logs are private.
 - **Residual risk:** Low (synthetic mnemonics never hold real funds). Tracked as [issue #9](https://github.com/MudwoodLabs/pyrxd/issues/9).
 
+### S18: Same-uid process abuses the signing agent to spend (TA1) — issue #8
+
+- **Action:** With the agent unlocked (A11), a malicious same-uid process connects to the socket and submits its own `SigningRequest` to drain the wallet. It passes `SO_PEERCRED` (same uid) and the `0600`/`0700` filesystem checks — those gate *other users*, not a co-resident attacker.
+- **Asset:** A11 (the unlocked wallet) → A8 (a signed, fund-moving tx).
+- **Control (THE control):** **per-spend confirmation.** The agent parses the tx, independently verifies each prevout (C1 — see S19), attributes every output (change re-derived and verified, the rest shown as external payees), and requires a human keypress **on the daemon's own controlling terminal** (`/dev/tty`) before signing — a channel the requesting process cannot drive. A detached daemon with no tty **fails closed** (declines). Small spends below an explicit, opt-in `--auto-confirm-under` threshold skip the prompt; that threshold is documented as outside the trust boundary. The agent **never returns key material** (conformance-tested), so reaching the socket lets an attacker *request* a signature, never *take* the key.
+- **Residual risk:** A user who blind-confirms, or who sets a high `--auto-confirm-under`, is unprotected — by their own choice. The confirmation is the boundary; automation of it is out of scope. Idle auto-lock and `agent lock` bound the unlock window.
+
+### S19: Agent tricked into a fee-theft / fund-redirect signature (TA1)
+
+- **Action:** A request lies about an input's prevout value (to burn the surplus to fees) or asks for a non-`ALL|FORKID` sighash (to recombine the signature into a different, fund-redirecting tx), while showing the user a benign-looking spend.
+- **Asset:** A4/A11 → A8.
+- **Control:** **Prevout authenticity (C1)** — the agent requires the full source tx for each input, verifies it hashes to the input's outpoint, and reads value/script from the *real* prevout (never the request's claim); the displayed summary is derived from the verified tx (display == sign). The agent re-derives the signing key and refuses to sign an input it does not own. **Sighash policy** — v1 signs only `ALL|FORKID`; any other type is refused (it would commit to fewer outputs than the confirmation showed). Partially-owned txs are refused (every input must be attributable).
+- **Residual risk:** v1 is P2PKH-only and fully-owned-only by design; multi-party / mixed-owner signing is out of scope.
+
 ## Controls in place
 
 Cross-reference of controls and the threats they address:
@@ -321,6 +336,13 @@ Cross-reference of controls and the threats they address:
 | Sole-authority audit gate (covenant-less use fails closed) | TA6 | `src/pyrxd/spv/proof.py:require_spv_sole_authority_cleared` |
 | SPV verification (Gravity) | TA6, TA8 | `src/pyrxd/spv/`, `src/pyrxd/gravity/` |
 | Gravity red-team test suite | TA8 | `tests/test_gravity_red_team.py` (1500+ lines) |
+| Agent per-spend confirmation on `/dev/tty` (fails closed w/o tty) | S18 | `src/pyrxd/agent/confirm.py`, `signer.py` |
+| Agent prevout authenticity (source-tx verified, value/script from real prevout) | S19 | `src/pyrxd/agent/signer.py:_verify_and_prepare_input` |
+| Agent `ALL\|FORKID`-only sighash + fully-owned-only | S19 | `src/pyrxd/agent/signer.py` |
+| Agent never returns key material (conformance-tested) | S18 | `src/pyrxd/agent/signer.py`, `tests/test_agent_signer.py` |
+| Agent socket: `0700` dir + `0600` socket + `SO_PEERCRED` uid==owner | TA1 (other-uid) | `src/pyrxd/agent/daemon.py:_bind/_read_peer_uid` |
+| Agent idle auto-lock + on-demand `lock` (seed zeroized) | A11 window | `src/pyrxd/agent/daemon.py:lock`, `_should_autolock` |
+| Agent process hygiene (mlock, PR_SET_DUMPABLE 0, no core dumps; best-effort) | A11 residency | `src/pyrxd/agent/hygiene.py` |
 | CodeQL on every push | static analysis | `.github/workflows/codeql.yml` |
 | Bandit on every push | security smells | `.github/workflows/ci.yml` |
 | ruff lint + format | code hygiene | `.github/workflows/lint.yml` |
@@ -351,7 +373,7 @@ Honest list. These are not vulnerabilities; they're places where pyrxd's defense
 
 8. **Broadcast summary doesn't show resolved `owner_pkh` from metadata files.** S7 residual risk. **Should be addressed before v0.3.0 release.**
 9. **No clipboard hygiene warning.** S3 residual risk. [Issue #11.](https://github.com/MudwoodLabs/pyrxd/issues/11)
-10. **Mnemonic re-entry per command** with no agent process. S2/S3 residual risk amplified by repetition. [Issue #8.](https://github.com/MudwoodLabs/pyrxd/issues/8)
+10. **Mnemonic re-entry per command** is mitigated by the optional `pyrxd agent` (issue #8, Path A′): a sign-on-behalf daemon holds the wallet for an unlock window so the mnemonic is typed once, and the key is removed from the short-lived CLI process entirely (the daemon signs). Residual: while unlocked, a same-uid process can *request* signatures — gated by per-spend confirmation (S18), never by taking the key. The agent is **opt-in**; with it off, the per-command prompt (and its S2/S3 residual risk) remains the default. The agent has not had a third-party audit (gap #1 applies).
 
 ### Protocol
 
