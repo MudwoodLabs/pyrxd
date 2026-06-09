@@ -36,6 +36,23 @@ from .context import CliContext
 from .errors import CliError
 
 
+class _SafePath(click.Path):
+    """``click.Path`` that turns an unparseable path into a clean usage error.
+
+    Click's ``Path`` type calls ``os.stat`` during conversion and catches
+    ``OSError`` — but a path with an embedded null byte raises ``ValueError``,
+    which escapes click's handling and surfaces as an unhandled traceback
+    (undocumented exit code). Converting it to ``BadParameter`` keeps the CLI
+    boundary's contract: every invocation exits with a documented code.
+    """
+
+    def convert(self, value, param, ctx):  # type: ignore[override]
+        try:
+            return super().convert(value, param, ctx)
+        except ValueError as exc:
+            self.fail(f"invalid path: {exc}", param, ctx)
+
+
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(_pyrxd_version, "--version", "-V", prog_name="pyrxd")
 @click.option(
@@ -54,7 +71,7 @@ from .errors import CliError
 @click.option(
     "--wallet",
     "wallet_path",
-    type=click.Path(path_type=Path),
+    type=_SafePath(path_type=Path),
     default=None,
     help="Path to encrypted wallet file (default ~/.pyrxd/wallet.dat).",
 )
@@ -64,7 +81,7 @@ from .errors import CliError
 @click.option(
     "--config",
     "config_path",
-    type=click.Path(path_type=Path),
+    type=_SafePath(path_type=Path),
     default=None,
     help="Alternate config file (default ~/.pyrxd/config.toml).",
 )
