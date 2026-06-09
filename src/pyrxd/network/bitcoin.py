@@ -116,7 +116,7 @@ async def _check_response_size(response: aiohttp.ClientResponse) -> bytes:
 async def _get_json(session: aiohttp.ClientSession, url: str) -> Any:
     """GET *url*, parse JSON, enforce size limit, raise NetworkError on failure."""
     try:
-        async with session.get(url) as resp:
+        async with session.get(url, allow_redirects=False) as resp:
             body = await _check_response_size(resp)
             if resp.status != 200:
                 raise NetworkError(f"HTTP request failed with status {resp.status}")
@@ -134,7 +134,7 @@ async def _get_json(session: aiohttp.ClientSession, url: str) -> Any:
 async def _get_hex_bytes(session: aiohttp.ClientSession, url: str, expected_len: int | None = None) -> bytes:
     """GET *url*, decode hex body, return raw bytes."""
     try:
-        async with session.get(url) as resp:
+        async with session.get(url, allow_redirects=False) as resp:
             body = await _check_response_size(resp)
             if resp.status != 200:
                 raise NetworkError(f"HTTP request failed with status {resp.status}")
@@ -187,7 +187,7 @@ class MempoolSpaceSource(BtcDataSource):
         session = await self._get_session()
         url = self._url("blocks/tip/height")
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, allow_redirects=False) as resp:
                 body = await _check_response_size(resp)
                 if resp.status != 200:
                     raise NetworkError(f"HTTP {resp.status} fetching tip height")
@@ -204,7 +204,7 @@ class MempoolSpaceSource(BtcDataSource):
         session = await self._get_session()
         url = self._url(f"block-height/{_safe_int_path(height)}")
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, allow_redirects=False) as resp:
                 body = await _check_response_size(resp)
                 if resp.status != 200:
                     raise NetworkError(f"HTTP {resp.status} fetching block hash")
@@ -274,7 +274,7 @@ class MempoolSpaceSource(BtcDataSource):
         # Fetch raw hex.
         hex_url = self._url(f"tx/{_safe_txid_path(txid)}/hex")
         try:
-            async with session.get(hex_url) as resp:
+            async with session.get(hex_url, allow_redirects=False) as resp:
                 body = await _check_response_size(resp)
                 if resp.status != 200:
                     raise NetworkError(f"HTTP {resp.status} fetching raw tx")
@@ -372,7 +372,7 @@ class BlockstreamSource(BtcDataSource):
         session = await self._get_session()
         url = self._url("blocks/tip/height")
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, allow_redirects=False) as resp:
                 body = await _check_response_size(resp)
                 if resp.status != 200:
                     raise NetworkError(f"HTTP {resp.status} fetching tip height")
@@ -389,7 +389,7 @@ class BlockstreamSource(BtcDataSource):
         session = await self._get_session()
         url = self._url(f"block-height/{_safe_int_path(height)}")
         try:
-            async with session.get(url) as resp:
+            async with session.get(url, allow_redirects=False) as resp:
                 body = await _check_response_size(resp)
                 if resp.status != 200:
                     raise NetworkError(f"HTTP {resp.status} fetching block hash")
@@ -451,7 +451,7 @@ class BlockstreamSource(BtcDataSource):
 
         hex_url = self._url(f"tx/{_safe_txid_path(txid)}/hex")
         try:
-            async with session.get(hex_url) as resp:
+            async with session.get(hex_url, allow_redirects=False) as resp:
                 body = await _check_response_size(resp)
                 if resp.status != 200:
                     raise NetworkError(f"HTTP {resp.status} fetching raw tx")
@@ -569,7 +569,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
             "params": params,
         }
         try:
-            async with session.post(self._url, json=payload) as resp:
+            async with session.post(self._url, json=payload, allow_redirects=False) as resp:
                 body = await _check_response_size(resp)
                 if resp.status not in (200, 500):
                     raise NetworkError(f"RPC HTTP error: {resp.status}")
@@ -896,7 +896,7 @@ class _MempoolHttpClient:
     async def tip_height(self) -> int:
         s = await self.session()
         try:
-            async with s.get(self.url("blocks/tip/height")) as resp:
+            async with s.get(self.url("blocks/tip/height"), allow_redirects=False) as resp:
                 body = await _check_response_size(resp)
                 if resp.status != 200:
                     raise NetworkError(f"HTTP {resp.status} fetching tip height")
@@ -942,7 +942,7 @@ class MempoolSpaceBroadcaster:
         raw = bytes(raw_tx)
         s = await self._http.session()
         try:
-            async with s.post(self._http.url("tx"), data=raw.hex()) as resp:
+            async with s.post(self._http.url("tx"), data=raw.hex(), allow_redirects=False) as resp:
                 body = (await _check_response_size(resp)).decode("ascii", "replace").strip()
                 if resp.status == 200:
                     # mempool.space returns the txid as the body on success.

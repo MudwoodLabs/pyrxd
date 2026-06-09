@@ -215,6 +215,14 @@ class PrivateKey:
         Low-s enforcement: coincurve's sign() calls libsecp256k1 which
         normalises signatures to low-s (SECP256K1_EC_NORMALIZED) by default.
         For custom k, _sign_custom_k() explicitly enforces low-s.
+
+        .. warning::
+            Passing an explicit ``k`` bypasses RFC 6979 deterministic-nonce
+            generation. ECDSA leaks the private key if the same ``k`` signs two
+            different messages under the same key. Only supply ``k`` for an
+            R-puzzle (see :meth:`pyrxd.script.type.RPuzzle.unlock`) and only with a
+            throwaway key that signs nothing else. Leave ``k`` as ``None`` for all
+            normal signing — libsecp256k1's deterministic nonce is the safe path.
         """
         if k is not None:
             return self._sign_custom_k(message, hasher, k)

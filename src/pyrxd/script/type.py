@@ -231,7 +231,7 @@ class RPuzzle(ScriptTemplate):
     def unlock(
         self,
         k: int,
-        private_key: PrivateKey | None = PrivateKey(),
+        private_key: PrivateKey | None = None,
         sign_outputs: str = "all",
         anyone_can_pay: bool = False,
     ):
@@ -239,11 +239,25 @@ class RPuzzle(ScriptTemplate):
         Creates a function that generates an R puzzle unlocking script along with its signature and length estimation.
 
         :param k: The K-value used to unlock the R-puzzle.
-        :param private_key: The private key used for signing the transaction.
+        :param private_key: The private key used for signing the transaction. When
+            omitted, a FRESH throwaway key is generated per call (see the security
+            note below) — never a shared module-level default.
         :param sign_outputs: The signature scope for outputs ('all', 'none', 'single').
         :param anyone_can_pay: Flag indicating if the signature allows for other inputs to be added later.
         :returns: An object containing the `sign` and `estimate_length` functions.
+
+        .. warning::
+            **R-puzzles reuse the nonce ``k`` by construction.** ECDSA leaks the
+            private key if the same ``k`` signs two different messages under the
+            same key (``d = (s1*k - z1) / r``). So ``private_key`` MUST be a
+            throwaway key that signs nothing else — never a key that holds (or will
+            hold) funds, and never reused across two R-puzzle inputs with the same
+            ``k``. The default now generates a fresh key per call to make the safe
+            path the easy one; previously the default was a single module-level key
+            shared across every call (a mutable-default-argument footgun).
         """
+        if private_key is None:
+            private_key = PrivateKey()
 
         def sign(tx, input_index) -> Script:
             sighash = SIGHASH.FORKID

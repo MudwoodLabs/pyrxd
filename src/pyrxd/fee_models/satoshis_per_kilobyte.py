@@ -27,11 +27,16 @@ class SatoshisPerKilobyte(FeeModel):
         """
 
         def get_varint_size(i: int) -> int:
-            if i > 2**32:
+            # Bitcoin CompactSize boundaries are inclusive at the lower edge:
+            # < 0xFD -> 1 byte, <= 0xFFFF -> 3, <= 0xFFFFFFFF -> 5, else 9. Using
+            # >= (not >) so the exact boundary values 253 / 2**16 / 2**32 are sized
+            # to the wider encoding they actually require (a 2-byte underestimate
+            # otherwise — harmless in practice, but wrong at the wire boundary).
+            if i >= 2**32:
                 return 9
-            elif i > 2**16:
+            elif i >= 2**16:
                 return 5
-            elif i > 253:
+            elif i >= 253:
                 return 3
             else:
                 return 1
