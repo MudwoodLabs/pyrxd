@@ -20,12 +20,17 @@ and requires confirmation before signing.
 
 from __future__ import annotations
 
+from .client import AgentClient
+from .confirm import TtyConfirmer, format_spend_summary
+from .daemon import AgentDaemon
 from .errors import SignerDeclined, SignerError, SignerUnavailableError
 from .protocol import ChangeClaim, ExternalOutput, InputToSign, SignedResult, SigningRequest, SpendSummary
 from .signer import AgentSigner
 from .watch_only import UnsignedSend, WatchOnlyTxBuilder, WatchOnlyUtxo
 
 __all__ = [
+    "AgentClient",
+    "AgentDaemon",
     "AgentSigner",
     "ChangeClaim",
     "ExternalOutput",
@@ -36,7 +41,9 @@ __all__ = [
     "SignerUnavailableError",
     "SigningRequest",
     "SpendSummary",
+    "TtyConfirmer",
     "UnsignedSend",
     "WatchOnlyTxBuilder",
     "WatchOnlyUtxo",
+    "format_spend_summary",
 ]
