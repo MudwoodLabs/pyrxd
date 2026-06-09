@@ -7,7 +7,10 @@ covenant-enforced; a plain transferable NFT singleton must not.
 
 from __future__ import annotations
 
-from pyrxd.glyph.soulbound_covenant import build_soulbound_nft_covenant
+from pyrxd.glyph.soulbound_covenant import (
+    build_composable_soulbound_nft_covenant,
+    build_soulbound_nft_covenant,
+)
 from pyrxd.glyph.soulbound_detect import Transferability, classify_soulbound
 from pyrxd.glyph.types import GlyphRef
 
@@ -53,6 +56,16 @@ def test_pyrxd_prototype_is_consensus_soulbound():
     assert c.transferability is Transferability.SOULBOUND_COVENANT
     assert c.has_self_replication
     assert c.has_burn_branch
+    assert c.bound_ref == _REF.to_bytes()
+
+
+def test_composable_variant_is_consensus_soulbound():
+    """The index-independent (CODESCRIPTHASHOUTPUTCOUNT) form must also classify
+    as soulbound — the detector recognises both self-replication shapes."""
+    spk = build_composable_soulbound_nft_covenant(_REF, _PKH).funded_spk
+    c = classify_soulbound(spk)
+    assert c.transferability is Transferability.SOULBOUND_COVENANT
+    assert c.has_self_replication
     assert c.bound_ref == _REF.to_bytes()
 
 

@@ -44,8 +44,8 @@ from enum import Enum
 from pyrxd.glyph.script import REF_OPCODES, TruncatedScriptError, count_input_refs
 
 __all__ = [
-    "Transferability",
     "SoulboundClassification",
+    "Transferability",
     "classify_soulbound",
 ]
 
@@ -58,10 +58,13 @@ _OP_REFOUTPUTCOUNT_OUTPUTS = 0xDE
 _OP_0 = 0x00
 _OP_NUMEQUAL = 0x9C
 
-# "What does this output look like?" introspection opcodes.
+# "What does this output look like?" introspection opcodes (compared via OP_EQUAL).
 _OUTPUT_BYTECODE_OPS = frozenset({0xCD, 0xEA})  # OP_OUTPUTBYTECODE, OP_CODESCRIPTBYTECODE_OUTPUT
 # "What do I (this input/utxo) look like?" introspection opcodes.
 _SELF_BYTECODE_OPS = frozenset({0xC7, 0xE9, 0xC1})  # OP_UTXOBYTECODE, OP_CODESCRIPTBYTECODE_UTXO, OP_ACTIVEBYTECODE
+# "How many outputs replicate my code script?" — the index-independent self-
+# replication form (own code hash via _SELF_BYTECODE_OPS + OP_HASH256, then count).
+_CODESCRIPTHASH_COUNT_OPS = frozenset({0xE5, 0xE6})  # OP_CODESCRIPTHASHOUTPUTCOUNT_{UTXOS,OUTPUTS}
 
 
 class Transferability(Enum):
@@ -158,12 +161,17 @@ def classify_soulbound(script: bytes) -> SoulboundClassification:
     if not is_singleton:
         return SoulboundClassification(Transferability.NOT_A_SINGLETON, bound_ref, False, False)
 
-    # (2) self-replication equality: an output-bytecode op AND an own-bytecode op,
-    # with an equality op present to join them.
-    has_output_bc = bool(op_set & _OUTPUT_BYTECODE_OPS)
+    # (2) self-replication constraint — the output(s) must replicate THIS script.
+    # Two known forms:
+    #   (a) direct equality: output-bytecode == own-bytecode (OP_EQUAL/OP_EQUALVERIFY)
+    #       e.g. OP_0 OP_OUTPUTBYTECODE … OP_INPUTINDEX OP_UTXOBYTECODE OP_EQUAL.
+    #   (b) index-independent count: count outputs whose code-script-hash == mine
+    #       (own hash via own-bytecode + OP_HASH256, then OP_CODESCRIPTHASHOUTPUTCOUNT_*).
     has_self_bc = bool(op_set & _SELF_BYTECODE_OPS)
     has_equality = _OP_EQUAL in op_set or _OP_EQUALVERIFY in op_set
-    has_self_replication = has_output_bc and has_self_bc and has_equality
+    form_a = bool(op_set & _OUTPUT_BYTECODE_OPS) and has_self_bc and has_equality
+    form_b = has_self_bc and bool(op_set & _CODESCRIPTHASH_COUNT_OPS)
+    has_self_replication = form_a or form_b
 
     # (3) burn branch: OP_REFOUTPUTCOUNT_OUTPUTS compared against zero.
     has_burn_branch = _OP_REFOUTPUTCOUNT_OUTPUTS in op_set and _OP_NUMEQUAL in op_set
@@ -177,7 +185,7 @@ def classify_soulbound(script: bytes) -> SoulboundClassification:
         # A singleton whose only other structure is OP_DROP + P2PKH (or anything
         # without a self-replication constraint) is freely transferable.
         # If it has stray introspection opcodes we can't reason about, say UNKNOWN.
-        introspection = op_set & (_OUTPUT_BYTECODE_OPS | _SELF_BYTECODE_OPS)
+        introspection = op_set & (_OUTPUT_BYTECODE_OPS | _SELF_BYTECODE_OPS | _CODESCRIPTHASH_COUNT_OPS)
         transferability = (
             Transferability.UNKNOWN if introspection else Transferability.TRANSFERABLE_NFT
         )

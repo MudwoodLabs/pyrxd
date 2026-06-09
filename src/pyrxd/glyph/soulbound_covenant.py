@@ -81,6 +81,7 @@ from pyrxd.security.errors import ValidationError
 
 __all__ = [
     "SoulboundNftCovenant",
+    "build_composable_soulbound_nft_covenant",
     "build_soulbound_nft_covenant",
 ]
 
@@ -206,6 +207,89 @@ def build_soulbound_nft_covenant(genesis_ref: GlyphRef, owner_pkh: bytes) -> Sou
     )
 
     # --- static guards (fail-closed at build time) ---
+    refs = set(count_input_refs(spk).keys())
+    if refs != {ref}:
+        got = sorted(r.hex() for r in refs)
+        raise ValidationError(
+            f"GUARD FAIL: input refs {got} != expected [{ref.hex()}] "
+            "(exactly the genesis singleton ref must bind)"
+        )
+    _assert_no_nonminimal_push(spk)
+
+    return SoulboundNftCovenant(funded_spk=spk, genesis_ref=ref, owner_pkh=bytes(owner_pkh))
+
+
+def build_composable_soulbound_nft_covenant(
+    genesis_ref: GlyphRef, owner_pkh: bytes
+) -> SoulboundNftCovenant:
+    """Build a soulbound covenant that recurs to a clone at ANY output index.
+
+    Same soulbound guarantee as :func:`build_soulbound_nft_covenant` (recur into a
+    code-identical clone of itself, or burn) but **index-independent**: instead of
+    pinning the clone to ``output[0]`` (``OP_0 OP_OUTPUTBYTECODE``), it requires
+    *exactly one* output whose code-script-hash equals this UTXO's own — wherever
+    it sits. That makes the credential **co-spendable**: it can recur to
+    ``output[1]`` while a swap asset claims ``output[0]``, which the fixed-index
+    covenant cannot do.
+
+    This is the prerequisite for revocation-aware credential binding: a swap claim
+    can ``OP_REQUIREINPUTREF`` the credential (forcing it to be a live input at
+    claim time, so a burned/revoked credential fails the claim) only if the
+    credential can ride along without fighting over ``output[0]``.
+
+    Recur branch::
+
+        OP_REFOUTPUTCOUNT_OUTPUTS OP_DUP OP_0 OP_NUMEQUAL OP_IF
+            OP_DROP                                   ; burn (0 outputs carry the ref)
+        OP_ELSE
+            OP_1 OP_NUMEQUALVERIFY                    ; exactly one output carries the ref
+            OP_INPUTINDEX OP_CODESCRIPTBYTECODE_UTXO OP_HASH256       ; my code-script hash
+            OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS OP_1 OP_NUMEQUALVERIFY  ; exactly one output clones me
+        OP_ENDIF
+        OP_DUP OP_HASH160 <ownerPkh> OP_EQUALVERIFY OP_CHECKSIG
+
+    Mirrors the proven code-script-hash conservation idiom used in Photonic's
+    container/vault FT covenants, narrowed to a single (NFT) singleton.
+
+    Consensus behaviour CONFIRMED on regtest
+    (``tests/test_soulbound_covenant_regtest.py``: recur-to-``output[1]`` accepted,
+    transfer rejected, burn accepted). Pre-external-audit; not for real value yet.
+    """
+    if not isinstance(owner_pkh, (bytes, bytearray)) or len(owner_pkh) != 20:
+        raise ValidationError("owner_pkh must be 20 bytes (hash160)")
+    ref = genesis_ref.to_bytes()
+    if len(ref) != 36:
+        raise ValidationError("genesis ref must encode to 36 bytes")
+
+    spk = b"".join(
+        [
+            OP.OP_PUSHINPUTREFSINGLETON,
+            ref,
+            OP.OP_REFOUTPUTCOUNT_OUTPUTS,  # consume <ref> -> carry count
+            OP.OP_DUP,
+            OP.OP_0,
+            OP.OP_NUMEQUAL,  # count == 0  ->  burn?
+            OP.OP_IF,
+            OP.OP_DROP,  #   burn: drop the dup'd count
+            OP.OP_ELSE,
+            OP.OP_1,
+            OP.OP_NUMEQUALVERIFY,  #   recur: exactly one output carries the ref
+            OP.OP_INPUTINDEX,
+            OP.OP_CODESCRIPTBYTECODE_UTXO,
+            OP.OP_HASH256,  #   my code-script hash
+            OP.OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS,
+            OP.OP_1,
+            OP.OP_NUMEQUALVERIFY,  #   exactly one output replicates my code script
+            OP.OP_ENDIF,
+            OP.OP_DUP,
+            OP.OP_HASH160,
+            bytes([20]),
+            bytes(owner_pkh),
+            OP.OP_EQUALVERIFY,
+            OP.OP_CHECKSIG,
+        ]
+    )
+
     refs = set(count_input_refs(spk).keys())
     if refs != {ref}:
         got = sorted(r.hex() for r in refs)
