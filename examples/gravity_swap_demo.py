@@ -35,6 +35,19 @@ Usage
     BTC_MEMPOOL_URL=https://mempool.space/testnet/api \\
     MAKER_RXD_WIF=<wif> TAKER_RXD_WIF=<wif> TAKER_BTC_WIF=<wif> \\
     python examples/gravity_swap_demo.py
+
+Network & safety
+----------------
+Targets Radiant + Bitcoin **testnet**. Safe-by-default: ``DRY_RUN`` defaults
+to ``1`` (builds and prints every tx, broadcasts nothing). ``DRY_RUN=0``
+broadcasts to live testnets — no mainnet value, but testnet coins still need
+funding.
+
+.. warning::
+
+   The Gravity cross-chain swap covenant is **pre-audit**. Do not adapt this
+   to mainnet / real value. See the project README and ``docs/`` for the
+   external-audit gate before any real-funds use.
 """
 
 from __future__ import annotations

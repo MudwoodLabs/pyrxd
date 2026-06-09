@@ -10,6 +10,7 @@ functions, and exceptions.
    pyrxd
    glyph
    gravity
+   swap
    hd
    network
    security
@@ -20,3 +21,4 @@ functions, and exceptions.
    curve
    fee_models
    btc_wallet
+   devnet

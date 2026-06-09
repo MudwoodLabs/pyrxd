@@ -11,6 +11,7 @@ Install with ``pip install pyrxd``.
    :maxdepth: 1
    :caption: Documentation
 
+   showcase
    tutorials/index
    how-to/index
    concepts/index

@@ -30,6 +30,18 @@ Key / address (RXD mainnet maker — do NOT expose WIF in logs):
   Address: optionally pin via EXPECTED_MAKER_ADDR (and EXPECTED_MAKER_PKH_HEX)
            to assert the WIF derives the address you expect; leave unset
            to skip the pin check.
+
+Network & safety
+----------------
+Reads from **RXD mainnet** ElectrumX (the only live RXD network) and **BTC
+testnet** APIs. Safe-by-default: ``DRY_RUN`` defaults to ``1`` and broadcasts
+nothing. ``DRY_RUN=0`` broadcasts the maker-offer tx on **RXD mainnet** (real
+photons); the BTC side never broadcasts.
+
+.. warning::
+
+   The Gravity cross-chain swap covenant is **pre-audit**. ``DRY_RUN=0`` moves
+   real mainnet value. Keep the default unless you accept that.
 """
 
 from __future__ import annotations

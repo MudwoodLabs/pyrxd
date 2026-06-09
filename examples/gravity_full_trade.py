@@ -34,6 +34,24 @@ Usage:
   GRAVITY_MODE=claim python3 examples/gravity_full_trade.py
   MAKER_RXD_WIF=<wif> GRAVITY_MODE=forfeit python3 examples/gravity_full_trade.py
   MAKER_RXD_WIF=<wif> GRAVITY_MODE=cancel python3 examples/gravity_full_trade.py
+
+Network & safety
+----------------
+This targets **RXD mainnet** ElectrumX (``radiant4people`` :50022) and, by
+default, **BTC mainnet** (``BTC_NETWORK=bc``, blockstream.info). The BTC side
+can be pointed at testnet via ``BTC_NETWORK=tb`` + a testnet ``BTC_API_URL``.
+
+.. warning::
+
+   **This script has NO dry-run mode — it broadcasts real transactions.**
+   ``GRAVITY_MODE=offer`` with a real ``MAKER_RXD_WIF`` builds and
+   **broadcasts a real MakerOffer transaction on RXD mainnet** (and the later
+   modes broadcast real claim/finalize/forfeit/cancel txs spending real
+   photons). The Gravity covenant is **pre-audit**. As a guard, on mainnet
+   (the default config) the script refuses to run unless you set
+   ``I_UNDERSTAND_THIS_IS_REAL=yes`` — an explicit acknowledgement that you
+   accept real, irreversible value movement. For a safe-by-default walkthrough
+   use ``gravity_swap_demo.py`` (testnet, ``DRY_RUN=1``) instead.
 """
 
 from __future__ import annotations
@@ -689,6 +707,18 @@ async def run() -> None:
     print("=" * 70)
     print(f"  Gravity Full Trade  —  mode: {GRAVITY_MODE}")
     print("=" * 70)
+    # Safety gate: this script broadcasts REAL transactions and has no dry-run.
+    # On mainnet (the default config) demand an explicit acknowledgement so a
+    # copy-pasted command can never move real value by accident.
+    on_mainnet = BTC_NETWORK == "bc" or "radiant4people" in RXD_ELECTRUMX_URL
+    if on_mainnet and os.environ.get("I_UNDERSTAND_THIS_IS_REAL") != "yes":
+        _fail(
+            "refusing to run on mainnet without acknowledgement.\n"
+            "         This script broadcasts REAL value and has no dry-run mode.\n"
+            "         To proceed on mainnet, set I_UNDERSTAND_THIS_IS_REAL=yes.\n"
+            "         For a safe walkthrough, use examples/gravity_swap_demo.py "
+            "(DRY_RUN=1 by default) instead."
+        )
     if GRAVITY_MODE == "offer":
         await mode_offer()
     elif GRAVITY_MODE == "claim":

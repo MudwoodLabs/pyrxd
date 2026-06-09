@@ -10,13 +10,15 @@ Quickstart::
 
 Subpackages:
     pyrxd.glyph      — Glyph token protocol (NFT, FT, dMint, mutable, V2)
-    pyrxd.gravity    — BTC↔RXD atomic swaps (Gravity protocol)
+    pyrxd.swap       — Same-chain partial-transaction swaps (RXD/token)
+    pyrxd.gravity    — Cross-chain (BTC/ETH↔RXD) HTLC atomic swaps
     pyrxd.security   — Typed secrets, error hierarchy, secure RNG
     pyrxd.hd         — BIP-32/39/44 HD wallet
     pyrxd.network    — ElectrumX client, BTC data sources
     pyrxd.spv        — SPV chain/payment verification
     pyrxd.transaction — Transaction building and serialization
     pyrxd.script     — Script types and evaluation
+    pyrxd.devnet     — Local regtest dev node (see `pyrxd regtest`)
 
 Implementation note — lazy top-level re-exports:
 
@@ -89,6 +91,19 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "mnemonic_from_entropy": ("pyrxd.hd.bip39", "mnemonic_from_entropy"),
     "script_hash_for_address": ("pyrxd.network.electrumx", "script_hash_for_address"),
     "seed_from_mnemonic": ("pyrxd.hd.bip39", "seed_from_mnemonic"),
+    # Same-chain swaps — pyrxd.swap (SIGHASH_SINGLE|ANYONECANPAY partial-tx offers)
+    "Asset": ("pyrxd.swap", "Asset"),
+    "FundingInput": ("pyrxd.swap", "FundingInput"),
+    "SwapOffer": ("pyrxd.swap", "SwapOffer"),
+    "SwapTerms": ("pyrxd.swap", "SwapTerms"),
+    "accept_offer": ("pyrxd.swap", "accept_offer"),
+    "create_offer": ("pyrxd.swap", "create_offer"),
+    # SPV verification
+    "SpvProof": ("pyrxd.spv", "SpvProof"),
+    "SpvProofBuilder": ("pyrxd.spv", "SpvProofBuilder"),
+    "verify_tx_in_block": ("pyrxd.spv", "verify_tx_in_block"),
+    # Local regtest dev node (see `pyrxd regtest` / the quickstart tutorial)
+    "RegtestNode": ("pyrxd.devnet", "RegtestNode"),
 }
 
 __all__ = sorted([*_LAZY_EXPORTS.keys(), "__version__"])

@@ -48,6 +48,7 @@ from pyrxd.gravity.watch import (
     FileHeartbeat,
     JsonDirRecordStore,
     LoggingAlertChannel,
+    MultiSourceRxdChainSource,
     OutspendBtcClaimSource,
     Reconciler,
     RefundExecutor,
@@ -68,7 +69,8 @@ logger = logging.getLogger("pyrxd.watchtower")
 def build_reconciler(
     *,
     records_dir,
-    rxd_client,
+    rxd_source,
+    rxd_corroborated,
     btc_funding_reader,
     http_session,
     mempool_base_urls,
@@ -80,12 +82,14 @@ def build_reconciler(
 ) -> Reconciler:
     """Compose the real ports into a Reconciler (pure wiring — no network at call time).
 
+    ``rxd_source`` is a ready :class:`RxdChainSource` (a single :class:`ElectrumRxdChainSource`, or a
+    fail-closed :class:`MultiSourceRxdChainSource` quorum); ``rxd_corroborated`` is ``True`` only when a
+    real >= quorum multi-source read backs it (clears the single-source ``low_corroboration`` flag).
     ``eth_source`` (an :class:`RpcEthChainSource`, optional) adds the ETH counter-leg watch path so a
     records dir holding RXD↔ETH swaps is observed too (``None`` → ETH swaps fail closed, paging).
     ``executor`` (an :class:`RefundExecutor`, optional) adds the v2 autonomous-refund path; ``None`` →
     a no-op ``NullExecutor`` → ALERT-ONLY, byte-identical to v1."""
     store = JsonDirRecordStore(records_dir)
-    rxd_source = ElectrumRxdChainSource(rxd_client)
 
     # Multi-source claim DETECTION (red-team MEDIUM): one /outspend fn per independent Esplora so a
     # single lagging/lying source cannot suppress the PAGE_CLAIM (detection fails toward paging).
@@ -97,8 +101,9 @@ def build_reconciler(
 
     outspend_fns = [_make_outspend(u) for u in mempool_base_urls]
     btc_source = OutspendBtcClaimSource(outspend_fns=outspend_fns, funding_reader=btc_funding_reader)
-    # v1/v3: RXD (and the single ETH RPC, if any) are single-source → every page is low-corroboration.
-    observer = ChainObserver(btc=btc_source, eth=eth_source, rxd=rxd_source, rxd_corroborated=False)
+    # RXD corroboration is ``rxd_corroborated`` (True only behind a real >= quorum MultiSourceRxdChainSource).
+    # The single ETH RPC, if any, is still single-source → its pages stay low-corroboration.
+    observer = ChainObserver(btc=btc_source, eth=eth_source, rxd=rxd_source, rxd_corroborated=rxd_corroborated)
     alerter = DedupAlerter(channel=alert_channel)
     return Reconciler(
         store=store,
@@ -176,18 +181,61 @@ def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> Mul
     return MultiSourceBtcFundingReader(readers, quorum=min(quorum, len(readers)), dust_cap_sats=10_000)
 
 
-async def _build_rxd_client(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
-    """The RXD chain source. ssh-tr is read-only (no broadcast surface); ElectrumX is
-    context-managed so the stack closes its websocket on exit."""
-    if args.rxd_backend == "ssh-tr":
+#: Default INDEPENDENT public Radiant ElectrumX endpoints (distinct operators), verified live
+#: 2026-06-08. Used when --rxd-electrumx-url is not given on an electrumx run, so the recommended
+#: 2-of-2 (or 2-of-3 with --rxd-include-node) corroboration is turnkey — mirrors the BTC reader's
+#: DEFAULT_MAINNET_ENDPOINTS. Pass --rxd-electrumx-url explicitly to override.
+DEFAULT_RXD_ELECTRUMX = (
+    "wss://electrumx.radiant4people.com:50022",
+    "wss://electrumx.radiantcore.org",
+)
+
+
+async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
+    """Assemble the RXD chain source(s); return ``(source, corroborated)``.
+
+    Composes (optionally) the operator's own ssh-tr node + any number of INDEPENDENT public ElectrumX
+    endpoints. With >= ``--rxd-quorum`` (default 2) sources they are wrapped in a fail-closed
+    :class:`MultiSourceRxdChainSource` and ``corroborated=True`` (clears the single-source
+    ``low_corroboration`` flag — the recurring v2 blocker); a single source stays ``corroborated=False``
+    (the v1 alert-only posture). ssh-tr is read-only (no broadcast surface); ElectrumX websockets are
+    context-managed so the stack closes them on exit. Note: corroboration clears the low-corroboration
+    gate but does NOT lift the executor's dust cap or the mainnet ``audit_cleared`` gate."""
+    sources: list = []
+    # The operator's own node (independent infra) — included on --rxd-backend ssh-tr OR --rxd-include-node.
+    if args.rxd_backend == "ssh-tr" or args.rxd_include_node:
         from watchtower_sshtr import SshTrRxdReader  # scripts/ sibling, only needed for this backend
 
-        return SshTrRxdReader(ssh_host=args.ssh_host, container=args.ssh_container)
-    if not args.rxd_electrumx_url:
-        raise SystemExit("--rxd-electrumx-url is required for --rxd-backend electrumx")
-    return await stack.enter_async_context(
-        ElectrumXClient([args.rxd_electrumx_url], allow_insecure=args.allow_insecure)
-    )
+        sources.append(ElectrumRxdChainSource(SshTrRxdReader(ssh_host=args.ssh_host, container=args.ssh_container)))
+    # Public ElectrumX endpoints (repeatable). Default to the verified set unless this is a node-only run.
+    urls = list(args.rxd_electrumx_url or [])
+    if not urls and args.rxd_backend != "ssh-tr":
+        urls = list(DEFAULT_RXD_ELECTRUMX)
+    seen: set[str] = set()
+    for raw_url in urls:
+        url = raw_url.strip()
+        # Dedup on a normalized key (case + trailing slash) so the SAME endpoint listed twice can't
+        # masquerade as two independent sources and fake corroboration. Connect with the exact URL.
+        key = url.rstrip("/").lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        client = await stack.enter_async_context(ElectrumXClient([url], allow_insecure=args.allow_insecure))
+        sources.append(ElectrumRxdChainSource(client))
+    if not sources:
+        raise SystemExit(
+            "no RXD source configured — pass --rxd-electrumx-url (repeatable) and/or --rxd-include-node "
+            "(or --rxd-backend ssh-tr)"
+        )
+    if len(sources) == 1:
+        return sources[0], False  # single source → low-corroboration (v1 posture)
+    if len(sources) < args.rxd_quorum:
+        raise SystemExit(
+            f"--rxd-quorum {args.rxd_quorum} but only {len(sources)} independent RXD source(s) wired; "
+            "add --rxd-electrumx-url / --rxd-include-node, or lower --rxd-quorum"
+        )
+    # corroborated only when the quorum is a real majority-style check (>= 2); quorum=1 trusts any one.
+    return MultiSourceRxdChainSource(sources, quorum=args.rxd_quorum), args.rxd_quorum >= 2
 
 
 async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
@@ -229,9 +277,29 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
 def _parse_args(argv=None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HTLC swap watchtower (v1 alert-only, BTC)")
     p.add_argument("--records-dir", required=True, help="dir of SwapRecord JSON files to watch")
-    p.add_argument("--rxd-backend", choices=("electrumx", "ssh-tr"), default="electrumx", help="RXD chain source")
-    p.add_argument("--rxd-electrumx-url", help="RXD ElectrumX ws/wss URL (required for --rxd-backend electrumx)")
-    p.add_argument("--ssh-host", default="tr", help="ssh host for --rxd-backend ssh-tr")
+    p.add_argument(
+        "--rxd-backend", choices=("electrumx", "ssh-tr"), default="electrumx", help="primary RXD chain source"
+    )
+    p.add_argument(
+        "--rxd-electrumx-url",
+        action="append",
+        help="RXD ElectrumX ws/wss URL (REPEATABLE for a multi-source quorum); defaults to the verified "
+        "public endpoints on an electrumx run when none given",
+    )
+    p.add_argument(
+        "--rxd-include-node",
+        action="store_true",
+        help="ALSO include the operator's own ssh-tr node as an independent RXD source (combine with "
+        "--rxd-electrumx-url for 2-of-3); the node's own infra is independent of the public ElectrumX",
+    )
+    p.add_argument(
+        "--rxd-quorum",
+        type=int,
+        default=2,
+        help="RXD source quorum (>=2 enables corroboration: clears low_corroboration when >= this many "
+        "independent sources are wired; fail-closed below it)",
+    )
+    p.add_argument("--ssh-host", default="tr", help="ssh host for --rxd-backend ssh-tr / --rxd-include-node")
     p.add_argument("--ssh-container", default="radiant-mainnet", help="radiant docker container for ssh-tr")
     p.add_argument("--mempool-base-url", default="https://mempool.space", help="primary Esplora/mempool.space base URL")
     p.add_argument(
@@ -360,12 +428,13 @@ async def _amain(argv=None) -> int:
     reader = _build_funding_reader(args.network, esploras, args.quorum)
     async with contextlib.AsyncExitStack() as stack:
         http_session = await stack.enter_async_context(aiohttp.ClientSession())
-        rxd_client = await _build_rxd_client(args, stack)
+        rxd_source, rxd_corroborated = await _build_rxd_source(args, stack)
         eth_source = await _build_eth_source(args, stack)
         executor = _build_executor(args, stack)  # None → ALERT-ONLY; armed only on a cleared network
         reconciler = build_reconciler(
             records_dir=args.records_dir,
-            rxd_client=rxd_client,
+            rxd_source=rxd_source,
+            rxd_corroborated=rxd_corroborated,
             btc_funding_reader=reader,
             http_session=http_session,
             mempool_base_urls=esploras,
