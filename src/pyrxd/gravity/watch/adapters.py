@@ -21,6 +21,7 @@ operational entrypoint (arg parsing, real-client construction, the poll loop) st
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -41,6 +42,7 @@ __all__ = [
     "ElectrumRxdChainSource",
     "JsonDirRecordStore",
     "LoggingAlertChannel",
+    "MultiSourceRxdChainSource",
     "OutspendBtcClaimSource",
     "WebhookAlertChannel",
     "mempool_space_outspend",
@@ -130,6 +132,99 @@ class ElectrumRxdChainSource:
         if not isinstance(confs, int) or isinstance(confs, bool) or confs < 1:
             return None
         return confs
+
+
+class MultiSourceRxdChainSource:
+    """Quorum ``RxdChainSource`` over N INDEPENDENT Radiant readers (the operator's own
+    node + public ElectrumX servers), mirroring :class:`network.bitcoin.MultiSourceBtcFundingReader`.
+
+    RXD reads are single-source in v1, so every observation is flagged low-corroboration
+    (a wrong read → a false page, never a false broadcast). Composing >= ``quorum``
+    independent sources lets a lone lagging/lying/down source NOT drive a decision; wire
+    this and pass ``rxd_corroborated=True`` to the :class:`ChainObserver` to clear the flag.
+
+    Semantics (conservative; fail-closed toward NOT auto-acting):
+
+    * ``tip_height`` — the MINIMUM height across responders (the chain is only as advanced
+      as its most-pessimistic source, defeating an over-reporter); fail-closed
+      (:class:`NetworkError`) below quorum.
+    * ``covenant_confirmations`` — answers "is the maker's asset locked?", which gates the
+      autonomous BTC refund (``None`` ⇒ not locked ⇒ refund-eligible). The two conclusions
+      have OPPOSITE safety directions, so they get different evidence bars:
+        - **LOCKED** is believed on ANY single source that sees the covenant (returns the
+          MIN depth among those that see it) — refusing to refund is the safe error.
+        - **NOT locked** (``None``, which ENABLES a broadcast) is returned ONLY when
+          >= ``quorum`` sources were provably REACHABLE this cycle (their ``tip_height``
+          succeeded) AND none saw the covenant — a corroborated absence.
+        - otherwise (too few reachable sources to corroborate absence) it raises
+          :class:`NetworkError`, which the reconciler turns into a PAGE, never a refund.
+      The reachability gate closes the absent-vs-unreachable trap: the underlying adapters
+      map both "unmined" and "unreachable" to ``None``, so a down source could otherwise
+      masquerade as "the asset is not locked" → a wrongful autonomous refund. Only a source
+      that proved reachable (tip read OK) may cast an "absent" vote.
+
+    A failing source is dropped from each read; if that drops the responding/reachable count
+    below quorum, the read fails closed as above.
+    """
+
+    def __init__(self, sources: list, *, quorum: int = 2) -> None:
+        sources = list(sources)
+        if quorum < 1:
+            raise ValidationError("quorum must be >= 1")
+        if len(sources) < quorum:
+            raise ValidationError(f"need at least quorum={quorum} RXD sources, got {len(sources)}")
+        self._sources = sources
+        self._quorum = quorum
+
+    async def _gather(self, coro_fn) -> list:
+        """Run ``coro_fn`` on every source; return only the successful (non-Exception)
+        results. A failing source is dropped — it never fails the whole read."""
+        results = await asyncio.gather(*(coro_fn(s) for s in self._sources), return_exceptions=True)
+        return [x for x in results if not isinstance(x, Exception)]
+
+    async def tip_height(self) -> int:
+        oks = [int(h) for h in await self._gather(lambda s: s.tip_height())]
+        if len(oks) < self._quorum:
+            raise NetworkError(
+                f"RXD tip height corroborated by only {len(oks)} source(s); require "
+                f"quorum={self._quorum} of {len(self._sources)}. Fail-closed."
+            )
+        return min(oks)  # only as advanced as the most-pessimistic source
+
+    async def _live_and_covenant(self, src, outpoint: str) -> tuple[bool, int | None]:
+        """``(reachable, covenant_depth_or_None)`` for one source. Reachability is proven by
+        a successful ``tip_height``; ONLY a reachable source may later count as an "absent"
+        vote (a down node's ``None`` must never read as "the asset is not locked")."""
+        try:
+            await src.tip_height()
+        except Exception:
+            return (False, None)  # unreachable → no vote on covenant presence/absence
+        try:
+            depth = await src.covenant_confirmations(outpoint)
+        except Exception:
+            depth = None
+        if depth is not None and (not isinstance(depth, int) or isinstance(depth, bool) or depth < 1):
+            depth = None
+        return (True, depth)
+
+    async def covenant_confirmations(self, outpoint: str) -> int | None:
+        results = await asyncio.gather(
+            *(self._live_and_covenant(s, outpoint) for s in self._sources), return_exceptions=True
+        )
+        ok = [r for r in results if not isinstance(r, Exception)]
+        present = [d for (_live, d) in ok if d is not None]
+        reachable = sum(1 for (live, _d) in ok if live)
+        if present:
+            return min(present)  # LOCKED — believed on any sighting; conservative (min) depth
+        if reachable >= self._quorum:
+            return None  # >= quorum reachable sources, none saw it → corroborated NOT locked
+        raise NetworkError(
+            f"RXD covenant lock status uncorroborated: only {reachable} reachable source(s) "
+            f"< quorum={self._quorum}; fail-closed (refusing to conclude 'not locked')."
+        )
+
+    async def close(self) -> None:
+        await asyncio.gather(*(s.close() for s in self._sources if hasattr(s, "close")), return_exceptions=True)
 
 
 # outspend(funding_txid, vout) -> (spent, spending_txid_or_None)

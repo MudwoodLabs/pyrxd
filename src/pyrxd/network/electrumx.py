@@ -378,16 +378,18 @@ class ElectrumXClient:
     async def get_tip_height(self) -> BlockHeight:
         """Return the current chain tip block height.
 
-        Uses blockchain.block.header with cp_height=0, which is a
-        proper one-shot RPC call.  The subscription method
-        blockchain.headers.subscribe is avoided here because it installs
-        a server-side push subscription; subsequent push notifications would
-        arrive interleaved with other _call() responses on a long-lived
-        connection.
+        Uses ``blockchain.headers.subscribe``, whose INITIAL response is the current
+        tip header — ``{"height": N, "hex": "..."}`` (standard ElectrumX). The call also
+        installs a server-side header-push subscription, but that is harmless here: the
+        reader loop drops every id-less server push (see :meth:`_reader_loop`), so later
+        header notifications never interfere with request/response matching.
 
-        Response format: {"height": N, "hex": "..."}
+        (The prior implementation called ``blockchain.block.header [0, 0]`` expecting a
+        ``{"height", ...}`` dict, but standard ElectrumX returns the bare genesis-header
+        hex *string* for that call — so the tip read raised "Unexpected response type"
+        against real servers, e.g. electrumx.radiant4people.com.)
         """
-        result = await self._call("blockchain.block.header", [0, 0])
+        result = await self._call("blockchain.headers.subscribe", [])
         if not isinstance(result, dict):
             raise NetworkError("Unexpected response type for tip height")
         try:
