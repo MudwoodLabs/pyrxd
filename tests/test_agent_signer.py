@@ -146,6 +146,38 @@ def test_rejects_unowned_input() -> None:
         AgentSigner(w).sign(wrong, confirm=_ACCEPT)
 
 
+def test_rejects_non_all_forkid_sighash() -> None:
+    # Sighash-downgrade defence: a request that asks the agent to sign an input with
+    # NONE/SINGLE/ANYONECANPAY is refused. Those commit to fewer outputs than the
+    # confirmation summary shows, so the caller could recombine the returned signature
+    # into a different tx and redirect the funds.
+    from pyrxd.constants import SIGHASH
+
+    w, req, _u, _s = _scenario()
+    downgraded = SigningRequest(
+        unsigned_tx_hex=req.unsigned_tx_hex,
+        inputs=(
+            InputToSign(0, 0, 0, req.inputs[0].source_tx_hex, sighash=int(SIGHASH.NONE_ANYONECANPAY_FORKID)),
+            req.inputs[1],
+        ),
+        change_claims=req.change_claims,
+    )
+    with pytest.raises(SignerError, match="ALL_FORKID"):
+        AgentSigner(w).sign(downgraded, confirm=_ACCEPT)
+
+
+def test_rejects_out_of_enum_sighash() -> None:
+    # A malformed sighash int is a clean SignerError, not a leaked ValueError.
+    w, req, _u, _s = _scenario()
+    bad = SigningRequest(
+        unsigned_tx_hex=req.unsigned_tx_hex,
+        inputs=(InputToSign(0, 0, 0, req.inputs[0].source_tx_hex, sighash=0x99), req.inputs[1]),
+        change_claims=req.change_claims,
+    )
+    with pytest.raises(SignerError, match="ALL_FORKID"):
+        AgentSigner(w).sign(bad, confirm=_ACCEPT)
+
+
 def test_rejects_partial_tx() -> None:
     # A tx with an input the request doesn't cover is refused (v1 fully-owned only).
     w, req, _u, _s = _scenario()

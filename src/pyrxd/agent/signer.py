@@ -122,7 +122,20 @@ class AgentSigner:
         # set the sighash before signing so preimage == what we attribute.
         ti.satoshis = prevout.satoshis
         ti.locking_script = prevout.locking_script
-        ti.sighash = SIGHASH(inp.sighash)
+        # v1 signs ONLY ALL_FORKID. NONE/SINGLE/ANYONECANPAY variants commit to
+        # fewer outputs than the confirmation summary shows, so a caller could take
+        # the returned signature, recombine it into a different transaction, and
+        # redirect the funds — while the user approved a benign-looking spend. A
+        # fully wallet-owned normal send has no legitimate use for anything else.
+        # (Compared explicitly, not via SIGHASH(inp.sighash), so an out-of-enum int
+        # is a clean SignerError rather than a leaked ValueError.)
+        if inp.sighash != int(SIGHASH.ALL_FORKID):
+            raise SignerError(
+                f"input {inp.input_index}: agent v1 signs only ALL_FORKID "
+                f"(0x{int(SIGHASH.ALL_FORKID):02x}); got {inp.sighash!r} — other sighash types "
+                "permit fund redirection and are refused"
+            )
+        ti.sighash = SIGHASH.ALL_FORKID
         ti.unlocking_script_template = P2PKH().unlock(privkey)
         # ``from_hex`` leaves unlocking_script as an empty Script (not None), which
         # ``Transaction.sign(bypass=True)`` would skip — reset so this input signs.
