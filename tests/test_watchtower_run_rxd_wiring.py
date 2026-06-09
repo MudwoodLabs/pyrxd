@@ -91,3 +91,10 @@ async def test_dedup_identical_urls_collapses_to_single_source():
     src, corr = await _build("--rxd-electrumx-url", "wss://dup", "--rxd-electrumx-url", "wss://dup")
     assert isinstance(src, ElectrumRxdChainSource)
     assert corr is False
+
+
+async def test_dedup_normalizes_trailing_slash_and_case():
+    # trivially-different forms of ONE endpoint (trailing slash / case) must NOT fake a 2-source quorum.
+    src, corr = await _build("--rxd-electrumx-url", "wss://Dup.Example", "--rxd-electrumx-url", "wss://dup.example/")
+    assert isinstance(src, ElectrumRxdChainSource)
+    assert corr is False

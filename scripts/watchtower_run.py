@@ -212,10 +212,14 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     if not urls and args.rxd_backend != "ssh-tr":
         urls = list(DEFAULT_RXD_ELECTRUMX)
     seen: set[str] = set()
-    for url in urls:
-        if url in seen:
+    for raw_url in urls:
+        url = raw_url.strip()
+        # Dedup on a normalized key (case + trailing slash) so the SAME endpoint listed twice can't
+        # masquerade as two independent sources and fake corroboration. Connect with the exact URL.
+        key = url.rstrip("/").lower()
+        if key in seen:
             continue
-        seen.add(url)
+        seen.add(key)
         client = await stack.enter_async_context(ElectrumXClient([url], allow_insecure=args.allow_insecure))
         sources.append(ElectrumRxdChainSource(client))
     if not sources:
