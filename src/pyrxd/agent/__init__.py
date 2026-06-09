@@ -23,6 +23,7 @@ from __future__ import annotations
 from .errors import SignerDeclined, SignerError, SignerUnavailableError
 from .protocol import ChangeClaim, ExternalOutput, InputToSign, SignedResult, SigningRequest, SpendSummary
 from .signer import AgentSigner
+from .watch_only import UnsignedSend, WatchOnlyTxBuilder, WatchOnlyUtxo
 
 __all__ = [
     "AgentSigner",
@@ -35,4 +36,7 @@ __all__ = [
     "SignerUnavailableError",
     "SigningRequest",
     "SpendSummary",
+    "UnsignedSend",
+    "WatchOnlyTxBuilder",
+    "WatchOnlyUtxo",
 ]
