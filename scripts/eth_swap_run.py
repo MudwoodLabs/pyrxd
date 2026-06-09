@@ -505,8 +505,8 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             "is never revealed) is the real loss path. Recovery in THIS runbook is coord.mutual_refund() "
             "AFTER BOTH timeouts elapse (t_eth -> taker's ETH HTLC; t_rxd/CSV -> maker's RXD covenant); "
             "it refunds BOTH legs, so neither side takes one-sided loss. Do NOT use "
-            "maybe_refund_asset_on_maker_stall here — that is the BTC<->RXD runbook's proactive path where "
-            "the TAKER owns the RXD covenant; here the MAKER owns it (CLAIM->taker, CSV-refund->maker). "
+            "maybe_refund_asset_on_maker_stall here OR on the BTC<->RXD runbook — the MAKER owns the RXD "
+            "covenant in BOTH (CLAIM->taker, CSV-refund->maker), so as a TAKER it strands you (FSM finding #2). "
             "Do NOT walk away before both refunds confirm. ***"
         )
 

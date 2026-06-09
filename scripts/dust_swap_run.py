@@ -324,8 +324,12 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
             )
 
         print(
-            "\n  *** MONITORING WINDOW (BOTH_LOCKED): poll maybe_refund_asset_on_maker_stall well inside "
-            "maker_stall_safety_window_blocks. Do NOT walk away — the maker-stall steal is the real loss path. ***"
+            "\n  *** MONITORING WINDOW (BOTH_LOCKED): the maker-stall steal is the real loss path. Recovery in "
+            "THIS runbook is coord.mutual_refund() AFTER BOTH timeouts elapse (t_btc -> taker's BTC HTLC; "
+            "t_rxd/CSV -> maker's RXD covenant) — it refunds BOTH legs, so neither side takes one-sided loss. "
+            "Do NOT run maybe_refund_asset_on_maker_stall: its CSV refund pays the MAKER (the maker owns the "
+            "covenant), so as a TAKER it strands you — you gift the asset back and the maker still claims your "
+            "BTC with p (FSM finding #2). Do NOT walk away before both refunds confirm. ***"
         )
 
         # 3. Maker claims BTC, revealing p.

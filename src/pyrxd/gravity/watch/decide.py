@@ -307,20 +307,29 @@ def decide(
             autonomous_btc_refund=_btc_refund_matured(terms, obs),
             low_corroboration=corr,
         )
-    # 3c. Asset-leg proactive refund on maker stall (BOTH_LOCKED / MAKER_STALLS).
-    if state in (SwapState.BOTH_LOCKED, SwapState.MAKER_STALLS):
+    # 3c. Maker stall (FSM finding #2, 2026-06-09). Recovery is mutual_refund, NOT the asset-only
+    #     maybe_refund_asset_on_maker_stall — IDENTICALLY to the ETH branch (_decide_eth). The maker
+    #     locks the RXD covenant in this runbook too, so its CSV refund pays the MAKER; routing the
+    #     taker to it is a one-sided taker LOSS: it destroys the taker's only recourse (the claimable
+    #     covenant) while the taker's BTC stays locked until t_btc, and the maker (still privately
+    #     holding p) then claims the BTC via the maker-only claim leaf. mutual_refund unwinds BOTH legs
+    #     once both timeouts elapse (proven by the regtest PoC TestMakerStallAssetOnlyRefundIsTakerLoss).
+    if state is SwapState.MAKER_STALLS:
+        # Unreachable on the coordinator-driven path post-fix: the only entry to MAKER_STALLS is
+        # maybe_refund_asset_on_maker_stall, which is no longer a taker watchtower action and advances
+        # straight to the terminal in the same call. If observed anyway, NO clean coordinator step
+        # applies (mutual_refund is BOTH_LOCKED-only) → fail closed to a decision-required page rather
+        # than name a step the coordinator rejects (mirrors the ETH branch).
+        return Decision(
+            Intent.PAGE_SQUEEZED,
+            reason="unexpected MAKER_STALLS on a BTC swap — no clean coordinator refund from here; recover via mutual_refund once both timeouts elapse",
+            recommended_action="investigate (mutual_refund is only valid from BOTH_LOCKED)",
+            low_corroboration=corr,
+        )
+    if state is SwapState.BOTH_LOCKED:
         if obs.asset_locked_at_height is None:
             return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
         deadline = _refund_opens_at(policy, terms, obs.asset_locked_at_height)
-        if state is SwapState.MAKER_STALLS:
-            # The FSM already classified this as a stall — the refund is due.
-            return Decision(
-                Intent.PAGE_REFUND,
-                reason="maker stalling (MAKER_STALLS) — refund the asset proactively before t_rxd",
-                recommended_action="maybe_refund_asset_on_maker_stall",
-                deadline_rxd_height=deadline,
-                low_corroboration=corr,
-            )
         try:
             refund_due = should_taker_refund_proactively(
                 now_block_height=obs.now_rxd_height,
@@ -335,15 +344,15 @@ def decide(
             return Decision(
                 Intent.PAGE_REFUND,
                 reason=f"maker-stall predicate un-evaluable, fail-closed to refund page: {exc}",
-                recommended_action="maybe_refund_asset_on_maker_stall",
+                recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
             )
         if refund_due:
             return Decision(
                 Intent.PAGE_REFUND,
-                reason="maker has not claimed and t_rxd maturity is approaching — refund the asset proactively",
-                recommended_action="maybe_refund_asset_on_maker_stall",
+                reason="maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund (broadcast once both timeouts elapse)",
+                recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
             )

@@ -142,6 +142,55 @@ def test_terminal_states_retire(state):
 
 
 # ---------------------------------------------------------------------------
+# Maker-stall recovery is SYMMETRIC across counter-chains (FSM finding #2, 2026-06-09 — FIXED)
+# ---------------------------------------------------------------------------
+# Both the BTC and ETH stall paths recommend the SAME safe recovery for the SAME situation
+# (BOTH_LOCKED, maker has not claimed, t_rxd maturity approaching): mutual_refund (unwinds BOTH
+# legs). Before the fix the BTC path named the asset-only maybe_refund_asset_on_maker_stall whose
+# CSV pays the MAKER — a one-sided taker loss (reproduced in test_xchain_swap_regtest_e2e.py::
+# TestMakerStallAssetOnlyRefundIsTakerLoss, which stays as the durable characterization of why that
+# helper is maker-only). These tests pin the symmetry so a regression re-surfaces here.
+
+
+def test_btc_and_eth_maker_stall_both_recommend_mutual_refund():
+    """The decision core is SYMMETRIC: identical maker-stall situation → mutual_refund on both."""
+    obs = Observations(maker_has_claimed_btc=False, now_rxd_height=170, asset_locked_at_height=LOCK)
+    btc = _decide(_record(SwapState.BOTH_LOCKED), obs)
+    eth = _decide_e(_eth(SwapState.BOTH_LOCKED), obs)
+    assert btc.intent is Intent.PAGE_REFUND and eth.intent is Intent.PAGE_REFUND
+    # Neither counter-chain routes the taker to the asset-only refund (pays the maker — the loss path).
+    assert btc.recommended_action == eth.recommended_action == "mutual_refund"
+
+
+def test_btc_maker_stalls_state_pages_squeezed_no_clean_step():
+    """MAKER_STALLS is unreachable on the coordinator path post-fix (its only producer,
+    maybe_refund_asset_on_maker_stall, is no longer a taker watchtower action). If a record is
+    observed there anyway, decide() fails closed to PAGE_SQUEEZED rather than naming a loss path —
+    mirroring the ETH branch."""
+    obs = Observations(maker_has_claimed_btc=False, now_rxd_height=150, asset_locked_at_height=LOCK)
+    d = _decide(_record(SwapState.MAKER_STALLS), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert d.recommended_action is not None and "mutual_refund" in d.recommended_action
+
+
+def test_asset_refunded_terminal_retires_while_btc_still_locked():
+    """Secondary strand (now unreachable on the taker path, but the invariant still holds): a record
+    at the terminal ASSET_REFUNDED_TAKER_ACTS makes the watchtower RETIRE — it stops tracking even
+    though a taker's BTC counter-leg would still be locked until t_btc. Removing the asset-only refund
+    from the taker path is what makes this terminal unreachable for a taker; this pins the underlying
+    terminal→RETIRE behavior so a future re-introduction of that path is caught."""
+    # BTC funding shallow + maker has NOT claimed: the BTC leg is unambiguously still locked.
+    obs = Observations(
+        maker_has_claimed_btc=False,
+        now_rxd_height=180,  # past t_rxd maturity (172) but t_btc (LOCK+144=244) is far off
+        asset_locked_at_height=LOCK,
+        btc_funding_confirmations=1,
+    )
+    d = _decide(_record(SwapState.ASSET_REFUNDED_TAKER_ACTS), obs)
+    assert d.intent is Intent.RETIRE  # no page to recover the still-locked BTC
+
+
+# ---------------------------------------------------------------------------
 # ETH counter-leg (v3) — finalized-checkpoint finality, mutual_refund on stall
 # ---------------------------------------------------------------------------
 # With _eth_policy(): rxd_burial = 2, counter_reserve_rxd = ceil(768/300) = 3, t_rxd = 72,
@@ -461,17 +510,19 @@ def test_both_locked_refund_not_due_watches():
 
 
 def test_both_locked_refund_due_pages_refund():
-    # now >= maturity - safety (166) → proactive refund due.
+    # now >= maturity - safety (166) → refund window near; the taker prepares mutual_refund (the
+    # safe both-legs unwind), NOT the asset-only refund that pays the maker (FSM finding #2).
     obs = Observations(maker_has_claimed_btc=False, now_rxd_height=167, asset_locked_at_height=LOCK)
     d = _decide(_record(SwapState.BOTH_LOCKED), obs)
     assert d.intent is Intent.PAGE_REFUND
-    assert d.recommended_action == "maybe_refund_asset_on_maker_stall"
+    assert d.recommended_action == "mutual_refund"
 
 
-def test_maker_stalls_pages_refund():
+def test_maker_stalls_pages_squeezed():
+    # Post-fix MAKER_STALLS is unreachable on the coordinator path; if seen, fail closed (no clean step).
     obs = Observations(maker_has_claimed_btc=False, now_rxd_height=150, asset_locked_at_height=LOCK)
     d = _decide(_record(SwapState.MAKER_STALLS), obs)
-    assert d.intent is Intent.PAGE_REFUND
+    assert d.intent is Intent.PAGE_SQUEEZED
 
 
 def test_both_locked_unknown_lock_height_watches():

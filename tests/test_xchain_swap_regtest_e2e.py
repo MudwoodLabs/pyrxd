@@ -383,7 +383,7 @@ class _Seen:
 class _LockedSwap:
     """A swap driven to BOTH_LOCKED on both real chains, ready for any terminal path."""
 
-    def __init__(self, *, coord, cov, p_secret, broadcaster, t_btc, t_rxd, rxd_locked_at):
+    def __init__(self, *, coord, cov, p_secret, broadcaster, t_btc, t_rxd, rxd_locked_at, rxd_amount):
         self.coord = coord
         self.cov = cov
         self.p_secret = p_secret
@@ -391,6 +391,7 @@ class _LockedSwap:
         self.t_btc = t_btc
         self.t_rxd = t_rxd
         self.rxd_locked_at = rxd_locked_at
+        self.rxd_amount = rxd_amount
 
 
 async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _LockedSwap:
@@ -503,6 +504,7 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _Locked
         t_btc=t_btc,
         t_rxd=t_rxd,
         rxd_locked_at=rxd_locked_at,
+        rxd_amount=rxd_photons,
     )
 
 
@@ -591,9 +593,11 @@ class TestCrossChainSwap:
         assert btc_spent in (None, ""), "BTC HTLC should be refunded (spent)"
         assert rxd_spent in (None, ""), "RXD covenant should be refunded (spent)"
 
-    async def test_maker_stall_taker_refunds_asset_proactively(self, nodes):
-        """Maker locks the asset but stalls (never claims BTC). As t_rxd nears, the
-        taker proactively refunds the RXD asset rather than wait — never loses both."""
+    async def test_maker_stall_asset_only_refund_mechanics(self, nodes):
+        """Exercises the maybe_refund_asset_on_maker_stall MECHANICS (the helper still exists as a
+        maker-side primitive). NOTE: its CSV refund pays the MAKER, not the taker — see
+        TestMakerStallAssetOnlyRefundIsTakerLoss for why this is NOT a taker recovery. The watchtower
+        no longer routes a taker here (FSM finding #2); the safe taker recovery is mutual_refund."""
         s = await _setup_locked_swap(nodes)
         coord = s.coord
 
@@ -607,7 +611,73 @@ class TestCrossChainSwap:
         assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
 
         rxd_spent = nodes.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
-        assert rxd_spent in (None, ""), "taker should have recovered the RXD asset (covenant spent)"
+        assert rxd_spent in (None, ""), "the covenant CSV refund was broadcast (covenant spent) — pays the MAKER"
+
+
+def _scan_value_for_spk(nodes: _Nodes, spk: bytes) -> int:
+    """Total confirmed UTXO value (sats) currently paying ``spk`` on the RXD chain."""
+    res = nodes.rxd("scantxoutset", "start", json.dumps([{"desc": f"raw({bytes(spk).hex()})"}]))
+    return round(sum(u["amount"] for u in res.get("unspents", [])) * 1e8)
+
+
+class TestMakerStallAssetOnlyRefundIsTakerLoss:
+    """ADVERSARIAL (FSM finding #2, 2026-06-09): on the BTC<->RXD runbook the asset-only
+    proactive refund (:meth:`maybe_refund_asset_on_maker_stall`) is NOT a taker defense — its
+    CSV refund pays the MAKER. If a taker is driven to run it on a maker stall (which the BTC
+    watchtower/runbook recommends: decide.py:311-349 + dust_swap_run.py:327), it DESTROYS the
+    taker's only recourse (the claimable covenant) while the taker's own BTC is still locked
+    until ``t_btc``. The maker, still privately holding ``p``, then claims the BTC (claim leaf is
+    maker-only, valid until ``t_btc``) and takes BOTH legs.
+
+    Contrast :meth:`TestCrossChainSwap.test_mutual_refund_when_maker_never_claims`, which unwinds
+    BOTH legs safely — the recovery the ETH path already mandates (decide.py:508-542)."""
+
+    async def test_asset_only_refund_gifts_asset_to_maker_then_maker_takes_btc(self, nodes):
+        # Small t_rxd (fast CSV), t_btc = t_rxd + 40 so the taker's BTC refund leaf is NOWHERE
+        # near open when the asset-only refund fires — the crux of the asymmetry.
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=3)
+        coord = s.coord
+        loc = coord.record.btc_locator
+        cov_value = s.rxd_amount
+
+        # Sanity: before the refund, the asset sits in the covenant; neither party's holder
+        # script holds it yet.
+        assert _scan_value_for_spk(nodes, s.cov.maker_holder_script) == 0
+        assert _scan_value_for_spk(nodes, s.cov.taker_holder_script) == 0
+
+        # 1. Maker stalls (never claims BTC; p stays private). The taker is driven to the
+        #    asset-only proactive refund. Mature the RXD CSV so the refund is BIP68-spendable.
+        nodes.rxd_mine(s.t_rxd.value)
+        now = int(nodes.rxd("getblockcount"))
+        rec = await coord.maybe_refund_asset_on_maker_stall(
+            now_block_height=now, asset_locked_at_height=s.rxd_locked_at, maker_has_claimed_btc=False
+        )
+        assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
+        nodes.rxd_mine(1)  # confirm the refund tx so scantxoutset sees the new output
+
+        # 2. THE BUG: the "taker's" proactive refund paid the MAKER, not the taker. The asset is
+        #    now back with the maker and the taker has NO covenant left to claim.
+        maker_got = _scan_value_for_spk(nodes, s.cov.maker_holder_script)
+        taker_got = _scan_value_for_spk(nodes, s.cov.taker_holder_script)
+        assert maker_got == cov_value, "the asset-only CSV refund pays the MAKER (maker_holder_script)"
+        assert taker_got == 0, "the taker recovered NOTHING from the covenant — its recourse is gone"
+
+        # 3. The taker's own BTC is STILL LOCKED: t_btc has not elapsed, so the refund leaf is not
+        #    open. The taker cannot recover the BTC yet.
+        funding_confs = int(nodes.btc("getrawtransaction", loc.funding_outpoint.txid, "true").get("confirmations", 0))
+        assert funding_confs < s.t_btc.value, "precondition: taker's BTC refund leaf must NOT be open yet"
+
+        # 4. The adversarial maker, still holding p, claims the BTC directly (bypassing the honest
+        #    coordinator — the FSM is terminal). The claim leaf is maker-only and valid until t_btc.
+        claim_txid = await coord.btc_leg.claim(loc, s.p_secret.unsafe_raw_bytes())
+        claim_decoded = nodes.btc("decoderawtransaction", s.broadcaster.last_raw[claim_txid].hex())
+
+        # 5. The maker now holds BOTH legs; the taker holds neither (one-sided taker loss).
+        btc_spent = nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout))
+        assert btc_spent in (None, ""), "maker claimed the taker's BTC HTLC (spent)"
+        assert claim_decoded["vout"], "the maker's BTC claim produced an output (to its own payout SPK)"
+        # The maker ends with the asset (RXD) AND the BTC; the taker is wiped out.
+        assert maker_got == cov_value and btc_spent in (None, "")
 
 
 # --------------------------------------------------------------------------- watchtower observation
@@ -782,8 +852,9 @@ class TestWatchtowerIntentSequence:
         assert len(channel.pages) == 1, "DedupAlerter must not re-page an unchanged situation"
 
     async def test_maker_stall_watch_then_page_refund(self, nodes):
-        """Maker locks the asset then stalls (never reveals p). As t_rxd nears, the tower pages a
-        proactive asset refund (WARN — recoverable, not a race), naming the coordinator step."""
+        """Maker locks the asset then stalls (never reveals p). As t_rxd nears, the tower pages the
+        safe both-legs recovery — mutual_refund (WARN — recoverable, not a race), NOT the asset-only
+        refund that pays the maker (FSM finding #2). The page names the coordinator step."""
         s = await _setup_locked_swap(nodes, t_rxd_blocks=30)
         coord = s.coord
         reconciler, channel = _watchtower(nodes, coord)
@@ -797,7 +868,7 @@ class TestWatchtowerIntentSequence:
         nodes.rxd_mine(27)
         r = await self._tick_one(reconciler)
         assert r.decision.intent is Intent.PAGE_REFUND
-        assert r.decision.recommended_action == "maybe_refund_asset_on_maker_stall"
+        assert r.decision.recommended_action == "mutual_refund"
         assert r.decision.deadline_rxd_height is not None
         assert r.alert_delivered is True
         assert len(channel.pages) == 1

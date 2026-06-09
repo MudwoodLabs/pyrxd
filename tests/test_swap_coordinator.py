@@ -788,8 +788,10 @@ async def test_e2e_maker_stalls_taker_refunds_asset():
         now_block_height=1066, asset_locked_at_height=1000, maker_has_claimed_btc=False
     )
     assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
-    assert rxd.refunded  # taker recovered the asset rather than wait
-    # Taker is whole on the asset side; never lost both.
+    assert rxd.refunded  # the covenant CSV refund was broadcast — it pays the MAKER, not the taker.
+    # NOTE: this exercises the helper's mechanics only. The CSV refund pays the maker (maker owns the
+    # covenant), so this is NOT a taker recovery — the watchtower routes a taker to mutual_refund
+    # instead (FSM finding #2, 2026-06-09). See test_xchain_swap_regtest_e2e for the taker-loss proof.
 
 
 async def test_maker_stall_noop_before_window():
