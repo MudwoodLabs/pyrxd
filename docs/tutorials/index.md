@@ -7,6 +7,7 @@ fungible token, run a Gravity swap.
 ```{toctree}
 :maxdepth: 1
 
+quickstart
 your-first-radiant-transaction
 inspect-a-radiant-transaction
 mint-a-glyph-nft
@@ -16,6 +17,12 @@ mint-from-a-dmint-contract
 
 ## Available now
 
+- **[5-minute quickstart: your first token on a local chain](quickstart.md)** —
+  the fastest path from `pip install` to a real on-chain Glyph NFT, minted on a
+  private regtest chain that runs entirely on your machine. One command
+  (`pyrxd regtest up`) stands up the node and hands you a pre-funded key; a
+  companion script mints the token; one command tears it all down. No faucet,
+  no mainnet RXD, nothing at risk. **Start here if you want to build.**
 - **[Your first Radiant transaction](your-first-radiant-transaction.md)** —
   fresh `pip install` to a built, signed RXD send. Walks through
   `pyrxd wallet new`, `pyrxd address`, `pyrxd balance --refresh`,
