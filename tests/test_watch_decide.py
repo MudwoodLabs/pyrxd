@@ -15,6 +15,7 @@ import os
 import pytest
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.gravity.finality import CounterClaimState
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.gravity.watch import Intent, Observations, decide
@@ -81,6 +82,22 @@ def _policy() -> MarginPolicy:
     )
 
 
+def _eth_policy() -> MarginPolicy:
+    # ETH finality is a CHECKPOINT, not a depth: the gate reserves a TIME window converted to RXD
+    # blocks (ceil(eth_finalization_window_s / rxd_block_interval_s)) in the WAIT branch, NOT a BTC
+    # depth. 768 s (~2 post-Merge epochs) is the floor; ceil(768 / 300) = 3 RXD blocks reserved.
+    # (RXD claim burial stays 2 blocks, as in _policy.)
+    return MarginPolicy(
+        margin=t.Timelock(72, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(2, t.TimeUnit.BLOCKS),
+        rxd_block_interval_s=300.0,
+        eth_finalization_window_s=768,
+    )
+
+
 def _record(state: SwapState, *, terms: NegotiatedTerms | None = None) -> SwapRecord:
     return SwapRecord(state=state, terms=terms or _btc_terms())
 
@@ -91,8 +108,17 @@ LOCK = 100  # asset_locked_at_height
 REFUND_OPENS = LOCK + 72
 
 
-def _decide(record, obs):
-    return decide(record=record, observations=obs, policy=_policy(), safety_window_blocks=SAFETY)
+def _decide(record, obs, *, policy: MarginPolicy | None = None):
+    return decide(record=record, observations=obs, policy=policy or _policy(), safety_window_blocks=SAFETY)
+
+
+def _eth(state: SwapState) -> SwapRecord:
+    return SwapRecord(state=state, terms=_eth_terms())
+
+
+def _decide_e(record, obs, *, policy: MarginPolicy | None = None):
+    """decide() with the ETH policy (carries eth_finalization_window_s) unless overridden."""
+    return decide(record=record, observations=obs, policy=policy or _eth_policy(), safety_window_blocks=SAFETY)
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +141,214 @@ def test_terminal_states_retire(state):
     assert d.intent is Intent.RETIRE
 
 
-def test_eth_swap_is_noop_v1():
-    rec = _record(SwapState.BOTH_LOCKED, terms=_eth_terms())
-    d = _decide(rec, Observations(maker_has_claimed_btc=False, now_rxd_height=150, asset_locked_at_height=LOCK))
-    assert d.intent is Intent.NOOP
+# ---------------------------------------------------------------------------
+# ETH counter-leg (v3) — finalized-checkpoint finality, mutual_refund on stall
+# ---------------------------------------------------------------------------
+# With _eth_policy(): rxd_burial = 2, counter_reserve_rxd = ceil(768/300) = 3, t_rxd = 72,
+# LOCK = 100 → REFUND_OPENS = 172, blocks_left = 172 - now. So:
+#   FINAL              → SAFE iff blocks_left >= 2, else SQUEEZED.
+#   NOT_YET_FINAL_LIVE → WAIT iff blocks_left >= 5 (blocks_left - 3 >= 2), else SQUEEZED.
+
+
+def _eth_obs(*, detected, finality, now, lock=LOCK, low_corroboration=False):
+    return Observations(
+        maker_has_claimed_btc=False,  # BTC field unused on the ETH path
+        now_rxd_height=now,
+        asset_locked_at_height=lock,
+        eth_claim_detected=detected,
+        eth_claim_finality=finality,
+        low_corroboration=low_corroboration,
+    )
+
+
+def test_eth_claim_finalized_pages_claim():
+    # FINAL + ample window → SAFE → PAGE_CLAIM with the ETH claim step + deadline.
+    obs = _eth_obs(detected=True, finality=CounterClaimState.FINAL, now=150)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.PAGE_CLAIM
+    assert d.recommended_action == "taker_scrape_and_claim_asset"
+    assert d.deadline_rxd_height == REFUND_OPENS
+
+
+def test_eth_claim_not_yet_finalized_waits():
+    # NOT_YET_FINAL_LIVE but window has room (blocks_left 22 >= 5) → WAIT → WATCH (no page).
+    obs = _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=150)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.WATCH
+
+
+def test_eth_claim_finalized_but_window_closing_squeezes():
+    # FINAL but only 1 block left (< rxd_burial 2) → SQUEEZED → PAGE_SQUEEZED (decision-required).
+    obs = _eth_obs(detected=True, finality=CounterClaimState.FINAL, now=REFUND_OPENS - 1)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert "vulnerable" in d.recommended_action.lower() or "winner" in d.recommended_action.lower()
+
+
+def test_eth_claim_not_yet_final_window_closing_squeezes():
+    # NOT_YET_FINAL_LIVE and blocks_left 4 < 5 → no room to wait for finality → SQUEEZED.
+    obs = _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=168)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+
+
+def test_eth_claim_dominates_lagging_record():
+    # Chain shows the ETH claim (FINAL) but the record still says BOTH_LOCKED (operator offline) →
+    # the claim race is assessed from chain truth anyway → PAGE_CLAIM.
+    obs = _eth_obs(detected=True, finality=CounterClaimState.FINAL, now=150)
+    d = _decide_e(_eth(SwapState.BOTH_LOCKED), obs)
+    assert d.intent is Intent.PAGE_CLAIM
+
+
+def test_eth_secret_revealed_record_with_no_finality_fails_closed():
+    # SECRET_REVEALED record arms the gate even if detection is suppressed; with no finalized verdict
+    # it fails CLOSED to a decision-required page (never a silent all-clear).
+    obs = _eth_obs(detected=False, finality=None, now=150)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert "un-assessable" in d.reason
+
+
+def test_eth_claim_missing_lock_height_fails_closed():
+    obs = _eth_obs(detected=True, finality=CounterClaimState.FINAL, now=150, lock=None)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+
+
+def test_eth_claim_now_below_lock_fails_closed():
+    # now < asset_locked ⇒ lagging/lying node ⇒ gate raises ⇒ fail-closed page.
+    obs = _eth_obs(detected=True, finality=CounterClaimState.FINAL, now=50)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+
+
+def test_eth_not_yet_final_without_finalization_window_fails_closed():
+    # The finalization-reserve (WAIT-vs-SQUEEZED) branch needs eth_finalization_window_s. A NOT_YET_FINAL
+    # claim under a policy that lacks it makes assess_claim_finality raise → decide() fails CLOSED to a
+    # decision-required page, never an optimistic WAIT/SAFE. (A FINAL claim needs no such reserve, so the
+    # window is only load-bearing here.)
+    obs = _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=150)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs, policy=_policy())  # _policy() has no eth window
+    assert d.intent is Intent.PAGE_SQUEEZED
+
+
+def test_eth_maker_stall_refund_due_pages_mutual_refund():
+    # now >= maturity - safety (166) and maker hasn't revealed → PAGE_REFUND naming mutual_refund
+    # (NOT maybe_refund_asset_on_maker_stall, which is forbidden on the ETH stall path).
+    obs = _eth_obs(detected=False, finality=None, now=167)
+    d = _decide_e(_eth(SwapState.BOTH_LOCKED), obs)
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.recommended_action == "mutual_refund"
+    assert d.deadline_rxd_height == REFUND_OPENS
+
+
+def test_eth_maker_stall_refund_not_due_watches():
+    obs = _eth_obs(detected=False, finality=None, now=150)
+    d = _decide_e(_eth(SwapState.BOTH_LOCKED), obs)
+    assert d.intent is Intent.WATCH
+
+
+def test_eth_maker_stalls_state_fails_closed_to_squeezed():
+    # MAKER_STALLS is unreachable on the coordinator-driven ETH path and no clean coordinator refund
+    # applies from it (mutual_refund is BOTH_LOCKED-only) → fail closed to a decision-required page,
+    # NOT a step the coordinator would reject.
+    obs = _eth_obs(detected=False, finality=None, now=150)
+    d = _decide_e(_eth(SwapState.MAKER_STALLS), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert d.recommended_action != "mutual_refund"
+
+
+def test_eth_params_mismatch_pages_counter_leg_refund():
+    # mutual_refund is BOTH_LOCKED-only and would touch the maker's covenant; the state-valid step
+    # from PARAMS_MISMATCH is taker_refund_btc, which refunds the ETH counter-leg HTLC (mirrors BTC).
+    obs = _eth_obs(detected=False, finality=None, now=150)
+    d = _decide_e(_eth(SwapState.PARAMS_MISMATCH), obs)
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.recommended_action == "taker_refund_btc"
+
+
+def test_eth_asset_vulnerable_pages_decision():
+    obs = _eth_obs(detected=False, finality=None, now=170)
+    d = _decide_e(_eth(SwapState.ASSET_VULNERABLE), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+
+
+def test_eth_low_corroboration_propagates():
+    obs = _eth_obs(detected=False, finality=None, now=167, low_corroboration=True)
+    d = _decide_e(_eth(SwapState.BOTH_LOCKED), obs)
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.low_corroboration is True
+
+
+def test_eth_terminal_retires():
+    obs = _eth_obs(detected=False, finality=None, now=150)
+    d = _decide_e(_eth(SwapState.COMPLETED), obs)
+    assert d.intent is Intent.RETIRE
+
+
+def test_eth_observations_validation():
+    with pytest.raises(ValidationError):
+        Observations(maker_has_claimed_btc=False, now_rxd_height=10, eth_claim_detected="yes")
+    with pytest.raises(ValidationError):
+        Observations(maker_has_claimed_btc=False, now_rxd_height=10, eth_claim_finality="final")
+
+
+def test_eth_counter_chain_not_finalizing_squeezes_even_with_room():
+    # RF-06: a non-finalizing counter chain must SQUEEZE, never WAIT — even with an ample t_rxd window.
+    # (The point-in-time leg verdict never emits this today; the field carries it for when the
+    # FinalityStallTracker is wired, and decide() must pass it straight to the gate, which SQUEEZES.)
+    obs = _eth_obs(detected=True, finality=CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING, now=150)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+
+
+def test_eth_detected_without_finality_fails_closed_regardless_of_state():
+    # The claim-race guard is armed by detection alone; a detected claim with NO finalized verdict
+    # fails CLOSED to a decision-required page even when record.state has not advanced (BOTH_LOCKED).
+    obs = _eth_obs(detected=True, finality=None, now=150)
+    d = _decide_e(_eth(SwapState.BOTH_LOCKED), obs)
+    assert d.intent is Intent.PAGE_SQUEEZED
+    assert "un-assessable" in d.reason
+
+
+def test_eth_not_yet_final_reserve_boundary():
+    # Locks the 3-block finalization reserve (ceil(768/300)) against an off-by-one regression:
+    # blocks_left 5 (now=167) still WAITs (5 - 3 >= burial 2); blocks_left 4 (now=168) SQUEEZES.
+    wait = _decide_e(
+        _eth(SwapState.SECRET_REVEALED), _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=167)
+    )
+    squeeze = _decide_e(
+        _eth(SwapState.SECRET_REVEALED), _eth_obs(detected=True, finality=CounterClaimState.NOT_YET_FINAL_LIVE, now=168)
+    )
+    assert wait.intent is Intent.WATCH
+    assert squeeze.intent is Intent.PAGE_SQUEEZED
+
+
+def test_btc_and_eth_finality_dispatch_parity():
+    # The two branches must map the gate verdict to the same Intents (guards against a one-sided edit):
+    #   FINAL + ample window      → PAGE_CLAIM
+    #   not-yet-final + room       → WATCH (never PAGE_CLAIM)
+    #   FINAL + closing window     → PAGE_SQUEEZED
+    def _btc(confs, now):
+        return _decide(
+            _record(SwapState.SECRET_REVEALED),
+            Observations(
+                maker_has_claimed_btc=True,
+                now_rxd_height=now,
+                asset_locked_at_height=LOCK,
+                btc_claim_confirmations=confs,
+            ),
+        ).intent
+
+    def _eth_(final, now):
+        return _decide_e(_eth(SwapState.SECRET_REVEALED), _eth_obs(detected=True, finality=final, now=now)).intent
+
+    assert _btc(6, 150) is Intent.PAGE_CLAIM and _eth_(CounterClaimState.FINAL, 150) is Intent.PAGE_CLAIM
+    assert _btc(3, 150) is Intent.WATCH and _eth_(CounterClaimState.NOT_YET_FINAL_LIVE, 150) is Intent.WATCH
+    assert (
+        _btc(6, REFUND_OPENS - 1) is Intent.PAGE_SQUEEZED
+        and _eth_(CounterClaimState.FINAL, REFUND_OPENS - 1) is Intent.PAGE_SQUEEZED
+    )
 
 
 # ---------------------------------------------------------------------------

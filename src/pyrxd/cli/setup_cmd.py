@@ -56,33 +56,76 @@ async def _probe_electrumx(url: str) -> bool:
         return False
 
 
+# --coin-type choices, mapped to the wallet each value is for (Avian-UI
+# style). 512 is the SLIP-0044 default; 0 is for Photonic / Electron-Radiant
+# restores; 236 is the pre-#14 pyrxd path, surfaced for completeness but not
+# promoted (no modern wallet creates at it).
+_COIN_TYPE_CHOICES = ("0", "236", "512")
+_COIN_TYPE_HELP = (
+    "SLIP-0044 coin type for the wallet `wallet new` will derive: "
+    "512 = Radiant (Standard, SLIP-0044) [default]; "
+    "0 = Legacy Bitcoin-compatible (use for wallets created in Photonic or "
+    "Electron-Radiant); "
+    "236 = old pyrxd (pre-#14 BSV coin type; not promoted)."
+)
+
+
 @click.command(name="setup")
 @click.option(
     "--no-interactive",
     is_flag=True,
     help="Don't prompt for any input. Just write the default config and exit.",
 )
+@click.option(
+    "--coin-type",
+    type=click.Choice(_COIN_TYPE_CHOICES),
+    default=None,
+    help=_COIN_TYPE_HELP + " Omitted: keep the existing config value (default 512).",
+)
 @click.pass_obj
-def setup_cmd(ctx: CliContext, no_interactive: bool) -> None:
+def setup_cmd(ctx: CliContext, no_interactive: bool, coin_type: str | None) -> None:
     """Onboarding walkthrough — detects node, ElectrumX, wallet.
 
     Prints what it finds and how to fix any gaps. Writes
     ``~/.pyrxd/config.toml`` with built-in defaults if the file is
-    missing. Does NOT create a wallet — run ``pyrxd wallet new``
-    afterwards.
+    missing. ``--coin-type`` records the SLIP-0044 coin type so a
+    later ``pyrxd wallet new`` derives at ``m/44'/<coin_type>'/0'``.
+    Does NOT create a wallet — run ``pyrxd wallet new`` afterwards.
     """
+    # Persistence design: setup is non-destructive and does NOT create a
+    # wallet, so it cannot bind the coin type to a seed here. Instead it
+    # writes ``coin_type`` into ~/.pyrxd/config.toml; the next
+    # ``wallet new`` reads ctx.config.coin_type and passes it to
+    # HdWallet.from_mnemonic(coin_type=...), which records + persists it in
+    # the wallet file. This is real persistence (not just an echoed hint)
+    # and survives across processes.
+    #
+    # ``--coin-type`` is only persisted when explicitly passed (default is
+    # None, not 512). A bare ``setup`` re-run must NOT clobber a coin type a
+    # previous ``setup --coin-type 0`` recorded — it just reports the current
+    # value. The effective coin type shown/emitted is the chosen value, else
+    # the existing config value.
+    chosen_coin_type = int(coin_type) if coin_type is not None else None
+    coin_type_int = chosen_coin_type if chosen_coin_type is not None else ctx.config.coin_type
+
     # 1. Config file presence.
     config_path = _config.DEFAULT_CONFIG_PATH
     config_existed = config_path.exists()
     if not config_existed:
         if no_interactive:
-            written = _config.write_default()
+            written = _config.write_default(coin_type=coin_type_int)
             click.echo(f"wrote default config to {written}") if ctx.output_mode == "human" else None
         else:
             click.echo(f"\nNo config at {config_path}.")
             if click.confirm("Create one with built-in defaults?", default=True):
-                written = _config.write_default()
+                written = _config.write_default(coin_type=coin_type_int)
                 click.echo(f"  wrote {written}")
+    elif chosen_coin_type is not None:
+        # Config exists and the user explicitly chose a coin type — update only
+        # that key in place. This is the path that makes `setup --coin-type 0`
+        # on an existing install stick, without disturbing other keys. A bare
+        # `setup` (chosen is None) leaves the file untouched.
+        _config.set_coin_type(chosen_coin_type, config_path)
 
     # 2. Node probe.
     has_node = _probe_local_node()
@@ -103,6 +146,8 @@ def setup_cmd(ctx: CliContext, no_interactive: bool) -> None:
         "electrumx_reachable": has_electrumx,
         "wallet_path": str(wallet_path),
         "wallet_exists": has_wallet,
+        "coin_type": coin_type_int,
+        "derivation_path": f"m/44'/{coin_type_int}'/0'",
     }
 
     if ctx.output_mode == "json":
@@ -121,6 +166,7 @@ def setup_cmd(ctx: CliContext, no_interactive: bool) -> None:
     click.echo(f"  node:      {_NODE_PROBE_HOST}:{_NODE_PROBE_PORT} {'reachable' if has_node else 'NOT reachable'}")
     click.echo(f"  electrumx: {ctx.electrumx_url} {'reachable' if has_electrumx else 'NOT reachable'}")
     click.echo(f"  wallet:    {wallet_path} {'(exists)' if has_wallet else '(missing)'}")
+    click.echo(f"  coin type: {coin_type_int}  (new wallets derive at m/44'/{coin_type_int}'/0')")
 
     next_steps: list[str] = []
     if not has_electrumx and not has_node:

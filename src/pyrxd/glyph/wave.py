@@ -311,26 +311,40 @@ def classify_glyph_metadata(metadata: GlyphMetadata) -> str:
         ``[NFT, MUT, WAVE]`` without attrs.name → ``"mut"`` (legacy, won't resolve)
         ``[NFT, MUT, CONTAINER]`` → ``"container"``
         ``[NFT, MUT]`` → ``"mut"``
+        ``[NFT, AUTHORITY]`` → ``"authority"``
+        ``[NFT, ENCRYPTED, TIMELOCK]`` → ``"timelock"``
         ``[NFT, ENCRYPTED]`` → ``"encrypted"``
         ``[NFT]`` → ``"nft"``
         ``[FT, DMINT]`` → ``"dmint"``
         ``[FT]`` → ``"ft"``
+        ``[DAT]`` → ``"dat"``
 
     The string mirrors :attr:`GlyphOutput.glyph_type` values where applicable,
     with extensions for the metadata-only types that scripts alone can't
-    distinguish (WAVE/CONTAINER/ENCRYPTED share script templates with MUT/NFT).
+    distinguish (WAVE/CONTAINER/ENCRYPTED/TIMELOCK/AUTHORITY share script
+    templates with MUT/NFT, and DAT is data-only).
+
+    Ordering is highest-specificity-first: TIMELOCK is checked before
+    ENCRYPTED (TIMELOCK *requires* ENCRYPTED per the protocol rules in
+    :mod:`~pyrxd.glyph.types`, so a timelocked token always carries both).
     """
     p = set(metadata.protocol)
     if GlyphProtocol.WAVE in p and wave_attrs_from_metadata(metadata) is not None:
         return "wave"
     if GlyphProtocol.CONTAINER in p:
         return "container"
+    if GlyphProtocol.AUTHORITY in p:
+        return "authority"
+    if GlyphProtocol.TIMELOCK in p:
+        return "timelock"
     if GlyphProtocol.ENCRYPTED in p:
         return "encrypted"
     if GlyphProtocol.DMINT in p:
         return "dmint"
     if GlyphProtocol.MUT in p:
         return "mut"
+    if GlyphProtocol.DAT in p:
+        return "dat"
     if GlyphProtocol.FT in p:
         return "ft"
     if GlyphProtocol.NFT in p:

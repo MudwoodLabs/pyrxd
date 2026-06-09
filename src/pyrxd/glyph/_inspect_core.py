@@ -39,6 +39,7 @@ from ..hash import hash256
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from ..transaction.transaction import Transaction
+from .types import GlyphProtocol
 
 # --- Length / shape constants ----------------------------------------------
 #
@@ -321,6 +322,53 @@ def _inspect_script(script_hex: str) -> dict:
     }
 
 
+def _classify_metadata_protocol(metadata) -> str:
+    """Return the highest-specificity Glyph-protocol classification label.
+
+    Pure, self-contained mirror of
+    :func:`pyrxd.glyph.wave.classify_glyph_metadata`, duplicated here on
+    purpose: ``wave.py`` is **not** import-pure (its module-level
+    ``WaveResolverError`` definition pulls in ``pyrxd.network.rxindexer``,
+    which transitively drags ``aiohttp`` / ``websockets`` / ``coincurve``).
+    Importing it — even lazily — would defeat this module's Pyodide
+    no-heavy-deps contract (see the module docstring). The two functions
+    must stay in sync; the shared classification rules are exercised by the
+    test suite against both.
+
+    Operates on a parsed :class:`~pyrxd.glyph.types.GlyphMetadata` so the
+    WAVE case can require a resolvable ``attrs.name`` (legacy top-level-name
+    WAVE tokens exist on-chain but RXinDexer won't index them, so they
+    classify as their underlying ``mut``).
+
+    Ordering is highest-specificity-first; TIMELOCK is checked before
+    ENCRYPTED because TIMELOCK *requires* ENCRYPTED (see the protocol rules
+    in :mod:`~pyrxd.glyph.types`), so a timelocked token always carries both.
+    """
+    p = set(metadata.protocol)
+    has_wave_name = bool(metadata.attrs and metadata.attrs.get("name"))
+    if GlyphProtocol.WAVE in p and has_wave_name:
+        return "wave"
+    if GlyphProtocol.CONTAINER in p:
+        return "container"
+    if GlyphProtocol.AUTHORITY in p:
+        return "authority"
+    if GlyphProtocol.TIMELOCK in p:
+        return "timelock"
+    if GlyphProtocol.ENCRYPTED in p:
+        return "encrypted"
+    if GlyphProtocol.DMINT in p:
+        return "dmint"
+    if GlyphProtocol.MUT in p:
+        return "mut"
+    if GlyphProtocol.DAT in p:
+        return "dat"
+    if GlyphProtocol.FT in p:
+        return "ft"
+    if GlyphProtocol.NFT in p:
+        return "nft"
+    return "unknown"
+
+
 def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None) -> dict:
     """Classify every output (and reveal CBOR) for a pre-fetched transaction.
 
@@ -436,6 +484,12 @@ def _classify_raw_tx(txid_hex: str, raw: bytes, *, only_vout: int | None = None)
         metadata_payload = {
             "input_index": input_idx,
             "protocol": [_sanitize_display_string(str(p)) for p in metadata.protocol],
+            # Human-friendly highest-specificity protocol label (e.g. "wave",
+            # "container", "timelock", "authority", "dat"). Computed from the
+            # real GlyphMetadata so the WAVE case can require a resolvable
+            # attrs.name. The label is drawn from a fixed internal vocabulary,
+            # not user-controllable CBOR text, so no sanitization is needed.
+            "classification": _classify_metadata_protocol(metadata),
             "name": _sanitize_display_string(metadata.name) if metadata.name else "",
             "ticker": _sanitize_display_string(metadata.ticker) if metadata.ticker else "",
             "description": _sanitize_display_string(metadata.description) if metadata.description else "",

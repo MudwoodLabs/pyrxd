@@ -82,7 +82,11 @@ class JsonDirRecordStore:
                 "report 0 swaps as healthy"
             )
         out: list[tuple[str, SwapRecord]] = []
-        paths = sorted(self._dir.glob("*.json"))
+        # Exclude v2 pre-signed-refund sidecars (``<swap_id>.refund.json``): they live beside the
+        # records (the default --refund-blobs-dir) and are NOT SwapRecords, so counting them here would
+        # spam per-tick "unreadable record" warnings and could trip the all-unreadable "watching nothing"
+        # page. They are loaded separately, keyed by swap_id, in the executor.
+        paths = [p for p in sorted(self._dir.glob("*.json")) if not p.name.endswith(".refund.json")]
         failed = 0
         for path in paths:
             try:
@@ -172,6 +176,16 @@ class OutspendBtcClaimSource:
 
     async def confirmations(self, claim_txid: str) -> int:
         return int(await self._reader.confirmations(claim_txid))
+
+    async def funding_confirmations(self, funding_txid: str) -> int | None:
+        """Funding-tx depth via the SAME quorum reader (conservative min). Returns ``None`` if the read
+        fails (down/unknown) so decide() fails closed (no autonomous refund) instead of guessing — a
+        genuine 0 (unconfirmed) is returned as 0 and the maturity gate keeps watching."""
+        try:
+            return int(await self._reader.confirmations(funding_txid))
+        except Exception:
+            logger.debug("funding-depth read failed for %s", funding_txid, exc_info=True)
+            return None
 
 
 async def mempool_space_outspend(

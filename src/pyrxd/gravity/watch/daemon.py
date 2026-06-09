@@ -14,6 +14,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+from pyrxd.gravity.watch.executor import ExecOutcome
 from pyrxd.gravity.watch.reconciler import Reconciler, ReconcileResult
 from pyrxd.security.errors import ValidationError
 
@@ -42,21 +43,28 @@ def combine_heartbeats(*heartbeats: Heartbeat) -> Heartbeat:
 
 
 def default_heartbeat(log: logging.Logger | None = None) -> Heartbeat:
-    """A heartbeat that logs tick count, swaps watched, pages decided, and UNDELIVERED pages."""
+    """A heartbeat that logs tick count, swaps watched, pages decided, UNDELIVERED pages, and the v2
+    autonomous-execution outcomes (broadcast / failed)."""
     log = log or logger
 
     def _hb(iteration: int, results: list[ReconcileResult]) -> None:
         paged = sum(1 for r in results if r.decision.intent.value.startswith("page_"))
         undelivered = sum(1 for r in results if r.alert_delivered is False)
-        # An undelivered CRITICAL page must be LOUD, not buried in a healthy-looking INFO tick.
-        level = logging.ERROR if undelivered else logging.INFO
+        broadcast = sum(1 for r in results if r.executed is ExecOutcome.BROADCAST)
+        exec_failed = sum(1 for r in results if r.executed is ExecOutcome.FAILED)
+        # An undelivered CRITICAL page OR a FAILED autonomous broadcast must be LOUD, not buried in a
+        # healthy-looking INFO tick — so a persistently-failing broadcaster surfaces on the heartbeat,
+        # not only on the per-tick alerter page.
+        level = logging.ERROR if (undelivered or exec_failed) else logging.INFO
         log.log(
             level,
-            "watchtower heartbeat: tick=%d swaps=%d paged=%d undelivered=%d",
+            "watchtower heartbeat: tick=%d swaps=%d paged=%d undelivered=%d broadcast=%d exec_failed=%d",
             iteration,
             len(results),
             paged,
             undelivered,
+            broadcast,
+            exec_failed,
         )
 
     return _hb

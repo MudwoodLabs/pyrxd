@@ -101,6 +101,11 @@ def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool, no_clipbo
     entropy_n = 16 if word_count == 12 else 32
     mnemonic = mnemonic_from_entropy(secure_random_bytes(entropy_n))
 
+    # Derive at the coin type recorded in config (written by `setup
+    # --coin-type`). Defaults to 512 (SLIP-0044). Persisted into the
+    # wallet file by HdWallet so later `load` calls derive the same path.
+    coin_type = ctx.config.coin_type
+
     # In JSON mode: emit the mnemonic as JSON without the gate. The user
     # passed --yes deliberately, so we trust them. In any other mode,
     # show the box + Enter gate.
@@ -108,7 +113,7 @@ def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool, no_clipbo
         passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default, not a hardcoded secret
         if passphrase:
             passphrase_str = prompt_passphrase_input(optional=True)
-        wallet = HdWallet.from_mnemonic(mnemonic, passphrase=passphrase_str)
+        wallet = HdWallet.from_mnemonic(mnemonic, passphrase=passphrase_str, coin_type=coin_type)
         wallet.save(ctx.wallet_path)
         click.echo(
             emit(
@@ -116,6 +121,8 @@ def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool, no_clipbo
                     "mnemonic": mnemonic,
                     "wallet_path": str(ctx.wallet_path),
                     "address": wallet.next_receive_address(),
+                    "coin_type": wallet.coin_type,
+                    "path": f"m/44'/{wallet.coin_type}'/{wallet.account}'",
                 },
                 mode="json",
             )
@@ -134,7 +141,7 @@ def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool, no_clipbo
     passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default, not a hardcoded secret
     if passphrase:
         passphrase_str = prompt_passphrase_input(optional=True)
-    wallet = HdWallet.from_mnemonic(mnemonic, passphrase=passphrase_str)
+    wallet = HdWallet.from_mnemonic(mnemonic, passphrase=passphrase_str, coin_type=coin_type)
     wallet.save(ctx.wallet_path)
     next_addr = wallet.next_receive_address()
 
@@ -144,6 +151,7 @@ def wallet_new(ctx: CliContext, mnemonic_words: str, passphrase: bool, no_clipbo
 
     click.echo("")
     click.echo(f"Wallet saved to {ctx.wallet_path}")
+    click.echo(f"Derivation path: m/44'/{wallet.coin_type}'/{wallet.account}'")
     click.echo(f"First receive address: {next_addr}")
 
 
@@ -217,7 +225,7 @@ def wallet_load(ctx: CliContext, passphrase: bool) -> None:
 def wallet_export_xpub(ctx: CliContext, passphrase: bool) -> None:
     """Print the account-level xpub for watch-only / recipient use.
 
-    The xpub at ``m/44'/512'/<account>'`` lets external tools generate
+    The xpub at ``m/44'/<coin_type>'/<account>'`` lets external tools generate
     receive addresses for this wallet without ever seeing the seed.
     Safe to share with watch-only services or merchant integrations.
     No private key material is exported.
@@ -245,14 +253,14 @@ def wallet_export_xpub(ctx: CliContext, passphrase: bool) -> None:
     payload = {
         "xpub": str(xpub),
         "account": wallet.account,
-        "path": f"m/44'/512'/{wallet.account}'",
+        "path": f"m/44'/{wallet.coin_type}'/{wallet.account}'",
     }
     if ctx.output_mode == "json":
         click.echo(emit(payload, mode="json"))
     elif ctx.output_mode == "quiet":
         click.echo(emit(payload, mode="quiet", quiet_field="xpub"))
     else:
-        click.echo(f"\nxpub at m/44'/512'/{wallet.account}':")
+        click.echo(f"\nxpub at m/44'/{wallet.coin_type}'/{wallet.account}':")
         click.echo(f"  {xpub}")
         click.echo("\nThis xpub lets external tools generate receive addresses")
         click.echo("for this wallet WITHOUT seeing the seed. Safe to share with")

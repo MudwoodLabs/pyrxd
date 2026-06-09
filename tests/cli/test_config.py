@@ -76,6 +76,66 @@ def test_write_default_creates_dir_with_correct_perms(tmp_path: Path) -> None:
     assert cfg.network == "mainnet"
 
 
+def test_coin_type_defaults_to_512(tmp_path: Path) -> None:
+    cfg = _config.load(tmp_path / "absent.toml")
+    assert cfg.coin_type == 512
+
+
+def test_coin_type_from_file(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('network = "mainnet"\ncoin_type = 0\n')
+    cfg = _config.load(cfg_file)
+    # coin_type 0 (legacy Bitcoin-compatible) must survive — it is falsy and a
+    # naive ``or`` chain would silently reset it to the 512 default.
+    assert cfg.coin_type == 0
+
+
+def test_coin_type_env_overrides_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text("coin_type = 512\n")
+    monkeypatch.setenv("PYRXD_COIN_TYPE", "236")
+    cfg = _config.load(cfg_file)
+    assert cfg.coin_type == 236
+
+
+def test_write_default_records_coin_type(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    _config.write_default(target, coin_type=0)
+    cfg = _config.load(target)
+    assert cfg.coin_type == 0
+
+
+def test_set_coin_type_creates_when_missing(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    _config.set_coin_type(0, target)
+    assert _config.load(target).coin_type == 0
+
+
+def test_set_coin_type_updates_in_place(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    target.write_text('network = "testnet"\nfee_rate = 5000\ncoin_type = 512\n')
+    _config.set_coin_type(236, target)
+    cfg = _config.load(target)
+    # Only coin_type changed; the other keys are preserved verbatim.
+    assert cfg.coin_type == 236
+    assert cfg.network == "testnet"
+    assert cfg.fee_rate == 5000
+
+
+def test_set_coin_type_appends_when_key_absent(tmp_path: Path) -> None:
+    target = tmp_path / "config.toml"
+    target.write_text('network = "mainnet"\n')
+    _config.set_coin_type(0, target)
+    assert _config.load(target).coin_type == 0
+
+
+def test_for_network_preserves_coin_type(tmp_path: Path) -> None:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('network = "mainnet"\ncoin_type = 0\n[networks.testnet]\nfee_rate = 1\n')
+    cfg = _config.load(cfg_file)
+    assert cfg.for_network("testnet").coin_type == 0
+
+
 def test_tomllib_is_available_at_module_load() -> None:
     """The `config` module must successfully import a TOML reader regardless
     of Python version. On 3.11+ the stdlib ``tomllib`` resolves; on 3.10 the

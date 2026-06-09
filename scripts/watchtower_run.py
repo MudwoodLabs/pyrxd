@@ -13,6 +13,8 @@ Backends:
               ``get_transaction_verbose(txid)`` via :func:`build_reconciler`.
 * BTC depth — ``MultiSourceBtcFundingReader`` (2-of-3 Esplora, conservative min depth).
 * BTC claim — mempool.space ``/outspend`` (detect the maker's claim of the HTLC outpoint).
+* ETH       — optional ``--eth-rpc-url`` (+ ``--eth-chain-id``): a keyless, read-only RPC to watch
+              RXD<->ETH swaps (detect the maker's ``Claimed`` event, finalized-checkpoint verdict).
 
 Example:
     python scripts/watchtower_run.py \
@@ -34,6 +36,7 @@ import signal
 
 import aiohttp
 
+from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.watch import (
@@ -41,18 +44,22 @@ from pyrxd.gravity.watch import (
     CompositeAlertChannel,
     DedupAlerter,
     ElectrumRxdChainSource,
+    Executor,
     FileHeartbeat,
     JsonDirRecordStore,
     LoggingAlertChannel,
     OutspendBtcClaimSource,
     Reconciler,
+    RefundExecutor,
+    RpcEthChainSource,
     WebhookAlertChannel,
     combine_heartbeats,
     default_heartbeat,
+    make_refund_broadcaster,
     mempool_space_outspend,
     run_loop,
 )
-from pyrxd.network.bitcoin import MultiSourceBtcFundingReader
+from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MempoolSpaceFundingReader, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
 
 logger = logging.getLogger("pyrxd.watchtower")
@@ -68,8 +75,15 @@ def build_reconciler(
     policy: MarginPolicy,
     safety_window_blocks: int,
     alert_channel,
+    eth_source=None,
+    executor: Executor | None = None,
 ) -> Reconciler:
-    """Compose the real ports into a Reconciler (pure wiring — no network at call time)."""
+    """Compose the real ports into a Reconciler (pure wiring — no network at call time).
+
+    ``eth_source`` (an :class:`RpcEthChainSource`, optional) adds the ETH counter-leg watch path so a
+    records dir holding RXD↔ETH swaps is observed too (``None`` → ETH swaps fail closed, paging).
+    ``executor`` (an :class:`RefundExecutor`, optional) adds the v2 autonomous-refund path; ``None`` →
+    a no-op ``NullExecutor`` → ALERT-ONLY, byte-identical to v1."""
     store = JsonDirRecordStore(records_dir)
     rxd_source = ElectrumRxdChainSource(rxd_client)
 
@@ -83,7 +97,8 @@ def build_reconciler(
 
     outspend_fns = [_make_outspend(u) for u in mempool_base_urls]
     btc_source = OutspendBtcClaimSource(outspend_fns=outspend_fns, funding_reader=btc_funding_reader)
-    observer = ChainObserver(btc=btc_source, rxd=rxd_source, rxd_corroborated=False)  # v1: RXD single-source
+    # v1/v3: RXD (and the single ETH RPC, if any) are single-source → every page is low-corroboration.
+    observer = ChainObserver(btc=btc_source, eth=eth_source, rxd=rxd_source, rxd_corroborated=False)
     alerter = DedupAlerter(channel=alert_channel)
     return Reconciler(
         store=store,
@@ -91,7 +106,74 @@ def build_reconciler(
         alerter=alerter,
         policy=policy,
         safety_window_blocks=safety_window_blocks,
+        executor=executor,
     )
+
+
+# mempool.space POST bases per network (the value-moving edge for an armed dust run). regtest/custom
+# nodes pass --btc-broadcast-url. Constructed ONLY inside the cleared branch (no eager live wire).
+_MEMPOOL_BASE = {
+    "bc": "https://mempool.space/api",
+    "signet": "https://mempool.space/signet/api",
+    "tb": "https://mempool.space/testnet/api",
+}
+
+
+def _build_executor(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> Executor | None:
+    """The optional v2 autonomous-refund executor. Returns ``None`` (→ ALERT-ONLY) unless ``--refund-spk``
+    is given. DORMANT-by-construction on a value-bearing network without ``--audit-cleared``: the broadcast
+    sink is built ONLY in the cleared branch, and :func:`make_refund_broadcaster` returns ``None`` otherwise,
+    so the executor declines + pages (broadcasts nothing)."""
+    if not args.refund_spk:
+        return None
+    try:
+        refund_spk = bytes.fromhex(args.refund_spk.removeprefix("0x"))
+    except ValueError as exc:
+        raise SystemExit("--refund-spk must be hex (the operator's pinned refund scriptPubKey)") from exc
+    cleared = args.network in AUDIT_CLEARED_NETWORKS or args.audit_cleared
+    sink = None
+    if cleared:  # construct the live wire ONLY when this network is (or is opted-in as) cleared
+        base = args.btc_broadcast_url or _MEMPOOL_BASE.get(args.network)
+        if not base:
+            raise SystemExit(f"--btc-broadcast-url is required to arm autonomy on network {args.network!r}")
+        sink = MempoolSpaceBroadcaster(base_url=base)
+        stack.push_async_callback(sink.close)  # close the lazily-opened aiohttp session on exit
+    broadcaster = make_refund_broadcaster(args.network, audit_cleared=args.audit_cleared, broadcaster=sink)
+    executor = RefundExecutor(
+        broadcaster=broadcaster,
+        blobs_dir=args.refund_blobs_dir or args.records_dir,
+        network=args.network,
+        cap_sats=args.autonomous_refund_cap_sats,
+        refund_spk=refund_spk,
+        accept_single_source=args.accept_single_source,
+    )
+    if broadcaster is not None:
+        logger.warning(
+            "AUTONOMOUS REFUND ARMED on %s (cap=%d sats, dust-capped%s) — will BROADCAST operator-pre-signed "
+            "refunds; external audit is the gate before any non-dust use",
+            args.network,
+            args.autonomous_refund_cap_sats,
+            ", single-source accepted" if args.accept_single_source else "",
+        )
+    else:
+        logger.info(
+            "autonomous refund DORMANT on %s (not audit-cleared) — ALERT-ONLY, broadcasts nothing", args.network
+        )
+    return executor
+
+
+def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> MultiSourceBtcFundingReader:
+    """The BTC funding-depth + claim-depth reader, NETWORK-AWARE. Mainnet uses the three default 2-of-3
+    Esplora endpoints. Any other network (signet/testnet) builds from the configured --mempool-base-url /
+    --esplora-url, which MUST be that network's Esplora (e.g. ``https://mempool.space/signet``): the
+    funding-reader API base is that base + ``/api`` (the outspend path appends ``/api/tx/...`` to the bare
+    base). A single-source network clamps the quorum to the source count (signet is typically 1-of-1).
+    A wrong/mainnet base on a signet run reads the wrong chain → the funding is never found → the maturity
+    gate stays WATCH (fail-closed, never a wrongful broadcast)."""
+    if network == "bc":
+        return MultiSourceBtcFundingReader.default_mainnet(quorum=quorum)
+    readers = [MempoolSpaceFundingReader(base_url=u.rstrip("/") + "/api") for u in esploras]
+    return MultiSourceBtcFundingReader(readers, quorum=min(quorum, len(readers)), dust_cap_sats=10_000)
 
 
 async def _build_rxd_client(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
@@ -106,6 +188,28 @@ async def _build_rxd_client(args: argparse.Namespace, stack: contextlib.AsyncExi
     return await stack.enter_async_context(
         ElectrumXClient([args.rxd_electrumx_url], allow_insecure=args.allow_insecure)
     )
+
+
+async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
+    """Optional ETH counter-leg source (alert-only v3): a keyless, read-only ``RpcEthChainSource``
+    over ``EthRpc``. Returns ``None`` when ``--eth-rpc-url`` is unset (a BTC-only tower). Fails closed
+    on a wrong network (``assert_chain``) so the tower never watches the wrong chain, and registers
+    the RPC's ``close()`` on the exit stack. No key, no broadcast — read-only observation only."""
+    if not args.eth_rpc_url:
+        return None
+    if not args.eth_chain_id:
+        raise SystemExit("--eth-chain-id is required with --eth-rpc-url")
+    from pyrxd.eth_wallet.rpc import EthRpc
+
+    rpc = EthRpc(args.eth_rpc_url, expected_chain_id=args.eth_chain_id)
+    stack.push_async_callback(rpc.close)
+    await rpc.assert_chain()  # fail closed if the endpoint is not the negotiated chain
+    logger.info(
+        "ETH counter-leg watch ENABLED: rpc=%s chain_id=%d (read-only, no key, single-source → low-corroboration)",
+        args.eth_rpc_url,
+        args.eth_chain_id,
+    )
+    return RpcEthChainSource(rpc)
 
 
 def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
@@ -160,6 +264,52 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--webhook-secret", help="optional HMAC-SHA256 secret -> X-Watchtower-Signature header")
     # #2 dead-man's switch: write a liveness file each tick (watched by watchtower_deadman.py)
     p.add_argument("--heartbeat-file", help="write a liveness heartbeat here each tick")
+    # ETH counter-leg (alert-only v3): watch RXD↔ETH swaps too. Read-only, no key, never touches p.
+    p.add_argument(
+        "--eth-rpc-url",
+        help="Ethereum RPC URL to watch RXD<->ETH swaps (read-only; enables the ETH counter-leg source). "
+        "Single-source in v1 → ETH pages are low-corroboration. Requires --eth-chain-id.",
+    )
+    p.add_argument(
+        "--eth-chain-id",
+        type=int,
+        help="expected EIP-155 chain id for --eth-rpc-url (e.g. 1 mainnet, 11155111 Sepolia); "
+        "the tower fails closed if the endpoint reports a different chain",
+    )
+    # v2 AUTONOMOUS refund (opt-in; DORMANT on a value-bearing network without --audit-cleared). Without
+    # --refund-spk the tower is ALERT-ONLY (broadcasts nothing), byte-identical to v1.
+    p.add_argument(
+        "--network",
+        default="bc",
+        help="BTC network the tower acts on (bc/signet/tb/bcrt); autonomy is DORMANT on a value-bearing network without --audit-cleared",
+    )
+    p.add_argument(
+        "--refund-spk",
+        help="hex scriptPubKey of YOUR refund address — REQUIRED to arm autonomous refunds; every pre-signed "
+        "refund's output must pay exactly this (a tampered on-disk blob paying elsewhere is refused)",
+    )
+    p.add_argument(
+        "--audit-cleared",
+        action="store_true",
+        help="explicit opt-in to arm autonomy on a value-bearing network (a deliberate, dust-capped run; an "
+        "external audit is the gate for any non-dust use)",
+    )
+    p.add_argument(
+        "--autonomous-refund-cap-sats",
+        type=int,
+        default=10_000,
+        help="max per-swap sats to auto-refund (hard-bound to the dust ceiling on a value-bearing network)",
+    )
+    p.add_argument(
+        "--refund-blobs-dir", help="dir of <swap_id>.refund.json pre-signed refund blobs (default: --records-dir)"
+    )
+    p.add_argument("--btc-broadcast-url", help="mempool.space-style POST base for the armed broadcast (regtest/custom)")
+    p.add_argument(
+        "--accept-single-source",
+        action="store_true",
+        help="permit an autonomous refund on a single-source (low-corroboration) read — required for a dust run "
+        "until a multi-source RXD quorum lands",
+    )
     return p.parse_args(argv)
 
 
@@ -191,7 +341,9 @@ async def _amain(argv=None) -> int:
     # Independent Esplora set for multi-source claim DETECTION (dedup, preserve order). Default a
     # free second source so corroboration is ON out of the box (red-team MEDIUM).
     esploras = [args.mempool_base_url, *(args.esplora_url or [])]
-    if len(esploras) == 1 and "blockstream.info" not in args.mempool_base_url:
+    # blockstream.info is a MAINNET endpoint — only auto-add it on mainnet (a signet/testnet run must
+    # point --mempool-base-url at that network's Esplora, e.g. https://mempool.space/signet).
+    if args.network == "bc" and len(esploras) == 1 and "blockstream.info" not in args.mempool_base_url:
         esploras.append("https://blockstream.info")
     _seen: set[str] = set()
     esploras = [u for u in esploras if not (u in _seen or _seen.add(u))]
@@ -205,10 +357,12 @@ async def _amain(argv=None) -> int:
             "one before relying on this tower."
         )
 
-    reader = MultiSourceBtcFundingReader.default_mainnet(quorum=args.quorum)
+    reader = _build_funding_reader(args.network, esploras, args.quorum)
     async with contextlib.AsyncExitStack() as stack:
         http_session = await stack.enter_async_context(aiohttp.ClientSession())
         rxd_client = await _build_rxd_client(args, stack)
+        eth_source = await _build_eth_source(args, stack)
+        executor = _build_executor(args, stack)  # None → ALERT-ONLY; armed only on a cleared network
         reconciler = build_reconciler(
             records_dir=args.records_dir,
             rxd_client=rxd_client,
@@ -218,6 +372,8 @@ async def _amain(argv=None) -> int:
             policy=policy,
             safety_window_blocks=args.safety_window_blocks,
             alert_channel=_build_alert_channel(args, http_session),
+            eth_source=eth_source,
+            executor=executor,
         )
         heartbeat = default_heartbeat(logger)
         if args.heartbeat_file:
@@ -228,12 +384,19 @@ async def _amain(argv=None) -> int:
             if args.rxd_backend == "electrumx"
             else f"ssh-tr:{args.ssh_host}/{args.ssh_container}"
         )
+        mode = (
+            "autonomy configured (armed/dormant per the status line above)"
+            if executor is not None
+            else "ALERT-ONLY (broadcasts nothing)"
+        )
         logger.info(
-            "watchtower started: records=%s rxd=%s mempool=%s poll=%.0fs (ALERT-ONLY — broadcasts nothing)",
+            "watchtower started: records=%s rxd=%s mempool=%s poll=%.0fs network=%s — %s",
             args.records_dir,
             rxd_desc,
             args.mempool_base_url,
             args.poll_interval_s,
+            args.network,
+            mode,
         )
         ticks = await run_loop(
             reconciler,

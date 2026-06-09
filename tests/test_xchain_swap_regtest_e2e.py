@@ -57,6 +57,10 @@ from pyrxd.gravity.htlc_spend import FeeInput
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
+from pyrxd.gravity.watch.alerts import DedupAlerter, Page, Severity
+from pyrxd.gravity.watch.decide import Intent
+from pyrxd.gravity.watch.quorum import BtcClaimStatus, ChainObserver
+from pyrxd.gravity.watch.reconciler import Reconciler
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
 from pyrxd.script.script import Script
@@ -604,3 +608,447 @@ class TestCrossChainSwap:
 
         rxd_spent = nodes.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
         assert rxd_spent in (None, ""), "taker should have recovered the RXD asset (covenant spent)"
+
+
+# --------------------------------------------------------------------------- watchtower observation
+#
+# The alert-only watchtower (v1) watches the SAME regtest swap the coordinator drives and PAGES the
+# operator with the due action — it broadcasts nothing, holds no key, never touches p. These thin,
+# READ-ONLY chain sources back the PRODUCTION ChainObserver against the two regtest nodes; decide(),
+# ChainObserver and DedupAlerter all run UNCHANGED, so a green run proves the real decision core emits
+# the correct Intent on real consensus (not a fake).
+#
+#   * _RegtestBtcClaimSource — maker-claim detection (is the HTLC funding outpoint spent?) + the
+#     claim's confirmation depth (the reorg-gate input), both derived purely from block data.
+#   * _RegtestRxdChainSource — RXD tip + covenant confirmation depth (→ asset-lock height).
+#
+# Estimated policy (the harness default): btc_claim_reorg_depth = rxd_claim_burial = 6, safety window
+# = 6, so the gate reduces to blocks_left = t_rxd - cov_confs + 1, where a SAFE claim needs the BTC
+# claim >= 6 deep AND blocks_left >= 6; a shallow claim WAITs only while blocks_left >= 18, else
+# SQUEEZES; a maker stall pages a refund once blocks_left <= 6.
+
+
+def _find_btc_spender(nodes: _Nodes, funding_txid: str, vout: int) -> str | None:
+    """The txid that spent ``funding_txid:vout`` (the maker's claim), found purely from block data —
+    no reliance on the broadcaster's memory or an address index (regtest has no Esplora outspend)."""
+    info = nodes.btc("getrawtransaction", funding_txid, "true")
+    bh = info.get("blockhash") if isinstance(info, dict) else None
+    start = int(nodes.btc("getblock", bh)["height"]) if bh else 0
+    tip = int(nodes.btc("getblockcount"))
+    for h in range(start, tip + 1):
+        blk = nodes.btc("getblock", str(nodes.btc("getblockhash", str(h))), "2")
+        for tx in blk.get("tx", []):
+            for vin in tx.get("vin", []):
+                if vin.get("txid") == funding_txid and int(vin.get("vout", -1)) == vout:
+                    return str(tx["txid"])
+    return None
+
+
+class _RegtestBtcClaimSource:
+    """``BtcClaimSource`` backed by the regtest bitcoind (read-only)."""
+
+    def __init__(self, nodes: _Nodes) -> None:
+        self._n = nodes
+
+    async def claim_status(self, funding_txid: str, funding_vout: int) -> BtcClaimStatus:
+        utxo = self._n.btc("gettxout", funding_txid, str(funding_vout))
+        if isinstance(utxo, dict):  # still in the UTXO set -> unspent -> maker has NOT claimed
+            return BtcClaimStatus(claimed=False)
+        spender = _find_btc_spender(self._n, funding_txid, funding_vout)
+        if spender is None:
+            # Spent but the spender is unfindable: surface it so the gate fails closed, rather than
+            # reporting "not claimed" (which would silently drop a revealed swap into WATCH).
+            raise NetworkError(f"funding {funding_txid}:{funding_vout} is spent but its spender was not found")
+        return BtcClaimStatus(claimed=True, claim_txid=spender)
+
+    async def confirmations(self, claim_txid: str) -> int:
+        info = self._n.btc("getrawtransaction", claim_txid, "true")
+        return int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else 0
+
+    async def funding_confirmations(self, funding_txid: str) -> int | None:
+        info = self._n.btc("getrawtransaction", funding_txid, "true")
+        return int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else None
+
+
+class _RegtestRxdChainSource:
+    """``RxdChainSource`` backed by the regtest radiantd (single-source → low-corroboration in v1)."""
+
+    def __init__(self, nodes: _Nodes) -> None:
+        self._n = nodes
+
+    async def tip_height(self) -> int:
+        return int(self._n.rxd("getblockcount"))
+
+    async def covenant_confirmations(self, outpoint: str) -> int | None:
+        info = self._n.rxd("getrawtransaction", outpoint.split(":")[0], "true")
+        confs = int(info.get("confirmations", 0) or 0) if isinstance(info, dict) else 0
+        return confs if confs >= 1 else None
+
+
+class _LiveRecordStore:
+    """Feeds the coordinator's LIVE record to the reconciler each tick (read-only; v1 never writes)."""
+
+    def __init__(self, coord: SwapCoordinator, swap_id: str = "wt-e2e") -> None:
+        self._coord = coord
+        self._id = swap_id
+
+    async def list_active(self) -> list[tuple[str, SwapRecord]]:
+        return [(self._id, self._coord.record)]
+
+
+class _RecordingChannel:
+    """Captures delivered Pages so the test can assert the alert payload (the shell's real channel
+    is authenticated; here we only need to observe what the alerter routed)."""
+
+    def __init__(self) -> None:
+        self.pages: list[Page] = []
+
+    async def send(self, page: Page) -> None:
+        self.pages.append(page)
+
+
+def _watchtower(nodes: _Nodes, coord: SwapCoordinator) -> tuple[Reconciler, _RecordingChannel]:
+    """Wire the PRODUCTION reconciler (real decide/ChainObserver/DedupAlerter) to observe ``coord``'s
+    swap on the two regtest nodes, with the SAME policy + safety window the coordinator runs."""
+    channel = _RecordingChannel()
+    reconciler = Reconciler(
+        store=_LiveRecordStore(coord),
+        observer=ChainObserver(
+            btc=_RegtestBtcClaimSource(nodes),
+            rxd=_RegtestRxdChainSource(nodes),
+            rxd_corroborated=False,  # v1: RXD is single-source → every page is flagged low-corroboration
+        ),
+        alerter=DedupAlerter(channel=channel),
+        policy=coord.config.margin_policy,
+        safety_window_blocks=coord.config.maker_stall_safety_window_blocks,
+    )
+    return reconciler, channel
+
+
+class TestWatchtowerIntentSequence:
+    """The alert-only watchtower observes the regtest swap the coordinator drives and emits the
+    correct Intent SEQUENCE for happy / reorg-WAIT / maker-stall / SQUEEZED — and NEVER pages
+    PAGE_CLAIM against a WAIT/SQUEEZED gate verdict (plan AC 2026-06-03, :109). It broadcasts
+    nothing: the production decide()/ChainObserver/DedupAlerter run unchanged against real consensus
+    on both chains. (blocks_left = t_rxd - cov_confs + 1; estimated policy → reorg depth 6, burial 6,
+    safety window 6.)"""
+
+    async def _tick_one(self, reconciler: Reconciler):
+        results = await reconciler.tick()
+        assert len(results) == 1, "exactly one swap is being watched"
+        return results[0]
+
+    async def test_happy_path_watch_then_wait_then_page_claim(self, nodes):
+        """Wide t_rxd window: pre-reveal WATCH → maker reveals shallow (gate WAIT → still WATCH, the
+        headline 'never claim on a reorg-unsafe BTC claim' invariant) → bury deep (gate SAFE) →
+        PAGE_CLAIM with the deadline + the named coordinator step."""
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=60)
+        coord = s.coord
+        reconciler, channel = _watchtower(nodes, coord)
+        depth = coord.config.margin_policy.btc_claim_reorg_depth.value
+
+        # 1. Both legs locked, maker has not revealed p, deadline far → WATCH (no page).
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.WATCH
+        assert r.alert_delivered is None
+        assert channel.pages == []
+
+        # 2. Maker claims the BTC (reveals p); the broadcaster mines 1 block → ~1 conf, shallower
+        #    than the reorg-safe depth. The gate is WAIT → the tower must keep WATCHING and must NOT
+        #    page a claim on a reorg-unsafe BTC claim (the headline safety invariant).
+        rec = await coord.maker_claims_btc(s.p_secret)
+        assert rec.state is SwapState.SECRET_REVEALED
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.WATCH, "must not PAGE_CLAIM against a WAIT gate verdict"
+        assert channel.pages == []
+
+        # 3. Bury the BTC claim to the reorg-safe depth → gate SAFE → PAGE_CLAIM.
+        nodes.btc_mine(depth)
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.PAGE_CLAIM
+        assert r.decision.recommended_action == "taker_scrape_and_claim_asset"
+        assert r.decision.deadline_rxd_height is not None
+        assert r.alert_delivered is True
+        assert len(channel.pages) == 1
+        page = channel.pages[0]
+        assert page.intent is Intent.PAGE_CLAIM
+        assert page.severity is Severity.CRITICAL
+        assert page.low_corroboration is True  # RXD single-source in v1
+        assert page.deadline_rxd_height == r.decision.deadline_rxd_height
+
+        # Dedup: re-ticking the same SAFE situation does not re-page (still 1).
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.PAGE_CLAIM
+        assert len(channel.pages) == 1, "DedupAlerter must not re-page an unchanged situation"
+
+    async def test_maker_stall_watch_then_page_refund(self, nodes):
+        """Maker locks the asset then stalls (never reveals p). As t_rxd nears, the tower pages a
+        proactive asset refund (WARN — recoverable, not a race), naming the coordinator step."""
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=30)
+        coord = s.coord
+        reconciler, channel = _watchtower(nodes, coord)
+
+        # 1. Just locked: blocks_left = 30 (>> safety window 6) → WATCH.
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.WATCH
+        assert channel.pages == []
+
+        # 2. Advance RXD toward t_rxd maturity (cov_confs → 28 ⇒ blocks_left = 3 ≤ 6) → PAGE_REFUND.
+        nodes.rxd_mine(27)
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.PAGE_REFUND
+        assert r.decision.recommended_action == "maybe_refund_asset_on_maker_stall"
+        assert r.decision.deadline_rxd_height is not None
+        assert r.alert_delivered is True
+        assert len(channel.pages) == 1
+        assert channel.pages[0].severity is Severity.WARN  # a stall refund is recoverable, not a race
+        assert channel.pages[0].low_corroboration is True
+
+    async def test_reveal_with_closing_window_pages_squeezed(self, nodes):
+        """Tight t_rxd window + a shallow reveal: there is no longer room to wait for a reorg-safe
+        burial before the maker's CSV refund opens → the gate SQUEEZES → a decision-required
+        PAGE_SQUEEZED (winner-take-all vs accept loss), never a silent claim or a silent wait."""
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=10)
+        coord = s.coord
+        reconciler, channel = _watchtower(nodes, coord)
+
+        # 1. Pre-reveal, window not yet near → WATCH.
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.WATCH
+        assert channel.pages == []
+
+        # 2. Maker reveals p with ~1 conf and blocks_left = 10 (< the 18 a WAIT requires): SQUEEZED.
+        rec = await coord.maker_claims_btc(s.p_secret)
+        assert rec.state is SwapState.SECRET_REVEALED
+        r = await self._tick_one(reconciler)
+        assert r.decision.intent is Intent.PAGE_SQUEEZED
+        assert r.alert_delivered is True
+        assert len(channel.pages) == 1
+        assert channel.pages[0].intent is Intent.PAGE_SQUEEZED
+        assert channel.pages[0].severity is Severity.CRITICAL
+        assert channel.pages[0].low_corroboration is True
+
+
+# ---------------------------------------------------------------------------------------------------
+# v2 AUTONOMOUS refund (capped, keyless, dormant-by-construction) — REAL bitcoind consensus.
+#
+# Proves the two facts the pure/property suite cannot: (1) the production RefundExecutor broadcasts an
+# operator-PRE-SIGNED refund that actually SPENDS the funding outpoint on real consensus once the CSV
+# matures; (2) an EARLY broadcast is REJECTED by BIP68 (the consensus backstop the design relies on).
+# Through the real executor; it holds no key, never rebuilds, broadcasts only the stored bytes.
+# ---------------------------------------------------------------------------------------------------
+
+
+class TestWatchtowerAutonomousRefundRegtest:
+    async def test_auto_refund_spends_outpoint_after_maturity_and_early_is_rejected(self, nodes, tmp_path):
+        from pyrxd.gravity.watch import Decision, ExecOutcome, PresignedRefund, RefundExecutor
+
+        t_btc = bt.Timelock(6, bt.TimeUnit.BLOCKS)
+        t_rxd = bt.Timelock(3, bt.TimeUnit.BLOCKS)
+        h = hashlib.sha256(os.urandom(32)).digest()
+        maker_btc = coincurve.PrivateKey(os.urandom(32))
+        taker_kp = generate_keypair("bcrt")
+        refund_priv = bytes(taker_kp._privkey.unsafe_raw_bytes())
+        refund_xo = coincurve.PublicKeyXOnly.from_secret(refund_priv).format()
+        claim_xo = coincurve.PublicKeyXOnly.from_secret(maker_btc.secret).format()
+        htlc = bt.build_htlc(
+            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=t_btc, network="bcrt"
+        )
+
+        # Fund the HTLC address on bitcoind regtest, find the funding outpoint.
+        btc_sats = 200_000
+        nodes.btc("sendtoaddress", htlc.address, f"{btc_sats / 1e8:.8f}", wallet="btcw")
+        nodes.btc_mine(1)
+        scan = nodes.btc("scantxoutset", "start", json.dumps([{"desc": f"raw({htlc.scriptpubkey.hex()})"}]))
+        u = scan["unspents"][0]
+        loc = htlc.with_funding(bt.BtcOutpoint(u["txid"], int(u["vout"])), round(u["amount"] * 1e8))
+
+        # Operator pre-signs the refund (ONCE, online) to a fresh payout address; tower will pin this SPK.
+        dest = bytes.fromhex(
+            nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
+        )
+        raw = bt.build_refund_tx(
+            locator=loc,
+            refund_privkey=refund_priv,
+            timeout=t_btc,
+            to_scriptpubkey=dest,
+            fee_sats=2_000,
+            aux_rand=os.urandom(32),
+        )
+        blob = PresignedRefund(raw_tx=raw, swap_id="auto1")
+        (tmp_path / "auto1.refund.json").write_text(json.dumps(blob.to_dict()))
+
+        # (1) NEGATIVE — broadcasting BEFORE the CSV matures is rejected by BIP68 (consensus backstop).
+        with pytest.raises(RuntimeError) as ei:
+            nodes.btc("sendrawtransaction", raw.hex())
+        assert "non-BIP68-final" in str(ei.value) or "non-final" in str(ei.value)
+
+        # Mature the relative CSV to EXACTLY t_btc confirmations (the empirically-verified BIP68 boundary:
+        # bitcoind accepts the relative-N refund at confs == N, rejects at N-1). Funding is at 1 conf, so
+        # mine t_btc.value - 1 more → confs == t_btc.value. This pins decide()'s `confs >= N` gate as correct.
+        nodes.btc_mine(t_btc.value - 1)
+        assert int(nodes.btc("getrawtransaction", loc.funding_outpoint.txid, "true")["confirmations"]) == t_btc.value
+
+        # (2) POSITIVE — the production executor broadcasts the stored bytes; the outpoint is spent.
+        terms = NegotiatedTerms(
+            hashlock=h,
+            btc_sats=btc_sats,
+            radiant_amount=1,
+            t_btc=t_btc,
+            t_rxd=t_rxd,
+            asset_variant="rxd",
+            genesis_ref=b"",
+            taker_dest_hash=b"\x11" * 32,
+            maker_dest_hash=b"\x22" * 32,
+            btc_claim_pubkey_xonly=claim_xo,
+            btc_refund_pubkey_xonly=refund_xo,
+        )
+        rec = SwapRecord(state=SwapState.BTC_LOCKED, terms=terms, counterchain_locator=loc)
+        ex = RefundExecutor(
+            broadcaster=_BtcBroadcaster(nodes),
+            blobs_dir=tmp_path,
+            network="bcrt",
+            cap_sats=btc_sats,
+            refund_spk=dest,
+            accept_single_source=True,
+        )
+        dec = Decision(
+            Intent.PAGE_REFUND,
+            reason="matured BTC refund due",
+            recommended_action="taker_refund_btc",
+            autonomous_btc_refund=True,
+            low_corroboration=True,
+        )
+        out = await ex.execute("auto1", rec, dec)
+        assert out is ExecOutcome.BROADCAST
+        spent = nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout))
+        assert spent in (None, ""), "funding outpoint must be SPENT by the auto-broadcast refund on real consensus"
+
+
+# scripts/ on path for the operator dust-run harness (used by the proof below).
+import sys as _sys
+from pathlib import Path as _Path
+
+_HARNESS_SCRIPTS = str(_Path(__file__).resolve().parent.parent / "scripts")
+if _HARNESS_SCRIPTS not in _sys.path:
+    _sys.path.insert(0, _HARNESS_SCRIPTS)
+
+
+class TestWatchtowerDustHarnessRegtest:
+    """Prove the GO-GATED dust harness (scripts/watchtower_dust_run.py) end-to-end on real bitcoind: its
+    setup→record→presign artifacts, loaded FROM DISK by the keyless production executor, broadcast a
+    refund that real consensus accepts and that lands the dust at the operator's pinned refund
+    scriptPubKey. This is the consensus backstop for the stranded-dust fix — it proves the funded HTLC
+    is refundable from the persisted state ALONE (no in-memory carry-over, no key in the tower)."""
+
+    async def test_harness_artifacts_drive_a_real_keyless_refund_to_the_pinned_spk(self, nodes, tmp_path):
+        import watchtower_dust_run as harness
+
+        from pyrxd.gravity.watch import Decision, ExecOutcome, PresignedRefund, RefundExecutor
+
+        records = tmp_path / "records"
+        records.mkdir()
+        state_file = tmp_path / "run.state.json"
+        swap_id, btc_sats, t_btc, t_rxd, fee = "dust1", 50_000, 6, 3, 2_000
+
+        # The operator's pinned refund address (a fresh node address) → its scriptPubKey.
+        dest = bytes.fromhex(
+            nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
+        )
+
+        # STEP setup — the harness self-tests reconstruction-from-disk BEFORE printing the funding address.
+        assert (
+            harness.main(
+                [
+                    "setup",
+                    "--state-file",
+                    str(state_file),
+                    "--swap-id",
+                    swap_id,
+                    "--network",
+                    "bcrt",
+                    "--btc-sats",
+                    str(btc_sats),
+                    "--t-btc",
+                    str(t_btc),
+                    "--t-rxd",
+                    str(t_rxd),
+                    "--refund-spk",
+                    dest.hex(),
+                ]
+            )
+            == 0
+        )
+        s = json.loads(state_file.read_text())
+        fund_address, fund_spk = s["htlc_address"], s["htlc_spk"]
+
+        # Fund the address the harness emitted; locate the outpoint.
+        nodes.btc("sendtoaddress", fund_address, f"{btc_sats / 1e8:.8f}", wallet="btcw")
+        nodes.btc_mine(1)
+        u = nodes.btc("scantxoutset", "start", json.dumps([{"desc": f"raw({fund_spk})"}]))["unspents"][0]
+        ftxid, fvout, fsats = u["txid"], int(u["vout"]), round(u["amount"] * 1e8)
+        assert fsats == btc_sats
+
+        # STEP record + STEP presign — produce the production SwapRecord + keyless sidecar on disk.
+        assert (
+            harness.main(
+                [
+                    "record",
+                    "--state-file",
+                    str(state_file),
+                    "--funding-txid",
+                    ftxid,
+                    "--funding-vout",
+                    str(fvout),
+                    "--funding-sats",
+                    str(fsats),
+                    "--records-dir",
+                    str(records),
+                ]
+            )
+            == 0
+        )
+        assert (
+            harness.main(
+                ["presign", "--state-file", str(state_file), "--records-dir", str(records), "--fee-sats", str(fee)]
+            )
+            == 0
+        )
+
+        # ---- From here ONLY the on-disk artifacts are used (no key, no in-memory HTLC). ----
+        rec = SwapRecord.from_dict(json.loads((records / f"{swap_id}.json").read_text()))
+        loc = rec.btc_locator
+        sidecar = PresignedRefund.from_dict(json.loads((records / f"{swap_id}.refund.json").read_text()))
+
+        # NEGATIVE — broadcasting before the CSV matures is BIP68-rejected (consensus backstop).
+        with pytest.raises(RuntimeError) as ei:
+            nodes.btc("sendrawtransaction", sidecar.raw_tx.hex())
+        assert "non-BIP68-final" in str(ei.value) or "non-final" in str(ei.value)
+
+        # Mature to EXACTLY t_btc confs (funding at 1 conf → mine t_btc - 1 more).
+        nodes.btc_mine(t_btc - 1)
+        assert int(nodes.btc("getrawtransaction", loc.funding_outpoint.txid, "true")["confirmations"]) == t_btc
+
+        # POSITIVE — the keyless production executor reads the SAME records dir, binds, and broadcasts.
+        ex = RefundExecutor(
+            broadcaster=_BtcBroadcaster(nodes),
+            blobs_dir=records,
+            network="bcrt",
+            cap_sats=btc_sats,
+            refund_spk=dest,
+            accept_single_source=True,
+        )
+        dec = Decision(
+            Intent.PAGE_REFUND,
+            reason="matured BTC refund due (maker never locked)",
+            recommended_action="taker_refund_btc",
+            autonomous_btc_refund=True,
+            low_corroboration=True,
+        )
+        assert await ex.execute(swap_id, rec, dec) is ExecOutcome.BROADCAST
+
+        # The funding outpoint is SPENT and the dust LANDS at the pinned refund SPK (refundability proven).
+        assert nodes.btc("gettxout", loc.funding_outpoint.txid, str(loc.funding_outpoint.vout)) in (None, "")
+        decoded = nodes.btc("getrawtransaction", sidecar.txid, "true")
+        assert bytes.fromhex(decoded["vout"][0]["scriptPubKey"]["hex"]) == dest
+        assert round(decoded["vout"][0]["value"] * 1e8) == btc_sats - fee

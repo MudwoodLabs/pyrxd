@@ -43,6 +43,7 @@ from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_coven
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
+from pyrxd.gravity.watch import ChainObserver, DedupAlerter, EthClaimStatus, Intent, Reconciler, Severity
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
@@ -61,8 +62,11 @@ from tests.test_swap_coordinator import FakeIndexer
 from tests.test_xchain_swap_regtest_e2e import (
     _RXD_RELAY_FEE,
     _FeeSource,
+    _LiveRecordStore,
     _p2pkh_unlock,
     _RadiantCliClient,
+    _RecordingChannel,
+    _RegtestRxdChainSource,
     _rxd_pay,
     _src,
 )
@@ -405,6 +409,184 @@ def _build(node, url, *, t_rxd_blocks, asset_variant="rxd"):
         config=CoordinatorConfig(margin_policy=_eth_policy(), accept_nondurable_seen=True),
     )
     return coord, cov, p_secret, eth_leg, rpc, ref_utxo
+
+
+# --------------------------------------------------------------------------- watchtower observation
+#
+# The alert-only watchtower (v3) watches the SAME ETH↔RXD swap the coordinator drives and PAGES the
+# operator with the due action — it broadcasts nothing, holds no key, never touches p. A thin
+# READ-ONLY EthChainSource backs the PRODUCTION ChainObserver against anvil: claim detection via
+# eth_getLogs (the Claimed event), finality delegated UNCHANGED to the audited
+# EthHtlcContractLeg.claim_finality_verdict (post-Merge `finalized` checkpoint, not a depth). decide(),
+# ChainObserver and DedupAlerter run UNCHANGED, so a green run proves the real ETH decision core emits
+# the correct Intent on real anvil+regtest consensus.
+#
+# With _eth_policy(): rxd_claim_burial = 6 (default), counter_reserve = ceil(768/300) = 3, so the gate
+# reduces to blocks_left = t_rxd - cov_confs + 1 with: FINAL → SAFE iff blocks_left >= 6; NOT_YET_FINAL
+# → WAIT iff blocks_left >= 9, else SQUEEZED; a maker stall pages mutual_refund once blocks_left <= 6.
+
+
+def _claimed_topic0() -> str:
+    from web3 import Web3
+
+    return Web3.to_hex(Web3.keccak(text="Claimed(bytes32)"))
+
+
+class _AnvilEthChainSource:
+    """``EthChainSource`` backed by anvil (read-only). Detects the maker's claim from the on-chain
+    ``Claimed`` event log (not the broadcaster's memory) and delegates the finalized-checkpoint verdict
+    to the audited ``EthHtlcContractLeg.claim_finality_verdict``."""
+
+    def __init__(self, url: str, contract_leg) -> None:
+        self._url = url
+        self._leg = contract_leg
+        self._topic0 = _claimed_topic0()
+
+    async def claim_status(self, contract_address, deploy_tx_hash) -> EthClaimStatus:
+        res = _anvil_rpc(
+            self._url,
+            "eth_getLogs",
+            [{"address": contract_address, "fromBlock": "0x0", "toBlock": "latest", "topics": [self._topic0]}],
+        )
+        logs = res.get("result", [])
+        if not logs:
+            return EthClaimStatus(claimed=False)
+        return EthClaimStatus(claimed=True, claim_tx_hash=str(logs[-1]["transactionHash"]))
+
+    async def claim_finality_verdict(self, claim_tx_hash):
+        return await self._leg.claim_finality_verdict(claim_tx_hash)
+
+
+def _eth_watchtower(node, url, coord, rpc):
+    """Wire the PRODUCTION reconciler (real decide/ChainObserver/DedupAlerter) to observe ``coord``'s
+    ETH↔RXD swap on anvil + the regtest node, with the SAME policy + safety window the coordinator runs.
+    Reuses ``rpc`` for a read-only contract leg (finality verdict only — no signing)."""
+    from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+
+    contract_leg = EthHtlcContractLeg(
+        rpc=rpc, signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY)), chain_id=_CHAIN_ID, artifact=_ARTIFACT
+    )
+    channel = _RecordingChannel()
+    reconciler = Reconciler(
+        store=_LiveRecordStore(coord),
+        observer=ChainObserver(
+            eth=_AnvilEthChainSource(url, contract_leg),
+            rxd=_RegtestRxdChainSource(node),
+            rxd_corroborated=False,  # v1/v3: RXD (and ETH RPC) single-source → every page low-corroboration
+        ),
+        alerter=DedupAlerter(channel=channel),
+        policy=coord.config.margin_policy,
+        safety_window_blocks=coord.config.maker_stall_safety_window_blocks,
+    )
+    return reconciler, channel
+
+
+async def _setup_eth_both_locked(node, url, *, t_rxd_blocks):
+    """Drive an ETH↔RXD (rxd) swap to BOTH_LOCKED on real anvil + regtest. Returns (coord, p_secret, rpc)."""
+    coord, cov, p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=t_rxd_blocks)
+    terms = coord.record.terms
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+    assert rec.state is SwapState.BTC_LOCKED
+    _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+    rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
+    assert rec.state is SwapState.BOTH_LOCKED
+    return coord, p_secret, rpc
+
+
+class TestWatchtowerEthIntentSequence:
+    """The alert-only watchtower observes the ETH↔RXD swap the coordinator drives and emits the correct
+    Intent SEQUENCE for happy / maker-stall / closing-window on real anvil+regtest consensus — and NEVER
+    pages PAGE_CLAIM against a not-yet-finalized (WAIT) verdict. It broadcasts nothing; the production
+    decide()/ChainObserver/DedupAlerter run unchanged (ETH finalized-checkpoint finality, mutual_refund
+    on stall)."""
+
+    async def _tick(self, reconciler):
+        results = await reconciler.tick()
+        assert len(results) == 1, "exactly one swap is being watched"
+        return results[0]
+
+    async def test_eth_happy_watch_then_wait_then_page_claim(self, env):
+        node, url = env
+        coord, p_secret, rpc = await _setup_eth_both_locked(node, url, t_rxd_blocks=60)
+        reconciler, channel = _eth_watchtower(node, url, coord, rpc)
+
+        # 1. maker hasn't revealed p, deadline far → WATCH (no page).
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.WATCH
+        assert channel.pages == []
+
+        # 2. maker claims ETH (reveals p, emits Claimed(p)); the claim is mined but anvil has NOT
+        #    finalized it yet (finalized = latest-2) → verdict NOT_YET_FINAL_LIVE → gate WAIT → the tower
+        #    must keep WATCHING and must NOT page a claim on a not-yet-reorg-safe reveal.
+        rec = await coord.maker_claims_btc(p_secret)
+        assert rec.state is SwapState.SECRET_REVEALED
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.WATCH, "must not PAGE_CLAIM against a not-yet-finalized (WAIT) verdict"
+        assert channel.pages == []
+
+        # 3. finalize the ETH claim (anvil --slots-in-an-epoch 1: finalized = latest-2) → gate SAFE → PAGE_CLAIM.
+        _anvil_mine(url, 3)
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.PAGE_CLAIM
+        assert r.decision.recommended_action == "taker_scrape_and_claim_asset"
+        assert r.decision.deadline_rxd_height is not None
+        assert r.alert_delivered is True
+        assert len(channel.pages) == 1
+        page = channel.pages[0]
+        assert page.intent is Intent.PAGE_CLAIM
+        assert page.severity is Severity.CRITICAL
+        assert page.low_corroboration is True  # single-source ETH RPC + RXD
+
+        # Dedup: re-ticking the same SAFE situation does not re-page.
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.PAGE_CLAIM
+        assert len(channel.pages) == 1, "DedupAlerter must not re-page an unchanged situation"
+        await rpc.close()
+
+    async def test_eth_maker_stall_watch_then_page_mutual_refund(self, env):
+        node, url = env
+        coord, _p_secret, rpc = await _setup_eth_both_locked(node, url, t_rxd_blocks=20)
+        reconciler, channel = _eth_watchtower(node, url, coord, rpc)
+
+        # 1. just locked, refund window not near → WATCH.
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.WATCH
+        assert channel.pages == []
+
+        # 2. maker never claims; advance RXD to within the safety window of t_rxd maturity
+        #    (cov_confs 1→15 ⇒ now >= maturity - 6) → PAGE_REFUND naming mutual_refund (NOT the RXD-only
+        #    maybe_refund_asset_on_maker_stall, which is forbidden on the ETH stall path).
+        node.rxd_mine(14)
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.PAGE_REFUND
+        assert r.decision.recommended_action == "mutual_refund"
+        assert r.alert_delivered is True
+        assert len(channel.pages) == 1
+        assert channel.pages[0].severity is Severity.WARN  # a stall refund is recoverable, not a race
+        assert channel.pages[0].low_corroboration is True
+        await rpc.close()
+
+    async def test_eth_reveal_with_closing_window_pages_squeezed(self, env):
+        node, url = env
+        coord, p_secret, rpc = await _setup_eth_both_locked(node, url, t_rxd_blocks=8)
+        reconciler, channel = _eth_watchtower(node, url, coord, rpc)
+
+        # 1. pre-reveal, window not yet near → WATCH.
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.WATCH
+        assert channel.pages == []
+
+        # 2. maker reveals p but the claim is NOT finalized and t_rxd is too tight to wait
+        #    (blocks_left 8 < the 9 a WAIT needs: 8 - reserve 3 < burial 6) → SQUEEZED → PAGE_SQUEEZED.
+        rec = await coord.maker_claims_btc(p_secret)
+        assert rec.state is SwapState.SECRET_REVEALED
+        r = await self._tick(reconciler)
+        assert r.decision.intent is Intent.PAGE_SQUEEZED
+        assert r.alert_delivered is True
+        assert len(channel.pages) == 1
+        assert channel.pages[0].intent is Intent.PAGE_SQUEEZED
+        assert channel.pages[0].severity is Severity.CRITICAL
+        await rpc.close()
 
 
 class TestEthRxdSwap:

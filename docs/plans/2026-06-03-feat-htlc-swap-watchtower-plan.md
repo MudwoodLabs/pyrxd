@@ -139,9 +139,17 @@ When autonomy is built, these panel findings are the blueprint (do **not** redis
 - **The abandoned/expired terminal** is an edit to the **shared** FSM (`gravity/swap_state.py:87-94`) — a new enum member + transition edges + the no-strand invariant test, gated like any core FSM change, not a watch-local addition (panel arch-F8).
 - **The external audit gate** lands here (before any real value): the autonomy logic (quorum + claim-finality assessment + custody) is the audit scope. Dust/e2e runs are plumbing proof, not security proof.
 
-## Deferred to v3 — ETH direction (carries the panel's ETH corrections)
+## v3 — ETH direction
 
-- **Verify `EthHtlc.sol` is open-callable.** The plan's earlier "open-callable, verified" claim was **unverified** — it conflated "pays the immutable refundee" (the Python leg, `eth_wallet/htlc_leg.py:322-328`) with "callable by anyone" (the Solidity, which lives in the sibling `pyrxd-eth-htlc` repo, not here). Phase-0-of-v3 must read the actual `refund()`/`claim()` guards (panel sec-H-A).
+> **ALERT-ONLY v3 ETH: DONE** (2026-06-04, branch `test/watchtower-regtest-e2e`, commits `f80e542` core + `c6a1387` e2e). The watchtower now watches RXD/Glyph↔ETH swaps and pages the operator, broadcasting nothing (same alert-only posture as v1). `decide()` gained `_decide_eth` (mirrors the BTC claim-race + maker-stall branches; consumes the SAME `assess_claim_finality` via a **depth-less** `CounterClaimFinality` — ETH finality is the post-Merge `finalized` CHECKPOINT, not a PoW depth — and never re-derives it). `Observations` gained `eth_claim_detected` + `eth_claim_finality` (a `CounterClaimState`, not a bool, so `COUNTER_CHAIN_NOT_FINALIZING` is representable later). `quorum.py` gained `EthClaimStatus` + the `EthChainSource` port; `ChainObserver` routes by `counter_chain`, fails closed when the matching source is absent. **The one divergence from BTC:** refund/mismatch pages name `mutual_refund` (NOT `maybe_refund_asset_on_maker_stall`, which only recovers RXD and is forbidden on the ETH stall path). Verified: +26 unit tests (decide ETH + ChainObserver ETH routing) and a 3-scenario `TestWatchtowerEthIntentSequence` e2e green on **real anvil + radiant-core regtest** (WATCH→WAIT(not-finalized)→PAGE_CLAIM; WATCH→PAGE_REFUND/mutual_refund; WATCH→PAGE_SQUEEZED). Still **alert-only → outside the audit gate.**
+>
+> **Contract-guard finding (corrects the bullet below):** the watchtower's observe-and-page logic is INDEPENDENT of the `refund()` access guard — it never calls `claim()`/`refund()`. The leg targets the per-swap-deploy `EthHtlc.sol` (`eth_wallet/htlc_leg.py:471-477`), NOT the sibling `HashedTimelock.sol` (a different shared-multi-swap model; its `refund()` happens to be sender-guarded — confirming the two are distinct). Whether `EthHtlc.sol`'s `refund()` is open-callable only matters for the **autonomous v2-ETH** broadcast path, not for alert-only v3.
+>
+> **Deferred from alert-only v3 (operational shell + autonomy):** a production `EthChainSource` adapter + a read-only `EthRpc.get_logs` wrapper (the e2e shim scans `eth_getLogs` directly; no production log-filter primitive added yet); `FinalityStallTracker` stays UNWIRED (point-in-time only — a finality stall still SQUEEZES via the RXD deadline math, just not via explicit stall detection); `MultiSourceEthRpc` finality quorum; the autonomous broadcast path below.
+
+### Deferred to autonomous v2-ETH (carries the panel's ETH corrections)
+
+- **Verify `EthHtlc.sol` is open-callable** *(autonomy-only; the alert-only tower does not depend on it — see the finding above).* The plan's earlier "open-callable, verified" claim was **unverified** — it conflated "pays the immutable refundee" (the Python leg, `eth_wallet/htlc_leg.py:322-328`) with "callable by anyone" (the Solidity, which lives in the sibling `pyrxd-eth-htlc` repo, not in this worktree). v2-ETH must read the actual `EthHtlc.sol` `refund()`/`claim()` guards (panel sec-H-A).
 - **ETH key authority:** if open-callable → gas-only EOA (best). Else → EIP-7702 session key, but the "bounded to gas + two calls" blast radius is *conditional on a net-new audited delegate contract* and 7702 delegation persists until overwritten (panel sec-H-B). Per-tenant capped gas EOA is the blast-radius floor regardless.
 - **`MultiSourceEthRpc`** (net-new — `finalized_block_number` is single-RPC today, `eth_wallet/rpc.py:141`): quorum over ≥2 independent ETH RPCs, conservative `finalized` = min for claim-finality, max head-vs-finalized gap for stall detection (panel sec-H-C). The ETH analog of F-17 is otherwise open.
 - **Wire `FinalityStallTracker`** (`finality.py:90-167`, inert today) into the ETH reconcile path, fed quorum-agreed `(head, finalized)`; genuine stall → SQUEEZED, not silent WAIT-to-loss.
@@ -156,8 +164,8 @@ When autonomy is built, these panel findings are the blueprint (do **not** redis
 
 ## Acceptance Criteria (v1)
 ### Functional
-- [ ] Reconciler emits the correct Intent sequence for happy / maker-stall / reorg-WAIT / SQUEEZED (BTC), driven by the existing regtest e2e.
-- [ ] Never pages `PAGE_CLAIM` against a WAIT/SQUEEZED gate verdict; SQUEEZED → `PAGE_SQUEEZED` (decision-required).
+- [x] Reconciler emits the correct Intent sequence for happy / maker-stall / reorg-WAIT / SQUEEZED (BTC), driven by the existing regtest e2e. (`tests/test_xchain_swap_regtest_e2e.py::TestWatchtowerIntentSequence`, 3 tests green on real radiantd+bitcoind regtest, 2026-06-04.)
+- [x] Never pages `PAGE_CLAIM` against a WAIT/SQUEEZED gate verdict; SQUEEZED → `PAGE_SQUEEZED` (decision-required). (Asserted live: shallow BTC claim → WATCH, no page; closing window → PAGE_SQUEEZED.)
 - [ ] BTC depth via `MultiSourceBtcFundingReader`; depth-inflation never yields a premature page.
 - [ ] RXD-derived pages carry a low-corroboration flag (single-source reality).
 - [ ] Pages are authenticated, deduped, and carry {action, swap-id, deadline, why}; human-latency-aware deadline.
@@ -222,8 +230,23 @@ All four phases built on `feat/htlc-watchtower-v1`; **88 unit tests green** (`te
 
 **NOT yet done (needs a live run — honestly unverified):**
 - **End-to-end wiring is LIVE-VERIFIED** (2026-06-03) against the real `tr` node + mempool.space/esplora. A synthetic `SwapRecord` (block-170 BTC tx as the spent funding outpoint → real claim detected; a real RXD coinbase as the covenant) driven through `watchtower_run.py --once --rxd-backend ssh-tr` exercised the whole stack: JSON store → ssh-tr RXD reads (`get_tip_height` + `get_transaction_verbose`) → mempool.space outspend (claim detect) → `MultiSourceBtcFundingReader` quorum depth (860006 conf) → `decide()` → logged a CRITICAL **PAGE_CLAIM** (`taker_scrape_and_claim_asset` by RXD height 434828, low-corroboration flagged), **broadcasting nothing**. STILL unexercised: a **real** in-flight swap (the record was synthetic), and the maker-stall / WAIT / SQUEEZED branches against live data.
-- The reconciler Intent-sequence test against the **regtest e2e** harness (needs the regtest nodes running).
+- ~~The reconciler Intent-sequence test against the **regtest e2e** harness (needs the regtest nodes running).~~ — **DONE** (2026-06-04, branch `test/watchtower-regtest-e2e`): `tests/test_xchain_swap_regtest_e2e.py::TestWatchtowerIntentSequence` drives the alert-only tower over the coordinator's own BTC↔RXD regtest swap on two real nodes and asserts the Intent SEQUENCE on real consensus — happy (WATCH→WAIT→PAGE_CLAIM+dedup), maker-stall (WATCH→PAGE_REFUND), closing-window (WATCH→PAGE_SQUEEZED). The production `decide()`/`ChainObserver`/`DedupAlerter` run UNCHANGED behind thin read-only regtest chain sources; the tower broadcasts nothing. Full file green (7/7 integration). **Still unexercised:** a **real mainnet/testnet** in-flight swap (regtest is deterministic but synthetic timing).
 - `task ci` full suite (only the watch tests + targeted lint were run locally).
 - ~~"Authenticated" alert channel + dead-man's switch~~ — **DONE** (`WebhookAlertChannel` HMAC-signed + `DeadMansSwitch`/`scripts/watchtower_deadman.py`, unit-tested + live-smoked). Still open: **human-reaction-latency** folded into the admission/`MarginPolicy` window (a v2 admission concern), and using a *different* alert endpoint for the dead-man's switch than the tower (operator config).
 
-v2 (autonomous BTC) and v3 (ETH) remain as specified above, carrying the divergent-panel corrections.
+## Update (2026-06-08) — v2 + alert-only v3 SHIPPED (in pyrxd 0.7.0)
+
+v2 and v3 are no longer "remaining as specified" — both landed, still behind the external-audit gate:
+
+- **alert-only v3 — ETH counter-leg watching.** Keyless `RpcEthChainSource` + `ChainObserver` routing + anvil/regtest e2e (#168, #170). No broadcast, no keys.
+- **v2 — autonomous BTC refund.** DORMANT-by-construction + dust-capped: a keyless, operator-pre-signed CSV refund the tower broadcasts when one is due (#171). Signet/testnet runner (#172) + a Go-gated dust-run harness whose `setup` refuses to emit a funding address unless the refund reconstructs from on-disk state (#173). Proven on a mainnet dust run.
+
+**Remaining work (the real todo):**
+
+- **Hard gate** — external security audit **+** a genuine two-party adversarial run before any non-dust value (every run so far is single-operator = plumbing proof, not adversarial safety). Untested adversarially: griefing, the asset-timeout race, untrusted-counterparty verification on the autonomous path.
+- **RXD multi-source quorum** — the recurring hard blocker. RXD is single-source (one ssh-tr node; `ChainTracker` is BTC-only) so every RXD observation is `low_corroboration`; a 2nd independent source is the prerequisite to broaden autonomy beyond dust. `MultiSourceEthRpc` is the ETH analogue (single-source detection can delay, never lose, a page).
+- **Broaden autonomous actions** (audit-gated; each needs the live capped-fee-key custody seam `RadiantLeg.fee_source`): RXD-covenant refund (not pre-signable), `mutual_refund`, the autonomous claim (`taker_scrape_and_claim_asset` — scrape `p`, reorg-gated Glyph claim; highest value, biggest lift), ETH-leg autonomy.
+- **ETH polish** — wire `FinalityStallTracker` into the live tower (point-in-time only today).
+- **Residuals** — below-quorum-inside-window hold-that-loses (accepted residual); dedup/`SeenStore` durability across restarts.
+
+The divergent-panel corrections above still apply to all remaining autonomous work.

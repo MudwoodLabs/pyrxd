@@ -19,6 +19,7 @@ from pyrxd.security.errors import NetworkError, ValidationError
 __all__ = ["EthRpc"]
 
 _MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # 10 MB cap, matching the BTC client
+_MAX_LOG_ENTRIES = 10_000  # bound an eth_getLogs return (a per-contract query yields a handful)
 
 
 def _require_web3() -> Any:
@@ -155,6 +156,21 @@ class EthRpc:
         except Exception as exc:
             raise NetworkError(f"eth_getTransactionByHash failed: {exc}") from exc
 
+    async def get_transaction_receipt(self, tx_hash: str) -> dict[str, Any] | None:
+        """A single NON-BLOCKING receipt fetch (`eth_getTransactionReceipt`). Returns ``None`` when
+        the tx is not currently mined — pending, or reorg-orphaned back to the mempool — instead of
+        blocking like :meth:`wait_receipt` (a poller must never sleep inside one read). A transport
+        failure is still a :class:`NetworkError` (fail-closed)."""
+        web3 = _require_web3()
+        try:
+            r = await self._w3.eth.get_transaction_receipt(tx_hash)
+        except Exception as exc:
+            not_found = getattr(web3.exceptions, "TransactionNotFound", None)
+            if not_found is not None and isinstance(exc, not_found):
+                return None
+            raise NetworkError(f"eth_getTransactionReceipt failed: {exc}") from exc
+        return dict(r)
+
     async def finalized_block_number(self) -> int:
         """Block number of the `finalized` consensus checkpoint (the reorg-safe tip).
 
@@ -185,6 +201,34 @@ class EthRpc:
             raise NetworkError(f"eth_getBlockByNumber({block_number}) failed: {exc}") from exc
         h = blk.get("hash")
         return bytes(h) if h is not None else b""
+
+    async def get_logs(
+        self,
+        *,
+        address: str,
+        topics: list[str | None | list[str]] | None = None,
+        from_block: int | str = "earliest",
+        to_block: int | str = "latest",
+    ) -> list[dict[str, Any]]:
+        """`eth_getLogs` for ONE contract address, optionally filtered by ``topics``. READ-ONLY.
+
+        Scoped to a single address (the per-swap-unique HTLC), so the result is that contract's own
+        event history — a handful of entries. Pass an int ``from_block`` (e.g. the deploy block) to
+        bound the scan; ``to_block="latest"`` catches a JUST-mined claim. Detection deliberately reads
+        to ``latest``, not ``finalized``: a watchtower must not MISS a fresh claim it has to race, and
+        reorg-safety is asserted SEPARATELY by the finalized-checkpoint verdict (a non-final log can
+        only ever cause a false PAGE, never a broadcast). Transport failure → :class:`NetworkError`;
+        the entry count is bounded (a pathological return must not OOM the tower)."""
+        filt: dict[str, Any] = {"address": address, "fromBlock": from_block, "toBlock": to_block}
+        if topics is not None:
+            filt["topics"] = topics
+        try:
+            raw = await self._w3.eth.get_logs(filt)
+        except Exception as exc:
+            raise NetworkError(f"eth_getLogs failed: {exc}") from exc
+        if len(raw) > _MAX_LOG_ENTRIES:
+            raise NetworkError(f"eth_getLogs returned {len(raw)} entries (> {_MAX_LOG_ENTRIES} cap); refusing")
+        return [dict(log) for log in raw]
 
     async def close(self) -> None:
         """Close the underlying provider session if it exposes one."""

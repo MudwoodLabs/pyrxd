@@ -54,10 +54,12 @@ __all__ = [
     "BtcHtlc",
     "BtcHtlcLocator",
     "BtcOutpoint",
+    "BtcSpendFields",
     "ScriptTree",
     "TimeUnit",
     "Timelock",
     "btc_input_outpoints_from_raw",
+    "btc_spend_fields_from_raw",
     "btc_txid_from_raw",
     "build_claim_tx",
     "build_htlc",
@@ -996,6 +998,86 @@ def btc_txid_from_raw(raw_tx: bytes) -> str:
 
     non_witness = version + bytes(vin) + bytes(vout) + locktime
     return _hash256(non_witness)[::-1].hex()
+
+
+@dataclass(frozen=True)
+class BtcSpendFields:
+    """Serialize-don't-trust binding fields of a BTC tx, for the watchtower to bind a pre-signed refund
+    against the swap record: each input's 36-byte wire prevout (``txid LE || vout LE``) + nSequence, and
+    each output's ``(value_sats, scriptPubKey_bytes)``. The witness (where a refund carries the schnorr
+    sig — never ``p``) is parsed only to validate structure, not returned."""
+
+    input_prevouts: tuple[bytes, ...]
+    input_sequences: tuple[int, ...]
+    outputs: tuple[tuple[int, bytes], ...]
+
+
+def btc_spend_fields_from_raw(raw_tx: bytes) -> BtcSpendFields:
+    """Parse a BTC tx's binding fields, FAIL-CLOSED, handling segwit and legacy — the exact same
+    SERIALIZE-don't-trust walk as :func:`btc_txid_from_raw`, never returning a half-parsed result.
+
+    Used by the v2 autonomous-refund executor to bind a pre-signed refund blob to the swap: the input
+    prevout must equal the funding outpoint, the input nSequence must equal ``terms.t_btc.to_nsequence()``,
+    and the output ``(value, scriptPubKey)`` must satisfy the cap + the operator's pinned refund address.
+    """
+    b = bytes(raw_tx)
+    n = len(b)
+    pos = 0
+
+    def take(k: int) -> bytes:
+        nonlocal pos
+        if k < 0 or pos + k > n:
+            raise ValidationError("btc_spend_fields_from_raw: truncated transaction")
+        out = b[pos : pos + k]
+        pos += k
+        return out
+
+    def take_compact() -> int:
+        first = take(1)[0]
+        if first < 0xFD:
+            return first
+        return int.from_bytes(take({0xFD: 2, 0xFE: 4, 0xFF: 8}[first]), "little")
+
+    take(4)  # version
+    is_segwit = pos + 2 <= n and b[pos] == 0x00 and b[pos + 1] == 0x01
+    if is_segwit:
+        take(2)  # marker+flag
+    n_in = take_compact()
+    if n_in == 0 or n_in > 100_000:
+        raise ValidationError("btc_spend_fields_from_raw: bad input count")
+    prevouts: list[bytes] = []
+    sequences: list[int] = []
+    for _ in range(n_in):
+        prevouts.append(take(36))
+        slen = take_compact()
+        if slen > n:
+            raise ValidationError("btc_spend_fields_from_raw: scriptSig length out of range")
+        take(slen)
+        sequences.append(int.from_bytes(take(4), "little"))
+    n_out = take_compact()
+    if n_out == 0 or n_out > 100_000:
+        raise ValidationError("btc_spend_fields_from_raw: bad output count")
+    outputs: list[tuple[int, bytes]] = []
+    for _ in range(n_out):
+        value = int.from_bytes(take(8), "little")
+        slen = take_compact()
+        if slen > n:
+            raise ValidationError("btc_spend_fields_from_raw: scriptPubKey length out of range")
+        outputs.append((value, bytes(take(slen))))
+    if is_segwit:
+        for _ in range(n_in):
+            n_items = take_compact()
+            if n_items > 100_000:
+                raise ValidationError("btc_spend_fields_from_raw: bad witness item count")
+            for _ in range(n_items):
+                ilen = take_compact()
+                if ilen > n:
+                    raise ValidationError("btc_spend_fields_from_raw: witness item length out of range")
+                take(ilen)
+    take(4)  # locktime
+    if pos != n:
+        raise ValidationError("btc_spend_fields_from_raw: trailing bytes after locktime")
+    return BtcSpendFields(tuple(prevouts), tuple(sequences), tuple(outputs))
 
 
 def btc_input_outpoints_from_raw(raw_tx: bytes) -> list[bytes]:

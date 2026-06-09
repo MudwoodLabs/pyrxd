@@ -210,6 +210,39 @@ class TestClassifyGlyphMetadata:
         md = GlyphMetadata(protocol=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED], name="e")
         assert classify_glyph_metadata(md) == "encrypted"
 
+    def test_dat(self):
+        md = GlyphMetadata(protocol=[GlyphProtocol.DAT], name="d")
+        assert classify_glyph_metadata(md) == "dat"
+
+    def test_authority(self):
+        md = GlyphMetadata(protocol=[GlyphProtocol.NFT, GlyphProtocol.AUTHORITY], name="a")
+        assert classify_glyph_metadata(md) == "authority"
+
+    def test_timelock(self):
+        # TIMELOCK requires ENCRYPTED (which requires NFT) per the protocol
+        # rules in types.py — and must out-rank the bare "encrypted" label.
+        md = GlyphMetadata(
+            protocol=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED, GlyphProtocol.TIMELOCK],
+            name="t",
+        )
+        assert classify_glyph_metadata(md) == "timelock"
+
+    def test_timelock_outranks_encrypted(self):
+        """A token carrying both ENCRYPTED and TIMELOCK is the more specific
+        'timelock', never the underlying 'encrypted'."""
+        md = GlyphMetadata(
+            protocol=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED, GlyphProtocol.TIMELOCK],
+            name="t",
+        )
+        assert classify_glyph_metadata(md) == "timelock"
+
+    def test_authority_with_mut_outranks_mut(self):
+        md = GlyphMetadata(
+            protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT, GlyphProtocol.AUTHORITY],
+            name="a",
+        )
+        assert classify_glyph_metadata(md) == "authority"
+
 
 # ─────────────────────────────────────────────── WaveResolver ──
 
