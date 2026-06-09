@@ -23,6 +23,7 @@ from __future__ import annotations
 from .client import AgentClient
 from .confirm import TtyConfirmer, format_spend_summary
 from .daemon import AgentDaemon
+from .discover import WatchOnlyScan, collect_watch_only_utxos
 from .errors import SignerDeclined, SignerError, SignerUnavailableError
 from .protocol import ChangeClaim, ExternalOutput, InputToSign, SignedResult, SigningRequest, SpendSummary
 from .signer import AgentSigner
@@ -43,7 +44,9 @@ __all__ = [
     "SpendSummary",
     "TtyConfirmer",
     "UnsignedSend",
+    "WatchOnlyScan",
     "WatchOnlyTxBuilder",
     "WatchOnlyUtxo",
+    "collect_watch_only_utxos",
     "format_spend_summary",
 ]

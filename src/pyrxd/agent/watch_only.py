@@ -76,10 +76,15 @@ class WatchOnlyUtxo:
 
 @dataclass(frozen=True)
 class UnsignedSend:
-    """The watch-only build result: an unsigned tx + the request to sign it."""
+    """The watch-only build result: an unsigned tx + the request to sign it.
+
+    ``input_total`` is the summed value of the SELECTED inputs (the builder picks a
+    subset), so the caller can show an accurate fee = input_total − Σ outputs.
+    """
 
     transaction: Transaction
     request: SigningRequest
+    input_total: int
 
 
 class WatchOnlyTxBuilder:
@@ -173,7 +178,7 @@ class WatchOnlyTxBuilder:
             ),
             change_claims=change_claims,
         )
-        return UnsignedSend(transaction=tx, request=request)
+        return UnsignedSend(transaction=tx, request=request, input_total=total_in)
 
     def _select(
         self,

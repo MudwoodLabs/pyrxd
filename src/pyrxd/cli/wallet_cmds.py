@@ -16,7 +16,9 @@ from typing import cast
 
 import click
 
+from ..agent import AgentClient, SignerDeclined, WatchOnlyTxBuilder, collect_watch_only_utxos
 from ..constants import Network
+from ..hd.bip32 import Xpub
 from ..hd.bip39 import mnemonic_from_entropy
 from ..hd.discovery import DEFAULT_ACCOUNTS, DEFAULT_COIN_TYPES, coin_type_label, discover
 from ..hd.wallet import HdWallet
@@ -587,6 +589,179 @@ def wallet_sweep(
     else:
         click.echo(f"\nSwept {format_photons(cast(int, result['swept_photons']))} to {to_address}")
         click.echo(f"Transaction: {result['txid']}")
+
+
+def _agent_socket(ctx: CliContext):
+    """The signing-agent socket co-located with the wallet (see `pyrxd agent`)."""
+    return ctx.wallet_path.parent / "agent.sock"
+
+
+def _send_summary(ctx: CliContext, *, to_address: str, amount: int, fee: int, inputs: int, signer: str) -> bool:
+    """Show the spend and (for the in-process path) get y/N. The agent path does
+    its OWN authoritative confirmation on the daemon's terminal, so it only displays."""
+    lines = [
+        "\n  Send:",
+        f"    to address:  {to_address}",
+        f"    amount:      {format_photons(amount)}",
+        f"    network fee: {format_photons(fee)}",
+        f"    inputs:      {inputs} UTXO(s)",
+        f"    signed by:   {signer}",
+        "",
+    ]
+    if signer == "agent":
+        for line in lines:
+            click.echo(line)
+        click.echo("  Approve the spend in the agent's terminal to broadcast.")
+        return True
+    return confirm_action(lines, ctx=ctx, prompt_text="Broadcast this send?")
+
+
+@wallet_group.command(name="send")
+@click.option("--to", "to_address", required=True, help="Destination Radiant P2PKH address you intend to pay.")
+@click.option("--amount", type=int, required=True, metavar="PHOTONS", help="Amount to send, in photons.")
+@click.option("--fee-rate", type=int, default=DEFAULT_FEE_RATE, show_default=True, help="Fee rate (photons per kB).")
+@click.option(
+    "--passphrase/--no-passphrase", default=False, help="Prompt for the BIP39 passphrase (in-process fallback only)."
+)
+@click.pass_obj
+def wallet_send(ctx: CliContext, to_address: str, amount: int, fee_rate: int, passphrase: bool) -> None:
+    """Send photons from this wallet's default account.
+
+    If a signing agent is unlocked (``pyrxd agent unlock``), the transaction is
+    built watch-only (from the account xpub) and signed by the agent — no mnemonic
+    prompt, and you approve the spend in the agent's terminal. Otherwise you are
+    prompted for the mnemonic and the transaction is signed in-process.
+    """
+    if not isinstance(amount, int) or amount <= 0:
+        raise UserError("--amount must be a positive integer (photons)")
+    if fee_rate <= 0:
+        raise UserError("--fee-rate must be a positive integer (photons per kB)")
+    ok, why = ctx.is_destructive_mode_safe()
+    if not ok:
+        raise UserError(why or "destructive op without --yes in --json mode")
+    if not validate_address(to_address, network=Network(ctx.network)):
+        raise UserError(
+            "invalid --to address",
+            cause=f"not a valid {ctx.network} Radiant P2PKH address",
+            fix=f"pass a {ctx.network} address" + (" (starts with 1)" if ctx.network == "mainnet" else ""),
+        )
+
+    if AgentClient(_agent_socket(ctx)).is_live():
+        result = _send_via_agent(ctx, to_address, amount, fee_rate)
+    else:
+        result = _send_in_process(ctx, to_address, amount, fee_rate, passphrase)
+
+    if ctx.output_mode == "json":
+        click.echo(emit(result, mode="json"))
+    elif ctx.output_mode == "quiet":
+        click.echo(emit(result, mode="quiet", quiet_field="txid"))
+    else:
+        click.echo(f"\nSent {format_photons(amount)} to {to_address} (signed by {result['signer']})")
+        click.echo(f"Transaction: {result['txid']}")
+
+
+def _send_via_agent(ctx: CliContext, to_address: str, amount: int, fee_rate: int) -> dict[str, object]:
+    """Build watch-only from the agent's xpub, let the agent sign, broadcast."""
+    client = AgentClient(_agent_socket(ctx))
+    xpub = Xpub(client.account_xpub())
+    builder = WatchOnlyTxBuilder(xpub)
+
+    async def _run() -> dict[str, object]:
+        ex = ctx.make_client()
+        async with ex:
+            scan = await collect_watch_only_utxos(xpub, ex)
+            if not scan.utxos:
+                raise UserError(
+                    "no spendable funds in this wallet's default account",
+                    cause="the watch-only scan found no UTXOs",
+                    fix="fund the wallet, or check you unlocked the right account",
+                )
+            built = builder.build_send(
+                scan.utxos, to_address, amount, change_index=scan.next_change_index, fee_rate=fee_rate
+            )
+            fee = built.input_total - sum(o.satoshis for o in built.transaction.outputs)
+            _send_summary(
+                ctx, to_address=to_address, amount=amount, fee=fee, inputs=len(built.request.inputs), signer="agent"
+            )
+            try:
+                signed = client.sign(built.request)
+            except SignerDeclined as exc:
+                raise UserError(
+                    "spend declined at the agent", cause=str(exc), fix="approve the spend, or send a different amount"
+                ) from exc
+            txid = await ex.broadcast(bytes.fromhex(signed.signed_tx_hex))
+            return {
+                "txid": str(txid),
+                "to": to_address,
+                "amount_photons": amount,
+                "fee_photons": fee,
+                "signer": "agent",
+            }
+
+    return _run_async(ctx, _run())
+
+
+def _send_in_process(
+    ctx: CliContext, to_address: str, amount: int, fee_rate: int, passphrase: bool
+) -> dict[str, object]:
+    """The fallback: prompt for the mnemonic and sign in-process (no agent)."""
+    if not ctx.wallet_path.exists():
+        raise UserError(
+            f"no wallet at {ctx.wallet_path}",
+            cause="the file does not exist",
+            fix="run `pyrxd wallet new` to create one, or unlock an agent with `pyrxd agent unlock`",
+        )
+    mnemonic = prompt_mnemonic_input()
+    if not mnemonic:
+        raise UserError("mnemonic is required", cause="no input received", fix="enter the wallet's BIP39 mnemonic")
+    passphrase_str = ""  # nosec B105 — empty string is the BIP39 spec default (no passphrase)
+    if passphrase:
+        passphrase_str = prompt_passphrase_input(optional=False)
+    try:
+        wallet = HdWallet.load(ctx.wallet_path, mnemonic, passphrase_str)
+    except (ValidationError, ValueError) as exc:
+        raise WalletDecryptError() from exc
+
+    async def _run() -> dict[str, object]:
+        ex = ctx.make_client()
+        async with ex:
+            await wallet.refresh(ex)
+            triples = await wallet.collect_spendable(ex)
+            if not triples:
+                raise UserError(
+                    "no spendable funds in this wallet",
+                    cause="the scan found no UTXOs",
+                    fix="fund the wallet first",
+                )
+            tx = wallet.build_send_tx(triples, to_address, amount, fee_rate=fee_rate)
+            input_total = sum(int(inp.satoshis) for inp in tx.inputs)
+            fee = input_total - sum(o.satoshis for o in tx.outputs)
+            if not _send_summary(
+                ctx, to_address=to_address, amount=amount, fee=fee, inputs=len(tx.inputs), signer="wallet (in-process)"
+            ):
+                raise UserError("aborted by user", cause="confirmation declined", fix="re-run when ready to broadcast")
+            txid = await ex.broadcast(tx.serialize())
+            return {
+                "txid": str(txid),
+                "to": to_address,
+                "amount_photons": amount,
+                "fee_photons": fee,
+                "signer": "in-process",
+            }
+
+    return _run_async(ctx, _run())
+
+
+def _run_async(ctx: CliContext, coro) -> dict[str, object]:
+    """Run an async send body, mapping NetworkError to the CLI boundary error."""
+    try:
+        return asyncio.run(coro)
+    except NetworkError as exc:
+        raise NetworkBoundaryError(
+            "could not reach ElectrumX",
+            cause=str(exc),
+            fix=f"check that {ctx.electrumx_url} is reachable, or use --electrumx URL",
+        ) from exc
 
 
 # Confirmation helper used by Cut 1 destructive ops outside this module.
