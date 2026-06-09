@@ -166,6 +166,9 @@ ignore = [
     "F811",   # reuses the shared `node` regtest fixture from test_htlc_regtest_e2e; pytest's
               # fixture-injection (each test's `node` param) reads as a redefinition to ruff
 ]
+"tests/test_soulbound_covenant_regtest.py" = [
+    "F811",   # same: reuses the shared `node` regtest fixture from test_htlc_regtest_e2e
+]
 "examples/**" = [
     "S",      # examples use test keys / hardcoded WIFs intentionally
     "E402",   # examples may reorder imports for narrative clarity

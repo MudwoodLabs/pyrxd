@@ -234,4 +234,19 @@ All four phases built on `feat/htlc-watchtower-v1`; **88 unit tests green** (`te
 - `task ci` full suite (only the watch tests + targeted lint were run locally).
 - ~~"Authenticated" alert channel + dead-man's switch~~ — **DONE** (`WebhookAlertChannel` HMAC-signed + `DeadMansSwitch`/`scripts/watchtower_deadman.py`, unit-tested + live-smoked). Still open: **human-reaction-latency** folded into the admission/`MarginPolicy` window (a v2 admission concern), and using a *different* alert endpoint for the dead-man's switch than the tower (operator config).
 
-v2 (autonomous BTC) and v3 (ETH) remain as specified above, carrying the divergent-panel corrections.
+## Update (2026-06-08) — v2 + alert-only v3 SHIPPED (in pyrxd 0.7.0)
+
+v2 and v3 are no longer "remaining as specified" — both landed, still behind the external-audit gate:
+
+- **alert-only v3 — ETH counter-leg watching.** Keyless `RpcEthChainSource` + `ChainObserver` routing + anvil/regtest e2e (#168, #170). No broadcast, no keys.
+- **v2 — autonomous BTC refund.** DORMANT-by-construction + dust-capped: a keyless, operator-pre-signed CSV refund the tower broadcasts when one is due (#171). Signet/testnet runner (#172) + a Go-gated dust-run harness whose `setup` refuses to emit a funding address unless the refund reconstructs from on-disk state (#173). Proven on a mainnet dust run.
+
+**Remaining work (the real todo):**
+
+- **Hard gate** — external security audit **+** a genuine two-party adversarial run before any non-dust value (every run so far is single-operator = plumbing proof, not adversarial safety). Untested adversarially: griefing, the asset-timeout race, untrusted-counterparty verification on the autonomous path.
+- **RXD multi-source quorum** — the recurring hard blocker. RXD is single-source (one ssh-tr node; `ChainTracker` is BTC-only) so every RXD observation is `low_corroboration`; a 2nd independent source is the prerequisite to broaden autonomy beyond dust. `MultiSourceEthRpc` is the ETH analogue (single-source detection can delay, never lose, a page).
+- **Broaden autonomous actions** (audit-gated; each needs the live capped-fee-key custody seam `RadiantLeg.fee_source`): RXD-covenant refund (not pre-signable), `mutual_refund`, the autonomous claim (`taker_scrape_and_claim_asset` — scrape `p`, reorg-gated Glyph claim; highest value, biggest lift), ETH-leg autonomy.
+- **ETH polish** — wire `FinalityStallTracker` into the live tower (point-in-time only today).
+- **Residuals** — below-quorum-inside-window hold-that-loses (accepted residual); dedup/`SeenStore` durability across restarts.
+
+The divergent-panel corrections above still apply to all remaining autonomous work.

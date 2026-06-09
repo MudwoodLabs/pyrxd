@@ -49,6 +49,8 @@ from pyrxd.btc_wallet.taproot import (
     btc_input_outpoints_from_raw,
 )
 from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
+from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import SecretBytes
 
@@ -704,6 +706,9 @@ class CoordinatorConfig:
     # runbook (the dust harness); a long-lived / multi-process deployment needs a
     # durable store (audit track), not this flag.
     accept_nondurable_seen: bool = False
+    # Min confirmations a gating credential's live UTXO must have (reorg safety),
+    # when a swap sets terms.credential_ref. Mirrors min_ref_confirmations.
+    min_credential_confirmations: int = 6
 
     def __post_init__(self) -> None:
         if not isinstance(self.margin_policy, MarginPolicy):
@@ -714,6 +719,9 @@ class CoordinatorConfig:
         c = self.min_ref_confirmations
         if not isinstance(c, int) or isinstance(c, bool) or c < 0:
             raise ValidationError("min_ref_confirmations must be a non-negative int")
+        cc = self.min_credential_confirmations
+        if not isinstance(cc, int) or isinstance(cc, bool) or cc < 0:
+            raise ValidationError("min_credential_confirmations must be a non-negative int")
         if not isinstance(self.accept_nondurable_seen, bool):
             raise ValidationError("accept_nondurable_seen must be a bool")
 
@@ -796,6 +804,7 @@ class SwapCoordinator:
         seen_store,
         config: CoordinatorConfig,
         persist: PersistHook | None = None,
+        credential_resolver=None,
     ) -> None:
         if not isinstance(record, SwapRecord):
             raise ValidationError("record must be a SwapRecord")
@@ -873,6 +882,9 @@ class SwapCoordinator:
         self.seen_store = seen_store
         self.config = config
         self._persist = persist
+        # Optional credential-gating resolver (duck-typed CredentialResolver). Required
+        # only when a swap sets terms.credential_ref; its absence then fails closed.
+        self._credential_resolver = credential_resolver
 
     @property
     def btc_leg(self):
@@ -942,6 +954,38 @@ class SwapCoordinator:
             )
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"REF authenticity failed; fail-closed ({exc})")
+
+        # 1b. Credential binding (only when the swap is credential-gated). Confirms the
+        #     taker holds a GENUINE consensus-soulbound credential (not a metadata flag)
+        #     AND that the swap's pinned payout (taker_dest_hash) pays the credential's
+        #     owner. Soulbound permanence => owner is immutable, so binding the payout to
+        #     it defeats both resale and rental without co-spending. Fail-closed.
+        if terms.credential_ref:
+            if self._credential_resolver is None:
+                return PreBtcLockGate(
+                    ok=False, reason="swap is credential-gated but no credential_resolver is wired; fail-closed"
+                )
+            try:
+                cred = await self._credential_resolver.resolve_credential(terms.credential_ref)
+                if cred is None:
+                    return PreBtcLockGate(
+                        ok=False, reason="credential ref did not resolve (unknown/spent); fail-closed"
+                    )
+                owner = assert_soulbound_credential(
+                    cred,
+                    min_confirmations=self.config.min_credential_confirmations,
+                    expected_credential_ref=terms.credential_ref,
+                )
+                expected = holder_hash(owner, variant=terms.asset_variant, genesis_ref=terms.genesis_ref)
+                if expected != terms.taker_dest_hash:
+                    return PreBtcLockGate(
+                        ok=False,
+                        reason="credential owner is not the swap payout recipient (taker_dest_hash); rental would pass — fail-closed",
+                    )
+            except (CredentialBindingError, ValidationError) as exc:
+                return PreBtcLockGate(ok=False, reason=f"credential binding failed; fail-closed ({exc})")
+            except Exception as exc:
+                return PreBtcLockGate(ok=False, reason=f"credential resolver unavailable; fail-closed ({exc})")
 
         # 2. H freshness — advisory read-only probe for a clean early reject; the
         #    authoritative atomic reserve is in taker_funds_btc, pre-broadcast.
