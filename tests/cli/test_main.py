@@ -38,3 +38,20 @@ def test_unknown_network_rejected(runner: CliRunner) -> None:
     assert result.exit_code != 0
     # Click's choice validator emits its own error.
     assert "marsnet" in result.output or "Invalid value" in result.output
+
+
+def test_wallet_path_with_null_byte_is_a_clean_usage_error(runner: CliRunner) -> None:
+    # A path with an embedded null byte raises ValueError deep inside click's
+    # Path conversion (os.stat); without _SafePath it escapes as an unhandled
+    # traceback with an undocumented exit code. It must be a clean usage error.
+    result = runner.invoke(cli, ["--wallet", "\x00", "balance"])
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "invalid path" in result.output.lower()
+
+
+def test_config_path_with_null_byte_is_a_clean_usage_error(runner: CliRunner) -> None:
+    result = runner.invoke(cli, ["--config", "\x00", "address"])
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "invalid path" in result.output.lower()
