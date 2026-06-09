@@ -1,9 +1,11 @@
-# `pyrxd.gravity.watch` — HTLC swap watchtower (v1: alert-only, BTC)
+# `pyrxd.gravity.watch` — HTLC swap watchtower
 
 The **brain** of the watchtower. A persistent reconciliation loop watches the chain
-for in-flight swaps and, when a time-critical action is due, **pages the operator**
-with the exact one-shot step + deadline. **v1 broadcasts nothing, holds no key, and
-never touches the preimage `p`** — it is a driver, not a second finality brain.
+(BTC **and** ETH counter-legs) for in-flight swaps and, when a time-critical action is
+due, **pages the operator** with the exact one-shot step + deadline. The watch core
+holds no key and never touches the preimage `p`; the only autonomous action that
+broadcasts is the **dormant, dust-capped, keyless BTC refund** (v2, below) — everything
+else is alert-only. It is a driver, not a second finality brain.
 
 Plan: `docs/plans/2026-06-03-feat-htlc-swap-watchtower-plan.md` ·
 Phase-0 verification: `docs/brainstorms/gravity-ref-spike/WATCHTOWER_PHASE0_VERIFICATION_2026-06-03.md`
@@ -29,7 +31,7 @@ RecordStore ─┐                                    ┌─ AlertChannel (authe
 | Situation (observed) | Intent | Operator action |
 |---|---|---|
 | terminal `record.state` | `RETIRE` | stop watching |
-| `counter_chain == "eth"` | `NOOP` | (deferred to v3) |
+| `counter_chain == "eth"` | (routed to `_decide_eth`) | alert-only ETH claim-race / refund pages |
 | maker claimed + gate **SAFE** | `PAGE_CLAIM` | `taker_scrape_and_claim_asset` before deadline |
 | maker claimed + gate **WAIT** | `WATCH` | none (awaiting reorg-safe burial) |
 | maker claimed + gate **SQUEEZED** | `PAGE_SQUEEZED` | decide: `taker_claim_asset_from_vulnerable` vs accept loss |
@@ -57,10 +59,20 @@ while True:                                  # ← the shell's loop, not the bra
     await asyncio.sleep(poll_interval_s)
 ```
 
-## Scope boundary
+## Status & scope (as of pyrxd 0.7.0)
 
-- **v1 (this package):** alert-only, BTC. No broadcast, no keys, no `p`, outside the autonomy audit gate. Operability: an authenticated `WebhookAlertChannel` (HMAC-signed) so an *offline* operator is actually paged, and a cross-process dead-man's switch (`FileHeartbeat` + `DeadMansSwitch`, run via `scripts/watchtower_deadman.py`) that pages if the tower's heartbeat stops. Entrypoints: `scripts/watchtower_run.py` (tower) + `scripts/watchtower_deadman.py` (monitor).
-- **v2 (autonomous BTC):** broadcasts. Adds the custody seam (capped fee key in `RadiantLeg.fee_source`; pre-signed BTC refund bypassing the live-key methods), a structural AUTONOMOUS gate bound to `audit_cleared`, the dead-man's-switch, and the **external audit gate**. RXD multi-source quorum is a hard blocker.
-- **v3 (ETH):** the ETH counter-leg watcher + key authority + `MultiSourceEthRpc` + `FinalityStallTracker` wiring.
+**Shipped** — all behind the external-audit gate for non-dust value:
 
-See the plan's v2/v3 sections for the divergent-panel corrections to honor.
+- **v1 — alert-only, BTC.** This package's core: watch + page, no broadcast, no keys, no `p`. Authenticated `WebhookAlertChannel` (HMAC) + a cross-process dead-man's-switch (`FileHeartbeat` + `DeadMansSwitch`, via `scripts/watchtower_deadman.py`). Entrypoints: `scripts/watchtower_run.py` + `scripts/watchtower_deadman.py`.
+- **alert-only v3 — ETH counter-leg watching.** Keyless, read-only `RpcEthChainSource` (`eth_adapters.py`) + `ChainObserver` routing by `counter_chain`; `decide()` mirrors the BTC branches, consuming the audited finality gate via a depth-less verdict. Still no broadcast / no keys.
+- **v2 — autonomous BTC refund (DORMANT-by-construction, dust-capped).** The only action that broadcasts. Keyless (re-sends operator-pre-signed bytes; the key signs once at setup via `scripts/presign_refund.py`), refund-only, capped to the dust ceiling, and a structural no-op on a value-bearing network without an explicit `audit_cleared` opt-in (`executor.py` + `make_refund_broadcaster`). Operator harness `scripts/watchtower_dust_run.py` won't emit a funding address unless the refund reconstructs from on-disk state; proven on a mainnet dust run.
+
+**Remaining (the todo):**
+
+- **Hard gate:** an external security audit **and** a genuine *two-party adversarial* run — every run so far is single-operator (a plumbing proof, not adversarial safety). Blocks all non-dust value.
+- **RXD multi-source quorum** (the recurring hard blocker): RXD is single-source today (one ssh-tr node; `ChainTracker` is BTC-only) so every RXD observation is `low_corroboration`. A 2nd independent source is the prerequisite to broaden autonomy beyond dust. `MultiSourceEthRpc` is the ETH analogue (single-source detection can *delay*, never lose, a page).
+- **Broaden autonomous actions** (each audit-gated; each needs the live capped-fee-key custody seam `RadiantLeg.fee_source`): RXD-covenant refund (not pre-signable), `mutual_refund` (two broadcasts), the autonomous **claim** (`taker_scrape_and_claim_asset` — scrape `p`, fire a reorg-gated Glyph claim before `t_rxd`; highest value, biggest lift), and ETH-leg autonomy (verify the real `EthHtlc.sol` `refund()` guard first).
+- **ETH polish:** wire `FinalityStallTracker` into the live tower (point-in-time finality only today; an across-time stall still SQUEEZES via the RXD deadline math).
+- **Residuals:** below-quorum-inside-window can co-fire claim+refund into a hold-that-loses (accepted residual: hold + CRITICAL operator fallback); dedup/`SeenStore` durability across restarts.
+
+Plans: `docs/plans/2026-06-03-feat-htlc-swap-watchtower-plan.md` (v1) + `docs/plans/2026-06-05-feat-watchtower-v2-refund-autonomy-plan.md` (v2) — honor the divergent-panel corrections noted there.
