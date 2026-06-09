@@ -38,7 +38,8 @@ RecordStore ─┐                                    ┌─ AlertChannel (authe
 | maker claimed + un-assessable (missing depth / `now<lock`) | `PAGE_SQUEEZED` | verify finality manually (fail-closed) |
 | `ASSET_VULNERABLE` | `PAGE_SQUEEZED` | winner-take-all decision |
 | `PARAMS_MISMATCH` | `PAGE_REFUND` | `taker_refund_btc` |
-| `MAKER_STALLS`, or `BOTH_LOCKED` + refund due | `PAGE_REFUND` | `maybe_refund_asset_on_maker_stall` |
+| `BOTH_LOCKED` + refund due | `PAGE_REFUND` | `mutual_refund` (broadcast once both timeouts elapse) |
+| `MAKER_STALLS` (unreachable post-fix) | `PAGE_SQUEEZED` | investigate — no clean step (FSM finding #2) |
 | `BOTH_LOCKED` (not yet due) / `NEGOTIATED` / `BTC_LOCKED` | `WATCH` | none |
 
 **Chain truth dominates a lagging record:** if the maker's claim is observed on-chain,

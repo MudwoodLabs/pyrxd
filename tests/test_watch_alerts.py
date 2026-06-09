@@ -69,7 +69,7 @@ async def test_dedup_same_intent_not_resent():
 async def test_intent_change_repages():
     ch = FakeChannel()
     a = DedupAlerter(channel=ch)
-    await a.handle("s1", _d(Intent.PAGE_REFUND, action="maybe_refund_asset_on_maker_stall"))
+    await a.handle("s1", _d(Intent.PAGE_REFUND, action="mutual_refund"))
     await a.handle("s1", _d(Intent.PAGE_CLAIM))
     assert [p.intent for p in ch.sent] == [Intent.PAGE_REFUND, Intent.PAGE_CLAIM]
 

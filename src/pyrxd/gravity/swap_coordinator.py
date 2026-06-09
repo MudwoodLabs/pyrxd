@@ -1561,14 +1561,20 @@ class SwapCoordinator:
         (returns the unchanged record) when the trigger has not fired yet. Async
         because the asset refund broadcasts a Radiant covenant spend.
 
-        RUNBOOK SCOPE (red-team MEDIUM): this refunds ONLY the RXD covenant, whose CSV refund pays
-        the MAKER in BOTH directions (the maker owns the asset leg; p is not yet public) — it is NOT
-        a "taker reclaims the covenant" action (an earlier note wrongly said the taker owns it; the
-        covenant CLAIM pays the taker, the CSV REFUND pays the maker, same as eth_rxd_timelock.py).
-        It is sufficient stall recovery only when the OTHER party's value is independently
-        recoverable on its own leg. In the ETH<->RXD runbook the taker's value sits in the ETH HTLC,
-        which this method does NOT touch, so the correct ETH stall recovery is :meth:`mutual_refund`
-        (refunds BOTH legs after both timeouts) — NOT this method. Do not wire it into the ETH stall path.
+        RUNBOOK SCOPE (FSM finding #2, 2026-06-09 — VERIFIED on regtest): this refunds ONLY the RXD
+        covenant, whose CSV refund pays the MAKER in BOTH directions (the maker owns the asset leg; p
+        is not yet public) — it is NOT a "taker reclaims the covenant" action (an earlier note wrongly
+        said the taker owns it; the covenant CLAIM pays the taker, the CSV REFUND pays the maker, same
+        as eth_rxd_timelock.py).
+
+        This is a MAKER-side primitive (the maker recovering its own asset) and MUST NOT be wired into
+        a TAKER recovery path on EITHER counter-chain. A taker driven to run it strands itself: it
+        gifts the asset back to the maker AND destroys its only recourse (the claimable covenant) while
+        its own counter-leg stays locked, after which the maker — still holding p — claims the
+        counter-leg and takes both (proven by tests/test_xchain_swap_regtest_e2e.py::
+        TestMakerStallAssetOnlyRefundIsTakerLoss). The correct TAKER stall recovery on BOTH the BTC
+        and ETH runbooks is :meth:`mutual_refund` (refunds BOTH legs after both timeouts). The
+        watchtower (gravity.watch.decide) routes neither counter-chain's taker here.
         """
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(
