@@ -51,13 +51,16 @@ the asset output). That is a separate follow-up.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 from pyrxd.glyph.soulbound_detect import classify_soulbound
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
     "CredentialBindingError",
+    "CredentialResolver",
     "ResolvedCredential",
+    "assert_soulbound_credential",
     "extract_owner_pkh",
     "verify_credential_binding",
 ]
@@ -90,6 +93,22 @@ class ResolvedCredential:
     current_spk: bytes
     confirmations: int
     bound_ref: bytes | None = None
+
+
+@runtime_checkable
+class CredentialResolver(Protocol):
+    """Indexer surface to resolve a credential ref to its CURRENT live UTXO.
+
+    Mirrors :class:`pyrxd.gravity.ref_authenticity.RefAuthenticityIndexer` but
+    resolves the credential's *current* (unspent) locking script — what governs
+    transferability now — rather than the genesis. ``resolve_credential`` is async
+    and MUST raise or return ``None`` (both fail-closed) when it cannot reach a
+    definitive answer; never return an optimistic stand-in.
+    """
+
+    async def resolve_credential(self, credential_ref: bytes) -> ResolvedCredential | None:
+        """Resolve ``credential_ref`` to its current UTXO, or ``None`` if unknown/spent."""
+        ...
 
 
 def extract_owner_pkh(spk: bytes) -> bytes | None:
@@ -140,31 +159,26 @@ def extract_owner_pkh(spk: bytes) -> bytes | None:
     return None
 
 
-def verify_credential_binding(
+def assert_soulbound_credential(
     credential: ResolvedCredential,
     *,
-    recipient_pkh: bytes,
     min_confirmations: int,
     expected_credential_ref: bytes | None = None,
-) -> None:
-    """Fail-closed gate: confirm a credential binds to the swap's payout owner.
+) -> bytes:
+    """Fail-closed: confirm a credential is a genuine, deep-enough soulbound token;
+    return its owner pkh.
 
-    Raises :class:`CredentialBindingError` unless ALL hold:
+    Checks (raising :class:`CredentialBindingError` on any failure):
 
     1. ``credential.current_spk`` is a genuine consensus-soulbound covenant
        (``classify_soulbound`` — NOT a plain NFT with an advisory metadata flag).
        This is what makes "owner is permanent" true and rental impossible.
-    2. the credential's embedded owner pkh equals ``recipient_pkh`` (the pkh the
-       swap covenant pins ``output[0]`` to) — the asset goes to the credential
-       owner.
-    3. ``confirmations >= min_confirmations`` (reorg safety).
-    4. if ``expected_credential_ref`` is given, the credential binds exactly it.
+    2. ``confirmations >= min_confirmations`` (reorg safety).
+    3. if ``expected_credential_ref`` is given, the credential binds exactly it.
 
-    Call this BEFORE locking the asset. Returns ``None`` on success.
+    Returns the credential's embedded owner pkh (so callers can bind the swap
+    payout to it — either directly, or against a holder-hash pin).
     """
-    if not isinstance(recipient_pkh, (bytes, bytearray)) or len(recipient_pkh) != 20:
-        raise CredentialBindingError("recipient_pkh must be 20 bytes (hash160)")
-
     cls = classify_soulbound(credential.current_spk)
 
     # (1) genuinely soulbound — the anti-rental / anti-resale root.
@@ -175,26 +189,48 @@ def verify_credential_binding(
             "rented or resold and must not gate a swap"
         )
 
-    # (4) the specific negotiated credential, if pinned.
+    # (3) the specific negotiated credential, if pinned.
     if expected_credential_ref is not None and cls.bound_ref != expected_credential_ref:
         got = cls.bound_ref.hex() if cls.bound_ref else None
         raise CredentialBindingError(
             f"credential binds ref {got}, expected {expected_credential_ref.hex()}"
         )
 
-    # (2) owner == swap recipient.
-    owner = extract_owner_pkh(credential.current_spk)
-    if owner is None:
-        raise CredentialBindingError("could not extract a single owner pkh from the credential script")
-    if owner != bytes(recipient_pkh):
-        raise CredentialBindingError(
-            f"credential owner {owner.hex()} != swap recipient {bytes(recipient_pkh).hex()} "
-            "(asset would not land with the credential owner — rental would pass the gate)"
-        )
-
-    # (3) reorg safety.
+    # (2) reorg safety.
     conf = credential.confirmations
     if not isinstance(conf, int) or isinstance(conf, bool) or conf < min_confirmations:
         raise CredentialBindingError(
             f"credential has {conf} confirmations, need >= {min_confirmations}"
+        )
+
+    owner = extract_owner_pkh(credential.current_spk)
+    if owner is None:
+        raise CredentialBindingError("could not extract a single owner pkh from the credential script")
+    return owner
+
+
+def verify_credential_binding(
+    credential: ResolvedCredential,
+    *,
+    recipient_pkh: bytes,
+    min_confirmations: int,
+    expected_credential_ref: bytes | None = None,
+) -> None:
+    """Fail-closed gate: confirm a credential binds to the swap's payout owner.
+
+    Runs :func:`assert_soulbound_credential` (genuine soulbound + confirmations +
+    optional ref) and additionally requires the credential's owner pkh to equal
+    ``recipient_pkh`` (the pkh the swap pays) — so the asset lands with the
+    credential owner. Call this BEFORE locking the asset.
+    """
+    if not isinstance(recipient_pkh, (bytes, bytearray)) or len(recipient_pkh) != 20:
+        raise CredentialBindingError("recipient_pkh must be 20 bytes (hash160)")
+
+    owner = assert_soulbound_credential(
+        credential, min_confirmations=min_confirmations, expected_credential_ref=expected_credential_ref
+    )
+    if owner != bytes(recipient_pkh):
+        raise CredentialBindingError(
+            f"credential owner {owner.hex()} != swap recipient {bytes(recipient_pkh).hex()} "
+            "(asset would not land with the credential owner — rental would pass the gate)"
         )

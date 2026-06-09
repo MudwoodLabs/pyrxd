@@ -56,6 +56,7 @@ __all__ = [
     "build_htlc_covenant_ft",
     "build_htlc_covenant_nft",
     "build_htlc_covenant_rxd",
+    "holder_hash",
 ]
 
 # The FT codeScriptHashValueSum epilogue weld (post-compile), identical to the
@@ -174,6 +175,29 @@ def _nft_holder_script(pkh: bytes, ref_wire: bytes) -> bytes:
 
 def _rxd_holder_script(pkh: bytes) -> bytes:
     return b"\x76\xa9\x14" + pkh + b"\x88\xac"
+
+
+def holder_hash(pkh: bytes, *, variant: str, genesis_ref: bytes = b"") -> bytes:
+    """``hash256`` of the holder script the covenant pins for ``pkh``.
+
+    The covenant binds ``hash256(holder_script)`` of its claim/refund destination
+    (``expected_taker_hash`` / ``expected_maker_hash``). Recompute that hash for an
+    arbitrary owner pkh — used to confirm a swap's pinned destination
+    (``taker_dest_hash``) really pays a given party (e.g. a verified credential's
+    owner), without trusting a separate pkh field.
+
+    ``genesis_ref`` (36-byte wire) is required for ``ft``/``nft`` (the holder
+    carries the asset's singleton/ref); ignored for ``rxd``.
+    """
+    if variant == "rxd":
+        return _hash256(_rxd_holder_script(pkh))
+    if len(genesis_ref) != 36:
+        raise ValidationError(f"{variant} holder hash requires a 36-byte genesis_ref")
+    if variant == "ft":
+        return _hash256(_ft_holder_script(pkh, genesis_ref))
+    if variant == "nft":
+        return _hash256(_nft_holder_script(pkh, genesis_ref))
+    raise ValidationError(f"unknown asset variant {variant!r} (expected rxd|ft|nft)")
 
 
 # --------------------------------------------------------------------------- static guards

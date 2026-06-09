@@ -261,6 +261,12 @@ class NegotiatedTerms:
     # validated so the coordinator's cross-clock ordering gate checks the actual on-chain
     # deadline, not the relative ``t_btc`` placeholder (audit HIGH-1). None for a BTC swap.
     eth_timeout_unix_s: int | None = None
+    # Optional credential gating: the 36-byte singleton ref of a soulbound credential
+    # the COUNTERPARTY (taker) must own for this swap to fund. Empty => no credential
+    # gate (every existing construction unchanged). Enforced by the coordinator's
+    # pre_btc_lock_check (genuine-soulbound + owner==payout binding); see
+    # pyrxd.glyph.credential_binding.
+    credential_ref: bytes = b""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "hashlock", _b32(self.hashlock, "hashlock"))
@@ -320,6 +326,9 @@ class NegotiatedTerms:
             raise ValidationError(f"{self.asset_variant} requires a non-empty genesis_ref")
         object.__setattr__(self, "taker_dest_hash", _b32(self.taker_dest_hash, "taker_dest_hash"))
         object.__setattr__(self, "maker_dest_hash", _b32(self.maker_dest_hash, "maker_dest_hash"))
+        object.__setattr__(self, "credential_ref", _bany(self.credential_ref, "credential_ref"))
+        if len(self.credential_ref) not in (0, 36):
+            raise ValidationError("credential_ref must be empty or 36 bytes (singleton ref wire form)")
         if self.counter_chain == "btc":
             object.__setattr__(
                 self, "btc_claim_pubkey_xonly", _b32(self.btc_claim_pubkey_xonly, "btc_claim_pubkey_xonly")
@@ -366,6 +375,8 @@ class NegotiatedTerms:
             d["value_amount"] = self.value_amount
         if self.eth_timeout_unix_s is not None:
             d["eth_timeout_unix_s"] = self.eth_timeout_unix_s
+        if self.credential_ref:
+            d["credential_ref"] = self.credential_ref.hex()
         return d
 
     @classmethod
@@ -385,6 +396,7 @@ class NegotiatedTerms:
             counter_chain=str(d.get("counter_chain", "btc")),  # legacy records → btc
             value_amount=int(d.get("value_amount", 0)),  # 0 sentinel → __post_init__ = btc_sats
             eth_timeout_unix_s=(int(d["eth_timeout_unix_s"]) if d.get("eth_timeout_unix_s") is not None else None),
+            credential_ref=bytes.fromhex(d["credential_ref"]) if d.get("credential_ref") else b"",
         )
 
 
