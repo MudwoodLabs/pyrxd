@@ -28,7 +28,6 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from ..hd.bip32 import Xpub
 from .errors import SignerDeclined, SignerError
 from .hygiene import harden_process
 from .protocol import SigningRequest
@@ -40,6 +39,12 @@ _UCRED = struct.Struct("3i")
 
 #: Default idle window before auto-lock (15 minutes).
 DEFAULT_IDLE_TIMEOUT_S = 900.0
+
+#: Max time to RECEIVE a complete request frame from an accepted peer, so a same-uid
+#: client that connects then stalls cannot wedge the serial accept loop (security-panel
+#: M3). It bounds only the recv of the request — the post-recv confirmation wait (which
+#: blocks on the human at the tty) is not a socket op and is unaffected.
+_CONN_TIMEOUT_S = 30.0
 
 
 class AgentDaemon:
@@ -59,8 +64,9 @@ class AgentDaemon:
         self._wallet = wallet
         self._signer: AgentSigner | None = AgentSigner(wallet)
         # The account xpub is public — cache it so it survives lock() and the CLI
-        # can keep building watch-only after the seed is gone.
-        self._account_xpub = str(Xpub.from_xprv(wallet._xprv))
+        # can keep building watch-only after the seed is gone. Via the public seam
+        # (no reach into wallet internals — security-panel M2).
+        self._account_xpub = str(wallet.account_xpub())
         self._socket_path = Path(socket_path)
         self._confirm = confirm
         self._idle_timeout_s = idle_timeout_s
@@ -106,7 +112,9 @@ class AgentDaemon:
                 with conn:
                     self._serve_conn(conn)
         finally:
-            self._close_socket()
+            # Backstop: ANY exit from the loop (break, exception, return) scrubs the
+            # seed + drops the key, not just the lock-op/idle paths (security-panel H2).
+            self.lock()
 
     def lock(self) -> None:
         """Zeroize the seed, drop the wallet, and stop serving. Idempotent."""
@@ -115,7 +123,7 @@ class AgentDaemon:
         self._locked = True
         wallet, self._wallet, self._signer = self._wallet, None, None
         try:
-            wallet._seed.zeroize()
+            wallet.zeroize()  # scrubs the seed + drops the signing-key reference (H1)
         except Exception:  # nosec B110 — best-effort scrub; locking must succeed even if zeroize raises
             pass
         self._close_socket()
@@ -173,9 +181,12 @@ class AgentDaemon:
         if uid is None or not self._peer_authorized(uid):
             self._safe_send(conn, {"ok": False, "kind": "error", "error": "peer not authorized"})
             return
+        # Bound the request recv so a stalled same-uid client cannot wedge the loop (M3).
+        conn.settimeout(_CONN_TIMEOUT_S)
         try:
             req = recv_frame(conn)
-        except SignerError as exc:
+        except (SignerError, OSError) as exc:
+            # OSError covers a recv timeout (TimeoutError) / reset from a slow or gone peer.
             self._safe_send(conn, {"ok": False, "kind": "error", "error": str(exc)})
             return
         self._safe_send(conn, self._dispatch(req))

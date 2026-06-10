@@ -336,12 +336,14 @@ Cross-reference of controls and the threats they address:
 | Sole-authority audit gate (covenant-less use fails closed) | TA6 | `src/pyrxd/spv/proof.py:require_spv_sole_authority_cleared` |
 | SPV verification (Gravity) | TA6, TA8 | `src/pyrxd/spv/`, `src/pyrxd/gravity/` |
 | Gravity red-team test suite | TA8 | `tests/test_gravity_red_team.py` (1500+ lines) |
-| Agent per-spend confirmation on `/dev/tty` (fails closed w/o tty) | S18 | `src/pyrxd/agent/confirm.py`, `signer.py` |
+| Agent per-spend confirmation on `/dev/tty`, threshold 0 = always confirm incl. self-spends (fails closed w/o tty; utf-8) | S18 | `src/pyrxd/agent/confirm.py`, `signer.py` |
+| Agent refuses unattributable outputs (non-P2PKH/non-OP_RETURN) so the user always sees a verifiable destination | S18 | `src/pyrxd/agent/signer.py:_summarize` |
+| Agent bounds attacker-supplied derivation coords (change∈{0,1}, index≤cap) before any key derivation | S18 (pre-confirm DoS) | `src/pyrxd/agent/signer.py:_check_coords` |
 | Agent prevout authenticity (source-tx verified, value/script from real prevout) | S19 | `src/pyrxd/agent/signer.py:_verify_and_prepare_input` |
 | Agent `ALL\|FORKID`-only sighash + fully-owned-only | S19 | `src/pyrxd/agent/signer.py` |
 | Agent never returns key material (conformance-tested) | S18 | `src/pyrxd/agent/signer.py`, `tests/test_agent_signer.py` |
-| Agent socket: `0700` dir + `0600` socket + `SO_PEERCRED` uid==owner | TA1 (other-uid) | `src/pyrxd/agent/daemon.py:_bind/_read_peer_uid` |
-| Agent idle auto-lock + on-demand `lock` (seed zeroized) | A11 window | `src/pyrxd/agent/daemon.py:lock`, `_should_autolock` |
+| Agent socket: `0700` dir + `0600` socket + `SO_PEERCRED` uid==owner; per-conn recv timeout (anti-slow-loris) | TA1 (other-uid) | `src/pyrxd/agent/daemon.py:_bind/_read_peer_uid/_serve_conn` |
+| Agent lock scrubs the seed AND drops the signing-key reference; idle auto-lock + on-demand `lock` + SIGTERM/SIGHUP/atexit | A11 window | `src/pyrxd/agent/daemon.py:lock`, `hd/wallet.py:zeroize`, `cli/agent_cmds.py` |
 | Agent process hygiene (mlock, PR_SET_DUMPABLE 0, no core dumps; best-effort) | A11 residency | `src/pyrxd/agent/hygiene.py` |
 | CodeQL on every push | static analysis | `.github/workflows/codeql.yml` |
 | Bandit on every push | security smells | `.github/workflows/ci.yml` |
@@ -361,7 +363,7 @@ Honest list. These are not vulnerabilities; they're places where pyrxd's defense
 2. **No formal verification of BIP32/39/44 vectors** beyond unit tests. Test vectors come from the BIP specs themselves.
 3. **No fuzz testing of the CLI surface.** [Issue #10.](https://github.com/MudwoodLabs/pyrxd/issues/10)
 4. **No timing-attack analysis** of pyrxd-internal comparisons beyond known-good `hmac.compare_digest` use.
-5. **Memory zeroization is best-effort** — CPython does not guarantee secure memory.
+5. **Memory zeroization is best-effort** — CPython does not guarantee secure memory. Specifically, the signing agent's seed (a `SecretBytes`) IS `memset` on lock, but the account xprv's private bytes are immutable `bytes` and partly held in libsecp256k1's C memory; `HdWallet.zeroize()` drops the reference (GC-eligible) but cannot overwrite those copies in place. Residency past lock is bounded by the agent's best-effort process hygiene (`mlock`/`PR_SET_DUMPABLE 0`/no core dumps), not a guaranteed erase. A future hardening would re-derive the xprv transiently from the seed per signing op so the only resident long-lived secret is the scrubbable seed.
 
 ### Network
 

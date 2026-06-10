@@ -20,7 +20,7 @@ and requires confirmation before signing.
 
 from __future__ import annotations
 
-from .client import AgentClient
+from .client import AgentClient, agent_socket_path
 from .confirm import TtyConfirmer, format_spend_summary
 from .daemon import AgentDaemon
 from .discover import WatchOnlyScan, collect_watch_only_utxos
@@ -47,6 +47,7 @@ __all__ = [
     "WatchOnlyScan",
     "WatchOnlyTxBuilder",
     "WatchOnlyUtxo",
+    "agent_socket_path",
     "collect_watch_only_utxos",
     "format_spend_summary",
 ]

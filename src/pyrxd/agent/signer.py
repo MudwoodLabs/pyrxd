@@ -38,6 +38,22 @@ from .protocol import ExternalOutput, SignedResult, SigningRequest, SpendSummary
 #: Confirmation gate: given the verified spend summary, return True to sign.
 ConfirmFn = Callable[[SpendSummary], bool]
 
+#: BIP44 chains the agent will derive (external/receive, internal/change). Any other
+#: ``change`` value in a request is refused (security-panel M5).
+_VALID_CHANGE = (0, 1)
+#: Upper bound on a derivation index a request may ask the agent to derive. Far above
+#: any real gap-limited wallet; caps an attacker-chosen index from driving unbounded
+#: secp256k1 derivations on the seed-holding loop before any confirmation (M5).
+_MAX_DERIVATION_INDEX = 100_000
+
+
+def _check_coords(change: int, index: int, *, what: str) -> None:
+    """Reject out-of-range BIP44 coords before any key derivation (M5, fail-closed)."""
+    if change not in _VALID_CHANGE:
+        raise SignerError(f"{what}: change must be 0 or 1, got {change!r}")
+    if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index <= _MAX_DERIVATION_INDEX:
+        raise SignerError(f"{what}: index out of range (0..{_MAX_DERIVATION_INDEX}), got {index!r}")
+
 
 def _is_p2pkh(script: bytes) -> bool:
     return len(script) == 25 and script[:3] == b"\x76\xa9\x14" and script[23:] == b"\x88\xac"
@@ -112,7 +128,8 @@ class AgentSigner:
         if not _is_p2pkh(script):
             raise SignerError(f"input {inp.input_index} is not P2PKH (agent v1 signs P2PKH only)")
 
-        privkey = self._wallet._privkey_for(inp.change, inp.index)
+        _check_coords(inp.change, inp.index, what=f"input {inp.input_index}")
+        privkey = self._wallet.privkey_for(inp.change, inp.index)
         if privkey.public_key().hash160() != script[3:23]:
             raise SignerError(
                 f"derived key (change={inp.change}, index={inp.index}) does not own input {inp.input_index}"
@@ -147,7 +164,8 @@ class AgentSigner:
         for claim in request.change_claims:
             if not 0 <= claim.output_index < len(tx.outputs):
                 raise SignerError(f"change claim output_index {claim.output_index} out of range")
-            addr = self._wallet._derive_address(claim.change, claim.index)
+            _check_coords(claim.change, claim.index, what=f"change claim {claim.output_index}")
+            addr = self._wallet.derive_address(claim.change, claim.index)
             claim_pkh = address_to_public_key_hash(addr)
             out_script = tx.outputs[claim.output_index].locking_script.serialize()
             if not _is_p2pkh(out_script) or out_script[3:23] != claim_pkh:
@@ -163,6 +181,16 @@ class AgentSigner:
             if idx in change_indices:
                 change_total += out.satoshis
             else:
+                # v1 attributes only P2PKH payees and OP_RETURN data. A non-P2PKH,
+                # non-OP_RETURN output cannot be meaningfully shown to the user (it would
+                # render as truncated hex), which would weaken the confirmation control —
+                # so refuse to sign it rather than display something unverifiable (M4).
+                script = out.locking_script.serialize()
+                if not _is_p2pkh(script) and script[:1] != b"\x6a":
+                    raise SignerError(
+                        f"output {idx} is neither P2PKH nor OP_RETURN; agent v1 will not sign a "
+                        "transaction with an unattributable output (cannot show it for confirmation)"
+                    )
                 external.append(ExternalOutput(output_index=idx, dest=_dest_of(out), amount=out.satoshis))
 
         # All inputs are verified+bound at this point (fully-owned invariant).

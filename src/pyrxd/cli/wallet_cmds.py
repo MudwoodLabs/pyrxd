@@ -16,7 +16,7 @@ from typing import cast
 
 import click
 
-from ..agent import AgentClient, SignerDeclined, WatchOnlyTxBuilder, collect_watch_only_utxos
+from ..agent import AgentClient, SignerDeclined, WatchOnlyTxBuilder, agent_socket_path, collect_watch_only_utxos
 from ..constants import Network
 from ..hd.bip32 import Xpub
 from ..hd.bip39 import mnemonic_from_entropy
@@ -593,7 +593,7 @@ def wallet_sweep(
 
 def _agent_socket(ctx: CliContext):
     """The signing-agent socket co-located with the wallet (see `pyrxd agent`)."""
-    return ctx.wallet_path.parent / "agent.sock"
+    return agent_socket_path(ctx.wallet_path)
 
 
 def _send_summary(ctx: CliContext, *, to_address: str, amount: int, fee: int, inputs: int, signer: str) -> bool:

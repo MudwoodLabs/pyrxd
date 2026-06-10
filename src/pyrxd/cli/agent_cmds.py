@@ -17,11 +17,12 @@ the same terminal if you want your shell back — ``/dev/tty`` still reaches you
 
 from __future__ import annotations
 
-from pathlib import Path
+import atexit
+import signal
 
 import click
 
-from ..agent import AgentClient, AgentDaemon, TtyConfirmer
+from ..agent import AgentClient, AgentDaemon, TtyConfirmer, agent_socket_path
 from ..agent.daemon import DEFAULT_IDLE_TIMEOUT_S
 from ..hd.wallet import HdWallet
 from ..security.errors import ValidationError
@@ -31,9 +32,9 @@ from .format import emit
 from .prompts import prompt_mnemonic_input, prompt_passphrase_input
 
 
-def _socket_path(ctx: CliContext) -> Path:
+def _socket_path(ctx: CliContext):
     """The agent socket sits next to the wallet file (``--wallet`` co-locates it)."""
-    return ctx.wallet_path.parent / "agent.sock"
+    return agent_socket_path(ctx.wallet_path)
 
 
 @click.group(name="agent")
@@ -126,6 +127,19 @@ def agent_unlock(ctx: CliContext, idle_timeout: float, auto_confirm_under: int, 
         confirm=TtyConfirmer(auto_confirm_under=auto_confirm_under),
         idle_timeout_s=idle_timeout,
     )
+
+    # Scrub on any exit path, not just Ctrl-C (security-panel H2): SIGTERM/SIGHUP
+    # (kill, logout) and a normal process exit must also zeroize. lock() is
+    # idempotent, so the overlapping handlers + atexit + serve_forever's own
+    # finally are all safe.
+    def _scrub_and_exit(signum, _frame):
+        daemon.lock()
+        raise SystemExit(128 + signum)
+
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(_sig, _scrub_and_exit)
+    atexit.register(daemon.lock)
+
     click.echo(f"pyrxd agent: unlocked. Serving on {sock}.")
     click.echo("  Per-spend confirmations appear in THIS terminal. Ctrl-C to lock and exit.")
     try:

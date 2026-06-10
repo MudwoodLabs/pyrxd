@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING
 
 from Cryptodome.Cipher import AES
 
-from ..hd.bip32 import Xprv, bip32_derive_xprv_from_mnemonic
+from ..hd.bip32 import Xprv, Xpub, bip32_derive_xprv_from_mnemonic
 from ..hd.bip39 import seed_from_mnemonic
 from ..keys import PrivateKey
 from ..network.electrumx import UtxoRecord, script_hash_for_address
@@ -64,7 +64,7 @@ from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
 from ..transaction.transaction_output import TransactionOutput
 from ..utils import validate_address
-from ..wallet import DEFAULT_FEE_RATE, DUST_THRESHOLD
+from ..wallet import DEFAULT_FEE_RATE, DUST_THRESHOLD, greedy_select_count
 
 if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient
@@ -740,6 +740,39 @@ class HdWallet:
         """Return the PrivateKey at ``m/.../change/index`` from the account xprv."""
         return self._xprv.ckd(change).ckd(index).private_key()
 
+    # ------------------------------------------------------------------
+    # Public signing seam (used by the signing agent, so it does not reach
+    # into private attributes — security-panel M2). Derive-only + zeroize;
+    # never exports key material.
+
+    def account_xpub(self) -> Xpub:
+        """The account-level xpub (watch-only safe; no private key)."""
+        return self._xprv.xpub()
+
+    def privkey_for(self, change: int, index: int) -> PrivateKey:
+        """Derive the signing key at ``change/index`` (public seam over ``_privkey_for``)."""
+        return self._privkey_for(change, index)
+
+    def derive_address(self, change: int, index: int) -> str:
+        """Derive the P2PKH address at ``change/index`` (public seam)."""
+        return self._derive_address(change, index)
+
+    def zeroize(self) -> None:
+        """Scrub the seed and drop the account-xprv reference; the wallet cannot sign after.
+
+        The 64-byte seed lives in a :class:`SecretBytes` and IS memset here. The
+        account xprv's private bytes, however, are immutable ``bytes``
+        (:class:`~pyrxd.hd.bip32.Xkey`) and partly held inside libsecp256k1's C
+        memory (coincurve) — CPython cannot overwrite either in place, so we drop
+        the reference (making them GC-eligible) rather than pretend to erase them.
+        Residency of those copies until the pages are reused is bounded by the
+        signing agent's best-effort process hygiene (``mlock`` / ``PR_SET_DUMPABLE 0``
+        / no core dumps), NOT a guaranteed erase. This matches the threat model's
+        documented best-effort memory limit; do not over-state it as "erased".
+        """
+        self._seed.zeroize()
+        self._xprv = None  # type: ignore[assignment]  # wallet is intentionally dead after zeroize
+
     def _next_change_index(self) -> int:
         """Return the next unused internal-chain index for change outputs.
 
@@ -857,27 +890,22 @@ class HdWallet:
         elif not validate_address(change_address):
             raise ValidationError("change_address is not a valid P2PKH address")
 
-        # Greedy descending-by-value selection.
+        # Greedy descending-by-value selection (shared algorithm; see greedy_select_count).
         sorted_triples = sorted(triples, key=lambda t: t[0].value, reverse=True)
 
         recipient_script = P2PKH().lock(to_address)
         change_script = P2PKH().lock(change_address)
 
-        min_input_bytes = 148
-        per_input_fee_cushion = min_input_bytes * fee_rate
+        per_input_fee_cushion = 148 * fee_rate
         base_fee_cushion = 80 * fee_rate
-
-        selected: list[tuple[UtxoRecord, str, PrivateKey]] = []
-        total_in = 0
-        for triple in sorted_triples:
-            selected.append(triple)
-            total_in += triple[0].value
-            target = photons + base_fee_cushion + per_input_fee_cushion * len(selected)
-            if total_in >= target:
-                break
-
-        if total_in < photons:
-            raise ValidationError("Insufficient funds for requested amount")
+        n_selected = greedy_select_count(
+            [t[0].value for t in sorted_triples],
+            photons,
+            base_cushion=base_fee_cushion,
+            per_input_cushion=per_input_fee_cushion,
+        )
+        selected: list[tuple[UtxoRecord, str, PrivateKey]] = sorted_triples[:n_selected]
+        total_in = sum(t[0].value for t in selected)
 
         # Trial pass.
         inputs = [self._build_utxo_input(u, addr, pk) for u, addr, pk in selected]
