@@ -18,6 +18,15 @@ from .protocol import SignedResult, SigningRequest
 from .transport import recv_frame, send_frame
 
 
+def agent_socket_path(wallet_path: Path) -> Path:
+    """The agent socket co-located with the wallet file: ``<wallet dir>/agent.sock``.
+
+    Single definition so the CLI's ``agent`` and ``wallet send`` commands cannot drift
+    to different (possibly looser) socket locations (security-panel M6).
+    """
+    return Path(wallet_path).parent / "agent.sock"
+
+
 class AgentClient:
     """Talks to a running :class:`~pyrxd.agent.daemon.AgentDaemon`."""
 

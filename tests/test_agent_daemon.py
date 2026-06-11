@@ -184,6 +184,17 @@ def test_tty_confirmer_fails_closed_without_tty(monkeypatch: pytest.MonkeyPatch)
     assert TtyConfirmer(auto_confirm_under=0)(_summary(120_000)) is False
 
 
+def test_zero_threshold_does_not_auto_confirm_self_spend(monkeypatch: pytest.MonkeyPatch) -> None:
+    # M1: at the default threshold 0, a self-spend (total_external == 0) must NOT be
+    # auto-approved — it must reach the tty path (which fails closed here), proving the
+    # agent did not silently sign a no-external-payee spend.
+    def _no_tty(*_a, **_k):
+        raise OSError("no controlling tty")
+
+    monkeypatch.setattr(confirm_mod, "open", _no_tty, raising=False)
+    assert TtyConfirmer(auto_confirm_under=0)(_summary(0)) is False
+
+
 # ──────────────────────────────── hygiene ──────────────────────────────────────
 
 
@@ -284,6 +295,45 @@ def test_lock_zeroizes_seed_and_stops(tmp_path) -> None:
     assert not sock_path.exists()  # socket cleaned up
     with pytest.raises(KeyMaterialError):  # seed scrubbed → access after zeroize raises
         w._seed.unsafe_raw_bytes()
+
+
+def test_lock_drops_signing_key_not_just_seed(tmp_path) -> None:
+    # H1: lock() must scrub the seed AND drop the signing-key reference, so the wallet
+    # cannot derive/sign afterward (the seed-only zeroize left the xprv live before).
+    w = _wallet()
+    daemon = AgentDaemon(w, socket_path=tmp_path / "agent.sock", confirm=_ACCEPT, harden=False)
+    t = _start(daemon)
+    AgentClient(tmp_path / "agent.sock").lock()
+    t.join(timeout=3)
+    with pytest.raises(KeyMaterialError):
+        w._seed.unsafe_raw_bytes()  # seed scrubbed
+    with pytest.raises(Exception):  # signing key dropped → cannot derive
+        w.privkey_for(0, 0)
+
+
+def test_public_seam_matches_private_derivation() -> None:
+    # M2: the agent-facing public seam must agree with the wallet's own derivation.
+    w = _wallet()
+    assert str(w.account_xpub()) == str(Xpub.from_xprv(w._xprv))
+    assert w.derive_address(0, 3) == w._derive_address(0, 3)
+    assert w.privkey_for(1, 2).serialize() == w._privkey_for(1, 2).serialize()
+
+
+def test_stalled_client_does_not_wedge_daemon(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # M3: a same-uid client that connects then sends nothing must not block the serial
+    # loop forever — the per-conn recv timeout lets the daemon recover and serve others.
+    monkeypatch.setattr("pyrxd.agent.daemon._CONN_TIMEOUT_S", 0.3)
+    daemon = AgentDaemon(_wallet(), socket_path=tmp_path / "agent.sock", confirm=_ACCEPT, harden=False)
+    t = _start(daemon)
+    staller = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        staller.connect(str(tmp_path / "agent.sock"))  # connect, then send NOTHING
+        # A well-behaved client is still served once the staller's recv times out.
+        assert AgentClient(tmp_path / "agent.sock", connect_timeout_s=5.0).is_live() is True
+    finally:
+        staller.close()
+        daemon.lock()
+        t.join(timeout=3)
 
 
 def test_idle_autolock_fires(tmp_path) -> None:

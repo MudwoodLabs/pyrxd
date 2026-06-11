@@ -41,6 +41,28 @@ DUST_THRESHOLD: int = 546
 DEFAULT_FEE_RATE: int = 10_000
 
 
+def greedy_select_count(values_desc: list[int], photons: int, *, base_cushion: int, per_input_cushion: int) -> int:
+    """Greedy descending-by-value coin selection — the SHARED algorithm.
+
+    ``values_desc`` must already be sorted high→low. Returns how many inputs to
+    take to cover ``photons`` plus an estimated fee of
+    ``base_cushion + per_input_cushion * n_selected``. Callers pass their own
+    cushion (the in-process path measures the real signed size afterwards; the
+    watch-only path keeps the estimate). One algorithm, so the two paths cannot
+    drift apart in WHICH coins they pick (security-panel H3).
+
+    Raises :class:`ValidationError` if the inputs cannot cover ``photons`` at all.
+    """
+    total = 0
+    for i, value in enumerate(values_desc, start=1):
+        total += value
+        if total >= photons + base_cushion + per_input_cushion * i:
+            return i
+    if total < photons:
+        raise ValidationError("Insufficient funds for requested amount")
+    return len(values_desc)
+
+
 class RxdWallet:
     """High-level wallet for plain RXD (photon) transfers on Radiant.
 

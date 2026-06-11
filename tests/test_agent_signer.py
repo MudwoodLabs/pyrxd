@@ -228,3 +228,48 @@ def test_request_dict_roundtrip() -> None:
     _w, req, _u, _s = _scenario()
     again = SigningRequest.from_dict(req.to_dict())
     assert again == req
+
+
+# ─────────────────── security-panel hardening regressions ────────────────────
+
+
+def test_refuses_unattributable_non_p2pkh_output() -> None:
+    # M4: a payee that is neither P2PKH nor OP_RETURN can't be shown for confirmation,
+    # so the agent refuses rather than display opaque hex the user can't verify.
+    from pyrxd.script.script import Script
+
+    w = _wallet()
+    src0 = _src(w, 0, 0, 100_000)
+    unsigned = Transaction()
+    unsigned.add_input(_unsigned_input(src0, 0))
+    unsigned.add_output(TransactionOutput(Script(b"\x51"), 90_000))  # bare OP_TRUE — not P2PKH/OP_RETURN
+    req = SigningRequest(
+        unsigned_tx_hex=unsigned.serialize().hex(),
+        inputs=(InputToSign(0, 0, 0, src0.serialize().hex()),),
+    )
+    with pytest.raises(SignerError, match="P2PKH nor OP_RETURN"):
+        AgentSigner(w).sign(req, confirm=_ACCEPT)
+
+
+def test_refuses_out_of_range_change() -> None:
+    # M5: change must be 0 or 1; an out-of-range value is rejected BEFORE any derivation.
+    w, req, _u, _s = _scenario()
+    bad = SigningRequest(
+        unsigned_tx_hex=req.unsigned_tx_hex,
+        inputs=(InputToSign(0, 5, 0, req.inputs[0].source_tx_hex), req.inputs[1]),
+        change_claims=req.change_claims,
+    )
+    with pytest.raises(SignerError, match="change must be 0 or 1"):
+        AgentSigner(w).sign(bad, confirm=_ACCEPT)
+
+
+def test_refuses_absurd_derivation_index() -> None:
+    # M5: a huge attacker-chosen index is refused before it can drive unbounded derivation.
+    w, req, _u, _s = _scenario()
+    bad = SigningRequest(
+        unsigned_tx_hex=req.unsigned_tx_hex,
+        inputs=(InputToSign(0, 0, 10**9, req.inputs[0].source_tx_hex), req.inputs[1]),
+        change_claims=req.change_claims,
+    )
+    with pytest.raises(SignerError, match="index out of range"):
+        AgentSigner(w).sign(bad, confirm=_ACCEPT)

@@ -54,10 +54,16 @@ class TtyConfirmer:
         self._threshold = auto_confirm_under
 
     def __call__(self, summary: SpendSummary) -> bool:
-        if summary.total_external <= self._threshold:
+        # Only skip the prompt when a POSITIVE threshold is set and the spend is under it.
+        # At the default 0 this never skips — including a self-spend (total_external == 0),
+        # which must still be confirmed, not silently signed (security-panel M1).
+        if self._threshold > 0 and summary.total_external <= self._threshold:
             return True
         try:
-            tty = open("/dev/tty", "r+")  # noqa: SIM115 — need explicit lifetime around the prompt
+            # utf-8 + replace: the summary uses box/arrow glyphs; under a C/non-UTF-8 locale
+            # a default-encoding write would raise UnicodeEncodeError (a ValueError, NOT an
+            # OSError) and escape the fail-closed guard below (M7).
+            tty = open("/dev/tty", "r+", encoding="utf-8", errors="replace")  # noqa: SIM115 — explicit lifetime
         except OSError:
             # No controlling terminal (detached daemon) → cannot ask → fail closed.
             return False
