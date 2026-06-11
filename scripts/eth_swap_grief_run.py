@@ -133,7 +133,11 @@ async def run(args) -> None:
         radiant_leg=rxd_leg,
         indexer=None,
         seen_store=InMemSeen(),
-        config=CoordinatorConfig(margin_policy=_policy(args), accept_nondurable_seen=True),
+        # accept_estimated_eth_margins: operator-gated DUST griefing run; consciously accepts
+        # estimated-margin risk on negligible value (MEDIUM-1). Non-dust value → measured policy.
+        config=CoordinatorConfig(
+            margin_policy=_policy(args), accept_nondurable_seen=True, accept_estimated_eth_margins=True
+        ),
     )
 
     try:

@@ -2198,3 +2198,70 @@ async def test_eth_post_confirm_reverify_failure_refuses_both_locked():
         await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms), now_unix_s=_NOW)
     assert coord.record.state is SwapState.BTC_LOCKED  # did NOT advance
     assert rxd.claimed_with is None
+
+
+# ---------------------------------------------------------------------------
+# MEDIUM-1 (whole-stack audit): value-bearing ETH leg must not silently run on
+# an estimated policy (which disables the verify->lock 'finalized' reorg pin +
+# the proactive-refund N-floor). Refuse at construction unless explicitly accepted.
+# ---------------------------------------------------------------------------
+
+
+def _value_bearing_radiant() -> FakeRadiantLeg:
+    rl = FakeRadiantLeg()
+    rl.network = "mainnet"  # not in AUDIT_CLEARED_NETWORKS => value-bearing
+    return rl
+
+
+def _construct_eth_coord(*, policy, accept_estimated=False, radiant_leg=None, window=8):
+    h = hashlib.sha256(os.urandom(32)).digest()
+    return SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_eth_terms(hashlock=h)),
+        counter_leg=FakeEthLeg(preimage=SecretBytes(os.urandom(32)), verdict=_final()),
+        radiant_leg=radiant_leg if radiant_leg is not None else _value_bearing_radiant(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(
+            margin_policy=policy,
+            accept_nondurable_seen=True,
+            accept_estimated_eth_margins=accept_estimated,
+            maker_stall_safety_window_blocks=window,
+        ),
+    )
+
+
+def test_value_bearing_eth_estimated_policy_refused():
+    # is_measured=False on a value-bearing ETH swap, no explicit opt-in -> refused.
+    with pytest.raises(ValidationError, match="value-bearing ETH"):
+        _construct_eth_coord(policy=_eth_finality_policy(is_measured=False))
+
+
+def test_value_bearing_eth_estimated_allowed_with_explicit_optin():
+    # Conscious dust-run acceptance (accept_estimated_eth_margins=True) -> constructs.
+    coord = _construct_eth_coord(policy=_eth_finality_policy(is_measured=False), accept_estimated=True)
+    assert coord is not None
+
+
+def test_value_bearing_eth_allowed_when_measured():
+    # A measured policy is the proper fix path; window>=N-floor (8) -> constructs.
+    coord = _construct_eth_coord(policy=_eth_finality_policy(is_measured=True), window=8)
+    assert coord is not None
+
+
+def test_non_value_bearing_eth_estimated_unaffected():
+    # No mainnet leg tag -> not value-bearing -> the MEDIUM-1 guard does not fire.
+    coord = _construct_eth_coord(policy=_eth_finality_policy(is_measured=False), radiant_leg=FakeRadiantLeg())
+    assert coord is not None
+
+
+def test_value_bearing_btc_estimated_unaffected():
+    # The guard is ETH-specific; a value-bearing BTC swap on an estimated policy still constructs.
+    coord = SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms()),
+        btc_leg=FakeBtcLeg(),
+        radiant_leg=_value_bearing_radiant(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(), accept_nondurable_seen=True),
+    )
+    assert coord is not None

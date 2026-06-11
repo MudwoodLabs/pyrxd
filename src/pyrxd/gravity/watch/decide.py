@@ -351,7 +351,7 @@ def decide(
         if refund_due:
             return Decision(
                 Intent.PAGE_REFUND,
-                reason="maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund (broadcast once both timeouts elapse)",
+                reason="maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund. The deadline shown is t_rxd, when the maker's CSV refund opens (the danger), NOT a mutual_refund deadline: mutual_refund's counter leg cannot mature until t_btc > t_rxd, so broadcast it once BOTH timeouts have elapsed",
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
@@ -538,7 +538,7 @@ def _decide_eth(
         if refund_due:
             return Decision(
                 Intent.PAGE_REFUND,
-                reason="maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund (broadcast once both timeouts elapse)",
+                reason="maker has not claimed and t_rxd maturity approaching — prepare to mutual_refund. The deadline shown is t_rxd, when the maker's CSV refund opens (the danger), NOT a mutual_refund deadline: mutual_refund's counter leg cannot mature until t_btc > t_rxd, so broadcast it once BOTH timeouts have elapsed",
                 recommended_action="mutual_refund",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,

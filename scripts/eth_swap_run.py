@@ -318,9 +318,7 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             if not args.nft_owner_wif:
                 raise SystemExit("--nft-reuse-reveal-txid requires --nft-owner-wif (to spend the singleton)")
             print(f"\n  --- NFT path: REUSING already-minted NFT at reveal {args.nft_reuse_reveal_txid} (no mint) ---")
-            minted = load_minted_nft(
-                rxd_client, reveal_txid=args.nft_reuse_reveal_txid, owner_wif=args.nft_owner_wif
-            )
+            minted = load_minted_nft(rxd_client, reveal_txid=args.nft_reuse_reveal_txid, owner_wif=args.nft_owner_wif)
         else:
             print("\n  --- NFT path: minting a fresh throwaway NFT on RXD MAINNET (commit→reveal, real-value) ---")
             minted = mint_nft_inline(
@@ -423,7 +421,10 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         else:
             indexer = SshTrHttpRefAdapter(chain_io=chain_io, ssh_host=args.rxd_ssh_host, api_base=args.rxd_api_base)
             print(f"  REF gate: REST SshTrHttpRefAdapter via ssh {args.rxd_ssh_host} -> {args.rxd_api_base}")
-    cfg = CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True)
+    # accept_estimated_eth_margins: this is an operator-gated DUST run that consciously
+    # accepts estimated-margin risk (is_measured=False) on negligible value (MEDIUM-1). A
+    # real (non-dust) value-bearing ETH swap MUST use MarginPolicy.measured(...) instead.
+    cfg = CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True, accept_estimated_eth_margins=True)
     coord = SwapCoordinator(
         record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=eth_leg,
@@ -589,15 +590,31 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--asset-variant", choices=("rxd", "nft", "ft"), default="rxd")
     ap.add_argument("--ft-name", default="ETH-RXD-REAL-FT")
     ap.add_argument("--ft-ticker", default="ERFT")
-    ap.add_argument("--ft-premine-photons", type=int, default=10_000_000)  # FT supply = covenant-locked amount (1 photon = 1 unit)
-    ap.add_argument("--ft-reuse-reveal-txid", default="", help="reuse an already-minted FT at this reveal txid (skip minting)")
-    ap.add_argument("--ft-owner-wif", default="", help="owner WIF for --ft-reuse-reveal-txid (spends the FT into the covenant)")
-    ap.add_argument("--rxd-indexer-ws", default="", help="OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api over ssh-tr")
+    ap.add_argument(
+        "--ft-premine-photons", type=int, default=10_000_000
+    )  # FT supply = covenant-locked amount (1 photon = 1 unit)
+    ap.add_argument(
+        "--ft-reuse-reveal-txid", default="", help="reuse an already-minted FT at this reveal txid (skip minting)"
+    )
+    ap.add_argument(
+        "--ft-owner-wif", default="", help="owner WIF for --ft-reuse-reveal-txid (spends the FT into the covenant)"
+    )
+    ap.add_argument(
+        "--rxd-indexer-ws",
+        default="",
+        help="OPTIONAL glyph-enabled ElectrumX ws/wss URL for the NFT REF gate; if omitted, resolve via the REST api over ssh-tr",
+    )
     ap.add_argument("--rxd-indexer-insecure", action="store_true", help="allow a non-TLS RXinDexer ws")
     ap.add_argument("--rxd-ssh-host", default="tr", help="ssh host for the RXinDexer REST REF gate (default tr)")
     ap.add_argument("--rxd-api-base", default="http://127.0.0.1:8000", help="RXinDexer REST api base on the ssh host")
-    ap.add_argument("--nft-reuse-reveal-txid", default="", help="reuse an already-minted NFT at this reveal txid (skip minting)")
-    ap.add_argument("--nft-owner-wif", default="", help="owner WIF for --nft-reuse-reveal-txid (spends the singleton into the covenant)")
+    ap.add_argument(
+        "--nft-reuse-reveal-txid", default="", help="reuse an already-minted NFT at this reveal txid (skip minting)"
+    )
+    ap.add_argument(
+        "--nft-owner-wif",
+        default="",
+        help="owner WIF for --nft-reuse-reveal-txid (spends the singleton into the covenant)",
+    )
     ap.add_argument("--nft-name", default="ETH-RXD-REAL-NFT")
     ap.add_argument("--nft-carrier-photons", type=int, default=1_000_000)  # carrier the covenant pins
     ap.add_argument("--nft-commit-photons", type=int, default=20_000_000)  # mint commit funding

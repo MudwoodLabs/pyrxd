@@ -473,13 +473,21 @@ def should_taker_refund_proactively(
     maker_has_claimed_btc: bool,
     block_interval_s: float = 600.0,
 ) -> bool:
-    """Return True once the taker MUST refund the asset rather than keep waiting.
+    """Return True once the refund window is near and the taker must act rather than wait.
 
-    The dominant adversarial risk: because ``t_BTC > t_RXD``, a malicious maker can
-    withhold their BTC claim until *after* ``t_RXD`` opens, then claim BTC (revealing
-    ``p``) AND refund the asset — the taker loses both. The defense (C1): treat
-    "maker has not claimed and ``t_RXD - N`` is approaching" as a trigger to refund
-    the asset proactively, NEVER a reason to keep waiting.
+    This is a TIMING PREDICATE only — "the maker has not claimed and ``t_RXD - N`` is
+    approaching" — NOT a prescription of which refund to run. The dominant adversarial
+    risk it guards: because ``t_BTC > t_RXD``, a malicious maker can withhold the BTC
+    claim until after ``t_RXD`` opens, then claim BTC (revealing ``p``) AND CSV-refund
+    the asset, taking both. Treat the trigger as "stop waiting", never "keep waiting".
+
+    IMPORTANT — what the taker DOES when this fires is :meth:`mutual_refund` (both legs
+    unwind once both timeouts elapse), NOT an asset-only refund. The asset CSV refund
+    pays the MAKER (the maker owns the covenant), so a taker that "refunds the asset
+    proactively" strands itself — see :meth:`maybe_refund_asset_on_maker_stall` (a
+    maker-only primitive) and ``gravity.watch.decide`` (FSM finding #2, 2026-06-09).
+    An earlier version of this docstring described that superseded asset-only model;
+    do not re-wire it.
 
     Returns False once the maker has claimed (``p`` is now public — the taker should
     instead scrape it and claim the asset). ``safety_window_blocks`` is the ``N``
@@ -706,6 +714,15 @@ class CoordinatorConfig:
     # runbook (the dust harness); a long-lived / multi-process deployment needs a
     # durable store (audit track), not this flag.
     accept_nondurable_seen: bool = False
+    # Explicit opt-in to run a VALUE-BEARING ETH (finalized-checkpoint) counter-leg swap
+    # with an ESTIMATED (is_measured=False) margin policy. is_measured gates TWO ETH
+    # defenses — the verify->lock 'finalized' reorg pin (a 'latest' re-verify cannot catch
+    # a reorg that re-deploys a different contract at the same CREATE address) and the
+    # proactive-refund N-floor — so the coordinator refuses a value-bearing ETH swap on an
+    # estimated policy unless this is set (whole-stack audit MEDIUM-1). Acceptable only for
+    # an operator-gated DUST run that consciously accepts estimated-margin risk on
+    # negligible value; a real (non-dust) value-bearing ETH swap MUST use a measured policy.
+    accept_estimated_eth_margins: bool = False
     # Min confirmations a gating credential's live UTXO must have (reorg safety),
     # when a swap sets terms.credential_ref. Mirrors min_ref_confirmations.
     min_credential_confirmations: int = 6
@@ -724,6 +741,8 @@ class CoordinatorConfig:
             raise ValidationError("min_credential_confirmations must be a non-negative int")
         if not isinstance(self.accept_nondurable_seen, bool):
             raise ValidationError("accept_nondurable_seen must be a bool")
+        if not isinstance(self.accept_estimated_eth_margins, bool):
+            raise ValidationError("accept_estimated_eth_margins must be a bool")
 
 
 def _serialized_step(method):
@@ -835,6 +854,28 @@ class SwapCoordinator:
                 "free-option window (SEEN-1). Use a durable SeenStore (durable=True), or pass "
                 "CoordinatorConfig(accept_nondurable_seen=True) to consciously accept "
                 "non-durability for a single-process, single-shot, fresh-H-per-run runbook."
+            )
+        # MEDIUM-1 (whole-stack audit): a VALUE-BEARING ETH counter-leg swap on an ESTIMATED
+        # policy silently runs in the weak mode of two defenses — the verify->lock 'finalized'
+        # reorg pin (_assert_eth_counter_funding_verified re-verifies at 'latest' when
+        # is_measured=False) and the proactive-refund N-floor (both gated on is_measured).
+        # Unlike the BTC path, nothing else couples value↔measured for ETH, and a 'latest'
+        # re-verify cannot catch a reorg re-deploying a different contract at the same CREATE
+        # address in the verify->lock window → one-sided maker loss. Refuse it unless the
+        # operator consciously accepts estimated margins (dust runs); fail-closed at setup so a
+        # future value-bearing ETH run cannot inherit is_measured=False by accident.
+        if (
+            value_bearing
+            and record.terms.counter_chain != "btc"
+            and not config.margin_policy.is_measured
+            and not config.accept_estimated_eth_margins
+        ):
+            raise ValidationError(
+                "value-bearing ETH counter-leg swap with an ESTIMATED margin policy "
+                "(is_measured=False): the verify->lock 'finalized' reorg pin AND the "
+                "proactive-refund N-floor are both disabled (MEDIUM-1). Use MarginPolicy.measured(...), "
+                "or pass CoordinatorConfig(accept_estimated_eth_margins=True) to consciously accept "
+                "estimated-margin risk on an operator-gated dust run."
             )
         # ETH (finalized-checkpoint) counter leg requires a finalization window on the policy
         # (audit finality/fsm fail-closed-at-setup): the reorg gate's no-depth WAIT-branch
@@ -1280,6 +1321,7 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
+    @_serialized_step
     async def maker_claims_btc(self, preimage: SecretBytes) -> SwapRecord:
         """Maker spends the BTC claim leaf with ``p`` (revealing it), then zeroizes p.
 
