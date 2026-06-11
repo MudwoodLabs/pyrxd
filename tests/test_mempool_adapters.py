@@ -76,6 +76,35 @@ async def test_broadcast_idempotent_already_known_derives_txid_locally():
     assert await b.broadcast(raw) == txid
 
 
+async def test_broadcast_present_phrases_are_idempotent_success():
+    # LOW-R4: the specific "already present" phrases each derive the txid locally (no-op re-broadcast).
+    raw, txid = _claim_vec()
+    for body in (
+        "sendrawtransaction: txn-already-known",
+        "Transaction already in block chain",
+        "txn-already-in-mempool: already in mempool",
+    ):
+        b = MempoolSpaceBroadcaster()
+        b._http.session = AsyncMock(return_value=_session_posting(_post_resp(400, body)))
+        assert await b.broadcast(raw) == txid, body
+
+
+async def test_broadcast_already_spent_conflict_is_fail_closed():
+    # LOW-R4: a rejection containing the bare word "already" but meaning a DOUBLE-SPEND/conflict
+    # (the counterparty spent the HTLC output first) must NOT be misread as idempotent success —
+    # else broadcast() would return a txid for a tx that never landed. Fail-closed.
+    raw, _ = _claim_vec()
+    for body in (
+        "bad-txns-inputs-missingorspent",
+        "sendrawtransaction: inputs already spent by another transaction",
+        "txn-mempool-conflict",
+    ):
+        b = MempoolSpaceBroadcaster()
+        b._http.session = AsyncMock(return_value=_session_posting(_post_resp(400, body)))
+        with pytest.raises(NetworkError, match="broadcast rejected"):
+            await b.broadcast(raw)
+
+
 async def test_broadcast_rejects_empty():
     b = MempoolSpaceBroadcaster()
     with pytest.raises(ValidationError, match="non-empty bytes"):

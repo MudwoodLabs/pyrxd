@@ -443,3 +443,89 @@ async def test_fund_rejects_timeout_mismatch_with_terms(monkeypatch):
 
     with pytest.raises(ValidationError, match="must agree"):
         await leg.fund(_TermsMismatch())
+
+
+# -- LOW-R1: verify_funded must pin the EOA get_code + balance reads to the SAME block ------
+
+
+class _RecordingRpc:
+    """Fake EthRpc recording the block_identifier each read is pinned to. Returns values that pass
+    verify_funded (claimant/refundee EOAs => empty code; balance == expected; immutables match)."""
+
+    def __init__(self, locator, amount_wei):
+        self._loc = locator
+        self._amount = amount_wei
+        self.code_block_ids: dict[str, object] = {}
+        self.balance_block_id: object = "UNSET"
+        from web3 import Web3
+
+        loc = locator
+
+        class _Getter:
+            def __init__(self, val):
+                self._val = val
+
+            async def call(self, *, block_identifier=None):
+                return self._val
+
+        class _Functions:
+            def hashlock(self):
+                return _Getter(loc.hashlock_bytes)
+
+            def claimant(self):
+                return _Getter(Web3.to_checksum_address(loc.claimant))
+
+            def refundee(self):
+                return _Getter(Web3.to_checksum_address(loc.refundee))
+
+            def timeout(self):
+                return _Getter(loc.timeout)
+
+        class _Eth:
+            def contract(self, address=None, abi=None):
+                class _C:
+                    functions = _Functions()
+
+                return _C()
+
+        class _W3:
+            eth = _Eth()
+
+        self.w3 = _W3()
+
+    async def assert_chain(self):
+        return None
+
+    async def get_code(self, address, block_identifier=None):
+        self.code_block_ids[address] = block_identifier
+        return b"\x60\x00" if address == self._loc.contract_address else b""  # contract has code; EOAs empty
+
+    async def get_balance(self, address, block_identifier=None):
+        self.balance_block_id = block_identifier
+        return self._amount
+
+
+async def test_verify_funded_pins_eoa_and_balance_reads_to_the_block():
+    from web3 import Web3
+
+    loc = EthHtlcLocator(
+        chain_id=11155111,
+        contract_address=Web3.to_checksum_address("0x" + "33" * 20),
+        deploy_tx_hash="0x" + "de" * 32,
+        hashlock="0x" + "ab" * 32,
+        claimant=Web3.to_checksum_address("0x" + "11" * 20),
+        refundee=Web3.to_checksum_address("0x" + "22" * 20),
+        timeout=4_000_000_000,
+        amount_wei=10**15,
+    )
+    rpc = _RecordingRpc(loc, loc.amount_wei)
+    leg = EthHtlcContractLeg(rpc=rpc, signing_key=PrivateKeyMaterial.generate(), chain_id=11155111, artifact=_ART)
+    leg._runtime_code_matches = lambda code: True  # bypass artifact-bytecode match; we test the PINNING
+
+    await leg.verify_funded(loc, expected_amount_wei=loc.amount_wei, block_identifier="finalized")
+
+    # The fix: the two EOA code reads AND the balance read honour the pin (were 'latest'/None before).
+    assert rpc.code_block_ids[loc.claimant] == "finalized"
+    assert rpc.code_block_ids[loc.refundee] == "finalized"
+    assert rpc.balance_block_id == "finalized"
+    assert rpc.code_block_ids[loc.contract_address] == "finalized"  # the core code read (already pinned)

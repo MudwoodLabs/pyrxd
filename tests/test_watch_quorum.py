@@ -91,9 +91,10 @@ class FakeBtc:
 
 
 class FakeRxd:
-    def __init__(self, tip: int, cov_confs: int | None = None):
+    def __init__(self, tip: int, cov_confs: int | None = None, *, corroborated: bool = False):
         self._tip = tip
         self._cov = cov_confs
+        self.corroborated = corroborated  # mirrors MultiSourceRxdChainSource.corroborated (LOW-R2)
 
     async def tip_height(self):
         return self._tip
@@ -152,14 +153,21 @@ async def test_bogus_covenant_confs_guarded_to_none():
     assert obs.asset_locked_at_height is None
 
 
-async def test_corroboration_flag_toggles():
+async def test_corroboration_flag_requires_structural_quorum():
+    # LOW-R2: rxd_corroborated must be backed by a real multi-source quorum, not a free bool.
     btc = FakeBtc(BtcClaimStatus(claimed=False))
-    rxd = FakeRxd(tip=200, cov_confs=101)
+    single = FakeRxd(tip=200, cov_confs=101)  # corroborated=False (a single source)
+    # default (single source) → low_corroboration flagged
     assert (
-        await ChainObserver(btc=btc, rxd=rxd, rxd_corroborated=False).observe("s", _record())
+        await ChainObserver(btc=btc, rxd=single, rxd_corroborated=False).observe("s", _record())
     ).low_corroboration is True
+    # asserting corroboration over a non-corroborated source is REFUSED at construction
+    with pytest.raises(ValidationError, match="multi-source RXD quorum"):
+        ChainObserver(btc=btc, rxd=single, rxd_corroborated=True)
+    # a genuinely corroborated (quorum) source clears the flag
+    quorum_rxd = FakeRxd(tip=200, cov_confs=101, corroborated=True)
     assert (
-        await ChainObserver(btc=btc, rxd=rxd, rxd_corroborated=True).observe("s", _record())
+        await ChainObserver(btc=btc, rxd=quorum_rxd, rxd_corroborated=True).observe("s", _record())
     ).low_corroboration is False
 
 

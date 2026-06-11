@@ -176,6 +176,16 @@ class MultiSourceRxdChainSource:
         self._sources = sources
         self._quorum = quorum
 
+    @property
+    def corroborated(self) -> bool:
+        """True iff this is a genuine multi-source quorum (>= 2 sources AND quorum >= 2).
+
+        The :class:`ChainObserver` reads this to STRUCTURALLY justify ``rxd_corroborated=True``
+        — so corroboration cannot be asserted over a single source (audit LOW-R2). A single
+        source (or quorum 1) is not corroboration however the flag is set.
+        """
+        return self._quorum >= 2 and len(self._sources) >= self._quorum
+
     async def _gather(self, coro_fn) -> list:
         """Run ``coro_fn`` on every source; return only the successful (non-Exception)
         results. A failing source is dropped — it never fails the whole read."""

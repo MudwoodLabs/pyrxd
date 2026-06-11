@@ -951,7 +951,12 @@ class MempoolSpaceBroadcaster:
                     except ValidationError:
                         raise NetworkError("broadcast returned a non-txid body")
                 low = body.lower()
-                if any(m in low for m in ("already", "txn-already-known", "in block chain", "in mempool")):
+                # Idempotent success = the tx is ALREADY PRESENT (re-broadcast is a no-op). Match only
+                # SPECIFIC present-phrases, NOT a bare "already" (audit LOW-R4): a conflict/rejection like
+                # "inputs already spent" (the counterparty spent the HTLC output first) contains "already"
+                # but is NOT a success — misreading it would return a txid for a tx that never landed.
+                # Anything not unambiguously "already present" is fail-closed.
+                if any(m in low for m in ("txn-already-known", "already in block chain", "already in mempool")):
                     # Idempotent success — derive the txid locally (no node on mainnet).
                     return btc_txid_from_raw(raw)
                 raise NetworkError(f"broadcast rejected (HTTP {resp.status})")

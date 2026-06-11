@@ -158,6 +158,19 @@ class ChainObserver(Observer):
     ) -> None:
         if not isinstance(rxd_corroborated, bool):
             raise ValidationError("ChainObserver.rxd_corroborated must be bool")
+        # LOW-R2: bind corroboration to STRUCTURE, not just a free bool. Asserting
+        # rxd_corroborated=True clears low_corroboration on every observation (which lets the
+        # autonomous refund act on a single RXD read), so it must be backed by an actual
+        # multi-source quorum. Require the rxd source to declare itself corroborated (a genuine
+        # >= 2-source quorum, see MultiSourceRxdChainSource.corroborated); a single source cannot
+        # assert it however the flag is passed. (accept_single_source remains the explicit,
+        # logged dust opt-in on the executor for the deliberate single-source case.)
+        if rxd_corroborated and not bool(getattr(rxd, "corroborated", False)):
+            raise ValidationError(
+                "rxd_corroborated=True requires a multi-source RXD quorum (the source must expose "
+                "corroborated=True, e.g. MultiSourceRxdChainSource with quorum>=2); a single source "
+                "cannot assert corroboration. Use a real quorum, or leave rxd_corroborated=False."
+            )
         if btc is None and eth is None:
             raise ValidationError("ChainObserver requires at least one counter-leg source (btc and/or eth)")
         self._btc = btc

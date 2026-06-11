@@ -105,9 +105,11 @@ async def test_run_loop_heartbeat_sink_failure_does_not_crash():
     assert n == 2  # loop survived despite the sink raising every tick
 
 
-async def test_run_loop_tick_timeout_emits_degraded_heartbeat():
-    # red-team #8: a tick that exceeds the watchdog budget must not block past the deadman window;
-    # the loop times it out, emits an alive (empty) heartbeat, and continues.
+async def test_run_loop_tick_timeout_skips_heartbeat():
+    # LOW-R3: a tick that exceeds the watchdog budget is "blind" — it must NOT refresh the
+    # cross-process heartbeat, so a slow-loris source that wedges every tick lets the age-only
+    # dead-man's-switch go stale and PAGE (rather than reporting a healthy-but-blind tower). The
+    # loop still times the tick out and continues; it just emits no beat for the blind tick.
     class _SlowStore:
         async def list_active(self):
             await asyncio.sleep(10)  # longer than the tick budget
@@ -126,4 +128,4 @@ async def test_run_loop_tick_timeout_emits_degraded_heartbeat():
         tick_timeout_s=0.01,
     )
     assert n == 1
-    assert beats == [0]  # degraded (empty) but ALIVE heartbeat still emitted
+    assert beats == []  # blind (timed-out) tick emits NO heartbeat → deadman sees staleness if it persists

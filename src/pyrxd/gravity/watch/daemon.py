@@ -103,6 +103,7 @@ async def run_loop(
     while not (stop is not None and stop.is_set()):
         if max_iterations is not None and iterations >= max_iterations:
             break
+        tick_timed_out = False
         try:
             if tick_timeout_s is None:
                 results = await reconciler.tick()
@@ -110,13 +111,20 @@ async def run_loop(
                 results = await asyncio.wait_for(reconciler.tick(), timeout=tick_timeout_s)
         except (asyncio.TimeoutError, TimeoutError):
             logger.error(
-                "watchtower tick %d exceeded %.0fs budget (slow source?) — degraded; emitting alive heartbeat",
+                "watchtower tick %d exceeded %.0fs budget (slow source?) — degraded; SKIPPING the "
+                "heartbeat so the cross-process dead-man's-switch sees staleness if this persists",
                 iterations + 1,
                 tick_timeout_s,
             )
             results = []
+            tick_timed_out = True
         iterations += 1
-        if on_heartbeat is not None:
+        # LOW-R3: only beat on a tick that actually OBSERVED the chain. A timed-out (blind) tick must
+        # NOT refresh the cross-process heartbeat — else a slow-loris source that wedges every tick
+        # keeps the age-only dead-man's-switch reporting ALIVE while the tower sees nothing. A
+        # PERSISTENT timeout → no fresh beats → the switch goes stale and pages; a single transient
+        # timeout is harmless (the next good tick beats well within max_silence).
+        if on_heartbeat is not None and not tick_timed_out:
             try:
                 on_heartbeat(iterations, results)
             except Exception:  # a heartbeat-sink failure must not crash the reconcile loop

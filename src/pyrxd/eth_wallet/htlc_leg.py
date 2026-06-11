@@ -234,11 +234,15 @@ class EthHtlcContractLeg:
             raise ValidationError("on-chain timeout != negotiated timeout")
         # EOA-only claimant/refundee: empty code == EOA. A contract recipient that reverts on
         # receive would lock the funds via the HTLC's require(ok) on the ETH transfer.
-        if await self._rpc.get_code(locator.claimant):
+        # Pin these to the SAME block as the code/immutables reads above (audit LOW-R1): at
+        # 'finalized' the EOA-ness of claimant/refundee and the funded balance must be read at the
+        # non-reorgable checkpoint too, not the reorg-able tip — else a reorg could flip an EOA to a
+        # reverting contract, or show a balance the finalized state does not have.
+        if await self._rpc.get_code(locator.claimant, block_identifier):
             raise ValidationError("claimant has contract code (not an EOA); a reverting recipient could lock funds")
-        if await self._rpc.get_code(locator.refundee):
+        if await self._rpc.get_code(locator.refundee, block_identifier):
             raise ValidationError("refundee has contract code (not an EOA); a reverting recipient could lock funds")
-        bal = await self._rpc.get_balance(locator.contract_address)
+        bal = await self._rpc.get_balance(locator.contract_address, block_identifier)
         # Lower bound, not exact-equal (red-team LOW): an attacker can force-send 1 wei (selfdestruct
         # / coinbase) to a contract, so an `== expected` check is griefable into a permanent verify
         # failure. Reject UNDER-funding; tolerate dust over-funding (any extra ETH is paid to whoever
