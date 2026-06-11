@@ -74,7 +74,7 @@ docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
 aiohttp = ">=3.14.0"
 coincurve = "^21.0.0"
 base58 = "^2.1.1"
-pycryptodomex = "^3.22.0"
+pycryptodomex = "^3.23.0"
 # Required for X25519 ECDH + HKDF-SHA256 used by Glyph TIMELOCK / ENCRYPTED
 # (pyrxd.crypto.kem). OpenSSL-backed, well-audited, typically already a
 # transitive dep in most environments.
