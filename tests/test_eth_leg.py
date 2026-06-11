@@ -506,6 +506,7 @@ class _RecordingRpc:
 
 
 async def test_verify_funded_pins_eoa_and_balance_reads_to_the_block():
+    pytest.importorskip("web3")  # verify_funded requires web3 (optional dep; absent in the base CI env)
     from web3 import Web3
 
     loc = EthHtlcLocator(
