@@ -111,8 +111,18 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CounterChainLeg": ("pyrxd.gravity.counter_chain_leg", "CounterChainLeg"),
     "RadiantCovenantLeg": ("pyrxd.gravity.radiant_leg", "RadiantCovenantLeg"),
     "EthLeg": ("pyrxd.gravity.eth_leg", "EthLeg"),
+    # Counter-chain registries (per-chain safety knobs; see the cross-chain how-to)
     "EvmChain": ("pyrxd.eth_wallet.chains", "EvmChain"),
     "KNOWN_EVM_CHAINS": ("pyrxd.eth_wallet.chains", "KNOWN_EVM_CHAINS"),
+    # Covenant building blocks (docs/concepts/covenant-building-blocks.md). PRE-AUDIT:
+    # consensus-validated on regtest (several mainnet-proven), not externally audited.
+    "HtlcCovenant": ("pyrxd.gravity.htlc_covenant", "HtlcCovenant"),
+    "build_htlc_covenant_rxd": ("pyrxd.gravity.htlc_covenant", "build_htlc_covenant_rxd"),
+    "build_htlc_covenant_ft": ("pyrxd.gravity.htlc_covenant", "build_htlc_covenant_ft"),
+    "build_htlc_covenant_nft": ("pyrxd.gravity.htlc_covenant", "build_htlc_covenant_nft"),
+    "SoulboundNftCovenant": ("pyrxd.glyph.soulbound_covenant", "SoulboundNftCovenant"),
+    "build_soulbound_nft_covenant": ("pyrxd.glyph.soulbound_covenant", "build_soulbound_nft_covenant"),
+    "verify_ref_authenticity": ("pyrxd.gravity.ref_authenticity", "verify_ref_authenticity"),
     # SPV verification
     "SpvProof": ("pyrxd.spv", "SpvProof"),
     "SpvProofBuilder": ("pyrxd.spv", "SpvProofBuilder"),

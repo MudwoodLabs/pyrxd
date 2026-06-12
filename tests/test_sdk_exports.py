@@ -25,8 +25,17 @@ _CROSS_CHAIN_EXPORTS = [
     "CounterChainLeg",
     "RadiantCovenantLeg",
     "EthLeg",
+    # Counter-chain registries (Tier 2.3)
     "EvmChain",
     "KNOWN_EVM_CHAINS",
+    # Covenant building blocks (Tier 2.4)
+    "HtlcCovenant",
+    "build_htlc_covenant_rxd",
+    "build_htlc_covenant_ft",
+    "build_htlc_covenant_nft",
+    "SoulboundNftCovenant",
+    "build_soulbound_nft_covenant",
+    "verify_ref_authenticity",
 ]
 
 
