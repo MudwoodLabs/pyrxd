@@ -530,3 +530,26 @@ async def test_verify_funded_pins_eoa_and_balance_reads_to_the_block():
     assert rpc.code_block_ids[loc.refundee] == "finalized"
     assert rpc.balance_block_id == "finalized"
     assert rpc.code_block_ids[loc.contract_address] == "finalized"  # the core code read (already pinned)
+
+
+def test_runtime_code_mask_gap_documented_and_empty_code_fails_closed():
+    """Pin the EXACT shape of the _runtime_code_matches masking gap (audit eth_leg_web3 LOW /
+    MEDIUM-1 residual): every committed-ZERO byte is masked — a superset of the immutable slots —
+    so a contract whose logic differs ONLY at committed-zero positions passes this gate. That is
+    why the gate alone cannot prove "no modified logic" and the 'finalized' verify pin is the live
+    backstop (staged for real in test_eth_leg_anvil_integration.py's reorg test). Also pins the
+    fail-closed cases the backstop relies on: empty code (a reorged-out deploy read at the
+    finalized checkpoint) and any non-zero-position or length deviation must be rejected."""
+    # offsets:                0     1     2     3     4
+    runtime = bytes.fromhex("600060ff00")  # committed zeros at offsets 1 and 4
+    art = {"abi": [], "bytecode": "0x00", "runtime_bytecode": "0x" + runtime.hex()}
+    leg = EthHtlcContractLeg(rpc=object(), signing_key=PrivateKeyMaterial.generate(), chain_id=1, artifact=art)
+
+    assert leg._runtime_code_matches(runtime)  # exact match passes
+    # THE GAP: a byte swapped in at a committed-zero position is NOT verified (masked superset).
+    assert leg._runtime_code_matches(bytes.fromhex("604260ff00"))
+    assert leg._runtime_code_matches(bytes.fromhex("600060ff42"))
+    # Fail-closed: non-zero-position deviation, length mismatch, and the reorged-out empty read.
+    assert not leg._runtime_code_matches(bytes.fromhex("600060fe00"))
+    assert not leg._runtime_code_matches(runtime + b"\x00")
+    assert not leg._runtime_code_matches(b"")

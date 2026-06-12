@@ -4,7 +4,7 @@ Pure, no chain/network. Covers every Intent branch, the chain-truth-dominates ru
 (claim race assessed from BOTH_LOCKED, not just SECRET_REVEALED), fail-closed paths
 (missing depth, lying ``now < lock``), and low-corroboration propagation. The
 finality-gate math is exercised indirectly — decide() consumes the real
-``assess_claim_finality`` / ``should_taker_refund_proactively``, never a re-derivation.
+``assess_claim_finality`` / ``taker_refund_window_open``, never a re-derivation.
 """
 
 from __future__ import annotations
