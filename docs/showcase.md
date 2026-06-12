@@ -45,8 +45,11 @@ mainnet.**
 > real value with someone you don't trust. Treat the cross-chain swap code as
 > pre-audit.
 
-### Run it
+### Build it
 
+- **[How-to: build a cross-chain atomic swap](how-to/build-a-cross-chain-swap.md)** —
+  the `SwapCoordinator` + legs surface (`from pyrxd import SwapCoordinator, …`), the
+  role/timelock safety invariant, and the proven regtest/Anvil harnesses to copy from.
 - [`examples/gravity_swap_demo.py`](../examples/gravity_swap_demo.py) — the full
   Gravity swap flow (offer → claim → payment → finalize). Defaults to a safe
   dry-run that builds every transaction but broadcasts nothing.

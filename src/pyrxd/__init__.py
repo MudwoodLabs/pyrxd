@@ -98,6 +98,19 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SwapTerms": ("pyrxd.swap", "SwapTerms"),
     "accept_offer": ("pyrxd.swap", "accept_offer"),
     "create_offer": ("pyrxd.swap", "create_offer"),
+    # Cross-chain atomic swap — pyrxd.gravity HTLC primitive (BTC/ETH↔RXD). PRE-AUDIT:
+    # proven on regtest + dust mainnet, but NOT externally audited — regtest/testnet only,
+    # no real value, until the audit gate clears. See docs/how-to/build-a-cross-chain-swap.md.
+    "SwapCoordinator": ("pyrxd.gravity.swap_coordinator", "SwapCoordinator"),
+    "CoordinatorConfig": ("pyrxd.gravity.swap_coordinator", "CoordinatorConfig"),
+    "MarginPolicy": ("pyrxd.gravity.swap_coordinator", "MarginPolicy"),
+    "generate_secret": ("pyrxd.gravity.swap_coordinator", "generate_secret"),
+    "NegotiatedTerms": ("pyrxd.gravity.swap_state", "NegotiatedTerms"),
+    "SwapRecord": ("pyrxd.gravity.swap_state", "SwapRecord"),
+    "SwapState": ("pyrxd.gravity.swap_state", "SwapState"),
+    "CounterChainLeg": ("pyrxd.gravity.counter_chain_leg", "CounterChainLeg"),
+    "RadiantCovenantLeg": ("pyrxd.gravity.radiant_leg", "RadiantCovenantLeg"),
+    "EthLeg": ("pyrxd.gravity.eth_leg", "EthLeg"),
     # SPV verification
     "SpvProof": ("pyrxd.spv", "SpvProof"),
     "SpvProofBuilder": ("pyrxd.spv", "SpvProofBuilder"),
