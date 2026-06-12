@@ -75,7 +75,10 @@ pytestmark = pytest.mark.integration
 
 _RXD_IMAGE = "radiant-core:v3.1.1-amd64"
 _RXD_CT = "xchain-eth-rxd-pytest"
-_CHAIN_ID = 31337
+# The anvil chain id. Default 31337; override to run the SAME coordinator suite as another
+# EVM-family chain (Tier 2.3) — e.g. XCHAIN_ETH_CHAIN_ID=84532 runs it as Base Sepolia,
+# proving the finalized-checkpoint path is chain-id-agnostic end-to-end.
+_CHAIN_ID = int(os.environ.get("XCHAIN_ETH_CHAIN_ID", "31337"))
 # Anvil's deterministic PUBLIC dev keys (local devnet only — no real value).
 _KEY = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"  # acct 0 — funds/claims/refunds
 _ADDR_TAKER = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266"  # acct 0 (refundee)

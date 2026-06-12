@@ -111,6 +111,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CounterChainLeg": ("pyrxd.gravity.counter_chain_leg", "CounterChainLeg"),
     "RadiantCovenantLeg": ("pyrxd.gravity.radiant_leg", "RadiantCovenantLeg"),
     "EthLeg": ("pyrxd.gravity.eth_leg", "EthLeg"),
+    "EvmChain": ("pyrxd.eth_wallet.chains", "EvmChain"),
+    "KNOWN_EVM_CHAINS": ("pyrxd.eth_wallet.chains", "KNOWN_EVM_CHAINS"),
     # SPV verification
     "SpvProof": ("pyrxd.spv", "SpvProof"),
     "SpvProofBuilder": ("pyrxd.spv", "SpvProofBuilder"),

@@ -105,11 +105,54 @@ $ XCHAIN_ETH_REGTEST=1 pytest tests/test_xchain_eth_swap_regtest_e2e.py -m integ
 
 ## Adding another counter-chain
 
+There are two very different costs, depending on the chain family.
+
+### EVM family — Base works today (no new code)
+
+The proven `EthLeg` + `EthHtlc.sol` machinery is **chain-id-agnostic**: the same contract
+bytecode, the same `finalized`-checkpoint reads, the same claim/refund/scrape paths run on
+any EVM-equivalent chain. Base (an OP-stack L2) is the first packaged example — swap a
+Radiant asset against **native ETH on Base** by changing three knobs, none of which touch
+the coordinator:
+
+```python
+from pyrxd import KNOWN_EVM_CHAINS, EthLeg, MarginPolicy
+
+base = KNOWN_EVM_CHAINS["base-sepolia"]          # or "base" (mainnet; audit-gated)
+
+rpc = EthRpc("https://sepolia.base.org", expected_chain_id=base.chain_id)
+contract_leg = EthHtlcContractLeg(rpc=rpc, signing_key=key, chain_id=base.chain_id, artifact=ARTIFACT)
+eth_leg = EthLeg(contract_leg=contract_leg, network=base.network, ...)  # audit gate applies
+
+policy = MarginPolicy(..., eth_finalization_window_s=base.finalization_window_s)
+```
+
+The chain is pinned at every layer: `EthRpc` refuses a node on the wrong chain id, the leg
+signs EIP-155-bound transactions, and the durable locator records `chain_id`. The
+negotiated `counter_chain` stays `"eth"` — it names the *finalized-checkpoint family*, and
+the locator's chain id pins the concrete chain.
+
+**The one genuinely chain-specific knob is finality.** `KNOWN_EVM_CHAINS`
+(`pyrxd.eth_wallet.chains`) records a sourced `finalization_window_s` per chain: on Base, an
+L2 block is `finalized` only once the batch containing it sits in a *finalized L1 block* —
+batch cadence (~1 min) + L1 inclusion + 2 L1 epochs, ≈15 min steady-state. The honest worst
+case is the OP-stack **12-hour sequencing window** (a batch may legally land that late);
+budget stalls in `CrossClockMargin.eth_finality_stall_tolerance_s`, exactly as for an L1
+finality stall — never by inflating the steady-state window. Provenance is cited in the
+module docstring; `evm_chain_by_id` fails closed on a chain with no vetted window.
+
+Proofs: `tests/test_eth_leg_anvil_integration.py::test_full_lifecycle_on_base_chain_id`
+(full leg lifecycle on Base Sepolia's chain id) and the entire coordinator e2e re-run as
+Base via `XCHAIN_ETH_CHAIN_ID=84532 XCHAIN_ETH_REGTEST=1 pytest
+tests/test_xchain_eth_swap_regtest_e2e.py -m integration`.
+
+### A new chain family (Litecoin, …) — a deliberate, separate effort
+
 `CounterChainLeg` (`pyrxd.gravity.counter_chain_leg`) is the documented contract a new
 backend implements: `derive_expected_funding` / `fund` / `claim` / `refund` /
 `recover_secret` / `is_final`. The ABC was extracted from two *real* shapes (BTC Taproot +
 ETH Solidity), so it reflects what a third chain actually needs — finality is a per-leg
-concern, not a single RPC read. Adopting the ABC in the coordinator (the BTC path is still
-duck-typed) and migrating the durable `SwapRecord` locator to a chain-tagged union is a
-deliberate, separately-tested change on mainnet-proven code — read the ABC's scope note
-before starting. New legs (e.g. Base native-ETH, Litecoin) are tracked in the roadmap.
+concern, not a single RPC read. A non-EVM chain (e.g. Litecoin) means generalizing the
+PoW-depth dispatch and standing up new regtest infrastructure; adopting the ABC in the
+coordinator (the BTC path is still duck-typed) is a deliberate, separately-tested change
+on mainnet-proven code — read the ABC's scope note before starting.

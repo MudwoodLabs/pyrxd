@@ -25,6 +25,8 @@ _CROSS_CHAIN_EXPORTS = [
     "CounterChainLeg",
     "RadiantCovenantLeg",
     "EthLeg",
+    "EvmChain",
+    "KNOWN_EVM_CHAINS",
 ]
 
 

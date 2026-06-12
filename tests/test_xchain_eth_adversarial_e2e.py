@@ -391,10 +391,18 @@ class TestEthAdversarial:
             with pytest.raises(ValidationError, match="claimant"):
                 await coord.maker_verify_counter_funding(malicious.contract_address)
 
-            # And the maker NEVER advanced to a locked state — its asset is untouched.
-            assert coord.record.state is SwapState.BTC_LOCKED
+            # And the maker recorded NOTHING from the malicious contract: the coordinator raises
+            # BEFORE with_counter_lock, so the record stays NEGOTIATED with no locator — the
+            # fail-closed contract in maker_verify_counter_funding's docstring. (This assert
+            # originally expected BTC_LOCKED, contradicting both that contract and this comment;
+            # the test had NEVER passed — it fails identically at its introducing commit ca78f0e.
+            # Recording a verify-FAILED locator would be the unsafe behavior.)
+            assert coord.record.state is SwapState.NEGOTIATED
+            assert coord.record.counterchain_locator is None
 
-            # Sanity: an HONEST contract (claimant=maker) passes the same gate.
+            # Sanity: an HONEST contract (claimant=maker) passes the same gate and only THEN
+            # records the verified locator. The STATE still does not advance here — the FSM
+            # moves off NEGOTIATED in the maker's subsequent lock step, never inside verify.
             honest_leg = EthLeg(
                 contract_leg=EthHtlcContractLeg(
                     rpc=attacker_rpc,
@@ -410,6 +418,9 @@ class TestEthAdversarial:
             )
             honest = await honest_leg.fund(terms)
             await coord.maker_verify_counter_funding(honest.contract_address)  # no raise
+            assert coord.record.state is SwapState.NEGOTIATED
+            assert coord.record.counterchain_locator is not None
+            assert coord.record.counterchain_locator.contract_address == honest.contract_address
         finally:
             await attacker_rpc.close()
             await rpc.close()
