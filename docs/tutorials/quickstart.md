@@ -12,19 +12,33 @@ is that the chain is yours alone and disposable.
 ## What you'll need
 
 - **Docker** — the regtest node runs in a container.
-- **The `radiant-core` regtest image** present locally (the same image the test
-  suite uses, `radiant-core:v2.3.0-amd64`).
 - **pyrxd installed** — `pip install pyrxd`, or `poetry install` from a checkout.
 
-Everything below is regtest-only and reached over `docker exec`; the node binds
-to localhost and is never exposed.
+That's it. The regtest node image is built for you in Step 0 — there's no image
+to find or pull. Everything below is regtest-only and reached over `docker exec`;
+the node binds to localhost and is never exposed.
+
+## Step 0 — build the regtest node image (one time)
+
+```console
+$ pyrxd regtest setup
+building radiant-core:v3.1.1-amd64 from the official Radiant-Core v3.1.1 release…
+(first build pulls ubuntu:22.04 + the release binary; subsequent builds are cached)
+built radiant-core:v3.1.1-amd64
+next: pyrxd regtest up
+```
+
+`setup` fetches the **official** Radiant-Core release daemon, verifies its SHA-256
+against the release checksum file, and wraps it in a small local image. It's a
+one-time step (the build is cached afterwards). To track a newer release later,
+`pyrxd regtest setup --version vX.Y.Z`.
 
 ## Step 1 — stand up a local chain
 
 ```console
 $ pyrxd regtest up
 regtest node up
-  container: pyrxd-devnet  (image radiant-core:v2.3.0-amd64)
+  container: pyrxd-devnet  (image radiant-core:v3.1.1-amd64)
   height:    101
   rpc:       user=pyrxd password=pyrxd wallet=devnet
 

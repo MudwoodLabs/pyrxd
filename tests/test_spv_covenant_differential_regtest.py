@@ -3,7 +3,7 @@ model leaves skipped.
 
 Resolves every "needs live-regtest" / "NOT modelled" question in
 ``tests/test_spv_covenant_differential_deployed.py`` against REAL Radiant consensus
-via ``testmempoolaccept`` on an isolated ``radiant-core:v2.3.0`` regtest node — the
+via ``testmempoolaccept`` on an isolated ``radiant-core:v3.1.1`` regtest node — the
 only way to pin behaviour that depends on the compiled script interpreter:
 
   * Group V  — value-field ``OP_8 OP_SPLIT OP_DROP OP_BIN2NUM`` on 5..8 significant
@@ -45,7 +45,7 @@ import struct
 import pytest
 
 # Reuse the isolated-regtest harness wholesale (node fixture spins up + tears down
-# a throwaway radiant-core:v2.3.0 container; accepts() == testmempoolaccept).
+# a throwaway radiant-core:v3.1.1 container; accepts() == testmempoolaccept).
 # Bare module names (NOT ``tests.X``): pytest's default prepend import mode puts the
 # ``tests/`` dir on sys.path, and there is no ``tests/__init__.py``, so ``tests`` is not
 # an importable package under ``pytest tests/ -o "addopts="`` (the coverage-overall step).

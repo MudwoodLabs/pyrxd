@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import click
 
-from ..devnet import DevnetError, RegtestNode
+from ..devnet import DEFAULT_RADIANT_VERSION, DevnetError, RegtestNode
 from .format import emit
 
 
@@ -28,6 +28,38 @@ def _fail(exc: DevnetError) -> None:
 @click.group(name="regtest")
 def regtest_group() -> None:
     """Manage a local Radiant regtest node for development (docker)."""
+
+
+@regtest_group.command(name="setup")
+@click.option(
+    "--version",
+    "version",
+    default=DEFAULT_RADIANT_VERSION,
+    metavar="TAG",
+    help=f"Radiant-Core release tag to build (default {DEFAULT_RADIANT_VERSION}).",
+)
+@click.option("--no-cache", is_flag=True, help="Rebuild from scratch (ignore docker layer cache).")
+@click.option("--json", "json_output", is_flag=True, help="Machine-readable output.")
+def regtest_setup(version: str, no_cache: bool, json_output: bool) -> None:
+    """Build the regtest node image from the official Radiant-Core release.
+
+    A one-time step before the first `pyrxd regtest up`. Fetches the published
+    radiant-<version>-linux-x64 daemon, verifies its SHA-256 against the release
+    checksum file, and tags the image radiant-core:<version>-amd64.
+    """
+    if not json_output:
+        click.echo(f"building radiant-core:{version}-amd64 from the official Radiant-Core {version} release…")
+        click.echo("(first build pulls ubuntu:22.04 + the release binary; subsequent builds are cached)")
+    node = RegtestNode()
+    try:
+        tag = node.build_image(version, no_cache=no_cache)
+    except DevnetError as exc:
+        _fail(exc)
+    if json_output:
+        click.echo(emit({"image": tag, "version": version}, mode="json"))
+    else:
+        click.echo(f"built {tag}")
+        click.echo("next: pyrxd regtest up")
 
 
 @regtest_group.command(name="up")

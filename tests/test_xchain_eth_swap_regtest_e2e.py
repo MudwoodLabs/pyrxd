@@ -73,7 +73,7 @@ from tests.test_xchain_swap_regtest_e2e import (
 
 pytestmark = pytest.mark.integration
 
-_RXD_IMAGE = "radiant-core:v2.3.0-amd64"
+_RXD_IMAGE = "radiant-core:v3.1.1-amd64"
 _RXD_CT = "xchain-eth-rxd-pytest"
 _CHAIN_ID = 31337
 # Anvil's deterministic PUBLIC dev keys (local devnet only — no real value).
@@ -406,7 +406,14 @@ def _build(node, url, *, t_rxd_blocks, asset_variant="rxd"):
         seen_store=_MemSeen(),
         # anvil is treated as value-bearing (it can fork mainnet); accept the in-process seen
         # store for this single-process, single-shot, fresh-H-per-run e2e (the documented hatch).
-        config=CoordinatorConfig(margin_policy=_eth_policy(), accept_nondurable_seen=True),
+        # accept_estimated_eth_margins: this e2e runs the estimated _eth_policy() (is_measured=False)
+        # on a value-bearing (anvil) counter-leg; the MEDIUM-1 guard (#192) refuses that unless the
+        # operator opts in — the same explicit hatch the dust harnesses use. No real value moves.
+        config=CoordinatorConfig(
+            margin_policy=_eth_policy(),
+            accept_nondurable_seen=True,
+            accept_estimated_eth_margins=True,
+        ),
     )
     return coord, cov, p_secret, eth_leg, rpc, ref_utxo
 

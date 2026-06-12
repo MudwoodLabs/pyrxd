@@ -8,6 +8,7 @@ you already know the basics and want a focused answer to "how do I X."
 
 broadcast-a-transaction
 recover-funds-across-wallet-paths
+use-the-public-testnet
 migrate-0.4-to-0.5
 verify-an-spv-proof
 spv-verification-pitfalls
@@ -25,6 +26,10 @@ spv-verification-pitfalls
   the BIP44 coin-type/account paths (Photonic, Chainbow, Electron, Tangem) to
   find which derivation actually holds the money. Read-only; `pyrxd wallet
   recover --scan` or the `pyrxd.hd.discover` API.
+- **[Use the public Radiant testnet](use-the-public-testnet.md)** — when to
+  graduate from the local regtest quickstart to the shared public testnet, how to
+  run `radiantd -testnet`, point pyrxd at it, and get testnet coins from the
+  (best-effort, community-run) faucet. For most work, stay on regtest.
 - **[Migrate from pyrxd 0.4.x to 0.5.0](migrate-0.4-to-0.5.md)** — three
   breaking signature changes on the V1 dMint mint path, with
   before/after snippets. Read this first if you upgraded from a 0.4.x

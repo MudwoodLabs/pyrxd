@@ -2,7 +2,7 @@
 title: Tier-1 on-ramp — close the three remaining gaps + bump Radiant-Core to the latest release
 type: plan
 date: 2026-06-11
-status: plan (awaiting decision on bump sequencing)
+status: DONE — bump-now/measured chosen; v3.1.1 measured GREEN, all workstreams shipped (see Outcome)
 parent: docs/ROADMAP.md → docs/plans/2026-06-07-sprint-tier1-dev-onramp.md
 ---
 
@@ -98,3 +98,26 @@ A and the pin interact. Two honest options:
 Recommendation: **bump-now, but measured** — the suite run turns the risk into a fact within this
 effort, and the user explicitly wants us current. Fall back to staging only if the measurement
 surfaces a real divergence.
+
+## Outcome (2026-06-11) — measured GREEN, all workstreams shipped
+
+The bump risk was settled by measurement, not assumption. Built `radiant-core:v3.1.1-amd64`
+from the committed Dockerfile and ran the consensus-sensitive suites against it:
+
+- `test_spv_covenant_differential_regtest.py` — **21 passed** (nBits exponent ceiling, bin2num
+  significant-bytes, OP_OUTPUTVALUE arity, sentinel direction, 20-level branch): the covenant's
+  consensus semantics are **identical** under v3.1.1's `SCRIPT_SECURITY_UPGRADE`. (The soft fork's
+  per-script stack budget is 64 MB per the v3.1.1 release notes; the covenant uses kilobytes —
+  hence no rejection.)
+- `test_htlc_regtest_e2e.py` + `test_soulbound_covenant_regtest.py` — **6 passed**.
+- BTC↔RXD `test_xchain_swap_regtest_e2e.py` — **10 passed**.
+- ETH↔RXD `test_xchain_eth_swap_regtest_e2e.py` — **7 passed** after fixing an *orthogonal*
+  pre-existing breakage (the test predated #192's MEDIUM-1 guard and never set
+  `accept_estimated_eth_margins=True`; not a bump regression).
+- North Star (`pyrxd regtest up` → `examples/regtest_quickstart.py` → mint) — green on v3.1.1.
+
+So → pinned everything to v3.1.1. Shipped: **A** committed `docker/regtest.Dockerfile` +
+`pyrxd regtest setup` (embedded Dockerfile, drift-guard test); **B** the pin across `devnet.py` +
+the regtest suites + dev-facing docs; **C** the `quickstart` CI job (build image → North Star →
+RXD covenant consensus suites); **D** `docs/how-to/use-the-public-testnet.md` (honest: regtest is
+the reliable path, testnet faucet verified best-effort — testnet faucet 502'd, mainnet faucet 200).

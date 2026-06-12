@@ -74,7 +74,7 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 
 pytestmark = pytest.mark.integration
 
-_RXD_IMAGE = "radiant-core:v2.3.0-amd64"
+_RXD_IMAGE = "radiant-core:v3.1.1-amd64"
 _BTC_IMAGE = "ruimarinho/bitcoin-core:24"
 _RXD_CT = "xchain-rxd-pytest"
 _BTC_CT = "xchain-btc-pytest"

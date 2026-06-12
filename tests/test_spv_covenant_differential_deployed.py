@@ -29,7 +29,7 @@ agreement: it is skipped or xfailed with a clear marker. In particular the
 8-byte OP_BIN2NUM >4-byte-element numeric behaviour, the compile-time
 claimDeadline clamp, OP_OUTPUTVALUE arity, and the exact tolerated branch length
 are NOT modelled as accept/reject decisions here. All four are now CONFIRMED on
-live radiant-core:v2.3.0 regtest consensus in
+live radiant-core:v3.1.1 regtest consensus in
 ``tests/test_spv_covenant_differential_regtest.py`` (groups V / S-3 / S-2 / M); see
 ``docs/brainstorms/gravity-ref-spike/REGTEST_COVENANT_SEMANTICS_RESULTS.json``.
 
@@ -581,7 +581,7 @@ def test_header_chain_anchor_differential():
 
 @pytest.mark.skip(
     reason="RESOLVED live in tests/test_spv_covenant_differential_regtest.py::"
-    "test_header_nbits_exponent_ceiling (NB-1..NB-2c): on radiant-core:v2.3.0 regtest "
+    "test_header_nbits_exponent_ceiling (NB-1..NB-2c): on radiant-core:v3.1.1 regtest "
     "the covenant ACCEPTS nBits exponent 0x1e/0x1f/0x20 (which Python's Nbits rejects "
     "as > 0x1d) and REJECTS 0x21 — a confirmed Direction-B accept-band [0x1e..0x20]. "
     "Corroborates F-02 (reject_low_difficulty mandatory for any covenant-less SPV use). "
@@ -729,7 +729,7 @@ def test_coinbase_pos_aliasing_rejected_differential():
 
 @pytest.mark.skip(
     reason="RESOLVED live in tests/test_spv_covenant_differential_regtest.py::"
-    "test_value_bin2num_significant_bytes (V-1..V-5): on radiant-core:v2.3.0 regtest the "
+    "test_value_bin2num_significant_bytes (V-1..V-5): on radiant-core:v3.1.1 regtest the "
     "covenant reads output-0 value as a full 64-bit signed CScriptNum — 5/7/8-significant-"
     "byte values ACCEPT (>= threshold incl. a 7-byte value vs a 7-byte threshold), a "
     "bit-63-set value decodes NEGATIVE and REJECTS, and a 7-byte value just below a 7-byte "

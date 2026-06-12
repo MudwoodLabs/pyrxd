@@ -24,7 +24,7 @@ def _extract_json(output: str) -> dict:
 
 _INFO = {
     "container": "pyrxd-devnet",
-    "image": "radiant-core:v2.3.0-amd64",
+    "image": "radiant-core:v3.1.1-amd64",
     "rpc_user": "pyrxd",
     "rpc_password": "pyrxd",
     "wallet": "devnet",
@@ -66,6 +66,10 @@ class _FakeNode:
         self.calls.append(("fund", address, amount_rxd))
         return "ab" * 32
 
+    def build_image(self, version: str = "v3.1.1", *, no_cache: bool = False) -> str:
+        self.calls.append(("build_image", version, no_cache))
+        return f"radiant-core:{version}-amd64"
+
 
 @pytest.fixture
 def runner() -> CliRunner:
@@ -81,6 +85,37 @@ def patch_node(monkeypatch):
         return node
 
     return _install
+
+
+class TestSetup:
+    def test_setup_builds_default_version(self, runner, patch_node):
+        node = patch_node(_FakeNode())
+        result = runner.invoke(cli, ["regtest", "setup"])
+        assert result.exit_code == 0, result.output
+        assert "built radiant-core:v3.1.1-amd64" in result.output
+        assert ("build_image", "v3.1.1", False) in node.calls
+
+    def test_setup_honours_version_and_no_cache(self, runner, patch_node):
+        node = patch_node(_FakeNode())
+        result = runner.invoke(cli, ["regtest", "setup", "--version", "v3.2.0", "--no-cache"])
+        assert result.exit_code == 0, result.output
+        assert ("build_image", "v3.2.0", True) in node.calls
+
+    def test_setup_json(self, runner, patch_node):
+        patch_node(_FakeNode())
+        result = runner.invoke(cli, ["regtest", "setup", "--json"])
+        assert result.exit_code == 0, result.output
+        assert _extract_json(result.output) == {"image": "radiant-core:v3.1.1-amd64", "version": "v3.1.1"}
+
+    def test_setup_build_failure_is_clean_error(self, runner, monkeypatch):
+        class _BuildFails(_FakeNode):
+            def build_image(self, version: str = "v3.1.1", *, no_cache: bool = False) -> str:
+                raise DevnetError("docker build failed: no space left on device")
+
+        monkeypatch.setattr("pyrxd.cli.regtest_cmds.RegtestNode", lambda: _BuildFails())
+        result = runner.invoke(cli, ["regtest", "setup"])
+        assert result.exit_code != 0
+        assert "no space left on device" in result.output
 
 
 class TestUp:

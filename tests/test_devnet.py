@@ -31,6 +31,7 @@ class _Docker:
         self.chain = chain
         self.height = height
         self.run_fails_with = ""  # set to simulate `docker run` failure stderr
+        self.build_fails_with = ""  # set to simulate `docker build` failure stderr
         self.calls: list[list[str]] = []
 
     def _rpc_method(self, argv: list[str]) -> str:
@@ -47,6 +48,10 @@ class _Docker:
         if argv[:2] == ["docker", "rm"]:
             self.running = False
             return _FakeProc(0)
+        if argv[:2] == ["docker", "build"]:
+            if self.build_fails_with:
+                return _FakeProc(1, stderr=self.build_fails_with)
+            return _FakeProc(0, stdout="built\n")
         if argv[:2] == ["docker", "run"]:
             if self.run_fails_with:
                 return _FakeProc(1, stderr=self.run_fails_with)
@@ -241,6 +246,46 @@ def test_cli_filenotfound_maps_to_devnet_error(monkeypatch):
     monkeypatch.setattr("pyrxd.devnet.subprocess.run", _raise)
     with pytest.raises(DevnetError, match="docker is not on PATH"):
         RegtestNode().cli("getblockchaininfo")
+
+
+class TestImageBuild:
+    def test_build_image_constructs_versioned_tag_and_build_arg(self, patch_docker):
+        d = patch_docker(_Docker())
+        tag = RegtestNode.build_image("v3.1.1")
+        assert tag == "radiant-core:v3.1.1-amd64"
+        build = next(c for c in d.calls if c[:2] == ["docker", "build"])
+        assert "--build-arg" in build and "RADIANT_VERSION=v3.1.1" in build
+        assert "-t" in build and "radiant-core:v3.1.1-amd64" in build
+
+    def test_build_image_defaults_to_pinned_version(self, patch_docker):
+        from pyrxd.devnet import DEFAULT_RADIANT_VERSION
+
+        patch_docker(_Docker())
+        assert RegtestNode.build_image() == f"radiant-core:{DEFAULT_RADIANT_VERSION}-amd64"
+
+    def test_build_image_failure_raises(self, patch_docker):
+        d = patch_docker(_Docker())
+        d.build_fails_with = "no space left on device"
+        with pytest.raises(DevnetError, match="no space left on device"):
+            RegtestNode.build_image("v3.1.1")
+
+    def test_image_attr_derives_from_default_version(self):
+        from pyrxd.devnet import DEFAULT_RADIANT_VERSION
+
+        assert f"radiant-core:{DEFAULT_RADIANT_VERSION}-amd64" == RegtestNode.IMAGE
+
+
+def test_committed_dockerfile_matches_embedded_constant():
+    """`pyrxd regtest setup` builds from the embedded _REGTEST_DOCKERFILE; the committed
+    docker/regtest.Dockerfile must stay byte-identical so a clone, CI, and a pip-installed
+    `regtest setup` all build the same image. Regenerate the committed file from the constant
+    if this fails."""
+    from pathlib import Path
+
+    from pyrxd.devnet import _REGTEST_DOCKERFILE
+
+    committed = Path(__file__).resolve().parents[1] / "docker" / "regtest.Dockerfile"
+    assert committed.read_text(encoding="utf-8") == _REGTEST_DOCKERFILE
 
 
 _ = subprocess  # keep the import meaningful for readers; patched via string paths

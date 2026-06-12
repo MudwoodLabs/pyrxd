@@ -19,7 +19,7 @@ pre-running RXinDexer stack indexing the node. It is therefore gated behind its 
 and the explicit node/indexer endpoints. Moves no real value: regtest + local Anvil devnet keys.
 
 Standing up the stack (one time):
-  * rxd-regtest-node  — radiant-core:v2.3.0 regtest, RPC :17443, wallet ``gravity``
+  * rxd-regtest-node  — radiant-core:v3.1.1 regtest, RPC :17443, wallet ``gravity``
   * rxd-indexer       — rxindexer-electrumx:regtest (NET=regtest, DB_ENGINE=rocksdb, GLYPH_INDEX=1),
                         ElectrumX WS on 127.0.0.1:50011
 

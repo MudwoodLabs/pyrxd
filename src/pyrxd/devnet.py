@@ -20,8 +20,87 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess  # nosec B404  # only ever runs a fixed `docker` argv (see call sites)
+import tempfile
 import time
 from dataclasses import dataclass
+from pathlib import Path
+
+# The Radiant-Core release the regtest image is built from. Bump this (and rebuild
+# via `pyrxd regtest setup`) to track the latest release; see docs/ROADMAP.md and
+# the bump plan for the revalidation the version pin carries.
+DEFAULT_RADIANT_VERSION = "v3.1.1"
+
+# Embedded copy of docker/regtest.Dockerfile so `pyrxd regtest setup` works for a
+# `pip install pyrxd` developer who has no repo checkout. A test
+# (tests/test_devnet.py) asserts this stays byte-identical to the committed file.
+_REGTEST_DOCKERFILE = """\
+# Regtest Radiant-Core node for local pyrxd development (`pyrxd regtest`).
+#
+# Wraps an OFFICIAL Radiant-Core release binary — we do not fork, patch, or
+# recompile the node; we fetch the published linux-x64 daemon and verify its
+# SHA-256 against the release's signed checksum file. This is the committed,
+# reproducible replacement for the previously ad-hoc `radiant-core:*-amd64`
+# image that was built outside the repo and that a fresh developer could not
+# obtain.
+#
+# Build (pin to the latest Radiant-Core release):
+#     docker build -f docker/regtest.Dockerfile \\
+#         --build-arg RADIANT_VERSION=v3.1.1 \\
+#         -t radiant-core:v3.1.1-amd64 .
+#
+# `pyrxd regtest setup` builds this for you; `pyrxd regtest up` then runs it.
+# The container is regtest-only, binds RPC to 127.0.0.1, and is reached solely
+# via `docker exec radiant-cli` — never exposed to the network.
+#
+# Base: ubuntu:22.04 is chosen deliberately — the release binary dynamically
+# links Boost 1.74 (22.04's default) and needs GLIBC >= 2.34 (22.04 ships
+# 2.35). Debian bullseye's glibc (2.31) is too old; bookworm's Boost (1.81) is
+# the wrong soname. Measured with `ldd`/`objdump -T` on the v3.1.x daemon.
+
+FROM ubuntu:22.04
+
+ARG RADIANT_VERSION=v3.1.1
+ARG RADIANT_TARBALL=radiant-${RADIANT_VERSION}-linux-x64.tar.gz
+ARG RADIANT_BASEURL=https://github.com/Radiant-Core/Radiant-Core/releases/download/${RADIANT_VERSION}
+
+# Runtime shared libraries the daemon links against (measured via ldd).
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+        ca-certificates \\
+        wget \\
+        libboost-chrono1.74.0 \\
+        libboost-filesystem1.74.0 \\
+        libboost-system1.74.0 \\
+        libboost-thread1.74.0 \\
+        libdb5.3++ \\
+        libevent-2.1-7 \\
+        libevent-pthreads-2.1-7 \\
+        libminiupnpc17 \\
+        libsodium23 \\
+        libssl3 \\
+        libzmq5 \\
+    && rm -rf /var/lib/apt/lists/*
+
+# Fetch the official release daemon + cli, verify integrity against the
+# release checksum file, install only the two binaries the devnet uses.
+RUN set -eux; \\
+    cd /tmp; \\
+    wget -q "${RADIANT_BASEURL}/${RADIANT_TARBALL}"; \\
+    wget -q "${RADIANT_BASEURL}/SHA256SUMS.txt"; \\
+    grep " ${RADIANT_TARBALL}\\$" SHA256SUMS.txt | sha256sum -c -; \\
+    tar xzf "${RADIANT_TARBALL}"; \\
+    install -m0755 "radiant-${RADIANT_VERSION}-linux-x64/radiantd" /usr/local/bin/radiantd; \\
+    install -m0755 "radiant-${RADIANT_VERSION}-linux-x64/radiant-cli" /usr/local/bin/radiant-cli; \\
+    rm -rf /tmp/*
+
+# Smoke-test that the binary actually runs in this base (catches a missing lib
+# at build time rather than at `regtest up`).
+RUN radiantd --version
+
+# The devnet driver overrides the entrypoint and passes -regtest flags
+# (see pyrxd/devnet.py); this default makes the image runnable standalone too.
+ENTRYPOINT ["radiantd"]
+CMD ["-regtest", "-server", "-printtoconsole"]
+"""
 
 
 class DevnetError(RuntimeError):
@@ -47,7 +126,7 @@ class RegtestNode:
     absent.
     """
 
-    IMAGE = "radiant-core:v2.3.0-amd64"
+    IMAGE = f"radiant-core:{DEFAULT_RADIANT_VERSION}-amd64"
     CONTAINER = "pyrxd-devnet"
     RPC_USER = "pyrxd"
     RPC_PASSWORD = "pyrxd"  # nosec B105  # localhost-only regtest sandbox cred (docker exec), not a secret
@@ -60,6 +139,32 @@ class RegtestNode:
     def _require_docker() -> None:
         if shutil.which("docker") is None:
             raise DevnetError("docker is not on PATH — install docker to use `pyrxd regtest`")
+
+    @classmethod
+    def build_image(cls, version: str = DEFAULT_RADIANT_VERSION, *, no_cache: bool = False) -> str:
+        """Build the regtest image from an OFFICIAL Radiant-Core release binary.
+
+        Wraps the published ``radiant-<version>-linux-x64`` daemon (SHA-256-verified
+        against the release checksum file) in a small ubuntu:22.04 image tagged
+        ``radiant-core:<version>-amd64``. Builds from the Dockerfile embedded in this
+        module, so it works for a ``pip install pyrxd`` developer with no repo checkout
+        as well as from a clone. Returns the built image tag.
+
+        This is the dev-facing replacement for the previously ad-hoc image that was
+        built outside the repo; ``pyrxd regtest setup`` calls it.
+        """
+        cls._require_docker()
+        tag = f"radiant-core:{version}-amd64"
+        with tempfile.TemporaryDirectory() as ctx:
+            (Path(ctx) / "Dockerfile").write_text(_REGTEST_DOCKERFILE, encoding="utf-8")
+            cmd = ["docker", "build", "-f", f"{ctx}/Dockerfile", "--build-arg", f"RADIANT_VERSION={version}", "-t", tag]
+            if no_cache:
+                cmd.append("--no-cache")
+            cmd.append(ctx)
+            r = subprocess.run(cmd, capture_output=True, text=True)  # nosec B603 B607  # controlled docker argv
+        if r.returncode != 0:
+            raise DevnetError(f"failed to build {tag}: {r.stderr.strip() or r.stdout.strip()}")
+        return tag
 
     def cli(self, *args: str, wallet: bool = False) -> object:
         """Run ``radiant-cli`` inside the container; parse JSON when possible."""
@@ -142,7 +247,8 @@ class RegtestNode:
             if "No such image" in stderr or "not found" in stderr:
                 raise DevnetError(
                     f"regtest image {self.IMAGE!r} is not present locally — "
-                    "build or pull the radiant-core regtest image first"
+                    "build it with `pyrxd regtest setup` (wraps the official "
+                    f"Radiant-Core {DEFAULT_RADIANT_VERSION} release binary)"
                 )
             raise DevnetError(f"failed to start regtest container: {stderr}")
 

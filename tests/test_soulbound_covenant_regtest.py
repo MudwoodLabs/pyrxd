@@ -1,6 +1,6 @@
 """Differential consensus validation of soulbound covenants on a real regtest node.
 
-Proves, against ``radiant-core:v2.3.0`` consensus (via ``testmempoolaccept``), that
+Proves, against ``radiant-core:v3.1.1`` consensus (via ``testmempoolaccept``), that
 BOTH soulbound covenant designs enforce the same security property:
 
 * **recur-to-self**  (output[0] is a byte-identical clone)            -> ACCEPTED

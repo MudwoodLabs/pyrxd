@@ -22,7 +22,7 @@ Gating (matches tests/test_dmint_deploy_integration.py convention):
 * ``@pytest.mark.integration`` — deselected by the default ``-m 'not integration'``
   addopts, so CI stays clean.
 * Opt-in: set ``RADIANT_REGTEST=1`` to run. Skips (not fails) if docker or the
-  ``radiant-core:v2.3.0-amd64`` image is unavailable.
+  ``radiant-core:v3.1.1-amd64`` image is unavailable.
 
 The test manages its OWN isolated regtest container (separate from any mainnet
 node), funds a throwaway wallet, mines its own blocks, and tears the container
@@ -55,7 +55,7 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 
 pytestmark = pytest.mark.integration
 
-_IMAGE = "radiant-core:v2.3.0-amd64"
+_IMAGE = "radiant-core:v3.1.1-amd64"
 _CONTAINER = "gravity-regtest-pytest"
 _RELAY_FEE_SATS = 1_000_000  # 0.01 RXD — >> relayfee (0.01 RXD/kB) for a sub-kB tx
 

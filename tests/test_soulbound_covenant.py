@@ -6,7 +6,7 @@ the *non-transferability invariant holds at the script level*: any "transfer"
 recur ``OP_EQUALVERIFY``.
 
 The consensus behaviour (does the Radiant VM accept/reject these spends?) is
-validated separately on a real ``radiant-core:v2.3.0`` regtest node in
+validated separately on a real ``radiant-core:v3.1.1`` regtest node in
 ``tests/test_soulbound_covenant_regtest.py`` (recur-to-self ACCEPTED,
 transfer-to-other REJECTED, burn ACCEPTED).
 """
@@ -122,6 +122,6 @@ def test_opcode_stream_walks_cleanly():
 # --------------------------------------------------------------------------- consensus validation
 #
 # The three consensus cases (recur-to-self ACCEPTED, transfer-to-other REJECTED,
-# burn ACCEPTED) are validated on a real radiant-core:v2.3.0 regtest node in
+# burn ACCEPTED) are validated on a real radiant-core:v3.1.1 regtest node in
 # tests/test_soulbound_covenant_regtest.py (run: RADIANT_REGTEST=1 ... -m integration),
 # differentially alongside the live mainnet deployed covenant design.

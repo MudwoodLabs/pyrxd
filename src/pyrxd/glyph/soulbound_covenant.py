@@ -1,7 +1,7 @@
 """PROTOTYPE: a *consensus-enforced* soulbound NFT covenant for Radiant Glyphs.
 
 Status: SPIKE — structural guards pass AND the consensus behaviour is CONFIRMED on
-``radiant-core:v2.3.0`` regtest (``tests/test_soulbound_covenant_regtest.py``:
+``radiant-core:v3.1.1`` regtest (``tests/test_soulbound_covenant_regtest.py``:
 recur-to-self ACCEPTED, transfer-to-other REJECTED, burn ACCEPTED), differentially
 alongside the live mainnet deployed design. Still pre-external-audit: do not use
 for real value until audited.
