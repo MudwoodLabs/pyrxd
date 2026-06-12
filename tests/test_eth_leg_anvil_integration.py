@@ -58,12 +58,12 @@ def _free_port() -> int:
     return port
 
 
-def _start_anvil(*extra_args: str):
+def _start_anvil(*extra_args: str, chain_id: int = _CHAIN_ID):
     """Start a fresh, isolated anvil (so evm_increaseTime cannot leak across tests); yield its URL."""
     port = _free_port()
     url = f"http://127.0.0.1:{port}"
     proc = subprocess.Popen(
-        ["anvil", "--port", str(port), "--chain-id", str(_CHAIN_ID), "--silent", *extra_args],
+        ["anvil", "--port", str(port), "--chain-id", str(chain_id), "--silent", *extra_args],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -101,14 +101,14 @@ def anvil_url_fast_finality():
     yield from _start_anvil("--slots-in-an-epoch", "1")
 
 
-def _legs(url: str):
+def _legs(url: str, chain_id: int = _CHAIN_ID):
     """A shared rpc + a taker leg (funds/refunds) and a maker leg (claims)."""
-    rpc = EthRpc(url, expected_chain_id=_CHAIN_ID)
+    rpc = EthRpc(url, expected_chain_id=chain_id)
     taker = EthHtlcContractLeg(
-        rpc=rpc, signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_TAKER)), chain_id=_CHAIN_ID, artifact=_ARTIFACT
+        rpc=rpc, signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_TAKER)), chain_id=chain_id, artifact=_ARTIFACT
     )
     maker = EthHtlcContractLeg(
-        rpc=rpc, signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_MAKER)), chain_id=_CHAIN_ID, artifact=_ARTIFACT
+        rpc=rpc, signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_MAKER)), chain_id=chain_id, artifact=_ARTIFACT
     )
     return rpc, taker, maker
 
@@ -279,5 +279,58 @@ async def test_finalized_pin_rejects_reorg_swapped_in_contract(anvil_url_fast_fi
         fin2 = await rpc.w3.eth.get_block("finalized")
         assert int(fin2["number"]) >= int(rec["blockNumber"])
         await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI, block_identifier="finalized")
+    finally:
+        await rpc.close()
+
+
+@pytest.fixture()
+def anvil_url_base_sepolia():
+    """Anvil presenting the Base Sepolia chain id — proves the leg machinery is
+    chain-id-agnostic across the EVM family (Tier 2.3: Base as a counter chain)."""
+    from pyrxd.eth_wallet.chains import KNOWN_EVM_CHAINS
+
+    yield from _start_anvil(chain_id=KNOWN_EVM_CHAINS["base-sepolia"].chain_id)
+
+
+async def test_full_lifecycle_on_base_chain_id(anvil_url_base_sepolia):
+    """Tier 2.3 (Base, EVM-family path): the SAME proven EthHtlc machinery — deploy/fund,
+    verify_funded binding gate, claim(p), secret scrape, R6 provenance — runs unmodified
+    against a node presenting Base Sepolia's chain id (84532). The chain is pinned at
+    every layer: EthRpc refuses a wrong chain id, the leg signs EIP-155-bound txs, and
+    the locator records chain_id for the durable SwapRecord."""
+    from pyrxd.eth_wallet.chains import KNOWN_EVM_CHAINS, evm_chain_by_id
+
+    base = KNOWN_EVM_CHAINS["base-sepolia"]
+    rpc, taker, maker = _legs(anvil_url_base_sepolia, chain_id=base.chain_id)
+    try:
+        p, h = _secret()
+        timeout = await _now_plus(rpc, 3600)
+        locator = await taker.fund(
+            hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=timeout, amount_wei=_AMOUNT_WEI
+        )
+        assert locator.chain_id == base.chain_id  # the durable record pins the chain
+        await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI)
+        claim_tx = await maker.claim(locator, p)
+        artifacts = await maker.fetch_claim_artifacts(claim_tx)
+        assert maker.recover_secret(artifacts, h) == p
+        await taker.assert_claim_provenance(claim_tx, contract_address=locator.contract_address, preimage=p)
+        # The registry's finality knob exists and respects the L1 floor (the safety contract
+        # a MarginPolicy for this chain is seeded from).
+        assert evm_chain_by_id(base.chain_id).finalization_window_s >= 768
+    finally:
+        await rpc.close()
+
+
+async def test_wrong_chain_id_refused(anvil_url_base_sepolia):
+    """The cross-chain pin fails closed: a leg negotiated for Ethereum L1 (chain id 1)
+    pointed at a Base-chain-id node refuses at assert_chain — a swap can never silently
+    run against the wrong EVM chain."""
+    rpc, taker, _maker = _legs(anvil_url_base_sepolia, chain_id=1)
+    try:
+        _, h = _secret()
+        with pytest.raises(ValidationError, match="wrong network"):
+            await taker.fund(
+                hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=4_000_000_000, amount_wei=_AMOUNT_WEI
+            )
     finally:
         await rpc.close()
