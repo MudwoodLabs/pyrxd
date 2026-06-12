@@ -28,6 +28,8 @@ _CROSS_CHAIN_EXPORTS = [
     # Counter-chain registries (Tier 2.3)
     "EvmChain",
     "KNOWN_EVM_CHAINS",
+    "PowChain",
+    "KNOWN_POW_CHAINS",
     # Covenant building blocks (Tier 2.4)
     "HtlcCovenant",
     "build_htlc_covenant_rxd",

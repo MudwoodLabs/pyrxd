@@ -114,6 +114,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # Counter-chain registries (per-chain safety knobs; see the cross-chain how-to)
     "EvmChain": ("pyrxd.eth_wallet.chains", "EvmChain"),
     "KNOWN_EVM_CHAINS": ("pyrxd.eth_wallet.chains", "KNOWN_EVM_CHAINS"),
+    "PowChain": ("pyrxd.btc_wallet.chains", "PowChain"),
+    "KNOWN_POW_CHAINS": ("pyrxd.btc_wallet.chains", "KNOWN_POW_CHAINS"),
     # Covenant building blocks (docs/concepts/covenant-building-blocks.md). PRE-AUDIT:
     # consensus-validated on regtest (several mainnet-proven), not externally audited.
     "HtlcCovenant": ("pyrxd.gravity.htlc_covenant", "HtlcCovenant"),

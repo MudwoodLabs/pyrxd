@@ -105,7 +105,8 @@ $ XCHAIN_ETH_REGTEST=1 pytest tests/test_xchain_eth_swap_regtest_e2e.py -m integ
 
 ## Adding another counter-chain
 
-There are two very different costs, depending on the chain family.
+Two families are proven; adding a chain within either is a config change, while a new
+family is a deliberate effort.
 
 ### EVM family — Base works today (no new code)
 
@@ -146,13 +147,51 @@ Proofs: `tests/test_eth_leg_anvil_integration.py::test_full_lifecycle_on_base_ch
 Base via `XCHAIN_ETH_CHAIN_ID=84532 XCHAIN_ETH_REGTEST=1 pytest
 tests/test_xchain_eth_swap_regtest_e2e.py -m integration`.
 
-### A new chain family (Litecoin, …) — a deliberate, separate effort
+### Bitcoin family — Litecoin works today (no coordinator change)
+
+The Taproot-HTLC leg machinery is **chain-agnostic across BIP341-activating Bitcoin-family
+chains**: the identical P2TR HTLC, claim/refund builders, preimage scrape, and BIP68 CSV
+semantics were proven byte-for-byte on **Litecoin** regtest consensus (claim accepted,
+wrong-preimage rejected with the same witness-program-mismatch reason, premature refund
+`non-BIP68-final`, matured refund accepted — Litecoin Core 0.21.5.5, taproot active). Swap
+a Radiant asset against LTC by changing three knobs, none of which touch the coordinator:
+
+```python
+from pyrxd import KNOWN_POW_CHAINS, MarginPolicy
+
+ltc = KNOWN_POW_CHAINS["litecoin"]   # network "ltc" / testnet "tltc" / regtest "rltc"
+
+kp = generate_keypair(ltc.regtest_network)            # bech32m, rltc1p… addresses
+htlc = build_htlc(..., network=ltc.regtest_network)   # the SAME taproot builders
+policy = MarginPolicy.estimated(block_interval_s=ltc.block_interval_s)  # 150 s, not 600
+```
+
+The negotiated `counter_chain` stays `"btc"` — it names the *PoW-depth family* — and the
+concrete chain is pinned by the leg/locator `network` tag (the bech32 HRP), exactly as an
+EVM swap pins its chain by chain id. **The one genuinely chain-specific safety knob is the
+block interval** (`pyrxd.btc_wallet.chains`): Litecoin's 2.5-minute target means an N-block
+margin is 4× less wall-clock than on Bitcoin, and the reorg gate's reserve math shifts
+accordingly — pass the registry interval or every timing margin silently shrinks.
+Two more honest caveats: confirmation **depth must be value-scaled per chain** (reorg
+resistance is priced in that chain's hashrate — the registry deliberately ships no depth
+defaults), and the bundled mainnet funding-reader/broadcaster backends are Bitcoin-specific
+(a Litecoin deployment supplies its own; the regtest harness drives the node RPC directly).
+
+Proofs: the BTC-leg consensus suite and the **entire coordinator e2e suite re-run as
+Litecoin** via the chain knobs —
+`BTC_FAMILY_CHAIN=ltc BTC_REGTEST=1 pytest tests/test_btc_htlc_regtest_e2e.py -m integration`
+and `XCHAIN_BTC_FAMILY=ltc XCHAIN_REGTEST=1 pytest tests/test_xchain_swap_regtest_e2e.py -m
+integration` (the node image builds from `docker/litecoin-regtest.Dockerfile`, wrapping the
+official release binary). Mainnet `"ltc"` stays behind the audit gate like every
+value-bearing network.
+
+### A new chain family — the deliberate path
 
 `CounterChainLeg` (`pyrxd.gravity.counter_chain_leg`) is the documented contract a new
 backend implements: `derive_expected_funding` / `fund` / `claim` / `refund` /
 `recover_secret` / `is_final`. The ABC was extracted from two *real* shapes (BTC Taproot +
 ETH Solidity), so it reflects what a third chain actually needs — finality is a per-leg
-concern, not a single RPC read. A non-EVM chain (e.g. Litecoin) means generalizing the
-PoW-depth dispatch and standing up new regtest infrastructure; adopting the ABC in the
-coordinator (the BTC path is still duck-typed) is a deliberate, separately-tested change
-on mainnet-proven code — read the ABC's scope note before starting.
+concern, not a single RPC read. A chain outside both proven families means new consensus
+semantics and new finality modelling; adopting the ABC in the coordinator (the BTC path is
+still duck-typed) is a deliberate, separately-tested change on mainnet-proven code — read
+the ABC's scope note before starting.
