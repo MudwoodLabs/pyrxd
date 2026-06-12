@@ -42,7 +42,7 @@ import hashlib
 import os
 
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
-from pyrxd.gravity.swap_coordinator import should_taker_refund_proactively
+from pyrxd.gravity.swap_coordinator import taker_refund_window_open
 from pyrxd.gravity.swap_state import SwapState
 from pyrxd.security.errors import NetworkError, ValidationError
 
@@ -122,7 +122,7 @@ class TestEthAdversarial:
             #    safety window the C1 trigger must NOT fire (the taker keeps waiting, correctly).
             n = coord.config.maker_stall_safety_window_blocks
             assert (
-                should_taker_refund_proactively(
+                taker_refund_window_open(
                     now_block_height=asset_locked_at + 1,
                     asset_locked_at_height=asset_locked_at,
                     t_rxd=terms.t_rxd,
@@ -137,7 +137,7 @@ class TestEthAdversarial:
             #    trigger must now FIRE ("stop waiting — the maker is stalling").
             node.rxd_mine(terms.t_rxd.value - n)
             assert (
-                should_taker_refund_proactively(
+                taker_refund_window_open(
                     now_block_height=int(node.rxd("getblockcount")),
                     asset_locked_at_height=asset_locked_at,
                     t_rxd=terms.t_rxd,

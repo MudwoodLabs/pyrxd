@@ -18,7 +18,7 @@ RecordStore ─┐                                    ┌─ AlertChannel (authe
         Reconciler.tick()  →  decide()  →  DedupAlerter.handle() → Page
              ▲                  ▲
    ChainObserver.observe() ─────┘   (consumes assess_claim_finality +
-   (BtcClaimSource + RxdChainSource) should_taker_refund_proactively — never re-derives)
+   (BtcClaimSource + RxdChainSource) taker_refund_window_open — never re-derives)
 ```
 
 - **`decide.py`** — pure `decide(record, observations, policy, safety_window_blocks) → Decision`.

@@ -58,13 +58,12 @@ def _free_port() -> int:
     return port
 
 
-@pytest.fixture()
-def anvil_url():
-    """Start a fresh, isolated anvil per test (so evm_increaseTime cannot leak across tests)."""
+def _start_anvil(*extra_args: str):
+    """Start a fresh, isolated anvil (so evm_increaseTime cannot leak across tests); yield its URL."""
     port = _free_port()
     url = f"http://127.0.0.1:{port}"
     proc = subprocess.Popen(
-        ["anvil", "--port", str(port), "--chain-id", str(_CHAIN_ID), "--silent"],
+        ["anvil", "--port", str(port), "--chain-id", str(_CHAIN_ID), "--silent", *extra_args],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -86,6 +85,20 @@ def anvil_url():
             proc.wait(timeout=5)
         except Exception:
             proc.kill()
+
+
+@pytest.fixture()
+def anvil_url():
+    yield from _start_anvil()
+
+
+@pytest.fixture()
+def anvil_url_fast_finality():
+    """Anvil with a 1-slot epoch so the 'finalized' tag lags the head by only ~2 blocks —
+    small enough to drive finality forward with a few evm_mine calls (default epoch = 32
+    slots → a 64-block lag), while still leaving a real non-finalized window at the tip
+    for the reorg test to attack."""
+    yield from _start_anvil("--slots-in-an-epoch", "1")
 
 
 def _legs(url: str):
@@ -203,5 +216,68 @@ async def test_refund_after_timeout_and_claim_blocked_when_expired(anvil_url):
         refund_tx = await taker.refund(locator)
         receipt = await rpc.wait_receipt(refund_tx)
         assert int(receipt.get("status", 0)) == 1
+    finally:
+        await rpc.close()
+
+
+async def test_finalized_pin_rejects_reorg_swapped_in_contract(anvil_url_fast_finality):
+    """MEDIUM-1 residual (whole-stack audit 2026-06-10): stage the verify→lock reorg substitution
+    on a real EVM and prove the 'finalized' pin is the live backstop for the runtime-mask gap.
+
+    Attack model: the taker's deploy is reorged out inside the verify→lock window and a DIFFERENT
+    deployment lands at the SAME (deployer, nonce) CREATE address. _runtime_code_matches masks
+    every committed-zero byte (see test_eth_leg.py's mask-gap test), so a swapped-in contract can
+    evade the 'latest' checks — the maker's pre-lock re-verify at 'finalized' is what closes this.
+
+    Asserts: (a) 'latest' ACCEPTS the swapped-in contract (it cannot tell the substitution
+    happened); (b) 'finalized' REJECTS it — the checkpoint predates the replacement, the code
+    read returns empty, fail closed; (c) the balance read honours the pin too (LOW-R1 residual);
+    (d) once the replacement itself finalizes, the SAME pinned verify passes — (b) rejected the
+    reorg, not a broken tag."""
+    rpc, taker, _maker = _legs(anvil_url_fast_finality)
+    try:
+        _, h = _secret()
+        timeout = await _now_plus(rpc, 3600)
+        snap = (await rpc.w3.provider.make_request("evm_snapshot", []))["result"]
+        locator = await taker.fund(
+            hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=timeout, amount_wei=_AMOUNT_WEI
+        )
+        # The taker's fund-time self-verify at 'latest' (the real protocol step) passes.
+        await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI)
+
+        # REORG: revert to the pre-deploy snapshot — the deploy is un-mined, nonce restored.
+        assert (await rpc.w3.provider.make_request("evm_revert", [snap]))["result"] is True
+        assert await rpc.get_code(locator.contract_address) == b""  # the honest deploy is gone
+
+        # The replacement: same negotiated immutables (so the getter binding cannot see it) but
+        # over-funded by 1 wei — a provably DIFFERENT deployment (different tx hash) at the SAME
+        # (deployer, nonce) CREATE address.
+        replacement = await taker.fund(
+            hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=timeout, amount_wei=_AMOUNT_WEI + 1
+        )
+        assert replacement.contract_address == locator.contract_address
+        assert replacement.deploy_tx_hash != locator.deploy_tx_hash
+
+        # Precondition for (b): the finalized checkpoint predates the replacement's block.
+        fin = await rpc.w3.eth.get_block("finalized")
+        rec = await rpc.w3.eth.get_transaction_receipt(replacement.deploy_tx_hash)
+        assert int(fin["number"]) < int(rec["blockNumber"])
+
+        # (a) 'latest' accepts the swapped-in contract against the ORIGINAL locator — blind.
+        await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI)
+        # (b) 'finalized' fails closed: empty code at the checkpoint → runtime-logic mismatch.
+        with pytest.raises(ValidationError, match="runtime logic"):
+            await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI, block_identifier="finalized")
+        # (c) LOW-R1 residual: the balance read honours the pin (0 at the checkpoint, funded at tip).
+        assert await rpc.get_balance(locator.contract_address, "finalized") == 0
+        assert await rpc.get_balance(locator.contract_address) == _AMOUNT_WEI + 1
+
+        # (d) Control: mine past the finality lag; the same pinned verify now passes — proving
+        # (b)'s rejection came from the reorg window, not from a broken/always-stale tag.
+        for _ in range(4):
+            await rpc.w3.provider.make_request("evm_mine", [])
+        fin2 = await rpc.w3.eth.get_block("finalized")
+        assert int(fin2["number"]) >= int(rec["blockNumber"])
+        await taker.verify_funded(locator, expected_amount_wei=_AMOUNT_WEI, block_identifier="finalized")
     finally:
         await rpc.close()

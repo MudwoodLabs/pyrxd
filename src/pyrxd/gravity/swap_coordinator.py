@@ -82,7 +82,8 @@ __all__ = [
     "assess_claim_finality",
     "generate_secret",
     "measure_margin_from_btc_block_times",
-    "should_taker_refund_proactively",
+    "should_taker_refund_proactively",  # deprecated alias of taker_refund_window_open
+    "taker_refund_window_open",
 ]
 
 logger = logging.getLogger(__name__)
@@ -464,7 +465,7 @@ def generate_secret() -> tuple[SecretBytes, bytes]:
 # ---------------------------------------------------------------------------
 
 
-def should_taker_refund_proactively(
+def taker_refund_window_open(
     *,
     now_block_height: int,
     asset_locked_at_height: int,
@@ -473,10 +474,12 @@ def should_taker_refund_proactively(
     maker_has_claimed_btc: bool,
     block_interval_s: float = 600.0,
 ) -> bool:
-    """Return True once the refund window is near and the taker must act rather than wait.
+    """Return True once the taker's act-now window is open: ``t_RXD - N`` reached, maker silent.
 
     This is a TIMING PREDICATE only — "the maker has not claimed and ``t_RXD - N`` is
-    approaching" — NOT a prescription of which refund to run. The dominant adversarial
+    approaching" — NOT a prescription of which refund to run. (Formerly named
+    ``should_taker_refund_proactively``; renamed because the name described an action
+    while the predicate only describes this window — deferred from PR #189.) The dominant adversarial
     risk it guards: because ``t_BTC > t_RXD``, a malicious maker can withhold the BTC
     claim until after ``t_RXD`` opens, then claim BTC (revealing ``p``) AND CSV-refund
     the asset, taking both. Treat the trigger as "stop waiting", never "keep waiting".
@@ -505,6 +508,10 @@ def should_taker_refund_proactively(
     # Act once we are within `safety_window_blocks` of that maturity.
     maturity = asset_locked_at_height + rxd_blocks
     return now_block_height >= (maturity - safety_window_blocks)
+
+
+# Deprecated alias (pre-0.8.0 public name); will be removed in a future release.
+should_taker_refund_proactively = taker_refund_window_open
 
 
 # ---------------------------------------------------------------------------
@@ -1622,7 +1629,7 @@ class SwapCoordinator:
             raise ValidationError(
                 f"maybe_refund_asset_on_maker_stall only valid from BOTH_LOCKED, not {self.record.state.value}"
             )
-        trigger = should_taker_refund_proactively(
+        trigger = taker_refund_window_open(
             now_block_height=now_block_height,
             asset_locked_at_height=asset_locked_at_height,
             t_rxd=self.record.terms.t_rxd,

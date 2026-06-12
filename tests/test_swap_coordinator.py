@@ -42,7 +42,7 @@ from pyrxd.gravity.swap_coordinator import (
     assess_claim_finality,
     generate_secret,
     measure_margin_from_btc_block_times,
-    should_taker_refund_proactively,
+    taker_refund_window_open,
 )
 from pyrxd.gravity.swap_state import (
     NegotiatedTerms,
@@ -643,14 +643,14 @@ async def test_taker_refuses_to_fund_on_failed_gate():
 def test_should_refund_proactively_only_near_maturity():
     t_rxd = t.Timelock(72, t.TimeUnit.BLOCKS)
     # locked at 1000; maturity = 1072; window = 6 -> act at >= 1066.
-    assert not should_taker_refund_proactively(
+    assert not taker_refund_window_open(
         now_block_height=1050,
         asset_locked_at_height=1000,
         t_rxd=t_rxd,
         safety_window_blocks=6,
         maker_has_claimed_btc=False,
     )
-    assert should_taker_refund_proactively(
+    assert taker_refund_window_open(
         now_block_height=1066,
         asset_locked_at_height=1000,
         t_rxd=t_rxd,
@@ -661,13 +661,21 @@ def test_should_refund_proactively_only_near_maturity():
 
 def test_should_not_refund_if_maker_already_claimed():
     # Once p is public the taker should scrape+claim, not refund.
-    assert not should_taker_refund_proactively(
+    assert not taker_refund_window_open(
         now_block_height=2000,
         asset_locked_at_height=1000,
         t_rxd=t.Timelock(72, t.TimeUnit.BLOCKS),
         safety_window_blocks=6,
         maker_has_claimed_btc=True,
     )
+
+
+def test_proactive_refund_deprecated_alias_points_at_renamed_predicate():
+    # The pre-0.8.0 name stays importable (deprecated alias) and IS the renamed predicate.
+    from pyrxd.gravity import swap_coordinator as sc
+
+    assert sc.should_taker_refund_proactively is sc.taker_refund_window_open
+    assert "should_taker_refund_proactively" in sc.__all__
 
 
 # ---------------------------------------------------------------------------

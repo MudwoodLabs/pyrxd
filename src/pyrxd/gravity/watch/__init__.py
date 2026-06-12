@@ -12,7 +12,7 @@ operational entrypoints live in ``scripts/watchtower_run.py`` (the tower) and
 ``scripts/watchtower_deadman.py`` (the independent dead-man's-switch monitor).
 
 The decision core (:func:`decide`) CONSUMES the audited gate functions
-``assess_claim_finality`` and ``should_taker_refund_proactively`` from
+``assess_claim_finality`` and ``taker_refund_window_open`` from
 ``swap_coordinator`` — it never re-derives finality. That is the audit-relevant
 invariant: the watchtower is a driver, not a second finality brain.
 """

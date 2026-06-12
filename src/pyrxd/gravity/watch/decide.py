@@ -5,7 +5,7 @@
 coordinator step the operator should run, and the deadline. It is **pure**: no
 chain calls, no I/O, exhaustively unit-testable, and it **consumes** the audited
 gate (``assess_claim_finality``) and the maker-stall predicate
-(``should_taker_refund_proactively``) rather than re-deriving them.
+(``taker_refund_window_open``) rather than re-deriving them.
 
 Key safety rules (mirrors the live coordinator, never routes around it):
 * Chain truth dominates a lagging record: if the maker's counter-leg claim is
@@ -37,7 +37,7 @@ from pyrxd.gravity.swap_coordinator import (
     ClaimFinality,
     MarginPolicy,
     assess_claim_finality,
-    should_taker_refund_proactively,
+    taker_refund_window_open,
 )
 from pyrxd.gravity.swap_state import SwapRecord, SwapState, is_terminal
 from pyrxd.security.errors import ValidationError
@@ -331,7 +331,7 @@ def decide(
             return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
         deadline = _refund_opens_at(policy, terms, obs.asset_locked_at_height)
         try:
-            refund_due = should_taker_refund_proactively(
+            refund_due = taker_refund_window_open(
                 now_block_height=obs.now_rxd_height,
                 asset_locked_at_height=obs.asset_locked_at_height,
                 t_rxd=terms.t_rxd,
@@ -416,7 +416,7 @@ def _decide_eth(
       (``swap_coordinator.py`` — the taker's value sits in the ETH HTLC it does not touch); ``mutual_refund``
       unwinds BOTH legs once their timeouts elapse.
     * **The maker-claim trigger is ``eth_claim_detected``** (an ETH claim tx observed) instead of a
-      spent BTC funding outpoint. ``should_taker_refund_proactively`` is chain-agnostic (it keys purely
+      spent BTC funding outpoint. ``taker_refund_window_open`` is chain-agnostic (it keys purely
       on RXD heights) and is reused unchanged.
 
     Alert-only: like the BTC branch it broadcasts nothing and only names the coordinator step.
@@ -519,7 +519,7 @@ def _decide_eth(
             return Decision(Intent.WATCH, reason="asset lock height not yet observed", low_corroboration=corr)
         deadline = _refund_opens_at(policy, terms, obs.asset_locked_at_height)
         try:
-            refund_due = should_taker_refund_proactively(
+            refund_due = taker_refund_window_open(
                 now_block_height=obs.now_rxd_height,
                 asset_locked_at_height=obs.asset_locked_at_height,
                 t_rxd=terms.t_rxd,

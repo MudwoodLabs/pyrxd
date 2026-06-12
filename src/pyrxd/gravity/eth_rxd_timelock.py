@@ -16,7 +16,7 @@ only starts counting once the covenant is MINED. This module bridges the two:
   creates (a maker withholding its claim until past the RXD refund, then claiming AND
   refunding) is mitigated by the proactive asset-refund + the cross-clock margin coupling, not
   by the timelock alone — see
-  :func:`pyrxd.gravity.swap_coordinator.should_taker_refund_proactively`.
+  :func:`pyrxd.gravity.swap_coordinator.taker_refund_window_open`.
 
   RESIDUAL FREE-OPTION (red-team HIGH, NOT fully closed pre-audit). The reveal-on-the-long-leg
   free-option is INHERENT to this swap shape and is only BOUNDED here, not eliminated. Honest
