@@ -92,11 +92,17 @@ jobs:
           poetry run python examples/regtest_quickstart.py | tee /tmp/quickstart.out
           grep -q "NFT minted on regtest" /tmp/quickstart.out
           poetry run pyrxd regtest down
-      - name: RXD covenant consensus suites on the pinned node
+      - name: RXD covenant spend under consensus on the pinned node
         env:
           RADIANT_REGTEST: "1"
+        # The covenant spend paths (HTLC + soulbound) validated against the real
+        # node's script interpreter — this is the gate that catches a Radiant-Core
+        # bump breaking covenant validation. The exhaustive nBits/bin2num
+        # differential matrix (test_spv_covenant_differential_regtest.py) is
+        # deliberately NOT run here: it needs pre-ground pure-Python PoW chains
+        # (tests/_regtest_grind_chains.py), the multi-minute cost PR #140 removed
+        # from CI on purpose. Run that matrix locally before a version bump.
         run: |
           poetry run pytest -o "addopts=" -m integration \
             tests/test_htlc_regtest_e2e.py \
-            tests/test_soulbound_covenant_regtest.py \
-            tests/test_spv_covenant_differential_regtest.py
+            tests/test_soulbound_covenant_regtest.py
