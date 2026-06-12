@@ -21,7 +21,7 @@
 # 2.35). Debian bullseye's glibc (2.31) is too old; bookworm's Boost (1.81) is
 # the wrong soname. Measured with `ldd`/`objdump -T` on the v3.1.x daemon.
 
-FROM ubuntu:22.04
+FROM ubuntu:22.04@sha256:4f838adc7181d9039ac795a7d0aba05a9bd9ecd480d294483169c5def983b64d
 
 ARG RADIANT_VERSION=v3.1.1
 ARG RADIANT_TARBALL=radiant-${RADIANT_VERSION}-linux-x64.tar.gz
