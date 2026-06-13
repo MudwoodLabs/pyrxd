@@ -88,9 +88,11 @@ class FundingPolicy:
 logger = logging.getLogger(__name__)
 
 # Networks that NEVER require the audit opt-in — isolated test chains that cannot
-# move real value. Everything else (mainnet "bc", and any value-bearing network)
-# requires an explicit audit-cleared opt-in.
-AUDIT_CLEARED_NETWORKS: frozenset[str] = frozenset({"bcrt", "regtest", "tb", "signet"})
+# move real value. Everything else (mainnet "bc"/"ltc", and any value-bearing network)
+# requires an explicit audit-cleared opt-in. "rltc"/"tltc" are Litecoin's regtest/
+# testnet HRPs (the Bitcoin-family Taproot-HTLC leg is chain-agnostic; see
+# pyrxd.btc_wallet.chains).
+AUDIT_CLEARED_NETWORKS: frozenset[str] = frozenset({"bcrt", "regtest", "tb", "signet", "rltc", "tltc"})
 
 # Broadcast responses that mean "the node already has this tx" — idempotent
 # success, NOT an error (a crash-recovery retry must not be treated as a failure).

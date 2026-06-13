@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import secrets
 import shutil
@@ -75,7 +76,21 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 pytestmark = pytest.mark.integration
 
 _RXD_IMAGE = "radiant-core:v3.1.1-amd64"
-_BTC_IMAGE = "ruimarinho/bitcoin-core:24"
+# Bitcoin-family chain knob (Tier 2.3): XCHAIN_BTC_FAMILY=ltc runs this SAME coordinator
+# e2e with Litecoin Core as the counter chain (the Taproot-HTLC leg is chain-agnostic
+# across the family; counter_chain stays "btc" — the PoW-depth FAMILY — and the network
+# HRP + block interval pin the concrete chain). Default: Bitcoin.
+_BTC_FAMILY = os.environ.get("XCHAIN_BTC_FAMILY", "btc")
+if _BTC_FAMILY == "ltc":
+    _BTC_IMAGE = "litecoin-core:v0.21.5.5-amd64"  # built from docker/litecoin-regtest.Dockerfile
+    _BTC_CLI = "litecoin-cli"
+    _BTC_HRP = "rltc"
+    _BTC_INTERVAL_S = 150.0  # Litecoin 2.5-min target (see pyrxd.btc_wallet.chains)
+else:
+    _BTC_IMAGE = "ruimarinho/bitcoin-core:24"
+    _BTC_CLI = "bitcoin-cli"
+    _BTC_HRP = "bcrt"
+    _BTC_INTERVAL_S = 600.0
 _RXD_CT = "xchain-rxd-pytest"
 _BTC_CT = "xchain-btc-pytest"
 _RXD_RELAY_FEE = 1_000_000  # 0.01 RXD per sub-kB tx
@@ -110,7 +125,7 @@ class _Nodes:
         return self._cli(_RXD_CT, "radiant-cli", "rt_user", self.rpass, wallet, a)
 
     def btc(self, *a, wallet=None):
-        return self._cli(_BTC_CT, "bitcoin-cli", "btc_user", self.bpass, wallet, a)
+        return self._cli(_BTC_CT, _BTC_CLI, "btc_user", self.bpass, wallet, a)
 
     def rxd_mine(self, n=1):
         self.rxd("generatetoaddress", str(n), self.raddr, wallet="gravity")
@@ -210,7 +225,18 @@ def nodes():
         pytest.skip("docker not available")
     for img in (_RXD_IMAGE, _BTC_IMAGE):
         if subprocess.run(["docker", "image", "inspect", img], capture_output=True).returncode != 0:
-            if img == _BTC_IMAGE:
+            if img == _BTC_IMAGE and _BTC_FAMILY == "ltc":
+                # Local-only image; build it from the committed Dockerfile.
+                repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                dockerfile = os.path.join(repo_root, "docker", "litecoin-regtest.Dockerfile")
+                if (
+                    subprocess.run(
+                        ["docker", "build", "-f", dockerfile, "-t", img, repo_root], capture_output=True, timeout=600
+                    ).returncode
+                    != 0
+                ):
+                    pytest.skip(f"could not build {img}")
+            elif img == _BTC_IMAGE:
                 if subprocess.run(["docker", "pull", img], capture_output=True, timeout=300).returncode != 0:
                     pytest.skip(f"could not obtain {img}")
             else:
@@ -410,7 +436,7 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _Locked
     t_btc = bt.Timelock(t_rxd_blocks + 40, bt.TimeUnit.BLOCKS)
 
     maker_btc = coincurve.PrivateKey(os.urandom(32))
-    taker_btc_kp = generate_keypair("bcrt")
+    taker_btc_kp = generate_keypair(_BTC_HRP)
     claim_xo = coincurve.PublicKeyXOnly.from_secret(maker_btc.secret).format()
     refund_xo = coincurve.PublicKeyXOnly.from_secret(bytes(taker_btc_kp._privkey.unsafe_raw_bytes())).format()
 
@@ -451,7 +477,7 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _Locked
         nodes.btc("getaddressinfo", nodes.btc("getnewaddress", wallet="btcw"), wallet="btcw")["scriptPubKey"]
     )
     btc_leg = BitcoinTaprootLeg(
-        network="bcrt",
+        network=_BTC_HRP,
         taker_keypair=taker_btc_kp,
         funding_utxo=funding_utxo,
         maker_claim_pubkey_xonly=claim_xo,
@@ -468,7 +494,7 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _Locked
     rxd_client = _RadiantCliClient(nodes)
     rxd_client.register_spk(cov.funded_spk)
     rxd_leg = RadiantCovenantLeg(
-        network="bcrt",
+        network=_BTC_HRP,
         taker_pkh=taker_pkh,
         maker_pkh=maker_pkh,
         chain_io=RadiantChainIO(rxd_client),
@@ -482,7 +508,7 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _Locked
         radiant_leg=rxd_leg,
         indexer=None,
         seen_store=_Seen(),
-        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated()),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(block_interval_s=_BTC_INTERVAL_S)),
     )
 
     # 1. Taker funds the BTC HTLC.
@@ -878,8 +904,20 @@ class TestWatchtowerIntentSequence:
     async def test_reveal_with_closing_window_pages_squeezed(self, nodes):
         """Tight t_rxd window + a shallow reveal: there is no longer room to wait for a reorg-safe
         burial before the maker's CSV refund opens → the gate SQUEEZES → a decision-required
-        PAGE_SQUEEZED (winner-take-all vs accept loss), never a silent claim or a silent wait."""
-        s = await _setup_locked_swap(nodes, t_rxd_blocks=10)
+        PAGE_SQUEEZED (winner-take-all vs accept loss), never a silent claim or a silent wait.
+
+        The squeeze threshold is CHAIN-SPECIFIC: WAIT needs blocks_left >= counter_reserve +
+        burial, where counter_reserve converts the counter chain's reorg depth into RXD blocks
+        via its block interval (BTC 600 s → reserve 12, threshold 18; LTC 150 s → reserve 3,
+        threshold 9 — a fixed window of 10 genuinely has room to WAIT on Litecoin, which is
+        correct gate behaviour, not slack). Derive the window from the same policy math so the
+        test forces a squeeze on whichever chain this run uses."""
+        policy = MarginPolicy.estimated(block_interval_s=_BTC_INTERVAL_S)
+        counter_reserve = math.ceil(
+            policy.btc_claim_reorg_depth.value * policy.block_interval_s / policy.rxd_block_interval_s
+        )
+        squeeze_window = counter_reserve + policy.rxd_claim_burial.value - 2  # 2 under the WAIT threshold
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=squeeze_window)
         coord = s.coord
         reconciler, channel = _watchtower(nodes, coord)
 
@@ -918,12 +956,12 @@ class TestWatchtowerAutonomousRefundRegtest:
         t_rxd = bt.Timelock(3, bt.TimeUnit.BLOCKS)
         h = hashlib.sha256(os.urandom(32)).digest()
         maker_btc = coincurve.PrivateKey(os.urandom(32))
-        taker_kp = generate_keypair("bcrt")
+        taker_kp = generate_keypair(_BTC_HRP)
         refund_priv = bytes(taker_kp._privkey.unsafe_raw_bytes())
         refund_xo = coincurve.PublicKeyXOnly.from_secret(refund_priv).format()
         claim_xo = coincurve.PublicKeyXOnly.from_secret(maker_btc.secret).format()
         htlc = bt.build_htlc(
-            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=t_btc, network="bcrt"
+            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=t_btc, network=_BTC_HRP
         )
 
         # Fund the HTLC address on bitcoind regtest, find the funding outpoint.
@@ -978,7 +1016,7 @@ class TestWatchtowerAutonomousRefundRegtest:
         ex = RefundExecutor(
             broadcaster=_BtcBroadcaster(nodes),
             blobs_dir=tmp_path,
-            network="bcrt",
+            network=_BTC_HRP,
             cap_sats=btc_sats,
             refund_spk=dest,
             accept_single_source=True,
@@ -1037,7 +1075,7 @@ class TestWatchtowerDustHarnessRegtest:
                     "--swap-id",
                     swap_id,
                     "--network",
-                    "bcrt",
+                    _BTC_HRP,
                     "--btc-sats",
                     str(btc_sats),
                     "--t-btc",
@@ -1104,7 +1142,7 @@ class TestWatchtowerDustHarnessRegtest:
         ex = RefundExecutor(
             broadcaster=_BtcBroadcaster(nodes),
             blobs_dir=records,
-            network="bcrt",
+            network=_BTC_HRP,
             cap_sats=btc_sats,
             refund_spk=dest,
             accept_single_source=True,

@@ -57,8 +57,12 @@ _TESTNET_P2PKH = 0x6F
 _TESTNET_P2SH = 0xC4
 _TESTNET_WIF = 0xEF
 
-# Known HRPs for which we use testnet-style base58 version bytes.
-_TESTNET_HRPS = frozenset({"tb", "bcrt"})
+# Known HRPs for which we use testnet-style base58 version bytes. Litecoin's test
+# chains ("tltc" testnet, "rltc" regtest) share Bitcoin's testnet versions
+# (P2PKH 0x6F / WIF 0xEF); Litecoin MAINNET ("ltc") deliberately stays on the
+# fallback path — its base58 versions differ (P2PKH 0x30), but the Taproot-HTLC
+# leg only ever uses bech32m output where the HRP alone is authoritative.
+_TESTNET_HRPS = frozenset({"tb", "bcrt", "tltc", "rltc"})
 
 
 def _version_bytes_for(network: str) -> tuple[int, int, int]:

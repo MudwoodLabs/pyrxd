@@ -45,7 +45,18 @@ from pyrxd.btc_wallet import taproot as t
 
 pytestmark = pytest.mark.integration
 
-_IMAGE = "ruimarinho/bitcoin-core:24"
+# Bitcoin-family chain knob (Tier 2.3): BTC_FAMILY_CHAIN=ltc runs this SAME consensus
+# suite against Litecoin Core (taproot active since 0.21.x; regtest HRP "rltc") —
+# proving the Taproot-HTLC leg is chain-agnostic across the family. Default: Bitcoin.
+_CHAIN = os.environ.get("BTC_FAMILY_CHAIN", "btc")
+if _CHAIN == "ltc":
+    _IMAGE = "litecoin-core:v0.21.5.5-amd64"  # built from docker/litecoin-regtest.Dockerfile
+    _CLI = "litecoin-cli"
+    _HRP = "rltc"
+else:
+    _IMAGE = "ruimarinho/bitcoin-core:24"
+    _CLI = "bitcoin-cli"
+    _HRP = "bcrt"
 _CONTAINER = "gravity-btc-regtest-pytest"
 _FEE_SATS = 2_000
 _REFUND_CSV = 3
@@ -64,7 +75,7 @@ class _BtcRegtest:
             "docker",
             "exec",
             _CONTAINER,
-            "bitcoin-cli",
+            _CLI,
             "-regtest",
             f"-rpcuser={self.user}",
             f"-rpcpassword={self.password}",
@@ -73,7 +84,7 @@ class _BtcRegtest:
             base.append("-rpcwallet=btcw")
         r = subprocess.run(base + list(args), capture_output=True, text=True, timeout=60)
         if r.returncode != 0:
-            raise RuntimeError(f"bitcoin-cli {args[0]} failed: {r.stderr.strip()}")
+            raise RuntimeError(f"{_CLI} {args[0]} failed: {r.stderr.strip()}")
         out = r.stdout.strip()
         try:
             return json.loads(out)
@@ -122,9 +133,15 @@ class _BtcRegtest:
         else:
             raise RuntimeError("bitcoind regtest RPC did not become ready")
         assert self.cli("getblockchaininfo")["chain"] == "regtest", "node is NOT regtest — aborting"
-        # Taproot must be active for the P2TR script-path spends.
-        dep = self.cli("getdeploymentinfo")
-        tr = dep["deployments"]["taproot"] if isinstance(dep, dict) and "deployments" in dep else {}
+        # Taproot must be active for the P2TR script-path spends. Bitcoin Core 23+
+        # reports it via getdeploymentinfo; Litecoin Core 0.21 (pre-23 RPC surface)
+        # via getblockchaininfo's softforks map.
+        try:
+            dep = self.cli("getdeploymentinfo")
+            tr = dep["deployments"]["taproot"] if isinstance(dep, dict) and "deployments" in dep else {}
+        except RuntimeError:
+            sf = self.cli("getblockchaininfo").get("softforks", {})
+            tr = sf.get("taproot", {})
         assert tr.get("active") is True, "taproot is not active on this regtest node"
         self.cli("createwallet", "btcw")
         self.mine_addr = str(self.cli("getnewaddress", wallet=True))
@@ -155,12 +172,31 @@ def btc():
         pytest.skip("BTC_REGTEST not set (opt-in for the live bitcoind e2e)")
     if shutil.which("docker") is None:
         pytest.skip("docker not available")
-    # Ensure the image is present (pull if needed); skip if we can't get it.
+    # Ensure the image is present. The bitcoin image pulls from docker hub; the
+    # litecoin image is local-only and builds from the committed Dockerfile.
     have = subprocess.run(["docker", "image", "inspect", _IMAGE], capture_output=True)
     if have.returncode != 0:
-        pull = subprocess.run(["docker", "pull", _IMAGE], capture_output=True, timeout=300)
-        if pull.returncode != 0:
-            pytest.skip(f"could not obtain {_IMAGE}")
+        if _CHAIN == "ltc":
+            repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            build = subprocess.run(
+                [
+                    "docker",
+                    "build",
+                    "-f",
+                    os.path.join(repo_root, "docker", "litecoin-regtest.Dockerfile"),
+                    "-t",
+                    _IMAGE,
+                    repo_root,
+                ],
+                capture_output=True,
+                timeout=600,
+            )
+            if build.returncode != 0:
+                pytest.skip(f"could not build {_IMAGE}")
+        else:
+            pull = subprocess.run(["docker", "pull", _IMAGE], capture_output=True, timeout=300)
+            if pull.returncode != 0:
+                pytest.skip(f"could not obtain {_IMAGE}")
     n = _BtcRegtest()
     n.start()
     try:
@@ -187,7 +223,7 @@ class TestBtcHtlcOnConsensus:
         h = hashlib.sha256(p).digest()
         timeout = t.Timelock(_REFUND_CSV, t.TimeUnit.BLOCKS)
         htlc = t.build_htlc(
-            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=timeout, network="bcrt"
+            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=timeout, network=_HRP
         )
         locator = btc.fund_htlc(htlc)
         payout = btc.payout_spk()
@@ -212,7 +248,7 @@ class TestBtcHtlcOnConsensus:
             claim_pubkey_xonly=claim_xo,
             refund_pubkey_xonly=refund_xo,
             timeout=timeout,
-            network="bcrt",
+            network=_HRP,
         )
         wrong_loc = wrong_htlc.with_funding(locator.funding_outpoint, locator.amount_sats)
         wrong_claim = t.build_claim_tx(
@@ -243,7 +279,7 @@ class TestBtcHtlcOnConsensus:
         h = hashlib.sha256(p).digest()
         timeout = t.Timelock(_REFUND_CSV, t.TimeUnit.BLOCKS)
         htlc = t.build_htlc(
-            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=timeout, network="bcrt"
+            hashlock=h, claim_pubkey_xonly=claim_xo, refund_pubkey_xonly=refund_xo, timeout=timeout, network=_HRP
         )
         locator = btc.fund_htlc(htlc)
         payout = btc.payout_spk()
