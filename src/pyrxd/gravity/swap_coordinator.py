@@ -196,6 +196,32 @@ class MarginPolicy:
     rxd_claim_burial: Timelock = field(
         default_factory=lambda: Timelock(ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS, TimeUnit.BLOCKS)
     )
+    # VALUE-SCALED claim burial (red-team 2026-06-12 HIGH). The flat ``rxd_claim_burial`` above
+    # bounds reorg PROBABILITY, not reorg COST vs. value — a low-cap PoW chain like Radiant can be
+    # shallow-reorged for ~a fixed marginal cost, so a swap whose Radiant-side value exceeds that
+    # cost is economically reversible at a flat burial (Bitcoin's "6 conf" folklore does NOT
+    # transfer to a low-cap chain; cf. THORChain value-scaled confs, Trail-of-Bits 25%-cost
+    # method). When BOTH of the next two are set, the reorg gate raises the required burial to
+    # ``ceil(value_at_risk_photons * burial_safety_factor / rxd_reorg_cost_per_block)`` (floored at
+    # the flat ``rxd_claim_burial``), so an attacker must spend >= the value at stake to reorg the
+    # taker's claim out. The coordinator REFUSES a value-bearing Radiant swap unless these are set
+    # OR ``accept_flat_burial=True`` (the dust opt-out) — fail-closed, mirroring ``require_measured``.
+    #
+    # rxd_reorg_cost_per_block: the MEASURED marginal cost to reorg ONE Radiant block, in PHOTONS
+    # (the honest reward + work an attacker must out-spend per block). Operator-supplied/refreshed
+    # (it tracks hashrate + RXD price); never hardcoded — an estimate masquerading as a measurement
+    # would size the whole defence wrong. None disables value-scaling (then accept_flat_burial gates).
+    rxd_reorg_cost_per_block: int | None = None
+    # value_at_risk_photons: the swap's ECONOMIC value to protect, in PHOTONS. For an RXD swap this
+    # equals ``terms.radiant_amount``; for FT/NFT the on-chain amount (token units / NFT carrier
+    # dust) is NOT the economic value, so the operator MUST assess and supply it explicitly.
+    value_at_risk_photons: int | None = None
+    # burial_safety_factor: required cost-to-reorg >= factor * value. 1.0 = break-even (an attack
+    # costs exactly the value — marginally unprofitable); raise it for margin.
+    burial_safety_factor: float = 1.0
+    # accept_flat_burial: the explicit dust opt-out. True = "this value is below the reorg cost, a
+    # flat burial is fine" — the conscious, logged escape from the fail-closed setup gate.
+    accept_flat_burial: bool = False
     # Finalized-checkpoint (ETH/PoS) counter-leg finalization window, in SECONDS (re-audit §9
     # #3). For a depth-based (BTC/PoW) leg this stays None and the reorg gate uses
     # btc_claim_reorg_depth. For an ETH leg — whose finality is a TIME checkpoint, not a block
@@ -245,6 +271,22 @@ class MarginPolicy:
                 "real-value mode (require_measured=True) requires a MEASURED margin; "
                 "the ESTIMATED default is test-only — supply measured block data + reorg depth"
             )
+        # Value-scaled-burial inputs (red-team 2026-06-12 HIGH): positive when set.
+        for label, val in (
+            ("rxd_reorg_cost_per_block", self.rxd_reorg_cost_per_block),
+            ("value_at_risk_photons", self.value_at_risk_photons),
+        ):
+            if val is not None and (not isinstance(val, int) or isinstance(val, bool) or val <= 0):
+                raise ValidationError(f"MarginPolicy.{label} must be a positive int (photons) or None")
+        if not isinstance(self.burial_safety_factor, (int, float)) or isinstance(self.burial_safety_factor, bool):
+            raise ValidationError("MarginPolicy.burial_safety_factor must be a number")
+        if self.burial_safety_factor < 1.0:
+            raise ValidationError(
+                f"MarginPolicy.burial_safety_factor = {self.burial_safety_factor} < 1.0; a factor below "
+                "break-even lets a reorg cost LESS than the value it reverses (the attack is profitable)"
+            )
+        if not isinstance(self.accept_flat_burial, bool):
+            raise ValidationError("MarginPolicy.accept_flat_burial must be bool")
         if self.eth_finalization_window_s is not None:
             if (
                 not isinstance(self.eth_finalization_window_s, int)
@@ -268,13 +310,20 @@ class MarginPolicy:
             raise ValidationError("MarginPolicy.max_covenant_confirm_wait_s must be a non-negative int or None")
 
     @classmethod
-    def estimated(cls, *, block_interval_s: float = 600.0, require_measured: bool = False) -> MarginPolicy:
-        """The ESTIMATED, test-only policy. Refuses to construct in real-value mode."""
+    def estimated(
+        cls, *, block_interval_s: float = 600.0, require_measured: bool = False, accept_flat_burial: bool = False
+    ) -> MarginPolicy:
+        """The ESTIMATED, test-only policy. Refuses to construct in real-value mode.
+
+        ``accept_flat_burial`` is the dust opt-out from the value-scaled-burial setup gate —
+        set it for a deliberate dust run whose value is below the Radiant reorg cost.
+        """
         return cls(
             margin=Timelock(ESTIMATED_DEFAULT_MARGIN_BLOCKS, TimeUnit.BLOCKS),
             block_interval_s=block_interval_s,
             is_measured=False,
             require_measured=require_measured,
+            accept_flat_burial=accept_flat_burial,
         )
 
     @classmethod
@@ -286,6 +335,10 @@ class MarginPolicy:
         btc_claim_reorg_depth: Timelock | None = None,
         rxd_claim_burial: Timelock | None = None,
         rxd_block_interval_s: float | None = None,
+        rxd_reorg_cost_per_block: int | None = None,
+        value_at_risk_photons: int | None = None,
+        burial_safety_factor: float = 1.0,
+        accept_flat_burial: bool = False,
     ) -> MarginPolicy:
         """A measured policy for real-value mainnet swaps.
 
@@ -293,12 +346,19 @@ class MarginPolicy:
         inputs; if omitted they fall back to the ESTIMATED defaults (acceptable only
         because a measured policy still carries the estimated reorg depths — supply
         measured values for a real mainnet swap).
+
+        ``rxd_reorg_cost_per_block`` (measured, photons/block) + ``value_at_risk_photons``
+        (the assessed economic value) drive the VALUE-SCALED claim burial (red-team HIGH):
+        supply both for a value-bearing Radiant swap, or set ``accept_flat_burial=True`` for
+        a dust run — the coordinator refuses a value-bearing swap that leaves them unset.
         """
         kwargs: dict = {
             "margin": margin,
             "block_interval_s": block_interval_s,
             "is_measured": True,
             "require_measured": True,
+            "burial_safety_factor": burial_safety_factor,
+            "accept_flat_burial": accept_flat_burial,
         }
         if btc_claim_reorg_depth is not None:
             kwargs["btc_claim_reorg_depth"] = btc_claim_reorg_depth
@@ -306,6 +366,10 @@ class MarginPolicy:
             kwargs["rxd_claim_burial"] = rxd_claim_burial
         if rxd_block_interval_s is not None:
             kwargs["rxd_block_interval_s"] = rxd_block_interval_s
+        if rxd_reorg_cost_per_block is not None:
+            kwargs["rxd_reorg_cost_per_block"] = rxd_reorg_cost_per_block
+        if value_at_risk_photons is not None:
+            kwargs["value_at_risk_photons"] = value_at_risk_photons
         return cls(**kwargs)
 
 
@@ -316,6 +380,7 @@ def measure_margin_from_btc_block_times(
     btc_claim_reorg_depth_blocks: int,
     rxd_claim_burial_blocks: int,
     rxd_block_interval_s: float,
+    accept_flat_burial: bool = False,
 ) -> tuple[MarginPolicy, dict]:
     """Build a MEASURED MarginPolicy from real mainnet BTC inter-block data (pure).
 
@@ -375,6 +440,9 @@ def measure_margin_from_btc_block_times(
         btc_claim_reorg_depth=Timelock(btc_claim_reorg_depth_blocks, TimeUnit.BLOCKS),
         rxd_claim_burial=Timelock(rxd_claim_burial_blocks, TimeUnit.BLOCKS),
         rxd_block_interval_s=float(rxd_block_interval_s),  # F-007: stored for the squeeze conversion
+        # Dust runs opt out of value-scaled burial (the value is below the Radiant reorg cost);
+        # a real-value run leaves this False and supplies rxd_reorg_cost_per_block + value_at_risk.
+        accept_flat_burial=accept_flat_burial,
     )
     provenance = {
         "measured": {
@@ -390,6 +458,7 @@ def measure_margin_from_btc_block_times(
             "rxd_claim_burial_blocks": rxd_claim_burial_blocks,
             "rxd_block_interval_s": rxd_block_interval_s,
             "min_reorg_depth_floor_blocks": _MIN_REORG_DEPTH_BLOCKS,
+            "accept_flat_burial": accept_flat_burial,
         },
         "note": (
             "margin + block_interval_s are MEASURED from observed BTC block timestamps; "
@@ -537,6 +606,25 @@ class ClaimFinality(Enum):
     SQUEEZED = "squeezed"
 
 
+def _value_scaled_burial_blocks(policy: MarginPolicy) -> int:
+    """Required claim-burial depth (Radiant blocks) so a reorg of the taker's claim costs at
+    least the value at stake — 0 when value-scaling is not configured (then the flat burial
+    stands). Pure (red-team 2026-06-12 HIGH).
+
+    ``required = ceil(value_at_risk_photons * burial_safety_factor / rxd_reorg_cost_per_block)``:
+    burying ``required`` blocks forces an attacker to out-spend ``required *
+    rxd_reorg_cost_per_block >= value_at_risk_photons * factor`` to reverse the claim. Both
+    economic inputs are operator-supplied (a measured per-block reorg cost + an assessed
+    value); when either is absent there is no basis to scale, so this returns 0 and the
+    coordinator's setup gate is what refused a value-bearing swap that left them unset.
+    """
+    cost = policy.rxd_reorg_cost_per_block
+    value = policy.value_at_risk_photons
+    if cost is None or value is None:
+        return 0
+    return math.ceil(value * policy.burial_safety_factor / cost)
+
+
 def _reserve_to_blocks(reserve: Timelock, block_interval_s: float) -> int:
     """Convert a REQUIREMENT/reserve Timelock to BLOCKS, rounding UP for a seconds-tagged value.
 
@@ -563,7 +651,9 @@ def assess_claim_finality(
       1. the maker's COUNTER-LEG claim must be FINAL (PoW: ``policy.btc_claim_reorg_depth``
          confirmations deep so ``p`` is reorg-safe; PoS: past the ``finalized`` checkpoint),
          supplied as a :class:`CounterClaimFinality` verdict, THEN
-      2. the taker's own Radiant claim must bury ``policy.rxd_claim_burial`` deep,
+      2. the taker's own Radiant claim must bury deep enough — ``max(policy.rxd_claim_burial,
+         value-scaled)``, where the value-scaled depth (red-team HIGH) makes a reorg of the
+         claim cost at least the value at stake (see ``_value_scaled_burial_blocks``) —
       both BEFORE ``t_rxd`` (the maker's CSV refund) opens at
       ``asset_locked_at_height + t_rxd``.
 
@@ -600,7 +690,10 @@ def assess_claim_finality(
         rxd_blocks = t_rxd.normalize_to(TimeUnit.BLOCKS, block_interval_s=policy.block_interval_s).value
         # Reserves round UP when seconds-tagged (flooring under-counts a reserve — unsafe);
         # t_rxd above floors, which is safe for a deadline (only shrinks the window).
-        rxd_burial = _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
+        flat_burial = _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
+        # VALUE-SCALED burial (red-team HIGH): the taker's claim must bury deep enough that
+        # reorging it costs at least the value at stake; the flat burial is only a FLOOR.
+        rxd_burial = max(flat_burial, _value_scaled_burial_blocks(policy))
         required_depth_blocks = _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
     except ValidationError:
         raise
@@ -861,6 +954,29 @@ class SwapCoordinator:
                 "free-option window (SEEN-1). Use a durable SeenStore (durable=True), or pass "
                 "CoordinatorConfig(accept_nondurable_seen=True) to consciously accept "
                 "non-durability for a single-process, single-shot, fresh-H-per-run runbook."
+            )
+        # VALUE-SCALED BURIAL (red-team 2026-06-12 HIGH): the taker's Radiant asset-claim is
+        # deemed reorg-safe at a FLAT burial that is never scaled to value. On a low-cap PoW
+        # chain a swap worth more than the marginal cost to reorg a few Radiant blocks is
+        # economically reversible. Fail-closed at setup, mirroring MEDIUM-1: a value-bearing
+        # RADIANT asset (mainnet) MUST supply the economic inputs the gate value-scales from
+        # (a measured per-block reorg cost + an assessed value-at-risk) OR consciously opt into a
+        # flat burial via MarginPolicy(accept_flat_burial=True) for a dust run.
+        if (
+            _leg_is_value_bearing(radiant_leg)
+            and not config.margin_policy.accept_flat_burial
+            and (
+                config.margin_policy.rxd_reorg_cost_per_block is None
+                or config.margin_policy.value_at_risk_photons is None
+            )
+        ):
+            raise ValidationError(
+                "value-bearing Radiant asset swap without value-scaled claim burial: a flat "
+                "rxd_claim_burial bounds reorg probability, not reorg COST vs. value, so a swap worth "
+                "more than the marginal Radiant reorg cost is economically reversible (red-team HIGH). "
+                "Set MarginPolicy.rxd_reorg_cost_per_block (measured, photons/block) AND "
+                "value_at_risk_photons (the assessed economic value), or pass "
+                "MarginPolicy(accept_flat_burial=True) to consciously accept a flat burial on a dust run."
             )
         # MEDIUM-1 (whole-stack audit): a VALUE-BEARING ETH counter-leg swap on an ESTIMATED
         # policy silently runs in the weak mode of two defenses — the verify->lock 'finalized'

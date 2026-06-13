@@ -116,6 +116,8 @@ def _policy(args: argparse.Namespace) -> MarginPolicy:
         eth_finalization_window_s=args.eth_finalization_window_s,
         cross_clock_margin=_cross_clock_margin(args),
         max_covenant_confirm_wait_s=args.max_covenant_confirm_wait_s,
+        # Dust harness: value below the Radiant reorg cost → opt out of value-scaled burial.
+        accept_flat_burial=True,
     )
 
 

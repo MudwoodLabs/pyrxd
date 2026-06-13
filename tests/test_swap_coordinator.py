@@ -1453,6 +1453,9 @@ def _eth_finality_policy(*, window_s=768, is_measured=False, rxd_block_interval_
         btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
         rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
         eth_finalization_window_s=window_s,
+        # These tests exercise the MEDIUM-1 ETH / SEEN gates, not the value-scaled-burial gate;
+        # opt out of the latter so a value-bearing radiant leg reaches the gate under test.
+        accept_flat_burial=True,
     )
 
 
@@ -2270,6 +2273,131 @@ def test_value_bearing_btc_estimated_unaffected():
         radiant_leg=_value_bearing_radiant(),
         indexer=FakeIndexer(),
         seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(
+            margin_policy=MarginPolicy.estimated(accept_flat_burial=True), accept_nondurable_seen=True
+        ),
+    )
+    assert coord is not None
+
+
+# --------------------------------------------------------------------------------------------------
+# Value-scaled claim burial (red-team 2026-06-12 HIGH): the taker's claim must bury deep enough
+# that a reorg of it costs at least the value at stake — flat burial is only a floor.
+# --------------------------------------------------------------------------------------------------
+
+
+def _burial_coord(margin_policy):
+    return SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms()),
+        btc_leg=FakeBtcLeg(),
+        radiant_leg=_value_bearing_radiant(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=margin_policy, accept_nondurable_seen=True),
+    )
+
+
+def test_value_scaled_burial_math_and_floor():
+    from pyrxd.gravity.swap_coordinator import _value_scaled_burial_blocks
+
+    # value 1,000,000 / cost 100,000 / factor 1.0 -> 10 blocks; ceil rounds up.
+    p = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_reorg_cost_per_block=100_000,
+        value_at_risk_photons=1_050_000,
+    )
+    assert _value_scaled_burial_blocks(p) == 11  # ceil(1,050,000 / 100,000)
+    # factor scales linearly.
+    p2 = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_reorg_cost_per_block=100_000,
+        value_at_risk_photons=1_000_000,
+        burial_safety_factor=2.0,
+    )
+    assert _value_scaled_burial_blocks(p2) == 20
+    # Unset inputs -> 0 (the flat burial stands).
+    assert _value_scaled_burial_blocks(MarginPolicy.estimated()) == 0
+
+
+def test_high_value_squeezes_where_flat_would_be_safe():
+    # A swap whose value-scaled burial exceeds the t_rxd window is SQUEEZED even with a final
+    # counter-leg claim — the gate refuses to call it SAFE on a shallow burial (the HIGH fix).
+    locked_at, now = 1000, 1001
+    t_rxd = t.Timelock(20, t.TimeUnit.BLOCKS)  # window ~19 blocks left
+    flat_safe = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_block_interval_s=300.0,
+        rxd_claim_burial=t.Timelock(2, t.TimeUnit.BLOCKS),
+        accept_flat_burial=True,
+    )
+    assert (
+        assess_claim_finality(
+            counter_claim_finality=_final(),
+            now_rxd_height=now,
+            asset_locked_at_height=locked_at,
+            t_rxd=t_rxd,
+            policy=flat_safe,
+        )
+        is ClaimFinality.SAFE
+    )
+    # Same window, but value demands burial 50 (5,000,000 / 100,000) >> 19 left -> SQUEEZED.
+    value_scaled = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_block_interval_s=300.0,
+        rxd_claim_burial=t.Timelock(2, t.TimeUnit.BLOCKS),
+        rxd_reorg_cost_per_block=100_000,
+        value_at_risk_photons=5_000_000,
+    )
+    assert (
+        assess_claim_finality(
+            counter_claim_finality=_final(),
+            now_rxd_height=now,
+            asset_locked_at_height=locked_at,
+            t_rxd=t_rxd,
+            policy=value_scaled,
+        )
+        is ClaimFinality.SQUEEZED
+    )
+
+
+def test_setup_gate_refuses_value_bearing_radiant_without_value_scaling():
+    with pytest.raises(ValidationError, match="value-scaled claim burial"):
+        _burial_coord(MarginPolicy.estimated())  # value-bearing radiant, no inputs, no opt-out
+
+
+def test_setup_gate_accepts_dust_optout():
+    assert _burial_coord(MarginPolicy.estimated(accept_flat_burial=True)) is not None
+
+
+def test_setup_gate_accepts_value_scaled_inputs():
+    p = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_reorg_cost_per_block=100_000,
+        value_at_risk_photons=1_000_000,
+    )
+    assert _burial_coord(p) is not None
+
+
+def test_setup_gate_does_not_fire_on_non_value_bearing_radiant():
+    # A regtest/fake (non-mainnet) radiant leg is not value-bearing -> no burial gate, no inputs needed.
+    coord = SwapCoordinator(
+        record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms()),
+        btc_leg=FakeBtcLeg(),
+        radiant_leg=FakeRadiantLeg(),  # no .network => not value-bearing
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
         config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(), accept_nondurable_seen=True),
     )
     assert coord is not None
+
+
+def test_burial_safety_factor_below_one_rejected():
+    with pytest.raises(ValidationError, match="burial_safety_factor"):
+        MarginPolicy.measured(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=300.0, burial_safety_factor=0.9
+        )

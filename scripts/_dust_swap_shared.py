@@ -242,6 +242,9 @@ async def measured_margin_from_mainnet(args: argparse.Namespace):
         btc_claim_reorg_depth_blocks=args.btc_claim_reorg_depth,
         rxd_claim_burial_blocks=args.rxd_claim_burial,
         rxd_block_interval_s=args.rxd_block_interval_s,
+        # This is a DUST harness (gated on --i-accept-dust-loss): the value is below the Radiant
+        # reorg cost, so opt out of value-scaled burial. A real-value run must NOT use this path.
+        accept_flat_burial=True,
     )
 
 

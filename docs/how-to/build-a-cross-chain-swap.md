@@ -81,6 +81,15 @@ coordinator = SwapCoordinator(
 - **`MarginPolicy.measured(...)` vs estimated.** A real-value swap MUST use a measured
   margin policy; the coordinator refuses a value-bearing swap on estimated margins unless
   you consciously opt in (`accept_estimated_eth_margins` / the dust-run hatches).
+- **Value-scaled claim burial.** Radiant is low-cap PoW, so a *flat* claim-burial depth
+  bounds reorg probability, not reorg *cost vs. value* — a swap worth more than the marginal
+  cost to reorg a few Radiant blocks is economically reversible. The coordinator therefore
+  refuses a value-bearing Radiant swap unless you give `MarginPolicy` the economic inputs it
+  scales burial from — `rxd_reorg_cost_per_block` (measured, photons/block) and
+  `value_at_risk_photons` (the assessed economic value; for FT/NFT this is *not* the on-chain
+  amount) — **or** set `accept_flat_burial=True` for a deliberate dust run. The reorg gate
+  then requires the taker's claim to bury `max(rxd_claim_burial, ceil(value × factor / cost))`
+  deep before it returns SAFE, so an attacker must out-spend the value to reverse it.
 
 ## Runnable references (start here — these actually execute)
 

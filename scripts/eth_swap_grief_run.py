@@ -62,6 +62,8 @@ def _policy(args) -> MarginPolicy:
         eth_finalization_window_s=args.eth_finalization_window_s,
         cross_clock_margin=_margin(args),
         max_covenant_confirm_wait_s=args.max_covenant_confirm_wait_s,
+        # Dust grief-test harness: opt out of value-scaled burial (value below the reorg cost).
+        accept_flat_burial=True,
     )
 
 
