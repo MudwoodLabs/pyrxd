@@ -721,13 +721,16 @@ class TestTransientAccountXprv:
         assert w._xprv == bip32_derive_xprv_from_mnemonic(MNEMONIC, path="m/44'/512'/7'")
 
     def test_xprv_fails_closed_after_zeroize(self):
+        from pyrxd.security.errors import KeyMaterialError
+
         w = HdWallet.from_mnemonic(MNEMONIC, coin_type=512)
         _ = w._xprv  # works before
         w.zeroize()
-        with pytest.raises(ValidationError, match="locked/zeroized"):
+        # Matches SecretBytes' post-scrub signal (KeyMaterialError), not the generic ValidationError.
+        with pytest.raises(KeyMaterialError, match="locked/zeroized"):
             _ = w._xprv
         # And the derivation seam is dead too (no silent garbage-key derivation).
-        with pytest.raises(ValidationError, match="locked/zeroized"):
+        with pytest.raises(KeyMaterialError, match="locked/zeroized"):
             w.privkey_for(0, 0)
 
 

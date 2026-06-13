@@ -40,6 +40,7 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
+from fractions import Fraction
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import (
@@ -606,23 +607,29 @@ class ClaimFinality(Enum):
     SQUEEZED = "squeezed"
 
 
-def _value_scaled_burial_blocks(policy: MarginPolicy) -> int:
+def _value_scaled_burial_blocks(policy: MarginPolicy, value_at_risk_photons: int | None) -> int:
     """Required claim-burial depth (Radiant blocks) so a reorg of the taker's claim costs at
     least the value at stake — 0 when value-scaling is not configured (then the flat burial
     stands). Pure (red-team 2026-06-12 HIGH).
 
     ``required = ceil(value_at_risk_photons * burial_safety_factor / rxd_reorg_cost_per_block)``:
     burying ``required`` blocks forces an attacker to out-spend ``required *
-    rxd_reorg_cost_per_block >= value_at_risk_photons * factor`` to reverse the claim. Both
-    economic inputs are operator-supplied (a measured per-block reorg cost + an assessed
-    value); when either is absent there is no basis to scale, so this returns 0 and the
-    coordinator's setup gate is what refused a value-bearing swap that left them unset.
+    rxd_reorg_cost_per_block >= value_at_risk_photons * factor`` to reverse the claim. The cost
+    is the operator-supplied per-block reorg cost; ``value_at_risk_photons`` is the EFFECTIVE
+    value at stake (the coordinator passes the policy's operator-assessed value; the watchtower
+    passes the per-record value). When either is absent there is no basis to scale → 0.
+
+    EXACT integer math (audit follow-up MEDIUM): the ceil is computed over ``Fraction``, not
+    float division. ``value * factor / cost`` in float silently loses integer precision for a
+    value > 2**53 photons (~90M RXD) and returns FEWER blocks than the true ceil — an
+    UNDER-count of the very depth that forces the attacker to out-spend the value. ``Fraction``
+    is exact for any ``burial_safety_factor``.
     """
     cost = policy.rxd_reorg_cost_per_block
-    value = policy.value_at_risk_photons
-    if cost is None or value is None:
+    if cost is None or value_at_risk_photons is None:
         return 0
-    return math.ceil(value * policy.burial_safety_factor / cost)
+    required = Fraction(value_at_risk_photons) * Fraction(policy.burial_safety_factor) / cost
+    return math.ceil(required)
 
 
 def _reserve_to_blocks(reserve: Timelock, block_interval_s: float) -> int:
@@ -644,6 +651,7 @@ def assess_claim_finality(
     asset_locked_at_height: int,
     t_rxd: Timelock,
     policy: MarginPolicy,
+    value_at_risk_photons: int | None = None,
 ) -> ClaimFinality:
     """Decide SAFE / WAIT / SQUEEZED for the taker's asset claim — fail-closed, pure.
 
@@ -662,6 +670,15 @@ def assess_claim_finality(
     refund. So this returns WAIT only while there is genuinely room to wait, and
     SQUEEZED (→ ASSET_VULNERABLE) once there is not. A counter chain that is not
     finalizing (verdict ``COUNTER_CHAIN_NOT_FINALIZING``) SQUEEZES — never WAIT.
+
+    ``value_at_risk_photons`` (audit follow-up) is the EFFECTIVE per-assessment value the
+    value-scaled burial uses, overriding ``policy.value_at_risk_photons`` when supplied. The
+    coordinator passes None (its operator-assessed value lives on the policy); the watchtower
+    passes the per-RECORD value (so one tower policy can judge many swaps of differing value
+    — it must NOT apply one swap's value to another). If value-scaling is CONFIGURED on the
+    policy (``rxd_reorg_cost_per_block`` set) but no effective value is available, this
+    fails closed (SQUEEZED — never an optimistic value-blind SAFE): the watchtower cannot
+    certify an FT/NFT swap SAFE on value it cannot see; the operator must decide.
 
     Raises ``ValidationError`` on any un-evaluable input (never assumes "plenty of
     time"). All depths normalised to Radiant BLOCKS via ``policy.block_interval_s``.
@@ -693,12 +710,24 @@ def assess_claim_finality(
         flat_burial = _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
         # VALUE-SCALED burial (red-team HIGH): the taker's claim must bury deep enough that
         # reorging it costs at least the value at stake; the flat burial is only a FLOOR.
-        rxd_burial = max(flat_burial, _value_scaled_burial_blocks(policy))
+        # Effective value: the explicit per-assessment value (watchtower per-record) overrides
+        # the policy's operator-assessed value (coordinator).
+        effective_value = value_at_risk_photons if value_at_risk_photons is not None else policy.value_at_risk_photons
+        rxd_burial = max(flat_burial, _value_scaled_burial_blocks(policy, effective_value))
         required_depth_blocks = _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
     except ValidationError:
         raise
     except Exception as exc:  # pragma: no cover - normalize_to only raises ValidationError
         raise ValidationError(f"could not normalise reorg depths to blocks: {exc}") from exc
+
+    # Value-scaling configured (a reorg cost is set) but no value to scale against → we CANNOT
+    # certify the claim is buried deep enough for its value. Fail closed (never a value-blind
+    # SAFE): the watchtower hits this for an FT/NFT swap whose economic value it cannot read
+    # off-chain; route to a decision (SQUEEZED → PAGE_SQUEEZED), never an optimistic claim. The
+    # coordinator never reaches here unscaled — its setup gate requires value+cost or
+    # accept_flat_burial (cost None) at construction.
+    if policy.rxd_reorg_cost_per_block is not None and effective_value is None:
+        return ClaimFinality.SQUEEZED
 
     # The maker's CSV refund opens here (Radiant blocks).
     refund_opens_at = asset_locked_at_height + rxd_blocks
@@ -977,6 +1006,23 @@ class SwapCoordinator:
                 "Set MarginPolicy.rxd_reorg_cost_per_block (measured, photons/block) AND "
                 "value_at_risk_photons (the assessed economic value), or pass "
                 "MarginPolicy(accept_flat_burial=True) to consciously accept a flat burial on a dust run."
+            )
+        # Value integrity (audit follow-up LOW): for an RXD asset, radiant_amount IS the photon
+        # value at stake, so value_at_risk_photons must not be UNDER-stated below it (an
+        # under-statement silently shrinks the value-scaled burial — the one scalar that defends
+        # the whole HIGH fix). FT/NFT are exempt: their radiant_amount is a token amount / NFT
+        # carrier dust, a different unit from the operator-assessed economic value.
+        if (
+            _leg_is_value_bearing(radiant_leg)
+            and record.terms.asset_variant == "rxd"
+            and config.margin_policy.value_at_risk_photons is not None
+            and config.margin_policy.value_at_risk_photons < record.terms.radiant_amount
+        ):
+            raise ValidationError(
+                f"value_at_risk_photons ({config.margin_policy.value_at_risk_photons}) < the RXD swap's "
+                f"radiant_amount ({record.terms.radiant_amount}): an under-stated value-at-risk shrinks the "
+                "value-scaled claim burial below what this swap's own on-chain value demands. Set "
+                "value_at_risk_photons >= radiant_amount for an RXD swap."
             )
         # MEDIUM-1 (whole-stack audit): a VALUE-BEARING ETH counter-leg swap on an ESTIMATED
         # policy silently runs in the weak mode of two defenses — the verify->lock 'finalized'

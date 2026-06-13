@@ -57,3 +57,13 @@ def test_no_registry_network_is_audit_exempt():
 
     for chain in KNOWN_EVM_CHAINS.values():
         assert chain.network not in AUDIT_CLEARED_NETWORKS, chain.name
+
+
+def test_floor_matches_margin_policy_floor():
+    """Audit follow-up: _FLOOR_S re-declares the canonical _MIN_ETH_FINALIZATION_WINDOW_S with a
+    'keep in sync' comment — enforce that invariant so a future floor bump in one file can't leave
+    the registry validating against a stale (looser) floor."""
+    from pyrxd.eth_wallet.chains import _FLOOR_S
+    from pyrxd.gravity.swap_coordinator import _MIN_ETH_FINALIZATION_WINDOW_S
+
+    assert _FLOOR_S == _MIN_ETH_FINALIZATION_WINDOW_S

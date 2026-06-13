@@ -158,6 +158,18 @@ class Decision:
             raise ValidationError("autonomous_btc_refund is only valid on a PAGE_REFUND decision")
 
 
+def _value_at_risk_photons(terms) -> int | None:
+    """The per-record value-at-risk (photons) for the value-scaled burial — the watchtower's
+    per-swap input so one tower policy judges many swaps correctly (audit follow-up).
+
+    Only an RXD swap's ``radiant_amount`` IS the photon economic value. For FT/NFT the on-chain
+    amount is the token amount / NFT carrier dust, NOT the off-chain economic value the
+    watchtower cannot see — so return None, and ``assess_claim_finality`` fails closed
+    (SQUEEZED, never a value-blind SAFE) whenever value-scaling is configured on the policy.
+    """
+    return terms.radiant_amount if terms.asset_variant == "rxd" else None
+
+
 def _required_btc_depth_blocks(policy: MarginPolicy) -> int:
     """The reorg depth the FINAL verdict requires, in blocks — identical to the
     coordinator's construction (swap_coordinator.py:1258-1260), so the verdict and
@@ -253,6 +265,7 @@ def decide(
                 asset_locked_at_height=obs.asset_locked_at_height,
                 t_rxd=terms.t_rxd,
                 policy=policy,
+                value_at_risk_photons=_value_at_risk_photons(terms),
             )
         except ValidationError as exc:
             # e.g. now_rxd_height < asset_locked_at_height (lagging/lying node) → fail-closed.
@@ -449,6 +462,7 @@ def _decide_eth(
                 asset_locked_at_height=obs.asset_locked_at_height,
                 t_rxd=terms.t_rxd,
                 policy=policy,
+                value_at_risk_photons=_value_at_risk_photons(terms),
             )
         except ValidationError as exc:
             # e.g. now_rxd < asset_locked (lagging node) or missing eth_finalization_window_s → fail-closed.

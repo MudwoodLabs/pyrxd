@@ -626,7 +626,10 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--margin-blocks", type=int, default=36)
     ap.add_argument("--btc-block-interval-s", type=float, default=600.0)
     ap.add_argument("--rxd-block-interval-s", type=float, default=300.0)
-    ap.add_argument("--eth-finalization-window-s", type=int, default=768)
+    # Default (None) → resolved from the EVM chain registry by --eth-chain-id in _args() below, so a
+    # known chain gets its VETTED finalization window (e.g. Base 900s, not Ethereum's 768s); an
+    # operator value always overrides. Realizes the registry's fail-closed per-chain safety.
+    ap.add_argument("--eth-finalization-window-s", type=int, default=None)
     ap.add_argument("--rxd-claim-burial-s", type=int, default=1800)
     ap.add_argument("--rxd-confirm-slack-s", type=int, default=600)
     ap.add_argument("--rounding-slack-s", type=int, default=300)
@@ -636,7 +639,20 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--resume-deadline-s", type=float, default=3600.0)
     ap.add_argument("--report-out", default="/tmp/eth_swap_report.json")  # noqa: S108 — operator-overridable
     ap.add_argument("--keys-out", default="~/.eth_swap_run_keys.json")
-    return ap.parse_args()
+    args = ap.parse_args()
+    # Wire the EVM chain registry (audit follow-up): when the operator does not pin the finalization
+    # window, take the vetted per-chain value for --eth-chain-id (Base 900s, Ethereum/Sepolia 768s);
+    # an unvetted chain (e.g. the 31337 dry-run anvil) fail-SOFTs to the consensus 2-epoch floor.
+    if args.eth_finalization_window_s is None:
+        from pyrxd.eth_wallet.chains import evm_chain_by_id
+        from pyrxd.gravity.swap_coordinator import _MIN_ETH_FINALIZATION_WINDOW_S
+        from pyrxd.security.errors import ValidationError
+
+        try:
+            args.eth_finalization_window_s = evm_chain_by_id(args.eth_chain_id).finalization_window_s
+        except ValidationError:
+            args.eth_finalization_window_s = _MIN_ETH_FINALIZATION_WINDOW_S
+    return args
 
 
 def main() -> None:

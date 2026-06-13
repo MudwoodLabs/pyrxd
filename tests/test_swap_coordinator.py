@@ -2307,7 +2307,7 @@ def test_value_scaled_burial_math_and_floor():
         rxd_reorg_cost_per_block=100_000,
         value_at_risk_photons=1_050_000,
     )
-    assert _value_scaled_burial_blocks(p) == 11  # ceil(1,050,000 / 100,000)
+    assert _value_scaled_burial_blocks(p, p.value_at_risk_photons) == 11  # ceil(1,050,000 / 100,000)
     # factor scales linearly.
     p2 = MarginPolicy.measured(
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
@@ -2316,9 +2316,86 @@ def test_value_scaled_burial_math_and_floor():
         value_at_risk_photons=1_000_000,
         burial_safety_factor=2.0,
     )
-    assert _value_scaled_burial_blocks(p2) == 20
+    assert _value_scaled_burial_blocks(p2, p2.value_at_risk_photons) == 20
     # Unset inputs -> 0 (the flat burial stands).
-    assert _value_scaled_burial_blocks(MarginPolicy.estimated()) == 0
+    assert _value_scaled_burial_blocks(MarginPolicy.estimated(), None) == 0
+
+
+def test_value_scaled_burial_exact_integer_no_float_undercount():
+    # Audit follow-up MEDIUM: float division under-counts for value > 2**53 photons (~90M RXD).
+    # Fraction-based ceil must equal the exact integer ceil (and exceed the buggy float result).
+    from pyrxd.gravity.swap_coordinator import _value_scaled_burial_blocks
+
+    value, cost = 100_000_000_000_000_003, 3  # > 2**53; not divisible by 3
+    p = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_reorg_cost_per_block=cost,
+        value_at_risk_photons=value,
+    )
+    exact = -(-value // cost)  # exact integer ceil of value/cost (factor 1.0)
+    assert _value_scaled_burial_blocks(p, value) == exact
+    # The OLD float path (math.ceil(value * 1.0 / cost)) is WRONG here — float precision loss makes
+    # it diverge from the exact ceil (it can err in either direction); the Fraction path does not.
+    assert math.ceil(value * 1.0 / cost) != exact
+
+
+def test_assess_per_record_value_override_and_fail_closed_without_value():
+    # The watchtower seam (audit follow-up): one policy carries the cost but no value; the per-record
+    # value is supplied at the call. No value + cost configured -> fail closed (never value-blind SAFE).
+    locked, now = 1000, 1001
+    t_rxd = t.Timelock(20, t.TimeUnit.BLOCKS)
+    p = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_block_interval_s=300.0,
+        rxd_claim_burial=t.Timelock(2, t.TimeUnit.BLOCKS),
+        rxd_reorg_cost_per_block=100_000,  # cost set, value unset (watchtower shape)
+    )
+    common = dict(counter_claim_finality=_final(), now_rxd_height=now, asset_locked_at_height=locked, t_rxd=t_rxd)
+    # No effective value but value-scaling configured -> SQUEEZED (the FT/NFT watchtower case).
+    assert assess_claim_finality(policy=p, **common) is ClaimFinality.SQUEEZED
+    # A small per-record value fits the window -> SAFE.
+    assert assess_claim_finality(policy=p, value_at_risk_photons=100_000, **common) is ClaimFinality.SAFE
+    # A large per-record value pushes required burial past the window -> SQUEEZED.
+    assert assess_claim_finality(policy=p, value_at_risk_photons=5_000_000, **common) is ClaimFinality.SQUEEZED
+
+
+def test_setup_gate_rejects_understated_value_for_rxd():
+    # An RXD swap whose value_at_risk_photons is below its own on-chain radiant_amount (1000) is refused.
+    under = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_reorg_cost_per_block=100_000,
+        value_at_risk_photons=999,
+    )
+    with pytest.raises(ValidationError, match="under-stated"):
+        SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(variant="rxd")),
+            btc_leg=FakeBtcLeg(),
+            radiant_leg=_value_bearing_radiant(),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),
+            config=CoordinatorConfig(margin_policy=under, accept_nondurable_seen=True),
+        )
+    # value >= radiant_amount constructs; and FT (different unit) is exempt from the check.
+    ok = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=300.0,
+        rxd_reorg_cost_per_block=100_000,
+        value_at_risk_photons=1_000,
+    )
+    assert (
+        SwapCoordinator(
+            record=SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(variant="rxd")),
+            btc_leg=FakeBtcLeg(),
+            radiant_leg=_value_bearing_radiant(),
+            indexer=FakeIndexer(),
+            seen_store=FakeSeenStore(),
+            config=CoordinatorConfig(margin_policy=ok, accept_nondurable_seen=True),
+        )
+        is not None
+    )
 
 
 def test_high_value_squeezes_where_flat_would_be_safe():

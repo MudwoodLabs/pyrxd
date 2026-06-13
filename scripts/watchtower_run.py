@@ -262,16 +262,26 @@ async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExi
 
 def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     if args.measured:
+        # Fail closed (mirrors the coordinator's setup gate): a measured tower signals real-value
+        # intent, so it must either value-scale (set the per-block reorg cost; the per-record value
+        # comes from each swap's terms in decide()) or consciously accept a flat burial for dust.
+        if args.rxd_reorg_cost_per_block is None and not args.accept_flat_burial:
+            raise SystemExit(
+                "a --measured watchtower must set --rxd-reorg-cost-per-block (value-scale RXD claims) "
+                "or --accept-flat-burial (dust); refusing to silently flat-assess value-bearing swaps"
+            )
         return MarginPolicy.measured(
             margin=Timelock(args.margin_blocks, TimeUnit.BLOCKS),
             block_interval_s=args.block_interval_s,
             btc_claim_reorg_depth=Timelock(args.btc_reorg_depth, TimeUnit.BLOCKS),
             rxd_claim_burial=Timelock(args.rxd_claim_burial, TimeUnit.BLOCKS),
             rxd_block_interval_s=args.rxd_block_interval_s,
+            rxd_reorg_cost_per_block=args.rxd_reorg_cost_per_block,
+            accept_flat_burial=args.accept_flat_burial,
         )
     # Estimated policy is acceptable for alert-only v1 (no value moves); the operator
     # verifies each page. Use --measured with real block data before any autonomy (v2).
-    return MarginPolicy.estimated(block_interval_s=args.block_interval_s)
+    return MarginPolicy.estimated(block_interval_s=args.block_interval_s, accept_flat_burial=args.accept_flat_burial)
 
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -323,6 +333,20 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--btc-reorg-depth", type=int, default=6)
     p.add_argument("--rxd-claim-burial", type=int, default=2)
     p.add_argument("--margin-blocks", type=int, default=72)
+    # Value-scaled burial (audit follow-up): the tower must value-scale RXD claims the same way
+    # the coordinator does, or it pages SAFE where the coordinator would SQUEEZE. The per-record
+    # value comes from each swap's terms; the per-block reorg cost is this chain-wide flag.
+    p.add_argument(
+        "--rxd-reorg-cost-per-block",
+        type=int,
+        default=None,
+        help="MEASURED marginal cost to reorg one Radiant block, in photons (enables value-scaled burial)",
+    )
+    p.add_argument(
+        "--accept-flat-burial",
+        action="store_true",
+        help="dust opt-out: accept a flat (non-value-scaled) burial (value below the reorg cost)",
+    )
     p.add_argument("--measured", action="store_true", help="use a measured MarginPolicy (recommended)")
     p.add_argument("--once", action="store_true", help="run a single tick and exit")
     p.add_argument("--allow-insecure", action="store_true", help="allow non-TLS ElectrumX")

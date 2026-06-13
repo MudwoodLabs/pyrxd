@@ -566,3 +566,30 @@ def test_observations_validation():
         Observations(maker_has_claimed_btc=False, now_rxd_height=-1)
     with pytest.raises(ValidationError):
         Observations(maker_has_claimed_btc=False, now_rxd_height=10, btc_claim_confirmations=-3)
+
+
+def test_value_at_risk_photons_rxd_only():
+    """Audit follow-up: the watchtower's per-record value is radiant_amount ONLY for an RXD swap;
+    FT/NFT (token amount / NFT carrier dust — not the off-chain economic value) return None."""
+    from pyrxd.gravity.watch.decide import _value_at_risk_photons
+
+    class _T:
+        def __init__(self, variant, amt):
+            self.asset_variant = variant
+            self.radiant_amount = amt
+
+    assert _value_at_risk_photons(_T("rxd", 7000)) == 7000
+    assert _value_at_risk_photons(_T("ft", 7000)) is None
+    assert _value_at_risk_photons(_T("nft", 1)) is None
+
+
+def test_watchtower_ft_swap_with_value_scaling_fails_closed():
+    """The seam fix: with value-scaling CONFIGURED on the tower policy but the swap FT/NFT (the tower
+    can't read the off-chain value), the gate fails closed → PAGE_SQUEEZED, never an optimistic
+    PAGE_CLAIM. Contrast test_eth_claim_finalized_pages_claim (same obs, no value-scaling → PAGE_CLAIM)."""
+    import dataclasses
+
+    vs_policy = dataclasses.replace(_eth_policy(), rxd_reorg_cost_per_block=100_000)
+    obs = _eth_obs(detected=True, finality=CounterClaimState.FINAL, now=150)
+    d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs, policy=vs_policy)
+    assert d.intent is Intent.PAGE_SQUEEZED

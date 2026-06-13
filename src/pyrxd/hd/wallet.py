@@ -58,7 +58,7 @@ from ..hd.bip39 import seed_from_mnemonic
 from ..keys import PrivateKey
 from ..network.electrumx import UtxoRecord, script_hash_for_address
 from ..script.type import P2PKH
-from ..security.errors import ValidationError
+from ..security.errors import KeyMaterialError, ValidationError
 from ..security.secrets import SecretBytes
 from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
@@ -304,17 +304,23 @@ class HdWallet:
         byte-for-byte identical to the previously-stored xprv (proved in
         ``tests/test_hd_wallet.py``), so callers are unaffected.
 
-        Cost: one HMAC-SHA512 + the hardened path walk per access — microseconds, fine for
-        a CLI wallet; if a future hot path needs many derivations it can cache the result
-        for the duration of a single operation (never beyond it).
+        Cost: one HMAC-SHA512 + the hardened path walk per access — microseconds, but it is NOT
+        free in a loop. Hot paths (gap-limit scans, multi-input signing) bind it once into a local
+        and reuse that for the operation — see ``_account_xprv``/``_derive_address``/``_privkey_for``
+        below — never holding it beyond the operation.
         """
-        if getattr(self, "_zeroized", False):
-            raise ValidationError("wallet is locked/zeroized; re-create it from the mnemonic to sign")
+        if getattr(self, "_zeroed", False):
+            # Match SecretBytes' post-scrub signal (KeyMaterialError), so a caller catching the
+            # documented "secret accessed after zeroize" type sees the locked-wallet raise too.
+            raise KeyMaterialError("wallet is locked/zeroized; re-create it from the mnemonic to sign")
         # The path is ALWAYS the canonical m/44'/<coin>'/<account>' — _parse_radiant_path
         # normalises any configured path to that shape, so reconstructing it here matches
         # what from_mnemonic/load derived (the env override only ever changes the coin int).
         master = master_xprv_from_seed(self._seed.unsafe_raw_bytes())
-        return ckd(master, f"m/44'/{self._coin_type}'/{self.account}'")
+        account_xprv = ckd(master, f"m/44'/{self._coin_type}'/{self.account}'")
+        if not isinstance(account_xprv, Xprv):  # pragma: no cover - private seed + hardened path => Xprv
+            raise KeyMaterialError("account derivation did not yield a private xprv")
+        return account_xprv
 
     # ------------------------------------------------------------------
     # Construction
@@ -341,7 +347,9 @@ class HdWallet:
         The chosen coin type is recorded on the wallet and persisted in
         the wallet file; subsequent :meth:`load` calls validate it.
         """
-        _radiant_path, resolved_coin_type = _resolve_coin_type(coin_type)
+        # Only the coin type is needed — the _xprv property reconstructs the canonical path from
+        # _coin_type + account; the path string is no longer used here.
+        _, resolved_coin_type = _resolve_coin_type(coin_type)
         seed = seed_from_mnemonic(mnemonic, passphrase=passphrase)
         # The account xprv is NOT stored — the _xprv property re-derives it from this seed
         # on demand (hardening #8/H1). _coin_type + account fully determine the path.
@@ -615,9 +623,15 @@ class HdWallet:
     # ------------------------------------------------------------------
     # Address derivation
 
-    def _derive_address(self, change: int, index: int) -> str:
-        """Derive the P2PKH address at change/index on the account key."""
-        child = self._xprv.ckd(change).ckd(index)
+    def _derive_address(self, change: int, index: int, account_xprv: Xprv | None = None) -> str:
+        """Derive the P2PKH address at change/index on the account key.
+
+        ``account_xprv`` lets a hot loop bind ``self._xprv`` ONCE and reuse it (the property
+        re-derives the master per access; passing the cached account key restores O(1) ckd per
+        index instead of a full master derivation each call). None → re-derive (the safe default).
+        """
+        acct = account_xprv if account_xprv is not None else self._xprv
+        child = acct.ckd(change).ckd(index)
         return child.address()
 
     def _path_key(self, change: int, index: int) -> str:
@@ -648,9 +662,13 @@ class HdWallet:
         consecutive_unused = 0
         index = 0
         newly_used = 0
+        # Bind the account xprv ONCE for the whole scan (the property re-derives the master per
+        # access; an attacker who seeds dust on K sequential addresses forces K+gap derivations —
+        # caching keeps that O(1) HMAC per index instead of a full master walk each call).
+        account_xprv = self._xprv
         while consecutive_unused < _GAP_LIMIT:
             # Fetch one address at a time — correct BIP44 gap-limit semantics.
-            addr = self._derive_address(change, index)
+            addr = self._derive_address(change, index, account_xprv)
             pkey = self._path_key(change, index)
             # Closes N5: do NOT swallow the exception. A failed lookup
             # cannot be safely interpreted as "unused" — the seemingly-
@@ -760,9 +778,13 @@ class HdWallet:
     # RxdWallet uses; see test_preimage.py for the stale-signature
     # pitfall that motivated the reset between passes.
 
-    def _privkey_for(self, change: int, index: int) -> PrivateKey:
-        """Return the PrivateKey at ``m/.../change/index`` from the account xprv."""
-        return self._xprv.ckd(change).ckd(index).private_key()
+    def _privkey_for(self, change: int, index: int, account_xprv: Xprv | None = None) -> PrivateKey:
+        """Return the PrivateKey at ``m/.../change/index`` from the account xprv.
+
+        ``account_xprv`` lets a multi-input signing loop bind ``self._xprv`` ONCE and reuse it
+        (avoids re-deriving the master per input); None → re-derive (the safe default)."""
+        acct = account_xprv if account_xprv is not None else self._xprv
+        return acct.ckd(change).ckd(index).private_key()
 
     # ------------------------------------------------------------------
     # Public signing seam (used by the signing agent, so it does not reach
@@ -787,17 +809,17 @@ class HdWallet:
         Hardening #8/H1: the account xprv is NO LONGER stored long-lived — the ``_xprv``
         property re-derives it transiently from the seed per operation — so the ONLY
         resident long-lived secret is this 64-byte seed, which lives in a
-        :class:`SecretBytes` and IS memset here. Setting ``_zeroized`` makes the ``_xprv``
-        property fail closed (rather than silently re-deriving a garbage key from the
-        now-zeroed seed). Any account-xprv copies that existed only during an in-flight
-        derivation are short-lived locals (GC-eligible immediately, never held across the
-        unlock window); their residency until the pages are reused is bounded by the
-        agent's best-effort process hygiene (``mlock`` / ``PR_SET_DUMPABLE 0`` / no core
+        :class:`SecretBytes` and IS memset here. Setting ``_zeroed`` (matching
+        ``SecretBytes._zeroed``) makes the ``_xprv`` property fail closed (rather than silently
+        re-deriving a garbage key from the now-zeroed seed). Any account-xprv copies that existed
+        only during an in-flight derivation are short-lived locals (GC-eligible immediately, never
+        held across the unlock window); their residency until the pages are reused is bounded by
+        the agent's best-effort process hygiene (``mlock`` / ``PR_SET_DUMPABLE 0`` / no core
         dumps), NOT a guaranteed erase — do not over-state it as "erased".
         """
         self._seed.zeroize()
         # Bypass the __setattr__ guard (it only blocks _coin_type, but be explicit).
-        object.__setattr__(self, "_zeroized", True)
+        object.__setattr__(self, "_zeroed", True)
 
     def _next_change_index(self) -> int:
         """Return the next unused internal-chain index for change outputs.
@@ -867,13 +889,16 @@ class HdWallet:
             return_exceptions=True,
         )
 
+        # Bind the account xprv once for the whole collection (avoid re-deriving the master per
+        # used address — see _scan_chain).
+        account_xprv = self._xprv
         triples: list[tuple[UtxoRecord, str, PrivateKey]] = []
         for rec, result in zip(used, results, strict=True):
             if not isinstance(result, list):
                 # Network error for this one address — log via the
                 # client's own error handling, drop on the floor here.
                 continue
-            privkey = self._privkey_for(rec.change, rec.index)
+            privkey = self._privkey_for(rec.change, rec.index, account_xprv)
             for utxo in result:
                 triples.append((utxo, rec.address, privkey))
         return triples
