@@ -53,7 +53,9 @@ class Intent(Enum):
 
     * ``WATCH`` — nothing due yet; keep observing (no page, or a low-severity tick).
     * ``PAGE_CLAIM`` — the maker revealed ``p`` and the claim is reorg-safe + fits
-      the window (gate SAFE). Operator must claim the asset before the deadline.
+      the window (gate SAFE). The tower **alerts and broadcasts nothing** — there is no
+      autonomous claim executor in v1 — so the OPERATOR/taker MUST claim the asset before
+      the deadline (the R1 free-option residual rests on this liveness; threat-model S20).
     * ``PAGE_REFUND`` — the maker stalled / params mismatch; the operator should
       refund (asset-on-stall or BTC counter-leg).
     * ``PAGE_SQUEEZED`` — a decision is required (gate SQUEEZED / ASSET_VULNERABLE,
