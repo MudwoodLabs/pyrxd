@@ -343,7 +343,7 @@ Cross-reference of controls and the threats they address:
 | Agent `ALL\|FORKID`-only sighash + fully-owned-only | S19 | `src/pyrxd/agent/signer.py` |
 | Agent never returns key material (conformance-tested) | S18 | `src/pyrxd/agent/signer.py`, `tests/test_agent_signer.py` |
 | Agent socket: `0700` dir + `0600` socket + `SO_PEERCRED` uid==owner; per-conn recv timeout (anti-slow-loris) | TA1 (other-uid) | `src/pyrxd/agent/daemon.py:_bind/_read_peer_uid/_serve_conn` |
-| Agent lock scrubs the seed AND drops the signing-key reference; idle auto-lock + on-demand `lock` + SIGTERM/SIGHUP/atexit | A11 window | `src/pyrxd/agent/daemon.py:lock`, `hd/wallet.py:zeroize`, `cli/agent_cmds.py` |
+| Agent lock scrubs the seed (the only long-lived secret — the account xprv is re-derived transiently, never stored, #8/H1) and fails the derivation seam closed; idle auto-lock + on-demand `lock` + SIGTERM/SIGHUP/atexit | A11 window | `src/pyrxd/agent/daemon.py:lock`, `hd/wallet.py:zeroize`/`_xprv`, `cli/agent_cmds.py` |
 | Agent process hygiene (mlock, PR_SET_DUMPABLE 0, no core dumps; best-effort) | A11 residency | `src/pyrxd/agent/hygiene.py` |
 | CodeQL on every push | static analysis | `.github/workflows/codeql.yml` |
 | Bandit on every push | security smells | `.github/workflows/ci.yml` |
@@ -363,7 +363,7 @@ Honest list. These are not vulnerabilities; they're places where pyrxd's defense
 2. **No formal verification of BIP32/39/44 vectors** beyond unit tests. Test vectors come from the BIP specs themselves.
 3. **No fuzz testing of the CLI surface.** [Issue #10.](https://github.com/MudwoodLabs/pyrxd/issues/10)
 4. **No timing-attack analysis** of pyrxd-internal comparisons beyond known-good `hmac.compare_digest` use.
-5. **Memory zeroization is best-effort** — CPython does not guarantee secure memory. Specifically, the signing agent's seed (a `SecretBytes`) IS `memset` on lock, but the account xprv's private bytes are immutable `bytes` and partly held in libsecp256k1's C memory; `HdWallet.zeroize()` drops the reference (GC-eligible) but cannot overwrite those copies in place. Residency past lock is bounded by the agent's best-effort process hygiene (`mlock`/`PR_SET_DUMPABLE 0`/no core dumps), not a guaranteed erase. A future hardening would re-derive the xprv transiently from the seed per signing op so the only resident long-lived secret is the scrubbable seed.
+5. **Memory zeroization is best-effort** — CPython does not guarantee secure memory. The signing agent's only resident **long-lived** secret is the seed (a `SecretBytes`), which IS `memset` on lock. The account xprv is **no longer stored long-lived** (hardening #8/H1): `HdWallet._xprv` is now a property that re-derives the account key from the seed per operation, so on lock the seed is scrubbed and the property fails closed — there is no persistent xprv copy to leak across the unlock window. The residual is now only the **transient** per-operation copy: while a signature is actively being produced, an account xprv / libsecp256k1 key necessarily exists in memory for that moment (you cannot sign without the key), and CPython cannot overwrite those immutable/C copies in place before GC. Their residency until the pages are reused is bounded by the agent's best-effort process hygiene (`mlock`/`PR_SET_DUMPABLE 0`/no core dumps), not a guaranteed erase — do not over-state it as "erased". This is the irreducible floor (the key must be usable to sign), not a design gap.
 
 ### Network
 

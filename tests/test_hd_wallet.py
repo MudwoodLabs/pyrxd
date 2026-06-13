@@ -646,19 +646,15 @@ class TestDirectConstructionValidatesCoinType:
 
     def _make_wallet_kwargs(self, *, coin_type: object) -> dict:
         # Build the minimum set of constructor kwargs needed to land
-        # in __post_init__ with a malicious _coin_type. The xprv/seed
-        # are real (so the test is realistic), but they're rooted at
-        # the *valid* default path — the test isn't about whether
-        # _xprv matches _coin_type, it's about whether the validator
-        # runs at all.
-        from pyrxd.hd.bip32 import bip32_derive_xprv_from_mnemonic
+        # in __post_init__ with a malicious _coin_type. The seed is real
+        # (so the test is realistic); the account xprv is no longer a
+        # stored field (the _xprv property re-derives it from the seed,
+        # hardening #8/H1), so it isn't passed here.
         from pyrxd.hd.bip39 import seed_from_mnemonic
         from pyrxd.security.secrets import SecretBytes
 
         seed = seed_from_mnemonic(MNEMONIC, passphrase="")
-        xprv = bip32_derive_xprv_from_mnemonic(MNEMONIC, passphrase="", path="m/44'/512'/0'")
         return {
-            "_xprv": xprv,
             "_seed": SecretBytes(seed),
             "account": 0,
             "_coin_type": coin_type,
@@ -686,6 +682,53 @@ class TestDirectConstructionValidatesCoinType:
         kwargs = self._make_wallet_kwargs(coin_type=0)
         w = HdWallet(**kwargs)
         assert w.coin_type == 0
+
+
+class TestTransientAccountXprv:
+    """Hardening #8/H1: the account xprv is re-derived from the seed per access and NEVER
+    stored long-lived, so the only resident long-lived secret is the scrubbable seed."""
+
+    def test_no_long_lived_xprv_is_stored_on_the_instance(self):
+        from pyrxd.hd.bip32 import Xprv
+
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=512)
+        # The instance dict holds the seed + metadata but NO Xprv object.
+        assert not any(isinstance(v, Xprv) for v in vars(w).values()), (
+            f"a long-lived Xprv is stored on the wallet: {vars(w)}"
+        )
+
+    def test_property_rederivation_is_byte_identical_to_the_canonical_path(self):
+        # The security contract: re-deriving from the seed must equal the old stored xprv
+        # exactly, for every supported coin type — else addresses would silently shift.
+        from pyrxd.hd.bip32 import bip32_derive_xprv_from_mnemonic
+
+        for coin_type in (512, 0, 236):
+            w = HdWallet.from_mnemonic(MNEMONIC, coin_type=coin_type)
+            canonical = bip32_derive_xprv_from_mnemonic(MNEMONIC, path=f"m/44'/{coin_type}'/0'")
+            assert w._xprv == canonical, f"xprv != canonical for coin_type={coin_type}"
+            assert w._xprv.serialize() == canonical.serialize()
+
+    def test_rederivation_is_stable_across_accesses(self):
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=512)
+        assert w._xprv == w._xprv  # two independent derivations agree
+        assert w.derive_address(0, 0) == w.derive_address(0, 0)
+        assert w.privkey_for(0, 3).public_key().hash160() == w.privkey_for(0, 3).public_key().hash160()
+
+    def test_account_index_is_honoured_in_rederivation(self):
+        from pyrxd.hd.bip32 import bip32_derive_xprv_from_mnemonic
+
+        w = HdWallet.from_mnemonic(MNEMONIC, account=7, coin_type=512)
+        assert w._xprv == bip32_derive_xprv_from_mnemonic(MNEMONIC, path="m/44'/512'/7'")
+
+    def test_xprv_fails_closed_after_zeroize(self):
+        w = HdWallet.from_mnemonic(MNEMONIC, coin_type=512)
+        _ = w._xprv  # works before
+        w.zeroize()
+        with pytest.raises(ValidationError, match="locked/zeroized"):
+            _ = w._xprv
+        # And the derivation seam is dead too (no silent garbage-key derivation).
+        with pytest.raises(ValidationError, match="locked/zeroized"):
+            w.privkey_for(0, 0)
 
 
 class TestUnderscoreMutationBlocked:

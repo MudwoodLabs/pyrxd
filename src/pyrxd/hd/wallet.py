@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING
 
 from Cryptodome.Cipher import AES
 
-from ..hd.bip32 import Xprv, Xpub, bip32_derive_xprv_from_mnemonic
+from ..hd.bip32 import Xprv, Xpub, ckd, master_xprv_from_seed
 from ..hd.bip39 import seed_from_mnemonic
 from ..keys import PrivateKey
 from ..network.electrumx import UtxoRecord, script_hash_for_address
@@ -225,7 +225,6 @@ class HdWallet:
         ``{path_key: AddressRecord}`` where path_key is ``f"{change}/{index}"``.
     """
 
-    _xprv: Xprv = field(repr=False)
     _seed: SecretBytes = field(repr=False)
     account: int = 0
     _coin_type: int = field(default_factory=lambda: _COIN_TYPE)
@@ -288,6 +287,35 @@ class HdWallet:
         """
         return self._coin_type
 
+    @property
+    def _xprv(self) -> Xprv:
+        """The account-level extended private key, **re-derived transiently** from the
+        seed on every access — it is NEVER stored as a long-lived field (hardening #8 /
+        threat-model gap #5, H1).
+
+        Why a property and not a stored field: the BIP39 seed lives in a scrubbable
+        :class:`SecretBytes` (``zeroize`` memsets it), but an ``Xprv``'s private bytes are
+        immutable ``bytes`` plus copies inside libsecp256k1's C memory, which CPython
+        cannot overwrite in place. Holding the account xprv for the whole unlock window
+        therefore left a non-erasable long-lived secret. Re-deriving it per operation
+        (``master_xprv_from_seed`` → hardened ``m/44'/coin'/account'``) means the only
+        resident long-lived secret is the scrubbable seed; each derived xprv is a local
+        that is GC-eligible the moment the caller is done. The re-derivation is
+        byte-for-byte identical to the previously-stored xprv (proved in
+        ``tests/test_hd_wallet.py``), so callers are unaffected.
+
+        Cost: one HMAC-SHA512 + the hardened path walk per access — microseconds, fine for
+        a CLI wallet; if a future hot path needs many derivations it can cache the result
+        for the duration of a single operation (never beyond it).
+        """
+        if getattr(self, "_zeroized", False):
+            raise ValidationError("wallet is locked/zeroized; re-create it from the mnemonic to sign")
+        # The path is ALWAYS the canonical m/44'/<coin>'/<account>' — _parse_radiant_path
+        # normalises any configured path to that shape, so reconstructing it here matches
+        # what from_mnemonic/load derived (the env override only ever changes the coin int).
+        master = master_xprv_from_seed(self._seed.unsafe_raw_bytes())
+        return ckd(master, f"m/44'/{self._coin_type}'/{self.account}'")
+
     # ------------------------------------------------------------------
     # Construction
 
@@ -313,12 +341,11 @@ class HdWallet:
         The chosen coin type is recorded on the wallet and persisted in
         the wallet file; subsequent :meth:`load` calls validate it.
         """
-        radiant_path, resolved_coin_type = _resolve_coin_type(coin_type)
+        _radiant_path, resolved_coin_type = _resolve_coin_type(coin_type)
         seed = seed_from_mnemonic(mnemonic, passphrase=passphrase)
-        path = f"{radiant_path}/{account}'"
-        xprv = bip32_derive_xprv_from_mnemonic(mnemonic, passphrase=passphrase, path=path)
+        # The account xprv is NOT stored — the _xprv property re-derives it from this seed
+        # on demand (hardening #8/H1). _coin_type + account fully determine the path.
         return cls(
-            _xprv=xprv,
             _seed=SecretBytes(seed),
             account=account,
             _coin_type=resolved_coin_type,
@@ -479,14 +506,11 @@ class HdWallet:
                     f"coin_type={coin_type}. Pass coin_type={persisted_coin_type} to load "
                     f"this wallet, or use a different file."
                 )
-            # Derive at the persisted path, not the module default — this is
-            # what prevents a default change from silently watching the wrong
-            # addresses for already-saved wallets.
-            account_xprv = bip32_derive_xprv_from_mnemonic(
-                mnemonic, passphrase=passphrase, path=f"m/44'/{persisted_coin_type}'/{account}'"
-            )
+            # The persisted coin_type pins the path; the _xprv property re-derives the
+            # account xprv from the seed at m/44'/<persisted_coin_type>'/<account>' on
+            # demand (hardening #8/H1) — this is what prevents a module-default change from
+            # silently watching the wrong addresses for already-saved wallets.
             wallet = cls(
-                _xprv=account_xprv,
                 _seed=SecretBytes(seed),
                 account=account,
                 _coin_type=persisted_coin_type,
@@ -758,20 +782,22 @@ class HdWallet:
         return self._derive_address(change, index)
 
     def zeroize(self) -> None:
-        """Scrub the seed and drop the account-xprv reference; the wallet cannot sign after.
+        """Scrub the seed and mark the wallet dead; it cannot derive or sign after.
 
-        The 64-byte seed lives in a :class:`SecretBytes` and IS memset here. The
-        account xprv's private bytes, however, are immutable ``bytes``
-        (:class:`~pyrxd.hd.bip32.Xkey`) and partly held inside libsecp256k1's C
-        memory (coincurve) — CPython cannot overwrite either in place, so we drop
-        the reference (making them GC-eligible) rather than pretend to erase them.
-        Residency of those copies until the pages are reused is bounded by the
-        signing agent's best-effort process hygiene (``mlock`` / ``PR_SET_DUMPABLE 0``
-        / no core dumps), NOT a guaranteed erase. This matches the threat model's
-        documented best-effort memory limit; do not over-state it as "erased".
+        Hardening #8/H1: the account xprv is NO LONGER stored long-lived — the ``_xprv``
+        property re-derives it transiently from the seed per operation — so the ONLY
+        resident long-lived secret is this 64-byte seed, which lives in a
+        :class:`SecretBytes` and IS memset here. Setting ``_zeroized`` makes the ``_xprv``
+        property fail closed (rather than silently re-deriving a garbage key from the
+        now-zeroed seed). Any account-xprv copies that existed only during an in-flight
+        derivation are short-lived locals (GC-eligible immediately, never held across the
+        unlock window); their residency until the pages are reused is bounded by the
+        agent's best-effort process hygiene (``mlock`` / ``PR_SET_DUMPABLE 0`` / no core
+        dumps), NOT a guaranteed erase — do not over-state it as "erased".
         """
         self._seed.zeroize()
-        self._xprv = None  # type: ignore[assignment]  # wallet is intentionally dead after zeroize
+        # Bypass the __setattr__ guard (it only blocks _coin_type, but be explicit).
+        object.__setattr__(self, "_zeroized", True)
 
     def _next_change_index(self) -> int:
         """Return the next unused internal-chain index for change outputs.
