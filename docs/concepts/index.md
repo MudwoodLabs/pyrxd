@@ -7,6 +7,7 @@ and how Radiant differs from related blockchains.
 :maxdepth: 1
 
 gravity
+covenant-building-blocks
 partial-tx-swaps
 glyph-structures-and-terminology
 radiant-fts-are-on-chain
@@ -15,6 +16,14 @@ external-miner-protocol
 ```
 
 ## Available now
+
+- **[Covenant building blocks](covenant-building-blocks.md)** — Radiant's
+  differentiated tech as composable primitives: the HTLC covenants (RXD/FT/NFT),
+  the consensus-enforced soulbound NFT covenant, the REF-authenticity gate
+  (consensus enforces ref *uniqueness*, not mint *provenance*), and
+  credential-bound swap gating — each with its import path and its on-chain
+  proof. Read this to build *with* covenants rather than only running the
+  shipped swap.
 
 - **[Gravity: cross-chain atomic swaps](gravity.md)** — what the
   Gravity protocol is, what a covenant is, and the difference between

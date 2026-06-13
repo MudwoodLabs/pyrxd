@@ -74,6 +74,11 @@ path works on mainnet.
   independently so claims race in parallel.
   Concept: [`docs/concepts/dmint-v1-deploy.md`](concepts/dmint-v1-deploy.md).
 
+Beyond plain tokens, the covenant layer is where Radiant is genuinely different:
+HTLC covenants, a consensus-enforced **soulbound** NFT, the REF-authenticity gate,
+and credential-bound swap gating — mapped as composable primitives in
+[`docs/concepts/covenant-building-blocks.md`](concepts/covenant-building-blocks.md).
+
 New to all this? The fastest way to mint a real token with zero risk is the
 local-regtest quickstart: [`docs/tutorials/quickstart.md`](tutorials/quickstart.md)
 (stand up a private chain in Docker, mint, tear it down).
