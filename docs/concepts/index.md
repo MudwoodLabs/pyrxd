@@ -6,6 +6,7 @@ and how Radiant differs from related blockchains.
 ```{toctree}
 :maxdepth: 1
 
+architecture
 gravity
 covenant-building-blocks
 partial-tx-swaps
@@ -17,6 +18,11 @@ external-miner-protocol
 
 ## Available now
 
+- **[Architecture & module map](architecture.md)** — the codebase shape for
+  contributors: the L0→L4 layering (primitives → wallets → protocols → CLI),
+  the one-way dependency rule + PEP 562 lazy exports, a per-subsystem map with
+  import paths, the trust boundaries (what's pre-audit / dust-only), and an
+  "I want to X → touch Y" table. **Start here to contribute.**
 - **[Covenant building blocks](covenant-building-blocks.md)** — Radiant's
   differentiated tech as composable primitives: the HTLC covenants (RXD/FT/NFT),
   the consensus-enforced soulbound NFT covenant, the REF-authenticity gate

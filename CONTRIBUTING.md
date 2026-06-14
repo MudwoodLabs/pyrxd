@@ -4,6 +4,10 @@ Thanks for considering a contribution. This document covers the
 practicalities: how to set up a dev environment, how to send a PR, and
 what we expect for code quality.
 
+New to the codebase? Read **[Architecture & module map](docs/concepts/architecture.md)**
+first — the layering, the one-way dependency rule, and an "I want to X → touch Y"
+table that points you at the right module.
+
 ## Development setup
 
 ```bash
