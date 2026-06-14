@@ -169,6 +169,9 @@ ignore = [
 "tests/test_soulbound_covenant_regtest.py" = [
     "F811",   # same: reuses the shared `node` regtest fixture from test_htlc_regtest_e2e
 ]
+"tests/test_dmint_v1_regtest_e2e.py" = [
+    "F811",   # same: reuses the shared `node` regtest fixture from test_htlc_regtest_e2e
+]
 "examples/**" = [
     "S",      # examples use test keys / hardcoded WIFs intentionally
     "E402",   # examples may reorder imports for narrative clarity

@@ -1090,6 +1090,21 @@ def _build_dmint_v1_mint_tx(
         raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
     if fee_rate < 1:
         raise ValidationError(f"fee_rate must be >= 1, got {fee_rate}")
+    if contract_utxo.value != 1:
+        # The V1 covenant's continue branch enforces
+        # ``OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY`` on the recreated contract
+        # output, and the mint preserves ``contract_utxo.value``. So a contract
+        # deployed with any carrier other than 1 photon is *unmintable* — the
+        # node rejects every mint with a cryptic ``mandatory-script-verify-flag-
+        # failed (OP_NUMEQUALVERIFY)``. Every live dMint contract is a 1-photon
+        # singleton (``build_reveal_outputs`` emits ``contract_value=1``); fail
+        # fast here rather than after a wasted PoW grind + broadcast. Proven on
+        # regtest by tests/test_dmint_v1_regtest_e2e.py.
+        raise ValidationError(
+            f"V1 dMint contract must be a 1-photon singleton, got {contract_utxo.value} photons. "
+            f"The covenant enforces OP_OUTPUTVALUE==1 on the recreated contract output, so a "
+            f"non-1-photon carrier is unmintable. Deploy with a 1-photon contract output."
+        )
 
     # Reject token-bearing funding UTXOs to prevent silent token-burn.
     if is_token_bearing_script(funding_utxo.script):

@@ -436,6 +436,16 @@ class TestBuildDmintMintTxV1:
         utxo = _make_v1_contract_utxo()
         assert self._mint(utxo).fee > 0
 
+    def test_non_singleton_carrier_rejected(self):
+        # The V1 covenant enforces OP_OUTPUTVALUE==1 on the recreated contract
+        # output, so a contract with any carrier other than 1 photon is
+        # unmintable — the node rejects every mint with a cryptic
+        # OP_NUMEQUALVERIFY failure. build_dmint_mint_tx fails fast instead.
+        # (Consensus-proven on regtest by test_dmint_v1_regtest_e2e.py.)
+        utxo = _make_v1_contract_utxo(value=100)
+        with pytest.raises(ValidationError, match="1-photon singleton"):
+            self._mint(utxo)
+
     def test_exhausted_contract_raises_typed_error(self):
         # height >= max_height → contract is exhausted at mint time
         utxo = _make_v1_contract_utxo(height=_RBG_MAX_HEIGHT - 1)

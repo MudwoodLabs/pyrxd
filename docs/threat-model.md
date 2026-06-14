@@ -388,7 +388,7 @@ Honest list. These are not vulnerabilities; they're places where pyrxd's defense
 ### Protocol
 
 11. **Gravity covenant variants flagged "still being hardened"** in README. TA8 is the highest-stakes attacker; this is the highest-priority audit target.
-12. **dMint PoW path documented but not implemented.** Only premine FT works in v0.3.
+12. **dMint V1 deploy + PoW mint: now regtest-consensus-validated.** The earlier "documented but not implemented" wording was stale — the builders + reference miner shipped; the real gap was node validation. `tests/test_dmint_v1_regtest_e2e.py` proves on a real `radiant-core` node that a pyrxd-built V1 deploy (commit→reveal genesis) and a PoW-mined mint are accepted, a wrong nonce is rejected, and the contract recreates at height+1. Surfaced a consensus requirement the golden vectors missed: V1 contracts MUST be 1-photon singletons (covenant enforces `OP_OUTPUTVALUE==1`); `build_dmint_mint_tx` now rejects non-1 carriers early. Residual: V2 contracts remain unvalidated (`V2UnvalidatedWarning`); no CLI verb exposes deploy/mint yet.
 13. **No multi-signature support.** Single-sig only; users wanting m-of-n must build it themselves.
 
 ### Supply chain
