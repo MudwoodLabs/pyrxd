@@ -176,7 +176,7 @@ The pre-push hook fired on the actual push, found nothing new because `task ci` 
 - [.github/workflows/ci.yml](../../../.github/workflows/ci.yml) — GitHub Actions CI job that defines the test matrix and coverage requirements (100% security module, 85% overall)
 - [.github/workflows/lint.yml](../../../.github/workflows/lint.yml) — GitHub Actions lint job with ruff check and format steps
 - [docs/pre-commit-config.md](../../pre-commit-config.md) — Documents the pre-commit framework (auto-formatting, linting, secret detection); predates the pre-push hook work
-- [docs/developer.md](../../developer.md) — Stub developer guide
+- [docs/concepts/architecture.md](../../concepts/architecture.md) — Contributor architecture & module map (replaced the developer.md stub)
 - [docs/pyproject.md](../../pyproject.md) — Explains pyproject.toml as config file for build/lint/test/publish
 
 **Recent related PRs/commits:**
