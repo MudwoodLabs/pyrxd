@@ -96,7 +96,7 @@ if TYPE_CHECKING:
 
     from ..glyph.dmint import DmintMintResult, PowPreimageResult
     from ..keys import PrivateKey
-    from ..network.electrumx import ElectrumXClient
+    from ..network.electrumx import ElectrumXClient, UtxoRecord
 
 
 # ---------------------------------------------------------------------------
@@ -825,6 +825,35 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
         click.echo(f"\nNFT transfer broadcast: {result['txid']}")
 
 
+async def _find_plain_rxd_utxo(
+    triples: list[tuple[UtxoRecord, str, PrivateKey]],
+    client: ElectrumXClient,
+    *,
+    exclude: set[tuple[str, int]],
+    needed: int,
+) -> tuple[UtxoRecord, str, PrivateKey] | None:
+    """Pick a plain-P2PKH (non-token) wallet UTXO >= ``needed`` to fund a fee.
+
+    Verifies each candidate's on-chain script is a bare 25-byte P2PKH so a
+    token-bearing UTXO is never spent as fee (which would burn the token).
+    Excludes the given outpoints (e.g. the NFT being transferred).
+    """
+    for u, a, k in sorted(triples, key=lambda t: t[0].value, reverse=True):
+        if (u.tx_hash, u.tx_pos) in exclude or u.value < needed:
+            continue
+        try:
+            raw = await client.get_transaction(Txid(u.tx_hash))
+        except NetworkError:
+            continue
+        tx = Transaction.from_hex(bytes(raw))
+        if tx is None or u.tx_pos >= len(tx.outputs):
+            continue
+        spk = tx.outputs[u.tx_pos].locking_script.serialize()
+        if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":
+            return u, a, k
+    return None
+
+
 async def _transfer_nft_inner(
     ctx: CliContext,
     wallet: HdWallet,
@@ -859,27 +888,52 @@ async def _transfer_nft_inner(
         )
     utxo, addr, pk, nft_script = found
 
-    # Build the input that spends the NFT, sign it with P2PKH unlock
-    # (the NFT script ends with a P2PKH gate to the owner_pkh).
-    locking = nft_script
-    src_out = TransactionOutput(Script(locking), utxo.value)
-    src_tx = Transaction(tx_inputs=[], tx_outputs=[src_out])
-    src_tx.txid = lambda: utxo.tx_hash  # type: ignore[method-assign]
+    # The NFT singleton carries only dust, so the fee must come from a separate
+    # plain-RXD funding input (else the tx pays 0 fee and the node rejects it).
+    fund = await _find_plain_rxd_utxo(triples, client, exclude={(utxo.tx_hash, utxo.tx_pos)}, needed=100_000)
+    if fund is None:
+        raise UserError(
+            "no plain-RXD UTXO to fund the NFT transfer fee",
+            fix="fund this wallet with a little plain RXD (the NFT itself carries only dust)",
+        )
+    fund_utxo, fund_addr, fund_key = fund
+    fund_spk = P2PKH().lock(fund_addr)
 
+    # Input 0: the NFT (P2PKH-gated to the owner), re-locked to the new owner.
+    # Input 1: the fee funding. Both source shims are padded to the real vout.
+    nft_src_outs = [TransactionOutput(Script(b""), 0) for _ in range(utxo.tx_pos)]
+    nft_src_outs.append(TransactionOutput(Script(nft_script), utxo.value))
+    nft_src = Transaction(tx_inputs=[], tx_outputs=nft_src_outs)
+    nft_src.txid = lambda: utxo.tx_hash  # type: ignore[method-assign]
     nft_input = TransactionInput(
-        source_transaction=src_tx,
+        source_transaction=nft_src,
         source_txid=utxo.tx_hash,
         source_output_index=utxo.tx_pos,
         unlocking_script_template=P2PKH().unlock(pk),
     )
     nft_input.satoshis = utxo.value
-    nft_input.locking_script = Script(locking)
+    nft_input.locking_script = Script(nft_script)
 
-    # Re-lock to the new owner via the same NFT script with new pkh.
+    fund_src_outs = [TransactionOutput(Script(b""), 0) for _ in range(fund_utxo.tx_pos)]
+    fund_src_outs.append(TransactionOutput(fund_spk, fund_utxo.value))
+    fund_src = Transaction(tx_inputs=[], tx_outputs=fund_src_outs)
+    fund_src.txid = lambda: fund_utxo.tx_hash  # type: ignore[method-assign]
+    fund_input = TransactionInput(
+        source_transaction=fund_src,
+        source_txid=fund_utxo.tx_hash,
+        source_output_index=fund_utxo.tx_pos,
+        unlocking_script_template=P2PKH().unlock(fund_key),
+    )
+    fund_input.satoshis = fund_utxo.value
+    fund_input.locking_script = fund_spk
+
     new_locking = build_nft_locking_script(to_pkh, ref)
     nft_tx = Transaction(
-        tx_inputs=[nft_input],
-        tx_outputs=[TransactionOutput(Script(new_locking), utxo.value)],
+        tx_inputs=[nft_input, fund_input],
+        tx_outputs=[
+            TransactionOutput(Script(new_locking), utxo.value),  # NFT singleton -> new owner
+            TransactionOutput(fund_spk, 0, change=True),  # fee change back to this wallet
+        ],
     )
     nft_tx.fee(SatoshisPerKilobyte(ctx.fee_rate * 1000))
     nft_tx.sign()

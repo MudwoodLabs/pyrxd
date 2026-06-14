@@ -511,6 +511,7 @@ from pyrxd.network.electrumx import UtxoRecord
 from pyrxd.script.script import Script
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
+from pyrxd.transaction.transaction_output import TransactionOutput
 
 
 class TestDmintCliAssembly:
@@ -639,3 +640,65 @@ class TestMultiTxGlyphAssembly:
         assert commit is not None and reveal is not None
         assert reveal.outputs[0].satoshis == 546  # NFT on a dust carrier; change returned
         assert "ref" in result
+
+
+class TestTransferNftAssembly:
+    """Regression: transfer-nft must pay a real fee from a plain-RXD funding
+    input (the NFT carries only dust), not a 0-fee tx, and survive an NFT/
+    funding UTXO at vout != 0."""
+
+    def test_transfer_nft_funds_the_fee(self, cli_context) -> None:
+        from pyrxd.cli.glyph_cmds import _transfer_nft_inner
+        from pyrxd.glyph.script import build_nft_locking_script
+        from pyrxd.script.type import P2PKH
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+
+        def _src_hex(vout: int, spk: bytes, value: int) -> bytes:
+            outs = [TransactionOutput(Script(b""), 0) for _ in range(vout)]
+            outs.append(TransactionOutput(Script(spk), value))
+            return Transaction(tx_inputs=[], tx_outputs=outs).serialize()
+
+        owner_key = PrivateKey()
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        nft_script = build_nft_locking_script(Hex20(owner_key.public_key().hash160()), ref)
+        nft_utxo = UtxoRecord(tx_hash="bb" * 32, tx_pos=1, value=1000, height=100)  # dust, vout != 0
+        fund_key = PrivateKey()
+        fund_spk = P2PKH().lock(fund_key.address()).serialize()
+        fund_utxo = UtxoRecord(tx_hash="cc" * 32, tx_pos=1, value=50_000_000, height=100)  # plain RXD
+
+        txmap = {
+            "bb" * 32: _src_hex(1, nft_script, 1000),
+            "cc" * 32: _src_hex(1, fund_spk, 50_000_000),
+        }
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [
+                    (nft_utxo, owner_key.address(), owner_key),
+                    (fund_utxo, fund_key.address(), fund_key),
+                ]
+
+        captured: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            captured.append(raw)
+            return "ff" * 32
+
+        client = MagicMock()
+        client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+        client.broadcast = _bcast
+
+        to_key = PrivateKey()
+        result = asyncio.run(
+            _transfer_nft_inner(ctx, _Wallet(), ref, Hex20(to_key.public_key().hash160()), to_key.address(), client)
+        )
+
+        assert len(captured) == 1
+        tx = Transaction.from_hex(captured[0])
+        assert len(tx.inputs) == 2, "NFT input + plain-RXD funding input"
+        assert tx.outputs[0].satoshis == 1000, "NFT singleton keeps its dust value"
+        total_in = 1000 + 50_000_000
+        total_out = sum(o.satoshis for o in tx.outputs)
+        assert total_in - total_out > 0, "pays a real (non-zero) fee"
+        assert result["txid"] == "ff" * 32
