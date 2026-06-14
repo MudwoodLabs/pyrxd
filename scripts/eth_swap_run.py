@@ -38,9 +38,10 @@ import urllib.request
 from pathlib import Path
 
 # scripts/ siblings (same import style as dust_swap_run.py / dust_swap_resume.py)
+from pyrxd.gravity.seen_store import DurableSeenStore
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
-    InMemSeen,
     SshTrFeeSource,
     StepReport,
     atomic_write_mode_600,
@@ -426,13 +427,17 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # accept_estimated_eth_margins: this is an operator-gated DUST run that consciously
     # accepts estimated-margin risk (is_measured=False) on negligible value (MEDIUM-1). A
     # real (non-dust) value-bearing ETH swap MUST use MarginPolicy.measured(...) instead.
-    cfg = CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True, accept_estimated_eth_margins=True)
+    # accept_estimated_eth_margins stays (a separate ETH-margin dust opt-in, MEDIUM-1);
+    # accept_nondurable_seen is dropped — the seen-store below is durable-by-default.
+    cfg = CoordinatorConfig(margin_policy=policy, accept_estimated_eth_margins=True)
     coord = SwapCoordinator(
         record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=eth_leg,
         radiant_leg=rxd_leg,
         indexer=indexer,
-        seen_store=InMemSeen(),
+        # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
+        # so the SEEN-1 reservation survives a restart / second process (was InMemSeen).
+        seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
         config=cfg,
     )
 

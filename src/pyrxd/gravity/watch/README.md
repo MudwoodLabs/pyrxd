@@ -23,7 +23,7 @@ RecordStore ─┐                                    ┌─ AlertChannel (authe
 
 - **`decide.py`** — pure `decide(record, observations, policy, safety_window_blocks) → Decision`.
 - **`reconciler.py`** — the loop body: list active swaps → observe → decide → route pages. Per-swap-id single-flight; per-swap fail-closed (a failure becomes `PAGE_SQUEEZED`, the loop never crashes). The **daemon shell owns the sleep/poll loop**, so the brain never sleeps.
-- **`quorum.py`** — `ChainObserver` builds `Observations`. BTC depth is quorum-agreed (shell backs `BtcClaimSource.confirmations` with `MultiSourceBtcFundingReader`); RXD is single-source in v1 → every observation is `low_corroboration` (a false RXD read → a false *page*, never a false broadcast).
+- **`quorum.py`** — `ChainObserver` builds `Observations`. BTC depth is quorum-agreed (shell backs `BtcClaimSource.confirmations` with `MultiSourceBtcFundingReader`); RXD depth is now quorum-agreed too (shell backs it with `MultiSourceRxdChainSource` over ≥2 independent Radiant readers, wired by default). A corroborated RXD read clears `low_corroboration`; a single-source fallback stays flagged (a false RXD read → a false *page*, never a false broadcast).
 - **`alerts.py`** — `DedupAlerter` maps a `Decision` → severity + `Page`, deduped by `(swap_id, intent)`; dedup advances only after a successful send (transient channel failures retry).
 
 ## Intent truth table (`decide`)
@@ -50,7 +50,7 @@ the claim race is assessed even if `record.state` is still `BOTH_LOCKED`.
 ```python
 reconciler = Reconciler(
     store=record_store,                      # RecordStore: the operator's in-flight swaps
-    observer=ChainObserver(btc=btc_src, rxd=rxd_src),   # rxd_corroborated=False in v1
+    observer=ChainObserver(btc=btc_src, rxd=rxd_src, rxd_corroborated=True),  # True with a ≥2-source RXD quorum
     alerter=DedupAlerter(channel=alert_channel),
     policy=margin_policy,                    # gravity.swap_coordinator.MarginPolicy
     safety_window_blocks=6,
@@ -71,7 +71,7 @@ while True:                                  # ← the shell's loop, not the bra
 **Remaining (the todo):**
 
 - **Hard gate:** an external security audit **and** a genuine *two-party adversarial* run — every run so far is single-operator (a plumbing proof, not adversarial safety). Blocks all non-dust value.
-- **RXD multi-source quorum** (the recurring hard blocker): RXD is single-source today (one ssh-tr node; `ChainTracker` is BTC-only) so every RXD observation is `low_corroboration`. A 2nd independent source is the prerequisite to broaden autonomy beyond dust. `MultiSourceEthRpc` is the ETH analogue (single-source detection can *delay*, never lose, a page).
+- **RXD multi-source quorum — DONE (#187):** `MultiSourceRxdChainSource` composes ≥2 independent Radiant readers (MAX-aggregated covenant depth, reachability-gated absence, fail-closed below quorum), wired by default in `watchtower_run.py` (2-of-2 public ElectrumX) so a default tower run is `rxd_corroborated`. What remains is operational (run genuinely-independent endpoints) and that broadening autonomy *beyond dust* is still audit-gated. `MultiSourceEthRpc` is the still-open ETH analogue (single-source detection can *delay*, never lose, a page).
 - **Broaden autonomous actions** (each audit-gated; each needs the live capped-fee-key custody seam `RadiantLeg.fee_source`): RXD-covenant refund (not pre-signable), `mutual_refund` (two broadcasts), the autonomous **claim** (`taker_scrape_and_claim_asset` — scrape `p`, fire a reorg-gated Glyph claim before `t_rxd`; highest value, biggest lift), and ETH-leg autonomy (verify the real `EthHtlc.sol` `refund()` guard first).
 - **ETH polish:** wire `FinalityStallTracker` into the live tower (point-in-time finality only today; an across-time stall still SQUEEZES via the RXD deadline math).
 - **Residuals:** below-quorum-inside-window can co-fire claim+refund into a hold-that-loses (accepted residual: hold + CRITICAL operator fallback); dedup/`SeenStore` durability across restarts.
