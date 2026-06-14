@@ -580,3 +580,62 @@ class TestDmintCliAssembly:
         assert len(mint.tx.outputs) == 4  # recreated contract, FT reward, OP_RETURN, change
         assert mint.tx.outputs[0].satoshis == contract.value  # singleton carrier preserved (==1)
         assert len(raw) > 0
+
+
+class TestMultiTxGlyphAssembly:
+    """Regression for the systemic fee()/shim crash the dMint-CLI review found
+    in the shipped deploy-ft / mint-nft commands: a manual change output + fee()
+    ZeroDivisions, and a single-output source shim IndexErrors when the funding
+    UTXO is not at vout 0. Both must build->fee->sign cleanly now."""
+
+    def _wallet_and_client(self):
+        key = PrivateKey()
+        utxo = UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=50_000_000, height=100)  # vout != 0
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [(utxo, key.address(), key)]
+
+        captured: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            captured.append(raw)
+            return ("11" if len(captured) == 1 else "22") * 32
+
+        client = MagicMock()
+        client.broadcast = _bcast
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+        return key, _Wallet(), client, captured
+
+    def test_deploy_ft_inner_funds_from_vout_nonzero(self, cli_context, tmp_path) -> None:
+        from pyrxd.cli.glyph_cmds import _deploy_ft_inner, _read_metadata_file
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key, wallet, client, captured = self._wallet_and_client()
+        meta = _read_metadata_file(_write_meta(tmp_path / "ft.json", protocol=["FT"]))
+        treasury_pkh = Hex20(key.public_key().hash160())
+
+        result = asyncio.run(_deploy_ft_inner(ctx, wallet, meta, treasury_pkh, 1000, client))
+
+        assert len(captured) == 2, "commit + reveal both built+signed without crashing"
+        commit = Transaction.from_hex(captured[0])
+        reveal = Transaction.from_hex(captured[1])
+        assert commit is not None and reveal is not None
+        assert reveal.outputs[0].satoshis == 1000  # premine supply preserved
+        assert result["ref"].endswith(":0")
+
+    def test_mint_nft_inner_funds_from_vout_nonzero(self, cli_context, tmp_path) -> None:
+        from pyrxd.cli.glyph_cmds import _mint_nft_inner, _read_metadata_file
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        _key, wallet, client, captured = self._wallet_and_client()
+        meta = _read_metadata_file(_write_meta(tmp_path / "nft.json", protocol=["NFT"]))
+
+        result = asyncio.run(_mint_nft_inner(ctx, wallet, meta, client))
+
+        assert len(captured) == 2
+        commit = Transaction.from_hex(captured[0])
+        reveal = Transaction.from_hex(captured[1])
+        assert commit is not None and reveal is not None
+        assert reveal.outputs[0].satoshis == 546  # NFT on a dust carrier; change returned
+        assert "ref" in result

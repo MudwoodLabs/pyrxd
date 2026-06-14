@@ -47,6 +47,7 @@ from ..glyph.builder import (
     FtTransferParams,
     FtUtxo,
     GlyphBuilder,
+    RevealParams,
 )
 from ..glyph.dmint import (
     DEFAULT_MAX_ATTEMPTS,
@@ -247,8 +248,11 @@ async def _mint_nft_inner(
 
     # Build the commit input + outputs.
     locking = P2PKH().lock(funding_addr)
-    src_out = TransactionOutput(locking, funding_utxo.value)
-    src_tx = Transaction(tx_inputs=[], tx_outputs=[src_out])
+    # Pad the source shim so the funding output sits at its real vout (the largest
+    # wallet UTXO is often change at vout != 0; TransactionInput + fee() index it).
+    src_outs = [TransactionOutput(Script(b""), 0) for _ in range(funding_utxo.tx_pos)]
+    src_outs.append(TransactionOutput(locking, funding_utxo.value))
+    src_tx = Transaction(tx_inputs=[], tx_outputs=src_outs)
     src_tx.txid = lambda: funding_utxo.tx_hash  # type: ignore[method-assign]
 
     commit_input = TransactionInput(
@@ -260,12 +264,12 @@ async def _mint_nft_inner(
     commit_input.satoshis = funding_utxo.value
     commit_input.locking_script = locking
 
-    change_value = funding_utxo.value - commit_value - commit_fee_estimate
-    if change_value < 546:
-        change_value = 0  # burn dust to fee
-    commit_outputs = [TransactionOutput(Script(commit_result.commit_script), commit_value)]
-    if change_value:
-        commit_outputs.append(TransactionOutput(locking, change_value))
+    # change=True lets fee() size the fee from the real length and fill the change;
+    # a manual change output + fee() ZeroDivisions when there are no change=True outputs.
+    commit_outputs = [
+        TransactionOutput(Script(commit_result.commit_script), commit_value),
+        TransactionOutput(locking, 0, change=True),
+    ]
     commit_tx = Transaction(tx_inputs=[commit_input], tx_outputs=commit_outputs)
     commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     commit_tx.sign()
@@ -298,11 +302,14 @@ async def _mint_nft_inner(
     cbor_bytes = commit_result.cbor_bytes
     is_nft = True
     reveal_scripts = builder.prepare_reveal(
-        commit_txid=str(commit_txid),
-        commit_vout=0,
-        cbor_bytes=cbor_bytes,
-        owner_pkh=funding_pkh,
-        is_nft=is_nft,
+        RevealParams(
+            commit_txid=str(commit_txid),
+            commit_vout=0,
+            commit_value=commit_value,
+            cbor_bytes=cbor_bytes,
+            owner_pkh=funding_pkh,
+            is_nft=is_nft,
+        )
     )
 
     shim_commit_out = TransactionOutput(Script(commit_result.commit_script), commit_value)
@@ -317,10 +324,14 @@ async def _mint_nft_inner(
     reveal_input.satoshis = commit_value
     reveal_input.locking_script = Script(commit_result.commit_script)
 
-    reveal_value = max(546, commit_value - reveal_fee_estimate)
+    # The NFT sits on a dust carrier; the rest of the commit value returns as change
+    # (fee() sized from the real length) instead of being burned to fee.
     reveal_tx = Transaction(
         tx_inputs=[reveal_input],
-        tx_outputs=[TransactionOutput(Script(reveal_scripts.locking_script), reveal_value)],
+        tx_outputs=[
+            TransactionOutput(Script(reveal_scripts.locking_script), 546),
+            TransactionOutput(locking, 0, change=True),
+        ],
     )
     reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     reveal_tx.sign()
@@ -333,7 +344,7 @@ async def _mint_nft_inner(
                 title="Reveal transaction",
                 lines=[
                     f"commit txid:   {commit_txid}",
-                    f"reveal value:  {reveal_value:,} photons",
+                    f"nft to:        {funding_pkh.hex()}  (546-photon carrier; change returned)",
                 ],
             )
         ],
@@ -485,8 +496,11 @@ async def _deploy_ft_inner(
     )
 
     locking = P2PKH().lock(funding_addr)
-    src_out = TransactionOutput(locking, funding_utxo.value)
-    src_tx = Transaction(tx_inputs=[], tx_outputs=[src_out])
+    # Pad the source shim so the funding output sits at its real vout (the largest
+    # wallet UTXO is often change at vout != 0; TransactionInput + fee() index it).
+    src_outs = [TransactionOutput(Script(b""), 0) for _ in range(funding_utxo.tx_pos)]
+    src_outs.append(TransactionOutput(locking, funding_utxo.value))
+    src_tx = Transaction(tx_inputs=[], tx_outputs=src_outs)
     src_tx.txid = lambda: funding_utxo.tx_hash  # type: ignore[method-assign]
 
     commit_input = TransactionInput(
@@ -498,12 +512,12 @@ async def _deploy_ft_inner(
     commit_input.satoshis = funding_utxo.value
     commit_input.locking_script = locking
 
-    change_value = funding_utxo.value - commit_value - commit_fee_estimate
-    if change_value < 546:
-        change_value = 0
-    commit_outputs = [TransactionOutput(Script(commit_result.commit_script), commit_value)]
-    if change_value:
-        commit_outputs.append(TransactionOutput(locking, change_value))
+    # change=True lets fee() size the fee from the real length and fill the change;
+    # a manual change output + fee() ZeroDivisions when there are no change=True outputs.
+    commit_outputs = [
+        TransactionOutput(Script(commit_result.commit_script), commit_value),
+        TransactionOutput(locking, 0, change=True),
+    ]
     commit_tx = Transaction(tx_inputs=[commit_input], tx_outputs=commit_outputs)
     commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     commit_tx.sign()
@@ -553,10 +567,14 @@ async def _deploy_ft_inner(
     reveal_input.satoshis = commit_value
     reveal_input.locking_script = Script(commit_result.commit_script)
 
-    # Premine: vout[0].value = the supply (1 photon = 1 unit).
+    # Premine: vout[0].value = the supply (1 photon = 1 unit); the commit headroom
+    # returns as change (fee() sized from the real length) instead of burning to fee.
     reveal_tx = Transaction(
         tx_inputs=[reveal_input],
-        tx_outputs=[TransactionOutput(Script(reveal_scripts.locking_script), supply)],
+        tx_outputs=[
+            TransactionOutput(Script(reveal_scripts.locking_script), supply),
+            TransactionOutput(locking, 0, change=True),
+        ],
     )
     reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     reveal_tx.sign()
