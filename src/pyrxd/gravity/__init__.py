@@ -24,6 +24,7 @@ Public surface
 
 from __future__ import annotations
 
+from .capped_fee_source import CappedFeeWalletSource
 from .codehash import compute_p2sh_code_hash
 from .covenant import (
     CovenantArtifact,
@@ -59,6 +60,7 @@ from .types import (
 
 __all__ = [
     "ActiveOffer",
+    "CappedFeeWalletSource",
     "ClaimResult",
     "ConfirmationStatus",
     "CovenantArtifact",

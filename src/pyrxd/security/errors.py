@@ -150,6 +150,17 @@ class PolicyRejection(CovenantError):
     """
 
 
+class FeePoolExhaustedError(RxdSdkError):
+    """Raised by a capped fee source when it refuses to dispense another fee UTXO —
+    the pre-funded pool is empty or the configured total-spend cap would be exceeded.
+
+    Fail-closed: the caller (e.g. an autonomous covenant spend) must surface this and
+    refuse/page rather than fall back to an uncapped wallet. This is the structural
+    spend ceiling for autonomous RXD fee-paying (see
+    ``pyrxd.gravity.capped_fee_source.CappedFeeWalletSource``).
+    """
+
+
 class UnsupportedScriptError(RxdSdkError):
     """Raised when the script engine encounters an opcode or script type it
     does not fully implement.

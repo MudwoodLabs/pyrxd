@@ -110,6 +110,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SwapState": ("pyrxd.gravity.swap_state", "SwapState"),
     "CounterChainLeg": ("pyrxd.gravity.counter_chain_leg", "CounterChainLeg"),
     "RadiantCovenantLeg": ("pyrxd.gravity.radiant_leg", "RadiantCovenantLeg"),
+    "CappedFeeWalletSource": ("pyrxd.gravity.capped_fee_source", "CappedFeeWalletSource"),
     "EthLeg": ("pyrxd.gravity.eth_leg", "EthLeg"),
     # Counter-chain registries (per-chain safety knobs; see the cross-chain how-to)
     "EvmChain": ("pyrxd.eth_wallet.chains", "EvmChain"),
