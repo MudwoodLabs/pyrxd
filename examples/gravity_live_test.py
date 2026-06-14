@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 """Gravity live integration test — real ElectrumX + real BTC testnet APIs.
 
+    !! DEPRECATED — SPV-ORACLE SWAP, superseded by the HTLC swap. !!
+    This script exercises the RETIRED SPV-oracle swap construction, not the
+    current atomic swap. Its any-wallet covenant parser has KNOWN, won't-fix
+    security findings (forged-payment-in-scriptsig); it is dominated by the HTLC
+    swap (pyrxd.SwapCoordinator) and is kept only as reference for the RETAINED
+    SPV verification PRIMITIVE (one-way bridge-in / oracle). Do NOT build a new
+    swap on this path.
+
+      Current swap example : examples/htlc_swap_demo.py
+      Guide                : docs/how-to/build-a-cross-chain-swap.md
+      Why deprecated       : docs/solutions/design-decisions/spv-swap-deprecated-primitive-retained.md
+
 Exercises the Gravity SDK against LIVE networks (RXD mainnet ElectrumX +
 BTC testnet/signet blockstream.info). Every fact this script reports is derived
 from a live network call, a cryptographic operation, or the SDK's own validators.

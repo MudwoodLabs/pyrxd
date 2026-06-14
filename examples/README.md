@@ -105,31 +105,37 @@ it runs with **no node and no network** — it exercises the real swap API
 
 ---
 
-## Cross-chain / Gravity swaps (pre-audit)
+## Cross-chain swaps (pre-audit)
 
-The Gravity BTC↔RXD swap covenant is **pre-audit** — it has not cleared an
-external security review. Treat all three scripts as reference material; do not
-use them with real mainnet value.
+pyrxd's cross-chain atomic swap is a **hash-timelock (HTLC) swap** driven by the
+chain-neutral `pyrxd.SwapCoordinator` — trade RXD / a Glyph FT / a Glyph NFT
+against BTC or ETH with no custodian. It is **pre-audit**: build and demo on
+regtest/testnet, but do not move real value until the audit gate clears.
 
-### `gravity_swap_demo.py` — testnet, `DRY_RUN=1` by default — pre-audit
-The safe entry point for Gravity. Walks every step of a BTC↔RXD swap against
-**testnet** (Radiant + Bitcoin). `DRY_RUN=1` (default) builds and prints every
-tx but broadcasts nothing; `DRY_RUN=0` broadcasts to live testnets (no mainnet
-value).
+### `htlc_swap_demo.py` — no network — the current swap, START HERE
+Builds the **Radiant asset leg of the current HTLC swap** end to end: the NFT
+HTLC covenant, the taker's hashlock claim spend (reveals the secret), and the
+maker's CSV refund spend — with the production builders, structurally validated,
+no network. The on-ramp to the swap you should actually build.
+→ [`../docs/how-to/build-a-cross-chain-swap.md`](../docs/how-to/build-a-cross-chain-swap.md)
+For the full two-chain flow on a live regtest node, see
+`tests/test_xchain_swap_regtest_e2e.py` (BTC↔RXD) and
+`tests/test_xchain_eth_swap_regtest_e2e.py` (ETH↔RXD).
 
-### `gravity_live_test.py` — RXD mainnet reads + BTC testnet, `DRY_RUN=1` by default — pre-audit
-Integration test driving the Gravity SDK against **live** networks: reads from
-RXD **mainnet** ElectrumX and BTC **testnet**, building txs from real covenant
-bytecode and running the SPV verifier on real BTC data. `DRY_RUN=0` broadcasts
-the maker-offer tx on **RXD mainnet** (real photons); the BTC side never
-broadcasts.
+### Deprecated — the `gravity_*` SPV-oracle swap demos
 
-### `gravity_full_trade.py` — RXD mainnet (+ BTC mainnet default) — NO dry-run — pre-audit
-The full offer → claim → finalize / forfeit / cancel state machine. **This
-script has no `DRY_RUN` mode** — it broadcasts real transactions. The BTC side
-defaults to **mainnet** (`BTC_NETWORK=bc`). As a guard, on mainnet it refuses to
-run unless you set `I_UNDERSTAND_THIS_IS_REAL=yes`, acknowledging irreversible
-value movement. Prefer `gravity_swap_demo.py` for a safe walkthrough.
+> **Deprecated. Do not build on these.** The three `gravity_*` scripts demo the
+> **retired SPV-oracle swap** construction, which is superseded by the HTLC swap
+> above. Their any-wallet covenant parser has known, won't-fix security findings,
+> and `gravity_full_trade.py` broadcasts real RXD mainnet value. They are kept
+> only as reference for the **retained SPV verification primitive** (one-way
+> bridge-in / oracle — which the HTLC swap structurally cannot replace). Why:
+> [`../docs/solutions/design-decisions/spv-swap-deprecated-primitive-retained.md`](../docs/solutions/design-decisions/spv-swap-deprecated-primitive-retained.md).
+
+- `gravity_swap_demo.py` — testnet, `DRY_RUN=1` by default — the safe SPV walkthrough.
+- `gravity_live_test.py` — RXD mainnet reads + BTC testnet, `DRY_RUN=1` by default.
+- `gravity_full_trade.py` — RXD mainnet, **no dry-run** (broadcasts real value;
+  guarded by `I_UNDERSTAND_THIS_IS_REAL=yes`).
 
 ---
 
