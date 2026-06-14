@@ -30,6 +30,11 @@ jobs:
   build:
     name: Build sdist + wheel
     runs-on: ubuntu-latest
+    permissions:
+      # contents: write attaches the CycloneDX SBOM to the GitHub Release.
+      # The release event is a trusted "publish now" gesture, so granting it
+      # to this build job is acceptable.
+      contents: write
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
@@ -54,6 +59,25 @@ jobs:
           echo "Version OK: $pkg_version"
       - name: Build distributions
         run: poetry build
+      - name: Generate CycloneDX SBOM
+        # Declared dependency tree from pyproject + a freshly-resolved lock
+        # (poetry.lock is intentionally gitignored — a published library pins
+        # nothing for its consumers). Written OUTSIDE dist/ so PyPI never sees
+        # it (gh-action-pypi-publish uploads everything in dist/).
+        # continue-on-error: the SBOM is supplementary — never block the PyPI
+        # publish on it.
+        continue-on-error: true
+        run: |
+          pkg_version=$(poetry version --short)
+          poetry lock --no-interaction
+          pip install cyclonedx-bom
+          mkdir -p sbom
+          cyclonedx-py poetry . --output-format JSON --output-file "sbom/pyrxd-${pkg_version}.cdx.json"
+      - name: Attach SBOM to the GitHub Release
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${GITHUB_REF_NAME}" sbom/pyrxd-*.cdx.json --clobber
       - name: Upload distributions as workflow artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -86,8 +110,11 @@ jobs:
           path: dist/
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # v1.14.0
-        # No `with:` block: defaults publish to PyPI from ./dist using
-        # Trusted Publishing OIDC. Print the upload URL so the workflow
-        # log links straight to the new release page.
+        # Publishes to PyPI from ./dist using Trusted Publishing OIDC. With
+        # id-token: write present, this action defaults `attestations: true`,
+        # so each artifact ships a PEP 740 / Sigstore digital attestation
+        # (verifiable on the PyPI project page and via `pip download
+        # --require-hashes`). Verify they appear after the first publish at
+        # https://pypi.org/project/pyrxd/#files (the "Provenance" badge).
         with:
           print-hash: true

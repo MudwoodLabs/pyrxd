@@ -24,6 +24,10 @@ We aim to:
 We will publicly credit reporters in the changelog and security
 advisories unless you request otherwise.
 
+Our internal handling steps — triage, private fix, coordinated disclosure,
+and release — are documented in
+[`docs/runbooks/incident-response.md`](docs/runbooks/incident-response.md).
+
 ## Scope
 
 Security reports are welcome on:

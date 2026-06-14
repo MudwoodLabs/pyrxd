@@ -375,7 +375,7 @@ Honest list. These are not vulnerabilities; they're places where pyrxd's defense
 
 ### Network
 
-6. **Single ElectrumX endpoint by default.** TA5 has unmitigated reach for plain RXD operations. Multi-source ElectrumX is not implemented; only Bitcoin data sources have quorum.
+6. **Single-source RXD reads (accepted assumption, stated for the auditor).** Three RXD-side reads trust a single source by design: (a) the default single **ElectrumX** endpoint for plain-RXD wallet ops (TA5 has unmitigated reach here — multi-source ElectrumX is not implemented; only the Bitcoin data sources have quorum); (b) the single **RXinDexer** that resolves Glyph reads and backs the Gravity REF-authenticity gate (`verify_ref_authenticity`); (c) single-source RXD funding depth (a SPOF accepted only for dust). This is an **accepted assumption, not a missing control**: a *self-consistent* lie is byte-identical from every source, so adding a 2nd source — which only detects *disagreement* — has bounded value while the operating cost is real. The load-bearing defenses are the on-chain covenant pins (nBits / `expectedNBits`, the REF-uniqueness consensus rule), not read-side quorum. Standing up a 2nd independent RXD source is the right hardening **at first non-dust real value**; it is documented here so the audit reviews a stated single-source boundary up front rather than discovering it.
 7. **No certificate pinning for ElectrumX TLS.** A CA compromise enables TA4. We rely on system trust store.
 8. **The SPV primitive is not a self-sufficient sole authority.** It enforces the committed nBits pin and per-header PoW but does **not** do most-cumulative-work selection or independent network-difficulty oracling (audit F-01). It is safe only behind an on-chain covenant pinning nBits; any covenant-less use (bridge-in/oracle/gate) fails closed via `require_spv_sole_authority_cleared` pending external audit. See [`docs/how-to/spv-verification-pitfalls.md`](how-to/spv-verification-pitfalls.md).
 
@@ -393,15 +393,15 @@ Honest list. These are not vulnerabilities; they're places where pyrxd's defense
 
 ### Supply chain
 
-14. **No pinned transitive dependency hashes.** A compromised release of `coincurve`, `Cryptodome`, etc. would propagate. `pip-audit` catches known CVEs but not zero-days.
-15. **No SBOM generation.** A signed software bill of materials would help downstream users verify what they got.
-16. **Release signing not yet set up.** PyPI 2FA is on; release artifact signing (sigstore, gpg) is not.
+14. **No pinned transitive dependency hashes.** A compromised release of `coincurve`, `Cryptodome`, etc. would propagate. `pip-audit` catches known CVEs but not zero-days. (Deliberate for a *library* — pinning transitive hashes over-constrains downstreams.)
+15. **SBOM now generated.** Each GitHub Release attaches a CycloneDX SBOM (`pyrxd-<version>.cdx.json`) built from the resolved dependency tree by the publish workflow (`.github/workflows/publish.yml`).
+16. **Release artifacts now carry PEP 740 attestations.** PyPI 2FA + OIDC Trusted Publishing are on, and the publish action emits per-artifact Sigstore digital attestations (verifiable on the PyPI project page). A gpg-signed git tag / GitHub Release signature is still optional and not set up.
 
 ### Process
 
-17. **No formal incident response plan.** If a vulnerability is reported via `security@mudwoodlabs.com`, response is ad-hoc.
-18. **No coordinated-disclosure SLA.** Researchers don't know what response time to expect.
-19. **No external eyes.** Solo developer; nothing has been reviewed by anyone else.
+17. **Incident-response runbook now exists.** [`docs/runbooks/incident-response.md`](runbooks/incident-response.md) documents the triage → fix-branch → GitHub Security Advisory / CVE → release → notify flow for a report to `security@mudwoodlabs.com`.
+18. ~~No coordinated-disclosure SLA.~~ **Resolved:** [`SECURITY.md`](../SECURITY.md) states the SLA — acknowledge within 2 business days, initial assessment within 7, coordinated disclosure typically within 90 (Project Zero norms).
+19. **No external eyes.** Solo developer; nothing has been reviewed by anyone else. The standing hard gate before any real-value mainnet use.
 
 ## Out of scope (explicit non-coverage)
 
