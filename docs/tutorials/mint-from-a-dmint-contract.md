@@ -15,9 +15,18 @@ before running any commands.
 
 ```{warning}
 **This tutorial is mainnet-only and broadcasts a real transaction.**
-There is no testnet path for V1 dMint contracts because every live
-contract is on Radiant mainnet. A clean dry-run does not commit; the
+There is no testnet path for mining an *existing* contract because every
+live one is on Radiant mainnet. A clean dry-run does not commit; the
 broadcast step at the end does.
+```
+
+```{tip}
+**Prefer the CLI, or want a testnet run?** `glyph claim-dmint --contract
+<txid>:<vout>` does this whole flow in one command, and
+[Issue and mine your own dMint token](../how-to/issue-a-dmint-token.md) shows
+how to *deploy* your own contract first — which you can do on testnet, no real
+value. This tutorial is the library-level deep-dive for mining a live mainnet
+contract.
 ```
 
 For the theory behind what a V1 dMint contract is and the byte-by-byte

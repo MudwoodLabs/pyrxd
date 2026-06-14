@@ -9,6 +9,7 @@ you already know the basics and want a focused answer to "how do I X."
 broadcast-a-transaction
 recover-funds-across-wallet-paths
 use-the-public-testnet
+issue-a-dmint-token
 build-a-cross-chain-swap
 migrate-0.4-to-0.5
 verify-an-spv-proof
@@ -31,6 +32,11 @@ spv-verification-pitfalls
   graduate from the local regtest quickstart to the shared public testnet, how to
   run `radiantd -testnet`, point pyrxd at it, and get testnet coins from the
   (best-effort, community-run) faucet. For most work, stay on regtest.
+- **[Issue and mine your own dMint token](issue-a-dmint-token.md)** — launch a
+  permissionless, PoW-mined fungible token (no premine, no central issuer) and
+  mine the first claim, end to end from the CLI: `glyph init-metadata --type
+  dmint-ft`, `glyph deploy-dmint`, `glyph claim-dmint`. Testnet-first — deploying
+  your own contract is the one dMint flow that doesn't need mainnet.
 - **[Build a cross-chain atomic swap](build-a-cross-chain-swap.md)** — embed the
   trustless BTC/ETH ↔ RXD HTLC swap: the role/timelock safety invariant, the
   `SwapCoordinator` + legs surface, and the proven regtest/Anvil harnesses to copy
