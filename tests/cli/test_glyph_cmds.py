@@ -323,3 +323,260 @@ class TestProtocolValidation:
         )
         assert result.exit_code != 0
         assert "FT" in result.output
+
+
+# ---------------------------------------------------------------------------
+# deploy-dmint / claim-dmint  (A2)
+# ---------------------------------------------------------------------------
+
+import pytest
+
+from pyrxd.cli.errors import UserError
+from pyrxd.cli.glyph_cmds import _mine_claim_with_rerolls, _resolve_miner_argv
+from pyrxd.glyph.dmint import (
+    DmintAlgo,
+    DmintContractUtxo,
+    DmintMinerFundingUtxo,
+    DmintState,
+    build_dmint_v1_contract_script,
+    difficulty_to_target,
+)
+from pyrxd.glyph.types import GlyphRef
+from pyrxd.security.errors import MaxAttemptsError
+
+
+class TestDeployDmint:
+    """Argument/parameter validation (no network — fires before _load_wallet)."""
+
+    def test_non_dmint_protocol_rejected(self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT"])  # missing DMINT
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "glyph",
+                "deploy-dmint",
+                str(meta),
+                "--max-height",
+                "100",
+                "--reward",
+                "1000",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "FT and DMINT" in result.output
+
+    def test_num_contracts_out_of_range(self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT", "DMINT"])
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "glyph",
+                "deploy-dmint",
+                str(meta),
+                "--num-contracts",
+                "0",
+                "--max-height",
+                "100",
+                "--reward",
+                "1000",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "invalid dMint deploy parameters" in result.output
+
+    def test_reward_zero_rejected(self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT", "DMINT"])
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "glyph",
+                "deploy-dmint",
+                str(meta),
+                "--max-height",
+                "100",
+                "--reward",
+                "0",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "invalid dMint deploy parameters" in result.output
+
+
+class TestClaimDmint:
+    """Locator validation (no network — the exactly-one check is the first line)."""
+
+    def test_requires_a_locator(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(cli, ["--wallet", str(tmp_wallet_path), "glyph", "claim-dmint"])
+        assert result.exit_code != 0
+        assert "exactly one" in result.output
+
+    def test_rejects_both_locators(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "glyph",
+                "claim-dmint",
+                "--contract",
+                "ab" * 32 + ":0",
+                "--token-ref",
+                "cd" * 32 + ":0",
+            ],
+        )
+        assert result.exit_code != 0
+        assert "exactly one" in result.output
+
+
+def _dmint_contract(value: int = 1) -> DmintContractUtxo:
+    spk = build_dmint_v1_contract_script(
+        height=0,
+        contract_ref=GlyphRef(txid="ab" * 32, vout=1),
+        token_ref=GlyphRef(txid="cd" * 32, vout=0),
+        max_height=100,
+        reward=1000,
+        target=difficulty_to_target(1, DmintAlgo.SHA256D),
+        algo=DmintAlgo.SHA256D,
+    )
+    return DmintContractUtxo(txid="ab" * 32, vout=0, value=value, script=spk, state=DmintState.from_script(spk))
+
+
+def _dmint_funding() -> DmintMinerFundingUtxo:
+    pkh = bytes(range(20))
+    return DmintMinerFundingUtxo(txid="ef" * 32, vout=0, value=50_000_000, script=b"\x76\xa9\x14" + pkh + b"\x88\xac")
+
+
+class TestDmintCliHelpers:
+    def test_resolve_miner_argv(self) -> None:
+        import sys
+
+        assert _resolve_miner_argv(None) == [sys.executable, "-m", "pyrxd.contrib.miner"]
+        assert _resolve_miner_argv("in-process") is None
+        assert _resolve_miner_argv("glyph-miner --stdin") == ["glyph-miner", "--stdin"]
+
+    def test_mine_rerolls_until_hit(self) -> None:
+        # V1's 4-byte nonce space often has no solution per preimage; the loop
+        # must reroll the OP_RETURN (a fresh preimage) on MaxAttemptsError.
+        contract, funding, miner_pkh = _dmint_contract(), _dmint_funding(), bytes(range(20))
+        seen: list[bytes] = []
+
+        def fake_mine(preimage: bytes, target: int) -> bytes:
+            seen.append(preimage)
+            if len(seen) <= 2:
+                raise MaxAttemptsError("swept without a hit", attempts=1, elapsed_s=0.1)
+            return b"\x01\x02\x03\x04"
+
+        _mint, _pre, nonce = _mine_claim_with_rerolls(
+            contract, funding, miner_pkh, b"msg", 10_000, mine=fake_mine, max_rerolls=10
+        )
+        assert nonce == b"\x01\x02\x03\x04"
+        assert len(seen) == 3  # 2 exhausted preimages + 1 hit
+        assert len(set(seen)) == 3  # each reroll varied the OP_RETURN -> distinct preimage
+
+    def test_mine_exhausts_rerolls(self) -> None:
+        def always_exhaust(preimage: bytes, target: int) -> bytes:
+            raise MaxAttemptsError("swept without a hit", attempts=1, elapsed_s=0.1)
+
+        with pytest.raises(UserError, match="no nonce found"):
+            _mine_claim_with_rerolls(
+                _dmint_contract(),
+                _dmint_funding(),
+                bytes(range(20)),
+                b"msg",
+                10_000,
+                mine=always_exhaust,
+                max_rerolls=3,
+            )
+
+
+import asyncio
+import dataclasses
+from unittest.mock import AsyncMock, MagicMock
+
+from pyrxd.glyph.dmint import build_mint_scriptsig
+from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+from pyrxd.keys import PrivateKey
+from pyrxd.network.electrumx import UtxoRecord
+from pyrxd.script.script import Script
+from pyrxd.security.types import Hex20
+from pyrxd.transaction.transaction import Transaction
+
+
+class TestDmintCliAssembly:
+    """Drive the real build->fee->sign tx-assembly (the part the validation
+    tests don't reach, and the part with no regtest-ElectrumX e2e)."""
+
+    def test_deploy_inner_funds_from_vout_nonzero(self, cli_context) -> None:
+        # Regression for the H-1 review finding: the largest wallet UTXO is
+        # commonly change at vout != 0. Pre-fix this IndexError'd (single-output
+        # shim) / ZeroDivisionError'd (manual change + fee()); both must be gone.
+        from pyrxd.cli.glyph_cmds import _deploy_dmint_inner
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key = PrivateKey()
+        utxo = UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=50_000_000, height=100)  # vout != 0
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [(utxo, key.address(), key)]
+
+        captured: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            captured.append(raw)
+            return ("11" if len(captured) == 1 else "22") * 32
+
+        client = MagicMock()
+        client.broadcast = _bcast
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+
+        meta = GlyphMetadata.for_dmint_ft(
+            ticker="TST", name="t", protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)]
+        )
+        result = asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), meta, 1, 100, 1000, 1, None, client))
+
+        assert len(captured) == 2, "commit + reveal both built+signed without crashing"
+        assert result["num_contracts"] == 1
+        commit = Transaction.from_hex(captured[0])
+        reveal = Transaction.from_hex(captured[1])
+        assert commit is not None and reveal is not None
+        # commit: FT-commit @vout0 + 1 ref-seed + change ; reveal vout0 = 1-photon contract (consensus-required)
+        assert len(commit.outputs) >= 3
+        assert reveal.outputs[0].satoshis == 1
+
+    def test_claim_assembly_builds_signed_mint(self) -> None:
+        from pyrxd.cli.glyph_cmds import _mine_claim_with_rerolls, _sign_funding_input
+
+        miner_key = PrivateKey()
+        miner_pkh = bytes(Hex20(miner_key.public_key().hash160()))
+        funding = DmintMinerFundingUtxo(
+            txid="ef" * 32, vout=0, value=50_000_000, script=b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+        )
+        contract = _dmint_contract()  # value == 1 (passes the A1 guard)
+
+        def fake_mine(preimage: bytes, target: int) -> bytes:
+            return b"\x01\x02\x03\x04"
+
+        mint, pre, nonce = _mine_claim_with_rerolls(
+            contract, funding, miner_pkh, b"m", 10_000, mine=fake_mine, max_rerolls=1
+        )
+        mint.tx.inputs[0].unlocking_script = Script(
+            build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=4)
+        )
+        _sign_funding_input(mint.tx, 1, miner_key)
+        raw = mint.tx.serialize()
+        assert len(mint.tx.inputs) == 2  # contract + funding
+        assert len(mint.tx.outputs) == 4  # recreated contract, FT reward, OP_RETURN, change
+        assert mint.tx.outputs[0].satoshis == contract.value  # singleton carrier preserved (==1)
+        assert len(raw) > 0
