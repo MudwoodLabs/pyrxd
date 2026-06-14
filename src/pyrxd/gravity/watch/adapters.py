@@ -138,10 +138,12 @@ class MultiSourceRxdChainSource:
     """Quorum ``RxdChainSource`` over N INDEPENDENT Radiant readers (the operator's own
     node + public ElectrumX servers), mirroring :class:`network.bitcoin.MultiSourceBtcFundingReader`.
 
-    RXD reads are single-source in v1, so every observation is flagged low-corroboration
-    (a wrong read → a false page, never a false broadcast). Composing >= ``quorum``
-    independent sources lets a lone lagging/lying/down source NOT drive a decision; wire
-    this and pass ``rxd_corroborated=True`` to the :class:`ChainObserver` to clear the flag.
+    A single RXD source is flagged low-corroboration (a wrong read → a false page, never a
+    false broadcast). Composing >= ``quorum`` independent sources lets a lone lagging/lying/down
+    source NOT drive a decision; wire this and pass ``rxd_corroborated=True`` to the
+    :class:`ChainObserver` to clear the flag. The daemon shell (``scripts/watchtower_run.py``)
+    wires this by default over 2 independent public ElectrumX endpoints, so a default tower run
+    is corroborated; a single-source run is the explicit fallback.
 
     Semantics (conservative; fail-closed toward NOT auto-acting):
 

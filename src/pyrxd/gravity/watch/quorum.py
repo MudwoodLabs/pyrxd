@@ -5,10 +5,14 @@ safety-critical input — the maker's BTC-claim *depth* — must be quorum-agree
 (conservative ``min`` across independent sources, fail-closed below quorum); the
 shell backs :class:`BtcClaimSource.confirmations` with
 ``network.bitcoin.MultiSourceBtcFundingReader`` (already built: ``min(depth)``,
-2-of-3, fail-closed). The RXD side is **single-source** in v1 (no Radiant
-multi-source primitive exists — Phase-0 finding), so every RXD-derived reading is
-flagged ``low_corroboration`` — a false RXD read causes a false *page*, never a
-false broadcast. Full RXD quorum is a v2 (autonomous) blocker.
+2-of-3, fail-closed). The RXD side is now **multi-source** too:
+:class:`pyrxd.gravity.watch.adapters.MultiSourceRxdChainSource` composes >= 2 independent
+Radiant readers (the operator's node + public ElectrumX), and the daemon shell wires it by
+default (``scripts/watchtower_run.py``, 2-of-2 public ElectrumX) — passing
+``rxd_corroborated=True`` clears the ``low_corroboration`` flag. A single-source RXD config
+is still permitted as a fallback and stays flagged ``low_corroboration`` (a false RXD read
+causes a false *page*, never a false broadcast). Corroboration clears the alert-path flag; it
+does **not** lift the executor's dust cap or the mainnet ``audit_cleared`` gate.
 
 This module defines the ports and the composing :class:`ChainObserver`; the
 concrete transports (mempool.space outspend for claim detection,
@@ -142,8 +146,10 @@ class ChainObserver(Observer):
     a :class:`RxdChainSource` into the :class:`Observations` that :func:`decide` consumes, routing by
     ``record.terms.counter_chain``. The RXD asset-lock derivation is shared across both directions.
 
-    ``rxd_corroborated`` is False in v1 (single RXD source) → every observation is flagged
-    ``low_corroboration``. Pass True only once a real ≥2-source RXD quorum exists (a v2 deliverable).
+    ``rxd_corroborated`` clears the per-observation ``low_corroboration`` flag. Pass True only with a
+    real ≥2-source RXD quorum (:class:`MultiSourceRxdChainSource`, ``corroborated=True``) — the
+    LOW-R2 guard below refuses it over a single source. A single-source RXD config leaves it False and
+    every observation flagged ``low_corroboration`` (a false read → a false page, never a broadcast).
     A swap is observed only if the source for its counter-chain was injected; otherwise ``observe``
     fails closed (the reconciler turns the error into a decision-required page, never a silent miss).
     """

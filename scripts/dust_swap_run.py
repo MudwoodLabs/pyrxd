@@ -46,6 +46,7 @@ from pyrxd.btc_wallet.keys import generate_keypair
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
     CoordinatorConfig,
     SwapCoordinator,
@@ -64,7 +65,6 @@ from pyrxd.security.types import Hex20, Txid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
     CapturingBroadcaster,
-    InMemSeen,
     SshTrFeeSource,
     StepReport,
     atomic_write_mode_600,
@@ -84,10 +84,10 @@ _STAGES = {
 _MAINNET_BTC_API = "https://mempool.space/api"
 
 
-# Helpers (CapturingBroadcaster, InMemSeen, SshTrFeeSource, StepReport, confirm,
+# Helpers (CapturingBroadcaster, SshTrFeeSource, StepReport, confirm,
 # atomic_write_mode_600, rxd_blockcount, measured_margin_from_mainnet) live in
 # _dust_swap_shared so the resume runner builds the SAME object graph. Imported at the
-# top of this file.
+# top of this file. (The durable seen-store is pyrxd.gravity.seen_store.DurableSeenStore.)
 
 
 # --------------------------------------------------------------------------- the run
@@ -284,10 +284,11 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         btc_leg=btc_leg,
         radiant_leg=rxd_leg,
         indexer=None,
-        seen_store=InMemSeen(),
-        # Single-process, single-shot, fresh-H-per-run: consciously accept the
-        # non-durable in-memory seen-store on this value-bearing network (SEEN-1).
-        config=CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True),
+        # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
+        # so the SEEN-1 replay/free-option reservation survives a restart or a second
+        # process (durable-by-default; no accept_nondurable_seen opt-in needed).
+        seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
+        config=CoordinatorConfig(margin_policy=policy),
     )
 
     try:

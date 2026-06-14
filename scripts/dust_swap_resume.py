@@ -32,6 +32,7 @@ from pyrxd.btc_wallet.keys import keypair_from_wif
 from pyrxd.btc_wallet.payment import BtcUtxo
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
     CoordinatorConfig,
     SwapCoordinator,
@@ -50,7 +51,6 @@ from pyrxd.security.types import Hex20, Txid
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _dust_swap_shared import (
     CapturingBroadcaster,
-    InMemSeen,
     SshTrFeeSource,
     confirm,
     measured_margin_from_mainnet,
@@ -211,12 +211,12 @@ async def resume(args) -> None:
         btc_leg=btc_leg,
         radiant_leg=rxd_leg,
         indexer=None,
-        seen_store=InMemSeen(),
-        # Single-process, single-shot, fresh-H-per-run: consciously accept the
-        # non-durable in-memory seen-store on this value-bearing network (SEEN-1).
-        # (Resume enters at BTC_LOCKED and never calls taker_funds_btc, so it neither
-        # reserves nor needs H — the guard still fires at construction, hence the opt-in.)
-        config=CoordinatorConfig(margin_policy=policy, accept_nondurable_seen=True),
+        # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file
+        # (shares the run's reservations). Resume enters at BTC_LOCKED and never calls
+        # taker_funds_btc, so it neither reserves nor needs H — but the durable store keeps
+        # the SEEN-1 guard satisfied without the accept_nondurable_seen opt-in.
+        seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
+        config=CoordinatorConfig(margin_policy=policy),
     )
     print(f"  coordinator seeded at {coord.record.state.value}")
 
