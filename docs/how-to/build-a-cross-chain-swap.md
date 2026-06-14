@@ -12,6 +12,13 @@ end-to-end on regtest and on small real-value mainnet/Sepolia runs.
 > property is what an audit certifies. See the swap coordinator's module docstring for
 > the current residual-risk notes.
 
+> **This is the HTLC swap — not the SPV-oracle one.** An earlier SPV-oracle swap covenant
+> is **deprecated and superseded** by this HTLC construction (it was a non-atomic, weaker
+> swap with known won't-fix parser findings). Build on the coordinator below; the
+> `examples/gravity_*` scripts are SPV-oracle reference-only. See
+> [the design decision](../solutions/design-decisions/spv-swap-deprecated-primitive-retained.md)
+> for why, and `examples/htlc_swap_demo.py` for a runnable on-ramp to *this* path.
+
 ## The mental model
 
 Two parties, two chains, one secret:
