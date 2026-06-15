@@ -194,17 +194,18 @@ class EthHtlcContractLeg:
 
         Fail-closed checks (any mismatch raises; the taker does NOT tell the maker to
         lock RXD):
-          1. chain id matches;
-          2. deployed runtime logic == the committed artifact's (immutable slots masked —
-             no attacker contract / no modified logic);
-          3. the contract IMMUTABLES (hashlock/claimant/refundee/timeout) read back via
-             the getters == the negotiated terms in the locator (the meaningful binding
-             check — proves the contract releases on the right secret to the right party
-             at the right time);
-          4. claimant and refundee are EOAs (empty code) — a contract recipient that
-             reverts on ``receive`` would brick claim/refund via the contract's
-             ``require(ok)``;
-          5. funded balance == expected amount (no underfunded contract).
+
+        1. chain id matches;
+        2. deployed runtime logic == the committed artifact's (immutable slots masked —
+           no attacker contract / no modified logic);
+        3. the contract IMMUTABLES (hashlock/claimant/refundee/timeout) read back via
+           the getters == the negotiated terms in the locator (the meaningful binding
+           check — proves the contract releases on the right secret to the right party
+           at the right time);
+        4. claimant and refundee are EOAs (empty code) — a contract recipient that
+           reverts on ``receive`` would brick claim/refund via the contract's
+           ``require(ok)``;
+        5. funded balance == expected amount (no underfunded contract).
 
         ``block_identifier`` (red-team HIGH TOCTOU): pin EVERY read to one block. The taker's
         fund-time self-verify reads 'latest' (None). The MAKER's pre-lock re-verify passes

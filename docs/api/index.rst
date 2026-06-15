@@ -10,10 +10,12 @@ functions, and exceptions.
    pyrxd
    glyph
    gravity
+   eth_wallet
    swap
    hd
    network
    security
+   agent
    spv
    transaction
    script
@@ -22,3 +24,4 @@ functions, and exceptions.
    fee_models
    btc_wallet
    devnet
+   cli

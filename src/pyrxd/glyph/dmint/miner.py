@@ -202,11 +202,12 @@ def compute_next_target_asert(
 ) -> int:
     """Compute next ASERT-lite target (mirrors on-chain OP_LSHIFT/OP_RSHIFT logic).
 
-    drift = (current_time - last_time - target_time) // half_life
-    drift is clamped to [-4, +4].
-    drift > 0 → target <<= drift (easier)
-    drift < 0 → target >>= |drift| (harder)
-    Minimum target is 1.
+    The V2-only retarget, as pseudo-code::
+
+        drift = (current_time - last_time - target_time) // half_life   # clamped to [-4, +4]
+        drift > 0  ->  target <<= drift          # easier
+        drift < 0  ->  target >>= abs(drift)     # harder
+        minimum target is 1
 
     .. warning::
        V2-only DAA. V1 has no DAA (fixed difficulty). Emits
@@ -461,13 +462,13 @@ def mine_solution_external(
 
     The miner is expected to:
 
-    1. Read one JSON object from stdin: ``{"preimage_hex", "target_hex", "nonce_width"}``
-    2. Search for a valid nonce
-    3. Write one JSON object to stdout:
-       - On hit (exit 0): ``{"nonce_hex", "attempts", "elapsed_s"}``
-       - On nonce-space exhaustion (exit 2, added in 0.5.1): ``{"exhausted": true}``
-         — pyrxd raises :class:`MaxAttemptsError` immediately rather than
-         waiting for the parent timeout to fire.
+    1. Read one JSON object from stdin: ``{"preimage_hex", "target_hex", "nonce_width"}``.
+    2. Search for a valid nonce.
+    3. Write one JSON object to stdout — on a hit (exit 0):
+       ``{"nonce_hex", "attempts", "elapsed_s"}``; on nonce-space exhaustion
+       (exit 2, added in 0.5.1): ``{"exhausted": true}`` (pyrxd then raises
+       :class:`MaxAttemptsError` immediately rather than waiting for the parent
+       timeout to fire).
 
     A bundled reference implementation ships at :mod:`pyrxd.contrib.miner`
     (added in 0.5.1) — see :doc:`/concepts/parallel-mining` for the full
