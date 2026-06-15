@@ -79,7 +79,7 @@ pycryptodomex = "^3.23.0"
 # (pyrxd.crypto.kem). OpenSSL-backed, well-audited, typically already a
 # transitive dep in most environments.
 cryptography = ">=49.0.0"
-websockets = ">=15.0.1,<17.0.0"
+websockets = ">=16.0,<17.0.0"
 cbor2 = "^6.1"
 click = "^8.4"
 # tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
