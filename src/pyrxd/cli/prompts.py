@@ -4,7 +4,8 @@ The mnemonic display follows the Cut 1 plan:
 
 1. Print the mnemonic in a clearly-flagged box.
 2. Wait for the user to press Enter.
-3. The mnemonic is never shown again by pyrxd.
+3. Print a clipboard-hygiene caution (S3 / issue #11).
+4. The mnemonic is never shown again by pyrxd.
 
 The Enter gate slows the user down; it doesn't protect against
 scrollback / tmux / screen-share exposure. Documented as the user's
@@ -30,6 +31,16 @@ _MNEMONIC_BOX_TOP = "╔══════════════════�
 _MNEMONIC_BOX_MID = "║ Recovery mnemonic — write this down, then never share it.  ║"
 _MNEMONIC_BOX_MID2 = "║ pyrxd will NOT show this again.                            ║"
 _MNEMONIC_BOX_BOT = "╚════════════════════════════════════════════════════════════╝"
+
+# Clipboard-hygiene caution, shown after the Enter gate. Clipboard
+# managers (KDE Klipper, GNOME, third-party tools) retain copy history,
+# so a copied mnemonic can outlive the terminal session. We cannot clear
+# the system clipboard from here — the most we can do is warn. Threat
+# model S3 (mnemonic exposure via clipboard manager); GitHub issue #11.
+_CLIPBOARD_BOX_TOP = "╔════════════════════════════════════════════════════════════╗"
+_CLIPBOARD_BOX_MID = "║ Clipboard caution: managers keep copy/paste history.       ║"
+_CLIPBOARD_BOX_MID2 = "║ If you copied the mnemonic, clear your clipboard now.      ║"
+_CLIPBOARD_BOX_BOT = "╚════════════════════════════════════════════════════════════╝"
 
 
 def show_mnemonic(words: Iterable[str], *, ctx: CliContext) -> None:
@@ -61,6 +72,15 @@ def show_mnemonic(words: Iterable[str], *, ctx: CliContext) -> None:
         show_default=False,
         prompt_suffix="",
     )
+    # Clipboard-hygiene caution (threat model S3, issue #11). Printed
+    # after the Enter gate so it's the last thing the user sees before
+    # the mnemonic scrolls away. We can't clear the system clipboard
+    # from here — warning is the only available control.
+    click.echo("")
+    click.echo(_CLIPBOARD_BOX_TOP)
+    click.echo(_CLIPBOARD_BOX_MID)
+    click.echo(_CLIPBOARD_BOX_MID2)
+    click.echo(_CLIPBOARD_BOX_BOT)
 
 
 def prompt_mnemonic_input() -> str:
