@@ -63,6 +63,7 @@ class _FakeEthRpc:
         finalized: int = 120,
         block_hash: bytes | None = b"\x11" * 32,
         canonical: bytes | None = b"\x11" * 32,
+        head: int | None = None,
     ) -> None:
         self._deploy_block = deploy_block
         self._logs = logs if logs is not None else []
@@ -70,6 +71,9 @@ class _FakeEthRpc:
         self._finalized_error = finalized_error
         self._status, self._block, self._finalized = status, block, finalized
         self._bh, self._canonical = block_hash, canonical
+        # `head` drives finality_checkpoint()'s latest-head read (eth_blockNumber). Defaults to
+        # finalized + 200 so a frozen finalized with a climbing head is the natural stall scenario.
+        self._head = head if head is not None else finalized + 200
         self.get_logs_calls: list[dict] = []
 
     async def get_transaction(self, tx_hash):
@@ -104,6 +108,9 @@ class _FakeEthRpc:
         if self._finalized_error is not None:
             raise self._finalized_error
         return self._finalized
+
+    async def block_number(self):  # eth_blockNumber — the latest head for finality_checkpoint()
+        return self._head
 
 
 class _FakeEthNs:
@@ -397,3 +404,40 @@ async def test_real_adapter_unclaimed_through_chain_observer():
     obs = await ChainObserver(eth=RpcEthChainSource(fake), rxd=FakeRxd(tip=200, cov_confs=101)).observe("s", rec)
     assert obs.eth_claim_detected is False
     assert obs.eth_claim_finality is None
+
+
+# ─────────────────────────────── A8: finality_checkpoint() + across-time stall via real adapter ──
+
+
+async def test_finality_checkpoint_returns_head_and_finalized():
+    # finality_checkpoint() surfaces (head, finalized) for the stall tracker; finalized <= head holds.
+    fake = _FakeEthRpc(deploy_block=10, finalized=900, head=1100)
+    head, finalized = await RpcEthChainSource(fake).finality_checkpoint()
+    assert (head, finalized) == (1100, 900)
+
+
+async def test_finality_checkpoint_clamps_a_head_that_regressed_below_finalized():
+    # A reorg/lagging-replica race where the head read comes back BELOW finalized must not yield an
+    # incoherent pair the tracker would reject — head is clamped up to finalized (gap 0 = no stall).
+    fake = _FakeEthRpc(deploy_block=10, finalized=1000, head=990)
+    head, finalized = await RpcEthChainSource(fake).finality_checkpoint()
+    assert finalized == 1000 and head == 1000  # clamped, finalized <= head holds
+
+
+async def test_real_adapter_sustained_stall_upgrades_to_not_finalizing_across_ticks():
+    # End-to-end through the REAL adapter: finalized frozen while the head climbs past the tracker's
+    # patience window upgrades NOT_YET_FINAL_LIVE -> COUNTER_CHAIN_NOT_FINALIZING, and decide() SQUEEZES.
+    # The point-in-time branch returns FINAL only when the claim tx_block <= finalized; here the claim
+    # is at block 100 while finalized is frozen at 50, so the point-in-time verdict stays
+    # NOT_YET_FINAL_LIVE every tick and only the across-time stall can upgrade it.
+    fake = _FakeEthRpc(deploy_block=10, logs=[_log(CLAIMED_TOPIC0, _CLAIM_HASH)], block=100, finalized=50, head=60)
+    observer = ChainObserver(eth=RpcEthChainSource(fake), rxd=FakeRxd(tip=150, cov_confs=51))
+    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+
+    obs = await observer.observe("s", rec)  # establish the frozen-finalized run (gap 10, head 60)
+    assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
+    fake._head = 60 + 130  # head climbs +130 past patience while finalized(50) stays frozen; gap now 140
+    obs = await observer.observe("s", rec)
+    assert obs.eth_claim_finality is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING
+    d = decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6)
+    assert d.intent is Intent.PAGE_SQUEEZED

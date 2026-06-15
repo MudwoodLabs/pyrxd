@@ -189,6 +189,15 @@ class EthRpc:
             raise NetworkError(f"incoherent finalized={fin} > latest head={head}; refusing (fail-closed)")
         return fin
 
+    async def block_number(self) -> int:
+        """The current ``latest`` head block number (``eth_blockNumber``). Used alongside
+        :meth:`finalized_block_number` to feed the across-time PoS finality-stall tracker the
+        ``(head, finalized)`` pair (a frozen ``finalized`` while the head climbs = a stall)."""
+        try:
+            return int(await self._w3.eth.block_number)
+        except Exception as exc:
+            raise NetworkError(f"eth_blockNumber failed: {exc}") from exc
+
     async def canonical_block_hash(self, block_number: int) -> bytes:
         """The canonical block hash at ``block_number`` (eth_getBlockByNumber). Used to bind a
         receipt's claimed blockNumber to the canonical chain (red-team HIGH: receipt blockNumber on

@@ -114,6 +114,27 @@ class RpcEthChainSource:
             raise NetworkError("a log from the HTLC contract is missing transactionHash; cannot identify the claim")
         return EthClaimStatus(claimed=True, claim_tx_hash=_to_0x_hash(tx_hash))
 
+    async def finality_checkpoint(self) -> tuple[int, int]:
+        """The current ``(head_block, finalized_block)`` checkpoint — the across-time stall input.
+
+        The point-in-time :meth:`claim_finality_verdict` only sees one ``finalized`` reading; a
+        genuine PoS finality STALL (``finalized`` frozen while the head climbs) can only be judged
+        across ticks. The watchtower observer feeds this pair to a per-swap
+        :class:`~pyrxd.gravity.finality.FinalityStallTracker` so a sustained stall upgrades
+        ``NOT_YET_FINAL_LIVE`` → ``COUNTER_CHAIN_NOT_FINALIZING`` (the gate then SQUEEZES). This is an
+        OPTIONAL capability (duck-typed; the observer probes for it) so a minimal source without it
+        keeps the point-in-time fast path unchanged — a missing checkpoint never INVENTS a stall.
+
+        ``finalized_block_number`` already rejects an incoherent ``finalized > head`` over-report
+        (fail-closed) and returns the same head it bounded against, so ``finalized <= head`` holds for
+        the tracker by construction."""
+        finalized = await self._rpc.finalized_block_number()  # rejects finalized > head (fail-closed)
+        head = await self._rpc.block_number()
+        # Defend the tracker's finalized <= head precondition against a head that regressed between the
+        # two reads (a reorg/lagging-replica race): clamp head up to finalized rather than feed an
+        # incoherent pair. A frozen finalized with head==finalized is simply "no stall" (gap 0).
+        return max(head, finalized), finalized
+
     async def claim_finality_verdict(self, claim_tx_hash: str) -> CounterClaimFinality:
         # VERDICT LOGIC identical to EthHtlcContractLeg.claim_finality_verdict (htlc_leg.py:438-460),
         # pinned by test_finality_verdict_parity_with_audited_leg. The ONE deliberate difference: a

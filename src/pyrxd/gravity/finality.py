@@ -90,14 +90,15 @@ class CounterClaimFinality:
 class FinalityStallTracker:
     """RF-06 across-time stall detector for a finalized-checkpoint (PoS) counter leg.
 
-    ⚠️ NOT WIRED INTO THE LIVE SWAP PATH (Phase-3 deferred — red-team). This class is built and
-    unit-tested (tests/test_finality_verdict.py) but the production ``SwapCoordinator`` does NOT
-    yet feed it samples: the running ETH↔RXD swap relies on the point-in-time
-    ``claim_finality_verdict`` only, so a sustained PoS finality stall ("finalized" frozen while
-    the head advances) is NOT currently auto-detected end-to-end. Do not assume across-time
-    stall protection is active. Wiring = a poll-loop that calls ``observe(...)`` each sample and
-    routes ``COUNTER_CHAIN_NOT_FINALIZING`` into the coordinator's SQUEEZE path; tracked as a
-    Phase-4 follow-up, NOT part of the current merge. Keep this banner until it is wired.
+    WIRED INTO THE LIVE WATCHTOWER ALERT PATH (A8): the watchtower's ``ChainObserver`` holds one
+    tracker per ``swap_id`` and feeds it the current ``(head, finalized)`` each tick (via the ETH
+    source's ``finality_checkpoint()`` capability), so a sustained PoS finality stall ("finalized"
+    frozen while the head advances) upgrades ``NOT_YET_FINAL_LIVE`` → ``COUNTER_CHAIN_NOT_FINALIZING``,
+    which ``decide()`` routes to an earlier SQUEEZE page. This is ALERT-ONLY — it sharpens/advances a
+    page; the tower broadcasts nothing and there is NO autonomy change. (The production
+    ``SwapCoordinator``'s own one-shot claim path still consults only the point-in-time
+    ``claim_finality_verdict``; the across-time judgment lives in the polling tower, which is where
+    samples accrue across time.)
 
     ``claim_finality_verdict`` is deliberately a single POINT-IN-TIME observation and never
     emits ``COUNTER_CHAIN_NOT_FINALIZING`` (a single non-advance of ``finalized`` is normal —

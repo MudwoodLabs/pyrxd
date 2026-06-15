@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
 from pyrxd.eth_wallet.locator import EthHtlcLocator
-from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
+from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState, FinalityStallTracker
 from pyrxd.gravity.swap_state import SwapRecord, SwapState
 from pyrxd.gravity.watch.decide import Observations
 from pyrxd.gravity.watch.reconciler import Observer
@@ -124,6 +124,15 @@ class EthChainSource(Protocol):
         """The point-in-time finalized-checkpoint verdict for the maker's ETH claim tx."""
         ...
 
+    # OPTIONAL across-time capability (duck-typed; the observer probes for it via ``hasattr``, like
+    # the RXD source's ``corroborated`` attribute): a source MAY expose ``finality_checkpoint()`` ->
+    # ``(head_block, finalized_block)`` so the observer can feed a per-swap FinalityStallTracker and
+    # upgrade ``NOT_YET_FINAL_LIVE`` -> ``COUNTER_CHAIN_NOT_FINALIZING`` on a sustained PoS stall (the
+    # point-in-time verdict alone never can — a single non-advance of ``finalized`` is normal). A
+    # source WITHOUT it keeps the point-in-time fast path unchanged; a missing checkpoint never
+    # INVENTS a stall. ``RpcEthChainSource`` provides it; it is intentionally NOT a required Protocol
+    # method so a minimal point-in-time-only source stays a valid EthChainSource.
+
 
 @runtime_checkable
 class RxdChainSource(Protocol):
@@ -152,6 +161,16 @@ class ChainObserver(Observer):
     every observation flagged ``low_corroboration`` (a false read → a false page, never a broadcast).
     A swap is observed only if the source for its counter-chain was injected; otherwise ``observe``
     fails closed (the reconciler turns the error into a decision-required page, never a silent miss).
+
+    STATEFUL across ticks for ETH only: it holds ONE :class:`FinalityStallTracker` per ``swap_id``
+    (A8 / RF-06). The point-in-time ``claim_finality_verdict`` cannot see a *sustained* PoS finality
+    stall (``finalized`` frozen while the head climbs) because a single non-advance of ``finalized`` is
+    normal epoch lag; the tracker judges it across observations and upgrades a ``NOT_YET_FINAL_LIVE``
+    verdict to ``COUNTER_CHAIN_NOT_FINALIZING`` once the stall is sustained (``decide()`` then routes
+    that to an earlier SQUEEZE page). Per-swap-id isolation: one swap's stall run never bleeds into
+    another's. ALERT-ONLY — the only effect is a sharper/earlier page; no broadcast, no autonomy. The
+    upgrade requires the ETH source to expose the optional ``finality_checkpoint()`` capability; a
+    source without it keeps the unchanged point-in-time fast path.
     """
 
     def __init__(
@@ -183,6 +202,10 @@ class ChainObserver(Observer):
         self._eth = eth
         self._rxd = rxd
         self._rxd_corroborated = rxd_corroborated
+        # Per-swap-id RF-06 finality-stall trackers (ETH only), created lazily on first observation of
+        # each swap. STATEFUL across ticks; isolated per swap_id so one stall run cannot bleed into
+        # another. Only consulted when the ETH source exposes finality_checkpoint() (see below).
+        self._eth_stall_trackers: dict[str, FinalityStallTracker] = {}
 
     async def observe(self, swap_id: str, record: SwapRecord) -> Observations:
         tip = await self._rxd.tip_height()
@@ -199,7 +222,7 @@ class ChainObserver(Observer):
         low_corr = not self._rxd_corroborated
 
         if record.terms.counter_chain == "eth":
-            eth_detected, eth_finality = await self._observe_eth_claim(record)
+            eth_detected, eth_finality = await self._observe_eth_claim(swap_id, record)
             return Observations(
                 maker_has_claimed_btc=False,
                 now_rxd_height=tip,
@@ -235,11 +258,18 @@ class ChainObserver(Observer):
             low_corroboration=low_corr,
         )
 
-    async def _observe_eth_claim(self, record: SwapRecord) -> tuple[bool, CounterClaimState | None]:
+    async def _observe_eth_claim(self, swap_id: str, record: SwapRecord) -> tuple[bool, CounterClaimState | None]:
         """Detect the maker's ETH claim + its finalized-checkpoint verdict STATE. Returns
         ``(detected, finality_state)``. ``(False, None)`` when no ETH locator is present yet
         (pre-fund) or the contract is unclaimed; fails closed (raises) if no ETH source was injected
-        — the reconciler turns that into a decision-required page rather than a silent all-clear."""
+        — the reconciler turns that into a decision-required page rather than a silent all-clear.
+
+        A8 / RF-06 across-time stall: the point-in-time ``verdict`` is the fast path and unchanged;
+        when the source exposes the optional ``finality_checkpoint()`` capability, the per-``swap_id``
+        :class:`FinalityStallTracker` may UPGRADE a ``NOT_YET_FINAL_LIVE`` to
+        ``COUNTER_CHAIN_NOT_FINALIZING`` once a sustained stall is judged across ticks (a ``FINAL``
+        verdict is never touched; a single non-advance never trips). Alert-only — the only effect is
+        that ``decide()`` SQUEEZES earlier; nothing is broadcast."""
         if self._eth is None:
             raise ValidationError("ChainObserver has no EthChainSource for an ETH swap")
         locator = record.counterchain_locator
@@ -249,4 +279,25 @@ class ChainObserver(Observer):
         if not status.claimed or status.claim_tx_hash is None:
             return False, None
         verdict = await self._eth.claim_finality_verdict(status.claim_tx_hash)
+        verdict = await self._upgrade_eth_stall(swap_id, verdict)
         return True, verdict.state
+
+    async def _upgrade_eth_stall(self, swap_id: str, verdict: CounterClaimFinality) -> CounterClaimFinality:
+        """Feed the per-``swap_id`` :class:`FinalityStallTracker` this tick's ``(head, finalized)`` and
+        return the (possibly upgraded) verdict. A ``FINAL`` verdict short-circuits BEFORE any chain
+        read — a final claim is final regardless of a counter-chain stall. The upgrade is skipped (the
+        point-in-time verdict returned unchanged) when the ETH source does not expose the optional
+        ``finality_checkpoint()`` capability, so a minimal source keeps the unchanged fast path and a
+        missing checkpoint never INVENTS a stall. The tracker itself only ever upgrades
+        ``NOT_YET_FINAL_LIVE`` and resets on a fresh ``finalized`` (live again)."""
+        if verdict.state is CounterClaimState.FINAL:
+            return verdict
+        checkpoint = getattr(self._eth, "finality_checkpoint", None)
+        if checkpoint is None:
+            return verdict  # point-in-time-only source: no across-time judgment available
+        head_block, finalized_block = await checkpoint()
+        tracker = self._eth_stall_trackers.get(swap_id)
+        if tracker is None:
+            tracker = FinalityStallTracker()
+            self._eth_stall_trackers[swap_id] = tracker
+        return tracker.verdict(verdict, head_block=head_block, finalized_block=finalized_block)

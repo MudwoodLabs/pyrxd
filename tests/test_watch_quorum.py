@@ -357,3 +357,120 @@ def test_eth_claim_status_claimed_requires_hash():
     # The dead-branch invariant the observer relies on: a claimed status MUST carry the tx hash.
     with pytest.raises(ValidationError):
         EthClaimStatus(claimed=True)
+
+
+# --- A8 / RF-06: across-time finality-stall wiring into the ETH observer path ----------------------
+
+
+class FakeStallEth:
+    """An ETH source whose point-in-time verdict is always NOT_YET_FINAL_LIVE and that exposes the
+    optional ``finality_checkpoint()`` capability so the observer's per-swap FinalityStallTracker can
+    judge a stall across ticks. The test drives ``(head, finalized)`` between observations to simulate
+    a frozen ``finalized`` (a stall) or a healthy one (advancing)."""
+
+    def __init__(self) -> None:
+        self.head = 5_000
+        self.finalized = 4_900  # initial gap 100 (> 96 normal-lag), well under FINAL
+        self.checkpoint_calls = 0
+
+    async def claim_status(self, contract_address, deploy_tx_hash):
+        return EthClaimStatus(claimed=True, claim_tx_hash="0x" + "12" * 32)
+
+    async def claim_finality_verdict(self, claim_tx_hash):
+        # Point-in-time always "live, not yet final" — the stall is an ACROSS-TIME judgment only.
+        return CounterClaimFinality(state=CounterClaimState.NOT_YET_FINAL_LIVE)
+
+    async def finality_checkpoint(self):
+        self.checkpoint_calls += 1
+        return self.head, self.finalized
+
+
+async def test_eth_sustained_finality_stall_upgrades_to_not_finalizing_and_squeezes():
+    # A SUSTAINED stall (finalized frozen while the head climbs past the tracker's patience window
+    # with a wide gap) must upgrade NOT_YET_FINAL_LIVE -> COUNTER_CHAIN_NOT_FINALIZING across ticks,
+    # which decide() then SQUEEZES even with an ample t_rxd window (RF-06). One observer instance is
+    # reused across ticks (the per-swap tracker is its state).
+    eth = FakeStallEth()
+    observer = ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51))
+    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+
+    # Tick 1: establishes the frozen-finalized run; not yet a stall.
+    obs = await observer.observe("swap-A", rec)
+    assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
+    assert decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6).intent is Intent.WATCH
+
+    # The head climbs PAST the patience window (>128 slots) while finalized stays frozen → stall.
+    eth.head = 5_000 + 130  # gap now 230 (> 96) AND head progress 130 (>= 128)
+    obs = await observer.observe("swap-A", rec)
+    assert obs.eth_claim_finality is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING
+    d = decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6)
+    assert d.intent is Intent.PAGE_SQUEEZED  # earlier/sharper page, never WAITed out
+
+
+async def test_eth_single_non_advance_does_not_trip_the_stall():
+    # A single tick's non-advance of finalized is NORMAL epoch lag — it must NOT upgrade the verdict.
+    eth = FakeStallEth()
+    observer = ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51))
+    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+
+    obs = await observer.observe("swap-A", rec)  # establish the run
+    assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
+    eth.head = 5_000 + 50  # only 50 slots of head progress (< 128 patience) → no stall yet
+    obs = await observer.observe("swap-A", rec)
+    assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
+    assert decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6).intent is Intent.WATCH
+
+
+async def test_eth_stall_tracker_is_per_swap_id_isolated():
+    # Two swaps share one observer; a sustained stall on swap-A must NOT contaminate swap-B, whose own
+    # finalized is advancing healthily. Per-swap-id tracker state is the isolation boundary.
+    eth = FakeStallEth()
+    observer = ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51))
+    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+
+    # swap-A: drive it into a sustained stall (two ticks, finalized frozen, head past patience).
+    await observer.observe("swap-A", rec)
+    eth.head = 5_000 + 130
+    obs_a = await observer.observe("swap-A", rec)
+    assert obs_a.eth_claim_finality is CounterClaimState.COUNTER_CHAIN_NOT_FINALIZING
+
+    # swap-B is observed for the FIRST time at the SAME stalled checkpoint reading. Because its tracker
+    # is fresh, this is just the run-establishing sample → NOT a stall (no cross-contamination from A).
+    obs_b = await observer.observe("swap-B", rec)
+    assert obs_b.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
+
+    # And swap-B with a healthy ADVANCING finalized never trips, even as the head keeps climbing.
+    eth.finalized = 5_000  # finalized jumped forward → live again for B's next sample
+    eth.head = 5_000 + 200
+    obs_b = await observer.observe("swap-B", rec)
+    assert obs_b.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
+
+
+async def test_eth_final_verdict_unaffected_by_stall_and_skips_checkpoint_read():
+    # A FINAL point-in-time verdict is final regardless of any counter-chain stall — the observer must
+    # return it unchanged AND short-circuit before reading the checkpoint (a final claim needs none).
+    class FinalThenCheckpoint(FakeStallEth):
+        async def claim_finality_verdict(self, claim_tx_hash):
+            return CounterClaimFinality(state=CounterClaimState.FINAL)
+
+    eth = FinalThenCheckpoint()
+    observer = ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51))
+    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    obs = await observer.observe("swap-A", rec)
+    assert obs.eth_claim_finality is CounterClaimState.FINAL
+    assert eth.checkpoint_calls == 0  # FINAL short-circuits before the checkpoint read
+
+
+async def test_eth_point_in_time_only_source_without_checkpoint_keeps_fast_path():
+    # A minimal EthChainSource WITHOUT the optional finality_checkpoint() capability is still valid:
+    # the observer keeps the unchanged point-in-time verdict (a missing checkpoint never invents a
+    # stall). FakeEth (above) has no finality_checkpoint method.
+    eth = FakeEth(
+        EthClaimStatus(claimed=True, claim_tx_hash="0x" + "12" * 32), finality=CounterClaimState.NOT_YET_FINAL_LIVE
+    )
+    assert not hasattr(eth, "finality_checkpoint")  # capability genuinely absent
+    observer = ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51))
+    rec = _eth_record(state=SwapState.SECRET_REVEALED)
+    for _ in range(5):  # many ticks, still no stall judgment available → stays the point-in-time state
+        obs = await observer.observe("swap-A", rec)
+        assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
