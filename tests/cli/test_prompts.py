@@ -74,13 +74,26 @@ class TestShowMnemonic:
         # No assertion needed — passing this test means no deadlock.
         # CliRunner-based wallet_new tests cover the actual rendered output.
 
+    def test_shows_clipboard_hygiene_warning_after_enter(self) -> None:
+        """After the Enter gate, a clipboard-hygiene caution must print
+        (threat model S3, issue #11). Clipboard managers retain copy
+        history, so a copied mnemonic can outlive the session.
+        """
+        ctx = _ctx(output_mode="human")
+        out = _capture_output(lambda: show_mnemonic(["abandon"] * 6, ctx=ctx), input="\n")
+        assert "Clipboard caution" in out
+        assert "clear your clipboard" in out
+
     def test_json_mode_skips_mnemonic_display(self) -> None:
         """In JSON mode, show_mnemonic must not print the box (caller
         handles the JSON mnemonic emission directly).
         """
         ctx = _ctx(output_mode="json")
-        _run_in_click_ctx(lambda: show_mnemonic(["one", "two"], ctx=ctx))
-        # No assertion needed — the function must not block on Enter.
+        out = _capture_output(lambda: show_mnemonic(["one", "two"], ctx=ctx))
+        # Neither the mnemonic box nor the clipboard caution may print —
+        # JSON consumers must not get human-readable chrome on stdout.
+        assert "Clipboard caution" not in out
+        assert "Recovery mnemonic" not in out
 
 
 # ---------------------------------------------------------------------------
@@ -103,3 +116,17 @@ def _run_in_click_ctx(fn, *, input: str | None = None):
     if invoke_result.exception is not None and not isinstance(invoke_result.exception, SystemExit):
         raise invoke_result.exception
     return getattr(_wrapper, "result", None)
+
+
+def _capture_output(fn, *, input: str | None = None) -> str:
+    """Run *fn* under a click runtime and return everything it wrote to stdout."""
+    runner = click.testing.CliRunner()
+
+    @click.command()
+    def _wrapper() -> None:
+        fn()
+
+    invoke_result = runner.invoke(_wrapper, input=input)
+    if invoke_result.exception is not None and not isinstance(invoke_result.exception, SystemExit):
+        raise invoke_result.exception
+    return invoke_result.output

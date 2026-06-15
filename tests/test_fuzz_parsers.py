@@ -32,6 +32,21 @@ Targets:
        — fixed-shape ref decoders
     8. round-trip: ``build_mutable_scriptsig`` →
        ``_parse_reveal_scriptsig`` recovers the embedded CBOR
+    9. ``glyph.script`` classifiers + extractors
+       — ``is_{nft,ft,commit,commit_nft,commit_ft}_script`` (hex),
+       ``is_dmint_contract_script`` (bytes),
+       ``extract_ref_from_{nft,ft}_script``,
+       ``extract_owner_pkh_from_{nft,ft,commit}_script``,
+       ``extract_payload_hash_from_commit_script``,
+       ``parse_mutable_nft_script``
+   10. ``glyph.script`` opcode-ref walkers
+       — ``iter_input_refs`` / ``count_input_refs`` (raise only
+       ``TruncatedScriptError``, a ``ValidationError`` subclass) and
+       ``is_token_bearing_script`` (never raises; returns ``bool``)
+   11. ``Transaction.from_hex`` — the ElectrumX/explorer tx decoder;
+       suppresses all internal failures, so the contract is "returns
+       ``None`` or a ``Transaction`` whose ``.serialize()`` round-trips,
+       never raises".
 """
 
 from __future__ import annotations
@@ -44,10 +59,29 @@ from hypothesis import strategies as st
 
 from pyrxd.glyph._inspect_core import _classify_input, _inspect_script
 from pyrxd.glyph.dmint import DmintState
+from pyrxd.glyph.dmint.chain import is_token_bearing_script
 from pyrxd.glyph.inspector import GlyphInspector
 from pyrxd.glyph.payload import build_mutable_scriptsig, decode_payload
+from pyrxd.glyph.script import (
+    count_input_refs,
+    extract_owner_pkh_from_commit_script,
+    extract_owner_pkh_from_ft_script,
+    extract_owner_pkh_from_nft_script,
+    extract_payload_hash_from_commit_script,
+    extract_ref_from_ft_script,
+    extract_ref_from_nft_script,
+    is_commit_ft_script,
+    is_commit_nft_script,
+    is_commit_script,
+    is_dmint_contract_script,
+    is_ft_script,
+    is_nft_script,
+    iter_input_refs,
+    parse_mutable_nft_script,
+)
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.security.errors import ValidationError
+from pyrxd.transaction.transaction import Transaction
 
 # Fuzz budget multiplier. CI default is 1; scripts/fuzz_deep.sh sets
 # HYPOTHESIS_PROFILE=deep which (combined with FUZZ_BUDGET_MULTIPLIER) scales
@@ -404,3 +438,232 @@ def test_build_mutable_scriptsig_roundtrip_extracts_cbor(
         inspector.extract_reveal_metadata(scriptsig)
     except Exception as exc:
         _fail_unexpected("extract_reveal_metadata (round-trip)", exc, scriptsig)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 9. glyph.script classifiers + extractors
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# These consume a locking script straight off a block explorer / ElectrumX
+# response. The hex classifiers (``is_*_script``) take an attacker-supplied
+# *string* and must answer ``bool`` without ever raising. The extractors take
+# raw *bytes* and must either return the structured field or raise
+# ``ValidationError`` — a leaked ``IndexError`` from a fixed-offset slice or a
+# ``ValueError`` from ``bytes.fromhex`` would be the parser leaking its internal
+# failure past the trust boundary.
+
+# Hex-string classifiers: random hex (well-formed and not) plus the all-byte
+# space via ``.hex()`` so the fuzzer reaches both the regex fast-path and the
+# ``.lower()`` normaliser.
+_HEX_CLASSIFIERS = [is_nft_script, is_ft_script, is_commit_script, is_commit_nft_script, is_commit_ft_script]
+
+
+@given(
+    s=st.one_of(
+        st.text(alphabet="0123456789abcdefABCDEF", min_size=0, max_size=200),
+        st.text(min_size=0, max_size=120),  # arbitrary unicode, incl. non-hex
+        st.binary(min_size=0, max_size=100).map(lambda b: b.hex()),
+    )
+)
+@settings(max_examples=_budget(400), suppress_health_check=[HealthCheck.too_slow])
+def test_hex_script_classifiers_only_return_bool(s):
+    """Every ``is_*_script`` hex classifier must answer ``bool`` for any
+    string — well-formed hex, mixed case, unicode, or empty — and never
+    raise. They are pure ``re.fullmatch`` predicates; a raised exception
+    would mean a malformed paste aborts inspection instead of being
+    classified ``unknown``."""
+    for fn in _HEX_CLASSIFIERS:
+        try:
+            result = fn(s)
+        except Exception as exc:
+            _fail_unexpected(f"{fn.__name__}", exc, s)
+            return
+        assert isinstance(result, bool)
+
+
+@given(data=st.binary(min_size=0, max_size=256))
+@settings(max_examples=_budget(300), suppress_health_check=[HealthCheck.too_slow])
+def test_is_dmint_contract_script_only_returns_bool(data):
+    """``is_dmint_contract_script`` wraps ``DmintState.from_script`` and is
+    documented to catch ``(ValidationError, struct.error, IndexError)`` and
+    answer ``bool``. Any *other* exception leaking is a real bug — that's the
+    defense-in-depth contract this fuzz pins down."""
+    try:
+        result = is_dmint_contract_script(data)
+    except Exception as exc:
+        _fail_unexpected("is_dmint_contract_script", exc, data)
+        return
+    assert isinstance(result, bool)
+
+
+# Byte extractors. Bias the strategy so some inputs land on the exact lengths
+# (63 for NFT, 75 for FT/commit) the parsers care about — otherwise nearly
+# every random input bails on the length check and the fixed-offset slicing /
+# ``Hex20`` / ``GlyphRef.from_bytes`` paths stay uncovered.
+_extractor_bytes = st.one_of(
+    st.binary(min_size=0, max_size=128),
+    st.binary(min_size=63, max_size=63),
+    st.binary(min_size=75, max_size=75),
+    # Valid-prefix NFT (0xd8) / FT (…bdd0…) leads so deeper slices run.
+    st.builds(lambda tail: b"\xd8" + tail, st.binary(min_size=62, max_size=62)),
+    st.builds(
+        lambda a, b: a + b"\xbd\xd0" + b,
+        st.binary(min_size=25, max_size=25),
+        st.binary(min_size=48, max_size=48),
+    ),
+)
+
+
+@given(data=_extractor_bytes)
+@settings(max_examples=_budget(400), suppress_health_check=[HealthCheck.too_slow])
+def test_script_byte_extractors_only_validation_error(data):
+    """Every fixed-offset extractor must return its field or raise
+    ``ValidationError`` — never an ``IndexError`` from a slice past the end,
+    a ``struct.error`` from a downstream decode, or a ``ValueError`` from
+    ``Hex20`` / ``GlyphRef`` on adversarial bytes."""
+    extractors = (
+        extract_ref_from_nft_script,
+        extract_ref_from_ft_script,
+        extract_owner_pkh_from_nft_script,
+        extract_owner_pkh_from_ft_script,
+        extract_payload_hash_from_commit_script,
+        extract_owner_pkh_from_commit_script,
+    )
+    for fn in extractors:
+        try:
+            fn(data)
+        except ValidationError:
+            # expected: parser rejected a non-matching script at the boundary
+            pass
+        except Exception as exc:
+            _fail_unexpected(f"{fn.__name__}", exc, data)
+            return
+
+
+@given(data=st.binary(min_size=0, max_size=300))
+@settings(max_examples=_budget(300), suppress_health_check=[HealthCheck.too_slow])
+def test_parse_mutable_nft_script_never_raises(data):
+    """``parse_mutable_nft_script`` is documented to return ``(ref, hash)`` or
+    ``None``. It guards on the fixed script size before the only inner decode
+    (``GlyphRef.from_bytes`` on an exactly-36-byte slice), so it must never
+    raise on arbitrary bytes."""
+    try:
+        result = parse_mutable_nft_script(data)
+    except Exception as exc:
+        _fail_unexpected("parse_mutable_nft_script", exc, data)
+        return
+    assert result is None or (isinstance(result, tuple) and len(result) == 2 and isinstance(result[0], GlyphRef))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 10. glyph.script opcode-ref walkers
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# ``iter_input_refs`` / ``count_input_refs`` walk an opcode stream looking for
+# the OP_PUSHINPUTREF family (0xd0..0xd8), each followed by a 36-byte operand.
+# A truncated push must surface as ``TruncatedScriptError`` (a ``ValidationError``
+# subclass) — never a bare ``IndexError`` from slicing past the end.
+# ``is_token_bearing_script`` swallows that internally and answers ``bool``.
+
+# Bias toward inputs that actually contain ref opcodes / push prefixes so the
+# walker's deeper truncation branches get exercised, not just the bail-on-byte-0
+# path. ``0x4c/0x4d/0x4e`` are PUSHDATA1/2/4 length prefixes.
+_refish_byte = st.sampled_from([0xD0, 0xD4, 0xD8, 0x4C, 0x4D, 0x4E, 0x14, 0x00, 0xFF])
+
+
+@given(
+    data=st.one_of(
+        st.binary(min_size=0, max_size=300),
+        st.lists(_refish_byte, min_size=0, max_size=80).map(bytes),
+    )
+)
+@settings(max_examples=_budget(500), suppress_health_check=[HealthCheck.too_slow])
+def test_iter_input_refs_only_validation_error(data):
+    """Walking arbitrary bytes must yield ``(opcode, 36-byte operand)`` tuples
+    or raise ``TruncatedScriptError``/``ValidationError`` — never an
+    ``IndexError`` / ``struct.error`` from an unguarded slice."""
+    try:
+        for op, operand in iter_input_refs(data):
+            assert isinstance(op, int)
+            assert isinstance(operand, (bytes, bytearray)) and len(operand) == 36
+    except ValidationError:
+        # TruncatedScriptError is a ValidationError subclass — expected.
+        pass
+    except Exception as exc:
+        _fail_unexpected("iter_input_refs", exc, data)
+
+
+@given(
+    data=st.one_of(
+        st.binary(min_size=0, max_size=300),
+        st.lists(_refish_byte, min_size=0, max_size=80).map(bytes),
+    )
+)
+@settings(max_examples=_budget(300), suppress_health_check=[HealthCheck.too_slow])
+def test_count_input_refs_only_validation_error(data):
+    """``count_input_refs`` aggregates the walker; same contract — a clean
+    ``dict`` of ref→count or a ``ValidationError``, nothing else."""
+    try:
+        result = count_input_refs(data)
+    except ValidationError:
+        pass
+    except Exception as exc:
+        _fail_unexpected("count_input_refs", exc, data)
+        return
+    else:
+        assert isinstance(result, dict)
+
+
+@given(
+    data=st.one_of(
+        st.binary(min_size=0, max_size=300),
+        st.lists(_refish_byte, min_size=0, max_size=80).map(bytes),
+    )
+)
+@settings(max_examples=_budget(300), suppress_health_check=[HealthCheck.too_slow])
+def test_is_token_bearing_script_never_raises(data):
+    """``is_token_bearing_script`` must answer ``bool`` for any bytes — it
+    catches ``TruncatedScriptError`` internally and treats a malformed script
+    as token-bearing (fail-closed). A leaked exception is a bug."""
+    try:
+        result = is_token_bearing_script(data)
+    except Exception as exc:
+        _fail_unexpected("is_token_bearing_script", exc, data)
+        return
+    assert isinstance(result, bool)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 11. Transaction.from_hex — ElectrumX / explorer raw-tx decoder
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# This is the parser that consumes a raw transaction supplied by an ElectrumX
+# server or pasted from a block explorer. It suppresses every internal failure
+# (``contextlib.suppress(Exception)``), so its boundary contract is: return
+# ``None`` or a ``Transaction`` — and if a ``Transaction``, ``.serialize()``
+# must not crash. ``test_property_based.py`` round-trips *valid* txs through it;
+# this fills the gap for *adversarial* bytes/hex it has never seen.
+
+
+@given(
+    stream=st.one_of(
+        st.binary(min_size=0, max_size=1024),
+        st.text(alphabet="0123456789abcdef", min_size=0, max_size=512).filter(lambda s: len(s) % 2 == 0),
+        st.text(min_size=0, max_size=200),  # arbitrary unicode / non-hex
+    )
+)
+@settings(max_examples=_budget(500), suppress_health_check=[HealthCheck.too_slow])
+def test_transaction_from_hex_never_raises(stream):
+    """``Transaction.from_hex`` must absorb every malformed input and return
+    ``None`` rather than leak an exception, and any ``Transaction`` it does
+    return must re-serialize without crashing."""
+    try:
+        tx = Transaction.from_hex(stream)
+    except Exception as exc:
+        _fail_unexpected("Transaction.from_hex", exc, stream)
+        return
+    if tx is not None:
+        try:
+            tx.serialize()
+        except Exception as exc:
+            _fail_unexpected("Transaction.from_hex(...).serialize()", exc, stream)
