@@ -11,6 +11,7 @@ recover-funds-across-wallet-paths
 use-the-public-testnet
 issue-a-dmint-token
 build-a-cross-chain-swap
+run-a-two-host-swap-dry-run
 migrate-0.4-to-0.5
 verify-an-spv-proof
 spv-verification-pitfalls
@@ -41,6 +42,11 @@ spv-verification-pitfalls
   trustless BTC/ETH ↔ RXD HTLC swap: the role/timelock safety invariant, the
   `SwapCoordinator` + legs surface, and the proven regtest/Anvil harnesses to copy
   from. Pre-audit — regtest/testnet only, no real value.
+- **[Run a two-host swap dry-run](run-a-two-host-swap-dry-run.md)** — split the
+  single-process ETH↔RXD swap across two operators on two hosts, each holding only
+  their own keys and exchanging only the public negotiation envelope out-of-band: the
+  first real exercise of untrusted-counterparty verification. The prep for a genuine
+  two-party adversarial run. Pre-audit — regtest/testnet only, no real value.
 - **[Migrate from pyrxd 0.4.x to 0.5.0](migrate-0.4-to-0.5.md)** — three
   breaking signature changes on the V1 dMint mint path, with
   before/after snippets. Read this first if you upgraded from a 0.4.x
