@@ -381,27 +381,27 @@ Honest list. These are not vulnerabilities; they're places where pyrxd's defense
 
 ### CLI
 
-8. **Broadcast summary doesn't show resolved `owner_pkh` from metadata files.** S7 residual risk. **Should be addressed before v0.3.0 release.**
-9. **No clipboard hygiene warning.** S3 residual risk. [Issue #11.](https://github.com/MudwoodLabs/pyrxd/issues/11)
-10. **Mnemonic re-entry per command** is mitigated by the optional `pyrxd agent` (issue #8, Path A′): a sign-on-behalf daemon holds the wallet for an unlock window so the mnemonic is typed once, and the key is removed from the short-lived CLI process entirely (the daemon signs). Residual: while unlocked, a same-uid process can *request* signatures — gated by per-spend confirmation (S18), never by taking the key. The agent is **opt-in**; with it off, the per-command prompt (and its S2/S3 residual risk) remains the default. The agent has not had a third-party audit (gap #1 applies).
+9. **Broadcast summary doesn't show resolved `owner_pkh` from metadata files.** S7 residual risk. **Should be addressed before v0.3.0 release.**
+10. **No clipboard hygiene warning.** S3 residual risk. [Issue #11.](https://github.com/MudwoodLabs/pyrxd/issues/11)
+11. **Mnemonic re-entry per command** is mitigated by the optional `pyrxd agent` (issue #8, Path A′): a sign-on-behalf daemon holds the wallet for an unlock window so the mnemonic is typed once, and the key is removed from the short-lived CLI process entirely (the daemon signs). Residual: while unlocked, a same-uid process can *request* signatures — gated by per-spend confirmation (S18), never by taking the key. The agent is **opt-in**; with it off, the per-command prompt (and its S2/S3 residual risk) remains the default. The agent has not had a third-party audit (gap #1 applies).
 
 ### Protocol
 
-11. **Gravity covenant variants flagged "still being hardened"** in README. TA8 is the highest-stakes attacker; this is the highest-priority audit target.
-12. **dMint V1 deploy + PoW mint: now regtest-consensus-validated.** The earlier "documented but not implemented" wording was stale — the builders + reference miner shipped; the real gap was node validation. `tests/test_dmint_v1_regtest_e2e.py` proves on a real `radiant-core` node that a pyrxd-built V1 deploy (commit→reveal genesis) and a PoW-mined mint are accepted, a wrong nonce is rejected, and the contract recreates at height+1. Surfaced a consensus requirement the golden vectors missed: V1 contracts MUST be 1-photon singletons (covenant enforces `OP_OUTPUTVALUE==1`); `build_dmint_mint_tx` now rejects non-1 carriers early. Residual: V2 contracts remain unvalidated (`V2UnvalidatedWarning`); no CLI verb exposes deploy/mint yet.
-13. **No multi-signature support.** Single-sig only; users wanting m-of-n must build it themselves.
+12. **Gravity covenant variants flagged "still being hardened"** in README. TA8 is the highest-stakes attacker; this is the highest-priority audit target.
+13. **dMint V1 deploy + PoW mint: now regtest-consensus-validated.** The earlier "documented but not implemented" wording was stale — the builders + reference miner shipped; the real gap was node validation. `tests/test_dmint_v1_regtest_e2e.py` proves on a real `radiant-core` node that a pyrxd-built V1 deploy (commit→reveal genesis) and a PoW-mined mint are accepted, a wrong nonce is rejected, and the contract recreates at height+1. Surfaced a consensus requirement the golden vectors missed: V1 contracts MUST be 1-photon singletons (covenant enforces `OP_OUTPUTVALUE==1`); `build_dmint_mint_tx` now rejects non-1 carriers early. Residual: V2 contracts remain unvalidated (`V2UnvalidatedWarning`); no CLI verb exposes deploy/mint yet.
+14. **No multi-signature support.** Single-sig only; users wanting m-of-n must build it themselves.
 
 ### Supply chain
 
-14. **No pinned transitive dependency hashes.** A compromised release of `coincurve`, `Cryptodome`, etc. would propagate. `pip-audit` catches known CVEs but not zero-days. (Deliberate for a *library* — pinning transitive hashes over-constrains downstreams.)
-15. **SBOM now generated.** Each GitHub Release attaches a CycloneDX SBOM (`pyrxd-<version>.cdx.json`) built from the resolved dependency tree by the publish workflow (`.github/workflows/publish.yml`).
-16. **Release artifacts now carry PEP 740 attestations.** PyPI 2FA + OIDC Trusted Publishing are on, and the publish action emits per-artifact Sigstore digital attestations (verifiable on the PyPI project page). A gpg-signed git tag / GitHub Release signature is still optional and not set up.
+15. **No pinned transitive dependency hashes.** A compromised release of `coincurve`, `Cryptodome`, etc. would propagate. `pip-audit` catches known CVEs but not zero-days. (Deliberate for a *library* — pinning transitive hashes over-constrains downstreams.)
+16. **SBOM now generated.** Each GitHub Release attaches a CycloneDX SBOM (`pyrxd-<version>.cdx.json`) built from the resolved dependency tree by the publish workflow (`.github/workflows/publish.yml`).
+17. **Release artifacts now carry PEP 740 attestations.** PyPI 2FA + OIDC Trusted Publishing are on, and the publish action emits per-artifact Sigstore digital attestations (verifiable on the PyPI project page). A gpg-signed git tag / GitHub Release signature is still optional and not set up.
 
 ### Process
 
-17. **Incident-response runbook now exists.** [`docs/runbooks/incident-response.md`](runbooks/incident-response.md) documents the triage → fix-branch → GitHub Security Advisory / CVE → release → notify flow for a report to `security@mudwoodlabs.com`.
-18. ~~No coordinated-disclosure SLA.~~ **Resolved:** [`SECURITY.md`](../SECURITY.md) states the SLA — acknowledge within 2 business days, initial assessment within 7, coordinated disclosure typically within 90 (Project Zero norms).
-19. **No external eyes.** Solo developer; nothing has been reviewed by anyone else. The standing hard gate before any real-value mainnet use.
+18. **Incident-response runbook now exists.** [`docs/runbooks/incident-response.md`](runbooks/incident-response.md) documents the triage → fix-branch → GitHub Security Advisory / CVE → release → notify flow for a report to `security@mudwoodlabs.com`.
+19. ~~No coordinated-disclosure SLA.~~ **Resolved:** [`SECURITY.md`](../SECURITY.md) states the SLA — acknowledge within 2 business days, initial assessment within 7, coordinated disclosure typically within 90 (Project Zero norms).
+20. **No external eyes.** Solo developer; nothing has been reviewed by anyone else. The standing hard gate before any real-value mainnet use.
 
 ## Out of scope (explicit non-coverage)
 
@@ -419,6 +419,11 @@ We do not protect against:
 
 ## For auditors and security researchers
 
+> A consolidated [**security audit scoping brief**](security-audit-scope.md) pulls the in-scope
+> module map, the load-bearing assumptions, the pre-audit fail-closed gates, and the **complete
+> stable-ID residual register** (this doc's scenarios *plus* the design-note and in-code residuals)
+> into one place — start there for a commissioned audit.
+
 If you have time and skill to look at pyrxd, here's where to start, ranked by expected return on investigation:
 
 1. **Gravity covenant code** (`src/pyrxd/gravity/`) — highest stakes, most complex protocol code. Review focus: SPV proof construction, covenant param validation, sighash flag handling, edge cases in `tests/test_gravity_red_team.py` that document known concerns.
@@ -435,6 +440,7 @@ If you find something, please report privately to `security@mudwoodlabs.com`. We
 
 ## Revision history
 
+- **2026-06-15** — fixed the duplicate gap-`#8` numbering: the "Known gaps" list now runs `1–20` uniquely (the CLI `owner_pkh` gap moved `8→9` and the tail shifted `+1`). Added the consolidated [security audit scoping brief](security-audit-scope.md) (stable residual IDs across this doc, the design notes, and in-code residuals).
 - **2026-05-01** v1.0 — initial threat model. Documents v0.3 surface (library + CLI + glyph commands).
 
 Future revisions should bump the version, add an entry, and call out which sections changed.
