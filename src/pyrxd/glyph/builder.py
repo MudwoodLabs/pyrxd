@@ -455,61 +455,70 @@ class GlyphBuilder:
         *,
         allow_v2_deploy: bool,
     ) -> DmintV2DeployResult:
-        """Original V2 deploy implementation, gated on ``allow_v2_deploy``."""
+        """Build the V2 deploy commit + placeholder contract scripts.
+
+        Mirrors :meth:`_prepare_dmint_v1_deploy` (commit + reveal that genesises
+        ``num_contracts`` parallel 1-photon V2 contract UTXOs at height 0,
+        ``contractRef[i] = commit:(i+1)`` / ``tokenRef = commit:0``), differing
+        only in the V2 contract bytecode. Gated on ``allow_v2_deploy``.
+        """
+        import warnings
+
+        from .dmint import V2UnvalidatedWarning
+
         if not allow_v2_deploy:
             raise DmintError(
                 "prepare_dmint_deploy with DmintV2DeployParams emits V2 dMint "
                 "contracts; no ecosystem miner (glyph-miner, etc.) targets V2 "
                 "and indexer behavior on V2 deploys is empirically unknown. "
-                "Refusing to build a token nobody can mine. For V1 (the only "
-                "live mainnet format), pass DmintV1DeployParams instead. To "
-                "deploy V2 anyway (e.g. SDK-internal testing), pass "
-                "allow_v2_deploy=True."
+                "Refusing by default. For V1 (the only live mainnet format), pass "
+                "DmintV1DeployParams instead. To deploy V2 anyway (e.g. SDK-internal "
+                "testing or regtest), pass allow_v2_deploy=True."
             )
-        # 1. Encode the token metadata payload.
+        if params.premine_amount is not None:
+            raise ValidationError(
+                "V2 deploy with premine is deferred work (mirrors V1). Set premine_amount=None for now."
+            )
+
+        # 1. Encode the CBOR token body and pin the FT+DMINT protocol shape.
         cbor_bytes, payload_hash = encode_payload(params.metadata)
+        decoded = cbor2.loads(cbor_bytes)
+        if "p" not in decoded or 1 not in decoded["p"] or 4 not in decoded["p"]:
+            raise ValidationError(
+                f"V2 dMint CBOR 'p' field must include both 1 (FT) and 4 (DMINT); got p={decoded.get('p')!r}"
+            )
 
-        # 2. Build commit script (FT shape — dMint tokens are FTs).
-        is_nft = GlyphProtocol.NFT in params.metadata.protocol
-        commit_script = build_commit_locking_script(
-            payload_hash,
-            params.owner_pkh,
-            is_nft=is_nft,
-        )
-        estimated_commit_fee = 276 * MIN_FEE_RATE
-
+        # 2. FT-commit hashlock (same 75-byte commit shape as V1).
+        commit_script = build_commit_locking_script(payload_hash, params.owner_pkh, is_nft=False)
         commit_result = CommitResult(
             commit_script=commit_script,
             cbor_bytes=cbor_bytes,
             payload_hash=payload_hash,
-            estimated_fee=estimated_commit_fee,
+            estimated_fee=276 * MIN_FEE_RATE,
         )
 
-        # 3. Build the reveal scripts (token ref UTXO — 75-byte FT locking script).
-        if params.premine_amount is not None and params.premine_amount < 546:
-            raise ValidationError(f"premine_amount ({params.premine_amount}) is below the dust limit (546).")
-
-        # 4. Build the deploy contract script.
-        deploy_params_template = DmintDeployParams(
-            contract_ref=params.contract_ref_placeholder,
-            token_ref=params.token_ref_placeholder,
-            max_height=params.max_height,
-            reward=params.reward_photons,
-            difficulty=params.difficulty,
-            algo=params.algo,
-            daa_mode=params.daa_mode,
-            target_time=params.target_time,
-            half_life=params.half_life,
-        )
-
-        # Pre-build with placeholder refs so the caller can inspect the script shape.
-        placeholder_contract_script = build_dmint_contract_script(deploy_params_template)
-
-        # 5. Validate reward pool.
-        if params.initial_pool_photons < params.reward_photons:
-            raise ValidationError(
-                f"initial_pool_photons ({params.initial_pool_photons}) must be >= "
-                f"reward_photons ({params.reward_photons}) for at least one mint."
+        # 3. Pre-build placeholder V2 contract scripts (height=0) so the caller can
+        # estimate the reveal fee before the commit txid is known. Each is the full
+        # V2 layout; only the txid component of contractRef/tokenRef changes at reveal.
+        placeholder_txid = "00" * 32
+        placeholder_token_ref = GlyphRef(txid=placeholder_txid, vout=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", V2UnvalidatedWarning)
+            placeholder_contract_scripts = tuple(
+                build_dmint_contract_script(
+                    DmintDeployParams(
+                        contract_ref=GlyphRef(txid=placeholder_txid, vout=i + 1),
+                        token_ref=placeholder_token_ref,
+                        max_height=params.max_height,
+                        reward=params.reward_photons,
+                        difficulty=params.difficulty,
+                        algo=params.algo,
+                        daa_mode=params.daa_mode,
+                        target_time=params.target_time,
+                        half_life=params.half_life,
+                    )
+                )
+                for i in range(params.num_contracts)
             )
 
         return DmintV2DeployResult(
@@ -517,9 +526,16 @@ class GlyphBuilder:
             cbor_bytes=cbor_bytes,
             owner_pkh=params.owner_pkh,
             premine_amount=params.premine_amount,
-            deploy_params_template=deploy_params_template,
-            placeholder_contract_script=placeholder_contract_script,
-            initial_pool_photons=params.initial_pool_photons,
+            num_contracts=params.num_contracts,
+            placeholder_contract_scripts=placeholder_contract_scripts,
+            max_height=params.max_height,
+            reward_photons=params.reward_photons,
+            difficulty=params.difficulty,
+            algo=params.algo,
+            op_return_msg=params.op_return_msg,
+            daa_mode=params.daa_mode,
+            target_time=params.target_time,
+            half_life=params.half_life,
         )
 
     # ------------------------------------------------------------------
@@ -925,55 +941,69 @@ class DmintV1DeployParams:
 
 @dataclass
 class DmintV2DeployParams:
-    """Parameters for a V2 dMint token deploy (commit + reveal + deploy).
+    """Parameters for a V2 dMint token deploy (2-tx: commit + reveal).
 
-    V2 has no live mainnet deploys; only `prepare_dmint_deploy(..., allow_v2_deploy=True)`
-    will accept it. The ecosystem (glyph-miner, RXinDexer) targets V1 only.
+    Mirrors :class:`DmintV1DeployParams`. V2 emits ``num_contracts`` parallel
+    **1-photon singleton** contract UTXOs directly in the reveal —
+    ``contractRef[i] = commit:(i+1)``, ``tokenRef = commit:0`` — exactly like V1.
+    The only consensus differences are the V2 contract bytecode (10-item state +
+    the V2 covenant) and the 8-byte mint nonce; the reward + tx fee for each mint
+    come from a miner-supplied funding input, not a pool.
 
-    :param metadata:                  :class:`GlyphMetadata` for the token
-                                      (must include ``GlyphProtocol.FT`` and
-                                      ``GlyphProtocol.DMINT`` in protocol).
-    :param owner_pkh:                 20-byte PKH of the key that signs commit/reveal.
-    :param max_height:                Maximum number of mints (total supply units).
-    :param reward_photons:            Photons paid to the miner per mint.
-    :param difficulty:                Initial PoW difficulty (1 = easiest).
-    :param initial_pool_photons:      Photons to lock in the contract UTXO as the
-                                      reward pool.  Must be >= ``reward_photons``.
-    :param premine_amount:            Photons to send to ``owner_pkh`` on the
-                                      reveal tx as an optional premine output.
-                                      ``None`` = no premine output.
-    :param contract_ref_placeholder:  Placeholder :class:`GlyphRef` used to
-                                      pre-build the contract script.  The caller
-                                      substitutes the real contract outpoint
-                                      (deploy tx outpoint) before broadcast.
-    :param token_ref_placeholder:     Placeholder :class:`GlyphRef` for the
-                                      token ref.  Substituted with the reveal
-                                      tx outpoint before broadcast.
-    :param algo:                      PoW algorithm (default SHA256d).
-    :param daa_mode:                  Difficulty adjustment algorithm (default FIXED).
-    :param target_time:               Target seconds between mints (DAA only).
-    :param half_life:                 ASERT half-life in seconds (DAA only).
+    Only ``DaaMode.FIXED`` is supported: the covenant's state-transition check
+    forbids advancing ``target``/``last_time``, so ASERT/LWMA contracts can never
+    adjust difficulty and are unmintable (see #219).
+
+    V2 has no live mainnet deploys; only ``prepare_dmint_deploy(..., allow_v2_deploy=True)``
+    accepts it, and construction emits ``V2UnvalidatedWarning``.
+
+    :param metadata:        :class:`GlyphMetadata` (must include ``GlyphProtocol.FT``
+        and ``GlyphProtocol.DMINT``; set ``version=2`` so indexers classify it as V2).
+    :param owner_pkh:       20-byte PKH of the key that signs commit + the
+        ref-seed reveal inputs.
+    :param num_contracts:   Count of parallel V2 contract UTXOs (``[1, 250]``).
+    :param max_height:      Maximum mints per contract.
+    :param reward_photons:  Photons paid per successful mint.
+    :param difficulty:      Initial PoW difficulty (1 = easiest).
+    :param premine_amount:  Deferred (mirrors V1) — must be ``None``.
+    :param op_return_msg:   Optional OP_RETURN data carrier (raw bytes after 0x6a).
+    :param algo:            PoW algorithm (default SHA256d; only SHA256D is mined).
+    :param daa_mode:        Must be ``DaaMode.FIXED`` (the only mintable mode).
+    :param target_time:     Echoed into the state (DAA-only; vestigial for FIXED).
+    :param half_life:       Echoed into the code (DAA-only; vestigial for FIXED).
     """
 
     metadata: GlyphMetadata
     owner_pkh: Hex20
+    num_contracts: int
     max_height: int
     reward_photons: int
     difficulty: int
-    initial_pool_photons: int
     premine_amount: int | None = None
-    contract_ref_placeholder: GlyphRef = None  # type: ignore[assignment]
-    token_ref_placeholder: GlyphRef = None  # type: ignore[assignment]
+    op_return_msg: bytes | None = None
     algo: DmintAlgo = DmintAlgo.SHA256D
     daa_mode: DaaMode = DaaMode.FIXED
     target_time: int = 60
     half_life: int = 3600
 
     def __post_init__(self) -> None:
-        if self.contract_ref_placeholder is None:
-            self.contract_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
-        if self.token_ref_placeholder is None:
-            self.token_ref_placeholder = GlyphRef(txid="00" * 32, vout=0)
+        if not (1 <= self.num_contracts <= 250):
+            raise ValidationError(
+                f"num_contracts must be in [1, 250], got {self.num_contracts} "
+                f"(250 is the standardness ceiling for the deploy reveal size)"
+            )
+        if self.max_height < 1:
+            raise ValidationError(f"max_height must be >= 1, got {self.max_height}")
+        if self.reward_photons < 1:
+            raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
+        if self.difficulty < 1:
+            raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
+        if self.daa_mode != DaaMode.FIXED:
+            raise ValidationError(
+                f"V2 dMint deploy supports only DaaMode.FIXED (got {self.daa_mode.name}); "
+                "the covenant's state-transition check forbids changing target/last_time, "
+                "so ASERT/LWMA contracts are unmintable. See #219."
+            )
         # V2 quarantine marker — see V2UnvalidatedWarning in pyrxd.glyph.dmint.
         # Subclasses suppress this (DmintFullDeployParams's deprecation warning
         # is the higher-priority signal there).
@@ -1168,88 +1198,94 @@ class DmintV1DeployResult:
 class DmintV2DeployResult:
     """Output of :meth:`GlyphBuilder.prepare_dmint_deploy` for V2 deploys.
 
-    :param commit_result:               :class:`CommitResult` — scripts + fee for the
-                                        commit tx (same as :meth:`prepare_commit` output).
-    :param cbor_bytes:                  Encoded CBOR payload (needed for reveal scriptSig).
-    :param owner_pkh:                   20-byte PKH of the deploy key.
-    :param premine_amount:              Photons for the premine output, or ``None``.
-    :param deploy_params_template:      :class:`DmintDeployParams` with placeholder refs —
-                                        substitute real refs then call
-                                        :func:`build_dmint_contract_script` to get the
-                                        final contract output script.
-    :param placeholder_contract_script: Pre-built contract script with placeholder refs —
-                                        shows the correct byte length for fee estimation.
-    :param initial_pool_photons:        Photons to lock in the deploy output (reward pool).
+    Mirrors :class:`DmintV1DeployResult`: V2 emits ``num_contracts`` parallel
+    1-photon singleton contract UTXOs directly in the reveal (no separate deploy
+    tx, no reward pool). Call :meth:`build_reveal_outputs` once the commit
+    confirms to get the reveal-tx output scripts.
+
+    :param commit_result:                 :class:`CommitResult` — commit-tx script + fee.
+    :param cbor_bytes:                    Encoded CBOR token body.
+    :param owner_pkh:                     20-byte PKH of the deploy key.
+    :param premine_amount:                Deferred — must be ``None`` (mirrors V1).
+    :param num_contracts:                 Count of parallel V2 contracts.
+    :param placeholder_contract_scripts:  Tuple of N V2 contract scripts built with the
+        placeholder commit txid (00…00) — same byte length as the final scripts, for
+        fee estimation before the commit txid is known.
+    :param max_height, reward_photons, difficulty, algo, op_return_msg, daa_mode,
+        target_time, half_life:  Echoed from params for :meth:`build_reveal_outputs`.
     """
 
     commit_result: CommitResult
     cbor_bytes: bytes
     owner_pkh: Hex20
     premine_amount: int | None
-    deploy_params_template: DmintDeployParams
-    placeholder_contract_script: bytes
-    initial_pool_photons: int
+    num_contracts: int
+    placeholder_contract_scripts: tuple[bytes, ...]
+    max_height: int
+    reward_photons: int
+    difficulty: int
+    algo: DmintAlgo
+    op_return_msg: bytes | None
+    daa_mode: DaaMode
+    target_time: int
+    half_life: int
 
-    def build_reveal_scripts(
-        self,
-        commit_txid: str,
-        commit_vout: int,
-        commit_value: int,
-    ) -> FtDeployRevealScripts | RevealScripts:
-        """Build reveal scripts given the confirmed commit outpoint.
+    def build_reveal_outputs(self, commit_txid: str) -> DmintV1RevealScripts:
+        """Build reveal-tx output scripts given the confirmed commit txid.
 
-        :param commit_txid:   txid of the confirmed commit tx.
-        :param commit_vout:   Output index of the commit UTXO.
-        :param commit_value:  Photon value of the commit output.
-        :returns: :class:`FtDeployRevealScripts` if ``premine_amount`` is set,
-                  otherwise :class:`RevealScripts`.
+        Mirrors :meth:`DmintV1DeployResult.build_reveal_outputs`: emits
+        ``num_contracts`` parallel 1-photon V2 contract UTXOs
+        (``contractRef[i] = commit:(i+1)``, ``tokenRef = commit:0``) + the
+        ``gly``/CBOR reveal scriptSig suffix + optional OP_RETURN. The returned
+        :class:`DmintV1RevealScripts` bag has the same shape for V1 and V2.
         """
-        builder = GlyphBuilder()
+        import warnings
+
+        from .dmint import V2UnvalidatedWarning
+
         if self.premine_amount is not None:
-            return builder.prepare_ft_deploy_reveal(
-                commit_txid=commit_txid,
-                commit_vout=commit_vout,
-                commit_value=commit_value,
-                cbor_bytes=self.cbor_bytes,
-                premine_pkh=self.owner_pkh,
-                premine_amount=self.premine_amount,
-            )
-        return builder.prepare_reveal(
-            RevealParams(
-                commit_txid=commit_txid,
-                commit_vout=commit_vout,
-                commit_value=commit_value,
-                cbor_bytes=self.cbor_bytes,
-                owner_pkh=self.owner_pkh,
-                is_nft=False,
-            )
-        )
+            raise NotImplementedError("V2 deploy with premine is deferred work. Set premine_amount=None.")
 
-    def build_contract_script(
-        self,
-        token_ref: GlyphRef,
-        contract_ref: GlyphRef,
-    ) -> bytes:
-        """Build the final contract output script with real outpoint refs.
+        token_ref = GlyphRef(txid=commit_txid, vout=0)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", V2UnvalidatedWarning)
+            contract_scripts = tuple(
+                build_dmint_contract_script(
+                    DmintDeployParams(
+                        contract_ref=GlyphRef(txid=commit_txid, vout=i + 1),
+                        token_ref=token_ref,
+                        max_height=self.max_height,
+                        reward=self.reward_photons,
+                        difficulty=self.difficulty,
+                        algo=self.algo,
+                        daa_mode=self.daa_mode,
+                        target_time=self.target_time,
+                        half_life=self.half_life,
+                    )
+                )
+                for i in range(self.num_contracts)
+            )
+        scriptsig_suffix = build_reveal_scriptsig_suffix(self.cbor_bytes)
 
-        :param token_ref:    :class:`GlyphRef` of the reveal tx outpoint
-                             (becomes the token ref in the contract state).
-        :param contract_ref: :class:`GlyphRef` of the deploy tx outpoint
-                             (becomes the contract ref in the contract state).
-        :returns: Full dMint contract output script bytes.
-        """
-        real_params = DmintDeployParams(
-            contract_ref=contract_ref,
-            token_ref=token_ref,
-            max_height=self.deploy_params_template.max_height,
-            reward=self.deploy_params_template.reward,
-            difficulty=self.deploy_params_template.difficulty,
-            algo=self.deploy_params_template.algo,
-            daa_mode=self.deploy_params_template.daa_mode,
-            target_time=self.deploy_params_template.target_time,
-            half_life=self.deploy_params_template.half_life,
+        op_return_script: bytes | None = None
+        if self.op_return_msg is not None:
+            msg = self.op_return_msg
+            if len(msg) <= 75:
+                op_return_script = bytes([0x6A, len(msg)]) + msg
+            elif len(msg) <= 255:
+                op_return_script = bytes([0x6A, 0x4C, len(msg)]) + msg
+            else:
+                raise ValidationError(f"op_return_msg too long: {len(msg)} bytes (cap at 255 for now)")
+
+        return DmintV1RevealScripts(
+            contract_scripts=contract_scripts,
+            contract_value=1,
+            cbor_bytes=self.cbor_bytes,
+            scriptsig_suffix=scriptsig_suffix,
+            premine_script=None,
+            premine_amount=None,
+            op_return_script=op_return_script,
         )
-        return build_dmint_contract_script(real_params)
 
 
 class DmintDeployResult(DmintV2DeployResult):

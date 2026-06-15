@@ -408,21 +408,18 @@ class TestPrepareDmintDeploy:
 
     _OWNER_PKH_HEX = None  # lazy init below
 
-    def _make_params(self, premine=None, pool=100_000):
+    def _make_params(self, num_contracts=1):
         from pyrxd.security.types import Hex20
 
-        # Migrated from DmintFullDeployParams (deprecated alias) to
-        # DmintV2DeployParams as part of the V1/V2 sibling-dataclass
-        # refactor. The deprecation warning is exercised separately in
-        # ``TestDmintFullDeployParamsDeprecation`` below.
+        # V2 deploy mirrors V1 (value-1 singletons in the reveal); the deprecation
+        # warning for DmintFullDeployParams is exercised in test_dmint_v1_deploy.py.
         return DmintV2DeployParams(
             metadata=self._META,
             owner_pkh=Hex20(bytes(b"\x11" * 20)),
+            num_contracts=num_contracts,
             max_height=1_000,
             reward_photons=1_000,
             difficulty=10,
-            initial_pool_photons=pool,
-            premine_amount=premine,
         )
 
     def test_returns_dmint_deploy_result(self):
@@ -442,79 +439,47 @@ class TestPrepareDmintDeploy:
         assert d["ticker"] == "TST"
         assert d["name"] == "Test Token"
 
-    def test_placeholder_contract_script_has_state_separator(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
-        assert b"\xbd" in result.placeholder_contract_script
+    def test_num_contracts_echoed(self):
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(num_contracts=3), allow_v2_deploy=True)
+        assert result.num_contracts == 3
+        assert len(result.placeholder_contract_scripts) == 3
 
-    def test_initial_pool_photons_echoed(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(pool=500_000), allow_v2_deploy=True)
-        assert result.initial_pool_photons == 500_000
+    def test_placeholder_contract_scripts_have_state_separator(self):
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(num_contracts=2), allow_v2_deploy=True)
+        assert all(b"\xbd" in s for s in result.placeholder_contract_scripts)
 
     def test_premine_amount_none_when_not_set(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         assert result.premine_amount is None
 
-    def test_premine_amount_echoed_when_set(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=10_000), allow_v2_deploy=True)
-        assert result.premine_amount == 10_000
+    def test_rejects_premine(self):
+        # V2 deploy with premine is deferred (mirrors V1).
+        from dataclasses import replace
 
-    def test_rejects_premine_below_dust(self):
-        with pytest.raises(ValidationError, match="dust"):
-            GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=100), allow_v2_deploy=True)
+        params = replace(self._make_params(), premine_amount=10_000)
+        with pytest.raises(ValidationError, match="premine"):
+            GlyphBuilder().prepare_dmint_deploy(params, allow_v2_deploy=True)
 
-    def test_rejects_pool_less_than_reward(self):
-        with pytest.raises(ValidationError, match="initial_pool_photons"):
-            GlyphBuilder().prepare_dmint_deploy(self._make_params(pool=500), allow_v2_deploy=True)  # reward=1000
+    def test_build_reveal_outputs_emits_value_1_v2_contracts(self):
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(num_contracts=2), allow_v2_deploy=True)
+        rev = result.build_reveal_outputs("ab" * 32)
+        assert len(rev.contract_scripts) == 2
+        assert rev.contract_value == 1  # singleton, like V1
+        for script in rev.contract_scripts:
+            assert b"\xbd" in script  # OP_STATESEPARATOR
+            state = DmintState.from_script(script)
+            assert state.is_v1 is False  # V2 contract
+            assert state.height == 0
 
-    def test_build_reveal_scripts_with_premine(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(premine=1_000_000), allow_v2_deploy=True)
-        from pyrxd.glyph.builder import FtDeployRevealScripts
-
-        reveal = result.build_reveal_scripts(
-            commit_txid="ab" * 32,
-            commit_vout=0,
-            commit_value=5_000_000,
-        )
-        assert isinstance(reveal, FtDeployRevealScripts)
-        assert len(reveal.locking_script) == 75
-
-    def test_build_reveal_scripts_without_premine(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
-        from pyrxd.glyph.builder import RevealScripts
-
-        reveal = result.build_reveal_scripts(
-            commit_txid="ab" * 32,
-            commit_vout=0,
-            commit_value=5_000_000,
-        )
-        assert isinstance(reveal, RevealScripts)
-
-    def test_build_contract_script_with_real_refs(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
-        real_token_ref = GlyphRef(txid="cc" * 32, vout=0)
-        real_contract_ref = GlyphRef(txid="dd" * 32, vout=0)
-        script = result.build_contract_script(
-            token_ref=real_token_ref,
-            contract_ref=real_contract_ref,
-        )
-        # Should contain both ref bytes and the state separator
-        assert b"\xbd" in script
-        assert real_token_ref.to_bytes() in script
-        assert real_contract_ref.to_bytes() in script
-
-    def test_contract_script_parses_back_with_real_refs(self):
-        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
-        real_token_ref = GlyphRef(txid="cc" * 32, vout=0)
-        real_contract_ref = GlyphRef(txid="dd" * 32, vout=0)
-        script = result.build_contract_script(
-            token_ref=real_token_ref,
-            contract_ref=real_contract_ref,
-        )
-        state = DmintState.from_script(script)
-        assert state.token_ref == real_token_ref
-        assert state.contract_ref == real_contract_ref
-        assert state.max_height == 1_000
-        assert state.reward == 1_000
+    def test_build_reveal_outputs_refs_are_commit_outpoints(self):
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(num_contracts=2), allow_v2_deploy=True)
+        commit_txid = "cd" * 32
+        rev = result.build_reveal_outputs(commit_txid)
+        for i, script in enumerate(rev.contract_scripts):
+            state = DmintState.from_script(script)
+            # contractRef[i] = commit:(i+1), tokenRef = commit:0 (V1-style)
+            assert state.contract_ref == GlyphRef(txid=commit_txid, vout=i + 1)
+            assert state.token_ref == GlyphRef(txid=commit_txid, vout=0)
 
 
 # ---------------------------------------------------------------------------

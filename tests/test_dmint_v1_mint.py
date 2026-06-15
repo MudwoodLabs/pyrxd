@@ -1689,12 +1689,10 @@ class TestPrepareDmintDeployV2Refusal:
                 ticker="TST",
             ),
             owner_pkh=Hex20(bytes(20)),
+            num_contracts=1,
             max_height=1000,
             reward_photons=1000,
             difficulty=10,
-            initial_pool_photons=10_000_000,
-            contract_ref_placeholder=_CONTRACT_REF,
-            token_ref_placeholder=_TOKEN_REF,
         )
 
     def test_default_call_raises_dmint_error(self):

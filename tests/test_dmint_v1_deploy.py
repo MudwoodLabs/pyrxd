@@ -692,10 +692,10 @@ class TestPrepareDmintDeployDispatch:
                 ticker="TV2",
             ),
             owner_pkh=Hex20(bytes(20)),
+            num_contracts=2,
             max_height=100,
             reward_photons=1_000,
             difficulty=10,
-            initial_pool_photons=100_000,
         )
 
     def test_v1_params_dispatches_to_v1_result(self):
@@ -867,10 +867,10 @@ class TestDeprecationAliases:
                     protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
                 ),
                 owner_pkh=Hex20(bytes(20)),
+                num_contracts=1,
                 max_height=10,
                 reward_photons=1,
                 difficulty=1,
-                initial_pool_photons=100,
             )
         # Inheritance — isinstance check works either direction
         assert isinstance(instance, DmintV2DeployParams)
@@ -881,9 +881,8 @@ class TestDeprecationAliases:
             DmintDeployResult,
             DmintV2DeployResult,
         )
-        from pyrxd.glyph.dmint import DaaMode, DmintDeployParams
+        from pyrxd.glyph.dmint import DaaMode
         from pyrxd.glyph.dmint import DmintAlgo as _Algo
-        from pyrxd.glyph.types import GlyphRef
         from pyrxd.security.types import Hex20
 
         commit_result = CommitResult(
@@ -892,26 +891,22 @@ class TestDeprecationAliases:
             payload_hash=b"\x00" * 32,
             estimated_fee=0,
         )
-        params = DmintDeployParams(
-            contract_ref=GlyphRef(txid="00" * 32, vout=0),
-            token_ref=GlyphRef(txid="00" * 32, vout=0),
-            max_height=1,
-            reward=1,
-            difficulty=1,
-            algo=_Algo.SHA256D,
-            daa_mode=DaaMode.FIXED,
-            target_time=60,
-            half_life=3600,
-        )
         with pytest.warns(DeprecationWarning, match="DmintDeployResult"):
             instance = DmintDeployResult(
                 commit_result=commit_result,
                 cbor_bytes=b"",
                 owner_pkh=Hex20(bytes(20)),
                 premine_amount=None,
-                deploy_params_template=params,
-                placeholder_contract_script=b"",
-                initial_pool_photons=100,
+                num_contracts=1,
+                placeholder_contract_scripts=(b"",),
+                max_height=1,
+                reward_photons=1,
+                difficulty=1,
+                algo=_Algo.SHA256D,
+                op_return_msg=None,
+                daa_mode=DaaMode.FIXED,
+                target_time=60,
+                half_life=3600,
             )
         assert isinstance(instance, DmintV2DeployResult)
 
