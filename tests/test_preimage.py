@@ -64,8 +64,23 @@ class TestGetPushRefs:
         script = bytes([0xD8]) + ref_a + bytes([0xD8]) + ref_b
         refs = _get_push_refs(script)
         assert len(refs) == 2
-        assert refs[0] == ref_b  # 00... sorts before ff...
+        assert refs[0] == ref_b  # 00... sorts before ff... (LE and BE agree here)
         assert refs[1] == ref_a
+
+    def test_multiple_refs_sorted_little_endian(self):
+        # Radiant collects refs into a std::set<uint288> sorted by NUMERIC
+        # (little-endian) value: byte[35] is most-significant, byte[0] least.
+        # This case distinguishes LE from raw-lexicographic (big-endian):
+        #   ref_lo differs only in its FIRST byte (0xff) -> uint288 is tiny
+        #   ref_hi differs only in its LAST byte (0x01)  -> uint288 is large
+        # Lexicographic (the old bug) would put ref_lo (0xff..) LAST; the
+        # uint288 order (consensus-correct) puts ref_hi (..0x01) last. Proven
+        # against radiant-core regtest by the dMint 2-ref contract-output e2e.
+        ref_lo = b"\xff" + bytes(35)  # MSB = byte[35] = 0x00 -> small
+        ref_hi = bytes(35) + b"\x01"  # MSB = byte[35] = 0x01 -> large
+        script = bytes([0xD0]) + ref_hi + bytes([0xD0]) + ref_lo
+        refs = _get_push_refs(script)
+        assert refs == [ref_lo, ref_hi], "refs must sort by uint288 (little-endian) value, not lexicographic"
 
     def test_skips_data_pushes_correctly(self):
         # OP_PUSH3 'gly' then OP_PUSHINPUTREFSINGLETON + ref

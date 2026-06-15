@@ -130,9 +130,20 @@ _PART_B2 = bytes.fromhex("51797ca269")
 # Part B.4: drop 5 V2 extras (new_target, lastTime, targetTime, daaMode, algoId)
 _PART_B4 = bytes.fromhex("7575757575")
 
-# Part C: output validation (identical to V1 — code script continuity + token reward + height checks)
+# Part C: output validation (code-script continuity + token reward + height checks).
+#
+# This is V1's epilogue tail starting at OP_7 OP_ROLL. The earlier version began
+# with an extra ``a269`` (OP_GREATERTHANOREQUAL OP_VERIFY) — V1's PoW
+# target-compare. But V2 already performs that compare in ``_PART_B2``
+# (``OP_1 OP_PICK OP_SWAP`` so ``target`` survives for the ``_PART_B4`` drop), so
+# the duplicate ran AFTER B4 popped the extras: with the stack reduced to
+# ``[.., maxHeight, reward]`` it executed ``maxHeight >= reward`` (e.g. 10 >= 1000)
+# → consensus rejects the mint with "Script failed an OP_VERIFY operation". From
+# OP_7 OP_ROLL onward this block is byte-identical to V1's tail and operates on
+# the same normalized stack. Dropping the leading ``a269`` is validated against
+# radiant-core regtest (tests/test_dmint_v2_regtest_e2e.py). Refs #219.
 _PART_C = bytes.fromhex(
-    "a269577ae500a069567ae600a06901d053797e0c"
+    "577ae500a069567ae600a06901d053797e0c"
     "dec0e9aa76e378e4a269e69d7eaa76e47b9d547a"
     "818b76537a9c537ade789181547ae6939d635279"
     "cd01d853797e016a7e886778de519d547854807e"

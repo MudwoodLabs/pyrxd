@@ -101,9 +101,21 @@ def _push_4bytes_le(n: int) -> bytes:
 # contractRefPickIndex = 10 - 1 = 9  → pushMinimal(9) = 0x59 (OP_9)
 # inputOutputPickIndex = 10 + 3 = 13 → pushMinimal(13) = 0x5d (OP_13)
 # nonceRollIndex       = 10 + 4 = 14 → pushMinimal(14) = 0x5e (OP_14)
+#
+# OP_INPUTINDEX (0xc0) is REQUIRED before OP_OUTPOINTTXHASH (0xc8): the latter
+# is a unary introspection op that pops an input index off the stack. Without
+# the OP_INPUTINDEX push, OP_OUTPOINTTXHASH consumes the top state item
+# (``target``, a huge number) as the index → consensus rejects every mint with
+# "input index out of range". V1's prologue has the same ``c0 c8`` pair; the
+# pick indices above (9/13/14 = stateItemCount ± offset, mirroring V1's 5/9/10)
+# are already calibrated for the stack WITH OP_INPUTINDEX present. Upstream
+# Photonic (script.ts) dropped the 0xc0 — that omission is the bug pyrxd copied;
+# restoring it is validated against radiant-core regtest (see
+# tests/test_dmint_v2_regtest_e2e.py). Refs #219.
 _PART_A = bytes.fromhex(
     "51"  # OP_1
     "75"  # OP_DROP
+    "c0"  # OP_INPUTINDEX  (pushes current input index for OP_OUTPOINTTXHASH)
     "c8"  # OP_OUTPOINTTXHASH
     "59"  # pushMinimal(9) = OP_9
     "79"  # OP_PICK
