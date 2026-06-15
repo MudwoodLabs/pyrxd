@@ -22,10 +22,19 @@ def _get_push_refs(script_bytes: bytes) -> list:
     each is followed by exactly 36 bytes of ref data. All other opcodes are
     skipped using their standard encoding (data-push length or single byte).
 
-    The sort + dedup behavior is **consensus-required**, not a bug:
-    radiantjs ``GetHashOutputHashes`` (lib/transaction/sighash.js) produces
-    the same encoding, and pyrxd's vectors are pinned against a confirmed
-    mainnet reveal tx (see ``tests/test_preimage.py``).
+    The sort + dedup behavior is **consensus-required**, not a bug. Radiant
+    consensus collects an output's refs into a ``std::set<uint288>`` and
+    hashes them in iteration order — i.e. ascending by the *uint288 numeric
+    value* of each 36-byte ref, which is **little-endian** (byte[35] is the
+    most-significant). See Radiant-Core ``src/primitives/transaction.h``
+    (``getRefHashDataSummary`` / ``writeOutputDataSummaryVector`` /
+    ``GetHashOutputHashes``). We therefore sort by ``ref[::-1]`` (the
+    fully-reversed bytes), NOT by the raw byte order (which would be
+    big-endian / lexicographic and diverges for any output with 2+ refs —
+    the bug that made dMint contract-output signing fail ~50% of the time on
+    a real node; single-ref outputs are unaffected since order is moot).
+    Validated end-to-end against radiant-core regtest by
+    ``tests/test_dmint_v1_regtest_e2e.py`` (2-ref contract output).
 
     Raises ``ValidationError`` if a pushref opcode is followed by fewer
     than 36 bytes (truncated script). Earlier versions silently produced
@@ -60,7 +69,9 @@ def _get_push_refs(script_bytes: bytes) -> list:
             n = int.from_bytes(script_bytes[i : i + 4], "little")
             i += 4 + n
         # else: single-byte opcode, already advanced by 1
-    return [refs[k] for k in sorted(refs.keys())]
+    # Sort by uint288 numeric value (little-endian: byte[35] most-significant),
+    # matching Radiant's std::set<uint288> iteration order — NOT raw lexicographic.
+    return sorted(refs.values(), key=lambda r: r[::-1])
 
 
 def _compute_hash_output_hashes(outputs: list[TransactionOutput], index: int = None) -> bytes:
