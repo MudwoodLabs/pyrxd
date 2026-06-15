@@ -68,7 +68,8 @@ Cryptographic primitives have not been independently audited. See
   small real-value dust runs), against BTC, ETH, and EVM L2s (Base / Optimism / Arbitrum /
   Linea). An external security audit is the hard gate before any real value.
 - dMint **V2** (DAA / ASERT difficulty) — builders ship behind a footgun guard
-  (`allow_v2_deploy=True`) but are not yet consensus-validated (`V2UnvalidatedWarning`).
+  (`allow_v2_deploy=True`) but are not yet consensus-validated (`V2UnvalidatedWarning`);
+  getting V2 mainnet-proven so it can move up is tracked in #219.
 
 ## Upgrading
 
