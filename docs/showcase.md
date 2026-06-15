@@ -23,8 +23,8 @@ the swap either completes for both parties or unwinds for both. That is what
 
 ### Proven swap directions
 
-Each row below is a real swap that was carried out end-to-end on real chains
-this week. Open any transaction in its explorer.
+Each row below is a real swap that was carried out end-to-end on real chains.
+Open any transaction in its explorer.
 
 | Direction | Networks | Proof (claim transactions) |
 |---|---|---|
@@ -47,12 +47,15 @@ mainnet.**
 
 ### Build it
 
+- **[Tutorial: trustless cross-chain swap (RXD ↔ ETH)](tutorials/cross-chain-swap.md)** — the
+  guided flagship: watch a full swap settle on local Anvil + a Radiant regtest node in seconds.
 - **[How-to: build a cross-chain atomic swap](how-to/build-a-cross-chain-swap.md)** —
   the `SwapCoordinator` + legs surface (`from pyrxd import SwapCoordinator, …`), the
-  role/timelock safety invariant, and the proven regtest/Anvil harnesses to copy from.
-- [`examples/gravity_swap_demo.py`](../examples/gravity_swap_demo.py) — the full
-  Gravity swap flow (offer → claim → payment → finalize). Defaults to a safe
-  dry-run that builds every transaction but broadcasts nothing.
+  role/timelock safety invariant, and how to add another counter-chain (BTC, ETH, and the EVM
+  L2s — Base, Optimism, Arbitrum, Linea — reuse the proven legs verbatim).
+- [`examples/htlc_swap_demo.py`](../examples/htlc_swap_demo.py) — build a real HTLC covenant +
+  the claim/refund spends with no network (the current path; the `gravity_*` SPV-oracle demos
+  are **deprecated** and superseded by this HTLC swap).
 - Concept walkthrough: [`docs/concepts/gravity.md`](concepts/gravity.md).
 
 ## Native tokens
@@ -68,11 +71,12 @@ path works on mainnet.
   issue your own FT with a full premine; the reveal output's outpoint becomes
   the permanent token ref.
   Tutorial: [`docs/tutorials/mint-a-glyph-ft.md`](tutorials/mint-a-glyph-ft.md).
-- **dMint (permissionless mining-based issuance)** —
-  [`examples/dmint_v1_deploy_demo.py`](../examples/dmint_v1_deploy_demo.py):
-  deploy a V1 dMint token that emits N parallel contract UTXOs, each mineable
-  independently so claims race in parallel.
-  Concept: [`docs/concepts/dmint-v1-deploy.md`](concepts/dmint-v1-deploy.md).
+- **dMint (permissionless mining-based issuance)** — deploy a token *anyone* can mine
+  (`pyrxd glyph deploy-dmint`) and mine/claim from one (`pyrxd glyph claim-dmint`): a V1
+  contract emits N parallel UTXOs, each mineable independently so claims race in parallel.
+  How-to: [`docs/how-to/issue-a-dmint-token.md`](how-to/issue-a-dmint-token.md);
+  example: [`examples/dmint_v1_deploy_demo.py`](../examples/dmint_v1_deploy_demo.py);
+  concept: [`docs/concepts/dmint-v1-deploy.md`](concepts/dmint-v1-deploy.md).
 
 Beyond plain tokens, the covenant layer is where Radiant is genuinely different:
 HTLC covenants, a consensus-enforced **soulbound** NFT, the REF-authenticity gate,
