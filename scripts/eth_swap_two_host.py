@@ -589,6 +589,11 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
         raise SystemExit("local preimage p does not hash to the envelope's H — wrong local file?")
     maker_pkh = bytes.fromhex(local["maker_pkh_hex"])
     taker_pkh = bytes.fromhex(local["taker_pkh_hex"])
+    # The covenant SPK is PUBLIC — source it from the public envelope, never from the secret-bearing
+    # ``local`` dict (which also holds the preimage p). Reading public display values out of the
+    # secret file is what makes a clear-text log of them taint-flagged (CodeQL py/clear-text-logging);
+    # sourcing them from the public envelope keeps the secret file write-only for actual secrets.
+    covenant_spk_hex = env["covenant_spk_hex"]
 
     rpc, raw_eth_leg = _eth_leg(
         args,
@@ -618,10 +623,10 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
         print("  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
 
         # 2. Lock the RXD covenant: the operator funds the SPK out-of-band, then we re-validate.
-        print(f"\n  Fund the RXD covenant SPK on regtest now (>= 1 conf):\n    {local['covenant_spk_hex']}")
+        print(f"\n  Fund the RXD covenant SPK on regtest now (>= 1 conf):\n    {covenant_spk_hex}")
         confirm("you have funded the RXD covenant SPK on regtest and it has >= 1 conf", auto_yes=args.yes)
         rec = await coord.post_asset_lock_revalidate(
-            bytes.fromhex(local["covenant_spk_hex"]), now_unix_s=int(time.time())
+            bytes.fromhex(covenant_spk_hex), now_unix_s=int(time.time())
         )
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(f"covenant/timing mismatch -> {rec.state.value}; refund the ETH HTLC after its timeout")
