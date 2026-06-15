@@ -50,11 +50,15 @@ Cryptographic primitives have not been independently audited. See
 
 **Working on mainnet today:**
 
-- RXD send / send-max, balance and UTXO queries
-- Glyph NFT mint (two-phase commit + reveal) and transfer — see `examples/glyph_mint_demo.py`
-- Glyph FT premine deploy via `prepare_ft_deploy_reveal` — entire supply at vout[0]
-- Glyph FT transfer via `FtUtxoSet.build_transfer_tx` (conservation-enforcing)
-- BIP32/BIP39/BIP44 HD wallets with optional encrypted persistence (`HdWallet`)
+- RXD send / send-max, balance and UTXO queries (`pyrxd address` / `balance` / `utxos`)
+- BIP32 / BIP39 / BIP44 HD wallets with optional encrypted persistence (`HdWallet`, `pyrxd wallet`)
+- Glyph **NFT** — mint (two-phase commit + reveal) and transfer (`pyrxd glyph mint-nft` / `transfer-nft`)
+- Glyph **FT** — premine deploy and conservation-enforced transfer (`pyrxd glyph deploy-ft` / `transfer-ft`)
+- **dMint permissionless PoW tokens (V1)** — deploy (byte-equal to the live Glyph-protocol deploy,
+  node-consensus-validated) and mine/claim from live mainnet contracts
+  (`pyrxd glyph deploy-dmint` / `claim-dmint`)
+- List your Glyph tokens (`pyrxd glyph list`)
+- `pyrxd agent` — a per-spend-confirmed signing daemon that keeps the key out of the short-lived CLI process
 - ElectrumX async client with reconnect, balance, UTXOs, history, broadcast
 
 **Experimental (pre-audit — build / demo on regtest / testnet, not for real value):**
@@ -63,9 +67,8 @@ Cryptographic primitives have not been independently audited. See
   Solidity legs driven by a chain-neutral coordinator; proven end-to-end on regtest (plus
   small real-value dust runs), against BTC, ETH, and EVM L2s (Base / Optimism / Arbitrum /
   Linea). An external security audit is the hard gate before any real value.
-- dMint permissionless PoW token mint — deploy + mine/claim ship today via
-  `pyrxd glyph deploy-dmint` / `claim-dmint`, with the V1 PoW mint validated on a real
-  `radiant-core` node (`tests/test_dmint_v1_regtest_e2e.py`). V2 (DAA/ASERT) is unvalidated.
+- dMint **V2** (DAA / ASERT difficulty) — builders ship behind a footgun guard
+  (`allow_v2_deploy=True`) but are not yet consensus-validated (`V2UnvalidatedWarning`).
 
 ## Upgrading
 
