@@ -124,7 +124,7 @@ $ XCHAIN_ETH_REGTEST=1 pytest tests/test_xchain_eth_swap_regtest_e2e.py -m integ
 Two families are proven; adding a chain within either is a config change, while a new
 family is a deliberate effort.
 
-### EVM family — Base works today (no new code)
+### EVM family — Base, Optimism, Arbitrum, Linea work today (no new code)
 
 The proven `EthLeg` + `EthHtlc.sol` machinery is **chain-id-agnostic**: the same contract
 bytecode, the same `finalized`-checkpoint reads, the same claim/refund/scrape paths run on
@@ -157,6 +157,17 @@ case is the OP-stack **12-hour sequencing window** (a batch may legally land tha
 budget stalls in `CrossClockMargin.eth_finality_stall_tolerance_s`, exactly as for an L1
 finality stall — never by inflating the steady-state window. Provenance is cited in the
 module docstring; `evm_chain_by_id` fails closed on a chain with no vetted window.
+
+**The registry now ships more EVM chains** (mainnet + testnet each, all audit-gated): **Optimism**
+(`optimism`, same OP-stack as Base, 900 s), **Arbitrum One** (`arbitrum-one`, Nitro, 1200 s — ~24 h
+sequencer force-inclusion worst case), and **Linea** (`linea`, a zk/validity rollup, 6000 s ≈ the
+median hard finality, with a documented up-to-16 h tail). Each window is sourced per chain because
+the finality *mechanism* differs (OP-stack batch cadence vs Arbitrum's vs zk proof cadence) even
+though the leg code is identical. **Polygon PoS is deliberately *not* in the registry**: its
+`finalized` tag is Polygon's own validator-set "milestone" finality (~5 s), **not** Ethereum-anchored
+— it's a sidechain, so the Ethereum-finality assumption (and the ≥768 s floor) would misrepresent its
+trust model. A Polygon-PoS swap would need a finality model justified in Polygon's *own* security
+terms; `evm_chain_by_id(137)` fails closed so a sidechain is never silently treated as a rollup.
 
 Proofs: `tests/test_eth_leg_anvil_integration.py::test_full_lifecycle_on_base_chain_id`
 (full leg lifecycle on Base Sepolia's chain id) and the entire coordinator e2e re-run as

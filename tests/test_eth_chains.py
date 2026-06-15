@@ -59,6 +59,38 @@ def test_no_registry_network_is_audit_exempt():
         assert chain.network not in AUDIT_CLEARED_NETWORKS, chain.name
 
 
+def test_optimism_arbitrum_linea_entries_present():
+    # The A6 additions: OP-stack (= Base), Arbitrum Nitro, Linea zk — all Ethereum-anchored
+    # rollups, so each (mainnet + testnet) respects the L1 floor with a sourced window.
+    expected = {
+        "optimism": (10, 900),
+        "optimism-sepolia": (11155420, 900),
+        "arbitrum-one": (42161, 1200),
+        "arbitrum-sepolia": (421614, 1200),
+        "linea": (59144, 6000),
+        "linea-sepolia": (59141, 6000),
+    }
+    eth_window = KNOWN_EVM_CHAINS["ethereum"].finalization_window_s
+    for key, (cid, window) in expected.items():
+        c = KNOWN_EVM_CHAINS[key]
+        assert (c.chain_id, c.finalization_window_s) == (cid, window), key
+        assert evm_chain_by_id(cid) is c
+        # an L2 cannot finalize faster than the L1 checkpoint it settles to
+        assert c.finalization_window_s >= eth_window, key
+
+
+def test_polygon_pos_deliberately_excluded():
+    # Polygon PoS (137) / Amoy (80002): a commit-chain/sidechain with its OWN validator-set
+    # milestone finality (Heimdall/CometBFT), NOT Ethereum-anchored — it does NOT fit this
+    # registry's finalized-checkpoint model (see the module docstring). Its absence is
+    # intentional; the lookup must fail closed rather than silently treat a sidechain as a
+    # rollup with an Ethereum-anchored window.
+    assert not any(c.chain_id == 137 for c in KNOWN_EVM_CHAINS.values())
+    for sidechain_id in (137, 80002):
+        with pytest.raises(ValidationError, match="unknown EVM chain id"):
+            evm_chain_by_id(sidechain_id)
+
+
 def test_floor_matches_margin_policy_floor():
     """Audit follow-up: _FLOOR_S re-declares the canonical _MIN_ETH_FINALIZATION_WINDOW_S with a
     'keep in sync' comment — enforce that invariant so a future floor bump in one file can't leave
