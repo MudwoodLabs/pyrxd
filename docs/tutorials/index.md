@@ -13,6 +13,7 @@ inspect-a-radiant-transaction
 mint-a-glyph-nft
 mint-a-glyph-ft
 mint-from-a-dmint-contract
+cross-chain-swap
 ```
 
 ## Available now
@@ -52,6 +53,12 @@ mint-from-a-dmint-contract
   miner protocol, the four-output mint-tx shape, and the broadcast
   handshake. This is the most advanced tutorial in the set — it touches
   the network, costs real RXD, and is irreversible.
+- **[Trustless cross-chain swap: RXD ↔ ETH](cross-chain-swap.md)** — the flagship.
+  Trade a Radiant asset for ETH with **no bridge and no custodian**, and watch a full
+  swap settle end-to-end on a local Anvil + Radiant regtest in seconds. See the HTLC
+  building blocks with zero setup, then run the real `SwapCoordinator` through
+  negotiated → completed for native RXD, a Glyph NFT, *and* a Glyph FT. Pre-audit —
+  local/testnet only, no real value at risk.
 
 ## Planned tutorials
 
