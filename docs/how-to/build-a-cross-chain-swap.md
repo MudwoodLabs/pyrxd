@@ -5,6 +5,10 @@ Glyph FT, or a Glyph NFT) against BTC or ETH with no custodian and no trusted th
 party. It's a hash-timelock (HTLC) swap driven by a chain-neutral coordinator, proven
 end-to-end on regtest and on small real-value mainnet/Sepolia runs.
 
+> **New to this?** Start with the guided tutorial —
+> [Trustless cross-chain swap: RXD ↔ ETH](../tutorials/cross-chain-swap.md) — which walks a full
+> swap settling on local chains. This page is the reference for the pieces.
+
 > **PRE-AUDIT — regtest / testnet only.** This primitive has **not** had an external
 > security audit. It's the right tool to build and demo cross-chain swaps on
 > regtest/testnet, but **do not move real value** with it until the audit gate clears.
