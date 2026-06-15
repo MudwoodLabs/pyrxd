@@ -6,10 +6,34 @@ Python SDK for the [Radiant (RXD) blockchain](https://radiantcore.org/).
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Docs](https://github.com/MudwoodLabs/pyrxd/actions/workflows/docs.yml/badge.svg)](https://mudwoodlabs.github.io/pyrxd/)
 
-A typed, async-first SDK for building applications on Radiant. Includes
-transaction construction, HD wallets, the Glyph token protocol (NFT, FT,
-dMint), Gravity cross-chain atomic swaps, SPV verification, and an
-ElectrumX network client.
+A typed, async-first SDK for building on Radiant — a UTXO chain with Bitcoin-style
+script *plus* induction (recursive covenants) and a native, consensus-enforced token
+layer. It ships transaction construction, HD wallets, the Glyph token protocol
+(NFT / FT / dMint), trustless cross-chain atomic swaps, SPV verification, and an
+ElectrumX client.
+
+## What you can build
+
+Things that need a custodian or a bridge elsewhere — on Radiant they're trustless and
+enforced on-chain:
+
+- **On-chain Glyph tokens (NFT / FT).** Supply and transfers enforced by Radiant
+  *consensus*, not an indexer or a sidecar.
+  → [mint an NFT](docs/tutorials/mint-a-glyph-nft.md) · [deploy an FT](docs/tutorials/mint-a-glyph-ft.md)
+- **Permissionless PoW token issuance (dMint).** Deploy a token that *anyone* can mine —
+  distributed issuance, no premine, secured by proof-of-work. Radiant-unique.
+  → [`pyrxd glyph deploy-dmint` / `claim-dmint`](docs/how-to/issue-a-dmint-token.md)
+- **Trustless cross-chain atomic swaps.** Trade a Radiant asset (RXD / FT / NFT) against
+  BTC or ETH — and EVM L2s (Base, Optimism, Arbitrum, Linea) — with **no bridge and no
+  custodian**: a hash-timelock swap driven by a chain-neutral coordinator. *(Pre-audit —
+  regtest / testnet today.)*
+  → [build a cross-chain swap](docs/how-to/build-a-cross-chain-swap.md)
+- **Recursive covenants.** Bitcoin-style script + induction lets a coin constrain the coin
+  that spends it — soulbound NFTs, swap covenants, PoW-mint contracts.
+  → [covenant building blocks](docs/concepts/covenant-building-blocks.md)
+
+**New here?** The [5-minute quickstart](docs/tutorials/quickstart.md) goes from `pip install`
+to a real on-chain token on a local regtest chain — no faucet, nothing at risk.
 
 ## Status
 
@@ -33,13 +57,15 @@ Cryptographic primitives have not been independently audited. See
 - BIP32/BIP39/BIP44 HD wallets with optional encrypted persistence (`HdWallet`)
 - ElectrumX async client with reconnect, balance, UTXOs, history, broadcast
 
-**Experimental:**
+**Experimental (pre-audit — build / demo on regtest / testnet, not for real value):**
 
-- Gravity cross-chain BTC↔RXD atomic swaps (`pyrxd.gravity`) — mainnet-proven
-  for sentinel artifact paths; covenant variants still being hardened.
-- dMint PoW-based distributed FT mint — premine-only deploys ship today; the
-  full PoW mint covenant is documented in `docs/dmint-followup.md` as future
-  work.
+- Cross-chain HTLC atomic swaps (`pyrxd.gravity`) — RXD covenant + BTC Taproot + ETH
+  Solidity legs driven by a chain-neutral coordinator; proven end-to-end on regtest (plus
+  small real-value dust runs), against BTC, ETH, and EVM L2s (Base / Optimism / Arbitrum /
+  Linea). An external security audit is the hard gate before any real value.
+- dMint permissionless PoW token mint — deploy + mine/claim ship today via
+  `pyrxd glyph deploy-dmint` / `claim-dmint`, with the V1 PoW mint validated on a real
+  `radiant-core` node (`tests/test_dmint_v1_regtest_e2e.py`). V2 (DAA/ASERT) is unvalidated.
 
 ## Upgrading
 
@@ -269,7 +295,6 @@ reference + tutorials + how-to guides + concepts).
 Other resources in this repo:
 
 - [`examples/`](examples/) — runnable end-to-end demos
-- [`docs/dmint-followup.md`](docs/dmint-followup.md) — premine vs PoW dMint scope
 - [`docs/dmint-research-photonic.md`](docs/dmint-research-photonic.md) — Photonic Wallet TS reference
 - [`docs/dmint-research-mainnet.md`](docs/dmint-research-mainnet.md) — decoded live dMint contracts
 - [`SECURITY.md`](SECURITY.md) — security policy and disclosure
