@@ -522,11 +522,12 @@ class TestPrepareDmintDeploy:
 # ---------------------------------------------------------------------------
 
 
-def _make_contract_utxo(height: int = 0, pool: int = 50_000_000, daa_mode=DaaMode.FIXED) -> DmintContractUtxo:
-    """Build a synthetic DmintContractUtxo for testing.
+def _make_contract_utxo(height: int = 0, daa_mode=DaaMode.FIXED, value: int = 1) -> DmintContractUtxo:
+    """Build a synthetic V2 DmintContractUtxo for testing.
 
-    Default pool is 50M photons — enough to cover fee (~4.3M ph) + reward (1000 ph)
-    at 10,000 ph/byte for a ~430-byte mint tx.
+    The contract is a 1-photon singleton (the covenant enforces
+    ``OP_OUTPUTVALUE==1`` on the recreated output); the FT reward + tx fee come
+    from a separate funding input (same shape as V1).
     """
     params = DmintDeployParams(
         contract_ref=_CONTRACT_REF,
@@ -542,164 +543,163 @@ def _make_contract_utxo(height: int = 0, pool: int = 50_000_000, daa_mode=DaaMod
     )
     script = build_dmint_contract_script(params)
     state = DmintState.from_script(script)
-    return DmintContractUtxo(
-        txid="cc" * 32,
-        vout=0,
-        value=pool,
-        script=script,
-        state=state,
-    )
+    return DmintContractUtxo(txid="cc" * 32, vout=0, value=value, script=script, state=state)
 
 
 _MINER_PKH = bytes(b"\x33" * 20)
 _NONCE = bytes(8)
-_CURRENT_TIME = 1_700_000_060
+_OP_RETURN = b"msg"
+
+
+def _funding(value: int = 500_000_000) -> DmintMinerFundingUtxo:
+    """Synthetic plain-RXD funding UTXO (pays reward + fee + change)."""
+    return DmintMinerFundingUtxo(txid="aa" * 32, vout=0, value=value, script=b"\x76\xa9\x14" + bytes(20) + b"\x88\xac")
+
+
+def _mint(utxo, *, nonce=_NONCE, pkh=_MINER_PKH, current_time=0, funding=None, op_return_msg=_OP_RETURN):
+    return build_dmint_mint_tx(
+        utxo,
+        nonce,
+        pkh,
+        current_time,
+        funding_utxo=_funding() if funding is None else funding,
+        op_return_msg=op_return_msg,
+    )
 
 
 class TestBuildDmintMintTx:
+    """The V2 mint builder emits the consensus-correct shape (proven on regtest
+    by tests/test_dmint_v2_regtest_e2e.py): same as V1 — a 1-photon contract
+    singleton + a plain funding input, recreating the contract at height+1
+    (value 1) and paying the FT reward, with an OP_RETURN at vout[2]."""
+
     def test_returns_dmint_mint_result(self):
-        utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
         from pyrxd.glyph.dmint import DmintMintResult
 
-        assert isinstance(result, DmintMintResult)
+        assert isinstance(_mint(_make_contract_utxo()), DmintMintResult)
 
     def test_updated_height_incremented(self):
-        utxo = _make_contract_utxo(height=0)
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert result.updated_state.height == 1
+        assert _mint(_make_contract_utxo(height=0)).updated_state.height == 1
 
     def test_updated_height_incremented_from_mid_height(self):
-        utxo = _make_contract_utxo(height=42)
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert result.updated_state.height == 43
+        assert _mint(_make_contract_utxo(height=42)).updated_state.height == 43
 
     def test_updated_state_target_unchanged_for_fixed_daa(self):
         utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert result.updated_state.target == utxo.state.target
+        assert _mint(utxo).updated_state.target == utxo.state.target
 
-    def test_updated_state_last_time_is_current_time(self):
-        utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert result.updated_state.last_time == _CURRENT_TIME
+    def test_updated_state_last_time_unchanged(self):
+        # FIXED V2: the covenant forbids changing any state field but `height`,
+        # so last_time stays byte-identical to the current contract (not current_time).
+        utxo = _make_contract_utxo(height=5)
+        assert _mint(utxo).updated_state.last_time == utxo.state.last_time
 
     def test_contract_script_has_state_separator(self):
-        utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert b"\xbd" in result.contract_script
+        assert b"\xbd" in _mint(_make_contract_utxo()).contract_script
 
     def test_contract_script_parses_back_to_updated_state(self):
         utxo = _make_contract_utxo(height=5)
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
+        result = _mint(utxo)
         reparsed = DmintState.from_script(result.contract_script)
         assert reparsed.height == result.updated_state.height
         assert reparsed.last_time == result.updated_state.last_time
         assert reparsed.target == result.updated_state.target
 
+    def test_contract_script_is_current_with_height_bumped(self):
+        # Recreated == current contract script with only the 5-byte height push changed.
+        utxo = _make_contract_utxo(height=7)
+        result = _mint(utxo)
+        assert result.contract_script[5:] == utxo.script[5:]
+        assert result.contract_script[:5] != utxo.script[:5]
+
     def test_reward_script_is_ft_wrapped_75_bytes(self):
-        """V2 reward output must be FT-wrapped, not bare P2PKH.
-
-        The V2 covenant's FT-conservation check at `_PART_C` (the
-        ``OP_CODESCRIPTHASHVALUESUM_OUTPUTS OP_NUMEQUALVERIFY`` sequence)
-        sums photons under the FT codescript and requires the total to
-        equal ``state.reward``. A bare P2PKH carries no FT codescript so
-        the sum is zero and every V2 mint would be rejected. See the
-        red-team finding R1 (2026-05-11) — the prior implementation
-        emitted a 25-byte P2PKH which would have failed on the first
-        live V2 contract.
-
-        The 75-byte shape: ``P2PKH(25) || OP_STATESEPARATOR(1) ||
-        OP_PUSHINPUTREF tokenRef(37) || 12-byte FT fingerprint`` —
-        byte-identical to V1's ``build_dmint_v1_ft_output_script``.
-        """
         from pyrxd.glyph.dmint import build_dmint_v1_ft_output_script
 
         utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
+        result = _mint(utxo)
         expected = build_dmint_v1_ft_output_script(_MINER_PKH, utxo.state.token_ref)
         assert result.reward_script == expected
         assert len(result.reward_script) == 75
-        # P2PKH prologue.
         assert result.reward_script[:3] == b"\x76\xa9\x14"
         assert result.reward_script[3:23] == _MINER_PKH
         assert result.reward_script[23:25] == b"\x88\xac"
-        # OP_STATESEPARATOR + OP_PUSHINPUTREF + tokenRef + 12-byte fingerprint.
         assert result.reward_script[25:26] == b"\xbd"
         assert result.reward_script[26:27] == b"\xd0"
         assert result.reward_script[63:] == bytes.fromhex("dec0e9aa76e378e4a269e69d")
 
-    def test_tx_has_one_input_two_outputs(self):
-        utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert len(result.tx.inputs) == 1
-        assert len(result.tx.outputs) == 2
+    def test_tx_has_two_inputs_four_outputs(self):
+        result = _mint(_make_contract_utxo())
+        assert len(result.tx.inputs) == 2  # contract + funding
+        assert len(result.tx.outputs) == 4  # contract, reward, OP_RETURN, change
+
+    def test_tx_output_0_is_contract_value_1(self):
+        result = _mint(_make_contract_utxo())
+        assert result.tx.outputs[0].locking_script.script == result.contract_script
+        assert result.tx.outputs[0].satoshis == 1  # singleton
 
     def test_tx_output_1_value_equals_reward(self):
         utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert result.tx.outputs[1].satoshis == utxo.state.reward
+        assert _mint(utxo).tx.outputs[1].satoshis == utxo.state.reward
 
-    def test_tx_output_0_contract_script(self):
-        utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert result.tx.outputs[0].locking_script.script == result.contract_script
+    def test_tx_output_2_is_op_return(self):
+        result = _mint(_make_contract_utxo())
+        assert result.tx.outputs[2].locking_script.script[0] == 0x6A
+        assert result.tx.outputs[3].satoshis > 546  # change
 
     def test_fee_is_positive(self):
-        utxo = _make_contract_utxo()
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        assert result.fee > 0
+        assert _mint(_make_contract_utxo()).fee > 0
+
+    def test_requires_funding_utxo(self):
+        with pytest.raises(ValidationError, match="funding_utxo"):
+            build_dmint_mint_tx(_make_contract_utxo(), _NONCE, _MINER_PKH, 0, op_return_msg=_OP_RETURN)
+
+    def test_contract_value_not_1_rejected(self):
+        with pytest.raises(ValidationError, match="1-photon singleton"):
+            _mint(_make_contract_utxo(value=100))
+
+    def test_current_time_must_be_zero(self):
+        with pytest.raises(ValidationError, match="current_time must be 0"):
+            _mint(_make_contract_utxo(), current_time=1_700_000_000)
 
     def test_exhausted_contract_raises(self):
         from pyrxd.security.errors import ContractExhaustedError
 
-        utxo = _make_contract_utxo(height=100)  # max_height=100
         with pytest.raises(ContractExhaustedError, match="exhausted"):
-            build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
+            _mint(_make_contract_utxo(height=100))  # max_height=100
 
     def test_wrong_nonce_length_raises(self):
-        utxo = _make_contract_utxo()
         with pytest.raises(ValidationError, match="nonce"):
-            build_dmint_mint_tx(utxo, bytes(7), _MINER_PKH, _CURRENT_TIME)
+            _mint(_make_contract_utxo(), nonce=bytes(7))
 
     def test_wrong_pkh_length_raises(self):
-        utxo = _make_contract_utxo()
         with pytest.raises(ValidationError, match="miner_pkh"):
-            build_dmint_mint_tx(utxo, _NONCE, bytes(19), _CURRENT_TIME)
+            _mint(_make_contract_utxo(), pkh=bytes(19))
 
-    def test_pool_too_small_raises(self):
-        # Pool much smaller than fee → contract output would be negative.
+    def test_funding_too_small_raises(self):
         from pyrxd.security.errors import PoolTooSmallError
 
-        utxo = _make_contract_utxo(pool=10_000)  # fee ~4.3M, pool=10k → far too small
         with pytest.raises(PoolTooSmallError, match="too small"):
-            build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
+            _mint(_make_contract_utxo(), funding=_funding(value=10_000))  # << fee + reward
 
-    def test_asert_daa_updates_target(self):
-        """With ASERT DAA and a slow block time, the target should increase."""
-        utxo = _make_contract_utxo(height=0, pool=50_000_000, daa_mode=DaaMode.ASERT)
-        # current_time is 7200s after last_time=0, target_time=60 → drift=+1 → target doubled
-        slow_time = 0 + 7_200  # last_time=0, current_time=7200
-        result = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, slow_time)
-        # drift = (7200-0-60)//3600 = 1 → target <<= 1 (doubled)
-        expected = utxo.state.target << 1
-        assert result.updated_state.target == expected
+    def test_asert_daa_rejected(self):
+        # DAA can't work with this covenant (state-transition forbids changing
+        # target/last_time); only FIXED is mintable.
+        with pytest.raises(NotImplementedError, match="ASERT/LWMA"):
+            _mint(_make_contract_utxo(daa_mode=DaaMode.ASERT))
 
     def test_consecutive_mints_chain_state(self):
-        """The contract script from mint N can feed mint N+1."""
-        utxo = _make_contract_utxo(pool=100_000_000)
-        result1 = build_dmint_mint_tx(utxo, _NONCE, _MINER_PKH, _CURRENT_TIME)
-        # Build second utxo from first result
+        utxo = _make_contract_utxo()
+        result1 = _mint(utxo)
         utxo2 = DmintContractUtxo(
             txid="dd" * 32,
             vout=0,
-            value=result1.tx.outputs[0].satoshis,
+            value=result1.tx.outputs[0].satoshis,  # singleton, == 1
             script=result1.contract_script,
             state=result1.updated_state,
         )
-        result2 = build_dmint_mint_tx(utxo2, _NONCE, _MINER_PKH, _CURRENT_TIME + 60)
+        result2 = _mint(utxo2)
         assert result2.updated_state.height == 2
-        assert result2.updated_state.last_time == _CURRENT_TIME + 60
+        assert result2.updated_state.last_time == utxo.state.last_time  # unchanged
 
 
 # ---------------------------------------------------------------------------

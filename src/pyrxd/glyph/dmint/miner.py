@@ -31,6 +31,7 @@ from typing import Any, Literal
 
 from pyrxd.security.errors import (
     ContractExhaustedError,
+    InvalidFundingUtxoError,
     MaxAttemptsError,
     PoolTooSmallError,
     ValidationError,
@@ -38,8 +39,6 @@ from pyrxd.security.errors import (
 
 from .builders import (
     _push_4bytes_le,
-    _push_minimal,
-    build_dmint_code_script,
     build_dmint_v1_contract_script,
     build_dmint_v1_ft_output_script,
 )
@@ -50,12 +49,10 @@ from .chain import (
     is_token_bearing_script,
 )
 from .types import (
-    _OP_STATESEPARATOR,
     MAX_SHA256D_TARGET,
     MAX_V2_TARGET_256,
     DaaMode,
     DmintAlgo,
-    DmintDeployParams,
     DmintMintResult,
     _warn_v2_unvalidated,
 )
@@ -759,20 +756,33 @@ def build_dmint_mint_tx(
 ) -> DmintMintResult:
     """Build an unsigned dMint mint transaction.
 
-    Constructs the transaction that spends the live dMint contract UTXO,
-    recreates the contract with the updated state (incremented height + DAA
-    target adjustment), and pays the miner reward to ``miner_pkh``.
+    Spends the live dMint contract UTXO, recreates the 1-photon contract
+    singleton at ``height + 1``, and pays the FT reward to ``miner_pkh`` from a
+    separate plain-RXD funding input. V1 and V2 use the **same consensus shape**
+    (the V2 covenant's output-validation block is byte-identical to V1's);
+    they differ only in the nonce width (4B V1 / 8B V2) and the 10-item V2 state.
 
-    Transaction structure
-    ---------------------
+    Transaction structure (both V1 and V2)
+    --------------------------------------
     **Inputs**
-      * Input 0: contract UTXO — unlocked by
-        ``build_mint_scriptsig(nonce, pow.input_hash, pow.output_hash)``
-        where ``pow = build_pow_preimage(txid_le, contract_ref, miner_input_script, miner_output_script)``
+      * Input 0: contract UTXO — covenant scriptSig
+        ``build_mint_scriptsig(nonce, pow.input_hash, pow.output_hash, nonce_width=4|8)``.
+      * Input 1: ``funding_utxo`` — a plain-RXD P2PKH input that pays the reward
+        photons + tx fee + change (the contract is a 1-photon singleton).
 
     **Outputs**
-      * Output 0: recreated contract UTXO (updated DmintState + same code section)
-      * Output 1: miner reward P2PKH output (value = state.reward)
+      * Output 0: recreated contract (current script with only ``height`` bumped), value **1**.
+      * Output 1: FT-wrapped reward output (value = ``state.reward``).
+      * Output 2: OP_RETURN (when ``op_return_msg`` is set) — the output the PoW
+        preimage binds (see :func:`build_dmint_v2_mint_preimage` / V1 analog).
+      * Output 3: change back to ``miner_pkh``.
+
+    .. note::
+       **V2 supports only ``DaaMode.FIXED``.** The covenant's state-transition
+       check requires the next state to equal the current state with only
+       ``height`` incremented, so ASERT/LWMA (which must advance
+       ``target``/``last_time``) can never fire — passing a DAA contract raises
+       :class:`NotImplementedError`. ``current_time`` must be 0 for V2.
 
     .. note::
        The preimage is a function of the *transaction itself* (txid of the input
@@ -851,41 +861,67 @@ def build_dmint_mint_tx(
             op_return_msg=op_return_msg,
         )
 
-    if op_return_msg is not None:
+    # --- V2 mint -----------------------------------------------------------
+    # The V2 covenant's output-validation block (_PART_C) is byte-identical to
+    # V1's tail, so a consensus-valid V2 mint has the SAME shape as V1: the
+    # 1-photon contract singleton + a plain funding input; it recreates the
+    # contract (height+1, value 1) and pays the FT reward, with an optional
+    # OP_RETURN at vout[2] that the PoW preimage binds (build_dmint_v2_mint_preimage).
+    # V2 differs from V1 only in the 8-byte nonce and the 10-item state. Proven
+    # on regtest by tests/test_dmint_v2_regtest_e2e.py (#219).
+    if funding_utxo is None:
         raise ValidationError(
-            "op_return_msg is V1-only — V2 mints do not include the Photonic 'msg' OP_RETURN convention by default."
+            "V2 mint requires a funding_utxo: the contract is a 1-photon singleton "
+            "and the FT reward + tx fee come from a separate plain-RXD input (same "
+            "shape as V1). Pass funding_utxo=DmintMinerFundingUtxo(...)."
+        )
+    if state.daa_mode != DaaMode.FIXED:
+        raise NotImplementedError(
+            f"V2 dMint with daa_mode={state.daa_mode.name} is not mintable: the "
+            "covenant's state-transition check requires the recreated state to equal "
+            "the current state with only `height` incremented, so target/last_time "
+            "can never advance \u2014 ASERT/LWMA cannot adjust difficulty. Only "
+            "DaaMode.FIXED is consensus-functional. See #219."
+        )
+    if current_time != 0:
+        raise ValidationError(
+            "current_time must be 0 for V2 FIXED mints: there is no DAA and the "
+            "recreated state's last_time must stay byte-identical to the current "
+            "contract (the covenant forbids changing it). Pass current_time=0."
         )
     if state.is_exhausted:
         raise ContractExhaustedError(
             f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
         )
     if len(nonce) != 8:
-        raise ValidationError(f"nonce must be 8 bytes, got {len(nonce)}")
+        raise ValidationError(f"V2 nonce must be 8 bytes, got {len(nonce)}")
     if len(miner_pkh) != 20:
         raise ValidationError(f"miner_pkh must be 20 bytes, got {len(miner_pkh)}")
+    if contract_utxo.value != 1:
+        raise ValidationError(
+            f"V2 dMint contract must be a 1-photon singleton, got {contract_utxo.value} photons. "
+            "The covenant enforces OP_OUTPUTVALUE==1 on the recreated contract output, so a "
+            "non-1-photon carrier is unmintable. Deploy with a 1-photon contract output."
+        )
 
-    # --- Compute updated state ---
+    # Reject token-bearing funding UTXOs to prevent silent token-burn.
+    if is_token_bearing_script(funding_utxo.script):
+        raise InvalidFundingUtxoError(
+            f"funding_utxo at {funding_utxo.txid}:{funding_utxo.vout} carries an "
+            "OP_PUSHINPUTREF-family opcode (token envelope) and cannot be spent as "
+            "fee \u2014 that would silently destroy the token. Use a plain RXD UTXO."
+        )
+    if op_return_msg is not None and len(op_return_msg) > 80:
+        raise ValidationError(f"op_return_msg too long ({len(op_return_msg)} bytes); standardness limit is 80 bytes")
+
+    # --- Updated state: ONLY `height` changes. The covenant rebuilds the
+    # expected next state as ``<height+1 push> + current_state[5:]`` and
+    # OP_EQUALVERIFYs it against the recreated output, so we recreate the
+    # contract script byte-for-byte from the spent UTXO with just the 5-byte
+    # height push bumped \u2014 exact by construction (target, last_time, algo,
+    # daaMode all preserved).
     new_height = state.height + 1
-
-    # DAA target update (off-chain mirror of on-chain script logic).
-    if state.daa_mode == DaaMode.ASERT:
-        new_target = compute_next_target_asert(
-            current_target=state.target,
-            last_time=state.last_time,
-            current_time=current_time,
-            target_time=state.target_time,
-            half_life=3600,  # embedded in the on-chain ASERT DAA bytecode
-        )
-    elif state.daa_mode == DaaMode.LWMA:
-        new_target = compute_next_target_linear(
-            current_target=state.target,
-            last_time=state.last_time,
-            current_time=current_time,
-            target_time=state.target_time,
-        )
-    else:
-        new_target = state.target  # FIXED — no DAA
-
+    contract_script = _push_4bytes_le(new_height) + contract_utxo.script[5:]
     updated_state = DmintState(
         height=new_height,
         contract_ref=state.contract_ref,
@@ -895,141 +931,85 @@ def build_dmint_mint_tx(
         algo=state.algo,
         daa_mode=state.daa_mode,
         target_time=state.target_time,
-        last_time=current_time,
-        target=new_target,
+        last_time=state.last_time,
+        target=state.target,
+        is_v1=False,
     )
 
-    # --- Build the updated contract script ---
-    # Reconstruct using DmintDeployParams as a vehicle for the builder (we only
-    # need the state + code sections; height/last_time will be updated).
-    updated_deploy_params = DmintDeployParams(
-        contract_ref=state.contract_ref,
-        token_ref=state.token_ref,
-        max_height=state.max_height,
-        reward=state.reward,
-        difficulty=1,  # dummy — we supply target directly below
-        algo=state.algo,
-        daa_mode=state.daa_mode,
-        target_time=state.target_time,
-        height=new_height,
-        last_time=current_time,
-    )
-    # Build code section from updated params (the code never changes across mints —
-    # only the state prefix changes).  We override the target in the state script
-    # by constructing it manually from the updated_state.
-    code_script = build_dmint_code_script(updated_deploy_params)
-
-    # Build updated state script directly from updated_state fields.
-    new_state_script = (
-        _push_4bytes_le(updated_state.height)
-        + b"\xd8"
-        + updated_state.contract_ref.to_bytes()
-        + b"\xd0"
-        + updated_state.token_ref.to_bytes()
-        + _push_minimal(updated_state.max_height)
-        + _push_minimal(updated_state.reward)
-        + _push_minimal(int(updated_state.algo))
-        + _push_minimal(int(updated_state.daa_mode))
-        + _push_minimal(updated_state.target_time)
-        + _push_4bytes_le(updated_state.last_time)
-        + _push_minimal(updated_state.target)
-    )
-    contract_script = new_state_script + _OP_STATESEPARATOR + code_script
-
-    # --- Build reward output script (75-byte FT-wrapped) ---
-    # The V2 covenant's FT-conservation check at _PART_C (offset 168 in the
-    # V1 layout, equivalent position in V2) sums photons under the FT
-    # codescript and requires the total to equal state.reward. A plain
-    # P2PKH carries no FT codescript, so its sum is zero and the
-    # NUMEQUALVERIFY would fail — the network would reject every V2 mint.
-    #
-    # The V2 fingerprint at _PART_C[20:32] (`dec0e9aa76e378e4a269e69d`) is
-    # byte-identical to V1's `_V1_FT_OUTPUT_EPILOGUE`; stronger, the entire
-    # _PART_C (107 bytes) equals _V1_EPILOGUE_SUFFIX[18:], so V2's whole
-    # output-validation block is V1's tail. The same 75-byte FT output
-    # builder works for both versions. The two invariants this relies on
-    # are pinned by TestFtLockingScriptBuilderCrossEquality (in
-    # tests/test_dmint_module.py) and TestBuildDmintMintTx (the V2 e2e
-    # path in tests/test_dmint_end_to_end.py).
-    #
-    # Discovered by red-team audit 2026-05-11 — the prior implementation
-    # used a 25-byte P2PKH which would have been rejected by any live V2
-    # contract (none exist on chain yet, so the bug stayed silent).
+    # The 75-byte FT-wrapped reward \u2014 load-bearing for the covenant's
+    # OP_CODESCRIPTHASHVALUESUM_OUTPUTS conservation check (_PART_C == V1 tail).
     reward_script = build_dmint_v1_ft_output_script(miner_pkh, state.token_ref)
+    change_script = b"\x76\xa9\x14" + miner_pkh + b"\x88\xac"
+    op_return_script: bytes | None = None
+    if op_return_msg is not None:
+        # Photonic-Wallet convention: OP_RETURN PUSH3 "msg" <push-len> <message>.
+        msg_marker = b"\x03msg"
+        if len(op_return_msg) <= 0x4B:
+            data_push = bytes([len(op_return_msg)]) + op_return_msg
+        else:
+            data_push = b"\x4c" + bytes([len(op_return_msg)]) + op_return_msg
+        op_return_script = b"\x6a" + msg_marker + data_push
 
-    # --- Placeholder scriptSig (nonce + two sentinel 0xff*32 hashes) ---
-    # The real hashes require txid + script bytes which are only available
-    # once outputs are finalised (see docstring). The placeholder uses
-    # 0xff bytes (rather than zeros) as a visibly-invalid sentinel: a
-    # miner loop that forgets to replace it produces a tx whose covenant
-    # rejects fast on the network rather than silently passing structural
-    # checks. Same sentinel used in the V1 path (see _build_dmint_v1_mint_tx).
+    # --- Placeholder scriptSigs: 8-byte-nonce covenant scriptSig (sentinel
+    # 0xff*32 hashes) + 108-byte worst-case P2PKH funding scriptSig (see the V1
+    # path for the 108-byte rationale). Both replaced after mining / signing.
     placeholder_hash = b"\xff" * 32
-    placeholder_scriptsig = build_mint_scriptsig(nonce, placeholder_hash, placeholder_hash, nonce_width=8)
+    placeholder_contract_scriptsig = build_mint_scriptsig(nonce, placeholder_hash, placeholder_hash, nonce_width=8)
+    placeholder_funding_scriptsig = b"\x00" * 108
 
-    # --- Estimate tx size for fee ---
-    # Approximate: 4 (ver) + 1 (in count) + 41 (outpoint+seq) + 1 (len) + len(scriptsig)
-    #              + 1 (out count) + 2 * (8+1+len(script)) + 4 (locktime)
-    _contract_script_len = len(contract_script)
-    _reward_script_len = len(reward_script)
-    _scriptsig_len = len(placeholder_scriptsig)
-    estimated_size = (
-        4  # version
-        + 1  # vin count
-        + 36  # outpoint (txid + vout)
-        + 4  # sequence
-        + _varint_size(_scriptsig_len)
-        + _scriptsig_len  # scriptsig
-        + 1  # vout count
-        + 8
-        + _varint_size(_contract_script_len)
-        + _contract_script_len  # contract out
-        + 8
-        + _varint_size(_reward_script_len)
-        + _reward_script_len  # reward out
-        + 4  # locktime
-    )
-    fee = estimated_size * fee_rate
-
-    # Contract output value = pool balance minus reward minus fee.
-    contract_out_value = contract_utxo.value - state.reward - fee
-
-    if contract_out_value < 546:
-        raise PoolTooSmallError(
-            f"Contract UTXO value ({contract_utxo.value}) too small to cover "
-            f"reward ({state.reward}) + fee ({fee}): contract output would be "
-            f"{contract_out_value} photons, below 546 dust limit."
-        )
-
-    # --- Assemble transaction (unsigned) ---
-    # We use Script wrappers for the transaction infra's type system.
     padding_output = TransactionOutput(Script(b""), 0)
-    shim_outputs = [padding_output] * contract_utxo.vout + [
+    contract_src_outputs = [padding_output] * contract_utxo.vout + [
         TransactionOutput(Script(contract_utxo.script), contract_utxo.value)
     ]
-    src_tx = Transaction(tx_inputs=[], tx_outputs=shim_outputs)
-    src_tx.txid = lambda: contract_utxo.txid  # type: ignore[method-assign]
+    contract_src_tx = Transaction(tx_inputs=[], tx_outputs=contract_src_outputs)
+    contract_src_tx.txid = lambda: contract_utxo.txid  # type: ignore[method-assign]
 
-    # The contract input's unlocking_script_template is set to None — we manage
-    # the scriptSig directly by setting unlocking_script after construction.
+    funding_src_outputs = [padding_output] * funding_utxo.vout + [
+        TransactionOutput(Script(funding_utxo.script), funding_utxo.value)
+    ]
+    funding_src_tx = Transaction(tx_inputs=[], tx_outputs=funding_src_outputs)
+    funding_src_tx.txid = lambda: funding_utxo.txid  # type: ignore[method-assign]
+
     contract_input = TransactionInput(
-        source_transaction=src_tx,
+        source_transaction=contract_src_tx,
         source_txid=contract_utxo.txid,
         source_output_index=contract_utxo.vout,
         unlocking_script_template=None,
     )
     contract_input.satoshis = contract_utxo.value
     contract_input.locking_script = Script(contract_utxo.script)
-    # Attach the placeholder scriptSig so callers can inspect the tx structure.
-    contract_input.unlocking_script = Script(placeholder_scriptsig)
+    contract_input.unlocking_script = Script(placeholder_contract_scriptsig)
 
-    tx = Transaction(
-        tx_inputs=[contract_input],
-        tx_outputs=[
-            TransactionOutput(Script(contract_script), contract_out_value),
-            TransactionOutput(Script(reward_script), state.reward),
-        ],
+    funding_input = TransactionInput(
+        source_transaction=funding_src_tx,
+        source_txid=funding_utxo.txid,
+        source_output_index=funding_utxo.vout,
+        unlocking_script_template=None,
     )
+    funding_input.satoshis = funding_utxo.value
+    funding_input.locking_script = Script(funding_utxo.script)
+    funding_input.unlocking_script = Script(placeholder_funding_scriptsig)
+
+    trial_outputs = [
+        TransactionOutput(Script(contract_script), contract_utxo.value),  # value 1 (singleton), preserved
+        TransactionOutput(Script(reward_script), state.reward),
+    ]
+    if op_return_script:
+        trial_outputs.append(TransactionOutput(Script(op_return_script), 0))
+    change_output = TransactionOutput(Script(change_script), 0)  # value patched below
+    trial_outputs.append(change_output)
+
+    tx = Transaction(tx_inputs=[contract_input, funding_input], tx_outputs=trial_outputs)
+    # The funding input pays the FT reward photons + the tx fee + change.
+    fee = len(tx.serialize()) * fee_rate
+    change_value = funding_utxo.value - state.reward - fee
+    if change_value < 546:
+        raise PoolTooSmallError(
+            f"funding_utxo ({funding_utxo.value} photons) too small to cover "
+            f"reward ({state.reward}) + fee ({fee}): change would be "
+            f"{change_value} photons, below 546 dust limit."
+        )
+    change_output.satoshis = change_value
 
     return DmintMintResult(
         tx=tx,

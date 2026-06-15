@@ -63,12 +63,13 @@ from pyrxd.glyph.dmint import (
     DmintAlgo,
     DmintContractUtxo,
     DmintDeployParams,
+    DmintMinerFundingUtxo,
     DmintState,
     V2UnvalidatedWarning,
     build_dmint_contract_script,
-    build_dmint_v1_ft_output_script,
+    build_dmint_mint_tx,
+    build_dmint_v2_mint_preimage,
     build_mint_scriptsig,
-    build_pow_preimage,
     mine_solution_dispatch,
 )
 from pyrxd.glyph.types import GlyphRef
@@ -193,66 +194,35 @@ def _build_signed_v2_mint(node: _RegtestNode, contract: DmintContractUtxo) -> tu
     preimage's bound output. An 8-byte nonce reliably solves in a single ~2**32
     sweep (no message-rolling, unlike V1's 4-byte nonce).
     """
-    state = contract.state
+    funding_coin = _carve(node, 50_000_000)
+    funding = DmintMinerFundingUtxo(
+        txid=funding_coin.txid, vout=funding_coin.vout, value=funding_coin.val, script=funding_coin.spk
+    )
+    miner_pkh = bytes(Hex20(PrivateKey(secrets.token_bytes(32)).public_key().hash160()))
+
+    # Build the mint via the real library API — the V2 path now emits the
+    # consensus-correct V1-shaped tx (contract + funding inputs; value-1 singleton
+    # recreated at height+1; FT reward; OP_RETURN at vout[2]; change).
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", V2UnvalidatedWarning)
-        recreated = build_dmint_contract_script(
-            _v2_params(
-                max_height=state.max_height,
-                reward=state.reward,
-                height=state.height + 1,
-                last_time=state.last_time,
-                contract_ref=state.contract_ref,
-                token_ref=state.token_ref,
-            )
+        result = build_dmint_mint_tx(
+            contract,
+            nonce=b"\x00" * 8,
+            miner_pkh=miner_pkh,
+            current_time=0,
+            funding_utxo=funding,
+            op_return_msg=b"pyrxd-v2-regtest",
         )
-    miner_pkh = bytes(Hex20(PrivateKey(secrets.token_bytes(32)).public_key().hash160()))
-    reward_script = build_dmint_v1_ft_output_script(miner_pkh, state.token_ref)
-    msg = b"pyrxd-v2-regtest"
-    op_return = b"\x6a\x03msg" + bytes([len(msg)]) + msg
+        tx = result.tx
+        op_return_script = tx.outputs[2].locking_script.script
+        pre = build_dmint_v2_mint_preimage(contract, funding, op_return_script)
 
-    funding = _carve(node, 50_000_000)
-    change_key = PrivateKey(secrets.token_bytes(32))
-
-    placeholder = b"\xff" * 32
-    # Contract input: a covenant UTXO (raw scriptSig), not a P2PKH — build directly.
-    contract_in = TransactionInput(
-        source_transaction=_src(contract.txid, contract.vout, contract.script, contract.value),
-        source_txid=contract.txid,
-        source_output_index=contract.vout,
-        unlocking_script_template=None,
-    )
-    contract_in.satoshis = contract.value
-    contract_in.locking_script = Script(contract.script)
-    contract_in.unlocking_script = Script(build_mint_scriptsig(b"\x00" * 8, placeholder, placeholder, nonce_width=8))
-    funding_in = _spend(funding)
-    funding_in.unlocking_script_template = None
-    funding_in.unlocking_script = Script(b"\x00" * 108)
-
-    outs = [
-        TransactionOutput(Script(recreated), _CONTRACT_VALUE),
-        TransactionOutput(Script(reward_script), state.reward),
-        TransactionOutput(Script(op_return), 0),
-        TransactionOutput(Script(_p2pkh_spk(change_key)), 0),
-    ]
-    tx = Transaction(tx_inputs=[contract_in, funding_in], tx_outputs=outs)
-    fee = len(tx.serialize()) * 10_000
-    change_val = funding.val - state.reward - fee
-    assert change_val > 546, f"funding too small: change {change_val}"
-    outs[3].satoshis = change_val
-
-    pre = build_pow_preimage(
-        txid_le=bytes.fromhex(contract.txid)[::-1],
-        contract_ref_bytes=state.contract_ref.to_bytes(),
-        input_script=funding.spk,
-        output_script=op_return,
-    )
     mined = mine_solution_dispatch(
-        preimage=pre.preimage, target=state.target, nonce_width=8, miner_argv=_MINER_ARGV, timeout_s=900.0
+        preimage=pre.preimage, target=contract.state.target, nonce_width=8, miner_argv=_MINER_ARGV, timeout_s=900.0
     )
     nonce = mined.nonce
-    contract_in.unlocking_script = Script(build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=8))
-    _sign_funding_input(tx, 1, funding.key)
+    tx.inputs[0].unlocking_script = Script(build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=8))
+    _sign_funding_input(tx, 1, funding_coin.key)
     return tx, nonce
 
 
