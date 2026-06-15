@@ -28,6 +28,31 @@ Window discipline (matches the existing codebase split):
   Sources: Base "Transaction Finality" docs; OP-stack batcher/configurability specs
   (https://docs.base.org/base-chain/network-information/transaction-finality,
   https://specs.optimism.io/protocol/configurability.html).
+* Optimism (OP-stack L2): the SAME stack as Base, identical finalized-tag semantics; 900 s
+  steady-state (observed ~15-20 min), 12 h sequencing-window worst case budgeted separately.
+  Source: https://docs.optimism.io/app-developers/transactions/statuses
+* Arbitrum One (Nitro optimistic rollup): finalized = L2 block whose Sequencer batch sits in a
+  FINALIZED L1 block (Ethereum-anchored hard finality). ~10-20 min steady-state -> 1200 s. WORST
+  CASE: the sequencer force-inclusion delay (``maxTimeVariation``) is ~24 h (vs OP-stack 12 h) — a
+  liveness stall of the finalized tag, budgeted via ``eth_finality_stall_tolerance_s``; NOT the
+  ~6.4 d withdrawal dispute window (irrelevant to reorg safety).
+  Source: https://docs.arbitrum.io/how-arbitrum-works/transaction-lifecycle
+* Linea (zk / validity rollup): finalized = L2 block whose validity PROOF is verified in a
+  finalized L1 block (Ethereum-anchored). Proof-cadence-dominated: official MEDIAN hard finality
+  ~1 h 40 (6000 s), documented to "never exceed 16 h" — that tail goes to the stall budget, not
+  the steady window. Source: https://docs.linea.build (finality).
+
+Deliberately NOT in the registry — **Polygon PoS** (chain_id 137): it does not fit this model.
+Its ``finalized`` tag is Polygon's OWN validator-set "milestone" finality (Heimdall / CometBFT,
+~5 s), NOT Ethereum-anchored — Polygon PoS is a commit-chain/sidechain that checkpoints to
+Ethereum for withdrawal proofs but does not inherit Ethereum finality block-by-block. So the
+768 s floor misrepresents it in BOTH directions: it finalizes far faster than 768 s (via its own
+~5 s consensus), and that finality is secured by Polygon's stake, not Ethereum's. Treating it as
+"just another EVM chain" would silently swap the trust model an atomic-swap operator relies on; a
+Polygon-PoS swap needs an explicit, separately-justified finality model (a reorg depth in
+Polygon's own security terms), not this Ethereum-anchored window. ``evm_chain_by_id(137)`` fails
+closed. (A 2025-09-10 faulty-milestone incident delayed Polygon finality ~15 min-1 h, resolved
+only by an emergency hard fork — a validator-set liveness risk with no Ethereum analogue.)
 
 The ``network`` tag feeds the existing fail-closed gates unchanged: any tag not in
 ``AUDIT_CLEARED_NETWORKS`` (only isolated test chains are) is value-bearing and refuses to
@@ -89,6 +114,28 @@ KNOWN_EVM_CHAINS: dict[str, EvmChain] = {
     # for the 12 h sequencing-window worst case and where to budget it.
     "base": EvmChain(name="base", chain_id=8453, network="base", finalization_window_s=900),
     "base-sepolia": EvmChain(name="base-sepolia", chain_id=84532, network="base-sepolia", finalization_window_s=900),
+    # Optimism (OP-stack L2) — the SAME stack as Base, identical finalized-tag semantics
+    # (finalized = batch in a finalized L1 block). 900 s matches Base's CHOSEN steady-state;
+    # observed steady lag ~15-20 min, the 12 h sequencing-window worst case budgeted separately.
+    "optimism": EvmChain(name="optimism", chain_id=10, network="optimism", finalization_window_s=900),
+    "optimism-sepolia": EvmChain(
+        name="optimism-sepolia", chain_id=11155420, network="optimism-sepolia", finalization_window_s=900
+    ),
+    # Arbitrum One (Nitro optimistic rollup) — finalized = L2 block whose Sequencer batch sits in
+    # a FINALIZED L1 block (Ethereum-anchored "hard finality"). Steady-state ~10-20 min -> 1200 s
+    # (upper end of the cited range); the ~24 h sequencer force-inclusion (maxTimeVariation) worst
+    # case is a liveness stall, budgeted separately. NOT the ~6.4 d withdrawal dispute window.
+    "arbitrum-one": EvmChain(name="arbitrum-one", chain_id=42161, network="arbitrum-one", finalization_window_s=1200),
+    "arbitrum-sepolia": EvmChain(
+        name="arbitrum-sepolia", chain_id=421614, network="arbitrum-sepolia", finalization_window_s=1200
+    ),
+    # Linea (zk / validity rollup) — finalized = L2 block whose validity PROOF is verified in a
+    # finalized L1 block (Ethereum-anchored). Proof-cadence-dominated: 6000 s ~= the official
+    # MEDIAN hard finality (~1 h 40); the documented up-to-16 h tail is budgeted separately.
+    "linea": EvmChain(name="linea", chain_id=59144, network="linea", finalization_window_s=6000),
+    "linea-sepolia": EvmChain(
+        name="linea-sepolia", chain_id=59141, network="linea-sepolia", finalization_window_s=6000
+    ),
 }
 
 
