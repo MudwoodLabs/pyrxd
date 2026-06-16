@@ -56,7 +56,6 @@ from .types import (
     DaaMode,
     DmintAlgo,
     DmintMintResult,
-    _warn_v2_unvalidated,
 )
 
 # ---------------------------------------------------------------------------
@@ -226,11 +225,9 @@ def compute_next_target_asert(
     The per-step cap matches the miner's ``newTarget = min(MAX, oldTarget<<drift)``
     clamp-at-MAX semantics (a naive ``target << drift`` would overshoot MAX).
 
-    .. warning::
-       V2-only DAA. V1 has no DAA (fixed difficulty). Emits
-       :class:`V2UnvalidatedWarning`.
+    .. note::
+       V2-only DAA. V1 has no DAA (fixed difficulty).
     """
-    _warn_v2_unvalidated()
     excess = (current_time - last_time) - target_time
     drift = _trunc_div(excess, half_life)
     drift = max(-4, min(4, drift))
@@ -264,10 +261,9 @@ def compute_next_target_linear(
     The MAX/4 target cap means LWMA contracts cannot have a difficulty floor
     below 4 (``target <= MAX_TARGET/4``).
 
-    .. warning::
-       V2-only DAA. See :class:`V2UnvalidatedWarning`.
+    .. note::
+       V2-only DAA.
     """
-    _warn_v2_unvalidated()
     time_delta_capped = min(current_time - last_time, 4 * target_time)
     target_capped = min(current_target, MAX_SHA256D_TARGET // 4)
     new_target = (target_capped // target_time) * time_delta_capped
@@ -1457,14 +1453,11 @@ def build_dmint_v2_mint_preimage(
     Callers selecting ``output_script`` should pick one of the actual
     transaction outputs and document the binding in their own code.
 
-    .. warning::
-       V2 has never been validated on Radiant mainnet. Emits
-       :class:`V2UnvalidatedWarning`. This helper exists to close the
-       audit's security-H1 finding (no V2 analog of
+    .. note::
+       This helper closes the audit's security-H1 finding (no V2 analog of
        ``build_dmint_v1_mint_preimage`` left V2 callers one careless
-       script-mismatch away from reproducing the M1 bug pattern), but
-       no live V2 contract has accepted the preimages this function
-       returns. Use V1 unless you have a specific reason to test V2.
+       script-mismatch away from reproducing the M1 bug pattern). V2 is
+       consensus-proven on regtest + mainnet (#219).
 
     :param contract_utxo:  The V2 contract UTXO being spent. Its
                            ``state.is_v1`` MUST be ``False`` — passing
@@ -1481,7 +1474,6 @@ def build_dmint_v2_mint_preimage(
     :raises ValidationError: V1 contract UTXO passed by mistake, or an
                            empty ``output_script``.
     """
-    _warn_v2_unvalidated()
     if contract_utxo.state.is_v1:
         raise ValidationError(
             "build_dmint_v2_mint_preimage called with a V1 contract UTXO "

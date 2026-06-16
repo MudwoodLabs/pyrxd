@@ -707,143 +707,55 @@ class TestFtLockingScriptMainnetGolden:
 
 
 # ---------------------------------------------------------------------------
-# V2 quarantine — V2UnvalidatedWarning fires on every V2 entry point
+# V2 is no longer quarantined — the per-call V2UnvalidatedWarning is not emitted
 # ---------------------------------------------------------------------------
 
 
-class TestV2QuarantineWarning:
-    """Every V2 dMint entry point emits ``V2UnvalidatedWarning`` because no
-    V2 contract exists on Radiant mainnet as of pyrxd 0.5.1. Users can
-    silence the warning (``simplefilter('ignore', V2UnvalidatedWarning)``)
-    once they accept the risk, or escalate it (``simplefilter('error', ...)``)
-    in CI to forbid V2 use until it's field-validated.
-
-    The pattern protects against the recurring "builder + verifier
-    round-trips fine, but the bytes have never run on chain" anti-pattern
-    that produced the M1 mint-shape bug and the 0.5.0 R1 V2 reward-shape
-    bug. See docs/solutions/logic-errors/dmint-v1-mint-shape-mismatch.md.
-    """
+class TestV2NotQuarantined:
+    """The canonical-Photonic V2 redesign is consensus-proven (regtest + mainnet,
+    #219), so V2 entry points NO LONGER emit ``V2UnvalidatedWarning``. These guard
+    against accidentally re-introducing the per-call warning."""
 
     def _params(self) -> DmintDeployParams:
         return DmintDeployParams(
-            contract_ref=_CONTRACT_REF,
-            token_ref=_TOKEN_REF,
-            max_height=10,
-            reward=1000,
-            difficulty=1,
+            contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF, max_height=10, reward=1000, difficulty=1
         )
 
-    def test_build_dmint_state_script_warns(self):
-        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_state_script
-
-        with pytest.warns(V2UnvalidatedWarning, match="V2 dMint code path"):
-            build_dmint_state_script(self._params())
-
-    def test_build_dmint_code_script_warns(self):
-        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_code_script
-
-        with pytest.warns(V2UnvalidatedWarning):
-            build_dmint_code_script(self._params())
-
-    def test_build_dmint_contract_script_warns_exactly_once(self):
-        """``build_dmint_contract_script`` calls ``build_dmint_state_script``
-        and ``build_dmint_code_script`` internally; without de-duplication
-        a single user call would emit 3 warnings. The implementation
-        suppresses the inner two so the user sees exactly one warning per
-        call site."""
-        import warnings
-
-        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_contract_script
-
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always", V2UnvalidatedWarning)
-            build_dmint_contract_script(self._params())
-        v2_warnings = [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)]
-        assert len(v2_warnings) == 1, f"expected exactly 1 V2UnvalidatedWarning, got {len(v2_warnings)}"
-
-    def test_compute_next_target_asert_warns(self):
-        from pyrxd.glyph.dmint import V2UnvalidatedWarning, compute_next_target_asert
-
-        with pytest.warns(V2UnvalidatedWarning):
-            compute_next_target_asert(
-                current_target=1_000_000,
-                last_time=0,
-                current_time=60,
-                target_time=60,
-                half_life=3600,
-            )
-
-    def test_compute_next_target_linear_warns(self):
-        from pyrxd.glyph.dmint import V2UnvalidatedWarning, compute_next_target_linear
-
-        with pytest.warns(V2UnvalidatedWarning):
-            compute_next_target_linear(
-                current_target=1_000_000,
-                last_time=0,
-                current_time=60,
-                target_time=60,
-            )
-
-    def test_warning_can_be_silenced(self):
-        """Production users who've audited V2 themselves can silence the
-        warning class without affecting other warnings."""
-        import warnings
-
-        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_state_script
-
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("ignore", V2UnvalidatedWarning)
-            build_dmint_state_script(self._params())
-        v2_warnings = [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)]
-        assert v2_warnings == []
-
-    def test_warning_can_be_made_fatal(self):
-        """CI environments that forbid V2 use can escalate the warning to
-        an exception."""
-        import warnings
-
-        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_state_script
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", V2UnvalidatedWarning)
-            with pytest.raises(V2UnvalidatedWarning, match="V2 dMint code path"):
-                build_dmint_state_script(self._params())
-
-    def test_v1_builders_do_not_warn(self):
-        """The V1 dMint builders (``build_dmint_v1_state_script``, etc.) are
-        field-validated against mainnet and must NOT emit the V2 quarantine
-        warning. Regression guard: a future refactor must not accidentally
-        mark V1 paths as untested."""
+    def test_v2_builders_do_not_warn(self):
         import warnings
 
         from pyrxd.glyph.dmint import (
             V2UnvalidatedWarning,
-            build_dmint_v1_contract_script,
-            build_dmint_v1_ft_output_script,
+            build_dmint_code_script,
+            build_dmint_contract_script,
+            build_dmint_state_script,
         )
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always", V2UnvalidatedWarning)
-            build_dmint_v1_contract_script(
-                height=0,
-                contract_ref=_CONTRACT_REF,
-                token_ref=_TOKEN_REF,
-                max_height=10,
-                reward=1000,
-                target=MAX_SHA256D_TARGET,
-            )
-            build_dmint_v1_ft_output_script(b"\x00" * 20, _TOKEN_REF)
-        v2_warnings = [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)]
-        assert v2_warnings == [], "V1 path emitted V2 quarantine warning — regression"
+            build_dmint_state_script(self._params())
+            build_dmint_code_script(self._params())
+            build_dmint_contract_script(self._params())
+        assert [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)] == []
 
-    def test_warning_class_is_subclass_of_user_warning(self):
-        """``V2UnvalidatedWarning`` inherits from ``UserWarning`` (not
-        ``DeprecationWarning``) so it doesn't get filtered with the
-        general "ignore deprecations" rules many projects set up."""
+    def test_v2_daa_helpers_do_not_warn(self):
+        import warnings
+
+        from pyrxd.glyph.dmint import V2UnvalidatedWarning, compute_next_target_asert, compute_next_target_linear
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", V2UnvalidatedWarning)
+            compute_next_target_asert(
+                current_target=1_000_000, last_time=0, current_time=60, target_time=60, half_life=3600
+            )
+            compute_next_target_linear(current_target=1_000_000, last_time=0, current_time=60, target_time=60)
+        assert [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)] == []
+
+    def test_warning_class_retained_for_backward_compat(self):
+        # Kept importable (not deleted) so downstream simplefilter() filters still resolve.
         from pyrxd.glyph.dmint import V2UnvalidatedWarning
 
         assert issubclass(V2UnvalidatedWarning, UserWarning)
-        assert not issubclass(V2UnvalidatedWarning, DeprecationWarning)
 
 
 # ---------------------------------------------------------------------------
