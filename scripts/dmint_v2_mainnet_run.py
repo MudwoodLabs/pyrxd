@@ -53,11 +53,21 @@ from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
 
-_STATE = "/tmp/dmint_v2_mainnet_state.json"  # noqa: S108 — ephemeral ops state (0600); holds throwaway carve WIFs
 _MINER_ARGV = [sys.executable, "-m", "pyrxd.contrib.miner", "--workers", "20"]
 _MINE_TIMEOUT_S = 2400.0
 
-# Run params (FIXED, difficulty=1 → target=MAX → only the 4-zero PoW floor gates).
+# Run mode: DMINT_RUN_MODE=fixed (default) or lwma. Both deploy at difficulty=1
+# (target=MAX → mining is just the consensus 4-zero PoW floor). LWMA additionally
+# proves adaptive difficulty: a fast block (delta=30 < target_time=60) lowers the
+# recreated target on-chain, exactly matching compute_next_target_linear.
+_MODE = os.environ.get("DMINT_RUN_MODE", "fixed").lower()
+_DAA_MODE = DaaMode.LWMA if _MODE == "lwma" else DaaMode.FIXED
+_STATE = f"/tmp/dmint_v2_mainnet_state_{_MODE}.json"  # noqa: S108 — ephemeral ops state (0600); holds throwaway WIFs
+_DEPLOY_LAST_TIME = 1_700_000_000 if _MODE == "lwma" else 0  # past ts so the mint nLockTime is final
+_TARGET_TIME = 60
+_MINT_CURRENT_TIME = _DEPLOY_LAST_TIME + 30 if _MODE == "lwma" else 0  # fast block → LWMA lowers target
+
+# Run params (difficulty=1 → target=MAX → only the 4-zero PoW floor gates mining).
 _MAX_HEIGHT = 10
 _REWARD = 1000  # photons emitted by the mint (FT reward output)
 _GENESIS_CARVE = 30_000_000  # 0.30 RXD per genesis UTXO (covers contract+deploy fee+change)
@@ -179,10 +189,10 @@ def prepare() -> None:
         reward=_REWARD,
         difficulty=1,
         algo=DmintAlgo.SHA256D,
-        daa_mode=DaaMode.FIXED,
-        target_time=60,
+        daa_mode=_DAA_MODE,
+        target_time=_TARGET_TIME,
         height=0,
-        last_time=0,
+        last_time=_DEPLOY_LAST_TIME,
     )
     contract_script = build_dmint_contract_script(params)
     state = DmintState.from_script(contract_script)
@@ -266,9 +276,9 @@ def mine() -> None:
         contract,
         nonce=b"\x00" * 8,
         miner_pkh=miner_pkh,
-        current_time=0,  # FIXED: lastTime stays 0 (== deploy), nLockTime 0
+        current_time=_MINT_CURRENT_TIME,  # FIXED: 0 (lastTime stays 0). LWMA: deploy_last_time+30.
         funding_utxo=funding,
-        op_return_msg=b"pyrxd-v2-mainnet",
+        op_return_msg=f"pyrxd-v2-mainnet-{_MODE}".encode(),
     )
     tx = result.tx
     op_return_script = tx.outputs[2].locking_script.script
@@ -322,8 +332,13 @@ def send_mint() -> None:
     print(f"  contract input spent (gettxout null expected when mempool-spent): {spent}", flush=True)
     print(f"  recreated contract vout0: {recreated}", flush=True)
     print(f"  reward vout1: {reward}", flush=True)
-    print(f"\n[send-mint] DONE. deploy={st.get('deploy_sent_txid')} mint={txid}", flush=True)
-    print(f"  recreated height={st['recreated_state']['height']}", flush=True)
+    rs = st["recreated_state"]
+    MAX = 0x7FFFFFFFFFFFFFFF
+    print(f"\n[send-mint] DONE ({_MODE}). deploy={st.get('deploy_sent_txid')} mint={txid}", flush=True)
+    print(f"  recreated height={rs['height']}  target={rs['target']}", flush=True)
+    if _MODE == "lwma":
+        moved = "LOWERED (DAA fired)" if rs["target"] < MAX else "unchanged"
+        print(f"  LWMA: deploy target=MAX ({MAX}); recreated target {moved} — on-chain == off-chain.", flush=True)
 
 
 _STAGES = {"prepare": prepare, "send-deploy": send_deploy, "mine": mine, "send-mint": send_mint}
