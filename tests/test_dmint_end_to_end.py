@@ -750,12 +750,11 @@ class TestBuildDmintV2MintPreimage:
     _SYNTH_OUTPUT_SCRIPT = bytes.fromhex("6a045465737400")  # OP_RETURN "Test\x00"
 
     def test_returns_pow_preimage_result(self):
-        from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_v2_mint_preimage
+        from pyrxd.glyph.dmint import build_dmint_v2_mint_preimage
 
         utxo = _make_contract_utxo()
         funding = _make_funding_utxo()
-        with pytest.warns(V2UnvalidatedWarning):
-            result = build_dmint_v2_mint_preimage(utxo, funding, self._SYNTH_OUTPUT_SCRIPT)
+        result = build_dmint_v2_mint_preimage(utxo, funding, self._SYNTH_OUTPUT_SCRIPT)
         assert len(result.preimage) == 64
         assert len(result.input_hash) == 32
         assert len(result.output_hash) == 32
@@ -868,12 +867,16 @@ class TestBuildDmintV2MintPreimage:
             with pytest.raises(ValidationError, match="output_script must be non-empty"):
                 build_dmint_v2_mint_preimage(utxo, funding, b"")
 
-    def test_emits_v2_unvalidated_warning(self):
-        """The helper itself emits V2UnvalidatedWarning (audit H1's
-        "make untested status visible at runtime" requirement)."""
+    def test_does_not_emit_v2_unvalidated_warning(self):
+        """V2 is consensus-proven (#219) — the preimage helper no longer emits
+        the quarantine warning."""
+        import warnings
+
         from pyrxd.glyph.dmint import V2UnvalidatedWarning, build_dmint_v2_mint_preimage
 
         utxo = _make_contract_utxo()
         funding = _make_funding_utxo()
-        with pytest.warns(V2UnvalidatedWarning, match="V2 dMint code path"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", V2UnvalidatedWarning)
             build_dmint_v2_mint_preimage(utxo, funding, self._SYNTH_OUTPUT_SCRIPT)
+        assert [w for w in caught if issubclass(w.category, V2UnvalidatedWarning)] == []

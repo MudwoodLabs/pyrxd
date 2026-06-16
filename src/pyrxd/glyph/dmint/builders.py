@@ -34,7 +34,6 @@ Symbols (17 + 4 epilogue constants shared with chain):
 from __future__ import annotations
 
 import struct
-import warnings
 
 from pyrxd.security.errors import ValidationError
 
@@ -48,8 +47,6 @@ from .types import (
     DaaMode,
     DmintAlgo,
     DmintDeployParams,
-    V2UnvalidatedWarning,
-    _warn_v2_unvalidated,
 )
 
 # ---------------------------------------------------------------------------
@@ -395,12 +392,7 @@ def build_dmint_state_script(params: DmintDeployParams) -> bytes:
     policy on mainnet. ``lastTime`` stays a 4-byte push (Unix timestamps are
     always 4-byte minimal), which simplifies Part C's ``04 || NUM2BIN(4, locktime)``
     reconstruction.
-
-    .. warning::
-       V2 has never been validated on Radiant mainnet (no V2 contract exists as
-       of pyrxd 0.5.1). Emits :class:`V2UnvalidatedWarning` once per call site.
     """
-    _warn_v2_unvalidated()
     return (
         _push_minimal(params.height)
         + _middle_literal(params)
@@ -410,12 +402,7 @@ def build_dmint_state_script(params: DmintDeployParams) -> bytes:
 
 
 def build_dmint_code_script(params: DmintDeployParams) -> bytes:
-    """Build the V2 dMint code bytecode (Part A + powHashOp + Part B + Part C).
-
-    .. warning::
-       V2-only. See :class:`V2UnvalidatedWarning`.
-    """
-    _warn_v2_unvalidated()
+    """Build the V2 dMint code bytecode (Part A + powHashOp + Part B + Part C)."""
     pow_op = _POW_HASH_OP[params.algo]
     part_b = _build_part_b(params.daa_mode, params.half_life)
     part_c = _build_part_c(_middle_literal(params))
@@ -427,19 +414,10 @@ def build_dmint_contract_script(params: DmintDeployParams) -> bytes:
 
     Byte-identical to the canonical Photonic ``dMintScript`` for the same
     parameters (validated against golden vectors in
-    tests/test_dmint_v2_canonical.py).
-
-    .. warning::
-       V2-only. See :class:`V2UnvalidatedWarning`.
+    tests/test_dmint_v2_canonical.py, and consensus-proven on regtest + mainnet).
     """
-    # Don't double-warn: the two helpers we delegate to already warn.
-    # Suppress here so a caller sees exactly one warning per
-    # build_dmint_contract_script call (not three).
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", V2UnvalidatedWarning)
-        state = build_dmint_state_script(params)
-        code = build_dmint_code_script(params)
-    _warn_v2_unvalidated()
+    state = build_dmint_state_script(params)
+    code = build_dmint_code_script(params)
     return state + _OP_STATESEPARATOR + code
 
 

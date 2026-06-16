@@ -167,11 +167,6 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "_match_v1_epilogue": ("pyrxd.glyph.dmint.chain", "_match_v1_epilogue"),
     "_push_4bytes_le": ("pyrxd.glyph.dmint.builders", "_push_4bytes_le"),
     "_push_minimal": ("pyrxd.glyph.dmint.builders", "_push_minimal"),
-    # Used internally by pyrxd.glyph.builder (V2 deploy warning path).
-    "_warn_v2_unvalidated": (
-        "pyrxd.glyph.dmint.types",
-        "_warn_v2_unvalidated",
-    ),
 }
 
 # Only public symbols (no leading underscore) appear in __all__ /

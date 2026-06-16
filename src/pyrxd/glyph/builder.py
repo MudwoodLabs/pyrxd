@@ -462,10 +462,6 @@ class GlyphBuilder:
         ``contractRef[i] = commit:(i+1)`` / ``tokenRef = commit:0``), differing
         only in the V2 contract bytecode. Gated on ``allow_v2_deploy``.
         """
-        import warnings
-
-        from .dmint import V2UnvalidatedWarning
-
         if not allow_v2_deploy:
             raise DmintError(
                 "prepare_dmint_deploy with DmintV2DeployParams emits V2 dMint "
@@ -502,24 +498,22 @@ class GlyphBuilder:
         # V2 layout; only the txid component of contractRef/tokenRef changes at reveal.
         placeholder_txid = "00" * 32
         placeholder_token_ref = GlyphRef(txid=placeholder_txid, vout=0)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", V2UnvalidatedWarning)
-            placeholder_contract_scripts = tuple(
-                build_dmint_contract_script(
-                    DmintDeployParams(
-                        contract_ref=GlyphRef(txid=placeholder_txid, vout=i + 1),
-                        token_ref=placeholder_token_ref,
-                        max_height=params.max_height,
-                        reward=params.reward_photons,
-                        difficulty=params.difficulty,
-                        algo=params.algo,
-                        daa_mode=params.daa_mode,
-                        target_time=params.target_time,
-                        half_life=params.half_life,
-                    )
+        placeholder_contract_scripts = tuple(
+            build_dmint_contract_script(
+                DmintDeployParams(
+                    contract_ref=GlyphRef(txid=placeholder_txid, vout=i + 1),
+                    token_ref=placeholder_token_ref,
+                    max_height=params.max_height,
+                    reward=params.reward_photons,
+                    difficulty=params.difficulty,
+                    algo=params.algo,
+                    daa_mode=params.daa_mode,
+                    target_time=params.target_time,
+                    half_life=params.half_life,
                 )
-                for i in range(params.num_contracts)
             )
+            for i in range(params.num_contracts)
+        )
 
         return DmintV2DeployResult(
             commit_result=commit_result,
@@ -950,12 +944,12 @@ class DmintV2DeployParams:
     the V2 covenant) and the 8-byte mint nonce; the reward + tx fee for each mint
     come from a miner-supplied funding input, not a pool.
 
-    Only ``DaaMode.FIXED`` is supported: the covenant's state-transition check
-    forbids advancing ``target``/``last_time``, so ASERT/LWMA contracts can never
-    adjust difficulty and are unmintable (see #219).
+    ``DaaMode.FIXED``, ``ASERT``, and ``LWMA`` are supported (the redesigned
+    covenant advances ``target``/``last_time`` on-chain); EPOCH/SCHEDULE are not
+    yet ported. See #219.
 
-    V2 has no live mainnet deploys; only ``prepare_dmint_deploy(..., allow_v2_deploy=True)``
-    accepts it, and construction emits ``V2UnvalidatedWarning``.
+    V2 is consensus-proven on regtest + mainnet but still pre-external-audit;
+    ``prepare_dmint_deploy`` requires ``allow_v2_deploy=True`` as a deliberate opt-in.
 
     :param metadata:        :class:`GlyphMetadata` (must include ``GlyphProtocol.FT``
         and ``GlyphProtocol.DMINT``; set ``version=2`` so indexers classify it as V2).
@@ -998,19 +992,12 @@ class DmintV2DeployParams:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
-        if self.daa_mode != DaaMode.FIXED:
+        if self.daa_mode in (DaaMode.EPOCH, DaaMode.SCHEDULE):
             raise ValidationError(
-                f"V2 dMint deploy supports only DaaMode.FIXED (got {self.daa_mode.name}); "
-                "the covenant's state-transition check forbids changing target/last_time, "
-                "so ASERT/LWMA contracts are unmintable. See #219."
+                f"V2 dMint deploy: DaaMode.{self.daa_mode.name} is defined in the protocol "
+                "but its bytecode emitter is not yet ported in pyrxd. Use FIXED, ASERT, or "
+                "LWMA (the redesigned covenant advances target/last_time on-chain; #219)."
             )
-        # V2 quarantine marker — see V2UnvalidatedWarning in pyrxd.glyph.dmint.
-        # Subclasses suppress this (DmintFullDeployParams's deprecation warning
-        # is the higher-priority signal there).
-        if type(self) is DmintV2DeployParams:
-            from .dmint import _warn_v2_unvalidated
-
-            _warn_v2_unvalidated()
 
 
 class DmintFullDeployParams(DmintV2DeployParams):
@@ -1239,32 +1226,26 @@ class DmintV2DeployResult:
         ``gly``/CBOR reveal scriptSig suffix + optional OP_RETURN. The returned
         :class:`DmintV1RevealScripts` bag has the same shape for V1 and V2.
         """
-        import warnings
-
-        from .dmint import V2UnvalidatedWarning
-
         if self.premine_amount is not None:
             raise NotImplementedError("V2 deploy with premine is deferred work. Set premine_amount=None.")
 
         token_ref = GlyphRef(txid=commit_txid, vout=0)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", V2UnvalidatedWarning)
-            contract_scripts = tuple(
-                build_dmint_contract_script(
-                    DmintDeployParams(
-                        contract_ref=GlyphRef(txid=commit_txid, vout=i + 1),
-                        token_ref=token_ref,
-                        max_height=self.max_height,
-                        reward=self.reward_photons,
-                        difficulty=self.difficulty,
-                        algo=self.algo,
-                        daa_mode=self.daa_mode,
-                        target_time=self.target_time,
-                        half_life=self.half_life,
-                    )
+        contract_scripts = tuple(
+            build_dmint_contract_script(
+                DmintDeployParams(
+                    contract_ref=GlyphRef(txid=commit_txid, vout=i + 1),
+                    token_ref=token_ref,
+                    max_height=self.max_height,
+                    reward=self.reward_photons,
+                    difficulty=self.difficulty,
+                    algo=self.algo,
+                    daa_mode=self.daa_mode,
+                    target_time=self.target_time,
+                    half_life=self.half_life,
                 )
-                for i in range(self.num_contracts)
             )
+            for i in range(self.num_contracts)
+        )
         scriptsig_suffix = build_reveal_scriptsig_suffix(self.cbor_bytes)
 
         op_return_script: bytes | None = None

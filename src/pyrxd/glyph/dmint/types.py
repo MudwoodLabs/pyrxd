@@ -6,7 +6,7 @@ constants. Depends on nothing within the subpackage; siblings import
 from here, not the reverse.
 
 Symbols (15):
-    V2UnvalidatedWarning, _V2_QUARANTINE_TEXT, _warn_v2_unvalidated,
+    V2UnvalidatedWarning,
     MAX_SHA256D_TARGET, MAX_V2_TARGET_256,
     DmintAlgo, DaaMode,
     _PART_B1, _PART_B2, _PART_B4,
@@ -16,7 +16,6 @@ Symbols (15):
 
 from __future__ import annotations
 
-import warnings
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any
@@ -43,41 +42,21 @@ from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 
 
 class V2UnvalidatedWarning(UserWarning):
-    """Warning category for V2 dMint code paths that have not been
-    validated against on-chain bytes.
+    """Retained warning category for V2 dMint code paths.
 
-    Distinct from ``DeprecationWarning`` because V2 isn't going away —
-    it's just not field-tested yet. Distinct from a bare ``UserWarning``
-    because callers should be able to filter it specifically (e.g.
-    ``warnings.simplefilter("error", V2UnvalidatedWarning)`` to make CI
-    fail hard on V2 use, or ``warnings.simplefilter("ignore",
-    V2UnvalidatedWarning)`` once a V2 contract is live and the warning
-    becomes noise).
+    HISTORY: V2 dMint was once quarantined behind this warning because it had
+    never been exercised against live consensus. That is no longer true — the
+    canonical-Photonic V2 redesign is byte-matched to upstream and consensus-
+    validated on radiant-core v3.1.1 regtest AND Radiant mainnet (3.1.2): the
+    first V2 dMint deploy + PoW mint confirmed on mainnet (deploy
+    ``95335028…bb16fb09``, mint ``1239f64a…e0cd6c67``; #219). The per-call
+    warning is therefore no longer emitted.
 
-    Will be removed (or reclassified) when V2 has its first mainnet
-    deploy + mint + several blocks of confirmed activity.
+    The class is kept (not deleted) so any downstream ``warnings.simplefilter(…,
+    V2UnvalidatedWarning)`` filters remain importable. V2 is still **pre-external-
+    audit** — that caveat lives in the README / threat-model, the same level as
+    V1, not in a per-call warning.
     """
-
-
-_V2_QUARANTINE_TEXT = (
-    "V2 dMint code path: pyrxd's V2 implementation is BYTE-EQUIVALENT "
-    "BY CONSTRUCTION to V1 where they share bytecode, but no V2 contract "
-    "exists on Radiant mainnet as of 0.5.1 — this path has never been "
-    "exercised against live consensus. Use V1 (DmintV1DeployParams) "
-    "unless you have a specific reason to test V2. To silence: "
-    "warnings.simplefilter('ignore', V2UnvalidatedWarning); to fail "
-    "loud: warnings.simplefilter('error', V2UnvalidatedWarning)."
-)
-
-
-def _warn_v2_unvalidated(stacklevel: int = 3) -> None:
-    """Emit the one-time V2 quarantine warning.
-
-    ``stacklevel=3`` so the warning points at the caller's call site, not
-    at this helper or the V2 entry-point function that called it. Adjust
-    if the call chain deepens.
-    """
-    warnings.warn(_V2_QUARANTINE_TEXT, V2UnvalidatedWarning, stacklevel=stacklevel)
 
 
 # ---------------------------------------------------------------------------

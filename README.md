@@ -67,9 +67,11 @@ Cryptographic primitives have not been independently audited. See
   Solidity legs driven by a chain-neutral coordinator; proven end-to-end on regtest (plus
   small real-value dust runs), against BTC, ETH, and EVM L2s (Base / Optimism / Arbitrum /
   Linea). An external security audit is the hard gate before any real value.
-- dMint **V2** (DAA / ASERT difficulty) — builders ship behind a footgun guard
-  (`allow_v2_deploy=True`) but are not yet consensus-validated (`V2UnvalidatedWarning`);
-  getting V2 mainnet-proven so it can move up is tracked in #219.
+- dMint **V2** (canonical Photonic redesign — FIXED plus ASERT / LWMA adaptive difficulty) —
+  byte-matched to upstream Photonic and consensus-validated on `radiant-core` v3.1.1 regtest
+  AND Radiant mainnet (3.1.2): the first V2 dMint deploy + PoW mint confirmed on mainnet (#219).
+  Like everything in this section it is still **pre-external-audit** (the hard gate), so V2
+  deploys are gated behind `allow_v2_deploy=True`.
 
 ## Upgrading
 
