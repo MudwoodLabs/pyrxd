@@ -589,9 +589,7 @@ class TestBuildDmintMintTx:
         # The code section (Part A/B/C) is invariant across mints: the spent
         # contract's code suffix appears verbatim at the tail of the recreated
         # script. The Part C prologue is a stable anchor inside that code.
-        part_c_prologue = bytes.fromhex(
-            "577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7e"
-        )
+        part_c_prologue = bytes.fromhex("577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7e")
         assert part_c_prologue in result.contract_script
         assert part_c_prologue in utxo.script
 

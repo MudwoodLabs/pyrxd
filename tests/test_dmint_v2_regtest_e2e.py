@@ -262,7 +262,11 @@ def _build_signed_v2_mint(
         pre = build_dmint_v2_mint_preimage(contract, funding, op_return_script)
 
     mined = mine_solution_dispatch(
-        preimage=pre.preimage, target=contract.state.target, nonce_width=8, miner_argv=_MINER_ARGV, timeout_s=_MINE_TIMEOUT_S
+        preimage=pre.preimage,
+        target=contract.state.target,
+        nonce_width=8,
+        miner_argv=_MINER_ARGV,
+        timeout_s=_MINE_TIMEOUT_S,
     )
     nonce = mined.nonce
     tx.inputs[0].unlocking_script = Script(build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=8))

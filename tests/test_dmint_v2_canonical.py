@@ -77,7 +77,9 @@ _GOLDEN: dict[str, tuple[dict, str]] = {
         "79cc519d75686d7551",
     ),
     "asert_h0": (
-        dict(height=0, max_height=100, reward=1000, difficulty=10, daa_mode=DaaMode.ASERT, target_time=60, half_life=3600),
+        dict(
+            height=0, max_height=100, reward=1000, difficulty=10, daa_mode=DaaMode.ASERT, target_time=60, half_life=3600
+        ),
         "00d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "d0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01"
         "6402e8030052013c040000000008cccccccccccccc0cbdc0c859797ea85d795d797ea87e5e7a"
@@ -96,7 +98,9 @@ _GOLDEN: dict[str, tuple[dict, str]] = {
         "518067827c7e68687e5379ec78885379eac0e9885379cc519d75686d7551",
     ),
     "asert_hl600": (
-        dict(height=5, max_height=100, reward=1000, difficulty=4, daa_mode=DaaMode.ASERT, target_time=120, half_life=600),
+        dict(
+            height=5, max_height=100, reward=1000, difficulty=4, daa_mode=DaaMode.ASERT, target_time=120, half_life=600
+        ),
         "55d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "d0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01"
         "6402e80300520178040000000008ffffffffffffff1fbdc0c859797ea85d795d797ea87e5e7a"

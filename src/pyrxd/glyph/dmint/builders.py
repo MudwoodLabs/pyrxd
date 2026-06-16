@@ -195,7 +195,7 @@ _ASERT_2MUL_STEP = (
 )
 
 # One unrolled negative-drift step: if |drift|_rem>0 then target //= 2, dec.
-_ASERT_2DIV_STEP = bytes.fromhex("7600a0" "63" "8c" "7c" "8e" "7c" "68")
+_ASERT_2DIV_STEP = bytes.fromhex("7600a0638c7c8e7c68")
 
 
 def _build_asert_daa(half_life: int) -> bytes:
@@ -338,7 +338,7 @@ def _build_part_c(middle_literal: bytes) -> bytes:
     )
     # IF branch (final mint, newHeight == maxHeight): consume alt-stack newTarget,
     # then the token-burn output check.
-    if_branch = bytes.fromhex("6c75" "5279cd01d853797e016a7e88")
+    if_branch = bytes.fromhex("6c755279cd01d853797e016a7e88")
     # ELSE branch (continue mining): rebuild expected_state from scratch.
     else_branch = (
         bytes.fromhex("78de519d")  # OVER REFOUTPUTCOUNT_OUTPUTS 1 NUMEQUALVERIFY

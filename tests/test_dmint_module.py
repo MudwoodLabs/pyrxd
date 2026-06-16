@@ -165,9 +165,7 @@ class TestBuildDmintContractScript:
         # Part C is deploy-parameterized in the redesign (no fixed constant).
         # Its stable prologue (input/output ref check) is byte-identical across
         # deploys; assert that anchor is present.
-        part_c_prologue = bytes.fromhex(
-            "577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7e"
-        )
+        part_c_prologue = bytes.fromhex("577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7e")
         assert part_c_prologue in build_dmint_code_script(_BASE_PARAMS)
 
     def test_sha256d_pow_opcode(self):
