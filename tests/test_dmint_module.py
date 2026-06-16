@@ -11,7 +11,6 @@ from pyrxd.glyph.dmint import (
     _PART_B1,
     _PART_B2,
     _PART_B4,
-    _PART_C,
     MAX_SHA256D_TARGET,
     MAX_V2_TARGET_256,
     DaaMode,
@@ -121,28 +120,32 @@ class TestDmintDeployParamsValidation:
 
 
 class TestBuildDmintStateScript:
-    def test_starts_with_height_4bytes(self):
+    def test_starts_with_height_minimal(self):
+        # Redesign: height uses minimal push. height=0 → OP_0 (0x00).
         script = build_dmint_state_script(_BASE_PARAMS)
-        assert script[:5] == b"\x04\x00\x00\x00\x00"
+        assert script[:1] == b"\x00"
 
     def test_contract_ref_prefix(self):
+        # After the 1-byte minimal height push, contractRef (0xd8) is at [1].
         script = build_dmint_state_script(_BASE_PARAMS)
-        assert script[5] == 0xD8
+        assert script[1] == 0xD8
 
     def test_token_ref_prefix(self):
+        # 1-byte height + 0xd8 + 36-byte ref → tokenRef (0xd0) at [38].
         script = build_dmint_state_script(_BASE_PARAMS)
-        assert script[42] == 0xD0
+        assert script[38] == 0xD0
 
     def test_no_state_separator(self):
         script = build_dmint_state_script(_BASE_PARAMS)
         assert b"\xbd" not in script
 
     def test_height_encoding(self):
+        # Redesign: height is a minimal push (variable width), not 0x04+LE4.
         p = DmintDeployParams(
             contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF, max_height=1000, reward=50, difficulty=10, height=42
         )
         script = build_dmint_state_script(p)
-        assert script[:5] == b"\x04" + struct.pack("<I", 42)
+        assert script[: len(_push_minimal(42))] == _push_minimal(42)
 
 
 class TestBuildDmintContractScript:
@@ -159,7 +162,13 @@ class TestBuildDmintContractScript:
         assert _PART_B4 in build_dmint_code_script(_BASE_PARAMS)
 
     def test_part_c_present(self):
-        assert _PART_C in build_dmint_code_script(_BASE_PARAMS)
+        # Part C is deploy-parameterized in the redesign (no fixed constant).
+        # Its stable prologue (input/output ref check) is byte-identical across
+        # deploys; assert that anchor is present.
+        part_c_prologue = bytes.fromhex(
+            "577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7e"
+        )
+        assert part_c_prologue in build_dmint_code_script(_BASE_PARAMS)
 
     def test_sha256d_pow_opcode(self):
         assert b"\xaa" in build_dmint_code_script(_BASE_PARAMS)
@@ -199,8 +208,12 @@ class TestBuildDmintContractScript:
         )
         assert b"\xc5" in build_dmint_code_script(p)
 
-    def test_fixed_no_txlocktime(self):
-        assert b"\xc5" not in build_dmint_code_script(_BASE_PARAMS)
+    def test_fixed_no_daa_bytecode(self):
+        # FIXED has no DAA block, so Part B is exactly B1+B2+B4 contiguous.
+        # (OP_TXLOCKTIME 0xc5 now appears in Part C's lastTime reconstruction
+        # for ALL modes, so its presence no longer distinguishes FIXED.)
+        code = build_dmint_code_script(_BASE_PARAMS)
+        assert _PART_B1 + _PART_B2 + _PART_B4 in code
 
     def test_deterministic(self):
         s1 = build_dmint_contract_script(_BASE_PARAMS)
@@ -302,12 +315,11 @@ class TestComputeNextTargetAsert:
         assert compute_next_target_asert(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 7200, 60, 3600) == 2_000_000
 
     def test_fast_halves_target(self):
-        # time_delta=60, target_time=3720, excess=-3660, drift=-3660//3600=-2 wait...
-        # In Python: -3660 // 3600 = -2 (floored division), clamped within [-4,4]
-        # new_target = 1_000_000 >> 2 = 250_000
+        # excess = 60 - 3720 = -3660. Redesign divides via OP_DIV (truncates
+        # toward zero, NOT Python floor): trunc(-3660/3600) = -1 (floor would be
+        # -2). drift=-1 → one OP_2DIV step → 1_000_000 // 2 = 500_000.
         result = compute_next_target_asert(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 60, 3720, 3600)
-        # excess = 60 - 3720 = -3660, drift = -3660//3600 = -2
-        assert result == 250_000
+        assert result == 500_000
 
     def test_drift_clamped_plus_4(self):
         # excess = 36000+60-60 = 36000, drift = 36000//3600 = 10 → clamped to 4
@@ -323,14 +335,25 @@ class TestComputeNextTargetAsert:
 
 
 class TestComputeNextTargetLinear:
-    def test_on_schedule_unchanged(self):
-        assert compute_next_target_linear(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 60, 60) == 1_000_000
+    # Redesign LWMA divides FIRST to avoid int64 overflow: (target // targetTime)
+    # * timeDelta_capped. Divide-first loses the remainder, so "unchanged" is only
+    # approximate (e.g. 1_000_000 // 60 * 60 = 999_960, not 1_000_000).
+    def test_on_schedule_approx_unchanged(self):
+        # (1_000_000 // 60) * 60 = 16666 * 60 = 999_960
+        assert compute_next_target_linear(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 60, 60) == 999_960
 
     def test_double_time_doubles_target(self):
-        assert compute_next_target_linear(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 120, 60) == 2_000_000
+        # timeDelta_capped = min(120, 4*60) = 120; (1_000_000 // 60) * 120 = 1_999_920
+        assert compute_next_target_linear(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 120, 60) == 1_999_920
 
     def test_half_time_halves_target(self):
-        assert compute_next_target_linear(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 30, 60) == 500_000
+        # (1_000_000 // 60) * 30 = 16666 * 30 = 499_980
+        assert compute_next_target_linear(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 30, 60) == 499_980
+
+    def test_time_delta_capped_at_4x(self):
+        # delta=600 but cap = 4*60 = 240, so (1_000_000 // 60) * 240 = 3_999_840,
+        # NOT scaled by the full 10x — single-block outliers are bounded.
+        assert compute_next_target_linear(1_000_000, _BASE_LAST_TIME, _BASE_LAST_TIME + 600, 60) == 3_999_840
 
     def test_minimum_is_1(self):
         assert compute_next_target_linear(1, _BASE_LAST_TIME, _BASE_LAST_TIME + 1, 60) == 1
@@ -536,7 +559,8 @@ def test_height_in_state():
         contract_ref=_CONTRACT_REF, token_ref=_TOKEN_REF, max_height=100, reward=10, difficulty=10, height=999
     )
     state = build_dmint_state_script(p)
-    assert state[:5] == b"\x04" + struct.pack("<I", 999)
+    # Redesign: height is a minimal push (999 → 0x02 e7 03), not 0x04+LE4.
+    assert state[: len(_push_minimal(999))] == _push_minimal(999)
 
 
 def test_last_time_in_state():

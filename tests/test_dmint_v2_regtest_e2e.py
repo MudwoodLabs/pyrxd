@@ -1,35 +1,38 @@
-"""dMint **V2** (FIXED difficulty) end-to-end consensus proof on a real
-radiant-core regtest node — the V2 analog of ``test_dmint_v1_regtest_e2e.py``
+"""dMint **V2** (canonical Photonic redesign) end-to-end consensus proof on a
+real radiant-core regtest node — the V2 analog of ``test_dmint_v1_regtest_e2e.py``
 (issue #219).
 
-V2 dMint had never been validated against on-chain bytes (hence
-``V2UnvalidatedWarning``) and was in fact broken at the covenant-bytecode level
-— it has never worked on any chain (consistent with "no V2 contract in the
-wild"). Two transcription bugs (inherited from Photonic's ``script.ts``) made
-every V2 mint consensus-invalid, and are fixed in ``pyrxd.glyph.dmint``:
+pyrxd's V2 covenant is now byte-for-byte the canonical
+``Radiant-Core/Photonic-Wallet`` ``dMintScript`` (post-2026-05-26 redesign;
+asserted offline in ``test_dmint_v2_canonical.py``). The redesign fixes the
+two showstoppers that made the prior shape un-mineable on mainnet:
 
-1. ``_PART_A`` was missing ``OP_INPUTINDEX`` (0xc0) before ``OP_OUTPOINTTXHASH``,
-   so the latter popped the ``target`` state value as the input index →
-   "input index out of range".
-2. ``_PART_C`` began with a duplicate ``a269`` (the PoW target-compare
-   ``_PART_B2`` already performs), which after ``_PART_B4`` ran ``maxHeight >=
-   reward`` → "Script failed an OP_VERIFY operation".
+1. State pushes for ``height``/``target`` are now MINIMAL (``_push_minimal``),
+   not fixed ``04 [LE4]`` / ``08 [LE8]`` — the non-minimal ``04 00000000`` height
+   push at height 0 was rejected by radiantd's MINIMALDATA mempool policy
+   (enforced on the v3.1.x image this test runs against).
+2. Part C is deploy-parameterized and rebuilds the next state from scratch
+   (``MINIMAL_PUSH(height) || <middle literal> || 04 NUM2BIN(locktime) ||
+   MINIMAL_PUSH(target)``), and Part B4 preserves the DAA ``newTarget`` on the
+   alt stack — so ASERT/LWMA can actually advance difficulty (the old shape
+   forbade any state change but ``height``).
 
-This test proves the fixed V2 covenant is accepted by REAL Radiant consensus:
-deploy a FIXED-difficulty V2 contract, PoW-mine an 8-byte-nonce mint, and
-confirm the node accepts it (and rejects a wrong nonce).
+This test proves the redesigned covenant is accepted by REAL Radiant consensus:
+deploy a V2 contract, PoW-mine an 8-byte-nonce mint, and confirm the node
+accepts it (and rejects a wrong nonce) — for FIXED difficulty AND for an ASERT
+DAA contract whose recreated ``target``/``last_time`` advance on-chain.
 
-Two paths are proven: ``test_v2_fixed_mint_...`` deploys by direct ref-induction
-(spend two genesis outpoints so the singleton ``contractRef`` + normal
-``tokenRef`` are inducted) as a focused covenant proof, and
+Paths proven: ``test_v2_fixed_mint_...`` and ``test_v2_asert_mint_...`` deploy by
+direct ref-induction (spend two genesis outpoints so the singleton
+``contractRef`` + normal ``tokenRef`` are inducted) as focused covenant proofs;
 ``test_v2_deploy_via_api_then_mint`` exercises the full library API
 (``prepare_dmint_deploy(DmintV2DeployParams)`` -> commit -> reveal ->
-``build_reveal_outputs``). Both feed ``build_dmint_mint_tx``, which emits the
-consensus-correct V1-shaped mint: contract + funding inputs; outputs = recreated
-contract (value **1**, a singleton) at vout[0], FT reward at vout[1], OP_RETURN
-at vout[2], change. The recreated state equals the current state with **only**
-``height`` incremented — which is also why DAA/ASERT/LWMA cannot work with this
-covenant (FIXED only).
+``build_reveal_outputs``). All feed ``build_dmint_mint_tx``, which emits the
+consensus-correct mint: contract + funding inputs; outputs = recreated contract
+(value **1**, a singleton) at vout[0], FT reward at vout[1], OP_RETURN at
+vout[2], change. ``current_time`` is the block locktime — it lands in the
+recreated state's ``last_time`` and the tx ``nLockTime`` (which must agree, since
+Part C rebuilds ``last_time`` from ``OP_TXLOCKTIME``).
 
 Gating / safety: opt-in via ``@pytest.mark.integration`` + ``RADIANT_REGTEST=1``;
 reuses the isolated throwaway-container harness from ``test_htlc_regtest_e2e``
@@ -40,6 +43,7 @@ Run: ``RADIANT_REGTEST=1 pytest tests/test_dmint_v2_regtest_e2e.py -m integratio
 
 from __future__ import annotations
 
+import os
 import secrets
 import sys
 import warnings
@@ -70,8 +74,10 @@ from pyrxd.glyph.dmint import (
     build_dmint_mint_tx,
     build_dmint_v2_mint_preimage,
     build_mint_scriptsig,
+    compute_next_target_linear,
     mine_solution_dispatch,
 )
+from pyrxd.glyph.dmint.types import MAX_SHA256D_TARGET
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
@@ -83,7 +89,15 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 
 pytestmark = pytest.mark.integration
 
+# Mining an 8-byte-nonce V2 mint is an intrinsic ~2**32 sweep (the 4-zero-byte
+# PoW floor is consensus-hardcoded). Workers + timeout are env-tunable so the
+# test stays robust on a loaded box: DMINT_MINE_WORKERS caps worker processes
+# (default os.cpu_count()) to avoid oversubscription, DMINT_MINE_TIMEOUT_S
+# raises the ceiling (default 1800s).
 _MINER_ARGV = [sys.executable, "-m", "pyrxd.contrib.miner"]
+if os.environ.get("DMINT_MINE_WORKERS"):
+    _MINER_ARGV += ["--workers", os.environ["DMINT_MINE_WORKERS"]]
+_MINE_TIMEOUT_S = float(os.environ.get("DMINT_MINE_TIMEOUT_S", "1800"))
 _CONTRACT_VALUE = 1  # V2 contract is a value-1 singleton (covenant: OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY)
 
 
@@ -126,26 +140,50 @@ def _sign_funding_input(tx: Transaction, idx: int, key: PrivateKey) -> None:
     )
 
 
-def _v2_params(*, max_height, reward, height, last_time, contract_ref, token_ref):
+def _v2_params(
+    *,
+    max_height,
+    reward,
+    height,
+    last_time,
+    contract_ref,
+    token_ref,
+    daa_mode=DaaMode.FIXED,
+    difficulty=1,
+    target_time=60,
+    half_life=3600,
+):
     return DmintDeployParams(
         contract_ref=contract_ref,
         token_ref=token_ref,
         max_height=max_height,
         reward=reward,
-        difficulty=1,  # FIXED, easiest target — only the 4-zero-byte PoW floor applies
+        # difficulty=1 → target=MAX, so only the 4-zero-byte PoW floor gates mining
+        # (fast); the DAA still retargets the RECREATED state for the next mint.
+        difficulty=difficulty,
         algo=DmintAlgo.SHA256D,
-        daa_mode=DaaMode.FIXED,
-        target_time=60,
-        half_life=3600,
+        daa_mode=daa_mode,
+        target_time=target_time,
+        half_life=half_life,
         height=height,
         last_time=last_time,
     )
 
 
-def _deploy_v2_contract(node: _RegtestNode, *, max_height: int, reward: int) -> DmintContractUtxo:
-    """Create a FIXED-difficulty V2 dMint contract UTXO (value-1 singleton) by
-    inducting the singleton ``contractRef`` + normal ``tokenRef`` from two spent
-    genesis outpoints, with the V2 contract script at vout 0.
+def _deploy_v2_contract(
+    node: _RegtestNode,
+    *,
+    max_height: int,
+    reward: int,
+    daa_mode=DaaMode.FIXED,
+    difficulty: int = 1,
+    last_time: int = 0,
+    target_time: int = 60,
+) -> DmintContractUtxo:
+    """Create a V2 dMint contract UTXO (value-1 singleton) by inducting the
+    singleton ``contractRef`` + normal ``tokenRef`` from two spent genesis
+    outpoints, with the V2 contract script at vout 0. Defaults to FIXED; pass
+    ``daa_mode``/``last_time`` to deploy an ASERT/LWMA contract.
     """
     g_tok = _carve(node, 200_000_000)
     g_con = _carve(node, 200_000_000)
@@ -158,9 +196,12 @@ def _deploy_v2_contract(node: _RegtestNode, *, max_height: int, reward: int) -> 
             max_height=max_height,
             reward=reward,
             height=0,
-            last_time=0,
+            last_time=last_time,
             contract_ref=contract_ref,
             token_ref=token_ref,
+            daa_mode=daa_mode,
+            difficulty=difficulty,
+            target_time=target_time,
         )
         contract_script = build_dmint_contract_script(params)
         state = DmintState.from_script(contract_script)
@@ -185,14 +226,17 @@ def _deploy_v2_contract(node: _RegtestNode, *, max_height: int, reward: int) -> 
     return DmintContractUtxo(txid=dtxid, vout=0, value=_CONTRACT_VALUE, script=contract_script, state=state)
 
 
-def _build_signed_v2_mint(node: _RegtestNode, contract: DmintContractUtxo) -> tuple[Transaction, bytes]:
-    """Build, mine, and sign a consensus-correct (V1-shaped) FIXED V2 mint.
+def _build_signed_v2_mint(
+    node: _RegtestNode, contract: DmintContractUtxo, *, current_time: int = 0
+) -> tuple[Transaction, bytes]:
+    """Build, mine, and sign a consensus-correct (V1-shaped) V2 mint.
 
     Returns ``(tx, nonce)``. The recreated contract carries the next state
-    (current state with only ``height`` incremented) at value 1; the FT reward +
-    fee come from a plain funding input; the OP_RETURN at vout[2] is the
-    preimage's bound output. An 8-byte nonce reliably solves in a single ~2**32
-    sweep (no message-rolling, unlike V1's 4-byte nonce).
+    (height+1; lastTime = ``current_time``; target retargeted by the DAA) at
+    value 1; the FT reward + fee come from a plain funding input; the OP_RETURN
+    at vout[2] is the preimage's bound output. ``current_time`` is the block
+    locktime (written into lastTime AND tx nLockTime). An 8-byte nonce reliably
+    solves in a single ~2**32 sweep (no message-rolling, unlike V1's 4-byte nonce).
     """
     funding_coin = _carve(node, 50_000_000)
     funding = DmintMinerFundingUtxo(
@@ -209,7 +253,7 @@ def _build_signed_v2_mint(node: _RegtestNode, contract: DmintContractUtxo) -> tu
             contract,
             nonce=b"\x00" * 8,
             miner_pkh=miner_pkh,
-            current_time=0,
+            current_time=current_time,
             funding_utxo=funding,
             op_return_msg=b"pyrxd-v2-regtest",
         )
@@ -218,7 +262,7 @@ def _build_signed_v2_mint(node: _RegtestNode, contract: DmintContractUtxo) -> tu
         pre = build_dmint_v2_mint_preimage(contract, funding, op_return_script)
 
     mined = mine_solution_dispatch(
-        preimage=pre.preimage, target=contract.state.target, nonce_width=8, miner_argv=_MINER_ARGV, timeout_s=900.0
+        preimage=pre.preimage, target=contract.state.target, nonce_width=8, miner_argv=_MINER_ARGV, timeout_s=_MINE_TIMEOUT_S
     )
     nonce = mined.nonce
     tx.inputs[0].unlocking_script = Script(build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=8))
@@ -371,6 +415,46 @@ class TestRadiantDmintV2OnConsensus:
         assert recreated_out and round(recreated_out["value"] * 1e8) == _CONTRACT_VALUE, "recreated V2 contract wrong"
         reward_out = node.cli("gettxout", mtxid, "1")
         assert reward_out and round(reward_out["value"] * 1e8) == 1000, "V2 FT reward output (vout 1) wrong"
+
+    def test_v2_lwma_mint_advances_target_on_chain(self, node):
+        """An LWMA (DAA) V2 contract mints and the covenant retargets difficulty
+        on-chain: the recreated state's ``target`` and ``last_time`` advance to
+        the DAA-computed values. Consensus accepting the mint PROVES pyrxd's
+        off-chain ``compute_next_target_linear`` byte-matches the on-chain
+        divide-first/capped LWMA bytecode (a mismatch → recreated state differs →
+        Part C's OP_EQUALVERIFY rejects the mint). The old V2 covenant could not
+        do this at all (it forbade any state change but ``height``).
+        """
+        last_time = 1_700_000_000
+        # difficulty=1 → current target = MAX, so THIS mint's PoW is just the
+        # 4-zero floor (fast). The contract retargets the NEXT state's target.
+        contract = _deploy_v2_contract(
+            node, max_height=10, reward=1000, daa_mode=DaaMode.LWMA, difficulty=1, last_time=last_time, target_time=60
+        )
+        assert contract.state.target == MAX_SHA256D_TARGET
+
+        # A fast block (delta=30 < target_time=60) → LWMA lowers the target.
+        current_time = last_time + 30
+        tx, _nonce = _build_signed_v2_mint(node, contract, current_time=current_time)
+
+        expected_target = compute_next_target_linear(
+            current_target=MAX_SHA256D_TARGET, last_time=last_time, current_time=current_time, target_time=60
+        )
+        assert expected_target < MAX_SHA256D_TARGET, "LWMA fast block should LOWER the target"
+
+        res = node.accepts(tx.serialize().hex())
+        assert res["allowed"] is True, f"LWMA V2 mint rejected by consensus (off-chain DAA != on-chain?): {res}"
+
+        mtxid = node.cli("sendrawtransaction", tx.serialize().hex())
+        assert isinstance(mtxid, str), mtxid
+        node.mine(1)
+        # The recreated contract carries the retargeted state: parse it back and
+        # confirm target/last_time advanced exactly as the off-chain DAA predicted.
+        recreated_spk = bytes.fromhex(node.cli("gettxout", mtxid, "0")["scriptPubKey"]["hex"])
+        recreated = DmintState.from_script(recreated_spk)
+        assert recreated.height == 1
+        assert recreated.last_time == current_time
+        assert recreated.target == expected_target
 
     def test_v2_deploy_via_api_then_mint(self, node):
         """The real deploy API (prepare_dmint_deploy(DmintV2DeployParams) ->

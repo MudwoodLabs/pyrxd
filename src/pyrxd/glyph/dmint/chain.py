@@ -241,7 +241,7 @@ class DmintState:
         a DmintState built from garbage parsed past the wrong cut point.
 
         Layout (matches ``build_dmint_state_script``):
-          [0] height      — ``_push_4bytes_le`` (opcode 0x04 + 4-byte LE uint32)
+          [0] height      — ``_push_minimal`` (variable width; redesign)
           [1] contractRef — ``0xd8`` + 36-byte wire ref
           [2] tokenRef    — ``0xd0`` + 36-byte wire ref
           [3] maxHeight   — ``_push_minimal``
@@ -261,17 +261,8 @@ class DmintState:
         # what bytes appeared inside the pushes.
         pos = 0
 
-        # --- Item 0: height (always _push_4bytes_le → opcode 0x04 + 4 bytes LE)
-        if pos >= len(script_bytes) or script_bytes[pos] != 0x04:
-            if pos >= len(script_bytes):
-                raise ValidationError("DmintState.from_script: script too short for height")
-            raise ValidationError(
-                f"DmintState.from_script: expected 0x04 (push-4) at pos {pos} for height, got 0x{script_bytes[pos]:02x}"
-            )
-        if pos + 5 > len(script_bytes):
-            raise ValidationError("DmintState.from_script: script truncated inside height")
-        height = struct.unpack("<I", script_bytes[pos + 1 : pos + 5])[0]
-        pos += 5
+        # --- Item 0: height (redesign: minimal push, variable width)
+        height, pos = _parse_script_int(script_bytes, pos)
 
         # --- Item 1: contractRef (0xd8 + 36 bytes wire ref)
         if pos >= len(script_bytes) or script_bytes[pos] != 0xD8:

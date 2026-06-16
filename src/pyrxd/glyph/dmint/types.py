@@ -9,7 +9,7 @@ Symbols (15):
     V2UnvalidatedWarning, _V2_QUARANTINE_TEXT, _warn_v2_unvalidated,
     MAX_SHA256D_TARGET, MAX_V2_TARGET_256,
     DmintAlgo, DaaMode,
-    _PART_B1, _PART_B2, _PART_B4, _PART_C,
+    _PART_B1, _PART_B2, _PART_B4,
     DmintDeployParams, DmintCborPayload, DmintMintResult,
     DmintV1ContractInitialState
 """
@@ -127,29 +127,16 @@ _PART_B1 = bytes.fromhex("bc01147f77587f040000000088817600a269")
 # Part B.2: target comparison (V2 preserves target for DAA)
 _PART_B2 = bytes.fromhex("51797ca269")
 
-# Part B.4: drop 5 V2 extras (new_target, lastTime, targetTime, daaMode, algoId)
-_PART_B4 = bytes.fromhex("7575757575")
+# Part B.4: TOALTSTACK newTarget + 4×OP_DROP (lastTime, targetTime, daaMode, algoId).
+# The pre-redesign shape was ``7575757575`` (5×OP_DROP), which discarded the
+# DAA-computed newTarget so difficulty never advanced on-chain. ``6b`` (TOALTSTACK)
+# preserves newTarget on the alt stack for Part C to write into the next state.
+_PART_B4 = bytes.fromhex("6b75757575")
 
-# Part C: output validation (code-script continuity + token reward + height checks).
-#
-# This is V1's epilogue tail starting at OP_7 OP_ROLL. The earlier version began
-# with an extra ``a269`` (OP_GREATERTHANOREQUAL OP_VERIFY) — V1's PoW
-# target-compare. But V2 already performs that compare in ``_PART_B2``
-# (``OP_1 OP_PICK OP_SWAP`` so ``target`` survives for the ``_PART_B4`` drop), so
-# the duplicate ran AFTER B4 popped the extras: with the stack reduced to
-# ``[.., maxHeight, reward]`` it executed ``maxHeight >= reward`` (e.g. 10 >= 1000)
-# → consensus rejects the mint with "Script failed an OP_VERIFY operation". From
-# OP_7 OP_ROLL onward this block is byte-identical to V1's tail and operates on
-# the same normalized stack. Dropping the leading ``a269`` is validated against
-# radiant-core regtest (tests/test_dmint_v2_regtest_e2e.py). Refs #219.
-_PART_C = bytes.fromhex(
-    "577ae500a069567ae600a06901d053797e0c"
-    "dec0e9aa76e378e4a269e69d7eaa76e47b9d547a"
-    "818b76537a9c537ade789181547ae6939d635279"
-    "cd01d853797e016a7e886778de519d547854807e"
-    "c0eb557f777e5379ec78885379eac0e9885379cc"
-    "519d75686d7551"
-)
+# NOTE: Part C is no longer a fixed constant. In the redesign it is
+# deploy-parameterized (embeds the immutable state slots so it can rebuild the
+# next-state script and let ASERT/LWMA advance difficulty), so it is built per
+# contract by ``builders._build_part_c(middle_literal)`` rather than stored here.
 
 
 # ---------------------------------------------------------------------------

@@ -553,11 +553,11 @@ class TestBuildDmintMintTx:
         utxo = _make_contract_utxo()
         assert _mint(utxo).updated_state.target == utxo.state.target
 
-    def test_updated_state_last_time_unchanged(self):
-        # FIXED V2: the covenant forbids changing any state field but `height`,
-        # so last_time stays byte-identical to the current contract (not current_time).
+    def test_updated_state_last_time_equals_current_time(self):
+        # Redesign: the covenant rebuilds lastTime from OP_TXLOCKTIME on EVERY
+        # mint (FIXED included), so the recreated state's last_time == current_time.
         utxo = _make_contract_utxo(height=5)
-        assert _mint(utxo).updated_state.last_time == utxo.state.last_time
+        assert _mint(utxo, current_time=1_700_000_123).updated_state.last_time == 1_700_000_123
 
     def test_contract_script_has_state_separator(self):
         assert b"\xbd" in _mint(_make_contract_utxo()).contract_script
@@ -570,12 +570,30 @@ class TestBuildDmintMintTx:
         assert reparsed.last_time == result.updated_state.last_time
         assert reparsed.target == result.updated_state.target
 
-    def test_contract_script_is_current_with_height_bumped(self):
-        # Recreated == current contract script with only the 5-byte height push changed.
+    def test_recreated_state_preserves_immutable_fields(self):
+        # Redesign: the recreated contract changes height/lastTime/target but
+        # preserves the immutable slots (refs, maxHeight, reward, algo, daa,
+        # targetTime) and the entire code section (Part A/B/C after 0xbd).
         utxo = _make_contract_utxo(height=7)
-        result = _mint(utxo)
-        assert result.contract_script[5:] == utxo.script[5:]
-        assert result.contract_script[:5] != utxo.script[:5]
+        result = _mint(utxo, current_time=1_700_000_000)
+        reparsed = DmintState.from_script(result.contract_script)
+        assert reparsed.height == 8
+        assert reparsed.last_time == 1_700_000_000
+        assert reparsed.contract_ref == utxo.state.contract_ref
+        assert reparsed.token_ref == utxo.state.token_ref
+        assert reparsed.max_height == utxo.state.max_height
+        assert reparsed.reward == utxo.state.reward
+        assert reparsed.algo == utxo.state.algo
+        assert reparsed.daa_mode == utxo.state.daa_mode
+        assert reparsed.target_time == utxo.state.target_time
+        # The code section (Part A/B/C) is invariant across mints: the spent
+        # contract's code suffix appears verbatim at the tail of the recreated
+        # script. The Part C prologue is a stable anchor inside that code.
+        part_c_prologue = bytes.fromhex(
+            "577ae500a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7e"
+        )
+        assert part_c_prologue in result.contract_script
+        assert part_c_prologue in utxo.script
 
     def test_reward_script_is_ft_wrapped_75_bytes(self):
         from pyrxd.glyph.dmint import build_dmint_v1_ft_output_script
@@ -622,9 +640,13 @@ class TestBuildDmintMintTx:
         with pytest.raises(ValidationError, match="1-photon singleton"):
             _mint(_make_contract_utxo(value=100))
 
-    def test_current_time_must_be_zero(self):
-        with pytest.raises(ValidationError, match="current_time must be 0"):
-            _mint(_make_contract_utxo(), current_time=1_700_000_000)
+    def test_current_time_sets_last_time_and_locktime(self):
+        # Redesign: current_time is the block locktime; it lands in the recreated
+        # state's lastTime AND the tx nLockTime (the covenant rebuilds lastTime
+        # from OP_TXLOCKTIME, so the two MUST agree).
+        result = _mint(_make_contract_utxo(), current_time=1_700_000_000)
+        assert result.updated_state.last_time == 1_700_000_000
+        assert result.tx.locktime == 1_700_000_000
 
     def test_exhausted_contract_raises(self):
         from pyrxd.security.errors import ContractExhaustedError
@@ -646,11 +668,20 @@ class TestBuildDmintMintTx:
         with pytest.raises(PoolTooSmallError, match="too small"):
             _mint(_make_contract_utxo(), funding=_funding(value=10_000))  # << fee + reward
 
-    def test_asert_daa_rejected(self):
-        # DAA can't work with this covenant (state-transition forbids changing
-        # target/last_time); only FIXED is mintable.
-        with pytest.raises(NotImplementedError, match="ASERT/LWMA"):
-            _mint(_make_contract_utxo(daa_mode=DaaMode.ASERT))
+    def test_asert_daa_updates_target(self):
+        # Redesign: ASERT is mintable. A slow block (delta=2*targetTime over the
+        # half-life worth of excess) eases difficulty → target grows.
+        utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.ASERT)
+        last_time = utxo.state.last_time
+        result = _mint(utxo, current_time=last_time + 7200)  # excess 7140, drift +1
+        assert result.updated_state.target > utxo.state.target
+        assert result.updated_state.last_time == last_time + 7200
+
+    def test_epoch_daa_not_buildable(self):
+        # EPOCH/SCHEDULE DAA bytecode emitters are not yet ported in pyrxd, so the
+        # builder refuses to construct such a contract (it can never be deployed).
+        with pytest.raises(NotImplementedError, match="not yet implemented"):
+            _make_contract_utxo(daa_mode=DaaMode.EPOCH)
 
     def test_consecutive_mints_chain_state(self):
         utxo = _make_contract_utxo()

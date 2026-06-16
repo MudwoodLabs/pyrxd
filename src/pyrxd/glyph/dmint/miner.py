@@ -39,6 +39,7 @@ from pyrxd.security.errors import (
 
 from .builders import (
     _push_4bytes_le,
+    _push_minimal,
     build_dmint_v1_contract_script,
     build_dmint_v1_ft_output_script,
 )
@@ -49,6 +50,7 @@ from .chain import (
     is_token_bearing_script,
 )
 from .types import (
+    _OP_STATESEPARATOR,
     MAX_SHA256D_TARGET,
     MAX_V2_TARGET_256,
     DaaMode,
@@ -190,6 +192,19 @@ def build_mint_scriptsig(
 # ---------------------------------------------------------------------------
 
 
+def _trunc_div(a: int, b: int) -> int:
+    """Integer division truncating toward zero (matches Radiant OP_DIV / C++ int64).
+
+    Python's ``//`` floors toward −∞; OP_DIV on CScriptNum truncates toward 0.
+    They differ when the numerator is negative (e.g. a block arrives early, so
+    ``excess < 0``). The on-chain ASERT divides by ``OP_DIV``, so the off-chain
+    mirror must truncate too, or the recreated state's target diverges and the
+    mint is rejected.
+    """
+    q = abs(a) // abs(b)
+    return -q if (a < 0) != (b < 0) else q
+
+
 def compute_next_target_asert(
     current_target: int,
     last_time: int,
@@ -197,32 +212,36 @@ def compute_next_target_asert(
     target_time: int,
     half_life: int,
 ) -> int:
-    """Compute next ASERT-lite target (mirrors on-chain OP_LSHIFT/OP_RSHIFT logic).
+    """Compute next ASERT-lite target (mirrors the redesigned on-chain bytecode).
 
-    The V2-only retarget, as pseudo-code::
+    The redesign replaced OP_LSHIFT/OP_RSHIFT (which Radiant evaluates as a
+    big-endian bit-string shift — wrong on the LE target encoding) with an
+    unrolled 4-step OP_2MUL/OP_2DIV loop with a per-step overflow cap::
 
-        drift = (current_time - last_time - target_time) // half_life   # clamped to [-4, +4]
-        drift > 0  ->  target <<= drift          # easier
-        drift < 0  ->  target >>= abs(drift)     # harder
+        drift = trunc((current_time - last_time - target_time) / half_life)  # clamp [-4,+4]
+        drift > 0:  repeat |drift|x:  target = MAX_TARGET if target > MAX/2 else target*2
+        drift < 0:  repeat |drift|x:  target = target // 2
         minimum target is 1
+
+    The per-step cap matches the miner's ``newTarget = min(MAX, oldTarget<<drift)``
+    clamp-at-MAX semantics (a naive ``target << drift`` would overshoot MAX).
 
     .. warning::
        V2-only DAA. V1 has no DAA (fixed difficulty). Emits
-       :class:`V2UnvalidatedWarning` — no V2 contract has run this
-       formula on chain.
+       :class:`V2UnvalidatedWarning`.
     """
     _warn_v2_unvalidated()
-    time_delta = current_time - last_time
-    excess = time_delta - target_time
-    drift = excess // half_life
+    excess = (current_time - last_time) - target_time
+    drift = _trunc_div(excess, half_life)
     drift = max(-4, min(4, drift))
 
+    new_target = current_target
     if drift > 0:
-        new_target = current_target << drift
+        for _ in range(drift):
+            new_target = MAX_SHA256D_TARGET if new_target > MAX_SHA256D_TARGET // 2 else new_target * 2
     elif drift < 0:
-        new_target = current_target >> (-drift)
-    else:
-        new_target = current_target
+        for _ in range(-drift):
+            new_target //= 2
 
     return max(1, new_target)
 
@@ -233,15 +252,52 @@ def compute_next_target_linear(
     current_time: int,
     target_time: int,
 ) -> int:
-    """Compute next linear DAA target: new_target = old_target * time_delta / target_time.
+    """Compute next linear/LWMA target (mirrors the redesigned on-chain bytecode).
+
+    Divide-first with caps so the on-chain OP_MUL never overflows int64::
+
+        timeDelta_capped = min(current_time - last_time, 4 * target_time)
+        target_capped    = min(current_target, MAX_TARGET // 4)
+        new_target       = min(MAX_TARGET, (target_capped // target_time) * timeDelta_capped)
+        minimum target is 1
+
+    The MAX/4 target cap means LWMA contracts cannot have a difficulty floor
+    below 4 (``target <= MAX_TARGET/4``).
 
     .. warning::
        V2-only DAA. See :class:`V2UnvalidatedWarning`.
     """
     _warn_v2_unvalidated()
-    time_delta = current_time - last_time
-    new_target = current_target * time_delta // target_time
+    time_delta_capped = min(current_time - last_time, 4 * target_time)
+    target_capped = min(current_target, MAX_SHA256D_TARGET // 4)
+    new_target = (target_capped // target_time) * time_delta_capped
+    new_target = min(new_target, MAX_SHA256D_TARGET)
     return max(1, new_target)
+
+
+def _v2_state_script_bytes(st: DmintState) -> bytes:
+    """Build the 10-item V2 state script (before 0xbd) from a parsed DmintState.
+
+    Mirrors ``builders.build_dmint_state_script`` but reads ``target``/``last_time``
+    directly off the state rather than deriving from difficulty. Used by the mint
+    builder to (a) locate the spent contract's state/code boundary and (b) emit
+    the recreated next-state prefix. Redesign encoding: height + target are
+    minimal pushes; lastTime is a 4-byte push.
+    """
+    return (
+        _push_minimal(st.height)
+        + b"\xd8"
+        + st.contract_ref.to_bytes()
+        + b"\xd0"
+        + st.token_ref.to_bytes()
+        + _push_minimal(st.max_height)
+        + _push_minimal(st.reward)
+        + _push_minimal(int(st.algo))
+        + _push_minimal(int(st.daa_mode))
+        + _push_minimal(st.target_time)
+        + _push_4bytes_le(st.last_time)
+        + _push_minimal(st.target)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -778,11 +834,13 @@ def build_dmint_mint_tx(
       * Output 3: change back to ``miner_pkh``.
 
     .. note::
-       **V2 supports only ``DaaMode.FIXED``.** The covenant's state-transition
-       check requires the next state to equal the current state with only
-       ``height`` incremented, so ASERT/LWMA (which must advance
-       ``target``/``last_time``) can never fire — passing a DAA contract raises
-       :class:`NotImplementedError`. ``current_time`` must be 0 for V2.
+       **V2 supports FIXED, ASERT, and LWMA** (the canonical Photonic redesign).
+       The covenant rebuilds the next state's ``last_time`` from ``OP_TXLOCKTIME``
+       and its ``target`` from the alt-stack DAA result on every mint, so
+       ``current_time`` IS the block locktime: it is written into the recreated
+       state's ``last_time`` AND set as the tx ``nLockTime`` (the two must agree),
+       and for DAA modes it drives the target retarget. EPOCH/SCHEDULE are not yet
+       ported and raise :class:`NotImplementedError`.
 
     .. note::
        The preimage is a function of the *transaction itself* (txid of the input
@@ -875,20 +933,19 @@ def build_dmint_mint_tx(
             "and the FT reward + tx fee come from a separate plain-RXD input (same "
             "shape as V1). Pass funding_utxo=DmintMinerFundingUtxo(...)."
         )
-    if state.daa_mode != DaaMode.FIXED:
+    if state.daa_mode in (DaaMode.EPOCH, DaaMode.SCHEDULE):
         raise NotImplementedError(
-            f"V2 dMint with daa_mode={state.daa_mode.name} is not mintable: the "
-            "covenant's state-transition check requires the recreated state to equal "
-            "the current state with only `height` incremented, so target/last_time "
-            "can never advance \u2014 ASERT/LWMA cannot adjust difficulty. Only "
-            "DaaMode.FIXED is consensus-functional. See #219."
+            f"V2 dMint with daa_mode={state.daa_mode.name} is not yet mintable in "
+            "pyrxd: the EPOCH/SCHEDULE DAA bytecode emitters are defined in the "
+            "protocol but not ported. Use FIXED, ASERT, or LWMA. See #219."
         )
-    if current_time != 0:
-        raise ValidationError(
-            "current_time must be 0 for V2 FIXED mints: there is no DAA and the "
-            "recreated state's last_time must stay byte-identical to the current "
-            "contract (the covenant forbids changing it). Pass current_time=0."
-        )
+    # Redesign: the covenant rebuilds the next state's lastTime from OP_TXLOCKTIME
+    # and its target from the alt-stack DAA result on EVERY mint (FIXED included),
+    # so current_time IS the block locktime written into the recreated state. It
+    # must be a sane Unix-timestamp-range locktime so the tx is final and the
+    # nLockTime byte-matches what the covenant reconstructs.
+    if current_time < 0:
+        raise ValidationError(f"current_time must be >= 0, got {current_time}")
     if state.is_exhausted:
         raise ContractExhaustedError(
             f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
@@ -914,14 +971,30 @@ def build_dmint_mint_tx(
     if op_return_msg is not None and len(op_return_msg) > 80:
         raise ValidationError(f"op_return_msg too long ({len(op_return_msg)} bytes); standardness limit is 80 bytes")
 
-    # --- Updated state: ONLY `height` changes. The covenant rebuilds the
-    # expected next state as ``<height+1 push> + current_state[5:]`` and
-    # OP_EQUALVERIFYs it against the recreated output, so we recreate the
-    # contract script byte-for-byte from the spent UTXO with just the 5-byte
-    # height push bumped \u2014 exact by construction (target, last_time, algo,
-    # daaMode all preserved).
+    # --- Updated state (redesign): height += 1, lastTime = locktime, target via
+    # the DAA mirror (unchanged for FIXED). The covenant's Part C rebuilds this
+    # exact next state from MINIMAL_PUSH(height) || <middle literal> ||
+    # 04 NUM2BIN(locktime) || MINIMAL_PUSH(target) and OP_EQUALVERIFYs it, so the
+    # off-chain reconstruction must byte-match.
     new_height = state.height + 1
-    contract_script = _push_4bytes_le(new_height) + contract_utxo.script[5:]
+    if state.daa_mode == DaaMode.ASERT:
+        new_target = compute_next_target_asert(
+            current_target=state.target,
+            last_time=state.last_time,
+            current_time=current_time,
+            target_time=state.target_time,
+            half_life=3600,  # embedded in the on-chain ASERT bytecode
+        )
+    elif state.daa_mode == DaaMode.LWMA:
+        new_target = compute_next_target_linear(
+            current_target=state.target,
+            last_time=state.last_time,
+            current_time=current_time,
+            target_time=state.target_time,
+        )
+    else:  # FIXED \u2014 target unchanged
+        new_target = state.target
+
     updated_state = DmintState(
         height=new_height,
         contract_ref=state.contract_ref,
@@ -931,10 +1004,28 @@ def build_dmint_mint_tx(
         algo=state.algo,
         daa_mode=state.daa_mode,
         target_time=state.target_time,
-        last_time=state.last_time,
-        target=state.target,
+        last_time=current_time,
+        target=new_target,
         is_v1=False,
     )
+
+    # Recreate the contract output script. The code section (Part A/B/C, after
+    # the 0xbd separator) is invariant across mints \u2014 slice it from the spent
+    # UTXO and graft the rebuilt state prefix. We reconstruct the spent state
+    # bytes from the parsed state and assert they prefix the UTXO script, which
+    # both locates the separator and guards against a contract whose on-chain
+    # encoding diverges from what we parsed.
+    old_state_bytes = _v2_state_script_bytes(state)
+    if (
+        not contract_utxo.script.startswith(old_state_bytes)
+        or contract_utxo.script[len(old_state_bytes) : len(old_state_bytes) + 1] != _OP_STATESEPARATOR
+    ):
+        raise ValidationError(
+            "V2 mint: parsed state does not round-trip to the contract UTXO script "
+            "(non-canonical encoding or unexpected layout); cannot safely recreate."
+        )
+    code_with_separator = contract_utxo.script[len(old_state_bytes) :]
+    contract_script = _v2_state_script_bytes(updated_state) + code_with_separator
 
     # The 75-byte FT-wrapped reward \u2014 load-bearing for the covenant's
     # OP_CODESCRIPTHASHVALUESUM_OUTPUTS conservation check (_PART_C == V1 tail).
@@ -999,7 +1090,14 @@ def build_dmint_mint_tx(
     change_output = TransactionOutput(Script(change_script), 0)  # value patched below
     trial_outputs.append(change_output)
 
-    tx = Transaction(tx_inputs=[contract_input, funding_input], tx_outputs=trial_outputs)
+    # nLockTime MUST equal current_time: the covenant reconstructs the next
+    # state's lastTime from OP_TXLOCKTIME, so the recreated state only byte-matches
+    # if the tx's locktime is exactly the value we wrote into updated_state.
+    tx = Transaction(
+        tx_inputs=[contract_input, funding_input],
+        tx_outputs=trial_outputs,
+        locktime=current_time,
+    )
     # The funding input pays the FT reward photons + the tx fee + change.
     fee = len(tx.serialize()) * fee_rate
     change_value = funding_utxo.value - state.reward - fee
