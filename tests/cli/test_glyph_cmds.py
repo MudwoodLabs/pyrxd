@@ -740,14 +740,41 @@ class TestDmintV2CliPaths:
         with pytest.raises(UserError, match="height, difficulty"):
             _parse_schedule("[[100, 4, 9]]")
 
+    def test_parse_schedule_red_team_edges(self):
+        # Red-team #219: difficulty→target=0, bad/non-ascending heights, >10, bool, empty.
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _parse_schedule
+
+        cases = {
+            "[[100, 99999999999999999999999]]": "yields target 0",  # huge difficulty → target 0
+            "[[-5, 4]]": "height must be >= 0",
+            "[[1000, 4], [100, 8]]": "strictly ascending",  # non-ascending
+            "[[100, 4], [100, 8]]": "strictly ascending",  # duplicate height
+            "[]": "at least one",  # empty
+            "[[100, 0]]": "difficulty must be >= 1",
+        }
+        for arg, msg in cases.items():
+            with pytest.raises(UserError, match=msg):
+                _parse_schedule(arg)
+        # >10 entries
+        with pytest.raises(UserError, match="at most 10"):
+            _parse_schedule(str([[i * 10, 4] for i in range(11)]))
+        # JSON bool is a Python int subclass — must be rejected as a height/difficulty
+        with pytest.raises(UserError, match="must be integers"):
+            _parse_schedule("[[true, 4]]")
+
     def test_v2_claim_daa_kwargs_per_mode(self):
         from pyrxd.cli.glyph_cmds import _v2_claim_daa_kwargs
         from pyrxd.glyph.dmint import DaaMode
 
-        assert _v2_claim_daa_kwargs(DaaMode.FIXED, 10, "4", None) == {}
-        assert _v2_claim_daa_kwargs(DaaMode.LWMA, 10, "4", None) == {}
-        assert _v2_claim_daa_kwargs(DaaMode.EPOCH, 10, "8", None) == {"epoch_length": 10, "max_adjustment_log2": 3}
-        sched = _v2_claim_daa_kwargs(DaaMode.SCHEDULE, 10, "4", "[[5, 2]]")
+        assert _v2_claim_daa_kwargs(DaaMode.FIXED, 10, "4", None, 3600) == {}
+        assert _v2_claim_daa_kwargs(DaaMode.LWMA, 10, "4", None, 3600) == {}
+        assert _v2_claim_daa_kwargs(DaaMode.ASERT, 10, "4", None, 600) == {"half_life": 600}
+        assert _v2_claim_daa_kwargs(DaaMode.EPOCH, 10, "8", None, 3600) == {
+            "epoch_length": 10,
+            "max_adjustment_log2": 3,
+        }
+        sched = _v2_claim_daa_kwargs(DaaMode.SCHEDULE, 10, "4", "[[5, 2]]", 3600)
         assert "schedule" in sched and sched["schedule"][0][0] == 5
 
     def test_v2_claim_schedule_requires_schedule_flag(self):
@@ -756,7 +783,7 @@ class TestDmintV2CliPaths:
         from pyrxd.glyph.dmint import DaaMode
 
         with pytest.raises(UserError, match="requires --schedule"):
-            _v2_claim_daa_kwargs(DaaMode.SCHEDULE, 10, "4", None)
+            _v2_claim_daa_kwargs(DaaMode.SCHEDULE, 10, "4", None, 3600)
 
     def test_deploy_inner_v2_lwma(self, cli_context) -> None:
         """The version-agnostic deploy inner produces a V2 (LWMA) contract: commit +

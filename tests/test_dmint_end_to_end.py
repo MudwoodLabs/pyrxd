@@ -708,6 +708,33 @@ class TestBuildDmintMintTx:
         result = _mint(utxo, current_time=1_700_000_001, schedule=sched)
         assert result.updated_state.target == MAX_SHA256D_TARGET // 2
 
+    # --- red-team regression guards (#219 review) -------------------------------
+
+    def test_current_time_post_2038_rejected(self):
+        # Locktime with bit-31 set → on-chain NUM2BIN(_,4) rejects; fail fast.
+        with pytest.raises(ValidationError, match="0x7FFFFFFF"):
+            _mint(_make_contract_utxo(), current_time=0x80000000)
+
+    def test_backwards_current_time_rejected_for_daa(self):
+        # LWMA negative-delta → on-chain OP_MUL overflows; off-chain would diverge.
+        utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.LWMA, difficulty=1)
+        with pytest.raises(ValidationError, match="must be >= the contract's last_time"):
+            _mint(utxo, current_time=0)  # 0 < the contract's last_time (1.7e9)
+
+    def test_backwards_current_time_allowed_for_fixed(self):
+        # FIXED has no DAA multiply → a backwards lastTime is harmless (no overflow).
+        utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.FIXED)
+        _mint(utxo, current_time=0)  # must NOT raise
+
+    def test_wrong_daa_params_rejected_before_grind(self):
+        # An EPOCH contract claimed with a non-matching epoch_length must fail fast
+        # (the baked Part B bytecode won't match), not grind-then-reject.
+        utxo = _make_contract_utxo(
+            height=5, daa_mode=DaaMode.EPOCH, difficulty=100000, epoch_length=10, max_adjustment_log2=2
+        )
+        with pytest.raises(ValidationError, match="do not reproduce the contract's baked bytecode"):
+            _mint(utxo, current_time=1_700_000_500, epoch_length=2016, max_adjustment_log2=2)
+
     def test_consecutive_mints_chain_state(self):
         utxo = _make_contract_utxo()
         result1 = _mint(utxo)

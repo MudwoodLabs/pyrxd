@@ -1060,11 +1060,29 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
         raise UserError("--schedule is not valid JSON", cause=str(exc), fix="e.g. --schedule '[[100, 4], [1000, 8]]'")
     if not isinstance(raw, list) or not all(isinstance(e, list) and len(e) == 2 for e in raw):
         raise UserError("--schedule must be a JSON list of [height, difficulty] pairs", cause=repr(raw))
-    out = []
-    for h, d in raw:
-        if not isinstance(h, int) or not isinstance(d, int) or d < 1:
-            raise UserError(f"--schedule entry [{h!r}, {d!r}]: height int and difficulty int >= 1 required")
-        out.append((h, MAX_SHA256D_TARGET // d))
+    if not raw:
+        raise UserError("--schedule must have at least one [height, difficulty] entry")
+    if len(raw) > 10:
+        raise UserError(f"--schedule allows at most 10 entries, got {len(raw)}")
+    out: list[tuple[int, int]] = []
+    prev_h = -1
+    for i, (h, d) in enumerate(raw):
+        # JSON `true`/`false` are ints in Python (bool ⊂ int) — reject explicitly.
+        if type(h) is not int or type(d) is not int:
+            raise UserError(f"--schedule entry {i} [{h!r}, {d!r}]: height and difficulty must be integers")
+        if d < 1:
+            raise UserError(f"--schedule entry {i}: difficulty must be >= 1, got {d}")
+        target = MAX_SHA256D_TARGET // d
+        if target < 1:
+            raise UserError(
+                f"--schedule entry {i}: difficulty {d} too large (yields target 0; max is {MAX_SHA256D_TARGET})"
+            )
+        if h < 0:
+            raise UserError(f"--schedule entry {i}: height must be >= 0, got {h}")
+        if h <= prev_h:
+            raise UserError(f"--schedule entry {i}: heights must be strictly ascending (got {h} after {prev_h})")
+        prev_h = h
+        out.append((h, target))
     return tuple(out)
 
 
@@ -1214,9 +1232,14 @@ def deploy_dmint_cmd(
         for outpoint in result["contracts"]:
             click.echo(f"    {outpoint}")
         click.echo(f"  total supply: {result['total_supply']:,} photons")
+        # claim-dmint auto-detects V1/V2 from the contract — there is NO --v2 flag.
+        # EPOCH/SCHEDULE bake their params into the contract code (not the on-chain
+        # state), so the claimer must re-supply them; surface that in the hint.
         _claim_hint = f"glyph claim-dmint --contract {result['contracts'][0]}"
-        if result["version"] == "V2":
-            _claim_hint += " --v2"
+        if v2 and daa_mode == "epoch":
+            _claim_hint += f" --epoch-length {epoch_length} --max-adjustment {max_adjustment}"
+        elif v2 and daa_mode == "schedule":
+            _claim_hint += f" --schedule '{schedule}'"
         click.echo(f"\n  claim with:   {_claim_hint}")
 
 
@@ -1262,7 +1285,13 @@ async def _deploy_dmint_inner(
     # The owner_pkh on the params object was a placeholder (validated upfront);
     # bind it to the actual funding key now.
     deploy_params = replace(deploy_params, owner_pkh=owner_pkh)
-    deploy = builder.prepare_dmint_deploy(deploy_params, allow_v2_deploy=True)
+    # EPOCH/SCHEDULE per-mode constraints (the 2^48 target cap, schedule shape) are
+    # enforced when prepare_dmint_deploy builds the contract scripts — surface them as a
+    # clean UserError instead of a top-level "unexpected failure" crash.
+    try:
+        deploy = builder.prepare_dmint_deploy(deploy_params, allow_v2_deploy=True)
+    except ValidationError as exc:
+        raise UserError("invalid dMint deploy parameters", cause=str(exc)) from exc
     commit_script = deploy.commit_result.commit_script
 
     # --- commit tx: [FT-commit hashlock | N ref-seeds | change] ---
@@ -1437,10 +1466,15 @@ def _mine_claim_with_rerolls(
     )
 
 
-def _v2_claim_daa_kwargs(daa_mode: DaaMode, epoch_length: int, max_adjustment: str, schedule: str | None) -> dict:
-    """The DAA params build_dmint_mint_tx needs for a V2 claim. EPOCH/SCHEDULE bake
-    their params into the contract code (not the parsed state), so the claimer must
-    supply them (``--epoch-length``/``--max-adjustment`` or ``--schedule``)."""
+def _v2_claim_daa_kwargs(
+    daa_mode: DaaMode, epoch_length: int, max_adjustment: str, schedule: str | None, half_life: int
+) -> dict:
+    """The DAA params build_dmint_mint_tx needs for a V2 claim. ASERT half_life,
+    EPOCH epoch_length/max_adjustment, and the SCHEDULE entries bake into the contract
+    code (not the parsed state), so the claimer must re-supply the ones their contract
+    used (``build_dmint_mint_tx`` fails fast if they don't reproduce the baked bytecode)."""
+    if daa_mode == DaaMode.ASERT:
+        return {"half_life": half_life}
     if daa_mode == DaaMode.EPOCH:
         return {"epoch_length": epoch_length, "max_adjustment_log2": _MAX_ADJUSTMENT_TO_LOG2[max_adjustment]}
     if daa_mode == DaaMode.SCHEDULE:
@@ -1450,7 +1484,7 @@ def _v2_claim_daa_kwargs(daa_mode: DaaMode, epoch_length: int, max_adjustment: s
                 fix="pass the same --schedule JSON used at deploy, e.g. --schedule '[[100, 4]]'",
             )
         return {"schedule": _parse_schedule(schedule)}
-    return {}  # FIXED / ASERT / LWMA need no extra params
+    return {}  # FIXED / LWMA need no extra params
 
 
 def _mine_claim_v2(
@@ -1535,6 +1569,9 @@ def _mine_claim_v2(
 @click.option(
     "--schedule", default=None, help="V2 SCHEDULE claim: the contract's schedule as JSON [[height, difficulty], ...]."
 )
+@click.option(
+    "--half-life", type=int, default=3600, show_default=True, help="V2 ASERT claim: the contract's half-life (s)."
+)
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def claim_dmint_cmd(
@@ -1551,9 +1588,10 @@ def claim_dmint_cmd(
     epoch_length: int,
     max_adjustment: str,
     schedule: str | None,
+    half_life: int,
     passphrase: bool,
 ) -> None:
-    """PoW-mine a claim from a live V1 dMint contract and broadcast the mint.
+    """PoW-mine a claim from a live dMint contract (V1 or V2) and broadcast the mint.
 
     Locate the contract (``--contract TXID:VOUT`` or ``--token-ref TXID:0``),
     fund the mint from this wallet, mine a nonce (rerolling the OP_RETURN on
@@ -1613,7 +1651,9 @@ def claim_dmint_cmd(
 
     try:
         if is_v2:
-            daa_kwargs = _v2_claim_daa_kwargs(contract_utxo.state.daa_mode, epoch_length, max_adjustment, schedule)
+            daa_kwargs = _v2_claim_daa_kwargs(
+                contract_utxo.state.daa_mode, epoch_length, max_adjustment, schedule, half_life
+            )
             mint, pre, nonce = _mine_claim_v2(
                 contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, current_time, daa_kwargs, mine=_mine
             )

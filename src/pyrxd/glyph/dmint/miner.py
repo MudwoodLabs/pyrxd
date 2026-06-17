@@ -38,6 +38,8 @@ from pyrxd.security.errors import (
 )
 
 from .builders import (
+    _PART_A,
+    _build_part_b,
     _push_4bytes_le,
     _push_minimal,
     build_dmint_v1_contract_script,
@@ -860,6 +862,7 @@ def build_dmint_mint_tx(
     *,
     funding_utxo: DmintMinerFundingUtxo | None = None,
     op_return_msg: bytes | None = None,
+    half_life: int = 3600,
     epoch_length: int | None = None,
     max_adjustment_log2: int | None = None,
     schedule: tuple[tuple[int, int], ...] | None = None,
@@ -888,13 +891,18 @@ def build_dmint_mint_tx(
       * Output 3: change back to ``miner_pkh``.
 
     .. note::
-       **V2 supports FIXED, ASERT, and LWMA** (the canonical Photonic redesign).
-       The covenant rebuilds the next state's ``last_time`` from ``OP_TXLOCKTIME``
-       and its ``target`` from the alt-stack DAA result on every mint, so
-       ``current_time`` IS the block locktime: it is written into the recreated
-       state's ``last_time`` AND set as the tx ``nLockTime`` (the two must agree),
-       and for DAA modes it drives the target retarget. EPOCH/SCHEDULE are not yet
-       ported and raise :class:`NotImplementedError`.
+       **V2 supports all five DAA modes** — FIXED, ASERT, LWMA, EPOCH, SCHEDULE
+       (the canonical Photonic redesign). The covenant rebuilds the next state's
+       ``last_time`` from ``OP_TXLOCKTIME`` and its ``target`` from the alt-stack DAA
+       result on every mint, so ``current_time`` IS the block locktime: it is written
+       into the recreated state's ``last_time`` AND set as the tx ``nLockTime`` (the
+       two must agree), and for DAA modes it drives the target retarget.
+       ``current_time`` must be in ``[last_time, 0x7FFFFFFF]`` for DAA modes (a
+       backwards or post-2038 locktime is rejected on-chain). EPOCH/SCHEDULE bake
+       their parameters into the contract code (not the parsed state), so the caller
+       passes ``epoch_length``/``max_adjustment_log2`` or ``schedule`` (and
+       ``half_life`` for ASERT) matching the deployed contract — a mismatch is caught
+       before the PoW grind.
 
     .. note::
        The preimage is a function of the *transaction itself* (txid of the input
@@ -1004,6 +1012,28 @@ def build_dmint_mint_tx(
     # nLockTime byte-matches what the covenant reconstructs.
     if current_time < 0:
         raise ValidationError(f"current_time must be >= 0, got {current_time}")
+    # Upper bound: Part C reconstructs lastTime via `04 || NUM2BIN(4, OP_TXLOCKTIME)`,
+    # which the on-chain interpreter REJECTS for a locktime with bit-31 set (it would
+    # need a 5th sign byte → SCRIPT_ERR_IMPOSSIBLE_ENCODING) — the 2038 cliff. And our
+    # `_push_4bytes_le` uses `struct.pack("<I", n)` which raises for n >= 2^32. Bound it
+    # to 0x7FFFFFFF so the off-chain build never produces a tx the node would reject.
+    if current_time > 0x7FFFFFFF:
+        raise ValidationError(
+            f"current_time must be <= 0x7FFFFFFF (2038-01-19), got {current_time}; the covenant "
+            "reconstructs lastTime via NUM2BIN(_,4), which rejects locktimes with bit 31 set"
+        )
+    # DAA modes (ASERT/LWMA/EPOCH) retarget on (current_time - last_time). A BACKWARDS
+    # locktime (current_time < last_time — reachable via the current_time=0 default or
+    # clock skew) makes the on-chain DAA multiply a large negative operand → OP_MUL
+    # overflows int64 → INVALID_NUMBER_RANGE_64_BIT abort (verified in radiant-core
+    # interpreter.cpp), while the off-chain mirror clamps to a finite value: a silent
+    # off-chain↔on-chain DIVERGENCE that wastes the PoW grind. Refuse it here (fail-fast).
+    if state.daa_mode != DaaMode.FIXED and current_time < state.last_time:
+        raise ValidationError(
+            f"current_time ({current_time}) must be >= the contract's last_time ({state.last_time}) for "
+            f"{state.daa_mode.name}: a backwards locktime makes the on-chain DAA retarget overflow and the "
+            "mint is rejected. Pass a current_time at or after the previous mint's time (and <= chain MTP)."
+        )
     if state.is_exhausted:
         raise ContractExhaustedError(
             f"dMint contract is exhausted: height={state.height} >= max_height={state.max_height}"
@@ -1041,7 +1071,7 @@ def build_dmint_mint_tx(
             last_time=state.last_time,
             current_time=current_time,
             target_time=state.target_time,
-            half_life=3600,  # embedded in the on-chain ASERT bytecode
+            half_life=half_life,  # the value baked into the contract's ASERT bytecode
         )
     elif state.daa_mode == DaaMode.LWMA:
         new_target = compute_next_target_linear(
@@ -1100,6 +1130,29 @@ def build_dmint_mint_tx(
         )
     code_with_separator = contract_utxo.script[len(old_state_bytes) :]
     contract_script = _v2_state_script_bytes(updated_state) + code_with_separator
+
+    # Guard the caller-supplied DAA params against the contract's BAKED bytecode.
+    # ASERT half_life, EPOCH epoch_length/max_adjustment, and SCHEDULE entries live in
+    # the Part B bytecode, NOT in the parsed state \u2014 so a wrong value would silently
+    # diverge new_target from what the covenant recomputes, and the mint would be
+    # rejected on-chain AFTER a multi-minute PoW grind. Rebuild Part B from the caller's
+    # params and check it byte-matches the baked Part B (at its fixed offset in the
+    # spliced code: after 0xbd + Part A + the 1-byte powHashOp), failing fast instead.
+    if state.daa_mode != DaaMode.FIXED:
+        expected_part_b = _build_part_b(
+            state.daa_mode,
+            half_life,
+            epoch_length=epoch_length if epoch_length is not None else 2016,
+            max_adjustment_log2=max_adjustment_log2 if max_adjustment_log2 is not None else 2,
+            schedule=schedule if schedule is not None else (),
+        )
+        part_b_start = 1 + len(_PART_A) + 1  # 0xbd + Part A + powHashOp
+        if code_with_separator[part_b_start : part_b_start + len(expected_part_b)] != expected_part_b:
+            raise ValidationError(
+                f"V2 {state.daa_mode.name} mint: the supplied DAA params (half_life/epoch_length/"
+                "max_adjustment_log2/schedule) do not reproduce the contract's baked bytecode. They must "
+                "match the values used at deploy, or the recreated target diverges and the mint is rejected."
+            )
 
     # The 75-byte FT-wrapped reward \u2014 load-bearing for the covenant's
     # OP_CODESCRIPTHASHVALUESUM_OUTPUTS conservation check (_PART_C == V1 tail).
