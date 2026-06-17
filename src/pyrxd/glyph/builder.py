@@ -1001,9 +1001,21 @@ class DmintV2DeployParams:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
-        # All five DAA modes are supported (FIXED/ASERT/LWMA/EPOCH/SCHEDULE). Per-mode
-        # parameter validation (EPOCH 2^48 cap + power-of-2 adjustment, SCHEDULE entry
-        # shape) is enforced by DmintDeployParams when the contract scripts are built.
+        # EPOCH is DISABLED for deploy: the canonical Photonic EPOCH bytecode has an
+        # int64-overflow bug (target × clampedDelta exceeds int64 for ordinary params,
+        # e.g. 1-hour blocks, and the retarget drifts past 2^48 over a few slow epochs),
+        # which BRICKS the contract on-chain. Confirmed against radiant-core consensus
+        # source and reported upstream; re-enable here (byte-matching upstream's fix)
+        # once Photonic lands it. The bytecode + parser are retained for compatibility;
+        # only deploying a new EPOCH contract is refused. Use FIXED/ASERT/LWMA/SCHEDULE.
+        if self.daa_mode == DaaMode.EPOCH:
+            raise ValidationError(
+                "EPOCH dMint is disabled pending an upstream Photonic fix: its retarget can overflow "
+                "int64 on-chain and brick the contract (target × clampedDelta > 2^63 for ordinary "
+                "params). Use FIXED, ASERT, LWMA, or SCHEDULE. See #219."
+            )
+        # FIXED/ASERT/LWMA/SCHEDULE proceed; per-mode parameter validation (the SCHEDULE
+        # entry shape) is enforced by DmintDeployParams when the contract scripts are built.
 
 
 class DmintFullDeployParams(DmintV2DeployParams):

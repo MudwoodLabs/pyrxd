@@ -39,8 +39,21 @@
 >   `find_dmint_contract_utxos` (current impl returns fresh contracts only)
 > - Live-mainnet V2 deploy proof (M3, deferred indefinitely — no
 >   ecosystem demand)
-> - EPOCH and SCHEDULE DAA modes (raise `NotImplementedError`; no
->   observed contract uses them)
+> - **Re-enable EPOCH DAA (blocked on upstream).** All five DAA modes
+>   (FIXED/ASERT/LWMA/EPOCH/SCHEDULE) are now ported and byte-matched to
+>   canonical Photonic — but **EPOCH deploy is intentionally refused**
+>   (`DmintV2DeployParams` / `deploy-dmint --v2 --daa-mode epoch`): the
+>   canonical EPOCH bytecode has an int64-overflow that bricks the contract
+>   on-chain (`target × clampedDelta` > 2^63; retarget also drifts past the
+>   2^48 safe target). Confirmed against `radiant-core` `interpreter.cpp`
+>   (`OP_MUL → safeMul` abort). **To re-enable:** file/track the upstream
+>   Photonic fix (draft report: two int64-overflow conditions in
+>   `dMintScript` — EPOCH `target × clampedDelta` and LWMA negative-delta;
+>   see #219), then byte-match the corrected bytecode here, re-add the 2^48
+>   retarget cap + `targetTime` bound (and the LWMA `OP_0 OP_MAX` delta
+>   floor) in both layers, drop the `DaaMode.EPOCH` refusal, and re-prove
+>   the golden + regtest boundary-mint. The EPOCH bytecode/parser stay in
+>   place meanwhile (parse-compat + the canonical byte-match golden test).
 > - Native fast miner — pyrxd ships a slow Python reference; users
 >   wanting GPU/multi-core go through the external-miner shim to
 >   `glyph-miner`
