@@ -66,9 +66,7 @@ pyrxd glyph init-metadata --type dmint-ft --out token.json
 
 This writes a `dmint-ft` template with `"protocol": ["FT", "DMINT"]`
 already set (a dMint deploy rejects anything else). Edit the file to set
-your `ticker`, `name`, and `decimals`. Do **not** add a `v` field —
-that marks the token V2, which `deploy-dmint` refuses (V2 has no live
-miners).
+your `ticker`, `name`, and `decimals`.
 
 ## Step 2 — deploy the contract
 
@@ -86,6 +84,31 @@ pyrxd --network testnet glyph deploy-dmint token.json \
 | `--reward P` | photons of the FT paid per successful claim |
 | `--num-contracts K` | parallel contracts to genesis (1–250); each is an independent mining lane |
 | `--difficulty D` | initial PoW difficulty (1 = easiest; start here on testnet) |
+
+### V1 vs V2 (adaptive difficulty)
+
+`deploy-dmint` deploys **V1** by default — the established mainnet format,
+fixed difficulty. Pass `--v2` for a V2 contract with a difficulty algorithm
+(`--daa-mode fixed|asert|lwma|epoch|schedule`). V2 is consensus-validated on
+regtest **and** Radiant mainnet but still **pre-external-audit** (it requires the
+`--v2` opt-in for that reason). Examples:
+
+```bash
+# LWMA adaptive difficulty (retargets every block)
+pyrxd glyph deploy-dmint token.json --v2 --daa-mode lwma --target-time 60 --max-height 100 --reward 1000
+
+# EPOCH (periodic retarget; needs difficulty >= 32768 for the 2^48 target cap)
+pyrxd glyph deploy-dmint token.json --v2 --daa-mode epoch --epoch-length 2016 --max-adjustment 4 --difficulty 32768 --max-height 100 --reward 1000
+
+# SCHEDULE (pre-baked difficulty curve: [height, difficulty] pairs)
+pyrxd glyph deploy-dmint token.json --v2 --daa-mode schedule --schedule '[[100, 4], [1000, 8]]' --max-height 2000 --reward 1000
+```
+
+`claim-dmint` auto-detects V1 vs V2 from the contract. For an **EPOCH** or
+**SCHEDULE** V2 contract you must pass the same `--epoch-length`/`--max-adjustment`
+or `--schedule` you deployed with (those parameters live in the contract code,
+not the on-chain state), plus `--current-time <ts>` if you want real
+difficulty tracking (default 0 = always-final locktime).
 
 The command builds a **commit** transaction (an FT-commit hashlock plus
 `K` ref-seed outputs), waits for it to confirm, then builds the
