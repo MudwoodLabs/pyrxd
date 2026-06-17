@@ -135,13 +135,16 @@ class TestGetPushRefsTruncation:
 
 
 class TestDaaModeNotImplemented:
-    def test_epoch_raises(self):
-        with pytest.raises(NotImplementedError, match="EPOCH"):
-            _build_part_b(DaaMode.EPOCH, half_life=600)
+    def test_epoch_emits_daa_bytes(self):
+        # EPOCH is now ported (#219) — emits bytecode beyond the bare B1+B2+B4.
+        result_fixed = _build_part_b(DaaMode.FIXED, half_life=0)
+        result_epoch = _build_part_b(DaaMode.EPOCH, epoch_length=10, max_adjustment_log2=2)
+        assert len(result_epoch) > len(result_fixed)
 
-    def test_schedule_raises(self):
-        with pytest.raises(NotImplementedError, match="SCHEDULE"):
-            _build_part_b(DaaMode.SCHEDULE, half_life=600)
+    def test_schedule_emits_daa_bytes(self):
+        result_fixed = _build_part_b(DaaMode.FIXED, half_life=0)
+        result_sched = _build_part_b(DaaMode.SCHEDULE, schedule=((10, 1000), (50, 500)))
+        assert len(result_sched) > len(result_fixed)
 
     def test_fixed_returns_no_daa_bytes(self):
         """FIXED is the documented "no DAA" mode and must succeed."""

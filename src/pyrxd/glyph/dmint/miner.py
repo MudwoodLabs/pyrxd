@@ -271,6 +271,61 @@ def compute_next_target_linear(
     return max(1, new_target)
 
 
+def compute_next_target_epoch(
+    current_target: int,
+    last_time: int,
+    current_time: int,
+    target_time: int,
+    height: int,
+    epoch_length: int,
+    max_adjustment_log2: int,
+) -> int:
+    """Compute next EPOCH target (mirrors the on-chain ``buildEpochDaaBytecode``).
+
+    Periodic retarget — only at epoch boundaries. ``height`` is the CURRENT (spent)
+    contract's height (the covenant gates on the state's own height, OP_9 PICK)::
+
+        if height > 0 and height % epoch_length == 0:
+            delta        = current_time - last_time
+            clampedDelta = max(target_time >> N, min(target_time << N, delta))
+            new          = min(MAX, max(1, target * clampedDelta // target_time))
+        else: target unchanged
+
+    N = max_adjustment_log2 (1..4). The clamp keeps ``clampedDelta`` ≥ target_time>>N > 0,
+    so the division has positive operands (floor == OP_DIV's truncate-toward-zero).
+
+    .. note:: V2-only DAA.
+    """
+    if height > 0 and height % epoch_length == 0:
+        delta = current_time - last_time
+        upper = target_time << max_adjustment_log2  # targetTime × 2^N
+        lower = target_time >> max_adjustment_log2  # targetTime ÷ 2^N
+        clamped = max(lower, min(upper, delta))
+        new_target = (current_target * clamped) // target_time
+        return max(1, min(new_target, MAX_SHA256D_TARGET))
+    return current_target
+
+
+def compute_next_target_schedule(
+    current_target: int,
+    height: int,
+    schedule: tuple[tuple[int, int], ...],
+) -> int:
+    """Compute next SCHEDULE target (mirrors the on-chain ``buildScheduleDaaBytecode``).
+
+    The target of the highest boundary ``height`` reached; unchanged if ``height`` is
+    below the lowest boundary. ``height`` is the CURRENT (spent) contract's height.
+    ``schedule`` is ascending ``(height, target)`` pairs.
+
+    .. note:: V2-only DAA.
+    """
+    new_target = current_target
+    for boundary_height, boundary_target in schedule:  # ascending → highest match wins
+        if height >= boundary_height:
+            new_target = boundary_target
+    return new_target
+
+
 def _v2_state_script_bytes(st: DmintState) -> bytes:
     """Build the 10-item V2 state script (before 0xbd) from a parsed DmintState.
 
@@ -805,6 +860,9 @@ def build_dmint_mint_tx(
     *,
     funding_utxo: DmintMinerFundingUtxo | None = None,
     op_return_msg: bytes | None = None,
+    epoch_length: int | None = None,
+    max_adjustment_log2: int | None = None,
+    schedule: tuple[tuple[int, int], ...] | None = None,
 ) -> DmintMintResult:
     """Build an unsigned dMint mint transaction.
 
@@ -929,11 +987,15 @@ def build_dmint_mint_tx(
             "and the FT reward + tx fee come from a separate plain-RXD input (same "
             "shape as V1). Pass funding_utxo=DmintMinerFundingUtxo(...)."
         )
-    if state.daa_mode in (DaaMode.EPOCH, DaaMode.SCHEDULE):
-        raise NotImplementedError(
-            f"V2 dMint with daa_mode={state.daa_mode.name} is not yet mintable in "
-            "pyrxd: the EPOCH/SCHEDULE DAA bytecode emitters are defined in the "
-            "protocol but not ported. Use FIXED, ASERT, or LWMA. See #219."
+    if state.daa_mode == DaaMode.EPOCH and (epoch_length is None or max_adjustment_log2 is None):
+        raise ValidationError(
+            "EPOCH mint requires epoch_length and max_adjustment_log2 (baked into the contract "
+            "at deploy, not carried in the parsed state) so the off-chain retarget can be computed."
+        )
+    if state.daa_mode == DaaMode.SCHEDULE and not schedule:
+        raise ValidationError(
+            "SCHEDULE mint requires the schedule entries (baked into the contract at deploy, not "
+            "carried in the parsed state) so the off-chain target lookup can be computed."
         )
     # Redesign: the covenant rebuilds the next state's lastTime from OP_TXLOCKTIME
     # and its target from the alt-stack DAA result on EVERY mint (FIXED included),
@@ -987,6 +1049,22 @@ def build_dmint_mint_tx(
             last_time=state.last_time,
             current_time=current_time,
             target_time=state.target_time,
+        )
+    elif state.daa_mode == DaaMode.EPOCH:
+        new_target = compute_next_target_epoch(
+            current_target=state.target,
+            last_time=state.last_time,
+            current_time=current_time,
+            target_time=state.target_time,
+            height=state.height,  # on-chain EPOCH gates on the CURRENT (spent) height
+            epoch_length=epoch_length,
+            max_adjustment_log2=max_adjustment_log2,
+        )
+    elif state.daa_mode == DaaMode.SCHEDULE:
+        new_target = compute_next_target_schedule(
+            current_target=state.target,
+            height=state.height,  # on-chain SCHEDULE gates on the CURRENT (spent) height
+            schedule=schedule,
         )
     else:  # FIXED \u2014 target unchanged
         new_target = state.target

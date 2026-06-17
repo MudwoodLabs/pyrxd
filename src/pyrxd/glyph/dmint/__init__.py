@@ -132,6 +132,14 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "pyrxd.glyph.dmint.miner",
         "compute_next_target_linear",
     ),
+    "compute_next_target_epoch": (
+        "pyrxd.glyph.dmint.miner",
+        "compute_next_target_epoch",
+    ),
+    "compute_next_target_schedule": (
+        "pyrxd.glyph.dmint.miner",
+        "compute_next_target_schedule",
+    ),
     "difficulty_to_target": (
         "pyrxd.glyph.dmint.miner",
         "difficulty_to_target",

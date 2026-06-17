@@ -487,24 +487,29 @@ class TestPrepareDmintDeploy:
 # ---------------------------------------------------------------------------
 
 
-def _make_contract_utxo(height: int = 0, daa_mode=DaaMode.FIXED, value: int = 1) -> DmintContractUtxo:
+def _make_contract_utxo(
+    height: int = 0, daa_mode=DaaMode.FIXED, value: int = 1, *, difficulty: int = 10, **daa_kwargs
+) -> DmintContractUtxo:
     """Build a synthetic V2 DmintContractUtxo for testing.
 
     The contract is a 1-photon singleton (the covenant enforces
     ``OP_OUTPUTVALUE==1`` on the recreated output); the FT reward + tx fee come
-    from a separate funding input (same shape as V1).
+    from a separate funding input (same shape as V1). ``difficulty`` /
+    ``daa_kwargs`` (epoch_length, max_adjustment_log2, schedule) let EPOCH/SCHEDULE
+    contracts be built (EPOCH needs difficulty >= 32768 for the 2^48 target cap).
     """
     params = DmintDeployParams(
         contract_ref=_CONTRACT_REF,
         token_ref=_TOKEN_REF,
         max_height=100,
         reward=1_000,
-        difficulty=10,
+        difficulty=difficulty,
         height=height,
         daa_mode=daa_mode,
         target_time=60,
         half_life=3_600,
         last_time=1_700_000_000 if height > 0 else 0,
+        **daa_kwargs,
     )
     script = build_dmint_contract_script(params)
     state = DmintState.from_script(script)
@@ -521,7 +526,7 @@ def _funding(value: int = 500_000_000) -> DmintMinerFundingUtxo:
     return DmintMinerFundingUtxo(txid="aa" * 32, vout=0, value=value, script=b"\x76\xa9\x14" + bytes(20) + b"\x88\xac")
 
 
-def _mint(utxo, *, nonce=_NONCE, pkh=_MINER_PKH, current_time=0, funding=None, op_return_msg=_OP_RETURN):
+def _mint(utxo, *, nonce=_NONCE, pkh=_MINER_PKH, current_time=0, funding=None, op_return_msg=_OP_RETURN, **daa_kwargs):
     return build_dmint_mint_tx(
         utxo,
         nonce,
@@ -529,6 +534,7 @@ def _mint(utxo, *, nonce=_NONCE, pkh=_MINER_PKH, current_time=0, funding=None, o
         current_time,
         funding_utxo=_funding() if funding is None else funding,
         op_return_msg=op_return_msg,
+        **daa_kwargs,
     )
 
 
@@ -675,11 +681,32 @@ class TestBuildDmintMintTx:
         assert result.updated_state.target > utxo.state.target
         assert result.updated_state.last_time == last_time + 7200
 
-    def test_epoch_daa_not_buildable(self):
-        # EPOCH/SCHEDULE DAA bytecode emitters are not yet ported in pyrxd, so the
-        # builder refuses to construct such a contract (it can never be deployed).
-        with pytest.raises(NotImplementedError, match="not yet implemented"):
-            _make_contract_utxo(daa_mode=DaaMode.EPOCH)
+    def test_epoch_mint_retargets_at_boundary(self):
+        # EPOCH is now buildable + mintable (#219). At an epoch boundary the
+        # recreated target advances; the caller supplies epoch_length/max_adjustment
+        # (baked into the contract, not carried in the parsed state).
+        utxo = _make_contract_utxo(
+            height=10, daa_mode=DaaMode.EPOCH, difficulty=100000, epoch_length=10, max_adjustment_log2=2
+        )
+        last_time = utxo.state.last_time
+        # delta = 4*targetTime (slow) → clamped to targetTime<<2 = 4*tt → target *4
+        result = _mint(utxo, current_time=last_time + 240, epoch_length=10, max_adjustment_log2=2)
+        assert result.updated_state.target == min(utxo.state.target * 4, MAX_SHA256D_TARGET)
+        assert result.updated_state.last_time == last_time + 240
+
+    def test_epoch_mint_requires_params(self):
+        utxo = _make_contract_utxo(
+            height=10, daa_mode=DaaMode.EPOCH, difficulty=100000, epoch_length=10, max_adjustment_log2=2
+        )
+        with pytest.raises(ValidationError, match="EPOCH mint requires"):
+            _mint(utxo)  # no epoch_length/max_adjustment passed
+
+    def test_schedule_mint_sets_target_at_boundary(self):
+        sched = ((1, MAX_SHA256D_TARGET // 2),)
+        utxo = _make_contract_utxo(height=5, daa_mode=DaaMode.SCHEDULE, difficulty=1, schedule=sched)
+        # current height 5 >= boundary 1 → recreated target = the scheduled value
+        result = _mint(utxo, current_time=1_700_000_001, schedule=sched)
+        assert result.updated_state.target == MAX_SHA256D_TARGET // 2
 
     def test_consecutive_mints_chain_state(self):
         utxo = _make_contract_utxo()

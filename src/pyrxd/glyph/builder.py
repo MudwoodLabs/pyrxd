@@ -510,6 +510,9 @@ class GlyphBuilder:
                     daa_mode=params.daa_mode,
                     target_time=params.target_time,
                     half_life=params.half_life,
+                    epoch_length=params.epoch_length,
+                    max_adjustment_log2=params.max_adjustment_log2,
+                    schedule=params.schedule,
                 )
             )
             for i in range(params.num_contracts)
@@ -530,6 +533,9 @@ class GlyphBuilder:
             daa_mode=params.daa_mode,
             target_time=params.target_time,
             half_life=params.half_life,
+            epoch_length=params.epoch_length,
+            max_adjustment_log2=params.max_adjustment_log2,
+            schedule=params.schedule,
         )
 
     # ------------------------------------------------------------------
@@ -979,6 +985,9 @@ class DmintV2DeployParams:
     daa_mode: DaaMode = DaaMode.FIXED
     target_time: int = 60
     half_life: int = 3600
+    epoch_length: int = 2016  # EPOCH: retarget every N blocks
+    max_adjustment_log2: int = 2  # EPOCH: max 2^N adjustment per epoch (1..4)
+    schedule: tuple[tuple[int, int], ...] = ()  # SCHEDULE: ascending (height, target) entries
 
     def __post_init__(self) -> None:
         if not (1 <= self.num_contracts <= 250):
@@ -992,12 +1001,9 @@ class DmintV2DeployParams:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
-        if self.daa_mode in (DaaMode.EPOCH, DaaMode.SCHEDULE):
-            raise ValidationError(
-                f"V2 dMint deploy: DaaMode.{self.daa_mode.name} is defined in the protocol "
-                "but its bytecode emitter is not yet ported in pyrxd. Use FIXED, ASERT, or "
-                "LWMA (the redesigned covenant advances target/last_time on-chain; #219)."
-            )
+        # All five DAA modes are supported (FIXED/ASERT/LWMA/EPOCH/SCHEDULE). Per-mode
+        # parameter validation (EPOCH 2^48 cap + power-of-2 adjustment, SCHEDULE entry
+        # shape) is enforced by DmintDeployParams when the contract scripts are built.
 
 
 class DmintFullDeployParams(DmintV2DeployParams):
@@ -1216,6 +1222,9 @@ class DmintV2DeployResult:
     daa_mode: DaaMode
     target_time: int
     half_life: int
+    epoch_length: int = 2016
+    max_adjustment_log2: int = 2
+    schedule: tuple[tuple[int, int], ...] = ()
 
     def build_reveal_outputs(self, commit_txid: str) -> DmintV1RevealScripts:
         """Build reveal-tx output scripts given the confirmed commit txid.
@@ -1242,6 +1251,9 @@ class DmintV2DeployResult:
                     daa_mode=self.daa_mode,
                     target_time=self.target_time,
                     half_life=self.half_life,
+                    epoch_length=self.epoch_length,
+                    max_adjustment_log2=self.max_adjustment_log2,
+                    schedule=self.schedule,
                 )
             )
             for i in range(self.num_contracts)

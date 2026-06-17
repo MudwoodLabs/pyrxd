@@ -70,6 +70,16 @@ MAX_SHA256D_TARGET = 0x7FFFFFFFFFFFFFFF
 # Maximum V2 256-bit target for blake3 / k12.
 MAX_V2_TARGET_256 = (1 << 256) - 1
 
+# EPOCH DAA: allowed max-adjustment factors and their log2 (shift count). Restricted
+# to powers of 2 so the boundary clamp uses bit-shifts (N× OP_2MUL / OP_2DIV).
+EPOCH_MAX_ADJUSTMENT_LOG2_VALUES = (1, 2, 3, 4)  # → 2× / 4× / 8× / 16×
+# EPOCH target ceiling: target > 2^48 risks overflow in `target × clampedDelta`
+# (clampedDelta ≤ targetTime × 2^N). Enforced at deploy when daa_mode == EPOCH.
+EPOCH_MAX_SAFE_TARGET = 1 << 48
+
+# SCHEDULE DAA: maximum number of (height, target) entries in a baked schedule.
+SCHEDULE_MAX_ENTRIES = 10
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -138,6 +148,9 @@ class DmintDeployParams:
     half_life: int = 3600  # ASERT half-life in seconds
     height: int = 0  # current mint height (0 at deploy)
     last_time: int = 0  # timestamp of last mint (0 at deploy)
+    epoch_length: int = 2016  # EPOCH: retarget every N blocks
+    max_adjustment_log2: int = 2  # EPOCH: max adjustment 2^N per epoch (1..4 → 2×..16×)
+    schedule: tuple[tuple[int, int], ...] = ()  # SCHEDULE: ascending (height, target) entries
 
     def __post_init__(self) -> None:
         if self.max_height < 1:
@@ -154,6 +167,37 @@ class DmintDeployParams:
             raise ValidationError("height must be >= 0")
         if self.last_time < 0:
             raise ValidationError("last_time must be >= 0")
+        if self.daa_mode == DaaMode.EPOCH:
+            if self.epoch_length < 1:
+                raise ValidationError("epoch_length must be >= 1 for EPOCH")
+            if self.max_adjustment_log2 not in EPOCH_MAX_ADJUSTMENT_LOG2_VALUES:
+                raise ValidationError(
+                    f"max_adjustment_log2 must be one of {EPOCH_MAX_ADJUSTMENT_LOG2_VALUES} for EPOCH "
+                    f"(got {self.max_adjustment_log2})"
+                )
+            # target × clampedDelta must not overflow int64 → cap target at 2^48.
+            if self.initial_target > EPOCH_MAX_SAFE_TARGET:
+                raise ValidationError(
+                    f"EPOCH requires initial target <= 2^48 (use difficulty >= "
+                    f"{MAX_SHA256D_TARGET // EPOCH_MAX_SAFE_TARGET + 1}); got target {self.initial_target} "
+                    "— larger targets risk OP_MUL overflow in the on-chain retarget"
+                )
+        if self.daa_mode == DaaMode.SCHEDULE:
+            if not self.schedule:
+                raise ValidationError("SCHEDULE requires a non-empty schedule (use FIXED for no schedule)")
+            if len(self.schedule) > SCHEDULE_MAX_ENTRIES:
+                raise ValidationError(
+                    f"SCHEDULE allows at most {SCHEDULE_MAX_ENTRIES} entries, got {len(self.schedule)}"
+                )
+            prev_h = -1
+            for i, (h, t) in enumerate(self.schedule):
+                if h < 0:
+                    raise ValidationError(f"SCHEDULE entry {i}: height must be >= 0, got {h}")
+                if h <= prev_h:
+                    raise ValidationError(f"SCHEDULE entries must be strictly ascending by height (entry {i})")
+                if not 1 <= t <= MAX_SHA256D_TARGET:
+                    raise ValidationError(f"SCHEDULE entry {i}: target must be in [1, MAX_SHA256D_TARGET], got {t}")
+                prev_h = h
 
     @property
     def initial_target(self) -> int:

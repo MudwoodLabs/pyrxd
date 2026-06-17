@@ -277,24 +277,99 @@ def _build_linear_daa() -> bytes:
     )
 
 
-def _build_part_b(daa_mode: DaaMode, half_life: int) -> bytes:
+def _build_epoch_daa(epoch_length: int, max_adjustment_log2: int) -> bytes:
+    """EPOCH DAA bytecode (byte-matched to canonical ``buildEpochDaaBytecode``).
+
+    Periodic retarget — only adjusts at epoch boundaries. When ``height > 0`` and
+    ``height % epoch_length == 0``::
+
+        delta        = currentTime - lastTime
+        clampedDelta = max(targetTime>>N, min(targetTime<<N, delta))   # N = max_adjustment_log2
+        newTarget    = min(MAX_TARGET, max(1, target * clampedDelta // targetTime))
+
+    otherwise the target is unchanged. ``N`` is a deploy-time power-of-2 exponent
+    (1..4 → 2×/4×/8×/16×); the shift is emitted as N× OP_2MUL / OP_2DIV (not
+    OP_LSHIFT/RSHIFT, which are big-endian-buffer-wise and wrong on LE script
+    numbers). Height is at state position 9 (OP_9 PICK).
+    """
+    lshift_n = b"\x8d" * max_adjustment_log2  # N × OP_2MUL  (targetTime << N)
+    rshift_n = b"\x8e" * max_adjustment_log2  # N × OP_2DIV  (targetTime >> N)
+    return (
+        bytes.fromhex("5979")  # OP_9 PICK — copy height
+        + b"\x76"  # DUP
+        + bytes.fromhex("00a0")  # OP_0 GREATERTHAN — height > 0?
+        + b"\x7c"  # SWAP
+        + _push_minimal(epoch_length)
+        + b"\x97"  # OP_MOD — height % epoch_length
+        + bytes.fromhex("009c")  # OP_0 NUMEQUAL — == 0?
+        + b"\x9a"  # OP_BOOLAND
+        + b"\x63"  # IF (boundary)
+        + b"\xc5"  # TXLOCKTIME — currentTime
+        + bytes.fromhex("5279")  # OP_2 PICK lastTime
+        + b"\x94"  # SUB → delta
+        + bytes.fromhex("5379")  # OP_3 PICK targetTime
+        + lshift_n  # upperBound = targetTime × 2^N
+        + b"\xa3"  # MIN
+        + bytes.fromhex("5379")  # OP_3 PICK targetTime
+        + rshift_n  # lowerBound = targetTime / 2^N
+        + b"\xa4"  # MAX
+        + b"\x7c"  # SWAP
+        + b"\x95"  # MUL — target × clampedDelta
+        + bytes.fromhex("5279")  # OP_2 PICK targetTime
+        + b"\x96"  # DIV → newTarget
+        + _PUSH_MAX_TARGET
+        + b"\xa3"  # MIN (defensive)
+        + bytes.fromhex("76519f")  # DUP 1 LESSTHAN
+        + b"\x63"  # IF
+        + bytes.fromhex("7551")  #   DROP 1
+        + b"\x68"  # ENDIF
+        + b"\x68"  # ENDIF (outer)
+    )
+
+
+def _build_schedule_daa(schedule: tuple[tuple[int, int], ...]) -> bytes:
+    """SCHEDULE DAA bytecode (byte-matched to canonical ``buildScheduleDaaBytecode``).
+
+    A pre-baked, time-independent difficulty curve: a nested descending IF chain
+    that sets ``target`` to the entry of the highest boundary ``height`` reached.
+    If ``height`` is below the lowest boundary the target is unchanged. Built
+    inside-out from an ascending-by-height ``schedule`` (so the outermost check is
+    the highest boundary).
+    """
+    body = b""
+    for height, target in schedule:
+        body = (
+            bytes.fromhex("5979")  # OP_9 PICK — copy height
+            + _push_minimal(height)  # boundary
+            + b"\xa2"  # GREATERTHANOREQUAL
+            + b"\x63"  # IF
+            + b"\x75"  # DROP old target
+            + _push_minimal(target)  # new target
+            + (b"\x67" if body else b"")  # ELSE (only if a deeper fallback exists)
+            + body
+            + b"\x68"  # ENDIF
+        )
+    return body
+
+
+def _build_part_b(
+    daa_mode: DaaMode,
+    half_life: int = 3600,
+    *,
+    epoch_length: int = 2016,
+    max_adjustment_log2: int = 2,
+    schedule: tuple[tuple[int, int], ...] = (),
+) -> bytes:
     if daa_mode == DaaMode.FIXED:
         daa_bytes = b""  # fixed difficulty — no DAA bytecode
     elif daa_mode == DaaMode.ASERT:
         daa_bytes = _build_asert_daa(half_life)
     elif daa_mode == DaaMode.LWMA:
         daa_bytes = _build_linear_daa()
-    elif daa_mode in (DaaMode.EPOCH, DaaMode.SCHEDULE):
-        # Defined in the protocol but not yet implemented in pyrxd. Earlier
-        # versions silently fell through to FIXED (empty daa_bytes), which
-        # would deploy a contract with no DAA logic — irreversible on
-        # mainnet for a PoW-dMint consumer that asked for adaptive difficulty.
-        # Refuse to build rather than ship a footgun.
-        raise NotImplementedError(
-            f"DaaMode.{daa_mode.name} is defined in the protocol but not yet "
-            "implemented in pyrxd. Use FIXED, ASERT, or LWMA, or contribute "
-            "the missing bytecode emitter."
-        )
+    elif daa_mode == DaaMode.EPOCH:
+        daa_bytes = _build_epoch_daa(epoch_length, max_adjustment_log2)
+    elif daa_mode == DaaMode.SCHEDULE:
+        daa_bytes = _build_schedule_daa(schedule)
     else:
         raise ValueError(f"unknown DaaMode: {daa_mode!r}")
     return _PART_B1 + _PART_B2 + daa_bytes + _PART_B4
@@ -404,7 +479,13 @@ def build_dmint_state_script(params: DmintDeployParams) -> bytes:
 def build_dmint_code_script(params: DmintDeployParams) -> bytes:
     """Build the V2 dMint code bytecode (Part A + powHashOp + Part B + Part C)."""
     pow_op = _POW_HASH_OP[params.algo]
-    part_b = _build_part_b(params.daa_mode, params.half_life)
+    part_b = _build_part_b(
+        params.daa_mode,
+        params.half_life,
+        epoch_length=params.epoch_length,
+        max_adjustment_log2=params.max_adjustment_log2,
+        schedule=params.schedule,
+    )
     part_c = _build_part_c(_middle_literal(params))
     return _PART_A + pow_op + part_b + part_c
 
