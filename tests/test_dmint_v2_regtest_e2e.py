@@ -152,6 +152,7 @@ def _v2_params(
     difficulty=1,
     target_time=60,
     half_life=3600,
+    **daa_kwargs,
 ):
     return DmintDeployParams(
         contract_ref=contract_ref,
@@ -167,6 +168,7 @@ def _v2_params(
         half_life=half_life,
         height=height,
         last_time=last_time,
+        **daa_kwargs,  # epoch_length / max_adjustment_log2 / schedule
     )
 
 
@@ -179,11 +181,12 @@ def _deploy_v2_contract(
     difficulty: int = 1,
     last_time: int = 0,
     target_time: int = 60,
+    **daa_kwargs,
 ) -> DmintContractUtxo:
     """Create a V2 dMint contract UTXO (value-1 singleton) by inducting the
     singleton ``contractRef`` + normal ``tokenRef`` from two spent genesis
     outpoints, with the V2 contract script at vout 0. Defaults to FIXED; pass
-    ``daa_mode``/``last_time`` to deploy an ASERT/LWMA contract.
+    ``daa_mode``/``last_time``/``schedule``/``epoch_*`` for an adaptive contract.
     """
     g_tok = _carve(node, 200_000_000)
     g_con = _carve(node, 200_000_000)
@@ -202,6 +205,7 @@ def _deploy_v2_contract(
             daa_mode=daa_mode,
             difficulty=difficulty,
             target_time=target_time,
+            **daa_kwargs,
         )
         contract_script = build_dmint_contract_script(params)
         state = DmintState.from_script(contract_script)
@@ -227,7 +231,7 @@ def _deploy_v2_contract(
 
 
 def _build_signed_v2_mint(
-    node: _RegtestNode, contract: DmintContractUtxo, *, current_time: int = 0
+    node: _RegtestNode, contract: DmintContractUtxo, *, current_time: int = 0, **daa_kwargs
 ) -> tuple[Transaction, bytes]:
     """Build, mine, and sign a consensus-correct (V1-shaped) V2 mint.
 
@@ -256,6 +260,7 @@ def _build_signed_v2_mint(
             current_time=current_time,
             funding_utxo=funding,
             op_return_msg=b"pyrxd-v2-regtest",
+            **daa_kwargs,  # schedule / epoch_length / max_adjustment_log2
         )
         tx = result.tx
         op_return_script = tx.outputs[2].locking_script.script
@@ -459,6 +464,48 @@ class TestRadiantDmintV2OnConsensus:
         assert recreated.height == 1
         assert recreated.last_time == current_time
         assert recreated.target == expected_target
+
+    def test_v2_schedule_mint_sets_target_on_chain(self, node):
+        """A SCHEDULE (pre-baked curve) V2 contract mints and the covenant sets the
+        recreated target to the scheduled value on-chain. Consensus acceptance proves
+        pyrxd's off-chain ``compute_next_target_schedule`` matches the on-chain nested
+        IF chain. difficulty=1 → THIS mint's PoW is just the 4-zero floor (fast).
+        """
+        sched = ((0, MAX_SHA256D_TARGET // 2),)  # at height >= 0, target → MAX/2
+        contract = _deploy_v2_contract(
+            node, max_height=10, reward=1000, daa_mode=DaaMode.SCHEDULE, difficulty=1, schedule=sched
+        )
+        assert contract.state.target == MAX_SHA256D_TARGET
+        tx, _nonce = _build_signed_v2_mint(node, contract, current_time=1_700_000_000, schedule=sched)
+        res = node.accepts(tx.serialize().hex())
+        assert res["allowed"] is True, f"SCHEDULE V2 mint rejected (off-chain != on-chain?): {res}"
+        mtxid = node.cli("sendrawtransaction", tx.serialize().hex())
+        assert isinstance(mtxid, str), mtxid
+        node.mine(1)
+        recreated = DmintState.from_script(bytes.fromhex(node.cli("gettxout", mtxid, "0")["scriptPubKey"]["hex"]))
+        assert recreated.height == 1
+        assert recreated.target == MAX_SHA256D_TARGET // 2  # the schedule's value, set on-chain
+
+    def test_v2_epoch_contract_deploys_on_consensus(self, node):
+        """An EPOCH contract DEPLOYS on real consensus (the contract script is valid).
+
+        EPOCH carries a 2^48 target cap (difficulty >= 32768), so an EPOCH *boundary*
+        mint needs >=2^40 PoW work — not feasibly mineable in a test. We validate the
+        deploy here (``_deploy_v2_contract`` asserts the reveal is accepted + mined into
+        a block); the EPOCH retarget bytecode itself is byte-matched to canonical
+        Photonic offline (tests/test_dmint_v2_daa_canonical.py).
+        """
+        contract = _deploy_v2_contract(
+            node,
+            max_height=1000,
+            reward=1000,
+            daa_mode=DaaMode.EPOCH,
+            difficulty=32768,
+            epoch_length=10,
+            max_adjustment_log2=2,
+        )
+        assert contract.state.daa_mode == DaaMode.EPOCH
+        assert contract.state.target <= (1 << 48)
 
     def test_v2_deploy_via_api_then_mint(self, node):
         """The real deploy API (prepare_dmint_deploy(DmintV2DeployParams) ->
