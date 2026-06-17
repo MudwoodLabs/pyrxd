@@ -545,7 +545,19 @@ class TestDmintCliAssembly:
         meta = GlyphMetadata.for_dmint_ft(
             ticker="TST", name="t", protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)]
         )
-        result = asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), meta, 1, 100, 1000, 1, None, client))
+        from pyrxd.glyph.builder import DmintV1DeployParams
+        from pyrxd.security.types import Hex20
+
+        params = DmintV1DeployParams(
+            metadata=meta,
+            owner_pkh=Hex20(b"\x00" * 20),
+            num_contracts=1,
+            max_height=100,
+            reward_photons=1000,
+            difficulty=1,
+            op_return_msg=None,
+        )
+        result = asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), params, client))
 
         assert len(captured) == 2, "commit + reveal both built+signed without crashing"
         assert result["num_contracts"] == 1
@@ -702,3 +714,90 @@ class TestTransferNftAssembly:
         total_out = sum(o.satoshis for o in tx.outputs)
         assert total_in - total_out > 0, "pays a real (non-zero) fee"
         assert result["txid"] == "ff" * 32
+
+
+class TestDmintV2CliPaths:
+    """V2 deploy/claim CLI wiring (#219) — pure helpers + the version-agnostic deploy inner."""
+
+    def test_parse_schedule_converts_difficulty_to_target(self):
+        from pyrxd.cli.glyph_cmds import _parse_schedule
+        from pyrxd.glyph.dmint import MAX_SHA256D_TARGET
+
+        out = _parse_schedule("[[100, 4], [1000, 8]]")
+        assert out == ((100, MAX_SHA256D_TARGET // 4), (1000, MAX_SHA256D_TARGET // 8))
+
+    def test_parse_schedule_rejects_bad_json(self):
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _parse_schedule
+
+        with pytest.raises(UserError, match="not valid JSON"):
+            _parse_schedule("[[100, 4]")
+
+    def test_parse_schedule_rejects_bad_shape(self):
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _parse_schedule
+
+        with pytest.raises(UserError, match="height, difficulty"):
+            _parse_schedule("[[100, 4, 9]]")
+
+    def test_v2_claim_daa_kwargs_per_mode(self):
+        from pyrxd.cli.glyph_cmds import _v2_claim_daa_kwargs
+        from pyrxd.glyph.dmint import DaaMode
+
+        assert _v2_claim_daa_kwargs(DaaMode.FIXED, 10, "4", None) == {}
+        assert _v2_claim_daa_kwargs(DaaMode.LWMA, 10, "4", None) == {}
+        assert _v2_claim_daa_kwargs(DaaMode.EPOCH, 10, "8", None) == {"epoch_length": 10, "max_adjustment_log2": 3}
+        sched = _v2_claim_daa_kwargs(DaaMode.SCHEDULE, 10, "4", "[[5, 2]]")
+        assert "schedule" in sched and sched["schedule"][0][0] == 5
+
+    def test_v2_claim_schedule_requires_schedule_flag(self):
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _v2_claim_daa_kwargs
+        from pyrxd.glyph.dmint import DaaMode
+
+        with pytest.raises(UserError, match="requires --schedule"):
+            _v2_claim_daa_kwargs(DaaMode.SCHEDULE, 10, "4", None)
+
+    def test_deploy_inner_v2_lwma(self, cli_context) -> None:
+        """The version-agnostic deploy inner produces a V2 (LWMA) contract: commit +
+        reveal both build/sign, and the result is tagged V2/LWMA."""
+        from pyrxd.cli.glyph_cmds import _deploy_dmint_inner
+        from pyrxd.glyph.builder import DmintV2DeployParams
+        from pyrxd.glyph.dmint import DaaMode
+        from pyrxd.security.types import Hex20
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key = PrivateKey()
+        utxo = UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=50_000_000, height=100)
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [(utxo, key.address(), key)]
+
+        captured: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            captured.append(raw)
+            return ("11" if len(captured) == 1 else "22") * 32
+
+        client = MagicMock()
+        client.broadcast = _bcast
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+
+        meta = GlyphMetadata.for_dmint_ft(
+            ticker="TV2", name="t", protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)]
+        )
+        params = DmintV2DeployParams(
+            metadata=meta,
+            owner_pkh=Hex20(b"\x00" * 20),
+            num_contracts=1,
+            max_height=100,
+            reward_photons=1000,
+            difficulty=10,
+            daa_mode=DaaMode.LWMA,
+            target_time=60,
+        )
+        result = asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), params, client))
+        assert len(captured) == 2
+        assert result["version"] == "V2"
+        assert result["daa_mode"] == "LWMA"

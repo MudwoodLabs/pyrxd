@@ -35,6 +35,7 @@ import asyncio
 import json
 import shlex
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -44,6 +45,7 @@ from ..fee_models import SatoshisPerKilobyte
 from ..glyph.builder import (
     CommitParams,
     DmintV1DeployParams,
+    DmintV2DeployParams,
     FtTransferParams,
     FtUtxo,
     GlyphBuilder,
@@ -51,11 +53,14 @@ from ..glyph.builder import (
 )
 from ..glyph.dmint import (
     DEFAULT_MAX_ATTEMPTS,
+    MAX_SHA256D_TARGET,
+    DaaMode,
     DmintContractUtxo,
     DmintMinerFundingUtxo,
     DmintState,
     build_dmint_mint_tx,
     build_dmint_v1_mint_preimage,
+    build_dmint_v2_mint_preimage,
     build_mint_scriptsig,
     find_dmint_contract_utxos,
     find_dmint_funding_utxo,
@@ -1040,33 +1045,96 @@ glyph_group.add_command(inspect_cmd)
 _DMINT_REF_SEED = 1_000  # > dust; one per contract, genesises each contractRef
 
 
+_MAX_ADJUSTMENT_TO_LOG2 = {"2": 1, "4": 2, "8": 3, "16": 4}
+
+
+def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
+    """Parse ``--schedule '[[height, difficulty], ...]'`` → ascending (height, target) entries.
+
+    Entries take *difficulty* (1 = easiest), converted to a target via the
+    SHA256d formula, to match how ``--difficulty`` works everywhere else.
+    """
+    try:
+        raw = json.loads(schedule_json)
+    except json.JSONDecodeError as exc:
+        raise UserError("--schedule is not valid JSON", cause=str(exc), fix="e.g. --schedule '[[100, 4], [1000, 8]]'")
+    if not isinstance(raw, list) or not all(isinstance(e, list) and len(e) == 2 for e in raw):
+        raise UserError("--schedule must be a JSON list of [height, difficulty] pairs", cause=repr(raw))
+    out = []
+    for h, d in raw:
+        if not isinstance(h, int) or not isinstance(d, int) or d < 1:
+            raise UserError(f"--schedule entry [{h!r}, {d!r}]: height int and difficulty int >= 1 required")
+        out.append((h, MAX_SHA256D_TARGET // d))
+    return tuple(out)
+
+
 @glyph_group.command(name="deploy-dmint")
 @click.argument("metadata_file", type=click.Path(path_type=Path))
 @click.option(
-    "--num-contracts", type=int, default=1, show_default=True, help="Parallel V1 contracts to genesis [1..250]."
+    "--v2",
+    is_flag=True,
+    default=False,
+    help="Deploy a V2 (DAA-capable) contract. Default: V1 (the established mainnet format).",
 )
+@click.option(
+    "--daa-mode",
+    type=click.Choice(["fixed", "asert", "lwma", "epoch", "schedule"]),
+    default="fixed",
+    show_default=True,
+    help="V2 difficulty mode (requires --v2).",
+)
+@click.option("--num-contracts", type=int, default=1, show_default=True, help="Parallel contracts to genesis [1..250].")
 @click.option("--max-height", type=int, required=True, help="Mints per contract [1..0xFFFFFF].")
 @click.option("--reward", type=int, required=True, help="Photons of the FT paid per successful mint [1..0xFFFFFF].")
-@click.option("--difficulty", type=int, default=1, show_default=True, help="Initial PoW difficulty (1 = easiest).")
-@click.option("--op-return", "op_return", default=None, help="Optional OP_RETURN carrier on the reveal (<=255 bytes).")
+@click.option(
+    "--difficulty",
+    type=int,
+    default=1,
+    show_default=True,
+    help="Initial PoW difficulty (1 = easiest; EPOCH needs >= 32768).",
+)
+@click.option("--target-time", type=int, default=60, show_default=True, help="V2 DAA: target seconds between mints.")
+@click.option("--half-life", type=int, default=3600, show_default=True, help="V2 ASERT: half-life in seconds.")
+@click.option("--epoch-length", type=int, default=2016, show_default=True, help="V2 EPOCH: retarget every N blocks.")
+@click.option(
+    "--max-adjustment",
+    type=click.Choice(["2", "4", "8", "16"]),
+    default="4",
+    show_default=True,
+    help="V2 EPOCH: max difficulty adjustment per epoch.",
+)
+@click.option(
+    "--schedule",
+    default=None,
+    help="V2 SCHEDULE: JSON [[height, difficulty], ...] (<=10, ascending), e.g. '[[100, 4], [1000, 8]]'.",
+)
+@click.option("--op-return", "op_return", default=None, help="Optional OP_RETURN carrier on the reveal (<=80 bytes).")
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def deploy_dmint_cmd(
     ctx: CliContext,
     metadata_file: Path,
+    v2: bool,
+    daa_mode: str,
     num_contracts: int,
     max_height: int,
     reward: int,
     difficulty: int,
+    target_time: int,
+    half_life: int,
+    epoch_length: int,
+    max_adjustment: str,
+    schedule: str | None,
     op_return: str | None,
     passphrase: bool,
 ) -> None:
-    """Deploy a V1 dMint contract (commit -> reveal) that miners claim from.
+    """Deploy a dMint contract (commit -> reveal) that miners claim from.
 
     Genesises ``--num-contracts`` parallel 1-photon singleton contracts; each
-    pays ``--reward`` photons of the FT per PoW-mined claim, up to
-    ``--max-height`` claims. Prints the token_ref and per-contract outpoints so
-    they can be claimed with ``glyph claim-dmint``.
+    pays ``--reward`` photons of the FT per PoW-mined claim, up to ``--max-height``
+    claims. V1 by default (the only established mainnet format). Pass ``--v2`` for
+    a DAA-capable V2 contract (``--daa-mode fixed/asert/lwma/epoch/schedule``);
+    V2 is consensus-validated (regtest + mainnet) but pre-external-audit.
     """
     metadata = _read_metadata_file(metadata_file)
     if GlyphProtocol.FT not in metadata.protocol or GlyphProtocol.DMINT not in metadata.protocol:
@@ -1081,19 +1149,39 @@ def deploy_dmint_cmd(
     # commit). 80 bytes is the node standardness limit (matches the mint path).
     if op_return_bytes is not None and len(op_return_bytes) > 80:
         raise UserError(f"--op-return is {len(op_return_bytes)} bytes; the standardness limit is 80")
+    if not v2 and daa_mode != "fixed":
+        raise UserError("--daa-mode requires --v2 (V1 dMint is FIXED difficulty only)")
 
-    # Validate parameter bounds early (DmintV1DeployParams.__post_init__) before
-    # any wallet prompt; owner_pkh is a placeholder here (bound to the funding key in _inner).
+    # Build (and bound-validate) the deploy params; owner_pkh is a placeholder
+    # here, bound to the funding key inside _deploy_dmint_inner.
+    placeholder_pkh = Hex20(b"\x00" * 20)
     try:
-        DmintV1DeployParams(
-            metadata=metadata,
-            owner_pkh=Hex20(b"\x00" * 20),
-            num_contracts=num_contracts,
-            max_height=max_height,
-            reward_photons=reward,
-            difficulty=difficulty,
-            op_return_msg=op_return_bytes,
-        )
+        if v2:
+            deploy_params: DmintV1DeployParams | DmintV2DeployParams = DmintV2DeployParams(
+                metadata=metadata,
+                owner_pkh=placeholder_pkh,
+                num_contracts=num_contracts,
+                max_height=max_height,
+                reward_photons=reward,
+                difficulty=difficulty,
+                op_return_msg=op_return_bytes,
+                daa_mode=DaaMode[daa_mode.upper()],
+                target_time=target_time,
+                half_life=half_life,
+                epoch_length=epoch_length,
+                max_adjustment_log2=_MAX_ADJUSTMENT_TO_LOG2[max_adjustment],
+                schedule=_parse_schedule(schedule) if schedule else (),
+            )
+        else:
+            deploy_params = DmintV1DeployParams(
+                metadata=metadata,
+                owner_pkh=placeholder_pkh,
+                num_contracts=num_contracts,
+                max_height=max_height,
+                reward_photons=reward,
+                difficulty=difficulty,
+                op_return_msg=op_return_bytes,
+            )
     except ValidationError as exc:
         raise UserError("invalid dMint deploy parameters", cause=str(exc)) from exc
 
@@ -1102,9 +1190,7 @@ def deploy_dmint_cmd(
     async def _do() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _deploy_dmint_inner(
-                ctx, wallet, metadata, num_contracts, max_height, reward, difficulty, op_return_bytes, client
-            )
+            return await _deploy_dmint_inner(ctx, wallet, deploy_params, client)
 
     try:
         result = asyncio.run(_do())
@@ -1118,28 +1204,36 @@ def deploy_dmint_cmd(
     elif ctx.output_mode == "quiet":
         click.echo(emit(result, mode="quiet", quiet_field="reveal_txid"))
     else:
-        click.echo("\ndMint contract deployed!")
+        click.echo(f"\ndMint {result['version']} contract deployed!")
         click.echo(f"  commit txid:  {result['commit_txid']}")
         click.echo(f"  reveal txid:  {result['reveal_txid']}")
         click.echo(f"  token_ref:    {result['token_ref']}")
+        if result["version"] == "V2":
+            click.echo(f"  daa_mode:     {result['daa_mode']}")
         click.echo(f"  contracts ({result['num_contracts']}):")
         for outpoint in result["contracts"]:
             click.echo(f"    {outpoint}")
         click.echo(f"  total supply: {result['total_supply']:,} photons")
-        click.echo(f"\n  claim with:   glyph claim-dmint --contract {result['contracts'][0]}")
+        _claim_hint = f"glyph claim-dmint --contract {result['contracts'][0]}"
+        if result["version"] == "V2":
+            _claim_hint += " --v2"
+        click.echo(f"\n  claim with:   {_claim_hint}")
 
 
 async def _deploy_dmint_inner(
     ctx: CliContext,
     wallet: HdWallet,
-    metadata: GlyphMetadata,
-    num_contracts: int,
-    max_height: int,
-    reward: int,
-    difficulty: int,
-    op_return_bytes: bytes | None,
+    deploy_params: DmintV1DeployParams | DmintV2DeployParams,
     client: ElectrumXClient,
 ) -> dict:
+    # Version-agnostic: V1 and V2 DeployResult share the commit_result /
+    # build_reveal_outputs interface, so the only V1-vs-V2 difference is which
+    # params class the caller built. allow_v2_deploy is ignored for V1.
+    metadata = deploy_params.metadata
+    num_contracts = deploy_params.num_contracts
+    max_height = deploy_params.max_height
+    reward = deploy_params.reward_photons
+    is_v2 = isinstance(deploy_params, DmintV2DeployParams)
     builder = GlyphBuilder()
     triples = await wallet.collect_spendable(client)
     if not triples:
@@ -1165,17 +1259,10 @@ async def _deploy_dmint_inner(
     owner_pkh = Hex20(owner_key.public_key().hash160())
     owner_spk = P2PKH().lock(funding_addr)
 
-    deploy = builder.prepare_dmint_deploy(
-        DmintV1DeployParams(
-            metadata=metadata,
-            owner_pkh=owner_pkh,
-            num_contracts=num_contracts,
-            max_height=max_height,
-            reward_photons=reward,
-            difficulty=difficulty,
-            op_return_msg=op_return_bytes,
-        )
-    )
+    # The owner_pkh on the params object was a placeholder (validated upfront);
+    # bind it to the actual funding key now.
+    deploy_params = replace(deploy_params, owner_pkh=owner_pkh)
+    deploy = builder.prepare_dmint_deploy(deploy_params, allow_v2_deploy=True)
     commit_script = deploy.commit_result.commit_script
 
     # --- commit tx: [FT-commit hashlock | N ref-seeds | change] ---
@@ -1278,6 +1365,8 @@ async def _deploy_dmint_inner(
     reveal_txid = await client.broadcast(reveal_tx.serialize())
     total_supply = reward * max_height * num_contracts
     return {
+        "version": "V2" if is_v2 else "V1",
+        "daa_mode": deploy_params.daa_mode.name if is_v2 else "FIXED",
         "commit_txid": str(commit_txid),
         "reveal_txid": str(reveal_txid),
         "token_ref": f"{commit_txid}:0",
@@ -1348,6 +1437,52 @@ def _mine_claim_with_rerolls(
     )
 
 
+def _v2_claim_daa_kwargs(daa_mode: DaaMode, epoch_length: int, max_adjustment: str, schedule: str | None) -> dict:
+    """The DAA params build_dmint_mint_tx needs for a V2 claim. EPOCH/SCHEDULE bake
+    their params into the contract code (not the parsed state), so the claimer must
+    supply them (``--epoch-length``/``--max-adjustment`` or ``--schedule``)."""
+    if daa_mode == DaaMode.EPOCH:
+        return {"epoch_length": epoch_length, "max_adjustment_log2": _MAX_ADJUSTMENT_TO_LOG2[max_adjustment]}
+    if daa_mode == DaaMode.SCHEDULE:
+        if not schedule:
+            raise UserError(
+                "claiming a SCHEDULE contract requires --schedule (the contract's baked schedule)",
+                fix="pass the same --schedule JSON used at deploy, e.g. --schedule '[[100, 4]]'",
+            )
+        return {"schedule": _parse_schedule(schedule)}
+    return {}  # FIXED / ASERT / LWMA need no extra params
+
+
+def _mine_claim_v2(
+    contract: DmintContractUtxo,
+    funding: DmintMinerFundingUtxo,
+    miner_pkh: bytes,
+    op_return_base: bytes,
+    fee_rate: int,
+    current_time: int,
+    daa_kwargs: dict,
+    *,
+    mine: Callable[[bytes, int], bytes],
+) -> tuple[DmintMintResult, PowPreimageResult, bytes]:
+    """Build + mine a V2 claim: 8-byte nonce, single ~2**32 sweep (the wide nonce
+    space always contains a solution, so no preimage rerolls like V1). The recreated
+    state advances height/lastTime/target per the contract's DAA mode."""
+    mint = build_dmint_mint_tx(
+        contract,
+        nonce=b"\x00" * 8,
+        miner_pkh=miner_pkh,
+        current_time=current_time,
+        fee_rate=fee_rate,
+        funding_utxo=funding,
+        op_return_msg=op_return_base,
+        **daa_kwargs,
+    )
+    op_return_script = mint.tx.outputs[2].locking_script.script
+    pre = build_dmint_v2_mint_preimage(contract, funding, op_return_script)
+    nonce = mine(pre.preimage, contract.state.target)
+    return mint, pre, nonce
+
+
 @glyph_group.command(name="claim-dmint")
 @click.option("--contract", default=None, help="Live contract UTXO as TXID:VOUT (direct).")
 @click.option("--token-ref", "token_ref", default=None, help="Token ref TXID:0 to auto-discover a live contract.")
@@ -1380,6 +1515,26 @@ def _mine_claim_with_rerolls(
     default=None,
     help="Wallet address that funds the mint and receives the FT reward + change. Default: the wallet address with the largest UTXO (pass this explicitly if that address holds no plain RXD).",
 )
+@click.option(
+    "--current-time",
+    type=int,
+    default=0,
+    show_default=True,
+    help="V2 only: block locktime written into the recreated state's lastTime (and the DAA retarget). 0 = always-final; for real DAA tracking pass a timestamp <= the chain's median-time-past.",
+)
+@click.option(
+    "--epoch-length", type=int, default=2016, show_default=True, help="V2 EPOCH claim: the contract's epoch length."
+)
+@click.option(
+    "--max-adjustment",
+    type=click.Choice(["2", "4", "8", "16"]),
+    default="4",
+    show_default=True,
+    help="V2 EPOCH claim: the contract's max adjustment.",
+)
+@click.option(
+    "--schedule", default=None, help="V2 SCHEDULE claim: the contract's schedule as JSON [[height, difficulty], ...]."
+)
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def claim_dmint_cmd(
@@ -1392,6 +1547,10 @@ def claim_dmint_cmd(
     max_attempts: int | None,
     max_rerolls: int,
     reward_address: str | None,
+    current_time: int,
+    epoch_length: int,
+    max_adjustment: str,
+    schedule: str | None,
     passphrase: bool,
 ) -> None:
     """PoW-mine a claim from a live V1 dMint contract and broadcast the mint.
@@ -1439,20 +1598,29 @@ def claim_dmint_cmd(
         ],
     )
 
+    is_v2 = not contract_utxo.state.is_v1
+    nonce_width = 8 if is_v2 else 4
+
     def _mine(preimage: bytes, target: int) -> bytes:
         return mine_solution_dispatch(
             preimage=preimage,
             target=target,
-            nonce_width=4,
+            nonce_width=nonce_width,
             miner_argv=miner_argv,
             max_attempts=max_attempts if max_attempts is not None else DEFAULT_MAX_ATTEMPTS,
             timeout_s=timeout_s,
         ).nonce
 
     try:
-        mint, pre, nonce = _mine_claim_with_rerolls(
-            contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, mine=_mine, max_rerolls=max_rerolls
-        )
+        if is_v2:
+            daa_kwargs = _v2_claim_daa_kwargs(contract_utxo.state.daa_mode, epoch_length, max_adjustment, schedule)
+            mint, pre, nonce = _mine_claim_v2(
+                contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, current_time, daa_kwargs, mine=_mine
+            )
+        else:
+            mint, pre, nonce = _mine_claim_with_rerolls(
+                contract_utxo, funding, miner_pkh, op_return_base, ctx.fee_rate, mine=_mine, max_rerolls=max_rerolls
+            )
     except DmintError as exc:  # PoolTooSmallError: funding can't cover reward + fee + dust
         raise UserError(
             "funding can't cover the mint reward + fee",
@@ -1463,7 +1631,7 @@ def claim_dmint_cmd(
         raise UserError("could not build a valid mint", cause=str(exc)) from exc
 
     mint.tx.inputs[0].unlocking_script = Script(
-        build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=4)
+        build_mint_scriptsig(nonce, pre.input_hash, pre.output_hash, nonce_width=nonce_width)
     )
     _sign_funding_input(mint.tx, 1, miner_key)
     raw_hex = mint.tx.serialize().hex()
@@ -1517,14 +1685,12 @@ async def _claim_prepare(
     else:
         tref = _parse_ref(token_ref_arg)  # type: ignore[arg-type]
         contracts = await find_dmint_contract_utxos(client, token_ref=tref)
-        contract_utxo = next((c for c in contracts if c.state.is_v1 and not c.state.is_exhausted), None)  # type: ignore[assignment]
+        contract_utxo = next((c for c in contracts if not c.state.is_exhausted), None)  # type: ignore[assignment]
         if contract_utxo is None:
             raise UserError(
-                "no live (non-exhausted) V1 dMint contract found for that token_ref",
+                "no live (non-exhausted) dMint contract found for that token_ref",
                 fix="check the token_ref, or pass --contract TXID:VOUT directly",
             )
-    if not contract_utxo.state.is_v1:
-        raise UserError("not a V1 dMint contract (only V1 is mintable today)")
     if contract_utxo.state.is_exhausted:
         raise UserError(
             f"contract is exhausted (height {contract_utxo.state.height} >= max_height {contract_utxo.state.max_height})"
