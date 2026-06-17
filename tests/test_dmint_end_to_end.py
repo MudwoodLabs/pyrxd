@@ -460,6 +460,26 @@ class TestPrepareDmintDeploy:
         with pytest.raises(ValidationError, match="premine"):
             GlyphBuilder().prepare_dmint_deploy(params, allow_v2_deploy=True)
 
+    def test_rejects_epoch_deploy(self):
+        # EPOCH is disabled at deploy pending an upstream Photonic int64-overflow
+        # fix (the on-chain retarget bricks the contract). The bytecode + parser
+        # are retained, but DmintV2DeployParams refuses to construct an EPOCH deploy.
+        from pyrxd.glyph.dmint import DaaMode
+        from pyrxd.security.types import Hex20
+
+        with pytest.raises(ValidationError, match="EPOCH .*disabled"):
+            DmintV2DeployParams(
+                metadata=self._META,
+                owner_pkh=Hex20(bytes(b"\x11" * 20)),
+                num_contracts=1,
+                max_height=1_000,
+                reward_photons=1_000,
+                difficulty=32768,
+                daa_mode=DaaMode.EPOCH,
+                epoch_length=10,
+                max_adjustment_log2=2,
+            )
+
     def test_build_reveal_outputs_emits_value_1_v2_contracts(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params(num_contracts=2), allow_v2_deploy=True)
         rev = result.build_reveal_outputs("ab" * 32)

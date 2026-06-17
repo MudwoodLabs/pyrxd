@@ -89,7 +89,7 @@ pyrxd --network testnet glyph deploy-dmint token.json \
 
 `deploy-dmint` deploys **V1** by default — the established mainnet format,
 fixed difficulty. Pass `--v2` for a V2 contract with a difficulty algorithm
-(`--daa-mode fixed|asert|lwma|epoch|schedule`). V2 is consensus-validated on
+(`--daa-mode fixed|asert|lwma|schedule`). V2 is consensus-validated on
 regtest **and** Radiant mainnet but still **pre-external-audit** (it requires the
 `--v2` opt-in for that reason). Examples:
 
@@ -97,12 +97,17 @@ regtest **and** Radiant mainnet but still **pre-external-audit** (it requires th
 # LWMA adaptive difficulty (retargets every block)
 pyrxd glyph deploy-dmint token.json --v2 --daa-mode lwma --target-time 60 --max-height 100 --reward 1000
 
-# EPOCH (periodic retarget; needs difficulty >= 32768 for the 2^48 target cap)
-pyrxd glyph deploy-dmint token.json --v2 --daa-mode epoch --epoch-length 2016 --max-adjustment 4 --difficulty 32768 --max-height 100 --reward 1000
-
 # SCHEDULE (pre-baked difficulty curve: [height, difficulty] pairs)
 pyrxd glyph deploy-dmint token.json --v2 --daa-mode schedule --schedule '[[100, 4], [1000, 8]]' --max-height 2000 --reward 1000
 ```
+
+> **EPOCH is temporarily disabled.** Its canonical Photonic bytecode has an
+> int64-overflow bug — the on-chain retarget computes `target × clampedDelta`,
+> which exceeds int64 for ordinary parameters (e.g. 1-hour blocks) and drifts
+> past the safe target over a few slow epochs, **bricking** the contract on-chain.
+> This is reported upstream; `--daa-mode epoch` is refused at deploy until a fix
+> lands. The EPOCH bytecode and parser are retained for compatibility. Use
+> `fixed`, `asert`, `lwma`, or `schedule`.
 
 `claim-dmint` auto-detects V1 vs V2 from the contract. For an **EPOCH** or
 **SCHEDULE** V2 contract you must pass the same `--epoch-length`/`--max-adjustment`

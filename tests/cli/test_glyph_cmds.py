@@ -785,6 +785,41 @@ class TestDmintV2CliPaths:
         with pytest.raises(UserError, match="requires --schedule"):
             _v2_claim_daa_kwargs(DaaMode.SCHEDULE, 10, "4", None, 3600)
 
+    def test_deploy_epoch_refused_with_clean_error(self, tmp_path) -> None:
+        """`deploy-dmint --v2 --daa-mode epoch` is refused with a clean UserError
+        (no traceback): EPOCH is disabled pending the upstream overflow fix."""
+        import json
+
+        from click.testing import CliRunner
+
+        from pyrxd.cli.glyph_cmds import deploy_dmint_cmd
+
+        md = tmp_path / "token.json"
+        md.write_text(json.dumps({"ticker": "TST", "name": "Test", "decimals": 0, "protocol": ["FT", "DMINT"]}))
+        result = CliRunner().invoke(
+            deploy_dmint_cmd,
+            [
+                str(md),
+                "--v2",
+                "--daa-mode",
+                "epoch",
+                "--epoch-length",
+                "10",
+                "--max-adjustment",
+                "2",
+                "--difficulty",
+                "32768",
+                "--max-height",
+                "100",
+                "--reward",
+                "1000",
+            ],
+        )
+        assert result.exit_code == 1
+        assert "EPOCH" in result.output and "disabled" in result.output
+        # clean UserError, not an unhandled exception
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+
     def test_deploy_inner_v2_lwma(self, cli_context) -> None:
         """The version-agnostic deploy inner produces a V2 (LWMA) contract: commit +
         reveal both build/sign, and the result is tagged V2/LWMA."""
