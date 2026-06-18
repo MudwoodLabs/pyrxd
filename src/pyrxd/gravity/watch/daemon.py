@@ -42,9 +42,12 @@ def combine_heartbeats(*heartbeats: Heartbeat) -> Heartbeat:
     return _hb
 
 
-def default_heartbeat(log: logging.Logger | None = None) -> Heartbeat:
-    """A heartbeat that logs tick count, swaps watched, pages decided, UNDELIVERED pages, and the v2
-    autonomous-execution outcomes (broadcast / failed)."""
+def default_heartbeat(
+    log: logging.Logger | None = None, *, unacked_critical: Callable[[], int] | None = None
+) -> Heartbeat:
+    """A heartbeat that logs tick count, swaps watched, pages decided, UNDELIVERED pages, the v2
+    autonomous-execution outcomes (broadcast / failed), and — when ``unacked_critical`` is wired —
+    the count of outstanding operator-un-ACK'd CRITICAL situations (review MEDIUM)."""
     log = log or logger
 
     def _hb(iteration: int, results: list[ReconcileResult]) -> None:
@@ -52,19 +55,27 @@ def default_heartbeat(log: logging.Logger | None = None) -> Heartbeat:
         undelivered = sum(1 for r in results if r.alert_delivered is False)
         broadcast = sum(1 for r in results if r.executed is ExecOutcome.BROADCAST)
         exec_failed = sum(1 for r in results if r.executed is ExecOutcome.FAILED)
-        # An undelivered CRITICAL page OR a FAILED autonomous broadcast must be LOUD, not buried in a
-        # healthy-looking INFO tick — so a persistently-failing broadcaster surfaces on the heartbeat,
-        # not only on the per-tick alerter page.
-        level = logging.ERROR if (undelivered or exec_failed) else logging.INFO
+        unacked = -1
+        if unacked_critical is not None:
+            try:
+                unacked = int(unacked_critical())
+            except Exception:  # pragma: no cover - a broken count must not crash the heartbeat
+                unacked = -1
+        # An undelivered CRITICAL page, a FAILED autonomous broadcast, OR outstanding un-ACK'd
+        # CRITICAL situations must be LOUD, not buried in a healthy-looking INFO tick — so a
+        # persistently-unacknowledged claim race surfaces on the heartbeat, not only on the page.
+        level = logging.ERROR if (undelivered or exec_failed or unacked > 0) else logging.INFO
         log.log(
             level,
-            "watchtower heartbeat: tick=%d swaps=%d paged=%d undelivered=%d broadcast=%d exec_failed=%d",
+            "watchtower heartbeat: tick=%d swaps=%d paged=%d undelivered=%d broadcast=%d "
+            "exec_failed=%d unacked_critical=%d",
             iteration,
             len(results),
             paged,
             undelivered,
             broadcast,
             exec_failed,
+            unacked,
         )
 
     return _hb
@@ -76,6 +87,7 @@ async def run_loop(
     interval_s: float,
     stop: asyncio.Event | None = None,
     on_heartbeat: Heartbeat | None = None,
+    on_tick_start: Callable[[], None] | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     max_iterations: int | None = None,
     tick_timeout_s: float | None = None,
@@ -103,6 +115,13 @@ async def run_loop(
     while not (stop is not None and stop.is_set()):
         if max_iterations is not None and iterations >= max_iterations:
             break
+        # Pre-tick hook (e.g. drain the operator ACK inbox → alerter.ack). GUARDED: a hook fault
+        # must never crash the reconcile loop or stop the heartbeat — log and tick anyway.
+        if on_tick_start is not None:
+            try:
+                on_tick_start()
+            except Exception:
+                logger.exception("on_tick_start hook failed at tick %d (continuing)", iterations + 1)
         tick_timed_out = False
         try:
             if tick_timeout_s is None:

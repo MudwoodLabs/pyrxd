@@ -25,17 +25,26 @@ from pyrxd.gravity.watch.adapters import (
     ElectrumRxdChainSource,
     JsonDirRecordStore,
     LoggingAlertChannel,
+    MempoolClaimBytesSource,
     MultiSourceRxdChainSource,
     OutspendBtcClaimSource,
     WebhookAlertChannel,
     mempool_space_outspend,
+    mempool_space_tx_hex,
     page_to_dict,
 )
 from pyrxd.gravity.watch.alerts import (
     AlertChannel,
     DedupAlerter,
+    FileAckInbox,
     Page,
     Severity,
+)
+from pyrxd.gravity.watch.claim_executor import (
+    ClaimBytesSource,
+    ClaimExecutor,
+    CovenantClaimContext,
+    load_claim_context,
 )
 from pyrxd.gravity.watch.daemon import combine_heartbeats, default_heartbeat, run_loop
 from pyrxd.gravity.watch.decide import (
@@ -46,6 +55,7 @@ from pyrxd.gravity.watch.decide import (
 )
 from pyrxd.gravity.watch.eth_adapters import RpcEthChainSource
 from pyrxd.gravity.watch.executor import (
+    CompositeExecutor,
     ExecOutcome,
     Executor,
     NullExecutor,
@@ -84,7 +94,11 @@ __all__ = [
     "BtcClaimStatus",
     "CallbackAlertChannel",
     "ChainObserver",
+    "ClaimBytesSource",
+    "ClaimExecutor",
     "CompositeAlertChannel",
+    "CompositeExecutor",
+    "CovenantClaimContext",
     "DeadManVerdict",
     "DeadMansSwitch",
     "Decision",
@@ -94,10 +108,12 @@ __all__ = [
     "EthClaimStatus",
     "ExecOutcome",
     "Executor",
+    "FileAckInbox",
     "FileHeartbeat",
     "Intent",
     "JsonDirRecordStore",
     "LoggingAlertChannel",
+    "MempoolClaimBytesSource",
     "MultiSourceRxdChainSource",
     "NullExecutor",
     "Observations",
@@ -117,9 +133,11 @@ __all__ = [
     "decide",
     "default_heartbeat",
     "heartbeat_age_s",
+    "load_claim_context",
     "load_presigned_refund",
     "make_refund_broadcaster",
     "mempool_space_outspend",
+    "mempool_space_tx_hex",
     "page_to_dict",
     "run_loop",
     "run_monitor",

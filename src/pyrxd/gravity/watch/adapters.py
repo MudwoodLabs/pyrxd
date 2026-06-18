@@ -42,10 +42,12 @@ __all__ = [
     "ElectrumRxdChainSource",
     "JsonDirRecordStore",
     "LoggingAlertChannel",
+    "MempoolClaimBytesSource",
     "MultiSourceRxdChainSource",
     "OutspendBtcClaimSource",
     "WebhookAlertChannel",
     "mempool_space_outspend",
+    "mempool_space_tx_hex",
     "page_to_dict",
 ]
 
@@ -84,11 +86,13 @@ class JsonDirRecordStore:
                 "report 0 swaps as healthy"
             )
         out: list[tuple[str, SwapRecord]] = []
-        # Exclude v2 pre-signed-refund sidecars (``<swap_id>.refund.json``): they live beside the
-        # records (the default --refund-blobs-dir) and are NOT SwapRecords, so counting them here would
-        # spam per-tick "unreadable record" warnings and could trip the all-unreadable "watching nothing"
-        # page. They are loaded separately, keyed by swap_id, in the executor.
-        paths = [p for p in sorted(self._dir.glob("*.json")) if not p.name.endswith(".refund.json")]
+        # Exclude the executor sidecars that live beside the records and are NOT SwapRecords: the v2
+        # pre-signed-refund blob (``<swap_id>.refund.json``) and the autonomous-claim covenant context
+        # (``<swap_id>.claim.json``). Counting them here would spam per-tick "unreadable record" warnings
+        # and could trip the all-unreadable "watching nothing" page (and their file stem isn't the swap_id
+        # either). They are loaded separately, keyed by swap_id, in the executor.
+        _SIDECARS = (".refund.json", ".claim.json")
+        paths = [p for p in sorted(self._dir.glob("*.json")) if not p.name.endswith(_SIDECARS)]
         failed = 0
         for path in paths:
             try:
@@ -150,11 +154,16 @@ class MultiSourceRxdChainSource:
     * ``tip_height`` — the MINIMUM height across responders (the chain is only as advanced
       as its most-pessimistic source, defeating an over-reporter); fail-closed
       (:class:`NetworkError`) below quorum.
-    * ``covenant_confirmations`` — answers "is the maker's asset locked?", which gates the
-      autonomous BTC refund (``None`` ⇒ not locked ⇒ refund-eligible). The two conclusions
-      have OPPOSITE safety directions, so they get different evidence bars:
+    * ``covenant_confirmations`` — answers "is the maker's asset locked, and how deep?". The two
+      conclusions have OPPOSITE safety directions, so they get different evidence bars:
         - **LOCKED** is believed on ANY single source that sees the covenant (returns the
-          MIN depth among those that see it) — refusing to refund is the safe error.
+          **MAX** depth among those that see it). MAX — not min — is the fail-closed depth because
+          this value feeds the autonomous CLAIM gate, where ``blocks_left = t_rxd − cov_confs + 1``:
+          a SMALLER ``cov_confs`` makes the gate read SAFE, so a single source UNDER-reporting depth
+          could drag an autonomous claim into a closing ``t_rxd`` window (false-SAFE → one-sided loss
+          on a cheap-reorg chain — review HIGH-2). MAX is also conservative for the maker-stall refund
+          timing (a larger depth ⇒ an older lock ⇒ act sooner). An over-reporter can only make the gate
+          MORE cautious (SQUEEZED → decline), which is fail-safe.
         - **NOT locked** (``None``, which ENABLES a broadcast) is returned ONLY when
           >= ``quorum`` sources were provably REACHABLE this cycle (their ``tip_height``
           succeeded) AND none saw the covenant — a corroborated absence.
@@ -227,7 +236,10 @@ class MultiSourceRxdChainSource:
         present = [d for (_live, d) in ok if d is not None]
         reachable = sum(1 for (live, _d) in ok if live)
         if present:
-            return min(present)  # LOCKED — believed on any sighting; conservative (min) depth
+            # LOCKED — believed on any sighting. MAX depth is the fail-closed direction for the CLAIM
+            # gate (blocks_left = t_rxd − cov_confs + 1; a small cov_confs reads SAFE), so a single
+            # under-reporting source cannot drag an autonomous claim into a closing window (HIGH-2).
+            return max(present)
         if reachable >= self._quorum:
             return None  # >= quorum reachable sources, none saw it → corroborated NOT locked
         raise NetworkError(
@@ -314,6 +326,44 @@ async def mempool_space_outspend(
     if not (isinstance(spender, str) and len(spender) == 64):
         spender = None
     return spent, spender
+
+
+async def mempool_space_tx_hex(session, base_url: str, txid: str, *, timeout_s: float = 15.0) -> bytes | None:
+    """Fetch a tx's RAW bytes via Esplora/mempool.space ``/api/tx/{txid}/hex`` → ``bytes`` (or ``None``
+    if not yet retrievable / unparseable). The ClaimExecutor uses this to get the maker's claim-tx bytes
+    so it can scrape ``p`` — it ALWAYS re-derives the txid locally and matches it before trusting the
+    bytes, so a single source is safe (a wrong-tx server is caught by the hash check, not trusted).
+
+    A 404 (not yet indexed/mined) returns ``None`` (the executor pages FAILED, never broadcasts off
+    missing bytes). The explicit per-request ``timeout_s`` bounds a slow source (same dead-man's-switch
+    reasoning as :func:`mempool_space_outspend`)."""
+    url = f"{base_url.rstrip('/')}/api/tx/{txid}/hex"
+    async with session.get(url, timeout=aiohttp_timeout(timeout_s)) as resp:
+        if getattr(resp, "status", 200) == 404:
+            return None
+        resp.raise_for_status()
+        text = (await resp.text()).strip()
+    try:
+        return bytes.fromhex(text)
+    except ValueError:
+        return None
+
+
+class MempoolClaimBytesSource:
+    """A ``ClaimBytesSource`` (``gravity.watch.claim_executor.ClaimBytesSource``) over an Esplora/
+    mempool.space ``/api/tx/{txid}/hex`` endpoint. Single-source is safe: the ClaimExecutor re-derives
+    the txid from the returned bytes and matches it before scraping, so this can only fail to serve
+    (→ a FAILED page), never substitute a different tx."""
+
+    def __init__(self, session, base_url: str, *, timeout_s: float = 15.0) -> None:
+        if not isinstance(base_url, str) or not base_url:
+            raise ValidationError("MempoolClaimBytesSource base_url must be a non-empty str")
+        self._session = session
+        self._base_url = base_url
+        self._timeout_s = timeout_s
+
+    async def claim_tx_bytes(self, claim_txid: str) -> bytes | None:
+        return await mempool_space_tx_hex(self._session, self._base_url, claim_txid, timeout_s=self._timeout_s)
 
 
 class LoggingAlertChannel:

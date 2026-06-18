@@ -250,6 +250,74 @@ async def test_covenant_outpoint_ambiguous_utxo_fail_closed():
         await leg.covenant_outpoint(terms)
 
 
+async def test_find_covenant_utxo_registers_spk_for_registry_client():
+    """Regression (mainnet autonomous-claim dust run, 2026-06-14): a registry-backed client
+    (``SshTrRadiantClient``-style — ``get_utxos`` resolves a script_hash to its SPK via a
+    ``register_spk`` registry to build its scantxoutset descriptor, so an UNREGISTERED
+    covenant SPK scans EMPTY) returned no UTXO for a covenant the fresh per-swap claim leg
+    never registered → ``find_covenant_utxo`` misread it as "not funded" and the autonomous
+    executor declined "already spent" while the covenant sat unspent. ``find_covenant_utxo``
+    must register the SPK it is about to scan (idempotent; no-op for registry-less clients)."""
+    import hashlib
+
+    spk = bytes.fromhex("76a914" + "11" * 20 + "88ac")
+
+    class RegistryClient:
+        """Resolves get_utxos ONLY for SPKs passed through register_spk (mirrors SshTr)."""
+
+        def __init__(self) -> None:
+            self._known: set[bytes] = set()
+
+        def register_spk(self, s: bytes) -> None:
+            self._known.add(hashlib.sha256(bytes(s)).digest()[::-1])
+
+        async def broadcast(self, raw):  # pragma: no cover - unused here
+            return "ab" * 32
+
+        async def get_transaction_verbose(self, txid):  # pragma: no cover - unused here
+            return {"confirmations": 10}
+
+        async def get_utxos(self, script_hash):
+            if bytes(script_hash) not in self._known:
+                return []  # the bug's trigger: an unregistered SPK scans empty
+            return [UtxoRecord(tx_hash="cd" * 32, tx_pos=0, value=1000, height=100)]
+
+    io = RadiantChainIO(RegistryClient())
+    # Pre-fix this raised NetworkError("no UTXO found ...") because the SPK was never
+    # registered; post-fix find_covenant_utxo registers it first and locates the UTXO.
+    outpoint, value, _height = await io.find_covenant_utxo(spk, expected_value=1000)
+    assert outpoint == "cd" * 32 + ":0"
+    assert value == 1000
+
+
+async def test_covenant_unspent_incl_mempool_delegates_and_falls_back():
+    """Mempool-AWARE covenant liveness (review HIGH): delegates to the client's optional
+    ``txout_unspent_incl_mempool`` (gettxout include_mempool) when present — True=unspent,
+    False=spent incl. mempool — and returns None when the client cannot answer, so a caller
+    without the capability keeps its own idempotency guard."""
+
+    class MempoolClient(FakeClient):
+        def __init__(self, unspent: bool) -> None:
+            super().__init__()
+            self._unspent = unspent
+            self.calls: list = []
+
+        async def txout_unspent_incl_mempool(self, txid, vout):
+            self.calls.append((txid, vout))
+            return self._unspent
+
+    c = MempoolClient(True)
+    assert await RadiantChainIO(c).covenant_unspent_incl_mempool("ab" * 32 + ":0") is True
+    assert c.calls == [("ab" * 32, 0)]  # outpoint split correctly
+    # spent (confirmed OR in mempool) → False (the executor treats this as already-claimed).
+    assert await RadiantChainIO(MempoolClient(False)).covenant_unspent_incl_mempool("cd" * 32 + ":1") is False
+    # a client WITHOUT the capability → None (caller falls back to its SeenStore guard).
+    assert await RadiantChainIO(FakeClient()).covenant_unspent_incl_mempool("ef" * 32 + ":0") is None
+    # malformed outpoint fails closed.
+    with pytest.raises(ValidationError, match="bad covenant outpoint"):
+        await RadiantChainIO(MempoolClient(True)).covenant_unspent_incl_mempool("nocolon")
+
+
 # --------------------------------------------------------------------------- claim / refund spends
 
 
