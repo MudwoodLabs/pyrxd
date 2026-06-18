@@ -4,6 +4,64 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-06-18
+
+Feature release on top of 0.7.0 — 56 commits. The headline is **full,
+mainnet-proven dMint V2** (PoW distributed mint with adaptive difficulty).
+Alongside, the **experimental, pre-audit** cross-chain swap + watchtower stack
+advances (an autonomous asset-claim executor, more counter-chains, a CLI
+signing agent) and a **CRITICAL** HTLC preimage fix lands.
+
+No breaking changes to the stable public API — everything is additive and
+existing import paths + CLI commands are unchanged. The cross-chain swap +
+watchtower stack and dMint V2 **real-value** use remain **pre-external-audit**
+and gated; this code is not for production until externally audited.
+
+### Added
+
+- **dMint V2 (PoW distributed mint) — full support, mainnet-proven.**
+  `pyrxd glyph deploy-dmint --v2` + `claim-dmint` deploy and PoW-mine V2
+  contracts with all five difficulty-adjustment modes
+  (FIXED, ASERT, LWMA, EPOCH, SCHEDULE), byte-matched to canonical Photonic
+  `dMintScript`. A first V2 deploy + PoW mint and an adaptive-difficulty
+  retarget were confirmed on Radiant mainnet. V2 deploy is gated behind an
+  explicit opt-in (pre-external-audit). (#206, #228, #232–#238)
+- **Autonomous asset-claim executor** for the swap watchtower —
+  dormant-by-construction, capped, value-vs-reorg-gated; arms a keyed RXD
+  covenant claim only on an audit-cleared network. (#239)
+- **More counter-chains:** Base and Litecoin, plus the
+  Optimism / Arbitrum / Linea EVM registry. (#198, #200, #216)
+- **CLI signing agent** (sign-on-behalf) with transient account-key
+  derivation (no long-lived key residency). (#190, #191, #201)
+- **RXD multi-source quorum** for the watchtower, clearing the single-source
+  `low_corroboration` blocker. (#187)
+- **Consensus-enforced soulbound covenants** + credential-bound swap gating.
+  (#186)
+- **High-level partial-transaction swap API** for same-chain trades. (#177)
+- **`CappedFeeWalletSource`** — a structural spend ceiling for autonomous RXD
+  fees. (#211)
+- Tier-1 developer on-ramp: SDK swap primitive, regtest tooling, quickstart,
+  a flagship RXD↔ETH cross-chain-swap tutorial, and expanded API reference.
+  (#177, #185, #195, #196, #214, #215, #220, #226, #227)
+
+### Fixed
+
+- **HTLC preimage-length theft (CRITICAL).** The BTC claim leaf and all three
+  Gravity HTLC covenants now consensus-pin the revealed preimage to exactly
+  32 bytes (`OP_SIZE`); without it a non-32-byte `p'` could defeat the keyless
+  secret-scrape and let a maker keep both legs. (#239)
+- **dMint EPOCH/LWMA int64-overflow.** Found via differential testing (the
+  on-chain retarget could exceed int64 and brick the contract), fixed upstream
+  in canonical Photonic, and re-enabled here byte-matched to the merged fix.
+  (#234, #238)
+- dMint V1 + FIXED V2 validated on real Radiant consensus
+  (`radiant-core` v3.1.1). (#195, #228)
+- Cross-chain swap hardening across several audit rounds — value-scaled claim
+  burial (fail-closed, dust opt-out), reorg-value guard, maker-stall →
+  `mutual_refund` routing, durable seen-store default. (#189, #192, #193,
+  #194, #210)
+- CLI: a malformed path option now returns a clean usage error. (#188)
+
 ## [0.7.0] — 2026-06-07
 
 Feature release on top of 0.6.x — 15 commits. The user-facing headline is a
