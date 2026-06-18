@@ -523,6 +523,22 @@ def test_claim_context_roundtrip_and_validation():
         CovenantClaimContext(swap_id="", taker_pkh=b"\x11" * 20, maker_pkh=b"\x22" * 20)
 
 
+def test_executor_rejects_non_finite_reorg_safety_factor():
+    # security review LOW: a NaN/inf reorg_safety_factor must fail-closed at CONSTRUCTION
+    # (NaN < 1.0 is False, so without the isfinite guard it would pass here and only crash a
+    # later tick inside max_protected_value instead of a clean decline).
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValidationError, match="finite"):
+            ClaimExecutor(
+                resolve_leg=None,
+                claim_status_source=None,
+                claim_bytes_source=None,
+                policy=MarginPolicy.estimated(),
+                network="bcrt",
+                reorg_safety_factor=bad,
+            )
+
+
 def test_load_claim_context_absent_misfiled_and_present(tmp_path):
     assert load_claim_context(tmp_path, "s1") is None  # absent → None (executor declines)
     ctx = CovenantClaimContext(swap_id="s1", taker_pkh=b"\xaa" * 20, maker_pkh=b"\xbb" * 20)

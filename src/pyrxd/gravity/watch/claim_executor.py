@@ -42,6 +42,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, runtime_checkable
@@ -224,9 +225,13 @@ class ClaimExecutor:
         if (
             not isinstance(reorg_safety_factor, (int, float))
             or isinstance(reorg_safety_factor, bool)
+            or not math.isfinite(reorg_safety_factor)
             or reorg_safety_factor < 1.0
         ):
-            raise ValidationError("reorg_safety_factor must be a float >= 1.0")
+            # Reject NaN/inf at construction (security review LOW): NaN < 1.0 is False, so without
+            # the isfinite guard a NaN factor would pass here and only fail-closed later inside
+            # max_protected_value, crashing the tick instead of a clean decline.
+            raise ValidationError("reorg_safety_factor must be a finite float >= 1.0")
         if not isinstance(claim_dust_ceiling, int) or isinstance(claim_dust_ceiling, bool) or claim_dust_ceiling <= 0:
             raise ValidationError("claim_dust_ceiling must be a positive int ('no cap' can never mean unlimited)")
         # PER-SWAP leg resolution: the watchtower watches MANY swaps and the record carries only the
