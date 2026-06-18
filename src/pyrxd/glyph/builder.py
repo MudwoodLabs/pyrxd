@@ -950,9 +950,10 @@ class DmintV2DeployParams:
     the V2 covenant) and the 8-byte mint nonce; the reward + tx fee for each mint
     come from a miner-supplied funding input, not a pool.
 
-    ``DaaMode.FIXED``, ``ASERT``, and ``LWMA`` are supported (the redesigned
-    covenant advances ``target``/``last_time`` on-chain); EPOCH/SCHEDULE are not
-    yet ported. See #219.
+    All five ``DaaMode`` values are supported — FIXED, ASERT, LWMA, EPOCH, and
+    SCHEDULE — and the redesigned covenant advances ``target``/``last_time``
+    on-chain, byte-matched to canonical Photonic ``dMintScript`` (incl. the
+    EPOCH/LWMA int64-overflow fix, Radiant-Core/Photonic-Wallet#2). See #219.
 
     V2 is consensus-proven on regtest + mainnet but still pre-external-audit;
     ``prepare_dmint_deploy`` requires ``allow_v2_deploy=True`` as a deliberate opt-in.
@@ -1001,21 +1002,13 @@ class DmintV2DeployParams:
             raise ValidationError(f"reward_photons must be >= 1, got {self.reward_photons}")
         if self.difficulty < 1:
             raise ValidationError(f"difficulty must be >= 1, got {self.difficulty}")
-        # EPOCH is DISABLED for deploy: the canonical Photonic EPOCH bytecode has an
-        # int64-overflow bug (target × clampedDelta exceeds int64 for ordinary params,
-        # e.g. 1-hour blocks, and the retarget drifts past 2^48 over a few slow epochs),
-        # which BRICKS the contract on-chain. Confirmed against radiant-core consensus
-        # source and reported upstream; re-enable here (byte-matching upstream's fix)
-        # once Photonic lands it. The bytecode + parser are retained for compatibility;
-        # only deploying a new EPOCH contract is refused. Use FIXED/ASERT/LWMA/SCHEDULE.
-        if self.daa_mode == DaaMode.EPOCH:
-            raise ValidationError(
-                "EPOCH dMint is disabled pending an upstream Photonic fix: its retarget can overflow "
-                "int64 on-chain and brick the contract (target × clampedDelta > 2^63 for ordinary "
-                "params). Use FIXED, ASERT, LWMA, or SCHEDULE. See #219."
-            )
-        # FIXED/ASERT/LWMA/SCHEDULE proceed; per-mode parameter validation (the SCHEDULE
-        # entry shape) is enforced by DmintDeployParams when the contract scripts are built.
+        # All five DAA modes are supported (FIXED/ASERT/LWMA/EPOCH/SCHEDULE). EPOCH was
+        # temporarily refused here while its canonical bytecode had an int64-overflow that
+        # bricked the contract on-chain; that fix is now merged upstream
+        # (Radiant-Core/Photonic-Wallet#2 — divide-first + 2^48 clamp on both sides of the
+        # retarget multiply) and pyrxd byte-matches it, so EPOCH deploy is re-enabled.
+        # Per-mode parameter validation (EPOCH 2^48 target cap + power-of-2 adjustment,
+        # SCHEDULE entry shape) is enforced by DmintDeployParams when the scripts are built.
 
 
 class DmintFullDeployParams(DmintV2DeployParams):

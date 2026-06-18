@@ -53,6 +53,7 @@ from .chain import (
 )
 from .types import (
     _OP_STATESEPARATOR,
+    EPOCH_MAX_SAFE_TARGET,
     MAX_SHA256D_TARGET,
     MAX_V2_TARGET_256,
     DaaMode,
@@ -255,18 +256,21 @@ def compute_next_target_linear(
 
     Divide-first with caps so the on-chain OP_MUL never overflows int64::
 
-        timeDelta_capped = min(current_time - last_time, 4 * target_time)
+        timeDelta_capped = max(0, min(current_time - last_time, 4 * target_time))
         target_capped    = min(current_target, MAX_TARGET // 4)
         new_target       = min(MAX_TARGET, (target_capped // target_time) * timeDelta_capped)
         minimum target is 1
 
     The MAX/4 target cap means LWMA contracts cannot have a difficulty floor
-    below 4 (``target <= MAX_TARGET/4``).
+    below 4 (``target <= MAX_TARGET/4``). The 0-floor on ``timeDelta`` mirrors the
+    on-chain ``OP_0 OP_MAX`` (Radiant-Core/Photonic-Wallet#2): a backwards-clock
+    block (locktime earlier than the previous mint) gives a negative delta that
+    would otherwise underflow the on-chain int64 multiply.
 
     .. note::
        V2-only DAA.
     """
-    time_delta_capped = min(current_time - last_time, 4 * target_time)
+    time_delta_capped = max(0, min(current_time - last_time, 4 * target_time))
     target_capped = min(current_target, MAX_SHA256D_TARGET // 4)
     new_target = (target_capped // target_time) * time_delta_capped
     new_target = min(new_target, MAX_SHA256D_TARGET)
@@ -290,11 +294,15 @@ def compute_next_target_epoch(
         if height > 0 and height % epoch_length == 0:
             delta        = current_time - last_time
             clampedDelta = max(target_time >> N, min(target_time << N, delta))
-            new          = min(MAX, max(1, target * clampedDelta // target_time))
+            new          = max(1, min(2^48, (min(target, 2^48) // target_time) * clampedDelta))
         else: target unchanged
 
     N = max_adjustment_log2 (1..4). The clamp keeps ``clampedDelta`` ≥ target_time>>N > 0,
     so the division has positive operands (floor == OP_DIV's truncate-toward-zero).
+    The target is clamped to ``EPOCH_MAX_SAFE_TARGET`` (2^48) on BOTH sides of the
+    multiply and the divide runs first, so the on-chain int64 multiply never
+    overflows (Radiant-Core/Photonic-Wallet#2). Capping the output at 2^48 keeps
+    ``target`` there for the next epoch (difficulty floor 32768).
 
     .. note:: V2-only DAA.
     """
@@ -303,8 +311,9 @@ def compute_next_target_epoch(
         upper = target_time << max_adjustment_log2  # targetTime × 2^N
         lower = target_time >> max_adjustment_log2  # targetTime ÷ 2^N
         clamped = max(lower, min(upper, delta))
-        new_target = (current_target * clamped) // target_time
-        return max(1, min(new_target, MAX_SHA256D_TARGET))
+        target_capped = min(current_target, EPOCH_MAX_SAFE_TARGET)
+        new_target = (target_capped // target_time) * clamped
+        return max(1, min(new_target, EPOCH_MAX_SAFE_TARGET))
     return current_target
 
 

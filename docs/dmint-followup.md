@@ -39,25 +39,22 @@
 >   `find_dmint_contract_utxos` (current impl returns fresh contracts only)
 > - Live-mainnet V2 deploy proof (M3, deferred indefinitely — no
 >   ecosystem demand)
-> - **Re-enable EPOCH DAA (blocked on upstream).** All five DAA modes
->   (FIXED/ASERT/LWMA/EPOCH/SCHEDULE) are now ported and byte-matched to
->   canonical Photonic — but **EPOCH deploy is intentionally refused**
->   (`DmintV2DeployParams` / `deploy-dmint --v2 --daa-mode epoch`): the
->   canonical EPOCH bytecode has an int64-overflow that bricks the contract
->   on-chain (`target × clampedDelta` > 2^63; retarget also drifts past the
->   2^48 safe target). Confirmed against `radiant-core` `interpreter.cpp`
->   (`OP_MUL → safeMul` abort). **A fix is now proposed upstream:**
->   [`Radiant-Core/Photonic-Wallet#2`](https://github.com/Radiant-Core/Photonic-Wallet/pull/2)
+> - **EPOCH DAA int64-overflow — fixed upstream and re-enabled (DONE).** All
+>   five DAA modes (FIXED/ASERT/LWMA/EPOCH/SCHEDULE) are ported and byte-matched
+>   to canonical Photonic. EPOCH deploy was briefly refused while the *canonical*
+>   EPOCH bytecode had an int64-overflow that bricked the contract on-chain
+>   (`target × clampedDelta` overflows int64; the retarget also drifted past the
+>   2^48 safe target — `radiant-core` `interpreter.cpp` `OP_MUL → safeMul` abort).
+>   The fix is now **merged upstream**
+>   ([`Radiant-Core/Photonic-Wallet#2`](https://github.com/Radiant-Core/Photonic-Wallet/pull/2)
 >   — EPOCH clamps target to 2^48 before the multiply, divides first
->   (`(target/targetTime) × clampedDelta`), and caps the output at 2^48
->   (mirrors the LWMA divide-first/MAX_TARGET-4 pattern, so no `targetTime`
->   bound is needed); LWMA floors `timeDelta` at 0 (`OP_0 OP_MAX`); and the
->   previously-unused `EPOCH_MAX_SAFE_TARGET` deploy check is wired up.
->   **To re-enable here** once that (or an equivalent) lands upstream:
->   byte-match the corrected `dMintScript` bytecode, drop the `DaaMode.EPOCH`
->   deploy refusal, and re-prove the golden + regtest boundary-mint. The
->   EPOCH bytecode/parser stay in place meanwhile (parse-compat + the
->   canonical byte-match golden test).
+>   `(target/targetTime) × clampedDelta`, caps the output at 2^48; LWMA floors
+>   `timeDelta` at 0 via `OP_0 OP_MAX`; the previously-unused
+>   `EPOCH_MAX_SAFE_TARGET` deploy check is wired up). pyrxd byte-matches the
+>   merged canonical: the EPOCH/LWMA bytecode builders + the off-chain miner
+>   replicas (`compute_next_target_epoch`/`_linear`) were updated, the golden
+>   vectors regenerated, the `DaaMode.EPOCH` deploy refusal dropped, and the full
+>   suite is green. EPOCH deploy needs `difficulty ≥ 32768` (the 2^48 cap).
 > - Native fast miner — pyrxd ships a slow Python reference; users
 >   wanting GPU/multi-core go through the external-miner shim to
 >   `glyph-miner`

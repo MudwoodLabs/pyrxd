@@ -170,6 +170,10 @@ _POW_HASH_OP: dict[DmintAlgo, bytes] = {
 _PUSH_MAX_TARGET = bytes.fromhex("08ffffffffffffff7f")  # 0x7fff_ffff_ffff_ffff
 _PUSH_HALF_MAX_TARGET = bytes.fromhex("08ffffffffffffff3f")  # MAX/2
 _PUSH_QUARTER_MAX_TARGET = bytes.fromhex("08ffffffffffffff1f")  # MAX/4
+# Minimal push of EPOCH_MAX_SAFE_TARGET (2^48). 7-byte minimal LE (07 + 6×00 + 01).
+# EPOCH clamps the target to this on BOTH sides of the retarget multiply so it
+# can never overflow int64 (Radiant-Core/Photonic-Wallet#2).
+_PUSH_EPOCH_MAX_SAFE_TARGET = bytes.fromhex("0700000000000001")  # 2^48
 
 # One unrolled positive-drift step: if drift_rem>0 then target = (target>MAX/2 ?
 # MAX : target*2), drift_rem -= 1. Entry stack [drift_rem, target, ...].
@@ -249,9 +253,14 @@ def _build_linear_daa() -> bytes:
     """Linear/LWMA DAA bytecode (§4.6). ``new_target = target * timeDelta / targetTime``.
 
     Divide-first with caps so OP_MUL never overflows int64: timeDelta is capped
-    to ``4×targetTime`` and target to ``MAX_TARGET/4`` (so LWMA contracts need
-    difficulty ≥ 4), then ``(target_capped / targetTime) × timeDelta_capped``,
-    final MIN against MAX_TARGET, clamp ≥ 1.
+    to ``4×targetTime`` (upper) and floored at 0, and target to ``MAX_TARGET/4``
+    (so LWMA contracts need difficulty ≥ 4), then
+    ``(target_capped / targetTime) × timeDelta_capped``, final MIN against
+    MAX_TARGET, clamp ≥ 1. The 0-floor (``OP_0 OP_MAX``) is required because a
+    block's nLockTime may be earlier than the previous mint's (it need only
+    exceed the 11-block median-time-past), making ``timeDelta`` negative; without
+    the floor ``(target/targetTime) × negativeDelta`` underflows int64 and
+    OP_MUL aborts (Radiant-Core/Photonic-Wallet#2).
     """
     return (
         b"\xc5"  # OP_TXLOCKTIME → currentTime
@@ -260,7 +269,9 @@ def _build_linear_daa() -> bytes:
         + b"\x53\x79"  # OP_3 PICK targetTime
         + b"\x54"  # OP_4
         + b"\x95"  # OP_MUL → 4×targetTime
-        + b"\xa3"  # OP_MIN → timeDelta_capped
+        + b"\xa3"  # OP_MIN → timeDelta_capped (upper)
+        + b"\x00"  # OP_0
+        + b"\xa4"  # OP_MAX → timeDelta_capped = max(0, min(4×targetTime, delta))
         + b"\x7c"  # SWAP → target on top
         + _PUSH_QUARTER_MAX_TARGET
         + b"\xa3"  # OP_MIN → target_capped
@@ -285,9 +296,15 @@ def _build_epoch_daa(epoch_length: int, max_adjustment_log2: int) -> bytes:
 
         delta        = currentTime - lastTime
         clampedDelta = max(targetTime>>N, min(targetTime<<N, delta))   # N = max_adjustment_log2
-        newTarget    = min(MAX_TARGET, max(1, target * clampedDelta // targetTime))
+        newTarget    = max(1, min(2^48, (min(target, 2^48) // targetTime) * clampedDelta))
 
-    otherwise the target is unchanged. ``N`` is a deploy-time power-of-2 exponent
+    otherwise the target is unchanged. The target is clamped to 2^48 on BOTH
+    sides of the multiply and the divide runs FIRST, so the intermediate is
+    ``(≤ 2^48 / targetTime) × (≤ targetTime × 16) ≤ 2^52`` and OP_MUL never
+    overflows int64 for any reachable state (Radiant-Core/Photonic-Wallet#2). The
+    earlier ``target × clampedDelta`` (multiply-first, MAX_TARGET output cap) let
+    target drift past 2^48 and bricked the contract at a boundary mint.
+    ``N`` is a deploy-time power-of-2 exponent
     (1..4 → 2×/4×/8×/16×); the shift is emitted as N× OP_2MUL / OP_2DIV (not
     OP_LSHIFT/RSHIFT, which are big-endian-buffer-wise and wrong on LE script
     numbers). Height is at state position 9 (OP_9 PICK).
@@ -312,13 +329,16 @@ def _build_epoch_daa(epoch_length: int, max_adjustment_log2: int) -> bytes:
         + b"\xa3"  # MIN
         + bytes.fromhex("5379")  # OP_3 PICK targetTime
         + rshift_n  # lowerBound = targetTime / 2^N
-        + b"\xa4"  # MAX
-        + b"\x7c"  # SWAP
-        + b"\x95"  # MUL — target × clampedDelta
-        + bytes.fromhex("5279")  # OP_2 PICK targetTime
-        + b"\x96"  # DIV → newTarget
-        + _PUSH_MAX_TARGET
-        + b"\xa3"  # MIN (defensive)
+        + b"\xa4"  # MAX → clampedDelta
+        # newTarget = min(2^48, (min(target, 2^48) // targetTime) × clampedDelta)
+        + b"\x7c"  # SWAP → [target, clampedDelta, ...]
+        + _PUSH_EPOCH_MAX_SAFE_TARGET  # push 2^48
+        + b"\xa3"  # MIN → target_capped = min(target, 2^48)
+        + bytes.fromhex("5379")  # OP_3 PICK targetTime
+        + b"\x96"  # DIV → target_capped // targetTime
+        + b"\x95"  # MUL — × clampedDelta = newTarget (≤ 2^52)
+        + _PUSH_EPOCH_MAX_SAFE_TARGET  # push 2^48
+        + b"\xa3"  # MIN → cap newTarget at 2^48
         + bytes.fromhex("76519f")  # DUP 1 LESSTHAN
         + b"\x63"  # IF
         + bytes.fromhex("7551")  #   DROP 1

@@ -123,30 +123,30 @@ _GOLDEN: dict[str, tuple[dict, str]] = {
         "00d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "d0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01"
         "6402e8030053013c040000000008ffffffffffffff1fbdc0c859797ea85d795d797ea87e5e7a"
-        "7eaabc01147f77587f040000000088817600a26951797ca269c552799453795495a37c08ffff"
-        "ffffffffff1fa35379969508ffffffffffffff7fa376519f637551686b75757575577ae500a0"
-        "69567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7eaa76e47b9d547a818b76537a"
-        "9c537ade789181547ae6939d636c755279cd01d853797e016a7e886778de519d7676009c6375"
-        "0100677660a163015093518067827c7e68684c53d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb016402e8030053013c7ec55480547c7e7e6c7600"
-        "9c63750100677660a163015093518067827c7e68687e5379ec78885379eac0e9885379cc519d"
-        "75686d7551",
+        "7eaabc01147f77587f040000000088817600a26951797ca269c552799453795495a300a47c08"
+        "ffffffffffffff1fa35379969508ffffffffffffff7fa376519f637551686b75757575577ae5"
+        "00a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7eaa76e47b9d547a818b76"
+        "537a9c537ade789181547ae6939d636c755279cd01d853797e016a7e886778de519d7676009c"
+        "63750100677660a163015093518067827c7e68684c53d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb016402e8030053013c7ec55480547c7e7e6c"
+        "76009c63750100677660a163015093518067827c7e68687e5379ec78885379eac0e9885379cc"
+        "519d75686d7551",
     ),
     "lwma_h7": (
         dict(height=7, max_height=100, reward=1000, difficulty=8, daa_mode=DaaMode.LWMA, target_time=30),
         "57d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         "d0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb01"
         "6402e8030053011e040000000008ffffffffffffff0fbdc0c859797ea85d795d797ea87e5e7a"
-        "7eaabc01147f77587f040000000088817600a26951797ca269c552799453795495a37c08ffff"
-        "ffffffffff1fa35379969508ffffffffffffff7fa376519f637551686b75757575577ae500a0"
-        "69567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7eaa76e47b9d547a818b76537a"
-        "9c537ade789181547ae6939d636c755279cd01d853797e016a7e886778de519d7676009c6375"
-        "0100677660a163015093518067827c7e68684c53d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb016402e8030053011e7ec55480547c7e7e6c7600"
-        "9c63750100677660a163015093518067827c7e68687e5379ec78885379eac0e9885379cc519d"
-        "75686d7551",
+        "7eaabc01147f77587f040000000088817600a26951797ca269c552799453795495a300a47c08"
+        "ffffffffffffff1fa35379969508ffffffffffffff7fa376519f637551686b75757575577ae5"
+        "00a069567ae600a06901d053797e0cdec0e9aa76e378e4a269e69d7eaa76e47b9d547a818b76"
+        "537a9c537ade789181547ae6939d636c755279cd01d853797e016a7e886778de519d7676009c"
+        "63750100677660a163015093518067827c7e68684c53d8aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaad0bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb016402e8030053011e7ec55480547c7e7e6c"
+        "76009c63750100677660a163015093518067827c7e68687e5379ec78885379eac0e9885379cc"
+        "519d75686d7551",
     ),
 }
 
