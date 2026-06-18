@@ -46,14 +46,18 @@
 >   canonical EPOCH bytecode has an int64-overflow that bricks the contract
 >   on-chain (`target × clampedDelta` > 2^63; retarget also drifts past the
 >   2^48 safe target). Confirmed against `radiant-core` `interpreter.cpp`
->   (`OP_MUL → safeMul` abort). **To re-enable:** file/track the upstream
->   Photonic fix (draft report: two int64-overflow conditions in
->   `dMintScript` — EPOCH `target × clampedDelta` and LWMA negative-delta;
->   see #219), then byte-match the corrected bytecode here, re-add the 2^48
->   retarget cap + `targetTime` bound (and the LWMA `OP_0 OP_MAX` delta
->   floor) in both layers, drop the `DaaMode.EPOCH` refusal, and re-prove
->   the golden + regtest boundary-mint. The EPOCH bytecode/parser stay in
->   place meanwhile (parse-compat + the canonical byte-match golden test).
+>   (`OP_MUL → safeMul` abort). **A fix is now proposed upstream:**
+>   [`Radiant-Core/Photonic-Wallet#2`](https://github.com/Radiant-Core/Photonic-Wallet/pull/2)
+>   — EPOCH clamps target to 2^48 before the multiply, divides first
+>   (`(target/targetTime) × clampedDelta`), and caps the output at 2^48
+>   (mirrors the LWMA divide-first/MAX_TARGET-4 pattern, so no `targetTime`
+>   bound is needed); LWMA floors `timeDelta` at 0 (`OP_0 OP_MAX`); and the
+>   previously-unused `EPOCH_MAX_SAFE_TARGET` deploy check is wired up.
+>   **To re-enable here** once that (or an equivalent) lands upstream:
+>   byte-match the corrected `dMintScript` bytecode, drop the `DaaMode.EPOCH`
+>   deploy refusal, and re-prove the golden + regtest boundary-mint. The
+>   EPOCH bytecode/parser stay in place meanwhile (parse-compat + the
+>   canonical byte-match golden test).
 > - Native fast miner — pyrxd ships a slow Python reference; users
 >   wanting GPU/multi-core go through the external-miner shim to
 >   `glyph-miner`
