@@ -66,6 +66,49 @@ async def test_run_loop_stops_on_event():
     assert seen == [1, 2]
 
 
+async def test_run_loop_calls_on_tick_start_before_each_tick():
+    order: list[str] = []
+    n = await run_loop(
+        _reconciler(),
+        interval_s=0,
+        on_tick_start=lambda: order.append("start"),
+        on_heartbeat=lambda i, res: order.append("beat"),
+        sleep=_noop_sleep,
+        max_iterations=2,
+    )
+    assert n == 2
+    # start fires before the tick's heartbeat, every iteration.
+    assert order == ["start", "beat", "start", "beat"]
+
+
+async def test_run_loop_on_tick_start_failure_does_not_crash():
+    beats: list[int] = []
+
+    def _boom():
+        raise RuntimeError("ack drain blew up")
+
+    # A failing pre-tick hook is guarded: the loop still ticks and beats.
+    n = await run_loop(
+        _reconciler(),
+        interval_s=0,
+        on_tick_start=_boom,
+        on_heartbeat=lambda i, res: beats.append(i),
+        sleep=_noop_sleep,
+        max_iterations=2,
+    )
+    assert n == 2
+    assert beats == [1, 2]
+
+
+def test_default_heartbeat_logs_and_warns_on_unacked(caplog):
+    hb = default_heartbeat(logging.getLogger("t"), unacked_critical=lambda: 2)
+    with caplog.at_level(logging.INFO, logger="t"):
+        hb(1, [])
+    rec = caplog.records[-1]
+    assert "unacked_critical=2" in rec.message
+    assert rec.levelno == logging.ERROR  # outstanding un-ACK'd CRITICALs escalate the heartbeat level
+
+
 async def test_run_loop_validates_args():
     with pytest.raises(ValidationError):
         await run_loop("not a reconciler", interval_s=1)

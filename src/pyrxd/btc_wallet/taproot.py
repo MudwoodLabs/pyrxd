@@ -186,6 +186,7 @@ def _push_minimal_int(value: int) -> bytes:
 
 
 # Script opcodes used by the HTLC leaves.
+_OP_SIZE = b"\x82"  # OP_SIZE — pushes the top item's byte-length (used to pin the preimage to 32)
 _OP_SHA256 = b"\xa8"
 _OP_EQUALVERIFY = b"\x88"
 _OP_CHECKSIG = b"\xac"
@@ -278,14 +279,28 @@ class Timelock:
 
 
 def claim_leaf_script(hashlock: bytes, claim_pubkey_xonly: bytes) -> bytes:
-    """Build the claim leaf: ``OP_SHA256 <H> OP_EQUALVERIFY <claimPk> OP_CHECKSIG``.
+    """Build the claim leaf: ``OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <H> OP_EQUALVERIFY <claimPk> OP_CHECKSIG``.
 
     Commits to the SHA256 *preimage* directly so the spending witness pushes the
-    real ``p`` (the cross-chain reveal channel).
+    real ``p`` (the cross-chain reveal channel). The leading ``OP_SIZE <0x20>
+    OP_EQUALVERIFY`` consensus-pins ``p`` to exactly 32 bytes: without it a malicious
+    maker could reveal a non-32-byte ``p'`` (with H = sha256(p')) that the 32-byte-only
+    ``scrape_secret`` silently skips, stranding the taker's covenant (security review:
+    preimage-length asset theft). 0x20 is pushed minimally (``0120``) so the F-001
+    minimal-data guard is not re-triggered.
     """
     h = _as_bytes(hashlock, name="hashlock", length=32)
     pk = _as_bytes(claim_pubkey_xonly, name="claim_pubkey_xonly", length=32)
-    return _OP_SHA256 + _push_data(h) + _OP_EQUALVERIFY + _push_data(pk) + _OP_CHECKSIG
+    return (
+        _OP_SIZE
+        + _push_minimal_int(32)
+        + _OP_EQUALVERIFY
+        + _OP_SHA256
+        + _push_data(h)
+        + _OP_EQUALVERIFY
+        + _push_data(pk)
+        + _OP_CHECKSIG
+    )
 
 
 def refund_leaf_script(refund_pubkey_xonly: bytes, timeout: Timelock) -> bytes:

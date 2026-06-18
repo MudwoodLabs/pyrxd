@@ -250,19 +250,26 @@ def test_no_keypath_spend_against_nums():
 
 
 def test_claim_leaf_commits_to_preimage_directly():
-    """Claim leaf is OP_SHA256 <H> OP_EQUALVERIFY <pk> OP_CHECKSIG (NOT HASH160)."""
+    """Claim leaf is OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <H> OP_EQUALVERIFY <pk> OP_CHECKSIG (NOT HASH160).
+
+    The leading ``OP_SIZE <0x20> OP_EQUALVERIFY`` consensus-pins the preimage to 32 bytes
+    (security review: a non-32-byte ``p'`` would be silently skipped by the 32-byte-only
+    ``scrape_secret`` and strand the taker)."""
     h = os.urandom(32)
     pk = os.urandom(32)
     script = t.claim_leaf_script(h, pk)
-    assert script[0:1] == b"\xa8"  # OP_SHA256
-    assert script[1] == 32 and script[2:34] == h  # push H directly
-    assert script[34:35] == b"\x88"  # OP_EQUALVERIFY
-    assert script[35] == 32 and script[36:68] == pk
-    assert script[68:69] == b"\xac"  # OP_CHECKSIG
-    # The leaf opens with OP_SHA256 (single hash), NOT OP_HASH160(SHA256) — Boltz's
+    assert script[0:1] == b"\x82"  # OP_SIZE
+    assert script[1:3] == b"\x01\x20"  # minimal push of 0x20 (== 32) — does NOT re-trigger F-001
+    assert script[3:4] == b"\x88"  # OP_EQUALVERIFY (length == 32)
+    assert script[4:5] == b"\xa8"  # OP_SHA256
+    assert script[5] == 32 and script[6:38] == h  # push H directly
+    assert script[38:39] == b"\x88"  # OP_EQUALVERIFY
+    assert script[39] == 32 and script[40:72] == pk
+    assert script[72:73] == b"\xac"  # OP_CHECKSIG
+    # The leaf hashes with OP_SHA256 (single hash), NOT OP_HASH160(SHA256) — Boltz's
     # pattern is explicitly avoided so the witness reveals the real preimage.
-    assert script[0] != 0xA9  # opcode position is OP_SHA256, not OP_HASH160
-    assert len(script) == 69  # fixed layout: no extra HASH160 round
+    assert script[4] != 0xA9  # the hash opcode is OP_SHA256, not OP_HASH160
+    assert len(script) == 73  # OP_SIZE pin (4 bytes) + OP_SHA256 <H> OP_EQUALVERIFY <pk> OP_CHECKSIG
 
 
 def test_refund_leaf_uses_csv():

@@ -1,10 +1,12 @@
 """Golden-vector + guard tests for the productized Radiant HTLC covenant builders.
 
-The strongest correctness evidence: the productized builders must reproduce the
-EXACT covenant scriptPubKeys + holder scripts that were accepted on Radiant
-MAINNET during the spike (recorded in ``docs/brainstorms/gravity-ref-spike/
-.live_swap_{nft,ft}.json``). If a byte drifts, a real node would reject the spend,
-so byte-for-byte equality against a mainnet-mined SPK is the bar.
+The builders reproduce the EXACT holder scripts that were accepted on Radiant MAINNET
+during the spike (recorded in ``docs/brainstorms/gravity-ref-spike/.live_swap_{nft,ft}.json``).
+NOTE (v2): the OP_SIZE<0x20> preimage-length pin (security review: preimage-length asset
+theft) intentionally SUPERSEDES the v1 mainnet covenant *scriptPubKey*, so the full SPK no
+longer reproduces v1 byte-for-byte — the holder scripts (unchanged by the pin) still do, and
+every claim branch now carries the 32-byte pin. v2 consensus validity is proven by the regtest
+spend/reject test (live node).
 
 The remaining tests pin the two static guards (bare-0xbd opcode walk + ref count)
 and the fail-closed parameter validation — the covenant moves real value, so every
@@ -48,7 +50,13 @@ def _load_vector(name: str) -> dict:
 # --------------------------------------------------------------------------- golden vectors
 
 
-def test_nft_reproduces_mainnet_proven_spk():
+def test_nft_covenant_v2_pins_preimage_length_holder_unchanged():
+    """v2 preimage-length pin (security review: preimage-length asset theft). The OP_SIZE<0x20>
+    check on the claim branch intentionally SUPERSEDES the v1 mainnet covenant SPK, so the full
+    scriptPubKey no longer reproduces v1 byte-for-byte (the v1 swap stays recorded in
+    .live_swap_nft.json as history; v2 consensus validity is proven by the regtest spend/reject
+    test). The HOLDER scripts (P2PKH of the pkhs) are untouched by v2, so they still reproduce
+    the mainnet-proven holders byte-for-byte."""
     v = _load_vector(".live_swap_nft.json")
     txid, vout = v["nft_genesis"].split(":")
     cov = build_htlc_covenant_nft(
@@ -60,13 +68,18 @@ def test_nft_reproduces_mainnet_proven_spk():
         hashlock=bytes.fromhex(v["hashlock"]),
         refund_csv=v["btc_refund_csv_blocks"],
     )
-    assert cov.funded_spk.hex() == v["nft_covenant_spk_hex"], "NFT covenant SPK drifted from mainnet-proven"
-    assert cov.taker_holder_script.hex() == v["nft_taker_holder_script"]
+    assert b"\x82\x01\x20\x88\xa8" in cov.funded_spk, (
+        "claim branch must pin p to 32 bytes (OP_SIZE<0x20>OP_EQUALVERIFY OP_SHA256)"
+    )
+    assert cov.funded_spk.hex() != v["nft_covenant_spk_hex"], "v1 mainnet SPK is intentionally superseded by the pin"
+    assert cov.taker_holder_script.hex() == v["nft_taker_holder_script"]  # holder unchanged (mainnet-proven)
     assert cov.variant == "nft"
     assert cov.genesis_ref  # non-empty
 
 
-def test_ft_reproduces_mainnet_proven_spk():
+def test_ft_covenant_v2_pins_preimage_length_holder_unchanged():
+    """v2 preimage-length pin (see the NFT test). v1 covenant SPK superseded; holder + the
+    FT epilogue weld + the sole bare-0xbd at prologue_len are structurally preserved."""
     v = _load_vector(".live_swap_ft.json")
     txid, vout = v["ft_genesis"].split(":")
     cov = build_htlc_covenant_ft(
@@ -78,11 +91,43 @@ def test_ft_reproduces_mainnet_proven_spk():
         hashlock=bytes.fromhex(v["hashlock"]),
         refund_csv=v["btc_refund_csv_blocks"],
     )
-    assert cov.funded_spk.hex() == v["ft_covenant_spk_hex"], "FT covenant SPK drifted from mainnet-proven"
-    assert cov.taker_holder_script.hex() == v["ft_taker_holder_script"]
+    assert b"\x82\x01\x20\x88\xa8" in cov.funded_spk, "claim branch must pin p to 32 bytes (OP_SIZE)"
+    assert cov.funded_spk.hex() != v["ft_covenant_spk_hex"], "v1 mainnet SPK is intentionally superseded by the pin"
+    assert cov.taker_holder_script.hex() == v["ft_taker_holder_script"]  # holder unchanged (mainnet-proven)
     # FT funded SPK ends with the epilogue weld; the sole bare-0xbd is at prologue_len.
     assert cov.funded_spk.endswith(FT_EPILOGUE)
     assert cov.funded_spk[cov.prologue_len] == 0xBD
+
+
+def test_all_three_covenant_variants_pin_preimage_to_32_bytes():
+    """Regression (security review: preimage-length asset theft): EVERY HTLC covenant variant's
+    claim branch must consensus-pin p to exactly 32 bytes via OP_SIZE<0x20>OP_EQUALVERIFY
+    immediately before the preimage OP_SHA256 (fragment 82 0120 88 a8), so a malicious maker
+    cannot reveal a non-32-byte p' that the 32-byte-only scrape_secret silently skips. CI-safe
+    (synthetic inputs, no private vectors). Full consensus rejection of a non-32-byte spend is
+    proven by the regtest spend/reject test (live radiant-core node)."""
+    h = hashlib.sha256(b"p" * 32).digest()
+    tp, mp, gt = bytes(range(20)), bytes([0x22] * 20), "ab" * 32
+    pin = b"\x82\x01\x20\x88\xa8"  # OP_SIZE  push(0x20)  OP_EQUALVERIFY  OP_SHA256
+    covs = {
+        "rxd": build_htlc_covenant_rxd(amount=1000, taker_pkh=tp, maker_pkh=mp, hashlock=h, refund_csv=48),
+        "ft": build_htlc_covenant_ft(
+            genesis_txid=gt, genesis_vout=0, amount=1000, taker_pkh=tp, maker_pkh=mp, hashlock=h, refund_csv=48
+        ),
+        "nft": build_htlc_covenant_nft(
+            genesis_txid=gt,
+            genesis_vout=0,
+            nft_carrier_value=1000,
+            taker_pkh=tp,
+            maker_pkh=mp,
+            hashlock=h,
+            refund_csv=48,
+        ),
+    }
+    for name, cov in covs.items():
+        assert pin in cov.funded_spk, f"{name}: claim branch missing the 32-byte preimage pin (theft regression)"
+        # the pin sits in the CLAIM branch, before that branch's hashlock check (OP_SHA256 <H>).
+        assert cov.funded_spk.index(pin) < cov.funded_spk.index(h), f"{name}: pin not before the claim hashlock"
 
 
 # --------------------------------------------------------------------------- RXD (no mainnet golden)

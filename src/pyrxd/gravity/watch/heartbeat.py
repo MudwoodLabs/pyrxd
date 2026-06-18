@@ -37,14 +37,25 @@ _CLOCK_SKEW_TOLERANCE_S = 60.0
 
 
 class FileHeartbeat:
-    """A heartbeat sink that atomically writes ``{ts, tick, swaps, paged, undelivered}`` to a file
-    each tick — the cross-process liveness signal the :class:`DeadMansSwitch` watches. ``undelivered``
-    (red-team MEDIUM) is the count of pages the alerter FAILED to deliver this tick, so a monitor /
-    operator can detect 'alive but dropping CRITICAL pages' rather than seeing a healthy-looking beat."""
+    """A heartbeat sink that atomically writes ``{ts, tick, swaps, paged, undelivered,
+    unacked_critical}`` to a file each tick — the cross-process liveness signal the
+    :class:`DeadMansSwitch` watches. ``undelivered`` (red-team MEDIUM) is the count of pages the
+    alerter FAILED to deliver this tick. ``unacked_critical`` (review MEDIUM) is the count of
+    outstanding, operator-un-ACK'd CRITICAL claim/squeeze situations (from
+    :meth:`DedupAlerter.unacked_critical_count`, injected): a persistent non-zero value means
+    time-critical pages are going unacknowledged, so an external monitor can escalate. Both let a
+    monitor detect 'alive but losing the claim race' rather than seeing a healthy-looking beat."""
 
-    def __init__(self, path: str | Path, *, clock: Callable[[], float] = time.time) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        clock: Callable[[], float] = time.time,
+        unacked_critical: Callable[[], int] | None = None,
+    ) -> None:
         self._path = Path(path)
         self._clock = clock
+        self._unacked = unacked_critical
 
     def __call__(self, iteration: int, results) -> None:
         paged = sum(1 for r in results if r.decision.intent.value.startswith("page_"))
@@ -56,6 +67,13 @@ class FileHeartbeat:
             "paged": paged,
             "undelivered": undelivered,
         }
+        if self._unacked is not None:
+            # The count source must never crash the liveness write — degrade to a -1 sentinel
+            # (visibly anomalous) rather than skip the heartbeat the dead-man's-switch depends on.
+            try:
+                data["unacked_critical"] = int(self._unacked())
+            except Exception:  # pragma: no cover - defensive: a broken count must not stop the beat
+                data["unacked_critical"] = -1
         tmp = self._path.with_name(self._path.name + ".tmp")
         tmp.write_text(json.dumps(data))
         os.replace(tmp, self._path)  # atomic on the same filesystem

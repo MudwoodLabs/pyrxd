@@ -16,11 +16,14 @@ from pyrxd.gravity.watch import (
     ElectrumRxdChainSource,
     JsonDirRecordStore,
     LoggingAlertChannel,
+    MempoolClaimBytesSource,
     OutspendBtcClaimSource,
     Page,
     Severity,
     mempool_space_outspend,
+    mempool_space_tx_hex,
 )
+from pyrxd.gravity.watch.claim_executor import ClaimBytesSource
 from pyrxd.security.errors import NetworkError, ValidationError
 
 
@@ -57,6 +60,17 @@ async def test_record_store_lists_only_active(tmp_path):
     active = await JsonDirRecordStore(tmp_path).list_active()
     assert [swap_id for swap_id, _ in active] == ["active"]  # terminal + garbage skipped
     assert active[0][1].state is SwapState.BOTH_LOCKED
+
+
+async def test_record_store_excludes_executor_sidecars(tmp_path):
+    # The refund blob + the claim covenant-context sidecars live beside the records and are NOT
+    # SwapRecords; they must NOT be globbed as records (else they'd spam "unreadable" warnings and
+    # could trip the all-unreadable "watching nothing" page — and their stem isn't the swap_id).
+    (tmp_path / "s1.json").write_text(json.dumps(SwapRecord(state=SwapState.SECRET_REVEALED, terms=_terms()).to_dict()))
+    (tmp_path / "s1.refund.json").write_text('{"version": 1, "swap_id": "s1", "raw_tx": "00"}')
+    (tmp_path / "s1.claim.json").write_text('{"version": 1, "swap_id": "s1", "taker_pkh": "11", "maker_pkh": "22"}')
+    active = await JsonDirRecordStore(tmp_path).list_active()
+    assert [swap_id for swap_id, _ in active] == ["s1"]  # only the real record; sidecars ignored
 
 
 async def test_record_store_missing_dir_raises(tmp_path):
@@ -241,6 +255,65 @@ async def test_mempool_outspend_bad_spender_txid_dropped():
     )
     assert spent is True
     assert spender is None  # malformed txid not trusted
+
+
+# --- mempool_space_tx_hex / MempoolClaimBytesSource -----------------------
+
+
+class _FakeHexResp:
+    def __init__(self, text="", status=200):
+        self._text, self.status = text, status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def raise_for_status(self):
+        if self.status >= 400:
+            raise NetworkError(f"http {self.status}")
+
+    async def text(self):
+        return self._text
+
+
+class _FakeHexSession:
+    def __init__(self, resp):
+        self._resp, self.urls = resp, []
+
+    def get(self, url, timeout=None):
+        self.urls.append(url)
+        return self._resp
+
+
+async def test_tx_hex_returns_bytes():
+    raw = b"\x01\x02\x03\xab"
+    sess = _FakeHexSession(_FakeHexResp(raw.hex()))
+    out = await mempool_space_tx_hex(sess, "https://mempool.space/", "cd" * 32)
+    assert out == raw
+    assert sess.urls == [f"https://mempool.space/api/tx/{'cd' * 32}/hex"]
+
+
+async def test_tx_hex_404_returns_none():
+    out = await mempool_space_tx_hex(_FakeHexSession(_FakeHexResp("", status=404)), "https://m", "cd" * 32)
+    assert out is None  # not yet indexed/mined → None, never garbage bytes
+
+
+async def test_tx_hex_unparseable_returns_none():
+    out = await mempool_space_tx_hex(_FakeHexSession(_FakeHexResp("not hex!!")), "https://m", "cd" * 32)
+    assert out is None
+
+
+async def test_claim_bytes_source_satisfies_protocol_and_delegates():
+    src = MempoolClaimBytesSource(_FakeHexSession(_FakeHexResp((b"\xde\xad").hex())), "https://m")
+    assert isinstance(src, ClaimBytesSource)  # structural Protocol conformance
+    assert await src.claim_tx_bytes("ab" * 32) == b"\xde\xad"
+
+
+def test_claim_bytes_source_validates_base_url():
+    with pytest.raises(ValidationError):
+        MempoolClaimBytesSource(_FakeHexSession(_FakeHexResp()), "")
 
 
 # --- alert channels -------------------------------------------------------

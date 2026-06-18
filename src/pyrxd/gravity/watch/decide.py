@@ -148,6 +148,13 @@ class Decision:
     # string (the ETH PARAMS_MISMATCH branch also emits "taker_refund_btc", so a string match would
     # wrongly arm on an ETH swap). Always False for every claim/squeeze/ETH/immature-refund decision.
     autonomous_btc_refund: bool = False
+    # TYPED autonomy discriminator for the autonomous asset CLAIM (the ClaimExecutor keys on THIS). True
+    # ONLY on a BTC↔RXD SAFE claim race (maker revealed p, BTC claim reorg-final, burial fits the window).
+    # NEVER set on the ETH branch — the ETH SAFE PAGE_CLAIM branch emits the same "taker_scrape_and_claim_
+    # asset" display string (decide.py ETH path), so a string match would wrongly arm on an ETH swap whose
+    # p-scrape source + finality model are out of scope here. The executor additionally re-asserts SAFE
+    # against a FRESH read before broadcasting (a tick-open verdict is stale on a cheap-reorg chain).
+    autonomous_asset_claim: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.intent, Intent):
@@ -156,8 +163,16 @@ class Decision:
             raise ValidationError("Decision.reason must be a non-empty str")
         if not isinstance(self.autonomous_btc_refund, bool):
             raise ValidationError("Decision.autonomous_btc_refund must be bool")
+        if not isinstance(self.autonomous_asset_claim, bool):
+            raise ValidationError("Decision.autonomous_asset_claim must be bool")
+        # Mutual exclusion FIRST (so it is reachable; each per-flag check below pins a different intent).
+        # NOTE the identifiers keep the message out of redact()'s BIP-39 (>=8 lowercase words) heuristic.
+        if self.autonomous_btc_refund and self.autonomous_asset_claim:
+            raise ValidationError("a Decision cannot set both autonomous_btc_refund and autonomous_asset_claim")
         if self.autonomous_btc_refund and self.intent is not Intent.PAGE_REFUND:
             raise ValidationError("autonomous_btc_refund is only valid on a PAGE_REFUND decision")
+        if self.autonomous_asset_claim and self.intent is not Intent.PAGE_CLAIM:
+            raise ValidationError("autonomous_asset_claim is only valid on a PAGE_CLAIM decision")
 
 
 def _value_at_risk_photons(terms) -> int | None:
@@ -285,6 +300,9 @@ def decide(
                 recommended_action="taker_scrape_and_claim_asset",
                 deadline_rxd_height=deadline,
                 low_corroboration=corr,
+                # BTC↔RXD SAFE claim race → arm the autonomous ClaimExecutor (BTC branch ONLY; the ETH
+                # SAFE branch below must NOT set this). The executor re-asserts SAFE fresh before firing.
+                autonomous_asset_claim=True,
             )
         if finality is ClaimFinality.WAIT:
             return Decision(

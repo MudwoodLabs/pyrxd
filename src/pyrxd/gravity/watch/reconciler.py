@@ -114,6 +114,12 @@ class Reconciler:
         self._safety = safety_window_blocks
         self._inflight: set[str] = set()
 
+    @property
+    def alerter(self) -> Alerter:
+        """The injected alerter — exposed so the shell can wire its operator-ACK inbox + the
+        un-ACK'd CRITICAL count into the heartbeat (a :class:`DedupAlerter` provides both)."""
+        return self._alerter
+
     async def tick(self) -> list[ReconcileResult]:
         """Reconcile every in-flight swap once. NEVER raises (red-team LOW: a directory-level store
         I/O fault — missing/typo'd/unmounted dir, EACCES/ESTALE/EIO, or every record unreadable —
@@ -173,11 +179,13 @@ class Reconciler:
             self._inflight.discard(swap_id)
 
     async def _safe_execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
-        """Run the autonomous executor for a refund decision. A broadcast failure must NOT crash the
-        loop and must NOT silence the operator — it is recorded as ``FAILED`` and the alerter still
-        pages. Only ``PAGE_REFUND`` is autonomy-eligible; every other routed intent is observed-only.
+        """Run the autonomous executor for an autonomy-eligible decision. A broadcast failure must NOT
+        crash the loop and must NOT silence the operator — it is recorded as ``FAILED`` and the alerter
+        still pages. ``PAGE_REFUND`` (keyless refund) and ``PAGE_CLAIM`` (the asset claim) are
+        autonomy-eligible; every other routed intent is observed-only. Each executor self-gates on its
+        own typed discriminator, so a wired RefundExecutor/ClaimExecutor only acts on its own intent.
         With the default :class:`NullExecutor` this is always a no-op (returns ``None``)."""
-        if decision.intent is not Intent.PAGE_REFUND:
+        if decision.intent not in (Intent.PAGE_REFUND, Intent.PAGE_CLAIM):
             return None
         try:
             return await self._executor.execute(swap_id, record, decision)

@@ -40,6 +40,7 @@ from pyrxd.security.errors import ValidationError
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "CompositeExecutor",
     "ExecOutcome",
     "Executor",
     "NullExecutor",
@@ -166,6 +167,28 @@ class NullExecutor:
     wiring is byte-identical (broadcasts nothing, holds nothing)."""
 
     async def execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
+        return None
+
+
+class CompositeExecutor:
+    """Fans a decision out to several sub-executors (e.g. a RefundExecutor + a ClaimExecutor), returning
+    the FIRST non-``None`` :class:`ExecOutcome`. Intents are mutually exclusive per tick (a decision is a
+    refund OR a claim OR neither), and each sub-executor self-gates on its own typed discriminator and
+    no-ops (returns ``None``) otherwise — so at most one ever acts, and the single
+    ``ReconcileResult.executed`` field still fits. The reconciler holds one executor slot; this is how two
+    autonomous actions coexist in it."""
+
+    def __init__(self, *executors: Executor) -> None:
+        for ex in executors:
+            if not isinstance(ex, Executor):
+                raise ValidationError("CompositeExecutor children must satisfy the Executor protocol")
+        self._executors: tuple[Executor, ...] = executors
+
+    async def execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
+        for ex in self._executors:
+            outcome = await ex.execute(swap_id, record, decision)
+            if outcome is not None:
+                return outcome
         return None
 
 

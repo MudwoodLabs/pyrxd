@@ -78,9 +78,19 @@ async def test_covenant_locked_believed_on_any_single_source():
     assert await src.covenant_confirmations(_OUTPOINT) == 5
 
 
-async def test_covenant_locked_returns_conservative_min_depth():
+async def test_covenant_locked_returns_conservative_max_depth():
+    # HIGH-2: the depth feeds the autonomous CLAIM gate (blocks_left = t_rxd − cov_confs + 1), where a
+    # SMALLER cov_confs reads SAFE. So MAX — not min — is the fail-closed direction: a single source
+    # under-reporting depth (here 5) must NOT drag the gate toward a premature claim; the deepest
+    # sighting (8) wins.
     src = MultiSourceRxdChainSource([_FakeRxd(covenant=8), _FakeRxd(covenant=5), _FakeRxd(covenant=None)], quorum=2)
-    assert await src.covenant_confirmations(_OUTPOINT) == 5  # most-pessimistic depth
+    assert await src.covenant_confirmations(_OUTPOINT) == 8
+
+
+async def test_covenant_under_reporting_source_cannot_lower_the_depth():
+    # A lone lagging/lying source reporting a tiny depth cannot make the claim gate read SAFE early.
+    src = MultiSourceRxdChainSource([_FakeRxd(covenant=1), _FakeRxd(covenant=20), _FakeRxd(covenant=None)], quorum=2)
+    assert await src.covenant_confirmations(_OUTPOINT) == 20
 
 
 async def test_covenant_not_locked_only_on_corroborated_absence():

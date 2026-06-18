@@ -179,6 +179,14 @@ class RadiantChainIO:
         """
         import hashlib
 
+        # A script-hash-keyed client (e.g. SshTrRadiantClient via scantxoutset) can only
+        # resolve a script_hash back to its SPK from a registry; an UNregistered covenant
+        # SPK scans EMPTY and is misread as "not funded / already spent". A fresh per-swap
+        # claim leg (sidecar_leg_resolver) never pre-registers, so register the SPK we are
+        # about to scan here — idempotent, and a no-op for clients without register_spk.
+        register = getattr(self._client, "register_spk", None)
+        if callable(register):
+            register(bytes(spk))
         script_hash = hashlib.sha256(bytes(spk)).digest()[::-1]
         utxos = await self._client.get_utxos(script_hash)
         if not utxos:
@@ -191,6 +199,25 @@ class RadiantChainIO:
             raise NetworkError(f"ambiguous covenant UTXO set ({len(utxos)} candidates); fail-closed")
         u = utxos[0]
         return f"{u.tx_hash}:{u.tx_pos}", int(u.value), int(u.height)
+
+    async def covenant_unspent_incl_mempool(self, outpoint: str) -> bool | None:
+        """Mempool-AWARE liveness of a covenant outpoint — the complement to
+        ``find_covenant_utxo``'s mempool-BLIND scantxoutset scan.
+
+        ``True`` = unspent considering the mempool; ``False`` = spent (confirmed OR by a
+        PENDING mempool tx); ``None`` = the client cannot answer (the caller keeps its own
+        idempotency guard). Lets the autonomous claim executor treat a covenant already spent
+        IN THE MEMPOOL as claimed — killing the per-tick re-carve drain WITHOUT a durable
+        cross-restart store and WITHOUT the SeenStore's eviction blind spot (a truly-unspent
+        covenant, e.g. after a claim is evicted by a reorg, correctly re-fires).
+        """
+        fn = getattr(self._client, "txout_unspent_incl_mempool", None)
+        if not callable(fn):
+            return None
+        txid, _sep, vout = outpoint.partition(":")
+        if not _sep or not vout.isdigit():
+            raise ValidationError(f"bad covenant outpoint {outpoint!r}")
+        return bool(await fn(txid, int(vout)))
 
 
 class _AlreadyKnown(Exception):

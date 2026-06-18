@@ -632,6 +632,65 @@ def _value_scaled_burial_blocks(policy: MarginPolicy, value_at_risk_photons: int
     return math.ceil(required)
 
 
+# CHOSEN (not measured): the autonomous claim executor's pre-broadcast value ceiling defaults to
+# requiring the cost to reorg the burial to exceed the value at risk by this multiple. An attacker
+# is ~indifferent at 1.0, so a margin above 1 is prudent; 2.0 means "reorging the burial must cost
+# at least twice the theft gain". The MarginPolicy's own ``burial_safety_factor`` (default 1.0)
+# governs the coordinator's burial-RAISING; this is the executor's independent ceiling default.
+_DEFAULT_REORG_SAFETY_FACTOR = 2.0
+
+
+def max_protected_value(
+    *,
+    rxd_claim_burial_blocks: int,
+    reorg_cost_per_block: int,
+    safety_factor: float = _DEFAULT_REORG_SAFETY_FACTOR,
+) -> int:
+    """Max value-at-risk a Radiant claim buried ``rxd_claim_burial_blocks`` deep defends.
+
+    The exact INVERSE of ``_value_scaled_burial_blocks`` (which raises the burial to cover a
+    value); this caps the value a given burial defends. Used by the autonomous claim executor as a
+    defense-in-depth pre-broadcast gate, independent of the coordinator's value-scaled-burial setup.
+
+    An attacker who reorgs the burial to undo the taker's asset claim (and take the maker's CSV
+    refund instead) must spend ~``rxd_claim_burial_blocks * reorg_cost_per_block``; their gain is the
+    asset's value. Require ``value * safety_factor <= burial * cost``, so the protected-value ceiling
+    is ``floor(burial * cost / safety_factor)``.
+
+    Units: ``reorg_cost_per_block`` and the returned ceiling are in the SAME unit as the declared
+    value-at-risk — RXD photons for an ``rxd`` swap, where the value at risk IS ``radiant_amount``;
+    for ``ft``/``nft`` the operator declares the asset's market value explicitly. ``reorg_cost_per_block``
+    is the attacker's NET marginal cost to add one Radiant block on the reorg chain. Both inputs are
+    OPERATOR-SUPPLIED (no live hashrate/price feed in the stack). Pure and fail-closed: raises
+    ``ValidationError`` on a non-positive depth/cost or a ``safety_factor`` not a finite float ``>= 1``.
+    """
+    if (
+        not isinstance(rxd_claim_burial_blocks, int)
+        or isinstance(rxd_claim_burial_blocks, bool)
+        or rxd_claim_burial_blocks <= 0
+    ):
+        raise ValidationError("rxd_claim_burial_blocks must be a positive int")
+    if not isinstance(reorg_cost_per_block, int) or isinstance(reorg_cost_per_block, bool) or reorg_cost_per_block <= 0:
+        raise ValidationError(
+            "reorg_cost_per_block must be a positive int (operator-MEASURED net marginal cost, "
+            "same unit as the declared value-at-risk)"
+        )
+    if (
+        not isinstance(safety_factor, (int, float))
+        or isinstance(safety_factor, bool)
+        or not math.isfinite(safety_factor)
+        or safety_factor < 1.0
+    ):
+        raise ValidationError(
+            "safety_factor must be a finite float >= 1.0 (a factor < 1 would bless theft-profitable swaps)"
+        )
+    # Integer-exact floor (review INFO): RXD's full supply in photons (~1.6e18) exceeds 2^53, where
+    # ``burial*cost/safety_factor`` as a float can drift — even UPWARD, violating the "always round
+    # DOWN" safety guarantee. Use the float's exact rational so the ceiling is never larger than true.
+    ratio = Fraction(safety_factor)
+    return (rxd_claim_burial_blocks * reorg_cost_per_block * ratio.denominator) // ratio.numerator
+
+
 def _reserve_to_blocks(reserve: Timelock, block_interval_s: float) -> int:
     """Convert a REQUIREMENT/reserve Timelock to BLOCKS, rounding UP for a seconds-tagged value.
 
