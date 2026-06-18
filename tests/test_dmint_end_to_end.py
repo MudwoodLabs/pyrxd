@@ -460,25 +460,31 @@ class TestPrepareDmintDeploy:
         with pytest.raises(ValidationError, match="premine"):
             GlyphBuilder().prepare_dmint_deploy(params, allow_v2_deploy=True)
 
-    def test_rejects_epoch_deploy(self):
-        # EPOCH is disabled at deploy pending an upstream Photonic int64-overflow
-        # fix (the on-chain retarget bricks the contract). The bytecode + parser
-        # are retained, but DmintV2DeployParams refuses to construct an EPOCH deploy.
+    def test_epoch_deploy_re_enabled(self):
+        # EPOCH deploy is re-enabled: the upstream int64-overflow fix is merged
+        # (Radiant-Core/Photonic-Wallet#2 — divide-first + 2^48 clamp) and pyrxd
+        # byte-matches it. A valid EPOCH deploy (difficulty >= 32768 → target
+        # <= 2^48) builds; below the 2^48 floor is still rejected.
         from pyrxd.glyph.dmint import DaaMode
         from pyrxd.security.types import Hex20
 
-        with pytest.raises(ValidationError, match="EPOCH .*disabled"):
-            DmintV2DeployParams(
+        def _epoch(difficulty):
+            return DmintV2DeployParams(
                 metadata=self._META,
                 owner_pkh=Hex20(bytes(b"\x11" * 20)),
                 num_contracts=1,
                 max_height=1_000,
                 reward_photons=1_000,
-                difficulty=32768,
+                difficulty=difficulty,
                 daa_mode=DaaMode.EPOCH,
                 epoch_length=10,
                 max_adjustment_log2=2,
             )
+
+        result = GlyphBuilder().prepare_dmint_deploy(_epoch(32768), allow_v2_deploy=True)
+        assert isinstance(result, DmintV2DeployResult)
+        with pytest.raises(ValidationError, match="2\\^48|32768"):
+            GlyphBuilder().prepare_dmint_deploy(_epoch(10), allow_v2_deploy=True)
 
     def test_build_reveal_outputs_emits_value_1_v2_contracts(self):
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params(num_contracts=2), allow_v2_deploy=True)
@@ -702,16 +708,25 @@ class TestBuildDmintMintTx:
         assert result.updated_state.last_time == last_time + 7200
 
     def test_epoch_mint_retargets_at_boundary(self):
-        # EPOCH is now buildable + mintable (#219). At an epoch boundary the
-        # recreated target advances; the caller supplies epoch_length/max_adjustment
-        # (baked into the contract, not carried in the parsed state).
+        # EPOCH is now buildable + mintable (#219). At an epoch boundary a slow
+        # block eases difficulty → target advances. The retarget uses the merged
+        # canonical formula (Radiant-Core/Photonic-Wallet#2): divide-first with the
+        # target clamped to EPOCH_MAX_SAFE_TARGET (2^48) on both sides of the
+        # multiply, so target stays <= 2^48 (difficulty floor 32768).
+        epoch_cap = 1 << 48
         utxo = _make_contract_utxo(
             height=10, daa_mode=DaaMode.EPOCH, difficulty=100000, epoch_length=10, max_adjustment_log2=2
         )
         last_time = utxo.state.last_time
-        # delta = 4*targetTime (slow) → clamped to targetTime<<2 = 4*tt → target *4
+        tt = utxo.state.target_time
+        # delta = 240; clampedDelta = max(tt>>2, min(tt<<2, 240)) = 240 (4×tt, slow)
+        clamped = max(tt >> 2, min(tt << 2, 240))
+        target_capped = min(utxo.state.target, epoch_cap)
+        expected = max(1, min(epoch_cap, (target_capped // tt) * clamped))
         result = _mint(utxo, current_time=last_time + 240, epoch_length=10, max_adjustment_log2=2)
-        assert result.updated_state.target == min(utxo.state.target * 4, MAX_SHA256D_TARGET)
+        assert result.updated_state.target == expected
+        assert result.updated_state.target > utxo.state.target  # slow epoch eased difficulty
+        assert result.updated_state.target <= epoch_cap  # never drifts past 2^48
         assert result.updated_state.last_time == last_time + 240
 
     def test_epoch_mint_requires_params(self):
