@@ -14,13 +14,13 @@ between the hosts out-of-band. It is the first real exercise of untrusted-counte
 verification — and it is the *prep* for a genuine two-party adversarial run, not the
 run itself.
 
-> **PRE-AUDIT — regtest / testnet only.** This is the same unaudited HTLC swap primitive
-> described in [Build a cross-chain atomic swap](build-a-cross-chain-swap.md). **Do not
-> move real value.** RXD runs on a Radiant **regtest** node; ETH runs on a local **anvil**
-> or **Sepolia** (free testnet). The harness fails closed on any value-bearing network —
-> there is no mainnet wiring, and you must pass `--audit-cleared` even to *name* Sepolia.
-> An atomic swap's safety against a hostile counterparty is exactly what an external audit
-> certifies; until that gate clears, this is a learning/validation exercise only.
+> **Regtest / testnet exercise — unaudited swap stack.** This is the same HTLC swap primitive
+> described in [Build a cross-chain atomic swap](build-a-cross-chain-swap.md): open-source,
+> provided as-is, and not externally audited — **verify it yourself before moving real value.**
+> RXD runs on a Radiant **regtest** node; ETH runs on a local **anvil** or **Sepolia** (free
+> testnet). This harness has no mainnet wiring — you pass `--audit-cleared` even to *name*
+> Sepolia, an explicit opt-in for the value-bearing testnet. It's a two-party learning /
+> validation exercise.
 
 For the model behind the steps — the maker/taker roles, the `H = SHA256(p)` hashlock, and
 the `t_counterchain > t_rxd + margin` safety invariant — read
@@ -76,7 +76,7 @@ maker's advertised `covenant_spk_hex`.
   the covenant-funding and fee UTXOs in a regtest wallet. See the
   [quickstart](../tutorials/quickstart.md) for `pyrxd regtest setup` / `up`.
 - An **ETH endpoint**: a local `anvil` (`--eth-chain-id 31337`) or **Sepolia**
-  (`--eth-rpc-url …`, plus `--audit-cleared` to opt in to the pre-audit testnet run).
+  (`--eth-rpc-url …`, plus `--audit-cleared` to opt in to the value-bearing testnet run).
 - Each operator funds their **own** regtest fee UTXO (the covenant output carries the asset
   and cannot also pay the miner fee). Pass it per role via
   `--fee-txid/--fee-vout/--fee-value/--fee-spk-hex/--fee-wif`. The WIF stays local — it is

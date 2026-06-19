@@ -7,9 +7,10 @@ tour of what is real and proven today, with on-chain transactions you can open
 in a block explorer and runnable examples you can read.
 
 A note on honesty up front: every link below points either to a real on-chain
-transaction or to code in this repository. Where a capability is proven only by
-a small proof run — not by an external security audit — this page says so
-explicitly. Read those caveats before moving real value.
+transaction or to code in this repository. pyrxd is open-source software,
+provided as-is, without warranty — see the [LICENSE](../LICENSE). Where a
+capability is proven by a small proof run rather than at scale, this page says
+so explicitly, so verify it yourself before moving real value.
 
 ## Trustless cross-chain atomic swaps
 
@@ -37,13 +38,11 @@ Open any transaction in its explorer.
 value. **Every ETH leg was on the Ethereum Sepolia testnet — not Ethereum
 mainnet.**
 
-> **Pre-audit caveat — read this.** These were small "dust" / proof runs whose
-> only purpose was to demonstrate the mechanism on real chains. **They are not a
-> security proof and this is not production-ready.** A single-operator proof run
-> shows the plumbing works; it does not exercise an adversarial untrusted
-> counterparty, and an external security audit is the hard gate before moving
-> real value with someone you don't trust. Treat the cross-chain swap code as
-> pre-audit.
+> **What these runs prove (and don't).** These were small "dust" / proof runs
+> that demonstrate the mechanism on real chains: a single-operator run shows the
+> plumbing works end-to-end. It does not exercise an adversarial untrusted
+> counterparty at scale. The cross-chain swap stack is **unaudited — verify it
+> yourself before moving real value** with someone you don't trust.
 
 ### Build it
 
@@ -107,8 +106,8 @@ network to broadcast.
 - Concept: [`docs/concepts/partial-tx-swaps.md`](concepts/partial-tx-swaps.md).
 
 This same-chain swap API is implemented and unit-tested (including adversarial
-cases); as with every value-moving primitive here, treat an external audit as
-the gate before real-value, untrusted-counterparty use.
+cases). As with every value-moving primitive here, it is open-source and
+provided as-is — verify it against your own use before moving real value.
 
 ## Start building
 

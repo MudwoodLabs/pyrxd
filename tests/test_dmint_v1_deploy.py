@@ -721,13 +721,26 @@ class TestPrepareDmintDeployDispatch:
         assert isinstance(result, DmintV2DeployResult)
         assert not isinstance(result, DmintV1DeployResult)
 
-    def test_v2_default_refusal_unchanged(self):
-        """Footgun guard: V2 deploys still refused by default."""
-        from pyrxd.glyph.builder import GlyphBuilder
-        from pyrxd.security.errors import DmintError
+    def test_v2_deploys_by_default(self):
+        """0.9.0: V2 deploys by default (consensus-proven on regtest + mainnet, #219).
+        ``allow_v2_deploy`` defaults to True and no longer blocks."""
+        from pyrxd.glyph.builder import DmintV2DeployResult, GlyphBuilder
 
-        with pytest.raises(DmintError, match="allow_v2_deploy"):
-            GlyphBuilder().prepare_dmint_deploy(self._v2_params())
+        result = GlyphBuilder().prepare_dmint_deploy(self._v2_params())
+        assert isinstance(result, DmintV2DeployResult)
+
+    def test_v2_explicit_optout_warns_but_proceeds(self):
+        """0.9.0: passing allow_v2_deploy=False no longer refuses — it emits a soft
+        warning and proceeds (the historical opt-out path stays observable)."""
+        import warnings
+
+        from pyrxd.glyph.builder import DmintV2DeployResult, GlyphBuilder
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = GlyphBuilder().prepare_dmint_deploy(self._v2_params(), allow_v2_deploy=False)
+        assert isinstance(result, DmintV2DeployResult)
+        assert any("allow_v2_deploy=False" in str(w.message) for w in caught)
 
     def test_v1_no_allow_v2_deploy_needed(self):
         """V1 deploys do NOT require the V2 opt-in flag — they are the

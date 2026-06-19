@@ -555,14 +555,34 @@ async def test_sidecar_resolver_none_without_sidecar(tmp_path):
     assert await resolve("s1", None) is None  # no sidecar for this swap → None (dormant)
 
 
-async def test_sidecar_resolver_loads_and_audit_gates(tmp_path):
+async def test_sidecar_resolver_loads_and_builds_leg_on_mainnet(tmp_path):
+    # 0.9.0: the audit gate is non-blocking. The resolver loads the sidecar and
+    # builds a live per-swap leg on a value-bearing network ("bc") without an
+    # explicit opt-in — proving the build is attempted and now succeeds.
+    from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+
+    class _Client:
+        async def broadcast(self, raw):
+            return "dd" * 32
+
+        async def get_transaction_verbose(self, txid):
+            return {"confirmations": 1}
+
+        async def get_utxos(self, script_hash):
+            return []
+
+    class _FeeSource:
+        def next_fee_input(self):  # pragma: no cover - not exercised here
+            raise NotImplementedError
+
     ctx = CovenantClaimContext(swap_id="s1", taker_pkh=b"\x11" * 20, maker_pkh=b"\x22" * 20)
     (tmp_path / "s1.claim.json").write_text(json.dumps(ctx.to_dict()))
-    # network "bc" without audit_cleared → the leg's require_audit_cleared raises (dormant by the audit
-    # gate) — proving the resolver loaded the sidecar and attempted the per-swap leg build with it.
-    resolve = sidecar_leg_resolver(tmp_path, chain_io=None, fee_source=None, network="bc", audit_cleared=False)
-    with pytest.raises(ValidationError):
-        await resolve("s1", None)
+    resolve = sidecar_leg_resolver(
+        tmp_path, chain_io=RadiantChainIO(_Client()), fee_source=_FeeSource(), network="bc", audit_cleared=False
+    )
+    leg = await resolve("s1", None)
+    assert isinstance(leg, RadiantCovenantLeg)
+    assert leg.network == "bc"
 
 
 def test_decision_rejects_claim_flag_on_non_page_claim():

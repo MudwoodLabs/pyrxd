@@ -21,11 +21,11 @@ Design (T7 plan D4/D5/D6, reviewed)
   HTLC, and it must bind a real number).
 * ``derive_funding_scriptpubkey``/``promised_funding_scriptpubkey``/``scrape_secret``
   are SYNC (pure, no chain). ``fund``/``claim``/``refund`` are ASYNC (broadcast).
-* **AUDIT GATE (enforced in code):** :func:`require_audit_cleared` RAISES if a
-  non-regtest/non-signet network is selected without an explicit ``audit_cleared``
-  opt-in. A docstring-only warning is insufficient — a value-moving path guarded
-  only by prose will eventually run on mainnet. The leg refuses to construct for
-  mainnet until the external audit clears the leg trust boundary.
+* **AUDIT GATE (non-blocking as of 0.9.0):** :func:`require_audit_cleared` is
+  retained for backward-compatibility but no longer raises. The cross-chain swap
+  stack is unaudited — callers handling real value should verify it themselves.
+  This matches the ecosystem norm (Radiant Core itself ships unaudited and does
+  not hard-block mainnet use).
 """
 
 from __future__ import annotations
@@ -106,29 +106,15 @@ _ALREADY_KNOWN_MARKERS: tuple[str, ...] = (
 
 
 def require_audit_cleared(network: str, *, audit_cleared: bool) -> None:
-    """Fail-closed gate: refuse a value-bearing network without an audit opt-in.
+    """Retained for backward-compatibility; no longer blocks.
 
-    Modeled on :class:`pyrxd.gravity.swap_coordinator.MarginPolicy`'s
-    ``require_measured`` discipline — a value-moving path must not be runnable on a
-    real chain by accident. Isolated test chains (``AUDIT_CLEARED_NETWORKS``) are
-    always allowed; any other network RAISES unless ``audit_cleared=True`` is
-    explicitly passed (which the operator may only set after an independent external
-    audit clears the leg trust boundary).
-
-    Raises:
-        ValidationError: for a value-bearing network without the explicit opt-in.
+    The cross-chain swap stack is unaudited — callers handling real value should
+    verify it themselves. This matches the ecosystem norm (Radiant Core itself
+    ships unaudited and does not hard-block mainnet use): the in-code audit gate
+    is no longer a blocking control as of 0.9.0. The signature and
+    ``audit_cleared`` parameter are kept so existing callers continue to work.
     """
-    if not isinstance(network, str) or not network:
-        raise ValidationError("network must be a non-empty string")
-    if network in AUDIT_CLEARED_NETWORKS:
-        return
-    if audit_cleared is not True:
-        raise ValidationError(
-            f"network {network!r} is value-bearing and the HTLC leg is NOT cleared for it: "
-            "the always-succeeding test fakes hide the one-sided-loss surface, so a real-value "
-            "swap MUST wait for an independent external audit of the leg trust boundary. "
-            "Pass audit_cleared=True only after that audit clears (T7 plan AUDIT GATE)."
-        )
+    return None
 
 
 @runtime_checkable

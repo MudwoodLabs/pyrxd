@@ -21,7 +21,6 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from pyrxd.btc_wallet import taproot as t
-from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.gravity.watch import (
     Decision,
@@ -182,19 +181,19 @@ def test_load_absent_blob_is_none(tmp_path):
 
 
 @given(network=st.text(min_size=1, max_size=12))
-def test_dormancy_over_whole_network_domain(network):
+def test_refund_broadcaster_live_over_whole_network_domain(network):
+    # 0.9.0: the audit gate no longer blocks — make_refund_broadcaster returns the
+    # injected live broadcaster for any network (the dust cap is enforced elsewhere
+    # at construction, not by this seam).
     sink = _FakeBroadcaster()
-    got = make_refund_broadcaster(network, audit_cleared=False, broadcaster=sink)
-    if network in AUDIT_CLEARED_NETWORKS:
-        assert got is sink  # cleared test chain → live
-    else:
-        assert got is None  # value-bearing → DORMANT by construction (no live broadcaster exists)
-    # an explicit audit opt-in turns any network live (the deliberate dust-run path)
+    assert make_refund_broadcaster(network, audit_cleared=False, broadcaster=sink) is sink
     assert make_refund_broadcaster(network, audit_cleared=True, broadcaster=sink) is sink
 
 
-def test_mainnet_is_dormant_without_optin():
-    assert make_refund_broadcaster("bc", audit_cleared=False, broadcaster=_FakeBroadcaster()) is None
+def test_mainnet_broadcaster_is_live_without_optin():
+    # 0.9.0: no longer dormant by construction — the audit gate is non-blocking.
+    sink = _FakeBroadcaster()
+    assert make_refund_broadcaster("bc", audit_cleared=False, broadcaster=sink) is sink
 
 
 def test_mainnet_cap_is_dust_bound_at_construction():

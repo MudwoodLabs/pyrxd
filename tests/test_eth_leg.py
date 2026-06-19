@@ -78,10 +78,11 @@ def test_ctor_rejects_non_contract_leg_and_bad_args():
         )
 
 
-def test_audit_gate_blocks_unaudited_value_network():
-    with pytest.raises(ValidationError):
-        _eth_leg(network="mainnet", audit_cleared=False)
-    # an explicit audit opt-in clears it
+def test_audit_gate_no_longer_blocks_value_network():
+    # 0.9.0: the audit gate is retained for backward-compat but no longer raises —
+    # the leg constructs on a value-bearing network with or without the opt-in.
+    leg = _eth_leg(network="mainnet", audit_cleared=False)
+    assert leg.network == "mainnet"
     leg = _eth_leg(network="mainnet", audit_cleared=True)
     assert leg.network == "mainnet"
 

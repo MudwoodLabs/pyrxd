@@ -4,6 +4,36 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — 2026-06-18
+
+Posture + documentation release. pyrxd's maturity framing is now consistent
+with the rest of the Radiant ecosystem: it is **open-source software provided
+as-is, without warranty** (Apache 2.0), like Radiant Core itself — rather than singling
+itself out as uniquely pre-audit. No new features; no breaking API changes.
+
+### Changed
+
+- **Audit gates are now advisory, not blocking.** The code-enforced gates that
+  previously raised on value-bearing networks no longer hard-block mainnet /
+  real-value use — pyrxd does what you tell it, consistent with running a Radiant
+  node. `require_audit_cleared` and `require_spv_sole_authority_cleared` are
+  retained as no-ops for backward compatibility (callers passing `audit_cleared=`
+  are unaffected), and dMint V2 deploy no longer requires the `allow_v2_deploy`
+  opt-in. **The cross-chain swap stack remains unaudited — verify it yourself
+  before moving real value.**
+- **Maturity language aligned to the standard open-source posture** across the
+  README and docs (the Apache-2.0 "as-is, no warranty" disclaimer is the operative one).
+
+### Documentation
+
+- Tutorials refreshed and verified end-to-end on regtest. Fixes: a wallet-load
+  crash in "your first Radiant transaction" (`str` → `Path`); the `GlyphMedia`
+  import path; the FT **token ref is the commit outpoint** (not the reveal txid);
+  the bundled parallel miner ships and is the default for `claim-dmint` (was
+  documented as "bring your own"); stale `0.5.0` version pins → `0.8.0`; and the
+  new `pyrxd wallet send` CLI is surfaced. The "inspect a transaction" supply
+  math and output-badge counts corrected.
+
 ## [0.8.0] — 2026-06-18
 
 Feature release on top of 0.7.0 — 56 commits. The headline is **full,

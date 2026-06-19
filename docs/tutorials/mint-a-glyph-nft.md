@@ -9,16 +9,23 @@ without a funded wallet on day one — the script will stop before
 broadcasting and print the transactions instead. The last section
 explains how to flip to a real wallet.
 
+> **Note on the referenced demo.** The snippets pasted on this page are
+> synthetic-safe and run with no funds. The full reference script
+> [`examples/glyph_mint_demo.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/glyph_mint_demo.py)
+> is different: it **requires** a funded `GLYPH_WIF` and fetches mainnet
+> UTXOs, and exits early if you run it without them. Read it for the
+> transaction-assembly plumbing, but don't expect it to run key-free.
+
 **Prerequisites**
 
-- pyrxd 0.5.0 (`pip install "pyrxd>=0.5.0"`)
+- pyrxd 0.8.0 (`pip install "pyrxd>=0.8.0"`)
 - Python 3.11+
 - `websockets` (`pip install websockets`) — only needed if you actually
   fetch UTXOs or broadcast
 
 If you have not yet built a first Radiant transaction with pyrxd, the
-[examples directory](https://github.com/MudwoodLabs/pyrxd/tree/main/examples)
-has shorter end-to-end demos that may be a gentler starting point. This
+[your first Radiant transaction](your-first-radiant-transaction.md)
+tutorial is a gentler starting point. This
 page assumes you can read a script that builds a `Transaction` from
 inputs and outputs.
 
@@ -68,7 +75,7 @@ To attach an inline image (or any other media payload), construct a
 `GlyphMedia` and pass it as `main`:
 
 ```python
-from pyrxd.glyph import GlyphMedia
+from pyrxd.glyph.types import GlyphMedia
 
 with open("nft.webp", "rb") as f:
     image_bytes = f.read()

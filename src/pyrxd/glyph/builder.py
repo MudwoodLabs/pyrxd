@@ -5,7 +5,7 @@ from typing import Any, overload
 
 import cbor2
 
-from pyrxd.security.errors import DmintError, ValidationError
+from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
 
 from .dmint import (
@@ -306,7 +306,7 @@ class GlyphBuilder:
         self,
         params: DmintV1DeployParams | DmintV2DeployParams,
         *,
-        allow_v2_deploy: bool = False,
+        allow_v2_deploy: bool = True,
     ) -> DmintV1DeployResult | DmintV2DeployResult:
         """Prepare a dMint token deploy.
 
@@ -317,21 +317,20 @@ class GlyphBuilder:
           a443d9df…878b). Two-tx deploy: commit + reveal (the reveal
           directly creates ``params.num_contracts`` parallel contract UTXOs).
 
-        * :class:`DmintV2DeployParams` → returns :class:`DmintV2DeployResult`,
-          but only if the caller passes ``allow_v2_deploy=True``. V2 has
-          no live mainnet contracts; no ecosystem miner (glyph-miner,
-          RXinDexer, Photonic explorer) targets V2. Refusing by default
-          prevents deploying tokens nobody can mine.
+        * :class:`DmintV2DeployParams` → returns :class:`DmintV2DeployResult`.
+          V2 is consensus-proven on regtest + mainnet (#219) and now deploys
+          by default (``allow_v2_deploy=True``). A soft :class:`UserWarning` is
+          emitted if the caller explicitly passes ``allow_v2_deploy=False`` so
+          the historical opt-out path stays observable without blocking.
 
         :param params: Either :class:`DmintV1DeployParams` (V1 deploy) or
-            :class:`DmintV2DeployParams` (V2 deploy, requires
-            ``allow_v2_deploy=True``). The deprecated
+            :class:`DmintV2DeployParams` (V2 deploy). The deprecated
             :class:`DmintFullDeployParams` is accepted (it's a subclass of
             ``DmintV2DeployParams``) but emits a ``DeprecationWarning`` at
             construction time.
-        :param allow_v2_deploy: Must be ``True`` to deploy V2. Ignored for V1.
+        :param allow_v2_deploy: Retained for backward-compatibility; defaults to
+            ``True`` (V2 deploys by default). Ignored for V1.
         :returns: V1 or V2 result, matching the param type via ``@overload``.
-        :raises DmintError: V2 path without ``allow_v2_deploy=True``.
         :raises ValidationError: Various per-version invariants — see
             :meth:`_prepare_dmint_v1_deploy` and the V2 implementation
             below for specifics.
@@ -463,13 +462,19 @@ class GlyphBuilder:
         only in the V2 contract bytecode. Gated on ``allow_v2_deploy``.
         """
         if not allow_v2_deploy:
-            raise DmintError(
-                "prepare_dmint_deploy with DmintV2DeployParams emits V2 dMint "
-                "contracts; no ecosystem miner (glyph-miner, etc.) targets V2 "
-                "and indexer behavior on V2 deploys is empirically unknown. "
-                "Refusing by default. For V1 (the only live mainnet format), pass "
-                "DmintV1DeployParams instead. To deploy V2 anyway (e.g. SDK-internal "
-                "testing or regtest), pass allow_v2_deploy=True."
+            # Non-blocking as of 0.9.0: V2 is consensus-proven on regtest +
+            # mainnet (#219). The historical opt-out (allow_v2_deploy=False) no
+            # longer refuses — it only emits a soft warning so the deliberate
+            # opt-out path stays observable.
+            import warnings
+
+            warnings.warn(
+                "prepare_dmint_deploy was called with allow_v2_deploy=False for a "
+                "DmintV2DeployParams; V2 deploy is no longer blocked (consensus-proven "
+                "on regtest + mainnet, #219) and proceeds anyway. Drop the "
+                "allow_v2_deploy=False argument to silence this warning.",
+                UserWarning,
+                stacklevel=2,
             )
         if params.premine_amount is not None:
             raise ValidationError(
@@ -956,7 +961,8 @@ class DmintV2DeployParams:
     EPOCH/LWMA int64-overflow fix, Radiant-Core/Photonic-Wallet#2). See #219.
 
     V2 is consensus-proven on regtest + mainnet but still pre-external-audit;
-    ``prepare_dmint_deploy`` requires ``allow_v2_deploy=True`` as a deliberate opt-in.
+    ``prepare_dmint_deploy`` deploys V2 by default as of 0.9.0 (``allow_v2_deploy``
+    defaults to ``True`` and is retained only for backward-compatibility).
 
     :param metadata:        :class:`GlyphMetadata` (must include ``GlyphProtocol.FT``
         and ``GlyphProtocol.DMINT``; set ``version=2`` so indexers classify it as V2).

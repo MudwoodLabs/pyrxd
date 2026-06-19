@@ -172,15 +172,17 @@ def test_seen_store_reserve_is_atomic_test_and_set():
 # --------------------------------------------------------------------------- audit gate
 
 
-def test_leg_refuses_mainnet_without_optin():
-    with pytest.raises(ValidationError, match="value-bearing"):
-        RadiantCovenantLeg(
-            network="rxd",
-            taker_pkh=_TAKER_PKH,
-            maker_pkh=_MAKER_PKH,
-            chain_io=RadiantChainIO(FakeClient()),
-            fee_source=FakeFeeSource(),
-        )
+def test_leg_constructs_on_mainnet_without_optin():
+    # 0.9.0: the audit gate is retained for backward-compat but no longer raises —
+    # the leg constructs on a value-bearing network without the opt-in.
+    leg = RadiantCovenantLeg(
+        network="rxd",
+        taker_pkh=_TAKER_PKH,
+        maker_pkh=_MAKER_PKH,
+        chain_io=RadiantChainIO(FakeClient()),
+        fee_source=FakeFeeSource(),
+    )
+    assert leg.network == "rxd"
 
 
 # --------------------------------------------------------------------------- covenant SPK binding

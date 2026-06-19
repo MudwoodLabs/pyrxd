@@ -98,9 +98,9 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "SwapTerms": ("pyrxd.swap", "SwapTerms"),
     "accept_offer": ("pyrxd.swap", "accept_offer"),
     "create_offer": ("pyrxd.swap", "create_offer"),
-    # Cross-chain atomic swap — pyrxd.gravity HTLC primitive (BTC/ETH↔RXD). PRE-AUDIT:
-    # proven on regtest + dust mainnet, but NOT externally audited — regtest/testnet only,
-    # no real value, until the audit gate clears. See docs/how-to/build-a-cross-chain-swap.md.
+    # Cross-chain atomic swap — pyrxd.gravity HTLC primitive (BTC/ETH↔RXD). Proven on
+    # regtest + small real-value (dust) mainnet runs; this stack is unaudited — verify it
+    # yourself before moving real value. See docs/how-to/build-a-cross-chain-swap.md.
     "SwapCoordinator": ("pyrxd.gravity.swap_coordinator", "SwapCoordinator"),
     "CoordinatorConfig": ("pyrxd.gravity.swap_coordinator", "CoordinatorConfig"),
     "MarginPolicy": ("pyrxd.gravity.swap_coordinator", "MarginPolicy"),
@@ -117,8 +117,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "KNOWN_EVM_CHAINS": ("pyrxd.eth_wallet.chains", "KNOWN_EVM_CHAINS"),
     "PowChain": ("pyrxd.btc_wallet.chains", "PowChain"),
     "KNOWN_POW_CHAINS": ("pyrxd.btc_wallet.chains", "KNOWN_POW_CHAINS"),
-    # Covenant building blocks (docs/concepts/covenant-building-blocks.md). PRE-AUDIT:
-    # consensus-validated on regtest (several mainnet-proven), not externally audited.
+    # Covenant building blocks (docs/concepts/covenant-building-blocks.md):
+    # consensus-validated on regtest (several mainnet-proven); unaudited.
     "HtlcCovenant": ("pyrxd.gravity.htlc_covenant", "HtlcCovenant"),
     "build_htlc_covenant_rxd": ("pyrxd.gravity.htlc_covenant", "build_htlc_covenant_rxd"),
     "build_htlc_covenant_ft": ("pyrxd.gravity.htlc_covenant", "build_htlc_covenant_ft"),

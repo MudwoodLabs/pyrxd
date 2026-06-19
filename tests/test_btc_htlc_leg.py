@@ -129,24 +129,20 @@ def test_audit_gate_allows_test_chains():
         require_audit_cleared(net, audit_cleared=False)  # no raise
 
 
-def test_audit_gate_refuses_mainnet_without_optin():
-    with pytest.raises(ValidationError, match="value-bearing"):
-        require_audit_cleared("bc", audit_cleared=False)
+def test_audit_gate_no_longer_blocks_mainnet_without_optin():
+    # 0.9.0: the audit gate is retained for backward-compat but no longer raises.
+    require_audit_cleared("bc", audit_cleared=False)  # no raise
 
 
 def test_audit_gate_allows_mainnet_with_explicit_optin():
     require_audit_cleared("bc", audit_cleared=True)  # no raise
 
 
-def test_audit_gate_rejects_empty_network():
-    with pytest.raises(ValidationError, match="non-empty"):
-        require_audit_cleared("", audit_cleared=True)
-
-
-def test_leg_ctor_refuses_mainnet_without_optin():
+def test_leg_ctor_constructs_on_mainnet_without_optin():
+    # 0.9.0: the leg no longer refuses to construct for a value-bearing network.
     taker, maker = generate_keypair("bc"), generate_keypair("bc")
-    with pytest.raises(ValidationError, match="value-bearing"):
-        _leg(taker_kp=taker, maker_kp=maker, network="bc")
+    leg = _leg(taker_kp=taker, maker_kp=maker, network="bc")
+    assert leg.network == "bc"
 
 
 # --------------------------------------------------------------------------- SPK derivation

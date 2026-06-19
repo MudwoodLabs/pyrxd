@@ -7,10 +7,11 @@ audit a moving `main`) · **Companion docs:** [`threat-model.md`](threat-model.m
 This brief tells an external auditor **what to audit, what is deliberately out of scope, the
 assumptions the code is allowed to make, and the complete register of accepted/known residual
 risks** — consolidated from the threat model, the design-decision notes, and the in-code
-residual notes so the audit reviews a *stated* boundary rather than rediscovering it. It is the
-deliverable that flips the project's standing hard gate: **the entire cross-chain swap stack is
-structurally barred from mainnet by `require_audit_cleared` until an audit clears it** — the
-auditor is effectively the gate that may flip `audit_cleared=True`.
+residual notes so the audit reviews a *stated* boundary rather than rediscovering it. pyrxd is
+open-source software, provided as-is under the [LICENSE](../LICENSE); the cross-chain swap stack
+is **unaudited**, and this brief is the deliverable that lets an independent review certify it.
+The code defaults the swap legs to test networks via `require_audit_cleared` (a fail-closed
+opt-in), so an audit's sign-off is the natural trigger to set `audit_cleared=True` for mainnet.
 
 ## 0. How to use this brief
 
@@ -19,7 +20,7 @@ auditor is effectively the gate that may flip `audit_cleared=True`.
   `R1`, `F-01`), the legacy id is noted — the legacy numbering has known collisions (see §7).
 - **Severity** is the *pre-mitigation* class; **Status** is `open` / `mitigated` (a control
   exists) / `accepted` (a conscious residual) / `deferred` (a feature not built) / `gate` (a
-  fail-closed opt-in that bars the risk pre-audit).
+  fail-closed opt-in that defaults the risk off until consciously enabled).
 - Start at §5 (priority targets) for where the return-on-review is highest.
 
 ## 1. Scope — what to audit
@@ -64,21 +65,21 @@ The audit should accept or challenge these explicitly — the code's safety argu
 - **`ASSUME-CAPFEE-ISOLATION`.** `CappedFeeWalletSource`'s structural ceiling is real **only if**
   the operator funds it from a key isolated from the main wallet (the class validates P2PKH +
   wif-control + the cap, but cannot verify key isolation). See `CAPFEE-ISOLATION`.
-- **`ASSUME-PRE-AUDIT-GATE`.** The whole HTLC swap is barred from mainnet by `require_audit_cleared`
+- **`ASSUME-PRE-AUDIT-GATE`.** The HTLC swap defaults to test networks via `require_audit_cleared`
   (`AUDIT_CLEARED_NETWORKS = {bcrt, regtest, tb, signet, rltc, tltc}`), and covenant-less SPV
-  value-release is barred by `require_spv_sole_authority_cleared`. No mainnet real-value swap has
-  the audit opt-in set.
+  value-release defaults off via `require_spv_sole_authority_cleared`. Both are advisory
+  fail-closed opt-ins — mainnet use requires consciously setting the opt-in.
 - **`ASSUME-WATCH-ALERT-ONLY`.** The watchtower core is **alert-only and keyless**; it never
   touches the preimage `p`. The sole autonomous action (v2 BTC refund) is dormant-by-construction
   + dust-capped (10 000 sats). R1's closure therefore rests on **taker/operator liveness within
   `t_rxd`**, not on automation — any "watchtower auto-claim" description is wrong against the code.
 
-## 4. Pre-audit fail-closed gates
+## 4. Fail-closed opt-in gates
 
-The code refuses value-bearing operation unless an explicit opt-in is set — these are the
-seams the audit certifies before they may be flipped:
+The code defaults value-bearing operation off unless an explicit opt-in is set — these are the
+seams an audit would certify before they are enabled:
 
-| Gate | Bars | Where |
+| Gate | Defaults off | Where |
 |---|---|---|
 | `require_audit_cleared` / `AUDIT_CLEARED_NETWORKS` | any mainnet swap leg | `btc_wallet/htlc_leg.py`, `gravity/radiant_leg.py` |
 | `require_spv_sole_authority_cleared` | covenant-less SPV value-release | `spv/proof.py` |
@@ -183,7 +184,7 @@ code docstring (the brief's value-add — these would otherwise be missed).
 ### 6.8 Supply chain / process / deferred
 | ID | Sev | Status | Residual | Where / legacy |
 |---|---|---|---|---|
-| `PROC-NO-AUDIT` | high | open | No external eyes — solo developer; the standing hard gate (this brief exists to lift it) | TM gap #1 / #20 |
+| `PROC-NO-AUDIT` | high | open | No external eyes — solo developer; an independent review is the natural next step for the swap stack (this brief scopes it) | TM gap #1 / #20 |
 | `SUPPLY-COINCURVE` | critical | accepted | Backdoored `coincurve` release would compromise every signature; major-range pin + `pip-audit` only | TM S11 |
 | `SUPPLY-NOPIN` | medium | accepted | No pinned transitive dep hashes — deliberate for a *library* | TM gap #15 |
 | `SUPPLY-GPGTAG` | low | open | PEP 740 attestations + SBOM now ship; a gpg-signed git tag is still optional | TM gap #17 |

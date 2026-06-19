@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg0: #0a0e1a; --bg1: #111a2e; --card: #16203a;
+    --accent: #2dd4bf; --accent2: #38bdf8; --gold: #fbbf24;
+    --ink: #e9eef7; --muted: #9fb0c9; --line: rgba(255,255,255,.08);
+  }
+  html, body { width: 1200px; height: 720px; }
+  body {
+    font-family: -apple-system, "Segoe UI", Inter, Roboto, sans-serif;
+    color: var(--ink);
+    background:
+      radial-gradient(900px 520px at 88% -12%, rgba(45,212,191,.18), transparent 60%),
+      radial-gradient(760px 520px at 3% 112%, rgba(56,189,248,.16), transparent 55%),
+      linear-gradient(160deg, var(--bg1), var(--bg0));
+    padding: 44px 56px; position: relative; overflow: hidden;
+  }
+  .grid-dots { position:absolute; inset:0; background-image: radial-gradient(rgba(255,255,255,.04) 1px, transparent 1px); background-size: 26px 26px; pointer-events:none; }
+  header { display:flex; align-items:center; justify-content:space-between; }
+  .brand { display:flex; align-items:baseline; gap:16px; }
+  .logo { font-size:54px; font-weight:800; letter-spacing:-2px; background:linear-gradient(92deg,var(--accent),var(--accent2)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .logo .x { color:var(--gold); -webkit-text-fill-color:var(--gold); }
+  .ver { font:600 15px/1 ui-monospace, monospace; color:var(--accent); border:1px solid rgba(45,212,191,.4); padding:7px 11px; border-radius:999px; background:rgba(45,212,191,.08); }
+  .kicker { text-align:right; color:var(--muted); font-size:15px; } .kicker b { color:var(--ink); }
+  h1 { font-size:44px; font-weight:800; letter-spacing:-1.2px; margin:22px 0 5px; }
+  h1 .hl { background:linear-gradient(92deg,var(--accent),var(--accent2)); -webkit-background-clip:text; background-clip:text; color:transparent; }
+  .sub { color:var(--muted); font-size:17px; max-width:820px; }
+  .tiles { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; margin:24px 0 18px; }
+  .tile { background:linear-gradient(180deg,var(--card),rgba(22,32,58,.55)); border:1px solid var(--line); border-radius:16px; padding:17px 18px 15px; }
+  .tile .ic { font-size:24px; } .tile .t { font-weight:700; font-size:16px; margin-top:9px; } .tile .d { color:var(--muted); font-size:13px; margin-top:3px; line-height:1.35; }
+  .strip { display:flex; align-items:center; gap:14px; border-radius:14px; padding:13px 18px; margin-bottom:12px; }
+  .strip.dmint { background:linear-gradient(92deg, rgba(251,191,36,.12), rgba(45,212,191,.08)); border:1px solid rgba(251,191,36,.28); }
+  .strip.xchain { background:linear-gradient(92deg, rgba(56,189,248,.13), rgba(45,212,191,.10)); border:1px solid rgba(56,189,248,.30); }
+  .badge { font:700 11px/1 ui-monospace,monospace; padding:6px 10px; border-radius:999px; white-space:nowrap; }
+  .badge.gold { color:#0a0e1a; background:var(--gold); } .badge.blue { color:#0a0e1a; background:var(--accent2); }
+  .strip .txt { font-size:14.5px; } .strip .txt b { color:var(--ink); }
+  .chains { display:flex; gap:7px; flex-wrap:wrap; align-items:center; }
+  .chip { font:600 12.5px/1 -apple-system,"Segoe UI",sans-serif; color:var(--ink); background:rgba(255,255,255,.06); border:1px solid var(--line); padding:6px 11px; border-radius:999px; }
+  .chip.rxd { background:rgba(45,212,191,.16); border-color:rgba(45,212,191,.4); color:var(--accent); font-weight:800; }
+  .arrow { color:var(--muted); font-size:15px; }
+  .row { display:flex; align-items:center; justify-content:space-between; margin-top:18px; }
+  .install { font:600 19px/1 ui-monospace, monospace; color:var(--ink); background:#0a0e1a; border:1px solid var(--line); border-radius:12px; padding:15px 22px; }
+  .install .p { color:var(--accent); }
+  .maturity { text-align:right; font-size:13px; color:var(--muted); line-height:1.5; }
+  .maturity .ok { color:var(--accent); font-weight:700; } .maturity .exp { color:var(--gold); font-weight:700; }
+  footer { position:absolute; left:56px; right:56px; bottom:28px; display:flex; gap:24px; color:var(--muted); font-size:14px; border-top:1px solid var(--line); padding-top:14px; }
+  footer b { color:var(--ink); }
+</style>
+</head>
+<body>
+  <div class="grid-dots"></div>
+  <header>
+    <div class="brand"><div class="logo">pyr<span class="x">x</span>d</div><span class="ver">v0.9.0 · PyPI</span></div>
+    <div class="kicker">open-source <b>Python SDK</b><br>for the <b>Radiant</b> blockchain</div>
+  </header>
+
+  <h1>Build on Radiant — <span class="hl">in Python.</span></h1>
+  <div class="sub">Wallets, tokens, SPV — and trustless cross-chain atomic swaps across <b>7 chains</b>, no bridge, no custodian.</div>
+
+  <div class="tiles">
+    <div class="tile"><div class="ic">💼</div><div class="t">Wallets &amp; Transactions</div><div class="d">HD wallets, tx building, ElectrumX, SPV proofs</div></div>
+    <div class="tile"><div class="ic">🪙</div><div class="t">Glyph Tokens</div><div class="d">NFT · FT · dMint — mint, transfer, deploy from code</div></div>
+    <div class="tile"><div class="ic">🛡️</div><div class="t">Soulbound &amp; Covenants</div><div class="d">consensus-enforced covenants, credential gating</div></div>
+  </div>
+
+  <div class="strip dmint">
+    <span class="badge gold">✅ MAINNET-PROVEN</span>
+    <span class="txt"><b>dMint V2</b> — PoW distributed mint, all 5 difficulty modes (FIXED · ASERT · LWMA · EPOCH · SCHEDULE), byte-matched to canonical Photonic.</span>
+  </div>
+
+  <div class="strip xchain">
+    <span class="badge blue">🌉 CROSS-CHAIN</span>
+    <div class="chains">
+      <span class="chip rxd">RXD</span><span class="arrow">↔</span>
+      <span class="chip">₿ Bitcoin</span><span class="chip">Ł Litecoin</span><span class="chip">◇ Ethereum</span><span class="chip">🔵 Base</span><span class="chip">🔴 Optimism</span><span class="chip">🔷 Arbitrum</span><span class="chip">▪ Linea</span>
+    </div>
+  </div>
+
+  <div class="row">
+    <div class="install"><span class="p">pip install</span> pyrxd</div>
+    <div class="maturity"><span class="ok">Open source · Apache 2.0</span> — provided as-is, no warranty<br><span class="exp">Cross-chain swaps are unaudited</span> — verify before moving real value</div>
+  </div>
+
+  <footer>
+    <div>📦 <b>pypi.org/project/pyrxd</b></div>
+    <div>📚 <b>mudwoodlabs.github.io/pyrxd</b></div>
+    <div>🎓 <b>/tutorials</b></div>
+    <div>💻 <b>github.com/MudwoodLabs/pyrxd</b></div>
+  </footer>
+</body>
+</html>

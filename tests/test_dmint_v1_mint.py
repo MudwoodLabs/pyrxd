@@ -51,7 +51,6 @@ from pyrxd.glyph.dmint import (
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.security.errors import (
     ContractExhaustedError,
-    DmintError,
     InvalidFundingUtxoError,
     MaxAttemptsError,
     PoolTooSmallError,
@@ -1666,45 +1665,48 @@ class TestFindDmintFundingUtxo:
 # ---------------------------------------------------------------------------
 
 
-class TestPrepareDmintDeployV2Refusal:
-    """V2 deploy is refused unless the caller passes `allow_v2_deploy=True`.
+class TestPrepareDmintDeployV2Default:
+    """0.9.0: V2 deploy proceeds by default (``allow_v2_deploy`` defaults to True).
 
-    A `DeprecationWarning` is too soft because Python filters
-    DeprecationWarning by default outside `__main__` — a library user calling
-    `prepare_dmint_deploy` from their own script sees nothing and gets a
-    deployable result, accidentally shipping a token no ecosystem miner
-    can claim. The hard refusal is the load-bearing footgun guard.
+    V2 is consensus-proven on regtest + mainnet (#219), so the historical hard
+    refusal was relaxed to a non-blocking default. ``allow_v2_deploy`` is retained
+    for backward-compat; passing it ``False`` emits a soft warning but still
+    proceeds.
     """
 
     @staticmethod
     def _params():
+        import warnings
+
         from pyrxd.glyph.builder import DmintFullDeployParams
         from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
         from pyrxd.security.types import Hex20
 
-        return DmintFullDeployParams(
-            metadata=GlyphMetadata(
-                protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
-                name="TEST",
-                ticker="TST",
-            ),
-            owner_pkh=Hex20(bytes(20)),
-            num_contracts=1,
-            max_height=1000,
-            reward_photons=1000,
-            difficulty=10,
-        )
+        with warnings.catch_warnings():
+            # DmintFullDeployParams is a deprecated alias; not the subject here.
+            warnings.simplefilter("ignore", DeprecationWarning)
+            return DmintFullDeployParams(
+                metadata=GlyphMetadata(
+                    protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
+                    name="TEST",
+                    ticker="TST",
+                ),
+                owner_pkh=Hex20(bytes(20)),
+                num_contracts=1,
+                max_height=1000,
+                reward_photons=1000,
+                difficulty=10,
+            )
 
-    def test_default_call_raises_dmint_error(self):
-        from pyrxd.glyph.builder import GlyphBuilder
+    def test_default_call_succeeds(self):
+        from pyrxd.glyph.builder import DmintV2DeployResult, GlyphBuilder
 
         builder = GlyphBuilder()
-        with pytest.raises(DmintError, match="allow_v2_deploy"):
-            builder.prepare_dmint_deploy(self._params())
+        result = builder.prepare_dmint_deploy(self._params())
+        assert isinstance(result, DmintV2DeployResult)
 
     def test_explicit_opt_in_succeeds(self):
-        """allow_v2_deploy=True bypasses the guard so SDK-internal V2 tests
-        and explicit V2 deployers can still build the artifacts."""
+        """allow_v2_deploy=True still builds the V2 artifacts."""
         from pyrxd.glyph.builder import DmintV2DeployResult, GlyphBuilder
 
         builder = GlyphBuilder()
@@ -1714,19 +1716,30 @@ class TestPrepareDmintDeployV2Refusal:
         # it explicitly — see TestDeprecationAliases.
         assert isinstance(result, DmintV2DeployResult)
 
-    def test_allow_v2_deploy_default_is_false(self):
-        """Mechanical regression check: a future refactor must not flip the
-        ``allow_v2_deploy`` default from False to True. (red-team N5 /
-        hardening-2)"""
+    def test_explicit_opt_out_warns_but_proceeds(self):
+        """0.9.0: allow_v2_deploy=False no longer refuses — soft warn, then proceed."""
+        import warnings
+
+        from pyrxd.glyph.builder import DmintV2DeployResult, GlyphBuilder
+
+        builder = GlyphBuilder()
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            result = builder.prepare_dmint_deploy(self._params(), allow_v2_deploy=False)
+        assert isinstance(result, DmintV2DeployResult)
+        assert any("allow_v2_deploy=False" in str(w.message) for w in caught)
+
+    def test_allow_v2_deploy_default_is_true(self):
+        """0.9.0: the ``allow_v2_deploy`` default is True (V2 deploys by default)."""
         import inspect
 
         from pyrxd.glyph.builder import GlyphBuilder
 
         sig = inspect.signature(GlyphBuilder.prepare_dmint_deploy)
         param = sig.parameters["allow_v2_deploy"]
-        assert param.default is False
-        # Also assert it's keyword-only — passing it positionally would
-        # let a refactor accidentally make it the second positional arg.
+        assert param.default is True
+        # Still keyword-only — passing it positionally would let a refactor
+        # accidentally make it the second positional arg.
         assert param.kind is inspect.Parameter.KEYWORD_ONLY
 
 

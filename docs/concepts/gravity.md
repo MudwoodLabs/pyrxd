@@ -12,9 +12,10 @@ actually means.
 but is **payment-verified, not atomic** — see the honest limitation
 below. The **HTLC** path (hashlock + relative-timelock) is the
 atomic construction; its full cross-chain flow has been demonstrated
-end-to-end on mainnet as a **proof-of-mechanism with test-size funds,
-and is NOT yet audited or production-ready** (external audit of
-cross-chain atomicity is a hard gate before any real-value use).
+end-to-end on mainnet as a **proof-of-mechanism with test-size funds**.
+Like the rest of pyrxd it is open-source, provided as-is under the
+[LICENSE](../../LICENSE); the cross-chain swap stack is **unaudited —
+verify it yourself before moving real value.**
 
 ## What Gravity is
 
@@ -309,8 +310,8 @@ versions:
    closed out in this category in 2026-05; P2SH and P2TR remain.
 3. **Independent security audit of the entire Gravity surface.**
    Self-audit found and fixed the issues in the deny-list above; an
-   external audit is the next step before any Gravity claims should
-   be considered production-grade beyond the proven path.
+   external review is the natural next step for the swap stack —
+   until then it's unaudited, so verify it yourself before real value.
 
 If you have a use case that needs one of the un-shipped pieces, open
 an issue at https://github.com/MudwoodLabs/pyrxd/issues so it can be

@@ -42,8 +42,8 @@ are willing to follow along without it.
 You need all of the following before you start. None of them are
 optional.
 
-- **pyrxd 0.5.0 installed** — `pip install pyrxd==0.5.0`. Earlier
-  versions ship a different mint-path signature; see
+- **pyrxd 0.8.0 or newer installed** — `pip install "pyrxd>=0.8.0"`.
+  Earlier versions ship a different mint-path signature; see
   [the migration guide](../how-to/migrate-0.4-to-0.5.md) if you upgraded
   from 0.4.x.
 - **A funded Radiant wallet.** You need the WIF private key for a
@@ -51,15 +51,16 @@ optional.
   to cover the contract's reward (50,000 photons for GLYPH) plus the
   transaction fee (≈10,000 photons at default rate) plus standard
   dust headroom. Funding a wallet is out of scope for this page.
-- **An external miner binary.** The pure-Python `mine_solution`
-  shipped in 0.5.0 is correct but sequential; on mainnet difficulty it
-  takes minutes to hours single-threaded. Point `EXTERNAL_MINER` at a
-  faster miner — the standalone
+- **A miner — bundled by default.** As of 0.8.0 pyrxd ships a
+  pure-Python *parallel* miner as `pyrxd.contrib.miner`, and it is the
+  default `--miner-cmd` for `glyph claim-dmint`. It uses
+  `multiprocessing` to sweep the V1 4-byte nonce space across all cores,
+  so no external binary is required. Supplying your own miner is
+  **optional**: point the `EXTERNAL_MINER` env var (or `--miner-cmd`) at
+  a faster/GPU miner — e.g. the standalone
   [`glyph-miner`](https://github.com/RadiantBlockchain-Community/glyph-miner)
-  C binary is the canonical choice. A bundled pure-Python parallel
-  miner shipping as `pyrxd.contrib.miner` is planned for **0.5.1**;
-  until then you must supply your own miner binary or accept the slow
-  single-threaded path.
+  C binary — only if you want more throughput than the bundled parallel
+  miner gives you.
 - **An ElectrumX endpoint.** The default,
   `wss://electrumx.radiant4people.com:50022/`, works without
   configuration. Override with the `ELECTRUMX_URL` env var if you run
@@ -151,12 +152,15 @@ your wallet has a qualifying UTXO before you mine, the call is:
 
 ```python
 from pyrxd.glyph.dmint import find_dmint_funding_utxo
+from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.keys import PrivateKey
+
+ELECTRUMX_URL = "wss://electrumx.radiant4people.com:50022/"
 
 miner_key = PrivateKey("<your WIF>")
 miner_address = miner_key.public_key().address()
 
-# Conservative bound: 50,000 reward + 10 MB headroom for fees.
+# Conservative bound: 50,000 reward + 10M photons headroom for fees.
 needed = 50_000 + 10_000_000 + 546
 
 async with ElectrumXClient([ELECTRUMX_URL]) as client:
@@ -169,10 +173,12 @@ plain-RXD (not FT, not NFT, not dMint) before continuing.
 
 ---
 
-## Step 2 — Configure the external miner
+## Step 2 — (Optional) Configure an external miner
 
-The shipped path for fast mining in 0.5.0 is the `EXTERNAL_MINER` env
-var, which delegates the nonce sweep to a separate process over a
+As of 0.8.0 the bundled parallel miner (`pyrxd.contrib.miner`) is the
+default and needs no setup — you can skip this step. It only matters if
+you want to delegate the nonce sweep to a faster (e.g. GPU) miner via the
+`EXTERNAL_MINER` env var, which spawns a separate process and speaks a
 small JSON-over-stdio protocol.
 
 Install [`glyph-miner`](https://github.com/RadiantBlockchain-Community/glyph-miner)
@@ -198,15 +204,14 @@ a malicious miner could leak it out-of-band, which the local nonce
 re-verification cannot detect.
 ```
 
-If `EXTERNAL_MINER` is unset, the demo falls back to
-`mine_solution` (the sequential pure-Python miner). That is correct
-but slow — expect 70+ minutes single-core at GLYPH's target. Use it
-only if you cannot install a fast miner.
-
-A bundled pure-Python parallel miner that uses `multiprocessing` to
-sweep the V1 4-byte nonce space in ~2-3 minutes on a 32-core machine
-is on track to ship as `pyrxd.contrib.miner` in **0.5.1**. Until then,
-`EXTERNAL_MINER` is the only fast path.
+If `EXTERNAL_MINER` is unset, `glyph claim-dmint` uses the bundled
+parallel miner (`pyrxd.contrib.miner`) by default, which uses
+`multiprocessing` to sweep the V1 4-byte nonce space across all cores
+(~2-3 minutes on a 32-core machine). The old single-threaded
+`mine_solution` is still available as a library call but is no longer
+the default path; expect 70+ minutes single-core at GLYPH's target if
+you call it directly. An external/GPU miner via `EXTERNAL_MINER` is the
+only reason to configure anything in this step.
 
 ---
 

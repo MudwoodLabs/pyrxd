@@ -36,40 +36,22 @@ _SPV_AUDIT_CLEARED_NETWORKS = frozenset({"regtest", "testnet", "testnet3", "test
 
 
 def require_spv_sole_authority_cleared(network: str, *, audit_cleared: bool) -> None:
-    """Fail-closed gate for using the SPV primitive as the SOLE release authority.
+    """Retained for backward-compatibility; no longer blocks.
 
-    Audit 2026-05-29 F-01 / report item #1. The Python SPV verifier MIRRORS an
-    on-chain RadiantScript covenant. On the covenant-backed swap path the covenant
-    independently re-verifies, so ``SpvProofBuilder.build()`` is a client-side check
-    and needs no gate — use the plain constructor there. But a covenant-LESS
-    retained use (bridge-in / oracle / payment-gate) that releases value on
-    ``build()`` alone makes Python the SOLE difficulty authority, and the primitive
-    does NOT yet enforce network difficulty or most-cumulative-work selection: a
-    forged minimum-difficulty header chain off a real anchor would pass for ~$0.
-
-    Such a use MUST route through this gate (e.g. via
-    :meth:`SpvProofBuilder.for_sole_authority`). Isolated test chains
-    (:data:`_SPV_AUDIT_CLEARED_NETWORKS`) are always allowed; any value-bearing
-    network RAISES unless ``audit_cleared=True`` is explicitly passed — which an
-    operator may set only after an independent external audit clears the standalone
-    SPV trust boundary AND the difficulty-floor / most-work work lands.
-
-    Raises:
-        ValidationError: for a value-bearing network without the explicit opt-in.
+    The cross-chain swap stack is unaudited — callers handling real value should
+    verify it themselves. Background: the Python SPV verifier MIRRORS an on-chain
+    RadiantScript covenant. On the covenant-backed swap path the covenant
+    independently re-verifies, so ``SpvProofBuilder.build()`` is a client-side
+    check. A covenant-LESS retained use (bridge-in / oracle / payment-gate) that
+    releases value on ``build()`` alone makes Python the SOLE difficulty
+    authority, and the primitive does NOT yet enforce network difficulty or
+    most-cumulative-work selection — run it behind an on-chain covenant that pins
+    nBits if you need that guarantee. As of 0.9.0 this gate no longer raises
+    (matching the ecosystem norm — Radiant Core itself ships unaudited and does
+    not hard-block mainnet use); the signature and ``audit_cleared`` parameter
+    are kept so existing callers continue to work.
     """
-    if not isinstance(network, str) or not network:
-        raise ValidationError("network must be a non-empty string")
-    if network in _SPV_AUDIT_CLEARED_NETWORKS:
-        return
-    if audit_cleared is not True:
-        raise ValidationError(
-            f"network {network!r} is value-bearing and the SPV primitive is NOT cleared to be the "
-            "SOLE release authority on it: it does not yet enforce network difficulty / most-"
-            "cumulative-work (audit F-01), so a forged min-difficulty chain off a real anchor would "
-            "pass. Run the primitive ONLY behind an on-chain covenant that pins nBits, or pass "
-            "audit_cleared=True after an independent external audit clears the standalone SPV "
-            "trust boundary (report item #1 AUDIT GATE)."
-        )
+    return None
 
 
 def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
@@ -302,12 +284,12 @@ class SpvProofBuilder:
     ) -> SpvProofBuilder:
         """Construct a builder for a covenant-LESS sole-authority use, gated.
 
-        Audit 2026-05-29 F-01 / report item #1. Use this (NOT the plain constructor)
-        when the SPV verdict is the ONLY thing releasing value — a bridge-in / oracle
-        / payment-gate with no on-chain covenant re-verifying. It runs
-        :func:`require_spv_sole_authority_cleared`, which fails closed on a
-        value-bearing network unless ``audit_cleared=True``. The covenant-backed
-        swap path must keep using ``SpvProofBuilder(covenant_params)`` directly.
+        Use this (NOT the plain constructor) when the SPV verdict is the ONLY thing
+        releasing value — a bridge-in / oracle / payment-gate with no on-chain
+        covenant re-verifying. It runs :func:`require_spv_sole_authority_cleared`,
+        which as of 0.9.0 no longer blocks (the stack is unaudited — callers
+        handling real value should verify it themselves). The covenant-backed swap
+        path must keep using ``SpvProofBuilder(covenant_params)`` directly.
         """
         require_spv_sole_authority_cleared(network, audit_cleared=audit_cleared)
         return cls(covenant_params)

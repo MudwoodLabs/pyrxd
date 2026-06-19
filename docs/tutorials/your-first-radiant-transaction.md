@@ -30,15 +30,29 @@ You will use:
 - `pyrxd balance --refresh` — scan the chain for funded addresses.
 - `pyrxd utxos` — list the spendable outputs.
 - A short Python script — build, sign, and (optionally)
-  broadcast the transaction. There is no `pyrxd send` CLI in
-  0.5.0; sends drop into Python.
+  broadcast the transaction. As of 0.8.0 there is also a
+  one-command CLI path (`pyrxd wallet send`); the Python
+  walkthrough shows what that command does under the hood.
+
+> **Shortcut (0.8.0):** if you just want to *send* photons and
+> skip the internals, the CLI now does it in one line:
+>
+> ```shell
+> $ pyrxd wallet send --to <addr> --amount <photons>
+> ```
+>
+> The Python script in Step 6 is the educational version — it
+> walks through the same build/sign/broadcast that
+> `pyrxd wallet send` performs for you. Read on to learn what
+> happens under the hood, or jump straight to the command if you
+> only need the result.
 
 ## Prerequisites
 
 ```shell
 $ pip install pyrxd
 $ pyrxd --version
-pyrxd, version 0.5.0
+pyrxd, version 0.8.0
 ```
 
 You also need:
@@ -193,8 +207,11 @@ page](../api/index.rst)).
 
 ## Step 6 — Build and sign the send in Python
 
-The plain RXD send path is library-level in 0.5.0 — there is no
-`pyrxd send` CLI. Drop into Python:
+As of 0.8.0 the one-command path is `pyrxd wallet send --to
+<addr> --amount <photons>` (see the shortcut callout near the
+top). This step drops into Python to show what that command does
+under the hood — the same build, sign, and broadcast, with each
+step visible so you can learn the API:
 
 ```python
 # send_demo.py
@@ -203,6 +220,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from pathlib import Path
 
 from pyrxd.hd.wallet import HdWallet
 from pyrxd.network.electrumx import ElectrumXClient
@@ -212,7 +230,7 @@ I_UNDERSTAND: bool = (
     os.environ.get("I_UNDERSTAND_THIS_IS_REAL", "").strip().lower() == "yes"
 )
 
-WALLET_PATH = os.path.expanduser(os.environ.get("WALLET_PATH", "~/.pyrxd/wallet.dat"))
+WALLET_PATH = Path(os.path.expanduser(os.environ.get("WALLET_PATH", "~/.pyrxd/wallet.dat")))
 MNEMONIC = os.environ["MNEMONIC"]
 RECIPIENT = os.environ["RECIPIENT"]
 PHOTONS = int(os.environ.get("PHOTONS", "100000"))
@@ -280,6 +298,10 @@ need to know:
   input. Returns a fully signed `Transaction`. Fees default to
   `pyrxd.wallet.DEFAULT_FEE_RATE` (`10_000` photons/byte) — you
   can override with `fee_rate=` if you know what you are doing.
+  Note the unit: this Python `fee_rate` is **photons per byte**,
+  whereas the `pyrxd wallet send --fee-rate` CLI flag is
+  **photons per kB** — don't conflate the two when copying a
+  number between them.
 
 `build_send_tx` does the fee calculation as a two-pass build —
 it signs a trial transaction to measure its size, then

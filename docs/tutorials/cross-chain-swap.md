@@ -51,7 +51,7 @@ pieces.
 
 ## Part 2 — run a full swap on local chains
 
-Now the whole thing: a real `EthLeg` (deploying the real `EthHtlc.sol` on a local **Anvil**) and a
+Now the whole thing: a real `EthLeg` (deploying the real `EthHtlc` contract on a local **Anvil**) and a
 real `RadiantCovenantLeg` (a **radiant-core regtest** node), driven through the production
 `SwapCoordinator` from negotiated to **completed**. No real value moves — Anvil is a local devnet
 with public deterministic keys, and the Radiant node is a throwaway regtest container.

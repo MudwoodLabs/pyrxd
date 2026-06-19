@@ -9,12 +9,12 @@ end-to-end on regtest and on small real-value mainnet/Sepolia runs.
 > [Trustless cross-chain swap: RXD ↔ ETH](../tutorials/cross-chain-swap.md) — which walks a full
 > swap settling on local chains. This page is the reference for the pieces.
 
-> **PRE-AUDIT — regtest / testnet only.** This primitive has **not** had an external
-> security audit. It's the right tool to build and demo cross-chain swaps on
-> regtest/testnet, but **do not move real value** with it until the audit gate clears.
-> An atomic swap's entire job is to be safe against a hostile counterparty; that
-> property is what an audit certifies. See the swap coordinator's module docstring for
-> the current residual-risk notes.
+> **Unaudited — verify it yourself before moving real value.** This swap stack is
+> open-source software, provided as-is (see the [LICENSE](../../LICENSE)). It's proven
+> end-to-end on regtest/testnet and on small real-value runs, but has not had an external
+> security audit. An atomic swap's whole job is to be safe against a hostile counterparty —
+> review the construction against your own use before trusting it with value. See the swap
+> coordinator's module docstring for the current residual-risk notes.
 
 > **This is the HTLC swap — not the SPV-oracle one.** An earlier SPV-oracle swap covenant
 > is **deprecated and superseded** by this HTLC construction (it was a non-atomic, weaker
@@ -138,12 +138,14 @@ the coordinator:
 
 ```python
 from pyrxd import KNOWN_EVM_CHAINS, EthLeg, MarginPolicy
+from pyrxd.eth_wallet.rpc import EthRpc
+from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 
-base = KNOWN_EVM_CHAINS["base-sepolia"]          # or "base" (mainnet; audit-gated)
+base = KNOWN_EVM_CHAINS["base-sepolia"]          # or "base" (mainnet; opt-in required)
 
 rpc = EthRpc("https://sepolia.base.org", expected_chain_id=base.chain_id)
 contract_leg = EthHtlcContractLeg(rpc=rpc, signing_key=key, chain_id=base.chain_id, artifact=ARTIFACT)
-eth_leg = EthLeg(contract_leg=contract_leg, network=base.network, ...)  # audit gate applies
+eth_leg = EthLeg(contract_leg=contract_leg, network=base.network, ...)  # mainnet needs an opt-in
 
 policy = MarginPolicy(..., eth_finalization_window_s=base.finalization_window_s)
 ```
@@ -162,7 +164,7 @@ budget stalls in `CrossClockMargin.eth_finality_stall_tolerance_s`, exactly as f
 finality stall — never by inflating the steady-state window. Provenance is cited in the
 module docstring; `evm_chain_by_id` fails closed on a chain with no vetted window.
 
-**The registry now ships more EVM chains** (mainnet + testnet each, all audit-gated): **Optimism**
+**The registry now ships more EVM chains** (mainnet + testnet each; mainnet behind an opt-in): **Optimism**
 (`optimism`, same OP-stack as Base, 900 s), **Arbitrum One** (`arbitrum-one`, Nitro, 1200 s — ~24 h
 sequencer force-inclusion worst case), and **Linea** (`linea`, a zk/validity rollup, 6000 s ≈ the
 median hard finality, with a documented up-to-16 h tail). Each window is sourced per chain because
@@ -189,6 +191,8 @@ a Radiant asset against LTC by changing three knobs, none of which touch the coo
 
 ```python
 from pyrxd import KNOWN_POW_CHAINS, MarginPolicy
+from pyrxd.btc_wallet.keys import generate_keypair
+from pyrxd.btc_wallet.taproot import build_htlc
 
 ltc = KNOWN_POW_CHAINS["litecoin"]   # network "ltc" / testnet "tltc" / regtest "rltc"
 
@@ -213,8 +217,8 @@ Litecoin** via the chain knobs —
 `BTC_FAMILY_CHAIN=ltc BTC_REGTEST=1 pytest tests/test_btc_htlc_regtest_e2e.py -m integration`
 and `XCHAIN_BTC_FAMILY=ltc XCHAIN_REGTEST=1 pytest tests/test_xchain_swap_regtest_e2e.py -m
 integration` (the node image builds from `docker/litecoin-regtest.Dockerfile`, wrapping the
-official release binary). Mainnet `"ltc"` stays behind the audit gate like every
-value-bearing network.
+official release binary). Mainnet `"ltc"`, like every value-bearing network, requires the
+explicit opt-in.
 
 ### A new chain family — the deliberate path
 

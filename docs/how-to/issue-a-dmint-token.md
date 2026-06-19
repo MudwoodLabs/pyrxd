@@ -90,8 +90,8 @@ pyrxd --network testnet glyph deploy-dmint token.json \
 `deploy-dmint` deploys **V1** by default — the established mainnet format,
 fixed difficulty. Pass `--v2` for a V2 contract with a difficulty algorithm
 (`--daa-mode fixed|asert|lwma|epoch|schedule`). V2 is consensus-validated on
-regtest **and** Radiant mainnet but still **pre-external-audit** (it requires the
-`--v2` opt-in for that reason). Examples:
+regtest **and** Radiant mainnet; it requires an explicit `--v2` opt-in as the
+newer format. Examples:
 
 ```bash
 # LWMA adaptive difficulty (retargets every block)

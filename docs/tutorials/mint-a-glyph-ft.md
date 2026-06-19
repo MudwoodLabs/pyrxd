@@ -1,14 +1,15 @@
 # Mint a Glyph FT
 
 **Goal:** issue your own fungible token on Radiant mainnet, from zero to a
-broadcastable reveal transaction, using pyrxd 0.5.0.
+broadcastable reveal transaction, using pyrxd 0.8.0.
 
 This tutorial walks the canonical two-transaction flow:
 
 1. **Commit tx** — places the metadata-hashlock script on chain.
 2. **Reveal tx** — spends the commit and emits a single 75-byte FT output
-   carrying your entire premine supply. Its outpoint becomes the
-   permanent token reference.
+   carrying your entire premine supply. The **commit outpoint**
+   (`commit_txid:commit_vout`) — *not* the reveal txid — is the
+   permanent token reference embedded in that output.
 
 The runnable reference is
 [`examples/ft_deploy_premine.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples/ft_deploy_premine.py).
@@ -18,7 +19,7 @@ dry run — no transaction is broadcast unless you explicitly opt in.
 ## Before you start
 
 You should already be comfortable with the
-[first-transaction tutorial](https://github.com/MudwoodLabs/pyrxd/tree/main/examples)
+[first-transaction tutorial](your-first-radiant-transaction.md)
 patterns: a funded WIF key, ElectrumX, fee math. If you've also minted
 a Glyph NFT before, this is the same commit/reveal shape with two
 differences:
@@ -38,7 +39,7 @@ You will need:
 
 - a WIF private key for a Radiant address holding enough RXD to cover
   the commit, the reveal, the premine, and fees;
-- pyrxd 0.5.0 installed (`pip install pyrxd`);
+- pyrxd 0.8.0 installed (`pip install "pyrxd>=0.8.0"`);
 - an ElectrumX endpoint (the example defaults to a public
   radiant4people node).
 
@@ -200,8 +201,10 @@ with `decimals`).
 ```
 
 The reveal tx spends `vout[0]` of the commit and produces *one*
-output — `vout[0]` carries the entire premine to `premine_pkh`. Its
-outpoint `(reveal_txid, 0)` is the permanent token reference: every
+output — `vout[0]` carries the entire premine to `premine_pkh`. The
+**commit outpoint** `(commit_txid, commit_vout)` — *not* the reveal
+txid — is the permanent token reference: it is the ref
+`prepare_ft_deploy_reveal` embeds in the FT locking script, and every
 future transfer of this FT will encode the same 36 bytes inside its
 output script.
 
@@ -223,8 +226,10 @@ Two practical points the reference example handles for you:
 With `DRY_RUN=0` and a confirmed commit, broadcast the reveal. On
 acceptance you have:
 
-- **Token ref:** `{reveal_txid}:0` — the 36-byte ref encoded into
-  every FT UTXO of this token.
+- **Token ref:** the **commit outpoint** `{commit_txid}:{commit_vout}`
+  — *not* the reveal txid — is the 36-byte ref encoded into every FT
+  UTXO of this token. This is the ref you use to look up or transfer
+  the token; getting it wrong means you can't find your own supply.
 - **Supply:** exactly `premine_amount` photons, living at
   `reveal_scripts.locking_script` at the address derived from
   `premine_pkh`.
@@ -233,11 +238,20 @@ Sanity-check the result with the inspect tool:
 
 ```bash
 $ pyrxd glyph inspect <reveal_txid> --fetch
-Transaction: ...
-  vout 0  type=ft     ref=<reveal_txid>:0  sats=1000000  (FT — full premine)
+Transaction: <reveal_txid>
+  size:    268 bytes
+  inputs:  1
+  outputs: 1
+
+Outputs:
+  vout   0  type=ft          sats=1000000
+            ref=<commit_txid>:<commit_vout>
+            owner_pkh=<your_pkh>
 ```
 
-`type=ft` confirms the locking script matches the 75-byte FT shape and
+The `ref` line is the **commit outpoint**, not the reveal txid — that
+is the token's permanent identity. `type=ft` confirms the locking
+script matches the 75-byte FT shape and
 its embedded ref points at itself — i.e. this is a freshly deployed
 FT. Any wallet implementing the standard FT classifier
 (`is_ft_script` + `extract_ref_from_ft_script`) will recognise it
@@ -260,6 +274,6 @@ without an indexer.
   different builder method (`prepare_dmint_deploy`) and a three-tx
   flow, not the two-tx flow on this page.
 - **Migrating from pyrxd 0.4.x?** Plain-FT deploy is unchanged in
-  0.5.0; only the V1 dMint *mint* path has breaking signature
+  0.8.0; only the V1 dMint *mint* path has breaking signature
   changes. See [Migrate from 0.4 to 0.5](../how-to/migrate-0.4-to-0.5.md)
   if you have a custom miner.

@@ -1338,18 +1338,18 @@ class TestAudit20260529Fixes:
         for net in ("regtest", "testnet", "testnet3", "signet"):
             require_spv_sole_authority_cleared(net, audit_cleared=False)  # no raise
 
-    def test_sole_authority_gate_blocks_mainnet_without_optin(self) -> None:
-        with pytest.raises(ValidationError, match="SOLE release authority"):
-            require_spv_sole_authority_cleared("mainnet", audit_cleared=False)
+    def test_sole_authority_gate_no_longer_blocks_mainnet_without_optin(self) -> None:
+        # 0.9.0: the gate is retained for backward-compat but no longer raises.
+        require_spv_sole_authority_cleared("mainnet", audit_cleared=False)  # no raise
 
     def test_sole_authority_gate_allows_mainnet_with_optin(self) -> None:
         require_spv_sole_authority_cleared("mainnet", audit_cleared=True)  # no raise
 
-    def test_for_sole_authority_factory_gated(self) -> None:
+    def test_for_sole_authority_factory_no_longer_gated(self) -> None:
         params = _valid_cp()
-        with pytest.raises(ValidationError, match="SOLE release authority"):
-            SpvProofBuilder.for_sole_authority(params, network="mainnet")
-        # explicit opt-in returns a usable builder
+        # 0.9.0: the factory builds a usable builder on any network, opt-in or not.
+        assert isinstance(SpvProofBuilder.for_sole_authority(params, network="mainnet"), SpvProofBuilder)
+        # explicit opt-in still returns a usable builder
         assert isinstance(
             SpvProofBuilder.for_sole_authority(params, network="mainnet", audit_cleared=True), SpvProofBuilder
         )

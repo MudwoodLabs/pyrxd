@@ -25,8 +25,8 @@ enforced on-chain:
   → [`pyrxd glyph deploy-dmint` / `claim-dmint`](docs/how-to/issue-a-dmint-token.md)
 - **Trustless cross-chain atomic swaps.** Trade a Radiant asset (RXD / FT / NFT) against
   BTC or ETH — and EVM L2s (Base, Optimism, Arbitrum, Linea) — with **no bridge and no
-  custodian**: a hash-timelock swap driven by a chain-neutral coordinator. *(Pre-audit —
-  regtest / testnet today.)*
+  custodian**: a hash-timelock swap driven by a chain-neutral coordinator. Proven
+  end-to-end on regtest and on small real-value mainnet / Sepolia runs.
   → [build a cross-chain swap](docs/how-to/build-a-cross-chain-swap.md)
 - **Recursive covenants.** Bitcoin-style script + induction lets a coin constrain the coin
   that spends it — soulbound NFTs, swap covenants, PoW-mint contracts.
@@ -38,15 +38,15 @@ to a real on-chain token on a local regtest chain — no faucet, nothing at risk
 ## Status
 
 **Pre-1.0 software.** APIs may change between minor versions before 1.0.
-Cryptographic primitives have not been independently audited. See
-[SECURITY.md](SECURITY.md) for security policy and disclosure.
+pyrxd is **open-source software, provided as-is, without warranty of any
+kind** — see the [LICENSE](LICENSE) (Apache 2.0, §7–8). Cryptographic
+primitives have not been independently audited. See [SECURITY.md](SECURITY.md)
+for security policy and disclosure.
 
-> ⚠️ **Use at your own risk.** pyrxd is alpha-quality software written
-> primarily by one person; cryptographic code has not been independently
-> audited. **Do not use it to handle funds you cannot afford to lose.**
-> Verify your derivation paths and transaction outputs against an
-> independent wallet before broadcasting on mainnet. If you find a bug
-> that affects funds, report it via the [security policy](SECURITY.md).
+As with any wallet software on a young chain, verify your derivation paths
+and transaction outputs against an independent wallet before broadcasting on
+mainnet. If you find a bug that affects funds, report it via the
+[security policy](SECURITY.md).
 
 **Working on mainnet today:**
 
@@ -61,18 +61,18 @@ Cryptographic primitives have not been independently audited. See
 - `pyrxd agent` — a per-spend-confirmed signing daemon that keeps the key out of the short-lived CLI process
 - ElectrumX async client with reconnect, balance, UTXOs, history, broadcast
 
-**Experimental (pre-audit — build / demo on regtest / testnet, not for real value):**
+**Experimental — newer surface, proven on regtest / testnet (and small real-value runs):**
 
 - Cross-chain HTLC atomic swaps (`pyrxd.gravity`) — RXD covenant + BTC Taproot + ETH
   Solidity legs driven by a chain-neutral coordinator; proven end-to-end on regtest (plus
   small real-value dust runs), against BTC, ETH, and EVM L2s (Base / Optimism / Arbitrum /
-  Linea). An external security audit is the hard gate before any real value.
+  Linea). This cross-chain swap stack is **unaudited — verify it yourself before moving
+  real value.**
 - dMint **V2** (canonical Photonic redesign — FIXED plus ASERT / LWMA adaptive difficulty) —
   byte-matched to upstream Photonic and consensus-validated on `radiant-core` v3.1.1 regtest
   AND Radiant mainnet (3.1.2): the first V2 dMint deploy + PoW mint confirmed on mainnet, plus an
   LWMA mint that advanced difficulty on-chain — adaptive difficulty proven on mainnet (#219).
-  Like everything in this section it is still **pre-external-audit** (the hard gate), so V2
-  deploys are gated behind `allow_v2_deploy=True`.
+  V2 deploys are gated behind `allow_v2_deploy=True` as a deliberate opt-in for the newer format.
 
 ## Upgrading
 

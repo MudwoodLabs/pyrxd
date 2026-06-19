@@ -165,9 +165,11 @@ The outputs list will be long. Skim it for the shape laid out in
   contract UTXOs. Each carries `height: 0`, the same `token_ref`,
   a unique `contract_ref`, and the deploy-time `max_height: 625000`
   and `reward: 50000` (sats per mint).
-- One row badged `FT` — the public-facing FT NFT singleton that
-  every Glyph FT deploy carries.
+- Two rows badged `NFT` — the public-facing singletons that the
+  Glyph FT deploy carries.
 - A final `P2PKH` row — RXD change to the deployer.
+
+That is 35 outputs in all: 32 `DMINT` + two `NFT` + one `P2PKH`.
 
 Above the outputs, a **Reveal metadata** section decodes the CBOR
 body that the deploy reveal carried in its `vin[0]` scriptSig. You
@@ -180,7 +182,7 @@ should see:
 - `description` — `The first of its kind`.
 
 Total supply for GLYPH is `32 contracts × 625,000 max_height ×
-50,000 photons = 10⁹ photons` (10,000 GLYPH at 8 decimals). All of
+50,000 photons = 10¹² photons` (10,000 GLYPH at 8 decimals). All of
 those numbers are visible on this single card.
 
 ---
