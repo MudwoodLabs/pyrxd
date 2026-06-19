@@ -1,7 +1,7 @@
 # External miner protocol: JSON-over-stdio subprocess contract
 
 **Why this page exists:** pyrxd ships a pure-Python reference miner
-([`mine_solution`](../../src/pyrxd/glyph/dmint.py)) so the library is
+([`mine_solution`](../../src/pyrxd/glyph/dmint/__init__.py)) so the library is
 self-contained and the verifier path is the same as the mining path —
 no silent divergence between "what the miner accepts" and "what
 on-chain validation enforces." That correctness comes at a cost: a
@@ -10,7 +10,7 @@ Mh/s per core, so a real mainnet contract takes minutes to over an
 hour on a single CPU. Anyone wanting to mine V1 dMint contracts in
 production wants a faster miner — a parallel Python worker pool, a C
 binary, a WebGPU shader. The shim that bridges pyrxd to those is
-[`mine_solution_external`](../../src/pyrxd/glyph/dmint.py): it spawns
+[`mine_solution_external`](../../src/pyrxd/glyph/dmint/__init__.py): it spawns
 a caller-supplied binary, hands it the search problem over JSON, and
 **re-verifies the returned nonce locally** before letting it touch a
 transaction. This page documents that wire protocol so you can wire
@@ -23,7 +23,7 @@ in your own miner.
 Two entry points:
 
 1. **Direct API.** Pass an `argv` list to
-   [`mine_solution_external`](../../src/pyrxd/glyph/dmint.py):
+   [`mine_solution_external`](../../src/pyrxd/glyph/dmint/__init__.py):
 
    ```python
    from pyrxd.glyph.dmint import mine_solution_external, build_pow_preimage
@@ -49,7 +49,7 @@ Two entry points:
      reference miner.
    - `EXTERNAL_MINER_TIMEOUT_S` — hard timeout in seconds (default
      `600.0`, defined as `EXTERNAL_MINER_TIMEOUT_S` at
-     [`src/pyrxd/glyph/dmint.py:877`](../../src/pyrxd/glyph/dmint.py)).
+     [`src/pyrxd/glyph/dmint.py:877`](../../src/pyrxd/glyph/dmint/__init__.py)).
      On timeout the subprocess is killed and `MaxAttemptsError` is
      raised.
 
@@ -81,7 +81,7 @@ exits.
 | `nonce_width`  | int    | yes      | `4` for V1 contracts, `8` for V2                   |
 
 The exact request shape lives in
-[`src/pyrxd/glyph/dmint.py:951-957`](../../src/pyrxd/glyph/dmint.py):
+[`src/pyrxd/glyph/dmint.py:951-957`](../../src/pyrxd/glyph/dmint/__init__.py):
 
 ```python
 request = json.dumps({
@@ -109,7 +109,7 @@ pyrxd then checks:
   `nonce_width` bytes long.
 
 If any of those fail, pyrxd raises `ValidationError`. See
-[`src/pyrxd/glyph/dmint.py:988-1016`](../../src/pyrxd/glyph/dmint.py)
+[`src/pyrxd/glyph/dmint.py:988-1016`](../../src/pyrxd/glyph/dmint/__init__.py)
 for the exact decoding path.
 
 ### Exit codes
@@ -131,7 +131,7 @@ parent timeout fires, or exit non-zero (which surfaces as
 
 Discarded. pyrxd attaches `stderr=subprocess.DEVNULL` so a misbehaving
 miner cannot OOM the parent by flooding stderr (see the comment at
-[`src/pyrxd/glyph/dmint.py:967-971`](../../src/pyrxd/glyph/dmint.py)).
+[`src/pyrxd/glyph/dmint.py:967-971`](../../src/pyrxd/glyph/dmint/__init__.py)).
 Loss of debug output is the price; if you need to see what your miner
 is doing, run it standalone with the same JSON request and watch
 stderr there.
@@ -142,7 +142,7 @@ stderr there.
 
 The 64 bytes pyrxd hands the miner are the **canonical V1 mint
 preimage** built by
-[`build_pow_preimage`](../../src/pyrxd/glyph/dmint.py): a fixed-layout
+[`build_pow_preimage`](../../src/pyrxd/glyph/dmint/__init__.py): a fixed-layout
 concatenation of the contract's previous txid, the contract ref, the
 miner's input script hash, and the miner's output script hash. The
 exact byte layout is pinned in
@@ -159,7 +159,7 @@ full[0:4] == b'\x00\x00\x00\x00'  AND  int.from_bytes(full[4:12], 'big') < targe
 ```
 
 This is the exact check `verify_sha256d_solution` performs at
-[`src/pyrxd/glyph/dmint.py:711`](../../src/pyrxd/glyph/dmint.py),
+[`src/pyrxd/glyph/dmint.py:711`](../../src/pyrxd/glyph/dmint/__init__.py),
 which `mine_solution_external` calls against every returned nonce
 before declaring success. A nonce that fails this check raises
 `ValidationError` regardless of what the miner claims, which is the
@@ -288,5 +288,5 @@ contract documented above will continue to work without change.
    network. Mitigations: invoke with an absolute path, verify
    checksums against the upstream release, run in a controlled
    environment. See the supply-chain warning in the
-   [`mine_solution_external` docstring](../../src/pyrxd/glyph/dmint.py)
+   [`mine_solution_external` docstring](../../src/pyrxd/glyph/dmint/__init__.py)
    for the full discussion.

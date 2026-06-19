@@ -184,7 +184,7 @@ small JSON-over-stdio protocol.
 Install [`glyph-miner`](https://github.com/RadiantBlockchain-Community/glyph-miner)
 (or any miner that speaks the same protocol — the wire shape is
 documented in the docstring of
-[`pyrxd.glyph.dmint.mine_solution_external`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint.py)).
+[`pyrxd.glyph.dmint.mine_solution_external`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/__init__.py)).
 
 Then export the variable. The value is the full command line pyrxd
 should spawn, space-separated:

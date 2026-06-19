@@ -75,7 +75,7 @@ The contract input value is **preserved across mints**. V1 contracts
 are singletons (the on-chain reference deploys all use 1-photon
 contract outputs), not a value pool — the reward photons come from
 the funding input, not from the contract UTXO. See
-[`_build_dmint_v1_mint_tx`](../../src/pyrxd/glyph/dmint.py) for the
+[`_build_dmint_v1_mint_tx`](../../src/pyrxd/glyph/dmint/__init__.py) for the
 builder's output assembly.
 
 The 241-byte recreated contract layout (state + epilogue) is the same
@@ -88,7 +88,7 @@ changes between mints.
 
 pyrxd's V1 mint builder will produce a 3-output transaction (no
 OP_RETURN) if `op_return_msg` is `None`. But the V1 preimage helper
-[`build_dmint_v1_mint_preimage`](../../src/pyrxd/glyph/dmint.py)
+[`build_dmint_v1_mint_preimage`](../../src/pyrxd/glyph/dmint/__init__.py)
 **requires** `unsigned_tx.outputs[2]` to exist and to be an OP_RETURN
 script (starts with `0x6a`). The covenant binds `outputHash` to that
 specific position; building a 3-output mint produces a preimage with
@@ -108,7 +108,7 @@ public helpers.
 The contract input's scriptSig is a fixed byte layout. The 4-byte
 nonce variant (V1) totals 72 bytes; the 8-byte variant (V2) totals
 76. Layout from
-[`build_mint_scriptsig`](../../src/pyrxd/glyph/dmint.py):
+[`build_mint_scriptsig`](../../src/pyrxd/glyph/dmint/__init__.py):
 
 ```
 ┌── V1 mint scriptSig (72 bytes) ────────────────────────────────────┐
@@ -132,7 +132,7 @@ where:
 The V2 form is identical except the first byte is `0x08` and the
 nonce is 8 bytes (76 bytes total). The single-byte switch
 between layouts is why
-[`build_mint_scriptsig`](../../src/pyrxd/glyph/dmint.py) takes a
+[`build_mint_scriptsig`](../../src/pyrxd/glyph/dmint/__init__.py) takes a
 keyword-only `nonce_width: Literal[4, 8]` argument — a stray
 positional `4` is a type error rather than a silent V1/V2 confusion.
 
@@ -151,7 +151,7 @@ scriptsig = build_mint_scriptsig(
 ```
 
 The scriptSig's `inputHash` / `outputHash` are
-[`PowPreimageResult.input_hash`](../../src/pyrxd/glyph/dmint.py) and
+[`PowPreimageResult.input_hash`](../../src/pyrxd/glyph/dmint/__init__.py) and
 `.output_hash` from the same call that produced the preimage the
 miner solved. Splitting the sources (recomputing the hashes
 separately in two helpers) is exactly the silent-rejection failure
@@ -191,8 +191,8 @@ where:
   the scriptSig also pushes (see previous section).
 
 This is the exact layout
-[`build_pow_preimage`](../../src/pyrxd/glyph/dmint.py) returns inside
-[`PowPreimageResult`](../../src/pyrxd/glyph/dmint.py). The miner
+[`build_pow_preimage`](../../src/pyrxd/glyph/dmint/__init__.py) returns inside
+[`PowPreimageResult`](../../src/pyrxd/glyph/dmint/__init__.py). The miner
 appends the nonce, double-SHA256's the 68 bytes (64 preimage + 4
 nonce for V1), and accepts the nonce when the little-endian integer
 of the result is less than `target`.
@@ -250,7 +250,7 @@ with:
 - The output value (`satoshis` field) exactly equal to
   `state.reward` photons — `1 photon = 1 FT unit` for Radiant FTs.
 
-[`build_dmint_v1_ft_output_script`](../../src/pyrxd/glyph/dmint.py)
+[`build_dmint_v1_ft_output_script`](../../src/pyrxd/glyph/dmint/__init__.py)
 builds this exact shape. A plain 25-byte P2PKH at `vout[1]` fails
 the covenant: the FT-CSH fingerprint isn't there to match, and the
 conservation sum collapses to zero on the output side while the
@@ -273,7 +273,7 @@ producing a covenant-rejected broadcast:
 
 1. **scriptSig pushes derived independently from the preimage.**
    `build_pow_preimage` returns a frozen
-   [`PowPreimageResult`](../../src/pyrxd/glyph/dmint.py) carrying
+   [`PowPreimageResult`](../../src/pyrxd/glyph/dmint/__init__.py) carrying
    the preimage plus `.input_hash` / `.output_hash`. The scriptSig
    builder takes those same hashes — there is no public path that
    splits the preimage halves and the scriptSig pushes into two
@@ -290,7 +290,7 @@ producing a covenant-rejected broadcast:
    addresses with matching payload bytes.
 
 3. **Missing OP_RETURN at vout[2].**
-   [`build_dmint_v1_mint_preimage`](../../src/pyrxd/glyph/dmint.py)
+   [`build_dmint_v1_mint_preimage`](../../src/pyrxd/glyph/dmint/__init__.py)
    refuses to compute a preimage when `unsigned_tx.outputs[2]` is
    absent or doesn't start with `0x6a`. The covenant binds
    `outputHash` to that exact position; producing a preimage from a

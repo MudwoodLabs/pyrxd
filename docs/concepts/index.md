@@ -11,9 +11,12 @@ gravity
 covenant-building-blocks
 partial-tx-swaps
 glyph-structures-and-terminology
+glyph-inspect-tool
 radiant-fts-are-on-chain
 dmint-v1-deploy
+v1-mint-mechanics
 external-miner-protocol
+parallel-mining
 ```
 
 ## Available now
@@ -48,6 +51,12 @@ external-miner-protocol
   the inspect tool. Read this first if you've ever been confused by
   why pasting a "contract id" shows you the *deploy* transaction
   instead of your *transfer*.
+- **[The Glyph inspect tool: structural match, not semantic correctness](glyph-inspect-tool.md)** —
+  what a green check from `glyph inspect` (CLI and browser) actually
+  means: it classifies which on-chain *shape* a script or transaction
+  matches, offline — it does **not** assert the FT will spend or the
+  contract will mint. Read this to understand the trust boundary before
+  trusting an inspect result.
 - **[Radiant FTs are on-chain (not metadata-on-P2PKH)](radiant-fts-are-on-chain.md)** —
   the most common confusion when porting from Atomicals / Runes / SPL
   is to assume Radiant FTs are plain UTXOs with off-chain meaning. This
@@ -58,6 +67,11 @@ external-miner-protocol
   to Radiant Glyph Protocol), why pyrxd refuses to emit V2 by default,
   and the five Photonic divergences pyrxd ships with. Read this before
   using `prepare_dmint_deploy` with `DmintV1DeployParams`.
+- **[V1 dMint mint mechanics: claiming a contract UTXO](v1-mint-mechanics.md)** —
+  the *claim* side of a V1 dMint contract: the canonical 4-output mint
+  transaction, the 72-byte scriptSig push convention, the 64-byte PoW
+  preimage layout, and the FT-conservation covenant check the script
+  enforces on the reward output. The companion to the *deploy* page above.
 - **[External miner protocol: JSON-over-stdio subprocess contract](external-miner-protocol.md)** —
   the wire protocol `mine_solution_external` uses to drive a fast
   external miner binary as a child process. Documents the request /
@@ -65,6 +79,11 @@ external-miner-protocol
   `EXTERNAL_MINER_TIMEOUT_S` env vars used by the dMint claim demo,
   what the library re-verifies before trusting a returned nonce, and
   a 20-line reference miner that fits the contract.
+- **[Parallel mining and the bundled miner](parallel-mining.md)** — the two
+  miners pyrxd ships (the slow-but-correct in-process `mine_solution` and the
+  fast subprocess `mine_solution_external`), the bundled `pyrxd.contrib.miner`
+  added in 0.5.1 so you don't have to supply your own, and how parallel workers
+  divide the nonce space. Read this to mine a dMint claim at a useful rate.
 
 ## Adjacent reading (not yet promoted to concept docs)
 

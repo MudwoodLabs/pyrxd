@@ -60,13 +60,14 @@ cross-chain-swap
   negotiated → completed for native RXD, a Glyph NFT, *and* a Glyph FT. Pre-audit —
   local/testnet only, no real value at risk.
 
-## Planned tutorials
+## More walkthroughs
 
-Tutorials are being written as the v0.5.x line stabilises. In the
-meantime, the runnable end-to-end demos in
-[`examples/`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples) are
-the closest thing — they exercise the same flows that the future tutorials
-will explain step-by-step.
+Once you've worked through the tutorials, the task-focused
+[How-to guides](../how-to/index.md) cover the next steps — transferring a token
+after you mint it, running the signing agent, recovering funds, and building a
+cross-chain swap. The runnable end-to-end demos in
+[`examples/`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples) exercise
+the same flows in code.
 
 If you have a use case that would make a useful tutorial, please open an
 [issue](https://github.com/MudwoodLabs/pyrxd/issues) describing it.
