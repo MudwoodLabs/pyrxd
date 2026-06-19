@@ -110,7 +110,7 @@ The epilogue is the same 145 bytes across every V1 mainnet deploy
 except for one byte: the algo selector (`0xaa` for sha256d on every
 live deploy seen to date). pyrxd's parser fingerprints on the
 epilogue prefix + algo byte + epilogue suffix
-([`_match_v1_epilogue`](../../src/pyrxd/glyph/dmint.py)).
+([`_match_v1_epilogue`](../../src/pyrxd/glyph/dmint/__init__.py)).
 
 ---
 

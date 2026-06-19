@@ -110,8 +110,33 @@ report = await discover(client, mnemonic, coin_types=(0, 512, 236), accounts=ran
 - Restore the seed in a wallet configured for the reported `coin_type`
   (for Photonic ≥ v3.0.1, the Recover screen auto-detects coin type 0 vs 512;
   tick "Use legacy derivation path" if it shows empty), **or**
-- Sweep with pyrxd's own spend path once your wallet is built at that coin
-  type (`HdWallet.from_mnemonic(mnemonic, coin_type=…)` then `send_max`).
+- Sweep the path with pyrxd directly — the next section.
+
+### Sweep a derived path with `pyrxd wallet sweep`
+
+When the funds sit at a path no GUI wallet can reach (a non-zero account, or a
+coin type your wallet won't derive), `wallet sweep` moves **everything** under
+that path to an address you control:
+
+```console
+$ pyrxd wallet sweep --coin-type 0 --to 1YourSafeAddress
+```
+
+Pass the `--coin-type` (and `--account`, if non-zero) that `wallet recover
+--scan` reported. The command sweeps every spendable UTXO under
+`m/44'/<coin-type>'/<account>'` to `--to`, minus the fee. It is a **real signed
+broadcast**, so it shows you the amount, fee, and destination and asks you to
+confirm before anything goes out.
+
+| Option | Default | Notes |
+|---|---|---|
+| `--coin-type` | *(required)* | The SLIP-0044 coin type the funds are on (e.g. `0` or `512`). |
+| `--account` | `0` | The BIP44 account index the funds are on. |
+| `--to` | *(required)* | Destination address you control. |
+| `--fee-rate` | `10000` | Photons per kB. |
+
+Send `--to` an address from a wallet you can actually use day-to-day — the point
+of the sweep is to get the coins onto a reachable path.
 
 ---
 

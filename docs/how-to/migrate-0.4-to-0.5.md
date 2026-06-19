@@ -1,10 +1,16 @@
-# How to migrate from pyrxd 0.4.x to 0.5.0
+# Breaking changes since pyrxd 0.4.x
 
-**Who this page is for:** anyone who imports `build_pow_preimage`,
-`build_mint_scriptsig`, or `build_dmint_v1_mint_preimage` from
-`pyrxd.glyph.dmint`. If you only use the CLI, the higher-level
-`GlyphBuilder` API, or the inspect tool, 0.5.0 is a drop-in upgrade and
-you can stop reading here.
+**Scope:** the only break to the stable public API since 0.4.x landed in
+**0.5.0** — three signature changes on the V1 dMint mint path, documented below.
+Every release since (0.5.x through the current version) is **additive and
+drop-in**: existing import paths and CLI commands are unchanged. If you're on
+0.5.0 or later, there is nothing to migrate.
+
+**Who this page is for:** anyone upgrading from a **0.4.x** pin who imports
+`build_pow_preimage`, `build_mint_scriptsig`, or `build_dmint_v1_mint_preimage`
+from `pyrxd.glyph.dmint`. If you only use the CLI, the higher-level
+`GlyphBuilder` API, or the inspect tool, 0.5.0 is a drop-in upgrade and you can
+stop reading here.
 
 0.5.0 makes three signature changes to the V1 dMint mint path. They
 are deliberately **hard breaks with loud errors** — no deprecation
