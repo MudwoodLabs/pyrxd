@@ -31,7 +31,10 @@ contract.
 
 For the theory behind what a V1 dMint contract is and the byte-by-byte
 shape of the mint transaction, see the
-[V1 dMint deploys concept page](../concepts/dmint-v1-deploy.md). This
+[V1 dMint deploys concept page](../concepts/dmint-v1-deploy.md). The
+Python API used throughout — `find_dmint_contract_utxos`,
+`build_dmint_mint_tx`, the miner — is documented in
+[`pyrxd.glyph.dmint`](../api/dmint.rst). This
 tutorial is hands-on; it assumes you have already skimmed that page or
 are willing to follow along without it.
 
@@ -184,7 +187,7 @@ small JSON-over-stdio protocol.
 Install [`glyph-miner`](https://github.com/RadiantBlockchain-Community/glyph-miner)
 (or any miner that speaks the same protocol — the wire shape is
 documented in the docstring of
-[`pyrxd.glyph.dmint.mine_solution_external`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/dmint/__init__.py)).
+[`pyrxd.glyph.dmint.mine_solution_external`](../api/dmint.rst)).
 
 Then export the variable. The value is the full command line pyrxd
 should spawn, space-separated:
@@ -360,7 +363,9 @@ mainnet:
   the supply-chain caveats are.
 
 For the protocol-level detail behind any of the above, see the
-[V1 dMint deploys concept page](../concepts/dmint-v1-deploy.md). For
+[V1 dMint deploys concept page](../concepts/dmint-v1-deploy.md); for the
+full signature of every function above, see the
+[`pyrxd.glyph.dmint` API reference](../api/dmint.rst). For
 the runnable reference,
 [`examples/dmint_claim_demo.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples/dmint_claim_demo.py)
 is the canonical script — every snippet on this page is a transcription
