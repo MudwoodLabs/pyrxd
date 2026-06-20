@@ -21,7 +21,7 @@ terminal — not the terminal that asked for the signature.
 ```console
 $ pyrxd agent unlock
 Mnemonic (input hidden):
-Signing agent live on /home/you/.pyrxd/agent.sock — Ctrl-C to lock.
+Signing agent live on ~/.pyrxd/agent.sock — Ctrl-C to lock.
 ```
 
 `unlock` prompts for the mnemonic once, then runs in the **foreground**, serving
@@ -76,7 +76,7 @@ to the in-process path and prompts for the mnemonic as normal.
 
 ```console
 $ pyrxd agent status
-Signing agent is live on /home/you/.pyrxd/agent.sock
+Signing agent is live on ~/.pyrxd/agent.sock
 
 $ pyrxd agent lock
 Agent locked and shut down.
