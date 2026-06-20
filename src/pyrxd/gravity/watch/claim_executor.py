@@ -14,9 +14,11 @@ claim by draining fees, hence the fee source is availability-critical, handled b
 
 Safety properties (mirroring the v2 refund discipline + the divergent-review hardening):
 
-* **Dormant-by-construction.** ``resolve_leg is None`` (or it returns ``None`` for a swap) == dormant →
-  declines + pages, broadcasts nothing. A live leg only exists on an audit-cleared network (the leg's own
-  ``require_audit_cleared`` gate) and only for a swap whose covenant sidecar the operator wrote.
+* **Dormant-by-construction + armed-by-exception.** ``resolve_leg is None`` (or it returns ``None`` for a
+  swap) == dormant → declines + pages, broadcasts nothing; a live leg requires a swap whose covenant sidecar
+  the operator wrote. Since 0.9.0 the leg's ``require_audit_cleared`` is advisory (no longer makes a network
+  dormant), so on a value-bearing network the affirmative control is ``enable_autonomous_mainnet_custody``
+  (default off) — un-armed → declines.
 * **Per-swap leg resolution.** The record carries only the covenant outpoint + SPK-hash, not the pkhs to
   rebuild the covenant script; the injected ``resolve_leg(swap_id, record)`` builds the per-swap leg from a
   stored sidecar (so the watchtower can claim DIFFERENT swap counterparties, not one fixed pair).
@@ -269,7 +271,9 @@ class ClaimExecutor:
         # The sole affirmative arming gate: reject a non-bool so a truthy string (``bool("false")`` is True)
         # from a config/env/YAML layer can never silently arm unattended mainnet custody (security panel #244).
         if not isinstance(enable_autonomous_mainnet_custody, bool):
-            raise ValidationError("enable_autonomous_mainnet_custody must be a bool (no truthy coercion for the arming latch)")
+            raise ValidationError(
+                "enable_autonomous_mainnet_custody must be a bool (no truthy coercion for the arming latch)"
+            )
         # PER-SWAP leg resolution: the watchtower watches MANY swaps and the record carries only the
         # covenant outpoint + SPK-hash, NOT the pkhs needed to rebuild the covenant script to spend it
         # (the maker pkh differs per counterparty). So the caller injects an async
@@ -297,7 +301,8 @@ class ClaimExecutor:
             if self._mainnet_custody_armed:
                 logger.warning(
                     "ClaimExecutor ARMED for autonomous mainnet custody on %r (claim ceiling=%d photons)",
-                    network, claim_dust_ceiling,
+                    network,
+                    claim_dust_ceiling,
                 )
             else:
                 logger.warning(

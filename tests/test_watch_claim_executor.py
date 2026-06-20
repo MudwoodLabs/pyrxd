@@ -341,8 +341,11 @@ async def test_unbounded_flag_does_not_waive_relative_ceiling_above_dust():
     # footgun). value 50_000 > 10k dust; raised ceiling 100_000 passes the absolute check; relative ceiling
     # floor(6 * 100 / 2.0) = 300 << 50_000 → DECLINE despite accept_unbounded=True.
     ex, leg, rec, _ = await _armed_executor(
-        network="bc", accept_unbounded_reorg_risk=True, radiant_amount=50_000,
-        claim_dust_ceiling=100_000, reorg_cost_per_block=100,
+        network="bc",
+        accept_unbounded_reorg_risk=True,
+        radiant_amount=50_000,
+        claim_dust_ceiling=100_000,
+        reorg_cost_per_block=100,
     )
     assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
     assert leg.claimed_with is None
