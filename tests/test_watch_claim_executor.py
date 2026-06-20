@@ -208,6 +208,9 @@ async def _armed_executor(
     )
     chain_io = _FakeChainIO(value=terms.radiant_amount, confs=confs, missing=missing, mempool_unspent=mempool_unspent)
     leg = _FakeRadiantLeg(chain_io)
+    # "armed" fixture: arm mainnet custody by default so the value-bearing tests exercise the claim path.
+    # (No effect on audit-cleared networks like bcrt, where _value_bearing is False.) Override via kw.
+    kw.setdefault("enable_autonomous_mainnet_custody", True)
     ex = ClaimExecutor(
         resolve_leg=_resolver(leg),
         claim_status_source=_FakeStatusSource(claim_txid=claim_txid, claimed=status_claimed, confs=btc_confs),
@@ -287,6 +290,85 @@ async def test_low_corroboration_allowed_with_optin():
 
 
 # --------------------------------------------------------------------------- tests: value-vs-reorg cap (HIGH-1)
+
+
+async def test_value_bearing_declines_without_mainnet_custody_arming():
+    # As-is posture: a wired executor on a value-bearing network broadcasts NOTHING until the operator
+    # explicitly arms it — even when value/finality would otherwise permit the claim.
+    ex, leg, rec, _ = await _armed_executor(
+        network="bc", reorg_cost_per_block=1_000, radiant_amount=1_000, enable_autonomous_mainnet_custody=False
+    )
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert leg.claimed_with is None
+
+
+async def test_value_bearing_default_is_unarmed_declines():
+    # Pin the load-bearing __init__ DEFAULT (security panel #244): an executor built WITHOUT the kwarg
+    # declines on a value-bearing network. Built directly to bypass the fixture's setdefault(..., True),
+    # so flipping the production default to True would fail this test.
+    terms, _p, raw, claim_txid, locator, _ = await _build_real_claim()
+    leg = _FakeRadiantLeg(_FakeChainIO(value=terms.radiant_amount))
+    ex = ClaimExecutor(
+        resolve_leg=_resolver(leg),
+        claim_status_source=_FakeStatusSource(claim_txid=claim_txid, claimed=True, confs=10),
+        claim_bytes_source=_FakeBytesSource({claim_txid: raw}),
+        policy=MarginPolicy.estimated(),
+        network="bc",
+        reorg_cost_per_block=1_000,
+    )
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, counterchain_locator=locator)
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert leg.claimed_with is None
+
+
+async def test_arming_flag_rejects_non_bool():
+    # The arming latch must reject truthy non-bools (bool("false") is True) so a config/env string
+    # can never silently arm unattended mainnet custody (security panel #244).
+    with pytest.raises(ValidationError):
+        ClaimExecutor(
+            resolve_leg=_resolver(_FakeRadiantLeg(_FakeChainIO(value=1_000))),
+            claim_status_source=None,
+            claim_bytes_source=None,
+            policy=MarginPolicy.estimated(),
+            network="bc",
+            enable_autonomous_mainnet_custody="true",
+        )
+
+
+async def test_unbounded_flag_does_not_waive_relative_ceiling_above_dust():
+    # accept_unbounded_reorg_risk is a DUST opt-in only: for RXD value ABOVE the 10k default it must NOT
+    # skip the relative reorg-cost ceiling, even with the absolute ceiling raised (security panel #244
+    # footgun). value 50_000 > 10k dust; raised ceiling 100_000 passes the absolute check; relative ceiling
+    # floor(6 * 100 / 2.0) = 300 << 50_000 → DECLINE despite accept_unbounded=True.
+    ex, leg, rec, _ = await _armed_executor(
+        network="bc",
+        accept_unbounded_reorg_risk=True,
+        radiant_amount=50_000,
+        claim_dust_ceiling=100_000,
+        reorg_cost_per_block=100,
+    )
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert leg.claimed_with is None
+
+
+async def test_unbounded_flag_still_waives_for_genuine_dust():
+    # The dust opt-in still works for RXD value <= the 10k default (the relative ceiling is not reached).
+    ex, leg, rec, p = await _armed_executor(
+        network="bc", accept_unbounded_reorg_risk=True, radiant_amount=5_000, reorg_cost_per_block=100
+    )
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
+    assert leg.claimed_with == p
+
+
+async def test_value_bearing_above_default_ceiling_broadcasts_when_operator_raises_it():
+    # The ceiling is a *default the operator raises with explicit per-value consent*, not a hard block.
+    # value 50_000 is ABOVE the 10k default ceiling but below the explicitly-raised claim_dust_ceiling
+    # (100_000) AND below the relative reorg ceiling floor(6 * 20_000 / 2.0) = 60_000 → broadcasts.
+    ex, leg, rec, p = await _armed_executor(
+        network="bc", reorg_cost_per_block=20_000, radiant_amount=50_000, claim_dust_ceiling=100_000
+    )
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
+    assert leg.claimed_with == p
 
 
 async def test_value_bearing_rxd_over_ceiling_declines():

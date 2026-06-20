@@ -14,9 +14,11 @@ claim by draining fees, hence the fee source is availability-critical, handled b
 
 Safety properties (mirroring the v2 refund discipline + the divergent-review hardening):
 
-* **Dormant-by-construction.** ``resolve_leg is None`` (or it returns ``None`` for a swap) == dormant →
-  declines + pages, broadcasts nothing. A live leg only exists on an audit-cleared network (the leg's own
-  ``require_audit_cleared`` gate) and only for a swap whose covenant sidecar the operator wrote.
+* **Dormant-by-construction + armed-by-exception.** ``resolve_leg is None`` (or it returns ``None`` for a
+  swap) == dormant → declines + pages, broadcasts nothing; a live leg requires a swap whose covenant sidecar
+  the operator wrote. Since 0.9.0 the leg's ``require_audit_cleared`` is advisory (no longer makes a network
+  dormant), so on a value-bearing network the affirmative control is ``enable_autonomous_mainnet_custody``
+  (default off) — un-armed → declines.
 * **Per-swap leg resolution.** The record carries only the covenant outpoint + SPK-hash, not the pkhs to
   rebuild the covenant script; the injected ``resolve_leg(swap_id, record)`` builds the per-swap leg from a
   stored sidecar (so the watchtower can claim DIFFERENT swap counterparties, not one fixed pair).
@@ -68,11 +70,19 @@ __all__ = [
     "sidecar_leg_resolver",
 ]
 
-# Absolute dust ceiling (RXD photons) on a value-bearing autonomous claim that --accept-unbounded-reorg-risk
-# CANNOT waive (review MEDIUM). The unbounded flag waives only the RELATIVE value-vs-reorg-cost ceiling; this
-# ABSOLUTE floor keeps "dust only" a structural fact, not a comment. Photon analogue of the refund path's
-# MAINNET_DUST_CEILING_SATS (executor.py): 10k photons of RXD is dust by any market measure.
+# DEFAULT autonomous-claim ceiling (RXD photons). As-is posture (0.9.0+): this is a *default the operator
+# can raise* via ``claim_dust_ceiling`` — explicit per-value consent (you state the magnitude), not a hard
+# block. What it is NOT is waivable by the *blunt* ``accept_unbounded_reorg_risk`` flag (review MEDIUM): that
+# flag waives only the RELATIVE value-vs-reorg-cost ceiling and deliberately cannot cross whatever absolute
+# ceiling is configured, so a single boolean can never arm an arbitrary-value claim. The default — 10k photons,
+# the photon analogue of the refund path's MAINNET_DUST_CEILING_SATS — is dust by any market measure, so an
+# un-tuned executor stays dust-only; moving real value is a conscious, numeric opt-in.
 MAINNET_DUST_CEILING_PHOTONS = 10_000
+
+# Test/regtest networks (no real value) == the audit-cleared set. Aliased so the executor's value-bearing
+# seam is named for its own intent, not the (now-advisory) audit gate (security panel #244): editing the
+# audit set must be a conscious change to executor arming, not an incidental one.
+TEST_NETWORKS = AUDIT_CLEARED_NETWORKS
 
 
 @dataclass(frozen=True)
@@ -135,10 +145,25 @@ def make_radiant_claim_leg(
     context: CovenantClaimContext, *, chain_io, fee_source, network: str, audit_cleared: bool = False
 ):
     """Build the per-swap ``RadiantCovenantLeg`` from a covenant sidecar + the operator's SHARED
-    ``chain_io`` (a ``RadiantChainIO``) and ``fee_source`` (the hot, capped fee key). The leg's own
-    ``require_audit_cleared`` gate makes a value-bearing network without ``audit_cleared`` raise — so
-    a non-cleared network has no live leg (dormant). Imported lazily to keep the watch package free of
-    a hard ``gravity.radiant_leg`` dependency until autonomy is actually armed."""
+    ``chain_io`` (a ``RadiantChainIO``) and ``fee_source``.
+
+    Posture (0.9.0+): the leg's ``require_audit_cleared`` is now *advisory* (the library-wide gates
+    were demoted to no-ops to match the Radiant "does what you tell it" stance), so it no longer raises
+    on a value-bearing network — it does NOT make a non-cleared network dormant. The affirmative control
+    for this hot-key, unattended path is :class:`ClaimExecutor`'s ``enable_autonomous_mainnet_custody``.
+
+    .. warning::
+       The arming gate + value cap live on :class:`ClaimExecutor`, not on the leg. **Any UNATTENDED
+       consumer of this leg MUST route its broadcasts through a :class:`ClaimExecutor`** — calling
+       ``leg.claim_asset(...)`` directly from a custom watch loop bypasses both the arming gate and the
+       value cap (security panel #244). Attended/operator-invoked callers (the ``SwapCoordinator`` taker
+       methods) are out of scope — those are a human deciding, not unattended automation.
+
+    ``fee_source`` SHOULD be a :class:`~pyrxd.gravity.capped_fee_source.CappedFeeWalletSource` so a
+    compromised/buggy hot fee key is bounded to a small pool rather than an arbitrary wallet — this is
+    *recommended, not enforced* (the same posture: the library hands you the safe tool, it doesn't refuse
+    your fee source). Imported lazily to keep the watch package free of a hard ``gravity.radiant_leg``
+    dependency until autonomy is actually armed."""
     from pyrxd.gravity.radiant_leg import RadiantCovenantLeg
 
     return RadiantCovenantLeg(
@@ -193,8 +218,16 @@ class ClaimStatusSource(Protocol):
 
 
 class ClaimExecutor:
-    """Autonomous Radiant asset-claim executor. Hot fee key, dormant-by-construction, value-capped,
-    fresh-re-assessed. Implements the ``Executor`` Protocol; safe to call for any decision."""
+    """Autonomous Radiant asset-claim executor. Hot fee key, dormant-by-construction,
+    explicitly-armed-for-mainnet, value-capped, fresh-re-assessed. Implements the ``Executor`` Protocol;
+    safe to call for any decision.
+
+    It cannot redirect the asset (the claim is keyless — output[0] is pinned to the taker holder PKH and
+    the watchtower holds no value key; it only scrapes the maker's already-public preimage and pays the
+    fee). On a value-bearing network it stays DECLINED unless ``enable_autonomous_mainnet_custody=True``
+    (the affirmative arming opt-in). The autonomous RXD claim size is bounded by ``claim_dust_ceiling``
+    (a default the operator raises with explicit per-value consent), and the recommended ``fee_source`` is
+    a capped pool so a hot-key compromise is bounded to fees, never the asset."""
 
     def __init__(
         self,
@@ -208,6 +241,7 @@ class ClaimExecutor:
         reorg_safety_factor: float = 2.0,
         accept_unbounded_reorg_risk: bool = False,
         accept_single_source: bool = False,
+        enable_autonomous_mainnet_custody: bool = False,
         seen_store=None,
         rxd_depth_corroborator=None,
         claim_dust_ceiling: int = MAINNET_DUST_CEILING_PHOTONS,
@@ -234,6 +268,12 @@ class ClaimExecutor:
             raise ValidationError("reorg_safety_factor must be a finite float >= 1.0")
         if not isinstance(claim_dust_ceiling, int) or isinstance(claim_dust_ceiling, bool) or claim_dust_ceiling <= 0:
             raise ValidationError("claim_dust_ceiling must be a positive int ('no cap' can never mean unlimited)")
+        # The sole affirmative arming gate: reject a non-bool so a truthy string (``bool("false")`` is True)
+        # from a config/env/YAML layer can never silently arm unattended mainnet custody (security panel #244).
+        if not isinstance(enable_autonomous_mainnet_custody, bool):
+            raise ValidationError(
+                "enable_autonomous_mainnet_custody must be a bool (no truthy coercion for the arming latch)"
+            )
         # PER-SWAP leg resolution: the watchtower watches MANY swaps and the record carries only the
         # covenant outpoint + SPK-hash, NOT the pkhs needed to rebuild the covenant script to spend it
         # (the maker pkh differs per counterparty). So the caller injects an async
@@ -251,6 +291,25 @@ class ClaimExecutor:
         self._reorg_safety_factor = float(reorg_safety_factor)
         self._accept_unbounded = bool(accept_unbounded_reorg_risk)
         self._accept_single_source = bool(accept_single_source)
+        # The affirmative arming latch for the unattended hot-key path (rationale in the class docstring +
+        # docs/solutions/design-decisions/autonomous-claim-executor-as-is-posture.md). Default False →
+        # value-bearing networks DECLINE until armed.
+        self._mainnet_custody_armed = enable_autonomous_mainnet_custody
+        # Startup visibility (the latch is in-memory only, so a config-drifted restart silently disarms):
+        # make the value-bearing arming posture loud at construction for the operator + post-incident forensics.
+        if self._value_bearing:
+            if self._mainnet_custody_armed:
+                logger.warning(
+                    "ClaimExecutor ARMED for autonomous mainnet custody on %r (claim ceiling=%d photons)",
+                    network,
+                    claim_dust_ceiling,
+                )
+            else:
+                logger.warning(
+                    "ClaimExecutor on value-bearing network %r is NOT armed (alert-only; "
+                    "set enable_autonomous_mainnet_custody=True to enable autonomous claims)",
+                    network,
+                )
         # FIRE-ONCE guard (review HIGH): the covenant reads "unspent" via the mempool-blind scantxoutset
         # between our broadcast and its confirmation, so without this the per-tick re-assess re-reaches the
         # broadcast step and re-carves a fresh real-value fee tx EVERY tick. An OPTIONAL duck-typed SeenStore
@@ -268,7 +327,11 @@ class ClaimExecutor:
 
     @property
     def _value_bearing(self) -> bool:
-        return self._network not in AUDIT_CLEARED_NETWORKS
+        # A network is value-bearing iff it is NOT a test/regtest network. We reuse the
+        # AUDIT_CLEARED_NETWORKS set (test chains) as TEST_NETWORKS via the module alias so the
+        # executor's intent is named at its own seam — editing the audit set must be a conscious
+        # change to executor arming, not an incidental one (security panel #244).
+        return self._network not in TEST_NETWORKS
 
     async def execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
         outcome, reason = await self._run(swap_id, record, decision)
@@ -291,6 +354,14 @@ class ClaimExecutor:
         # 2. Dormancy — no claim sources wired → structurally cannot fire.
         if self._resolve_leg is None or self._status is None or self._bytes is None:
             return ExecOutcome.DECLINED, f"DORMANT: network {self._network!r} not armed (broadcasts nothing)"
+        # 2b. AS-IS POSTURE arming gate — unattended mainnet money-movement requires the explicit
+        #     affirmative opt-in (the "tell it" that 0.9.0's now-advisory require_audit_cleared no longer
+        #     demands). A wired-but-un-armed executor on a value-bearing network broadcasts nothing.
+        if self._value_bearing and not self._mainnet_custody_armed:
+            return ExecOutcome.DECLINED, (
+                f"autonomous mainnet custody not armed on {self._network!r} "
+                "(set enable_autonomous_mainnet_custody=True to arm this hot-key, unattended path)"
+            )
         # Resolve the PER-SWAP leg from its covenant sidecar (None → no sidecar for this swap → dormant).
         try:
             leg = await self._resolve_leg(swap_id, record)
@@ -298,6 +369,16 @@ class ClaimExecutor:
             return ExecOutcome.FAILED, f"leg resolution failed: {type(exc).__name__}: {exc}"
         if leg is None:
             return ExecOutcome.DECLINED, "no covenant claim context for this swap (dormant)"
+        # Network-consistency: the arming gate (2b) and value cap key on the EXECUTOR's network, but the leg
+        # broadcasts on ITS network (set independently in sidecar_leg_resolver). A mismatch (e.g. executor
+        # tagged a test net while the leg points chain_io at mainnet) would skip both guards on real value.
+        # Fail closed on divergence (security panel #244).
+        leg_net = getattr(leg, "network", None)
+        if leg_net is not None and leg_net != self._network:
+            return ExecOutcome.DECLINED, (
+                f"executor network {self._network!r} != resolved leg network {leg_net!r} "
+                "(refusing — arming/value gates key on the executor network; a mismatch could skip them)"
+            )
         # 3. low_corroboration hard-stop — the claim has NO consensus backstop, so a single-source RXD
         #    read must not auto-broadcast unless the operator explicitly accepted single-source (dust).
         if decision.low_corroboration and not self._accept_single_source:
@@ -450,24 +531,37 @@ class ClaimExecutor:
 
         Mirrors ``swap_coordinator``'s ``max_protected_value`` guard, per swap. Skipped on audit-cleared
         (regtest/dust) networks and when the operator accepts unbounded reorg risk (a dust opt-in)."""
-        # ABSOLUTE dust floor (review MEDIUM): --accept-unbounded-reorg-risk waives only the RELATIVE
-        # value-vs-reorg ceiling below — NEVER this absolute cap. Enforce it FIRST, on the value-bearing rxd
-        # claim path, so the unbounded flag can never arm an arbitrary-value claim ("dust only" stays a fact,
-        # not a comment). ft/nft radiant_amount is carrier dust, not market value, so the cap below handles it.
+        # ABSOLUTE ceiling: an RXD autonomous claim above ``claim_dust_ceiling`` is declined. The ceiling is
+        # a *default the operator raises with explicit per-value consent* (you state the magnitude) — it is
+        # enforced FIRST, before the unbounded short-circuit, so the blunt accept_unbounded_reorg_risk flag
+        # can never cross it. ft/nft radiant_amount is carrier dust, not market value, so the cap below handles it.
         if (
             self._value_bearing
             and record.terms.asset_variant == "rxd"
             and record.terms.radiant_amount > self._claim_dust_ceiling
         ):
             return (
-                f"radiant_amount {record.terms.radiant_amount} exceeds the absolute claim dust ceiling "
-                f"{self._claim_dust_ceiling} photons (not waivable by accept_unbounded_reorg_risk; external "
-                "audit is the gate for any non-dust autonomous claim)"
+                f"radiant_amount {record.terms.radiant_amount} exceeds the configured claim ceiling "
+                f"{self._claim_dust_ceiling} photons — raise claim_dust_ceiling to authorize a larger "
+                "autonomous claim (explicit per-value consent; the blunt accept_unbounded_reorg_risk flag "
+                "deliberately cannot cross this ceiling)"
             )
-        if not self._value_bearing or self._accept_unbounded:
+        if not self._value_bearing:
             return None
         variant = record.terms.asset_variant
-        if variant != "rxd":
+        # accept_unbounded_reorg_risk is a DUST opt-in: it waives the RELATIVE reorg-cost ceiling ONLY for
+        # genuinely dust value, NEVER for a raised claim_dust_ceiling (security panel #244 — else "raise the
+        # ceiling for a large claim" + a stale dust-run flag would strip reorg-cost bounding entirely). For
+        # RXD that means value <= the 10k default; above-dust RXD ALWAYS falls through to the relative ceiling.
+        # For ft/nft (carrier dust, market value unbounded-from-record) it stays the conscious "this token's
+        # value is mine to risk" posture.
+        if self._accept_unbounded:
+            if variant != "rxd":
+                return None
+            if record.terms.radiant_amount <= MAINNET_DUST_CEILING_PHOTONS:
+                return None
+            # else: above-dust RXD — do NOT waive; fall through to the relative ceiling below.
+        elif variant != "rxd":
             # radiant_amount is a token quantity / NFT carrier dust here, not a market value — the
             # watchtower cannot bound it from the record. Fail closed (an ft/nft autonomous claim needs
             # accept_unbounded_reorg_risk, i.e. a conscious dust posture).

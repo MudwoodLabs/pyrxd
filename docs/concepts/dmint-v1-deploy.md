@@ -27,11 +27,12 @@ picks one of the N contract UTXOs, finds a PoW nonce, spends it, and
 re-creates it at `height+1` with the same `tokenRef`. Total supply is
 `num_contracts × max_height × reward_photons`.
 
-V2 dMint exists in Photonic Wallet's source but **no live mainnet
-contracts are V2**, so pyrxd's `prepare_dmint_deploy` accepts V2 only
-behind an explicit `allow_v2_deploy=True` opt-in. See [the Photonic
-divergences section below](#photonic-divergences) for why this gate
-exists.
+As of 0.9.0, V2 dMint is **consensus-validated and mainnet-proven** across all
+five DAA modes (byte-matched to canonical Photonic), so `prepare_dmint_deploy`
+deploys **V2 by default** (`allow_v2_deploy` defaults to `True`); the historical
+`allow_v2_deploy=False` opt-out is deprecated and soft-warns. This page documents
+the V1 format, which remains the established mainnet format; the
+[`deploy-dmint --v2` CLI](../how-to/issue-a-dmint-token.md) covers V2.
 
 ---
 
@@ -271,10 +272,11 @@ docs):
    misclassify ~51 % of legitimate P2PKH addresses; the opcode-aware
    walker only counts opcodes, not push payload bytes.
 
-2. **V2-by-accident.** pyrxd's `prepare_dmint_deploy` refuses
-   `DmintV2DeployParams` unless the caller explicitly passes
-   `allow_v2_deploy=True`. No live miner targets V2; deploying V2
-   produces a token nobody can mine.
+2. **V1 vs V2.** As of 0.9.0 `prepare_dmint_deploy` deploys **V2 by
+   default** (`allow_v2_deploy` defaults `True`) — V2 is consensus-validated
+   and mainnet-proven, and the bundled parallel miner mines it via
+   `claim-dmint`. Pass `DmintV1DeployParams` to deploy the established V1
+   format; the deprecated `allow_v2_deploy=False` opt-out soft-warns.
 
 3. **Synthetic-only validation.** Round-trip tests don't catch
    shape mismatches with mainnet. pyrxd pins V1 builders with

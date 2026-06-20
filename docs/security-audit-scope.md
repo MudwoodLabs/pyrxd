@@ -10,8 +10,12 @@ risks** — consolidated from the threat model, the design-decision notes, and t
 residual notes so the audit reviews a *stated* boundary rather than rediscovering it. pyrxd is
 open-source software, provided as-is under the [LICENSE](../LICENSE); the cross-chain swap stack
 is **unaudited**, and this brief is the deliverable that lets an independent review certify it.
-The code defaults the swap legs to test networks via `require_audit_cleared` (a fail-closed
-opt-in), so an audit's sign-off is the natural trigger to set `audit_cleared=True` for mainnet.
+As of 0.9.0 the library-wide `require_audit_cleared` / `require_spv_sole_authority_cleared` gates are
+**advisory no-ops** (retained for backward compatibility) — pyrxd "does what you tell it," consistent
+with running a Radiant node, and does **not** code-block mainnet/real-value use. Real-value safety is
+therefore a documented operator responsibility, not a code-enforced default (see `ASSUME-AS-IS-POSTURE`
+in §3). The one exception is the autonomous claim executor's `enable_autonomous_mainnet_custody`
+(default off), which still affirmatively gates unattended mainnet money-movement.
 
 ## 0. How to use this brief
 
@@ -19,8 +23,11 @@ opt-in), so an audit's sign-off is the natural trigger to set `audit_cleared=Tru
   had a legacy id (a threat-model `S#`/gap `#n`, or an in-code tag like `SEEN-1`, `MEDIUM-1`,
   `R1`, `F-01`), the legacy id is noted — the legacy numbering has known collisions (see §7).
 - **Severity** is the *pre-mitigation* class; **Status** is `open` / `mitigated` (a control
-  exists) / `accepted` (a conscious residual) / `deferred` (a feature not built) / `gate` (a
-  fail-closed opt-in that defaults the risk off until consciously enabled).
+  exists) / `accepted` (a conscious residual) / `deferred` (a feature not built) / `gate` (an
+  affirmative opt-in that defaults the risk off until consciously enabled). NOTE: the legacy
+  library-wide `require_audit_cleared` / `require_spv_sole_authority_cleared` "gates" are **advisory
+  no-ops** as of 0.9.0 (posture-only, not fail-closed); the only live `gate` is the executor's
+  `enable_autonomous_mainnet_custody`.
 - Start at §5 (priority targets) for where the return-on-review is highest.
 
 ## 1. Scope — what to audit
@@ -65,27 +72,44 @@ The audit should accept or challenge these explicitly — the code's safety argu
 - **`ASSUME-CAPFEE-ISOLATION`.** `CappedFeeWalletSource`'s structural ceiling is real **only if**
   the operator funds it from a key isolated from the main wallet (the class validates P2PKH +
   wif-control + the cap, but cannot verify key isolation). See `CAPFEE-ISOLATION`.
-- **`ASSUME-PRE-AUDIT-GATE`.** The HTLC swap defaults to test networks via `require_audit_cleared`
-  (`AUDIT_CLEARED_NETWORKS = {bcrt, regtest, tb, signet, rltc, tltc}`), and covenant-less SPV
-  value-release defaults off via `require_spv_sole_authority_cleared`. Both are advisory
-  fail-closed opt-ins — mainnet use requires consciously setting the opt-in.
-- **`ASSUME-WATCH-ALERT-ONLY`.** The watchtower core is **alert-only and keyless**; it never
-  touches the preimage `p`. The sole autonomous action (v2 BTC refund) is dormant-by-construction
-  + dust-capped (10 000 sats). R1's closure therefore rests on **taker/operator liveness within
-  `t_rxd`**, not on automation — any "watchtower auto-claim" description is wrong against the code.
+- **`ASSUME-AS-IS-POSTURE`** (was `ASSUME-PRE-AUDIT-GATE`). As of 0.9.0 the library-wide
+  `require_audit_cleared` (`AUDIT_CLEARED_NETWORKS = {bcrt, regtest, tb, signet, rltc, tltc}`) and
+  `require_spv_sole_authority_cleared` gates are **advisory no-ops** — they no longer block mainnet /
+  real-value use (`spv/proof.py`, `btc_wallet/htlc_leg.py` both note "retained for backward-compatibility;
+  no longer blocks"). pyrxd "does what you tell it," like running a Radiant node: real-value safety is a
+  documented operator responsibility, not a code-enforced default. An auditor should treat these as
+  *posture documentation*, not a fail-closed property. The single still-live affirmative gate is the
+  executor's `enable_autonomous_mainnet_custody` (next item).
+- **`ASSUME-WATCH-ALERT-ONLY`.** The watchtower core is **alert-only and keyless for the asset**; it
+  never holds a value key and never touches `p` except to scrape the maker's already-public preimage.
+  Two autonomous actions exist, both bounded: the v2 BTC refund (operator-pre-signed, dust-capped
+  10 000 sats) and the Radiant **claim executor** (`watch/claim_executor.py`). The claim executor is
+  **keyless for the asset** (`output[0]` pinned to the taker holder PKH → cannot redirect the asset;
+  a stolen *fee* key burns only dust fees), **dormant-by-construction** (needs a wired resolver + a
+  per-swap covenant sidecar), and **armed-by-exception** (`enable_autonomous_mainnet_custody`, default
+  off, gates any value-bearing network). Autonomous RXD claim size is bounded by `claim_dust_ceiling`
+  (a default the operator raises with explicit per-value consent; the blunt `accept_unbounded_reorg_risk`
+  flag cannot cross it). R1's closure rests on **taker/operator liveness within `t_rxd`** for an un-armed
+  or un-wired tower, and on the executor within the consented value bound for an armed one — there is no
+  unattended asset-theft surface. See `CAPFEE-TYPE-GATE` for the (recommended-not-enforced) fee-source cap.
 
-## 4. Fail-closed opt-in gates
+## 4. Affirmative opt-in gates
 
-The code defaults value-bearing operation off unless an explicit opt-in is set — these are the
-seams an audit would certify before they are enabled:
+These are the live seams that default value-bearing risk off unless an explicit opt-in is set —
+the seams an audit would certify before they are enabled:
 
 | Gate | Defaults off | Where |
 |---|---|---|
-| `require_audit_cleared` / `AUDIT_CLEARED_NETWORKS` | any mainnet swap leg | `btc_wallet/htlc_leg.py`, `gravity/radiant_leg.py` |
-| `require_spv_sole_authority_cleared` | covenant-less SPV value-release | `spv/proof.py` |
+| `enable_autonomous_mainnet_custody` | unattended mainnet asset-claim broadcast | `gravity/watch/claim_executor.py` |
 | `require_measured` margins (`MEDIUM-1`) | a real-value ETH swap on *estimated* margins | `gravity/swap_coordinator.py` |
 | value-scaled claim burial vs `accept_flat_burial` | a non-dust swap reorg-reversible at flat burial | `gravity/swap_coordinator.py` |
 | durable seen-store default (was `accept_nondurable_seen`) | replay/free-option window across restart | `gravity/seen_store.py`, value harnesses |
+| `claim_dust_ceiling` (autonomous claim) | non-dust autonomous RXD claim (raise = explicit per-value consent) | `gravity/watch/claim_executor.py` |
+
+> **Demoted (advisory no-ops as of 0.9.0, NOT fail-closed):** `require_audit_cleared` /
+> `AUDIT_CLEARED_NETWORKS` (`btc_wallet/htlc_leg.py`, `gravity/radiant_leg.py`) and
+> `require_spv_sole_authority_cleared` (`spv/proof.py`). These no longer block mainnet use — they are
+> posture documentation only (see `ASSUME-AS-IS-POSTURE`). Do not certify them as fail-closed.
 
 ## 5. Priority targets (ranked by expected return)
 
@@ -124,7 +148,7 @@ code docstring (the brief's value-add — these would otherwise be missed).
 | ID | Sev | Status | Residual | Where |
 |---|---|---|---|---|
 | `CAPFEE-ISOLATION` | high | accepted | The structural ceiling holds only if the pool key is isolated from the main wallet — the class cannot verify this | `capped_fee_source.py` |
-| `CAPFEE-TYPE-GATE` | high | open | `RadiantCovenantLeg`'s `FeeUtxoSource` gate can't distinguish capped from uncapped — future autonomous wiring **must** assert the concrete type | `radiant_leg.py` |
+| `CAPFEE-TYPE-GATE` | high | accepted | `RadiantCovenantLeg` accepts any `FeeUtxoSource` (shape, not capped type). As-is posture decision (0.9.0+): `CappedFeeWalletSource` is **recommended, not enforced** — the library hands you the safe tool, it doesn't refuse your fee source. Blast radius of an uncapped key is fees-only (cannot redirect the asset); arming the autonomous path is the affirmative gate. | `radiant_leg.py`, `claim_executor.py` |
 | `CAPFEE-MANUAL-REFILL` | medium | accepted | Pool refill must be a manual, audited op — never an auto top-up from the main wallet | `capped_fee_source.py` |
 | `CAPFEE-FAILCLOSED-CALLER` | medium | accepted | The caller must treat `FeePoolExhaustedError` as fail-closed (no uncapped fallback) | `capped_fee_source.py` |
 
@@ -178,8 +202,7 @@ code docstring (the brief's value-add — these would otherwise be missed).
 | `GLYPH-OWNERPKH` | high | open | Broadcast summary doesn't surface the resolved `owner_pkh` from a metadata file (hostile-metadata substitution) | TM S7 / gap #9 |
 | `GLYPH-PARSER-FUZZ` | medium | open | Attacker-facing parser surface not yet fuzzed (hypothesis stage planned) | TM gap #3 / issue #10 |
 | `GLYPH-DUAL-WALKER` | medium | open | Phantom-ref risk: two divergent opcode walkers can drift on reserved bytes | FT-covenant note |
-| `DMINT-V2-GOLDEN` | medium | open | No mainnet golden vectors for V2 dMint / FT transfer / NFT mint | dMint notes |
-| `DMINT-V2-UNVALIDATED` | low | open | V2 dMint contracts unvalidated (`V2UnvalidatedWarning`); no CLI verb yet | TM gap #13 |
+| `DMINT-V2-GOLDEN` | medium | open | No mainnet golden vectors for V2 dMint / FT transfer / NFT mint. (V2 itself is now consensus-validated + mainnet-proven across all 5 DAA modes with `deploy-dmint --v2` / `claim-dmint` CLI — the former `DMINT-V2-UNVALIDATED` residual is superseded; only golden-vector pinning remains.) | dMint notes |
 
 ### 6.8 Supply chain / process / deferred
 | ID | Sev | Status | Residual | Where / legacy |
