@@ -9,6 +9,7 @@ functions, and exceptions.
 
    pyrxd
    glyph
+   dmint
    gravity
    eth_wallet
    swap
