@@ -20,6 +20,14 @@ Glyph tokens
 - ``pyrxd glyph deploy-dmint`` / ``claim-dmint`` — deploy a dMint contract and mine/claim from one.
 - ``pyrxd glyph list`` — list the Glyph tokens a wallet holds.
 
+Cross-chain swaps
+-----------------
+
+- ``pyrxd swap status --swap-file PATH`` — **read-only** inspection of a Gravity cross-chain swap
+  from its recovery file: identity + timelock deadlines, and with ``--check-chain`` a read-only
+  ElectrumX query of the RXD covenant that classifies the live situation (LOCKED / REFUND_OPEN /
+  SETTLED / NOT_FUNDED) and prints the single safe next action. Never broadcasts.
+
 Local dev chain
 ---------------
 

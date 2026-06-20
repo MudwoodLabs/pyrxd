@@ -180,7 +180,7 @@ def run() -> None:
 # and that breaks static analysis even though Python's import system
 # tolerates it at runtime.
 
-from . import agent_cmds, glyph_cmds, query_cmds, regtest_cmds, setup_cmd, wallet_cmds  # noqa: E402
+from . import agent_cmds, glyph_cmds, query_cmds, regtest_cmds, setup_cmd, swap_cmds, wallet_cmds  # noqa: E402
 
 cli.add_command(agent_cmds.agent_group)
 cli.add_command(glyph_cmds.glyph_group)
@@ -189,6 +189,7 @@ cli.add_command(query_cmds.balance_cmd)
 cli.add_command(query_cmds.utxos_cmd)
 cli.add_command(regtest_cmds.regtest_group)
 cli.add_command(setup_cmd.setup_cmd)
+cli.add_command(swap_cmds.swap_group)
 cli.add_command(wallet_cmds.wallet_group)
 
 
