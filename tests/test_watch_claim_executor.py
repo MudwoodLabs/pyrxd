@@ -208,6 +208,9 @@ async def _armed_executor(
     )
     chain_io = _FakeChainIO(value=terms.radiant_amount, confs=confs, missing=missing, mempool_unspent=mempool_unspent)
     leg = _FakeRadiantLeg(chain_io)
+    # "armed" fixture: arm mainnet custody by default so the value-bearing tests exercise the claim path.
+    # (No effect on audit-cleared networks like bcrt, where _value_bearing is False.) Override via kw.
+    kw.setdefault("enable_autonomous_mainnet_custody", True)
     ex = ClaimExecutor(
         resolve_leg=_resolver(leg),
         claim_status_source=_FakeStatusSource(claim_txid=claim_txid, claimed=status_claimed, confs=btc_confs),
@@ -287,6 +290,27 @@ async def test_low_corroboration_allowed_with_optin():
 
 
 # --------------------------------------------------------------------------- tests: value-vs-reorg cap (HIGH-1)
+
+
+async def test_value_bearing_declines_without_mainnet_custody_arming():
+    # As-is posture: a wired executor on a value-bearing network broadcasts NOTHING until the operator
+    # explicitly arms it — even when value/finality would otherwise permit the claim.
+    ex, leg, rec, _ = await _armed_executor(
+        network="bc", reorg_cost_per_block=1_000, radiant_amount=1_000, enable_autonomous_mainnet_custody=False
+    )
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert leg.claimed_with is None
+
+
+async def test_value_bearing_above_default_ceiling_broadcasts_when_operator_raises_it():
+    # The ceiling is a *default the operator raises with explicit per-value consent*, not a hard block.
+    # value 50_000 is ABOVE the 10k default ceiling but below the explicitly-raised claim_dust_ceiling
+    # (100_000) AND below the relative reorg ceiling floor(6 * 20_000 / 2.0) = 60_000 → broadcasts.
+    ex, leg, rec, p = await _armed_executor(
+        network="bc", reorg_cost_per_block=20_000, radiant_amount=50_000, claim_dust_ceiling=100_000
+    )
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
+    assert leg.claimed_with == p
 
 
 async def test_value_bearing_rxd_over_ceiling_declines():
