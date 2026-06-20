@@ -66,10 +66,16 @@ If you are deploying pyrxd in a production system handling real funds:
 
 ## Supported Versions
 
+pyrxd is pre-1.0: the API and on-chain formats may change between minors, and
+security fixes land on the latest minor only. Security-relevant fixes have
+already shipped across recent minors (e.g. the HTLC preimage-length pin in
+0.8.0), so running an older release means running known-unfixed code — upgrade
+to receive them.
+
 | Version | Supported |
 |---------|-----------|
-| 0.2.x   | ✅ Yes (current) |
-| < 0.2   | ❌ No (pre-public release; do not use) |
+| Latest published minor | ✅ Yes — receives security fixes (see CHANGELOG / PyPI) |
+| Any earlier release     | ❌ No — upgrade to the latest minor |
 
 Once we reach 1.0, the policy will move to a published support window
 covering at least the current major and the most recent minor of the
