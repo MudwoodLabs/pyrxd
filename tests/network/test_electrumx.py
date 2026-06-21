@@ -405,6 +405,18 @@ class TestBroadcastMalformedResponse:
 # behavior: each _call() future is resolved by the matching id.
 
 
+async def _drain_until(predicate, *, max_yields: int = 10_000) -> None:
+    """Yield the event loop until ``predicate()`` is true (bounded). A deterministic, slow-runner-robust
+    replacement for a fixed number of ``await asyncio.sleep(0)`` — the fixed-yield form raced and failed
+    on 3.10/3.11 CI runners (the awaited tasks hadn't reached their send yet). Bounded so a never-true
+    predicate fails fast instead of hanging."""
+    for _ in range(max_yields):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition not reached within the yield bound")
+
+
 class TestResponseCorrelation:
     """Concurrent _call() invocations must each receive the response whose
     JSON-RPC id matches the request they sent — never another caller's.
@@ -474,8 +486,7 @@ class TestResponseCorrelation:
         task_a = asyncio.create_task(client._call("blockchain.transaction.get", ["a" * 64, False]))
         task_b = asyncio.create_task(client._call("blockchain.transaction.get", ["b" * 64, False]))
         # Let both register and send.
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await _drain_until(lambda: len(send_log) == 2)
 
         # Both sends should have happened.
         assert len(send_log) == 2
@@ -527,7 +538,7 @@ class TestResponseCorrelation:
 
         # Now make a real call.
         task = asyncio.create_task(client.broadcast(_VALID_RAW_TX))
-        await asyncio.sleep(0)
+        await _drain_until(lambda: len(send_log) == 1)
         assert len(send_log) == 1
         good = "a" * 64
         await outbox.put(json.dumps({"id": send_log[0]["id"], "result": good}))
@@ -564,8 +575,7 @@ class TestResponseCorrelation:
 
         # Fire a call that will never receive a response.
         task = asyncio.create_task(client.get_tip_height())
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await _drain_until(lambda: len(client._pending) >= 1)
 
         # Close while the call is pending.
         await client.close()
@@ -602,8 +612,7 @@ class TestResponseCorrelation:
 
         task_a = asyncio.create_task(client.get_tip_height())  # will time out
         task_b = asyncio.create_task(client.broadcast(_VALID_RAW_TX))
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        await _drain_until(lambda: len(send_log) == 2)
         assert len(send_log) == 2
         id_b = send_log[1]["id"]
 
@@ -658,9 +667,8 @@ class TestResponseCorrelation:
         client._ws = ws
 
         tasks = [asyncio.create_task(client.get_tip_height()) for _ in range(5)]
-        # Give them a chance to all send.
-        for _ in range(10):
-            await asyncio.sleep(0)
+        # Wait until all five have funneled through the send lock.
+        await _drain_until(lambda: len(send_log) == 5)
 
         assert max_concurrent_sends == 1, f"send_lock should serialize sends; max concurrent was {max_concurrent_sends}"
 
@@ -697,7 +705,7 @@ class TestResponseCorrelation:
         client._ws = ws
 
         task = asyncio.create_task(client.get_tip_height())
-        await asyncio.sleep(0)
+        await _drain_until(lambda: len(send_log) >= 1)
 
         # Push two malformed messages (no id, then string id), then the real one.
         await outbox.put(json.dumps({"method": "blockchain.headers.subscribe", "params": [{"height": 999}]}))
