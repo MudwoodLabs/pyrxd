@@ -38,18 +38,31 @@ if _REPO_ROOT not in sys.path:
 #   overnight — extreme: 250_000 examples, no deadline. Hours per file.
 try:
     from hypothesis import HealthCheck, settings
+    from hypothesis.database import DirectoryBasedExampleDatabase
 
-    settings.register_profile("ci")  # no overrides
+    # COMMITTED example database (tests/.hypothesis-corpus/) so a shrunk counterexample found by any
+    # fuzz test PERSISTS and is replayed on every future run until fixed. The default .hypothesis/ dir is
+    # gitignored and ephemeral on CI runners, so found failures were silently discarded (audit follow-up).
+    # A developer who reproduces a failure commits the corpus entry; it then regresses forever. NOT
+    # gitignored (the ignore is `.hypothesis/`, a different name).
+    _corpus = DirectoryBasedExampleDatabase(os.path.join(os.path.dirname(__file__), ".hypothesis-corpus"))
+
+    # ci: keep random exploration but replay the committed corpus first, so a previously-found
+    # counterexample regresses on every run. (Hypothesis makes derandomize and a database mutually
+    # exclusive — derandomize implies database=None — and the persistent corpus is the load-bearing half.)
+    settings.register_profile("ci", database=_corpus)
     settings.register_profile(
         "deep",
         max_examples=25_000,
         deadline=None,
+        database=_corpus,
         suppress_health_check=[HealthCheck.too_slow, HealthCheck.large_base_example],
     )
     settings.register_profile(
         "overnight",
         max_examples=250_000,
         deadline=None,
+        database=_corpus,
         suppress_health_check=[HealthCheck.too_slow, HealthCheck.large_base_example],
     )
     settings.load_profile(os.environ.get("HYPOTHESIS_PROFILE", "ci"))
