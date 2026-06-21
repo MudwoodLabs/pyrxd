@@ -48,6 +48,26 @@ Out of scope:
 - Issues requiring physical access to a victim's device
 - Issues already documented in the public CHANGELOG or issue tracker
 
+## Safe Harbor for Good-Faith Research
+
+We support security research conducted in good faith and will not pursue or
+support legal action against researchers who:
+
+- Make a good-faith effort to avoid privacy violations, data destruction, and
+  service disruption while testing;
+- Test only against their **own** wallets, keys, and testnet/regtest deployments
+  — never against another user's funds or a third party's infrastructure;
+- Do not exploit a finding beyond the minimum needed to demonstrate it, and do
+  not exfiltrate, retain, or publicly disclose others' data;
+- Report privately (see above) and give us reasonable time to remediate before
+  any public disclosure.
+
+This is **authorization to test within those bounds — not a paid bug bounty.**
+pyrxd is a volunteer-maintained, pre-1.0, open-source project; there is **no
+monetary reward** at this time. We credit researchers in this file and the
+changelog with their consent. If demonstrating a finding would require moving
+real value, describe the mechanism instead — never put anyone's funds at risk.
+
 ## Status
 
 pyrxd is **pre-1.0 software**. The cryptographic primitives have not
