@@ -23,12 +23,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # CI currently only verifies 3.12. The lib supports 3.10+ in metadata but
-        # a few async tests in tests/network/test_electrumx.py are timing-sensitive
-        # on slower runners and fail on 3.10/3.11. To re-enable, fix the
-        # TestResponseCorrelation tests to be timing-robust, then add the
-        # versions back to this matrix.
-        python-version: ["3.12"]
+        # pyrxd advertises 3.10+ (classifiers + requires-python) and has a real 3.10-only
+        # code path (the tomli backport in cli/config.py), so CI verifies the whole range.
+        # The TestResponseCorrelation async tests that previously raced on slower 3.10/3.11
+        # runners now wait on a deterministic condition (_drain_until) instead of a fixed
+        # number of sleep(0) yields.
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6
