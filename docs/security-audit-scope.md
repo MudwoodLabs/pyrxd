@@ -202,7 +202,7 @@ code docstring (the brief's value-add — these would otherwise be missed).
 | `GLYPH-OWNERPKH` | high | open | Broadcast summary doesn't surface the resolved `owner_pkh` from a metadata file (hostile-metadata substitution) | TM S7 / gap #9 |
 | `GLYPH-PARSER-FUZZ` | medium | open | Attacker-facing parser surface not yet fuzzed (hypothesis stage planned) | TM gap #3 / issue #10 |
 | `GLYPH-DUAL-WALKER` | medium | open | Phantom-ref risk: two divergent opcode walkers can drift on reserved bytes | FT-covenant note |
-| `DMINT-V2-GOLDEN` | medium | open | No mainnet golden vectors for V2 dMint / FT transfer / NFT mint. (V2 itself is now consensus-validated + mainnet-proven across all 5 DAA modes with `deploy-dmint --v2` / `claim-dmint` CLI — the former `DMINT-V2-UNVALIDATED` residual is superseded; only golden-vector pinning remains.) | dMint notes |
+| `DMINT-V2-GOLDEN` | medium | mitigated (partial) | The **V2 FIXED contract** builder is now pinned byte-equal to the first mainnet V2 deploy (`tests/test_dmint_v2_mainnet_golden.py` vs reveal `95335028…bb16fb09`). FT-transfer / NFT-mint mainnet golden vectors remain open. Note: the mainnet **LWMA** deploy (`dea3beb9…`) is on **pre-fix** bytecode (before the `OP_0 OP_MAX` timeDelta floor) so it is not a valid anchor for the current builder — the post-fix LWMA path is covered by regenerated synthetic vectors + the regtest e2e. (V2 itself is consensus-validated + mainnet-proven across all 5 DAA modes; the former `DMINT-V2-UNVALIDATED` residual is superseded.) | `tests/test_dmint_v2_mainnet_golden.py` |
 
 ### 6.8 Supply chain / process / deferred
 | ID | Sev | Status | Residual | Where / legacy |
