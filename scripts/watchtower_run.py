@@ -60,6 +60,7 @@ from pyrxd.gravity.watch import (
     mempool_space_outspend,
     run_loop,
 )
+from pyrxd.gravity.watch.preflight import preflight_timing
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MempoolSpaceFundingReader, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
 
@@ -326,6 +327,13 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "blocking past the dead-man's-switch window (defaults to 4x poll interval)",
     )
     p.add_argument("--poll-interval-s", type=float, default=30.0)
+    p.add_argument(
+        "--deadman-max-silence-s",
+        type=float,
+        default=180.0,
+        help="the dead-man's-switch --max-silence-s you run watchtower_deadman.py with; used only for a "
+        "boot-time timing cross-check (the watchdog is a separate process). Set to match it.",
+    )
     p.add_argument("--safety-window-blocks", type=int, default=6)
     p.add_argument("--quorum", type=int, default=2, help="BTC funding-reader quorum (of 3 Esplora sources)")
     p.add_argument("--block-interval-s", type=float, default=600.0)
@@ -448,6 +456,24 @@ async def _amain(argv=None) -> int:
             "(the dead-man's-switch is DISABLED — a crash/wedge will NOT be detected). Configure at least "
             "one before relying on this tower."
         )
+
+    # Boot-time timing-safety preflight (config-only, no chain reads). Fail fast on a footgun config
+    # rather than false-paging (or paging too late) in production — see docs/runbooks/watchtower-operations.md.
+    effective_tick_timeout = (
+        args.tick_timeout_s if args.tick_timeout_s is not None else max(4.0 * args.poll_interval_s, 30.0)
+    )
+    timing_problems = preflight_timing(
+        poll_interval_s=args.poll_interval_s,
+        tick_timeout_s=effective_tick_timeout,
+        safety_window_blocks=args.safety_window_blocks,
+        rxd_block_interval_s=args.rxd_block_interval_s,
+        deadman_max_silence_s=args.deadman_max_silence_s,
+    )
+    for problem in timing_problems:
+        (logger.error if problem.severity == "error" else logger.warning)("timing preflight: %s", problem.message)
+    if any(p.severity == "error" for p in timing_problems):
+        logger.error("refusing to start on a timing-unsafe config (fix the errors above)")
+        return 2
 
     reader = _build_funding_reader(args.network, esploras, args.quorum)
     async with contextlib.AsyncExitStack() as stack:
