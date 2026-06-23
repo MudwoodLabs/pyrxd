@@ -75,6 +75,12 @@ paperwork process. Most editors and CI systems handle DCO transparently.
   your change pulls in a new third-party package.
 - **Don't bypass tests or linters.** If a check is failing, fix the
   cause; don't add a `# noqa` or skip the test.
+- **Flag breaking-class changes.** "Breaking" for an on-chain SDK is more
+  than a changed Python signature — it includes covenant/script bytecode,
+  wire/serialization formats, and **security-posture / safety-default**
+  changes. If your PR touches any of those, say so in the CHANGELOG and add
+  a deprecation/migration note. See
+  [`docs/versioning-and-deprecation-policy.md`](docs/versioning-and-deprecation-policy.md).
 
 ## Code style
 
