@@ -26,8 +26,9 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from collections import Counter
+from collections.abc import Sequence
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 import aiohttp
 
@@ -1058,6 +1059,31 @@ class MempoolSpaceFundingReader:
         await self._http.close()
 
 
+def endpoint_host(url: str) -> str | None:
+    """The lowercased hostname of a base URL, for endpoint-diversity checks. ``None`` if unparseable
+    (a token with no host is conservatively treated as its own distinct source by the caller)."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    parsed = urlparse(url if "://" in url else "//" + url.strip())
+    host = (parsed.hostname or "").lower()
+    return host or None
+
+
+def count_distinct_hosts(urls: Sequence[str]) -> int:
+    """Number of DISTINCT endpoint hosts in *urls*. URLs whose host can't be parsed are counted as one
+    distinct source each (we can't prove they collide). Used to bound a real quorum: a quorum of
+    same-host endpoints is false corroboration — one hostile/buggy host satisfies the whole "quorum"."""
+    hosts: set[str] = set()
+    opaque = 0
+    for u in urls:
+        h = endpoint_host(u)
+        if h is None:
+            opaque += 1
+        else:
+            hosts.add(h)
+    return len(hosts) + opaque
+
+
 class MultiSourceBtcFundingReader:
     """Quorum ``BtcFundingReader`` over N independent Esplora-style providers.
 
@@ -1101,10 +1127,36 @@ class MultiSourceBtcFundingReader:
         self._dust_cap_sats = dust_cap_sats
 
     @classmethod
+    def from_endpoints(
+        cls, urls: Sequence[str], *, quorum: int = 2, dust_cap_sats: int = 10_000
+    ) -> MultiSourceBtcFundingReader:
+        """Build the reader from Esplora base URLs, **clamping the effective quorum to the number of
+        DISTINCT hosts**. A quorum of same-host endpoints is false corroboration (one hostile/buggy host
+        satisfies it), so e.g. two ``mempool.space`` URLs can never form a 2-of-2 quorum. A clamp is
+        logged loudly so the operator sees the real corroboration level."""
+        if not urls:
+            raise ValidationError("from_endpoints requires at least one endpoint URL")
+        distinct = count_distinct_hosts(urls)
+        effective = max(1, min(quorum, distinct))
+        if effective < quorum:
+            logger.warning(
+                "BTC funding quorum: %d endpoint(s) resolve to only %d distinct host(s); clamping quorum "
+                "%d -> %d. A quorum of same-host endpoints is false corroboration — configure >= %d "
+                "INDEPENDENT hosts for genuine %d-of-N safety.",
+                len(urls),
+                distinct,
+                quorum,
+                effective,
+                quorum,
+                quorum,
+            )
+        readers = [MempoolSpaceFundingReader(base_url=u) for u in urls]
+        return cls(readers, quorum=effective, dust_cap_sats=dust_cap_sats)
+
+    @classmethod
     def default_mainnet(cls, *, quorum: int = 2, dust_cap_sats: int = 10_000) -> MultiSourceBtcFundingReader:
         """Wire the three default independent mainnet Esplora endpoints (2-of-3)."""
-        readers = [MempoolSpaceFundingReader(base_url=u) for u in cls.DEFAULT_MAINNET_ENDPOINTS]
-        return cls(readers, quorum=quorum, dust_cap_sats=dust_cap_sats)
+        return cls.from_endpoints(cls.DEFAULT_MAINNET_ENDPOINTS, quorum=quorum, dust_cap_sats=dust_cap_sats)
 
     async def _gather(self, coro_fn) -> list:
         """Run ``coro_fn`` on every reader; return only the successful (non-Exception)
