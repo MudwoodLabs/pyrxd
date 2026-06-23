@@ -61,7 +61,7 @@ from pyrxd.gravity.watch import (
     run_loop,
 )
 from pyrxd.gravity.watch.preflight import preflight_timing
-from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MempoolSpaceFundingReader, MultiSourceBtcFundingReader
+from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
 
 logger = logging.getLogger("pyrxd.watchtower")
@@ -178,8 +178,10 @@ def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> Mul
     gate stays WATCH (fail-closed, never a wrongful broadcast)."""
     if network == "bc":
         return MultiSourceBtcFundingReader.default_mainnet(quorum=quorum)
-    readers = [MempoolSpaceFundingReader(base_url=u.rstrip("/") + "/api") for u in esploras]
-    return MultiSourceBtcFundingReader(readers, quorum=min(quorum, len(readers)), dust_cap_sats=10_000)
+    # from_endpoints clamps the effective quorum to the number of DISTINCT hosts (not URL count) and warns
+    # — so two same-host esploras can't masquerade as a real 2-of-2 quorum (false corroboration).
+    api_urls = [u.rstrip("/") + "/api" for u in esploras]
+    return MultiSourceBtcFundingReader.from_endpoints(api_urls, quorum=quorum, dust_cap_sats=10_000)
 
 
 #: Default INDEPENDENT public Radiant ElectrumX endpoints (distinct operators), verified live
