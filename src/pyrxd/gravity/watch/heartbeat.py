@@ -37,14 +37,19 @@ _CLOCK_SKEW_TOLERANCE_S = 60.0
 
 
 class FileHeartbeat:
-    """A heartbeat sink that atomically writes ``{ts, tick, swaps, paged, undelivered,
-    unacked_critical}`` to a file each tick — the cross-process liveness signal the
-    :class:`DeadMansSwitch` watches. ``undelivered`` (red-team MEDIUM) is the count of pages the
-    alerter FAILED to deliver this tick. ``unacked_critical`` (review MEDIUM) is the count of
-    outstanding, operator-un-ACK'd CRITICAL claim/squeeze situations (from
-    :meth:`DedupAlerter.unacked_critical_count`, injected): a persistent non-zero value means
-    time-critical pages are going unacknowledged, so an external monitor can escalate. Both let a
-    monitor detect 'alive but losing the claim race' rather than seeing a healthy-looking beat."""
+    """A heartbeat sink that atomically writes ``{ts, tick, swaps, paged, squeezed, undelivered,
+    errored, min_deadline_rxd_height, unacked_critical}`` to a file each tick — the cross-process
+    liveness signal the :class:`DeadMansSwitch` watches, plus **leading indicators** so a monitor sees
+    trouble building before liveness is lost (not just a healthy-looking beat):
+
+    * ``undelivered`` (red-team MEDIUM) — pages the alerter FAILED to deliver this tick.
+    * ``squeezed`` — winner-take-all / decision-required swaps this tick (value at risk).
+    * ``errored`` — swaps whose read/exec FAILED this tick (a degraded-tick proxy).
+    * ``min_deadline_rxd_height`` — the SOONEST claim/refund deadline across in-flight swaps; a monitor
+      that knows the current RXD height watches the remaining slack shrink toward a squeeze.
+    * ``unacked_critical`` (review MEDIUM) — outstanding operator-un-ACK'd CRITICAL claim/squeeze
+      situations (from :meth:`DedupAlerter.unacked_critical_count`, injected); a persistent non-zero
+      value means time-critical pages are going unacknowledged, so a monitor can escalate."""
 
     def __init__(
         self,
@@ -60,12 +65,23 @@ class FileHeartbeat:
     def __call__(self, iteration: int, results) -> None:
         paged = sum(1 for r in results if r.decision.intent.value.startswith("page_"))
         undelivered = sum(1 for r in results if getattr(r, "alert_delivered", None) is False)
+        # Leading indicators (a monitor sees trouble building before liveness is lost):
+        #   squeezed                 — winner-take-all / decision-required swaps this tick (value at risk).
+        #   errored                  — swaps whose read/exec FAILED this tick (a degraded-tick proxy).
+        #   min_deadline_rxd_height  — the SOONEST claim/refund deadline across in-flight swaps; a monitor
+        #                              that knows the current RXD height watches the remaining slack shrink.
+        squeezed = sum(1 for r in results if r.decision.intent.value == "page_squeezed")
+        errored = sum(1 for r in results if getattr(r, "error", None) is not None)
+        deadlines = [r.decision.deadline_rxd_height for r in results if r.decision.deadline_rxd_height is not None]
         data = {
             "ts": self._clock(),
             "tick": iteration,
             "swaps": len(results),
             "paged": paged,
+            "squeezed": squeezed,
             "undelivered": undelivered,
+            "errored": errored,
+            "min_deadline_rxd_height": min(deadlines) if deadlines else None,
         }
         if self._unacked is not None:
             # The count source must never crash the liveness write — degrade to a -1 sentinel

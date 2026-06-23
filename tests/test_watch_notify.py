@@ -145,8 +145,27 @@ def test_file_heartbeat_writes_atomically(tmp_path):
         "tick": 5,
         "swaps": 2,
         "paged": 1,
+        "squeezed": 0,
         "undelivered": 0,
+        "errored": 0,
+        "min_deadline_rxd_height": None,
     }
+
+
+def test_file_heartbeat_leading_indicators(tmp_path):
+    # squeezed/errored counts + the soonest deadline let a monitor see trouble building.
+    hb = FileHeartbeat(tmp_path / "hb.json", clock=lambda: 1000.0)
+    results = [
+        ReconcileResult("a", Decision(Intent.PAGE_SQUEEZED, reason="winner-take-all", deadline_rxd_height=120)),
+        ReconcileResult("b", Decision(Intent.PAGE_CLAIM, reason="claim", deadline_rxd_height=200)),
+        ReconcileResult("c", Decision(Intent.WATCH, reason="watch"), error="read failed"),
+    ]
+    hb(7, results)
+    data = json.loads((tmp_path / "hb.json").read_text())
+    assert data["squeezed"] == 1
+    assert data["errored"] == 1
+    assert data["min_deadline_rxd_height"] == 120  # the soonest of {120, 200}
+    assert data["paged"] == 2  # PAGE_SQUEEZED + PAGE_CLAIM both start with "page_"
 
 
 def test_heartbeat_age(tmp_path):
