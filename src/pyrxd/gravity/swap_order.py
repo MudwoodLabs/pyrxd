@@ -3,9 +3,10 @@
 Decodes a **v2** RSWP order advertised in an ``OP_RETURN`` output into structured fields, including the
 Photonic ``MultiTxOutV1`` ``price_terms`` (the outputs the maker demands). This is the **canonical**
 decode: it follows the on-chain producer (Photonic-Wallet) and the consensus-node parser
-(Radiant-Core ``swapindex.cpp``), **not** RXinDexer — which mis-decodes ``price_terms`` as small price
-integers and produces garbage against real on-chain orders (see ``docs/swap-order-wire-format.md``
-§Conflicts). Read-only: this builds and signs nothing.
+(Radiant-Core ``swapindex.cpp``). It matches current ``Radiant-Core/RXinDexer``, which decodes the same
+``MultiTxOutV1``. (RXinDexer *historically* mis-decoded ``price_terms`` as small integers and produced
+garbage against real orders; that was fixed upstream 2026-06-01, commit ``24572c7c``.) See
+``docs/swap-order-wire-format.md`` §Conflicts. Read-only: this builds and signs nothing.
 
 The frame (pushes after ``OP_RETURN``): ``"RSWP" version flags offeredType termsType tokenID
 [wantTokenID] offeredUTXOHash offeredUTXOIndex priceTerms… signature``. The tail rule (node
