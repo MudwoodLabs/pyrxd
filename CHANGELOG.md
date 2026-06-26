@@ -8,7 +8,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 Feature + audit-readiness release (vs 0.9.0's posture-only one). New read-only tooling
 (swap-status CLI, RSWP order decoder), watchtower hardening, language-agnostic
-cross-implementation conformance vectors, and a mutation-testing gate. Every addition
+cross-implementation conformance vectors, and a mutation-testing harness. Every addition
 is additive or opt-in (default off); no breaking API changes. **The cross-chain swap
 stack remains unaudited — verify it yourself before moving real value.**
 
@@ -32,8 +32,10 @@ stack remains unaudited — verify it yourself before moving real value.**
   `min_deadline_rxd_height` so a monitor sees trouble building before liveness is lost (#261).
 - **Autonomous claim executor arming gate** — `enable_autonomous_mainnet_custody`
   (default off), with the as-is posture documented (#244).
-- **Mutation-testing gate** — `task mutate` (cosmic-ray) over the SPV verification core,
-  plus SPV input-validation hardening tests that close the genuine gaps it found (#268).
+- **Mutation-testing harness** — `task mutate` (cosmic-ray) measures mutant-kill coverage
+  over the SPV verification core (run on demand, not wired into CI), plus SPV
+  input-validation hardening **tests** that kill the surviving mutants it surfaced —
+  closing test-coverage gaps, with no SPV source change required (#268).
 - dMint subpackage API reference (#243); operator backup/DR and watchtower operations
   runbooks (#247, #262); mutation-testing how-to (#268); a versioning & deprecation
   policy (#263).
