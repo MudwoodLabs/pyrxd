@@ -5,8 +5,9 @@ during the spike (recorded in ``docs/brainstorms/gravity-ref-spike/.live_swap_{n
 NOTE (v2): the OP_SIZE<0x20> preimage-length pin (security review: preimage-length asset
 theft) intentionally SUPERSEDES the v1 mainnet covenant *scriptPubKey*, so the full SPK no
 longer reproduces v1 byte-for-byte — the holder scripts (unchanged by the pin) still do, and
-every claim branch now carries the 32-byte pin. v2 consensus validity is proven by the regtest
-spend/reject test (live node).
+every claim branch now carries the 32-byte pin. v2 consensus validity (that the OP_SIZE pin rejects a
+non-32-byte spend at consensus) is reasoned from the opcodes and exercised at the builder level; an
+executed live-node spend/reject test is a recommended follow-up, not yet in the tree.
 
 The remaining tests pin the two static guards (bare-0xbd opcode walk + ref count)
 and the fail-closed parameter validation — the covenant moves real value, so every
@@ -104,8 +105,15 @@ def test_all_three_covenant_variants_pin_preimage_to_32_bytes():
     claim branch must consensus-pin p to exactly 32 bytes via OP_SIZE<0x20>OP_EQUALVERIFY
     immediately before the preimage OP_SHA256 (fragment 82 0120 88 a8), so a malicious maker
     cannot reveal a non-32-byte p' that the 32-byte-only scrape_secret silently skips. CI-safe
-    (synthetic inputs, no private vectors). Full consensus rejection of a non-32-byte spend is
-    proven by the regtest spend/reject test (live radiant-core node)."""
+    (synthetic inputs, no private vectors).
+
+    Scope of this test: STRUCTURAL — it asserts the pin opcodes are present and ordered before the
+    claim hashlock. The builder-level length rejection (a non-32-byte preimage raises before a tx is
+    even built) is covered by ``test_build_htlc_claim_tx_rejects_non_32_byte_preimage`` in
+    ``tests/test_htlc_spend_productized.py``. A live-node test that hand-crafts a non-32-byte spend and
+    observes CONSENSUS rejection is NOT yet in the tree — that the OP_SIZE pin rejects at consensus
+    rests on opcode reasoning, not an executed negative test (a recommended follow-up before external
+    audit)."""
     h = hashlib.sha256(b"p" * 32).digest()
     tp, mp, gt = bytes(range(20)), bytes([0x22] * 20), "ab" * 32
     pin = b"\x82\x01\x20\x88\xa8"  # OP_SIZE  push(0x20)  OP_EQUALVERIFY  OP_SHA256

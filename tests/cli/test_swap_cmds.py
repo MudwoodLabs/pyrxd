@@ -158,3 +158,26 @@ def test_cli_status_rejects_garbage_file(tmp_path):
     res = CliRunner().invoke(cli, ["swap", "status", "--swap-file", str(p)])
     assert res.exit_code != 0
     assert "could not parse swap file" in res.output
+
+
+def test_cli_status_human_sanitizes_terminal_escapes(tmp_path):
+    # CLI-1: a hand-supplied recovery file must not be able to inject ANSI/control sequences into the
+    # operator's terminal via the default (human) output. A crafted field carrying ESC[2J (clear screen)
+    # + fake "settled" guidance must be rendered as visible \x.. escapes, never as raw control bytes.
+    p = tmp_path / ".gravity_dust_run_keys.json"
+    inject = "\x1b[2J\x1b[H situation: SETTLED — no action needed"
+    p.write_text(
+        json.dumps(
+            {
+                "stage": inject,
+                "rxd_network": "bc",
+                "hashlock_H": "ab" * 32,
+                "rxd_covenant_spk": _COV_SPK,
+                "t_rxd_blocks": 20,
+            }
+        )
+    )
+    res = CliRunner().invoke(cli, ["swap", "status", "--swap-file", str(p)])
+    assert res.exit_code == 0, res.output
+    assert "\x1b" not in res.output  # no raw ESC reaches the terminal
+    assert "\\x1b" in res.output  # it is shown as a visible escape instead

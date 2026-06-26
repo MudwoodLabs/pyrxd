@@ -48,5 +48,21 @@ EOF
   printf '  %-9s %4d mutants  %4d killed  %4d survived  (%d%% killed)\n' "$f" "$t" "$((t - s))" "$s" "$pct"
   total=$((total + t)); killed=$((killed + t - s)); surv=$((surv + s))
 done
-tpct=0; [ "$total" -gt 0 ] && tpct=$(( killed * 100 / total ))
+# Fail closed on a broken run: zero mutants means cosmic-ray init/exec silently no-op'd (missing tool,
+# wrong module path, env breakage) and the redirected stderr hid it — otherwise this would print
+# "0% killed" and exit 0, indistinguishable from a healthy run to a CI consumer.
+if [ "$total" -eq 0 ]; then
+  echo "ERROR: cosmic-ray produced 0 mutants — the run is broken (tool missing, wrong path, or every step no-op'd). Failing." >&2
+  exit 1
+fi
+tpct=$(( killed * 100 / total ))
 printf 'TOTAL: %d mutants, %d killed, %d survived (%d%% killed)\n' "$total" "$killed" "$surv" "$tpct"
+
+# Opt-in gate: when MUTATION_MIN_KILL_PCT is set, exit non-zero if the total kill rate is below it.
+# Unset (the default) => report-only measurement. The score includes known equivalent mutants that
+# cannot be killed (see docs/how-to/mutation-testing.md), so pick a threshold below 100.
+MIN_KILL="${MUTATION_MIN_KILL_PCT:-}"
+if [ -n "$MIN_KILL" ] && [ "$tpct" -lt "$MIN_KILL" ]; then
+  echo "FAIL: total kill rate ${tpct}% < threshold ${MIN_KILL}% (MUTATION_MIN_KILL_PCT)" >&2
+  exit 1
+fi

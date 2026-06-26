@@ -37,12 +37,24 @@ def test_default_mainnet_endpoints_are_independent():
     assert count_distinct_hosts(MultiSourceBtcFundingReader.DEFAULT_MAINNET_ENDPOINTS) >= 2
 
 
-def test_from_endpoints_clamps_same_host_quorum(caplog):
-    with caplog.at_level(logging.WARNING):
-        r = MultiSourceBtcFundingReader.from_endpoints(
+def test_from_endpoints_fails_closed_on_same_host_quorum():
+    # Default: insufficient host diversity FAILS CLOSED rather than silently clamping the quorum to 1
+    # (a log-only clamp could arm single-source above-dust custody — the F-17 SPOF).
+    with pytest.raises(ValidationError, match="fails closed"):
+        MultiSourceBtcFundingReader.from_endpoints(
             ["https://mempool.space/api", "https://mempool.space/signet/api"], quorum=2
         )
-    assert r._quorum == 1  # 2 URLs but only 1 distinct host → clamped
+
+
+def test_from_endpoints_clamps_same_host_quorum_with_opt_in(caplog):
+    # Explicit opt-in (mirrors --accept-single-source): clamp to the distinct-host count + warn loudly.
+    with caplog.at_level(logging.WARNING):
+        r = MultiSourceBtcFundingReader.from_endpoints(
+            ["https://mempool.space/api", "https://mempool.space/signet/api"],
+            quorum=2,
+            allow_insufficient_diversity=True,
+        )
+    assert r._quorum == 1  # 2 URLs but only 1 distinct host → clamped under the explicit opt-in
     assert "false corroboration" in caplog.text
 
 

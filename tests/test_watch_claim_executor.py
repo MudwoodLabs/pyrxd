@@ -474,6 +474,48 @@ async def test_shallow_btc_claim_waits_or_declines():
     assert leg.claimed_with is None
 
 
+async def test_fresh_reassess_passes_per_record_value_at_risk(monkeypatch):
+    # CLAIM-1 regression: the executor's fresh pre-broadcast re-assess must pass the SAME per-record
+    # value-at-risk that decide() uses (radiant_amount for an rxd swap), not let it default to None.
+    # Otherwise, under the recommended value-scaled policy (rxd_reorg_cost_per_block set,
+    # value_at_risk_photons=None), assess_claim_finality returns SQUEEZED for EVERY swap and the
+    # autonomous claim silently never fires (degrades to alert-only). Spy on the call to lock the kwarg.
+    import pyrxd.gravity.watch.claim_executor as ce
+
+    captured: dict = {}
+    real = ce.assess_claim_finality
+
+    def _spy(**kw):
+        captured.update(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(ce, "assess_claim_finality", _spy)
+    ex, _leg, rec, _p = await _armed_executor(radiant_amount=1_234)
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
+    assert captured.get("value_at_risk_photons") == 1_234  # the rxd per-record value reached the gate, not None
+
+
+async def test_fresh_reassess_value_at_risk_is_none_for_ft_nft(monkeypatch):
+    # The FT/NFT peer of the above: their on-chain radiant_amount is carrier dust, not market value, so
+    # decide()'s _value_at_risk_photons returns None and the gate still fails closed (SQUEEZED) under a
+    # value-scaled policy. Lock that the executor passes None (not the dust amount) for nft.
+    import pyrxd.gravity.watch.claim_executor as ce
+
+    captured: dict = {}
+    real = ce.assess_claim_finality
+
+    def _spy(**kw):
+        captured.update(kw)
+        return real(**kw)
+
+    monkeypatch.setattr(ce, "assess_claim_finality", _spy)
+    # unbounded dust opt-in so an nft swap reaches the fresh re-assess on bcrt (past the value cap).
+    ex, _leg, rec, _ = await _armed_executor(variant="nft", radiant_amount=1, accept_unbounded_reorg_risk=True)
+    await ex.execute("s1", rec, _claim_decision())
+    assert "value_at_risk_photons" in captured
+    assert captured["value_at_risk_photons"] is None  # ft/nft carrier dust is NOT treated as economic value
+
+
 # --------------------------------------------------------------------------- FIX 1: fire-once guard
 
 

@@ -1128,28 +1128,48 @@ class MultiSourceBtcFundingReader:
 
     @classmethod
     def from_endpoints(
-        cls, urls: Sequence[str], *, quorum: int = 2, dust_cap_sats: int = 10_000
+        cls,
+        urls: Sequence[str],
+        *,
+        quorum: int = 2,
+        dust_cap_sats: int = 10_000,
+        allow_insufficient_diversity: bool = False,
     ) -> MultiSourceBtcFundingReader:
-        """Build the reader from Esplora base URLs, **clamping the effective quorum to the number of
-        DISTINCT hosts**. A quorum of same-host endpoints is false corroboration (one hostile/buggy host
-        satisfies it), so e.g. two ``mempool.space`` URLs can never form a 2-of-2 quorum. A clamp is
-        logged loudly so the operator sees the real corroboration level."""
+        """Build the reader from Esplora base URLs, requiring at least ``quorum`` DISTINCT hosts.
+
+        A quorum of same-host endpoints is false corroboration (one hostile/buggy/MITM'd host satisfies
+        the whole "quorum"), so e.g. two ``mempool.space`` URLs can never form a genuine 2-of-2. By
+        default this **fails closed** (raises ``ValidationError``) when the endpoints resolve to fewer
+        than ``quorum`` distinct hosts, rather than silently clamping the effective quorum down to 1 —
+        a log-only clamp could arm single-source above-dust custody (the F-17 SPOF) on a misconfig.
+
+        Pass ``allow_insufficient_diversity=True`` to explicitly accept the degraded low-/single-source
+        posture (mirrors the executor's ``--accept-single-source`` dust opt-in); the clamp is then logged
+        loudly so the operator sees the real corroboration level."""
         if not urls:
             raise ValidationError("from_endpoints requires at least one endpoint URL")
         distinct = count_distinct_hosts(urls)
-        effective = max(1, min(quorum, distinct))
-        if effective < quorum:
+        if distinct < quorum:
+            if not allow_insufficient_diversity:
+                raise ValidationError(
+                    f"BTC funding quorum: {len(urls)} endpoint(s) resolve to only {distinct} distinct "
+                    f"host(s), short of quorum={quorum}. A quorum of same-host endpoints is false "
+                    f"corroboration (one hostile/buggy host satisfies it), so this fails closed. "
+                    f"Configure >= {quorum} INDEPENDENT hosts, or pass allow_insufficient_diversity=True "
+                    f"to explicitly accept the degraded single-/low-source posture."
+                )
             logger.warning(
                 "BTC funding quorum: %d endpoint(s) resolve to only %d distinct host(s); clamping quorum "
-                "%d -> %d. A quorum of same-host endpoints is false corroboration — configure >= %d "
-                "INDEPENDENT hosts for genuine %d-of-N safety.",
+                "%d -> %d (allow_insufficient_diversity). A quorum of same-host endpoints is false "
+                "corroboration — configure >= %d INDEPENDENT hosts for genuine %d-of-N safety.",
                 len(urls),
                 distinct,
                 quorum,
-                effective,
+                max(1, distinct),
                 quorum,
                 quorum,
             )
+        effective = max(1, min(quorum, distinct))
         readers = [MempoolSpaceFundingReader(base_url=u) for u in urls]
         return cls(readers, quorum=effective, dust_cap_sats=dust_cap_sats)
 

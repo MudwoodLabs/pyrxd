@@ -21,7 +21,7 @@ from pathlib import Path
 import click
 
 from .context import CliContext
-from .format import emit
+from .format import emit, sanitize_terminal
 
 # --------------------------------------------------------------------------- recovery-file parsing
 
@@ -240,16 +240,28 @@ def swap_status_cmd(ctx: CliContext, swap_file: Path, check_chain: bool) -> None
         click.echo(emit(payload, mode="quiet", quiet_field="situation" if check_chain else "counter_chain"))
         return
 
+    # Every field below is interpolated from the (untrusted) recovery file. Sanitize each so a crafted
+    # file cannot inject ANSI/control sequences into the operator's terminal and spoof the rendered
+    # status or the "next action" guidance (CLI-1). Numeric fields are int-typed (parse_recovery_file)
+    # and safe as-is; only the free-form strings need escaping.
+    _chain = sanitize_terminal(facts.counter_chain, max_len=16)
     lines = [
-        f"Swap: {facts.counter_chain.upper()}↔RXD  ({facts.asset_variant})   stage={facts.stage or '?'}",
-        f"  hashlock H : {facts.hashlock_hex}",
-        f"  covenant   : {facts.rxd_covenant_spk[:24]}…  (rxd_network={facts.rxd_network})",
+        f"Swap: {_chain.upper()}↔RXD  ({sanitize_terminal(facts.asset_variant, max_len=16)})   "
+        f"stage={sanitize_terminal(facts.stage, max_len=32) or '?'}",
+        f"  hashlock H : {sanitize_terminal(facts.hashlock_hex, max_len=64)}",
+        f"  covenant   : {sanitize_terminal(facts.rxd_covenant_spk[:24])}…  "
+        f"(rxd_network={sanitize_terminal(facts.rxd_network, max_len=16)})",
         f"  t_rxd      : {facts.t_rxd_blocks} blocks (Radiant refund / claim deadline window)",
     ]
     if facts.counter_chain == "btc":
-        lines.append(f"  t_btc      : {facts.t_btc_blocks} blocks   BTC HTLC: {facts.btc_htlc_address}")
+        lines.append(
+            f"  t_btc      : {facts.t_btc_blocks} blocks   "
+            f"BTC HTLC: {sanitize_terminal(facts.btc_htlc_address, max_len=120)}"
+        )
     else:
-        lines.append(f"  eth        : {facts.eth_chain}   timeout_unix={facts.eth_timeout_unix_s}")
+        lines.append(
+            f"  eth        : {sanitize_terminal(facts.eth_chain, max_len=32)}   timeout_unix={facts.eth_timeout_unix_s}"
+        )
     if facts.has_preimage or facts.has_keys:
         lines.append("  ⚠ this file holds keys/preimage — keep it mode 0600 and shred after the swap settles.")
     if check_chain:
