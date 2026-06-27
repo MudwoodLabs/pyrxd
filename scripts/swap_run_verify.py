@@ -23,10 +23,13 @@ SCOPE (be honest about it):
     BTC counter-leg disposition (claim reveals p -> maker; refund spends the outpoint -> taker), ETH
     counter-leg disposition (successful Claimed(p) from OUR contract -> maker; Refunded() -> taker;
     reverted/foreign-contract -> anomalous; mirrors swap_coordinator.assert_claim_provenance R6), the
-    independent re-fetch adapters (Esplora / ElectrumX / ETH RPC), the p-link/provenance check, and the
+    independent re-fetch adapters (Esplora / ElectrumX / ETH RPC), the p-link/provenance check, the
     lucky-pass MARGIN grade (a PASS whose asset-claim only just beat the maker CSV refund window is flagged
-    MARGINAL).
-  * NOT YET (clearly marked TODO): the full before/after balance ledger ("made-whole" P&L); the intent-side
+    MARGINAL), and asset-side VALUE integrity (the covenant must be funded with the agreed amount and pay
+    its full carrier to the holder — catches under-funding / short-changed payout).
+  * NOT YET (clearly marked TODO): the cross-chain net-of-fees balance "made-whole" ledger (needs balance
+    snapshots that can't be re-read at a past height independently — deliberately deferred rather than added
+    as a journal-trusted check that would weaken the all-chain-re-derived guarantee); the intent-side
     lucky-pass detector (adversary-plan vs on-chain trigger height); two-instance FSM consistency; FT/NFT
     covenant variants; BTC outpoint->spender scanning (the harness must cite the spend txid). Next-cut.
 
@@ -255,14 +258,19 @@ def rxd_expected_scripts(m: RunManifest) -> tuple[bytes, bytes, bytes]:
     return cov.funded_spk, cov.taker_holder_script, cov.maker_holder_script
 
 
-def _output_spk(raw_tx: bytes, vout: int) -> bytes:
-    """The locking script (scriptPubKey) of output `vout` of a NON-segwit (RXD) raw tx."""
+def _output(raw_tx: bytes, vout: int) -> tuple[bytes, int]:
+    """The (scriptPubKey, satoshis) of output `vout` of a NON-segwit (RXD) raw tx."""
     tx = Transaction.from_hex(raw_tx)
     if tx is None:
         raise ValueError("could not parse RXD transaction bytes")
     if not (0 <= vout < len(tx.outputs)):
         raise ValueError(f"vout {vout} out of range (tx has {len(tx.outputs)} outputs)")
-    return tx.outputs[vout].locking_script.serialize()
+    out = tx.outputs[vout]
+    return out.locking_script.serialize(), int(out.satoshis)
+
+
+def _output_spk(raw_tx: bytes, vout: int) -> bytes:
+    return _output(raw_tx, vout)[0]
 
 
 def verify_asset_leg(
@@ -275,7 +283,14 @@ def verify_asset_leg(
     """
     notes: list[str] = []
     funded_spk, taker_holder, maker_holder = rxd_expected_scripts(m)
-    observed_funding_spk = _output_spk(covenant_funding_tx, m.covenant_funding.vout)
+    observed_funding_spk, observed_funding_value = _output(covenant_funding_tx, m.covenant_funding.vout)
+    # Independent value-integrity: the covenant must carry the agreed amount (catches an under-funded asset —
+    # a partial-fill / short-change attack the SPK check alone would miss).
+    if observed_funding_value != m.rxd_amount:
+        notes.append(
+            f"WARNING: covenant funded with {observed_funding_value} photons, agreed {m.rxd_amount} "
+            f"(value mismatch — asset under/over-funded)"
+        )
     if observed_funding_spk != funded_spk:
         return AssetLeg.ANOMALOUS, [
             "covenant funding output SPK does NOT match the covenant re-derived from public terms — "
@@ -284,7 +299,14 @@ def verify_asset_leg(
     notes.append("covenant funding SPK == re-derived covenant (asset locked to the agreed covenant)")
     if covenant_spend_tx is None:
         return AssetLeg.PENDING, [*notes, "covenant outpoint still unspent"]
-    spent_to = _output_spk(covenant_spend_tx, 0)
+    spent_to, paid_value = _output(covenant_spend_tx, 0)
+    # Independent made-whole (asset side): the covenant pays its full carrier amount to the holder (the miner
+    # fee comes from a separate fee input, never the carrier), so the payout must equal the funded amount.
+    if paid_value != observed_funding_value:
+        notes.append(
+            f"WARNING: covenant spend paid {paid_value} photons, carrier was {observed_funding_value} "
+            f"(value not conserved — short-changed payout)"
+        )
     if spent_to == taker_holder:
         # claim path: the covenant claim scriptSig reveals p; confirm it hashes to H.
         try:
@@ -700,6 +722,11 @@ def _self_check() -> int:
     check("RXD spent to neither holder -> ANOMALOUS", a4 is AssetLeg.ANOMALOUS)
     a5, _ = verify_asset_leg(m, _rxd_tx(b"\x00\x14" + b"\xff" * 20), claim)  # funding to a wrong SPK
     check("RXD wrong funding SPK -> ANOMALOUS", a5 is AssetLeg.ANOMALOUS)
+    # value integrity: under-funded covenant + short-changed payout each raise a warning note.
+    _, a6_notes = verify_asset_leg(m, _rxd_tx(funded_spk, value=500), claim)
+    check("RXD under-funded covenant -> value warning", any("under/over-funded" in n for n in a6_notes))
+    _, a7_notes = verify_asset_leg(m, _rxd_tx(funded_spk, 1000), _rxd_tx(taker_holder, 900))
+    check("RXD short-changed payout -> value warning", any("value not conserved" in n for n in a7_notes))
 
     # 5) full happy-path through verify_from_bytes — manifest H must equal sha256(stub p) so the BTC claim
     #    actually reveals a matching preimage (counter -> MAKER_CLAIMED) and the asset goes to the taker.
