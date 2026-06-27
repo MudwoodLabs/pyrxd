@@ -24,8 +24,9 @@ stack remains unaudited — verify it yourself before moving real value.**
   language-agnostic V2 dMint contract vectors across all five DAA modes (one
   mainnet-anchored), with a CI round-trip that keeps them honest (#264).
 - **Watchtower endpoint-diversity guard** — `MultiSourceBtcFundingReader.from_endpoints`
-  clamps the BTC funding quorum to the number of *distinct hosts*, so same-host
-  endpoints can't masquerade as a real quorum (#260).
+  requires at least `quorum` *distinct hosts* and **fails closed** on insufficient
+  diversity (with an explicit `allow_insufficient_diversity` opt-in for no-value test
+  networks), so same-host endpoints can't masquerade as a real quorum (#260, #270).
 - **Watchtower boot-time timing-safety preflight** — refuses to start on poll /
   dead-man's-switch / tick interval misconfigurations (#249).
 - **Watchtower heartbeat leading indicators** — `squeezed`, `errored`, and
@@ -33,9 +34,10 @@ stack remains unaudited — verify it yourself before moving real value.**
 - **Autonomous claim executor arming gate** — `enable_autonomous_mainnet_custody`
   (default off), with the as-is posture documented (#244).
 - **Mutation-testing harness** — `task mutate` (cosmic-ray) measures mutant-kill coverage
-  over the SPV verification core (run on demand, not wired into CI), plus SPV
-  input-validation hardening **tests** that kill the surviving mutants it surfaced —
-  closing test-coverage gaps, with no SPV source change required (#268).
+  over the SPV verification core (run on demand, not wired into CI; fails on a broken run,
+  with an opt-in `MUTATION_MIN_KILL_PCT` kill-threshold gate), plus SPV input-validation
+  hardening **tests** that kill the surviving mutants it surfaced — closing test-coverage
+  gaps, with no SPV source change required (#268, #270).
 - dMint subpackage API reference (#243); operator backup/DR and watchtower operations
   runbooks (#247, #262); mutation-testing how-to (#268); a versioning & deprecation
   policy (#263).
@@ -59,6 +61,15 @@ stack remains unaudited — verify it yourself before moving real value.**
 
 - Eight-reviewer security-panel hardening of the autonomous executor: a strict `bool`
   arming check (closing a fail-open), and the value cap reframed to waive dust only (#244).
+- Internal pre-release red-team hardening (#270). No fund-loss issue was found; these harden
+  paths that are not yet wired: the autonomous claim executor's fresh pre-broadcast re-assess
+  now passes the per-record value-at-risk (so a value-scaled policy no longer silently
+  declines every claim; ft/nft still fail closed); `pyrxd swap status` sanitizes
+  terminal-control bytes from recovery-file fields; the watchtower webhook secret / auth
+  header can be supplied via file or env var (off the process table); and the RSWP
+  price-terms parser bounds the script length (no `OverflowError` escapes the decoder).
+- Pinned the patched `msgpack >= 1.2.1` dev dependency (transitive via
+  `pip-audit` → `cachecontrol`), resolving GHSA-6v7p-g79w-8964 — dev-scope, not shipped (#271).
 
 ## [0.9.0] — 2026-06-18
 
