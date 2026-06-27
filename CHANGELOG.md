@@ -4,6 +4,73 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] — 2026-06-26
+
+Feature + audit-readiness release (vs 0.9.0's posture-only one). New read-only tooling
+(swap-status CLI, RSWP order decoder), watchtower hardening, language-agnostic
+cross-implementation conformance vectors, and a mutation-testing harness. Every addition
+is additive or opt-in (default off); no breaking API changes. **The cross-chain swap
+stack remains unaudited — verify it yourself before moving real value.**
+
+### Added
+
+- **`pyrxd swap status`** — read-only CLI to inspect a swap recovery file's on-chain
+  covenant state (`NOT_FOUND` / `SETTLED` / `LOCKED` / `REFUND_OPEN`), with an optional
+  `--check-chain`; never leaks secrets (#246).
+- **RSWP on-chain swap-order decoder** — `pyrxd.gravity.swap_order.decode_rswp_order`
+  decodes the v2 RSWP `OP_RETURN` wire format including Photonic `MultiTxOutV1`
+  `price_terms`; the source-confirmed wire-format spec is now tracked (#265).
+- **Cross-impl conformance vectors** — `conformance/dmint-v2-contract-vectors.json`,
+  language-agnostic V2 dMint contract vectors across all five DAA modes (one
+  mainnet-anchored), with a CI round-trip that keeps them honest (#264).
+- **Watchtower endpoint-diversity guard** — `MultiSourceBtcFundingReader.from_endpoints`
+  requires at least `quorum` *distinct hosts* and **fails closed** on insufficient
+  diversity (with an explicit `allow_insufficient_diversity` opt-in for no-value test
+  networks), so same-host endpoints can't masquerade as a real quorum (#260, #270).
+- **Watchtower boot-time timing-safety preflight** — refuses to start on poll /
+  dead-man's-switch / tick interval misconfigurations (#249).
+- **Watchtower heartbeat leading indicators** — `squeezed`, `errored`, and
+  `min_deadline_rxd_height` so a monitor sees trouble building before liveness is lost (#261).
+- **Autonomous claim executor arming gate** — `enable_autonomous_mainnet_custody`
+  (default off), with the as-is posture documented (#244).
+- **Mutation-testing harness** — `task mutate` (cosmic-ray) measures mutant-kill coverage
+  over the SPV verification core (run on demand, not wired into CI; fails on a broken run,
+  with an opt-in `MUTATION_MIN_KILL_PCT` kill-threshold gate), plus SPV input-validation
+  hardening **tests** that kill the surviving mutants it surfaced — closing test-coverage
+  gaps, with no SPV source change required (#268, #270).
+- dMint subpackage API reference (#243); operator backup/DR and watchtower operations
+  runbooks (#247, #262); mutation-testing how-to (#268); a versioning & deprecation
+  policy (#263).
+- Audit-readiness tests: persistent Hypothesis counterexample corpus (#252), dMint V2
+  mainnet golden vector (#251), residual-register traceability check (#259).
+
+### Changed
+
+- `MultiSourceBtcFundingReader.default_mainnet` now routes through the diversity-aware
+  `from_endpoints` (no behavior change for the default three-distinct-host quorum) (#260).
+- Restored the Python 3.10 / 3.11 / 3.12 CI test matrix (#248).
+
+### Fixed
+
+- Corrected a stale doc claim that RXinDexer mis-decodes RSWP `price_terms` — that was
+  fixed upstream on 2026-06-01 (`Radiant-Core/RXinDexer`) (#266).
+- Signing-agent how-to bare-path fix (#245); newcomer documentation gaps and stale
+  indexes / source links (#242).
+
+### Security
+
+- Eight-reviewer security-panel hardening of the autonomous executor: a strict `bool`
+  arming check (closing a fail-open), and the value cap reframed to waive dust only (#244).
+- Internal pre-release red-team hardening (#270). No fund-loss issue was found; these harden
+  paths that are not yet wired: the autonomous claim executor's fresh pre-broadcast re-assess
+  now passes the per-record value-at-risk (so a value-scaled policy no longer silently
+  declines every claim; ft/nft still fail closed); `pyrxd swap status` sanitizes
+  terminal-control bytes from recovery-file fields; the watchtower webhook secret / auth
+  header can be supplied via file or env var (off the process table); and the RSWP
+  price-terms parser bounds the script length (no `OverflowError` escapes the decoder).
+- Pinned the patched `msgpack >= 1.2.1` dev dependency (transitive via
+  `pip-audit` → `cachecontrol`), resolving GHSA-6v7p-g79w-8964 — dev-scope, not shipped (#271).
+
 ## [0.9.0] — 2026-06-18
 
 Posture + documentation release. pyrxd's maturity framing is now consistent
