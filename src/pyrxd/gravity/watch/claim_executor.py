@@ -54,7 +54,7 @@ from pyrxd.btc_wallet.taproot import TimeUnit, btc_input_outpoints_from_raw, btc
 from pyrxd.gravity.finality import CounterClaimFinality
 from pyrxd.gravity.swap_coordinator import ClaimFinality, MarginPolicy, assess_claim_finality, max_protected_value
 from pyrxd.gravity.swap_state import SwapRecord
-from pyrxd.gravity.watch.decide import Decision, Intent
+from pyrxd.gravity.watch.decide import Decision, Intent, _value_at_risk_photons
 from pyrxd.gravity.watch.executor import ExecOutcome
 from pyrxd.security.errors import NetworkError, ValidationError
 
@@ -501,6 +501,12 @@ class ClaimExecutor:
                 asset_locked_at_height=funded_h,
                 t_rxd=record.terms.t_rxd,
                 policy=self._policy,
+                # Pass the SAME per-record value-at-risk decide() uses (radiant_amount for rxd, None
+                # for ft/nft). Without it the fresh re-assess fell back to policy.value_at_risk_photons
+                # — None in the recommended value-scaled config — so the value-scaled gate returned
+                # SQUEEZED for EVERY swap and the executor silently never fired (autonomous claim
+                # degraded to alert-only). FT/NFT still fail closed (None → SQUEEZED), as intended.
+                value_at_risk_photons=_value_at_risk_photons(record.terms),
             )
         except ValidationError as exc:
             return ExecOutcome.DECLINED, f"fresh finality un-assessable, fail-closed: {exc}"

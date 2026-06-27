@@ -3,6 +3,13 @@
 Keeps ``conformance/dmint-v2-contract-vectors.json`` honest: a builder change that diverges from the
 published canonical bytecode fails CI. Other Radiant implementations byte-compare their own V2 dMint
 contract build against this JSON.
+
+HONESTY NOTE: because pyrxd is the reference *producer*, this roundtrip is a REGRESSION-LOCK for the
+five reference-sourced vectors (it catches the builder silently drifting from its own committed bytes),
+NOT independent cross-impl validation of those bytes. Only the ``v2-fixed-mainnet`` vector is
+independently anchored — to the live mainnet FIXED deploy (see ``test_dmint_v2_mainnet_golden.py``).
+Independent anchoring of the non-FIXED DAA modes would require a second implementation's output. See
+``conformance/README.md`` §"Authority & honesty".
 """
 
 from __future__ import annotations

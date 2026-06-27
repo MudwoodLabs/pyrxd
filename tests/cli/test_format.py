@@ -6,7 +6,27 @@ import json
 
 import pytest
 
-from pyrxd.cli.format import emit, emit_table, format_photons
+from pyrxd.cli.format import emit, emit_table, format_photons, sanitize_terminal
+
+
+class TestSanitizeTerminal:
+    def test_plain_text_unchanged(self) -> None:
+        assert sanitize_terminal("bc1qexample") == "bc1qexample"
+        assert sanitize_terminal("rxd ↔ btc") == "rxd ↔ btc"  # printable non-ASCII passes
+
+    def test_escapes_c0_control_and_esc(self) -> None:
+        assert sanitize_terminal("\x1b[2J") == "\\x1b[2J"  # ESC escaped, '[2J' printable
+        assert sanitize_terminal("a\nb\tc") == "a\\x0ab\\x09c"
+        assert sanitize_terminal("x\x7fy") == "x\\x7fy"  # DEL
+
+    def test_escapes_c1_control(self) -> None:
+        assert sanitize_terminal("\x9b") == "\\x9b"  # C1 CSI
+
+    def test_none_is_empty(self) -> None:
+        assert sanitize_terminal(None) == ""
+
+    def test_max_len_truncates_before_escaping(self) -> None:
+        assert sanitize_terminal("abcdef", max_len=3) == "abc…"
 
 
 class TestFormatPhotons:

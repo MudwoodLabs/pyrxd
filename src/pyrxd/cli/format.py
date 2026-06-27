@@ -16,6 +16,22 @@ import json as _json
 from typing import Any
 
 
+def sanitize_terminal(value: object, *, max_len: int | None = None) -> str:
+    """Render an UNTRUSTED string safe to print to an interactive terminal.
+
+    Replaces C0/C1 control bytes (ord < 0x20, DEL 0x7f, and 0x80–0x9f) — including ESC 0x1b — with a
+    visible ``\\xNN`` escape, so an attacker-controlled field (e.g. a hand-supplied swap recovery file)
+    cannot inject ANSI / cursor-movement / bidi-override sequences that spoof or hide the rendered output
+    (notably the safety-critical "next action" guidance). ``click.echo`` does NOT strip these on an
+    interactive tty. JSON mode is already protected by ``ensure_ascii=True``; this is the human-mode peer.
+    Optional ``max_len`` truncates over-long fields (with an ellipsis) before escaping.
+    """
+    s = "" if value is None else str(value)
+    if max_len is not None and len(s) > max_len:
+        s = s[:max_len] + "…"
+    return "".join(f"\\x{o:02x}" if (o := ord(ch)) < 0x20 or o == 0x7F or 0x80 <= o <= 0x9F else ch for ch in s)
+
+
 def format_photons(n: int, *, with_rxd: bool = True) -> str:
     """Format an integer photon count for human display.
 

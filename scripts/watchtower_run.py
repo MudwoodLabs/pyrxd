@@ -32,7 +32,9 @@ import argparse
 import asyncio
 import contextlib
 import logging
+import os
 import signal
+from pathlib import Path
 
 import aiohttp
 
@@ -177,11 +179,17 @@ def _build_funding_reader(network: str, esploras: list[str], quorum: int) -> Mul
     A wrong/mainnet base on a signet run reads the wrong chain → the funding is never found → the maturity
     gate stays WATCH (fail-closed, never a wrongful broadcast)."""
     if network == "bc":
+        # Mainnet: the three default independent endpoints (2-of-3). from_endpoints fails closed if the
+        # endpoints ever resolve to < quorum distinct hosts — no silent single-source above-dust arming.
         return MultiSourceBtcFundingReader.default_mainnet(quorum=quorum)
-    # from_endpoints clamps the effective quorum to the number of DISTINCT hosts (not URL count) and warns
-    # — so two same-host esploras can't masquerade as a real 2-of-2 quorum (false corroboration).
+    # Non-mainnet (signet/testnet) is a NO-REAL-VALUE test network and is typically 1-of-1, so it
+    # explicitly accepts insufficient host diversity (allow_insufficient_diversity) and clamps the
+    # effective quorum to the distinct-host count with a loud warning — the mainnet fail-closed above is
+    # the one that guards real value.
     api_urls = [u.rstrip("/") + "/api" for u in esploras]
-    return MultiSourceBtcFundingReader.from_endpoints(api_urls, quorum=quorum, dust_cap_sats=10_000)
+    return MultiSourceBtcFundingReader.from_endpoints(
+        api_urls, quorum=quorum, dust_cap_sats=10_000, allow_insufficient_diversity=True
+    )
 
 
 #: Default INDEPENDENT public Radiant ElectrumX endpoints (distinct operators), verified live
@@ -362,8 +370,24 @@ def _parse_args(argv=None) -> argparse.Namespace:
     p.add_argument("--allow-insecure", action="store_true", help="allow non-TLS ElectrumX")
     # #1 notification channel (in addition to the always-on log)
     p.add_argument("--webhook-url", help="POST pages to this webhook (ntfy/Pushover/Slack/custom)")
-    p.add_argument("--webhook-auth-header", help="optional 'Header: value' sent with the webhook (e.g. a bearer token)")
-    p.add_argument("--webhook-secret", help="optional HMAC-SHA256 secret -> X-Watchtower-Signature header")
+    p.add_argument(
+        "--webhook-auth-header",
+        help="DEPRECATED (process-table/shell-history exposure) optional 'Header: value' sent with the "
+        "webhook; prefer --webhook-auth-header-file or PYRXD_WATCHTOWER_WEBHOOK_AUTH_HEADER",
+    )
+    p.add_argument(
+        "--webhook-auth-header-file",
+        help="read the 'Header: value' auth header from this (0600) file instead of the command line",
+    )
+    p.add_argument(
+        "--webhook-secret",
+        help="DEPRECATED (process-table/shell-history exposure) optional HMAC-SHA256 secret -> "
+        "X-Watchtower-Signature header; prefer --webhook-secret-file or PYRXD_WATCHTOWER_WEBHOOK_SECRET",
+    )
+    p.add_argument(
+        "--webhook-secret-file",
+        help="read the HMAC-SHA256 secret from this (0600) file instead of the command line",
+    )
     # #2 dead-man's switch: write a liveness file each tick (watched by watchtower_deadman.py)
     p.add_argument("--heartbeat-file", help="write a liveness heartbeat here each tick")
     # ETH counter-leg (alert-only v3): watch RXD↔ETH swaps too. Read-only, no key, never touches p.
@@ -415,17 +439,48 @@ def _parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
+def _resolve_secret(inline: str | None, file_path: str | None, env_name: str, *, flag: str) -> str | None:
+    """Resolve a webhook secret from (in precedence) the inline CLI flag, a 0600 file, or an env var.
+
+    The inline flag is accepted for backward compatibility but warned against: process arguments are
+    world-readable via ``/proc/<pid>/cmdline`` / ``ps`` and are captured in shell history (SECRET-1).
+    The file/env paths keep the secret off the process table.
+    """
+    if inline:
+        logger.warning(
+            "%s passed on the command line is visible in the process table (ps / /proc/<pid>/cmdline) and "
+            "shell history; prefer %s-file or the %s env var.",
+            flag,
+            flag,
+            env_name,
+        )
+        return inline
+    if file_path:
+        return Path(file_path).read_text(encoding="utf-8").strip() or None
+    return os.environ.get(env_name) or None
+
+
 def _build_alert_channel(args: argparse.Namespace, session):
     """Always log; additionally POST to an authenticated webhook if configured."""
     channels = [LoggingAlertChannel()]
     if args.webhook_url:
         auth = None
-        if args.webhook_auth_header:
-            key, _, val = args.webhook_auth_header.partition(":")
-            auth = {key.strip(): val.strip()}
-        channels.append(
-            WebhookAlertChannel(args.webhook_url, session=session, auth_header=auth, hmac_secret=args.webhook_secret)
+        auth_header = _resolve_secret(
+            args.webhook_auth_header,
+            args.webhook_auth_header_file,
+            "PYRXD_WATCHTOWER_WEBHOOK_AUTH_HEADER",
+            flag="--webhook-auth-header",
         )
+        if auth_header:
+            key, _, val = auth_header.partition(":")
+            auth = {key.strip(): val.strip()}
+        secret = _resolve_secret(
+            args.webhook_secret,
+            args.webhook_secret_file,
+            "PYRXD_WATCHTOWER_WEBHOOK_SECRET",
+            flag="--webhook-secret",
+        )
+        channels.append(WebhookAlertChannel(args.webhook_url, session=session, auth_header=auth, hmac_secret=secret))
     return channels[0] if len(channels) == 1 else CompositeAlertChannel(*channels)
 
 

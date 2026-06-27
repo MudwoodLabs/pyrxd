@@ -79,6 +79,19 @@ def test_claim_scriptsig_is_preimage_then_op0_selector():
     assert ss[33:] == b"\x00"  # OP_0 claim selector (LAST / on top)
 
 
+@pytest.mark.parametrize("bad", [b"", b"\x11" * 31, b"\x11" * 33, b"\x11" * 64])
+def test_build_htlc_claim_tx_rejects_non_32_byte_preimage(bad):
+    # Preimage-length asset-theft guard (builder level), peer to the consensus OP_SIZE<0x20> pin
+    # asserted structurally in tests/test_htlc_covenant.py. A non-32-byte p' must raise BEFORE any tx
+    # is built, so a wrong-length preimage can never be relayed into a claim. Covers the 0/31/33/64-byte
+    # cases that the existing happy-path tests (always 32 bytes) never exercised.
+    cov = _rxd_cov()
+    with pytest.raises(ValidationError, match="32 bytes"):
+        build_htlc_claim_tx(
+            covenant=cov, covenant_outpoint="cd" * 32 + ":0", carrier_value=100_000, preimage=bad, fee=_fee()
+        )
+
+
 def test_claim_single_output_to_taker_holder():
     cov = _rxd_cov()
     tx = build_htlc_claim_tx(

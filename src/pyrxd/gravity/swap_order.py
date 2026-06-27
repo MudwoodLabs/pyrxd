@@ -107,7 +107,11 @@ def parse_price_terms(blob: bytes) -> list[DemandedOutput] | None:
         if vb is None or len(vb) != 8:
             return None
         slen = r.read_var_int_num()
-        if slen is None or slen < 0:
+        # Bound slen by the blob length: a script can never exceed the remaining blob, and an
+        # unbounded slen (a 0xff varint up to 2**64-1) would otherwise reach BytesIO.read and raise
+        # OverflowError — leaking out of the public decode_rswp_order, which documents ValidationError
+        # only. Reject out-of-range lengths as "not clean MultiTxOutV1" (None), the documented outcome.
+        if slen is None or slen < 0 or slen > len(blob):
             return None
         script = r.read_bytes(slen) if slen else b""
         if script is None or len(script) != slen:
