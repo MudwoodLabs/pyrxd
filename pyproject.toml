@@ -101,6 +101,11 @@ ruff = "^0.15.17"
 hypothesis = "^6.155.2"
 pytest-asyncio = ">=1.4.0"
 cosmic-ray = "^8.4.6"
+# Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
+# out-of-bounds-read / crash on Unpacker reuse after a caught error in <= 1.2.0
+# (GHSA-6v7p-g79w-8964). cachecontrol allows < 2.0.0, so pin the patched floor. Dev-scope only —
+# msgpack is not a pyrxd runtime dependency and never ships in the published package.
+msgpack = ">=1.2.1"
 
 [tool.poetry.group.test.dependencies]
 bandit = {version = "^1.9.4", extras = ["toml"]}
