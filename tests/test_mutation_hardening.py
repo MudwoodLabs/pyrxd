@@ -533,6 +533,82 @@ class TestDmintStateParserRejectsCorruption:
             DmintState.from_script(bytes(script))
 
 
+class TestTimelockScriptBytes:
+    """script/timelock.py — CSV/CLTV builder mutants. Expected bytes are
+    hand-assembled from the BIP-65/BIP-112 reference shapes in the module
+    docstring, never from the builders."""
+
+    def test_cltv_script_exact_bytes(self):
+        """Byte-for-byte against the BIP-65 reference shape:
+        <locktime> OP_CHECKLOCKTIMEVERIFY(0xb1) OP_DROP(0x75)
+        OP_DUP(0x76) OP_HASH160(0xa9) 0x14 <pkh> OP_EQUALVERIFY(0x88)
+        OP_CHECKSIG(0xac), locktime as a minimal script number (LE,
+        sign-bit padding)."""
+        from pyrxd.script.timelock import build_p2pkh_with_cltv_script
+
+        pkh = b"\xaa" * 20
+        tail = b"\x76\xa9\x14" + pkh + b"\x88\xac"
+        # 100 = 0x64, no sign bit → single-byte push
+        assert build_p2pkh_with_cltv_script(pkh, 100) == b"\x01\x64\xb1\x75" + tail
+        # 500_000_000 = 0x1DCD6500 → LE 00 65 cd 1d, 4-byte push (the
+        # BIP-65 height/time threshold value itself)
+        assert build_p2pkh_with_cltv_script(pkh, 500_000_000) == b"\x04\x00\x65\xcd\x1d\xb1\x75" + tail
+
+    def test_csv_script_exact_bytes_with_sign_padding(self):
+        """144 = 0x90 has the sign bit set, so the minimal script number is
+        90 00 (two bytes) — a padding rule a wrong encoder silently breaks.
+        OP_CHECKSEQUENCEVERIFY is 0xb2."""
+        from pyrxd.script.timelock import build_p2pkh_with_csv_script
+
+        pkh = b"\xaa" * 20
+        tail = b"\x76\xa9\x14" + pkh + b"\x88\xac"
+        assert build_p2pkh_with_csv_script(pkh, 144) == b"\x02\x90\x00\xb2\x75" + tail
+
+    def test_cltv_locktime_bounds(self):
+        from pyrxd.script.timelock import build_p2pkh_with_cltv_script
+        from pyrxd.security.errors import ValidationError
+
+        pkh = b"\xaa" * 20
+        assert build_p2pkh_with_cltv_script(pkh, 0)  # boundary: 0 valid
+        assert build_p2pkh_with_cltv_script(pkh, 0xFFFFFFFF)  # max valid
+        for bad in (-1, 0x1_0000_0000):
+            with pytest.raises(ValidationError):
+                build_p2pkh_with_cltv_script(pkh, bad)
+
+    def test_csv_sequence_encoding_per_bip112(self):
+        from pyrxd.script.timelock import CsvKind, build_csv_sequence
+
+        # blocks: the value IS the unit count; time: bit 22 set, per BIP-112.
+        assert build_csv_sequence(144, CsvKind.BLOCKS) == 144
+        assert build_csv_sequence(144, CsvKind.TIME_512_SECONDS) == 144 | (1 << 22)
+        assert build_csv_sequence(0xFFFF, CsvKind.BLOCKS) == 0xFFFF  # max units
+
+    def test_csv_sequence_bounds(self):
+        from pyrxd.script.timelock import CsvKind, build_csv_sequence
+        from pyrxd.security.errors import ValidationError
+
+        for bad in (-1, 0x1_0000):
+            with pytest.raises(ValidationError):
+                build_csv_sequence(bad, CsvKind.BLOCKS)
+
+    def test_csv_script_rejects_disable_bit(self):
+        from pyrxd.script.timelock import build_p2pkh_with_csv_script
+        from pyrxd.security.errors import ValidationError
+
+        pkh = b"\xaa" * 20
+        assert build_p2pkh_with_csv_script(pkh, 144)  # valid sequence
+        with pytest.raises(ValidationError, match="disable"):
+            build_p2pkh_with_csv_script(pkh, 144 | (1 << 31))
+
+    def test_pkh_length_guard(self):
+        from pyrxd.script.timelock import build_p2pkh_with_cltv_script
+        from pyrxd.security.errors import ValidationError
+
+        for bad in (b"\xaa" * 19, b"\xaa" * 21):
+            with pytest.raises(ValidationError):
+                build_p2pkh_with_cltv_script(bad, 100)
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
