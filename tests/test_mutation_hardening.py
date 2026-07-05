@@ -609,6 +609,65 @@ class TestTimelockScriptBytes:
                 build_p2pkh_with_cltv_script(bad, 100)
 
 
+class TestDmintPushEncoders:
+    """glyph/dmint/builders.py — _push_minimal/_encode_data_push mutants.
+    The negative-number and PUSHDATA branches never execute for valid dMint
+    params, so they only die to direct unit pins against the script
+    minimal-encoding rules (same rules as TestDmintScriptIntParser, from
+    the encode side)."""
+
+    def test_push_minimal_opcode_forms(self):
+        from pyrxd.glyph.dmint.builders import _push_minimal
+
+        assert _push_minimal(0) == b"\x00"
+        assert _push_minimal(-1) == b"\x4f"
+        assert _push_minimal(1) == b"\x51"
+        assert _push_minimal(16) == b"\x60"
+        assert _push_minimal(17) == b"\x01\x11"  # first non-opcode value
+
+    def test_push_minimal_sign_bit_rules(self):
+        from pyrxd.glyph.dmint.builders import _push_minimal
+
+        # 0x90 needs a 00 pad; negative counterpart pads with 0x80
+        assert _push_minimal(0x90) == b"\x02\x90\x00"
+        assert _push_minimal(-0x90) == b"\x02\x90\x80"
+        # small negatives set the sign bit in the last byte
+        assert _push_minimal(-2) == b"\x01\x82"
+        assert _push_minimal(-255) == b"\x02\xff\x80"
+        # positive multi-byte little-endian
+        assert _push_minimal(0x1234) == b"\x02\x34\x12"
+
+    def test_push_minimal_length_cliffs(self):
+        from pyrxd.glyph.dmint.builders import _push_minimal
+        from pyrxd.security.errors import ValidationError
+
+        # 75-byte payload → direct push; 76 → PUSHDATA1; >255 → error
+        n75 = int.from_bytes(b"\x7f" * 75, "little")
+        assert _push_minimal(n75) == bytes([75]) + b"\x7f" * 75
+        n76 = int.from_bytes(b"\x7f" * 76, "little")
+        assert _push_minimal(n76) == b"\x4c\x4c" + b"\x7f" * 76
+        n255 = int.from_bytes(b"\x7f" * 255, "little")
+        assert _push_minimal(n255) == b"\x4c\xff" + b"\x7f" * 255
+        with pytest.raises(ValidationError):
+            _push_minimal(int.from_bytes(b"\x7f" * 256, "little"))
+
+    def test_push_4bytes_le(self):
+        from pyrxd.glyph.dmint.builders import _push_4bytes_le
+
+        assert _push_4bytes_le(0) == b"\x04\x00\x00\x00\x00"
+        assert _push_4bytes_le(0x01020304) == b"\x04\x04\x03\x02\x01"
+
+    def test_encode_data_push_cliffs(self):
+        from pyrxd.glyph.dmint.builders import _encode_data_push
+
+        assert _encode_data_push(b"\xee" * 75) == bytes([75]) + b"\xee" * 75
+        assert _encode_data_push(b"\xee" * 76) == b"\x4c\x4c" + b"\xee" * 76
+        assert _encode_data_push(b"\xee" * 255) == b"\x4c\xff" + b"\xee" * 255
+        assert _encode_data_push(b"\xee" * 256) == b"\x4d\x00\x01" + b"\xee" * 256
+        assert _encode_data_push(b"\xee" * 65535) == b"\x4d\xff\xff" + b"\xee" * 65535
+        assert _encode_data_push(b"\xee" * 65536) == b"\x4e\x00\x00\x01\x00" + b"\xee" * 65536
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
