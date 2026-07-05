@@ -993,6 +993,63 @@ class TestDmintDaaBoundaries:
             mine_solution(preimage, 1, algo=DmintAlgo.BLAKE3)
 
 
+class TestDmintV1StateParserGuards:
+    """glyph/dmint/chain.py — _from_v1_script slot guards (L362–L400),
+    exercised by corrupting a valid built V1 contract at the fixed-width
+    layout offsets (docs/dmint-research-mainnet.md §2.2)."""
+
+    @staticmethod
+    def _v1_contract() -> bytes:
+        from pyrxd.glyph.dmint import DmintAlgo
+        from pyrxd.glyph.dmint.builders import build_dmint_v1_contract_script
+        from pyrxd.glyph.types import GlyphRef
+
+        return build_dmint_v1_contract_script(
+            height=3,
+            contract_ref=GlyphRef(txid="22" * 32, vout=1),
+            token_ref=GlyphRef(txid="22" * 32, vout=0),
+            max_height=100,
+            reward=5000,
+            target=0x00000000FFFF0000,
+            algo=DmintAlgo.SHA256D,
+        )
+
+    def test_v1_roundtrip(self):
+        from pyrxd.glyph.dmint.chain import DmintState
+
+        st = DmintState.from_script(self._v1_contract())
+        assert st.is_v1
+        assert (st.height, st.max_height, st.reward) == (3, 100, 5000)
+        assert st.target == 0x00000000FFFF0000
+        assert st.contract_ref.vout == 1
+        assert st.token_ref.vout == 0
+
+    def test_v1_corruptions_rejected(self):
+        from pyrxd.glyph.dmint.chain import DmintState
+        from pyrxd.security.errors import ValidationError
+
+        good = self._v1_contract()
+        # V1 layout: 04 height(4) | d8 ref(36) | d0 ref(36) | maxHeight |
+        # reward | 08 target(8) | 0xbd epilogue
+        assert good[0] == 0x04
+        assert good[5] == 0xD8
+        assert good[42] == 0xD0
+        corruptions = [
+            bytes([0x05]) + good[1:],  # wrong height push width
+            good[:5] + bytes([0xD1]) + good[6:],  # wrong contractRef opcode
+            good[:42] + bytes([0xD1]) + good[43:],  # wrong tokenRef opcode
+            good[:30],  # truncated inside contractRef
+        ]
+        for bad in corruptions:
+            with pytest.raises(ValidationError):
+                DmintState.from_script(bad)
+
+    def test_chain_dataclasses_frozen(self):
+        from pyrxd.glyph.dmint.chain import DmintState
+
+        assert DmintState.__dataclass_params__.frozen is True
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
