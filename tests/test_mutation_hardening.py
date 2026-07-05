@@ -1050,6 +1050,79 @@ class TestDmintV1StateParserGuards:
         assert DmintState.__dataclass_params__.frozen is True
 
 
+class TestDmintV1BuilderGuards:
+    """glyph/dmint/builders.py — V1 builder constants and guards."""
+
+    def test_v1_algo_byte_map_exact(self):
+        """The algo selector bytes are consensus bytes in the V1 epilogue:
+        OP_HASH256 0xAA / OP_BLAKE3 0xEE / OP_K12 0xEF."""
+        from pyrxd.glyph.dmint import DmintAlgo
+        from pyrxd.glyph.dmint.builders import _V1_ALGO_BYTE_TO_ENUM, _V1_ENUM_TO_ALGO_BYTE
+
+        assert _V1_ALGO_BYTE_TO_ENUM == {
+            0xAA: DmintAlgo.SHA256D,
+            0xEE: DmintAlgo.BLAKE3,
+            0xEF: DmintAlgo.K12,
+        }
+        assert _V1_ENUM_TO_ALGO_BYTE[DmintAlgo.BLAKE3] == 0xEE
+
+    def test_v1_epilogue_length_is_145(self):
+        """docs/dmint-research-mainnet.md §2.2: the V1 code epilogue is a
+        145-byte fixed template (prefix + 1 algo byte + suffix)."""
+        from pyrxd.glyph.dmint import DmintAlgo
+        from pyrxd.glyph.dmint.builders import _V1_EPILOGUE_LEN, build_dmint_v1_code_script
+
+        assert _V1_EPILOGUE_LEN == 145
+        assert len(build_dmint_v1_code_script(DmintAlgo.SHA256D)) == 145
+
+    def test_v1_code_script_rejects_unknown_algo(self):
+        from pyrxd.glyph.dmint.builders import build_dmint_v1_code_script
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError):
+            build_dmint_v1_code_script(99)  # not a DmintAlgo member
+
+    def test_v1_state_script_guards(self):
+        from pyrxd.glyph.dmint.builders import build_dmint_v1_state_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.errors import ValidationError
+
+        refs = dict(contract_ref=GlyphRef(txid="33" * 32, vout=1), token_ref=GlyphRef(txid="33" * 32, vout=0))
+        ok = dict(height=0, max_height=1, reward=1, target=1, **refs)
+        assert build_dmint_v1_state_script(**ok)
+        assert build_dmint_v1_state_script(**{**ok, "target": 0x7FFFFFFFFFFFFFFF})
+        for field, bad in (("max_height", 0), ("reward", 0), ("target", 0)):
+            with pytest.raises(ValidationError):
+                build_dmint_v1_state_script(**{**ok, field: bad})
+        # exhausted contract: height == max_height must be rejected,
+        # height == max_height - 1 accepted
+        with pytest.raises(ValidationError):
+            build_dmint_v1_state_script(**{**ok, "height": 1})
+
+    def test_v1_ft_output_pkh_guard(self):
+        from pyrxd.glyph.dmint.builders import build_dmint_v1_ft_output_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.errors import ValidationError
+
+        ref = GlyphRef(txid="33" * 32, vout=0)
+        script = build_dmint_v1_ft_output_script(b"\xaa" * 20, ref)
+        assert len(script) == 75  # documented total (§4 vout[1])
+        for bad in (b"\xaa" * 19, b"\xaa" * 21):
+            with pytest.raises(ValidationError):
+                build_dmint_v1_ft_output_script(bad, ref)
+
+    def test_part_b_defaults_match_explicit(self):
+        """The documented defaults (half_life 3600, epoch 2016, log2 2) must
+        be what the no-arg form actually builds."""
+        from pyrxd.glyph.dmint import DaaMode
+        from pyrxd.glyph.dmint.builders import _build_part_b
+
+        assert _build_part_b(DaaMode.ASERT) == _build_part_b(DaaMode.ASERT, 3600)
+        assert _build_part_b(DaaMode.EPOCH) == _build_part_b(
+            DaaMode.EPOCH, 3600, epoch_length=2016, max_adjustment_log2=2
+        )
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
