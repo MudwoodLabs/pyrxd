@@ -767,6 +767,141 @@ class TestDmintCborPayloadDecode:
         assert DmintV1ContractInitialState.__dataclass_params__.frozen is True
 
 
+class TestScriptTemplates:
+    """script/type.py — template lock/unlock mutants. Locking bytes are
+    hand-assembled from the canonical script shapes; sighash suffixes are
+    pinned to exactly ONE byte (the `to_bytes(1)` → `to_bytes(2)` class
+    would produce node-invalid signatures)."""
+
+    def test_abstract_template_rejects_incomplete_subclass(self):
+        from pyrxd.script.type import ScriptTemplate
+
+        class Incomplete(ScriptTemplate):
+            pass
+
+        with pytest.raises(TypeError):
+            Incomplete()
+
+    def test_op_return_lock_uses_non_minimal_push(self):
+        """0x01 as OP_RETURN data must stay a literal `01 01` push — the
+        minimal-push form (OP_1) would CHANGE the pushed byte semantics for
+        data carriers that read raw pushdata."""
+        from pyrxd.script.type import OpReturn
+
+        assert OpReturn().lock([b"\x01"]).serialize() == b"\x00\x6a\x01\x01"
+        assert OpReturn().lock(["hi"]).serialize() == b"\x00\x6a\x02hi"
+
+    def test_p2pk_lock_bytes_and_length_guard(self):
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PK
+        from pyrxd.security.errors import ValidationError
+
+        pub = PrivateKey().public_key().serialize()  # 33-byte compressed
+        assert P2PK().lock(pub).serialize() == b"\x21" + pub + b"\xac"
+        with pytest.raises(ValidationError):
+            P2PK().lock(b"\x02" * 32)
+
+    def test_bare_multisig_lock_bytes_and_threshold_guards(self):
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import BareMultisig
+        from pyrxd.security.errors import ValidationError
+
+        keys = [PrivateKey().public_key().serialize() for _ in range(3)]
+        script = BareMultisig().lock(keys, 2).serialize()
+        expected = b"\x52" + b"".join(b"\x21" + k for k in keys) + b"\x53\xae"
+        assert script == expected
+        for bad in (0, 4):
+            with pytest.raises(ValidationError):
+                BareMultisig().lock(keys, bad)
+
+    def test_rpuzzle_lock_hash_op_dispatch(self):
+        from pyrxd.script.type import RPuzzle
+
+        value = b"\x99" * 32
+        base_prefix = bytes.fromhex("78537f7751 7f7c7f75".replace(" ", ""))
+        raw = RPuzzle("raw").lock(value).serialize()
+        sha = RPuzzle("SHA256").lock(value).serialize()
+        assert raw == base_prefix + b"\x20" + value + b"\x88\xac"
+        assert sha == base_prefix + b"\xa8" + b"\x20" + value + b"\x88\xac"
+
+    def test_estimated_unlocking_lengths(self):
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PK, BareMultisig, RPuzzle
+
+        pk = PrivateKey()
+        assert P2PKH().unlock(pk).estimated_unlocking_byte_length() == 107
+        pk_uncompressed = PrivateKey()
+        pk_uncompressed.compressed = False
+        assert P2PKH().unlock(pk_uncompressed).estimated_unlocking_byte_length() == 139
+        assert P2PK().unlock(pk).estimated_unlocking_byte_length() == 73
+        assert BareMultisig().unlock([pk, pk]).estimated_unlocking_byte_length() == 1 + 73 * 2 + 1
+        assert RPuzzle().unlock(k=12345).estimated_unlocking_byte_length() == 108
+
+    @staticmethod
+    def _signed_input(template):
+        tx_in = _in()
+        tx_in.unlocking_script_template = template
+        tx = Transaction(tx_inputs=[tx_in], tx_outputs=[_out(_P2PKH_AA, 1_000)])
+        tx.sign()
+        return tx_in
+
+    def test_p2pkh_sign_appends_exactly_one_sighash_byte(self):
+        from pyrxd.keys import PrivateKey
+
+        pk = PrivateKey()
+        tx_in = self._signed_input(P2PKH().unlock(pk))
+        sig_push, pub_push = tx_in.unlocking_script.chunks
+        assert pub_push.data == pk.public_key().serialize()
+        assert sig_push.data[0] == 0x30  # DER sequence tag
+        assert sig_push.data[-1] == int(tx_in.sighash)  # single 0x41 byte
+        assert len(sig_push.data) <= 73  # DER sig (<=72) + 1 sighash byte
+
+    def test_p2pk_and_multisig_sign_sighash_suffix(self):
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PK, BareMultisig
+
+        tx_in = self._signed_input(P2PK().unlock(PrivateKey()))
+        (sig_push,) = tx_in.unlocking_script.chunks
+        assert sig_push.data[-1] == int(tx_in.sighash)
+
+        tx_in = self._signed_input(BareMultisig().unlock([PrivateKey(), PrivateKey()]))
+        chunks = tx_in.unlocking_script.chunks
+        assert len(chunks) == 3  # OP_0 + two signatures (NULLDUMMY + loop ran)
+        assert chunks[0].op == b"\x00"
+        for sig in chunks[1:]:
+            assert sig.data[-1] == int(tx_in.sighash)
+
+    def test_rpuzzle_sign_sighash_flag_branches(self):
+        """sign_outputs/anyone_can_pay must map to the exact FORKID sighash
+        bytes (ALL 0x41, NONE 0x42, SINGLE 0x43, |0x80 for ACP) — and the
+        flags are WRITTEN BACK to the input before preimaging."""
+        from pyrxd.script.type import RPuzzle
+
+        cases = [
+            (dict(sign_outputs="all"), 0x41),
+            (dict(sign_outputs="none"), 0x42),
+            (dict(sign_outputs="single"), 0x43),
+            (dict(sign_outputs="single", anyone_can_pay=True), 0xC3),
+        ]
+        for kwargs, expected in cases:
+            tx_in = self._signed_input(RPuzzle().unlock(k=12345, **kwargs))
+            sig_push = tx_in.unlocking_script.chunks[0]
+            assert int(tx_in.sighash) == expected, kwargs
+            assert sig_push.data[-1] == expected, kwargs
+
+    def test_rpuzzle_honors_provided_private_key(self):
+        """Kills the L259 `if private_key is None` negation: a caller's key
+        must be used, not silently replaced with a fresh one (nonce-reuse
+        safety depends on the caller controlling which key signs)."""
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import RPuzzle
+
+        pk = PrivateKey()
+        tx_in = self._signed_input(RPuzzle().unlock(k=999, private_key=pk))
+        pub_push = tx_in.unlocking_script.chunks[-1]
+        assert pub_push.data == pk.public_key().serialize()
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
