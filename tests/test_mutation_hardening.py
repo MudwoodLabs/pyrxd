@@ -1064,6 +1064,40 @@ class TestDmintV1StateParserGuards:
 
         assert DmintState.__dataclass_params__.frozen is True
 
+    def test_is_exhausted_beyond_max_height(self):
+        """`>=` → `==` survivor: a state with height PAST max_height (e.g.
+        parsed from a hostile UTXO) must still read as exhausted."""
+        from pyrxd.glyph.dmint import DaaMode, DmintAlgo
+        from pyrxd.glyph.dmint.chain import DmintState
+        from pyrxd.glyph.types import GlyphRef
+
+        ref = GlyphRef(txid="44" * 32, vout=0)
+        st = DmintState(
+            height=5,
+            contract_ref=ref,
+            token_ref=ref,
+            max_height=3,
+            reward=1,
+            algo=DmintAlgo.SHA256D,
+            daa_mode=DaaMode.FIXED,
+            target_time=60,
+            last_time=0,
+            target=1,
+        )
+        assert st.is_exhausted
+        assert not DmintState(
+            height=2,
+            contract_ref=ref,
+            token_ref=ref,
+            max_height=3,
+            reward=1,
+            algo=DmintAlgo.SHA256D,
+            daa_mode=DaaMode.FIXED,
+            target_time=60,
+            last_time=0,
+            target=1,
+        ).is_exhausted
+
 
 class TestDmintV1BuilderGuards:
     """glyph/dmint/builders.py — V1 builder constants and guards."""
