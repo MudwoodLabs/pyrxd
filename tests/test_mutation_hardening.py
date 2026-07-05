@@ -679,6 +679,35 @@ class TestDmintPushEncoders:
         assert _encode_data_push(b"\xee" * 65536) == b"\x4e\x00\x00\x01\x00" + b"\xee" * 65536
 
 
+class TestPushRefScannerGuards:
+    """transaction_preimage.py — _get_push_refs truncation guards. The
+    differential suite only generates WELL-FORMED scripts, so the malformed
+    branch needs direct pins (consensus context: a silently short ref would
+    corrupt hashOutputHashes)."""
+
+    def test_ref_ending_exactly_at_script_end_is_valid(self):
+        from pyrxd.transaction.transaction_preimage import _get_push_refs
+
+        ref = bytes(range(36))
+        assert _get_push_refs(b"\xd0" + ref) == [ref]
+        assert _get_push_refs(b"\xd8" + ref) == [ref]
+
+    def test_truncated_ref_raises(self):
+        from pyrxd.security.errors import ValidationError
+        from pyrxd.transaction.transaction_preimage import _get_push_refs
+
+        for short in (0, 1, 35):
+            with pytest.raises(ValidationError, match="truncated pushref"):
+                _get_push_refs(b"\xd0" + bytes(range(short)))
+
+    def test_single_byte_push_is_not_an_opcode(self):
+        """A 1-byte direct push must consume its payload: [0x01, 0xd0]
+        contains NO pushref (the 0xd0 is data, not an opcode)."""
+        from pyrxd.transaction.transaction_preimage import _get_push_refs
+
+        assert _get_push_refs(b"\x01\xd0") == []
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
