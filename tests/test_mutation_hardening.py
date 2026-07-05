@@ -270,6 +270,21 @@ class TestFromAsm:
         with pytest.raises(ValueError):
             Script.from_asm("zz")
 
+    def test_non_canonical_hex_token_rejected(self):
+        """Uppercase hex parses via fromhex but is NOT canonical; the
+        round-trip check must reject it (kills the `!=` → `is` survivor,
+        which never fires because .hex() returns a fresh string)."""
+        with pytest.raises(ValueError):
+            Script.from_asm("AA")
+
+    def test_token_index_arithmetic_at_distinguishing_positions(self):
+        """Token cursors advance by +1/+3; the XOR/OR mutants coincide with
+        addition at index 0/1, so pin shapes where they diverge (hex token
+        at odd index, PUSHDATA form starting at index 2)."""
+        assert Script.from_asm("OP_1 aa OP_1").hex() == "5101aa51"
+        s = Script.from_asm("OP_1 OP_1 OP_PUSHDATA1 4c " + "ef" * 76)
+        assert s.hex() == "5151" + "4c4c" + "ef" * 76
+
 
 class TestDmintParamsValidation:
     """glyph/dmint/types.py — __post_init__ boundary mutants. Each guard
