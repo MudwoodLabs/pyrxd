@@ -384,6 +384,155 @@ class TestDmintParamsValidation:
                 DmintCborPayload(**kwargs)
 
 
+class TestTransactionInputConstruction:
+    """transaction_input.py — constructor mutants."""
+
+    def test_default_output_index_is_zero(self):
+        assert TransactionInput(source_txid="ab" * 32).source_output_index == 0
+
+    def test_no_source_at_all_leaves_txid_none(self):
+        """Kills the L28 `and not` → `or not` survivor, which would call
+        .txid() on a None source_transaction."""
+        tx_in = TransactionInput()
+        assert tx_in.source_txid is None
+
+
+class TestTransactionOutputWire:
+    """transaction_output.py — constructor default + from_hex guard mutants."""
+
+    def test_default_is_not_change(self):
+        assert TransactionOutput(Script(_P2PKH_AA), 1_000).change is False
+
+    def test_from_hex_accepts_large_script_exactly(self):
+        """Kills the L54 `!=` → `is not` survivor: for a >256-byte script the
+        two equal lengths are distinct int objects, so `is not` would reject
+        a VALID output. 300 bytes also exercises the 0xfd varint form."""
+        script = bytes([0x4C, 0x2C]) + b"\xee" * 44 + b"\x51" * 254  # 300 bytes total
+        raw = (5_000).to_bytes(8, "little") + b"\xfd\x2c\x01" + script
+        out = TransactionOutput.from_hex(raw)
+        assert out is not None
+        assert out.locking_script.serialize() == script
+        assert out.satoshis == 5_000
+
+    def test_from_hex_rejects_truncated_script(self):
+        """The varint over-claim guard (hashOutputHashes corruption class):
+        claiming 300 bytes with fewer available must yield None, not a
+        silently truncated output."""
+        script = b"\x51" * 100
+        raw = (5_000).to_bytes(8, "little") + b"\xfd\x2c\x01" + script
+        assert TransactionOutput.from_hex(raw) is None
+
+
+class TestDmintScriptIntParser:
+    """glyph/dmint/chain.py — _parse_script_int/_decode_script_le_int
+    mutants. Expected values re-derived from the Bitcoin script-number
+    encoding rules (little-endian, sign bit = MSB of last byte)."""
+
+    def test_opcode_forms(self):
+        from pyrxd.glyph.dmint.chain import _parse_script_int
+
+        assert _parse_script_int(b"\x00", 0) == (0, 1)
+        assert _parse_script_int(b"\x4f", 0) == (-1, 1)
+        assert _parse_script_int(b"\x51", 0) == (1, 1)  # OP_1 boundary
+        assert _parse_script_int(b"\x60", 0) == (16, 1)  # OP_16 boundary
+
+    def test_direct_push_forms_and_positions(self):
+        from pyrxd.glyph.dmint.chain import _parse_script_int
+
+        assert _parse_script_int(b"\x01\x11", 0) == (0x11, 2)
+        # little-endian multi-byte with position advance
+        assert _parse_script_int(b"\xff\x02\x34\x12\xff", 1) == (0x1234, 4)
+        # sign bit: 0x81 encodes -1, 0xff,0x80 encodes -255
+        assert _parse_script_int(b"\x01\x81", 0) == (-1, 2)
+        assert _parse_script_int(b"\x02\xff\x80", 0) == (-255, 3)
+
+    def test_pushdata1_form(self):
+        from pyrxd.glyph.dmint.chain import _parse_script_int
+
+        payload = (123456789).to_bytes(4, "little")
+        assert _parse_script_int(b"\x4c\x04" + payload, 0) == (123456789, 6)
+
+    def test_truncated_pushes_raise(self):
+        from pyrxd.glyph.dmint.chain import _parse_script_int
+
+        for bad in (b"\x02\x01", b"\x4c", b"\x4c\x04\x01"):
+            with pytest.raises(Exception):
+                _parse_script_int(bad, 0)
+
+
+class TestDmintStateParserRejectsCorruption:
+    """glyph/dmint/chain.py — _from_v2_script guard mutants: a valid built
+    contract corrupted at documented layout offsets must be REJECTED, and
+    the offsets are computed from the layout, not the parser."""
+
+    @staticmethod
+    def _contract() -> bytes:
+        from pyrxd.glyph.dmint import DaaMode, DmintAlgo, DmintDeployParams, build_dmint_contract_script
+        from pyrxd.glyph.types import GlyphRef
+
+        return build_dmint_contract_script(
+            DmintDeployParams(
+                contract_ref=GlyphRef(txid="11" * 32, vout=1),
+                token_ref=GlyphRef(txid="11" * 32, vout=0),
+                max_height=10,
+                reward=1000,
+                difficulty=1,
+                algo=DmintAlgo.SHA256D,
+                daa_mode=DaaMode.FIXED,
+            )
+        )
+
+    def test_valid_contract_parses(self):
+        from pyrxd.glyph.dmint.chain import DmintState
+
+        assert DmintState.from_script(self._contract()).max_height == 10
+
+    def test_wrong_tokenref_opcode_rejected(self):
+        from pyrxd.glyph.dmint.chain import DmintState
+        from pyrxd.security.errors import ValidationError
+
+        script = bytearray(self._contract())
+        # layout: height push (1B for height 0) + d8+36 → tokenRef d0 at 38
+        assert script[38] == 0xD0
+        script[38] = 0xD1
+        with pytest.raises(ValidationError):
+            DmintState.from_script(bytes(script))
+
+    def test_truncated_contract_ref_rejected(self):
+        from pyrxd.glyph.dmint.chain import DmintState
+        from pyrxd.security.errors import ValidationError
+
+        script = self._contract()
+        # cut inside the 36-byte contractRef payload (offset 2..37)
+        with pytest.raises(ValidationError):
+            DmintState.from_script(script[:20])
+
+    def test_wrong_lasttime_push_width_rejected(self):
+        from pyrxd.glyph.dmint.chain import DmintState
+        from pyrxd.security.errors import ValidationError
+
+        script = bytearray(self._contract())
+        # lastTime is the fixed 4-byte push after the five numeric slots;
+        # locate it from the layout: 1 (height) + 37 + 37 + 5 pushes for
+        # maxHeight(1B opcode-form? no: 10 → 0x01 0x0a = 2B) …
+        # Simpler and layout-true: find the documented 04-push preceding the
+        # target slot by scanning for the exact 0x04 || last_time(=0) window.
+        idx = bytes(script).index(b"\x04\x00\x00\x00\x00")
+        script[idx] = 0x05
+        with pytest.raises(ValidationError):
+            DmintState.from_script(bytes(script))
+
+    def test_missing_state_separator_rejected(self):
+        from pyrxd.glyph.dmint.chain import DmintState
+        from pyrxd.security.errors import ValidationError
+
+        script = bytearray(self._contract())
+        sep = bytes(script).index(b"\xbd")
+        script[sep] = 0xBE
+        with pytest.raises(ValidationError):
+            DmintState.from_script(bytes(script))
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
