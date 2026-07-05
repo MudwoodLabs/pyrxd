@@ -587,9 +587,20 @@ class TestTimelockScriptBytes:
         from pyrxd.script.timelock import CsvKind, build_csv_sequence
         from pyrxd.security.errors import ValidationError
 
+        assert build_csv_sequence(0, CsvKind.BLOCKS) == 0  # zero units valid
         for bad in (-1, 0x1_0000):
             with pytest.raises(ValidationError):
                 build_csv_sequence(bad, CsvKind.BLOCKS)
+
+    def test_csv_max_sequence_fails_on_disable_bit_not_range(self):
+        """sequence 0xFFFFFFFF is INSIDE the 32-bit range; it must be
+        rejected by the disable-bit guard specifically (kills the range
+        `<=` → `<` mutant, which would fire the wrong error first)."""
+        from pyrxd.script.timelock import build_p2pkh_with_csv_script
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError, match="disable"):
+            build_p2pkh_with_csv_script(b"\xaa" * 20, 0xFFFFFFFF)
 
     def test_csv_script_rejects_disable_bit(self):
         from pyrxd.script.timelock import build_p2pkh_with_csv_script
