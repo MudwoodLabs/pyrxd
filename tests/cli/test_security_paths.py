@@ -123,9 +123,7 @@ class TestSendInProcessFallback:
         _saved_wallet(tmp_path / "wallet.dat")
         client = _funded_client_for(DEST)
         ctx = _ctx(tmp_path / "wallet.dat", client, yes=True)
-        result = runner.invoke(
-            wallet_group, ["send", "--to", DEST, "--amount", "10000000"], obj=ctx, input="\n"
-        )
+        result = runner.invoke(wallet_group, ["send", "--to", DEST, "--amount", "10000000"], obj=ctx, input="\n")
         assert result.exit_code != 0
         assert "mnemonic is required" in result.output
         client.broadcast.assert_not_awaited()
@@ -194,9 +192,7 @@ class TestAgentUnlockLifecycle:
         monkeypatch.setattr("pyrxd.cli.agent_cmds.atexit", MagicMock())
         return daemon_cls
 
-    def test_unlock_serves_then_reports_locked(
-        self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock
-    ) -> None:
+    def test_unlock_serves_then_reports_locked(self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock) -> None:
         _saved_wallet(tmp_path / "wallet.dat")
         ctx = _ctx(tmp_path / "wallet.dat")
         result = runner.invoke(agent_group, ["unlock"], obj=ctx, input=f"{MNEMONIC}\n")
@@ -207,9 +203,7 @@ class TestAgentUnlockLifecycle:
         # Socket must live next to the wallet file, not in a world-visible tmp.
         assert str(tmp_path) in str(daemon_cls.call_args.kwargs["socket_path"])
 
-    def test_unlock_ctrl_c_still_zeroizes(
-        self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock
-    ) -> None:
+    def test_unlock_ctrl_c_still_zeroizes(self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock) -> None:
         _saved_wallet(tmp_path / "wallet.dat")
         daemon_cls.return_value.serve_forever.side_effect = KeyboardInterrupt
         ctx = _ctx(tmp_path / "wallet.dat")
@@ -217,9 +211,7 @@ class TestAgentUnlockLifecycle:
         assert "agent locked (seed zeroized)" in result.output
         daemon_cls.return_value.lock.assert_called()
 
-    def test_unlock_empty_mnemonic_rejected(
-        self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock
-    ) -> None:
+    def test_unlock_empty_mnemonic_rejected(self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock) -> None:
         _saved_wallet(tmp_path / "wallet.dat")
         ctx = _ctx(tmp_path / "wallet.dat")
         result = runner.invoke(agent_group, ["unlock"], obj=ctx, input="\n")
@@ -227,9 +219,7 @@ class TestAgentUnlockLifecycle:
         assert "mnemonic is required" in result.output
         daemon_cls.assert_not_called()
 
-    def test_unlock_wrong_mnemonic_no_echo(
-        self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock
-    ) -> None:
+    def test_unlock_wrong_mnemonic_no_echo(self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock) -> None:
         _saved_wallet(tmp_path / "wallet.dat")
         ctx = _ctx(tmp_path / "wallet.dat")
         result = runner.invoke(agent_group, ["unlock"], obj=ctx, input=f"{WRONG_MNEMONIC}\n")
@@ -252,9 +242,7 @@ class TestQueryCommandPaths:
         either secret)."""
         _saved_wallet(tmp_path / "wallet.dat")
         ctx = _ctx(tmp_path / "wallet.dat")
-        result = runner.invoke(
-            address_cmd, ["--index", "0", "--passphrase"], obj=ctx, input=f"{MNEMONIC}\nhunter2\n"
-        )
+        result = runner.invoke(address_cmd, ["--index", "0", "--passphrase"], obj=ctx, input=f"{MNEMONIC}\nhunter2\n")
         assert result.exit_code != 0
         assert "Could not decrypt" in result.output
         assert "hunter2" not in result.output
@@ -305,9 +293,7 @@ class TestQueryCommandPaths:
         # A min-photons filter above the UTXO value must yield an empty list.
         client2 = _funded_client_for(funded)
         ctx2 = _ctx(tmp_path / "wallet.dat", client2, output_mode="json")
-        result2 = runner.invoke(
-            utxos_cmd, ["--min-photons", "200000000"], obj=ctx2, input=f"{MNEMONIC}\n"
-        )
+        result2 = runner.invoke(utxos_cmd, ["--min-photons", "200000000"], obj=ctx2, input=f"{MNEMONIC}\n")
         assert result2.exit_code == 0, result2.output
         assert "100000000" not in result2.output
 

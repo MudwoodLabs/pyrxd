@@ -142,9 +142,7 @@ def _ref_preimage(
     if acp:
         hash_prevouts = b"\x00" * 32
     else:
-        hash_prevouts = hash256(
-            b"".join(i["txid"][::-1] + struct.pack("<I", i["vout"]) for i in inputs)
-        )
+        hash_prevouts = hash256(b"".join(i["txid"][::-1] + struct.pack("<I", i["vout"]) for i in inputs))
 
     if not acp and base != _SINGLE and base != _NONE:
         hash_sequence = hash256(b"".join(struct.pack("<I", i["sequence"]) for i in inputs))
@@ -223,8 +221,8 @@ class TestReferenceAnchoredToRadiantjsVectors:
 # under uint288-LE vs raw-lexicographic comparison, plus refs sharing bytes
 # to exercise dedup.
 _REF_POOL = [
-    b"\xff" + bytes(35),          # huge first byte, tiny uint288
-    bytes(35) + b"\x01",          # tiny bytes, huge uint288
+    b"\xff" + bytes(35),  # huge first byte, tiny uint288
+    bytes(35) + b"\x01",  # tiny bytes, huge uint288
     b"\x01" + bytes(35),
     bytes(35) + b"\xff",
     bytes.fromhex(_REF_HEX),
@@ -245,9 +243,7 @@ _plain_opcodes = st.sampled_from(
 # Data pushes across all four encodings. Payloads may contain 0xd0/0xd8
 # bytes on purpose: a correct scanner must skip push payloads, never
 # interpret them as pushref opcodes.
-_direct_push = st.binary(min_size=0, max_size=0x4B).map(
-    lambda d: (bytes([len(d)]) + d) if d else b"\x00"
-)
+_direct_push = st.binary(min_size=0, max_size=0x4B).map(lambda d: (bytes([len(d)]) + d) if d else b"\x00")
 _pushdata1 = st.binary(min_size=0, max_size=80).map(lambda d: b"\x4c" + bytes([len(d)]) + d)
 _pushdata2 = st.binary(min_size=0, max_size=80).map(lambda d: b"\x4d" + struct.pack("<H", len(d)) + d)
 _pushdata4 = st.binary(min_size=0, max_size=80).map(lambda d: b"\x4e" + struct.pack("<I", len(d)) + d)
