@@ -708,6 +708,65 @@ class TestPushRefScannerGuards:
         assert _get_push_refs(b"\x01\xd0") == []
 
 
+class TestDmintCborPayloadDecode:
+    """glyph/dmint/types.py — from_cbor_dict default/except mutants."""
+
+    def test_minimal_dict_defaults(self):
+        """Absent optional keys must take the DOCUMENTED defaults (Photonic
+        DmintPayload semantics): numContracts 1, premine 0, FIXED DAA at
+        60s target."""
+        from pyrxd.glyph.dmint import DaaMode, DmintAlgo
+        from pyrxd.glyph.dmint.types import DmintCborPayload
+
+        p = DmintCborPayload.from_cbor_dict({"algo": 0, "maxHeight": 5, "reward": 10, "diff": 1})
+        assert p.algo == DmintAlgo.SHA256D
+        assert p.num_contracts == 1
+        assert p.premine == 0
+        assert p.daa_mode == DaaMode.FIXED
+        assert p.target_block_time == 60
+        assert p.half_life == 0
+        assert p.window_size == 0
+
+    def test_daa_subdict_defaults(self):
+        from pyrxd.glyph.dmint import DaaMode
+        from pyrxd.glyph.dmint.types import DmintCborPayload
+
+        p = DmintCborPayload.from_cbor_dict({"algo": 0, "maxHeight": 5, "reward": 10, "diff": 1, "daa": {"mode": 2}})
+        assert p.daa_mode == DaaMode.ASERT
+        assert p.target_block_time == 60  # daa present, targetBlockTime absent
+
+    def test_missing_and_invalid_algo_are_validation_errors(self):
+        """Kills the ExceptionReplacer mutants on the (KeyError, ValueError)
+        handler: BOTH failure shapes must surface as ValidationError, never
+        a raw KeyError/ValueError."""
+        from pyrxd.glyph.dmint.types import DmintCborPayload
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError, match="algo"):
+            DmintCborPayload.from_cbor_dict({"maxHeight": 5, "reward": 10, "diff": 1})
+        with pytest.raises(ValidationError, match="algo"):
+            DmintCborPayload.from_cbor_dict({"algo": 99, "maxHeight": 5, "reward": 10, "diff": 1})
+
+    def test_missing_required_field_is_validation_error(self):
+        from pyrxd.glyph.dmint.types import DmintCborPayload
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError):
+            DmintCborPayload.from_cbor_dict({"algo": 0, "reward": 10, "diff": 1})  # no maxHeight
+
+    def test_payload_dataclasses_frozen(self):
+        import dataclasses
+
+        from pyrxd.glyph.dmint import DmintAlgo
+        from pyrxd.glyph.dmint.types import DmintCborPayload, DmintV1ContractInitialState
+
+        p = DmintCborPayload(algo=DmintAlgo.SHA256D, num_contracts=1, max_height=1, reward=0, premine=0, diff=1)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            p.reward = 5
+        assert dataclasses.fields(DmintV1ContractInitialState)  # class exists, frozen checked below
+        assert DmintV1ContractInitialState.__dataclass_params__.frozen is True
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
