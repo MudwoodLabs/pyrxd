@@ -902,6 +902,97 @@ class TestScriptTemplates:
         assert pub_push.data == pk.public_key().serialize()
 
 
+class TestDmintDaaBoundaries:
+    """glyph/dmint/miner.py — DAA target-arithmetic mutants. Every expected
+    value below is computed from the documented formula in the function's
+    docstring, with the boundary chosen to distinguish the mutant."""
+
+    _MAX = 0x7FFFFFFFFFFFFFFF
+
+    def test_asert_doubling_cap_boundary(self):
+        """current_target == MAX//2 doubles to MAX-1 (it is NOT above the
+        cap threshold); the `MAX//2` → `MAX//3` mutant would clamp to MAX."""
+        from pyrxd.glyph.dmint.miner import compute_next_target_asert
+
+        got = compute_next_target_asert(
+            current_target=self._MAX // 2, last_time=0, current_time=60 + 3600, target_time=60, half_life=3600
+        )
+        assert got == (self._MAX // 2) * 2  # == MAX - 1
+
+    def test_asert_halving_and_clamp(self):
+        from pyrxd.glyph.dmint.miner import compute_next_target_asert
+
+        # drift −1 → exact halving
+        assert compute_next_target_asert(1000, 0, 60 - 3600, 60, 3600) == 500
+        # huge positive excess clamps at drift +4 → ×16
+        assert compute_next_target_asert(1000, 0, 60 + 100 * 3600, 60, 3600) == 16_000
+        # floor at 1
+        assert compute_next_target_asert(1, 0, 60 - 100 * 3600, 60, 3600) == 1
+
+    def test_linear_formula_at_target_cap(self):
+        """target cap is MAX//4 exactly (LWMA difficulty floor 4)."""
+        from pyrxd.glyph.dmint.miner import compute_next_target_linear
+
+        got = compute_next_target_linear(self._MAX, last_time=0, current_time=60, target_time=60)
+        assert got == (self._MAX // 4 // 60) * 60
+        # negative delta floors at 0 → minimum target 1
+        assert compute_next_target_linear(self._MAX, last_time=100, current_time=40, target_time=60) == 1
+        # delta caps at 4× target_time
+        assert compute_next_target_linear(1_000_000, 0, 10_000_000, 60) == (1_000_000 // 60) * 240
+
+    def test_epoch_retargets_only_at_boundary(self):
+        from pyrxd.glyph.dmint.miner import compute_next_target_epoch
+
+        kwargs = dict(
+            current_target=1 << 40,
+            last_time=0,
+            current_time=120,
+            target_time=60,
+            epoch_length=10,
+            max_adjustment_log2=2,
+        )
+        # boundary hit: (target // 60) * clamped(120) per the docstring
+        assert compute_next_target_epoch(height=10, **kwargs) == ((1 << 40) // 60) * 120
+        # non-boundary heights leave the target untouched, including 0
+        assert compute_next_target_epoch(height=11, **kwargs) == 1 << 40
+        assert compute_next_target_epoch(height=0, **kwargs) == 1 << 40
+
+    def test_schedule_boundary_is_inclusive(self):
+        from pyrxd.glyph.dmint.miner import compute_next_target_schedule
+
+        sched = ((10, 111), (20, 222))
+        assert compute_next_target_schedule(999, 9, sched) == 999  # below lowest
+        assert compute_next_target_schedule(999, 10, sched) == 111  # AT boundary
+        assert compute_next_target_schedule(999, 20, sched) == 222  # highest match wins
+        assert compute_next_target_schedule(999, 25, sched) == 222
+
+    def test_difficulty_target_conversions(self):
+        from pyrxd.glyph.dmint import DmintAlgo
+        from pyrxd.glyph.dmint.miner import difficulty_to_target, target_to_difficulty
+        from pyrxd.security.errors import ValidationError
+
+        assert difficulty_to_target(1) == self._MAX
+        assert difficulty_to_target(1, DmintAlgo.BLAKE3) == (1 << 256) - 1  # 256-bit max, not SHA256D's
+        assert target_to_difficulty(1) == self._MAX  # target=1 boundary valid
+        assert target_to_difficulty(self._MAX) == 1
+        for fn in (difficulty_to_target, target_to_difficulty):
+            with pytest.raises(ValidationError):
+                fn(0)
+
+    def test_mine_solution_guards(self):
+        from pyrxd.glyph.dmint import DmintAlgo
+        from pyrxd.glyph.dmint.miner import mine_solution
+        from pyrxd.security.errors import ValidationError
+
+        preimage = bytes(64)
+        with pytest.raises(ValidationError):
+            mine_solution(preimage, 0)
+        with pytest.raises(ValidationError):
+            mine_solution(preimage, 1, max_attempts=0)
+        with pytest.raises(NotImplementedError):
+            mine_solution(preimage, 1, algo=DmintAlgo.BLAKE3)
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
