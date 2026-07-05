@@ -151,6 +151,239 @@ class TestTransactionAccounting:
             tx.fee(0, change_distribution="random")
 
 
+class TestWireFormats:
+    """transaction.py — from_beef guard and parse_script_offsets mutants."""
+
+    def test_from_beef_rejects_wrong_version_below_magic(self):
+        """Kills the L244 `!=` → `>` survivor: a version BELOW the BEEF magic
+        (4022206465) must raise, not fall through to parsing garbage."""
+        tx = Transaction(tx_outputs=[_out(_P2PKH_AA, 1_000)])
+        good = (4022206465).to_bytes(4, "little") + b"\x00" + b"\x01" + tx.serialize() + b"\x00"
+        assert Transaction.from_beef(good).txid() == tx.txid()
+        bad = (1).to_bytes(4, "little") + good[4:]
+        with pytest.raises(ValueError, match="BEEF version"):
+            Transaction.from_beef(bad)
+
+    def test_parse_script_offsets_exact_slices(self):
+        """Kills the parse_script_offsets skip-arithmetic survivors
+        (L416–L429): every reported (offset, length) must slice the raw tx
+        back to the exact script bytes, across multiple inputs/outputs with
+        distinct script lengths."""
+        in_a, in_b = _in(txid="11" * 32), _in(txid="22" * 32)
+        in_a.unlocking_script = Script(b"\x51" * 7)
+        in_b.unlocking_script = Script(b"\x52" * 19)
+        tx = Transaction(
+            tx_inputs=[in_a, in_b],
+            tx_outputs=[_out(_P2PKH_AA, 1_000), _out(_P2PKH_BB, 2_000)],
+        )
+        raw = tx.serialize()
+        offsets = Transaction.parse_script_offsets(raw)
+        assert [i["vin"] for i in offsets["inputs"]] == [0, 1]
+        assert [o["vout"] for o in offsets["outputs"]] == [0, 1]
+        for rec, script in zip(offsets["inputs"], [b"\x51" * 7, b"\x52" * 19]):
+            assert raw[rec["offset"] : rec["offset"] + rec["length"]] == script
+        for rec, script in zip(offsets["outputs"], [_P2PKH_AA, _P2PKH_BB]):
+            assert raw[rec["offset"] : rec["offset"] + rec["length"]] == script
+
+
+class TestScriptChunkParsing:
+    """script/script.py — _build_chunks parser mutants (L45–L67). The chunk
+    view feeds to_asm/find_and_delete; no prior test asserted parsed chunk
+    DATA, so every push-dispatch comparison survived."""
+
+    def test_p2pkh_chunks_carry_exact_push_data(self):
+        s = Script(_P2PKH_AA)
+        ops = [c.op for c in s.chunks]
+        assert ops == [b"\x76", b"\xa9", b"\x14", b"\x88", b"\xac"]
+        assert s.chunks[2].data == b"\xaa" * 20
+        assert s.chunks[0].data is None
+
+    def test_direct_push_boundary_75_bytes(self):
+        """op == 0x4b is the LAST direct-push opcode; `<= 0x4b` → `< 0x4b`
+        must not drop its payload."""
+        payload = bytes(range(75))
+        s = Script(bytes([0x4B]) + payload)
+        assert len(s.chunks) == 1
+        assert s.chunks[0].data == payload
+
+    def test_pushdata_1_2_4_dispatch(self):
+        payload = b"\xcd" * 80
+        for opcode, len_bytes in (
+            (b"\x4c", (80).to_bytes(1, "little")),
+            (b"\x4d", (80).to_bytes(2, "little")),
+            (b"\x4e", (80).to_bytes(4, "little")),
+        ):
+            s = Script(opcode + len_bytes + payload)
+            assert len(s.chunks) == 1, f"opcode {opcode.hex()}"
+            assert s.chunks[0].data == payload, f"opcode {opcode.hex()}"
+
+    def test_script_equality_is_not_ordering(self):
+        """__eq__ `==` → `>=` survivor: equality must be symmetric-false for
+        two different scripts regardless of byte order."""
+        lo, hi = Script(b"\x51"), Script(b"\x52")
+        assert lo == Script(b"\x51")
+        # NB: `!=` falls back to object identity (no __ne__), so the kill
+        # must go through __eq__ from both sides explicitly.
+        assert (lo == hi) is False
+        assert (hi == lo) is False
+
+    def test_find_and_delete_keeps_nonmatching_chunks(self):
+        source = Script.from_chunks(Script(_P2PKH_AA).chunks)
+        pattern = Script(b"\x76")  # OP_DUP
+        remaining = Script.find_and_delete(source, pattern)
+        assert remaining.serialize() == _P2PKH_AA[1:]
+
+
+class TestFromAsm:
+    """script/script.py — from_asm token handling mutants (L113–L162)."""
+
+    def test_op_false_normalizes_to_op_0(self):
+        assert Script.from_asm("OP_FALSE").hex() == "00"
+        assert Script.from_asm("0").hex() == "00"
+
+    def test_minus_one_is_op_1negate_not_zero(self):
+        """Kills the L126 `== "0"` → `<= "0"` survivor ("-1" sorts before
+        "0" lexicographically and would be swallowed by the zero branch)."""
+        assert Script.from_asm("-1").hex() == "4f"
+
+    def test_hex_push_encodings_by_length(self):
+        """Kills the L142–L148 push-size boundary survivors: 75 bytes stays
+        a direct push, 76..255 → PUSHDATA1, 256..65535 → PUSHDATA2."""
+        for n, prefix in ((75, "4b"), (76, "4c4c"), (255, "4cff"), (256, "4d0001")):
+            asm = "ab" * n
+            assert Script.from_asm(asm).hex() == prefix + "ab" * n, f"len {n}"
+
+    def test_pushdata_token_form_roundtrip(self):
+        """OP_PUSHDATAx SIZE DATA consumes exactly three tokens (L151–L158
+        index arithmetic)."""
+        s = Script.from_asm("OP_PUSHDATA1 4c " + "ef" * 76 + " OP_CHECKSIG")
+        assert s.hex() == "4c4c" + "ef" * 76 + "ac"
+
+    def test_unknown_op_token_is_value_error(self):
+        """Kills the L122 `and` → `or` survivor: an OP_-prefixed token that
+        is NOT a known opcode must fail hex validation (ValueError), not
+        KeyError into the opcode table."""
+        with pytest.raises(ValueError):
+            Script.from_asm("OP_NOT_A_REAL_OPCODE")
+
+    def test_invalid_hex_token_rejected(self):
+        with pytest.raises(ValueError):
+            Script.from_asm("zz")
+
+
+class TestDmintParamsValidation:
+    """glyph/dmint/types.py — __post_init__ boundary mutants. Each guard
+    gets its exact boundary: the smallest VALID value must construct and the
+    first INVALID value must raise, so `<` → `<=` (and friends) all die."""
+
+    @staticmethod
+    def _params(**overrides):
+        from pyrxd.glyph.dmint import DaaMode, DmintAlgo, DmintDeployParams
+        from pyrxd.glyph.types import GlyphRef
+
+        base = dict(
+            contract_ref=GlyphRef(txid="11" * 32, vout=1),
+            token_ref=GlyphRef(txid="11" * 32, vout=0),
+            max_height=10,
+            reward=1000,
+            difficulty=1,
+            algo=DmintAlgo.SHA256D,
+            daa_mode=DaaMode.FIXED,
+        )
+        base.update(overrides)
+        return DmintDeployParams(**base)
+
+    def test_boundary_minimums(self):
+        from pyrxd.security.errors import ValidationError
+
+        p = self._params(max_height=1, reward=1, difficulty=1, target_time=1, half_life=1)
+        assert (p.max_height, p.reward, p.difficulty, p.target_time, p.half_life) == (1, 1, 1, 1, 1)
+        for field, bad in (
+            ("max_height", 0),
+            ("reward", 0),
+            ("difficulty", 0),
+            ("target_time", 0),
+            ("half_life", 0),
+            ("height", -1),
+            ("last_time", -1),
+        ):
+            with pytest.raises(ValidationError):
+                self._params(**{field: bad})
+
+    def test_documented_defaults(self):
+        p = self._params()
+        assert p.target_time == 60
+        assert p.half_life == 3600
+        assert p.height == 0
+        assert p.last_time == 0
+        assert p.epoch_length == 2016
+        assert p.max_adjustment_log2 == 2
+
+    def test_params_are_frozen(self):
+        import dataclasses
+
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            self._params().max_height = 99
+
+    def test_max_v2_target_is_2_256_minus_1(self):
+        from pyrxd.glyph.dmint import DmintAlgo
+
+        p = self._params(algo=DmintAlgo.BLAKE3, difficulty=1)
+        assert p.initial_target == (1 << 256) - 1
+
+    def test_schedule_boundaries(self):
+        from pyrxd.glyph.dmint import DaaMode
+        from pyrxd.security.errors import ValidationError
+
+        # height 0 in the first entry is VALID (prev_h starts at -1, not -0)
+        p = self._params(daa_mode=DaaMode.SCHEDULE, schedule=((0, 1000),))
+        assert p.schedule == ((0, 1000),)
+        # exactly 10 entries allowed, 11 rejected
+        ok = tuple((h, 1000) for h in range(10))
+        assert self._params(daa_mode=DaaMode.SCHEDULE, schedule=ok).schedule == ok
+        with pytest.raises(ValidationError, match="at most"):
+            self._params(daa_mode=DaaMode.SCHEDULE, schedule=tuple((h, 1000) for h in range(11)))
+        with pytest.raises(ValidationError, match="height must be >= 0"):
+            self._params(daa_mode=DaaMode.SCHEDULE, schedule=((-1, 1000),))
+        with pytest.raises(ValidationError, match="ascending"):
+            self._params(daa_mode=DaaMode.SCHEDULE, schedule=((5, 1000), (5, 2000)))
+        with pytest.raises(ValidationError, match="non-empty"):
+            self._params(daa_mode=DaaMode.SCHEDULE, schedule=())
+
+    def test_epoch_guards(self):
+        from pyrxd.glyph.dmint import DaaMode
+        from pyrxd.security.errors import ValidationError
+
+        min_diff = 0x7FFFFFFFFFFFFFFF // (1 << 48) + 1
+        p = self._params(daa_mode=DaaMode.EPOCH, difficulty=min_diff, epoch_length=1)
+        assert p.epoch_length == 1
+        with pytest.raises(ValidationError):
+            self._params(daa_mode=DaaMode.EPOCH, difficulty=min_diff, epoch_length=0)
+        with pytest.raises(ValidationError, match="2\\^48"):
+            self._params(daa_mode=DaaMode.EPOCH, difficulty=1)
+        with pytest.raises(ValidationError, match="max_adjustment_log2"):
+            self._params(daa_mode=DaaMode.EPOCH, difficulty=min_diff, max_adjustment_log2=5)
+
+    def test_cbor_payload_guards(self):
+        from pyrxd.glyph.dmint import DmintAlgo
+        from pyrxd.glyph.dmint.types import DmintCborPayload
+        from pyrxd.security.errors import ValidationError
+
+        ok = DmintCborPayload(algo=DmintAlgo.SHA256D, num_contracts=1, max_height=1, reward=0, premine=0, diff=1)
+        assert (ok.num_contracts, ok.max_height, ok.reward, ok.premine, ok.diff) == (1, 1, 0, 0, 1)
+        for field, bad in (
+            ("num_contracts", 0),
+            ("max_height", 0),
+            ("reward", -1),
+            ("premine", -1),
+            ("diff", 0),
+        ):
+            kwargs = dict(algo=DmintAlgo.SHA256D, num_contracts=1, max_height=1, reward=0, premine=0, diff=1)
+            kwargs[field] = bad
+            with pytest.raises(ValidationError):
+                DmintCborPayload(**kwargs)
+
+
 class TestSignValidation:
     """transaction.py — sign()'s missing-amount validation mutants (L106–108)."""
 
