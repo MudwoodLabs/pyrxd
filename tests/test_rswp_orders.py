@@ -84,7 +84,7 @@ def test_post_take_rxd_for_ft_full_loop() -> None:
     mk, mk_pkh = _key()
     tk, tk_pkh = _key()
     src = _rxd_src(mk_pkh, 1000)
-    post, order = _post_and_decode(src, mk, Asset("ft", 50, _REF_R), mk_pkh)
+    _post, order = _post_and_decode(src, mk, Asset("ft", 50, _REF_R), mk_pkh)
 
     assert order.offered_is_rxd and order.want_token_id == swap_token_id(_REF_R)[::-1]
     assert order.offered_txid == src.txid() and order.offered_utxo_index == 0
@@ -108,7 +108,7 @@ def test_post_take_ft_for_rxd_full_loop() -> None:
     mk, mk_pkh = _key()
     tk, tk_pkh = _key()
     src = _ft_src(mk_pkh, _REF_G, 777)
-    post, order = _post_and_decode(src, mk, Asset("rxd", 900), mk_pkh)
+    _post, order = _post_and_decode(src, mk, Asset("rxd", 900), mk_pkh)
 
     assert order.token_id == swap_token_id(_REF_G)[::-1]
     assert order.want_token_id is None and order.flags == 0  # RXD want side: field omitted
@@ -138,7 +138,7 @@ def test_bridge_offer_equals_private_envelope() -> None:
 def test_verify_offer_signature_accepts_fresh_offer() -> None:
     mk, mk_pkh = _key()
     src = _rxd_src(mk_pkh, 1000)
-    post, order = _post_and_decode(src, mk, Asset("rxd", 600), mk_pkh)
+    _post, order = _post_and_decode(src, mk, Asset("rxd", 600), mk_pkh)
     verify_offer_signature(rswp_order_to_swap_offer(order, give_source_tx=src))  # does not raise
 
 

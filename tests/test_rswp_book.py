@@ -109,7 +109,7 @@ def test_fake_source_satisfies_protocol() -> None:
 
 
 async def test_open_verified_order_is_fillable_end_to_end() -> None:
-    source, src, _, _ = _setup_book()
+    source, _src, _, _ = _setup_book()
     entries = await OrderbookClient(source).orders_offering(_REF)
     assert len(entries) == 1
     e = entries[0]
@@ -152,7 +152,7 @@ async def test_spent_offered_utxo_reports_spent_not_fillable() -> None:
 async def test_lying_row_reported_with_problem_not_dropped() -> None:
     """Index row advertises a token id that doesn't match the real UTXO —
     surfaced as a problem entry, never shown fillable, never silently dropped."""
-    source, src, _, _ = _setup_book()
+    source, _src, _, _ = _setup_book()
     source.rows[0]["tokenid"] = swap_token_id(GlyphRef(txid=Txid("ef" * 32), vout=9)).hex()
     entries = await OrderbookClient(source).orders_offering(GlyphRef(txid=Txid("ef" * 32), vout=9))
     assert len(entries) == 1
