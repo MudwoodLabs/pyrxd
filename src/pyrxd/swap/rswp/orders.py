@@ -246,7 +246,7 @@ def rswp_order_to_swap_offer(order: RswpOrder, *, give_source_tx: Transaction) -
     if not 0 <= order.offered_utxo_index < len(give_source_tx.outputs):
         # Also rejects a hostile advert whose CScriptNum vout decodes negative or huge
         # (the decoder is deliberately permissive about representing such frames).
-        raise ValidationError("advertised offered vout does not exist in the source transaction")
+        raise ValidationError("advertised offered vout is not present in give_source_tx")
     give_out = give_source_tx.outputs[order.offered_utxo_index]
     if not 0 < demanded.value <= _MAX_PHOTONS:
         raise ValidationError(f"demanded output value {demanded.value} is outside the fundable range")

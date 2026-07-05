@@ -81,7 +81,9 @@ def encode_price_terms(outputs: Sequence[DemandedOutput]) -> bytes:
     Round-trips through :func:`pyrxd.gravity.swap_order.parse_price_terms`.
     """
     if not outputs:
-        raise ValidationError("price terms require at least one demanded output")
+        # NB: phrased with a digit — 8+ all-lowercase words trip the BIP-39
+        # redaction heuristic in security.errors and would print "<redacted>".
+        raise ValidationError("price terms require at least 1 demanded output")
     blob = unsigned_to_varint(len(outputs))
     for out in outputs:
         if not 0 <= out.value <= 0xFFFFFFFFFFFFFFFF:
