@@ -299,7 +299,11 @@ golden-vector concern, not a §3 fuzz concern.
 **Cost.** The Hypothesis suite runs in ~1.5 s at CI budget (400
 examples per target). The atheris harnesses are overnight-run
 material — invoke via `scripts/fuzz_overnight.sh` against an 8-core
-box. Don't put atheris on the per-commit CI path.
+box. Don't put atheris on the per-commit CI path. Both engines DO
+run on the weekly scheduled lane (`.github/workflows/fuzz.yml`):
+`fuzz_deep.sh deep` for Hypothesis, and the atheris harnesses with a
+libFuzzer corpus accumulated across runs via the Actions cache —
+scheduled exploration is where their cost belongs.
 
 **Anti-pattern.** A `try/except: pass` with no comment looks like a
 broad swallow even when it's correct. Either add a comment naming
