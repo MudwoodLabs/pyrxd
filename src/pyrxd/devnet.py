@@ -203,8 +203,13 @@ class RegtestNode:
 
     # ----------------------------------------------------------------- lifecycle
 
-    def start(self, *, fresh: bool = False, initial_blocks: int = 101) -> None:
+    def start(self, *, fresh: bool = False, initial_blocks: int = 101, extra_args: tuple[str, ...] = ()) -> None:
         """Start the regtest node, create the dev wallet, and mature a coinbase.
+
+        ``extra_args`` are appended verbatim to the ``radiantd`` argv — e.g.
+        ``("-swapindex=1",)`` to serve the RSWP orderbook RPCs
+        (``getopenorders`` / ``getopenordersbywant``). Ignored when an already
+        running container is reused (start with ``fresh=True`` to apply).
 
         Idempotent unless ``fresh`` is set: if the container is already running
         it is left untouched (the chain state is preserved). ``fresh=True``
@@ -238,6 +243,7 @@ class RegtestNode:
                 f"-rpcpassword={self.RPC_PASSWORD}",
                 "-rpcbind=127.0.0.1",
                 "-rpcallowip=127.0.0.1",
+                *extra_args,
             ],
             capture_output=True,
             text=True,
