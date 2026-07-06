@@ -171,7 +171,12 @@ async def _read_covenant(ctx: CliContext, spk_hex: str) -> dict:
 
 @click.group(name="swap")
 def swap_group() -> None:
-    """Inspect Gravity cross-chain swaps (read-only — never broadcasts)."""
+    """Same-chain RSWP orderbook (orders/post/take/cancel) + cross-chain swap status.
+
+    ``status`` and ``orders`` are read-only. ``post``/``take``/``cancel``
+    broadcast AFTER an explicit value confirmation (``--json`` requires
+    ``--yes``) — see each command's help for what exactly is signed.
+    """
 
 
 @swap_group.command(name="status")
