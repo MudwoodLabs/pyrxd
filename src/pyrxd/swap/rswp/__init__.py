@@ -44,6 +44,7 @@ from ...gravity.swap_order import (
     parse_price_terms_lenient,
 )
 from .book import BookEntry, OrderbookClient, OrderbookSource
+from .node_rpc import NodeRpcSource
 from .orders import (
     RswpOrderPost,
     build_advert_tx,
@@ -83,6 +84,7 @@ __all__ = [
     "RXD_TOKEN_ID",
     "BookEntry",
     "DemandedOutput",
+    "NodeRpcSource",
     "OrderbookClient",
     "OrderbookSource",
     "RswpOrder",
