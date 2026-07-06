@@ -1,0 +1,181 @@
+{
+  "schema": "radiant-rswp-order/1",
+  "builder": "pyrxd.swap.rswp: encode_rswp_order / encode_price_terms / swap_token_id",
+  "provenance": "REFERENCE vectors produced by pyrxd, byte-derived from the canonical sources (Radiant-Core src/index/swapindex.cpp parser; Photonic-Wallet buildSwapAdvertisementScript / encodeScriptNum / assetToSwapTokenId / MultiTxOutV1). No vector here is yet anchored to a live mainnet order \u2014 a mainnet golden vector is a tracked follow-up. The reassembly vector reproduces the Radiant-Core functional test (test/functional/feature_swap.py). The v3 frame follows the Photonic Phase-2 layout (expiry_height 4-byte LE after wantTokenID, flag 0x02); NOTE the deployed Radiant-Core swapindex parses v2 only and drops v3 adverts.",
+  "notes": {
+    "signature_field": "opaque at the frame layer (the full maker scriptSig); vectors use a fixed synthetic value",
+    "token_id": "sha256 of the 36-byte little-endian ref (txid reversed || vout LE); display orientation in this file; pushed byte-reversed on chain",
+    "small_fields": "version/flags/offeredType/termsType MUST be 1-byte direct data pushes (node requires data.size()==1; OP_N is dropped)",
+    "vout": "OP_0 for 0, else minimal CScriptNum direct push; must fit a 4-byte CScriptNum (node reads CScriptNum(data,false,4))"
+  },
+  "token_id_vectors": [
+    {
+      "id": "rxd-native",
+      "ref": null,
+      "token_id_display_hex": "0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "id": "glyph-ref-a",
+      "ref": {
+        "txid": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001",
+        "vout": 1
+      },
+      "token_id_display_hex": "35fa0b2776848ba33b9ebc8f2ce4739325e773c7cba1b2525c33cab421ef597e"
+    },
+    {
+      "id": "glyph-ref-b",
+      "ref": {
+        "txid": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f102",
+        "vout": 0
+      },
+      "token_id_display_hex": "2ae9f433a0292548c6ffe3aa386453c49ae024878c7a11eda920e2d7881858c3"
+    }
+  ],
+  "price_terms_vectors": [
+    {
+      "id": "single-p2pkh",
+      "outputs": [
+        {
+          "value": 123456789,
+          "script_hex": "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        }
+      ],
+      "price_terms_hex": "0115cd5b07000000001976a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+    },
+    {
+      "id": "two-outputs",
+      "outputs": [
+        {
+          "value": 1,
+          "script_hex": "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+        },
+        {
+          "value": 4294967295,
+          "script_hex": "51"
+        }
+      ],
+      "price_terms_hex": "0201000000000000001976a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88acffffffff000000000151"
+    },
+    {
+      "id": "long-script",
+      "outputs": [
+        {
+          "value": 600,
+          "script_hex": "6a4c96bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "price_terms_hex": "015802000000000000996a4c96bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "frame_vectors": [
+    {
+      "id": "v2-ft-for-rxd",
+      "source": "reference",
+      "params": {
+        "offered_type": 2,
+        "token_ref": {
+          "txid": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001",
+          "vout": 1
+        },
+        "want_token_ref": null,
+        "offered_txid": "abababababababababababababababababababababababababababababababab",
+        "offered_vout": 0,
+        "price_terms_outputs": [
+          {
+            "value": 123456789,
+            "script_hex": "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+          }
+        ],
+        "signature_hex": "4730440220111111111111111111111111111111111111111111111111111111111111111102202222222222222222222222222222222222222222222222222222222222222222c321023333333333333333333333333333333333333333333333333333333333333333",
+        "expiry_height": null
+      },
+      "advert_script_hex": "6a04525357500102010001020101207e59ef21b4ca335c52b2a1cbc773e7259373e42c8fbc9e3ba38b8476270bfa3520abababababababababababababababababababababababababababababababab00230115cd5b07000000001976a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac4c6a4730440220111111111111111111111111111111111111111111111111111111111111111102202222222222222222222222222222222222222222222222222222222222222222c321023333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "id": "v2-rxd-for-ft",
+      "source": "reference",
+      "params": {
+        "offered_type": 0,
+        "token_ref": null,
+        "want_token_ref": {
+          "txid": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001",
+          "vout": 1
+        },
+        "offered_txid": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "offered_vout": 1,
+        "price_terms_outputs": [
+          {
+            "value": 123456789,
+            "script_hex": "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+          }
+        ],
+        "signature_hex": "4730440220111111111111111111111111111111111111111111111111111111111111111102202222222222222222222222222222222222222222222222222222222222222222c321023333333333333333333333333333333333333333333333333333333333333333",
+        "expiry_height": null
+      },
+      "advert_script_hex": "6a04525357500102010101000101200000000000000000000000000000000000000000000000000000000000000000207e59ef21b4ca335c52b2a1cbc773e7259373e42c8fbc9e3ba38b8476270bfa3520cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd0101230115cd5b07000000001976a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac4c6a4730440220111111111111111111111111111111111111111111111111111111111111111102202222222222222222222222222222222222222222222222222222222222222222c321023333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "id": "v2-vout-128-scriptnum-pad",
+      "source": "reference",
+      "params": {
+        "offered_type": 2,
+        "token_ref": {
+          "txid": "f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f1f102",
+          "vout": 0
+        },
+        "want_token_ref": {
+          "txid": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001",
+          "vout": 1
+        },
+        "offered_txid": "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+        "offered_vout": 128,
+        "price_terms_outputs": [
+          {
+            "value": 1,
+            "script_hex": "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+          },
+          {
+            "value": 4294967295,
+            "script_hex": "51"
+          }
+        ],
+        "signature_hex": "4730440220111111111111111111111111111111111111111111111111111111111111111102202222222222222222222222222222222222222222222222222222222222222222c321023333333333333333333333333333333333333333333333333333333333333333",
+        "expiry_height": null
+      },
+      "advert_script_hex": "6a0452535750010201010102010120c3581888d7e220a9ed117a8c8724e09ac4536438aae3ffc6482529a033f4e92a207e59ef21b4ca335c52b2a1cbc773e7259373e42c8fbc9e3ba38b8476270bfa3520efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef0280002d0201000000000000001976a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88acffffffff0000000001514c6a4730440220111111111111111111111111111111111111111111111111111111111111111102202222222222222222222222222222222222222222222222222222222222222222c321023333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "id": "v3-with-expiry",
+      "source": "reference",
+      "params": {
+        "offered_type": 0,
+        "token_ref": null,
+        "want_token_ref": {
+          "txid": "e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001",
+          "vout": 1
+        },
+        "offered_txid": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "offered_vout": 0,
+        "price_terms_outputs": [
+          {
+            "value": 123456789,
+            "script_hex": "76a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac"
+          }
+        ],
+        "signature_hex": "4730440220111111111111111111111111111111111111111111111111111111111111111102202222222222222222222222222222222222222222222222222222222222222222c321023333333333333333333333333333333333333333333333333333333333333333",
+        "expiry_height": 840000
+      },
+      "advert_script_hex": "6a04525357500103010301000101200000000000000000000000000000000000000000000000000000000000000000207e59ef21b4ca335c52b2a1cbc773e7259373e42c8fbc9e3ba38b8476270bfa350440d10c0020cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd00230115cd5b07000000001976a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac4c6a4730440220111111111111111111111111111111111111111111111111111111111111111102202222222222222222222222222222222222222222222222222222222222222222c321023333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "reassembly_vector": {
+    "id": "radiant-core-feature-swap-tail-rule",
+    "source": "Radiant-Core test/functional/feature_swap.py (see docs/swap-order-wire-format.md)",
+    "description": "price_terms = concat of all middle pushes, signature = final push",
+    "frame_hex": "6a0452535750010201000100010120000000000000000000000000000000000000000000000000000000000000000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa0005010203040505060708090a0404050607",
+    "expected": {
+      "price_terms_hex": "0102030405060708090a",
+      "signature_hex": "04050607"
+    }
+  }
+}
