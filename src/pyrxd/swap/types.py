@@ -16,17 +16,19 @@ from ..glyph.types import GlyphRef
 from ..security.errors import ValidationError
 from ..security.types import Txid
 
-AssetKind = Literal["rxd", "ft"]
+AssetKind = Literal["rxd", "ft", "nft"]
 
 
 @dataclass(frozen=True)
 class Asset:
-    """One side of a trade: plain RXD, or a Glyph fungible token.
+    """One side of a trade: plain RXD, a Glyph fungible token, or a Glyph NFT singleton.
 
     ``amount`` is in photons. For an FT this is also the token-unit count
-    (Radiant convention: 1 photon = 1 FT unit). ``ref`` is the FT's
-    genesis/commit outpoint (the permanent token identity) and is required
-    for — and only for — ``kind == "ft"``.
+    (Radiant convention: 1 photon = 1 FT unit). For an NFT it is the
+    singleton's CARRIER value (the photons riding on the one UTXO that holds
+    the singleton ref — the NFT itself is the ref, indivisible). ``ref`` is
+    the token's genesis/commit outpoint (the permanent identity) and is
+    required for — and only for — ``kind in ("ft", "nft")``.
     """
 
     kind: AssetKind
@@ -36,8 +38,8 @@ class Asset:
     def __post_init__(self) -> None:
         if self.amount <= 0:
             raise ValidationError(f"asset amount must be positive, got {self.amount}")
-        if self.kind == "ft" and self.ref is None:
-            raise ValidationError("an FT asset requires a genesis ref")
+        if self.kind in ("ft", "nft") and self.ref is None:
+            raise ValidationError(f"a {self.kind.upper()} asset requires a genesis ref")
         if self.kind == "rxd" and self.ref is not None:
             raise ValidationError("a plain RXD asset must not carry a ref")
 

@@ -98,21 +98,31 @@ def _parse_token(value: str) -> GlyphRef | None:
 
 
 def _parse_asset_spec(value: str) -> Asset:
-    """``rxd:AMOUNT`` or ``TOKEN:AMOUNT`` (token as 72-hex ref or txid:vout) → Asset."""
+    """``rxd:AMOUNT`` | ``TOKEN:AMOUNT`` (FT) | ``nft:TOKEN:CARRIER_PHOTONS`` → Asset.
+
+    A bare token ref means FT (the common case); an NFT must be explicit via
+    the ``nft:`` prefix because the ref alone cannot distinguish the two.
+    """
+    kind = "ft"
+    if value.lower().startswith("nft:"):
+        kind = "nft"
+        value = value[4:]
     token_part, sep, amount_part = value.rpartition(":")
     if not sep:
         raise UserError(
             f"invalid asset spec {sanitize_terminal(value, max_len=80)!r}",
             cause="expected ASSET:AMOUNT",
-            fix="e.g. --receive rxd:900000 or --receive <72-hex-ref>:50",
+            fix="e.g. --receive rxd:900000, --receive <72-hex-ref>:50, or --receive nft:<72-hex-ref>:600",
         )
     try:
         amount = int(amount_part)
     except ValueError as exc:
         raise UserError(f"invalid amount {sanitize_terminal(amount_part, max_len=40)!r}") from exc
     ref = _parse_token(token_part)
+    if ref is None and kind == "nft":
+        raise UserError("nft: prefix requires a token ref, not 'rxd'")
     try:
-        return Asset(kind="rxd", amount=amount) if ref is None else Asset(kind="ft", amount=amount, ref=ref)
+        return Asset(kind="rxd", amount=amount) if ref is None else Asset(kind=kind, amount=amount, ref=ref)
     except RxdSdkError as exc:
         raise UserError(f"invalid asset spec: {exc}") from exc
 
@@ -120,6 +130,8 @@ def _parse_asset_spec(value: str) -> Asset:
 def _describe_asset(asset: Asset) -> str:
     if asset.kind == "rxd":
         return f"{asset.amount} photons (RXD)"
+    if asset.kind == "nft":
+        return f"the NFT {asset.ref.txid}:{asset.ref.vout} (carrier {asset.amount} photons)"
     return f"{asset.amount} units of FT {asset.ref.txid}:{asset.ref.vout}"
 
 
