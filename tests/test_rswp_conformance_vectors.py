@@ -96,3 +96,43 @@ def test_covenant_vectors_re_derive_and_parse_back(vec: dict) -> None:
     inner, expiry = parse_refund_covenant(bytes.fromhex(vec["covenant_spk_hex"]))
     assert expiry == int(vec["expiry_height"])
     assert inner[3:23].hex() == vec["owner_pkh_hex"]
+
+
+@pytest.mark.parametrize("vec", _VECTORS["mainnet_anchors"], ids=lambda v: v["id"])
+def test_mainnet_anchor_decodes_to_the_recorded_rpc_row(vec: dict) -> None:
+    """Byte-anchored live-mainnet vector (see ``vec["description"]``/``vec["queried_2026-07-05"]``
+    for the full provenance trail): ``advert_script_hex`` is the raw on-chain RSWP advert located at
+    ``vec["source"]`` (``mainnet:<txid>:<vout>``). This locks the decoder to that real advert AND
+    cross-checks every field against the ``getswaphistory`` RPC row recorded alongside it — a second,
+    independent implementation (the swapindex) parsed the same bytes and reported the same fields."""
+    exp = vec["expected"]
+    order = decode_rswp_order(bytes.fromhex(vec["advert_script_hex"]))
+
+    assert order.version == exp["version"]
+    assert order.flags == exp["flags"]
+    assert order.offered_type == exp["offered_type"]
+    assert order.terms_type == exp["terms_type"]
+    assert order.token_id[::-1].hex() == exp["token_id_display_hex"]
+    assert order.want_token_id is not None
+    assert order.want_token_id[::-1].hex() == exp["want_token_id_display_hex"]
+    assert order.offered_txid == exp["offered_txid"]
+    assert order.offered_utxo_index == exp["offered_vout"]
+    assert order.price_terms.hex() == exp["price_terms_hex"]
+    assert order.signature.hex() == exp["signature_hex"]
+    assert order.demanded_outputs is not None and len(order.demanded_outputs) == 1
+    assert order.demanded_outputs[0].value == exp["demanded_output_value"]
+    assert order.demanded_outputs[0].script.hex() == exp["demanded_output_script_hex"]
+
+    # Cross-check against the raw swapindex RPC row recorded alongside the vector: the decoder's
+    # output and the live node's own indexed row must agree field-for-field.
+    row = vec["rpc_cross_check_row"]["row"]
+    assert row["version"] == exp["version"]
+    assert row["flags"] == exp["flags"]
+    assert row["offered_type"] == exp["offered_type"]
+    assert row["terms_type"] == exp["terms_type"]
+    assert row["tokenid"] == exp["token_id_display_hex"]
+    assert row["want_tokenid"] == exp["want_token_id_display_hex"]
+    assert row["utxo"]["txid"] == exp["offered_txid"]
+    assert row["utxo"]["vout"] == exp["offered_vout"]
+    assert row["price_terms"] == exp["price_terms_hex"]
+    assert row["signature"] == exp["signature_hex"]
