@@ -103,6 +103,16 @@ it runs with **no node and no network** — it exercises the real swap API
 (signing, conservation, maker-signature re-verification) but never broadcasts.
 → [`../docs/concepts/partial-tx-swaps.md`](../docs/concepts/partial-tx-swaps.md)
 
+### `rswp_orderbook_demo.py` — no network
+The **on-chain RSWP orderbook** (`pyrxd.swap.rswp`): the public version of the
+partial-tx swap. Maker posts an `OP_RETURN` advertisement any wallet can
+discover; taker decodes the advert **bytes**, re-verifies every claim against
+the offered UTXO (lying adverts are rejected — demonstrated), completes the
+swap; maker cancel = the self-spend hard revocation. Runs with **no node and
+no network**; the live-node version (real `-swapindex` book, double-take and
+cancel races on real consensus) is `tests/test_rswp_regtest_e2e.py`.
+→ [`../docs/plans/2026-07-05-rswp-orderbook-design.md`](../docs/plans/2026-07-05-rswp-orderbook-design.md)
+
 ---
 
 ## Cross-chain swaps (pre-audit)

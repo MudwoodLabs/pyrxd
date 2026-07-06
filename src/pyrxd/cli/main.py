@@ -180,7 +180,16 @@ def run() -> None:
 # and that breaks static analysis even though Python's import system
 # tolerates it at runtime.
 
-from . import agent_cmds, glyph_cmds, query_cmds, regtest_cmds, setup_cmd, swap_cmds, wallet_cmds  # noqa: E402
+from . import (  # noqa: E402
+    agent_cmds,
+    glyph_cmds,
+    query_cmds,
+    regtest_cmds,
+    setup_cmd,
+    swap_book_cmds,
+    swap_cmds,
+    wallet_cmds,
+)
 
 cli.add_command(agent_cmds.agent_group)
 cli.add_command(glyph_cmds.glyph_group)
@@ -191,6 +200,13 @@ cli.add_command(regtest_cmds.regtest_group)
 cli.add_command(setup_cmd.setup_cmd)
 cli.add_command(swap_cmds.swap_group)
 cli.add_command(wallet_cmds.wallet_group)
+
+# RSWP orderbook commands live in their own module but share the `swap` group
+# (same no-import-cycle rule as above: swap_book_cmds does not import swap_cmds).
+swap_cmds.swap_group.add_command(swap_book_cmds.swap_orders_cmd)
+swap_cmds.swap_group.add_command(swap_book_cmds.swap_post_cmd)
+swap_cmds.swap_group.add_command(swap_book_cmds.swap_take_cmd)
+swap_cmds.swap_group.add_command(swap_book_cmds.swap_cancel_cmd)
 
 
 if __name__ == "__main__":

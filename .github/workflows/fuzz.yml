@@ -1,0 +1,128 @@
+name: Fuzz (scheduled)
+
+# Weekly deep-fuzz lane. Two independent engines over the attacker-exposed
+# parsers and the byte-exact consensus builders:
+#
+#   hypothesis-deep — scripts/fuzz_deep.sh deep (25 000 examples per test,
+#     replaying the committed corpus in tests/.hypothesis-corpus first, per
+#     tests/conftest.py). Covers the property/differential suites including
+#     the FORKID sighash + CBOR envelope + dMint vector-derivation corpora.
+#   atheris — the coverage-guided libFuzzer harnesses under
+#     scripts/fuzz_atheris/, with a corpus accumulated across runs via the
+#     Actions cache so each week explores beyond the last.
+#
+# Deliberately NOT on the per-commit path (docs/security-review-playbook.md):
+# per-commit CI keeps the fast unit gate; this lane does the slow exploration
+# on a schedule. Manual runs: gh workflow run "Fuzz (scheduled)".
+
+on:
+  schedule:
+    - cron: "23 5 * * 1" # Mondays 05:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  hypothesis-deep:
+    # Don't burn scheduled minutes on forks; manual dispatch still works anywhere.
+    if: github.event_name != 'schedule' || github.repository == 'MudwoodLabs/pyrxd'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.12"
+      - name: Cache Poetry packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-py3.12-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-py3.12-
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      - name: Deep Hypothesis run (25k examples/test, corpus replayed first)
+        run: poetry run bash scripts/fuzz_deep.sh deep
+      - name: Upload shrunk counterexamples + log
+        # On failure the corpus dir holds the shrunk reproducer(s) — commit
+        # them alongside the fix per tests/.hypothesis-corpus/README.md.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hypothesis-deep-output
+          path: |
+            logs/
+            tests/.hypothesis-corpus/
+          retention-days: 30
+
+  atheris:
+    if: github.event_name != 'schedule' || github.repository == 'MudwoodLabs/pyrxd'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6
+        with:
+          python-version: "3.12"
+      - name: Cache Poetry packages
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-py3.12-${{ hashFiles('poetry.lock') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-py3.12-
+      # Accumulated libFuzzer corpus: restore the newest previous save, write
+      # this run's additions under a fresh key (a per-run key is how you get
+      # an append-style cache out of actions/cache's immutable entries).
+      - name: Restore accumulated libFuzzer corpus
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        with:
+          path: .atheris-corpus
+          key: atheris-corpus-${{ github.run_id }}
+          restore-keys: |
+            atheris-corpus-
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      - name: Install atheris
+        # Not a poetry dep on purpose (overnight/scheduled tool, not a dev
+        # requirement — docs/security-review-playbook.md). Bump deliberately.
+        run: poetry run pip install "atheris==2.3.0"
+      - name: Run coverage-guided harnesses
+        # Every harness runs even if an earlier one finds a crash; findings
+        # drop reproducers in logs/ (uploaded below) and fail the job at the
+        # end. The committed Hypothesis corpus rides along as extra seeds.
+        run: |
+          set -uo pipefail
+          mkdir -p logs
+          rc=0
+          for h in scripts/fuzz_atheris/harness_*.py; do
+            name="$(basename "$h" .py)"
+            mkdir -p ".atheris-corpus/$name"
+            echo "== $name =="
+            if ! poetry run python "$h" \
+                 -max_total_time=360 \
+                 -print_final_stats=1 \
+                 -artifact_prefix="logs/${name}-" \
+                 ".atheris-corpus/$name" tests/.hypothesis-corpus; then
+              echo "::error::atheris finding in $name (reproducer in logs/)"
+              rc=1
+            fi
+          done
+          exit "$rc"
+      - name: Upload reproducers
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: atheris-findings
+          path: logs/
+          retention-days: 90

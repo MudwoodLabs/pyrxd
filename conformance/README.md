@@ -10,6 +10,7 @@ byte-compare against the expected hex.
 | File | Covers | Anchor |
 |---|---|---|
 | `dmint-v2-contract-vectors.json` | The V2 dMint **contract script** for given deploy params, across all 5 DAA modes (FIXED / LWMA / ASERT / EPOCH / SCHEDULE) | One vector is byte-anchored to the first **mainnet** V2 deploy (`source: mainnet:…`); the rest are reference vectors |
+| `rswp-order-vectors.json` | The **RSWP swap-order advertisement** (v2 + v3 frames), `MultiTxOutV1` price terms, and swap token-id derivation | Reference vectors byte-derived from the canonical producers/parsers (Radiant-Core `swapindex.cpp`, Photonic builder); the reassembly vector reproduces the Radiant-Core functional test. **No mainnet-anchored vector yet** (tracked follow-up). Guarded by `tests/test_rswp_conformance_vectors.py`. |
 
 ## Format (`dmint-v2-contract-vectors/1`)
 
