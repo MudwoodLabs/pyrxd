@@ -219,8 +219,8 @@ def rswp_order_to_swap_offer(order: RswpOrder, *, give_source_tx: Transaction) -
     * exactly ONE demanded output (``SIGHASH_SINGLE`` signs only output[0];
       extra "demands" would be unenforceable — design note D6);
     * the source tx hashes to the advertised outpoint, and the vout exists;
-    * the offered UTXO is a spendable RXD/FT script (a v3 covenant-held or
-      otherwise exotic script is refused);
+    * the offered UTXO is a spendable RXD / Glyph FT / Glyph NFT-singleton
+      script (a v3 covenant-held or otherwise exotic script is refused);
     * the advertised ``token_id`` / ``want_token_id`` / ``offeredType`` match
       the REAL offered/demanded scripts — a lying advertisement is rejected
       here rather than surviving to display or completion;

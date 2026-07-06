@@ -198,15 +198,26 @@ class _WalletFunds:
     """Wallet UTXOs resolved for a build: funding inputs plus key lookup by owner pkh."""
 
     triples: list  # (UtxoRecord, address, PrivateKey)
+    wallet: object = None  # the loaded HdWallet, for deriving a key by pkh beyond the UTXO-bearing set
 
     def key_for_pkh(self, pkh: bytes) -> PrivateKey:
+        # First the UTXO-bearing addresses (the common case, and all we have if `wallet` wasn't threaded).
         for _utxo, _addr, key in self.triples:
             if key.public_key().hash160() == pkh:
                 return key
+        # Fallback (audit M5): derive from ANY known HD address, not only ones that currently hold a UTXO.
+        # A v3 covenant refund/cancel spends only the covenant input, so the owner_pkh address often holds
+        # no plain UTXO at reclaim time — yet it is the maker's own address, so its key is derivable. This
+        # makes the advertised "guaranteed reclaim" hold without a live UTXO sitting at owner_pkh.
+        if self.wallet is not None:
+            for rec in getattr(self.wallet, "addresses", {}).values():
+                key = self.wallet._privkey_for(rec.change, rec.index)
+                if key.public_key().hash160() == pkh:
+                    return key
         raise UserError(
-            "the UTXO's owner key is not in this wallet",
-            cause="no wallet address matches the output's owner pubkey-hash",
-            fix="run `pyrxd balance --refresh` to discover used addresses, or check the outpoint",
+            "the owner key for this output is not in this wallet",
+            cause="no wallet address (spendable or derived) matches the output's owner pubkey-hash",
+            fix="run `pyrxd balance --refresh` to widen HD discovery, or check the outpoint/--wallet",
         )
 
     def change_pkh(self) -> bytes:
@@ -217,7 +228,7 @@ class _WalletFunds:
 
 async def _collect_funds(ctx: CliContext, client) -> _WalletFunds:
     wallet = _load_wallet(ctx)
-    return _WalletFunds(triples=await wallet.collect_spendable(client))
+    return _WalletFunds(triples=await wallet.collect_spendable(client), wallet=wallet)
 
 
 async def _rxd_funding(
@@ -575,8 +586,12 @@ def swap_take_cmd(ctx: CliContext, advert_arg: str, fee_override: int | None) ->
                 [
                     _BroadcastSummary(
                         title="FILL swap order",
+                        # Show what the taker ACTUALLY pays — the demanded ASSET, not the carrier photons.
+                        # For an FT demand `demand.value` is a tiny carrier (e.g. ~546) while the real cost is
+                        # `demand_asset.amount` token units; printing photons here understated the cost on the
+                        # one screen that exists to obtain informed consent (audit M3).
                         lines=[
-                            f"you pay     : {demand.value} photons to the maker",
+                            f"you pay     : {_describe_asset(demand_asset)} to the maker",
                             f"you receive : {_describe_asset(gives)}",
                             f"fee         : {fee} photons",
                         ],
@@ -586,7 +601,7 @@ def swap_take_cmd(ctx: CliContext, advert_arg: str, fee_override: int | None) ->
             txid = await client.broadcast(completion.serialize())
             return {
                 "completion_txid": str(txid),
-                "paid_photons": demand.value,
+                "paid": _describe_asset(demand_asset),
                 "received": _describe_asset(gives),
             }
 

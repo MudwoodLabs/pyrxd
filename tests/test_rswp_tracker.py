@@ -66,9 +66,12 @@ class FakeElectrumX:
     def __init__(self) -> None:
         self._txs: dict[str, Transaction] = {}
         self._hostile_raw: dict[str, bytes] = {}
+        self._heights: dict[str, int] = {}
 
-    def add(self, tx: Transaction) -> None:
+    def add(self, tx: Transaction, height: int = 100) -> None:
+        """Register a tx. ``height`` is its confirmed block height (0 = unconfirmed/mempool)."""
         self._txs[tx.txid()] = tx
+        self._heights[tx.txid()] = height
 
     def substitute(self, txid: str, hostile_raw: bytes) -> None:
         """Simulate a hostile/buggy server returning the WRONG bytes for *txid*."""
@@ -111,7 +114,7 @@ class FakeElectrumX:
                             touches = True
                             break
             if touches:
-                out.append({"tx_hash": txid, "height": 0})
+                out.append({"tx_hash": txid, "height": self._heights.get(txid, 0)})
         return out
 
 
@@ -177,6 +180,41 @@ async def test_classify_filled_offer_reports_settlement_txid() -> None:
     result = await classify(fake, offer)
     assert result.status is OfferStatus.FILLED
     assert result.spending_txid == completion.txid()
+
+
+async def test_classify_unconfirmed_spender_stays_open_not_filled() -> None:
+    """Audit FINDING A (confirmation gate): a spend the server reports only in the mempool
+    (height 0) — including a fabricated one paying the demand exactly — must NOT flip the
+    offer to FILLED; it stays OPEN (re-poll) until the spend is confirmed in a block."""
+    mk, mk_pkh = _key()
+    tk, tk_pkh = _key()
+    src = _rxd_src(mk_pkh, 1000)
+    post, order, advert_tx = _post_offer(src, mk, Asset("ft", 50, _REF_R), mk_pkh)
+    completion = take_rswp_order(
+        order,
+        give_source_tx=src,
+        funding=[FundingInput(_ft_src(tk_pkh, _REF_R, 60), 0, tk), FundingInput(_rxd_src(tk_pkh, 5000), 0, tk)],
+        taker_receive_pkh=tk_pkh,
+        taker_change_pkh=tk_pkh,
+        fee=300,
+    )
+    fake = FakeElectrumX()
+    fake.add(src)
+    fake.add(advert_tx)
+    fake.add(completion, height=0)  # spender is UNCONFIRMED / mempool-only (or fabricated)
+
+    offer = TrackedOffer(
+        outpoint_txid=Txid(src.txid()),
+        outpoint_vout=0,
+        terms=post.offer.terms,
+        posted_advert_txid=Txid(advert_tx.txid()),
+    )
+    result = await classify(fake, offer)
+    assert result.status is OfferStatus.OPEN
+    assert result.spending_txid is None
+    # once confirmed, the same spend classifies FILLED.
+    fake._heights[completion.txid()] = 101
+    assert (await classify(fake, offer)).status is OfferStatus.FILLED
 
 
 async def test_classify_cancelled_offer_reports_settlement_txid() -> None:

@@ -97,7 +97,12 @@ class NodeRpcSource:
         raw = await self._call("getrawtransaction", [str(txid)])
         if not isinstance(raw, str):
             raise NetworkError("getrawtransaction returned a non-hex result")
-        return bytes.fromhex(raw)
+        try:
+            return bytes.fromhex(raw)
+        except ValueError as exc:
+            # A non-hex string from the node is a transport-level fault; raise NetworkError (fail closed)
+            # rather than a bare ValueError that would escape the book client's row-content guard.
+            raise NetworkError(f"getrawtransaction returned a non-hex string: {exc}") from exc
 
     async def is_unspent(self, txid: str, vout: int) -> bool:
         # gettxout returns null for a spent/unknown outpoint — that IS the answer
