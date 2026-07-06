@@ -171,11 +171,14 @@ async def _read_covenant(ctx: CliContext, spk_hex: str) -> dict:
 
 @click.group(name="swap")
 def swap_group() -> None:
-    """Same-chain RSWP orderbook (orders/post/take/cancel) + cross-chain swap status.
+    """Same-chain RSWP orderbook (orders/reserve/post/take/cancel/refund) + cross-chain swap status.
 
-    ``status`` and ``orders`` are read-only. ``post``/``take``/``cancel``
-    broadcast AFTER an explicit value confirmation (``--json`` requires
-    ``--yes``) — see each command's help for what exactly is signed.
+    ``status`` and ``orders`` are read-only. ``reserve``/``post``/``take``/
+    ``cancel``/``refund`` broadcast AFTER an explicit value confirmation
+    (``--json`` requires ``--yes``) — see each command's help for what
+    exactly is signed. ``reserve``/``refund`` are the v3 timelocked-refund
+    covenant flows; ``post``/``take``/``cancel`` auto-detect a covenant-held
+    UTXO and route to the matching v3 builder.
     """
 
 

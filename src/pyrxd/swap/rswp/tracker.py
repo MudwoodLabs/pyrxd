@@ -1,0 +1,283 @@
+"""Maker offer lifecycle tracker: record posted RSWP offers, poll ElectrumX to
+classify OPEN / FILLED / CANCELLED, and roll up per-asset net position.
+
+This module never broadcasts, never signs, and never guesses. The chain is the
+only source of truth for classification:
+
+* OPEN means the offered UTXO is still unspent (``blockchain.scripthash.listunspent``).
+  A hostile/buggy server can falsely claim "still unspent" for something that
+  was actually spent — that is a **liveness** failure only (a stale OPEN the
+  caller re-polls away), never a safety one: it can never make a real fill or
+  cancel disappear, only delay noticing it.
+* FILLED requires a byte-exact match (value AND locking script) between the
+  spending transaction's output[0] and the demanded output the maker's own
+  ``0xC3``-signed advertisement committed to. A server cannot forge that match
+  without forging the maker's transaction itself — substituting a different
+  transaction is caught by :func:`pyrxd.swap.resolve.fetch_transaction`'s
+  computed-txid check before any byte comparison even runs.
+* Anything else that spent the offered UTXO (most commonly the maker's own
+  :func:`pyrxd.swap.rswp.orders.build_cancel_tx`) is CANCELLED.
+
+Persistence is deliberately NOT this module's job — :class:`OfferTracker`
+wraps a plain Python list the caller owns; :func:`load_offers` / :func:`save_offers`
+are a thin JSON file convenience, not a database.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
+from enum import Enum
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from ...gravity.swap_order import decode_rswp_order
+from ...hash import sha256
+from ...security.errors import ValidationError
+from ...security.types import Txid
+from ..resolve import fetch_transaction
+from ..types import Asset, SwapTerms
+
+if TYPE_CHECKING:
+    from ...network.electrumx import ElectrumXClient
+
+__all__ = [
+    "ClassifyResult",
+    "OfferStatus",
+    "OfferTracker",
+    "TrackedOffer",
+    "classify",
+    "load_offers",
+    "net_position",
+    "save_offers",
+]
+
+
+class OfferStatus(Enum):
+    """Where a posted offer stands, as read from the chain (never inferred)."""
+
+    OPEN = "open"  # offered UTXO still unspent — fillable or still cancellable
+    FILLED = "filled"  # spent by a tx whose output[0] byte-matches the demanded output
+    CANCELLED = "cancelled"  # spent, but NOT by a tx matching the demand (maker's own revocation)
+
+
+@dataclass(frozen=True)
+class TrackedOffer:
+    """One posted maker offer, as recorded by the caller — chain-public data only.
+
+    ``outpoint_txid``/``outpoint_vout`` is the offered UTXO (the exact-amount
+    give-side output — see :func:`pyrxd.swap.rswp.orders.prepare_offered_utxo`).
+    ``terms`` is the human-readable trade (:class:`~pyrxd.swap.types.SwapTerms`).
+    ``posted_advert_txid`` is the broadcast RSWP advertisement, if any — required
+    by :func:`classify` to read the exact demanded output (value + script) that
+    distinguishes FILLED from CANCELLED; an offer negotiated purely off-chain
+    has none, and classification then degrades to OPEN vs "spent, unverifiable
+    fill" (reported CANCELLED — see :func:`classify`). No key material of any
+    kind belongs on this dataclass, ever.
+    """
+
+    outpoint_txid: Txid
+    outpoint_vout: int
+    terms: SwapTerms
+    posted_advert_txid: Txid | None = None
+    created_height: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.outpoint_vout < 0:
+            raise ValidationError(f"TrackedOffer outpoint_vout must be non-negative, got {self.outpoint_vout}")
+        if self.created_height is not None and self.created_height < 0:
+            raise ValidationError(f"TrackedOffer created_height must be non-negative, got {self.created_height}")
+
+    def to_dict(self) -> dict:
+        return {
+            "outpoint_txid": str(self.outpoint_txid),
+            "outpoint_vout": self.outpoint_vout,
+            "terms": self.terms.to_dict(),
+            "posted_advert_txid": None if self.posted_advert_txid is None else str(self.posted_advert_txid),
+            "created_height": self.created_height,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> TrackedOffer:
+        advert = d.get("posted_advert_txid")
+        height = d.get("created_height")
+        return cls(
+            outpoint_txid=Txid(str(d["outpoint_txid"])),
+            outpoint_vout=int(d["outpoint_vout"]),
+            terms=SwapTerms.from_dict(d["terms"]),
+            posted_advert_txid=None if advert is None else Txid(str(advert)),
+            created_height=None if height is None else int(height),
+        )
+
+
+@dataclass(frozen=True)
+class ClassifyResult:
+    """The verdict :func:`classify` reached for one :class:`TrackedOffer`.
+
+    ``spending_txid`` is the settlement proof: the transaction that spent the
+    offered UTXO. ``None`` only when ``status`` is OPEN (nothing has spent it).
+    """
+
+    status: OfferStatus
+    spending_txid: str | None
+
+
+def _script_hash(script: bytes) -> bytes:
+    """ElectrumX ``script_hash``: ``sha256(script)`` reversed to display (little-endian) order.
+
+    Same one-liner as ``pyrxd.cli.swap_cmds.electrumx_script_hash``, kept local rather than
+    imported so this network module never depends on the CLI package.
+    """
+    return sha256(script)[::-1]
+
+
+async def classify(client: ElectrumXClient, offer: TrackedOffer) -> ClassifyResult:
+    """Classify ``offer`` against the live chain — see the module docstring for the
+    security argument. Every transaction this reads (the offered UTXO's own source
+    tx, every history candidate, and the advert) goes through the txid-verified
+    :func:`pyrxd.swap.resolve.fetch_transaction`, so a hostile ElectrumX server
+    cannot substitute a different transaction at any step.
+    """
+    source_tx = await fetch_transaction(client, offer.outpoint_txid)
+    if not 0 <= offer.outpoint_vout < len(source_tx.outputs):
+        raise ValidationError(f"TrackedOffer outpoint vout {offer.outpoint_vout} is out of range for its own source Tx")
+    offered_out = source_tx.outputs[offer.outpoint_vout]
+    script_hash = _script_hash(offered_out.locking_script.serialize())
+
+    utxos = await client.get_utxos(script_hash)
+    still_unspent = any(u.tx_hash == str(offer.outpoint_txid) and u.tx_pos == offer.outpoint_vout for u in utxos)
+    if still_unspent:
+        return ClassifyResult(status=OfferStatus.OPEN, spending_txid=None)
+
+    # Spent (or the server claims so) — find the spending tx among the scripthash's history.
+    history = await client.get_history(script_hash)
+    spending_tx = None
+    spending_txid: str | None = None
+    for entry in history:
+        candidate_txid = str(entry["tx_hash"])
+        if candidate_txid == str(offer.outpoint_txid):
+            continue  # the tx that CREATED this output, not one that spends it
+        candidate = await fetch_transaction(client, candidate_txid)
+        spends_it = any(
+            i.source_txid == str(offer.outpoint_txid) and i.source_output_index == offer.outpoint_vout
+            for i in candidate.inputs
+        )
+        if spends_it:
+            spending_tx = candidate
+            spending_txid = candidate_txid
+            break
+
+    if spending_tx is None:
+        raise ValidationError(
+            "ElectrumX server reports the offered Utxo spent but its scripthash history has no matching spender"
+        )
+
+    # FILLED requires proof: the advertised demand, decoded from the maker's own signed
+    # advert (never from `terms`, which is caller-declared and unverified against chain).
+    if offer.posted_advert_txid is None or not spending_tx.outputs:
+        return ClassifyResult(status=OfferStatus.CANCELLED, spending_txid=spending_txid)
+
+    advert_tx = await fetch_transaction(client, offer.posted_advert_txid)
+    if not advert_tx.outputs:
+        raise ValidationError("posted advert Tx has no outputs to decode an RSWP order from")
+    order = decode_rswp_order(advert_tx.outputs[0].locking_script.serialize())
+    if order.demanded_outputs is None or len(order.demanded_outputs) != 1:
+        # An unparseable/multi-output demand carries no enforceable settlement proof
+        # (mirrors the SIGHASH_SINGLE "exactly one demanded output" invariant elsewhere).
+        return ClassifyResult(status=OfferStatus.CANCELLED, spending_txid=spending_txid)
+    demanded = order.demanded_outputs[0]
+
+    settled = spending_tx.outputs[0]
+    if settled.satoshis == demanded.value and settled.locking_script.serialize() == demanded.script:
+        return ClassifyResult(status=OfferStatus.FILLED, spending_txid=spending_txid)
+    return ClassifyResult(status=OfferStatus.CANCELLED, spending_txid=spending_txid)
+
+
+class OfferTracker:
+    """A maker's posted-offer registry. The store is just ``self.offers`` — a plain
+    Python list the caller owns, mutates, and persists (see :func:`save_offers` /
+    :func:`load_offers`). This class adds ElectrumX-backed classification on top of
+    it; it is NOT a database.
+    """
+
+    def __init__(self, offers: list[TrackedOffer] | None = None) -> None:
+        self.offers: list[TrackedOffer] = list(offers) if offers is not None else []
+
+    def add(self, offer: TrackedOffer) -> None:
+        self.offers.append(offer)
+
+    async def classify_all(self, client: ElectrumXClient) -> list[ClassifyResult]:
+        """Classify every tracked offer, in ``self.offers`` order (one :func:`classify`
+        call each — sequential, so a single hostile/unreachable server fails clearly
+        on the offer it broke rather than silently skipping it)."""
+        return [await classify(client, offer) for offer in self.offers]
+
+
+def load_offers(path: str | Path) -> list[TrackedOffer]:
+    """Load tracked offers from a JSON file. A missing file returns an empty list —
+    that is the natural "nothing tracked yet" starting state, not an error."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    raw = json.loads(p.read_text())
+    if not isinstance(raw, list):
+        raise ValidationError("Offer store file must contain a JSON list at its top level")
+    return [TrackedOffer.from_dict(d) for d in raw]
+
+
+def save_offers(path: str | Path, offers: Iterable[TrackedOffer]) -> None:
+    """Persist tracked offers to a JSON file, atomically (write to a Tmp file, then rename)."""
+    p = Path(path)
+    data = [offer.to_dict() for offer in offers]
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, p)
+
+
+def _asset_key(asset: Asset) -> str:
+    """Stable, JSON-friendly per-asset key: ``"rxd"`` or ``"ft:<genesis txid>:<vout>"``."""
+    if asset.kind == "rxd":
+        return "rxd"
+    ref = asset.ref
+    if ref is None:  # unreachable: Asset.__post_init__ requires a ref for kind == "ft"
+        raise ValidationError("Ft asset is missing its Ref despite the Asset invariant")
+    return f"ft:{ref.txid}:{ref.vout}"
+
+
+def net_position(offers: Sequence[TrackedOffer], statuses: Sequence[OfferStatus]) -> dict[str, dict[str, int]]:
+    """Per-asset totals across ``offers`` given their parallel ``statuses`` (same
+    order and length — typically the result of :meth:`OfferTracker.classify_all`).
+
+    For every asset key (see :func:`_asset_key`):
+
+    * ``given``    — total amount the maker handed over across FILLED offers
+                     where this asset was the give side.
+    * ``received`` — total amount the maker took in across FILLED offers
+                     where this asset was the receive side.
+    * ``exposed``  — total amount still at risk: the give side of every OPEN
+                     offer (a taker could complete it at any time).
+
+    CANCELLED offers contribute nothing (the maker's own revocation returned
+    the offered asset, minus a network fee this function does not track).
+    Pure function — no I/O, no chain calls — and exact integers throughout;
+    Radiant/Glyph amounts are always whole photons, never fractional.
+    """
+    if len(offers) != len(statuses):
+        raise ValidationError(f"offers ({len(offers)}) and statuses ({len(statuses)}) must be the same Length")
+    totals: dict[str, dict[str, int]] = {}
+
+    def _bucket(key: str) -> dict[str, int]:
+        return totals.setdefault(key, {"given": 0, "received": 0, "exposed": 0})
+
+    for offer, status in zip(offers, statuses, strict=True):
+        give, receive = offer.terms.give, offer.terms.receive
+        if status is OfferStatus.FILLED:
+            _bucket(_asset_key(give))["given"] += give.amount
+            _bucket(_asset_key(receive))["received"] += receive.amount
+        elif status is OfferStatus.OPEN:
+            _bucket(_asset_key(give))["exposed"] += give.amount
+        # CANCELLED: no change — the maker's revocation returned the asset.
+
+    return totals

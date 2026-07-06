@@ -47,6 +47,12 @@ Targets:
        suppresses all internal failures, so the contract is "returns
        ``None`` or a ``Transaction`` whose ``.serialize()`` round-trips,
        never raises".
+   12. ``decode_rswp_order(arbitrary bytes)`` / ``parse_price_terms_lenient``
+       — the RSWP swap-order ``OP_RETURN`` decoder (``pyrxd.gravity.swap_order``);
+       consumes bytes pulled straight off an ElectrumX/RXinDexer output.
+       ``decode_rswp_order`` must raise ``ValidationError`` or return an
+       ``RswpOrder``; ``parse_price_terms_lenient`` is documented to never
+       raise at all.
 """
 
 from __future__ import annotations
@@ -80,6 +86,7 @@ from pyrxd.glyph.script import (
     parse_mutable_nft_script,
 )
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.swap_order import RswpOrder, decode_rswp_order, parse_price_terms_lenient
 from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction import Transaction
 
@@ -667,3 +674,49 @@ def test_transaction_from_hex_never_raises(stream):
             tx.serialize()
         except Exception as exc:
             _fail_unexpected("Transaction.from_hex(...).serialize()", exc, stream)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 12. decode_rswp_order / parse_price_terms_lenient — RSWP swap-order decoder
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# ``decode_rswp_order`` consumes an OP_RETURN script pulled straight off an
+# ElectrumX/RXinDexer response — the same attacker-supplied-bytes trust
+# boundary as ``decode_payload`` (target 1) and ``DmintState.from_script``
+# (target 2). Complements the structured round-trip property in
+# ``tests/test_rswp_wire.py`` (encoder-shaped bytes only) and the
+# coverage-guided ``scripts/fuzz_atheris/harness_decode_rswp_order.py``.
+
+
+@given(data=st.binary(min_size=0, max_size=2_048))
+@settings(max_examples=_budget(400), suppress_health_check=[HealthCheck.too_slow])
+def test_decode_rswp_order_only_validation_error(data):
+    """``decode_rswp_order`` walks the OP_RETURN chunk stream, then a fixed
+    field sequence, then the greedy price_terms/signature tail. Every
+    truncation, wrong-opcode, or malformed-tail case must surface as
+    ``ValidationError`` — never an ``IndexError`` or other internal
+    exception leaking past the trust boundary."""
+    try:
+        order = decode_rswp_order(data)
+    except ValidationError:
+        # expected: decoder rejected a malformed/non-RSWP frame cleanly
+        return
+    except Exception as exc:
+        _fail_unexpected("decode_rswp_order", exc, data)
+        return
+    assert isinstance(order, RswpOrder)
+
+
+@given(data=st.binary(min_size=0, max_size=1_024))
+@settings(max_examples=_budget(400), suppress_health_check=[HealthCheck.too_slow])
+def test_parse_price_terms_lenient_never_raises(data):
+    """``parse_price_terms_lenient`` is documented to never raise: clean
+    ``MultiTxOutV1``, else Photonic's bare ``value(8 LE) || script`` fallback,
+    else ``None``. No try/except for an expected exception type here — the
+    contract is total, so *any* exception is a bug."""
+    try:
+        result = parse_price_terms_lenient(data)
+    except Exception as exc:
+        _fail_unexpected("parse_price_terms_lenient", exc, data)
+        return
+    assert result is None or isinstance(result, list)

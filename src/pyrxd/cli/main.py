@@ -204,9 +204,11 @@ cli.add_command(wallet_cmds.wallet_group)
 # RSWP orderbook commands live in their own module but share the `swap` group
 # (same no-import-cycle rule as above: swap_book_cmds does not import swap_cmds).
 swap_cmds.swap_group.add_command(swap_book_cmds.swap_orders_cmd)
+swap_cmds.swap_group.add_command(swap_book_cmds.swap_reserve_cmd)
 swap_cmds.swap_group.add_command(swap_book_cmds.swap_post_cmd)
 swap_cmds.swap_group.add_command(swap_book_cmds.swap_take_cmd)
 swap_cmds.swap_group.add_command(swap_book_cmds.swap_cancel_cmd)
+swap_cmds.swap_group.add_command(swap_book_cmds.swap_refund_cmd)
 
 
 if __name__ == "__main__":
