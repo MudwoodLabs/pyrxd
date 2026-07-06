@@ -121,11 +121,31 @@ class TestDecodeAdvertArg:
 
 
 class TestTakeGuards:
-    def test_ft_demand_refused_before_any_network(self, runner: CliRunner) -> None:
+    def test_ft_demand_passes_the_pre_wallet_guard(self, runner: CliRunner) -> None:
+        """FT demands are fundable since the v3 FT-demand PR — the old pre-wallet
+        refusal must NOT fire; the command proceeds to (and fails at) wallet access."""
         post, _ = _posted_order(Asset(kind="ft", amount=50, ref=_REF))
         result = runner.invoke(cli, ["swap", "take", "--advert", post.advert_script.hex()])
+        assert "RXD-demand orders only" not in result.output
+        assert "NFT-demand" not in result.output
+
+    def test_nft_demand_refused_before_any_network(self, runner: CliRunner) -> None:
+        """A specific singleton cannot be greedily selected — refused up front."""
+
+        mk, mk_pkh = _key()
+        src = _nft_like_rxd_src = _rxd_src(mk_pkh, 1200)
+        from pyrxd.swap.rswp import create_rswp_order as _cro
+
+        post = _cro(
+            give_source_tx=src,
+            give_vout=0,
+            maker_key=mk,
+            receive=Asset(kind="nft", amount=600, ref=_REF),
+            maker_receive_pkh=mk_pkh,
+        )
+        result = runner.invoke(cli, ["swap", "take", "--advert", post.advert_script.hex()])
         assert result.exit_code != 0
-        assert "RXD-demand orders only" in result.output
+        assert "NFT-demand orders" in result.output
 
     def test_undecodable_advert_refused(self, runner: CliRunner) -> None:
         result = runner.invoke(cli, ["swap", "take", "--advert", "6a04beef"])

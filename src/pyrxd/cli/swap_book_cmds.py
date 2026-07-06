@@ -1,4 +1,4 @@
-"""``pyrxd swap orders/post/take/cancel`` — the on-chain RSWP orderbook commands.
+"""``pyrxd swap orders/post/take/cancel/reserve/refund`` — the on-chain RSWP orderbook commands.
 
 Thin CLI over the proven :mod:`pyrxd.swap.rswp` library (design:
 docs/plans/2026-07-05-rswp-orderbook-design.md). Same safety posture as the
@@ -8,15 +8,40 @@ glyph commands:
   Radiant node running ``-swapindex=1`` and re-verifies every row against
   chain data — *fillable* means the maker signature and every advertised
   claim checked out, not that the index said so.
-* **Write side** (``post`` / ``take`` / ``cancel``) shows a full value summary
-  and asks for confirmation before ANY broadcast (``--json`` requires
-  ``--yes``, same gate as the glyph commands). Funding comes from the local
-  HD wallet; the offered/give UTXO must be owned by a wallet key.
+* **Write side** (``post`` / ``take`` / ``cancel`` / ``reserve`` / ``refund``)
+  shows a full value summary and asks for confirmation before ANY broadcast
+  (``--json`` requires ``--yes``, same gate as the glyph commands). Funding
+  comes from the local HD wallet; the offered/give UTXO must be owned by a
+  wallet key. Every transaction is built exclusively with
+  :mod:`pyrxd.swap.rswp` builders — this module never hand-assembles a
+  script or transaction.
 
 Wire/format authority: the maker's offer is signed
 ``SIGHASH_SINGLE|ANYONECANPAY|FORKID`` — posting publishes a price that stays
 fillable until the offered UTXO is spent. ``cancel`` (a self-spend) is the
-ONLY hard revocation; the confirmation text says so.
+ONLY hard revocation for a v2 order; the confirmation text says so.
+
+v3 timelocked-refund covenant flows (:mod:`pyrxd.swap.rswp.covenant`)
+----------------------------------------------------------------------
+``reserve`` puts RXD into a v3 refund covenant; ``post`` auto-detects a
+covenant-held ``--give`` (via ``is_refund_covenant``) and posts a v3 advert
+instead of a v2 one; ``take`` auto-detects a v3 advert (``expiry_height`` set)
+and fills it through the CLTV-aware builder; ``refund`` and ``cancel`` route a
+covenant-held ``--give`` to the covenant builders (before-expiry self-spend
+for ``cancel``, at/after-expiry CLTV reclaim for ``refund``). Two operator
+warnings are MANDATORY reading (both repeated in every relevant confirmation
+summary below — see :mod:`pyrxd.swap.rswp.covenant`'s module docstring for
+the full detail):
+
+* **Refund txids are third-party malleable.** Track a refund by the
+  covenant OUTPOINT it spent, never by the txid the CLI prints.
+* **Expiry does not stop fills.** At/after the covenant's expiry, the
+  maker's refund RACES any late taker still holding a signed v3 advert —
+  "expired" alone does not make the reservation safe; act promptly.
+
+v3 adverts are DROPPED by the deployed Radiant-Core ``-swapindex`` (design
+note D1) — ``post``'s v3 path is rollout/testing only until every consumer
+that matters parses v3.
 """
 
 from __future__ import annotations
@@ -39,10 +64,18 @@ from ..swap.rswp import (
     RswpOrder,
     build_advert_tx,
     build_cancel_tx,
+    build_covenant_cancel_tx,
+    build_covenant_refund_tx,
+    create_covenant_order,
     create_rswp_order,
     decode_rswp_order,
+    is_refund_covenant,
+    parse_refund_covenant,
+    prepare_covenant_offer,
+    take_covenant_order,
     take_rswp_order,
 )
+from ..swap.rswp.covenant import _inner_p2pkh_pkh
 from ..transaction.transaction import Transaction
 from .context import CliContext
 from .errors import UserError
@@ -212,6 +245,33 @@ async def _rxd_funding(
     )
 
 
+async def _ft_funding(client, funds: _WalletFunds, ref, target_units: int) -> list[FundingInput]:
+    """Greedy FT funding selection: UTXOs of exactly *ref* totalling >= target units.
+
+    Mirrors :func:`_rxd_funding`; the library take paths re-enforce per-ref
+    conservation and emit FT change, so over-selection is safe and any other
+    token is never picked up here.
+    """
+    picked: list[FundingInput] = []
+    total = 0
+    for utxo, _addr, key in sorted(funds.triples, key=lambda t: t[0].value, reverse=True):
+        if len(picked) >= _MAX_FUNDING_INPUTS:
+            break
+        source = await fetch_transaction(client, utxo.tx_hash)
+        out = source.outputs[utxo.tx_pos]
+        asset = _asset_of(out.satoshis, out.locking_script.serialize())
+        if asset.kind != "ft" or asset.ref != ref:
+            continue
+        picked.append(FundingInput(source_tx=source, vout=utxo.tx_pos, key=key))
+        total += asset.amount
+        if total >= target_units:
+            return picked
+    raise UserError(
+        f"wallet cannot fund {target_units} units of the demanded FT (found {total} across {len(picked)} UTXOs)",
+        fix="acquire the token, consolidate its UTXOs, or fund via the library take path",
+    )
+
+
 # --------------------------------------------------------------------------- commands
 
 
@@ -278,6 +338,72 @@ def swap_orders_cmd(ctx: CliContext, token: str, want: bool, node_rpc: str, rpc_
         click.echo(f"{r['offered_utxo']}\n  gives {r['gives']}\n  wants {r['wants']}\n  [{mark}]")
 
 
+@click.command(name="reserve")
+@click.option("--amount", "amount", required=True, type=int, help="Photons of RXD to reserve into the v3 covenant.")
+@click.option(
+    "--expiry", "expiry_height", required=True, type=int, help="Block height the CLTV refund branch opens at."
+)
+@click.option("--fee", "fee_override", type=int, default=None, help="Reservation-tx fee in photons.")
+@click.pass_obj
+def swap_reserve_cmd(ctx: CliContext, amount: int, expiry_height: int, fee_override: int | None) -> None:
+    """Reserve RXD into a v3 timelocked-refund covenant (RXD ONLY — no FT/NFT).
+
+    ``pyrxd swap post --give <the reservation outpoint>`` can then advertise
+    it as a v3 order. Two things every operator MUST understand before
+    running this:
+
+    \b
+    * Reclaim at --expiry is GUARANTEED — `pyrxd swap refund` always works
+      at/after that height (barring a lost key).
+    * That guarantee does NOT stop a fill: at/after --expiry the refund
+      RACES any late taker still holding a signed v3 advert. Cancel with
+      `pyrxd swap cancel` before --expiry if you no longer want it live.
+    """
+    if amount <= 0:
+        raise UserError("--amount must be Positive")
+    if expiry_height <= 0:
+        raise UserError("--expiry must be a Positive block height")
+
+    async def _run() -> dict:
+        async with ctx.make_client() as client:
+            funds = await _collect_funds(ctx, client)
+            owner_pkh = funds.change_pkh()
+            fee = _estimate_fee(ctx, 2, 2, fee_override)
+            funding = await _rxd_funding(client, funds, amount + fee)
+            reserve_tx = prepare_covenant_offer(
+                funding=funding,
+                photons=amount,
+                owner_pkh=owner_pkh,
+                expiry_height=expiry_height,
+                change_pkh=owner_pkh,
+                fee=fee,
+            )
+            _confirm_or_abort(
+                ctx,
+                [
+                    _BroadcastSummary(
+                        title="RESERVE into v3 refund covenant (RXD only)",
+                        lines=[
+                            f"reserve  : {amount} photons — RXD only, no FT/NFT",
+                            f"guaranteed reclaim at height {expiry_height} via `pyrxd swap refund`",
+                            "WARNING  : refund races late fills at/after expiry — expiry does Not itself "
+                            "invalidate a fill; act promptly.",
+                            f"fee      : {fee} photons",
+                        ],
+                    )
+                ],
+            )
+            txid = await client.broadcast(reserve_tx.serialize())
+            return {
+                "reservation_txid": str(txid),
+                "covenant_outpoint": f"{txid}:0",
+                "reserved_photons": amount,
+                "expiry_height": expiry_height,
+            }
+
+    _finish(ctx, _run, quiet_field="reservation_txid")
+
+
 @click.command(name="post")
 @click.option("--give", "give_outpoint", required=True, help="Offered UTXO as TXID:VOUT (wallet-owned, given WHOLE).")
 @click.option("--receive", "receive_spec", required=True, help="Demanded asset as rxd:AMOUNT or TOKEN:AMOUNT.")
@@ -288,9 +414,15 @@ def swap_orders_cmd(ctx: CliContext, token: str, want: bool, node_rpc: str, rpc_
 def swap_post_cmd(ctx: CliContext, give_outpoint: str, receive_spec: str, fee_override: int | None) -> None:
     """Post an order to the on-chain book: offer the --give UTXO for --receive.
 
-    The offered UTXO is given WHOLE and the signed price has NO expiry — it
-    stays fillable until you spend the UTXO (``pyrxd swap cancel``). Pre-split
-    an exact amount before posting.
+    A plain P2PKH/FT --give is posted as a v2 order: it is given WHOLE and the
+    signed price has NO expiry — it stays fillable until you spend the UTXO
+    (``pyrxd swap cancel``). Pre-split an exact amount before posting.
+
+    A --give that rests in a v3 refund covenant (``pyrxd swap reserve``) is
+    posted as a v3 order instead (the reservation's expiry rides on the
+    advert). WARNING: the deployed Radiant-Core ``-swapindex`` DROPS v3
+    adverts — this path is rollout/testing only until every consumer you
+    care about parses v3.
     """
     give_txid, give_vout = _parse_outpoint(give_outpoint)
     receive = _parse_asset_spec(receive_spec)
@@ -301,17 +433,39 @@ def swap_post_cmd(ctx: CliContext, give_outpoint: str, receive_spec: str, fee_ov
             if not 0 <= give_vout < len(give_source.outputs):
                 raise UserError(f"vout {give_vout} does not exist in {give_txid}")
             give_out = give_source.outputs[give_vout]
-            give_asset = _asset_of(give_out.satoshis, give_out.locking_script.serialize())
-
+            give_spk = give_out.locking_script.serialize()
             funds = await _collect_funds(ctx, client)
-            maker_key = funds.key_for_pkh(_owner_pkh_of(give_out.locking_script.serialize()))
-            post = create_rswp_order(
-                give_source_tx=give_source,
-                give_vout=give_vout,
-                maker_key=maker_key,
-                receive=receive,
-                maker_receive_pkh=maker_key.public_key().hash160(),
-            )
+
+            extra_lines: list[str] = []
+            if is_refund_covenant(give_spk):
+                owner_pkh, expiry = _inner_p2pkh_pkh(give_spk)
+                maker_key = funds.key_for_pkh(owner_pkh)
+                give_asset = Asset(kind="rxd", amount=give_out.satoshis)
+                post = create_covenant_order(
+                    covenant_source_tx=give_source,
+                    covenant_vout=give_vout,
+                    maker_key=maker_key,
+                    receive=receive,
+                    maker_receive_pkh=maker_key.public_key().hash160(),
+                )
+                title = "POST v3 covenant swap order (ROLLOUT/TESTING ONLY)"
+                extra_lines = [
+                    f"expiry     : height {expiry} (v3 refund covenant)",
+                    "WARNING    : the deployed swapindex Drops v3 adverts — rollout/testing only, "
+                    "not yet indexed by production nodes.",
+                ]
+            else:
+                give_asset = _asset_of(give_out.satoshis, give_spk)
+                maker_key = funds.key_for_pkh(_owner_pkh_of(give_spk))
+                post = create_rswp_order(
+                    give_source_tx=give_source,
+                    give_vout=give_vout,
+                    maker_key=maker_key,
+                    receive=receive,
+                    maker_receive_pkh=maker_key.public_key().hash160(),
+                )
+                title = "POST public swap order (no expiry — cancel is the only revocation)"
+
             fee = _estimate_fee(ctx, 1, 2, fee_override)
             funding = await _rxd_funding(client, funds, fee + _MIN_FEE_PHOTONS, exclude=(give_txid, give_vout))
             advert_tx = build_advert_tx(
@@ -321,11 +475,12 @@ def swap_post_cmd(ctx: CliContext, give_outpoint: str, receive_spec: str, fee_ov
                 ctx,
                 [
                     _BroadcastSummary(
-                        title="POST public swap order (no expiry — cancel is the only revocation)",
+                        title=title,
                         lines=[
                             f"you give   : {_describe_asset(give_asset)}  ({give_txid}:{give_vout}, spent WHOLE)",
                             f"you demand : {_describe_asset(receive)}",
                             f"advert fee : {fee} photons",
+                            *extra_lines,
                         ],
                     )
                 ],
@@ -354,38 +509,67 @@ def swap_take_cmd(ctx: CliContext, advert_arg: str, fee_override: int | None) ->
     """Verify and fill an on-chain order (the offered UTXO's source tx is fetched txid-verified).
 
     Every advertised claim is checked against the chain before your funds are
-    committed; a lying or unfillable advert aborts with the reason.
+    committed; a lying or unfillable advert aborts with the reason. An order
+    carrying an ``expiry_height`` (v3, covenant-held) is filled through the
+    CLTV-aware builder, which refuses to fill at/after expiry — the chain tip
+    is fetched fresh (via ElectrumX) and checked BEFORE the wallet is even
+    opened, so an unreachable node fails closed with no funds at risk.
     """
     order = _decode_advert_arg(advert_arg)
     if order.demanded_outputs is None or len(order.demanded_outputs) != 1:
         raise UserError("order does not have exactly one demanded output", cause="unenforceable demand (design D6)")
     demand = order.demanded_outputs[0]
     demand_asset = _asset_of(demand.value, demand.script)
-    if demand_asset.kind != "rxd":
+    if demand_asset.kind == "nft":
         raise UserError(
-            "this CLI can fund RXD-demand orders only (the maker wants an FT)",
-            fix="use the pyrxd.swap.rswp library take path with FT funding inputs",
+            "this CLI cannot fund NFT-demand orders (the maker wants a specific singleton)",
+            fix="use the pyrxd.swap.rswp library take path with the singleton as a funding input",
         )
 
     async def _run() -> dict:
         async with ctx.make_client() as client:
             give_source = await fetch_transaction(client, order.offered_txid)
+            tip_height = None
+            if order.expiry_height is not None:
+                # Fetched — and the order's freshness checked — BEFORE any wallet
+                # access: a dead node fails closed without ever prompting for the
+                # mnemonic. See take_covenant_order's docstring: filling at/after
+                # expiry races the maker's live refund.
+                tip_height = int(await client.get_tip_height())
             funds = await _collect_funds(ctx, client)
             fee = _estimate_fee(ctx, 1 + 2, 4, fee_override)
-            funding = await _rxd_funding(client, funds, demand.value + fee)
+            if demand_asset.kind == "ft":
+                # The demand is paid in tokens; plain RXD only needs to cover the
+                # fee (the library enforces per-ref conservation + emits change).
+                funding = await _ft_funding(client, funds, demand_asset.ref, demand_asset.amount)
+                funding += await _rxd_funding(client, funds, fee)
+            else:
+                funding = await _rxd_funding(client, funds, demand.value + fee)
             taker_pkh = funds.change_pkh()
-            completion = take_rswp_order(
-                order,
-                give_source_tx=give_source,
-                funding=funding,
-                taker_receive_pkh=taker_pkh,
-                taker_change_pkh=taker_pkh,
-                fee=fee,
-            )
-            gives = _asset_of(
-                give_source.outputs[order.offered_utxo_index].satoshis,
-                give_source.outputs[order.offered_utxo_index].locking_script.serialize(),
-            )
+            if order.expiry_height is not None:
+                completion = take_covenant_order(
+                    order,
+                    give_source_tx=give_source,
+                    funding=funding,
+                    taker_receive_pkh=taker_pkh,
+                    taker_change_pkh=taker_pkh,
+                    fee=fee,
+                    current_height=tip_height,
+                )
+                gives = Asset(kind="rxd", amount=give_source.outputs[order.offered_utxo_index].satoshis)
+            else:
+                completion = take_rswp_order(
+                    order,
+                    give_source_tx=give_source,
+                    funding=funding,
+                    taker_receive_pkh=taker_pkh,
+                    taker_change_pkh=taker_pkh,
+                    fee=fee,
+                )
+                gives = _asset_of(
+                    give_source.outputs[order.offered_utxo_index].satoshis,
+                    give_source.outputs[order.offered_utxo_index].locking_script.serialize(),
+                )
             _confirm_or_abort(
                 ctx,
                 [
@@ -417,7 +601,9 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
     """Cancel a posted order by self-spending its offered UTXO — the ONLY hard revocation.
 
     Until this confirms, anyone holding the signed advert can still fill at
-    the original price.
+    the original price. A --give held in a v3 refund covenant is cancelled
+    via its SWAP-branch self-spend (works at ANY height, before or after
+    expiry); a plain P2PKH/FT --give keeps the v2 self-spend path.
     """
     give_txid, give_vout = _parse_outpoint(give_outpoint)
 
@@ -427,29 +613,49 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
             if not 0 <= give_vout < len(give_source.outputs):
                 raise UserError(f"vout {give_vout} does not exist in {give_txid}")
             give_out = give_source.outputs[give_vout]
-            give_asset = _asset_of(give_out.satoshis, give_out.locking_script.serialize())
+            give_spk = give_out.locking_script.serialize()
             funds = await _collect_funds(ctx, client)
-            maker_key = funds.key_for_pkh(_owner_pkh_of(give_out.locking_script.serialize()))
-            fee = _estimate_fee(ctx, 2, 2, fee_override)
-            funding = None
-            if _cancel_needs_fee_funding(give_asset.kind, give_out.satoshis, fee):
-                funding = await _rxd_funding(client, funds, fee, exclude=(give_txid, give_vout))
-            cancel = build_cancel_tx(
-                offered_source_tx=give_source,
-                offered_vout=give_vout,
-                maker_key=maker_key,
-                refund_pkh=maker_key.public_key().hash160(),
-                fee=fee,
-                funding=funding,
-            )
+            extra_lines: list[str] = []
+            if is_refund_covenant(give_spk):
+                owner_pkh, expiry = _inner_p2pkh_pkh(give_spk)
+                maker_key = funds.key_for_pkh(owner_pkh)
+                give_asset = Asset(kind="rxd", amount=give_out.satoshis)
+                fee = _estimate_fee(ctx, 1, 1, fee_override)
+                cancel = build_covenant_cancel_tx(
+                    covenant_source_tx=give_source,
+                    covenant_vout=give_vout,
+                    maker_key=maker_key,
+                    refund_pkh=owner_pkh,
+                    fee=fee,
+                )
+                title = "CANCEL v3 covenant reservation (SWAP-branch self-spend, before OR after expiry)"
+                extra_lines = [f"covenant expiry: height {expiry} (informational — cancel works at Any height)"]
+            else:
+                give_asset = _asset_of(give_out.satoshis, give_spk)
+                maker_key = funds.key_for_pkh(_owner_pkh_of(give_spk))
+                fee = _estimate_fee(ctx, 2, 2, fee_override)
+                funding = None
+                if _cancel_needs_fee_funding(give_asset.kind, give_out.satoshis, fee):
+                    funding = await _rxd_funding(client, funds, fee, exclude=(give_txid, give_vout))
+                cancel = build_cancel_tx(
+                    offered_source_tx=give_source,
+                    offered_vout=give_vout,
+                    maker_key=maker_key,
+                    refund_pkh=maker_key.public_key().hash160(),
+                    fee=fee,
+                    funding=funding,
+                )
+                title = "CANCEL posted order (self-spend; kills every copy of the signed offer)"
+
             _confirm_or_abort(
                 ctx,
                 [
                     _BroadcastSummary(
-                        title="CANCEL posted order (self-spend; kills every copy of the signed offer)",
+                        title=title,
                         lines=[
                             f"reclaims : {_describe_asset(give_asset)}  ({give_txid}:{give_vout})",
                             f"fee      : {fee} photons",
+                            *extra_lines,
                         ],
                     )
                 ],
@@ -458,6 +664,76 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
             return {"cancel_txid": str(txid), "reclaimed": _describe_asset(give_asset)}
 
     _finish(ctx, _run, quiet_field="cancel_txid")
+
+
+@click.command(name="refund")
+@click.option("--give", "give_outpoint", required=True, help="The v3 covenant UTXO to reclaim, as TXID:VOUT.")
+@click.option("--fee", "fee_override", type=int, default=None, help="Refund-tx fee in photons.")
+@click.pass_obj
+def swap_refund_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | None) -> None:
+    """Reclaim a v3 covenant reservation via its CLTV refund branch.
+
+    Only mineable AT or AFTER the covenant's expiry height — a node will
+    reject this transaction as non-final if broadcast earlier. Two things to
+    remember (see :mod:`pyrxd.swap.rswp.covenant`):
+
+    \b
+    * The resulting txid is third-party MALLEABLE (the branch selector is
+      unsigned scriptSig data) — track this reservation by the covenant
+      OUTPOINT you reclaimed, never by the txid this command prints.
+    * Filing at/after expiry RACES any late taker still holding a signed
+      v3 advert for this same outpoint — cancel first if the order was
+      never advertised, or you no longer want it live.
+    """
+    give_txid, give_vout = _parse_outpoint(give_outpoint)
+
+    async def _run() -> dict:
+        async with ctx.make_client() as client:
+            give_source = await fetch_transaction(client, give_txid)
+            if not 0 <= give_vout < len(give_source.outputs):
+                raise UserError(f"vout {give_vout} does not exist in {give_txid}")
+            give_out = give_source.outputs[give_vout]
+            give_spk = give_out.locking_script.serialize()
+            if parse_refund_covenant(give_spk) is None:
+                raise UserError(
+                    "the --give UTXO is Not a v3 refund covenant",
+                    cause="`pyrxd swap refund` only reclaims v3 covenant reservations",
+                    fix="use `pyrxd swap cancel` for a plain v2 posted order instead",
+                )
+            owner_pkh, expiry = _inner_p2pkh_pkh(give_spk)
+            funds = await _collect_funds(ctx, client)
+            maker_key = funds.key_for_pkh(owner_pkh)
+            fee = _estimate_fee(ctx, 1, 1, fee_override)
+            refund_tx = build_covenant_refund_tx(
+                covenant_source_tx=give_source,
+                covenant_vout=give_vout,
+                maker_key=maker_key,
+                refund_pkh=owner_pkh,
+                fee=fee,
+            )
+            _confirm_or_abort(
+                ctx,
+                [
+                    _BroadcastSummary(
+                        title="REFUND v3 covenant reservation (CLTV branch)",
+                        lines=[
+                            f"reclaims : {give_out.satoshis} photons — RXD only  ({give_txid}:{give_vout})",
+                            f"mineable : only at/after height {expiry}",
+                            "WARNING  : the refund txid is Malleable — track the OUTPOINT above, never this txid.",
+                            f"fee      : {fee} photons",
+                        ],
+                    )
+                ],
+            )
+            txid = await client.broadcast(refund_tx.serialize())
+            return {
+                "refund_txid": str(txid),
+                "reclaimed_outpoint": f"{give_txid}:{give_vout}",
+                "reclaimed_photons": give_out.satoshis,
+                "expiry_height": expiry,
+            }
+
+    _finish(ctx, _run, quiet_field="refund_txid")
 
 
 # --------------------------------------------------------------------------- shared runners
