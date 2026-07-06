@@ -1,6 +1,6 @@
 """Decoder for the Radiant on-chain swap-order ("RSWP") OP_RETURN wire format — the READ side.
 
-Decodes a **v2** RSWP order advertised in an ``OP_RETURN`` output into structured fields, including the
+Decodes a **v2 or v3** RSWP order advertised in an ``OP_RETURN`` output into structured fields, including the
 Photonic ``MultiTxOutV1`` ``price_terms`` (the outputs the maker demands). This is the **canonical**
 decode: it follows the on-chain producer (Photonic-Wallet) and the consensus-node parser
 (Radiant-Core ``swapindex.cpp``). It matches current ``Radiant-Core/RXinDexer``, which decodes the same
@@ -9,9 +9,15 @@ garbage against real orders; that was fixed upstream 2026-06-01, commit ``24572c
 ``docs/swap-order-wire-format.md`` §Conflicts. Read-only: this builds and signs nothing.
 
 The frame (pushes after ``OP_RETURN``): ``"RSWP" version flags offeredType termsType tokenID
-[wantTokenID] offeredUTXOHash offeredUTXOIndex priceTerms… signature``. The tail rule (node
-``swapindex.cpp:642-659``): of the remaining pushes, ``price_terms = concat(tail[:-1])`` and
+[wantTokenID] [expiryHeight] offeredUTXOHash offeredUTXOIndex priceTerms… signature``. The tail rule
+(node ``swapindex.cpp:642-659``): of the remaining pushes, ``price_terms = concat(tail[:-1])`` and
 ``signature = tail[-1]`` (require ``len(tail) >= 2``).
+
+**v3** (Photonic ``docs/swap-offer-expiry-cancellation.md`` §4) bumps the version byte to ``0x03`` and,
+when flag bit ``0x02`` is set, inserts a 4-byte little-endian absolute ``expiry_height`` between the
+want-token id and the outpoint. The v2 field layout is otherwise unchanged. NOTE: the deployed
+Radiant-Core swapindex parses v2 only and *drops* v3 adverts — decode support here is part of the
+cross-repo v3 parser rollout, not evidence of live-network support.
 """
 
 from __future__ import annotations
@@ -25,6 +31,7 @@ from ..utils import Reader
 
 _RSWP_MAGIC = b"RSWP"
 _FLAG_HAS_WANT = 0x01
+_FLAG_HAS_EXPIRY = 0x02  # v3 only
 _RXD_TOKEN_ID = b"\x00" * 32
 
 
@@ -38,7 +45,7 @@ class DemandedOutput:
 
 @dataclass(frozen=True)
 class RswpOrder:
-    """A decoded v2 RSWP swap order. ``price_terms`` is the raw opaque blob; ``demanded_outputs`` is the
+    """A decoded v2/v3 RSWP swap order. ``price_terms`` is the raw opaque blob; ``demanded_outputs`` is the
     parsed ``MultiTxOutV1`` view (``None`` if the blob isn't valid MultiTxOutV1 — use ``price_terms``)."""
 
     version: int
@@ -52,6 +59,15 @@ class RswpOrder:
     price_terms: bytes  # opaque concat of the middle pushes
     demanded_outputs: list[DemandedOutput] | None  # parsed MultiTxOutV1, or None
     signature: bytes  # the full scriptSig: PUSH(DER||0xC3) PUSH(pubkey)
+    expiry_height: int | None = None  # v3 only: absolute block height (4-byte LE on the wire)
+
+    def __post_init__(self) -> None:
+        # v3 iff expiry (Photonic emits v3 exactly when an expiry is present; a
+        # v2 frame has no field to carry one). Keeps hand-built orders honest.
+        if self.version == 2 and self.expiry_height is not None:
+            raise ValidationError("a v2 RSWP order cannot carry an expiry_height")
+        if self.version == 3 and self.expiry_height is None:
+            raise ValidationError("a v3 RSWP order requires an expiry_height")
 
     @property
     def offered_txid(self) -> str:
@@ -133,8 +149,10 @@ def parse_price_terms_lenient(blob: bytes) -> list[DemandedOutput] | None:
 
 
 def decode_rswp_order(op_return_script: bytes) -> RswpOrder:
-    """Decode a v2 RSWP ``OP_RETURN`` script into an :class:`RswpOrder`. Raises ``ValidationError`` on a
-    malformed / non-v2 / non-RSWP frame."""
+    """Decode a v2/v3 RSWP ``OP_RETURN`` script into an :class:`RswpOrder`. Raises ``ValidationError``
+    on a malformed / unknown-version / non-RSWP frame, including a version/expiry-flag mismatch
+    (``version == 3`` iff flag ``0x02`` — a mis-gated 4-byte push would otherwise be silently folded
+    into ``price_terms`` by the greedy tail rule)."""
     items = _items(op_return_script)
     i = 0
 
@@ -164,13 +182,16 @@ def decode_rswp_order(op_return_script: bytes) -> RswpOrder:
     if _data("magic", 4) != _RSWP_MAGIC:
         raise ValidationError("not an RSWP order (missing magic)")
     version = _small_int("version")
-    if version != 2:
-        raise ValidationError(f"unsupported RSWP version {version} (this decoder handles v2)")
+    if version not in (2, 3):
+        raise ValidationError(f"unsupported RSWP version {version} (this decoder handles v2/v3)")
     flags = _small_int("flags")
+    if bool(flags & _FLAG_HAS_EXPIRY) != (version == 3):
+        raise ValidationError(f"RSWP version {version} is inconsistent with expiry flag 0x02 (v3 iff expiry)")
     offered_type = _small_int("offeredType")
     terms_type = _small_int("termsType")
     token_id = _data("tokenID", 32)
     want_token_id = _data("wantTokenID", 32) if (flags & _FLAG_HAS_WANT) else None
+    expiry_height = int.from_bytes(_data("expiryHeight", 4), "little") if (flags & _FLAG_HAS_EXPIRY) else None
     offered_utxo_hash = _data("offeredUTXOHash", 32)
     # offeredUTXOIndex: OP_0..OP_16 OR a minimal CScriptNum push.
     if i >= len(items):
@@ -197,4 +218,5 @@ def decode_rswp_order(op_return_script: bytes) -> RswpOrder:
         price_terms=price_terms,
         demanded_outputs=parse_price_terms(price_terms),
         signature=signature,
+        expiry_height=expiry_height,
     )

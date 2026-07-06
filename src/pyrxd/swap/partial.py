@@ -130,6 +130,16 @@ def _verify_owner_signature(tx: Transaction, index: int) -> None:
     if len(sig_with_flag) < 2:
         raise ValidationError("malformed signature push")
     der, flag = sig_with_flag[:-1], sig_with_flag[-1]  # signature + its trailing sighash-type byte
+    # The maker input of an offer must be signed EXACTLY SINGLE|ANYONECANPAY|FORKID.
+    # The flag byte comes from the untrusted scriptSig, and NONE|ANYONECANPAY|FORKID
+    # (0xC2) is the one flag that verifies both before AND after the taker completes
+    # the transaction while committing to NO outputs at all — i.e. the offer's
+    # receive terms would not be bound by the signature it "verifies" under.
+    if flag != _OFFER_SIGHASH:
+        raise ValidationError(
+            f"offer input {index} is signed with sighash 0x{flag:02x}; only "
+            f"SINGLE|ANYONECANPAY|FORKID (0x{int(_OFFER_SIGHASH):02x}) binds the offer terms"
+        )
     # The sighash type is NOT carried in the tx wire format (it lives only in
     # the signature byte), so a parsed input always reports the default flag.
     # Restore the actual flag from the signature before computing the preimage,
