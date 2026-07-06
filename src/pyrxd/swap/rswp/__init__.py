@@ -67,6 +67,7 @@ from .orders import (
     verify_offer_signature,
 )
 from .quoting import LadderQuote, PriceFeed, implied_price, quote_ladder, quote_legs
+from .rxindexer_source import RxindexerOrderbookSource
 from .tracker import (
     ClassifyResult,
     OfferStatus,
@@ -117,6 +118,7 @@ __all__ = [
     "PriceFeed",
     "RswpOrder",
     "RswpOrderPost",
+    "RxindexerOrderbookSource",
     "TrackedOffer",
     "build_advert_tx",
     "build_cancel_tx",

@@ -134,6 +134,39 @@ class RxinDexerClient:
         """``glyph.get_metadata`` — decoded CBOR metadata for a token."""
         return await self._call("glyph.get_metadata", [ref])
 
+    # ─────────────────────────────────────────── Swap (RSWP) ──
+    #
+    # Verified 2026-07-05 against ``Radiant-Core/RXinDexer`` (upstream ``main``,
+    # commit range through 2026-06-30) — the RPC is wired in
+    # ``electrumx/server/glyph_api.py`` (``GLYPH_METHODS['swap.get_orders']``),
+    # NOT in ``electrumx/server/swap_index.py`` as an older internal
+    # ``SWAP_METHODS`` table (dead code, since removed) once suggested. There is
+    # exactly one confirmed-order query method; see
+    # :mod:`pyrxd.swap.rswp.rxindexer_source` for the capability this implies
+    # (no want-token-only filter) and why the returned dict fields are used only
+    # for order *discovery*, never trusted for signature/price-terms content.
+
+    async def swap_get_orders(
+        self,
+        base_ref: str | None = None,
+        quote_ref: str | None = None,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> Any:
+        """``swap.get_orders`` — RXinDexer's confirmed swap-order query.
+
+        With only ``base_ref`` (``txid_vout`` or 72-hex, per
+        ``glyph_api.py::_parse_ref``): open orders offering that token,
+        newest-index-first, server-side ``limit`` clamped to 200. With BOTH
+        ``base_ref`` and ``quote_ref``: the ``{bids, asks}`` orderbook for that
+        exact pair instead of a flat list. There is NO filter for "orders
+        wanting token X" alone (no symmetric quote-only index exists server
+        side as of this 2026-07-05 verification) — callers needing that must
+        raise rather than approximate it by scanning every base ref.
+        """
+        return await self._call("swap.get_orders", [base_ref, quote_ref, limit, offset])
+
     # ─────────────────────────────────────────── transport ──
 
     async def _call(self, method: str, params: list) -> Any:
