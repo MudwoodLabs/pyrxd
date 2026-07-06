@@ -223,3 +223,23 @@ class TestOrders:
         result = runner.invoke(cli, ["swap", "orders", "rxd", "--node-rpc", "http://x"])
         assert result.exit_code == 0, result.output
         assert "no open orders" in result.output
+
+
+class TestCancelFeeFunding:
+    """Red-team MEDIUM (NFT slice): token cancels always need separate fee funding —
+    an NFT cancel returns the FULL carrier (no singleton change path), so the
+    FT-only condition made the advertised hard revocation abort for every
+    non-dust NFT."""
+
+    def test_token_cancels_always_need_funding(self) -> None:
+        from pyrxd.cli.swap_book_cmds import _cancel_needs_fee_funding
+
+        assert _cancel_needs_fee_funding("ft", 1_000_000, 1_000)
+        assert _cancel_needs_fee_funding("nft", 1_000_000, 1_000)  # the fixed case
+        assert _cancel_needs_fee_funding("nft", 500, 1_000)
+
+    def test_rxd_cancel_funds_fee_from_its_own_value(self) -> None:
+        from pyrxd.cli.swap_book_cmds import _cancel_needs_fee_funding
+
+        assert not _cancel_needs_fee_funding("rxd", 1_000_000, 1_000)
+        assert _cancel_needs_fee_funding("rxd", 900, 1_000)  # value cannot cover the fee

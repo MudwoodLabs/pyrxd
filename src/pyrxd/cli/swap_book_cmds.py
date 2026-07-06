@@ -98,21 +98,31 @@ def _parse_token(value: str) -> GlyphRef | None:
 
 
 def _parse_asset_spec(value: str) -> Asset:
-    """``rxd:AMOUNT`` or ``TOKEN:AMOUNT`` (token as 72-hex ref or txid:vout) → Asset."""
+    """``rxd:AMOUNT`` | ``TOKEN:AMOUNT`` (FT) | ``nft:TOKEN:CARRIER_PHOTONS`` → Asset.
+
+    A bare token ref means FT (the common case); an NFT must be explicit via
+    the ``nft:`` prefix because the ref alone cannot distinguish the two.
+    """
+    kind = "ft"
+    if value.lower().startswith("nft:"):
+        kind = "nft"
+        value = value[4:]
     token_part, sep, amount_part = value.rpartition(":")
     if not sep:
         raise UserError(
             f"invalid asset spec {sanitize_terminal(value, max_len=80)!r}",
             cause="expected ASSET:AMOUNT",
-            fix="e.g. --receive rxd:900000 or --receive <72-hex-ref>:50",
+            fix="e.g. --receive rxd:900000, --receive <72-hex-ref>:50, or --receive nft:<72-hex-ref>:600",
         )
     try:
         amount = int(amount_part)
     except ValueError as exc:
         raise UserError(f"invalid amount {sanitize_terminal(amount_part, max_len=40)!r}") from exc
     ref = _parse_token(token_part)
+    if ref is None and kind == "nft":
+        raise UserError("nft: prefix requires a token ref, not 'rxd'")
     try:
-        return Asset(kind="rxd", amount=amount) if ref is None else Asset(kind="ft", amount=amount, ref=ref)
+        return Asset(kind="rxd", amount=amount) if ref is None else Asset(kind=kind, amount=amount, ref=ref)
     except RxdSdkError as exc:
         raise UserError(f"invalid asset spec: {exc}") from exc
 
@@ -120,6 +130,8 @@ def _parse_asset_spec(value: str) -> Asset:
 def _describe_asset(asset: Asset) -> str:
     if asset.kind == "rxd":
         return f"{asset.amount} photons (RXD)"
+    if asset.kind == "nft":
+        return f"the NFT {asset.ref.txid}:{asset.ref.vout} (carrier {asset.amount} photons)"
     return f"{asset.amount} units of FT {asset.ref.txid}:{asset.ref.vout}"
 
 
@@ -130,6 +142,19 @@ def _estimate_fee(ctx: CliContext, n_inputs: int, n_outputs: int, override: int 
         return override
     size = _TX_BASE_BYTES + n_inputs * _TX_PER_INPUT_BYTES + n_outputs * _TX_PER_OUTPUT_BYTES
     return max(_MIN_FEE_PHOTONS, (ctx.fee_rate * size + 999) // 1000)
+
+
+def _cancel_needs_fee_funding(give_kind: str, give_value: int, fee: int) -> bool:
+    """Whether a cancel self-spend needs separate plain-RXD fee funding.
+
+    Token cancels ALWAYS do: an FT cancel conserves the full token amount and
+    an NFT cancel returns the full carrier (a singleton has no change path), so
+    neither leaves photons for the fee. (Red-team MEDIUM on the NFT slice: the
+    original FT-only condition made `swap cancel` — the advertised hard
+    revocation — abort for every non-dust NFT.) An RXD cancel funds the fee
+    from its own value unless that value cannot cover it.
+    """
+    return give_kind in ("ft", "nft") or give_value <= fee
 
 
 # --------------------------------------------------------------------------- wallet plumbing
@@ -406,9 +431,8 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
             funds = await _collect_funds(ctx, client)
             maker_key = funds.key_for_pkh(_owner_pkh_of(give_out.locking_script.serialize()))
             fee = _estimate_fee(ctx, 2, 2, fee_override)
-            # FT cancels conserve the full token amount, so the fee needs plain-RXD funding.
             funding = None
-            if give_asset.kind == "ft" or give_out.satoshis <= fee:
+            if _cancel_needs_fee_funding(give_asset.kind, give_out.satoshis, fee):
                 funding = await _rxd_funding(client, funds, fee, exclude=(give_txid, give_vout))
             cancel = build_cancel_tx(
                 offered_source_tx=give_source,
