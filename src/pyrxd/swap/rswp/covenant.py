@@ -166,6 +166,12 @@ def _append_selector(tx: Transaction, index: int, selector: bytes) -> None:
     inp.unlocking_script = Script(inp.unlocking_script.serialize() + selector)
 
 
+def _build_ft_change(ref, amount: int, pkh: bytes) -> TransactionOutput:
+    from ...glyph.script import build_ft_locking_script
+
+    return TransactionOutput(Script(build_ft_locking_script(Hex20(pkh), ref)), amount)
+
+
 # --------------------------------------------------------------------------- maker: reserve + post
 
 
@@ -234,11 +240,10 @@ def create_covenant_order(
     the SWAP selector is appended by the TAKER at completion (Photonic
     convention), so v2 verifiers see the familiar two-push shape.
 
-    Asymmetry to know about (red-team L4): an FT *demand* is protocol-valid
-    and postable here (a covenant-aware external taker can fill it), but
-    :func:`take_covenant_order` in this slice completes RXD-demand orders
-    only — an FT-demand v3 order is not yet fillable by pyrxd itself. The
-    maker's covenant refund/cancel is unaffected either way.
+    Both demand kinds are fillable by pyrxd: RXD demands and FT demands
+    (:func:`take_covenant_order` enforces per-ref conservation for the
+    latter). The RESERVED side stays RXD-only — FT-in-covenant is blocked at
+    consensus by the FT codeScript epilogue.
     """
     if not 0 <= covenant_vout < len(covenant_source_tx.outputs):
         raise ValidationError("covenant_vout out of range for the source transaction")
@@ -313,10 +318,13 @@ def take_covenant_order(
     maker-signature verification over the reconstructed preimage (whose
     scriptCode is the covenant SPK).
 
-    RXD-only: the covenant's inner script must be P2PKH, and the demanded
-    output must be classifiable; taker funding must be plain RXD (there is no
-    token conservation in an all-RXD completion — the arithmetic is checked
-    explicitly instead).
+    The RESERVED side is RXD-only (covenant inner script must be P2PKH). The
+    DEMAND side may be RXD or a Glyph FT: for an FT demand the taker funds
+    with FT UTXOs of exactly the demanded ref (plus plain RXD for value/fee),
+    and per-ref conservation is enforced here — the demanded amount goes to
+    the maker, any FT surplus returns to ``taker_change_pkh``, and funding
+    carrying any OTHER token (different FT ref, or an NFT) is refused rather
+    than burned or stranded.
     """
     from ..partial import _asset_of, _parse_p2pkh_scriptsig
 
@@ -382,16 +390,26 @@ def take_covenant_order(
         # heuristic in security.errors and would print "<redacted>".
         raise ValidationError("maker signature does NOT validate over the covenant order")
 
-    # Complete: taker receives the reserved RXD; plain-RXD funding covers the
-    # demand + fee; explicit arithmetic replaces FT conservation (all-RXD tx).
+    # Complete: taker receives the reserved RXD; funding covers the demand + fee.
+    # Per-ref FT conservation is single-ref by construction (D6: exactly one
+    # demanded output), so it reduces to: FT-in(demanded ref) >= demanded amount,
+    # surplus returned as FT change, and NO other token may enter the funding.
     tx.add_output(TransactionOutput(P2PKH().lock(bytes(taker_receive_pkh)), cov_out.satoshis))
     total_funding = 0
+    ft_funded = 0
+    demanded_ref = receive.ref  # None for an RXD demand
     for f in funding:
         if not 0 <= f.vout < len(f.source_tx.outputs):
             raise ValidationError("funding input references a non-existent source output")
         f_out = f.source_tx.outputs[f.vout]
-        if _asset_of(f_out.satoshis, f_out.locking_script.serialize()).kind != "rxd":
-            raise ValidationError("v3 take funding must be plain RXD")
+        f_asset = _asset_of(f_out.satoshis, f_out.locking_script.serialize())
+        if f_asset.kind == "ft" and demanded_ref is not None and f_asset.ref == demanded_ref:
+            ft_funded += f_asset.amount
+        elif f_asset.kind != "rxd":
+            raise ValidationError(
+                "v3 take funding must be plain RXD, or FTs of exactly the demanded ref — "
+                "any other token here would be burned or stranded"
+            )
         total_funding += f_out.satoshis
         tx.add_input(
             TransactionInput(
@@ -401,9 +419,16 @@ def take_covenant_order(
                 sighash=SIGHASH.ALL_FORKID,
             )
         )
-    if receive.kind != "rxd":
-        raise ValidationError("v3 take supports RXD-demand orders only in this slice")
-    change = total_funding - demanded.value - fee
+    ft_surplus = 0
+    if demanded_ref is not None:
+        ft_surplus = ft_funded - receive.amount
+        if ft_surplus < 0:
+            raise ValidationError(
+                f"funding lacks {-ft_surplus} units of the demanded FT {demanded_ref.txid}:{demanded_ref.vout}"
+            )
+        if ft_surplus > 0:
+            tx.add_output(_build_ft_change(demanded_ref, ft_surplus, bytes(taker_change_pkh)))
+    change = total_funding - demanded.value - ft_surplus - fee
     if change < 0:
         raise ValidationError(f"funding is {-change} photons short of the demand plus fee")
     if change >= _DUST_PHOTONS:
