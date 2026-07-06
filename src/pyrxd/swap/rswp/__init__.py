@@ -67,6 +67,7 @@ from .orders import (
     verify_offer_signature,
 )
 from .quoting import LadderQuote, PriceFeed, implied_price, quote_ladder, quote_legs
+from .rxindexer_source import RxindexerOrderbookSource
 from .wire import (
     CONTRACT_TYPE_FT,
     CONTRACT_TYPE_NFT,
@@ -104,6 +105,7 @@ __all__ = [
     "PriceFeed",
     "RswpOrder",
     "RswpOrderPost",
+    "RxindexerOrderbookSource",
     "build_advert_tx",
     "build_cancel_tx",
     "build_covenant_cancel_tx",
