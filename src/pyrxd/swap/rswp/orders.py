@@ -45,6 +45,7 @@ from ..partial import (
 from ..types import Asset, SwapOffer, SwapTerms
 from .wire import (
     CONTRACT_TYPE_FT,
+    CONTRACT_TYPE_NFT,
     CONTRACT_TYPE_RXD,
     RXD_TOKEN_ID,
     encode_price_terms,
@@ -58,12 +59,22 @@ _MAX_PHOTONS = 21_000_000_000 * 100_000_000
 
 
 def _contract_type_of(asset: Asset) -> int:
-    """Photonic ``ContractType`` byte for an asset this module supports (RXD=0, FT=2)."""
-    return CONTRACT_TYPE_FT if asset.kind == "ft" else CONTRACT_TYPE_RXD
+    """Photonic ``ContractType`` byte (RXD=0, NFT=1, FT=2 — verified from Photonic source)."""
+    if asset.kind == "ft":
+        return CONTRACT_TYPE_FT
+    if asset.kind == "nft":
+        return CONTRACT_TYPE_NFT
+    return CONTRACT_TYPE_RXD
 
 
 def _pushed_token_id(asset: Asset) -> bytes:
-    """The 32 token-id bytes as they appear ON CHAIN (display digest reversed; zeros for RXD)."""
+    """The 32 token-id bytes as they appear ON CHAIN (display digest reversed; zeros for RXD).
+
+    NB: the id is REF-ONLY — an FT and an NFT sharing a genesis ref would hash
+    identically (unreachable on chain: one genesis commits to one refType).
+    Kind is therefore discriminated by the bridge's offered_type-vs-reality
+    check, never by token_id; do not lean on token_id as a kind signal.
+    """
     tid = swap_token_id(asset.ref)
     return tid if tid == RXD_TOKEN_ID else tid[::-1]
 
@@ -372,7 +383,13 @@ def build_cancel_tx(
                 sighash=SIGHASH.ALL_FORKID,
             )
         )
-    # No explicit outputs: conservation emits the FT amount (if any) and the
+    offered = offered_source_tx.outputs[offered_vout]
+    offered_asset = _asset_of(offered.satoshis, offered.locking_script.serialize())
+    if offered_asset.kind == "nft":
+        # A singleton has no change path — send it back explicitly, or the
+        # conservation check would (correctly) refuse the burn.
+        tx.add_output(_build_asset_output(offered_asset, bytes(refund_pkh)))
+    # Remaining value: conservation emits the FT amount (if any) and the
     # remaining RXD, less fee, as "change" to the maker's refund key.
     _balance_and_add_change(tx, bytes(refund_pkh), fee)
     if not tx.outputs:

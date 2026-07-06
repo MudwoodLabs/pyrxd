@@ -21,10 +21,11 @@ freely, but cannot alter what the maker gives or receives without
 invalidating the maker's signature — which :func:`accept_offer` checks
 before returning.
 
-Scope (v1): plain RXD and Glyph FT assets, on the same chain. The maker
-spends their entire given UTXO (SINGLE protects only output[0], so a
-maker-side change output would be unprotected — pre-split the UTXO to
-sell a partial amount). NFTs are out of scope.
+Scope: plain RXD, Glyph FT, and Glyph NFT singleton assets, on the same
+chain. The maker spends their entire given UTXO (SINGLE protects only
+output[0], so a maker-side change output would be unprotected — pre-split
+the UTXO to sell a partial amount). An NFT moves whole (the singleton ref
+must appear exactly once on each side; there is no NFT change).
 
 This module is pure (no network). To fetch the source/funding
 transactions an offer references, see :mod:`pyrxd.swap.resolve`.
@@ -35,7 +36,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..constants import SIGHASH
-from ..glyph.script import build_ft_locking_script, extract_ref_from_ft_script, is_ft_script
+from ..glyph.script import (
+    build_ft_locking_script,
+    build_nft_locking_script,
+    extract_owner_pkh_from_nft_script,
+    extract_ref_from_ft_script,
+    extract_ref_from_nft_script,
+    is_ft_script,
+    is_nft_script,
+)
 from ..glyph.types import GlyphRef
 from ..keys import PrivateKey, PublicKey
 from ..script.script import Script
@@ -63,27 +72,33 @@ def _is_p2pkh(script: bytes) -> bool:
 
 
 def _owner_pkh_of(script: bytes) -> bytes:
-    """Owner PKH of a spendable output (plain P2PKH or an FT lock — both embed it at [3:23])."""
+    """Owner PKH of a spendable output (P2PKH / FT embed it at [3:23]; the NFT singleton at [41:61])."""
     if _is_p2pkh(script) or is_ft_script(script.hex()):
         return script[3:23]
-    raise ValidationError("output is not a spendable P2PKH or FT script")
+    if is_nft_script(script.hex()):
+        return bytes(extract_owner_pkh_from_nft_script(script))
+    raise ValidationError("output is not a spendable P2PKH, FT, or NFT script")
 
 
 def _asset_of(satoshis: int, script: bytes) -> Asset:
-    """Classify an output's spendable asset. Rejects anything but RXD / FT."""
+    """Classify an output's spendable asset. Rejects anything but RXD / FT / NFT."""
     if is_ft_script(script.hex()):
         return Asset(kind="ft", amount=satoshis, ref=extract_ref_from_ft_script(script))
+    if is_nft_script(script.hex()):
+        return Asset(kind="nft", amount=satoshis, ref=extract_ref_from_nft_script(script))
     if _is_p2pkh(script):
         return Asset(kind="rxd", amount=satoshis, ref=None)
-    raise ValidationError("unsupported asset: output is neither plain RXD (P2PKH) nor a Glyph FT")
+    raise ValidationError("unsupported asset: output is not plain RXD (P2PKH), a Glyph FT, or a Glyph NFT")
 
 
 def _build_asset_output(asset: Asset, pkh: bytes) -> TransactionOutput:
     """Build the output that pays *asset* to the holder of *pkh*."""
+    if asset.ref is None and asset.kind != "rxd":  # guaranteed by Asset.__post_init__; keeps types + bandit happy
+        raise ValidationError(f"{asset.kind.upper()} asset is missing its ref")
     if asset.kind == "ft":
-        if asset.ref is None:  # guaranteed by Asset.__post_init__; guard keeps types + bandit happy
-            raise ValidationError("FT asset is missing its ref")
         return TransactionOutput(Script(build_ft_locking_script(Hex20(pkh), asset.ref)), asset.amount)
+    if asset.kind == "nft":
+        return TransactionOutput(Script(build_nft_locking_script(Hex20(pkh), asset.ref)), asset.amount)
     return TransactionOutput(P2PKH().lock(pkh), asset.amount)
 
 
@@ -311,17 +326,23 @@ def accept_offer(
 
 
 def _balance_and_add_change(tx: Transaction, taker_change_pkh: bytes, fee: int) -> None:
-    """Enforce per-FT-ref conservation and append FT/RXD change outputs.
+    """Enforce per-FT-ref conservation + NFT singleton discipline; append FT/RXD change.
 
     Each FT ref must conserve (sum of input photons of that ref == sum of
     output photons); any surplus becomes an FT change output to the taker.
-    The remaining (non-FT) photon surplus, less ``fee``, becomes an RXD
-    change output. Raises if the taker under-funded any leg.
+    Each NFT singleton ref present anywhere must appear EXACTLY once on each
+    side — an NFT in the inputs with no output would be silently BURNED
+    (consensus permits burning; only this builder stands in the way), and an
+    NFT in the outputs with no input is an unbacked ref the chain rejects.
+    There is no NFT change (a singleton is indivisible). The remaining photon
+    surplus, less ``fee``, becomes an RXD change output. Raises if the taker
+    under-funded any leg.
     """
     if fee < 0:
         raise ValidationError("fee must be non-negative")
 
     ft_in: dict[GlyphRef, int] = {}
+    nft_in: dict[GlyphRef, int] = {}
     total_in = 0
     for inp in tx.inputs:
         if inp.satoshis is None or inp.locking_script is None:
@@ -330,14 +351,31 @@ def _balance_and_add_change(tx: Transaction, taker_change_pkh: bytes, fee: int) 
         asset = _asset_of(inp.satoshis, inp.locking_script.serialize())
         if asset.kind == "ft":
             ft_in[asset.ref] = ft_in.get(asset.ref, 0) + asset.amount  # type: ignore[index]
+        elif asset.kind == "nft":
+            nft_in[asset.ref] = nft_in.get(asset.ref, 0) + 1  # type: ignore[index]
 
     ft_out: dict[GlyphRef, int] = {}
+    nft_out: dict[GlyphRef, int] = {}
     total_out = 0
     for out in tx.outputs:
         total_out += out.satoshis
         asset = _asset_of(out.satoshis, out.locking_script.serialize())
         if asset.kind == "ft":
             ft_out[asset.ref] = ft_out.get(asset.ref, 0) + asset.amount  # type: ignore[index]
+        elif asset.kind == "nft":
+            nft_out[asset.ref] = nft_out.get(asset.ref, 0) + 1  # type: ignore[index]
+
+    # NFT singleton discipline: exactly one in, exactly one out, per ref.
+    for ref in set(nft_in) | set(nft_out):
+        in_c, out_c = nft_in.get(ref, 0), nft_out.get(ref, 0)
+        if in_c == 0:
+            raise ValidationError(f"funding lacks the NFT singleton {ref.txid}:{ref.vout}")
+        if out_c == 0:
+            raise ValidationError(
+                f"transaction would BURN the NFT singleton {ref.txid}:{ref.vout} (no output carries it)"
+            )
+        if in_c > 1 or out_c > 1:
+            raise ValidationError(f"the NFT singleton {ref.txid}:{ref.vout} appears more than once on a side")
 
     # FT change: per ref, emit the surplus back to the taker; a deficit is
     # under-funding (and the chain would reject the unbacked output ref).
