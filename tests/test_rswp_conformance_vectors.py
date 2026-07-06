@@ -85,3 +85,14 @@ def test_reassembly_vector_locks_decoder_tail_rule() -> None:
     order = decode_rswp_order(bytes.fromhex(vec["frame_hex"]))
     assert order.price_terms.hex() == vec["expected"]["price_terms_hex"]
     assert order.signature.hex() == vec["expected"]["signature_hex"]
+
+
+@pytest.mark.parametrize("vec", _VECTORS["covenant_vectors"]["vectors"], ids=lambda v: v["id"])
+def test_covenant_vectors_re_derive_and_parse_back(vec: dict) -> None:
+    from pyrxd.swap.rswp import build_refund_covenant_script, parse_refund_covenant
+
+    spk = build_refund_covenant_script(bytes.fromhex(vec["owner_pkh_hex"]), int(vec["expiry_height"]))
+    assert spk.hex() == vec["covenant_spk_hex"]
+    inner, expiry = parse_refund_covenant(bytes.fromhex(vec["covenant_spk_hex"]))
+    assert expiry == int(vec["expiry_height"])
+    assert inner[3:23].hex() == vec["owner_pkh_hex"]
