@@ -1,7 +1,7 @@
 {
   "schema": "radiant-rswp-order/1",
   "builder": "pyrxd.swap.rswp: encode_rswp_order / encode_price_terms / swap_token_id",
-  "provenance": "REFERENCE vectors produced by pyrxd, byte-derived from the canonical sources (Radiant-Core src/index/swapindex.cpp parser; Photonic-Wallet buildSwapAdvertisementScript / encodeScriptNum / assetToSwapTokenId / MultiTxOutV1). No vector here is yet anchored to a live mainnet order \u2014 a mainnet golden vector is a tracked follow-up. The reassembly vector reproduces the Radiant-Core functional test (test/functional/feature_swap.py). The v3 frame follows the Photonic Phase-2 layout (expiry_height 4-byte LE after wantTokenID, flag 0x02); NOTE the deployed Radiant-Core swapindex parses v2 only and drops v3 adverts.",
+  "provenance": "REFERENCE vectors produced by pyrxd, byte-derived from the canonical sources (Radiant-Core src/index/swapindex.cpp parser; Photonic-Wallet buildSwapAdvertisementScript / encodeScriptNum / assetToSwapTokenId / MultiTxOutV1). The reassembly vector reproduces the Radiant-Core functional test (test/functional/feature_swap.py). The v3 frame follows the Photonic Phase-2 layout (expiry_height 4-byte LE after wantTokenID, flag 0x02); NOTE the deployed Radiant-Core swapindex parses v2 only and drops v3 adverts. UPDATE 2026-07-05: `mainnet_anchors` below adds one BYTE-anchored live-mainnet vector (raw advert OP_RETURN bytes, independently located on-chain and decode-diffed field-for-field against the public swapindex RPC row, plus a live signature-validity check) \u2014 see that section's own `description`/`queried` fields for the full provenance trail. All REFERENCE vectors above remain pyrxd-derived, not mainnet-sourced.",
   "notes": {
     "signature_field": "opaque at the frame layer (the full maker scriptSig); vectors use a fixed synthetic value",
     "token_id": "sha256 of the 36-byte little-endian ref (txid reversed || vout LE); display orientation in this file; pushed byte-reversed on chain",
@@ -213,5 +213,58 @@
         "covenant_spk_hex": "6376a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac6704ff64cd1db17576a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac68"
       }
     ]
-  }
+  },
+  "mainnet_anchors": [
+    {
+      "id": "mainnet-2026-07-05-rxd-for-glyph-2b568707",
+      "kind": "mainnet_anchor",
+      "source": "mainnet:675e0607166c9618758f844b10b363fdbea185c3a5a1ef7b3c0377877409698e:0",
+      "description": "A real Radiant mainnet RSWP v2 advertisement (RXD offered, offered_type=0, wanting a Glyph token whose token id starts 2b568707). The raw OP_RETURN bytes below were independently located on chain (not supplied by any RPC) by scanning block 437389 for an output whose script starts with the RSWP magic push 6a04525357, then verifying byte-for-byte that decode_rswp_order(advert_script_hex) reproduces every field of a real getswaphistory row served by the public https://swap.radiantcore.org swapindex endpoint (a CORS-proxied Radiant-Core node run with -swapindex=1, JSON-RPC POST, no auth — the same endpoint the Photonic wallet uses). This is a BYTE anchor, not just a field anchor: the frame hex below is the actual on-chain push data, and every one of version/flags/offered_type/terms_type/tokenid/want_tokenid/utxo.txid/utxo.vout/price_terms/signature decoded from it matched the RPC row exactly (see rpc_cross_check_row). The maker's ECDSA signature was additionally verified to cryptographically validate against the reconstructed SIGHASH_SINGLE|ANYONECANPAY|FORKID preimage (prevout = the offered UTXO's own funding tx, fetched by getrawtransaction and txid-checked; output[0] = the decoded demanded output) via pyrxd.swap.partial._verify_owner_signature called directly — the higher-level rswp_order_to_swap_offer/verify_offer_signature bridge cannot be used end-to-end for this particular order because its demanded output is a Glyph covenant script that pyrxd.swap.partial._asset_of does not classify (an existing take-path scope gap for covenant-style demands, unrelated to wire-format correctness).",
+      "queried_2026-07-05": [
+        "getswapindexinfo() -> {enabled: true, current_height: 444065, total_orders: 5, open_orders: 1, history_orders: 4, history_blocks: 10000}",
+        "getopenorders('00'*32, 20, 0) -> [] (no order currently open offering native RXD)",
+        "getopenordersbywant('00'*32, 20, 0) -> [] (no order currently open wanting native RXD)",
+        "getswaphistory('00'*32, 20, 0) -> 4 rows (all offered_type=0 / RXD-offered); this vector is the row whose want_tokenid starts 2b568707",
+        "getswaphistorybywant('00'*32, 20, 0) -> []",
+        "getrawtransaction('35d17de932391310352ba71b02ddf3668759ce5979da2ddb3c40526fc419f250', 1) -> the offered UTXO's own funding tx: 2 plain P2PKH outputs (10 RXD exact-amount + change), no OP_RETURN, confirmations=6677, blockhash 000000000000008a41091f4313be87a54d61c399d4f58a266713a8cf53e8dcb2",
+        "getblock('000000000000008a41091f4313be87a54d61c399d4f58a266713a8cf53e8dcb2', 1) -> height 437389 (exact height of the offered-UTXO funding tx, used to locate the advert)",
+        "getblock('000000000000008a41091f4313be87a54d61c399d4f58a266713a8cf53e8dcb2', 2) -> 27 txs scanned for an output script starting 6a04525357; exactly one match, at vout 0 of tx 675e0607166c9618758f844b10b363fdbea185c3a5a1ef7b3c0377877409698e — this is advert_script_hex below",
+        "getrawtransaction('35d17de932391310352ba71b02ddf3668759ce5979da2ddb3c40526fc419f250', 0) -> raw hex reused (not re-fetched) to build the SIGHASH_SINGLE|ANYONECANPAY|FORKID preimage for the signature-validity check",
+        "getblockhash(439123) and getblock(<that hash>, 2) -> also probed (439123 is the getswaphistory row's own block_height field) but that block contains NO RSWP OP_RETURN matching this order — see caveat"
+      ],
+      "caveat": "The getswaphistory row's 'block_height' field (439123) is NOT the height of the advert transaction — the advert was independently found in block 437389 (confirmed via getblock verbosity 1 on the offered UTXO's own blockhash), and block 439123 contains no matching RSWP OP_RETURN at all. 'block_height' appears to record some other index event (plausibly when the order was classified as history, i.e. when the offered UTXO was spent/settled) rather than the advert's own confirmation height. Do not treat the RPC row's block_height as an advert-tx locator; this vector's source line cites the height that was actually verified.",
+      "advert_script_hex": "6a045253575001020101010001012000000000000000000000000000000000000000000000000000000000000000002089d5805d5cbf92140b5e71825861d31494f606ec11ff4739faf667d70787562b2050f219c46f52403cdb2dda7959ce598766f3dd021ba72b3510133932e97dd135004d8d010100e1f50500000000fd810114350e8568a5d5a9eaf5e62acb48ff8b586d159cb6bd7576009c637c5279adc0eb517f777ba988d07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aa76e6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9d76e37ce49c776776519c637c5279adc0eb517f777ba988d07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aa76e6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9d76e47ce3a17767529dc0eb517f7714000000000000000000000000000000000000000088247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee00000000d9529dd07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aae6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9c68684c6b483045022100ffd5fd94ed66c787b39e556ae3610ec96d748b94582ce74d0823c4197ccfaad602204f378f8ed31d0a3c5f01d43eac788b10a1e7a8576c1b92dd6dd02a7da939cb27c321025421bb4175689463cbe511c01bb8bdb545455b1c044bf63fdf79ec1a6e2104c8",
+      "expected": {
+        "version": 2,
+        "flags": 1,
+        "offered_type": 0,
+        "terms_type": 1,
+        "token_id_display_hex": "0000000000000000000000000000000000000000000000000000000000000000",
+        "want_token_id_display_hex": "2b568707d767f6fa3947ff11ec06f69414d3615882715e0b1492bf5c5d80d589",
+        "offered_txid": "35d17de932391310352ba71b02ddf3668759ce5979da2ddb3c40526fc419f250",
+        "offered_vout": 0,
+        "price_terms_hex": "0100e1f50500000000fd810114350e8568a5d5a9eaf5e62acb48ff8b586d159cb6bd7576009c637c5279adc0eb517f777ba988d07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aa76e6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9d76e37ce49c776776519c637c5279adc0eb517f777ba988d07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aa76e6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9d76e47ce3a17767529dc0eb517f7714000000000000000000000000000000000000000088247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee00000000d9529dd07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aae6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9c6868",
+        "signature_hex": "483045022100ffd5fd94ed66c787b39e556ae3610ec96d748b94582ce74d0823c4197ccfaad602204f378f8ed31d0a3c5f01d43eac788b10a1e7a8576c1b92dd6dd02a7da939cb27c321025421bb4175689463cbe511c01bb8bdb545455b1c044bf63fdf79ec1a6e2104c8",
+        "demanded_output_value": 100000000,
+        "demanded_output_script_hex": "14350e8568a5d5a9eaf5e62acb48ff8b586d159cb6bd7576009c637c5279adc0eb517f777ba988d07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aa76e6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9d76e37ce49c776776519c637c5279adc0eb517f777ba988d07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aa76e6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9d76e47ce3a17767529dc0eb517f7714000000000000000000000000000000000000000088247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee00000000d9529dd07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aae6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9c6868"
+      },
+      "rpc_cross_check_row": {
+        "endpoint": "https://swap.radiantcore.org",
+        "method": "getswaphistory",
+        "params": ["0000000000000000000000000000000000000000000000000000000000000000", 20, 0],
+        "row": {
+          "version": 2,
+          "flags": 1,
+          "offered_type": 0,
+          "terms_type": 1,
+          "tokenid": "0000000000000000000000000000000000000000000000000000000000000000",
+          "want_tokenid": "2b568707d767f6fa3947ff11ec06f69414d3615882715e0b1492bf5c5d80d589",
+          "utxo": {"txid": "35d17de932391310352ba71b02ddf3668759ce5979da2ddb3c40526fc419f250", "vout": 0},
+          "price_terms": "0100e1f50500000000fd810114350e8568a5d5a9eaf5e62acb48ff8b586d159cb6bd7576009c637c5279adc0eb517f777ba988d07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aa76e6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9d76e37ce49c776776519c637c5279adc0eb517f777ba988d07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aa76e6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9d76e47ce3a17767529dc0eb517f7714000000000000000000000000000000000000000088247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee00000000d9529dd07392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee0100000075c0e9aae6247392d158e4b8a856c355c0a411e7863d54601ab08fa615eb202048ad1ef6f6ee01000000de9c6868",
+          "signature": "483045022100ffd5fd94ed66c787b39e556ae3610ec96d748b94582ce74d0823c4197ccfaad602204f378f8ed31d0a3c5f01d43eac788b10a1e7a8576c1b92dd6dd02a7da939cb27c321025421bb4175689463cbe511c01bb8bdb545455b1c044bf63fdf79ec1a6e2104c8",
+          "block_height": 439123
+        }
+      }
+    }
+  ]
 }
