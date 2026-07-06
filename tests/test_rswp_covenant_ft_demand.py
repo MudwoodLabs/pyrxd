@@ -203,3 +203,38 @@ def test_tampered_ft_demand_amount_breaks_signature() -> None:
             taker,
             [FundingInput(_ft_src(tk_pkh, _FT_REF, 50), 0, taker), FundingInput(_rxd_src(tk_pkh, 5_000), 0, taker)],
         )
+
+
+def test_tampered_ft_demand_script_breaks_signature() -> None:
+    """Red-team hunt 3 hardening: tamper the demanded SCRIPT (ref and owner),
+    keeping the advert metadata CONSISTENT so only the signature can object —
+    SINGLE's hash_outputs + Radiant's hashOutputHashes both bind the script."""
+    from pyrxd.gravity.swap_order import DemandedOutput, RswpOrder
+    from pyrxd.swap.rswp import encode_price_terms, swap_token_id
+
+    maker, _ = _key()
+    taker, tk_pkh = _key()
+    _, attacker_pkh = _key()
+    reservation, order = _posted_ft_demand(maker)
+
+    def _mutate_with(script: bytes, want_id: bytes | None) -> RswpOrder:
+        outs = [DemandedOutput(value=order.demanded_outputs[0].value, script=script)]
+        fields = {f: getattr(order, f) for f in RswpOrder.__dataclass_fields__}
+        fields.update(price_terms=encode_price_terms(outs), demanded_outputs=outs)
+        if want_id is not None:
+            fields["want_token_id"] = want_id
+        return RswpOrder(**fields)
+
+    funding = [FundingInput(_ft_src(tk_pkh, _OTHER_REF, 50), 0, taker), FundingInput(_rxd_src(tk_pkh, 5_000), 0, taker)]
+    # (a) different REF, want_token_id updated to match it (metadata coherent).
+    swapped_ref = build_ft_locking_script(Hex20(order.demanded_outputs[0].script[3:23]), _OTHER_REF)
+    with pytest.raises(ValidationError, match="signature does NOT validate"):
+        _take(_mutate_with(swapped_ref, swap_token_id(_OTHER_REF)[::-1]), reservation, taker, funding)
+    # (b) same ref, different OWNER pkh (metadata untouched and still coherent).
+    funding_same_ref = [
+        FundingInput(_ft_src(tk_pkh, _FT_REF, 50), 0, taker),
+        FundingInput(_rxd_src(tk_pkh, 5_000), 0, taker),
+    ]
+    swapped_owner = build_ft_locking_script(Hex20(attacker_pkh), _FT_REF)
+    with pytest.raises(ValidationError, match="signature does NOT validate"):
+        _take(_mutate_with(swapped_owner, None), reservation, taker, funding_same_ref)
