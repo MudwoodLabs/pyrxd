@@ -59,7 +59,30 @@ from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.transaction.transaction import Transaction
 
 # Secret substrings forbidden in any cross-host / journal file (mirrors eth_swap_two_host._assert_public_only).
-_SECRET_FORBIDDEN_KEYS = ("preimage", "p_hex", "wif", "secret", "privkey", "mnemonic", "seed")
+# NB: "priv" (not "privkey") so `private_key` / `priv_key` / `privatekey` all match despite the separator;
+# "key" is deliberately broad (an audit journal names things like txid/height/state/address, never a bare
+# "key"), and "xprv"/"entropy" cover BIP32 extended-private-keys and raw seed entropy.
+_SECRET_FORBIDDEN_KEYS = (
+    "preimage",
+    "p_hex",
+    "wif",
+    "secret",
+    "priv",
+    "key",
+    "mnemonic",
+    "seed",
+    "xprv",
+    "entropy",
+)
+
+
+def _looks_like_wif(s: str) -> bool:
+    """A base58 WIF-shaped VALUE (51-52 chars, 5/K/L lead). Distinguishable from a 64-hex txid — so scanning
+    values for this can't false-positive on the txids that legitimately fill every journal. (A raw 32-byte
+    preimage is 64-hex, SHAPE-identical to a txid, so it is caught by key name, not by value scan.)"""
+    if not (51 <= len(s) <= 52) or s[0] not in "5KL":
+        return False
+    return all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in s)
 
 
 def _sha256(b: bytes) -> bytes:
@@ -228,10 +251,21 @@ def assert_no_secrets(doc: object, *, what: str) -> None:
     elif isinstance(doc, list):
         for v in doc:
             assert_no_secrets(v, what=what)
+    elif isinstance(doc, str) and _looks_like_wif(doc):
+        # Value-level catch for a WIF stored under an innocuous key ({"note": "L5..."}). Limited to the
+        # WIF shape on purpose — a raw preimage/txid is 64-hex and indistinguishable, so those are guarded
+        # by key name above rather than by a value scan that would reject every legitimate txid.
+        raise ValueError(f"{what}: a WIF-shaped secret value is present in a public file")
 
 
 def assert_independent_endpoints(verifier_urls: list[str], party_endpoints: tuple[str, ...]) -> None:
-    """The verifier's corroboration sources MUST be hosts neither party ran (else it's not independent)."""
+    """The verifier's corroboration sources MUST be hosts neither party ran (else it's not independent).
+
+    NB: `party_endpoints` is manifest-supplied (party-declared), so an adversary who runs the "third-party"
+    source can simply omit it here and this hostname check passes. This guard is therefore ADVISORY — the
+    auditor should still pass endpoints they trust out-of-band. The load-bearing anti-substitution defenses
+    are the per-tx txid pins (BTC/RXD: bytes hash to the cited txid) plus the covenant-outpoint provenance
+    checks, which hold even against a source that lies about which txid is which."""
     party_hosts = {(urlparse(e).hostname or e).lower() for e in party_endpoints}
     for u in verifier_urls:
         host = (urlparse(u).hostname or u).lower()
@@ -269,6 +303,22 @@ def _output(raw_tx: bytes, vout: int) -> tuple[bytes, int]:
     return out.locking_script.serialize(), int(out.satoshis)
 
 
+def _rxd_input_prevouts(raw_tx: bytes) -> set[bytes]:
+    """The set of prevout-le-bytes (reversed txid || vout LE) consumed by a NON-segwit RXD tx.
+
+    Parallels ``btc_input_outpoints_from_raw`` for the asset leg so ``verify_asset_leg`` can prove a
+    cited spend actually consumes the covenant funding outpoint (provenance) — not merely that some tx
+    happens to pay a party's holder address. Matches ``Outpoint.prevout_le_bytes`` exactly.
+    """
+    tx = Transaction.from_hex(raw_tx)
+    if tx is None:
+        raise ValueError("could not parse RXD transaction bytes")
+    out: set[bytes] = set()
+    for inp in tx.inputs:
+        out.add(bytes.fromhex(inp.source_txid)[::-1] + int(inp.source_output_index).to_bytes(4, "little"))
+    return out
+
+
 def _output_spk(raw_tx: bytes, vout: int) -> bytes:
     return _output(raw_tx, vout)[0]
 
@@ -279,43 +329,56 @@ def verify_asset_leg(
     """Re-derive the RXD asset-leg disposition from the funding + spending tx bytes.
 
     1. The funding output MUST pay the re-derived covenant SPK (the asset was locked to the legit covenant).
-    2. The spend's output[0] decides who got the asset: taker_holder => taker claimed; maker_holder => refund.
+    2. The spend MUST consume the covenant funding outpoint (provenance) — the cited spend txid is
+       journal-supplied, so a party cannot pass off an unrelated tx that merely pays a holder address.
+    3. The spend's output[0] decides who got the asset: taker_holder => taker claimed; maker_holder => refund.
+
+    Because the funding SPK is proven to be the real hashlock covenant (check 1) and the confirmed spend
+    is proven to consume it (check 2), a confirmed spend to the taker holder necessarily satisfied the
+    hashlock branch at consensus (revealing p) — so re-scraping p here would be redundant, and is
+    unreliable anyway (RXD is non-segwit; p rides in the scriptSig, not a witness). Provenance + value
+    conservation (checks 2 & 4) are the load-bearing gates.
     """
     notes: list[str] = []
     funded_spk, taker_holder, maker_holder = rxd_expected_scripts(m)
     observed_funding_spk, observed_funding_value = _output(covenant_funding_tx, m.covenant_funding.vout)
-    # Independent value-integrity: the covenant must carry the agreed amount (catches an under-funded asset —
-    # a partial-fill / short-change attack the SPK check alone would miss).
-    if observed_funding_value != m.rxd_amount:
-        notes.append(
-            f"WARNING: covenant funded with {observed_funding_value} photons, agreed {m.rxd_amount} "
-            f"(value mismatch — asset under/over-funded)"
-        )
     if observed_funding_spk != funded_spk:
         return AssetLeg.ANOMALOUS, [
             "covenant funding output SPK does NOT match the covenant re-derived from public terms — "
             "the asset was not locked to the agreed covenant (PARAMS_MISMATCH territory)"
         ]
-    notes.append("covenant funding SPK == re-derived covenant (asset locked to the agreed covenant)")
+    # Independent value-integrity: the covenant must carry the agreed amount (catches an under-funded asset —
+    # a partial-fill / short-change attack the SPK check alone would miss). Verdict-affecting: a genuine run
+    # conserves value, so a mismatch is ANOMALOUS, never a note-only warning that a PASS could sail past.
+    if observed_funding_value != m.rxd_amount:
+        return AssetLeg.ANOMALOUS, [
+            f"covenant funded with {observed_funding_value} photons, agreed {m.rxd_amount} "
+            f"(value mismatch — asset under/over-funded)"
+        ]
+    notes.append("covenant funding SPK == re-derived covenant, carrying the agreed amount")
     if covenant_spend_tx is None:
         return AssetLeg.PENDING, [*notes, "covenant outpoint still unspent"]
+    # PROVENANCE (the fix for the false-PASS free-option attack): the cited spend must actually consume the
+    # covenant funding outpoint. Mirrors verify_counter_leg_btc's prevout check, which the asset leg lacked.
+    if m.covenant_funding.prevout_le_bytes() not in _rxd_input_prevouts(covenant_spend_tx):
+        return AssetLeg.ANOMALOUS, [
+            *notes,
+            "the cited covenant-spend does NOT consume the covenant funding outpoint "
+            "(wrong/decoy tx — provenance fail)",
+        ]
+    notes.append("covenant-spend consumes the covenant funding outpoint")
     spent_to, paid_value = _output(covenant_spend_tx, 0)
-    # Independent made-whole (asset side): the covenant pays its full carrier amount to the holder (the miner
-    # fee comes from a separate fee input, never the carrier), so the payout must equal the funded amount.
+    # Made-whole (asset side): the covenant pays its full carrier amount to the holder (the miner fee comes
+    # from a separate fee input, never the carrier), so a short-changed payout is a value-integrity failure,
+    # not a cosmetic note — ANOMALOUS.
     if paid_value != observed_funding_value:
-        notes.append(
-            f"WARNING: covenant spend paid {paid_value} photons, carrier was {observed_funding_value} "
-            f"(value not conserved — short-changed payout)"
-        )
+        return AssetLeg.ANOMALOUS, [
+            *notes,
+            f"covenant spend paid {paid_value} photons, carrier was {observed_funding_value} "
+            f"(value not conserved — short-changed payout)",
+        ]
     if spent_to == taker_holder:
-        # claim path: the covenant claim scriptSig reveals p; confirm it hashes to H.
-        try:
-            p = scrape_secret(covenant_spend_tx, bytes.fromhex(m.h_hex))
-            if _sha256(p) == bytes.fromhex(m.h_hex):
-                notes.append("asset claim reveals a 32-byte p with sha256(p)==H")
-        except Exception:
-            notes.append("WARNING: asset paid the taker holder but p was not scrapeable from the spend")
-        return AssetLeg.TAKER_CLAIMED, notes
+        return AssetLeg.TAKER_CLAIMED, [*notes, "covenant spent to the taker holder (hashlock claim)"]
     if spent_to == maker_holder:
         return AssetLeg.MAKER_REFUNDED, [*notes, "covenant spent to the maker holder (CSV refund)"]
     return AssetLeg.ANOMALOUS, [*notes, "covenant spent to NEITHER the taker nor maker holder script"]
@@ -546,7 +609,14 @@ class _RxdFetcher:
 
     async def raw_tx(self, txid: str) -> bytes:
         async with self._client as c:
-            return bytes(await c.get_transaction(txid))
+            raw = bytes(await c.get_transaction(txid))
+        # Pin the returned bytes to the requested txid (txid == hash(tx) for RXD). Without this a hostile
+        # or MITM'd ElectrumX could substitute arbitrary bytes and steer the asset-leg verdict — the sibling
+        # BTC/resolve fetchers already do this; the RXD path was the lone outlier.
+        parsed = Transaction.from_hex(raw)
+        if parsed is None or parsed.txid() != str(txid):
+            raise ValueError(f"RXD endpoint returned bytes whose hash != requested txid ({txid})")
+        return raw
 
     async def confirm_height(self, txid: str) -> int | None:
         """The block height a tx confirmed at (tip - confirmations + 1), or None if unconfirmed/unknown."""
@@ -589,8 +659,17 @@ async def _fetch_for_live(m: RunManifest, cited: dict, btc_url: str, rxd_url: st
         cov_fund = await rxd.raw_tx(m.covenant_funding.txid)
         spend_txid = cited.get("covenant_spend_txid")
         cov_spend = await rxd.raw_tx(spend_txid) if spend_txid else None
-        if spend_txid:  # for the lucky-pass margin grade
+        if spend_txid:
             asset_claim_height = await rxd.confirm_height(spend_txid)
+            # Confirmation gate: a cited spend must be MINED. An unconfirmed (or unknown) tx was never
+            # validated by consensus, so its scriptSig could be junk that doesn't actually satisfy the
+            # covenant — treating it as a settled disposition would let a fabricated tx that merely names
+            # the covenant outpoint pass the provenance check. Mirrors the BTC leg's min_confirmations=1.
+            if asset_claim_height is None:
+                raise ValueError(
+                    f"cited covenant-spend {spend_txid} is not confirmed on the independent RXD source — "
+                    "refusing to score an unconfirmed disposition"
+                )
     finally:
         await rxd.close()
 
@@ -629,8 +708,11 @@ def run_verify(
     else:
         tx, rcpt = counter_obj if counter_obj else (None, None)
         counter, counter_p_sha256, counter_notes = verify_counter_leg_eth(m, tx, rcpt)
-    # Leg verifiers return sha256(p) (== manifest H, proven in-leg), never raw p; the
-    # asset leg additionally reports no digest at all (its H-match is note-level only).
+    # Leg verifiers return sha256(p) (== manifest H, proven in-leg), never raw p. The asset-side digest is
+    # INTENTIONALLY None: both legs are already bound to the single manifest H (the covenant SPK is rebuilt
+    # from H, and the counter claim is checked sha256(p)==H), so equal-H both-complete ⟺ same preimage by
+    # collision resistance — the asset_p_sha256 arg is a redundant belt-and-suspenders slot. Do NOT wire a
+    # raw scraped preimage back in here (it re-introduces the CodeQL clear-text-secret taint of PR #273).
     res = atomicity_verdict(m, asset, counter, None, counter_p_sha256)
     grade, slack, margin_note = margin_grade(m, asset, counter, asset_claim_height)
     res.checks = {
@@ -716,9 +798,13 @@ def _self_check() -> int:
     # 4) RXD asset-leg disposition against a synthetic covenant funding + claim tx.
     funded_spk, taker_holder, maker_holder = rxd_expected_scripts(m)
 
-    def _rxd_tx(out_spk: bytes, value: int = 1000) -> bytes:
+    # All self-check manifests lock the asset at this covenant outpoint; a genuine claim/refund CONSUMES it
+    # (provenance). `spend_covenant=False` builds a "decoy" that pays a holder address without spending the
+    # covenant — the exact free-option forgery the provenance gate now rejects.
+    def _rxd_tx(out_spk: bytes, value: int = 1000, *, spend_covenant: bool = True) -> bytes:
+        src_txid = "ab" * 32 if spend_covenant else "00" * 32
         tx = _Tx()
-        tx.add_input(TransactionInput(source_txid="00" * 32, source_output_index=0, unlocking_script=Script(b"")))
+        tx.add_input(TransactionInput(source_txid=src_txid, source_output_index=0, unlocking_script=Script(b"")))
         tx.add_output(TransactionOutput(locking_script=Script(out_spk), satoshis=value))
         return tx.serialize()
 
@@ -737,11 +823,15 @@ def _self_check() -> int:
     check("RXD spent to neither holder -> ANOMALOUS", a4 is AssetLeg.ANOMALOUS)
     a5, _ = verify_asset_leg(m, _rxd_tx(b"\x00\x14" + b"\xff" * 20), claim)  # funding to a wrong SPK
     check("RXD wrong funding SPK -> ANOMALOUS", a5 is AssetLeg.ANOMALOUS)
-    # value integrity: under-funded covenant + short-changed payout each raise a warning note.
-    _, a6_notes = verify_asset_leg(m, _rxd_tx(funded_spk, value=500), claim)
-    check("RXD under-funded covenant -> value warning", any("under/over-funded" in n for n in a6_notes))
-    _, a7_notes = verify_asset_leg(m, _rxd_tx(funded_spk, 1000), _rxd_tx(taker_holder, 900))
-    check("RXD short-changed payout -> value warning", any("value not conserved" in n for n in a7_notes))
+    # PROVENANCE regression (the free-option false-PASS): a decoy paying the taker holder that does NOT
+    # spend the covenant must be ANOMALOUS, not TAKER_CLAIMED.
+    a_decoy, _ = verify_asset_leg(m, funding, _rxd_tx(taker_holder, spend_covenant=False))
+    check("RXD decoy (pays taker, doesn't spend covenant) -> ANOMALOUS", a_decoy is AssetLeg.ANOMALOUS)
+    # value integrity is verdict-affecting: under-funded covenant + short-changed payout each ANOMALOUS.
+    a6, _ = verify_asset_leg(m, _rxd_tx(funded_spk, value=500), claim)
+    check("RXD under-funded covenant -> ANOMALOUS", a6 is AssetLeg.ANOMALOUS)
+    a7, _ = verify_asset_leg(m, _rxd_tx(funded_spk, 1000), _rxd_tx(taker_holder, 900))
+    check("RXD short-changed payout -> ANOMALOUS", a7 is AssetLeg.ANOMALOUS)
 
     # 5) full happy-path through verify_from_bytes — manifest H must equal sha256(stub p) so the BTC claim
     #    actually reveals a matching preimage (counter -> MAKER_CLAIMED) and the asset goes to the taker.
