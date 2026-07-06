@@ -55,6 +55,7 @@ from .covenant import (
     prepare_covenant_offer,
     take_covenant_order,
 )
+from .node_rpc import NodeRpcSource
 from .orders import (
     RswpOrderPost,
     build_advert_tx,
@@ -65,6 +66,7 @@ from .orders import (
     take_rswp_order,
     verify_offer_signature,
 )
+from .quoting import LadderQuote, PriceFeed, implied_price, quote_ladder, quote_legs
 from .wire import (
     CONTRACT_TYPE_FT,
     CONTRACT_TYPE_NFT,
@@ -95,8 +97,11 @@ __all__ = [
     "RXD_TOKEN_ID",
     "BookEntry",
     "DemandedOutput",
+    "LadderQuote",
+    "NodeRpcSource",
     "OrderbookClient",
     "OrderbookSource",
+    "PriceFeed",
     "RswpOrder",
     "RswpOrderPost",
     "build_advert_tx",
@@ -109,12 +114,15 @@ __all__ = [
     "decode_rswp_order",
     "encode_price_terms",
     "encode_rswp_order",
+    "implied_price",
     "is_refund_covenant",
     "parse_price_terms",
     "parse_price_terms_lenient",
     "parse_refund_covenant",
     "prepare_covenant_offer",
     "prepare_offered_utxo",
+    "quote_ladder",
+    "quote_legs",
     "rswp_order_to_swap_offer",
     "swap_token_id",
     "take_covenant_order",
