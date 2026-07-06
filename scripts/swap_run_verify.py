@@ -326,7 +326,8 @@ def verify_counter_leg_btc(
 ) -> tuple[CounterLeg, bytes | None, list[str]]:
     """Re-derive the BTC counter-leg disposition. The claim leaf reveals p (and pays the maker); the refund
     leaf is a CSV spend back to the taker. We distinguish by whether p is scrapeable, and we require the
-    spend to actually consume OUR HTLC funding outpoint (provenance)."""
+    spend to actually consume OUR HTLC funding outpoint (provenance). The middle return element is the
+    DIGEST sha256(p) (== manifest H, proven here) — raw preimage bytes never leave this function."""
     notes: list[str] = []
     if counter_spend_tx is None:
         return CounterLeg.PENDING, None, ["counter (BTC HTLC) outpoint still unspent"]
@@ -342,7 +343,15 @@ def verify_counter_leg_btc(
     try:
         p = scrape_secret(counter_spend_tx, bytes.fromhex(m.h_hex))
         if _sha256(p) == bytes.fromhex(m.h_hex):
-            return CounterLeg.MAKER_CLAIMED, p, [*notes, "counter claim reveals p with sha256(p)==H -> maker claimed"]
+            # Return the DIGEST-level fact only: at this point sha256(p) == the manifest H,
+            # so H itself is the digest. Raw preimage bytes never leave the leg verifiers
+            # (CodeQL py/clear-text-logging-sensitive-data on PR #273 — the taint path is
+            # broken at the source side, not just filtered at the sink).
+            return (
+                CounterLeg.MAKER_CLAIMED,
+                bytes.fromhex(m.h_hex),
+                [*notes, "counter claim reveals p with sha256(p)==H -> maker claimed"],
+            )
     except Exception:
         pass
     # No valid p in the witness + it spends our outpoint => the CSV refund leaf (back to the taker).
@@ -408,9 +417,11 @@ def verify_counter_leg_eth(
         for lg in our_logs:
             blob = b"".join(_hb(t) for t in (lg.get("topics") or [])) + _hb(lg.get("data"))
             if p in blob:
+                # Digest-level fact only (sha256(p) == H was enforced by recover_secret);
+                # raw p stays local to this verifier — see the BTC leg note.
                 return (
                     CounterLeg.MAKER_CLAIMED,
-                    p,
+                    H,
                     [*notes, "our HTLC emitted Claimed(p) with sha256(p)==H -> maker claimed"],
                 )
         return CounterLeg.ANOMALOUS, None, [*notes, "p not bound to an our-contract log (provenance fail)"]
@@ -423,8 +434,8 @@ def atomicity_verdict(
     m: RunManifest,
     asset: AssetLeg,
     counter: CounterLeg,
-    asset_p: bytes | None,
-    counter_p: bytes | None,
+    asset_p_sha256: bytes | None,
+    counter_p_sha256: bytes | None,
 ) -> VerifyResult:
     """The global truth table. PASS iff both-complete XOR both-unwind; any mixed corner is a one-sided loss."""
     res = VerifyResult(verdict=Verdict.PENDING, asset_leg=asset, counter_leg=counter)
@@ -442,8 +453,11 @@ def atomicity_verdict(
     both_unwind = asset is AssetLeg.MAKER_REFUNDED and counter is CounterLeg.TAKER_REFUNDED
 
     if both_complete:
-        # p-link: the SAME secret links the two claims (atomicity in action).
-        if asset_p is not None and counter_p is not None and asset_p != counter_p:
+        # p-link at DIGEST level: the SAME secret links the two claims (atomicity in
+        # action). Each leg verifier only reports CLAIMED after proving sha256(p) == the
+        # manifest H, so equal digests <=> equal preimages (collision resistance); raw p
+        # never reaches this function.
+        if asset_p_sha256 is not None and counter_p_sha256 is not None and asset_p_sha256 != counter_p_sha256:
             res.verdict = Verdict.ANOMALOUS
             res.reasons.append("both legs claimed but with DIFFERENT preimages — broken H-linkage")
             return res
@@ -611,12 +625,13 @@ def run_verify(
     `asset_claim_height` (the RXD covenant-spend confirm height) drives the lucky-pass margin grade."""
     asset, asset_notes = verify_asset_leg(m, covenant_funding_tx, covenant_spend_tx)
     if m.counter_chain == "btc":
-        counter, counter_p, counter_notes = verify_counter_leg_btc(m, counter_obj)
+        counter, counter_p_sha256, counter_notes = verify_counter_leg_btc(m, counter_obj)
     else:
         tx, rcpt = counter_obj if counter_obj else (None, None)
-        counter, counter_p, counter_notes = verify_counter_leg_eth(m, tx, rcpt)
-    asset_p = None  # we don't return the scraped asset p (avoid handling a secret); H-match already checked
-    res = atomicity_verdict(m, asset, counter, asset_p, counter_p)
+        counter, counter_p_sha256, counter_notes = verify_counter_leg_eth(m, tx, rcpt)
+    # Leg verifiers return sha256(p) (== manifest H, proven in-leg), never raw p; the
+    # asset leg additionally reports no digest at all (its H-match is note-level only).
+    res = atomicity_verdict(m, asset, counter, None, counter_p_sha256)
     grade, slack, margin_note = margin_grade(m, asset, counter, asset_claim_height)
     res.checks = {
         "counter_chain": m.counter_chain,
@@ -790,8 +805,11 @@ def _self_check() -> int:
         "logs": [{"address": "0x" + "ee" * 20, "topics": [_ETH_CLAIMED_TOPIC], "data": "0x" + p_eth.hex()}],
     }
 
-    e1, e1p, _ = verify_counter_leg_eth(m_eth, claim_tx, claim_rcpt)
-    check("ETH claim -> MAKER_CLAIMED (p recovered)", e1 is CounterLeg.MAKER_CLAIMED and e1p == p_eth)
+    e1, e1_digest, _ = verify_counter_leg_eth(m_eth, claim_tx, claim_rcpt)
+    check(
+        "ETH claim -> MAKER_CLAIMED (digest == H, raw p not returned)",
+        e1 is CounterLeg.MAKER_CLAIMED and e1_digest == _sha256(p_eth),
+    )
     e2, _, _ = verify_counter_leg_eth(m_eth, {"input": "0x962e097e"}, refund_rcpt)
     check("ETH refund -> TAKER_REFUNDED", e2 is CounterLeg.TAKER_REFUNDED)
     e3, _, _ = verify_counter_leg_eth(m_eth, claim_tx, reverted_rcpt)
