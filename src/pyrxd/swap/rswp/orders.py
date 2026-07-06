@@ -68,7 +68,13 @@ def _contract_type_of(asset: Asset) -> int:
 
 
 def _pushed_token_id(asset: Asset) -> bytes:
-    """The 32 token-id bytes as they appear ON CHAIN (display digest reversed; zeros for RXD)."""
+    """The 32 token-id bytes as they appear ON CHAIN (display digest reversed; zeros for RXD).
+
+    NB: the id is REF-ONLY — an FT and an NFT sharing a genesis ref would hash
+    identically (unreachable on chain: one genesis commits to one refType).
+    Kind is therefore discriminated by the bridge's offered_type-vs-reality
+    check, never by token_id; do not lean on token_id as a kind signal.
+    """
     tid = swap_token_id(asset.ref)
     return tid if tid == RXD_TOKEN_ID else tid[::-1]
 

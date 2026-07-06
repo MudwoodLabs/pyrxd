@@ -144,6 +144,19 @@ def _estimate_fee(ctx: CliContext, n_inputs: int, n_outputs: int, override: int 
     return max(_MIN_FEE_PHOTONS, (ctx.fee_rate * size + 999) // 1000)
 
 
+def _cancel_needs_fee_funding(give_kind: str, give_value: int, fee: int) -> bool:
+    """Whether a cancel self-spend needs separate plain-RXD fee funding.
+
+    Token cancels ALWAYS do: an FT cancel conserves the full token amount and
+    an NFT cancel returns the full carrier (a singleton has no change path), so
+    neither leaves photons for the fee. (Red-team MEDIUM on the NFT slice: the
+    original FT-only condition made `swap cancel` — the advertised hard
+    revocation — abort for every non-dust NFT.) An RXD cancel funds the fee
+    from its own value unless that value cannot cover it.
+    """
+    return give_kind in ("ft", "nft") or give_value <= fee
+
+
 # --------------------------------------------------------------------------- wallet plumbing
 
 
@@ -418,9 +431,8 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
             funds = await _collect_funds(ctx, client)
             maker_key = funds.key_for_pkh(_owner_pkh_of(give_out.locking_script.serialize()))
             fee = _estimate_fee(ctx, 2, 2, fee_override)
-            # FT cancels conserve the full token amount, so the fee needs plain-RXD funding.
             funding = None
-            if give_asset.kind == "ft" or give_out.satoshis <= fee:
+            if _cancel_needs_fee_funding(give_asset.kind, give_out.satoshis, fee):
                 funding = await _rxd_funding(client, funds, fee, exclude=(give_txid, give_vout))
             cancel = build_cancel_tx(
                 offered_source_tx=give_source,
