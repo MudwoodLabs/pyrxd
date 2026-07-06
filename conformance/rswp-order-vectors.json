@@ -177,5 +177,41 @@
       "price_terms_hex": "0102030405060708090a",
       "signature_hex": "04050607"
     }
+  },
+  "covenant_vectors": {
+    "description": "RSWP v3 timelocked-refund covenant SPK (RXD / P2PKH-inner only): 63 <inner> 67 <expiry minimal-CScriptNum push> b1 75 <inner> 68. Selectors appended after <sig> <pubkey>: 0x51 SWAP, 0x00 REFUND (refund also needs nSequence=0xFFFFFFFE and nLockTime>=expiry). Byte-compatible with Photonic swapRefundCovenant.ts; consensus-proven by tests/test_rswp_v3_regtest_e2e.py.",
+    "builder": "pyrxd.swap.rswp.build_refund_covenant_script(owner_pkh, expiry_height)",
+    "vectors": [
+      {
+        "id": "rxd-expiry-1",
+        "owner_pkh_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expiry_height": 1,
+        "covenant_spk_hex": "6376a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac670101b17576a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac68"
+      },
+      {
+        "id": "rxd-expiry-127",
+        "owner_pkh_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expiry_height": 127,
+        "covenant_spk_hex": "6376a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac67017fb17576a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac68"
+      },
+      {
+        "id": "rxd-expiry-128",
+        "owner_pkh_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expiry_height": 128,
+        "covenant_spk_hex": "6376a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac67028000b17576a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac68"
+      },
+      {
+        "id": "rxd-expiry-840000",
+        "owner_pkh_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expiry_height": 840000,
+        "covenant_spk_hex": "6376a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac670340d10cb17576a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac68"
+      },
+      {
+        "id": "rxd-expiry-499999999",
+        "owner_pkh_hex": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "expiry_height": 499999999,
+        "covenant_spk_hex": "6376a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac6704ff64cd1db17576a914aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa88ac68"
+      }
+    ]
   }
 }

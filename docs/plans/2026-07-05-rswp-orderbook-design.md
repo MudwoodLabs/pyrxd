@@ -277,3 +277,45 @@ red-teamed PR, RXD-only first; must address the refund-selector txid malleabilit
 the post-expiry fill race documented above), CLI (`swap post/fill/orders`),
 market-maker quoting toolkit, maker lifecycle tracker, RXinDexer `swap.*` source
 adapter, NFT take/post, atheris harness for the encoder.
+
+## Addendum (2026-07-05, the v3 follow-up PR): shipped v3 write-side scope
+
+The v3 write side shipped as its own PR per D13, RXD-only, in
+`pyrxd/swap/rswp/covenant.py`: covenant build/parse byte-compatible with the
+Photonic layout (`63 <inner> 67 <expiryPush> b1 75 <inner> 68`; strict
+both-ways minimality on the expiry push; differing-branch forgeries parse as
+not-a-covenant), `prepare_covenant_offer` / `create_covenant_order` (v3 advert;
+the signature push stays the bare two-push scriptSig — the TAKER appends the
+`OP_1` selector, Photonic convention), `take_covenant_order` (requires
+`current_height`; refuses at `tip >= expiry`), `build_covenant_refund_tx`
+(`nLockTime=expiry`, `nSequence=0xFFFFFFFE`, `OP_0`) and
+`build_covenant_cancel_tx` (SWAP branch, any height). Consensus-proven on
+regtest: fill-before-expiry, refund-rejected-early, refund-at-expiry,
+cancel-before-expiry, and a DELIBERATE on-chain demonstration of the F3
+selector txid-malleability (track covenant refunds by OUTPOINT, never txid).
+The deployed swapindex drops v3 adverts — also asserted on regtest.
+
+**One deviation from the python-shape review's recommendation**, recorded
+here: instead of teaching `partial.py`'s classifiers to see through the
+covenant (option (a), a narrow seam), the v3 take is its own small completion
+path (option (b)). Rationale: with the RXD-only restriction there is NO token
+conservation to replicate — the completion is one arithmetic check — while
+option (a) would have changed the shared classifiers' behavior for every v2
+and private-envelope caller (e.g. a covenant UTXO advertised as v2 would have
+started classifying as plain RXD and produced consensus-invalid completions).
+Zero shared-code changes; the v2 bridge still refuses covenant-held gives
+exactly as before (regression-tested). The seam approach remains the right
+call IF FT-in-covenant ever becomes possible — revisit then.
+
+**Red-team result (pre-PR gate, security-sentinel):** NO fund-safety blocker.
+The parser-ambiguity hunt came back clean (structural argument + a
+200,000-covenant fuzz with adversarially seeded `0x67`/`0xb1 0x75` bytes in
+the pkh: zero mis-parses); scriptCode/selector/preimage handling verified
+sound; all v2↔v3 tool interactions fail closed. Four Low findings, ALL
+applied with regression tests: L1 the v3 take now enforces the same
+metadata-vs-reality + MAX_MONEY bounds as the v2 bridge (its parity claim is
+now literally true); L2 covenant funding requires the full P2PKH shape incl.
+the `88ac` suffix; L3 negative-fee guards on take/refund/cancel; L4 the
+FT-demand post/take asymmetry is documented at the API (postable —
+protocol-valid for covenant-aware external takers — but not yet fillable by
+pyrxd; the maker's refund is unaffected).

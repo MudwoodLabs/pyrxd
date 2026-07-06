@@ -44,6 +44,17 @@ from ...gravity.swap_order import (
     parse_price_terms_lenient,
 )
 from .book import BookEntry, OrderbookClient, OrderbookSource
+from .covenant import (
+    REFUND_SEQUENCE,
+    build_covenant_cancel_tx,
+    build_covenant_refund_tx,
+    build_refund_covenant_script,
+    create_covenant_order,
+    is_refund_covenant,
+    parse_refund_covenant,
+    prepare_covenant_offer,
+    take_covenant_order,
+)
 from .node_rpc import NodeRpcSource
 from .orders import (
     RswpOrderPost,
@@ -79,6 +90,7 @@ __all__ = [
     "CONTRACT_TYPE_VAULT",
     "FLAG_HAS_EXPIRY",
     "FLAG_HAS_WANT",
+    "REFUND_SEQUENCE",
     "RSWP_MAGIC",
     "RSWP_VERSION_V2",
     "RSWP_VERSION_V3",
@@ -94,18 +106,26 @@ __all__ = [
     "RswpOrderPost",
     "build_advert_tx",
     "build_cancel_tx",
+    "build_covenant_cancel_tx",
+    "build_covenant_refund_tx",
+    "build_refund_covenant_script",
+    "create_covenant_order",
     "create_rswp_order",
     "decode_rswp_order",
     "encode_price_terms",
     "encode_rswp_order",
     "implied_price",
+    "is_refund_covenant",
     "parse_price_terms",
     "parse_price_terms_lenient",
+    "parse_refund_covenant",
+    "prepare_covenant_offer",
     "prepare_offered_utxo",
     "quote_ladder",
     "quote_legs",
     "rswp_order_to_swap_offer",
     "swap_token_id",
+    "take_covenant_order",
     "take_rswp_order",
     "verify_offer_signature",
 ]
