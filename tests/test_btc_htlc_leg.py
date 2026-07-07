@@ -487,13 +487,29 @@ async def test_claim_broadcasts_with_maker_key_and_reveals_preimage():
 
 async def test_refund_signs_with_taker_key_and_broadcasts():
     taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
-    terms = _terms(maker_kp=maker, taker_kp=taker)
+    terms = _terms(maker_kp=maker, taker_kp=taker)  # t_btc = 144 blocks
     bc = FakeBroadcaster()
-    leg = _leg(taker_kp=taker, maker_kp=maker, broadcaster=bc)
+    # Mature: the funding utxo is buried >= t_btc (144) deep, so the CSV refund is final.
+    leg = _leg(taker_kp=taker, maker_kp=maker, broadcaster=bc, reader=FakeFundingReader(claim_confs=144))
     htlc = leg._htlc(terms)
     locator = htlc.with_funding(t.BtcOutpoint("cd" * 32, 0), terms.btc_sats)
     await leg.refund(locator, terms.t_btc)
     assert len(bc.raw_seen) == 1  # broadcast the CSV refund
+
+
+async def test_refund_rejects_premature_csv():
+    """P3 maturity self-check: a BTC CSV refund one block short of t_btc maturity must fail closed with
+    a clear "needs N, has M" message and NOT broadcast — the leg refuses a non-final refund rather than
+    relying on node rejection under deadline pressure."""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    terms = _terms(maker_kp=maker, taker_kp=taker)  # t_btc = 144 → mature at funding confs >= 144
+    bc = FakeBroadcaster()
+    leg = _leg(taker_kp=taker, maker_kp=maker, broadcaster=bc, reader=FakeFundingReader(claim_confs=143))
+    htlc = leg._htlc(terms)
+    locator = htlc.with_funding(t.BtcOutpoint("cd" * 32, 0), terms.btc_sats)
+    with pytest.raises(ValidationError, match="not yet mature: needs 144 confirmations, has 143"):
+        await leg.refund(locator, terms.t_btc)
+    assert bc.raw_seen == [], "no non-final refund may be broadcast before CSV maturity"
 
 
 # --------------------------------------------------------------------------- broadcaster idempotency
