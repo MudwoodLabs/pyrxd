@@ -47,6 +47,7 @@ from pyrxd.gravity.swap_coordinator import (
 from pyrxd.gravity.swap_state import (
     NegotiatedTerms,
     SwapRecord,
+    SwapRole,
     SwapState,
 )
 from pyrxd.security.errors import NetworkError, ValidationError
@@ -260,7 +261,9 @@ def _terms(*, variant: str = "ft", t_btc_blocks: int = 144, t_rxd_blocks: int = 
     )
 
 
-def _coordinator(*, terms, btc_leg=None, radiant_leg=None, indexer=None, seen_store=None, policy=None, window=6):
+def _coordinator(
+    *, terms, btc_leg=None, radiant_leg=None, indexer=None, seen_store=None, policy=None, window=6, role=None
+):
     rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
     return SwapCoordinator(
         record=rec,
@@ -271,6 +274,7 @@ def _coordinator(*, terms, btc_leg=None, radiant_leg=None, indexer=None, seen_st
         config=CoordinatorConfig(
             margin_policy=policy or MarginPolicy.estimated(),
             maker_stall_safety_window_blocks=window,
+            role=role,
         ),
     )
 
@@ -790,16 +794,62 @@ async def test_e2e_maker_stalls_taker_refunds_asset():
     await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
     assert coord.record.state is SwapState.BOTH_LOCKED
 
-    # Maker stalls: hasn't claimed and we are within N of t_RXD maturity.
-    # locked at 1000; maturity = 1072; act at >= 1066.
+    # Maker stalls: hasn't claimed and the covenant's CSV refund is now MATURE.
+    # locked at 1000; maturity = 1072; the CSV refund can only be MINED at >= 1072
+    # (the trigger fires N earlier at 1066, but the P3 maturity pre-check refuses to
+    # broadcast a non-final refund — see test_maker_stall_refuses_premature_refund).
     rec = await coord.maybe_refund_asset_on_maker_stall(
-        now_block_height=1066, asset_locked_at_height=1000, maker_has_claimed_btc=False
+        now_block_height=1072, asset_locked_at_height=1000, maker_has_claimed_btc=False
     )
     assert rec.state is SwapState.ASSET_REFUNDED_TAKER_ACTS
     assert rxd.refunded  # the covenant CSV refund was broadcast — it pays the MAKER, not the taker.
     # NOTE: this exercises the helper's mechanics only. The CSV refund pays the maker (maker owns the
     # covenant), so this is NOT a taker recovery — the watchtower routes a taker to mutual_refund
     # instead (FSM finding #2, 2026-06-09). See test_xchain_swap_regtest_e2e for the taker-loss proof.
+
+
+async def test_maker_stall_refuses_premature_refund():
+    """P3 maturity pre-check: the trigger fires at t_rxd-N ("stop waiting"), but the CSV refund can
+    only be mined at maturity. Between trigger-fire and maturity the method must REFUSE to broadcast a
+    non-final refund (rather than emit a tx a real node rejects), with an exact "matures at N, now M"
+    message a block-based poller can act on — and it must NOT broadcast or advance the FSM."""
+    _p, h = generate_secret()
+    terms = _terms(hashlock=h, t_rxd_blocks=72)
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, radiant_leg=rxd, window=6)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+    # locked at 1000; maturity = 1072; trigger fires at 1066 but the covenant is 6 blocks short of
+    # CSV maturity — refuse to broadcast.
+    with pytest.raises(ValidationError, match="not yet mature.*matures at height 1072, now 1066"):
+        await coord.maybe_refund_asset_on_maker_stall(
+            now_block_height=1066, asset_locked_at_height=1000, maker_has_claimed_btc=False
+        )
+    assert not rxd.refunded, "no non-final refund may be broadcast before CSV maturity"
+    assert coord.record.state is SwapState.BOTH_LOCKED, "the FSM must stay BOTH_LOCKED (retryable)"
+
+
+async def test_maker_stall_forbidden_for_taker_role():
+    """P3 role guard: the asset-only CSV refund pays the MAKER, so a TAKER that runs it strands itself.
+    A TAKER-role coordinator must be PHYSICALLY unable to call it (fail closed in code, not merely in a
+    docstring) — even at a mature height where a role-less coordinator would broadcast."""
+    _p, h = generate_secret()
+    terms = _terms(hashlock=h, t_rxd_blocks=72)
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, radiant_leg=rxd, window=6, role=SwapRole.TAKER)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+    # Mature height (1072) — a role-less coordinator would broadcast here; the taker role must not.
+    with pytest.raises(ValidationError, match="forbidden for a TAKER-role coordinator"):
+        await coord.maybe_refund_asset_on_maker_stall(
+            now_block_height=1072, asset_locked_at_height=1000, maker_has_claimed_btc=False
+        )
+    assert not rxd.refunded, "a taker-role coordinator must never broadcast the asset-only refund"
+    assert coord.record.state is SwapState.BOTH_LOCKED
 
 
 async def test_maker_stall_noop_before_window():
