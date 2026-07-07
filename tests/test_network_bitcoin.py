@@ -21,6 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pyrxd.network.bitcoin import (
+    BitcoinCoreFundingReader,
     BlockstreamSource,
     MempoolSpaceSource,
     MultiSourceBtcDataSource,
@@ -775,3 +776,81 @@ class TestChooseFundingReader:
     def test_negative_value_rejected(self):
         with pytest.raises(ValidationError):
             choose_funding_reader(-1, single=object(), multi=object())
+
+
+# ─────────────────────────────────────────────── BitcoinCoreFundingReader
+
+
+class _FakeBtcRpc:
+    """A fake async bitcoind ``rpc(method, params)`` returning a canned getrawtransaction result."""
+
+    def __init__(self, getrawtransaction=None):
+        self._grt = getrawtransaction
+        self.calls: list = []
+
+    async def __call__(self, method, params=None):
+        self.calls.append((method, list(params or [])))
+        if method == "getrawtransaction":
+            if isinstance(self._grt, Exception):
+                raise self._grt
+            return self._grt
+        raise AssertionError(f"unexpected rpc method {method}")
+
+
+_TXID = "ab" * 32
+
+
+class TestBitcoinCoreFundingReader:
+    async def test_confirmations_confirmed(self):
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc({"confirmations": 5, "vout": []}))
+        assert await reader.confirmations(_TXID) == 5
+
+    async def test_confirmations_unconfirmed_returns_zero(self):
+        # No 'confirmations' field == in the mempool -> 0, so the reorg gate fails closed.
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc({"vout": []}))
+        assert await reader.confirmations(_TXID) == 0
+
+    async def test_confirmations_non_dict_raises(self):
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc("not-a-dict"))
+        with pytest.raises(NetworkError, match="verbose object"):
+            await reader.confirmations(_TXID)
+
+    async def test_read_output_amount_sats_exact_decimal_conversion(self):
+        # BTC -> sats must be EXACT: 0.001 -> 100_000 (a naive float *1e8 lands on 99999.999… -> truncates).
+        grt = {"confirmations": 6, "vout": [{"value": 0.001}, {"value": 1.23456789}]}
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc(grt))
+        assert await reader.read_output_amount_sats(_TXID, 0, min_confirmations=1) == 100_000
+        assert await reader.read_output_amount_sats(_TXID, 1, min_confirmations=1) == 123_456_789
+
+    async def test_read_output_amount_sats_insufficient_confs(self):
+        grt = {"confirmations": 2, "vout": [{"value": 0.001}]}
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc(grt))
+        with pytest.raises(InsufficientConfirmationsError):
+            await reader.read_output_amount_sats(_TXID, 0, min_confirmations=6)
+
+    async def test_read_output_amount_sats_unconfirmed_fails_closed(self):
+        # Unconfirmed (confs=0) against any positive min_confirmations -> fail closed.
+        grt = {"vout": [{"value": 0.001}]}
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc(grt))
+        with pytest.raises(InsufficientConfirmationsError):
+            await reader.read_output_amount_sats(_TXID, 0, min_confirmations=1)
+
+    async def test_read_output_amount_sats_bad_vout_raises(self):
+        grt = {"confirmations": 6, "vout": [{"value": 0.001}]}
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc(grt))
+        with pytest.raises(NetworkError, match="output value"):
+            await reader.read_output_amount_sats(_TXID, 5, min_confirmations=1)  # vout index out of range
+
+    async def test_rejects_non_callable_rpc(self):
+        with pytest.raises(ValidationError, match="async callable"):
+            BitcoinCoreFundingReader("not-callable")
+
+    async def test_txid_of_delegates_to_btc_txid_from_raw(self):
+        from pyrxd.btc_wallet.taproot import btc_txid_from_raw
+
+        # A minimal structurally-valid non-segwit tx (1 in, 1 out): txid_of must match the pure serializer.
+        raw = bytes.fromhex(
+            "0100000001" + "00" * 32 + "00000000" + "00" + "ffffffff" + "01" + "00" * 8 + "00" + "00000000"
+        )
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc())
+        assert await reader.txid_of(raw) == btc_txid_from_raw(raw)
