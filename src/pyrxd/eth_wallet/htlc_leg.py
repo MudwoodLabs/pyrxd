@@ -364,8 +364,23 @@ class EthHtlcContractLeg:
 
     async def refund(self, locator: EthHtlcLocator) -> str:
         """Taker: call refund() after timeout; returns the tx hash. Taker-unilateral
-        (no maker signature; the contract pays the immutable refundee)."""
+        (no maker signature; the contract pays the immutable refundee).
+
+        P3 maturity pre-check: the contract's ``refund()`` reverts until
+        ``block.timestamp >= timeout``. We read the latest block timestamp and refuse a premature
+        refund with a clear "matures at unix T, now S" message rather than burning gas on a guaranteed
+        revert. Unlike the BTC/RXD CSV legs, a premature ETH refund is a deterministic on-chain revert
+        (never a silent mempool strand), so this is a gas/clarity guard — the contract stays the source
+        of truth for the deadline.
+        """
         await self._rpc.assert_chain()
+        now_ts = int((await self._rpc.w3.eth.get_block("latest"))["timestamp"])
+        if now_ts < int(locator.timeout):
+            raise ValidationError(
+                f"ETH HTLC refund is not yet mature: matures at unix {int(locator.timeout)}, now {now_ts} "
+                f"({int(locator.timeout) - now_ts}s to go) — refusing to submit a refund the contract "
+                "would revert (gas/clarity guard; the contract enforces the deadline regardless)."
+            )
         c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
         built = await c.functions.refund().build_transaction(await self._base_tx(gas=100_000))
         return await self._sign_and_send(built)
