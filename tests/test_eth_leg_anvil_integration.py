@@ -207,6 +207,10 @@ async def test_refund_after_timeout_and_claim_blocked_when_expired(anvil_url):
         locator = await taker.fund(
             hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=timeout, amount_wei=_AMOUNT_WEI
         )
+        # P3 gas pre-check: a refund BEFORE the timeout is refused (the contract would revert anyway),
+        # so no gas is burned on a guaranteed-revert tx.
+        with pytest.raises(ValidationError, match="not yet mature"):
+            await taker.refund(locator)
         # Fast-forward past the timeout.
         await _advance_time(rpc, 200)
         # A claim is now expired — the contract reverts; the leg's eth_call preflight catches it.
