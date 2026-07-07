@@ -75,3 +75,86 @@ def test_independence_guard_rejects_shared_endpoint():
 
     with pytest.raises(ValueError):
         v.assert_independent_endpoints(["https://x.example/api"], ("https://x.example/api",))
+
+
+# ─────────────────── audit follow-ups: asset-leg provenance + value gates ───────────────────
+
+from pyrxd.script.script import Script
+from pyrxd.transaction.transaction import Transaction
+from pyrxd.transaction.transaction_input import TransactionInput
+from pyrxd.transaction.transaction_output import TransactionOutput
+
+
+def _rxd_tx(out_spk: bytes, value: int = 1000, spend_txid: str = "ab" * 32) -> bytes:
+    """A synthetic RXD tx whose single input spends spend_txid:0 and whose output[0] is out_spk."""
+    tx = Transaction()
+    tx.add_input(TransactionInput(source_txid=spend_txid, source_output_index=0, unlocking_script=Script(b"")))
+    tx.add_output(TransactionOutput(locking_script=Script(out_spk), satoshis=value))
+    return tx.serialize()
+
+
+def test_asset_leg_rejects_decoy_that_does_not_spend_the_covenant():
+    """Audit C1 (CRITICAL): the free-option false-PASS. A spend paying the taker holder but NOT consuming
+    the covenant outpoint must be ANOMALOUS, not TAKER_CLAIMED — otherwise a genuine one-sided loss (maker
+    refunds the asset AND claims the counter) scores PASS by citing a decoy txid."""
+    m = _m()  # covenant_funding = ab*32:0
+    funded, taker_holder, _maker_holder = v.rxd_expected_scripts(m)
+    funding = _rxd_tx(funded)
+    honest_claim = _rxd_tx(taker_holder, spend_txid="ab" * 32)  # spends the covenant
+    decoy = _rxd_tx(taker_holder, spend_txid="00" * 32)  # pays taker, does NOT spend the covenant
+
+    assert v.verify_asset_leg(m, funding, honest_claim)[0] is v.AssetLeg.TAKER_CLAIMED
+    assert v.verify_asset_leg(m, funding, decoy)[0] is v.AssetLeg.ANOMALOUS
+
+    # End-to-end: the decoy can no longer flip a real one-sided loss to PASS.
+    p = b"\xab" * 32
+    m2 = v.RunManifest(
+        swap_id="t2",
+        asset_variant="rxd",
+        counter_chain="btc",
+        honest_party="taker",
+        h_hex=v._sha256(p).hex(),
+        taker_pkh_hex="22" * 20,
+        maker_pkh_hex="33" * 20,
+        rxd_amount=1000,
+        refund_csv=48,
+        covenant_funding=v.Outpoint("ab" * 32, 0),
+        counter_funding=v.Outpoint("cd" * 32, 0),
+    )
+    f2, t2_holder, m2_holder = v.rxd_expected_scripts(m2)
+    btc_claim = v._btc_claim_stub(m2, p)  # maker claimed the counter (revealed p)
+    real_refund = _rxd_tx(m2_holder, spend_txid="ab" * 32)  # asset really refunded to the maker
+    assert v.run_verify(m2, _rxd_tx(f2), real_refund, btc_claim).verdict is v.Verdict.FAIL_ONE_SIDED
+    decoy_claim = _rxd_tx(t2_holder, spend_txid="00" * 32)  # decoy paying the taker
+    assert v.run_verify(m2, _rxd_tx(f2), decoy_claim, btc_claim).verdict is not v.Verdict.PASS
+
+
+def test_asset_leg_value_integrity_is_verdict_affecting():
+    """Audit F-B3: under-funded covenant and short-changed payout are ANOMALOUS, not note-only warnings."""
+    m = _m()
+    funded, taker_holder, _ = v.rxd_expected_scripts(m)  # m.rxd_amount == 1000
+    claim = _rxd_tx(taker_holder, spend_txid="ab" * 32)
+    assert v.verify_asset_leg(m, _rxd_tx(funded, value=500), claim)[0] is v.AssetLeg.ANOMALOUS  # under-funded
+    short = _rxd_tx(taker_holder, value=900, spend_txid="ab" * 32)
+    assert v.verify_asset_leg(m, _rxd_tx(funded, 1000), short)[0] is v.AssetLeg.ANOMALOUS  # short-changed
+
+
+def test_assert_no_secrets_hardening():
+    """Audit MED-2: named private-key fields and WIF-shaped values are caught; a clean journal full of
+    64-hex txids is NOT a false positive (a raw preimage is shape-identical to a txid, so it is guarded by
+    key name, never by a hex value scan)."""
+    import pytest
+
+    for doc in (
+        {"maker_private_key": "x"},
+        {"xprv": "x"},
+        {"account_priv_key": "x"},
+        {"note": "5Kb8kLf9zgWQnogidDA76MzPL6TsZZY36hWXMssSzNydYXYB9KF"},
+    ):
+        with pytest.raises(ValueError):
+            v.assert_no_secrets(doc, what="journal")
+    # clean journal: 64-hex txids everywhere must pass.
+    v.assert_no_secrets(
+        {"steps": [{"txid": "cd" * 32, "spend_txid": "ab" * 32, "state": "COMPLETED", "height": 444076}]},
+        what="journal",
+    )
