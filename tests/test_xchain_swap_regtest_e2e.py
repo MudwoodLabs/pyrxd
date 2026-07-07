@@ -646,6 +646,39 @@ def _scan_value_for_spk(nodes: _Nodes, spk: bytes) -> int:
     return round(sum(u["amount"] for u in res.get("unspents", [])) * 1e8)
 
 
+class TestCovenantRefundCsvMaturity:
+    """P3 leg-level maturity self-check calibrated against REAL consensus: RadiantCovenantLeg.refund_asset
+    must refuse a non-final CSV refund below t_rxd maturity (a real node would reject it) and succeed at
+    exactly t_rxd confirmations. Proves the leg's `confs >= t_rxd.value` boundary is neither too strict
+    (would waste a block) nor too lax (would emit a tx the node rejects — the failure mode P3 exists to
+    avoid). Drives the leg directly to isolate the leg check from the coordinator-side height gate."""
+
+    async def test_refund_asset_boundary_matches_consensus(self, nodes):
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=5)
+        leg = s.coord.radiant_leg
+        rec = s.coord.record
+        cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
+
+        async def _confs() -> int:
+            return await leg.chain_io.confirmations(cov_txid)
+
+        # Mine to exactly t_rxd - 1 confirmations (one short of CSV maturity).
+        while await _confs() < s.t_rxd.value - 1:
+            nodes.rxd_mine(1)
+        assert await _confs() == s.t_rxd.value - 1
+        # The leg refuses to broadcast a non-final refund — fail-closed, no tx emitted.
+        with pytest.raises(NetworkError, match=f"needs {s.t_rxd.value} confirmations, has {s.t_rxd.value - 1}"):
+            await leg.refund_asset(rec)
+
+        # One more block → exactly t_rxd confirmations → the CSV refund is final; the node accepts it.
+        nodes.rxd_mine(1)
+        assert await _confs() == s.t_rxd.value
+        txid = await leg.refund_asset(rec)  # broadcasts; a too-lax boundary would raise here (node reject)
+        assert len(txid) == 64
+        nodes.rxd_mine(1)
+        assert nodes.rxd("gettxout", cov_txid, "0") in (None, ""), "the mature CSV refund spent the covenant"
+
+
 class TestMakerStallAssetOnlyRefundIsTakerLoss:
     """ADVERSARIAL (FSM finding #2, 2026-06-09): on the BTC<->RXD runbook the asset-only
     proactive refund (:meth:`maybe_refund_asset_on_maker_stall`) is NOT a taker defense — its
