@@ -334,13 +334,38 @@ async def test_claim_asset_builds_and_broadcasts():
 
 
 async def test_refund_asset_builds_and_broadcasts():
-    terms = _rxd_terms(amount=100_000)
-    client = FakeClient(utxo_value=100_000, confirmations=3)
+    terms = _rxd_terms(amount=100_000)  # csv=6
+    # Mature: the covenant UTXO is buried >= t_rxd (6) deep, so the CSV refund is final.
+    client = FakeClient(utxo_value=100_000, confirmations=6)
     leg = _leg(client=client)
     rec = SwapRecord(state=SwapState.MAKER_STALLS, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
     txid = await leg.refund_asset(rec)
     assert txid == "ab" * 32
     assert len(client.broadcast_raw) == 1
+
+
+async def test_refund_asset_rejects_premature_csv():
+    """P3 maturity self-check: a CSV refund one block short of t_rxd maturity must fail closed with a
+    clear "needs N, has M" message and NOT broadcast — the leg refuses a non-final refund rather than
+    relying on node rejection under deadline pressure."""
+    terms = _rxd_terms(amount=100_000)  # csv=6 → mature at confirmations >= 6
+    client = FakeClient(utxo_value=100_000, confirmations=5)
+    leg = _leg(client=client)
+    rec = SwapRecord(state=SwapState.MAKER_STALLS, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    with pytest.raises(NetworkError, match="not yet mature: needs 6 confirmations, has 5"):
+        await leg.refund_asset(rec)
+    assert client.broadcast_raw == [], "no non-final refund may be broadcast before CSV maturity"
+
+
+async def test_claim_asset_not_gated_by_csv_maturity():
+    """The CLAIM branch has no CSV — claim_asset must remain spendable at shallow depth (only the
+    reorg min_confirmations gate applies), unaffected by the refund-side maturity check."""
+    terms = _rxd_terms(amount=100_000)  # csv=6
+    client = FakeClient(utxo_value=100_000, confirmations=1)  # far below csv, but >= min_confirmations
+    leg = _leg(client=client, min_confirmations=1)
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    txid = await leg.claim_asset(rec, _P)
+    assert txid == "ab" * 32
 
 
 async def test_spend_conf_gated():

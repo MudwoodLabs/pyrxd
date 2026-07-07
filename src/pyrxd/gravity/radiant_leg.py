@@ -513,10 +513,29 @@ class RadiantCovenantLeg:
         return await self._broadcast(tx)
 
     async def refund_asset(self, record: SwapRecord) -> str:
-        """Build + broadcast the MAKER's CSV refund spend. Returns the txid."""
+        """Build + broadcast the MAKER's CSV refund spend. Returns the txid.
+
+        P3 maturity self-check: the covenant's CSV refund leaf is only spendable once the covenant UTXO
+        is buried ``t_rxd`` deep (the BIP68 relative-block timelock the covenant was built with:
+        ``refund_csv=t_rxd.value``, mature at ``confirmations >= t_rxd.value``). Refuse a non-final
+        refund HERE rather than emit a tx a node rejects — under a deadline-pinning mempool "rely on
+        node rejection" is fragile — with an exact "needs N confirmations, has M" message a block-based
+        poller retries on. This guards EVERY ``refund_asset`` caller (``mutual_refund``,
+        ``maybe_refund_asset_on_maker_stall``) at the leg, complementing the coordinator-side height
+        check in ``maybe_refund_asset_on_maker_stall``. (The CLAIM branch has no CSV, so ``claim_asset``
+        is intentionally NOT gated this way.)
+        """
         if not isinstance(record, SwapRecord):
             raise ValidationError("record must be a SwapRecord")
         cov, outpoint, carrier = await self._resolve_covenant(record)
+        required_csv = record.terms.t_rxd.value
+        confs = await self.chain_io.confirmations(outpoint.split(":")[0])
+        if confs < required_csv:
+            raise NetworkError(
+                f"covenant CSV refund is not yet mature: needs {required_csv} confirmations, has {confs} "
+                f"({required_csv - confs} block(s) to go) — refusing to broadcast a non-final refund "
+                "(P3 maturity self-check); poll and retry at maturity rather than relying on node rejection."
+            )
         tx = build_htlc_refund_tx(
             covenant=cov,
             covenant_outpoint=outpoint,
