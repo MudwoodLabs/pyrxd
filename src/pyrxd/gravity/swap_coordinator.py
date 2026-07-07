@@ -62,6 +62,7 @@ from .swap_state import (
     NegotiatedTerms,
     SwapEvent,
     SwapRecord,
+    SwapRole,
     SwapState,
     advance,
 )
@@ -914,6 +915,12 @@ class CoordinatorConfig:
     # Min confirmations a gating credential's live UTXO must have (reorg safety),
     # when a swap sets terms.credential_ref. Mirrors min_ref_confirmations.
     min_credential_confirmations: int = 6
+    # Which side this coordinator drives (P3 role guard). ``None`` = the legacy
+    # single-operator flow where one coordinator drives both legs; a genuine
+    # two-party deployment sets the honest party's role so role-scoped recovery
+    # guards (e.g. the taker-stranding asset-only refund) fail closed in code, not
+    # merely in a docstring.
+    role: SwapRole | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.margin_policy, MarginPolicy):
@@ -931,6 +938,8 @@ class CoordinatorConfig:
             raise ValidationError("accept_nondurable_seen must be a bool")
         if not isinstance(self.accept_estimated_eth_margins, bool):
             raise ValidationError("accept_estimated_eth_margins must be a bool")
+        if self.role is not None and not isinstance(self.role, SwapRole):
+            raise ValidationError("role must be a SwapRole or None")
 
 
 def _serialized_step(method):
@@ -1846,6 +1855,18 @@ class SwapCoordinator:
         and ETH runbooks is :meth:`mutual_refund` (refunds BOTH legs after both timeouts). The
         watchtower (gravity.watch.decide) routes neither counter-chain's taker here.
         """
+        # ROLE GUARD (P3): this primitive's CSV refund pays the MAKER in BOTH directions, so a TAKER
+        # that runs it gifts the asset back AND destroys its only recourse (the claimable covenant)
+        # while its own counter-leg stays locked — the maker, still holding p, then takes both legs
+        # (proven by tests/test_xchain_swap_regtest_e2e.py::TestMakerStallAssetOnlyRefundIsTakerLoss).
+        # The docstring has always said "MAKER-side only"; a TAKER-role coordinator now cannot call it
+        # at all. The taker's stall recovery is mutual_refund (both legs unwind, no one-sided loss).
+        if self.config.role is SwapRole.TAKER:
+            raise ValidationError(
+                "maybe_refund_asset_on_maker_stall is a MAKER-side primitive and is forbidden for a "
+                "TAKER-role coordinator: its CSV refund pays the MAKER, so a taker that runs it strands "
+                "itself. The taker's maker-stall recovery is mutual_refund (P3 role guard)."
+            )
         if self.record.state is not SwapState.BOTH_LOCKED:
             raise ValidationError(
                 f"maybe_refund_asset_on_maker_stall only valid from BOTH_LOCKED, not {self.record.state.value}"
@@ -1860,6 +1881,23 @@ class SwapCoordinator:
         )
         if not trigger:
             return self.record
+        # MATURITY PRE-CHECK (P3): the trigger fires N blocks BEFORE t_rxd maturity ("stop waiting"),
+        # but the covenant's CSV refund cannot be MINED until it is buried t_rxd deep. Broadcasting at
+        # trigger time (t_rxd - N) is non-final — a real node rejects it, and under deadline pressure a
+        # hostile mempool (deadline-pinning) makes "rely on node rejection" fragile. Refuse to broadcast
+        # before maturity with an exact "matures at height N, now M" message; a block-based poller
+        # retries at maturity. (Uses the SAME normalize_to(BLOCKS) as the trigger so the two agree.)
+        rxd_blocks = self.record.terms.t_rxd.normalize_to(
+            TimeUnit.BLOCKS, block_interval_s=self.config.margin_policy.block_interval_s
+        ).value
+        maturity_height = asset_locked_at_height + rxd_blocks
+        if now_block_height < maturity_height:
+            raise ValidationError(
+                f"covenant CSV refund is not yet mature: it matures at height {maturity_height}, now "
+                f"{now_block_height} ({maturity_height - now_block_height} block(s) to go). Refusing to "
+                "broadcast a non-final refund (P3 maturity pre-check) — poll and retry at maturity "
+                "rather than relying on node rejection under deadline pressure."
+            )
         # BROADCAST-THEN-ADVANCE (red-team LOW): advancing to MAKER_STALLS before the on-chain
         # refund broadcast wedges the swap there (maybe_refund is only valid from BOTH_LOCKED) if
         # the broadcast transiently fails. Broadcast FIRST — a raising refund leaves the record at

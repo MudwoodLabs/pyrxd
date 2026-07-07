@@ -83,6 +83,21 @@ class SwapState(Enum):
     # ABORTED terminal (no asset, no BTC was ever locked → nothing to recover).
 
 
+class SwapRole(Enum):
+    """Which side of the swap a coordinator instance is driving.
+
+    Used for role-scoped safety guards: a recovery primitive that is safe for one
+    role can be self-destructive for the other (e.g. the asset-only CSV refund pays
+    the MAKER, so a TAKER that runs it strands itself). ``None`` (role unset)
+    preserves the legacy single-operator flows where one coordinator drives BOTH
+    legs; a genuine two-party deployment sets the honest party's role so the guard
+    can fail closed instead of relying on a docstring warning.
+    """
+
+    MAKER = "maker"
+    TAKER = "taker"
+
+
 # The diagram's ``--> [*]`` sinks. No transition may leave a terminal state.
 TERMINAL_STATES: frozenset[SwapState] = frozenset(
     {
