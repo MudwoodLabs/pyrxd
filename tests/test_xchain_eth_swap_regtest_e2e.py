@@ -303,7 +303,7 @@ def _fund_spending_ref(node, dest_spk: bytes, amount: int, ref_utxo: dict) -> st
     return str(txid)
 
 
-def _build(node, url, *, t_rxd_blocks, asset_variant="rxd"):
+def _build(node, url, *, t_rxd_blocks, asset_variant="rxd", role=None):
     """Build the covenant, the real legs, and the coordinator for an ETH↔(RXD|FT-glyph|NFT-glyph)
     swap. Returns (coord, cov, p_secret, eth_leg, rpc, ref_utxo) — ref_utxo is None for rxd, else
     the wallet UTXO that funds the singleton (the maker spends it to lock the asset)."""
@@ -416,6 +416,7 @@ def _build(node, url, *, t_rxd_blocks, asset_variant="rxd"):
             margin_policy=_eth_policy(),
             accept_nondurable_seen=True,
             accept_estimated_eth_margins=True,
+            role=role,
         ),
     )
     return coord, cov, p_secret, eth_leg, rpc, ref_utxo
