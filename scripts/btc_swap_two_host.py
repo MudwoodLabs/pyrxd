@@ -347,18 +347,32 @@ def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
     )
 
 
-def _maker_verify_btc_funding(btc_leg: BitcoinTaprootLeg, terms, locator) -> None:
-    """MAKER-side fail-closed gate (the BTC analog of the ETH maker_verify_counter_funding): the maker
-    re-derives the EXPECTED HTLC funding scriptPubKey from terms (its own claim key + the taker's
-    refund key + H + t_btc) and REFUSES to lock RXD unless the taker's published funding locator pays
-    exactly THAT scriptPubKey. A hostile taker that funds a different/absent HTLC is rejected here,
-    before any RXD is locked (else the maker locks its asset against a leg that cannot pay it)."""
-    expected_spk = btc_leg.derive_funding_scriptpubkey(terms)
-    if bytes(locator.scriptpubkey()) != bytes(expected_spk):
+async def _maker_verify_btc_funding(btc_leg: BitcoinTaprootLeg, terms, locator) -> int:
+    """MAKER-side fail-closed gate (the BTC analog of the ETH maker_verify_counter_funding): bind the
+    taker's advertised funding OUTPOINT to the expected HTLC ON-CHAIN — its actual scriptPubKey, value,
+    and unspent status read authoritatively from the node — NOT the self-reported locator fields.
+
+    Security (review finding): comparing the locator's OWN ``scriptpubkey()`` proves nothing — the
+    taker controls every field of the deserialized locator and can set a correct HTLC tree while
+    pointing ``funding_outpoint`` at any decoy output it owns. The maker MUST re-derive the expected
+    HTLC scriptPubKey from terms (its own claim key + the taker's refund key + H + t_btc) and assert
+    that the REAL output at ``funding_outpoint`` pays exactly that SPK, carries >= the agreed amount,
+    and is still unspent — else it locks its asset against an HTLC whose claim its own sighash cannot
+    satisfy (a griefing DoS: RXD locked, maker cannot claim BTC, never reveals p). Returns funded sats;
+    raises SystemExit on any mismatch, before any RXD is locked."""
+    expected_spk = bytes(btc_leg.derive_funding_scriptpubkey(terms))
+    onchain_spk, funded = await btc_leg.funding_reader.read_confirmed_unspent_output(
+        locator.funding_outpoint.txid, locator.funding_outpoint.vout
+    )
+    if bytes(onchain_spk) != expected_spk:
         raise SystemExit(
-            "REFUSING to lock RXD: the taker's BTC HTLC funding scriptPubKey does NOT match the HTLC "
-            "re-derived from the agreed terms — a hostile/mis-funded counter leg. Aborting."
+            "REFUSING to lock RXD: the REAL output at the taker's funding outpoint does NOT pay the BTC "
+            "HTLC re-derived from the agreed terms (on-chain scriptPubKey mismatch) — a hostile/mis-funded "
+            "counter leg. Aborting."
         )
+    if funded < terms.btc_sats:
+        raise SystemExit(f"REFUSING to lock RXD: BTC HTLC funded {funded} sats < agreed {terms.btc_sats}. Aborting.")
+    return funded
 
 
 # ---------------------------------------------------------------------------
@@ -657,19 +671,13 @@ async def maker_phase_lock_claim(args) -> None:
     try:
         # 1. Re-derive the expected HTLC SPK and REFUSE to lock RXD if the taker funded a different one.
         confirm(
-            "maker BTC-HTLC verify: re-derive the expected HTLC SPK from terms and check the taker's funding",
+            "maker BTC-HTLC verify: bind the taker's funding outpoint to the expected HTLC on-chain",
             auto_yes=args.yes,
         )
-        _maker_verify_btc_funding(btc_leg, terms, loc)
-        # Also conf-gate the funded amount on-chain (fail-closed on an under-funded / shallow HTLC).
-        funded = await btc_leg.funding_reader.read_output_amount_sats(
-            loc.funding_outpoint.txid, loc.funding_outpoint.vout, min_confirmations=1
+        funded = await _maker_verify_btc_funding(btc_leg, terms, loc)
+        print(
+            f"  -> verified: taker funded the agreed HTLC on-chain (SPK match) with {funded} sats (>= {terms.btc_sats})"
         )
-        if funded < terms.btc_sats:
-            raise SystemExit(
-                f"REFUSING to lock RXD: BTC HTLC funded {funded} sats < agreed {terms.btc_sats}. Aborting."
-            )
-        print(f"  -> verified: taker funded the agreed HTLC with {funded} sats (>= {terms.btc_sats})")
 
         # 2. Lock the RXD covenant (operator funds the SPK out-of-band), then re-validate -> BOTH_LOCKED.
         print(f"\n  Fund the RXD covenant SPK on regtest now (>= 1 conf):\n    {covenant_spk_hex}")

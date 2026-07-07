@@ -782,10 +782,11 @@ class TestChooseFundingReader:
 
 
 class _FakeBtcRpc:
-    """A fake async bitcoind ``rpc(method, params)`` returning a canned getrawtransaction result."""
+    """A fake async bitcoind ``rpc(method, params)`` returning canned getrawtransaction / gettxout."""
 
-    def __init__(self, getrawtransaction=None):
+    def __init__(self, getrawtransaction=None, gettxout=None):
         self._grt = getrawtransaction
+        self._gto = gettxout
         self.calls: list = []
 
     async def __call__(self, method, params=None):
@@ -794,6 +795,10 @@ class _FakeBtcRpc:
             if isinstance(self._grt, Exception):
                 raise self._grt
             return self._grt
+        if method == "gettxout":
+            if isinstance(self._gto, Exception):
+                raise self._gto
+            return self._gto
         raise AssertionError(f"unexpected rpc method {method}")
 
 
@@ -854,3 +859,30 @@ class TestBitcoinCoreFundingReader:
         )
         reader = BitcoinCoreFundingReader(_FakeBtcRpc())
         assert await reader.txid_of(raw) == btc_txid_from_raw(raw)
+
+    async def test_read_confirmed_unspent_output_binds_spk_and_value(self):
+        # gettxout of a confirmed UNSPENT output: returns (on-chain scriptPubKey bytes, value in sats).
+        gto = {"value": 0.001, "confirmations": 3, "scriptPubKey": {"hex": "51201234" + "00" * 30}}
+        fake = _FakeBtcRpc(gettxout=gto)
+        reader = BitcoinCoreFundingReader(fake)
+        spk, sats = await reader.read_confirmed_unspent_output(_TXID, 0)
+        assert spk == bytes.fromhex("51201234" + "00" * 30)
+        assert sats == 100_000
+        # gettxout was called with include_mempool=False (confirmed UTXO set only).
+        assert ("gettxout", [_TXID, 0, False]) in fake.calls
+
+    async def test_read_confirmed_unspent_output_spent_or_unknown_fails_closed(self):
+        # gettxout returns null for a spent / unconfirmed / unknown output -> fail closed.
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc(gettxout=None))
+        with pytest.raises(NetworkError, match="returned null"):
+            await reader.read_confirmed_unspent_output(_TXID, 0)
+
+    async def test_read_confirmed_unspent_output_missing_spk_fails_closed(self):
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc(gettxout={"value": 0.001, "scriptPubKey": {}}))
+        with pytest.raises(NetworkError, match="scriptPubKey"):
+            await reader.read_confirmed_unspent_output(_TXID, 0)
+
+    async def test_read_confirmed_unspent_output_missing_value_fails_closed(self):
+        reader = BitcoinCoreFundingReader(_FakeBtcRpc(gettxout={"scriptPubKey": {"hex": "0014" + "00" * 20}}))
+        with pytest.raises(NetworkError, match="no value"):
+            await reader.read_confirmed_unspent_output(_TXID, 0)
