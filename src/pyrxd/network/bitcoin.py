@@ -27,6 +27,7 @@ import logging
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Sequence
+from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
@@ -1082,6 +1083,97 @@ def count_distinct_hosts(urls: Sequence[str]) -> int:
         else:
             hosts.add(h)
     return len(hosts) + opaque
+
+
+_SATS_PER_BTC = Decimal(100_000_000)
+
+
+class BitcoinCoreFundingReader:
+    """``BtcFundingReader`` over a Bitcoin Core JSON-RPC node (the regtest/local-node milestone).
+
+    The node-backed sibling of :class:`MempoolSpaceFundingReader`: reads funding value +
+    confirmation depth from a local Bitcoin Core node (needs ``-txindex`` so ``getrawtransaction``
+    resolves any tx, not only wallet txs). Shares the injected async ``rpc(method, params)`` callable
+    (e.g. :attr:`BitcoinCoreRpcSource._rpc`) with :class:`BitcoinCoreBroadcaster`, so one
+    session/auth backs both. Fail-closed, mirroring the mempool.space reader: every uncertain outcome
+    reads 0 / raises — never "assume confirmed".
+    """
+
+    def __init__(self, rpc: Any) -> None:
+        if not callable(rpc):
+            raise ValidationError("rpc must be an async callable rpc(method, params)")
+        self._rpc = rpc
+
+    async def _verbose_tx(self, txid: str) -> dict:
+        tx = str(txid if isinstance(txid, Txid) else Txid(txid))
+        data = await self._rpc("getrawtransaction", [tx, True])
+        if not isinstance(data, dict):
+            raise NetworkError("getrawtransaction did not return a verbose object; fail-closed")
+        return data
+
+    async def confirmations(self, txid: str) -> int:
+        data = await self._verbose_tx(txid)
+        confs = data.get("confirmations")
+        if confs is None:
+            # In the mempool / unconfirmed / unknown -> 0, so the reorg gate's ``>= N`` check
+            # fails closed rather than treating an un-mined tx as buried.
+            return 0
+        confs = int(confs)
+        return confs if confs > 0 else 0
+
+    @staticmethod
+    def _btc_to_sats(btc_value) -> int:
+        # BTC -> sats WITHOUT float error: str(value) is round-trip-safe for the node's ≤8-dp decimal,
+        # and Decimal makes the *1e8 exact (a naive float *1e8 can land on 99999.999… and truncate).
+        sats = int((Decimal(str(btc_value)) * _SATS_PER_BTC).to_integral_value(rounding=ROUND_HALF_UP))
+        if sats < 0:
+            raise NetworkError("node reported a negative output value; fail-closed")
+        return sats
+
+    async def read_output_amount_sats(self, txid: str, vout: int, *, min_confirmations: int) -> int:
+        confs = await self.confirmations(txid)
+        if confs < min_confirmations:
+            raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
+        data = await self._verbose_tx(txid)
+        try:
+            btc_value = data["vout"][int(vout)]["value"]  # Bitcoin Core reports the output value in BTC
+        except (KeyError, IndexError, TypeError) as exc:
+            raise NetworkError(f"could not read output value for {str(txid)[:16]}…:{vout}") from exc
+        return self._btc_to_sats(btc_value)
+
+    async def read_confirmed_unspent_output(self, txid: str, vout: int) -> tuple[bytes, int]:
+        """Return the ``(scriptPubKey, value_sats)`` of a CONFIRMED, UNSPENT output — read authoritatively
+        from the node via ``gettxout`` (``include_mempool=False``), NOT from any self-reported locator.
+
+        A spent/unconfirmed/unknown outpoint makes ``gettxout`` return ``null`` -> fail closed. This is
+        the binding a maker needs to prove the taker's advertised funding outpoint actually pays the
+        expected HTLC scriptPubKey (and is still spendable) before locking its own asset — the
+        locator's own ``scriptpubkey()`` is attacker-supplied and proves nothing about the outpoint.
+        """
+        tx = str(txid if isinstance(txid, Txid) else Txid(txid))
+        res = await self._rpc("gettxout", [tx, int(vout), False])  # False: confirmed UTXO set only
+        if not isinstance(res, dict):
+            raise NetworkError(
+                f"gettxout for {tx[:16]}…:{vout} returned null — the output is spent, unconfirmed, or "
+                "unknown; fail-closed"
+            )
+        spk_hex = (res.get("scriptPubKey") or {}).get("hex") if isinstance(res.get("scriptPubKey"), dict) else None
+        if not isinstance(spk_hex, str) or not spk_hex:
+            raise NetworkError("gettxout returned no scriptPubKey hex; fail-closed")
+        try:
+            spk = bytes.fromhex(spk_hex)
+        except ValueError as exc:
+            raise NetworkError("gettxout scriptPubKey hex is not valid hex; fail-closed") from exc
+        if "value" not in res:
+            raise NetworkError("gettxout returned no value; fail-closed")
+        return spk, self._btc_to_sats(res["value"])
+
+    async def txid_of(self, raw_tx: bytes) -> str:
+        # Local, node-free (mirrors MempoolSpaceFundingReader): the reorg gate derives its own txid,
+        # but the Protocol method exists for non-gate callers.
+        from ..btc_wallet.taproot import btc_txid_from_raw
+
+        return btc_txid_from_raw(bytes(raw_tx))
 
 
 class MultiSourceBtcFundingReader:

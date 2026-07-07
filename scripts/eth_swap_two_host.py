@@ -91,7 +91,7 @@ from pyrxd.gravity.swap_coordinator import (
     SwapCoordinator,
     assert_timelock_margin,
 )
-from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
+from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapRole, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
@@ -681,16 +681,22 @@ class _CapturingEthLeg:
 
 def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
     """Build the REAL SwapCoordinator — the SAME object graph as eth_swap_run.py / the e2e, only
-    each process constructs its own side. Durable seen-store by default."""
+    each process constructs its own side. Durable seen-store by default.
+
+    The coordinator is ROLE-tagged (security review): this is a genuine two-party deployment, so the
+    P3 role guard must be armed — without it a taker who mistakenly runs the maker-only
+    ``maybe_refund_asset_on_maker_stall`` self-strands (its CSV refund pays the maker). The BTC sibling
+    already threads this; the ETH one previously left ``role`` unset (guard disabled)."""
     if record is None:
         record = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
+    role = SwapRole.MAKER if args.role == "maker" else SwapRole.TAKER
     return SwapCoordinator(
         record=record,
         counter_leg=eth_leg,
         radiant_leg=rxd_leg,
         indexer=None,  # plain RXD has no genesis ref → no ref-authenticity indexer needed
         seen_store=DurableSeenStore(str(Path(keys_out).expanduser()) + ".seen.sqlite"),
-        config=CoordinatorConfig(margin_policy=_margin_policy(args), accept_estimated_eth_margins=True),
+        config=CoordinatorConfig(margin_policy=_margin_policy(args), accept_estimated_eth_margins=True, role=role),
     )
 
 
