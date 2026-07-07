@@ -57,7 +57,7 @@ from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
-from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
+from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapRole, SwapState
 from pyrxd.gravity.watch.alerts import DedupAlerter, Page, Severity
 from pyrxd.gravity.watch.decide import Intent
 from pyrxd.gravity.watch.quorum import BtcClaimStatus, ChainObserver
@@ -420,7 +420,7 @@ class _LockedSwap:
         self.rxd_amount = rxd_amount
 
 
-async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _LockedSwap:
+async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3, role=None) -> _LockedSwap:
     """Fund the BTC HTLC + the RXD covenant and drive the coordinator to BOTH_LOCKED.
 
     Shared by the happy path and the failure paths — all terminal scenarios branch
@@ -508,7 +508,7 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3) -> _Locked
         radiant_leg=rxd_leg,
         indexer=None,
         seen_store=_Seen(),
-        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(block_interval_s=_BTC_INTERVAL_S)),
+        config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(block_interval_s=_BTC_INTERVAL_S), role=role),
     )
 
     # 1. Taker funds the BTC HTLC.
@@ -677,6 +677,60 @@ class TestCovenantRefundCsvMaturity:
         assert len(txid) == 64
         nodes.rxd_mine(1)
         assert nodes.rxd("gettxout", cov_txid, "0") in (None, ""), "the mature CSV refund spent the covenant"
+
+
+class TestBtcActiveAdversary:
+    """P2 for the BTC arm ("the hard case"): the genuinely-separated active-adversary analog of
+    test_xchain_eth_active_adversary_e2e, on real bitcoind + radiantd consensus. A SEPARATE adversary
+    (its own build_claim_tx, never the honest coordinator's methods) claims the BTC HTLC with p —
+    publishing p in the witness on-chain. The honest taker (role=TAKER, never running the maker's
+    claim) OBSERVES the reveal via taker_observed_reveal (the BTC path, on real regtest — previously
+    only unit-tested with fakes), recovers p FROM the on-chain claim tx, and settles the covenant.
+    Safety is asserted from chain-re-derived facts."""
+
+    async def test_A1_active_reveal_honest_taker_recovers_from_chain(self, nodes):
+        # Large t_rxd so the reorg-gate burial of the BTC claim still leaves the t_rxd window open.
+        s = await _setup_locked_swap(nodes, t_rxd_blocks=60, role=SwapRole.TAKER)
+        coord = s.coord
+        depth = coord.config.margin_policy.btc_claim_reorg_depth.value
+
+        # The ADVERSARY claims the BTC HTLC with p via its OWN build_claim_tx + broadcast — publishing p
+        # in the witness on-chain. The honest coordinator never runs maker_claims_btc (the maker's key +
+        # p live only in the adversary's construction here).
+        claim_raw = bt.build_claim_tx(
+            locator=coord.record.btc_locator,
+            preimage=s.p_secret.unsafe_raw_bytes(),
+            claim_privkey=coord.counter_leg._maker_claim_privkey,
+            to_scriptpubkey=coord.counter_leg.claim_to_scriptpubkey,
+            fee_sats=coord.counter_leg.fee_sats,
+            aux_rand=os.urandom(32),
+        )
+        claim_txid = nodes.btc("sendrawtransaction", claim_raw.hex())
+        nodes.btc_mine(depth)  # bury the adversary's claim to the reorg-safe depth (gate → SAFE)
+
+        # The honest taker OBSERVES the reveal: it fetches the claim tx bytes FROM CHAIN (by the public
+        # txid) and taker_observed_reveal verifies sha256(p)==H + that the claim spends OUR HTLC outpoint,
+        # then advances BOTH_LOCKED -> SECRET_REVEALED — without the honest side ever holding p.
+        claim_bytes = bytes.fromhex(nodes.btc("getrawtransaction", claim_txid))
+        rec = await coord.taker_observed_reveal(claim_bytes)
+        assert rec.state is SwapState.SECRET_REVEALED
+
+        # Recover p from the chain + reorg-gated covenant claim (CLAIM branch → taker).
+        now = int(nodes.rxd("getblockcount"))
+        rec = await coord.taker_scrape_and_claim_asset(
+            claim_bytes, now_rxd_height=now, asset_locked_at_height=s.rxd_locked_at
+        )
+        assert rec.state is SwapState.COMPLETED, f"honest taker should settle the covenant, got {rec.state.value}"
+        nodes.rxd_mine(1)  # confirm the covenant claim so scantxoutset (confirmed-only) sees the payout
+
+        # SAFETY from chain reads: the covenant is spent to the TAKER holder (asset reached the honest
+        # taker) and NOT the maker — atomic COMPLETED, no one-sided loss.
+        cov_txid = rec.radiant_covenant_outpoint.split(":")[0]
+        assert nodes.rxd("gettxout", cov_txid, "0") in (None, ""), "covenant must be spent (claimed)"
+        assert _scan_value_for_spk(nodes, s.cov.taker_holder_script) == s.rxd_amount, (
+            "the covenant claim must pay the TAKER holder (asset reached the honest taker)"
+        )
+        assert _scan_value_for_spk(nodes, s.cov.maker_holder_script) == 0, "the maker must NOT hold the covenant"
 
 
 class TestMakerStallAssetOnlyRefundIsTakerLoss:
