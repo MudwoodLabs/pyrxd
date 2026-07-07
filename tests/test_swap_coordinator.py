@@ -729,6 +729,70 @@ async def test_e2e_happy_path_completed():
 
 
 # ---------------------------------------------------------------------------
+# Two-party: the taker OBSERVES the maker's on-chain reveal (never executes it)
+# ---------------------------------------------------------------------------
+
+
+async def test_taker_observed_reveal_advances_then_claims():
+    """Two-party seam replacement: the honest taker OBSERVES the maker's on-chain claim (it never runs
+    maker_claims_btc — that is the maker's key/action on another host) and advances BOTH_LOCKED ->
+    SECRET_REVEALED via taker_observed_reveal, which verifies sha256(p)==H + the provenance gate from
+    the tx. The claim step then completes the swap."""
+    p_secret, h = generate_secret()
+    terms = _terms(hashlock=h)
+    btc = FakeBtcLeg()
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd, role=SwapRole.TAKER)
+
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+    # The maker claimed BTC on another host, publishing p on-chain. The honest taker only ever sees
+    # the claim tx (built here from the public locator + the now-public p); it never called claim.
+    claim_tx = _real_maker_claim_tx(coord.record.btc_locator, p_secret.unsafe_raw_bytes())
+    rec = await coord.taker_observed_reveal(claim_tx)
+    assert rec.state is SwapState.SECRET_REVEALED
+    assert "claim" not in btc.calls, "the honest taker must NOT have executed the maker's claim"
+
+    rec = await coord.taker_scrape_and_claim_asset(claim_tx, now_rxd_height=1000, asset_locked_at_height=1000)
+    assert rec.state is SwapState.COMPLETED
+    assert rxd.claimed_with is not None and hashlib.sha256(rxd.claimed_with).digest() == h
+
+
+async def test_taker_observed_reveal_rejects_foreign_reveal():
+    """A syntactically-valid claim tx from a DIFFERENT swap (it reveals p2, which opens H2 not our H)
+    must fail closed and leave the FSM at BOTH_LOCKED — a foreign/cross-swap "reveal" cannot push the
+    taker into the claim flow."""
+    _p1, h1 = generate_secret()
+    coord = _coordinator(terms=_terms(hashlock=h1), role=SwapRole.TAKER)
+    await coord.taker_funds_btc(coord.record.terms)
+    await coord.post_asset_lock_revalidate(await coord.radiant_leg.expected_covenant_scriptpubkey(coord.record.terms))
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+    # A REAL claim tx from a different swap (its own H2/p2) — reveals p2, which does not open our H1.
+    p2, h2 = generate_secret()
+    other = _coordinator(terms=_terms(hashlock=h2))
+    await other.taker_funds_btc(other.record.terms)
+    foreign_claim = _real_maker_claim_tx(other.record.btc_locator, p2.unsafe_raw_bytes())
+    with pytest.raises((ValidationError, Exception)):
+        await coord.taker_observed_reveal(foreign_claim)
+    assert coord.record.state is SwapState.BOTH_LOCKED, "a foreign reveal must not advance the FSM"
+
+
+async def test_taker_observed_reveal_only_from_both_locked():
+    """taker_observed_reveal is only valid from BOTH_LOCKED (both legs locked; the reveal is what
+    arms the claim flow)."""
+    p_secret, h = generate_secret()
+    terms = _terms(hashlock=h)
+    coord = _coordinator(terms=terms, role=SwapRole.TAKER)
+    await coord.taker_funds_btc(terms)  # BTC_LOCKED, not yet BOTH_LOCKED
+    claim_tx = _real_maker_claim_tx(coord.record.btc_locator, p_secret.unsafe_raw_bytes())
+    with pytest.raises(ValidationError, match="only valid from BOTH_LOCKED"):
+        await coord.taker_observed_reveal(claim_tx)
+
+
+# ---------------------------------------------------------------------------
 # SIMULATED: MUTUAL_REFUND (maker never claims)
 # ---------------------------------------------------------------------------
 

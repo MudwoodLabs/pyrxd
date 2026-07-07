@@ -16,12 +16,11 @@ SwapState.
 What this proves / what it does NOT: separation is at the OBJECT + secret level (the honest
 coordinator never receives `p` and never broadcasts the reveal — asserted). Fully separate OS
 processes / hosts / independent chain access are P4 (two-host networked regtest); this runs both sides
-in one process against one shared regtest node + anvil. Recovering off the *observed* reveal still
-requires advancing the taker FSM to SECRET_REVEALED — for which there is no first-class coordinator
-method; the production two-host harness fabricates that state as a resume seam
-(`eth_swap_two_host.py:467`). We use the same FSM event `maker_claims_btc` uses, WITHOUT the honest
-side ever holding/broadcasting `p`. **P2 finding:** a first-class `taker_observed_reveal()` transition
-would remove the need for either seam.
+in one process against one shared regtest node + anvil. The honest taker enters the claim flow off the
+*observed* reveal via the first-class `SwapCoordinator.taker_observed_reveal()` transition, which
+verifies the reveal FROM CHAIN (`sha256(p)==H` + the R6 provenance gate) before advancing
+BOTH_LOCKED -> SECRET_REVEALED — replacing the resume-seam that fabricated that state
+(`eth_swap_two_host.py`). The honest side never holds or broadcasts `p`.
 
 Run it:  XCHAIN_ETH_REGTEST=1 pytest tests/test_xchain_eth_active_adversary_e2e.py -m integration -s
 """
@@ -43,7 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.eth_leg import EthLeg
-from pyrxd.gravity.swap_state import SwapEvent, SwapRole, SwapState
+from pyrxd.gravity.swap_state import SwapRole, SwapState
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 # Reuse the real chain harness from the happy-path e2e (one source of truth for node/anvil/legs).
@@ -143,13 +142,12 @@ class TestEthActiveAdversary:
             claim_hash = await adv.claim_eth_revealing_p(locator)
             _anvil_mine(url, 3)  # finalize the ETH claim (anvil --slots-in-an-epoch 1 → finalized=latest-2)
 
-            # 4. The honest taker OBSERVES the reveal on-chain and advances to SECRET_REVEALED. There
-            #    is no first-class "observe reveal" coordinator method (see the module docstring / P2
-            #    finding); we advance the FSM via the SAME event maker_claims_btc uses — WITHOUT the
-            #    honest side holding or broadcasting p.
+            # 4. The honest taker OBSERVES the reveal on-chain: taker_observed_reveal fetches the claim
+            #    by its PUBLIC hash, verifies sha256(p)==H + the R6 provenance gate FROM CHAIN, and
+            #    advances BOTH_LOCKED -> SECRET_REVEALED. The honest side never holds/broadcasts p.
             assert coord.record.state is SwapState.BOTH_LOCKED
-            coord._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
-            assert coord.record.state is SwapState.SECRET_REVEALED
+            rec = await coord.taker_observed_reveal(claim_hash)
+            assert rec.state is SwapState.SECRET_REVEALED
 
             # 5. Honest taker recovers p FROM THE CHAIN (fetch calldata+logs by the public claim hash),
             #    runs the R6 provenance + finalized-checkpoint reorg gate, then claims the covenant
@@ -209,8 +207,8 @@ class TestEthActiveAdversary:
             # Active reveal — anvil auto-mines the claim (1 block) so it is MINED but NOT finalized
             # (finalized = latest-2). We do NOT mine 3 more, so the finality gate sees a non-final claim.
             claim_hash = await adv.claim_eth_revealing_p(locator)
-            coord._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
-            assert coord.record.state is SwapState.SECRET_REVEALED
+            rec = await coord.taker_observed_reveal(claim_hash)
+            assert rec.state is SwapState.SECRET_REVEALED
 
             # Drive RXD to the edge of t_rxd maturity while the ETH claim stays non-final → the gate
             # has no room left to WAIT for finality → SQUEEZED → ASSET_VULNERABLE (deliberate, not silent).
