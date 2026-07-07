@@ -461,13 +461,20 @@ async def taker_phase_claim(args: argparse.Namespace) -> None:
     if fee_source is None:
         raise SystemExit("taker claim needs a regtest fee UTXO (see --fee-* flags)")
     rxd_leg = _radiant_leg(args, taker_pkh=taker_pkh, maker_pkh=maker_pkh, fee_source=fee_source)
-    # Rebuild the coordinator with the funded counter-leg locator attached (so the FSM is at
-    # BOTH_LOCKED/SECRET_REVEALED — the resume seam mirrors dust_swap_resume.py).
+    # Rebuild the coordinator with the funded counter-leg locator attached (resume at BOTH_LOCKED —
+    # the resume seam mirrors dust_swap_resume.py). We advance to SECRET_REVEALED below via the
+    # first-class taker_observed_reveal, which VERIFIES the maker's on-chain reveal before advancing.
     loc = EthHtlcLocator.from_dict(_read_public(io_dir, "taker_funding.json")["eth_locator"])
-    record = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms).with_counter_lock(loc)
+    record = SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms).with_counter_lock(loc)
     coord = _coordinator(args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out, record=record)
 
     try:
+        # First-class observe-reveal (replaces the old fabricated-SECRET_REVEALED seam): verify the
+        # maker's on-chain ETH claim genuinely reveals THIS swap's p — sha256(p)==H + the R6 provenance
+        # gate, all read FROM CHAIN — and advance BOTH_LOCKED -> SECRET_REVEALED. A fabricated or
+        # cross-swap "reveal" fails closed here rather than entering the claim flow.
+        confirm("taker_observed_reveal: verify the maker's on-chain reveal before claiming", auto_yes=args.yes)
+        await coord.taker_observed_reveal(eth_claim_tx)
         deadline = time.monotonic() + args.resume_deadline_s
         print(
             f"  scraping p from the maker's ETH claim {eth_claim_tx} + reorg-gated RXD claim (deadline {args.resume_deadline_s:.0f}s)"
@@ -625,9 +632,7 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
         # 2. Lock the RXD covenant: the operator funds the SPK out-of-band, then we re-validate.
         print(f"\n  Fund the RXD covenant SPK on regtest now (>= 1 conf):\n    {covenant_spk_hex}")
         confirm("you have funded the RXD covenant SPK on regtest and it has >= 1 conf", auto_yes=args.yes)
-        rec = await coord.post_asset_lock_revalidate(
-            bytes.fromhex(covenant_spk_hex), now_unix_s=int(time.time())
-        )
+        rec = await coord.post_asset_lock_revalidate(bytes.fromhex(covenant_spk_hex), now_unix_s=int(time.time()))
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(f"covenant/timing mismatch -> {rec.state.value}; refund the ETH HTLC after its timeout")
         print(f"  -> {rec.state.value}")

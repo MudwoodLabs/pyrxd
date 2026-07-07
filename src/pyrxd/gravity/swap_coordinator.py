@@ -1611,6 +1611,52 @@ class SwapCoordinator:
                 "refusing to scrape p (wrong or cross-swap claim tx)"
             )
 
+    # -- taker OBSERVES the maker's on-chain reveal (two-party step 4.5) ----
+    @_serialized_step
+    async def taker_observed_reveal(self, maker_claim_ref) -> SwapRecord:
+        """Advance BOTH_LOCKED -> SECRET_REVEALED on OBSERVING the maker's on-chain claim.
+
+        The honest TAKER never executes the maker's claim (that is the maker's key/action, on a
+        different host); it OBSERVES the reveal on-chain and must then enter the claim flow. The only
+        other path to SECRET_REVEALED is :meth:`maker_claims_btc` — a MAKER action — so two-party
+        callers previously FABRICATED a SECRET_REVEALED record as a resume seam
+        (``scripts/eth_swap_two_host.py``) or advanced the FSM directly in tests. This is the
+        first-class taker-side transition that replaces both seams.
+
+        It VERIFIES the observed claim is a genuine reveal of THIS swap's ``p`` before advancing —
+        ``sha256(p) == H`` scraped from the claim AND the per-swap provenance gate (BTC: the claim
+        spends OUR funding outpoint; ETH: it targets OUR HTLC contract and emits ``Claimed(p)``). A
+        fabricated or cross-swap "reveal" fails closed and does NOT move the FSM.
+
+        It deliberately does NOT claim the asset and does NOT run the reorg/finality gate — those stay
+        in :meth:`taker_scrape_and_claim_asset`, which the caller invokes NEXT (that gate decides
+        SAFE/WAIT/SQUEEZED off the same reveal). ``maker_claim_ref`` is the ETH claim tx HASH (str) or
+        the raw BTC claim tx bytes — exactly what :meth:`taker_scrape_and_claim_asset` takes.
+        """
+        if self.record.state is not SwapState.BOTH_LOCKED:
+            raise ValidationError(f"taker_observed_reveal only valid from BOTH_LOCKED, not {self.record.state.value}")
+        # Prove the observed claim genuinely reveals THIS swap's p (fail-closed) BEFORE advancing —
+        # the SAME scrape + provenance the claim step re-runs, minus the finality gate + broadcast.
+        if self.record.terms.counter_chain == "btc":
+            p = self.counter_leg.scrape_secret(maker_claim_ref, self.record.terms.hashlock)
+            if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+                raise ValidationError("observed claim does not reveal a p that opens H; refusing to advance")
+            self._assert_claim_tx_spends_our_htlc(maker_claim_ref)
+        else:
+            locator = self.record.counterchain_locator
+            if not isinstance(locator, EthHtlcLocator):
+                raise ValidationError("ETH reveal-observation requires an EthHtlcLocator on the record")
+            artifacts = await self.counter_leg.fetch_claim_artifacts(maker_claim_ref)
+            p = self.counter_leg.scrape_secret(artifacts, self.record.terms.hashlock)
+            if hashlib.sha256(bytes(p)).digest() != self.record.terms.hashlock:
+                raise ValidationError("observed claim does not reveal a p that opens H; refusing to advance")
+            await self.counter_leg.assert_claim_provenance(
+                maker_claim_ref, contract_address=locator.contract_address, preimage=bytes(p)
+            )
+        self._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
+        await self._persist_record(self.record, shield=True)
+        return self.record
+
     # -- taker scrapes p from the claim tx and claims the asset (step 5) ----
     @_serialized_step
     async def taker_scrape_and_claim_asset(
