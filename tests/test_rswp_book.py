@@ -8,14 +8,11 @@ a bad order look fillable.
 
 from __future__ import annotations
 
-import pytest
-
 from pyrxd.glyph.script import build_ft_locking_script
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
-from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.swap import Asset, FundingInput, accept_offer
 from pyrxd.swap.rswp import (
@@ -171,10 +168,47 @@ async def test_hostile_source_tx_substitution_caught_by_txid_check() -> None:
     assert "hash != requested" in e.problem
 
 
-async def test_malformed_index_row_raises_fail_closed() -> None:
-    """A structurally-broken row is index misbehavior — the listing call raises
-    rather than presenting a partial book as healthy."""
+async def test_malformed_index_row_becomes_a_problem_entry_not_a_batch_crash() -> None:
+    """Audit M1: a structurally-broken ROW must NOT crash the whole listing — it becomes a per-row
+    ``problem`` entry so one poisoned row can't empty the book. (Contrast: a TRANSPORT error still
+    propagates / fails closed — covered by is_unspent/get_transaction raising NetworkError elsewhere.)"""
     source, _, _, _ = _setup_book()
     del source.rows[0]["signature"]
-    with pytest.raises(ValidationError, match="malformed swapindex response row"):
-        await OrderbookClient(source).orders_offering(_REF)
+    entries = await OrderbookClient(source).orders_offering(_REF)
+    assert len(entries) == 1
+    e = entries[0]
+    assert not e.fillable and e.offer is None and e.order is None
+    assert "malformed swapindex response row" in e.problem
+
+
+async def test_invalid_pubkey_in_signature_does_not_crash_the_batch() -> None:
+    """Audit M1 (coincurve ValueError): an advert whose signature push carries an invalid pubkey point
+    made verify raise a builtin ValueError that escaped the ValidationError-only guard and crashed the
+    browse. It must now be a per-row problem entry."""
+    source, _src, _, _ = _setup_book()
+    # A two-push scriptSig: <2-byte sig+0xC3> <33-byte invalid pubkey point>.
+    bad_sig = bytes([0x02, 0xAA, 0xC3]) + bytes([0x21]) + b"\x00" * 33
+    source.rows[0]["signature"] = bad_sig.hex()
+    entries = await OrderbookClient(source).orders_offering(_REF)
+    assert len(entries) == 1 and not entries[0].fillable and entries[0].problem is not None
+
+
+async def test_query_correspondence_hostile_index_different_asset_rejected() -> None:
+    """Audit M2: a hostile index, asked for token A, returns a fully self-consistent, signature-verified
+    order that actually GIVES token B (a real cheap token-B UTXO). The bridge's internal-consistency
+    checks all pass — only the query-correspondence check catches that the row doesn't offer the queried
+    token, so it must not be presented as fillable for the token-A query."""
+
+    class HostileSource(FakeSource):
+        async def get_open_orders(self, token_id_hex, *, limit=100, offset=0):
+            return list(self.rows)  # returns the (genuine) token-B order regardless of what was asked
+
+    source, _src, _, _ = _setup_book()  # holds ONE genuine order offering _REF (== "token B")
+    hostile = HostileSource()
+    hostile.rows, hostile.txs, hostile.spent = source.rows, source.txs, source.spent
+
+    other = GlyphRef(txid=Txid("ef" * 32), vout=9)  # "token A": what the caller asked for
+    entries = await OrderbookClient(hostile).orders_offering(other)
+    assert len(entries) == 1
+    e = entries[0]
+    assert not e.fillable and "does not offer the queried token" in (e.problem or "")

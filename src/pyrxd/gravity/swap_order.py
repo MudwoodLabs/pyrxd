@@ -167,17 +167,18 @@ def decode_rswp_order(op_return_script: bytes) -> RswpOrder:
         return v
 
     def _small_int(field: str) -> int:
-        """A 1-byte value field, which minimal-push encoding may emit as OP_0/OP_1..OP_16."""
+        """A 1-byte value field. The consensus node (swapindex.cpp) requires a 1-byte DIRECT data push
+        (``data.size() == 1``) and DROPS an ``OP_N``-encoded value (``GetOp`` yields empty data for ``OP_N``),
+        so we mirror that strictness: an ``OP_N`` here decodes to a frame the live index never accepted, and
+        treating it as valid would make pyrxd disagree with the canonical book (selective-disclosure lever)."""
         nonlocal i
         if i >= len(items):
             raise ValidationError(f"RSWP frame truncated at {field}")
         v = items[i]
         i += 1
-        if isinstance(v, int):
-            return v
-        if len(v) == 1:
+        if isinstance(v, bytes) and len(v) == 1:
             return v[0]
-        raise ValidationError(f"RSWP {field}: expected a 1-byte value")
+        raise ValidationError(f"RSWP {field}: expected a 1-byte direct data push (the node drops OP_N here)")
 
     if _data("magic", 4) != _RSWP_MAGIC:
         raise ValidationError("not an RSWP order (missing magic)")
@@ -198,7 +199,14 @@ def decode_rswp_order(op_return_script: bytes) -> RswpOrder:
         raise ValidationError("RSWP frame truncated at offeredUTXOIndex")
     idx_item = items[i]
     i += 1
-    offered_utxo_index = idx_item if isinstance(idx_item, int) else _decode_scriptnum(idx_item)
+    if isinstance(idx_item, int):  # OP_0..OP_16 — the node accepts these via DecodeOP_N
+        offered_utxo_index = idx_item
+    else:
+        # The node reads the vout with CScriptNum(data, false, 4), which rejects a push > 4 bytes. Mirror
+        # that cap so pyrxd never accepts an offered-index the live index dropped.
+        if len(idx_item) > 4:
+            raise ValidationError("RSWP offeredUTXOIndex: CScriptNum push exceeds 4 bytes (node drops it)")
+        offered_utxo_index = _decode_scriptnum(idx_item)
 
     tail = items[i:]
     if len(tail) < 2 or not all(isinstance(t, bytes) for t in tail):

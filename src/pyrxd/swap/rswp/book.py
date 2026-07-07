@@ -69,8 +69,8 @@ class BookEntry:
     says exactly which verification failed.
     """
 
-    order: RswpOrder
-    status: str  # "open" | "spent"
+    order: RswpOrder | None  # None only when the row was too malformed to even decode
+    status: str  # "open" | "spent" | "unknown" (row failed verification before the liveness check)
     fillable: bool
     offer: SwapOffer | None
     problem: str | None
@@ -118,31 +118,44 @@ class OrderbookClient:
     async def orders_offering(self, ref: GlyphRef | None, *, limit: int = 100, offset: int = 0) -> list[BookEntry]:
         """Open orders OFFERING the given asset (``None`` = native RXD)."""
         rows = await self._source.get_open_orders(swap_token_id(ref).hex(), limit=limit, offset=offset)
-        return [await self._verify_row(row) for row in rows]
+        return [await self._verify_row(row, expected_ref=ref, side="offer") for row in rows]
 
     async def orders_wanting(self, ref: GlyphRef, *, limit: int = 100, offset: int = 0) -> list[BookEntry]:
         """Open orders WANTING the given Glyph token (the ask side of that token's book)."""
         rows = await self._source.get_open_orders_by_want(swap_token_id(ref).hex(), limit=limit, offset=offset)
-        return [await self._verify_row(row) for row in rows]
+        return [await self._verify_row(row, expected_ref=ref, side="want") for row in rows]
 
-    async def _verify_row(self, row: dict) -> BookEntry:
-        """The hostile-input pipeline for one index row. Transport errors propagate (fail closed);
-        per-order verification failures become ``problem`` entries."""
+    async def _verify_row(self, row: dict, *, expected_ref: GlyphRef | None, side: str) -> BookEntry:
+        """The hostile-input pipeline for one index row.
+
+        Row-CONTENT failures (a malformed frame, a bad signature — including a coincurve ``ValueError`` on
+        an invalid pubkey/DER, and a row that does not offer/want the QUERIED asset) become a per-row
+        ``problem`` entry so one poisoned row can never crash or empty the whole batch (design invariant #5
+        / #9). TRANSPORT failures (``NetworkError`` from the source) are NOT caught here — they propagate so
+        an unreachable/hostile transport fails closed rather than masquerading as an empty book.
+        """
         block_height = row.get("block_height")
-        order = _order_from_rpc(row)  # malformed rows raise — an index handing back garbage is transport-level
-        unspent = await self._source.is_unspent(order.offered_txid, order.offered_utxo_index)
-        status = "open" if unspent else "spent"
+        order: RswpOrder | None = None
         try:
+            order = _order_from_rpc(row)
             give_source_tx = await fetch_transaction(self._source, order.offered_txid)
             offer = rswp_order_to_swap_offer(order, give_source_tx=give_source_tx)
             verify_offer_signature(offer)
-        except ValidationError as exc:
+            # M2: the re-derived asset must match the QUERIED token — a hostile index cannot slip a
+            # different (worthless) asset into a query's results as a fillable row.
+            got_ref = offer.terms.give.ref if side == "offer" else offer.terms.receive.ref
+            if got_ref != expected_ref:
+                raise ValidationError(f"row does not {side} the queried token (offered/wanted asset ref mismatch)")
+        except (ValidationError, ValueError) as exc:
             return BookEntry(
-                order=order, status=status, fillable=False, offer=None, problem=str(exc), block_height=block_height
+                order=order, status="unknown", fillable=False, offer=None, problem=str(exc), block_height=block_height
             )
+        # Row verified & corresponds to the query. Now the liveness check — a transport error here fails
+        # closed (propagates), consistent with the OrderbookSource fail-closed contract.
+        unspent = await self._source.is_unspent(order.offered_txid, order.offered_utxo_index)
         return BookEntry(
             order=order,
-            status=status,
+            status="open" if unspent else "spent",
             fillable=unspent,
             offer=offer,
             problem=None if unspent else "offered UTXO already spent (order filled or cancelled)",

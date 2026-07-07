@@ -414,3 +414,17 @@ def test_ft_inner_refused_everywhere() -> None:
     assert parse_refund_covenant(spk) is not None  # structurally valid covenant…
     with pytest.raises(ValidationError, match="not P2PKH"):
         _inner_p2pkh_pkh(spk)  # …but the RXD-only gate refuses it
+
+
+def test_reservation_below_dust_refused() -> None:
+    """Audit F3: a sub-dust reservation would produce an unspendable covenant UTXO."""
+    maker, mk_pkh = _key()
+    with pytest.raises(ValidationError, match="below the dust floor"):
+        prepare_covenant_offer(
+            funding=[FundingInput(_rxd_src(mk_pkh, 10_000), 0, maker)],
+            photons=100,  # < 546
+            owner_pkh=mk_pkh,
+            expiry_height=_EXPIRY,
+            change_pkh=mk_pkh,
+            fee=1_000,
+        )

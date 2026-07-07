@@ -9,14 +9,28 @@ only source of truth for classification:
   was actually spent — that is a **liveness** failure only (a stale OPEN the
   caller re-polls away), never a safety one: it can never make a real fill or
   cancel disappear, only delay noticing it.
-* FILLED requires a byte-exact match (value AND locking script) between the
-  spending transaction's output[0] and the demanded output the maker's own
-  ``0xC3``-signed advertisement committed to. A server cannot forge that match
-  without forging the maker's transaction itself — substituting a different
-  transaction is caught by :func:`pyrxd.swap.resolve.fetch_transaction`'s
-  computed-txid check before any byte comparison even runs.
-* Anything else that spent the offered UTXO (most commonly the maker's own
-  :func:`pyrxd.swap.rswp.orders.build_cancel_tx`) is CANCELLED.
+* FILLED / CANCELLED require a **confirmed** spender: the spending tx must
+  appear in the offered scripthash's history at a block ``height > 0``, actually
+  consume the offered outpoint, and (for FILLED) its output[0] must byte-match
+  (value AND locking script) the demanded output the maker's own ``0xC3``-signed
+  advertisement committed to. Every tx read goes through the txid-verified
+  :func:`pyrxd.swap.resolve.fetch_transaction`, and an *unconfirmed* claimed
+  spender is treated as still-OPEN (re-poll), so a fabricated mempool tx cannot
+  flip an offer to FILLED.
+
+  **Trust model (read this — it is not consensus-grade):** classification trusts
+  the *queried ElectrumX server's* report of what is confirmed. A fully hostile
+  or MITM'd server can still forge FILLED/CANCELLED by presenting a fabricated
+  spend it *claims* is confirmed — the confirmation gate only stops the naive
+  (unconfirmed) forgery, not a server that lies about ``height``. This tracker is
+  a convenience position view, **not** a settlement validator. For
+  trust-minimized proof of a fill, SPV-verify the spending tx (Merkle inclusion
+  + header PoW via :mod:`pyrxd.spv`) or cross-check ≥2 independent servers before
+  treating FILLED as "paid" (e.g. before releasing an off-chain good). SPV
+  inclusion in ``classify`` is a tracked follow-up.
+* Anything that confirmed-spends the offered UTXO but does not match the demand
+  (most commonly the maker's own :func:`pyrxd.swap.rswp.orders.build_cancel_tx`)
+  is CANCELLED.
 
 Persistence is deliberately NOT this module's job — :class:`OfferTracker`
 wraps a plain Python list the caller owns; :func:`load_offers` / :func:`save_offers`
@@ -151,7 +165,9 @@ async def classify(client: ElectrumXClient, offer: TrackedOffer) -> ClassifyResu
     if still_unspent:
         return ClassifyResult(status=OfferStatus.OPEN, spending_txid=None)
 
-    # Spent (or the server claims so) — find the spending tx among the scripthash's history.
+    # Spent (or the server claims so) — find the CONFIRMED spending tx among the scripthash's history.
+    # A settlement disposition (FILLED/CANCELLED) requires the spender be in a block (height > 0): an
+    # unconfirmed/mempool-only "spender" is not a settled fact and, if fabricated, must not flip the offer.
     history = await client.get_history(script_hash)
     spending_tx = None
     spending_txid: str | None = None
@@ -159,6 +175,12 @@ async def classify(client: ElectrumXClient, offer: TrackedOffer) -> ClassifyResu
         candidate_txid = str(entry["tx_hash"])
         if candidate_txid == str(offer.outpoint_txid):
             continue  # the tx that CREATED this output, not one that spends it
+        try:
+            entry_height = int(entry.get("height", 0))
+        except (TypeError, ValueError):
+            entry_height = 0
+        if entry_height <= 0:
+            continue  # unconfirmed (mempool) — not a settled spender; skip
         candidate = await fetch_transaction(client, candidate_txid)
         spends_it = any(
             i.source_txid == str(offer.outpoint_txid) and i.source_output_index == offer.outpoint_vout
@@ -170,9 +192,10 @@ async def classify(client: ElectrumXClient, offer: TrackedOffer) -> ClassifyResu
             break
 
     if spending_tx is None:
-        raise ValidationError(
-            "ElectrumX server reports the offered Utxo spent but its scripthash history has no matching spender"
-        )
+        # The UTXO reads spent but no CONFIRMED matching spender is in history yet — treat as still-OPEN
+        # (re-poll) rather than trusting the unconfirmed report. Matches the "stale OPEN is liveness-only,
+        # never safety" posture in the module docstring, and denies a fabricated mempool spend a FILLED.
+        return ClassifyResult(status=OfferStatus.OPEN, spending_txid=None)
 
     # FILLED requires proof: the advertised demand, decoded from the maker's own signed
     # advert (never from `terms`, which is caller-declared and unverified against chain).

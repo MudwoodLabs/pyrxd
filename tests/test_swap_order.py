@@ -142,3 +142,35 @@ def test_rejects_short_tail():
     # Only one tail push (no separate signature) → must be >= 2.
     with pytest.raises(ValidationError, match="tail"):
         decode_rswp_order(_v2_frame(tail=[_push(b"onlyone")]))
+
+
+# --------------------------------------------------------------------------- audit M4: node-strictness parity
+
+
+def test_op_n_small_field_rejected():
+    """Audit M4: the node requires a 1-byte DIRECT push for version/flags/offeredType/termsType and drops
+    an OP_N there — the decoder must not accept an OP_N-encoded small field the live index never indexed."""
+    # version as OP_2 (0x52) instead of a direct push of 0x02.
+    frame = _frame(
+        [
+            _push(b"RSWP"),
+            _op_n(2),  # version via OP_N — node drops this
+            _push(b"\x00"),
+            _push(b"\x00"),
+            _push(b"\x01"),
+            _push(b"\x00" * 32),
+            _push(b"\xaa" * 32),
+            _op_n(0),
+            _push(b"pt"),
+            _push(b"sig"),
+        ]
+    )
+    with pytest.raises(ValidationError, match="1-byte direct data push"):
+        decode_rswp_order(frame)
+
+
+def test_oversized_vout_scriptnum_rejected():
+    """Audit M4: the node reads offeredUTXOIndex with CScriptNum(data, false, 4); a >4-byte push is dropped."""
+    frame = _v2_frame(idx_item=_push(b"\x01\x00\x00\x00\x00"), tail=[_push(b"pt"), _push(b"sig")])
+    with pytest.raises(ValidationError, match="exceeds 4 bytes"):
+        decode_rswp_order(frame)

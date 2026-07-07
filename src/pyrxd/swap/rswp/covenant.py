@@ -191,8 +191,10 @@ def prepare_covenant_offer(
     *expiry_height* even if they lose the advert — but see the module
     docstring: it does NOT make late fills invalid.
     """
-    if photons <= 0:
-        raise ValidationError("reserved photons must be positive")
+    if photons < _DUST_PHOTONS:
+        # A reservation below the dust floor produces an unspendable (node-rejected) covenant UTXO the
+        # maker could not later fill or refund (audit F3, availability). Refuse it up front.
+        raise ValidationError(f"reserved photons {photons} is below the dust floor ({_DUST_PHOTONS})")
     if fee < 0:
         raise ValidationError("fee must be non-negative")
     tx = Transaction()

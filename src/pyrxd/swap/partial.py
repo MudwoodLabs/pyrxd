@@ -337,6 +337,21 @@ def _balance_and_add_change(tx: Transaction, taker_change_pkh: bytes, fee: int) 
     There is no NFT change (a singleton is indivisible). The remaining photon
     surplus, less ``fee``, becomes an RXD change output. Raises if the taker
     under-funded any leg.
+
+    NFT CONSERVATION CONTRACT (read before adding an NFT-emitting caller). This
+    function conserves (a) TOTAL photons (``total_in - total_out == fee``, via
+    the RXD-change computation) and (b) NFT singleton COUNT (exactly one in, one
+    out, per ref). It does NOT equalize an NFT's CARRIER value in vs out — a
+    singleton's carrier photons legitimately flow through the RXD ledger, so a
+    taker's e.g. 550-photon singleton can satisfy a maker's 600-photon demanded
+    NFT with the difference topped up from RXD (and vice-versa: excess carrier
+    returns as RXD change). That means the VALUE of an emitted NFT output is not
+    checked here — it is bound elsewhere: for a maker's demand, by the maker's
+    ``SIGHASH_SINGLE`` signature over output[0]; for a maker's give, by
+    :func:`accept_offer` building the taker-receive output from the REAL on-chain
+    carrier. A future caller that lets a COUNTERPARTY choose an NFT output's
+    value would divert the carrier delta into RXD change and MUST bind that value
+    itself (signature or chain-derived) — do not rely on this function for it.
     """
     if fee < 0:
         raise ValidationError("fee must be non-negative")
