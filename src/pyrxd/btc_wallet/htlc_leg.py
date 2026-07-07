@@ -495,11 +495,27 @@ class BitcoinTaprootLeg:
 
         The refund leaf spends via the taker's refund key (held by this leg) after
         the relative timelock matures. Idempotent broadcast tolerates a retry.
+
+        P3 maturity self-check: the refund spends the CSV leaf (BIP68/112 relative-block
+        timelock), final only once the FUNDING utxo is buried ``timeout`` deep (mature at
+        ``funding confirmations >= timeout``). Refuse a non-final refund HERE with an exact
+        "needs N confirmations, has M" message a block-based poller retries on — rather than
+        emitting a tx a node rejects (under a deadline-pinning mempool "rely on node rejection"
+        is fragile). The twin of RadiantCovenantLeg.refund_asset's covenant-CSV check. Only the
+        block-CSV case is confs-checkable; a (non-default) time-based CSV is left to the node.
         """
         if not isinstance(locator, t.BtcHtlcLocator):
             raise ValidationError("locator must be a BtcHtlcLocator")
         if not isinstance(timeout, t.Timelock):
             raise ValidationError("timeout must be a Timelock")
+        if timeout.unit is t.TimeUnit.BLOCKS:
+            confs = await self.funding_reader.confirmations(locator.funding_outpoint.txid)
+            if confs < timeout.value:
+                raise ValidationError(
+                    f"BTC CSV refund is not yet mature: needs {timeout.value} confirmations, has {confs} "
+                    f"({timeout.value - confs} block(s) to go) — refusing to broadcast a non-final refund "
+                    "(P3 maturity self-check); poll and retry at maturity rather than relying on node rejection."
+                )
         raw = t.build_refund_tx(
             locator=locator,
             refund_privkey=self.taker_keypair._privkey.unsafe_raw_bytes(),
