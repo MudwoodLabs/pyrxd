@@ -376,7 +376,10 @@ class EthHtlcContractLeg:
         await self._rpc.assert_chain()
         now_ts = int((await self._rpc.w3.eth.get_block("latest"))["timestamp"])
         if now_ts < int(locator.timeout):
-            raise ValidationError(
+            # NetworkError (not ValidationError): "not yet mature" is a TRANSIENT, retryable condition
+            # (wait for the timeout, then refund), not a permanent input error — consistent with the
+            # BTC/covenant premature-refund raises (review LOW: unify the retryable exception family).
+            raise NetworkError(
                 f"ETH HTLC refund is not yet mature: matures at unix {int(locator.timeout)}, now {now_ts} "
                 f"({int(locator.timeout) - now_ts}s to go) — refusing to submit a refund the contract "
                 "would revert (gas/clarity guard; the contract enforces the deadline regardless)."

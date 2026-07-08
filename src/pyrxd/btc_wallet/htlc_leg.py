@@ -511,7 +511,10 @@ class BitcoinTaprootLeg:
         if timeout.unit is t.TimeUnit.BLOCKS:
             confs = await self.funding_reader.confirmations(locator.funding_outpoint.txid)
             if confs < timeout.value:
-                raise ValidationError(
+                # NetworkError (not ValidationError): "not yet mature" is a TRANSIENT, retryable condition
+                # (poll and re-broadcast at maturity), not a permanent input error — consistent with the
+                # covenant leg's premature-refund raise (review LOW: unify the retryable exception family).
+                raise NetworkError(
                     f"BTC CSV refund is not yet mature: needs {timeout.value} confirmations, has {confs} "
                     f"({timeout.value - confs} block(s) to go) — refusing to broadcast a non-final refund "
                     "(P3 maturity self-check); poll and retry at maturity rather than relying on node rejection."
