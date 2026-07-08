@@ -44,7 +44,7 @@ import enum
 import hashlib
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -53,6 +53,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from pyrxd.btc_wallet.taproot import (
     btc_input_outpoints_from_raw,
+    btc_spend_fields_from_raw,
     scrape_secret,
 )
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
@@ -62,13 +63,17 @@ from pyrxd.transaction.transaction import Transaction
 # NB: "priv" (not "privkey") so `private_key` / `priv_key` / `privatekey` all match despite the separator;
 # "key" is deliberately broad (an audit journal names things like txid/height/state/address, never a bare
 # "key"), and "xprv"/"entropy" cover BIP32 extended-private-keys and raw seed entropy.
+# Private-key-bearing key-name markers (review LOW): the bare substring "key" was too broad — it
+# rejected legitimately-PUBLIC journal fields (`pubkey`, `public_key`, `claim_pubkey`, `..._pkh_key`),
+# an availability regression. "priv"/"secret"/"xprv"/"wif" already cover privkey/private_key/secret_key,
+# so we only additionally need the private signing-key name; "signing_key" cannot match a public field.
 _SECRET_FORBIDDEN_KEYS = (
     "preimage",
     "p_hex",
     "wif",
     "secret",
     "priv",
-    "key",
+    "signing_key",
     "mnemonic",
     "seed",
     "xprv",
@@ -174,6 +179,10 @@ class RunManifest:
     counter_funding: Outpoint | None = None  # btc: the HTLC P2TR funding outpoint
     eth_contract: str | None = None  # eth: the per-swap deployed EthHtlc contract address (0x..)
     eth_chain_id: int | None = None  # eth: the chain id the contract lives on
+    # counter-leg VALUE (review MEDIUM): the agreed amount the counter HTLC must be funded with (btc: sats).
+    # When set, the verifier asserts the counter FUNDING output carries exactly this — else an atomic-but-
+    # MISPRICED swap (counter leg funded at the wrong amount) would score PASS. Optional (None = not checked).
+    counter_amount: int | None = None
     # lucky-pass margin grading (optional): the RXD height the covenant was funded at + the declared minimum
     # slack the honest taker's asset-claim must have had before the maker's CSV refund window opened.
     asset_locked_at_height: int | None = None
@@ -237,6 +246,7 @@ class RunManifest:
             ),
             min_margin_blocks=int(d.get("min_margin_blocks", 2)),
             party_endpoints=tuple(str(e) for e in d.get("party_endpoints", [])),
+            counter_amount=(int(d["counter_amount"]) if d.get("counter_amount") is not None else None),
         )
 
 
@@ -385,12 +395,17 @@ def verify_asset_leg(
 
 
 def verify_counter_leg_btc(
-    m: RunManifest, counter_spend_tx: bytes | None
+    m: RunManifest, counter_spend_tx: bytes | None, counter_funding_tx: bytes | None = None
 ) -> tuple[CounterLeg, bytes | None, list[str]]:
     """Re-derive the BTC counter-leg disposition. The claim leaf reveals p (and pays the maker); the refund
     leaf is a CSV spend back to the taker. We distinguish by whether p is scrapeable, and we require the
     spend to actually consume OUR HTLC funding outpoint (provenance). The middle return element is the
-    DIGEST sha256(p) (== manifest H, proven here) — raw preimage bytes never leave this function."""
+    DIGEST sha256(p) (== manifest H, proven here) — raw preimage bytes never leave this function.
+
+    When ``m.counter_amount`` + ``counter_funding_tx`` are supplied, the counter HTLC's on-chain FUNDING
+    output value is asserted to equal the agreed amount (VALUE integrity, review MEDIUM): an atomic-but-
+    MISPRICED swap (counter leg funded at the wrong amount) is ANOMALOUS, not a silent PASS. Mirrors the
+    asset leg's funding-value check."""
     notes: list[str] = []
     if counter_spend_tx is None:
         return CounterLeg.PENDING, None, ["counter (BTC HTLC) outpoint still unspent"]
@@ -403,6 +418,24 @@ def verify_counter_leg_btc(
             ["the cited counter-spend does NOT spend our BTC HTLC funding outpoint (wrong/forged tx)"],
         )
     notes.append("counter spend consumes our HTLC funding outpoint")
+    if m.counter_amount is not None and counter_funding_tx is not None:
+        # BTC funding tx is segwit — parse with the BTC-aware reader (btc_spend_fields_from_raw returns
+        # (value, spk) per output, handling marker/flag), NOT the RXD Transaction parser.
+        outs = btc_spend_fields_from_raw(counter_funding_tx).outputs
+        if m.counter_funding.vout >= len(outs):
+            return CounterLeg.ANOMALOUS, None, [*notes, "counter funding vout out of range (forged funding tx)"]
+        funded_value = outs[m.counter_funding.vout][0]
+        if funded_value != m.counter_amount:
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [
+                    *notes,
+                    f"counter HTLC funded with {funded_value} sats, agreed {m.counter_amount} "
+                    "(value mismatch — counter leg under/over-funded / mispriced)",
+                ],
+            )
+        notes.append(f"counter HTLC funded with the agreed {m.counter_amount} sats")
     try:
         p = scrape_secret(counter_spend_tx, bytes.fromhex(m.h_hex))
         if _sha256(p) == bytes.fromhex(m.h_hex):
@@ -581,17 +614,33 @@ def margin_grade(
 class _BtcFetcher:
     """Re-fetch BTC raw txs from an Esplora the parties did NOT run."""
 
-    def __init__(self, esplora_url: str):
+    def __init__(self, esplora_url: str, *, min_confirmations: int = 1):
         from pyrxd.network.bitcoin import MempoolSpaceSource  # lazy: only needed for a live run
 
+        self._base = esplora_url.rstrip("/")
         self._src = MempoolSpaceSource(base_url=esplora_url)
+        self._min_conf = min_confirmations
 
     async def raw_tx(self, txid: str) -> bytes:
-        return bytes(await self._src.get_raw_tx(txid, min_confirmations=1))
+        return bytes(await self._src.get_raw_tx(txid, min_confirmations=self._min_conf))
 
-    async def spend_of(self, op: Outpoint) -> bytes | None:
-        # NOTE (first-cut): the harness must cite the counter-spend txid; outpoint->spender scanning over
-        # Esplora (/outspend) is a next-cut convenience. Returns None to signal "look up the cited txid".
+    async def spend_of(self, op: Outpoint) -> str | None:
+        """Independent outpoint->spender discovery (review MEDIUM): so a party CANNOT park a leg at
+        PENDING by omitting its spend txid. Esplora ``/tx/{txid}/outspend/{vout}`` returns the spending
+        txid; None if the outpoint is still unspent (genuinely PENDING) or the source can't say (fails
+        soft to None — a missed discovery degrades to the same PENDING as today, never a false PASS)."""
+        import aiohttp
+
+        url = f"{self._base}/tx/{op.txid}/outspend/{op.vout}"
+        try:
+            async with aiohttp.ClientSession() as s, s.get(url) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json(content_type=None)
+            if isinstance(data, dict) and data.get("spent") and isinstance(data.get("txid"), str):
+                return str(data["txid"]).lower()
+        except Exception:
+            return None
         return None
 
     async def close(self) -> None:
@@ -628,6 +677,37 @@ class _RxdFetcher:
             tip = int(await c.get_tip_height())
             return tip - confs + 1
 
+    async def confirmations(self, txid: str) -> int:
+        """The confirmation depth of `txid` (0 if unconfirmed/unknown) — the reorg-depth oracle."""
+        async with self._client as c:
+            verbose = await c.get_transaction_verbose(txid)
+            confs = int(verbose.get("confirmations", 0) or 0)
+            return confs if confs > 0 else 0
+
+    async def spend_of(self, op: Outpoint, spk: bytes) -> str | None:
+        """Independent outpoint->spender discovery (review MEDIUM): find the tx that consumed `op` by
+        walking the covenant SPK's scripthash history and checking each candidate's inputs — so a party
+        CANNOT park the asset leg at PENDING by omitting its spend txid. Fail-soft to None (a missed
+        discovery degrades to the same PENDING as today, never a false PASS)."""
+        try:
+            scripthash = hashlib.sha256(bytes(spk)).digest()[::-1]
+            target = op.prevout_le_bytes()
+            async with self._client as c:
+                hist = await c.get_history(scripthash)
+                for entry in hist:
+                    cand = str(entry.get("tx_hash") or "")
+                    if not cand or cand == op.txid:  # skip the funding tx itself
+                        continue
+                    try:
+                        raw = bytes(await c.get_transaction(cand))
+                        if target in _rxd_input_prevouts(raw):
+                            return cand.lower()
+                    except Exception:  # noqa: S112 — a malformed/unfetchable candidate must not abort the scan
+                        continue
+        except Exception:
+            return None
+        return None
+
     async def close(self) -> None:
         pass
 
@@ -649,35 +729,56 @@ class _EthFetcher:
         await self._rpc.close()
 
 
-async def _fetch_for_live(m: RunManifest, cited: dict, btc_url: str, rxd_url: str, eth_url: str | None):
-    """Fetch (covenant_funding_tx, covenant_spend_tx|None, counter_obj) from INDEPENDENT sources. `cited`
-    carries the only journal-trusted data: the spend tx ids. counter_obj is raw bytes (btc) or (tx,receipt)
-    (eth)."""
+async def _fetch_for_live(
+    m: RunManifest, cited: dict, btc_url: str, rxd_url: str, eth_url: str | None, *, min_confirmations: int = 1
+):
+    """Fetch (covenant_funding_tx, covenant_spend_tx|None, counter_obj, counter_funding_tx|None) from
+    INDEPENDENT sources.
+
+    `cited` carries the only journal-trusted data: the spend tx ids — but when a spend txid is OMITTED,
+    the verifier DISCOVERS the spender independently (outpoint->spender scan), so a party CANNOT park a
+    leg at PENDING by withholding it (review MEDIUM). A cited/discovered spend must be buried
+    >= `min_confirmations` deep on the independent source; set it deep for real-value runs — a shallow,
+    source-TRUSTED disposition is reorgable, and a scored PASS on a 1-conf claim that later reorgs is a
+    real one-sided loss (review MEDIUM). counter_obj is raw bytes (btc) or (tx,receipt) (eth)."""
+    funded_spk, _tk, _mk = rxd_expected_scripts(m)
     rxd = _RxdFetcher(rxd_url)
     asset_claim_height = None
     try:
         cov_fund = await rxd.raw_tx(m.covenant_funding.txid)
         spend_txid = cited.get("covenant_spend_txid")
+        if not spend_txid:
+            spend_txid = await rxd.spend_of(m.covenant_funding, funded_spk)  # DISCOVER an omitted spend
+            if spend_txid:
+                print(f"  discovered covenant spend {spend_txid} independently (was not cited)", file=sys.stderr)
         cov_spend = await rxd.raw_tx(spend_txid) if spend_txid else None
         if spend_txid:
-            asset_claim_height = await rxd.confirm_height(spend_txid)
-            # Confirmation gate: a cited spend must be MINED. An unconfirmed (or unknown) tx was never
-            # validated by consensus, so its scriptSig could be junk that doesn't actually satisfy the
-            # covenant — treating it as a settled disposition would let a fabricated tx that merely names
-            # the covenant outpoint pass the provenance check. Mirrors the BTC leg's min_confirmations=1.
-            if asset_claim_height is None:
+            # Depth gate: a cited/discovered spend must be buried >= min_confirmations. Below that it is
+            # unconfirmed (junk scriptSig — never consensus-validated) OR shallow (reorgable); either way
+            # scoring it as a settled disposition is a false-PASS window.
+            confs = await rxd.confirmations(spend_txid)
+            if confs < min_confirmations:
                 raise ValueError(
-                    f"cited covenant-spend {spend_txid} is not confirmed on the independent RXD source — "
-                    "refusing to score an unconfirmed disposition"
+                    f"covenant-spend {spend_txid} has {confs} confirmations (< required {min_confirmations}) "
+                    "on the independent RXD source — refusing to score a shallow/unconfirmed (reorgable) "
+                    "disposition"
                 )
+            asset_claim_height = await rxd.confirm_height(spend_txid)
     finally:
         await rxd.close()
 
     counter_obj = None
+    counter_funding_tx = None
     spend_id = cited.get("counter_spend_txid")
     if m.counter_chain == "btc":
-        btc = _BtcFetcher(btc_url)
+        btc = _BtcFetcher(btc_url, min_confirmations=min_confirmations)
         try:
+            if m.counter_funding is not None:
+                counter_funding_tx = await btc.raw_tx(m.counter_funding.txid)  # for the counter VALUE check
+            if not spend_id and m.counter_funding is not None:
+                spend_id = await btc.spend_of(m.counter_funding)  # DISCOVER an omitted counter spend
+                if spend_id:
+                    print(f"  discovered counter spend {spend_id} independently (was not cited)", file=sys.stderr)
             counter_obj = await btc.raw_tx(spend_id) if spend_id else None
         finally:
             await btc.close()
@@ -688,7 +789,7 @@ async def _fetch_for_live(m: RunManifest, cited: dict, btc_url: str, rxd_url: st
                 counter_obj = await eth.tx_and_receipt(spend_id)
             finally:
                 await eth.close()
-    return cov_fund, cov_spend, counter_obj, asset_claim_height
+    return cov_fund, cov_spend, counter_obj, counter_funding_tx, asset_claim_height
 
 
 def run_verify(
@@ -698,13 +799,15 @@ def run_verify(
     counter_obj,
     *,
     asset_claim_height: int | None = None,
+    counter_funding_tx: bytes | None = None,
 ) -> VerifyResult:
     """The pure verification core — given re-fetched data, produce the verdict. counter_obj is raw bytes
     (btc) or a (tx_dict, receipt_dict) tuple (eth) or None. Network-free; the offline self-check uses it.
-    `asset_claim_height` (the RXD covenant-spend confirm height) drives the lucky-pass margin grade."""
+    `asset_claim_height` (the RXD covenant-spend confirm height) drives the lucky-pass margin grade.
+    `counter_funding_tx` (btc) enables the counter-leg VALUE check when m.counter_amount is set."""
     asset, asset_notes = verify_asset_leg(m, covenant_funding_tx, covenant_spend_tx)
     if m.counter_chain == "btc":
-        counter, counter_p_sha256, counter_notes = verify_counter_leg_btc(m, counter_obj)
+        counter, counter_p_sha256, counter_notes = verify_counter_leg_btc(m, counter_obj, counter_funding_tx)
     else:
         tx, rcpt = counter_obj if counter_obj else (None, None)
         counter, counter_p_sha256, counter_notes = verify_counter_leg_eth(m, tx, rcpt)
@@ -865,6 +968,44 @@ def _self_check() -> int:
     res_fail = run_verify(m2, funding2, refund2, btc_claim)
     check("end-to-end BTC free-option -> FAIL_ONE_SIDED", res_fail.verdict is Verdict.FAIL_ONE_SIDED)
 
+    # 5b) counter-leg VALUE integrity (review MEDIUM): the counter HTLC funding output must carry the
+    # agreed counter_amount — an atomic-but-MISPRICED swap is ANOMALOUS, not a silent PASS. Build a
+    # minimal legacy BTC funding tx with a 100_000-sat output at vout 0 (segwit-aware parse in the leg).
+    import struct as _struct
+
+    cf_tx = (
+        _struct.pack("<i", 1)  # version
+        + b"\x01"
+        + b"\x00" * 32
+        + b"\x00\x00\x00\x00"  # 1 input (prevout)
+        + b"\x00"
+        + b"\xff\xff\xff\xff"  # empty scriptSig, seq
+        + b"\x01"
+        + _struct.pack("<q", 100_000)
+        + b"\x00"  # 1 output: 100_000 sats, empty spk
+        + b"\x00\x00\x00\x00"  # locktime
+    )
+    cl_ok, _, _ = verify_counter_leg_btc(replace(m2, counter_amount=100_000), btc_claim, cf_tx)
+    check("counter value MATCHES agreed -> MAKER_CLAIMED (not anomalous)", cl_ok is CounterLeg.MAKER_CLAIMED)
+    cl_bad, _, _ = verify_counter_leg_btc(replace(m2, counter_amount=99_999), btc_claim, cf_tx)
+    check("counter value MISMATCH (mispriced) -> ANOMALOUS", cl_bad is CounterLeg.ANOMALOUS)
+
+    # 5c) secret-key guard (review LOW): PRIVATE keys rejected, PUBLIC keys NOT (the bare "key" substring
+    # used to false-positive on pubkey/public_key).
+    def _rejects(doc: dict) -> bool:
+        try:
+            assert_no_secrets(doc, what="t")
+            return False
+        except ValueError:
+            return True
+
+    check(
+        "secret guard PASSES public-key fields (pubkey/public_key/pkh)",
+        not _rejects({"maker_pubkey_hex": "ab" * 33, "claim_public_key": "cd" * 33, "taker_pkh_hex": "ee" * 20}),
+    )
+    check("secret guard REJECTS a private signing_key", _rejects({"signing_key_hex": "de" * 32}))
+    check("secret guard REJECTS a nested privkey", _rejects({"x": {"maker_privkey_hex": "de" * 32}}))
+
     # 6) ETH counter-leg disposition against synthetic tx/receipt dicts.
     p_eth = b"\xcd" * 32
     h_eth = _sha256(p_eth)
@@ -1005,10 +1146,22 @@ async def _run_cli(args: argparse.Namespace) -> int:
             cited.setdefault(k, v)
 
     # 3) re-fetch from independent sources + verify.
-    cov_fund, cov_spend, counter_obj, asset_claim_height = await _fetch_for_live(
-        m, cited, args.btc_esplora_url, args.rxd_electrumx_url, args.eth_rpc_url
+    cov_fund, cov_spend, counter_obj, counter_funding_tx, asset_claim_height = await _fetch_for_live(
+        m,
+        cited,
+        args.btc_esplora_url,
+        args.rxd_electrumx_url,
+        args.eth_rpc_url,
+        min_confirmations=args.min_confirmations,
     )
-    res = run_verify(m, cov_fund, cov_spend, counter_obj, asset_claim_height=asset_claim_height)
+    res = run_verify(
+        m,
+        cov_fund,
+        cov_spend,
+        counter_obj,
+        asset_claim_height=asset_claim_height,
+        counter_funding_tx=counter_funding_tx,
+    )
     print(json.dumps(res.as_dict(), indent=2))
     return (
         0 if res.verdict is Verdict.PASS else (2 if res.verdict in (Verdict.FAIL_ONE_SIDED, Verdict.ANOMALOUS) else 4)
@@ -1023,6 +1176,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--rxd-electrumx-url", help="an RXD ElectrumX NEITHER party ran")
     ap.add_argument("--btc-esplora-url", help="an Esplora NEITHER party ran (btc counter leg)")
     ap.add_argument("--eth-rpc-url", help="an ETH RPC NEITHER party ran (eth counter leg)")
+    ap.add_argument(
+        "--min-confirmations",
+        type=int,
+        default=1,
+        help="min burial depth a cited/discovered spend must have on the independent source before it is "
+        "scored (default 1 = MINED-only, fine for regtest/testnet). REAL-VALUE runs MUST set this DEEP "
+        "(e.g. 6+ BTC / a value-scaled RXD depth): a shallow, source-trusted disposition is reorgable, so a "
+        "PASS on a 1-conf claim that later reorgs is a real one-sided loss.",
+    )
     args = ap.parse_args(argv)
 
     if args.self_check:
