@@ -179,9 +179,11 @@ class RunManifest:
     counter_funding: Outpoint | None = None  # btc: the HTLC P2TR funding outpoint
     eth_contract: str | None = None  # eth: the per-swap deployed EthHtlc contract address (0x..)
     eth_chain_id: int | None = None  # eth: the chain id the contract lives on
-    # counter-leg VALUE (review MEDIUM): the agreed amount the counter HTLC must be funded with (btc: sats).
-    # When set, the verifier asserts the counter FUNDING output carries exactly this — else an atomic-but-
-    # MISPRICED swap (counter leg funded at the wrong amount) would score PASS. Optional (None = not checked).
+    eth_funding_tx: str | None = None  # eth: the DEPLOY tx hash (payable ctor; its value == the funded wei)
+    # counter-leg VALUE (review MEDIUM): the agreed amount the counter HTLC must be funded with (btc: sats;
+    # eth: wei). When set, the verifier asserts the counter leg was FUNDED with exactly this — BTC from the
+    # funding output value, ETH from the deploy tx value (payable constructor, bound to our contract via the
+    # deploy receipt's contractAddress) — else an atomic-but-MISPRICED swap would PASS. Optional (None = off).
     counter_amount: int | None = None
     # lucky-pass margin grading (optional): the RXD height the covenant was funded at + the declared minimum
     # slack the honest taker's asset-claim must have had before the maker's CSV refund window opened.
@@ -215,7 +217,7 @@ class RunManifest:
             raise ValueError("h_hex must be 32 bytes")
         if len(bytes.fromhex(d["taker_pkh_hex"])) != 20 or len(bytes.fromhex(d["maker_pkh_hex"])) != 20:
             raise ValueError("taker_pkh_hex / maker_pkh_hex must be 20 bytes")
-        counter_funding = eth_contract = eth_chain_id = None
+        counter_funding = eth_contract = eth_chain_id = eth_funding_tx = None
         if d["counter_chain"] == "btc":
             if "counter_funding" not in d:
                 raise ValueError("btc counter_chain requires 'counter_funding' (txid:vout)")
@@ -227,6 +229,10 @@ class RunManifest:
             if not (eth_contract.startswith("0x") and len(eth_contract) == 42):
                 raise ValueError("eth_contract must be a 0x-prefixed 20-byte address")
             eth_chain_id = int(d["eth_chain_id"])
+            if d.get("eth_funding_tx") is not None:  # optional; required only to check counter VALUE
+                eth_funding_tx = str(d["eth_funding_tx"]).lower()
+                if not (eth_funding_tx.startswith("0x") and len(eth_funding_tx) == 66):
+                    raise ValueError("eth_funding_tx must be a 0x-prefixed 32-byte tx hash")
         return cls(
             swap_id=str(d["swap_id"]),
             asset_variant=str(d["asset_variant"]),
@@ -241,6 +247,7 @@ class RunManifest:
             counter_funding=counter_funding,
             eth_contract=eth_contract,
             eth_chain_id=eth_chain_id,
+            eth_funding_tx=eth_funding_tx,
             asset_locked_at_height=(
                 int(d["asset_locked_at_height"]) if d.get("asset_locked_at_height") is not None else None
             ),
@@ -479,14 +486,23 @@ def _as_int(x: object) -> int:
 
 
 def verify_counter_leg_eth(
-    m: RunManifest, claim_tx: dict | None, claim_receipt: dict | None
+    m: RunManifest,
+    claim_tx: dict | None,
+    claim_receipt: dict | None,
+    funding: tuple[dict, dict | None] | None = None,
 ) -> tuple[CounterLeg, bytes | None, list[str]]:
     """Re-derive the ETH counter-leg disposition from an independently-fetched tx + receipt.
 
     Mirrors swap_coordinator.assert_claim_provenance (R6): the spend must (a) have SUCCEEDED (status==1 —
     a reverted-but-mined claim leaks p but moved no ETH), and (b) emit a Claimed/Refunded event FROM OUR
     contract instance. A claim's p is recovered from calldata + our-contract log data (recover_secret) and
-    must appear in an our-contract log blob (topics||data). p scraped from a DIFFERENT contract is rejected."""
+    must appear in an our-contract log blob (topics||data). p scraped from a DIFFERENT contract is rejected.
+
+    When ``m.counter_amount`` + ``funding`` (the deploy tx + receipt) are supplied, the ETH HTLC's funded
+    VALUE is checked (review MEDIUM): the EthHtlc payable constructor funds the contract with the deploy
+    tx's ``value``, and the deploy receipt's ``contractAddress`` binds that deploy to OUR contract — so
+    ``deploy.value == counter_amount`` proves the counter leg was funded at the agreed wei. A mispriced
+    (under/over-funded) counter leg is ANOMALOUS, not a silent PASS. Symmetric with the BTC leg's check."""
     from pyrxd.eth_wallet.secret import recover_secret  # lazy: keep the btc path web3/eth-free
 
     notes: list[str] = []
@@ -494,6 +510,28 @@ def verify_counter_leg_eth(
         return CounterLeg.PENDING, None, ["counter (ETH HTLC) has no cited claim/refund tx (unspent)"]
     assert m.eth_contract is not None  # guaranteed by manifest validation for eth
     contract = m.eth_contract.lower()
+    if m.counter_amount is not None and funding is not None:
+        f_tx, f_rcpt = funding
+        created = str((f_rcpt or {}).get("contractAddress", "") or "").lower()
+        if created != contract:
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [
+                    "cited eth_funding_tx did NOT create our HTLC contract (contractAddress mismatch — wrong/forged funding tx)"
+                ],
+            )
+        funded_wei = _as_int(f_tx.get("value", 0))
+        if funded_wei != m.counter_amount:
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [
+                    f"ETH HTLC funded with {funded_wei} wei, agreed {m.counter_amount} "
+                    "(value mismatch — counter leg under/over-funded / mispriced)"
+                ],
+            )
+        notes.append(f"ETH HTLC deploy funded the agreed {m.counter_amount} wei to our contract")
     if _as_int(claim_receipt.get("status", 0)) != 1:
         return CounterLeg.ANOMALOUS, None, ["counter spend tx REVERTED (status != 1) — moved no ETH"]
     our_logs = [lg for lg in (claim_receipt.get("logs") or []) if str(lg.get("address", "")).lower() == contract]
@@ -768,13 +806,13 @@ async def _fetch_for_live(
         await rxd.close()
 
     counter_obj = None
-    counter_funding_tx = None
+    counter_funding = None  # btc: raw funding tx bytes; eth: (deploy_tx, deploy_receipt) — for the VALUE check
     spend_id = cited.get("counter_spend_txid")
     if m.counter_chain == "btc":
         btc = _BtcFetcher(btc_url, min_confirmations=min_confirmations)
         try:
             if m.counter_funding is not None:
-                counter_funding_tx = await btc.raw_tx(m.counter_funding.txid)  # for the counter VALUE check
+                counter_funding = await btc.raw_tx(m.counter_funding.txid)  # for the counter VALUE check
             if not spend_id and m.counter_funding is not None:
                 spend_id = await btc.spend_of(m.counter_funding)  # DISCOVER an omitted counter spend
                 if spend_id:
@@ -783,13 +821,16 @@ async def _fetch_for_live(
         finally:
             await btc.close()
     else:  # eth
-        if spend_id:
+        if spend_id or m.eth_funding_tx:
             eth = _EthFetcher(eth_url, m.eth_chain_id)  # type: ignore[arg-type]
             try:
-                counter_obj = await eth.tx_and_receipt(spend_id)
+                if spend_id:
+                    counter_obj = await eth.tx_and_receipt(spend_id)
+                if m.eth_funding_tx:
+                    counter_funding = await eth.tx_and_receipt(m.eth_funding_tx)  # deploy tx: value == funded wei
             finally:
                 await eth.close()
-    return cov_fund, cov_spend, counter_obj, counter_funding_tx, asset_claim_height
+    return cov_fund, cov_spend, counter_obj, counter_funding, asset_claim_height
 
 
 def run_verify(
@@ -799,18 +840,19 @@ def run_verify(
     counter_obj,
     *,
     asset_claim_height: int | None = None,
-    counter_funding_tx: bytes | None = None,
+    counter_funding=None,
 ) -> VerifyResult:
     """The pure verification core — given re-fetched data, produce the verdict. counter_obj is raw bytes
     (btc) or a (tx_dict, receipt_dict) tuple (eth) or None. Network-free; the offline self-check uses it.
     `asset_claim_height` (the RXD covenant-spend confirm height) drives the lucky-pass margin grade.
-    `counter_funding_tx` (btc) enables the counter-leg VALUE check when m.counter_amount is set."""
+    `counter_funding` enables the counter-leg VALUE check when m.counter_amount is set — raw funding-tx
+    bytes (btc) or the deploy (tx, receipt) tuple (eth)."""
     asset, asset_notes = verify_asset_leg(m, covenant_funding_tx, covenant_spend_tx)
     if m.counter_chain == "btc":
-        counter, counter_p_sha256, counter_notes = verify_counter_leg_btc(m, counter_obj, counter_funding_tx)
+        counter, counter_p_sha256, counter_notes = verify_counter_leg_btc(m, counter_obj, counter_funding)
     else:
         tx, rcpt = counter_obj if counter_obj else (None, None)
-        counter, counter_p_sha256, counter_notes = verify_counter_leg_eth(m, tx, rcpt)
+        counter, counter_p_sha256, counter_notes = verify_counter_leg_eth(m, tx, rcpt, funding=counter_funding)
     # Leg verifiers return sha256(p) (== manifest H, proven in-leg), never raw p. The asset-side digest is
     # INTENTIONALLY None: both legs are already bound to the single manifest H (the covenant SPK is rebuilt
     # from H, and the counter claim is checked sha256(p)==H), so equal-H both-complete ⟺ same preimage by
@@ -1050,6 +1092,23 @@ def _self_check() -> int:
     e5, _, _ = verify_counter_leg_eth(m_eth, None, None)
     check("ETH no cited spend -> PENDING", e5 is CounterLeg.PENDING)
 
+    # ETH counter-leg VALUE integrity (review follow-up): the deploy tx's value == the funded wei, bound
+    # to OUR contract via the deploy receipt's contractAddress. A mispriced or foreign-contract funding
+    # tx is ANOMALOUS, not a silent PASS.
+    eth_amt = 10**14
+    funding_ok = ({"value": hex(eth_amt)}, {"contractAddress": contract})
+    ev1, _, _ = verify_counter_leg_eth(replace(m_eth, counter_amount=eth_amt), claim_tx, claim_rcpt, funding=funding_ok)
+    check("ETH counter value MATCHES agreed -> MAKER_CLAIMED", ev1 is CounterLeg.MAKER_CLAIMED)
+    ev2, _, _ = verify_counter_leg_eth(
+        replace(m_eth, counter_amount=eth_amt + 1), claim_tx, claim_rcpt, funding=funding_ok
+    )
+    check("ETH counter value MISMATCH (mispriced) -> ANOMALOUS", ev2 is CounterLeg.ANOMALOUS)
+    funding_foreign = ({"value": hex(eth_amt)}, {"contractAddress": "0x" + "cc" * 20})
+    ev3, _, _ = verify_counter_leg_eth(
+        replace(m_eth, counter_amount=eth_amt), claim_tx, claim_rcpt, funding=funding_foreign
+    )
+    check("ETH funding tx created a DIFFERENT contract -> ANOMALOUS", ev3 is CounterLeg.ANOMALOUS)
+
     # end-to-end ETH happy path: asset claimed by taker + ETH claimed by maker -> PASS.
     fe_spk, te_holder, me_holder = rxd_expected_scripts(m_eth)
     res_eth = run_verify(m_eth, _rxd_tx(fe_spk), _rxd_tx(te_holder), (claim_tx, claim_rcpt))
@@ -1146,7 +1205,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
             cited.setdefault(k, v)
 
     # 3) re-fetch from independent sources + verify.
-    cov_fund, cov_spend, counter_obj, counter_funding_tx, asset_claim_height = await _fetch_for_live(
+    cov_fund, cov_spend, counter_obj, counter_funding, asset_claim_height = await _fetch_for_live(
         m,
         cited,
         args.btc_esplora_url,
@@ -1160,7 +1219,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         cov_spend,
         counter_obj,
         asset_claim_height=asset_claim_height,
-        counter_funding_tx=counter_funding_tx,
+        counter_funding=counter_funding,
     )
     print(json.dumps(res.as_dict(), indent=2))
     return (
