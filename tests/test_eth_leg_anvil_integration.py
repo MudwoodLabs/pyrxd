@@ -34,7 +34,7 @@ if shutil.which("anvil") is None:  # pragma: no cover - environment gate
 
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 from pyrxd.eth_wallet.rpc import EthRpc
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 pytestmark = pytest.mark.integration
@@ -208,8 +208,9 @@ async def test_refund_after_timeout_and_claim_blocked_when_expired(anvil_url):
             hashlock=h, claimant=_ADDR_MAKER, refundee=_ADDR_TAKER, timeout=timeout, amount_wei=_AMOUNT_WEI
         )
         # P3 gas pre-check: a refund BEFORE the timeout is refused (the contract would revert anyway),
-        # so no gas is burned on a guaranteed-revert tx.
-        with pytest.raises(ValidationError, match="not yet mature"):
+        # so no gas is burned on a guaranteed-revert tx. NetworkError = transient/retryable (wait for the
+        # timeout), consistent with the BTC/covenant legs — not a fatal ValidationError.
+        with pytest.raises(NetworkError, match="not yet mature"):
             await taker.refund(locator)
         # Fast-forward past the timeout.
         await _advance_time(rpc, 200)

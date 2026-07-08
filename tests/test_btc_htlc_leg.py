@@ -507,7 +507,8 @@ async def test_refund_rejects_premature_csv():
     leg = _leg(taker_kp=taker, maker_kp=maker, broadcaster=bc, reader=FakeFundingReader(claim_confs=143))
     htlc = leg._htlc(terms)
     locator = htlc.with_funding(t.BtcOutpoint("cd" * 32, 0), terms.btc_sats)
-    with pytest.raises(ValidationError, match="not yet mature: needs 144 confirmations, has 143"):
+    # NetworkError (transient/retryable), consistent with the covenant leg — not a fatal ValidationError.
+    with pytest.raises(NetworkError, match="not yet mature: needs 144 confirmations, has 143"):
         await leg.refund(locator, terms.t_btc)
     assert bc.raw_seen == [], "no non-final refund may be broadcast before CSV maturity"
 

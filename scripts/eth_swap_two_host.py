@@ -423,6 +423,21 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
     coord = _coordinator(args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out)
 
     try:
+        # HARDENING (review F2): confirm the maker ACTUALLY funded the RXD covenant on-chain (with the
+        # agreed amount) BEFORE we lock any ETH. Otherwise a hostile maker who never locks RXD can wait
+        # for our ETH HTLC and claim it with p -> one-sided taker loss. We verify it fail-closed.
+        confirm("verify the maker funded the RXD covenant on-chain before funding ETH", auto_yes=args.yes)
+        try:
+            fop, fval, _fh = await rxd_leg.chain_io.find_covenant_utxo(
+                cov.funded_spk, expected_value=terms.radiant_amount
+            )
+        except Exception as exc:
+            raise SystemExit(
+                "REFUSING to fund ETH: the agreed RXD covenant SPK is NOT funded on-chain with the agreed "
+                f"amount ({exc}). A hostile maker may not have locked RXD; aborting before our ETH is at risk."
+            ) from None
+        print(f"  -> RXD covenant confirmed funded on-chain at {fop} ({fval} photons)")
+
         confirm("taker_funds_btc: deploy+fund the ETH HTLC (taker pays gas; claim pays the maker)", auto_yes=args.yes)
         rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
         if rec.state is not SwapState.BTC_LOCKED:
