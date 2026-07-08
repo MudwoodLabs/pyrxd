@@ -763,6 +763,31 @@ class _EthFetcher:
         rcpt = await self._rpc.get_transaction_receipt(tx_hash)
         return dict(tx), (dict(rcpt) if rcpt is not None else None)
 
+    async def finalized_height(self) -> int | None:
+        """The post-Merge ``finalized`` checkpoint block number (the ETH reorg-safety oracle), or None
+        if the endpoint can't report it (fail closed at the caller)."""
+        try:
+            return int(await self._rpc.finalized_block_number())
+        except Exception:
+            return None
+
+    async def spend_of(self, contract: str) -> str | None:
+        """Independent discovery of an OMITTED ETH claim/refund (review — the ETH analog of BTC/RXD spend
+        discovery): ``eth_getLogs`` for OUR per-swap contract's ``Claimed``/``Refunded`` events. Returns
+        the spending tx hash; None if no such event (genuinely PENDING) or the source can't say
+        (fail-soft — a missed discovery degrades to PENDING, never a false PASS)."""
+        try:
+            logs = await self._rpc.get_logs(address=contract, topics=[[_ETH_CLAIMED_TOPIC, _ETH_REFUNDED_TOPIC]])
+            for lg in logs:
+                th = lg.get("transactionHash")
+                if th is not None:
+                    b = _hb(th)  # HexBytes / '0x..' / bytes -> bytes
+                    if len(b) == 32:
+                        return "0x" + b.hex()
+        except Exception:
+            return None
+        return None
+
     async def close(self) -> None:
         await self._rpc.close()
 
@@ -821,15 +846,30 @@ async def _fetch_for_live(
         finally:
             await btc.close()
     else:  # eth
-        if spend_id or m.eth_funding_tx:
-            eth = _EthFetcher(eth_url, m.eth_chain_id)  # type: ignore[arg-type]
-            try:
+        eth = _EthFetcher(eth_url, m.eth_chain_id)  # type: ignore[arg-type]
+        try:
+            if not spend_id and m.eth_contract is not None:
+                spend_id = await eth.spend_of(m.eth_contract)  # DISCOVER an omitted ETH claim/refund
                 if spend_id:
-                    counter_obj = await eth.tx_and_receipt(spend_id)
-                if m.eth_funding_tx:
-                    counter_funding = await eth.tx_and_receipt(m.eth_funding_tx)  # deploy tx: value == funded wei
-            finally:
-                await eth.close()
+                    print(f"  discovered counter (ETH) spend {spend_id} independently (was not cited)", file=sys.stderr)
+            if spend_id:
+                counter_obj = await eth.tx_and_receipt(spend_id)
+                # FINALITY gate (review): the ETH claim/refund must be at/under the `finalized` checkpoint
+                # — a mined-but-non-final (reorgable) disposition must NOT be scored as settled. This is
+                # the ETH analog of the BTC/RXD confirmation-depth gate (ETH reorg-safety is checkpoint-
+                # based, not depth-based), matching swap_coordinator's finalized-checkpoint verdict.
+                _tx, rcpt = counter_obj
+                claim_block = _as_int((rcpt or {}).get("blockNumber", 0)) if rcpt else 0
+                finalized = await eth.finalized_height()
+                if finalized is None or claim_block <= 0 or claim_block > finalized:
+                    raise ValueError(
+                        f"cited/discovered ETH counter-spend {spend_id} is NOT finalized (block {claim_block}, "
+                        f"finalized {finalized}) on the independent source — refusing to score a reorgable disposition"
+                    )
+            if m.eth_funding_tx:
+                counter_funding = await eth.tx_and_receipt(m.eth_funding_tx)  # deploy tx: value == funded wei
+        finally:
+            await eth.close()
     return cov_fund, cov_spend, counter_obj, counter_funding, asset_claim_height
 
 
