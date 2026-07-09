@@ -110,7 +110,24 @@ _BTC_REGTEST = "bcrt"
 # File exchange (the cross-host surface — all public, never the preimage p)
 # ---------------------------------------------------------------------------
 
-_SECRET_FORBIDDEN_KEYS = ("preimage", "preimage_p", "preimage_p_hex", "p_hex", "wif", "secret", "privkey")
+_SECRET_FORBIDDEN_KEYS = (
+    "preimage",
+    "preimage_p",
+    "preimage_p_hex",
+    "p_hex",
+    "wif",
+    "secret",
+    "privkey",
+    # review MEDIUM: the original list missed several secret-carrying key names. Substring match, so
+    # "private_key" is NOT caught by "privkey" and "eth_key" covers "eth_key_hex".
+    "private_key",
+    "signing_key",
+    "eth_key",
+    "seed",
+    "mnemonic",
+    "xprv",
+    "xpriv",
+)
 
 
 def _assert_public_only(doc: dict, *, what: str) -> None:
@@ -481,7 +498,23 @@ async def taker_phase_fund(args) -> None:
                 "REFUSING to fund BTC: the agreed RXD covenant SPK is NOT funded on-chain with the agreed "
                 f"amount ({exc}). A hostile maker may not have locked RXD; aborting before our BTC is at risk."
             ) from None
-        print(f"  -> RXD covenant confirmed funded on-chain at {fop} ({fval} photons)")
+        # DEPTH GATE (review MEDIUM): "funded" is not enough — the funding must be BURIED. find_covenant_utxo
+        # can return a 0-conf/mempool UTXO (ElectrumX listunspent includes unconfirmed), and a hostile maker
+        # who funds RXD with a replaceable/reorgable tx, waits for our BTC lock, then double-spends the RXD
+        # funding away strands our BTC (the maker still claims BTC with p; the vanished covenant is no longer
+        # claimable by us -> one-sided taker loss). Require a confirmation floor; fail closed below it.
+        fop_txid = fop.split(":")[0]
+        try:
+            confs = await rxd_leg.chain_io.confirmations(fop_txid)
+        except Exception as exc:
+            raise SystemExit(f"REFUSING to fund BTC: could not read RXD covenant confirmation depth ({exc}).") from None
+        if confs < args.taker_min_rxd_confs:
+            raise SystemExit(
+                f"REFUSING to fund BTC: the RXD covenant funding {fop_txid} has {confs} confirmation(s) "
+                f"(< required {args.taker_min_rxd_confs}) — a shallow/mempool funding is reorgable/replaceable "
+                "and could be double-spent after we lock. Wait for it to bury, then retry."
+            )
+        print(f"  -> RXD covenant confirmed funded on-chain at {fop} ({fval} photons), buried {confs} conf(s)")
 
         confirm(
             "taker_funds_btc: fund the BTC HTLC (taker's UTXO; claim pays the maker, refund pays the taker)",
@@ -886,6 +919,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--t-rxd-blocks", type=int, default=20, help="(maker) the RXD covenant CSV")
     p.add_argument("--t-btc-blocks", type=int, default=60, help="(maker) the BTC HTLC CSV (must exceed t_rxd + margin)")
     p.add_argument("--margin-blocks", type=int, default=36)
+    p.add_argument(
+        "--taker-min-rxd-confs",
+        type=int,
+        default=1,
+        help="(taker) min confirmations the maker's RXD covenant funding must have before we lock BTC "
+        "(default 1 = MINED-only, fine for regtest). REAL VALUE must set this DEEP: a shallow/mempool RXD "
+        "funding is reorgable/replaceable, and a maker who double-spends it after we lock strands our BTC.",
+    )
 
     # Taker BTC funding UTXO + payout (taker)
     p.add_argument("--btc-funding-txid", default="")

@@ -576,7 +576,10 @@ class BitcoinCoreRpcSource(BtcDataSource):
                 if resp.status not in (200, 500):
                     raise NetworkError(f"RPC HTTP error: {resp.status}")
                 try:
-                    data = json.loads(body)
+                    # parse_float=Decimal (review MEDIUM): Bitcoin Core reports BTC amounts as JSON numbers.
+                    # The default float parser is lossy, so downstream sat conversion could round-trip a
+                    # wrong value. Decimal keeps the node's decimal exact all the way into _btc_to_sats.
+                    data = json.loads(body, parse_float=Decimal)
                 except json.JSONDecodeError:
                     raise NetworkError("Bitcoin Core returned non-JSON response")
                 if data.get("error") is not None:
@@ -1112,6 +1115,10 @@ class BitcoinCoreFundingReader:
         return data
 
     async def confirmations(self, txid: str) -> int:
+        # NB (review MEDIUM, source-trust): this is the node's SELF-REPORTED depth — a single hostile/buggy
+        # node could OVER-report it, defeating a reorg-depth gate that trusts one source. The txid pin can't
+        # catch this (depth isn't in the tx). For real value use MultiSourceBtcFundingReader (quorum) so no
+        # single source's depth is load-bearing.
         data = await self._verbose_tx(txid)
         confs = data.get("confirmations")
         if confs is None:

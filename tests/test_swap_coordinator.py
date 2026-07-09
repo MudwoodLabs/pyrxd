@@ -887,7 +887,9 @@ async def test_maker_stall_refuses_premature_refund():
 
     # locked at 1000; maturity = 1072; trigger fires at 1066 but the covenant is 6 blocks short of
     # CSV maturity — refuse to broadcast.
-    with pytest.raises(ValidationError, match="not yet mature.*matures at height 1072, now 1066"):
+    # NetworkError (not ValidationError): "not yet mature" is a TRANSIENT/retryable condition, the same
+    # convention the RadiantLeg/BtcLeg refund maturity self-checks use — a block poller keys on it to retry.
+    with pytest.raises(NetworkError, match="not yet mature.*matures at height 1072, now 1066"):
         await coord.maybe_refund_asset_on_maker_stall(
             now_block_height=1066, asset_locked_at_height=1000, maker_has_claimed_btc=False
         )
