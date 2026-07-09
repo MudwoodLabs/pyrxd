@@ -311,6 +311,20 @@ def assert_no_secrets(doc: object, *, what: str) -> None:
         raise ValueError(f"{what}: a WIF-shaped secret value is present in a public file")
 
 
+def _dedup_by_host(urls: list[str]) -> list[str]:
+    """Collapse URLs that share a hostname to one (order-preserving). Two endpoints on the SAME host are the
+    SAME trust domain, so counting them as two independent sources would be a fake quorum — a party who runs
+    that host could feed both a fabricated tx/receipt in lockstep."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for u in urls:
+        host = (urlparse(u).hostname or u).lower()
+        if host not in seen:
+            seen.add(host)
+            out.append(u)
+    return out
+
+
 def assert_independent_endpoints(verifier_urls: list[str], party_endpoints: tuple[str, ...]) -> None:
     """The verifier's corroboration sources MUST be hosts neither party ran (else it's not independent).
 
@@ -751,6 +765,18 @@ def margin_grade(
 
 # --------------------------------------------------------------------------- chain re-fetch (independent)
 
+# Bound on the outpoint->spender discovery scans (review MEDIUM, DoS): a hostile ElectrumX/Esplora can
+# return an unboundedly long scripthash history, and the RXD scan fetches each candidate tx sequentially.
+# Without a cap that is an amplification lever (one request -> N full-tx fetches). The genuine spender of a
+# freshly-funded covenant sits at the FRONT of the history, so a modest cap never misses an honest spend;
+# if it is hit we log and fail-soft to None (degrades to PENDING, never a false PASS).
+_MAX_DISCOVERY_CANDIDATES = 256
+# Cap on a single discovery HTTP response body (Esplora /outspend is a tiny JSON object; anything larger is
+# a hostile source trying to exhaust memory).
+_MAX_DISCOVERY_BODY_BYTES = 64 * 1024
+# Per-request network timeout for the discovery HTTP calls (a hostile source must not be able to hang the run).
+_DISCOVERY_HTTP_TIMEOUT_S = 30
+
 
 class _BtcFetcher:
     """Re-fetch BTC raw txs from an Esplora the parties did NOT run."""
@@ -773,11 +799,17 @@ class _BtcFetcher:
         import aiohttp
 
         url = f"{self._base}/tx/{op.txid}/outspend/{op.vout}"
+        timeout = aiohttp.ClientTimeout(total=_DISCOVERY_HTTP_TIMEOUT_S)
         try:
-            async with aiohttp.ClientSession() as s, s.get(url) as r:
+            async with aiohttp.ClientSession(timeout=timeout) as s, s.get(url) as r:
                 if r.status != 200:
                     return None
-                data = await r.json(content_type=None)
+                # Body cap (review MEDIUM, DoS): /outspend is a tiny JSON object; a hostile Esplora could
+                # stream an unbounded body to exhaust memory. Read at most the cap, then parse.
+                body = await r.content.read(_MAX_DISCOVERY_BODY_BYTES + 1)
+                if len(body) > _MAX_DISCOVERY_BODY_BYTES:
+                    return None
+                data = json.loads(body)
             if isinstance(data, dict) and data.get("spent") and isinstance(data.get("txid"), str):
                 return str(data["txid"]).lower()
         except Exception:
@@ -835,6 +867,16 @@ class _RxdFetcher:
             target = op.prevout_le_bytes()
             async with self._client as c:
                 hist = await c.get_history(scripthash)
+                if len(hist) > _MAX_DISCOVERY_CANDIDATES:
+                    # DoS cap (review MEDIUM): the honest spender sits at the front of a freshly-funded
+                    # covenant's history, so truncating a hostile, padded history never misses it; a miss
+                    # fails soft to None (PENDING), never a false PASS.
+                    print(
+                        f"  RXD spend-discovery history for {op.txid} exceeded {_MAX_DISCOVERY_CANDIDATES} "
+                        f"candidates ({len(hist)}) — scanning the first {_MAX_DISCOVERY_CANDIDATES} only",
+                        file=sys.stderr,
+                    )
+                    hist = hist[:_MAX_DISCOVERY_CANDIDATES]
                 for entry in hist:
                     cand = str(entry.get("tx_hash") or "")
                     if not cand or cand == op.txid:  # skip the funding tx itself
@@ -895,8 +937,83 @@ class _EthFetcher:
         await self._rpc.close()
 
 
+def _eth_material_fp(tx: dict, rcpt: dict | None) -> tuple:
+    """Canonical fingerprint of the ONLY tx/receipt fields the ETH verdict depends on: the deploy/claim
+    input bytes (constructor args + revealed preimage), the funded value, the receipt status, the created
+    contract address, the block (finality), and every emitted log (address/topics/data). Two honest RPCs
+    return byte-identical values for these on a given tx, so equality across sources is the cross-check;
+    any divergence means at least one source is lying about a material fact (H2)."""
+    r = rcpt or {}
+    logs = tuple(
+        sorted(
+            (
+                str(lg.get("address", "") or "").lower(),
+                tuple(_hb(t).hex() for t in (lg.get("topics") or [])),
+                _hb(lg.get("data")).hex(),
+            )
+            for lg in (r.get("logs") or [])
+        )
+    )
+    return (
+        _hb(tx.get("input")).hex(),
+        _as_int(tx.get("value", 0)),
+        _as_int(r.get("status")) if r.get("status") is not None else None,
+        str(r.get("contractAddress", "") or "").lower(),
+        _as_int(r.get("blockNumber")) if r.get("blockNumber") is not None else None,
+        logs,
+    )
+
+
+class _MultiEthFetcher:
+    """Cross-check an ETH tx/receipt across N INDEPENDENT RPCs (H2). Unlike a BTC/RXD tx — whose bytes are
+    pinned by ``hash(tx) == txid`` — an ETH tx/receipt cannot be self-verified from the returned fields, so
+    a single hostile or MITM'd RPC could fabricate a receipt (wrong value, forged Claimed log, spoofed
+    finality) and steer the verdict to a false PASS. This fetcher queries every configured RPC and requires
+    them to AGREE on every material fact (see ``_eth_material_fp``); a lone dissenter fails the run rather
+    than being out-voted. With a single RPC it degrades to one source and the caller emits a loud
+    not-independent warning."""
+
+    def __init__(self, rpc_urls: list[str], chain_id: int):
+        self._fetchers = [_EthFetcher(u, chain_id) for u in rpc_urls]
+        if not self._fetchers:
+            raise ValueError("at least one ETH RPC url is required")
+        self.source_count = len(self._fetchers)
+
+    async def tx_and_receipt(self, tx_hash: str) -> tuple[dict, dict | None]:
+        results = [await f.tx_and_receipt(tx_hash) for f in self._fetchers]
+        fps = {_eth_material_fp(tx, rcpt) for (tx, rcpt) in results}
+        if len(fps) != 1:
+            raise ValueError(
+                f"ETH sources DISAGREE on the material facts of {tx_hash} across {self.source_count} "
+                "independent RPCs — refusing to score a possibly-fabricated tx/receipt"
+            )
+        return results[0]
+
+    async def finalized_height(self) -> int | None:
+        """The MINIMUM `finalized` checkpoint across sources: an over-reporting source cannot make a
+        non-final (reorgable) claim look settled, and any source that can't report finality fails the run
+        closed (None -> the caller's finality gate refuses)."""
+        heights = [await f.finalized_height() for f in self._fetchers]
+        if any(h is None for h in heights):
+            return None
+        return min(heights)
+
+    async def spend_of(self, contract: str) -> str | None:
+        """Discover an omitted claim/refund across sources. All sources that find a spend must agree on the
+        SAME tx hash; a disagreement (or none found) fails soft to None -> PENDING, never a false PASS."""
+        found = [await f.spend_of(contract) for f in self._fetchers]
+        non_null = {x for x in found if x}
+        if len(non_null) != 1:
+            return None
+        return next(iter(non_null))
+
+    async def close(self) -> None:
+        for f in self._fetchers:
+            await f.close()
+
+
 async def _fetch_for_live(
-    m: RunManifest, cited: dict, btc_url: str, rxd_url: str, eth_url: str | None, *, min_confirmations: int = 1
+    m: RunManifest, cited: dict, btc_url: str, rxd_url: str, eth_urls: list[str] | None, *, min_confirmations: int = 1
 ):
     """Fetch (covenant_funding_tx, covenant_spend_tx|None, counter_obj, counter_funding_tx|None) from
     INDEPENDENT sources.
@@ -949,7 +1066,7 @@ async def _fetch_for_live(
         finally:
             await btc.close()
     else:  # eth
-        eth = _EthFetcher(eth_url, m.eth_chain_id)  # type: ignore[arg-type]
+        eth = _MultiEthFetcher([u for u in (eth_urls or []) if u], m.eth_chain_id)
         try:
             if not spend_id and m.eth_contract is not None:
                 spend_id = await eth.spend_of(m.eth_contract)  # DISCOVER an omitted ETH claim/refund
@@ -1413,6 +1530,64 @@ def _self_check() -> int:
         res_marg.verdict is Verdict.PASS and res_marg.checks["margin"]["grade"] == "MARGINAL",
     )
 
+    # 9) ETH cross-source fingerprint (H2): identical tx/receipt -> equal fp; any material divergence -> differ.
+    _tx = {"input": "0xdead", "value": 5}
+    _rc = {
+        "status": "0x1",
+        "contractAddress": "0xAbC",
+        "blockNumber": "0x10",
+        "logs": [{"address": "0xC0", "topics": [_ETH_CLAIMED_TOPIC], "data": "0xbeef"}],
+    }
+    check("eth fp: identical sources agree", _eth_material_fp(_tx, _rc) == _eth_material_fp(dict(_tx), dict(_rc)))
+    check("eth fp: different value differs", _eth_material_fp(_tx, _rc) != _eth_material_fp({**_tx, "value": 6}, _rc))
+    check(
+        "eth fp: forged log differs",
+        _eth_material_fp(_tx, _rc)
+        != _eth_material_fp(_tx, {**_rc, "logs": [{"address": "0xC0", "topics": [_ETH_REFUNDED_TOPIC], "data": "0x"}]}),
+    )
+    check(
+        "eth fp: address case-insensitive",
+        _eth_material_fp(_tx, _rc) == _eth_material_fp(_tx, {**_rc, "contractAddress": "0xabc"}),
+    )
+
+    # 10) trust advisories (H2 single-source ETH warning + M2 depth note).
+    m_eth = RunManifest(
+        swap_id="ad",
+        asset_variant="rxd",
+        counter_chain="eth",
+        honest_party="taker",
+        h_hex="11" * 32,
+        taker_pkh_hex="22" * 20,
+        maker_pkh_hex="33" * 20,
+        rxd_amount=1000,
+        refund_csv=48,
+        covenant_funding=Outpoint("ab" * 32, 0),
+        eth_contract="0x" + "cc" * 20,
+        eth_chain_id=1,
+    )
+    r_single = VerifyResult(verdict=Verdict.PASS)
+    _append_trust_advisories(r_single, m_eth, ["https://a.example"], 1)
+    check(
+        "advisory: single ETH RPC -> loud warning + count 1",
+        r_single.checks.get("eth_source_count") == 1 and any("SINGLE RPC" in x for x in r_single.reasons),
+    )
+    r_multi = VerifyResult(verdict=Verdict.PASS)
+    _append_trust_advisories(r_multi, m_eth, ["https://a.example", "https://b.example"], 6)
+    check(
+        "advisory: 2 ETH RPCs -> no single-source warning, count 2",
+        r_multi.checks.get("eth_source_count") == 2 and not any("SINGLE RPC" in x for x in r_multi.reasons),
+    )
+    check("advisory: PASS gets depth note", any("burial DEPTH" in x for x in r_multi.reasons))
+    r_fail = VerifyResult(verdict=Verdict.FAIL_ONE_SIDED)
+    _append_trust_advisories(r_fail, m_eth, ["https://a.example", "https://b.example"], 6)
+    check("advisory: FAIL gets no depth note", not any("burial DEPTH" in x for x in r_fail.reasons))
+    # same-host URLs are NOT two independent sources (fake-quorum guard).
+    check(
+        "dedup: same host collapses to one",
+        _dedup_by_host(["https://a.example/x", "https://a.example/y", "https://b.example"])
+        == ["https://a.example/x", "https://b.example"],
+    )
+
     print()
     if failures:
         print(f"SELF-CHECK FAILED: {len(failures)} check(s) failed")
@@ -1442,6 +1617,33 @@ def _load_json(path: str) -> dict:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def _append_trust_advisories(res: VerifyResult, m: RunManifest, eth_urls: list[str], min_confirmations: int) -> None:
+    """Attach loud, structured notes about the residual trust the re-fetch could NOT eliminate, so an
+    operator can't mistake a PASS for more assurance than it carries (review MEDIUM: source-trust
+    boundaries). Two residuals: (H2) a single ETH RPC is trusted — an ETH tx/receipt is not hash-pinnable,
+    so cross-check it with >=2 --eth-rpc-url; (M2) BTC/RXD confirmation depth is read from ONE independent
+    source — the txid pin is unforgeable but the *depth* (reorg-safety) is source-trusted, so set
+    --min-confirmations deep for real value."""
+    if m.counter_chain == "eth":
+        n = len([u for u in eth_urls if u])
+        res.checks["eth_source_count"] = n
+        if n < 2:
+            res.reasons.append(
+                "WARNING: the ETH counter leg was re-fetched from a SINGLE RPC — unlike a BTC/RXD tx, an "
+                "ETH tx/receipt cannot be hash-pinned from its returned fields, so a single hostile or "
+                "MITM'd RPC could fabricate the value/logs/finality that drive this verdict. Pass >=2 "
+                "independent --eth-rpc-url for a cross-checked (quorum) re-fetch before trusting a PASS."
+            )
+    if res.verdict in (Verdict.PASS, Verdict.PENDING):
+        res.checks["depth_source"] = "single-source-trusted"
+        res.reasons.append(
+            f"NOTE: confirmation depth / finality of the settled leg(s) was read from a SINGLE independent "
+            f"source (min_confirmations={min_confirmations}); the txid is unforgeable but its burial DEPTH "
+            "is source-trusted. For real value set --min-confirmations deep and prefer multiple independent "
+            "depth sources — a shallow disposition that later reorgs is a real one-sided loss."
+        )
+
+
 async def _run_cli(args: argparse.Namespace) -> int:
     manifest_doc = _load_json(args.manifest)
     journals = [_load_json(p) for p in args.journal]
@@ -1450,9 +1652,8 @@ async def _run_cli(args: argparse.Namespace) -> int:
     for i, j in enumerate(journals):
         assert_no_secrets(j, what=f"journal[{i}]")
     m = RunManifest.from_dict(manifest_doc)
-    verifier_urls = [args.rxd_electrumx_url] + (
-        [args.btc_esplora_url] if m.counter_chain == "btc" else [args.eth_rpc_url]
-    )
+    eth_urls = _dedup_by_host([u for u in (args.eth_rpc_url or []) if u])
+    verifier_urls = [args.rxd_electrumx_url] + ([args.btc_esplora_url] if m.counter_chain == "btc" else eth_urls)
     assert_independent_endpoints([u for u in verifier_urls if u], m.party_endpoints)
 
     # 2) the only journal-trusted data: cited spend txids (cross-checked between both journals if present).
@@ -1470,7 +1671,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         cited,
         args.btc_esplora_url,
         args.rxd_electrumx_url,
-        args.eth_rpc_url,
+        eth_urls,
         min_confirmations=args.min_confirmations,
     )
     res = run_verify(
@@ -1481,6 +1682,7 @@ async def _run_cli(args: argparse.Namespace) -> int:
         asset_claim_height=asset_claim_height,
         counter_funding=counter_funding,
     )
+    _append_trust_advisories(res, m, eth_urls, args.min_confirmations)
     print(json.dumps(res.as_dict(), indent=2))
     return (
         0 if res.verdict is Verdict.PASS else (2 if res.verdict in (Verdict.FAIL_ONE_SIDED, Verdict.ANOMALOUS) else 4)
@@ -1494,7 +1696,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--journal", action="append", default=[], help="party journal JSON (repeatable; expects 2)")
     ap.add_argument("--rxd-electrumx-url", help="an RXD ElectrumX NEITHER party ran")
     ap.add_argument("--btc-esplora-url", help="an Esplora NEITHER party ran (btc counter leg)")
-    ap.add_argument("--eth-rpc-url", help="an ETH RPC NEITHER party ran (eth counter leg)")
+    ap.add_argument(
+        "--eth-rpc-url",
+        action="append",
+        default=None,
+        help="an ETH RPC NEITHER party ran (eth counter leg). REPEATABLE: pass >=2 independent RPCs for a "
+        "cross-checked (quorum) re-fetch — unlike a BTC/RXD tx, an ETH tx/receipt cannot be hash-pinned, so "
+        "a single RPC is trusted (a loud not-independent warning is emitted).",
+    )
     ap.add_argument(
         "--min-confirmations",
         type=int,
