@@ -52,8 +52,11 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from pyrxd.btc_wallet.taproot import (
+    Timelock,
+    TimeUnit,
     btc_input_outpoints_from_raw,
     btc_spend_fields_from_raw,
+    build_htlc,
     scrape_secret,
 )
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
@@ -180,6 +183,17 @@ class RunManifest:
     eth_contract: str | None = None  # eth: the per-swap deployed EthHtlc contract address (0x..)
     eth_chain_id: int | None = None  # eth: the chain id the contract lives on
     eth_funding_tx: str | None = None  # eth: the DEPLOY tx hash (payable ctor; its value == the funded wei)
+    # counter-leg RECIPIENT binding (review HIGH): the verifier previously inferred "maker claimed" purely
+    # from "a spend revealed p", never that the claim actually PAYS THE MAKER — so a malformed counter HTLC
+    # whose claim reveals p but pays the TAKER (btc: taker-keyed claim leaf; eth: contract claimant=taker)
+    # would score MAKER_CLAIMED while the honest maker lost both legs. These public negotiated terms let the
+    # verifier RE-DERIVE the counter HTLC and bind the claim to the maker (symmetry with the asset leg):
+    #   btc: rebuild the funding SPK from the two x-only pubkeys + H + t_btc; assert the funding output pays it.
+    #   eth: decode the deploy tx's constructor args (claimant/hashlock); assert claimant==maker && hashlock==H.
+    btc_claim_xonly_hex: str | None = None  # btc: the MAKER's 32-byte x-only claim pubkey
+    btc_refund_xonly_hex: str | None = None  # btc: the TAKER's 32-byte x-only refund pubkey
+    t_btc_blocks: int | None = None  # btc: the counter HTLC CSV (blocks)
+    eth_maker_claimant: str | None = None  # eth: the MAKER's payout address (the contract's immutable claimant)
     # counter-leg VALUE (review MEDIUM): the agreed amount the counter HTLC must be funded with (btc: sats;
     # eth: wei). When set, the verifier asserts the counter leg was FUNDED with exactly this — BTC from the
     # funding output value, ETH from the deploy tx value (payable constructor, bound to our contract via the
@@ -218,10 +232,24 @@ class RunManifest:
         if len(bytes.fromhex(d["taker_pkh_hex"])) != 20 or len(bytes.fromhex(d["maker_pkh_hex"])) != 20:
             raise ValueError("taker_pkh_hex / maker_pkh_hex must be 20 bytes")
         counter_funding = eth_contract = eth_chain_id = eth_funding_tx = None
+        btc_claim_xonly_hex = btc_refund_xonly_hex = t_btc_blocks = eth_maker_claimant = None
         if d["counter_chain"] == "btc":
             if "counter_funding" not in d:
                 raise ValueError("btc counter_chain requires 'counter_funding' (txid:vout)")
             counter_funding = Outpoint.parse(str(d["counter_funding"]))
+            # Optional counter-RECIPIENT binding inputs (all three required together, or none).
+            _rk = [k for k in ("btc_claim_xonly_hex", "btc_refund_xonly_hex", "t_btc_blocks") if d.get(k) is not None]
+            if _rk:
+                if len(_rk) != 3:
+                    raise ValueError(
+                        "btc counter-recipient binding needs ALL of btc_claim_xonly_hex, "
+                        "btc_refund_xonly_hex, t_btc_blocks (or none)"
+                    )
+                btc_claim_xonly_hex = str(d["btc_claim_xonly_hex"]).lower()
+                btc_refund_xonly_hex = str(d["btc_refund_xonly_hex"]).lower()
+                if len(bytes.fromhex(btc_claim_xonly_hex)) != 32 or len(bytes.fromhex(btc_refund_xonly_hex)) != 32:
+                    raise ValueError("btc_claim_xonly_hex / btc_refund_xonly_hex must be 32-byte x-only pubkeys")
+                t_btc_blocks = int(d["t_btc_blocks"])
         else:  # eth
             if "eth_contract" not in d or "eth_chain_id" not in d:
                 raise ValueError("eth counter_chain requires 'eth_contract' (0x addr) and 'eth_chain_id'")
@@ -229,10 +257,14 @@ class RunManifest:
             if not (eth_contract.startswith("0x") and len(eth_contract) == 42):
                 raise ValueError("eth_contract must be a 0x-prefixed 20-byte address")
             eth_chain_id = int(d["eth_chain_id"])
-            if d.get("eth_funding_tx") is not None:  # optional; required only to check counter VALUE
+            if d.get("eth_funding_tx") is not None:  # optional; required to check counter VALUE + RECIPIENT
                 eth_funding_tx = str(d["eth_funding_tx"]).lower()
                 if not (eth_funding_tx.startswith("0x") and len(eth_funding_tx) == 66):
                     raise ValueError("eth_funding_tx must be a 0x-prefixed 32-byte tx hash")
+            if d.get("eth_maker_claimant") is not None:  # optional counter-RECIPIENT binding
+                eth_maker_claimant = str(d["eth_maker_claimant"]).lower()
+                if not (eth_maker_claimant.startswith("0x") and len(eth_maker_claimant) == 42):
+                    raise ValueError("eth_maker_claimant must be a 0x-prefixed 20-byte address")
         return cls(
             swap_id=str(d["swap_id"]),
             asset_variant=str(d["asset_variant"]),
@@ -248,6 +280,10 @@ class RunManifest:
             eth_contract=eth_contract,
             eth_chain_id=eth_chain_id,
             eth_funding_tx=eth_funding_tx,
+            btc_claim_xonly_hex=btc_claim_xonly_hex,
+            btc_refund_xonly_hex=btc_refund_xonly_hex,
+            t_btc_blocks=t_btc_blocks,
+            eth_maker_claimant=eth_maker_claimant,
             asset_locked_at_height=(
                 int(d["asset_locked_at_height"]) if d.get("asset_locked_at_height") is not None else None
             ),
@@ -443,6 +479,32 @@ def verify_counter_leg_btc(
                 ],
             )
         notes.append(f"counter HTLC funded with the agreed {m.counter_amount} sats")
+    if m.btc_claim_xonly_hex is not None and counter_funding_tx is not None:
+        # RECIPIENT binding (review HIGH): re-derive the counter HTLC funding SPK from the agreed
+        # maker-claim + taker-refund x-only keys + H + t_btc, and assert the funding output pays exactly
+        # it. This binds the claim LEAF to the MAKER's key — so a claim revealing p is necessarily
+        # maker-authorized (pays the maker), closing the "malformed HTLC whose claim pays the taker"
+        # false-PASS. Symmetry with the asset leg's covenant SPK re-derivation.
+        outs = btc_spend_fields_from_raw(counter_funding_tx).outputs
+        if m.counter_funding.vout >= len(outs):
+            return CounterLeg.ANOMALOUS, None, [*notes, "counter funding vout out of range (forged funding tx)"]
+        expected_spk = build_htlc(
+            hashlock=bytes.fromhex(m.h_hex),
+            claim_pubkey_xonly=bytes.fromhex(m.btc_claim_xonly_hex),
+            refund_pubkey_xonly=bytes.fromhex(m.btc_refund_xonly_hex),
+            timeout=Timelock(int(m.t_btc_blocks), TimeUnit.BLOCKS),
+        ).scriptpubkey
+        if outs[m.counter_funding.vout][1] != bytes(expected_spk):
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [
+                    *notes,
+                    "counter funding output does NOT pay the HTLC re-derived from the agreed maker-claim/"
+                    "taker-refund keys + H + t_btc (malformed/hostile counter HTLC — its claim may pay the taker)",
+                ],
+            )
+        notes.append("counter funding output == HTLC re-derived from the agreed keys (claim is maker-authorized)")
     try:
         p = scrape_secret(counter_spend_tx, bytes.fromhex(m.h_hex))
         if _sha256(p) == bytes.fromhex(m.h_hex):
@@ -532,6 +594,47 @@ def verify_counter_leg_eth(
                 ],
             )
         notes.append(f"ETH HTLC deploy funded the agreed {m.counter_amount} wei to our contract")
+    if m.eth_maker_claimant is not None and funding is not None:
+        # RECIPIENT binding (review HIGH): decode the deploy tx's constructor args — last 128 bytes are
+        # (hashlock, claimant, refundee, timeout) per `constructor(bytes32,address,address,uint256)` — and
+        # assert claimant == the agreed maker payout AND hashlock == H. So a Claimed(p) event means the
+        # contract paid THE MAKER (not the taker). Reuses the already-fetched deploy tx (no extra RPC) and
+        # does not depend on the contract surviving post-claim.
+        f_tx, f_rcpt = funding
+        created = str((f_rcpt or {}).get("contractAddress", "") or "").lower()
+        if created != contract:
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [*notes, "eth_funding_tx did not create our HTLC contract (recipient binding)"],
+            )
+        deploy_input = _hb(f_tx.get("input"))
+        if len(deploy_input) < 128:
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [*notes, "eth deploy tx input too short for constructor args (forged funding tx)"],
+            )
+        args = deploy_input[-128:]
+        ctor_hashlock = args[0:32]
+        ctor_claimant = "0x" + args[44:64].hex()  # 2nd 32-byte word, low 20 bytes = the claimant address
+        if ctor_hashlock != bytes.fromhex(m.h_hex):
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [*notes, "eth HTLC constructor hashlock != manifest H (wrong/forged deploy)"],
+            )
+        if ctor_claimant.lower() != m.eth_maker_claimant.lower():
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [
+                    *notes,
+                    f"eth HTLC claimant {ctor_claimant} != agreed maker {m.eth_maker_claimant} "
+                    "(a Claimed(p) would NOT pay the maker — malformed/hostile counter HTLC)",
+                ],
+            )
+        notes.append("eth HTLC constructor binds claimant==maker + hashlock==H (claim pays the maker)")
     if _as_int(claim_receipt.get("status", 0)) != 1:
         return CounterLeg.ANOMALOUS, None, ["counter spend tx REVERTED (status != 1) — moved no ETH"]
     our_logs = [lg for lg in (claim_receipt.get("logs") or []) if str(lg.get("address", "")).lower() == contract]
@@ -900,15 +1003,44 @@ def run_verify(
     # raw scraped preimage back in here (it re-introduces the CodeQL clear-text-secret taint of PR #273).
     res = atomicity_verdict(m, asset, counter, None, counter_p_sha256)
     grade, slack, margin_note = margin_grade(m, asset, counter, asset_claim_height)
+    # Counter-leg VALUE + RECIPIENT checks are OPT-IN (they need extra manifest fields). The asset leg's
+    # value is always re-derived, so an omitted counter check is an ASYMMETRY the operator must see — a
+    # silent PASS would be read as "value/recipient verified" when it was not (review MEDIUM/HIGH). Derive
+    # what was actually verifiable and surface it loudly; a PASS that skipped either is flagged in reasons.
+    if m.counter_chain == "btc":
+        value_verified = m.counter_amount is not None
+        recipient_verified = m.btc_claim_xonly_hex is not None
+    else:  # eth — both need the deploy tx (eth_funding_tx)
+        value_verified = m.counter_amount is not None and m.eth_funding_tx is not None
+        recipient_verified = m.eth_maker_claimant is not None and m.eth_funding_tx is not None
     res.checks = {
         "counter_chain": m.counter_chain,
         "asset_leg_notes": asset_notes,
         "counter_leg_notes": counter_notes,
         "honest_party": m.honest_party,
+        "counter_value_verified": value_verified,
+        "counter_recipient_verified": recipient_verified,
         "margin": {"grade": grade, "slack_blocks": slack, "note": margin_note},
     }
-    if res.verdict is Verdict.PASS and grade == "MARGINAL":
-        res.reasons.append(f"PASS but MARGINAL: {margin_note}")
+    if res.verdict is Verdict.PASS:
+        if grade == "MARGINAL":
+            res.reasons.append(f"PASS but MARGINAL: {margin_note}")
+        if not value_verified:
+            _need = "counter_amount + eth_funding_tx" if m.counter_chain == "eth" else "counter_amount"
+            res.reasons.append(
+                f"WARNING: counter-leg VALUE was NOT verified (manifest omitted {_need}) — this PASS does "
+                "NOT attest the counter leg was funded at the agreed amount (an atomic-but-mispriced swap)"
+            )
+        if not recipient_verified:
+            _need = (
+                "btc_claim_xonly_hex + btc_refund_xonly_hex + t_btc_blocks"
+                if m.counter_chain == "btc"
+                else "eth_maker_claimant + eth_funding_tx"
+            )
+            res.reasons.append(
+                f"WARNING: counter-leg RECIPIENT was NOT verified (manifest omitted {_need}) — this PASS "
+                "does NOT attest the counter claim PAYS THE MAKER (a malformed counter HTLC could pay the taker)"
+            )
     return res
 
 
@@ -1072,6 +1204,62 @@ def _self_check() -> int:
     cl_bad, _, _ = verify_counter_leg_btc(replace(m2, counter_amount=99_999), btc_claim, cf_tx)
     check("counter value MISMATCH (mispriced) -> ANOMALOUS", cl_bad is CounterLeg.ANOMALOUS)
 
+    # 5d) counter RECIPIENT binding (review HIGH): re-derive the HTLC funding SPK from the agreed keys +
+    # H + t_btc; the funding output MUST pay it (so a claim is maker-authorized, not paying the taker).
+    import coincurve as _cc
+
+    _cx = _cc.PublicKeyXOnly.from_secret(b"\x11" * 32).format()
+    _rx = _cc.PublicKeyXOnly.from_secret(b"\x22" * 32).format()
+    _htlc_spk = build_htlc(
+        hashlock=bytes.fromhex(m2.h_hex),
+        claim_pubkey_xonly=_cx,
+        refund_pubkey_xonly=_rx,
+        timeout=Timelock(144, TimeUnit.BLOCKS),
+    ).scriptpubkey
+
+    def _btc_fund_paying(spk: bytes) -> bytes:
+        return (
+            _struct.pack("<i", 1)
+            + b"\x01"
+            + b"\x00" * 32
+            + b"\x00\x00\x00\x00"
+            + b"\x00"
+            + b"\xff\xff\xff\xff"
+            + b"\x01"
+            + _struct.pack("<q", 100_000)
+            + bytes([len(spk)])
+            + bytes(spk)
+            + b"\x00\x00\x00\x00"
+        )
+
+    _m2r = replace(m2, btc_claim_xonly_hex=_cx.hex(), btc_refund_xonly_hex=_rx.hex(), t_btc_blocks=144)
+    clr_ok, _, _ = verify_counter_leg_btc(_m2r, btc_claim, _btc_fund_paying(_htlc_spk))
+    check("BTC recipient MATCH (funding == re-derived HTLC) -> MAKER_CLAIMED", clr_ok is CounterLeg.MAKER_CLAIMED)
+    clr_bad, _, _ = verify_counter_leg_btc(_m2r, btc_claim, _btc_fund_paying(b"\x51\x20" + b"\xff" * 32))
+    check("BTC recipient MISMATCH (funding pays a different SPK) -> ANOMALOUS", clr_bad is CounterLeg.ANOMALOUS)
+
+    # 5e) run_verify: a full manifest sets both verified flags true + emits NO NOT_VERIFIED warning; an
+    # empty one (the earlier m2 happy path `res`) emits BOTH loud warnings but still PASSes.
+    _m2_full = replace(
+        m2, counter_amount=100_000, btc_claim_xonly_hex=_cx.hex(), btc_refund_xonly_hex=_rx.hex(), t_btc_blocks=144
+    )
+    res_full = run_verify(_m2_full, funding2, claim2, btc_claim, counter_funding=_btc_fund_paying(_htlc_spk))
+    check(
+        "run_verify full counter checks -> PASS, verified flags true, no NOT_VERIFIED warning",
+        res_full.verdict is Verdict.PASS
+        and res_full.checks["counter_value_verified"] is True
+        and res_full.checks["counter_recipient_verified"] is True
+        and not any("NOT verified" in r for r in res_full.reasons),
+    )
+    check(
+        "run_verify without counter inputs -> PASS but loud value+recipient NOT_VERIFIED warnings",
+        res.verdict is Verdict.PASS
+        and res.checks["counter_value_verified"] is False
+        and res.checks["counter_recipient_verified"] is False
+        and any("VALUE was NOT verified" in r for r in res.reasons)
+        and any("RECIPIENT was NOT verified" in r for r in res.reasons),
+    )
+
     # 5c) secret-key guard (review LOW): PRIVATE keys rejected, PUBLIC keys NOT (the bare "key" substring
     # used to false-positive on pubkey/public_key).
     def _rejects(doc: dict) -> bool:
@@ -1148,6 +1336,38 @@ def _self_check() -> int:
         replace(m_eth, counter_amount=eth_amt), claim_tx, claim_rcpt, funding=funding_foreign
     )
     check("ETH funding tx created a DIFFERENT contract -> ANOMALOUS", ev3 is CounterLeg.ANOMALOUS)
+
+    # ETH counter-leg RECIPIENT binding (review HIGH): decode the deploy constructor args (hashlock,
+    # claimant, ...) and assert claimant == the agreed maker AND hashlock == H — so a Claimed(p) pays the
+    # maker, not the taker. Deploy input = <init code> + 128B args (hashlock, claimant, refundee, timeout).
+    _maker_addr = "0x" + "bb" * 20
+
+    def _eth_deploy(hashlock: bytes, claim20: bytes) -> dict:
+        args = hashlock + (bytes(12) + claim20) + bytes(32) + (999).to_bytes(32, "big")
+        return {"input": "0x" + (b"\xfe" * 20 + args).hex()}
+
+    _m_eth_r = replace(m_eth, eth_maker_claimant=_maker_addr, eth_funding_tx="0x" + "11" * 32)
+    evr_ok, _, _ = verify_counter_leg_eth(
+        _m_eth_r,
+        claim_tx,
+        claim_rcpt,
+        funding=(_eth_deploy(h_eth, bytes.fromhex("bb" * 20)), {"contractAddress": contract}),
+    )
+    check("ETH recipient claimant==maker + H match -> MAKER_CLAIMED", evr_ok is CounterLeg.MAKER_CLAIMED)
+    evr_bad, _, _ = verify_counter_leg_eth(
+        _m_eth_r,
+        claim_tx,
+        claim_rcpt,
+        funding=(_eth_deploy(h_eth, bytes.fromhex("cc" * 20)), {"contractAddress": contract}),
+    )
+    check("ETH recipient claimant!=maker -> ANOMALOUS", evr_bad is CounterLeg.ANOMALOUS)
+    evr_badh, _, _ = verify_counter_leg_eth(
+        _m_eth_r,
+        claim_tx,
+        claim_rcpt,
+        funding=(_eth_deploy(b"\x00" * 32, bytes.fromhex("bb" * 20)), {"contractAddress": contract}),
+    )
+    check("ETH recipient constructor hashlock!=H -> ANOMALOUS", evr_badh is CounterLeg.ANOMALOUS)
 
     # end-to-end ETH happy path: asset claimed by taker + ETH claimed by maker -> PASS.
     fe_spk, te_holder, me_holder = rxd_expected_scripts(m_eth)
