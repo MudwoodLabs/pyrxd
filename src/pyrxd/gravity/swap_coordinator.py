@@ -52,7 +52,7 @@ from pyrxd.btc_wallet.taproot import (
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import SecretBytes
 
 from .eth_rxd_timelock import CrossClockMargin, assert_covenant_confirms_before_eth_deadline
@@ -1938,7 +1938,12 @@ class SwapCoordinator:
         ).value
         maturity_height = asset_locked_at_height + rxd_blocks
         if now_block_height < maturity_height:
-            raise ValidationError(
+            # NetworkError (not ValidationError): "not yet mature" is a TRANSIENT, retryable condition — the
+            # same convention the RadiantLeg/BtcLeg refund maturity self-checks use. A block-based poller
+            # keys on NetworkError to retry at maturity; raising ValidationError here (a permanent/input
+            # error) would make that poller give up on a swap that only needs to wait, risking a missed
+            # proactive refund.
+            raise NetworkError(
                 f"covenant CSV refund is not yet mature: it matures at height {maturity_height}, now "
                 f"{now_block_height} ({maturity_height - now_block_height} block(s) to go). Refusing to "
                 "broadcast a non-final refund (P3 maturity pre-check) — poll and retry at maturity "
