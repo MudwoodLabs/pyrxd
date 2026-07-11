@@ -110,28 +110,39 @@ _BTC_REGTEST = "bcrt"
 # File exchange (the cross-host surface — all public, never the preimage p)
 # ---------------------------------------------------------------------------
 
+# Substring markers for secret-bearing key names (review MEDIUM). Uses "priv" (NOT "privkey") so
+# private_key / priv_key / privatekey all match despite the separator, and "entropy"/"xprv"/"seed"/
+# "mnemonic" cover raw entropy and BIP32/BIP39 material. KEEP IN SYNC with eth_swap_two_host.py and with
+# swap_run_verify._SECRET_FORBIDDEN_KEYS (a parity test enforces it); "preimage" already covers
+# preimage_p/preimage_p_hex, "priv"/"secret"/"wif" cover privkey/secret_key.
 _SECRET_FORBIDDEN_KEYS = (
     "preimage",
-    "preimage_p",
-    "preimage_p_hex",
     "p_hex",
     "wif",
     "secret",
-    "privkey",
-    # review MEDIUM: the original list missed several secret-carrying key names. Substring match, so
-    # "private_key" is NOT caught by "privkey" and "eth_key" covers "eth_key_hex".
-    "private_key",
+    "priv",
     "signing_key",
     "eth_key",
     "seed",
     "mnemonic",
     "xprv",
     "xpriv",
+    "entropy",
 )
 
 
+def _looks_like_wif(s: str) -> bool:
+    """A base58 WIF-shaped VALUE (51-52 chars, 5/K/L lead) — catches a WIF stored under an innocuous key
+    name (review LOW: the key-name markers alone miss that). Distinguishable from hex spk/pkh/txid values
+    (which fill every public doc), so scanning values for this can't false-positive on them."""
+    if not (51 <= len(s) <= 52) or s[0] not in "5KL":
+        return False
+    return all(c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in s)
+
+
 def _assert_public_only(doc: dict, *, what: str) -> None:
-    """Fail-closed: refuse to write a cross-host file that smuggles a secret (recursive, case-insensitive)."""
+    """Fail-closed: refuse to write a cross-host file that smuggles a secret (recursive, case-insensitive) —
+    by key NAME (private-material markers) and by VALUE shape (a WIF under a benign key)."""
 
     def _walk(node: object, path: str) -> None:
         if isinstance(node, dict):
@@ -143,6 +154,8 @@ def _assert_public_only(doc: dict, *, what: str) -> None:
         elif isinstance(node, list):
             for i, v in enumerate(node):
                 _walk(v, f"{path}{i}.")
+        elif isinstance(node, str) and _looks_like_wif(node):
+            raise SystemExit(f"REFUSING to write {what}: value at {path} is WIF-shaped (a smuggled private key)")
 
     _walk(doc, "")
 
@@ -269,7 +282,10 @@ def _radiant_leg(args, *, taker_pkh: bytes, maker_pkh: bytes, fee_source):
         maker_pkh=bytes(Hex20(maker_pkh)),
         chain_io=RadiantChainIO(client),
         fee_source=fee_source,
-        min_confirmations=1,
+        # Thread the taker's covenant depth floor into the LEG too (review MEDIUM): --taker-min-rxd-confs
+        # gated the pre-lock covenant lookup, but the leg's own spend-side reorg gate stayed hard-pinned at
+        # 1, so a deep operator setting still resolved later spends at floor-1. Use the same floor here.
+        min_confirmations=max(1, getattr(args, "taker_min_rxd_confs", 1)),
     )
 
 
@@ -965,6 +981,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.self_check:
         run_self_check()
         return
+    # A 0/negative floor would SILENTLY disable the taker depth gate (0 < 0 is false), defeating the fix
+    # (review LOW). The gate exists precisely so a 0-conf covenant is refused — never accept below 1-conf.
+    if args.taker_min_rxd_confs < 1:
+        raise SystemExit("--taker-min-rxd-confs must be >= 1 (a 0/negative floor silently disables the depth gate)")
     if not args.role or not args.phase:
         raise SystemExit("pass --self-check, OR both --role and --phase (see --help)")
     fn = _DISPATCH.get((args.role, args.phase))
