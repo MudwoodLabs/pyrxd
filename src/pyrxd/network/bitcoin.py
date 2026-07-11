@@ -579,6 +579,8 @@ class BitcoinCoreRpcSource(BtcDataSource):
                     # parse_float=Decimal (review MEDIUM): Bitcoin Core reports BTC amounts as JSON numbers.
                     # The default float parser is lossy, so downstream sat conversion could round-trip a
                     # wrong value. Decimal keeps the node's decimal exact all the way into _btc_to_sats.
+                    # NB (latent): a Decimal is NOT json-serializable — any future code that json.dumps a raw
+                    # RPC result would TypeError. Today no consumer does (all coerce to int/str/bytes first).
                     data = json.loads(body, parse_float=Decimal)
                 except json.JSONDecodeError:
                     raise NetworkError("Bitcoin Core returned non-JSON response")

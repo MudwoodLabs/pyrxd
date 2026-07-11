@@ -158,3 +158,55 @@ def test_assert_no_secrets_hardening():
         {"steps": [{"txid": "cd" * 32, "spend_txid": "ab" * 32, "state": "COMPLETED", "height": 444076}]},
         what="journal",
     )
+
+
+def test_eth_creation_bytecode_pin_matches_fixture():
+    """Audit HIGH: the ETH recipient binding pins the deployed contract to the canonical EthHtlc CREATION
+    bytecode. If the fixture is recompiled without updating the pin, this fails CI (drift guard) — a stale
+    pin would reject the real contract, a stale fixture would let a look-alike pass."""
+    import hashlib
+    import json
+
+    fixture = json.loads((Path(__file__).resolve().parent.parent / "tests/fixtures/EthHtlc.json").read_text())
+    creation = bytes.fromhex(fixture["bytecode"][2:] if fixture["bytecode"].startswith("0x") else fixture["bytecode"])
+    assert hashlib.sha256(creation).digest() == v._ETH_HTLC_CREATION_SHA256
+
+
+def test_pass_unverified_downgrade_is_distinct():
+    """Audit HIGH (H-2): a both-complete PASS whose counter CLAIM was not recipient/value-verified must be a
+    DISTINCT verdict, not a clean PASS that automation conflates with a fully-checked one."""
+    p = b"\xcd" * 32
+    m2 = v.RunManifest(
+        swap_id="u",
+        asset_variant="rxd",
+        counter_chain="btc",
+        honest_party="taker",
+        h_hex=v._sha256(p).hex(),
+        taker_pkh_hex="22" * 20,
+        maker_pkh_hex="33" * 20,
+        rxd_amount=1000,
+        refund_csv=48,
+        covenant_funding=v.Outpoint("ab" * 32, 0),
+        counter_funding=v.Outpoint("cd" * 32, 0),
+    )
+    f2, t2_holder, _ = v.rxd_expected_scripts(m2)
+    btc_claim = v._btc_claim_stub(m2, p)
+    res = v.run_verify(m2, _rxd_tx(f2), _rxd_tx(t2_holder, spend_txid="ab" * 32), btc_claim)
+    assert res.verdict is v.Verdict.PASS_UNVERIFIED
+    assert res.checks["counter_fully_verified"] is False
+
+
+def test_secret_guard_lists_are_in_parity():
+    """Audit MEDIUM (M-d): the three _SECRET_FORBIDDEN_KEYS copies (verifier + both two-host harnesses) must
+    stay a superset of the core private-material markers, and the two harness copies must be identical, so a
+    fix to one can't silently leave the others weaker."""
+    import btc_swap_two_host as btc
+    import eth_swap_two_host as eth
+
+    assert btc._SECRET_FORBIDDEN_KEYS == eth._SECRET_FORBIDDEN_KEYS
+    core = {"priv", "secret", "wif", "preimage", "seed", "mnemonic", "entropy", "xprv"}
+    for markers in (set(v._SECRET_FORBIDDEN_KEYS), set(btc._SECRET_FORBIDDEN_KEYS)):
+        assert core <= markers
+    # the "priv" marker closes the class the enumerated list missed.
+    for bad in ("private_key", "priv_key", "privatekey", "master_entropy"):
+        assert any(mark in bad for mark in btc._SECRET_FORBIDDEN_KEYS)

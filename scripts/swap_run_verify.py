@@ -44,6 +44,7 @@ import enum
 import hashlib
 import json
 import sys
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlparse
@@ -115,7 +116,8 @@ class CounterLeg(enum.Enum):
 
 
 class Verdict(enum.Enum):
-    PASS = "PASS"  # both-complete XOR both-unwind, chain-verified
+    PASS = "PASS"  # both-complete XOR both-unwind, chain-verified AND counter recipient/value verified
+    PASS_UNVERIFIED = "PASS_UNVERIFIED"  # both-complete, but the counter CLAIM's recipient/value was not checked
     FAIL_ONE_SIDED = "FAIL_ONE_SIDED"  # the cardinal failure: an honest party is out a leg
     PENDING = "PENDING"  # a leg is still unspent — not scorable yet, never PASS
     ANOMALOUS = "ANOMALOUS"  # a leg landed somewhere impossible — investigate
@@ -249,6 +251,10 @@ class RunManifest:
                 btc_refund_xonly_hex = str(d["btc_refund_xonly_hex"]).lower()
                 if len(bytes.fromhex(btc_claim_xonly_hex)) != 32 or len(bytes.fromhex(btc_refund_xonly_hex)) != 32:
                     raise ValueError("btc_claim_xonly_hex / btc_refund_xonly_hex must be 32-byte x-only pubkeys")
+                # Validate range HERE (a clean INVALID) rather than letting a hostile 0 / 70000 / JSON `true`
+                # blow up inside Timelock/build_htlc mid-verify (review LOW). BIP68 relative-block CSV is 16-bit.
+                if isinstance(d["t_btc_blocks"], bool) or not (1 <= int(d["t_btc_blocks"]) <= 65535):
+                    raise ValueError("t_btc_blocks must be an int in [1, 65535] (BIP68 relative-block CSV)")
                 t_btc_blocks = int(d["t_btc_blocks"])
         else:  # eth
             if "eth_contract" not in d or "eth_chain_id" not in d:
@@ -311,6 +317,15 @@ def assert_no_secrets(doc: object, *, what: str) -> None:
         raise ValueError(f"{what}: a WIF-shaped secret value is present in a public file")
 
 
+def _host_of(url: str) -> str:
+    """Hostname of a URL, ROBUST to scheme-less forms. ``urlparse("localhost:8545").hostname`` is ``None``
+    (it reads ``localhost`` as the scheme), so a naive ``.hostname or url`` would treat ``localhost:8545``
+    and ``localhost:8546`` as two distinct 'hosts' — a fake quorum / false independence (review LOW).
+    Prepend ``//`` when there is no scheme so the netloc parses; fall back to the raw string."""
+    u = url if "://" in url else "//" + url.lstrip("/")
+    return (urlparse(u).hostname or url).lower()
+
+
 def _dedup_by_host(urls: list[str]) -> list[str]:
     """Collapse URLs that share a hostname to one (order-preserving). Two endpoints on the SAME host are the
     SAME trust domain, so counting them as two independent sources would be a fake quorum — a party who runs
@@ -318,7 +333,7 @@ def _dedup_by_host(urls: list[str]) -> list[str]:
     seen: set[str] = set()
     out: list[str] = []
     for u in urls:
-        host = (urlparse(u).hostname or u).lower()
+        host = _host_of(u)
         if host not in seen:
             seen.add(host)
             out.append(u)
@@ -333,9 +348,9 @@ def assert_independent_endpoints(verifier_urls: list[str], party_endpoints: tupl
     auditor should still pass endpoints they trust out-of-band. The load-bearing anti-substitution defenses
     are the per-tx txid pins (BTC/RXD: bytes hash to the cited txid) plus the covenant-outpoint provenance
     checks, which hold even against a source that lies about which txid is which."""
-    party_hosts = {(urlparse(e).hostname or e).lower() for e in party_endpoints}
+    party_hosts = {_host_of(e) for e in party_endpoints}
     for u in verifier_urls:
-        host = (urlparse(u).hostname or u).lower()
+        host = _host_of(u)
         if host in party_hosts:
             raise ValueError(
                 f"verifier endpoint {host!r} was ALSO used by a swap party — re-fetch is not independent. "
@@ -540,6 +555,15 @@ def verify_counter_leg_btc(
 # EthHtlc event topic0 (keccak of the event signature) — from tests/fixtures/EthHtlc.json.
 _ETH_CLAIMED_TOPIC = "0xb651fac6b68e9074a2da0835d9a5cb12e8cc45ff91d6e79e31a9627866507cc7"
 _ETH_REFUNDED_TOPIC = "0xa4891be4c05fc4b104f07fbbd9f643c3a98d0f9d3c4e616281bdba972991a558"
+# sha256 of the canonical EthHtlc CREATION bytecode (init code), from tests/fixtures/EthHtlc.json "bytecode".
+# A deploy tx input is <init code> || <128B ABI ctor args>, and the init code is CONSTANT across deploys
+# (constructor args live in the trailing calldata, immutables are baked into the *runtime* not the init
+# code). Pinning it proves the deployed contract IS the audited EthHtlc — so its decoded ctor args are
+# authentic and a Claimed(p) provably pays the ctor-named claimant. WITHOUT this, the taker (who deploys the
+# ETH leg) can ship a look-alike that decodes honest (H, maker) ctor bytes yet pays the taker and emits a
+# forged Claimed(p) — a false PASS on a one-sided maker loss (audit HIGH). tests/test_swap_run_verify.py
+# re-derives this from the fixture so a fixture change without a pin update fails CI.
+_ETH_HTLC_CREATION_SHA256 = bytes.fromhex("81270a8375c83f51f1bd1812f36a31ef7b9b14e2bca8aea3287561d34d64b5ff")
 
 
 def _hb(x: object) -> bytes:
@@ -629,8 +653,29 @@ def verify_counter_leg_eth(
                 None,
                 [*notes, "eth deploy tx input too short for constructor args (forged funding tx)"],
             )
+        # CODE PIN (audit HIGH): the ctor-arg decode below is meaningless unless the deployed contract is
+        # actually the audited EthHtlc — the taker controls the whole deploy payload and could ship a
+        # look-alike that decodes honest (H, maker) bytes yet pays the taker. Pin the init code
+        # (deploy_input minus the trailing 128B ABI args) to the canonical creation bytecode. No extra RPC,
+        # and unlike eth_getCode it does not depend on the contract surviving post-claim.
+        if hashlib.sha256(deploy_input[:-128]).digest() != _ETH_HTLC_CREATION_SHA256:
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [
+                    *notes,
+                    "eth deploy init code != canonical EthHtlc creation bytecode — NOT our audited HTLC "
+                    "(a look-alike could decode honest ctor args yet pay the taker)",
+                ],
+            )
         args = deploy_input[-128:]
         ctor_hashlock = args[0:32]
+        if args[32:44] != bytes(12):
+            return (
+                CounterLeg.ANOMALOUS,
+                None,
+                [*notes, "eth ctor claimant word is not a clean left-padded 20-byte address (malformed deploy)"],
+            )
         ctor_claimant = "0x" + args[44:64].hex()  # 2nd 32-byte word, low 20 bytes = the claimant address
         if ctor_hashlock != bytes.fromhex(m.h_hex):
             return (
@@ -767,15 +812,28 @@ def margin_grade(
 
 # Bound on the outpoint->spender discovery scans (review MEDIUM, DoS): a hostile ElectrumX/Esplora can
 # return an unboundedly long scripthash history, and the RXD scan fetches each candidate tx sequentially.
-# Without a cap that is an amplification lever (one request -> N full-tx fetches). The genuine spender of a
-# freshly-funded covenant sits at the FRONT of the history, so a modest cap never misses an honest spend;
-# if it is hit we log and fail-soft to None (degrades to PENDING, never a false PASS).
-_MAX_DISCOVERY_CANDIDATES = 256
+# Without a cap that is an amplification lever (one request -> N full-tx fetches). The genuine spender sits
+# at height >= the funding height, so we first drop pre-funding candidates, then cap. On a cap-hit we do
+# NOT silently return None (that would degrade to a benign-looking PENDING and MASK a one-sided loss a
+# griefer buried past the cap — review MEDIUM); we raise _DiscoveryTruncated so the caller surfaces it loudly.
+_MAX_DISCOVERY_CANDIDATES = 4096
+# Wall-clock budget for a single spender-discovery scan (a hostile source dripping ~timeout-length responses
+# per candidate must not stall the whole run for hours — review LOW).
+_DISCOVERY_TOTAL_BUDGET_S = 120
 # Cap on a single discovery HTTP response body (Esplora /outspend is a tiny JSON object; anything larger is
 # a hostile source trying to exhaust memory).
 _MAX_DISCOVERY_BODY_BYTES = 64 * 1024
 # Per-request network timeout for the discovery HTTP calls (a hostile source must not be able to hang the run).
 _DISCOVERY_HTTP_TIMEOUT_S = 30
+# A single-source burial depth at/above which the source-trust depth reminder is NOT emitted (below it, the
+# depth is "shallow" and the reminder is useful; above it the operator has already set it deep — review LOW).
+_DEEP_CONFIRMATIONS = 6
+
+
+class _DiscoveryTruncated(Exception):
+    """Raised when spender discovery could not scan the whole candidate set within the cap/time budget, so a
+    'no spender found' result is INCONCLUSIVE (possible griefing burial) rather than a genuine unspent — the
+    caller surfaces this loudly instead of scoring a clean PENDING."""
 
 
 class _BtcFetcher:
@@ -857,27 +915,39 @@ class _RxdFetcher:
             confs = int(verbose.get("confirmations", 0) or 0)
             return confs if confs > 0 else 0
 
-    async def spend_of(self, op: Outpoint, spk: bytes) -> str | None:
+    async def spend_of(self, op: Outpoint, spk: bytes, *, funding_height: int | None = None) -> str | None:
         """Independent outpoint->spender discovery (review MEDIUM): find the tx that consumed `op` by
         walking the covenant SPK's scripthash history and checking each candidate's inputs — so a party
-        CANNOT park the asset leg at PENDING by omitting its spend txid. Fail-soft to None (a missed
-        discovery degrades to the same PENDING as today, never a false PASS)."""
+        CANNOT park the asset leg at PENDING by omitting its spend txid.
+
+        The spender confirms at height >= the covenant funding height, so pre-funding history entries (a
+        griefer's cheap way to pad the front) are dropped first; then the scan is bounded by a candidate cap
+        + a wall-clock budget. A genuine unspent outpoint returns None (PENDING). But if the bound is hit
+        WITHOUT finding the spender, the result is INCONCLUSIVE (the real spender may be buried past the cap)
+        — we raise _DiscoveryTruncated so the caller surfaces it loudly instead of scoring a benign-looking
+        PENDING that masks a one-sided loss (review MEDIUM). A network error still fails soft to None."""
+        scripthash = hashlib.sha256(bytes(spk)).digest()[::-1]
+        target = op.prevout_le_bytes()
+        deadline = time.monotonic() + _DISCOVERY_TOTAL_BUDGET_S
+        truncated = False
         try:
-            scripthash = hashlib.sha256(bytes(spk)).digest()[::-1]
-            target = op.prevout_le_bytes()
             async with self._client as c:
                 hist = await c.get_history(scripthash)
-                if len(hist) > _MAX_DISCOVERY_CANDIDATES:
-                    # DoS cap (review MEDIUM): the honest spender sits at the front of a freshly-funded
-                    # covenant's history, so truncating a hostile, padded history never misses it; a miss
-                    # fails soft to None (PENDING), never a false PASS.
-                    print(
-                        f"  RXD spend-discovery history for {op.txid} exceeded {_MAX_DISCOVERY_CANDIDATES} "
-                        f"candidates ({len(hist)}) — scanning the first {_MAX_DISCOVERY_CANDIDATES} only",
-                        file=sys.stderr,
-                    )
-                    hist = hist[:_MAX_DISCOVERY_CANDIDATES]
-                for entry in hist:
+                # Drop pre-funding candidates (height 0 = mempool is kept; the spender may be unconfirmed).
+                candidates = [
+                    e
+                    for e in hist
+                    if funding_height is None
+                    or int(e.get("height", 0) or 0) == 0
+                    or int(e.get("height", 0) or 0) >= funding_height
+                ]
+                if len(candidates) > _MAX_DISCOVERY_CANDIDATES:
+                    truncated = True
+                    candidates = candidates[:_MAX_DISCOVERY_CANDIDATES]
+                for entry in candidates:
+                    if time.monotonic() > deadline:
+                        truncated = True
+                        break
                     cand = str(entry.get("tx_hash") or "")
                     if not cand or cand == op.txid:  # skip the funding tx itself
                         continue
@@ -889,6 +959,12 @@ class _RxdFetcher:
                         continue
         except Exception:
             return None
+        if truncated:
+            raise _DiscoveryTruncated(
+                f"RXD spend-discovery for {op.txid} could not scan all post-funding candidates within "
+                f"{_MAX_DISCOVERY_CANDIDATES} candidates / {_DISCOVERY_TOTAL_BUDGET_S}s — 'unspent' is "
+                "INCONCLUSIVE (the spender may be buried; possible griefing)"
+            )
         return None
 
     async def close(self) -> None:
@@ -974,13 +1050,18 @@ class _MultiEthFetcher:
     not-independent warning."""
 
     def __init__(self, rpc_urls: list[str], chain_id: int):
-        self._fetchers = [_EthFetcher(u, chain_id) for u in rpc_urls]
+        # Dedup by host here too (not only at the CLI): a programmatic caller passing two same-host URLs
+        # would otherwise get a fake quorum (review LOW). _host_of is scheme-less-robust.
+        deduped = _dedup_by_host([u for u in rpc_urls if u])
+        self._fetchers = [_EthFetcher(u, chain_id) for u in deduped]
         if not self._fetchers:
             raise ValueError("at least one ETH RPC url is required")
         self.source_count = len(self._fetchers)
 
     async def tx_and_receipt(self, tx_hash: str) -> tuple[dict, dict | None]:
-        results = [await f.tx_and_receipt(tx_hash) for f in self._fetchers]
+        # Fetch from all sources concurrently (review LOW: sequential awaits were N x round-trips). A raising
+        # source propagates -> the run fails CLOSED (never scored off the survivors).
+        results = await asyncio.gather(*(f.tx_and_receipt(tx_hash) for f in self._fetchers))
         fps = {_eth_material_fp(tx, rcpt) for (tx, rcpt) in results}
         if len(fps) != 1:
             raise ValueError(
@@ -993,7 +1074,7 @@ class _MultiEthFetcher:
         """The MINIMUM `finalized` checkpoint across sources: an over-reporting source cannot make a
         non-final (reorgable) claim look settled, and any source that can't report finality fails the run
         closed (None -> the caller's finality gate refuses)."""
-        heights = [await f.finalized_height() for f in self._fetchers]
+        heights = await asyncio.gather(*(f.finalized_height() for f in self._fetchers))
         if any(h is None for h in heights):
             return None
         return min(heights)
@@ -1001,7 +1082,7 @@ class _MultiEthFetcher:
     async def spend_of(self, contract: str) -> str | None:
         """Discover an omitted claim/refund across sources. All sources that find a spend must agree on the
         SAME tx hash; a disagreement (or none found) fails soft to None -> PENDING, never a false PASS."""
-        found = [await f.spend_of(contract) for f in self._fetchers]
+        found = await asyncio.gather(*(f.spend_of(contract) for f in self._fetchers))
         non_null = {x for x in found if x}
         if len(non_null) != 1:
             return None
@@ -1031,7 +1112,10 @@ async def _fetch_for_live(
         cov_fund = await rxd.raw_tx(m.covenant_funding.txid)
         spend_txid = cited.get("covenant_spend_txid")
         if not spend_txid:
-            spend_txid = await rxd.spend_of(m.covenant_funding, funded_spk)  # DISCOVER an omitted spend
+            # The spender confirms at/after the funding height — pass it so discovery drops pre-funding
+            # padding and its cap/budget applies only to genuinely-plausible candidates.
+            funding_height = await rxd.confirm_height(m.covenant_funding.txid)
+            spend_txid = await rxd.spend_of(m.covenant_funding, funded_spk, funding_height=funding_height)
             if spend_txid:
                 print(f"  discovered covenant spend {spend_txid} independently (was not cited)", file=sys.stderr)
         cov_spend = await rxd.raw_tx(spend_txid) if spend_txid else None
@@ -1124,12 +1208,16 @@ def run_verify(
     # value is always re-derived, so an omitted counter check is an ASYMMETRY the operator must see — a
     # silent PASS would be read as "value/recipient verified" when it was not (review MEDIUM/HIGH). Derive
     # what was actually verifiable and surface it loudly; a PASS that skipped either is flagged in reasons.
+    # A check only actually RAN if counter_funding was present — the leg verifiers gate value/recipient on
+    # it (review MEDIUM). Deriving these flags from manifest fields ALONE would report "verified: true" to a
+    # direct run_verify caller that passed counter_funding=None — a flag that lies. AND in funding presence.
+    _funding_present = counter_funding is not None
     if m.counter_chain == "btc":
-        value_verified = m.counter_amount is not None
-        recipient_verified = m.btc_claim_xonly_hex is not None
-    else:  # eth — both need the deploy tx (eth_funding_tx)
-        value_verified = m.counter_amount is not None and m.eth_funding_tx is not None
-        recipient_verified = m.eth_maker_claimant is not None and m.eth_funding_tx is not None
+        value_verified = m.counter_amount is not None and _funding_present
+        recipient_verified = m.btc_claim_xonly_hex is not None and _funding_present
+    else:  # eth — both need the deploy tx (eth_funding_tx) AND the fetched funding object
+        value_verified = m.counter_amount is not None and m.eth_funding_tx is not None and _funding_present
+        recipient_verified = m.eth_maker_claimant is not None and m.eth_funding_tx is not None and _funding_present
     res.checks = {
         "counter_chain": m.counter_chain,
         "asset_leg_notes": asset_notes,
@@ -1137,9 +1225,20 @@ def run_verify(
         "honest_party": m.honest_party,
         "counter_value_verified": value_verified,
         "counter_recipient_verified": recipient_verified,
+        "counter_fully_verified": value_verified and recipient_verified,
         "margin": {"grade": grade, "slack_blocks": slack, "note": margin_note},
     }
-    if res.verdict is Verdict.PASS:
+    # A both-complete PASS whose counter CLAIM was not recipient/value-verified is NOT a fully-verified PASS
+    # (review HIGH): the verifier cannot rule out a counter HTLC that pays the taker — the exact hole the H1
+    # binding closes ONLY when its manifest fields are supplied. Downgrade to a DISTINCT verdict + exit so
+    # automation keying on verdict==PASS / exit 0 cannot conflate it with a fully-checked PASS.
+    if (
+        res.verdict is Verdict.PASS
+        and counter is CounterLeg.MAKER_CLAIMED
+        and not (value_verified and recipient_verified)
+    ):
+        res.verdict = Verdict.PASS_UNVERIFIED
+    if res.verdict in (Verdict.PASS, Verdict.PASS_UNVERIFIED):
         if grade == "MARGINAL":
             res.reasons.append(f"PASS but MARGINAL: {margin_note}")
         if not value_verified:
@@ -1157,6 +1256,11 @@ def run_verify(
             res.reasons.append(
                 f"WARNING: counter-leg RECIPIENT was NOT verified (manifest omitted {_need}) — this PASS "
                 "does NOT attest the counter claim PAYS THE MAKER (a malformed counter HTLC could pay the taker)"
+            )
+        if res.verdict is Verdict.PASS_UNVERIFIED:
+            res.reasons.append(
+                "DOWNGRADED PASS -> PASS_UNVERIFIED: the counter CLAIM's recipient/value was not verified "
+                "(see warnings) — supply the counter binding fields for a fully-verified PASS"
             )
     return res
 
@@ -1293,7 +1397,7 @@ def _self_check() -> int:
         _sha256(scrape_secret(btc_claim, _sha256(p_stub))) == _sha256(p_stub),
     )
     res = run_verify(m2, funding2, claim2, btc_claim)
-    check("end-to-end BTC happy path -> PASS", res.verdict is Verdict.PASS)
+    check("end-to-end BTC w/o counter fields -> PASS_UNVERIFIED", res.verdict is Verdict.PASS_UNVERIFIED)
     # and a one-sided failure: maker claimed counter (reveals p) but asset got refunded to maker.
     refund2 = _rxd_tx(_m2_holder)
     res_fail = run_verify(m2, funding2, refund2, btc_claim)
@@ -1369,12 +1473,21 @@ def _self_check() -> int:
         and not any("NOT verified" in r for r in res_full.reasons),
     )
     check(
-        "run_verify without counter inputs -> PASS but loud value+recipient NOT_VERIFIED warnings",
-        res.verdict is Verdict.PASS
+        "run_verify without counter inputs -> PASS_UNVERIFIED + loud value+recipient NOT_VERIFIED warnings",
+        res.verdict is Verdict.PASS_UNVERIFIED
         and res.checks["counter_value_verified"] is False
         and res.checks["counter_recipient_verified"] is False
+        and res.checks["counter_fully_verified"] is False
         and any("VALUE was NOT verified" in r for r in res.reasons)
         and any("RECIPIENT was NOT verified" in r for r in res.reasons),
+    )
+    # M-b: the "verified" flag must reflect what RAN, not just manifest fields — a full manifest but
+    # counter_funding=None (a pure-core caller) must NOT report recipient_verified true.
+    res_noffund = run_verify(_m2_full, funding2, claim2, btc_claim, counter_funding=None)
+    check(
+        "M-b: full manifest but no counter_funding -> flags False (not a lying 'verified')",
+        res_noffund.checks["counter_recipient_verified"] is False
+        and res_noffund.checks["counter_value_verified"] is False,
     )
 
     # 5c) secret-key guard (review LOW): PRIVATE keys rejected, PUBLIC keys NOT (the bare "key" substring
@@ -1458,10 +1571,14 @@ def _self_check() -> int:
     # claimant, ...) and assert claimant == the agreed maker AND hashlock == H — so a Claimed(p) pays the
     # maker, not the taker. Deploy input = <init code> + 128B args (hashlock, claimant, refundee, timeout).
     _maker_addr = "0x" + "bb" * 20
+    # Real EthHtlc creation bytecode — the code pin only passes for the canonical init code (audit HIGH).
+    _eth_creation = bytes.fromhex(
+        json.loads((Path(__file__).resolve().parent.parent / "tests/fixtures/EthHtlc.json").read_text())["bytecode"][2:]
+    )
 
-    def _eth_deploy(hashlock: bytes, claim20: bytes) -> dict:
+    def _eth_deploy(hashlock: bytes, claim20: bytes, *, init_code: bytes = _eth_creation) -> dict:
         args = hashlock + (bytes(12) + claim20) + bytes(32) + (999).to_bytes(32, "big")
-        return {"input": "0x" + (b"\xfe" * 20 + args).hex()}
+        return {"input": "0x" + (init_code + args).hex()}
 
     _m_eth_r = replace(m_eth, eth_maker_claimant=_maker_addr, eth_funding_tx="0x" + "11" * 32)
     evr_ok, _, _ = verify_counter_leg_eth(
@@ -1485,11 +1602,46 @@ def _self_check() -> int:
         funding=(_eth_deploy(b"\x00" * 32, bytes.fromhex("bb" * 20)), {"contractAddress": contract}),
     )
     check("ETH recipient constructor hashlock!=H -> ANOMALOUS", evr_badh is CounterLeg.ANOMALOUS)
+    # H-1: a LOOK-ALIKE contract (non-canonical init code) whose ctor decodes honest (H, maker) bytes must
+    # be REJECTED — the taker deploys the ETH leg and could otherwise ship a contract that pays the taker.
+    evr_fake, _, _ = verify_counter_leg_eth(
+        _m_eth_r,
+        claim_tx,
+        claim_rcpt,
+        funding=(_eth_deploy(h_eth, bytes.fromhex("bb" * 20), init_code=b"\xfe" * 200), {"contractAddress": contract}),
+    )
+    check("ETH look-alike contract (init code != canonical EthHtlc) -> ANOMALOUS", evr_fake is CounterLeg.ANOMALOUS)
+    # non-clean address left-pad (upper 12 bytes of the claimant word non-zero) is a malformed deploy ->
+    # ANOMALOUS. args = deploy_input[-128:]; claimant word = args[32:64] = deploy_input[-96:-64]; its upper
+    # -12 padding starts at deploy_input[-96].
+    _dirty = _eth_deploy(h_eth, bytes.fromhex("bb" * 20))
+    _di = bytearray(_hb(_dirty["input"]))
+    _di[-96] = 0xAA  # first byte of the claimant word's upper-12 padding
+    evr_pad, _, _ = verify_counter_leg_eth(
+        _m_eth_r, claim_tx, claim_rcpt, funding=({"input": "0x" + _di.hex()}, {"contractAddress": contract})
+    )
+    check("ETH claimant word not clean left-pad -> ANOMALOUS", evr_pad is CounterLeg.ANOMALOUS)
 
-    # end-to-end ETH happy path: asset claimed by taker + ETH claimed by maker -> PASS.
+    # end-to-end ETH: WITHOUT counter binding fields -> both-complete downgrades to PASS_UNVERIFIED (H-2);
+    # WITH them (recipient + value bound to the canonical contract) -> a real PASS.
     fe_spk, te_holder, me_holder = rxd_expected_scripts(m_eth)
     res_eth = run_verify(m_eth, _rxd_tx(fe_spk), _rxd_tx(te_holder), (claim_tx, claim_rcpt))
-    check("end-to-end ETH happy path -> PASS", res_eth.verdict is Verdict.PASS)
+    check("end-to-end ETH w/o counter fields -> PASS_UNVERIFIED", res_eth.verdict is Verdict.PASS_UNVERIFIED)
+    _m_eth_full = replace(
+        m_eth, eth_maker_claimant=_maker_addr, eth_funding_tx="0x" + "11" * 32, counter_amount=eth_amt
+    )
+    _deploy_full = {**_eth_deploy(h_eth, bytes.fromhex("bb" * 20)), "value": hex(eth_amt)}
+    res_eth_full = run_verify(
+        _m_eth_full,
+        _rxd_tx(fe_spk),
+        _rxd_tx(te_holder),
+        (claim_tx, claim_rcpt),
+        counter_funding=(_deploy_full, {"contractAddress": contract}),
+    )
+    check(
+        "end-to-end ETH FULLY verified -> PASS",
+        res_eth_full.verdict is Verdict.PASS and res_eth_full.checks["counter_fully_verified"] is True,
+    )
     res_eth_fail = run_verify(m_eth, _rxd_tx(fe_spk), _rxd_tx(me_holder), (claim_tx, claim_rcpt))
     check("end-to-end ETH free-option -> FAIL_ONE_SIDED", res_eth_fail.verdict is Verdict.FAIL_ONE_SIDED)
 
@@ -1517,7 +1669,8 @@ def _self_check() -> int:
     check("margin N/A on the unwind case", g_na == "N/A")
     g_unk, _, _ = margin_grade(m_marg, AssetLeg.TAKER_CLAIMED, CounterLeg.MAKER_CLAIMED, None)
     check("margin UNKNOWN without heights", g_unk == "UNKNOWN")
-    # a MARGINAL claim is still a PASS but flagged.
+    # a MARGINAL claim is still a (PASS-family) verdict but flagged; m_marg omits counter fields, so the
+    # verdict is PASS_UNVERIFIED and the margin grade is still surfaced.
     res_marg = run_verify(
         m_marg,
         _rxd_tx(rxd_expected_scripts(m_marg)[0]),
@@ -1526,8 +1679,8 @@ def _self_check() -> int:
         asset_claim_height=1045,
     )
     check(
-        "MARGINAL claim still PASS, flagged",
-        res_marg.verdict is Verdict.PASS and res_marg.checks["margin"]["grade"] == "MARGINAL",
+        "MARGINAL claim (no counter fields) -> PASS_UNVERIFIED, margin flagged",
+        res_marg.verdict is Verdict.PASS_UNVERIFIED and res_marg.checks["margin"]["grade"] == "MARGINAL",
     )
 
     # 9) ETH cross-source fingerprint (H2): identical tx/receipt -> equal fp; any material divergence -> differ.
@@ -1577,9 +1730,17 @@ def _self_check() -> int:
         "advisory: 2 ETH RPCs -> no single-source warning, count 2",
         r_multi.checks.get("eth_source_count") == 2 and not any("SINGLE RPC" in x for x in r_multi.reasons),
     )
-    check("advisory: PASS gets depth note", any("burial DEPTH" in x for x in r_multi.reasons))
+    # L-7: a DEEP min_confirmations (>= _DEEP_CONFIRMATIONS) suppresses the prose depth reminder (not
+    # wallpaper) but KEEPS the structured depth_source check; a SHALLOW one emits the loud note.
+    check(
+        "advisory: deep min_conf -> no prose note but structured check",
+        not any("burial DEPTH" in x for x in r_multi.reasons) and r_multi.checks.get("depth_source"),
+    )
+    r_shallow = VerifyResult(verdict=Verdict.PASS)
+    _append_trust_advisories(r_shallow, m_eth, ["https://a.example", "https://b.example"], 1)
+    check("advisory: shallow min_conf PASS gets depth note", any("burial DEPTH" in x for x in r_shallow.reasons))
     r_fail = VerifyResult(verdict=Verdict.FAIL_ONE_SIDED)
-    _append_trust_advisories(r_fail, m_eth, ["https://a.example", "https://b.example"], 6)
+    _append_trust_advisories(r_fail, m_eth, ["https://a.example", "https://b.example"], 1)
     check("advisory: FAIL gets no depth note", not any("burial DEPTH" in x for x in r_fail.reasons))
     # same-host URLs are NOT two independent sources (fake-quorum guard).
     check(
@@ -1587,6 +1748,40 @@ def _self_check() -> int:
         _dedup_by_host(["https://a.example/x", "https://a.example/y", "https://b.example"])
         == ["https://a.example/x", "https://b.example"],
     )
+    # L-1: scheme-less hosts (urlparse(...).hostname is None) must still collapse (localhost:8545/:8546).
+    check(
+        "dedup: scheme-less same host collapses",
+        _dedup_by_host(["localhost:8545", "localhost:8546", "127.0.0.1:8545"]) == ["localhost:8545", "127.0.0.1:8545"],
+    )
+
+    # L-4: hostile t_btc_blocks (out-of-range / bool) is a clean INVALID, not a mid-verify traceback.
+    def _bad_manifest(tb: object) -> bool:
+        base = {
+            "swap_id": "x",
+            "asset_variant": "rxd",
+            "counter_chain": "btc",
+            "honest_party": "taker",
+            "h_hex": "11" * 32,
+            "taker_pkh_hex": "22" * 20,
+            "maker_pkh_hex": "33" * 20,
+            "rxd_amount": 1000,
+            "refund_csv": 48,
+            "covenant_funding": "ab" * 32 + ":0",
+            "counter_funding": "cd" * 32 + ":0",
+            "btc_claim_xonly_hex": "aa" * 32,
+            "btc_refund_xonly_hex": "bb" * 32,
+            "t_btc_blocks": tb,
+        }
+        try:
+            RunManifest.from_dict(base)
+            return False
+        except ValueError:
+            return True
+
+    check("L-4: t_btc_blocks=0 rejected", _bad_manifest(0))
+    check("L-4: t_btc_blocks=70000 rejected", _bad_manifest(70000))
+    check("L-4: t_btc_blocks=True rejected", _bad_manifest(True))
+    check("L-4: t_btc_blocks=144 accepted", not _bad_manifest(144))
 
     print()
     if failures:
@@ -1634,14 +1829,20 @@ def _append_trust_advisories(res: VerifyResult, m: RunManifest, eth_urls: list[s
                 "MITM'd RPC could fabricate the value/logs/finality that drive this verdict. Pass >=2 "
                 "independent --eth-rpc-url for a cross-checked (quorum) re-fetch before trusting a PASS."
             )
-    if res.verdict in (Verdict.PASS, Verdict.PENDING):
+    if res.verdict in (Verdict.PASS, Verdict.PASS_UNVERIFIED, Verdict.PENDING):
         res.checks["depth_source"] = "single-source-trusted"
-        res.reasons.append(
-            f"NOTE: confirmation depth / finality of the settled leg(s) was read from a SINGLE independent "
-            f"source (min_confirmations={min_confirmations}); the txid is unforgeable but its burial DEPTH "
-            "is source-trusted. For real value set --min-confirmations deep and prefer multiple independent "
-            "depth sources — a shallow disposition that later reorgs is a real one-sided loss."
-        )
+        res.checks["min_confirmations"] = min_confirmations
+        # Only emit the prose reminder when the depth is SHALLOW (below a real-value floor). Firing it on
+        # every PASS trains operators to ignore it (review LOW: advisory wallpaper); the structured
+        # depth_source/min_confirmations checks above stay machine-readable regardless.
+        if min_confirmations < _DEEP_CONFIRMATIONS:
+            res.reasons.append(
+                f"NOTE: confirmation depth / finality of the settled leg(s) was read from a SINGLE "
+                f"independent source at a SHALLOW min_confirmations={min_confirmations} (< {_DEEP_CONFIRMATIONS}); "
+                "the txid is unforgeable but its burial DEPTH is source-trusted. For real value set "
+                "--min-confirmations deep and prefer multiple independent depth sources — a shallow "
+                "disposition that later reorgs is a real one-sided loss."
+            )
 
 
 async def _run_cli(args: argparse.Namespace) -> int:
@@ -1666,14 +1867,21 @@ async def _run_cli(args: argparse.Namespace) -> int:
             cited.setdefault(k, v)
 
     # 3) re-fetch from independent sources + verify.
-    cov_fund, cov_spend, counter_obj, counter_funding, asset_claim_height = await _fetch_for_live(
-        m,
-        cited,
-        args.btc_esplora_url,
-        args.rxd_electrumx_url,
-        eth_urls,
-        min_confirmations=args.min_confirmations,
-    )
+    try:
+        cov_fund, cov_spend, counter_obj, counter_funding, asset_claim_height = await _fetch_for_live(
+            m,
+            cited,
+            args.btc_esplora_url,
+            args.rxd_electrumx_url,
+            eth_urls,
+            min_confirmations=args.min_confirmations,
+        )
+    except _DiscoveryTruncated as exc:
+        # Spender discovery could not complete within its bound -> the asset disposition is INCONCLUSIVE,
+        # not a clean unspent. Refuse to score rather than emit a benign-looking PENDING that masks a
+        # possibly-buried one-sided loss (review MEDIUM). Non-zero exit; the honest party can cite the spend.
+        print(f"INCONCLUSIVE: {exc} — cite the covenant spend txid explicitly and re-run", file=sys.stderr)
+        return 4
     res = run_verify(
         m,
         cov_fund,
@@ -1684,9 +1892,15 @@ async def _run_cli(args: argparse.Namespace) -> int:
     )
     _append_trust_advisories(res, m, eth_urls, args.min_confirmations)
     print(json.dumps(res.as_dict(), indent=2))
-    return (
-        0 if res.verdict is Verdict.PASS else (2 if res.verdict in (Verdict.FAIL_ONE_SIDED, Verdict.ANOMALOUS) else 4)
-    )
+    # Exit codes: 0 fully-verified PASS · 5 PASS_UNVERIFIED (both-complete but counter not recipient/value
+    # -verified — distinct so CI can't treat it as a clean PASS) · 2 one-sided/anomalous · 4 pending.
+    if res.verdict is Verdict.PASS:
+        return 0
+    if res.verdict is Verdict.PASS_UNVERIFIED:
+        return 5
+    if res.verdict in (Verdict.FAIL_ONE_SIDED, Verdict.ANOMALOUS):
+        return 2
+    return 4
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1724,8 +1938,10 @@ def main(argv: list[str] | None = None) -> int:
     cc = _load_json(args.manifest).get("counter_chain")
     if cc == "btc" and not args.btc_esplora_url:
         ap.error("btc counter leg needs --btc-esplora-url (an Esplora neither party ran)")
-    if cc == "eth" and not args.eth_rpc_url:
-        ap.error("eth counter leg needs --eth-rpc-url (an ETH RPC neither party ran)")
+    # Check the FILTERED list, not the raw arg: `--eth-rpc-url ""` makes args.eth_rpc_url == [""] (truthy)
+    # but resolves to zero real endpoints, which would otherwise raise a raw ValueError mid-run (review LOW).
+    if cc == "eth" and not [u for u in (args.eth_rpc_url or []) if u]:
+        ap.error("eth counter leg needs at least one non-empty --eth-rpc-url (an ETH RPC neither party ran)")
     return asyncio.run(_run_cli(args))
 
 
