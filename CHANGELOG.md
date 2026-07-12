@@ -61,8 +61,18 @@ real value.**
   clean one (#273, #300, #302, #303, #304, #305, #308). A taker RXD-funding depth gate
   refuses to lock the counter asset against an unconfirmed/reorgable covenant funding
   (#306).
-- No fund-loss issue in the shipped library was found this cycle. The cross-chain swap
-  stack **remains unaudited** and the RSWP orderbook is **experimental**.
+- **A pre-release security panel over the RSWP orderbook found and fixed two HIGH
+  fund-safety bugs** in the (experimental) order-construction layer before release (#310):
+  `accept_offer` did not bound a `SIGHASH_SINGLE|ANYONECANPAY` offer's output count (a
+  hand-delivered offer with an injected extra output could make a taker overpay), and a
+  covenant order with an NFT demand silently degraded to a dust `P2PKH` (selling the
+  reserved RXD for dust). Also: DoS bounds on the browse / tracker / covenant-parse paths,
+  strict rejection of truncated pushes (an advert book-visibility divergence), and CLI
+  hardening (terminal-escape sanitization, malformed-row resilience). The consensus-level
+  covenant and the shipped HTLC coordinator/legs were reviewed **clean**.
+- The two HIGH RSWP bugs above were found and fixed **pre-release**; no fund-loss issue
+  survives this cycle. The cross-chain swap stack **remains unaudited** and the RSWP
+  orderbook is **experimental** — verify both yourself before moving real value.
 
 ## [0.10.0] — 2026-06-26
 
