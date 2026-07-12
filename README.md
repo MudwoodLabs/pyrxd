@@ -57,6 +57,10 @@ mainnet. If you find a bug that affects funds, report it via the
 - **dMint permissionless PoW tokens (V1)** — deploy (byte-equal to the live Glyph-protocol deploy,
   node-consensus-validated) and mine/claim from live mainnet contracts
   (`pyrxd glyph deploy-dmint` / `claim-dmint`)
+- **dMint permissionless PoW tokens (V2)** — the canonical Photonic redesign with adaptive difficulty
+  (FIXED / ASERT / LWMA / EPOCH / SCHEDULE), byte-matched to upstream Photonic and node-consensus-validated
+  on regtest and Radiant mainnet: the first V2 deploy + PoW mint and an on-chain difficulty retarget were
+  confirmed on mainnet (`pyrxd glyph deploy-dmint --v2` / `claim-dmint`)
 - List your Glyph tokens (`pyrxd glyph list`)
 - `pyrxd agent` — a per-spend-confirmed signing daemon that keeps the key out of the short-lived CLI process
 - ElectrumX async client with reconnect, balance, UTXOs, history, broadcast
@@ -68,11 +72,6 @@ mainnet. If you find a bug that affects funds, report it via the
   small real-value dust runs), against BTC, ETH, and EVM L2s (Base / Optimism / Arbitrum /
   Linea). This cross-chain swap stack is **unaudited — verify it yourself before moving
   real value.**
-- dMint **V2** (canonical Photonic redesign — FIXED plus ASERT / LWMA adaptive difficulty) —
-  byte-matched to upstream Photonic and consensus-validated on `radiant-core` v3.1.1 regtest
-  AND Radiant mainnet (3.1.2): the first V2 dMint deploy + PoW mint confirmed on mainnet, plus an
-  LWMA mint that advanced difficulty on-chain — adaptive difficulty proven on mainnet (#219).
-  V2 deploys are gated behind `allow_v2_deploy=True` as a deliberate opt-in for the newer format.
 
 ## Upgrading
 

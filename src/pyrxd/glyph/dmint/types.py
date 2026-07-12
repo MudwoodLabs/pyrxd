@@ -25,20 +25,15 @@ from pyrxd.security.errors import ValidationError
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 
 # ---------------------------------------------------------------------------
-# V2 quarantine marker
+# V2 warning category (retired)
 # ---------------------------------------------------------------------------
 #
-# V2 dMint is implemented per spec but **has never been validated against
-# on-chain bytes** — no V2 contract exists on Radiant mainnet as of pyrxd
-# 0.5.1. Every protocol-level claim in the V2 path is byte-derived from
-# the V1 covenant (where the two share bytecode, e.g. ``_PART_C``) or
-# from the V2 design doc; nothing is cross-validated against live
-# transactions. This is the same anti-pattern that produced the M1
-# mint-shape bug (docs/solutions/logic-errors/dmint-v1-mint-shape-mismatch.md)
-# and the V2 reward-shape bug caught by the 0.5.0 red-team audit. The
-# quarantine warning below is the smallest reversible signal we can put
-# on every V2 entry point to make the "this path has never run on chain"
-# status visible at runtime.
+# V2 dMint was once quarantined behind a per-call warning because it had never
+# run against live consensus. That is no longer true (see the class docstring):
+# the canonical-Photonic V2 redesign is byte-matched to upstream and mainnet-
+# proven, so the warning is retained as an importable category but is no longer
+# emitted. V2 now sits alongside V1 in the README's "Working on mainnet today"
+# list under the same blanket "unaudited primitives" caveat.
 
 
 class V2UnvalidatedWarning(UserWarning):
