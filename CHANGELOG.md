@@ -42,6 +42,12 @@ real value.**
   retryable condition) consistently across the coordinator and all legs (#301, #306, #308).
 - `BitcoinCoreRpcSource` parses node BTC amounts with `parse_float=Decimal`, keeping the
   amount exact all the way into sat conversion (#308).
+- **dMint V2 promoted from "Experimental" to "Working on mainnet today"** (closes #219). The
+  implementation, a real mainnet deploy + PoW mint, and an on-chain adaptive-difficulty retarget
+  were all proven and merged; the label now matches V1 — the same evidence class (node-consensus-
+  validated + mainnet-proven), under the same blanket "unaudited primitives" caveat. The stale
+  `allow_v2_deploy` opt-in note is dropped (that gate was removed in 0.9.0). *The cross-chain **swap**
+  stack stays Experimental/unaudited — a different bar, gated on an external audit, not this cleanup.*
 
 ### Fixed
 
