@@ -75,6 +75,11 @@ REFUND_SEQUENCE = 0xFFFFFFFE
 #: nLockTime/CLTV values at/above this are UNIX timestamps, not heights. The
 #: swap expiry is always a HEIGHT; reject anything at/above the threshold.
 LOCKTIME_HEIGHT_THRESHOLD = 500_000_000
+# A real swap-refund covenant SPK is ~62-67 bytes (OP_IF + 25B P2PKH + OP_ELSE + <=6B expiry push +
+# CLTV DROP + 25B P2PKH + OP_ENDIF). The parser's nested marker scan is ~O(len^2) in the worst case, and a
+# griefer picks the advertised covenant txid (fetch_transaction has no size cap), so bound the input before
+# scanning — anything larger cannot be a covenant (review MEDIUM DoS).
+_MAX_COVENANT_SPK = 256
 
 _DUST_PHOTONS = 546  # same fold-to-fee rule as pyrxd.swap.partial
 
@@ -110,7 +115,7 @@ def parse_refund_covenant(spk: bytes) -> tuple[bytes, int] | None:
     the two inner branches to be byte-identical — a tampered covenant whose
     branches differ is NOT a swap-refund covenant.
     """
-    if len(spk) < 8 or spk[:1] != _OP_IF or spk[-1:] != _OP_ENDIF:
+    if not 8 <= len(spk) <= _MAX_COVENANT_SPK or spk[:1] != _OP_IF or spk[-1:] != _OP_ENDIF:
         return None
     for data_len in range(1, 7):  # minimal pushes of 1..6 bytes
         for else_pos in range(1, len(spk) - (1 + 1 + data_len + 2)):
@@ -295,6 +300,15 @@ def _p2pkh_or_ft_output(asset: Asset, pkh: bytes) -> TransactionOutput:
         from ...glyph.script import build_ft_locking_script
 
         return TransactionOutput(Script(build_ft_locking_script(Hex20(pkh), asset.ref)), asset.amount)
+    if asset.kind != "rxd":
+        # audit HIGH: an nft (or any non-rxd/ft) demand would silently become a plain P2PKH paying only
+        # asset.amount (the ~dust carrier value), and create_covenant_order signs THAT as the price for the
+        # reserved RXD — so the covenant becomes spendable for dust and the maker loses the reservation.
+        # NFT-in-covenant demand is not supported by this builder; fail closed instead of emitting a dust demand.
+        raise ValidationError(
+            f"covenant order demand of kind {asset.kind!r} is not supported (only rxd/ft) — an nft demand "
+            "would silently degrade to a dust P2PKH output and sell the reserved RXD for dust"
+        )
     return TransactionOutput(P2PKH().lock(pkh), asset.amount)
 
 
@@ -427,6 +441,14 @@ def take_covenant_order(
         if ft_surplus < 0:
             raise ValidationError(
                 f"funding lacks {-ft_surplus} units of the demanded FT {demanded_ref.txid}:{demanded_ref.vout}"
+            )
+        if 0 < ft_surplus < _DUST_PHOTONS:
+            # An FT change output below the dust floor is relay-rejected, so the whole take would be an
+            # unbroadcastable tx that fails opaquely (review MEDIUM). Folding the surplus to fee would BURN
+            # tokens, so refuse and tell the taker to fund exact-or-dust-clear instead.
+            raise ValidationError(
+                f"FT funding surplus is {ft_surplus} units (< dust floor {_DUST_PHOTONS}); the change output "
+                "would be un-relayable — re-fund the exact demanded amount or leave a >= dust surplus"
             )
         if ft_surplus > 0:
             tx.add_output(_build_ft_change(demanded_ref, ft_surplus, bytes(taker_change_pkh)))

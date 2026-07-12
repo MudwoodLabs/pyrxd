@@ -174,7 +174,19 @@ class RxindexerOrderbookSource:
         discovery, then an independent re-derive of each order (see module docstring)."""
         base_ref = f"{token_id_hex}_0"
         entries = await self._call_swap_get_orders(base_ref=base_ref, limit=limit, offset=offset)
-        return [await self._row_from_discovery(entry) for entry in entries]
+        # RM-1 (DoS): a source ignoring `limit` can't force unbounded per-row fetch+decode work.
+        entries = entries[: max(0, limit)]
+        rows: list[dict] = []
+        for entry in entries:
+            try:
+                rows.append(await self._row_from_discovery(entry))
+            except ValidationError:
+                # RM-7: an advert RXinDexer indexes but pyrxd's STRICTER decoder rejects (e.g. an OP_N /
+                # selective-disclosure field) must NOT abort the whole browse — that violates book.py's
+                # per-row invariant. Pass the raw discovery row through so book._verify_row surfaces it as a
+                # per-row PROBLEM. A transport failure (NetworkError) still propagates (fails closed).
+                rows.append({**entry, "block_height": entry.get("height")})
+        return rows
 
     async def get_open_orders_by_want(self, want_token_id_hex: str, *, limit: int = 100, offset: int = 0) -> list[dict]:
         """Always raises — RXinDexer has no want-token-only order index.

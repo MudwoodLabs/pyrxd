@@ -144,6 +144,15 @@ def test_rejects_short_tail():
         decode_rswp_order(_v2_frame(tail=[_push(b"onlyone")]))
 
 
+def test_rejects_truncated_push():
+    """RM-3: a push whose DECLARED length exceeds the bytes present must be rejected (Radiant-Core GetOp
+    drops it), not silently clamped — else pyrxd would show as fillable a frame the canonical book never
+    indexes. OP_RETURN + a direct push declaring 32 bytes but with only 4 present."""
+    truncated = bytes([0x6A, 0x20]) + b"\x01\x02\x03\x04"
+    with pytest.raises(ValidationError, match="truncated"):
+        decode_rswp_order(truncated)
+
+
 # --------------------------------------------------------------------------- audit M4: node-strictness parity
 
 

@@ -305,8 +305,14 @@ def verify_offer_signature(offer: SwapOffer) -> None:
     """
     partial = Transaction.from_hex(bytes.fromhex(offer.partial_tx_hex))
     give_source = Transaction.from_hex(bytes.fromhex(offer.give_source_tx_hex))
-    if partial is None or give_source is None or not partial.inputs or not partial.outputs:
+    if partial is None or give_source is None:
         raise ValidationError("offer does not contain a parseable partial/source transaction")
+    # Mirror accept_offer's invariant (audit HIGH): SINGLE|ANYONECANPAY binds only input[0]/output[0], so a
+    # "fillable" verdict on an offer with extra unsigned outputs would mislead a browser into funding them.
+    if len(partial.inputs) != 1 or len(partial.outputs) != 1:
+        raise ValidationError(
+            "offer must have exactly one maker input and one output (SINGLE|ANYONECANPAY binds only those)"
+        )
     maker_in = partial.inputs[0]
     if give_source.txid() != maker_in.source_txid:
         raise ValidationError("give_source_tx does not match the maker input's outpoint")
