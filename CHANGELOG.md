@@ -4,6 +4,66 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] — 2026-07-11
+
+Feature + swap-safety-hardening release. The headline is the **RSWP on-chain
+orderbook** (the write side): an experimental swap-order subpackage and CLI for
+posting/taking/cancelling/refunding orders through an on-chain covenant. Alongside it,
+a full cycle of cross-chain HTLC swap-safety work — coordinator/leg refund-maturity
+pre-checks, and extensive adversarial hardening of the two-party-adversarial-run tooling
+(a chain-re-derivation verifier + two-host harnesses that live under `scripts/` and are
+**not** part of the shipped wheel). Every addition is additive or opt-in; no breaking
+API, wire-format, or covenant-bytecode changes. **The cross-chain swap stack remains
+unaudited, and the RSWP orderbook is experimental — verify both yourself before moving
+real value.**
+
+### Added
+
+- **RSWP on-chain orderbook (v3 covenant, experimental)** — the new `pyrxd.swap.rswp`
+  subpackage: on-chain `reserve` / `post` / `take` / `cancel` / `refund` covenant flows
+  (RXD, red-teamed), a maker offer lifecycle + fill-detection tracker, a pure
+  market-maker quoting toolkit, and an (experimental) RXinDexer orderbook source adapter.
+  Same-chain swaps gained FT-demand fills with per-ref conservation and NFT-singleton
+  support (#276, #278, #279, #281, #282, #283, #284, #285).
+- **`pyrxd swap orders | reserve | post | take | cancel | refund`** — CLI for the RSWP
+  orderbook, sharing the existing `swap` command group (#277, #282).
+- RSWP wire-format fuzz coverage, plus broader mutation / differential / conformance test
+  hardening and a scheduled (weekly) fuzz CI lane (#275, #280).
+
+### Changed
+
+- **HTLC swap coordinator/leg safety.** A first-class `taker_observed_reveal` transition
+  verifies an on-chain secret reveal (`sha256(p) == H` + per-swap provenance) before the
+  FSM advances, removing a harness resume seam (#294). A role guard blocks a taker from
+  calling the maker-side, self-stranding `maybe_refund_asset_on_maker_stall` (#292). BIP68
+  CSV refund-maturity pre-checks were pushed into the RXD covenant, BTC, and ETH legs so a
+  non-final refund is refused rather than left to node rejection under deadline pressure
+  (#295, #296, #297, #301). "Not-yet-mature" now raises `NetworkError` (a transient,
+  retryable condition) consistently across the coordinator and all legs (#301, #306, #308).
+- `BitcoinCoreRpcSource` parses node BTC amounts with `parse_float=Decimal`, keeping the
+  amount exact all the way into sat conversion (#308).
+
+### Fixed
+
+- RSWP audit follow-ups: a fill-tracker forgery gate, an order-book DoS bound, query/
+  response correspondence, decoder parity with the encoder, and CLI take-consent (#289).
+
+### Security
+
+- The two-party-adversarial-run tooling (a chain-re-derivation verifier + two-host
+  harnesses — **dev tooling under `scripts/`, not shipped in the wheel**) went through
+  several adversarial red-team rounds. They found and fixed a CRITICAL asset-leg
+  false-PASS (a decoy spend that paid the right party but never consumed the covenant
+  outpoint, #288) and a series of subsequent false-PASS / counter-leg-binding gaps —
+  confirmation-depth and independent spender-discovery gates, counter-leg value and
+  recipient binding, ETH cross-source quorum, an ETH contract-code (creation-bytecode)
+  pin, and a distinct `PASS_UNVERIFIED` verdict so an unverified pass can't be read as a
+  clean one (#273, #300, #302, #303, #304, #305, #308). A taker RXD-funding depth gate
+  refuses to lock the counter asset against an unconfirmed/reorgable covenant funding
+  (#306).
+- No fund-loss issue in the shipped library was found this cycle. The cross-chain swap
+  stack **remains unaudited** and the RSWP orderbook is **experimental**.
+
 ## [0.10.0] — 2026-06-26
 
 Feature + audit-readiness release (vs 0.9.0's posture-only one). New read-only tooling
