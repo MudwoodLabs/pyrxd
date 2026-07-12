@@ -316,6 +316,22 @@ def swap_orders_cmd(ctx: CliContext, token: str, want: bool, node_rpc: str, rpc_
             entries = await (book.orders_wanting(ref, limit=limit) if want else book.orders_offering(ref, limit=limit))
         rows = []
         for e in entries:
+            if e.order is None:
+                # A row too malformed to even decode an order from — book.py surfaced it as a problem with
+                # order=None. Render it as a problem line rather than dereferencing e.order (review MEDIUM:
+                # one such row must not AttributeError and crash the whole browse).
+                rows.append(
+                    {
+                        "offered_utxo": "(undecodable)",
+                        "gives": "(unverified)",
+                        "wants": "(unparseable)",
+                        "status": e.status,
+                        "fillable": e.fillable,
+                        "block_height": e.block_height,
+                        "problem": e.problem,
+                    }
+                )
+                continue
             demanded = e.order.demanded_outputs
             rows.append(
                 {
@@ -335,7 +351,9 @@ def swap_orders_cmd(ctx: CliContext, token: str, want: bool, node_rpc: str, rpc_
     try:
         rows = asyncio.run(_run())
     except RxdSdkError as exc:
-        raise click.ClickException(f"orderbook read failed: {exc}") from exc
+        # The error text can embed a hostile node's RPC message — strip terminal-control bytes so it can't
+        # inject ANSI/cursor sequences that spoof or hide CLI output (review MEDIUM).
+        raise click.ClickException(f"orderbook read failed: {sanitize_terminal(str(exc), max_len=300)}") from exc
 
     payload = {"token": token, "side": "want" if want else "offer", "count": len(rows), "orders": rows}
     if ctx.output_mode in ("json", "quiet"):
@@ -793,5 +811,6 @@ def _finish(ctx: CliContext, run, *, quiet_field: str) -> None:
     except (UserError, click.ClickException):
         raise
     except RxdSdkError as exc:
-        raise click.ClickException(str(exc)) from exc
+        # Strip terminal-control bytes: the message can carry a hostile node/server string (review MEDIUM).
+        raise click.ClickException(sanitize_terminal(str(exc), max_len=300)) from exc
     click.echo(emit(payload, mode=ctx.output_mode, quiet_field=quiet_field))

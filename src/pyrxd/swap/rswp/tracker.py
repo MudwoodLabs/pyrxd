@@ -147,6 +147,13 @@ def _script_hash(script: bytes) -> bytes:
     return sha256(script)[::-1]
 
 
+# Cap on confirmed history candidates fetched while hunting the offered outpoint's spender (review MEDIUM
+# DoS): a hostile ElectrumX can pad the scripthash history with confirmed-looking non-matching entries, each
+# costing a full-tx fetch. Beyond the cap the offer falls to OPEN (re-poll) — the same safe liveness-only
+# disposition as "no confirmed spender yet", never a false FILLED.
+_MAX_HISTORY_FETCHES = 256
+
+
 async def classify(client: ElectrumXClient, offer: TrackedOffer) -> ClassifyResult:
     """Classify ``offer`` against the live chain — see the module docstring for the
     security argument. Every transaction this reads (the offered UTXO's own source
@@ -171,6 +178,8 @@ async def classify(client: ElectrumXClient, offer: TrackedOffer) -> ClassifyResu
     history = await client.get_history(script_hash)
     spending_tx = None
     spending_txid: str | None = None
+    spend_input_index = 0
+    fetches = 0
     for entry in history:
         candidate_txid = str(entry["tx_hash"])
         if candidate_txid == str(offer.outpoint_txid):
@@ -181,14 +190,22 @@ async def classify(client: ElectrumXClient, offer: TrackedOffer) -> ClassifyResu
             entry_height = 0
         if entry_height <= 0:
             continue  # unconfirmed (mempool) — not a settled spender; skip
+        if fetches >= _MAX_HISTORY_FETCHES:
+            break  # DoS cap — an un-found spender falls to OPEN below (safe, liveness-only)
+        fetches += 1
         candidate = await fetch_transaction(client, candidate_txid)
-        spends_it = any(
-            i.source_txid == str(offer.outpoint_txid) and i.source_output_index == offer.outpoint_vout
-            for i in candidate.inputs
+        spend_idx = next(
+            (
+                k
+                for k, i in enumerate(candidate.inputs)
+                if i.source_txid == str(offer.outpoint_txid) and i.source_output_index == offer.outpoint_vout
+            ),
+            None,
         )
-        if spends_it:
+        if spend_idx is not None:
             spending_tx = candidate
             spending_txid = candidate_txid
+            spend_input_index = spend_idx
             break
 
     if spending_tx is None:
@@ -212,9 +229,14 @@ async def classify(client: ElectrumXClient, offer: TrackedOffer) -> ClassifyResu
         return ClassifyResult(status=OfferStatus.CANCELLED, spending_txid=spending_txid)
     demanded = order.demanded_outputs[0]
 
-    settled = spending_tx.outputs[0]
-    if settled.satoshis == demanded.value and settled.locking_script.serialize() == demanded.script:
-        return ClassifyResult(status=OfferStatus.FILLED, spending_txid=spending_txid)
+    # SIGHASH_SINGLE binds the maker's demand to the output at the SAME index as the maker's signing input.
+    # A fill built by another wallet may place the maker input at index != 0, so check THAT output — not
+    # output[0] — else a genuine fill is misreported CANCELLED and the maker's net_position silently drops a
+    # given/received leg (review MEDIUM).
+    if spend_input_index < len(spending_tx.outputs):
+        settled = spending_tx.outputs[spend_input_index]
+        if settled.satoshis == demanded.value and settled.locking_script.serialize() == demanded.script:
+            return ClassifyResult(status=OfferStatus.FILLED, spending_txid=spending_txid)
     return ClassifyResult(status=OfferStatus.CANCELLED, spending_txid=spending_txid)
 
 

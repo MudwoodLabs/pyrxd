@@ -306,6 +306,43 @@ def test_tampered_receive_output_breaks_maker_signature() -> None:
         )
 
 
+def test_injected_extra_output_rejected() -> None:
+    """RH-1 (audit HIGH): a maker's SINGLE|ANYONECANPAY signature binds only output[0], so an offer carrying
+    an EXTRA unsigned output would be funded from the TAKER's inputs (silent overpay; the maker pockets the
+    injected amount while the advertised terms look fair). accept_offer and verify_offer_signature must
+    refuse any offer whose partial tx has more than one input/output."""
+    mk, mk_pkh = _key()
+    tk, tk_pkh = _key()
+    _atk, atk_pkh = _key()
+    offer = create_offer(
+        give_source_tx=_rxd_src(mk_pkh, 1000),
+        give_vout=0,
+        maker_key=mk,
+        receive=Asset("rxd", 600),
+        maker_receive_pkh=mk_pkh,
+    )
+    partial = Transaction.from_hex(bytes.fromhex(offer.partial_tx_hex))
+    partial.add_output(TransactionOutput(P2PKH().lock(atk_pkh), 500_000))  # unsigned injected payout to the maker
+    tampered = SwapOffer(
+        partial_tx_hex=partial.serialize().hex(),
+        give_source_tx_hex=offer.give_source_tx_hex,
+        give_vout=offer.give_vout,
+        terms=offer.terms,
+    )
+    with pytest.raises(ValidationError, match="one maker input and one output"):
+        accept_offer(
+            tampered,
+            funding=[FundingInput(_rxd_src(tk_pkh, 600_000), 0, tk)],
+            taker_receive_pkh=tk_pkh,
+            taker_change_pkh=tk_pkh,
+            fee=300,
+        )
+    from pyrxd.swap.rswp.orders import verify_offer_signature
+
+    with pytest.raises(ValidationError, match="one maker input and one output"):
+        verify_offer_signature(tampered)
+
+
 def test_substituted_give_source_tx_rejected() -> None:
     """Swapping in a different source tx (claiming a bigger given asset) is
     caught by the outpoint-hash check."""

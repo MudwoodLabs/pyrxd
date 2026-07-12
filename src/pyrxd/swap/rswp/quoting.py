@@ -88,6 +88,10 @@ def quote_ladder(mid: Fraction | int, spread_bps: int, sizes: Sequence[int]) -> 
     to zero photons (size × price too small to be a real order) or if a bid
     would go non-positive (spread too wide for the level count).
     """
+    if isinstance(mid, float):
+        # A float mid introduces binary-rounding error into an exact-Fraction price ladder (review INFO);
+        # require an exact type so the maker-favorable rounding is the ONLY rounding that happens.
+        raise ValidationError("mid must be an int, Fraction, or decimal string — not a float (binary rounding)")
     mid = Fraction(mid)
     if mid <= 0:
         raise ValidationError(f"mid price must be positive, got {mid}")

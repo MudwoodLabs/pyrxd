@@ -102,16 +102,55 @@ def test_ft_demand_surplus_returns_as_ft_change() -> None:
     taker, tk_pkh = _key()
     reservation, order = _posted_ft_demand(maker)
 
+    # Fund with a surplus that clears the dust floor (a sub-dust FT change is un-relayable and now raises —
+    # see test_ft_demand_sub_dust_surplus_rejected): 600 funded, 50 demanded -> 550 change (>= 546).
     tx = _take(
         order,
         reservation,
         taker,
-        [FundingInput(_ft_src(tk_pkh, _FT_REF, 80), 0, taker), FundingInput(_rxd_src(tk_pkh, 5_000), 0, taker)],
+        [FundingInput(_ft_src(tk_pkh, _FT_REF, 600), 0, taker), FundingInput(_rxd_src(tk_pkh, 5_000), 0, taker)],
     )
     ft_outs = [o for o in tx.outputs if is_ft_script(o.locking_script.serialize().hex())]
-    assert [o.satoshis for o in ft_outs] == [50, 30]  # demand + change, conserved exactly
-    total_in = 10_000 + 80 + 5_000
+    assert [o.satoshis for o in ft_outs] == [50, 550]  # demand + change, conserved exactly
+    total_in = 10_000 + 600 + 5_000
     assert total_in - sum(o.satoshis for o in tx.outputs) == 1_000  # fee exact
+
+
+def test_ft_demand_sub_dust_surplus_rejected() -> None:
+    """RM-8: an FT change surplus below the dust floor would make an un-relayable (opaquely-failing) take —
+    refuse with a clear error instead (folding to fee would burn tokens)."""
+    maker, _ = _key()
+    taker, tk_pkh = _key()
+    reservation, order = _posted_ft_demand(maker)  # demand = 50 FT
+    with pytest.raises(ValidationError, match="dust"):
+        _take(
+            order,
+            reservation,
+            taker,
+            [FundingInput(_ft_src(tk_pkh, _FT_REF, 80), 0, taker), FundingInput(_rxd_src(tk_pkh, 5_000), 0, taker)],
+        )
+
+
+def test_covenant_order_nft_demand_rejected() -> None:
+    """RH-2 (audit HIGH): an nft demand would silently degrade to a dust P2PKH output that create_covenant_order
+    then signs as the price — the reserved RXD becomes spendable for dust and the maker loses it. Refuse it."""
+    maker, pkh = _key()
+    reservation = prepare_covenant_offer(
+        funding=[FundingInput(_rxd_src(pkh, 15_000), 0, maker)],
+        photons=10_000,
+        owner_pkh=pkh,
+        expiry_height=_EXPIRY,
+        change_pkh=pkh,
+        fee=1_000,
+    )
+    with pytest.raises(ValidationError, match="nft"):
+        create_covenant_order(
+            covenant_source_tx=reservation,
+            covenant_vout=0,
+            maker_key=maker,
+            receive=Asset("nft", 600, _FT_REF),
+            maker_receive_pkh=pkh,
+        )
 
 
 def test_ft_underfunding_refused() -> None:
