@@ -245,28 +245,32 @@ async def test_unknown_advert_tx_raises() -> None:
         await source.get_open_orders(RXD_TOKEN_ID.hex())
 
 
-async def test_malformed_advert_script_raises_validation_error() -> None:
-    """The referenced output exists but isn't a valid RSWP frame — decode_rswp_order raises,
-    matching book.py's own "malformed rows raise" contract for _order_from_rpc."""
+async def test_malformed_advert_row_survives_batch_as_problem() -> None:
+    """RM-7: the referenced output isn't a valid RSWP frame — decode_rswp_order rejects it, but that must
+    NOT abort the whole browse (book.py's per-row invariant). get_open_orders returns a passthrough row
+    (no decoded-order fields) that book._verify_row then surfaces as a per-row problem."""
     tx = Transaction()
     tx.add_output(TransactionOutput(P2PKH().lock(b"\x00" * 20), 0))  # not an OP_RETURN at all
     transport = FakeTransport()
     transport.add_tx(tx)
     transport.extension_responses["swap.get_orders"] = [{"tx_hash": tx.txid(), "vout": 0, "height": 1}]
     source = RxindexerOrderbookSource(transport=transport)
-    with pytest.raises(ValidationError):
-        await source.get_open_orders(RXD_TOKEN_ID.hex())
+    rows = await source.get_open_orders(RXD_TOKEN_ID.hex())
+    assert len(rows) == 1  # batch survived, row not dropped
+    assert "version" not in rows[0]  # passthrough (undecodable) -> book renders it a problem
 
 
-async def test_vout_out_of_range_raises_validation_error() -> None:
+async def test_vout_out_of_range_row_survives_batch_as_problem() -> None:
+    """RM-7: an out-of-range advertised vout is a per-row problem, not a batch abort."""
     tx = Transaction()
     tx.add_output(TransactionOutput(P2PKH().lock(b"\x00" * 20), 0))
     transport = FakeTransport()
     transport.add_tx(tx)
     transport.extension_responses["swap.get_orders"] = [{"tx_hash": tx.txid(), "vout": 5, "height": 1}]
     source = RxindexerOrderbookSource(transport=transport)
-    with pytest.raises(ValidationError, match="out of range"):
-        await source.get_open_orders(RXD_TOKEN_ID.hex())
+    rows = await source.get_open_orders(RXD_TOKEN_ID.hex())
+    assert len(rows) == 1
+    assert "version" not in rows[0]
 
 
 # --------------------------------------------------------------------------- get_open_orders_by_want gap

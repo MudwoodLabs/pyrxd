@@ -266,8 +266,16 @@ def accept_offer(
     give_source = Transaction.from_hex(bytes.fromhex(offer.give_source_tx_hex))
     if partial is None or give_source is None:
         raise ValidationError("offer contains an unparseable transaction")
-    if not partial.inputs or not partial.outputs:
-        raise ValidationError("offer partial transaction is missing the maker input/output")
+    # SINGLE|ANYONECANPAY binds EXACTLY input[0] + output[0]; ANY additional maker input or output is
+    # UNSIGNED, and _balance_and_add_change funds every output from the taker's inputs — so a hand-delivered
+    # offer carrying an injected extra output (paying the maker) would make the taker silently overpay by
+    # that amount while the advertised terms show a fair trade (audit HIGH). The public book path rebuilds
+    # with exactly one output; enforce the same invariant here for the direct/private-transport primitive.
+    if len(partial.inputs) != 1 or len(partial.outputs) != 1:
+        raise ValidationError(
+            "offer partial transaction must have EXACTLY one maker input and one output — "
+            "SIGHASH_SINGLE|ANYONECANPAY binds only input[0]/output[0]; any extra is attacker-injectable"
+        )
 
     maker_in = partial.inputs[0]
     # The source tx the taker was handed must be the real funder of the maker input.

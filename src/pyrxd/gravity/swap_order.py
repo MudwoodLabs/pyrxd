@@ -25,7 +25,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..constants import OpCode
-from ..script import Script
 from ..security.errors import ValidationError
 from ..utils import Reader
 
@@ -81,20 +80,41 @@ class RswpOrder:
 
 
 def _items(op_return_script: bytes) -> list:
-    """Post-``OP_RETURN`` pushes as a list of ``bytes`` (data push) or ``int`` (OP_0 / OP_1..OP_16)."""
-    chunks = Script(op_return_script).chunks
-    if not chunks or chunks[0].op != bytes(OpCode.OP_RETURN):
+    """Post-``OP_RETURN`` pushes as a list of ``bytes`` (data push) or ``int`` (OP_0 / OP_1..OP_16).
+
+    Strict, node-matching walk (review MEDIUM): a push whose DECLARED length exceeds the bytes actually
+    present is REJECTED — Radiant-Core ``GetOp`` returns false on a truncated push and drops the advert, but
+    ``Script``'s chunk parser silently CLAMPS it, so pyrxd would otherwise decode (and show as fillable) a
+    frame the canonical book never indexes. Non-minimal / PUSHDATA-form pushes are still accepted (the node
+    is lenient there); only truncation is a hard error.
+    """
+    if not op_return_script or op_return_script[0] != bytes(OpCode.OP_RETURN)[0]:
         raise ValidationError("not an OP_RETURN script")
     out: list = []
-    for c in chunks[1:]:
-        if c.data is not None:
-            out.append(c.data)
-        elif c.op == b"\x00":  # OP_0
+    i, n = 1, len(op_return_script)
+    while i < n:
+        op = op_return_script[i]
+        i += 1
+        if op == 0x00:  # OP_0
             out.append(0)
-        elif b"\x51" <= c.op <= b"\x60":  # OP_1..OP_16
-            out.append(c.op[0] - 0x50)
+        elif 0x51 <= op <= 0x60:  # OP_1..OP_16
+            out.append(op - 0x50)
+        elif op <= 0x4B or op in (0x4C, 0x4D, 0x4E):
+            if op <= 0x4B:
+                plen = op
+            else:
+                width = {0x4C: 1, 0x4D: 2, 0x4E: 4}[op]
+                if i + width > n:
+                    raise ValidationError("truncated push-length prefix in RSWP frame")
+                plen = int.from_bytes(op_return_script[i : i + width], "little")
+                i += width
+            data = op_return_script[i : i + plen]
+            if len(data) != plen:
+                raise ValidationError("truncated push in RSWP frame (declared length exceeds available bytes)")
+            i += plen
+            out.append(bytes(data))
         else:
-            raise ValidationError(f"unexpected opcode 0x{c.op.hex()} in RSWP frame")
+            raise ValidationError(f"unexpected opcode 0x{op:02x} in RSWP frame")
     return out
 
 
@@ -127,9 +147,11 @@ def parse_price_terms(blob: bytes) -> list[DemandedOutput] | None:
         # unbounded slen (a 0xff varint up to 2**64-1) would otherwise reach BytesIO.read and raise
         # OverflowError — leaking out of the public decode_rswp_order, which documents ValidationError
         # only. Reject out-of-range lengths as "not clean MultiTxOutV1" (None), the documented outcome.
-        if slen is None or slen < 0 or slen > len(blob):
+        # A zero-length demanded script is not a real demand (the encoder refuses it too) — reject for
+        # round-trip fidelity (review LOW).
+        if slen is None or slen <= 0 or slen > len(blob):
             return None
-        script = r.read_bytes(slen) if slen else b""
+        script = r.read_bytes(slen)
         if script is None or len(script) != slen:
             return None
         outs.append(DemandedOutput(value=int.from_bytes(vb, "little"), script=script))

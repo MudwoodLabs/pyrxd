@@ -109,6 +109,13 @@ def _order_from_rpc(entry: dict) -> RswpOrder:
         raise ValidationError(f"malformed swapindex response row: {exc!r}") from exc
 
 
+def _clamp_rows(rows: list[dict], limit: int) -> list[dict]:
+    """A source MUST honor ``limit``, but a hostile/MITM'd one can ignore it and return N rows — each costs
+    a network fetch + an ECDSA verify in ``_verify_row`` (review MEDIUM DoS). Truncate to the requested
+    limit so one browse can't be amplified into unbounded work."""
+    return rows[: max(0, limit)]
+
+
 class OrderbookClient:
     """Browse the on-chain book through any :class:`OrderbookSource`, verifying before trusting."""
 
@@ -118,11 +125,13 @@ class OrderbookClient:
     async def orders_offering(self, ref: GlyphRef | None, *, limit: int = 100, offset: int = 0) -> list[BookEntry]:
         """Open orders OFFERING the given asset (``None`` = native RXD)."""
         rows = await self._source.get_open_orders(swap_token_id(ref).hex(), limit=limit, offset=offset)
+        rows = _clamp_rows(rows, limit)
         return [await self._verify_row(row, expected_ref=ref, side="offer") for row in rows]
 
     async def orders_wanting(self, ref: GlyphRef, *, limit: int = 100, offset: int = 0) -> list[BookEntry]:
         """Open orders WANTING the given Glyph token (the ask side of that token's book)."""
         rows = await self._source.get_open_orders_by_want(swap_token_id(ref).hex(), limit=limit, offset=offset)
+        rows = _clamp_rows(rows, limit)
         return [await self._verify_row(row, expected_ref=ref, side="want") for row in rows]
 
     async def _verify_row(self, row: dict, *, expected_ref: GlyphRef | None, side: str) -> BookEntry:
