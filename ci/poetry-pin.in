@@ -1,1 +1,4 @@
 poetry==2.4.1
+# Floor for the transitive cryptography dep: <48.0.1 ships wheels with a
+# vulnerable statically-linked OpenSSL (Dependabot alert #4).
+cryptography>=48.0.1

@@ -16,9 +16,11 @@
 # reaches RPC via `docker exec litecoin-cli` — never exposed to the network.
 #
 # The release binary links only the libc family (measured via ldd), so the bare
-# ubuntu:22.04 base needs no extra runtime packages.
+# ubuntu:22.04 base needs no extra runtime packages. The base is digest-pinned
+# (supply-chain rule); digest = the ubuntu:22.04 multi-arch index, verified
+# against Docker Hub 2026-07-12. Refresh the digest when bumping the base.
 
-FROM ubuntu:22.04
+FROM ubuntu:22.04@sha256:0e0a0fc6d18feda9db1590da249ac93e8d5abfea8f4c3c0c849ce512b5ef8982
 
 ARG LITECOIN_VERSION=0.21.5.5
 ARG LITECOIN_SHA256=623410d4f2695a68aa71332ae0672fee19276f41c1c63a531f97e24a50edde14

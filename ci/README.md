@@ -6,8 +6,9 @@ the OpenSSF Scorecard / CodeQL `PinnedDependenciesID` alerts on
 
 | File | Used by | Pins |
 |---|---|---|
-| `poetry-pin.txt` | `ci.yml`, `publish.yml` | `poetry==2.3.4` + full transitive closure |
+| `poetry-pin.txt` | `ci.yml`, `publish.yml` | `poetry==2.4.1` + full transitive closure (with a `cryptography>=48.0.1` floor — see `.in`) |
 | `ruff-pin.txt` | `lint.yml` | `ruff==0.15.12` |
+| `cyclonedx-pin.txt` | `publish.yml` (SBOM step) | `cyclonedx-bom==7.3.0` + full transitive closure |
 
 ## Workflow consumption
 
@@ -26,7 +27,7 @@ supply-chain rule.
 2. Regenerate the lock file:
 
    ```bash
-   pipx run pip-tools pip-compile --generate-hashes \
+   pipx run --spec pip-tools pip-compile --generate-hashes \
        --output-file=ci/poetry-pin.txt ci/poetry-pin.in
    ```
 

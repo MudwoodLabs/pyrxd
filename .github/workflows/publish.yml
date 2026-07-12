@@ -70,7 +70,7 @@ jobs:
         run: |
           pkg_version=$(poetry version --short)
           poetry lock --no-interaction
-          pip install cyclonedx-bom
+          pip install -r ci/cyclonedx-pin.txt --require-hashes
           mkdir -p sbom
           cyclonedx-py poetry . --output-format JSON --output-file "sbom/pyrxd-${pkg_version}.cdx.json"
       - name: Attach SBOM to the GitHub Release
