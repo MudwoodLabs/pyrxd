@@ -2,7 +2,7 @@
 
 Python SDK for the [Radiant (RXD) blockchain](https://radiantcore.org/).
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://github.com/MudwoodLabs/pyrxd/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Docs](https://github.com/MudwoodLabs/pyrxd/actions/workflows/docs.yml/badge.svg)](https://mudwoodlabs.github.io/pyrxd/)
 
@@ -19,34 +19,34 @@ enforced on-chain:
 
 - **On-chain Glyph tokens (NFT / FT).** Supply and transfers enforced by Radiant
   *consensus*, not an indexer or a sidecar.
-  → [mint an NFT](docs/tutorials/mint-a-glyph-nft.md) · [deploy an FT](docs/tutorials/mint-a-glyph-ft.md)
+  → [mint an NFT](https://mudwoodlabs.github.io/pyrxd/tutorials/mint-a-glyph-nft.html) · [deploy an FT](https://mudwoodlabs.github.io/pyrxd/tutorials/mint-a-glyph-ft.html)
 - **Permissionless PoW token issuance (dMint).** Deploy a token that *anyone* can mine —
   distributed issuance, no premine, secured by proof-of-work. Radiant-unique.
-  → [`pyrxd glyph deploy-dmint` / `claim-dmint`](docs/how-to/issue-a-dmint-token.md)
+  → [`pyrxd glyph deploy-dmint` / `claim-dmint`](https://mudwoodlabs.github.io/pyrxd/how-to/issue-a-dmint-token.html)
 - **Trustless cross-chain atomic swaps.** Trade a Radiant asset (RXD / FT / NFT) against
   BTC or ETH — and EVM L2s (Base, Optimism, Arbitrum, Linea) — with **no bridge and no
   custodian**: a hash-timelock swap driven by a chain-neutral coordinator. Proven
   end-to-end on regtest and on small real-value mainnet / Sepolia runs.
-  → [build a cross-chain swap](docs/how-to/build-a-cross-chain-swap.md)
+  → [build a cross-chain swap](https://mudwoodlabs.github.io/pyrxd/how-to/build-a-cross-chain-swap.html)
 - **Recursive covenants.** Bitcoin-style script + induction lets a coin constrain the coin
   that spends it — soulbound NFTs, swap covenants, PoW-mint contracts.
-  → [covenant building blocks](docs/concepts/covenant-building-blocks.md)
+  → [covenant building blocks](https://mudwoodlabs.github.io/pyrxd/concepts/covenant-building-blocks.html)
 
-**New here?** The [5-minute quickstart](docs/tutorials/quickstart.md) goes from `pip install`
+**New here?** The [5-minute quickstart](https://mudwoodlabs.github.io/pyrxd/tutorials/quickstart.html) goes from `pip install`
 to a real on-chain token on a local regtest chain — no faucet, nothing at risk.
 
 ## Status
 
 **Pre-1.0 software.** APIs may change between minor versions before 1.0.
 pyrxd is **open-source software, provided as-is, without warranty of any
-kind** — see the [LICENSE](LICENSE) (Apache 2.0, §7–8). Cryptographic
-primitives have not been independently audited. See [SECURITY.md](SECURITY.md)
+kind** — see the [LICENSE](https://github.com/MudwoodLabs/pyrxd/blob/main/LICENSE) (Apache 2.0, §7–8). Cryptographic
+primitives have not been independently audited. See [SECURITY.md](https://github.com/MudwoodLabs/pyrxd/blob/main/SECURITY.md)
 for security policy and disclosure.
 
 As with any wallet software on a young chain, verify your derivation paths
 and transaction outputs against an independent wallet before broadcasting on
 mainnet. If you find a bug that affects funds, report it via the
-[security policy](SECURITY.md).
+[security policy](https://github.com/MudwoodLabs/pyrxd/blob/main/SECURITY.md).
 
 **Working on mainnet today:**
 
@@ -77,7 +77,7 @@ mainnet. If you find a bug that affects funds, report it via the
 
 Pin pyrxd to a specific version in production and move versions deliberately.
 Between minor versions before 1.0, APIs can change in breaking ways
-(see [CHANGELOG](CHANGELOG.md)).
+(see [CHANGELOG](https://github.com/MudwoodLabs/pyrxd/blob/main/CHANGELOG.md)).
 
 **Do not downgrade after creating a wallet with a non-default `coin_type`.**
 Since 0.3.0, `HdWallet` stores the derivation `coin_type` in the wallet
@@ -184,7 +184,7 @@ print(f"WIF:     {priv.wif()}")
 print(f"address: {priv.public_key().address()}")
 ```
 
-See [`examples/mnemonic_to_key.py`](examples/mnemonic_to_key.py) for a
+See [`examples/mnemonic_to_key.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/mnemonic_to_key.py) for a
 runnable version of both flows.
 
 ### Mint a Glyph NFT
@@ -203,8 +203,8 @@ commit = builder.prepare_commit(CommitParams(metadata=metadata, owner_pkh=pkh, c
 # ... broadcast commit, then reveal ...
 ```
 
-See [`examples/glyph_mint_demo.py`](examples/glyph_mint_demo.py) for a
-complete end-to-end NFT mint, and [`examples/ft_deploy_premine.py`](examples/ft_deploy_premine.py)
+See [`examples/glyph_mint_demo.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/glyph_mint_demo.py) for a
+complete end-to-end NFT mint, and [`examples/ft_deploy_premine.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/ft_deploy_premine.py)
 for an FT premine deployment.
 
 ### Deploy a fungible token (premine)
@@ -300,14 +300,14 @@ reference + tutorials + how-to guides + concepts).
 
 Other resources in this repo:
 
-- [`examples/`](examples/) — runnable end-to-end demos
-- [`docs/dmint-research-photonic.md`](docs/dmint-research-photonic.md) — Photonic Wallet TS reference
-- [`docs/dmint-research-mainnet.md`](docs/dmint-research-mainnet.md) — decoded live dMint contracts
-- [`SECURITY.md`](SECURITY.md) — security policy and disclosure
+- [`examples/`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples) — runnable end-to-end demos
+- [`docs/dmint-research-photonic.md`](https://mudwoodlabs.github.io/pyrxd/dmint-research-photonic.html) — Photonic Wallet TS reference
+- [`docs/dmint-research-mainnet.md`](https://mudwoodlabs.github.io/pyrxd/dmint-research-mainnet.html) — decoded live dMint contracts
+- [`SECURITY.md`](https://github.com/MudwoodLabs/pyrxd/blob/main/SECURITY.md) — security policy and disclosure
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, code style,
+See [CONTRIBUTING.md](https://github.com/MudwoodLabs/pyrxd/blob/main/CONTRIBUTING.md) for development setup, code style,
 and how to send a PR. We use the [Developer Certificate of Origin](https://developercertificate.org/)
 for contributor sign-off — no CLA paperwork.
 
@@ -317,10 +317,10 @@ Apache 2.0.
 ## Security
 
 Report vulnerabilities privately to **security@mudwoodlabs.com**. See
-[SECURITY.md](SECURITY.md) for the full policy and disclosure timeline.
+[SECURITY.md](https://github.com/MudwoodLabs/pyrxd/blob/main/SECURITY.md) for the full policy and disclosure timeline.
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Apache License 2.0 — see [LICENSE](https://github.com/MudwoodLabs/pyrxd/blob/main/LICENSE) and [NOTICE](https://github.com/MudwoodLabs/pyrxd/blob/main/NOTICE).
 
 Copyright 2026 [Mudwood Labs](https://mudwoodlabs.com).
