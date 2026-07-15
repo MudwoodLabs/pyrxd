@@ -4,6 +4,20 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] — 2026-07-14
+
+Patch release. Fixes broken links on the PyPI project page.
+
+### Fixed
+
+- **README links 404 on PyPI.** All repo-relative Markdown links (`docs/...md`,
+  `LICENSE`, `SECURITY.md`, `CHANGELOG.md`, `CONTRIBUTING.md`, `NOTICE`, `examples/...`)
+  resolved fine on GitHub (which rewrites relative links against the repo) but 404'd on
+  PyPI, which renders the README standalone against `pypi.org`. Every relative link is
+  now an absolute URL — doc pages point at the published Sphinx site
+  (`mudwoodlabs.github.io/pyrxd`), everything else points at the GitHub blob/tree view
+  on `main`.
+
 ## [0.11.0] — 2026-07-11
 
 Feature + swap-safety-hardening release. The headline is the **RSWP on-chain
