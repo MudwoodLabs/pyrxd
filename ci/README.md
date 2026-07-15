@@ -27,18 +27,26 @@ supply-chain rule.
 2. Regenerate the lock file:
 
    ```bash
-   pipx run --spec pip-tools pip-compile --generate-hashes \
+   uv pip compile --universal --generate-hashes --python-version 3.10 \
        --output-file=ci/poetry-pin.txt ci/poetry-pin.in
    ```
 
 3. Commit both the `.in` and `.txt` files together.
 
-`pip-compile` resolves the transitive closure deterministically from
-PyPI's current view — re-running on the same `.in` file at a different
-time may produce a different `.txt` if PyPI has added a new compatible
-version of a transitive (the resolver picks the newest compatible
-release). Pin the `.in` file's top-level version tightly to keep the
-re-generation reproducible.
+**Use `--universal`, not plain `pip-compile`.** CI installs each pin on
+the full `python-version` matrix (3.10–3.12). A single-interpreter
+resolver (`pip-compile`, or `uv` without `--universal`) emits a lock with
+no environment markers, valid only for the Python it ran on. Installing
+that on another version fails `--require-hashes` when a marker-conditional
+backport (`exceptiongroup`, `tomli`, …) enters or leaves the graph. The
+universal resolver, floored at the lowest supported Python (`3.10`, per
+`requires-python`), emits the `; python_full_version < '3.11'` markers so
+one file installs cleanly across the whole matrix.
+
+The resolver picks the newest release compatible with the `.in`
+constraints, so re-running at a different time can change a transitive if
+PyPI has published a newer compatible version. Pin the `.in` file's
+top-level version tightly to keep regeneration reproducible.
 
 ## Why not hash-pin everything?
 
