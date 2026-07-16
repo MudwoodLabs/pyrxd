@@ -60,19 +60,64 @@ jobs:
       - name: Build distributions
         run: poetry build
       - name: Generate CycloneDX SBOM
-        # Declared dependency tree from pyproject + a freshly-resolved lock
-        # (poetry.lock is intentionally gitignored — a published library pins
-        # nothing for its consumers). Written OUTSIDE dist/ so PyPI never sees
-        # it (gh-action-pypi-publish uploads everything in dist/).
+        # Built from a fresh venv containing only the just-built wheel,
+        # rather than parsed from pyproject.toml directly: cyclonedx-py's
+        # `poetry` backbone (and `environment --pyproject`) treats ANY
+        # `[tool.poetry]` table as legacy Poetry format and reads
+        # name/version/description straight out of it — with no PEP 621
+        # `[project]` fallback — so it unconditionally calls
+        # `poetry['name']` (cyclonedx_py/_internal/utils/pyproject.py).
+        # pyrxd's `[tool.poetry]` only holds `packages`/`include`
+        # (name/version/etc. live under `[project]`, Poetry's PEP 621
+        # mode), so that lookup raised `KeyError: 'name'` on every release
+        # since the PEP 621 migration — silently, since this step is
+        # continue-on-error, and never actually produced an SBOM (zero SBOM
+        # assets exist on any past release). Fix: `environment` mode
+        # introspects the ACTUALLY INSTALLED distribution instead of
+        # parsing pyproject.toml for dependency discovery (so poetry.lock,
+        # intentionally gitignored, isn't needed here either), and its
+        # root-component metadata is read from a `[tool.poetry]`-stripped
+        # copy of pyproject.toml so cyclonedx-py's PEP 621 branch (which
+        # only triggers when `[tool.poetry]` is entirely absent from the
+        # file it's given) is the one that actually runs.
+        # Written OUTSIDE dist/ so PyPI never sees it (gh-action-pypi-publish
+        # uploads everything in dist/).
         # continue-on-error: the SBOM is supplementary — never block the PyPI
         # publish on it.
         continue-on-error: true
         run: |
+          set -euo pipefail
           pkg_version=$(poetry version --short)
-          poetry lock --no-interaction
           pip install -r ci/cyclonedx-pin.txt --require-hashes
+
+          strip_script=$(mktemp)
+          cat > "$strip_script" <<'PY'
+          import sys
+          with open('pyproject.toml') as f:
+              lines = f.readlines()
+          out, skip = [], False
+          for line in lines:
+              stripped = line.strip()
+              if stripped.startswith('[') and stripped.endswith(']'):
+                  skip = stripped.startswith('[tool.poetry')
+              if not skip:
+                  out.append(line)
+          with open(sys.argv[1], 'w') as f:
+              f.writelines(out)
+          PY
+          pep621_pyproject=$(mktemp)
+          python3 "$strip_script" "$pep621_pyproject"
+          rm -f "$strip_script"
+
+          python3 -m venv /tmp/sbom-venv
+          /tmp/sbom-venv/bin/pip install --quiet dist/*.whl
+
           mkdir -p sbom
-          cyclonedx-py poetry . --output-format JSON --output-file "sbom/pyrxd-${pkg_version}.cdx.json"
+          cyclonedx-py environment /tmp/sbom-venv \
+            --pyproject "$pep621_pyproject" \
+            --output-format JSON \
+            --output-file "sbom/pyrxd-${pkg_version}.cdx.json"
+          rm -f "$pep621_pyproject"
       - name: Attach SBOM to the GitHub Release
         continue-on-error: true
         env:
