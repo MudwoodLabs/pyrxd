@@ -39,7 +39,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Cache Poetry packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pypoetry
           key: poetry-${{ runner.os }}-py3.12-${{ hashFiles('poetry.lock') }}
@@ -73,7 +73,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Cache Poetry packages
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pypoetry
           key: poetry-${{ runner.os }}-py3.12-${{ hashFiles('poetry.lock') }}
@@ -83,7 +83,7 @@ jobs:
       # this run's additions under a fresh key (a per-run key is how you get
       # an append-style cache out of actions/cache's immutable entries).
       - name: Restore accumulated libFuzzer corpus
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .atheris-corpus
           key: atheris-corpus-${{ github.run_id }}
