@@ -6,6 +6,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`RxinDexerClient` discovery wrappers** (`glyph_get_recent`,
+  `glyph_get_tokens_by_type`) — global newest-first asset lists over the
+  RXinDexer v4 discovery indexes (Glyph DB schema 4, live on
+  `electrumx.radiantcore.org` since 2026-07-18). Cursor-paginated
+  (`{"tokens", "next_cursor"}`); `order="recent"` on the by-type call is
+  newest-deployed-first, default `"ref"` keeps the legacy order. Enables
+  incremental watermark sync: page newest-first, stop when `deploy_height`
+  drops below the last run's watermark.
+  Cherry-picked from `Radiant-Core:pyrxd` `4e4e4bee` (theartofsatoshi, 2026-07-19); the
+  RPC was re-confirmed live on `electrumx.radiantcore.org` on 2026-09-16.
+
 ## [0.24.0] — 2026-09-14
 
 ### Security
