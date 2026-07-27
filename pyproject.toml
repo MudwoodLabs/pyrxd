@@ -110,7 +110,7 @@ msgpack = ">=1.2.1"
 [tool.poetry.group.test.dependencies]
 bandit = {version = "^1.9.4", extras = ["toml"]}
 check-manifest = "0.51"
-pre-commit = "4.6.0"
+pre-commit = "4.6.1"
 pytest-cov = "7.1.0"
 pytest-mock = "<3.15.2"
 pytest-runner = "*"
