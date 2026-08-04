@@ -96,7 +96,13 @@ jobs:
       - name: Install atheris
         # Not a poetry dep on purpose (overnight/scheduled tool, not a dev
         # requirement — docs/security-review-playbook.md). Bump deliberately.
-        run: poetry run pip install "atheris==2.3.0"
+        #
+        # Must stay >=3.0.0 while this job runs Python 3.12: atheris 2.3.0 ships
+        # no cp312 wheel, so pip fell back to a source build that fails on
+        # `PRECALL` (an opcode CPython removed in 3.12). Keep the pin and the
+        # setup-python version above in sync — 3.1.0 has cp312/cp313/cp314
+        # wheels and dropped cp311.
+        run: poetry run pip install "atheris==3.1.0"
       - name: Run coverage-guided harnesses
         # Every harness runs even if an earlier one finds a crash; findings
         # drop reproducers in logs/ (uploaded below) and fail the job at the
