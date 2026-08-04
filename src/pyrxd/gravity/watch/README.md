@@ -49,13 +49,13 @@ the claim race is assessed even if `record.state` is still `BOTH_LOCKED`.
 
 ```python
 reconciler = Reconciler(
-    store=record_store,                      # RecordStore: the operator's in-flight swaps
+    store=record_store,  # RecordStore: the operator's in-flight swaps
     observer=ChainObserver(btc=btc_src, rxd=rxd_src, rxd_corroborated=True),  # True with a ≥2-source RXD quorum
     alerter=DedupAlerter(channel=alert_channel),
-    policy=margin_policy,                    # gravity.swap_coordinator.MarginPolicy
+    policy=margin_policy,  # gravity.swap_coordinator.MarginPolicy
     safety_window_blocks=6,
 )
-while True:                                  # ← the shell's loop, not the brain's
+while True:  # ← the shell's loop, not the brain's
     await reconciler.tick()
     await asyncio.sleep(poll_interval_s)
 ```
