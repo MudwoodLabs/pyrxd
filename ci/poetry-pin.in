@@ -1,4 +1,8 @@
 poetry==2.4.1
-# Floor for the transitive cryptography dep: <48.0.1 ships wheels with a
-# vulnerable statically-linked OpenSSL (Dependabot alert #4).
-cryptography>=48.0.1
+# Floor for the transitive cryptography dep. Two advisories stack here:
+#   <48.0.1  ships wheels with a vulnerable statically-linked OpenSSL
+#            (Dependabot alert #4).
+#   <50.0.0  PKCS#7 EnvelopedData decryption exposes a Bleichenbacher oracle
+#            (GHSA-g6cj-pr64-35w5). Not a path pyrxd itself uses, but this pin
+#            is what CI installs, so it must not resolve to a flagged version.
+cryptography>=50.0.0
