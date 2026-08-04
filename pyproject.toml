@@ -1,5 +1,7 @@
 [build-system]
-requires = ["poetry-core>=1.0.0"]
+# >=2.0.0: PEP 621 `[project].dependencies` support. A 1.x poetry-core would
+# silently build a wheel with NO Requires-Dist, since it ignores `[project]`.
+requires = ["poetry-core>=2.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [project]
@@ -24,6 +26,26 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Topic :: Security :: Cryptography",
     "Topic :: Software Development :: Libraries :: Python Modules",
+]
+# PEP 508 strings (PEP 621). These are the published wheel's Requires-Dist —
+# the caret bounds below are the literal expansion of the Poetry carets they
+# replaced, so the built metadata is unchanged. Dependency GROUPS remain under
+# [tool.poetry.group.*]; Poetry only reads the main deps from here.
+dependencies = [
+    "aiohttp>=3.14.3",
+    "base58>=2.1.1,<3.0.0",
+    "cbor2>=6.1,<7.0",
+    "click>=8.4,<9.0",
+    "coincurve>=21.0.0,<22.0.0",
+    # Required for X25519 ECDH + HKDF-SHA256 used by Glyph TIMELOCK / ENCRYPTED
+    # (pyrxd.crypto.kem). OpenSSL-backed, well-audited, typically already a
+    # transitive dep in most environments.
+    "cryptography>=50.0.0",
+    "pycryptodomex>=3.23.0,<4.0.0",
+    # tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
+    # pyrxd.cli.config falls back to this when running on 3.10.
+    "tomli>=2.4,<3.0; python_version < '3.11'",
+    "websockets>=16.1.1,<17.0.0",
 ]
 
 [project.urls]
@@ -75,21 +97,6 @@ docs = "sphinx-build -b html docs docs/_build/html"
 docs-clean = "rm -rf docs/_build"
 docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
 
-[tool.poetry.dependencies]
-aiohttp = ">=3.14.3"
-coincurve = "^21.0.0"
-base58 = "^2.1.1"
-pycryptodomex = "^3.23.0"
-# Required for X25519 ECDH + HKDF-SHA256 used by Glyph TIMELOCK / ENCRYPTED
-# (pyrxd.crypto.kem). OpenSSL-backed, well-audited, typically already a
-# transitive dep in most environments.
-cryptography = ">=50.0.0"
-websockets = ">=16.1.1,<17.0.0"
-cbor2 = "^6.1"
-click = "^8.4"
-# tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
-# pyrxd.cli.config falls back to this when running on 3.10.
-tomli = {version = "^2.4", python = "<3.11"}
 
 [tool.poetry.group.dev.dependencies]
 taskipy = "^1.14.1"
