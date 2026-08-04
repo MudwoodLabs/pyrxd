@@ -215,7 +215,7 @@ class EthRpc:
         self,
         *,
         address: str,
-        topics: list[str | None | list[str]] | None = None,
+        topics: list[str | list[str] | None] | None = None,
         from_block: int | str = "earliest",
         to_block: int | str = "latest",
     ) -> list[dict[str, Any]]:
