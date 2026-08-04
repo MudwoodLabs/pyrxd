@@ -97,8 +97,8 @@ bandit = {version = "^1.9.4", extras = ["toml"]}
 pip-audit = "^2.10.1"
 detect-secrets = "^1.5.0"
 mypy = "^2.3.0"
-ruff = "^0.16.0"
-hypothesis = "^6.161.6"
+ruff = "^0.16.1"
+hypothesis = "^6.164.0"
 pytest-asyncio = ">=1.4.0"
 cosmic-ray = "^8.4.6"
 # Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
@@ -112,7 +112,7 @@ msgpack = ">=1.2.1"
 # (GHSA-956x-8gvw-wg5v, GHSA-2f96-g7mh-g2hx, GHSA-v396-v7q4-x2qj, patched 3.1.51). cosmic-ray sets no
 # upper cap, so floor at the highest patched version. Dev-scope only — gitpython is not a pyrxd
 # runtime dependency and never ships in the published package.
-gitpython = ">=3.1.52"
+gitpython = ">=3.1.57"
 
 [tool.poetry.group.test.dependencies]
 bandit = {version = "^1.9.4", extras = ["toml"]}
