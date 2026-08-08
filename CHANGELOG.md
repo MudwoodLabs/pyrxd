@@ -4,6 +4,45 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.2] — 2026-08-07
+
+Maintenance release. No functional, API, wire-format, or covenant-bytecode changes —
+the shipped code is identical to 0.11.1 apart from one type-annotation reordering.
+What changed is packaging metadata, dependency floors, and release tooling. The
+cross-chain swap stack remains **unaudited** and the RSWP orderbook **experimental**.
+
+### Changed
+
+- **Runtime dependency floors raised** (visible in the wheel's `Requires-Dist`):
+  `cryptography>=50.0.0` (was `>=49.0.0`, closing GHSA-g6cj-pr64-35w5),
+  `aiohttp>=3.14.3` (was `>=3.14.1`), and `websockets>=16.1.1` (was `>=16.0`).
+  Remaining constraints are unchanged — they are the literal PEP 508 expansion of the
+  Poetry carets they replaced (#313, #327, #333, #339, #340, #341).
+- **Runtime dependencies moved to PEP 621 `[project].dependencies`**, and dev/test/docs
+  moved to PEP 735 `[dependency-groups]`. The built metadata and the
+  `poetry install` set are unchanged; this only removes the last of the legacy
+  `[tool.poetry.*]` dependency tables (#343, #344).
+- **`[build-system].requires` raised to `poetry-core>=2.0.0`.** Building an sdist with a
+  1.x poetry-core would silently produce a wheel with **no** `Requires-Dist`, since 1.x
+  ignores `[project]` (#343).
+
+### Fixed
+
+- **CycloneDX SBOM generation has been silently failing on every release since the PEP 621
+  migration** — no release back through v0.9.0 has an SBOM asset. `cyclonedx-py poetry`
+  reads project metadata only from the legacy `[tool.poetry]` table with no PEP 621
+  fallback, so it raised `KeyError: 'name'` on every run, masked by the step's
+  `continue-on-error`. The publish workflow now uses `cyclonedx-py environment` against a
+  fresh venv holding only the just-built wheel, with root-component metadata read from a
+  `[tool.poetry]`-stripped copy of `pyproject.toml`. **0.11.2 is the first release to
+  actually ship an SBOM** (#320).
+- **The weekly atheris fuzz lane was broken** — the install step didn't work on Python
+  3.12 and the SPV harness had bit-rotted against the current API. Both are repaired, so
+  the scheduled lane runs again (#338).
+- `EthRpc.get_logs`' `topics` annotation reordered to `list[str | list[str] | None] | None`
+  for `ruff`/`mypy` union-ordering consistency. Type-checking only — no runtime behavior
+  change (#342).
+
 ## [0.11.1] — 2026-07-14
 
 Patch release. Fixes broken links on the PyPI project page.
