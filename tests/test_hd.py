@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import unicodedata
+from hashlib import pbkdf2_hmac
+
 import pytest
 
 from pyrxd.hd.bip32 import Xprv, Xpub, ckd, master_xprv_from_seed
@@ -363,3 +366,94 @@ def test_bip39_invalid_checksum_raises():
         validate_mnemonic(
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon"
         )
+
+
+#
+# BIP39 NFKD normalization (spec conformance)
+#
+# BIP39 requires the mnemonic sentence and the passphrase to be NFKD normalized
+# before entering PBKDF2. Before 0.11.3 pyrxd hashed both raw, so two spellings
+# a user cannot visually distinguish derived different seeds — and therefore
+# entirely different wallets, unrecoverable in any conformant implementation.
+#
+# The canonical trap: "café" as precomposed U+00E9, versus "e" + combining U+0301.
+#
+_CAFE_COMPOSED = "café"  # e-acute as one codepoint
+_CAFE_DECOMPOSED = "café"  # e + combining acute
+
+
+def test_bip39_passphrase_nfkd_equivalence():
+    """Unicode-equivalent passphrases MUST derive the same seed (BIP39 §Seed)."""
+    assert _CAFE_COMPOSED != _CAFE_DECOMPOSED, "test inputs must differ as raw strings"
+    mnemonic = mnemonic_from_entropy(bytes(16))
+
+    composed = seed_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED)
+    decomposed = seed_from_mnemonic(mnemonic, passphrase=_CAFE_DECOMPOSED)
+
+    assert composed == decomposed
+
+
+def test_bip39_normalized_seed_matches_nfkd_form():
+    """The normalized seed equals the seed of the already-NFKD spelling.
+
+    Pins *which* of the two pre-0.11.3 seeds is the conformant one, so the fix
+    can't be "made consistent" in the wrong direction.
+    """
+    mnemonic = mnemonic_from_entropy(bytes(16))
+    assert unicodedata.normalize("NFKD", _CAFE_COMPOSED) == _CAFE_DECOMPOSED
+
+    assert seed_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED) == seed_from_mnemonic(
+        mnemonic, passphrase=_CAFE_DECOMPOSED, normalize=False
+    )
+
+
+def test_bip39_legacy_mode_reproduces_pre_0_11_3_seed():
+    """normalize=False must still derive the old, non-conformant seed.
+
+    This is the recovery path for anyone who funded a wallet under the old
+    behavior with a non-ASCII passphrase; if it regresses, those funds become
+    unreachable through pyrxd.
+    """
+    mnemonic = mnemonic_from_entropy(bytes(16))
+    legacy = seed_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED, normalize=False)
+    fixed = seed_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED)
+
+    assert legacy != fixed, "legacy mode must not silently return the normalized seed"
+    # The legacy seed is exactly PBKDF2 over the raw, unnormalized bytes.
+    expected = pbkdf2_hmac("sha512", mnemonic.encode(), ("mnemonic" + _CAFE_COMPOSED).encode(), 2048, 64)
+    assert legacy == expected
+
+
+def test_bip39_ascii_passphrase_unaffected_by_normalization():
+    """The fix must be a no-op for ASCII passphrases — i.e. for nearly every user."""
+    mnemonic = mnemonic_from_entropy(bytes(16))
+    for passphrase in ("", "TREZOR", "correct horse battery staple"):
+        assert seed_from_mnemonic(mnemonic, passphrase=passphrase) == seed_from_mnemonic(
+            mnemonic, passphrase=passphrase, normalize=False
+        )
+
+
+def test_bip39_shipped_wordlists_are_nfkd_stable():
+    """Both shipped wordlists are NFKD-stable, so the mnemonic side is a no-op.
+
+    Guards the scoping claim behind the fix: if a wordlist with unstable words
+    (French, Spanish, Czech, Portuguese) is ever added, this fails and forces a
+    re-think of mnemonic-side compatibility.
+    """
+    for lang in ("en", "zh-cn"):
+        words = WordList.load_wordlist(lang)
+        unstable = [w for w in words if unicodedata.normalize("NFKD", w) != w]
+        assert unstable == [], f"{lang} has non-NFKD-stable words: {unstable[:5]}"
+
+
+def test_hd_wallet_from_mnemonic_normalizes_by_default():
+    """The wallet entry point inherits the fix, and exposes the legacy escape."""
+    from pyrxd.hd.wallet import HdWallet
+
+    mnemonic = mnemonic_from_entropy(bytes(16))
+    composed = HdWallet.from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED, coin_type=512)
+    decomposed = HdWallet.from_mnemonic(mnemonic, passphrase=_CAFE_DECOMPOSED, coin_type=512)
+    legacy = HdWallet.from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED, coin_type=512, normalize=False)
+
+    assert composed.derive_address(0, 0) == decomposed.derive_address(0, 0)
+    assert legacy.derive_address(0, 0) != composed.derive_address(0, 0)

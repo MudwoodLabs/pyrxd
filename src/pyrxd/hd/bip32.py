@@ -270,11 +270,17 @@ def bip32_derive_xprv_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spe
     prefix: str = "mnemonic",
     path: str = BIP32_DERIVATION_PATH,
     network: Network = Network.MAINNET,
+    *,
+    normalize: bool = True,
 ) -> Xprv:
     """
     Derive the subtree root extended private key from mnemonic and path.
+
+    :param normalize: See :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. Leave
+        ``True`` unless recovering a wallet created before 0.11.3 with a
+        non-ASCII passphrase.
     """
-    seed = seed_from_mnemonic(mnemonic, lang, passphrase, prefix)
+    seed = seed_from_mnemonic(mnemonic, lang, passphrase, prefix, normalize=normalize)
     master_xprv = Xprv.from_seed(seed, network)
     return ckd(master_xprv, path)
 
@@ -289,11 +295,15 @@ def bip32_derive_xprvs_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 sp
     path: str = BIP32_DERIVATION_PATH,
     change: str | int = 0,
     network: Network = Network.MAINNET,
+    *,
+    normalize: bool = True,
 ) -> list[Xprv]:
     """
     Derive a range of extended keys from a nmemonic using BIP32 format
+
+    :param normalize: See :func:`~pyrxd.hd.bip39.seed_from_mnemonic`.
     """
-    xprv = bip32_derive_xprv_from_mnemonic(mnemonic, lang, passphrase, prefix, path, network)
+    xprv = bip32_derive_xprv_from_mnemonic(mnemonic, lang, passphrase, prefix, path, network, normalize=normalize)
     return _derive_xkeys_from_xkey(xprv, index_start, index_end, change)
 
 
