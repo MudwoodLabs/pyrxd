@@ -191,6 +191,28 @@ def _coerce_hex32(value: Hex32 | bytes | bytearray | str) -> Hex32:
     raise ValidationError(f"script_hash must be Hex32, bytes, or hex str; got {type(value).__name__}")
 
 
+def script_hash_for_script(locking_script: bytes) -> Hex32:
+    """Return the ElectrumX ``script_hash`` for a raw *locking_script*.
+
+    ElectrumX indexes **every** output by ``sha256(locking_script)`` with the
+    bytes reversed (little-endian display order) — not just address-shaped
+    ones. Use this when you hold the script bytes rather than an address, e.g.
+    to ask for the history of a Glyph commit output (which is how the scanner
+    finds the reveal transaction that spent it).
+
+    Parameters
+    ----------
+    locking_script:
+        Raw scriptPubKey bytes.
+
+    Returns
+    -------
+    Hex32
+        The 32-byte script hash suitable for ElectrumX RPC calls.
+    """
+    return Hex32(sha256(bytes(locking_script))[::-1])
+
+
 def script_hash_for_address(address: str) -> Hex32:
     """Return the ElectrumX ``script_hash`` for a P2PKH *address*.
 
@@ -208,9 +230,7 @@ def script_hash_for_address(address: str) -> Hex32:
     Hex32
         The 32-byte script hash suitable for ElectrumX RPC calls.
     """
-    locking = P2PKH().lock(address)
-    digest = sha256(locking.serialize())
-    return Hex32(digest[::-1])
+    return script_hash_for_script(P2PKH().lock(address).serialize())
 
 
 class ElectrumXClient:

@@ -43,7 +43,7 @@ async def list_glyphs(address: str, server_url: str) -> None:
 
     for item in items:
         if isinstance(item, GlyphNft):
-            name = item.metadata.name if item.metadata else "(transfer, no metadata)"
+            name = item.metadata.name if item.metadata else "(metadata unresolved)"
             print(f"NFT  ref={item.ref.txid}:{item.ref.vout}  name={name!r}")
         elif isinstance(item, GlyphFt):
             ticker = item.metadata.ticker if item.metadata else ""
@@ -65,10 +65,12 @@ A few things to know:
   lifecycle. Use `ElectrumXClient` as an `async with` context manager and
   pass it in. The scanner reuses the open WebSocket for every fetch.
 - **Concurrency is automatic.** Per-UTXO source-tx fetches and
-  reveal-metadata fetches are each batched through `asyncio.gather`. A
-  100-Glyph wallet pays roughly two round trips of latency, not 200.
-- **A failed reveal does not poison the result.** If the origin tx for
-  one Glyph fails to fetch, that item still returns with
+  reveal-metadata resolutions are each batched through `asyncio.gather`,
+  and each distinct `ref` is resolved once no matter how many UTXOs
+  carry it. A 100-Glyph wallet pays a few round trips of latency, not
+  200.
+- **A failed reveal does not poison the result.** If the reveal for one
+  Glyph cannot be fetched, that item still returns with
   `metadata=None`; the others come back with their metadata.
 - **There is also `scan_script_hash(...)`** if you have already
   converted the address to a 32-byte script hash (e.g. for a non-P2PKH
@@ -80,18 +82,45 @@ A few things to know:
 
 | Result entry | When | Notable fields |
 | --- | --- | --- |
-| `GlyphNft`   | UTXO's locking script is the canonical 63-byte NFT singleton shape | `ref`, `owner_pkh`, `metadata` (or `None` for transfers) |
-| `GlyphFt`    | UTXO's locking script is the canonical 75-byte FT shape | `ref`, `owner_pkh`, `amount` (photons), `metadata` (or `None` for transfers) |
-
-`metadata` is `None` when the origin transaction was a **transfer** (no
-`gly` marker in `input[0]`'s scriptSig). That's normal — only the
-*reveal* tx that first defined the token carries CBOR metadata; every
-subsequent transfer is just a spend of the existing ref.
+| `GlyphNft`   | UTXO's locking script is the canonical 63-byte NFT singleton shape | `ref`, `owner_pkh`, `metadata` (or `None`, see below) |
+| `GlyphFt`    | UTXO's locking script is the canonical 75-byte FT shape | `ref`, `owner_pkh`, `amount` (photons), `metadata` (or `None`, see below) |
 
 `ref` is a `GlyphRef(txid, vout)` — the outpoint that uniquely
 identifies the token. Two `GlyphFt` entries with the same `ref` are the
 same token (split across multiple UTXOs); `ref.txid` plus a colon plus
 `ref.vout` is the form Radiant explorers display.
+
+### Where the metadata comes from
+
+`ref` is the token's **genesis outpoint, which is the commit outpoint** —
+not the reveal txid. A mint is two transactions:
+
+```text
+commit tx                          reveal tx (spends commit vout)
+┌───────────────────────────┐      ┌────────────────────────────────┐
+│ in[0]: plain P2PKH funding│  ──▶ │ in[0] scriptSig:               │
+│ out[v]: commit script     │      │   <sig> <pubkey> "gly" <CBOR>  │◀── metadata
+└───────────────────────────┘      │ out[0]: NFT/FT lock            │
+            ▲                      │   …ref = commit_txid:v         │
+            └── ref points HERE    └────────────────────────────────┘
+```
+
+The CBOR metadata lives in the scriptSig of the input that **spends**
+`ref.txid:ref.vout` — that is, in the reveal. The commit transaction
+itself has no `gly` marker anywhere, so fetching `ref.txid` and reading
+`input[0]` finds only a funding spend.
+
+The scanner resolves the reveal for you. If the UTXO you hold came
+straight out of the reveal, that tx *is* the reveal and no extra lookup
+happens; otherwise the scanner asks the indexer for the history of the
+commit output's script hash and picks the transaction whose input spends
+the ref.
+
+`metadata` is `None` only when that resolution fails — an indexer with no
+history for the commit output, an unfetchable reveal, or a reveal whose
+envelope pyrxd cannot decode. A plain transfer is *not* a reason for
+`None`: transfers resolve the same metadata as freshly minted outputs,
+one hop further back.
 
 ---
 
@@ -130,9 +159,12 @@ dmint_fts = [
 ```
 
 Items with `metadata=None` cannot be filtered this way — the protocol
-list lives in the reveal CBOR, and a pure transfer doesn't carry one.
-For those you'll need the reveal txid (`item.ref.txid`) and a separate
-fetch.
+list lives in the reveal CBOR, and the scanner could not reach it. To
+chase one down by hand, remember that `item.ref` is the *commit*
+outpoint: fetch `item.ref.txid`, hash its output script at
+`item.ref.vout` into an ElectrumX script hash, and look through
+`get_history(...)` for the transaction that spends that outpoint. That
+is the reveal.
 
 ### One thing the scanner does *not* return
 

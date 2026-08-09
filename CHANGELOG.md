@@ -17,6 +17,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `ConfirmationTimeoutError` rather than the CLI's click-based
   `NetworkBoundaryError`; `_wait_for_tx` is now just the click translation layer.
 
+- **`pyrxd.network.electrumx.script_hash_for_script`** — derive an ElectrumX script
+  hash from raw locking-script bytes. ElectrumX indexes *every* output, not just
+  address-shaped ones, so this is what you need to ask for the history of a
+  non-P2PKH script (the Glyph scanner uses it to find the reveal that spent a commit
+  output). `script_hash_for_address` is now a thin wrapper over it.
+
 - **`pyrxd.glyph.fees`** — reveal-size and reveal-fee estimation from the encoded CBOR
   payload (`estimate_reveal_fee`, `estimate_reveal_fee_for_metadata`,
   `check_reveal_funding`). The estimate runs the real `SatoshisPerKilobyte.compute_fee`
@@ -100,6 +106,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wrong and should be re-read from the chain — the token itself is unaffected and
   was always correctly formed on-chain; only the reported identifier was wrong.
   The commands' `commit_txid` / `reveal_txid` fields were, and remain, correct.
+
+- **`GlyphScanner` returned `metadata=None` for every glyph on real chain data.**
+  The scanner looked for the `gly` CBOR envelope in `inputs[0]` of the transaction
+  named by `ref.txid` — but `ref` is the token's genesis outpoint, which is the
+  **commit** outpoint (`prepare_reveal` embeds it into the reveal's locking script;
+  `extract_ref_from_{nft,ft}_script` reads it back). A commit transaction's inputs
+  are plain P2PKH funding spends and carry no envelope; the envelope is in the
+  scriptSig of the input that *spends* `ref.txid:ref.vout`, i.e. in the **reveal**.
+  Token discovery worked, so this failed silently: `pyrxd glyph list` showed every
+  name as blank, and any `metadata.protocol` filter matched nothing. The bug dates
+  to the scanner's introduction in 0.2.0 and was masked by test fixtures that put
+  the envelope in `ref.txid` itself — a shape that cannot occur on chain.
+
+  The scanner now resolves the reveal properly: if the UTXO's own source transaction
+  spends the ref outpoint it *is* the reveal (freshly minted glyphs cost no extra
+  round trip); otherwise the commit output's script hash is looked up via
+  `blockchain.scripthash.get_history` and the transaction spending the ref is
+  selected from it (ElectrumX has no "what spent this outpoint" RPC). Candidate
+  fetches are capped so a padded history cannot cost unbounded round trips, and
+  metadata is now resolved once per distinct `ref` rather than once per UTXO, so an
+  FT split across many UTXOs no longer pays N lookups. `metadata` is still `None`
+  when the reveal genuinely cannot be reached — a metadata miss never drops the
+  token itself from the scan.
 
 - **BIP39 seeds were derived without NFKD normalization** (`hd/bip39.py`). BIP39
   requires the mnemonic sentence and the passphrase to be NFKD-normalized before
