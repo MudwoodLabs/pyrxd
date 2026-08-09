@@ -20,6 +20,7 @@ verify-an-spv-proof
 spv-verification-pitfalls
 handle-radiant-bip143-quirks
 migrate-0.4-to-0.5
+troubleshoot-common-errors
 ```
 
 ## Available now
@@ -94,6 +95,12 @@ migrate-0.4-to-0.5
   release since (0.5.x → current) is additive and drop-in. Read this only if
   you're upgrading from a 0.4.x pin and hitting `TypeError` / `ValidationError`
   from `pyrxd.glyph.dmint`.
+- **[Troubleshoot common errors](troubleshoot-common-errors.md)** — "I got
+  error X — what now?" Maps concrete error strings and symptoms (a zero
+  balance after restore, `no single UTXO is large enough to fund the mint`,
+  a rejected broadcast, a stuck `claim-dmint`, an FT that shows as plain RXD)
+  to their cause and a one-line fix, with file/line citations into the
+  source that raises each one.
 
 ## Coming soon
 

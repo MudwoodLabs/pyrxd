@@ -341,6 +341,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   without an `if __name__ == "__main__":` guard, where the `spawn` start
   method makes every worker re-import it, re-enter `mine()`, and die in
   milliseconds. The CLI surfaces it with a fix hint.
+### Documentation
+
+- **New how-to: `docs/how-to/troubleshoot-common-errors.md`.** An "I got
+  error X — what now?" index mapping concrete error strings and symptoms
+  (a zero balance after wallet restore, `no single UTXO is large enough to
+  fund the mint`, a reveal too large to fund its own fee, a stuck
+  `claim-dmint`, a rejected broadcast, ElectrumX connection failures, the
+  dMint v2 flag gate, and an FT/NFT silently counted as plain RXD) to their
+  cause and a one-line fix, each cited to the file and line that raises it.
 
 ## [0.11.2] — 2026-08-07
 
