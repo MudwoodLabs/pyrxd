@@ -1046,6 +1046,139 @@ class TestSaveLoad:
 
 
 # ---------------------------------------------------------------------------
+# normalize=False fund-recovery escape through the persistence layer.
+#
+# The BIP39 seed doubles as the wallet file's AES-GCM key (see HdWallet.save),
+# so a wallet saved by pre-0.11.3 pyrxd with a non-ASCII passphrase was
+# encrypted under the old, UNnormalized seed. HdWallet.load must be able to
+# reproduce that seed on explicit request (normalize=False) or the user is
+# locked out of their own wallet file through the public API. The default
+# (normalize=True) must stay byte-for-byte unchanged, and a failed decrypt
+# must NEVER silently retry under the other mode.
+# ---------------------------------------------------------------------------
+
+# NFKD-unstable passphrase: e-acute as one precomposed codepoint (U+00E9).
+# NFKD rewrites it to "e" + combining U+0301, so the two modes derive
+# different seeds — the trap this whole escape hatch exists for.
+_PASSPHRASE_COMPOSED = "café"
+
+
+class TestNormalizeLoadPath:
+    def _save_legacy_wallet(self, p: Path) -> HdWallet:
+        """Save a wallet exactly as pre-0.11.3 pyrxd would have: seed derived
+        WITHOUT NFKD normalization from an NFKD-unstable passphrase."""
+        w = HdWallet.from_mnemonic(MNEMONIC, passphrase=_PASSPHRASE_COMPOSED, normalize=False)
+        w.external_tip = 4
+        w.save(p)
+        return w
+
+    def test_round_trip_under_normalize_false(self):
+        """A wallet saved from the legacy seed round-trips through save/load
+        when the caller opts into the legacy mode on both sides."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            w = self._save_legacy_wallet(p)
+
+            w2 = HdWallet.load(p, MNEMONIC, _PASSPHRASE_COMPOSED, normalize=False)
+            assert w2.external_tip == 4
+            assert w2.derive_address(0, 0) == w.derive_address(0, 0)
+
+    def test_legacy_wallet_fails_closed_under_default_but_loads_via_escape(self):
+        """The headline gap: a pre-0.11.3 wallet file must (a) NOT decrypt
+        under the conformant default — no silent wrong-seed switch — and
+        (b) BE decryptable through the documented normalize=False escape."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            w = self._save_legacy_wallet(p)
+
+            with pytest.raises(ValidationError, match="Could not decrypt"):
+                HdWallet.load(p, MNEMONIC, _PASSPHRASE_COMPOSED)
+
+            w2 = HdWallet.load(p, MNEMONIC, _PASSPHRASE_COMPOSED, normalize=False)
+            assert w2.derive_address(0, 0) == w.derive_address(0, 0)
+
+    def test_conformant_wallet_unchanged_and_not_readable_in_legacy_mode(self):
+        """The default path is untouched, and the asymmetry holds both ways:
+        a conformant file does not decrypt under the legacy seed either."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            w = HdWallet.from_mnemonic(MNEMONIC, passphrase=_PASSPHRASE_COMPOSED)
+            w.save(p)
+
+            w2 = HdWallet.load(p, MNEMONIC, _PASSPHRASE_COMPOSED)
+            assert w2.derive_address(0, 0) == w.derive_address(0, 0)
+
+            with pytest.raises(ValidationError, match="Could not decrypt"):
+                HdWallet.load(p, MNEMONIC, _PASSPHRASE_COMPOSED, normalize=False)
+
+    def test_modes_interchangeable_for_nfkd_stable_passphrase(self):
+        """For an NFKD-stable (here: ASCII) passphrase the two modes derive
+        identical seeds, so either flag value opens the same file — the fix
+        is provably inert for the overwhelmingly common case."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            w = HdWallet.from_mnemonic(MNEMONIC, passphrase="TREZOR")
+            w.save(p)
+
+            a = HdWallet.load(p, MNEMONIC, "TREZOR")
+            b = HdWallet.load(p, MNEMONIC, "TREZOR", normalize=False)
+            assert a.derive_address(0, 0) == b.derive_address(0, 0) == w.derive_address(0, 0)
+
+    def test_decrypt_error_hints_legacy_mode_for_unstable_passphrase(self):
+        """When the default mode fails on an NFKD-unstable passphrase, the
+        error must name the legacy possibility — the old message pointed the
+        user AWAY from the real cause."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            self._save_legacy_wallet(p)
+
+            with pytest.raises(ValidationError, match="normalize=False"):
+                HdWallet.load(p, MNEMONIC, _PASSPHRASE_COMPOSED)
+
+    def test_decrypt_error_omits_legacy_hint_for_ascii_passphrase(self):
+        """An ASCII passphrase cannot be a normalization victim — the hint
+        would send a plainly-wrong-passphrase user down a recovery rabbit
+        hole, so it must not appear."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            w = HdWallet.from_mnemonic(MNEMONIC, passphrase="TREZOR")
+            w.save(p)
+
+            with pytest.raises(ValidationError) as excinfo:
+                HdWallet.load(p, MNEMONIC, "wrong-passphrase")
+            assert "normalize" not in str(excinfo.value)
+
+    def test_decrypt_error_hints_dropping_legacy_mode_on_conformant_file(self):
+        """The reverse mistake — normalize=False against a conformant file —
+        gets the mirrored hint."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            w = HdWallet.from_mnemonic(MNEMONIC, passphrase=_PASSPHRASE_COMPOSED)
+            w.save(p)
+
+            with pytest.raises(ValidationError, match="without normalize=False"):
+                HdWallet.load(p, MNEMONIC, _PASSPHRASE_COMPOSED, normalize=False)
+
+    def test_load_or_create_threads_normalize_on_load_branch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "wallet.dat"
+            w = self._save_legacy_wallet(p)
+
+            w2 = HdWallet.load_or_create(p, MNEMONIC, _PASSPHRASE_COMPOSED, normalize=False)
+            assert w2.external_tip == 4
+            assert w2.derive_address(0, 0) == w.derive_address(0, 0)
+
+    def test_load_or_create_threads_normalize_on_create_branch(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "missing.dat"
+            w = HdWallet.load_or_create(p, MNEMONIC, _PASSPHRASE_COMPOSED, normalize=False)
+            legacy = HdWallet.from_mnemonic(MNEMONIC, passphrase=_PASSPHRASE_COMPOSED, normalize=False)
+            conformant = HdWallet.from_mnemonic(MNEMONIC, passphrase=_PASSPHRASE_COMPOSED)
+            assert w.derive_address(0, 0) == legacy.derive_address(0, 0)
+            assert w.derive_address(0, 0) != conformant.derive_address(0, 0)
+
+
+# ---------------------------------------------------------------------------
 # Balance and UTXO tests
 # ---------------------------------------------------------------------------
 

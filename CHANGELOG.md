@@ -150,6 +150,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   flag exists solely as a recovery path — it produces a wallet no other
   implementation can reproduce, and should not be used for new wallets.
 
+- **The `normalize=False` fund-recovery escape was unreachable from the wallet
+  persistence layer and the BIP44 helpers.** The BIP39 seed doubles as the wallet
+  file's AES-GCM encryption key, so a wallet file saved by pre-0.11.3 pyrxd with a
+  non-ASCII passphrase can only be decrypted by reproducing the old, unnormalized
+  seed — but `HdWallet.load` / `load_or_create` had no way to request it and
+  failed closed with a message pointing at the wrong causes ("wrong mnemonic,
+  wrong passphrase, or ciphertext tampered"). Likewise `bip44_derive_xprv[s]_from_mnemonic`
+  (and the deprecated `derive_xprv[s]_from_mnemonic` aliases) did not forward the
+  flag, leaving the *default* derivation family with no route to the recovery
+  mode, and `hd.discover` could only scan the conformant seed's paths. All of
+  these now accept a keyword-only `normalize: bool = True`; the default behavior
+  is byte-for-byte unchanged. The decrypt-failure message now names the legacy
+  mode as a possibility — only when the supplied passphrase is actually changed
+  by NFKD, so ASCII-passphrase users never see the noise — but the control flow
+  stays fail-closed: pyrxd never silently retries with the other seed, so the
+  legacy mode remains explicit opt-in. The recovery recipe (both symptoms and
+  the sweep-off-the-legacy-seed procedure) is documented in
+  `docs/how-to/recover-funds-across-wallet-paths.md`.
+
 ## [0.11.2] — 2026-08-07
 
 Maintenance release. No functional, API, wire-format, or covenant-bytecode changes —

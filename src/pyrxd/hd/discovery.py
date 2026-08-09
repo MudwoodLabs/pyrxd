@@ -106,6 +106,7 @@ async def discover(
     passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
     coin_types: Sequence[int] = DEFAULT_COIN_TYPES,
     accounts: Sequence[int] = DEFAULT_ACCOUNTS,
+    normalize: bool = True,
 ) -> DiscoveryReport:
     """Scan ``coin_types x accounts`` for derived addresses with on-chain history.
 
@@ -113,6 +114,13 @@ async def discover(
     standard BIP44 gap-limit scan (gap 20, both chains) via
     :meth:`HdWallet.refresh`, and records every used address together with its
     confirmed/unconfirmed balance and full derivation path.
+
+    *normalize* controls BIP39 NFKD normalization of the mnemonic and
+    passphrase — see :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. A scan with
+    the default ``True`` derives the spec-conformant seed and therefore
+    **cannot** see funds sitting on a seed pyrxd derived before 0.11.3 from a
+    non-ASCII passphrase; pass ``normalize=False`` to scan that legacy seed's
+    paths instead. Recovery-only — never for new wallets.
 
     *mnemonic* is used only to derive keys locally; it is never sent to the
     server. Only derived addresses (as scripthashes) reach the network.
@@ -132,7 +140,9 @@ async def discover(
 
     for coin_type in coin_types:
         for account in accounts:
-            wallet = HdWallet.from_mnemonic(mnemonic, passphrase=passphrase, account=account, coin_type=coin_type)
+            wallet = HdWallet.from_mnemonic(
+                mnemonic, passphrase=passphrase, account=account, coin_type=coin_type, normalize=normalize
+            )
             await wallet.refresh(client)
             scanned.append((coin_type, account))
 

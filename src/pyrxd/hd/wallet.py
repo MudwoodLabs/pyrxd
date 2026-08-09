@@ -47,6 +47,7 @@ import json
 import os
 import secrets
 import tempfile
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -375,6 +376,8 @@ class HdWallet:
         mnemonic: str,
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         coin_type: int | None = None,
+        *,
+        normalize: bool = True,
     ) -> HdWallet:
         """Load a previously saved wallet from *path*.
 
@@ -390,13 +393,24 @@ class HdWallet:
         default change between pyrxd versions would otherwise have the
         loaded wallet derive at a different path than it was saved at.
         Pass ``None`` (default) to accept whatever was persisted.
+
+        *normalize* controls BIP39 NFKD normalization of the mnemonic and
+        passphrase — see :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. It
+        matters here because the derived seed is also the wallet file's
+        AES-GCM decryption key: a wallet saved by pyrxd before 0.11.3 with
+        a **non-ASCII passphrase** was encrypted under the old,
+        unnormalized seed, and can only be decrypted by reproducing that
+        seed with ``normalize=False``. Leave the default ``True`` for
+        every other case. Loading never guesses the mode: a GCM failure
+        raises rather than silently retrying with the other seed, so the
+        legacy mode is only ever entered by explicit opt-in.
         """
         if not path.exists():
             raise FileNotFoundError(
                 f"Wallet file not found: {path}. Use HdWallet.load_or_create(...) "
                 f"if you intended to create a new wallet on this path."
             )
-        return cls._load_existing(path, mnemonic, passphrase, coin_type)
+        return cls._load_existing(path, mnemonic, passphrase, coin_type, normalize=normalize)
 
     @classmethod
     def load_or_create(
@@ -406,6 +420,8 @@ class HdWallet:
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         account: int = 0,
         coin_type: int | None = None,
+        *,
+        normalize: bool = True,
     ) -> HdWallet:
         """Load a wallet from *path*, or build a fresh one if the file is missing.
 
@@ -418,13 +434,29 @@ class HdWallet:
         *coin_type* applies to both branches: when loading, it is
         validated against the persisted value; when creating, it is the
         coin type the new wallet uses.
+
+        *normalize* also applies to both branches — see :meth:`load` for
+        why it matters on the load branch (the seed doubles as the wallet
+        file's decryption key). ``False`` is a fund-recovery escape for
+        pre-0.11.3 wallets with non-ASCII passphrases; never use it for
+        new wallets.
         """
         if path.exists():
-            return cls._load_existing(path, mnemonic, passphrase, coin_type)
-        return cls.from_mnemonic(mnemonic, passphrase=passphrase, account=account, coin_type=coin_type)
+            return cls._load_existing(path, mnemonic, passphrase, coin_type, normalize=normalize)
+        return cls.from_mnemonic(
+            mnemonic, passphrase=passphrase, account=account, coin_type=coin_type, normalize=normalize
+        )
 
     @classmethod
-    def _load_existing(cls, path: Path, mnemonic: str, passphrase: str, coin_type: int | None = None) -> HdWallet:
+    def _load_existing(
+        cls,
+        path: Path,
+        mnemonic: str,
+        passphrase: str,
+        coin_type: int | None = None,
+        *,
+        normalize: bool = True,
+    ) -> HdWallet:
         # Mode check: refuse to load a wallet that's group/world readable.
         # ``save()`` always writes 0o600, but a user who restored from
         # backup with ``cp`` or ``rsync`` might end up with a wider
@@ -443,7 +475,7 @@ class HdWallet:
                 "must be 0o600 (owner-only). Run `chmod 0600 <path>` and retry."
             )
 
-        seed = seed_from_mnemonic(mnemonic, passphrase=passphrase)
+        seed = seed_from_mnemonic(mnemonic, passphrase=passphrase, normalize=normalize)
 
         raw = path.read_bytes()
         if len(raw) < _HEADER_LEN:
@@ -470,9 +502,34 @@ class HdWallet:
             # GCM tag mismatch raises ValueError; bad key length raises
             # ValueError too. Surface a single static message (no
             # context-leaking detail) — closes Stream C #4 finding pattern.
-            raise ValidationError(
-                "Could not decrypt wallet file — wrong mnemonic, wrong passphrase, or ciphertext tampered."
-            ) from exc
+            #
+            # The optional legacy-mode hint below varies ONLY on the
+            # caller's own inputs (the passphrase they typed and the
+            # normalize flag they passed) — never on the file contents or
+            # the crypto internals — so it opens no new information
+            # channel. It fires only when NFKD would actually change the
+            # passphrase bytes, because for NFKD-stable (e.g. all-ASCII)
+            # passphrases the two modes derive identical seeds and the
+            # hint would be pure noise. Control flow stays fail-closed:
+            # there is NO automatic retry under the other mode — silently
+            # switching seeds on a GCM failure could mask a genuinely
+            # wrong passphrase and land the user on an unexpected keyset.
+            message = "Could not decrypt wallet file — wrong mnemonic, wrong passphrase, or ciphertext tampered."
+            if unicodedata.normalize("NFKD", passphrase) != passphrase:
+                if normalize:
+                    message += (
+                        " Note: this passphrase contains characters changed by NFKD normalization. "
+                        "If this wallet file was created by pyrxd before 0.11.3, its encryption key "
+                        "came from the old, unnormalized seed — retry with normalize=False (fund-"
+                        "recovery mode; see docs/how-to/recover-funds-across-wallet-paths.md)."
+                    )
+                else:
+                    message += (
+                        " Note: normalize=False (legacy fund-recovery mode) was requested. If this "
+                        "wallet file was created with the spec-conformant seed (pyrxd 0.11.3+, or "
+                        "an ASCII passphrase), load it without normalize=False."
+                    )
+            raise ValidationError(message) from exc
 
         try:
             data = json.loads(plaintext.decode())
