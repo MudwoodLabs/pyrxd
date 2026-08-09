@@ -64,10 +64,13 @@ from .script import build_ft_locking_script, build_nft_locking_script
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef
 
 __all__ = [
+    "MIN_COMMIT_OVERHEAD",
     "P2PKH_LOCKING_SCRIPT_BYTES",
     "REVEAL_SIG_PREFIX_BYTES",
+    "REVEAL_SIZE_SLACK_BYTES",
     "RevealFeeEstimate",
     "check_reveal_funding",
+    "commit_value_for_reveal",
     "estimate_reveal_fee",
     "estimate_reveal_fee_for_metadata",
     "measure_reveal_fee",
@@ -275,6 +278,34 @@ def estimate_reveal_fee_for_metadata(
         fee_rate=fee_rate,
         extra_output_script_sizes=extra_output_script_sizes,
     )
+
+
+# Historical floor for the commit output's overhead above the token carrier — the flat
+# 5,000,000 photons both mint paths used to hard-code. Kept as a floor so small-metadata
+# mints size as they always have; the reveal estimate only ever raises it.
+MIN_COMMIT_OVERHEAD = 5_000_000
+
+# Slack (in reveal bytes) folded in on top of the exact estimate. Unspent slack comes
+# straight back as reveal change, so it costs nothing — it just keeps the change output
+# above dust, which in turn keeps the reveal the size the fee model measured.
+REVEAL_SIZE_SLACK_BYTES = 64
+
+
+def commit_value_for_reveal(carrier_value: int, estimate: RevealFeeEstimate) -> int:
+    """Commit-output value that lets the reveal pay its own fee, never below the floor.
+
+    ``carrier_value`` is what the reveal must place on its token output — a 546-photon
+    dust carrier for an NFT, the whole premined supply for an FT — and is therefore
+    *not* available to pay the fee.
+
+    This is the single source of truth for commit sizing. It lived as a private helper
+    in ``pyrxd.cli.glyph_cmds`` until :mod:`pyrxd.glyph.mint` needed the same number:
+    a second copy in the library would be two fund-safety constants free to drift, and
+    the direction they drift matters — under-sizing the commit strands it permanently
+    (see the module docstring).
+    """
+    slack = REVEAL_SIZE_SLACK_BYTES * estimate.fee_rate
+    return carrier_value + max(MIN_COMMIT_OVERHEAD, estimate.fee + slack)
 
 
 def check_reveal_funding(

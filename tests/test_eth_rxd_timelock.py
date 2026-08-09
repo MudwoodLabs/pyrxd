@@ -206,7 +206,27 @@ def test_converter_invariants_or_failclosed(eth_timeout, rxd_lock, m1, m2, m3, m
     assert t.unit is TimeUnit.BLOCKS
     assert t.value == math.floor(budget / interval)
     assert floor_blocks <= t.value <= _CAP
-    assert t.value * interval <= budget  # floor is conservative — never overshoots the budget
+    # "floor is conservative — never overshoots the budget", to within floating-point noise.
+    #
+    # The tolerance is not papering over a production bug; it is here because BOTH sides of
+    # this comparison are IEEE 754 doubles and neither can represent the exact quantity:
+    #
+    #   1. The production function computes `math.floor(budget / rxd_block_interval_s)`, and
+    #      that division is itself rounded. It can round the true quotient UP across an
+    #      integer boundary — at eth_timeout=54294, m4=4904, interval=1.1 the budget is 49390
+    #      and the exact quotient is 44899.999999999996, but the float quotient is exactly
+    #      44900.0, so floor returns 44900 rather than the exact floor 44899.
+    #   2. This test then recomputes `t.value * interval` in floating point, which rounds again.
+    #
+    # The combined overshoot is bounded by ~2 ULP of the budget (one rounding from each
+    # step); measured worst case across a structured sweep of "nice" intervals is 1 ULP —
+    # for the case above, 7.3e-12 seconds against a 49,390-second budget. `floor` remains
+    # the right, conservative choice: any REAL overshoot would be at least one whole block,
+    # i.e. >= `interval` >= 1.0 second, which is many orders of magnitude above this bound,
+    # so the invariant still fails loudly if the direction of the rounding ever flips.
+    # Sub-block remainder is covered by `margin.rounding_slack_s` by design (see the
+    # `eth_absolute_to_rxd_relative_blocks` docstring).
+    assert t.value * interval <= budget + 8 * math.ulp(float(budget))
 
 
 # ─────────────────────────────────────────────────── funding-confirm gate (D2) ──

@@ -71,6 +71,7 @@ from ..glyph.dmint import (
 from ..glyph.fees import (
     RevealFeeEstimate,
     check_reveal_funding,
+    commit_value_for_reveal,
     estimate_reveal_fee_for_metadata,
     measure_reveal_fee,
 )
@@ -224,25 +225,11 @@ def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None
         click.echo(f"  glyph ref:   {result['ref']}")
 
 
-# Historical floor for the commit output's overhead above the token carrier — the flat
-# 5,000,000 photons both mint paths used to hard-code. Kept as a floor so small-metadata
-# mints size as they always have; the reveal estimate only ever raises it.
-_MIN_COMMIT_OVERHEAD = 5_000_000
-# Slack (in reveal bytes) folded in on top of the exact estimate. Unspent slack comes
-# straight back as reveal change, so it costs nothing — it just keeps the change output
-# above dust, which in turn keeps the reveal the size the fee model measured.
-_REVEAL_SIZE_SLACK_BYTES = 64
-
-
-def _commit_value_for_reveal(carrier_value: int, estimate: RevealFeeEstimate) -> int:
-    """Commit-output value that lets the reveal pay its own fee, never below the floor.
-
-    ``carrier_value`` is what the reveal must place on its token output — a 546-photon
-    dust carrier for an NFT, the whole premined supply for an FT — and is therefore
-    *not* available to pay the fee.
-    """
-    slack = _REVEAL_SIZE_SLACK_BYTES * estimate.fee_rate
-    return carrier_value + max(_MIN_COMMIT_OVERHEAD, estimate.fee + slack)
+# Commit sizing now lives in ``pyrxd.glyph.fees`` — the library-side mint facade
+# (``pyrxd.glyph.mint``) sizes its commits from the same function, and a private CLI copy
+# would be a second fund-safety constant free to drift from it. Re-bound as a module-level
+# name so it stays monkeypatchable in tests/cli/test_glyph_cmds.py.
+_commit_value_for_reveal = commit_value_for_reveal
 
 
 # Stand-in commit txid for the dry-run reveal built by :func:`_assert_reveal_is_fundable`

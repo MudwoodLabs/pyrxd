@@ -8,6 +8,53 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`pyrxd.glyph.mint` — a two-phase, resumable Glyph mint facade** (`GlyphMinter`).
+  `commit_nft`/`reveal_nft` and `commit_ft`/`reveal_ft` are separable phases; `mint_nft`
+  and `deploy_ft` compose each pair. The minter owns what every caller was
+  re-implementing around `GlyphBuilder`: UTXO selection, sizing the commit so the reveal
+  can pay its own fee, signing, the pre-broadcast fee guard, and confirmation polling.
+  No new protocol code — the builders, `pyrxd.glyph.fees` and
+  `pyrxd.network.wait_for_confirmation` already existed; this is the plumbing between
+  them.
+  - **Persistence is a required constructor argument, not an optional keyword.** The
+    commit output is a hashlock (`OP_HASH256 <payload_hash> OP_EQUALVERIFY`) with no
+    owner-only spend path, so losing the exact CBOR bytes between the commit and the
+    reveal makes it **permanently unspendable**. An optional `persist=None` would default
+    that fund-safety mechanism to OFF on the most discoverable method in the module.
+    `JsonFilePendingStore` is the implementation; opting out means naming
+    `UnsafeNullPendingStore`, which warns when constructed.
+  - The `PendingMint` is written **before** the commit is broadcast — one `0600` file per
+    record in a `0700` directory, `os.open`-created at mode (not `chmod`ed afterwards),
+    `fsync`ed, `os.replace`d, then **read back and compared**. The read-back also runs in
+    the minter, so it covers third-party stores whose `save` silently drops the record.
+  - `PendingMint` carries `cbor_bytes` as **bytes** (hex only at the `to_dict` boundary),
+    validates every field in `__post_init__`, and `from_dict` **rejects** an unrecognised
+    `schema_version` rather than best-effort parsing a record that decides whether an
+    output can be spent.
+  - Before a reveal is built, the stored payload is re-hashed and the commit script
+    rebuilt from it. A mismatch — tampered CBOR, a flipped NFT/FT flag, the wrong wallet —
+    is refused instead of broadcast.
+  - Protocol mixes whose reveal is a different shape (MUT, CONTAINER, WAVE, DMINT) are
+    refused at commit time; committing to a reveal the facade cannot build would strand
+    the output. Use `GlyphBuilder` directly for those.
+  - Note on reproducibility: `encode_payload` is canonical CBOR, so identical metadata
+    does re-encode to identical bytes. The bytes are stored because `GlyphMetadata`
+    carries `created`/`commit_outpoint` and callers routinely stamp timestamps into
+    `attrs`, so the metadata may not be reproducible in practice — not because the
+    encoding is non-deterministic.
+- **`pyrxd.glyph.mint.build_reveal_unlock_template`** — the Glyph reveal unlocking-script
+  template, which existed in four copies (`pyrxd.cli.glyph_helpers` plus one in each of
+  the three `examples/*.py` mint scripts). Each copy restated the estimated unlocking
+  length that `pyrxd.glyph.fees` sizes the reveal fee from; a copy that drifted low would
+  make the fee guard under-estimate and pass, stranding the commit.
+- **`pyrxd.glyph.fees.commit_value_for_reveal`** (with `MIN_COMMIT_OVERHEAD` and
+  `REVEAL_SIZE_SLACK_BYTES`) — promoted from a private helper in `pyrxd.cli.glyph_cmds`
+  so the CLI and the new facade size commits from one function rather than two
+  fund-safety constants free to drift apart.
+- **`HdWallet.privkey_for_address`** — address → signing key via the recorded derivation
+  path (one `ckd` chain, not a scan). The minter never persists key material, only the
+  funding address, so the reveal has to re-derive the key that spends the commit.
+
 - **Watchtower second-channel escalation monitor** (`pyrxd-watchtower-escalate`,
   `pyrxd.gravity.watch.escalation`). A third, separately-supervised process that reads the
   heartbeat's `unacked_critical` count and pages a **different** channel when a CRITICAL
@@ -43,6 +90,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   third-party alerters.
 
 ### Fixed
+
+- **Flaky property test in `tests/test_eth_rxd_timelock.py`** (`test_converter_invariants_or_failclosed`,
+  pre-existing and reproducible on released 0.12.0). The assertion `t.value * interval <= budget`
+  failed by ~1e-11 s at `eth_timeout=54294, m4=4904, interval=1.1`. **The production function is
+  unchanged** — `floor(budget / interval)` is the right, conservative choice. The failure is
+  floating point on both sides of the comparison: the test recomputes the product as a double,
+  *and* the production division itself rounds the true quotient (44899.999999999996) up to exactly
+  44900.0, so `floor` returns one block above the exact floor. The combined overshoot is bounded
+  by ~2 ULP of the budget (measured worst case: 1 ULP), against a real overshoot that would be at
+  least one whole block — `interval` >= 1.0 s. The assertion now allows 8 ULP and explains why.
 
 - **The watchtower's LOG heartbeat never saw the un-ACK'd CRITICAL count.** `run.py` wired
   `unacked_critical` into the *file* heartbeat but built `default_heartbeat` without it, so the
