@@ -35,6 +35,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   *more* than `ts` refuse a payload shape it does not know. The escalation monitor does exactly
   that. Upgrade the tower before the monitor.
 
+### Fixed
+
+- **The watchtower's LOG heartbeat never saw the un-ACK'd CRITICAL count.** `run.py` wired
+  `unacked_critical` into the *file* heartbeat but built `default_heartbeat` without it, so the
+  log side fell back to its "not wired" `-1` forever: the tick line reported `unacked_critical=-1`
+  next to a file heartbeat carrying the real count, and the ERROR-level escalation that fires on
+  `unacked > 0` could never trigger (`-1` is not `> 0`).
+
 ## [0.12.0] — 2026-08-09
 
 Correctness and hardening release. It fixes **four defects that could cost users funds or
