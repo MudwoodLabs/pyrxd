@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from pyrxd.gravity.watch import ElectrumRxdChainSource, MultiSourceRxdChainSource
+from pyrxd.security.errors import ValidationError
 
 _SCRIPTS = str(Path(__file__).resolve().parent.parent / "scripts")
 if _SCRIPTS not in sys.path:
@@ -98,8 +99,9 @@ async def test_ssh_only_is_single_source():
 
 
 async def test_quorum_above_wired_sources_fails_loud():
-    # 2 sources but --rxd-quorum 3 → a clean SystemExit (fail-loud), never silently weakened/raw-raised.
-    with pytest.raises(SystemExit):
+    # 2 sources but --rxd-quorum 3 → a clean typed error (fail-loud), never silently weakened/raw-raised.
+    # ValidationError, NOT SystemExit: this is package code now, so an embedder must be able to catch it.
+    with pytest.raises(ValidationError):
         await _build("--rxd-electrumx-url", "wss://a", "--rxd-electrumx-url", "wss://b", "--rxd-quorum", "3")
 
 
@@ -124,9 +126,9 @@ async def test_ssh_backend_without_host_or_container_refuses_to_start():
     --rxd-include-node would have attempted `ssh tr` — handing whoever answers that name in
     their DNS search domain the txid set of their in-flight swaps.
     """
-    with pytest.raises(SystemExit, match="--ssh-host and --ssh-container required"):
+    with pytest.raises(ValidationError, match="--ssh-host and --ssh-container required"):
         await _build("--rxd-backend", "ssh-tr")
 
     # Only the genuinely-missing flag is named.
-    with pytest.raises(SystemExit, match=r"^--ssh-container required"):
+    with pytest.raises(ValidationError, match=r"^--ssh-container required"):
         await _build("--rxd-electrumx-url", "wss://a", "--rxd-include-node", "--ssh-host", "h")

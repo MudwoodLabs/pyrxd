@@ -24,7 +24,10 @@ changes or the swap retires). WARN/INFO intents keep the once-per-situation dedu
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+import stat
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -34,6 +37,8 @@ from pyrxd.gravity.watch.decide import Decision, Intent
 from pyrxd.security.errors import ValidationError
 
 __all__ = ["AlertChannel", "DedupAlerter", "FileAckInbox", "Page", "Severity"]
+
+logger = logging.getLogger("pyrxd.watchtower.alerts")
 
 
 class Severity(Enum):
@@ -178,6 +183,18 @@ class DedupAlerter:
         self._critical_ticks[swap_id] = 0  # reset the re-page backoff after a successful (re)page
 
 
+#: A drained ACK id must look like a swap id — the records store keys swaps by a JSON file
+#: stem, so this is deliberately filename-shaped. Anything else is a typo or a probe, and is
+#: dropped before it ever reaches :meth:`DedupAlerter.ack`.
+_ACK_ID_RE = re.compile(r"\A[A-Za-z0-9._:-]{1,128}\Z")
+
+#: Ceiling on one drain. The drain runs on the daemon's ``on_tick_start`` hook, which fires
+#: OUTSIDE the per-tick watchdog (``daemon.run_loop`` calls it before ``asyncio.wait_for``),
+#: so an unbounded read of an attacker-grown file would stall the tower past the
+#: dead-man's-switch window with no timeout to catch it. 64 KiB is ~1000 ACKs.
+MAX_ACK_INBOX_BYTES = 64 * 1024
+
+
 class FileAckInbox:
     """Operator → watchtower ACK transport (the mirror of :class:`FileHeartbeat`).
 
@@ -190,10 +207,35 @@ class FileAckInbox:
     :meth:`drain` is atomic against a concurrent appender: it renames the inbox aside before
     reading, so ids appended during the read land in a fresh file and are consumed next tick
     (an ACK is never lost or double-consumed).
+
+    **This inbox is a control channel, not a log.** An ACK suppresses CRITICAL re-pages and
+    zeroes ``unacked_critical_count`` — the external escalation signal — so anyone who can
+    write the file can silence the tower during a claim race. It is therefore held to the
+    same bar as the (far lower-value) webhook secret file:
+
+    * **0600 + owner** — a group/world-writable or foreign-owned inbox is REFUSED. Refusal
+      is fail-closed *toward paging*: the claimed contents are dropped (so the pages keep
+      firing) and an ERROR names the required ``chmod``. Create it with
+      ``install -m 600 /dev/null "$WATCHTOWER_ACKS"``.
+    * **no symlink / regular file only** — checked via ``O_NOFOLLOW`` + ``fstat`` on the same
+      fd that is read, so there is no stat/read TOCTOU.
+    * **bounded read** (:data:`MAX_ACK_INBOX_BYTES`) — see that constant: this runs outside
+      the tick watchdog.
+    * **lossy decode** — decoded with ``errors="replace"``. A strict decode would raise
+      *after* the ``os.replace`` had already claimed the file, and the ``finally: unlink``
+      would then destroy every pending ACK because of one bad byte. The mangled line simply
+      fails :data:`_ACK_ID_RE` and is dropped.
+
+    Ids that do not match :data:`_ACK_ID_RE` are dropped here; ids that match but name no
+    live CRITICAL situation are already inert (:meth:`DedupAlerter.ack` returns ``False``
+    without recording anything).
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, max_bytes: int = MAX_ACK_INBOX_BYTES) -> None:
+        if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 1:
+            raise ValidationError("FileAckInbox max_bytes must be an int >= 1")
         self._path = Path(path)
+        self._max_bytes = max_bytes
 
     def drain(self) -> list[str]:
         tmp = self._path.with_name(self._path.name + ".draining")
@@ -201,8 +243,78 @@ class FileAckInbox:
             os.replace(self._path, tmp)  # atomically claim the current inbox contents
         except FileNotFoundError:
             return []
+        except OSError as exc:  # e.g. EACCES/EISDIR on a hostile path — never crash the tick
+            logger.error("ACK inbox %s could not be claimed for draining: %s", self._path, exc)
+            return []
         try:
-            content = tmp.read_text()
+            content = self._read_checked(tmp)
         finally:
             tmp.unlink(missing_ok=True)
-        return [line.strip() for line in content.splitlines() if line.strip()]
+        if content is None:
+            return []
+        ids: list[str] = []
+        for line in content.splitlines():
+            candidate = line.strip()
+            if not candidate:
+                continue
+            if not _ACK_ID_RE.match(candidate):
+                logger.warning("ACK inbox %s: dropping malformed swap id (%d chars)", self._path, len(candidate))
+                continue
+            ids.append(candidate)
+        return ids
+
+    def _read_checked(self, tmp: Path) -> str | None:
+        """Read the claimed inbox under the mode/owner/size gate. ``None`` = refused."""
+        # O_NONBLOCK so a FIFO left at this path returns instead of blocking the tick forever
+        # (it is then refused by the S_ISREG check); inert for a regular file.
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        try:
+            fd = os.open(str(tmp), flags)
+        except OSError as exc:
+            logger.error("ACK inbox %s is unreadable (%s) — ACKs dropped, pages will keep firing", self._path, exc)
+            return None
+        try:
+            if os.name == "posix":
+                st = os.fstat(fd)
+                if not stat.S_ISREG(st.st_mode):
+                    logger.error("ACK inbox %s is not a regular file — REFUSED (ACKs dropped)", self._path)
+                    return None
+                mode = st.st_mode & 0o777
+                if mode & 0o077:
+                    logger.error(
+                        "ACK inbox %s has mode %s; must be 0o600 (owner-only) — REFUSED, ACKs dropped and "
+                        "CRITICAL pages will keep firing. Any local user who can write this file can silence "
+                        "the tower. Run `chmod 600 %s`.",
+                        self._path,
+                        oct(mode),
+                        self._path,
+                    )
+                    return None
+                if st.st_uid != os.geteuid():
+                    logger.error(
+                        "ACK inbox %s is owned by uid %d, not this process's uid %d — REFUSED (ACKs dropped)",
+                        self._path,
+                        st.st_uid,
+                        os.geteuid(),
+                    )
+                    return None
+            data = os.read(fd, self._max_bytes + 1)
+        except OSError as exc:
+            logger.error("ACK inbox %s read failed (%s) — ACKs dropped", self._path, exc)
+            return None
+        finally:
+            os.close(fd)
+        truncated = len(data) > self._max_bytes
+        if truncated:
+            # Keep only whole lines: the cut can land mid-id, and a half id must not be ACK'd.
+            data = data[: self._max_bytes]
+            data = data[: data.rfind(b"\n") + 1]
+            logger.error(
+                "ACK inbox %s exceeded %d bytes — truncated to whole lines; the remainder is DROPPED "
+                "(re-append any ids that were not acknowledged)",
+                self._path,
+                self._max_bytes,
+            )
+        # errors="replace": a strict decode would raise after the file was already claimed, and
+        # the caller's `finally: unlink` would destroy every pending ACK over one bad byte.
+        return data.decode("utf-8", errors="replace")

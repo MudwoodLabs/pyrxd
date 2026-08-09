@@ -36,6 +36,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import sys
 
 import aiohttp
 
@@ -68,6 +69,7 @@ from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
 from pyrxd.gravity.watch.preflight import preflight_timing
 from pyrxd.network.bitcoin import MempoolSpaceBroadcaster, MultiSourceBtcFundingReader
 from pyrxd.network.electrumx import ElectrumXClient
+from pyrxd.security.errors import RxdSdkError, ValidationError
 
 logger = logging.getLogger("pyrxd.watchtower")
 
@@ -140,13 +142,13 @@ def _build_executor(args: argparse.Namespace, stack: contextlib.AsyncExitStack) 
     try:
         refund_spk = bytes.fromhex(args.refund_spk.removeprefix("0x"))
     except ValueError as exc:
-        raise SystemExit("--refund-spk must be hex (the operator's pinned refund scriptPubKey)") from exc
+        raise ValidationError("--refund-spk must be hex (the operator's pinned refund scriptPubKey)") from exc
     cleared = args.network in AUDIT_CLEARED_NETWORKS or args.audit_cleared
     sink = None
     if cleared:  # construct the live wire ONLY when this network is (or is opted-in as) cleared
         base = args.btc_broadcast_url or _MEMPOOL_BASE.get(args.network)
         if not base:
-            raise SystemExit(f"--btc-broadcast-url is required to arm autonomy on network {args.network!r}")
+            raise ValidationError(f"--btc-broadcast-url is required to arm autonomy on network {args.network!r}")
         sink = MempoolSpaceBroadcaster(base_url=base)
         stack.push_async_callback(sink.close)  # close the lazily-opened aiohttp session on exit
     broadcaster = make_refund_broadcaster(args.network, audit_cleared=args.audit_cleared, broadcaster=sink)
@@ -226,7 +228,7 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
             flag for flag, val in (("--ssh-host", args.ssh_host), ("--ssh-container", args.ssh_container)) if not val
         ]
         if missing:
-            raise SystemExit(
+            raise ValidationError(
                 f"{' and '.join(missing)} required with "
                 f"{'--rxd-backend ssh-tr' if args.rxd_backend == 'ssh-tr' else '--rxd-include-node'}"
             )
@@ -247,14 +249,14 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
         client = await stack.enter_async_context(ElectrumXClient([url], allow_insecure=args.allow_insecure))
         sources.append(ElectrumRxdChainSource(client))
     if not sources:
-        raise SystemExit(
+        raise ValidationError(
             "no RXD source configured — pass --rxd-electrumx-url (repeatable) and/or --rxd-include-node "
             "(or --rxd-backend ssh-tr)"
         )
     if len(sources) == 1:
         return sources[0], False  # single source → low-corroboration (v1 posture)
     if len(sources) < args.rxd_quorum:
-        raise SystemExit(
+        raise ValidationError(
             f"--rxd-quorum {args.rxd_quorum} but only {len(sources)} independent RXD source(s) wired; "
             "add --rxd-electrumx-url / --rxd-include-node, or lower --rxd-quorum"
         )
@@ -270,7 +272,7 @@ async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     if not args.eth_rpc_url:
         return None
     if not args.eth_chain_id:
-        raise SystemExit("--eth-chain-id is required with --eth-rpc-url")
+        raise ValidationError("--eth-chain-id is required with --eth-rpc-url")
     from pyrxd.eth_wallet.rpc import EthRpc
 
     rpc = EthRpc(args.eth_rpc_url, expected_chain_id=args.eth_chain_id)
@@ -290,7 +292,7 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
         # intent, so it must either value-scale (set the per-block reorg cost; the per-record value
         # comes from each swap's terms in decide()) or consciously accept a flat burial for dust.
         if args.rxd_reorg_cost_per_block is None and not args.accept_flat_burial:
-            raise SystemExit(
+            raise ValidationError(
                 "a --measured watchtower must set --rxd-reorg-cost-per-block (value-scale RXD claims) "
                 "or --accept-flat-burial (dust); refusing to silently flat-assess value-bearing swaps"
             )
@@ -414,7 +416,9 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "--ack-inbox",
         help="operator ACK inbox: append a swap_id per line (e.g. `echo <swap_id> >> FILE`) to "
         "acknowledge its CRITICAL page. Drained once per tick; suppresses re-paging for that "
-        "exact situation and drops it from the heartbeat's unacked_critical count.",
+        "exact situation and drops it from the heartbeat's unacked_critical count. MUST be a "
+        "0600 regular file you own (create it with `install -m 600 /dev/null FILE`) — anyone "
+        "who can write it can silence a claim-race page.",
     )
     # ETH counter-leg (alert-only v3): watch RXD↔ETH swaps too. Read-only, no key, never touches p.
     p.add_argument(
@@ -573,7 +577,11 @@ async def _amain(argv=None) -> int:
 
             def on_tick_start() -> None:  # deliberate conditional (re)definition of on_tick_start
                 for swap_id in ack_inbox.drain():
-                    alerter.ack(swap_id)
+                    if not alerter.ack(swap_id):
+                        # ACKs are inert for an unknown/uncritical swap (DedupAlerter.ack records
+                        # nothing), but say so: it is either an operator typo on a time-critical
+                        # page, or someone probing the inbox to silence one.
+                        logger.warning("ACK for %r ignored — no live CRITICAL situation with that swap id", swap_id)
 
         tick_budget = args.tick_timeout_s if args.tick_timeout_s is not None else max(4.0 * args.poll_interval_s, 30.0)
         rxd_desc = (
@@ -611,7 +619,19 @@ async def _amain(argv=None) -> int:
 
 
 def main(argv=None) -> int:
-    return asyncio.run(_amain(argv))
+    """Console-script shell. Returns the process exit code (0 ok, 1 config error, 2 unsafe timing).
+
+    The tower's config checks live in package code, so they raise typed
+    :class:`~pyrxd.security.errors.RxdSdkError`\\ s — an application that imports and calls
+    ``_build_rxd_source``/``_build_executor`` must be able to CATCH a bad config, not have its
+    process killed by a bare ``SystemExit``. This is the one place that becomes an exit code,
+    and it is the same code (1, message on stderr) the ``SystemExit`` produced.
+    """
+    try:
+        return asyncio.run(_amain(argv))
+    except RxdSdkError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

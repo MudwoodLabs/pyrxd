@@ -445,6 +445,10 @@ async def test_presign_step_arms_an_executor_acceptable_blob(tmp_path):
         out_dir=tmp_path,
     )
     assert dest.name == "swap1.refund.json"
+    # Custody-sensitive (a signed tx paying the operator): owner-only, and written via
+    # mkstemp+fchmod+fsync+os.replace, so no partial/wide-mode file is ever left behind.
+    assert dest.stat().st_mode & 0o777 == 0o600
+    assert not [p for p in tmp_path.iterdir() if p.name.endswith(".tmp")]
     # the tower loads + accepts it (arming with the SAME pinned refund SPK) → BROADCAST
     b = _FakeBroadcaster()
     out = await _armed(tmp_path, b).execute("swap1", rec, _refund_decision())

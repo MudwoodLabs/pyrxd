@@ -32,12 +32,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
+import tempfile
 from pathlib import Path
 
 from pyrxd.btc_wallet import taproot as t
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch import PresignedRefund
-from pyrxd.security.errors import ValidationError
+from pyrxd.gravity.watch.cli_secrets import read_secret_file
+from pyrxd.security.errors import RxdSdkError, ValidationError
 
 
 def presign_refund(
@@ -87,16 +90,57 @@ def presign_refund(
     out = Path(out_dir) if out_dir is not None else record_path.parent
     dest = out / f"{swap_id}.refund.json"
     # Write LAST (the record already exists) so a partial setup never yields an armed-but-mismatched pair.
-    dest.write_text(json.dumps(blob.to_dict()))
-    os.chmod(dest, 0o600)  # custody-sensitive: a signed tx that pays you
+    _atomic_write_0600(dest, json.dumps(blob.to_dict()).encode())
     return dest
 
 
+def _atomic_write_0600(dest: Path, payload: bytes) -> None:
+    """mkstemp + fchmod + fsync + os.replace — the house convention (``pyrxd.hd.wallet.save``).
+
+    The sidecar is custody-sensitive (a signed transaction that pays you), and the tower reads
+    it unattended, so ``write_text`` + ``chmod`` was wrong twice over: the file existed at the
+    process umask (typically 0644 — world-readable) for the window before the ``chmod``, and a
+    crash mid-write left a TRUNCATED blob at the armed path for the tower to load. Here the mode
+    is set on the fd before any bytes are written, and the destination only ever appears as the
+    complete, fsynced file (or not at all).
+    """
+    parent = dest.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=f".{dest.name}.", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, payload)
+        os.fsync(fd)
+        os.close(fd)
+        fd = -1
+        os.replace(tmp_path, dest)
+    except Exception:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:  # best-effort cleanup; the original exception is re-raised below
+                pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:  # best-effort cleanup; the original exception is re-raised below
+            pass
+        raise
+
+
 def _read_privkey(path: str) -> bytes:
-    raw = Path(path).read_text().strip().removeprefix("0x")
-    key = bytes.fromhex(raw)
+    """Load the 32-byte hex refund key from an owner-only file.
+
+    Gated by :func:`read_secret_file` — the same 0600 + owner + no-symlink check the tower
+    applies to the (far lower-value) webhook secret. This file holds a PRIVATE KEY; reading it
+    with no mode check at all while refusing a group-readable webhook secret was backwards.
+    """
+    raw = read_secret_file(path, label="--refund-key-file").strip().removeprefix("0x")
+    try:
+        key = bytes.fromhex(raw)
+    except ValueError as exc:
+        raise ValidationError("--refund-key-file must contain a 32-byte hex private key") from exc
     if len(key) != 32:
-        raise SystemExit("--refund-key-file must contain a 32-byte hex private key")
+        raise ValidationError("--refund-key-file must contain a 32-byte hex private key")
     return key
 
 
@@ -110,10 +154,22 @@ def main(argv=None) -> int:
     p.add_argument("--fee-sats", type=int, required=True, help="absolute fee baked into the (unbumpable) refund tx")
     p.add_argument("--out-dir", help="where to write <swap_id>.refund.json (default: the record's dir)")
     args = p.parse_args(argv)
+    # Package code raises typed errors; this shell is the ONE place they become an exit code
+    # (1 — the same code the bare `raise SystemExit("...")` produced), so an embedding
+    # application that imports presign_refund()/_read_privkey() gets a catchable exception
+    # instead of a killed process.
+    try:
+        return _run(args)
+    except RxdSdkError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+
+def _run(args: argparse.Namespace) -> int:
     try:
         spk = bytes.fromhex(args.to_scriptpubkey.removeprefix("0x"))
     except ValueError as exc:
-        raise SystemExit("--to-scriptpubkey must be hex") from exc
+        raise ValidationError("--to-scriptpubkey must be hex") from exc
     dest = presign_refund(
         record_path=args.record,
         refund_privkey=_read_privkey(args.refund_key_file),

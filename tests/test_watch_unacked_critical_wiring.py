@@ -61,8 +61,10 @@ async def test_ack_drops_the_count_to_zero(tmp_path: Path) -> None:
     await alerter.handle("swap-1", Decision(Intent.PAGE_CLAIM, reason="claim race"))
     assert alerter.unacked_critical_count() == 1
 
-    # The operator's documented gesture: append the swap id to the inbox.
+    # The operator's documented gesture: append the swap id to the inbox (owner-only, 0600 —
+    # a group/world-accessible inbox is a silencing channel and is refused).
     inbox_path.write_text("swap-1\n")
+    inbox_path.chmod(0o600)
     for swap_id in inbox.drain():
         alerter.ack(swap_id)
 

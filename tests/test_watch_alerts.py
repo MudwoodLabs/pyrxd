@@ -202,6 +202,7 @@ def test_file_ack_inbox_drain(tmp_path):
     inbox = FileAckInbox(path)
     assert inbox.drain() == []  # missing file -> empty
     path.write_text("s1\n s2 \n\ns3\n")  # operator-appended ids, whitespace/blank tolerant
+    path.chmod(0o600)  # the inbox is a control channel: owner-only or it is refused
     assert inbox.drain() == ["s1", "s2", "s3"]
     assert inbox.drain() == []  # drained: consumed exactly once
     assert not path.exists()
