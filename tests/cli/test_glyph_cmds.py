@@ -637,6 +637,45 @@ class TestMultiTxGlyphAssembly:
         assert reveal.outputs[0].satoshis == 1000  # premine supply preserved
         assert result["ref"].endswith(":0")
 
+    def test_deploy_ft_ref_is_commit_outpoint_not_reveal(self, cli_context, tmp_path) -> None:
+        """The reported ref must be the ref actually embedded in the reveal script.
+
+        Regression: the CLI reported the REVEAL txid while the builder embeds the
+        COMMIT outpoint, so `transfer-ft` -- which matches on the *extracted* ref --
+        could never resolve a token `deploy-ft` had just reported.
+        """
+        from pyrxd.cli.glyph_cmds import _deploy_ft_inner, _read_metadata_file
+        from pyrxd.glyph.script import extract_ref_from_ft_script
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key, wallet, client, captured = self._wallet_and_client()
+        meta = _read_metadata_file(_write_meta(tmp_path / "ft.json", protocol=["FT"]))
+        treasury_pkh = Hex20(key.public_key().hash160())
+
+        result = asyncio.run(_deploy_ft_inner(ctx, wallet, meta, treasury_pkh, 1000, client))
+
+        reveal = Transaction.from_hex(captured[1])
+        on_chain = extract_ref_from_ft_script(reveal.outputs[0].locking_script.serialize())
+        assert result["ref"] == f"{on_chain.txid}:{on_chain.vout}"
+        assert result["ref"].startswith(result["commit_txid"])
+        assert not result["ref"].startswith(result["reveal_txid"])
+
+    def test_mint_nft_ref_is_commit_outpoint_not_reveal(self, cli_context, tmp_path) -> None:
+        """Same regression on the NFT path, which `transfer-nft` matches on."""
+        from pyrxd.cli.glyph_cmds import _mint_nft_inner, _read_metadata_file
+        from pyrxd.glyph.script import extract_ref_from_nft_script
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        _key, wallet, client, captured = self._wallet_and_client()
+        meta = _read_metadata_file(_write_meta(tmp_path / "nft.json", protocol=["NFT"]))
+        result = asyncio.run(_mint_nft_inner(ctx, wallet, meta, client))
+
+        reveal = Transaction.from_hex(captured[1])
+        on_chain = extract_ref_from_nft_script(reveal.outputs[0].locking_script.serialize())
+        assert result["ref"] == f"{on_chain.txid}:{on_chain.vout}"
+        assert result["ref"].startswith(result["commit_txid"])
+        assert not result["ref"].startswith(result["reveal_txid"])
+
     def test_mint_nft_inner_funds_from_vout_nonzero(self, cli_context, tmp_path) -> None:
         from pyrxd.cli.glyph_cmds import _mint_nft_inner, _read_metadata_file
 

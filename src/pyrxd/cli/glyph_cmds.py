@@ -355,7 +355,11 @@ async def _mint_nft_inner(
         ],
     )
     reveal_txid = await client.broadcast(reveal_hex)
-    ref = GlyphRef(txid=Txid(str(reveal_txid)), vout=0)
+    # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
+    # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
+    # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
+    # back — so it is what `transfer-nft` / `transfer-ft` match on.
+    ref = GlyphRef(txid=Txid(str(commit_txid)), vout=0)
 
     return {
         "commit_txid": str(commit_txid),
@@ -597,7 +601,11 @@ async def _deploy_ft_inner(
         ],
     )
     reveal_txid = await client.broadcast(reveal_tx.serialize())
-    ref = GlyphRef(txid=Txid(str(reveal_txid)), vout=0)
+    # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
+    # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
+    # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
+    # back — so it is what `transfer-nft` / `transfer-ft` match on.
+    ref = GlyphRef(txid=Txid(str(commit_txid)), vout=0)
 
     return {
         "commit_txid": str(commit_txid),

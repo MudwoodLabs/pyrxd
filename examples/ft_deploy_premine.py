@@ -9,8 +9,9 @@ This is the canonical "issue your own token" flow using pyrxd:
   4. prepare_ft_deploy_reveal → FT locking script + scriptSig suffix
   5. Broadcast reveal tx (commit output → FT output carrying full supply)
 
-The reveal output's outpoint becomes the permanent token ref.  All issued
-units land in the deployer's FT UTXO.  Radiant convention: 1 photon = 1 FT
+The COMMIT outpoint becomes the permanent token ref -- it is embedded into
+the reveal's locking script, and is what ``extract_ref_from_ft_script`` reads
+back.  All issued units land in the deployer's FT UTXO.  Radiant convention: 1 photon = 1 FT
 unit, so ``PREMINE_AMOUNT`` is the integer supply.
 
 Usage

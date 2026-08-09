@@ -246,8 +246,10 @@ class GlyphBuilder:
 
         Thin convenience wrapper around :meth:`prepare_reveal` for the
         FT-deploy-with-premine flow: the reveal produces one FT output
-        carrying the full issued supply to ``premine_pkh``, and its
-        outpoint becomes the permanent token ref.
+        carrying the full issued supply to ``premine_pkh``. The permanent
+        token ref is the **commit** outpoint (``commit_txid:commit_vout``),
+        which this method embeds into the reveal's locking script — not the
+        reveal's own outpoint.
 
         Caller still constructs the actual transaction. The returned
         ``premine_amount`` is what ``vout[0].value`` must be on the
