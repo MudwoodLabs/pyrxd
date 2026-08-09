@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -56,6 +57,13 @@ def _confirmations_of(info: Any) -> int:
         return 0
     raw = info.get("confirmations", 0)
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return 0
+    # Non-finite guard: json.loads ACCEPTS the non-standard literals Infinity/-Infinity/NaN,
+    # so a hostile or broken server can return `{"confirmations": 1e999}` -> float('inf').
+    # int(inf) raises OverflowError and int(nan) raises ValueError — neither is a NetworkError,
+    # so without this they escape the caller's fail-closed handling and surface as a bare
+    # traceback. On the mint path that happens AFTER the commit is already on-chain.
+    if isinstance(raw, float) and not math.isfinite(raw):
         return 0
     depth = int(raw)
     return depth if depth > 0 else 0
