@@ -72,4 +72,17 @@ jobs:
           # matches (pattern matches that couldn't be auto-verified).
           # Skips unverified because that bucket is mostly noise from
           # documentation examples and test vectors.
-          extra_args: --results=verified,unknown
+          #
+          # --exclude-detectors=Lob — Lob API keys are `test_` + 35 chars,
+          # so the detector matches ANY 40-character identifier beginning
+          # `test_` — i.e. ordinary pytest function names. Worse, it reports
+          # them as *verified*: Lob's test environment accepts any `test_*`
+          # key, so the verification step confirms them (the finding carries
+          # `"environment":"test"`). 152 test names already on main are
+          # exactly 40 characters, so this fires whenever a PR happens to add
+          # one — an intermittent, unexplainable-looking failure on the one
+          # gate that must never cry wolf. pyrxd is a blockchain SDK and will
+          # never hold a Lob (direct-mail) credential, so the detector has no
+          # true-positive value here and its false positives actively erode
+          # trust in the scan. Every other detector stays enabled.
+          extra_args: --results=verified,unknown --exclude-detectors=Lob
