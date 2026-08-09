@@ -11,13 +11,25 @@ def bip44_derive_xprv_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spe
     prefix: str = "mnemonic",
     path: str = BIP44_DERIVATION_PATH,
     network: Network = Network.MAINNET,
+    *,
+    normalize: bool = True,
 ) -> Xprv:
     """
     Derives extended private key using BIP44 format- it is a subset of BIP32.
     Inherits from BIP32, only changing the default path value.
+
+    :param normalize: See :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. Leave
+        ``True`` unless recovering a wallet created before 0.11.3 with a
+        non-ASCII passphrase.
     """
     return bip32_derive_xprv_from_mnemonic(
-        mnemonic=mnemonic, lang=lang, passphrase=passphrase, prefix=prefix, path=path, network=network
+        mnemonic=mnemonic,
+        lang=lang,
+        passphrase=passphrase,
+        prefix=prefix,
+        path=path,
+        network=network,
+        normalize=normalize,
     )
 
 
@@ -31,12 +43,16 @@ def bip44_derive_xprvs_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 sp
     path: str = BIP44_DERIVATION_PATH,
     change: str | int = 0,
     network: Network = Network.MAINNET,
+    *,
+    normalize: bool = True,
 ) -> list[Xprv]:
     """
     Derive a range of extended keys from a nmemonic using BIP44 format
+
+    :param normalize: See :func:`~pyrxd.hd.bip39.seed_from_mnemonic`.
     """
 
-    xprv = bip44_derive_xprv_from_mnemonic(mnemonic, lang, passphrase, prefix, path, network)
+    xprv = bip44_derive_xprv_from_mnemonic(mnemonic, lang, passphrase, prefix, path, network, normalize=normalize)
     return _derive_xkeys_from_xkey(xprv, index_start, index_end, change)
 
 
@@ -69,13 +85,21 @@ def derive_xprv_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spec defa
     prefix: str = "mnemonic",
     path: str = BIP44_DERIVATION_PATH,
     network: Network = Network.MAINNET,
+    *,
+    normalize: bool = True,
 ) -> Xprv:
     """
     [DEPRECATED] Use bip44_derive_xprv_from_mnemonic instead.
       This function name is kept for backward compatibility.
     """
     return bip44_derive_xprv_from_mnemonic(
-        mnemonic=mnemonic, lang=lang, passphrase=passphrase, prefix=prefix, path=path, network=network
+        mnemonic=mnemonic,
+        lang=lang,
+        passphrase=passphrase,
+        prefix=prefix,
+        path=path,
+        network=network,
+        normalize=normalize,
     )
 
 
@@ -90,6 +114,8 @@ def derive_xprvs_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spec def
     path: str = BIP44_DERIVATION_PATH,
     change: str | int = 0,
     network: Network = Network.MAINNET,
+    *,
+    normalize: bool = True,
 ) -> list[Xprv]:
     """
     [DEPRECATED] Use bip44_derive_xprvs_from_mnemonic instead.
@@ -105,4 +131,5 @@ def derive_xprvs_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spec def
         path=path,
         change=change,
         network=network,
+        normalize=normalize,
     )

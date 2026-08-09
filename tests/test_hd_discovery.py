@@ -145,6 +145,31 @@ class TestDiscover:
         with pytest.raises(ConnectionError):
             _run(discover(client, MNEMONIC))
 
+    def test_normalize_false_scans_the_legacy_seed(self):
+        # Funds sitting on the pre-0.11.3 unnormalized seed (non-ASCII
+        # passphrase, no NFKD) are invisible to a default scan — the default
+        # derives the conformant seed, a different key tree entirely. The
+        # recovery scan must reach them via normalize=False.
+        passphrase = "café"  # precomposed U+00E9: NFKD-unstable
+        legacy_wallet = HdWallet.from_mnemonic(MNEMONIC, passphrase=passphrase, coin_type=512, normalize=False)
+        funded = legacy_wallet._derive_address(0, 0)
+        client = _mock_client(
+            history_map={funded: [{"tx_hash": "55" * 32, "height": 1}]},
+            balance_map={funded: (42, 0)},
+        )
+
+        # Default scan derives the conformant seed — cannot see the funds.
+        default_report = _run(discover(client, MNEMONIC, passphrase=passphrase, coin_types=[512], accounts=[0]))
+        assert not default_report.found
+
+        # Legacy-mode scan reaches the old seed's paths.
+        legacy_report = _run(
+            discover(client, MNEMONIC, passphrase=passphrase, coin_types=[512], accounts=[0], normalize=False)
+        )
+        assert legacy_report.found
+        assert legacy_report.hits[0].address == funded
+        assert legacy_report.total_confirmed == 42
+
     def test_mnemonic_not_in_report(self):
         # No seed material should be reachable through the returned report.
         funded = _addr(0, 0, 0, 0)
