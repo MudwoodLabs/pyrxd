@@ -160,16 +160,37 @@ On success it prints the mint txid; the contract is recreated at
 
 ### Mining notes
 
-- **It uses an external parallel miner by default** (`python -m
-  pyrxd.contrib.miner`) across your CPU cores. At difficulty 1 a claim
-  takes minutes; point `--miner-cmd "/path/to/glyph-miner …"` at a GPU
-  miner for seconds. `--miner-cmd in-process` forces the slow pure-Python
-  miner.
-- **V1's nonce is only 4 bytes**, so any single attempt has roughly a 39%
+- **Size the job first.** `pyrxd glyph dmint-estimate --contract <TXID>:<VOUT>`
+  benchmarks this machine's SHA256d rate and prints the expected attempts
+  and an ETA. It keeps them apart on purpose: the hash rate is MEASURED,
+  the attempt counts are EXACT (`2**96 / target`), and every ETA is
+  PROJECTED — the aggregate rate assumes linear scaling across workers,
+  which is not measured. Add `--json` for the same split machine-readably.
+
+  ```bash
+  pyrxd glyph dmint-estimate --difficulty 1        # offline, no wallet needed
+  ```
+
+- **Read the ETA as a distribution, not a countdown.** Mining is
+  memoryless: hashes already spent do not shorten what remains. That is
+  why the output is a mean plus p50/p90/p99, and why the live progress
+  during a claim does not tick down.
+
+- **It uses the bundled parallel miner by default**, across your CPU
+  cores, with live hash rate + remaining-time quantiles on **stderr**
+  (`--no-progress` to silence, `--workers N` to change the pool). Point
+  `--miner-cmd "/path/to/glyph-miner …"` at a GPU miner for seconds
+  instead of minutes — external miners report no live progress, because
+  the JSON-over-stdio protocol carries no progress frames.
+  `--miner-cmd in-process` forces the slow single-threaded miner.
+
+- **V1's nonce is only 4 bytes**, so any single sweep has roughly a 39%
   chance of containing a valid nonce. `claim-dmint` handles this the way
   real miners do — it **rerolls** an internal field and re-mines on
-  exhaustion (up to `--max-rerolls`). If a sweep is too short, raise
-  `--timeout`.
+  exhaustion (up to `--max-rerolls`). Rerolling does not change the
+  estimate: the total attempts you need are the same whether they are
+  spent in one sweep or ten. `--timeout` caps each individual grind.
+
 - The signed mint hex is echoed to **stderr** before broadcast, so a
   dropped connection is recoverable (re-broadcast the hex).
 

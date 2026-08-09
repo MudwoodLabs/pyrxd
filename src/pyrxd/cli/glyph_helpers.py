@@ -9,7 +9,10 @@ imported by ``glyph_cmds``:
 * the pre-broadcast confirmation summary (``_BroadcastSummary``,
   ``_confirm_or_abort``, ``_metadata_summary``),
 * the Glyph reveal unlock-script builder (``_build_glyph_unlock``),
-* Glyph ref parsing (``_parse_ref``, ``_try_extract_ft_ref``).
+* Glyph ref parsing (``_parse_ref``, ``_try_extract_ft_ref``),
+* live dMint contract lookup (``_fetch_dmint_contract``) — shared by
+  ``glyph_cmds`` (claim) and ``glyph_estimate`` (estimate), which is why it
+  sits here rather than in either of them.
 
 These are glyph-specific; the shared ``_load_wallet`` lives in
 :mod:`pyrxd.cli.prompts` (it is used by query commands too).
@@ -32,7 +35,9 @@ from .errors import UserError
 from .prompts import confirm_action
 
 if TYPE_CHECKING:
+    from ..glyph.dmint import DmintContractUtxo
     from ..keys import PrivateKey
+    from ..network.electrumx import ElectrumXClient
 
 
 # ---------------------------------------------------------------------------
@@ -278,3 +283,32 @@ def _try_extract_ft_ref(script: bytes) -> GlyphRef | None:
         return extract_ref_from_ft_script(script)
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Live dMint contract lookup
+# ---------------------------------------------------------------------------
+
+
+async def _fetch_dmint_contract(client: ElectrumXClient, txid: str, vout: int) -> DmintContractUtxo:
+    """Fetch a dMint contract UTXO and parse its on-chain state.
+
+    Shared by ``glyph claim-dmint`` and ``glyph dmint-estimate`` — both need
+    the same "read the live contract's target" step, and a second copy would
+    be a place for the two to disagree about what counts as a dMint output.
+    """
+    from ..glyph.dmint import DmintContractUtxo, DmintState
+    from ..security.types import Txid as _Txid
+    from ..transaction.transaction import Transaction
+
+    tx_bytes = await client.get_transaction(_Txid(txid))
+    tx = Transaction.from_hex(bytes(tx_bytes))
+    if tx is None or vout >= len(tx.outputs):
+        raise UserError(f"contract output {txid}:{vout} not found in the fetched tx")
+    out = tx.outputs[vout]
+    script = out.locking_script.serialize()
+    try:
+        state = DmintState.from_script(script)
+    except ValidationError as exc:
+        raise UserError(f"{txid}:{vout} is not a dMint contract", cause=str(exc)) from exc
+    return DmintContractUtxo(txid=txid, vout=vout, value=out.satoshis, script=script, state=state)

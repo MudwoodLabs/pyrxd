@@ -55,10 +55,11 @@ optional.
   transaction fee (≈10,000 photons at default rate) plus standard
   dust headroom. Funding a wallet is out of scope for this page.
 - **A miner — bundled by default.** As of 0.8.0 pyrxd ships a
-  pure-Python *parallel* miner as `pyrxd.contrib.miner`, and it is the
-  default `--miner-cmd` for `glyph claim-dmint`. It uses
+  pure-Python *parallel* miner as `pyrxd.contrib.miner`, and it is what
+  `glyph claim-dmint` runs when `--miner-cmd` is unset. It uses
   `multiprocessing` to sweep the V1 4-byte nonce space across all cores,
-  so no external binary is required. Supplying your own miner is
+  so no external binary is required, and it streams live hash rate and
+  remaining-time quantiles to stderr while it grinds. Supplying your own miner is
   **optional**: point the `EXTERNAL_MINER` env var (or `--miner-cmd`) at
   a faster/GPU miner — e.g. the standalone
   [`glyph-miner`](https://github.com/RadiantBlockchain-Community/glyph-miner)
@@ -210,11 +211,13 @@ re-verification cannot detect.
 If `EXTERNAL_MINER` is unset, `glyph claim-dmint` uses the bundled
 parallel miner (`pyrxd.contrib.miner`) by default, which uses
 `multiprocessing` to sweep the V1 4-byte nonce space across all cores
-(~2-3 minutes on a 32-core machine). The old single-threaded
-`mine_solution` is still available as a library call but is no longer
-the default path; expect 70+ minutes single-core at GLYPH's target if
-you call it directly. An external/GPU miner via `EXTERNAL_MINER` is the
-only reason to configure anything in this step.
+(~2-3 minutes on the 32-core machine this was measured on — check yours
+with `pyrxd glyph dmint-estimate`). It runs inside the CLI process, so it
+can report live hash rate and ETA; an external `--miner-cmd` cannot,
+because the JSON-over-stdio protocol carries no progress frames. The old
+single-threaded `mine_solution` is still available as a library call but
+is not the default path. An external/GPU miner via `EXTERNAL_MINER` is
+the only reason to configure anything in this step.
 
 ---
 

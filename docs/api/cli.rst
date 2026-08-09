@@ -18,6 +18,8 @@ Glyph tokens
 - ``pyrxd glyph mint-nft`` / ``transfer-nft`` — mint and transfer a Glyph NFT.
 - ``pyrxd glyph deploy-ft`` / ``transfer-ft`` — deploy (premine) and transfer a Glyph FT.
 - ``pyrxd glyph deploy-dmint`` / ``claim-dmint`` — deploy a dMint contract and mine/claim from one.
+- ``pyrxd glyph dmint-estimate`` — benchmark this machine's SHA256d rate and estimate
+  time-to-mint (MEASURED rate, EXACT attempt distribution, PROJECTED ETA — kept apart).
 - ``pyrxd glyph list`` — list the Glyph tokens a wallet holds.
 
 Cross-chain swaps

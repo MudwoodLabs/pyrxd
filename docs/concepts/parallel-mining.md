@@ -11,10 +11,20 @@ at `pyrxd.contrib.miner` so callers don't have to provide their own.
 ### `mine_solution` — slow but correct
 
 In-process, single-threaded. Calls `verify_sha256d_solution` per
-attempt — same code path the on-chain covenant ultimately mirrors. At
-~1 Mh/s on modern x86, a full V1 nonce-space sweep (2^32 attempts)
-takes ~70 minutes. Useful for tests, dev, and "I want to mine overnight
-without external tooling." Not viable for production mining.
+attempt — same code path the on-chain covenant ultimately mirrors.
+Useful for tests, dev, and "I want to mine overnight without external
+tooling." Not viable for production mining.
+
+How long a sweep takes depends on the machine, so pyrxd measures rather
+than assumes: run
+
+```bash
+pyrxd glyph dmint-estimate --difficulty 1 --workers 1
+```
+
+to get *your* single-core rate (MEASURED) alongside the attempt
+distribution (EXACT) and the resulting ETA (PROJECTED). See
+[Estimating time-to-mint](#estimating-time-to-mint) below.
 
 ### `mine_solution_external` — fast via subprocess
 
@@ -98,6 +108,9 @@ result = mine_solution_external(
 
 ### Performance
 
+Numbers below are from one dated run on one machine. They are a data
+point, not a spec — benchmark your own with `pyrxd glyph dmint-estimate`.
+
 Measured against the canonical pyrxd PXD mint at txid
 `c9fdcd3488f3e396bec3ce0b766bb8070963e7e75bb513b8820b6663e469e530`
 (2026-05-11), on a 32-core i9-14900K:
@@ -111,6 +124,82 @@ Measured against the canonical pyrxd PXD mint at txid
 
 On a 4-core CI VM, a full sweep takes ~20 minutes. Still acceptable
 for "deploy + first mints" workloads.
+
+Note what those two lines already show: 28 Mh/s across 32 cores is
+~875 Kh/s per core, not 32 × the single-core figure. Cross-core scaling
+is sublinear, and pyrxd does not measure it — which is why every
+aggregate rate the estimator prints is labelled PROJECTED.
+
+## Estimating time-to-mint
+
+`pyrxd glyph dmint-estimate` benchmarks this machine and turns a target
+into an expected grind. It keeps three kinds of number apart, and so
+should you:
+
+- **MEASURED** — the single-core SHA256d rate, benchmarked on the same
+  hash chain the workers run.
+- **EXACT** — the hit probability and attempt counts. Closed form.
+- **PROJECTED** — every ETA, plus the `single-core × workers` aggregate
+  rate they divide by.
+
+```bash
+pyrxd glyph dmint-estimate --difficulty 1            # offline
+pyrxd glyph dmint-estimate --contract <TXID>:<VOUT>  # against a live contract
+pyrxd glyph dmint-estimate --difficulty 1 --json     # separate top-level keys
+```
+
+The same numbers stream to stderr while `pyrxd glyph claim-dmint` is
+mining (`--no-progress` to silence), reporting the *observed* aggregate
+rate — measured, not projected — and the remaining-time distribution.
+
+### The arithmetic, and one formula to avoid
+
+A digest is a hit iff its top 96 bits, read big-endian, are below the
+target (the verifier's "four zero bytes plus an 8-byte value under the
+target" is exactly that condition, because the target is always under
+`2**64`). SHA-256 is uniform, so:
+
+```text
+p           = target / 2**96
+E[attempts] = 2**96 / target
+```
+
+**`MAX_SHA256D_TARGET / target` is the difficulty multiplier, not an
+attempt count.** It is low by a factor of ~`2**33`: at difficulty 1 it
+says one expected attempt, where the true mean is ~8.59 billion. The
+cross-check is the V1 reroll behaviour pyrxd already relies on — at
+difficulty 1 a full 2^32 nonce sweep hits with probability
+`1 - (1-p)**(2**32) ≈ 39%`, which is why V1 rerolls its OP_RETURN.
+
+Because the process is geometric it is **memoryless**: attempts already
+spent do not shorten what remains. That is why pyrxd reports a mean plus
+p50/p90/p99 quantiles and never a countdown, and why the V1 reroll loop
+does not perturb the estimate — chopping an i.i.d. hash stream into
+2^32-nonce pieces leaves the total-attempts distribution unchanged.
+
+### Live progress from your own code
+
+`mine()` takes an optional `progress` callback. It is called with
+`(attempts, elapsed_s)` from inside the worker-cleanup context, so an
+exception raised in it (the supported way to impose a deadline) still
+reaps every worker:
+
+```python
+from pyrxd.contrib.miner.parallel import MineParams, mine
+from pyrxd.glyph.dmint import estimate_attempts, live_stats
+
+est = estimate_attempts(target)
+
+def on_progress(attempts: int, elapsed_s: float) -> None:
+    s = live_stats(attempts, elapsed_s, est)
+    print(f"{s.observed_hashes_per_second:,.0f} h/s, mean {s.remaining_mean_s:,.0f}s remaining")
+
+result = mine(MineParams(...), progress=on_progress)
+```
+
+`pyrxd.glyph.dmint.mine_solution` accepts the same `progress` hook. The
+external-miner path does **not**: the JSON-over-stdio protocol carries
+no progress frames, and extending it is a follow-up.
 
 ### Why pure-Python and not C / GPU
 

@@ -332,7 +332,7 @@ class TestProtocolValidation:
 import pytest
 
 from pyrxd.cli.errors import UserError
-from pyrxd.cli.glyph_cmds import _mine_claim_with_rerolls, _resolve_miner_argv
+from pyrxd.cli.glyph_cmds import _mine_claim_with_rerolls, _resolve_miner_choice
 from pyrxd.glyph.dmint import (
     DmintAlgo,
     DmintContractUtxo,
@@ -458,12 +458,65 @@ def _dmint_funding() -> DmintMinerFundingUtxo:
 
 
 class TestDmintCliHelpers:
-    def test_resolve_miner_argv(self) -> None:
+    def test_resolve_miner_choice(self) -> None:
+        # The default is now the bundled parallel miner run IN THIS PROCESS
+        # (it used to be the same miner spawned as a subprocess): identical
+        # workers, hashing and full nonce-space sweep, but the parent can read
+        # the shared attempts counter and stream live hash rate + ETA.
+        assert _resolve_miner_choice(None) == ("parallel", None)
+        assert _resolve_miner_choice("in-process") == ("sequential", None)
+        assert _resolve_miner_choice("glyph-miner --stdin") == ("external", ["glyph-miner", "--stdin"])
+
+    def test_bundled_miner_is_still_reachable_over_the_wire_protocol(self) -> None:
+        """Subprocess isolation stays available — it is just no longer the default."""
         import sys
 
-        assert _resolve_miner_argv(None) == [sys.executable, "-m", "pyrxd.contrib.miner"]
-        assert _resolve_miner_argv("in-process") is None
-        assert _resolve_miner_argv("glyph-miner --stdin") == ["glyph-miner", "--stdin"]
+        kind, argv = _resolve_miner_choice(f"{sys.executable} -m pyrxd.contrib.miner")
+        assert kind == "external"
+        assert argv == [sys.executable, "-m", "pyrxd.contrib.miner"]
+
+    def test_bundled_parallel_returns_the_winning_nonce(self, monkeypatch) -> None:
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.contrib.miner import parallel
+        from pyrxd.contrib.miner.protocol import MineSuccess
+
+        seen: dict = {}
+
+        def fake_mine(params, *, progress=None, **kwargs):
+            seen["params"] = params
+            seen["progress"] = progress
+            return MineSuccess(nonce=b"\x01\x02\x03\x04", attempts=99, elapsed_s=1.0)
+
+        monkeypatch.setattr(parallel, "mine", fake_mine)
+        nonce = glyph_cmds._mine_bundled_parallel(
+            b"\xab" * 64, 1234, nonce_width=4, workers=3, progress=lambda a, e: None
+        )
+        assert nonce == b"\x01\x02\x03\x04"
+        assert seen["params"].n_workers == 3
+        assert seen["params"].nonce_max == 2**32, "must sweep the whole V1 nonce space"
+        assert seen["progress"] is not None, "the progress hook must reach the miner"
+
+    def test_bundled_parallel_exhaustion_raises_max_attempts(self, monkeypatch) -> None:
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.contrib.miner import parallel
+        from pyrxd.contrib.miner.protocol import MineExhausted
+
+        monkeypatch.setattr(parallel, "mine", lambda *a, **k: MineExhausted())
+        with pytest.raises(MaxAttemptsError, match="without a solution"):
+            glyph_cmds._mine_bundled_parallel(b"\xab" * 64, 1, nonce_width=8, workers=1, progress=None)
+
+    def test_bundled_parallel_worker_failure_becomes_a_user_error(self, monkeypatch) -> None:
+        """A worker that never ran is a setup problem, not "no solution"."""
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.contrib.miner import parallel
+
+        def boom(*_a, **_k):
+            raise RuntimeError("worker(s) exited abnormally")
+
+        monkeypatch.setattr(parallel, "mine", boom)
+        with pytest.raises(UserError, match="could not run its workers") as exc:
+            glyph_cmds._mine_bundled_parallel(b"\xab" * 64, 1, nonce_width=4, workers=2, progress=None)
+        assert "in-process" in (exc.value.fix or "")
 
     def test_mine_rerolls_until_hit(self) -> None:
         # V1's 4-byte nonce space often has no solution per preimage; the loop

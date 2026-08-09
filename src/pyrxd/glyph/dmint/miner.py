@@ -7,9 +7,10 @@ result dataclasses (``PowPreimageResult``, ``DmintMineResult``) and
 timeout constants (``DEFAULT_MAX_ATTEMPTS``, ``EXTERNAL_MINER_TIMEOUT_S``).
 Depends on ``.types``, ``.builders``, ``.chain``.
 
-Symbols (19):
+Symbols (22):
     PowPreimageResult, build_pow_preimage,
     build_mint_scriptsig,
+    ProgressCallback, DEFAULT_PROGRESS_INTERVAL_S, _PROGRESS_CHECK_MASK,
     compute_next_target_asert, compute_next_target_linear,
     difficulty_to_target, target_to_difficulty,
     verify_sha256d_solution,
@@ -26,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -60,6 +62,14 @@ from .types import (
     DmintAlgo,
     DmintMintResult,
 )
+
+#: Live-progress hook: ``callback(attempts, elapsed_s)``. Deliberately two
+#: plain scalars rather than a dataclass — ``pyrxd.contrib.miner.parallel``
+#: implements the same shape and must stay importable without pulling in
+#: ``pyrxd.glyph.dmint`` (its workers re-import the module on every spawn).
+#: Feed the pair to :func:`~pyrxd.glyph.dmint.live_stats` to turn it into an
+#: observed rate plus remaining-time quantiles.
+ProgressCallback = Callable[[int, float], None]
 
 # ---------------------------------------------------------------------------
 # PoW preimage (same structure as V1 — §2.5 / Appendix B)
@@ -440,11 +450,29 @@ def verify_sha256d_solution(
 # dmint-v1-classifier-gap.md). The performance cost of one extra Python
 # call per attempt is negligible compared to the SHA-256d itself.
 
-# Default: ≈minutes single-core at the SHA256d rate of ~1-2M h/s observed on
-# modern x86. A naive `mine_solution()` call against a real-mainnet target
-# would otherwise wedge for hours; callers who want unbounded mining can
-# raise this explicitly.
+# A fail-fast cap, NOT a "should succeed" budget. Deliberately stated in
+# attempts rather than wall-clock: pyrxd does not know this machine's hash
+# rate, and asserting one would be a guess. Measure it instead —
+# `pyrxd glyph dmint-estimate`, or `benchmark_sha256d()` from
+# `pyrxd.glyph.dmint` — and divide.
+#
+# What IS exactly known is the attempt distribution (see .estimate): at
+# difficulty 1 the mean is 2**96 / (2**63 - 1) = 2**33 ≈ 8.59e9 attempts, so
+# this cap covers ~7.0% of the mean and hits with probability
+# 1 - (1 - p)**600e6 ≈ 6.7%. It exists so a naive `mine_solution()` against a
+# real-mainnet target raises instead of wedging; callers who want unbounded
+# mining raise it explicitly.
 DEFAULT_MAX_ATTEMPTS = 600_000_000
+
+# Attempts between progress-callback checks in `mine_solution`, as a bitmask
+# (one AND, no modulo). 65536 matches the shared-state poll cadence in
+# `pyrxd.contrib.miner.parallel._worker` so both miners report at the same
+# granularity.
+_PROGRESS_CHECK_MASK = 0xFFFF
+
+#: Default seconds between progress callbacks. Callers that render to a
+#: terminal usually want to rate-limit further inside their own callback.
+DEFAULT_PROGRESS_INTERVAL_S = 0.5
 
 
 @dataclass(frozen=True)
@@ -468,6 +496,8 @@ def mine_solution(
     algo: DmintAlgo = DmintAlgo.SHA256D,
     nonce_width: Literal[4, 8] = 4,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    progress: ProgressCallback | None = None,
+    progress_interval_s: float = DEFAULT_PROGRESS_INTERVAL_S,
 ) -> DmintMineResult:
     """Search for a nonce satisfying the V1/V2 dMint PoW target.
 
@@ -488,25 +518,49 @@ def mine_solution(
                          so a stray positional value is a type error rather than
                          a silent V1/V2 confusion.
     :param max_attempts: Upper bound on iterations before raising
-                         :class:`MaxAttemptsError`. Defaults to ≈minutes
-                         single-core at typical CPython hashlib speeds.
+                         :class:`MaxAttemptsError`. See
+                         :data:`DEFAULT_MAX_ATTEMPTS` — it is a fail-fast cap
+                         in attempts, not a wall-clock budget.
+    :param progress:     Optional ``callback(attempts, elapsed_s)`` invoked
+                         roughly every ``progress_interval_s`` while grinding.
+                         Feed the pair to
+                         :func:`~pyrxd.glyph.dmint.live_stats` for an observed
+                         rate + remaining-time quantiles. Exceptions raised by
+                         the callback propagate to the caller — which is a
+                         supported way to impose a deadline on the grind.
+    :param progress_interval_s: Minimum seconds between callbacks. Checked at
+                         a 65536-attempt granularity, so a very slow machine
+                         may report less often than requested.
     :raises ValidationError:   ``preimage`` is not 64 bytes, ``target`` is not positive,
-                               ``nonce_width`` is not 4 or 8, or ``max_attempts`` is < 1.
+                               ``nonce_width`` is not 4 or 8, ``max_attempts`` is < 1,
+                               or ``progress_interval_s`` is not positive.
     :raises NotImplementedError: ``algo`` is BLAKE3 or K12.
     :raises MaxAttemptsError:  No solution found within ``max_attempts`` iterations.
                                The exception's ``attempts`` and ``elapsed_s``
                                attributes carry telemetry.
 
-    Worked example (small target chosen so the loop completes in ms)::
+    .. note::
+       **There is no "easy" target for this loop.** The verifier requires
+       four leading zero bytes, so the mean is ``2**96 / target`` and floors
+       at ``2**33 ≈ 8.6e9`` attempts even at difficulty 1 — lowering the
+       difficulty cannot bring a run under that. (An earlier version of this
+       docstring claimed a shifted target gave "~1 in 256 expected"; it
+       confused the difficulty multiplier for an attempt count, and no such
+       example completes in milliseconds.) Size a run with
+       :func:`~pyrxd.glyph.dmint.estimate_attempts` before starting it, and
+       use :func:`~pyrxd.glyph.dmint.benchmark_sha256d` (or
+       ``pyrxd glyph dmint-estimate``) to turn that into wall clock.
 
-        >>> from pyrxd.glyph.dmint import (
-        ...     mine_solution, verify_sha256d_solution, MAX_SHA256D_TARGET,
-        ... )
-        >>> preimage = b"\\x00" * 64
-        >>> target = MAX_SHA256D_TARGET >> 8  # easy: ~1 in 256 expected
-        >>> result = mine_solution(preimage, target, nonce_width=4)
-        >>> verify_sha256d_solution(preimage, result.nonce, target, nonce_width=4)
-        True
+    Usage::
+
+        from pyrxd.glyph.dmint import estimate_attempts, mine_solution
+
+        est = estimate_attempts(target)          # EXACT: mean + quantiles
+        result = mine_solution(
+            preimage, target, nonce_width=4,
+            max_attempts=est.quantile_attempts[-1][1],   # e.g. the p99 budget
+            progress=lambda attempts, elapsed: ...,      # live rate + ETA
+        )
     """
     if len(preimage) != 64:
         raise ValidationError(f"preimage must be 64 bytes, got {len(preimage)}")
@@ -516,10 +570,13 @@ def mine_solution(
         raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
     if max_attempts < 1:
         raise ValidationError(f"max_attempts must be >= 1, got {max_attempts}")
+    if progress_interval_s <= 0:
+        raise ValidationError(f"progress_interval_s must be positive, got {progress_interval_s}")
     if algo != DmintAlgo.SHA256D:
         raise NotImplementedError(f"mine_solution: algo {algo.name} not implemented in M1; only SHA256D ships")
 
     started = time.monotonic()
+    next_progress = started + progress_interval_s
     for n in range(max_attempts):
         nonce = n.to_bytes(nonce_width, "little")
         if verify_sha256d_solution(preimage, nonce, target, nonce_width=nonce_width):
@@ -528,6 +585,13 @@ def mine_solution(
                 attempts=n + 1,
                 elapsed_s=time.monotonic() - started,
             )
+        # Mask first: 65535 of every 65536 iterations stop at one AND, so the
+        # no-callback case costs a bitmask per attempt against a full SHA256d.
+        if (n & _PROGRESS_CHECK_MASK) == 0 and progress is not None:
+            now = time.monotonic()
+            if now >= next_progress:
+                next_progress = now + progress_interval_s
+                progress(n + 1, now - started)
 
     elapsed = time.monotonic() - started
     raise MaxAttemptsError(
@@ -776,6 +840,8 @@ def mine_solution_dispatch(
     miner_argv: list[str] | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
     timeout_s: float = EXTERNAL_MINER_TIMEOUT_S,
+    progress: ProgressCallback | None = None,
+    progress_interval_s: float = DEFAULT_PROGRESS_INTERVAL_S,
 ) -> DmintMineResult:
     """Mine a nonce — picks the in-process or subprocess miner from one entrypoint.
 
@@ -820,6 +886,13 @@ def mine_solution_dispatch(
                          caps via ``timeout_s`` instead).
     :param timeout_s:    Subprocess timeout on the external-miner path.
                          Ignored in-process (use ``max_attempts`` there).
+    :param progress:     Live-progress hook, in-process path only. The
+                         external-miner wire protocol carries no progress
+                         frames and is **not** being extended here, so an
+                         external miner reports nothing until it finishes —
+                         streaming progress from a third-party binary is a
+                         follow-up that needs a protocol change.
+    :param progress_interval_s: Minimum seconds between ``progress`` calls.
 
     :returns: :class:`DmintMineResult` with the verified nonce.
     :raises MaxAttemptsError:  in-process exhausted ``max_attempts``,
@@ -836,6 +909,8 @@ def mine_solution_dispatch(
             algo=algo,
             nonce_width=nonce_width,
             max_attempts=max_attempts,
+            progress=progress,
+            progress_interval_s=progress_interval_s,
         )
     return mine_solution_external(
         preimage=preimage,

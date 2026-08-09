@@ -57,11 +57,11 @@ from ..glyph.dmint import (
     DaaMode,
     DmintContractUtxo,
     DmintMinerFundingUtxo,
-    DmintState,
     build_dmint_mint_tx,
     build_dmint_v1_mint_preimage,
     build_dmint_v2_mint_preimage,
     build_mint_scriptsig,
+    estimate_attempts,
     find_dmint_contract_utxos,
     find_dmint_funding_utxo,
     mine_solution_dispatch,
@@ -89,11 +89,13 @@ from ..transaction.transaction_output import TransactionOutput
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
 from .format import emit, emit_table
+from .glyph_estimate import MiningDeadline, _MiningReporter, dmint_estimate_cmd
 from .glyph_helpers import (
     _TEMPLATE_TYPES,
     _BroadcastSummary,
     _build_glyph_unlock,
     _confirm_or_abort,
+    _fetch_dmint_contract,
     _metadata_summary,
     _parse_ref,
     _read_metadata_file,
@@ -1105,6 +1107,13 @@ def list_cmd(ctx: CliContext, kind: str, passphrase: bool) -> None:
 # canonical Click pattern for splitting a group's subcommands across files.
 glyph_group.add_command(inspect_cmd)
 
+# ---------------------------------------------------------------------------
+# dmint-estimate — benchmark this machine, estimate time-to-mint
+# ---------------------------------------------------------------------------
+# Same split: the command, its renderers, and the live-progress reporter that
+# ``claim-dmint`` reuses all live in ``glyph_estimate``.
+glyph_group.add_command(dmint_estimate_cmd)
+
 
 # ---------------------------------------------------------------------------
 # deploy-dmint (V1 dMint contract genesis)
@@ -1483,18 +1492,82 @@ async def _deploy_dmint_inner(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_miner_argv(miner_cmd: str | None) -> list[str] | None:
-    """Resolve --miner-cmd to a mine_solution_dispatch argv (or None for in-process).
+def _resolve_miner_choice(miner_cmd: str | None) -> tuple[str, list[str] | None]:
+    """Resolve --miner-cmd to a ``(kind, argv)`` pair.
 
-    None -> bundled parallel miner (the safe default: the in-process miner's
-    DEFAULT_MAX_ATTEMPTS is < 2**32 and would sweep only part of the nonce space);
-    "in-process" -> in-process miner; anything else -> shlex.split(...).
+    * ``None`` (default) -> ``("parallel", None)``: the bundled parallel miner,
+      run **in this process** via ``pyrxd.contrib.miner.parallel.mine``. Same
+      workers, same hashing, same full nonce-space sweep as before; what
+      changes is that the parent can now read the shared attempts counter and
+      stream live hash rate + ETA. Spawned workers get only the pickled search
+      arguments (``spawn``, not ``fork``), so no wallet key material reaches
+      them.
+    * ``"in-process"`` -> ``("sequential", None)``: the slow single-threaded
+      reference miner. Retained because it is the only miner with no
+      multiprocessing at all.
+    * anything else -> ``("external", shlex.split(...))``: a user-supplied
+      binary over the JSON-over-stdio protocol. No live progress — the wire
+      protocol carries no progress frames and is not being extended here.
+      ``--miner-cmd "python -m pyrxd.contrib.miner"`` still reaches the
+      bundled miner over that protocol if subprocess isolation is wanted.
+
+    Before this, ``None`` meant "spawn the bundled miner as a subprocess". The
+    reason for that default was nonce-space coverage (the sequential miner's
+    ``DEFAULT_MAX_ATTEMPTS`` is < 2**32 and would sweep only part of the V1
+    space) — which the in-process parallel miner satisfies identically.
     """
     if miner_cmd is None:
-        return [sys.executable, "-m", "pyrxd.contrib.miner"]
+        return "parallel", None
     if miner_cmd == "in-process":
-        return None
-    return shlex.split(miner_cmd)
+        return "sequential", None
+    return "external", shlex.split(miner_cmd)
+
+
+def _mine_bundled_parallel(
+    preimage: bytes,
+    target: int,
+    *,
+    nonce_width: int,
+    workers: int,
+    progress: Callable[[int, float], None] | None,
+) -> bytes:
+    """Run the bundled parallel miner in this process and return the nonce.
+
+    Imported lazily: ``pyrxd.glyph.dmint`` deliberately does not depend on
+    ``pyrxd.contrib``, so the bridge between the two lives at the CLI edge.
+
+    Sweeps the whole nonce space (``2**(8*nonce_width)``); exhaustion becomes
+    :class:`MaxAttemptsError`, which is what the V1 reroll loop expects, and
+    matches what the external miner's exit-code-2 path already raises.
+    """
+    from ..contrib.miner.parallel import MineParams, mine
+    from ..contrib.miner.protocol import MineSuccess
+
+    nonce_max = 2 ** (nonce_width * 8)
+    try:
+        result = mine(
+            MineParams(
+                preimage=preimage,
+                target=target,
+                nonce_width=nonce_width,
+                n_workers=workers,
+                nonce_max=nonce_max,
+            ),
+            progress=progress,
+        )
+    except RuntimeError as exc:  # workers died before finishing their slices
+        raise UserError(
+            "the bundled parallel miner could not run its workers",
+            cause=str(exc),
+            fix="retry with --miner-cmd 'in-process' (single-threaded, no worker processes), or point --miner-cmd at an external miner",
+        ) from exc
+    if not isinstance(result, MineSuccess):
+        raise MaxAttemptsError(
+            f"the bundled parallel miner swept the {nonce_width}-byte nonce space without a solution",
+            attempts=nonce_max,
+            elapsed_s=0.0,
+        )
+    return result.nonce
 
 
 def _mine_claim_with_rerolls(
@@ -1603,7 +1676,7 @@ def _mine_claim_v2(
 @click.option(
     "--miner-cmd",
     default=None,
-    help="External miner argv (shlex). Default: bundled 'python -m pyrxd.contrib.miner'. 'in-process' forces the slow in-process miner.",
+    help="External miner argv (shlex). Default: the bundled parallel miner, in-process with live progress. 'in-process' forces the slow single-threaded miner.",
 )
 @click.option(
     "--timeout",
@@ -1611,7 +1684,19 @@ def _mine_claim_v2(
     type=float,
     default=600.0,
     show_default=True,
-    help="External-miner subprocess timeout (s).",
+    help="Wall-clock cap on one mining grind (s). Applies to every miner; on nonce exhaustion or timeout, V1 rerolls the OP_RETURN and starts a fresh grind.",
+)
+@click.option(
+    "--workers",
+    type=int,
+    default=None,
+    help="Parallel miner worker count [default: one per logical CPU].",
+)
+@click.option(
+    "--progress/--no-progress",
+    default=True,
+    show_default=True,
+    help="Stream live hash rate + remaining-time quantiles to stderr while mining (stdout stays clean).",
 )
 @click.option("--max-attempts", type=int, default=None, help="In-process nonce cap (default: the library default).")
 @click.option(
@@ -1654,6 +1739,8 @@ def claim_dmint_cmd(
     op_return: str,
     miner_cmd: str | None,
     timeout_s: float,
+    workers: int | None,
+    progress: bool,
     max_attempts: int | None,
     max_rerolls: int,
     reward_address: str | None,
@@ -1670,10 +1757,18 @@ def claim_dmint_cmd(
     fund the mint from this wallet, mine a nonce (rerolling the OP_RETURN on
     exhaustion, the way real miners do), and broadcast. The FT reward + change
     go to ``--reward-address`` (default: the wallet's largest-UTXO address).
+
+    While mining, live hash rate and remaining-time quantiles stream to stderr
+    (``--no-progress`` to silence). The remaining-time figures are a memoryless
+    distribution, not a countdown: hashes already spent do not shorten what is
+    left. Run ``pyrxd glyph dmint-estimate`` first for the same numbers before
+    committing to the grind.
     """
     if (contract is None) == (token_ref is None):
         raise UserError("pass exactly one of --contract TXID:VOUT or --token-ref TXID:0")
-    miner_argv = _resolve_miner_argv(miner_cmd)
+    miner_kind, miner_argv = _resolve_miner_choice(miner_cmd)
+    if workers is not None and workers < 1:
+        raise UserError(f"--workers must be >= 1, got {workers}")
     op_return_base = op_return.encode("utf-8")
 
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
@@ -1712,15 +1807,53 @@ def claim_dmint_cmd(
     is_v2 = not contract_utxo.state.is_v1
     nonce_width = 8 if is_v2 else 4
 
+    if miner_kind == "parallel":
+        from ..contrib.miner.parallel import default_n_workers
+
+        n_workers = default_n_workers() if workers is None else workers
+    else:
+        n_workers = workers or 1
+    if miner_kind == "external" and progress:
+        click.echo(
+            "note: no live progress for an external --miner-cmd — the JSON-over-stdio protocol "
+            "carries no progress frames, and extending it is a follow-up. Run "
+            "'pyrxd glyph dmint-estimate' for the up-front numbers.",
+            err=True,
+        )
+
     def _mine(preimage: bytes, target: int) -> bytes:
-        return mine_solution_dispatch(
-            preimage=preimage,
-            target=target,
-            nonce_width=nonce_width,
-            miner_argv=miner_argv,
-            max_attempts=max_attempts if max_attempts is not None else DEFAULT_MAX_ATTEMPTS,
-            timeout_s=timeout_s,
-        ).nonce
+        # One reporter per grind, so each V1 reroll gets a fresh --timeout
+        # budget — the same per-invocation semantics the external miner's
+        # subprocess timeout has always had.
+        reporter = _MiningReporter(
+            estimate_attempts(target),
+            enabled=progress and ctx.output_mode != "quiet",
+            deadline_s=None if miner_kind == "external" else timeout_s,
+        )
+        try:
+            if miner_kind == "parallel":
+                return _mine_bundled_parallel(
+                    preimage,
+                    target,
+                    nonce_width=nonce_width,
+                    workers=n_workers,
+                    progress=reporter,
+                )
+            return mine_solution_dispatch(
+                preimage=preimage,
+                target=target,
+                nonce_width=nonce_width,
+                miner_argv=miner_argv,
+                max_attempts=max_attempts if max_attempts is not None else DEFAULT_MAX_ATTEMPTS,
+                timeout_s=timeout_s,
+                progress=reporter if miner_kind == "sequential" else None,
+            ).nonce
+        except MiningDeadline as exc:
+            # Same signal an external miner's timeout raises, so the V1 reroll
+            # loop upstream does not need to know which miner ran.
+            raise MaxAttemptsError(str(exc), attempts=0, elapsed_s=timeout_s) from exc
+        finally:
+            reporter.finish()
 
     try:
         if is_v2:
@@ -1824,20 +1957,6 @@ async def _claim_prepare(
             fix=f"fund {miner_address} with >= {needed:,} photons of plain RXD, or pass --reward-address",
         ) from exc
     return contract_utxo, funding, miner_key, miner_pkh
-
-
-async def _fetch_dmint_contract(client: ElectrumXClient, txid: str, vout: int) -> DmintContractUtxo:
-    tx_bytes = await client.get_transaction(Txid(txid))
-    tx = Transaction.from_hex(bytes(tx_bytes))
-    if tx is None or vout >= len(tx.outputs):
-        raise UserError(f"contract output {txid}:{vout} not found in the fetched tx")
-    out = tx.outputs[vout]
-    script = out.locking_script.serialize()
-    try:
-        state = DmintState.from_script(script)
-    except ValidationError as exc:
-        raise UserError(f"{txid}:{vout} is not a dMint contract", cause=str(exc)) from exc
-    return DmintContractUtxo(txid=txid, vout=vout, value=out.satoshis, script=script, state=state)
 
 
 async def _select_miner_identity(
