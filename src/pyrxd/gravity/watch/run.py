@@ -566,7 +566,11 @@ async def _amain(argv=None) -> int:
         # Reconciler.alerter exists precisely for this (see its docstring).
         alerter = reconciler.alerter
         unacked = getattr(alerter, "unacked_critical_count", None)
-        heartbeat = default_heartbeat(logger)
+        # The LOG heartbeat needs the same count: `default_heartbeat` raises its tick line to ERROR
+        # when un-ACK'd CRITICALs are outstanding, and without the source wired it defaulted to the
+        # "not wired" -1 forever — so that escalation never fired and the log line reported -1 while
+        # the FILE heartbeat carried the real count.
+        heartbeat = default_heartbeat(logger, unacked_critical=unacked)
         if args.heartbeat_file:
             heartbeat = combine_heartbeats(heartbeat, FileHeartbeat(args.heartbeat_file, unacked_critical=unacked))
         # Drain the operator ACK inbox once per tick, before the reconciler decides. An ACK is

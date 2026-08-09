@@ -15,9 +15,10 @@ passing unit tests while the composed behavior was broken.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
-from pyrxd.gravity.watch import DedupAlerter, FileAckInbox, FileHeartbeat
+from pyrxd.gravity.watch import DedupAlerter, FileAckInbox, FileHeartbeat, default_heartbeat
 from pyrxd.gravity.watch.decide import Decision, Intent
 from pyrxd.gravity.watch.reconciler import ReconcileResult
 
@@ -84,3 +85,23 @@ async def test_unwired_heartbeat_omits_the_key(tmp_path: Path) -> None:
     beat(1, _results())
 
     assert "unacked_critical" not in json.loads(hb_path.read_text())
+
+
+async def test_the_log_heartbeat_gets_the_count_too(caplog) -> None:
+    """The LOG side of the same signal was dead.
+
+    ``default_heartbeat`` raises its tick line to ERROR when un-ACK'd CRITICALs are outstanding,
+    but ``run.py`` built it WITHOUT the count source -- so it fell back to the "not wired" -1
+    forever, the ERROR escalation could never fire (-1 is not > 0), and the log line contradicted
+    the file heartbeat sitting next to it.
+    """
+    alerter = DedupAlerter(channel=_CollectingChannel())
+    await alerter.handle("swap-1", Decision(Intent.PAGE_CLAIM, reason="claim race"))
+    beat = default_heartbeat(logging.getLogger("t"), unacked_critical=alerter.unacked_critical_count)
+
+    with caplog.at_level(logging.INFO, logger="t"):
+        beat(1, _results())
+
+    record = caplog.records[-1]
+    assert "unacked_critical=1" in record.getMessage()
+    assert record.levelno == logging.ERROR  # outstanding un-ACK'd CRITICALs must be LOUD

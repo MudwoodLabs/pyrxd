@@ -25,7 +25,14 @@ from pathlib import Path
 from pyrxd.gravity.watch.alerts import Page, Severity
 from pyrxd.security.errors import ValidationError
 
-__all__ = ["DeadManVerdict", "DeadMansSwitch", "FileHeartbeat", "heartbeat_age_s", "run_monitor"]
+__all__ = [
+    "HEARTBEAT_SCHEMA_VERSION",
+    "DeadManVerdict",
+    "DeadMansSwitch",
+    "FileHeartbeat",
+    "heartbeat_age_s",
+    "run_monitor",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +42,21 @@ _WATCHTOWER = "<watchtower>"
 # (fail-closed clock-skew guard) rather than as fresh liveness — red-team LOW.
 _CLOCK_SKEW_TOLERANCE_S = 60.0
 
+#: Wire version of the heartbeat JSON object. A consumer that reads more than ``ts`` (the
+#: escalation monitor reads ``unacked_critical``, whose *meaning* is what a version pins)
+#: must refuse a version it does not know rather than guess at the fields — misreading the
+#: escalation signal is exactly the failure the signal exists to prevent. Bump this on ANY
+#: change to the meaning/units of an existing key; adding a purely additive key does not
+#: need a bump, but removing or re-interpreting one does.
+#:
+#: v1 = ``{schema_version, ts, tick, swaps, paged, squeezed, undelivered, errored,
+#: min_deadline_rxd_height}`` plus ``unacked_critical`` when the count source is wired.
+HEARTBEAT_SCHEMA_VERSION = 1
+
 
 class FileHeartbeat:
-    """A heartbeat sink that atomically writes ``{ts, tick, swaps, paged, squeezed, undelivered,
-    errored, min_deadline_rxd_height, unacked_critical}`` to a file each tick — the cross-process
+    """A heartbeat sink that atomically writes ``{schema_version, ts, tick, swaps, paged, squeezed,
+    undelivered, errored, min_deadline_rxd_height, unacked_critical}`` to a file each tick — the cross-process
     liveness signal the :class:`DeadMansSwitch` watches, plus **leading indicators** so a monitor sees
     trouble building before liveness is lost (not just a healthy-looking beat):
 
@@ -49,7 +67,10 @@ class FileHeartbeat:
       that knows the current RXD height watches the remaining slack shrink toward a squeeze.
     * ``unacked_critical`` (review MEDIUM) — outstanding operator-un-ACK'd CRITICAL claim/squeeze
       situations (from :meth:`DedupAlerter.unacked_critical_count`, injected); a persistent non-zero
-      value means time-critical pages are going unacknowledged, so a monitor can escalate."""
+      value means time-critical pages are going unacknowledged, so a monitor can escalate.
+      :mod:`pyrxd.gravity.watch.escalation` is that monitor. The key is **omitted entirely** when no
+      count source is wired, and is ``-1`` when the wired source raised — neither may be read as
+      "0 = healthy"; see :data:`HEARTBEAT_SCHEMA_VERSION` for the wire contract."""
 
     def __init__(
         self,
@@ -74,6 +95,10 @@ class FileHeartbeat:
         errored = sum(1 for r in results if getattr(r, "error", None) is not None)
         deadlines = [r.decision.deadline_rxd_height for r in results if r.decision.deadline_rxd_height is not None]
         data = {
+            # Additive: `heartbeat_age_s` (and therefore `DeadMansSwitch`) reads only `ts`, so an
+            # older reader is unaffected. A NEW reader that interprets more than `ts` — the
+            # escalation monitor — refuses a version it does not know.
+            "schema_version": HEARTBEAT_SCHEMA_VERSION,
             "ts": self._clock(),
             "tick": iteration,
             "swaps": len(results),

@@ -60,6 +60,7 @@ pyrxd = "pyrxd.cli.main:run"
 pyrxd-miner = "pyrxd.contrib.miner.cli:main"
 pyrxd-watchtower = "pyrxd.gravity.watch.run:main"
 pyrxd-watchtower-deadman = "pyrxd.gravity.watch.deadman:main"
+pyrxd-watchtower-escalate = "pyrxd.gravity.watch.escalation:main"
 pyrxd-presign-refund = "pyrxd.gravity.watch.presign:main"
 
 [tool.poetry]

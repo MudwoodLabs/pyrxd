@@ -9,19 +9,38 @@ take a maintenance window — without defeating its own safety design. For *vuln
 > pre-signed BTC refund and the Radiant claim executor) are **dormant-by-construction and armed-by-
 > exception**; see [the as-is posture decision](../solutions/design-decisions/autonomous-claim-executor-as-is-posture.md).
 
-## The two-process model (read this first)
+## The three-process model (read this first)
 
-The watchtower is **two independent processes** that talk only through a heartbeat file:
+The watchtower is **three independent processes** that talk only through files:
 
-| Process | Script | Role |
+| Process | Console script | Role |
 |---|---|---|
-| Tower | `scripts/watchtower_run.py` | Polls the chains each `--poll-interval-s`, decides per swap, **pages** on a due action, and **writes the heartbeat file** every tick. |
-| Dead-man's-switch | `scripts/watchtower_deadman.py` | Watches that heartbeat file; if it goes stale past `--max-silence-s`, **pages that the tower itself is down**. |
+| Tower | `pyrxd-watchtower` | Polls the chains each `--poll-interval-s`, decides per swap, **pages** on a due action, drains the operator `--ack-inbox`, and **writes the heartbeat file** every tick. |
+| Dead-man's-switch | `pyrxd-watchtower-deadman` | Watches that heartbeat file; if it goes stale past `--max-silence-s`, **pages that the tower itself is down**. Answers *is the tower alive?* |
+| Escalation monitor | `pyrxd-watchtower-escalate` | Reads the heartbeat's `unacked_critical`; if a CRITICAL page stays unacknowledged past `--escalate-after-s`, **pages a different channel**. Answers *is the operator alive?* |
 
-**Footgun #1 — supervise both, independently.** The dead-man's-switch exists to catch a *crashed or
-hung tower*. If you run only the tower, a crash is silent. If a single supervisor unit restarts both
-together, a supervisor failure takes down the watchdog too. Run them as **two separate** supervised
-units (two systemd services, two containers, etc.) so either can outlive the other.
+```
+tower ──writes──▶ heartbeat.json ──▶ dead-man's-switch  ──▶ channel A (tower down)
+                        │
+                        └──────────▶ escalation monitor ──▶ channel B (nobody is answering)
+   operator ──appends──▶ ack-inbox ──▶ tower  (clears unacked_critical)
+```
+
+(The old `python scripts/watchtower_run.py` / `scripts/watchtower_deadman.py` paths still work as
+thin shims over the same code.)
+
+**Footgun #1 — supervise all three, independently.** The dead-man's-switch exists to catch a *crashed
+or hung tower*; the escalation monitor exists to catch a *page nobody is reading*. If you run only the
+tower, a crash is silent. If a single supervisor unit restarts them together, a supervisor failure
+takes down the watchdogs too. Run them as **three separate** supervised units (three systemd services,
+three containers, etc.) so any one can outlive the others. Use `Restart=on-failure`: both monitors
+exit non-zero on a misconfiguration you must see, and are the backstops that must come back.
+
+**Footgun #4 — three channels, or the escalation is theatre.** The escalation monitor **refuses to
+start** if its `--webhook-url` equals the tower's (pass the tower's URL as `--primary-webhook-url` so
+it can check; `--allow-same-channel` overrides for smoke tests). It warns if the two merely share a
+host. If the reason the operator is missing the page is a muted app or a dead receiver, escalating
+into the same app or receiver changes nothing.
 
 ## Prerequisites
 
@@ -34,18 +53,35 @@ units (two systemd services, two containers, etc.) so either can outlive the oth
 ## Running
 
 ```bash
-# 1) the tower (writes a heartbeat each tick)
-python scripts/watchtower_run.py \
+# 1) the tower (writes a heartbeat each tick, drains operator ACKs)
+install -m 600 /dev/null /run/wt/acks
+pyrxd-watchtower \
     --records-dir ~/.pyrxd/watchtower/swaps \
     --rxd-electrumx-url wss://electrumx.radiant4people.com:50022 \
     --poll-interval-s 30 \
-    --heartbeat-file /run/wt/hb.json
+    --heartbeat-file /run/wt/hb.json \
+    --ack-inbox /run/wt/acks \
+    --webhook-url https://primary.pager/endpoint
 
 # 2) the dead-man's-switch (separate unit; pages if the heartbeat goes stale)
-python scripts/watchtower_deadman.py \
+pyrxd-watchtower-deadman \
     --heartbeat-file /run/wt/hb.json \
     --max-silence-s 180 --check-interval-s 60 \
-    --webhook-url https://your.pager/endpoint
+    --webhook-url https://deadman.pager/endpoint
+
+# 3) the escalation monitor (separate unit; pages a DIFFERENT channel when a CRITICAL
+#    page goes unacknowledged for 15 minutes)
+pyrxd-watchtower-escalate \
+    --heartbeat-file /run/wt/hb.json \
+    --escalate-after-s 900 --max-silence-s 180 --check-interval-s 60 \
+    --primary-webhook-url https://primary.pager/endpoint \
+    --webhook-url https://escalation.channel/endpoint
+```
+
+Acknowledging a CRITICAL page is a one-liner — it is what stops the re-paging *and* the escalation:
+
+```bash
+echo <swap_id> >> /run/wt/acks
 ```
 
 ## Timing relationships that must hold
@@ -63,6 +99,14 @@ first two at startup; honor the third when sizing swaps.
 3. **`--max-silence-s` < the tightest in-flight `(deadline − safety_window)`.** A tower that is silent
    for longer than a swap's remaining slack is, for that swap, indistinguishable from down — size your
    swaps' `t_rxd` (and the safety window) so the watchdog can catch a stall in time.
+4. **`--escalate-after-s` well under the tightest in-flight `(deadline − safety_window)`.** The
+   escalation is only useful if it leaves time to *act*. Escalating at minute 14 of a 15-minute claim
+   race is a notification, not a save. Budget it as `remaining_slack − (time to reach a human) −
+   (time to run the one-shot step)`.
+5. **Run the escalation monitor with the SAME `--max-silence-s` as the dead-man's-switch.** That is the
+   boundary at which the escalation monitor stops trusting the count and defers the alarm to the
+   dead-man's-switch. A shorter value makes it go blind while the watchdog still says "alive"; a longer
+   one makes it act on a count from a tower that is already being reported down.
 
 ## Restart & graceful upgrade
 
@@ -78,7 +122,14 @@ Drain procedure:
 3. Re-start the watchdog (if paused). Never leave it paused — that is the one window where a real crash
    is silent.
 4. For an **upgrade**, prepare the new version out-of-band (build the image / install deps first) so the
-   swap of the running process is sub-`max-silence-s`.
+   swap of the running process is sub-`max-silence-s`. Restart the **tower first**, then the escalation
+   monitor: the monitor refuses to start against a heartbeat whose `schema_version` it does not know,
+   and against one written by a tower that is not publishing `unacked_critical` at all.
+
+A restart of the **escalation monitor** is cheap and loses nothing: `first_unacked_ts` and the
+one-shot blind-WARN edge are both on disk, so it neither rewinds the countdown nor re-pages. It does
+**refuse to start** if the heartbeat file is missing entirely (a typo'd path must not read as "quiet"),
+which under `Restart=on-failure` shows up as a visible restart loop with the reason on stderr.
 
 ## Maintenance window
 
@@ -110,6 +161,38 @@ first, confirming a fresh heartbeat, then un-muting the watchdog. The swaps don'
 - The dead-man's-switch posts to `--webhook-url` (optionally HMAC-signed via `--webhook-secret`).
 - A `PAGE_SQUEEZED` / decision-required page means a swap is in a winner-take-all state — act on the
   printed one-shot step immediately; do not wait for the next tick.
+- The heartbeat JSON carries `schema_version` (currently `1`). The escalation monitor refuses a version
+  it does not know, so **upgrade the tower before the monitor**, not the other way round.
+- **What the escalation channel sends, and what each one means:**
+
+  | Page | Meaning | What to do |
+  |---|---|---|
+  | `CRITICAL … UNACKNOWLEDGED for Ns` | The tower is alive and paging; nobody has ACK'd. | Check the primary channel, act on the swap, `echo <swap_id> >> $ACK_INBOX`. |
+  | `CRITICAL (blind) …` | The heartbeat carries no usable count (`-1` sentinel, missing key, or an unknown `schema_version`). | Fix the tower's wiring. Until then the escalation path is **not** protecting you — watch in-flight swaps by hand. |
+  | `WARN … monitor is BLIND` | The heartbeat is stale/absent/future-dated. Sent **once** per episode. | Nothing new: the dead-man's-switch owns this alarm. The WARN doubles as proof this channel still works. |
+  | `INFO escalation cleared` | `unacked_critical` is back to zero. | Nothing. |
+
+- **A silent escalation channel is not proof it works.** It is silent whenever the operator is
+  keeping up. Smoke-test it deliberately: point a throwaway run at it with
+  `--escalate-after-s 0 --allow-same-channel` against a heartbeat you hand-write with
+  `unacked_critical` set, or simply stop the tower and wait for the one-shot blind WARN.
+
+## Escalation-monitor state file
+
+The monitor persists `{first_unacked_ts, last_escalated_ts, fired}` to `--state-file` (default:
+the heartbeat path + `.escalation-state.json`), created `0600`.
+
+- **Why on disk:** if the countdown lived in memory, a crash-restart loop would restart it on every
+  restart and escalation would never fire — precisely when the host is sick and you want it most.
+- **It is a control file.** Anyone who can write it can defer an escalation, so the monitor ignores it
+  (and starts fresh, logging an ERROR) if it is not a `0600` regular file you own. A corrupt file is
+  also treated as fresh rather than fatal: refusing to start would turn cosmetic damage into *no
+  escalation at all*.
+- **Deleting it** costs at most one `--escalate-after-s` window of deferral. That is the safe way to
+  reset a stuck `fired` after an incident.
+- Back it up with the rest of the tower's operator state (see
+  [`operator-state-backup-recovery.md`](operator-state-backup-recovery.md)) — it is small and
+  regenerable, but restoring it preserves an in-flight countdown.
 
 ## See also
 
