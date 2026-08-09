@@ -37,9 +37,23 @@ def _patch_run(monkeypatch, *, stdout="", returncode=0, stderr=""):
     return captured
 
 
+# ssh_host / container are required (no built-in default — see the constructor's docstring:
+# this reader ships in the public wheel and must not bake in any one operator's private ssh
+# host / docker container name). These are just arbitrary-but-realistic stand-ins for tests
+# that don't care about the exact value.
+_HOST = "radiant-node"
+_CONTAINER = "radiant-mainnet"
+
+
 def test_cli_argv_is_shell_safe():
-    argv = SshTrRxdReader()._cli_argv("getblockcount")
-    assert argv == ["ssh", "-o", "ConnectTimeout=10", "tr", "docker exec radiant-mainnet radiant-cli getblockcount"]
+    argv = SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER)._cli_argv("getblockcount")
+    assert argv == [
+        "ssh",
+        "-o",
+        "ConnectTimeout=10",
+        _HOST,
+        f"docker exec {_CONTAINER} radiant-cli getblockcount",
+    ]
 
 
 def test_cli_argv_custom_host_container():
@@ -48,14 +62,20 @@ def test_cli_argv_custom_host_container():
     assert argv[4] == "docker exec rxd radiant-cli getblockcount"
 
 
+def test_ssh_host_and_container_are_required():
+    # The public-wheel hardening: no default host/container (a caller must be explicit).
+    with pytest.raises(TypeError):
+        SshTrRxdReader()  # type: ignore[call-arg]
+
+
 async def test_get_tip_height(monkeypatch):
     _patch_run(monkeypatch, stdout="850000\n")
-    assert await SshTrRxdReader().get_tip_height() == 850000
+    assert await SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER).get_tip_height() == 850000
 
 
 async def test_get_transaction_verbose_returns_dict(monkeypatch):
     cap = _patch_run(monkeypatch, stdout=json.dumps({"confirmations": 5, "txid": "ab" * 32}))
-    res = await SshTrRxdReader().get_transaction_verbose("ab" * 32)
+    res = await SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER).get_transaction_verbose("ab" * 32)
     assert res["confirmations"] == 5
     # getrawtransaction <txid> true
     assert cap["argv"][4].endswith(f"radiant-cli getrawtransaction {'ab' * 32} true")
@@ -64,30 +84,30 @@ async def test_get_transaction_verbose_returns_dict(monkeypatch):
 async def test_get_transaction_verbose_rejects_non_dict(monkeypatch):
     _patch_run(monkeypatch, stdout=json.dumps("not-a-dict"))
     with pytest.raises(RuntimeError):
-        await SshTrRxdReader().get_transaction_verbose("ab" * 32)
+        await SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER).get_transaction_verbose("ab" * 32)
 
 
 async def test_nonzero_exit_raises(monkeypatch):
     _patch_run(monkeypatch, returncode=1, stderr="error: backend down")
     with pytest.raises(RuntimeError):
-        await SshTrRxdReader().get_tip_height()
+        await SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER).get_tip_height()
 
 
 async def test_composes_with_chain_source(monkeypatch):
     # The reader plugs into ElectrumRxdChainSource (the watchtower's RxdChainSource).
     _patch_run(monkeypatch, stdout=json.dumps({"confirmations": 12}))
-    src = ElectrumRxdChainSource(SshTrRxdReader())
+    src = ElectrumRxdChainSource(SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER))
     assert await src.covenant_confirmations("cd" * 32 + ":0") == 12
 
 
 async def test_chain_source_unmined_via_reader(monkeypatch):
     _patch_run(monkeypatch, stdout=json.dumps({"confirmations": 0}))
-    src = ElectrumRxdChainSource(SshTrRxdReader())
+    src = ElectrumRxdChainSource(SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER))
     assert await src.covenant_confirmations("cd" * 32 + ":0") is None
 
 
 def test_reader_has_no_broadcast_surface():
     # v1 alert-only: the ssh-tr reader must NOT expose any value-moving method.
-    reader = SshTrRxdReader()
+    reader = SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER)
     for forbidden in ("broadcast", "sendrawtransaction", "carve_fee_input", "get_utxos"):
         assert not hasattr(reader, forbidden)

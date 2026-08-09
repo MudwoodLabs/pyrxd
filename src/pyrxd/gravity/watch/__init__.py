@@ -8,8 +8,14 @@ no key and moves no value — see
 
 Layering: this subpackage is the "brain" + thin transports/loop helper. It imports
 downward only (``gravity`` → ``btc_wallet``/``network``), never the reverse. The
-operational entrypoints live in ``scripts/watchtower_run.py`` (the tower) and
-``scripts/watchtower_deadman.py`` (the independent dead-man's-switch monitor).
+operational entrypoints are :mod:`pyrxd.gravity.watch.run` (the tower, console script
+``pyrxd-watchtower``) and :mod:`pyrxd.gravity.watch.deadman` (the independent
+dead-man's-switch monitor, console script ``pyrxd-watchtower-deadman``) — deliberately
+NOT part of the ``pyrxd`` CLI itself: the tower's v2 refund path is a real (dust-capped,
+audit-gated) broadcaster, and the shipped ``pyrxd`` command has zero broadcast surface
+for the cross-chain stack by design (see ``src/pyrxd/cli/swap_cmds.py``). The old
+``scripts/watchtower_run.py`` / ``scripts/watchtower_deadman.py`` paths still work as
+thin back-compat shims.
 
 The decision core (:func:`decide`) CONSUMES the audited gate functions
 ``assess_claim_finality`` and ``taker_refund_window_open`` from

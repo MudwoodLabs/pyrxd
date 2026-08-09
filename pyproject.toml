@@ -58,6 +58,9 @@ Changelog = "https://github.com/MudwoodLabs/pyrxd/blob/main/CHANGELOG.md"
 [project.scripts]
 pyrxd = "pyrxd.cli.main:run"
 pyrxd-miner = "pyrxd.contrib.miner.cli:main"
+pyrxd-watchtower = "pyrxd.gravity.watch.run:main"
+pyrxd-watchtower-deadman = "pyrxd.gravity.watch.deadman:main"
+pyrxd-presign-refund = "pyrxd.gravity.watch.presign:main"
 
 [tool.poetry]
 packages = [{include = "pyrxd", from = "src"}]
@@ -230,6 +233,11 @@ ignore = [
 "src/pyrxd/devnet.py" = [
     "S603",   # the module's whole purpose is shelling the docker CLI with fully-controlled list-form argv
     "S607",   # `docker` resolved via PATH (guarded by shutil.which up front)
+]
+"src/pyrxd/gravity/watch/sshtr.py" = [
+    "S603",   # read-only ssh+radiant-cli reader: fully-controlled list-form argv, every token
+              # shlex.quote'd, no shell=True (see the module docstring's Safety section)
+    "S607",   # `ssh` / `docker` resolved via PATH, same as scripts/** dev-script convention
 ]
 "docs/conf.py" = ["E", "F", "I"]
 
