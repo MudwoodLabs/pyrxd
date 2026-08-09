@@ -10,9 +10,13 @@ Nothing in this package should ever log, print, or format raw key material.
 from __future__ import annotations
 
 from .errors import (
+    ConfirmationTimeoutError,
     CovenantError,
+    InsufficientConfirmationsError,
+    InsufficientFundsError,
     KeyMaterialError,
     NetworkError,
+    PolicyRejection,
     RxdSdkError,
     SpvVerificationError,
     ValidationError,
@@ -34,13 +38,17 @@ from .types import (
 
 __all__ = [
     "BlockHeight",
+    "ConfirmationTimeoutError",
     "CovenantError",
     "Hex20",
     "Hex32",
+    "InsufficientConfirmationsError",
+    "InsufficientFundsError",
     "KeyMaterialError",
     "Nbits",
     "NetworkError",
     "Photons",
+    "PolicyRejection",
     "PrivateKeyMaterial",
     "RawTx",
     "RxdSdkError",

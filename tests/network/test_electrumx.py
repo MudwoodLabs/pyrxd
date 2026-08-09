@@ -912,3 +912,156 @@ class TestConnectFirstRace:
             await client._ensure_connected()
 
         assert len(calls) == 1, "_connect_first should be called exactly once"
+
+
+# ── Node-rejection classification (PolicyRejection) ───────────────────────────
+#
+# Every RPC error used to collapse to NetworkError("ElectrumX RPC error (code N)") with
+# the server's message discarded, so mandatory-script-verify-flag-failed, dust and
+# min-relay-fee were indistinguishable from a dropped socket. That masking hid a dMint
+# covenant-rejection bug for weeks.
+
+from pyrxd.network.electrumx import _rpc_error
+from pyrxd.security.errors import CovenantError, PolicyRejection
+
+
+class TestPolicyRejectionClassification:
+    @pytest.mark.parametrize("code", [1, -25, -26, -27])
+    def test_transaction_verdict_codes_map_to_policy_rejection(self, code) -> None:
+        err = _rpc_error(code, "the transaction was rejected by network rules")
+        assert isinstance(err, PolicyRejection)
+        assert err.code == code
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "the transaction was rejected by network rules",
+            "mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)",
+            "non-mandatory-script-verify-flag (Non-canonical signature)",
+            "min relay fee not met",
+            "dust",
+            "bad-txns-inputs-missingorspent",
+            "txn-already-in-mempool",
+            "too-long-mempool-chain",
+            "scriptsig-not-pushonly",
+            "absurdly-high-fee",
+        ],
+    )
+    def test_policy_shaped_reasons_map_to_policy_rejection_under_any_code(self, message) -> None:
+        # Deliberately an unremarkable code: the reason alone must be enough.
+        assert isinstance(_rpc_error(-99, message), PolicyRejection)
+
+    @pytest.mark.parametrize(
+        ("code", "message"),
+        [
+            (-32601, "Method not found"),
+            (-32700, "Parse error"),
+            (-5, "No such mempool or blockchain transaction"),
+            (-99, "server is shutting down"),
+        ],
+    )
+    def test_transport_and_protocol_errors_stay_plain_network_error(self, code, message) -> None:
+        err = _rpc_error(code, message)
+        assert isinstance(err, NetworkError)
+        assert not isinstance(err, PolicyRejection)
+
+    def test_policy_rejection_is_catchable_as_network_error(self) -> None:
+        # ~30 sites in the SDK already wrap broadcasts in `except NetworkError`. Now
+        # that this class is actually raised, none of them may silently stop catching.
+        with pytest.raises(NetworkError):
+            raise _rpc_error(1, "the transaction was rejected by network rules")
+
+    def test_policy_rejection_is_catchable_as_covenant_error(self) -> None:
+        with pytest.raises(CovenantError):
+            raise _rpc_error(1, "mandatory-script-verify-flag-failed")
+
+    def test_reason_survives_so_the_failure_is_diagnosable(self) -> None:
+        err = _rpc_error(1, "mandatory-script-verify-flag-failed (Script evaluated without error)")
+        assert "mandatory-script-verify-flag-failed" in str(err)
+        assert "mandatory-script-verify-flag-failed" in err.reason
+
+    def test_missing_message_still_classifies_by_code(self) -> None:
+        err = _rpc_error(1, None)
+        assert isinstance(err, PolicyRejection)
+        assert err.reason == ""
+        assert str(err) == "node rejected the transaction (code 1)"
+
+
+class TestServerMessageSanitization:
+    """The node message is attacker-influencable text; it never reaches a caller raw."""
+
+    def test_embedded_raw_tx_hex_is_redacted(self) -> None:
+        # ElectrumX has historically appended the whole raw transaction to a reject
+        # reason. That token is pure hex and must collapse, not land in a traceback.
+        raw_hex = "0100000001" + "ab" * 300
+        err = _rpc_error(1, f"the transaction was rejected by network rules {raw_hex}")
+        assert raw_hex not in str(err)
+        assert "<redacted>" in str(err)
+        assert "rejected by network rules" in str(err)
+
+    def test_wif_shaped_token_is_redacted(self) -> None:
+        wif = "L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ"
+        err = _rpc_error(1, f"dust {wif}")
+        assert wif not in str(err)
+
+    def test_ordinary_prose_survives_redaction(self) -> None:
+        # redact()'s base58 heuristic eats plain English words ("transaction" is all
+        # base58 characters), so it is applied per-token above a length floor only.
+        err = _rpc_error(1, "the transaction was rejected by network rules")
+        assert "transaction" in str(err)
+        assert "<redacted>" not in str(err)
+
+    def test_only_the_first_line_is_kept(self) -> None:
+        err = _rpc_error(1, "dust\nsecond line with detail\nthird line")
+        assert "second line" not in str(err)
+        assert "third line" not in str(err)
+
+    def test_control_characters_are_stripped(self) -> None:
+        err = _rpc_error(1, "dust \x1b[31mred\x00nul\ttab")
+        text = str(err)
+        assert "\x1b" not in text
+        assert "\x00" not in text
+        assert "\t" not in text
+
+    def test_message_length_is_bounded(self) -> None:
+        err = _rpc_error(1, "dust " + "word " * 500)
+        assert len(err.reason) <= 210
+
+    def test_unflagged_long_token_is_clipped_not_dropped(self) -> None:
+        # A long hyphenated reject code is not key-material-shaped, so redact() lets it
+        # through — it still must not be an unbounded server-controlled run.
+        token = "mandatory-" + "x" * 200
+        err = _rpc_error(1, token)
+        assert token not in str(err)
+        assert "mandatory-" in str(err)
+
+    def test_non_string_message_is_ignored(self) -> None:
+        for message in ({"nested": "object"}, 42, [1, 2], None):
+            err = _rpc_error(1, message)
+            assert err.reason == ""
+
+    def test_no_raw_server_text_is_chained_into_the_traceback(self) -> None:
+        err = _rpc_error(1, "dust " + "ab" * 300)
+        assert err.__cause__ is None
+        assert err.__context__ is None
+
+
+async def test_policy_rejection_surfaces_through_a_broadcast() -> None:
+    """End-to-end through the reader loop: a rejected broadcast must arrive typed."""
+    ws = _make_ws_mock(
+        {
+            "id": 1,
+            "error": {
+                "code": 1,
+                "message": ("the transaction was rejected by network rules. mandatory-script-verify-flag-failed"),
+            },
+        }
+    )
+
+    with _patch_connect(ws):
+        async with ElectrumXClient(["wss://example.com"]) as client:
+            with pytest.raises(PolicyRejection) as ei:
+                await client.broadcast(_VALID_RAW_TX)
+
+    assert "mandatory-script-verify-flag-failed" in str(ei.value)
+    assert ei.value.code == 1

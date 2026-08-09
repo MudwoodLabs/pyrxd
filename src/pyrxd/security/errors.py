@@ -26,9 +26,13 @@ import re
 from typing import Any
 
 __all__ = [
+    "ConfirmationTimeoutError",
     "ContractExhaustedError",
     "CovenantError",
     "DmintError",
+    "FeePoolExhaustedError",
+    "InsufficientConfirmationsError",
+    "InsufficientFundsError",
     "InvalidFundingUtxoError",
     "KeyMaterialError",
     "MaxAttemptsError",
@@ -105,6 +109,44 @@ class ValidationError(RxdSdkError):
     """Raised when input fails a trust-boundary validation check."""
 
 
+class InsufficientFundsError(ValidationError):
+    """A pre-flight value check found less funding than the operation provably needs.
+
+    Deliberately a **subclass of** :class:`ValidationError`: the SDK already raises
+    a bare ``ValidationError("Insufficient funds…")`` from ~16 sites in
+    ``wallet.py``, ``hd/wallet.py``, ``agent/watch_only.py`` and
+    ``btc_wallet/payment.py``, and every existing ``except ValidationError``
+    handler must keep catching this. The subclass only *adds* the machine-readable
+    ``available`` / ``required`` / ``shortfall`` triple so a caller can say how much
+    more is needed instead of substring-matching a message.
+
+    Not to be confused with :class:`pyrxd.transaction.transaction.InsufficientFunds`,
+    which is a bare ``ValueError`` raised by the low-level transaction builder and is
+    **not** part of the :class:`RxdSdkError` family. That one means "these inputs do
+    not cover these outputs" at serialisation time; this one means "we checked before
+    spending anything and the operation cannot succeed". The two are not
+    interchangeable and neither catches the other; new library code should raise this
+    one.
+
+    Args:
+        message: static description — must not embed key material.
+        available: value the caller actually has, in the operation's own units.
+        required: value the operation needs, same units.
+    """
+
+    def __init__(self, message: str, *, available: int | None = None, required: int | None = None) -> None:
+        super().__init__(message)
+        self.available = available
+        self.required = required
+
+    @property
+    def shortfall(self) -> int | None:
+        """``required - available`` when both are known, else ``None``."""
+        if self.available is None or self.required is None:
+            return None
+        return self.required - self.available
+
+
 class SpvVerificationError(RxdSdkError):
     """Raised when an SPV proof (Merkle path, header chain) fails to verify."""
 
@@ -126,28 +168,97 @@ class InsufficientConfirmationsError(NetworkError):
     Args:
         have: observed confirmation depth at read time (0 if unconfirmed).
         required: the caller-supplied ``min_confirmations`` threshold.
+        detail: optional extra context appended in parentheses (e.g. why the
+            wait gave up). Static description only — never key material.
     """
 
-    def __init__(self, *, have: int, required: int) -> None:
-        super().__init__(f"tx has {have} confirmations, required {required}")
+    def __init__(self, *, have: int, required: int, detail: str | None = None) -> None:
+        message = f"tx has {have} confirmations, required {required}"
+        if detail:
+            message = f"{message} ({detail})"
+        super().__init__(message)
         self.have = have
         self.required = required
+
+
+class ConfirmationTimeoutError(InsufficientConfirmationsError):
+    """A confirmation wait gave up before the tx reached the required depth.
+
+    A subclass of :class:`InsufficientConfirmationsError` (and therefore of
+    :class:`NetworkError`) — which is exactly the distinction that class exists to
+    make: "the tx is just shallow, retry / check the explorer" is a fundamentally
+    different operator response from "the transport is broken". A confirmation
+    timeout is the former, so raising a bare :class:`NetworkError` would tell the
+    caller the wrong thing.
+
+    Carries ``txid`` and ``waited_s`` so a caller can render a resume hint. The txid
+    is public chain data and is intentionally kept verbatim — it is the only thing
+    that makes the failure actionable.
+
+    Args:
+        txid: the transaction that failed to reach ``required`` confirmations.
+        have: the last observed depth (0 if the tx was never seen).
+        required: the caller-supplied ``min_confirmations`` threshold.
+        waited_s: elapsed seconds on the injected clock when the wait gave up.
+        reason: why the wait stopped (``"timeout"``, ``"max_iterations"``, …).
+    """
+
+    def __init__(
+        self,
+        *,
+        txid: str,
+        have: int,
+        required: int,
+        waited_s: float,
+        reason: str = "timeout",
+    ) -> None:
+        super().__init__(
+            have=have,
+            required=required,
+            detail=f"{reason} after {waited_s:.0f}s waiting for {txid}",
+        )
+        self.txid = txid
+        self.waited_s = waited_s
+        self.reason = reason
 
 
 class CovenantError(RxdSdkError):
     """Raised for covenant construction or verification failures."""
 
 
-class PolicyRejection(CovenantError):
-    """Raised when a node rejects a covenant spend on a consensus/policy rule
-    (e.g. ``mandatory-script-verify-flag-failed``, an ElectrumX ``code 1``).
+class PolicyRejection(CovenantError, NetworkError):
+    """Raised when a node rejects a transaction on a consensus/policy rule
+    (e.g. ``mandatory-script-verify-flag-failed``, dust, min-relay-fee, an
+    ElectrumX ``code 1``).
 
-    A subclass of :class:`CovenantError` so existing ``except CovenantError``
-    handlers catch it. Surface this distinctly rather than letting a node
-    rejection be reclassified as :class:`NetworkError` — that masking hid a
-    critical dMint covenant-rejection bug for weeks (see
-    docs/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.md).
+    Surface this distinctly rather than letting a node rejection be reclassified as a
+    plain :class:`NetworkError` — that masking hid a critical dMint covenant-rejection
+    bug for weeks (see docs/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.md).
+    The masking harm was that the node's *reason* was discarded, so a script failure
+    was indistinguishable from a dropped socket.
+
+    Parentage: it inherits from **both** :class:`CovenantError` (its original parent —
+    keeps every ``except CovenantError`` handler working) and :class:`NetworkError`
+    (so the ~30 ``except NetworkError`` handlers that already wrap broadcast calls do
+    not silently stop catching rejections now that this class is actually raised).
+    A node rejection is not covenant-specific — a dust or min-relay-fee rejection has
+    nothing to do with covenants — so the covenant-only parentage it shipped with was
+    too narrow. Widening it here is the compatible fix; re-rooting it under a
+    dedicated ``NodeRejection`` base would be the cleaner shape but is a breaking
+    change for existing handlers.
+
+    Args:
+        message: sanitized, caller-safe description. Node messages are
+            attacker-influencable text — run them through :func:`redact` and strip
+            control characters *before* constructing this.
+        code: the RPC error code, when the server supplied one.
+        reason: the sanitized server reason on its own, for programmatic matching.
     """
+
+    def __init__(self, *args: Any, code: Any = None, reason: str | None = None) -> None:
+        super().__init__(*args)
+        self.code = code
+        self.reason = reason
 
 
 class FeePoolExhaustedError(RxdSdkError):

@@ -5,14 +5,17 @@ from __future__ import annotations
 import pytest
 
 from pyrxd.security.errors import (
+    ConfirmationTimeoutError,
     ContractExhaustedError,
     CovenantError,
     DmintError,
     InsufficientConfirmationsError,
+    InsufficientFundsError,
     InvalidFundingUtxoError,
     KeyMaterialError,
     MaxAttemptsError,
     NetworkError,
+    PolicyRejection,
     PoolTooSmallError,
     RxdSdkError,
     SpvVerificationError,
@@ -201,3 +204,88 @@ class TestDmintErrors:
         ):
             with pytest.raises(DmintError):
                 raise exc_cls("test")
+
+
+class TestInsufficientFundsError:
+    """The typed pre-flight funding error added for the Glyph reveal-fee guard (C-1)."""
+
+    def test_subclasses_validation_error(self) -> None:
+        # ~16 sites already raise a bare ValidationError("Insufficient funds…"); every
+        # existing `except ValidationError` handler must keep catching this one.
+        assert issubclass(InsufficientFundsError, ValidationError)
+        assert issubclass(InsufficientFundsError, RxdSdkError)
+        with pytest.raises(ValidationError):
+            raise InsufficientFundsError("short")
+
+    def test_is_not_the_transaction_builder_insufficient_funds(self) -> None:
+        # transaction.InsufficientFunds is a bare ValueError outside the SDK family.
+        # Neither catches the other — that separation is deliberate, so assert it.
+        from pyrxd.transaction.transaction import InsufficientFunds
+
+        assert not issubclass(InsufficientFundsError, InsufficientFunds)
+        assert not issubclass(InsufficientFunds, InsufficientFundsError)
+        assert not issubclass(InsufficientFunds, RxdSdkError)
+
+    def test_carries_shortfall(self) -> None:
+        err = InsufficientFundsError("short", available=100, required=175)
+        assert err.available == 100
+        assert err.required == 175
+        assert err.shortfall == 75
+
+    def test_shortfall_is_none_when_amounts_unknown(self) -> None:
+        assert InsufficientFundsError("short").shortfall is None
+        assert InsufficientFundsError("short", available=1).shortfall is None
+        assert InsufficientFundsError("short", required=1).shortfall is None
+
+
+class TestConfirmationTimeoutError:
+    """A confirmation timeout is 'shallow, retry', not 'transport is broken'."""
+
+    def test_subclasses_insufficient_confirmations_not_bare_network_error(self) -> None:
+        assert issubclass(ConfirmationTimeoutError, InsufficientConfirmationsError)
+        assert issubclass(ConfirmationTimeoutError, NetworkError)
+
+    def test_message_names_the_txid_and_the_wait(self) -> None:
+        err = ConfirmationTimeoutError(txid="ab" * 32, have=0, required=1, waited_s=1800.0)
+        text = str(err)
+        assert "0 confirmations, required 1" in text
+        assert "ab" * 32 in text  # public chain data — the only actionable detail
+        assert "1800s" in text
+        assert err.txid == "ab" * 32
+        assert err.waited_s == 1800.0
+        assert err.reason == "timeout"
+
+    def test_reason_is_carried(self) -> None:
+        err = ConfirmationTimeoutError(txid="cd" * 32, have=2, required=6, waited_s=5.0, reason="max_iterations=3")
+        assert err.reason == "max_iterations=3"
+        assert "max_iterations=3" in str(err)
+        assert err.have == 2 and err.required == 6
+
+    def test_insufficient_confirmations_detail_is_optional(self) -> None:
+        # The unadorned message the 8 existing call sites in network/bitcoin.py produce
+        # must not change.
+        assert str(InsufficientConfirmationsError(have=1, required=6)) == "tx has 1 confirmations, required 6"
+        assert "(why)" in str(InsufficientConfirmationsError(have=1, required=6, detail="why"))
+
+
+class TestPolicyRejectionParentage:
+    """PolicyRejection is now actually raised (from network/electrumx), so its
+    parentage has to work for every handler that already wraps a broadcast."""
+
+    def test_catchable_as_both_covenant_error_and_network_error(self) -> None:
+        assert issubclass(PolicyRejection, CovenantError)
+        assert issubclass(PolicyRejection, NetworkError)
+        with pytest.raises(CovenantError):
+            raise PolicyRejection("rejected")
+        with pytest.raises(NetworkError):
+            raise PolicyRejection("rejected")
+
+    def test_carries_code_and_reason(self) -> None:
+        err = PolicyRejection("node rejected the transaction (code 1): dust", code=1, reason="dust")
+        assert err.code == 1
+        assert err.reason == "dust"
+
+    def test_defaults_have_no_code_or_reason(self) -> None:
+        err = PolicyRejection("rejected")
+        assert err.code is None
+        assert err.reason is None
