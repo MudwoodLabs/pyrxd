@@ -1279,6 +1279,31 @@ class TestKnownAddresses:
 
 
 # ---------------------------------------------------------------------------
+# privkey_for_address — address → signing key (used by pyrxd.glyph.mint to
+# re-derive the key that spends a Glyph commit output after a crash)
+# ---------------------------------------------------------------------------
+
+
+class TestPrivkeyForAddress:
+    def test_returns_the_key_whose_pkh_matches_the_address(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addr = w._derive_address(1, 4)
+        w.addresses["1/4"] = AddressRecord(address=addr, change=1, index=4, used=True)
+        key = w.privkey_for_address(addr)
+        # The point of the lookup: this key must be able to sign for that address.
+        assert key.public_key().address() == addr
+        assert key.public_key().hash160() == w.privkey_for(1, 4).public_key().hash160()
+
+    def test_unknown_address_raises_rather_than_returning_a_wrong_key(self):
+        """Signing with a key that hashes to a different PKH produces a transaction the
+        network rejects — fail loudly instead."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        stranger = HdWallet.from_mnemonic(MNEMONIC2)._derive_address(0, 0)
+        with pytest.raises(ValidationError, match="not known to this wallet"):
+            w.privkey_for_address(stranger)
+
+
+# ---------------------------------------------------------------------------
 # Stream C / HD-hardening tests (N1-N5; N6 covered above)
 # ---------------------------------------------------------------------------
 

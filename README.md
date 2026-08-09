@@ -189,38 +189,56 @@ runnable version of both flows.
 
 ### Mint a Glyph NFT
 
+A Glyph mint is two transactions: a **commit** that locks a hash of the metadata,
+then a **reveal** that publishes the metadata and creates the token.
+`GlyphMinter` runs both — UTXO selection, commit sizing, the pre-broadcast fee
+guard, signing and confirmation polling included.
+
 ```python
-from pyrxd.glyph import GlyphBuilder, GlyphMetadata, GlyphProtocol
-from pyrxd.glyph.builder import CommitParams
+from pyrxd.glyph import GlyphMetadata, GlyphProtocol
+from pyrxd.glyph.mint import GlyphMinter, JsonFilePendingStore
 
 metadata = GlyphMetadata(
     protocol=[GlyphProtocol.NFT],
     name="My NFT",
     description="A demo non-fungible token.",
 )
-builder = GlyphBuilder()
-commit = builder.prepare_commit(CommitParams(metadata=metadata, owner_pkh=pkh, change_pkh=pkh, funding_satoshis=funding_amount))
-# ... broadcast commit, then reveal ...
+minter = GlyphMinter(client, wallet, JsonFilePendingStore("~/.pyrxd/pending-mints"))
+result = await minter.mint_nft(metadata)
+print(result.ref)  # the token's permanent identity: the commit outpoint
 ```
 
-See [`examples/glyph_mint_demo.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/glyph_mint_demo.py) for a
-complete end-to-end NFT mint, and [`examples/ft_deploy_premine.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/ft_deploy_premine.py)
-for an FT premine deployment.
+The store is a required argument, not an option. The commit output is a hashlock
+with no owner-only spend path, so losing the metadata bytes between the two
+phases makes it **permanently unspendable** — the store writes them to disk, and
+verifies the write, before the commit is broadcast. That is also what makes the
+mint resumable:
+
+```python
+pending = await minter.commit_nft(metadata)   # persisted, then broadcast
+...                                           # crash, reboot, next week
+result = await minter.reveal_nft(store.load(pending.commit_txid))
+```
 
 ### Deploy a fungible token (premine)
 
 ```python
-from pyrxd.glyph import GlyphBuilder, GlyphMetadata, GlyphProtocol
-
 metadata = GlyphMetadata(
     protocol=[GlyphProtocol.FT],
     name="My Token",
     ticker="MTK",
     description="A premine fungible token.",
 )
-# Single commit + reveal mints the entire supply to one address.
-# See examples/ft_deploy_premine.py for the full flow.
+result = await minter.deploy_ft(metadata, supply=1_000_000)
 ```
+
+`GlyphBuilder` remains the lower-level API when you need to compose the
+transactions yourself (mutable NFTs, containers, WAVE names and dMint deploys
+have different reveal shapes and are built through it directly).
+
+See [`examples/glyph_mint_demo.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/glyph_mint_demo.py) for a
+complete end-to-end NFT mint, and [`examples/ft_deploy_premine.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/ft_deploy_premine.py)
+for an FT premine deployment.
 
 ## Command line
 

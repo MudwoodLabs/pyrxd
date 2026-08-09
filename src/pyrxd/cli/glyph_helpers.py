@@ -25,10 +25,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..glyph.fees import REVEAL_SIG_PREFIX_BYTES
+from ..glyph.mint import build_reveal_unlock_template
 from ..glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
-from ..script.script import Script
-from ..script.type import encode_pushdata, to_unlock_script_template
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from .context import CliContext
@@ -236,26 +234,16 @@ def _metadata_summary(metadata: GlyphMetadata) -> _BroadcastSummary:
 
 
 def _build_glyph_unlock(privkey: PrivateKey, scriptsig_suffix: bytes):
-    """Return an UnlockingScriptTemplate that signs P2PKH then appends Glyph suffix.
+    """Return an UnlockingScriptTemplate that signs P2PKH then appends the Glyph suffix.
 
-    Mirrors examples/glyph_mint_demo.py glyph_reveal_unlock.
+    Thin alias for :func:`pyrxd.glyph.mint.build_reveal_unlock_template`. This template
+    existed in four places at once — here plus one copy in each of the three
+    ``examples/*.py`` mint scripts — and each copy restated the estimated unlocking
+    length, the number ``pyrxd.glyph.fees`` sizes the reveal fee from. A copy that
+    drifted low would make the fee guard under-estimate and pass, stranding the commit.
+    One definition now, in the library where the examples can import it too.
     """
-
-    def sign(tx, input_index):
-        tx_input = tx.inputs[input_index]
-        sighash = tx_input.sighash
-        signature = privkey.sign(tx.preimage(input_index))
-        pubkey = privkey.public_key().serialize()
-        p2pkh_part = encode_pushdata(signature + sighash.to_bytes(1, "little")) + encode_pushdata(pubkey)
-        return Script(p2pkh_part + scriptsig_suffix)
-
-    def estimated_unlocking_byte_length() -> int:
-        # REVEAL_SIG_PREFIX_BYTES is imported, not re-stated: pyrxd.glyph.fees sizes the
-        # reveal fee from the same number, and a private copy here that drifted from it
-        # would make the fee guard under-estimate and pass — stranding the commit.
-        return REVEAL_SIG_PREFIX_BYTES + len(scriptsig_suffix)
-
-    return to_unlock_script_template(sign, estimated_unlocking_byte_length)
+    return build_reveal_unlock_template(privkey, scriptsig_suffix)
 
 
 # ---------------------------------------------------------------------------

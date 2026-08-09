@@ -64,15 +64,15 @@ wiping it. Use `pyrxd regtest up --fresh` when you want a clean chain.
 ## Step 2 — mint a Glyph NFT
 
 The repo ships a companion script that mints an NFT against the running node.
-It pulls a funded UTXO from the dev wallet, builds the two-phase commit/reveal
-with `GlyphBuilder`, broadcasts each transaction through the
-node, and mines a block to confirm each one:
+It pulls a funded UTXO from the dev wallet, runs the two-phase commit/reveal
+with `GlyphMinter`, broadcasts each transaction through the node, and mines a
+block to confirm each one:
 
 ```console
 $ python examples/regtest_quickstart.py
-minting from mxeCaRUMTjAmRch131Tt5Hac4ZWvaQomJP  (UTXO 15bd14177471…:0, 5,000,000,000,000 photons)
+minting from mxeCaRUMTjAmRch131Tt5Hac4ZWvaQomJP
 commit:  c10108ef496cac1f75fa9ccab4ce112bee0d6539f27c9f7edcc7a7c8a7572f33  (7,160,546 photons, confirmed)
-reveal:  94ac6d18113d48f5166f4629091015c872e954814963a92fec0f92b27178095a  (NFT output 3,454,046 photons, confirmed)
+reveal:  94ac6d18113d48f5166f4629091015c872e954814963a92fec0f92b27178095a  (NFT carrier 546 photons, confirmed)
 
 NFT minted on regtest.
   genesis ref: c10108ef496cac1f75fa9ccab4ce112bee0d6539f27c9f7edcc7a7c8a7572f33:0   <- this is the token's permanent identity
@@ -84,10 +84,17 @@ is minted in two transactions: a **commit** that locks a hash of the metadata,
 then a **reveal** that publishes the metadata and creates the token output. The
 token's permanent identity is its **genesis ref** — the commit `txid:vout`.
 
-The transaction-building in `regtest_quickstart.py` is the same logic as
-[`examples/glyph_mint_demo.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples/glyph_mint_demo.py),
-which mints on mainnet via ElectrumX — only the transport is swapped to the
-local node.
+The mint in `regtest_quickstart.py` is not merely *like* the mainnet one in
+[`examples/glyph_mint_demo.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples/glyph_mint_demo.py)
+— it is literally the same code path. Both call `GlyphMinter.commit_nft` and
+`reveal_nft`; the quickstart just hands the minter a small adapter that speaks
+to the local node instead of ElectrumX.
+
+One thing worth noticing even on a throwaway chain: the minter requires a
+`PendingStore`. The commit output is a hashlock with no owner-only spend path,
+so losing the metadata bytes between the two phases makes it permanently
+unspendable. `JsonFilePendingStore` writes them to disk before the commit is
+broadcast, and the script keeps that habit rather than opting out.
 
 ## Step 3 — look at what you minted
 

@@ -869,6 +869,28 @@ class HdWallet:
         """Derive the P2PKH address at ``change/index`` (public seam)."""
         return self._derive_address(change, index)
 
+    def privkey_for_address(self, address: str) -> PrivateKey:
+        """Derive the signing key for a **known** address.
+
+        The derivation path is looked up in ``self.addresses`` rather than searched for,
+        so this is one ``ckd`` chain, not a scan.
+
+        Added for :class:`pyrxd.glyph.mint.GlyphMinter`, which must re-derive the key
+        that spends a Glyph commit output after a crash. It deliberately does not
+        persist the key, only the funding address, so it needs address → key. Keeping
+        that lookup here also keeps the minter's wallet contract down to two methods
+        (:meth:`collect_spendable` and this one), which is what makes it practical to
+        drive the minter with a non-HD wallet in a test or a dev script.
+
+        :raises ValidationError: if the address is not one this wallet derived — the
+            caller has the wrong wallet, and signing with a key that hashes to a
+            different PKH would produce a transaction the network rejects.
+        """
+        for rec in self.addresses.values():
+            if rec.address == address:
+                return self._privkey_for(rec.change, rec.index)
+        raise ValidationError(f"address {address} is not known to this wallet")
+
     def zeroize(self) -> None:
         """Scrub the seed and mark the wallet dead; it cannot derive or sign after.
 

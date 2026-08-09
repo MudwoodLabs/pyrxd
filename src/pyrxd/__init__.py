@@ -64,6 +64,11 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "GlyphInspector": ("pyrxd.glyph", "GlyphInspector"),
     "GlyphItem": ("pyrxd.glyph", "GlyphItem"),
     "GlyphMetadata": ("pyrxd.glyph", "GlyphMetadata"),
+    # The high-level mint facade. GlyphMinter + JsonFilePendingStore are surfaced at the
+    # top level because they are the pair a caller needs to mint at all — the store is a
+    # required constructor argument, so exporting one without the other would leave the
+    # advertised entry point unusable from `from pyrxd import ...`.
+    "GlyphMinter": ("pyrxd.glyph", "GlyphMinter"),
     "GlyphProtocol": ("pyrxd.glyph", "GlyphProtocol"),
     "GlyphRef": ("pyrxd.glyph", "GlyphRef"),
     "GlyphScanner": ("pyrxd.glyph", "GlyphScanner"),
@@ -71,6 +76,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "GravityOfferParams": ("pyrxd.gravity", "GravityOfferParams"),
     "GravityTrade": ("pyrxd.gravity", "GravityTrade"),
     "HdWallet": ("pyrxd.hd.wallet", "HdWallet"),
+    "JsonFilePendingStore": ("pyrxd.glyph", "JsonFilePendingStore"),
     # Keys
     "PrivateKey": ("pyrxd.keys", "PrivateKey"),
     # Errors

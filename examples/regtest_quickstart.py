@@ -1,149 +1,106 @@
 #!/usr/bin/env python3
 """Mint your first Glyph NFT on a local regtest chain — zero config.
 
-This is the companion script for the 5-minute quickstart
-(``docs/tutorials/quickstart.md``). It assumes a regtest node is already
-running::
+Companion script for the 5-minute quickstart (``docs/tutorials/quickstart.md``).
+It assumes a regtest node is already running::
 
     pyrxd regtest up
 
-and then mints a Glyph NFT end-to-end against it: it pulls a funded UTXO from
-the dev wallet, builds the two-phase commit/reveal with the pyrxd SDK
-(:class:`pyrxd.glyph.GlyphBuilder`), broadcasts each tx through the node's RPC,
-and mines a block to confirm. No ElectrumX, no mainnet, no real value.
+then mints a Glyph NFT end-to-end against it.
+
+The mint itself is three lines, because :class:`~pyrxd.glyph.mint.GlyphMinter`
+does it — the same code path ``examples/glyph_mint_demo.py`` uses on mainnet.
+What is local to this file is only the *transport*: the minter is duck-typed on
+its client and wallet, so the two small adapters below teach it to talk to
+``pyrxd regtest`` instead of ElectrumX. That is the interesting part of this
+example, and it is the only part.
 
     python examples/regtest_quickstart.py
-
-The transaction-building here is the same proven logic as
-``examples/glyph_mint_demo.py`` (which mints on mainnet via ElectrumX); only the
-transport is swapped — UTXO lookup, broadcast, and confirmation all go through
-``pyrxd regtest`` instead of a remote server.
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import time
 
-# Make pyrxd importable from the source tree when run in-place.
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from pyrxd.devnet import DevnetError, RegtestNode
-from pyrxd.fee_models import SatoshisPerKilobyte
-from pyrxd.glyph import GlyphBuilder, GlyphMetadata, GlyphProtocol
-from pyrxd.glyph.builder import CommitParams, RevealParams
+from pyrxd.glyph import GlyphMetadata, GlyphProtocol
+from pyrxd.glyph.mint import GlyphMinter, JsonFilePendingStore
 from pyrxd.keys import PrivateKey
-from pyrxd.script.script import Script
-from pyrxd.script.type import P2PKH, encode_pushdata, to_unlock_script_template
-from pyrxd.security.types import Hex20
-from pyrxd.transaction.transaction import Transaction, TransactionInput, TransactionOutput
+from pyrxd.network.electrumx import UtxoRecord
 
-MIN_FEE_RATE = 10_000  # photons/byte — regtest relay floor matches mainnet
-REVEAL_BUDGET = 580 * MIN_FEE_RATE * 12 // 10 + 546
-COMMIT_VALUE = REVEAL_BUDGET + 200_000  # commit output must cover the reveal cost
-COMMIT_DUST = 276 * MIN_FEE_RATE
+# Enough to cover the commit value the minter computes plus its fee. The minter
+# refuses (before broadcasting anything) if the UTXO it finds is too small, so this
+# only needs to be comfortably large.
+NEED_PHOTONS = 20_000_000
 
 
-# --------------------------------------------------------------------- tx builders
-# (identical to examples/glyph_mint_demo.py — pure SDK, no transport coupling)
+class RegtestClient:
+    """The client half of the minter's contract, over ``pyrxd regtest``.
+
+    Two methods: broadcast a transaction, and report a transaction's confirmation
+    depth. :func:`~pyrxd.network.confirm.wait_for_confirmation` polls the second one.
+    """
+
+    def __init__(self, node: RegtestNode) -> None:
+        self.node = node
+
+    async def broadcast(self, raw_tx: bytes) -> str:
+        txid = str(self.node.cli("sendrawtransaction", raw_tx.hex()))
+        # Regtest mines on demand — nothing else will produce a block, so the minter
+        # would poll for a confirmation that never arrives. Mainnet transports do not
+        # do this; the node does.
+        self.node.mine(1)
+        return txid
+
+    async def get_transaction_verbose(self, txid: str) -> dict:
+        result = self.node.cli("getrawtransaction", str(txid), "1")
+        return result if isinstance(result, dict) else {}
 
 
-def _glyph_reveal_unlock(private_key: PrivateKey, scriptsig_suffix: bytes):
-    def sign(tx, input_index) -> Script:
-        tx_input = tx.inputs[input_index]
-        signature = private_key.sign(tx.preimage(input_index))
-        pubkey = private_key.public_key().serialize()
-        p2pkh_part = encode_pushdata(signature + tx_input.sighash.to_bytes(1, "little")) + encode_pushdata(pubkey)
-        return Script(p2pkh_part + scriptsig_suffix)
+class RegtestWallet:
+    """The wallet half: fund a mint, and re-derive the reveal's signing key.
 
-    return to_unlock_script_template(sign, lambda: 107 + len(scriptsig_suffix))
+    Backed by the node's own dev wallet, so ``pyrxd regtest up`` is the only setup.
+    """
 
+    def __init__(self, node: RegtestNode) -> None:
+        self.node = node
 
-def _build_commit_tx(utxo: dict, key: PrivateKey, commit_script: bytes, commit_value: int, address: str) -> Transaction:
-    inp = TransactionInput(
-        source_txid=utxo["tx_hash"],
-        source_output_index=utxo["tx_pos"],
-        unlocking_script_template=P2PKH().unlock(key),
-    )
-    inp.satoshis = utxo["value"]
-    inp.locking_script = P2PKH().lock(address)
-    src_out = TransactionOutput(P2PKH().lock(address), utxo["value"])
+    async def collect_spendable(self, client: RegtestClient) -> list:
+        unspent = self.node.cli("listunspent", "1", "9999999", wallet=True)
+        if not isinstance(unspent, list):
+            raise DevnetError("could not list regtest UTXOs")
+        triples = []
+        for u in unspent:
+            value = round(u["amount"] * 1e8)
+            utxo = UtxoRecord(tx_hash=u["txid"], tx_pos=u["vout"], value=value, height=1)
+            triples.append((utxo, u["address"], self.privkey_for_address(u["address"])))
+        return triples
 
-    class _SrcTx:
-        def __init__(self, out, _tx_pos: int = utxo["tx_pos"]) -> None:
-            self.outputs = {_tx_pos: out}
-
-    inp.source_transaction = _SrcTx(src_out)
-    if utxo["value"] < commit_value + COMMIT_DUST * 3:
-        raise ValueError(f"funding UTXO too small: {utxo['value']} < {commit_value + COMMIT_DUST * 3}")
-
-    tx = Transaction(
-        tx_inputs=[inp],
-        tx_outputs=[
-            TransactionOutput(Script(commit_script), commit_value),
-            TransactionOutput(P2PKH().lock(address), change=True),
-        ],
-    )
-    tx.fee(SatoshisPerKilobyte(MIN_FEE_RATE * 1000))
-    tx.sign()
-    return tx
+    def privkey_for_address(self, address: str) -> PrivateKey:
+        return PrivateKey(str(self.node.cli("dumpprivkey", address, wallet=True)))
 
 
-def _build_reveal_tx(
-    commit_txid: str, commit_value: int, commit_script: bytes, suffix: bytes, nft_script: bytes, key: PrivateKey
-) -> Transaction:
-    src = Transaction(tx_inputs=[], tx_outputs=[TransactionOutput(Script(commit_script), commit_value)])
-    src.txid = lambda: commit_txid  # type: ignore[method-assign]
-    reveal_input = TransactionInput(
-        source_transaction=src,
-        source_output_index=0,
-        unlocking_script_template=_glyph_reveal_unlock(key, suffix),
-    )
-    # Pass 1: measure the real signed size with a trial output value.
-    trial = Transaction(
-        tx_inputs=[reveal_input],
-        tx_outputs=[TransactionOutput(Script(nft_script), max(546, commit_value // 2))],
-    )
-    trial.sign()
-    fee = trial.byte_length() * (MIN_FEE_RATE + 500)
-    nft_value = commit_value - fee
-    if nft_value < 546:
-        raise ValueError(f"commit value {commit_value} too small for reveal fee {fee}")
-    # Pass 2: re-sign over the final output.
-    reveal_input.unlocking_script = None
-    tx = Transaction(tx_inputs=[reveal_input], tx_outputs=[TransactionOutput(Script(nft_script), nft_value)])
-    tx.sign()
-    return tx
-
-
-# --------------------------------------------------------------------- main flow
-
-
-def _funded_key(node: RegtestNode, need: int) -> tuple[PrivateKey, str, dict]:
-    """Pull a funded UTXO + its key from the dev wallet."""
-    unspent = node.cli("listunspent", "1", "9999999", wallet=True)
-    if not isinstance(unspent, list):
-        raise DevnetError("could not list regtest UTXOs")
-    for u in unspent:
-        value = round(u["amount"] * 1e8)
-        if value >= need:
-            wif = str(node.cli("dumpprivkey", u["address"], wallet=True))
-            return PrivateKey(wif), u["address"], {"tx_hash": u["txid"], "tx_pos": u["vout"], "value": value}
-    raise DevnetError(f"no UTXO with at least {need} photons — try `pyrxd regtest mine 10`")
-
-
-def main() -> None:
+async def main() -> None:
     node = RegtestNode()
     if not node.is_running():
-        print("regtest node is not running. Start it first:\n    pyrxd regtest up")
-        sys.exit(1)
+        sys.exit("regtest node is not running. Start it first:\n    pyrxd regtest up")
 
-    key, address, utxo = _funded_key(node, COMMIT_VALUE + COMMIT_DUST * 3)
-    pkh = Hex20(key.public_key().hash160())
-    print(f"minting from {address}  (UTXO {utxo['tx_hash'][:12]}…:{utxo['tx_pos']}, {utxo['value']:,} photons)")
+    wallet = RegtestWallet(node)
+    if not any(u.value >= NEED_PHOTONS for u, _, _ in await wallet.collect_spendable(RegtestClient(node))):
+        sys.exit(f"no UTXO with at least {NEED_PHOTONS:,} photons — try `pyrxd regtest mine 10`")
 
-    builder = GlyphBuilder()
+    # The pending store is required, not optional: the commit output is a hashlock, so
+    # losing its CBOR payload before the reveal would strand it permanently. On regtest
+    # that costs nothing, but the API does not have a cheap mode — the habit is the point.
+    store = JsonFilePendingStore(os.path.join(os.path.dirname(__file__), ".pending-mints"))
+    minter = GlyphMinter(RegtestClient(node), wallet, store)
+
     metadata = GlyphMetadata(
         protocol=[GlyphProtocol.NFT],
         name="my-first-glyph",
@@ -151,45 +108,25 @@ def main() -> None:
         token_type="quickstart",
         attrs={"minted_at": str(int(time.time()))},
     )
-    commit = builder.prepare_commit(CommitParams(metadata=metadata, owner_pkh=pkh, change_pkh=pkh, funding_satoshis=0))
 
-    # --- commit ---
-    commit_tx = _build_commit_tx(utxo, key, commit.commit_script, COMMIT_VALUE, address)
-    commit_txid = node.cli("sendrawtransaction", commit_tx.serialize().hex())
-    node.mine(1)
-    commit_value = commit_tx.outputs[0].satoshis
-    print(f"commit:  {commit_txid}  ({commit_value:,} photons, confirmed)")
+    pending = await minter.commit_nft(metadata)
+    print(f"minting from {pending.funding_address}")
+    print(f"commit:  {pending.commit_txid}  ({pending.commit_value:,} photons, confirmed)")
+    result = await minter.reveal_nft(pending)
+    print(f"reveal:  {result.reveal_txid}  (NFT carrier {result.carrier_value:,} photons, confirmed)")
 
-    # --- reveal ---
-    reveal = builder.prepare_reveal(
-        RevealParams(
-            commit_txid=str(commit_txid),
-            commit_vout=0,
-            commit_value=commit_value,
-            cbor_bytes=commit.cbor_bytes,
-            owner_pkh=pkh,
-            is_nft=True,
-        )
-    )
-    reveal_tx = _build_reveal_tx(
-        str(commit_txid), commit_value, commit.commit_script, reveal.scriptsig_suffix, reveal.locking_script, key
-    )
-    reveal_txid = node.cli("sendrawtransaction", reveal_tx.serialize().hex())
-    node.mine(1)
-
-    print(f"reveal:  {reveal_txid}  (NFT output {reveal_tx.outputs[0].satoshis:,} photons, confirmed)")
     print()
     print("NFT minted on regtest.")
-    print(f"  genesis ref: {commit_txid}:0   <- this is the token's permanent identity")
-    print(f"  owner:       {address}")
+    print(f"  genesis ref: {result.ref.txid}:{result.ref.vout}   <- this is the token's permanent identity")
+    print(f"  owner:       {pending.funding_address}")
     print()
     print("inspect it on the node:")
     print("  pyrxd regtest info")
     print(
         f"  docker exec {RegtestNode.CONTAINER} radiant-cli -regtest -rpcuser={RegtestNode.RPC_USER} "
-        f"-rpcpassword={RegtestNode.RPC_PASSWORD} getrawtransaction {reveal_txid} 1"
+        f"-rpcpassword={RegtestNode.RPC_PASSWORD} getrawtransaction {result.reveal_txid} 1"
     )
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
