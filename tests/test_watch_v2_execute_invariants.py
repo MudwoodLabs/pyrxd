@@ -35,7 +35,7 @@ from pyrxd.gravity.watch import (
     make_refund_broadcaster,
 )
 from pyrxd.gravity.watch.executor import MAINNET_DUST_CEILING_SATS
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, PolicyRejection, ValidationError
 from tests.test_watch_quorum import _policy
 
 _H = hashlib.sha256(b"v2-refund").digest()
@@ -579,3 +579,68 @@ async def test_reconciler_broadcast_failure_is_failed_and_still_pages(tmp_path):
     [res] = await r.tick()
     assert res.executed is ExecOutcome.FAILED  # broadcast raised → recorded, not swallowed
     assert alerter.pages == [("swap1", Intent.PAGE_REFUND)]  # and the operator is STILL paged
+
+
+# ───────────────────────── permanent node rejection must not retry forever ──
+#
+# PolicyRejection subclasses NetworkError (so existing `except NetworkError` broadcast
+# handlers keep catching node rejections). That makes clause ORDER load-bearing at every
+# broadcast site: without an explicit PolicyRejection clause first, a PERMANENT rejection
+# (bad script, dust, min-relay-fee) reads as a transient failure. The reconciler records
+# FAILED and calls the executor again next tick — forever — while the operator sees a
+# rolling "broadcast failed" and not the fact that their pre-signed refund is UNUSABLE.
+
+
+class _RejectingBroadcaster:
+    """A node that permanently rejects the tx (e.g. mandatory-script-verify-flag-failed)."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def broadcast(self, raw_tx: bytes) -> str:
+        self.calls += 1
+        raise PolicyRejection("node rejected the transaction")
+
+
+async def test_policy_rejection_is_declined_not_failed(tmp_path):
+    """A permanent rejection must DECLINE (page, stop) — not raise into a FAILED retry."""
+    rec, blob = _swap(network="bcrt", btc_sats=5_000, fee_sats=500)
+    _write(tmp_path, blob)
+    b = _RejectingBroadcaster()
+
+    out = await _armed(tmp_path, b).execute("swap1", rec, _refund_decision())
+
+    assert out is ExecOutcome.DECLINED
+    assert b.calls == 1
+
+
+async def test_policy_rejection_does_not_escape_as_networkerror(tmp_path):
+    """Pins the clause ordering: PolicyRejection must not propagate out of execute().
+
+    If the explicit clause is ever removed, PolicyRejection propagates (it IS a
+    NetworkError), the reconciler's blanket handler records FAILED, and the retry loop is
+    back. This test fails loudly in that case.
+    """
+    rec, blob = _swap(network="bcrt", btc_sats=5_000, fee_sats=500)
+    _write(tmp_path, blob)
+
+    # Must not raise.
+    out = await _armed(tmp_path, _RejectingBroadcaster()).execute("swap1", rec, _refund_decision())
+    assert out is ExecOutcome.DECLINED
+
+
+async def test_transient_network_error_still_propagates_for_retry(tmp_path):
+    """The complement: a genuinely transient failure MUST still reach the retry path.
+
+    Over-catching here would be as bad as under-catching — a node that is merely down
+    would stop the tower ever retrying a refund that is still due.
+    """
+    rec, blob = _swap(network="bcrt", btc_sats=5_000, fee_sats=500)
+    _write(tmp_path, blob)
+
+    class _TransientBroadcaster:
+        async def broadcast(self, raw_tx: bytes) -> str:
+            raise NetworkError("connection reset")
+
+    with pytest.raises(NetworkError):
+        await _armed(tmp_path, _TransientBroadcaster()).execute("swap1", rec, _refund_decision())

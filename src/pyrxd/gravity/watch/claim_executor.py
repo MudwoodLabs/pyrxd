@@ -56,7 +56,7 @@ from pyrxd.gravity.swap_coordinator import ClaimFinality, MarginPolicy, assess_c
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent, _value_at_risk_photons
 from pyrxd.gravity.watch.executor import ExecOutcome
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import NetworkError, PolicyRejection, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +516,27 @@ class ClaimExecutor:
         # 8. Broadcast the covenant claim (reuses the mainnet-proven leg path; logs txid+value, never p).
         try:
             txid = await leg.claim_asset(record, bytes(p))
+        except PolicyRejection as exc:
+            # PERMANENT: the node rejected the tx on a consensus/policy rule (bad script, dust,
+            # min-relay-fee). Retrying cannot help, and this path RE-CARVES a real-value fee input
+            # on every attempt — so a FAILED here would burn fees every tick, forever.
+            #
+            # PolicyRejection subclasses NetworkError so existing broadcast handlers keep catching
+            # node rejections; that makes THIS clause order load-bearing — it must precede the
+            # NetworkError clause below or a permanent rejection reads as transient.
+            #
+            # Mark seen for the same reason a success does: stop the fire-once loop. The operator is
+            # still paged (DECLINED pages), and the reason names the rejection so it is actionable
+            # rather than an endless "claim broadcast failed".
+            if self._seen is not None:
+                await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
+            logger.error(
+                "autonomous claim swap %s: node PERMANENTLY rejected the covenant claim (%s) — "
+                "not retrying; operator must act before the deadline",
+                swap_id,
+                exc,
+            )
+            return ExecOutcome.DECLINED, f"node rejected the claim on a policy/consensus rule (permanent): {exc}"
         except NetworkError as exc:
             if _is_missing_utxo(exc):  # raced to spent between the check and the build → benign
                 return ExecOutcome.DECLINED, "covenant spent during claim (raced) — idempotent no-op"
