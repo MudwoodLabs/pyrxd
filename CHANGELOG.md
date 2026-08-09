@@ -4,7 +4,35 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.12.0] — 2026-08-09
+
+Correctness and hardening release. It fixes **four defects that could cost users funds or
+strand assets**, closes a verified-exploitable local command-execution path in the watchtower,
+and makes the watchtower installable for the first time. The cross-chain swap stack remains
+**unaudited** and the RSWP orderbook **experimental** — an external audit and a genuine
+two-party adversarial run are still the gates before real, adversarial value.
+
+### ⚠ Breaking-class changes (read before upgrading)
+
+Per [the versioning policy](docs/versioning-and-deprecation-policy.md), a `0.N → 0.N+1` minor may
+carry breaking-class changes and must name them. These are they:
+
+1. **BIP39 seeds change for non-ASCII passphrases.** Seeds are now NFKD-normalized, as BIP39
+   requires. If you created a wallet with a passphrase containing non-ASCII characters, its
+   derived addresses change and the wallet file no longer decrypts under the default path.
+   **Your funds are reachable**: pass `normalize=False` to `HdWallet.load` / `from_mnemonic` /
+   `discover` to derive the old seed and sweep to a conformant wallet. See
+   [the recovery how-to](docs/how-to/recover-funds-across-wallet-paths.md). Inert for ASCII
+   passphrases and for no passphrase, which is the overwhelmingly common case.
+2. **`glyph mint-nft` and `glyph deploy-ft` report a different `ref`.** They now return the
+   **commit** outpoint — the token's actual on-chain identity — instead of the reveal txid. Any
+   ref you recorded from an earlier run is wrong and should be re-read from the chain. The tokens
+   themselves were always correctly formed; only the reported identifier was wrong.
+3. **The watchtower refuses configurations it previously accepted.** Secret and ACK-inbox files
+   must be mode 0600 and owned by the running user; a symlinked secret file, a configured-but-empty
+   secret, and an unauthenticated ACK inbox are all now refused. `--ssh-host` / `--ssh-container`
+   no longer default to one operator's private infrastructure and are required when the ssh
+   backend is selected. Existing deployments may need to `chmod 600` their files and add two flags.
 
 ### Added
 
