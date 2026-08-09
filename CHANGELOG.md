@@ -8,6 +8,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`glyph mint-nft` and `glyph deploy-ft` reported the wrong genesis ref.** Both
+  printed `<reveal_txid>:0`, but a Glyph token's permanent identity is its
+  **commit** outpoint — that is what `prepare_reveal` embeds into the reveal's
+  locking script, and what `extract_ref_from_{nft,ft}_script` reads back. Since
+  `transfer-nft` / `transfer-ft` locate a token by the *extracted* ref, the
+  identifier these commands printed could never be resolved by the commands meant
+  to consume it. The ref is now the commit outpoint, matching the builders, the
+  scanner, and `docs/tutorials/quickstart.md`.
+
+  **Impact:** any ref recorded from a previous `mint-nft` / `deploy-ft` run is
+  wrong and should be re-read from the chain — the token itself is unaffected and
+  was always correctly formed on-chain; only the reported identifier was wrong.
+  The commands' `commit_txid` / `reveal_txid` fields were, and remain, correct.
+
 - **BIP39 seeds were derived without NFKD normalization** (`hd/bip39.py`). BIP39
   requires the mnemonic sentence and the passphrase to be NFKD-normalized before
   they enter PBKDF2. pyrxd hashed both raw, so two spellings a user cannot tell
