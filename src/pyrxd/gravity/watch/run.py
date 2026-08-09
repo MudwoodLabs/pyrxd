@@ -37,6 +37,8 @@ import contextlib
 import logging
 import signal
 import sys
+from collections.abc import Awaitable, Callable, Sequence
+from pathlib import Path
 
 import aiohttp
 
@@ -44,10 +46,13 @@ from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
 from pyrxd.gravity.swap_coordinator import MarginPolicy
 from pyrxd.gravity.watch import (
+    AckingAlerter,
+    AlertChannel,
     ChainObserver,
     CompositeAlertChannel,
     DedupAlerter,
     ElectrumRxdChainSource,
+    EthChainSource,
     Executor,
     FileAckInbox,
     FileHeartbeat,
@@ -58,6 +63,7 @@ from pyrxd.gravity.watch import (
     Reconciler,
     RefundExecutor,
     RpcEthChainSource,
+    RxdChainSource,
     WebhookAlertChannel,
     combine_heartbeats,
     default_heartbeat,
@@ -76,16 +82,16 @@ logger = logging.getLogger("pyrxd.watchtower")
 
 def build_reconciler(
     *,
-    records_dir,
-    rxd_source,
-    rxd_corroborated,
-    btc_funding_reader,
-    http_session,
-    mempool_base_urls,
+    records_dir: str | Path,
+    rxd_source: RxdChainSource,
+    rxd_corroborated: bool,
+    btc_funding_reader: MultiSourceBtcFundingReader,
+    http_session: aiohttp.ClientSession,
+    mempool_base_urls: Sequence[str],
     policy: MarginPolicy,
     safety_window_blocks: int,
-    alert_channel,
-    eth_source=None,
+    alert_channel: AlertChannel,
+    eth_source: EthChainSource | None = None,
     executor: Executor | None = None,
 ) -> Reconciler:
     """Compose the real ports into a Reconciler (pure wiring — no network at call time).
@@ -101,8 +107,8 @@ def build_reconciler(
 
     # Multi-source claim DETECTION (red-team MEDIUM): one /outspend fn per independent Esplora so a
     # single lagging/lying source cannot suppress the PAGE_CLAIM (detection fails toward paging).
-    def _make_outspend(base_url: str):
-        async def _outspend(funding_txid: str, vout: int):
+    def _make_outspend(base_url: str) -> Callable[[str, int], Awaitable[tuple[bool, str | None]]]:
+        async def _outspend(funding_txid: str, vout: int) -> tuple[bool, str | None]:
             return await mempool_space_outspend(http_session, base_url, funding_txid, vout)
 
         return _outspend
@@ -207,7 +213,7 @@ DEFAULT_RXD_ELECTRUMX = (
 )
 
 
-async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
+async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> tuple[RxdChainSource, bool]:
     """Assemble the RXD chain source(s); return ``(source, corroborated)``.
 
     Composes (optionally) the operator's own ssh-tr node + any number of INDEPENDENT public ElectrumX
@@ -217,7 +223,7 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     (the v1 alert-only posture). ssh-tr is read-only (no broadcast surface); ElectrumX websockets are
     context-managed so the stack closes them on exit. Note: corroboration clears the low-corroboration
     gate but does NOT lift the executor's dust cap or the mainnet ``audit_cleared`` gate."""
-    sources: list = []
+    sources: list[RxdChainSource] = []
     # The operator's own node (independent infra) — included on --rxd-backend ssh-tr OR --rxd-include-node.
     if args.rxd_backend == "ssh-tr" or args.rxd_include_node:
         from pyrxd.gravity.watch.sshtr import SshTrRxdReader  # deferred: only needed for this backend
@@ -264,7 +270,7 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     return MultiSourceRxdChainSource(sources, quorum=args.rxd_quorum), args.rxd_quorum >= 2
 
 
-async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack):
+async def _build_eth_source(args: argparse.Namespace, stack: contextlib.AsyncExitStack) -> RpcEthChainSource | None:
     """Optional ETH counter-leg source (alert-only v3): a keyless, read-only ``RpcEthChainSource``
     over ``EthRpc``. Returns ``None`` when ``--eth-rpc-url`` is unset (a BTC-only tower). Fails closed
     on a wrong network (``assert_chain``) so the tower never watches the wrong chain, and registers
@@ -310,7 +316,7 @@ def _policy_from_args(args: argparse.Namespace) -> MarginPolicy:
     return MarginPolicy.estimated(block_interval_s=args.block_interval_s, accept_flat_burial=args.accept_flat_burial)
 
 
-def _parse_args(argv=None) -> argparse.Namespace:
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HTLC swap watchtower (v1 alert-only, BTC)")
     p.add_argument("--records-dir", required=True, help="dir of SwapRecord JSON files to watch")
     p.add_argument(
@@ -469,9 +475,31 @@ def _parse_args(argv=None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def _build_alert_channel(args: argparse.Namespace, session):
+def _require_acking_alerter(alerter: object, ack_inbox: str) -> AckingAlerter:
+    """Fail loudly at startup when ``--ack-inbox`` is configured against an alerter that
+    cannot consume ACKs.
+
+    PROBE, don't assume — the same discipline the heartbeat already applies to
+    ``unacked_critical_count``. ``ack`` is a :class:`DedupAlerter` capability, not part of
+    the reconciler's ``Alerter`` port, so an alerter without it used to raise
+    ``AttributeError`` inside the per-tick hook. ``run_loop`` guards that hook (a hook
+    fault must not stop the reconcile loop), so the tower kept running and merely logged
+    — but ``FileAckInbox.drain`` had *already* renamed the inbox aside and deleted it, so
+    every acknowledgement the operator sent was consumed and destroyed, every tick, while
+    the un-ACK'd CRITICAL count stayed latched. Refusing to start is the honest answer:
+    an operator who configured an ACK transport must not be handed a dead one.
+    """
+    if not isinstance(alerter, AckingAlerter):
+        raise ValidationError(
+            f"--ack-inbox {ack_inbox} needs an alerter exposing ack(swap_id) (DedupAlerter does); "
+            f"{type(alerter).__name__} does not — refusing to start with a dead ACK path"
+        )
+    return alerter
+
+
+def _build_alert_channel(args: argparse.Namespace, session: aiohttp.ClientSession) -> AlertChannel:
     """Always log; additionally POST to an authenticated webhook if configured."""
-    channels = [LoggingAlertChannel()]
+    channels: list[AlertChannel] = [LoggingAlertChannel()]
     if args.webhook_url:
         auth = None
         auth_header = _resolve_secret(
@@ -493,7 +521,7 @@ def _build_alert_channel(args: argparse.Namespace, session):
     return channels[0] if len(channels) == 1 else CompositeAlertChannel(*channels)
 
 
-async def _amain(argv=None) -> int:
+async def _amain(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     args = _parse_args(argv)
     policy = _policy_from_args(args)
@@ -512,7 +540,12 @@ async def _amain(argv=None) -> int:
     if args.network == "bc" and len(esploras) == 1 and "blockstream.info" not in args.mempool_base_url:
         esploras.append("https://blockstream.info")
     _seen: set[str] = set()
-    esploras = [u for u in esploras if not (u in _seen or _seen.add(u))]
+    _deduped: list[str] = []
+    for url in esploras:
+        if url not in _seen:
+            _seen.add(url)
+            _deduped.append(url)
+    esploras = _deduped
 
     # Anti-silent-failure defaults (red-team MEDIUM): without a webhook AND a heartbeat file, paging
     # is log-only and the cross-process dead-man's-switch is DISABLED. Warn loudly at startup.
@@ -575,17 +608,20 @@ async def _amain(argv=None) -> int:
             heartbeat = combine_heartbeats(heartbeat, FileHeartbeat(args.heartbeat_file, unacked_critical=unacked))
         # Drain the operator ACK inbox once per tick, before the reconciler decides. An ACK is
         # never lost or double-consumed (FileAckInbox.drain renames the inbox aside atomically).
-        on_tick_start = None
+        on_tick_start: Callable[[], None] | None = None
         if args.ack_inbox:
+            acking_alerter = _require_acking_alerter(alerter, args.ack_inbox)
             ack_inbox = FileAckInbox(args.ack_inbox)
 
-            def on_tick_start() -> None:  # deliberate conditional (re)definition of on_tick_start
+            def _drain_acks() -> None:
                 for swap_id in ack_inbox.drain():
-                    if not alerter.ack(swap_id):
+                    if not acking_alerter.ack(swap_id):
                         # ACKs are inert for an unknown/uncritical swap (DedupAlerter.ack records
                         # nothing), but say so: it is either an operator typo on a time-critical
                         # page, or someone probing the inbox to silence one.
                         logger.warning("ACK for %r ignored — no live CRITICAL situation with that swap id", swap_id)
+
+            on_tick_start = _drain_acks
 
         tick_budget = args.tick_timeout_s if args.tick_timeout_s is not None else max(4.0 * args.poll_interval_s, 30.0)
         rxd_desc = (
@@ -622,7 +658,7 @@ async def _amain(argv=None) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """Console-script shell. Returns the process exit code (0 ok, 1 config error, 2 unsafe timing).
 
     The tower's config checks live in package code, so they raise typed

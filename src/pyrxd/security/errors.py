@@ -85,6 +85,20 @@ def redact(value: Any) -> Any:
     return value
 
 
+def _rebuild_error(cls: type[BaseException], args: tuple[Any, ...]) -> BaseException:
+    """Reconstruct *cls* from its ``args`` without going through ``__init__``.
+
+    The unpickle half of :meth:`RxdSdkError.__reduce__`. Deliberately bypasses the
+    subclass constructor: several of the classes below take **keyword-only**
+    arguments and derive ``args`` from them, so replaying ``args`` positionally
+    (what the default ``BaseException.__reduce__`` does) cannot work. Instance
+    attributes are restored separately by pickle, from the state dict.
+    """
+    exc = cls.__new__(cls)
+    BaseException.__init__(exc, *args)
+    return exc
+
+
 class RxdSdkError(Exception):
     """Base class for every exception raised by pyrxd.
 
@@ -95,6 +109,27 @@ class RxdSdkError(Exception):
 
     def __init__(self, *args: Any) -> None:
         super().__init__(*(redact(a) for a in args))
+
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Make the whole family picklable, including keyword-only subclasses.
+
+        ``BaseException.__reduce__`` returns ``(type(self), self.args)`` and pickle
+        then calls ``type(self)(*args)``. That is wrong for any subclass whose
+        constructor is keyword-only and *derives* ``args`` from those keywords —
+        :class:`InsufficientConfirmationsError` and :class:`ConfirmationTimeoutError`
+        both build a single message string from ``have``/``required``/…, so the replay
+        raised ``TypeError: __init__() takes 1 positional argument but 2 were given``.
+        That breaks ``pickle``, ``copy.copy``, and — the one that bites in production —
+        re-raising an SDK exception across a ``ProcessPoolExecutor`` boundary, where the
+        real error is replaced by an opaque unpickling ``TypeError``.
+
+        Rebuilding via :func:`_rebuild_error` skips ``__init__`` entirely and restores
+        ``args`` verbatim (already redacted at construction — never re-redacted, so a
+        round trip is idempotent). Instance attributes ride along in the state dict,
+        which pickle applies to ``__dict__`` after the call. Defined on the base class
+        so a *new* subclass with keyword-only arguments is correct by default.
+        """
+        return (_rebuild_error, (type(self), self.args), self.__dict__.copy())
 
 
 class KeyMaterialError(RxdSdkError):

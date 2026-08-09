@@ -12,6 +12,7 @@ from __future__ import annotations
 import pytest
 
 from pyrxd.fee_models import SatoshisPerKilobyte
+from pyrxd.glyph import fees
 from pyrxd.glyph.builder import MIN_FEE_RATE, CommitParams, GlyphBuilder, RevealParams
 from pyrxd.glyph.fees import (
     P2PKH_LOCKING_SCRIPT_BYTES,
@@ -19,6 +20,7 @@ from pyrxd.glyph.fees import (
     check_reveal_funding,
     estimate_reveal_fee,
     estimate_reveal_fee_for_metadata,
+    measure_reveal_fee,
     reveal_locking_script_size,
 )
 from pyrxd.glyph.payload import encode_payload
@@ -41,7 +43,9 @@ def _ft_metadata() -> GlyphMetadata:
     return GlyphMetadata(name="Test", description="test", ticker="TST", protocol=[int(GlyphProtocol.FT)])
 
 
-def _build_real_reveal(metadata: GlyphMetadata, *, commit_value: int, fee_rate: int) -> Transaction:
+def _build_real_reveal(
+    metadata: GlyphMetadata, *, commit_value: int, fee_rate: int, commit_txid: str = "ab" * 32
+) -> Transaction:
     """Build + sign a reveal exactly the way ``_mint_nft_inner`` does."""
     from pyrxd.cli.glyph_helpers import _build_glyph_unlock
 
@@ -53,7 +57,7 @@ def _build_real_reveal(metadata: GlyphMetadata, *, commit_value: int, fee_rate: 
     )
     reveal_scripts = builder.prepare_reveal(
         RevealParams(
-            commit_txid="ab" * 32,
+            commit_txid=commit_txid,
             commit_vout=0,
             commit_value=commit_value,
             cbor_bytes=commit.cbor_bytes,
@@ -63,7 +67,7 @@ def _build_real_reveal(metadata: GlyphMetadata, *, commit_value: int, fee_rate: 
     )
     shim_out = TransactionOutput(Script(commit.commit_script), commit_value)
     src = Transaction(tx_inputs=[], tx_outputs=[shim_out])
-    src.txid = lambda: "ab" * 32  # type: ignore[method-assign]
+    src.txid = lambda: commit_txid  # type: ignore[method-assign]
 
     reveal_input = TransactionInput(
         source_transaction=src,
@@ -216,3 +220,72 @@ class TestEstimateArgumentValidation:
         one = estimate_reveal_fee(cbor_bytes=cbor, is_nft=True)
         none = estimate_reveal_fee(cbor_bytes=cbor, is_nft=True, extra_output_script_sizes=())
         assert one.size_bytes - none.size_bytes == 8 + 1 + P2PKH_LOCKING_SCRIPT_BYTES
+
+
+class TestMeasureRevealFee:
+    """``measure_reveal_fee`` measures a BUILT reveal, which is what makes the CLI's
+    pre-broadcast guard something other than a tautology: the commit value is derived
+    from ``estimate_reveal_fee``, so re-checking it against that same estimate can never
+    fail. The measurement is taken from the real transaction instead."""
+
+    @pytest.mark.parametrize("description", ["t", "x" * 200, "y" * 900])
+    def test_measurement_agrees_with_the_estimate_on_a_real_reveal(self, description: str) -> None:
+        metadata = _nft_metadata(description)
+        reveal = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
+        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE)
+        estimate = estimate_reveal_fee_for_metadata(metadata, fee_rate=MIN_FEE_RATE)
+        assert measured.fee == estimate.fee
+        assert measured.size_bytes == estimate.size_bytes
+        assert measured.scriptsig_bytes == estimate.scriptsig_bytes
+
+    def test_a_placeholder_commit_txid_measures_identically_to_the_real_one(self) -> None:
+        # The CLI must measure the reveal BEFORE the commit exists, so it builds the
+        # dry run against an all-zero txid. A txid is 32 bytes whatever its value —
+        # both in the input outpoint and in the locking script's ref push — so the two
+        # transactions serialize to the same length. This is the assumption the whole
+        # pre-broadcast check rests on.
+        metadata = _nft_metadata("x" * 300)
+        placeholder = _build_real_reveal(
+            metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE, commit_txid="00" * 32
+        )
+        real = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE, commit_txid="9f" * 32)
+        assert measure_reveal_fee(placeholder, fee_rate=MIN_FEE_RATE) == measure_reveal_fee(real, fee_rate=MIN_FEE_RATE)
+
+    def test_measurement_catches_a_shim_that_understates_the_prefix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The drift this guard exists for: if the estimator's sig+pubkey allowance ever
+        # falls below what the real unlocking template reports, the estimate — and the
+        # commit value derived from it — is too small, and a check against the estimate
+        # would still pass. Measuring the built transaction catches it.
+        metadata = _nft_metadata("x" * 200)
+        reveal = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
+        monkeypatch.setattr(fees, "REVEAL_SIG_PREFIX_BYTES", 7)
+        understated = estimate_reveal_fee_for_metadata(metadata, fee_rate=MIN_FEE_RATE)
+        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE)
+        assert understated.fee < measured.fee
+
+        commit_value = 546 + understated.fee  # what a caller sized from the bad estimate
+        check_reveal_funding(commit_value=commit_value, carrier_value=546, estimate=understated)  # tautology: passes
+        with pytest.raises(InsufficientFundsError):  # the measurement does not
+            check_reveal_funding(commit_value=commit_value, carrier_value=546, estimate=measured)
+
+    def test_falls_back_to_the_concrete_unlocking_script_when_signed(self) -> None:
+        metadata = _nft_metadata("x" * 100)
+        reveal = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
+        reveal.fee(SatoshisPerKilobyte(MIN_FEE_RATE * 1000))
+        reveal.sign()
+        signed = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE)
+        # A real low-S signature is a byte or two shorter than the 107-byte allowance.
+        assert signed.size_bytes <= estimate_reveal_fee_for_metadata(metadata, fee_rate=MIN_FEE_RATE).size_bytes
+
+    def test_carries_the_cbor_length_into_the_error_message(self) -> None:
+        metadata = _nft_metadata("x" * 900)
+        reveal = _build_real_reveal(metadata, commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
+        measured = measure_reveal_fee(reveal, fee_rate=MIN_FEE_RATE, cbor_bytes_len=931)
+        with pytest.raises(InsufficientFundsError, match="931 bytes of CBOR"):
+            check_reveal_funding(commit_value=546, carrier_value=546, estimate=measured)
+
+    @pytest.mark.parametrize("fee_rate", [0, -1, 1.5, True, "10000"])
+    def test_rejects_a_bad_fee_rate(self, fee_rate) -> None:
+        reveal = _build_real_reveal(_nft_metadata(), commit_value=200_000_000, fee_rate=MIN_FEE_RATE)
+        with pytest.raises(ValidationError):
+            measure_reveal_fee(reveal, fee_rate=fee_rate)

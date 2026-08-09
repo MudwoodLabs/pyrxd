@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..glyph.fees import REVEAL_SIG_PREFIX_BYTES
 from ..glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from ..script.script import Script
 from ..script.type import encode_pushdata, to_unlock_script_template
@@ -249,7 +250,10 @@ def _build_glyph_unlock(privkey: PrivateKey, scriptsig_suffix: bytes):
         return Script(p2pkh_part + scriptsig_suffix)
 
     def estimated_unlocking_byte_length() -> int:
-        return 107 + len(scriptsig_suffix)
+        # REVEAL_SIG_PREFIX_BYTES is imported, not re-stated: pyrxd.glyph.fees sizes the
+        # reveal fee from the same number, and a private copy here that drifted from it
+        # would make the fee guard under-estimate and pass — stranding the commit.
+        return REVEAL_SIG_PREFIX_BYTES + len(scriptsig_suffix)
 
     return to_unlock_script_template(sign, estimated_unlocking_byte_length)
 

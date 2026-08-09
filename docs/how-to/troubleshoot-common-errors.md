@@ -326,13 +326,47 @@ up." At the CLI, a poll that never confirms surfaces as:
 ```
 error: timed out waiting for confirmation
   cause: tx has <N> confirmations, required <M> (timeout (last poll error: <text>))
-  fix: check the chain explorer; if confirmed, re-run with COMMIT_TXID=<txid> to resume reveal
+  fix: check the txid on a block explorer. Not confirmed: nothing is stranded — re-run the
+       command. Confirmed: this CLI has no resume flag, so rebuild the reveal with the SDK …
 ```
 
-— [`src/pyrxd/cli/glyph_cmds.py:437-452`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py),
-exit code 2. **Fix:** check the commit txid on a block explorer. If it
-confirmed, resume with `COMMIT_TXID=<txid>` rather than re-broadcasting a
-new commit. If it never confirmed, re-broadcast is the recovery.
+— [`src/pyrxd/cli/glyph_cmds.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/cli/glyph_cmds.py),
+exit code 2. **Fix:** check the commit txid on a block explorer.
+
+- **It never confirmed.** Nothing was spent that you cannot re-spend. Re-run
+  the command.
+- **It confirmed.** There is no `--resume` flag and no `COMMIT_TXID`
+  environment variable in this CLI — earlier versions of this page and of the
+  error hint said otherwise, and were wrong. (`COMMIT_TXID` is read by the
+  standalone `examples/*.py` demo scripts, which carry their own hard-coded
+  metadata and cannot resume a CLI mint.) Recover through the SDK instead:
+
+  ```python
+  from pyrxd.glyph.builder import GlyphBuilder, RevealParams
+  from pyrxd.glyph.payload import encode_payload
+
+  cbor_bytes, _payload_hash = encode_payload(metadata)   # the SAME metadata file, unmodified
+  scripts = GlyphBuilder().prepare_reveal(
+      RevealParams(
+          commit_txid=commit_txid,      # from the explorer
+          commit_vout=0,
+          commit_value=commit_value,    # the commit output's value
+          cbor_bytes=cbor_bytes,
+          owner_pkh=owner_pkh,          # the minting wallet's PKH
+          is_nft=True,                  # False for an FT deploy
+      )
+  )
+  ```
+
+  Then build the reveal transaction spending `commit_txid:0` with
+  `scripts.scriptsig_suffix` appended to a normal P2PKH unlock — see
+  `examples/glyph_mint_demo.py` for the shape.
+
+  **The metadata file must be byte-identical.** The commit output's script is
+  `OP_HASH256 <payload_hash> OP_EQUALVERIFY …` before its P2PKH tail, so it can
+  only ever be spent by a reveal that pushes CBOR hashing to that exact
+  `payload_hash`. Re-encoding an edited metadata file produces a different hash
+  and the output becomes unspendable — there is no owner-only escape path.
 
 ---
 

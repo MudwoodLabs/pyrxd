@@ -80,6 +80,23 @@ class AlertChannel(Protocol):
     async def send(self, page: Page) -> None: ...
 
 
+@runtime_checkable
+class AckingAlerter(Protocol):
+    """An alerter that can consume operator acknowledgements.
+
+    Deliberately NOT folded into the reconciler's ``Alerter`` port: the reconciler never
+    calls ``ack``, and requiring it would break every minimal third-party alerter. It is
+    the *shell* that needs it, to wire ``--ack-inbox``, so the shell probes for it with
+    ``isinstance`` and refuses to start when the configured alerter cannot honour the
+    inbox — rather than raising ``AttributeError`` inside the per-tick hook, where the
+    loop's guard would log it and carry on with every ACK silently discarded.
+
+    :class:`DedupAlerter` satisfies it.
+    """
+
+    def ack(self, swap_id: str) -> bool: ...
+
+
 def _message(swap_id: str, decision: Decision, severity: Severity) -> str:
     parts = [f"[{severity.value.upper()}] swap {swap_id}: {decision.reason}"]
     if decision.recommended_action:

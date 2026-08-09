@@ -1152,3 +1152,85 @@ class TestWaitForTxTranslation:
             asyncio.run(wait_for_confirmation(client, "ab" * 32, timeout_s=1e-9))
 
         assert not isinstance(ei.value, click.ClickException)
+
+
+class TestConfirmationTimeoutRecoveryHint:
+    """A confirmation timeout can strand real value (the commit output has no
+    owner-only spend path), so the hint must describe a recovery that exists. It used
+    to say "re-run with COMMIT_TXID=<txid>" — a flag this CLI has never had."""
+
+    def _timeout_error(self):
+        from pyrxd.cli.errors import NetworkBoundaryError
+        from pyrxd.cli.glyph_cmds import _wait_for_tx
+
+        client = MagicMock()
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 0})
+        with pytest.raises(NetworkBoundaryError) as ei:
+            asyncio.run(_wait_for_tx(client, "ab" * 32, timeout_s=1e-9))
+        return ei.value
+
+    def test_hint_names_no_flag_or_env_var_the_cli_does_not_have(self) -> None:
+        fix = self._timeout_error().fix
+        assert "COMMIT_TXID" not in fix
+        assert "--resume" not in fix
+        # Whatever it names must actually be reachable from the shipped CLI options.
+        from pyrxd.cli.glyph_cmds import deploy_ft_cmd, mint_nft_cmd
+
+        declared = {opt for cmd in (mint_nft_cmd, deploy_ft_cmd) for p in cmd.params for opt in getattr(p, "opts", ())}
+        assert not any(word.startswith("--") and word not in declared for word in fix.split())
+
+    def test_hint_points_at_the_sdk_call_that_exists(self) -> None:
+        from pyrxd.glyph.builder import GlyphBuilder, RevealParams
+
+        fix = self._timeout_error().fix
+        assert "prepare_reveal" in fix
+        assert hasattr(GlyphBuilder, "prepare_reveal")
+        # Every keyword the hint spells out must be a real RevealParams field.
+        named = {"commit_txid", "commit_vout", "commit_value", "cbor_bytes", "owner_pkh", "is_nft"}
+        assert named <= set(RevealParams.__dataclass_fields__)
+        assert all(f"{field}=" in fix for field in named)
+
+    def test_the_recovery_it_describes_reconstructs_a_spendable_reveal(self, tmp_path) -> None:
+        # Walk the documented path: re-read the SAME metadata file, re-encode, and check
+        # the rebuilt reveal still satisfies the commit script's payload-hash covenant.
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+        from pyrxd.glyph.builder import CommitParams, GlyphBuilder, RevealParams
+        from pyrxd.glyph.payload import encode_payload
+        from pyrxd.keys import PrivateKey
+        from pyrxd.security.types import Hex20
+
+        path = _write_meta(tmp_path / "nft.json", protocol=["NFT"])
+        key = PrivateKey()
+        pkh = Hex20(key.public_key().hash160())
+        builder = GlyphBuilder()
+        commit = builder.prepare_commit(
+            CommitParams(metadata=_read_metadata_file(path), owner_pkh=pkh, change_pkh=pkh, funding_satoshis=50_000_000)
+        )
+        embedded_payload_hash = commit.commit_script[2:34]  # OP_HASH256 PUSH32 <hash>
+
+        # …later, in a fresh process, from the unmodified file:
+        cbor_bytes, payload_hash = encode_payload(_read_metadata_file(path))
+        assert payload_hash == embedded_payload_hash
+        scripts = builder.prepare_reveal(
+            RevealParams(
+                commit_txid="ab" * 32,
+                commit_vout=0,
+                commit_value=5_000_000,
+                cbor_bytes=cbor_bytes,
+                owner_pkh=pkh,
+                is_nft=True,
+            )
+        )
+        # The suffix pushes exactly the CBOR the commit output's OP_HASH256 demands.
+        assert cbor_bytes == commit.cbor_bytes
+        assert cbor_bytes in scripts.scriptsig_suffix
+
+    def test_an_edited_metadata_file_does_not_reconstruct_it(self, tmp_path) -> None:
+        # Why the hint says "SAME unmodified metadata file": a different payload hashes
+        # differently and the commit output becomes unspendable.
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+        from pyrxd.glyph.payload import encode_payload
+
+        original = _read_metadata_file(_write_meta(tmp_path / "a.json", protocol=["NFT"]))
+        edited = _read_metadata_file(_write_meta(tmp_path / "b.json", protocol=["NFT"], name="Edited"))
+        assert encode_payload(original)[1] != encode_payload(edited)[1]

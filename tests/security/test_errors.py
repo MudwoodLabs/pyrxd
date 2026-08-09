@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import copy
+import inspect
+import pickle
+
 import pytest
 
+from pyrxd.security import errors
 from pyrxd.security.errors import (
     ConfirmationTimeoutError,
     ContractExhaustedError,
@@ -289,3 +294,114 @@ class TestPolicyRejectionParentage:
         err = PolicyRejection("rejected")
         assert err.code is None
         assert err.reason is None
+
+
+# ---------------------------------------------------------------------------
+# Pickle / copy round trips
+# ---------------------------------------------------------------------------
+#
+# ``BaseException.__reduce__`` replays ``self.args`` POSITIONALLY through the
+# constructor. Several classes here take keyword-only arguments and *derive* args
+# from them, so the replay raised
+# ``TypeError: __init__() takes 1 positional argument but 2 were given`` — breaking
+# ``pickle.loads``, ``copy.copy``, and the re-raise of an SDK error across a
+# ``ProcessPoolExecutor`` boundary (where the real failure is replaced by an opaque
+# unpickling TypeError). ``RxdSdkError.__reduce__`` fixes it for the whole family.
+
+# One sample value per constructor parameter name used anywhere in the module. The
+# round-trip test below builds EVERY exported exception from this table, so adding a
+# class with a new parameter fails the test until the table is extended — which is the
+# point: the next keyword-only exception cannot silently ship unpicklable.
+_SAMPLE_ARGS: dict[str, object] = {
+    "message": "boom",
+    "available": 3,
+    "required": 6,
+    "have": 1,
+    "detail": "gave up early",
+    "txid": "ab" * 32,
+    "waited_s": 12.5,
+    "reason": "max_iterations=3",
+    "code": -26,
+    "attempts": 9,
+    "elapsed_s": 1.5,
+}
+
+
+def _all_sdk_exception_classes() -> list[type[RxdSdkError]]:
+    """Every exception class this module exports, discovered — not hand-listed."""
+    found = [getattr(errors, name) for name in errors.__all__]
+    return sorted(
+        (obj for obj in found if isinstance(obj, type) and issubclass(obj, RxdSdkError)),
+        key=lambda c: c.__name__,
+    )
+
+
+def _construct(exc_cls: type[RxdSdkError]) -> RxdSdkError:
+    """Instantiate *exc_cls* with a value for every parameter its ``__init__`` declares."""
+    args: list[object] = []
+    kwargs: dict[str, object] = {}
+    params = list(inspect.signature(exc_cls.__init__).parameters.values())[1:]  # drop self
+    for param in params:
+        if param.kind is inspect.Parameter.VAR_POSITIONAL:
+            args.append(_SAMPLE_ARGS["message"])  # the *args message
+            continue
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            continue
+        assert param.name in _SAMPLE_ARGS, (
+            f"{exc_cls.__name__}.__init__ takes an unknown parameter {param.name!r}; "
+            "add a sample value to _SAMPLE_ARGS so the pickle round trip covers it"
+        )
+        value = _SAMPLE_ARGS[param.name]
+        if param.kind is inspect.Parameter.KEYWORD_ONLY:
+            kwargs[param.name] = value
+        else:
+            args.append(value)
+    return exc_cls(*args, **kwargs)  # type: ignore[arg-type]
+
+
+class TestExceptionRoundTrips:
+    """Every SDK exception must survive pickle and copy — including keyword-only ones."""
+
+    @pytest.mark.parametrize("exc_cls", _all_sdk_exception_classes(), ids=lambda c: c.__name__)
+    def test_pickle_round_trip_preserves_message_and_attributes(self, exc_cls: type[RxdSdkError]) -> None:
+        original = _construct(exc_cls)
+        restored = pickle.loads(pickle.dumps(original))
+        assert type(restored) is exc_cls
+        assert restored.args == original.args
+        assert str(restored) == str(original)
+        assert vars(restored) == vars(original)
+
+    @pytest.mark.parametrize("exc_cls", _all_sdk_exception_classes(), ids=lambda c: c.__name__)
+    def test_copy_round_trip(self, exc_cls: type[RxdSdkError]) -> None:
+        # copy.copy goes through the same __reduce_ex__ path as pickle.
+        original = _construct(exc_cls)
+        assert str(copy.copy(original)) == str(original)
+        assert vars(copy.deepcopy(original)) == vars(original)
+
+    def test_every_exported_exception_is_covered(self) -> None:
+        # Guards the discovery itself: if __all__ stops exporting the exception classes
+        # the parametrized tests above would silently shrink to nothing.
+        names = {c.__name__ for c in _all_sdk_exception_classes()}
+        assert {"ConfirmationTimeoutError", "InsufficientConfirmationsError", "PolicyRejection"} <= names
+
+    def test_keyword_only_classes_were_the_regression(self) -> None:
+        # The exact repro: both take keyword-only args and derive `args` from them, so
+        # the default BaseException.__reduce__ replayed a message string positionally.
+        err = ConfirmationTimeoutError(txid="ab" * 32, have=0, required=1, waited_s=1.0)
+        restored = pickle.loads(pickle.dumps(err))
+        assert restored.txid == err.txid
+        assert (restored.have, restored.required, restored.waited_s) == (0, 1, 1.0)
+        base = InsufficientConfirmationsError(have=0, required=2, detail="why")
+        assert str(pickle.loads(pickle.dumps(base))) == str(base)
+
+    def test_round_trip_does_not_re_redact(self) -> None:
+        # Rebuilding restores args verbatim rather than replaying them through
+        # __init__, so a redacted arg cannot be redacted a second time.
+        err = KeyMaterialError("cafebabe" * 8)
+        assert str(err) == "<redacted>"
+        assert str(pickle.loads(pickle.dumps(err))) == "<redacted>"
+
+    def test_raising_a_restored_exception_still_works(self) -> None:
+        restored = pickle.loads(pickle.dumps(NetworkError("down")))
+        with pytest.raises(NetworkError, match="down"):
+            raise restored
