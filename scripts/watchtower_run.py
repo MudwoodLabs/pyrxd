@@ -47,6 +47,7 @@ from pyrxd.gravity.watch import (
     DedupAlerter,
     ElectrumRxdChainSource,
     Executor,
+    FileAckInbox,
     FileHeartbeat,
     JsonDirRecordStore,
     LoggingAlertChannel,
@@ -390,6 +391,15 @@ def _parse_args(argv=None) -> argparse.Namespace:
     )
     # #2 dead-man's switch: write a liveness file each tick (watched by watchtower_deadman.py)
     p.add_argument("--heartbeat-file", help="write a liveness heartbeat here each tick")
+    # Operator -> watchtower ACK transport. Without this the un-ACK'd CRITICAL count can never
+    # fall once a CRITICAL situation is paged, so an escalation monitor reading the heartbeat
+    # would latch on forever. See FileAckInbox in gravity/watch/alerts.py.
+    p.add_argument(
+        "--ack-inbox",
+        help="operator ACK inbox: append a swap_id per line (e.g. `echo <swap_id> >> FILE`) to "
+        "acknowledge its CRITICAL page. Drained once per tick; suppresses re-paging for that "
+        "exact situation and drops it from the heartbeat's unacked_critical count.",
+    )
     # ETH counter-leg (alert-only v3): watch RXD↔ETH swaps too. Read-only, no key, never touches p.
     p.add_argument(
         "--eth-rpc-url",
@@ -551,9 +561,26 @@ async def _amain(argv=None) -> int:
             eth_source=eth_source,
             executor=executor,
         )
+        # Wire the un-ACK'd CRITICAL count into the heartbeat. Without this the emitted beat
+        # carries no `unacked_critical` key at all, so an external escalation monitor has
+        # nothing to read and cannot distinguish "no outstanding pages" from "not wired".
+        # Reconciler.alerter exists precisely for this (see its docstring).
+        alerter = reconciler.alerter
+        unacked = getattr(alerter, "unacked_critical_count", None)
         heartbeat = default_heartbeat(logger)
         if args.heartbeat_file:
-            heartbeat = combine_heartbeats(heartbeat, FileHeartbeat(args.heartbeat_file))
+            heartbeat = combine_heartbeats(
+                heartbeat, FileHeartbeat(args.heartbeat_file, unacked_critical=unacked)
+            )
+        # Drain the operator ACK inbox once per tick, before the reconciler decides. An ACK is
+        # never lost or double-consumed (FileAckInbox.drain renames the inbox aside atomically).
+        on_tick_start = None
+        if args.ack_inbox:
+            ack_inbox = FileAckInbox(args.ack_inbox)
+
+            def on_tick_start() -> None:  # noqa: F811 — deliberate conditional definition
+                for swap_id in ack_inbox.drain():
+                    alerter.ack(swap_id)
         tick_budget = args.tick_timeout_s if args.tick_timeout_s is not None else max(4.0 * args.poll_interval_s, 30.0)
         rxd_desc = (
             args.rxd_electrumx_url
@@ -579,6 +606,7 @@ async def _amain(argv=None) -> int:
             interval_s=args.poll_interval_s,
             stop=stop,
             on_heartbeat=heartbeat,
+            on_tick_start=on_tick_start,
             max_iterations=1 if args.once else None,
             tick_timeout_s=tick_budget,
         )
