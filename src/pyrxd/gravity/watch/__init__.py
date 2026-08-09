@@ -9,8 +9,11 @@ no key and moves no value — see
 Layering: this subpackage is the "brain" + thin transports/loop helper. It imports
 downward only (``gravity`` → ``btc_wallet``/``network``), never the reverse. The
 operational entrypoints are :mod:`pyrxd.gravity.watch.run` (the tower, console script
-``pyrxd-watchtower``) and :mod:`pyrxd.gravity.watch.deadman` (the independent
-dead-man's-switch monitor, console script ``pyrxd-watchtower-deadman``) — deliberately
+``pyrxd-watchtower``), :mod:`pyrxd.gravity.watch.deadman` (the independent
+dead-man's-switch monitor — "is the tower alive?" — console script
+``pyrxd-watchtower-deadman``), and :mod:`pyrxd.gravity.watch.escalation` (the
+second-channel escalation monitor — "is the OPERATOR alive?" — console script
+``pyrxd-watchtower-escalate``). All three are deliberately
 NOT part of the ``pyrxd`` CLI itself: the tower's v2 refund path is a real (dust-capped,
 audit-gated) broadcaster, and the shipped ``pyrxd`` command has zero broadcast surface
 for the cross-chain stack by design (see ``src/pyrxd/cli/swap_cmds.py``). The old
@@ -59,6 +62,14 @@ from pyrxd.gravity.watch.decide import (
     Observations,
     decide,
 )
+from pyrxd.gravity.watch.escalation import (
+    BeatReading,
+    EscalationMonitor,
+    EscalationState,
+    EscalationVerdict,
+    read_beat,
+    run_escalation_monitor,
+)
 from pyrxd.gravity.watch.eth_adapters import RpcEthChainSource
 from pyrxd.gravity.watch.executor import (
     CompositeExecutor,
@@ -71,6 +82,7 @@ from pyrxd.gravity.watch.executor import (
     make_refund_broadcaster,
 )
 from pyrxd.gravity.watch.heartbeat import (
+    HEARTBEAT_SCHEMA_VERSION,
     DeadMansSwitch,
     DeadManVerdict,
     FileHeartbeat,
@@ -94,8 +106,10 @@ from pyrxd.gravity.watch.reconciler import (
 )
 
 __all__ = [
+    "HEARTBEAT_SCHEMA_VERSION",
     "AlertChannel",
     "Alerter",
+    "BeatReading",
     "BtcClaimSource",
     "BtcClaimStatus",
     "CallbackAlertChannel",
@@ -110,6 +124,9 @@ __all__ = [
     "Decision",
     "DedupAlerter",
     "ElectrumRxdChainSource",
+    "EscalationMonitor",
+    "EscalationState",
+    "EscalationVerdict",
     "EthChainSource",
     "EthClaimStatus",
     "ExecOutcome",
@@ -145,6 +162,8 @@ __all__ = [
     "mempool_space_outspend",
     "mempool_space_tx_hex",
     "page_to_dict",
+    "read_beat",
+    "run_escalation_monitor",
     "run_loop",
     "run_monitor",
 ]

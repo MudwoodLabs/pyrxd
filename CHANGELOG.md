@@ -4,6 +4,37 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Watchtower second-channel escalation monitor** (`pyrxd-watchtower-escalate`,
+  `pyrxd.gravity.watch.escalation`). A third, separately-supervised process that reads the
+  heartbeat's `unacked_critical` count and pages a **different** channel when a CRITICAL
+  claim/squeeze page stays unacknowledged. The dead-man's-switch answers *is the tower alive?*;
+  this answers *is the operator alive?* — the case the primary channel cannot report on itself
+  (a muted app, a dead webhook receiver, a phone in a drawer). Previously the count was published
+  but had no consumer: escalation was a manual, external step.
+  - The threshold is measured in the **tower's** clock (deltas between beat `ts` values), not in
+    monitor iterations — the monitor does not tick with the tower, so a tick-based threshold would
+    fire at a wall-clock time that silently depended on the tower's poll interval.
+  - `{first_unacked_ts, last_escalated_ts, fired}` is persisted `0600` beside the heartbeat
+    (atomic tmp + `os.replace`), so a crash-restart loop cannot defer escalation indefinitely by
+    rewinding an in-memory countdown.
+  - Fail-closed reading of the count: an **absent** `unacked_critical` key refuses startup (it
+    means the producer is not wired, which is not "zero"); the `-1` sentinel the tower writes when
+    its count source raises **escalates immediately** (blind, not healthy); a **stale** beat does
+    not escalate at all but emits one edge-triggered WARN, so the dead-man's-switch keeps sole
+    ownership of the "tower is down" alarm and the escalation channel still proves it is alive.
+  - Channel distinctness is **enforced**: the monitor refuses to start when its `--webhook-url`
+    equals the tower's `--primary-webhook-url` (normalized compare) unless `--allow-same-channel`,
+    and warns when the two merely share a host.
+  - Recovery: an INFO page and a full state reset when the count returns to zero.
+- **`schema_version` on the watchtower heartbeat JSON** (currently `1`). Purely additive —
+  `heartbeat_age_s` and `DeadMansSwitch` read only `ts` — but it lets a consumer that interprets
+  *more* than `ts` refuse a payload shape it does not know. The escalation monitor does exactly
+  that. Upgrade the tower before the monitor.
+
 ## [0.12.0] — 2026-08-09
 
 Correctness and hardening release. It fixes **four defects that could cost users funds or

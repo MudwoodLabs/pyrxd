@@ -9,6 +9,7 @@ import json
 import pytest
 
 from pyrxd.gravity.watch import (
+    HEARTBEAT_SCHEMA_VERSION,
     CompositeAlertChannel,
     DeadMansSwitch,
     Decision,
@@ -141,6 +142,10 @@ def test_file_heartbeat_writes_atomically(tmp_path):
     ]
     hb(5, results)
     assert json.loads((tmp_path / "hb.json").read_text()) == {
+        # `schema_version` is additive: `heartbeat_age_s`/`DeadMansSwitch` read only `ts`, but a
+        # consumer that interprets MORE than ts (the escalation monitor reads unacked_critical)
+        # must be able to refuse a payload shape it does not know.
+        "schema_version": HEARTBEAT_SCHEMA_VERSION,
         "ts": 1000.0,
         "tick": 5,
         "swaps": 2,
