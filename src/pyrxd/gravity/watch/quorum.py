@@ -8,7 +8,7 @@ shell backs :class:`BtcClaimSource.confirmations` with
 2-of-3, fail-closed). The RXD side is now **multi-source** too:
 :class:`pyrxd.gravity.watch.adapters.MultiSourceRxdChainSource` composes >= 2 independent
 Radiant readers (the operator's node + public ElectrumX), and the daemon shell wires it by
-default (``scripts/watchtower_run.py``, 2-of-2 public ElectrumX) — passing
+default (``pyrxd.gravity.watch.run``, 2-of-2 public ElectrumX) — passing
 ``rxd_corroborated=True`` clears the ``low_corroboration`` flag. A single-source RXD config
 is still permitted as a fallback and stays flagged ``low_corroboration`` (a false RXD read
 causes a false *page*, never a false broadcast). Corroboration clears the alert-path flag; it

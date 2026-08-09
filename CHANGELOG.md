@@ -30,6 +30,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   timeout stays distinguishable from a broken transport). `InsufficientConfirmationsError`,
   `PolicyRejection` and `FeePoolExhaustedError` were missing from the module's `__all__`
   and/or from `pyrxd.security`'s re-exports; all are exported now.
+- **The HTLC watchtower's operational entrypoints are now pip-installable console
+  scripts**: `pyrxd-watchtower`, `pyrxd-watchtower-deadman`, and `pyrxd-presign-refund`.
+  Previously these lived under `scripts/`, which never ships in the wheel/sdist, so
+  `pip install pyrxd` alone could not run them — a `[project.scripts]` entry point must
+  resolve to importable package code. `watchtower_run.py`, `watchtower_deadman.py`,
+  `watchtower_sshtr.py`, and `presign_refund.py` moved to `pyrxd.gravity.watch.{run,
+  deadman, sshtr, presign}`; the old `scripts/` paths still work as thin back-compat
+  shims (`python scripts/watchtower_run.py ...`, etc.). These are deliberately **separate
+  console scripts, not `pyrxd` subcommands**: the tower's v2 refund path is a real
+  (dust-capped, audit-gated) broadcaster, and the shipped `pyrxd` CLI has zero broadcast
+  surface for the cross-chain stack by design.
+
+### Security
+
+- **The ssh-tr RXD reader's `ssh_host`/`container` constructor defaults are removed.**
+  `SshTrRxdReader` shipped with `ssh_host="tr"` / `container="radiant-mainnet"` — one
+  operator's private infrastructure hostname baked in as a default. Now that this reader
+  ships in the public wheel (see Added, above), both are required keyword arguments with
+  no default. The CLI's `--ssh-host` / `--ssh-container` flags are unaffected.
+- **The watchtower dead-man's-switch's `--webhook-secret` is no longer inline-flag-only.**
+  It previously accepted the HMAC secret only as a command-line argument, which is
+  world-readable via `/proc/<pid>/cmdline` (`ps`) to any local user and captured in shell
+  history. It now shares the tower's existing flag → 0600-file → env-var resolution
+  (`--webhook-secret-file` / `PYRXD_WATCHTOWER_DEADMAN_WEBHOOK_SECRET`, and the same for
+  `--webhook-auth-header` / `--webhook-auth-header-file`); the inline flag still works but
+  logs a warning. The shared resolver also now verifies a secret file is mode `0600`
+  before reading it (POSIX only), refusing a group/world-readable file rather than
+  silently trusting it.
 
 ### Fixed
 

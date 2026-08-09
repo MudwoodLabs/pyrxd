@@ -3,7 +3,7 @@
 Thin adapters that satisfy the watchtower ports by composing EXISTING pyrxd network
 code — they add no new heavy dependencies, so they can live in the package while the
 operational entrypoint (arg parsing, real-client construction, the poll loop) stays in
-``scripts/watchtower_run.py``.
+``pyrxd.gravity.watch.run`` (console script ``pyrxd-watchtower``).
 
 * :class:`JsonDirRecordStore` — discovers the operator's in-flight swaps from a
   directory of ``SwapRecord`` JSON files (the same JSON the coordinator persists),
@@ -145,7 +145,7 @@ class MultiSourceRxdChainSource:
     A single RXD source is flagged low-corroboration (a wrong read → a false page, never a
     false broadcast). Composing >= ``quorum`` independent sources lets a lone lagging/lying/down
     source NOT drive a decision; wire this and pass ``rxd_corroborated=True`` to the
-    :class:`ChainObserver` to clear the flag. The daemon shell (``scripts/watchtower_run.py``)
+    :class:`ChainObserver` to clear the flag. The daemon shell (``pyrxd.gravity.watch.run``)
     wires this by default over 2 independent public ElectrumX endpoints, so a default tower run
     is corroborated; a single-source run is the explicit fallback.
 
