@@ -351,6 +351,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dMint v2 flag gate, and an FT/NFT silently counted as plain RXD) to their
   cause and a one-line fix, each cited to the file and line that raises it.
 
+- **The sdist no longer packages gitignored build artifacts**, and `check-manifest` moved out
+  of the local `task ci` chain into CI only. Poetry's `include` globs match the *filesystem*,
+  not git, so `{ path = "docs/inspect_static" }` swept in the gitignored Pyodide wheels and any
+  local `__pycache__` — un-reviewed binaries in a source release. A top-level `exclude` does not
+  undo an explicit `include`, so the include is now narrowed to the tracked source extensions.
+  For the same filesystem-vs-git reason, `check-manifest` fails on any working tree holding
+  ordinary untracked scratch, which made `task ci` red during normal work; it now runs against
+  CI's clean checkout where the check is unambiguous. Note a local `python -m build` on a dirty
+  tree can still sweep untracked files into an sdist — releases are built by `publish.yml` from
+  a clean checkout, so published artifacts are unaffected.
+
 ## [0.11.2] — 2026-08-07
 
 Maintenance release. No functional, API, wire-format, or covenant-bytecode changes —
