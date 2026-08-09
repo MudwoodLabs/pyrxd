@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import logging
 import signal
+import sys
 
 import aiohttp
 
@@ -43,6 +44,7 @@ from pyrxd.gravity.watch import (
     run_monitor,
 )
 from pyrxd.gravity.watch.cli_secrets import resolve_secret as _resolve_secret
+from pyrxd.security.errors import RxdSdkError
 
 logger = logging.getLogger("pyrxd.watchtower.deadman")
 
@@ -134,7 +136,17 @@ async def _amain(argv=None) -> int:
 
 
 def main(argv=None) -> int:
-    return asyncio.run(_amain(argv))
+    """Console-script shell. Returns the process exit code (0 ok, 1 config error).
+
+    ``resolve_secret`` is package code and raises a typed error rather than ``SystemExit`` (an
+    embedder must be able to catch a bad secret file); this shell is the one place that becomes
+    an exit code, and it is the same code (1, message on stderr) as before.
+    """
+    try:
+        return asyncio.run(_amain(argv))
+    except RxdSdkError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
