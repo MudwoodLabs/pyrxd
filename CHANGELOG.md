@@ -65,6 +65,74 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before reading it (POSIX only), refusing a group/world-readable file rather than
   silently trusting it.
 
+- **An empty webhook secret silently disabled HMAC signing.** `resolve_secret` returned
+  `read_text().strip() or None`, and `WebhookAlertChannel` signs only `if self._secret`
+  — so a truncated secret file, `--webhook-secret ""`, or
+  `PYRXD_WATCHTOWER_WEBHOOK_SECRET=""` made the tower POST every page **unsigned**, with
+  no warning. A *missing* secret file failed closed; an *empty* one failed open. A
+  configured-but-empty secret (from any of the three sources) now raises. Leaving the
+  secret entirely unconfigured still means "no HMAC" and is unchanged.
+
+  **Operator impact:** a tower that was running with an emptied secret file or an empty
+  env var now refuses to start instead of paging unsigned. Write a real secret, or drop
+  the flag/env var.
+
+- **The secret-file mode check followed symlinks and had a stat/read TOCTOU.** It called
+  `Path.stat()` (which resolves symlinks), never checked `st_uid`, and then read the file
+  through a *second*, unchecked lookup — so a 0600 symlink could point at a file the
+  operator does not control, and the bytes read were not necessarily the bytes that
+  passed the check. Credential files are now opened once with `O_NOFOLLOW | O_NONBLOCK`
+  and validated by `fstat` **on that same descriptor**: regular file, mode `0600`, owned
+  by the running uid, and read under a 64 KiB cap. A symlinked, foreign-owned, FIFO, or
+  oversized secret file is refused. The gate stays POSIX-only — Windows/non-POSIX keeps
+  the bounded read with no mode/owner enforcement rather than failing spuriously.
+
+  **Operator impact:** a secret file reached through a symlink, or owned by a different
+  user (e.g. root-owned, read by a non-root tower), now fails to start. Point the flag at
+  the real file and `chown` it to the tower's user.
+
+- **The pre-signed refund key file had no mode check at all.** `pyrxd-presign-refund
+  --refund-key-file` read a 32-byte **private key** with no permission gate, while the
+  same tower refused a group-readable *webhook secret*. It now goes through the same
+  owner-only, no-symlink gate. **Operator impact:** a key file that is not `0600` (or is
+  owned by another user) is now refused — `chmod 600` it.
+
+- **The pre-signed refund sidecar was written non-atomically at the process umask.**
+  `presign_refund` did `dest.write_text(...)` followed by `os.chmod(dest, 0o600)`, so this
+  custody-sensitive artifact (a signed transaction paying the operator) existed
+  world-readable at the ambient umask — typically `0644` — for the window in between, and
+  a crash mid-write left a **truncated blob at the armed path** for the watchtower to
+  load. It now uses the house convention (`mkstemp` + `fchmod(0o600)` + `fsync` +
+  `os.replace`, as in `HdWallet.save`): the mode is set on the descriptor before any bytes
+  exist, and the destination is only ever the complete file or the previous one.
+
+- **The operator ACK inbox was an unauthenticated silencing channel.** Every line of
+  `--ack-inbox` became a `DedupAlerter.ack(swap_id)`, which suppresses CRITICAL claim/squeeze
+  **re-pages** and zeroes `unacked_critical` — the count an external monitor escalates on —
+  and the file was read with no mode check, no owner check, no id validation, and an
+  unbounded `read_text()`. Any local user who could write that path could quiet the tower
+  during a claim race. `FileAckInbox.drain` now requires a `0600` regular file owned by the
+  running uid (opened `O_NOFOLLOW | O_NONBLOCK`, validated by `fstat` on the same fd),
+  caps the read at 64 KiB truncated to whole lines, drops ids that are not filename-shaped,
+  and decodes with `errors="replace"` so one corrupt byte cannot destroy every pending ACK
+  via the drain's `unlink`. A refused inbox fails closed **toward paging**: the claimed ids
+  are dropped, an ERROR names the required `chmod`, and the CRITICAL pages keep firing.
+
+  **Operator impact:** create the inbox owner-only —
+  `install -m 600 /dev/null "$WATCHTOWER_ACKS"`. An inbox left at the default `0644` from
+  `touch`/`echo >` is now refused and its ACKs are dropped (the tower keeps paging; it
+  never goes quiet as a result of the refusal).
+
+- **The watchtower entrypoints no longer raise bare `SystemExit` from library code.**
+  `run.py`, `deadman.py`, `presign.py`, and `cli_secrets.py` moved out of `scripts/` and
+  into the shipped package, where `raise SystemExit(...)` kills the process of any
+  application that imports and calls them (`_build_rxd_source`, `_build_executor`,
+  `_policy_from_args`, `resolve_secret`, `presign_refund`, ...). They now raise the typed
+  `ValidationError`, and each module's `main()` is the single place that translates it to
+  an exit code. **The observable CLI behavior is unchanged**: the same message on stderr
+  and the same exit code 1; argparse's own usage errors still exit 2, and the timing
+  preflight still exits 2.
+
 ### Fixed
 
 - **A Glyph mint could strand the commit output on-chain when the metadata was large.**
