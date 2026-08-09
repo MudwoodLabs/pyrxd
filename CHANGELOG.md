@@ -237,6 +237,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the sweep-off-the-legacy-seed procedure) is documented in
   `docs/how-to/recover-funds-across-wallet-paths.md`.
 
+### Changed
+
+- **The sdist is now a complete, auditable source release, and `check-manifest`
+  actually guards it.** `check-manifest` has been a `test`-group dependency
+  since early on, but had no `[tool.check-manifest]` config and no CI job
+  invoking it, so it guarded nothing — running it found 511 git-tracked files
+  missing from the sdist, including `CHANGELOG.md`, `SECURITY.md`,
+  `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, `SUPPORT.md`, every `ci/*-pin.txt`
+  hash-pin, and the entire `tests/`/`docs/`/`scripts/`/`examples/` trees. Added
+  sdist-only `[tool.poetry] include` entries (via `format = ["sdist"]`, so the
+  installed *wheel* is unchanged) for those plus `conformance/`, `docker/`, and
+  `guides/`. Deliberately left out — and documented why in
+  `[tool.check-manifest] ignore` — `.vscode/`, `.claude/`,
+  `.pre-commit-config.yaml`, `.gitleaks.toml`, `.secrets.baseline` (editor/dev
+  tooling, not source), and `docs/brainstorms/`, `docs/plans/`,
+  `docs/_static/announce/` (working drafts and social-media collateral not
+  curated for a release). `check-manifest` now runs in CI (`ci.yml`'s `test`
+  job, once per push/PR rather than once per Python version) and in `task ci`.
+
 ## [0.11.2] — 2026-08-07
 
 Maintenance release. No functional, API, wire-format, or covenant-bytecode changes —

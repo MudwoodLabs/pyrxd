@@ -69,6 +69,115 @@ include = [
     { path = "src/pyrxd/hd/wordlist/*.txt",        format = ["sdist", "wheel"] },
     { path = "src/pyrxd/py.typed",                 format = ["sdist", "wheel"] },
     { path = "src/pyrxd/contrib/miner/README.md",  format = ["sdist", "wheel"] },
+
+    # --- sdist-only additions below ---
+    # An sdist is a buildable, auditable source release: a downstream packager
+    # or security auditor needs these to reproduce CI, run the test suite, or
+    # verify the supply chain from source. `format` omitted -> poetry defaults
+    # `include` to sdist-only, so none of this changes the installed wheel.
+    # See `[tool.check-manifest] ignore` below for what was deliberately left
+    # out (and why).
+
+    # Governance / security-contact docs referenced from README.md and PyPI's
+    # project links (Changelog, etc).
+    { path = "CHANGELOG.md", format = ["sdist"] },
+    { path = "CODE_OF_CONDUCT.md", format = ["sdist"] },
+    { path = "CONTRIBUTING.md", format = ["sdist"] },
+    { path = "SECURITY.md", format = ["sdist"] },
+    { path = "SUPPORT.md", format = ["sdist"] },
+
+    # CI hash-pins (ci/*-pin.in/.txt, installed with `--require-hashes`) plus
+    # ci/README.md explaining how to bump them -- the exact, reproducible
+    # supply-chain pins CI installs from. Needed to verify or reproduce the CI
+    # toolchain from a source release.
+    { path = "ci", format = ["sdist"] },
+
+    # Conformance test vectors (BIP44 derivation, dMint V2 contract, RSWP wire
+    # format) cross-checked against the canonical Photonic reference impl --
+    # part of the auditable test surface, not just the library code.
+    { path = "conformance", format = ["sdist"] },
+
+    # Dockerfiles used to build the regtest node image the test suite (and
+    # `pyrxd regtest`) run against.
+    { path = "docker", format = ["sdist"] },
+
+    # The full test suite. Needed to actually run/reproduce `task ci` from a
+    # source release rather than just read the library code.
+    { path = "tests", format = ["sdist"] },
+
+    # Runnable usage examples and longer-form how-to guides referenced from
+    # README.md / the docs site.
+    { path = "examples", format = ["sdist"] },
+    { path = "guides", format = ["sdist"] },
+
+    # Dev/ops tooling: fuzz harnesses, mainnet run/recovery scripts, the
+    # watchtower entrypoints' back-compat shims, the private-link guard this
+    # CI job itself runs, etc. Never ships in the *wheel* (installed users get
+    # the `pyrxd` / `pyrxd-watchtower` / etc. console scripts instead -- see
+    # CHANGELOG's "console scripts" entry) but is legitimate, already-public
+    # auditable source for a source release.
+    { path = "scripts", format = ["sdist"] },
+
+    # Published Sphinx documentation source (built at
+    # https://mudwoodlabs.github.io/pyrxd/: api/, concepts/, how-to/,
+    # tutorials/, showcase.md, index.rst, conf.py, the pyodide-hosted inspect
+    # tool's static assets) plus auditor-facing reference docs not in the
+    # public toctree (threat model, security audit scope, versioning policy,
+    # operational runbooks, the solved-problem knowledge base under
+    # solutions/). Deliberately EXCLUDES docs/brainstorms/ and docs/plans/ --
+    # working-draft space by established project convention, not curated for
+    # a release -- and docs/_static/announce/ (social-media announcement
+    # collateral, not referenced by any built doc page). See
+    # `[tool.check-manifest] ignore` below.
+    { path = "docs/*.md", format = ["sdist"] },
+    { path = "docs/*.rst", format = ["sdist"] },
+    { path = "docs/*.py", format = ["sdist"] },
+    { path = "docs/*.txt", format = ["sdist"] },
+    { path = "docs/Makefile", format = ["sdist"] },
+    { path = "docs/make.bat", format = ["sdist"] },
+    { path = "docs/api", format = ["sdist"] },
+    { path = "docs/concepts", format = ["sdist"] },
+    { path = "docs/how-to", format = ["sdist"] },
+    { path = "docs/tutorials", format = ["sdist"] },
+    { path = "docs/runbooks", format = ["sdist"] },
+    { path = "docs/research", format = ["sdist"] },
+    { path = "docs/solutions", format = ["sdist"] },
+    { path = "docs/inspect_static", format = ["sdist"] },
+]
+
+# `check-manifest` (wired into `task ci` and CI's `test` job, see
+# .github/workflows/ci.yml) diffs git-tracked files against the built sdist
+# and fails on any gap, so a file that should ship (like `[tool.poetry]
+# include` above adds) can't silently stop shipping again, and a new
+# top-level file can't silently go un-packaged. The `ignore` list below is
+# the complete, deliberate set of tracked paths that should NOT ship in a
+# source release -- each group says why.
+[tool.check-manifest]
+ignore = [
+    # Editor / AI-agent tooling state -- machine-local, not part of the
+    # library, source release, or its docs. `**` (not `*`): both have files
+    # nested below the top level (.claude/skills/<name>/SKILL.md).
+    ".vscode/**",
+    ".claude/**",
+
+    # Dev/CI tooling config that's only actionable inside a git checkout (e.g.
+    # `pre-commit install` needs `.git/hooks/`, which an sdist tarball doesn't
+    # have) or is itself a secret-scanner allowlist, not source.
+    ".pre-commit-config.yaml",
+    ".gitleaks.toml",
+    ".secrets.baseline",
+
+    # Working-draft space: brainstorms and plans are drafted freely pre-release
+    # and are not curated/sanitized as release content (see project convention
+    # in CONTRIBUTING.md / docs/solutions/ vs. docs/brainstorms+plans/). `**`:
+    # both have files nested in subdirectories (e.g. brainstorms/gravity-ref-spike/).
+    "docs/brainstorms/**",
+    "docs/plans/**",
+
+    # Social-media announcement collateral -- not referenced by any built docs
+    # page (see docs/index.rst's toctree) and not needed to build or audit the
+    # package.
+    "docs/_static/announce/**",
 ]
 
 [tool.taskipy.tasks]
@@ -86,11 +195,17 @@ coverage-overall = 'pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85'
 # link to gitignored paths. Catches leaks where a public doc references a
 # private design doc — broken links + leaked filenames in commit history.
 check-private-links = "python3 scripts/check-no-private-links.py"
+# `task check-manifest` diffs git-tracked files against the built sdist and
+# fails on any gap, so a file declared in `[tool.poetry] include` can't
+# silently stop shipping again, and a new top-level file/dir can't silently go
+# unpackaged (see `[tool.check-manifest] ignore` for the deliberately-excluded
+# paths, each with a reason).
+check-manifest = "check-manifest"
 # `task ci` runs the full set of checks GitHub Actions runs (.github/workflows/{lint,ci}.yml)
-# plus local-only guardrails (private-link check). Run before pushing to avoid
-# the push-fail-fix-push loop. ~3-5 min.
+# plus local-only guardrails (private-link check, sdist/MANIFEST parity). Run
+# before pushing to avoid the push-fail-fix-push loop. ~3-5 min.
 # For a faster pre-commit pass, just run `task lint && task format-check && task test`.
-ci = "task lint && task format-check && task test && task coverage-security && task coverage-overall && task typecheck && task check-private-links"
+ci = "task lint && task format-check && task test && task coverage-security && task coverage-overall && task typecheck && task check-private-links && task check-manifest"
 # `task mutate` runs cosmic-ray mutation testing on the consensus-critical SPV
 # verification modules (pow/merkle/chain/payment). Slow + mutates src/pyrxd/spv in
 # place (restored via git on exit) — an occasional gate, NOT part of `task ci`. See
