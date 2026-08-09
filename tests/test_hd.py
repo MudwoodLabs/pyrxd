@@ -5,9 +5,15 @@ from hashlib import pbkdf2_hmac
 
 import pytest
 
-from pyrxd.hd.bip32 import Xprv, Xpub, ckd, master_xprv_from_seed
+from pyrxd.hd.bip32 import Xprv, Xpub, bip32_derive_xprv_from_mnemonic, ckd, master_xprv_from_seed
 from pyrxd.hd.bip39 import WordList, mnemonic_from_entropy, seed_from_mnemonic, validate_mnemonic
-from pyrxd.hd.bip44 import derive_xkeys_from_xkey, derive_xprvs_from_mnemonic
+from pyrxd.hd.bip44 import (
+    bip44_derive_xprv_from_mnemonic,
+    bip44_derive_xprvs_from_mnemonic,
+    derive_xkeys_from_xkey,
+    derive_xprv_from_mnemonic,
+    derive_xprvs_from_mnemonic,
+)
 from pyrxd.security.errors import ValidationError
 
 _mnemonic = "slice simple ring fluid capital exhaust will illegal march annual shift hood"
@@ -457,3 +463,46 @@ def test_hd_wallet_from_mnemonic_normalizes_by_default():
 
     assert composed.derive_address(0, 0) == decomposed.derive_address(0, 0)
     assert legacy.derive_address(0, 0) != composed.derive_address(0, 0)
+
+
+def test_bip44_helpers_forward_normalize():
+    """The BIP44 family — the DEFAULT derivation path — must expose the same
+    legacy escape as the BIP32 functions it wraps. Before this fix the flag
+    stopped at bip32_*, so the recovery mode was unreachable through bip44_*."""
+    mnemonic = mnemonic_from_entropy(bytes(16))
+
+    legacy = bip44_derive_xprv_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED, normalize=False)
+    fixed = bip44_derive_xprv_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED)
+
+    # The flag actually changes the derivation for an NFKD-unstable passphrase...
+    assert legacy != fixed
+    # ...and forwards to exactly the bip32 derivation at the BIP44 default path.
+    from pyrxd.constants import BIP44_DERIVATION_PATH
+
+    assert legacy == bip32_derive_xprv_from_mnemonic(
+        mnemonic, passphrase=_CAFE_COMPOSED, path=BIP44_DERIVATION_PATH, normalize=False
+    )
+
+
+def test_bip44_default_normalization_unchanged():
+    """Unicode-equivalent passphrases must agree under the default — the fix
+    itself, seen through the bip44 entry point."""
+    mnemonic = mnemonic_from_entropy(bytes(16))
+    assert bip44_derive_xprv_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED) == bip44_derive_xprv_from_mnemonic(
+        mnemonic, passphrase=_CAFE_DECOMPOSED
+    )
+
+
+def test_bip44_range_and_deprecated_aliases_forward_normalize():
+    """bip44_derive_xprvs_from_mnemonic and both deprecated aliases must all
+    reach the same legacy derivation as the canonical function."""
+    mnemonic = mnemonic_from_entropy(bytes(16))
+
+    canonical = bip44_derive_xprv_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED, normalize=False)
+    assert derive_xprv_from_mnemonic(mnemonic, passphrase=_CAFE_COMPOSED, normalize=False) == canonical
+
+    ranged = bip44_derive_xprvs_from_mnemonic(mnemonic, 0, 2, passphrase=_CAFE_COMPOSED, normalize=False)
+    ranged_deprecated = derive_xprvs_from_mnemonic(mnemonic, 0, 2, passphrase=_CAFE_COMPOSED, normalize=False)
+    expected = [canonical.ckd(0).ckd(i) for i in range(2)]
+    assert ranged == expected
+    assert ranged_deprecated == expected
