@@ -62,6 +62,13 @@ jobs:
         run: poetry run bandit -r src/ -c pyproject.toml
       - name: Type check
         run: poetry run mypy src/pyrxd/security/
+      # check-manifest is already installed (it's a `test`-group dependency
+      # `poetry install --sync` above pulled in) and diffs git-tracked files
+      # against a built sdist -- run once, not once per Python version, since
+      # the sdist's file *list* doesn't depend on the interpreter.
+      - name: check-manifest (sdist matches tracked files)
+        if: matrix.python-version == '3.12'
+        run: poetry run check-manifest
 
   quickstart:
     # Tier-1 North Star gate: a fresh dev goes from `pip install` to a minted Glyph
