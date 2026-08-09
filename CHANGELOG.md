@@ -4,6 +4,30 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **BIP39 seeds were derived without NFKD normalization** (`hd/bip39.py`). BIP39
+  requires the mnemonic sentence and the passphrase to be NFKD-normalized before
+  they enter PBKDF2. pyrxd hashed both raw, so two spellings a user cannot tell
+  apart — `café` with a precomposed `U+00E9`, versus `e` + combining `U+0301` —
+  derived **different seeds, and therefore entirely different wallets**. A wallet
+  created this way is not reproducible by any conformant BIP39 implementation, so
+  the funds in it could not be recovered in another wallet.
+
+  **Who is affected:** only users who set a BIP39 passphrase containing non-ASCII
+  characters not already in NFKD form. The fix is byte-for-byte inert for every
+  ASCII passphrase (and for no passphrase at all), and both shipped wordlists
+  (English, Chinese Simplified) are NFKD-stable, so the mnemonic side never
+  diverged. Every existing derivation golden in the test suite is unchanged.
+
+  **If you are affected:** pass `normalize=False` to `seed_from_mnemonic()`,
+  `HdWallet.from_mnemonic()`, or `bip32_derive_xprv_from_mnemonic()` to reproduce
+  the old seed and move the funds to a wallet derived the conformant way. That
+  flag exists solely as a recovery path — it produces a wallet no other
+  implementation can reproduce, and should not be used for new wallets.
+
 ## [0.11.2] — 2026-08-07
 
 Maintenance release. No functional, API, wire-format, or covenant-bytecode changes —

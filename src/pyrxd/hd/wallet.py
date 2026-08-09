@@ -332,6 +332,8 @@ class HdWallet:
         passphrase: str = "",  # nosec B107 — BIP39 passphrase, not a hardcoded password
         account: int = 0,
         coin_type: int | None = None,
+        *,
+        normalize: bool = True,
     ) -> HdWallet:
         """Create a fresh wallet from a BIP39 mnemonic.
 
@@ -346,11 +348,18 @@ class HdWallet:
 
         The chosen coin type is recorded on the wallet and persisted in
         the wallet file; subsequent :meth:`load` calls validate it.
+
+        *normalize* controls BIP39 NFKD normalization — see
+        :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. Leave it ``True`` unless
+        you are recovering funds from a wallet created before 0.11.3 using a
+        **non-ASCII passphrase**, which pyrxd then hashed unnormalized. Wrong
+        for every other case: it derives a wallet no other BIP39
+        implementation can reproduce.
         """
         # Only the coin type is needed — the _xprv property reconstructs the canonical path from
         # _coin_type + account; the path string is no longer used here.
         _, resolved_coin_type = _resolve_coin_type(coin_type)
-        seed = seed_from_mnemonic(mnemonic, passphrase=passphrase)
+        seed = seed_from_mnemonic(mnemonic, passphrase=passphrase, normalize=normalize)
         # The account xprv is NOT stored — the _xprv property re-derives it from this seed
         # on demand (hardening #8/H1). _coin_type + account fully determine the path.
         return cls(

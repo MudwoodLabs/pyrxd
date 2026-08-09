@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from contextlib import suppress
 from hashlib import pbkdf2_hmac
 from secrets import randbits
@@ -100,9 +101,42 @@ def validate_mnemonic(mnemonic: str, lang: str = "en"):
         raise ValidationError("invalid mnemonic, checksum mismatch")
 
 
-def seed_from_mnemonic(mnemonic: str, lang: str = "en", passphrase: str = "", prefix: str = "mnemonic") -> bytes:  # nosec B107 -- passphrase="" is the BIP39 spec default (no passphrase), not a hardcoded secret
+def seed_from_mnemonic(  # nosec B107 -- passphrase="" is the BIP39 spec default (no passphrase), not a hardcoded secret
+    mnemonic: str,
+    lang: str = "en",
+    passphrase: str = "",
+    prefix: str = "mnemonic",
+    *,
+    normalize: bool = True,
+) -> bytes:
+    """Derive the 64-byte BIP39 seed from a mnemonic (+ optional passphrase).
+
+    BIP39 requires the mnemonic sentence and the passphrase to be **NFKD
+    normalized** before they enter PBKDF2. Without it, two spellings that a
+    user cannot tell apart -- "café" with a precomposed U+00E9 versus the same
+    word as "e" + combining U+0301 -- derive *different* seeds, and therefore
+    entirely different wallets.
+
+    :param normalize: Leave ``True`` (the default) for spec-conformant,
+        cross-wallet-compatible seeds. Pass ``False`` **only** to reproduce
+        the non-conformant seed pyrxd produced before 0.11.3, which is the
+        recovery path for anyone who funded a wallet using a non-ASCII
+        passphrase under the old behavior. It is not interoperable with any
+        other BIP39 implementation -- see
+        ``docs/how-to/recover-funds-across-wallet-paths.md``.
+
+    .. note::
+       ``normalize=False`` is inert for a passphrase that is already in NFKD
+       form, which includes every pure-ASCII passphrase (the overwhelmingly
+       common case) and both wordlists pyrxd ships. For those inputs the two
+       modes return byte-identical seeds.
+    """
     # SECURITY: mnemonic and passphrase are sensitive — returned seed is sensitive
     validate_mnemonic(mnemonic, lang)
+    if normalize:
+        mnemonic = unicodedata.normalize("NFKD", mnemonic)
+        passphrase = unicodedata.normalize("NFKD", passphrase)
+        prefix = unicodedata.normalize("NFKD", prefix)
     hash_name = "sha512"
     password = mnemonic.encode()
     salt = (prefix + passphrase).encode()
