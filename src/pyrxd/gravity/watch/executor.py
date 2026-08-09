@@ -35,7 +35,7 @@ from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS, BtcBroadcaster, re
 from pyrxd.btc_wallet.taproot import btc_spend_fields_from_raw, btc_txid_from_raw
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import PolicyRejection, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -239,7 +239,25 @@ class RefundExecutor:
         # ARMED + every bind holds → broadcast the stored signed bytes. A broadcaster error PROPAGATES
         # (the reconciler records FAILED and the alerter still pages — never silently swallowed). The
         # broadcaster is idempotent, so a crash-recovery re-broadcast of the same bytes is safe.
-        txid = await self._b.broadcast(blob.raw_tx)  # type: ignore[union-attr]  # _b non-None when authorized
+        try:
+            txid = await self._b.broadcast(blob.raw_tx)  # type: ignore[union-attr]  # _b non-None when authorized
+        except PolicyRejection as exc:
+            # PERMANENT: the node rejected the pre-signed refund on a consensus/policy rule. Unlike a
+            # transient transport error, retrying next tick cannot succeed. Re-broadcasting these exact
+            # bytes is idempotent so it costs no fee — but letting it read as FAILED would page
+            # "broadcast failed" every tick and bury the fact that the operator's PRE-SIGNED REFUND IS
+            # UNUSABLE and they must act manually before the CSV deadline.
+            #
+            # PolicyRejection subclasses NetworkError so existing handlers keep catching rejections;
+            # that is exactly why this must be caught explicitly rather than left to propagate.
+            logger.error(
+                "AUTONOMOUS REFUND swap %s on %s: node PERMANENTLY rejected the pre-signed refund (%s) — "
+                "the stored blob is unusable; operator must refund manually before the CSV deadline",
+                swap_id,
+                self._network,
+                exc,
+            )
+            return ExecOutcome.DECLINED
         logger.warning(
             "AUTONOMOUS REFUND BROADCAST for swap %s on %s: txid=%s value=%d sats to pinned refund address",
             swap_id,
