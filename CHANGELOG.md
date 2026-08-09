@@ -255,6 +255,92 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `docs/_static/announce/` (working drafts and social-media collateral not
   curated for a release). `check-manifest` now runs in CI (`ci.yml`'s `test`
   job, once per push/PR rather than once per Python version) and in `task ci`.
+### Added
+
+- **dMint hash-rate benchmark + time-to-mint estimator.** New
+  `pyrxd glyph dmint-estimate` and a matching SDK surface in
+  `pyrxd.glyph.dmint` (`benchmark_sha256d`, `estimate_attempts`,
+  `attempts_for_quantile`, `project_mint_eta`, `live_stats`). It answers
+  "how long will this contract take me to mint?" and replaces the hardcoded
+  "~1-2M h/s" guess that had been copied across `miner.py`,
+  `contrib/miner/parallel.py`, and two concept docs.
+
+  The three kinds of number are kept apart in the API, in the human output,
+  and as separate top-level keys in `--json`:
+
+  - **MEASURED** — the single-core SHA256d rate, benchmarked on the same
+    `sha256(sha256(preimage + nonce))` chain the workers run (a test
+    byte-matches the benchmark's first digest so a refactor cannot silently
+    benchmark something else). During a grind, the *observed* aggregate rate.
+  - **EXACT** — `p = target / 2**96` and `E[attempts] = 2**96 / target`,
+    derived from the verifier predicate: `digest[:4] == 0` plus
+    `int(digest[4:12]) < target` is exactly "the digest's top 96 bits are
+    below the target", because the target is always under `2**64`. Plus
+    p50/p90/p99 attempt counts.
+  - **PROJECTED** — every ETA, and the `single-core × workers` aggregate
+    rate they divide by. Cross-core scaling is *not* measured and real
+    machines fall short of linear, so the projection reads high.
+
+  Reported as a mean plus quantiles, never a countdown: mining is geometric
+  and therefore memoryless, so hashes already spent do not shorten what
+  remains. For the same reason V1's OP_RETURN rerolls do not perturb the
+  estimate — chopping an i.i.d. hash stream into 2^32-nonce pieces leaves
+  the total-attempts distribution unchanged.
+
+  Note for anyone who has used `MAX_SHA256D_TARGET / target` as an expected
+  attempt count: that is the *difficulty multiplier*
+  (`target_to_difficulty`), low by a factor of ~`2**33`. At difficulty 1 it
+  claims one expected attempt where the true mean is ~8.59 billion. The
+  cross-check is pyrxd's own long-standing "~39% chance of a hit per V1
+  sweep at difficulty 1" — which follows from the correct `p` and is now a
+  unit test. The worked example in `mine_solution`'s docstring, which
+  claimed a shifted target made the loop finish in milliseconds, made the
+  same error and has been corrected: no target finishes fast, because the
+  four-zero-byte prefix floors the mean at `2**33` attempts.
+
+- **Live hash rate + ETA while `pyrxd glyph claim-dmint` mines.** Both
+  in-process miners now take an optional `progress` callback
+  (`callback(attempts, elapsed_s)`): `pyrxd.glyph.dmint.mine_solution` (and
+  `mine_solution_dispatch` on its in-process branch) and
+  `pyrxd.contrib.miner.parallel.mine`. The CLI renders it to **stderr** so
+  stdout stays clean for `--json`; `--no-progress` silences it. In the
+  parallel miner the workers publish their attempt counts at the *existing*
+  65536-attempt poll checkpoint, and the parent's poll-join stays inside
+  `_ensure_workers_terminated`, so the orphan-prevention guarantees are
+  unchanged — including for a callback that raises, which is the supported
+  way to impose a deadline. The regression suite for the original
+  orphaned-worker leak passes unmodified, with a new case covering a SIGTERM
+  that arrives while the parent is inside the progress-poll wait.
+
+  **External `--miner-cmd` miners report no live progress.** The
+  JSON-over-stdio wire protocol carries no progress frames and is
+  deliberately not extended here (it would affect every third-party miner);
+  the CLI says so and points at `dmint-estimate`. Tracked as a follow-up.
+
+### Changed
+
+- **`pyrxd glyph claim-dmint`'s default miner now runs in this process.**
+  `--miner-cmd` unset previously spawned the bundled parallel miner as a
+  subprocess (`python -m pyrxd.contrib.miner`); it now calls the same miner
+  in-process. Same workers, same hashing, same full nonce-space sweep — the
+  reason for that default was nonce-space coverage, which is unchanged — but
+  the parent can now read the shared attempts counter and stream live
+  progress. Workers are still `spawn`ed (not forked), so no wallet key
+  material reaches them. Subprocess isolation remains available:
+  `--miner-cmd "python -m pyrxd.contrib.miner"`.
+
+  Two related adjustments: `--timeout` now caps a grind on *every* miner
+  rather than only the external subprocess (same per-grind, reroll-on-expiry
+  semantics as before), and `--workers N` sets the pool size.
+
+- **`pyrxd.contrib.miner.parallel.mine` now raises instead of reporting a
+  completed sweep when a worker dies.** A worker that exited abnormally never
+  searched its slice, so `MineExhausted` was a lie — and an expensive one,
+  since callers answer exhaustion by rerolling and grinding again. The
+  failure this catches in practice: calling `mine()` from a `__main__`
+  without an `if __name__ == "__main__":` guard, where the `spawn` start
+  method makes every worker re-import it, re-enter `mine()`, and die in
+  milliseconds. The CLI surfaces it with a fix hint.
 
 ## [0.11.2] — 2026-08-07
 

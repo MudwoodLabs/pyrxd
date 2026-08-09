@@ -30,11 +30,26 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
 from .protocol import MAX_SHA256D_TARGET, MineExhausted, MineSuccess
+
+#: ``callback(attempts, elapsed_s)``. Structurally identical to
+#: ``pyrxd.glyph.dmint.ProgressCallback``, but declared here rather than
+#: imported: this package stays free of ``pyrxd.glyph`` imports so a worker
+#: spawn re-imports as little as possible.
+ProgressCallback = Callable[[int, float], None]
+
+#: Default minimum seconds between progress callbacks.
+DEFAULT_PROGRESS_INTERVAL_S = 0.5
+
+# Join timeout used while polling for progress. Bounds how long a finished
+# mine() can sit unnoticed, and how long a raising callback (the deadline
+# idiom) can be delayed. Small enough to feel instant, large enough that the
+# poll loop is free next to the workers' hashing.
+_PROGRESS_POLL_S = 0.1
 
 # Linux prctl option: deliver a signal to THIS process when its parent dies.
 # (asm-generic/prctl.h — stable kernel ABI value.) This is the ONE defense that
@@ -124,8 +139,16 @@ def _worker(
     3. The slice is exhausted — returns.
 
     The shared-state polling check fires every 65 536 attempts (cheap
-    bitmask). At ~1 Mh/s per core that's ~16 ms between polls — short
-    enough to be responsive, long enough not to thrash the IPC primitive.
+    bitmask): short enough to stay responsive to a win by a sibling
+    worker, long enough not to thrash the IPC primitive. How often that
+    is in milliseconds depends on the machine's hash rate — measure it
+    with ``pyrxd glyph dmint-estimate`` rather than assuming a figure.
+
+    That same checkpoint publishes this worker's attempt count into the
+    shared ``attempts_counter`` so the parent can report live progress.
+    It is deliberately the *existing* checkpoint and not a second one:
+    the loop's cadence is load-bearing for orphan detection, and adding
+    a parallel schedule would give two things to keep in sync.
 
     Must be a module-level function (not a closure or method) so the
     ``spawn`` start method can pickle it.
@@ -145,6 +168,7 @@ def _worker(
     sha256 = hashlib.sha256
     effective_target = min(target, MAX_SHA256D_TARGET)
     local_attempts = 0
+    published_attempts = 0  # how much of local_attempts is already in the shared counter
     check_interval = 65536  # 2**16 — bitmask check is one AND, no modulo
 
     for n in range(start, stop, stride):
@@ -160,6 +184,13 @@ def _worker(
                         found_event.set()
                 break
         if (local_attempts & (check_interval - 1)) == 0:
+            # Publish the delta since the last checkpoint so the parent can
+            # read a live attempt total. Delta (not absolute) keeps the
+            # end-of-loop flush below correct and the final total exact,
+            # whether or not this branch ever ran.
+            with attempts_counter.get_lock():
+                attempts_counter.value += local_attempts - published_attempts
+            published_attempts = local_attempts
             if found_event.is_set():
                 break
             # Orphan self-check (the deterministic backstop for PR_SET_PDEATHSIG's
@@ -172,10 +203,15 @@ def _worker(
                 os._exit(0)
 
     with attempts_counter.get_lock():
-        attempts_counter.value += local_attempts
+        attempts_counter.value += local_attempts - published_attempts
 
 
-def mine(params: MineParams) -> MineSuccess | MineExhausted:
+def mine(
+    params: MineParams,
+    *,
+    progress: ProgressCallback | None = None,
+    progress_interval_s: float = DEFAULT_PROGRESS_INTERVAL_S,
+) -> MineSuccess | MineExhausted:
     """Run the parallel miner.
 
     Spawns ``params.n_workers`` subprocess workers, splits the
@@ -185,7 +221,20 @@ def mine(params: MineParams) -> MineSuccess | MineExhausted:
     Returns :class:`MineSuccess` on hit, :class:`MineExhausted` on
     sweep with no hit. Never raises for "no solution" — that's a
     protocol-level signal, not an exception. Real bugs (invalid
-    parameters, broken workers) still raise.
+    parameters, broken workers) still raise: a worker that exits
+    abnormally means its slice was never searched, so the sweep is
+    reported as a :class:`RuntimeError` rather than as exhaustion.
+
+    :param progress: Optional ``callback(attempts, elapsed_s)``, called
+        roughly every ``progress_interval_s`` with the aggregate attempts
+        published by the workers so far. The wait becomes a poll-join to
+        service it — still entirely inside
+        :func:`_ensure_workers_terminated`, so every interrupt path
+        (exception, SIGTERM, KeyboardInterrupt, callback raising) still
+        reaps every worker before this function returns. **A callback that
+        raises propagates**, which is the supported way to impose a
+        deadline on a grind.
+    :param progress_interval_s: Minimum seconds between callbacks.
     """
     if params.nonce_width not in (4, 8):
         raise ValueError(f"nonce_width must be 4 or 8, got {params.nonce_width}")
@@ -197,6 +246,8 @@ def mine(params: MineParams) -> MineSuccess | MineExhausted:
         raise ValueError(f"n_workers must be ≥ 1, got {params.n_workers}")
     if params.nonce_max < 1:
         raise ValueError(f"nonce_max must be ≥ 1, got {params.nonce_max}")
+    if progress_interval_s <= 0:
+        raise ValueError(f"progress_interval_s must be > 0, got {progress_interval_s}")
 
     # Force the ``spawn`` start method so behaviour is identical on
     # Linux, macOS, and Windows. ``get_context`` returns a fresh
@@ -246,12 +297,24 @@ def mine(params: MineParams) -> MineSuccess | MineExhausted:
             p.start()
             procs.append(p)
 
-        for p in procs:
-            p.join()
+        # Both waits live INSIDE _ensure_workers_terminated — that placement
+        # is the orphan-prevention guarantee, not an accident of layout.
+        if progress is None:
+            for p in procs:
+                p.join()
+        else:
+            _join_with_progress(
+                procs,
+                attempts_counter=attempts_counter,
+                started=started,
+                progress=progress,
+                progress_interval_s=progress_interval_s,
+            )
 
     elapsed = time.monotonic() - started
 
     if not found_event.is_set():
+        _assert_workers_completed(procs)
         return MineExhausted()
 
     nonce_int = found_value.value
@@ -263,9 +326,75 @@ def mine(params: MineParams) -> MineSuccess | MineExhausted:
     )
 
 
+def _assert_workers_completed(procs: list[mp.process.BaseProcess]) -> None:
+    """Raise unless every worker exited cleanly. Call only on the no-hit path.
+
+    A worker that died instead of finishing its slice did NOT search it, so
+    reporting "exhausted" would be a lie — an expensive one, since callers
+    answer exhaustion by rerolling and grinding all over again.
+
+    The failure mode this catches in the field: an embedder calls
+    :func:`mine` from a ``__main__`` with no ``if __name__ == "__main__":``
+    guard. Under the ``spawn`` start method each worker re-imports that
+    module, re-enters ``mine()``, and multiprocessing kills it — so every
+    worker dies in milliseconds and the parent used to report a completed
+    sweep of the entire nonce space.
+
+    Only meaningful when no solution was found: after a win, the cleanup
+    path deliberately terminates the losing workers, and their SIGTERM exit
+    codes are expected.
+    """
+    failed = sorted({p.exitcode for p in procs if p.exitcode})
+    if failed:
+        raise RuntimeError(
+            f"parallel miner: worker(s) exited abnormally (exit codes {failed}) before finishing "
+            "their nonce slices, so the search did not complete. If you call mine() from a script, "
+            'guard the entry point with `if __name__ == "__main__":` — the spawn start method '
+            "re-imports it in every worker."
+        )
+
+
+def _join_with_progress(
+    procs: list[mp.process.BaseProcess],
+    *,
+    attempts_counter,
+    started: float,
+    progress: ProgressCallback,
+    progress_interval_s: float,
+) -> None:
+    """Join every worker, calling ``progress`` while we wait.
+
+    Called ONLY from inside :func:`mine`'s ``_ensure_workers_terminated``
+    block. Nothing here spawns, so the cleanup guarantee is unchanged: a
+    SIGTERM landing in the ``p.join(_PROGRESS_POLL_S)`` below raises
+    KeyboardInterrupt out of this function and into that context manager's
+    ``finally``, which terminates and reaps every worker — exactly as it
+    does for a plain blocking join.
+
+    Exceptions from ``progress`` are not caught. That is deliberate: it lets
+    a caller impose a deadline (or a user-abort) by raising, and the same
+    cleanup path still runs.
+    """
+    next_emit = time.monotonic() + progress_interval_s
+    for p in procs:
+        while p.is_alive():
+            p.join(_PROGRESS_POLL_S)
+            now = time.monotonic()
+            if now >= next_emit:
+                next_emit = now + progress_interval_s
+                # Read without the lock, like the MineSuccess path below.
+                # Two reasons: a stale or (on a hypothetical platform with
+                # non-atomic 64-bit loads) torn count only ever mis-renders
+                # one progress line, whereas acquiring a lock that a worker
+                # could have been SIGTERMed while holding would block the
+                # parent forever.
+                progress(attempts_counter.value, now - started)
+        p.join()
+
+
 # Grace period for cooperative shutdown after found_event is set.
-# Workers poll the event every `check_interval` hashes (~256 hashes in
-# the current impl), so this should be near-instantaneous in practice.
+# Workers poll the event every `check_interval` hashes (65 536 in the
+# current impl), so this should be near-instantaneous in practice.
 _WORKER_TERMINATE_GRACE_S = 1.0
 # Hard kill grace after SIGTERM. If a worker is in a tight C loop and
 # ignores SIGTERM, SIGKILL after this.

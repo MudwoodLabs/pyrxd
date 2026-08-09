@@ -2,8 +2,8 @@
 ``dmint.py`` per the plan at
 ``docs/plans/2026-05-18-refactor-dmint-py-subpackage-split-plan.md``.
 
-The subpackage layers as ``types ← builders ← chain ← miner`` (one-way
-dependency). The ``__init__.py`` uses PEP 562 lazy ``__getattr__`` to
+The subpackage layers as ``types ← builders ← chain ← miner ← estimate``
+(one-way dependency). The ``__init__.py`` uses PEP 562 lazy ``__getattr__`` to
 re-export every public symbol — plus 10 underscore-private symbols that
 existing tests + ``pyrxd.glyph.builder`` import directly — at their
 original ``pyrxd.glyph.dmint`` path. This matches the convention used
@@ -103,7 +103,12 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "pyrxd.glyph.dmint.miner",
         "EXTERNAL_MINER_TIMEOUT_S",
     ),
+    "DEFAULT_PROGRESS_INTERVAL_S": (
+        "pyrxd.glyph.dmint.miner",
+        "DEFAULT_PROGRESS_INTERVAL_S",
+    ),
     "PowPreimageResult": ("pyrxd.glyph.dmint.miner", "PowPreimageResult"),
+    "ProgressCallback": ("pyrxd.glyph.dmint.miner", "ProgressCallback"),
     "build_dmint_mint_tx": (
         "pyrxd.glyph.dmint.miner",
         "build_dmint_mint_tx",
@@ -161,6 +166,26 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
         "pyrxd.glyph.dmint.miner",
         "verify_sha256d_solution",
     ),
+    # Public — estimate bucket (hash-rate benchmark + time-to-mint estimator)
+    "AttemptEstimate": ("pyrxd.glyph.dmint.estimate", "AttemptEstimate"),
+    "BENCHMARK_PREIMAGE": ("pyrxd.glyph.dmint.estimate", "BENCHMARK_PREIMAGE"),
+    "DEFAULT_BENCHMARK_SECONDS": (
+        "pyrxd.glyph.dmint.estimate",
+        "DEFAULT_BENCHMARK_SECONDS",
+    ),
+    "DEFAULT_QUANTILES": ("pyrxd.glyph.dmint.estimate", "DEFAULT_QUANTILES"),
+    "LiveMiningStats": ("pyrxd.glyph.dmint.estimate", "LiveMiningStats"),
+    "MintEtaProjection": ("pyrxd.glyph.dmint.estimate", "MintEtaProjection"),
+    "SHA256D_HIT_SPACE": ("pyrxd.glyph.dmint.estimate", "SHA256D_HIT_SPACE"),
+    "Sha256dBenchmark": ("pyrxd.glyph.dmint.estimate", "Sha256dBenchmark"),
+    "attempts_for_quantile": (
+        "pyrxd.glyph.dmint.estimate",
+        "attempts_for_quantile",
+    ),
+    "benchmark_sha256d": ("pyrxd.glyph.dmint.estimate", "benchmark_sha256d"),
+    "estimate_attempts": ("pyrxd.glyph.dmint.estimate", "estimate_attempts"),
+    "live_stats": ("pyrxd.glyph.dmint.estimate", "live_stats"),
+    "project_mint_eta": ("pyrxd.glyph.dmint.estimate", "project_mint_eta"),
     # Underscore-private shims — re-exported here so existing test
     # imports like `from pyrxd.glyph.dmint import _match_v1_epilogue`
     # keep working unchanged. Per the brainstorm's PR #49 facade

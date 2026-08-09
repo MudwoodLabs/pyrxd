@@ -585,3 +585,249 @@ class TestParentDeathSignal:
         )
         result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=15)
         assert result.returncode == 0, f"child crashed arming PDEATHSIG: {result.stderr.decode()}"
+
+
+# ---------------------------------------------------------------------------
+# Live-progress tests
+#
+# mine() grew an optional progress callback so the CLI can stream hash rate +
+# ETA during a grind. The risk it introduces is to the orphan-prevention
+# machinery above: the parent now poll-joins instead of blocking. These tests
+# cover the counter arithmetic, the callback contract, and — the one that
+# matters — a SIGTERM arriving while the parent sits in that poll.
+#
+# TestOrphanPrevention above is deliberately left untouched: it is the
+# regression suite for the original leak and must keep passing verbatim.
+# ---------------------------------------------------------------------------
+
+
+def _shared_counters():
+    """Fresh (found_event, found_value, attempts_counter) for a direct _worker call."""
+    ctx = mp.get_context("spawn")
+    return ctx.Event(), ctx.Value("Q", 0), ctx.Value("Q", 0)
+
+
+def _is_resource_tracker(pid: int) -> bool:
+    """True for multiprocessing's resource_tracker helper child.
+
+    It is spawned once per process on first use of a spawn context and
+    deliberately outlives every mine(), so orphan checks must not count it —
+    and must certainly not SIGKILL it, which would break later spawns.
+    """
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return b"resource_tracker" in f.read()
+    except OSError:
+        return False
+
+
+class TestWorkerAttemptPublishing:
+    """The worker publishes attempts at its EXISTING 65536-attempt checkpoint.
+
+    Called in-process (``_worker`` is a plain function) so the shared counter
+    can be read directly. The property under test is that incremental
+    publishing plus the end-of-loop flush still total exactly the attempts
+    made — a double-count here would inflate every reported hash rate.
+
+    ``parent_pid`` MUST be ``os.getppid()``, not ``os.getpid()``: the worker's
+    orphan self-check is "my ppid is no longer the pid I was told", so passing
+    our own pid makes it think it was reparented and ``os._exit(0)`` the
+    pytest process (silently, mid-run).
+    """
+
+    def test_short_slice_publishes_only_at_the_end(self):
+        from pyrxd.contrib.miner.parallel import _worker
+
+        found_event, found_value, attempts = _shared_counters()
+        _worker(os.getppid(), b"\xab" * 64, 1, 4, 0, 1000, 1, found_event, found_value, attempts)
+        assert attempts.value == 1000
+
+    def test_slice_spanning_several_checkpoints_is_not_double_counted(self):
+        from pyrxd.contrib.miner.parallel import _worker
+
+        n = 65536 * 3 + 17  # three checkpoints plus a partial tail
+        found_event, found_value, attempts = _shared_counters()
+        _worker(os.getppid(), b"\xab" * 64, 1, 4, 0, n, 1, found_event, found_value, attempts)
+        assert attempts.value == n
+
+    def test_strided_slice_counts_its_own_attempts_only(self):
+        from pyrxd.contrib.miner.parallel import _worker
+
+        found_event, found_value, attempts = _shared_counters()
+        _worker(os.getppid(), b"\xab" * 64, 1, 4, 1, 200_001, 2, found_event, found_value, attempts)
+        assert attempts.value == 100_000
+
+
+class TestAbnormalWorkerExitIsNotExhaustion:
+    """A worker that died did not search its slice, so the sweep is incomplete.
+
+    The field failure this guards: calling ``mine()`` from a ``__main__``
+    without an ``if __name__ == "__main__":`` guard. Under ``spawn`` every
+    worker re-imports it, re-enters ``mine()``, and multiprocessing kills it —
+    and the parent used to report a clean sweep of the whole nonce space,
+    sending the caller off to reroll and grind again.
+    """
+
+    class _FakeProc:
+        def __init__(self, exitcode):
+            self.exitcode = exitcode
+
+    def test_clean_exits_pass(self):
+        from pyrxd.contrib.miner.parallel import _assert_workers_completed
+
+        _assert_workers_completed([self._FakeProc(0), self._FakeProc(0)])
+
+    def test_nonzero_exit_raises_with_the_guard_hint(self):
+        from pyrxd.contrib.miner.parallel import _assert_workers_completed
+
+        with pytest.raises(RuntimeError, match="did not complete"):
+            _assert_workers_completed([self._FakeProc(0), self._FakeProc(1)])
+
+    def test_signal_death_raises(self):
+        from pyrxd.contrib.miner.parallel import _assert_workers_completed
+
+        with pytest.raises(RuntimeError, match=r"exit codes \[-15\]"):
+            _assert_workers_completed([self._FakeProc(-15)])
+
+    def test_still_running_worker_is_not_treated_as_failed(self):
+        from pyrxd.contrib.miner.parallel import _assert_workers_completed
+
+        _assert_workers_completed([self._FakeProc(None)])
+
+
+class TestMineProgressCallback:
+    def test_callback_receives_monotonic_attempts_and_elapsed(self):
+        seen: list[tuple[int, float]] = []
+        result = mine(
+            _params(n_workers=2, nonce_max=400_000),
+            progress=lambda a, e: seen.append((a, e)),
+            progress_interval_s=1e-9,
+        )
+        assert isinstance(result, MineExhausted)
+        assert seen, "progress callback never fired"
+        assert [a for a, _ in seen] == sorted(a for a, _ in seen)
+        assert all(e >= 0 for _, e in seen)
+
+    def test_no_callback_path_is_unchanged(self):
+        assert isinstance(mine(_params(nonce_max=256)), MineExhausted)
+
+    def test_rejects_non_positive_progress_interval(self):
+        with pytest.raises(ValueError, match="progress_interval_s must be > 0"):
+            mine(_params(nonce_max=16), progress=lambda a, e: None, progress_interval_s=0)
+
+    def test_callback_exception_propagates_and_still_reaps_workers(self):
+        """Raising from the callback is the supported deadline/abort idiom.
+
+        It must unwind through _ensure_workers_terminated, so the workers it
+        aborts are reaped rather than left grinding — the same guarantee the
+        SIGTERM path has.
+        """
+
+        class Abort(Exception):
+            pass
+
+        worker_pids: list[int] = []
+        # Running mine() in-process makes the workers direct children of the
+        # pytest runner, which also owns multiprocessing's long-lived
+        # resource_tracker helper. Screen it out by cmdline: it is a child of
+        # this process, it legitimately outlives mine(), and SIGKILLing it (as
+        # the cleanup below would) breaks every later spawn in the session.
+        preexisting = set(TestOrphanPrevention._direct_children(os.getpid()))
+
+        def abort(_attempts: int, _elapsed: float) -> None:
+            worker_pids.extend(
+                pid
+                for pid in TestOrphanPrevention._direct_children(os.getpid())
+                if pid not in worker_pids and pid not in preexisting and not _is_resource_tracker(pid)
+            )
+            raise Abort
+
+        with pytest.raises(Abort):
+            mine(
+                MineParams(
+                    preimage=bytes.fromhex("ab" * 64),
+                    target=1,  # impossible: the workers would grind for hours
+                    nonce_width=8,
+                    n_workers=2,
+                    nonce_max=2**40,
+                ),
+                progress=abort,
+                progress_interval_s=1e-9,
+            )
+
+        assert worker_pids, "no workers observed; the test proved nothing"
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if not any(TestOrphanPrevention._pid_alive(pid) for pid in worker_pids):
+                break
+            time.sleep(0.1)
+        survivors = [pid for pid in worker_pids if TestOrphanPrevention._pid_alive(pid)]
+        for pid in survivors:  # never leave a grinder behind, even on failure
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        assert not survivors, f"a raising progress callback leaked workers: {survivors}"
+
+
+def _run_long_mine_with_progress_in_subprocess() -> None:
+    """Entry point: mine() with a progress callback and a huge nonce_max.
+
+    The parent test SIGTERMs this process while it is parked inside the
+    progress poll-join, which is the code path the plain-join tests above
+    never enter.
+    """
+    from pyrxd.contrib.miner.parallel import MineParams, mine
+
+    mine(
+        MineParams(
+            preimage=bytes.fromhex("ab" * 64),
+            target=1,
+            nonce_width=8,
+            n_workers=2,
+            nonce_max=2**40,
+        ),
+        progress=lambda _attempts, _elapsed: None,
+        progress_interval_s=0.05,
+    )
+
+
+class TestOrphanPreventionDuringProgressPoll:
+    """The new case: SIGTERM lands while the parent is in the progress poll.
+
+    Same shape as ``TestOrphanPrevention.test_sigterm_terminates_all_workers``
+    but against the poll-join wait rather than the blocking one. The
+    poll-join must remain inside ``_ensure_workers_terminated`` for this to
+    pass; moving it out is exactly the regression this catches.
+    """
+
+    def test_sigterm_inside_the_progress_wait_terminates_all_workers(self):
+        ctx = mp.get_context("spawn")
+        p = ctx.Process(target=_run_long_mine_with_progress_in_subprocess)
+        p.start()
+        worker_pids: list[int] = []
+        try:
+            TestOrphanPrevention._wait_for_workers_to_start(p.pid, want=2, timeout_s=5.0)
+            worker_pids = TestOrphanPrevention._direct_children(p.pid)
+            assert len(worker_pids) >= 2, f"expected ≥2 workers under parent {p.pid}, got {worker_pids}"
+
+            # The parent has been polling for a while by now, so the signal
+            # lands in p.join(_PROGRESS_POLL_S) rather than the blocking join.
+            time.sleep(0.3)
+            os.kill(p.pid, signal.SIGTERM)
+            p.join(timeout=5.0)
+            assert not p.is_alive(), "mine() subprocess did not exit within 5s of SIGTERM"
+
+            time.sleep(1.0)
+            survivors = [pid for pid in worker_pids if TestOrphanPrevention._pid_alive(pid)]
+            assert not survivors, f"SIGTERM during the progress poll left {len(survivors)} orphans: {survivors}"
+        finally:
+            if p.is_alive():
+                p.kill()
+                p.join(timeout=2.0)
+            for orphan in worker_pids:
+                if TestOrphanPrevention._pid_alive(orphan):
+                    try:
+                        os.kill(orphan, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass

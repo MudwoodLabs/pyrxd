@@ -5,9 +5,12 @@
 self-contained and the verifier path is the same as the mining path —
 no silent divergence between "what the miner accepts" and "what
 on-chain validation enforces." That correctness comes at a cost: a
-4-byte V1 nonce sweep through CPython's `hashlib` runs at roughly 1
-Mh/s per core, so a real mainnet contract takes minutes to over an
-hour on a single CPU. Anyone wanting to mine V1 dMint contracts in
+V1 mint needs ~8.59 billion SHA256d attempts on average even at
+difficulty 1 (`2**96 / target` — see
+[Estimating time-to-mint](parallel-mining.md#estimating-time-to-mint)),
+and CPython's `hashlib` gets through them one core at a time. What that
+is in wall clock depends on the machine; measure it with `pyrxd glyph
+dmint-estimate` rather than assuming a rate. Anyone wanting to mine V1 dMint contracts in
 production wants a faster miner — a parallel Python worker pool, a C
 binary, a WebGPU shader. The shim that bridges pyrxd to those is
 [`mine_solution_external`](../../src/pyrxd/glyph/dmint/__init__.py): it spawns
@@ -256,6 +259,23 @@ The 0.5.1 protocol freeze is **additive**: it adds an optional
 `protocol: 1` field on the request and a `{"exhausted": true}`
 response shape on the exit-code-2 path. Miners that follow the 0.5.0
 contract documented above will continue to work without change.
+
+Those throughput figures are one dated machine, not a spec. Benchmark
+yours with `pyrxd glyph dmint-estimate`.
+
+## No progress frames (yet)
+
+The protocol is strictly request → response: the miner is silent until
+it finds a nonce, exhausts the space, or errors. There is no frame for
+"I have tried N nonces so far", so `pyrxd glyph claim-dmint` shows no
+live hash rate or ETA when driving an external `--miner-cmd` — it says
+so and points at `dmint-estimate` for the up-front numbers instead.
+
+The in-process miners (the bundled parallel miner, which is the CLI
+default, and `mine_solution`) do stream progress; they need no wire
+format to do it. Adding progress frames here would be a protocol change
+affecting every third-party miner, so it is deliberately left as a
+follow-up rather than bundled with the estimator.
 
 ---
 
