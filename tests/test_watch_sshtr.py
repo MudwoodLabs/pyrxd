@@ -51,6 +51,7 @@ def test_cli_argv_is_shell_safe():
         "ssh",
         "-o",
         "ConnectTimeout=10",
+        "--",
         _HOST,
         f"docker exec {_CONTAINER} radiant-cli getblockcount",
     ]
@@ -58,8 +59,9 @@ def test_cli_argv_is_shell_safe():
 
 def test_cli_argv_custom_host_container():
     argv = SshTrRxdReader(ssh_host="myhost", container="rxd")._cli_argv("getblockcount")
-    assert argv[3] == "myhost"
-    assert argv[4] == "docker exec rxd radiant-cli getblockcount"
+    assert argv[3] == "--"  # end-of-options terminator (argv-injection hardening)
+    assert argv[4] == "myhost"
+    assert argv[5] == "docker exec rxd radiant-cli getblockcount"
 
 
 def test_ssh_host_and_container_are_required():
@@ -78,7 +80,7 @@ async def test_get_transaction_verbose_returns_dict(monkeypatch):
     res = await SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER).get_transaction_verbose("ab" * 32)
     assert res["confirmations"] == 5
     # getrawtransaction <txid> true
-    assert cap["argv"][4].endswith(f"radiant-cli getrawtransaction {'ab' * 32} true")
+    assert cap["argv"][-1].endswith(f"radiant-cli getrawtransaction {'ab' * 32} true")
 
 
 async def test_get_transaction_verbose_rejects_non_dict(monkeypatch):
@@ -111,3 +113,59 @@ def test_reader_has_no_broadcast_surface():
     reader = SshTrRxdReader(ssh_host=_HOST, container=_CONTAINER)
     for forbidden in ("broadcast", "sendrawtransaction", "carve_fee_input", "get_utxos"):
         assert not hasattr(reader, forbidden)
+
+
+#
+# argv-injection hardening
+#
+# ssh_host / ssh_container are operator-supplied (flag, env, config) and land in an argv.
+# OpenSSH's getopt honours an option ANYWHERE in argv, so a host of "-oProxyCommand=<cmd>"
+# executes <cmd> LOCALLY as the watchtower user -- the account holding pre-signed refund
+# blobs and webhook secrets. shlex.quote does not help: it escapes for the REMOTE shell,
+# and "-o" needs no shell metacharacters at all.
+#
+from pyrxd.security.errors import ValidationError
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "-oProxyCommand=touch /tmp/pwned",  # the actual exploit: local command execution
+        "-F/tmp/attacker_ssh_config",  # alternate config file
+        "-obatchmode=no",
+        "--",
+        "-",
+        "host;touch /tmp/x",
+        "host with space",
+        "host$(id)",
+        "host`id`",
+        "host\nProxyCommand=id",
+    ],
+)
+def test_hostile_ssh_host_is_refused(hostile):
+    """A host that could be read as an ssh option or shell metacharacter must not construct."""
+    with pytest.raises(ValidationError):
+        SshTrRxdReader(ssh_host=hostile, container="radiant-mainnet")
+
+
+@pytest.mark.parametrize("hostile", ["-u", "-v", "--user=root", "c;id", "c d", ""])
+def test_hostile_container_is_refused(hostile):
+    """`shlex.quote("-u")` is "-u" -- a live `docker exec` flag on the remote side."""
+    with pytest.raises(ValidationError):
+        SshTrRxdReader(ssh_host="node.example.com", container=hostile)
+
+
+@pytest.mark.parametrize(
+    "ok",
+    ["tr", "node.example.com", "user@host", "host:2222", "10.0.0.5", "my-node_1"],
+)
+def test_legitimate_hosts_still_accepted(ok):
+    """The guard must not break real hostnames, user@host, or ports."""
+    assert SshTrRxdReader(ssh_host=ok, container="radiant-mainnet") is not None
+
+
+def test_argv_uses_end_of_options_terminator():
+    """Belt-and-braces: `--` stops getopt reading a later token as an option."""
+    argv = SshTrRxdReader(ssh_host="node.example.com", container="radiant-mainnet")._cli_argv("getblockcount")
+    assert "--" in argv
+    assert argv.index("--") < argv.index("node.example.com")

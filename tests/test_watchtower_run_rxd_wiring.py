@@ -68,14 +68,31 @@ async def test_single_source_stays_low_corroboration():
 
 async def test_include_node_combines_with_electrumx_for_quorum():
     # the operator's own node + one public ElectrumX = 2 independent sources → corroborated.
-    src, corr = await _build("--rxd-electrumx-url", "wss://a", "--rxd-include-node")
+    # --ssh-host/--ssh-container are required (no private-infra defaults) whenever the
+    # operator's own node is included.
+    src, corr = await _build(
+        "--rxd-electrumx-url",
+        "wss://a",
+        "--rxd-include-node",
+        "--ssh-host",
+        "node.example.com",
+        "--ssh-container",
+        "radiant-mainnet",
+    )
     assert isinstance(src, MultiSourceRxdChainSource)
     assert corr is True
 
 
 async def test_ssh_only_is_single_source():
     # node-only run (no electrumx default added) → single source, low-corroboration.
-    src, corr = await _build("--rxd-backend", "ssh-tr")
+    src, corr = await _build(
+        "--rxd-backend",
+        "ssh-tr",
+        "--ssh-host",
+        "node.example.com",
+        "--ssh-container",
+        "radiant-mainnet",
+    )
     assert isinstance(src, ElectrumRxdChainSource)
     assert corr is False
 
@@ -98,3 +115,18 @@ async def test_dedup_normalizes_trailing_slash_and_case():
     src, corr = await _build("--rxd-electrumx-url", "wss://Dup.Example", "--rxd-electrumx-url", "wss://dup.example/")
     assert isinstance(src, ElectrumRxdChainSource)
     assert corr is False
+
+
+async def test_ssh_backend_without_host_or_container_refuses_to_start():
+    """No private-infra defaults: omitting them must fail loudly, not silently `ssh tr`.
+
+    The old defaults were one operator's own host/container. A public user who passed only
+    --rxd-include-node would have attempted `ssh tr` — handing whoever answers that name in
+    their DNS search domain the txid set of their in-flight swaps.
+    """
+    with pytest.raises(SystemExit, match="--ssh-host and --ssh-container required"):
+        await _build("--rxd-backend", "ssh-tr")
+
+    # Only the genuinely-missing flag is named.
+    with pytest.raises(SystemExit, match=r"^--ssh-container required"):
+        await _build("--rxd-electrumx-url", "wss://a", "--rxd-include-node", "--ssh-host", "h")

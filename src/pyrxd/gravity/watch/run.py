@@ -220,6 +220,16 @@ async def _build_rxd_source(args: argparse.Namespace, stack: contextlib.AsyncExi
     if args.rxd_backend == "ssh-tr" or args.rxd_include_node:
         from pyrxd.gravity.watch.sshtr import SshTrRxdReader  # deferred: only needed for this backend
 
+        # Required, not defaulted: see the --ssh-host/--ssh-container declarations. Fail loudly
+        # here rather than let SshTrRxdReader raise on a None it can't explain in context.
+        missing = [
+            flag for flag, val in (("--ssh-host", args.ssh_host), ("--ssh-container", args.ssh_container)) if not val
+        ]
+        if missing:
+            raise SystemExit(
+                f"{' and '.join(missing)} required with "
+                f"{'--rxd-backend ssh-tr' if args.rxd_backend == 'ssh-tr' else '--rxd-include-node'}"
+            )
         sources.append(ElectrumRxdChainSource(SshTrRxdReader(ssh_host=args.ssh_host, container=args.ssh_container)))
     # Public ElectrumX endpoints (repeatable). Default to the verified set unless this is a node-only run.
     urls = list(args.rxd_electrumx_url or [])
@@ -323,8 +333,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
         help="RXD source quorum (>=2 enables corroboration: clears low_corroboration when >= this many "
         "independent sources are wired; fail-closed below it)",
     )
-    p.add_argument("--ssh-host", default="tr", help="ssh host for --rxd-backend ssh-tr / --rxd-include-node")
-    p.add_argument("--ssh-container", default="radiant-mainnet", help="radiant docker container for ssh-tr")
+    # No defaults: this ships in the public wheel. The previous "tr" / "radiant-mainnet"
+    # defaults were one operator's private infrastructure, and a user who passed only
+    # --rxd-include-node would silently attempt `ssh tr` — handing whoever answers that
+    # name the txid set of their in-flight swaps.
+    p.add_argument("--ssh-host", help="ssh host for --rxd-backend ssh-tr / --rxd-include-node (required for those)")
+    p.add_argument("--ssh-container", help="radiant docker container for ssh-tr (required for those)")
     p.add_argument("--mempool-base-url", default="https://mempool.space", help="primary Esplora/mempool.space base URL")
     p.add_argument(
         "--esplora-url",

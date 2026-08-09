@@ -233,3 +233,36 @@ class TestArgumentValidation:
     def test_defaults_match_the_cli_behaviour_they_replaced(self) -> None:
         assert DEFAULT_POLL_INTERVAL_S == 10.0
         assert DEFAULT_CONFIRMATION_TIMEOUT_S == 1800.0
+
+
+#
+# Non-finite depth from a hostile/broken server
+#
+# json.loads ACCEPTS the non-standard literals Infinity/-Infinity/NaN. int(inf) raises
+# OverflowError and int(nan) raises ValueError — neither is a NetworkError, so before the
+# guard these escaped the fail-closed contract and surfaced as a bare traceback. On the
+# mint path that happens AFTER the commit is already broadcast on-chain.
+#
+import json as _json
+import math as _math
+
+import pytest as _pytest
+
+from pyrxd.network.confirm import _confirmations_of
+
+
+@_pytest.mark.parametrize("literal", ["1e999", "-1e999", "NaN", "Infinity", "-Infinity"])
+def test_non_finite_confirmations_are_treated_as_zero_depth(literal):
+    """A non-finite depth must read as 'no confirmations', never raise."""
+    info = _json.loads(f'{{"confirmations": {literal}}}')
+    raw = info["confirmations"]
+    assert isinstance(raw, float) and not _math.isfinite(raw), "precondition: json really parsed it"
+
+    assert _confirmations_of(info) == 0
+
+
+def test_finite_depths_still_work():
+    assert _confirmations_of({"confirmations": 3}) == 3
+    assert _confirmations_of({"confirmations": 2.9}) == 2
+    assert _confirmations_of({"confirmations": -5}) == 0
+    assert _confirmations_of({"confirmations": True}) == 0
