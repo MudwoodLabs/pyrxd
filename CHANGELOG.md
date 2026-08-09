@@ -6,7 +6,58 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`pyrxd.network.wait_for_confirmation`** — a public, testable confirmation poller
+  with both time seams injected (`sleep` **and** `clock`, plus `max_iterations`),
+  matching the pattern in `gravity.watch.daemon.run_loop` / `heartbeat.run_monitor`.
+  It replaces the CLI's private `_wait_for_tx`, whose deadline came from
+  `asyncio.get_event_loop().time()` — injecting a fake `sleep` did not advance that
+  clock, so the timeout branch was unreachable in a test. It raises the typed
+  `ConfirmationTimeoutError` rather than the CLI's click-based
+  `NetworkBoundaryError`; `_wait_for_tx` is now just the click translation layer.
+
+- **`pyrxd.glyph.fees`** — reveal-size and reveal-fee estimation from the encoded CBOR
+  payload (`estimate_reveal_fee`, `estimate_reveal_fee_for_metadata`,
+  `check_reveal_funding`). The estimate runs the real `SatoshisPerKilobyte.compute_fee`
+  over shim records rather than re-deriving the size arithmetic, so it cannot drift
+  from the transaction the CLI then builds.
+
+- **New typed errors** in `pyrxd.security.errors`: `InsufficientFundsError`
+  (subclasses `ValidationError`, so every existing `except ValidationError` around the
+  SDK's ~16 `"Insufficient funds…"` sites still catches it) and
+  `ConfirmationTimeoutError` (subclasses `InsufficientConfirmationsError`, so a
+  timeout stays distinguishable from a broken transport). `InsufficientConfirmationsError`,
+  `PolicyRejection` and `FeePoolExhaustedError` were missing from the module's `__all__`
+  and/or from `pyrxd.security`'s re-exports; all are exported now.
+
 ### Fixed
+
+- **A Glyph mint could strand the commit output on-chain when the metadata was large.**
+  The reveal's scriptSig carries the entire CBOR payload, so the reveal's size — and
+  its fee — scale with metadata size, and that fee is paid entirely out of the commit
+  output. Both mint paths hard-coded a flat 5,000,000-photon commit value, which at the
+  10,000 photons/**byte** minimum fee rate covers only about **230 bytes of CBOR**.
+  Past that the reveal could not pay its own fee — and this was discovered only when
+  the node rejected the reveal, *after* the commit was already broadcast, leaving its
+  value in an output whose sole spending path could no longer be funded.
+  `glyph mint-nft` and `glyph deploy-ft` now size the commit from the real reveal
+  estimate and assert `commit_value >= carrier + reveal_fee` **before** broadcasting
+  the commit, raising `InsufficientFundsError` (surfaced as a CLI `UserError`) that
+  names the shortfall. The historical 5,000,000-photon overhead is kept as a floor, so
+  small-metadata mints are unchanged.
+
+- **Every ElectrumX RPC error was reported as a generic `NetworkError` with the
+  server's message discarded**, which made `mandatory-script-verify-flag-failed`, dust
+  and min-relay-fee rejections indistinguishable from a dropped socket — the masking
+  that hid a dMint covenant-rejection bug for weeks. Node rejections now raise the
+  typed `PolicyRejection` carrying a **sanitized** reason (first line only,
+  non-printables stripped, long tokens run through `redact` — an ElectrumX reject
+  reason has historically included the whole raw transaction hex — then clipped).
+  Transport and protocol errors keep the original static description. `PolicyRejection`
+  now also inherits from `NetworkError` alongside `CovenantError` so the ~30 existing
+  `except NetworkError` handlers wrapping broadcasts do not silently stop catching
+  rejections now that the class is actually raised.
 
 - **`glyph mint-nft` and `glyph deploy-ft` reported the wrong genesis ref.** Both
   printed `<reveal_txid>:0`, but a Glyph token's permanent identity is its

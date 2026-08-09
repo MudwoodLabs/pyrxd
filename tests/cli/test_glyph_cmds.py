@@ -509,6 +509,7 @@ from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
 from pyrxd.script.script import Script
+from pyrxd.security.errors import ConfirmationTimeoutError, InsufficientFundsError
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
@@ -914,3 +915,187 @@ class TestDmintV2CliPaths:
         assert len(captured) == 2
         assert result["version"] == "V2"
         assert result["daa_mode"] == "LWMA"
+
+
+# ---------------------------------------------------------------------------
+# C-1: the reveal fee scales with the CBOR payload and is paid out of the commit
+# output. The guard must fire BEFORE the commit is broadcast — once the commit is
+# on-chain, an unfundable reveal strands its value permanently.
+# ---------------------------------------------------------------------------
+
+
+class TestRevealFeeGuard:
+    def _wallet_and_client(self, utxo_value: int = 50_000_000):
+        key = PrivateKey()
+        utxo = UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=utxo_value, height=100)
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [(utxo, key.address(), key)]
+
+        captured: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            captured.append(raw)
+            return ("11" if len(captured) == 1 else "22") * 32
+
+        client = MagicMock()
+        client.broadcast = _bcast
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+        return key, _Wallet(), client, captured
+
+    def test_mint_nft_sizes_the_commit_from_the_real_reveal_estimate(self, cli_context, tmp_path) -> None:
+        from pyrxd.cli.glyph_cmds import _mint_nft_inner, _read_metadata_file
+        from pyrxd.glyph.fees import estimate_reveal_fee_for_metadata
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        _key, wallet, client, captured = self._wallet_and_client(utxo_value=500_000_000)
+        # Big enough that the historical flat 5,000,000-photon commit could not have
+        # paid the reveal fee.
+        meta = _read_metadata_file(_write_meta(tmp_path / "big.json", protocol=["NFT"], description="x" * 900))
+        estimate = estimate_reveal_fee_for_metadata(meta, fee_rate=ctx.fee_rate)
+        assert estimate.fee > 5_000_000, "fixture must exercise the C-1 regime"
+
+        asyncio.run(_mint_nft_inner(ctx, wallet, meta, client))
+
+        assert len(captured) == 2, "commit + reveal both broadcast"
+        commit = Transaction.from_hex(captured[0])
+        reveal = Transaction.from_hex(captured[1])
+        commit_value = commit.outputs[0].satoshis
+        assert commit_value >= 546 + estimate.fee, "commit must cover carrier + reveal fee"
+        # The reveal actually pays a real fee and still returns change — i.e. it is a
+        # transaction a node would accept, not one whose outputs exceed its input.
+        reveal_out = sum(o.satoshis for o in reveal.outputs)
+        assert reveal_out < commit_value
+        assert commit_value - reveal_out >= estimate.fee
+
+    def test_guard_fires_before_the_commit_is_broadcast(self, cli_context, tmp_path, monkeypatch) -> None:
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.cli.glyph_cmds import _mint_nft_inner, _read_metadata_file
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        _key, wallet, client, captured = self._wallet_and_client(utxo_value=500_000_000)
+        meta = _read_metadata_file(_write_meta(tmp_path / "big.json", protocol=["NFT"], description="x" * 900))
+        # Pin the commit value back to the historical flat 5,000,000 so the guard has
+        # something to catch. This is exactly the pre-fix behaviour.
+        monkeypatch.setattr(glyph_cmds, "_commit_value_for_reveal", lambda carrier, est: 5_000_000)
+
+        with pytest.raises(UserError) as ei:
+            asyncio.run(_mint_nft_inner(ctx, wallet, meta, client))
+
+        assert captured == [], "NOTHING may be broadcast — that is the whole point"
+        assert "cannot cover the reveal fee" in str(ei.value.message)
+        assert "short by" in str(ei.value.cause)
+        assert isinstance(ei.value.__cause__, InsufficientFundsError)
+
+    def test_deploy_ft_guard_fires_before_the_commit_is_broadcast(self, cli_context, tmp_path, monkeypatch) -> None:
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.cli.glyph_cmds import _deploy_ft_inner, _read_metadata_file
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key, wallet, client, captured = self._wallet_and_client(utxo_value=500_000_000)
+        meta = _read_metadata_file(_write_meta(tmp_path / "bigft.json", protocol=["FT"], description="x" * 900))
+        treasury_pkh = Hex20(key.public_key().hash160())
+        monkeypatch.setattr(glyph_cmds, "_commit_value_for_reveal", lambda carrier, est: carrier + 5_000_000)
+
+        with pytest.raises(UserError):
+            asyncio.run(_deploy_ft_inner(ctx, wallet, meta, treasury_pkh, 1000, client))
+
+        assert captured == []
+
+    def test_deploy_ft_sizes_the_commit_from_the_real_reveal_estimate(self, cli_context, tmp_path) -> None:
+        from pyrxd.cli.glyph_cmds import _deploy_ft_inner, _read_metadata_file
+        from pyrxd.glyph.fees import estimate_reveal_fee_for_metadata
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key, wallet, client, captured = self._wallet_and_client(utxo_value=500_000_000)
+        meta = _read_metadata_file(_write_meta(tmp_path / "bigft.json", protocol=["FT"], description="x" * 900))
+        treasury_pkh = Hex20(key.public_key().hash160())
+        estimate = estimate_reveal_fee_for_metadata(meta, fee_rate=ctx.fee_rate)
+
+        asyncio.run(_deploy_ft_inner(ctx, wallet, meta, treasury_pkh, 1000, client))
+
+        assert len(captured) == 2
+        commit = Transaction.from_hex(captured[0])
+        reveal = Transaction.from_hex(captured[1])
+        # The whole supply sits on the reveal's vout[0], so none of it pays the fee.
+        assert reveal.outputs[0].satoshis == 1000
+        assert commit.outputs[0].satoshis >= 1000 + estimate.fee
+
+    def test_small_metadata_keeps_the_historical_commit_overhead(self, cli_context, tmp_path) -> None:
+        # The 5,000,000-photon floor is preserved for payloads that always fitted.
+        from pyrxd.cli.glyph_cmds import _mint_nft_inner, _read_metadata_file
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        _key, wallet, client, captured = self._wallet_and_client()
+        meta = _read_metadata_file(_write_meta(tmp_path / "nft.json", protocol=["NFT"]))
+
+        asyncio.run(_mint_nft_inner(ctx, wallet, meta, client))
+
+        commit = Transaction.from_hex(captured[0])
+        assert commit.outputs[0].satoshis == 546 + 5_000_000
+
+    def test_reveal_fee_is_shown_in_the_confirmation_summary(self, cli_context, tmp_path, monkeypatch) -> None:
+        # A human confirming a broadcast should see what the reveal will cost, since
+        # it comes out of the value they are about to lock in the commit.
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.cli.glyph_cmds import _mint_nft_inner, _read_metadata_file
+
+        seen: list[str] = []
+        monkeypatch.setattr(
+            glyph_cmds,
+            "_confirm_or_abort",
+            lambda ctx, sections: seen.extend(line for sec in sections for line in sec.lines),
+        )
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        _key, wallet, client, _captured = self._wallet_and_client()
+        meta = _read_metadata_file(_write_meta(tmp_path / "nft.json", protocol=["NFT"]))
+
+        asyncio.run(_mint_nft_inner(ctx, wallet, meta, client))
+
+        summary = "\n".join(seen)
+        assert "reveal fee:" in summary
+        assert "paid from commit value" in summary
+
+
+class TestWaitForTxTranslation:
+    """``_wait_for_tx`` is now a thin click-boundary wrapper; the polling lives in
+    ``pyrxd.network.confirm`` where both time seams are injectable."""
+
+    def test_library_timeout_becomes_a_network_boundary_error(self) -> None:
+        from pyrxd.cli.errors import NetworkBoundaryError
+        from pyrxd.cli.glyph_cmds import _wait_for_tx
+
+        client = MagicMock()
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 0})
+
+        # timeout_s smaller than the 10s poll interval: the first elapsed check on the
+        # real monotonic clock is already past it, so this terminates immediately.
+        with pytest.raises(NetworkBoundaryError) as ei:
+            asyncio.run(_wait_for_tx(client, "ab" * 32, timeout_s=1e-9))
+
+        assert ei.value.exit_code == 2
+        assert "timed out waiting for confirmation" in ei.value.message
+        assert isinstance(ei.value.__cause__, ConfirmationTimeoutError)
+
+    def test_returns_quietly_once_confirmed(self) -> None:
+        from pyrxd.cli.glyph_cmds import _wait_for_tx
+
+        client = MagicMock()
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+        assert asyncio.run(_wait_for_tx(client, "ab" * 32)) is None
+
+    def test_does_not_leak_a_click_exception_out_of_the_library(self) -> None:
+        # NetworkBoundaryError is a click.ClickException; library code must never
+        # raise it. wait_for_confirmation raises the typed library error instead.
+        import click
+
+        from pyrxd.network.confirm import wait_for_confirmation
+
+        client = MagicMock()
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 0})
+
+        with pytest.raises(ConfirmationTimeoutError) as ei:
+            asyncio.run(wait_for_confirmation(client, "ab" * 32, timeout_s=1e-9))
+
+        assert not isinstance(ei.value, click.ClickException)

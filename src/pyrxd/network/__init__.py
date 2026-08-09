@@ -17,9 +17,16 @@ from .bitcoin import (
     choose_funding_reader,
 )
 from .chaintracker import ChainTracker
+from .confirm import (
+    DEFAULT_CONFIRMATION_TIMEOUT_S,
+    DEFAULT_POLL_INTERVAL_S,
+    wait_for_confirmation,
+)
 from .electrumx import ElectrumXClient
 
 __all__ = [
+    "DEFAULT_CONFIRMATION_TIMEOUT_S",
+    "DEFAULT_POLL_INTERVAL_S",
     "BitcoinCoreRpcSource",
     "BlockstreamSource",
     "BtcDataSource",
@@ -29,4 +36,5 @@ __all__ = [
     "MultiSourceBtcDataSource",
     "MultiSourceBtcFundingReader",
     "choose_funding_reader",
+    "wait_for_confirmation",
 ]

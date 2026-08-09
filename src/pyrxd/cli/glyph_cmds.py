@@ -66,13 +66,22 @@ from ..glyph.dmint import (
     find_dmint_funding_utxo,
     mine_solution_dispatch,
 )
+from ..glyph.fees import RevealFeeEstimate, check_reveal_funding, estimate_reveal_fee_for_metadata
 from ..glyph.scanner import GlyphScanner
 from ..glyph.script import build_nft_locking_script, extract_ref_from_nft_script
 from ..glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
 from ..hd.wallet import HdWallet
+from ..network.confirm import wait_for_confirmation
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata
-from ..security.errors import DmintError, MaxAttemptsError, NetworkError, ValidationError
+from ..security.errors import (
+    ConfirmationTimeoutError,
+    DmintError,
+    InsufficientFundsError,
+    MaxAttemptsError,
+    NetworkError,
+    ValidationError,
+)
 from ..security.types import Hex20, Txid
 from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
@@ -206,6 +215,49 @@ def mint_nft_cmd(ctx: CliContext, metadata_file: Path, passphrase: bool) -> None
         click.echo(f"  glyph ref:   {result['ref']}")
 
 
+# Historical floor for the commit output's overhead above the token carrier — the flat
+# 5,000,000 photons both mint paths used to hard-code. Kept as a floor so small-metadata
+# mints size as they always have; the reveal estimate only ever raises it.
+_MIN_COMMIT_OVERHEAD = 5_000_000
+# Slack (in reveal bytes) folded in on top of the exact estimate. Unspent slack comes
+# straight back as reveal change, so it costs nothing — it just keeps the change output
+# above dust, which in turn keeps the reveal the size the fee model measured.
+_REVEAL_SIZE_SLACK_BYTES = 64
+
+
+def _commit_value_for_reveal(carrier_value: int, estimate: RevealFeeEstimate) -> int:
+    """Commit-output value that lets the reveal pay its own fee, never below the floor.
+
+    ``carrier_value`` is what the reveal must place on its token output — a 546-photon
+    dust carrier for an NFT, the whole premined supply for an FT — and is therefore
+    *not* available to pay the fee.
+    """
+    slack = _REVEAL_SIZE_SLACK_BYTES * estimate.fee_rate
+    return carrier_value + max(_MIN_COMMIT_OVERHEAD, estimate.fee + slack)
+
+
+def _assert_reveal_is_fundable(
+    commit_value: int,
+    carrier_value: int,
+    estimate: RevealFeeEstimate,
+) -> None:
+    """Fail the mint *before* the commit is broadcast if the reveal cannot pay its fee.
+
+    Belt-and-braces against :func:`_commit_value_for_reveal`: if the two ever disagree,
+    the caller gets a typed :class:`InsufficientFundsError` naming the shortfall while
+    the money is still in their wallet — instead of a rejected reveal and a commit
+    output that nothing can spend.
+    """
+    try:
+        check_reveal_funding(commit_value=commit_value, carrier_value=carrier_value, estimate=estimate)
+    except InsufficientFundsError as exc:
+        raise UserError(
+            "commit value cannot cover the reveal fee — refusing to broadcast the commit",
+            cause=str(exc),
+            fix=("shrink the metadata (the reveal scriptSig carries the whole CBOR payload) or lower --fee-rate"),
+        ) from exc
+
+
 async def _mint_nft_inner(
     ctx: CliContext,
     wallet: HdWallet,
@@ -225,10 +277,18 @@ async def _mint_nft_inner(
 
     # Estimate funding requirement: commit value + commit fee + reveal fee buffer.
     fee_rate = ctx.fee_rate
-    commit_value = 5_000_000  # photons; covers reveal-time outputs + headroom
+    carrier_value = 546  # the NFT's dust carrier on the reveal
+    # C-1: the reveal's scriptSig carries the whole CBOR payload, so the reveal fee
+    # scales with metadata size and is paid entirely out of the commit output. Size
+    # the commit from the real estimate instead of the old flat 5,000,000, which at
+    # 10,000 photons/byte only covered ~230 bytes of CBOR.
+    reveal_estimate = estimate_reveal_fee_for_metadata(metadata, fee_rate=fee_rate)
+    commit_value = _commit_value_for_reveal(carrier_value, reveal_estimate)
     commit_fee_estimate = 300 * fee_rate  # ~300-byte commit
-    reveal_fee_estimate = 600 * fee_rate  # ~600-byte reveal w/ CBOR
-    total_required = commit_value + commit_fee_estimate + reveal_fee_estimate + 546
+    # The reveal fee comes out of commit_value (sized above), so the funding UTXO needs
+    # the commit value plus the commit's own fee; the extra carrier_value is slack so a
+    # UTXO is not selected on an exact tie.
+    total_required = commit_value + commit_fee_estimate + carrier_value
 
     triples.sort(key=lambda t: t[0].value, reverse=True)
     funding = next((t for t in triples if t[0].value >= total_required), None)
@@ -290,10 +350,15 @@ async def _mint_nft_inner(
                 f"funding value: {funding_utxo.value:,} photons",
                 f"commit value:  {commit_value:,} photons",
                 f"owner_pkh:     {funding_pkh.hex()}  (this wallet)",
+                f"reveal fee:    {reveal_estimate.fee:,} photons "
+                f"({reveal_estimate.size_bytes:,} B @ {fee_rate:,}/B, paid from commit value)",
                 f"network:       {ctx.network}",
             ],
         ),
     ]
+    # C-1 gate: the last point at which nothing has been spent. Once the commit is
+    # broadcast an unfundable reveal strands the commit output permanently.
+    _assert_reveal_is_fundable(commit_value, carrier_value, reveal_estimate)
     _confirm_or_abort(ctx, sections)
     commit_txid = await client.broadcast(commit_hex)
 
@@ -334,7 +399,7 @@ async def _mint_nft_inner(
     reveal_tx = Transaction(
         tx_inputs=[reveal_input],
         tx_outputs=[
-            TransactionOutput(Script(reveal_scripts.locking_script), 546),
+            TransactionOutput(Script(reveal_scripts.locking_script), carrier_value),
             TransactionOutput(locking, 0, change=True),
         ],
     )
@@ -370,30 +435,21 @@ async def _mint_nft_inner(
 
 
 async def _wait_for_tx(client: ElectrumXClient, txid: str, *, timeout_s: float = 1800.0) -> None:
-    """Poll get_transaction_verbose until ``confirmations`` is >= 1.
+    """CLI wrapper around :func:`pyrxd.network.confirm.wait_for_confirmation`.
 
-    Mirrors the polling pattern used in examples/. Re-raises on
-    persistent network failure; treats a transient miss as "not yet
-    confirmed."
+    The polling logic itself lives in the library, where both time seams are injected
+    so the timeout branch is reachable in a test. All this adds is the click-level
+    translation: the library raises ``ConfirmationTimeoutError``; the CLI turns it into
+    a ``NetworkBoundaryError`` (exit code 2) with a resume hint.
     """
-    start = asyncio.get_event_loop().time()
-    interval = 10.0
-    while True:
-        try:
-            info = await client.get_transaction_verbose(Txid(txid))
-            confirmations = int(info.get("confirmations", 0)) if isinstance(info, dict) else 0
-            if confirmations >= 1:
-                return
-        except NetworkError:
-            # Tx may not be visible yet; keep polling.
-            pass
-        if asyncio.get_event_loop().time() - start > timeout_s:
-            raise NetworkBoundaryError(
-                "timed out waiting for confirmation",
-                cause=f"{txid} did not confirm within {timeout_s:.0f}s",
-                fix="check the chain explorer; if confirmed, re-run with COMMIT_TXID=<txid> to resume reveal",
-            )
-        await asyncio.sleep(interval)
+    try:
+        await wait_for_confirmation(client, txid, timeout_s=timeout_s)
+    except ConfirmationTimeoutError as exc:
+        raise NetworkBoundaryError(
+            "timed out waiting for confirmation",
+            cause=str(exc),
+            fix="check the chain explorer; if confirmed, re-run with COMMIT_TXID=<txid> to resume reveal",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -479,10 +535,14 @@ async def _deploy_ft_inner(
         raise UserError("no spendable UTXOs in the wallet")
 
     fee_rate = ctx.fee_rate
-    commit_value = supply + 5_000_000  # supply + overhead
+    # The FT premine puts the entire supply on the reveal's vout[0], so the "carrier"
+    # the commit must cover on top of the reveal fee is the supply itself. C-1: the
+    # reveal fee scales with the CBOR payload the reveal scriptSig carries.
+    carrier_value = supply
+    reveal_estimate = estimate_reveal_fee_for_metadata(metadata, fee_rate=fee_rate)
+    commit_value = _commit_value_for_reveal(carrier_value, reveal_estimate)
     commit_fee_estimate = 300 * fee_rate
-    reveal_fee_estimate = 600 * fee_rate
-    total_required = commit_value + commit_fee_estimate + reveal_fee_estimate + 546
+    total_required = commit_value + commit_fee_estimate + 546
 
     triples.sort(key=lambda t: t[0].value, reverse=True)
     funding = next((t for t in triples if t[0].value >= total_required), None)
@@ -531,6 +591,9 @@ async def _deploy_ft_inner(
     commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     commit_tx.sign()
 
+    # C-1 gate: the last point at which nothing has been spent. Once the commit is
+    # broadcast an unfundable reveal strands the commit output permanently.
+    _assert_reveal_is_fundable(commit_value, carrier_value, reveal_estimate)
     _confirm_or_abort(
         ctx,
         [
@@ -543,6 +606,8 @@ async def _deploy_ft_inner(
                     f"funding value: {funding_utxo.value:,} photons",
                     f"commit value:  {commit_value:,} photons",
                     f"owner_pkh:     {funding_pkh.hex()}  (this wallet)",
+                    f"reveal fee:    {reveal_estimate.fee:,} photons "
+                    f"({reveal_estimate.size_bytes:,} B @ {fee_rate:,}/B, paid from commit value)",
                     f"network:       {ctx.network}",
                 ],
             ),

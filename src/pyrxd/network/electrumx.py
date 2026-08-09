@@ -6,8 +6,13 @@ Security notes
   ``NetworkError`` unless the caller explicitly passes ``allow_insecure=True``.
 * All method arguments are validated against pyrxd security types before any
   network call is made.
-* Raw server responses are NEVER embedded in exception messages – only static
-  descriptions are surfaced to the caller.
+* Raw server responses are NEVER embedded in exception messages verbatim. The one
+  deliberate carve-out is a node's **rejection reason**, which is the difference
+  between "your script failed verification" and "the socket dropped" and so cannot be
+  thrown away. It is passed through ``_sanitize_server_message`` first — first line
+  only, non-printables stripped, long tokens run through
+  :func:`~pyrxd.security.errors.redact`, then clipped — and surfaced as a typed
+  ``PolicyRejection``. Everything else still gets a static description.
 * ``script_hash`` parameters follow the ElectrumX convention: the value is
   ``sha256(locking_script)`` with the bytes reversed (little-endian hash).
 
@@ -31,7 +36,7 @@ from websockets.exceptions import WebSocketException
 from ..hash import sha256
 from ..merkle_path import MerklePath
 from ..script.type import P2PKH
-from ..security.errors import NetworkError, ValidationError
+from ..security.errors import NetworkError, PolicyRejection, ValidationError, redact
 from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
 
 logger = logging.getLogger(__name__)
@@ -62,6 +67,112 @@ class UtxoRecord:
 
 
 _MAX_RESPONSE_BYTES: int = 10 * 1024 * 1024  # 10 MB
+
+
+# ---------------------------------------------------------------------------
+# RPC-error classification
+# ---------------------------------------------------------------------------
+#
+# Every RPC error used to collapse to ``NetworkError("ElectrumX RPC error (code N)")``,
+# discarding the server's message. That made a script-verification failure, a dust
+# output and an unmet min-relay-fee indistinguishable from a dropped socket — the exact
+# masking that hid a dMint covenant-rejection bug for weeks (see
+# docs/solutions/logic-errors/dmint-v1-mint-scriptsig-divergence.md). A node rejection
+# now raises the typed ``PolicyRejection``; genuine transport faults stay ``NetworkError``.
+
+# Codes that mean "the node evaluated your transaction and said no".
+#   1   ElectrumX's DAEMON_ERROR — how it forwards a bitcoind sendrawtransaction failure
+#  -25  RPC_TRANSACTION_ERROR
+#  -26  RPC_TRANSACTION_REJECTED
+#  -27  RPC_TRANSACTION_ALREADY_IN_CHAIN
+_POLICY_ERROR_CODES: frozenset[int] = frozenset({1, -25, -26, -27})
+
+# Reject-reason fragments (matched case-insensitively) that identify a policy/consensus
+# rejection even when it arrives under an unexpected code. Kept to strings a node emits
+# for a *transaction* verdict — nothing here matches a connection or protocol fault.
+_POLICY_MESSAGE_MARKERS: tuple[str, ...] = (
+    "rejected by network rules",
+    "mandatory-script-verify-flag-failed",
+    "non-mandatory-script-verify-flag",
+    "min relay fee not met",
+    "insufficient priority",
+    "insufficient fee",
+    "absurdly-high-fee",
+    "too-long-mempool-chain",
+    "txn-already-",
+    "bad-txns-",
+    "scriptsig-",
+    "scriptpubkey",
+    "non-final",
+    "dust",
+    "missing-inputs",
+    "txn-mempool-conflict",
+)
+
+# A server message is attacker-influencable text. It never reaches a caller verbatim.
+_MAX_SERVER_MESSAGE_CHARS: int = 200
+# Tokens at least this long are run through ``redact`` — below it we are looking at
+# prose, and ``redact``'s deliberately aggressive base58 heuristic would eat ordinary
+# English words ("transaction" is all-base58 characters).
+_REDACT_TOKEN_MIN_CHARS: int = 20
+# A long token ``redact`` did not flag (e.g. "mandatory-script-verify-flag-failed") is
+# kept, but clipped — no unbounded server-controlled run in an exception message.
+_MAX_TOKEN_CHARS: int = 64
+
+
+def _sanitize_server_message(message: Any) -> str:
+    """Render an untrusted node message safe to embed in an exception.
+
+    Applies, in order: non-``str`` → empty; first line only (kills multi-line reject
+    dumps and log-injection via embedded newlines); non-printable characters → spaces
+    (ANSI escapes, NULs); :func:`~pyrxd.security.errors.redact` per long whitespace
+    token (an ElectrumX broadcast error historically appended the **entire raw
+    transaction hex** to the reason — that token is pure hex and collapses to
+    ``<redacted>``); per-token clipping; whole-message clipping.
+
+    The result is what callers and tracebacks see. Raw server bytes are never stored
+    on the exception and never chained via ``raise ... from``.
+    """
+    if not isinstance(message, str) or not message:
+        return ""
+    first_line = message.splitlines()[0]
+    cleaned = "".join(ch if ch.isprintable() else " " for ch in first_line)
+    tokens = []
+    for token in cleaned.split():
+        if len(token) >= _REDACT_TOKEN_MIN_CHARS:
+            scrubbed = str(redact(token))
+            token = scrubbed if scrubbed != token else token[:_MAX_TOKEN_CHARS]
+        tokens.append(token)
+    out = " ".join(tokens)
+    if len(out) > _MAX_SERVER_MESSAGE_CHARS:
+        out = out[:_MAX_SERVER_MESSAGE_CHARS] + "..."
+    return out
+
+
+def _rpc_error(code: Any, message: Any) -> NetworkError:
+    """Build the exception for a JSON-RPC error object.
+
+    Returns :class:`~pyrxd.security.errors.PolicyRejection` (itself a
+    ``NetworkError``, so existing ``except NetworkError`` handlers keep working) when
+    the code or the sanitized reason says the node rejected a transaction; a plain
+    ``NetworkError`` otherwise.
+
+    The sanitized reason is attached **only** to a policy rejection — that is the one
+    place where discarding it caused real harm. Every other RPC error keeps the
+    original static description, so the module's "no server text in the message"
+    invariant still holds everywhere it mattered before.
+    """
+    reason = _sanitize_server_message(message)
+    lowered = reason.lower()
+    is_policy = code in _POLICY_ERROR_CODES or any(marker in lowered for marker in _POLICY_MESSAGE_MARKERS)
+    if not is_policy:
+        return NetworkError(f"ElectrumX RPC error (code {code})")
+    detail = f": {reason}" if reason else ""
+    return PolicyRejection(
+        f"node rejected the transaction (code {code}){detail}",
+        code=code,
+        reason=reason,
+    )
 
 
 def _coerce_hex32(value: Hex32 | bytes | bytearray | str) -> Hex32:
@@ -570,8 +681,7 @@ class ElectrumXClient:
                 if "error" in data and data["error"] is not None:
                     err = data["error"]
                     if isinstance(err, dict):
-                        code = err.get("code", "unknown")
-                        fut.set_exception(NetworkError(f"ElectrumX RPC error (code {code})"))
+                        fut.set_exception(_rpc_error(err.get("code", "unknown"), err.get("message")))
                     else:
                         fut.set_exception(NetworkError("ElectrumX RPC error"))
                 elif "result" in data:
