@@ -118,27 +118,59 @@ _REDACT_TOKEN_MIN_CHARS: int = 20
 # A long token ``redact`` did not flag (e.g. "mandatory-script-verify-flag-failed") is
 # kept, but clipped — no unbounded server-controlled run in an exception message.
 _MAX_TOKEN_CHARS: int = 64
+# How much of an untrusted message is examined AT ALL. Everything below — the line
+# split, the per-character printability scan, the per-token ``redact`` — is O(len), and
+# this function runs on the receive-loop coroutine, so on a frame at the 10 MB cap it
+# blocked the whole client's event loop for ~200 ms (measured: 201 ms on a 10 MB
+# single-line message, 281 ms on 10 MB of short tokens), repeatably, on every RPC error a
+# hostile or broken server chose to send. Clipping FIRST bounds that to microseconds.
+#
+# 8 KiB is 40x the 200-char output cap, so it cannot change the result for any message
+# whose leading tokens are of sane length; a message that needs more than 8 KiB of input
+# to produce 200 characters of output is one built out of multi-KiB tokens, and every
+# such token collapses to ``<redacted>`` or a 64-char clip anyway.
+_MAX_SCANNED_CHARS: int = 8192
 
 
 def _sanitize_server_message(message: Any) -> str:
     """Render an untrusted node message safe to embed in an exception.
 
-    Applies, in order: non-``str`` → empty; first line only (kills multi-line reject
-    dumps and log-injection via embedded newlines); non-printable characters → spaces
-    (ANSI escapes, NULs); :func:`~pyrxd.security.errors.redact` per long whitespace
-    token (an ElectrumX broadcast error historically appended the **entire raw
-    transaction hex** to the reason — that token is pure hex and collapses to
-    ``<redacted>``); per-token clipping; whole-message clipping.
+    Applies, in order: non-``str`` → empty; **clip to** :data:`_MAX_SCANNED_CHARS` (see
+    there — this bounds every step below, which would otherwise stall the receive loop
+    on a 10 MB frame); first line only (kills multi-line reject dumps and log-injection
+    via embedded newlines); non-printable characters → spaces (ANSI escapes, NULs, bidi
+    controls); :func:`~pyrxd.security.errors.redact` per long whitespace token (an
+    ElectrumX broadcast error historically appended the **entire raw transaction hex**
+    to the reason — that token is pure hex and collapses to ``<redacted>``); per-token
+    clipping; whole-message clipping.
 
     The result is what callers and tracebacks see. Raw server bytes are never stored
     on the exception and never chained via ``raise ... from``.
     """
     if not isinstance(message, str) or not message:
         return ""
-    first_line = message.splitlines()[0]
+    head = message[:_MAX_SCANNED_CHARS]
+    lines = head.splitlines()
+    first_line = lines[0] if lines else ""
+    # Did the clip land inside the first line (rather than the line ending first)? If so
+    # its final token is a FRAGMENT of a longer one. A fragment at or above
+    # _REDACT_TOKEN_MIN_CHARS is fine — it is still redacted/clipped like any long token,
+    # and a prefix of hex/base58 is still hex/base58, so a payload that would have
+    # collapsed to "<redacted>" still does. A SHORT fragment is the one hazard: it would
+    # slip past a redaction the whole token would have triggered. Drop only that.
+    clipped_mid_line = len(message) > _MAX_SCANNED_CHARS and len(lines) <= 1
     cleaned = "".join(ch if ch.isprintable() else " " for ch in first_line)
+    raw_tokens = cleaned.split()
+    if (
+        clipped_mid_line
+        and len(raw_tokens) > 1
+        and cleaned
+        and not cleaned[-1].isspace()
+        and len(raw_tokens[-1]) < _REDACT_TOKEN_MIN_CHARS
+    ):
+        raw_tokens = raw_tokens[:-1]
     tokens = []
-    for token in cleaned.split():
+    for token in raw_tokens:
         if len(token) >= _REDACT_TOKEN_MIN_CHARS:
             scrubbed = str(redact(token))
             token = scrubbed if scrubbed != token else token[:_MAX_TOKEN_CHARS]

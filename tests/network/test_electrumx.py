@@ -921,8 +921,11 @@ class TestConnectFirstRace:
 # min-relay-fee were indistinguishable from a dropped socket. That masking hid a dMint
 # covenant-rejection bug for weeks.
 
-from pyrxd.network.electrumx import _rpc_error
-from pyrxd.security.errors import CovenantError, PolicyRejection
+import time
+
+from pyrxd.network import electrumx
+from pyrxd.network.electrumx import _rpc_error, _sanitize_server_message
+from pyrxd.security.errors import CovenantError, PolicyRejection, redact
 
 
 class TestPolicyRejectionClassification:
@@ -1044,6 +1047,106 @@ class TestServerMessageSanitization:
         err = _rpc_error(1, "dust " + "ab" * 300)
         assert err.__cause__ is None
         assert err.__context__ is None
+
+
+class TestServerMessageSanitizationIsBounded:
+    """Frames are capped at 10 MB and this runs on the receive-loop coroutine, so an
+    O(len(message)) sanitize blocks the whole client's event loop. It used to: the line
+    split, the per-character printability scan and the per-token redact all ran over the
+    ENTIRE message before the 200-char clip at the end (measured ~201 ms on a 10 MB
+    single-line message, repeatable on every RPC error). The message is clipped first
+    now; these tests pin both halves — still correct, and bounded."""
+
+    _BIG = 10 * 1024 * 1024
+
+    @pytest.mark.parametrize(
+        ("name", "message"),
+        [
+            ("one huge hex token", "rejected by network rules " + "ab" * (10 * 1024 * 1024 // 2)),
+            ("many short tokens", "dust " + "word " * (10 * 1024 * 1024 // 5)),
+            ("many short lines", "dust\n" + ("x" * 79 + "\n") * 130_000),
+            ("one huge base58 token", "dust " + "L1aW4aubDFB7yfras2S1mN3bqg9nwySY" * 300_000),
+            ("escape flood", "dust " + "\x1b[31m" * (10 * 1024 * 1024 // 5)),
+        ],
+    )
+    def test_a_ten_megabyte_hostile_message_is_sanitized_fast(self, name: str, message: str) -> None:
+        assert len(message) >= self._BIG // 2  # the inputs really are large
+        start = time.perf_counter()
+        out = _sanitize_server_message(message)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        # Generous vs. the ~200 ms it took before, tight vs. anything O(10 MB).
+        assert elapsed_ms < 25, f"{name}: {elapsed_ms:.1f} ms"
+        assert len(out) <= 210
+        assert "\x1b" not in out and "\x00" not in out
+
+    def test_a_huge_hex_payload_still_collapses_to_redacted(self) -> None:
+        # The behaviour the clip must not cost us: the historical failure was an
+        # ElectrumX reject reason with the whole raw tx appended.
+        raw_hex = "ab" * (5 * 1024 * 1024)
+        out = _sanitize_server_message(f"rejected by network rules {raw_hex}")
+        assert "<redacted>" in out
+        assert "ababababab" not in out
+        assert "rejected by network rules" in out
+
+    def test_a_huge_wif_shaped_payload_still_collapses(self) -> None:
+        wif_ish = "L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ" * 100_000
+        out = _sanitize_server_message(f"dust {wif_ish}")
+        assert "<redacted>" in out
+        assert "L1aW4aubDFB7" not in out
+
+    def test_a_short_fragment_at_the_clip_boundary_is_not_leaked(self) -> None:
+        # The clip can land inside a token. A fragment long enough to still be redacted
+        # is kept; a SHORT fragment (below the redaction floor) is dropped rather than
+        # emitted unredacted. Either way nothing key-material-shaped survives verbatim.
+        secret = "c0ffee" * 2_000_000
+        padded = "dust " + "x" * (electrumx._MAX_SCANNED_CHARS - 6) + " " + secret
+        out = _sanitize_server_message(padded)
+        assert "c0ffee" not in out
+
+    def test_control_characters_beyond_the_clip_cannot_reach_the_output(self) -> None:
+        message = "dust " + "y" * (electrumx._MAX_SCANNED_CHARS * 4) + "\x1b[31mred‮"
+        out = _sanitize_server_message(message)
+        assert "\x1b" not in out
+        assert "‮" not in out
+
+    @staticmethod
+    def _unclipped_reference(message: object) -> str:
+        """The pre-fix implementation, verbatim — the semantics to preserve."""
+        if not isinstance(message, str) or not message:
+            return ""
+        first_line = message.splitlines()[0]
+        cleaned = "".join(ch if ch.isprintable() else " " for ch in first_line)
+        tokens = []
+        for token in cleaned.split():
+            if len(token) >= electrumx._REDACT_TOKEN_MIN_CHARS:
+                scrubbed = str(redact(token))
+                token = scrubbed if scrubbed != token else token[: electrumx._MAX_TOKEN_CHARS]
+            tokens.append(token)
+        out = " ".join(tokens)
+        if len(out) > electrumx._MAX_SERVER_MESSAGE_CHARS:
+            out = out[: electrumx._MAX_SERVER_MESSAGE_CHARS] + "..."
+        return out
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "the transaction was rejected by network rules. mandatory-script-verify-flag-failed",
+            "dust\nsecond line with detail\nthird line",
+            "min relay fee not met",
+            "dust " + "ab" * 300,
+            "dust L1aW4aubDFB7yfras2S1mN3bqg9nwySY8nkoLmJebSLD5BWv3ENZ",
+            "dust \x1b[31mred\x00nul\ttab",
+            "mandatory-" + "x" * 200,
+            "dust " + "word " * 500,
+            "‮gnirts-desrever",
+            "",
+        ],
+    )
+    def test_output_is_identical_to_the_unclipped_implementation(self, message: str) -> None:
+        # Every message a real node sends is orders of magnitude below the clip, so the
+        # fix must be invisible for them. Compared against the old code, not a literal.
+        assert _sanitize_server_message(message) == self._unclipped_reference(message)
 
 
 async def test_policy_rejection_surfaces_through_a_broadcast() -> None:

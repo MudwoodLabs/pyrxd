@@ -43,6 +43,7 @@ from pyrxd.gravity.watch.adapters import (
     page_to_dict,
 )
 from pyrxd.gravity.watch.alerts import (
+    AckingAlerter,
     AlertChannel,
     DedupAlerter,
     FileAckInbox,
@@ -107,6 +108,7 @@ from pyrxd.gravity.watch.reconciler import (
 
 __all__ = [
     "HEARTBEAT_SCHEMA_VERSION",
+    "AckingAlerter",
     "AlertChannel",
     "Alerter",
     "BeatReading",

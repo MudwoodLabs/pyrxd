@@ -46,10 +46,12 @@ from ..glyph.builder import (
     CommitParams,
     DmintV1DeployParams,
     DmintV2DeployParams,
+    FtDeployRevealScripts,
     FtTransferParams,
     FtUtxo,
     GlyphBuilder,
     RevealParams,
+    RevealScripts,
 )
 from ..glyph.dmint import (
     DEFAULT_MAX_ATTEMPTS,
@@ -66,7 +68,12 @@ from ..glyph.dmint import (
     find_dmint_funding_utxo,
     mine_solution_dispatch,
 )
-from ..glyph.fees import RevealFeeEstimate, check_reveal_funding, estimate_reveal_fee_for_metadata
+from ..glyph.fees import (
+    RevealFeeEstimate,
+    check_reveal_funding,
+    estimate_reveal_fee_for_metadata,
+    measure_reveal_fee,
+)
 from ..glyph.scanner import GlyphScanner
 from ..glyph.script import build_nft_locking_script, extract_ref_from_nft_script
 from ..glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
@@ -238,26 +245,87 @@ def _commit_value_for_reveal(carrier_value: int, estimate: RevealFeeEstimate) ->
     return carrier_value + max(_MIN_COMMIT_OVERHEAD, estimate.fee + slack)
 
 
+# Stand-in commit txid for the dry-run reveal built by :func:`_assert_reveal_is_fundable`
+# before the real commit exists. A txid occupies 32 bytes in the input outpoint and 32
+# bytes in the reveal locking script's ref push whatever its value, so the dry-run reveal
+# serializes to exactly the same length as the real one — which is what the fee model
+# measures. ``tests/test_glyph_reveal_fees.py`` pins that equality.
+_PLACEHOLDER_COMMIT_TXID = "00" * 32
+
+
 def _assert_reveal_is_fundable(
     commit_value: int,
     carrier_value: int,
-    estimate: RevealFeeEstimate,
-) -> None:
+    reveal_tx: Transaction,
+    fee_rate: int,
+    cbor_bytes_len: int,
+) -> RevealFeeEstimate:
     """Fail the mint *before* the commit is broadcast if the reveal cannot pay its fee.
 
-    Belt-and-braces against :func:`_commit_value_for_reveal`: if the two ever disagree,
-    the caller gets a typed :class:`InsufficientFundsError` naming the shortfall while
-    the money is still in their wallet — instead of a rejected reveal and a commit
-    output that nothing can spend.
+    Takes the **built** (dry-run) reveal transaction and measures it, rather than
+    re-checking the estimate the commit value was derived from. That distinction is the
+    whole value of this function: ``_commit_value_for_reveal`` sets
+    ``commit_value = carrier + max(floor, estimate.fee + slack)``, so re-testing
+    ``commit_value >= carrier + estimate.fee`` against that same estimate is a tautology
+    that can never fail. Measuring the real transaction is an independent check — it
+    fires if the estimator's shim (its prefix constant, its locking-script sizes, its
+    assumed output set) has stopped describing the transaction the CLI actually builds.
+
+    Returns the measured estimate so the caller can display the real number. Raises
+    :class:`UserError` naming the shortfall while the money is still in the wallet,
+    instead of leaving a rejected reveal and a commit output nothing can spend.
     """
+    measured = measure_reveal_fee(reveal_tx, fee_rate=fee_rate, cbor_bytes_len=cbor_bytes_len)
     try:
-        check_reveal_funding(commit_value=commit_value, carrier_value=carrier_value, estimate=estimate)
+        check_reveal_funding(commit_value=commit_value, carrier_value=carrier_value, estimate=measured)
     except InsufficientFundsError as exc:
         raise UserError(
             "commit value cannot cover the reveal fee — refusing to broadcast the commit",
             cause=str(exc),
             fix=("shrink the metadata (the reveal scriptSig carries the whole CBOR payload) or lower --fee-rate"),
         ) from exc
+    return measured
+
+
+def _build_reveal_tx(
+    *,
+    commit_txid: str,
+    commit_value: int,
+    commit_script: bytes,
+    reveal_locking_script: bytes,
+    carrier_value: int,
+    change_locking: Script,
+    funding_key: PrivateKey,
+    scriptsig_suffix: bytes,
+) -> Transaction:
+    """Build (unsigned, un-fee'd) the reveal that spends the commit output.
+
+    Shared by the pre-broadcast dry run and the real post-confirmation build so the two
+    cannot diverge — a dry run that measured a *different* transaction would be worth no
+    more than the tautology it replaced.
+    """
+    shim_commit_out = TransactionOutput(Script(commit_script), commit_value)
+    src_commit_tx = Transaction(tx_inputs=[], tx_outputs=[shim_commit_out])
+    src_commit_tx.txid = lambda: commit_txid  # type: ignore[method-assign]
+
+    reveal_input = TransactionInput(
+        source_transaction=src_commit_tx,
+        source_output_index=0,
+        unlocking_script_template=_build_glyph_unlock(funding_key, scriptsig_suffix),
+    )
+    reveal_input.satoshis = commit_value
+    reveal_input.locking_script = Script(commit_script)
+
+    # The token sits on vout[0] (a dust carrier for an NFT, the whole supply for an FT
+    # premine); the rest of the commit value returns as change (fee() sized from the real
+    # length) instead of being burned to fee.
+    return Transaction(
+        tx_inputs=[reveal_input],
+        tx_outputs=[
+            TransactionOutput(Script(reveal_locking_script), carrier_value),
+            TransactionOutput(change_locking, 0, change=True),
+        ],
+    )
 
 
 async def _mint_nft_inner(
@@ -342,6 +410,38 @@ async def _mint_nft_inner(
     commit_tx.sign()
     commit_hex = commit_tx.serialize()
 
+    # C-1 gate: the last point at which nothing has been spent. Once the commit is
+    # broadcast an unfundable reveal strands the commit output permanently. Build the
+    # reveal now, against a placeholder commit txid, and MEASURE it — an independent
+    # check on the estimate that sized commit_value above.
+    cbor_bytes = commit_result.cbor_bytes
+    is_nft = True
+
+    def _nft_reveal_scripts(txid: str) -> RevealScripts:
+        return builder.prepare_reveal(
+            RevealParams(
+                commit_txid=txid,
+                commit_vout=0,
+                commit_value=commit_value,
+                cbor_bytes=cbor_bytes,
+                owner_pkh=funding_pkh,
+                is_nft=is_nft,
+            )
+        )
+
+    dry_run_scripts = _nft_reveal_scripts(_PLACEHOLDER_COMMIT_TXID)
+    dry_run_reveal = _build_reveal_tx(
+        commit_txid=_PLACEHOLDER_COMMIT_TXID,
+        commit_value=commit_value,
+        commit_script=commit_result.commit_script,
+        reveal_locking_script=dry_run_scripts.locking_script,
+        carrier_value=carrier_value,
+        change_locking=locking,
+        funding_key=funding_key,
+        scriptsig_suffix=dry_run_scripts.scriptsig_suffix,
+    )
+    measured = _assert_reveal_is_fundable(commit_value, carrier_value, dry_run_reveal, fee_rate, len(cbor_bytes))
+
     sections = [
         _metadata_summary(metadata),
         _BroadcastSummary(
@@ -352,15 +452,12 @@ async def _mint_nft_inner(
                 f"funding value: {funding_utxo.value:,} photons",
                 f"commit value:  {commit_value:,} photons",
                 f"owner_pkh:     {funding_pkh.hex()}  (this wallet)",
-                f"reveal fee:    {reveal_estimate.fee:,} photons "
-                f"({reveal_estimate.size_bytes:,} B @ {fee_rate:,}/B, paid from commit value)",
+                f"reveal fee:    {measured.fee:,} photons "
+                f"({measured.size_bytes:,} B @ {fee_rate:,}/B, paid from commit value)",
                 f"network:       {ctx.network}",
             ],
         ),
     ]
-    # C-1 gate: the last point at which nothing has been spent. Once the commit is
-    # broadcast an unfundable reveal strands the commit output permanently.
-    _assert_reveal_is_fundable(commit_value, carrier_value, reveal_estimate)
     _confirm_or_abort(ctx, sections)
     commit_txid = await client.broadcast(commit_hex)
 
@@ -370,40 +467,18 @@ async def _mint_nft_inner(
         click.echo("waiting for confirmation (this can take 10+ minutes)...")
     await _wait_for_tx(client, str(commit_txid))
 
-    # 4) Build reveal.
-    cbor_bytes = commit_result.cbor_bytes
-    is_nft = True
-    reveal_scripts = builder.prepare_reveal(
-        RevealParams(
-            commit_txid=str(commit_txid),
-            commit_vout=0,
-            commit_value=commit_value,
-            cbor_bytes=cbor_bytes,
-            owner_pkh=funding_pkh,
-            is_nft=is_nft,
-        )
-    )
-
-    shim_commit_out = TransactionOutput(Script(commit_result.commit_script), commit_value)
-    src_commit_tx = Transaction(tx_inputs=[], tx_outputs=[shim_commit_out])
-    src_commit_tx.txid = lambda: str(commit_txid)  # type: ignore[method-assign]
-
-    reveal_input = TransactionInput(
-        source_transaction=src_commit_tx,
-        source_output_index=0,
-        unlocking_script_template=_build_glyph_unlock(funding_key, reveal_scripts.scriptsig_suffix),
-    )
-    reveal_input.satoshis = commit_value
-    reveal_input.locking_script = Script(commit_result.commit_script)
-
-    # The NFT sits on a dust carrier; the rest of the commit value returns as change
-    # (fee() sized from the real length) instead of being burned to fee.
-    reveal_tx = Transaction(
-        tx_inputs=[reveal_input],
-        tx_outputs=[
-            TransactionOutput(Script(reveal_scripts.locking_script), carrier_value),
-            TransactionOutput(locking, 0, change=True),
-        ],
+    # 4) Build reveal — the same builder the dry run above measured, now with the real
+    # commit txid (same length, so the same size and fee).
+    reveal_scripts = _nft_reveal_scripts(str(commit_txid))
+    reveal_tx = _build_reveal_tx(
+        commit_txid=str(commit_txid),
+        commit_value=commit_value,
+        commit_script=commit_result.commit_script,
+        reveal_locking_script=reveal_scripts.locking_script,
+        carrier_value=carrier_value,
+        change_locking=locking,
+        funding_key=funding_key,
+        scriptsig_suffix=reveal_scripts.scriptsig_suffix,
     )
     reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     reveal_tx.sign()
@@ -442,7 +517,16 @@ async def _wait_for_tx(client: ElectrumXClient, txid: str, *, timeout_s: float =
     The polling logic itself lives in the library, where both time seams are injected
     so the timeout branch is reachable in a test. All this adds is the click-level
     translation: the library raises ``ConfirmationTimeoutError``; the CLI turns it into
-    a ``NetworkBoundaryError`` (exit code 2) with a resume hint.
+    a ``NetworkBoundaryError`` (exit code 2) with a recovery hint.
+
+    The hint used to read "re-run with ``COMMIT_TXID=<txid>`` to resume reveal". No such
+    flag or environment variable exists in this CLI — that spelling comes from the
+    standalone ``examples/*.py`` demo scripts, which carry their own hard-coded metadata
+    and cannot resume a CLI mint. Since the commit script has no owner-only spend path
+    (``OP_HASH256 <payload_hash> OP_EQUALVERIFY`` runs before the P2PKH tail, so the only
+    way to spend the output is a reveal pushing byte-identical CBOR), a timeout here can
+    strand real value — and sending that user to a flag that does not exist is the worst
+    possible answer. The text below names the recovery that actually works.
     """
     try:
         await wait_for_confirmation(client, txid, timeout_s=timeout_s)
@@ -450,7 +534,14 @@ async def _wait_for_tx(client: ElectrumXClient, txid: str, *, timeout_s: float =
         raise NetworkBoundaryError(
             "timed out waiting for confirmation",
             cause=str(exc),
-            fix="check the chain explorer; if confirmed, re-run with COMMIT_TXID=<txid> to resume reveal",
+            fix=(
+                "check the txid on a block explorer. Not confirmed: nothing is stranded — re-run the "
+                "command. Confirmed: this CLI has no resume flag, so rebuild the reveal with the SDK — "
+                "GlyphBuilder.prepare_reveal(RevealParams(commit_txid=<txid>, commit_vout=0, "
+                "commit_value=<photons>, cbor_bytes=..., owner_pkh=..., is_nft=...)) using the SAME "
+                "unmodified metadata file and the SAME wallet (the commit output is spendable only by a "
+                "reveal carrying byte-identical metadata). See docs/how-to/troubleshoot-common-errors.md"
+            ),
         ) from exc
 
 
@@ -594,8 +685,34 @@ async def _deploy_ft_inner(
     commit_tx.sign()
 
     # C-1 gate: the last point at which nothing has been spent. Once the commit is
-    # broadcast an unfundable reveal strands the commit output permanently.
-    _assert_reveal_is_fundable(commit_value, carrier_value, reveal_estimate)
+    # broadcast an unfundable reveal strands the commit output permanently. Build the
+    # reveal now, against a placeholder commit txid, and MEASURE it — an independent
+    # check on the estimate that sized commit_value above.
+    def _ft_reveal_scripts(txid: str) -> FtDeployRevealScripts:
+        return builder.prepare_ft_deploy_reveal(
+            commit_txid=txid,
+            commit_vout=0,
+            commit_value=commit_value,
+            cbor_bytes=commit_result.cbor_bytes,
+            premine_pkh=treasury_pkh,
+            premine_amount=supply,
+        )
+
+    dry_run_scripts = _ft_reveal_scripts(_PLACEHOLDER_COMMIT_TXID)
+    dry_run_reveal = _build_reveal_tx(
+        commit_txid=_PLACEHOLDER_COMMIT_TXID,
+        commit_value=commit_value,
+        commit_script=commit_result.commit_script,
+        reveal_locking_script=dry_run_scripts.locking_script,
+        carrier_value=carrier_value,
+        change_locking=locking,
+        funding_key=funding_key,
+        scriptsig_suffix=dry_run_scripts.scriptsig_suffix,
+    )
+    measured = _assert_reveal_is_fundable(
+        commit_value, carrier_value, dry_run_reveal, fee_rate, len(commit_result.cbor_bytes)
+    )
+
     _confirm_or_abort(
         ctx,
         [
@@ -608,8 +725,8 @@ async def _deploy_ft_inner(
                     f"funding value: {funding_utxo.value:,} photons",
                     f"commit value:  {commit_value:,} photons",
                     f"owner_pkh:     {funding_pkh.hex()}  (this wallet)",
-                    f"reveal fee:    {reveal_estimate.fee:,} photons "
-                    f"({reveal_estimate.size_bytes:,} B @ {fee_rate:,}/B, paid from commit value)",
+                    f"reveal fee:    {measured.fee:,} photons "
+                    f"({measured.size_bytes:,} B @ {fee_rate:,}/B, paid from commit value)",
                     f"network:       {ctx.network}",
                 ],
             ),
@@ -622,35 +739,18 @@ async def _deploy_ft_inner(
         click.echo("waiting for confirmation (this can take 10+ minutes)...")
     await _wait_for_tx(client, str(commit_txid))
 
-    reveal_scripts = builder.prepare_ft_deploy_reveal(
+    # The same builder the dry run above measured, now with the real commit txid.
+    # Premine: vout[0].value = the supply (1 photon = 1 unit).
+    reveal_scripts = _ft_reveal_scripts(str(commit_txid))
+    reveal_tx = _build_reveal_tx(
         commit_txid=str(commit_txid),
-        commit_vout=0,
         commit_value=commit_value,
-        cbor_bytes=commit_result.cbor_bytes,
-        premine_pkh=treasury_pkh,
-        premine_amount=supply,
-    )
-
-    shim_commit_out = TransactionOutput(Script(commit_result.commit_script), commit_value)
-    src_commit_tx = Transaction(tx_inputs=[], tx_outputs=[shim_commit_out])
-    src_commit_tx.txid = lambda: str(commit_txid)  # type: ignore[method-assign]
-
-    reveal_input = TransactionInput(
-        source_transaction=src_commit_tx,
-        source_output_index=0,
-        unlocking_script_template=_build_glyph_unlock(funding_key, reveal_scripts.scriptsig_suffix),
-    )
-    reveal_input.satoshis = commit_value
-    reveal_input.locking_script = Script(commit_result.commit_script)
-
-    # Premine: vout[0].value = the supply (1 photon = 1 unit); the commit headroom
-    # returns as change (fee() sized from the real length) instead of burning to fee.
-    reveal_tx = Transaction(
-        tx_inputs=[reveal_input],
-        tx_outputs=[
-            TransactionOutput(Script(reveal_scripts.locking_script), supply),
-            TransactionOutput(locking, 0, change=True),
-        ],
+        commit_script=commit_result.commit_script,
+        reveal_locking_script=reveal_scripts.locking_script,
+        carrier_value=carrier_value,
+        change_locking=locking,
+        funding_key=funding_key,
+        scriptsig_suffix=reveal_scripts.scriptsig_suffix,
     )
     reveal_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
     reveal_tx.sign()

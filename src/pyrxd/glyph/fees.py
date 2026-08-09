@@ -32,11 +32,28 @@ Rounding direction: the estimate includes the change output. ``Transaction.fee``
 a change output that would land at or below dust, which makes the broadcast tx
 *smaller* than estimated — so including it can only over-estimate the fee, which is the
 safe direction for a spend guard.
+
+Two layers, and why the second one has to measure
+-------------------------------------------------
+:func:`estimate_reveal_fee` sizes a *shim*: fixed-length stand-in scripts built from
+:data:`REVEAL_SIG_PREFIX_BYTES` and :func:`reveal_locking_script_size`. Sizing the
+commit output from that estimate and then calling :func:`check_reveal_funding` with the
+**same** estimate proves nothing — the CLI sets ``commit_value = carrier + max(floor,
+fee + slack)``, so ``commit_value >= carrier + fee`` holds by construction and the check
+can never fail. It reads like a fund-safety backstop and backs up nothing.
+
+:func:`measure_reveal_fee` is the honest second layer. It measures the reveal
+transaction the caller actually built — real locking scripts, real
+``estimated_unlocking_byte_length`` — so the guard fires if the shim ever stops
+describing the real transaction. The CLI runs it against a dry-run reveal (a placeholder
+commit txid; a txid is 32 bytes whatever its value, so the size is identical to the real
+one) at the last moment before the commit is broadcast.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from ..fee_models import SatoshisPerKilobyte
 from ..security.errors import InsufficientFundsError, ValidationError
@@ -53,12 +70,21 @@ __all__ = [
     "check_reveal_funding",
     "estimate_reveal_fee",
     "estimate_reveal_fee_for_metadata",
+    "measure_reveal_fee",
     "reveal_locking_script_size",
 ]
 
-# The sig + pubkey pushes the caller prepends to the 'gly'+CBOR suffix. Mirrors
-# ``pyrxd.cli.glyph_helpers._build_glyph_unlock.estimated_unlocking_byte_length``,
-# which is the value the fee model actually uses when it sizes the real reveal.
+# The sig + pubkey pushes the caller prepends to the 'gly'+CBOR suffix:
+# 1 + 72 (DER sig + sighash byte) + 1 + 33 (compressed pubkey) — the same number
+# ``pyrxd.script.type.P2PKH().unlock(...).estimated_unlocking_byte_length()`` reports.
+#
+# THIS is the single source of truth. ``pyrxd.cli.glyph_helpers._build_glyph_unlock``
+# imports it for the reveal input's ``estimated_unlocking_byte_length``, which is the
+# value the fee model uses when it sizes the *real* reveal. It used to hard-code its own
+# ``107`` literal: two copies of the same magic number, with the fee guard's copy
+# documented as merely "mirroring" the CLI's. Had they drifted apart, this module would
+# have under-estimated the reveal fee and the guard would have passed — producing exactly
+# the stranded-commit failure the module exists to prevent.
 REVEAL_SIG_PREFIX_BYTES = 107
 
 # OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG — the change output.
@@ -169,17 +195,63 @@ def estimate_reveal_fee(
             *(_ShimOutput(locking_script=_FixedSizeScript(n)) for n in extra_output_script_sizes),
         ],
     )
+    return _measure(tx, fee_rate=fee_rate, cbor_bytes_len=len(cbor_bytes), scriptsig_bytes=scriptsig_bytes)
+
+
+def _measure(tx: Any, *, fee_rate: int, cbor_bytes_len: int, scriptsig_bytes: int) -> RevealFeeEstimate:
+    """Run the fee model over *tx* twice: once for the size, once for the fee."""
     # value=1000 makes compute_fee's ceil(size/1000 * value) collapse to the size in
     # bytes — reusing the model rather than re-deriving the varint arithmetic.
-    size_bytes = SatoshisPerKilobyte(1000).compute_fee(tx)
-    fee = SatoshisPerKilobyte(fee_rate * 1000).compute_fee(tx)
     return RevealFeeEstimate(
-        size_bytes=size_bytes,
-        fee=fee,
+        size_bytes=SatoshisPerKilobyte(1000).compute_fee(tx),
+        fee=SatoshisPerKilobyte(fee_rate * 1000).compute_fee(tx),
         fee_rate=fee_rate,
-        cbor_bytes_len=len(cbor_bytes),
+        cbor_bytes_len=cbor_bytes_len,
         scriptsig_bytes=scriptsig_bytes,
     )
+
+
+def measure_reveal_fee(reveal_tx: Any, *, fee_rate: int = MIN_FEE_RATE, cbor_bytes_len: int = 0) -> RevealFeeEstimate:
+    """Measure an **already-built** reveal transaction instead of estimating one.
+
+    :func:`estimate_reveal_fee` sizes a *shim* — fixed-length stand-in scripts derived
+    from :data:`REVEAL_SIG_PREFIX_BYTES` and :func:`reveal_locking_script_size`. This
+    function takes the real :class:`~pyrxd.transaction.transaction.Transaction` the
+    caller is about to broadcast and measures *that*, so the numbers come from the
+    genuine locking scripts and the genuine
+    ``unlocking_script_template.estimated_unlocking_byte_length()``.
+
+    That difference is the point. Feeding the estimate into
+    :func:`check_reveal_funding` and then checking a commit value that was *derived from
+    the same estimate* is a tautology — it can never fail. Measuring the built
+    transaction makes the check independent: it catches a shim that no longer matches
+    the real scripts (an extra output, a wider locking script, a drifted prefix
+    constant), which is exactly the class of bug that strands a commit output.
+
+    What it does **not** re-derive is ``compute_fee`` itself — both paths share the fee
+    model on purpose, so a change to the model moves the estimate and the check
+    together. The risk being guarded is the *size* model, not the rate arithmetic.
+
+    Args:
+        reveal_tx: the built (need not be signed) reveal transaction. Inputs must carry
+            an unlocking script or an unlocking-script template.
+        fee_rate: photons per byte — the same rate the transaction will be fee'd at.
+        cbor_bytes_len: payload length, carried through for the error message only.
+
+    Raises:
+        ValidationError: on a non-positive ``fee_rate``.
+    """
+    if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
+        raise ValidationError("measure_reveal_fee fee_rate must be a positive int")
+    scriptsig_bytes = 0
+    for tx_input in reveal_tx.inputs:
+        script = getattr(tx_input, "unlocking_script", None)
+        template = getattr(tx_input, "unlocking_script_template", None)
+        if script:
+            scriptsig_bytes += len(script.serialize())
+        elif template is not None:
+            scriptsig_bytes += int(template.estimated_unlocking_byte_length())
+    return _measure(reveal_tx, fee_rate=fee_rate, cbor_bytes_len=cbor_bytes_len, scriptsig_bytes=scriptsig_bytes)
 
 
 def estimate_reveal_fee_for_metadata(

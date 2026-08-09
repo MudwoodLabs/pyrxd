@@ -34,6 +34,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `heartbeat_age_s` and `DeadMansSwitch` read only `ts` — but it lets a consumer that interprets
   *more* than `ts` refuse a payload shape it does not know. The escalation monitor does exactly
   that. Upgrade the tower before the monitor.
+- **`pyrxd.glyph.fees.measure_reveal_fee`** — measures a built reveal transaction
+  instead of estimating one from shim scripts. Public because the independent
+  pre-broadcast check is worth running from any commit/reveal flow, not just the CLI's.
+- **`pyrxd.gravity.watch.AckingAlerter`** — a runtime-checkable protocol for an alerter
+  that can consume operator acknowledgements. Deliberately separate from the
+  reconciler's `Alerter` port, which does not need `ack` and should not require it of
+  third-party alerters.
 
 ### Fixed
 
@@ -42,6 +49,85 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   log side fell back to its "not wired" `-1` forever: the tick line reported `unacked_critical=-1`
   next to a file heartbeat carrying the real count, and the ERROR-level escalation that fires on
   `unacked > 0` could never trigger (`-1` is not `> 0`).
+
+The rest of this section is follow-ups to the eight-reviewer security panel run against
+0.12.0. All MEDIUM; no fund-safety blocker among them. Each was re-verified against the
+code before it was changed — one reviewer claim is corrected at the end rather than acted
+on.
+
+- **SDK exceptions are picklable again.** `ConfirmationTimeoutError` and its base
+  `InsufficientConfirmationsError` take keyword-only arguments and derive `args` from
+  them, so the `BaseException.__reduce__` default — which replays `args`
+  *positionally* — raised `TypeError: __init__() takes 1 positional argument but 2 were
+  given`. That broke `pickle`, `copy.copy`, and re-raising an SDK error across a
+  `ProcessPoolExecutor` boundary, where the real failure was replaced by an opaque
+  unpickling `TypeError`. `RxdSdkError.__reduce__` now rebuilds without replaying
+  `args` through `__init__`, so **every** exception in the family round-trips —
+  including any future keyword-only subclass. A parametrized test constructs every
+  exported exception class by introspecting its signature and round-trips it, and fails
+  loudly if a new constructor parameter appears that it does not know how to supply.
+- **The reveal-fee guard is a real check, not a tautology.** `glyph mint-nft` and
+  `glyph deploy-ft` sized the commit output from `estimate_reveal_fee` and then
+  "verified" that same estimate with `check_reveal_funding` — but the commit value is
+  `carrier + max(floor, estimate.fee + slack)`, so the check could never fail. It read
+  as a fund-safety backstop and backed up nothing. Both commands now build the reveal
+  transaction *before* broadcasting the commit (against a placeholder commit txid; a
+  txid is 32 bytes whatever its value, so the size is identical) and measure the real
+  thing with the new `pyrxd.glyph.fees.measure_reveal_fee`. The guard now fires if the
+  estimator's shim — its prefix constant, locking-script sizes, or assumed output set —
+  ever stops describing the transaction the CLI actually builds, which is the drift that
+  would strand a commit output. The estimator itself was independently swept for
+  under-estimates and found sound; this is about the *second* check being real.
+- **`REVEAL_SIG_PREFIX_BYTES` has one definition.** `pyrxd.glyph.fees` defined `107` and
+  `pyrxd.cli.glyph_helpers` hard-coded the same literal, with the fee module's comment
+  naming the CLI-private helper as the source of truth — the wrong direction. Drift
+  would have made the fee guard under-estimate *and* pass. The CLI now imports the
+  constant.
+- **The confirmation-timeout hint named a flag that does not exist.** It told the user
+  to "re-run with `COMMIT_TXID=<txid>` to resume reveal". No such option or environment
+  variable exists in the CLI — that spelling comes from the standalone `examples/*.py`
+  demo scripts, which carry their own hard-coded metadata and cannot resume a CLI mint.
+  Because the commit script has no owner-only spend path, a confirmation timeout can
+  strand real value, so this sent a user with money at stake to a nonexistent recovery.
+  The hint (and the matching section of the troubleshooting how-to) now describes the
+  recovery that works: rebuild the reveal via `GlyphBuilder.prepare_reveal` from the
+  same unmodified metadata file and the same wallet. Tests assert the hint names no
+  undeclared flag and that the described procedure reconstructs a reveal satisfying the
+  commit script's payload-hash covenant.
+- **A hostile ElectrumX message no longer stalls the client's event loop.**
+  `_sanitize_server_message` ran `splitlines()`, a per-character printability scan and a
+  per-token `redact()` over the *entire* message before clipping the result to 200
+  characters. Frames are capped at 10 MB and this runs on the receive-loop coroutine, so
+  a large message blocked every other request in flight — measured **201 ms** on a 10 MB
+  single-line message and 281 ms on 10 MB of short tokens, repeatable on every RPC
+  error. The message is now clipped to 8 KiB *before* any of that work: the same two
+  cases measure **0.2 ms** (~1000x). Sanitization semantics are unchanged — a
+  parametrized test compares the output against the previous implementation verbatim for
+  realistic messages, and a fragment left at the clip boundary is dropped rather than
+  allowed to escape redaction.
+- **The watchtower refuses `--ack-inbox` it cannot honour.** `Reconciler.alerter` is
+  typed as the `Alerter` port, which declares `handle` and nothing else; `ack` belongs to
+  `DedupAlerter`. The per-tick hook called `alerter.ack(...)` unconditionally, so with
+  any other alerter it raised `AttributeError` inside a hook `run_loop` deliberately
+  guards — the tower logged and kept running while `FileAckInbox.drain` had already
+  claimed and deleted the inbox, destroying every acknowledgement in it, every tick. The
+  shell now probes for the capability at startup (the same discipline already applied to
+  `unacked_critical_count`) and refuses to start with a dead ACK path. Not reachable
+  through the shipped `pyrxd-watchtower` entrypoint, which always wires a `DedupAlerter`;
+  it bit programmatic callers assembling their own `Reconciler`.
+- **`pyrxd.gravity.watch.run` passes `mypy --strict`** (14 errors → 0): missing
+  annotations throughout, a `channels` list inferred as `list[LoggingAlertChannel]` that
+  a `WebhookAlertChannel` could not join, and a `set.add()` return value used as a value
+  in a dedup comprehension. CI's mypy scope is unchanged (`src/pyrxd/security/`) — this
+  is a correctness cleanup, not a scope expansion.
+
+### Reviewer claims corrected
+
+- The panel reported that the watchtower ACK path "fails silently every tick". It is not
+  silent: `run_loop` logs the hook fault with `logger.exception` at ERROR. The real harm
+  is narrower and worse than silence — the ACKs are *destroyed*, because
+  `FileAckInbox.drain()` consumes the inbox before the first `ack()` call. That is the
+  behaviour the startup refusal prevents.
 
 ## [0.12.0] — 2026-08-09
 
