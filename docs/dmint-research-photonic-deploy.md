@@ -323,6 +323,33 @@ The on-chain GLYPH deploy did not use a premine. **Decision (M2):**
 skip premine support in the first cut — file as deferred work. Adds 1
 output to the reveal if non-zero, no other complexity.
 
+> **CLOSED (2026-08-10).** Premine is implemented for V1 and V2
+> (`premine_amount` / `premine_pkh`, `glyph deploy-dmint --premine`). The
+> "no other complexity" call held up: it is one additional output, the
+> canonical `ftScript(address, tokenRef)`, placed directly after the
+> contract outputs — Photonic `createRevealOutputs` parity.
+>
+> The one thing worth recording that this section did *not* anticipate:
+> the shape of that output is **load-bearing at reveal time**. The commit
+> hashlock the reveal spends asserts `OP_REFTYPE_OUTPUT == OP_1` (NORMAL)
+> on `tokenRef` (§2.1). An FT lock pushes `tokenRef` with
+> `OP_PUSHINPUTREF` (0xd0 → NORMAL) and keeps that assert satisfied; an
+> NFT/singleton lock (0xd8 → SINGLETON) would flip it and the reveal would
+> be rejected outright. So the premine can only ever be an FT output, and
+> the builder — not the caller — picks the script.
+>
+> pyrxd adds one guard Photonic has not got: §9.1 of
+> `docs/dmint-research-photonic.md` notes there are **no bounds checks on
+> `premine` anywhere in Photonic's `mint.ts`/`script.ts`**. pyrxd bounds it
+> to `[1, MAX_MONEY]`, and if V2 metadata declares a `dmint.premine`, the
+> deploy is refused unless it equals the photons actually emitted — a token
+> whose advertised supply differs from its on-chain supply is a
+> mis-reporting bug that is otherwise silent.
+>
+> Verified on a live `radiant-core` regtest node (V1 + V2 reveal accepted,
+> premined FT spendable, contract still PoW-mints afterwards, wrong nonce
+> still rejected): `tests/test_dmint_premine_regtest_e2e.py`.
+
 ### 7.3 Delegate-ref commit prefix
 
 Photonic supports `delegateRef` in commit scripts (a prefix like

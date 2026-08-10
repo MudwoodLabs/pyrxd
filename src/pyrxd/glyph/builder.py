@@ -26,6 +26,35 @@ from .types import GlyphMetadata, GlyphProtocol, GlyphRef
 # Minimum fee rate post-V2: 10,000 photons/byte
 MIN_FEE_RATE = 10_000  # photons per byte
 
+# Radiant MAX_MONEY: 21,000,000,000 RXD x 100,000,000 photons. A dMint premine is
+# denominated in photons (1 photon = 1 FT unit), so anything above the money supply
+# is a caller mistake that would otherwise surface only as an unfundable reveal.
+_MAX_PHOTONS = 21_000_000_000 * 100_000_000
+
+
+def _assert_declared_premine_matches(decoded_cbor: dict, premine_amount: int | None) -> None:
+    """Refuse a deploy whose metadata advertises a premine it does not emit.
+
+    The token body can carry a ``dmint.premine`` field (Photonic ``DmintPayload``);
+    indexers and wallets read it to display the supply breakdown without parsing
+    the reveal. Nothing on chain reconciles it against the photons the reveal
+    actually emits, so a mismatch is a permanently mis-reported supply and it is
+    silent. Photonic performs no bounds or consistency checks on ``premine`` at all
+    (see ``docs/dmint-research-photonic.md`` §9.1) — this is a deliberate pyrxd
+    addition, not a divergence in behaviour for correct callers.
+    """
+    declared = decoded_cbor.get("dmint")
+    if not isinstance(declared, dict) or "premine" not in declared:
+        return
+    declared_premine = int(declared["premine"])
+    actual_premine = premine_amount or 0
+    if declared_premine != actual_premine:
+        raise ValidationError(
+            f"metadata declares dmint.premine={declared_premine} but the deploy emits "
+            f"{actual_premine} premine photons. Set premine_amount={declared_premine} "
+            f"(or fix the metadata) so the advertised supply matches the chain."
+        )
+
 
 @dataclass
 class CommitParams:
@@ -358,7 +387,8 @@ class GlyphBuilder:
           commit-tx outputs using the supplied ref-seed PKH and the
           NFT-commit pattern from the existing builder API.)
         * Reveal tx: spends the commit, emits ``num_contracts`` V1
-          dMint contract UTXOs + FT-NFT singleton + auth NFT + change.
+          dMint contract UTXOs, then an optional premine FT output,
+          then an optional OP_RETURN, then change.
           The reveal-output script bytes are built by
           :meth:`DmintV1DeployResult.build_reveal_outputs` once the
           caller has the commit txid.
@@ -372,13 +402,6 @@ class GlyphBuilder:
             build_dmint_v1_contract_script,
             difficulty_to_target,
         )
-
-        if params.premine_amount is not None:
-            raise ValidationError(
-                "V1 deploy with premine is deferred work — see "
-                "docs/dmint-research-photonic-deploy.md §7.2. Set "
-                "premine_amount=None for now."
-            )
 
         # 1. Encode the CBOR token body.
         cbor_bytes, payload_hash = encode_payload(params.metadata)
@@ -398,6 +421,7 @@ class GlyphBuilder:
             raise ValidationError(
                 f"V1 dMint CBOR 'p' field must include both 1 (FT) and 4 (DMINT); got p={decoded.get('p')!r}"
             )
+        _assert_declared_premine_matches(decoded, params.premine_amount)
 
         # 2. Build the FT-commit hashlock (75-byte script — exactly the
         # Photonic ftCommitScript shape; the existing helper produces it).
@@ -448,6 +472,7 @@ class GlyphBuilder:
             difficulty=params.difficulty,
             algo=params.algo,
             op_return_msg=params.op_return_msg,
+            premine_pkh=params.premine_pkh,
         )
 
     def _prepare_dmint_v2_deploy(
@@ -478,10 +503,6 @@ class GlyphBuilder:
                 UserWarning,
                 stacklevel=2,
             )
-        if params.premine_amount is not None:
-            raise ValidationError(
-                "V2 deploy with premine is deferred work (mirrors V1). Set premine_amount=None for now."
-            )
 
         # 1. Encode the CBOR token body and pin the FT+DMINT protocol shape.
         cbor_bytes, payload_hash = encode_payload(params.metadata)
@@ -490,6 +511,7 @@ class GlyphBuilder:
             raise ValidationError(
                 f"V2 dMint CBOR 'p' field must include both 1 (FT) and 4 (DMINT); got p={decoded.get('p')!r}"
             )
+        _assert_declared_premine_matches(decoded, params.premine_amount)
 
         # 2. FT-commit hashlock (same 75-byte commit shape as V1).
         commit_script = build_commit_locking_script(payload_hash, params.owner_pkh, is_nft=False)
@@ -543,6 +565,7 @@ class GlyphBuilder:
             epoch_length=params.epoch_length,
             max_adjustment_log2=params.max_adjustment_log2,
             schedule=params.schedule,
+            premine_pkh=params.premine_pkh,
         )
 
     # ------------------------------------------------------------------
@@ -873,6 +896,56 @@ class GlyphBuilder:
 from .dmint import DaaMode, DmintAlgo  # noqa: E402 (after class def — no circular dep)
 
 
+def _validate_premine(premine_amount: int | None, premine_pkh: Hex20 | None) -> None:
+    """Shared V1/V2 bound-check for the dMint deploy premine fields.
+
+    The floor is 1 photon, not 546. Radiant-Core has **no dust threshold**:
+    ``GetDustThreshold`` returns 1 satoshi unconditionally and ``IsDust`` is
+    ``nValue <= 0`` (``src/policy/policy.cpp:19-25`` @ ``afdf57b1``), so any
+    output worth at least one photon is standard regardless of script shape.
+    That is why every mainnet dMint contract sits at 1 photon. The 546 in
+    :meth:`GlyphBuilder.prepare_ft_deploy_reveal` is a pyrxd-imposed guard on a
+    *different* flow (a whole FT supply below 546 units is almost certainly a
+    decimals mistake), not a chain rule, and it should not be copied here — a
+    deliberate 1-unit premine is a legitimate thing to want.
+    """
+    if premine_amount is None:
+        if premine_pkh is not None:
+            raise ValidationError(
+                "premine_pkh was set without premine_amount — the premine output would "
+                "not be emitted at all. Set premine_amount, or drop premine_pkh."
+            )
+        return
+    if isinstance(premine_amount, bool) or not isinstance(premine_amount, int):
+        raise ValidationError(f"premine_amount must be an int or None, got {type(premine_amount).__name__}")
+    if premine_amount < 1:
+        raise ValidationError(
+            f"premine_amount must be >= 1 photon when set (use None for no premine), got {premine_amount}"
+        )
+    if premine_amount > _MAX_PHOTONS:
+        raise ValidationError(f"premine_amount ({premine_amount}) exceeds Radiant's money supply ({_MAX_PHOTONS})")
+
+
+def _build_premine_script(
+    premine_amount: int | None,
+    premine_pkh: Hex20 | None,
+    owner_pkh: Hex20,
+    token_ref: GlyphRef,
+) -> bytes | None:
+    """The premine output's locking script, or ``None`` when there is no premine.
+
+    Shared by the V1 and V2 ``build_reveal_outputs``; the premine output is
+    identical in both (an FT lock on ``tokenRef``) because the token itself is
+    version-independent — only the *contract* bytecode differs between V1 and
+    V2. It is byte-identical to the FT reward output a mint pays out
+    (``build_dmint_v1_ft_output_script``), so the premined units are fungible
+    with mined units under the same ``tokenRef``.
+    """
+    if premine_amount is None:
+        return None
+    return build_ft_locking_script(premine_pkh if premine_pkh is not None else owner_pkh, token_ref)
+
+
 @dataclass(frozen=True)
 class DmintV1DeployParams:
     """Parameters for a V1 dMint deploy (2-tx: commit + reveal).
@@ -904,10 +977,19 @@ class DmintV1DeployParams:
         ceiling — see V1 contract state layout).
     :param difficulty:         Initial PoW difficulty (1 = easiest).
         Translated to 8-byte target via :func:`difficulty_to_target`.
-    :param premine_amount:     Photons to send to ``owner_pkh`` on the
-        reveal tx as an optional premine FT output. ``None`` = no premine.
-        Filed as deferred work in M2 (`docs/dmint-research-photonic-deploy.md` §7.2);
-        accepted in the dataclass but rejected at build time for now.
+    :param premine_amount:     Photons emitted as an additional FT output on
+        the reveal tx (1 photon = 1 FT unit), on top of the mineable supply.
+        ``None`` = no premine. The photons are real: the deployer must fund
+        them, and they are NOT deducted from ``reward_photons * max_height *
+        num_contracts`` — total issued supply becomes
+        ``reward_photons * max_height * num_contracts + premine_amount``.
+        Mirrors Photonic Wallet ``RevealDmintParams.premine`` (``mint.ts``
+        ``createRevealOutputs``), which likewise appends one ``ftScript``
+        output after the contract outputs.
+    :param premine_pkh:        20-byte PKH that receives the premine output.
+        ``None`` (default) sends it to ``owner_pkh``, which is what Photonic
+        does (it uses the single creator address for both). Only meaningful
+        when ``premine_amount`` is set.
     :param op_return_msg:      Optional OP_RETURN data carrier (raw bytes
         after the 0x6a prefix). ``None`` = no OP_RETURN output.
     :param algo:               PoW algorithm. Defaults to ``DmintAlgo.SHA256D``
@@ -923,8 +1005,10 @@ class DmintV1DeployParams:
     premine_amount: int | None = None
     op_return_msg: bytes | None = None
     algo: DmintAlgo = DmintAlgo.SHA256D
+    premine_pkh: Hex20 | None = None
 
     def __post_init__(self) -> None:
+        _validate_premine(self.premine_amount, self.premine_pkh)
         if not (1 <= self.num_contracts <= 250):
             raise ValidationError(
                 f"num_contracts must be in [1, 250], got {self.num_contracts} "
@@ -974,7 +1058,11 @@ class DmintV2DeployParams:
     :param max_height:      Maximum mints per contract.
     :param reward_photons:  Photons paid per successful mint.
     :param difficulty:      Initial PoW difficulty (1 = easiest).
-    :param premine_amount:  Deferred (mirrors V1) — must be ``None``.
+    :param premine_amount:  Photons emitted as an extra FT output on the reveal,
+        on top of the mineable supply (mirrors V1 — see
+        :class:`DmintV1DeployParams`). If ``metadata`` carries a ``dmint.premine``
+        field, the two must agree or the deploy is refused.
+    :param premine_pkh:     PKH receiving the premine; ``None`` = ``owner_pkh``.
     :param op_return_msg:   Optional OP_RETURN data carrier (raw bytes after 0x6a).
     :param algo:            PoW algorithm (default SHA256d; only SHA256D is mined).
     :param daa_mode:        Must be ``DaaMode.FIXED`` (the only mintable mode).
@@ -997,8 +1085,10 @@ class DmintV2DeployParams:
     epoch_length: int = 2016  # EPOCH: retarget every N blocks
     max_adjustment_log2: int = 2  # EPOCH: max 2^N adjustment per epoch (1..4)
     schedule: tuple[tuple[int, int], ...] = ()  # SCHEDULE: ascending (height, target) entries
+    premine_pkh: Hex20 | None = None
 
     def __post_init__(self) -> None:
+        _validate_premine(self.premine_amount, self.premine_pkh)
         if not (1 <= self.num_contracts <= 250):
             raise ValidationError(
                 f"num_contracts must be in [1, 250], got {self.num_contracts} "
@@ -1052,6 +1142,27 @@ class DmintV1RevealScripts:
     + optional OP_RETURN. The caller composes these into a transaction
     in declared order, signs each input, and broadcasts.
 
+    **Output order is part of the contract with this bag.** Place them as::
+
+        vout[0 .. N-1]   contract_scripts, each valued contract_value (1)
+        vout[N]          premine_script,   valued premine_amount   (if any)
+        vout[N+1]        op_return_script, valued 0                (if any)
+        vout[...]        change
+
+    which is what Photonic Wallet's ``createRevealOutputs`` emits
+    (``mint.ts``: the ``premine > 0`` ``ftScript`` push comes directly after
+    the ``numContracts`` ``dMintScript`` pushes). Nothing in consensus reads
+    the ordering — the reveal runs only the commit hashlock, whose
+    ``OP_REFTYPE_OUTPUT`` check is position-independent — but indexers key
+    off it, so deviating makes a token that pyrxd can spend and other tools
+    cannot classify.
+
+    Safety note on the premine script shape: it is an FT lock, so it pushes
+    ``tokenRef`` with ``OP_PUSHINPUTREF`` (0xd0, refType NORMAL). The commit
+    hashlock the reveal spends asserts ``OP_REFTYPE_OUTPUT == OP_1`` (NORMAL)
+    for exactly this ref. Emitting the premine as an NFT/singleton lock
+    (0xd8) would flip that to SINGLETON and the reveal would be rejected.
+
     :param contract_scripts:  Tuple of full V1 dMint contract output
         scripts (state + epilogue), one per parallel contract. Length
         equals the deploy's ``num_contracts``. Each is the 241-byte
@@ -1066,11 +1177,10 @@ class DmintV1RevealScripts:
     :param scriptsig_suffix:  The push sequence ``<gly> <CBOR>`` ready
         to append after ``<sig> <pubkey>`` for vin[0]. Mirrors the
         :class:`FtDeployRevealScripts.scriptsig_suffix` convention.
-    :param premine_script:    Locking script for an optional premine
-        FT output (``None`` = no premine). Deferred work in M2 — the
-        builder currently raises if ``premine_amount`` is set.
+    :param premine_script:    75-byte FT locking script for the optional
+        premine output, bound to ``tokenRef`` (``None`` = no premine).
     :param premine_amount:    Photons for the premine output (``None``
-        if no premine).
+        if no premine). Set it as that output's value verbatim.
     :param op_return_script:  Locking script for an optional OP_RETURN
         data carrier (``None`` if no OP_RETURN).
     """
@@ -1103,8 +1213,8 @@ class DmintV1DeployResult:
         script + fee. Same shape as the V2 result's field.
     :param cbor_bytes:                    Encoded CBOR token body.
     :param owner_pkh:                     20-byte PKH of the deploy key.
-    :param premine_amount:                Photons for optional premine
-        output, or ``None``. Deferred work in M2 — must be ``None``.
+    :param premine_amount:                Photons for the optional premine
+        output, or ``None`` for no premine.
     :param num_contracts:                 Count of parallel V1 contracts.
     :param placeholder_contract_scripts:  Tuple of N contract scripts built
         with the placeholder commit txid (00…00). Each is the same byte
@@ -1117,6 +1227,8 @@ class DmintV1DeployResult:
     :param difficulty:                    Echoed from params.
     :param algo:                          Echoed from params.
     :param op_return_msg:                 Echoed from params.
+    :param premine_pkh:                   Echoed from params; ``None`` means
+        the premine (if any) goes to ``owner_pkh``.
     """
 
     commit_result: CommitResult
@@ -1130,14 +1242,17 @@ class DmintV1DeployResult:
     difficulty: int
     algo: DmintAlgo
     op_return_msg: bytes | None
+    premine_pkh: Hex20 | None = None
 
     def build_reveal_outputs(self, commit_txid: str) -> DmintV1RevealScripts:
         """Build reveal-tx output scripts given the confirmed commit txid.
 
         The V1 reveal:
-        * spends commit vouts 0 + 1..N + (N+1 NFT-commit) + (N+2 change)
+
+        * spends commit vouts 0 (FT-commit hashlock) + 1..N (ref-seeds) + change
         * emits N parallel dMint contract UTXOs at vouts 0..N-1
-        * emits the FT NFT singleton + auth NFT singleton + change
+        * emits the optional premine FT output, then the optional OP_RETURN,
+          then change — see :class:`DmintV1RevealScripts` for the ordering rule
 
         The method name is ``build_reveal_outputs`` (not
         ``build_reveal_scripts`` as in V2) because V1's reveal directly
@@ -1154,13 +1269,6 @@ class DmintV1DeployResult:
             build_dmint_v1_contract_script,
             difficulty_to_target,
         )
-
-        if self.premine_amount is not None:
-            raise NotImplementedError(
-                "V1 deploy with premine is deferred work — see "
-                "docs/dmint-research-photonic-deploy.md §7.2. Set "
-                "premine_amount=None for now."
-            )
 
         token_ref = GlyphRef(txid=commit_txid, vout=0)
         target = difficulty_to_target(self.difficulty, self.algo)
@@ -1189,13 +1297,15 @@ class DmintV1DeployResult:
             else:
                 raise ValidationError(f"op_return_msg too long: {len(msg)} bytes (cap at 255 for now)")
 
+        premine_script = _build_premine_script(self.premine_amount, self.premine_pkh, self.owner_pkh, token_ref)
+
         return DmintV1RevealScripts(
             contract_scripts=contract_scripts,
             contract_value=1,
             cbor_bytes=self.cbor_bytes,
             scriptsig_suffix=scriptsig_suffix,
-            premine_script=None,
-            premine_amount=None,
+            premine_script=premine_script,
+            premine_amount=self.premine_amount,
             op_return_script=op_return_script,
         )
 
@@ -1212,7 +1322,8 @@ class DmintV2DeployResult:
     :param commit_result:                 :class:`CommitResult` — commit-tx script + fee.
     :param cbor_bytes:                    Encoded CBOR token body.
     :param owner_pkh:                     20-byte PKH of the deploy key.
-    :param premine_amount:                Deferred — must be ``None`` (mirrors V1).
+    :param premine_amount:                Photons for the optional premine output,
+        or ``None`` for no premine (mirrors V1).
     :param num_contracts:                 Count of parallel V2 contracts.
     :param placeholder_contract_scripts:  Tuple of N V2 contract scripts built with the
         placeholder commit txid (00…00) — same byte length as the final scripts, for
@@ -1238,6 +1349,7 @@ class DmintV2DeployResult:
     epoch_length: int = 2016
     max_adjustment_log2: int = 2
     schedule: tuple[tuple[int, int], ...] = ()
+    premine_pkh: Hex20 | None = None
 
     def build_reveal_outputs(self, commit_txid: str) -> DmintV1RevealScripts:
         """Build reveal-tx output scripts given the confirmed commit txid.
@@ -1245,12 +1357,10 @@ class DmintV2DeployResult:
         Mirrors :meth:`DmintV1DeployResult.build_reveal_outputs`: emits
         ``num_contracts`` parallel 1-photon V2 contract UTXOs
         (``contractRef[i] = commit:(i+1)``, ``tokenRef = commit:0``) + the
-        ``gly``/CBOR reveal scriptSig suffix + optional OP_RETURN. The returned
-        :class:`DmintV1RevealScripts` bag has the same shape for V1 and V2.
+        ``gly``/CBOR reveal scriptSig suffix + optional premine FT output +
+        optional OP_RETURN. The returned :class:`DmintV1RevealScripts` bag has
+        the same shape — and the same output-ordering rule — for V1 and V2.
         """
-        if self.premine_amount is not None:
-            raise NotImplementedError("V2 deploy with premine is deferred work. Set premine_amount=None.")
-
         token_ref = GlyphRef(txid=commit_txid, vout=0)
         contract_scripts = tuple(
             build_dmint_contract_script(
@@ -1283,13 +1393,15 @@ class DmintV2DeployResult:
             else:
                 raise ValidationError(f"op_return_msg too long: {len(msg)} bytes (cap at 255 for now)")
 
+        premine_script = _build_premine_script(self.premine_amount, self.premine_pkh, self.owner_pkh, token_ref)
+
         return DmintV1RevealScripts(
             contract_scripts=contract_scripts,
             contract_value=1,
             cbor_bytes=self.cbor_bytes,
             scriptsig_suffix=scriptsig_suffix,
-            premine_script=None,
-            premine_amount=None,
+            premine_script=premine_script,
+            premine_amount=self.premine_amount,
             op_return_script=op_return_script,
         )
 

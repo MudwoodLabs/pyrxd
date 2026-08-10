@@ -1212,6 +1212,56 @@ glyph_group.add_command(dmint_estimate_cmd)
 # recreates the contract at height+1, up to `--max-height` claims.
 
 _DMINT_REF_SEED = 1_000  # > dust; one per contract, genesises each contractRef
+# Serialized cost of the optional premine output on the reveal: 8-byte value +
+# 1-byte script length + the 75-byte FT locking script.
+_PREMINE_OUTPUT_BYTES = 8 + 1 + 75
+
+
+def _varint_len(n: int) -> int:
+    return 1 if n < 0xFD else (3 if n <= 0xFFFF else 5)
+
+
+def _estimate_dmint_reveal_bytes(
+    *,
+    contract_scripts: tuple[bytes, ...],
+    cbor_len: int,
+    premine: bool,
+    op_return_len: int,
+) -> int:
+    """Upper-bound the serialized size of the dMint deploy reveal, in bytes.
+
+    This has to be an over-estimate, never an under-estimate. ``commit0_value``
+    is derived from it, and the reveal has no funding input of its own: if the
+    commit carries forward less than the reveal's fee, the commit is already
+    confirmed by the time that is discovered and its value is stranded behind an
+    unbroadcastable reveal.
+
+    The previous formula was a flat ``num_contracts * 260 + 400``, which does not
+    describe the transaction the CLI builds — it under-counts the ref-seed inputs
+    and assumes a V1-sized contract script. Measured against the real builder it
+    was short for every V1 deploy with 2+ contracts and for *every* V2 deploy
+    (V2's contract script is ~380 bytes, not 241). Sizing from the actual script
+    bytes instead removes the whole class of error.
+    """
+    # 4 version + 4 locktime + the two count varints (num_contracts <= 250, so
+    # the input/output counts stay inside 3 bytes even with premine + OP_RETURN).
+    size = 4 + 4 + 3 + 3
+    # vin[0], the FT-commit hashlock: 32 txid + 4 index + 4 sequence, a scriptSig
+    # length varint (the CBOR body pushes it well past 252 bytes), then
+    # <sig+sighash> <pubkey> <"gly"> <CBOR>, each at its worst-case push encoding.
+    size += 40 + 3 + (1 + 73) + (1 + 33) + (1 + 3) + (5 + cbor_len)
+    # vin[1..N], the ref-seeds: plain P2PKH spends.
+    size += len(contract_scripts) * (40 + 1 + (1 + 73) + (1 + 33))
+    # Outputs: 8-byte value + script-length varint + script.
+    for script in contract_scripts:
+        size += 8 + _varint_len(len(script)) + len(script)
+    if premine:
+        size += _PREMINE_OUTPUT_BYTES
+    if op_return_len:
+        # OP_RETURN + push prefix (1 byte direct, or 2 for OP_PUSHDATA1) + data.
+        size += 8 + 1 + 1 + (1 if op_return_len > 75 else 0) + op_return_len
+    size += 8 + 1 + 25  # change (P2PKH)
+    return size
 
 
 _MAX_ADJUSTMENT_TO_LOG2 = {"2": 1, "4": 2, "8": 3, "16": 4}
@@ -1296,6 +1346,18 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
     help="V2 SCHEDULE: JSON [[height, difficulty], ...] (<=10, ascending), e.g. '[[100, 4], [1000, 8]]'.",
 )
 @click.option("--op-return", "op_return", default=None, help="Optional OP_RETURN carrier on the reveal (<=80 bytes).")
+@click.option(
+    "--premine",
+    type=int,
+    default=None,
+    help="Premine photons issued to the deployer on the reveal, ON TOP of the mineable supply. "
+    "You fund these photons yourself (1 photon = 1 FT unit).",
+)
+@click.option(
+    "--premine-to",
+    default=None,
+    help="Address that receives --premine (default: the funding/deploy address).",
+)
 @click.option("--passphrase/--no-passphrase", default=False)
 @click.pass_obj
 def deploy_dmint_cmd(
@@ -1313,6 +1375,8 @@ def deploy_dmint_cmd(
     max_adjustment: str,
     schedule: str | None,
     op_return: str | None,
+    premine: int | None,
+    premine_to: str | None,
     passphrase: bool,
 ) -> None:
     """Deploy a dMint contract (commit -> reveal) that miners claim from.
@@ -1322,6 +1386,11 @@ def deploy_dmint_cmd(
     claims. V1 by default (the only established mainnet format). Pass ``--v2`` for
     a DAA-capable V2 contract (``--daa-mode fixed/asert/lwma/epoch/schedule``);
     V2 is consensus-validated (regtest + mainnet) but pre-external-audit.
+
+    ``--premine`` adds one FT output to the reveal carrying that many photons to
+    the deployer (or ``--premine-to``). Those photons come out of the deployer's
+    wallet — total issued supply becomes
+    ``reward * max_height * num_contracts + premine``.
     """
     metadata = _read_metadata_file(metadata_file)
     if GlyphProtocol.FT not in metadata.protocol or GlyphProtocol.DMINT not in metadata.protocol:
@@ -1338,6 +1407,22 @@ def deploy_dmint_cmd(
         raise UserError(f"--op-return is {len(op_return_bytes)} bytes; the standardness limit is 80")
     if not v2 and daa_mode != "fixed":
         raise UserError("--daa-mode requires --v2 (V1 dMint is FIXED difficulty only)")
+    if premine is not None and premine < 1:
+        raise UserError("--premine must be >= 1 photon (omit the flag for no premine)")
+    if premine_to is not None and premine is None:
+        raise UserError(
+            "--premine-to was given without --premine",
+            cause="there would be no premine output to send anywhere",
+            fix="add --premine <photons>, or drop --premine-to",
+        )
+    premine_pkh: Hex20 | None = None
+    if premine_to is not None:
+        from ..utils import address_to_public_key_hash
+
+        try:
+            premine_pkh = Hex20(address_to_public_key_hash(premine_to))
+        except (ValidationError, ValueError) as exc:
+            raise UserError("invalid --premine-to address", cause=str(exc)) from exc
 
     # Build (and bound-validate) the deploy params; owner_pkh is a placeholder
     # here, bound to the funding key inside _deploy_dmint_inner.
@@ -1351,6 +1436,8 @@ def deploy_dmint_cmd(
                 max_height=max_height,
                 reward_photons=reward,
                 difficulty=difficulty,
+                premine_amount=premine,
+                premine_pkh=premine_pkh,
                 op_return_msg=op_return_bytes,
                 daa_mode=DaaMode[daa_mode.upper()],
                 target_time=target_time,
@@ -1367,6 +1454,8 @@ def deploy_dmint_cmd(
                 max_height=max_height,
                 reward_photons=reward,
                 difficulty=difficulty,
+                premine_amount=premine,
+                premine_pkh=premine_pkh,
                 op_return_msg=op_return_bytes,
             )
     except ValidationError as exc:
@@ -1400,6 +1489,8 @@ def deploy_dmint_cmd(
         click.echo(f"  contracts ({result['num_contracts']}):")
         for outpoint in result["contracts"]:
             click.echo(f"    {outpoint}")
+        if result["premine"]:
+            click.echo(f"  premine:      {result['premine']:,} photons at {result['premine_outpoint']}")
         click.echo(f"  total supply: {result['total_supply']:,} photons")
         # claim-dmint auto-detects V1/V2 from the contract — there is NO --v2 flag.
         # EPOCH/SCHEDULE bake their params into the contract code (not the on-chain
@@ -1427,15 +1518,37 @@ async def _deploy_dmint_inner(
     reward = deploy_params.reward_photons
     is_v2 = isinstance(deploy_params, DmintV2DeployParams)
     builder = GlyphBuilder()
+
+    # Size the reveal from the REAL script bytes before touching the wallet.
+    # owner_pkh is still the caller's placeholder here, but nothing this needs
+    # depends on it: contract script lengths and the CBOR body are owner-agnostic,
+    # and the premine/change output sizes are fixed. Building here also surfaces
+    # per-mode parameter errors (the EPOCH 2^48 cap, SCHEDULE shape) before the
+    # user is told their wallet is too small.
+    try:
+        sizing = builder.prepare_dmint_deploy(deploy_params, allow_v2_deploy=True)
+    except ValidationError as exc:
+        raise UserError("invalid dMint deploy parameters", cause=str(exc)) from exc
+
     triples = await wallet.collect_spendable(client)
     if not triples:
         raise UserError("no spendable UTXOs in the wallet")
 
     fee_rate = ctx.fee_rate
-    # vout0 (FT-commit hashlock) must cover the N 1-photon carriers + the reveal fee;
-    # vouts 1..N are above-dust ref-seeds that genesis each contractRef when the reveal spends them.
-    reveal_fee_estimate = (num_contracts * 260 + 400) * fee_rate
-    commit0_value = num_contracts + reveal_fee_estimate + 10_000
+    # The premine is REAL photons on an extra 75-byte FT output of the reveal, so it
+    # widens both the value the commit must carry forward and the reveal's size.
+    premine = deploy_params.premine_amount or 0
+    # vout0 (FT-commit hashlock) must cover the N 1-photon carriers + the premine +
+    # the reveal fee; vouts 1..N are above-dust ref-seeds that genesis each
+    # contractRef when the reveal spends them.
+    reveal_bytes = _estimate_dmint_reveal_bytes(
+        contract_scripts=sizing.placeholder_contract_scripts,
+        cbor_len=len(sizing.cbor_bytes),
+        premine=bool(premine),
+        op_return_len=len(deploy_params.op_return_msg or b""),
+    )
+    reveal_fee_estimate = reveal_bytes * fee_rate
+    commit0_value = num_contracts + premine + reveal_fee_estimate + 10_000
     commit_fee_estimate = (num_contracts * 40 + 300) * fee_rate
     total_required = commit0_value + num_contracts * _DMINT_REF_SEED + commit_fee_estimate + 546
 
@@ -1454,9 +1567,9 @@ async def _deploy_dmint_inner(
     # The owner_pkh on the params object was a placeholder (validated upfront);
     # bind it to the actual funding key now.
     deploy_params = replace(deploy_params, owner_pkh=owner_pkh)
-    # EPOCH/SCHEDULE per-mode constraints (the 2^48 target cap, schedule shape) are
-    # enforced when prepare_dmint_deploy builds the contract scripts — surface them as a
-    # clean UserError instead of a top-level "unexpected failure" crash.
+    # Rebuild with the real owner. Same script lengths as the sizing pass above
+    # (only the embedded PKH and the ref txids differ), so `reveal_bytes` still
+    # describes the transaction that gets built below.
     try:
         deploy = builder.prepare_dmint_deploy(deploy_params, allow_v2_deploy=True)
     except ValidationError as exc:
@@ -1500,6 +1613,15 @@ async def _deploy_dmint_inner(
                     f"funding utxo:  {funding_utxo.tx_hash}:{funding_utxo.tx_pos} ({funding_utxo.value:,} photons)",
                     f"contracts:     {num_contracts}  (reward {reward:,}/mint, max_height {max_height:,})",
                     f"owner_pkh:     {owner_pkh.hex()}  (this wallet)",
+                    *(
+                        [
+                            f"premine:       {premine:,} photons -> "
+                            f"{(deploy_params.premine_pkh or owner_pkh).hex()}"
+                            "  (funded by you, on top of the mineable supply)"
+                        ]
+                        if premine
+                        else []
+                    ),
                     f"network:       {ctx.network}",
                 ],
             ),
@@ -1537,9 +1659,15 @@ async def _deploy_dmint_inner(
         rin.locking_script = owner_spk
         reveal_inputs.append(rin)
 
+    # Output order is fixed by DmintV1RevealScripts (Photonic createRevealOutputs
+    # parity): N contracts, then the premine, then OP_RETURN, then change.
     reveal_outputs = [
         TransactionOutput(Script(rev.contract_scripts[i]), rev.contract_value) for i in range(num_contracts)
     ]
+    premine_vout: int | None = None
+    if rev.premine_script is not None and rev.premine_amount:
+        premine_vout = len(reveal_outputs)
+        reveal_outputs.append(TransactionOutput(Script(rev.premine_script), rev.premine_amount))
     if rev.op_return_script:
         reveal_outputs.append(TransactionOutput(Script(rev.op_return_script), 0))
     reveal_outputs.append(TransactionOutput(owner_spk, 0, change=True))
@@ -1556,12 +1684,13 @@ async def _deploy_dmint_inner(
                     f"commit txid: {commit_txid}",
                     f"contracts:   {num_contracts} x 1-photon singleton",
                     f"token_ref:   {commit_txid}:0",
+                    *([f"premine:     {premine:,} photons at vout {premine_vout}"] if premine else []),
                 ],
             ),
         ],
     )
     reveal_txid = await client.broadcast(reveal_tx.serialize())
-    total_supply = reward * max_height * num_contracts
+    mineable_supply = reward * max_height * num_contracts
     return {
         "version": "V2" if is_v2 else "V1",
         "daa_mode": deploy_params.daa_mode.name if is_v2 else "FIXED",
@@ -1570,7 +1699,10 @@ async def _deploy_dmint_inner(
         "token_ref": f"{commit_txid}:0",
         "contracts": [f"{reveal_txid}:{i}" for i in range(num_contracts)],
         "num_contracts": num_contracts,
-        "total_supply": total_supply,
+        "premine": premine,
+        "premine_outpoint": f"{reveal_txid}:{premine_vout}" if premine_vout is not None else None,
+        "mineable_supply": mineable_supply,
+        "total_supply": mineable_supply + premine,
     }
 
 

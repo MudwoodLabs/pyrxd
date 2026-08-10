@@ -410,6 +410,51 @@ class TestDeployDmint:
         assert result.exit_code != 0
         assert "invalid dMint deploy parameters" in result.output
 
+    def _premine_args(self, wallet: Path, meta: Path, *extra: str) -> list[str]:
+        return [
+            "--wallet",
+            str(wallet),
+            "glyph",
+            "deploy-dmint",
+            str(meta),
+            "--max-height",
+            "100",
+            "--reward",
+            "1000",
+            *extra,
+        ]
+
+    def test_premine_below_one_rejected(self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT", "DMINT"])
+        result = runner.invoke(cli, self._premine_args(tmp_wallet_path, meta, "--premine", "0"))
+        assert result.exit_code != 0
+        assert "--premine must be >= 1" in result.output
+
+    def test_premine_to_without_premine_rejected(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path
+    ) -> None:
+        # Silently dropping the premine because the amount was omitted would only
+        # show up as a missing treasury after the deploy is irreversibly on chain.
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT", "DMINT"])
+        result = runner.invoke(
+            cli, self._premine_args(tmp_wallet_path, meta, "--premine-to", "1BoatSLRHtKNngkdXEeobR76b53LETtpyT")
+        )
+        assert result.exit_code != 0
+        assert "--premine-to was given without --premine" in result.output
+
+    def test_premine_to_invalid_address_rejected(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path
+    ) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        meta = _write_meta(tmp_path / "m.json", protocol=["FT", "DMINT"])
+        result = runner.invoke(
+            cli, self._premine_args(tmp_wallet_path, meta, "--premine", "1000", "--premine-to", "not-an-address")
+        )
+        assert result.exit_code != 0
+        assert "invalid --premine-to address" in result.output
+
 
 class TestClaimDmint:
     """Locator validation (no network — the exactly-one check is the first line)."""
@@ -621,6 +666,183 @@ class TestDmintCliAssembly:
         # commit: FT-commit @vout0 + 1 ref-seed + change ; reveal vout0 = 1-photon contract (consensus-required)
         assert len(commit.outputs) >= 3
         assert reveal.outputs[0].satoshis == 1
+
+    def test_deploy_inner_emits_premine_output(self, cli_context) -> None:
+        """A premine adds one FT output after the contracts, sized and funded.
+
+        The commit must carry the premine photons forward — the reveal has no
+        other funding input, so under-sizing commit:0 would strand a confirmed
+        commit with an unfundable reveal.
+        """
+        from pyrxd.cli.glyph_cmds import _deploy_dmint_inner
+        from pyrxd.glyph.builder import DmintV1DeployParams
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+
+        premine = 7_000_000
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key = PrivateKey()
+        utxo = UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=500_000_000, height=100)
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [(utxo, key.address(), key)]
+
+        captured: list[bytes] = []
+        commit_txid = "11" * 32
+
+        async def _bcast(raw: bytes) -> str:
+            captured.append(raw)
+            return commit_txid if len(captured) == 1 else "22" * 32
+
+        client = MagicMock()
+        client.broadcast = _bcast
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+
+        meta = GlyphMetadata.for_dmint_ft(
+            ticker="TST", name="t", protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)]
+        )
+        params = DmintV1DeployParams(
+            metadata=meta,
+            owner_pkh=Hex20(b"\x00" * 20),
+            num_contracts=2,
+            max_height=100,
+            reward_photons=1000,
+            difficulty=1,
+            premine_amount=premine,
+        )
+        result = asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), params, client))
+
+        reveal = Transaction.from_hex(captured[1])
+        assert reveal is not None
+        # vout 0..1 contracts (1 photon each), vout 2 premine, vout 3 change.
+        assert [o.satoshis for o in reveal.outputs[:3]] == [1, 1, premine]
+        owner_pkh = Hex20(key.public_key().hash160())
+        assert reveal.outputs[2].locking_script.script == build_ft_locking_script(
+            owner_pkh, GlyphRef(txid=commit_txid, vout=0)
+        )
+        # Change is still positive: commit:0 was sized to cover premine + fee.
+        assert reveal.outputs[3].satoshis > 0
+
+        assert result["premine"] == premine
+        assert result["premine_outpoint"] == f"{'22' * 32}:2"
+        assert result["mineable_supply"] == 1000 * 100 * 2
+        assert result["total_supply"] == 1000 * 100 * 2 + premine
+
+    def test_deploy_inner_premine_absent_by_default(self, cli_context) -> None:
+        from pyrxd.cli.glyph_cmds import _deploy_dmint_inner
+        from pyrxd.glyph.builder import DmintV1DeployParams
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key = PrivateKey()
+        utxo = UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=50_000_000, height=100)
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [(utxo, key.address(), key)]
+
+        captured: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            captured.append(raw)
+            return ("11" if len(captured) == 1 else "22") * 32
+
+        client = MagicMock()
+        client.broadcast = _bcast
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+
+        meta = GlyphMetadata.for_dmint_ft(
+            ticker="TST", name="t", protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)]
+        )
+        result = asyncio.run(
+            _deploy_dmint_inner(
+                ctx,
+                _Wallet(),
+                DmintV1DeployParams(
+                    metadata=meta,
+                    owner_pkh=Hex20(b"\x00" * 20),
+                    num_contracts=1,
+                    max_height=100,
+                    reward_photons=1000,
+                    difficulty=1,
+                ),
+                client,
+            )
+        )
+        reveal = Transaction.from_hex(captured[1])
+        assert reveal is not None
+        assert len(reveal.outputs) == 2  # contract + change, no premine
+        assert result["premine"] == 0
+        assert result["premine_outpoint"] is None
+        assert result["total_supply"] == result["mineable_supply"]
+
+    @pytest.mark.parametrize("v2", [False, True])
+    @pytest.mark.parametrize("num_contracts", [1, 2, 5, 20])
+    @pytest.mark.parametrize("premine", [None, 7_000_000])
+    def test_reveal_size_estimate_is_an_upper_bound(self, cli_context, v2, num_contracts, premine) -> None:
+        """The reveal-size estimate must never come in UNDER the real transaction.
+
+        ``commit0_value`` is derived from it and the reveal has no funding input of
+        its own, so an under-estimate strands a confirmed commit behind a reveal
+        that cannot pay its fee. The old flat ``n * 260 + 400`` formula was short
+        for every V1 deploy with 2+ contracts and for every V2 deploy — this
+        parametrisation is exactly the grid that caught it.
+        """
+        from pyrxd.cli.glyph_cmds import _deploy_dmint_inner, _estimate_dmint_reveal_bytes
+        from pyrxd.glyph.builder import DmintV1DeployParams, DmintV2DeployParams, GlyphBuilder
+
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        key = PrivateKey()
+        utxo = UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=1_000_000_000_000, height=100)
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [(utxo, key.address(), key)]
+
+        captured: list[bytes] = []
+
+        async def _bcast(raw: bytes) -> str:
+            captured.append(raw)
+            return ("11" if len(captured) == 1 else "22") * 32
+
+        client = MagicMock()
+        client.broadcast = _bcast
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+
+        meta = GlyphMetadata.for_dmint_ft(
+            ticker="TST",
+            name="sizing",
+            description="d" * 60,
+            protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)],
+        )
+        cls = DmintV2DeployParams if v2 else DmintV1DeployParams
+        params = cls(
+            metadata=meta,
+            owner_pkh=Hex20(b"\x00" * 20),
+            num_contracts=num_contracts,
+            max_height=100,
+            reward_photons=1000,
+            difficulty=1,
+            premine_amount=premine,
+        )
+        asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), params, client))
+
+        sizing = GlyphBuilder().prepare_dmint_deploy(params)
+        estimate = _estimate_dmint_reveal_bytes(
+            contract_scripts=sizing.placeholder_contract_scripts,
+            cbor_len=len(sizing.cbor_bytes),
+            premine=bool(premine),
+            op_return_len=0,
+        )
+        actual = len(captured[1])
+        assert estimate >= actual, f"reveal size estimate {estimate} UNDER the real {actual} bytes"
+        # ...and not so loose that the deploy burns the surplus as fee. The change
+        # output surviving fee() is the observable proof the surplus comes back.
+        assert estimate <= actual * 1.10 + 64, f"estimate {estimate} is wastefully above {actual}"
+        reveal = Transaction.from_hex(captured[1])
+        assert reveal is not None
+        expected_outputs = num_contracts + (1 if premine else 0) + 1  # + change
+        assert len(reveal.outputs) == expected_outputs, "change output was dropped — the reveal underpaid"
 
     def test_claim_assembly_builds_signed_mint(self) -> None:
         from pyrxd.cli.glyph_cmds import _mine_claim_with_rerolls, _sign_funding_input
