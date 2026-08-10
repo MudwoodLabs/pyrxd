@@ -56,6 +56,7 @@ from Cryptodome.Cipher import AES
 
 from ..hd.bip32 import Xprv, Xpub, ckd, master_xprv_from_seed
 from ..hd.bip39 import seed_from_mnemonic
+from ..hd.descriptor import AccountDescriptors, account_descriptors
 from ..keys import PrivateKey
 from ..network.electrumx import UtxoRecord, script_hash_for_address
 from ..script.type import P2PKH
@@ -318,7 +319,7 @@ class HdWallet:
         # normalises any configured path to that shape, so reconstructing it here matches
         # what from_mnemonic/load derived (the env override only ever changes the coin int).
         master = master_xprv_from_seed(self._seed.unsafe_raw_bytes())
-        account_xprv = ckd(master, f"m/44'/{self._coin_type}'/{self.account}'")
+        account_xprv = ckd(master, self.account_path)
         if not isinstance(account_xprv, Xprv):  # pragma: no cover - private seed + hardened path => Xprv
             raise KeyMaterialError("account derivation did not yield a private xprv")
         return account_xprv
@@ -860,6 +861,57 @@ class HdWallet:
     def account_xpub(self) -> Xpub:
         """The account-level xpub (watch-only safe; no private key)."""
         return self._xprv.xpub()
+
+    @property
+    def account_path(self) -> str:
+        """This wallet's BIP44 account path, e.g. ``m/44'/512'/0'``.
+
+        Single source of truth for the string several callers used to build
+        inline. The ``_xprv`` property derives from exactly this path.
+        """
+        return f"m/44'/{self._coin_type}'/{self.account}'"
+
+    def master_fingerprint(self) -> bytes:
+        """The BIP32 **master** key fingerprint: ``hash160(master pubkey)[:4]``.
+
+        This is what an output-script descriptor's key-origin field wants, and
+        it is NOT ``account_xpub().fingerprint`` — that attribute is the
+        *parent* fingerprint (payload bytes 5:9), i.e. the fingerprint of
+        ``m/44'/<coin>'``, one level up. The two values differ for every
+        account at depth > 1.
+
+        The distinction matters because using the parent fingerprint produces
+        a descriptor that still derives the correct addresses, so nothing
+        appears broken — but it misidentifies the key's origin, and any
+        consumer that later tries to match the descriptor to a signing device
+        (or to another descriptor from the same seed) will fail to.
+
+        Public (no private material leaves): the return value is a truncated
+        hash of a public key.
+        """
+        if getattr(self, "_zeroed", False):
+            raise KeyMaterialError("wallet is locked/zeroized; re-create it from the mnemonic")
+        master = master_xprv_from_seed(self._seed.unsafe_raw_bytes())
+        return master.public_key().hash160()[:4]
+
+    def descriptors(self, *, checksum: bool = False) -> AccountDescriptors:
+        """Output-script descriptors for this account's receive + change chains.
+
+        Watch-only safe: the descriptors embed the account **xpub**, never the
+        xprv or the seed. Note that an xpub still discloses every address this
+        wallet will ever derive on both chains — a larger privacy surface than
+        handing out a single address.
+
+        *checksum* appends the BIP380 suffix. Off by default because Radiant
+        Core rejects the checksummed form; see
+        :mod:`pyrxd.hd.descriptor`.
+        """
+        return account_descriptors(
+            self.account_xpub(),
+            master_fingerprint=self.master_fingerprint(),
+            account_path=self.account_path,
+            checksum=checksum,
+        )
 
     def privkey_for(self, change: int, index: int) -> PrivateKey:
         """Derive the signing key at ``change/index`` (public seam over ``_privkey_for``)."""
