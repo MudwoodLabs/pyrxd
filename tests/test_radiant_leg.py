@@ -18,6 +18,7 @@ import pytest
 
 from pyrxd.btc_wallet import taproot as t
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput
 from pyrxd.gravity.radiant_leg import (
@@ -30,7 +31,7 @@ from pyrxd.gravity.ref_authenticity import verify_ref_authenticity
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20
 
 _P = b"\xaa" * 32
@@ -647,3 +648,145 @@ async def test_ref_adapter_tolerates_malformed_indexer_fields(token):
     assert resolved is not None  # does not crash
     if "payload_hash" in token:
         assert resolved.payload_hash == b""  # malformed payload -> empty (no binding)
+
+
+# --------------------------------------------------------------------------- deadline-aware fee gate (A1)
+#
+# Radiant has neither RBF nor CPFP, so an under-fee'd claim/refund cannot be repaired
+# after broadcast — it squats on its own inputs until mempool expiry (8h). The leg is
+# the single choke point every time-critical covenant spend passes through, so the
+# pre-broadcast affordability gate lives there. See pyrxd.gravity.fee_policy.
+
+
+class SizedFeeSource:
+    """A fee source dispensing an exact photon value, counting how often it is drawn."""
+
+    def __init__(self, value: int) -> None:
+        self.value = value
+        self.calls = 0
+
+    def next_fee_input(self) -> FeeInput:
+        self.calls += 1
+        k = PrivateKey(bytes.fromhex("33" * 32))
+        pkh = bytes(Hex20(k.public_key().hash160()))
+        return FeeInput(
+            txid="ef" * 32, vout=0, value=self.value, scriptpubkey=b"\x76\xa9\x14" + pkh + b"\x88\xac", wif=k.wif()
+        )
+
+
+def test_leg_rejects_a_non_policy_fee_policy():
+    with pytest.raises(ValidationError, match="fee_policy must be a DeadlineFeePolicy"):
+        RadiantCovenantLeg(
+            network="bcrt",
+            taker_pkh=_TAKER_PKH,
+            maker_pkh=_MAKER_PKH,
+            chain_io=RadiantChainIO(FakeClient()),
+            fee_source=FakeFeeSource(),
+            fee_policy=object(),  # type: ignore[arg-type]
+        )
+
+
+def test_leg_defaults_to_the_effective_min_relay_rate():
+    assert _leg().fee_policy is DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+    assert _leg().fee_policy.relay_fee_per_kb == 10_000_000  # 0.10 RXD/kB
+
+
+async def test_claim_refused_and_paged_when_the_fee_cannot_make_the_deadline(caplog):
+    """The fee clears the flat relay floor but NOT the deadline-aware requirement.
+
+    csv=6 with 5 confirmations leaves 1 block before the maker's CSV refund opens, so
+    the urgency multiplier is 1 + 2*(6-1)/6 = 8/3. A ~266-byte claim needs ~2.66M
+    photons flat, but ~7.1M at that urgency.
+    """
+    terms = _rxd_terms(amount=100_000, csv=6)
+    client = FakeClient(utxo_value=100_000, confirmations=5)
+    src = SizedFeeSource(3_000_000)  # over the flat floor, under the urgent one
+    leg = _leg(client=client, fee_source=src)
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    with caplog.at_level("ERROR"):
+        with pytest.raises(InsufficientFundsError) as ei:
+            await leg.claim_asset(rec, _P)
+    assert ei.value.available == 3_000_000
+    assert ei.value.required is not None and ei.value.required > 3_000_000
+    assert client.broadcast_raw == [], "nothing may go on-chain when the gate refuses"
+    # PAGE: the refusal is logged at ERROR with the deadline, so an operator is woken.
+    assert any(
+        r.levelname == "ERROR"
+        and "REFUSING to broadcast" in r.getMessage()
+        and "blocks_to_deadline=1" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+async def test_the_same_fee_is_accepted_far_from_the_deadline():
+    """Identical fee input, identical transaction — only the deadline differs.
+
+    This is what makes the gate deadline-AWARE rather than just a higher flat floor.
+    """
+    terms = _rxd_terms(amount=100_000, csv=100)  # deadline far outside the 6-block horizon
+    client = FakeClient(utxo_value=100_000, confirmations=3)
+    src = SizedFeeSource(3_000_000)
+    leg = _leg(client=client, fee_source=src)
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    assert await leg.claim_asset(rec, _P) == "ab" * 32
+    assert len(client.broadcast_raw) == 1
+
+
+async def test_claim_past_the_deadline_takes_the_maximum_premium():
+    # confirmations >= csv: the maker's refund branch is already open. Maximum urgency,
+    # never more — and never a negative blocks_to_deadline.
+    terms = _rxd_terms(amount=100_000, csv=6)
+    client = FakeClient(utxo_value=100_000, confirmations=99)
+    src = SizedFeeSource(7_000_000)  # under 3.0x of ~2.66M
+    leg = _leg(client=client, fee_source=src)
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    with pytest.raises(InsufficientFundsError, match="0 block\\(s\\) to deadline"):
+        await leg.claim_asset(rec, _P)
+    assert client.broadcast_raw == []
+
+
+async def test_refund_uses_the_flat_floor_with_no_urgency_premium():
+    """A matured CSV refund has no closing window — it stays valid indefinitely — so it
+    pays the relay floor and no premium. The floor itself still binds."""
+    terms = _rxd_terms(amount=100_000, csv=6)
+    client = FakeClient(utxo_value=100_000, confirmations=6)
+    rec = SwapRecord(state=SwapState.MAKER_STALLS, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    # 3M photons > the ~2.33M flat floor for a ~233-byte refund => accepted, even though
+    # the covenant is exactly at its CSV deadline (which would be 3x on the claim path).
+    ok_leg = _leg(client=client, fee_source=SizedFeeSource(3_000_000))
+    assert await ok_leg.refund_asset(rec) == "ab" * 32
+    # ...but a sub-floor fee is still refused.
+    bad_client = FakeClient(utxo_value=100_000, confirmations=6)
+    bad_leg = _leg(client=bad_client, fee_source=SizedFeeSource(1_000_000))
+    with pytest.raises(InsufficientFundsError, match="no deadline"):
+        await bad_leg.refund_asset(rec)
+    assert bad_client.broadcast_raw == []
+
+
+async def test_an_injected_policy_overrides_the_default_rate():
+    # The node's effective_minrelaytxfee is policy, not protocol: a leg pointed at a
+    # node advertising 0.01 RXD/kB is sized for that node, with no code change.
+    terms = _rxd_terms(amount=100_000, csv=6)
+    client = FakeClient(utxo_value=100_000, confirmations=5)
+    leg = RadiantCovenantLeg(
+        network="bcrt",
+        taker_pkh=_TAKER_PKH,
+        maker_pkh=_MAKER_PKH,
+        chain_io=RadiantChainIO(client),
+        fee_source=SizedFeeSource(3_000_000),
+        fee_policy=DeadlineFeePolicy(relay_fee_per_kb=1_000_000),
+    )
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    assert await leg.claim_asset(rec, _P) == "ab" * 32
+
+
+async def test_the_gate_measures_the_transaction_it_is_about_to_send():
+    # The requirement must track the ACTUAL broadcast bytes. Build at a comfortable fee,
+    # read the size off the wire bytes the leg sent, and check the arithmetic closes.
+    terms = _rxd_terms(amount=100_000, csv=100)
+    client = FakeClient(utxo_value=100_000, confirmations=3)
+    leg = _leg(client=client, fee_source=SizedFeeSource(10_000_000))
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    await leg.claim_asset(rec, _P)
+    sent = client.broadcast_raw[0]
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.min_relay_fee(len(sent)) <= 10_000_000

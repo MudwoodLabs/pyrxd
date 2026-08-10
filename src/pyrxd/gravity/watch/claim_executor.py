@@ -56,7 +56,7 @@ from pyrxd.gravity.swap_coordinator import ClaimFinality, MarginPolicy, assess_c
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent, _value_at_risk_photons
 from pyrxd.gravity.watch.executor import ExecOutcome
-from pyrxd.security.errors import NetworkError, PolicyRejection, ValidationError
+from pyrxd.security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +516,25 @@ class ClaimExecutor:
         # 8. Broadcast the covenant claim (reuses the mainnet-proven leg path; logs txid+value, never p).
         try:
             txid = await leg.claim_asset(record, bytes(p))
+        except InsufficientFundsError as exc:
+            # PRE-BROADCAST fee gate (gap-closure A1): the dispensed fee input cannot meet the
+            # deadline-aware min-relay requirement, so the leg refused to broadcast. Nothing went
+            # on-chain and no fee was burned — but this CANNOT self-resolve, because the same fee
+            # source will keep handing out the same too-small UTXOs. Treat it exactly like a
+            # permanent PolicyRejection: mark seen so the per-tick retry does not walk the capped
+            # fee pool's cursor to exhaustion for a claim that will never be sent, and page with
+            # the exact shortfall so the operator can fund a larger fee input. Radiant has no RBF
+            # and no CPFP, so refusing here is strictly better than an unfixable stuck claim.
+            if self._seen is not None:
+                await _maybe_await(self._seen.mark_seen, f"claim:{outpoint}".encode())
+            logger.error(
+                "autonomous claim swap %s: fee input CANNOT COVER the deadline-aware relay "
+                "requirement (%s) — nothing broadcast; operator must fund a larger fee input "
+                "before the maker's CSV refund opens",
+                swap_id,
+                exc,
+            )
+            return ExecOutcome.DECLINED, f"fee input below the deadline-aware relay requirement: {exc}"
         except PolicyRejection as exc:
             # PERMANENT: the node rejected the tx on a consensus/policy rule (bad script, dust,
             # min-relay-fee). Retrying cannot help, and this path RE-CARVES a real-value fee input

@@ -155,6 +155,71 @@ first, confirming a fresh heartbeat, then un-muting the watchdog. The swaps don'
   keyless and output-pinned to the taker). Rotate by refilling/replacing the **capped pool** (a manual,
   audited op — never an auto top-up from the main wallet), then re-arm.
 
+## Fee sizing — the 8-hour irreversibility window
+
+**Footgun #5 — an under-fee'd time-critical spend cannot be fixed. By any means.**
+
+**Radiant supports neither RBF nor CPFP.** This is not a pyrxd limitation; it is the chain
+(verified against `Radiant-Core` @ `afdf57b1` and the live mainnet node, 2026-08-09):
+
+- **No RBF.** Any mempool conflict is rejected outright (`txn-mempool-conflict`,
+  `src/validation.cpp:667`/`:856`). There is **no `bumpfee` RPC**. Radiant ships DSProof —
+  it treats a conflict as *fraud to broadcast*, the opposite of replacement.
+- **No CPFP.** The miner selects on each transaction's **own** fee over its **own** size
+  (`GetModifiedFeeRate()`, `src/miner.cpp:380`). Paying a high-fee child does **not** lift a
+  low-fee parent into a block. `getmempoolancestors`/`getmempooldescendants` existing makes
+  it *look* supported. It is not.
+- **The window.** `DEFAULT_MEMPOOL_EXPIRY` is **8 hours** (`src/validation.h:82`). An
+  under-fee'd transaction squats on its own inputs for up to 8 hours before you can even
+  rebuild. **If the deadline lands inside that window, the asset is gone.**
+
+Therefore: **do not attempt a fee bump.** There is no procedure to run. The only control is
+pre-sizing, and pyrxd now enforces it before broadcast.
+
+**What the tower does.** Every Radiant covenant claim/refund is checked against
+`ceil(size × effective_minrelaytxfee / 1000)` for the transaction's **real** serialized size,
+with a deadline-scaled premium on the claim path (blocks left before the maker's `t_rxd` CSV
+refund opens). A shortfall is **refused, not broadcast**, and pages:
+
+```
+autonomous claim DECLINED for <swap>: fee input below the deadline-aware relay requirement:
+HTLC covenant claim (pre-broadcast gate): fee of N photons is below the required M photons
+(short by M-N) for a S-byte transaction at 10000000 photons/kB x2.33 urgency (2 block(s) to deadline)
+```
+
+**Operator response to that page — you have blocks, not hours:**
+
+1. **Fund a larger fee UTXO** into the capped fee pool. The message states the exact shortfall;
+   round up generously — a few hundredths of an RXD is not worth a lost swap leg.
+2. **Restart the tower** so the fire-once guard (in-memory) clears and the claim re-fires. A fee
+   shortfall is marked seen deliberately, so the tower does *not* walk your fee pool's cursor to
+   exhaustion retrying a claim it cannot send.
+3. If there is not time for that, **run the one-shot claim yourself** from a node with a funded
+   fee UTXO. Do not wait for the next tick.
+
+**Sizing the pool up front.** At the reference node's `effective_minrelaytxfee` of 0.10 RXD/kB,
+a covenant spend is a few hundred bytes, so a claim costs roughly **0.03 RXD** flat and up to
+**~0.08 RXD** at the maximum urgency premium (3×). Stock each pool UTXO at **0.1–0.2 RXD** and
+keep several — the fee source is availability-critical: an empty pool is a missed deadline, and
+the covenant's single-output rule means the *entire* fee input is consumed as the miner fee
+(there is no change output to recover the remainder).
+
+**Check the rate, don't assume it.** `effective_minrelaytxfee` is node policy and can change,
+and it is **10× the nominal `minrelaytxfee`** on the reference node:
+
+```bash
+radiant-cli getmempoolinfo | grep -E 'minrelaytxfee'
+# "minrelaytxfee": 0.01000000,  "effective_minrelaytxfee": 0.10000000
+```
+
+If your node reports something else, pass it explicitly rather than relying on the default —
+`RadiantCovenantLeg(..., fee_policy=DeadlineFeePolicy(relay_fee_per_kb=photons_per_kb_from_rxd_per_kb(rate)))`.
+
+**BTC side.** The pre-signed refund blob's fee is fixed at presign time and the tower holds no
+key to rebuild it, so the executor declines a blob whose fee is not viable. Re-run
+`scripts/presign_refund.py` with a sane `--fee-sats` rather than trying to bump it in flight.
+(BTC, unlike Radiant, does have RBF and CPFP — but not for a blob you cannot re-sign.)
+
 ## Health & alerts
 
 - The tower logs each tick at the mapped severity; the heartbeat file's mtime is the liveness signal.

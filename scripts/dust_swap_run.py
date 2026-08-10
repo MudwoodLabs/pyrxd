@@ -436,7 +436,19 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     ap.add_argument("--btc-sats", type=int, default=600)
     ap.add_argument("--rxd-photons", type=int, default=1000)
     ap.add_argument("--btc-fee-sats", type=int, default=400, help="flat BTC fee (under-fee claim = SAFETY issue)")
-    ap.add_argument("--rxd-fee-photons", type=int, default=2_000_000, help="flat RXD fee (relayfee 0.10/kB)")
+    # 2,000,000 was BELOW the node's floor: AcceptToMemoryPool requires
+    # ceil-ish(size x effective_minrelaytxfee / 1000) over the FULL serialized size, and a
+    # measured RXD covenant claim is ~266 B => ~2,660,000 photons at 0.10 RXD/kB. The claim
+    # path also pays a deadline-urgency premium (up to 3x) as t_rxd closes, and Radiant has
+    # neither RBF nor CPFP, so an under-fee'd claim cannot be repaired. 20,000,000 (0.2 RXD)
+    # clears the worst case with margin; the whole input is consumed as fee (no change), so
+    # this is the amount actually spent per spend.
+    ap.add_argument(
+        "--rxd-fee-photons",
+        type=int,
+        default=20_000_000,
+        help="flat RXD fee input, consumed ENTIRELY as the miner fee (effective relayfee 0.10 RXD/kB)",
+    )
     ap.add_argument("--btc-claim-payout", default="", help="scriptPubKey hex the maker's BTC claim pays out to")
     ap.add_argument("--btc-refund-payout", default="", help="scriptPubKey hex the taker's BTC refund pays out to")
     ap.add_argument("--t-rxd-blocks", type=int, default=20)

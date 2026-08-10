@@ -727,3 +727,52 @@ async def test_composite_dispatches_to_the_matching_executor():
     # A non-claim decision: both no-op → None.
     refund = Decision(Intent.PAGE_REFUND, reason="x", recommended_action="mutual_refund")
     assert await composite.execute("s1", rec, refund) is None
+
+
+# --------------------------------------------------------------------------- A1: fee affordability
+
+
+async def test_fee_shortfall_declines_pages_and_does_not_drain_the_fee_pool():
+    """The leg's pre-broadcast fee gate refused: nothing broadcast, operator paged.
+
+    A fee shortfall cannot self-resolve — the same fee source keeps handing out the same
+    too-small UTXOs — so it is handled like a permanent PolicyRejection: DECLINED (which
+    pages) and marked seen, so the per-tick retry does not walk a capped fee pool's cursor
+    to exhaustion for a claim that will never be sent.
+    """
+    from pyrxd.gravity.radiant_leg import SeenStore
+    from pyrxd.security.errors import InsufficientFundsError
+
+    ex, leg, rec, _p = await _armed_executor(seen_store=SeenStore())
+
+    async def _too_poor(record, preimage):
+        leg.claim_calls += 1
+        raise InsufficientFundsError(
+            "HTLC covenant claim (pre-broadcast gate): fee of 546 photons is below the required 2660000",
+            available=546,
+            required=2_660_000,
+        )
+
+    leg.claim_asset = _too_poor
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert leg.claim_calls == 1
+    # Marked seen → the next tick is an idempotent no-op rather than another fee draw.
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert leg.claim_calls == 1
+
+
+async def test_fee_shortfall_is_not_reported_as_a_transient_failure(caplog):
+    # It must not read as FAILED ("retry next tick"), and the log must be actionable.
+    from pyrxd.security.errors import InsufficientFundsError
+
+    ex, leg, rec, _p = await _armed_executor()
+
+    async def _too_poor(record, preimage):
+        raise InsufficientFundsError(
+            "fee of 546 photons is below the required 2660000", available=546, required=2_660_000
+        )
+
+    leg.claim_asset = _too_poor
+    with caplog.at_level("ERROR"):
+        assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert any("CANNOT COVER" in r.getMessage() and r.levelname == "ERROR" for r in caplog.records)

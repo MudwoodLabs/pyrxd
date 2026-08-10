@@ -69,7 +69,11 @@ def _synthetic_fee_input(owner: PrivateKey) -> FeeInput:
     """
     pkh = _pkh(owner)
     spk = b"\x76\xa9\x14" + pkh + b"\x88\xac"  # OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG
-    return FeeInput(txid=os.urandom(32).hex(), vout=0, value=5_000_000, scriptpubkey=spk, wif=owner.wif())
+    # 0.2 RXD. The covenant enforces a single output, so there is no change: this whole
+    # input becomes the miner fee. It must clear the node's min-relay floor (0.10 RXD/kB
+    # over the full serialized size) — the builders refuse an under-fee'd spend, because
+    # Radiant has neither RBF nor CPFP to repair one. See pyrxd.gravity.fee_policy.
+    return FeeInput(txid=os.urandom(32).hex(), vout=0, value=20_000_000, scriptpubkey=spk, wif=owner.wif())
 
 
 def main() -> None:

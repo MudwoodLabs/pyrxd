@@ -209,7 +209,8 @@ def _args():
     )
     ap.add_argument("--eth-timeout-s", type=int, default=1800)  # 30 min — clears the 768s finality floor + margin
     ap.add_argument("--rxd-photons", type=int, default=1000)
-    ap.add_argument("--rxd-fee-photons", type=int, default=5_000_000)
+    # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
+    ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)
     ap.add_argument("--rxd-wallet", default="")
     ap.add_argument("--t-rxd-blocks", type=int, default=3)  # small CSV so it matures fast on mainnet
     # Margin kept lean for a fast dust demo, EXCEPT eth-finalization-window-s, which is hard-floored at

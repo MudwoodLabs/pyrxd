@@ -4,6 +4,69 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Security
+
+- **Deadline-aware fee sizing for time-critical HTLC spends.** The only fee guard on a
+  Radiant covenant spend was a flat `if fee.value < 546: raise` — a Bitcoin dust floor. At
+  the reference mainnet node's advertised `effective_minrelaytxfee` (0.10 RXD/kB) a covenant
+  spend of a few hundred bytes needs on the order of **2,600,000 photons**, about **4,900×**
+  that floor. Because the covenant enforces a single output there is no change, so the entire
+  fee input is the miner fee — an under-sized fee UTXO produced a transaction no node would
+  relay.
+
+  This matters far more on Radiant than the same bug would on Bitcoin. **Radiant supports
+  neither RBF nor CPFP** (verified against `Radiant-Core` @ `afdf57b1` and the live mainnet
+  node): mempool conflicts are rejected outright (`txn-mempool-conflict`, no `bumpfee` RPC),
+  and the miner selects on each transaction's *own* fee over its *own* size
+  (`GetModifiedFeeRate()`), so a high-fee child cannot lift a low-fee parent. An under-fee'd
+  time-critical claim or refund therefore **cannot be repaired by any means** — it squats on
+  its own inputs until mempool expiry (`DEFAULT_MEMPOOL_EXPIRY` = **8 hours**). If the swap
+  deadline falls inside that window, the asset is lost to the counterparty's refund. Fee
+  pre-sizing is the only available control. (Conversely: BIP125 mempool *pinning* does not
+  apply to Radiant, because nothing is replaceable.)
+
+  New in this release:
+
+  - **`pyrxd.gravity.fee_policy`** — a pure, injectable `DeadlineFeePolicy`.
+    `min_relay_fee(size)` is the derivation `ceil(size × rate / 1000)`;
+    `urgency_multiplier(blocks_to_deadline)` is a linear ramp above it inside a 6-block
+    horizon (a documented **policy choice**, not a measured inclusion model — no Radiant
+    fee/confirmation curve has been measured). The rate is a **parameter, not a constant**:
+    `effective_minrelaytxfee` is node policy and moves, and
+    `photons_per_kb_from_rxd_per_kb()` converts a `getmempoolinfo` reading directly.
+  - **`build_htlc_claim_tx` / `build_htlc_refund_tx`** now refuse to return an under-fee'd
+    transaction, sized against `len(tx.serialize())` — the exact wire bytes, measured after
+    signing, never an estimate. Both accept an optional `fee_policy`.
+  - **`RadiantCovenantLeg`** applies the **deadline-aware** requirement immediately before
+    broadcast. On the claim path blocks-to-deadline is `t_rxd − covenant confirmations` (the
+    maker's CSV refund branch opens at that depth); a shortfall refuses, logs at ERROR, and
+    raises rather than emitting an unrepairable transaction. Accepts an optional `fee_policy`.
+  - **`watch/claim_executor.py`** maps a fee shortfall to `DECLINED` (which pages) with the
+    exact shortfall, and marks it fire-once so a per-tick retry cannot walk a capped fee
+    pool's cursor to exhaustion for a claim it can never send.
+  - **`watch/executor.py`** (BTC pre-signed refund) declines a blob whose implied fee is not
+    viable. Deliberately sized on a **lower bound** of the true vsize requirement, so it can
+    never falsely refuse a refund the node would have accepted.
+  - **No RBF or CPFP path was built, and none should be.** Both are absent from the chain;
+    "just bump the fee" is Bitcoin semantics assumed onto a BCH-lineage chain. Recorded in
+    `docs/threat-model.md` (**S21**) and `docs/runbooks/watchtower-operations.md`.
+
+### Upgrade notes
+
+- **Operator-visible break: a covenant claim/refund funded with a too-small fee input is now
+  REFUSED at build time.** Previously it was built and broadcast, and then silently failed to
+  confirm — which, given no RBF and no CPFP, was unrecoverable within the 8-hour mempool
+  window. The refusal raises `InsufficientFundsError` (a `ValidationError` subclass, so
+  existing `except ValidationError` handlers keep catching it) carrying
+  `available` / `required` / `shortfall`, and the message names all three.
+  **Action:** size fee UTXOs at **0.1–0.2 RXD** each rather than dust. If you target a node
+  whose `effective_minrelaytxfee` differs from the 0.10 RXD/kB default, pass an explicit
+  `fee_policy` instead of relying on the default.
+- The historical 546-photon dust floor is **retained** as a floor. It is now the cheap
+  pre-check, not the requirement.
+
 ## [0.13.0] — 2026-08-09
 
 Feature release, and the follow-through on 0.12.0's security panel. Adds a **two-phase,

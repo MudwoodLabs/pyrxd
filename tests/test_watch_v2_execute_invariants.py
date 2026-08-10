@@ -648,3 +648,71 @@ async def test_transient_network_error_still_propagates_for_retry(tmp_path):
 
     with pytest.raises(NetworkError):
         await _armed(tmp_path, _TransientBroadcaster()).execute("swap1", rec, _refund_decision())
+
+
+# ───────────────────────────────────── A1: pre-signed refund affordability floor ──
+
+
+async def test_decline_blob_whose_fee_is_not_viable(tmp_path):
+    """A blob paying a token fee is declined + paged rather than broadcast.
+
+    ``value < amount_sats`` alone only proves the fee is non-zero. This blob pays 1 sat
+    for a ~256-byte refund — the node will not relay it, and the executor holds no key
+    to rebuild it, so broadcasting would burn the CSV window on a transaction that
+    cannot confirm.
+    """
+    rec, blob = _swap(fee_sats=1)
+    _write(tmp_path, blob)
+    b = _FakeBroadcaster()
+    ex = _armed(tmp_path, b)
+    assert await ex.execute("swap1", rec, _refund_decision()) is ExecOutcome.DECLINED
+    assert b.calls == []
+
+
+async def test_a_normally_presigned_refund_is_not_falsely_declined(tmp_path):
+    """The floor is a LOWER bound on min-relay, so it must never refuse a viable blob.
+
+    ``presign``'s own default (500 sats) and even a lean 1-sat/vB-ish fee must pass:
+    a false decline would strand a refund the node would have accepted.
+    """
+    for fee_sats in (500, 200, 120):
+        rec, blob = _swap(fee_sats=fee_sats)
+        d = tmp_path / f"f{fee_sats}"
+        d.mkdir()
+        _write(d, blob)
+        b = _FakeBroadcaster()
+        ex = _armed(d, b)
+        assert await ex.execute("swap1", rec, _refund_decision()) is ExecOutcome.BROADCAST, fee_sats
+        assert len(b.calls) == 1
+
+
+async def test_refund_executor_rejects_a_non_policy_fee_policy(tmp_path):
+    with pytest.raises(ValidationError, match="fee_policy must be a DeadlineFeePolicy"):
+        RefundExecutor(
+            broadcaster=None,
+            blobs_dir=tmp_path,
+            network="bcrt",
+            cap_sats=10_000,
+            refund_spk=_REFUND_SPK,
+            fee_policy=object(),  # type: ignore[arg-type]
+        )
+
+
+async def test_the_floor_tracks_the_injected_rate(tmp_path):
+    # An operator on a chain/fee environment with a different min-relay rate injects it;
+    # nothing about the floor is hardcoded.
+    from pyrxd.gravity.fee_policy import DeadlineFeePolicy
+
+    rec, blob = _swap(fee_sats=500)
+    _write(tmp_path, blob)
+    b = _FakeBroadcaster()
+    ex = RefundExecutor(
+        broadcaster=b,
+        blobs_dir=tmp_path,
+        network="bcrt",
+        cap_sats=10_000,
+        refund_spk=_REFUND_SPK,
+        fee_policy=DeadlineFeePolicy(relay_fee_per_kb=100_000),  # 100 sats/vB — absurdly high
+    )
+    assert await ex.execute("swap1", rec, _refund_decision()) is ExecOutcome.DECLINED
+    assert b.calls == []

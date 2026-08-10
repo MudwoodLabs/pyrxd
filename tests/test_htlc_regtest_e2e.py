@@ -248,8 +248,14 @@ def _pay_to_spk(
     return btxid
 
 
-def _fee_input(node: _RegtestNode, amount: int = 5_000_000) -> FeeInput:
-    """Carve a plain-P2PKH UTXO of ``amount`` for a covenant spend's fee leg."""
+def _fee_input(node: _RegtestNode, amount: int = 20_000_000) -> FeeInput:
+    """Carve a plain-P2PKH UTXO of ``amount`` for a covenant spend's fee leg.
+
+    0.2 RXD, not dust: the whole input is consumed as the miner fee (single-output
+    covenant, no change), and the builders enforce the node's min-relay floor —
+    ~2.66M photons for a ~266-byte spend at 0.10 RXD/kB — plus, on the leg's claim
+    path, a deadline-urgency premium of up to 3x. See pyrxd.gravity.fee_policy.
+    """
     u = _biggest_utxo(node)
     wif = str(node.cli("dumpprivkey", u["address"], wallet=True))
     key = PrivateKey(wif)
