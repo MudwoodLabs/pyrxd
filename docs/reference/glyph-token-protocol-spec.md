@@ -96,12 +96,40 @@ The full opcode family (`0xd0`–`0xec`) is enumerated at
 A ref operand is 36 raw bytes following the opcode; it is **not** a push. An
 implementation that needs to enumerate the refs in a script MUST walk the script
 as an opcode stream — consuming each push opcode's payload — rather than scanning
-for bytes in the `0xd0`–`0xd8` range, because roughly half of random 20-byte
-public-key hashes contain such a byte. pyrxd's walker is
-`iter_input_refs` (`src/pyrxd/glyph/script.py:404-456`), which mirrors Radiant
-consensus's `CScript::GetPushRefs`. A script that ends mid-push or mid-ref-operand
-has ambiguous length; implementations MUST refuse it rather than guess
-(`TruncatedScriptError`, `src/pyrxd/glyph/script.py:395-401`).
+for bytes in the ref-opcode range, because roughly half of random 20-byte
+public-key hashes contain such a byte.
+
+Exactly **five** opcodes are followed by a 36-byte operand, and the set is
+**not** the contiguous `0xd0`–`0xd8` range:
+
+| Opcode | Byte | Operand |
+|---|---|---|
+| `OP_PUSHINPUTREF` | `0xd0` | 36 bytes |
+| `OP_REQUIREINPUTREF` | `0xd1` | 36 bytes |
+| `OP_DISALLOWPUSHINPUTREF` | `0xd2` | 36 bytes |
+| `OP_DISALLOWPUSHINPUTREFSIBLING` | `0xd3` | 36 bytes |
+| `OP_REFHASHDATASUMMARY_UTXO` | `0xd4` | **none** |
+| `OP_REFHASHVALUESUM_UTXOS` | `0xd5` | **none** |
+| `OP_REFHASHDATASUMMARY_OUTPUT` | `0xd6` | **none** |
+| `OP_REFHASHVALUESUM_OUTPUTS` | `0xd7` | **none** |
+| `OP_PUSHINPUTREFSINGLETON` | `0xd8` | 36 bytes |
+
+`0xd4`–`0xd7` are operand-less stack operations that happen to sit inside the
+same byte range (`Radiant-Core/src/script/script.h:281-284`). Radiant's opcode
+stepper `GetScriptOp` advances the program counter by 36 for the other five only
+(`Radiant-Core/src/script/script.cpp:710-716`), and `CScript::GetPushRefs`
+collects refs for that same five (`:586-590`). A walker that treats the range as
+contiguous desynchronizes from consensus after any `0xd4`–`0xd7`: it either
+rejects a valid script or — when the byte it resumes on happens to be a valid
+single-byte opcode — silently resynchronizes, reporting a **phantom** ref and
+dropping the real one. Implementations MUST use the five-opcode set.
+
+pyrxd's walker is `iter_input_refs` (`src/pyrxd/glyph/script.py:454-509`) over
+the constant `REF_OPCODES` (`:442`); the differential test against a port of the
+consensus rule is `TestRefWalkerConsensusDifferential` in `tests/test_glyph.py`.
+A script that ends mid-push or mid-ref-operand has ambiguous length;
+implementations MUST refuse it rather than guess (`TruncatedScriptError`,
+`src/pyrxd/glyph/script.py:445-451`).
 
 ## 3. Identifiers
 
@@ -265,10 +293,12 @@ Notes on individual fields:
 
 The 256 KiB body cap is a DoS bound chosen above the largest known real payload
 (the 65,569-byte mainnet body); it is a pyrxd policy limit, not a consensus one.
-Note the internal inconsistency this creates: the 100 KB `main.b` ceiling is
-enforced by the `GlyphMedia` constructor but **not** by `decode_payload`, which
-accepts any `main.b` that fits inside the 256 KiB body — so pyrxd decodes media it
-would refuse to construct.
+
+Both caps are enforced on decode. `decode_payload` constructs a `GlyphMedia`
+(`src/pyrxd/glyph/payload.py:122`), so the 100,000-byte `main.b` ceiling checked
+in `GlyphMedia.__post_init__` (`src/pyrxd/glyph/types.py:116-117`) rejects an
+oversize blob even though the enclosing body is still under 256 KiB. Measured:
+100,000 bytes decodes; 100,001 raises `ValidationError`.
 
 ### 4.5 What a decoder MUST reject
 
@@ -280,6 +310,9 @@ would refuse to construct.
 - A map with no `p` key, or whose `p` is not an array.
 - Any text field exceeding its length cap in §4.3.
 - A `main.t` longer than 256 characters.
+- A `main.b` longer than 100,000 bytes (`src/pyrxd/glyph/types.py:116-117`,
+  reached through the `GlyphMedia` construction at
+  `src/pyrxd/glyph/payload.py:122`).
 - An `attrs` map with more than 64 entries.
 - A `decimals` that is a float or boolean.
 

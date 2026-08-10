@@ -227,6 +227,75 @@ class TestProgressReaderMemoryBound:
         finally:
             stream.close()
 
+    def test_newline_free_flood_never_grows_the_buffer_past_the_cap(self):
+        """The cap must hold for a miner that NEVER writes a newline.
+
+        The class docstring promises "a miner that never writes ``\\n`` (or
+        writes one absurdly long line) cannot grow the internal buffer past a
+        few KB". If the cap check is gated on ``not skipping``, the very first
+        overflow latches ``skipping = True`` and the check is never evaluated
+        again — so the buffer grows linearly with the stream until a newline
+        finally arrives, which for a hostile/broken miner is never.
+
+        White-box, and deliberately so: the bound is on a local ``buf`` that no
+        public surface exposes. ``read1`` is called from inside ``_run``'s loop
+        on the same thread, so ``sys._getframe(1).f_locals["buf"]`` reads the
+        real buffer at a deterministic point — right before the next chunk is
+        appended, i.e. exactly where the invariant must hold.
+        """
+        chunk_size = 4096
+        total_mb = 12
+        chunks = (total_mb * 1024 * 1024) // chunk_size
+
+        class _Probe:
+            def __init__(self) -> None:
+                self.remaining = chunks
+                self.peak = 0
+                self.served = 0
+
+            def read1(self, _n: int) -> bytes:
+                buf = sys._getframe(1).f_locals.get("buf")
+                if buf is not None:
+                    self.peak = max(self.peak, len(buf))
+                if self.remaining <= 0:
+                    return b""  # EOF
+                self.remaining -= 1
+                self.served += chunk_size
+                return b"x" * chunk_size  # no newline, ever
+
+        probe = _Probe()
+        reader = _ExternalMinerProgressReader(probe)
+        reader._run()  # synchronous: no thread, no timing race
+
+        assert probe.served == total_mb * 1024 * 1024
+        assert probe.peak <= _PROGRESS_LINE_MAX_BYTES, (
+            f"unterminated-line buffer reached {probe.peak:,} bytes on "
+            f"{probe.served:,} bytes of newline-free stderr — the "
+            f"{_PROGRESS_LINE_MAX_BYTES:,}-byte cap is not being re-checked "
+            f"once the reader has latched into skip mode"
+        )
+        assert reader.latest() is None
+
+    def test_reader_still_resyncs_after_a_newline_free_flood(self):
+        """Capping harder must not break resynchronization: the first newline
+        after the flood still ends the skipped line, and the NEXT line parses."""
+        good = json.dumps({"progress": {"attempts": 7, "elapsed_s": 2.5}}).encode()
+        chunks = [b"y" * 4096] * 200 + [b"\n" + good + b"\n"]
+
+        class _Scripted:
+            def __init__(self) -> None:
+                self.i = 0
+
+            def read1(self, _n: int) -> bytes:
+                if self.i >= len(chunks):
+                    return b""
+                self.i += 1
+                return chunks[self.i - 1]
+
+        reader = _ExternalMinerProgressReader(_Scripted())
+        reader._run()
+        assert reader.latest() == (7, 2.5)
+
     def test_fifty_thousand_frames_only_the_latest_is_retained(self):
         import os
 

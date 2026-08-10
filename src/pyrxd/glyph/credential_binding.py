@@ -53,6 +53,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+from pyrxd.glyph.script import REF_OPCODES
 from pyrxd.glyph.soulbound_detect import classify_soulbound
 from pyrxd.security.errors import ValidationError
 
@@ -124,8 +125,11 @@ def extract_owner_pkh(spk: bytes) -> bytes | None:
     pos, n = 0, len(spk)
     while pos < n:
         op = spk[pos]
-        # Skip ref opcodes (0xd0..0xd8): opcode + 36-byte operand.
-        if 0xD0 <= op <= 0xD8:
+        # Skip ref opcodes: opcode + 36-byte operand. Only {d0,d1,d2,d3,d8}
+        # carry an operand — 0xd4-0xd7 (REFHASH*) are operand-less stack
+        # opcodes. Consuming 36 bytes after one of those desynchronizes the
+        # walk from consensus and can surface a pkh that is really ref bytes.
+        if op in REF_OPCODES:
             pos += 37
             continue
         # P2PKH pattern: 76 a9 14 <20> 88 (ac|ad)

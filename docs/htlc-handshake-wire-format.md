@@ -183,8 +183,25 @@ expected covenant scriptPubKey from `terms` and compares it byte-for-byte agains
 `PARAMS_MISMATCH` and the taker refunds the counter leg (`:1464-1469` — the unrecomputable case is
 treated as a mismatch, which is the fail-closed direction).
 
-Because every negotiated Radiant parameter is substituted into the covenant bytecode, this single
-byte-comparison revalidates all of them at once.
+Every negotiated Radiant parameter that is substituted into the covenant bytecode — `hashlock`,
+`t_rxd`, `asset_variant`, `genesis_ref`, `radiant_amount`, `taker_dest_hash`, `maker_dest_hash` — is
+revalidated by this single byte-comparison, because changing any of them changes the SPK.
+
+**`credential_ref` is the exception, and it is a load-bearing one.** It is **not** substituted into
+the covenant; no covenant builder takes a credential parameter
+(`src/pyrxd/gravity/htlc_covenant.py:391-419`). A credential-gated swap and an ungated one with
+otherwise identical terms produce a **byte-identical** covenant scriptPubKey — the published
+`btc-rxd-credential-gated` and `btc-rxd` vectors in `conformance/htlc-handshake-vectors.json`
+demonstrate exactly that, and `test_credential_gating_does_not_change_the_covenant_spk` asserts it.
+
+The credential gate is therefore **off-chain policy, enforced before funding, by the party that
+chooses to run it** — `pre_btc_lock_gate` (`swap_coordinator.py:1241-1266`) resolves the credential,
+checks it is genuinely consensus-soulbound, and requires its owner to be the swap's pinned payout
+(`taker_dest_hash`). It is fail-closed when a `credential_ref` is present (an unwired resolver, an
+unresolvable ref, or an owner mismatch all abort), but it is a **pre-fund check, not a spending
+condition**: nothing on chain stops an uncredentialed party who learns `p` and can produce the
+pinned holder script from claiming. An implementer who treats the SPK byte-compare as binding the
+gate has no gate at all.
 
 ### 5. `maker_claim` (maker → taker)
 
@@ -221,7 +238,7 @@ consumed by `from_dict` (`:397-415`). All hex is bare lowercase with no `0x` pre
 | `t_btc` | `{value:int, unit:"blocks"\|"seconds"}` | **yes** | Counter-leg relative refund timelock. **Advisory on an ETH swap** — see **HZ-4**. | `:323-325` |
 | `t_rxd` | `{value:int, unit:"blocks"}` | **yes** | Radiant relative refund timelock. **MUST be `blocks`** — the covenant CSV has no seconds encoding. Covenant additionally requires `1 ≤ value ≤ 0xFFFF`. | `:332-336`; `htlc_covenant.py:371-378` |
 | `asset_variant` | `"rxd"\|"ft"\|"nft"` | **yes** | Selects the covenant template. | `:337-338` |
-| `genesis_ref` | hex | **yes** | Empty for `rxd`; **36 bytes** for `ft`/`nft` (reversed txid ‖ vout LE32). | `:339-341` |
+| `genesis_ref` | hex | **yes** | Reversed txid ‖ vout LE32. Produce **36 bytes** for `ft`/`nft` and **empty** for `rxd` — but see the enforcement note below; only part of that is checked at construction. | `:339-341`; `htlc_covenant.py:194-195` |
 | `taker_dest_hash` | 64-hex | **yes** | 32 bytes = `hash256(taker holder script)` — **double** SHA256 of the *script*, not of the pkh. | `:342`; `htlc_covenant.py:180-200` |
 | `maker_dest_hash` | 64-hex | **yes** | 32 bytes = `hash256(maker holder script)`. | `:343` |
 | `btc_claim_pubkey_xonly` | 64-hex | **yes** | 32 bytes. Maker's key on the claim leaf. **MUST be 32 zero bytes on an ETH swap.** | `:347-361` |
@@ -229,7 +246,21 @@ consumed by `from_dict` (`:397-415`). All hex is bare lowercase with no `0x` pre
 | `counter_chain` | `"btc"\|"eth"` | optional | **Default `"btc"`** when absent. | `:292-293, 411` |
 | `value_amount` | int | conditional | Counter-leg amount in the counter chain's own unit. **Omitted when it equals `btc_sats`**; **MUST be present and > 0 on an ETH swap** (wei — the sats sentinel deliberately does not cross the unit boundary). | `:296-314, 389` |
 | `eth_timeout_unix_s` | int | conditional | **Required on an ETH swap**, **forbidden on a BTC swap**. Absolute unix deadline; the contract immutable `timeout`. This is the *real* ETH counter-leg deadline. | `:315-322` |
-| `credential_ref` | hex | optional | Empty or **exactly 36 bytes**. Soulbound-credential gate the taker must satisfy. | `:344-346` |
+| `credential_ref` | hex | optional | Empty or **exactly 36 bytes**. **Off-chain** soulbound-credential gate, checked before funding by `pre_btc_lock_gate`. It does **not** enter the covenant bytecode and is **not** covered by the §4 SPK byte-compare. | `:344-346`; `swap_coordinator.py:1241-1266` |
+
+### `genesis_ref` — what is actually enforced, and where
+
+The row above states the producer rule. The checks a *consumer* can rely on are narrower, and the
+difference matters to anyone porting the validation:
+
+| Case | Checked by | Behaviour |
+|---|---|---|
+| `ft`/`nft` with an **empty** `genesis_ref` | `NegotiatedTerms.__post_init__` (`swap_state.py:339-341`) | `ValidationError` at construction. This is a **non-emptiness** check only — it does not look at the length. |
+| `ft`/`nft` with a **non-empty, non-36-byte** `genesis_ref` | `holder_hash` (`htlc_covenant.py:194-195`) | Constructs fine; raises `ValidationError` later, at covenant/holder-hash derivation. Fail-closed, but **deferred** — a conforming reader must not assume `len(genesis_ref) == 36` merely because `NegotiatedTerms` accepted the document. |
+| `rxd` with a **non-empty** `genesis_ref` | nothing | **Accepted and silently ignored.** The `rxd` branch of `holder_hash` (`htlc_covenant.py:192-193`) returns before the length check, and the RXD covenant template carries no ref. The field round-trips through `to_dict` unchanged, so two `rxd` documents differing only in `genesis_ref` describe the same swap and derive the same covenant SPK. |
+
+An implementation that wants the strict rule stated in the row must check it itself; pyrxd does not
+reject an `rxd` swap that carries one.
 
 ### Omission and default rules — normative
 

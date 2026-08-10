@@ -110,7 +110,7 @@ def _opcodes(script: bytes) -> list[int]:
     while pos < n:
         op = script[pos]
         ops.append(op)
-        if op in REF_OPCODES:  # 0xd0..0xd8: opcode + 36-byte ref operand
+        if op in REF_OPCODES:  # {d0,d1,d2,d3,d8}: opcode + 36-byte ref operand
             pos += 37
             continue
         if 0x01 <= op <= 0x4B:

@@ -1394,6 +1394,39 @@ class TestSecurityRejection:
         with pytest.raises(ValidationError, match="main.t.*too long"):
             decode_payload(evil)
 
+    def test_decode_payload_enforces_the_100kb_media_ceiling(self):
+        """The `main.b` cap applies on DECODE, not just on construction.
+
+        ``decode_payload`` builds a ``GlyphMedia`` (``payload.py:122``), so the
+        100,000-byte ceiling in ``GlyphMedia.__post_init__``
+        (``types.py:116-117``) fires even though the enclosing CBOR body is
+        comfortably under the 256 KiB limit. Pinned because
+        ``docs/reference/glyph-token-protocol-spec.md`` §4.4 previously asserted
+        the opposite — that pyrxd "decodes media it would refuse to construct".
+        """
+        import cbor2
+
+        from pyrxd.glyph.payload import decode_payload
+
+        oversize = cbor2.dumps({"p": [GlyphProtocol.NFT.value], "main": {"t": "image/png", "b": b"\x00" * 150_000}})
+        assert len(oversize) < 262_144  # well inside the body cap: the media cap is what fires
+        with pytest.raises(ValidationError, match="media too large"):
+            decode_payload(oversize)
+
+    @pytest.mark.parametrize(("size", "accepted"), [(100_000, True), (100_001, False)])
+    def test_decode_payload_media_ceiling_boundary(self, size: int, accepted: bool):
+        import cbor2
+
+        from pyrxd.glyph.payload import decode_payload
+
+        body = cbor2.dumps({"p": [GlyphProtocol.NFT.value], "main": {"t": "image/png", "b": b"\x00" * size}})
+        if accepted:
+            meta = decode_payload(body)
+            assert meta.main is not None and len(meta.main.data) == size
+        else:
+            with pytest.raises(ValidationError, match="media too large"):
+                decode_payload(body)
+
     def test_commit_script_wrong_hash_len_raises(self):
         with pytest.raises(ValidationError, match="32 bytes"):
             build_commit_locking_script(bytes(31), KNOWN_HEX20)
@@ -1494,3 +1527,228 @@ class TestInputRefWalker:
     def test_iter_yields_opcode_and_operand(self):
         spk = b"\xd0" + self._REF
         assert list(iter_input_refs(spk)) == [(0xD0, self._REF)]
+
+
+# ---------------------------------------------------------------------------
+# Differential: pyrxd's ref walker vs a port of Radiant consensus
+# ---------------------------------------------------------------------------
+#
+# Ported from Radiant Core (github.com/Radiant-Core/Radiant-Core, src/script/):
+#
+# * ``GetScriptOp`` (script.cpp:662-731) is the byte-level opcode stepper. It
+#   consumes a 36-byte operand for EXACTLY five opcodes (:710-716):
+#   OP_PUSHINPUTREF 0xd0, OP_REQUIREINPUTREF 0xd1, OP_DISALLOWPUSHINPUTREF 0xd2,
+#   OP_DISALLOWPUSHINPUTREFSIBLING 0xd3, OP_PUSHINPUTREFSINGLETON 0xd8.
+# * ``CScript::GetPushRefs`` (script.cpp:586-590) collects refs for the same
+#   five opcodes.
+# * 0xd4-0xd7 are OP_REFHASHDATASUMMARY_UTXO / OP_REFHASHVALUESUM_UTXOS /
+#   OP_REFHASHDATASUMMARY_OUTPUT / OP_REFHASHVALUESUM_OUTPUTS (script.h:281-284)
+#   — stack operations with NO operand, even though they sit inside the
+#   0xd0..0xd8 byte range.
+
+_CONSENSUS_REF_OPERAND_OPCODES = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
+
+
+class _ConsensusWalkFailed(Exception):
+    """``GetScriptOp`` returned false — ``GetPushRefs`` rejects the script."""
+
+
+def _consensus_get_script_op(script: bytes, pc: int):
+    """Port of Radiant Core ``GetScriptOp``; returns ``(opcode, operand, new_pc)``.
+
+    Raises :class:`_ConsensusWalkFailed` where the C++ returns ``false``.
+    """
+    n = len(script)
+    if pc >= n:
+        raise _ConsensusWalkFailed("pc >= end")
+    opcode = script[pc]
+    pc += 1
+    operand = b""
+    if opcode <= 0x4E:  # <= OP_PUSHDATA4
+        if opcode < 0x4C:  # < OP_PUSHDATA1
+            size = opcode
+        elif opcode == 0x4C:
+            if n - pc < 1:
+                raise _ConsensusWalkFailed("PUSHDATA1 size truncated")
+            size = script[pc]
+            pc += 1
+        elif opcode == 0x4D:
+            if n - pc < 2:
+                raise _ConsensusWalkFailed("PUSHDATA2 size truncated")
+            size = int.from_bytes(script[pc : pc + 2], "little")
+            pc += 2
+        else:
+            if n - pc < 4:
+                raise _ConsensusWalkFailed("PUSHDATA4 size truncated")
+            size = int.from_bytes(script[pc : pc + 4], "little")
+            pc += 4
+        if n - pc < size:
+            raise _ConsensusWalkFailed("push payload truncated")
+        operand = script[pc : pc + size]
+        pc += size
+    elif opcode in _CONSENSUS_REF_OPERAND_OPCODES:
+        if n - pc < 36:
+            raise _ConsensusWalkFailed("ref operand truncated")
+        operand = script[pc : pc + 36]
+        pc += 36
+    # Every other opcode (including 0xd4-0xd7) takes no operand.
+    return opcode, operand, pc
+
+
+def _consensus_refs(script: bytes) -> list[tuple[int, bytes]]:
+    """The ``(opcode, ref)`` list Radiant consensus's ``GetPushRefs`` sees."""
+    out: list[tuple[int, bytes]] = []
+    pc = 0
+    while pc < len(script):
+        opcode, operand, pc = _consensus_get_script_op(script, pc)
+        if opcode in _CONSENSUS_REF_OPERAND_OPCODES:
+            out.append((opcode, operand))
+    return out
+
+
+def _assert_matches_consensus(script: bytes) -> None:
+    """pyrxd's walker must agree with the consensus port, failure included."""
+    try:
+        expected = _consensus_refs(script)
+    except _ConsensusWalkFailed:
+        with pytest.raises(TruncatedScriptError):
+            list(iter_input_refs(script))
+        return
+    assert list(iter_input_refs(script)) == expected, (
+        f"ref walk diverged from Radiant consensus for script {script.hex()}"
+    )
+
+
+class TestRefWalkerConsensusDifferential:
+    """The ref walker must consume a 36-byte operand for exactly ``{d0,d1,d2,d3,d8}``.
+
+    A walker that also swallows 36 bytes after 0xd4-0xd7 (the REFHASH* stack
+    opcodes) desynchronizes from consensus: depending on the byte that lands
+    where the walk resumes, it either raises ``TruncatedScriptError``
+    (fail-closed, merely wrong) or silently resynchronizes and reports a
+    PHANTOM ref while dropping the real one — and ``count_input_refs`` /
+    ``is_token_bearing_script`` classify arbitrary chain scripts, so a
+    token-bearing UTXO that reads as plain funding can be spent as a fee input
+    and the token burned.
+    """
+
+    # A realistic ref: 32-byte reversed txid ‖ vout LE32. vout 0 puts 0x00 in
+    # ref[35], and OP_0 takes no operand — which is exactly what lets a
+    # d4-desynchronized walk resynchronize SILENTLY instead of raising.
+    _REF = bytes.fromhex("be93e76a51cf480e112233445566778899aabbccddeeff001122334455667788") + bytes(4)
+    _P2PKH = b"\x76\xa9\x14" + bytes(20) + b"\x88\xac"
+
+    def test_ref_opcode_set_is_exactly_the_consensus_five(self):
+        from pyrxd.glyph.script import REF_OPCODES
+
+        assert REF_OPCODES == _CONSENSUS_REF_OPERAND_OPCODES, (
+            "REF_OPCODES must list only the opcodes Radiant's GetScriptOp follows "
+            "with a 36-byte operand (script.cpp:710-716); 0xd4-0xd7 are operand-less "
+            "REFHASH* stack opcodes (script.h:281-284)"
+        )
+
+    def test_refhash_opcode_before_a_real_ref_does_not_create_a_phantom(self):
+        """The demonstrated silent-corruption layout: ``d4 d0 <ref> <p2pkh>``."""
+        assert len(self._REF) == 36
+        assert self._REF[35] == 0x00  # the byte that lets a bad walk resynchronize
+        script = b"\xd4" + b"\xd0" + self._REF + self._P2PKH
+
+        # Consensus: OP_REFHASHDATASUMMARY_UTXO (no operand), then one push-ref.
+        assert _consensus_refs(script) == [(0xD0, self._REF)]
+
+        refs = count_input_refs(script)
+        assert refs == {self._REF: 1}, f"phantom/missing ref: {[k.hex() for k in refs]}"
+        _assert_matches_consensus(script)
+
+    @pytest.mark.parametrize("op", [0xD4, 0xD5, 0xD6, 0xD7])
+    def test_refhash_opcodes_carry_no_operand(self, op: int):
+        """Standalone d4-d7 must be a 1-byte opcode, not a 37-byte swallow.
+
+        Before the fix this layout raised ``TruncatedScriptError`` — fail-closed,
+        but still a divergence: consensus accepts the script and reports no refs.
+        """
+        script = bytes([op]) + self._P2PKH
+        assert _consensus_refs(script) == []
+        assert count_input_refs(script) == {}
+        _assert_matches_consensus(script)
+
+    @pytest.mark.parametrize("op", [0xD0, 0xD1, 0xD2, 0xD3, 0xD8])
+    def test_operand_carrying_opcodes_still_consume_36_bytes(self, op: int):
+        script = bytes([op]) + self._REF + self._P2PKH
+        assert list(iter_input_refs(script)) == [(op, self._REF)]
+        _assert_matches_consensus(script)
+
+    @pytest.mark.parametrize("op", [0xD0, 0xD1, 0xD2, 0xD3, 0xD8])
+    def test_truncated_operand_is_fail_closed_for_both(self, op: int):
+        script = bytes([op]) + self._REF[:35]
+        with pytest.raises(_ConsensusWalkFailed):
+            _consensus_refs(script)
+        _assert_matches_consensus(script)
+
+    @pytest.mark.parametrize("op", list(range(0xD0, 0xD9)))
+    def test_every_ref_range_opcode_in_varied_positions(self, op: int):
+        """Each 0xd0-0xd8 byte at the head, in the middle, at the tail, and
+        inside push-data — the walk must track consensus in every position."""
+        b = bytes([op])
+        layouts = [
+            b + self._REF + self._P2PKH,
+            self._P2PKH + b + self._REF,
+            b"\xd0" + self._REF + b + self._REF + self._P2PKH,
+            b"\xd8" + self._REF + b + self._P2PKH + self._REF,
+            b"\x51" + b + self._REF + b"\x75" + self._P2PKH,
+            b"\x4c\x25" + b + self._REF + self._P2PKH,  # PUSHDATA1 37 bytes: op is DATA
+            b"\x25" + b + self._REF + self._P2PKH,  # direct 37-byte push: op is DATA
+            self._P2PKH + b,  # trailing, nothing after it
+        ]
+        for script in layouts:
+            _assert_matches_consensus(script)
+
+    def test_pushed_ref_operand_is_never_walked_as_opcode(self):
+        """A 37-byte push of ``d0||ref`` is DATA — consensus sees zero refs.
+
+        This is the dMint state-script shape: the ref declaration is carried as
+        push-data and only re-executed after the covenant concatenates it.
+        """
+        script = b"\x25" + b"\xd0" + self._REF + self._P2PKH
+        assert _consensus_refs(script) == []
+        assert count_input_refs(script) == {}
+
+    def test_randomized_differential_over_ref_dense_scripts(self):
+        """Seeded sweep over scripts built from a ref-opcode-dense alphabet.
+
+        Random bytes almost never produce an interesting layout; this alphabet
+        makes ref opcodes, REFHASH opcodes, pushes and ref-shaped payloads
+        collide constantly, which is where the desynchronization shows up.
+        """
+        import random
+
+        rng = random.Random(20260807)
+        alphabet = [
+            b"\xd0",
+            b"\xd1",
+            b"\xd2",
+            b"\xd3",
+            b"\xd4",
+            b"\xd5",
+            b"\xd6",
+            b"\xd7",
+            b"\xd8",
+            b"\x00",
+            b"\x51",
+            b"\x75",
+            b"\x87",
+            b"\xbd",
+            b"\x4c",
+            b"\x4d",
+            b"\x76\xa9\x14",
+            self._REF,
+            self._P2PKH,
+            bytes(20),
+            bytes([0xD0, 0xD4, 0xD8] * 4),
+        ]
+        checked = 0
+        for _ in range(3000):
+            script = b"".join(rng.choice(alphabet) for _ in range(rng.randint(1, 12)))
+            _assert_matches_consensus(script)
+            checked += 1
+        assert checked == 3000
