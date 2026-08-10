@@ -28,7 +28,7 @@ from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import KeyMaterialError, ValidationError
 
 # --------------------------------------------------------------------------- fixtures / builders
 
@@ -406,6 +406,28 @@ def test_covenant_pkhs_from_wifs_never_leak_the_wif(tmp_path: Path) -> None:
     assert taker == bytes(PrivateKey(doc["taker_rxd_wif"]).public_key().hash160())
 
 
+def test_a_malformed_wif_in_the_recovery_file_is_never_echoed(tmp_path: Path) -> None:
+    """The sink the audit reproduced: ``covenant_pkhs`` -> ``_pkh_from_wif`` ->
+    ``PrivateKey(wif)`` -> ``base58``, whose ``ValueError`` escaped ``_run`` (which
+    catches only ``NetworkError``/``OSError``) to the CLI boundary's
+    ``cause: {exc}``. One out-of-alphabet character — a line wrap, a stray space,
+    an ``O``/``I``/``l`` typo — published 51 of a 52-character key."""
+    good = PrivateKey().wif()
+    typo = good[:20] + "0" + good[21:]  # '0' is not in the base58 alphabet
+    f = _keys_file(tmp_path, taker_rxd_wif=typo)
+
+    with pytest.raises(KeyMaterialError) as exc:
+        sr.covenant_pkhs(f)
+
+    node: BaseException | None = exc.value
+    while node is not None:
+        rendered = f"{node}{node.args!r}"
+        for start in range(len(good) - 8):
+            assert good[start : start + 8] not in rendered
+            assert typo[start : start + 8] not in rendered
+        node = node.__cause__ or node.__context__
+
+
 def test_covenant_pkhs_accept_explicit_overrides(tmp_path: Path) -> None:
     f = _keys_file(tmp_path)
     taker, maker = sr.covenant_pkhs(f, taker_pkh_hex="ab" * 20, maker_pkh_hex="cd" * 20)
@@ -530,8 +552,13 @@ def test_explicit_fee_utxo_must_actually_be_unspent() -> None:
 
 
 def test_explicit_fee_utxo_is_honoured_even_when_it_is_not_the_default_pick() -> None:
+    # Realistic floor/target: the overpay ceiling (audit B4) is a MULTIPLE of the requirement,
+    # so the degenerate floor=target=1 this used to pass would make any real UTXO an "overpay".
     chosen = sr.select_fee_utxo(
-        [_utxo(3_000_000, "aa"), _utxo(9_000_000, "bb")], floor=1, target=1, explicit="bb" * 32 + ":0"
+        [_utxo(3_000_000, "aa"), _utxo(9_000_000, "bb")],
+        floor=1_000_000,
+        target=2_660_000,
+        explicit="bb" * 32 + ":0",
     )
     assert chosen.value == 9_000_000
 
@@ -982,3 +1009,106 @@ async def test_read_counter_leg_dispatches_to_the_configured_chain(monkeypatch) 
         _Facts("eth"), sr.RecoveryExtras(eth_contract_address=CONTRACT), eth_rpc_url="http://x"
     )
     assert got.chain == "eth" and eth_reader.await_count == 1
+
+
+# ------------------- audit B4: an unbounded fee overpay burns the whole input ------------------
+
+
+def test_fee_selection_refuses_a_mistakenly_huge_utxo() -> None:
+    """The covenant permits ONE output, so the whole fee input IS the miner fee.
+
+    An ordinary funded key holding a single 500 RXD UTXO was selected without a ceiling and
+    burned 50,000,000,000 photons against a ~2,660,000 target — 18,727x — while the CLI
+    printed that it "clears the deadline-aware TARGET". Refuse, and say what to do instead.
+    """
+    with pytest.raises(ValidationError, match="OVERPAY"):
+        sr.select_fee_utxo([_utxo(50_000_000_000)], floor=1_000_000, target=2_660_000, explicit=None)
+
+
+def test_fee_selection_prefers_an_in_band_input_over_a_huge_one() -> None:
+    chosen = sr.select_fee_utxo(
+        [_utxo(50_000_000_000, "aa"), _utxo(4_000_000, "bb")],
+        floor=1_000_000,
+        target=2_660_000,
+        explicit=None,
+    )
+    assert chosen.value == 4_000_000
+
+
+def test_fee_selection_allows_the_overpay_when_the_operator_asks_for_it() -> None:
+    chosen = sr.select_fee_utxo(
+        [_utxo(50_000_000_000)], floor=1_000_000, target=2_660_000, explicit=None, allow_overpay=True
+    )
+    assert chosen.value == 50_000_000_000
+
+
+def test_explicit_fee_utxo_is_also_ceilinged() -> None:
+    """Naming a UTXO by hand is not consent to burn 500 RXD on a 0.0266 RXD fee."""
+    with pytest.raises(ValidationError, match="OVERPAY"):
+        sr.select_fee_utxo([_utxo(50_000_000_000, "aa")], floor=1_000_000, target=2_660_000, explicit="aa" * 32 + ":0")
+    chosen = sr.select_fee_utxo(
+        [_utxo(50_000_000_000, "aa")],
+        floor=1_000_000,
+        target=2_660_000,
+        explicit="aa" * 32 + ":0",
+        allow_overpay=True,
+    )
+    assert chosen.value == 50_000_000_000
+
+
+def test_fee_selection_ceiling_is_relative_to_the_target_not_absolute() -> None:
+    """A large fee is fine when the requirement is large — the guard is a MULTIPLE."""
+    big_target = 5_000_000_000
+    chosen = sr.select_fee_utxo([_utxo(6_000_000_000)], floor=1_000_000, target=big_target, explicit=None)
+    assert chosen.value == 6_000_000_000
+
+
+def test_cold_spend_reports_the_overpay_multiple(swap_setup) -> None:
+    """The verdict an operator reads must name the overpay, not only the target."""
+    cov, _t, _m, fee_key = swap_setup
+    spend = sr.build_cold_claim(
+        covenant=cov, chain=_chain(5), preimage=P, fee_wif=fee_key.wif(), fee_utxo=_utxo(50_000_000_000)
+    )
+    assert spend.is_overpay is True
+    assert spend.overpay_multiple > 1000
+    assert spend.to_dict()["is_overpay"] is True
+    modest = sr.build_cold_claim(
+        covenant=cov, chain=_chain(5), preimage=P, fee_wif=fee_key.wif(), fee_utxo=_utxo(4_000_000)
+    )
+    assert modest.is_overpay is False
+
+
+# ------------------- audit B5: build-claim must not build against a 0-conf covenant ------------
+
+
+def test_cold_claim_refuses_an_unconfirmed_covenant(swap_setup) -> None:
+    """ElectrumX ``listunspent`` returns MEMPOOL utxos, so ``read_covenant_chain_state`` can
+    report a 0-conf covenant. If that parent is conflicted out the claim dies and its fee
+    input squats for the 8h mempool expiry — inside the ``t_rxd`` window. The automated leg
+    already enforces this (``radiant_leg._resolve_covenant``); the cold path did not.
+    """
+    cov, _t, _m, fee_key = swap_setup
+    with pytest.raises(ValidationError, match="unconfirmed|0 confirmations"):
+        sr.build_cold_claim(covenant=cov, chain=_chain(0), preimage=P, fee_wif=fee_key.wif(), fee_utxo=_utxo(4_000_000))
+
+
+def test_cold_claim_can_be_built_against_an_unconfirmed_covenant_when_forced(swap_setup) -> None:
+    cov, _t, _m, fee_key = swap_setup
+    spend = sr.build_cold_claim(
+        covenant=cov,
+        chain=_chain(0),
+        preimage=P,
+        fee_wif=fee_key.wif(),
+        fee_utxo=_utxo(4_000_000),
+        allow_unconfirmed=True,
+    )
+    assert spend.csv_confirmations == 0
+
+
+def test_cold_refund_refuses_an_unconfirmed_covenant_even_with_allow_immature(swap_setup) -> None:
+    """``--allow-immature`` is about the CSV, not about the parent's existence on-chain."""
+    cov, _t, _m, fee_key = swap_setup
+    with pytest.raises(ValidationError, match="unconfirmed|0 confirmations"):
+        sr.build_cold_refund(
+            covenant=cov, chain=_chain(0), fee_wif=fee_key.wif(), fee_utxo=_utxo(4_000_000), allow_immature=True
+        )

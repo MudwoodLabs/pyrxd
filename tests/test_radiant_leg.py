@@ -908,3 +908,92 @@ async def test_the_gate_measures_the_transaction_it_is_about_to_send():
     await leg.claim_asset(rec, _P)
     sent = client.broadcast_raw[0]
     assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.min_relay_fee(len(sent)) <= 10_000_000
+
+
+# ------- audit B3: a REFUSED build must not charge the fee pool's cap ------------------------
+
+
+def _capped_pool(*values: int):
+    """A real :class:`CappedFeeWalletSource` over a freshly generated pool key.
+
+    One key owns every pool UTXO (that is what a pool wallet is), so only the outpoints
+    differ. The key is generated, never hand-written.
+    """
+    from pyrxd.gravity.capped_fee_source import CappedFeeWalletSource
+
+    key = PrivateKey(os.urandom(32))
+    spk = b"\x76\xa9\x14" + bytes(Hex20(key.public_key().hash160())) + b"\x88\xac"
+    pool = [FeeInput(txid=os.urandom(32).hex(), vout=0, value=v, scriptpubkey=spk, wif=key.wif()) for v in values]
+    return CappedFeeWalletSource(pool, total_cap_photons=20_000_000)
+
+
+async def test_a_refused_claim_does_not_charge_the_fee_cap():
+    """The leg dispenses BEFORE it builds, and the build refuses below the relay floor.
+
+    Nothing is broadcast and no fee is paid, so the operator's cumulative cap must be
+    untouched. Before the fix the refused input stayed charged: seven such refusals burned
+    3,500,000 of a 20,000,000 cap and the covering 20,000,000 input became unreachable.
+    """
+    terms = _rxd_terms(amount=100_000)
+    client = FakeClient(utxo_value=100_000, confirmations=3)
+    src = _capped_pool(500_000, 20_000_000)  # 500,000 is below the ~2.67M floor for a claim
+    leg = _leg(client=client, fee_source=src)
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+
+    with pytest.raises(InsufficientFundsError):
+        await leg.claim_asset(rec, _P)
+
+    assert client.broadcast_raw == [], "nothing went on-chain, so nothing may be charged"
+    assert src.dispensed_photons == 0, "a refused build must not consume the cap"
+    assert src.remaining_inputs == 1, "dispense-once still holds: the refused input is retired"
+
+
+async def test_seven_refused_ticks_do_not_strand_the_covering_input_end_to_end():
+    """The audit's measured drain, driven through the real leg.
+
+    Pool = 7 x 500,000 + 1 x 20,000,000, cap = 20,000,000, exactly as measured. Seven
+    refusals then a claim: pre-fix the eighth call raised ``FeePoolExhaustedError`` and the
+    asset was left to the counterparty's CSV refund with a funded pool still sitting there.
+    """
+    terms = _rxd_terms(amount=100_000)
+    client = FakeClient(utxo_value=100_000, confirmations=3)
+    src = _capped_pool(*([500_000] * 7), 20_000_000)
+    leg = _leg(client=client, fee_source=src)
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+
+    for _ in range(7):
+        with pytest.raises(InsufficientFundsError):
+            await leg.claim_asset(rec, _P)
+    assert client.broadcast_raw == []
+
+    txid = await leg.claim_asset(rec, _P)  # the covering input is still reachable
+    assert txid == "ab" * 32
+    assert len(client.broadcast_raw) == 1
+    assert src.dispensed_photons == 20_000_000  # only the input actually spent is charged
+
+
+async def test_a_refused_refund_does_not_charge_the_fee_cap():
+    """Same guarantee on the refund path (the maker's CSV escape hatch)."""
+    terms = _rxd_terms(amount=100_000)  # csv=6
+    client = FakeClient(utxo_value=100_000, confirmations=6)  # mature
+    src = _capped_pool(500_000, 20_000_000)
+    leg = _leg(client=client, fee_source=src)
+    rec = SwapRecord(state=SwapState.MAKER_STALLS, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+
+    with pytest.raises(InsufficientFundsError):
+        await leg.refund_asset(rec)
+
+    assert client.broadcast_raw == []
+    assert src.dispensed_photons == 0
+
+
+async def test_a_fee_source_without_release_unspent_still_works():
+    """The release is duck-typed and OPTIONAL: a plain FeeUtxoSource must keep working."""
+    terms = _rxd_terms(amount=100_000)
+    client = FakeClient(utxo_value=100_000, confirmations=3)
+    src = SizedFeeSource(1_000_000)  # no release_unspent
+    leg = _leg(client=client, fee_source=src)
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    with pytest.raises(InsufficientFundsError):
+        await leg.claim_asset(rec, _P)
+    assert client.broadcast_raw == []

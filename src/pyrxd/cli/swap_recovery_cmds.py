@@ -394,6 +394,7 @@ async def _prepare(
     fee_utxo: str | None,
     policy: DeadlineFeePolicy,
     kind: str,
+    allow_overpay: bool = False,
 ) -> tuple[Any, Any, Any]:
     """Read the covenant + fee UTXOs, rebuild the covenant, and pick a fee input.
 
@@ -434,7 +435,7 @@ async def _prepare(
     # large input and burn the difference as fee.
     blocks_left = max(0, facts.t_rxd_blocks - chain.confirmations) if kind == "claim" else None
     target = policy.required_fee(size_estimate, blocks_to_deadline=blocks_left)
-    chosen = select_fee_utxo(utxos, floor=floor, target=target, explicit=fee_utxo)
+    chosen = select_fee_utxo(utxos, floor=floor, target=target, explicit=fee_utxo, allow_overpay=allow_overpay)
     return covenant, chain, chosen
 
 
@@ -455,6 +456,11 @@ def _spend_lines(spend: ColdSpend, *, tip_height: int) -> list[str]:
             else "BELOW THE RELAY FLOOR"
         )
     )
+    # An overpay CLEARS the target, so the old verdict read as reassuring while the operator
+    # burned three orders of magnitude more than the requirement (audit B4). Name it here, in
+    # the same line an operator reads to decide whether to send this.
+    if spend.is_overpay:
+        fee_state = f"OVERPAY — {spend.overpay_multiple:.0f}x the requirement; the WHOLE input is burned as fee"
     # The SAME number means opposite things on the two branches, and conflating them is a
     # way to get an operator killed: on the REFUND the covenant's CSV is a GATE (a node
     # rejects a non-final spend), while on the CLAIM the claim branch has no timelock at
@@ -513,6 +519,12 @@ def _spend_lines(spend: ColdSpend, *, tip_height: int) -> list[str]:
             "  ⚠ THE MAKER'S REFUND WINDOW IS ALREADY OPEN — this claim is RACING their refund. "
             "It is still valid and worth sending, but send it now and expect to lose the race."
         )
+    if spend.is_overpay:
+        lines.append(
+            f"  ⚠ OVERPAY: this spend pays {spend.fee_photons} photons for a ~{spend.target_photons}-photon "
+            f"requirement ({spend.overpay_multiple:.0f}x). The covenant permits ONE output, so there is no "
+            "change — the difference is GONE to the miner. Carve a smaller fee UTXO unless this is deliberate."
+        )
     if not spend.clears_floor:  # pragma: no cover - see below
         # Unreachable today: the builders themselves refuse below the relay floor
         # (`_assert_fee_clears_relay_floor`), so a spend that got this far has cleared it.
@@ -563,6 +575,20 @@ def _cold_options(f: Any) -> Any:
                 default=False,
                 help="Permit a relay rate under the chain floor (regtest / a chain you control).",
             ),
+            click.option(
+                "--allow-overpay",
+                is_flag=True,
+                default=False,
+                help="Burn a fee UTXO far larger than the requirement. The covenant permits ONE "
+                "output, so the WHOLE input is the miner fee — without this the build refuses.",
+            ),
+            click.option(
+                "--allow-unconfirmed",
+                is_flag=True,
+                default=False,
+                help="Build against a 0-conf (mempool-only) covenant. The spend is only as good "
+                "as its parent, and Radiant has no RBF/CPFP to repair it.",
+            ),
         ]
     ):
         f = opt(f)
@@ -585,6 +611,8 @@ def swap_build_claim_cmd(
     maker_pkh: str | None,
     relay_fee_rxd_per_kb: float | None,
     allow_below_protocol_floor: bool,
+    allow_overpay: bool,
+    allow_unconfirmed: bool,
     preimage: str,
 ) -> None:
     """Build the TAKER's claim spend and PRINT its hex. READ-ONLY — never broadcasts.
@@ -622,9 +650,18 @@ def swap_build_claim_cmd(
                 fee_utxo=fee_utxo,
                 policy=policy,
                 kind="claim",
+                allow_overpay=allow_overpay,
             )
         )
-        spend = build_cold_claim(covenant=covenant, chain=chain, preimage=p, fee_wif=wif, fee_utxo=utxo, policy=policy)
+        spend = build_cold_claim(
+            covenant=covenant,
+            chain=chain,
+            preimage=p,
+            fee_wif=wif,
+            fee_utxo=utxo,
+            policy=policy,
+            allow_unconfirmed=allow_unconfirmed,
+        )
     except ValidationError as exc:
         raise UserError(
             "could not build the claim spend",
@@ -655,6 +692,8 @@ def swap_build_refund_cmd(
     maker_pkh: str | None,
     relay_fee_rxd_per_kb: float | None,
     allow_below_protocol_floor: bool,
+    allow_overpay: bool,
+    allow_unconfirmed: bool,
     allow_immature: bool,
 ) -> None:
     """Build the MAKER's CSV refund spend and PRINT its hex. READ-ONLY — never broadcasts.
@@ -685,6 +724,7 @@ def swap_build_refund_cmd(
                 fee_utxo=fee_utxo,
                 policy=policy,
                 kind="refund",
+                allow_overpay=allow_overpay,
             )
         )
         spend = build_cold_refund(
@@ -694,6 +734,7 @@ def swap_build_refund_cmd(
             fee_utxo=utxo,
             policy=policy,
             allow_immature=allow_immature,
+            allow_unconfirmed=allow_unconfirmed,
         )
     except ValidationError as exc:
         raise UserError(

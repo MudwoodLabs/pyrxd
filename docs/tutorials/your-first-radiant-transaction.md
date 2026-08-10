@@ -299,9 +299,12 @@ need to know:
   `pyrxd.wallet.DEFAULT_FEE_RATE` (`10_000` photons/byte) — you
   can override with `fee_rate=` if you know what you are doing.
   Note the unit: this Python `fee_rate` is **photons per byte**,
-  whereas the `pyrxd wallet send --fee-rate` CLI flag is
-  **photons per kB** — don't conflate the two when copying a
-  number between them.
+  and so is the `pyrxd wallet send --fee-rate` CLI flag — the same
+  number means the same thing in both. (Earlier docs and the flag's
+  own help text said "per kB". That was wrong: the code has always
+  computed `fee = size_in_bytes * fee_rate`.) Both are floor-checked
+  against Radiant's effective relay minimum; a lower value is
+  refused rather than built into a transaction no node will relay.
 
 `build_send_tx` does the fee calculation as a two-pass build —
 it signs a trial transaction to measure its size, then

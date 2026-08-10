@@ -398,6 +398,55 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A refused (never-broadcast) covenant spend no longer charges the fee pool's cap**
+  (`CappedFeeWalletSource.release_unspent`, `RadiantCovenantLeg._unspent_on_failure`). The fee input
+  has to be dispensed *before* the transaction can be built — its value and script are inputs to the
+  build — and the build refuses when that input cannot clear the node's deadline-aware relay floor.
+  Nothing reached a node and no fee was paid, but the source had already committed the input and
+  charged the cumulative cap. `watch/claim_executor.py` deliberately retries a `DECLINED` fee
+  refusal on the next tick (correctly: the source is dispense-once, so the next dispense may be
+  larger), so the refusals compounded. Measured on the pool shape an operator would actually
+  configure — 7 × 500,000 + 1 × 20,000,000 photons, cap 20,000,000, floor ~2,670,000 for a 267-byte
+  claim:
+
+  ```
+  FeePoolExhaustedError: capped fee cap reached: dispensing 20000000 photons would exceed
+  total_cap_photons=20000000 (already dispensed 3500000). Fail-closed.
+  ```
+
+  Seven ticks broadcast nothing and burned 3,500,000 of the cap; the eighth could no longer reach
+  the one input large enough to work. The covering UTXO was funded, unspent, and unreachable, and
+  the asset ran out its deadline to the counterparty's CSV refund.
+
+  The fix credits the cap back on any pre-broadcast failure, **without** rewinding the dispense-once
+  cursor: no input can ever back two transactions, and a small head-of-line input cannot re-refuse
+  forever while a covering input sits behind it. The broadcast itself is outside the guarded block —
+  once bytes reach a node the input may well be spent, and crediting it then would under-count real
+  spend against the cap. The report is duck-typed and optional, so a plain `FeeUtxoSource` keeps
+  working. `docs/threat-model.md` **S21** claimed the executor "does not retry into a fee-pool
+  drain"; that claim was wrong and has been corrected in place.
+- **The cold recovery toolkit refuses an unbounded fee overpay** (`swap_recovery.select_fee_utxo`,
+  `pyrxd swap build-claim` / `build-refund`). The covenant permits exactly one output, so there is no
+  change and the **entire** fee input is paid to the miner. The selector picked the smallest UTXO at
+  or above the target with no upper bound, so pointing the toolkit at an ordinary funded key holding
+  a single 500 RXD UTXO burned **50,000,000,000 photons against a 2,660,000-photon target — 18,727×**
+  — while the CLI printed that the fee "clears the deadline-aware TARGET". (`htlc_spend._check_carrier`
+  claims to guard "a mistakenly-huge UTXO" but only ever checked the dust end.)
+
+  A fee input above `10 ×` the requirement is now refused with an `OVERPAY` message naming the
+  multiple and the ceiling; `--allow-overpay` burns it deliberately, and an explicitly named
+  `--fee-utxo` is held to the same bar (naming a UTXO by hand is not consent to burn 500 RXD on a
+  0.0266 RXD fee). The ceiling is a **multiple**, so a genuinely large requirement scales with it.
+  `ColdSpend` gained `overpay_multiple` / `is_overpay`, and the human output now prints an OVERPAY
+  verdict instead of a reassuring one.
+- **`pyrxd swap build-claim` no longer builds against a 0-conf covenant.** ElectrumX `listunspent`
+  returns mempool outputs, so `read_covenant_chain_state` resolved an unconfirmed covenant and the
+  cold builders exited 0 against it. A spend of an unconfirmed parent dies with that parent, and
+  with neither RBF nor CPFP its fee input then squats until the 8-hour mempool expiry — inside the
+  `t_rxd` window the claim exists to beat. The automated path already enforced this
+  (`radiant_leg._resolve_covenant`); the cold path now matches, with `--allow-unconfirmed` as the
+  explicit override. `build-refund` is gated too: `--allow-immature` is about the CSV, not about the
+  parent's existence on chain.
 - **The external-miner stderr reader could grow without bound on a miner that never writes a
   newline.** `_ExternalMinerProgressReader` caps one physical line at `_PROGRESS_LINE_MAX_BYTES`
   (4 KiB) and its docstring promises that bound holds "however long the miner writes". The check
@@ -612,6 +661,63 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **The taker-side "did the maker actually lock the asset?" check now exists in the library**
+  (`SwapCoordinator.taker_verify_asset_funding`, `RadiantCovenantLeg.verify_maker_asset_funded`).
+  This closes hazard **HZ-1** of `docs/htlc-handshake-wire-format.md` — the mirror of HZ-3 above,
+  and the cheaper attack, because the loss is the **whole** counter leg rather than a shortfall —
+  and is recorded as threat-model **S24**.
+
+  HZ-1 already stated the rule normatively: *"a taker MUST NOT fund the counter leg until it has
+  confirmed the maker's asset lock on chain, at the agreed scriptPubKey, for the agreed value, at a
+  depth the taker chose."* No library code enforced it. The check lived only in
+  `scripts/btc_swap_two_host.py` and `scripts/eth_swap_two_host.py`, so any caller driving
+  `SwapCoordinator` directly locked BTC (or ETH) against nothing. Driving the real coordinator
+  against a chain where the covenant was never funded, on the pre-fix code:
+
+  ```
+  gate.ok=True | state=btc_locked | btc broadcasts=1 | radiant leg calls=[]
+  ```
+
+  `pre_btc_lock_check` returned `ok=True` and `taker_funds_btc` reached `BTC_LOCKED` having invoked
+  **zero** methods on the Radiant leg — the library never read the Radiant chain. The maker holds
+  both `p` and the BTC claim key from the moment it publishes the envelope, and the BTC claim leaf
+  is `<H> OP_SHA256 OP_EQUALVERIFY <makerClaimPk> OP_CHECKSIG` with **no precondition that the asset
+  was ever locked**, so a maker that locks nothing sweeps the taker's HTLC as soon as it appears.
+  The taker's own refund does not open until `t_btc`. Loss: the full `btc_sats`.
+
+  What the library now enforces, all fail-closed:
+
+  - the covenant **scriptPubKey re-derived from the taker's own `terms`** (amount, `H`, the `t_rxd`
+    CSV, both dest hashes, the asset REF) — never one the maker advertises — and a funded UTXO
+    located at exactly that script;
+  - the **on-chain value against `terms.radiant_amount` exactly**; an ambiguous UTXO set at that
+    script refuses rather than picking one;
+  - a **confirmation depth**. "Funded" alone is not enough: ElectrumX `listunspent` includes
+    mempool outputs, so a maker can fund with a replaceable transaction, wait for the taker's lock,
+    then double-spend the funding away — it still claims the counter leg with `p`, and the vanished
+    covenant leaves the taker nothing to claim;
+  - and the gate is **non-skippable**: it is step 5 of `pre_btc_lock_check`, and `taker_funds_btc`
+    **re-runs** it immediately before the counter-leg broadcast, which is what closes the
+    verify→lock TOCTOU. The re-run sits *before* the `SeenStore` reserve so the reserve keeps its
+    "last step before the only broadcast" property and a refusal does not burn `H`.
+
+  The depth pin reuses the existing policy knob: a real-value (`MarginPolicy.is_measured`) swap
+  requires `rxd_claim_burial` confirmations on the covenant funding — the same depth the
+  claim-finality gate requires of the taker's own Radiant claim — while an estimated/test policy
+  defers to the leg's `min_confirmations` (the operator's `--taker-min-rxd-confs`). Same
+  `is_measured` discipline as the ETH `finalized` pin and the maker-side BTC depth above.
+
+  Both operator scripts now call the library version instead of carrying their own copy, so there is
+  one implementation and no drift.
+
+  **Breaking for direct `SwapCoordinator` callers, and for the `-m integration` suites.** A
+  `radiant_leg` that does not implement `verify_maker_asset_funded` now fails the pre-lock gate
+  closed (a leg that cannot be verified cannot be verified at all), and the maker's covenant must be
+  funded and buried **before** `taker_funds_btc` is called. The six `-m integration` end-to-end
+  suites still fund the covenant *after* that call — the pre-HZ-1 order the hazard names as unsafe —
+  and must be reordered before they will pass. They are deselected from `task ci` and require live
+  bitcoind/radiantd/anvil nodes, so that reordering is **not** included here and is a tracked
+  follow-up rather than an unverified blind edit.
 - **The ref-opcode walker diverged from Radiant consensus on `0xd4`–`0xd7`, and could report a
   phantom ref while dropping the real one.** `REF_OPCODES` was `frozenset(range(0xD0, 0xD9))` —
   the contiguous `0xd0`–`0xd8` range — and the walker advanced 37 bytes for every member.
@@ -688,6 +794,107 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pull the transaction back. `wallet sweep` and `wallet send` have pinned the network for
   exactly this reason; both glyph paths now do the same. An airdrop file is where a stray line
   survives review, and it pays N recipients in one irreversible transaction.
+- **A malformed WIF is no longer echoed back, disclosing the private key it failed to decode.**
+  `pyrxd.base58.b58_decode` raised `ValueError(f"invalid base58 encoded {encoded}")`. `PrivateKey(wif)`
+  reaches it through `decode_wif`, `swap recovery` reaches `PrivateKey(wif)` through `_pkh_from_wif`
+  (both from an explicit `--wif` and from a `*_rxd_wif` field in a hand-edited recovery file), and
+  the CLI error boundary prints `cause: {exc}` for anything that is not a `NetworkError`/`OSError`.
+
+  So a WIF with **one** character outside the base58 alphabet — a line wrap, a stray space, an
+  `O`/`I`/`l` typo — printed **51 of its 52 characters** to stderr, into terminal scrollback and
+  into any pasted bug report. A few thousand checksum-verifiable candidates recover the key from
+  that. Reproduced end to end; the regression suite
+  (`tests/security/test_key_material_never_echoed.py`) measured 51/52 before the fix and 0/52 after.
+
+  The fix is at the **source**, not at the call site, because the decoder cannot know what it was
+  handed: by the time a string reaches `b58_decode` there is no type information left saying "this
+  one is public". It now treats every input as secret and raises a new
+  `pyrxd.security.errors.Base58Error` carrying a static message and `from None`, so the input cannot
+  resurface through `__cause__` in a traceback either. Every other raise in the base58/keys/WIF path
+  was audited for the same pattern and made static: the base58check **checksum mismatch** (which
+  reported both the caller's trailing bytes and `hash256` over the decoded payload — for a mistyped
+  WIF, that payload *is* the private key), `decode_address` (which echoed a WIF pasted into an
+  address field verbatim), `decode_wif`'s unknown-version-byte branch, and the second, independent
+  base58 implementation in `pyrxd.utils.from_base58`. The mistyped-xprv path through
+  `Xkey.__init__` is closed by the same source fix.
+
+  `Base58Error` subclasses **both** `ValidationError` and `ValueError`: `base58` raised a bare
+  `ValueError` for the SDK's whole history and callers across the CLI, `hd`, and `gravity` still
+  catch that, so the class widens rather than swaps.
+
+- **A per-network `fee_rate` no longer bypasses the relay-floor guard.** `_validated_fee_rate` ran
+  only in `load()`. `Config.for_network` applied `overrides.get("fee_rate")` from the
+  `[networks.<net>]` table with no floor check at all — and `cli/main.py` routes **every**
+  invocation through `for_network`. The guard added for the top-level key in `e0772e0` was therefore
+  bypassable by moving the same value one table down: a top-level `fee_rate = 100` was correctly
+  rejected, while
+
+  ```toml
+  network = "mainnet"
+  [networks.mainnet]
+  fee_rate = 100
+  ```
+
+  yielded `for_network("mainnet").fee_rate == 100` against a 10,000 photons/byte floor. Every
+  mint/transfer/send then built ~100x under floor, and Radiant has **neither RBF nor CPFP**
+  (threat-model S21), so those transactions cannot be bumped by any means and squat on their own
+  inputs until mempool expiry (8h). The per-network value now goes through the same guard, the
+  message names the `[networks.<net>]` table and the file rather than a top-level key that is not
+  the one in force, and a non-integer value there is a typed `ValidationError` instead of a bare
+  `int()` `ValueError` escaping the config boundary.
+
+- **The network name is normalized and validated; an unknown one is refused.** `load()` took
+  `PYRXD_NETWORK` / the config `network` key verbatim, with no `.lower()` and no membership test —
+  the only check was a `strip()` truthiness test. `PYRXD_NETWORK=REGTEST` therefore produced a
+  config whose network was the literal string `"REGTEST"`, and three things went wrong at once:
+  the lowercase `[networks.regtest]` table never matched; `network == cfg.network` compared **equal**
+  (both sides being the same env string), so the **top-level mainnet server list was inherited**; and
+  `genesis_hash_for("REGTEST")` returned `None`, which made `FailoverElectrumXClient._client_for`
+  skip `assert_chain` **entirely**.
+
+  A run the operator believed was regtest talked to a mainnet server with the one check that would
+  have caught it disabled. `--network REGTEST` was safe only by accident, because `click.Choice`
+  lowercases it first. Names are now `strip().lower()`-normalized and checked against
+  `KNOWN_NETWORKS` in both `load()` and `for_network()` (the latter because that is what the CLI
+  always calls, and a library caller can build a `Config` without going through `load` at all), and
+  `cli/main.py` reads the network back off the resolved config rather than reusing its raw input.
+
+  Relatedly and independently: `FailoverElectrumXClient` now **fails closed** when
+  `verify_chain=True` and the profile carries no genesis hash, instead of silently performing no
+  chain check. A check that quietly turns itself off is worse than no check, because it is believed.
+  Opting out requires the explicit `verify_chain=False`.
+
+- **`_coerce_xpub` re-validates an `Xpub` instance instead of trusting its type.** The
+  `Xpub`-instance branch returned `str(xpub)` with no re-validation while the string branch had an
+  explicit raise. `Xkey.payload` is a plain mutable attribute and `Xkey.__str__` re-encodes it on
+  every call, so an object that passed `Xpub.__init__` can afterwards be made to serialise an
+  **xprv** (`xp = Xpub(str(acct)); xp.payload = master_xprv.payload`) — and the emitted descriptor
+  would carry the wallet's spending key to wherever it was pasted. Not reachable from `src/` today;
+  fixed anyway, because this is the boundary where a private key becomes a published string and the
+  guard belongs there explicitly rather than resting on how every caller happens to construct its
+  argument. The key body is now asserted to be a compressed public point (SEC1 prefix `0x02`/`0x03`),
+  and the refusal message and its whole cause chain are checked to carry no part of the key.
+
+- **`HdWallet.load_or_create(..., normalize=False)` refuses to create.** It silently **minted** a
+  new wallet on the legacy unnormalized BIP39 seed when the path did not exist. That mode is a
+  fund-recovery escape for pre-0.12.0 wallets with non-ASCII passphrases — there is nothing to
+  recover at a path with no wallet on it, and the likeliest way to reach that branch is a typo in
+  the path, which is exactly the failure `load_or_create` was split out of `load` to make visible.
+  A wallet created that way derives from a seed no other BIP39 implementation reproduces. The load
+  branch is unchanged.
+
+- **`--fee-rate` is floor-checked, and its help text no longer says "per kB".** `wallet send` and
+  `wallet sweep` validated only `> 0`, making the flag the one remaining path into a spend that
+  could still set a rate the network will not relay (same no-RBF/no-CPFP consequence as above). The
+  help said "photons per kB" while `hd/wallet.py` computes `fee = size * fee_rate` with size in
+  **bytes** — understating the fee 1000x for anyone who read the help and did the arithmetic. Both
+  now say "per BYTE" and both apply the relay floor, still before the mnemonic prompt.
+
+- **`descriptor.verify_checksum` requires exactly one `#`.** `#` is a member of `INPUT_CHARSET`, so
+  a doubly-checksummed string — `raw(deadbeef)#89f8spxm#4x0avkn4` — polymodded correctly and
+  verified True, while Bitcoin Core's `descsum_check` rejects it and `descriptor_checksum` already
+  refused to *create* one. Accepting what we will not emit, and what the consumer will not take, is
+  the wrong half of that pair to be lenient in.
 
 - **The maker-side "did the taker fund the right HTLC for the right amount?" check now exists in
   the library for a BTC counter leg** (`SwapCoordinator.maker_verify_counter_funding`,
@@ -743,6 +950,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   over-funded, decoy scriptPubKey, insufficient depth, spent/unconfirmed, and verified-then-reorged.
   The under-funded case was confirmed to reach `BOTH_LOCKED` against a 70,000-sat HTLC on a
   100,000-sat swap before the fix.
+- **A present-but-falsy `spent` no longer reads as UNSPENT** (`MempoolSpaceFundingReader.
+  read_confirmed_unspent_output`). The guard was `bool(spend.get("spent", True))` with a comment
+  claiming "missing/ambiguous -> treat as SPENT (fail-closed)", but the `True` default only covered
+  a **missing** key: `{"spent": null}` — what an Esplora-shaped server emits for "no data" — and
+  `{"spent": 0}` / `{"spent": ""}` / `{"spent": []}` all evaluated falsy and were read as unspent.
+  `_MempoolHttpClient.outspend` only checked `"spent" in data`, so the null form passed the wire
+  check too. Only the boolean `False` now means unspent; anything else refuses at both layers.
+
+  This read backs the maker-side counter-funding gate added above, so a hostile or buggy source
+  could present an already-swept HTLC output as live and the maker would lock its own asset against
+  BTC that is already gone.
+- **Fund-safety reads on the BTC path now survive a hostile server's non-finite numbers, and bind
+  the transaction they were answered about.** `json.loads` accepts the non-standard `Infinity` /
+  `NaN` literals, and `int(float('inf'))` raises `OverflowError` — which is not a `NetworkError` and
+  was absent from the `(KeyError, IndexError, TypeError, ValueError)` fail-closed tuples, so a
+  crafted response turned a value read into a bare traceback that escaped every `except
+  NetworkError` on a value-moving path. (`network/confirm.py` already guarded this shape; the BTC
+  reads did not.) Separately, `read_output_amount_sats` and `read_confirmed_unspent_output` never
+  checked that `/tx/{txid}` echoed the txid they asked for, so a single malicious source could serve
+  **another transaction's** favourable `(scriptPubKey, value)`. Both now refuse.
+- **An "already known" broadcast rejection is honored only when a read-back confirms it**
+  (`FailoverElectrumXClient.broadcast`). After a transport failure on one endpoint, a later endpoint
+  answering RPC `-27` / `txn-already-known` was treated as success — so a hostile or broken
+  secondary could make `broadcast` report a live transaction, and a live txid, for something no node
+  ever accepted. The claim is now corroborated by asking that endpoint for the transaction and
+  requiring the same bytes back; a node that cannot produce what it claims to hold is skipped like
+  any other failure. Residual, stated plainly: an endpoint corroborates its own claim, so a fully
+  hostile endpoint that both rejects with `-27` and echoes the bytes still passes — what this
+  removes is the far cheaper failure of a `-27` backed by no transaction at all.
 - **Deadline-aware fee sizing for time-critical HTLC spends.** The only fee guard on a
   Radiant covenant spend was a flat `if fee.value < 546: raise` — a Bitcoin dust floor. At
   the reference mainnet node's advertised `effective_minrelaytxfee` (0.10 RXD/kB) a covenant
@@ -857,6 +1093,37 @@ Three corrections from a pre-release audit, each verified against the code rathe
   `glyph/dmint/chain.py`. See the Security entry above.
 
 ### Upgrade notes
+
+- **Operator-visible break: an unknown or mis-cased `network` name is now REFUSED at config
+  load.** `PYRXD_NETWORK` and the config file's `network` key are `strip().lower()`-normalized
+  and must be one of `mainnet` / `testnet` / `regtest`. `PYRXD_NETWORK=REGTEST` previously
+  "worked" — by inheriting the top-level *mainnet* endpoint with the chain check silently
+  disabled — and now resolves correctly to regtest; a typo such as `mainet` now fails with a
+  message listing the known names instead of running against a chain it cannot verify.
+  `PYRXD_NETWORK=` (empty) still means "unset" and falls through to the file/default.
+
+- **Operator-visible break: a `[networks.<net>] fee_rate` below the relay floor is now REFUSED**,
+  as a top-level `fee_rate` already was. If you carry a low per-network rate for a local regtest
+  indexer, raise it to at least 10,000 photons/byte (the default) — a sub-floor transaction
+  cannot be fee-bumped on Radiant and squats on its inputs until mempool expiry.
+
+- **Operator-visible break: `wallet send --fee-rate` / `wallet sweep --fee-rate` now apply the
+  same relay floor**, and their help text now correctly reads **photons per BYTE** (it said
+  "per kB"; the code has always been per byte). The refusal happens before the mnemonic prompt.
+
+- **Library break: `HdWallet.load_or_create(..., normalize=False)` on a path with no wallet file
+  now raises `ValidationError` instead of creating one.** `normalize=False` is a recovery mode for
+  pre-0.12.0 wallets; drop it to create a new wallet. The load branch is unchanged.
+
+- **Library break: `FailoverElectrumXClient(profile)` with `verify_chain=True` (the default) now
+  raises when `profile.genesis_hash is None`**, rather than skipping the chain check. Pass
+  `verify_chain=False` to accept an unverified chain binding explicitly.
+
+- **Library note: `pyrxd.base58` and `pyrxd.utils` decode failures now raise
+  `pyrxd.security.errors.Base58Error`** with a static message that never contains the input.
+  `Base58Error` subclasses both `ValidationError` and `ValueError`, so existing
+  `except ValueError` and `except RxdSdkError` handlers keep working; only code matching on the
+  *message text* needs updating.
 
 - **Operator-visible break: `--network testnet` / `--network regtest` now REFUSE to run a
   network command unless you configure an endpoint for that network.** Previously they

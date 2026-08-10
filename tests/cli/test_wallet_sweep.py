@@ -182,6 +182,33 @@ class TestWalletSweep:
         assert "Mnemonic" not in result.output  # never reached the seed prompt
         client.broadcast.assert_not_awaited()
 
+    @pytest.mark.parametrize("rate", ["1", "100", "9999"])
+    def test_sub_floor_fee_rate_rejected_before_seed_prompt(self, runner: CliRunner, rate: str) -> None:
+        """``--fee-rate`` was checked only for ``> 0``, so it was the one path into a
+        spend that could still set a rate the network will not relay. Radiant has
+        neither RBF nor CPFP, so such a transaction cannot be bumped and squats on
+        its own inputs until mempool expiry. The config file's ``fee_rate`` has been
+        floor-checked since e0772e0; the flag that overrides it was not."""
+        client = _funded_client(_addr(0, 0, 0, 0))
+        result = runner.invoke(
+            wallet_group,
+            ["sweep", "--coin-type", "0", "--to", DEST, "--fee-rate", rate],
+            obj=_ctx(client),
+            input="",
+        )
+        assert result.exit_code != 0
+        assert "relay floor" in result.output
+        assert "Mnemonic" not in result.output
+        client.broadcast.assert_not_awaited()
+
+    def test_fee_rate_help_says_per_byte_not_per_kB(self, runner: CliRunner) -> None:
+        """``hd/wallet.py`` computes ``fee = size * fee_rate`` with size in BYTES.
+        The help said "per kB", which understates the fee by 1000x to anyone who
+        reads it and does the arithmetic."""
+        result = runner.invoke(wallet_group, ["sweep", "--help"])
+        assert "per BYTE" in result.output
+        assert "per kB" not in result.output
+
     def test_negative_coin_type_rejected(self, runner: CliRunner) -> None:
         client = _funded_client(None)
         result = _invoke(runner, _ctx(client), ["sweep", "--coin-type", "-1", "--to", DEST])

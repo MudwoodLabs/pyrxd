@@ -1168,14 +1168,24 @@ class TestNormalizeLoadPath:
             assert w2.external_tip == 4
             assert w2.derive_address(0, 0) == w.derive_address(0, 0)
 
-    def test_load_or_create_threads_normalize_on_create_branch(self):
+    def test_load_or_create_refuses_to_CREATE_a_legacy_wallet(self):
+        """Was ``test_load_or_create_threads_normalize_on_create_branch``, which
+        asserted the bug: a typo'd path silently *minted* a brand-new wallet on the
+        legacy unnormalized seed, permanently non-restorable by any other BIP39
+        implementation. ``normalize=False`` exists to reach funds that already exist;
+        at a path with no wallet on it there is nothing to recover."""
         with tempfile.TemporaryDirectory() as tmpdir:
             p = Path(tmpdir) / "missing.dat"
-            w = HdWallet.load_or_create(p, MNEMONIC, _PASSPHRASE_COMPOSED, normalize=False)
-            legacy = HdWallet.from_mnemonic(MNEMONIC, passphrase=_PASSPHRASE_COMPOSED, normalize=False)
+            with pytest.raises(ValidationError, match="refusing to CREATE"):
+                HdWallet.load_or_create(p, MNEMONIC, _PASSPHRASE_COMPOSED, normalize=False)
+            assert not p.exists()
+
+    def test_load_or_create_still_creates_a_conformant_wallet_by_default(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            p = Path(tmpdir) / "missing.dat"
+            w = HdWallet.load_or_create(p, MNEMONIC, _PASSPHRASE_COMPOSED)
             conformant = HdWallet.from_mnemonic(MNEMONIC, passphrase=_PASSPHRASE_COMPOSED)
-            assert w.derive_address(0, 0) == legacy.derive_address(0, 0)
-            assert w.derive_address(0, 0) != conformant.derive_address(0, 0)
+            assert w.derive_address(0, 0) == conformant.derive_address(0, 0)
 
 
 # ---------------------------------------------------------------------------

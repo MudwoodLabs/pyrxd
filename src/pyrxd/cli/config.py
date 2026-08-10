@@ -59,7 +59,13 @@ from pathlib import Path
 from typing import Any
 
 from ..gravity.fee_policy import RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
-from ..network.registry import DEFAULT_ENDPOINTS, NetworkProfile, default_endpoints, genesis_hash_for
+from ..network.registry import (
+    DEFAULT_ENDPOINTS,
+    KNOWN_NETWORKS,
+    NetworkProfile,
+    default_endpoints,
+    genesis_hash_for,
+)
 from ..security.errors import ValidationError
 
 # tomllib landed in Python 3.11. pyproject.toml declares ``requires-python = ">=3.10"``
@@ -186,7 +192,14 @@ class Config:
         returned config has empty endpoints and a populated ``endpoint_error``;
         :meth:`require_profile` turns that into a typed failure at the point a
         client would be built.
+
+        *network* is normalized and checked against
+        :data:`~pyrxd.network.registry.KNOWN_NETWORKS` here as well as in
+        :func:`load`, because this is the method the CLI always routes through
+        (``--network`` lands here directly) and a library caller can construct a
+        :class:`Config` without going through ``load`` at all.
         """
+        network = _validated_network(network, self.source_path, source="argument")
         overrides = self.networks.get(network, {})
         if not isinstance(overrides, dict):
             overrides = {}
@@ -210,9 +223,13 @@ class Config:
             electrumx_servers=servers,
             allow_insecure=allow_insecure,
             spki_pins=spki_pins,
-            fee_rate=int(overrides.get("fee_rate", self.fee_rate)),
+            # The per-network fee_rate goes through the SAME relay-floor guard as the
+            # top-level one. It used to bypass it entirely — and since the CLI always
+            # routes through `for_network`, `[networks.<net>] fee_rate = 100` produced
+            # a config 100x under the floor that `load()` would have rejected outright.
+            fee_rate=_network_fee_rate(self, network, overrides),
             wallet_path=Path(str(overrides.get("wallet_path", self.wallet_path))).expanduser(),
-            coin_type=int(overrides.get("coin_type", self.coin_type)),
+            coin_type=_as_int(overrides.get("coin_type", self.coin_type), f"networks.{network}.coin_type"),
             endpoint_gap=None if servers else EndpointGap(network, self.source_path),
         )
 
@@ -256,7 +273,68 @@ def _resolve_servers(
     return tuple(default_endpoints(network))
 
 
-def _validated_fee_rate(rate: int, source_path: Path | None, *, from_env: bool) -> int:
+def _validated_network(value: Any, source_path: Path | None, *, source: str) -> str:
+    """Normalize a network name and reject anything outside :data:`KNOWN_NETWORKS`.
+
+    Fund-safety, not tidiness. The name used to be taken verbatim, with the only
+    check being a ``strip()`` truthiness test. ``PYRXD_NETWORK=REGTEST`` therefore
+    produced a config whose network was the literal string ``"REGTEST"``, and:
+
+    * ``[networks.regtest]`` never matched, so the per-network block was ignored;
+    * ``network == cfg.network`` compared *equal* (both sides were the same env
+      string), so the **top-level mainnet server list was inherited**;
+    * :func:`~pyrxd.network.registry.genesis_hash_for` returned ``None``, so the
+      chain-binding check was skipped entirely.
+
+    A run the operator believed was regtest talked to mainnet with the one check
+    that would have caught it disabled. ``--network REGTEST`` was safe only by
+    accident, because ``click.Choice`` lowercases it first.
+
+    Normalizing (``strip().lower()``) fixes the mismatch; rejecting an unknown name
+    is what makes it fail *closed* — a typo can no longer land on the "pyrxd has no
+    constant for this chain, so don't verify it" path.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValidationError(f"network ({source}) must be a non-empty string")
+    network = value.strip().lower()
+    if network not in KNOWN_NETWORKS:
+        known = ", ".join(KNOWN_NETWORKS)
+        if source == "env":
+            where = "the PYRXD_NETWORK environment variable"
+        elif source == "argument":
+            where = "the requested network"
+        elif source_path is not None:
+            where = f"the network key in {source_path}"
+        else:
+            where = "the network key"
+        raise ValidationError(
+            f"unknown network {network!r} in {where}. Known networks: {known}. "
+            "pyrxd refuses an unrecognised name rather than guessing: it has no genesis "
+            "hash for one, so the endpoint's chain could not be verified, and the name "
+            "would not match any [networks.<name>] table either."
+        )
+    return network
+
+
+def _network_fee_rate(cfg: Config, network: str, overrides: dict[str, Any]) -> int:
+    """Fee rate for *network*: the ``[networks.<net>]`` override, floor-checked."""
+    if "fee_rate" not in overrides:
+        # Already validated by `load()` on the way in.
+        return cfg.fee_rate
+    return validated_fee_rate(
+        _as_int(overrides["fee_rate"], f"networks.{network}.fee_rate"),
+        cfg.source_path,
+        table=f"networks.{network}",
+    )
+
+
+def validated_fee_rate(
+    rate: int,
+    source_path: Path | None,
+    *,
+    from_env: bool = False,
+    table: str | None = None,
+) -> int:
     """Reject a fee rate below Radiant's effective relay floor.
 
     Fund-safety, not tidiness. ``fee_rate`` is photons per BYTE; the chain's
@@ -267,19 +345,31 @@ def _validated_fee_rate(rate: int, source_path: Path | None, *, from_env: bool) 
     On a time-critical spend that is a total loss.
 
     The default sits exactly at the floor, so this only ever fires on a deliberate
-    override via ``PYRXD_FEE_RATE`` or ``fee_rate`` in the config file — which is
-    precisely the path that had no validation at all. ``DeadlineFeePolicy`` already
-    rejects a sub-floor rate for the swap stack; this closes the same gap for every
-    other CLI command.
+    override via ``PYRXD_FEE_RATE``, the top-level ``fee_rate``, or a
+    ``[networks.<net>] fee_rate`` — all three of which are checked here.
+    ``DeadlineFeePolicy`` already rejects a sub-floor rate for the swap stack; this
+    closes the same gap for every other CLI command.
 
     A HIGHER rate is always allowed: overpaying is the operator's prerogative.
+
+    Args:
+        rate: photons per byte.
+        source_path: the config file the value came from, if any.
+        from_env: the value came from ``PYRXD_FEE_RATE``.
+        table: the TOML table the value came from (e.g. ``networks.regtest``),
+            when it is not the top-level key.
     """
     floor_per_byte = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB // 1000
     if rate < floor_per_byte:
         # Name the ACTUAL source. An env override with a config file present would
-        # otherwise send the operator to edit a file that does not contain the value.
+        # otherwise send the operator to edit a file that does not contain the value,
+        # and a `[networks.<net>]` override would send them to a top-level key that
+        # is not the one in force.
         if from_env:
             where = " (set via the PYRXD_FEE_RATE environment variable)"
+        elif table is not None:
+            in_file = f" in {source_path}" if source_path is not None else ""
+            where = f" (set under [{table}]{in_file})"
         elif source_path is not None:
             where = f" (set in {source_path})"
         else:
@@ -321,7 +411,12 @@ def load(path: Path | None = None) -> Config:
                 raise ValidationError(f"config file at {target} is not valid TOML: {exc}") from exc
         source_path = target
 
-    network = os.environ.get("PYRXD_NETWORK") or file_data.get("network") or _DEFAULTS["network"]
+    env_network = os.environ.get("PYRXD_NETWORK")
+    network = _validated_network(
+        env_network or file_data.get("network") or _DEFAULTS["network"],
+        source_path,
+        source="env" if env_network else "file",
+    )
     # No built-in fallback here: an unset endpoint stays unset and is resolved
     # per-network by `for_network`. See the module docstring.
     electrumx = os.environ.get("PYRXD_ELECTRUMX") or file_data.get("electrumx") or ""
@@ -344,12 +439,12 @@ def load(path: Path | None = None) -> Config:
         networks = {}
 
     return Config(
-        network=str(network),
+        network=network,
         electrumx=str(electrumx),
         electrumx_servers=servers,
         allow_insecure=bool(file_data.get("allow_insecure", False)),
         spki_pins=_as_str_tuple(file_data.get("spki_pins", ()), "spki_pins"),
-        fee_rate=_validated_fee_rate(
+        fee_rate=validated_fee_rate(
             _as_int(fee_rate_raw, "fee_rate"),
             source_path,
             from_env=bool(os.environ.get("PYRXD_FEE_RATE")),

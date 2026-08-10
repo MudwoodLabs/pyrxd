@@ -436,14 +436,31 @@ class HdWallet:
         validated against the persisted value; when creating, it is the
         coin type the new wallet uses.
 
-        *normalize* also applies to both branches — see :meth:`load` for
-        why it matters on the load branch (the seed doubles as the wallet
-        file's decryption key). ``False`` is a fund-recovery escape for
-        pre-0.12.0 wallets with non-ASCII passphrases; never use it for
-        new wallets.
+        *normalize* also applies to the load branch — see :meth:`load` for
+        why it matters there (the seed doubles as the wallet file's
+        decryption key). ``False`` is a fund-recovery escape for
+        pre-0.12.0 wallets with non-ASCII passphrases.
+
+        Raises:
+            ValidationError: if *path* does not exist and ``normalize=False``.
+                The legacy seed mode exists solely to reach funds already held
+                under a pre-0.12.0 wallet; there is nothing to recover at a path
+                that has no wallet on it. Creating one there instead would mint a
+                brand-new, permanently non-conformant wallet whose mnemonic no
+                other BIP39 implementation can restore — and the likeliest way to
+                land in that branch is a typo in *path*, which is exactly the
+                failure ``load_or_create`` was split out to make visible.
         """
         if path.exists():
             return cls._load_existing(path, mnemonic, passphrase, coin_type, normalize=normalize)
+        if not normalize:
+            raise ValidationError(
+                f"refusing to CREATE a wallet at {path} with normalize=False. "
+                "No wallet file exists there, and normalize=False is a recovery mode for "
+                "wallets created before 0.12.0 — a new wallet made this way would derive "
+                "from an unnormalized seed that no other BIP39 wallet reproduces. "
+                "Check the path for a typo; to create a new wallet here, drop normalize=False."
+            )
         return cls.from_mnemonic(
             mnemonic, passphrase=passphrase, account=account, coin_type=coin_type, normalize=normalize
         )

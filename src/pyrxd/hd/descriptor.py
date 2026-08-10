@@ -123,7 +123,16 @@ def verify_checksum(descriptor: str) -> bool:
     False for an unchecksummed descriptor, a malformed suffix, or a payload
     that does not match its checksum. Never raises — this is a predicate for
     validating untrusted input.
+
+    Exactly one ``#`` is required. ``#`` is a member of :data:`INPUT_CHARSET`, so
+    a *doubly* checksummed string such as ``raw(deadbeef)#89f8spxm#4x0avkn4``
+    polymods correctly and used to verify True here — while Bitcoin Core's
+    ``descsum_check`` rejects it, and :func:`descriptor_checksum` already refuses
+    to *create* one. Accepting what we will not emit, and what the consumer will
+    not take, is the wrong half of that pair to be lenient in.
     """
+    if descriptor.count("#") != 1:
+        return False
     if len(descriptor) < CHECKSUM_LENGTH + 1 or descriptor[-(CHECKSUM_LENGTH + 1)] != "#":
         return False
     tail = descriptor[-CHECKSUM_LENGTH:]
@@ -207,28 +216,51 @@ def key_origin(master_fingerprint: bytes, path: str) -> str:
     return f"[{bytes(master_fingerprint).hex()}{suffix}]"
 
 
+_NOT_AN_XPUB = (
+    "descriptor key must be an extended PUBLIC key (xpub/tpub). "
+    "Never place an xprv in a descriptor — it exports spending authority."
+)
+
+
 def _coerce_xpub(xpub: Xpub | str) -> str:
     """Return the base58 xpub string, refusing anything that is not an xpub.
 
     An ``Xprv`` (or an xprv string) reaching a descriptor would publish the
-    wallet's spending key to whatever the descriptor is pasted into. ``Xpub``
-    already rejects a non-xpub prefix; this wrapper makes the intent explicit
-    and gives the caller a message that names the hazard.
+    wallet's spending key to whatever the descriptor is pasted into.
+
+    The ``Xpub``-instance branch **re-validates** rather than trusting the type.
+    :attr:`pyrxd.hd.bip32.Xkey.payload` is a plain mutable attribute and
+    ``Xkey.__str__`` re-encodes it on every call, so an object that passed
+    ``Xpub.__init__`` can afterwards be made to serialise an xprv::
+
+        xp = Xpub(str(account_xpub))
+        xp.payload = master_xprv.payload   # str(xp) now yields an xprv
+
+    Nothing in ``src/`` does that today, but this is the boundary where a private
+    key becomes a published string, and the guard belongs here explicitly rather
+    than resting on how every caller happens to construct its argument.
     """
     if isinstance(xpub, Xpub):
-        return str(xpub)
+        encoded = str(xpub)
+        try:
+            revalidated = Xpub(encoded)
+        except (ValidationError, ValueError, TypeError) as exc:
+            raise ValidationError(_NOT_AN_XPUB) from exc
+        # Belt and braces: assert the 33-byte key body is a compressed public
+        # point (SEC1 prefix 0x02/0x03). An xprv body is 0x00 + 32 scalar bytes.
+        if not revalidated.key_bytes or revalidated.key_bytes[0] not in (2, 3):
+            raise ValidationError(_NOT_AN_XPUB)
+        return encoded
     if not isinstance(xpub, str):
         raise ValidationError("xpub must be an Xpub or a base58 xpub string")
     try:
-        return str(Xpub(xpub))
+        return _coerce_xpub(Xpub(xpub))
     except (ValidationError, ValueError, TypeError) as exc:
-        # base58check_decode raises bare ValueError on a bad checksum, and Xkey
-        # raises TypeError on a non-str/bytes; normalize everything to the
-        # repo's ValidationError so callers have one thing to catch.
-        raise ValidationError(
-            "descriptor key must be an extended PUBLIC key (xpub/tpub). "
-            "Never place an xprv in a descriptor — it exports spending authority."
-        ) from exc
+        # base58check_decode raises Base58Error (a ValueError) on a bad checksum,
+        # and Xkey raises TypeError on a non-str/bytes; normalize everything to
+        # the repo's ValidationError so callers have one thing to catch. None of
+        # those messages carry the offending string — see pyrxd.base58.
+        raise ValidationError(_NOT_AN_XPUB) from exc
 
 
 def pkh_descriptor(

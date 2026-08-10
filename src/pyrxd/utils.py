@@ -12,7 +12,7 @@ from typing import Literal
 from .base58 import base58check_decode
 from .constants import ADDRESS_PREFIX_NETWORK_DICT, NUMBER_BYTE_LENGTH, WIF_PREFIX_NETWORK_DICT, Network, OpCode
 from .curve import curve
-from .security.errors import ValidationError
+from .security.errors import Base58Error, ValidationError
 
 
 def unsigned_to_varint(num: int) -> bytes:
@@ -46,7 +46,12 @@ def decode_address(address: str) -> tuple[bytes, Network]:
         # - a Bitcoin address is between 25 and 34 characters long;
         # - the address always starts with a 1, m, or n
         # - an address can contain all alphanumeric characters, with the exceptions of 0, O, I, and l.
-        raise ValueError(f"invalid P2PKH address {address}")
+        #
+        # The rejected string is NOT echoed. An address is public, but this is the
+        # branch a *non*-address takes, and the most likely non-address an operator
+        # pastes into an address field is a WIF — which is exactly the shape this
+        # regex rejects (starts with 5/K/L, 51-52 chars).
+        raise Base58Error("invalid P2PKH address")
     decoded = base58check_decode(address)
     prefix = decoded[:1]
     network = ADDRESS_PREFIX_NETWORK_DICT.get(prefix)
@@ -80,7 +85,12 @@ def decode_wif(wif: str) -> tuple[bytes, bool, Network]:
     prefix = decoded[:1]
     network = WIF_PREFIX_NETWORK_DICT.get(prefix)
     if not network:
-        raise ValueError(f"unknown WIF prefix {prefix.hex()}")
+        # The version byte is withheld too. It is only reachable for a WIF whose
+        # checksum already verified — i.e. a real key — and this module's rule is
+        # that nothing decoded from a WIF is interpolated into a message. The
+        # network is readable from the WIF's own first character anyway
+        # (5/K/L = mainnet, 9/c = testnet).
+        raise Base58Error("unknown WIF network prefix")
     if len(wif) == 52 and decoded[-1] == 1:
         return decoded[1:-1], True, network
     return decoded[1:], False, network
@@ -369,11 +379,15 @@ base58chars = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
 def from_base58(str_: str) -> list[int]:
-    """Converts a base58 string to a binary array."""
+    """Converts a base58 string to a binary array.
+
+    Rejection messages are static for the same reason as :mod:`pyrxd.base58`:
+    this decoder cannot tell a WIF from an address, so it never echoes its input.
+    """
     if not str_ or not isinstance(str_, str):
-        raise ValueError(f"Expected base58 string but got '{str_}'")
+        raise Base58Error("expected a non-empty base58 string")
     if "0" in str_ or "I" in str_ or "O" in str_ or "l" in str_:
-        raise ValueError(f"Invalid base58 character in '{str_}'")
+        raise Base58Error("invalid base58 character")
 
     lz = len(str_) - len(str_.lstrip("1"))
     psz = lz
@@ -431,7 +445,7 @@ def from_base58_check(str_: str, enc: str | None = None, prefix_length: int = 1)
 
     hash_ = hashlib.sha256(hashlib.sha256(bytes(prefix + data)).digest()).digest()
     if list(hash_[:4]) != checksum:
-        raise ValueError("Invalid checksum")
+        raise Base58Error("invalid base58 checksum")
 
     if enc == "hex":
         prefix = to_hex(bytes(prefix))
