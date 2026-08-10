@@ -33,6 +33,7 @@ from typing import Protocol, runtime_checkable
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS, BtcBroadcaster, require_audit_cleared
 from pyrxd.btc_wallet.taproot import btc_spend_fields_from_raw, btc_txid_from_raw
+from pyrxd.gravity.fee_policy import DEFAULT_BITCOIN_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent
 from pyrxd.security.errors import PolicyRejection, ValidationError
@@ -207,9 +208,12 @@ class RefundExecutor:
         cap_sats: int,
         refund_spk: bytes,
         accept_single_source: bool = False,
+        fee_policy: DeadlineFeePolicy | None = None,
     ) -> None:
         if broadcaster is not None and not isinstance(broadcaster, BtcBroadcaster):
             raise ValidationError("broadcaster must satisfy BtcBroadcaster or be None")
+        if fee_policy is not None and not isinstance(fee_policy, DeadlineFeePolicy):
+            raise ValidationError("fee_policy must be a DeadlineFeePolicy or None")
         if not isinstance(network, str) or not network:
             raise ValidationError("network must be a non-empty str")
         if not isinstance(cap_sats, int) or isinstance(cap_sats, bool) or cap_sats <= 0:
@@ -229,6 +233,7 @@ class RefundExecutor:
         self._cap = cap_sats
         self._refund_spk = bytes(refund_spk)
         self._accept_single_source = bool(accept_single_source)
+        self._fee_policy = fee_policy or DEFAULT_BITCOIN_DEADLINE_FEE_POLICY
 
     async def execute(self, swap_id: str, record: SwapRecord, decision: Decision) -> ExecOutcome | None:
         blob, decline = self._authorize(swap_id, record, decision)
@@ -309,4 +314,30 @@ class RefundExecutor:
             return None, f"blob output value {value} sats over cap {self._cap}"
         if value >= locator.amount_sats:
             return None, f"blob output value {value} >= funded amount {locator.amount_sats} (no fee?) — refusing"
+        # 7. AFFORDABILITY FLOOR (gap-closure A1). "value < funded" only proves the blob pays
+        #    a NON-ZERO fee; it does not prove that fee is viable. A pre-signed blob cannot be
+        #    rebuilt here (no key), so an unviable one is dead weight against a CSV deadline —
+        #    better to decline + page than to broadcast it and hope.
+        #
+        #    DELIBERATELY A LOWER BOUND, not the exact min-relay requirement. BIP141 vsize is
+        #    ``(3*base + total)/4``, and this executor does not parse the base/witness split; but
+        #    ``vsize > total/4`` holds for every transaction, segwit or not. Sizing on
+        #    ``ceil(len(raw_tx)/4)`` therefore under-states the node's real requirement, which is
+        #    the ONLY safe direction here: a false decline would strand a valid refund the node
+        #    would have accepted, and unlike Radiant, BTC has RBF and CPFP, so a merely-thin fee
+        #    is recoverable while a wrongly-withheld refund is not. This catches the broken
+        #    blob (a token fee, a mis-sized `fee_sats`), not the marginal one.
+        #
+        #    Deadline-unaware: once mature a CSV refund stays valid indefinitely, so there is no
+        #    closing window to pay a premium for.
+        implied_fee = locator.amount_sats - value
+        vsize_lower_bound = -(-len(blob.raw_tx) // 4)
+        required = self._fee_policy.required_fee(vsize_lower_bound)
+        if implied_fee < required:
+            return None, (
+                f"pre-signed refund pays only {implied_fee} sats fee, below the {required} sats floor "
+                f"(a LOWER bound on min-relay for its {len(blob.raw_tx)} serialized bytes at "
+                f"{self._fee_policy.relay_fee_per_kb} sats/kB; short by {required - implied_fee}) — "
+                "a pre-signed blob cannot be re-fee'd here; re-presign at a viable fee before the CSV deadline"
+            )
         return blob, None

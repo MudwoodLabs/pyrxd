@@ -590,7 +590,8 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--eth-timeout-s", type=int, default=86_400)  # 1 day ETH refund deadline
     # RXD
     ap.add_argument("--rxd-photons", type=int, default=1000)
-    ap.add_argument("--rxd-fee-photons", type=int, default=5_000_000)
+    # >= min-relay for a covenant spend at 0.10 RXD/kB plus the claim urgency premium (A1).
+    ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)
     ap.add_argument("--rxd-wallet", default="")
     ap.add_argument("--t-rxd-blocks", type=int, default=60)
     # asset: plain RXD (default) or a freshly-minted NFT Glyph (Glyph↔ETH).

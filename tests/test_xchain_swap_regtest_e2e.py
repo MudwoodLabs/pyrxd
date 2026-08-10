@@ -381,8 +381,10 @@ class _FeeSource:
         wif = str(self._n.rxd("dumpprivkey", u["address"], wallet="gravity"))
         pkh = bytes(Hex20(PrivateKey(wif).public_key().hash160()))
         out_spk = b"\x76\xa9\x14" + pkh + b"\x88\xac"
-        txid = _rxd_pay(self._n, out_spk, 5_000_000)
-        return FeeInput(txid=txid, vout=0, value=5_000_000, scriptpubkey=out_spk, wif=wif)
+        # 0.2 RXD: the whole input is the miner fee (single-output covenant, no change),
+        # and the leg enforces min-relay + up to a 3x deadline-urgency premium on a claim.
+        txid = _rxd_pay(self._n, out_spk, 20_000_000)
+        return FeeInput(txid=txid, vout=0, value=20_000_000, scriptpubkey=out_spk, wif=wif)
 
 
 class _Seen:

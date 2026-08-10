@@ -45,6 +45,11 @@ from typing import Protocol, runtime_checkable
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
 from pyrxd.btc_wallet.taproot import TimeUnit
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.fee_policy import (
+    DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
+    DeadlineFeePolicy,
+    assert_fee_covers,
+)
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
     build_htlc_covenant_ft,
@@ -54,7 +59,7 @@ from pyrxd.gravity.htlc_covenant import (
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20
 
 __all__ = [
@@ -377,6 +382,11 @@ class RadiantCovenantLeg:
     audit_cleared:
         Explicit opt-in for a value-bearing ``network`` (see
         :func:`pyrxd.btc_wallet.htlc_leg.require_audit_cleared`).
+    fee_policy:
+        The :class:`~pyrxd.gravity.fee_policy.DeadlineFeePolicy` the pre-broadcast
+        affordability gate enforces. Defaults to the reference node's advertised
+        0.10 RXD/kB effective relay rate; pass an explicit policy when the node this
+        leg broadcasts to advertises a different ``effective_minrelaytxfee``.
     """
 
     def __init__(
@@ -389,6 +399,7 @@ class RadiantCovenantLeg:
         fee_source: FeeUtxoSource,
         min_confirmations: int = 1,
         audit_cleared: bool = False,
+        fee_policy: DeadlineFeePolicy | None = None,
     ) -> None:
         require_audit_cleared(network, audit_cleared=audit_cleared)
         if not isinstance(chain_io, RadiantChainIO):
@@ -397,6 +408,9 @@ class RadiantCovenantLeg:
             raise ValidationError("fee_source must implement next_fee_input()")
         if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 0:
             raise ValidationError("min_confirmations must be a non-negative int")
+        if fee_policy is not None and not isinstance(fee_policy, DeadlineFeePolicy):
+            raise ValidationError("fee_policy must be a DeadlineFeePolicy or None")
+        self.fee_policy = fee_policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY
         self.network = network
         self.taker_pkh = bytes(Hex20(taker_pkh))
         self.maker_pkh = bytes(Hex20(maker_pkh))
@@ -476,11 +490,15 @@ class RadiantCovenantLeg:
         return outpoint
 
     # -- spends -------------------------------------------------------------
-    async def _resolve_covenant(self, record: SwapRecord) -> tuple[HtlcCovenant, str, int]:
-        """Build the covenant, locate its funded UTXO, conf-gate it, return value.
+    async def _resolve_covenant(self, record: SwapRecord) -> tuple[HtlcCovenant, str, int, int]:
+        """Build the covenant, locate its funded UTXO, conf-gate it, return value + depth.
 
         Reads the on-chain value (never a self-report) and rejects a covenant
         shallower than ``min_confirmations`` so a reorg cannot un-fund it mid-spend.
+        The confirmation depth is returned alongside because the claim path needs it
+        to compute blocks-to-deadline (the covenant's CSV refund branch opens at
+        ``confirmations >= refund_csv``) — re-reading it would be a second network
+        round-trip for a number we already have.
         """
         cov = self._build_covenant(record.terms)
         outpoint, value, _height = await self.chain_io.find_covenant_utxo(
@@ -496,20 +514,82 @@ class RadiantCovenantLeg:
             value <= 0
         ):  # pragma: no cover - defense-in-depth; find_covenant_utxo already pins value>0 via expected_value
             raise NetworkError("covenant output value is non-positive; fail-closed")
-        return cov, outpoint, value
+        return cov, outpoint, value, confs
+
+    def _assert_affordable(self, tx, fee: FeeInput, *, blocks_to_deadline: int | None, kind: str) -> None:
+        """PRE-BROADCAST affordability gate (gap-closure A1) — refuse, and PAGE, rather
+        than emit a time-critical spend that cannot be repaired.
+
+        Radiant has no RBF and no CPFP (see :mod:`pyrxd.gravity.fee_policy`), so a
+        transaction broadcast below the effective relay floor is not merely slow — it is
+        unfixable, and it squats on its own inputs until mempool expiry (8h). If the
+        deadline falls inside that window the asset is simply lost to the counterparty's
+        refund. Failing loudly here is strictly better than that outcome.
+
+        Sized against ``len(tx.serialize())`` — the exact wire bytes, not an estimate.
+        The whole fee input is the miner fee (single-output covenant, no change).
+        """
+        try:
+            target = assert_fee_covers(
+                fee_value=fee.value,
+                size_bytes=len(tx.serialize()),
+                policy=self.fee_policy,
+                blocks_to_deadline=blocks_to_deadline,
+                what=f"HTLC covenant {kind} (pre-broadcast gate)",
+            )
+            # Above the node's floor but below the urgency TARGET: broadcast anyway (the
+            # node accepts it, and refusing would hand the asset to the counterparty's
+            # refund) but page — the operator should fund a larger pool before the next
+            # deadline-critical spend.
+            if fee.value < target:
+                logger.warning(
+                    "Radiant covenant %s on %s clears the relay floor but is below the "
+                    "urgency target (%d < %d photons, blocks_to_deadline=%s) — broadcasting, "
+                    "but inclusion may be slow; fund a larger fee input",
+                    kind,
+                    self.network,
+                    fee.value,
+                    target,
+                    blocks_to_deadline,
+                )
+        except InsufficientFundsError as exc:
+            # PAGE: an operator has to fund a larger fee input before this spend can go
+            # out, and on the claim path the clock to the counterparty's refund is running.
+            logger.error(
+                "REFUSING to broadcast the Radiant covenant %s on %s: %s (blocks_to_deadline=%s)",
+                kind,
+                self.network,
+                exc,
+                blocks_to_deadline,
+            )
+            raise
 
     async def claim_asset(self, record: SwapRecord, preimage: bytes) -> str:
-        """Build + broadcast the TAKER's claim spend (reveals ``p``). Returns the txid."""
+        """Build + broadcast the TAKER's claim spend (reveals ``p``). Returns the txid.
+
+        Fee-sized against the DEADLINE: the maker's CSV refund branch opens once the
+        covenant is ``t_rxd`` confirmations deep, so ``t_rxd - confirmations`` is the
+        number of Radiant blocks in which this claim must be *mined*, not merely
+        broadcast. The pre-broadcast gate refuses (and pages) if the dispensed fee input
+        cannot meet that requirement — there is no post-broadcast remedy on Radiant.
+        """
         if not isinstance(record, SwapRecord):
             raise ValidationError("record must be a SwapRecord")
-        cov, outpoint, carrier = await self._resolve_covenant(record)
+        cov, outpoint, carrier, confs = await self._resolve_covenant(record)
+        # The covenant CSV is a BIP68 BLOCK count (_build_covenant refuses any other
+        # unit), so this subtraction is in Radiant blocks. Clamped at 0: a deadline
+        # already passed takes the maximum urgency premium, never a negative one.
+        blocks_to_deadline = max(0, record.terms.t_rxd.value - confs)
+        fee = self.fee_source.next_fee_input()
         tx = build_htlc_claim_tx(
             covenant=cov,
             covenant_outpoint=outpoint,
             carrier_value=carrier,
             preimage=bytes(preimage),
-            fee=self.fee_source.next_fee_input(),
+            fee=fee,
+            fee_policy=self.fee_policy,
         )
+        self._assert_affordable(tx, fee, blocks_to_deadline=blocks_to_deadline, kind="claim")
         return await self._broadcast(tx)
 
     async def refund_asset(self, record: SwapRecord) -> str:
@@ -527,7 +607,7 @@ class RadiantCovenantLeg:
         """
         if not isinstance(record, SwapRecord):
             raise ValidationError("record must be a SwapRecord")
-        cov, outpoint, carrier = await self._resolve_covenant(record)
+        cov, outpoint, carrier, _confs = await self._resolve_covenant(record)
         required_csv = record.terms.t_rxd.value
         confs = await self.chain_io.confirmations(outpoint.split(":")[0])
         if confs < required_csv:
@@ -536,12 +616,20 @@ class RadiantCovenantLeg:
                 f"({required_csv - confs} block(s) to go) — refusing to broadcast a non-final refund "
                 "(P3 maturity self-check); poll and retry at maturity rather than relying on node rejection."
             )
+        fee = self.fee_source.next_fee_input()
         tx = build_htlc_refund_tx(
             covenant=cov,
             covenant_outpoint=outpoint,
             carrier_value=carrier,
-            fee=self.fee_source.next_fee_input(),
+            fee=fee,
+            fee_policy=self.fee_policy,
         )
+        # blocks_to_deadline=None (the plain relay floor, no urgency premium): unlike the
+        # claim, the CSV refund has no closing window. It only becomes broadcastable AT
+        # maturity and stays valid indefinitely thereafter — the competing claim branch
+        # needs p, which on this path the counterparty has not revealed. A premium here
+        # would burn fee for urgency that does not exist. The floor itself still binds.
+        self._assert_affordable(tx, fee, blocks_to_deadline=None, kind="refund")
         return await self._broadcast(tx)
 
     async def _broadcast(self, tx) -> str:

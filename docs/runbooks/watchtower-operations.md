@@ -155,6 +155,109 @@ first, confirming a fresh heartbeat, then un-muting the watchdog. The swaps don'
   keyless and output-pinned to the taker). Rotate by refilling/replacing the **capped pool** (a manual,
   audited op — never an auto top-up from the main wallet), then re-arm.
 
+## Fee sizing — the 8-hour irreversibility window
+
+**Footgun #5 — an under-fee'd time-critical spend cannot be fixed. By any means.**
+
+**Radiant supports neither RBF nor CPFP.** This is not a pyrxd limitation; it is the chain
+(verified against `Radiant-Core` @ `afdf57b1` and the live mainnet node, 2026-08-09):
+
+- **No RBF.** Any mempool conflict is rejected outright (`txn-mempool-conflict`,
+  `src/validation.cpp:667`/`:856`). There is **no `bumpfee` RPC**. Radiant ships DSProof —
+  it treats a conflict as *fraud to broadcast*, the opposite of replacement.
+- **No CPFP.** The miner selects on each transaction's **own** fee over its **own** size
+  (`GetModifiedFeeRate()`, `src/miner.cpp:380`). Paying a high-fee child does **not** lift a
+  low-fee parent into a block. `getmempoolancestors`/`getmempooldescendants` existing makes
+  it *look* supported. It is not.
+- **The window.** `DEFAULT_MEMPOOL_EXPIRY` is **8 hours** (`src/validation.h:82`). An
+  under-fee'd transaction squats on its own inputs for up to 8 hours before you can even
+  rebuild. **If the deadline lands inside that window, the asset is gone.**
+
+Therefore: **do not attempt a fee bump.** There is no procedure to run. The only control is
+pre-sizing, and pyrxd now enforces it before broadcast.
+
+**What the tower does.** Every Radiant covenant claim/refund is checked against
+`ceil(size × effective_minrelaytxfee / 1000)` for the transaction's **real** serialized size.
+On the claim path a deadline-scaled premium (blocks left before the maker's `t_rxd` CSV refund
+opens) is computed on top of that. Only the first of those two numbers is a gate.
+
+> **The urgency premium is a funding TARGET, not a relay requirement.**
+> The **relay floor** — `ceil(size × effective_minrelaytxfee / 1000)` — is what the node
+> actually demands, and a spend below it is refused, because the node would reject it anyway
+> and with no RBF/CPFP it could not be repaired. The **urgency premium** (up to 3× the floor
+> as the deadline closes) is headroom for prompt inclusion, and it is *advisory*. If you fund
+> at the bare floor, the spend still **broadcasts**; you get a `WARNING` and possibly a slow
+> inclusion — never a refusal. Refusing there would be strictly worse than broadcasting: the
+> node accepts the transaction, refusing does not lower the fee paid (the covenant enforces a
+> single output, so the whole fee input is the miner fee either way), and on the claim path
+> the maker's CSV refund would then take the asset. Because the premium *rises* as the
+> deadline closes, gating on it would refuse hardest exactly when claiming matters most.
+
+A fee that clears the floor but not the target logs and keeps going:
+
+```
+WARNING Radiant covenant claim on mainnet clears the relay floor but is below the urgency
+target (3000000 < 7093334 photons, blocks_to_deadline=1) — broadcasting, but inclusion may
+be slow; fund a larger fee input
+```
+
+A fee **below the floor** is refused, not broadcast, and pages:
+
+```
+autonomous claim DECLINED for <swap>: fee input below the deadline-aware relay requirement:
+HTLC covenant claim (pre-broadcast gate): fee of N photons is below the required M photons
+(short by M-N) for a S-byte transaction at 10000000 photons/kB x2.33 urgency (2 block(s) to deadline)
+```
+
+`M` there is the **relay floor** — the number you must clear to get the spend relayed at all,
+not the urgency target quoted in the same line.
+
+**Operator response to that page — you have blocks, not hours:**
+
+1. **Fund a larger fee UTXO** into the capped fee pool. The message states the exact shortfall;
+   round up generously — a few hundredths of an RXD is not worth a lost swap leg.
+2. **No restart is needed.** A fee shortfall is deliberately *not* marked seen, so the claim
+   stays armed and the next tick retries with whatever the pool dispenses then. That matters
+   because `CappedFeeWalletSource` is dispense-once and dispenses in pool order: the input that
+   fell short is gone, and the next tick draws a *different*, possibly larger one. (Marking a
+   shortfall seen would permanently disarm a claim your pool could still fund — e.g. a pool
+   ordered small-first.) Retry cost is bounded: the pool is capped and dispense-once, so its
+   cursor advances at most one input per tick and cannot run past its own cap.
+3. If there is not time for that, **run the one-shot claim yourself** from a node with a funded
+   fee UTXO. Do not wait for the next tick.
+
+**Sizing the pool up front.** At the reference node's `effective_minrelaytxfee` of 0.10 RXD/kB,
+a covenant spend is a few hundred bytes, so a claim costs roughly **0.03 RXD** at the relay
+floor and up to **~0.08 RXD** at the maximum urgency target (3×). Size to the *target*, not the
+floor: the floor is only the point below which the tower stops, whereas the target is what buys
+you prompt inclusion when a deadline is close. Stock each pool UTXO at **0.1–0.2 RXD** and keep
+several — the fee source is availability-critical: an empty pool is a missed deadline, and the
+covenant's single-output rule means the *entire* fee input is consumed as the miner fee (there
+is no change output to recover the remainder).
+
+**Check the rate, don't assume it.** `effective_minrelaytxfee` is node policy and can change,
+and it is **10× the nominal `minrelaytxfee`** on the reference node:
+
+```bash
+radiant-cli getmempoolinfo | grep -E 'minrelaytxfee'
+# "minrelaytxfee": 0.01000000,  "effective_minrelaytxfee": 0.10000000
+```
+
+If your node reports something else, pass it explicitly rather than relying on the default —
+`RadiantCovenantLeg(..., fee_policy=DeadlineFeePolicy(relay_fee_per_kb=photons_per_kb_from_rxd_per_kb(rate)))`.
+
+That reading crosses a trust boundary, so `DeadlineFeePolicy` bounds it: a rate below the
+chain's own relay floor (`protocol_floor_per_kb`, 1,000,000 photons/kB on Radiant) is
+**refused at construction**. A lying or misconfigured endpoint reporting 0.00000001 RXD/kB
+would otherwise give you a "floor" of ~1 photon/kB and an unfixable spend. On regtest or a
+chain you control, opt out explicitly with `allow_below_protocol_floor=True`. Units are
+per-chain — a BTC-side policy passes Bitcoin's floor in **sats**/kB, not Radiant's photons.
+
+**BTC side.** The pre-signed refund blob's fee is fixed at presign time and the tower holds no
+key to rebuild it, so the executor declines a blob whose fee is not viable. Re-run
+`scripts/presign_refund.py` with a sane `--fee-sats` rather than trying to bump it in flight.
+(BTC, unlike Radiant, does have RBF and CPFP — but not for a blob you cannot re-sign.)
+
 ## Health & alerts
 
 - The tower logs each tick at the mapped severity; the heartbeat file's mtime is the liveness signal.

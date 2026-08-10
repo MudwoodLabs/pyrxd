@@ -56,7 +56,7 @@ from pyrxd.gravity.swap_coordinator import ClaimFinality, MarginPolicy, assess_c
 from pyrxd.gravity.swap_state import SwapRecord
 from pyrxd.gravity.watch.decide import Decision, Intent, _value_at_risk_photons
 from pyrxd.gravity.watch.executor import ExecOutcome
-from pyrxd.security.errors import NetworkError, PolicyRejection, ValidationError
+from pyrxd.security.errors import InsufficientFundsError, NetworkError, PolicyRejection, ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +516,32 @@ class ClaimExecutor:
         # 8. Broadcast the covenant claim (reuses the mainnet-proven leg path; logs txid+value, never p).
         try:
             txid = await leg.claim_asset(record, bytes(p))
+        except InsufficientFundsError as exc:
+            # PRE-BROADCAST fee gate (gap-closure A1): the dispensed fee input is below the
+            # node's relay floor, so the leg refused to broadcast. Nothing went on-chain and no
+            # fee was burned.
+            #
+            # Deliberately NOT marked seen. The first cut of this handler did mark it, on the
+            # reasoning that "the same fee source will keep handing out the same too-small
+            # UTXOs" — which is FALSE for the source actually used here: CappedFeeWalletSource
+            # is dispense-once ("the returned UTXO is never returned again"), so the next tick
+            # dispenses a DIFFERENT, possibly larger input. A pool ordered small-first would
+            # have had its claim permanently disarmed by the first small dispense while
+            # covering inputs remained — turning a recoverable tick into a lost asset. The same
+            # applied to a one-tick transient (e.g. a briefly-inflated confirmations read).
+            #
+            # The cost of retrying is bounded: the pool is capped and dispense-once, so the
+            # cursor advances at most once per tick and cannot be walked past its own cap. That
+            # is a far cheaper failure than disarming a claim the pool could still fund.
+            # Page with the exact shortfall so the operator can fund a larger input.
+            logger.error(
+                "autonomous claim swap %s: fee input CANNOT COVER the deadline-aware relay "
+                "requirement (%s) — nothing broadcast; operator must fund a larger fee input "
+                "before the maker's CSV refund opens",
+                swap_id,
+                exc,
+            )
+            return ExecOutcome.DECLINED, f"fee input below the deadline-aware relay requirement: {exc}"
         except PolicyRejection as exc:
             # PERMANENT: the node rejected the tx on a consensus/policy rule (bad script, dust,
             # min-relay-fee). Retrying cannot help, and this path RE-CARVES a real-value fee input

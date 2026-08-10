@@ -344,7 +344,9 @@ def _parse_args(argv):
     ap.add_argument("--btc-sats", type=int, default=1260)
     ap.add_argument("--rxd-photons", type=int, default=1000)
     ap.add_argument("--btc-fee-sats", type=int, default=600)
-    ap.add_argument("--rxd-fee-photons", type=int, default=4_000_000)
+    # >= the node's min-relay floor for a ~266 B covenant spend at 0.10 RXD/kB (~2.66M)
+    # PLUS the claim path's deadline-urgency premium (up to 3x). No RBF/CPFP on Radiant. (A1)
+    ap.add_argument("--rxd-fee-photons", type=int, default=20_000_000)
     ap.add_argument(
         "--t-rxd-blocks",
         type=int,
