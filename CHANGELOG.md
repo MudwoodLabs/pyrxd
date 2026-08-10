@@ -584,6 +584,108 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1,285 hex blobs across `conformance/`, `tests/` and `src/pyrxd/` found zero whose ref-walk
   changes under the fix.
 
+- **A malformed WIF is no longer echoed back, disclosing the private key it failed to decode.**
+  `pyrxd.base58.b58_decode` raised `ValueError(f"invalid base58 encoded {encoded}")`. `PrivateKey(wif)`
+  reaches it through `decode_wif`, `swap recovery` reaches `PrivateKey(wif)` through `_pkh_from_wif`
+  (both from an explicit `--wif` and from a `*_rxd_wif` field in a hand-edited recovery file), and
+  the CLI error boundary prints `cause: {exc}` for anything that is not a `NetworkError`/`OSError`.
+
+  So a WIF with **one** character outside the base58 alphabet — a line wrap, a stray space, an
+  `O`/`I`/`l` typo — printed **51 of its 52 characters** to stderr, into terminal scrollback and
+  into any pasted bug report. A few thousand checksum-verifiable candidates recover the key from
+  that. Reproduced end to end; the regression suite
+  (`tests/security/test_key_material_never_echoed.py`) measured 51/52 before the fix and 0/52 after.
+
+  The fix is at the **source**, not at the call site, because the decoder cannot know what it was
+  handed: by the time a string reaches `b58_decode` there is no type information left saying "this
+  one is public". It now treats every input as secret and raises a new
+  `pyrxd.security.errors.Base58Error` carrying a static message and `from None`, so the input cannot
+  resurface through `__cause__` in a traceback either. Every other raise in the base58/keys/WIF path
+  was audited for the same pattern and made static: the base58check **checksum mismatch** (which
+  reported both the caller's trailing bytes and `hash256` over the decoded payload — for a mistyped
+  WIF, that payload *is* the private key), `decode_address` (which echoed a WIF pasted into an
+  address field verbatim), `decode_wif`'s unknown-version-byte branch, and the second, independent
+  base58 implementation in `pyrxd.utils.from_base58`. The mistyped-xprv path through
+  `Xkey.__init__` is closed by the same source fix.
+
+  `Base58Error` subclasses **both** `ValidationError` and `ValueError`: `base58` raised a bare
+  `ValueError` for the SDK's whole history and callers across the CLI, `hd`, and `gravity` still
+  catch that, so the class widens rather than swaps.
+
+- **A per-network `fee_rate` no longer bypasses the relay-floor guard.** `_validated_fee_rate` ran
+  only in `load()`. `Config.for_network` applied `overrides.get("fee_rate")` from the
+  `[networks.<net>]` table with no floor check at all — and `cli/main.py` routes **every**
+  invocation through `for_network`. The guard added for the top-level key in `e0772e0` was therefore
+  bypassable by moving the same value one table down: a top-level `fee_rate = 100` was correctly
+  rejected, while
+
+  ```toml
+  network = "mainnet"
+  [networks.mainnet]
+  fee_rate = 100
+  ```
+
+  yielded `for_network("mainnet").fee_rate == 100` against a 10,000 photons/byte floor. Every
+  mint/transfer/send then built ~100x under floor, and Radiant has **neither RBF nor CPFP**
+  (threat-model S21), so those transactions cannot be bumped by any means and squat on their own
+  inputs until mempool expiry (8h). The per-network value now goes through the same guard, the
+  message names the `[networks.<net>]` table and the file rather than a top-level key that is not
+  the one in force, and a non-integer value there is a typed `ValidationError` instead of a bare
+  `int()` `ValueError` escaping the config boundary.
+
+- **The network name is normalized and validated; an unknown one is refused.** `load()` took
+  `PYRXD_NETWORK` / the config `network` key verbatim, with no `.lower()` and no membership test —
+  the only check was a `strip()` truthiness test. `PYRXD_NETWORK=REGTEST` therefore produced a
+  config whose network was the literal string `"REGTEST"`, and three things went wrong at once:
+  the lowercase `[networks.regtest]` table never matched; `network == cfg.network` compared **equal**
+  (both sides being the same env string), so the **top-level mainnet server list was inherited**; and
+  `genesis_hash_for("REGTEST")` returned `None`, which made `FailoverElectrumXClient._client_for`
+  skip `assert_chain` **entirely**.
+
+  A run the operator believed was regtest talked to a mainnet server with the one check that would
+  have caught it disabled. `--network REGTEST` was safe only by accident, because `click.Choice`
+  lowercases it first. Names are now `strip().lower()`-normalized and checked against
+  `KNOWN_NETWORKS` in both `load()` and `for_network()` (the latter because that is what the CLI
+  always calls, and a library caller can build a `Config` without going through `load` at all), and
+  `cli/main.py` reads the network back off the resolved config rather than reusing its raw input.
+
+  Relatedly and independently: `FailoverElectrumXClient` now **fails closed** when
+  `verify_chain=True` and the profile carries no genesis hash, instead of silently performing no
+  chain check. A check that quietly turns itself off is worse than no check, because it is believed.
+  Opting out requires the explicit `verify_chain=False`.
+
+- **`_coerce_xpub` re-validates an `Xpub` instance instead of trusting its type.** The
+  `Xpub`-instance branch returned `str(xpub)` with no re-validation while the string branch had an
+  explicit raise. `Xkey.payload` is a plain mutable attribute and `Xkey.__str__` re-encodes it on
+  every call, so an object that passed `Xpub.__init__` can afterwards be made to serialise an
+  **xprv** (`xp = Xpub(str(acct)); xp.payload = master_xprv.payload`) — and the emitted descriptor
+  would carry the wallet's spending key to wherever it was pasted. Not reachable from `src/` today;
+  fixed anyway, because this is the boundary where a private key becomes a published string and the
+  guard belongs there explicitly rather than resting on how every caller happens to construct its
+  argument. The key body is now asserted to be a compressed public point (SEC1 prefix `0x02`/`0x03`),
+  and the refusal message and its whole cause chain are checked to carry no part of the key.
+
+- **`HdWallet.load_or_create(..., normalize=False)` refuses to create.** It silently **minted** a
+  new wallet on the legacy unnormalized BIP39 seed when the path did not exist. That mode is a
+  fund-recovery escape for pre-0.12.0 wallets with non-ASCII passphrases — there is nothing to
+  recover at a path with no wallet on it, and the likeliest way to reach that branch is a typo in
+  the path, which is exactly the failure `load_or_create` was split out of `load` to make visible.
+  A wallet created that way derives from a seed no other BIP39 implementation reproduces. The load
+  branch is unchanged.
+
+- **`--fee-rate` is floor-checked, and its help text no longer says "per kB".** `wallet send` and
+  `wallet sweep` validated only `> 0`, making the flag the one remaining path into a spend that
+  could still set a rate the network will not relay (same no-RBF/no-CPFP consequence as above). The
+  help said "photons per kB" while `hd/wallet.py` computes `fee = size * fee_rate` with size in
+  **bytes** — understating the fee 1000x for anyone who read the help and did the arithmetic. Both
+  now say "per BYTE" and both apply the relay floor, still before the mnemonic prompt.
+
+- **`descriptor.verify_checksum` requires exactly one `#`.** `#` is a member of `INPUT_CHARSET`, so
+  a doubly-checksummed string — `raw(deadbeef)#89f8spxm#4x0avkn4` — polymodded correctly and
+  verified True, while Bitcoin Core's `descsum_check` rejects it and `descriptor_checksum` already
+  refused to *create* one. Accepting what we will not emit, and what the consumer will not take, is
+  the wrong half of that pair to be lenient in.
+
 - **The maker-side "did the taker fund the right HTLC for the right amount?" check now exists in
   the library for a BTC counter leg** (`SwapCoordinator.maker_verify_counter_funding`,
   `BitcoinTaprootLeg.verify_counterparty_funded`). This closes hazard **HZ-3** of
@@ -752,6 +854,37 @@ Three corrections from a pre-release audit, each verified against the code rathe
   `glyph/dmint/chain.py`. See the Security entry above.
 
 ### Upgrade notes
+
+- **Operator-visible break: an unknown or mis-cased `network` name is now REFUSED at config
+  load.** `PYRXD_NETWORK` and the config file's `network` key are `strip().lower()`-normalized
+  and must be one of `mainnet` / `testnet` / `regtest`. `PYRXD_NETWORK=REGTEST` previously
+  "worked" — by inheriting the top-level *mainnet* endpoint with the chain check silently
+  disabled — and now resolves correctly to regtest; a typo such as `mainet` now fails with a
+  message listing the known names instead of running against a chain it cannot verify.
+  `PYRXD_NETWORK=` (empty) still means "unset" and falls through to the file/default.
+
+- **Operator-visible break: a `[networks.<net>] fee_rate` below the relay floor is now REFUSED**,
+  as a top-level `fee_rate` already was. If you carry a low per-network rate for a local regtest
+  indexer, raise it to at least 10,000 photons/byte (the default) — a sub-floor transaction
+  cannot be fee-bumped on Radiant and squats on its inputs until mempool expiry.
+
+- **Operator-visible break: `wallet send --fee-rate` / `wallet sweep --fee-rate` now apply the
+  same relay floor**, and their help text now correctly reads **photons per BYTE** (it said
+  "per kB"; the code has always been per byte). The refusal happens before the mnemonic prompt.
+
+- **Library break: `HdWallet.load_or_create(..., normalize=False)` on a path with no wallet file
+  now raises `ValidationError` instead of creating one.** `normalize=False` is a recovery mode for
+  pre-0.12.0 wallets; drop it to create a new wallet. The load branch is unchanged.
+
+- **Library break: `FailoverElectrumXClient(profile)` with `verify_chain=True` (the default) now
+  raises when `profile.genesis_hash is None`**, rather than skipping the chain check. Pass
+  `verify_chain=False` to accept an unverified chain binding explicitly.
+
+- **Library note: `pyrxd.base58` and `pyrxd.utils` decode failures now raise
+  `pyrxd.security.errors.Base58Error`** with a static message that never contains the input.
+  `Base58Error` subclasses both `ValidationError` and `ValueError`, so existing
+  `except ValueError` and `except RxdSdkError` handlers keep working; only code matching on the
+  *message text* needs updating.
 
 - **Operator-visible break: `--network testnet` / `--network regtest` now REFUSE to run a
   network command unless you configure an endpoint for that network.** Previously they

@@ -26,6 +26,7 @@ import re
 from typing import Any
 
 __all__ = [
+    "Base58Error",
     "ConfirmationTimeoutError",
     "ContractExhaustedError",
     "CovenantError",
@@ -143,6 +144,28 @@ class KeyMaterialError(RxdSdkError):
 
 class ValidationError(RxdSdkError):
     """Raised when input fails a trust-boundary validation check."""
+
+
+class Base58Error(ValidationError, ValueError):
+    """A base58 / base58check string could not be decoded.
+
+    **Never carries the offending string, or any part of it.** The decoder cannot
+    know whether the thing it was handed is an address (public) or a WIF / xprv
+    (spending authority), so it must assume the worst. Echoing a WIF with one
+    mistyped character — a line wrap, a stray space, an ``O``/``I``/``l`` typo —
+    publishes 51 of its 52 characters into terminal scrollback and any pasted bug
+    report, and a few thousand checksum-verifiable candidates recover the key.
+    Length, position, and the decoded prefix are all withheld for the same reason.
+
+    Parentage is deliberately dual:
+
+    * :class:`ValidationError` — this is a trust-boundary rejection like every
+      other, and ``except RxdSdkError`` handlers must catch it.
+    * :class:`ValueError` — :mod:`pyrxd.base58` and :func:`pyrxd.utils.decode_wif`
+      raised bare ``ValueError`` for the SDK's whole history, and callers across
+      the CLI, ``hd``, and ``gravity`` still catch that. Widening rather than
+      swapping keeps every one of them working.
+    """
 
 
 class InsufficientFundsError(ValidationError):

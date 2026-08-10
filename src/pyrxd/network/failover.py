@@ -116,7 +116,9 @@ class FailoverElectrumXClient:
     verify_chain:
         Verify each endpoint's genesis hash on first use (default ``True``). Only
         turn this off for a chain pyrxd has no constant for — and then you are
-        trusting the URL, which is what got us here.
+        trusting the URL, which is what got us here. Leaving it ``True`` for a
+        profile that carries no genesis hash is a construction error and raises:
+        the check must never silently become a no-op.
 
     Notes
     -----
@@ -139,6 +141,20 @@ class FailoverElectrumXClient:
             raise ValidationError(f"profile must be a NetworkProfile, got {type(profile).__name__}")
         if not isinstance(timeout, (int, float)) or timeout <= 0:
             raise ValidationError("timeout must be a positive number")
+        if verify_chain and profile.genesis_hash is None:
+            # Fail CLOSED. `_client_for` used to skip `assert_chain` outright when the
+            # profile had no genesis hash, so "pyrxd has no constant for this chain"
+            # silently degraded into "do not verify the chain at all" — the one check
+            # that catches a regtest-labelled config pointed at a mainnet server. A
+            # check that quietly turns itself off is worse than no check, because it
+            # is believed. Callers who really are on a chain pyrxd has no constant for
+            # must say so with `verify_chain=False` and own that decision.
+            raise ValidationError(
+                f"no genesis hash is known for network {profile.network!r}, so this client's "
+                "endpoints cannot be verified to be on the chain you asked for. Use one of the "
+                "networks pyrxd ships a genesis constant for, or pass verify_chain=False to "
+                "accept an unverified chain binding explicitly."
+            )
         self._profile = profile
         self._timeout = float(timeout)
         self._factory = client_factory or self._default_factory

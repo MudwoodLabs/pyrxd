@@ -34,7 +34,7 @@ def test_base58check_encode():
 def test_base58check_decode():
     assert base58check_decode("3vQB7B6MrGQZaxCuFg4oh") == b"hello world"
     assert base58check_decode(ADDRESS) == MAIN_ADDRESS_PREFIX + PUBLIC_KEY_HASH
-    with pytest.raises(ValueError, match=r"invalid base58 encoded"):
+    with pytest.raises(ValueError, match=r"invalid base58 encoding"):
         base58check_decode("l")
     with pytest.raises(ValueError, match=r"unmatched base58 checksum"):
         base58check_decode("L")

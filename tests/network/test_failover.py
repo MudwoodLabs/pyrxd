@@ -299,8 +299,26 @@ async def test_a_transport_failure_during_the_chain_check_does_fail_over() -> No
     assert fakes[B].chain_checks == 1
 
 
-async def test_no_chain_check_when_the_profile_has_no_genesis() -> None:
-    client, fakes = build([A], genesis=None, verify_chain=True)
+async def test_a_genesisless_profile_is_refused_rather_than_silently_unverified() -> None:
+    """Was ``test_no_chain_check_when_the_profile_has_no_genesis``, which asserted the bug.
+
+    ``_client_for`` used to skip ``assert_chain`` outright when the profile carried
+    no genesis hash, so ``verify_chain=True`` on a genesis-less profile degraded to
+    "no chain check at all" — measured at 0 checks — while the caller believed the
+    binding was being verified. That is the state an un-normalized ``PYRXD_NETWORK``
+    put the CLI into (``genesis_hash_for("REGTEST") is None``), and it is the one
+    check that would have caught a "regtest" run pointed at a mainnet server.
+
+    Construction now fails closed instead; opting out must be explicit.
+    """
+    with pytest.raises(ValidationError, match="no genesis hash is known"):
+        build([A], genesis=None, verify_chain=True)
+
+
+async def test_verify_chain_false_still_permits_a_genesisless_profile() -> None:
+    """The explicit opt-out is preserved — that is the escape hatch for a chain
+    pyrxd ships no constant for, and it is the caller's stated decision."""
+    client, fakes = build([A], genesis=None, verify_chain=False)
     await client.get_tip_height()
     assert fakes[A].chain_checks == 0
 

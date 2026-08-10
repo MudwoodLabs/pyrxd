@@ -155,7 +155,10 @@ class TestDecodeWifErrors:
         # Manually encode: prefix 0x00 + 32 bytes
         raw = bytes([0x00]) + b"\xab" * 32
         encoded = base58check_encode(raw)
-        with pytest.raises(ValueError, match="unknown WIF prefix"):
+        # The message no longer interpolates the decoded version byte — see
+        # tests/security/test_key_material_never_echoed.py. Nothing decoded from
+        # a WIF goes into an error message.
+        with pytest.raises(ValueError, match="unknown WIF network prefix"):
             decode_wif(encoded)
 
 
