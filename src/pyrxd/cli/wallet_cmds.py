@@ -223,15 +223,47 @@ def wallet_load(ctx: CliContext, passphrase: bool) -> None:
 
 @wallet_group.command(name="export-xpub")
 @click.option("--passphrase/--no-passphrase", default=False)
+@click.option(
+    "--descriptor",
+    is_flag=True,
+    default=False,
+    help="Also emit pkh() output-script descriptors (receive + change) with key-origin metadata.",
+)
+@click.option(
+    "--checksum",
+    is_flag=True,
+    default=False,
+    help=(
+        "Append the BIP380 #checksum to the descriptors. Requires --descriptor. "
+        "Radiant Core REJECTS checksummed descriptors; use this only for "
+        "Bitcoin-Core-lineage tools that require one."
+    ),
+)
 @click.pass_obj
-def wallet_export_xpub(ctx: CliContext, passphrase: bool) -> None:
+def wallet_export_xpub(ctx: CliContext, passphrase: bool, descriptor: bool, checksum: bool) -> None:
     """Print the account-level xpub for watch-only / recipient use.
 
     The xpub at ``m/44'/<coin_type>'/<account>'`` lets external tools generate
-    receive addresses for this wallet without ever seeing the seed.
-    Safe to share with watch-only services or merchant integrations.
-    No private key material is exported.
+    receive addresses for this wallet without ever seeing the seed. No private
+    key material is exported.
+
+    With ``--descriptor``, also prints ``pkh()`` output-script descriptors for
+    the receive (``/0/*``) and change (``/1/*``) chains, carrying the master
+    fingerprint and full BIP44 path. That is what other wallets want for a
+    clean watch-only import; a bare xpub leaves them guessing the script type
+    and the origin.
+
+    PRIVACY: an xpub (and therefore a descriptor) reveals every address this
+    wallet will ever derive, on BOTH chains, plus the links between them. That
+    is a much larger disclosure than handing out one address — share it only
+    with a party you would let see your whole transaction history.
     """
+    if checksum and not descriptor:
+        raise UserError(
+            "--checksum has no effect without --descriptor",
+            cause="the checksum is a suffix on the descriptor string, not on the xpub",
+            fix="pass --descriptor --checksum, or drop --checksum",
+        )
     if not ctx.wallet_path.exists():
         raise UserError(
             f"no wallet at {ctx.wallet_path}",
@@ -251,22 +283,41 @@ def wallet_export_xpub(ctx: CliContext, passphrase: bool) -> None:
     except (ValidationError, ValueError) as exc:
         raise WalletDecryptError() from exc
 
-    xpub = wallet._xprv.xpub()
-    payload = {
+    xpub = wallet.account_xpub()
+    payload: dict[str, object] = {
         "xpub": str(xpub),
         "account": wallet.account,
-        "path": f"m/44'/{wallet.coin_type}'/{wallet.account}'",
+        "path": wallet.account_path,
     }
+    descriptors = wallet.descriptors(checksum=checksum) if descriptor else None
+    if descriptors is not None:
+        payload.update(descriptors.as_dict())
+        payload["descriptor_checksum"] = checksum
+
     if ctx.output_mode == "json":
         click.echo(emit(payload, mode="json"))
     elif ctx.output_mode == "quiet":
-        click.echo(emit(payload, mode="quiet", quiet_field="xpub"))
+        # Quiet mode stays single-valued: the descriptor when one was asked
+        # for (it supersedes the xpub for the import use case), else the xpub.
+        click.echo(emit(payload, mode="quiet", quiet_field="descriptor_receive" if descriptor else "xpub"))
     else:
-        click.echo(f"\nxpub at m/44'/{wallet.coin_type}'/{wallet.account}':")
+        click.echo(f"\nxpub at {wallet.account_path}:")
         click.echo(f"  {xpub}")
-        click.echo("\nThis xpub lets external tools generate receive addresses")
-        click.echo("for this wallet WITHOUT seeing the seed. Safe to share with")
-        click.echo("watch-only services. Do NOT share the mnemonic.")
+        if descriptors is not None:
+            click.echo(f"\noutput script descriptors (master fingerprint {descriptors.master_fingerprint}):")
+            click.echo(f"  receive: {descriptors.receive}")
+            click.echo(f"  change:  {descriptors.change}")
+            click.echo("\nImport BOTH. A watch-only import that omits the change")
+            click.echo("descriptor silently under-reports the balance.")
+            if checksum:
+                click.echo("\nNOTE: --checksum was used. Radiant Core REJECTS checksummed")
+                click.echo("descriptors ('Invalid descriptor'); re-run without --checksum")
+                click.echo("for radiant-cli scantxoutset.")
+        click.echo("\nThis exports NO private key material — external tools can")
+        click.echo("derive addresses but cannot spend. Do NOT share the mnemonic.")
+        click.echo("PRIVACY: it does reveal every address this wallet will ever")
+        click.echo("derive on both chains, so share it only with a party you")
+        click.echo("would let see your whole transaction history.")
 
 
 @wallet_group.command(name="info")
