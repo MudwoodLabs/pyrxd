@@ -322,6 +322,20 @@ Each scenario lists actor → action → asset → control(s) → residual risk.
 - **Explicitly NOT built:** RBF and CPFP fee-bump paths. Neither exists on this chain; a "just bump the fee" proposal is Bitcoin semantics assumed onto a BCH-lineage chain. The remedy is pre-sizing, not escalation.
 - **Residual risk:** an operator whose fee source is *underfunded* still cannot spend — but they now learn at build time, with an exact shortfall, instead of after an irreversible broadcast. The urgency multiplier is a **policy choice, not a measured inclusion model**: no Radiant fee/confirmation-time curve has been measured, so the premium buys headroom against relay-policy change and mempool competition and claims nothing about latency. Fee-source availability under a deadline remains an operator responsibility (see the watchtower runbook).
 
+### S22: Capital-lockup griefing — the accepted LIVENESS residual (TA8, economic)
+
+- **Action:** A counterparty repeatedly opens swaps, lets the victim lock capital on-chain, then simply **never locks their own leg**. The victim is made whole — eventually — but their funds are immobilised for the full timelock and they pay two on-chain fees. The attacker's move is *inaction*: they never transact, so there is nothing to slash and nothing to observe on-chain.
+- **Asset:** none lost. **Availability of the victim's capital**, and their fees.
+- **Why the asymmetry is structural** (verified against the shipped state machine, not inferred):
+  - The **taker locks first** — `swap_state.py`: `NEGOTIATED --> BTC_LOCKED : taker funds BTC P2TR HTLC (locks FIRST)`.
+  - The taker's own refund is the **longer** timelock — `assert_timelock_margin` enforces `t_btc - t_rxd >= margin` (`swap_coordinator.py:475`). That direction is deliberate and correct (it is what prevents the far worse one-sided-loss race), but it means the party who commits first also waits longest to get out.
+  - Recourse works and is slow: `taker_refund_btc` is valid from `BTC_LOCKED` once `t_btc` elapses.
+  - Attacker cost to repeat: **~zero**. Victim cost: linear in swaps accepted.
+- **Why no test catches it:** every safety oracle asks whether anyone ended with less than they started. Here **nobody does** — the both-complete-XOR-both-refund invariant holds and the record reaches `ABORTED` cleanly. A griefing campaign and a counterparty with flaky connectivity are **indistinguishable** to every check in the adversarial matrix. It survived a red-team pass and an eight-reviewer panel unflagged because it is not a defect; it is a property of HTLC swaps.
+- **Control:** operational, not protocol. Order the legs by trust (taker-locks-first is a default, not a consensus rule — have an untrusted counterparty lock first); size `t_btc` deliberately, since everything above the safety floor is chosen and directly lengthens the griefing window; keep counterparty state at the negotiation layer; and **do not auto-accept orders from unknown counterparties** — automation is the risk multiplier, not the attack.
+- **Explicitly NOT built:** a bond or deposit. It would change the protocol for every honest swap to price a threat with **no observed instance**; escrow needs adjudication, which is new consensus-adjacent surface on an already-unaudited stack; and slashing on abort cannot distinguish malice from a stalled node, punishing the users least able to absorb it. Full reasoning and the revisit trigger: `docs/solutions/design-decisions/griefing-is-a-liveness-residual-not-a-bond.md`.
+- **Residual risk:** REAL and **ACCEPTED**. Stated plainly: **pyrxd's swap stack defends SAFETY, not LIVENESS.** It will not let a counterparty take your funds; it will not stop one wasting your time and immobilising your capital for a timelock at near-zero cost to themselves. Revisit on an actual incident, or when the orderbook carries untrusted counterparties at volume.
+
 ## Controls in place
 
 Cross-reference of controls and the threats they address:
