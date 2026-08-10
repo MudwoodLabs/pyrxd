@@ -213,8 +213,13 @@ parallel miner (`pyrxd.contrib.miner`) by default, which uses
 `multiprocessing` to sweep the V1 4-byte nonce space across all cores
 (~2-3 minutes on the 32-core machine this was measured on — check yours
 with `pyrxd glyph dmint-estimate`). It runs inside the CLI process, so it
-can report live hash rate and ETA; an external `--miner-cmd` cannot,
-because the JSON-over-stdio protocol carries no progress frames. The old
+can report live hash rate and ETA directly. An external `--miner-cmd`
+can too, but only if the miner emits it: the wire protocol carries
+OPTIONAL progress frames on stderr (see
+`docs/concepts/parallel-mining.md`) — the bundled miner does this when
+invoked via `EXTERNAL_MINER="python -m pyrxd.contrib.miner"`, and a
+third-party binary can adopt the same convention; one that predates it
+just stays silent until it finishes, which still works. The old
 single-threaded `mine_solution` is still available as a library call but
 is not the default path. An external/GPU miner via `EXTERNAL_MINER` is
 the only reason to configure anything in this step.

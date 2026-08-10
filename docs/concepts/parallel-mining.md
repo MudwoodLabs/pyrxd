@@ -68,6 +68,43 @@ convention can still surface exhaustion by sleeping past the parent's
 `timeout_s` — pyrxd will SIGKILL it and raise `MaxAttemptsError` via
 the timeout path. Both behaviours are valid.
 
+### Progress frames (stderr, optional — added after 0.13.0)
+
+While it searches, a miner MAY write zero or more progress lines to
+**stderr** — never stdout, never mixed with the response above:
+
+```json
+{"progress": {"attempts": 4200000, "elapsed_s": 1.7}}
+```
+
+This needed no `protocol` version bump — it's still `protocol: 1` —
+because it is purely additive on both sides:
+
+* stdout keeps carrying exactly one line, unchanged. Every consumer
+  that only ever reads stdout (every consumer before this addition)
+  sees no difference.
+* An old miner that has never heard of progress frames writes nothing
+  extra to stderr. Silence is valid: no progress is shown, exactly as
+  before.
+* A new miner talking to an old parent that still discards stderr
+  outright is equally safe — the frames land in a stream nobody reads.
+
+Pass `mine_solution_external(..., progress=callback)` to opt in on the
+consumer side. Progress is a **display hint, not a trust boundary**: a
+malformed or adversarial line is silently dropped (it can never be
+parsed into anything that looks like a solution — the parser can only
+ever produce an `(attempts, elapsed_s)` pair, and stdout is the only
+channel the result parser reads), and stays bounded in memory no
+matter how much or how fast a miner writes to stderr — see
+`pyrxd.glyph.dmint.miner._ExternalMinerProgressReader` for the reader
+that replaced the old `stderr=subprocess.DEVNULL` and keeps its same
+flat-memory guarantee.
+
+The bundled `pyrxd.contrib.miner` emits these frames by default
+(`--quiet` suppresses them, same as the exhaustion message) — it is
+the reference implementation of this extension as well as of the base
+protocol.
+
 ### Exit codes
 
 | Code | Meaning                                                  |
@@ -197,9 +234,26 @@ def on_progress(attempts: int, elapsed_s: float) -> None:
 result = mine(MineParams(...), progress=on_progress)
 ```
 
-`pyrxd.glyph.dmint.mine_solution` accepts the same `progress` hook. The
-external-miner path does **not**: the JSON-over-stdio protocol carries
-no progress frames, and extending it is a follow-up.
+`pyrxd.glyph.dmint.mine_solution` accepts the same `progress` hook, and
+so does `mine_solution_external` (added after 0.13.0 — see "Progress
+frames" above):
+
+```python
+from pyrxd.glyph.dmint import mine_solution_external
+
+result = mine_solution_external(
+    preimage=preimage,
+    target=target,
+    miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner"],
+    nonce_width=4,
+    progress=lambda attempts, elapsed: ...,   # called if the miner emits frames
+)
+```
+
+An external miner that never emits a progress frame (the common case
+for a third-party binary that predates this addition) simply means the
+callback is never called — the grind still runs to completion or
+timeout exactly as it would with `progress=None`.
 
 ### Why pure-Python and not C / GPU
 

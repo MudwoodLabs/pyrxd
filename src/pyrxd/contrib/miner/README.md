@@ -44,9 +44,16 @@ echo '{"preimage_hex":"...","target_hex":"7fffffffffffffff","nonce_width":4}' \
 Flags:
 
 - `--workers N` — override `os.cpu_count()`.
-- `--quiet` — suppress stderr progress on exhaustion.
+- `--quiet` — suppress stderr progress output (both the periodic
+  progress frames and the exhaustion message).
 - `--protocol-version` — print supported protocol version.
 - `--help` — full usage.
+
+While it searches, the miner writes optional progress frames to
+stderr (`{"progress": {"attempts": N, "elapsed_s": F}}`, one JSON
+object per line) — pass `progress=` to `mine_solution_external` to
+receive them. This is purely additive: an older pyrxd that never asks
+for progress simply discards stderr as it always did.
 
 ## Protocol
 
