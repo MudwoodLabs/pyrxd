@@ -2,11 +2,20 @@
 
 Mirrors the shim/mock pattern in ``tests/test_glyph_transfer.py`` so the
 full signing pipeline can be exercised against synthetic UTXOs.
+
+The fixtures build UTXOs the way the chain does — ``ft_amount == value``,
+because an FT's quantity IS its output's photons — and fund the fee from a
+separate plain-RXD input. The previous fixtures set ``value`` to a fixed
+5,000,000 regardless of ``ft_amount``, a shape that cannot exist on chain, and
+that is precisely why the transfer builder's fund-loss bug survived: every test
+exercised the one input shape the author had in mind.
 """
 
 from __future__ import annotations
 
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
 from pyrxd.glyph.builder import (
     FtTransferParams,
@@ -14,7 +23,7 @@ from pyrxd.glyph.builder import (
     FtUtxo,
     GlyphBuilder,
 )
-from pyrxd.glyph.ft import FtUtxoSet
+from pyrxd.glyph.ft import AirdropFunding, FtUtxoSet
 from pyrxd.glyph.script import (
     build_ft_locking_script,
     extract_owner_pkh_from_ft_script,
@@ -31,24 +40,30 @@ from pyrxd.transaction.transaction import Transaction
 # Fixtures
 # ---------------------------------------------------------------------------
 
-_ALICE_KEY_INT = 0x1111111111111111111111111111111111111111111111111111111111111111
-_BOB_PKH = bytes(range(20, 40))  # 20 bytes, distinct from Alice
-_CHARLIE_PKH = bytes(range(40, 60))  # 20 bytes, distinct
+# Keys are GENERATED, never written down. `PrivateKey()` draws from the
+# library's own CSPRNG; a hard-coded low-entropy test key in this repo was once
+# swept on a live chain by a scanning bot, so no test may introduce another.
+_ALICE = PrivateKey()
+_FUNDER = PrivateKey()
+_BOB_PKH = PrivateKey().public_key().hash160()
+_CHARLIE_PKH = PrivateKey().public_key().hash160()
 
 # Token's minting ref (synthetic).
 _REF_TXID = "cd" * 32  # 64 hex chars
 _REF_VOUT = 0
 
-# Default RXD value carried on each FT UTXO — plenty for several transfer fees.
-_DEFAULT_RXD_VALUE = 5_000_000
+# Plain-RXD funding for the fee. A 1-FT-input transfer is ~510 bytes, so at the
+# 10,000 photons/byte floor the fee is ~5.1M; 50M leaves room for the
+# multi-input and higher-fee-rate cases without re-tuning every test.
+_FUNDING_VALUE = 50_000_000
 
 
 def _alice_key() -> PrivateKey:
-    return PrivateKey(_ALICE_KEY_INT)
+    return _ALICE
 
 
 def _alice_pkh() -> bytes:
-    return _alice_key().public_key().hash160()
+    return _ALICE.public_key().hash160()
 
 
 def _token_ref() -> GlyphRef:
@@ -65,18 +80,37 @@ def _make_utxo(
     *,
     txid_byte: int = 0xA0,
     vout: int = 0,
-    value: int = _DEFAULT_RXD_VALUE,
+    value: int | None = None,
     owner_pkh: bytes | None = None,
     ref: GlyphRef | None = None,
 ) -> FtUtxo:
-    """Build a synthetic FT UTXO. ``txid_byte`` seeds a unique txid."""
+    """Build a synthetic FT UTXO. ``txid_byte`` seeds a unique txid.
+
+    ``value`` defaults to ``ft_amount`` — the only relationship that exists on
+    chain. Pass it explicitly to construct an impossible UTXO on purpose.
+    """
     return FtUtxo(
         txid=bytes([txid_byte]).hex() * 32,  # 64-hex txid (all the same byte)
         vout=vout,
-        value=value,
+        value=ft_amount if value is None else value,
         ft_amount=ft_amount,
         ft_script=_ft_script_for(owner_pkh or _alice_pkh(), ref),
     )
+
+
+def _funding(value: int = _FUNDING_VALUE, *, txid_byte: int = 0xF0, vout: int = 0) -> AirdropFunding:
+    """A plain-P2PKH RXD UTXO that pays the transfer fee."""
+    return AirdropFunding(
+        txid=bytes([txid_byte]).hex() * 32,
+        vout=vout,
+        value=value,
+        private_key=_FUNDER,
+    )
+
+
+def _ft_outputs(result) -> list:
+    """The transaction outputs that carry the token (75-byte FT locks)."""
+    return [o for o in result.tx.outputs if is_ft_script(o.locking_script.serialize().hex())]
 
 
 # ---------------------------------------------------------------------------
@@ -154,22 +188,160 @@ class TestSelect:
 
 
 # ---------------------------------------------------------------------------
+# The recipient gets exactly `amount` — the A1 regression surface
+# ---------------------------------------------------------------------------
+
+
+class TestRecipientAmountIsExact:
+    """``build_transfer_tx`` must deliver ``amount`` units, never an RXD figure.
+
+    History: the builder sized the recipient output as
+    ``rxd_in_total - fee - change_alloc``. On a 50,000,000-unit UTXO an
+    ``amount=250`` transfer delivered 46,739,454 units — the sender's whole
+    balance. A later patch guarded ``value == ft_amount`` and left the
+    expression alone, so the same call at ``value == ft_amount ± 1`` still
+    delivered ~46.7 million. These tests pin the property, not the shapes.
+    """
+
+    _SHAPES = [
+        (1, 1),
+        (2, 1),
+        (100, 40),
+        (100, 100),
+        (546, 545),
+        (547, 546),
+        (1_000, 1),
+        (50_000_000, 250),
+        (50_000_000, 49_999_999),
+        (50_000_000, 50_000_000),
+        (2**32, 1),
+        (2**32 + 1, 2**32),
+        (2**40, 12_345),
+    ]
+
+    @pytest.mark.parametrize(("ft_amount", "amount"), _SHAPES)
+    def test_recipient_receives_exactly_amount(self, ft_amount: int, amount: int):
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(ft_amount)])
+        result = s.build_transfer_tx(
+            amount=amount,
+            new_owner_pkh=Hex20(_BOB_PKH),
+            private_key=_alice_key(),
+            funding=[_funding()],
+        )
+        ft_outs = _ft_outputs(result)
+        assert ft_outs[0].locking_script.serialize() == result.new_ft_script
+        assert ft_outs[0].satoshis == amount
+
+    @pytest.mark.parametrize(("ft_amount", "amount"), _SHAPES)
+    def test_conservation_ft_in_equals_ft_out(self, ft_amount: int, amount: int):
+        """sum(ft_in) == sum(ft_out): nothing minted, nothing burned."""
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(ft_amount)])
+        result = s.build_transfer_tx(
+            amount=amount,
+            new_owner_pkh=Hex20(_BOB_PKH),
+            private_key=_alice_key(),
+            funding=[_funding()],
+        )
+        assert sum(o.satoshis for o in _ft_outputs(result)) == ft_amount
+
+    @settings(max_examples=40, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+    @given(
+        ft_amount=st.integers(min_value=1, max_value=2**45),
+        frac=st.floats(min_value=0.0, max_value=1.0, allow_nan=False),
+        fee_rate=st.integers(min_value=10_000, max_value=40_000),
+    )
+    def test_property_amount_and_conservation_hold(self, ft_amount: int, frac: float, fee_rate: int):
+        amount = max(1, min(ft_amount, int(ft_amount * frac) or 1))
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(ft_amount)])
+        result = s.build_transfer_tx(
+            amount=amount,
+            new_owner_pkh=Hex20(_BOB_PKH),
+            private_key=_alice_key(),
+            fee_rate=fee_rate,
+            funding=[_funding(_FUNDING_VALUE * 4)],
+        )
+        ft_outs = _ft_outputs(result)
+        assert ft_outs[0].satoshis == amount
+        assert sum(o.satoshis for o in ft_outs) == ft_amount
+
+    def test_recipient_value_does_not_depend_on_the_rxd_budget(self):
+        """Differential: the delivered quantity is a function of ``amount`` alone.
+
+        Same token inputs, wildly different fee rates and funding sizes. If any
+        part of the recipient output were still derived from the RXD budget —
+        the shape of the original bug — these would disagree.
+        """
+        delivered = set()
+        for fee_rate, fund_value in [
+            (10_000, 20_000_000),
+            (10_000, 900_000_000),
+            (37_000, 900_000_000),
+            (10_001, 20_500_000),
+        ]:
+            s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(50_000_000)])
+            result = s.build_transfer_tx(
+                amount=250,
+                new_owner_pkh=Hex20(_BOB_PKH),
+                private_key=_alice_key(),
+                fee_rate=fee_rate,
+                funding=[_funding(fund_value)],
+            )
+            ft_outs = _ft_outputs(result)
+            delivered.add((ft_outs[0].satoshis, ft_outs[1].satoshis))
+        assert delivered == {(250, 49_999_750)}
+
+    def test_original_fund_loss_shape_is_correct_now(self):
+        """The exact reported case: 50,000,000 units held, 250 requested."""
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(50_000_000)])
+        result = s.build_transfer_tx(
+            amount=250,
+            new_owner_pkh=Hex20(_BOB_PKH),
+            private_key=_alice_key(),
+            funding=[_funding()],
+        )
+        ft_outs = _ft_outputs(result)
+        assert [o.satoshis for o in ft_outs] == [250, 49_999_750]
+        assert ft_outs[0].satoshis != 46_739_454  # the number the bug produced
+
+    @pytest.mark.parametrize("delta", [-1_000_000, -1, 1, 1_000_000])
+    def test_impossible_value_ft_amount_mismatch_fails_closed(self, delta: int):
+        """``value != ft_amount`` cannot exist on chain, in EITHER direction.
+
+        ``ft_amount > value`` would materialise more of the ref than the inputs
+        carry and consensus rejects it; ``ft_amount < value`` means the caller
+        built ``FtUtxo`` from the wrong field and the surplus photons would be
+        burned. Both refuse rather than guess which number the caller meant.
+        This is a backstop: the exactness above does not depend on it.
+        """
+        utxo = _make_utxo(50_000_000, value=50_000_000 + delta)
+        s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
+        with pytest.raises(ValidationError, match="value.*ft_amount|ft_amount.*value"):
+            s.build_transfer_tx(
+                amount=250,
+                new_owner_pkh=Hex20(_BOB_PKH),
+                private_key=_alice_key(),
+                funding=[_funding()],
+            )
+
+
+# ---------------------------------------------------------------------------
 # Conservation
 # ---------------------------------------------------------------------------
 
 
 class TestConservation:
     def test_exact_amount_no_change(self):
-        """Transfer exactly the full input ft_amount — no change output."""
+        """Transfer exactly the full input ft_amount — no FT change output."""
         utxo = _make_utxo(ft_amount=100)
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         result = s.build_transfer_tx(
             amount=100,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert result.change_ft_script is None
-        assert len(result.tx.outputs) == 1
+        assert len(_ft_outputs(result)) == 1
 
     def test_change_case_partial_amount(self):
         """Transfer less than total — change output must exist."""
@@ -179,9 +351,10 @@ class TestConservation:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert result.change_ft_script is not None
-        assert len(result.tx.outputs) == 2
+        assert len(_ft_outputs(result)) == 2
 
     def test_conservation_ft_in_equals_ft_out(self):
         """sum(input ft) == amount + ft_change (always, by math)."""
@@ -194,16 +367,17 @@ class TestConservation:
         ft_in = sum(u.ft_amount for u in selected)
         amount = 90
         ft_change = ft_in - amount
-        # Build the tx — it must not raise, confirming the conservation
-        # invariant assertion holds at runtime.
         result = s.build_transfer_tx(
             amount=amount,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert ft_in == amount + ft_change
         # Change output present iff there is leftover FT.
         assert (result.change_ft_script is not None) == (ft_change > 0)
+        # …and the outputs really carry those numbers.
+        assert [o.satoshis for o in _ft_outputs(result)] == [amount, ft_change]
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +393,7 @@ class TestOutputScripts:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         # Classifier passes => script matches the canonical FT layout.
         assert is_ft_script(result.new_ft_script.hex())
@@ -233,6 +408,7 @@ class TestOutputScripts:
             amount=30,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert result.change_ft_script is not None
         assert is_ft_script(result.change_ft_script.hex())
@@ -246,9 +422,10 @@ class TestOutputScripts:
             amount=100,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert result.change_ft_script is None
-        assert len(result.tx.outputs) == 1
+        assert len(_ft_outputs(result)) == 1
 
     def test_transfer_output_locked_to_new_owner(self):
         utxo = _make_utxo(100)
@@ -257,6 +434,7 @@ class TestOutputScripts:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         pkh_in_script = extract_owner_pkh_from_ft_script(result.new_ft_script)
         assert bytes(pkh_in_script) == _BOB_PKH
@@ -268,6 +446,7 @@ class TestOutputScripts:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert result.change_ft_script is not None
         pkh_in_script = extract_owner_pkh_from_ft_script(result.change_ft_script)
@@ -281,6 +460,7 @@ class TestOutputScripts:
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
             change_pkh=Hex20(_CHARLIE_PKH),
+            funding=[_funding()],
         )
         assert result.change_ft_script is not None
         pkh_in_script = extract_owner_pkh_from_ft_script(result.change_ft_script)
@@ -300,6 +480,7 @@ class TestRefPreservation:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert extract_ref_from_ft_script(result.new_ft_script) == _token_ref()
         assert result.ref == _token_ref()
@@ -311,6 +492,7 @@ class TestRefPreservation:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert result.change_ft_script is not None
         assert extract_ref_from_ft_script(result.change_ft_script) == _token_ref()
@@ -321,7 +503,7 @@ class TestRefPreservation:
         utxo_wrong_ref = FtUtxo(
             txid="aa" * 32,
             vout=0,
-            value=_DEFAULT_RXD_VALUE,
+            value=100,
             ft_amount=100,
             ft_script=_ft_script_for(_alice_pkh(), ref=other_ref),
         )
@@ -337,7 +519,7 @@ class TestRefPreservation:
         utxo = FtUtxo(
             txid="aa" * 32,
             vout=0,
-            value=_DEFAULT_RXD_VALUE,
+            value=100,
             ft_amount=100,
             ft_script=plain_p2pkh,
         )
@@ -349,7 +531,7 @@ class TestRefPreservation:
         utxo = FtUtxo(
             txid="aa" * 32,
             vout=0,
-            value=_DEFAULT_RXD_VALUE,
+            value=100,
             ft_amount=100,
             ft_script=_ft_script_for(_alice_pkh()).hex(),  # type: ignore[arg-type]
         )
@@ -370,20 +552,29 @@ class TestFee:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert result.fee > 0
 
-    def test_fee_lt_input_rxd_total(self):
-        utxo = _make_utxo(100, value=_DEFAULT_RXD_VALUE)
+    def test_fee_comes_from_funding_not_from_the_token(self):
+        """The token side contributes nothing to the fee — it is all units."""
+        utxo = _make_utxo(100)
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         result = s.build_transfer_tx(
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
-        assert result.fee < _DEFAULT_RXD_VALUE
+        assert result.fee < _FUNDING_VALUE
+        assert sum(o.satoshis for o in _ft_outputs(result)) == 100
 
-    def test_fee_matches_size_times_rate(self):
+    def test_fee_clears_size_times_rate(self):
+        """Radiant has no RBF and no CPFP: a sub-floor fee is unfixable.
+
+        ``>=`` not ``==``: a sub-dust RXD remainder is folded into the fee
+        rather than emitted as an output, which can only raise what is paid.
+        """
         utxo = _make_utxo(100)
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         result = s.build_transfer_tx(
@@ -391,33 +582,44 @@ class TestFee:
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
             fee_rate=10_000,
+            funding=[_funding()],
         )
-        # byte_length of the final tx × fee_rate == result.fee
-        # (size between trial and final is stable: only output-value bytes
-        # change, and those are fixed 8-byte encodings.)
-        assert result.fee == result.tx.byte_length() * 10_000
+        assert result.fee >= result.tx.byte_length() * 10_000
 
     def test_higher_fee_rate_produces_higher_fee(self):
-        utxo = _make_utxo(100, value=10_000_000)
+        utxo = _make_utxo(100)
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         low = s.build_transfer_tx(
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
             fee_rate=10_000,
+            funding=[_funding()],
         )
         high = s.build_transfer_tx(
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
             fee_rate=15_000,
+            funding=[_funding()],
         )
         assert high.fee > low.fee
 
-    def test_insufficient_rxd_for_dust_raises(self):
-        """Total RXD on selected inputs < fee + dust_limit * n_outputs must raise."""
-        # Single UTXO with just 1000 photons — not enough for a ~3.25M fee.
-        utxo = _make_utxo(100, value=1000)
+    def test_sub_floor_fee_rate_refused(self):
+        utxo = _make_utxo(100)
+        s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
+        with pytest.raises(ValueError, match="relay floor|photons/byte"):
+            s.build_transfer_tx(
+                amount=40,
+                new_owner_pkh=Hex20(_BOB_PKH),
+                private_key=_alice_key(),
+                fee_rate=1,
+                funding=[_funding()],
+            )
+
+    def test_no_funding_raises(self):
+        """The token cannot pay its own fee: every photon on it is a unit."""
+        utxo = _make_utxo(100)
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         with pytest.raises(ValueError, match="Insufficient RXD"):
             s.build_transfer_tx(
@@ -426,21 +628,34 @@ class TestFee:
                 private_key=_alice_key(),
             )
 
-    def test_rxd_distributed_change_gets_dust_transfer_gets_remainder(self):
-        """Change output = dust_limit; transfer output = rxd_in - fee - dust."""
-        utxo = _make_utxo(100, value=_DEFAULT_RXD_VALUE)
+    def test_insufficient_funding_raises(self):
+        """Funding below the fee must raise, not silently underpay."""
+        utxo = _make_utxo(100)
+        s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
+        with pytest.raises(ValueError, match="Insufficient RXD"):
+            s.build_transfer_tx(
+                amount=40,
+                new_owner_pkh=Hex20(_BOB_PKH),
+                private_key=_alice_key(),
+                funding=[_funding(1_000)],
+            )
+
+    def test_rxd_change_is_plain_p2pkh_not_a_token_output(self):
+        """Leftover funding comes back as plain RXD — never as extra units."""
+        utxo = _make_utxo(100)
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         result = s.build_transfer_tx(
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
-        # Two outputs: [transfer, change]
-        assert len(result.tx.outputs) == 2
-        change_val = result.tx.outputs[1].satoshis
-        transfer_val = result.tx.outputs[0].satoshis
-        assert change_val == 546  # dust_limit
-        assert transfer_val == _DEFAULT_RXD_VALUE - result.fee - 546
+        ft_outs = _ft_outputs(result)
+        assert [o.satoshis for o in ft_outs] == [40, 60]
+        rxd_change = [o for o in result.tx.outputs if o not in ft_outs]
+        assert len(rxd_change) == 1
+        spk = rxd_change[0].locking_script.serialize()
+        assert len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:] == b"\x88\xac"
 
 
 # ---------------------------------------------------------------------------
@@ -460,11 +675,13 @@ class TestTwoPassSigning:
         from pyrxd.transaction.transaction_output import TransactionOutput
 
         utxo = _make_utxo(100)
+        fund = _funding()
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         result = s.build_transfer_tx(
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[fund],
         )
 
         # Rebuild an equivalent tx from scratch with the *same* final output
@@ -483,17 +700,21 @@ class TestTwoPassSigning:
         inp.satoshis = utxo.value
         inp.locking_script = Script(bytes(utxo.ft_script))
 
-        outs = [
-            TransactionOutput(
-                Script(result.new_ft_script),
-                result.tx.outputs[0].satoshis,
-            ),
-            TransactionOutput(
-                Script(result.change_ft_script),  # type: ignore[arg-type]
-                result.tx.outputs[1].satoshis,
-            ),
-        ]
-        independent = Transaction(tx_inputs=[inp], tx_outputs=outs)
+        fund_spk = P2PKH().lock(fund.private_key.public_key().hash160())
+        fund_shim = [padding] * fund.vout + [TransactionOutput(fund_spk, fund.value)]
+        fund_src = Transaction(tx_inputs=[], tx_outputs=fund_shim)
+        fund_src.txid = lambda: fund.txid  # type: ignore[method-assign]
+        fund_inp = TransactionInput(
+            source_transaction=fund_src,
+            source_txid=fund.txid,
+            source_output_index=fund.vout,
+            unlocking_script_template=P2PKH().unlock(fund.private_key),
+        )
+        fund_inp.satoshis = fund.value
+        fund_inp.locking_script = fund_spk
+
+        outs = [TransactionOutput(o.locking_script, o.satoshis) for o in result.tx.outputs]
+        independent = Transaction(tx_inputs=[inp, fund_inp], tx_outputs=outs)
         independent.sign()
 
         assert result.tx.inputs[0].unlocking_script.serialize() == independent.inputs[0].unlocking_script.serialize()
@@ -505,6 +726,7 @@ class TestTwoPassSigning:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         raw = result.tx.serialize()
         assert len(raw) > 0
@@ -520,32 +742,35 @@ class TestMultipleInputs:
     def test_multiple_inputs_consolidated(self):
         """Three UTXOs (30 + 25 + 20 = 75), transfer 60 → all three spent."""
         utxos = [
-            _make_utxo(30, txid_byte=0x01, value=_DEFAULT_RXD_VALUE),
-            _make_utxo(25, txid_byte=0x02, value=_DEFAULT_RXD_VALUE),
-            _make_utxo(20, txid_byte=0x03, value=_DEFAULT_RXD_VALUE),
+            _make_utxo(30, txid_byte=0x01),
+            _make_utxo(25, txid_byte=0x02),
+            _make_utxo(20, txid_byte=0x03),
         ]
         s = FtUtxoSet(ref=_token_ref(), utxos=utxos)
         result = s.build_transfer_tx(
             amount=60,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
-        assert len(result.tx.inputs) == 3
+        # 3 FT inputs + 1 funding input.
+        assert len(result.tx.inputs) == 4
         # 75 in - 60 out = 15 change → change output present.
         assert result.change_ft_script is not None
-        assert len(result.tx.outputs) == 2
+        assert [o.satoshis for o in _ft_outputs(result)] == [60, 15]
 
     def test_single_input_exact_amount(self):
-        """Single input, exact amount — no change, one output."""
+        """Single input, exact amount — no FT change."""
         utxo = _make_utxo(100)
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         result = s.build_transfer_tx(
             amount=100,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
-        assert len(result.tx.inputs) == 1
-        assert len(result.tx.outputs) == 1
+        assert len(result.tx.inputs) == 2  # FT input + funding input
+        assert len(_ft_outputs(result)) == 1
         assert result.change_ft_script is None
 
 
@@ -563,6 +788,7 @@ class TestGlyphBuilderDelegates:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         result = GlyphBuilder().build_ft_transfer_tx(params)
         assert isinstance(result, FtTransferResult)
@@ -577,18 +803,49 @@ class TestGlyphBuilderDelegates:
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         via_builder = GlyphBuilder().build_ft_transfer_tx(params)
         via_direct = FtUtxoSet(ref=_token_ref(), utxos=[utxo]).build_transfer_tx(
             amount=40,
             new_owner_pkh=Hex20(_BOB_PKH),
             private_key=_alice_key(),
+            funding=[_funding()],
         )
         assert via_builder.fee == via_direct.fee
         assert via_builder.new_ft_script == via_direct.new_ft_script
         assert via_builder.change_ft_script == via_direct.change_ft_script
         assert len(via_builder.tx.inputs) == len(via_direct.tx.inputs)
         assert len(via_builder.tx.outputs) == len(via_direct.tx.outputs)
+
+    def test_transfer_matches_a_one_recipient_airdrop(self):
+        """Differential: the transfer path IS the airdrop path, so a
+        single-recipient airdrop must produce a byte-identical transaction."""
+        from pyrxd.glyph.builder import FtAirdropParams
+        from pyrxd.glyph.ft import AirdropRecipient
+
+        utxo = _make_utxo(100)
+        transfer = GlyphBuilder().build_ft_transfer_tx(
+            FtTransferParams(
+                ref=_token_ref(),
+                utxos=[utxo],
+                amount=40,
+                new_owner_pkh=Hex20(_BOB_PKH),
+                private_key=_alice_key(),
+                funding=[_funding()],
+            )
+        )
+        airdrop = GlyphBuilder().build_ft_airdrop_tx(
+            FtAirdropParams(
+                ref=_token_ref(),
+                utxos=[utxo],
+                recipients=[AirdropRecipient(pkh=Hex20(_BOB_PKH), amount=40)],
+                private_key=_alice_key(),
+                funding=[_funding()],
+            )
+        )
+        assert transfer.tx.serialize() == airdrop.tx.serialize()
+        assert transfer.fee == airdrop.fee
 
 
 # ---------------------------------------------------------------------------
@@ -616,3 +873,13 @@ class TestFtTransferParamsDefaults:
             private_key=_alice_key(),
         )
         assert params.change_pkh is None
+
+    def test_default_funding_is_empty(self):
+        params = FtTransferParams(
+            ref=_token_ref(),
+            utxos=[_make_utxo(100)],
+            amount=40,
+            new_owner_pkh=Hex20(_BOB_PKH),
+            private_key=_alice_key(),
+        )
+        assert params.funding == []

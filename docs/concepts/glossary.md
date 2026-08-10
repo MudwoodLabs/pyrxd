@@ -391,9 +391,13 @@ those for depth; use this page to look something up mid-task.
   push. A compliant wallet pays it; a non-compliant one does not, and both
   transactions confirm. pyrxd computes and pays it —
   `pyrxd.glyph.royalty`, and `royalty=` on the FT airdrop builder, which
-  pays by default once supplied — but never describes it as a guarantee.
-  (Not on `build_transfer_tx` or `build_nft_transfer_tx`: neither has a
-  plain-RXD input, so a royalty there could only be paid out of the token.) The `enforced` flag in the metadata means "wallets *should*
+  pays by default when the token's `enforced` flag is set and takes
+  `pay_royalty=True` to honour an advisory one anyway — but never
+  describes it as a guarantee. The payable total is capped at
+  `sale_price`, so a token's unbounded `minimum` cannot drain the funding
+  of whoever moves it.
+  (Not on `build_transfer_tx` or `build_nft_transfer_tx`: their result
+  types have nowhere to report who was paid.) The `enforced` flag in the metadata means "wallets *should*
   enforce", not "the chain will". A royalty **can** be made binding on a
   *buyer* by listing the token into a sale covenant; it cannot be made
   binding on a *holder*, who chooses the transaction. See

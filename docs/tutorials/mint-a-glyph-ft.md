@@ -260,12 +260,19 @@ without an indexer.
 ## What's next
 
 - **Send some tokens.** Once the reveal confirms, you can transfer
-  units of the token using `GlyphBuilder.build_ft_transfer_tx`. The
-  load-bearing prerequisite — filtering wallet UTXOs to the correct
-  75-byte FT shape *and* the right token ref — is explained at length
-  in [Radiant FTs are on-chain](../concepts/radiant-fts-are-on-chain.md)
-  and demonstrated end-to-end in
+  units of the token using `GlyphBuilder.build_ft_transfer_tx` — or
+  `GlyphBuilder.build_ft_airdrop_tx` to pay several holders in one
+  transaction; the transfer builder *is* the airdrop builder with one
+  recipient. Both need a plain-RXD `funding` input: an FT's quantity is
+  its output's photon value, so the token cannot pay its own fee
+  without burning units. The other load-bearing prerequisite —
+  filtering wallet UTXOs to the correct 75-byte FT shape *and* the
+  right token ref — is explained at length in
+  [Radiant FTs are on-chain](../concepts/radiant-fts-are-on-chain.md),
+  and both are demonstrated end-to-end in
   [`examples/ft_transfer_demo.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples/ft_transfer_demo.py).
+  The full recipe, including royalties, is in
+  [Transfer a Glyph token](../how-to/transfer-a-glyph-token.md).
 - **Distribute by mining instead of premining.** If you want supply
   emitted by parallel proof-of-work contracts rather than handed to a
   single address up front, that's a *dMint* deploy

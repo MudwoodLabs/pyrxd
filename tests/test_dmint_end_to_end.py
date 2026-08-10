@@ -488,13 +488,17 @@ class TestPrepareDmintDeploy:
             ticker="PRE",
             name="Premine",
             protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)],
+            # Every field except `premine` agrees with `_make_params()`, so this
+            # isolates the premine reconciliation. All six are reconciled — the
+            # per-field coverage is in
+            # tests/test_dmint_v1_deploy.py::test_every_declared_dmint_field_is_reconciled.
             dmint_params=DmintCborPayload(
                 algo=DmintAlgo.SHA256D,
                 num_contracts=1,
-                max_height=100,
+                max_height=1_000,
                 reward=1_000,
                 premine=777,
-                diff=1,
+                diff=10,
             ),
         )
         params = replace(self._make_params(), metadata=meta, premine_amount=10_000)

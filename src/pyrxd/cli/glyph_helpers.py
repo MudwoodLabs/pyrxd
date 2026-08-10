@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..glyph.dmint import DmintCborPayload
 from ..glyph.mint import build_reveal_unlock_template
 from ..glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef, GlyphRoyalty
 from ..security.errors import ValidationError
@@ -109,12 +110,79 @@ def _read_metadata_file(path: Path) -> GlyphMetadata:
             image_ipfs=data.get("image_ipfs", ""),
             image_sha256=data.get("image_sha256", ""),
             royalty=_read_royalty(data.get("royalty")),
+            dmint_params=_read_dmint(data.get("dmint")),
         )
     except ValidationError as exc:
         raise UserError(
             "metadata file failed validation",
             cause=str(exc),
             fix="see the error above; check protocol combinations and decimals range",
+        ) from exc
+
+
+def _read_dmint(raw: object) -> DmintCborPayload | None:
+    """Parse the optional ``dmint`` block of a metadata file.
+
+    Until this existed the key was **silently dropped**. ``_read_metadata_file``
+    never passed ``dmint_params`` to :class:`GlyphMetadata`, so ``deploy-dmint``
+    emitted CBOR with no ``dmint`` object — and
+    :func:`pyrxd.glyph.builder._assert_declared_dmint_matches`, the guard that
+    exists precisely to stop a token advertising a supply it does not mint,
+    returned early on every deploy the CLI made. It was unreachable from the
+    only command that emits a premine. A metadata file declaring
+    ``"premine": 999999999`` deployed with no premine at all, and nothing said
+    so.
+
+    Declaring the block is optional. What is not optional is that a declaration,
+    once made, is checked against the contract actually built — see that guard
+    for which fields are reconciled and why the ``daa`` sub-object is not.
+
+    ``algo`` accepts either the CBOR integer or a name (``"sha256d"``,
+    ``"blake3"``, ``"k12"``), because a hand-written metadata file is written by
+    a person and ``"algo": 1`` is not a thing a person can check.
+
+    Shape (mirrors the CBOR the envelope carries)::
+
+        "dmint": {
+            "algo": "sha256d",
+            "numContracts": 1,
+            "maxHeight": 10000,
+            "reward": 1000,
+            "premine": 0,
+            "diff": 1
+        }
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise UserError(
+            "metadata.dmint must be a JSON object",
+            cause=f"got {type(raw).__name__}: {raw!r}",
+            fix='use {"numContracts": 1, "maxHeight": 10000, "reward": 1000, "premine": 0, "diff": 1}',
+        )
+
+    from ..glyph.dmint import DmintAlgo
+
+    block = dict(raw)
+    algo = block.get("algo", int(DmintAlgo.SHA256D))
+    if isinstance(algo, str):
+        try:
+            block["algo"] = int(DmintAlgo[algo.upper()])
+        except KeyError:
+            raise UserError(
+                f"unknown metadata.dmint.algo name: {algo!r}",
+                fix=f"valid names: {sorted(a.name.lower() for a in DmintAlgo)}",
+            ) from None
+    else:
+        block["algo"] = algo
+
+    try:
+        return DmintCborPayload.from_cbor_dict(block)
+    except (ValidationError, KeyError, TypeError, ValueError) as exc:
+        raise UserError(
+            "metadata.dmint failed validation",
+            cause=str(exc),
+            fix="required keys: maxHeight, reward, diff (numContracts and premine default to 1 and 0)",
         ) from exc
 
 

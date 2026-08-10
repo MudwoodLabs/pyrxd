@@ -923,8 +923,11 @@ class TestDmintV1DeployResult:
             protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
             name="V1",
             ticker="V1T",
+            # Every other field agrees with the deploy params below, so this
+            # test isolates the premine reconciliation rather than tripping on
+            # a second mismatch.
             dmint_params=DmintCborPayload(
-                algo=DmintAlgo.SHA256D, num_contracts=1, max_height=100, reward=1_000, premine=500, diff=1
+                algo=DmintAlgo.SHA256D, num_contracts=1, max_height=100, reward=1_000, premine=500, diff=10
             ),
         )
 
@@ -942,6 +945,143 @@ class TestDmintV1DeployResult:
         with pytest.raises(ValidationError, match="dmint.premine"):
             GlyphBuilder().prepare_dmint_deploy(_p(None))
         assert GlyphBuilder().prepare_dmint_deploy(_p(500)).premine_amount == 500
+
+    @pytest.mark.parametrize(
+        ("field", "declared", "deploy_kwarg", "deploy_value"),
+        [
+            ("premine", 999_999_999, "premine_amount", None),
+            ("reward", 10, "reward_photons", 16_777_215),
+            ("maxHeight", 10_000, "max_height", 16_777_215),
+            ("numContracts", 1, "num_contracts", 250),
+            ("diff", 1, "difficulty", 4_096),
+            # Declared the other way round: V1 refuses a non-SHA256d `algo`
+            # param at construction, so the divergence has to live in the
+            # metadata — which is exactly the token that lies to miners.
+            ("algo", int(DmintAlgo.BLAKE3), "algo", DmintAlgo.SHA256D),
+        ],
+    )
+    def test_every_declared_dmint_field_is_reconciled(self, field, declared, deploy_kwarg, deploy_value):
+        """Supply is ``reward * maxHeight * numContracts (+ premine)``.
+
+        Reconciling only ``premine`` left the product unchecked: metadata
+        advertising ``reward=10, maxHeight=10_000, numContracts=1`` (100,000
+        supply) deployed against the 3-byte ceilings genesises contracts minting
+        70,368,735,789,056,250 photons, with both premines 0 so the old check
+        passed. Each field is pinned individually here.
+        """
+        from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
+        from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+        from pyrxd.security.types import Hex20
+
+        base_declared = {
+            "algo": int(DmintAlgo.SHA256D),
+            "numContracts": 1,
+            "maxHeight": 10_000,
+            "reward": 10,
+            "premine": 0,
+            "diff": 1,
+        }
+        base_declared[field] = declared
+        meta = GlyphMetadata(
+            protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
+            name="V1",
+            ticker="V1T",
+            dmint_params=DmintCborPayload.from_cbor_dict(base_declared),
+        )
+        kwargs = {
+            "num_contracts": 1,
+            "max_height": 10_000,
+            "reward_photons": 10,
+            "difficulty": 1,
+            "premine_amount": None,
+        }
+        kwargs[deploy_kwarg] = deploy_value
+        params = DmintV1DeployParams(metadata=meta, owner_pkh=Hex20(bytes(20)), **kwargs)
+        with pytest.raises(ValidationError, match=f"dmint.{field}"):
+            GlyphBuilder().prepare_dmint_deploy(params)
+
+    def test_all_mismatches_are_reported_at_once(self):
+        """One exception per field would mean one re-broadcast commit per field."""
+        from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
+        from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+        from pyrxd.security.types import Hex20
+
+        meta = GlyphMetadata(
+            protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
+            name="V1",
+            ticker="V1T",
+            dmint_params=DmintCborPayload(
+                algo=DmintAlgo.SHA256D, num_contracts=1, max_height=10_000, reward=10, premine=0, diff=1
+            ),
+        )
+        params = DmintV1DeployParams(
+            metadata=meta,
+            owner_pkh=Hex20(bytes(20)),
+            num_contracts=250,
+            max_height=16_777_215,
+            reward_photons=16_777_215,
+            difficulty=1,
+            premine_amount=999_999_999,
+        )
+        with pytest.raises(ValidationError) as exc:
+            GlyphBuilder().prepare_dmint_deploy(params)
+        for field in ("dmint.premine", "dmint.reward", "dmint.maxHeight", "dmint.numContracts"):
+            assert field in str(exc.value)
+
+    def test_a_consistent_declaration_deploys(self):
+        """The guard must not refuse a metadata block that tells the truth."""
+        from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
+        from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+        from pyrxd.security.types import Hex20
+
+        meta = GlyphMetadata(
+            protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
+            name="V1",
+            ticker="V1T",
+            dmint_params=DmintCborPayload(
+                algo=DmintAlgo.SHA256D, num_contracts=2, max_height=10_000, reward=10, premine=500, diff=1
+            ),
+        )
+        result = GlyphBuilder().prepare_dmint_deploy(
+            DmintV1DeployParams(
+                metadata=meta,
+                owner_pkh=Hex20(bytes(20)),
+                num_contracts=2,
+                max_height=10_000,
+                reward_photons=10,
+                difficulty=1,
+                premine_amount=500,
+            )
+        )
+        assert result.premine_amount == 500
+        assert len(result.placeholder_contract_scripts) == 2
+
+    def test_reward_that_encodes_the_v_key_bytes_still_deploys(self):
+        """``reward = 0x6176`` encodes as ``19 61 76`` — the CBOR bytes for "v".
+
+        The V1 "must not carry a 'v' field" check used to search the serialised
+        payload for that pair and refused this legal deploy. It asks the decoded
+        map now.
+        """
+        from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+        from pyrxd.security.types import Hex20
+
+        meta = GlyphMetadata(protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT], name="V1", ticker="V1T")
+        result = GlyphBuilder().prepare_dmint_deploy(
+            DmintV1DeployParams(
+                metadata=meta,
+                owner_pkh=Hex20(bytes(20)),
+                num_contracts=1,
+                max_height=100,
+                reward_photons=0x6176,
+                difficulty=1,
+            )
+        )
+        assert result.reward_photons == 0x6176
 
     def test_op_return_msg_emitted_when_set(self):
         from pyrxd.glyph.builder import GlyphBuilder

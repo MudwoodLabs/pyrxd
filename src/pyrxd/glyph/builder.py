@@ -33,27 +33,69 @@ MIN_FEE_RATE = 10_000  # photons per byte
 _MAX_PHOTONS = 21_000_000_000 * 100_000_000
 
 
-def _assert_declared_premine_matches(decoded_cbor: dict, premine_amount: int | None) -> None:
-    """Refuse a deploy whose metadata advertises a premine it does not emit.
+def _assert_declared_dmint_matches(decoded_cbor: dict, params: Any) -> None:
+    """Refuse a deploy whose metadata advertises numbers it does not emit.
 
-    The token body can carry a ``dmint.premine`` field (Photonic ``DmintPayload``);
-    indexers and wallets read it to display the supply breakdown without parsing
-    the reveal. Nothing on chain reconciles it against the photons the reveal
-    actually emits, so a mismatch is a permanently mis-reported supply and it is
-    silent. Photonic performs no bounds or consistency checks on ``premine`` at all
-    (see ``docs/dmint-research-photonic.md`` §9.1) — this is a deliberate pyrxd
+    The token body can carry a ``dmint`` object (Photonic ``DmintPayload``);
+    indexers and wallets read it to display supply and mining parameters without
+    parsing the reveal or decompiling the contract. **Nothing on chain reconciles
+    it** against what the deploy actually emits, so a mismatch is a permanently
+    mis-reported token and it is silent. Photonic performs no bounds or
+    consistency checks on these fields at all (see
+    ``docs/dmint-research-photonic.md`` §9.1) — this is a deliberate pyrxd
     addition, not a divergence in behaviour for correct callers.
+
+    **All the supply-bearing fields, not just ``premine``.** Reconciling one
+    field of six left the interesting divergence wide open: metadata advertising
+    ``reward=10, maxHeight=10_000, numContracts=1`` — 100,000 total supply —
+    deployed against ``--reward 16777215 --max-height 16777215 --num-contracts
+    250`` genesises contracts minting 70,368,735,789,056,250 photons, and the
+    premine check passes because both premines are 0. Supply is the product of
+    three of these numbers; checking one of them is not checking supply.
+
+    ``algo`` and ``diff`` are reconciled too. They do not change the supply, but
+    a token whose metadata says SHA256d while its contracts run BLAKE3 tells
+    every miner the wrong thing, and it is the same class of silent
+    misstatement.
+
+    The ``daa`` sub-object is NOT reconciled: V1 params carry no DAA fields at
+    all, so there is nothing on that side to compare against, and the mode does
+    not change what is issued — only how fast.
+
+    Every mismatch is reported at once. A caller fixing these one exception at a
+    time would re-broadcast a commit per field.
     """
     declared = decoded_cbor.get("dmint")
-    if not isinstance(declared, dict) or "premine" not in declared:
+    if not isinstance(declared, dict):
         return
-    declared_premine = int(declared["premine"])
-    actual_premine = premine_amount or 0
-    if declared_premine != actual_premine:
+
+    # A declared value is only checked when the metadata actually carries the
+    # key, so a partial `dmint` object stays legal.
+    mismatches: list[str] = []
+    for cbor_key, actual in (
+        ("premine", params.premine_amount or 0),
+        ("reward", params.reward_photons),
+        ("maxHeight", params.max_height),
+        ("numContracts", params.num_contracts),
+        ("diff", params.difficulty),
+        ("algo", int(params.algo)),
+    ):
+        if cbor_key not in declared:
+            continue
+        try:
+            declared_value = int(declared[cbor_key])
+        except (TypeError, ValueError) as exc:
+            raise ValidationError(f"metadata dmint.{cbor_key}={declared[cbor_key]!r} is not an integer") from exc
+        if declared_value != actual:
+            mismatches.append(f"dmint.{cbor_key}: metadata says {declared_value}, deploy emits {actual}")
+
+    if mismatches:
         raise ValidationError(
-            f"metadata declares dmint.premine={declared_premine} but the deploy emits "
-            f"{actual_premine} premine photons. Set premine_amount={declared_premine} "
-            f"(or fix the metadata) so the advertised supply matches the chain."
+            "the token metadata advertises a dMint contract this deploy does not build — "
+            + "; ".join(mismatches)
+            + ". Nothing on chain reconciles the two, so the token would permanently misreport "
+            "itself. Change the deploy parameters to match the metadata, or edit the metadata to "
+            "match the deploy."
         )
 
 
@@ -407,22 +449,30 @@ class GlyphBuilder:
         # 1. Encode the CBOR token body.
         cbor_bytes, payload_hash = encode_payload(params.metadata)
 
+        decoded = cbor2.loads(cbor_bytes)
+
         # Defensive cross-check: V1 must NOT emit a 'v' field (V2 marker).
         # encode_payload draws 'v' from metadata.version; if the caller
         # forgot to leave it at the V1 default, the resulting CBOR would
         # be classified as V2 by RXinDexer.
-        if b"\x61v" in cbor2.dumps({"v": 1}) and b"\x61v" in cbor_bytes:
+        #
+        # Asked of the DECODED map, not of the raw bytes. The previous form
+        # searched the serialised payload for `61 76` — the CBOR encoding of the
+        # key "v" — which also matches the two low bytes of any integer whose
+        # value happens to be 0x6176 (24_950): `19 61 76`. A `reward: 24950`, or
+        # any other field landing on those bytes, refused a perfectly legal V1
+        # deploy. Decoding first asks the question that was actually meant.
+        if "v" in decoded:
             raise ValidationError(
                 "V1 dMint CBOR must NOT include a 'v' field; got one in the "
                 "encoded body. Set GlyphMetadata(version=None) or omit it."
             )
-        # Belt-and-braces: also re-decode and pin the 'p' field shape.
-        decoded = cbor2.loads(cbor_bytes)
+        # Belt-and-braces: also pin the 'p' field shape.
         if "p" not in decoded or 1 not in decoded["p"] or 4 not in decoded["p"]:
             raise ValidationError(
                 f"V1 dMint CBOR 'p' field must include both 1 (FT) and 4 (DMINT); got p={decoded.get('p')!r}"
             )
-        _assert_declared_premine_matches(decoded, params.premine_amount)
+        _assert_declared_dmint_matches(decoded, params)
 
         # 2. Build the FT-commit hashlock (75-byte script — exactly the
         # Photonic ftCommitScript shape; the existing helper produces it).
@@ -512,7 +562,7 @@ class GlyphBuilder:
             raise ValidationError(
                 f"V2 dMint CBOR 'p' field must include both 1 (FT) and 4 (DMINT); got p={decoded.get('p')!r}"
             )
-        _assert_declared_premine_matches(decoded, params.premine_amount)
+        _assert_declared_dmint_matches(decoded, params)
 
         # 2. FT-commit hashlock (same 75-byte commit shape as V1).
         commit_script = build_commit_locking_script(payload_hash, params.owner_pkh, is_nft=False)
@@ -869,12 +919,14 @@ class GlyphBuilder:
         Thin delegator to :meth:`FtUtxoSet.build_transfer_tx` — the real logic
         (selection, two-pass fee, conservation) lives there so the API surface
         is available both at the builder level and directly on a UTXO-set
-        instance.
+        instance. That method is itself a single-recipient
+        :meth:`FtUtxoSet.build_airdrop_tx`, so the recipient output's value is
+        ``params.amount`` and nothing else.
 
         :param params: :class:`FtTransferParams` — see dataclass docstring.
         :returns:      :class:`FtTransferResult` — signed tx + scripts + fee.
         :raises ValueError: same conditions as :meth:`FtUtxoSet.build_transfer_tx`
-            (insufficient FT balance, insufficient RXD for fee + dust).
+            (insufficient FT balance, sub-floor fee rate, funding too small).
         """
         # Local import: FtUtxoSet depends on this module (for MIN_FEE_RATE
         # parity), but we only need it at call time.
@@ -885,8 +937,10 @@ class GlyphBuilder:
             amount=params.amount,
             new_owner_pkh=params.new_owner_pkh,
             private_key=params.private_key,
+            funding=params.funding,
             fee_rate=params.fee_rate,
             change_pkh=params.change_pkh,
+            dust_limit=params.dust_limit,
         )
 
     def build_ft_airdrop_tx(self, params: FtAirdropParams) -> FtAirdropResult:
@@ -1548,14 +1602,22 @@ class FtTransferParams:
     :param amount:         FT units to send to ``new_owner_pkh``
     :param new_owner_pkh:  recipient's 20-byte PKH
     :param private_key:    sender's :class:`pyrxd.keys.PrivateKey`
+    :param funding:        plain-RXD :class:`~pyrxd.glyph.ft.AirdropFunding`
+                           inputs that pay the fee. **Required in practice**:
+                           an FT output's value is its unit count, so taking the
+                           fee from the token would burn units and short the
+                           recipient. A transfer with no funding raises.
     :param fee_rate:       photons/byte (Radiant post-V2 minimum is 10_000)
-    :param change_pkh:     FT-change recipient PKH. Defaults to the sender's
-                           PKH when ``None``.
+    :param change_pkh:     FT- and RXD-change recipient PKH. Defaults to the
+                           sender's PKH when ``None``.
+    :param dust_limit:     fold-to-fee threshold for the plain-RXD change
+                           output. Not a floor on the token output.
 
     .. note::
-       No ``royalty`` here, unlike :class:`FtAirdropParams`. See the warning on
-       :meth:`FtUtxoSet.build_transfer_tx`: that builder has no plain-RXD source,
-       so a royalty could only be paid out of the token itself.
+       No ``royalty`` here, unlike :class:`FtAirdropParams`.
+       :class:`~pyrxd.glyph.ft.FtTransferResult` has nowhere to report who was
+       paid, and paying a royalty without reporting it would be worse than not
+       offering the option. Use :class:`FtAirdropParams` with one recipient.
     """
 
     ref: GlyphRef
@@ -1563,8 +1625,10 @@ class FtTransferParams:
     amount: int
     new_owner_pkh: Hex20
     private_key: Any
+    funding: list = dc_field(default_factory=list)  # list[AirdropFunding]
     fee_rate: int = MIN_FEE_RATE
     change_pkh: Hex20 | None = None
+    dust_limit: int = FT_DUST_LIMIT
 
 
 @dataclass
@@ -1586,9 +1650,12 @@ class FtAirdropParams:
     :param change_pkh:   FT- and RXD-change PKH. Defaults to the sender's.
     :param dust_limit:   photons on each recipient output. A pyrxd wallet-policy
                          floor, not a chain rule — Radiant's dust threshold is 1.
-    :param royalty:      optional; paid by default when supplied. Advisory.
-    :param sale_price:   photons the seller receives; the royalty base.
-    :param pay_royalty:  ``False`` to skip an otherwise-payable royalty.
+    :param royalty:      optional. Advisory — see :mod:`pyrxd.glyph.royalty`.
+    :param sale_price:   photons the seller receives; the royalty base, and the
+                         cap — a royalty can never exceed it.
+    :param pay_royalty:  ``None`` (default) pays iff ``royalty.enforced``;
+                         ``True`` pays an advisory royalty anyway; ``False``
+                         never pays.
     """
 
     ref: GlyphRef
@@ -1601,4 +1668,4 @@ class FtAirdropParams:
     dust_limit: int = FT_DUST_LIMIT
     royalty: GlyphRoyalty | None = None
     sale_price: int = 0
-    pay_royalty: bool = True
+    pay_royalty: bool | None = None

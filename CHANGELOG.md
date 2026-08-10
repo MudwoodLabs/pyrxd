@@ -498,6 +498,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `tests/test_dmint_premine_regtest_e2e.py` moved to the airdrop path, so the live proof
     exercises the builder that is correct rather than the full-spend case that hid this.
 
+- **That `value == ft_amount` tripwire was not a fix, and the fund loss was still reachable at
+  ±1 photon.** A pre-release audit re-ran the original case against the guarded code:
+
+  ```
+  value == ft_amount      : refused (ValidationError)
+  value == ft_amount + 1  : recipient = 46,749,455 units  (asked 250)   <- FUND LOSS
+  value == ft_amount - 1  : recipient = 46,739,453 units  (asked 250)   <- FUND LOSS
+  ```
+
+  The guard fenced off one input shape and left `transfer_value = rxd_in_total - fee -
+  change_alloc` exactly where it was. Enumerating the shapes someone thought of cannot make a
+  wrong expression right, and the shape it did catch was the *only* one anybody had thought of.
+
+  **`FtUtxoSet.build_transfer_tx` is now a single-recipient `build_airdrop_tx`** — one
+  implementation, so the recipient output's value is `amount` by construction rather than by
+  guard, for input shapes nobody predicted. It gains a `funding` parameter (as do
+  `FtTransferParams` and `GlyphBuilder.build_ft_transfer_tx`); the `value != ft_amount` check
+  that survives inside the airdrop builder is a fail-closed backstop against a caller who built
+  `FtUtxo` from the wrong field, and correctness no longer rests on it.
+
+  Pinned by a property/differential suite over a wide `(value, ft_amount, amount)` space
+  (`tests/test_ft_transfer.py::TestRecipientAmountIsExact`, including a Hypothesis case over
+  `ft_amount` up to 2**45 and every fee rate from the relay floor up): the recipient always
+  receives exactly `amount`, `sum(ft_in) == sum(ft_out)`, and the delivered quantity is
+  **byte-identical across a 45x range of funding sizes and fee rates** — the property the
+  original bug violated. A further test asserts the transfer and a one-recipient airdrop
+  serialise identically, so the two cannot drift apart again.
+
+  **Breaking for library callers:** `build_transfer_tx` / `build_ft_transfer_tx` now raise
+  without `funding` (previously they raised on every real FT holding anyway), reject a fee rate
+  below Radiant's 10,000 photons/byte relay floor, and may emit a plain-RXD change output.
+
 - **A `royalty` block in a metadata file was silently dropped.** `_read_metadata_file` never
   passed `royalty` to `GlyphMetadata`, so a creator could write a complete royalty block, mint,
   and end up with a token whose CBOR carried no royalty at all — with no warning, and nothing
@@ -517,6 +549,47 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `policy.transferable: false` — a token a creator marked soulbound mints as freely
   transferable, silently. `docs/red-team-checklist.md` §5.1 now flags the `creator` step as a
   known-failing gap rather than leaving a red-teamer to conclude the summary is broken.
+
+- **A `dmint` block in a metadata file was silently dropped too, which made the
+  declared-vs-emitted supply guard unreachable from the only command that emits a premine.**
+  `_assert_declared_premine_matches` exists to stop a token advertising a supply it does not
+  mint. `_read_metadata_file` never set `dmint_params`, so every CLI `deploy-dmint` produced
+  CBOR with no `dmint` object and the guard returned on its first line. Audit evidence: a
+  metadata file declaring `"premine": 999999999` deployed against `--premine` unset was
+  **accepted**.
+
+  Worse, on the library path — where a caller *can* set `dmint_params` — only `premine` was
+  reconciled. Supply is `reward * maxHeight * numContracts (+ premine)`, so checking one factor
+  is not checking supply: metadata advertising `reward=10, maxHeight=10_000, numContracts=1`
+  (100,000 total) deployed against the 3-byte ceilings genesises contracts minting
+  **70,368,735,789,056,250** photons, a 7x10^11 divergence, with both premines 0 so the check
+  passed.
+
+  Two changes: `_read_metadata_file` parses an optional `dmint` block (CBOR field names;
+  `algo` also accepts `"sha256d"`/`"blake3"`/`"k12"`), and the guard — now
+  `_assert_declared_dmint_matches` — reconciles `premine`, `reward`, `maxHeight`,
+  `numContracts`, `diff` and `algo`, reporting every mismatch in one exception rather than
+  costing a re-broadcast commit per field. `daa` is deliberately not reconciled: V1 deploy
+  params carry no DAA fields to compare against, and the mode changes how fast supply is
+  issued, not how much. Declaring the block stays optional — a deploy that advertises nothing
+  mis-advertises nothing.
+
+- **`build_ft_airdrop_tx` appeared in no source document, and the one documented FT-transfer
+  recipe always raised.** `examples/ft_transfer_demo.py` and the FT tutorial correctly set
+  `ft_amount = u.value` — what a real on-chain FT looks like — and were therefore refused by the
+  tripwire above on every input. The example now sources a plain-RXD funding UTXO (checking the
+  on-chain script is a bare 25-byte P2PKH, so it can never spend a token to pay a fee) and reads
+  the delivered quantity back off the built transaction before broadcasting rather than trusting
+  that it equals `AMOUNT`. Verified by running it end to end against a stubbed node: 250 units
+  requested, 250 delivered, 49,999,750 change, in a 507-byte 2-in/3-out transaction.
+  `docs/how-to/transfer-a-glyph-token.md` gains a **From Python** section covering both builders.
+
+- **A V1 dMint deploy could be refused because an integer in its payload happened to encode the
+  bytes `61 76`.** The "V1 CBOR must not carry a `v` field" check searched the *serialised*
+  payload for that pair — the CBOR encoding of the key `"v"` — which also matches the low two
+  bytes of any integer whose value is `0x6176` (24,950), encoded `19 61 76`. A `reward: 24950`
+  was enough. It asks the decoded map now. Found while adding the `dmint` block, which widened
+  the surface.
 
 - **`glyph deploy-dmint` under-sized the reveal fee, which could strand a confirmed commit.**
   The commit's vout 0 carries the only value the reveal ever gets, and it was sized from a flat
@@ -690,6 +763,37 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   1,285 hex blobs across `conformance/`, `tests/` and `src/pyrxd/` found zero whose ref-walk
   changes under the fix.
 
+- **A token's royalty `minimum` was unbounded and paid by default, out of the funding inputs of
+  whoever moved the token.** `GlyphRoyalty.minimum` only has to be `>= 0`; nothing at mint time
+  and nothing on chain bounds it. `royalty_due` returned `max(minimum, pct)` with no ceiling, so
+  a token declaring `minimum = 10**15` charged that against a plain transfer — a wallet that
+  passed the royalty *because it was trying to be honest* paid it. Two bounds now:
+
+  - **`royalty_due` is capped at `sale_price`.** A royalty larger than the consideration is not
+    a royalty. `minimum` raises the payment toward the sale price and cannot raise it past.
+    Behaviour change: a `minimum` with `sale_price = 0` now resolves to 0, which removes the
+    flat-fee-on-a-gift reading the module used to document beside its own statement that "a gift
+    has no price". That reading *was* the unbounded-spend path.
+  - **`enforced` is honoured instead of ignored.** `pay_royalty` becomes three-way:
+    `None` (the new default) pays iff `royalty.enforced`, `True` pays an advisory royalty
+    anyway, `False` never pays. The flag is the creator's own statement about whether wallets
+    should insist and it defaults to `False` everywhere a `GlyphRoyalty` is built; paying
+    regardless spends the sender's photons on a payment the creator did not ask to be insisted
+    on. Keeping the `True` override is what stops this collapsing into Photonic's behaviour,
+    where "advisory" is implemented as "never paid".
+
+  Royalties remain **advisory, not consensus-enforceable** — that is a documented design fact
+  (`docs/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.md`) and
+  nothing here changes it.
+
+- **`glyph airdrop-ft` and `glyph transfer-ft` did not pin recipient addresses to the active
+  network.** `address_to_public_key_hash` decodes any well-formed base58check P2PKH address and
+  returns its hash160 whatever the version byte, so a testnet-prefixed address (`m…`/`n…`)
+  pasted into a mainnet command produced a valid-looking PKH and an output locked to a script no
+  mainnet key can spend. Tokens are not recoverable from that: no refund path, and no RBF to
+  pull the transaction back. `wallet sweep` and `wallet send` have pinned the network for
+  exactly this reason; both glyph paths now do the same. An airdrop file is where a stray line
+  survives review, and it pays N recipients in one irreversible transaction.
 - **A malformed WIF is no longer echoed back, disclosing the private key it failed to decode.**
   `pyrxd.base58.b58_decode` raised `ValueError(f"invalid base58 encoded {encoded}")`. `PrivateKey(wif)`
   reaches it through `decode_wif`, `swap recovery` reaches `PrivateKey(wif)` through `_pkh_from_wif`

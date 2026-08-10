@@ -111,6 +111,137 @@ def _write_meta(path: Path, **overrides: object) -> Path:
     return path
 
 
+class TestMetadataDmintBlock:
+    """A ``dmint`` block in metadata.json must reach the deploy-vs-declared guard.
+
+    It did not. ``_read_metadata_file`` never passed ``dmint_params`` to
+    ``GlyphMetadata``, so every CLI deploy emitted CBOR with no ``dmint`` object
+    and ``_assert_declared_dmint_matches`` returned on its first line — the
+    guard was unreachable from the only command that emits a premine. A
+    metadata file declaring ``"premine": 999999999`` deployed with no premine at
+    all and said nothing.
+    """
+
+    _DMINT_META = {
+        "protocol": ["FT", "DMINT"],
+        "dmint": {
+            "algo": "sha256d",
+            "numContracts": 1,
+            "maxHeight": 10_000,
+            "reward": 10,
+            "premine": 999_999_999,
+            "diff": 1,
+        },
+    }
+
+    def _deploy_params(self, meta, **overrides):
+        from pyrxd.glyph.builder import DmintV1DeployParams
+        from pyrxd.security.types import Hex20
+
+        kwargs = {
+            "num_contracts": 1,
+            "max_height": 10_000,
+            "reward_photons": 10,
+            "difficulty": 1,
+            "premine_amount": None,
+        }
+        kwargs.update(overrides)
+        return DmintV1DeployParams(metadata=meta, owner_pkh=Hex20(bytes(20)), **kwargs)
+
+    def test_dmint_block_is_parsed_into_metadata(self, tmp_path: Path) -> None:
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+
+        meta = _read_metadata_file(_write_meta(tmp_path / "d.json", **self._DMINT_META))
+        assert meta.dmint_params is not None
+        assert meta.dmint_params.premine == 999_999_999
+        assert meta.dmint_params.max_height == 10_000
+        assert meta.dmint_params.reward == 10
+
+    def test_declared_premine_now_refuses_a_deploy_that_emits_none(self, tmp_path: Path) -> None:
+        """The audit's exact case: previously ACCEPTED."""
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+        from pyrxd.glyph.builder import GlyphBuilder
+        from pyrxd.security.errors import ValidationError
+
+        meta = _read_metadata_file(_write_meta(tmp_path / "d.json", **self._DMINT_META))
+        with pytest.raises(ValidationError, match="dmint.premine"):
+            GlyphBuilder().prepare_dmint_deploy(self._deploy_params(meta))
+
+    def test_declared_supply_now_refuses_a_deploy_that_mints_more(self, tmp_path: Path) -> None:
+        """100,000 advertised vs 70,368,735,789,056,250 actually mintable."""
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+        from pyrxd.glyph.builder import GlyphBuilder
+        from pyrxd.security.errors import ValidationError
+
+        body = dict(self._DMINT_META)
+        body["dmint"] = {**self._DMINT_META["dmint"], "premine": 0}
+        meta = _read_metadata_file(_write_meta(tmp_path / "d.json", **body))
+        with pytest.raises(ValidationError, match="dmint.reward"):
+            GlyphBuilder().prepare_dmint_deploy(
+                self._deploy_params(
+                    meta,
+                    reward_photons=16_777_215,
+                    max_height=16_777_215,
+                    num_contracts=250,
+                )
+            )
+
+    def test_a_truthful_declaration_deploys(self, tmp_path: Path) -> None:
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+        from pyrxd.glyph.builder import GlyphBuilder
+
+        body = dict(self._DMINT_META)
+        body["dmint"] = {**self._DMINT_META["dmint"], "premine": 500}
+        meta = _read_metadata_file(_write_meta(tmp_path / "d.json", **body))
+        result = GlyphBuilder().prepare_dmint_deploy(self._deploy_params(meta, premine_amount=500))
+        assert result.premine_amount == 500
+
+    def test_metadata_without_a_dmint_block_still_deploys(self, tmp_path: Path) -> None:
+        """Declaring the block stays optional — nothing advertised, nothing to check."""
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+        from pyrxd.glyph.builder import GlyphBuilder
+
+        meta = _read_metadata_file(_write_meta(tmp_path / "d.json", protocol=["FT", "DMINT"]))
+        assert meta.dmint_params is None
+        assert GlyphBuilder().prepare_dmint_deploy(self._deploy_params(meta)) is not None
+
+    def test_algo_accepts_a_name_or_an_int(self, tmp_path: Path) -> None:
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+
+        body = dict(self._DMINT_META)
+        body["dmint"] = {**self._DMINT_META["dmint"], "algo": 1}
+        by_int = _read_metadata_file(_write_meta(tmp_path / "i.json", **body))
+        body["dmint"] = {**self._DMINT_META["dmint"], "algo": "blake3"}
+        by_name = _read_metadata_file(_write_meta(tmp_path / "n.json", **body))
+        assert by_int.dmint_params is not None and by_name.dmint_params is not None
+        assert by_int.dmint_params.algo == by_name.dmint_params.algo
+
+    def test_unknown_algo_name_is_a_user_error(self, tmp_path: Path) -> None:
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+
+        body = dict(self._DMINT_META)
+        body["dmint"] = {**self._DMINT_META["dmint"], "algo": "scrypt"}
+        with pytest.raises(UserError, match="dmint.algo"):
+            _read_metadata_file(_write_meta(tmp_path / "bad.json", **body))
+
+    def test_non_object_dmint_is_a_user_error(self, tmp_path: Path) -> None:
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+
+        with pytest.raises(UserError, match="metadata.dmint must be a JSON object"):
+            _read_metadata_file(_write_meta(tmp_path / "bad.json", protocol=["FT", "DMINT"], dmint=[1, 2, 3]))
+
+    def test_malformed_dmint_block_is_a_user_error(self, tmp_path: Path) -> None:
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _read_metadata_file
+
+        with pytest.raises(UserError, match="metadata.dmint failed validation"):
+            _read_metadata_file(
+                _write_meta(tmp_path / "bad.json", protocol=["FT", "DMINT"], dmint={"maxHeight": 10, "reward": 1})
+            )
+
+
 class TestMetadataFileErrors:
     def test_missing_file(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
         # File doesn't exist → UserError before any wallet decryption.

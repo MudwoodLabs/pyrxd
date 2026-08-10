@@ -27,30 +27,35 @@ wrong for Radiant. An FT's quantity *is* its output's ``satoshis`` — 1 photon 
 1 token unit (``docs/concepts/radiant-fts-are-on-chain.md``), which is exactly
 what the CLI constructs (``ft_amount = utxo.value``).
 
-The distinction is not academic. :meth:`FtUtxoSet.build_transfer_tx` sizes the
-recipient's output from the RXD budget rather than from ``amount``, which under
-the orthogonal model is merely odd and on a real holding delivers the wrong
-number of tokens — measured at 46,739,454 units for an ``amount=250`` transfer
-out of a 50,000,000-unit UTXO. It now refuses inputs where
-``value == ft_amount`` and points at :meth:`FtUtxoSet.build_airdrop_tx`, which
-is written for the real model:
+The distinction is not academic. :meth:`FtUtxoSet.build_transfer_tx` used to size
+the recipient's output from the RXD budget (``rxd_in - fee - change_alloc``)
+rather than from ``amount``, so on a real holding it delivered the wrong number
+of tokens — measured at 46,739,454 units for an ``amount=250`` transfer out of a
+50,000,000-unit UTXO. An interim fix bolted an ``if value == ft_amount: raise``
+tripwire onto it, which is not a fix: a re-run at **±1 photon** still delivered
+46.7 million units for a 250-unit request, because the sizing expression was
+untouched. Predicting which input shapes are wrong cannot make a wrong
+expression right.
 
-* every output's value is the units it carries, so nothing is ever delivered in
-  the wrong quantity;
+``build_transfer_tx`` is therefore now a **single-recipient call into**
+:meth:`FtUtxoSet.build_airdrop_tx`, which has always been written for the real
+model:
+
+* every output's value is the units it carries, so the recipient receives
+  exactly ``amount`` for any input shape — by construction, not by guard;
 * the fee therefore cannot come out of a token output — that would burn units —
-  so it comes from plain-RXD :class:`AirdropFunding` inputs.
+  so it comes from plain-RXD :class:`AirdropFunding` inputs, which
+  ``build_transfer_tx`` now also takes.
 
-``build_transfer_tx`` is kept for callers genuinely using the decoupled model
-(and for the tests built on it). It should be folded into ``build_airdrop_tx``
-and removed.
+One implementation, so the two cannot drift apart again. The ``value !=
+ft_amount`` check that survives inside ``build_airdrop_tx`` is a fail-closed
+backstop against a caller who built :class:`FtUtxo` from the wrong field, not
+the thing that makes the amount correct.
 
 Other design notes
 ------------------
 * ``FtUtxoSet.select`` uses a trivial greedy-largest-first strategy. Smarter
   coin-selection (branch-and-bound etc.) is out of scope here.
-* Legacy ``build_transfer_tx`` RXD distribution: the transfer output always gets
-  ``dust_limit``; the change output (if any FT change exists) also gets
-  ``dust_limit``; the leftover RXD after fee lands on the transfer output.
 * :meth:`FtUtxoSet.build_airdrop_tx` gives each recipient exactly the units
   requested and returns the remaining funding as plain-RXD change, so an airdrop
   never gifts the sender's RXD to recipient #1.
@@ -169,9 +174,11 @@ class FtTransferResult:
     :param fee:                fee paid in photons
 
     .. note::
-       No ``royalty_payouts`` here, unlike :class:`FtAirdropResult`. A royalty
-       has to be funded from RXD, and :meth:`FtUtxoSet.build_transfer_tx` has no
-       RXD source that is not already a token unit — see its warning.
+       No ``royalty_payouts`` here, unlike :class:`FtAirdropResult`. Paying a
+       royalty without reporting who was paid would be worse than not offering
+       it, so :meth:`FtUtxoSet.build_transfer_tx` takes no ``royalty`` argument
+       at all. Use :meth:`FtUtxoSet.build_airdrop_tx` (one recipient is a legal
+       airdrop) when a royalty is in play — it returns the payouts.
     """
 
     tx: Any
@@ -341,18 +348,29 @@ class FtUtxoSet:
     def _resolve_royalty(
         royalty: GlyphRoyalty | None,
         sale_price: int,
-        pay_royalty: bool,
+        pay_royalty: bool | None,
     ) -> tuple[RoyaltyPayout, ...]:
         """Payouts a transfer should honour, or ``()``.
 
-        Paying is the **default**: supplying a ``royalty`` is what asks for it,
-        and ``pay_royalty=False`` is the explicit opt-out. The opt-out is not a
-        cheat — a royalty on an ordinary transfer is advisory (see
-        :mod:`pyrxd.glyph.royalty`), so a caller who omits it is not breaking a
-        rule the chain would have enforced. It is recorded in the result either
-        way so the decision is visible rather than silent.
+        Three-way, and the default consults the token rather than overriding it:
+
+        * ``None`` — pay iff ``royalty.enforced``. That flag is the creator's own
+          statement about whether wallets should insist, and it defaults to
+          ``False`` everywhere a ``GlyphRoyalty`` is built. This builder used to
+          ignore it and pay anyway, which spends the *sender's* funding photons
+          on a payment the creator did not ask to be insisted on.
+        * ``True`` — pay regardless. The explicit opt-in: an advisory royalty a
+          caller has decided to honour is exactly the case this exists for.
+        * ``False`` — never pay. Not a cheat: a royalty on an ordinary transfer
+          is advisory (see :mod:`pyrxd.glyph.royalty`), so a caller who skips it
+          is not breaking a rule the chain would have enforced.
+
+        The decision is recorded in the result either way, so it is visible
+        rather than silent.
         """
-        if royalty is None or not pay_royalty:
+        if royalty is None or pay_royalty is False:
+            return ()
+        if pay_royalty is None and not royalty.enforced:
             return ()
         return royalty_payouts(royalty, sale_price)
 
@@ -366,205 +384,86 @@ class FtUtxoSet:
         fee_rate: int = MIN_FEE_RATE,
         change_pkh: Hex20 | None = None,
         dust_limit: int = DUST_LIMIT,
+        funding: Sequence[AirdropFunding] = (),
     ) -> FtTransferResult:
-        """Build a signed FT transfer transaction enforcing conservation.
+        """Build a signed FT transfer: ``amount`` units of this token to one PKH.
+
+        A single-recipient :meth:`build_airdrop_tx`, and deliberately nothing
+        more. The recipient output's value **is** ``amount`` and the change
+        output's value **is** ``ft_in - amount``, because on Radiant an FT's
+        quantity is its output's ``satoshis`` — 1 photon = 1 unit
+        (``docs/concepts/radiant-fts-are-on-chain.md``).
 
         .. warning::
-           **This method cannot send a correct amount of a real on-chain FT, and
-           now refuses to try.** It allocates the transfer output's value from
-           the inputs' RXD — ``rxd_in_total - fee - change_alloc`` — rather than
-           from ``amount``. That is only coherent under this module's original
-           model, where ``FtUtxo.value`` and ``FtUtxo.ft_amount`` are orthogonal.
-           On chain they are the same number: 1 photon **is** 1 token unit
-           (``docs/concepts/radiant-fts-are-on-chain.md``), so an output's value
-           *is* the quantity delivered. Measured against a realistic holding —
-           one UTXO of 50,000,000 units, ``amount=250``, default fee rate — this
-           produced a **46,739,454-unit** output to the recipient and kept 546.
-           The sender's whole balance, silently, to a counterparty who asked for
-           250.
+           **Fund-safety history — read before "simplifying" this back.** This
+           method used to size the recipient output from the inputs' RXD
+           (``rxd_in_total - fee - change_alloc``) rather than from ``amount``.
+           On a realistic holding — one 50,000,000-unit UTXO, ``amount=250`` —
+           that delivered **46,739,454 units** to the recipient and kept 546:
+           the sender's whole balance, silently, to a counterparty who asked for
+           250. An interim patch added an ``if value == ft_amount: raise``
+           tripwire; re-running at ``value == ft_amount ± 1`` still delivered
+           ~46.7 million units, because the sizing expression was never touched.
+           The only fix that holds for input shapes nobody predicted is to size
+           the output from the number the caller asked for, which is what the
+           airdrop builder does — so this now *is* the airdrop builder.
 
-           Any selected UTXO with ``value == ft_amount`` therefore raises rather
-           than building. Use :meth:`build_airdrop_tx` with a single recipient:
-           it sizes each output from the requested units and takes the fee from
-           a plain-RXD funding input, which is the only arrangement that can be
-           right. ``glyph transfer-ft`` was rewired to that path.
+        **The token cannot pay its own fee.** Every photon on an FT input is a
+        token unit, so subtracting a fee from a token output burns units. The
+        fee comes from plain-RXD ``funding`` inputs, exactly as ``transfer-nft``
+        sources a separate input to move a dust-carrying singleton. A call with
+        no ``funding`` therefore raises rather than quietly shipping a 0-fee
+        transaction that no node will relay.
 
-           The method is kept, for now, for callers genuinely using the
-           decoupled model (and the tests built on it). It should be folded into
-           ``build_airdrop_tx`` and removed.
+        Output layout::
 
-        The selected UTXOs are spent with a standard P2PKH scriptSig (same unlock
-        as an NFT transfer — the FT script embeds a full P2PKH prefix before the
-        ``OP_PUSHINPUTREF`` / conservation epilogue, so ``<sig> <pubkey>`` satisfies
-        it). A transfer output locked to ``new_owner_pkh`` is created for
-        ``amount`` token units; any leftover token units flow to a change output
-        locked to ``change_pkh`` (or the sender's PKH if omitted).
-
-        Fee calculation uses the same two-pass pattern as
-        :meth:`GlyphBuilder.build_nft_transfer_tx`: build a trial tx → sign → measure
-        bytes → rebuild fresh (so the final signature commits to the final
-        outputs, not the trial ones).
+            [0]     recipient FT output, value == amount
+            [1]     FT change,           value == ft_in - amount  (iff any)
+            [last]  plain P2PKH RXD change                        (iff >= dust_limit)
 
         :param amount:         FT units to transfer to ``new_owner_pkh``
         :param new_owner_pkh:  recipient's 20-byte PKH
         :param private_key:    :class:`pyrxd.keys.PrivateKey` owning the inputs
-        :param fee_rate:       photons/byte (default 10_000, the Radiant minimum)
-        :param change_pkh:     FT-change recipient PKH. Defaults to the sender's
+        :param fee_rate:       photons/byte. Validated against Radiant's
+                               effective relay floor — see :func:`_check_fee_rate`.
+        :param change_pkh:     FT- and RXD-change PKH. Defaults to the sender's
                                PKH derived from ``private_key``.
-        :param dust_limit:     minimum photon value per output (default 546)
+        :param dust_limit:     fold-to-fee threshold for the RXD change output.
+                               NOT a floor on the token output: Radiant's dust
+                               threshold is 1 photon, and a 546 floor would
+                               forbid transferring 100 units of anything.
+        :param funding:        plain-P2PKH RXD UTXOs paying the fee.
 
-        :raises ValidationError: a selected UTXO has ``value == ft_amount`` —
-            see the warning above; use :meth:`build_airdrop_tx`.
-        :raises ValueError: ``amount <= 0``; total FT < amount; total RXD from
-            the selected inputs cannot cover ``dust_limit * n_outputs + fee``.
+        :raises ValidationError: ``new_owner_pkh`` is not 20 bytes, or a selected
+            UTXO has ``value != ft_amount`` (the fail-closed backstop — see
+            :meth:`build_airdrop_tx`).
+        :raises ValueError: ``amount <= 0``; total FT < ``amount``; ``fee_rate``
+            below the relay floor; or ``funding`` cannot cover the fee.
 
         :returns: :class:`FtTransferResult` (signed tx, scripts, fee, ref).
         """
-        # Local imports — same rationale as build_nft_transfer_tx: keep
-        # module-load-time dependencies light.
-        from pyrxd.script.script import Script
-        from pyrxd.script.type import P2PKH
-        from pyrxd.transaction.transaction import Transaction
-        from pyrxd.transaction.transaction_input import TransactionInput
-        from pyrxd.transaction.transaction_output import TransactionOutput
-
+        # Checked here as well as in build_airdrop_tx so the failure mode of a
+        # non-positive amount stays a ValueError with this method's wording;
+        # the airdrop builder raises ValidationError from its recipient loop.
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            raise ValueError(f"amount must be an int (FT units), got {type(amount).__name__}")
         if amount <= 0:
             raise ValueError(f"amount must be > 0, got {amount}")
-        if fee_rate <= 0:
-            raise ValueError(f"fee_rate must be > 0, got {fee_rate}")
-        if dust_limit < 1:
-            raise ValueError(f"dust_limit must be >= 1, got {dust_limit}")
 
-        # 1. Select FT UTXOs covering the requested amount.
-        selected = self.select(amount)
-
-        # 1b. Refuse the inputs this method gets wrong. See the warning in the
-        #     docstring: `value == ft_amount` is what a REAL holding looks like,
-        #     and for those the transfer output's value — which IS the delivered
-        #     quantity — is computed from the RXD budget instead of from
-        #     `amount`. Failing loudly beats sending a stranger the sender's
-        #     whole balance, which is what this did.
-        for u in selected:
-            if u.value == u.ft_amount:
-                raise ValidationError(
-                    f"UTXO {u.txid}:{u.vout} has value == ft_amount ({u.value}), which is what a real "
-                    "on-chain FT holding looks like (1 photon = 1 unit). build_transfer_tx sizes the "
-                    "transfer output from the inputs' RXD rather than from `amount`, so it would "
-                    "deliver the wrong number of units — potentially the sender's entire balance. Use "
-                    "build_airdrop_tx with a single recipient instead: it sizes each output from the "
-                    "units requested and pays the fee from a plain-RXD funding input."
-                )
-
-        # 2. Conservation arithmetic (single source of truth for ft totals).
-        ft_in_total = sum(u.ft_amount for u in selected)
-        ft_change = ft_in_total - amount
-        if ft_change < 0:
-            raise ValidationError(
-                f"FT conservation invariant violated: in={ft_in_total}, "
-                f"out={amount}, change={ft_change} (negative change means inputs insufficient)"
-            )
-
-        # 3. Resolve change_pkh.
-        if change_pkh is None:
-            # Derive sender's PKH from the signing key. PrivateKey.public_key()
-            # .hash160() returns 20 bytes.
-            sender_pkh = Hex20(private_key.public_key().hash160())
-        else:
-            sender_pkh = change_pkh if isinstance(change_pkh, Hex20) else Hex20(change_pkh)
-
-        # 5. Build output locking scripts.
-        new_ft_script = build_ft_locking_script(new_owner_pkh, self.ref)
-        change_ft_script: bytes | None = None
-        if ft_change > 0:
-            change_ft_script = build_ft_locking_script(sender_pkh, self.ref)
-
-        # 6. Total RXD available from the selected inputs.
-        rxd_in_total = sum(u.value for u in selected)
-
-        # Shared unlock template: a standard P2PKH scriptSig unlocks the FT
-        # script (which prepends a full P2PKH prefix to its conservation
-        # epilogue — see build_ft_locking_script).
-        unlocking_template = P2PKH().unlock(private_key)
-
-        def _make_inputs() -> list[TransactionInput]:
-            """Factory: fresh TransactionInput list for each signing pass.
-
-            Reusing inputs across passes would preserve the trial signature
-            and mis-commit the final tx (see build_nft_transfer_tx docstring).
-            """
-            inputs: list[TransactionInput] = []
-            for u in selected:
-                padding_output = TransactionOutput(Script(b""), 0)
-                shim_outputs = [padding_output] * u.vout + [TransactionOutput(Script(bytes(u.ft_script)), u.value)]
-                src = Transaction(tx_inputs=[], tx_outputs=shim_outputs)
-                # Pin the shim's txid to the real UTXO txid so the preimage
-                # hashes commit to the real outpoint, not the shim's hash.
-                src.txid = lambda _txid=u.txid: _txid  # type: ignore[method-assign]
-                inp = TransactionInput(
-                    source_transaction=src,
-                    source_txid=u.txid,
-                    source_output_index=u.vout,
-                    unlocking_script_template=unlocking_template,
-                )
-                inp.satoshis = u.value
-                inp.locking_script = Script(bytes(u.ft_script))
-                inputs.append(inp)
-            return inputs
-
-        def _make_outputs(transfer_value: int, change_value: int | None):
-            outs = [TransactionOutput(Script(new_ft_script), transfer_value)]
-            if change_value is not None:
-                if change_ft_script is None:
-                    raise ValidationError("internal invariant violated: change_ft_script is None when ft_change > 0")
-                outs.append(TransactionOutput(Script(change_ft_script), change_value))
-            return outs
-
-        # 7. Trial pass: use provisional values to size the tx. Use dust_limit
-        #    on every output so the encoded varint lengths (always 9 bytes
-        #    including the leading 0x08 prefix for <= 0xffffffff values anyway
-        #    — satoshis is fixed 8 bytes) match the final.
-        trial_transfer_value = dust_limit
-        trial_change_value = dust_limit if change_ft_script is not None else None
-        trial_tx = Transaction(
-            tx_inputs=_make_inputs(),
-            tx_outputs=_make_outputs(trial_transfer_value, trial_change_value),
+        result = self.build_airdrop_tx(
+            recipients=[AirdropRecipient(pkh=new_owner_pkh, amount=amount)],
+            private_key=private_key,
+            funding=funding,
+            fee_rate=fee_rate,
+            change_pkh=change_pkh,
+            dust_limit=dust_limit,
         )
-        trial_tx.sign()
-        size = trial_tx.byte_length()
-        fee = size * fee_rate
-
-        # 8. Allocate RXD on the final outputs.
-        #    - change gets dust_limit flat (if present)
-        #    - transfer gets (rxd_in_total - fee - change_allocation)
-        #    - must be >= dust_limit on transfer output
-        change_alloc = dust_limit if change_ft_script is not None else 0
-        transfer_value = rxd_in_total - fee - change_alloc
-
-        if transfer_value < dust_limit:
-            raise ValueError(
-                f"Insufficient RXD from FT inputs ({rxd_in_total} photons) to "
-                f"cover fee ({fee} for {size} bytes at {fee_rate} ph/B) + "
-                f"{'2' if change_ft_script else '1'}x dust_limit ({dust_limit}): "
-                f"transfer output would be {transfer_value} photons."
-            )
-
-        # 9. Final pass: rebuild with fresh inputs so sign() covers the
-        #    final output values, not the trial ones.
-        final_tx = Transaction(
-            tx_inputs=_make_inputs(),
-            tx_outputs=_make_outputs(
-                transfer_value,
-                dust_limit if change_ft_script is not None else None,
-            ),
-        )
-        final_tx.sign()
-
         return FtTransferResult(
-            tx=final_tx,
-            new_ft_script=new_ft_script,
-            change_ft_script=change_ft_script,
-            ref=self.ref,
-            fee=fee,
+            tx=result.tx,
+            new_ft_script=result.recipient_scripts[0],
+            change_ft_script=result.change_ft_script,
+            ref=result.ref,
+            fee=result.fee,
         )
 
     # ------------------------------------------------------------- airdrop
@@ -580,7 +479,7 @@ class FtUtxoSet:
         *,
         royalty: GlyphRoyalty | None = None,
         sale_price: int = 0,
-        pay_royalty: bool = True,
+        pay_royalty: bool | None = None,
     ) -> FtAirdropResult:
         """Build one signed transaction paying FT units to N recipients.
 
@@ -638,10 +537,12 @@ class FtUtxoSet:
         :param change_pkh:   FT- and RXD-change PKH. Defaults to the sender's,
                              derived from ``private_key``.
         :param dust_limit:   fold-to-fee threshold for the RXD change output.
-        :param royalty:      optional; paid by default when supplied. Advisory —
-                             see :mod:`pyrxd.glyph.royalty`.
-        :param sale_price:   photons the seller receives; the royalty base.
-        :param pay_royalty:  ``False`` to skip an otherwise-payable royalty.
+        :param royalty:      optional. Advisory — see :mod:`pyrxd.glyph.royalty`.
+        :param sale_price:   photons the seller receives; the royalty base. Also
+                             the cap: a royalty can never exceed it.
+        :param pay_royalty:  ``None`` (default) pays iff ``royalty.enforced``;
+                             ``True`` pays an advisory royalty anyway; ``False``
+                             never pays. See :meth:`_resolve_royalty`.
 
         :raises ValidationError: empty/oversized recipient list, a duplicate
             recipient PKH, a non-positive amount, a malformed PKH, or the
