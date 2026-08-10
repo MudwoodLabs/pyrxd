@@ -464,6 +464,38 @@ on chain, at the agreed scriptPubKey, for the agreed value, at a depth the taker
 nominal ordering is a bookkeeping order, not a safety guarantee. Do not read "taker locks first" as
 permission to lock first.
 
+**What the library enforces (added after this hazard was written).** The rule above was normative
+and *unimplemented*: the check lived only in the two operator scripts, so a caller driving
+`SwapCoordinator` directly got `pre_btc_lock_check(...) -> ok=True` and `taker_funds_btc(...) ->
+BTC_LOCKED` having invoked **zero** methods on the Radiant leg. It is now step 5 of the gate:
+
+- **`RadiantCovenantLeg.verify_maker_asset_funded(terms, *, min_confirmations=None)`** re-derives the
+  covenant scriptPubKey from the **taker's own `terms`** (never anything the maker advertises),
+  locates its funded UTXO, binds the **on-chain value to `terms.radiant_amount` exactly**, and
+  requires a confirmation depth. "Funded" alone is not enough — ElectrumX `listunspent` includes
+  mempool outputs, so a maker can fund with a replaceable transaction, wait for the lock, then
+  double-spend the funding away.
+- **`SwapCoordinator.taker_verify_asset_funding`** is the entry point, run inside
+  `pre_btc_lock_check` and **re-run inside `taker_funds_btc`** immediately before the counter-leg
+  broadcast — that re-run is what closes the verify→lock TOCTOU. It sits *before* the `SeenStore`
+  reserve, so the reserve keeps its "last step before the only broadcast" property (TOCTOU-1) and a
+  refusal does not burn `H`.
+- **Depth pin from existing policy:** a real-value (`MarginPolicy.is_measured`) swap requires
+  `rxd_claim_burial` confirmations — the same depth the claim-finality gate requires of the taker's
+  own Radiant claim. An estimated/test policy defers to the leg's `min_confirmations`.
+- **Fail-closed everywhere:** an unfunded SPK, a mis-valued or ambiguous covenant UTXO, a shallow
+  funding, an unreachable node, and a `radiant_leg` that does not implement the read all refuse.
+
+Both operator scripts now call the library rather than their own copy, so there is one
+implementation. Threat model: [S24](threat-model.md). Tests:
+`tests/test_taker_asset_funding_gate_adversarial.py`.
+
+The FSM ordering is left as-is deliberately: it records *transitions*, and the safety requirement is
+a precondition on the taker's transition, not a different edge. **Note for anyone driving the
+coordinator:** the maker's covenant must be funded and buried before `taker_funds_btc` is called.
+The `-m integration` end-to-end suites still fund the covenant *after* that call (the pre-HZ-1
+order) and must be reordered before they will pass — see the CHANGELOG entry.
+
 ### HZ-2: The version tag is written but never read
 
 The two envelope schema strings appear at exactly four sites, all of them **writes**

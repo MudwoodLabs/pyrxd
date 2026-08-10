@@ -404,6 +404,27 @@ async def _maker_verify_btc_funding(coord: SwapCoordinator, locator) -> int:
     return rec.counterchain_locator.amount_sats
 
 
+async def _taker_verify_rxd_funding(coord: SwapCoordinator, terms) -> tuple[str, int, int]:
+    """TAKER-side fail-closed gate — now a thin wrapper over the LIBRARY's
+    ``RadiantCovenantLeg.verify_maker_asset_funded``, reached through the coordinator so the
+    depth pin comes from the same margin policy the rest of the swap uses. Returns
+    ``(outpoint, photons, confirmations)``; converts the library's raise into a ``SystemExit``.
+
+    This logic used to live HERE (the ``find_covenant_utxo`` + depth check inline in
+    ``taker_phase_fund``), which meant a caller driving ``SwapCoordinator`` directly had no
+    taker-side asset check at all — hazard HZ-1, and a one-sided taker loss of the full
+    ``btc_sats`` against a maker that locks nothing. It now lives in the library, with exactly one
+    implementation, inside ``pre_btc_lock_check``; ``taker_funds_btc`` additionally RE-RUNS it at
+    lock time, so this call cannot be skipped and the verify->lock window is covered too."""
+    try:
+        return await coord.taker_verify_asset_funding(terms)
+    except (ValidationError, NetworkError) as exc:
+        raise SystemExit(
+            "REFUSING to fund BTC: the maker's RXD covenant is not verifiably locked at the agreed value and "
+            f"depth — {exc}. A hostile maker may not have locked RXD; aborting before our BTC is at risk."
+        ) from None
+
+
 # ---------------------------------------------------------------------------
 # Role: TAKER
 # ---------------------------------------------------------------------------
@@ -496,36 +517,19 @@ async def taker_phase_fund(args) -> None:
     coord = _coordinator(args, terms=terms, btc_leg=btc_leg, rxd_leg=rxd_leg, keys_out=args.local_out)
 
     try:
-        # HARDENING (review F2): confirm the maker ACTUALLY funded the RXD covenant on-chain (with the
-        # agreed amount) BEFORE we lock any BTC. Otherwise a hostile maker who never locks RXD can wait
-        # for our BTC HTLC and claim it with p -> one-sided taker loss. The maker funds RXD in its
-        # envelope step (runbook); we verify it programmatically here and fail closed.
+        # HARDENING (review F2 / hazard HZ-1): confirm the maker ACTUALLY funded the RXD covenant
+        # on-chain — at the agreed amount, and BURIED — BEFORE we lock any BTC. Otherwise a hostile
+        # maker who never locks RXD can wait for our BTC HTLC and claim it with p (it has held both
+        # p and the claim key since the envelope) -> one-sided taker loss of the full btc_sats. A
+        # 0-conf/mempool funding is equally unsafe: it can be double-spent away after we lock.
+        #
+        # The check itself is the LIBRARY's now (one implementation, no drift): the coordinator's
+        # pre_btc_lock_check runs it and taker_funds_btc RE-RUNS it at lock time.
         confirm("verify the maker funded the RXD covenant on-chain before funding BTC", auto_yes=args.yes)
-        try:
-            fop, fval, _fh = await rxd_leg.chain_io.find_covenant_utxo(
-                cov.funded_spk, expected_value=terms.radiant_amount
-            )
-        except Exception as exc:
-            raise SystemExit(
-                "REFUSING to fund BTC: the agreed RXD covenant SPK is NOT funded on-chain with the agreed "
-                f"amount ({exc}). A hostile maker may not have locked RXD; aborting before our BTC is at risk."
-            ) from None
-        # DEPTH GATE (review MEDIUM): "funded" is not enough — the funding must be BURIED. find_covenant_utxo
-        # can return a 0-conf/mempool UTXO (ElectrumX listunspent includes unconfirmed), and a hostile maker
-        # who funds RXD with a replaceable/reorgable tx, waits for our BTC lock, then double-spends the RXD
-        # funding away strands our BTC (the maker still claims BTC with p; the vanished covenant is no longer
-        # claimable by us -> one-sided taker loss). Require a confirmation floor; fail closed below it.
-        fop_txid = fop.split(":")[0]
-        try:
-            confs = await rxd_leg.chain_io.confirmations(fop_txid)
-        except Exception as exc:
-            raise SystemExit(f"REFUSING to fund BTC: could not read RXD covenant confirmation depth ({exc}).") from None
-        if confs < args.taker_min_rxd_confs:
-            raise SystemExit(
-                f"REFUSING to fund BTC: the RXD covenant funding {fop_txid} has {confs} confirmation(s) "
-                f"(< required {args.taker_min_rxd_confs}) — a shallow/mempool funding is reorgable/replaceable "
-                "and could be double-spent after we lock. Wait for it to bury, then retry."
-            )
+        # The depth floor is --taker-min-rxd-confs: _radiant_leg threads it into the leg's own
+        # min_confirmations, which is what the library gate uses on an estimated policy (a measured
+        # policy pins the higher rxd_claim_burial instead — coordinator._asset_funding_depth).
+        fop, fval, confs = await _taker_verify_rxd_funding(coord, terms)
         print(f"  -> RXD covenant confirmed funded on-chain at {fop} ({fval} photons), buried {confs} conf(s)")
 
         confirm(

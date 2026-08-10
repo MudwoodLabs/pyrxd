@@ -24,6 +24,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Sequence
@@ -105,6 +106,40 @@ def _safe_txid_path(txid: Txid) -> str:
 def _safe_int_path(value: int) -> str:
     """Return a URL-safe integer path segment."""
     return quote(str(int(value)), safe="")
+
+
+def _finite_int(value: Any) -> int:
+    """``int(value)`` for a JSON number, refusing the non-finite literals (audit B6).
+
+    ``json.loads`` accepts the non-standard ``Infinity`` / ``-Infinity`` / ``NaN`` literals, so a
+    hostile or broken server can hand back ``float('inf')``. ``int(inf)`` raises ``OverflowError``
+    — which is NOT a ``NetworkError`` and is absent from the fail-closed
+    ``(KeyError, IndexError, TypeError, ValueError)`` tuples the fund-safety reads catch — so it
+    escaped as a bare traceback through every ``except NetworkError`` on a value-moving path.
+    ``network/confirm.py`` already guards this shape; this is the same guard for the BTC reads.
+    Raises ``ValueError`` so existing fail-closed tuples catch it.
+    """
+    if isinstance(value, bool):
+        raise ValueError("a boolean is not a numeric value")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError("non-finite numeric value (Infinity/NaN); fail-closed")
+    return int(value)
+
+
+def _assert_tx_identity(data: Any, txid: Txid) -> None:
+    """Refuse a ``/tx/{txid}`` body that is not about the transaction we asked for (audit B6).
+
+    Esplora echoes the transaction's own ``txid``. Without binding it, a single malicious or
+    MITM'd source could answer a funding-verification read with ANOTHER transaction's favorable
+    ``(scriptPubKey, value)`` — the maker/taker gates would then bind the right numbers to the
+    wrong outpoint. A missing echo is equally un-verifiable, so it also refuses.
+    """
+    echoed = data.get("txid") if isinstance(data, dict) else None
+    if not isinstance(echoed, str) or echoed.strip().lower() != str(txid).lower():
+        raise NetworkError(
+            f"tx response does not identify the requested transaction {str(txid)[:16]}… "
+            "(missing or mismatched txid — the source may be answering about a different transaction); fail-closed"
+        )
 
 
 async def _check_response_size(response: aiohttp.ClientResponse) -> bytes:
@@ -927,11 +962,17 @@ class _MempoolHttpClient:
         return data
 
     async def outspend(self, txid: Txid, vout: int) -> dict:
-        """``/tx/{txid}/outspend/{vout}`` -> dict (``spent``, and the spender when spent)."""
+        """``/tx/{txid}/outspend/{vout}`` -> dict (``spent``, and the spender when spent).
+
+        ``spent`` must be a real JSON boolean. Checking only ``"spent" in data`` let
+        ``{"spent": null}`` — what a broken or hostile Esplora-shaped server emits for "no
+        data" — reach the caller, where it evaluated falsy and was read as UNSPENT (audit B1).
+        An un-interpretable liveness answer is refused at the wire, not normalized.
+        """
         s = await self.session()
         data = await _get_json(s, self.url(f"tx/{_safe_txid_path(txid)}/outspend/{_safe_int_path(vout)}"))
-        if not isinstance(data, dict) or "spent" not in data:
-            raise NetworkError("unexpected outspend response")
+        if not isinstance(data, dict) or not isinstance(data.get("spent"), bool):
+            raise NetworkError("unexpected outspend response: 'spent' is missing or not a boolean; fail-closed")
         return data
 
 
@@ -1009,7 +1050,10 @@ class MempoolSpaceFundingReader:
         if not status.get("confirmed", False) or status.get("block_height") is None:
             return 0  # unconfirmed / unknown -> 0 (the gate's >= N check fails closed)
         tip = await self._http.tip_height()
-        block_height = int(status["block_height"])
+        try:
+            block_height = _finite_int(status["block_height"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise NetworkError(f"unreadable block_height for {str(tx)[:16]}…; fail-closed") from exc
         # F-005: internal consistency check. A tx cannot be in a block above the tip, and
         # a real confirmed tx sits at height >= 1. An inverted/garbage response is a
         # confused or lying source — fail-closed LOUD (raise) rather than silently
@@ -1030,9 +1074,10 @@ class MempoolSpaceFundingReader:
         if confs < min_confirmations:
             raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
         data = await self._http.tx_json(tx)
+        _assert_tx_identity(data, tx)
         try:
-            return int(data["vout"][vout]["value"])  # mempool.space vout value is in sats
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            return _finite_int(data["vout"][vout]["value"])  # mempool.space vout value is in sats
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
             raise NetworkError(f"could not read output value for {str(tx)[:16]}…:{vout}") from exc
 
     async def read_confirmed_unspent_output(self, txid: str, vout: int) -> tuple[bytes, int]:
@@ -1053,16 +1098,28 @@ class MempoolSpaceFundingReader:
         if await self.confirmations(tx) < 1:
             raise NetworkError(f"output {str(tx)[:16]}…:{index} is unconfirmed or unknown; fail-closed")
         data = await self._http.tx_json(tx)
+        _assert_tx_identity(data, tx)
         try:
             out = data["vout"][index]
             spk = bytes.fromhex(str(out["scriptpubkey"]))
-            value = int(out["value"])  # Esplora reports the output value in sats
-        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            value = _finite_int(out["value"])  # Esplora reports the output value in sats
+        except (KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
             raise NetworkError(f"could not read output {str(tx)[:16]}…:{index}; fail-closed") from exc
         if not spk or value < 0:
             raise NetworkError(f"output {str(tx)[:16]}…:{index} has an empty scriptPubKey or negative value")
         spend = await self._http.outspend(tx, index)
-        if bool(spend.get("spent", True)):  # missing/ambiguous -> treat as SPENT (fail-closed)
+        # Only the boolean ``False`` means UNSPENT (audit B1). The old
+        # ``bool(spend.get("spent", True))`` defaulted a MISSING key to SPENT but read a key that
+        # was PRESENT-and-falsy — ``null`` / ``0`` / ``""`` / ``[]`` — as UNSPENT, so a hostile or
+        # buggy source could present an already-swept HTLC output as live and the maker's
+        # counter-funding gate would lock its own asset against BTC that is already gone.
+        spent_flag = spend.get("spent", True)
+        if spent_flag is not False:
+            if not isinstance(spent_flag, bool):
+                raise NetworkError(
+                    f"output {str(tx)[:16]}…:{index} has an uninterpretable 'spent' field "
+                    f"({type(spent_flag).__name__}); refusing to read it as UNSPENT — fail-closed"
+                )
             raise NetworkError(f"output {str(tx)[:16]}…:{index} is already SPENT; fail-closed")
         return spk, value
 

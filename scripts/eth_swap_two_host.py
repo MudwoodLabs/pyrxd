@@ -94,6 +94,7 @@ from pyrxd.gravity.swap_coordinator import (
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapRole, SwapState
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import ElectrumXClient
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
 
@@ -456,35 +457,23 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
     coord = _coordinator(args, terms=terms, eth_leg=eth_leg, rxd_leg=rxd_leg, keys_out=args.local_out)
 
     try:
-        # HARDENING (review F2): confirm the maker ACTUALLY funded the RXD covenant on-chain (with the
-        # agreed amount) BEFORE we lock any ETH. Otherwise a hostile maker who never locks RXD can wait
-        # for our ETH HTLC and claim it with p -> one-sided taker loss. We verify it fail-closed.
+        # HARDENING (review F2 / hazard HZ-1): confirm the maker ACTUALLY funded the RXD covenant
+        # on-chain — at the agreed amount, and BURIED — BEFORE we lock any ETH. Otherwise a hostile
+        # maker who never locks RXD can wait for our ETH HTLC and claim it with p -> one-sided taker
+        # loss. A 0-conf/mempool funding is equally unsafe: it can be double-spent away after we lock.
+        #
+        # The check itself is the LIBRARY's now (one implementation, no drift): the coordinator's
+        # pre_btc_lock_check runs it and taker_funds_btc RE-RUNS it at lock time. The depth floor is
+        # --taker-min-rxd-confs, threaded into the leg by _radiant_leg (a MEASURED margin policy pins
+        # the higher rxd_claim_burial instead — coordinator._asset_funding_depth).
         confirm("verify the maker funded the RXD covenant on-chain before funding ETH", auto_yes=args.yes)
         try:
-            fop, fval, _fh = await rxd_leg.chain_io.find_covenant_utxo(
-                cov.funded_spk, expected_value=terms.radiant_amount
-            )
-        except Exception as exc:
+            fop, fval, confs = await coord.taker_verify_asset_funding(terms)
+        except (ValidationError, NetworkError) as exc:
             raise SystemExit(
-                "REFUSING to fund ETH: the agreed RXD covenant SPK is NOT funded on-chain with the agreed "
-                f"amount ({exc}). A hostile maker may not have locked RXD; aborting before our ETH is at risk."
+                "REFUSING to fund ETH: the maker's RXD covenant is not verifiably locked at the agreed value "
+                f"and depth — {exc}. A hostile maker may not have locked RXD; aborting before our ETH is at risk."
             ) from None
-        # DEPTH GATE (review MEDIUM): "funded" is not enough — the funding must be BURIED. find_covenant_utxo
-        # can return a 0-conf/mempool UTXO, and a hostile maker who funds RXD with a replaceable/reorgable tx,
-        # waits for our ETH lock, then double-spends the RXD funding away strands our ETH (the maker still
-        # claims ETH with p; the vanished covenant is no longer claimable by us -> one-sided taker loss).
-        # Require a confirmation floor; fail closed below it.
-        fop_txid = fop.split(":")[0]
-        try:
-            confs = await rxd_leg.chain_io.confirmations(fop_txid)
-        except Exception as exc:
-            raise SystemExit(f"REFUSING to fund ETH: could not read RXD covenant confirmation depth ({exc}).") from None
-        if confs < args.taker_min_rxd_confs:
-            raise SystemExit(
-                f"REFUSING to fund ETH: the RXD covenant funding {fop_txid} has {confs} confirmation(s) "
-                f"(< required {args.taker_min_rxd_confs}) — a shallow/mempool funding is reorgable/replaceable "
-                "and could be double-spent after we lock. Wait for it to bury, then retry."
-            )
         print(f"  -> RXD covenant confirmed funded on-chain at {fop} ({fval} photons), buried {confs} conf(s)")
 
         confirm("taker_funds_btc: deploy+fund the ETH HTLC (taker pays gas; claim pays the maker)", auto_yes=args.yes)
@@ -1005,7 +994,6 @@ def _args() -> argparse.Namespace:
     if args.eth_finalization_window_s is None:
         from pyrxd.eth_wallet.chains import evm_chain_by_id
         from pyrxd.gravity.swap_coordinator import _MIN_ETH_FINALIZATION_WINDOW_S
-        from pyrxd.security.errors import ValidationError
 
         try:
             args.eth_finalization_window_s = evm_chain_by_id(args.eth_chain_id).finalization_window_s
