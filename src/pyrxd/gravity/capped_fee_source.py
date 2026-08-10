@@ -144,6 +144,9 @@ class CappedFeeWalletSource:
         self.__cap = total_cap_photons
         self.__dispensed_photons = 0
         self.__funded_photons = sum(x.value for x in pool)
+        # Outpoints of dispensed inputs whose cap charge has been credited back because the
+        # caller never broadcast with them (see :meth:`release_unspent`). Bounded by the pool.
+        self.__released: set[tuple[str, int]] = set()
 
     # -- introspection (a tower pages when the pool runs low) ------------------------------
     @property
@@ -210,3 +213,43 @@ class CappedFeeWalletSource:
             self.__cursor += 1
             self.__dispensed_photons += nxt.value
             return nxt
+
+    def release_unspent(self, fee_input: FeeInput) -> bool:
+        """Credit back the cap charge for a dispensed input that was **never broadcast**.
+
+        The cap authorises *spend*, but :meth:`next_fee_input` had to charge it at *dispense*
+        — and the caller dispenses before it can know whether the spend will build. A build
+        that refuses (the fee is below the node's deadline-aware relay floor) puts nothing
+        on-chain and pays no fee, yet left the charge standing: repeated refusals ate the
+        budget the covering input needed, and the pool exhausted with a funded, unspendable
+        UTXO still in it while the asset ran out its deadline (audit B3).
+
+        Returns ``True`` when the charge was credited, ``False`` when this input was already
+        credited (idempotent — a second credit would fabricate budget). Raises
+        :class:`ValidationError` for anything this source has not dispensed.
+
+        The cursor is deliberately **not** rewound. Dispense-once is the property that stops
+        one UTXO ever backing two transactions, and it must survive the un-charge: the
+        released input is retired, and the next dispense moves on to the next one — which is
+        also what stops a small head-of-line input from re-refusing forever while a covering
+        input sits behind it.
+
+        Only the caller can know whether it broadcast, so this is a report, not an inference.
+        Call it exactly on the paths where the dispensed input provably never reached a node.
+        """
+        if not isinstance(fee_input, FeeInput):
+            raise ValidationError("release_unspent requires the FeeInput that was dispensed")
+        key = (str(fee_input.txid), int(fee_input.vout))
+        with self._lock:
+            dispensed = {(str(x.txid), int(x.vout)): x for x in self.__pool[: self.__cursor]}
+            match = dispensed.get(key)
+            if match is None:
+                raise ValidationError(
+                    f"fee input {key[0]}:{key[1]} was never dispensed by this source; refusing to credit "
+                    "a cap charge that was never made"
+                )
+            if key in self.__released:
+                return False
+            self.__released.add(key)
+            self.__dispensed_photons -= int(match.value)
+            return True

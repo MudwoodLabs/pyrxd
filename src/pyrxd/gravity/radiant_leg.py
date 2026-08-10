@@ -39,6 +39,7 @@ Design notes (T7 plan D5/D6, reviewed)
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Protocol, runtime_checkable
 
@@ -489,6 +490,58 @@ class RadiantCovenantLeg:
         )
         return outpoint
 
+    async def verify_maker_asset_funded(
+        self, terms: NegotiatedTerms, *, min_confirmations: int | None = None
+    ) -> tuple[str, int, int]:
+        """TAKER-side fail-closed gate: is the MAKER's asset really locked, at the agreed value,
+        buried deep enough, before the taker funds the counter leg? Returns
+        ``(outpoint, value_photons, confirmations)``; RAISES on anything else — the taker MUST NOT
+        lock BTC/ETH if this raises. The Radiant twin of
+        :meth:`pyrxd.btc_wallet.htlc_leg.BitcoinTaprootLeg.verify_counterparty_funded`.
+
+        WHY: ``docs/htlc-handshake-wire-format.md`` HZ-1 states it normatively — *"a taker MUST NOT
+        fund the counter leg until it has confirmed the maker's asset lock on chain, at the agreed
+        scriptPubKey, for the agreed value, at a depth the taker chose."* Nothing else in the
+        handshake gives the taker that. The BTC claim leaf is ``<H> … <makerClaimPk> OP_CHECKSIG``
+        with no precondition that the asset was ever locked, and the maker holds both ``p`` and the
+        claim key from the moment it publishes the envelope. So a maker that locks NOTHING and
+        simply waits can sweep the taker's HTLC the instant it appears: the taker's loss is the
+        full ``btc_sats``, and the FSM's nominal "taker locks first" ordering is bookkeeping, not
+        a safety guarantee.
+
+        What is checked, all fail-closed:
+
+        1. the covenant scriptPubKey is **re-derived here from the taker's own ``terms``**
+           (:meth:`_build_covenant` — amount, H, ``t_rxd`` CSV, both dest hashes, the asset REF),
+           never taken from anything the maker advertises;
+        2. that exact SPK holds a funded UTXO, and its ON-CHAIN value equals
+           ``terms.radiant_amount`` — an unfunded SPK, a mis-valued one, and an ambiguous UTXO set
+           all raise (:meth:`RadiantChainIO.find_covenant_utxo`);
+        3. the funding is buried ``min_confirmations`` deep. "Funded" alone is NOT enough:
+           ElectrumX ``listunspent`` includes MEMPOOL outputs, so a maker can fund with a
+           replaceable transaction, wait for the taker's lock, then double-spend the funding away
+           — it still claims the counter leg with ``p`` while the vanished covenant leaves the
+           taker nothing to claim. ``None`` uses this leg's configured ``min_confirmations``; the
+           coordinator passes the policy's RXD burial depth for a real-value swap.
+        """
+        cov = self._build_covenant(terms)
+        required = self.min_confirmations if min_confirmations is None else int(min_confirmations)
+        if not isinstance(required, int) or isinstance(required, bool) or required < 0:
+            raise ValidationError("min_confirmations must be a non-negative int or None")
+        outpoint, value, _height = await self.chain_io.find_covenant_utxo(
+            cov.funded_spk, expected_value=terms.radiant_amount
+        )
+        confs = await self.chain_io.confirmations(outpoint.split(":")[0])
+        if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
+            raise NetworkError("confirmations reader returned a non-negative-int depth; fail-closed")
+        if confs < required:
+            raise NetworkError(
+                f"the maker's Radiant covenant funding {outpoint} has {confs} confirmation(s) < the required "
+                f"{required}: a shallow/mempool funding is reorgable and can be double-spent away after the "
+                "counter leg is locked. Wait for it to bury, then retry."
+            )
+        return outpoint, int(value), confs
+
     # -- spends -------------------------------------------------------------
     async def _resolve_covenant(self, record: SwapRecord) -> tuple[HtlcCovenant, str, int, int]:
         """Build the covenant, locate its funded UTXO, conf-gate it, return value + depth.
@@ -515,6 +568,41 @@ class RadiantCovenantLeg:
         ):  # pragma: no cover - defense-in-depth; find_covenant_utxo already pins value>0 via expected_value
             raise NetworkError("covenant output value is non-positive; fail-closed")
         return cov, outpoint, value, confs
+
+    @contextlib.contextmanager
+    def _unspent_on_failure(self, fee: FeeInput):
+        """Report a dispensed fee input back to the source when the spend never gets built.
+
+        The fee input must be dispensed BEFORE the transaction can be built (its value and
+        script are inputs to the build), and the build can refuse: ``build_htlc_*_tx`` and
+        :meth:`_assert_affordable` both raise :class:`InsufficientFundsError` when the
+        dispensed input cannot clear the node's relay floor. Nothing reaches a node on that
+        path and no fee is paid — but the source had already committed the input and charged
+        its cumulative cap, so a run of refusals ate the operator's budget and left a funded
+        pool that could no longer dispense the one input large enough to work (audit B3).
+
+        Everything inside this block is strictly pre-broadcast, so a raise here provably means
+        the input was never spent. The broadcast itself is deliberately OUTSIDE the block: once
+        bytes are handed to a node the input may well be spent, and crediting it back then
+        would under-count real spend against the cap.
+
+        The report is duck-typed and optional — a plain ``FeeUtxoSource`` (only
+        ``next_fee_input``) keeps working unchanged, it just does not get the credit.
+        """
+        try:
+            yield
+        except BaseException:
+            release = getattr(self.fee_source, "release_unspent", None)
+            if callable(release):
+                try:
+                    release(fee)
+                except Exception:
+                    logger.warning(
+                        "could not return the unspent fee input %s:%s to the pool after a refused build",
+                        fee.txid,
+                        fee.vout,
+                    )
+            raise
 
     def _assert_affordable(self, tx, fee: FeeInput, *, blocks_to_deadline: int | None, kind: str) -> None:
         """PRE-BROADCAST affordability gate (gap-closure A1) — refuse, and PAGE, rather
@@ -581,15 +669,16 @@ class RadiantCovenantLeg:
         # already passed takes the maximum urgency premium, never a negative one.
         blocks_to_deadline = max(0, record.terms.t_rxd.value - confs)
         fee = self.fee_source.next_fee_input()
-        tx = build_htlc_claim_tx(
-            covenant=cov,
-            covenant_outpoint=outpoint,
-            carrier_value=carrier,
-            preimage=bytes(preimage),
-            fee=fee,
-            fee_policy=self.fee_policy,
-        )
-        self._assert_affordable(tx, fee, blocks_to_deadline=blocks_to_deadline, kind="claim")
+        with self._unspent_on_failure(fee):
+            tx = build_htlc_claim_tx(
+                covenant=cov,
+                covenant_outpoint=outpoint,
+                carrier_value=carrier,
+                preimage=bytes(preimage),
+                fee=fee,
+                fee_policy=self.fee_policy,
+            )
+            self._assert_affordable(tx, fee, blocks_to_deadline=blocks_to_deadline, kind="claim")
         return await self._broadcast(tx)
 
     async def refund_asset(self, record: SwapRecord) -> str:
@@ -617,19 +706,20 @@ class RadiantCovenantLeg:
                 "(P3 maturity self-check); poll and retry at maturity rather than relying on node rejection."
             )
         fee = self.fee_source.next_fee_input()
-        tx = build_htlc_refund_tx(
-            covenant=cov,
-            covenant_outpoint=outpoint,
-            carrier_value=carrier,
-            fee=fee,
-            fee_policy=self.fee_policy,
-        )
-        # blocks_to_deadline=None (the plain relay floor, no urgency premium): unlike the
-        # claim, the CSV refund has no closing window. It only becomes broadcastable AT
-        # maturity and stays valid indefinitely thereafter — the competing claim branch
-        # needs p, which on this path the counterparty has not revealed. A premium here
-        # would burn fee for urgency that does not exist. The floor itself still binds.
-        self._assert_affordable(tx, fee, blocks_to_deadline=None, kind="refund")
+        with self._unspent_on_failure(fee):
+            tx = build_htlc_refund_tx(
+                covenant=cov,
+                covenant_outpoint=outpoint,
+                carrier_value=carrier,
+                fee=fee,
+                fee_policy=self.fee_policy,
+            )
+            # blocks_to_deadline=None (the plain relay floor, no urgency premium): unlike the
+            # claim, the CSV refund has no closing window. It only becomes broadcastable AT
+            # maturity and stays valid indefinitely thereafter — the competing claim branch
+            # needs p, which on this path the counterparty has not revealed. A premium here
+            # would burn fee for urgency that does not exist. The floor itself still binds.
+            self._assert_affordable(tx, fee, blocks_to_deadline=None, kind="refund")
         return await self._broadcast(tx)
 
     async def _broadcast(self, tx) -> str:

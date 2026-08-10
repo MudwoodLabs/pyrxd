@@ -398,6 +398,55 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A refused (never-broadcast) covenant spend no longer charges the fee pool's cap**
+  (`CappedFeeWalletSource.release_unspent`, `RadiantCovenantLeg._unspent_on_failure`). The fee input
+  has to be dispensed *before* the transaction can be built — its value and script are inputs to the
+  build — and the build refuses when that input cannot clear the node's deadline-aware relay floor.
+  Nothing reached a node and no fee was paid, but the source had already committed the input and
+  charged the cumulative cap. `watch/claim_executor.py` deliberately retries a `DECLINED` fee
+  refusal on the next tick (correctly: the source is dispense-once, so the next dispense may be
+  larger), so the refusals compounded. Measured on the pool shape an operator would actually
+  configure — 7 × 500,000 + 1 × 20,000,000 photons, cap 20,000,000, floor ~2,670,000 for a 267-byte
+  claim:
+
+  ```
+  FeePoolExhaustedError: capped fee cap reached: dispensing 20000000 photons would exceed
+  total_cap_photons=20000000 (already dispensed 3500000). Fail-closed.
+  ```
+
+  Seven ticks broadcast nothing and burned 3,500,000 of the cap; the eighth could no longer reach
+  the one input large enough to work. The covering UTXO was funded, unspent, and unreachable, and
+  the asset ran out its deadline to the counterparty's CSV refund.
+
+  The fix credits the cap back on any pre-broadcast failure, **without** rewinding the dispense-once
+  cursor: no input can ever back two transactions, and a small head-of-line input cannot re-refuse
+  forever while a covering input sits behind it. The broadcast itself is outside the guarded block —
+  once bytes reach a node the input may well be spent, and crediting it then would under-count real
+  spend against the cap. The report is duck-typed and optional, so a plain `FeeUtxoSource` keeps
+  working. `docs/threat-model.md` **S21** claimed the executor "does not retry into a fee-pool
+  drain"; that claim was wrong and has been corrected in place.
+- **The cold recovery toolkit refuses an unbounded fee overpay** (`swap_recovery.select_fee_utxo`,
+  `pyrxd swap build-claim` / `build-refund`). The covenant permits exactly one output, so there is no
+  change and the **entire** fee input is paid to the miner. The selector picked the smallest UTXO at
+  or above the target with no upper bound, so pointing the toolkit at an ordinary funded key holding
+  a single 500 RXD UTXO burned **50,000,000,000 photons against a 2,660,000-photon target — 18,727×**
+  — while the CLI printed that the fee "clears the deadline-aware TARGET". (`htlc_spend._check_carrier`
+  claims to guard "a mistakenly-huge UTXO" but only ever checked the dust end.)
+
+  A fee input above `10 ×` the requirement is now refused with an `OVERPAY` message naming the
+  multiple and the ceiling; `--allow-overpay` burns it deliberately, and an explicitly named
+  `--fee-utxo` is held to the same bar (naming a UTXO by hand is not consent to burn 500 RXD on a
+  0.0266 RXD fee). The ceiling is a **multiple**, so a genuinely large requirement scales with it.
+  `ColdSpend` gained `overpay_multiple` / `is_overpay`, and the human output now prints an OVERPAY
+  verdict instead of a reassuring one.
+- **`pyrxd swap build-claim` no longer builds against a 0-conf covenant.** ElectrumX `listunspent`
+  returns mempool outputs, so `read_covenant_chain_state` resolved an unconfirmed covenant and the
+  cold builders exited 0 against it. A spend of an unconfirmed parent dies with that parent, and
+  with neither RBF nor CPFP its fee input then squats until the 8-hour mempool expiry — inside the
+  `t_rxd` window the claim exists to beat. The automated path already enforced this
+  (`radiant_leg._resolve_covenant`); the cold path now matches, with `--allow-unconfirmed` as the
+  explicit override. `build-refund` is gated too: `--allow-immature` is about the CSV, not about the
+  parent's existence on chain.
 - **The external-miner stderr reader could grow without bound on a miner that never writes a
   newline.** `_ExternalMinerProgressReader` caps one physical line at `_PROGRESS_LINE_MAX_BYTES`
   (4 KiB) and its docstring promises that bound holds "however long the miner writes". The check
@@ -539,6 +588,63 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **The taker-side "did the maker actually lock the asset?" check now exists in the library**
+  (`SwapCoordinator.taker_verify_asset_funding`, `RadiantCovenantLeg.verify_maker_asset_funded`).
+  This closes hazard **HZ-1** of `docs/htlc-handshake-wire-format.md` — the mirror of HZ-3 above,
+  and the cheaper attack, because the loss is the **whole** counter leg rather than a shortfall —
+  and is recorded as threat-model **S24**.
+
+  HZ-1 already stated the rule normatively: *"a taker MUST NOT fund the counter leg until it has
+  confirmed the maker's asset lock on chain, at the agreed scriptPubKey, for the agreed value, at a
+  depth the taker chose."* No library code enforced it. The check lived only in
+  `scripts/btc_swap_two_host.py` and `scripts/eth_swap_two_host.py`, so any caller driving
+  `SwapCoordinator` directly locked BTC (or ETH) against nothing. Driving the real coordinator
+  against a chain where the covenant was never funded, on the pre-fix code:
+
+  ```
+  gate.ok=True | state=btc_locked | btc broadcasts=1 | radiant leg calls=[]
+  ```
+
+  `pre_btc_lock_check` returned `ok=True` and `taker_funds_btc` reached `BTC_LOCKED` having invoked
+  **zero** methods on the Radiant leg — the library never read the Radiant chain. The maker holds
+  both `p` and the BTC claim key from the moment it publishes the envelope, and the BTC claim leaf
+  is `<H> OP_SHA256 OP_EQUALVERIFY <makerClaimPk> OP_CHECKSIG` with **no precondition that the asset
+  was ever locked**, so a maker that locks nothing sweeps the taker's HTLC as soon as it appears.
+  The taker's own refund does not open until `t_btc`. Loss: the full `btc_sats`.
+
+  What the library now enforces, all fail-closed:
+
+  - the covenant **scriptPubKey re-derived from the taker's own `terms`** (amount, `H`, the `t_rxd`
+    CSV, both dest hashes, the asset REF) — never one the maker advertises — and a funded UTXO
+    located at exactly that script;
+  - the **on-chain value against `terms.radiant_amount` exactly**; an ambiguous UTXO set at that
+    script refuses rather than picking one;
+  - a **confirmation depth**. "Funded" alone is not enough: ElectrumX `listunspent` includes
+    mempool outputs, so a maker can fund with a replaceable transaction, wait for the taker's lock,
+    then double-spend the funding away — it still claims the counter leg with `p`, and the vanished
+    covenant leaves the taker nothing to claim;
+  - and the gate is **non-skippable**: it is step 5 of `pre_btc_lock_check`, and `taker_funds_btc`
+    **re-runs** it immediately before the counter-leg broadcast, which is what closes the
+    verify→lock TOCTOU. The re-run sits *before* the `SeenStore` reserve so the reserve keeps its
+    "last step before the only broadcast" property and a refusal does not burn `H`.
+
+  The depth pin reuses the existing policy knob: a real-value (`MarginPolicy.is_measured`) swap
+  requires `rxd_claim_burial` confirmations on the covenant funding — the same depth the
+  claim-finality gate requires of the taker's own Radiant claim — while an estimated/test policy
+  defers to the leg's `min_confirmations` (the operator's `--taker-min-rxd-confs`). Same
+  `is_measured` discipline as the ETH `finalized` pin and the maker-side BTC depth above.
+
+  Both operator scripts now call the library version instead of carrying their own copy, so there is
+  one implementation and no drift.
+
+  **Breaking for direct `SwapCoordinator` callers, and for the `-m integration` suites.** A
+  `radiant_leg` that does not implement `verify_maker_asset_funded` now fails the pre-lock gate
+  closed (a leg that cannot be verified cannot be verified at all), and the maker's covenant must be
+  funded and buried **before** `taker_funds_btc` is called. The six `-m integration` end-to-end
+  suites still fund the covenant *after* that call — the pre-HZ-1 order the hazard names as unsafe —
+  and must be reordered before they will pass. They are deselected from `task ci` and require live
+  bitcoind/radiantd/anvil nodes, so that reordering is **not** included here and is a tracked
+  follow-up rather than an unverified blind edit.
 - **The ref-opcode walker diverged from Radiant consensus on `0xd4`–`0xd7`, and could report a
   phantom ref while dropping the real one.** `REF_OPCODES` was `frozenset(range(0xD0, 0xD9))` —
   the contiguous `0xd0`–`0xd8` range — and the walker advanced 37 bytes for every member.
@@ -638,6 +744,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   over-funded, decoy scriptPubKey, insufficient depth, spent/unconfirmed, and verified-then-reorged.
   The under-funded case was confirmed to reach `BOTH_LOCKED` against a 70,000-sat HTLC on a
   100,000-sat swap before the fix.
+- **A present-but-falsy `spent` no longer reads as UNSPENT** (`MempoolSpaceFundingReader.
+  read_confirmed_unspent_output`). The guard was `bool(spend.get("spent", True))` with a comment
+  claiming "missing/ambiguous -> treat as SPENT (fail-closed)", but the `True` default only covered
+  a **missing** key: `{"spent": null}` — what an Esplora-shaped server emits for "no data" — and
+  `{"spent": 0}` / `{"spent": ""}` / `{"spent": []}` all evaluated falsy and were read as unspent.
+  `_MempoolHttpClient.outspend` only checked `"spent" in data`, so the null form passed the wire
+  check too. Only the boolean `False` now means unspent; anything else refuses at both layers.
+
+  This read backs the maker-side counter-funding gate added above, so a hostile or buggy source
+  could present an already-swept HTLC output as live and the maker would lock its own asset against
+  BTC that is already gone.
+- **Fund-safety reads on the BTC path now survive a hostile server's non-finite numbers, and bind
+  the transaction they were answered about.** `json.loads` accepts the non-standard `Infinity` /
+  `NaN` literals, and `int(float('inf'))` raises `OverflowError` — which is not a `NetworkError` and
+  was absent from the `(KeyError, IndexError, TypeError, ValueError)` fail-closed tuples, so a
+  crafted response turned a value read into a bare traceback that escaped every `except
+  NetworkError` on a value-moving path. (`network/confirm.py` already guarded this shape; the BTC
+  reads did not.) Separately, `read_output_amount_sats` and `read_confirmed_unspent_output` never
+  checked that `/tx/{txid}` echoed the txid they asked for, so a single malicious source could serve
+  **another transaction's** favourable `(scriptPubKey, value)`. Both now refuse.
+- **An "already known" broadcast rejection is honored only when a read-back confirms it**
+  (`FailoverElectrumXClient.broadcast`). After a transport failure on one endpoint, a later endpoint
+  answering RPC `-27` / `txn-already-known` was treated as success — so a hostile or broken
+  secondary could make `broadcast` report a live transaction, and a live txid, for something no node
+  ever accepted. The claim is now corroborated by asking that endpoint for the transaction and
+  requiring the same bytes back; a node that cannot produce what it claims to hold is skipped like
+  any other failure. Residual, stated plainly: an endpoint corroborates its own claim, so a fully
+  hostile endpoint that both rejects with `-27` and echoes the bytes still passes — what this
+  removes is the far cheaper failure of a `-27` backed by no transaction at all.
 - **Deadline-aware fee sizing for time-critical HTLC spends.** The only fee guard on a
   Radiant covenant spend was a flat `if fee.value < 546: raise` — a Bitcoin dust floor. At
   the reference mainnet node's advertised `effective_minrelaytxfee` (0.10 RXD/kB) a covenant

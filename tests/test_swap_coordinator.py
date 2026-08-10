@@ -181,10 +181,22 @@ class FakeRadiantLeg:
     on-chain-vs-expected match to drive PARAMS_MISMATCH.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, asset_funded: bool = True) -> None:
         self.calls: list[str] = []
         self.claimed_with: bytes | None = None
         self.refunded = False
+        # HZ-1 taker-side gate: an honest fake reports the maker's covenant as locked. Flip
+        # ``asset_funded`` to model a maker that locked nothing (see the adversarial suite in
+        # tests/test_taker_asset_funding_gate_adversarial.py for the real-leg version).
+        self.asset_funded = bool(asset_funded)
+        self.verify_min_confirmations: list[int | None] = []
+
+    async def verify_maker_asset_funded(self, terms: NegotiatedTerms, *, min_confirmations=None):
+        self.calls.append("verify_maker_asset_funded")
+        self.verify_min_confirmations.append(min_confirmations)
+        if not self.asset_funded:
+            raise NetworkError("no UTXO found for the covenant scriptPubKey (not yet funded / wrong SPK)")
+        return ("ef" * 32 + ":0", terms.radiant_amount, max(int(min_confirmations or 1), 1))
 
     async def expected_covenant_scriptpubkey(self, terms: NegotiatedTerms) -> bytes:
         # Deterministic stand-in for the fused covenant SPK.

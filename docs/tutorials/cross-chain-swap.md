@@ -81,11 +81,19 @@ coord = SwapCoordinator(record=SwapRecord(state=SwapState.NEGOTIATED, terms=term
                         counter_leg=eth_leg, radiant_leg=rxd_leg, indexer=indexer,
                         seen_store=seen, config=config)
 
-# 1. TAKER locks the ETH first — deploys + funds the EthHtlc on Anvil, bound to H.
+# 0. MAKER funds the Radiant HTLC covenant on chain, and lets it bury.
+#    This is a PRECONDITION, not an ordering preference: the BTC/ETH claim leaf has no
+#    precondition that the asset was ever locked, and the maker holds p from the start — so a
+#    maker that locks nothing can sweep a counter leg locked before it. See hazard HZ-1 in
+#    docs/htlc-handshake-wire-format.md and threat-model S24.
+
+# 1. TAKER locks the ETH — deploys + funds the EthHtlc on Anvil, bound to H. The pre-lock gate
+#    reads the Radiant chain itself and REFUSES unless the maker's covenant is funded at the
+#    agreed value and buried; the check is re-run immediately before the broadcast.
 rec = await coord.taker_funds_btc(terms)                 # NEGOTIATED → BTC_LOCKED
 
-# 2. MAKER locks the asset second — funds the Radiant HTLC covenant; the taker re-validates the
-#    covenant SPK, the Glyph ref, and the cross-clock timelock margin before trusting it.
+# 2. The taker re-validates the on-chain covenant SPK, the Glyph ref, and the cross-clock
+#    timelock margin, and records the asset lock in the FSM.
 rec = await coord.post_asset_lock_revalidate(cov.funded_spk)   # → BOTH_LOCKED
 
 # 3. MAKER claims the ETH — revealing p on-chain (the EthHtlc emits Claimed(p)).

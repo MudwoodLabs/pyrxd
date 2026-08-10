@@ -1210,6 +1210,12 @@ class SwapCoordinator:
           4. Maker-*promised* params match the locally re-derived BTC funding SPK
              (the on-chain re-validation happens later in
              :meth:`post_asset_lock_revalidate`).
+          5. The MAKER'S ASSET IS REALLY LOCKED (hazard HZ-1 / threat-model S24) —
+             :meth:`taker_verify_asset_funding`. Checks 1-4 are all re-derivations of what
+             the swap SHOULD look like; this is the only one that reads the Radiant chain,
+             and without it the taker locks its counter leg against a maker that locked
+             nothing (which then sweeps it with the ``p`` it has held since the envelope).
+             Unfunded / mis-valued / shallow / unreadable => fail-closed.
 
         ``now_unix_s`` is the caller's wall-clock (the ``now_rxd_height`` precedent: the
         coordinator takes clocks as params, never reads them) — REQUIRED for an ETH swap,
@@ -1292,7 +1298,67 @@ class SwapCoordinator:
         if expected_spk != promised_spk:
             return PreBtcLockGate(ok=False, reason="maker-promised BTC params do not match re-derived funding SPK")
 
+        # 5. The MAKER'S ASSET IS REALLY LOCKED (HZ-1). Everything above is a re-derivation of what
+        #    the swap SHOULD look like; only this reads the Radiant chain. See
+        #    :meth:`taker_verify_asset_funding`.
+        try:
+            await self.taker_verify_asset_funding(terms)
+        except (ValidationError, NetworkError) as exc:
+            return PreBtcLockGate(ok=False, reason=f"maker's Radiant covenant not verified; fail-closed ({exc})")
+        except Exception as exc:
+            return PreBtcLockGate(
+                ok=False, reason=f"could not verify the maker's Radiant covenant; fail-closed ({exc})"
+            )
+
         return PreBtcLockGate(ok=True)
+
+    def _asset_funding_depth(self) -> int | None:
+        """How deep the MAKER's Radiant covenant funding must be buried before the taker locks.
+
+        The RXD mirror of :meth:`_btc_counter_funding_depth`, and it reuses the policy's EXISTING
+        RXD reorg knob rather than inventing a second notion of Radiant finality: a real-value
+        (``is_measured``) swap must bury the covenant funding ``rxd_claim_burial`` deep — the same
+        depth the claim-finality gate requires of the taker's own Radiant claim. ``None`` (an
+        estimated/test policy) defers to the leg's configured ``min_confirmations``, the same
+        ``is_measured`` discipline the ETH ``'finalized'`` pin, the N-floor and the cross-clock
+        margin already use.
+        """
+        policy = self.config.margin_policy
+        if not policy.is_measured:
+            return None
+        return _reserve_to_blocks(policy.rxd_claim_burial, policy.block_interval_s)
+
+    async def taker_verify_asset_funding(self, terms: NegotiatedTerms) -> tuple[str, int, int]:
+        """Fail-closed: the MAKER's asset must be locked on chain before the taker locks anything.
+
+        Returns the verified ``(outpoint, value_photons, confirmations)``; RAISES on anything else.
+
+        HZ-1 in ``docs/htlc-handshake-wire-format.md`` states this as a normative MUST, and until
+        now no library code enforced it — the check existed only inside
+        ``scripts/btc_swap_two_host.py``, so any caller driving :class:`SwapCoordinator` directly
+        locked its counter leg against nothing. The maker holds both ``p`` and the counter-leg
+        claim key from the moment the envelope is published, and the BTC claim leaf carries no
+        precondition that the asset was ever locked, so a maker that locks NOTHING sweeps the
+        taker's HTLC as soon as it appears: a one-sided taker loss of the full ``btc_sats``.
+
+        The Radiant leg re-derives the covenant scriptPubKey from the taker's OWN ``terms`` and
+        reads the chain for it (value bound exactly, depth pinned by :meth:`_asset_funding_depth`).
+        A leg that cannot perform that read cannot be verified AT ALL, so its absence refuses —
+        mirroring :meth:`_counter_verify_callable` on the maker side.
+
+        Called from :meth:`pre_btc_lock_check` AND re-run inside :meth:`taker_funds_btc`
+        immediately before the counter-leg broadcast: re-running is what closes the verify->lock
+        TOCTOU, where a maker double-spends its covenant funding away in the window between the
+        taker's check and the taker's lock.
+        """
+        verify = getattr(self.radiant_leg, "verify_maker_asset_funded", None)
+        if not callable(verify):
+            raise ValidationError(
+                "radiant_leg does not implement verify_maker_asset_funded, so the maker's asset lock "
+                "cannot be confirmed on chain; fail-closed (refuse to fund the counter leg). Wire a "
+                "RadiantCovenantLeg, or a leg exposing that read."
+            )
+        return await verify(terms, min_confirmations=self._asset_funding_depth())
 
     def _assert_eth_timelock_ordering(self, terms: NegotiatedTerms, *, now_unix_s: int | None) -> None:
         """ETH cross-clock ordering gate (audit HIGH-1) — wires the previously-orphaned
@@ -1333,7 +1399,10 @@ class SwapCoordinator:
         """Run the pre-lock gate, fund the counter-leg HTLC, record the locator, advance.
 
         Refuses (raises) if the pre-lock gate fails — the taker NEVER funds against a
-        failed gate. H is ATOMICALLY reserved in the seen-store PRE-broadcast (so a
+        failed gate. The gate's on-chain asset check (:meth:`taker_verify_asset_funding`) is
+        RE-RUN here, immediately before the broadcast, which is what closes the verify->lock
+        TOCTOU: a maker can double-spend its covenant funding away in the window between the
+        taker's check and the taker's lock. H is ATOMICALLY reserved in the seen-store PRE-broadcast (so a
         concurrent or repeat funder of the same H is refused before any value moves;
         TOCTOU-1), and the durable record carries the full counter-leg locator.
 
@@ -1359,6 +1428,15 @@ class SwapCoordinator:
         # crash after this write but before/within the broadcast leaves a record
         # that knows WHERE the HTLC address is (recoverable), not a silent gap.
         await self._persist_record(self.record)
+
+        # RE-VERIFY the maker's asset lock at LOCK TIME (HZ-1). The gate above ran before this
+        # method's own persist, and a maker can double-spend its covenant funding away inside that
+        # window — a one-shot check would never see it, and the taker would lock BTC against a
+        # covenant that no longer exists while the maker still claims with p. Placed here, not
+        # after the H reserve, so the reserve keeps its "last step before the only broadcast"
+        # property (TOCTOU-1) and a refusal does not burn H for nothing. Fail-closed: this raises
+        # and nothing is broadcast.
+        await self.taker_verify_asset_funding(terms)
 
         # Reserve H ATOMICALLY and PRE-broadcast (TOCTOU-1 fix). The check-and-mark
         # is one indivisible step strictly before the only on-chain effect below, so
