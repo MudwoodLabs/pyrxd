@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING
 
 import click
 
+from ..constants import Network
 from ..fee_models import SatoshisPerKilobyte
 from ..glyph.builder import (
     AirdropFunding,
@@ -97,6 +98,7 @@ from ..security.types import Hex20, Txid
 from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
 from ..transaction.transaction_output import TransactionOutput
+from ..utils import validate_address
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError
 from .format import emit, emit_table
@@ -794,10 +796,11 @@ def transfer_ft_cmd(ctx: CliContext, ref: str, amount: int, to_address: str, pas
 
     from ..utils import address_to_public_key_hash
 
-    try:
-        to_pkh = Hex20(address_to_public_key_hash(to_address))
-    except (ValidationError, ValueError) as exc:
-        raise UserError("invalid --to address", cause=str(exc)) from exc
+    # Same network pin as `airdrop-ft` and `wallet sweep`: a testnet-prefixed
+    # address decodes fine on mainnet and the tokens land on a script no
+    # mainnet key can spend.
+    _require_address_on_network(ctx, to_address, what="--to address")
+    to_pkh = Hex20(address_to_public_key_hash(to_address))
 
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
 
@@ -821,6 +824,28 @@ def transfer_ft_cmd(ctx: CliContext, ref: str, amount: int, to_address: str, pas
         click.echo(emit(result, mode="quiet", quiet_field="txid"))
     else:
         click.echo(f"\nFT transfer broadcast: {result['txid']}")
+
+
+def _require_address_on_network(ctx: CliContext, address: str, *, what: str) -> None:
+    """Refuse a destination address that is not valid on the ACTIVE network.
+
+    ``address_to_public_key_hash`` decodes any well-formed base58check P2PKH
+    address and returns its hash160 regardless of the version byte, so a
+    testnet-prefixed address (``m…``/``n…``) pasted into a mainnet command
+    produced a perfectly valid-looking 20-byte PKH and an output locked to a
+    script no mainnet key can spend. Token quantities are not recoverable from
+    that; there is no refund path and no RBF to pull the transaction back.
+
+    ``wallet sweep`` and ``wallet send`` already pin the network this way. The
+    glyph transfer paths did not, which is the same unrecoverable paste error
+    with tokens on it instead of RXD.
+    """
+    if not validate_address(address, network=Network(ctx.network)):
+        raise UserError(
+            f"invalid {what}",
+            cause=f"not a valid {ctx.network} Radiant P2PKH address",
+            fix=f"pass a {ctx.network} address" + (" (starts with 1)" if ctx.network == "mainnet" else ""),
+        )
 
 
 async def _select_ft_inputs(
@@ -1209,10 +1234,14 @@ def airdrop_ft_cmd(
                 fix="combine the entries into a single line if the total is intended",
             )
         seen[address] = amount
-        try:
-            pkh = Hex20(address_to_public_key_hash(address))
-        except (ValidationError, ValueError) as exc:
-            raise UserError(f"invalid recipient address: {address}", cause=str(exc)) from exc
+        # Pin every recipient to the ACTIVE network, the way `wallet sweep` and
+        # `wallet send` do. Without this a testnet-prefixed address (m…/n…)
+        # decodes cleanly on mainnet and the airdrop pays a script no mainnet
+        # key can spend — units gone, with no way back. An airdrop file is
+        # exactly where a stray line survives review, and it pays N recipients
+        # in one irreversible transaction.
+        _require_address_on_network(ctx, address, what=f"recipient {address}")
+        pkh = Hex20(address_to_public_key_hash(address))
         recipients.append(AirdropRecipient(pkh=pkh, amount=amount))
 
     wallet = _load_wallet(ctx, prompt_passphrase=passphrase)

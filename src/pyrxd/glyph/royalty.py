@@ -46,11 +46,29 @@ as a guarantee.
 
 Arithmetic
 ----------
-``due = max(minimum, floor(sale_price * bps / 10_000))``
+``due = min(max(minimum, floor(sale_price * bps / 10_000)), sale_price)``
 
-That matches Photonic's ``calculateRoyalty`` (``packages/lib/src/royalty.ts``)
-exactly, including the flooring direction, so a pyrxd-built payment and a
-Photonic-built payment agree to the photon on the single-recipient path.
+The ``max`` half matches Photonic's ``calculateRoyalty``
+(``packages/lib/src/royalty.ts``) exactly, including the flooring direction, so
+a pyrxd-built payment and a Photonic-built payment agree to the photon whenever
+the declared terms are sane.
+
+The ``min`` half is a pyrxd bound Photonic does not have, and it is a
+fund-safety bound rather than a style preference. ``GlyphRoyalty.minimum`` is a
+free integer that only has to be ``>= 0``: nothing at mint time, and nothing on
+chain, stops a token declaring ``minimum = 10**15``. That number is not paid by
+the buyer — it is paid out of the **funding inputs of whoever moves the token**,
+by a wallet that supplied the royalty because it was trying to be honest. A
+royalty larger than the consideration is not a royalty, so the payable total is
+now capped at ``sale_price``.
+
+**Consequence, stated plainly:** a ``minimum`` with ``sale_price = 0`` now pays
+nothing. That removes a use case this module used to document — a flat
+per-transfer fee — and removing it is the point. A transfer with no
+consideration has no royalty base, which is what the paragraph on
+:func:`royalty_due` said before the flat-fee escape hatch was bolted on beside
+it; the hatch was the unbounded-spend path. A creator who wants a fee on a sale
+declares ``minimum`` and the sale reports its price.
 
 Two deliberate deviations from Photonic on the ``splits`` path, both because
 Photonic's version can pay the creator *less than the terms they recorded*:
@@ -67,11 +85,32 @@ Photonic's version can pay the creator *less than the terms they recorded*:
    left to the top-level ``address``. The invariant is exact:
    ``sum(payout.photons) == royalty_due(...)``.
 
-There is no ``enforced``-flag branch here. Photonic returns *no* outputs when
-``enforced`` is false, which makes an advisory royalty mean "never paid" — the
-opposite of advisory. In pyrxd the caller's decision to pass a royalty *is* the
-decision to pay it; ``enforced`` stays a metadata field that a marketplace may
-use for display or policy.
+``enforced`` is an input, not decoration
+---------------------------------------
+This module used to ignore ``GlyphRoyalty.enforced`` entirely: supplying a
+royalty meant paying it, whatever the creator had recorded. That reads as
+respectful and is not. ``enforced`` is the creator's own statement about whether
+wallets should insist, it defaults to ``False`` in every path that builds one,
+and spending a user's photons on a payment the creator explicitly did not insist
+on is still spending a user's photons.
+
+The builders therefore resolve it as a three-way decision (see
+:meth:`pyrxd.glyph.ft.FtUtxoSet._resolve_royalty`):
+
+* ``pay_royalty=None`` — the default — pays iff ``royalty.enforced``;
+* ``pay_royalty=True`` pays regardless, the explicit opt-in for an advisory
+  royalty a caller has decided to honour anyway;
+* ``pay_royalty=False`` never pays.
+
+That is not Photonic's behaviour and not the old pyrxd behaviour. Photonic
+returns *no* outputs when ``enforced`` is false and offers no override, so an
+advisory royalty means "never paid"; pyrxd keeps the override, so it can still
+mean "paid by anyone who chooses to". What changes is that choosing is now
+something a caller does rather than something that happens to them.
+
+None of this makes a royalty enforceable. Nothing in Radiant consensus, and
+nothing in any script pyrxd builds, requires the output to exist — see the top
+of this file for the evidence.
 """
 
 from __future__ import annotations
@@ -114,12 +153,18 @@ class RoyaltyPayout:
 def royalty_due(royalty: GlyphRoyalty, sale_price: int) -> int:
     """Total photons owed on a sale of ``sale_price`` photons.
 
-    ``max(minimum, floor(sale_price * bps / 10_000))`` — Photonic parity.
+    ``min(max(minimum, floor(sale_price * bps / 10_000)), sale_price)``.
 
     ``sale_price`` is the consideration the seller receives, in photons. There
     is no such thing as a royalty on a *transfer*: a gift has no price, and
-    charging basis points of nothing yields nothing. A caller that wants a flat
-    per-move payment expresses it as ``minimum`` with ``sale_price=0``.
+    charging basis points of nothing yields nothing. ``minimum`` raises the
+    payment toward the sale price; it cannot raise it past.
+
+    The cap is the whole difference from Photonic's ``calculateRoyalty``, and it
+    exists because ``minimum`` is otherwise an unbounded number chosen by the
+    token's creator and spent from the funding inputs of whoever moves the
+    token. ``GlyphRoyalty`` only requires ``minimum >= 0``. See the module
+    docstring for the use case this deliberately removes.
 
     :raises ValidationError: ``sale_price`` is negative or not an ``int``.
     """
@@ -127,7 +172,7 @@ def royalty_due(royalty: GlyphRoyalty, sale_price: int) -> int:
         raise ValidationError(f"sale_price must be an int (photons), got {type(sale_price).__name__}")
     if sale_price < 0:
         raise ValidationError(f"sale_price must be >= 0 photons, got {sale_price}")
-    return max(royalty.minimum, (sale_price * royalty.bps) // _BPS_DENOMINATOR)
+    return min(max(royalty.minimum, (sale_price * royalty.bps) // _BPS_DENOMINATOR), sale_price)
 
 
 def royalty_payouts(royalty: GlyphRoyalty, sale_price: int) -> tuple[RoyaltyPayout, ...]:

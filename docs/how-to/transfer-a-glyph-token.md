@@ -177,6 +177,54 @@ who got what straight from the transaction.
 
 ---
 
+## From Python
+
+The CLI verbs are thin wrappers. `GlyphBuilder.build_ft_transfer_tx` and
+`GlyphBuilder.build_ft_airdrop_tx` build the same transactions from the library,
+and both take plain-RXD `funding` for the same reason the CLI needs it in your
+wallet:
+
+```python
+from pyrxd.glyph.builder import FtAirdropParams, FtTransferParams, GlyphBuilder
+from pyrxd.glyph.ft import AirdropFunding, AirdropRecipient
+
+funding = [AirdropFunding(txid=fee_txid, vout=0, value=fee_value, private_key=fee_key)]
+
+# One recipient.
+transfer = GlyphBuilder().build_ft_transfer_tx(
+    FtTransferParams(
+        ref=ref, utxos=ft_utxos, amount=250,
+        new_owner_pkh=recipient_pkh, private_key=key, funding=funding,
+    )
+)
+
+# Many recipients, one transaction. Output order follows the list.
+airdrop = GlyphBuilder().build_ft_airdrop_tx(
+    FtAirdropParams(
+        ref=ref, utxos=ft_utxos, private_key=key, funding=funding,
+        recipients=[
+            AirdropRecipient(pkh=alice_pkh, amount=250),
+            AirdropRecipient(pkh=bob_pkh, amount=100),
+        ],
+    )
+)
+airdrop.recipient_scripts   # index-aligned with `recipients` and with tx.outputs
+airdrop.fee                 # actual fee paid, in photons
+```
+
+`build_ft_transfer_tx` **is** a single-recipient `build_ft_airdrop_tx` — one
+implementation, so the two cannot disagree about how many units anyone gets.
+Reach for the airdrop form directly when you have several recipients, or when a
+royalty is in play: `FtAirdropResult` reports the payouts and
+`FtTransferResult` has no field for them.
+
+Build your `FtUtxo` records with `ft_amount = value`. That is not a convention,
+it is what an FT is: the builders refuse a mismatch rather than guess which of
+the two numbers you meant. The filter that finds those UTXOs on chain is worked
+through in [`examples/ft_transfer_demo.py`](https://github.com/MudwoodLabs/pyrxd/tree/main/examples/ft_transfer_demo.py).
+
+---
+
 ## Royalties: honoured, not enforced
 
 If a token's metadata declares a royalty, pyrxd can pay it — and you should know
@@ -187,9 +235,9 @@ push. Any wallet, pyrxd included, is free to build a transfer with no royalty
 output at all, and the chain will accept it.
 
 So: a royalty is a convention that a compliant wallet honours. pyrxd's FT
-airdrop builder pays one **by default** when you hand it the token's
-`GlyphRoyalty` and the sale price, and records the decision in the result either
-way (a one-recipient airdrop is an ordinary transfer):
+airdrop builder resolves it from the token's own `enforced` flag, and records
+the decision in the result either way (a one-recipient airdrop is an ordinary
+transfer):
 
 ```python
 from pyrxd.glyph.ft import AirdropFunding, AirdropRecipient, FtUtxoSet
@@ -200,13 +248,30 @@ result = FtUtxoSet(ref=ref, utxos=utxos).build_airdrop_tx(
     funding=[AirdropFunding(txid=..., vout=0, value=..., private_key=fee_key)],
     royalty=token_royalty,      # the creator's recorded terms
     sale_price=1_000_000,       # photons the seller receives
+    # pay_royalty=None (default) → pay iff token_royalty.enforced
+    # pay_royalty=True           → pay an advisory royalty anyway
+    # pay_royalty=False          → never pay
 )
 result.royalty_payouts          # who was paid, and how much
 ```
 
-`build_transfer_tx` takes no `royalty`: it has no plain-RXD input, so a royalty
-could only be paid out of the token itself — which on Radiant means burning
-units. Same reason `build_nft_transfer_tx` takes none.
+Two bounds worth knowing before you rely on this:
+
+- **`enforced` is consulted, not ignored.** It is the creator's own statement
+  about whether wallets should insist, and it defaults to `false`. Paying
+  regardless would spend *your* funding photons on a payment the creator did not
+  ask to be insisted on, so the default follows the flag and `pay_royalty=True`
+  is the explicit opt-in for honouring an advisory royalty anyway.
+- **A royalty can never exceed the sale price.** `minimum` is a free integer
+  chosen by the token's creator with nothing on chain bounding it, and it is
+  paid out of *your* funding inputs. It raises the payment toward the sale
+  price; it cannot raise it past. A `minimum` on a transfer with no
+  consideration (`sale_price=0`) therefore pays nothing.
+
+`build_transfer_tx` takes no `royalty`: `FtTransferResult` has nowhere to report
+who was paid, and paying without reporting would be worse than not offering the
+option. Use the airdrop builder with one recipient — it is the same code path
+and the same transaction. Same reason `build_nft_transfer_tx` takes none.
 
 The royalty comes out of the RXD side as plain P2PKH outputs, never out of the
 token, so it cannot change how many units anyone receives.
@@ -228,10 +293,10 @@ metadata file before `glyph mint-nft` / `glyph deploy-ft`:
 }
 ```
 
-`bps` is basis points (500 = 5%). Optional: `minimum` (a photon floor, which
-also acts as a flat fee when `bps` is 0), `enforced` (a display hint for
-marketplaces — it does **not** make the chain enforce anything), and `splits`
-(a list of `{"address": …, "bps": …}`).
+`bps` is basis points (500 = 5%). Optional: `minimum` (a photon floor, capped at
+the sale price), `enforced` (whether compliant wallets should insist — pyrxd's
+builders pay by default only when this is `true`; it still does **not** make the
+chain enforce anything), and `splits` (a list of `{"address": …, "bps": …}`).
 
 ---
 

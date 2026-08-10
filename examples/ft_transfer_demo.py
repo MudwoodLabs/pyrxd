@@ -27,6 +27,21 @@ This example shows the correct filter: fetch the wallet's UTXOs, fetch each
 source tx, classify the locking script, and only build ``FtUtxo`` records
 for outputs that are actually FT scripts for the target token's ref.
 
+You also need plain RXD
+-----------------------
+The sender's address must additionally hold a plain-P2PKH RXD UTXO to pay the
+fee. On Radiant an FT's quantity **is** its output's photon value — 1 photon = 1
+unit — so subtracting a fee from a token output burns units and delivers the
+recipient less than was asked for. There is no arrangement in which the token
+pays for its own move. ``transfer-nft`` sources a separate input for the same
+reason.
+
+A single-recipient transfer is a single-recipient airdrop, so
+``GlyphBuilder.build_ft_airdrop_tx`` (docs/how-to/transfer-a-glyph-token.md)
+builds exactly the same transaction from an ``AirdropRecipient`` list; use it
+directly when sending to several holders at once, or when a royalty is in play
+— it reports the payouts, which ``FtTransferResult`` has no field for.
+
 Usage
 -----
     SENDER_WIF=<wif> \\
@@ -63,6 +78,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from pyrxd.glyph.builder import FtTransferParams, FtUtxo, GlyphBuilder
+from pyrxd.glyph.ft import AirdropFunding
 from pyrxd.glyph.script import extract_ref_from_ft_script, is_ft_script
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.keys import PrivateKey
@@ -178,6 +194,44 @@ async def collect_ft_utxos(
     return ft_utxos
 
 
+async def collect_funding_utxo(
+    client: ElectrumXClient,
+    sender_key: PrivateKey,
+    sender_address: str,
+    needed: int,
+) -> AirdropFunding | None:
+    """Find a plain-P2PKH RXD UTXO at *sender_address* to pay the fee.
+
+    **The token cannot pay its own fee.** An FT output's value IS its unit
+    count (1 photon = 1 unit), so taking the fee out of a token output would
+    burn units and deliver the recipient less than was asked for. The fee comes
+    from a separate plain-RXD input, the same way ``transfer-nft`` sources one
+    to move a dust-carrying singleton.
+
+    "Plain" is checked against the on-chain script, not assumed: a 25-byte
+    P2PKH and nothing else. Spending a token-bearing UTXO here would burn that
+    token.
+    """
+    raw_utxos = await client.get_utxos(script_hash_for_address(sender_address))
+    best: AirdropFunding | None = None
+    for u in sorted(raw_utxos, key=lambda x: x.value, reverse=True):
+        if u.value < needed:
+            continue
+        try:
+            raw = await client.get_transaction(Txid(u.tx_hash))
+        except NetworkError:
+            continue
+        tx = Transaction.from_hex(bytes(raw))
+        if tx is None or u.tx_pos >= len(tx.outputs):
+            continue
+        spk = tx.outputs[u.tx_pos].locking_script.serialize()
+        if len(spk) != 25 or spk[:3] != b"\x76\xa9\x14" or spk[23:] != b"\x88\xac":
+            continue  # not a bare P2PKH — could be carrying a token
+        best = AirdropFunding(txid=u.tx_hash, vout=u.tx_pos, value=u.value, private_key=sender_key)
+        break
+    return best
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -266,6 +320,26 @@ async def main() -> None:
             print(f"ERROR: insufficient FT balance — need {AMOUNT:,}, have {total_ft:,}")
             sys.exit(2)
 
+        # Fee funding. Sized generously and then checked: an underfunded build
+        # fails cleanly here, but a transaction that squeaks past and lands
+        # under the relay floor cannot be repaired on Radiant — there is no RBF
+        # and no CPFP, so it would sit on its inputs until mempool expiry 8
+        # hours later. ~84 B per FT output, ~148 B per input, ~50 B of envelope,
+        # then doubled.
+        est_bytes = 84 * 3 + 148 * (len(ft_utxos) + 1) + 50
+        needed = est_bytes * FEE_RATE * 2
+        print(f"Looking for a plain-RXD UTXO of at least {needed:,} photons to pay the fee...")
+        funding = await collect_funding_utxo(client, sender_key, sender_address, needed)
+        if funding is None:
+            print(f"No plain-RXD UTXO of >= {needed:,} photons at {sender_address}.")
+            print()
+            print("An FT output's value IS its unit count on Radiant, so the token cannot pay")
+            print("its own fee without burning units. Send a little plain RXD to this address")
+            print("and re-run.")
+            sys.exit(2)
+        print(f"Funding:     {funding.txid}:{funding.vout} ({funding.value:,} photons)")
+        print()
+
         builder = GlyphBuilder()
         result = builder.build_ft_transfer_tx(
             FtTransferParams(
@@ -274,6 +348,7 @@ async def main() -> None:
                 amount=AMOUNT,
                 new_owner_pkh=recipient_pkh,
                 private_key=sender_key,
+                funding=[funding],
                 fee_rate=FEE_RATE,
             )
         )
@@ -294,6 +369,17 @@ async def main() -> None:
             selected_ft_in = sum(u.ft_amount for u in ft_utxos if (u.txid, u.vout) in selected_keys)
             change_amount = selected_ft_in - AMOUNT
             print(f"  change:    {sender_address} ({change_amount:,} FT units)")
+        print()
+
+        # Read the delivered quantity back off the built transaction rather than
+        # trusting that it equals AMOUNT because we asked for AMOUNT. The bug
+        # this guards against sized the recipient output from the inputs' RXD
+        # and shipped 46,739,454 units for a 250-unit request.
+        delivered = result.tx.outputs[0].satoshis
+        if delivered != AMOUNT:
+            print(f"REFUSING TO BROADCAST: recipient output is {delivered:,} units, not {AMOUNT:,}.")
+            sys.exit(3)
+        print(f"Verified:    recipient output carries exactly {delivered:,} units")
         print()
 
         if DRY_RUN:

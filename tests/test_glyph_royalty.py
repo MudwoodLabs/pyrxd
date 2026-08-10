@@ -34,7 +34,11 @@ _SPLIT_B = PrivateKey().public_key().address()
 
 
 class TestRoyaltyDue:
-    """``max(minimum, floor(sale_price * bps / 10_000))`` — Photonic parity."""
+    """``min(max(minimum, floor(sale_price * bps / 10_000)), sale_price)``.
+
+    The ``max`` half is Photonic parity. The ``min`` half is a pyrxd bound that
+    Photonic does not have — see :class:`TestMinimumIsBounded`.
+    """
 
     @pytest.mark.parametrize(
         ("bps", "price", "expected"),
@@ -58,11 +62,6 @@ class TestRoyaltyDue:
         r = GlyphRoyalty(bps=1_000, address=_CREATOR, minimum=50)
         assert royalty_due(r, 10_000) == 1_000
 
-    def test_zero_bps_with_minimum_is_a_flat_fee(self):
-        """A royalty with no rate but a minimum is legal and means a flat fee."""
-        r = GlyphRoyalty(bps=0, address=_CREATOR, minimum=777)
-        assert royalty_due(r, 0) == 777
-
     def test_negative_price_refused(self):
         with pytest.raises(ValidationError, match="sale_price must be >= 0"):
             royalty_due(GlyphRoyalty(bps=500, address=_CREATOR), -1)
@@ -71,6 +70,38 @@ class TestRoyaltyDue:
         # bool is an int subclass; True would silently mean "1 photon".
         with pytest.raises(ValidationError, match="must be an int"):
             royalty_due(GlyphRoyalty(bps=500, address=_CREATOR), True)
+
+
+class TestMinimumIsBounded:
+    """``minimum`` is an unbounded integer chosen by the token's creator.
+
+    ``GlyphRoyalty`` only requires ``minimum >= 0``, nothing at mint time checks
+    it, and nothing on chain does either — so a token can declare
+    ``minimum = 10**15``. That number is not paid by a buyer: it is paid out of
+    the funding inputs of whoever moves the token, by a wallet that supplied the
+    royalty because it was trying to be honest. The payable total is therefore
+    capped at the consideration.
+    """
+
+    @pytest.mark.parametrize("minimum", [10**9, 10**15, 21_000_000_000 * 100_000_000])
+    def test_a_huge_minimum_cannot_exceed_the_sale_price(self, minimum):
+        r = GlyphRoyalty(bps=100, address=_CREATOR, minimum=minimum)
+        assert royalty_due(r, 10_000) == 10_000
+
+    def test_a_huge_minimum_on_a_zero_price_transfer_pays_nothing(self):
+        """The flat-fee-on-a-gift path is gone; it was the unbounded-spend path."""
+        r = GlyphRoyalty(bps=0, address=_CREATOR, minimum=10**15)
+        assert royalty_due(r, 0) == 0
+        assert royalty_payouts(r, 0) == ()
+
+    def test_a_minimum_below_the_sale_price_is_untouched(self):
+        r = GlyphRoyalty(bps=100, address=_CREATOR, minimum=1_000)
+        assert royalty_due(r, 10_000) == 1_000  # 1% = 100, raised to the minimum
+
+    def test_a_100_percent_royalty_is_still_exactly_the_sale_price(self):
+        """The cap must not clip a legitimately-declared full-price royalty."""
+        r = GlyphRoyalty(bps=10_000, address=_CREATOR)
+        assert royalty_due(r, 12_345) == 12_345
 
 
 class TestRoyaltyPayouts:
@@ -109,8 +140,10 @@ class TestRoyaltyPayouts:
             minimum=50_000,
             splits=((_SPLIT_A, 50), (_SPLIT_B, 50)),
         )
-        payouts = royalty_payouts(r, 1_000)
-        # Photonic would pay floor(1000 * 50/10000) = 5 photons each, total 10.
+        # Priced above the minimum so the sale-price cap is not what is under
+        # test here — see TestMinimumIsBounded for that.
+        payouts = royalty_payouts(r, 1_000_000)
+        # Photonic would pay floor(1_000_000 * 50/10000) = 5_000 each, 10_000 total.
         assert sum(p.photons for p in payouts) == 50_000
         assert [p.photons for p in payouts] == [25_000, 25_000]
 

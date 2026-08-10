@@ -34,6 +34,19 @@ def _new_wallet_args(tmp_wallet_path: Path) -> list[str]:
     return ["--wallet", str(tmp_wallet_path), "--json", "--yes", "wallet", "new"]
 
 
+def _testnet_address() -> str:
+    """A well-formed TESTNET P2PKH address.
+
+    ``PublicKey.address()`` takes the network as an argument and defaults to
+    mainnet — it does NOT read the private key's ``network`` field, so
+    ``PrivateKey(network=Network.TESTNET).public_key().address()`` returns a
+    mainnet ``1…`` address and would silently make this test assert nothing.
+    """
+    from pyrxd.constants import Network
+
+    return PrivateKey().public_key().address(network=Network.TESTNET)
+
+
 class TestRecipientSpecParsing:
     def test_address_amount(self):
         assert _parse_recipient_spec(f"{_ADDR_A}:250") == (_ADDR_A, 250)
@@ -145,7 +158,36 @@ class TestAirdropCommandGuards:
             ["--wallet", str(tmp_wallet_path), "glyph", "airdrop-ft", _REF, "--to", "not-an-address:10"],
         )
         assert result.exit_code != 0
-        assert "invalid recipient address" in result.output.lower()
+        assert "invalid recipient" in result.output.lower()
+
+    def test_wrong_network_address_refused(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """A testnet address decodes cleanly on mainnet and pays an unspendable script.
+
+        ``address_to_public_key_hash`` returns a valid-looking 20-byte PKH for
+        any well-formed base58check address, whatever its version byte, so
+        without a network pin this airdrop would have built, confirmed, and
+        stranded the units. ``wallet sweep`` has pinned the network for this
+        reason; the glyph paths did not.
+        """
+        testnet_addr = _testnet_address()
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "glyph", "airdrop-ft", _REF, "--to", f"{testnet_addr}:10"],
+        )
+        assert result.exit_code != 0
+        assert "not a valid mainnet radiant p2pkh address" in result.output.lower()
+
+    def test_transfer_ft_wrong_network_address_refused(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """`transfer-ft` had the identical gap — same paste, same unspendable output."""
+        testnet_addr = _testnet_address()
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "glyph", "transfer-ft", _REF, "10", "--to", testnet_addr],
+        )
+        assert result.exit_code != 0
+        assert "not a valid mainnet radiant p2pkh address" in result.output.lower()
 
     def test_missing_recipients_file_refused(self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path) -> None:
         runner.invoke(cli, _new_wallet_args(tmp_wallet_path))

@@ -89,13 +89,26 @@ Checked, not assumed:
 Pay it honestly, and never imply more:
 
 - `pyrxd.glyph.royalty` computes the payouts.
-  `royalty_due = max(minimum, floor(sale_price * bps / 10_000))` — byte-for-byte
-  Photonic's `calculateRoyalty`, so a pyrxd payment and a Photonic payment agree
-  on the single-recipient path.
-- `FtUtxoSet.build_airdrop_tx` takes an optional `royalty=` and **pays it by
-  default** once supplied. `pay_royalty=False` is an explicit opt-out, and the
-  decision is recorded in the result either way. A one-recipient airdrop is an
-  ordinary transfer, so this covers the transfer case too.
+  `royalty_due = min(max(minimum, floor(sale_price * bps / 10_000)), sale_price)`.
+  The `max` half is byte-for-byte Photonic's `calculateRoyalty`, so a pyrxd
+  payment and a Photonic payment agree on the single-recipient path whenever the
+  declared terms are sane. The `min` half is a pyrxd bound Photonic does not
+  have: `GlyphRoyalty.minimum` is a free integer chosen by the token's creator
+  with nothing on chain limiting it, and it is spent from the funding inputs of
+  whoever *moves* the token. A royalty larger than the consideration is not a
+  royalty. Consequence: a `minimum` with `sale_price=0` now pays nothing, which
+  removes the flat-fee-on-a-gift reading this module used to document.
+- `FtUtxoSet.build_airdrop_tx` takes an optional `royalty=` and resolves it
+  three ways: `pay_royalty=None` (the default) pays **iff `royalty.enforced`**,
+  `True` pays an advisory royalty anyway, `False` never pays. The builder used
+  to ignore `enforced` entirely and pay whenever a royalty was supplied — but
+  `enforced` is the creator's own statement about whether wallets should insist,
+  it defaults to `False` everywhere a `GlyphRoyalty` is built, and paying anyway
+  spends the *sender's* photons on a payment the creator did not ask to be
+  insisted on. Keeping the `True` override is what stops this collapsing into
+  Photonic's "advisory means never paid". The decision is recorded in the result
+  either way. A one-recipient airdrop is an ordinary transfer, so this covers the
+  transfer case too.
 - Payouts are plain 25-byte P2PKH outputs. They carry no ref, so they contribute
   to no conservation sum — which is why a royalty can ride on an FT transfer at
   all. Verified against a live `radiant-core:v3.1.1` regtest node in
@@ -130,15 +143,18 @@ rather than dropped. The invariant is exact:
   a lookup pyrxd does not have yet. Until it does, the library takes a
   `GlyphRoyalty` and a marketplace built on pyrxd supplies it.
 - **A royalty on `build_nft_transfer_tx` or `FtUtxoSet.build_transfer_tx`.**
-  Neither has a plain-RXD input. The NFT builder takes exactly one input, the
-  dust-carrying singleton; the FT transfer builder takes only token inputs,
-  where every photon is already a unit. A royalty paid from either would come
-  out of the token — burning units to pay a creator, which is not honouring
-  anything. The first cut of this work did exactly that on the FT transfer path:
-  a review measured a 5% royalty on a 1,000,000-photon sale costing the
-  recipient 390,000 **units**. Both parameters were removed rather than papered
-  over. Paying a royalty needs a funded builder, which is what
-  `build_airdrop_tx` is.
+  The NFT builder takes exactly one input, the dust-carrying singleton, so a
+  royalty paid from it would come out of the token. The first cut of this work
+  did exactly that on the FT transfer path: a review measured a 5% royalty on a
+  1,000,000-photon sale costing the recipient 390,000 **units**. Both parameters
+  were removed rather than papered over.
+
+  `FtUtxoSet.build_transfer_tx` now takes plain-RXD `funding` (it is a
+  single-recipient `build_airdrop_tx`), so the funding objection no longer
+  applies to it — but the parameter stays off, because `FtTransferResult` has no
+  field for the payouts and paying a creator without reporting who was paid is
+  worse than not offering the option. Use `build_airdrop_tx` with one recipient;
+  it is the same transaction and it returns `royalty_payouts`.
 
 ## What would change this
 

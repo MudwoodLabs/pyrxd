@@ -390,10 +390,10 @@ class TestDustLimitIsPolicyNotConsensus:
 class TestRoyalty:
     """An airdrop can carry an advisory royalty. It is never token-side."""
 
-    def _royalty(self) -> GlyphRoyalty:
-        return GlyphRoyalty(bps=500, address=PrivateKey().public_key().address())
+    def _royalty(self, *, enforced: bool = True) -> GlyphRoyalty:
+        return GlyphRoyalty(bps=500, address=PrivateKey().public_key().address(), enforced=enforced)
 
-    def test_royalty_is_paid_by_default_when_supplied(self):
+    def test_enforced_royalty_is_paid_by_default(self):
         s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
         result = s.build_airdrop_tx(
             _recipients((_BOB_PKH, 10)),
@@ -409,6 +409,91 @@ class TestRoyalty:
         # Plain P2PKH — carries no ref, so it changes no conservation sum.
         assert len(paid[0].locking_script.serialize()) == 25
 
+    def test_unenforced_royalty_is_not_paid_by_default(self):
+        """``enforced`` is the creator's own statement about insisting.
+
+        The builder used to ignore it and pay anyway, spending the *sender's*
+        funding photons on a payment the creator did not ask to be insisted on.
+        ``enforced`` defaults to ``False`` in every path that builds a
+        ``GlyphRoyalty``, so this was the common case, not the corner.
+        """
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
+        result = s.build_airdrop_tx(
+            _recipients((_BOB_PKH, 10)),
+            _alice_key(),
+            funding=[_funding()],
+            royalty=self._royalty(enforced=False),
+            sale_price=1_000_000,
+        )
+        assert result.royalty_payouts == ()
+
+    def test_pay_royalty_true_honours_an_advisory_royalty_anyway(self):
+        """The override survives: advisory must be able to mean "paid by choice"."""
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
+        result = s.build_airdrop_tx(
+            _recipients((_BOB_PKH, 10)),
+            _alice_key(),
+            funding=[_funding()],
+            royalty=self._royalty(enforced=False),
+            sale_price=1_000_000,
+            pay_royalty=True,
+        )
+        assert [p.photons for p in result.royalty_payouts] == [50_000]
+
+    def test_pay_royalty_false_overrides_an_enforced_royalty(self):
+        """Nothing on chain compels the output, so ``False`` still wins."""
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
+        result = s.build_airdrop_tx(
+            _recipients((_BOB_PKH, 10)),
+            _alice_key(),
+            funding=[_funding()],
+            royalty=self._royalty(enforced=True),
+            sale_price=1_000_000,
+            pay_royalty=False,
+        )
+        assert result.royalty_payouts == ()
+
+    def test_an_unbounded_minimum_cannot_drain_the_funding(self):
+        """``minimum`` is a free integer chosen by the token's creator.
+
+        Before the cap, ``minimum = 10**15`` on a plain transfer (``sale_price =
+        0``) resolved to 10**15 photons payable out of the *sender's* funding
+        inputs. It is now bounded by the consideration, which for a transfer is
+        nothing.
+        """
+        r = GlyphRoyalty(
+            bps=0,
+            address=PrivateKey().public_key().address(),
+            enforced=True,
+            minimum=10**15,
+        )
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
+        result = s.build_airdrop_tx(
+            _recipients((_BOB_PKH, 10)),
+            _alice_key(),
+            funding=[_funding()],
+            royalty=r,
+            sale_price=0,
+        )
+        assert result.royalty_payouts == ()
+
+    def test_minimum_is_capped_at_the_sale_price(self):
+        r = GlyphRoyalty(
+            bps=100,
+            address=PrivateKey().public_key().address(),
+            enforced=True,
+            minimum=10**15,
+        )
+        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
+        result = s.build_airdrop_tx(
+            _recipients((_BOB_PKH, 10)),
+            _alice_key(),
+            funding=[_funding()],
+            royalty=r,
+            sale_price=1_000_000,
+        )
+        assert [p.photons for p in result.royalty_payouts] == [1_000_000]
+
     def test_pay_royalty_false_is_the_explicit_opt_out(self):
         s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
         result = s.build_airdrop_tx(
@@ -422,7 +507,7 @@ class TestRoyalty:
         assert result.royalty_payouts == ()
 
     def test_royalty_comes_out_of_funding_never_out_of_the_token(self):
-        r = self._royalty()
+        r = self._royalty(enforced=True)
         s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
         without = s.build_airdrop_tx(_recipients((_BOB_PKH, 10)), _alice_key(), funding=[_funding()])
         with_r = s.build_airdrop_tx(
@@ -447,39 +532,68 @@ class TestRoyalty:
             )
 
 
-class TestTransferBuilderRefusesRealInputs:
-    """`build_transfer_tx` cannot send a correct amount of a real FT.
+class TestTransferBuilderIsTheAirdropBuilder:
+    """`build_transfer_tx` is a single-recipient `build_airdrop_tx`.
 
-    It sizes the transfer output from the inputs' RXD rather than from `amount`.
-    Under this module's original model — `value` and `ft_amount` orthogonal —
-    that is merely odd. On chain they are the same number, so it delivers the
-    wrong quantity: measured at 46,739,454 units for `amount=250` out of a
-    50,000,000-unit holding, i.e. the sender's whole balance to someone who
-    asked for 250. It now refuses those inputs instead.
+    It used to size the transfer output from the inputs' RXD rather than from
+    `amount`, which on a real holding delivered the wrong quantity — measured at
+    46,739,454 units for `amount=250` out of a 50,000,000-unit UTXO, i.e. the
+    sender's whole balance to someone who asked for 250. A tripwire on
+    `value == ft_amount` was added and did not fix it: the same call at
+    `value == ft_amount ± 1` still delivered ~46.7 million. Delegating removes
+    the expression rather than fencing it off.
     """
 
-    def test_coupled_inputs_are_refused(self):
+    def test_coupled_inputs_send_the_exact_amount(self):
+        """The shape the tripwire used to refuse is the shape that must work."""
         s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(50_000_000)])
-        with pytest.raises(ValidationError, match="value == ft_amount"):
-            s.build_transfer_tx(amount=250, new_owner_pkh=Hex20(_BOB_PKH), private_key=_alice_key())
+        result = s.build_transfer_tx(
+            amount=250,
+            new_owner_pkh=Hex20(_BOB_PKH),
+            private_key=_alice_key(),
+            funding=[_funding()],
+        )
+        assert result.tx.outputs[0].satoshis == 250
+        assert result.tx.outputs[1].satoshis == 49_999_750
 
-    def test_the_refusal_names_the_builder_to_use(self):
-        s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(50_000_000)])
-        with pytest.raises(ValidationError, match="build_airdrop_tx"):
-            s.build_transfer_tx(amount=250, new_owner_pkh=Hex20(_BOB_PKH), private_key=_alice_key())
+    @pytest.mark.parametrize("delta", [-1, 1])
+    def test_decoupled_inputs_are_refused(self, delta: int):
+        """`value != ft_amount` cannot exist on chain and is refused either way.
 
-    def test_decoupled_inputs_still_build(self):
-        """The legacy model keeps working — that is what the existing suite uses."""
+        This is the fail-closed backstop, not the thing that makes the amount
+        correct — the recipient output above is `amount` regardless.
+        """
         utxo = FtUtxo(
             txid="a0" * 32,
             vout=0,
-            value=50_000_000,
-            ft_amount=1_000,
+            value=50_000_000 + delta,
+            ft_amount=50_000_000,
             ft_script=build_ft_locking_script(Hex20(_alice_pkh()), _token_ref()),
         )
         s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
-        result = s.build_transfer_tx(amount=400, new_owner_pkh=Hex20(_BOB_PKH), private_key=_alice_key())
-        assert len(result.tx.outputs) == 2
+        with pytest.raises(ValidationError, match="ft_amount"):
+            s.build_transfer_tx(
+                amount=250,
+                new_owner_pkh=Hex20(_BOB_PKH),
+                private_key=_alice_key(),
+                funding=[_funding()],
+            )
+
+    def test_transfer_and_one_recipient_airdrop_are_byte_identical(self):
+        """One implementation, so the two cannot drift apart again."""
+        utxos = [_make_utxo(50_000_000)]
+        transfer = FtUtxoSet(ref=_token_ref(), utxos=utxos).build_transfer_tx(
+            amount=250,
+            new_owner_pkh=Hex20(_BOB_PKH),
+            private_key=_alice_key(),
+            funding=[_funding()],
+        )
+        airdrop = FtUtxoSet(ref=_token_ref(), utxos=utxos).build_airdrop_tx(
+            _recipients((_BOB_PKH, 250)),
+            _alice_key(),
+            funding=[_funding()],
+        )
+        assert transfer.tx.serialize() == airdrop.tx.serialize()
 
     def test_no_royalty_parameter_exists(self):
         """A royalty has to be funded from RXD, and this builder has none."""
