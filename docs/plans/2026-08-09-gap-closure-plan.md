@@ -145,14 +145,17 @@ order the legs by trust, size `t_btc` deliberately, don't auto-accept from unkno
      non-compliant seller nor an out-of-band gift. Full evidence:
      `docs/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.md`.
      Shipped: `pyrxd.glyph.royalty` (Photonic-parity arithmetic), `royalty=` on the FT
-     transfer and airdrop builders paying by default with an explicit opt-out, and the
-     `royalty` block of a metadata file — which the CLI had been **silently dropping**, so a
-     royalty could not be recorded at mint time at all.
+     airdrop builder paying by default with an explicit opt-out (a one-recipient airdrop is
+     an ordinary transfer), and the `royalty` block of a metadata file — which the CLI had
+     been **silently dropping**, so a royalty could not be recorded at mint time at all.
+     Deliberately NOT on `build_transfer_tx` or `build_nft_transfer_tx`: neither has a
+     plain-RXD input, so a royalty there would be paid out of the token itself.
   2. **Multi-recipient airdrop — SHIPPED.** `glyph airdrop-ft` / `FtUtxoSet.build_airdrop_tx`,
      proven against a live `radiant-core:v3.1.1` regtest node with a negative control.
   3. **CONTAINER collection mint — DEFERRED, and the description above is WRONG.** "the enum
      exists, unused" does not match the code: `GlyphBuilder.prepare_container_reveal`
-     (`glyph/builder.py:622`) is a complete script-level builder with 43 unit tests, the CLI
+     (`glyph/builder.py:622`) is a complete script-level builder with 10 unit tests
+     (`tests/test_mut_container_wave_builders.py::TestPrepareContainerReveal`), the CLI
      ships a `container-nft` metadata template, and `docs/concepts/glossary.md` (added by
      #379) already says so — "pyrxd ships a full builder". The provenance table's row is
      likewise wrong on this point.
