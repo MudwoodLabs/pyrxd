@@ -16,7 +16,7 @@ Covers **everything still deferred**, sequenced, with explicit triggers for the 
 | No offline cold refund/claim builder CLI | grep `build-refund\|build-claim` in `src/pyrxd/cli/` — zero hits |
 | ETH multi-source quorum EXISTS | `MultiSourceEthRpc` present |
 | dMint deploy-with-premine deferred | 10 raise/doc sites in `glyph/builder.py` |
-| No royalty payment, airdrop, or CONTAINER collection mint | grep — royalty decoded only; others absent |
+| No royalty payment, airdrop, or CONTAINER collection mint | grep — royalty decoded only; others absent. **CORRECTED 2026-08-10:** the CONTAINER half was wrong — `GlyphBuilder.prepare_container_reveal` exists and is unit-tested, and the #379 glossary already said so. What is absent is the commit→reveal *orchestration*, shared with MUT/WAVE. See §B2. |
 | No A–Z glossary page | `docs/how-to/`, `docs/concepts/` |
 
 **NOT verified — every effort size below is ESTIMATED and unspiked.** This repo has a documented
@@ -132,6 +132,54 @@ order the legs by trust, size `t_btc` deliberately, don't auto-accept from unkno
 - **B2. Token issuance completeness** — royalty-honouring transfer (metadata is decoded but never
   *paid*), multi-recipient airdrop, `CONTAINER`-based collection mint (the enum exists, unused).
   **ESTIMATED: M each.**
+
+  **Outcome (2026-08-10): two of three shipped; the CONTAINER item was mis-scoped and is
+  re-specified below.**
+
+  1. **Royalty — SHIPPED as an advisory payment path, not an enforcement mechanism.** The
+     enforceability question was settled before any code: a royalty on an ordinary Radiant
+     transfer is a **social convention**. FT/NFT locks are P2PKH-gated; the FT epilogue
+     enforces ref *conservation*, never where value goes. No shipped covenant references a
+     royalty. Photonic reaches the same structural conclusion — enforcement exists only inside
+     a *voluntary* listing covenant, and its own header records that this stops neither a
+     non-compliant seller nor an out-of-band gift. Full evidence:
+     `docs/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.md`.
+     Shipped: `pyrxd.glyph.royalty` (Photonic-parity arithmetic), `royalty=` on the FT
+     transfer and airdrop builders paying by default with an explicit opt-out, and the
+     `royalty` block of a metadata file — which the CLI had been **silently dropping**, so a
+     royalty could not be recorded at mint time at all.
+  2. **Multi-recipient airdrop — SHIPPED.** `glyph airdrop-ft` / `FtUtxoSet.build_airdrop_tx`,
+     proven against a live `radiant-core:v3.1.1` regtest node with a negative control.
+  3. **CONTAINER collection mint — DEFERRED, and the description above is WRONG.** "the enum
+     exists, unused" does not match the code: `GlyphBuilder.prepare_container_reveal`
+     (`glyph/builder.py:622`) is a complete script-level builder with 43 unit tests, the CLI
+     ships a `container-nft` metadata template, and `docs/concepts/glossary.md` (added by
+     #379) already says so — "pyrxd ships a full builder". The provenance table's row is
+     likewise wrong on this point.
+
+     **The actual gap is orchestration, not a builder**, and it is not CONTAINER-specific.
+     `glyph/mint.py` lists `MUT`, `CONTAINER`, `WAVE` and `DMINT` in `_UNSUPPORTED_PROTOCOLS`
+     (`:174-179`) because each has a reveal shape the single-output `GlyphMinter` facade
+     cannot build; it refuses them with a clear error rather than stranding a commit, which is
+     correct behaviour, not a bug. So today `glyph init-metadata --type container-nft` hands a
+     user a template that `glyph mint-nft` will (safely) refuse.
+
+     **Concrete plan.** Build the commit→reveal orchestration once, for the whole class,
+     rather than three times:
+     - Extend `GlyphMinter` with a reveal-shape strategy so `_UNSUPPORTED_PROTOCOLS` becomes a
+       dispatch table rather than a refusal list. `prepare_dmint_deploy` already proves the
+       facade can carry a non-trivial shape — it just does so through a separate path.
+     - CONTAINER's specific need is small: an optional `OP_PUSHINPUTREF <child_ref>` prefix on
+       the NFT lock, plus fee sizing that accounts for those 37 extra bytes
+       (`glyph/fees.py:estimate_reveal_fee` already takes `extra_output_script_sizes`).
+     - Add `glyph mint-container --child-ref` (or a `--child-ref` option on `mint-nft`), and a
+       collection-membership read path — a container is only useful if something can enumerate
+       its members, which is an indexer question `RxinDexerClient` may or may not answer today.
+       **Spike that before committing to a size.**
+     - Prove on regtest that a node accepts a container reveal, and that the child ref survives
+       a transfer of the container.
+     The membership/read half is the unknown, and it is the reason this was not rushed in
+     alongside the other two. **ESTIMATED: M, unspiked — treat as an ordering hint only.**
 - **B3. External-miner progress frames** — extend the JSON-over-stdio protocol so third-party
   miners can report live progress. Additive; the bundled miner already streams. Must preserve the
   "stderr discarded to bound memory" defence. **ESTIMATED: S.**

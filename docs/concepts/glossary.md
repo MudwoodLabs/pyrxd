@@ -16,6 +16,16 @@ those for depth; use this page to look something up mid-task.
 
 ## A
 
+- **airdrop** — one transaction paying FT units to many recipients
+  (`pyrxd glyph airdrop-ft`, `FtUtxoSet.build_airdrop_tx`). One transaction
+  rather than N sequential transfers, because sequential transfers chain —
+  each spends the previous one's change — so a failure partway leaves the
+  set half-delivered with no way to tell which half from the token's ref
+  alone. Two things follow from **1 photon = 1 token unit**: each
+  recipient's output value *is* the units they receive, and the fee cannot
+  come out of a token output without burning units, so it comes from a
+  separate plain-RXD funding input. Conservation is the same
+  `select`/`ft_in - out == change` path a single transfer uses.
 - **AUTHORITY** — a Glyph protocol type (`GlyphProtocol.AUTHORITY = 10`,
   [`src/pyrxd/glyph/types.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/types.py))
   marking issuer-authority metadata. pyrxd **decodes and classifies** it
@@ -362,6 +372,22 @@ those for depth; use this page to look something up mid-task.
   doesn't change the total-attempts distribution — it's a mechanical
   workaround for V1's narrow nonce field, not a different probability
   model. **V2's 8-byte nonce field doesn't need it.**
+- **royalty** — a creator's cut of a secondary sale, recorded in the Glyph
+  envelope as `GlyphRoyalty` (`bps`, `address`, optional `minimum` and
+  `splits`). **Advisory, not consensus-enforced.** Nothing in Radiant, and
+  nothing in the scripts pyrxd builds, requires a royalty output: an FT
+  lock's epilogue enforces *ref conservation* (how many units may exist),
+  never where value goes, and an NFT lock is a bare P2PKH behind a ref
+  push. A compliant wallet pays it; a non-compliant one does not, and both
+  transactions confirm. pyrxd computes and pays it —
+  `pyrxd.glyph.royalty`, and `royalty=` on the FT airdrop builder, which
+  pays by default once supplied — but never describes it as a guarantee.
+  (Not on `build_transfer_tx` or `build_nft_transfer_tx`: neither has a
+  plain-RXD input, so a royalty there could only be paid out of the token.) The `enforced` flag in the metadata means "wallets *should*
+  enforce", not "the chain will". A royalty **can** be made binding on a
+  *buyer* by listing the token into a sale covenant; it cannot be made
+  binding on a *holder*, who chooses the transaction. See
+  [the design decision](../solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.md).
 - **RSWP** — the on-chain swap-order wire format: an `OP_RETURN` output
   whose first push is the ASCII marker `RSWP`, not a special script
   template. pyrxd ships `pyrxd.swap.rswp` (post/take/cancel/browse). The

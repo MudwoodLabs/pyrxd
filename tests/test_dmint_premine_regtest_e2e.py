@@ -54,9 +54,11 @@ from test_htlc_regtest_e2e import (  # noqa: F401  (node = fixture)
 )
 
 from pyrxd.glyph.builder import (
+    AirdropFunding,
+    AirdropRecipient,
     DmintV1DeployParams,
     DmintV2DeployParams,
-    FtTransferParams,
+    FtAirdropParams,
     FtUtxo,
     GlyphBuilder,
 )
@@ -74,7 +76,7 @@ from pyrxd.glyph.script import build_ft_locking_script
 from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
-from pyrxd.script.type import encode_pushdata, to_unlock_script_template
+from pyrxd.script.type import P2PKH, encode_pushdata, to_unlock_script_template
 from pyrxd.security.errors import MaxAttemptsError
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
@@ -262,10 +264,23 @@ def _deploy_with_premine(node: _RegtestNode, owner: PrivateKey, *, v2: bool) -> 
 
 
 def _spend_premine(node: _RegtestNode, owner: PrivateKey, dep: _PremineDeploy) -> None:
-    """Move the premined FT through the shipped transfer path and prove acceptance."""
+    """Move the premined FT through the shipped transfer path and prove acceptance.
+
+    Uses ``build_ft_airdrop_tx`` with one recipient rather than
+    ``build_ft_transfer_tx``. The latter now refuses these inputs on purpose: it
+    sizes the transfer output from the inputs' RXD instead of from ``amount``,
+    which on a real holding (``value == ft_amount``) delivers the wrong number of
+    units. This test previously passed *because* it spent the premine in full —
+    the only case where the two agree — and so could not have caught it.
+    """
     recipient_pkh = Hex20(secrets.token_bytes(20))
-    result = GlyphBuilder().build_ft_transfer_tx(
-        FtTransferParams(
+    fund_key = PrivateKey(secrets.token_bytes(32))
+    fund_spk = P2PKH().lock(fund_key.public_key().hash160()).serialize()
+    fund_txid = _pay_to_spk(node, fund_spk, 200_000_000)
+    node.mine(1)
+
+    result = GlyphBuilder().build_ft_airdrop_tx(
+        FtAirdropParams(
             ref=dep.token_ref,
             utxos=[
                 FtUtxo(
@@ -276,9 +291,9 @@ def _spend_premine(node: _RegtestNode, owner: PrivateKey, dep: _PremineDeploy) -
                     ft_script=dep.premine_script,
                 )
             ],
-            amount=dep.premine_value,
-            new_owner_pkh=recipient_pkh,
+            recipients=[AirdropRecipient(pkh=recipient_pkh, amount=dep.premine_value)],
             private_key=owner,
+            funding=[AirdropFunding(txid=fund_txid, vout=0, value=200_000_000, private_key=fund_key)],
         )
     )
     raw = result.tx.serialize().hex()

@@ -183,8 +183,18 @@ Threat scenario S7 from the threat model. As-shipped, the broadcast summary now 
 - [ ] Edit the file: change `name` to "ATTACKER NFT", set `description` to something obvious.
 - [ ] Run `pyrxd glyph deploy-ft /tmp/ft.json --supply 100 --treasury <some addr>` (use a fake-but-valid-shape addr if not testing on chain).
 - [ ] At the confirmation prompt, confirm the "Metadata" section shows the modified name and description. Abort the broadcast.
-- [ ] Repeat with a metadata file that has a `creator` block (manually added). Confirm `creator: pubkey=...` appears in the summary.
-- [ ] Repeat with a `royalty` block. Confirm royalty bps and address appear, and any splits appear with their own bps.
+- [ ] Repeat with a `royalty` block. Confirm royalty bps and address appear, any splits appear
+      with their own bps, and the line `(ADVISORY — recorded on chain, not enforced by consensus)`
+      appears beneath them. Until 2026-08-10 this step could not pass: `_read_metadata_file`
+      never passed `royalty` to `GlyphMetadata`, so the block was silently dropped and never
+      reached the CBOR at all.
+- [ ] ⚠️ **KNOWN GAP — expected to fail.** Repeat with a metadata file that has a `creator` block
+      (manually added). `creator: pubkey=...` will **not** appear, because `_read_metadata_file`
+      still drops `creator`, `policy`, `rights` and `v` the same way it used to drop `royalty`.
+      The summary renders them when they are present; nothing on the CLI path can put them
+      there. Set them through the Python API (`GlyphMetadata(creator=...)`) to exercise the
+      summary. Note that a dropped `policy.transferable: false` means a token a creator marked
+      soulbound mints as freely transferable, with no warning.
 
 ### 5.2 Metadata that triggers validation errors
 

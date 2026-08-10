@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any, overload
 
 import cbor2
@@ -21,7 +22,7 @@ from .script import (
     extract_ref_from_nft_script,
     hash_payload,
 )
-from .types import GlyphMetadata, GlyphProtocol, GlyphRef
+from .types import GlyphMetadata, GlyphProtocol, GlyphRef, GlyphRoyalty
 
 # Minimum fee rate post-V2: 10,000 photons/byte
 MIN_FEE_RATE = 10_000  # photons per byte
@@ -888,6 +889,36 @@ class GlyphBuilder:
             change_pkh=params.change_pkh,
         )
 
+    def build_ft_airdrop_tx(self, params: FtAirdropParams) -> FtAirdropResult:
+        """Build one signed transaction paying FT units to many recipients.
+
+        Thin delegator to :meth:`FtUtxoSet.build_airdrop_tx`, exactly as
+        :meth:`build_ft_transfer_tx` delegates to ``build_transfer_tx`` — the
+        selection, conservation and two-pass fee logic live on the UTXO set so
+        both API surfaces share one implementation rather than two that can
+        disagree about how many units exist.
+
+        :param params: :class:`FtAirdropParams` — see dataclass docstring.
+        :returns:      :class:`~pyrxd.glyph.ft.FtAirdropResult`.
+        :raises ValidationError: bad recipient list, or the conservation backstop.
+        :raises ValueError: fee rate below Radiant's relay floor, or the selected
+            inputs' RXD cannot cover dust + royalty + fee.
+        """
+        from .ft import FtUtxoSet
+
+        utxo_set = FtUtxoSet(ref=params.ref, utxos=params.utxos)
+        return utxo_set.build_airdrop_tx(
+            recipients=params.recipients,
+            private_key=params.private_key,
+            funding=params.funding,
+            fee_rate=params.fee_rate,
+            change_pkh=params.change_pkh,
+            dust_limit=params.dust_limit,
+            royalty=params.royalty,
+            sale_price=params.sale_price,
+            pay_royalty=params.pay_royalty,
+        )
+
 
 # ---------------------------------------------------------------------------
 # dMint deploy API dataclasses
@@ -1449,6 +1480,16 @@ class TransferParams:
     :param new_owner_pkh:  recipient's 20-byte public-key hash
     :param private_key:    pyrxd.keys.PrivateKey — current owner's signing key
     :param fee_rate:       photons per byte (Radiant post-V2 minimum is 10_000)
+
+    .. note::
+       There is no ``royalty`` here, unlike :class:`FtTransferParams`. This
+       builder takes exactly **one** input — the NFT UTXO — and an NFT carrier
+       holds dust, so there is no RXD budget a royalty could be paid from; the
+       parameter would exist and never be satisfiable. Paying a royalty on an
+       NFT needs a funded builder (the CLI's ``transfer-nft`` already sources a
+       separate plain-RXD input for its fee, and builds its transaction
+       directly rather than through this method). Tracked as the NFT half of the
+       royalty work; the FT path in :mod:`pyrxd.glyph.ft` carries it today.
     """
 
     nft_utxo_txid: str
@@ -1487,6 +1528,13 @@ class TransferResult:
 # pragma the way ruff does — and makes the re-export intent obvious to
 # readers. One real consumer is examples/ft_transfer_demo.py, which
 # imports FtUtxo from this module for back-compat with pre-0.4 layouts.
+# The airdrop's per-output floor default. Aliased rather than restated so the two
+# modules cannot drift; ``ft.py`` owns the value and the note that 546 is pyrxd
+# wallet policy, not a Radiant rule.
+from .ft import DUST_LIMIT as FT_DUST_LIMIT  # noqa: E402
+from .ft import AirdropFunding as AirdropFunding  # noqa: E402
+from .ft import AirdropRecipient as AirdropRecipient  # noqa: E402
+from .ft import FtAirdropResult as FtAirdropResult  # noqa: E402
 from .ft import FtTransferResult as FtTransferResult  # noqa: E402
 from .ft import FtUtxo as FtUtxo  # noqa: E402
 
@@ -1503,6 +1551,11 @@ class FtTransferParams:
     :param fee_rate:       photons/byte (Radiant post-V2 minimum is 10_000)
     :param change_pkh:     FT-change recipient PKH. Defaults to the sender's
                            PKH when ``None``.
+
+    .. note::
+       No ``royalty`` here, unlike :class:`FtAirdropParams`. See the warning on
+       :meth:`FtUtxoSet.build_transfer_tx`: that builder has no plain-RXD source,
+       so a royalty could only be paid out of the token itself.
     """
 
     ref: GlyphRef
@@ -1512,3 +1565,40 @@ class FtTransferParams:
     private_key: Any
     fee_rate: int = MIN_FEE_RATE
     change_pkh: Hex20 | None = None
+
+
+@dataclass
+class FtAirdropParams:
+    """Parameters for a multi-recipient FT airdrop.
+
+    Mirrors :class:`FtTransferParams`, with ``amount`` + ``new_owner_pkh``
+    replaced by an ordered list of :class:`~pyrxd.glyph.ft.AirdropRecipient`.
+
+    :param ref:          the :class:`GlyphRef` identifying the token
+    :param utxos:        list of :class:`FtUtxo` available to spend
+    :param recipients:   ordered destinations. Output order follows this list.
+    :param private_key:  sender's :class:`pyrxd.keys.PrivateKey`
+    :param funding:      plain-RXD :class:`~pyrxd.glyph.ft.AirdropFunding`
+                         inputs that pay the fee. The token cannot pay it —
+                         an FT output's value is its unit count.
+    :param fee_rate:     photons/byte. Validated against Radiant's effective
+                         relay floor by the builder.
+    :param change_pkh:   FT- and RXD-change PKH. Defaults to the sender's.
+    :param dust_limit:   photons on each recipient output. A pyrxd wallet-policy
+                         floor, not a chain rule — Radiant's dust threshold is 1.
+    :param royalty:      optional; paid by default when supplied. Advisory.
+    :param sale_price:   photons the seller receives; the royalty base.
+    :param pay_royalty:  ``False`` to skip an otherwise-payable royalty.
+    """
+
+    ref: GlyphRef
+    utxos: list  # list[FtUtxo] — mirrors FtTransferParams' style.
+    recipients: list  # list[AirdropRecipient]
+    private_key: Any
+    funding: list = dc_field(default_factory=list)  # list[AirdropFunding]
+    fee_rate: int = MIN_FEE_RATE
+    change_pkh: Hex20 | None = None
+    dust_limit: int = FT_DUST_LIMIT
+    royalty: GlyphRoyalty | None = None
+    sale_price: int = 0
+    pay_royalty: bool = True

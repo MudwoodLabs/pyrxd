@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..glyph.mint import build_reveal_unlock_template
-from ..glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
+from ..glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef, GlyphRoyalty
 from ..security.errors import ValidationError
 from ..security.types import Txid
 from .context import CliContext
@@ -108,6 +108,7 @@ def _read_metadata_file(path: Path) -> GlyphMetadata:
             image_url=data.get("image_url", ""),
             image_ipfs=data.get("image_ipfs", ""),
             image_sha256=data.get("image_sha256", ""),
+            royalty=_read_royalty(data.get("royalty")),
         )
     except ValidationError as exc:
         raise UserError(
@@ -115,6 +116,116 @@ def _read_metadata_file(path: Path) -> GlyphMetadata:
             cause=str(exc),
             fix="see the error above; check protocol combinations and decimals range",
         ) from exc
+
+
+def _read_royalty(raw: object) -> GlyphRoyalty | None:
+    """Parse the optional ``royalty`` block of a metadata file.
+
+    Until this existed the key was **silently dropped**: ``_read_metadata_file``
+    never passed ``royalty`` to :class:`GlyphMetadata`, so a creator could write
+    a complete royalty block, mint, and end up with a token whose CBOR carried
+    no royalty at all — with no warning, and nothing to notice afterwards except
+    that no wallet ever showed one. Minting is one-way, so the failure was
+    permanent for that token.
+
+    The royalty that lands here is a **declaration, not a guarantee**. Nothing in
+    Radiant consensus makes a later transfer pay it; see
+    :mod:`pyrxd.glyph.royalty` for what "honouring" it can and cannot mean.
+
+    Shape (mirrors the CBOR the envelope carries)::
+
+        "royalty": {
+            "bps": 500,
+            "address": "1Recipient…",
+            "enforced": false,
+            "minimum": 0,
+            "splits": [{"address": "1A…", "bps": 300},
+                       {"address": "1B…", "bps": 200}]
+        }
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise UserError(
+            "metadata.royalty must be a JSON object",
+            cause=f"got {type(raw).__name__}: {raw!r}",
+            fix='use {"bps": 500, "address": "<radiant address>"}',
+        )
+    if "bps" not in raw or "address" not in raw:
+        raise UserError(
+            "metadata.royalty needs both 'bps' and 'address'",
+            cause=f"got keys {sorted(raw)}",
+            fix='e.g. {"bps": 500, "address": "<radiant address>"} for 5%',
+        )
+
+    # Not `raw.get("splits", []) or []` — that turns any falsy value, including
+    # a wrong-typed `{}`, into an empty list and skips the type check below.
+    splits_raw = raw["splits"] if "splits" in raw and raw["splits"] is not None else []
+    if not isinstance(splits_raw, list):
+        raise UserError(
+            "metadata.royalty.splits must be a list of objects",
+            cause=f"got {type(splits_raw).__name__}",
+            fix='e.g. [{"address": "<addr>", "bps": 300}]',
+        )
+    splits: list[tuple[str, int]] = []
+    for i, s in enumerate(splits_raw):
+        if not isinstance(s, dict) or "address" not in s or "bps" not in s:
+            raise UserError(
+                f"metadata.royalty.splits[{i}] must be an object with 'address' and 'bps'",
+                cause=f"got {s!r}",
+            )
+        # int() is inside its own guard: a non-numeric split bps would otherwise
+        # escape as a raw ValueError/TypeError traceback rather than the
+        # message/cause/fix block every other CLI failure produces.
+        try:
+            split_bps = int(s["bps"])
+        except (TypeError, ValueError) as exc:
+            raise UserError(
+                f"metadata.royalty.splits[{i}].bps is not an integer",
+                cause=f"got {s['bps']!r}",
+                fix="basis points are whole numbers, e.g. 300 for 3%",
+            ) from exc
+        splits.append((str(s["address"]), split_bps))
+
+    try:
+        royalty = GlyphRoyalty(
+            bps=int(raw["bps"]),
+            address=str(raw["address"]),
+            enforced=bool(raw.get("enforced", False)),
+            minimum=int(raw.get("minimum", 0)),
+            splits=tuple(splits),
+        )
+    except (ValidationError, TypeError, ValueError) as exc:
+        raise UserError(
+            "metadata.royalty failed validation",
+            cause=str(exc),
+            fix="bps must be 0..10000, address non-empty, minimum >= 0, and splits must not exceed bps",
+        ) from exc
+
+    # GlyphRoyalty accepts any non-empty address string, so an unusable address
+    # would otherwise be signed into the token's CBOR and only surface when
+    # somebody tried to pay it. Decode EVERY address named in the block — not
+    # whichever ones happen to be paid at some probe price. Running
+    # `royalty_payouts` and hoping looked equivalent and is not: it drops
+    # recipients whose share floors to zero, so splits that exactly cover `bps`
+    # leave the top-level address unchecked, and `bps=0` with no minimum checks
+    # nothing at all. Minting is one-way; a typo caught here is free.
+    from ..utils import address_to_public_key_hash
+
+    for label, address in [
+        ("address", royalty.address),
+        *((f"splits[{i}].address", a) for i, (a, _) in enumerate(royalty.splits)),
+    ]:
+        try:
+            if len(address_to_public_key_hash(address)) != 20:
+                raise ValueError("decoded to the wrong length")
+        except (ValidationError, ValueError) as exc:
+            raise UserError(
+                f"metadata.royalty.{label} is not a valid Radiant address",
+                cause=f"{address!r}: {exc}",
+                fix="check every 'address' in the royalty block, including any splits",
+            ) from exc
+    return royalty
 
 
 _TEMPLATE_TYPES = ("nft", "ft", "dmint-ft", "mutable-nft", "container-nft")
@@ -225,6 +336,11 @@ def _metadata_summary(metadata: GlyphMetadata) -> _BroadcastSummary:
         if metadata.royalty.splits:
             for addr, bps in metadata.royalty.splits:
                 lines.append(f"             split: {bps} bps → {addr}")
+        # Say it here, at the only moment the creator is still deciding. A
+        # royalty recorded in a Glyph envelope is a declaration honoured by
+        # compliant wallets, not something Radiant consensus can compel — see
+        # pyrxd.glyph.royalty for the evidence behind that sentence.
+        lines.append("             (ADVISORY — recorded on chain, not enforced by consensus)")
     return _BroadcastSummary(title="Metadata", lines=lines)
 
 

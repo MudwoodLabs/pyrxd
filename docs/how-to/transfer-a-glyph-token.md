@@ -8,6 +8,7 @@ of it to someone else. Two CLI verbs cover both cases:
 | You hold | Command | What moves |
 |---|---|---|
 | A fungible token (FT) | `pyrxd glyph transfer-ft` | `AMOUNT` units to one recipient, change back to you |
+| A fungible token (FT), many recipients | `pyrxd glyph airdrop-ft` | one transaction paying N recipients, change back to you |
 | A non-fungible token (NFT) | `pyrxd glyph transfer-nft` | the whole singleton to one recipient |
 
 Both **sign and broadcast a real transaction** and ask you to confirm the
@@ -54,9 +55,15 @@ $ pyrxd glyph transfer-ft <REF> <AMOUNT> --to <ADDRESS>
 
 pyrxd scans your used addresses for UTXOs of `REF`, greedily selects enough to
 cover `AMOUNT`, and builds a **conservation-enforcing** transfer: the recipient
-gets a new FT output for `AMOUNT`, and any remainder comes back to you as a
-change FT output. The Radiant FT consensus rule (token in == token out) is
+gets a new FT output for exactly `AMOUNT`, and any remainder comes back to you as
+a change FT output. The Radiant FT consensus rule (token in == token out) is
 preserved by construction — you cannot accidentally create or destroy units.
+
+> **You need a little plain RXD.** An FT's quantity *is* its output value on
+> Radiant (1 photon = 1 unit), so the fee cannot come out of a token output
+> without shorting the recipient. The transfer sources it from a separate
+> plain-RXD UTXO, the same way `transfer-nft` does. Without one it stops with
+> *"no plain-RXD UTXO large enough to fund the fee"*.
 
 ```console
 $ pyrxd glyph transfer-ft 9d3f…a1:1 250 --to 1Qq…recipient
@@ -110,6 +117,124 @@ NFT transfer broadcast: c88a…91
 
 ---
 
+## Send to many recipients at once (FT airdrop)
+
+```console
+$ pyrxd glyph airdrop-ft <REF> --to <ADDRESS>:<AMOUNT> --to <ADDRESS>:<AMOUNT>
+$ pyrxd glyph airdrop-ft <REF> --recipients holders.csv
+```
+
+One transaction, not one per recipient. That matters more than it sounds: N
+sequential transfers each spend the previous one's change, so if the run dies
+partway you are left with a half-delivered list and no way to tell which half
+from the token's ref alone. An airdrop lands whole or it does not land.
+
+`--to` is repeatable and can be combined with `--recipients`. The file is either
+a `.json` array of `{"address": …, "amount": …}` objects, or `address,amount`
+CSV (blank lines and `#` comments ignored):
+
+```
+# holders.csv
+1Alice…,250
+1Bob…,100
+1Carol…,50
+```
+
+```console
+$ pyrxd glyph airdrop-ft 9d3f…a1:1 --recipients holders.csv
+
+  FT airdrop
+    ref:          9d3f…a1:1
+    recipients:   3
+    total:        400 units
+    fee:          6,420,000 photons (from plain RXD, not the token)
+    network:      mainnet
+
+  Destinations
+    vout 0: 250 units → 1Alice…
+    vout 1: 100 units → 1Bob…
+    vout 2: 50 units → 1Carol…
+
+Broadcast this airdrop? [y/N]: y
+
+FT airdrop broadcast: 71ba…0c
+```
+
+Output order follows your list, so `vout N` is recipient N — you can reconcile
+who got what straight from the transaction.
+
+> **You need plain RXD, and it is not optional.** On Radiant an FT's quantity
+> *is* its output's value — 1 photon = 1 unit — so taking the fee out of a token
+> output would deliver fewer units than you asked for. The airdrop sources the
+> fee from a separate plain-RXD UTXO instead. Without one it stops with *"no
+> plain-RXD UTXO large enough to fund the airdrop fee"* rather than quietly
+> shorting a recipient. Budget roughly `0.0084 RXD` per recipient at the default
+> fee rate.
+
+> **A repeated address is refused, not merged.** Two rows for the same address
+> is usually a duplicated line in a holder export, and paying twice cannot be
+> undone. Combine them into one row if the total really is intended.
+
+---
+
+## Royalties: honoured, not enforced
+
+If a token's metadata declares a royalty, pyrxd can pay it — and you should know
+exactly what that means. **Radiant does not enforce royalties.** An FT lock's
+epilogue enforces *conservation* (how many units may exist on the output side);
+it says nothing about where value goes. An NFT lock is a bare P2PKH behind a ref
+push. Any wallet, pyrxd included, is free to build a transfer with no royalty
+output at all, and the chain will accept it.
+
+So: a royalty is a convention that a compliant wallet honours. pyrxd's FT
+airdrop builder pays one **by default** when you hand it the token's
+`GlyphRoyalty` and the sale price, and records the decision in the result either
+way (a one-recipient airdrop is an ordinary transfer):
+
+```python
+from pyrxd.glyph.ft import AirdropFunding, AirdropRecipient, FtUtxoSet
+
+result = FtUtxoSet(ref=ref, utxos=utxos).build_airdrop_tx(
+    [AirdropRecipient(pkh=recipient_pkh, amount=250)],
+    key,
+    funding=[AirdropFunding(txid=..., vout=0, value=..., private_key=fee_key)],
+    royalty=token_royalty,      # the creator's recorded terms
+    sale_price=1_000_000,       # photons the seller receives
+)
+result.royalty_payouts          # who was paid, and how much
+```
+
+`build_transfer_tx` takes no `royalty`: it has no plain-RXD input, so a royalty
+could only be paid out of the token itself — which on Radiant means burning
+units. Same reason `build_nft_transfer_tx` takes none.
+
+The royalty comes out of the RXD side as plain P2PKH outputs, never out of the
+token, so it cannot change how many units anyone receives.
+
+There is deliberately no `--royalty-address` CLI flag: terms typed in by the
+person *paying* protect no creator. Reading a token's recorded terms off the
+chain is the missing piece, and it is not built yet. See
+[the design decision](../solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.md)
+for the full evidence, including what Photonic does.
+
+To record a royalty on a token you are minting, add a `royalty` block to your
+metadata file before `glyph mint-nft` / `glyph deploy-ft`:
+
+```json
+{
+  "protocol": ["NFT"],
+  "name": "My Token",
+  "royalty": { "bps": 500, "address": "1Creator…" }
+}
+```
+
+`bps` is basis points (500 = 5%). Optional: `minimum` (a photon floor, which
+also acts as a flat fee when `bps` is 0), `enforced` (a display hint for
+marketplaces — it does **not** make the chain enforce anything), and `splits`
+(a list of `{"address": …, "bps": …}`).
+
+---
+
 ## Failure modes
 
 - **`no FT holdings for <ref>` / `<NFT> is not held by this wallet`.** The
@@ -122,6 +247,12 @@ NFT transfer broadcast: c88a…91
   Consolidate the units onto one address first (see the note above).
 - **`no plain-RXD UTXO to fund the NFT transfer fee`.** Add a little RXD to the
   wallet — the NFT itself can't pay its own fee.
+- **`no plain-RXD UTXO large enough to fund the airdrop fee`.** Same cause, and
+  an airdrop needs more of it: roughly `0.0084 RXD` per recipient at the default
+  fee rate, on a *single* non-token UTXO. Consolidate some RXD, or split the
+  list into smaller batches.
+- **`recipient <address> appears more than once`.** A duplicated row in the
+  holder list. Combine the two entries if the double payment is intended.
 - **Couldn't reach ElectrumX.** The transfer needs the network to fetch source
   outputs and broadcast. Point at a reachable server with `--electrumx URL`.
 

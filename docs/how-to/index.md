@@ -32,9 +32,11 @@ troubleshoot-common-errors
   mnemonic.
 - **[Transfer a Glyph token after you mint it](transfer-a-glyph-token.md)** — the
   canonical second task: send an FT or NFT to someone with `glyph transfer-ft
-  REF AMOUNT --to ADDR` / `glyph transfer-nft REF --to ADDR`. Explains that `REF`
-  is the token's genesis ref (not the UTXO), FT conservation + change, and why an
-  NFT transfer needs a little plain RXD for the fee.
+  REF AMOUNT --to ADDR` / `glyph transfer-nft REF --to ADDR`, or pay many
+  recipients in one transaction with `glyph airdrop-ft REF --recipients FILE`.
+  Explains that `REF` is the token's genesis ref (not the UTXO), FT conservation
+  + change, why a transfer needs a little plain RXD for the fee, and why a
+  royalty is honoured but never enforced.
 - **[Use the local signing agent](use-the-signing-agent.md)** — unlock the wallet
   once into a foreground agent (`pyrxd agent unlock`); the seed lives in one
   process, `wallet send` signs against it with no mnemonic re-entry, and you

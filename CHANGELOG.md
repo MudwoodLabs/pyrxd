@@ -8,6 +8,103 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Multi-recipient FT airdrop — `glyph airdrop-ft`, `FtUtxoSet.build_airdrop_tx`,
+  `GlyphBuilder.build_ft_airdrop_tx`.** One transaction paying N recipients, instead of N
+  sequential transfers. The difference is not convenience: sequential transfers chain, each
+  spending the previous one's change, so a failure partway leaves the set half-delivered with
+  no way to tell which half from the token's ref alone. One transaction lands whole or not at
+  all.
+
+  Conservation goes through the existing path rather than around it — `select` for "do I hold
+  enough", `FtUtxoSet.__init__` for the per-ref input check, and the same
+  `ft_in - out == change` identity with `out = sum(amounts)`. No new code computes token
+  amounts, so there is no new way to mint units.
+
+  Two consequences of **1 photon = 1 FT unit** shape the builder, and getting the first one
+  wrong in the first cut is what the regtest proof caught:
+
+  - **A recipient's output value IS the units they receive**, so it is not a free parameter —
+    it must equal the requested amount, not a dust constant.
+  - **The fee therefore cannot come out of a token output**; doing so would silently burn
+    units and short a recipient. It comes from plain-RXD `AirdropFunding` inputs, the same way
+    `transfer-nft` already sources a separate input to move a dust-carrying singleton. Each
+    funding UTXO carries its own key, so the RXD may live at a different wallet address from
+    the token.
+
+  The airdrop is correspondingly stricter than the single-recipient transfer about the inputs
+  it will spend: it refuses an `FtUtxo` whose `value` and `ft_amount` disagree. On chain they
+  are the same number, so a mismatch means the caller built the record from the wrong field —
+  and it is not a modelling nuance here, it is a wrong transaction (`ft_amount > value`
+  materialises more of the ref than the inputs carry and consensus rejects the broadcast;
+  `ft_amount < value` routes the surplus photons to change or fee, burning units).
+  `build_transfer_tx` still tolerates a mismatch because it does not size outputs from token
+  amounts.
+
+  Recipient outputs have a **1-photon** floor — the chain's actual rule
+  (`GetDustThreshold` returns 1 unconditionally, `Radiant-Core/src/policy/policy.cpp:19-25`) —
+  deliberately **not** 546, which would forbid airdropping 100 units of anything. `dust_limit`
+  governs only the RXD change output's fold-to-fee threshold.
+
+  The builder binds its fee floor to `gravity.fee_policy.RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`
+  rather than restating it, and adds 2 bytes per input of sizing headroom before computing the
+  fee: the trial and final passes sign different messages, so their DER signatures can differ
+  in length and a fee sized purely off the trial can land *below* the rate it was built for.
+  Radiant has neither RBF nor CPFP, so that transaction could not be repaired — it would hold
+  its inputs until mempool expiry. The built transaction is re-checked against the rate before
+  it is returned.
+
+  **Proven on a node**, not just built: `tests/test_ft_airdrop_regtest_e2e.py` deploys a real
+  FT and runs three recipients + change + ref-less P2PKH outputs past a live
+  `radiant-core:v3.1.1` regtest node, confirms unit totals off the confirmed transaction, and
+  carries a negative control — the same transaction with one recipient output inflated by a
+  single unit is rejected with `mandatory-script-verify-flag-failed (Script failed an OP_VERIFY
+  operation)`, which is the FT epilogue firing. A node that accepted everything could not have
+  masqueraded as a pass.
+
+- **Royalty payment — `pyrxd.glyph.royalty`, and `royalty=` on the FT airdrop builder.**
+  `GlyphRoyalty` has been decoded from the Glyph envelope since 0.9.0 and never paid. It is
+  paid now, and described accurately.
+
+  **Royalties on Radiant are ADVISORY. They are not enforced by consensus.** This was
+  established before any code was written, because getting it wrong would ship something that
+  tells a creator they are being paid when nothing guarantees it. An FT lock's 12-byte epilogue
+  enforces *ref conservation* — how many units may exist on the output side — and says nothing
+  about where value goes; an NFT lock is a bare P2PKH behind a ref push. No covenant that ships
+  in pyrxd references a royalty. Photonic Wallet reaches the same structural conclusion: in
+  `royaltyCovenant.ts` the NFT at rest lives in the ordinary `nftScript`, enforcement exists
+  only once a holder *voluntarily lists* it into a sale covenant, and that file's own "Honest
+  scope" note records that it cannot stop a non-compliant seller or an out-of-band gift.
+  Photonic's non-covenant `royalty.ts` layer is referenced only by its own unit tests. Full
+  evidence in
+  [`docs/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.md`](docs/solutions/design-decisions/royalties-are-advisory-not-consensus-enforced.md).
+
+  So: `royalty_due = max(minimum, floor(sale_price * bps / 10_000))` — byte-for-byte Photonic's
+  `calculateRoyalty`, so a pyrxd payment and a Photonic payment agree on the single-recipient
+  path. Supplying a `royalty` to a builder **pays it by default**; `pay_royalty=False` is an
+  explicit opt-out and the decision is recorded in the result either way. Payouts are plain
+  25-byte P2PKH outputs, which carry no ref and therefore contribute to no conservation sum —
+  the property that makes a royalty safe to bolt onto an FT transfer, now confirmed against a
+  live node. Royalty addresses are finally *validated*: `GlyphRoyalty` only checks that the
+  string is non-empty, so a typo used to survive minting and would have surfaced as a burned
+  payment.
+
+  Two deliberate deviations from Photonic on the `splits` path, both because its version can
+  pay the creator less than the terms they recorded: `minimum` is honoured when splits are
+  present (Photonic computes each split from `sale_price` directly and never consults it), and
+  the residue — flooring loss plus any bps the splits do not cover — goes to the top-level
+  `address` rather than being dropped. `sum(payouts) == royalty_due` exactly.
+
+  Not built, deliberately: no `--sale-price` / `--royalty-address` CLI flags, because terms
+  typed in by the person *paying* protect no creator — honouring a royalty from the CLI needs
+  the creator's recorded terms, which means resolving a ref to its reveal transaction.
+
+  And **no royalty on `build_nft_transfer_tx` or `FtUtxoSet.build_transfer_tx`**: neither has a
+  plain-RXD input, so a royalty there could only be paid out of the token, burning units to pay
+  a creator. The first cut of this work did exactly that on the FT transfer path — a pre-merge
+  review measured a 5% royalty on a 1,000,000-photon sale costing the recipient **390,000
+  units**. The parameter was removed rather than patched. A one-recipient `build_airdrop_tx`
+  call is an ordinary transfer and can pay a royalty properly, because it is funded.
+
 - **[`docs/concepts/glossary.md`](docs/concepts/glossary.md) — an A–Z glossary
   of Radiant and pyrxd vocabulary.** Deliberately excluded from the 0.12.0
   troubleshooting page as a separate item; this closes it. Roughly 50 terms
@@ -144,6 +241,62 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   construction — a pin that silently fails to parse is a pin that silently does nothing.
 
 ### Fixed
+
+- **`glyph transfer-ft` could send the wrong number of FT units — up to the sender's entire
+  balance.** Found while building the airdrop, in shipped code, not in the new work.
+
+  `FtUtxoSet.build_transfer_tx` sizes the recipient's output as
+  `rxd_in_total - fee - change_alloc`, not from `amount`. Under this module's original model —
+  where `FtUtxo.value` and `FtUtxo.ft_amount` are documented as orthogonal — that is merely
+  odd. On chain they are the same number: an FT's quantity **is** its output's `satoshis`
+  (`docs/concepts/radiant-fts-are-on-chain.md`), which is exactly what the CLI constructs
+  (`ft_amount = utxo.value`). Measured on a realistic holding — one 50,000,000-unit UTXO,
+  `amount=250`, default fee rate:
+
+  ```
+  asked to send:                    250 units
+  recipient output (units sent):    46,739,454
+  change output (units kept):       546
+  ```
+
+  Not a rounding error — the sender's whole position, to a counterparty who asked for 250, with
+  no error and no way back once confirmed. It stayed invisible because the offline test suite
+  uses deliberately decoupled fixtures (`value=5_000_000, ft_amount=100`), and the one live
+  regtest exercise of this path spent its balance **in full**, the single case where the two
+  numbers agree.
+
+  Three changes:
+  - `glyph transfer-ft` now builds through `build_ft_airdrop_tx` with one recipient. That
+    builder sizes each output from the units requested and pays the fee from a plain-RXD input,
+    which is the only arrangement that can be correct. **The command now requires a little
+    plain RXD**, exactly as `transfer-nft` already did — the token cannot pay its own fee
+    without burning units.
+  - `build_transfer_tx` **refuses** any input with `value == ft_amount` — i.e. what a real
+    holding looks like — and names `build_airdrop_tx` in the error. It is kept for callers
+    genuinely using the decoupled model, and should be folded into `build_airdrop_tx` and
+    removed.
+  - `tests/test_dmint_premine_regtest_e2e.py` moved to the airdrop path, so the live proof
+    exercises the builder that is correct rather than the full-spend case that hid this.
+
+- **A `royalty` block in a metadata file was silently dropped.** `_read_metadata_file` never
+  passed `royalty` to `GlyphMetadata`, so a creator could write a complete royalty block, mint,
+  and end up with a token whose CBOR carried no royalty at all — with no warning, and nothing
+  to notice afterwards except that no wallet ever showed one. Minting is one-way, so that was
+  permanent for the token. It is parsed now, including `minimum`, `enforced` and `splits`, with
+  every recipient address decoded before the mint rather than after. (This also means the
+  manual `docs/red-team-checklist.md` step that asks an operator to confirm a royalty appears
+  in the envelope can pass as written, which it could not before.)
+
+  The CLI's pre-broadcast metadata summary now prints
+  `(ADVISORY — recorded on chain, not enforced by consensus)` beneath any royalty, at the one
+  moment a creator is still deciding.
+
+  **Residual, found while fixing this and deliberately left in place:** the same loader still
+  drops `creator`, `policy`, `rights` and `v`. `royalty` was fixed because B2 names it; the
+  others are the same bug and need the same treatment. The most consequential is
+  `policy.transferable: false` — a token a creator marked soulbound mints as freely
+  transferable, silently. `docs/red-team-checklist.md` §5.1 now flags the `creator` step as a
+  known-failing gap rather than leaving a red-teamer to conclude the summary is broken.
 
 - **`glyph deploy-dmint` under-sized the reveal fee, which could strand a confirmed commit.**
   The commit's vout 0 carries the only value the reveal ever gets, and it was sized from a flat
