@@ -277,7 +277,7 @@ def bip32_derive_xprv_from_mnemonic(  # nosec B107 -- passphrase="" is BIP39 spe
     Derive the subtree root extended private key from mnemonic and path.
 
     :param normalize: See :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. Leave
-        ``True`` unless recovering a wallet created before 0.11.3 with a
+        ``True`` unless recovering a wallet created before 0.12.0 with a
         non-ASCII passphrase.
     """
     seed = seed_from_mnemonic(mnemonic, lang, passphrase, prefix, normalize=normalize)
