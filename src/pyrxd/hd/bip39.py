@@ -119,7 +119,7 @@ def seed_from_mnemonic(  # nosec B107 -- passphrase="" is the BIP39 spec default
 
     :param normalize: Leave ``True`` (the default) for spec-conformant,
         cross-wallet-compatible seeds. Pass ``False`` **only** to reproduce
-        the non-conformant seed pyrxd produced before 0.11.3, which is the
+        the non-conformant seed pyrxd produced before 0.12.0, which is the
         recovery path for anyone who funded a wallet using a non-ASCII
         passphrase under the old behavior. It is not interoperable with any
         other BIP39 implementation -- see
