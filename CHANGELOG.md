@@ -44,10 +44,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Writing the spec surfaced eight interop hazards, recorded in the document rather than smoothed
   over. The two with fund-loss consequence: the maker-side "did the taker fund the right HTLC for
-  the right amount" check exists only in a script, not in the library, and `SwapCoordinator`
-  explicitly declines to provide it for a BTC leg — an under-funded HTLC therefore pays the maker
-  less than the agreed price, and the coordinator's own amount bind cannot catch it because it
-  runs on the honest taker's leg. And the `schema` tag every envelope carries is written at four
+  the right amount" check existed only in a script, not in the library, and `SwapCoordinator`
+  explicitly declined to provide it for a BTC leg — an under-funded HTLC therefore paid the maker
+  less than the agreed price, and the coordinator's own amount bind could not catch it because it
+  runs on the honest taker's leg. (**HZ-3 is fixed in this same release** — see Security below;
+  the hazard section now documents what the library enforces.) And the `schema` tag every envelope
+  carries is written at four
   sites and read at none, while `NegotiatedTerms` has no version field and silently drops unknown
   keys — so there is no mechanism by which a receiver can detect that a sender meant something it
   does not understand. Safety consequently rests on the two re-derived scriptPubKey comparisons,
@@ -522,6 +524,60 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **The maker-side "did the taker fund the right HTLC for the right amount?" check now exists in
+  the library for a BTC counter leg** (`SwapCoordinator.maker_verify_counter_funding`,
+  `BitcoinTaprootLeg.verify_counterparty_funded`). This closes hazard **HZ-3** of
+  `docs/htlc-handshake-wire-format.md` — the BTC analogue of a gap fixed on the ETH side and
+  labelled a red-team CRITICAL — and is recorded as threat-model **S23**.
+
+  The swap runbook is taker-funds-the-counter-leg-first, maker-locks-the-asset-second, so the maker
+  commits its own value against a leg the counterparty built. On BTC the coordinator previously
+  **refused** to provide that check, on the stated grounds that "a BTC counter leg's funding target
+  is pre-derivable and bound by the derive==promised gate". That reasoning was wrong twice over: the
+  funding *address* is bound, but a P2TR scriptPubKey commits to the **taptree, not the output
+  value**; and the amount bind that does exist lives inside `taker_funds_btc` — the *taker's own*
+  method — which a hostile taker simply never calls, funding the freely-derivable HTLC address
+  directly instead. A taker who funded the correct address short therefore passed every check in the
+  handshake: the maker locked its asset, claimed the under-funded BTC (revealing `p`), and the taker
+  claimed the full asset. The maker is paid less than the agreed price — a one-sided loss reachable
+  in the intended two-party flow by anyone driving `SwapCoordinator` directly rather than the
+  shipped operator script, which had its own copy of the check.
+
+  What the library now enforces, all fail-closed:
+
+  - the funding output's **scriptPubKey**, re-derived from the maker's own `terms` and compared
+    against the real output read from the chain (never against the counterparty-supplied locator,
+    every field of which is attacker-chosen — it can describe a correct HTLC tree while pointing the
+    outpoint at a decoy the taker owns);
+  - the **funded amount against `terms.value_amount` exactly**. Over-funding is rejected as well as
+    under-funding, matching the existing taker-side bind: the claim leaf does not cap value, so an
+    over-funded HTLC is a one-sided *taker* loss;
+  - **confirmation depth**, and that the output is confirmed and unspent;
+  - and the gate is **non-skippable**: `post_asset_lock_revalidate` refuses `BOTH_LOCKED` (the state
+    that enables the `p` reveal) without a verified locator on the record, and **re-runs** the
+    verification at asset-lock time, which is what closes the verify→lock TOCTOU — a reorg, or a
+    taker who funds only after the maker looked, is caught there rather than after the asset moves.
+
+  The depth pin reuses the existing policy knob rather than inventing a second notion of BTC
+  finality: a real-value (`MarginPolicy.is_measured`) swap requires `btc_claim_reorg_depth`
+  confirmations on the funding — PoW finality *is* a confirmation depth — while an estimated/test
+  policy defers to the leg's `min_confirmations`. This mirrors the ETH gate's
+  `block_identifier='finalized'` pin and the same `is_measured` discipline the N-floor and the
+  cross-clock margin already use. **Operator note:** a mainnet run on a measured policy will now
+  wait for that depth before the maker's asset lock is allowed to complete; the refusal is a
+  retryable `InsufficientConfirmationsError` and leaves the record at `BTC_LOCKED`.
+
+  `scripts/btc_swap_two_host.py` now calls the library version instead of carrying its own, so there
+  is exactly one implementation. `MempoolSpaceFundingReader` and `MultiSourceBtcFundingReader` gained
+  `read_confirmed_unspent_output` (Esplora status + tx + outspend, quorum'd in the multi-source case)
+  so the check works where there is no local node; a reader that cannot answer it refuses the lock
+  rather than proceeding.
+
+  Adversarial coverage: `tests/test_btc_maker_counter_funding_adversarial.py` drives the real
+  coordinator and the real `BitcoinTaprootLeg` against a hostile chain view — under-funded,
+  over-funded, decoy scriptPubKey, insufficient depth, spent/unconfirmed, and verified-then-reorged.
+  The under-funded case was confirmed to reach `BOTH_LOCKED` against a 70,000-sat HTLC on a
+  100,000-sat swap before the fix.
 - **Deadline-aware fee sizing for time-critical HTLC spends.** The only fee guard on a
   Radiant covenant spend was a flat `if fee.value < 546: raise` — a Bitcoin dust floor. At
   the reference mainnet node's advertised `effective_minrelaytxfee` (0.10 RXD/kB) a covenant

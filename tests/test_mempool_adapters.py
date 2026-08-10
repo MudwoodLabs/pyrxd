@@ -199,6 +199,56 @@ async def test_read_output_amount_bad_vout_fail_closed():
         await r.read_output_amount_sats("ab" * 32, 5, min_confirmations=1)  # vout 5 OOB
 
 
+# ------------------------------------------- funding reader: confirmed-unspent output (maker gate)
+
+
+def _confirmed_reader(*, spk_hex="5120" + "11" * 32, value=100_000, spent=False, confs=6):
+    """A reader whose three Esplora reads (status, tx, outspend) are scripted."""
+    r = MempoolSpaceFundingReader()
+    r._http.tx_status = AsyncMock(return_value={"confirmed": confs > 0, "block_height": 800_000})
+    r._http.tip_height = AsyncMock(return_value=800_000 + max(confs - 1, 0))
+    r._http.tx_json = AsyncMock(return_value={"vout": [{"scriptpubkey": spk_hex, "value": value}]})
+    r._http.outspend = AsyncMock(return_value={"spent": spent})
+    return r
+
+
+async def test_read_confirmed_unspent_output_binds_spk_and_value():
+    """The maker-side gate's capability on Esplora: confirmed + present + unspent -> (spk, sats)."""
+    spk, sats = await _confirmed_reader().read_confirmed_unspent_output("ab" * 32, 0)
+    assert spk == bytes.fromhex("5120" + "11" * 32)
+    assert sats == 100_000
+
+
+async def test_read_confirmed_unspent_output_unconfirmed_fails_closed():
+    r = MempoolSpaceFundingReader()
+    r._http.tx_status = AsyncMock(return_value={"confirmed": False, "block_height": None})
+    with pytest.raises(NetworkError, match="unconfirmed or unknown"):
+        await r.read_confirmed_unspent_output("ab" * 32, 0)
+
+
+async def test_read_confirmed_unspent_output_spent_fails_closed():
+    with pytest.raises(NetworkError, match="SPENT"):
+        await _confirmed_reader(spent=True).read_confirmed_unspent_output("ab" * 32, 0)
+
+
+async def test_read_confirmed_unspent_output_ambiguous_outspend_treated_as_spent():
+    """A response with no ``spent`` key is ambiguous — treat it as SPENT, never as unspent."""
+    r = _confirmed_reader()
+    r._http.outspend = AsyncMock(return_value={})
+    with pytest.raises(NetworkError, match="SPENT"):
+        await r.read_confirmed_unspent_output("ab" * 32, 0)
+
+
+async def test_read_confirmed_unspent_output_bad_vout_fails_closed():
+    with pytest.raises(NetworkError, match="could not read output"):
+        await _confirmed_reader().read_confirmed_unspent_output("ab" * 32, 5)
+
+
+async def test_read_confirmed_unspent_output_rejects_negative_vout():
+    with pytest.raises(ValidationError, match="non-negative"):
+        await _confirmed_reader().read_confirmed_unspent_output("ab" * 32, -1)
+
+
 # --------------------------------------------------------------------------- txid_of (local)
 
 
