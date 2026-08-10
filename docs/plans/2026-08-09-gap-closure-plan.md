@@ -105,12 +105,22 @@ The security-critical part is the preimage scrape: it must reuse the provenance-
 `preimage_p_hex` from the recovery file — that copy may still be a pre-reveal secret.
 **Effort ESTIMATED: M.**
 
-### A3. Anti-griefing — decide, don't necessarily build
+### A3. Anti-griefing — **DONE: analysed, residual ACCEPTED** (no bond built)
 Repeated capital-lockup DoS costs an attacker almost nothing and **passes every safety oracle**,
 because it is a liveness/economic attack, not a safety one. Options: a bond/deposit, or an explicit
 written acceptance that the stack defends safety and not liveness. **Recommendation: write the
 analysis first and probably accept the residual.** A bond changes the protocol and the UX for a
 threat with no observed instance. **Effort ESTIMATED: S to document, L to build.**
+
+**Outcome (2026-08-10):** analysed and accepted. Registered as threat-model **S22**; full reasoning
+and the revisit trigger in
+`docs/solutions/design-decisions/griefing-is-a-liveness-residual-not-a-bond.md`. The asymmetry is
+structural — the taker locks first AND holds the longer timelock (`t_btc - t_rxd >= margin`), so the
+party who commits first waits longest to get out, while the attacker's move is *inaction* and costs
+them nothing. No safety oracle can see it, because nobody loses principal. A bond was rejected: it
+prices a threat with no observed instance, needs adjudication (new consensus-adjacent surface on an
+unaudited stack), and cannot distinguish malice from a stalled node. Mitigations are operational —
+order the legs by trust, size `t_btc` deliberately, don't auto-accept from unknown counterparties.
 
 ---
 
