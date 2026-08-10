@@ -4,7 +4,29 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.13.0] — 2026-08-09
+
+Feature release, and the follow-through on 0.12.0's security panel. Adds a **two-phase,
+resumable Glyph mint** that makes the permanent-fund-loss window between commit and reveal
+hard to fall into, and an **automatic second-channel escalation monitor** — the last open
+piece of the watchtower's alerting chain. Alongside those, the remaining panel findings are
+closed, including two the panel got subtly wrong (see `### Fixed`). No breaking-class
+changes for an existing caller.
+
+The cross-chain swap stack remains **unaudited** and the RSWP orderbook **experimental**.
+
+### Upgrade notes
+
+- **The watchtower heartbeat JSON gained `schema_version: 1`.** Additive, but a consumer
+  asserting an exact key set will need updating. The escalation monitor refuses a payload
+  shape it does not recognise, which is the point of the field.
+- **`--ack-inbox` now refuses to start when the alerter cannot honour it.** Unreachable via
+  the shipped `pyrxd-watchtower` (which always wires a `DedupAlerter`); it affects only
+  programmatic callers assembling their own `Reconciler`. Previously that configuration
+  silently destroyed every acknowledgement, so a refusal is strictly safer.
+- **New console script `pyrxd-watchtower-escalate`** requires `--primary-webhook-url` (or an
+  explicit `--allow-same-channel`) so that "escalate to a *distinct* channel" is enforced
+  rather than assumed.
 
 ### Added
 
@@ -177,14 +199,6 @@ on.
   a `WebhookAlertChannel` could not join, and a `set.add()` return value used as a value
   in a dedup comprehension. CI's mypy scope is unchanged (`src/pyrxd/security/`) — this
   is a correctness cleanup, not a scope expansion.
-
-### Reviewer claims corrected
-
-- The panel reported that the watchtower ACK path "fails silently every tick". It is not
-  silent: `run_loop` logs the hook fault with `logger.exception` at ERROR. The real harm
-  is narrower and worse than silence — the ACKs are *destroyed*, because
-  `FileAckInbox.drain()` consumes the inbox before the first `ack()` call. That is the
-  behaviour the startup refusal prevents.
 
 ## [0.12.0] — 2026-08-09
 
