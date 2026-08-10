@@ -59,7 +59,12 @@ those for depth; use this page to look something up mid-task.
   `cbor2.dumps(..., canonical=True)` (RFC 8949 canonical form) and prepends a
   3-byte ASCII `"gly"` marker in the reveal scriptSig — the marker is *not*
   part of the CBOR bytes.
-  ([`src/pyrxd/glyph/payload.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/payload.py))
+  ([`src/pyrxd/glyph/payload.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/glyph/payload.py)).
+  Canonical form is a *producer* rule only: real mainnet envelopes are not
+  canonical, so a reader must hash the bytes it received rather than a
+  re-encoding, and must never reject an envelope for being non-canonical. See
+  [the Glyph protocol specification](../reference/glyph-token-protocol-spec.md)
+  §4.2.
 - **coin_type** — the third path element in BIP44
   (`m/44'/coin_type'/account'/...`). Radiant's ecosystem never agreed on one,
   so the **same seed produces different addresses in different wallets**.
@@ -309,9 +314,14 @@ those for depth; use this page to look something up mid-task.
   Code:
   [`src/pyrxd/hd/bip39.py:110`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/hd/bip39.py).
 - **NFT** — non-fungible singleton, one of the three Glyph token kinds
-  (`GlyphProtocol.NFT = 2`). A 63-byte locking script with a singleton ref;
-  the covenant enforces that the same ref cannot exist in two unspent
-  outputs simultaneously.
+  (`GlyphProtocol.NFT = 2`). A 63-byte locking script with a singleton ref.
+  The script itself is `OP_PUSHINPUTREFSINGLETON <ref> OP_DROP` plus a bare
+  P2PKH and enforces nothing: uniqueness (the same ref cannot exist in two
+  unspent outputs) comes from **consensus**, via the `0xd8` opcode. That is a
+  cap, not a floor — burning is permitted, so "exactly one output" needs a
+  covenant. See
+  [the Glyph protocol specification](../reference/glyph-token-protocol-spec.md)
+  §9.3.
 
 ## O
 

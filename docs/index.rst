@@ -15,6 +15,7 @@ Install with ``pip install pyrxd``.
    tutorials/index
    how-to/index
    concepts/index
+   reference/index
    api/index
 
 .. toctree::

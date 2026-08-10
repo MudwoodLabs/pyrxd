@@ -101,13 +101,16 @@ your holding of it. Every transfer of RBG carries this same `04`
 ref in its FT output's locking script — the script is what makes
 the UTXO an "RBG holding."
 
-### `payload_hash` — sha256 of CBOR metadata
+### `payload_hash` — SHA256d of CBOR metadata
 
 In the deploy transaction's commit output, the locking script
-contains a 32-byte SHA256 of the metadata CBOR payload. The reveal
-transaction's scriptSig then pushes the same CBOR bytes and the
-covenant verifies the hash matches. This identifier appears mostly
-in dMint covenant code and isn't usually pasted into tools.
+contains a 32-byte **SHA256d** — double SHA-256 — of the metadata CBOR
+payload. It is the double hash because the commit script's first opcode
+is `OP_HASH256`. The reveal transaction's scriptSig then pushes the same
+CBOR bytes and the covenant verifies the hash matches. This identifier
+appears mostly in dMint covenant code and isn't usually pasted into
+tools. Exact derivation:
+[the Glyph protocol specification](../reference/glyph-token-protocol-spec.md).
 
 ## "Which identifier do I paste where?"
 
@@ -149,9 +152,14 @@ units."
 ### `nft` — NFT singleton
 
 A 63-byte locking script with a singleton ref. Spending this UTXO
-moves the NFT to a new owner. The singleton property is enforced
-by the covenant — the same ref cannot appear in two unspent
-outputs simultaneously.
+moves the NFT to a new owner. The singleton property is enforced by
+**consensus**, not by a covenant: the script is
+`OP_PUSHINPUTREFSINGLETON <ref> OP_DROP` followed by a bare P2PKH, and
+it is the `0xd8` opcode that stops the same ref appearing in two
+unspent outputs. Note what that does *not* give you — it caps the ref
+at one output, it does not require one. Burning an NFT is legal, so
+"the token must go somewhere" is a covenant's job. See
+[covenant building blocks](covenant-building-blocks.md).
 
 ### `mut` — mutable contract output
 

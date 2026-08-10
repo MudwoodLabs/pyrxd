@@ -273,6 +273,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   equivalent of the parallel-miner immediate-death bug `_assert_workers_completed` guards
   against was already absent, and now has a regression test pinning it.
 
+- **A normative specification of the Glyph token protocol —
+  `docs/reference/glyph-token-protocol-spec.md`, in a new `Reference` section of the docs.**
+  The protocol previously existed as code plus scattered prose; there was no single document a
+  second implementation could build against. This one is precise enough to produce
+  byte-identical envelopes, scripts, and refs: the CBOR envelope and its limits, the
+  commit/reveal hashlock, ref derivation, every locking-script template with its opcode
+  semantics spelled out, the validation rules in RFC 2119 terms, versioning, and a worked
+  example anchored to the mainnet Glyph Protocol deploy (`a443d9df…878b` →
+  `b965b32d…9dd6`) whose 65,569-byte CBOR body is already a checked-in fixture.
+
+  It was derived from the source rather than from the existing docs, and that turned up four
+  things worth knowing independently of the document:
+
+  - **Canonical CBOR is a producer rule, not a validity rule.** pyrxd encodes with
+    `canonical=True`, but the reference mainnet token does not: its map header is `b9 0006`
+    where canonical form requires `a6`, and its keys are in insertion order. Re-encoding it
+    canonically yields 65,565 bytes and a different payload hash. A verifier MUST therefore
+    hash the bytes it received and MUST NOT reject a non-canonical envelope — decode-then-
+    re-encode rejects the flagship mainnet token.
+  - **FT conservation is `sum(in) >= sum(out)`, not `==`.** The epilogue opcode is `0xa2`
+    (`OP_GREATERTHANOREQUAL`), so burning is permitted; the second check is that the number of
+    outputs carrying the ref equals the number carrying the FT code-script hash. Several
+    docstrings and one concept page said `==`; corrected below.
+  - **The creator signature is computed over a non-canonical encoding** and covers pyrxd's
+    decoded field set rather than the on-chain bytes, so adding an unknown top-level CBOR field
+    does not invalidate it. Documented as a caveat, not changed — changing it would invalidate
+    every existing signature.
+  - **A CONTAINER built with a child ref is a 100-byte script no pyrxd classifier matches**;
+    it reports as `unknown`, is skipped by `find_glyphs`, and cannot be transferred by
+    `build_nft_transfer_tx`. Recorded in the spec's "underspecified" section.
+
+  The spec also states plainly what is *not* enforceable: royalties, soulbound
+  `policy.transferable`, container membership, `dmint.premine` consistency, and ref provenance
+  are all advisory or off-chain concerns.
+
 ### Fixed
 
 - **`glyph transfer-ft` could send the wrong number of FT units — up to the sender's entire

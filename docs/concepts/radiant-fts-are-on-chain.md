@@ -47,8 +47,9 @@ PUSH(20) <pkh>            │       │             │
 OP_EQUALVERIFY            │       │             │
 OP_CHECKSIG               │       │             │
                           │       │             │
-                          │       │             Hashed by the dMint contract to enforce
-                          │       │             conservation: sum(input ft) == sum(output ft).
+                          │       │             The FT-CSH epilogue. When this UTXO is
+                          │       │             spent, its own script enforces
+                          │       │             sum(input ft) >= sum(output ft).
                           │       │             This is the canonical "FT-CSH" fingerprint that
                           │       │             pyrxd's classifier matches.
                           │       │
@@ -64,8 +65,14 @@ OP_CHECKSIG               │       │             │
 The first 25 bytes are a perfectly normal P2PKH — that's why a key holder can
 sign and spend the UTXO with a regular `<sig> <pubkey>` scriptSig. The next
 38 bytes (`bd d0 <ref:36>`) bind the UTXO to a specific token via consensus.
-The trailing 12 bytes are the conservation "fingerprint" — the dMint
-contract hashes them as part of enforcing `sum(input ft) == sum(output ft)`.
+The trailing 12 bytes are the conservation logic. They are not inert: when
+the UTXO is spent, *this script* runs them, hashes its own code script
+(`bd`-onwards) and requires `sum(input ft) >= sum(output ft)` for outputs
+carrying that hash. It is `>=`, not `==` — inflation is impossible, burning is
+permitted. The same 12 bytes also appear inside the dMint covenant, which
+rebuilds the expected reward-output script from them. The opcode-by-opcode walk
+is in
+[the Glyph protocol specification](../reference/glyph-token-protocol-spec.md).
 
 **The ref is the token's permanent identity.** Every UTXO of the same FT
 encodes the same 36 bytes there. Different tokens have different refs.
