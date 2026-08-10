@@ -69,7 +69,82 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     the reason** rather than failing, so a mid-incident operator still gets the covenant
     verdict.
 
+- **ElectrumX server registry + request-level failover (`pyrxd.network.registry`,
+  `pyrxd.network.failover`).** Until now there was exactly one hardcoded endpoint and racing
+  happened only at *connect* time — once a socket was up, an endpoint that went away failed
+  every wallet operation, and `ElectrumXClient._call`'s own docstring noted that "callers that
+  want retry semantics should layer it above `_call`". Nothing did. `FailoverElectrumXClient`
+  is that layer, strictly above the transport: it owns one client per endpoint and retries a
+  failed call on the next one. Nothing was added to the reader loop, the id-correlation map,
+  or `_call`.
+  - **The shipped set is small and verified, not aspirational.** mainnet ships the two
+    independent public servers (`electrumx.radiant4people.com:50022`,
+    `electrumx.radiantcore.org`) that the watchtower already used, both re-confirmed live —
+    same tip, both serving the mainnet genesis header. **testnet and regtest ship none**: no
+    public Radiant testnet ElectrumX server was confirmed, and regtest is a local chain.
+    Inventing a plausible host there would recreate the very bug fixed above.
+  - **Node verdicts are never retried.** A `PolicyRejection` ("invalid", "underpriced",
+    "dust") is an *answer*. Re-asking a different node is shopping for a server with laxer
+    rules and it buries the reject reason.
+  - **`call_extension` is not retried by default** — it reaches arbitrary indexer RPCs whose
+    side effects this layer cannot know. Callers opt in per call with `idempotent=True`.
+  - **`broadcast` IS retried, under stated conditions.** See *Upgrade notes* for the full
+    argument; in short: the bytes are captured once so a retry can never be a *different*
+    transaction, only transport failures trigger it, and a later endpoint answering
+    "already known" is treated as success rather than a spurious failure for a transaction
+    that is demonstrably on the network.
+  - Configure with `electrumx_servers = [...]` (top level or per `[networks.<name>]`).
+    Configuring a single endpoint keeps the previous single-server behaviour exactly.
+
+- **Optional TLS SPKI pinning (`pyrxd.network.tls_pin`), off by default.** Ordinary TLS says
+  "some CA vouches for this hostname", which a mis-issuing CA, a TLS-inspecting middlebox, or
+  DNS hijack plus an ACME challenge all satisfy. Pinning the SHA-256 of the server's DER
+  `SubjectPublicKeyInfo` closes that: a substituted server is refused before any RPC is sent.
+  Format is the HPKP/`curl --pinnedpubkey` string (`sha256/<base64>`), so an operator can
+  produce one with `openssl` (recipe in the module docstring). It is **opt-in** because a pin
+  is a hard commitment to a key, and a routine operator key rotation would otherwise break
+  every client at once and look exactly like an attack; a mismatch raises the new, distinct
+  `TlsPinMismatchError` (a `NetworkError` subclass, so existing handlers still catch it) naming
+  the observed pin so a rotation is a one-line config edit. A malformed pin is rejected at
+  construction — a pin that silently fails to parse is a pin that silently does nothing.
+
 ### Fixed
+
+- **`--network` no longer selects a network while talking to a different chain
+  (`Config.for_network`).** `for_network()` returned the **unchanged default endpoint**
+  whenever the selected network had no `[networks.<name>]` block — and the default endpoint is
+  mainnet's. On a stock config:
+
+  ```
+  --network regtest  -> network=regtest  electrumx=wss://electrumx.radiant4people.com:50022/   MAINNET
+  --network testnet  -> network=testnet  electrumx=wss://electrumx.radiant4people.com:50022/   MAINNET
+  ```
+
+  A developer "testing on regtest" could broadcast a real transaction to mainnet while every
+  status line said regtest. The fix has three parts:
+  - **The top-level `electrumx` belongs to the top-level `network`, and nothing else.** It is
+    no longer carried across a `--network` change. Resolution order is now: `--electrumx`
+    flag → `[networks.N]` → the top-level endpoint *only when N is the config's own network* →
+    pyrxd's shipped defaults for N.
+  - **Fail closed when nothing resolves.** There is no guessing step. The resolved config
+    carries a structured `EndpointGap` and every attempt to build a client raises it, naming
+    the network, why the fallback was refused, the exact TOML table and key to add, the config
+    file to add it to, and the one-off `--electrumx` escape. The failure is deferred to client
+    construction (not config load) so offline commands — `wallet new`, the cold
+    `swap build-refund`, `--help`, `setup` — still work on a machine with no endpoint for the
+    selected network. Nothing that touches the network can proceed.
+  - **The binding is verified, not merely declared.** New
+    `ElectrumXClient.assert_chain(genesis_hash)` reads block 0 and compares the Radiant
+    double-SHA-512/256 header hash against the expected genesis — mirroring
+    `EthRpc.assert_chain`, which the ETH leg has had since it shipped. The failover client runs
+    it once per endpoint before any read or broadcast, and a chain mismatch is **not** treated
+    as a failover-able fault: it raises, because silently routing around a server that is on
+    the wrong chain would hide both the misconfiguration and the attack. Genesis constants for
+    all three networks were cross-checked against `Radiant-Core` @ `afdf57b1`
+    `src/chainparams.cpp` **and** live nodes (mainnet against the reference node; testnet and
+    regtest against a local `radiant-core:v3.1.1` container).
+
+  `--network mainnet` is unchanged: same primary server, now with a second one behind it.
 
 - **The swap harness recovery files now persist the locators the cold path needs.** All three
   gaps were verified against the writers: `scripts/dust_swap_run.py` printed the BTC HTLC
@@ -157,6 +232,47 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `docs/threat-model.md` (**S21**) and `docs/runbooks/watchtower-operations.md`.
 
 ### Upgrade notes
+
+- **Operator-visible break: `--network testnet` / `--network regtest` now REFUSE to run a
+  network command unless you configure an endpoint for that network.** Previously they
+  "worked" by using the mainnet server. Add to `~/.pyrxd/config.toml`:
+
+  ```toml
+  [networks.regtest]
+  electrumx = "ws://127.0.0.1:50022/"
+  allow_insecure = true          # required for plaintext ws://; regtest only
+  ```
+
+  or pass `--electrumx <url>` for a one-off run. The error message contains this snippet.
+  `--network mainnet` needs no action.
+
+- **`Config.electrumx` on a freshly `load()`-ed config is now `""` when nothing was
+  configured, instead of the mainnet URL**, and `for_network()` takes a new keyword-only
+  `electrumx_override`. Read endpoints from `Config.endpoints` (or `require_profile()`) after
+  calling `for_network()`. Library users constructing `ElectrumXClient` directly are
+  unaffected.
+
+- **Broadcast retry semantics, stated explicitly.** `FailoverElectrumXClient.broadcast()`
+  replays the *same serialised transaction* on the next endpoint after a **transport**
+  failure. That is safe here for three reasons, and unsafe without them:
+  1. The bytes are captured once, before the first attempt. The dangerous shape of this
+     feature takes a *builder callback* and re-runs it — a rebuild can pick different UTXOs,
+     a different fee, or a different signature, and broadcasting a different transaction that
+     spends the same inputs is a double-spend attempt, not a retry. Radiant has **no RBF**
+     (`src/validation.cpp:667` rejects any mempool conflict as `txn-mempool-conflict`), so a
+     conflicting sibling cannot *replace* the original — but it can be the one that gets mined
+     and strand the transaction the caller believes it sent. The signature is
+     `broadcast(raw_tx: bytes)` precisely so the class cannot rebuild anything.
+  2. The txid is a pure function of those bytes, so a retry cannot change the identity of what
+     was sent, and a server returning a different txid is refused.
+  3. Only transport failures trigger it. A node verdict is returned to the caller immediately.
+
+  The failure this fixes is the **lost response** — the node accepted the transaction and the
+  socket died before the reply. Retrying then is necessary, not merely safe: otherwise the
+  caller reports failure for a live transaction. A later endpoint answering `txn-already-known`
+  / `txn-already-in-mempool` / already-in-chain is therefore treated as success. On the *first*
+  attempt that same rejection still raises unchanged — with no transport fault to explain it,
+  "already known" is information worth surfacing.
 
 - **Operator-visible break: a covenant claim/refund funded below the node's relay floor is now
   REFUSED at build time.** Previously it was built and broadcast, and then silently failed to

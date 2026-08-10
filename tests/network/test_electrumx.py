@@ -1168,3 +1168,65 @@ async def test_policy_rejection_surfaces_through_a_broadcast() -> None:
 
     assert "mandatory-script-verify-flag-failed" in str(ei.value)
     assert ei.value.code == 1
+
+
+# ── Chain binding (assert_chain) ──────────────────────────────────────────────
+#
+# An ElectrumX URL says nothing about which chain is behind it. `assert_chain` is
+# what turns a DECLARED network binding into a verified one — the same discipline
+# the ETH leg has had since it shipped (EthRpc.assert_chain).
+
+_MAINNET_GENESIS_HEADER = bytes.fromhex(
+    "01000000"
+    "0000000000000000000000000000000000000000000000000000000000000000"
+    "372cbaf89794aeed5e711b02e78ec4502ad8b315a987c2e2758a85e36a3f7c02"
+    "aadeaf62"
+    "ffff001d"
+    "7980b72a"
+)
+_MAINNET_GENESIS = "0000000065d8ed5d8be28d6876b3ffb660ac2a6c0ca59e437e1f7a6f4e003fb4"
+_REGTEST_GENESIS = "7c1797514a165b0d99953a993a2a42081d6c0706026c36c06fc6fe728f93a5dd"
+
+
+def _client_serving(header: bytes) -> ElectrumXClient:
+    client = ElectrumXClient(["wss://example.com"])
+
+    async def _header(height):
+        assert int(height) == 0
+        return header
+
+    client.get_block_header = _header  # type: ignore[method-assign]
+    return client
+
+
+@pytest.mark.asyncio
+async def test_assert_chain_accepts_the_matching_genesis() -> None:
+    client = _client_serving(_MAINNET_GENESIS_HEADER)
+    assert await client.assert_chain(_MAINNET_GENESIS) == _MAINNET_GENESIS
+
+
+@pytest.mark.asyncio
+async def test_assert_chain_is_case_insensitive_about_the_expected_value() -> None:
+    client = _client_serving(_MAINNET_GENESIS_HEADER)
+    assert await client.assert_chain(_MAINNET_GENESIS.upper()) == _MAINNET_GENESIS
+
+
+@pytest.mark.asyncio
+async def test_assert_chain_refuses_a_mainnet_server_asked_for_regtest() -> None:
+    """The exact misconfiguration behind the network-binding bug: the endpoint is
+    real and healthy, it is just on the wrong chain."""
+    client = _client_serving(_MAINNET_GENESIS_HEADER)
+    with pytest.raises(ValidationError) as exc:
+        await client.assert_chain(_REGTEST_GENESIS)
+    message = str(exc.value)
+    # Both values are public chain data and both are named — that is what makes
+    # the failure fixable rather than mysterious.
+    assert _MAINNET_GENESIS in message
+    assert _REGTEST_GENESIS in message
+
+
+@pytest.mark.asyncio
+async def test_assert_chain_rejects_a_malformed_header() -> None:
+    client = _client_serving(b"\x00" * 79)
+    with pytest.raises(ValidationError, match="80 bytes"):
+        await client.assert_chain(_MAINNET_GENESIS)

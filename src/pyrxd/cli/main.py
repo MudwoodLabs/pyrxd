@@ -126,13 +126,22 @@ def cli(
     cfg = _config.load(config_path)
 
     # Resolve final network: flag > env (already in cfg) > built-in default.
+    #
+    # The `--electrumx` override is passed INTO the resolution rather than applied
+    # afterwards: `for_network` is what refuses to reuse another network's endpoint,
+    # and it needs to know the operator named one explicitly for this run. Applying
+    # the flag after the fact would leave `cfg.endpoint_error` set on a run that is
+    # in fact fully configured.
     final_network = network or cfg.network
-    cfg = cfg.for_network(final_network)
+    cfg = cfg.for_network(final_network, electrumx_override=electrumx_url)
 
     ctx = CliContext(
         config=cfg,
         network=final_network,
-        electrumx_url=electrumx_url or cfg.electrumx,
+        # Display/primary endpoint. May be "" when the selected network has none
+        # configured — that case fails closed in CliContext.make_client() with a
+        # message naming what to add, instead of silently borrowing mainnet's.
+        electrumx_url=cfg.electrumx,
         fee_rate=cfg.fee_rate,
         wallet_path=(wallet_path.expanduser() if wallet_path else cfg.wallet_path),
         output_mode=("json" if json_output else "quiet" if quiet else "human"),

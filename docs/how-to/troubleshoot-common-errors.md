@@ -370,6 +370,50 @@ exit code 2. **Fix:** check the commit txid on a block explorer.
 
 ---
 
+## 7b. "no ElectrumX endpoint is configured for network 'regtest'"
+
+```
+error: no ElectrumX endpoint is configured for network 'regtest'
+  cause: pyrxd ships no default regtest server (shipped defaults exist for: mainnet), and it
+         will not fall back to another network's endpoint — that is exactly how a regtest
+         command ends up talking to mainnet
+  fix: add [networks.regtest] with electrumx = "wss://your-regtest-server:50022/" to
+       ~/.pyrxd/config.toml, or pass --electrumx wss://your-regtest-server:50022/ (or set
+       PYRXD_ELECTRUMX) for a one-off run
+```
+
+**This is deliberate, and it replaced something worse.** `--network testnet` and
+`--network regtest` used to "work" without any per-network configuration — by
+using the **mainnet** ElectrumX server while reporting themselves as testnet or
+regtest. A developer testing on regtest could broadcast a real transaction to
+mainnet with nothing on screen to suggest it. The top-level `electrumx` key now
+belongs to the top-level `network` and is never carried across a `--network`
+change; when nothing resolves, pyrxd refuses rather than guessing.
+
+**Fix — one of:**
+
+```toml
+# ~/.pyrxd/config.toml
+[networks.regtest]
+electrumx = "ws://127.0.0.1:50022/"
+allow_insecure = true          # required for plaintext ws://; regtest only
+```
+
+```console
+$ pyrxd --network regtest --electrumx ws://127.0.0.1:50022/ ...
+```
+
+`--network mainnet` needs no change.
+
+**Related:** `"ElectrumX endpoint is on the wrong chain: genesis <a> != expected <b>"`
+means the endpoint answered, but block 0 is not the network you selected —
+`ElectrumXClient.assert_chain` checked, rather than trusting the URL. Either the
+`[networks.<name>]` entry points at the wrong server, or `--network` is wrong.
+Both hashes are printed; compare them against
+`pyrxd.network.registry.GENESIS_BLOCK_HASHES`.
+
+---
+
 ## 8. dMint v2 flags and premine
 
 **`--daa-mode` requires `--v2`**, verbatim:

@@ -44,7 +44,13 @@ async def _probe_electrumx(url: str) -> bool:
     """Try to open + close an ElectrumXClient at *url*. Returns True
     on success. Suppresses all exceptions — this is a "can we reach
     it" check, not a strict validation.
+
+    An empty *url* means the selected network has no endpoint configured; report
+    "not reachable" rather than constructing a client with a blank URL.
     """
+    if not url:
+        return False
+
     from ..network.electrumx import ElectrumXClient
 
     try:
@@ -174,8 +180,13 @@ def setup_cmd(ctx: CliContext, no_interactive: bool, coin_type: str | None) -> N
             "ElectrumX not reachable. Either:\n"
             "      - run a local Radiant Core node on 127.0.0.1:7332, or\n"
             f"      - point pyrxd at a public ElectrumX server via PYRXD_ELECTRUMX env\n"
-            f"        (current: {ctx.electrumx_url})"
+            f"        (current: {ctx.electrumx_url or '<none configured for this network>'})"
         )
+    if ctx.config.endpoint_error:
+        # No endpoint resolved for the selected network. Print the full guidance
+        # rather than a one-liner: this is the message that stops a `--network
+        # regtest` run from silently using a mainnet server.
+        next_steps.append(ctx.config.endpoint_error)
     if not has_wallet:
         next_steps.append("create a wallet:  pyrxd wallet new")
 
