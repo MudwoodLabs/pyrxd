@@ -17,6 +17,7 @@ dmint-v1-deploy
 v1-mint-mechanics
 external-miner-protocol
 parallel-mining
+glossary
 ```
 
 ## Available now
@@ -84,6 +85,13 @@ parallel-mining
   fast subprocess `mine_solution_external`), the bundled `pyrxd.contrib.miner`
   added in 0.5.1 so you don't have to supply your own, and how parallel workers
   divide the nonce space. Read this to mine a dMint claim at a useful rate.
+- **[Glossary](glossary.md)** — a flat A–Z lookup for Radiant and pyrxd
+  vocabulary: photon, ref/induction, `OP_PUSHINPUTREF`, the genesis-ref vs
+  `contract_id` vs outpoint confusion, dMint's difficulty-vs-target trap,
+  HTLC/hashlock/CSV-refund/griefing, and BIP32/39/44 wallet terms — each
+  defined against what the code actually does, with a file citation. Read
+  this when a term stops you mid-task; read the linked deep-dive pages for
+  the full story.
 
 ## Adjacent reading (not yet promoted to concept docs)
 
