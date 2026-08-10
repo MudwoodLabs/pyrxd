@@ -14,6 +14,8 @@ from __future__ import annotations
 # Map of public-name → (module-path, attribute) pairs. Resolved on
 # first attribute access.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "AirdropFunding": ("pyrxd.glyph.ft", "AirdropFunding"),
+    "AirdropRecipient": ("pyrxd.glyph.ft", "AirdropRecipient"),
     "ContainerRevealScripts": ("pyrxd.glyph.builder", "ContainerRevealScripts"),
     "DaaMode": ("pyrxd.glyph.dmint", "DaaMode"),
     "DmintAlgo": ("pyrxd.glyph.dmint", "DmintAlgo"),
@@ -29,6 +31,8 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "DmintV2DeployParams": ("pyrxd.glyph.builder", "DmintV2DeployParams"),
     "DmintV2DeployResult": ("pyrxd.glyph.builder", "DmintV2DeployResult"),
     "find_dmint_contract_utxos": ("pyrxd.glyph.dmint", "find_dmint_contract_utxos"),
+    "FtAirdropParams": ("pyrxd.glyph.builder", "FtAirdropParams"),
+    "FtAirdropResult": ("pyrxd.glyph.ft", "FtAirdropResult"),
     "FtTransferParams": ("pyrxd.glyph.builder", "FtTransferParams"),
     "FtTransferResult": ("pyrxd.glyph.ft", "FtTransferResult"),
     "FtUtxo": ("pyrxd.glyph.ft", "FtUtxo"),
@@ -78,6 +82,10 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "target_to_difficulty": ("pyrxd.glyph.dmint", "target_to_difficulty"),
     "verify_creator_signature": ("pyrxd.glyph.creator", "verify_creator_signature"),
     "verify_sha256d_solution": ("pyrxd.glyph.dmint", "verify_sha256d_solution"),
+    "RoyaltyPayout": ("pyrxd.glyph.royalty", "RoyaltyPayout"),
+    "royalty_due": ("pyrxd.glyph.royalty", "royalty_due"),
+    "royalty_output_scripts": ("pyrxd.glyph.royalty", "royalty_output_scripts"),
+    "royalty_payouts": ("pyrxd.glyph.royalty", "royalty_payouts"),
     "RxinDexerClient": ("pyrxd.network.rxindexer", "RxinDexerClient"),
     "RxinDexerError": ("pyrxd.network.rxindexer", "RxinDexerError"),
     "RxinDexerNotFound": ("pyrxd.network.rxindexer", "RxinDexerNotFound"),

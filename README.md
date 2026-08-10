@@ -53,7 +53,8 @@ mainnet. If you find a bug that affects funds, report it via the
 - RXD send / send-max, balance and UTXO queries (`pyrxd address` / `balance` / `utxos`)
 - BIP32 / BIP39 / BIP44 HD wallets with optional encrypted persistence (`HdWallet`, `pyrxd wallet`)
 - Glyph **NFT** — mint (two-phase commit + reveal) and transfer (`pyrxd glyph mint-nft` / `transfer-nft`)
-- Glyph **FT** — premine deploy and conservation-enforced transfer (`pyrxd glyph deploy-ft` / `transfer-ft`)
+- Glyph **FT** — premine deploy, conservation-enforced transfer, and one-transaction
+  multi-recipient airdrop (`pyrxd glyph deploy-ft` / `transfer-ft` / `airdrop-ft`)
 - **dMint permissionless PoW tokens (V1)** — deploy (byte-equal to the live Glyph-protocol deploy,
   node-consensus-validated) and mine/claim from live mainnet contracts
   (`pyrxd glyph deploy-dmint` / `claim-dmint`)

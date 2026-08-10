@@ -7,6 +7,7 @@ Commands:
   glyph deploy-dmint    V1 dMint contract genesis (commit/reveal).
   glyph claim-dmint     PoW-mine a claim from a live dMint contract.
   glyph transfer-ft     FT transfer with conservation enforcement.
+  glyph airdrop-ft      One-tx FT distribution to many recipients.
   glyph transfer-nft    NFT singleton transfer.
   glyph list            Scan wallet addresses for Glyph holdings.
 
@@ -43,11 +44,13 @@ import click
 
 from ..fee_models import SatoshisPerKilobyte
 from ..glyph.builder import (
+    AirdropFunding,
+    AirdropRecipient,
     CommitParams,
     DmintV1DeployParams,
     DmintV2DeployParams,
+    FtAirdropParams,
     FtDeployRevealScripts,
-    FtTransferParams,
     FtUtxo,
     GlyphBuilder,
     RevealParams,
@@ -820,16 +823,21 @@ def transfer_ft_cmd(ctx: CliContext, ref: str, amount: int, to_address: str, pas
         click.echo(f"\nFT transfer broadcast: {result['txid']}")
 
 
-async def _transfer_ft_inner(
-    ctx: CliContext,
+async def _select_ft_inputs(
     wallet: HdWallet,
     ref: GlyphRef,
     amount: int,
-    to_pkh: Hex20,
-    to_address: str,
     client: ElectrumXClient,
-) -> dict:
-    """FT transfer: scan wallet, find FT utxos for ref, build + broadcast."""
+) -> list[tuple[FtUtxo, str, PrivateKey]]:
+    """Find this wallet's FT UTXOs for ``ref`` and greedily cover ``amount``.
+
+    Shared by ``transfer-ft`` and ``airdrop-ft``. Extracted rather than copied:
+    the two commands must agree on what counts as a spendable holding of a
+    token, and a second copy of the "is this output really an FT of this ref"
+    filter is a place for them to silently diverge.
+
+    Returns ``(FtUtxo, address, key)`` triples in the order they were selected.
+    """
     # Scan wallet for FT holdings of this ref.
     scanner = GlyphScanner(client)
     items: list[GlyphFt] = []
@@ -903,35 +911,72 @@ async def _transfer_ft_inner(
         selected_total += triple[0].ft_amount
         if selected_total >= amount:
             break
+    return selected
 
-    # Use FtUtxoSet to build the transfer (conservation enforcement).
-    builder = GlyphBuilder()
-    # Need a single signing key; FtUtxoSet expects one. We assume all
-    # FT utxos in the wallet share the same key — the wallet is a
-    # single HD chain with one address per FT receipt typically. If
-    # they don't, this will produce an invalid signature on inputs
-    # signed with the wrong key.
-    # For Cut 2 simplicity, restrict transfer to FT utxos that all use
-    # the same signing key (the one for input 0). Caller can split if
-    # they hit a multi-key wallet.
+
+def _single_ft_signing_key(
+    selected: list[tuple[FtUtxo, str, PrivateKey]],
+    what: str,
+) -> PrivateKey:
+    """The one key that signs every selected FT input, or a clear refusal.
+
+    ``FtUtxoSet`` signs all inputs with a single key. If the selection spans
+    several HD-derived addresses, signing anyway would emit a transaction with
+    invalid signatures on some inputs — rejected at broadcast, but only after
+    the user has confirmed a spend. Refuse first instead.
+    """
     first_key = selected[0][2]
     for _utxo, _addr, k in selected:
         if k.public_key().address() != first_key.public_key().address():
             raise UserError(
-                "FT transfer across multiple wallet addresses isn't supported in Cut 2",
+                f"{what} across multiple wallet addresses isn't supported in Cut 2",
                 cause="selected FT utxos span multiple HD-derived keys",
                 fix="consolidate FT holdings to one address first (Cut 3 will lift this restriction)",
             )
+    return first_key
 
-    params = FtTransferParams(
+
+async def _transfer_ft_inner(
+    ctx: CliContext,
+    wallet: HdWallet,
+    ref: GlyphRef,
+    amount: int,
+    to_pkh: Hex20,
+    to_address: str,
+    client: ElectrumXClient,
+) -> dict:
+    """FT transfer: scan wallet, find FT utxos for ref, build + broadcast.
+
+    Built through ``build_ft_airdrop_tx`` with a single recipient rather than
+    through ``build_ft_transfer_tx``. That is a **fund-safety correction**, not a
+    refactor: the transfer builder sizes its output from the inputs' RXD instead
+    of from ``amount``, and because an FT's quantity IS its output value on
+    Radiant, this command used to deliver the wrong number of units. Measured on
+    a realistic holding — one 50,000,000-unit UTXO, ``amount=250`` — it produced
+    a 46,739,454-unit output to the recipient and kept 546. The airdrop builder
+    sizes each output from the units requested and pays the fee from a plain-RXD
+    input, which is the only arrangement that can be correct.
+    """
+    selected = await _select_ft_inputs(wallet, ref, amount, client)
+    first_key = _single_ft_signing_key(selected, "FT transfer")
+    funding = await _airdrop_funding(ctx, wallet, selected, n_outputs=1, client=client)
+
+    params = FtAirdropParams(
         ref=ref,
         utxos=[t[0] for t in selected],
-        amount=amount,
-        new_owner_pkh=to_pkh,
+        recipients=[AirdropRecipient(pkh=to_pkh, amount=amount)],
         private_key=first_key,
+        funding=[funding],
         fee_rate=ctx.fee_rate,
     )
-    transfer_result = builder.build_ft_transfer_tx(params)
+    try:
+        transfer_result = GlyphBuilder().build_ft_airdrop_tx(params)
+    except (ValidationError, ValueError) as exc:
+        raise UserError(
+            "could not build the transfer",
+            cause=str(exc),
+            fix="fund the wallet with a little plain RXD — the token cannot pay its own fee",
+        ) from exc
     raw_hex = transfer_result.tx.serialize()
 
     _confirm_or_abort(
@@ -943,6 +988,7 @@ async def _transfer_ft_inner(
                     f"ref:          {ref.txid}:{ref.vout}",
                     f"amount:       {amount:,} units",
                     f"recipient:    {to_address}",
+                    f"fee:          {transfer_result.fee:,} photons (from plain RXD, not the token)",
                     f"network:      {ctx.network}",
                 ],
             ),
@@ -950,6 +996,311 @@ async def _transfer_ft_inner(
     )
     txid = await client.broadcast(raw_hex)
     return {"txid": str(txid), "ref": f"{ref.txid}:{ref.vout}", "amount": amount, "to": to_address}
+
+
+async def _airdrop_funding(
+    ctx: CliContext,
+    wallet: HdWallet,
+    selected: list[tuple[FtUtxo, str, PrivateKey]],
+    *,
+    n_outputs: int,
+    client: ElectrumXClient,
+) -> AirdropFunding:
+    """Find a plain-RXD UTXO big enough to pay for ``n_outputs`` token outputs.
+
+    The token cannot pay the fee: an FT output's value IS its unit count, so
+    taking the fee from one would burn units and short a recipient. This sources
+    the fee the same way ``transfer-nft`` sources it for a dust singleton.
+
+    The estimate is deliberately generous — an unfunded build fails cleanly, but
+    a build that squeaks past and lands under the relay floor cannot be repaired
+    on Radiant (no RBF, no CPFP). ~84 B per FT output, ~148 B per input, ~50 B of
+    envelope, then doubled for headroom.
+    """
+    est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50
+    needed = est_bytes * ctx.fee_rate * 2
+    triples = await wallet.collect_spendable(client)
+    fund = await _find_plain_rxd_utxo(
+        triples,
+        client,
+        exclude={(u.txid, u.vout) for u, _a, _k in selected},
+        needed=needed,
+    )
+    if fund is None:
+        raise UserError(
+            "no plain-RXD UTXO large enough to fund the fee",
+            cause=f"need about {needed:,} photons on a single non-token UTXO",
+            fix="send some plain RXD to this wallet — an FT output's value is its unit count, "
+            "so the token itself cannot pay the fee without burning units",
+        )
+    fund_utxo, _fund_addr, fund_key = fund
+    return AirdropFunding(
+        txid=fund_utxo.tx_hash,
+        vout=fund_utxo.tx_pos,
+        value=fund_utxo.value,
+        private_key=fund_key,
+    )
+
+
+# ---------------------------------------------------------------------------
+# airdrop-ft
+# ---------------------------------------------------------------------------
+
+
+def _parse_recipient_spec(spec: str) -> tuple[str, int]:
+    """Parse one ``ADDRESS:AMOUNT`` pair from ``--to``.
+
+    Split on the LAST colon so nothing breaks if an address form ever carries
+    one (``rxd:qq…`` prefixes exist in the wider Radiant ecosystem).
+    """
+    address, sep, amount_str = spec.rpartition(":")
+    if not sep or not address:
+        raise UserError(
+            f"malformed recipient {spec!r}",
+            cause="expected ADDRESS:AMOUNT",
+            fix="e.g. --to 1Alice…:250",
+        )
+    try:
+        amount = int(amount_str)
+    except ValueError:
+        raise UserError(
+            f"malformed recipient {spec!r}",
+            cause=f"{amount_str!r} is not an integer amount",
+            fix="amounts are whole FT units, e.g. --to 1Alice…:250",
+        ) from None
+    return address, amount
+
+
+def _load_recipients_file(path: Path) -> list[tuple[str, int]]:
+    """Read a recipients file: JSON array of objects, or ``address,amount`` CSV.
+
+    Both shapes are accepted because both are what people actually have. The
+    format is chosen by extension so a mis-named file fails loudly instead of
+    being parsed as the wrong thing.
+    """
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise UserError(
+            f"could not read recipients file: {path}",
+            cause=str(exc),
+            fix="check the path and permissions",
+        ) from exc
+
+    if path.suffix.lower() == ".json":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise UserError(
+                f"recipients file is not valid JSON: {path}",
+                cause=str(exc),
+            ) from exc
+        if not isinstance(data, list):
+            raise UserError(
+                "recipients JSON must be an array",
+                cause=f"got {type(data).__name__}",
+                fix='e.g. [{"address": "1Alice…", "amount": 250}]',
+            )
+        out: list[tuple[str, int]] = []
+        for i, row in enumerate(data):
+            if not isinstance(row, dict) or "address" not in row or "amount" not in row:
+                raise UserError(
+                    f"recipients[{i}] must be an object with 'address' and 'amount'",
+                    cause=f"got {row!r}",
+                )
+            try:
+                out.append((str(row["address"]), int(row["amount"])))
+            except (TypeError, ValueError) as exc:
+                raise UserError(f"recipients[{i}].amount is not an integer", cause=str(exc)) from exc
+        return out
+
+    rows: list[tuple[str, int]] = []
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        parts = [p.strip() for p in stripped.split(",")]
+        if len(parts) != 2:
+            raise UserError(
+                f"{path}:{lineno} is not `address,amount`",
+                cause=f"got {stripped!r}",
+                fix="one recipient per line, e.g. 1Alice…,250",
+            )
+        try:
+            rows.append((parts[0], int(parts[1])))
+        except ValueError:
+            raise UserError(
+                f"{path}:{lineno} has a non-integer amount",
+                cause=f"got {parts[1]!r}",
+            ) from None
+    return rows
+
+
+@glyph_group.command(name="airdrop-ft")
+@click.argument("ref", type=str)
+@click.option(
+    "--to",
+    "to_specs",
+    multiple=True,
+    help="Recipient as ADDRESS:AMOUNT. Repeatable; combine with or instead of --recipients.",
+)
+@click.option(
+    "--recipients",
+    "recipients_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Recipients file: `.json` array of {address, amount}, or `address,amount` CSV.",
+)
+@click.option("--passphrase/--no-passphrase", default=False)
+@click.pass_obj
+def airdrop_ft_cmd(
+    ctx: CliContext,
+    ref: str,
+    to_specs: tuple[str, ...],
+    recipients_path: Path | None,
+    passphrase: bool,
+) -> None:
+    """Send FT units of REF (txid:vout) to many recipients in ONE transaction.
+
+    One transaction, not N: an airdrop split across N transactions chains each
+    one onto the previous one's change output, so a failure partway through
+    leaves the set half-delivered and the token's ref alone cannot tell you
+    which half. Conservation is enforced by the same
+    ``FtUtxoSet``/``select`` path ``transfer-ft`` uses.
+
+    \b
+    Examples:
+      pyrxd glyph airdrop-ft REF --to 1Alice:250 --to 1Bob:100
+      pyrxd glyph airdrop-ft REF --recipients holders.csv
+    """
+    glyph_ref = _parse_ref(ref)
+
+    pairs: list[tuple[str, int]] = [_parse_recipient_spec(s) for s in to_specs]
+    if recipients_path is not None:
+        if not recipients_path.exists():
+            raise UserError(
+                f"recipients file not found: {recipients_path}",
+                fix="pass an existing .json or .csv file, or use --to ADDRESS:AMOUNT",
+            )
+        pairs.extend(_load_recipients_file(recipients_path))
+    if not pairs:
+        raise UserError(
+            "no recipients given",
+            fix="pass --to ADDRESS:AMOUNT (repeatable) and/or --recipients FILE",
+        )
+
+    from ..glyph.ft import AirdropRecipient
+    from ..utils import address_to_public_key_hash
+
+    recipients: list[AirdropRecipient] = []
+    seen: dict[str, int] = {}
+    for address, amount in pairs:
+        if amount <= 0:
+            raise UserError(
+                f"recipient {address} has amount {amount}",
+                cause="airdrop amounts must be > 0",
+            )
+        if address in seen:
+            # Refuse rather than merge: a repeated address in a holder list is
+            # usually a duplicated row, and paying it twice cannot be undone.
+            raise UserError(
+                f"recipient {address} appears more than once",
+                cause=f"amounts {seen[address]} and {amount}",
+                fix="combine the entries into a single line if the total is intended",
+            )
+        seen[address] = amount
+        try:
+            pkh = Hex20(address_to_public_key_hash(address))
+        except (ValidationError, ValueError) as exc:
+            raise UserError(f"invalid recipient address: {address}", cause=str(exc)) from exc
+        recipients.append(AirdropRecipient(pkh=pkh, amount=amount))
+
+    wallet = _load_wallet(ctx, prompt_passphrase=passphrase)
+
+    async def _do_airdrop() -> dict:
+        client = ctx.make_client()
+        async with client:
+            return await _airdrop_ft_inner(ctx, wallet, glyph_ref, recipients, pairs, client)
+
+    try:
+        result = asyncio.run(_do_airdrop())
+    except NetworkError as exc:
+        raise NetworkBoundaryError(
+            "could not reach ElectrumX",
+            cause=str(exc),
+            fix=f"check that {ctx.electrumx_url} is reachable",
+        ) from exc
+
+    if ctx.output_mode == "json":
+        click.echo(emit(result, mode="json"))
+    elif ctx.output_mode == "quiet":
+        click.echo(emit(result, mode="quiet", quiet_field="txid"))
+    else:
+        click.echo(f"\nFT airdrop broadcast: {result['txid']}")
+        click.echo(emit_table(result["recipients"], ["address", "amount", "vout"], mode="human"))
+
+
+async def _airdrop_ft_inner(
+    ctx: CliContext,
+    wallet: HdWallet,
+    ref: GlyphRef,
+    recipients: list,  # list[AirdropRecipient]
+    pairs: list[tuple[str, int]],
+    client: ElectrumXClient,
+) -> dict:
+    """FT airdrop: scan wallet, select FT utxos for ref, fund the fee, broadcast."""
+    total = sum(r.amount for r in recipients)
+    selected = await _select_ft_inputs(wallet, ref, total, client)
+    first_key = _single_ft_signing_key(selected, "FT airdrop")
+
+    funding = await _airdrop_funding(ctx, wallet, selected, n_outputs=len(recipients), client=client)
+
+    params = FtAirdropParams(
+        ref=ref,
+        utxos=[t[0] for t in selected],
+        recipients=recipients,
+        private_key=first_key,
+        funding=[funding],
+        fee_rate=ctx.fee_rate,
+    )
+    try:
+        airdrop_result = GlyphBuilder().build_ft_airdrop_tx(params)
+    except (ValidationError, ValueError) as exc:
+        raise UserError(
+            "could not build the airdrop",
+            cause=str(exc),
+            fix="fund the wallet with more plain RXD, or split the list into smaller batches",
+        ) from exc
+
+    rows = [{"address": address, "amount": amount, "vout": vout} for vout, (address, amount) in enumerate(pairs)]
+    _confirm_or_abort(
+        ctx,
+        [
+            _BroadcastSummary(
+                title="FT airdrop",
+                lines=[
+                    f"ref:          {ref.txid}:{ref.vout}",
+                    f"recipients:   {len(recipients)}",
+                    f"total:        {total:,} units",
+                    f"fee:          {airdrop_result.fee:,} photons (from plain RXD, not the token)",
+                    f"network:      {ctx.network}",
+                ],
+            ),
+            _BroadcastSummary(
+                title="Destinations",
+                lines=[f"vout {r['vout']}: {r['amount']:,} units → {r['address']}" for r in rows],
+            ),
+        ],
+    )
+    txid = await client.broadcast(airdrop_result.tx.serialize())
+    return {
+        "txid": str(txid),
+        "ref": f"{ref.txid}:{ref.vout}",
+        "recipient_count": len(recipients),
+        "total_units": total,
+        "fee": airdrop_result.fee,
+        "recipients": rows,
+    }
 
 
 @glyph_group.command(name="transfer-nft")
@@ -2214,6 +2565,7 @@ def _sign_funding_input(tx: Transaction, idx: int, key: PrivateKey) -> None:
 
 
 __all__ = [
+    "airdrop_ft_cmd",
     "claim_dmint_cmd",
     "deploy_dmint_cmd",
     "deploy_ft_cmd",
