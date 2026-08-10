@@ -32,7 +32,14 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dust_swap_shared import InMemSeen, SshTrFeeSource, StepReport, atomic_write_mode_600, confirm
+from _dust_swap_shared import (
+    InMemSeen,
+    SshTrFeeSource,
+    StepReport,
+    atomic_write_mode_600,
+    confirm,
+    merge_into_mode_600,
+)
 from eth_swap_run import _build_terms_and_covenant, _eth_leg
 from radiant_mainnet_chainio import SshTrRadiantClient
 
@@ -101,6 +108,9 @@ async def run(args) -> None:
                 "maker_rxd_wif": rkeys[1].wif(),
                 "rxd_covenant_spk": cov.funded_spk.hex(),
                 "t_rxd_blocks": terms.t_rxd.value,
+                # The covenant's `amount` PARAMETER — the cold builders rebuild the covenant
+                # from it (`pyrxd swap build-claim` / `build-refund`).
+                "rxd_covenant_amount": terms.radiant_amount,
                 "note": "grief run recovery; mode 600 — delete after the refunds confirm.",
             },
             indent=2,
@@ -153,6 +163,9 @@ async def run(args) -> None:
             contract=rec.counterchain_locator.contract_address,
         )
         print(f"  -> {rec.state.value} (ETH HTLC {rec.counterchain_locator.contract_address})")
+        # PERSIST the per-swap contract address — the ETH-side provenance anchor the cold
+        # toolkit binds a scraped preimage to (`pyrxd swap recover-preimage --eth-contract`).
+        merge_into_mode_600(keys_path, {"eth_contract_address": rec.counterchain_locator.contract_address})
 
         # 2. Maker locks the RXD covenant on MAINNET (operator funds the SPK).
         print(f"\n  Fund the RXD covenant SPK on MAINNET (the maker lock; >= 1 conf):\n    {cov.funded_spk.hex()}")

@@ -55,7 +55,19 @@ e.g. `age`/`gpg` to an offline key. Verify perms stay `0600` on restore.
 4. **Re-arm autonomous custody** if you use it (`enable_autonomous_mainnet_custody`, default off) — it
    does not persist; a restored tower comes up alert-only until re-armed.
 5. **Triage in-flight swaps** with `pyrxd swap status --swap-file … --check-chain`: any swap whose
-   `deadline − safety_window` falls near now needs action first.
+   `deadline − safety_window` falls near now needs action first. Pass the counter-leg locator
+   (`--btc-funding-outpoint TXID:VOUT`, or `--eth-contract 0x… --eth-rpc-url …`) so the triage also
+   reports whether the counterparty has already claimed and revealed the preimage — a live RXD
+   covenant looks identical either way, and that is the difference between "keep watching" and
+   "claim now". Recovery files written before the harnesses started persisting
+   `btc_funding_outpoint` / `eth_contract_address` do not carry it; older runs need the flag.
+6. **If a swap needs action the tower will not take** — because the fee gate refused, or because you
+   are recovering without a running tower — drive it by hand with the read-only cold toolkit:
+   `pyrxd swap recover-preimage` to extract `p` from the counterparty's own claim (provenance-checked;
+   it never trusts the recovery file's `preimage_p_hex`), then `pyrxd swap build-claim` or
+   `build-refund` to print the raw hex. **Neither broadcasts** — read the decoded output, the fee, the
+   relay floor and the deadline-aware target, then broadcast from your own node. Radiant has no RBF
+   and no CPFP: an under-fee'd spend cannot be repaired, so this decision is deliberately yours.
 
 ### Recovering the seen-store
 
@@ -77,4 +89,7 @@ never restored is a hypothesis, not a backup.
 
 - [`watchtower-operations.md`](watchtower-operations.md) — running, restart/upgrade, key rotation.
 - [`incident-response.md`](incident-response.md) — vulnerability triage → fix → disclosure.
-- `pyrxd swap status --swap-file PATH --check-chain` — per-swap situational triage.
+- `pyrxd swap status --swap-file PATH --check-chain` — per-swap situational triage (RXD covenant
+  + counter-leg).
+- `pyrxd swap recover-preimage` / `build-claim` / `build-refund` — the read-only cold toolkit for
+  driving a swap by hand. Prints raw hex; never broadcasts.

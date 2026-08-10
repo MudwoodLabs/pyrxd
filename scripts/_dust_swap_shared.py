@@ -21,6 +21,7 @@ import json
 import math
 import os
 import struct
+import tempfile
 import time
 from pathlib import Path
 
@@ -153,6 +154,40 @@ def atomic_write_mode_600(path: Path, content: str) -> None:
         # Best-effort cleanup of a half-written file — re-raise the original error.
         try:
             path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def merge_into_mode_600(path: Path, extra: dict) -> None:
+    """Merge ``extra`` into an existing mode-0600 JSON file, atomically.
+
+    :func:`atomic_write_mode_600` is ``O_EXCL`` (create-only) by design, so it cannot
+    update a file that already exists. This is the update peer: write the merged
+    document to a fresh 0600 temp file in the SAME directory, fsync it, then
+    ``os.replace`` — a rename within one filesystem, so a reader only ever sees the old
+    document or the new one, never a truncated one.
+
+    Why it exists: the recovery file is written BEFORE funding (so a crash mid-run
+    cannot strand value), which means the locators that only exist afterwards — the BTC
+    HTLC funding outpoint, the deployed ETH contract address — were printed to the
+    console and then lost. Both are required by ``pyrxd swap recover-preimage`` /
+    ``build-claim`` to prove a claim belongs to THIS swap, and an operator recovering
+    from a crash does not have the console any more.
+    """
+    doc = json.loads(path.read_text())
+    doc.update(extra)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name + ".", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(json.dumps(doc, indent=2))
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, str(path))
+    except Exception:
+        try:
+            os.unlink(tmp)
         except FileNotFoundError:
             pass
         raise

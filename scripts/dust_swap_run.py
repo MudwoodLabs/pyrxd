@@ -70,6 +70,7 @@ from _dust_swap_shared import (
     atomic_write_mode_600,
     confirm,
     measured_margin_from_mainnet,
+    merge_into_mode_600,
     rxd_blockcount,
     validated_resume_deadline_s,
 )
@@ -196,6 +197,10 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
         # that doesn't match the on-chain HTLC. Found by review of cbd5fc0.
         "t_btc_blocks": t_btc.value,
         "t_rxd_blocks": t_rxd.value,
+        # The covenant's `amount` PARAMETER (not merely the funded value): the covenant
+        # SPK is built from it, so `pyrxd swap build-claim` / `build-refund` need it to
+        # rebuild the covenant they are about to spend. Nothing used to persist it.
+        "rxd_covenant_amount": args.rxd_photons,
         "margin_blocks": margin_blocks,
         "btc_htlc_address": htlc.address,
         "note": "ALL run state for recovery/sweep incl preimage p. Single point of total "
@@ -303,6 +308,18 @@ async def run_dust_swap(args: argparse.Namespace) -> None:
             amount_sats=rec.btc_locator.amount_sats,
         )
         print(f"  -> {rec.state.value} (HTLC funded: {rec.btc_locator.funding_outpoint.txid})")
+        # PERSIST the funding outpoint now that it exists. It is the provenance anchor the
+        # cold toolkit binds a scraped preimage to (`pyrxd swap recover-preimage
+        # --btc-funding-outpoint`), and until now a crash here left the operator with only
+        # a console line they no longer have.
+        merge_into_mode_600(
+            keys_path,
+            {
+                "btc_funding_outpoint": (
+                    f"{rec.btc_locator.funding_outpoint.txid}:{rec.btc_locator.funding_outpoint.vout}"
+                )
+            },
+        )
 
         # 2. Maker locks the RXD covenant (operator pays the SPK), taker re-validates.
         # Capture the RXD height at/just-before the asset lock — the t_rxd refund window is

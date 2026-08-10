@@ -6,6 +6,69 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Offline / cold swap-recovery toolkit — `pyrxd swap recover-preimage`, `build-claim`,
+  `build-refund`.** The human fallback for the page that the deadline-aware fee gate (below)
+  now raises. Because Radiant has neither RBF nor CPFP, automation refuses to broadcast an
+  unaffordable time-critical spend rather than emit one it can never repair; this is the
+  other end of that page. An operator builds the covenant spend **cold**, reads every field,
+  chooses the fee, and broadcasts it from their own node.
+
+  **These commands are strictly read-only and never broadcast.** They print raw transaction
+  hex — nothing more. That is the same posture `pyrxd swap status` already has, and it is
+  what keeps the cold path outside the external swap audit gate. No broadcaster, coordinator,
+  or key-holding leg is imported; a test asserts that at the source level, a second asserts no
+  broadcast-shaped call exists on any path, and the chain fakes in the suite raise if their
+  `broadcast` is ever reached.
+
+  - **`swap recover-preimage`** scrapes the preimage `p` off the counter-chain (BTC witness or
+    ETH calldata/log data) and re-verifies it. **Provenance is mandatory, including offline.**
+    A scrape that accepts any 32-byte value hashing to `H` is a real vulnerability, not a
+    convenience: two swaps can share a hashlock, so a transaction that merely *contains* a
+    valid-looking `p` is not evidence that OUR counter-leg was claimed. Reusing the discipline
+    proven in the watchtower's claim executor, the txid is re-derived from the fetched bytes
+    and matched against the reported spender, the transaction must spend **our** funding
+    outpoint (exact 36-byte wire prevout, never an offset), and only then is `p` scraped and
+    independently re-verified. On Ethereum the equivalent bind is the per-swap-unique HTLC
+    contract address: only calldata and logs bound to it are scanned. `--claim-tx-hex` /
+    `--claim-tx-file` accept operator-supplied bytes for a fully offline run, and still
+    require the funding outpoint.
+  - **`p` is never read from the recovery file.** The harness JSON carries `preimage_p_hex`,
+    but on a maker's host that copy may still be a **pre-reveal** secret — trusting it would
+    manufacture a claim the operator is not yet entitled to make. Only the chain-scraped value
+    is legitimate, and a chain-scraped `p` is already public, which is why printing *that* one
+    is safe.
+  - **`swap build-claim` / `swap build-refund`** rebuild the covenant from public parameters
+    (fail-closed: the rebuilt scriptPubKey must equal the persisted one, so a wrong amount,
+    pkh, or timelock cannot produce a spend of some other covenant) and print, beside the hex,
+    the decoded output and who it pays, the fee, **the node's relay floor**, the
+    **deadline-aware target** from `gravity.fee_policy`, and the CSV maturity state. The point
+    is that a human sizes the fee deliberately. `build-refund` refuses an immature CSV by
+    default; `--allow-immature` pre-builds it for broadcast at maturity.
+  - **`swap status --check-chain` now also reads the counter-leg**, through that same
+    provenance-checked path, so it can say the counterparty's claim has revealed `p` — the
+    difference between "keep waiting" and "claim now", which the RXD covenant alone cannot
+    show. It reports only that a preimage *is* recoverable; extracting it stays a separate,
+    deliberate verb. With no locator or endpoint configured it reports `NOT_CHECKED` **with
+    the reason** rather than failing, so a mid-incident operator still gets the covenant
+    verdict.
+
+### Fixed
+
+- **The swap harness recovery files now persist the locators the cold path needs.** All three
+  gaps were verified against the writers: `scripts/dust_swap_run.py` printed the BTC HTLC
+  funding outpoint but never wrote it; only `scripts/eth_swap_two_host.py` persisted the ETH
+  contract address; and **no** writer persisted the covenant's `amount` parameter, which the
+  covenant scriptPubKey is built from. The recovery file is written *before* funding so a
+  crash cannot strand value, which is exactly why the post-funding locators were being lost —
+  they existed only on the console. `scripts/_dust_swap_shared.py` gains
+  `merge_into_mode_600()`, the atomic, still-owner-only update peer of the `O_EXCL`
+  `atomic_write_mode_600()`, and the BTC/ETH runners use it to record
+  `btc_funding_outpoint` / `eth_contract_address` / `rxd_covenant_amount`. The CLI reads them
+  when present and accepts flags when they are not, so files written before this change
+  still work.
+
 ### Security
 
 - **Deadline-aware fee sizing for time-critical HTLC spends.** The only fee guard on a
