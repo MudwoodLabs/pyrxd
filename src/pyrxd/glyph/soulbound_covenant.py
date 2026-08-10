@@ -75,7 +75,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from pyrxd.constants import OpCode as OP
-from pyrxd.glyph.script import count_input_refs
+from pyrxd.glyph.script import REF_OPCODES, count_input_refs
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.security.errors import ValidationError
 
@@ -86,7 +86,8 @@ __all__ = [
 ]
 
 # Ref-carrying opcodes consume a 36-byte operand (used by the opcode walk).
-_REF_OPS = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
+# Single source of truth so this walk cannot drift from the consensus set.
+_REF_OPS = REF_OPCODES
 
 
 @dataclass(frozen=True)

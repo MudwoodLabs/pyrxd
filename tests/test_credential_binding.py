@@ -52,6 +52,46 @@ def test_extract_owner_none_when_absent():
     assert extract_owner_pkh(b"\x00\x01\x02") is None
 
 
+# --- the walk must use the consensus ref-operand set, not the 0xd0-0xd8 range ---
+#
+# 0xd4-0xd7 (OP_REFHASHDATASUMMARY_UTXO, OP_REFHASHVALUESUM_UTXOS,
+# OP_REFHASHDATASUMMARY_OUTPUT, OP_REFHASHVALUESUM_OUTPUTS —
+# Radiant-Core/src/script/script.h:281-284) take NO operand. A walk that skips
+# 37 bytes for one of them steps over real script and can report an owner the
+# consensus-correct walk would never see. These opcodes exist precisely for
+# covenant use, so a soulbound credential covenant can legitimately contain one.
+
+_P2PKH_FAKE = b"\x76\xa9\x14" + bytes.fromhex("cc" * 20) + b"\x88\xac"
+
+
+def test_refhash_opcode_does_not_hide_the_real_owner():
+    """``d4`` then P2PKH(owner): the owner is at offset 1, not offset 37."""
+    spk = b"\xd4" + b"\x76\xa9\x14" + _P + b"\x88\xac"
+    assert extract_owner_pkh(spk) == _P
+
+
+def test_refhash_opcode_cannot_promote_a_second_pkh_to_sole_owner():
+    """Two P2PKH runs => ambiguous => ``None``.
+
+    A walk that swallowed 36 bytes after the ``d4`` would step clean over the
+    first P2PKH and confidently return the second — reporting an owner the
+    script does not unambiguously bind, which is what the anti-rental gate
+    compares against ``taker_dest_hash``.
+    """
+    spk = b"\xd4" + b"\x76\xa9\x14" + _P + b"\x88\xac" + b"\x75" * 11 + _P2PKH_FAKE
+    assert spk[37:].startswith(_P2PKH_FAKE)  # exactly where a 37-byte skip lands
+    assert extract_owner_pkh(spk) is None
+
+
+def test_operand_carrying_ref_opcodes_still_skip_36_bytes():
+    """A P2PKH-shaped run inside a real 36-byte ref operand is DATA, not an owner."""
+    poisoned_ref = (b"\x76\xa9\x14" + bytes.fromhex("dd" * 20) + b"\x88\xac") + bytes(11)
+    assert len(poisoned_ref) == 36
+    for op in (0xD0, 0xD1, 0xD2, 0xD3, 0xD8):
+        spk = bytes([op]) + poisoned_ref + b"\x76\xa9\x14" + _P + b"\x88\xac"
+        assert extract_owner_pkh(spk) == _P, f"ref operand walked as opcodes after {op:#x}"
+
+
 # --------------------------------------------------------------------------- the gate: accept
 
 

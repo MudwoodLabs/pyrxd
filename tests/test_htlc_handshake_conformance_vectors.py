@@ -304,6 +304,104 @@ def test_btc_funding_spk_rederives_from_terms(vec: dict):
     assert htlc.script_tree.refund_script.hex() == dp["btc_refund_leaf_script_hex"]
 
 
+def test_credential_gating_does_not_change_the_covenant_spk():
+    """``credential_ref`` is OFF-CHAIN policy — it is absent from the bytecode.
+
+    Without this, ``btc-rxd-credential-gated`` passes
+    ``test_radiant_covenant_spk_rederives_from_terms`` for the wrong reason: the
+    builder is simply never told about the credential, so of course the bytes match.
+    Asserted here as the *expected* property, because the spec's §4 claim that a single
+    SPK byte-comparison revalidates every negotiated Radiant parameter has exactly one
+    exception, and this is it. An implementer who reads that claim as covering the
+    credential gate has no gate at all: nothing on chain stops an uncredentialed party
+    who learns ``p`` and can produce the pinned holder script from claiming.
+
+    If this ever starts failing because the credential became covenant-bound, that is a
+    security improvement — update ``docs/htlc-handshake-wire-format.md`` §4 with it.
+    """
+    gated = next(v for v in _TERMS if v["id"] == "btc-rxd-credential-gated")
+    plain = next(v for v in _TERMS if v["id"] == "btc-rxd")
+
+    assert gated["terms"]["credential_ref"], "the gated vector must actually carry a credential_ref"
+    assert "credential_ref" not in plain["terms"]
+    assert {k: v for k, v in gated["terms"].items() if k != "credential_ref"} == plain["terms"], (
+        "the two vectors must differ ONLY by credential_ref for this comparison to mean anything"
+    )
+    assert gated["covenant_scriptpubkey_hex"] == plain["covenant_scriptpubkey_hex"], (
+        "credential_ref unexpectedly entered the covenant bytecode"
+    )
+    assert gated["derivation_params"] == plain["derivation_params"]
+
+
+def test_no_covenant_builder_accepts_a_credential_parameter():
+    """The structural half of the claim above: there is no parameter to pass."""
+    import inspect
+
+    for builder in (build_htlc_covenant_rxd, build_htlc_covenant_ft, build_htlc_covenant_nft):
+        params = set(inspect.signature(builder).parameters)
+        assert not any("credential" in p for p in params), f"{builder.__name__} grew a credential parameter: {params}"
+
+
+# ---------------------------------------------------------------------------
+# 5. genesis_ref — what is enforced, and where
+# ---------------------------------------------------------------------------
+
+
+def _rxd_vector() -> dict:
+    return next(v for v in _TERMS if v["id"] == "btc-rxd")
+
+
+def test_ft_nft_empty_genesis_ref_rejected_at_construction():
+    """``swap_state.py:339-341`` is a NON-EMPTINESS check — this is all it catches."""
+    for variant in ("ft", "nft"):
+        d = dict(_rxd_vector()["terms"])
+        d["asset_variant"] = variant
+        d["genesis_ref"] = ""
+        with pytest.raises(ValidationError, match="non-empty genesis_ref"):
+            NegotiatedTerms.from_dict(d)
+
+
+def test_ft_wrong_length_genesis_ref_constructs_and_fails_later():
+    """The 36-byte rule is enforced at ``htlc_covenant.py:194-195``, not at construction.
+
+    Fail-closed, but DEFERRED: a reader must not infer ``len(genesis_ref) == 36`` from the
+    fact that ``NegotiatedTerms`` accepted the document.
+    """
+    d = dict(_rxd_vector()["terms"])
+    d["asset_variant"] = "ft"
+    d["genesis_ref"] = "ab" * 7
+    terms = NegotiatedTerms.from_dict(d)  # constructs — the emptiness guard does not fire
+    assert len(terms.genesis_ref) == 7
+    with pytest.raises(ValidationError, match="36-byte genesis_ref"):
+        holder_hash(bytes(20), variant="ft", genesis_ref=terms.genesis_ref)
+
+
+def test_rxd_genesis_ref_is_accepted_and_silently_ignored():
+    """Nothing rejects a non-empty ``genesis_ref`` on an ``rxd`` swap.
+
+    It round-trips through the wire form and changes nothing that is derived, so two
+    ``rxd`` documents differing only here describe the same swap. Documented rather
+    than fixed: rejecting it would be a wire-format break.
+    """
+    vec = _rxd_vector()
+    d = dict(vec["terms"])
+    d["genesis_ref"] = "ab" * 36
+    terms = NegotiatedTerms.from_dict(d)
+
+    assert terms.to_dict()["genesis_ref"] == "ab" * 36  # preserved, not normalised away
+    assert holder_hash(bytes(20), variant="rxd", genesis_ref=terms.genesis_ref) == holder_hash(
+        bytes(20), variant="rxd", genesis_ref=b""
+    )
+
+    dp = vec["derivation_params"]
+    pkhs = (bytes.fromhex(dp["taker_pkh_hex"]), bytes.fromhex(dp["maker_pkh_hex"]))
+    assert (
+        _covenant_for(terms, *pkhs).funded_spk.hex()
+        == _covenant_for(NegotiatedTerms.from_dict(vec["terms"]), *pkhs).funded_spk.hex()
+        == vec["covenant_scriptpubkey_hex"]
+    )
+
+
 def test_btc_funding_spk_does_not_bind_the_asset_side():
     """A published fact a second implementer must not get wrong.
 

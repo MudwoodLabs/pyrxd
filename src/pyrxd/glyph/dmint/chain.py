@@ -456,7 +456,8 @@ class DmintMinerFundingUtxo:
     funding input.
 
     The locking script must be a plain script with NO Glyph/FT/dMint
-    ref pushes (``OP_PUSHINPUTREF*``, opcodes 0xd0–0xd8). Spending a
+    ref pushes (``OP_PUSHINPUTREF*``, opcodes d0/d1/d2/d3/d8 — see
+    :data:`pyrxd.glyph.script.REF_OPCODES`). Spending a
     token-bearing UTXO as fee silently destroys the token; the V1 mint
     builder validates this and raises :class:`InvalidFundingUtxoError`
     if the funding script carries any ref envelope.
@@ -477,9 +478,10 @@ def is_token_bearing_script(script: bytes) -> bool:
     """Return True if ``script`` uses any OP_PUSHINPUTREF-family opcode.
 
     Walks the script as an opcode stream so that only *opcode position* bytes
-    are checked against the ref-opcode range — a naive bare-byte scan would
-    falsely flag any P2PKH whose 20-byte hash contains a 0xd0–0xd8 byte (~51%
-    of random addresses), denying about half of honest miners.
+    are checked against :data:`pyrxd.glyph.script.REF_OPCODES` — a naive
+    bare-byte scan would falsely flag any P2PKH whose 20-byte hash contains a
+    0xd0–0xd8 byte (~51% of random addresses), denying about half of honest
+    miners.
 
     Truncated push fields are treated as token-bearing — a malformed script of
     ambiguous length should not be accepted as funding.

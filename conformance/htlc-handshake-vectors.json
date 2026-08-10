@@ -8,6 +8,8 @@
     "timelock_ordering": "t_btc MUST exceed t_rxd by at least the verifier's own margin. The taker locks first and holds the LONGER refund.",
     "t_rxd_unit": "t_rxd MUST be BLOCKS. The Radiant covenant CSV has no SECONDS encoding.",
     "omitted_defaults": "counter_chain/value_amount/eth_timeout_unix_s/credential_ref are emitted only when they differ from the BTC defaults; a reader MUST apply the defaults for absent keys.",
+    "credential_ref_is_off_chain": "credential_ref is NOT substituted into the covenant bytecode. btc-rxd-credential-gated and btc-rxd differ only by credential_ref and their covenant_scriptpubkey_hex is byte-IDENTICAL -- that equality is the EXPECTED result, asserted by test_credential_gating_does_not_change_the_covenant_spk, not an accident of the comparison. The gate is off-chain pre-fund policy (swap_coordinator.pre_btc_lock_gate); the covenant pays whoever produces the pinned holder script with p, credentialed or not. Do NOT treat the section-4 SPK byte-compare as binding this gate.",
+    "genesis_ref_enforcement": "ft/nft: only NON-EMPTINESS is checked at NegotiatedTerms construction (swap_state.py:339-341); the 36-byte length is enforced later, fail-closed, at holder_hash (htlc_covenant.py:194-195). rxd: a non-empty genesis_ref is accepted and silently ignored -- it round-trips through the wire form and changes no derived value.",
     "hex": "bare lowercase, no 0x prefix; genesis_txid in derivation_params is DISPLAY byte order, the 36-byte wire ref is reversed-txid || vout LE32."
   },
   "hashlock_vectors": [

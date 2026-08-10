@@ -447,6 +447,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`radiant_leg._resolve_covenant`); the cold path now matches, with `--allow-unconfirmed` as the
   explicit override. `build-refund` is gated too: `--allow-immature` is about the CSV, not about the
   parent's existence on chain.
+- **The external-miner stderr reader could grow without bound on a miner that never writes a
+  newline.** `_ExternalMinerProgressReader` caps one physical line at `_PROGRESS_LINE_MAX_BYTES`
+  (4 KiB) and its docstring promises that bound holds "however long the miner writes". The check
+  was gated on `not skipping`, so the *first* overflow latched `skipping = True` and the cap was
+  never evaluated again — the buffer then grew linearly with the stream until a newline arrived,
+  which for a broken or hostile miner is never. Measured: **12,574,720 bytes** retained on
+  12,582,912 bytes (12 MiB) of newline-free stderr.
+
+  Latent until `0.13.0`, where the external path always ran `stderr=subprocess.DEVNULL`; the
+  progress-frame extension now routes stderr through this reader (`miner.py:894-899`, reachable
+  from `pyrxd glyph mine --miner-cmd`). The cap is now re-checked unconditionally, holding the
+  buffer at `cap + one read chunk` for the whole of an unterminated line. Locked by
+  `test_newline_free_flood_never_grows_the_buffer_past_the_cap`, with a companion test confirming
+  the reader still resynchronizes at the first newline after a flood.
+
 - **`glyph transfer-ft` could send the wrong number of FT units — up to the sender's entire
   balance.** Found while building the airdrop, in shipped code, not in the new work.
 
@@ -630,6 +645,50 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and must be reordered before they will pass. They are deselected from `task ci` and require live
   bitcoind/radiantd/anvil nodes, so that reordering is **not** included here and is a tracked
   follow-up rather than an unverified blind edit.
+- **The ref-opcode walker diverged from Radiant consensus on `0xd4`–`0xd7`, and could report a
+  phantom ref while dropping the real one.** `REF_OPCODES` was `frozenset(range(0xD0, 0xD9))` —
+  the contiguous `0xd0`–`0xd8` range — and the walker advanced 37 bytes for every member.
+
+  Radiant consensus consumes a 36-byte operand for exactly five opcodes: `OP_PUSHINPUTREF`
+  `0xd0`, `OP_REQUIREINPUTREF` `0xd1`, `OP_DISALLOWPUSHINPUTREF` `0xd2`,
+  `OP_DISALLOWPUSHINPUTREFSIBLING` `0xd3` and `OP_PUSHINPUTREFSINGLETON` `0xd8`
+  (`GetScriptOp`, Radiant-Core `src/script/script.cpp:710-716`; `CScript::GetPushRefs`,
+  `:586-590`). The four in between — `OP_REFHASHDATASUMMARY_UTXO`, `OP_REFHASHVALUESUM_UTXOS`,
+  `OP_REFHASHDATASUMMARY_OUTPUT`, `OP_REFHASHVALUESUM_OUTPUTS` (`script.h:281-284`) — are
+  operand-less stack operations that merely sit inside the same byte range.
+
+  A `0xd4`–`0xd7` in opcode position therefore swallowed the following 36 bytes and desynchronized
+  the walk. The failure mode is **layout-dependent**, which is what makes it dangerous: sometimes
+  the walk resumes on a byte that is not a valid single-byte opcode and `TruncatedScriptError` is
+  raised (fail-closed, merely wrong), and sometimes it resumes on one that is — `0x00` for any
+  ref whose vout fits in one byte — and resynchronizes **silently**. Demonstrated on
+  `[0xd4][0xd0][36-byte ref][P2PKH]`, where consensus sees one push-ref and the old walker
+  reported a phantom ref shifted by one byte, with the real ref absent and no exception raised.
+
+  This matters because `count_input_refs` / `is_token_bearing_script` classify **arbitrary chain
+  scripts**, not just pyrxd's own: the dMint funding-UTXO guard (`glyph/dmint/chain.py`), the HTLC
+  covenant phantom-ref guard (`gravity/htlc_covenant.py`) and the soulbound classifier
+  (`glyph/soulbound_detect.py`) all build on them. A token-bearing UTXO misclassified as plain
+  funding can be spent as a fee input, silently burning the token. pyrxd's own FT (75 B) and NFT
+  (63 B) locking scripts contain no `0xd4`–`0xd7`, so simple pyrxd-generated tokens were never
+  affected; the exposure is foreign covenants and any script using the REFHASH opcodes — which
+  exist precisely for covenant use.
+
+  A second walker had the same defect independently: `extract_owner_pkh`
+  (`glyph/credential_binding.py`) hard-coded `0xD0 <= op <= 0xD8`. It backs the anti-rental
+  credential gate, which compares the extracted owner against the swap's pinned payout. On a
+  script where the consensus-correct walk finds two candidate pkhs and therefore refuses to name
+  an owner (returns `None`, fail-closed), the old walk stepped clean over the first and
+  confidently returned the second — a wrong owner presented as the right one. Both walkers now
+  share the single `REF_OPCODES` constant, as do the two local copies in `htlc_covenant.py` and
+  `soulbound_covenant.py` that already held the correct five-opcode set.
+
+  Locked by `TestRefWalkerConsensusDifferential` (`tests/test_glyph.py`), which differentials the
+  walker against a port of Radiant's `GetScriptOp` over every opcode `0xd0`–`0xd8` in varied
+  positions plus a 3,000-script seeded sweep, and by three cases in `tests/test_credential_binding.py`.
+  No conformance vector, golden fixture or existing test encoded the wrong behaviour: a sweep of
+  1,285 hex blobs across `conformance/`, `tests/` and `src/pyrxd/` found zero whose ref-walk
+  changes under the fix.
 
 - **The maker-side "did the taker fund the right HTLC for the right amount?" check now exists in
   the library for a BTC counter leg** (`SwapCoordinator.maker_verify_counter_funding`,
@@ -783,6 +842,49 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - **No RBF or CPFP path was built, and none should be.** Both are absent from the chain;
     "just bump the fee" is Bitcoin semantics assumed onto a BCH-lineage chain. Recorded in
     `docs/threat-model.md` (**S21**) and `docs/runbooks/watchtower-operations.md`.
+
+### Documentation
+
+Three corrections from a pre-release audit, each verified against the code rather than restated.
+
+- **`credential_ref` is off-chain policy, not a covenant binding** —
+  `docs/htlc-handshake-wire-format.md` §4. The section claimed that because every negotiated
+  Radiant parameter is substituted into the covenant bytecode, "this single byte-comparison
+  revalidates all of them at once", and the `terms` table described `credential_ref` as a gate
+  the taker must satisfy. `credential_ref` is the one exception, and a load-bearing one: no
+  covenant builder takes a credential parameter (`gravity/htlc_covenant.py:391-419`), and the
+  `btc-rxd-credential-gated` conformance vector's `covenant_scriptpubkey_hex` is **byte-identical**
+  to plain `btc-rxd`. Enforcement is a pre-fund, off-chain check by whichever party runs it
+  (`swap_coordinator.py:1241-1266`); nothing on chain stops an uncredentialed party who learns
+  `p` and can produce the pinned holder script from claiming. §4 now carves the exception out
+  explicitly, and the conformance suite **asserts** the SPK equality as the expected property
+  (`test_credential_gating_does_not_change_the_covenant_spk`, plus a structural check that no
+  builder has grown a credential parameter) instead of passing for the wrong reason — the gated
+  vector previously re-derived correctly only because the builder was never told about the
+  credential.
+
+- **A measurably false claim about `decode_payload` removed** —
+  `docs/reference/glyph-token-protocol-spec.md` §4.4. It stated the 100 KB `main.b` ceiling was
+  enforced by the `GlyphMedia` constructor "but **not** by `decode_payload`… pyrxd decodes media
+  it would refuse to construct". It does: `decode_payload` constructs a `GlyphMedia`
+  (`glyph/payload.py:122`), so the cap in `glyph/types.py:116-117` fires. Measured — 100,000 bytes
+  decodes, 100,001 raises `ValidationError`. The sentence is gone, the `main.b` case is added to
+  §4.5's MUST-reject list, and both the boundary and a 150 KB body are now pinned by tests.
+
+- **`genesis_ref` — what is actually enforced, and where** —
+  `docs/htlc-handshake-wire-format.md`. The table said "Empty for `rxd`; 36 bytes for `ft`/`nft`"
+  and cited `swap_state.py:339-341`, which only checks **non-emptiness**. The 36-byte length is
+  caught later, fail-closed, at `htlc_covenant.py:194-195` — so a reader must not infer
+  `len(genesis_ref) == 36` from `NegotiatedTerms` having accepted a document. And a non-empty
+  `genesis_ref` on an `rxd` swap is accepted and silently ignored: it round-trips through the wire
+  form and changes no derived value, so two `rxd` documents differing only there describe the same
+  swap. A new sub-section states each case and where it is (or is not) checked, and three tests pin
+  it. Documented rather than fixed — rejecting it would be a wire-format break.
+
+- **The ref-opcode range corrected wherever it was stated as contiguous** —
+  `docs/reference/glyph-token-protocol-spec.md` §2.2 (now carrying the full per-opcode table and
+  the consensus citations), `docs/concepts/v1-mint-mechanics.md`, and the docstrings in
+  `glyph/dmint/chain.py`. See the Security entry above.
 
 ### Upgrade notes
 

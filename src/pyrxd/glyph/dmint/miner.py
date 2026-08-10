@@ -780,7 +780,14 @@ class _ExternalMinerProgressReader:
                     if frame is not None:
                         with self._lock:
                             self._latest = frame
-                if not skipping and len(buf) > _PROGRESS_LINE_MAX_BYTES:
+                # NOT gated on ``not skipping``: once the reader latches into
+                # skip mode it is still accumulating bytes into ``buf``, and a
+                # miner that never writes another ``\n`` would grow it without
+                # bound (measured: ~12 MB retained on 12 MB of newline-free
+                # stderr). Re-checking unconditionally keeps the buffer at
+                # ``cap + one read chunk`` for the whole of an unterminated
+                # line, however long it runs.
+                if len(buf) > _PROGRESS_LINE_MAX_BYTES:
                     buf.clear()
                     skipping = True
         except (ValueError, OSError):

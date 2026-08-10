@@ -45,7 +45,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from pyrxd.glyph.script import count_input_refs
+from pyrxd.glyph.script import REF_OPCODES, count_input_refs
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
@@ -65,8 +65,9 @@ FT_EPILOGUE = bytes.fromhex("dec0e9aa76e378e4a269e69d")
 
 _ARTIFACTS_DIR = Path(__file__).parent / "artifacts"
 
-# Ref-carrying opcodes (consume a 36-byte operand): d0/d1/d2/d3/d8.
-_REF_OPS = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
+# Ref-carrying opcodes (consume a 36-byte operand): d0/d1/d2/d3/d8. Aliased to
+# the shared constant so this walk cannot drift from the consensus set.
+_REF_OPS = REF_OPCODES
 
 
 @dataclass(frozen=True)
