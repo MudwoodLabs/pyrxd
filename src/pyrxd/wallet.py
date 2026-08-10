@@ -31,8 +31,18 @@ from .transaction.transaction_input import TransactionInput
 from .transaction.transaction_output import TransactionOutput
 from .utils import validate_address
 
-# The Radiant/BCH-style dust threshold used by relay policy on mainnet.
-# Outputs below this are considered non-standard and will not relay.
+# A pyrxd send-policy floor — NOT a Radiant relay rule.
+#
+# Radiant has no dust threshold: `GetDustThreshold` returns 1 satoshi
+# unconditionally and `IsDust` is `nValue <= 0` (Radiant-Core
+# `src/policy/policy.cpp:19-25`), so ANY output >= 1 photon is standard and
+# relays. This constant is a conservative wallet-level guard against creating
+# uneconomic change, inherited from Bitcoin's 546-sat convention.
+#
+# The distinction matters: pyrxd itself depends on 1-photon outputs being
+# valid — a V1 dMint contract MUST be a 1-photon singleton (the covenant
+# enforces `OP_OUTPUTVALUE == 1`). Treating 546 as a chain rule would
+# contradict a consensus requirement this library already implements.
 DUST_THRESHOLD: int = 546
 
 # Default miner fee in photons-per-byte. Radiant mainnet currently accepts a
@@ -181,7 +191,8 @@ class RxdWallet:
 
         Rules
         -----
-        * ``photons`` must be >= :data:`DUST_THRESHOLD` (546).
+        * ``photons`` must be >= :data:`DUST_THRESHOLD` (546) — a pyrxd
+          send-policy floor, not a chain rule (Radiant's real floor is 1).
         * UTXOs are greedily selected in descending order of value.
         * A change output back to ``self.address`` is added only if the
           remainder after paying the fee exceeds the dust threshold; otherwise
