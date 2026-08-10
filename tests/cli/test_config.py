@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from pyrxd.cli import config as _config
+from pyrxd.cli.config import load
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.errors import UserError
 from pyrxd.network.registry import DEFAULT_ENDPOINTS, GENESIS_BLOCK_HASHES
@@ -26,23 +27,23 @@ def test_defaults_when_no_file(tmp_path: Path) -> None:
 def test_file_overrides_defaults(tmp_path: Path) -> None:
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
-        f'network = "testnet"\nelectrumx = "wss://custom/"\nfee_rate = 5000\nwallet_path = "{tmp_path / "w.dat"}"\n'
+        f'network = "testnet"\nelectrumx = "wss://custom/"\nfee_rate = 25000\nwallet_path = "{tmp_path / "w.dat"}"\n'
     )
     cfg = _config.load(cfg_file)
     assert cfg.network == "testnet"
     assert cfg.electrumx == "wss://custom/"
-    assert cfg.fee_rate == 5000
+    assert cfg.fee_rate == 25_000
     assert cfg.source_path == cfg_file
 
 
 def test_env_overrides_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text('network = "testnet"\nfee_rate = 5000\n')
+    cfg_file.write_text('network = "testnet"\nfee_rate = 25000\n')
     monkeypatch.setenv("PYRXD_NETWORK", "regtest")
-    monkeypatch.setenv("PYRXD_FEE_RATE", "1234")
+    monkeypatch.setenv("PYRXD_FEE_RATE", "31234")
     cfg = _config.load(cfg_file)
     assert cfg.network == "regtest"
-    assert cfg.fee_rate == 1234
+    assert cfg.fee_rate == 31234
 
 
 def test_per_network_overrides(tmp_path: Path) -> None:
@@ -127,13 +128,13 @@ def test_set_coin_type_creates_when_missing(tmp_path: Path) -> None:
 
 def test_set_coin_type_updates_in_place(tmp_path: Path) -> None:
     target = tmp_path / "config.toml"
-    target.write_text('network = "testnet"\nfee_rate = 5000\ncoin_type = 512\n')
+    target.write_text('network = "testnet"\nfee_rate = 25000\ncoin_type = 512\n')
     _config.set_coin_type(236, target)
     cfg = _config.load(target)
     # Only coin_type changed; the other keys are preserved verbatim.
     assert cfg.coin_type == 236
     assert cfg.network == "testnet"
-    assert cfg.fee_rate == 5000
+    assert cfg.fee_rate == 25_000
 
 
 def test_set_coin_type_appends_when_key_absent(tmp_path: Path) -> None:
@@ -399,3 +400,35 @@ def test_write_default_writes_a_failover_list_for_its_own_network(tmp_path: Path
     assert cfg.endpoints == DEFAULT_ENDPOINTS["mainnet"]
     # ...and the written file still refuses to serve another network.
     assert cfg.for_network("regtest").endpoints == ()
+
+
+def test_fee_rate_below_the_relay_floor_is_refused(tmp_path, monkeypatch):
+    """A sub-floor fee_rate must be refused at load, not discovered on-chain.
+
+    Radiant has neither RBF nor CPFP (threat-model S21), so a transaction built
+    below the effective relay floor cannot be bumped by any means and squats on
+    its own inputs until mempool expiry. `DeadlineFeePolicy` already rejects a
+    sub-floor rate for the swap stack; before this guard, every other CLI command
+    accepted `PYRXD_FEE_RATE=1` without complaint.
+    """
+    from pyrxd.gravity.fee_policy import RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
+
+    floor_per_byte = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB // 1000
+
+    monkeypatch.setenv("PYRXD_FEE_RATE", str(floor_per_byte - 1))
+    with pytest.raises(ValidationError, match="below Radiant's effective relay floor"):
+        load()
+
+    # At the floor, and above it, are both fine — overpaying is the operator's call.
+    for ok in (floor_per_byte, floor_per_byte * 5):
+        monkeypatch.setenv("PYRXD_FEE_RATE", str(ok))
+        assert load().fee_rate == ok
+
+
+def test_fee_rate_error_names_where_the_value_came_from(tmp_path, monkeypatch):
+    """The message must point at the file, so the operator knows what to edit."""
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('network = "mainnet"\nfee_rate = 1\n')
+    monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+    with pytest.raises(ValidationError, match=str(cfg)):
+        load(cfg)

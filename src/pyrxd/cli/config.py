@@ -58,6 +58,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from ..gravity.fee_policy import RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
 from ..network.registry import DEFAULT_ENDPOINTS, NetworkProfile, default_endpoints, genesis_hash_for
 from ..security.errors import ValidationError
 
@@ -255,6 +256,44 @@ def _resolve_servers(
     return tuple(default_endpoints(network))
 
 
+def _validated_fee_rate(rate: int, source_path: Path | None, *, from_env: bool) -> int:
+    """Reject a fee rate below Radiant's effective relay floor.
+
+    Fund-safety, not tidiness. ``fee_rate`` is photons per BYTE; the chain's
+    effective floor is :data:`RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB` per kB.
+    A rate under that produces transactions the node will not relay — and Radiant
+    has **neither RBF nor CPFP** (threat-model S21), so such a transaction cannot
+    be bumped by any means and squats on its own inputs until mempool expiry (8h).
+    On a time-critical spend that is a total loss.
+
+    The default sits exactly at the floor, so this only ever fires on a deliberate
+    override via ``PYRXD_FEE_RATE`` or ``fee_rate`` in the config file — which is
+    precisely the path that had no validation at all. ``DeadlineFeePolicy`` already
+    rejects a sub-floor rate for the swap stack; this closes the same gap for every
+    other CLI command.
+
+    A HIGHER rate is always allowed: overpaying is the operator's prerogative.
+    """
+    floor_per_byte = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB // 1000
+    if rate < floor_per_byte:
+        # Name the ACTUAL source. An env override with a config file present would
+        # otherwise send the operator to edit a file that does not contain the value.
+        if from_env:
+            where = " (set via the PYRXD_FEE_RATE environment variable)"
+        elif source_path is not None:
+            where = f" (set in {source_path})"
+        else:
+            where = ""
+        raise ValidationError(
+            f"fee_rate={rate} photons/byte is below Radiant's effective relay floor of "
+            f"{floor_per_byte} photons/byte ({RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB} per kB)"
+            f"{where}. A transaction built at this rate will not relay, and Radiant has no RBF "
+            "and no CPFP — it cannot be fee-bumped and will squat on its inputs until mempool "
+            "expiry. Raise fee_rate to at least the floor."
+        )
+    return rate
+
+
 def load(path: Path | None = None) -> Config:
     """Load config from *path* (default ~/.pyrxd/config.toml).
 
@@ -310,7 +349,11 @@ def load(path: Path | None = None) -> Config:
         electrumx_servers=servers,
         allow_insecure=bool(file_data.get("allow_insecure", False)),
         spki_pins=_as_str_tuple(file_data.get("spki_pins", ()), "spki_pins"),
-        fee_rate=_as_int(fee_rate_raw, "fee_rate"),
+        fee_rate=_validated_fee_rate(
+            _as_int(fee_rate_raw, "fee_rate"),
+            source_path,
+            from_env=bool(os.environ.get("PYRXD_FEE_RATE")),
+        ),
         wallet_path=Path(str(wallet_path)).expanduser(),
         coin_type=_as_int(coin_type_raw, "coin_type"),
         networks=networks,
