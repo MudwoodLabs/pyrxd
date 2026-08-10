@@ -120,7 +120,7 @@ include = [
     { path = "scripts", format = ["sdist"] },
 
     # Published Sphinx documentation source (built at
-    # https://mudwoodlabs.github.io/pyrxd/: api/, concepts/, how-to/,
+    # https://mudwoodlabs.github.io/pyrxd/: api/, concepts/, reference/, how-to/,
     # tutorials/, showcase.md, index.rst, conf.py, the pyodide-hosted inspect
     # tool's static assets) plus auditor-facing reference docs not in the
     # public toctree (threat model, security audit scope, versioning policy,
@@ -138,6 +138,7 @@ include = [
     { path = "docs/make.bat", format = ["sdist"] },
     { path = "docs/api", format = ["sdist"] },
     { path = "docs/concepts", format = ["sdist"] },
+    { path = "docs/reference", format = ["sdist"] },
     { path = "docs/how-to", format = ["sdist"] },
     { path = "docs/tutorials", format = ["sdist"] },
     { path = "docs/runbooks", format = ["sdist"] },

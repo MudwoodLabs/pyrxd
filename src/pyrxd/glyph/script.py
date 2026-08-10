@@ -49,9 +49,13 @@ The 75-byte FT layout in detail
       OP_EQUALVERIFY            │       │             │
       OP_CHECKSIG               │       │             │
                                 │       │             │
-                                │       │             Hashed by the dMint contract
-                                │       │             to enforce conservation:
-                                │       │             sum(input ft) == sum(output ft)
+                                │       │             The FT-CSH epilogue. This
+                                │       │             output's OWN script enforces
+                                │       │             conservation when it is spent:
+                                │       │             sum(input ft) >= sum(output ft)
+                                │       │             (0xa2 = OP_GREATERTHANOREQUAL —
+                                │       │             burning is permitted, inflation
+                                │       │             is not). See the walk below.
                                 │       │
                                 │       OP_PUSHINPUTREF <36-byte wire ref>
                                 │       ─ wire ref = txid_LE_reversed + vout_LE
@@ -75,6 +79,32 @@ must also appear in some INPUT being spent::
 The Radiant node enforces this with the consensus error
 ``bad-txns-inputs-outputs-invalid-transaction-reference-operations``.
 Refs cannot be conjured from thin air — only carried forward.
+
+What the 12-byte epilogue enforces
+----------------------------------
+
+Induction (above) is a consensus rule about refs. The *amount* rule is
+enforced by the FT output's own script when it is spent::
+
+      de   OP_REFOUTPUTCOUNT_OUTPUTS            ref      -> n_ref
+      c0   OP_INPUTINDEX
+      e9   OP_CODESCRIPTBYTECODE_UTXO           this input's code script
+      aa   OP_HASH256                                    -> csh
+      76   OP_DUP
+      e3   OP_CODESCRIPTHASHVALUESUM_UTXOS      csh      -> sum_in
+      78   OP_OVER
+      e4   OP_CODESCRIPTHASHVALUESUM_OUTPUTS    csh      -> sum_out
+      a2   OP_GREATERTHANOREQUAL                         -> sum_in >= sum_out
+      69   OP_VERIFY
+      e6   OP_CODESCRIPTHASHOUTPUTCOUNT_OUTPUTS csh      -> n_csh
+      9d   OP_NUMEQUALVERIFY                             -> n_ref == n_csh
+
+So exactly two things hold: ``sum_in >= sum_out`` (inflation impossible,
+**burning permitted** — it is ``>=``, not ``==``), and the ref appears in
+exactly as many outputs as the FT code-script hash does, which is what
+stops the ref being carried into an output of any other shape. The code
+script hashed here is ``d0 <token_ref> || <12-byte epilogue>``, so it is
+unique per token. See ``docs/reference/glyph-token-protocol-spec.md`` §9.2.
 
 Wallets at a single address can hold mixed UTXO shapes
 ------------------------------------------------------
