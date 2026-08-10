@@ -8,6 +8,21 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **[`docs/concepts/glossary.md`](docs/concepts/glossary.md) — an A–Z glossary
+  of Radiant and pyrxd vocabulary.** Deliberately excluded from the 0.12.0
+  troubleshooting page as a separate item; this closes it. Roughly 50 terms
+  across chain primitives (photon, ref/induction, `OP_PUSHINPUTREF` family,
+  FORKID, `hashOutputHashes`, scripthash, dust floor, min-relay fee), Glyph
+  (CBOR envelope, commit/reveal, the protocol-type enum, premine, carrier
+  value), dMint (difficulty vs target, DAA modes, reroll), HTLC swaps
+  (hashlock, `t_btc`/`t_rxd`/margin, the free option, griefing, RSWP, SPV,
+  watchtower), and HD wallets (BIP32/39/44, `coin_type` 0/236/512, NFKD
+  normalization, xprv/xpub, gap limit, WIF) — each grounded against the
+  defining module or an existing doc rather than a general definition. Two
+  entries record real shipped bugs this repo hit: the genesis-ref-vs-
+  reveal-txid confusion (0.12.0) and the `MAX_SHA256D_TARGET / target`
+  difficulty-multiplier-vs-expected-attempts trap (off by `2**33`).
+
 - **Offline / cold swap-recovery toolkit — `pyrxd swap recover-preimage`, `build-claim`,
   `build-refund`.** The human fallback for the page that the deadline-aware fee gate (below)
   now raises. Because Radiant has neither RBF nor CPFP, automation refuses to broadcast an

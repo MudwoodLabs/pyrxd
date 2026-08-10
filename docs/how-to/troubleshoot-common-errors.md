@@ -454,3 +454,6 @@ you need to know what's actually spendable versus what's a token carrier.
 - [`src/pyrxd/security/errors.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/src/pyrxd/security/errors.py) — the library's typed exception hierarchy
 - [Recover funds across wallet paths](recover-funds-across-wallet-paths.md) — coin-type scanning and the non-ASCII passphrase / NFKD recovery recipe
 - [Broadcast a transaction](broadcast-a-transaction.md) — the four common node-rejection symptoms
+- [Glossary](../concepts/glossary.md) — a flat A–Z lookup for the vocabulary
+  used across this page and the rest of the docs (ref, genesis ref vs
+  `contract_id`, dust floor, hashlock, coin_type, and more)
