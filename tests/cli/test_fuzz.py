@@ -183,6 +183,8 @@ _CLI_VOCAB = [
     "load",
     "recover",
     "export-xpub",
+    "--descriptor",
+    "--checksum",
     "--no-interactive",
     "--coin-type",
     "--scan",

@@ -7,6 +7,7 @@ you already know the basics and want a focused answer to "how do I X."
 :maxdepth: 1
 
 receive-and-check-balance
+export-a-watch-only-descriptor
 transfer-a-glyph-token
 use-the-signing-agent
 recover-funds-across-wallet-paths
@@ -30,6 +31,12 @@ troubleshoot-common-errors
   --refresh` to confirm money arrived, `pyrxd utxos` to see exactly what you
   hold, and `wallet export-xpub` for watch-only receiving. No signing, no
   mnemonic.
+- **[Export a watch-only output-script descriptor](export-a-watch-only-descriptor.md)**
+  — `wallet export-xpub --descriptor` emits `pkh()` descriptors for the receive
+  and change chains with master-fingerprint key origin, ready for another
+  wallet or `radiant-cli scantxoutset`. Covers the fork trap that costs people
+  an afternoon: Radiant Core **rejects** the BIP380 `#checksum` suffix that
+  Bitcoin Core requires. Also the privacy cost of handing out an xpub.
 - **[Transfer a Glyph token after you mint it](transfer-a-glyph-token.md)** — the
   canonical second task: send an FT or NFT to someone with `glyph transfer-ft
   REF AMOUNT --to ADDR` / `glyph transfer-nft REF --to ADDR`, or pay many

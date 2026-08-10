@@ -19,6 +19,15 @@ from .bip44 import (
     derive_xprv_from_mnemonic,
     derive_xprvs_from_mnemonic,
 )
+from .descriptor import (
+    AccountDescriptors,
+    account_descriptors,
+    append_checksum,
+    descriptor_checksum,
+    key_origin,
+    pkh_descriptor,
+    verify_checksum,
+)
 from .discovery import (
     DEFAULT_ACCOUNTS,
     DEFAULT_COIN_TYPES,
@@ -33,6 +42,8 @@ __all__ = [
     # discovery (multi-path recovery)
     "DEFAULT_ACCOUNTS",
     "DEFAULT_COIN_TYPES",
+    # descriptor (watch-only export)
+    "AccountDescriptors",
     # wallet
     "AddressRecord",
     "DiscoveryHit",
@@ -44,6 +55,8 @@ __all__ = [
     "Xkey",
     "Xprv",
     "Xpub",
+    "account_descriptors",
+    "append_checksum",
     "bip32_derive_xkeys_from_xkey",
     "bip32_derive_xprv_from_mnemonic",
     "bip32_derive_xprvs_from_mnemonic",
@@ -55,10 +68,14 @@ __all__ = [
     "derive_xkeys_from_xkey",
     "derive_xprv_from_mnemonic",
     "derive_xprvs_from_mnemonic",
+    "descriptor_checksum",
     "discover",
+    "key_origin",
     "master_xprv_from_seed",
     "mnemonic_from_entropy",
+    "pkh_descriptor",
     "seed_from_mnemonic",
     "step_to_index",
     "validate_mnemonic",
+    "verify_checksum",
 ]

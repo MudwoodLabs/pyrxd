@@ -8,6 +8,44 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Output-script descriptor export — `wallet export-xpub --descriptor`, `HdWallet.descriptors()`,
+  `pyrxd.hd.descriptor`.** A bare xpub leaves a watch-only consumer guessing two things: which
+  script type to build, and which seed the key came from. A descriptor states both —
+  `pkh([73c5da0a/44h/512h/0h]xpub6BmWw…/0/*)` — so the import is unambiguous.
+
+  **Radiant Core rejects the checksummed form that Bitcoin Core requires.** The fork predates
+  Bitcoin Core 0.18, so `src/script/descriptor.cpp` has no checksum machinery at all and the
+  BIP380 `#xxxxxxxx` suffix reads as unparseable trailing input: `scantxoutset` answers
+  `error code: -5, Invalid descriptor`. The default output therefore carries **no checksum**,
+  which is what the only descriptor consumer in the Radiant ecosystem accepts. `--checksum`
+  appends a real BIP380 checksum (the polymod, proven against the BIP's published
+  `raw(deadbeef)#89f8spxm` vector) for Bitcoin-Core-lineage tools that demand one.
+
+  Both chains are emitted, receive (`/0/*`) and change (`/1/*`). A watch-only import that takes
+  only the receive descriptor does not report a smaller wallet — it reports a *wrong* balance
+  that silently omits every change output, which after a few spends is most of the funds.
+
+  The key-origin fingerprint is the **master** fingerprint, `hash160(master pubkey)[:4]`, exposed
+  as `HdWallet.master_fingerprint()`. It is deliberately not `Xkey.fingerprint` on the account
+  xpub, which is the BIP32 *parent* fingerprint (of `m/44'/<coin>'`, one level up) and differs for
+  every account below depth 1. Using the parent there is the kind of bug that never surfaces in
+  testing: the descriptor still derives every address correctly, so balances look right, and it
+  only fails when a consumer tries to match the descriptor to a signing device.
+
+  Hardened steps are written `h`, not `'`. Radiant Core accepts both (verified against a mainnet
+  node), but a descriptor containing `'` cannot be pasted inside a shell's single quotes, and
+  `radiant-cli` invocations are written exactly that way.
+
+  Descriptor builders refuse any key that is not an xpub. This is not theoretical tidiness:
+  `scantxoutset`'s own help documents the key as "an xpub/xprv", so the node would accept a
+  descriptor carrying spending authority without complaint.
+
+  The command's guidance was corrected while it was open: the previous "Safe to share with
+  watch-only services" overstated the case. An xpub discloses every address the wallet will ever
+  derive on both chains — a whole-history disclosure, permanent, and much larger than handing out
+  one address. Both the `--help` text and the human-mode output now say so. See
+  [Export a watch-only output-script descriptor](docs/how-to/export-a-watch-only-descriptor.md).
+
 - **Multi-recipient FT airdrop — `glyph airdrop-ft`, `FtUtxoSet.build_airdrop_tx`,
   `GlyphBuilder.build_ft_airdrop_tx`.** One transaction paying N recipients, instead of N
   sequential transfers. The difference is not convenience: sequential transfers chain, each

@@ -86,8 +86,30 @@ xpub6C…
 ```
 
 The xpub at `m/44'/<coin_type>'/<account>'` derives receive addresses but
-**carries no private keys** — safe to hand to a watch-only wallet or a merchant
-integration. Anyone with it can watch and derive addresses; they cannot spend.
+**carries no private keys** — anyone with it can watch and derive addresses;
+they cannot spend.
+
+It is not, however, a casual thing to hand out. An xpub reveals *every*
+address the wallet will ever derive, on both the receive and change chains,
+and the fact that they belong together — a permanent disclosure of your whole
+transaction history, past and future. Share it only with a party you would
+trust with that; for a one-off payment, hand over a single address instead.
+
+Add `--descriptor` to get an output script descriptor rather than a bare
+xpub — script type, key origin, and derivation range in one string, which is
+what other wallets actually want for a watch-only import:
+
+```console
+$ pyrxd wallet export-xpub --descriptor
+...
+  receive: pkh([73c5da0a/44h/512h/0h]xpub6BmWw…NZpB/0/*)
+  change:  pkh([73c5da0a/44h/512h/0h]xpub6BmWw…NZpB/1/*)
+```
+
+See [Export a watch-only output-script
+descriptor](export-a-watch-only-descriptor.md) for the full recipe, including
+the `radiant-cli scantxoutset` example and the checksum incompatibility
+between Radiant Core and Bitcoin Core.
 
 ---
 
