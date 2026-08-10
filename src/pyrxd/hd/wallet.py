@@ -352,7 +352,7 @@ class HdWallet:
 
         *normalize* controls BIP39 NFKD normalization — see
         :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. Leave it ``True`` unless
-        you are recovering funds from a wallet created before 0.11.3 using a
+        you are recovering funds from a wallet created before 0.12.0 using a
         **non-ASCII passphrase**, which pyrxd then hashed unnormalized. Wrong
         for every other case: it derives a wallet no other BIP39
         implementation can reproduce.
@@ -397,7 +397,7 @@ class HdWallet:
         *normalize* controls BIP39 NFKD normalization of the mnemonic and
         passphrase — see :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. It
         matters here because the derived seed is also the wallet file's
-        AES-GCM decryption key: a wallet saved by pyrxd before 0.11.3 with
+        AES-GCM decryption key: a wallet saved by pyrxd before 0.12.0 with
         a **non-ASCII passphrase** was encrypted under the old,
         unnormalized seed, and can only be decrypted by reproducing that
         seed with ``normalize=False``. Leave the default ``True`` for
@@ -438,7 +438,7 @@ class HdWallet:
         *normalize* also applies to both branches — see :meth:`load` for
         why it matters on the load branch (the seed doubles as the wallet
         file's decryption key). ``False`` is a fund-recovery escape for
-        pre-0.11.3 wallets with non-ASCII passphrases; never use it for
+        pre-0.12.0 wallets with non-ASCII passphrases; never use it for
         new wallets.
         """
         if path.exists():
@@ -519,14 +519,14 @@ class HdWallet:
                 if normalize:
                     message += (
                         " Note: this passphrase contains characters changed by NFKD normalization. "
-                        "If this wallet file was created by pyrxd before 0.11.3, its encryption key "
+                        "If this wallet file was created by pyrxd before 0.12.0, its encryption key "
                         "came from the old, unnormalized seed — retry with normalize=False (fund-"
                         "recovery mode; see docs/how-to/recover-funds-across-wallet-paths.md)."
                     )
                 else:
                     message += (
                         " Note: normalize=False (legacy fund-recovery mode) was requested. If this "
-                        "wallet file was created with the spec-conformant seed (pyrxd 0.11.3+, or "
+                        "wallet file was created with the spec-conformant seed (pyrxd 0.12.0+, or "
                         "an ASCII passphrase), load it without normalize=False."
                     )
             raise ValidationError(message) from exc
