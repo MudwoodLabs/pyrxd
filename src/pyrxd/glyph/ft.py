@@ -4,7 +4,15 @@ Radiant FTs use ``OP_PUSHINPUTREF (0xd0)`` in their locking script (unlike NFT
 singletons which use ``OP_PUSHINPUTREFSINGLETON (0xd8)``), and every FT transfer
 must satisfy **conservation**:
 
-    sum(input FT amounts) == sum(output FT amounts)
+    sum(input FT amounts) >= sum(output FT amounts)
+
+That is ``>=``, not ``==``: the epilogue opcode is ``0xa2``
+(``OP_GREATERTHANOREQUAL``), so inflation is impossible but **burning is
+permitted**. pyrxd's builders emit exact-balance transactions anyway — a
+transfer that silently burned the difference would be a fund-loss bug — but an
+implementation reading the chain must not assume every transfer balanced. The
+full opcode walk is in ``pyrxd.glyph.script`` and in
+``docs/reference/glyph-token-protocol-spec.md`` §9.2.
 
 This module owns the fee-aware transfer builder. Mirrors the two-pass signing
 pattern in :meth:`GlyphBuilder.build_nft_transfer_tx` (see that method's
