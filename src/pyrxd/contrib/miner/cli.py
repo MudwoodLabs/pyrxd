@@ -2,7 +2,12 @@
 
 Implements pyrxd's JSON-over-subprocess external-miner protocol. Reads
 one JSON object from stdin, writes one JSON object to stdout, exits
-with a documented code.
+with a documented code. While it searches, it also writes zero or more
+optional progress frames to stderr (``{"progress": {...}}``, one per
+line) — the reference implementation of the protocol's stderr progress
+extension; ``--quiet`` suppresses them. A consumer that predates this
+addition (stderr fully discarded, as ``mine_solution_external`` did
+before ``progress=`` existed) is unaffected either way.
 
 Invoke as a console script:
 
@@ -27,15 +32,37 @@ from __future__ import annotations
 import argparse
 import sys
 
-from .parallel import MineParams, default_n_workers, mine
+from .parallel import DEFAULT_PROGRESS_INTERVAL_S, MineParams, default_n_workers, mine
 from .protocol import (
     MAX_REQUEST_BYTES,
     PROTOCOL_VERSION,
     MineExhausted,
+    MineProgress,
     MineRequest,
     MineSuccess,
     ProtocolError,
 )
+
+
+def _make_progress_reporter(quiet: bool):
+    """Build the ``progress`` callback passed to :func:`mine`, or ``None``.
+
+    Demonstrates the stderr progress-frame extension end to end: this is
+    the SAME ``callback(attempts, elapsed_s)`` seam ``mine()`` already
+    used (and tested — see ``TestOrphanPreventionDuringProgressPoll``) for
+    in-process callers; here it just serialises each call as one
+    :class:`MineProgress` JSON line to stderr instead of updating a
+    terminal. ``--quiet`` suppresses this exactly as it already suppressed
+    the exhaustion message — both are "stderr progress output".
+    """
+    if quiet:
+        return None
+
+    def _report(attempts: int, elapsed_s: float) -> None:
+        sys.stderr.write(MineProgress(attempts=attempts, elapsed_s=elapsed_s).to_json() + "\n")
+        sys.stderr.flush()
+
+    return _report
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -65,7 +92,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--quiet",
         action="store_true",
-        help="Suppress stderr progress messages on exhaustion.",
+        help="Suppress stderr progress output (both the periodic progress frames and the exhaustion message).",
     )
     parser.add_argument(
         "--protocol-version",
@@ -118,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         nonce_max=nonce_max,
     )
 
-    result = mine(params)
+    result = mine(params, progress=_make_progress_reporter(args.quiet), progress_interval_s=DEFAULT_PROGRESS_INTERVAL_S)
 
     if isinstance(result, MineExhausted):
         if not args.quiet:

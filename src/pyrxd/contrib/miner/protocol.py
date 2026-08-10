@@ -8,6 +8,31 @@ This module is the single source of truth for the protocol shape.
 Both the miner (this package's ``cli.main``) and the verifier
 (:func:`pyrxd.glyph.dmint.mine_solution_external` in pyrxd core)
 must agree on what the bytes on the wire look like.
+
+**Progress frames (added after 0.13.0, still protocol=1).** A miner MAY
+write zero or more optional progress lines to **stderr** while it
+searches — one JSON object per line, shape ``{"progress": {"attempts":
+N, "elapsed_s": F}}`` (see :class:`MineProgress`). This needs no
+``protocol`` version bump because it is a pure out-of-band addition:
+
+* stdout still carries exactly one line — the authoritative
+  :class:`MineSuccess` / :class:`MineExhausted` response — completely
+  unchanged. A parent that only ever reads stdout (every pre-existing
+  consumer) sees no difference.
+* An old miner that has never heard of progress frames writes nothing
+  extra to stderr. Silence is valid: the parent simply never sees a
+  progress update, exactly like before this addition existed.
+* A new miner talking to an old parent (one that still discards stderr
+  outright) is equally safe — the frames are written into a stream
+  nobody reads, and are dropped along with everything else that used to
+  go there.
+
+Progress is a **display hint, never a trust boundary**: it lives on a
+channel (stderr) that the result parser (:func:`parse_response`) never
+reads, and :func:`parse_progress_line` never returns anything shaped
+like a solution — it fails soft (returns ``None``) instead of raising,
+because a malformed or adversarial progress line must never abort an
+otherwise-successful grind.
 """
 
 from __future__ import annotations
@@ -35,6 +60,14 @@ MAX_REQUEST_BYTES = 4096
 # Upper-bound stdout response size. The miner writes one short JSON
 # line; anything larger is a bug.
 MAX_RESPONSE_BYTES = 4096
+
+# Upper-bound for one progress-frame LINE on stderr. A real progress frame
+# is well under 200 bytes; anything longer is either not a progress frame
+# or a flood, and consumers are expected to drop it and resynchronize at
+# the next newline rather than growing an unbounded buffer trying to
+# parse it. See mine_solution_external's stderr reader for the consumer
+# side of that discipline.
+MAX_PROGRESS_LINE_BYTES = 4096
 
 
 class ProtocolError(ValueError):
@@ -180,6 +213,97 @@ class MineExhausted:
 
     def to_json(self) -> str:
         return json.dumps({"exhausted": True})
+
+
+@dataclass(frozen=True)
+class MineProgress:
+    """One optional in-flight progress frame. Wire-shape on **stderr**,
+    one JSON object per line — never stdout, and never mixed with
+    :class:`MineSuccess` / :class:`MineExhausted`.
+
+    :param attempts:  Cumulative nonces tried so far (best-effort, same
+                      convention as :attr:`MineSuccess.attempts`).
+    :param elapsed_s: Wall-clock seconds since the miner started searching.
+    """
+
+    attempts: int
+    elapsed_s: float
+
+    def to_json(self) -> str:
+        """Serialise to the one-line JSON shape a progress-aware parent expects.
+
+        Same finite-``elapsed_s`` assertion as :meth:`MineSuccess.to_json`,
+        for the same reason: a buggy miner should fail loudly here rather
+        than have the parent silently drop the frame later.
+        """
+        if not math.isfinite(self.elapsed_s):
+            raise ProtocolError(f"elapsed_s must be finite, got {self.elapsed_s!r}")
+        return json.dumps({"progress": {"attempts": self.attempts, "elapsed_s": self.elapsed_s}})
+
+
+def parse_progress_line(raw: bytes | str) -> MineProgress | None:
+    """Best-effort parse of one stderr line as a progress frame.
+
+    Returns ``None`` — **never raises** — for anything that isn't a
+    well-formed ``{"progress": {"attempts": int, "elapsed_s": float}}``
+    object: an oversize line, non-UTF-8 bytes, non-JSON text, a JSON
+    value that isn't an object, a missing/malformed ``progress`` field,
+    or out-of-range values. This is deliberately the opposite failure
+    mode from :func:`parse_response`: progress is a display hint, not a
+    trust boundary, so a malformed or adversarial line is silently
+    dropped rather than aborting an otherwise-successful grind.
+
+    A miner's debug chatter, blank lines, or anything else written to
+    stderr that isn't this exact shape is invisible to this parser —
+    which is the point: a third-party miner does not have to know about
+    progress frames to remain protocol-compliant, and lines it does
+    write for its own purposes cannot be mistaken for one.
+    """
+    if isinstance(raw, bytes):
+        if len(raw) > MAX_PROGRESS_LINE_BYTES:
+            return None
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    else:
+        if len(raw) > MAX_PROGRESS_LINE_BYTES:
+            return None
+        text = raw
+
+    text = text.strip()
+    if not text:
+        return None
+
+    try:
+        obj: Any = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+
+    progress = obj.get("progress")
+    if not isinstance(progress, dict):
+        return None
+
+    attempts = progress.get("attempts")
+    elapsed_s = progress.get("elapsed_s")
+
+    # Same defenses as parse_response's attempts/elapsed_s checks (bool is
+    # an int subclass; NaN/Inf pass isinstance(_, float)) — mirrored here
+    # rather than shared because a malformed value means "ignore this
+    # frame", not "raise", so the control flow can't be reused directly.
+    if isinstance(attempts, bool) or not isinstance(attempts, int):
+        return None
+    if attempts < 0 or attempts > (1 << 40):
+        return None
+    if isinstance(elapsed_s, bool) or not isinstance(elapsed_s, (int, float)):
+        return None
+    elapsed_s_float = float(elapsed_s)
+    if not math.isfinite(elapsed_s_float) or elapsed_s_float < 0:
+        return None
+
+    return MineProgress(attempts=attempts, elapsed_s=elapsed_s_float)
 
 
 def parse_response(raw: bytes | str) -> MineSuccess | MineExhausted:

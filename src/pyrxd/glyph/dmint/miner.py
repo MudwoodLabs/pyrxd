@@ -25,7 +25,9 @@ Symbols (22):
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -614,13 +616,330 @@ def mine_solution(
 #   stdin  (one JSON line):  {"preimage_hex": "...", "target_hex": "...",
 #                             "nonce_width": 4 | 8}
 #   stdout (one JSON line):  {"nonce_hex": "...", "attempts": N, "elapsed_s": F}
+#   stderr (zero+ JSON lines, OPTIONAL, added after 0.13.0):
+#                             {"progress": {"attempts": N, "elapsed_s": F}}
 #
 # Whatever nonce the external process returns is RE-VERIFIED locally before
 # being returned to the caller. A buggy or malicious miner that returns a
 # wrong nonce raises ValidationError rather than letting pyrxd build a tx
 # the network would reject.
+#
+# Progress frames are read from stderr ONLY when a caller passes
+# ``progress=`` — see mine_solution_external below for why that split
+# exists (it preserves the stderr=DEVNULL memory bound byte-for-byte on
+# the default no-progress path) and _ExternalMinerProgressReader for how
+# the read side stays bounded even against a flooding/malicious miner.
+# This module hand-rolls the wire-shape checks below rather than
+# importing pyrxd.contrib.miner.protocol's MineProgress/parse_progress_line
+# — pyrxd.glyph.dmint deliberately does not depend on pyrxd.contrib (see
+# the _mine_bundled_parallel docstring above); the two must simply agree
+# on the shape, which docs/concepts/parallel-mining.md pins.
 
 EXTERNAL_MINER_TIMEOUT_S = 600.0  # 10 minutes — generous default for slow contracts
+
+# Upper bound for one progress-frame line read from an external miner's
+# stderr. Mirrors pyrxd.contrib.miner.protocol.MAX_PROGRESS_LINE_BYTES — a
+# real progress frame is well under 200 bytes; a longer "line" is either
+# not a progress frame or a flood, and is dropped rather than accumulated.
+_PROGRESS_LINE_MAX_BYTES = 4096
+
+# Chunk size for the background stdout/stderr readers. Independent of
+# _PROGRESS_LINE_MAX_BYTES: this is how much we ask the OS for per read()
+# call, not a content limit.
+_STREAM_READ_CHUNK_BYTES = 4096
+
+# Upper bound on the external miner's final stdout response. Mirrors
+# pyrxd.contrib.miner.protocol.MAX_RESPONSE_BYTES; used on both the
+# progress and no-progress paths (replaces what used to be a bare 4096
+# literal below).
+_EXTERNAL_MINER_MAX_STDOUT_BYTES = 4096
+
+# How often the progress-poll loop checks the subprocess + the deadline,
+# independent of progress_interval_s (which only rate-limits how often the
+# caller's callback actually fires). Matches parallel._PROGRESS_POLL_S's
+# cadence rationale: short enough to feel instant, long enough not to spin.
+_PROGRESS_POLL_INTERVAL_S = 0.1
+
+# Grace periods for cleaning up the external miner subprocess if it is
+# still running when mine_solution_external's progress-poll loop exits
+# (deadline hit, or the caller's progress callback raised). Mirrors
+# pyrxd.contrib.miner.parallel's _WORKER_TERMINATE_GRACE_S /
+# _WORKER_KILL_GRACE_S values without importing them (module-boundary
+# note above): cooperative SIGTERM first, SIGKILL if it's ignored.
+_EXTERNAL_MINER_TERMINATE_GRACE_S = 1.0
+_EXTERNAL_MINER_KILL_GRACE_S = 0.5
+
+
+def _parse_external_progress_frame(line: bytes) -> tuple[int, float] | None:
+    """Best-effort parse of one external-miner stderr line as a progress frame.
+
+    Returns ``None`` — never raises — for anything that isn't exactly
+    ``{"progress": {"attempts": int, "elapsed_s": float}}`` with in-range
+    values. This is a display hint, not a trust boundary: a malformed or
+    adversarial line must never abort an otherwise-successful grind, and
+    (structurally, by the return type) it can never carry anything
+    nonce-shaped — the only thing that can come out of this function is a
+    ``(int, float)`` pair, which :func:`mine_solution_external` feeds
+    straight to the caller's ``progress`` callback and nowhere near the
+    result-verification path below.
+
+    Mirrors ``pyrxd.contrib.miner.protocol.parse_progress_line`` without
+    importing it — see the module-boundary note above.
+    """
+    try:
+        obj: Any = json.loads(line.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    progress = obj.get("progress")
+    if not isinstance(progress, dict):
+        return None
+    attempts = progress.get("attempts")
+    elapsed_s = progress.get("elapsed_s")
+    if isinstance(attempts, bool) or not isinstance(attempts, int):
+        return None
+    if attempts < 0 or attempts > (1 << 40):
+        return None
+    if isinstance(elapsed_s, bool) or not isinstance(elapsed_s, (int, float)):
+        return None
+    elapsed_s_float = float(elapsed_s)
+    if not math.isfinite(elapsed_s_float) or elapsed_s_float < 0:
+        return None
+    return attempts, elapsed_s_float
+
+
+class _ExternalMinerProgressReader:
+    """Background thread that drains an external miner's stderr, bounded.
+
+    This is the direct replacement for ``stderr=subprocess.DEVNULL`` on
+    the progress-enabled path: DEVNULL discarded the stream outright to
+    keep memory flat against a misbehaving miner; this reads it, but
+    preserves the same flat-memory guarantee by construction:
+
+    * Only the SINGLE most-recently-parsed frame is ever retained. A
+      flood of a million frames costs this thread CPU (parsing JSON
+      once per line), never growing memory — each new frame simply
+      overwrites the last, so the retained state is O(1) regardless of
+      how long or how fast the miner writes.
+    * One physical "line" is capped at ``_PROGRESS_LINE_MAX_BYTES``. A
+      miner that never writes ``\\n`` (or writes one absurdly long line)
+      cannot grow the internal buffer past a few KB: once the
+      accumulated bytes since the last newline exceed the cap, they are
+      dropped and the reader resynchronizes at the next ``\\n`` it sees.
+
+    Runs until stderr hits EOF (the subprocess exited and closed the
+    pipe) or the stream errors out. Daemon thread — never blocks
+    interpreter/process exit even if somehow still reading.
+    """
+
+    def __init__(self, stream: Any) -> None:
+        self._stream = stream
+        self._lock = threading.Lock()
+        self._latest: tuple[int, float] | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def latest(self) -> tuple[int, float] | None:
+        with self._lock:
+            return self._latest
+
+    def join(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout)
+
+    def _run(self) -> None:
+        buf = bytearray()
+        skipping = False  # discarding an oversize line until the next \n
+        try:
+            while True:
+                # read1(), NOT read(): a plain BufferedReader.read(n) blocks
+                # until `n` bytes are available OR EOF — for a miner that
+                # writes one small line every fraction of a second, that
+                # means nothing is ever delivered until the pipe finally
+                # hits EOF at process exit, and every frame but the last
+                # arrives in one lump too late to be "live" at all.
+                # read1(n) returns as soon as ANY data is available (at
+                # most one underlying read syscall's worth), which is what
+                # "stream" progress actually requires.
+                chunk = self._stream.read1(_STREAM_READ_CHUNK_BYTES)
+                if not chunk:
+                    return  # EOF: subprocess exited and closed stderr
+                buf.extend(chunk)
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl == -1:
+                        break
+                    line = bytes(buf[:nl])
+                    del buf[: nl + 1]
+                    if skipping:
+                        skipping = False  # this newline resynchronizes us
+                        continue
+                    frame = _parse_external_progress_frame(line)
+                    if frame is not None:
+                        with self._lock:
+                            self._latest = frame
+                if not skipping and len(buf) > _PROGRESS_LINE_MAX_BYTES:
+                    buf.clear()
+                    skipping = True
+        except (ValueError, OSError):
+            return  # stream closed out from under us — nothing left to read
+
+
+class _BoundedStreamAccumulator:
+    """Background thread that drains a stream into a byte cap, no more.
+
+    Used for the external miner's stdout when progress streaming is
+    active. Once ``subprocess.run`` stops being used (its ``communicate``
+    drains stdout and stderr concurrently for free, avoiding a full-pipe
+    deadlock), something has to keep draining stdout while the
+    progress-poll loop waits — otherwise a miner whose single response
+    line somehow exceeded the OS pipe buffer would block on ``write()``
+    forever, with nothing reading. Bytes past ``cap`` are discarded (the
+    accumulated buffer never exceeds ``cap + 1``) rather than grown
+    without bound — long enough to preserve the exact "too many bytes"
+    diagnostic the no-progress path already raises, without unbounded
+    memory.
+    """
+
+    def __init__(self, stream: Any, cap: int) -> None:
+        self._stream = stream
+        self._cap = cap
+        self._buf = bytearray()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def join(self, timeout: float | None = None) -> None:
+        self._thread.join(timeout)
+
+    def result(self) -> bytes:
+        return bytes(self._buf)
+
+    def _run(self) -> None:
+        try:
+            while True:
+                # read1(), not read() — see _ExternalMinerProgressReader's
+                # _run for why: draining stdout concurrently only prevents
+                # the pipe-backpressure deadlock this class exists for if
+                # each call returns as soon as data is available, not once
+                # a full chunk has accumulated (which could mean "never,
+                # until the process exits" for a short response).
+                chunk = self._stream.read1(_STREAM_READ_CHUNK_BYTES)
+                if not chunk:
+                    return
+                room = self._cap + 1 - len(self._buf)
+                if room > 0:
+                    self._buf.extend(chunk[:room])
+                # Anything beyond `cap + 1` bytes is drained and discarded
+                # (not appended) — we already know at that point the
+                # response is oversized; we just keep pulling from the
+                # pipe so the child's write() never blocks on us.
+        except (ValueError, OSError):
+            return
+
+
+def _run_external_miner_with_progress(
+    miner_argv: list[str],
+    request_bytes: bytes,
+    *,
+    timeout_s: float,
+    progress: ProgressCallback,
+    progress_interval_s: float,
+    started: float,
+) -> tuple[int, bytes]:
+    """Popen-based invocation used only when the caller wants live progress.
+
+    The no-progress path in :func:`mine_solution_external` keeps using
+    plain ``subprocess.run(..., stderr=subprocess.DEVNULL)`` completely
+    unchanged — this function exists purely so that opting into progress
+    doesn't change behavior for anyone who doesn't.
+
+    Drains stdout (:class:`_BoundedStreamAccumulator`) and stderr
+    (:class:`_ExternalMinerProgressReader`) concurrently in background
+    threads while polling the subprocess and the deadline from this
+    (the caller's) thread — the same deadlock-avoidance
+    ``subprocess.run``'s ``communicate()`` gives you internally, done by
+    hand because we need to act on stderr *while the process is still
+    running* rather than only after it exits.
+
+    stdout remains the sole authoritative result channel, byte-for-byte
+    the same contract as before (one line, ``_EXTERNAL_MINER_MAX_STDOUT_BYTES``
+    cap). stderr progress frames are parsed by
+    :func:`_parse_external_progress_frame`, which can only ever produce an
+    ``(int, float)`` pair — there is no code path from a stderr line to
+    the nonce/result parsing below, so a progress frame (even an
+    adversarial one shaped like a solution) is structurally incapable of
+    being mistaken for one.
+
+    :raises subprocess.TimeoutExpired: ``timeout_s`` elapsed before the
+        subprocess exited. Caught by :func:`mine_solution_external`
+        exactly like the ``subprocess.run`` timeout it replaces.
+    """
+    import subprocess  # nosec B404 — see mine_solution_external's docstring
+
+    proc = subprocess.Popen(  # noqa: S603 # nosec B603 — miner_argv is caller-supplied by design
+        miner_argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    stdout_reader = _BoundedStreamAccumulator(proc.stdout, _EXTERNAL_MINER_MAX_STDOUT_BYTES)
+    stderr_reader = _ExternalMinerProgressReader(proc.stderr)
+    stdout_reader.start()
+    stderr_reader.start()
+    returncode: int | None = None
+    try:
+        try:
+            proc.stdin.write(request_bytes)
+            proc.stdin.close()
+        except (BrokenPipeError, OSError):
+            # Miner exited/closed stdin early (e.g. a usage error) — not
+            # our problem to diagnose here; its stdout/exit code below
+            # will carry whatever it wanted to say.
+            pass
+
+        deadline = started + timeout_s
+        next_emit = time.monotonic()
+        while True:
+            returncode = proc.poll()
+            if returncode is not None:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                raise subprocess.TimeoutExpired(miner_argv, timeout_s)
+            if now >= next_emit:
+                next_emit = now + progress_interval_s
+                frame = stderr_reader.latest()
+                if frame is not None:
+                    progress(frame[0], frame[1])
+            time.sleep(max(0.0, min(_PROGRESS_POLL_INTERVAL_S, deadline - now)))
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=_EXTERNAL_MINER_TERMINATE_GRACE_S)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=_EXTERNAL_MINER_KILL_GRACE_S)
+        stdout_reader.join(timeout=1.0)
+        stderr_reader.join(timeout=1.0)
+        if proc.stdin is not None and not proc.stdin.closed:
+            proc.stdin.close()
+        proc.stdout.close()
+        proc.stderr.close()
+
+    if returncode is None:
+        # Unreachable: the while-loop above only exits via `break` (which only
+        # runs once `returncode` has been assigned a non-None `proc.poll()`
+        # result) or by raising TimeoutExpired. Not a bare `assert` — bandit
+        # (B101) flags those, and asserts also vanish under `-O`.
+        raise AssertionError(
+            "unreachable: mine_solution_external's poll loop exited without a returncode"
+        )  # pragma: no cover
+    return returncode, stdout_reader.result()
 
 
 def mine_solution_external(
@@ -630,6 +949,8 @@ def mine_solution_external(
     miner_argv: list[str],
     nonce_width: Literal[4, 8] = 4,
     timeout_s: float = EXTERNAL_MINER_TIMEOUT_S,
+    progress: ProgressCallback | None = None,
+    progress_interval_s: float = DEFAULT_PROGRESS_INTERVAL_S,
 ) -> DmintMineResult:
     """Delegate nonce search to an external miner via JSON-over-subprocess.
 
@@ -648,6 +969,11 @@ def mine_solution_external(
        (exit 2, added in 0.5.1): ``{"exhausted": true}`` (pyrxd then raises
        :class:`MaxAttemptsError` immediately rather than waiting for the parent
        timeout to fire).
+    4. OPTIONALLY (added after 0.13.0) write zero or more progress lines to
+       **stderr** while it searches: ``{"progress": {"attempts": N,
+       "elapsed_s": F}}``, one JSON object per line. Purely additive — a
+       miner that has never heard of this writes nothing extra, and
+       nothing here changes for it.
 
     A bundled reference implementation ships at :mod:`pyrxd.contrib.miner`
     (added in 0.5.1) — see :doc:`/concepts/parallel-mining` for the full
@@ -685,13 +1011,35 @@ def mine_solution_external(
     :param nonce_width:  4 for V1, 8 for V2.
     :param timeout_s:    Hard timeout. The subprocess is killed and
                          :class:`MaxAttemptsError` raised on expiry.
+    :param progress:     Optional ``callback(attempts, elapsed_s)``. When
+                         ``None`` (the default), behavior is byte-for-byte
+                         identical to before this parameter existed: a
+                         single blocking ``subprocess.run`` call with
+                         stderr fully discarded (``subprocess.DEVNULL``),
+                         same as pyrxd <= 0.13.0. Passing a callback opts
+                         into a streaming invocation that reads (rather
+                         than discards) stderr, parses any progress frames
+                         the miner chooses to emit, and calls ``progress``
+                         with the most recently observed one roughly every
+                         ``progress_interval_s`` — the same cadence
+                         contract :func:`mine_solution` documents. An
+                         external miner that never emits a progress frame
+                         (the common case today) simply means ``progress``
+                         is never called; the grind still runs to
+                         completion or timeout exactly as it would with
+                         ``progress=None``. A raising callback propagates
+                         and the subprocess is terminated — the supported
+                         way to impose a deadline, mirroring
+                         :func:`mine_solution` and
+                         ``pyrxd.contrib.miner.parallel.mine``.
+    :param progress_interval_s: Minimum seconds between ``progress`` calls.
+                         Ignored when ``progress`` is ``None``.
     :raises ValidationError:   The miner returned a malformed JSON response,
                                a nonce of wrong width, or a nonce that fails
                                local verification.
     :raises MaxAttemptsError:  The miner exceeded ``timeout_s``.
     :raises FileNotFoundError: ``miner_argv[0]`` is not on PATH.
     """
-    import json
     import subprocess  # nosec B404 — used to invoke a caller-supplied external miner; see docstring supply-chain warning
 
     if len(preimage) != 64:
@@ -702,6 +1050,8 @@ def mine_solution_external(
         raise ValidationError(f"nonce_width must be 4 or 8, got {nonce_width}")
     if not miner_argv:
         raise ValidationError("miner_argv must not be empty")
+    if progress_interval_s <= 0:
+        raise ValidationError(f"progress_interval_s must be positive, got {progress_interval_s}")
 
     request = json.dumps(
         {
@@ -713,25 +1063,45 @@ def mine_solution_external(
 
     started = time.monotonic()
     try:
-        # miner_argv is caller-controlled by design (this is a plug-in
-        # protocol for external miners); the contract is "you tell pyrxd
-        # which binary to invoke." Local re-verification of the returned
-        # nonce below is the load-bearing safety check, not subprocess
-        # argv sanitization.
-        #
-        # stderr is discarded rather than captured: a misbehaving miner
-        # writing gigabytes to stderr would otherwise OOM the parent before
-        # the timeout fires. Loss of debug info is an acceptable trade for
-        # the bounded-memory guarantee. The subprocess's stdin/stdout
-        # protocol is the only contract; stderr is implementation chatter.
-        completed = subprocess.run(  # noqa: S603 # nosec B603 — see comment + docstring supply-chain warning
-            miner_argv,
-            input=request.encode("utf-8"),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout_s,
-            check=False,
-        )
+        if progress is None:
+            # miner_argv is caller-controlled by design (this is a plug-in
+            # protocol for external miners); the contract is "you tell
+            # pyrxd which binary to invoke." Local re-verification of the
+            # returned nonce below is the load-bearing safety check, not
+            # subprocess argv sanitization.
+            #
+            # stderr is discarded rather than captured: a misbehaving miner
+            # writing gigabytes to stderr would otherwise OOM the parent
+            # before the timeout fires. Loss of debug info is an acceptable
+            # trade for the bounded-memory guarantee. The subprocess's
+            # stdin/stdout protocol is the only contract; stderr is
+            # implementation chatter. This is the ONLY code path when the
+            # caller doesn't ask for progress — unchanged from pyrxd
+            # <= 0.13.0, byte for byte.
+            completed = subprocess.run(  # noqa: S603 # nosec B603 — see comment + docstring supply-chain warning
+                miner_argv,
+                input=request.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=timeout_s,
+                check=False,
+            )
+            returncode = completed.returncode
+            stdout_bytes = completed.stdout or b""
+        else:
+            # Opted into progress: stderr is now READ instead of discarded.
+            # _run_external_miner_with_progress preserves the same bounded-
+            # memory guarantee stderr=DEVNULL gave (see its docstring and
+            # _ExternalMinerProgressReader) — nothing here can grow without
+            # bound just because we stopped throwing the stream away.
+            returncode, stdout_bytes = _run_external_miner_with_progress(
+                miner_argv,
+                request.encode("utf-8"),
+                timeout_s=timeout_s,
+                progress=progress,
+                progress_interval_s=progress_interval_s,
+                started=started,
+            )
     except subprocess.TimeoutExpired as exc:
         elapsed = time.monotonic() - started
         raise MaxAttemptsError(
@@ -743,10 +1113,17 @@ def mine_solution_external(
     # Decode stdout. A miner returning malformed UTF-8 is a malformed
     # response, not an exception that should escape.
     try:
-        stdout = (completed.stdout or b"").decode("utf-8")
+        stdout = stdout_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValidationError(f"external miner {miner_argv[0]!r} returned non-UTF-8 stdout") from exc
-    if len(stdout) > 4096:
+    # Checked on the DECODED string, matching pyrxd <= 0.13.0 exactly (not
+    # on stdout_bytes — that would make a response containing multi-byte
+    # UTF-8 characters trip the cap at a different threshold than before,
+    # which would break the "byte-for-byte identical on the no-progress
+    # path" promise above). The progress path's actual memory bound comes
+    # from _BoundedStreamAccumulator's raw-byte cap, independent of this
+    # check.
+    if len(stdout) > _EXTERNAL_MINER_MAX_STDOUT_BYTES:
         raise ValidationError(f"external miner produced {len(stdout)} bytes of stdout; expected one short JSON line")
 
     # Protocol-level exhaustion signal (added 0.5.1): a miner that
@@ -755,7 +1132,14 @@ def mine_solution_external(
     # immediately so callers don't have to wait for the parent timeout.
     # Older miners that don't know this convention fall through to the
     # generic rc != 0 path below (or are SIGKILLed by the parent timeout).
-    if completed.returncode == 2 and stdout.strip():
+    # A miner that dies immediately (crash, missing dependency, etc.) exits
+    # non-zero with a code other than this exact (2, {"exhausted": true})
+    # combination, so it falls to the `returncode != 0` branch below and is
+    # reported as a failure — never as a false "swept the whole nonce
+    # space" claim that would send a caller off to reroll and grind again
+    # for nothing (the equivalent of the parallel-miner immediate-death bug
+    # _assert_workers_completed guards against).
+    if returncode == 2 and stdout.strip():
         try:
             maybe_exhausted = json.loads(stdout)
         except json.JSONDecodeError:
@@ -768,8 +1152,8 @@ def mine_solution_external(
                 elapsed_s=elapsed,
             )
 
-    if completed.returncode != 0:
-        raise ValidationError(f"external miner {miner_argv[0]!r} exited with code {completed.returncode}")
+    if returncode != 0:
+        raise ValidationError(f"external miner {miner_argv[0]!r} exited with code {returncode}")
 
     try:
         response = json.loads(stdout)
@@ -886,12 +1270,15 @@ def mine_solution_dispatch(
                          caps via ``timeout_s`` instead).
     :param timeout_s:    Subprocess timeout on the external-miner path.
                          Ignored in-process (use ``max_attempts`` there).
-    :param progress:     Live-progress hook, in-process path only. The
-                         external-miner wire protocol carries no progress
-                         frames and is **not** being extended here, so an
-                         external miner reports nothing until it finishes —
-                         streaming progress from a third-party binary is a
-                         follow-up that needs a protocol change.
+    :param progress:     Live-progress hook. On the in-process path this
+                         is :func:`mine_solution`'s own callback. On the
+                         external-miner path it is passed to
+                         :func:`mine_solution_external`, which streams a
+                         miner's optional stderr progress frames if it
+                         emits any (added after 0.13.0) — an external
+                         miner that doesn't know about progress frames
+                         simply never triggers the callback, same as
+                         ``progress=None``.
     :param progress_interval_s: Minimum seconds between ``progress`` calls.
 
     :returns: :class:`DmintMineResult` with the verified nonce.
@@ -918,6 +1305,8 @@ def mine_solution_dispatch(
         miner_argv=miner_argv,
         nonce_width=nonce_width,
         timeout_s=timeout_s,
+        progress=progress,
+        progress_interval_s=progress_interval_s,
     )
 
 

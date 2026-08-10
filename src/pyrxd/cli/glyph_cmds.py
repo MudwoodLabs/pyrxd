@@ -2076,10 +2076,16 @@ def _resolve_miner_choice(miner_cmd: str | None) -> tuple[str, list[str] | None]
       reference miner. Retained because it is the only miner with no
       multiprocessing at all.
     * anything else -> ``("external", shlex.split(...))``: a user-supplied
-      binary over the JSON-over-stdio protocol. No live progress — the wire
-      protocol carries no progress frames and is not being extended here.
+      binary over the JSON-over-stdio protocol. Live progress here depends
+      on the miner: the protocol carries OPTIONAL progress frames on
+      stderr (added after 0.13.0 — see ``docs/concepts/parallel-mining.md``),
+      so an updated third-party miner streams the same way the in-process
+      paths do; an older one that has never heard of progress frames just
+      stays silent until it finishes, which still works exactly as before.
       ``--miner-cmd "python -m pyrxd.contrib.miner"`` still reaches the
-      bundled miner over that protocol if subprocess isolation is wanted.
+      bundled miner over that protocol if subprocess isolation is wanted
+      (and now streams progress too — it's the reference implementation
+      of the extension).
 
     Before this, ``None`` meant "spawn the bundled miner as a subprocess". The
     reason for that default was nonce-space coverage (the sequential miner's
@@ -2385,9 +2391,10 @@ def claim_dmint_cmd(
         n_workers = workers or 1
     if miner_kind == "external" and progress:
         click.echo(
-            "note: no live progress for an external --miner-cmd — the JSON-over-stdio protocol "
-            "carries no progress frames, and extending it is a follow-up. Run "
-            "'pyrxd glyph dmint-estimate' for the up-front numbers.",
+            "note: live progress for an external --miner-cmd depends on the miner emitting "
+            "the optional stderr progress frames (see docs/concepts/parallel-mining.md); an "
+            "older miner that doesn't know about them just stays silent until it finishes, which "
+            "still works. Run 'pyrxd glyph dmint-estimate' for the up-front numbers either way.",
             err=True,
         )
 
@@ -2409,6 +2416,9 @@ def claim_dmint_cmd(
                     workers=n_workers,
                     progress=reporter,
                 )
+            # sequential -> mine_solution's in-process progress hook;
+            # external -> mine_solution_external's stderr progress-frame
+            # stream (silent no-op if the miner never emits one).
             return mine_solution_dispatch(
                 preimage=preimage,
                 target=target,
@@ -2416,7 +2426,7 @@ def claim_dmint_cmd(
                 miner_argv=miner_argv,
                 max_attempts=max_attempts if max_attempts is not None else DEFAULT_MAX_ATTEMPTS,
                 timeout_s=timeout_s,
-                progress=reporter if miner_kind == "sequential" else None,
+                progress=reporter,
             ).nonce
         except MiningDeadline as exc:
             # Same signal an external miner's timeout raises, so the V1 reroll

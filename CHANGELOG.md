@@ -240,6 +240,39 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the observed pin so a rotation is a one-line config edit. A malformed pin is rejected at
   construction — a pin that silently fails to parse is a pin that silently does nothing.
 
+- **External-miner progress frames (B3).** The dMint ETA work (#361) streamed live hashrate/ETA
+  during a claim grind, but only for the bundled miner running in-process — a genuine external
+  `--miner-cmd` binary got a static "no live progress" message, because the JSON-over-stdio
+  protocol had no way to report progress. `mine_solution_external` now accepts a `progress=`
+  callback: the miner MAY write zero or more optional lines to **stderr** while it searches
+  (`{"progress": {"attempts": N, "elapsed_s": F}}`, one JSON object per line — see
+  `docs/concepts/parallel-mining.md`). This needed no `protocol` version bump; it's purely
+  additive on both sides — an old miner that has never heard of progress frames simply stays
+  silent, and an old caller that never asks for progress is byte-for-byte unaffected (the
+  no-progress path still uses the original single blocking `subprocess.run(...,
+  stderr=subprocess.DEVNULL)` call, unchanged).
+
+  Two things this had to get right, both load-bearing:
+
+  - **The `stderr=DEVNULL` memory bound had to survive reading the stream instead of discarding
+    it.** Opting into progress switches to a `Popen`-based reader
+    (`_ExternalMinerProgressReader`) that retains only the single most-recently-parsed frame —
+    a flood of a million lines costs CPU parsing JSON, never growing memory, because each new
+    frame overwrites the last — and caps one unterminated "line" at 4096 bytes, dropping and
+    resynchronizing at the next newline rather than accumulating an unbounded buffer against a
+    miner that never emits `\n`.
+  - **A progress frame can never be mistaken for a solution.** It lives on stderr, a stream the
+    result parser never reads at all, and its parser (`_parse_external_progress_frame`) can only
+    ever return an `(attempts, elapsed_s)` pair — there is no code path from a stderr line,
+    however solution-shaped, to the nonce-verification logic.
+
+  The bundled reference miner (`pyrxd.contrib.miner`) now emits these frames by default
+  (`--quiet` suppresses them, same as the exhaustion message), demonstrating the extension
+  end-to-end. Also confirmed while here: an external miner that exits immediately is reported
+  as a failure (`ValidationError`), never as nonce-space exhaustion — the external-path
+  equivalent of the parallel-miner immediate-death bug `_assert_workers_completed` guards
+  against was already absent, and now has a regression test pinning it.
+
 ### Fixed
 
 - **`glyph transfer-ft` could send the wrong number of FT units — up to the sender's entire
