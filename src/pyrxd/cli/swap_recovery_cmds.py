@@ -393,6 +393,7 @@ async def _prepare(
     fee_wif: str,
     fee_utxo: str | None,
     policy: DeadlineFeePolicy,
+    kind: str,
 ) -> tuple[Any, Any, Any]:
     """Read the covenant + fee UTXOs, rebuild the covenant, and pick a fee input.
 
@@ -415,13 +416,24 @@ async def _prepare(
         assert_covenant_matches(covenant, facts.rxd_covenant_spk)
 
         utxos = await read_fee_utxos(client, fee_wif)
-    # Size the floor/target against a REPRESENTATIVE spend size before the tx exists.
-    # 300 bytes is above both built shapes measured on this tree (claim 266 / refund 234),
-    # so the pre-selection bar errs high; the exact requirement is re-measured against
-    # len(tx.serialize()) once the transaction is assembled.
-    floor = policy.min_relay_fee(300)
-    blocks_left = max(0, facts.t_rxd_blocks - chain.confirmations)
-    target = policy.required_fee(300, blocks_to_deadline=blocks_left)
+    # Selecting a fee input needs a size, but the size is only knowable once the transaction
+    # is built and signed — and it is built FROM the input. So the bar is set against an
+    # over-estimate and the exact requirement is re-measured against len(tx.serialize())
+    # afterwards; over-estimating only picks a marginally larger input, which is the safe
+    # direction, while under-estimating would select an input the builder then rejects.
+    #
+    # 300 bytes covers the RXD shapes measured on this tree (claim 267 / refund 234). The
+    # only part that varies by asset variant is the single output's holder script (RXD 25
+    # bytes, NFT 63, FT 75), so adding its real length keeps the estimate above every
+    # variant rather than only the one that happened to be measured.
+    holder = covenant.taker_holder_script if kind == "claim" else covenant.maker_holder_script
+    size_estimate = 300 + len(holder)
+    floor = policy.min_relay_fee(size_estimate)
+    # The urgency premium applies to the CLAIM only: a CSV refund has no closing window
+    # (see build_cold_refund), so targeting a premium for it would select a needlessly
+    # large input and burn the difference as fee.
+    blocks_left = max(0, facts.t_rxd_blocks - chain.confirmations) if kind == "claim" else None
+    target = policy.required_fee(size_estimate, blocks_to_deadline=blocks_left)
     chosen = select_fee_utxo(utxos, floor=floor, target=target, explicit=fee_utxo)
     return covenant, chain, chosen
 
@@ -609,6 +621,7 @@ def swap_build_claim_cmd(
                 fee_wif=wif,
                 fee_utxo=fee_utxo,
                 policy=policy,
+                kind="claim",
             )
         )
         spend = build_cold_claim(covenant=covenant, chain=chain, preimage=p, fee_wif=wif, fee_utxo=utxo, policy=policy)
@@ -671,6 +684,7 @@ def swap_build_refund_cmd(
                 fee_wif=wif,
                 fee_utxo=fee_utxo,
                 policy=policy,
+                kind="refund",
             )
         )
         spend = build_cold_refund(

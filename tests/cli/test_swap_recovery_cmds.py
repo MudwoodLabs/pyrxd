@@ -420,6 +420,42 @@ def test_build_refund_at_maturity_pays_the_maker(swap) -> None:
     assert payload["outputs"][0]["scriptpubkey_hex"] == swap["cov"].maker_holder_script.hex()
 
 
+def _two_utxo_client(swap, *, confirmations: int):
+    return _NoBroadcastClient(
+        {
+            swap["cov_sh"]: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=100)],
+            swap["fee_sh"]: [
+                UtxoRecord(tx_hash="11" * 32, tx_pos=0, value=4_000_000, height=90),
+                UtxoRecord(tx_hash="22" * 32, tx_pos=0, value=9_000_000, height=90),
+            ],
+        },
+        tip=100 + confirmations - 1,
+    )
+
+
+def _chosen_fee(res) -> int:
+    return json.loads(res.output)["fee_photons"]
+
+
+def test_fee_selection_buys_urgency_only_where_urgency_exists(swap) -> None:
+    """The whole fee input is burned, so over-selecting is money spent, not headroom kept.
+
+    A claim near its deadline should reach for the larger input; the same claim far from
+    the deadline, and a refund at ANY depth (a CSV refund has no closing window), should
+    take the smaller one.
+    """
+    far = _build(
+        swap, "build-claim", "--preimage", P.hex(), client=_two_utxo_client(swap, confirmations=5), output_mode="json"
+    )
+    near = _build(
+        swap, "build-claim", "--preimage", P.hex(), client=_two_utxo_client(swap, confirmations=18), output_mode="json"
+    )
+    refund = _build(swap, "build-refund", client=_two_utxo_client(swap, confirmations=25), output_mode="json")
+    assert _chosen_fee(far) == 4_000_000
+    assert _chosen_fee(near) == 9_000_000
+    assert _chosen_fee(refund) == 4_000_000
+
+
 def test_neither_builder_ever_calls_broadcast(swap) -> None:
     # _NoBroadcastClient.broadcast raises AssertionError; a clean exit proves it was
     # never reached on either path.
