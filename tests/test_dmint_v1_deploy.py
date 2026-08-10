@@ -824,19 +824,124 @@ class TestDmintV1DeployResult:
             assert state.max_height == 100
             assert state.reward == 1_000
 
-    def test_build_reveal_outputs_with_premine_rejected(self):
-        """Premine is deferred work — must raise NotImplementedError."""
-        from pyrxd.glyph.builder import GlyphBuilder
+    def test_build_reveal_outputs_emits_premine_ft_output(self):
+        """A premine adds exactly one 75-byte FT output bound to tokenRef.
 
-        # premine is rejected at prepare_dmint_deploy time (ValidationError),
-        # but if a caller constructs DmintV1DeployResult directly with
-        # premine_amount set, build_reveal_outputs must still refuse.
-        params = self._params(num=1)
-        result = GlyphBuilder().prepare_dmint_deploy(params)
-        # Manually patch in a premine to exercise the guard.
-        object.__setattr__(result, "premine_amount", 100_000)
-        with pytest.raises(NotImplementedError, match="premine"):
-            result.build_reveal_outputs("00" * 32)
+        The contract outputs are untouched — the premine must not perturb the
+        1-photon singleton carriers the V1 covenant hardcodes.
+        """
+        from pyrxd.glyph.builder import GlyphBuilder
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20
+
+        commit_txid = "ab" * 32
+        no_premine = GlyphBuilder().prepare_dmint_deploy(self._params(num=2)).build_reveal_outputs(commit_txid)
+        with_premine = (
+            GlyphBuilder().prepare_dmint_deploy(self._params(num=2, premine=100_000)).build_reveal_outputs(commit_txid)
+        )
+
+        assert with_premine.contract_scripts == no_premine.contract_scripts
+        assert with_premine.contract_value == 1
+        assert with_premine.premine_amount == 100_000
+        assert with_premine.premine_script == build_ft_locking_script(
+            Hex20(bytes(20)), GlyphRef(txid=commit_txid, vout=0)
+        )
+
+    def test_premine_script_matches_the_mint_reward_ft_script(self):
+        """The premined units must be fungible with mined units.
+
+        Both are FT locks on the same ``tokenRef``; ``build_dmint_v1_ft_output_script``
+        is the one a mint pays out. If these two ever diverged, the premine would
+        live under a different code-script hash and the covenant's FT conservation
+        sum would not see it as the same token.
+        """
+        from pyrxd.glyph.builder import GlyphBuilder
+        from pyrxd.glyph.dmint import build_dmint_v1_ft_output_script
+        from pyrxd.glyph.types import GlyphRef
+
+        commit_txid = "ab" * 32
+        rev = GlyphBuilder().prepare_dmint_deploy(self._params(num=1, premine=42)).build_reveal_outputs(commit_txid)
+        assert rev.premine_script == build_dmint_v1_ft_output_script(bytes(20), GlyphRef(txid=commit_txid, vout=0))
+
+    def test_premine_goes_to_premine_pkh_when_given(self):
+        from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
+        from pyrxd.security.types import Hex20
+
+        treasury = Hex20(b"\x77" * 20)
+        params = DmintV1DeployParams(
+            metadata=GlyphMetadata(protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT], name="V1", ticker="V1T"),
+            owner_pkh=Hex20(bytes(20)),
+            num_contracts=1,
+            max_height=100,
+            reward_photons=1_000,
+            difficulty=10,
+            premine_amount=500,
+            premine_pkh=treasury,
+        )
+        rev = GlyphBuilder().prepare_dmint_deploy(params).build_reveal_outputs("ab" * 32)
+        assert rev.premine_script == build_ft_locking_script(treasury, GlyphRef(txid="ab" * 32, vout=0))
+
+    def test_premine_pkh_without_amount_rejected(self):
+        """Silently dropping a premine because the amount was omitted is the
+        kind of bug that only shows up as a missing treasury after mainnet."""
+        from pyrxd.glyph.builder import DmintV1DeployParams
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+        from pyrxd.security.types import Hex20
+
+        with pytest.raises(ValidationError, match="premine_pkh"):
+            DmintV1DeployParams(
+                metadata=GlyphMetadata(protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT], name="V1", ticker="V1T"),
+                owner_pkh=Hex20(bytes(20)),
+                num_contracts=1,
+                max_height=100,
+                reward_photons=1_000,
+                difficulty=10,
+                premine_pkh=Hex20(b"\x77" * 20),
+            )
+
+    @pytest.mark.parametrize("bad", [0, -1, 21_000_000_000 * 100_000_000 + 1])
+    def test_premine_amount_bounds(self, bad):
+        with pytest.raises(ValidationError, match="premine_amount"):
+            self._params(premine=bad)
+
+    def test_v1_metadata_premine_must_match_emitted_premine(self):
+        """The declared-vs-emitted premine check is not V2-only.
+
+        ``dmint_params`` normally forces ``v=2``, but ``GlyphMetadata`` can be
+        constructed directly with a dMint payload and no ``v`` — which is a valid
+        V1 body. That path must not slip past the supply cross-check.
+        """
+        from pyrxd.glyph.builder import DmintV1DeployParams, GlyphBuilder
+        from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+        from pyrxd.security.types import Hex20
+
+        meta = GlyphMetadata(
+            protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT],
+            name="V1",
+            ticker="V1T",
+            dmint_params=DmintCborPayload(
+                algo=DmintAlgo.SHA256D, num_contracts=1, max_height=100, reward=1_000, premine=500, diff=1
+            ),
+        )
+
+        def _p(premine):
+            return DmintV1DeployParams(
+                metadata=meta,
+                owner_pkh=Hex20(bytes(20)),
+                num_contracts=1,
+                max_height=100,
+                reward_photons=1_000,
+                difficulty=10,
+                premine_amount=premine,
+            )
+
+        with pytest.raises(ValidationError, match="dmint.premine"):
+            GlyphBuilder().prepare_dmint_deploy(_p(None))
+        assert GlyphBuilder().prepare_dmint_deploy(_p(500)).premine_amount == 500
 
     def test_op_return_msg_emitted_when_set(self):
         from pyrxd.glyph.builder import GlyphBuilder
@@ -854,13 +959,13 @@ class TestDmintV1DeployResult:
         reveal = result.build_reveal_outputs("00" * 32)
         assert reveal.op_return_script is None
 
-    def test_premine_in_params_rejected_at_prepare_time(self):
-        """Setting ``premine_amount`` in params is deferred work — caller
-        sees the deferral immediately, not three method calls later."""
+    def test_premine_echoed_from_params_through_prepare(self):
         from pyrxd.glyph.builder import GlyphBuilder
 
-        with pytest.raises(ValidationError, match="premine"):
-            GlyphBuilder().prepare_dmint_deploy(self._params(premine=1_000))
+        result = GlyphBuilder().prepare_dmint_deploy(self._params(premine=1_000))
+        assert result.premine_amount == 1_000
+        # The premine must not change the contract set the deploy genesises.
+        assert len(result.placeholder_contract_scripts) == 2
 
 
 class TestDeprecationAliases:

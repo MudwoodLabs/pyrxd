@@ -3,9 +3,13 @@
 **Who this page is for:** anyone who wants to launch a **permissionless,
 PoW-mined fungible token** on Radiant and mine the first claim from it —
 end to end, from the command line, on **testnet** (no real value at risk).
-A dMint token has no premine and no central issuer: you deploy a contract
-that pays a fixed FT reward to whoever finds a valid proof-of-work nonce,
-and anyone (including you) mines claims from it until it's exhausted.
+A dMint token has no central issuer: you deploy a contract that pays a fixed
+FT reward to whoever finds a valid proof-of-work nonce, and anyone (including
+you) mines claims from it until it's exhausted. This guide deploys with **no
+premine** — every unit has to be mined. If you want an allocation issued
+alongside the mineable supply, `--premine <photons>` adds one, and
+`--premine-to <address>` chooses who gets it; see
+[Premine](../concepts/dmint-v1-deploy.md#premine).
 
 This is the issuance counterpart to
 [Mint from a V1 dMint contract](../tutorials/mint-from-a-dmint-contract.md)

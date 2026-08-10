@@ -23,6 +23,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reveal-txid confusion (0.12.0) and the `MAX_SHA256D_TARGET / target`
   difficulty-multiplier-vs-expected-attempts trap (off by `2**33`).
 
+- **dMint deploy-with-premine (V1 and V2) — `premine_amount` / `premine_pkh`, and
+  `glyph deploy-dmint --premine`.** `GlyphBuilder.prepare_dmint_deploy` refused a premine at
+  every entry point; that was the largest single deferral left in shipped code. A dMint deploy
+  can now issue a fixed allocation alongside the mineable supply — a treasury, a fair-launch
+  bootstrap, an airdrop float — in the same commit/reveal pair, instead of requiring a second,
+  separate FT deploy under a different `tokenRef` that no miner's reward would ever be
+  fungible with.
+
+  The reveal gains exactly one output: the canonical 75-byte FT lock on `tokenRef`, byte-identical
+  to the reward output a mint pays out (`build_dmint_v1_ft_output_script`), placed directly
+  after the contract outputs. That position and shape are Photonic Wallet
+  `createRevealOutputs` parity, and the shape is load-bearing: the premine pushes `tokenRef`
+  with `OP_PUSHINPUTREF` (refType NORMAL), which is what the commit hashlock's
+  `OP_REFTYPE_OUTPUT == OP_1` assert demands. Emitting it as a singleton would make the
+  reveal unspendable. The contract carriers are untouched — still 1-photon singletons, which
+  both covenants hardcode.
+
+  **The premine is real photons the deployer funds**, not an accounting entry: 1 photon = 1 FT
+  unit, so total issued supply becomes `reward × max_height × num_contracts + premine`. The CLI
+  sizes the commit and the reveal fee for it, names it in the confirmation gate, and reports
+  `premine`, `premine_outpoint`, `mineable_supply`, and `total_supply` in `--json`.
+  `--premine-to` sends it elsewhere (default: the deploying wallet). If V2 metadata declares a
+  `dmint.premine`, it must equal what the deploy emits — a token that mis-reports its own
+  supply is refused rather than minted. The floor is 1 photon, not 546: Radiant-Core has no
+  dust threshold at all (`GetDustThreshold` returns 1 satoshi, `IsDust` is `nValue <= 0` —
+  `src/policy/policy.cpp:19-25`), which is also why every mainnet dMint contract sits at
+  1 photon.
+
+  Proven on a real `radiant-core` regtest node, not merely constructed
+  (`tests/test_dmint_premine_regtest_e2e.py`, opt-in): for V1 **and** V2, the node accepts the
+  premine reveal, the premined FT is spendable through the shipped
+  `GlyphBuilder.build_ft_transfer_tx` path, and the contract still yields a PoW-mined claim
+  afterwards — with a wrong-nonce negative control, so a node that accepted everything could
+  not pass.
+
 - **Offline / cold swap-recovery toolkit — `pyrxd swap recover-preimage`, `build-claim`,
   `build-refund`.** The human fallback for the page that the deadline-aware fee gate (below)
   now raises. Because Radiant has neither RBF nor CPFP, automation refuses to broadcast an
@@ -109,6 +144,25 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   construction — a pin that silently fails to parse is a pin that silently does nothing.
 
 ### Fixed
+
+- **`glyph deploy-dmint` under-sized the reveal fee, which could strand a confirmed commit.**
+  The commit's vout 0 carries the only value the reveal ever gets, and it was sized from a flat
+  `num_contracts × 260 + 400` byte estimate. Measured against the transaction the CLI actually
+  builds, that estimate is short for **every V1 deploy with 2 or more contracts and for every
+  V2 deploy** — it under-counts the per-contract ref-seed input and assumes a V1-sized 241-byte
+  contract script when V2's is ~380. At `--num-contracts 50` the shortfall is ~6,600 bytes,
+  i.e. the reveal is short by roughly 0.66 RXD of fee at the default rate. Because
+  `Transaction.fee()` drops the change output rather than failing when the residual is too
+  small, this surfaced as a silently over-paying reveal in the mild cases and an
+  unbroadcastable one in the worst — after the commit was already confirmed and its value
+  committed.
+
+  The estimate is now computed from the real script bytes the builder produces (contract
+  scripts, CBOR body length, premine and OP_RETURN outputs, worst-case push encodings), which
+  is a tight upper bound — verified within 0.3–2% across V1/V2 × 1–50 contracts × premine
+  on/off, with the change output now surviving in every case, so the surplus comes back to the
+  deployer instead of going to the miner. A parametrised regression test asserts
+  `estimate >= actual` over that same grid.
 
 - **`--network` no longer selects a network while talking to a different chain
   (`Config.for_network`).** `for_network()` returned the **unchanged default endpoint**

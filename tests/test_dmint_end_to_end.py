@@ -452,13 +452,58 @@ class TestPrepareDmintDeploy:
         result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
         assert result.premine_amount is None
 
-    def test_rejects_premine(self):
-        # V2 deploy with premine is deferred (mirrors V1).
+    def test_premine_emits_ft_output_on_reveal(self):
+        # V2 deploy with premine emits one extra FT output bound to tokenRef,
+        # placed AFTER the contract outputs (Photonic createRevealOutputs order).
         from dataclasses import replace
 
-        params = replace(self._make_params(), premine_amount=10_000)
-        with pytest.raises(ValidationError, match="premine"):
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+
+        params = replace(self._make_params(num_contracts=2), premine_amount=10_000)
+        result = GlyphBuilder().prepare_dmint_deploy(params, allow_v2_deploy=True)
+        assert result.premine_amount == 10_000
+
+        commit_txid = "cd" * 32
+        rev = result.build_reveal_outputs(commit_txid)
+        assert rev.premine_amount == 10_000
+        assert rev.premine_script == build_ft_locking_script(params.owner_pkh, GlyphRef(txid=commit_txid, vout=0))
+        assert len(rev.premine_script) == 75
+
+    def test_premine_absent_leaves_script_none(self):
+        result = GlyphBuilder().prepare_dmint_deploy(self._make_params(), allow_v2_deploy=True)
+        rev = result.build_reveal_outputs("cd" * 32)
+        assert rev.premine_script is None
+        assert rev.premine_amount is None
+
+    def test_metadata_premine_must_match_emitted_premine(self):
+        # A token whose advertised dmint.premine differs from the photons the
+        # reveal actually emits mis-reports its own supply — refuse the deploy.
+        from dataclasses import replace
+
+        from pyrxd.glyph.dmint import DmintAlgo, DmintCborPayload
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+
+        meta = GlyphMetadata.for_dmint_ft(
+            ticker="PRE",
+            name="Premine",
+            protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)],
+            dmint_params=DmintCborPayload(
+                algo=DmintAlgo.SHA256D,
+                num_contracts=1,
+                max_height=100,
+                reward=1_000,
+                premine=777,
+                diff=1,
+            ),
+        )
+        params = replace(self._make_params(), metadata=meta, premine_amount=10_000)
+        with pytest.raises(ValidationError, match="dmint.premine"):
             GlyphBuilder().prepare_dmint_deploy(params, allow_v2_deploy=True)
+
+        # Agreeing values are accepted.
+        ok = replace(params, premine_amount=777)
+        assert GlyphBuilder().prepare_dmint_deploy(ok, allow_v2_deploy=True).premine_amount == 777
 
     def test_epoch_deploy_re_enabled(self):
         # EPOCH deploy is re-enabled: the upstream int64-overflow fix is merged

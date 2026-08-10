@@ -220,10 +220,13 @@ shape wherever sensible. There are five places M2 deviates intentionally:
    only emits the V2 10-state-item shape; V1 (the only mainnet format)
    is no longer reachable from there. pyrxd ships its own V1 builder
    matching the 9-item layout decoded from chain.
-2. **Premine.** Photonic's `RevealDmintParams` supports a `premine`
-   field that adds an FT output to the reveal. pyrxd accepts the field
-   on the params dataclass but rejects it at build time with a clear
-   "deferred work" error — the GLYPH reference deploy doesn't use it.
+2. **Premine.** *(No longer a divergence — pyrxd now matches Photonic.)*
+   `premine_amount` adds one FT output on `tokenRef` to the reveal,
+   directly after the contract outputs, exactly as Photonic's
+   `createRevealOutputs` does. pyrxd adds one guard Photonic does not
+   have: if V2 metadata declares a `dmint.premine`, it must equal the
+   photons the deploy actually emits, so a token cannot mis-report its
+   own supply. See [Premine](#premine) below.
 3. **Delegate-ref commits.** Photonic supports a delegate-ref prefix
    on commit scripts. pyrxd hardcodes `delegate=None` for V1.
 4. **Algorithm + DAA.** Photonic accepts `algorithm` and `daaMode`
@@ -238,6 +241,47 @@ These are all documented in
 
 ---
 
+## Premine
+
+A dMint deploy can issue a fixed allocation next to the mineable supply —
+a treasury, a fair-launch bootstrap, an airdrop float. Set `premine_amount`
+on `DmintV1DeployParams` / `DmintV2DeployParams`, or pass
+`glyph deploy-dmint --premine <photons>`:
+
+```
+vout[0 .. N-1]   dMint contracts    value 1 each   (singleton carriers)
+vout[N]          premine FT output  value premine_amount
+vout[N+1]        OP_RETURN          value 0        (if any)
+vout[...]        change
+```
+
+The premine output is the canonical 75-byte FT lock on `tokenRef` — byte for
+byte the same script a mint pays its reward into, so premined units and mined
+units are the same token and spend through the same `transfer-ft` path.
+`--premine-to` sends it to an address other than the deploying wallet.
+
+Three things worth knowing before using it:
+
+- **The photons are real.** 1 photon = 1 FT unit on Radiant, so the deployer
+  funds the premine out of their own wallet. Total issued supply becomes
+  `reward × max_height × num_contracts + premine`. The floor is 1 photon, not
+  546: Radiant-Core has no dust threshold at all (`GetDustThreshold` returns
+  1 satoshi, `IsDust` is `nValue <= 0` — `src/policy/policy.cpp:19-25`), which
+  is also why every mainnet dMint contract sits at 1 photon.
+- **It must be a NORMAL ref, not a singleton.** The commit hashlock the reveal
+  spends asserts `OP_REFTYPE_OUTPUT == OP_1` on `tokenRef`. The FT lock's
+  `OP_PUSHINPUTREF` (0xd0) satisfies that; an NFT lock's
+  `OP_PUSHINPUTREFSINGLETON` (0xd8) would flip the assert and the reveal would
+  be rejected. This is why the builder — not the caller — chooses the script.
+- **It does not touch the contracts.** Both covenants hardcode
+  `OP_OUTPUTVALUE OP_1` for the recreated contract, and the premine is a
+  separate output in a different transaction from any mint. Consensus
+  acceptance of a premine deploy, a premine spend, and a post-premine PoW mint
+  is proven on a real regtest node for V1 and V2 in
+  `tests/test_dmint_premine_regtest_e2e.py`.
+
+---
+
 ## Deferred work
 
 The pyrxd M2 V1 deploy library does NOT yet cover:
@@ -248,7 +292,6 @@ The pyrxd M2 V1 deploy library does NOT yet cover:
   the example stays focused on the dMint machinery. Adding it is
   straightforward (mint a fresh NFT in the same reveal, or forward-
   prior an existing one) and lands in a follow-up milestone.
-- **Premine FT output.** See divergence #2 above.
 - **Walking forward through mined-from contracts.** `find_dmint_contract_utxos`
   currently returns *fresh* contracts (height=0). Once a contract has
   been mined from at least once, its scripthash drifts and the helper
