@@ -634,11 +634,13 @@ class TestMultiSourceBtcDataSource:
 # ---------------------------------------------------------------------------
 
 
-def _fake_reader(*, confs=None, amount=None, confs_exc=None, amount_exc=None):
-    """A duck-typed funding reader whose confirmations / amount are scriptable."""
+def _fake_reader(*, confs=None, amount=None, confs_exc=None, amount_exc=None, output=None, output_exc=None):
+    """A duck-typed funding reader whose confirmations / amount / confirmed-unspent output are
+    scriptable (``output`` is the ``(scriptPubKey, value_sats)`` pair)."""
     r = MagicMock()
     r.confirmations = AsyncMock(return_value=confs, side_effect=confs_exc)
     r.read_output_amount_sats = AsyncMock(return_value=amount, side_effect=amount_exc)
+    r.read_confirmed_unspent_output = AsyncMock(return_value=output, side_effect=output_exc)
     return r
 
 
@@ -738,6 +740,45 @@ class TestMultiSourceBtcFundingReader:
         )
         with pytest.raises(InsufficientConfirmationsError):
             await reader.read_output_amount_sats(self.TXID, 0, min_confirmations=6)
+
+    # -- confirmed-unspent output (the maker-side counter-funding gate's read) --
+
+    @pytest.mark.asyncio
+    async def test_read_confirmed_unspent_output_above_dust_requires_quorum_agreement(self):
+        spk = bytes.fromhex("5120" + "11" * 32)
+        reader = MultiSourceBtcFundingReader(
+            [_fake_reader(output=(spk, 50_000)), _fake_reader(output=(spk, 50_000)), _fake_reader(output=(spk, 9))],
+            quorum=2,
+        )
+        assert await reader.read_confirmed_unspent_output(self.TXID, 0) == (spk, 50_000)
+
+    @pytest.mark.asyncio
+    async def test_read_confirmed_unspent_output_disagreement_fails_closed(self):
+        """A single MITM'd source must not be able to certify a funding output: above the dust cap
+        the exact (scriptPubKey, value) pair needs the quorum."""
+        spk = bytes.fromhex("5120" + "11" * 32)
+        reader = MultiSourceBtcFundingReader(
+            [
+                _fake_reader(output=(spk, 50_000)),
+                _fake_reader(output=(spk, 49_000)),
+                _fake_reader(output=(bytes.fromhex("0014" + "22" * 20), 50_000)),
+            ],
+            quorum=2,
+        )
+        with pytest.raises(NetworkError, match="corroborated by only"):
+            await reader.read_confirmed_unspent_output(self.TXID, 0)
+
+    @pytest.mark.asyncio
+    async def test_read_confirmed_unspent_output_no_source_fails_closed(self):
+        reader = MultiSourceBtcFundingReader(
+            [
+                _fake_reader(output_exc=NetworkError("spent")),
+                _fake_reader(output_exc=NetworkError("down")),
+            ],
+            quorum=2,
+        )
+        with pytest.raises(NetworkError, match="no source returned"):
+            await reader.read_confirmed_unspent_output(self.TXID, 0)
 
 
 # ---------------------------------------------------------------------------

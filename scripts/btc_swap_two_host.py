@@ -97,7 +97,7 @@ from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapRole, Swap
 from pyrxd.keys import PrivateKey
 from pyrxd.network.bitcoin import BitcoinCoreFundingReader, BitcoinCoreRpcSource
 from pyrxd.network.electrumx import ElectrumXClient
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.types import Hex20
 
 # Regtest-only: both HRPs are in AUDIT_CLEARED_NETWORKS so the legs' audit gates pass without an
@@ -380,32 +380,28 @@ def _coordinator(args, *, terms, btc_leg, rxd_leg, keys_out, record=None):
     )
 
 
-async def _maker_verify_btc_funding(btc_leg: BitcoinTaprootLeg, terms, locator) -> int:
-    """MAKER-side fail-closed gate (the BTC analog of the ETH maker_verify_counter_funding): bind the
-    taker's advertised funding OUTPOINT to the expected HTLC ON-CHAIN — its actual scriptPubKey, value,
-    and unspent status read authoritatively from the node — NOT the self-reported locator fields.
+async def _maker_verify_btc_funding(coord: SwapCoordinator, locator) -> int:
+    """MAKER-side fail-closed gate — now a thin wrapper over the LIBRARY's
+    ``SwapCoordinator.maker_verify_counter_funding`` (which delegates to
+    ``BitcoinTaprootLeg.verify_counterparty_funded``). Returns the verified funded sats; converts
+    the library's fail-closed raise into a ``SystemExit`` for this operator harness.
 
-    Security (review finding): comparing the locator's OWN ``scriptpubkey()`` proves nothing — the
-    taker controls every field of the deserialized locator and can set a correct HTLC tree while
-    pointing ``funding_outpoint`` at any decoy output it owns. The maker MUST re-derive the expected
-    HTLC scriptPubKey from terms (its own claim key + the taker's refund key + H + t_btc) and assert
-    that the REAL output at ``funding_outpoint`` pays exactly that SPK, carries >= the agreed amount,
-    and is still unspent — else it locks its asset against an HTLC whose claim its own sighash cannot
-    satisfy (a griefing DoS: RXD locked, maker cannot claim BTC, never reveals p). Returns funded sats;
-    raises SystemExit on any mismatch, before any RXD is locked."""
-    expected_spk = bytes(btc_leg.derive_funding_scriptpubkey(terms))
-    onchain_spk, funded = await btc_leg.funding_reader.read_confirmed_unspent_output(
-        locator.funding_outpoint.txid, locator.funding_outpoint.vout
-    )
-    if bytes(onchain_spk) != expected_spk:
-        raise SystemExit(
-            "REFUSING to lock RXD: the REAL output at the taker's funding outpoint does NOT pay the BTC "
-            "HTLC re-derived from the agreed terms (on-chain scriptPubKey mismatch) — a hostile/mis-funded "
-            "counter leg. Aborting."
-        )
-    if funded < terms.btc_sats:
-        raise SystemExit(f"REFUSING to lock RXD: BTC HTLC funded {funded} sats < agreed {terms.btc_sats}. Aborting.")
-    return funded
+    This logic used to live HERE, in the script, which meant a caller driving ``SwapCoordinator``
+    directly had no maker-side BTC funding check at all (hazard HZ-3). It now lives in the library,
+    with exactly one implementation, and the coordinator additionally RE-RUNS it at asset-lock time
+    (``post_asset_lock_revalidate``) so this call cannot be skipped and the verify->lock window is
+    covered too.
+
+    The one untrusted input is the taker's advertised funding OUTPOINT; everything else — the
+    expected HTLC scriptPubKey, the agreed amount, the required depth — comes from the maker's own
+    terms + policy. The locator's OWN ``scriptpubkey()`` is deliberately not consulted: the taker
+    controls every field of the deserialized locator and can present a correct HTLC tree while
+    pointing ``funding_outpoint`` at a decoy output it owns."""
+    try:
+        rec = await coord.maker_verify_counter_funding(locator.funding_outpoint)
+    except (ValidationError, NetworkError) as exc:
+        raise SystemExit(f"REFUSING to lock RXD: the taker's BTC HTLC does not bind to the agreed terms — {exc}")
+    return rec.counterchain_locator.amount_sats
 
 
 # ---------------------------------------------------------------------------
@@ -739,10 +735,8 @@ async def maker_phase_lock_claim(args) -> None:
             "maker BTC-HTLC verify: bind the taker's funding outpoint to the expected HTLC on-chain",
             auto_yes=args.yes,
         )
-        funded = await _maker_verify_btc_funding(btc_leg, terms, loc)
-        print(
-            f"  -> verified: taker funded the agreed HTLC on-chain (SPK match) with {funded} sats (>= {terms.btc_sats})"
-        )
+        funded = await _maker_verify_btc_funding(coord, loc)
+        print(f"  -> verified: taker funded the agreed HTLC on-chain (SPK match) with exactly {funded} sats")
 
         # 2. Lock the RXD covenant (operator funds the SPK out-of-band), then re-validate -> BOTH_LOCKED.
         print(f"\n  Fund the RXD covenant SPK on regtest now (>= 1 conf):\n    {covenant_spk_hex}")

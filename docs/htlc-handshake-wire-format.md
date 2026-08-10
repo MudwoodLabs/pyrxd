@@ -168,10 +168,11 @@ serialiser that normalises one to the other will produce a rejected document
 
 **A receiving maker MUST NOT trust any field of this document.** The taker controls every byte of
 it and can, for example, describe a correct HTLC tree while pointing `funding_outpoint` at an
-unrelated output it owns. The only safe use is as a *pointer*: read the real output at that
-outpoint from a node and compare it against a locally re-derived expectation. See
-**HZ-3** — this is the highest-severity
-item in this document.
+unrelated output it owns, or self-report an `amount_sats` the chain does not carry. The only safe
+use is as a *pointer*: read the real output at that outpoint from a node and compare it against a
+locally re-derived expectation. In this library that is
+`SwapCoordinator.maker_verify_counter_funding`, which reads only the outpoint out of this document;
+see **HZ-3** for what it binds and why the derivable funding *address* does not bind the *value*.
 
 ### 4. Asset lock and revalidation
 
@@ -487,41 +488,72 @@ comparisons is, in effect, unauthenticated.
 **Normative:** validate `schema` and fail closed on an unknown value. If you extend `terms`, put
 the new field inside one of the two re-derived commitments, or it is not binding.
 
-### HZ-3: The maker-side BTC funding check is not in the library
+### HZ-3: The maker-side BTC funding check — CLOSED in the library
 
-`SwapCoordinator.maker_verify_counter_funding` exists — and **explicitly refuses a BTC counter leg**
-(`swap_coordinator.py:1546-1550`), on the stated grounds that "a BTC counter leg's funding target is
-a pure function of terms, so the coordinator's `derive==promised` pre-fund gate + the funding reader
-already bind it." That reasoning does not hold, for two reasons:
+> **Status: fixed.** This section previously documented an open hole. It now documents what the
+> library enforces; the historical framing is kept because the *reasoning* that produced the hole is
+> the part worth not repeating.
 
-- the `derive==promised` gate runs on the **taker's** side, inside the taker's own funding step
-  (`:1354`), so a hostile taker simply does not run it; and
+**What the hole was.** `SwapCoordinator.maker_verify_counter_funding` used to **refuse a BTC counter
+leg outright**, on the stated grounds that "a BTC counter leg's funding target is a pure function of
+terms, so the coordinator's `derive==promised` pre-fund gate + the funding reader already bind it."
+That reasoning does not hold, for two reasons:
+
+- the `derive==promised` gate runs on the **taker's** side, inside the taker's own funding step, so a
+  hostile taker simply does not run it; and
 - it is a tautology anyway — see **HZ-4b**.
 
-The only BTC maker-side binding in the repository is `_maker_verify_btc_funding` in a **script**
-(`scripts/btc_swap_two_host.py:383-408`). It re-derives the expected HTLC scriptPubKey from terms
-and asserts the *real* output at the taker's advertised outpoint pays exactly that, is unspent, and
-carries at least `terms.btc_sats`. Its own docstring explains why reading the locator's fields
-instead proves nothing (`:388-394`).
-
-**Consequence.** An implementation built against `pyrxd.gravity.SwapCoordinator` alone has **no
-maker-side check that the taker funded the right HTLC with the right amount** on a BTC swap. Two
-outcomes, both real:
+The only BTC maker-side binding was `_maker_verify_btc_funding`, in a **script**
+(`scripts/btc_swap_two_host.py`). So an implementation built against `pyrxd.gravity.SwapCoordinator`
+alone had **no maker-side check that the taker funded the right HTLC with the right amount** on a
+BTC swap. Two outcomes, both real:
 
 - *Wrong/absent HTLC* → the maker locks the asset, cannot claim the BTC (its signature does not
   satisfy a taptree it did not expect), never reveals `p`; both sides refund at their timelocks.
   Capital lockup, no theft — the griefing residual, from the maker's side.
 - *Correct HTLC, under-funded* → the maker locks the asset, claims the under-funded BTC (revealing
-  `p`), and the taker claims the asset. **The maker is paid less than the agreed price.** This is a
-  real, bounded, one-sided maker loss, and the coordinator's own amount bind does not catch it: that
-  check runs inside `taker_funds_btc` (`:1389-1394`), i.e. on the honest taker's own leg.
+  `p`), and the taker claims the asset. **The maker is paid less than the agreed price.** A real,
+  bounded, one-sided maker loss — and the coordinator's own amount bind does not catch it, because
+  that check runs inside `taker_funds_btc`, i.e. on the honest taker's own leg. A P2TR scriptPubKey
+  commits to the taptree, **not to the output value**, so every SPK-derivation check in the
+  handshake passes on an HTLC funded short.
 
-**Normative:** before locking the asset on a BTC swap, a maker MUST read the output at the taker's
-advertised outpoint from a node it trusts, and MUST assert its scriptPubKey equals the locally
-re-derived HTLC scriptPubKey, its value is at least `terms.btc_sats`, and it is unspent and buried
-to the maker's chosen depth. On any failure: do not lock. The ETH path has this as a first-class
-coordinator method (`maker_verify_counter_funding`, `:1525`) and additionally makes it
-non-skippable (`:1502-1509`); the BTC path does not.
+**What the library now enforces.** The check moved out of the script and into the library, with one
+implementation:
+
+- `BitcoinTaprootLeg.verify_counterparty_funded(funding_ref, terms, *, min_confirmations=None)` reads
+  the output at the counterparty's advertised outpoint **authoritatively from the chain** (a
+  confirmed, unspent output — a spent/unconfirmed/unknown one raises) and asserts, all fail-closed:
+  its **scriptPubKey** equals the HTLC re-derived from the maker's own `terms`; its **value equals
+  `terms.value_amount` exactly** (over-funding is rejected as well as under-funding, matching the
+  taker-side bind — the claim leaf does not cap value, so an over-funded HTLC is a one-sided *taker*
+  loss); and it is buried `min_confirmations` deep. The returned locator is rebuilt from the leg's
+  own derivation, so nothing counterparty-supplied survives into the maker's claim.
+- `SwapCoordinator.maker_verify_counter_funding` now **accepts a BTC counter leg** and dispatches to
+  it. The one untrusted input the maker passes is the funding **outpoint** (a `BtcOutpoint`, a
+  `BtcHtlcLocator` whose outpoint alone is read, or `"<txid>:<vout>"`).
+- `SwapCoordinator.post_asset_lock_revalidate` makes it **non-skippable on both chains**: it requires
+  a verified locator on the record and **re-runs** the verification at asset-lock time before it will
+  advance to `BOTH_LOCKED` (the state that enables the `p` reveal). Re-running is what closes the
+  verify→lock TOCTOU — a reorg, or a taker who funds only after the maker looked, is caught there.
+- The depth pin reuses the policy's existing reorg knob rather than inventing a second notion of BTC
+  finality: a real-value (`MarginPolicy.is_measured`) swap requires `btc_claim_reorg_depth`
+  confirmations; an estimated/test policy defers to the leg's `min_confirmations`. This is the BTC
+  analogue of the ETH gate's `block_identifier='finalized'` pin, and the same `is_measured`
+  discipline the N-floor and the cross-clock margin already use. PoW finality *is* a depth (see
+  `gravity/finality.py`).
+- A funding reader that cannot report a confirmed output's scriptPubKey + value, a counter leg with
+  no `verify_counterparty_funded`, a missing locator, and an unreachable node all **refuse the lock**.
+
+Adversarial coverage: `tests/test_btc_maker_counter_funding_adversarial.py` (under-funded,
+over-funded, decoy scriptPubKey, shallow, spent, verified-then-reorged, and the fail-closed plumbing).
+
+**Normative (unchanged, and now what the library does):** before locking the asset on a BTC swap, a
+maker MUST read the output at the taker's advertised outpoint from a node it trusts, and MUST assert
+its scriptPubKey equals the locally re-derived HTLC scriptPubKey, its value equals
+`terms.value_amount`, and it is unspent and buried to the maker's chosen depth. On any failure: do
+not lock. A second implementer MUST NOT infer from "the BTC funding address is derivable from terms"
+that the funding is therefore bound — the address is bound; the **value** is not.
 
 ### HZ-4: `t_btc` is required on an ETH swap and means nothing
 

@@ -1474,20 +1474,87 @@ class SwapCoordinator:
             self._advance(SwapEvent.MAKER_LOCKS_WRONG_PARAMS)
             await self._persist_record(self.record, shield=True)
             return self.record
-        # ETH post-confirm gate (audit re-verify HIGH + red-team HIGH): the SPK is right, but for an
-        # ETH counter leg two more things must hold before BOTH_LOCKED — which is the precondition
-        # for maker_claims_btc (the p-reveal). (1) The maker's counter-funding verification MUST have
-        # run and must STILL hold, re-checked here pinned to finality so a reorg cannot have replaced
-        # the taker's deploy after it was verified (the TOCTOU). (2) A maker who DELAYED the covenant
-        # broadcast may have collapsed the cross-clock margin the pre-fund gate projected. Either
-        # failure refuses BOTH_LOCKED (persist for recovery + raise) so the maker never reveals p
-        # against an unverified/reorg-replaced or timing-collapsed counter leg — it refunds the
-        # covenant via CSV instead of entering the one-sided-loss window.
-        if self.record.terms.counter_chain != "btc":
+        # Post-confirm counter-funding gate (audit re-verify HIGH + red-team HIGH): the SPK is
+        # right, but the counter leg must ALSO be verified before BOTH_LOCKED — which is the
+        # precondition for maker_claims_btc (the p-reveal). On BOTH chains the maker's
+        # counter-funding verification MUST have run and must STILL hold, re-checked here pinned to
+        # finality so a reorg cannot have replaced the taker's funding after it was verified (the
+        # verify->lock TOCTOU). An ETH leg additionally re-checks the cross-clock timing (a maker
+        # who DELAYED the covenant broadcast may have collapsed the margin the pre-fund gate
+        # projected). Any failure refuses BOTH_LOCKED (persist for recovery + raise) so the maker
+        # never reveals p against an unverified / reorg-replaced / mis-funded / timing-collapsed
+        # counter leg — it refunds the covenant via CSV instead of entering the one-sided-loss
+        # window.
+        if self.record.terms.counter_chain == "btc":
+            await self._assert_btc_counter_funding_verified()
+        else:
             await self._assert_eth_counter_funding_verified(now_unix_s=now_unix_s)
         self._advance(SwapEvent.MAKER_LOCKS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record
+
+    def _counter_verify_callable(self):
+        """The counter leg's maker-side verification entry point, or fail-closed.
+
+        A leg that cannot verify the counterparty's funding cannot be verified AT ALL, so the
+        maker must refuse to lock rather than silently skip the gate."""
+        verify = getattr(self.counter_leg, "verify_counterparty_funded", None)
+        if verify is None:
+            raise ValidationError("counter_leg does not implement verify_counterparty_funded; fail-closed")
+        return verify
+
+    def _btc_counter_funding_depth(self) -> int | None:
+        """How deep the taker's BTC HTLC funding must be buried before the maker locks the asset.
+
+        BTC's "finalized" is a confirmation DEPTH, not a checkpoint (see
+        :class:`pyrxd.gravity.finality.CounterClaimFinality.from_btc_depth`), so this is the BTC
+        analogue of the ETH gate's ``block_identifier='finalized'`` pin — and it reuses the policy's
+        EXISTING reorg-depth knob rather than inventing a second notion of BTC finality: a real-value
+        (``is_measured``) swap must bury the funding ``btc_claim_reorg_depth`` deep, the same depth
+        the claim-finality gate requires of the maker's own claim. ``None`` (an estimated/test
+        policy) defers to the leg's configured ``min_confirmations`` — the same ``is_measured``
+        discipline the ETH pin, the N-floor and the cross-clock margin already use.
+        """
+        policy = self.config.margin_policy
+        if not policy.is_measured:
+            return None
+        return _reserve_to_blocks(policy.btc_claim_reorg_depth, policy.block_interval_s)
+
+    async def _assert_btc_counter_funding_verified(self) -> None:
+        """BTC-leg precondition for BOTH_LOCKED — the twin of
+        :meth:`_assert_eth_counter_funding_verified`, closing the same hole on the BTC arm.
+
+        We REQUIRE a ``BtcHtlcLocator`` on the record (so the maker knows WHICH outpoint the taker
+        claims to have funded — advancing to the reveal-enabling BOTH_LOCKED without one is
+        impossible) and RE-RUN the on-chain verification here, at lock time, pinned to
+        :meth:`_btc_counter_funding_depth`. Re-running is what closes the verify->lock TOCTOU: a
+        reorg (or a taker who funded only after the maker looked) can replace the funding output
+        between the maker's verify and its own asset lock, and a one-shot verify would never see it.
+        The record's locator is then REPLACED with the leg's own re-derivation, so nothing
+        counterparty-supplied survives into ``maker_claims_btc``. Any failure persists for recovery
+        and raises (fail-closed) — the maker refunds the covenant via CSV rather than revealing p."""
+        locator = self.record.counterchain_locator
+        if not isinstance(locator, BtcHtlcLocator):
+            await self._persist_record(self.record, shield=True)
+            raise ValidationError(
+                "BTC counter-funding was never verified (no BtcHtlcLocator on record); "
+                "maker_verify_counter_funding MUST run before locking the asset — refusing BOTH_LOCKED "
+                "(the maker should refund the covenant via CSV)"
+            )
+        verify = self._counter_verify_callable()
+        try:
+            reverified = await verify(
+                locator.funding_outpoint, self.record.terms, min_confirmations=self._btc_counter_funding_depth()
+            )
+            self.record = self.record.with_counter_lock(reverified)
+        except (ValidationError, NetworkError):
+            await self._persist_record(self.record, shield=True)
+            raise
+        except Exception as exc:
+            await self._persist_record(self.record, shield=True)
+            raise ValidationError(
+                f"could not verify the BTC counter-funding at lock time; fail-closed ({exc})"
+            ) from exc
 
     async def _assert_eth_counter_funding_verified(self, *, now_unix_s: int | None) -> None:
         """ETH-leg precondition for BOTH_LOCKED (red-team HIGH): the maker-side counter-funding gate
@@ -1507,10 +1574,11 @@ class SwapCoordinator:
                 "maker_verify_counter_funding MUST run before locking RXD — refusing BOTH_LOCKED "
                 "(the maker should refund the covenant via CSV)"
             )
-        verify = getattr(self.counter_leg, "verify_counterparty_funded", None)
-        if verify is None:
+        try:
+            verify = self._counter_verify_callable()
+        except ValidationError:
             await self._persist_record(self.record, shield=True)
-            raise ValidationError("counter_leg does not implement verify_counterparty_funded; fail-closed")
+            raise
         block_id = "finalized" if self.config.margin_policy.is_measured else None
         try:
             reverified = await verify(locator.contract_address, self.record.terms, block_identifier=block_id)
@@ -1522,38 +1590,51 @@ class SwapCoordinator:
 
     # -- maker verifies the taker's counter-leg HTLC before locking the asset (red-team CRITICAL) --
     @_serialized_step
-    async def maker_verify_counter_funding(self, counter_contract_address: str) -> SwapRecord:
+    async def maker_verify_counter_funding(self, counter_funding_ref) -> SwapRecord:
         """MAKER-side fail-closed gate (red-team CRITICAL fix): the maker MUST verify the
-        TAKER-deployed counter-leg HTLC binds to the negotiated terms + the maker's own payout
+        TAKER-funded counter-leg HTLC binds to the negotiated terms + the maker's own payout
         config BEFORE the maker locks the asset (funds the RXD covenant). Returns on success
         (recording the verified locator on the record so :meth:`maker_claims_btc` can claim it);
         RAISES on any mismatch — the maker MUST NOT lock the asset if this raises.
 
-        WHY THIS EXISTS: the runbook is TAKER-funds-counter-FIRST, MAKER-locks-asset-SECOND. For a
-        BTC counter leg the funding target is a pure function of terms, so the coordinator's
-        ``derive==promised`` pre-fund gate + the funding reader already bind it. For an ETH counter
-        leg there is NO pre-fund commitment — the contract does not exist until the taker deploys it
-        — so ``EthHtlcContractLeg.verify_funded`` is the ONLY thing binding the taker's contract to
-        terms, and it previously ran ONLY inside the taker's own ``fund()``. Without this maker-side
-        call a hostile taker deploys ``claimant=self`` (or underfunds / sets a bad timeout) and the
-        honest maker locks the asset for nothing — a one-sided maker loss reachable in the intended
-        two-party flow. The maker passes ONLY the contract ADDRESS (the one untrusted input from the
-        taker); the leg builds the EXPECTED locator from the maker's own config and verifies the
-        chain matches it.
+        WHY THIS EXISTS: the runbook is TAKER-funds-counter-FIRST, MAKER-locks-asset-SECOND, so the
+        maker commits its own value against a leg the COUNTERPARTY built. Nothing else in the
+        handshake binds that leg: every other check the maker can run is a re-derivation of what the
+        counter leg SHOULD look like, and re-deriving a target says nothing about what the taker
+        actually funded. This is the only place the maker compares the two against the chain.
 
-        ``counter_contract_address`` is the address the taker advertises for its deployed HTLC."""
+        Both chains need it, for the same reason and by different mechanics:
+
+        * **ETH** — there is no pre-fund commitment at all (the contract does not exist until the
+          taker deploys it), so a hostile taker can deploy ``claimant=self``, underfund, or set a
+          bad timeout. ``EthHtlcContractLeg.verify_funded`` is the only binding, and it previously
+          ran ONLY inside the taker's own ``fund()``.
+        * **BTC** — the funding ADDRESS is a pure function of terms, but a P2TR scriptPubKey commits
+          to the TAPTREE, **not to the output value**. So a hostile taker funds the correct,
+          freely-derivable HTLC address with LESS than ``value_amount`` and every SPK check still
+          passes. (This method used to REFUSE a BTC counter leg on the grounds that the pre-fund
+          ``derive==promised`` gate already bound it. That was wrong twice over: that gate is a
+          self-consistency check between two derivations of the maker's own terms, and it runs
+          inside the TAKER's ``taker_funds_btc``, which a hostile taker simply does not call. The
+          amount bind in the same method is likewise the honest taker's own. Documented as hazard
+          HZ-3 in ``docs/htlc-handshake-wire-format.md``.)
+
+        The maker passes ONLY the one untrusted datum the counterparty must supply — the ETH
+        contract ADDRESS, or the BTC funding OUTPOINT (a ``BtcOutpoint``, a ``BtcHtlcLocator`` whose
+        outpoint is read and whose other fields are ignored, or ``"<txid>:<vout>"``). The leg builds
+        the EXPECTED leg from the maker's own config + terms and verifies the chain matches it.
+
+        This gate is NOT optional: :meth:`post_asset_lock_revalidate` requires a verified locator on
+        the record and RE-RUNS the verification at lock time (closing the verify->lock TOCTOU) before
+        it will advance to BOTH_LOCKED, on both chains."""
         terms = self.record.terms
-        if terms.counter_chain != "eth":
-            raise ValidationError(
-                "maker_verify_counter_funding is for an ETH counter leg; a BTC counter leg's funding "
-                "target is pre-derivable and bound by the derive==promised gate"
-            )
-        verify = getattr(self.counter_leg, "verify_counterparty_funded", None)
-        if verify is None:
-            raise ValidationError("counter_leg does not implement verify_counterparty_funded; fail-closed")
-        # Raises on any mismatch (wrong claimant/refundee/H/timeout/amount/logic). The maker MUST NOT
-        # lock the asset if this raises.
-        locator = await verify(counter_contract_address, terms)
+        verify = self._counter_verify_callable()
+        # Raises on any mismatch (BTC: wrong scriptPubKey / amount / depth / spent; ETH: wrong
+        # claimant/refundee/H/timeout/amount/logic). The maker MUST NOT lock the asset if it raises.
+        if terms.counter_chain == "btc":
+            locator = await verify(counter_funding_ref, terms, min_confirmations=self._btc_counter_funding_depth())
+        else:
+            locator = await verify(counter_funding_ref, terms)
         self.record = self.record.with_counter_lock(locator)
         await self._persist_record(self.record, shield=True)
         return self.record

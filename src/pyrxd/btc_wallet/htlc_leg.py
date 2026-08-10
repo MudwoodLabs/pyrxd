@@ -47,6 +47,7 @@ __all__ = [
     "BitcoinCoreBroadcaster",
     "BitcoinTaprootLeg",
     "BtcBroadcaster",
+    "BtcConfirmedOutputReader",
     "BtcFundingReader",
     "FundingPolicy",
     "require_audit_cleared",
@@ -155,6 +156,29 @@ class BtcFundingReader(Protocol):
 
     async def txid_of(self, raw_tx: bytes) -> str:
         """Resolve ``raw_tx``'s canonical txid via the node (NOT a local parse)."""
+        ...
+
+
+@runtime_checkable
+class BtcConfirmedOutputReader(Protocol):
+    """The extra read a MAKER needs to bind a COUNTERPARTY-funded HTLC (see
+    :meth:`BitcoinTaprootLeg.verify_counterparty_funded`).
+
+    Deliberately a SEPARATE Protocol from :class:`BtcFundingReader`: the funding read-back
+    (``read_output_amount_sats``) answers "how much is at MY outpoint", which is enough for the
+    taker funding its own HTLC. A maker verifying someone else's funding needs the output's
+    actual ``scriptPubKey`` too — the taker chooses the outpoint, so without the SPK the maker
+    is only checking the value of an output the counterparty picked. Keeping it separate also
+    means an existing reader that only satisfies ``BtcFundingReader`` still constructs a leg;
+    the maker-side gate then fails CLOSED (refuses to lock) rather than the leg refusing to exist.
+    """
+
+    async def read_confirmed_unspent_output(self, txid: str, vout: int) -> tuple[bytes, int]:
+        """Return ``(scriptPubKey, value_sats)`` of a CONFIRMED, UNSPENT output.
+
+        Spent / unconfirmed / unknown MUST raise (never a sentinel) — the caller is deciding
+        whether to lock its own asset against this output.
+        """
         ...
 
 
@@ -369,6 +393,101 @@ class BitcoinTaprootLeg:
         """The funded amount the coordinator binds to ``terms.value_amount`` — sats for BTC
         (the chain-neutral seam; an ETH leg returns wei)."""
         return locator.amount_sats
+
+    # -- maker-side counter-funding gate (async) ----------------------------
+    @staticmethod
+    def _counterparty_outpoint(funding_ref) -> t.BtcOutpoint:
+        """Coerce the ONE untrusted input — the outpoint the counterparty advertises — into a
+        validated :class:`BtcOutpoint`. Accepts a ``BtcOutpoint``, a ``BtcHtlcLocator`` (only its
+        outpoint is read; every other locator field is attacker-chosen and is ignored), or a
+        ``"<txid>:<vout>"`` string. Anything else fails closed."""
+        if isinstance(funding_ref, t.BtcHtlcLocator):
+            return funding_ref.funding_outpoint
+        if isinstance(funding_ref, t.BtcOutpoint):
+            return funding_ref
+        if isinstance(funding_ref, str):
+            txid, sep, vout = funding_ref.rpartition(":")
+            if not sep:
+                raise ValidationError("funding outpoint string must be '<txid>:<vout>'")
+            try:
+                return t.BtcOutpoint(txid=txid, vout=int(vout))
+            except ValueError as exc:
+                raise ValidationError("funding outpoint vout must be an integer") from exc
+        raise ValidationError("funding_ref must be a BtcOutpoint, a BtcHtlcLocator, or '<txid>:<vout>'")
+
+    async def verify_counterparty_funded(
+        self, funding_ref, terms, *, min_confirmations: int | None = None
+    ) -> t.BtcHtlcLocator:
+        """MAKER-side fail-closed gate: bind the counterparty's advertised funding OUTPOINT to the
+        HTLC this leg re-derives from its OWN copy of ``terms``, reading the output AUTHORITATIVELY
+        from the node. Returns the locator the maker may act on; RAISES on any mismatch — the maker
+        MUST NOT lock its asset if this raises. The BTC twin of
+        :meth:`pyrxd.gravity.eth_leg.EthLeg.verify_counterparty_funded`.
+
+        WHY: the runbook is TAKER-funds-BTC-FIRST, MAKER-locks-asset-SECOND, and a P2TR
+        scriptPubKey commits to the TAPTREE, not to the output VALUE. So every SPK-derivation check
+        in the handshake still passes on an HTLC funded with the WRONG AMOUNT, and the coordinator's
+        amount bind lives inside ``taker_funds_btc`` — the taker's own method, which a hostile taker
+        simply never calls (it funds the freely-derivable HTLC address directly). Without this gate
+        the maker locks its asset, claims the under-funded BTC (revealing ``p``), the taker claims
+        the full asset, and the maker is paid less than the agreed price.
+
+        What is checked, in order (all fail-closed):
+
+        1. the reader can report a CONFIRMED, UNSPENT output at all
+           (:class:`BtcConfirmedOutputReader`); a reader without that capability, or a spent /
+           unconfirmed / unknown outpoint, refuses;
+        2. the real on-chain ``scriptPubKey`` equals the HTLC re-derived here from ``terms``
+           (maker's claim key + taker's refund key + H + ``t_btc``). Comparing a supplied
+           locator's own ``scriptpubkey()`` would prove nothing: the counterparty controls every
+           field of it and can present a correct tree while pointing the outpoint at a decoy
+           output it owns;
+        3. the on-chain value equals ``terms.value_amount`` EXACTLY — under- AND over-funding are
+           both rejected, matching ``SwapCoordinator.taker_funds_btc``'s bind (an over-funded HTLC
+           is a one-sided TAKER loss, since the claim leaf does not cap value). For a BTC swap
+           ``value_amount`` is ``btc_sats`` (``NegotiatedTerms`` enforces the equality);
+        4. the funding is buried ``min_confirmations`` deep. PoW finality IS a confirmation depth
+           (see :class:`pyrxd.gravity.finality.CounterClaimFinality`), and a shallow funding can be
+           reorged out from under the maker AFTER it locks. ``None`` uses this leg's configured
+           ``min_confirmations``; the coordinator passes the policy's BTC reorg depth for a
+           real-value swap.
+
+        The returned locator is rebuilt from THIS leg's derivation + the on-chain outpoint/amount,
+        so nothing counterparty-supplied survives into the maker's later claim."""
+        outpoint = self._counterparty_outpoint(funding_ref)
+        required = self.min_confirmations if min_confirmations is None else int(min_confirmations)
+        if not isinstance(required, int) or isinstance(required, bool) or required < 0:
+            raise ValidationError("min_confirmations must be a non-negative int or None")
+        reader = self.funding_reader
+        if not isinstance(reader, BtcConfirmedOutputReader):
+            raise ValidationError(
+                "funding_reader does not implement read_confirmed_unspent_output, so the "
+                "counterparty's funding output cannot be bound to the expected HTLC; fail-closed "
+                "(refuse to lock). Wire a reader that can read a confirmed, unspent output."
+            )
+        expected_spk = bytes(self.derive_funding_scriptpubkey(terms))
+        onchain_spk, funded_sats = await reader.read_confirmed_unspent_output(outpoint.txid, outpoint.vout)
+        if bytes(onchain_spk) != expected_spk:
+            raise ValidationError(
+                f"the real output at {outpoint.txid[:16]}…:{outpoint.vout} does NOT pay the BTC HTLC "
+                "re-derived from the agreed terms (on-chain scriptPubKey mismatch) — a hostile or "
+                "mis-funded counter leg; refusing to treat it as the counter leg"
+            )
+        expected_amount = int(terms.value_amount)
+        if int(funded_sats) != expected_amount:
+            raise ValidationError(
+                f"BTC HTLC is funded {int(funded_sats)} sats, not the negotiated {expected_amount}; "
+                "refusing a mis-valued counter leg (under-funding short-pays the maker; over-funding "
+                "over-pays it, because the claim leaf does not cap value)"
+            )
+        confs = await reader.confirmations(outpoint.txid)
+        if not isinstance(confs, int) or isinstance(confs, bool) or confs < 0:
+            raise NetworkError("confirmations reader returned a non-negative-int depth; fail-closed")
+        if confs < required:
+            raise InsufficientConfirmationsError(
+                have=confs, required=required, detail="counterparty BTC HTLC funding is not buried deep enough"
+            )
+        return self._htlc(terms).with_funding(outpoint, int(funded_sats))
 
     # -- reorg gate: confirmation depth of the maker's claim (async) --------
     async def confirmations_of_claim(self, claim_tx_bytes: bytes) -> int:

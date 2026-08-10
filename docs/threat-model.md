@@ -336,6 +336,20 @@ Each scenario lists actor → action → asset → control(s) → residual risk.
 - **Explicitly NOT built:** a bond or deposit. It would change the protocol for every honest swap to price a threat with **no observed instance**; escrow needs adjudication, which is new consensus-adjacent surface on an already-unaudited stack; and slashing on abort cannot distinguish malice from a stalled node, punishing the users least able to absorb it. Full reasoning and the revisit trigger: `docs/solutions/design-decisions/griefing-is-a-liveness-residual-not-a-bond.md`.
 - **Residual risk:** REAL and **ACCEPTED**. Stated plainly: **pyrxd's swap stack defends SAFETY, not LIVENESS.** It will not let a counterparty take your funds; it will not stop one wasting your time and immobilising your capital for a timelock at near-zero cost to themselves. Revisit on an actual incident, or when the orderbook carries untrusted counterparties at volume.
 
+### S23: Hostile taker under-funds the counter-leg HTLC (TA8)
+
+- **Action:** The runbook is taker-funds-the-counter-leg-first, maker-locks-the-asset-second. A hostile taker funds the **correct** counter-leg HTLC — the BTC funding address is a pure function of `terms`, so it is freely derivable — with **less than `terms.value_amount`**. The honest maker locks its Radiant asset, claims the under-funded counter leg (revealing `p` on chain), and the taker then claims the full asset with that `p`. Both legs complete; the maker is simply paid less than the agreed price. The ETH shape of the same attack is a taker-deployed contract with `claimant = attacker` or a short balance.
+- **Asset:** A8, real funds. A **one-sided maker loss**, bounded by the shortfall the taker chose.
+- **Why the obvious defences do not catch it:** a P2TR scriptPubKey commits to the **taptree, not the output value** (and an ETH HTLC address commits to immutables, not the funded balance), so every scriptPubKey/address re-derivation in the handshake passes on a short-funded HTLC. The coordinator's amount bind lives inside `taker_funds_btc` — the **taker's own** method — which a hostile taker never calls. And the locator JSON the taker hands the maker is entirely attacker-chosen: it can describe a correct HTLC tree, self-report the agreed `amount_sats`, and point `funding_outpoint` at a decoy output.
+- **Controls:**
+  - `SwapCoordinator.maker_verify_counter_funding` — the maker's independent, fail-closed gate. It takes only the untrusted **outpoint** (BTC) or **contract address** (ETH) and verifies the chain against the maker's own re-derivation.
+  - `BitcoinTaprootLeg.verify_counterparty_funded` — reads the confirmed, unspent output authoritatively and binds its **scriptPubKey** (re-derived from the maker's own `terms`), its **value against `terms.value_amount` exactly** (over-funding rejected too — the claim leaf does not cap value, so an over-funded HTLC is a one-sided *taker* loss), and its **confirmation depth**. `EthLeg.verify_counterparty_funded` is the ETH twin.
+  - `SwapCoordinator.post_asset_lock_revalidate` makes the gate **non-skippable on both chains**: no verified locator on the record ⇒ refuse `BOTH_LOCKED`; and the verification is **re-run at asset-lock time**, closing the verify→lock TOCTOU (a reorg, or a taker who funds only after the maker looked).
+  - Reorg pin from existing policy: a real-value (`MarginPolicy.is_measured`) swap requires `btc_claim_reorg_depth` confirmations on the BTC funding (PoW finality is a depth); the ETH twin pins to the `finalized` checkpoint.
+  - Fail-closed everywhere: a reader that cannot report a confirmed output, a leg without the verification method, a missing locator, or an unreachable node all refuse the lock.
+  - `tests/test_btc_maker_counter_funding_adversarial.py` (under/over-funded, decoy scriptPubKey, shallow, spent, verified-then-reorged) and `tests/test_xchain_eth_adversarial_e2e.py::test_S7`.
+- **Residual risk:** the gate is only as good as the chain source behind it. A maker reading a single lying/MITM'd endpoint can be told an output exists that does not — use `MultiSourceBtcFundingReader` (quorum) or a local node for real value, per TA6. The BTC arm of this control has **not** been exercised in a live two-party run; only in tests.
+
 ## Controls in place
 
 Cross-reference of controls and the threats they address:
@@ -374,6 +388,8 @@ Cross-reference of controls and the threats they address:
 | Confirmation-depth `[1,tip]` floor + above-dust funding quorum | TA6 | `src/pyrxd/network/bitcoin.py:get_raw_tx`, `MultiSourceBtcFundingReader` |
 | Sole-authority audit gate (covenant-less use fails closed) | TA6 | `src/pyrxd/spv/proof.py:require_spv_sole_authority_cleared` |
 | SPV verification (Gravity) | TA6, TA8 | `src/pyrxd/spv/`, `src/pyrxd/gravity/` |
+| Maker-side counter-funding gate: on-chain scriptPubKey + exact amount + depth, re-derived from the maker's own terms (both chains) | S23 | `src/pyrxd/gravity/swap_coordinator.py:maker_verify_counter_funding`, `btc_wallet/htlc_leg.py:verify_counterparty_funded`, `gravity/eth_leg.py:verify_counterparty_funded` |
+| Counter-funding verification re-run at asset-lock time (verify→lock TOCTOU) + non-skippable before `BOTH_LOCKED` | S23 | `src/pyrxd/gravity/swap_coordinator.py:_assert_btc_counter_funding_verified`, `_assert_eth_counter_funding_verified` |
 | Gravity red-team test suite | TA8 | `tests/test_gravity_red_team.py` (1500+ lines) |
 | Agent per-spend confirmation on `/dev/tty`, threshold 0 = always confirm incl. self-spends (fails closed w/o tty; utf-8) | S18 | `src/pyrxd/agent/confirm.py`, `signer.py` |
 | Agent refuses unattributable outputs (non-P2PKH/non-OP_RETURN) so the user always sees a verifiable destination | S18 | `src/pyrxd/agent/signer.py:_summarize` |
@@ -473,6 +489,7 @@ If you find something, please report privately to `security@mudwoodlabs.com`. We
 
 ## Revision history
 
+- **2026-08-10** — added **S23** (hostile taker under-funds the counter-leg HTLC). Records the BTC arm of the maker-side counter-funding gate, which previously existed only for ETH and only in an operator script for BTC (hazard HZ-3 in [`htlc-handshake-wire-format.md`](htlc-handshake-wire-format.md)); the library now binds scriptPubKey + exact amount + depth on both chains and re-runs the check at asset-lock time. Two new rows in "Controls in place".
 - **2026-08-09** — added **S21** (under-fee'd time-critical spend / the 8-hour irreversibility window). Records the verified fact that **Radiant supports neither RBF nor CPFP**, so fee pre-sizing is the only control, and documents the pre-sizing controls now enforced in `gravity/fee_policy.py`, `htlc_spend.py` and `radiant_leg.py`. Also records that BIP125 mempool **pinning** does not apply to Radiant. Two new rows in "Controls in place".
 - **2026-06-15** — fixed the duplicate gap-`#8` numbering: the "Known gaps" list now runs `1–20` uniquely (the CLI `owner_pkh` gap moved `8→9` and the tail shifted `+1`). Added the consolidated [security audit scoping brief](security-audit-scope.md) (stable residual IDs across this doc, the design notes, and in-code residuals).
 - **2026-05-01** v1.0 — initial threat model. Documents v0.3 surface (library + CLI + glyph commands).

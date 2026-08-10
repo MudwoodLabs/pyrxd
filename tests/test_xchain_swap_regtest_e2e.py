@@ -314,6 +314,14 @@ class _BtcFundingReader:
         info = self._n.btc("getrawtransaction", str(txid), "true")
         return int(info.get("confirmations", 0) or 0)
 
+    async def read_confirmed_unspent_output(self, txid, vout) -> tuple[bytes, int]:
+        # The maker-side counter-funding gate's read: the CONFIRMED UTXO set only
+        # (include_mempool=false), so a spent/unconfirmed/unknown outpoint returns null -> raise.
+        res = self._n.btc("gettxout", str(txid), str(int(vout)), "false")
+        if not isinstance(res, dict):
+            raise NetworkError("gettxout returned null — spent, unconfirmed, or unknown; fail-closed")
+        return bytes.fromhex(res["scriptPubKey"]["hex"]), round(res["value"] * 1e8)
+
     async def txid_of(self, raw_tx: bytes) -> str:
         # Node-authoritative txid (never a local segwit parse).
         decoded = self._n.btc("decoderawtransaction", bytes(raw_tx).hex())

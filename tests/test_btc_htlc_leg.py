@@ -759,3 +759,123 @@ async def test_confirmations_of_claim_fail_closed_on_bad_depth():
     leg = _leg(taker_kp=taker, maker_kp=maker, reader=BadReader())
     with pytest.raises(NetworkError, match="non-negative-int depth"):
         await leg.confirmations_of_claim(_real_claim_tx(taker, maker))
+
+
+# ------------------------------------------------- maker-side gate: verify_counterparty_funded
+
+
+class ConfirmedOutputReader(FakeFundingReader):
+    """A funding reader that ALSO reports a confirmed, unspent output's (scriptPubKey, value)."""
+
+    def __init__(self, *, spk: bytes, sats: int, confs: int = 6) -> None:
+        super().__init__(amount_sats=sats, claim_confs=confs)
+        self.spk = bytes(spk)
+
+    async def read_confirmed_unspent_output(self, txid: str, vout: int) -> tuple[bytes, int]:
+        return self.spk, self.amount_sats
+
+
+def _verify_leg(*, sats_delta: int = 0, spk: bytes | None = None, confs: int = 6, min_confirmations: int = 1):
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    terms = _terms(maker_kp=maker, taker_kp=taker)
+    expected_spk = t.build_htlc(
+        hashlock=terms.hashlock,
+        claim_pubkey_xonly=terms.btc_claim_pubkey_xonly,
+        refund_pubkey_xonly=terms.btc_refund_pubkey_xonly,
+        timeout=terms.t_btc,
+        network="bcrt",
+    ).scriptpubkey
+    reader = ConfirmedOutputReader(
+        spk=expected_spk if spk is None else spk, sats=terms.btc_sats + sats_delta, confs=confs
+    )
+    leg = BitcoinTaprootLeg(
+        network="bcrt",
+        taker_keypair=taker,
+        funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=500_000),
+        maker_claim_pubkey_xonly=terms.btc_claim_pubkey_xonly,
+        broadcaster=FakeBroadcaster(),
+        funding_reader=reader,
+        refund_to_scriptpubkey=b"\x00\x14" + os.urandom(20),
+        claim_to_scriptpubkey=b"\x00\x14" + os.urandom(20),
+        policy=FundingPolicy(fee_sats=500, min_confirmations=min_confirmations),
+    )
+    return leg, terms, reader
+
+
+async def test_verify_counterparty_funded_rebuilds_the_locator_from_own_derivation():
+    """On success the returned locator is the leg's OWN HTLC derivation bound to the on-chain
+    outpoint/amount — nothing counterparty-supplied survives into the maker's later claim."""
+    leg, terms, _reader = _verify_leg()
+    loc = await leg.verify_counterparty_funded(t.BtcOutpoint("cd" * 32, 1), terms)
+    assert loc.scriptpubkey == leg.derive_funding_scriptpubkey(terms)
+    assert loc.funding_outpoint == t.BtcOutpoint("cd" * 32, 1)
+    assert loc.amount_sats == terms.btc_sats
+
+
+@pytest.mark.parametrize("delta", [-1, 1, -50_000, 50_000])
+async def test_verify_counterparty_funded_rejects_any_amount_deviation(delta):
+    """Exact bind: under-funding short-pays the maker, over-funding over-pays it (the claim leaf
+    does not cap value) — both are refused, matching the taker-side bind."""
+    leg, terms, _reader = _verify_leg(sats_delta=delta)
+    with pytest.raises(ValidationError, match="not the negotiated"):
+        await leg.verify_counterparty_funded(t.BtcOutpoint("cd" * 32, 0), terms)
+
+
+async def test_verify_counterparty_funded_rejects_wrong_scriptpubkey():
+    leg, terms, _reader = _verify_leg(spk=b"\x00\x14" + b"\x07" * 20)
+    with pytest.raises(ValidationError, match="scriptPubKey mismatch"):
+        await leg.verify_counterparty_funded(t.BtcOutpoint("cd" * 32, 0), terms)
+
+
+async def test_verify_counterparty_funded_enforces_depth():
+    leg, terms, _reader = _verify_leg(confs=2, min_confirmations=1)
+    # The leg's own default (1) is satisfied...
+    await leg.verify_counterparty_funded(t.BtcOutpoint("cd" * 32, 0), terms)
+    # ...but an explicit deeper pin (the coordinator's real-value reorg depth) is not.
+    with pytest.raises(InsufficientConfirmationsError) as ei:
+        await leg.verify_counterparty_funded(t.BtcOutpoint("cd" * 32, 0), terms, min_confirmations=6)
+    assert (ei.value.have, ei.value.required) == (2, 6)
+
+
+async def test_verify_counterparty_funded_reader_without_capability_fails_closed():
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    terms = _terms(maker_kp=maker, taker_kp=taker)
+    leg = _leg(taker_kp=taker, maker_kp=maker, reader=FakeFundingReader())  # no read_confirmed_unspent_output
+    with pytest.raises(ValidationError, match="read_confirmed_unspent_output"):
+        await leg.verify_counterparty_funded(t.BtcOutpoint("cd" * 32, 0), terms)
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "cd" * 32 + ":0",  # "<txid>:<vout>"
+        t.BtcOutpoint("cd" * 32, 0),
+    ],
+)
+async def test_verify_counterparty_funded_accepts_outpoint_forms(ref):
+    leg, terms, _reader = _verify_leg()
+    loc = await leg.verify_counterparty_funded(ref, terms)
+    assert loc.funding_outpoint == t.BtcOutpoint("cd" * 32, 0)
+
+
+async def test_verify_counterparty_funded_reads_only_the_outpoint_of_a_supplied_locator():
+    """A counterparty-supplied locator contributes ONLY its outpoint: its own scriptpubkey/amount
+    are attacker-chosen and must not influence the verdict."""
+    leg, terms, _reader = _verify_leg()
+    hostile = t.build_htlc(
+        hashlock=hashlib.sha256(os.urandom(32)).digest(),  # a DIFFERENT HTLC entirely
+        claim_pubkey_xonly=terms.btc_claim_pubkey_xonly,
+        refund_pubkey_xonly=terms.btc_refund_pubkey_xonly,
+        timeout=terms.t_btc,
+        network="bcrt",
+    ).with_funding(t.BtcOutpoint("cd" * 32, 0), terms.btc_sats * 99)
+    loc = await leg.verify_counterparty_funded(hostile, terms)
+    assert loc.scriptpubkey == leg.derive_funding_scriptpubkey(terms) != hostile.scriptpubkey
+    assert loc.amount_sats == terms.btc_sats
+
+
+@pytest.mark.parametrize("bad", [b"not-a-ref", 7, None, "cd" * 32, "cd" * 32 + ":x"])
+async def test_verify_counterparty_funded_rejects_malformed_outpoint(bad):
+    leg, terms, _reader = _verify_leg()
+    with pytest.raises(ValidationError):
+        await leg.verify_counterparty_funded(bad, terms)

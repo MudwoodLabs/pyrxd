@@ -80,14 +80,27 @@ class FakeBtcLeg:
     """
 
     def __init__(
-        self, *, tamper_promised_spk: bool = False, fund_amount_delta: int = 0, claim_confs: int = 100
+        self,
+        *,
+        tamper_promised_spk: bool = False,
+        fund_amount_delta: int = 0,
+        claim_confs: int = 100,
+        counterparty_verify_raises: bool = False,
+        funding_confs: int = 100,
     ) -> None:
         self.tamper_promised_spk = tamper_promised_spk
         # Simulate a buggy/malicious leg (or a mutated `terms`) that funds the HTLC
         # with a value != the negotiated btc_sats. Positive = overfund, negative = under.
+        # ALSO what the maker-side verification reads back "on-chain" (one chain view).
         self.fund_amount_delta = fund_amount_delta
         # Reorg gate: confirmation depth confirmations_of_claim reports. Default deep.
         self.claim_confs = claim_confs
+        # Maker-side counter-funding gate: simulate a hostile/mis-funded HTLC (wrong SPK) and
+        # the burial depth of the funding output. Mirrors FakeEthLeg's knobs of the same name.
+        self.counterparty_verify_raises = counterparty_verify_raises
+        self.funding_confs = funding_confs
+        self.min_confirmations = 1  # the real leg's FundingPolicy default depth
+        self.last_verify_min_confirmations: int | None = None
         self.calls: list[str] = []
         self.last_locator: t.BtcHtlcLocator | None = None
         self.claimed_with: bytes | None = None
@@ -130,6 +143,25 @@ class FakeBtcLeg:
 
     def locked_amount(self, locator) -> int:
         return locator.amount_sats
+
+    # Maker-side counter-funding gate: what the maker's node says is REALLY at the outpoint
+    # the counterparty advertised (the real leg reads scriptPubKey + value + depth off-chain
+    # and rebuilds the locator from its OWN derivation; this fake mirrors that contract).
+    async def verify_counterparty_funded(
+        self, funding_ref, terms: NegotiatedTerms, *, min_confirmations: int | None = None
+    ) -> t.BtcHtlcLocator:
+        self.calls.append("verify_counterparty")
+        self.last_verify_min_confirmations = min_confirmations
+        outpoint = funding_ref.funding_outpoint if isinstance(funding_ref, t.BtcHtlcLocator) else funding_ref
+        if self.counterparty_verify_raises:
+            raise ValidationError("on-chain scriptPubKey mismatch — hostile/mis-funded BTC counter leg")
+        on_chain_sats = terms.value_amount + self.fund_amount_delta
+        if on_chain_sats != terms.value_amount:
+            raise ValidationError(f"BTC HTLC is funded {on_chain_sats} sats, not the negotiated {terms.value_amount}")
+        required = self.min_confirmations if min_confirmations is None else min_confirmations
+        if self.funding_confs < required:
+            raise NetworkError(f"tx has {self.funding_confs} confirmations, required {required}")
+        return self._htlc(terms).with_funding(outpoint, on_chain_sats)
 
     # Sync: pure byte-parse of the claim tx witness (no chain access).
     def scrape_secret(self, claim_tx_bytes: bytes, hashlock: bytes) -> bytes:
@@ -1858,20 +1890,87 @@ async def test_maker_verify_counter_funding_records_locator_on_success():
     assert rec.counterchain_locator.contract_address.lower() == ("0x" + "99" * 20).lower()
 
 
-async def test_maker_verify_counter_funding_rejects_btc_leg():
-    """The gate is ETH-specific (BTC funding target is pre-derivable + bound by derive==promised)."""
+def _btc_coord_at_btc_locked(*, btc_leg, terms, policy=None) -> SwapCoordinator:
+    return SwapCoordinator(
+        record=SwapRecord(state=SwapState.BTC_LOCKED, terms=terms),
+        counter_leg=btc_leg,
+        radiant_leg=FakeRadiantLeg(),
+        indexer=FakeIndexer(),
+        seen_store=FakeSeenStore(),
+        config=CoordinatorConfig(margin_policy=policy or _policy()),
+    )
+
+
+async def test_maker_verify_counter_funding_accepts_a_btc_leg():
+    """HZ-3: the gate is NOT ETH-specific. A BTC counter leg's funding ADDRESS is derivable, but a
+    P2TR scriptPubKey does not commit to the output VALUE, so the maker must still bind the taker's
+    funding on-chain. On success the verified locator is recorded for the maker's later claim."""
     _p, h = generate_secret()
     btc_terms = _terms(hashlock=h)  # counter_chain defaults to btc
+    leg = FakeBtcLeg()
+    coord = _btc_coord_at_btc_locked(btc_leg=leg, terms=btc_terms)
+    rec = await coord.maker_verify_counter_funding(t.BtcOutpoint("ab" * 32, 0))
+    assert "verify_counterparty" in leg.calls
+    assert rec.counterchain_locator.funding_outpoint == t.BtcOutpoint("ab" * 32, 0)
+    assert rec.counterchain_locator.amount_sats == btc_terms.value_amount
+
+
+async def test_maker_verify_counter_funding_refuses_hostile_taker_btc_htlc():
+    """A hostile taker funds something that is not the agreed HTLC (or funds it short): the maker's
+    gate raises and the maker never locks the asset (state unchanged, no locator recorded)."""
+    _p, h = generate_secret()
+    btc_terms = _terms(hashlock=h)
+    leg = FakeBtcLeg(counterparty_verify_raises=True)
+    coord = _btc_coord_at_btc_locked(btc_leg=leg, terms=btc_terms)
+    with pytest.raises(ValidationError, match="scriptPubKey"):
+        await coord.maker_verify_counter_funding(t.BtcOutpoint("ab" * 32, 0))
+    assert coord.record.state is SwapState.BTC_LOCKED
+    assert coord.record.counterchain_locator is None
+
+
+async def test_btc_counter_funding_depth_pins_to_reorg_depth_only_when_measured():
+    """The BTC analogue of the ETH 'finalized'-when-measured pin: a real-value (is_measured) policy
+    requires the policy's btc_claim_reorg_depth confirmations; an estimated/test policy passes None
+    and defers to the leg's own min_confirmations."""
+    _p, h = generate_secret()
+    btc_terms = _terms(hashlock=h)
+    leg = FakeBtcLeg()
+    await _btc_coord_at_btc_locked(btc_leg=leg, terms=btc_terms).maker_verify_counter_funding(
+        t.BtcOutpoint("ab" * 32, 0)
+    )
+    assert leg.last_verify_min_confirmations is None  # is_measured=False -> leg default
+
+    measured = MarginPolicy.measured(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+    )
+    leg2 = FakeBtcLeg()
+    await _btc_coord_at_btc_locked(btc_leg=leg2, terms=btc_terms, policy=measured).maker_verify_counter_funding(
+        t.BtcOutpoint("ab" * 32, 0)
+    )
+    assert leg2.last_verify_min_confirmations == 6
+
+
+async def test_btc_post_confirm_refuses_unverified_counter_funding():
+    """HZ-3, FSM-enforced: a BTC leg with NO locator on the record (the maker never ran
+    maker_verify_counter_funding) must FAIL CLOSED at post_asset_lock_revalidate — reaching the
+    reveal-enabling BOTH_LOCKED without the counter-funding verification is impossible."""
+    _p, h = generate_secret()
+    btc_terms = _terms(hashlock=h)
+    rxd = FakeRadiantLeg()
     coord = SwapCoordinator(
         record=SwapRecord(state=SwapState.BTC_LOCKED, terms=btc_terms),
         counter_leg=FakeBtcLeg(),
-        radiant_leg=FakeRadiantLeg(),
+        radiant_leg=rxd,
         indexer=FakeIndexer(),
         seen_store=FakeSeenStore(),
         config=CoordinatorConfig(margin_policy=_policy()),
     )
-    with pytest.raises(ValidationError, match="ETH counter leg"):
-        await coord.maker_verify_counter_funding("0x" + "99" * 20)
+    with pytest.raises(ValidationError, match="never verified"):
+        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(btc_terms))
+    assert coord.record.state is SwapState.BTC_LOCKED
 
 
 # -- red-team HIGH: proactive-refund N coupled to the ETH finality reserve -------------

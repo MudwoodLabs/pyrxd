@@ -926,6 +926,14 @@ class _MempoolHttpClient:
             raise NetworkError("unexpected tx json response")
         return data
 
+    async def outspend(self, txid: Txid, vout: int) -> dict:
+        """``/tx/{txid}/outspend/{vout}`` -> dict (``spent``, and the spender when spent)."""
+        s = await self.session()
+        data = await _get_json(s, self.url(f"tx/{_safe_txid_path(txid)}/outspend/{_safe_int_path(vout)}"))
+        if not isinstance(data, dict) or "spent" not in data:
+            raise NetworkError("unexpected outspend response")
+        return data
+
 
 class MempoolSpaceBroadcaster:
     """``BtcBroadcaster`` over mempool.space ``POST /api/tx`` (the value-moving edge).
@@ -1026,6 +1034,37 @@ class MempoolSpaceFundingReader:
             return int(data["vout"][vout]["value"])  # mempool.space vout value is in sats
         except (KeyError, IndexError, TypeError, ValueError) as exc:
             raise NetworkError(f"could not read output value for {str(tx)[:16]}…:{vout}") from exc
+
+    async def read_confirmed_unspent_output(self, txid: str, vout: int) -> tuple[bytes, int]:
+        """Return the ``(scriptPubKey, value_sats)`` of a CONFIRMED, UNSPENT output — the
+        :class:`pyrxd.btc_wallet.htlc_leg.BtcConfirmedOutputReader` capability the maker-side
+        counter-funding gate needs where there is no local node (mainnet).
+
+        Esplora has no ``gettxout``, so this composes the three reads that make the same
+        statement: the tx is confirmed (``/tx/{txid}/status`` via :meth:`confirmations`), the
+        output exists with this SPK/value (``/tx/{txid}``), and it is still UNSPENT
+        (``/tx/{txid}/outspend/{vout}``). Every uncertain outcome RAISES — a caller is deciding
+        whether to lock its own asset against this output, so "probably fine" is not an answer.
+        Single-source: for real value wrap several in :class:`MultiSourceBtcFundingReader`."""
+        tx = txid if isinstance(txid, Txid) else Txid(txid)
+        index = int(vout)
+        if index < 0:
+            raise ValidationError("vout must be a non-negative int")
+        if await self.confirmations(tx) < 1:
+            raise NetworkError(f"output {str(tx)[:16]}…:{index} is unconfirmed or unknown; fail-closed")
+        data = await self._http.tx_json(tx)
+        try:
+            out = data["vout"][index]
+            spk = bytes.fromhex(str(out["scriptpubkey"]))
+            value = int(out["value"])  # Esplora reports the output value in sats
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            raise NetworkError(f"could not read output {str(tx)[:16]}…:{index}; fail-closed") from exc
+        if not spk or value < 0:
+            raise NetworkError(f"output {str(tx)[:16]}…:{index} has an empty scriptPubKey or negative value")
+        spend = await self._http.outspend(tx, index)
+        if bool(spend.get("spent", True)):  # missing/ambiguous -> treat as SPENT (fail-closed)
+            raise NetworkError(f"output {str(tx)[:16]}…:{index} is already SPENT; fail-closed")
+        return spk, value
 
     async def txid_of(self, raw_tx: bytes) -> str:
         from ..btc_wallet.taproot import btc_txid_from_raw
@@ -1323,6 +1362,27 @@ class MultiSourceBtcFundingReader:
         if confs < min_confirmations:
             raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
         return agreed
+
+    async def read_confirmed_unspent_output(self, txid: str, vout: int) -> tuple[bytes, int]:
+        """Quorum'd ``(scriptPubKey, value_sats)`` of a confirmed, unspent output.
+
+        The maker-side counter-funding gate decides whether to lock the maker's own asset on this
+        answer, so it gets the same F-17 treatment as the amount read: the EXACT ``(spk, value)``
+        pair must be corroborated by >= ``quorum`` sources above the dust cap, and a source that
+        reports the output as spent/unconfirmed simply fails and drops out. Fail-closed when no
+        source answers or the quorum is short — a single MITM'd endpoint must not be able to
+        certify a funding output that is not there."""
+        pairs = [p for p in await self._gather(lambda r: r.read_confirmed_unspent_output(txid, vout))]
+        if not pairs:
+            raise NetworkError("no source returned a confirmed unspent output (F-17 fail-closed)")
+        normalized = [(bytes(spk), int(value)) for spk, value in pairs]
+        (agreed_spk, agreed_value), count = Counter(normalized).most_common(1)[0]
+        if agreed_value > self._dust_cap_sats and count < self._quorum:
+            raise NetworkError(
+                f"above-dust funding output corroborated by only {count} source(s); "
+                f"need quorum={self._quorum} (sources disagree on scriptPubKey/value). Fail-closed."
+            )
+        return agreed_spk, agreed_value
 
     async def txid_of(self, raw_tx: bytes) -> str:
         from ..btc_wallet.taproot import btc_txid_from_raw
