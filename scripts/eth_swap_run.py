@@ -46,6 +46,7 @@ from _dust_swap_shared import (
     StepReport,
     atomic_write_mode_600,
     confirm,
+    merge_into_mode_600,
     rxd_blockcount,
 )
 from _glyph_mainnet import (  # scripts/ sibling (NFT + FT paths)
@@ -377,6 +378,10 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 "maker_rxd_wif": _rkeys[1].wif(),
                 "rxd_covenant_spk": cov.funded_spk.hex(),
                 "t_rxd_blocks": terms.t_rxd.value,
+                # The covenant's `amount`/`nftCarrierValue` PARAMETER — the covenant SPK is
+                # built from it, so the cold builders (`pyrxd swap build-claim`/`build-refund`)
+                # need it to rebuild the covenant they spend. Nothing used to persist it.
+                "rxd_covenant_amount": terms.radiant_amount,
                 "asset_variant": args.asset_variant,
                 "asset_genesis_ref": minted.ref_str if minted else None,
                 "asset_owner_wif": minted.owner_key.wif() if minted else None,
@@ -459,6 +464,11 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
             contract=rec.counterchain_locator.contract_address,
         )
         print(f"  -> {rec.state.value} (ETH HTLC: {rec.counterchain_locator.contract_address})")
+        # PERSIST the per-swap contract address now that it exists. It is the ETH-side
+        # provenance anchor (`pyrxd swap recover-preimage --eth-contract`): only artifacts
+        # bound to THIS address may be scraped for p. Previously only eth_swap_two_host.py
+        # wrote it, so a crash here left the address on the console alone.
+        merge_into_mode_600(keys_path, {"eth_contract_address": rec.counterchain_locator.contract_address})
 
         # 1b. MAKER verifies the taker-deployed ETH HTLC binds to terms BEFORE locking RXD
         #     (red-team CRITICAL/HIGH). In a real TWO-PARTY flow this is the maker's go/no-go gate —

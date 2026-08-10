@@ -5,9 +5,17 @@ ETH↔RXD) and prints the swap's identity + timelock deadlines. With ``--check-c
 does a **read-only** ElectrumX query of the RXD covenant to classify the live situation and the single
 safe next action. **It never broadcasts** — so it sidesteps the swap audit gate entirely.
 
+``--check-chain`` also reads the **counter-leg** (BTC or ETH) through the provenance-checked path in
+:mod:`pyrxd.cli.swap_recovery`, so it can say whether the counterparty's claim has revealed the
+preimage ``p``. That is the difference between "keep waiting" and "claim NOW" and the RXD covenant
+alone cannot show it: a live covenant looks identical either way. The counter-leg read needs a
+locator + an endpoint that the recovery file may not carry, so when either is missing it reports
+``NOT_CHECKED`` *with the reason* rather than failing — the covenant verdict is still worth having.
+
 The recovery file holds WIFs + the preimage; this command reads them only to derive public facts and
 **never echoes any secret** — output carries booleans (``has_preimage``/``has_keys``) and a hygiene
-reminder, not key material.
+reminder, not key material. The counter-leg verdict likewise reports only that a preimage IS
+recoverable; extracting it is ``pyrxd swap recover-preimage``.
 """
 
 from __future__ import annotations
@@ -20,8 +28,13 @@ from pathlib import Path
 
 import click
 
+from ..security.errors import ValidationError
 from .context import CliContext
 from .format import emit, sanitize_terminal
+from .swap_recovery import CounterLegStatus, parse_recovery_extras, read_counter_leg
+
+#: Default Esplora/mempool.space base URL for the BTC counter-leg read (a GET-only API).
+DEFAULT_BTC_API_URL = "https://mempool.space"
 
 # --------------------------------------------------------------------------- recovery-file parsing
 
@@ -194,14 +207,30 @@ def swap_group() -> None:
     "--check-chain",
     is_flag=True,
     default=False,
-    help="Also do a READ-ONLY ElectrumX query of the RXD covenant to classify the live situation.",
+    help="Also do a READ-ONLY query of the RXD covenant AND the counter-leg to classify the situation.",
 )
+@click.option("--btc-funding-outpoint", "btc_outpoint", default=None, help="BTC HTLC funding outpoint TXID:VOUT.")
+@click.option("--btc-api-url", default=DEFAULT_BTC_API_URL, show_default=True, help="Esplora / mempool.space base URL.")
+@click.option("--eth-contract", default=None, help="The swap's per-swap ETH HTLC contract address (0x…).")
+@click.option("--eth-rpc-url", default=None, help="Ethereum JSON-RPC URL (read-only methods only).")
 @click.pass_obj
-def swap_status_cmd(ctx: CliContext, swap_file: Path, check_chain: bool) -> None:
+def swap_status_cmd(
+    ctx: CliContext,
+    swap_file: Path,
+    check_chain: bool,
+    btc_outpoint: str | None,
+    btc_api_url: str,
+    eth_contract: str | None,
+    eth_rpc_url: str | None,
+) -> None:
     """Show a swap's identity, timelock deadlines, and (with --check-chain) the safe next action."""
     try:
         facts = parse_recovery_file(swap_file)
-    except (ValueError, json.JSONDecodeError, OSError) as exc:
+        # ValidationError is NOT a ValueError subclass (it derives from RxdSdkError), so the
+        # extras parser needs naming here explicitly — otherwise a file shape it rejects would
+        # escape as an unhandled exception instead of the clean "could not parse" message.
+        extras = parse_recovery_extras(swap_file)
+    except (ValueError, ValidationError, json.JSONDecodeError, OSError) as exc:
         raise click.ClickException(f"could not parse swap file: {exc}") from exc
 
     payload: dict = {
@@ -240,6 +269,28 @@ def swap_status_cmd(ctx: CliContext, swap_file: Path, check_chain: bool) -> None
             chain["blocks_to_refund"] = chain["refund_opens_height"] - chain["now_height"]
         payload["chain"] = chain
         payload["situation"] = situation  # top-level for quiet mode
+
+        # The counter-leg read is BEST-EFFORT and must never sink the covenant verdict above:
+        # an unreachable third-party explorer is not a reason to deny an operator the RXD facts
+        # they came for, mid-incident. Any failure is reported as an ERROR row, not raised.
+        try:
+            counter = asyncio.run(
+                read_counter_leg(
+                    facts,
+                    extras,
+                    btc_outpoint=btc_outpoint,
+                    btc_api_url=btc_api_url,
+                    eth_contract=eth_contract,
+                    eth_rpc_url=eth_rpc_url,
+                )
+            )
+        except Exception as exc:
+            counter = CounterLegStatus(
+                chain=facts.counter_chain,
+                state="ERROR",
+                reason=f"counter-leg read failed: {type(exc).__name__}: {exc}",
+            )
+        payload["counter_leg"] = counter.to_dict()
 
     if ctx.output_mode == "json":
         click.echo(emit(payload, mode="json"))
@@ -283,6 +334,16 @@ def swap_status_cmd(ctx: CliContext, swap_file: Path, check_chain: bool) -> None
             )
         lines.append(f"  situation  : {chain['situation']}")
         lines.append(f"  next action: {chain['next_action']}")
+        cl = payload["counter_leg"]
+        lines.append("")
+        # Every field here came off a third-party explorer / RPC, so it is untrusted input in
+        # exactly the same sense the recovery file is — sanitize before it reaches the terminal.
+        lines.append(f"Counter-leg ({sanitize_terminal(cl['chain'], max_len=8).upper()}): {cl['state']}")
+        lines.append(f"  {sanitize_terminal(cl['reason'], max_len=400)}")
+        if cl["claim_txid"]:
+            lines.append(f"  claim tx   : {sanitize_terminal(cl['claim_txid'], max_len=80)}")
+        if cl["preimage_available"]:
+            lines.append("  ⇒ run `pyrxd swap recover-preimage` to extract p, then `pyrxd swap build-claim`.")
     else:
         lines.append("")
         lines.append("  (run with --check-chain for the live covenant state + safe next action)")

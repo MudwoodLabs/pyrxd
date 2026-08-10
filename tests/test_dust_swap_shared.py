@@ -8,8 +8,10 @@ paths (live runs against regtest / mainnet, recorded in the dust report).
 
 from __future__ import annotations
 
+import json
 import math
 import os
+import stat
 import sys
 from pathlib import Path
 
@@ -20,6 +22,7 @@ _SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(_SCRIPTS))
 from _dust_swap_shared import (
     atomic_write_mode_600,
+    merge_into_mode_600,
     validated_resume_deadline_s,
 )
 
@@ -148,3 +151,47 @@ class TestAtomicWriteMode600:
         with pytest.raises(OSError, match="simulated"):
             atomic_write_mode_600(target, "anything")
         assert not target.exists(), "half-written file should have been unlinked"
+
+
+# --------------------------------------------------------------------------- merge_into_mode_600
+
+
+class TestMergeIntoMode600:
+    """The UPDATE peer of ``atomic_write_mode_600`` (which is ``O_EXCL``, create-only).
+
+    The recovery file is written BEFORE funding, so a crash mid-run cannot strand value —
+    but that means locators which only exist afterwards (the BTC HTLC funding outpoint,
+    the deployed ETH contract address) were printed to the console and then lost. Both
+    are required by the cold toolkit to prove a scraped preimage belongs to THIS swap.
+    """
+
+    def test_merges_without_disturbing_the_existing_fields(self, tmp_path: Path) -> None:
+        target = tmp_path / "keys.json"
+        atomic_write_mode_600(target, json.dumps({"hashlock_H": "ab", "taker_rxd_wif": "secret"}))
+        merge_into_mode_600(target, {"btc_funding_outpoint": "cd" * 32 + ":0"})
+        doc = json.loads(target.read_text())
+        assert doc["btc_funding_outpoint"] == "cd" * 32 + ":0"
+        assert doc["taker_rxd_wif"] == "secret"
+
+    def test_the_merged_file_is_still_owner_only(self, tmp_path: Path) -> None:
+        # A fresh temp file + os.replace would silently widen the mode to the umask
+        # default without the explicit fchmod — and this file holds every key in the swap.
+        target = tmp_path / "keys.json"
+        atomic_write_mode_600(target, json.dumps({"a": 1}))
+        merge_into_mode_600(target, {"b": 2})
+        assert stat.S_IMODE(os.stat(target).st_mode) == 0o600
+
+    def test_a_failed_merge_leaves_the_original_intact_and_no_temp_behind(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "keys.json"
+        atomic_write_mode_600(target, json.dumps({"taker_rxd_wif": "secret"}))
+
+        def _boom(*_a: object, **_k: object) -> None:
+            raise OSError("simulated")
+
+        monkeypatch.setattr(os, "replace", _boom)
+        with pytest.raises(OSError, match="simulated"):
+            merge_into_mode_600(target, {"b": 2})
+        assert json.loads(target.read_text()) == {"taker_rxd_wif": "secret"}
+        assert list(tmp_path.iterdir()) == [target], "the temp file must not be left lying around"
