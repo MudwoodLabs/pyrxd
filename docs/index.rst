@@ -20,6 +20,13 @@ Install with ``pip install pyrxd``.
 
 .. toctree::
    :maxdepth: 1
+   :caption: Protocol specifications
+
+   htlc-handshake-wire-format
+   swap-order-wire-format
+
+.. toctree::
+   :maxdepth: 1
    :caption: Project
 
    Source on GitHub <https://github.com/MudwoodLabs/pyrxd>

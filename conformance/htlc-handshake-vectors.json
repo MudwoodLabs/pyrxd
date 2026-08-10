@@ -1,0 +1,284 @@
+{
+  "schema": "radiant-htlc-handshake/1",
+  "builder": "pyrxd.gravity.swap_state: NegotiatedTerms.to_dict / from_dict; pyrxd.gravity.htlc_covenant: build_htlc_covenant_{rxd,ft,nft} / holder_hash; pyrxd.btc_wallet.taproot: build_htlc / claim_leaf_script / refund_leaf_script; pyrxd.gravity.swap_coordinator: assert_timelock_margin",
+  "provenance": "REFERENCE vectors produced by pyrxd from its own builders \u2014 pyrxd is the reference PRODUCER here, so this suite is a regression lock against silent drift, not an independent cross-check. NO mainnet-anchored vector (tracked follow-up). The swap stack these vectors describe is UNAUDITED: passing this suite means a second implementation agrees with pyrxd's bytes, NOT that the protocol is safe. The 32-byte preimage below is a fixed ASCII string, deliberately not CSPRNG output, so that no conformance file ever carries a value that could open a funded HTLC. Guarded by tests/test_htlc_handshake_conformance_vectors.py.",
+  "notes": {
+    "hashlock": "H = SHA256(p), SINGLE sha256, exactly 32 bytes. p itself is exactly 32 bytes and NEVER crosses the wire.",
+    "dest_hashes": "taker_dest_hash / maker_dest_hash are hash256 (double-SHA256) of the holder script, NOT of a pkh.",
+    "timelock_ordering": "t_btc MUST exceed t_rxd by at least the verifier's own margin. The taker locks first and holds the LONGER refund.",
+    "t_rxd_unit": "t_rxd MUST be BLOCKS. The Radiant covenant CSV has no SECONDS encoding.",
+    "omitted_defaults": "counter_chain/value_amount/eth_timeout_unix_s/credential_ref are emitted only when they differ from the BTC defaults; a reader MUST apply the defaults for absent keys.",
+    "hex": "bare lowercase, no 0x prefix; genesis_txid in derivation_params is DISPLAY byte order, the 36-byte wire ref is reversed-txid || vout LE32."
+  },
+  "hashlock_vectors": [
+    {
+      "id": "preimage-32-ascii",
+      "source": "reference",
+      "preimage_ascii": "pyrxd-htlc-conformance-vect-0001",
+      "preimage_len": 32,
+      "hashlock_hex": "c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb",
+      "conforming": true
+    },
+    {
+      "id": "preimage-31-too-short",
+      "source": "reference",
+      "preimage_ascii": "pyrxd-htlc-conformance-vect-000",
+      "preimage_len": 31,
+      "hashlock_hex": "e7c14c58d6fc0ffabe74391ecbb8fa31d9e87b457b7d36e559d83648e3380029",
+      "conforming": false,
+      "why": "OP_SIZE <0x20> OP_EQUALVERIFY on both legs' claim branches rejects any preimage that is not exactly 32 bytes; a builder MUST refuse it before broadcast."
+    },
+    {
+      "id": "preimage-33-too-long",
+      "source": "reference",
+      "preimage_ascii": "pyrxd-htlc-conformance-vect-0001z",
+      "preimage_len": 33,
+      "hashlock_hex": "f5d35188242deeea1d28d5f30fc2fe2b43829c8ec30337dab0cfb34a8951240e",
+      "conforming": false,
+      "why": "Same pin. A non-32-byte p that still satisfies H would be skipped by the 32-byte-only scrape and strand the counterparty (fixed preimage-length theft vector)."
+    }
+  ],
+  "margin_vectors": [
+    {
+      "id": "margin-ok-gap-40-margin-36",
+      "source": "reference",
+      "t_btc": {
+        "value": 60,
+        "unit": "blocks"
+      },
+      "t_rxd": {
+        "value": 20,
+        "unit": "blocks"
+      },
+      "margin": {
+        "value": 36,
+        "unit": "blocks"
+      },
+      "block_interval_s": 600.0,
+      "verdict": "accept"
+    },
+    {
+      "id": "margin-too-tight-gap-10-margin-36",
+      "source": "reference",
+      "t_btc": {
+        "value": 60,
+        "unit": "blocks"
+      },
+      "t_rxd": {
+        "value": 50,
+        "unit": "blocks"
+      },
+      "margin": {
+        "value": 36,
+        "unit": "blocks"
+      },
+      "block_interval_s": 600.0,
+      "verdict": "reject",
+      "why": "insufficient margin: t_btc - t_rxd = 10 blk < required 36 blk"
+    },
+    {
+      "id": "margin-inverted-ordering",
+      "source": "reference",
+      "t_btc": {
+        "value": 20,
+        "unit": "blocks"
+      },
+      "t_rxd": {
+        "value": 60,
+        "unit": "blocks"
+      },
+      "margin": {
+        "value": 36,
+        "unit": "blocks"
+      },
+      "block_interval_s": 600.0,
+      "verdict": "reject",
+      "why": "t_btc must EXCEED t_rxd. Inverting the order lets the first-locking party's refund open first \u2014 the maker can then claim the counter leg AND refund the asset."
+    },
+    {
+      "id": "margin-cross-unit-inversion",
+      "source": "reference",
+      "t_btc": {
+        "value": 600,
+        "unit": "seconds"
+      },
+      "t_rxd": {
+        "value": 12,
+        "unit": "blocks"
+      },
+      "margin": {
+        "value": 36,
+        "unit": "blocks"
+      },
+      "block_interval_s": 600.0,
+      "verdict": "reject",
+      "why": "600 s normalises to 1 block at a 600 s interval, which is BELOW t_rxd. NegotiatedTerms' cheap same-unit construction guard does NOT fire here \u2014 only the normalising margin check catches it. A conforming implementation MUST run the normalising check."
+    }
+  ],
+  "terms_vectors": [
+    {
+      "id": "btc-rxd",
+      "source": "reference",
+      "derivation_params": {
+        "taker_pkh_hex": "1111111111111111111111111111111111111111",
+        "maker_pkh_hex": "2222222222222222222222222222222222222222",
+        "btc_network": "bc",
+        "btc_claim_leaf_script_hex": "82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb88203333333333333333333333333333333333333333333333333333333333333333ac",
+        "btc_refund_leaf_script_hex": "013cb275204444444444444444444444444444444444444444444444444444444444444444ac",
+        "btc_funding_scriptpubkey_hex": "51209d6253be8748ce4770fb04ae258140717533f82dbfdbe522217542251db3d8fd",
+        "btc_funding_address": "bc1pn4398058fr8ywu8mqjhztq2qw96n87pdhld72g3pw4pz28dnmr7s3djm6k"
+      },
+      "terms": {
+        "hashlock": "c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb",
+        "btc_sats": 100000,
+        "radiant_amount": 100000,
+        "t_btc": {
+          "value": 60,
+          "unit": "blocks"
+        },
+        "t_rxd": {
+          "value": 20,
+          "unit": "blocks"
+        },
+        "asset_variant": "rxd",
+        "genesis_ref": "",
+        "taker_dest_hash": "f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37",
+        "maker_dest_hash": "ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b162",
+        "btc_claim_pubkey_xonly": "3333333333333333333333333333333333333333333333333333333333333333",
+        "btc_refund_pubkey_xonly": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d0114b27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
+    },
+    {
+      "id": "btc-ft",
+      "source": "reference",
+      "derivation_params": {
+        "taker_pkh_hex": "1111111111111111111111111111111111111111",
+        "maker_pkh_hex": "2222222222222222222222222222222222222222",
+        "btc_network": "bc",
+        "btc_claim_leaf_script_hex": "82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb88203333333333333333333333333333333333333333333333333333333333333333ac",
+        "btc_refund_leaf_script_hex": "013cb275204444444444444444444444444444444444444444444444444444444444444444ac",
+        "btc_funding_scriptpubkey_hex": "51209d6253be8748ce4770fb04ae258140717533f82dbfdbe522217542251db3d8fd",
+        "btc_funding_address": "bc1pn4398058fr8ywu8mqjhztq2qw96n87pdhld72g3pw4pz28dnmr7s3djm6k"
+      },
+      "terms": {
+        "hashlock": "c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb",
+        "btc_sats": 100000,
+        "radiant_amount": 5000,
+        "t_btc": {
+          "value": 60,
+          "unit": "blocks"
+        },
+        "t_rxd": {
+          "value": 20,
+          "unit": "blocks"
+        },
+        "asset_variant": "ft",
+        "genesis_ref": "01e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000",
+        "taker_dest_hash": "a831b57d2fb14c06dd8d58b41b5c7daace489126392da8c25ac9d51b26caf227",
+        "maker_dest_hash": "6d51abe99d4ed3381a56f43f4da2cb2c383f4801a4bc7ad0ed5479f3046cc25c",
+        "btc_claim_pubkey_xonly": "3333333333333333333333333333333333333333333333333333333333333333",
+        "btc_refund_pubkey_xonly": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "covenant_scriptpubkey_hex": "d001e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000c4519d76de519ddc0288139d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cdaa20a831b57d2fb14c06dd8d58b41b5c7daace489126392da8c25ac9d51b26caf227877767519d0114b27500cdaa206d51abe99d4ed3381a56f43f4da2cb2c383f4801a4bc7ad0ed5479f3046cc25c8768bdd001e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000dec0e9aa76e378e4a269e69d"
+    },
+    {
+      "id": "btc-nft",
+      "source": "reference",
+      "derivation_params": {
+        "taker_pkh_hex": "1111111111111111111111111111111111111111",
+        "maker_pkh_hex": "2222222222222222222222222222222222222222",
+        "btc_network": "bc",
+        "btc_claim_leaf_script_hex": "82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb88203333333333333333333333333333333333333333333333333333333333333333ac",
+        "btc_refund_leaf_script_hex": "013cb275204444444444444444444444444444444444444444444444444444444444444444ac",
+        "btc_funding_scriptpubkey_hex": "51209d6253be8748ce4770fb04ae258140717533f82dbfdbe522217542251db3d8fd",
+        "btc_funding_address": "bc1pn4398058fr8ywu8mqjhztq2qw96n87pdhld72g3pw4pz28dnmr7s3djm6k"
+      },
+      "terms": {
+        "hashlock": "c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb",
+        "btc_sats": 100000,
+        "radiant_amount": 546,
+        "t_btc": {
+          "value": 60,
+          "unit": "blocks"
+        },
+        "t_rxd": {
+          "value": 20,
+          "unit": "blocks"
+        },
+        "asset_variant": "nft",
+        "genesis_ref": "01e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000",
+        "taker_dest_hash": "ab4f06cc51c6e3d31ee445240882c70aa3c9c3dd4bc6222b6c994340d8833859",
+        "maker_dest_hash": "4f9e31140f311d888dd2acab3df2915f0e76f978d90b2a965999493f1577de60",
+        "btc_claim_pubkey_xonly": "3333333333333333333333333333333333333333333333333333333333333333",
+        "btc_refund_pubkey_xonly": "4444444444444444444444444444444444444444444444444444444444444444"
+      },
+      "covenant_scriptpubkey_hex": "d801e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000c4519dde519d00cc0222029d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cdaa20ab4f06cc51c6e3d31ee445240882c70aa3c9c3dd4bc6222b6c994340d8833859877767519d0114b27500cdaa204f9e31140f311d888dd2acab3df2915f0e76f978d90b2a965999493f1577de608768"
+    },
+    {
+      "id": "eth-rxd",
+      "source": "reference",
+      "derivation_params": {
+        "taker_pkh_hex": "1111111111111111111111111111111111111111",
+        "maker_pkh_hex": "2222222222222222222222222222222222222222"
+      },
+      "terms": {
+        "hashlock": "c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb",
+        "btc_sats": 100000,
+        "radiant_amount": 100000,
+        "t_btc": {
+          "value": 60,
+          "unit": "blocks"
+        },
+        "t_rxd": {
+          "value": 20,
+          "unit": "blocks"
+        },
+        "asset_variant": "rxd",
+        "genesis_ref": "",
+        "taker_dest_hash": "f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37",
+        "maker_dest_hash": "ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b162",
+        "btc_claim_pubkey_xonly": "0000000000000000000000000000000000000000000000000000000000000000",
+        "btc_refund_pubkey_xonly": "0000000000000000000000000000000000000000000000000000000000000000",
+        "counter_chain": "eth",
+        "value_amount": 1000000000000000,
+        "eth_timeout_unix_s": 1800000000
+      },
+      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d0114b27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
+    },
+    {
+      "id": "btc-rxd-credential-gated",
+      "source": "reference",
+      "derivation_params": {
+        "taker_pkh_hex": "1111111111111111111111111111111111111111",
+        "maker_pkh_hex": "2222222222222222222222222222222222222222",
+        "btc_network": "bc",
+        "btc_claim_leaf_script_hex": "82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb88203333333333333333333333333333333333333333333333333333333333333333ac",
+        "btc_refund_leaf_script_hex": "013cb275204444444444444444444444444444444444444444444444444444444444444444ac",
+        "btc_funding_scriptpubkey_hex": "51209d6253be8748ce4770fb04ae258140717533f82dbfdbe522217542251db3d8fd",
+        "btc_funding_address": "bc1pn4398058fr8ywu8mqjhztq2qw96n87pdhld72g3pw4pz28dnmr7s3djm6k"
+      },
+      "terms": {
+        "hashlock": "c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb",
+        "btc_sats": 100000,
+        "radiant_amount": 100000,
+        "t_btc": {
+          "value": 60,
+          "unit": "blocks"
+        },
+        "t_rxd": {
+          "value": 20,
+          "unit": "blocks"
+        },
+        "asset_variant": "rxd",
+        "genesis_ref": "",
+        "taker_dest_hash": "f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37",
+        "maker_dest_hash": "ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b162",
+        "btc_claim_pubkey_xonly": "3333333333333333333333333333333333333333333333333333333333333333",
+        "btc_refund_pubkey_xonly": "4444444444444444444444444444444444444444444444444444444444444444",
+        "credential_ref": "01e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e001000000"
+      },
+      "covenant_scriptpubkey_hex": "c4519d76009c637c82012088a820c8cfe67f2d85148469f2998b7259d7cf356463c18a649c693e75f775a5259ddb8800cc03a08601a26900cdaa20f556d6f9c7bfc196c1ad35f89669e7a8059f95cc6cb5e57e54edbd87b38ace37877767519d0114b27500cc03a08601a26900cdaa20ba62286130c024d125dc9ad9e1672f5ed7619b5cef52b66a34b4517e5b64b1628768"
+    }
+  ]
+}
