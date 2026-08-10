@@ -151,7 +151,7 @@ class TestSetupCoinType:
 
     def test_existing_config_updated_in_place(self, runner: CliRunner, tmp_path: Path, tmp_wallet_path: Path) -> None:
         cfg_path = tmp_path / "config.toml"
-        cfg_path.write_text('network = "testnet"\nfee_rate = 5000\n')
+        cfg_path.write_text('network = "testnet"\nfee_rate = 25000\n')
         n, e = _patches(node_ok=False, electrumx_ok=False)
         with patch("pyrxd.cli.setup_cmd._config.DEFAULT_CONFIG_PATH", cfg_path), n, e:
             result = runner.invoke(
@@ -163,7 +163,7 @@ class TestSetupCoinType:
 
         cfg = _config.load(cfg_path)
         assert cfg.coin_type == 0
-        assert cfg.fee_rate == 5000  # untouched
+        assert cfg.fee_rate == 25_000  # untouched
 
     def test_bare_rerun_does_not_clobber_existing_coin_type(
         self, runner: CliRunner, tmp_path: Path, tmp_wallet_path: Path
