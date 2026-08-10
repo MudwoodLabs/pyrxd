@@ -412,14 +412,34 @@ def parse_mutable_nft_script(script: bytes) -> tuple[GlyphRef, bytes] | None:
 # ---------------------------------------------------------------------------
 # The OP_PUSHINPUTREF family. Each of these opcodes, when it appears in an
 # *opcode position* (not inside push-data), is followed by a 36-byte ref
-# operand — matching Radiant consensus ``CScript::GetPushRefs``
-# (Radiant-Core/src/script/script.cpp). A bare-byte scan cannot tell an
+# operand. This set is EXACTLY the one Radiant consensus follows with a 36-byte
+# operand in ``GetScriptOp`` (Radiant-Core/src/script/script.cpp:710-716), and
+# exactly the set ``CScript::GetPushRefs`` (:586-590) collects refs for:
+#
+#   0xd0  OP_PUSHINPUTREF
+#   0xd1  OP_REQUIREINPUTREF
+#   0xd2  OP_DISALLOWPUSHINPUTREF
+#   0xd3  OP_DISALLOWPUSHINPUTREFSIBLING
+#   0xd8  OP_PUSHINPUTREFSINGLETON
+#
+# It is NOT the contiguous range 0xd0–0xd8. The four opcodes in between —
+# 0xd4 OP_REFHASHDATASUMMARY_UTXO, 0xd5 OP_REFHASHVALUESUM_UTXOS,
+# 0xd6 OP_REFHASHDATASUMMARY_OUTPUT, 0xd7 OP_REFHASHVALUESUM_OUTPUTS
+# (Radiant-Core/src/script/script.h:281-284) — are pure stack operations that
+# take NO operand. Consuming 36 bytes after one of them desynchronizes the walk
+# from consensus: depending on the byte the walk resumes on, it either raises
+# ``TruncatedScriptError`` (fail-closed) or silently resynchronizes and reports
+# a PHANTOM ref while dropping the real one. Since ``count_input_refs`` /
+# ``is_token_bearing_script`` classify arbitrary chain scripts, that second case
+# lets a token-bearing UTXO read as plain funding and be burned as a fee input.
+#
+# A bare-byte scan is wrong for a different reason: it cannot tell an
 # opcode-position ref byte from a 0xd0–0xd8 byte sitting inside a pushed
 # payload (e.g. ~51% of random P2PKH pubkey-hashes contain one); only an
 # opcode-aware walk is correct. See
 # docs/solutions/logic-errors/funding-utxo-byte-scan-dos.md and
 # docs/solutions/logic-errors/ft-in-covenant-two-consensus-gates.md.
-REF_OPCODES = frozenset(range(0xD0, 0xD9))  # 0xd0..0xd8 inclusive
+REF_OPCODES = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
 
 
 class TruncatedScriptError(ValidationError):
@@ -434,11 +454,13 @@ class TruncatedScriptError(ValidationError):
 def iter_input_refs(script: bytes):
     """Yield ``(opcode, ref_operand)`` for each OP_PUSHINPUTREF-family opcode
     in *script*, walking it as an opcode stream the way Radiant consensus does
-    (``CScript::GetPushRefs``).
+    (``GetScriptOp`` / ``CScript::GetPushRefs``).
 
     Push opcodes consume their payload, so a ref-range byte inside push-data is
     never mistaken for an opcode. Each ``ref_operand`` is the 36 bytes
-    following the opcode.
+    following the opcode. Only :data:`REF_OPCODES` carry an operand — the
+    REFHASH* opcodes ``0xd4``–``0xd7`` sit in the same byte range but are
+    operand-less stack operations and must advance the walk by one byte.
 
     Raises :class:`TruncatedScriptError` if the script ends mid-push or a ref
     opcode's 36-byte operand is truncated — the script's structure is

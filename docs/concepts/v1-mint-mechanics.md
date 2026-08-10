@@ -284,9 +284,11 @@ producing a covenant-rejected broadcast:
    an FT, NFT, or dMint UTXO as `vin[1]` would destroy the token.
    `find_dmint_funding_utxo` and `_build_dmint_v1_mint_tx` both
    reject any funding input whose script contains an
-   `OP_PUSHINPUTREF`-family opcode (`0xd0`–`0xd8`) via
-   `is_token_bearing_script`. An opcode-aware classifier — not a
-   byte-substring scan, which would misclassify legitimate P2PKH
+   `OP_PUSHINPUTREF`-family opcode (`0xd0`, `0xd1`, `0xd2`, `0xd3`,
+   `0xd8` — **not** the contiguous `0xd0`–`0xd8` range; `0xd4`–`0xd7`
+   are operand-less `REFHASH*` stack opcodes, see the protocol spec
+   §2.2) via `is_token_bearing_script`. An opcode-aware classifier —
+   not a byte-substring scan, which would misclassify legitimate P2PKH
    addresses with matching payload bytes.
 
 3. **Missing OP_RETURN at vout[2].**
