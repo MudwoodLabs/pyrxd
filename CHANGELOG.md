@@ -8,6 +8,55 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Cross-chain HTLC swap-handshake wire format — `docs/htlc-handshake-wire-format.md` plus
+  `conformance/htlc-handshake-vectors.json`.** The swap *legs* were already specified by their
+  chains; the negotiation that precedes them was not specified anywhere. It lived implicitly in
+  `SwapCoordinator` and two operator harnesses, which meant a second implementation could
+  reproduce every on-chain artifact and still be unable to complete a swap — it had no way to
+  tell which fields cross the wire, which are local policy, which are consensus-binding, and
+  which are decorative.
+
+  The spec is derived from the implementation, not from a plan, and every normative statement is
+  pinned to a `file:line` or a test. It covers the five artifacts that cross between the parties,
+  the `NegotiatedTerms` JSON wire form field by field (including the omit-when-default rules a
+  reader must apply, or it will reject every honest BTC handshake), the state transitions each
+  message drives, and — the part that loses funds when it is wrong — the exact constraints on the
+  hashlock, the per-leg timelock deltas, the destination bindings, and the funding and finality
+  parameters. Two of those deserve naming here:
+
+  - **The preimage is exactly 32 bytes**, and this is consensus-pinned on both legs
+    (`OP_SIZE <0x20> OP_EQUALVERIFY` ahead of the hashlock check). The spec states the rule
+    normatively and explains the vector it closes: a non-32-byte `p'` with `SHA256(p') = H`
+    satisfies a naive hashlock check, so the maker's claim succeeds, but the 32-byte-only witness
+    scrape silently finds nothing and the counterparty's asset strands until the CSV refund takes
+    it. An implementer who treats the length as a convention walks straight into the bug this
+    repo already fixed.
+  - **The timelock direction is counterintuitive and load-bearing.** `t_btc − t_rxd >= margin`:
+    the party who locks first holds the *longer* refund. Inverting it collapses the window in
+    which the second claimer can act.
+
+  A shipped conformance suite (51 checks) makes the spec executable rather than prose-only: five
+  `terms` vectors across all three asset variants and both counter chains, three preimage-length
+  vectors, and four margin verdicts, each republishing the two scriptPubKeys a counterparty
+  independently re-derives. One vector pair is itself a finding — the `rxd`, `ft` and `nft`
+  vectors derive the *identical* BTC funding address, because the taptree commits to nothing on
+  the Radiant side. Verifying the counter leg tells you nothing about which asset you are buying.
+
+  Writing the spec surfaced eight interop hazards, recorded in the document rather than smoothed
+  over. The two with fund-loss consequence: the maker-side "did the taker fund the right HTLC for
+  the right amount" check exists only in a script, not in the library, and `SwapCoordinator`
+  explicitly declines to provide it for a BTC leg — an under-funded HTLC therefore pays the maker
+  less than the agreed price, and the coordinator's own amount bind cannot catch it because it
+  runs on the honest taker's leg. And the `schema` tag every envelope carries is written at four
+  sites and read at none, while `NegotiatedTerms` has no version field and silently drops unknown
+  keys — so there is no mechanism by which a receiver can detect that a sender meant something it
+  does not understand. Safety consequently rests on the two re-derived scriptPubKey comparisons,
+  not on the envelope; anything outside them is effectively unauthenticated.
+
+  The document carries the swap stack's **UNAUDITED** status prominently and states that the
+  stack defends safety, not liveness — capital-lockup griefing remains an accepted residual
+  (threat model S22). A passing conformance run is a regression lock, not an assurance argument.
+
 - **Multi-recipient FT airdrop — `glyph airdrop-ft`, `FtUtxoSet.build_airdrop_tx`,
   `GlyphBuilder.build_ft_airdrop_tx`.** One transaction paying N recipients, instead of N
   sequential transfers. The difference is not convenience: sequential transfers chain, each
