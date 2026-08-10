@@ -856,7 +856,30 @@ async def read_fee_utxos(client: Any, wif: str) -> list[Any]:
     return list(await client.get_utxos(electrumx_script_hash(fee_scriptpubkey(wif))))
 
 
-def select_fee_utxo(utxos: Sequence[Any], *, floor: int, target: int, explicit: str | None) -> Any:
+#: How many times the fee requirement a single input may exceed before it is treated as a
+#: mistake rather than a choice. The covenant permits ONE output, so there is no change and the
+#: ENTIRE input becomes the miner fee — an operator who points the cold toolkit at an ordinary
+#: funded key (one 500 RXD UTXO) was burning ~18,700x the ~2.66M-photon requirement while the
+#: CLI reported that the fee "clears the deadline-aware TARGET" (audit B4). 10x leaves generous
+#: headroom for a deadline-critical spend and still catches a whole-wallet UTXO by three orders
+#: of magnitude. It is a MULTIPLE, not an absolute: a genuinely large requirement scales with it.
+MAX_FEE_OVERPAY_MULTIPLE: int = 10
+
+
+def fee_overpay_ceiling(*, floor: int, target: int) -> int:
+    """The largest fee input the cold path will burn without an explicit ``--allow-overpay``."""
+    return max(int(floor), int(target)) * MAX_FEE_OVERPAY_MULTIPLE
+
+
+def fee_overpay_multiple(fee_photons: int, *, floor: int, target: int) -> float:
+    """How many times the fee requirement this input actually pays (>= 1.0 is normal)."""
+    requirement = max(int(floor), int(target), 1)
+    return int(fee_photons) / requirement
+
+
+def select_fee_utxo(
+    utxos: Sequence[Any], *, floor: int, target: int, explicit: str | None, allow_overpay: bool = False
+) -> Any:
     """Pick the fee input, or explain exactly why none will do.
 
     The covenant permits a single output, so there is no change and **the whole fee
@@ -869,11 +892,30 @@ def select_fee_utxo(utxos: Sequence[Any], *, floor: int, target: int, explicit: 
     and refusing a spend the node would have accepted is how an operator loses the asset
     to the counterparty's refund (the same reasoning as
     :func:`~pyrxd.gravity.fee_policy.assert_fee_covers`).
+
+    Both ends are bounded. Below the floor the node rejects outright; ABOVE
+    :func:`fee_overpay_ceiling` the input is refused as an overpay (audit B4) — the
+    dust-floor check in :func:`pyrxd.gravity.htlc_spend._check_carrier` claims to guard "a
+    mistakenly-huge UTXO" but only ever checked the small end. ``allow_overpay=True`` is the
+    deliberate override, and it applies to an explicitly named ``--fee-utxo`` too: naming a
+    UTXO by hand is not consent to burn 500 RXD on a 0.0266 RXD fee.
     """
+    ceiling = fee_overpay_ceiling(floor=floor, target=target)
+
+    def _reject_overpay(value: int, *, chosen_by: str) -> ValidationError:
+        return ValidationError(
+            f"OVERPAY refused: the {chosen_by} fee input is {value} photons against a requirement of "
+            f"~{max(int(floor), int(target))} photons ({value / max(int(floor), int(target), 1):.0f}x). The "
+            "covenant permits ONE output, so there is no change — the ENTIRE input is paid to the miner. "
+            f"Carve a fee UTXO under ~{ceiling} photons, or pass --allow-overpay to burn this one deliberately."
+        )
+
     if explicit is not None:
         want = parse_outpoint(explicit, what="--fee-utxo")
         for u in utxos:
             if u.tx_hash == want.txid and int(u.tx_pos) == want.vout:
+                if int(u.value) > ceiling and not allow_overpay:
+                    raise _reject_overpay(int(u.value), chosen_by="requested")
                 return u
         raise ValidationError(
             f"--fee-utxo {explicit} is not an unspent output of the fee key. "
@@ -882,13 +924,18 @@ def select_fee_utxo(utxos: Sequence[Any], *, floor: int, target: int, explicit: 
     if not utxos:
         raise ValidationError("the fee key has no unspent outputs; fund it before building a cold spend")
     by_value = sorted(utxos, key=lambda u: int(u.value))
-    for u in by_value:
+    in_band = by_value if allow_overpay else [u for u in by_value if int(u.value) <= ceiling]
+    for u in in_band:
         if int(u.value) >= target:
             return u
-    for u in by_value:
+    for u in in_band:
         if int(u.value) >= floor:
             return u
     biggest = int(by_value[-1].value)
+    if biggest > ceiling:
+        # There IS an input that clears the floor — it is just absurdly large. Say that,
+        # rather than the misleading "no fee input clears the relay floor".
+        raise _reject_overpay(biggest, chosen_by="only available")
     raise ValidationError(
         f"no fee input clears the relay floor: the largest available is {biggest} photons, the floor is "
         f"~{floor} photons. Radiant has no RBF and no CPFP, so an under-fee'd spend cannot be bumped — "
@@ -984,6 +1031,10 @@ class ColdSpend:
     csv_confirmations: int
     csv_mature: bool
     outputs: tuple[dict[str, Any], ...]
+    #: fee paid / fee required. The whole input is the fee, so this is the real overpay factor.
+    overpay_multiple: float = 1.0
+    #: True when the fee exceeds :func:`fee_overpay_ceiling` — reachable only via --allow-overpay.
+    is_overpay: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1005,6 +1056,8 @@ class ColdSpend:
             "csv_confirmations": self.csv_confirmations,
             "csv_mature": self.csv_mature,
             "outputs": list(self.outputs),
+            "overpay_multiple": self.overpay_multiple,
+            "is_overpay": self.is_overpay,
             "broadcast": False,
         }
 
@@ -1066,6 +1119,27 @@ def _measure(
     )
 
 
+def _assert_covenant_confirmed(chain: CovenantChainState, *, allow_unconfirmed: bool, kind: str) -> None:
+    """Refuse to build against a covenant that is only in the mempool (audit B5).
+
+    ElectrumX ``listunspent`` returns UNCONFIRMED outputs, so
+    :func:`read_covenant_chain_state` happily resolves a 0-conf covenant and the cold builders
+    exited 0 against it. A spend of an unconfirmed parent dies with that parent: if the funding
+    is conflicted out (or simply never mines), the child is unrelayable, and with neither RBF
+    nor CPFP on Radiant its own fee input is then squatted on until the 8h mempool expiry —
+    inside the ``t_rxd`` window this claim exists to beat. The automated path already enforces
+    this (``radiant_leg.RadiantCovenantLeg._resolve_covenant``); the cold path is now the same.
+    """
+    if chain.confirmations >= 1 or allow_unconfirmed:
+        return
+    raise ValidationError(
+        f"the covenant funding is UNCONFIRMED (0 confirmations, mempool only) — refusing to build a cold "
+        f"{kind}. A spend of an unconfirmed parent dies with it, and Radiant has neither RBF nor CPFP, so "
+        "the fee input would then squat until the 8h mempool expiry. Wait for at least one confirmation, "
+        "or pass --allow-unconfirmed if you understand that this spend is only as good as its parent."
+    )
+
+
 def build_cold_claim(
     *,
     covenant: HtlcCovenant,
@@ -1074,6 +1148,7 @@ def build_cold_claim(
     fee_wif: str,
     fee_utxo: Any,
     policy: DeadlineFeePolicy | None = None,
+    allow_unconfirmed: bool = False,
 ) -> ColdSpend:
     """Build (never broadcast) the TAKER's claim spend and measure it against the deadline.
 
@@ -1081,8 +1156,12 @@ def build_cold_claim(
     opens once the covenant is ``t_rxd`` deep, so that is the number of Radiant blocks in
     which this claim must be **mined**, not merely broadcast. Clamped at 0 — a deadline
     already passed takes the maximum premium, never a negative one.
+
+    Refuses a 0-conf (mempool-only) covenant unless ``allow_unconfirmed`` — see
+    :func:`_assert_covenant_confirmed`.
     """
     pol = policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+    _assert_covenant_confirmed(chain, allow_unconfirmed=allow_unconfirmed, kind="claim")
     fee = _fee_input_from(fee_wif, fee_utxo)
     tx = build_htlc_claim_tx(
         covenant=covenant,
@@ -1113,6 +1192,8 @@ def build_cold_claim(
         csv_confirmations=chain.confirmations,
         csv_mature=chain.confirmations >= covenant.refund_csv,
         outputs=_decode_outputs(tx, covenant, "claim"),
+        overpay_multiple=fee_overpay_multiple(fee.value, floor=floor, target=target),
+        is_overpay=fee.value > fee_overpay_ceiling(floor=floor, target=target),
     )
 
 
@@ -1124,6 +1205,7 @@ def build_cold_refund(
     fee_utxo: Any,
     policy: DeadlineFeePolicy | None = None,
     allow_immature: bool = False,
+    allow_unconfirmed: bool = False,
 ) -> ColdSpend:
     """Build (never broadcast) the MAKER's CSV refund spend.
 
@@ -1137,8 +1219,12 @@ def build_cold_refund(
     workflow (assemble and inspect now, broadcast the moment the CSV opens). It is off
     by default so an operator cannot broadcast a non-final refund by accident — with no
     RBF, that transaction would then squat on the covenant for up to 8 hours.
+
+    ``allow_immature`` is about the CSV, NOT about the parent's existence on-chain: a 0-conf
+    covenant is still refused unless ``allow_unconfirmed`` is also passed.
     """
     pol = policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+    _assert_covenant_confirmed(chain, allow_unconfirmed=allow_unconfirmed, kind="refund")
     mature = chain.confirmations >= covenant.refund_csv
     if not mature and not allow_immature:
         raise ValidationError(
@@ -1175,4 +1261,6 @@ def build_cold_refund(
         csv_confirmations=chain.confirmations,
         csv_mature=mature,
         outputs=_decode_outputs(tx, covenant, "refund"),
+        overpay_multiple=fee_overpay_multiple(fee.value, floor=floor, target=target),
+        is_overpay=fee.value > fee_overpay_ceiling(floor=floor, target=target),
     )

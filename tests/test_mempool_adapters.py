@@ -25,6 +25,10 @@ from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, 
 
 _SPIKE = _Path(__file__).resolve().parent.parent / "docs" / "brainstorms" / "gravity-ref-spike"
 
+#: The txid every scripted reader below is asked about. Esplora echoes it back in ``/tx/{txid}``,
+#: and the reader binds the echo (a source that answers about a DIFFERENT tx is refused).
+_TXID = "ab" * 32
+
 
 def _claim_vec():
     p = _SPIKE / ".live_swap_nft.json"
@@ -176,7 +180,7 @@ async def test_read_output_amount_above_min_confs():
     r = MempoolSpaceFundingReader()
     r._http.tx_status = AsyncMock(return_value={"confirmed": True, "block_height": 800_000})
     r._http.tip_height = AsyncMock(return_value=800_010)
-    r._http.tx_json = AsyncMock(return_value={"vout": [{"value": 100_000}, {"value": 5}]})
+    r._http.tx_json = AsyncMock(return_value={"txid": _TXID, "vout": [{"value": 100_000}, {"value": 5}]})
     assert await r.read_output_amount_sats("ab" * 32, 0, min_confirmations=6) == 100_000
 
 
@@ -194,7 +198,7 @@ async def test_read_output_amount_bad_vout_fail_closed():
     r = MempoolSpaceFundingReader()
     r._http.tx_status = AsyncMock(return_value={"confirmed": True, "block_height": 800_000})
     r._http.tip_height = AsyncMock(return_value=800_010)
-    r._http.tx_json = AsyncMock(return_value={"vout": [{"value": 100_000}]})
+    r._http.tx_json = AsyncMock(return_value={"txid": _TXID, "vout": [{"value": 100_000}]})
     with pytest.raises(NetworkError, match="could not read output value"):
         await r.read_output_amount_sats("ab" * 32, 5, min_confirmations=1)  # vout 5 OOB
 
@@ -202,12 +206,12 @@ async def test_read_output_amount_bad_vout_fail_closed():
 # ------------------------------------------- funding reader: confirmed-unspent output (maker gate)
 
 
-def _confirmed_reader(*, spk_hex="5120" + "11" * 32, value=100_000, spent=False, confs=6):
+def _confirmed_reader(*, spk_hex="5120" + "11" * 32, value=100_000, spent=False, confs=6, txid=_TXID):
     """A reader whose three Esplora reads (status, tx, outspend) are scripted."""
     r = MempoolSpaceFundingReader()
     r._http.tx_status = AsyncMock(return_value={"confirmed": confs > 0, "block_height": 800_000})
     r._http.tip_height = AsyncMock(return_value=800_000 + max(confs - 1, 0))
-    r._http.tx_json = AsyncMock(return_value={"vout": [{"scriptpubkey": spk_hex, "value": value}]})
+    r._http.tx_json = AsyncMock(return_value={"txid": txid, "vout": [{"scriptpubkey": spk_hex, "value": value}]})
     r._http.outspend = AsyncMock(return_value={"spent": spent})
     return r
 
@@ -247,6 +251,110 @@ async def test_read_confirmed_unspent_output_bad_vout_fails_closed():
 async def test_read_confirmed_unspent_output_rejects_negative_vout():
     with pytest.raises(ValidationError, match="non-negative"):
         await _confirmed_reader().read_confirmed_unspent_output("ab" * 32, -1)
+
+
+# ---------------------------------- B1: a present-but-falsy `spent` is NOT "unspent" ----------
+
+
+@pytest.mark.parametrize(
+    "hostile_spent",
+    [None, 0, "", [], {}, 0.0],
+    ids=["null", "zero", "empty-string", "empty-list", "empty-dict", "zero-float"],
+)
+async def test_read_confirmed_unspent_output_non_boolean_spent_fails_closed(hostile_spent):
+    """B1: only ``spent is False`` means UNSPENT.
+
+    ``bool(spend.get("spent", True))`` defaults only a MISSING key to True; a key that is
+    PRESENT and falsy (``null`` — what Esplora-shaped servers emit for "no data" — or ``0`` /
+    ``""`` / ``[]``) evaluated False and read as UNSPENT. A hostile or buggy source could then
+    make an already-swept HTLC output look live, and the maker's counter-funding gate would
+    lock its own asset against BTC that is gone. Anything that is not the boolean ``False``
+    is un-interpretable and must refuse.
+    """
+    r = _confirmed_reader()
+    r._http.outspend = AsyncMock(return_value={"spent": hostile_spent})
+    with pytest.raises(NetworkError, match="SPENT|uninterpretable"):
+        await r.read_confirmed_unspent_output("ab" * 32, 0)
+
+
+async def test_read_confirmed_unspent_output_true_spent_still_fails_closed():
+    """The honest SPENT answer keeps refusing (control for the parametrized case above)."""
+    with pytest.raises(NetworkError, match="SPENT"):
+        await _confirmed_reader(spent=True).read_confirmed_unspent_output("ab" * 32, 0)
+
+
+async def test_outspend_wire_rejects_non_boolean_spent():
+    """B1 (wire layer): ``_MempoolHttpClient.outspend`` only checked ``"spent" in data``, so
+    ``{"spent": null}`` passed the transport check too. The flag must be a real boolean."""
+    c = _MempoolHttpClient()
+    c.session = AsyncMock(return_value=_session_getting(_get_resp(200, b'{"spent": null}', "application/json")))
+    with pytest.raises(NetworkError, match="outspend"):
+        await c.outspend("ab" * 32, 0)
+
+
+async def test_outspend_wire_accepts_boolean_spent():
+    c = _MempoolHttpClient()
+    c.session = AsyncMock(return_value=_session_getting(_get_resp(200, b'{"spent": false}', "application/json")))
+    assert (await c.outspend("ab" * 32, 0))["spent"] is False
+
+
+# ------------------- B6: non-finite values and tx-identity on the fund-safety reads -----------
+
+
+@pytest.mark.parametrize("hostile", [float("inf"), float("-inf"), float("nan")], ids=["inf", "-inf", "nan"])
+async def test_read_confirmed_unspent_output_non_finite_value_fails_closed(hostile):
+    """B6: ``json.loads`` accepts ``Infinity``/``NaN``, and ``int(inf)`` raises ``OverflowError``
+    — absent from the fail-closed except tuple, so a hostile server turned a fund-safety read
+    into a traceback that escapes every ``except NetworkError``."""
+    r = _confirmed_reader()
+    r._http.tx_json = AsyncMock(
+        return_value={"txid": _TXID, "vout": [{"scriptpubkey": "5120" + "11" * 32, "value": hostile}]}
+    )
+    with pytest.raises(NetworkError, match="could not read output"):
+        await r.read_confirmed_unspent_output("ab" * 32, 0)
+
+
+@pytest.mark.parametrize("hostile", [float("inf"), float("nan")], ids=["inf", "nan"])
+async def test_read_output_amount_non_finite_value_fails_closed(hostile):
+    r = MempoolSpaceFundingReader()
+    r._http.tx_status = AsyncMock(return_value={"confirmed": True, "block_height": 800_000})
+    r._http.tip_height = AsyncMock(return_value=800_010)
+    r._http.tx_json = AsyncMock(return_value={"txid": _TXID, "vout": [{"value": hostile}]})
+    with pytest.raises(NetworkError, match="could not read output value"):
+        await r.read_output_amount_sats("ab" * 32, 0, min_confirmations=1)
+
+
+async def test_confirmations_non_finite_block_height_fails_closed():
+    """The same non-finite hazard on the depth read (``int(status["block_height"])``)."""
+    r = MempoolSpaceFundingReader()
+    r._http.tx_status = AsyncMock(return_value={"confirmed": True, "block_height": float("inf")})
+    r._http.tip_height = AsyncMock(return_value=800_010)
+    with pytest.raises(NetworkError):
+        await r.confirmations("ab" * 32)
+
+
+async def test_read_confirmed_unspent_output_rejects_a_different_txs_answer():
+    """B6: a single malicious source could serve ANOTHER transaction's favorable
+    ``(scriptPubKey, value)`` because the reader never checked the echoed ``txid``."""
+    r = _confirmed_reader(txid="cd" * 32)  # we asked about "ab"*32
+    with pytest.raises(NetworkError, match="different transaction|txid"):
+        await r.read_confirmed_unspent_output("ab" * 32, 0)
+
+
+async def test_read_confirmed_unspent_output_rejects_a_missing_txid():
+    r = _confirmed_reader()
+    r._http.tx_json = AsyncMock(return_value={"vout": [{"scriptpubkey": "5120" + "11" * 32, "value": 100_000}]})
+    with pytest.raises(NetworkError, match="different transaction|txid"):
+        await r.read_confirmed_unspent_output("ab" * 32, 0)
+
+
+async def test_read_output_amount_rejects_a_different_txs_answer():
+    r = MempoolSpaceFundingReader()
+    r._http.tx_status = AsyncMock(return_value={"confirmed": True, "block_height": 800_000})
+    r._http.tip_height = AsyncMock(return_value=800_010)
+    r._http.tx_json = AsyncMock(return_value={"txid": "cd" * 32, "vout": [{"value": 100_000}]})
+    with pytest.raises(NetworkError, match="different transaction|txid"):
+        await r.read_output_amount_sats("ab" * 32, 0, min_confirmations=1)
 
 
 # --------------------------------------------------------------------------- txid_of (local)

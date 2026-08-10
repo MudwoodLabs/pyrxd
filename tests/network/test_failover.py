@@ -17,7 +17,7 @@ from pyrxd.hash import double_sha256
 from pyrxd.network.failover import FailoverElectrumXClient
 from pyrxd.network.registry import Endpoint, NetworkProfile
 from pyrxd.security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError
-from pyrxd.security.types import BlockHeight, Txid
+from pyrxd.security.types import BlockHeight, RawTx, Txid
 
 pytestmark = pytest.mark.asyncio
 
@@ -44,6 +44,10 @@ class FakeClient:
         self.chain_error: Exception | None = None
         self.chain_checks = 0
         self.extension_error: Exception | None = None
+        # The read-back an "already known" claim must survive (audit B6): by default the
+        # node really does hold the transaction it says it holds.
+        self.get_transaction_error: Exception | None = None
+        self.get_transaction_result: bytes | None = None
 
     async def assert_chain(self, expected: str) -> str:
         self.chain_checks += 1
@@ -63,6 +67,12 @@ class FakeClient:
         if self.broadcast_error is not None:
             raise self.broadcast_error
         return Txid(self.broadcast_result or _EXPECTED_TXID)
+
+    async def get_transaction(self, txid: Txid) -> RawTx:
+        self.calls.append(("get_transaction", str(txid)))
+        if self.get_transaction_error is not None:
+            raise self.get_transaction_error
+        return RawTx(self.get_transaction_result if self.get_transaction_result is not None else _RAW_TX)
 
     async def call_extension(self, method: str, params: list | None = None) -> object:
         self.calls.append(("call_extension", method))
@@ -234,6 +244,58 @@ async def test_broadcast_already_in_chain_code_after_a_failure_is_success() -> N
     fakes[B].broadcast_error = PolicyRejection("already", code=-27, reason="transaction already in block chain")
 
     assert str(await client.broadcast(_RAW_TX)) == _EXPECTED_TXID
+
+
+async def test_broadcast_already_known_is_refused_when_the_node_cannot_produce_the_tx() -> None:
+    """B6: an "already known" claim is a CLAIM, not evidence.
+
+    After a transport failure elsewhere, a hostile or broken secondary can answer any
+    broadcast with RPC ``-27`` / ``txn-already-known`` and the wrapper reported SUCCESS
+    for a transaction that was never accepted anywhere — the caller then polls forever
+    for a ghost, and on a swap path believes its leg is locked. The claim must be
+    corroborated by a read that actually returns the transaction.
+    """
+    client, fakes = build([A, B])
+    fakes[A].broadcast_error = NetworkError("ElectrumX connection lost")
+    fakes[B].broadcast_error = PolicyRejection("already", code=-27, reason="transaction already in block chain")
+    fakes[B].get_transaction_error = NetworkError("no such mempool or blockchain transaction")
+
+    with pytest.raises(NetworkError):
+        await client.broadcast(_RAW_TX)
+
+
+async def test_broadcast_already_known_is_refused_when_the_read_back_is_a_different_tx() -> None:
+    """The read-back is bound to the SAME bytes: a node that serves some other transaction
+    has not demonstrated it holds ours."""
+    client, fakes = build([A, B])
+    fakes[A].broadcast_error = NetworkError("down")
+    fakes[B].broadcast_error = PolicyRejection("already", code=-27, reason="txn-already-known")
+    fakes[B].get_transaction_result = bytes(range(70)) * 2  # a valid RawTx, but not ours
+
+    with pytest.raises(NetworkError):
+        await client.broadcast(_RAW_TX)
+
+
+async def test_broadcast_already_known_is_refused_when_the_node_cannot_be_read_at_all() -> None:
+    """Fail-closed on a MISSING capability too: a client with no ``get_transaction`` cannot
+    corroborate its own claim, so the claim is not honored."""
+    client, fakes = build([A, B])
+    fakes[A].broadcast_error = NetworkError("down")
+    fakes[B].broadcast_error = PolicyRejection("already", code=-27, reason="txn-already-known")
+    fakes[B].get_transaction = None  # type: ignore[assignment]  # no read surface at all
+
+    with pytest.raises(NetworkError):
+        await client.broadcast(_RAW_TX)
+
+
+async def test_broadcast_already_known_corroborated_by_a_read_is_still_success() -> None:
+    """The honest lost-response case keeps working: node B really does hold the tx."""
+    client, fakes = build([A, B])
+    fakes[A].broadcast_error = NetworkError("ElectrumX connection lost")
+    fakes[B].broadcast_error = PolicyRejection("already", code=-27, reason="txn-already-known")
+
+    assert str(await client.broadcast(_RAW_TX)) == _EXPECTED_TXID
+    assert ("get_transaction", _EXPECTED_TXID) in fakes[B].calls
 
 
 async def test_broadcast_already_known_on_the_FIRST_attempt_still_raises() -> None:

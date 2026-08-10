@@ -250,3 +250,73 @@ def test_cannot_grow_inventory_via_constructor_list_mutation():
     src = CappedFeeWalletSource(caller_list, total_cap_photons=1_000_000)
     caller_list.append(_fee(1000))
     assert src.remaining_inputs == 2  # unaffected by the post-construction append
+
+
+# ---------------------- release_unspent: the cap must charge SPEND, not DISPENSE (audit B3) ----
+
+
+def test_release_unspent_uncharges_the_cap_without_rewinding_the_cursor():
+    """A dispensed input the caller never broadcast must not consume the operator's cap.
+
+    The leg dispenses BEFORE it builds, and the build can refuse (the fee is below the node's
+    deadline-aware relay floor). Nothing goes on-chain, no fee is paid — but the cap was
+    charged anyway, so refusals ate the budget that the covering input needed. The cursor is
+    deliberately NOT rewound: dispense-once is the property that stops the same UTXO ever
+    backing two transactions, and it must survive the un-charge.
+    """
+    src = CappedFeeWalletSource(_pool(500_000, 20_000_000), total_cap_photons=20_000_000)
+    first = src.next_fee_input()
+    assert src.dispensed_photons == 500_000
+    assert src.release_unspent(first) is True
+    assert src.dispensed_photons == 0  # charge refunded — nothing was spent
+    assert src.remaining_inputs == 1  # cursor NOT rewound: `first` is retired forever
+    second = src.next_fee_input()  # the covering input is now reachable under the cap
+    assert second.value == 20_000_000
+    assert (second.txid, second.vout) != (first.txid, first.vout)
+
+
+def test_release_unspent_is_idempotent_and_cannot_credit_twice():
+    src = CappedFeeWalletSource(_pool(1000, 1000), total_cap_photons=10_000)
+    f = src.next_fee_input()
+    assert src.release_unspent(f) is True
+    assert src.release_unspent(f) is False  # a second credit would fabricate budget
+    assert src.dispensed_photons == 0
+
+
+def test_release_unspent_refuses_an_input_this_source_never_dispensed():
+    src = CappedFeeWalletSource(_pool(1000), total_cap_photons=10_000)
+    src.next_fee_input()
+    with pytest.raises(ValidationError, match="never dispensed"):
+        src.release_unspent(_fee(50_000))
+    assert src.dispensed_photons == 1000
+
+
+def test_release_unspent_refuses_an_undispensed_pool_input():
+    """Crediting an input still ahead of the cursor would invent budget out of nothing."""
+    pool = _pool(1000, 2000)
+    src = CappedFeeWalletSource(pool, total_cap_photons=10_000)
+    src.next_fee_input()
+    with pytest.raises(ValidationError, match="never dispensed"):
+        src.release_unspent(pool[1])
+
+
+def test_release_unspent_rejects_a_non_feeinput():
+    src = CappedFeeWalletSource(_pool(1000), total_cap_photons=10_000)
+    with pytest.raises(ValidationError, match="FeeInput"):
+        src.release_unspent("not-a-fee-input")
+
+
+def test_seven_refusals_do_not_strand_the_covering_input():
+    """The audit's measured scenario, as a property of the source.
+
+    Pool = 7 x 500,000 + 1 x 20,000,000, cap = 20,000,000. Seven builds refuse (below the
+    deadline-aware floor for a 267-byte claim) and broadcast nothing. Before the fix those
+    seven charged 3,500,000 to the cap, so the covering 20,000,000 input no longer fit under
+    it and the eighth dispense raised FeePoolExhaustedError — the asset then went to CSV
+    refund with a funded, unspendable pool sitting right there.
+    """
+    src = CappedFeeWalletSource(_pool(*([500_000] * 7), 20_000_000), total_cap_photons=20_000_000)
+    for _ in range(7):
+        src.release_unspent(src.next_fee_input())  # refused build: nothing broadcast
+    assert src.dispensed_photons == 0
+    assert src.next_fee_input().value == 20_000_000  # reachable, not stranded

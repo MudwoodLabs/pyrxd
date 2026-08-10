@@ -290,8 +290,10 @@ class FailoverElectrumXClient:
         is not just safe, it is necessary — otherwise the caller reports failure for
         a transaction that is live on the network. When a later endpoint answers
         "I already have this" (``txn-already-known`` / ``txn-already-in-mempool`` /
-        already-in-chain), that is treated as **success**: the transaction is
-        demonstrably out there, and the txid is already known from the bytes.
+        already-in-chain), that is treated as **success** — but only after the claim is
+        **corroborated by a read** (:meth:`_holds_tx`): the endpoint must serve the same
+        bytes back. An uncorroborated ``-27`` is a claim any hostile or broken server can
+        make for free, and honoring it reports a live transaction where there is none.
 
         That last conversion applies only to a *retry*. On the very first attempt an
         "already known" rejection still raises, unchanged — there the caller is
@@ -310,13 +312,32 @@ class FailoverElectrumXClient:
                 result = await client.broadcast(payload)
             except PolicyRejection as exc:
                 if attempted > 0 and _is_already_have(exc):
-                    logger.info(
-                        "broadcast: %s already has tx %s after a transport failure elsewhere — treating as success",
+                    # "I already have this" is a CLAIM, not evidence (audit B6). Corroborate it
+                    # with a READ before honoring it: ask this endpoint for the transaction and
+                    # require the bytes back to be the ones we sent. Without that, a hostile or
+                    # broken secondary answering every broadcast with RPC -27 made this method
+                    # report SUCCESS for a transaction no node ever accepted — the caller then
+                    # polls for a ghost, and a swap driver believes a leg is locked when nothing
+                    # is on-chain. A node that cannot produce what it claims to hold is skipped
+                    # like any other failure (fail-closed), never honored.
+                    if await self._holds_tx(endpoint, expected_txid, payload):
+                        logger.info(
+                            "broadcast: %s already has tx %s after a transport failure elsewhere "
+                            "(corroborated by a read-back) — treating as success",
+                            endpoint.url,
+                            expected_txid,
+                        )
+                        self._promote(endpoint)
+                        return expected_txid
+                    last_exc = exc
+                    attempted += 1
+                    logger.warning(
+                        "broadcast: %s claimed to already have tx %s but could NOT produce it on read-back; "
+                        "refusing to report success — next endpoint",
                         endpoint.url,
                         expected_txid,
                     )
-                    self._promote(endpoint)
-                    return expected_txid
+                    continue
                 raise  # a node verdict is an answer, not a failure — see (3) above
             except TlsPinMismatchError:
                 raise  # a substituted server must never be silently routed around
@@ -336,6 +357,40 @@ class FailoverElectrumXClient:
             self._promote(endpoint)
             return expected_txid
         raise NetworkError(f"broadcast failed on all {len(self._order)} ElectrumX endpoint(s)") from last_exc
+
+    async def _holds_tx(self, endpoint: Endpoint, expected_txid: Txid, payload: bytes) -> bool:
+        """Does *endpoint* really hold the transaction it just claimed to already have?
+
+        Fail-closed corroboration for the ``already-have``-after-a-transport-failure branch of
+        :meth:`broadcast`. The endpoint must return, on a plain read, bytes identical to what we
+        sent — which is exactly the statement "this transaction is out there" that the branch
+        converts into a success. Anything else (no read surface, an error, different bytes) is
+        ``False``: the claim is not honored.
+
+        Residual, stated plainly: this makes an endpoint corroborate its own claim, so a fully
+        hostile endpoint that both rejects with ``-27`` and echoes the bytes back still passes.
+        What it removes is the far cheaper failure — a broken or lazily-hostile server whose
+        ``-27`` is not backed by any transaction at all — and it costs one read on a path that
+        has already failed once. Corroboration across INDEPENDENT sources is the operator's job
+        (see :class:`pyrxd.network.bitcoin.MultiSourceBtcFundingReader` for that shape).
+        """
+        try:
+            client = await self._client_for(endpoint)
+        except Exception:
+            return False
+        read = getattr(client, "get_transaction", None)
+        if not callable(read):
+            logger.warning(
+                "broadcast: %s has no get_transaction read surface, so its 'already known' claim "
+                "cannot be corroborated; fail-closed",
+                endpoint.url,
+            )
+            return False
+        try:
+            raw = await read(expected_txid)
+        except Exception:
+            return False
+        return bytes(raw) == bytes(payload)
 
     # ------------------------------------------------------------------ internals
 
