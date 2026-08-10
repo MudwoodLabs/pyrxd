@@ -732,13 +732,21 @@ async def test_composite_dispatches_to_the_matching_executor():
 # --------------------------------------------------------------------------- A1: fee affordability
 
 
-async def test_fee_shortfall_declines_pages_and_does_not_drain_the_fee_pool():
-    """The leg's pre-broadcast fee gate refused: nothing broadcast, operator paged.
+async def test_fee_shortfall_declines_and_pages_but_does_NOT_disarm_the_claim():
+    """REGRESSION TEST: a fee shortfall must not permanently disarm an armed claim.
 
-    A fee shortfall cannot self-resolve — the same fee source keeps handing out the same
-    too-small UTXOs — so it is handled like a permanent PolicyRejection: DECLINED (which
-    pages) and marked seen, so the per-tick retry does not walk a capped fee pool's cursor
-    to exhaustion for a claim that will never be sent.
+    The first cut of this handler called ``mark_seen`` on InsufficientFundsError, on the
+    reasoning that "the same fee source will keep handing out the same too-small UTXOs".
+    That is FALSE for the source actually wired here: ``CappedFeeWalletSource`` is
+    dispense-once ("the returned UTXO is never returned again") and dispenses its pool
+    in order, so the NEXT tick hands out a DIFFERENT input. A pool ordered small-first
+    would therefore have had its claim disarmed by the first small dispense while
+    perfectly good covering inputs were still sitting in the pool — and once seen, the
+    claim never fires again and the maker's CSV refund takes the asset.
+
+    So: DECLINED (which pages) on every shortfall, but the claim stays armed and the
+    next tick tries again. Retry cost is bounded — the pool is capped and dispense-once,
+    so its cursor advances at most one input per tick and cannot run past its own cap.
     """
     from pyrxd.gravity.radiant_leg import SeenStore
     from pyrxd.security.errors import InsufficientFundsError
@@ -756,9 +764,37 @@ async def test_fee_shortfall_declines_pages_and_does_not_drain_the_fee_pool():
     leg.claim_asset = _too_poor
     assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
     assert leg.claim_calls == 1
-    # Marked seen → the next tick is an idempotent no-op rather than another fee draw.
+    # NOT marked seen → the next tick retries rather than being an idempotent no-op.
     assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
-    assert leg.claim_calls == 1
+    assert leg.claim_calls == 2
+
+
+async def test_a_later_tick_with_a_bigger_input_still_claims_after_a_shortfall():
+    """The point of not marking seen: the claim is still there to fire when funds arrive.
+
+    Tick 1 draws a too-small input and declines. Tick 2 draws a covering one — the claim
+    must broadcast. Under the old mark-seen behaviour tick 2 was an idempotent no-op and
+    the asset was lost while the pool could still have paid for it.
+    """
+    from pyrxd.gravity.radiant_leg import SeenStore
+    from pyrxd.security.errors import InsufficientFundsError
+
+    ex, leg, rec, _p = await _armed_executor(seen_store=SeenStore())
+
+    async def _poor_then_rich(record, preimage):
+        leg.claim_calls += 1
+        if leg.claim_calls == 1:
+            raise InsufficientFundsError(
+                "HTLC covenant claim (pre-broadcast gate): fee of 546 photons is below the required 2660000",
+                available=546,
+                required=2_660_000,
+            )
+        return "ab" * 32
+
+    leg.claim_asset = _poor_then_rich
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.BROADCAST
+    assert leg.claim_calls == 2
 
 
 async def test_fee_shortfall_is_not_reported_as_a_transient_failure(caplog):

@@ -48,7 +48,10 @@ _OUTPOINT = "cd" * 32 + ":0"
 # exercise something OTHER than the fee guard (1 photon/kB => 1 photon for any
 # sub-1000-byte tx). This is the documented escape hatch: an explicit, injected
 # policy — never a weakened guard.
-_NEGLIGIBLE_RATE = DeadlineFeePolicy(relay_fee_per_kb=1)
+# allow_below_protocol_floor: a rate this low is refused by default, because in
+# production it can only come from a lying or misconfigured node (security review).
+# Opting out here is exactly the deliberate, greppable act the flag exists for.
+_NEGLIGIBLE_RATE = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
 
 
 def _fee(value: int) -> FeeInput:

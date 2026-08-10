@@ -36,16 +36,41 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     fee/confirmation curve has been measured). The rate is a **parameter, not a constant**:
     `effective_minrelaytxfee` is node policy and moves, and
     `photons_per_kb_from_rxd_per_kb()` converts a `getmempoolinfo` reading directly.
-  - **`build_htlc_claim_tx` / `build_htlc_refund_tx`** now refuse to return an under-fee'd
-    transaction, sized against `len(tx.serialize())` — the exact wire bytes, measured after
-    signing, never an estimate. Both accept an optional `fee_policy`.
-  - **`RadiantCovenantLeg`** applies the **deadline-aware** requirement immediately before
+  - **The relay floor is a gate; the urgency premium is only a TARGET.** `assert_fee_covers`
+    raises **only** below `min_relay_fee(size)` — the node's real requirement — and otherwise
+    *returns* the premium-inclusive `required_fee(...)` for the caller to log against and size
+    its pool by. Gating on the premium would be a fund-loss bug, not a safety measure: the
+    node would have accepted the transaction, refusing does not reduce the fee paid (the whole
+    input is the miner fee on a single-output covenant), and on the claim path the
+    counterparty's CSV refund then takes the asset. Because the premium *rises* as the
+    deadline closes, a hard gate on it would refuse hardest exactly when claiming matters
+    most — including `taker_claim_asset_from_vulnerable`, whose entire purpose is to race
+    that deadline.
+  - **`DeadlineFeePolicy` bounds its own injected rate.** In production the rate is read from
+    a **node** (`getmempoolinfo`), so it crosses a trust boundary: a lying or misconfigured
+    endpoint advertising, say, 0.00000001 RXD/kB would otherwise yield a "floor" of ~1
+    photon/kB, thousands of times under the real requirement, and the resulting spend is
+    unfixable for 8 hours. A rate below `protocol_floor_per_kb` is now refused at
+    construction. That bound is **per-chain** (Radiant photons/kB vs Bitcoin sats/kB), and
+    `allow_below_protocol_floor=True` is the explicit, greppable opt-out for regtest or a
+    chain you control.
+  - **`build_htlc_claim_tx` / `build_htlc_refund_tx`** now refuse to return a transaction
+    below the relay floor, sized against `len(tx.serialize())` — the exact wire bytes,
+    measured after signing, never an estimate. Both accept an optional `fee_policy`.
+  - **`RadiantCovenantLeg`** computes the **deadline-aware** target immediately before
     broadcast. On the claim path blocks-to-deadline is `t_rxd − covenant confirmations` (the
-    maker's CSV refund branch opens at that depth); a shortfall refuses, logs at ERROR, and
-    raises rather than emitting an unrepairable transaction. Accepts an optional `fee_policy`.
+    maker's CSV refund branch opens at that depth). Below the node's floor it refuses, logs at
+    ERROR, and raises rather than emitting an unrepairable transaction. **Above the floor but
+    below the urgency target it broadcasts and logs a WARNING** — inclusion may be slow, but a
+    slow claim beats a claim that never goes out. Accepts an optional `fee_policy`.
   - **`watch/claim_executor.py`** maps a fee shortfall to `DECLINED` (which pages) with the
-    exact shortfall, and marks it fire-once so a per-tick retry cannot walk a capped fee
-    pool's cursor to exhaustion for a claim it can never send.
+    exact shortfall, and **deliberately does not mark the swap seen**, so a later tick can
+    still claim. `CappedFeeWalletSource` is dispense-once ("the returned UTXO is never
+    returned again") and dispenses in pool order, so the next tick hands out a *different*,
+    possibly larger input — a pool ordered small-first would otherwise have had its claim
+    permanently disarmed by the first small dispense while covering inputs remained. Retry
+    cost is bounded: the pool is capped and dispense-once, so its cursor advances at most one
+    input per tick and cannot run past its own cap.
   - **`watch/executor.py`** (BTC pre-signed refund) declines a blob whose implied fee is not
     viable. Deliberately sized on a **lower bound** of the true vsize requirement, so it can
     never falsely refuse a refund the node would have accepted.
@@ -55,17 +80,28 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrade notes
 
-- **Operator-visible break: a covenant claim/refund funded with a too-small fee input is now
+- **Operator-visible break: a covenant claim/refund funded below the node's relay floor is now
   REFUSED at build time.** Previously it was built and broadcast, and then silently failed to
   confirm — which, given no RBF and no CPFP, was unrecoverable within the 8-hour mempool
   window. The refusal raises `InsufficientFundsError` (a `ValidationError` subclass, so
   existing `except ValidationError` handlers keep catching it) carrying
-  `available` / `required` / `shortfall`, and the message names all three.
+  `available` / `required` / `shortfall`, and the message names all three. `required` is the
+  **relay floor**, not the urgency target — it is the number you must clear to get the spend
+  relayed at all.
   **Action:** size fee UTXOs at **0.1–0.2 RXD** each rather than dust. If you target a node
   whose `effective_minrelaytxfee` differs from the 0.10 RXD/kB default, pass an explicit
   `fee_policy` instead of relying on the default.
+- **Funding at the bare floor is not an error.** The urgency premium is a funding *target*.
+  A spend that clears the floor but not the target still broadcasts; you get a WARNING and
+  possibly a slower inclusion, never a refusal. Size the pool against
+  `DeadlineFeePolicy.required_fee(size, blocks_to_deadline=0)` (3× the floor at defaults) if
+  you want deadline-critical claims to carry headroom.
 - The historical 546-photon dust floor is **retained** as a floor. It is now the cheap
   pre-check, not the requirement.
+- **`DeadlineFeePolicy` now refuses a sub-floor `relay_fee_per_kb` at construction.** If you
+  build a policy for a non-Radiant chain, pass that chain's own `protocol_floor_per_kb`
+  (units are per-chain: photons/kB vs sats/kB) — `DEFAULT_BITCOIN_DEADLINE_FEE_POLICY`
+  already does. For regtest or a chain you control, pass `allow_below_protocol_floor=True`.
 
 ## [0.13.0] — 2026-08-09
 

@@ -530,13 +530,28 @@ class RadiantCovenantLeg:
         The whole fee input is the miner fee (single-output covenant, no change).
         """
         try:
-            assert_fee_covers(
+            target = assert_fee_covers(
                 fee_value=fee.value,
                 size_bytes=len(tx.serialize()),
                 policy=self.fee_policy,
                 blocks_to_deadline=blocks_to_deadline,
                 what=f"HTLC covenant {kind} (pre-broadcast gate)",
             )
+            # Above the node's floor but below the urgency TARGET: broadcast anyway (the
+            # node accepts it, and refusing would hand the asset to the counterparty's
+            # refund) but page — the operator should fund a larger pool before the next
+            # deadline-critical spend.
+            if fee.value < target:
+                logger.warning(
+                    "Radiant covenant %s on %s clears the relay floor but is below the "
+                    "urgency target (%d < %d photons, blocks_to_deadline=%s) — broadcasting, "
+                    "but inclusion may be slow; fund a larger fee input",
+                    kind,
+                    self.network,
+                    fee.value,
+                    target,
+                    blocks_to_deadline,
+                )
         except InsufficientFundsError as exc:
             # PAGE: an operator has to fund a larger fee input before this spend can go
             # out, and on the claim path the clock to the counterparty's refund is running.

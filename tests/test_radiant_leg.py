@@ -10,6 +10,7 @@ and the audit gate. On-chain acceptance is the e2e regtest milestone (step 5).
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 
@@ -691,25 +692,126 @@ def test_leg_defaults_to_the_effective_min_relay_rate():
     assert _leg().fee_policy.relay_fee_per_kb == 10_000_000  # 0.10 RXD/kB
 
 
-async def test_claim_refused_and_paged_when_the_fee_cannot_make_the_deadline(caplog):
-    """The fee clears the flat relay floor but NOT the deadline-aware requirement.
+async def test_claim_broadcasts_and_warns_when_the_fee_clears_the_floor_but_not_the_target(caplog):
+    """REGRESSION TEST for a fund-loss bug: the urgency premium must NOT gate broadcast.
 
-    csv=6 with 5 confirmations leaves 1 block before the maker's CSV refund opens, so
-    the urgency multiplier is 1 + 2*(6-1)/6 = 8/3. A ~266-byte claim needs ~2.66M
-    photons flat, but ~7.1M at that urgency.
+    Two independent security passes (a review and a ~2.17M-case red-team sweep) found
+    the same bug in the first cut of this feature: the premium was enforced as a HARD
+    pre-broadcast gate, so a fee the node WOULD have accepted and mined was refused.
+    Refusing changes nothing about the fee paid — the whole fee input is the miner fee
+    on a single-output covenant either way — so the claim simply never went out, the
+    maker's CSV refund branch opened, and the asset was LOST. Worse, the premium RISES
+    as the deadline closes, so the old gate refused hardest exactly when claiming
+    mattered most.
+
+    Here csv=6 with 5 confirmations leaves 1 block to the deadline: multiplier
+    1 + 2*(6-1)/6 = 8/3, so a ~266-byte claim targets ~7.1M photons while the node's
+    real floor is ~2.66M. 3,000,000 photons is ABOVE the floor and BELOW the target.
+    It must BROADCAST, and warn.
     """
     terms = _rxd_terms(amount=100_000, csv=6)
     client = FakeClient(utxo_value=100_000, confirmations=5)
-    src = SizedFeeSource(3_000_000)  # over the flat floor, under the urgent one
+    src = SizedFeeSource(3_000_000)  # over the node's floor, under the urgency target
     leg = _leg(client=client, fee_source=src)
     rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
-    with caplog.at_level("ERROR"):
-        with pytest.raises(InsufficientFundsError) as ei:
-            await leg.claim_asset(rec, _P)
-    assert ei.value.available == 3_000_000
-    assert ei.value.required is not None and ei.value.required > 3_000_000
+    with caplog.at_level("WARNING"):
+        assert await leg.claim_asset(rec, _P) == "ab" * 32
+    assert len(client.broadcast_raw) == 1, "a fee the node accepts must go on-chain, deadline or not"
+    # The fee really is under the urgency target — otherwise this test proves nothing.
+    sent = len(client.broadcast_raw[0])
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.min_relay_fee(sent) <= 3_000_000
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.required_fee(sent, blocks_to_deadline=1) > 3_000_000
+    # ...and the operator is told to fund a larger pool — a WARNING, not a refusal.
+    assert any(
+        r.levelname == "WARNING"
+        and "below the " in r.getMessage()
+        and "urgency target" in r.getMessage()
+        and "blocks_to_deadline=1" in r.getMessage()
+        for r in caplog.records
+    )
+    assert not any("REFUSING to broadcast" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("blocks_left", [0, 1, 2])
+async def test_a_fee_over_the_floor_broadcasts_at_every_urgency(blocks_left, caplog):
+    """The same regression, swept across the closest deadlines — where the premium peaks.
+
+    ``taker_claim_asset_from_vulnerable`` exists to race this window; a gate that
+    refuses at 0/1/2 blocks left would disarm exactly the spend it is meant to protect.
+    """
+    csv = 6
+    terms = _rxd_terms(amount=100_000, csv=csv)
+    # confirmations = csv - blocks_left, so `blocks_left` blocks remain before refund.
+    client = FakeClient(utxo_value=100_000, confirmations=csv - blocks_left)
+    leg = _leg(client=client, fee_source=SizedFeeSource(3_000_000))
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    with caplog.at_level("WARNING"):
+        assert await leg.claim_asset(rec, _P) == "ab" * 32
+    assert len(client.broadcast_raw) == 1
+    sent = len(client.broadcast_raw[0])
+    # Under the target at every one of these distances — so each case is a real regression.
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.required_fee(sent, blocks_to_deadline=blocks_left) > 3_000_000
+    assert any(r.levelname == "WARNING" and "urgency target" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("blocks_left", [0, 1, 2])
+async def test_claim_below_the_node_floor_is_still_refused(blocks_left):
+    """The guard must not have been WEAKENED, only re-aimed at the node's real floor.
+
+    Below ``min_relay_fee`` the spend is unrelayable, and with no RBF and no CPFP it
+    cannot be repaired — it squats on its own inputs until mempool expiry. Refusing is
+    strictly better than that, and unlike the premium case it costs nothing: the node
+    would not have accepted this transaction anyway. Swept across the tightest deadlines
+    to show the floor binds regardless of urgency, exactly as the premium no longer does.
+    """
+    csv = 6
+    terms = _rxd_terms(amount=100_000, csv=csv)
+    client = FakeClient(utxo_value=100_000, confirmations=csv - blocks_left)
+    src = SizedFeeSource(1_000_000)  # under the ~2.66M floor for a ~266-byte claim
+    leg = _leg(client=client, fee_source=src)
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    with pytest.raises(InsufficientFundsError) as ei:
+        await leg.claim_asset(rec, _P)
+    assert ei.value.available == 1_000_000
+    # The shortfall is reported against the HARD floor, not the urgency target: that is
+    # the number an operator has to clear to get this spend relayed at all. The claim is
+    # ~266 bytes; band the assertion over 200..400 bytes so it does not pin an exact
+    # signature length, but keep it tight enough to EXCLUDE the premium numbers
+    # (>= 5.3M at these distances), which is what the old buggy gate reported here.
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.min_relay_fee(200) <= ei.value.required
+    assert ei.value.required <= DEFAULT_RADIANT_DEADLINE_FEE_POLICY.min_relay_fee(400)
     assert client.broadcast_raw == [], "nothing may go on-chain when the gate refuses"
-    # PAGE: the refusal is logged at ERROR with the deadline, so an operator is woken.
+    # The message must carry WHY this is fatal rather than merely slow — an operator
+    # reading the page has to know there is no bump path.
+    assert "no RBF" in str(ei.value) and "no CPFP" in str(ei.value)
+
+
+async def test_the_leg_pages_when_the_builder_did_not_already_refuse(caplog):
+    """The leg's own ERROR page, exercised directly.
+
+    Sub-floor fees are caught twice: ``build_htlc_claim_tx`` runs a deadline-UNAWARE
+    floor check on the assembled bytes (``htlc_spend._assert_fee_clears_relay_floor``)
+    before the leg's ``_assert_affordable`` ever sees them, and since the correction both
+    gates test the identical condition (``fee < min_relay_fee``) against the identical
+    bytes. So on the normal claim path the builder always raises first and the leg's
+    page is defence-in-depth. Drive it directly so the paging text stays covered and
+    keeps naming the deadline.
+    """
+    terms = _rxd_terms(amount=100_000, csv=6)
+    client = FakeClient(utxo_value=100_000, confirmations=5)
+    leg = _leg(client=client, fee_source=SizedFeeSource(10_000_000))
+    rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
+    await leg.claim_asset(rec, _P)  # build a real, correctly-sized claim to measure
+    sent = client.broadcast_raw[0]
+
+    class _Tx:
+        def serialize(self):
+            return sent
+
+    poor = dataclasses.replace(leg.fee_source.next_fee_input(), value=1_000)
+    with caplog.at_level("ERROR"):
+        with pytest.raises(InsufficientFundsError):
+            leg._assert_affordable(_Tx(), poor, blocks_to_deadline=1, kind="claim")
     assert any(
         r.levelname == "ERROR"
         and "REFUSING to broadcast" in r.getMessage()
@@ -732,17 +834,33 @@ async def test_the_same_fee_is_accepted_far_from_the_deadline():
     assert len(client.broadcast_raw) == 1
 
 
-async def test_claim_past_the_deadline_takes_the_maximum_premium():
-    # confirmations >= csv: the maker's refund branch is already open. Maximum urgency,
-    # never more — and never a negative blocks_to_deadline.
+async def test_claim_past_the_deadline_targets_the_maximum_premium_but_still_broadcasts(caplog):
+    """Past the deadline the TARGET is the maximum premium — but it is still only a target.
+
+    confirmations >= csv: the maker's refund branch is already open, so
+    ``blocks_to_deadline`` clamps to 0 (never negative) and the multiplier to 3.0. This
+    is the worst case for the old hard gate: the largest premium, on the claim with the
+    least time left, where a refusal is closest to a guaranteed loss. The node's floor
+    is still ~2.66M, so 7,000,000 photons relays fine and MUST go out.
+    """
     terms = _rxd_terms(amount=100_000, csv=6)
     client = FakeClient(utxo_value=100_000, confirmations=99)
-    src = SizedFeeSource(7_000_000)  # under 3.0x of ~2.66M
+    src = SizedFeeSource(7_000_000)  # over the ~2.66M floor, under 3.0x of it (~7.98M)
     leg = _leg(client=client, fee_source=src)
     rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
-    with pytest.raises(InsufficientFundsError, match="0 block\\(s\\) to deadline"):
-        await leg.claim_asset(rec, _P)
-    assert client.broadcast_raw == []
+    with caplog.at_level("WARNING"):
+        assert await leg.claim_asset(rec, _P) == "ab" * 32
+    assert len(client.broadcast_raw) == 1
+    sent = len(client.broadcast_raw[0])
+    # The premium clamps at 3.0x and never exceeds it, however far past the deadline.
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.required_fee(
+        sent, blocks_to_deadline=0
+    ) == DEFAULT_RADIANT_DEADLINE_FEE_POLICY.required_fee(sent, blocks_to_deadline=-99)
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.required_fee(sent, blocks_to_deadline=0) > 7_000_000
+    assert any(
+        r.levelname == "WARNING" and "urgency target" in r.getMessage() and "blocks_to_deadline=0" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 async def test_refund_uses_the_flat_floor_with_no_urgency_premium():

@@ -96,7 +96,12 @@ def test_photons_per_kb_rejects_non_numbers():
     ],
 )
 def test_min_relay_fee_is_size_times_rate_rounded_up(size, rate, expected):
-    assert DeadlineFeePolicy(relay_fee_per_kb=rate).min_relay_fee(size) == expected
+    # allow_below_protocol_floor: the last three cases use rates far under Radiant's
+    # 1,000,000 photons/kB floor DELIBERATELY, to exercise the rounding arithmetic at
+    # sizes where ceil() is observable at all (at 10M/kB every case rounds exactly).
+    # The construction guard would otherwise refuse them, correctly — so opt out
+    # explicitly rather than weaken the guard. See the guard tests below.
+    assert DeadlineFeePolicy(relay_fee_per_kb=rate, allow_below_protocol_floor=True).min_relay_fee(size) == expected
 
 
 def test_min_relay_fee_matches_ceil_for_a_wide_size_sweep():
@@ -172,14 +177,23 @@ def test_required_fee_scales_with_the_deadline():
 
 def test_required_fee_uses_exact_rational_arithmetic_not_floats():
     # 1/3-shaped multipliers are where a float path drifts. 1 + 2*(6-4)/6 = 5/3.
-    policy = DeadlineFeePolicy(relay_fee_per_kb=3, urgency_horizon_blocks=6, max_urgency_multiplier=3.0)
+    # A 3-photon/kB rate is a deliberate arithmetic fixture (it makes the base fee
+    # exactly 3, so a one-unit float drift is visible), not a realistic node reading —
+    # hence the explicit opt-out from the protocol-floor guard.
+    policy = DeadlineFeePolicy(
+        relay_fee_per_kb=3, urgency_horizon_blocks=6, max_urgency_multiplier=3.0, allow_below_protocol_floor=True
+    )
     base = policy.min_relay_fee(1000)  # exactly 3
     assert base == 3
     assert policy.required_fee(1000, blocks_to_deadline=4) == 5  # ceil(3 * 5/3) == 5, exactly
 
 
 def test_required_fee_rounds_up():
-    policy = DeadlineFeePolicy(relay_fee_per_kb=1_000, urgency_horizon_blocks=6, max_urgency_multiplier=2.0)
+    # 1,000/kB over 101 bytes gives a base of 101 — a size where ceil() is observable.
+    # Under Radiant's floor, so opt out explicitly; this is arithmetic, not a node rate.
+    policy = DeadlineFeePolicy(
+        relay_fee_per_kb=1_000, urgency_horizon_blocks=6, max_urgency_multiplier=2.0, allow_below_protocol_floor=True
+    )
     base = policy.min_relay_fee(101)  # ceil(101 * 1000/1000) == 101
     assert base == 101
     # b=5 -> 1 + 1*(1/6) = 7/6; ceil(101 * 7/6) == ceil(117.83) == 118
@@ -214,6 +228,66 @@ def test_policy_is_frozen():
         DEFAULT_RADIANT_DEADLINE_FEE_POLICY.relay_fee_per_kb = 1  # type: ignore[misc]
 
 
+# ---------------------------------------------------------------- the protocol-floor bound
+#
+# The rate is normally read from a NODE (`getmempoolinfo` -> photons_per_kb_from_rxd_per_kb),
+# so it crosses a trust boundary. A lying or misconfigured endpoint could otherwise set an
+# arbitrarily low "floor", and with no RBF and no CPFP the resulting spend is unfixable.
+
+
+@pytest.mark.parametrize("hostile", [1, 999_999, 10])
+def test_policy_refuses_a_rate_below_the_chains_own_relay_floor(hostile):
+    # 0.00000001 RXD/kB from a hostile node would make the "floor" ~1 photon/kB —
+    # thousands of times under the real requirement. Refuse at construction.
+    with pytest.raises(ValidationError, match="below the chain's relay floor"):
+        DeadlineFeePolicy(relay_fee_per_kb=hostile)
+
+
+def test_the_sub_floor_opt_out_is_explicit_and_works():
+    # regtest / a chain you control legitimately runs lower — but saying so must be a
+    # deliberate, greppable act, never a silently-accepted low rate.
+    policy = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+    assert policy.min_relay_fee(266) == 1  # ceil(266 * 1/1000)
+
+
+def test_the_bound_is_per_chain_not_a_hardcoded_photon_number():
+    # Bitcoin's floor is 1,000 SATS/kB; Radiant's is 1,000,000 PHOTONS/kB. A BTC-side
+    # policy sized in sats must pass its own chain's floor, not opt out of the guard.
+    btc = DeadlineFeePolicy(
+        relay_fee_per_kb=BITCOIN_MIN_RELAY_SATS_PER_KB, protocol_floor_per_kb=BITCOIN_MIN_RELAY_SATS_PER_KB
+    )
+    assert btc.relay_fee_per_kb == 1_000
+    assert btc.allow_below_protocol_floor is False
+    # The same rate against Radiant's floor is (correctly) refused.
+    with pytest.raises(ValidationError, match="below the chain's relay floor"):
+        DeadlineFeePolicy(relay_fee_per_kb=BITCOIN_MIN_RELAY_SATS_PER_KB)
+
+
+def test_the_shipped_bitcoin_default_still_constructs():
+    # Module import would blow up if the shipped BTC default were bounded by Radiant's
+    # photon floor — a units bug that would break every watchtower refund path at import.
+    assert DEFAULT_BITCOIN_DEADLINE_FEE_POLICY.relay_fee_per_kb == BITCOIN_MIN_RELAY_SATS_PER_KB
+    assert DEFAULT_BITCOIN_DEADLINE_FEE_POLICY.protocol_floor_per_kb == BITCOIN_MIN_RELAY_SATS_PER_KB
+    assert DEFAULT_BITCOIN_DEADLINE_FEE_POLICY.allow_below_protocol_floor is False
+    assert DEFAULT_BITCOIN_DEADLINE_FEE_POLICY.min_relay_fee(250) == 250  # 250 vB at 1 sat/vB
+
+
+def test_the_radiant_default_sits_at_the_effective_rate_ten_x_above_its_own_bound():
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.protocol_floor_per_kb == RADIANT_MIN_RELAY_PHOTONS_PER_KB
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.allow_below_protocol_floor is False
+    # The bound is the LEGACY floor, so the effective rate is comfortably inside it: the
+    # guard catches hostile lowballs without rejecting a node that reports the old rate.
+    assert DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB).relay_fee_per_kb == 1_000_000
+
+
+def test_a_node_reading_that_is_hostile_is_caught_end_to_end():
+    # The realistic attack shape: the endpoint reports a rate 1e7x too low in RXD/kB.
+    hostile_rate = photons_per_kb_from_rxd_per_kb(0.000_000_01)
+    assert hostile_rate == 1
+    with pytest.raises(ValidationError, match="below the chain's relay floor"):
+        DeadlineFeePolicy(relay_fee_per_kb=hostile_rate)
+
+
 # ---------------------------------------------------------------- assert_fee_covers
 
 
@@ -226,6 +300,53 @@ def test_assert_fee_covers_returns_the_requirement_when_covered():
         what="test",
     )
     assert got == 2_660_000
+
+
+@pytest.mark.parametrize("blocks_left", [0, 1, 2, 3])  # 4+ puts the target under the 5M fixture
+def test_assert_fee_covers_does_not_raise_between_the_floor_and_the_urgency_target(blocks_left):
+    """REGRESSION TEST: the urgency premium is a TARGET, never a broadcast gate.
+
+    The first cut raised here, which was a fund-loss bug. 5,000,000 photons on a
+    266-byte claim is nearly 2x the node's real 2,660,000 floor — the node accepts it
+    and mines it — but the premium demands up to 3x, so the old gate refused. Refusing
+    does not reduce the fee paid (the whole input is the fee on a single-output
+    covenant), it just means the claim never goes out, the counterparty's CSV refund
+    opens, and the asset is lost. And because the premium RISES as the deadline closes,
+    it refused hardest exactly when claiming mattered most.
+    """
+    policy = DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+    fee = 5_000_000
+    assert policy.min_relay_fee(266) == 2_660_000 < fee, "fixture must clear the node floor"
+    target = policy.required_fee(266, blocks_to_deadline=blocks_left)
+    assert target > fee, "fixture must sit UNDER the urgency target, or it proves nothing"
+    got = assert_fee_covers(
+        fee_value=fee,
+        size_bytes=266,
+        policy=policy,
+        blocks_to_deadline=blocks_left,
+        what="HTLC covenant claim",
+    )
+    # It returns the premium-inclusive target so the caller can WARN and size its pool.
+    assert got == target
+
+
+def test_assert_fee_covers_still_raises_below_the_node_floor_at_every_urgency():
+    # The guard was re-aimed, not weakened: under min_relay_fee the node itself rejects,
+    # and with no RBF/CPFP the spend is unfixable — refusing costs nothing there.
+    policy = DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+    for blocks_left in (None, 0, 1, 3, 6, 100):
+        with pytest.raises(InsufficientFundsError) as ei:
+            assert_fee_covers(
+                fee_value=2_659_999,  # one photon under the 2,660,000 floor
+                size_bytes=266,
+                policy=policy,
+                blocks_to_deadline=blocks_left,
+                what="HTLC covenant claim",
+            )
+        # The shortfall is reported against the HARD floor, not the (larger) target —
+        # that is the number an operator must clear to get the spend relayed at all.
+        assert ei.value.required == 2_660_000, blocks_left
+        assert ei.value.shortfall == 1, blocks_left
 
 
 def test_assert_fee_covers_accepts_exactly_the_requirement():

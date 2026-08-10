@@ -143,6 +143,14 @@ class DeadlineFeePolicy:
     """
 
     relay_fee_per_kb: int = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
+    # The chain's own minimum relay rate, used ONLY to sanity-bound `relay_fee_per_kb`
+    # (see __post_init__). Per-chain because the units differ: Radiant photons/kB vs
+    # Bitcoin sats/kB. Set it to the target chain's floor when constructing a policy for
+    # a chain other than Radiant.
+    protocol_floor_per_kb: int = RADIANT_MIN_RELAY_PHOTONS_PER_KB
+    # Escape hatch for regtest / a chain you control. Named so that using it is a
+    # deliberate, greppable act rather than a silently-accepted low rate.
+    allow_below_protocol_floor: bool = False
     urgency_horizon_blocks: int = 6
     max_urgency_multiplier: float = 3.0
 
@@ -153,6 +161,21 @@ class DeadlineFeePolicy:
             or self.relay_fee_per_kb <= 0
         ):
             raise ValidationError("DeadlineFeePolicy.relay_fee_per_kb must be a positive int (units per kB)")
+        # SECURITY (review finding): the rate is normally read from a NODE
+        # (`getmempoolinfo` -> photons_per_kb_from_rxd_per_kb), so it crosses a trust
+        # boundary. A lying or misconfigured endpoint advertising, say, 0.00000001 RXD/kB
+        # would yield a policy whose "floor" is ~1 photon/kB — thousands of times under the
+        # real requirement — and with no RBF/CPFP the resulting spend is unfixable for
+        # MEMPOOL_EXPIRY_HOURS. Refuse a rate below the protocol's own legacy floor unless
+        # the caller explicitly opts out (regtest/custom chains legitimately run lower).
+        if not self.allow_below_protocol_floor and self.relay_fee_per_kb < self.protocol_floor_per_kb:
+            raise ValidationError(
+                f"DeadlineFeePolicy.relay_fee_per_kb={self.relay_fee_per_kb} is below the chain's "
+                f"relay floor ({self.protocol_floor_per_kb}/kB). A rate read "
+                "from an untrusted or misconfigured node can be arbitrarily low, and an under-fee'd "
+                "time-critical spend cannot be bumped (no RBF, no CPFP). Pass "
+                "allow_below_protocol_floor=True only for regtest or a chain you control."
+            )
         if (
             not isinstance(self.urgency_horizon_blocks, int)
             or isinstance(self.urgency_horizon_blocks, bool)
@@ -219,7 +242,11 @@ class DeadlineFeePolicy:
 
 
 DEFAULT_RADIANT_DEADLINE_FEE_POLICY = DeadlineFeePolicy()
-DEFAULT_BITCOIN_DEADLINE_FEE_POLICY = DeadlineFeePolicy(relay_fee_per_kb=BITCOIN_MIN_RELAY_SATS_PER_KB)
+DEFAULT_BITCOIN_DEADLINE_FEE_POLICY = DeadlineFeePolicy(
+    relay_fee_per_kb=BITCOIN_MIN_RELAY_SATS_PER_KB,
+    # Bitcoin's floor, in sats/kB — NOT Radiant's photon floor. The bound is per-chain.
+    protocol_floor_per_kb=BITCOIN_MIN_RELAY_SATS_PER_KB,
+)
 
 
 def assert_fee_covers(
@@ -231,18 +258,40 @@ def assert_fee_covers(
     what: str,
     unit: str = "photons",
 ) -> int:
-    """Fail closed unless ``fee_value`` clears ``policy.required_fee(size_bytes, ...)``.
+    """Fail closed ONLY below the node's relay floor; the urgency premium is a target.
 
-    Returns the required fee when it is covered. Raises
-    :class:`~pyrxd.security.errors.InsufficientFundsError` (a ``ValidationError``
-    subclass, so existing handlers still catch it) carrying the machine-readable
-    ``available`` / ``required`` / ``shortfall`` triple, and a message that names all
-    three plus the irreversibility that makes this worth failing on.
+    This distinction is fund-safety-critical, and getting it wrong inverts the whole
+    point of the gate (security review of the first cut of this module).
+
+    * ``policy.min_relay_fee(size)`` is what the NODE demands
+      (``nModifiedFees < effectiveMinRelayTxFee.GetFee(GetTotalSize())``). Below it the
+      spend is unrelayable and — with no RBF and no CPFP — unfixable for
+      ``MEMPOOL_EXPIRY_HOURS``. Refusing is strictly better than broadcasting.
+    * ``policy.required_fee(size, blocks_to_deadline)`` adds an urgency PREMIUM. That is
+      a pool-sizing target for getting mined *promptly*, not a relay requirement.
+
+    Refusing to broadcast a spend that clears the floor but not the premium would be a
+    guaranteed loss, not a safety measure: the node would have accepted it, refusing does
+    not reduce the fee paid (the whole input is the fee either way), and on the claim path
+    the counterparty's CSV refund then takes the asset. The premium also RISES as the
+    deadline closes, so a hard gate on it would refuse hardest exactly when claiming
+    matters most — including ``taker_claim_asset_from_vulnerable``, whose entire purpose
+    is to race that deadline.
+
+    So: raise below the floor; return normally above it. A caller that wants to page on a
+    thin premium can compare against :meth:`DeadlineFeePolicy.required_fee` itself.
+
+    Returns the premium-inclusive target fee (for logging/pool sizing) when the floor is
+    covered. Raises :class:`~pyrxd.security.errors.InsufficientFundsError` (a
+    ``ValidationError`` subclass, so existing handlers still catch it) carrying the
+    machine-readable ``available`` / ``required`` / ``shortfall`` triple.
     """
+    floor = policy.min_relay_fee(size_bytes)
     required = policy.required_fee(size_bytes, blocks_to_deadline=blocks_to_deadline)
-    if fee_value >= required:
+    if fee_value >= floor:
         return required
     mult = policy.urgency_multiplier(blocks_to_deadline)
+    required = floor  # report the shortfall against the HARD requirement, not the target
     deadline = "no deadline" if blocks_to_deadline is None else f"{blocks_to_deadline} block(s) to deadline"
     raise InsufficientFundsError(
         f"{what}: fee of {fee_value} {unit} is below the required {required} {unit} "

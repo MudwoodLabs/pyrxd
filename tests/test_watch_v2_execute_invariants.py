@@ -701,7 +701,7 @@ async def test_refund_executor_rejects_a_non_policy_fee_policy(tmp_path):
 async def test_the_floor_tracks_the_injected_rate(tmp_path):
     # An operator on a chain/fee environment with a different min-relay rate injects it;
     # nothing about the floor is hardcoded.
-    from pyrxd.gravity.fee_policy import DeadlineFeePolicy
+    from pyrxd.gravity.fee_policy import BITCOIN_MIN_RELAY_SATS_PER_KB, DeadlineFeePolicy
 
     rec, blob = _swap(fee_sats=500)
     _write(tmp_path, blob)
@@ -712,7 +712,13 @@ async def test_the_floor_tracks_the_injected_rate(tmp_path):
         network="bcrt",
         cap_sats=10_000,
         refund_spk=_REFUND_SPK,
-        fee_policy=DeadlineFeePolicy(relay_fee_per_kb=100_000),  # 100 sats/vB — absurdly high
+        # 100 sats/vB — absurdly high. This is the BTC leg, so the protocol floor that
+        # bounds the injected rate is Bitcoin's (sats/kB), NOT Radiant's photon floor:
+        # the default `protocol_floor_per_kb` is Radiant's, and 100,000 sats/kB sits far
+        # under 1,000,000 photons/kB even though it is 100x Bitcoin's own floor. Units
+        # are per-chain, so pass the chain's own floor rather than opting out of the
+        # guard — the rate here is well ABOVE its real floor and needs no escape hatch.
+        fee_policy=DeadlineFeePolicy(relay_fee_per_kb=100_000, protocol_floor_per_kb=BITCOIN_MIN_RELAY_SATS_PER_KB),
     )
     assert await ex.execute("swap1", rec, _refund_decision()) is ExecOutcome.DECLINED
     assert b.calls == []
