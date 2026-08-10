@@ -184,9 +184,12 @@ On success it prints the mint txid; the contract is recreated at
   cores, with live hash rate + remaining-time quantiles on **stderr**
   (`--no-progress` to silence, `--workers N` to change the pool). Point
   `--miner-cmd "/path/to/glyph-miner …"` at a GPU miner for seconds
-  instead of minutes — external miners report no live progress, because
-  the JSON-over-stdio protocol carries no progress frames.
-  `--miner-cmd in-process` forces the slow single-threaded miner.
+  instead of minutes — whether you see live progress from it depends on
+  the miner: the wire protocol carries OPTIONAL progress frames on
+  stderr (see `docs/concepts/parallel-mining.md`), so an updated
+  external miner streams the same way; an older one just stays silent
+  until it finishes, which still works. `--miner-cmd in-process` forces
+  the slow single-threaded miner.
 
 - **V1's nonce is only 4 bytes**, so any single sweep has roughly a 39%
   chance of containing a valid nonce. `claim-dmint` handles this the way

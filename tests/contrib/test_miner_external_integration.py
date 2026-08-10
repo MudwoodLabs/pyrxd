@@ -211,3 +211,39 @@ class TestRealMinerSubprocess:
                 nonce_width=4,
                 timeout_s=2,  # tight: forces timeout before real hit
             )
+
+    def test_real_miner_streams_progress_frames_before_timing_out(self, tmp_path: Path, monkeypatch):
+        """Same real-subprocess wire-compatibility guard as above, but
+        WITHOUT ``--quiet``: the bundled miner (``pyrxd.contrib.miner.cli``)
+        is the reference implementation of the B3 stderr progress-frame
+        extension, and this is the one test that exercises the whole
+        chain for real -- real subprocess, real ``parallel.mine()``
+        workers, real stderr JSON lines, parsed by the real
+        ``_ExternalMinerProgressReader``. Stub-miner tests in
+        ``test_miner_external_progress.py`` cover every edge case; this
+        one just proves the two real implementations still agree.
+
+        Still expected to time out before finding a real solution (V1
+        difficulty=1 takes minutes) -- the assertion is that at least one
+        progress callback fired before that happened.
+        """
+        worktree_src = Path(__file__).resolve().parents[2] / "src"
+        existing = os.environ.get("PYTHONPATH", "")
+        new_path = f"{worktree_src}{os.pathsep}{existing}" if existing else str(worktree_src)
+        monkeypatch.setenv("PYTHONPATH", new_path)
+
+        calls: list[tuple[int, float]] = []
+        with pytest.raises(MaxAttemptsError, match="did not return a solution"):
+            mine_solution_external(
+                preimage=_PREIMAGE,
+                target=_TARGET,
+                miner_argv=[sys.executable, "-m", "pyrxd.contrib.miner", "--workers", "2"],
+                nonce_width=4,
+                timeout_s=3,  # generous enough for >=1 progress frame at the default 0.5s cadence
+                progress=lambda a, e: calls.append((a, e)),
+                progress_interval_s=0.1,
+            )
+        assert len(calls) >= 1, "expected the real bundled miner to emit at least one live progress frame"
+        for attempts, elapsed_s in calls:
+            assert attempts >= 0
+            assert elapsed_s >= 0
