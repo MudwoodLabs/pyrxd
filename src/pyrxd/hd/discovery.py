@@ -118,7 +118,7 @@ async def discover(
     *normalize* controls BIP39 NFKD normalization of the mnemonic and
     passphrase — see :func:`~pyrxd.hd.bip39.seed_from_mnemonic`. A scan with
     the default ``True`` derives the spec-conformant seed and therefore
-    **cannot** see funds sitting on a seed pyrxd derived before 0.11.3 from a
+    **cannot** see funds sitting on a seed pyrxd derived before 0.12.0 from a
     non-ASCII passphrase; pass ``normalize=False`` to scan that legacy seed's
     paths instead. Recovery-only — never for new wallets.
 

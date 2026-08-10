@@ -80,7 +80,7 @@ including `wallet sweep` to move the funds once found:
 
 ## 2. Wallet won't decrypt after upgrading pyrxd (non-ASCII passphrase)
 
-**Symptom:** a wallet file created before **pyrxd 0.11.3** with a
+**Symptom:** a wallet file created before **pyrxd 0.12.0** with a
 **non-ASCII BIP39 passphrase** (accents, umlauts, CJK — anything beyond
 plain ASCII) now fails to decrypt, even though you're certain the mnemonic
 and passphrase are correct.
@@ -109,7 +109,7 @@ this generic message is the *only* symptom you get — nothing on-screen
 mentions NFKD or normalization.
 
 **Cause:** BIP39 requires the mnemonic and passphrase to be NFKD-normalized
-before they enter PBKDF2. pyrxd versions before 0.11.3 skipped that step, so
+before they enter PBKDF2. pyrxd versions before 0.12.0 skipped that step, so
 a non-ASCII passphrase could derive a different seed than the spec requires
 — and the wallet file's AES-GCM key is derived from that seed, so a file
 saved under the old seed only decrypts by reproducing it.
