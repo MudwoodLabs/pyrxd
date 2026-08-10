@@ -37,6 +37,23 @@ validate covenant-heavy work here before mainnet.
 pyrxd's CLI config takes a `network` of `mainnet | testnet | regtest`
 (`~/.pyrxd/config.toml`, see `pyrxd.cli.config`). Set `network = "testnet"` and
 put your testnet node's RPC/ElectrumX endpoints under `[networks.testnet]`.
+
+**This is required, not optional.** pyrxd ships no default testnet ElectrumX
+server (none was confirmed to exist), and it will not fall back to the mainnet
+one — a `--network testnet` run with no testnet endpoint configured refuses with
+a message naming the exact TOML to add. That refusal replaced the older
+behaviour, where the same command silently used the *mainnet* server while
+reporting itself as testnet. Every endpoint is additionally checked against the
+network's genesis hash on first use, so a wrong entry fails immediately instead
+of at broadcast time.
+
+```toml
+network = "testnet"
+
+[networks.testnet]
+electrumx = "wss://your-testnet-electrumx:50022/"
+```
+
 Testnet addresses use the testnet version bytes, so a key reconstructed with
 `PrivateKey(wif)` from a testnet wallet derives a testnet address — the same flow
 as the quickstart, just on the shared chain.

@@ -41,6 +41,7 @@ __all__ = [
     "PoolTooSmallError",
     "RxdSdkError",
     "SpvVerificationError",
+    "TlsPinMismatchError",
     "UnsupportedScriptError",
     "ValidationError",
     "redact",
@@ -255,6 +256,22 @@ class ConfirmationTimeoutError(InsufficientConfirmationsError):
         self.txid = txid
         self.waited_s = waited_s
         self.reason = reason
+
+
+class TlsPinMismatchError(NetworkError):
+    """Raised when a TLS SPKI pin check fails, or cannot be performed at all.
+
+    A subclass of :class:`NetworkError` so the ~30 existing ``except NetworkError``
+    handlers keep working, but a distinct class because the operator response is
+    completely different from a dropped socket: either the server operator rotated
+    their key (add the new pin) or you are not talking to the server you pinned
+    (stop). Pinning is opt-in — see :mod:`pyrxd.network.tls_pin` — so this can only
+    fire for someone who deliberately asked for the check.
+
+    "Cannot be performed" (no peer certificate available) raises this too, on
+    purpose: a check that silently degrades to no check is worse than no check,
+    because it is believed.
+    """
 
 
 class CovenantError(RxdSdkError):

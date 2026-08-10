@@ -24,6 +24,7 @@ from pyrxd.security.errors import (
     PoolTooSmallError,
     RxdSdkError,
     SpvVerificationError,
+    TlsPinMismatchError,
     ValidationError,
     redact,
 )
@@ -294,6 +295,24 @@ class TestPolicyRejectionParentage:
         err = PolicyRejection("rejected")
         assert err.code is None
         assert err.reason is None
+
+
+class TestTlsPinMismatchParentage:
+    """Raised by the opt-in TLS SPKI pin check (pyrxd.network.tls_pin)."""
+
+    def test_catchable_as_a_network_error(self) -> None:
+        # Existing `except NetworkError` handlers around every network call must
+        # keep catching it; a pinning failure is still a failure to reach a server.
+        assert issubclass(TlsPinMismatchError, NetworkError)
+        with pytest.raises(NetworkError):
+            raise TlsPinMismatchError("pin mismatch")
+
+    def test_is_distinct_from_a_plain_transport_fault(self) -> None:
+        # ...but distinguishable, because the operator response is different:
+        # "the operator rotated their key" vs "the socket dropped".
+        with pytest.raises(TlsPinMismatchError):
+            raise TlsPinMismatchError("pin mismatch")
+        assert not issubclass(NetworkError, TlsPinMismatchError)
 
 
 # ---------------------------------------------------------------------------

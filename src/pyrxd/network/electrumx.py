@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,8 +37,10 @@ from websockets.exceptions import WebSocketException
 from ..hash import sha256
 from ..merkle_path import MerklePath
 from ..script.type import P2PKH
-from ..security.errors import NetworkError, PolicyRejection, ValidationError, redact
+from ..security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError, redact
 from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
+from .registry import block_hash_hex
+from .tls_pin import normalize_pin, verify_connection_pin
 
 logger = logging.getLogger(__name__)
 
@@ -278,6 +281,12 @@ class ElectrumXClient:
         Set to ``True`` only for local testing.
     timeout:
         Per-request timeout in seconds (default 30).
+    spki_pins:
+        Optional TLS SubjectPublicKeyInfo pins (``sha256/<base64>``). Empty (the
+        default) leaves pinning OFF — ordinary CA validation only. When supplied,
+        every connection is checked against the set before any RPC is sent and a
+        mismatch raises :class:`~pyrxd.security.errors.TlsPinMismatchError`. See
+        :mod:`pyrxd.network.tls_pin` for the format and for why it is opt-in.
     """
 
     def __init__(
@@ -286,12 +295,17 @@ class ElectrumXClient:
         *,
         allow_insecure: bool = False,
         timeout: float = _DEFAULT_TIMEOUT,
+        spki_pins: Sequence[str] = (),
     ) -> None:
         if not urls:
             raise ValidationError("ElectrumXClient requires at least one server URL")
         self._urls = urls
         self._allow_insecure = allow_insecure
         self._timeout = timeout
+        # Normalised at construction so a malformed pin fails at wiring time, not
+        # on the first network hiccup. An unparseable pin must never degrade to
+        # "unpinned" — see tls_pin.normalize_pin.
+        self._spki_pins: tuple[str, ...] = tuple(normalize_pin(pin) for pin in spki_pins)
         self._ws: Any | None = None  # websockets.WebSocketClientProtocol
         self._id_counter: int = 0
         self._id_lock: asyncio.Lock = asyncio.Lock()
@@ -561,6 +575,51 @@ class ElectrumXClient:
             raise NetworkError("Malformed tip height response from server")
         return height
 
+    async def assert_chain(self, expected_genesis_hash: str) -> str:
+        """Fail closed unless the server is on the chain identified by *expected_genesis_hash*.
+
+        Mirrors :meth:`pyrxd.eth_wallet.rpc.EthRpc.assert_chain` — the ETH leg has
+        refused to act on a wrong-chain endpoint since it shipped, and an ElectrumX
+        URL carries even less information about which chain is behind it than an
+        RPC URL does. Reads block 0 (``blockchain.block.header [0]``, one round
+        trip, no state) and compares the Radiant double-SHA-512/256 header hash
+        against the expected value.
+
+        This is what turns a *declared* network binding into a *verified* one:
+        without it, ``--network regtest`` pointed at a mainnet server is
+        indistinguishable from a correct setup until a transaction lands on the
+        wrong chain.
+
+        Parameters
+        ----------
+        expected_genesis_hash:
+            Genesis block hash in display order — see
+            :data:`pyrxd.network.registry.GENESIS_BLOCK_HASHES`.
+
+        Returns
+        -------
+        str
+            The observed genesis hash (equal to the expected one on success).
+
+        Raises
+        ------
+        ValidationError
+            If the server's genesis hash differs from the expected one. Both
+            values are public chain data, so both are named verbatim — that is
+            what makes the misconfiguration fixable.
+        NetworkError
+            On transport failure or a malformed header response.
+        """
+        expected = str(expected_genesis_hash).strip().lower()
+        header = await self.get_block_header(BlockHeight(0))
+        observed = block_hash_hex(header)
+        if observed != expected:
+            raise ValidationError(
+                f"ElectrumX endpoint is on the wrong chain: genesis {observed} != expected {expected}. "
+                "Check --network and the endpoint configured for it."
+            )
+        return observed
+
     # ---------------------------------------------------------------------- internals
 
     def _validate_url(self, url: str) -> None:
@@ -602,18 +661,27 @@ class ElectrumXClient:
         the ``CancelledError`` but cannot retrieve the orphaned ws.
 
         Raises ``NetworkError`` if all connections fail or the overall
-        timeout expires before any succeeds.
+        timeout expires before any succeeds. A TLS SPKI pin mismatch is re-raised
+        as itself rather than folded into the generic message: "you are not
+        talking to the server you pinned" needs a different operator response
+        from "nothing answered", and burying it would make an opt-in security
+        control look like a flaky network.
         """
         created: list[Any] = []  # every ws actually returned by websockets.connect
 
         async def _try(url: str) -> Any:
             ws = await websockets.connect(url)  # type: ignore[attr-defined]
+            # Append BEFORE the pin check so the `finally` block below still closes
+            # this socket when the check rejects it.
             created.append(ws)
+            if self._spki_pins:
+                verify_connection_pin(ws, self._spki_pins, url=url)
             return ws
 
         tasks = [asyncio.create_task(_try(url)) for url in urls]
         winner_ws: Any | None = None
         last_exc: Exception | None = None
+        pin_exc: TlsPinMismatchError | None = None
         remaining: set[asyncio.Task[Any]] = set(tasks)
 
         try:
@@ -635,6 +703,11 @@ class ElectrumXClient:
                 for task in done:
                     try:
                         ws = task.result()
+                    except TlsPinMismatchError as exc:
+                        logger.debug("ElectrumX connect rejected by SPKI pin")
+                        pin_exc = pin_exc or exc
+                        last_exc = exc
+                        continue
                     except Exception as exc:
                         logger.debug("ElectrumX connect failed: %s", exc)
                         last_exc = exc
@@ -664,6 +737,8 @@ class ElectrumXClient:
 
         if winner_ws is not None:
             return winner_ws
+        if pin_exc is not None:
+            raise pin_exc
         raise NetworkError("Failed to connect to any ElectrumX server") from last_exc
 
     def _fail_all_pending(self, exc: Exception) -> None:
