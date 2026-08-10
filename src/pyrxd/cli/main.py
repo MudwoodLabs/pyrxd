@@ -132,8 +132,11 @@ def cli(
     # and it needs to know the operator named one explicitly for this run. Applying
     # the flag after the fact would leave `cfg.endpoint_error` set on a run that is
     # in fact fully configured.
-    final_network = network or cfg.network
-    cfg = cfg.for_network(final_network, electrumx_override=electrumx_url)
+    cfg = cfg.for_network(network or cfg.network, electrumx_override=electrumx_url)
+    # Read the network back off the RESOLVED config rather than reusing the raw
+    # input: `for_network` normalizes and validates it, and the context (and every
+    # status line built from it) must report the name that was actually resolved.
+    final_network = cfg.network
 
     ctx = CliContext(
         config=cfg,

@@ -133,7 +133,7 @@ confirm before anything goes out.
 | `--coin-type` | *(required)* | The SLIP-0044 coin type the funds are on (e.g. `0` or `512`). |
 | `--account` | `0` | The BIP44 account index the funds are on. |
 | `--to` | *(required)* | Destination address you control. |
-| `--fee-rate` | `10000` | Photons per kB. |
+| `--fee-rate` | `10000` | Photons per **byte** (`fee = tx size in bytes x this`). The default sits exactly at Radiant's effective relay floor; a lower value is refused, because Radiant has no RBF and no CPFP so a sub-floor transaction cannot be fee-bumped. |
 
 Send `--to` an address from a wallet you can actually use day-to-day — the point
 of the sweep is to get the coins onto a reachable path.

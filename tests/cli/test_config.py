@@ -10,7 +10,7 @@ from pyrxd.cli import config as _config
 from pyrxd.cli.config import load
 from pyrxd.cli.context import CliContext
 from pyrxd.cli.errors import UserError
-from pyrxd.network.registry import DEFAULT_ENDPOINTS, GENESIS_BLOCK_HASHES
+from pyrxd.network.registry import DEFAULT_ENDPOINTS, GENESIS_BLOCK_HASHES, KNOWN_NETWORKS
 from pyrxd.security.errors import ValidationError
 
 # The endpoint that used to leak across every network selection.
@@ -54,12 +54,14 @@ def test_per_network_overrides(tmp_path: Path) -> None:
         "fee_rate = 10000\n"
         "[networks.testnet]\n"
         'electrumx = "wss://test/"\n'
-        "fee_rate = 1\n"
+        # Was `fee_rate = 1` — 10,000x under the relay floor, which the
+        # per-network path used to accept. See the FEE-FLOOR section below.
+        "fee_rate = 25000\n"
     )
     cfg = _config.load(cfg_file)
     test_cfg = cfg.for_network("testnet")
     assert test_cfg.electrumx == "wss://test/"
-    assert test_cfg.fee_rate == 1
+    assert test_cfg.fee_rate == 25_000
     # Original mainnet config still has its own values.
     assert cfg.electrumx == "wss://main/"
 
@@ -146,7 +148,7 @@ def test_set_coin_type_appends_when_key_absent(tmp_path: Path) -> None:
 
 def test_for_network_preserves_coin_type(tmp_path: Path) -> None:
     cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text('network = "mainnet"\ncoin_type = 0\n[networks.testnet]\nfee_rate = 1\n')
+    cfg_file.write_text('network = "mainnet"\ncoin_type = 0\n[networks.testnet]\nfee_rate = 12000\n')
     cfg = _config.load(cfg_file)
     assert cfg.for_network("testnet").coin_type == 0
 
@@ -432,3 +434,169 @@ def test_fee_rate_error_names_where_the_value_came_from(tmp_path, monkeypatch):
     monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
     with pytest.raises(ValidationError, match=str(cfg)):
         load(cfg)
+
+
+# ── FEE FLOOR: the per-network table ──────────────────────────────────────────
+#
+# REGRESSION SUITE. `_validated_fee_rate` ran only in `load()`. `for_network`
+# applied `overrides.get("fee_rate")` from `[networks.<net>]` with no floor check
+# at all — and `cli/main.py` routes EVERY invocation through `for_network`. So the
+# guard added for the top-level key was bypassable by moving the same value one
+# table down, and every mint/transfer/send then built ~100x under the floor.
+
+
+def test_a_per_network_fee_rate_below_the_floor_is_refused(tmp_path: Path, monkeypatch) -> None:
+    """THE regression test for the bypass. Measured before the fix:
+    top-level `fee_rate = 100` was correctly rejected by `load()`, while
+    `[networks.mainnet] fee_rate = 100` yielded `for_network("mainnet").fee_rate == 100`
+    against a 10,000 photons/byte floor."""
+    monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('network = "mainnet"\n[networks.mainnet]\nfee_rate = 100\n')
+
+    # The top-level key on its own IS caught — that is the guard being bypassed.
+    control = tmp_path / "control.toml"
+    control.write_text('network = "mainnet"\nfee_rate = 100\n')
+    with pytest.raises(ValidationError, match="below Radiant's effective relay floor"):
+        load(control)
+
+    # ...and the per-network table must now be caught by the same guard.
+    cfg = load(cfg_file)
+    with pytest.raises(ValidationError, match="below Radiant's effective relay floor"):
+        cfg.for_network("mainnet")
+
+
+@pytest.mark.parametrize("network", ["mainnet", "testnet", "regtest"])
+def test_the_per_network_fee_rate_error_names_the_table_not_the_top_level_key(
+    tmp_path: Path, monkeypatch, network: str
+) -> None:
+    """Naming the top-level `fee_rate` would send the operator to edit a key that
+    is not the one in force."""
+    monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(f'network = "mainnet"\n[networks.{network}]\nfee_rate = 1\n')
+    with pytest.raises(ValidationError) as exc:
+        load(cfg_file).for_network(network)
+    rendered = str(exc.value)
+    assert f"[networks.{network}]" in rendered
+    assert str(cfg_file) in rendered
+
+
+def test_a_per_network_fee_rate_at_or_above_the_floor_is_kept(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('network = "mainnet"\nfee_rate = 10000\n[networks.testnet]\nfee_rate = 90000\n')
+    cfg = load(cfg_file)
+    assert cfg.for_network("testnet").fee_rate == 90_000
+    assert cfg.for_network("mainnet").fee_rate == 10_000
+
+
+def test_a_non_integer_per_network_fee_rate_is_a_typed_error(tmp_path: Path, monkeypatch) -> None:
+    """`int()` on garbage used to escape as a bare ValueError past the config boundary."""
+    monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('network = "mainnet"\n[networks.mainnet]\nfee_rate = "cheap"\n')
+    with pytest.raises(ValidationError, match="networks.mainnet.fee_rate"):
+        load(cfg_file).for_network("mainnet")
+
+
+# ── NETWORK NAME: normalization + membership ──────────────────────────────────
+#
+# REGRESSION SUITE. The network name was taken verbatim; the only check was a
+# `strip()` truthiness test. `PYRXD_NETWORK=REGTEST` therefore:
+#   * missed the lowercase `[networks.regtest]` table;
+#   * compared EQUAL in `network == cfg.network` (both sides the same env
+#     string), so the top-level MAINNET server list was inherited;
+#   * produced `genesis_hash_for("REGTEST") is None`, which made the failover
+#     client skip `assert_chain` entirely.
+# A run the operator believed was regtest broadcast to mainnet with the chain
+# check disabled. `--network REGTEST` was safe only because click.Choice
+# lowercases it first.
+
+_MIXED_CASE_CONFIG = (
+    'network = "mainnet"\n'
+    'electrumx_servers = ["wss://mainnet.example:50022/"]\n'
+    "[networks.regtest]\n"
+    'electrumx = "ws://127.0.0.1:50010/"\n'
+    "allow_insecure = true\n"
+)
+
+
+@pytest.mark.parametrize("spelling", ["REGTEST", "Regtest", " regtest ", "regTEST"])
+def test_a_mixed_case_network_never_inherits_the_mainnet_endpoint(tmp_path: Path, monkeypatch, spelling: str) -> None:
+    """THE regression test. Measured before the fix with ``PYRXD_NETWORK=REGTEST``:
+    resolved endpoints were ``("wss://mainnet.example:50022/",)`` — the top-level
+    MAINNET list — on a run reported as regtest."""
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_MIXED_CASE_CONFIG)
+    monkeypatch.setenv("PYRXD_NETWORK", spelling)
+
+    cfg = _config.load(cfg_file)
+    assert cfg.network == "regtest"
+
+    out = cfg.for_network(cfg.network)
+    assert out.network == "regtest"
+    assert out.endpoints == ("ws://127.0.0.1:50010/",)
+    assert "wss://mainnet.example:50022/" not in out.endpoints
+
+
+@pytest.mark.parametrize("spelling", ["REGTEST", "Regtest", " regtest "])
+def test_a_mixed_case_network_still_resolves_a_genesis_hash(tmp_path: Path, monkeypatch, spelling: str) -> None:
+    """`genesis_hash is None` is what silently disabled `assert_chain`."""
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_MIXED_CASE_CONFIG)
+    monkeypatch.setenv("PYRXD_NETWORK", spelling)
+    profile = _config.load(cfg_file).for_network("regtest").require_profile()
+    assert profile.genesis_hash == GENESIS_BLOCK_HASHES["regtest"]
+
+
+@pytest.mark.parametrize("bad", ["mainet", "main net", "REGTEST-2", "bitcoin", "   "])
+def test_an_unknown_network_is_refused_at_load(tmp_path: Path, monkeypatch, bad: str) -> None:
+    """Fail CLOSED: a typo must not land on the 'pyrxd has no genesis constant for
+    this chain, so skip the check' path."""
+    monkeypatch.setenv("PYRXD_NETWORK", bad)
+    with pytest.raises(ValidationError):
+        _config.load(tmp_path / "absent.toml")
+
+
+def test_an_empty_PYRXD_NETWORK_means_unset_not_invalid(tmp_path: Path, monkeypatch) -> None:
+    """``PYRXD_NETWORK=`` is the shell's way of clearing a variable, so it falls
+    through to the file/default — which is itself validated. Whitespace-only is
+    NOT the same thing and is refused (see above)."""
+    monkeypatch.setenv("PYRXD_NETWORK", "")
+    assert _config.load(tmp_path / "absent.toml").network == "mainnet"
+
+
+@pytest.mark.parametrize("bad", ["mainet", "REGTEST-2", "bitcoin"])
+def test_an_unknown_network_is_refused_by_for_network_too(tmp_path: Path, monkeypatch, bad: str) -> None:
+    """`for_network` is what the CLI always calls, and a library caller can build a
+    Config without going through `load` at all."""
+    monkeypatch.delenv("PYRXD_NETWORK", raising=False)
+    cfg = _config.load(tmp_path / "absent.toml")
+    with pytest.raises(ValidationError, match="unknown network"):
+        cfg.for_network(bad)
+
+
+def test_the_unknown_network_error_lists_the_known_ones(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("PYRXD_NETWORK", "mainet")
+    with pytest.raises(ValidationError) as exc:
+        _config.load(tmp_path / "absent.toml")
+    rendered = str(exc.value)
+    assert "PYRXD_NETWORK" in rendered
+    for known in KNOWN_NETWORKS:
+        assert known in rendered
+
+
+def test_a_mixed_case_network_in_the_file_is_normalized(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("PYRXD_NETWORK", raising=False)
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('network = "MainNet"\n')
+    assert _config.load(cfg_file).network == "mainnet"
+
+
+def test_an_unknown_network_in_the_file_names_the_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("PYRXD_NETWORK", raising=False)
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('network = "mainet"\n')
+    with pytest.raises(ValidationError, match=str(cfg_file)):
+        _config.load(cfg_file)

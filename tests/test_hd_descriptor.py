@@ -121,6 +121,21 @@ class TestBip380Checksum:
         with pytest.raises(ValidationError, match="input charset"):
             descriptor_checksum("raw(Ü)")
 
+    def test_a_doubly_checksummed_descriptor_is_rejected(self) -> None:
+        """``#`` is a member of INPUT_CHARSET, so ``raw(deadbeef)#89f8spxm#4x0avkn4``
+        polymods correctly and ``verify_checksum`` returned True for it — while
+        Bitcoin Core's ``descsum_check`` rejects it and ``descriptor_checksum``
+        already refuses to *create* one. Accepting what we will not emit, and what
+        the consumer will not take, is the wrong half to be lenient in."""
+        doubled = "raw(deadbeef)#89f8spxm#4x0avkn4"
+        # Sanity: the vector really is a valid polymod over the inner string, so
+        # the only thing rejecting it is the new one-`#` rule.
+        assert doubled.startswith(append_checksum("raw(deadbeef)"))
+        assert verify_checksum(doubled) is False
+
+    def test_a_checksum_embedded_mid_string_is_rejected(self) -> None:
+        assert verify_checksum("raw(dead#beef)#89f8spxm") is False
+
 
 # ---------------------------------------------------------------------------
 # Path + key origin
@@ -403,6 +418,67 @@ class TestNoPrivateMaterialLeaks:
         assert isinstance(Xpub(key_part), Xpub)
         with pytest.raises(ValidationError):
             Xprv(key_part)
+
+    def test_a_mutated_Xpub_instance_cannot_smuggle_an_xprv_into_a_descriptor(self) -> None:
+        """``_coerce_xpub``'s ``Xpub``-instance branch returned ``str(xpub)`` with no
+        re-validation, while the string branch had an explicit raise.
+        ``Xkey.payload`` is a plain mutable attribute and ``Xkey.__str__``
+        re-encodes it on every call, so an object that passed ``Xpub.__init__``
+        could afterwards be made to serialise an **xprv** — and the descriptor
+        would carry the wallet's spending key to wherever it was pasted.
+
+        Not reachable from ``src/`` today. This is a key boundary, and the guard
+        must be explicit rather than by-construction."""
+        wallet = _fresh_wallet()
+        master_xprv = master_xprv_from_seed(wallet._seed.unsafe_raw_bytes())
+        account_xpub = wallet.account_xpub()
+
+        smuggler = Xpub(str(account_xpub))
+        smuggler.payload = master_xprv.payload  # the mutation the guard must catch
+        assert str(smuggler).startswith("xprv")  # ...and it really does emit one
+
+        with pytest.raises(ValidationError, match="extended PUBLIC key"):
+            pkh_descriptor(
+                smuggler,
+                master_fingerprint=wallet.master_fingerprint(),
+                account_path=wallet.account_path,
+                chain=0,
+            )
+
+    def test_the_rejection_does_not_echo_the_xprv(self) -> None:
+        """The refusal message and its whole cause chain must not carry the key
+        it just refused to publish."""
+        wallet = _fresh_wallet()
+        master_xprv = master_xprv_from_seed(wallet._seed.unsafe_raw_bytes())
+        xprv_str = master_xprv.serialize()
+
+        smuggler = Xpub(str(wallet.account_xpub()))
+        smuggler.payload = master_xprv.payload
+
+        with pytest.raises(ValidationError) as exc:
+            pkh_descriptor(
+                smuggler,
+                master_fingerprint=wallet.master_fingerprint(),
+                account_path=wallet.account_path,
+                chain=0,
+            )
+        node: BaseException | None = exc.value
+        while node is not None:
+            rendered = f"{node}{node.args!r}"
+            for start in range(0, len(xprv_str) - 8):
+                assert xprv_str[start : start + 8] not in rendered
+            node = node.__cause__ or node.__context__
+
+    def test_a_genuine_Xpub_instance_still_works(self) -> None:
+        wallet = _fresh_wallet()
+        desc = pkh_descriptor(
+            wallet.account_xpub(),
+            master_fingerprint=wallet.master_fingerprint(),
+            account_path=wallet.account_path,
+            chain=0,
+        )
+        assert "xpub" in desc
+        assert "xprv" not in desc
 
 
 class TestGoldenVector:

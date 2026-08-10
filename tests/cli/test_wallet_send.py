@@ -129,3 +129,28 @@ def test_rejects_bad_destination(runner: CliRunner, tmp_path: Path) -> None:
     result = runner.invoke(wallet_group, ["send", "--to", "not-an-address", "--amount", "10000000"], obj=ctx)
     assert result.exit_code != 0
     assert "address" in result.output.lower()
+
+
+@pytest.mark.parametrize("rate", ["1", "100", "9999"])
+def test_rejects_a_sub_floor_fee_rate(runner: CliRunner, tmp_path: Path, rate: str) -> None:
+    """``--fee-rate`` skipped the relay-floor guard the config file's ``fee_rate``
+    has had since e0772e0. Radiant has no RBF and no CPFP, so a sub-floor
+    transaction cannot be bumped and squats on its inputs until mempool expiry."""
+    client = _funded_client_for(HdWallet.from_mnemonic(MNEMONIC)._derive_address(0, 0))
+    ctx = _ctx(tmp_path / "wallet.dat", client)
+    result = runner.invoke(
+        wallet_group,
+        ["send", "--to", DEST, "--amount", "10000000", "--fee-rate", rate],
+        obj=ctx,
+    )
+    assert result.exit_code != 0
+    assert "relay floor" in result.output
+    client.broadcast.assert_not_awaited()
+
+
+def test_fee_rate_help_says_per_byte_not_per_kB(runner: CliRunner) -> None:
+    """``fee = size * fee_rate`` with size in BYTES (hd/wallet.py). The help said
+    "per kB", understating the fee 1000x for anyone who read it."""
+    result = runner.invoke(wallet_group, ["send", "--help"])
+    assert "per BYTE" in result.output
+    assert "per kB" not in result.output

@@ -28,7 +28,7 @@ from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import KeyMaterialError, ValidationError
 
 # --------------------------------------------------------------------------- fixtures / builders
 
@@ -404,6 +404,28 @@ def test_covenant_pkhs_from_wifs_never_leak_the_wif(tmp_path: Path) -> None:
     assert len(taker) == 20 and len(maker) == 20
     doc = json.loads(f.read_text())
     assert taker == bytes(PrivateKey(doc["taker_rxd_wif"]).public_key().hash160())
+
+
+def test_a_malformed_wif_in_the_recovery_file_is_never_echoed(tmp_path: Path) -> None:
+    """The sink the audit reproduced: ``covenant_pkhs`` -> ``_pkh_from_wif`` ->
+    ``PrivateKey(wif)`` -> ``base58``, whose ``ValueError`` escaped ``_run`` (which
+    catches only ``NetworkError``/``OSError``) to the CLI boundary's
+    ``cause: {exc}``. One out-of-alphabet character — a line wrap, a stray space,
+    an ``O``/``I``/``l`` typo — published 51 of a 52-character key."""
+    good = PrivateKey().wif()
+    typo = good[:20] + "0" + good[21:]  # '0' is not in the base58 alphabet
+    f = _keys_file(tmp_path, taker_rxd_wif=typo)
+
+    with pytest.raises(KeyMaterialError) as exc:
+        sr.covenant_pkhs(f)
+
+    node: BaseException | None = exc.value
+    while node is not None:
+        rendered = f"{node}{node.args!r}"
+        for start in range(len(good) - 8):
+            assert good[start : start + 8] not in rendered
+            assert typo[start : start + 8] not in rendered
+        node = node.__cause__ or node.__context__
 
 
 def test_covenant_pkhs_accept_explicit_overrides(tmp_path: Path) -> None:

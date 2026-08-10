@@ -26,6 +26,7 @@ from ..security.errors import NetworkError, ValidationError
 from ..security.rng import secure_random_bytes
 from ..utils import validate_address
 from ..wallet import DEFAULT_FEE_RATE
+from .config import validated_fee_rate
 from .context import CliContext
 from .errors import NetworkBoundaryError, UserError, WalletDecryptError
 from .format import emit, format_photons
@@ -58,6 +59,27 @@ def _parse_int_csv(value: str, *, flag: str) -> list[int]:
     if not out:
         raise UserError(f"{flag} must contain at least one value")
     return out
+
+
+def _checked_fee_rate(fee_rate: int) -> int:
+    """Validate ``--fee-rate`` (photons per BYTE) against Radiant's relay floor.
+
+    ``--fee-rate`` used to be checked only for ``> 0``, so it was the one path into
+    a spend that could still set a rate the network will not relay — and Radiant has
+    neither RBF nor CPFP, so such a transaction cannot be bumped and squats on its
+    inputs until mempool expiry. The config file's ``fee_rate`` has been floor-checked
+    since ``e0772e0``; this applies the same floor to the flag that overrides it.
+    """
+    if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
+        raise UserError("--fee-rate must be a positive integer (photons per byte)")
+    try:
+        return validated_fee_rate(fee_rate, None)
+    except ValidationError as exc:
+        raise UserError(
+            "--fee-rate is below Radiant's relay floor",
+            cause=str(exc),
+            fix=f"pass --fee-rate {DEFAULT_FEE_RATE} or higher (photons per byte)",
+        ) from exc
 
 
 @click.group(name="wallet")
@@ -511,7 +533,7 @@ def wallet_recover(ctx: CliContext, scan: bool, coin_types: str, accounts: str, 
     type=int,
     default=DEFAULT_FEE_RATE,
     show_default=True,
-    help="Fee rate in photons per kB.",
+    help="Fee rate in photons per BYTE (fee = tx size in bytes x this).",
 )
 @click.option(
     "--passphrase/--no-passphrase",
@@ -534,10 +556,9 @@ def wallet_sweep(
     """
     if coin_type < 0 or account < 0:
         raise UserError("--coin-type and --account must be non-negative")
-    if fee_rate <= 0:
-        # Validate before the mnemonic prompt so a bad invocation fails
-        # without the user first typing their seed.
-        raise UserError("--fee-rate must be a positive integer (photons per kB)")
+    # Validate before the mnemonic prompt so a bad invocation fails
+    # without the user first typing their seed.
+    fee_rate = _checked_fee_rate(fee_rate)
     # Block --json without --yes early (a broadcast must not auto-confirm).
     ok, why = ctx.is_destructive_mode_safe()
     if not ok:
@@ -670,7 +691,13 @@ def _send_summary(ctx: CliContext, *, to_address: str, amount: int, fee: int, in
 @wallet_group.command(name="send")
 @click.option("--to", "to_address", required=True, help="Destination Radiant P2PKH address you intend to pay.")
 @click.option("--amount", type=int, required=True, metavar="PHOTONS", help="Amount to send, in photons.")
-@click.option("--fee-rate", type=int, default=DEFAULT_FEE_RATE, show_default=True, help="Fee rate (photons per kB).")
+@click.option(
+    "--fee-rate",
+    type=int,
+    default=DEFAULT_FEE_RATE,
+    show_default=True,
+    help="Fee rate in photons per BYTE (fee = tx size in bytes x this).",
+)
 @click.option(
     "--passphrase/--no-passphrase", default=False, help="Prompt for the BIP39 passphrase (in-process fallback only)."
 )
@@ -685,8 +712,7 @@ def wallet_send(ctx: CliContext, to_address: str, amount: int, fee_rate: int, pa
     """
     if not isinstance(amount, int) or amount <= 0:
         raise UserError("--amount must be a positive integer (photons)")
-    if fee_rate <= 0:
-        raise UserError("--fee-rate must be a positive integer (photons per kB)")
+    fee_rate = _checked_fee_rate(fee_rate)
     ok, why = ctx.is_destructive_mode_safe()
     if not ok:
         raise UserError(why or "destructive op without --yes in --json mode")

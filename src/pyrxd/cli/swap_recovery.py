@@ -99,7 +99,7 @@ from pyrxd.gravity.htlc_covenant import (
 )
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import KeyMaterialError, ValidationError
 
 __all__ = [
     "ETH_READ_ONLY_RPC_METHODS",
@@ -222,7 +222,23 @@ def parse_recovery_extras(path: Path) -> RecoveryExtras:
 
 
 def _pkh_from_wif(wif: str) -> bytes:
-    return bytes(PrivateKey(wif).public_key().hash160())
+    """Hash a WIF to its pkh, never letting the WIF into an error message.
+
+    ``pyrxd.base58`` is the source-level fix for that (its decode failures carry a
+    static message and no ``__cause__``); this is the matching call-site guard, so
+    an unreadable ``*_rxd_wif`` in a hand-edited recovery file surfaces as a clean
+    typed error rather than an "unexpected failure" at the CLI boundary. The
+    exception is re-raised ``from None`` as a second, independent barrier — this
+    function must not depend on any other module's message hygiene.
+    """
+    try:
+        return bytes(PrivateKey(wif).public_key().hash160())
+    except Exception:
+        raise KeyMaterialError(
+            "could not decode a WIF from the recovery file. The offending value is "
+            "deliberately not shown — it is a private key. Check it for a line wrap, "
+            "a stray space, or an O/I/l typo, or pass the public --taker-pkh/--maker-pkh instead."
+        ) from None
 
 
 def covenant_pkhs(
