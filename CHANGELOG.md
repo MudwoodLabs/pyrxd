@@ -34,8 +34,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   plain 63-byte singleton, container-ness carried by the `7` marker in the envelope — which
   is Photonic Wallet's model and what makes it routable by every existing code path: it is
   classified by `find_glyphs`, surfaced by `GlyphScanner`, and moved by `build_nft_transfer_tx`
-  with no special case. `GlyphMinter.commit_nft` / `pyrxd glyph mint-nft` now accept a
-  CONTAINER instead of refusing it.
+  with no special case. `GlyphMinter.commit_nft` now accepts a CONTAINER instead of refusing
+  it — it was listed as an unsupported reveal shape purely because of the removed child-ref
+  prefix. (`pyrxd glyph mint-nft` builds through `GlyphBuilder` directly and never refused
+  one; what changes there is that `glyph init-metadata --type container-nft` now writes
+  Photonic's `type: "container"` rather than `"collection"`, which Photonic renders as a plain
+  object.)
 - **Collection membership in the envelope: `GlyphMetadata.container_refs` / `.author_refs`**,
   encoded as the Glyph `in` / `by` fields. Refs are 36-byte byte strings in the same wire form
   the locking script uses, which is what lets a reader check a claim; CBOR tag 64-wrapped
