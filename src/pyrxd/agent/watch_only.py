@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from ..fee_sizing import assert_fee_rate_clears_relay_floor
 from ..hd.bip32 import Xpub
 from ..script.script import Script
 from ..script.type import P2PKH
@@ -114,12 +115,26 @@ class WatchOnlyTxBuilder:
         change_index: int,
         change_chain: int = _INTERNAL_CHAIN,
         fee_rate: int = DEFAULT_FEE_RATE,
+        allow_below_relay_floor: bool = False,
     ) -> UnsignedSend:
         """Build an unsigned send of ``photons`` to ``to_address`` with change to
         ``change_chain/change_index``. Returns the unsigned tx + a SigningRequest.
 
         Mirrors :meth:`HdWallet.build_send_tx`'s greedy selection and dust-burn
         rule, but key-free and with an estimated (not signature-measured) fee.
+
+        ``fee_rate`` is refused below Radiant's relay floor, exactly as in
+        :meth:`HdWallet.build_send_tx`. Being key-free does not soften the
+        consequence: this builder's output is signed by the agent and broadcast,
+        and Radiant has neither RBF nor CPFP, so a sub-floor transaction cannot be
+        replaced or bumped — it holds its inputs until mempool expiry, 8 hours
+        later. The fee here is *estimated* from a standard signed-P2PKH size
+        rather than measured, which makes the rate the only thing that can be
+        judged at all, so it is judged here.
+
+        :param allow_below_relay_floor: the same deliberate, greppable escape
+            hatch the other builders carry — for regtest and for chains the
+            caller controls, which legitimately relay lower.
         """
         if not isinstance(photons, int) or isinstance(photons, bool):
             raise ValidationError("photons must be int")
@@ -135,6 +150,15 @@ class WatchOnlyTxBuilder:
             raise ValidationError("to_address is not a valid P2PKH address")
         if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
             raise ValidationError("fee_rate must be a positive int")
+        # The fee below is `size_estimate * fee_rate` and nothing else, so a
+        # sub-floor rate has to be refused HERE or not at all — same reasoning as
+        # HdWallet.build_send_tx, which this method mirrors.
+        assert_fee_rate_clears_relay_floor(
+            fee_rate,
+            what="WatchOnlyTxBuilder.build_send",
+            allow_below_relay_floor=allow_below_relay_floor,
+            error_type=ValidationError,
+        )
         for label, val in (("change_index", change_index), ("change_chain", change_chain)):
             if not isinstance(val, int) or isinstance(val, bool) or val < 0:
                 raise ValidationError(f"{label} must be a non-negative int")

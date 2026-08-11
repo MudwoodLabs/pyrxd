@@ -156,6 +156,7 @@ async def run_demo() -> None:
     # Late imports so the module is importable even without the SDK installed
     from pyrxd.btc_wallet.keys import generate_keypair, keypair_from_wif
     from pyrxd.btc_wallet.payment import BtcUtxo, build_payment_tx
+    from pyrxd.gravity.codehash import compute_p2sh_code_hash
     from pyrxd.gravity.transactions import build_claim_tx, build_finalize_tx
     from pyrxd.gravity.types import GravityOffer
     from pyrxd.network.bitcoin import MempoolSpaceSource
@@ -245,8 +246,17 @@ async def run_demo() -> None:
     offer_redeem_hex = _p2pkh_script(maker_pkh).hex()
     claimed_redeem_hex = _p2pkh_script(taker_rxd_pkh).hex()
 
+    # expectedClaimedCodeHash = hash256(P2SH_scriptPubKey(claimed_redeem)) — the
+    # value MakerOffer checks output[0]'s codeScript against on-chain, and a
+    # required field of GravityOffer. Derived here with the SAME helper the
+    # production builder uses (`gravity.covenant.build_gravity_offer`), never
+    # hand-typed: a code hash that does not match the claimed redeem script
+    # produces a covenant no claim tx can satisfy.
+    expected_code_hash_hex = compute_p2sh_code_hash(bytes.fromhex(claimed_redeem_hex)).hex()
+
     _ok(f"offer_redeem_hex:   {offer_redeem_hex}")
     _ok(f"claimed_redeem_hex: {claimed_redeem_hex}")
+    _ok(f"expected_code_hash: {expected_code_hash_hex}")
 
     # ── Step 4: Chain anchor (from BTC) ───────────────────────────────────
     _hr("Step 4: Chain Anchor")
@@ -286,6 +296,7 @@ async def run_demo() -> None:
         photons_offered=PHOTONS_OFFERED,
         offer_redeem_hex=offer_redeem_hex,
         claimed_redeem_hex=claimed_redeem_hex,
+        expected_code_hash_hex=expected_code_hash_hex,
     )
 
     _ok("GravityOffer created")

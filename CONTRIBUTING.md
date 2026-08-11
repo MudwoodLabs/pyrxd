@@ -147,11 +147,55 @@ Two things to know before writing a node-backed test:
   node a transaction one or two bytes short of its own rate is accepted anyway,
   and the node cannot contradict the builder. That is how
   `build_nft_transfer_tx` shipped under-fee'ing ~25% of NFT transfers for four
-  releases with green regtest suites. Lower the floor only deliberately, via the
-  fixture's `min_relay_rxd_per_kb`, with the reason written down
-  (`tests/test_rswp_regtest_e2e.py` is the one place that does).
+  releases with green regtest suites. Lower the floor only deliberately, with the
+  reason written down. Three suites do, each passing `-minrelaytxfee=0.01`
+  explicitly and asserting `getmempoolinfo` reports it back:
+  `tests/test_rswp_regtest_e2e.py`, `tests/test_xchain_swap_regtest_e2e.py` and
+  `tests/test_xchain_eth_swap_regtest_e2e.py` — they prove orderbook, covenant and
+  cross-chain-sequencing *semantics*, and their carriers are sized around their own
+  fee constants. Every Radiant node the test tree starts declares its floor and
+  verifies it; none inherits one.
 - **Each module force-removes its container by name**, so two suites sharing a
   container name destroy each other's node. Give a new node a distinct name.
+
+#### The one suite CI does not run: `test_xchain_eth_glyph_real_rxindexer_e2e.py`
+
+Every other node-backed module is enumerated in `integration.yml`. This one is
+**operator-run, by decision**, and is the only integration module in no CI job.
+
+It needs a pre-running **RXinDexer** stack indexing a regtest node — an image this
+repo neither builds nor pins (`docker/` holds only `regtest.Dockerfile` and
+`litecoin-regtest.Dockerfile`; there is no published `rxindexer-electrumx:regtest`
+to pull). Standing it up in CI would mean building an external project from an
+unpinned branch on every run, which buys a job that goes red for reasons that have
+nothing to do with this repo. Adding a job that *skips* when the stack is absent
+would be worse still — a green tick that proves nothing is the exact failure mode
+the integration lane was built to remove, and it is why `vendor-freshness` is a
+scheduled job rather than a pytest test.
+
+What it uniquely proves — and what silently rots without it — is the seam between a
+real mint and the real indexer: that a genuine `GlyphBuilder` commit→reveal produces
+a token RXinDexer actually indexes, and that `RxinDexerRefAdapter` maps RXinDexer's
+**real** `glyph.get_token` response (`glyph_id` / `txid` / `vout`) onto a
+`ResolvedRef` the pre-lock REF gate accepts. `test_xchain_eth_swap_regtest_e2e.py`
+cannot cover this: it binds a fake singleton through a `FakeIndexer` that hands back
+a pre-built `ResolvedRef`, which is precisely how a real field-name mismatch in that
+adapter once stayed hidden.
+
+**Run it after any change to `RxinDexerRefAdapter`, `network/rxindexer.py`, the REF
+gate, or the Glyph mint path** — that is the trigger, not a calendar:
+
+```bash
+# One time: rxd-regtest-node (radiant-core regtest, RPC :17443, wallet `gravity`)
+# and rxd-indexer (rxindexer-electrumx regtest, NET=regtest, DB_ENGINE=rocksdb,
+# GLYPH_INDEX=1, ElectrumX WS on 127.0.0.1:50011). Needs `anvil` on PATH.
+XCHAIN_ETH_GLYPH_REAL=1 \
+RXD_NODE_CT=rxd-regtest-node RXD_RPCUSER=rxduser RXD_RPCPASS=rxdpass RXD_WALLET=gravity \
+RXINDEXER_WS=ws://127.0.0.1:50011 \
+poetry run pytest tests/test_xchain_eth_glyph_real_rxindexer_e2e.py -m integration -s
+```
+
+Regtest and a local Anvil devnet only — it moves no real value.
 
 ### Keeping the vendored consensus sources fresh
 
