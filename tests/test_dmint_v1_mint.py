@@ -405,9 +405,15 @@ class TestBuildDmintMintTxV1:
         assert op_return_script == expected
 
     def test_op_return_msg_too_long_raises(self):
+        """256 bytes exceeds the OP_PUSHDATA1 one-byte length field — a real limit.
+
+        81 bytes is NOT: that used to be refused as a "standardness limit", a Bitcoin
+        rule on a chain where ``fRequireStandard`` is hardcoded ``false``.
+        """
         utxo = _make_v1_contract_utxo()
         with pytest.raises(ValidationError, match="op_return_msg"):
-            self._mint(utxo, op_return_msg=b"x" * 81)
+            self._mint(utxo, op_return_msg=b"x" * 256)
+        self._mint(utxo, op_return_msg=b"x" * 81)  # must NOT raise
 
     def test_contract_output_value_is_preserved(self):
         """Contract output value never decreases — V1 is a singleton, the

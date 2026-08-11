@@ -294,9 +294,10 @@ REVEAL_SIZE_SLACK_BYTES = 64
 def commit_value_for_reveal(carrier_value: int, estimate: RevealFeeEstimate) -> int:
     """Commit-output value that lets the reveal pay its own fee, never below the floor.
 
-    ``carrier_value`` is what the reveal must place on its token output — a 546-photon
-    dust carrier for an NFT, the whole premined supply for an FT — and is therefore
-    *not* available to pay the fee.
+    ``carrier_value`` is what the reveal must place on its token output — pyrxd's
+    conventional 546-photon carrier for an NFT (a pyrxd choice, not a chain minimum:
+    Radiant's output floor is 1 photon), the whole premined supply for an FT — and is
+    therefore *not* available to pay the fee.
 
     This is the single source of truth for commit sizing. It lived as a private helper
     in ``pyrxd.cli.glyph_cmds`` until :mod:`pyrxd.glyph.mint` needed the same number:
@@ -318,8 +319,8 @@ def check_reveal_funding(
 
     Args:
         commit_value: photons the commit output will hold — the reveal's only input.
-        carrier_value: photons the reveal must place on the token output (546 for an
-            NFT dust carrier; the full supply for an FT premine).
+        carrier_value: photons the reveal must place on the token output (pyrxd's
+            conventional 546 for an NFT carrier; the full supply for an FT premine).
         estimate: from :func:`estimate_reveal_fee` / :func:`estimate_reveal_fee_for_metadata`.
 
     Raises:

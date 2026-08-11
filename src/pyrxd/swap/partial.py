@@ -36,7 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ..constants import SIGHASH
+from ..constants import DUST_THRESHOLD_PHOTONS, SIGHASH
 from ..fee_sizing import radiant_relay_size
 from ..glyph.script import (
     build_ft_locking_script,
@@ -62,8 +62,11 @@ if TYPE_CHECKING:  # pragma: no cover - typing only (runtime import is deferred,
     from ..gravity.fee_policy import DeadlineFeePolicy
 
 # Photons below this are not worth a standalone change output; fold into fee.
+# pyrxd POLICY, not a node rule — Radiant relays any output of 1 photon or more
+# (`GetDustThreshold` returns 1, `IsDust` is `nValue <= 0`). See
+# :data:`pyrxd.constants.DUST_THRESHOLD_PHOTONS`, the one definition.
 # (Token/FT change is always emitted regardless — it carries token value.)
-_DUST_PHOTONS = 546
+_DUST_PHOTONS = DUST_THRESHOLD_PHOTONS
 
 # A maker offer input is signed with this so the taker can complete the tx.
 _OFFER_SIGHASH = SIGHASH.SINGLE_ANYONECANPAY_FORKID

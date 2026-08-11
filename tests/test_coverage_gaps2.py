@@ -368,7 +368,9 @@ class TestTransactionEstimatedLength:
         pk = PrivateKey(998)
         addr = pk.address()
         locking = _p2pkh_script(addr)
-        src_out = TransactionOutput(locking, 100_000)
+        # The default model is Radiant's relay floor (10_000_000 photons/kB), so the
+        # input must cover a real fee for a change output to survive at all.
+        src_out = TransactionOutput(locking, 100_000_000)
         src_tx = Transaction(tx_inputs=[], tx_outputs=[src_out])
         tx_in = TransactionInput(
             source_transaction=src_tx,

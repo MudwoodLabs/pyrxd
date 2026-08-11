@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING
 
 import click
 
-from ..constants import Network
+from ..constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES, Network
 from ..fee_models import SatoshisPerKilobyte
 from ..glyph.builder import (
     AirdropFunding,
@@ -339,7 +339,11 @@ async def _mint_nft_inner(
 
     # Estimate funding requirement: commit value + commit fee + reveal fee buffer.
     fee_rate = ctx.fee_rate
-    carrier_value = 546  # the NFT's dust carrier on the reveal
+    # The NFT's carrier value on the reveal. Same number as
+    # ``pyrxd.glyph.mint.NFT_CARRIER_VALUE``, which derives from the same constant.
+    # It is a pyrxd convention, not a chain minimum: Radiant would carry the NFT on
+    # 1 photon (`GetDustThreshold` returns 1) — dMint contracts do exactly that.
+    carrier_value = DUST_THRESHOLD_PHOTONS
     # C-1: the reveal's scriptSig carries the whole CBOR payload, so the reveal fee
     # scales with metadata size and is paid entirely out of the commit output. Size
     # the commit from the real estimate instead of the old flat 5,000,000, which at
@@ -483,7 +487,7 @@ async def _mint_nft_inner(
                 title="Reveal transaction",
                 lines=[
                     f"commit txid:   {commit_txid}",
-                    f"nft to:        {funding_pkh.hex()}  (546-photon carrier; change returned)",
+                    f"nft to:        {funding_pkh.hex()}  ({carrier_value}-photon carrier; change returned)",
                 ],
             )
         ],
@@ -627,7 +631,8 @@ async def _deploy_ft_inner(
     reveal_estimate = estimate_reveal_fee_for_metadata(metadata, fee_rate=fee_rate)
     commit_value = _commit_value_for_reveal(carrier_value, reveal_estimate)
     commit_fee_estimate = 300 * fee_rate
-    total_required = commit_value + commit_fee_estimate + 546
+    # + one uneconomic-change floor so the funding UTXO can still emit change.
+    total_required = commit_value + commit_fee_estimate + DUST_THRESHOLD_PHOTONS
 
     triples.sort(key=lambda t: t[0].value, reverse=True)
     funding = next((t for t in triples if t[0].value >= total_required), None)
@@ -1720,7 +1725,7 @@ def _parse_schedule(schedule_json: str) -> tuple[tuple[int, int], ...]:
     default=None,
     help="V2 SCHEDULE: JSON [[height, difficulty], ...] (<=10, ascending), e.g. '[[100, 4], [1000, 8]]'.",
 )
-@click.option("--op-return", "op_return", default=None, help="Optional OP_RETURN carrier on the reveal (<=80 bytes).")
+@click.option("--op-return", "op_return", default=None, help="Optional OP_RETURN carrier on the reveal (<=255 bytes).")
 @click.option(
     "--premine",
     type=int,
@@ -1777,9 +1782,14 @@ def deploy_dmint_cmd(
     op_return_bytes = op_return.encode("utf-8") if op_return else None
     # Validate the OP_RETURN length UP FRONT — build_reveal_outputs only checks it
     # after the commit is already on-chain (an over-long value would strand the
-    # commit). 80 bytes is the node standardness limit (matches the mint path).
-    if op_return_bytes is not None and len(op_return_bytes) > 80:
-        raise UserError(f"--op-return is {len(op_return_bytes)} bytes; the standardness limit is 80")
+    # commit). The cap is pyrxd's OP_PUSHDATA1 ENCODER limit and matches the builder
+    # and mint paths; it is NOT a node standardness limit, which Radiant never
+    # consults (see :data:`pyrxd.constants.MAX_OP_RETURN_MSG_BYTES`).
+    if op_return_bytes is not None and len(op_return_bytes) > MAX_OP_RETURN_MSG_BYTES:
+        raise UserError(
+            f"--op-return is {len(op_return_bytes)} bytes; pyrxd encodes it with OP_PUSHDATA1 "
+            f"(one-byte length), so the cap is {MAX_OP_RETURN_MSG_BYTES} bytes"
+        )
     if not v2 and daa_mode != "fixed":
         raise UserError("--daa-mode requires --v2 (V1 dMint is FIXED difficulty only)")
     if premine is not None and premine < 1:
@@ -1925,7 +1935,8 @@ async def _deploy_dmint_inner(
     reveal_fee_estimate = reveal_bytes * fee_rate
     commit0_value = num_contracts + premine + reveal_fee_estimate + 10_000
     commit_fee_estimate = (num_contracts * 40 + 300) * fee_rate
-    total_required = commit0_value + num_contracts * _DMINT_REF_SEED + commit_fee_estimate + 546
+    # + one uneconomic-change floor so the funding UTXO can still emit change.
+    total_required = commit0_value + num_contracts * _DMINT_REF_SEED + commit_fee_estimate + DUST_THRESHOLD_PHOTONS
 
     triples.sort(key=lambda t: t[0].value, reverse=True)
     funding = next((t for t in triples if t[0].value >= total_required), None)
@@ -2551,7 +2562,7 @@ async def _claim_prepare(
     miner_pkh = bytes(Hex20(miner_key.public_key().hash160()))
 
     # 3. Scan that address for a plain-RXD funding UTXO (excludes token-bearing UTXOs).
-    needed = contract_utxo.state.reward + 10_000_000 + 546
+    needed = contract_utxo.state.reward + 10_000_000 + DUST_THRESHOLD_PHOTONS
     try:
         funding = await find_dmint_funding_utxo(client, miner_address, needed)
     except (DmintError, ValidationError) as exc:  # InvalidFundingUtxoError is a DmintError, not a ValidationError

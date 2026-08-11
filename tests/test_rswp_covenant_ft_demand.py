@@ -139,7 +139,7 @@ def test_ft_demand_sub_dust_surplus_is_returned_as_change(funded: int) -> None:
     satoshi and ``IsDust`` is ``nValue <= 0``
     (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is never
     consulted — ``fRequireStandard`` is hardcoded ``false``
-    (Radiant-Core/src/validation.cpp:271, src/init.cpp:1965), which is the only
+    (Radiant-Core/src/validation.cpp:271, src/init.cpp:1995), which is the only
     reason a 75-byte FT script relays at all. A taker holding 80 units against a
     50-unit demand could not fill the order.
 

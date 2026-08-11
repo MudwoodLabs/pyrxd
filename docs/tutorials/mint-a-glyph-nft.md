@@ -180,17 +180,25 @@ specific CBOR payload.
 ## Step 3 — Wait for commit confirmation
 
 Once you broadcast the commit, wait for it to confirm before building
-the reveal. Radiant's target block time is ~2 minutes, so 90 seconds
-plus a fresh UTXO lookup is usually enough on mainnet:
+the reveal. Radiant's target block time is **~5 minutes**
+(`nPowTargetSpacing = 5 * 60`, `Radiant-Core/src/chainparams.cpp:117`
+at tag `v3.1.2`), so do not sleep a fixed 90 seconds and assume the
+commit landed — poll for the confirmation instead. `wait_for_confirmation`
+is the shipped helper and is what `pyrxd glyph mint-nft` uses:
 
 ```python
-import asyncio
+from pyrxd.network.confirm import wait_for_confirmation
 
 # After broadcasting commit_tx and getting commit_txid back from ElectrumX:
 print(f"Commit tx broadcast: {commit_txid}")
-print("Waiting 90s for the commit to confirm...")
-await asyncio.sleep(90)
+print("Waiting for the commit to confirm...")
+await wait_for_confirmation(client, commit_txid, min_confirmations=1)
 ```
+
+Confirmation depth is a pyrxd convention here, not a protocol rule —
+a commit and the reveal that spends it can legitimately land in the
+same block (see `pyrxd.glyph.mint.DEFAULT_MINT_CONFIRMATIONS` for the
+evidence). Waiting is about mempool-eviction and propagation risk.
 
 The demo script saves the commit txid, vout, and the exact CBOR
 payload bytes to `/tmp/glyph_mint_resume.json` between the two phases.

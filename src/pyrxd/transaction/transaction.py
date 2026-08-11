@@ -166,7 +166,14 @@ class Transaction:
         """
         Computes the fee for the transaction and adjusts the change outputs accordingly.
 
-        :param model_or_fee: Fee model or fee amount. Defaults to `SatoshisPerKilobyte` with value 10 if not provided.
+        :param model_or_fee: Fee model or fee amount. Defaults to
+            ``SatoshisPerKilobyte(TRANSACTION_FEE_RATE)``, i.e. Radiant's effective
+            minimum relay rate of 10_000_000 photons/kB. The old default of 5
+            photons/kB was a Bitcoin-shaped inheritance that produced transactions
+            2_000_000x under the floor `AcceptToMemoryPool` enforces; every one of
+            them was unrelayable. Prefer :mod:`pyrxd.fee_sizing` for anything that
+            must provably clear the floor at its FINAL serialised size — this method
+            sizes against the estimate, not the signed bytes.
         :param change_distribution: Method of change distribution ('equal' or 'random'). Defaults to 'equal'.
         """
 

@@ -226,9 +226,9 @@ def _assert_fee_clears_relay_floor(
     (:func:`_validate_fee_sats`), which catches an accounting impossibility but says
     nothing about viability. Radiant's ``AcceptToMemoryPool`` rejects
     ``nModifiedFees < GetEffectiveMinRelayFee(height).GetFee(tx.GetTotalSize())``
-    (``src/validation.cpp:778``) with ``66: min relay fee not met``, and **Radiant has
-    neither RBF nor CPFP** — ``src/validation.cpp:667``/``:856`` reject a mempool conflict
-    outright and ``src/miner.cpp:380`` selects on the transaction's own
+    (``src/validation.cpp:779``) with ``66: min relay fee not met``, and **Radiant has
+    neither RBF nor CPFP** — ``src/validation.cpp:667``/``:866`` reject a mempool conflict
+    outright and ``src/miner.cpp:404`` selects on the transaction's own
     ``GetModifiedFeeRate()``. So an under-fee'd Gravity tx cannot be replaced, cannot be
     bumped by a child, and squats on the UTXO it spends until ``DEFAULT_MEMPOOL_EXPIRY``
     (8h) frees it for a rebuild. Handing the caller a plausible ``txid`` and plausible

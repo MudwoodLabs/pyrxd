@@ -45,7 +45,7 @@ asset classification, as before).
 
 from __future__ import annotations
 
-from ...constants import SIGHASH
+from ...constants import DUST_THRESHOLD_PHOTONS, SIGHASH
 from ...fee_sizing import radiant_relay_size
 from ...gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy, assert_fee_covers
 from ...gravity.swap_order import DemandedOutput
@@ -83,7 +83,9 @@ LOCKTIME_HEIGHT_THRESHOLD = 500_000_000
 # scanning — anything larger cannot be a covenant (review MEDIUM DoS).
 _MAX_COVENANT_SPK = 256
 
-_DUST_PHOTONS = 546  # same fold-to-fee rule as pyrxd.swap.partial
+# Same fold-to-fee rule as pyrxd.swap.partial, and the same single definition:
+# pyrxd POLICY for a plain-RXD change output, never a floor on a token output.
+_DUST_PHOTONS = DUST_THRESHOLD_PHOTONS
 
 
 def encode_expiry_height(height: int) -> bytes:
@@ -514,7 +516,7 @@ def take_covenant_order(
             # (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is not
             # consulted at all on this chain: ``fRequireStandard`` is hardcoded
             # ``false`` (Radiant-Core/src/validation.cpp:271, re-set
-            # unconditionally at src/init.cpp:1965), which is the only reason a
+            # unconditionally at src/init.cpp:1995), which is the only reason a
             # 75-byte FT script relays in the first place — ``Solver`` classifies
             # it ``TX_NONSTANDARD``. A taker holding 80 units against a 50-unit
             # demand could not fill the order at all, on a chain where that

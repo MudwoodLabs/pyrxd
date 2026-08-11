@@ -64,7 +64,7 @@ _T = TypeVar("_T")
 _DEFAULT_TIMEOUT: float = 30.0
 
 # Node reject reasons that mean "I already have this exact transaction". Verified
-# against Radiant-Core @ afdf57b1:
+# against Radiant-Core @ tag v3.1.2 (the pin in tests/vendor/radiant_core/MANIFEST.json):
 #   src/validation.cpp:605          -> "txn-already-in-mempool"
 #   src/validation.cpp:692          -> "txn-already-known"
 #   src/node/transaction.cpp:69-70  -> RPC_TRANSACTION_ALREADY_IN_CHAIN (-27),

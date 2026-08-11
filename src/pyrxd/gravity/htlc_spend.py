@@ -36,7 +36,7 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 
-from pyrxd.constants import SIGHASH
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS, SIGHASH
 from pyrxd.gravity.fee_policy import (
     DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
     DeadlineFeePolicy,
@@ -61,7 +61,10 @@ _REFUND_SELECTOR = b"\x51"  # OP_1 (function index 1)
 # the fee requirement: at the reference node's 0.10 RXD/kB effective relay rate a
 # ~266-byte RXD claim needs ~2,660,000 photons, ~4,900x this. See
 # :mod:`pyrxd.gravity.fee_policy` for the size-derived requirement that binds.
-DUST_FLOOR_PHOTONS = 546
+#
+# It is pyrxd POLICY, not a Radiant rule: the chain relays any output of 1 photon
+# or more. Aliased from :data:`pyrxd.constants.DUST_THRESHOLD_PHOTONS`.
+DUST_FLOOR_PHOTONS = DUST_THRESHOLD_PHOTONS
 
 
 @dataclass(frozen=True)
