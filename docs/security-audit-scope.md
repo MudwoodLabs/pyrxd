@@ -260,11 +260,17 @@ this commit, not against a plan:
    the hazard names as unsafe — so the fail-closed gate refuses them. They are opt-in
    (env-gated) and deselected from `task ci` (`pyproject.toml:432`, `-m 'not integration'`), so
    default CI is green; the reordering is a tracked follow-up (CHANGELOG 0.14.0).
-2. **A CONTAINER output with a child ref is mintable but unroutable**: `prepare_container_reveal`
-   (`glyph/builder.py:673`) builds a 100-byte script no pyrxd classifier matches —
-   `GlyphInspector.find_glyphs` skips it and `build_nft_transfer_tx` refuses it (requires
-   exactly 63 bytes). Container semantics beyond creation are undefined in this implementation
-   (spec §16.2).
+2. **A CONTAINER output with a child ref was mintable, unroutable, and worse — CLOSED after
+   0.14.0.** `prepare_container_reveal(child_ref=...)` built a 100-byte script no classifier
+   matched. Investigated against a regtest node rather than routed: the output was
+   **permanently unspendable** (the `OP_PUSHINPUTREF` push is never dropped, so the P2PKH tail
+   hashes the ref — `mandatory-script-verify-flag-failed`), and creating one **consumed the
+   child NFT's singleton ref irrecoverably** (a singleton may not appear in a sibling output,
+   and one consumed into a `0xd0` push never re-enters `inputSingletonRefSet`). The parameter
+   now raises; a container is an ordinary NFT and membership lives in the child's envelope
+   (`in`). Evidence: `tests/test_container_regtest_e2e.py`, spec §7.5 / §17.1. **An auditor
+   should still look for pre-0.15.0 outputs of this shape on chain** — pyrxd can identify one
+   (`is_legacy_container_script`) but nothing can recover it.
 3. **The handshake has no version negotiation.** The envelope `schema` tag is written at four
    sites and read at none; `NegotiatedTerms` has **no version field** and `from_dict` silently
    drops unknown keys (`gravity/swap_state.py:398-415`; locked by
@@ -372,9 +378,9 @@ these would otherwise be missed).
 |---|---|---|---|---|
 | `GLYPH-OWNERPKH` | high | mitigated (CLI) | The CLI mint paths now derive `owner_pkh` from the funding wallet (not from the metadata file) and the pre-broadcast summary prints it — `owner_pkh: … (this wallet)` (`cli/glyph_cmds.py:446,719`). TM S7 / gap #9's "summary does not surface owner_pkh" wording predates this. The hostile-metadata residual has **moved**, not vanished: see `GLYPH-METADATA-DROPPED-FIELDS` | `cli/glyph_cmds.py` · TM S7 / gap #9 |
 | `GLYPH-METADATA-DROPPED-FIELDS` | high | open | The CLI metadata-file loader silently drops `creator`, `policy`, `rights`, `v` (`royalty` and `dmint` were the same bug, fixed 0.14.0). Most consequential: `policy.transferable: false` — a token the creator marked soulbound mints freely transferable, with no warning, permanently | `cli/glyph_helpers.py` · CHANGELOG 0.14.0 residual |
-| `GLYPH-ENVELOPE-LOSSY` | medium | accepted | `decode_payload` drops unknown keys; decode-then-encode is not an identity and MUST NOT verify a payload against a commit hash (measured on the reference mainnet token — its `by` field is discarded) | `glyph/payload.py` · spec §16.1 |
+| `GLYPH-ENVELOPE-LOSSY` | medium | accepted | `decode_payload` drops unknown keys; decode-then-encode is not an identity and MUST NOT verify a payload against a commit hash. The reference mainnet token's `by` refs are no longer part of the loss (`in` / `by` decode since 0.15.0), but tag-64-wrapped byte strings still re-encode untagged, so the property stands | `glyph/payload.py` · spec §16.1 |
 | `GLYPH-CREATOR-SIG-CANON` | medium | accepted | Creator signatures are computed over a **non-canonical**, insertion-order CBOR encoding (`glyph/creator.py:43`) and attest to the modelled field set, not the on-chain bytes (unknown fields do not invalidate). Unchangeable without invalidating every existing on-chain signature — a permanent compat constraint | `glyph/creator.py` · spec §10.2–10.3 |
-| `GLYPH-CONTAINER-UNROUTABLE` | medium | open | A CONTAINER with a child ref is mintable but no classifier matches it: invisible to `find_glyphs`, refused by transfer (§8 item 2) | `glyph/builder.py`, `glyph/inspector.py` · spec §16.2 |
+| `GLYPH-CONTAINER-UNROUTABLE` | high | mitigated | Re-rated from medium after regtest investigation: the 100-byte CONTAINER-with-child-ref output was not merely unroutable, it was **unspendable**, and building one **destroyed the child NFT** (§8 item 2). The builder parameter now raises; a container is a plain NFT and membership is the child's envelope `in` field. Residual: any such output already on chain is unrecoverable — pyrxd identifies it (`is_legacy_container_script`) and says so | `glyph/builder.py`, `glyph/script.py`, `glyph/inspector.py` · `tests/test_container_regtest_e2e.py` · spec §7.5, §17.1 |
 | `GLYPH-PARSER-FUZZ` | medium | mitigated (partial) | Formerly "not yet fuzzed". Coverage-guided atheris harnesses now exist for the attacker-facing parsers — `scripts/fuzz_atheris/` (`harness_decode_payload.py`, `harness_inspect_script.py`, `harness_classify_input.py`, `harness_extract_reveal_metadata.py`, `harness_dmint_from_script.py`, plus RSWP + SPV harnesses) — on a **weekly scheduled** CI lane (`.github/workflows/fuzz.yml`), not per-PR. TM gap #3's CLI-surface fuzzing (issue #10) remains open | `scripts/fuzz_atheris/harness_decode_payload.py` · TM gap #3 |
 | `GLYPH-DUAL-WALKER` | medium | mitigated | Formerly: divergent opcode walkers could drift on reserved bytes. This is exactly the defect the 0.14.0 panel found live (§7 item 2 — four walkers, split two-and-two). All walkers now share the single consensus-correct `REF_OPCODES` (`glyph/script.py:442`), differential-locked against a port of Radiant's `GetScriptOp` (`tests/test_glyph.py`) | `glyph/script.py`, `glyph/credential_binding.py` · FT-covenant note |
 | `GLYPH-MINT-STRAND` | medium | mitigated | The commit output is a hashlock with **no owner-only spend path**: losing the exact CBOR between commit and reveal strands it permanently. The two-phase minter makes persistence a *required* constructor argument (opting out means naming `UnsafeNullPendingStore`), writes-then-reads-back before broadcast, and re-hashes the stored payload before any reveal | `glyph/mint.py` · CHANGELOG 0.13.0 |

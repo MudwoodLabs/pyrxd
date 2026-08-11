@@ -9,6 +9,7 @@ you already know the basics and want a focused answer to "how do I X."
 receive-and-check-balance
 export-a-watch-only-descriptor
 transfer-a-glyph-token
+create-a-token-collection
 use-the-signing-agent
 recover-funds-across-wallet-paths
 broadcast-a-transaction
@@ -44,6 +45,12 @@ troubleshoot-common-errors
   Explains that `REF` is the token's genesis ref (not the UTXO), FT conservation
   + change, why a transfer needs a little plain RXD for the fee, and why a
   royalty is honoured but never enforced.
+- **[Create a token collection](create-a-token-collection.md)** — group NFTs into a
+  CONTAINER: mint the collection (an ordinary NFT carrying protocol marker `7`),
+  mint members that declare it in their envelope's `in` field, and make the claim
+  *checkable* by spending and re-creating the collection UTXO in the member's
+  reveal. Covers what a collection does and does not guarantee, and why Radiant
+  consensus makes a script-level parent/child ref impossible.
 - **[Use the local signing agent](use-the-signing-agent.md)** — unlock the wallet
   once into a foreground agent (`pyrxd agent unlock`); the seed lives in one
   process, `wallet send` signs against it with no mnemonic re-entry, and you

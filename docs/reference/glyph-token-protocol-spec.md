@@ -14,8 +14,11 @@ and [Radiant FTs are on-chain](../concepts/radiant-fts-are-on-chain.md).
 
 ## 1. Status, scope, and how to read this
 
-**Specification revision:** 1 — describes pyrxd **0.13.0**
+**Specification revision:** 2 — describes pyrxd **0.15.0** (unreleased)
 (`pyproject.toml:9`).
+
+Revision 2 rewrote §7.5 (CONTAINER) after putting its claims to a regtest node,
+added the `in` / `by` envelope fields to §4.3, and retired §16.2. See §17.1.
 
 **Source of truth.** Every normative statement below was derived from the pyrxd
 source, and where possible from a test or conformance vector that pins the
@@ -264,8 +267,20 @@ Field names, decoder types, and limits are from
 | `rights` | map | no | — | Licence and attribution |
 | `created` | text | no | 64 | Creation timestamp |
 | `commit_outpoint` | text | no | 128 | Self-declared commit outpoint |
+| `in` | array of byte strings | no | — | Containers this token is a member of (§7.5) |
+| `by` | array of byte strings | no | — | Author / issuer tokens |
 
 Notes on individual fields:
+
+- **`in` / `by`** each hold 36-byte refs in the **same wire form the locking
+  script uses** — `txid` reversed, then `vout` little-endian — NOT the 72-char
+  display form of §5. That is what lets a reader intersect a claimed ref against
+  the refs it parsed out of the reveal's *output* scripts, which is the only
+  check either field admits (§7.5, §9.4). Entries MAY be raw byte strings or
+  wrapped in **CBOR tag 64**, like `main.b`; a decoder MUST accept both
+  (`src/pyrxd/glyph/payload.py:81-121`). pyrxd emits raw byte strings.
+  A decoder SHOULD drop a malformed entry rather than fail the whole envelope —
+  this is advisory metadata on an attacker-controlled payload.
 
 - **`main.b`** MAY be a raw byte string or a byte string wrapped in **CBOR tag 64**
   (uint8 array). Photonic emits tag 64; a decoder MUST unwrap it
@@ -566,31 +581,77 @@ the regex and the built script (`src/pyrxd/glyph/script.py:332-335`).
 
 ### 7.5 CONTAINER
 
-A container is an NFT with an OPTIONAL child-ref prefix
-(`src/pyrxd/glyph/builder.py:623-667`):
+A container's locking script is the **63-byte NFT singleton of §7.1, unchanged**
+(`src/pyrxd/glyph/builder.py:673-737`). There is no container script shape.
+Container-ness is the `7` marker in the envelope's `p` field, and it is invisible
+on chain — exactly as in Photonic Wallet, which has a single `nftScript` and no
+container variant (`packages/lib/src/script.ts`).
+
+Membership points **child → parent** and lives in the *child's* envelope, in the
+`in` field (§4.3). Nothing links a container to its members from the container
+side.
+
+#### 7.5.1 Why membership cannot be a script-level ref
+
+This is a consensus property, not an implementation choice, and it constrains
+every implementation equally.
+
+`OP_PUSHINPUTREFSINGLETON` (`0xd8`) files its ref into **three** sets, not one —
+`foundPushRefs`, `foundSingletonRefs`, and `foundDisallowedSiblingRefs`
+(Radiant-Core `src/script/script.cpp:600-607`). The last one means: within a
+single transaction, a ref pushed as a singleton by output *i* may not appear in
+the push-ref set of **any** output *j ≠ i*
+(`validateDisallowedSiblingsRefRule`, `src/validation.h:945-968`).
+
+So a transaction that both (a) creates an output carrying `0xd0 <child_ref>` and
+(b) keeps the child NFT alive as `0xd8 <child_ref>` is rejected with
+`bad-txns-inputs-outputs-invalid-transaction-reference-operations`. And the
+mirror image — a child whose script names a live container — fails for the same
+reason. The only accepted form **consumes** the child's singleton, and because a
+singleton ref re-enters `inputSingletonRefSet` only from an input's `0xd8` push
+or an input outpoint (`src/validation.h:1046-1050`), a ref that has been consumed
+into a `0xd0` push can never be minted as a singleton again. Naming a child in a
+container's script therefore destroys that child, permanently.
+
+The FT route is closed too: an FT input's own epilogue requires the ref's output
+count to equal the FT code-script-hash output count (§9.2), and a container
+output carrying the token ref breaks that equality — `OP_NUMEQUALVERIFY` fails.
+
+All four behaviours are proven against a Radiant Core v3.1.1 regtest node in
+`tests/test_container_regtest_e2e.py`; the reject reasons are quoted in §17.1.
+
+#### 7.5.2 The removed 100-byte shape (pyrxd 0.9.0 – 0.14.0)
+
+`prepare_container_reveal(child_ref=...)` used to emit:
 
 ```
-d0 <child_ref:36>          OP_PUSHINPUTREF <child_ref>       (37 bytes, OPTIONAL)
+d0 <child_ref:36>          OP_PUSHINPUTREF <child_ref>
 d8 <ref:36> 75             the 63-byte NFT body of §7.1
 76 a9 14 <pkh:20> 88 ac
 ```
 
-- With no child ref the script is **byte-identical to a plain NFT**. Container-ness
-  is then carried entirely by the `7` marker in the envelope's `p` field — it is
-  invisible on chain.
-- With a child ref the script is **100 bytes**. Because `OP_PUSHINPUTREF` requires
-  the ref to be present in an input, a container that names a child can only be
-  created in a transaction that also spends something carrying the child's ref.
-  That is the only enforcement: nothing constrains what the child is, nothing
-  prevents the same child being claimed by several containers, and nothing keeps
-  the link alive after either side moves.
+An implementation that encounters one of these outputs on chain should know two
+things about it:
 
-Two limitations of the current implementation are recorded here because an
-interoperating implementation will hit them (see §16.2): a 100-byte container
-output is not matched by any pyrxd classifier — it reports as `unknown` and is
-skipped entirely by `GlyphInspector.find_glyphs` — and it cannot be transferred by
-`build_nft_transfer_tx`, which requires a 63-byte script. Verified by building one
-and running it through `_inspect_script` and `find_glyphs`.
+1. **It cannot be spent by anyone.** `OP_PUSHINPUTREF` pushes the 36-byte ref and
+   nothing drops it, so `OP_DUP OP_HASH160` runs over the ref rather than the
+   pubkey and the `OP_EQUALVERIFY` against `<pkh>` fails for every possible
+   scriptSig — the failing item is pushed by the *locking* script, so no unlock
+   can influence it. Observed:
+   `mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)`.
+   (Contrast Photonic's `delegateTokenScript`, which is `OP_PUSHINPUTREF <ref>
+   OP_DROP` + P2PKH — the `OP_DROP` is what pyrxd's prefix was missing. Repairing
+   it makes the output spendable but does not rescue the design: §7.5.1 still
+   applies, and the holder can drop the ref at any transfer.)
+2. **Creating one destroyed a real NFT** (§7.5.1).
+
+pyrxd 0.15.0 removed the parameter — passing it raises `ValidationError` — and
+recognises the shape only to report it: `_inspect_script` returns
+`type: "container-legacy"` with `spendable: false`,
+`GlyphInspector.find_glyphs` returns a `container-legacy` entry with
+`spendable=False`, `GlyphScanner` logs it and does not hand it back as a token,
+and `build_nft_transfer_tx` refuses it by name
+(`src/pyrxd/glyph/script.py:238-286`).
 
 ### 7.6 dMint contracts
 
@@ -736,7 +797,8 @@ envelope carries more type information than the chain does.
 | dMint contract | parses as a V1 or V2 state+code layout | `DmintState.from_script` |
 | MUT contract | 174-byte script, fixed 102-byte body | `MUTABLE_NFT_SCRIPT_RE` |
 | commit (FT / NFT) | 75-byte script, `aa 20` prefix, byte 48 = `0x51` / `0x52` | `is_commit_{ft,nft}_script` |
-| CONTAINER | **not distinguishable** — identical to NFT when empty, unclassified when it carries a child ref | none |
+| container-legacy (dead, pre-0.15.0) | 100-byte script, `0xd0`+36 then the 63-byte NFT body | `is_legacy_container_script` |
+| CONTAINER | **not distinguishable** — byte-identical to an NFT by design (§7.5) | envelope only |
 | DAT, BURN, ENCRYPTED, TIMELOCK, AUTHORITY, WAVE | **not distinguishable** — envelope markers only | envelope only |
 
 `src/pyrxd/glyph/_inspect_core.py:210-322` is the dispatch order pyrxd uses, and
@@ -829,7 +891,7 @@ following as guarantees:
 |---|---|
 | Royalties | Advisory only. See §11. |
 | `policy.transferable = false` (soulbound) | Advisory metadata. An ordinary NFT script has no transfer restriction. A consensus-enforced version requires a purpose-built covenant (`src/pyrxd/glyph/soulbound_covenant.py`). |
-| Container membership | A child ref in a container's script only requires that ref to be present in an input at creation time. Nothing maintains the relationship afterwards. |
+| Container membership | The child's `in` field is a claim. Nothing on chain binds a token to a container, nothing stops a token naming a container it never touched, and nothing stops the same claim being made by any number of tokens. The strongest available check is that the container's ref also appears among the refs of the child's reveal outputs — see §7.5. A script-level link is not an option: consensus forbids it (§7.5.1). |
 | `dmint.premine` matching the emitted supply | Nothing on chain reconciles them. pyrxd checks at build time; other producers need not. |
 | `commit_outpoint` in the envelope | Self-declared; nothing verifies it. |
 | Ref provenance | Consensus never checks that a ref was ever a Glyph mint. §9.1. |
@@ -999,7 +1061,7 @@ bytes), V2's is a minimal-push `algoId`
 discriminator is the nonce width, 4 vs 8 bytes (§7.7).
 
 **Relation to the pyrxd version.** This specification revision describes pyrxd
-0.13.0. pyrxd is 0.x: the API and on-chain formats are **not yet stable**. Under
+0.15.0. pyrxd is 0.x: the API and on-chain formats are **not yet stable**. Under
 [the versioning and deprecation policy](../versioning-and-deprecation-policy.md),
 "the Glyph CBOR envelope" is named explicitly as a wire format whose change is
 **breaking-class**, so:
@@ -1201,21 +1263,27 @@ should treat the current pyrxd behaviour as observed fact, not as a rule.
 ### 16.1 Envelope round-tripping is lossy
 
 `decode_payload` builds a fixed-field object, so any key it does not know is
-dropped. Measured: an unknown top-level key does not survive a decode. This is
-observable on the reference mainnet token itself — its `by` field (a list of CBOR
-tag 64-wrapped refs) has no representation in pyrxd's metadata type and is silently
-discarded. Combined with the tag-64 media asymmetry (§10.3), **decode-then-encode
-is not an identity** and MUST NOT be used to verify a payload against a commit
-hash.
+dropped. Measured: an unknown top-level key does not survive a decode. Combined
+with the tag-64 media asymmetry (§10.3), **decode-then-encode is not an identity**
+and MUST NOT be used to verify a payload against a commit hash.
 
-### 16.2 CONTAINER outputs with a child ref are unroutable in pyrxd
+`in` and `by` were part of this loss until 0.15.0 — observable on the reference
+mainnet token, whose `by` refs (CBOR tag 64-wrapped) had no representation in
+pyrxd's metadata type. Both now decode
+(`GlyphMetadata.container_refs` / `.author_refs`) and re-encode as raw byte
+strings. That last asymmetry is deliberate and matches how pyrxd already handles
+`main.b`: it decodes tag 64 and emits untagged, so a tag-64 producer's payload
+still does not round-trip byte-for-byte.
 
-`prepare_container_reveal` builds a 100-byte script (§7.5) that no pyrxd classifier
-matches: `_inspect_script` reports `unknown`, `GlyphInspector.find_glyphs` skips
-it, and `build_nft_transfer_tx` refuses it because it requires exactly 63 bytes.
-An empty container is indistinguishable from a plain NFT. Container semantics
-beyond "the child ref must be present in an input at creation" are therefore
-undefined in this implementation.
+### 16.2 Container membership carries no on-chain guarantee
+
+Settled since 0.15.0, and recorded here because the shape of what is *not*
+specified matters: a container is a plain NFT (§7.5), membership is the child's
+`in` claim, and the only check available to a reader is the output-ref
+intersection of §7.5. What remains genuinely unspecified is what a reader should
+do with a token whose `in` names a container that has since been burned, and
+whether a container may be a member of another container (nothing forbids it;
+nothing implements it either).
 
 ### 16.3 A second, incompatible envelope shape for ENCRYPTED / TIMELOCK
 
@@ -1269,17 +1337,35 @@ transaction in CI. The anchors:
 | dMint V1 mint reward output (75 B) | `146a4d68…f3c` vout 1 | `tests/test_dmint_v1_mint.py:253-291` |
 | dMint V2 contract, FIXED (380 B) | `95335028…bb16fb09` vout 0 | `tests/test_dmint_v2_mainnet_golden.py:23-68` |
 | Mutable NFT body (102 B) | Photonic `parseMutableScript` reference | `tests/test_glyph_v2.py:110-127` |
+| Container lock (63 B) + `in` envelope | frozen goldfile | `tests/test_golden_vectors.py`, `TestFrozenContainerVectors` |
 | Canonical CBOR determinism | frozen goldfile | `tests/test_golden_vectors.py:42-143` |
 | Envelope push framing across boundaries | property-based | `tests/test_glyph_cbor_roundtrip.py:184-232` |
 | Genesis ref = commit outpoint | round-trip through the built reveal | `tests/cli/test_glyph_cmds.py`, `tests/test_glyph_mint_facade.py:212-216` |
 
 Measurements stated in this document that are **not** covered by an existing test —
 the non-canonicality of the mainnet fixture (§4.2, §14), the creator-signature
-canonicalisation gap (§10.2), the signature's indifference to unknown fields
-(§10.3), and the CONTAINER classification gap (§16.2) — were produced by running
-pyrxd 0.13.0 against the checked-in fixture and builders while writing this
-specification. They are reproducible from the snippets given, but they are not yet
-regression-locked in CI.
+canonicalisation gap (§10.2), and the signature's indifference to unknown fields
+(§10.3) — were produced by running pyrxd against the checked-in fixture and
+builders while writing this specification. They are reproducible from the
+snippets given, but they are not yet regression-locked in CI.
+
+### 17.1 Consensus behaviour verified on a node
+
+The CONTAINER claims of §7.5 are not derived from reading Radiant-Core; they were
+put to a **Radiant Core v3.1.1 regtest node** and the reject reasons recorded.
+`tests/test_container_regtest_e2e.py` (opt-in: `RADIANT_REGTEST=1 pytest -m
+integration`) reproduces every row.
+
+| Transaction | Result | Node's reason |
+|---|---|---|
+| Container + member reveal: spend the container UTXO, output `[child NFT, container re-created]` | **accepted** | — |
+| Container transferred with `build_nft_transfer_tx` | **accepted** | — |
+| Output carrying `0xd0 <child_ref>` **and** a sibling output re-creating the child as `0xd8 <child_ref>` | rejected | `bad-txns-inputs-outputs-invalid-transaction-reference-operations` |
+| Same, with the child **not** re-created (the child NFT is consumed) | **accepted** — which is the hazard | — |
+| Any spend of the resulting 100-byte output | rejected | `mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)` |
+| Re-minting the consumed child as `0xd8 <child_ref>` from that output | rejected | `bad-txns-inputs-outputs-invalid-transaction-reference-operations` |
+| Container naming an **FT** ref, with the FT kept alive in a sibling output | rejected | `mandatory-script-verify-flag-failed (Script failed an OP_NUMEQUALVERIFY operation)` |
+| A token claiming `in` for a container it never spent | **accepted** — membership is advisory (§9.4) | — |
 
 ## See also
 

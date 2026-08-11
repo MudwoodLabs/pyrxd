@@ -222,6 +222,7 @@ def _inspect_script(script_hex: str) -> dict:
         is_commit_nft_script,
         is_ft_script,
         is_nft_script,
+        parse_legacy_container_script,
         parse_mutable_nft_script,
     )
 
@@ -271,6 +272,26 @@ def _inspect_script(script_hex: str) -> dict:
             "ref_vout": ref.vout,
             "ref_outpoint": f"{ref.txid}:{ref.vout}",
             "owner_pkh": bytes(pkh).hex(),
+        }
+
+    parsed_legacy = parse_legacy_container_script(script)
+    if parsed_legacy is not None:
+        container_ref, child_ref, pkh = parsed_legacy
+        return {
+            **base,
+            "type": "container-legacy",
+            "spendable": False,
+            "ref_txid": container_ref.txid,
+            "ref_vout": container_ref.vout,
+            "ref_outpoint": f"{container_ref.txid}:{container_ref.vout}",
+            "child_ref_outpoint": f"{child_ref.txid}:{child_ref.vout}",
+            "owner_pkh": bytes(pkh).hex(),
+            "note": (
+                "pre-0.15.0 CONTAINER-with-child-ref output. PERMANENTLY UNSPENDABLE: OP_PUSHINPUTREF "
+                "leaves the child ref on the stack, so the P2PKH tail hashes the ref and OP_EQUALVERIFY "
+                "always fails. The child NFT's singleton ref was consumed to create it and cannot be "
+                "re-minted. Collection membership now lives in the envelope's 'in' field."
+            ),
         }
 
     if MUTABLE_NFT_SCRIPT_RE.fullmatch(script_hex):

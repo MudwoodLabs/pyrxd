@@ -22,10 +22,17 @@ should be a deliberate, reviewed act — not a side effect of a
 
 from __future__ import annotations
 
+import cbor2
+import pytest
+
+from pyrxd.glyph.builder import GlyphBuilder
 from pyrxd.glyph.dmint import DaaMode, DmintAlgo, DmintCborPayload
 from pyrxd.glyph.payload import encode_payload
-from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+from pyrxd.glyph.script import build_nft_locking_script, is_legacy_container_script, is_nft_script
+from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.keys import PrivateKey
+from pyrxd.security.errors import ValidationError
+from pyrxd.security.types import Hex20, Txid
 
 # ---------------------------------------------------------------------------
 # Frozen reference CBOR goldfile
@@ -235,3 +242,126 @@ class TestEcdsaRfc6979GoldenVector:
         sig_a = PrivateKey(bytes.fromhex(_GOLDEN_PRIV_HEX)).sign(_GOLDEN_MSG)
         sig_b = PrivateKey(bytes.fromhex("02" * 32)).sign(_GOLDEN_MSG)
         assert sig_a != sig_b
+
+
+# ---------------------------------------------------------------------------
+# Frozen CONTAINER (collection) vectors
+# ---------------------------------------------------------------------------
+#
+# A container has no distinct script shape — that IS the design, and it is the
+# property most at risk from a well-meaning refactor. Between 0.9.0 and 0.14.0
+# pyrxd prefixed the NFT body with ``OP_PUSHINPUTREF <child_ref>`` for a
+# container with a child; that 100-byte output was permanently unspendable and
+# creating one destroyed the child NFT (both proven on a regtest node in
+# ``tests/test_container_regtest_e2e.py``). Pinning the bytes here means the
+# prefix cannot come back by accident.
+
+_CONTAINER_REF = GlyphRef(txid=Txid("11" * 32), vout=7)
+_CONTAINER_OWNER_PKH = Hex20(bytes.fromhex("33" * 20))
+_CHILD_COMMIT_TXID = Txid("22" * 32)
+
+_FROZEN_CONTAINER_CBOR_HEX = (
+    "a36170820207646e616d65781b46726f7a656e205265666572656e636520436f6c6c656374696f6e647479706569636f6e7461696e6572"
+)
+_FROZEN_CONTAINER_SCRIPT_HEX = (
+    "d8"
+    "1111111111111111111111111111111111111111111111111111111111111111"
+    "07000000"
+    "75"
+    "76a914"
+    "3333333333333333333333333333333333333333"
+    "88ac"
+)
+# ``in`` holds ONE 36-byte ref in locking-script wire form (txid reversed || vout
+# LE): 5824 is CBOR "byte string, 36 bytes". Photonic's indexer compares these
+# bytes directly against the refs it parses out of the reveal's output scripts.
+_FROZEN_CONTAINER_CHILD_CBOR_HEX = (
+    "a36170810262696e815824"
+    "1111111111111111111111111111111111111111111111111111111111111111"
+    "07000000"
+    "646e616d657746726f7a656e205265666572656e6365204d656d626572"
+)
+_FROZEN_CONTAINER_CHILD_NFT_SCRIPT_HEX = (
+    "d8"
+    "2222222222222222222222222222222222222222222222222222222222222222"
+    "01000000"
+    "75"
+    "76a914"
+    "3333333333333333333333333333333333333333"
+    "88ac"
+)
+
+
+def _frozen_container_metadata() -> GlyphMetadata:
+    return GlyphMetadata(
+        protocol=[GlyphProtocol.NFT, GlyphProtocol.CONTAINER],
+        name="Frozen Reference Collection",
+        token_type="container",
+    )
+
+
+def _frozen_child_metadata() -> GlyphMetadata:
+    return GlyphMetadata(
+        protocol=[GlyphProtocol.NFT],
+        name="Frozen Reference Member",
+        container_refs=(_CONTAINER_REF,),
+    )
+
+
+class TestFrozenContainerVectors:
+    def test_container_locking_script_matches_frozen_value(self):
+        result = GlyphBuilder().prepare_container_reveal(
+            str(_CONTAINER_REF.txid),
+            _CONTAINER_REF.vout,
+            encode_payload(_frozen_container_metadata())[0],
+            _CONTAINER_OWNER_PKH,
+        )
+        assert result.locking_script.hex() == _FROZEN_CONTAINER_SCRIPT_HEX
+
+    def test_container_locking_script_is_exactly_the_nft_singleton(self):
+        """No prefix, no suffix, 63 bytes. A container is an NFT.
+
+        If this ever fails because the script grew, the change is breaking-class:
+        every NFT classifier, ``GlyphScanner`` and ``build_nft_transfer_tx`` stop
+        recognising collections, and — as the removed child-ref prefix proved —
+        an extra ref push makes the output unspendable.
+        """
+        script = bytes.fromhex(_FROZEN_CONTAINER_SCRIPT_HEX)
+        assert len(script) == 63
+        assert script == build_nft_locking_script(_CONTAINER_OWNER_PKH, _CONTAINER_REF)
+        assert is_nft_script(script.hex())
+        assert not is_legacy_container_script(script.hex())
+
+    def test_container_cbor_matches_frozen_value(self):
+        assert encode_payload(_frozen_container_metadata())[0].hex() == _FROZEN_CONTAINER_CBOR_HEX
+
+    def test_child_membership_cbor_matches_frozen_value(self):
+        assert encode_payload(_frozen_child_metadata())[0].hex() == _FROZEN_CONTAINER_CHILD_CBOR_HEX
+
+    def test_child_reveal_scripts_match_frozen_values(self):
+        result = GlyphBuilder().prepare_container_child_reveal(
+            str(_CHILD_COMMIT_TXID),
+            1,
+            encode_payload(_frozen_child_metadata())[0],
+            _CONTAINER_OWNER_PKH,
+            _CONTAINER_REF,
+            _CONTAINER_OWNER_PKH,
+        )
+        assert result.nft_script.hex() == _FROZEN_CONTAINER_CHILD_NFT_SCRIPT_HEX
+        # Output 1 re-creates the container byte-for-byte — minting a member must
+        # not move or re-own the collection.
+        assert result.container_script.hex() == _FROZEN_CONTAINER_SCRIPT_HEX
+
+    def test_child_in_field_holds_the_container_wire_ref(self):
+        raw = cbor2.loads(bytes.fromhex(_FROZEN_CONTAINER_CHILD_CBOR_HEX))
+        assert raw["in"] == [_CONTAINER_REF.to_bytes()]
+
+    def test_removed_child_ref_prefix_cannot_come_back(self):
+        with pytest.raises(ValidationError):
+            GlyphBuilder().prepare_container_reveal(
+                str(_CONTAINER_REF.txid),
+                _CONTAINER_REF.vout,
+                encode_payload(_frozen_container_metadata())[0],
+                _CONTAINER_OWNER_PKH,
+                child_ref=GlyphRef(txid=_CHILD_COMMIT_TXID, vout=1),
+            )

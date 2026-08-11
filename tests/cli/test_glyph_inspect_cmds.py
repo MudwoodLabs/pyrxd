@@ -265,6 +265,18 @@ class TestInspectScriptHex:
         # PR #39 added the version field — V2 builder produces V2 layout.
         assert "version:      dMint v2" in result.output
 
+    def test_classifies_a_dead_legacy_container_and_says_so(self, runner: CliRunner) -> None:
+        """A holder of a pre-0.15.0 CONTAINER-with-child-ref output has a dead
+        UTXO. ``unknown`` sends them hunting for a tool that can move it; there
+        isn't one, so the card has to say the output is unspendable and why."""
+        legacy = bytes([0xD0]) + GlyphRef(txid=Txid("22" * 32), vout=1).to_bytes() + _nft_script()
+        result = runner.invoke(cli, ["glyph", "inspect", legacy.hex()])
+        assert result.exit_code == 0, result.output
+        assert "type: container-legacy" in result.output
+        assert "UNSPENDABLE" in result.output
+        assert f"{'22' * 32}:1" in result.output  # the child ref it consumed
+        assert f"{_KNOWN_TXID}:4" in result.output  # the container's own ref
+
     def test_classifies_v1_dmint_contract_human(self, runner: CliRunner) -> None:
         """A real V1 contract from the RBG mainnet reveal must classify as
         ``dmint`` and surface ``version: dMint v1`` plus the derived total

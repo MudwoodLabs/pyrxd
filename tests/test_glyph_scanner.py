@@ -21,6 +21,7 @@ transaction named by ``ref.txid`` is modelling a chain that cannot exist.
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -95,9 +96,12 @@ class _Mint:
         reveal_txid: str,
         is_nft: bool = True,
         satoshis: int = 546,
+        protocol: list[int] | None = None,
+        container_refs: tuple[GlyphRef, ...] = (),
     ) -> None:
-        protocol = [GlyphProtocol.NFT] if is_nft else [GlyphProtocol.FT]
-        self.metadata = GlyphMetadata(name=name, protocol=protocol)
+        if protocol is None:
+            protocol = [GlyphProtocol.NFT] if is_nft else [GlyphProtocol.FT]
+        self.metadata = GlyphMetadata(name=name, protocol=protocol, container_refs=container_refs)
         cbor_bytes, payload_hash = encode_payload(self.metadata)
         self.ref = GlyphRef(txid=Txid(commit_txid), vout=0)
         self.commit_txid = commit_txid
@@ -359,6 +363,80 @@ class TestGlyphScannerNftOutput:
         result = asyncio.run(scanner.scan_script_hash("cc" * 32))
         assert len(result) == 1
         assert result[0].metadata is None
+
+
+class TestGlyphScannerContainers:
+    """A collection is an ordinary NFT to the scanner — and that is the point.
+
+    Nothing about the locking script says "container", here or in any other
+    implementation, so the scanner surfaces container-ness and membership by
+    joining the reveal envelope it already resolves onto the token.
+    """
+
+    CONTAINER_MINT = _Mint(
+        name="TestCollection",
+        commit_txid="a7" * 32,
+        reveal_txid="b7" * 32,
+        protocol=[GlyphProtocol.NFT, GlyphProtocol.CONTAINER],
+    )
+    MEMBER_MINT = _Mint(
+        name="TestMember",
+        commit_txid="c7" * 32,
+        reveal_txid="d7" * 32,
+        container_refs=(GlyphRef(txid=Txid("a7" * 32), vout=0),),
+    )
+
+    def _scan(self, mint: _Mint) -> GlyphNft:
+        tx_map, history = _chain(mint)
+        utxos = [UtxoRecord(tx_hash=mint.reveal_txid, tx_pos=0, value=546, height=101)]
+        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash("cc" * 32))
+        assert len(result) == 1
+        return result[0]
+
+    def test_container_is_returned_as_a_glyph_nft(self):
+        item = self._scan(self.CONTAINER_MINT)
+        assert isinstance(item, GlyphNft)
+        assert item.ref == self.CONTAINER_MINT.ref
+
+    def test_container_is_flagged(self):
+        assert self._scan(self.CONTAINER_MINT).is_container is True
+
+    def test_a_plain_nft_is_not_flagged_as_a_container(self):
+        tx_map, history = _chain(NFT_MINT)
+        utxos = [UtxoRecord(tx_hash=TXID_REVEAL, tx_pos=0, value=546, height=101)]
+        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash("cc" * 32))
+        assert result[0].is_container is False
+
+    def test_member_surfaces_the_container_it_belongs_to(self):
+        item = self._scan(self.MEMBER_MINT)
+        assert item.container_refs == (self.CONTAINER_MINT.ref,)
+        assert item.is_container is False
+
+    def test_unresolved_metadata_leaves_membership_empty_not_broken(self):
+        """A missing reveal must cost the membership, never the token."""
+        tx_map, history = _chain(self.MEMBER_MINT, drop=(self.MEMBER_MINT.reveal_txid,))
+        transfer_txid = "e7" * 32
+        tx_map[transfer_txid] = self.MEMBER_MINT.transfer_tx_hex()
+        utxos = [UtxoRecord(tx_hash=transfer_txid, tx_pos=0, value=546, height=102)]
+        result = asyncio.run(GlyphScanner(_mock_client(utxos, tx_map, history)).scan_script_hash("cc" * 32))
+        assert len(result) == 1
+        assert result[0].metadata is None
+        assert result[0].container_refs == ()
+
+    def test_a_dead_legacy_container_output_is_skipped_with_a_warning(self, caplog):
+        """The pre-0.15.0 100-byte output cannot be spent, so it must not come
+        back as a transferable token — but a silent drop would leave the holder
+        with no idea where their carrier photons went."""
+        legacy_script = bytes([0xD0]) + GlyphRef(txid=Txid("f7" * 32), vout=2).to_bytes() + self.CONTAINER_MINT.lock
+        legacy_txid = "aa" * 31 + "07"
+        tx_map, history = _chain(self.CONTAINER_MINT)
+        tx_map[legacy_txid] = _tx([(TXID_FUNDING, 0, _p2pkh_scriptsig())], [(legacy_script, 10_000)])
+        utxos = [UtxoRecord(tx_hash=legacy_txid, tx_pos=0, value=10_000, height=103)]
+        scanner = GlyphScanner(_mock_client(utxos, tx_map, history))
+        with caplog.at_level(logging.WARNING):
+            result = asyncio.run(scanner.scan_script_hash("cc" * 32))
+        assert result == []
+        assert "unspendable container-legacy" in caplog.text
 
 
 class TestGlyphScannerFtOutput:

@@ -69,6 +69,9 @@ class TestInitMetadata:
         result = runner.invoke(cli, ["glyph", "init-metadata", "--type", "container-nft"])
         payload = _extract_json(result.output)
         assert payload["protocol"] == ["NFT", "CONTAINER"]
+        # Photonic's `type` value for a collection is the literal "container";
+        # anything else renders the collection as a plain object there.
+        assert payload["token_type"] == "container"
 
     def test_out_writes_file(self, runner: CliRunner, tmp_path: Path) -> None:
         target = tmp_path / "metadata.json"

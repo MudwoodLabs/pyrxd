@@ -315,6 +315,21 @@ class GlyphMetadata:
     rights: GlyphRights | None = None  # V2 licensing and attribution
     created: str = ""  # V2 ISO8601 creation timestamp
     commit_outpoint: str = ""  # V2 txid:vout of the commit UTXO
+    # CBOR ``in`` — the CONTAINER(s) this token is a member of. Membership points
+    # CHILD -> PARENT and lives here, in the envelope, because it cannot live in
+    # the locking script: an output may not carry a ref that a *sibling* output
+    # holds as an ``OP_PUSHINPUTREFSINGLETON``, so a script-level link to a live
+    # NFT is rejected by consensus. See the CONTAINER section of
+    # ``docs/reference/glyph-token-protocol-spec.md``.
+    container_refs: tuple[GlyphRef, ...] = ()
+    # CBOR ``by`` — the author / user token(s) that issued this one. Same shape,
+    # same (advisory) enforcement story as ``container_refs``.
+    author_refs: tuple[GlyphRef, ...] = ()
+
+    @property
+    def is_container(self) -> bool:
+        """True when this envelope marks the token itself as a CONTAINER."""
+        return GlyphProtocol.CONTAINER in self.protocol
 
     def __post_init__(self) -> None:
         import re
@@ -377,6 +392,18 @@ class GlyphMetadata:
                 f"image_sha256 must be 64 lowercase hex chars (SHA-256), "
                 f"got {len(self.image_sha256)!r} chars: {self.image_sha256[:16]!r}..."
             )
+        # Relationship refs: accept any sequence, store an immutable tuple (same
+        # reason as ``protocol`` above — frozen=True does not stop list mutation).
+        for _fname in ("container_refs", "author_refs"):
+            value = getattr(self, _fname)
+            if isinstance(value, GlyphRef):
+                raise ValidationError(f"{_fname} must be a sequence of GlyphRef, not a bare GlyphRef")
+            if not isinstance(value, (list, tuple)):
+                raise ValidationError(f"{_fname} must be a sequence of GlyphRef, got {type(value).__name__!r}")
+            for r in value:
+                if not isinstance(r, GlyphRef):
+                    raise ValidationError(f"{_fname} entries must be GlyphRef, got {type(r).__name__!r}: {r!r}")
+            object.__setattr__(self, _fname, tuple(value))
 
     def to_cbor_dict(self) -> dict:
         """Build the dict that gets CBOR-encoded (excluding 'gly' marker)."""
@@ -426,6 +453,16 @@ class GlyphMetadata:
             d["created"] = self.created
         if self.commit_outpoint:
             d["commit_outpoint"] = self.commit_outpoint
+        # ``in`` / ``by`` carry 36-byte refs in the SAME wire form the locking
+        # script uses (txid reversed || vout LE) — that is what makes Photonic's
+        # ``filterRels`` able to compare a claimed ``in`` entry against the refs
+        # it parsed out of the reveal's output scripts. Encoded as plain CBOR
+        # byte strings; see :func:`pyrxd.glyph.payload.decode_payload` for the
+        # tag-64 asymmetry on the decode side.
+        if self.container_refs:
+            d["in"] = [r.to_bytes() for r in self.container_refs]
+        if self.author_refs:
+            d["by"] = [r.to_bytes() for r in self.author_refs]
         return d
 
     @classmethod
@@ -466,11 +503,45 @@ class GlyphMetadata:
 
 @dataclass(frozen=True)
 class GlyphNft:
-    """A minted or transferable NFT Glyph."""
+    """A minted or transferable NFT Glyph.
+
+    A **CONTAINER** (collection) is an ordinary ``GlyphNft`` — same 63-byte
+    locking script, same transfer path. Use :attr:`is_container` to tell one
+    apart and :attr:`container_refs` to read which collection(s) *this* token
+    declares membership in.
+    """
 
     ref: GlyphRef
     owner_pkh: Hex20  # 20-byte P2PKH hash of current owner
-    metadata: GlyphMetadata
+    # ``None`` when the reveal could not be located (see GlyphScanner) — the
+    # token is still real, only its envelope is unavailable.
+    metadata: GlyphMetadata | None
+
+    @property
+    def is_container(self) -> bool:
+        """True when this token is itself a CONTAINER (envelope marker ``7``).
+
+        ``False`` when the metadata could not be resolved — absence of evidence.
+        A caller that must distinguish "not a container" from "unknown" should
+        check ``metadata is None`` first.
+        """
+        return self.metadata is not None and self.metadata.is_container
+
+    @property
+    def container_refs(self) -> tuple[GlyphRef, ...]:
+        """Containers this token declares membership in (envelope ``in`` field).
+
+        Advisory: nothing on chain binds a token to a container. What makes a
+        claim checkable is that the container's ref also appears among the
+        refs of the reveal transaction's outputs — see
+        :meth:`pyrxd.glyph.builder.GlyphBuilder.prepare_container_child_reveal`.
+        """
+        return () if self.metadata is None else self.metadata.container_refs
+
+    @property
+    def author_refs(self) -> tuple[GlyphRef, ...]:
+        """Author / issuer tokens this token declares (envelope ``by`` field)."""
+        return () if self.metadata is None else self.metadata.author_refs
 
 
 @dataclass(frozen=True)
@@ -480,4 +551,5 @@ class GlyphFt:
     ref: GlyphRef
     owner_pkh: Hex20
     amount: int  # in photons (Radiant satoshi equivalent)
-    metadata: GlyphMetadata
+    # ``None`` when the reveal could not be located — same contract as GlyphNft.
+    metadata: GlyphMetadata | None

@@ -162,6 +162,23 @@ class GlyphScanner:
             for g in glyphs:
                 if g.vout != utxo.tx_pos:
                     continue
+                if not g.spendable:
+                    # A pre-0.15.0 container-with-child-ref output. It is not a
+                    # transferable token, so it must not come back as a GlyphNft
+                    # — but staying silent would leave the holder wondering
+                    # where their carrier photons went.
+                    logger.warning(
+                        "Skipping unspendable %s output at %s:%d (container ref %s:%d, child ref %s:%d) — "
+                        "see pyrxd.glyph.script.is_legacy_container_script",
+                        g.glyph_type,
+                        utxo.tx_hash,
+                        utxo.tx_pos,
+                        g.ref.txid,
+                        g.ref.vout,
+                        g.child_ref.txid if g.child_ref else "?",
+                        g.child_ref.vout if g.child_ref else -1,
+                    )
+                    continue
                 pending.append((utxo, g, tx))
 
         if not pending:
