@@ -6,6 +6,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.15.0] — 2026-08-11
+
+Collections work, and the feature that claimed to build them is gone.
+
+`prepare_container_reveal(child_ref=...)` has shipped since 0.9.0. Put to a Radiant Core
+v3.1.1 regtest node before building the routing it was missing, it turned out to have two
+defects the Python side could not see:
+
+- **The output could not be spent by anyone.** The ref push is never dropped, so the P2PKH
+  tail's `OP_DUP OP_HASH160` operated on the ref instead of the pubkey. The failing item is
+  pushed by the *locking* script, so no scriptSig can rescue it.
+- **Creating one destroyed the child token, permanently.** `OP_PUSHINPUTREFSINGLETON` files
+  its ref into `foundDisallowedSiblingRefs` as well as the push-ref set
+  (`Radiant-Core/src/script/script.cpp:601-606`), so no other output of the same transaction
+  may carry that ref. The only form the node accepts consumes the child without re-creating
+  it.
+
+Naming an FT instead fails the FT epilogue. So a **script-level link between a container and
+a live token is impossible on Radiant** — not unimplemented, impossible — and anyone who
+called that builder burned the token they were adding to a collection. The parameter now
+raises, naming the reason and the replacement.
+
+Collections instead use the model Photonic already uses: a container is an ordinary 63-byte
+NFT, and membership lives in the child's envelope. That makes it classify, scan, and transfer
+through code paths that already existed.
+
+Also: the six cross-chain integration suites now fund the maker's covenant before the taker
+locks, matching the taker-side gate added in 0.14.0 — all six run green against live regtest
+nodes. `web3`, required by five of them and declared nowhere, is now a declared test
+dependency. The external-audit scoping brief is current, and the threat model no longer
+describes an advisory SPV control as if it enforced.
+
 ### Fixed
 
 - **`web3` was required by five integration suites and declared nowhere**, so
