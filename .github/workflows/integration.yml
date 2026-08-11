@@ -139,8 +139,11 @@ jobs:
           grep -q "NFT minted on regtest" /tmp/quickstart.out
           poetry run pyrxd regtest down
       # The Radiant suites that are cheap enough to run on every push. Each module
-      # stands up its own container (the shared harness force-removes by name), so
-      # this is deliberately sequential — measured at ~1.5 min of pytest locally.
+      # stands up its own container (the shared harness force-removes by name), so this
+      # is deliberately sequential. Measured on this runner: 78 passed, 2 skipped in
+      # 135 s; 3 m 31 s for the whole job including the image build and the quickstart.
+      # The 2 skips are the BTC half of test_remaining_builder_floors_regtest_e2e, which
+      # runs in `nightly-btc-family` where a bitcoind exists.
       - name: Radiant covenant + builder suites under consensus
         env:
           RADIANT_REGTEST: "1"

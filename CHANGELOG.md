@@ -612,8 +612,10 @@ both. It is fixed here.
     The Tier-1 quickstart (moved verbatim from `ci.yml`'s `quickstart` job) plus eleven
     Radiant covenant/builder suites. **Measured 119 s of pytest** across those eleven,
     each standing up its own container.
-    Measured **on the runner**: 161 s of pytest, **3 m 55 s** for the whole job including
-    the docker build, `poetry install` and the quickstart.
+    Measured **on the runner**: **78 passed, 2 skipped in 135 s** of pytest, **3 m 31 s**
+    for the whole job including the docker build, `poetry install` and the quickstart.
+    (The 2 skips are the BTC half of `test_remaining_builder_floors_regtest_e2e`, which
+    runs in `nightly-btc-family` where a bitcoind exists.)
   - Nightly (and `workflow_dispatch`), as parallel jobs so the wall-clock is the slowest
     job and not their sum: RSWP (**42 s**, 11 cases), dMint's proof-of-work suites
     (V1 **80-219 s**, V2 + premine **396 s**, on a 32-core box — the covenant's ~2⁻³³
