@@ -56,5 +56,12 @@ class TransactionOutput:
                     f"truncated output script: varint claims {script_length} bytes, "
                     f"only {len(locking_script_bytes)} available"
                 )
-            return TransactionOutput(locking_script=Script(locking_script_bytes), satoshis=satoshis)
+            # Chain bytes: a scriptPubKey is only executed when the output is
+            # SPENT, so a transaction whose output script cannot be walked by
+            # ``GetOp`` is still valid in a block. Deserialization must therefore
+            # tolerate one (``Script.truncated_at`` records it) even though the
+            # over-claiming length prefix above is refused outright.
+            return TransactionOutput(
+                locking_script=Script(locking_script_bytes, allow_malformed=True), satoshis=satoshis
+            )
         return None

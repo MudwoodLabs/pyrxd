@@ -6,7 +6,141 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-08-11
+
+A security release. Most of it was found by asking a different question.
+
+Nine transaction builders had never been put in front of a node — every test that covered them
+was offline. Putting them there found defects in five, including two that had shipped for
+several releases: **`glyph transfer-ft` could send the sender's entire balance**, and **every
+MUT and WAVE reveal was rejected by consensus**, so no WAVE name could ever be registered.
+Fixing the second exposed a defect in the core signing path — the BIP143 `hashOutputHashes`
+walker desynchronised on `OP_REQUIREINPUTREF`, producing an invalid signature on *every* input
+of a transaction paying to such a script.
+
+**Fees are the other half.** Radiant has neither RBF nor CPFP, so a transaction built below
+the relay floor cannot be repaired — it holds its inputs until the 8-hour mempool expiry. Ten
+builders accepted a fee on trust, and four more sized their fee from a *trial* signature and
+never re-measured the final one, so roughly a quarter of plain sends and NFT transfers were
+built below the floor. `pyrxd.fee_sizing` is now the single answer to "what fee must this
+transaction pay", and every builder binds to it.
+
+Hostile server responses now fail closed. Several guards read a field through Python
+truthiness, so a present-but-falsy value inverted their meaning: the watchtower could read an
+already-claimed HTLC as unclaimed and silently suppress its page, and a forged confirmation
+depth passed the gate before SPV finalize.
+
+**The most uncomfortable findings were about the tests, not the code.** A differential test
+whose purpose was catching sighash bugs carried the same wrong opcode set as the bug it
+guarded, and certified it as correct. A `conftest` marker silently excluded 26 of 55 security
+tests from every CI run, via a substring that never once matched what it was written for. Six
+guards could not detect the defect they existed to prevent. Those are fixed, and each fix was
+proved by planting the defect and watching the test go red.
+
+Consensus rules pyrxd re-implements are now pinned to Radiant Core source that is vendored,
+digest-checked, and *parsed* rather than transcribed — the ref-opcode family, the operand
+widths, and the script walkers.
+
+### Upgrade notes
+
+- **Fee floors are enforced, not advisory.** Builders that previously accepted any `fee` /
+  `fee_rate` now refuse one below Radiant's relay floor. If you were passing a low fee, you
+  were building transactions the network would not relay; they now raise instead. Legitimate
+  sub-floor cases (a lower-floor node, a trial sizing pass) take an explicit opt-out.
+- **`DeadlineFeePolicy.protocol_floor_per_kb` now defaults to the effective relay rate**
+  (10,000,000/kB), not the legacy 1,000,000. Pass `allow_below_protocol_floor=True` if you
+  genuinely target a lower-floor node.
+- **`GlyphBuilder.build_nft_transfer_tx` and the RSWP v3 covenant builders validate their fee
+  rate up front**, so a bad rate fails at the call rather than on broadcast.
+- A malformed WIF, xprv or signature no longer appears in an exception message. If you were
+  parsing error text to recover the offending value, it is gone deliberately.
+
 ### Security
+
+- **Four parsers accepted input Radiant's consensus code rejects.** Each takes
+  attacker-controlled bytes — an advert's source transaction, an ElectrumX response, a
+  watchtower blob, a presigned recovery file — and each was more permissive than the node,
+  which is not a convenience: it reports "valid" for bytes that can never confirm, and
+  re-serializes them to *different* bytes, so a txid taken over the parse names a
+  transaction the input bytes do not encode.
+
+  - **`Script._build_chunks` clamped a truncated push and was blind to ref operands.** Where
+    Radiant's `GetScriptOp` (`script.cpp:662-731`) returns **false**, pyrxd read "as many
+    bytes as are left" and appended a chunk, so `Script(b"\x05\xaa\xbb")` — a push declaring
+    5 bytes with 2 present — parsed cleanly and `is_push_only()` returned `True`, while
+    `CScript::IsPushOnly` (`script.cpp:537-553`) returns `False` the moment `GetOp` fails.
+    `SCRIPT_VERIFY_SIGPUSHONLY` is applied to every connected block
+    (`validation.cpp::GetNextBlockScriptFlags`), so that answer called a scriptSig valid that
+    no block can contain. The walk was also ref-blind: `d0 <36-byte ref> ac` produced **7**
+    chunks instead of 2, reading the ref's own bytes as opcodes — the fourth instance of the
+    class that produced three bugs in two days. `_build_chunks` now mirrors `GetScriptOp`
+    exactly, using the shared `REF_OPERAND_OPCODES` / `REF_OPERAND_WIDTH`, and **refuses a
+    malformed script by default**. The one caller that legitimately needs leniency —
+    transaction deserialization, because a scriptPubKey is only executed when the output is
+    *spent*, so an unwalkable one is valid in a block — opts in explicitly with
+    `Script(..., allow_malformed=True)`, which stops the walk where `GetOp` does and records
+    the offset in `Script.truncated_at` instead of inventing a chunk. `is_push_only()` fails
+    closed on it and `to_asm()` appends `[error]`, as `ScriptToAsmStr` does
+    (`core_write.cpp:117-120`).
+  - **`Script.from_chunks` rewrote non-minimal pushes.** It ran every chunk through
+    `encode_pushdata`, which normalises, so `from_chunks(Script(x).chunks)` was not the
+    identity: `4c 02 aa bb` came back as `02 aa bb`. `find_and_delete` is built on it, so a
+    call that deleted nothing could still change a script's bytes — and its hash. Chunks now
+    re-emit their own declared encoding.
+  - **`TransactionInput.from_hex` failed open where `TransactionOutput.from_hex` fails
+    closed.** Same file, same wire format, opposite behaviour on a script-length varint that
+    over-claims. Inside a transaction such a varint does not run off the end — it eats the
+    fields that follow and every later boundary slides: a 63-byte blob parsed "successfully"
+    into a transaction with one input, **zero** outputs and 8 bytes left unread, which
+    re-serialized to 56 different bytes. The input parser now refuses the over-claim exactly
+    as the output parser does; `Transaction.from_hex` additionally requires a whole-buffer
+    parse to end at EOF (a `Reader` argument still streams, for `from_beef`).
+  - **`Reader`'s fixed-width reads zero-extended a short read.** `int.from_bytes` turned two
+    remaining bytes of a four-byte field into a plausible number rather than an error, so
+    version, vout, sequence, locktime and satoshis could each decode from a truncated
+    transaction. `read_exact` now backs all of them and returns `None` unless the full field
+    is present.
+  - **`deserialize_ecdsa_der` checked only the length arithmetic.** Encoding was enforced on
+    the way out and not on the way in, so a negative `r`/`s`, a non-minimally-encoded one, a
+    body over 72 bytes, or a **high-S** signature all decoded happily. `SCRIPT_VERIFY_LOW_S`
+    and `SCRIPT_VERIFY_STRICTENC` are both applied to every connected block
+    (`GetNextBlockScriptFlags`), and `VerifyScript` ORs `STRICTENC` in whenever
+    `SIGHASH_FORKID` is set, so these are consensus rules on this chain, not policy —
+    `fRequireStandard` is hardcoded `false` (`validation.cpp:271`), which makes the
+    policy/consensus distinction load-bearing. All of `IsValidDERSignatureEncoding`'s rules
+    plus `CheckLowS` are now applied on decode. `require_low_s=False` is the explicit
+    opt-out for inspecting a foreign or pre-BIP146 signature; the encoding rules are never
+    relaxed.
+
+- **BIP68 sequence-lock constants were defined in two modules and hand-typed in a third
+  place.** `script/timelock.py` and `btc_wallet/taproot.py` each carried a private copy of
+  `1 << 31` / `1 << 22` / `0xFFFF`, `gravity/eth_rxd_timelock.py` a fourth spelling of the
+  mask, and `tests/test_htlc_spend_productized.py` cited `interpreter.cpp` **in a comment**
+  while asserting a hand-typed `1 << 22` — a transcription cannot detect the constant it
+  transcribed moving. All five now come from `pyrxd.constants`
+  (`SEQUENCE_FINAL`, `SEQUENCE_LOCKTIME_DISABLE_FLAG`, `SEQUENCE_LOCKTIME_TYPE_FLAG`,
+  `SEQUENCE_LOCKTIME_MASK`, `SEQUENCE_LOCKTIME_GRANULARITY`, plus `BIP68_MIN_TX_VERSION`),
+  derived from Radiant's `CTxIn` and pinned to the vendored header the way the ref-opcode
+  constants are. This governs HTLC refund maturity, and Radiant has neither RBF nor CPFP: a
+  refund that misjudges maturity by one block cannot be repaired.
+
+- **`gravity/codehash.hash160` bypassed the OpenSSL-3 fallback `pyrxd.hash` exists to
+  provide**, as did `gravity/transactions.py`, `btc_wallet/keys.py` and three examples.
+  `hashlib.new("ripemd160", ...)` raises wherever OpenSSL 3 leaves RIPEMD160 in the unloaded
+  legacy provider — Ubuntu 24.04, Debian 12, the python.org macOS installer, Pyodide/WASM —
+  so Gravity's `expectedClaimedCodeHash` could not be computed at all there. **Not
+  reproducible on the machine this was found on** (its OpenSSL still exposes RIPEMD160), so
+  it is a portability defect rather than a live bug; `pyrxd.hash`'s own fallback was checked
+  first and is correct (published RIPEMD-160 vectors, `tests/test_ripemd160_fallback.py`).
+  All call sites now route through it.
+
+  Consensus ground truth for all of the above is derived by parsing pinned Radiant Core
+  sources rather than transcribing them. The vendored set grows from `script.h`/`script.cpp`
+  to also cover `primitives/transaction.h`, `script/interpreter.cpp`,
+  `script/sigencoding.cpp`, `script/script_flags.h`, `policy/policy.h` and `validation.cpp`;
+  `tests/consensus_oracle.py` gains extractors for the sequence constants, `CheckSequence`'s
+  semantics, the DER size bounds and encoding gates, and the consensus-vs-policy flag split.
+  New differential: `tests/test_consensus_parser_strictness.py`.
 
 - **`Reader.read_var_int_num` accepted non-canonical CompactSize, under `Transaction`
   deserialization.** `spv/proof.py` and `spv/witness.py` have rejected overlong encodings

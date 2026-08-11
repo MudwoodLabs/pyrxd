@@ -40,6 +40,22 @@ MANIFEST_PATH = VENDOR_DIR / "MANIFEST.json"
 FILES = {
     "script.h": "src/script/script.h",
     "script.cpp": "src/script/script.cpp",
+    # BIP68 relative-locktime constants (CTxIn::SEQUENCE_LOCKTIME_*) — the
+    # definition site for every sequence/CSV constant pyrxd re-spells.
+    "primitives_transaction.h": "src/primitives/transaction.h",
+    # CheckSequence: the code that consumes those constants, and VerifyScript,
+    # which folds STRICTENC in whenever SIGHASH_FORKID is enabled.
+    "interpreter.cpp": "src/script/interpreter.cpp",
+    # IsValidDERSignatureEncoding + the LOW_S / STRICTENC gates on it.
+    "sigencoding.cpp": "src/script/sigencoding.cpp",
+    # SCRIPT_VERIFY_* bit definitions.
+    "script_flags.h": "src/script/script_flags.h",
+    # Which of those flags are MANDATORY (consensus) vs merely STANDARD (policy).
+    "policy.h": "src/policy/policy.h",
+    # GetNextBlockScriptFlags — the flag set a block is actually connected under,
+    # which is the only authority on "consensus vs policy". Also the file where
+    # `fRequireStandard = false` is hardcoded, so the policy layer is absent here.
+    "validation.cpp": "src/validation.cpp",
 }
 
 

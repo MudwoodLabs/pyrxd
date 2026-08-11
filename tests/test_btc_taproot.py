@@ -29,6 +29,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.constants import SEQUENCE_LOCKTIME_TYPE_FLAG
 from pyrxd.security.errors import ValidationError
 
 _VECTORS = json.loads((Path(__file__).parent / "fixtures" / "bip341_wallet_vectors.json").read_text())
@@ -325,7 +326,7 @@ def test_timelock_block_nsequence():
 def test_timelock_seconds_nsequence():
     # 1024 seconds = 2 * 512s units, with the type flag (bit 22) set.
     ns = t.Timelock(1024, t.TimeUnit.SECONDS).to_nsequence()
-    assert ns == (1 << 22) | 2
+    assert ns == SEQUENCE_LOCKTIME_TYPE_FLAG | 2
 
 
 def test_timelock_normalize_requires_like_units_to_compare():

@@ -96,7 +96,31 @@ def decode_wif(wif: str) -> tuple[bytes, bool, Network]:
     return decoded[1:], False, network
 
 
-def deserialize_ecdsa_der(signature: bytes) -> tuple[int, int]:
+#: Consensus bounds on a DER signature body, excluding the trailing sighash
+#: byte. ``IsValidDERSignatureEncoding`` rejects anything outside them
+#: (``src/script/sigencoding.cpp``); ``tests/test_consensus_parser_strictness.py``
+#: re-derives both numbers from the vendored copy of that file.
+DER_SIGNATURE_MIN_LENGTH: int = 8
+DER_SIGNATURE_MAX_LENGTH: int = 72
+
+
+def _check_der_integer(signature: bytes, start: int, length: int, name: str) -> None:
+    """Apply the two canonical-integer rules ``IsValidDERSignatureEncoding`` applies.
+
+    Both are consensus on Radiant, not stylistic: strict-DER encoding is
+    enforced whenever any of ``SCRIPT_VERIFY_DERSIG``/``LOW_S``/``STRICTENC``
+    is set, and a block is connected with LOW_S and STRICTENC always on
+    (``GetNextBlockScriptFlags``). ``VerifyScript`` additionally ORs STRICTENC
+    in because SIGHASH_FORKID is set, so there is no configuration of this
+    chain in which they are optional.
+    """
+    if signature[start] & 0x80:
+        raise ValueError(f"non-canonical DER: {name} is negative (high bit set on its first byte)")
+    if length > 1 and signature[start] == 0x00 and not (signature[start + 1] & 0x80):
+        raise ValueError(f"non-canonical DER: {name} has non-minimal zero padding")
+
+
+def deserialize_ecdsa_der(signature: bytes, *, require_low_s: bool = True) -> tuple[int, int]:
     """
     Deserialize ECDSA signature from bitcoin strict DER to (r, s).
 
@@ -111,10 +135,31 @@ def deserialize_ecdsa_der(signature: bytes) -> tuple[int, int]:
     any trailing bytes when the declared lengths did not match the buffer
     size. That permitted attacker-chosen non-canonical encodings to
     round-trip to a valid ``(r, s)`` of the attacker's choosing.
+
+    Beyond the length arithmetic this now applies every rule Radiant applies
+    when it validates a signature, because a decoder that is more permissive
+    than consensus reports "valid" for bytes no block can contain, and hands
+    back an ``(r, s)`` that re-encodes to *different* bytes than it was given
+    — a malleability and divergence hazard in one:
+
+    * total size within ``[8, 72]`` (``IsValidDERSignatureEncoding``);
+    * ``r`` and ``s`` positive and minimally encoded (BIP66, and consensus here
+      via ``SCRIPT_VERIFY_STRICTENC``, which ``VerifyScript`` turns on for
+      SIGHASH_FORKID — mandatory on this chain);
+    * ``s <= n/2`` (``CPubKey::CheckLowS`` under ``SCRIPT_VERIFY_LOW_S``, set
+      unconditionally for every connected block in ``GetNextBlockScriptFlags``).
+
+    ``require_low_s=False`` is the deliberate, explicit escape hatch for
+    inspecting a *foreign* signature — a pre-BIP146 Bitcoin history blob, or
+    one produced by another chain's tooling. It relaxes only the low-S rule;
+    the encoding rules are never relaxed, because a non-canonical encoding is
+    invalid on every chain this SDK touches.
     """
     try:
-        if len(signature) < 8:
-            raise ValueError("DER signature too short (min 8 bytes)")
+        if len(signature) < DER_SIGNATURE_MIN_LENGTH:
+            raise ValueError(f"DER signature too short (min {DER_SIGNATURE_MIN_LENGTH} bytes)")
+        if len(signature) > DER_SIGNATURE_MAX_LENGTH:
+            raise ValueError(f"DER signature too long (max {DER_SIGNATURE_MAX_LENGTH} bytes)")
         if signature[0] != 0x30:
             raise ValueError("expected DER sequence tag 0x30")
 
@@ -132,6 +177,7 @@ def deserialize_ecdsa_der(signature: bytes) -> tuple[int, int]:
         r_end = r_off + r_len
         if r_end + 2 > len(signature):
             raise ValueError("DER r overruns buffer")
+        _check_der_integer(signature, r_off, r_len, "r")
         r = int.from_bytes(signature[r_off:r_end], "big")
 
         # s
@@ -144,7 +190,14 @@ def deserialize_ecdsa_der(signature: bytes) -> tuple[int, int]:
         s_end = s_off + s_len
         if s_end != len(signature):
             raise ValueError("DER total length mismatch: r_len + s_len + 6 must equal len(signature)")
+        _check_der_integer(signature, s_off, s_len, "s")
         s = int.from_bytes(signature[s_off:s_end], "big")
+
+        if require_low_s and s > curve.n // 2:
+            raise ValueError(
+                "non-canonical DER: high-S signature. SCRIPT_VERIFY_LOW_S is applied to every "
+                "connected block, so its complement (n - s) is the only encoding that can confirm"
+            )
 
         return r, s
     except (ValueError, ValidationError):
@@ -550,48 +603,61 @@ class Reader(BytesIO):
         result = super().read(length)
         return result if result else None
 
+    def read_exact(self, length: int) -> bytes | None:
+        """Read exactly ``length`` bytes, or ``None`` if that many are not left.
+
+        ``BytesIO.read(n)`` returns a SHORT buffer at end of input rather than
+        erroring, and ``int.from_bytes`` happily zero-extends it — so a
+        four-byte field with two bytes remaining used to decode as a perfectly
+        plausible number instead of failing. Every fixed-width field in the
+        transaction wire format (version, vout, sequence, locktime, satoshis)
+        is exposed to that, and each one is load-bearing for a txid.
+        """
+        data = super().read(length)
+        return data if data is not None and len(data) == length else None
+
     def read_reverse(self, length: int = None) -> bytes:
         data = self.read(length)
         return data[::-1] if data else None
 
     def read_uint8(self) -> int | None:
-        data = self.read(1)
+        data = self.read_exact(1)
         return data[0] if data else None
 
     def read_int8(self) -> int | None:
-        data = self.read(1)
+        data = self.read_exact(1)
         return int.from_bytes(data, byteorder="big", signed=True) if data else None
 
     def read_uint16_be(self) -> int | None:
-        data = self.read(2)
+        data = self.read_exact(2)
         return int.from_bytes(data, byteorder="big") if data else None
 
     def read_int16_be(self) -> int | None:
-        data = self.read(2)
+        data = self.read_exact(2)
         return int.from_bytes(data, byteorder="big", signed=True) if data else None
 
     def read_uint16_le(self) -> int | None:
-        data = self.read(2)
+        data = self.read_exact(2)
         return int.from_bytes(data, byteorder="little") if data else None
 
     def read_int16_le(self) -> int | None:
-        data = self.read(2)
+        data = self.read_exact(2)
         return int.from_bytes(data, byteorder="little", signed=True) if data else None
 
     def read_uint32_be(self) -> int | None:
-        data = self.read(4)
+        data = self.read_exact(4)
         return int.from_bytes(data, byteorder="big") if data else None
 
     def read_int32_be(self) -> int | None:
-        data = self.read(4)
+        data = self.read_exact(4)
         return int.from_bytes(data, byteorder="big", signed=True) if data else None
 
     def read_uint32_le(self) -> int | None:
-        data = self.read(4)
+        data = self.read_exact(4)
         return int.from_bytes(data, byteorder="little") if data else None
 
     def read_int32_le(self) -> int | None:
-        data = self.read(4)
+        data = self.read_exact(4)
         return int.from_bytes(data, byteorder="little", signed=True) if data else None
 
     #: CompactSize prefix -> (operand width, largest value the SHORTER encoding covers).
@@ -658,7 +724,13 @@ class Reader(BytesIO):
         return result if result else b""
 
     def read_int(self, byte_length: int, byteorder: Literal["big", "little"] = "little") -> int | None:
-        octets = self.read_bytes(byte_length)
+        """Read a fixed-width integer, or ``None`` if the field is incomplete.
+
+        Fails closed on a short read for the reason spelled out in
+        :meth:`read_exact`: a partially-present field is not a smaller number,
+        it is a truncated transaction.
+        """
+        octets = self.read_exact(byte_length)
         if not octets:
             return None
         return int.from_bytes(octets, byteorder=byteorder)
