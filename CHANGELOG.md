@@ -255,6 +255,80 @@ a Radiant Core v3.1.1 regtest one.
 
 ### Fixed
 
+- **Bitcoin's supply cap was applied to Radiant photons, which blinded a whole address and
+  then evicted every healthy endpoint.** `ElectrumXClient.get_utxos` bounded `listunspent`'s
+  `value` with `Satoshis`, whose cap is 2,100,000,000,000,000 — *Bitcoin's* 21,000,000 BTC.
+  Radiant's `MAX_MONEY` is 21,000,000,000 RXD = 2.1e18 photons, a thousand times higher, and
+  this repo already stated that number in `glyph/builder.py` and `swap/rswp/orders.py`. So a
+  single UTXO above 21,000,000 RXD — 0.1% of supply, and reachable by a whale, an exchange, a
+  funded covenant, or a Glyph FT whose unit count *is* its photon value — was rejected as
+  invalid. Because the bound was applied inside a **list comprehension**, that one entry
+  aborted the whole list: every sibling UTXO on the address vanished and the address became
+  unspendable, not merely under-reported. And because it surfaced as `NetworkError`,
+  `FailoverElectrumXClient._run` read it as a transport fault and `_discard`ed the endpoint —
+  so the SDK closed one healthy server after another and finished with "failed on all N
+  endpoints" for returning the truth. Reached from `wallet.py`, `hd/wallet.py`,
+  `glyph/scanner.py`, `hd/discovery.py`, `swap/rswp/tracker.py` and `cli/swap_recovery.py`.
+
+  Both `get_utxos` and `get_balance` (whose cap was pre-existing, and whose value is a *sum*,
+  so it crosses the line sooner) now use `Photons`, which is bounded by
+  `RADIANT_MAX_PHOTONS`. `Satoshis` keeps its Bitcoin cap and its docstring now says so; the
+  comment claiming "Radiant inherits Bitcoin's supply upper bound" is gone. The two
+  `_MAX_PHOTONS` copies now derive from the one constant. The type-level guards that catch a
+  hostile response — non-int, `bool`, non-finite, negative — are unchanged.
+
+- **`GravityMakerSession.cancel_offer`'s documented default was guaranteed to fail.** It
+  carried `fee_sats: int = 1000` while `gravity/transactions.py`'s relay-floor gate demands
+  2,850,000 photons for the 285-byte transaction it builds, so the module's own documented
+  flow, `cancel_offer(active)`, raised `InsufficientFundsError` on first use — taking away the
+  Maker's only revocation path. The fixtures in `tests/test_gravity_maker.py` were updated to
+  `3_500_000` when the gate landed; the production default was not, and nothing exercised it.
+
+  `fee_sats` is now optional and, when omitted, sized from the assembled transaction's own
+  measured bytes at the policy's relay floor. That is the only correct default: the cancel
+  scriptSig carries the whole MakerOffer redeem script, so its size — and its floor — is a
+  property of the offer, and no constant can track it. An explicitly-passed sub-floor fee is
+  still refused. The sub-floor examples in `maker.py` and `trade.py`'s docstrings are
+  corrected.
+
+- **`fee_policy` was threaded into all five Gravity builders but not into the high-level
+  API.** `GravityTrade.claim` / `.finalize` and `GravityMakerSession` had no way to pass it,
+  so on regtest — which advertises a tenth of the mainnet relay floor — the orchestrators
+  could not reach the escape hatch the builders already accepted. `TradeConfig.fee_policy`
+  and `GravityMakerSession(fee_policy=...)` now exist, with per-call overrides on `claim`,
+  `finalize` and `cancel_offer`.
+
+- **A new constructor guard removed the operator's override during a CSV race.**
+  `CovenantChainState.__post_init__` refuses `funding_height > tip_height` — correct for a
+  single consistent view, but `read_covenant_chain_state` makes **two** round trips
+  (`listunspent`, then `get_tip_height`) and failover picks an endpoint *per call*. A lagging
+  second endpoint, or a reorg between the two reads, produces exactly that triple. At v0.15.0
+  it yielded `confirmations == 0`, which `_assert_covenant_confirmed` refused but
+  `--allow-unconfirmed` could override; the guard fires in the constructor, *before* any
+  override can be consulted, on the cold-recovery path, on a chain with neither RBF nor CPFP.
+
+  The reader now re-reads the tip (highest reading wins — a tip only moves forward) before
+  drawing any conclusion, which resolves the transient case at the cost of one extra round
+  trip *only* when the first two disagree. If they still disagree it records
+  `depth_unresolved` — keeping both real numbers rather than inventing a third — and the
+  builders treat it conservatively: `build_cold_claim` refuses unless `--allow-unconfirmed`
+  and then takes `blocks_to_deadline = 0` (maximum urgency, never the optimistic direction a
+  fabricated depth of 0 would produce), and `build_cold_refund` cannot use it to claim CSV
+  maturity. The constructor stays strict for every other triple.
+
+- **Coin selection stopped short of the fee it was about to be charged.** `wallet.py` and
+  `hd/wallet.py` size the fee from `trial_size_with_slack` — the trial bytes plus
+  `SIG_SIZE_SLACK_BYTES` (3) per input — but the greedy selection cushion still budgeted a
+  bare 148 B/input + 80 B. Selection therefore stopped up to `3n - 2` bytes short and raised
+  `Insufficient funds after fee` with UTXOs still unselected. At three inputs the gap is
+  1..7 bytes whichever way the DER lengths fall, i.e. always short. Measured: a build that
+  succeeded under the v0.15.0 arithmetic raised at HEAD with a spendable UTXO left over.
+
+  The cushion now derives from `SIG_SIZE_SLACK_BYTES` so it cannot drift from the fee again,
+  and both builders re-select rather than refuse: where the estimate and the measurement
+  disagree they take one more UTXO and measure again, raising only when nothing is left. A
+  build refused while the funds exist is the same class of bug as a build that cannot relay.
+
 - **`take_covenant_order` refused any FT take leaving 1-545 units of change.** An RSWP v3
   covenant take whose FT funding exceeded the demand by less than 546 units raised
   `ValidationError` on the stated grounds that the change output "would be un-relayable".

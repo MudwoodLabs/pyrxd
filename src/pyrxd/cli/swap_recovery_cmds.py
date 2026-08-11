@@ -467,7 +467,20 @@ def _spend_lines(spend: ColdSpend, *, tip_height: int) -> list[str]:
     # all — that same depth is the DEADLINE, the point at which the counterparty's refund
     # opens and the asset is lost. So the refund reports maturity, and the claim reports
     # depth plus how long is left; neither borrows the other's wording.
-    if spend.kind == "refund":
+    #
+    # An UNRESOLVED depth gets its own wording on both branches. ``csv_confirmations`` is 0
+    # there because nothing measured it — two chain reads disagreed — not because the
+    # covenant is 0-conf, and printing "0 confirmations" would state as fact a number this
+    # run never established.
+    if spend.depth_unresolved:
+        timing = (
+            f"  depth      : UNRESOLVED — two chain reads disagreed, so the covenant's depth was never "
+            f"measured (the maker's CSV refund branch opens at {spend.csv_required})",
+            "  deadline   : treated as ALREADY HERE — the fee is sized at maximum urgency rather than "
+            "assuming time that was not measured. Re-run against a single, caught-up endpoint for a "
+            "real depth before you rely on this number.",
+        )
+    elif spend.kind == "refund":
         timing = (
             "  csv        : "
             + (

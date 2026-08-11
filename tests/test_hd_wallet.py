@@ -1642,6 +1642,35 @@ class TestBuildSendTxOffline:
         with pytest.raises(ValidationError, match="Insufficient"):
             w.build_send_tx(triples, _RECIPIENT_ADDR, photons=1_000_000_000)
 
+    def test_selection_does_not_stop_short_of_the_fee_it_will_be_charged(self):
+        """``HdWallet``'s copy of the same arithmetic, and the same shortfall.
+
+        The cushion budgeted 148 bytes per input while the fee is sized from
+        ``trial_size_with_slack`` (trial bytes + 3 per input), so selection stopped
+        ``3n - 2`` bytes short and raised "Insufficient funds after fee" with a UTXO
+        still unselected. Three equal inputs make it deterministic: the gap is 1..7
+        bytes whichever way the DER lengths fall.
+        """
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        addr, pk = w._derive_address(0, 0), w._privkey_for(0, 0)
+        values = (1_780_000, 1_780_000, 1_780_000, 1_700_000)
+        triples = [(_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=v), addr, pk) for i, v in enumerate(values)]
+        tx = w.build_send_tx(triples, _RECIPIENT_ADDR, photons=100_000, fee_rate=10_000)
+        assert len(tx.inputs) == 4
+        assert tx.outputs[0].satoshis == 100_000
+        assert (sum(values) - sum(o.satoshis for o in tx.outputs)) >= tx.byte_length() * 10_000
+
+    def test_a_genuine_shortfall_is_still_refused(self):
+        """The top-up loop must not turn "cannot pay" into a bad transaction."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        _seed_wallet_with_used_addresses(w)
+        addr, pk = w._derive_address(0, 0), w._privkey_for(0, 0)
+        # Every UTXO is worth less than the ~148 bytes of fee it adds.
+        triples = [(_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=400_000), addr, pk) for i in range(6)]
+        with pytest.raises(ValidationError, match="Insufficient funds after fee"):
+            w.build_send_tx(triples, _RECIPIENT_ADDR, photons=1_000_000, fee_rate=10_000)
+
     def test_below_dust_raises(self):
         w = HdWallet.from_mnemonic(MNEMONIC)
         _seed_wallet_with_used_addresses(w)

@@ -38,7 +38,7 @@ from ..hash import hash256, sha256
 from ..merkle_path import MerklePath
 from ..script.type import P2PKH
 from ..security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError, redact
-from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
+from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from ._guards import finite_int, hex_str, merkle_branch, nonneg_int
 from .registry import block_hash_hex
 from .tls_pin import normalize_pin, verify_connection_pin
@@ -59,7 +59,8 @@ class UtxoRecord:
     tx_pos:
         Output index within the transaction.
     value:
-        Output value in satoshis.
+        Output value in **photons** (RXD's smallest unit) — this is a Radiant client.
+        For a Glyph FT the same number is also the token's unit count.
     height:
         Block height at which the output was confirmed (0 = unconfirmed).
     """
@@ -497,8 +498,8 @@ class ElectrumXClient:
         except ValidationError as exc:
             raise NetworkError("Server returned invalid txid after broadcast") from exc
 
-    async def get_balance(self, script_hash: Hex32 | bytes | str) -> tuple[Satoshis, Satoshis]:
-        """Return the confirmed and unconfirmed balance for *script_hash*.
+    async def get_balance(self, script_hash: Hex32 | bytes | str) -> tuple[Photons, Photons]:
+        """Return the confirmed and unconfirmed balance for *script_hash*, in photons.
 
         The ``script_hash`` is ``sha256(locking_script)`` with bytes reversed
         (ElectrumX little-endian convention). Accepts ``Hex32``, raw
@@ -506,7 +507,7 @@ class ElectrumXClient:
 
         Returns
         -------
-        tuple[Satoshis, Satoshis]
+        tuple[Photons, Photons]
             ``(confirmed, unconfirmed)``
         """
         script_hash = _coerce_hex32(script_hash)
@@ -514,8 +515,11 @@ class ElectrumXClient:
         if not isinstance(result, dict):
             raise NetworkError("Unexpected response type for balance")
         try:
-            confirmed = Satoshis(nonneg_int(result["confirmed"]))
-            unconfirmed = Satoshis(nonneg_int(result["unconfirmed"]))
+            # Photons, not Satoshis. Radiant's MAX_MONEY is 1000x Bitcoin's, so the BTC cap
+            # rejected any address holding more than 21,000,000 RXD — reporting a truthful
+            # answer as a malformed one. See ``pyrxd.security.types``.
+            confirmed = Photons(nonneg_int(result["confirmed"]))
+            unconfirmed = Photons(nonneg_int(result["unconfirmed"]))
         except (KeyError, TypeError, ValueError, ValidationError):
             raise NetworkError("Malformed balance response from server")
         return confirmed, unconfirmed
@@ -535,11 +539,19 @@ class ElectrumXClient:
             # all (a `null` propagated into the outpoint of a tx the wallet was about to sign),
             # a negative `value`/`tx_pos` was returned verbatim, `1.9` was truncated to `1`, and
             # `Infinity` escaped as OverflowError — absent from the tuple below.
+            #
+            # `value` is bounded by RADIANT MAX_MONEY, not Bitcoin's. It was briefly bounded by
+            # `Satoshis` — a cap 1000x too low for this chain — and because this is a list
+            # COMPREHENSION, one UTXO over 21,000,000 RXD did not merely lose itself: it aborted
+            # the whole list, so every sibling UTXO on that address became invisible and the
+            # address unspendable. It surfaced as `NetworkError`, which `FailoverElectrumXClient`
+            # reads as a transport fault, so the SDK then discarded one healthy endpoint after
+            # another for returning the truth. See ``pyrxd.security.types``.
             return [
                 UtxoRecord(
                     tx_hash=hex_str(item["tx_hash"], nbytes=32),
                     tx_pos=nonneg_int(item["tx_pos"]),
-                    value=int(Satoshis(nonneg_int(item["value"]))),
+                    value=int(Photons(nonneg_int(item["value"]))),
                     height=nonneg_int(item["height"]),
                 )
                 for item in result

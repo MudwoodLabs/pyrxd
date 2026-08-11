@@ -7,7 +7,7 @@ from typing import Any, overload
 import cbor2
 
 from pyrxd.security.errors import ValidationError
-from pyrxd.security.types import Hex20
+from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20
 
 from .dmint import (
     DmintDeployParams,
@@ -31,7 +31,9 @@ MIN_FEE_RATE = 10_000  # photons per byte
 # Radiant MAX_MONEY: 21,000,000,000 RXD x 100,000,000 photons. A dMint premine is
 # denominated in photons (1 photon = 1 FT unit), so anything above the money supply
 # is a caller mistake that would otherwise surface only as an unfundable reveal.
-_MAX_PHOTONS = 21_000_000_000 * 100_000_000
+# Derived from ``pyrxd.security.types`` rather than restated: the same number written out
+# in three places is how a BTC supply cap ended up on the Radiant ElectrumX client.
+_MAX_PHOTONS = RADIANT_MAX_PHOTONS
 
 
 def _assert_declared_dmint_matches(decoded_cbor: dict, params: Any) -> None:

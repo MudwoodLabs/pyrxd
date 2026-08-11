@@ -25,6 +25,8 @@ from .errors import (
 from .rng import secure_random_bytes
 from .secrets import PrivateKeyMaterial, SecretBytes, secure_scalar_mod_n
 from .types import (
+    BTC_MAX_SATS,
+    RADIANT_MAX_PHOTONS,
     BlockHeight,
     Hex20,
     Hex32,
@@ -37,6 +39,8 @@ from .types import (
 )
 
 __all__ = [
+    "BTC_MAX_SATS",
+    "RADIANT_MAX_PHOTONS",
     "BlockHeight",
     "ConfirmationTimeoutError",
     "CovenantError",

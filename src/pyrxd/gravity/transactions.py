@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import time
 
+from pyrxd.fee_sizing import trial_size_with_slack
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.spv.proof import SpvProof
@@ -468,8 +469,8 @@ def build_cancel_tx(
     funding_vout: int,
     funding_photons: int,
     maker_address: str,
-    fee_sats: int,
-    maker_privkey: PrivateKeyMaterial,
+    fee_sats: int | None = None,
+    maker_privkey: PrivateKeyMaterial | None = None,
     fee_policy: DeadlineFeePolicy | None = None,
 ) -> CancelResult:
     """Build the Radiant cancel() tx: Maker reclaims a MakerOffer UTXO.
@@ -478,8 +479,17 @@ def build_cancel_tx(
     Requires Maker signature. No deadline constraint.
     scriptSig: <makerSig+hashtype> OP_0 <offer_redeem>
 
-    ``fee_policy`` supplies the min-relay rate the assembled transaction is checked
-    against, defaulting to
+    ``fee_sats=None`` (the default) sizes the fee from the transaction's own measured
+    bytes at ``fee_policy``'s relay floor, which is the only number that can be right:
+    the cancel scriptSig carries the entire MakerOffer redeem script, so its size — and
+    therefore its floor — is a property of *this* offer, not a constant. A hard-coded
+    default cannot track it. The one this signature used to carry, ``1000``, was ~2,840x
+    under the floor for a 285-byte cancel and made the module's own documented
+    ``cancel_offer(active)`` flow raise on first use, taking away the Maker's only
+    revocation path.
+
+    ``fee_policy`` supplies the min-relay rate the assembled transaction is sized and
+    checked against, defaulting to
     :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`. Pass a policy
     built from the target node's own ``getmempoolinfo``/``effective_minrelaytxfee`` when
     it advertises something else, which regtest does.
@@ -487,42 +497,65 @@ def build_cancel_tx(
     Raises
     ------
     ~pyrxd.security.errors.InsufficientFundsError
-        If ``fee_sats`` is below the node's min-relay floor for the transaction's real,
-        signed size — a cancel that cannot relay leaves the offer takeable. See
-        :func:`_assert_fee_clears_relay_floor`.
+        If an explicit ``fee_sats`` is below the node's min-relay floor for the
+        transaction's real, signed size — a cancel that cannot relay leaves the offer
+        takeable. See :func:`_assert_fee_clears_relay_floor`.
     """
+    if maker_privkey is None:
+        raise ValidationError("maker_privkey is required to sign the cancel tx")
     _validate_txid(funding_txid)
-    _validate_fee_sats(fee_sats)
+    if fee_sats is not None:
+        _validate_fee_sats(fee_sats)
     offer_redeem = bytes.fromhex(offer.offer_redeem_hex)
-    output_photons = funding_photons - fee_sats
-    if output_photons <= 0:
-        raise ValidationError("fee exceeds funding photons")
     maker_spk = _radiant_address_to_p2pkh_script(maker_address)
-    output_bytes = output_photons.to_bytes(8, "little") + _varint(len(maker_spk)) + maker_spk
-    sig_bytes = _sign_radiant_p2sh_input(
-        privkey=maker_privkey,
-        txid=funding_txid,
-        vout=funding_vout,
-        input_value=funding_photons,
-        script_code=offer_redeem,
-        outputs_serialized=output_bytes,
-        sequence=0xFFFFFFFF,
-        locktime=0,
-        version=2,
-    )
-    sig_with_type = sig_bytes + bytes([0x41])
-    script_sig = _push_data(sig_with_type) + b"\x00" + _push_data(offer_redeem)
-    prevout_hash = bytes.fromhex(funding_txid)[::-1]
-    input_bytes = (
-        prevout_hash
-        + funding_vout.to_bytes(4, "little")
-        + _varint(len(script_sig))
-        + script_sig
-        + (0xFFFFFFFF).to_bytes(4, "little")
-    )
-    raw_tx = (
-        (2).to_bytes(4, "little") + _varint(1) + input_bytes + _varint(1) + output_bytes + (0).to_bytes(4, "little")
-    )
+
+    def _assemble(fee: int) -> tuple[bytes, int]:
+        output_photons = funding_photons - fee
+        if output_photons <= 0:
+            raise ValidationError("fee exceeds funding photons")
+        output_bytes = output_photons.to_bytes(8, "little") + _varint(len(maker_spk)) + maker_spk
+        sig_bytes = _sign_radiant_p2sh_input(
+            privkey=maker_privkey,
+            txid=funding_txid,
+            vout=funding_vout,
+            input_value=funding_photons,
+            script_code=offer_redeem,
+            outputs_serialized=output_bytes,
+            sequence=0xFFFFFFFF,
+            locktime=0,
+            version=2,
+        )
+        sig_with_type = sig_bytes + bytes([0x41])
+        script_sig = _push_data(sig_with_type) + b"\x00" + _push_data(offer_redeem)
+        prevout_hash = bytes.fromhex(funding_txid)[::-1]
+        input_bytes = (
+            prevout_hash
+            + funding_vout.to_bytes(4, "little")
+            + _varint(len(script_sig))
+            + script_sig
+            + (0xFFFFFFFF).to_bytes(4, "little")
+        )
+        raw = (
+            (2).to_bytes(4, "little") + _varint(1) + input_bytes + _varint(1) + output_bytes + (0).to_bytes(4, "little")
+        )
+        return raw, output_photons
+
+    if fee_sats is None:
+        policy = fee_policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+        # Two passes, same shape as every other fee-sizing site in this SDK: the only part
+        # of this transaction whose length is not fixed is the DER signature (69-71 bytes),
+        # and it signs a preimage that commits to the output value — so the trial and final
+        # signatures can differ in length. Measure the trial, pad by
+        # ``SIG_SIZE_SLACK_BYTES`` for the one input, and size the fee off that. The
+        # assertion below then PROVES the result rather than trusting the estimate.
+        # The trial's fee value is immaterial to its SIZE (the output value is a fixed
+        # 8-byte field either way), so it is zero — that keeps the trial constructible for
+        # any funding amount and leaves "fee exceeds funding photons" to be raised by the
+        # real pass, where the number in it is the real one.
+        trial_raw, _ = _assemble(0)
+        fee_sats = policy.required_fee(trial_size_with_slack(radiant_relay_size(trial_raw), 1))
+
+    raw_tx, output_photons = _assemble(fee_sats)
     _assert_fee_clears_relay_floor(raw_tx, fee_sats, fee_policy, what="Gravity MakerOffer cancel tx")
     txid = hash256(raw_tx)[::-1].hex()
     return CancelResult(

@@ -29,7 +29,13 @@ Design notes
 
 from __future__ import annotations
 
-from .fee_sizing import assert_tx_pays_for_itself, relay_floor_photons_per_byte, required_fee, trial_size_with_slack
+from .fee_sizing import (
+    SIG_SIZE_SLACK_BYTES,
+    assert_tx_pays_for_itself,
+    relay_floor_photons_per_byte,
+    required_fee,
+    trial_size_with_slack,
+)
 from .keys import PrivateKey
 from .network.electrumx import ElectrumXClient, UtxoRecord, script_hash_for_address
 from .script.type import P2PKH
@@ -65,6 +71,25 @@ DUST_THRESHOLD: int = 546
 # curiosity, it is ``66: min relay fee not met``, and Radiant has neither RBF nor
 # CPFP to repair it.
 DEFAULT_FEE_RATE: int = relay_floor_photons_per_byte()
+
+# Bytes the greedy selection budgets ONCE per transaction: version + input/output varints
+# + two P2PKH outputs + locktime measure 78; 80 leaves two bytes of headroom.
+SELECTION_BASE_BYTES: int = 80
+
+# Bytes the greedy selection budgets PER INPUT.
+#
+# 148 is a signed P2PKH input (32 txid + 4 vout + 1 scriptLen + ~107 scriptSig + 4
+# sequence). The ``+ SIG_SIZE_SLACK_BYTES`` is not padding-on-padding: the FEE is sized
+# from :func:`~pyrxd.fee_sizing.trial_size_with_slack` — the trial bytes PLUS 3 per input —
+# so a cushion of a bare 148 budgets ``3n - 2`` bytes LESS than the fee about to be
+# charged. Selection then stops that far short and the build raises "Insufficient funds
+# after fee" with UTXOs still unselected: a refusal to spend spendable coins, which is its
+# own fund-safety bug. At the default rate each of those bytes is 10,000 photons.
+#
+# Derived from the fee module's own constant rather than written out, so the cushion and
+# the fee cannot drift apart again. The re-selection loop in the builders is what PROVES
+# they agree, rather than trusting this arithmetic.
+SELECTION_INPUT_BYTES: int = 148 + SIG_SIZE_SLACK_BYTES
 
 
 def greedy_select_count(values_desc: list[int], photons: int, *, base_cushion: int, per_input_cushion: int) -> int:
@@ -232,41 +257,46 @@ class RxdWallet:
         change_script = P2PKH().lock(self._address)
 
         # Greedy selection: stop once we have enough for the trial output plus
-        # a generous fee-plus-change buffer (re-checked after the trial pass).
-        selected: list[UtxoRecord] = []
-        total_in = 0
-        min_input_bytes = 148  # signed P2PKH input approx 148 bytes
-        per_input_fee_cushion = min_input_bytes * self._fee_rate
-        # Base overhead (two outputs + version + locktime) approx 78 bytes.
-        base_fee_cushion = 80 * self._fee_rate
-
-        for utxo in sorted_utxos:
-            selected.append(utxo)
-            total_in += utxo.value
-            target = photons + base_fee_cushion + per_input_fee_cushion * len(selected)
-            if total_in >= target:
-                break
-
-        if total_in < photons:
-            raise ValidationError("Insufficient funds for requested amount")
+        # a fee-plus-change buffer (PROVEN against the real fee below).
+        base_fee_cushion = SELECTION_BASE_BYTES * self._fee_rate
+        per_input_fee_cushion = SELECTION_INPUT_BYTES * self._fee_rate
+        n_selected = greedy_select_count(
+            [u.value for u in sorted_utxos],
+            photons,
+            base_cushion=base_fee_cushion,
+            per_input_cushion=per_input_fee_cushion,
+        )
 
         # ---- Trial pass: build with placeholder change to measure size.
-        inputs = [self._make_input(u) for u in selected]
-        trial_change = max(DUST_THRESHOLD, total_in - photons - base_fee_cushion)
-        trial_outputs = [
-            TransactionOutput(recipient_script, photons),
-            TransactionOutput(change_script, trial_change),
-        ]
-        trial_tx = Transaction(tx_inputs=inputs, tx_outputs=trial_outputs)
-        trial_tx.sign()
-        # Pad the trial measurement by the most a signature can grow between passes
-        # (see :data:`pyrxd.fee_sizing.SIG_SIZE_SLACK_BYTES`). Without this the fee
-        # pays for the TRIAL bytes while the caller broadcasts the FINAL ones.
-        trial_size = trial_size_with_slack(trial_tx.byte_length(), len(inputs))
-        fee = required_fee(trial_size, self._fee_rate)
-
-        if total_in < photons + fee:
-            raise ValidationError("Insufficient funds after fee")
+        #
+        # The cushion above is an ESTIMATE; ``fee`` below is a MEASUREMENT. Where they
+        # disagree, take one more UTXO and measure again rather than telling a caller who
+        # still holds coins that they have insufficient funds — a build refused while the
+        # funds exist is the same class of bug as an unrelayable build. This loop is what
+        # makes the cushion's exact value a performance question rather than a correctness
+        # one, and it terminates: every pass either returns or consumes one more UTXO.
+        selected: list[UtxoRecord]
+        while True:
+            selected = sorted_utxos[:n_selected]
+            total_in = sum(u.value for u in selected)
+            inputs = [self._make_input(u) for u in selected]
+            trial_change = max(DUST_THRESHOLD, total_in - photons - base_fee_cushion)
+            trial_outputs = [
+                TransactionOutput(recipient_script, photons),
+                TransactionOutput(change_script, trial_change),
+            ]
+            trial_tx = Transaction(tx_inputs=inputs, tx_outputs=trial_outputs)
+            trial_tx.sign()
+            # Pad the trial measurement by the most a signature can grow between passes
+            # (see :data:`pyrxd.fee_sizing.SIG_SIZE_SLACK_BYTES`). Without this the fee
+            # pays for the TRIAL bytes while the caller broadcasts the FINAL ones.
+            trial_size = trial_size_with_slack(trial_tx.byte_length(), len(inputs))
+            fee = required_fee(trial_size, self._fee_rate)
+            if total_in >= photons + fee:
+                break
+            if n_selected >= len(sorted_utxos):
+                raise ValidationError("Insufficient funds after fee")
+            n_selected += 1
 
         change_value = total_in - photons - fee
 
