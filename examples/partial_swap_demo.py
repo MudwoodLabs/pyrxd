@@ -84,11 +84,18 @@ def main() -> None:
     print(f"\nOffer serialized to a {len(str(payload))}-char transport payload.\n")
 
     # --- Taker side --------------------------------------------------------
-    # The taker funds the maker's 800 RXD (+ fee) from a 2000-RXD UTXO and
-    # receives the FT. accept_offer reads the maker's real given asset from
-    # the offer, reconciles the terms, and re-verifies the maker signature.
-    taker_rxd_utxo = _p2pkh_source(taker_pkh, 2000)
-    fee = 300
+    # The taker funds the maker's 800 RXD (+ fee) and receives the FT.
+    # accept_offer reads the maker's real given asset from the offer, reconciles
+    # the terms, and re-verifies the maker signature.
+    #
+    # The fee is REAL, and so is the funding it comes out of. `accept_offer`
+    # refuses anything below Radiant's relay floor: this shape (FT input + RXD
+    # funding input, 3 outputs) serialises to 457 bytes, so its floor is 4,570,000
+    # photons at 10,000 photons/byte. This demo used to pass 300 — about 15,000x
+    # under — which would have produced a swap no node relays, on a chain with
+    # neither RBF nor CPFP to repair it.
+    taker_rxd_utxo = _p2pkh_source(taker_pkh, 20_000_000)
+    fee = 5_000_000
     tx = accept_offer(
         SwapOffer.from_dict(payload),
         funding=[FundingInput(source_tx=taker_rxd_utxo, vout=0, key=taker)],

@@ -40,6 +40,7 @@ import pytest
 from pyrxd.constants import Network
 from pyrxd.glyph.script import build_ft_locking_script
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
@@ -63,6 +64,19 @@ pytestmark = pytest.mark.integration
 _IMAGE = "radiant-core:v3.1.1-amd64"
 _CONTAINER = "rswp-regtest-pytest"
 _FEE = 1_000_000  # 0.01 RXD — comfortably above regtest relay for sub-kB txs
+
+# The fee-gated builders (`take_rswp_order` / `accept_offer` / the v3 covenant
+# builders / `build_cancel_tx`) default to the MAINNET relay floor, 0.10 RXD/kB. This
+# node relays at a tenth of that, and `_FEE` is sized for THIS node — which is the
+# point of an e2e — so the gate has to be told which node it is judging. Pinned to
+# what the node itself advertises rather than to a guessed constant, the same way
+# `test_gravity_maker_offer_regtest_e2e._node_policy` does it.
+#
+# `allow_below_protocol_floor` because that advertised rate IS below the protocol
+# floor: a default regtest node is exactly the case the escape hatch exists for.
+# The MAINNET-floor boundary is proven separately, against a node started at
+# `-minrelaytxfee=0.10`, in tests/test_fee_floor_boundary_regtest_e2e.py.
+_NODE_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1_000_000, allow_below_protocol_floor=True)
 _RXD_TOKEN_HEX = "00" * 32
 
 
@@ -285,6 +299,7 @@ async def test_happy_path_ft_for_rxd_post_browse_take_settle(node) -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     verdict = node.accepts(completion.serialize().hex())
     assert verdict.get("allowed") is True, verdict
@@ -334,6 +349,7 @@ async def test_happy_path_rxd_for_ft_mirror(node) -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     verdict = node.accepts(completion.serialize().hex())
     assert verdict.get("allowed") is True, verdict
@@ -356,6 +372,7 @@ async def test_double_take_single_winner(node) -> None:
                 taker_receive_pkh=taker.public_key().hash160(),
                 taker_change_pkh=taker.public_key().hash160(),
                 fee=_FEE,
+                fee_policy=_NODE_POLICY,
             )
         )
 
@@ -381,6 +398,7 @@ async def test_cancel_beats_take(node) -> None:
         taker_receive_pkh=taker.public_key().hash160(),
         taker_change_pkh=taker.public_key().hash160(),
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
 
     fee_fund, ff_vout = _fund_key(node, maker, 20_000_000)
@@ -390,6 +408,7 @@ async def test_cancel_beats_take(node) -> None:
         maker_key=maker,
         refund_pkh=maker.public_key().hash160(),
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
         funding=[FundingInput(fee_fund, ff_vout, maker)],
     )
     node.send_and_mine(cancel)
@@ -413,6 +432,7 @@ async def test_tampered_demand_rejected_by_consensus(node) -> None:
         taker_receive_pkh=taker.public_key().hash160(),
         taker_change_pkh=taker.public_key().hash160(),
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     completion.outputs[0].satoshis -= 1  # steal one photon from the maker's demand
     verdict = node.accepts(completion.serialize().hex())

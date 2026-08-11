@@ -272,12 +272,26 @@ def test_the_shipped_bitcoin_default_still_constructs():
     assert DEFAULT_BITCOIN_DEADLINE_FEE_POLICY.min_relay_fee(250) == 250  # 250 vB at 1 sat/vB
 
 
-def test_the_radiant_default_sits_at_the_effective_rate_ten_x_above_its_own_bound():
-    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.protocol_floor_per_kb == RADIANT_MIN_RELAY_PHOTONS_PER_KB
+def test_the_radiant_bound_is_the_effective_rate_not_the_legacy_one():
+    """REGRESSION: the bound used to be the LEGACY rate, which made it 10x too low.
+
+    ``getmempoolinfo`` reports both ``minrelaytxfee`` (0.01 RXD/kB) and
+    ``effective_minrelaytxfee`` (0.10). Only the second is what
+    ``AcceptToMemoryPool`` enforces — but the first is the one with the obvious
+    field name, and an operator who wired it up landed on a policy that was
+    ACCEPTED with no opt-out and computed ``min_relay_fee(226) == 226_000``
+    against a real requirement of 2_260_000. The bound is now the effective rate,
+    so reading the wrong field fails loudly instead of under-fee'ing silently.
+    """
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.protocol_floor_per_kb == RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
     assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.allow_below_protocol_floor is False
-    # The bound is the LEGACY floor, so the effective rate is comfortably inside it: the
-    # guard catches hostile lowballs without rejecting a node that reports the old rate.
-    assert DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB).relay_fee_per_kb == 1_000_000
+    # The legacy rate is exactly the accepted-but-10x-under value, and it is refused now.
+    with pytest.raises(ValidationError, match="below the chain's relay floor"):
+        DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB)
+    # 226 bytes: what the wrong reading would have demanded, vs what the node does.
+    permissive = DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB, allow_below_protocol_floor=True)
+    assert permissive.min_relay_fee(226) == 226_000
+    assert DEFAULT_RADIANT_DEADLINE_FEE_POLICY.min_relay_fee(226) == 2_260_000
 
 
 def test_a_node_reading_that_is_hostile_is_caught_end_to_end():

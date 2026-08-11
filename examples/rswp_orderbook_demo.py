@@ -78,12 +78,17 @@ def main() -> None:
         receive=Asset(kind="rxd", amount=800),
         maker_receive_pkh=maker_pkh,
     )
+    # Every fee in this demo is a REAL Radiant fee, sized against the relay floor of
+    # 10,000 photons per SERIALIZED byte. They used to be illustrative three-digit
+    # numbers, which taught exactly the wrong order of magnitude. This advert
+    # measures 425 bytes, so its floor is 4,250,000 photons.
     advert_tx = build_advert_tx(
         advert_script=post.advert_script,
-        funding=[FundingInput(_p2pkh_source(maker_pkh, 5_000), 0, maker)],
+        funding=[FundingInput(_p2pkh_source(maker_pkh, 20_000_000), 0, maker)],
         change_pkh=maker_pkh,
-        fee=500,
+        fee=5_000_000,
     )
+    assert advert_tx.get_fee() >= len(advert_tx.serialize()) * 10_000
     print(f"advert OP_RETURN script ({len(post.advert_script)} bytes):")
     print(f"  {post.advert_script.hex()}")
     print(f"advert tx to broadcast: {advert_tx.txid()}\n")
@@ -100,13 +105,16 @@ def main() -> None:
     print(f"  demands  : {order.demanded_outputs[0].value} photons → maker script")
     print(f"  signature: {len(order.signature)} bytes, sighash 0xc3\n")
 
+    # 457 bytes for this shape, so 4,570,000 photons of floor. `take_rswp_order`
+    # refuses less: an unrelayable completion is the taker committing funding inputs
+    # to a transaction no node will carry, and Radiant cannot fee-bump it.
     swap_tx = take_rswp_order(
         order,
         give_source_tx=ft_source,  # in production: fetch_transaction(client, order.offered_txid)
-        funding=[FundingInput(_p2pkh_source(taker_pkh, 2_000), 0, taker)],
+        funding=[FundingInput(_p2pkh_source(taker_pkh, 20_000_000), 0, taker)],
         taker_receive_pkh=taker_pkh,
         taker_change_pkh=taker_pkh,
-        fee=300,
+        fee=5_000_000,
     )
     print(f"completion tx to broadcast: {swap_tx.txid()}")
     print(f"  output[0] (maker receives): {swap_tx.outputs[0].satoshis} photons")

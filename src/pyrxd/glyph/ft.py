@@ -69,6 +69,7 @@ from typing import Any
 
 from pyrxd.fee_sizing import (
     SIG_SIZE_SLACK_BYTES,
+    assert_fee_rate_clears_relay_floor,
     assert_pays_for_its_size,
     relay_floor_photons_per_byte,
     trial_size_with_slack,
@@ -133,19 +134,12 @@ def _check_fee_rate(fee_rate: int) -> None:
     hours later. That makes a sub-floor rate a fund-safety bug, not a tuning
     mistake, which is why this refuses rather than warns.
 
-    The floor is taken from :mod:`pyrxd.fee_sizing` rather than restated, so the
-    wallet, glyph and swap stacks cannot drift apart on it.
+    The CHECK, not merely the floor, is taken from :mod:`pyrxd.fee_sizing` — this
+    used to be a second copy of the same three lines, and the NFT transfer builder
+    next door had a third copy of *nothing*, which is the bug that made this shared.
+    Kept as a named function because its callers document it by name.
     """
-    if isinstance(fee_rate, bool) or not isinstance(fee_rate, int):
-        raise ValueError(f"fee_rate must be an int (photons/byte), got {type(fee_rate).__name__}")
-    floor_per_byte = relay_floor_photons_per_byte()
-    if fee_rate < floor_per_byte:
-        raise ValueError(
-            f"fee_rate must be >= {floor_per_byte} photons/byte (Radiant's effective relay floor of "
-            f"{floor_per_byte * 1000} per kB), got {fee_rate}. A transaction built "
-            "below the floor will not relay, and Radiant has no RBF and no CPFP — it cannot be "
-            "fee-bumped and will hold its inputs until mempool expiry."
-        )
+    assert_fee_rate_clears_relay_floor(fee_rate, what="FT builder")
 
 
 @dataclass(frozen=True)

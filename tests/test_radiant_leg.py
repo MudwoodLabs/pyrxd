@@ -892,7 +892,9 @@ async def test_an_injected_policy_overrides_the_default_rate():
         maker_pkh=_MAKER_PKH,
         chain_io=RadiantChainIO(client),
         fee_source=SizedFeeSource(3_000_000),
-        fee_policy=DeadlineFeePolicy(relay_fee_per_kb=1_000_000),
+        # 0.01 RXD/kB is the LEGACY rate, below the protocol bound (now the EFFECTIVE
+        # rate), so pointing at a node that really relays this low is an explicit act.
+        fee_policy=DeadlineFeePolicy(relay_fee_per_kb=1_000_000, allow_below_protocol_floor=True),
     )
     rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, radiant_covenant_outpoint="cd" * 32 + ":0")
     assert await leg.claim_asset(rec, _P) == "ab" * 32

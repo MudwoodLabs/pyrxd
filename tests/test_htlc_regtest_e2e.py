@@ -64,18 +64,30 @@ _RELAY_FEE_SATS = 1_000_000  # 0.01 RXD — >> relayfee (0.01 RXD/kB) for a sub-
 
 
 class _RegtestNode:
-    """A self-managed isolated radiant-core regtest node (docker)."""
+    """A self-managed isolated radiant-core regtest node (docker).
 
-    def __init__(self) -> None:
+    ``container`` and ``extra_args`` exist so a suite that needs a node with
+    DIFFERENT POLICY can stand one up without colliding with this module's. The
+    fee-floor boundary suite runs at ``-minrelaytxfee=0.10`` — the MAINNET floor,
+    which is also the rate pyrxd's builders default to — because a default regtest
+    node advertises a tenth of that, and at a tenth of the built rate a one- or
+    two-byte fee shortfall is structurally invisible. Both must be non-default
+    together: ``start()`` force-removes its container by name, so two suites sharing
+    one name would destroy each other's node.
+    """
+
+    def __init__(self, *, container: str = _CONTAINER, extra_args: tuple[str, ...] = ()) -> None:
         self.user = "rt_user"
         self.password = secrets.token_hex(12)
         self.mine_addr = ""
+        self.container = container
+        self.extra_args = tuple(extra_args)
 
     def cli(self, *args: str, wallet: bool = False) -> object:
         base = [
             "docker",
             "exec",
-            _CONTAINER,
+            self.container,
             "radiant-cli",
             "-regtest",
             f"-rpcuser={self.user}",
@@ -100,14 +112,14 @@ class _RegtestNode:
         return res[0] if isinstance(res, list) else res
 
     def start(self) -> None:
-        subprocess.run(["docker", "rm", "-f", _CONTAINER], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
         up = subprocess.run(
             [
                 "docker",
                 "run",
                 "-d",
                 "--name",
-                _CONTAINER,
+                self.container,
                 "--entrypoint",
                 "radiantd",
                 _IMAGE,
@@ -120,6 +132,7 @@ class _RegtestNode:
                 f"-rpcpassword={self.password}",
                 "-rpcbind=0.0.0.0",
                 "-rpcallowip=0.0.0.0/0",
+                *self.extra_args,
             ],
             capture_output=True,
             text=True,
@@ -144,7 +157,7 @@ class _RegtestNode:
         self.mine(101)  # mature a coinbase
 
     def stop(self) -> None:
-        subprocess.run(["docker", "rm", "-f", _CONTAINER], capture_output=True)
+        subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
 
 
 @pytest.fixture(scope="module")

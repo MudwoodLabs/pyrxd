@@ -18,6 +18,7 @@ from pyrxd.glyph.script import (
     is_ft_script,
 )
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
@@ -27,6 +28,16 @@ from pyrxd.swap import Asset, FundingInput, SwapOffer, accept_offer, create_offe
 from pyrxd.swap.partial import _is_p2pkh
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
+
+# These fixtures work in TOY photon values (hundreds or a few thousand, not the millions
+# a real Radiant fee costs), so their fees sit far below the chain's relay floor by
+# design: what they test is conservation arithmetic, signature binding and parsing, not
+# fee sizing. Those builders now GATE `fee` against that floor, so the opt-out is stated
+# here explicitly rather than left implicit. The floor itself is proven offline in
+# tests/test_swap_and_nft_fee_floors.py and at a real node in
+# tests/test_fee_floor_boundary_regtest_e2e.py.
+_TOY_FEE_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+
 
 _REF_G = GlyphRef(txid=Txid("aa" * 32), vout=0)
 _REF_R = GlyphRef(txid=Txid("bb" * 32), vout=1)
@@ -88,6 +99,7 @@ def test_rxd_for_rxd() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=200,
+        fee_policy=_TOY_FEE_POLICY,
     )
     # out0 maker receives 600 rxd; out1 taker receives the 1000 rxd given.
     assert _classify(tx.outputs[0]) == ("rxd", 600, None)
@@ -111,6 +123,7 @@ def test_ft_for_rxd() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert _classify(tx.outputs[0]) == ("rxd", 800, None)  # maker receive
     assert _classify(tx.outputs[1]) == ("ft", 1000, _REF_G)  # taker receives the FT
@@ -138,6 +151,7 @@ def test_rxd_for_ft() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert _classify(tx.outputs[0]) == ("ft", 50, _REF_R)  # maker receives 50 FT
     assert _classify(tx.outputs[1]) == ("rxd", 1000, None)  # taker receives the rxd given
@@ -167,6 +181,7 @@ def test_ft_for_ft() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     kinds = [_classify(o) for o in tx.outputs]
     assert _classify(tx.outputs[0]) == ("ft", 30, _REF_R)  # maker receives R_r
@@ -193,6 +208,7 @@ def test_exact_funding_no_rxd_change() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=100,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert len(tx.outputs) == 2  # maker receive + taker FT only
     _assert_balanced(tx, 1000, 900, 100)
@@ -215,6 +231,7 @@ def test_sub_dust_change_folded_into_fee() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=90,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert len(tx.outputs) == 2  # no dust change output
     total_out = sum(o.satoshis for o in tx.outputs)
@@ -273,6 +290,7 @@ def test_tampered_declared_give_terms_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -303,6 +321,7 @@ def test_tampered_receive_output_breaks_maker_signature() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -336,6 +355,7 @@ def test_injected_extra_output_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
     from pyrxd.swap.rswp.orders import verify_offer_signature
 
@@ -364,6 +384,7 @@ def test_substituted_give_source_tx_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -384,6 +405,7 @@ def test_underfunded_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -407,6 +429,7 @@ def test_insufficient_ft_funding_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=100,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -429,5 +452,6 @@ def test_taker_receive_amount_is_derived_not_assumed() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert _classify(tx.outputs[1]) == ("ft", 777, _REF_G)  # exactly what the maker gave

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from pyrxd.fee_sizing import SIG_SIZE_SLACK_BYTES
 from pyrxd.glyph.builder import GlyphBuilder, TransferParams, TransferResult
 from pyrxd.glyph.script import (
     build_nft_locking_script,
@@ -153,12 +154,27 @@ class TestFee:
         result = GlyphBuilder().build_nft_transfer_tx(params)
         assert result.tx.outputs[0].satoshis == params.nft_utxo_value - result.fee
 
-    def test_fee_matches_size_times_rate(self):
+    def test_fee_covers_size_times_rate_and_overpays_by_at_most_the_headroom(self):
+        """It used to assert ``fee == size * rate`` EXACTLY, and that was the bug.
+
+        The two signing passes commit to different output values, so their DER
+        signatures differ in length; sizing the fee off the trial pass alone left
+        24.9% of builds (measured, 3000 fresh keys) paying for fewer bytes than the
+        final transaction contains. The fee is now sized from the trial measurement
+        plus ``SIG_SIZE_SLACK_BYTES`` per input, so exact equality is no longer the
+        invariant — clearing the rate is, and the overpayment is bounded.
+
+        The cap is ``2 × SIG_SIZE_SLACK_BYTES`` bytes' worth for this one-input
+        builder, exactly as in ``test_wallet_fee_sizing``: the deliberate headroom in
+        one direction, plus the final signature coming out *shorter* than the trial's
+        in the other, bounded by the same DER spread. At the default rate that is
+        0.0006 RXD, worst case, taken out of the NFT's own carrier.
+        """
         params = _transfer_params(fee_rate=10_000)
         result = GlyphBuilder().build_nft_transfer_tx(params)
-        # The trial tx and the final tx have the same byte length (same input
-        # template, same output script, output-value only affects 8 fixed bytes).
-        assert result.fee == result.tx.byte_length() * params.fee_rate
+        size = result.tx.byte_length()
+        assert result.fee >= size * params.fee_rate
+        assert result.fee <= (size + 2 * SIG_SIZE_SLACK_BYTES) * params.fee_rate
 
     def test_fee_is_positive(self):
         result = GlyphBuilder().build_nft_transfer_tx(_transfer_params())
@@ -183,19 +199,37 @@ class TestDust:
         with pytest.raises(ValueError, match="dust"):
             GlyphBuilder().build_nft_transfer_tx(_transfer_params(nft_value=1000))
 
+    @staticmethod
+    def _settle(remainder: int):
+        """Find an input value whose own fee leaves exactly *remainder* photons.
+
+        Iterated rather than solved in one shot. The fee depends on the SIGNED trial
+        size, and the trial signs over the input value — so changing the value to hit
+        a target can change the DER length and move the fee out from under you. A
+        one-shot probe was silently relying on the two builds happening to size the
+        same, which stopped being true once the fee gained per-input headroom.
+
+        :returns: ``(value, result_or_None)`` — ``None`` when the builder refused,
+            which is the outcome the sub-dust case wants.
+        """
+        value = GlyphBuilder().build_nft_transfer_tx(_transfer_params()).fee + remainder
+        for _ in range(8):
+            try:
+                result = GlyphBuilder().build_nft_transfer_tx(_transfer_params(nft_value=value))
+            except ValueError:
+                return value, None
+            if result.fee + remainder == value:
+                return value, result
+            value = result.fee + remainder
+        raise AssertionError("the fee never settled — the builder's sizing is not a fixed point")
+
     def test_value_exactly_below_dust_after_fee_raises(self):
-        # Build a tx once to learn actual tx size, then pick a value that leaves 545.
-        probe = GlyphBuilder().build_nft_transfer_tx(_transfer_params())
-        probe_fee = probe.fee
-        just_under = probe_fee + 545
-        with pytest.raises(ValueError):
-            GlyphBuilder().build_nft_transfer_tx(_transfer_params(nft_value=just_under))
+        value, result = self._settle(545)
+        assert result is None, f"a {value}-photon NFT left 545 photons and was NOT refused"
 
     def test_value_exactly_at_dust_succeeds(self):
-        probe = GlyphBuilder().build_nft_transfer_tx(_transfer_params())
-        probe_fee = probe.fee
-        at_dust = probe_fee + 546
-        result = GlyphBuilder().build_nft_transfer_tx(_transfer_params(nft_value=at_dust))
+        _value, result = self._settle(546)
+        assert result is not None, "a build leaving exactly the dust limit must succeed"
         assert result.tx.outputs[0].satoshis == 546
 
 

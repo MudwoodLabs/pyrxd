@@ -541,6 +541,10 @@ def swap_reserve_cmd(ctx: CliContext, amount: int, expiry_height: int, fee_overr
                     expiry_height=expiry_height,
                     change_pkh=owner_pkh,
                     fee=f,
+                    # Trial builds are deliberately sub-floor; `_assert_relayable`
+                    # gates the transaction that is actually returned. See
+                    # `_SIZING_TRIAL_POLICY`.
+                    fee_policy=_SIZING_TRIAL_POLICY,
                 ),
                 seed_inputs=1,
                 seed_outputs=2,
@@ -734,6 +738,10 @@ def swap_take_cmd(ctx: CliContext, advert_arg: str, fee_override: int | None) ->
                         taker_change_pkh=taker_pkh,
                         fee=fee,
                         current_height=tip_height,
+                        # Trial builds are deliberately sub-floor; `_assert_relayable`
+                        # gates the transaction that is actually returned. See
+                        # `_SIZING_TRIAL_POLICY`.
+                        fee_policy=_SIZING_TRIAL_POLICY,
                     )
                 return take_rswp_order(
                     order,
@@ -742,6 +750,7 @@ def swap_take_cmd(ctx: CliContext, advert_arg: str, fee_override: int | None) ->
                     taker_receive_pkh=taker_pkh,
                     taker_change_pkh=taker_pkh,
                     fee=fee,
+                    fee_policy=_SIZING_TRIAL_POLICY,
                 )
 
             completion, fee = await _build_at_measured_fee(
@@ -817,6 +826,10 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
                         maker_key=maker_key,
                         refund_pkh=owner_pkh,
                         fee=f,
+                        # Trial builds are deliberately sub-floor; `_assert_relayable`
+                        # gates the transaction that is actually returned. See
+                        # `_SIZING_TRIAL_POLICY`.
+                        fee_policy=_SIZING_TRIAL_POLICY,
                     ),
                     seed_inputs=1,
                     seed_outputs=1,
@@ -921,6 +934,10 @@ def swap_refund_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
                     maker_key=maker_key,
                     refund_pkh=owner_pkh,
                     fee=f,
+                    # Trial builds are deliberately sub-floor; `_assert_relayable`
+                    # gates the transaction that is actually returned. See
+                    # `_SIZING_TRIAL_POLICY`.
+                    fee_policy=_SIZING_TRIAL_POLICY,
                 ),
                 seed_inputs=1,
                 seed_outputs=1,

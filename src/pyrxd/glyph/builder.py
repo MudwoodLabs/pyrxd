@@ -6,6 +6,13 @@ from typing import Any, overload
 
 import cbor2
 
+from pyrxd.fee_sizing import (
+    assert_fee_rate_clears_relay_floor,
+    assert_pays_for_its_size,
+    relay_floor_photons_per_byte,
+    required_fee,
+    trial_size_with_slack,
+)
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import RADIANT_MAX_PHOTONS, Hex20
 
@@ -25,8 +32,14 @@ from .script import (
 )
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef, GlyphRoyalty
 
-# Minimum fee rate post-V2: 10,000 photons/byte
-MIN_FEE_RATE = 10_000  # photons per byte
+# Minimum fee rate post-V2. DERIVED from the single definition of Radiant's
+# effective relay floor in :mod:`pyrxd.fee_sizing` rather than written out — this
+# was a hardcoded ``10_000`` literal, the fourth independent spelling of the same
+# number in this SDK, and the whole reason ``fee_sizing`` exists is that this repo
+# has a measured history of one copy of a fee rule moving while the others did not.
+# ``pyrxd.glyph.ft.MIN_FEE_RATE`` and ``pyrxd.wallet.DEFAULT_FEE_RATE`` are bound to
+# the same call.
+MIN_FEE_RATE: int = relay_floor_photons_per_byte()  # photons per byte
 
 # Radiant MAX_MONEY: 21,000,000,000 RXD x 100,000,000 photons. A dMint premine is
 # denominated in photons (1 photon = 1 FT unit), so anything above the money supply
@@ -1063,6 +1076,14 @@ class GlyphBuilder:
         from pyrxd.transaction.transaction_input import TransactionInput
         from pyrxd.transaction.transaction_output import TransactionOutput
 
+        # 0. The RATE has to be judged before any bytes exist, and nothing further
+        #    down can do it: `required_fee` binds the caller's rate and only the
+        #    caller's rate (see its docstring), so a sub-floor rate produces a
+        #    transaction that is internally consistent, passes every later assertion,
+        #    and is refused by every node on the network. Same no-opt-out refusal the
+        #    FT builders next door already make, via the same shared implementation.
+        assert_fee_rate_clears_relay_floor(params.fee_rate, what="build_nft_transfer_tx")
+
         # 1. Validate input script shape and extract ref.
         #    extract_ref_from_nft_script raises ValidationError if len != 63 or
         #    first byte != 0xd8.
@@ -1118,14 +1139,27 @@ class GlyphBuilder:
 
         # 5. Two-pass fee calculation. First pass: trial with nft_utxo_value as
         #    output (no fee yet) — sign, measure byte_length, compute fee.
+        #
+        #    The trial measurement is padded by SIG_SIZE_SLACK_BYTES per input before
+        #    it is fee'd. Without that padding this builder fee'd the TRIAL bytes and
+        #    handed back the FINAL ones: the two passes sign different messages (the
+        #    final one commits to the real output value), so their DER signatures are
+        #    not the same length, and whenever the final one came out longer the
+        #    transaction paid for fewer bytes than it contained. Measured over 3000
+        #    builds on fresh keys at the default rate: 746 (24.9%) landed 1-2 bytes
+        #    short. Signing is deterministic (RFC 6979), so an affected transfer is
+        #    short on every retry — it is a property of that NFT and that recipient,
+        #    not a flake. This is byte-for-byte the defect already fixed in
+        #    ``pyrxd.wallet`` / ``pyrxd.hd.wallet``; the rule lives in one place now.
         trial_input = _make_input()
         trial_tx = Transaction(
             tx_inputs=[trial_input],
             tx_outputs=[TransactionOutput(Script(new_nft_script), params.nft_utxo_value)],
         )
         trial_tx.sign()
-        size = trial_tx.byte_length()
-        fee = size * params.fee_rate
+        # One input, always: this builder spends the NFT UTXO and nothing else.
+        size = trial_size_with_slack(trial_tx.byte_length(), len(trial_tx.inputs))
+        fee = required_fee(size, params.fee_rate)
 
         output_value = params.nft_utxo_value - fee
         if output_value < 546:
@@ -1145,6 +1179,26 @@ class GlyphBuilder:
             tx_outputs=[TransactionOutput(Script(new_nft_script), output_value)],
         )
         final_tx.sign()
+
+        # 7. The fee this transaction ACTUALLY pays must clear the rate it was built
+        #    for, measured on the bytes it actually contains. The headroom above is
+        #    what should make this unreachable; this is what proves it, rather than
+        #    trusting it. Refusing costs an aborted build — returning costs the NFT's
+        #    own UTXO for 8 hours, because Radiant has neither RBF nor CPFP and a
+        #    below-floor transaction can be neither replaced nor bumped.
+        #
+        #    ``assert_pays_for_its_size``, not ``assert_tx_pays_for_itself``: the fee
+        #    is derived from the caller's ``nft_utxo_value``, which is the number the
+        #    node will use, rather than from the SHIM ``source_transaction`` built at
+        #    step 4 — a padded stand-in with a monkey-patched ``txid`` that exists
+        #    only to make the preimage computable. Reading a fee out of a fake is a
+        #    dependency this check should not have.
+        assert_pays_for_its_size(
+            size_bytes=final_tx.byte_length(),
+            fee_paid=params.nft_utxo_value - output_value,
+            fee_rate=params.fee_rate,
+            what="build_nft_transfer_tx",
+        )
 
         return TransferResult(
             tx=final_tx,

@@ -40,7 +40,7 @@ from pyrxd.swap.rswp import (
     take_covenant_order,
 )
 from pyrxd.transaction.transaction import Transaction
-from tests.test_rswp_regtest_e2e import _FEE, _fund_key, _Node
+from tests.test_rswp_regtest_e2e import _FEE, _NODE_POLICY, _fund_key, _Node
 from tests.test_rswp_regtest_e2e import node as node
 
 pytestmark = pytest.mark.integration
@@ -63,6 +63,7 @@ def _reserve_and_post(
         expiry_height=expiry,
         change_pkh=mk_pkh,
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     node.send_and_mine(reserved)
 
@@ -104,6 +105,7 @@ async def test_v3_fill_before_expiry_and_index_drops_the_advert(node) -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
         current_height=_tip(node),
     )
     verdict = node.accepts(completion.serialize().hex())
@@ -120,7 +122,12 @@ async def test_v3_refund_rejected_early_accepted_at_expiry(node) -> None:
     reserved, _order = _reserve_and_post(node, maker, photons=8_000_000, demand=7_000_000, expiry=expiry)
 
     refund = build_covenant_refund_tx(
-        covenant_source_tx=reserved, covenant_vout=0, maker_key=maker, refund_pkh=mk_pkh, fee=_FEE
+        covenant_source_tx=reserved,
+        covenant_vout=0,
+        maker_key=maker,
+        refund_pkh=mk_pkh,
+        fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     early = node.accepts(refund.serialize().hex())
     assert early.get("allowed") is False
@@ -142,7 +149,12 @@ async def test_v3_cancel_before_expiry_via_swap_branch(node) -> None:
     reserved, _order = _reserve_and_post(node, maker, photons=6_000_000, demand=5_000_000, expiry=expiry)
 
     cancel = build_covenant_cancel_tx(
-        covenant_source_tx=reserved, covenant_vout=0, maker_key=maker, refund_pkh=mk_pkh, fee=_FEE
+        covenant_source_tx=reserved,
+        covenant_vout=0,
+        maker_key=maker,
+        refund_pkh=mk_pkh,
+        fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     verdict = node.accepts(cancel.serialize().hex())
     assert verdict.get("allowed") is True, verdict
@@ -161,7 +173,12 @@ async def test_v3_refund_txid_is_selector_malleable_by_design(node) -> None:
         node.mine(1)
 
     refund = build_covenant_refund_tx(
-        covenant_source_tx=reserved, covenant_vout=0, maker_key=maker, refund_pkh=mk_pkh, fee=_FEE
+        covenant_source_tx=reserved,
+        covenant_vout=0,
+        maker_key=maker,
+        refund_pkh=mk_pkh,
+        fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     assert node.accepts(refund.serialize().hex()).get("allowed") is True
 

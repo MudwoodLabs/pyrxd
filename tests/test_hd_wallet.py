@@ -1726,11 +1726,19 @@ class TestBuildSendTxOffline:
         # Use a low fee_rate so the residual is small but the function still
         # builds; the test asserts that the dust-burning branch fires.
         # With photons=9_999_454 and fee_rate=1, fee~tx_bytes < 546 leftover.
+        #
+        # 1 photon/byte is 1/10_000 of Radiant's relay floor, so the builder now
+        # refuses it unless the caller says explicitly that they mean it. Said
+        # explicitly here: the subject is the dust-burning branch, and a rate this low
+        # is what keeps the residual predictable (at the real floor the fee moves by
+        # ~10_000 photons with a one-byte DER swing, which would swamp the 546 gap).
+        # The transaction this builds is deliberately not relayable on mainnet.
         tx = w.build_send_tx(
             triples,
             _RECIPIENT_ADDR,
             photons=9_999_500,
             fee_rate=1,
+            allow_below_relay_floor=True,
         )
         assert len(tx.outputs) == 1  # change burned
         assert tx.outputs[0].satoshis == 9_999_500

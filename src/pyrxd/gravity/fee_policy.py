@@ -162,6 +162,10 @@ class DeadlineFeePolicy:
         on Radiant, satoshis on BTC). This is *node policy* and it moves — read it
         from ``getmempoolinfo`` (``effective_minrelaytxfee``, via
         :func:`photons_per_kb_from_rxd_per_kb`) rather than trusting the default.
+        Read ``effective_minrelaytxfee``, **not** ``minrelaytxfee``: the node
+        reports both, they differ by 10x, and only the first is the one
+        ``AcceptToMemoryPool`` enforces. ``protocol_floor_per_kb`` now refuses the
+        wrong one rather than accepting it silently.
     urgency_horizon_blocks:
         Blocks-to-deadline at (or above) which no urgency premium applies. Inside
         the horizon the multiplier ramps linearly toward
@@ -179,7 +183,24 @@ class DeadlineFeePolicy:
     # (see __post_init__). Per-chain because the units differ: Radiant photons/kB vs
     # Bitcoin sats/kB. Set it to the target chain's floor when constructing a policy for
     # a chain other than Radiant.
-    protocol_floor_per_kb: int = RADIANT_MIN_RELAY_PHOTONS_PER_KB
+    #
+    # The EFFECTIVE floor (10_000_000), not the LEGACY one (1_000_000). This bound used
+    # to be the legacy rate, which made it 10x too low to catch anything real: the rate
+    # `AcceptToMemoryPool` actually enforces is `GetEffectiveMinRelayFee(height)`, and the
+    # reference mainnet node reports it as 0.10 RXD/kB. A policy at the legacy rate was
+    # accepted with no opt-out and computed `min_relay_fee(226) == 226_000` against a real
+    # requirement of 2_260_000.
+    #
+    # The trap was well-built, which is why it survived: `getmempoolinfo` reports BOTH
+    # `minrelaytxfee` (0.01) and `effective_minrelaytxfee` (0.10), so an operator wiring
+    # up the obvious field name landed exactly on the accepted-but-10x-under value, and
+    # every guard downstream agreed with them. `photons_per_kb_from_rxd_per_kb` reads a
+    # number; only this bound can say which number was the right one to read.
+    #
+    # Chains and nodes that genuinely relay lower — regtest at a tenth of this, or a
+    # chain you control — set `allow_below_protocol_floor=True`, or pass their own
+    # `protocol_floor_per_kb` (as `DEFAULT_BITCOIN_DEADLINE_FEE_POLICY` does).
+    protocol_floor_per_kb: int = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
     # Escape hatch for regtest / a chain you control. Named so that using it is a
     # deliberate, greppable act rather than a silently-accepted low rate.
     allow_below_protocol_floor: bool = False

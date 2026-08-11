@@ -90,7 +90,12 @@ Radiant FTs carry their amount as the output's photon value (1 photon =
   unprotected. Pre-split the UTXO to sell a partial amount.
 - **RXD and FT only.** NFTs (singletons) are out of scope.
 - **Explicit fee.** `accept_offer(fee=…)` takes an absolute photon fee;
-  the taker funds it.
+  the taker funds it. It is checked against Radiant's min-relay floor for the
+  **completed, signed** size before `accept_offer` returns, and refused below it —
+  an unrelayable completion commits the taker's funding inputs to a transaction no
+  node will carry, and Radiant has neither RBF nor CPFP to repair it. Pass
+  `fee_policy=` to size against a node that relays lower (regtest, or a chain you
+  control).
 
 ## Minimal example
 
@@ -112,12 +117,14 @@ offer = create_offer(
 payload = offer.to_dict()  # JSON-able; send over any transport
 
 # Taker: verify + complete + sign.
+# The fee is real: ~370 serialized bytes at Radiant's 10,000 photons/byte relay
+# floor is ~3,700,000 photons. accept_offer refuses anything under it.
 tx = accept_offer(
     SwapOffer.from_dict(payload),
     funding=[FundingInput(taker_rxd_source_tx, 0, taker_key)],
     taker_receive_pkh=taker_pkh,
     taker_change_pkh=taker_pkh,
-    fee=300,
+    fee=5_000_000,
 )
 raw = tx.serialize().hex()  # broadcast
 ```

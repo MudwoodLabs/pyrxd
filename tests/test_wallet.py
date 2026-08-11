@@ -64,9 +64,35 @@ class TestConstruction:
         assert w.fee_rate == DEFAULT_FEE_RATE == 10_000
 
     def test_custom_fee_rate(self) -> None:
+        # ABOVE the relay floor. A custom rate is honoured; a custom rate BELOW what
+        # the network relays is a different question, answered by the two tests below.
         pk = PrivateKey(_WALLET_KEY_BYTES)
-        w = RxdWallet(pk, "wss://x.example.com", fee_rate=5_000)
-        assert w.fee_rate == 5_000
+        w = RxdWallet(pk, "wss://x.example.com", fee_rate=25_000)
+        assert w.fee_rate == 25_000
+
+    def test_a_sub_floor_fee_rate_is_refused_at_construction(self) -> None:
+        """REGRESSION: ``fee_rate`` used to be validated only as ``> 0``.
+
+        Nothing downstream could catch it: ``required_fee`` binds the caller's rate
+        and only the caller's rate, and ``assert_tx_pays_for_itself`` then checks the
+        built transaction against that same rate — so every guard on the send path
+        agreed a ``fee_rate=1`` wallet was correct, and returned a transaction paying
+        1/10_000 of the mainnet floor. Radiant has neither RBF nor CPFP, so such a
+        send holds its inputs for 8 hours.
+        """
+        pk = PrivateKey(_WALLET_KEY_BYTES)
+        for rate in (1, 9_999, DEFAULT_FEE_RATE // 10):
+            with pytest.raises(ValidationError, match="relay floor"):
+                RxdWallet(pk, "wss://x.example.com", fee_rate=rate)
+
+    def test_the_sub_floor_opt_out_is_explicit_and_still_validates_the_rate(self) -> None:
+        """Regtest relays a tenth of mainnet's floor; saying so has to be possible."""
+        pk = PrivateKey(_WALLET_KEY_BYTES)
+        w = RxdWallet(pk, "wss://x.example.com", fee_rate=1_000, allow_below_relay_floor=True)
+        assert w.fee_rate == 1_000
+        # The escape hatch skips the FLOOR, not the type/positivity check.
+        with pytest.raises(ValidationError):
+            RxdWallet(pk, "wss://x.example.com", fee_rate=0, allow_below_relay_floor=True)
 
     def test_rejects_non_private_key(self) -> None:
         with pytest.raises(ValidationError):

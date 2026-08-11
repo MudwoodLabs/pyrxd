@@ -31,6 +31,7 @@ from __future__ import annotations
 
 from .fee_sizing import (
     SIG_SIZE_SLACK_BYTES,
+    assert_fee_rate_clears_relay_floor,
     assert_tx_pays_for_itself,
     relay_floor_photons_per_byte,
     required_fee,
@@ -127,7 +128,15 @@ class RxdWallet:
         ergonomic parity with ``ElectrumXClient([url])``.
     fee_rate:
         Miner fee in photons per byte. Defaults to 10_000 (the current
-        mainnet relay minimum).
+        mainnet relay minimum), and is REFUSED below it unless
+        ``allow_below_relay_floor`` says otherwise.
+    allow_below_relay_floor:
+        Accept a ``fee_rate`` under Radiant's effective relay floor. The
+        deliberate, greppable opt-out for regtest and for chains you control,
+        which legitimately relay lower — a default regtest node runs at a tenth
+        of mainnet's rate. Never a way to make a mainnet wallet stop
+        complaining: every send it builds would be refused by every node, and
+        with no RBF and no CPFP could not be repaired.
     allow_insecure:
         Pass-through to :class:`ElectrumXClient`. Only set for local dev.
     """
@@ -138,6 +147,7 @@ class RxdWallet:
         electrumx_url: str,
         fee_rate: int = DEFAULT_FEE_RATE,
         *,
+        allow_below_relay_floor: bool = False,
         allow_insecure: bool = False,
     ) -> None:
         if not isinstance(private_key, PrivateKey):
@@ -146,6 +156,21 @@ class RxdWallet:
             raise ValidationError("electrumx_url must be a non-empty string")
         if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
             raise ValidationError("fee_rate must be a positive int")
+        # The RATE is judged HERE, at construction, because nothing downstream can.
+        # `required_fee` binds the caller's rate and only the caller's rate — its
+        # `max(at_rate, protocol_floor)` cannot bind while the floor is exactly
+        # `size * 10_000` (measured: 0 differences from `size * rate` over 200_000
+        # random pairs) — and `assert_tx_pays_for_itself` then checks the built
+        # transaction against that same rate. So every guard on the send path agrees
+        # a `fee_rate=1` wallet is correct, and it is: correct at one photon per
+        # byte, which is 1/10_000 of what a node will relay. The FT builder has
+        # refused sub-floor rates all along; this is the wallet catching up.
+        assert_fee_rate_clears_relay_floor(
+            fee_rate,
+            what="RxdWallet",
+            allow_below_relay_floor=allow_below_relay_floor,
+            error_type=ValidationError,
+        )
 
         self._private_key = private_key
         self._public_key = private_key.public_key()

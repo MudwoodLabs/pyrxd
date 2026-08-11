@@ -336,12 +336,14 @@ def take_rswp_order(
     taker_receive_pkh: bytes | Hex20,
     taker_change_pkh: bytes | Hex20,
     fee: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """Verify and complete an on-chain order, returning a broadcast-ready transaction.
 
     Convenience composition of :func:`rswp_order_to_swap_offer` (advertisement
     vs chain verification) and :func:`pyrxd.swap.partial.accept_offer`
-    (signature re-verification, completion, conservation, change).
+    (signature re-verification, completion, conservation, change, and the
+    min-relay-floor gate that ``fee_policy`` parameterises).
     """
     offer = rswp_order_to_swap_offer(order, give_source_tx=give_source_tx)
     return accept_offer(
@@ -350,6 +352,7 @@ def take_rswp_order(
         taker_receive_pkh=taker_receive_pkh,
         taker_change_pkh=taker_change_pkh,
         fee=fee,
+        fee_policy=fee_policy,
     )
 
 

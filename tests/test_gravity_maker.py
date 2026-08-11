@@ -510,7 +510,13 @@ class TestCancelOffer:
         active = _make_active_offer(priv)
         # What a default regtest node advertises: a tenth of the mainnet effective floor
         # (and exactly Radiant's legacy 0.01 RXD/kB, so no opt-out flag is needed).
-        regtest = DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB)
+        regtest = DeadlineFeePolicy(
+            relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB,
+            # The LEGACY rate is now BELOW `protocol_floor_per_kb`, which defaults to the
+            # EFFECTIVE one (it used to default to the legacy rate, and so bounded nothing).
+            # A node that really relays this low is exactly the escape hatch's case.
+            allow_below_protocol_floor=True,
+        )
         session = GravityMakerSession(rxd_client=_make_mock_client("dd" * 32), maker_priv=priv, fee_policy=regtest)
         addr = self._maker_address(priv)
 

@@ -82,6 +82,7 @@ __all__ = [
     "RADIANT_MIN_RELAY_PHOTONS_PER_KB",
     "SIG_SIZE_SLACK_BYTES",
     "WITNESS_SCALE_FACTOR",
+    "assert_fee_rate_clears_relay_floor",
     "assert_pays_for_its_size",
     "assert_tx_pays_for_itself",
     "bitcoin_virtual_size",
@@ -243,12 +244,36 @@ def _check_rate(fee_rate: int) -> None:
 def required_fee(size_bytes: int, fee_rate: int) -> int:
     """Photons a ``size_bytes`` transaction must pay at ``fee_rate`` photons/byte.
 
-    Binds BOTH floors — the caller's rate and the chain's — except that a
-    ``fee_rate`` already below the protocol floor is read as a deliberate opt-out
-    (regtest, or a chain the caller controls) and only the caller's rate binds. See
-    the module docstring for why that opt-out is not a hole: raising a regtest fee
-    to the mainnet floor would make every node-level proof of this code vacuous,
-    since the node could then never reject anything it built.
+    **This binds the caller's rate and NOTHING ELSE.** Read that literally before
+    relying on it — an earlier version of this docstring said it "binds BOTH
+    floors", and that claim was false in the only direction that matters.
+
+    The ``max`` below cannot raise anything at the current constants.
+    ``RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`` is 10_000_000, an exact multiple
+    of 1000, so ``min_relay_fee(size) == size * 10_000`` with no rounding — and the
+    branch is only reached when ``fee_rate >= 10_000``, where ``size * fee_rate`` is
+    already ``>=`` that. Measured: **0 differences from ``size * fee_rate`` over
+    200_000 random (size, rate) pairs**, and 0 over an exhaustive sweep of
+    ``size`` 1..2999 against every rate within 3 of the floor. The ``max`` is kept
+    because it stops being dead the moment the per-kB constant is not a multiple of
+    1000 (``fee_for_kb_rate`` rounds up while ``relay_floor_photons_per_byte``
+    rounds down), not because it is doing work today.
+
+    So the protocol floor is enforced here *only* by the caller having chosen a
+    ``fee_rate`` at or above it. A sub-floor rate is passed straight through, on the
+    reading that it is a deliberate opt-out (regtest, or a chain the caller
+    controls) — see the module docstring for why raising it instead would make
+    every node-level proof of this code vacuous.
+
+    That opt-out is only safe where ``fee_rate`` is trusted. It is a HOLE anywhere
+    the rate can arrive unvalidated: ``required_fee(226, 1)`` is 226 photons against
+    a mainnet requirement of 2_260_000, a factor of 10_000, and every downstream
+    assertion built on this function agrees the result is fine. Callers must
+    therefore gate the RATE themselves —
+    :func:`assert_fee_rate_clears_relay_floor` at the entry point, or
+    :func:`fee_never_below_relay_floor` in place of this function — rather than
+    expecting this to catch it. ``pyrxd.wallet`` and ``pyrxd.hd.wallet`` do the
+    former; ``pyrxd.cli.swap_book_cmds`` does the latter.
     """
     _check_rate(fee_rate)
     floor = min_relay_fee(size_bytes)  # also validates size_bytes
@@ -256,6 +281,46 @@ def required_fee(size_bytes: int, fee_rate: int) -> int:
     if fee_rate < relay_floor_photons_per_byte():
         return at_rate
     return max(at_rate, floor)
+
+
+def assert_fee_rate_clears_relay_floor(
+    fee_rate: int,
+    *,
+    what: str,
+    allow_below_relay_floor: bool = False,
+    error_type: type[Exception] = ValueError,
+) -> int:
+    """Refuse a per-byte fee rate the network will not relay. Returns the rate.
+
+    The one implementation of "is this rate even viable", shared by every builder
+    that takes a ``fee_rate`` from a caller. It exists because :func:`required_fee`
+    does **not** do this (see its docstring): a builder that validates only
+    ``fee_rate > 0`` and then sizes with :func:`required_fee` will happily return a
+    transaction 10_000x under the mainnet floor, and every guard downstream of it
+    will agree the transaction is correct — because it is, at the rate it was asked
+    for. The rate is the thing that has to be judged, and it can only be judged
+    here, before any bytes exist.
+
+    Radiant has neither RBF nor CPFP, so a sub-floor transaction cannot be bumped
+    by any means: it squats on its own inputs until mempool expiry, 8 hours later.
+    That makes a sub-floor rate a fund-safety bug rather than a tuning mistake,
+    which is why this refuses instead of warning.
+
+    ``allow_below_relay_floor`` is the deliberate, greppable escape hatch — named
+    the same way as :attr:`~pyrxd.gravity.fee_policy.DeadlineFeePolicy.allow_below_protocol_floor`
+    — for regtest and for chains the caller controls, which legitimately relay
+    lower. It only skips the FLOOR; the rate still has to be a positive int.
+    """
+    _check_rate(fee_rate)
+    floor_per_byte = relay_floor_photons_per_byte()
+    if allow_below_relay_floor or fee_rate >= floor_per_byte:
+        return fee_rate
+    raise error_type(
+        f"{what}: fee_rate must be >= {floor_per_byte} photons/byte (Radiant's effective relay floor of "
+        f"{floor_per_byte * 1000} per kB), got {fee_rate}. A transaction built "
+        "below the floor will not relay, and Radiant has no RBF and no CPFP — it cannot be "
+        "fee-bumped and will hold its inputs until mempool expiry."
+    )
 
 
 def fee_never_below_relay_floor(size_bytes: int, fee_rate: int) -> int:

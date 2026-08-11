@@ -512,8 +512,11 @@ class TestThePolicyIsInjectable:
     def test_maker_offer_accepts_a_lower_regtest_rate(self):
         pk = _maker()
         offer = _offer(pk)
-        # Radiant's legacy floor, 1/10th the post-2.0 effective one.
-        low = DeadlineFeePolicy(relay_fee_per_kb=1_000_000)
+        # Radiant's legacy floor, 1/10th the post-2.0 effective one — and therefore now
+        # BELOW `protocol_floor_per_kb`, which used to be that same legacy rate and so
+        # bound nothing. Pointing at a node that really relays this low is legitimate,
+        # and the explicit escape hatch is how you say so.
+        low = DeadlineFeePolicy(relay_fee_per_kb=1_000_000, allow_below_protocol_floor=True)
         built = _build_offer_tx(pk, offer, 250_000, fee_policy=low)
         assert built.fee_sats == 250_000
         # ...and the same fee is still refused under the mainnet default.
@@ -523,7 +526,7 @@ class TestThePolicyIsInjectable:
     def test_maker_offer_still_refuses_below_the_injected_rate(self):
         pk = _maker()
         offer = _offer(pk)
-        low = DeadlineFeePolicy(relay_fee_per_kb=1_000_000)
+        low = DeadlineFeePolicy(relay_fee_per_kb=1_000_000, allow_below_protocol_floor=True)
         with pytest.raises(InsufficientFundsError):
             _build_offer_tx(pk, offer, 1_000, fee_policy=low)
 

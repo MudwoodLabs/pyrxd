@@ -13,6 +13,7 @@ import pytest
 from pyrxd.constants import SIGHASH
 from pyrxd.glyph.script import build_ft_locking_script, extract_ref_from_ft_script, is_ft_script
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
@@ -34,6 +35,16 @@ from pyrxd.swap.rswp import (
 )
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
+
+# These fixtures work in TOY photon values (hundreds or a few thousand, not the millions
+# a real Radiant fee costs), so their fees sit far below the chain's relay floor by
+# design: what they test is conservation arithmetic, signature binding and parsing, not
+# fee sizing. Those builders now GATE `fee` against that floor, so the opt-out is stated
+# here explicitly rather than left implicit. The floor itself is proven offline in
+# tests/test_swap_and_nft_fee_floors.py and at a real node in
+# tests/test_fee_floor_boundary_regtest_e2e.py.
+_TOY_FEE_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+
 
 _REF_G = GlyphRef(txid=Txid("aa" * 32), vout=0)  # token the maker gives
 _REF_R = GlyphRef(txid=Txid("bb" * 32), vout=1)  # token the maker wants
@@ -96,6 +107,7 @@ def test_post_take_rxd_for_ft_full_loop() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert _classify(tx.outputs[0]) == ("ft", 50, _REF_R)  # maker's demand, index 0 (SINGLE)
     assert _classify(tx.outputs[1]) == ("rxd", 1000, None)  # taker receives the offered RXD
@@ -120,6 +132,7 @@ def test_post_take_ft_for_rxd_full_loop() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=200,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert _classify(tx.outputs[0]) == ("rxd", 900, None)
     assert _classify(tx.outputs[1]) == ("ft", 777, _REF_G)
@@ -232,6 +245,7 @@ def test_tampered_demanded_value_breaks_maker_signature() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
