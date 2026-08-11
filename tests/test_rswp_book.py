@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pyrxd.glyph.script import build_ft_locking_script
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
@@ -24,6 +25,16 @@ from pyrxd.swap.rswp import (
 )
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
+
+# These fixtures work in TOY photon values (hundreds or a few thousand, not the millions
+# a real Radiant fee costs), so their fees sit far below the chain's relay floor by
+# design: what they test is conservation arithmetic, signature binding and parsing, not
+# fee sizing. Those builders now GATE `fee` against that floor, so the opt-out is stated
+# here explicitly rather than left implicit. The floor itself is proven offline in
+# tests/test_swap_and_nft_fee_floors.py and at a real node in
+# tests/test_fee_floor_boundary_regtest_e2e.py.
+_TOY_FEE_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+
 
 _REF = GlyphRef(txid=Txid("cd" * 32), vout=0)
 
@@ -120,6 +131,7 @@ async def test_open_verified_order_is_fillable_end_to_end() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=200,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert tx.outputs[0].satoshis == 900
 

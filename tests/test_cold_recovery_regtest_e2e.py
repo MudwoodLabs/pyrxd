@@ -141,7 +141,12 @@ def _node_policy(rt: _RegtestNode) -> DeadlineFeePolicy:
     boundary case below can claim to be measuring the node's real floor.
     """
     rate = photons_per_kb_from_rxd_per_kb(float(rt.cli("getmempoolinfo")["effective_minrelaytxfee"]))
-    return DeadlineFeePolicy(relay_fee_per_kb=rate)
+    # `allow_below_protocol_floor` because that reading IS below the protocol floor:
+    # `protocol_floor_per_kb` now defaults to the EFFECTIVE mainnet rate (it used to
+    # default to the legacy one, which was 10x too low to bound anything), and a
+    # default regtest node advertises a tenth of it. Pointing at a node that really
+    # relays this low is exactly what the escape hatch is for.
+    return DeadlineFeePolicy(relay_fee_per_kb=rate, allow_below_protocol_floor=True)
 
 
 def _funded_covenant(rt: _RegtestNode, *, refund_csv: int = _REFUND_CSV):

@@ -94,8 +94,17 @@ _UNUSED_URL = "wss://unused.invalid"  # no network call is made by the builders
 
 def _wallet(fee_rate: int = DEFAULT_FEE_RATE) -> RxdWallet:
     """A wallet on a freshly generated key. Never a hard-coded key: weak inline
-    test keys in this repo were once swept by a live bot."""
-    return RxdWallet(PrivateKey(), _UNUSED_URL, fee_rate=fee_rate)
+    test keys in this repo were once swept by a live bot.
+
+    ``allow_below_relay_floor`` because every case here builds at the rate THIS NODE
+    advertises (``_relay_floor``), which on a default regtest node is a tenth of the
+    mainnet floor the constructor otherwise demands. That is the case the opt-out
+    exists for, and building at the node's own rate is what makes the node the oracle
+    for its own policy — the whole point of these cases. The mainnet-floor boundary
+    is proven separately, on a node started at ``-minrelaytxfee=0.10``, in
+    ``tests/test_fee_floor_boundary_regtest_e2e.py``.
+    """
+    return RxdWallet(PrivateKey(), _UNUSED_URL, fee_rate=fee_rate, allow_below_relay_floor=True)
 
 
 def _spk(address: str) -> bytes:

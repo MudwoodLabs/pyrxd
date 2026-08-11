@@ -76,8 +76,15 @@ def _coin(i: int, value: int = 200_000_000) -> UtxoRecord:
 
 
 def _wallet(fee_rate: int) -> RxdWallet:
-    """A wallet on a freshly generated key — never a hard-coded one."""
-    return RxdWallet(PrivateKey(), _URL, fee_rate=fee_rate)
+    """A wallet on a freshly generated key — never a hard-coded one.
+
+    ``allow_below_relay_floor`` because ``_RATES`` deliberately includes 1_000, a
+    tenth of the mainnet floor, to prove the sizing is not tuned to one rate. The
+    constructor otherwise refuses sub-floor rates outright (see
+    ``TestTheRateItselfIsJudged``); this is the explicit opt-out that refusal exists
+    to make deliberate.
+    """
+    return RxdWallet(PrivateKey(), _URL, fee_rate=fee_rate, allow_below_relay_floor=True)
 
 
 def _shortfall(tx: Transaction, fee_rate: int) -> int:

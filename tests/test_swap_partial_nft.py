@@ -12,6 +12,7 @@ import pytest
 
 from pyrxd.glyph.script import build_nft_locking_script, extract_owner_pkh_from_nft_script, is_nft_script
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
@@ -21,6 +22,16 @@ from pyrxd.swap import Asset, FundingInput, SwapOffer, accept_offer, create_offe
 from pyrxd.swap.rswp import build_cancel_tx, create_rswp_order, decode_rswp_order, take_rswp_order
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
+
+# These fixtures work in TOY photon values (hundreds or a few thousand, not the millions
+# a real Radiant fee costs), so their fees sit far below the chain's relay floor by
+# design: what they test is conservation arithmetic, signature binding and parsing, not
+# fee sizing. Those builders now GATE `fee` against that floor, so the opt-out is stated
+# here explicitly rather than left implicit. The floor itself is proven offline in
+# tests/test_swap_and_nft_fee_floors.py and at a real node in
+# tests/test_fee_floor_boundary_regtest_e2e.py.
+_TOY_FEE_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+
 
 _NFT_REF = GlyphRef(txid=Txid("aa" * 32), vout=0)
 _NFT_REF2 = GlyphRef(txid=Txid("bb" * 32), vout=1)
@@ -69,6 +80,7 @@ def test_nft_for_rxd() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert tx.outputs[0].satoshis == 5_000  # maker's RXD demand
     nft_out = tx.outputs[1].locking_script.serialize()
@@ -94,6 +106,7 @@ def test_rxd_for_nft() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     out0 = tx.outputs[0].locking_script.serialize()
     assert is_nft_script(out0.hex()) and bytes(extract_owner_pkh_from_nft_script(out0)) == mk_pkh
@@ -121,6 +134,7 @@ def test_nft_for_ft() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert _out_kinds(tx).count("nft") == 1  # the singleton moved, exactly once
 
@@ -145,6 +159,7 @@ def test_taker_missing_demanded_nft_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -170,6 +185,7 @@ def test_wrong_nft_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -195,6 +211,7 @@ def test_stray_nft_funding_would_burn_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=300,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -216,6 +233,7 @@ def test_nft_carrier_value_mismatch_is_not_the_singleton() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert tx.outputs[0].satoshis == 600  # signature-bound demand honored
     total_in = 5_000 + 550 + 2_000
@@ -246,6 +264,7 @@ def test_rswp_nft_order_full_loop() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=300,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert _out_kinds(tx).count("nft") == 1
 
@@ -263,6 +282,7 @@ def test_rswp_nft_cancel_returns_singleton() -> None:
         # Radiant's relay floor for this shape — the old 300-photon fee built a cancel no
         # node would relay, which for the ONLY revocation mechanism is a fund-safety bug.
         fee=5_000_000,
+        fee_policy=_TOY_FEE_POLICY,
         funding=[FundingInput(_rxd_src(mk_pkh, 10_000_000), 0, mk)],
     )
     out0 = tx.outputs[0].locking_script.serialize()

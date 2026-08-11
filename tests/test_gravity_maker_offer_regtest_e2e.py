@@ -188,6 +188,9 @@ class TestMakerOfferOnConsensus:
             funding_photons=result.output_photons,
             fee_sats=_FEE,
             taker_privkey=taker.material,
+            # `_FEE` is sized for THIS node (a tenth of the mainnet floor); the guard
+            # defaults to mainnet's, so it has to be told which node it is judging.
+            fee_policy=_node_policy(node),
         )
         res = node.accepts(claim.tx_hex)
         assert res.get("allowed") is True, f"the deployed offer could not be TAKEN: {res}"
@@ -251,6 +254,7 @@ class TestMakerOfferOnConsensus:
             funding_photons=result.output_photons,
             fee_sats=_FEE,
             taker_privkey=stranger.material,
+            fee_policy=_node_policy(node),
         )
         res = node.accepts(forged.tx_hex)
         assert res.get("allowed") is False, f"consensus let a STRANGER take the offer: {res}"
@@ -267,6 +271,9 @@ class TestMakerOfferOnConsensus:
             funding_photons=result.output_photons,
             fee_sats=_FEE,
             taker_privkey=taker.material,
+            # `_FEE` is sized for THIS node (a tenth of the mainnet floor); the guard
+            # defaults to mainnet's, so it has to be told which node it is judging.
+            fee_policy=_node_policy(node),
         )
         assert node.accepts(good.tx_hex).get("allowed") is True
 
@@ -342,9 +349,32 @@ class TestMakerOfferOnConsensus:
         assert at_floor is not None, "no offer tx reached a fee equal to its own relay floor"
         assert under is not None, "could not build a same-size transaction one photon under the floor"
 
-        # The guard itself refuses that transaction.
-        with pytest.raises(InsufficientFundsError):
-            _deploy(node, maker, taker, fee=under.fee_sats, policy=policy)
+        # The guard itself refuses that fee. Stated in two parts, because a single
+        # `pytest.raises(_deploy(fee=under.fee_sats))` is NOT a deterministic
+        # assertion and was failing roughly one run in four: `_deploy` spends a fresh
+        # funding UTXO, so the rebuild re-rolls its own DER length, and a rebuild that
+        # comes out SMALLER legitimately clears its own floor at this fee — the guard
+        # allowing it is correct, not a miss. (Same failure mode as the covenant
+        # boundary search in tests/test_fee_floor_boundary_regtest_e2e.py, which
+        # avoids it by holding the state fixed across the pair.)
+        #
+        # (a) Deterministic, on the bytes actually in hand: the guard's own condition
+        #     holds for this transaction at this size.
+        assert under.fee_sats < policy.min_relay_fee(under.tx_size)
+        # (b) Reached through the public builder: over several rebuilds at that fee,
+        #     at least one must be refused, and anything RETURNED must clear its own
+        #     floor — so no build slips through underpaying.
+        refused = 0
+        for _ in range(12):
+            try:
+                _o, rebuilt = _deploy(node, maker, taker, fee=under.fee_sats, policy=policy)
+            except InsufficientFundsError:
+                refused += 1
+                continue
+            assert rebuilt.fee_sats >= policy.min_relay_fee(rebuilt.tx_size), (
+                f"the guard returned an underpaying offer: {rebuilt.fee_sats} for {rebuilt.tx_size} bytes"
+            )
+        assert refused > 0, "12 rebuilds at a sub-floor fee and the guard refused none of them"
 
         res = node.accepts(under.tx_hex)
         assert res.get("allowed") is False, f"the node ACCEPTED one photon under its own floor: {res}"

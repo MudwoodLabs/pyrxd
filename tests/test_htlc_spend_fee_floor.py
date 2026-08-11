@@ -229,7 +229,9 @@ def test_a_realistic_fee_input_builds_normally():
 def test_the_requirement_tracks_the_injected_rate_not_a_hardcoded_constant():
     # The node's effective_minrelaytxfee is POLICY and can move. A caller pointing at
     # a node with a different rate gets a different requirement, with no code change.
-    cheap = DeadlineFeePolicy(relay_fee_per_kb=1_000_000)  # 0.01 RXD/kB (minrelaytxfee)
+    # 0.01 RXD/kB — the LEGACY minrelaytxfee, a tenth of what the chain now enforces, so
+    # it needs the explicit escape hatch (the protocol bound is the EFFECTIVE rate now).
+    cheap = DeadlineFeePolicy(relay_fee_per_kb=1_000_000, allow_below_protocol_floor=True)
     tx = build_htlc_claim_tx(
         covenant=_rxd_cov(),
         covenant_outpoint=_OUTPOINT,

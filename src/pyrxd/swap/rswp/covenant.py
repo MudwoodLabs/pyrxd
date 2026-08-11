@@ -46,6 +46,8 @@ asset classification, as before).
 from __future__ import annotations
 
 from ...constants import SIGHASH
+from ...fee_sizing import radiant_relay_size
+from ...gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy, assert_fee_covers
 from ...gravity.swap_order import DemandedOutput
 from ...keys import PrivateKey, PublicKey
 from ...script.script import Script
@@ -177,6 +179,50 @@ def _build_ft_change(ref, amount: int, pkh: bytes) -> TransactionOutput:
     return TransactionOutput(Script(build_ft_locking_script(Hex20(pkh), ref)), amount)
 
 
+# --------------------------------------------------------------------------- the fee gate
+
+
+def _assert_relayable(tx: Transaction, fee: int, policy: DeadlineFeePolicy | None, what: str) -> None:
+    """Refuse to return a v3 covenant transaction the node will not relay.
+
+    Every builder in this module took ``fee`` on trust and checked only ``fee >= 0``.
+    They are exported public API (``pyrxd.swap.rswp``), and the only thing standing
+    between a caller and an unrelayable transaction was
+    :func:`pyrxd.cli.swap_book_cmds._assert_relayable` — which an SDK consumer never
+    runs. ``examples/rswp_orderbook_demo.py`` passes ``fee=300``; a ~230-byte spend
+    needs ~2_300_000 photons at the mainnet floor.
+
+    The reasoning that put this same gate on the v2 sibling
+    (:func:`pyrxd.swap.rswp.orders.build_cancel_tx`) applies here with higher stakes:
+    **cancel is the only hard revocation there is.** Until it confirms, every copy of
+    the signed advert stays fillable at the original price — so a cancel returned
+    below the relay floor never enters a mempool, cannot be replaced (no RBF) or
+    bumped by a child (no CPFP), and the caller has been handed a transaction and a
+    txid and told the order was revoked while it is still takeable. That is a silent
+    fund-safety failure, not a stuck transaction. Here the value at stake is a
+    *reservation covenant* rather than a bare UTXO, and the refund branch is
+    CLTV-gated, so the maker's fallback is time-locked as well.
+
+    Sized from the **signed** bytes, and from the bytes AFTER the branch selector is
+    appended where there is one: :func:`_append_selector` adds to the scriptSig after
+    ``sign()``, and the node charges its floor against ``GetTotalSize()``.
+
+    ``policy`` defaults to :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`
+    (the reference mainnet node's 0.10 RXD/kB effective rate). Callers that
+    legitimately run lower — regtest, or the CLI's deliberately sub-floor trial
+    passes in :func:`~pyrxd.cli.swap_book_cmds._build_at_measured_fee` — pass their
+    own, exactly as the v2 builder already allows.
+    """
+    assert_fee_covers(
+        fee_value=fee,
+        size_bytes=radiant_relay_size(tx.serialize()),
+        policy=policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
+        blocks_to_deadline=None,
+        what=what,
+        unit="photons",
+    )
+
+
 # --------------------------------------------------------------------------- maker: reserve + post
 
 
@@ -188,6 +234,7 @@ def prepare_covenant_offer(
     expiry_height: int,
     change_pkh: bytes | Hex20,
     fee: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """Reserve *photons* of RXD into the refund covenant at output 0 (the v3 ``prepare_offered_utxo``).
 
@@ -195,6 +242,12 @@ def prepare_covenant_offer(
     plain-RXD UTXOs. The covenant guarantees the maker's reclaim at
     *expiry_height* even if they lose the advert — but see the module
     docstring: it does NOT make late fills invalid.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee`` is below the node's min-relay floor for the transaction's real,
+        signed size — see :func:`_assert_relayable`.
     """
     if photons < _DUST_PHOTONS:
         # A reservation below the dust floor produces an unspendable (node-rejected) covenant UTXO the
@@ -230,6 +283,7 @@ def prepare_covenant_offer(
     if change >= _DUST_PHOTONS:
         tx.add_output(TransactionOutput(P2PKH().lock(bytes(change_pkh)), change))
     tx.sign(bypass=True)
+    _assert_relayable(tx, fee, fee_policy, "RSWP v3 covenant reservation (prepare_covenant_offer)")
     return tx
 
 
@@ -324,6 +378,7 @@ def take_covenant_order(
     taker_change_pkh: bytes | Hex20,
     fee: int,
     current_height: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """Verify and complete a v3 covenant order (SWAP branch, ``OP_1`` selector appended).
 
@@ -341,6 +396,12 @@ def take_covenant_order(
     the maker, any FT surplus returns to ``taker_change_pkh``, and funding
     carrying any OTHER token (different FT ref, or an NFT) is refused rather
     than burned or stranded.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee`` is below the node's min-relay floor for the completed,
+        signed, selector-appended size — see :func:`_assert_relayable`.
     """
     from ..partial import _asset_of, _parse_p2pkh_scriptsig
 
@@ -477,6 +538,10 @@ def take_covenant_order(
     # signature re-verification is possible (the scriptSig is 3-push now), and
     # none is needed — the sighash never covers scriptSig bytes.
     _append_selector(tx, 0, SWAP_SELECTOR)
+    # AFTER the selector: it is scriptSig data and the relay floor is charged
+    # against GetTotalSize(), so gating before this would size the fee against
+    # bytes the node does not see.
+    _assert_relayable(tx, fee, fee_policy, "RSWP v3 covenant take (take_covenant_order)")
     return tx
 
 
@@ -490,6 +555,7 @@ def build_covenant_refund_tx(
     maker_key: PrivateKey,
     refund_pkh: bytes | Hex20,
     fee: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """The maker's at/after-expiry reclaim (REFUND branch, ``OP_0`` selector).
 
@@ -497,6 +563,15 @@ def build_covenant_refund_tx(
     inside the signed preimage). Broadcast at/after expiry; earlier the node
     rejects it as non-final. REMEMBER: the resulting txid is third-party
     malleable via the selector — track the covenant OUTPOINT, not this txid.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee`` is below the node's min-relay floor for the signed,
+        selector-appended size — see :func:`_assert_relayable`. An unrelayable
+        refund is the maker's *last* exit failing silently: the SWAP branch stays
+        valid forever, so a late taker can still fill while the maker believes
+        the value has been reclaimed.
     """
     if fee < 0:
         raise ValidationError("fee must be non-negative")
@@ -522,6 +597,7 @@ def build_covenant_refund_tx(
     tx.add_output(TransactionOutput(P2PKH().lock(bytes(refund_pkh)), value))
     tx.sign(bypass=True)
     _append_selector(tx, 0, REFUND_SELECTOR)
+    _assert_relayable(tx, fee, fee_policy, "RSWP v3 covenant refund (build_covenant_refund_tx)")
     return tx
 
 
@@ -532,12 +608,22 @@ def build_covenant_cancel_tx(
     maker_key: PrivateKey,
     refund_pkh: bytes | Hex20,
     fee: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """Cancel BEFORE expiry via the SWAP branch (``OP_1``) — the maker self-fills.
 
     Works at any height (the swap branch has no timelock); this is the v3
     equivalent of the v2 cancel self-spend and the right move when the maker
     wants out before the refund window opens.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee`` is below the node's min-relay floor for the signed,
+        selector-appended size. **This is the one that matters most** — cancel is
+        the only hard revocation, so an unrelayable one leaves the reservation
+        takeable while the caller has been told it was revoked. See
+        :func:`_assert_relayable`.
     """
     if fee < 0:
         raise ValidationError("fee must be non-negative")
@@ -562,4 +648,5 @@ def build_covenant_cancel_tx(
     tx.add_output(TransactionOutput(P2PKH().lock(bytes(refund_pkh)), value))
     tx.sign(bypass=True)
     _append_selector(tx, 0, SWAP_SELECTOR)
+    _assert_relayable(tx, fee, fee_policy, "RSWP v3 covenant cancel (the only hard revocation)")
     return tx

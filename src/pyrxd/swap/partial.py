@@ -34,8 +34,10 @@ transactions an offer references, see :mod:`pyrxd.swap.resolve`.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from ..constants import SIGHASH
+from ..fee_sizing import radiant_relay_size
 from ..glyph.script import (
     build_ft_locking_script,
     build_nft_locking_script,
@@ -55,6 +57,9 @@ from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
 from ..transaction.transaction_output import TransactionOutput
 from .types import Asset, SwapOffer, SwapTerms
+
+if TYPE_CHECKING:  # pragma: no cover - typing only (runtime import is deferred, see accept_offer)
+    from ..gravity.fee_policy import DeadlineFeePolicy
 
 # Photons below this are not worth a standalone change output; fold into fee.
 # (Token/FT change is always emitted regardless — it carries token value.)
@@ -240,6 +245,7 @@ def accept_offer(
     taker_receive_pkh: bytes | Hex20,
     taker_change_pkh: bytes | Hex20,
     fee: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """Complete and sign a maker's offer, returning a broadcast-ready transaction.
 
@@ -255,8 +261,28 @@ def accept_offer(
     * Token conservation is enforced per FT ref; RXD change goes to the
       taker. The taker receives the maker's given asset in output[1].
 
-    ``fee`` is the absolute fee in photons; the taker funds it.
+    ``fee`` is the absolute fee in photons; the taker funds it, and it is checked
+    against the node's min-relay floor for the **completed, signed** size before
+    this returns. It used to be taken on trust (``fee >= 0``, in
+    ``_balance_and_add_change``), which on the taker's side means paying for the
+    maker's asset in a transaction no node will relay — and Radiant has neither RBF
+    nor CPFP, so the taker's funding UTXOs are then held until mempool expiry with
+    nothing received.
+
+    ``fee_policy`` overrides the rate that floor is derived from, defaulting to
+    :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`; regtest
+    callers and the CLI's deliberately sub-floor sizing passes pass their own.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee`` is below that floor.
     """
+    # Deferred: pyrxd.gravity.__init__ pulls in the hd/btc/eth wallet stack, and
+    # pyrxd.swap.rswp.orders already imports THIS module. Module-scope would close
+    # the cycle. (pyrxd.fee_sizing itself is a leaf and is imported at the top.)
+    from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, assert_fee_covers
+
     if not funding:
         raise ValidationError("at least one funding input is required")
     taker_recv_pkh = bytes(taker_receive_pkh)
@@ -330,6 +356,16 @@ def accept_offer(
     if partial.outputs[0].serialize() != maker_output_0:
         raise ValidationError("internal error: maker receive output changed during accept")
     _verify_owner_signature(partial, 0)
+    # Post-SIGNING relay-floor gate, on the real serialized size — the DER
+    # signatures are 69-71 bytes each and only exist now.
+    assert_fee_covers(
+        fee_value=fee,
+        size_bytes=radiant_relay_size(partial.serialize()),
+        policy=fee_policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
+        blocks_to_deadline=None,
+        what="swap accept_offer (the taker pays for the maker's asset in this transaction)",
+        unit="photons",
+    )
     return partial
 
 

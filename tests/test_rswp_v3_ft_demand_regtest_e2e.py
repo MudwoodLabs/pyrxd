@@ -20,7 +20,7 @@ from pyrxd.glyph.script import is_ft_script
 from pyrxd.keys import PrivateKey
 from pyrxd.swap import Asset, FundingInput
 from pyrxd.swap.rswp import create_covenant_order, decode_rswp_order, prepare_covenant_offer, take_covenant_order
-from tests.test_rswp_regtest_e2e import _FEE, _fund_key, _mint_ft, _Node
+from tests.test_rswp_regtest_e2e import _FEE, _NODE_POLICY, _fund_key, _mint_ft, _Node
 from tests.test_rswp_regtest_e2e import node as node
 
 pytestmark = pytest.mark.integration
@@ -44,6 +44,7 @@ async def test_v3_ft_demand_fill_conserves_on_chain(node) -> None:
         expiry_height=_tip(node) + 60,
         change_pkh=mk_pkh,
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     node.send_and_mine(reservation)
     post = create_covenant_order(
@@ -64,6 +65,7 @@ async def test_v3_ft_demand_fill_conserves_on_chain(node) -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
         current_height=_tip(node),
     )
     verdict = node.accepts(completion.serialize().hex())

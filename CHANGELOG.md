@@ -24,6 +24,75 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   clean MultiTxOutV1" `None`, preserving `parse_price_terms_lenient`'s never-raises contract
   (caught by the existing parser fuzz test).
 
+- **`GlyphBuilder.build_nft_transfer_tx` under-fee'd roughly a quarter of NFT transfers,
+  below the mainnet relay floor.** It sized the fee from the **trial** signing pass
+  (`fee = size * fee_rate`, `glyph/builder.py`), with no per-input signature headroom, no
+  re-measurement of the final transaction, and no floor check on `fee_rate` — byte for byte
+  the defect already fixed in `wallet.py` / `hd/wallet.py`. The two passes sign different
+  messages, so their DER signatures differ in length (69/70/71 bytes); whenever the final one
+  came out longer, the transaction paid for fewer bytes than it contained. Measured over
+  **3000 builds on fresh keys at the default rate: 746 (24.9%) short by 1-2 bytes; 0/3000
+  after the fix.** Signing is deterministic (RFC 6979), so an affected transfer is short on
+  *every* retry — it is a property of that NFT and that recipient, not a flake. The default
+  rate *is* the mainnet floor, and Radiant has neither RBF nor CPFP, so such a transfer
+  cannot be bumped and holds the NFT's own UTXO until mempool expiry, 8 hours later.
+
+  Proven on a regtest node started at `-minrelaytxfee=0.10` — **the mainnet floor**, which is
+  also the rate the builder defaults to. Before the fix, 2 of 12 real singleton transfers were
+  refused there with `66: min relay fee not met`; with the headroom removed, 7 of 30. The
+  existing NFT regtest coverage could not see this because a default regtest node advertises
+  a tenth of the built rate, where a 1-2 byte shortfall is structurally invisible; and
+  `tests/test_glyph_transfer.py` built one transaction from one hard-coded key, which lands
+  safe permanently. The fee now uses `fee_sizing.trial_size_with_slack` +
+  `required_fee`, the final signed transaction is re-measured with
+  `assert_pays_for_its_size`, and `fee_rate` is refused below the relay floor. New
+  corpus in `tests/test_swap_and_nft_fee_floors.py` (many fresh keys, plus a differential
+  that removes the headroom and requires the builds to start failing) and
+  `tests/test_fee_floor_boundary_regtest_e2e.py` (the node, at the mainnet floor).
+
+- **The RSWP v3 covenant builders and `swap.partial.accept_offer` took `fee` on trust.**
+  `prepare_covenant_offer`, `take_covenant_order`, `build_covenant_refund_tx`,
+  `build_covenant_cancel_tx` and `accept_offer` validated only `fee >= 0` while being
+  exported public API; the only thing between an SDK consumer and an unrelayable transaction
+  was the CLI's own `_assert_relayable`, which a library caller never runs.
+  `examples/rswp_orderbook_demo.py` passed `fee=300` for a ~457-byte transaction whose floor
+  is 4,570,000 photons. Each now runs the same post-signing `assert_fee_covers` gate that
+  #411 put on the v2 sibling `rswp.build_cancel_tx`, for the same reason and higher stakes:
+  **cancel is the only hard revocation**, so an unrelayable one leaves the reservation
+  takeable at the advertised price while the caller has been handed a txid and told it was
+  revoked. The size is measured **after** `_append_selector`, because the branch selector is
+  scriptSig data and Radiant charges its floor against `GetTotalSize()`. All five (and
+  `take_rswp_order`) accept `fee_policy=` for a node that relays lower; the CLI passes its
+  existing `_SIZING_TRIAL_POLICY` on the deliberately sub-floor sizing passes. Boundary
+  proven at a node for cancel and refund: one photon under → `66: min relay fee not met`,
+  exactly at the floor → accepted.
+
+- **`DeadlineFeePolicy.protocol_floor_per_kb` defaulted to the LEGACY relay rate**
+  (`RADIANT_MIN_RELAY_PHOTONS_PER_KB`, 1_000_000) rather than the effective one
+  (10_000_000) that `AcceptToMemoryPool` enforces, making the guard 10x too low to catch
+  anything real: `DeadlineFeePolicy(relay_fee_per_kb=1_000_000)` was accepted with no opt-out
+  and computed `min_relay_fee(226) == 226_000` against a mainnet requirement of 2_260_000.
+  The trap was well built — `getmempoolinfo` reports **both** `minrelaytxfee` (0.01) and
+  `effective_minrelaytxfee` (0.10), so an operator wiring up the obvious field name landed
+  exactly on the accepted-but-10x-under value. The bound is now the effective rate;
+  `allow_below_protocol_floor=True` remains for regtest and chains that genuinely relay
+  lower, and the four fixtures that were encoding the legacy rate now say so explicitly.
+
+- **`fee_sizing.required_fee`'s docstring claimed a guarantee the code does not provide.**
+  It said "Binds BOTH floors"; its `max(size * rate, protocol_floor)` cannot bind at the
+  current constants, because the floor is exactly `size * 10_000` and the branch is only
+  reached when `rate >= 10_000` — verified as **0 differences from `size * rate` over 200,000
+  random (size, rate) pairs**, and over an exhaustive sweep near the floor. `RxdWallet` and
+  `HdWallet` relied on it while validating `fee_rate` only as `> 0`, so
+  `RxdWallet(pk, url, fee_rate=1)` passed every guard on the send path and returned a
+  transaction paying 1/10_000 of the mainnet floor — correctly, at the rate it was asked for.
+  The docstring now states what the function actually binds and names the hole; both wallets
+  gate the RATE at their entry point through the new shared
+  `fee_sizing.assert_fee_rate_clears_relay_floor` (which `glyph.ft._check_fee_rate` and the
+  NFT transfer builder also use, so there is one implementation), with an explicit
+  `allow_below_relay_floor=` opt-out for regtest. `glyph/builder.py`'s hardcoded
+  `MIN_FEE_RATE = 10_000` literal is now derived from the same constant.
+
 - **The watchtower's claim detection read `spent` through Python truthiness, so an
   already-claimed BTC HTLC could read as unclaimed.** `mempool_space_outspend` used
   `bool(data.get("spent"))` — the same defect as the fixed `bool(spend.get("spent", True))`

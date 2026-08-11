@@ -13,6 +13,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
@@ -40,6 +41,16 @@ from pyrxd.swap.rswp.covenant import (
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
 
+# These fixtures work in TOY photon values (hundreds or a few thousand, not the millions
+# a real Radiant fee costs), so their fees sit far below the chain's relay floor by
+# design: what they test is conservation arithmetic, signature binding and parsing, not
+# fee sizing. Those builders now GATE `fee` against that floor, so the opt-out is stated
+# here explicitly rather than left implicit. The floor itself is proven offline in
+# tests/test_swap_and_nft_fee_floors.py and at a real node in
+# tests/test_fee_floor_boundary_regtest_e2e.py.
+_TOY_FEE_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+
+
 _EXPIRY = 840_000
 
 
@@ -64,6 +75,7 @@ def _reserved(maker: PrivateKey, photons: int = 10_000, expiry: int = _EXPIRY) -
         expiry_height=expiry,
         change_pkh=pkh,
         fee=1_000,
+        fee_policy=_TOY_FEE_POLICY,
     )
 
 
@@ -165,6 +177,7 @@ def test_reserve_post_take_full_loop() -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=1_000,
+        fee_policy=_TOY_FEE_POLICY,
         current_height=_EXPIRY - 10,
     )
     assert tx.outputs[0].satoshis == 9_000  # maker demand at index 0 (SINGLE)
@@ -194,6 +207,7 @@ def test_take_refused_at_and_after_expiry() -> None:
                 taker_receive_pkh=tk_pkh,
                 taker_change_pkh=tk_pkh,
                 fee=1_000,
+                fee_policy=_TOY_FEE_POLICY,
                 current_height=tip,
             )
 
@@ -224,6 +238,7 @@ def test_tampered_demand_breaks_covenant_order_signature() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=1_000,
+            fee_policy=_TOY_FEE_POLICY,
             current_height=_EXPIRY - 10,
         )
 
@@ -251,6 +266,7 @@ def test_advertised_expiry_must_match_the_chain() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=1_000,
+            fee_policy=_TOY_FEE_POLICY,
             current_height=_EXPIRY - 10,
         )
 
@@ -278,6 +294,7 @@ def test_lying_v3_metadata_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=1_000,
+            fee_policy=_TOY_FEE_POLICY,
             current_height=tip,
         )
 
@@ -303,6 +320,7 @@ def test_lying_v3_metadata_rejected() -> None:
             taker_receive_pkh=tk_pkh,
             taker_change_pkh=tk_pkh,
             fee=-1,
+            fee_policy=_TOY_FEE_POLICY,
             current_height=_EXPIRY - 10,
         )
 
@@ -330,6 +348,7 @@ def test_near_p2pkh_funding_refused() -> None:
             expiry_height=_EXPIRY,
             change_pkh=mk_pkh,
             fee=1_000,
+            fee_policy=_TOY_FEE_POLICY,
         )
 
 
@@ -354,7 +373,12 @@ def test_refund_tx_shape() -> None:
     maker, mk_pkh = _key()
     reserved = _reserved(maker)
     tx = build_covenant_refund_tx(
-        covenant_source_tx=reserved, covenant_vout=0, maker_key=maker, refund_pkh=mk_pkh, fee=1_000
+        covenant_source_tx=reserved,
+        covenant_vout=0,
+        maker_key=maker,
+        refund_pkh=mk_pkh,
+        fee=1_000,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert tx.locktime == _EXPIRY
     assert tx.inputs[0].sequence == REFUND_SEQUENCE
@@ -366,7 +390,12 @@ def test_cancel_tx_shape() -> None:
     maker, mk_pkh = _key()
     reserved = _reserved(maker)
     tx = build_covenant_cancel_tx(
-        covenant_source_tx=reserved, covenant_vout=0, maker_key=maker, refund_pkh=mk_pkh, fee=1_000
+        covenant_source_tx=reserved,
+        covenant_vout=0,
+        maker_key=maker,
+        refund_pkh=mk_pkh,
+        fee=1_000,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert tx.locktime == 0  # swap branch: no timelock
     assert tx.inputs[0].unlocking_script.serialize().endswith(b"\x51")  # SWAP selector
@@ -427,4 +456,5 @@ def test_reservation_below_dust_refused() -> None:
             expiry_height=_EXPIRY,
             change_pkh=mk_pkh,
             fee=1_000,
+            fee_policy=_TOY_FEE_POLICY,
         )

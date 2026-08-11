@@ -54,7 +54,12 @@ from typing import TYPE_CHECKING
 
 from Cryptodome.Cipher import AES
 
-from ..fee_sizing import assert_tx_pays_for_itself, required_fee, trial_size_with_slack
+from ..fee_sizing import (
+    assert_fee_rate_clears_relay_floor,
+    assert_tx_pays_for_itself,
+    required_fee,
+    trial_size_with_slack,
+)
 from ..hd.bip32 import Xprv, Xpub, ckd, master_xprv_from_seed
 from ..hd.bip39 import seed_from_mnemonic
 from ..hd.descriptor import AccountDescriptors, account_descriptors
@@ -1074,6 +1079,7 @@ class HdWallet:
         photons: int,
         *,
         fee_rate: int = DEFAULT_FEE_RATE,
+        allow_below_relay_floor: bool = False,
         change_address: str | None = None,
     ) -> Transaction:
         """Build and sign a P2PKH transfer from HD UTXOs to *to_address*.
@@ -1085,6 +1091,11 @@ class HdWallet:
         ``change_address`` defaults to the next unused internal index;
         callers can override (e.g. to keep change on the external chain
         for a single-address-style wallet).
+
+        ``fee_rate`` is refused below Radiant's effective relay floor unless
+        ``allow_below_relay_floor`` is set — the deliberate opt-out for regtest
+        and chains you control. Unlike :class:`~pyrxd.wallet.RxdWallet`, the rate
+        arrives per CALL here, so this is where it has to be judged.
         """
         if not isinstance(photons, int) or isinstance(photons, bool):
             raise ValidationError("photons must be int")
@@ -1096,6 +1107,14 @@ class HdWallet:
             raise ValidationError("to_address is not a valid P2PKH address")
         if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
             raise ValidationError("fee_rate must be a positive int")
+        # See RxdWallet.__init__: `required_fee` binds the caller's rate and nothing
+        # else, so a sub-floor rate has to be refused HERE or not at all.
+        assert_fee_rate_clears_relay_floor(
+            fee_rate,
+            what="HdWallet.build_send_tx",
+            allow_below_relay_floor=allow_below_relay_floor,
+            error_type=ValidationError,
+        )
         if not triples:
             raise ValidationError("Insufficient funds: no UTXOs supplied")
 
@@ -1176,12 +1195,23 @@ class HdWallet:
         to_address: str,
         *,
         fee_rate: int = DEFAULT_FEE_RATE,
+        allow_below_relay_floor: bool = False,
     ) -> Transaction:
-        """Sweep all *triples* to *to_address* minus fee. No change output."""
+        """Sweep all *triples* to *to_address* minus fee. No change output.
+
+        ``fee_rate`` is refused below Radiant's effective relay floor unless
+        ``allow_below_relay_floor`` is set — see :meth:`build_send_tx`.
+        """
         if not validate_address(to_address):
             raise ValidationError("to_address is not a valid P2PKH address")
         if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
             raise ValidationError("fee_rate must be a positive int")
+        assert_fee_rate_clears_relay_floor(
+            fee_rate,
+            what="HdWallet.build_send_max_tx",
+            allow_below_relay_floor=allow_below_relay_floor,
+            error_type=ValidationError,
+        )
         if not triples:
             raise ValidationError("Insufficient funds: no UTXOs supplied")
 
@@ -1224,6 +1254,7 @@ class HdWallet:
         photons: int,
         *,
         fee_rate: int = DEFAULT_FEE_RATE,
+        allow_below_relay_floor: bool = False,
         change_address: str | None = None,
     ) -> str:
         """Fetch UTXOs, build, sign, broadcast. Returns broadcast txid.
@@ -1237,6 +1268,7 @@ class HdWallet:
             to_address,
             photons,
             fee_rate=fee_rate,
+            allow_below_relay_floor=allow_below_relay_floor,
             change_address=change_address,
         )
         txid = await client.broadcast(tx.serialize())
@@ -1248,10 +1280,16 @@ class HdWallet:
         to_address: str,
         *,
         fee_rate: int = DEFAULT_FEE_RATE,
+        allow_below_relay_floor: bool = False,
     ) -> str:
         """Sweep all UTXOs to *to_address* minus fee. Returns broadcast txid."""
         triples = await self.collect_spendable(client)
-        tx = self.build_send_max_tx(triples, to_address, fee_rate=fee_rate)
+        tx = self.build_send_max_tx(
+            triples,
+            to_address,
+            fee_rate=fee_rate,
+            allow_below_relay_floor=allow_below_relay_floor,
+        )
         txid = await client.broadcast(tx.serialize())
         return str(txid)
 

@@ -479,7 +479,13 @@ class TestGravityTradeFinalize:
         rate hurts most, and on regtest (a tenth of the mainnet floor) the orchestrator
         had no way to say so.
         """
-        regtest = DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB)
+        regtest = DeadlineFeePolicy(
+            relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB,
+            # The LEGACY rate is now BELOW `protocol_floor_per_kb`, which defaults to the
+            # EFFECTIVE one (it used to default to the legacy rate, and so bounded nothing).
+            # A node that really relays this low is exactly the escape hatch's case.
+            allow_below_protocol_floor=True,
+        )
         trade, _rxd, btc = self._make_trade(
             cfg=TradeConfig(min_btc_confirmations=1, poll_interval_seconds=0.01, fee_policy=regtest)
         )
@@ -511,7 +517,13 @@ class TestGravityTradeFinalize:
 
     @pytest.mark.asyncio
     async def test_claim_forwards_a_per_call_fee_policy_over_the_config_one(self):
-        cfg_policy = DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB)
+        cfg_policy = DeadlineFeePolicy(
+            relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB,
+            # The LEGACY rate is now BELOW `protocol_floor_per_kb`, which defaults to the
+            # EFFECTIVE one (it used to default to the legacy rate, and so bounded nothing).
+            # A node that really relays this low is exactly the escape hatch's case.
+            allow_below_protocol_floor=True,
+        )
         per_call = DeadlineFeePolicy(relay_fee_per_kb=20_000_000)
         trade, _, _ = self._make_trade(
             cfg=TradeConfig(min_btc_confirmations=1, poll_interval_seconds=0.01, fee_policy=cfg_policy)

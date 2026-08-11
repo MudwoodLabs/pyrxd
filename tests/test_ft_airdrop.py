@@ -353,8 +353,11 @@ class TestFeeFloor:
         assert result.fee > 0
 
     def test_bool_fee_rate_refused(self):
+        # ``_check_fee_rate`` now delegates to ``fee_sizing.assert_fee_rate_clears_relay_floor``
+        # (one implementation of the rule for every builder), so the wording is that
+        # function's. The refusal — a bool is not a fee rate — is unchanged.
         s = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(1_000)])
-        with pytest.raises(ValueError, match="must be an int"):
+        with pytest.raises(ValueError, match="must be a positive int"):
             s.build_airdrop_tx(_recipients((_BOB_PKH, 10)), _alice_key(), funding=[_funding()], fee_rate=True)
 
     def test_no_funding_at_all_is_refused_not_silently_burned(self):

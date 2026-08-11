@@ -34,7 +34,7 @@ from pyrxd.swap.rswp import (
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
-from tests.test_rswp_regtest_e2e import _FEE, _CliSource, _fund_key, _Node
+from tests.test_rswp_regtest_e2e import _FEE, _NODE_POLICY, _CliSource, _fund_key, _Node
 from tests.test_rswp_regtest_e2e import node as node
 
 pytestmark = pytest.mark.integration
@@ -97,6 +97,7 @@ async def test_nft_order_post_browse_take_settle(node) -> None:
         taker_receive_pkh=tk_pkh,
         taker_change_pkh=tk_pkh,
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     verdict = node.accepts(completion.serialize().hex())
     assert verdict.get("allowed") is True, verdict
