@@ -32,6 +32,7 @@ from pyrxd.glyph.script import (
 from pyrxd.glyph.types import GlyphMedia, GlyphMetadata, GlyphProtocol, GlyphRef
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
+from tests.consensus_oracle import ref_operand_opcodes
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -1546,7 +1547,12 @@ class TestInputRefWalker:
 #   — stack operations with NO operand, even though they sit inside the
 #   0xd0..0xd8 byte range.
 
-_CONSENSUS_REF_OPERAND_OPCODES = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
+# Parsed out of the vendored Radiant Core `script.cpp`, not typed here. This
+# constant used to be a hand-written literal, which made it a FIFTH independent
+# spelling of the rule whose four earlier spellings produced three bugs — a
+# hand-typed oracle can be wrong in exactly the same way as the code it checks.
+# See tests/consensus_oracle.py and tests/test_consensus_opcode_parity.py.
+_CONSENSUS_REF_OPERAND_OPCODES = ref_operand_opcodes()
 
 
 class _ConsensusWalkFailed(Exception):

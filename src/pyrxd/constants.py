@@ -261,7 +261,9 @@ class OpCode(bytes, Enum):
     # Reserved NOPs
     OP_NOP1 = b"\xb0"
     OP_CHECKLOCKTIMEVERIFY = b"\xb1"
+    OP_NOP2 = b"\xb1"  # alias, per Radiant's `OP_NOP2 = OP_CHECKLOCKTIMEVERIFY`
     OP_CHECKSEQUENCEVERIFY = b"\xb2"
+    OP_NOP3 = b"\xb2"  # alias, per Radiant's `OP_NOP3 = OP_CHECKSEQUENCEVERIFY`
     OP_NOP4 = b"\xb3"
     OP_NOP5 = b"\xb4"
     OP_NOP6 = b"\xb5"
@@ -329,8 +331,25 @@ class OpCode(bytes, Enum):
     OP_CODESCRIPTBYTECODE_OUTPUT = b"\xea"
     OP_STATESCRIPTBYTECODE_UTXO = b"\xeb"
     OP_STATESCRIPTBYTECODE_OUTPUT = b"\xec"
+    OP_PUSH_TX_STATE = b"\xed"
 
-    # Pseudo-words
+    # Glyph v2 dMint hash opcodes (Hard Fork V2)
+    OP_BLAKE3 = b"\xee"
+    OP_K12 = b"\xef"
+
+    # Pseudo-words.
+    #
+    # NOT Radiant opcodes. These five are Bitcoin Core legacy names that
+    # Radiant's ``enum opcodetype`` does not define at all. Every one of them
+    # sits above :data:`MAX_OPCODE`, so ``CScript::HasValidOps`` rejects any
+    # script containing these bytes — they can never appear in a valid script
+    # and must never be emitted. They are unused anywhere in pyrxd and are
+    # retained only so that removing them is a deliberate, separately-reviewed
+    # API break rather than a drive-by change.
+    #
+    # ``tests/test_consensus_opcode_parity.py`` allow-lists exactly these names
+    # and asserts each is > MAX_OPCODE, so the exemption stays honest: if one
+    # ever drifted down into the valid opcode range the parity test fails.
     OP_DATA = b"\xfb"
     OP_SIG = b"\xfc"
     OP_PUBKEYHASH = b"\xfd"
@@ -360,6 +379,19 @@ OPCODE_VALUE_NAME_DICT[b"\x00"] = "OP_0"
 # preimage's ``hashOutputHashes`` field
 # (:func:`pyrxd.transaction.transaction_preimage._get_push_refs`).
 REF_OPERAND_OPCODES: frozenset[int] = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
+
+# Width of that immediate operand, in bytes. ``GetScriptOp`` advances the
+# program counter by exactly this much and returns those bytes as the ref
+# (``pc += 36``). Centralised for the same reason as the opcode set: a walker
+# that hard-codes the width is a walker that can disagree with consensus.
+REF_OPERAND_WIDTH: int = 36
+
+# The largest byte Radiant will accept as an opcode —  ``MAX_OPCODE`` in
+# ``src/script/script.h``, defined there as ``FIRST_UNDEFINED_OP_VALUE - 1``.
+# ``CScript::HasValidOps`` (``src/script/script.cpp``) rejects any script
+# containing a byte above this, so it is a real validity boundary and not just
+# a table size.
+MAX_OPCODE: int = 0xEF
 
 # The subset that contributes to an output's **push-ref set** — the set Radiant
 # hashes into the sighash's ``hashOutputHashes`` and returns from
