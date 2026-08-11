@@ -355,7 +355,9 @@ class TestTransactionMethods:
 
     def test_fee_random_distribution_raises_not_implemented(self):
         locking = _make_locking()
-        src_out = TransactionOutput(locking_script=locking, satoshis=100_000)
+        # 1 RXD: the default fee model is Radiant's relay floor (10_000_000 photons/kB),
+        # so a 100_000-photon input no longer reaches the change-distribution branch.
+        src_out = TransactionOutput(locking_script=locking, satoshis=100_000_000)
         src_tx = Transaction(tx_inputs=[], tx_outputs=[src_out])
         tx_in = TransactionInput(
             source_transaction=src_tx,

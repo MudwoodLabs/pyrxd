@@ -63,19 +63,29 @@ pytestmark = pytest.mark.integration
 
 _IMAGE = "radiant-core:v3.1.1-amd64"
 _CONTAINER = "rswp-regtest-pytest"
-_FEE = 1_000_000  # 0.01 RXD — comfortably above regtest relay for sub-kB txs
+_FEE = 1_000_000  # 0.01 RXD — comfortably above THIS node's relay floor for sub-kB txs
+
+#: This suite's node runs at the LEGACY 0.01 RXD/kB floor, a tenth of mainnet's — the
+#: one Radiant regtest lane still deliberately below the mainnet rate.
+#:
+#: Declared and asserted (``_Node.start`` passes it and checks ``getmempoolinfo``
+#: reports it back) rather than inherited from the node's default, so the rate `_FEE`
+#: and `_NODE_POLICY` are sized for cannot silently desync from the rate the node
+#: enforces. The shared harness in ``test_htlc_regtest_e2e`` moved to the mainnet floor;
+#: this one did not, because what it proves is orderbook and covenant SEMANTICS, and its
+#: carriers (e.g. the 8 000 000-photon v3 reservation whose remainder a case asserts on
+#: chain) are sized around `_FEE`. The fee floors of these very builders — the v3
+#: covenant cancel and refund paths — ARE proven at the mainnet floor, on a node started
+#: there, in ``tests/test_fee_floor_boundary_regtest_e2e.py``.
+_MIN_RELAY_RXD_PER_KB = "0.01"
 
 # The fee-gated builders (`take_rswp_order` / `accept_offer` / the v3 covenant
 # builders / `build_cancel_tx`) default to the MAINNET relay floor, 0.10 RXD/kB. This
 # node relays at a tenth of that, and `_FEE` is sized for THIS node — which is the
-# point of an e2e — so the gate has to be told which node it is judging. Pinned to
-# what the node itself advertises rather than to a guessed constant, the same way
-# `test_gravity_maker_offer_regtest_e2e._node_policy` does it.
+# point of an e2e — so the gate has to be told which node it is judging.
 #
 # `allow_below_protocol_floor` because that advertised rate IS below the protocol
-# floor: a default regtest node is exactly the case the escape hatch exists for.
-# The MAINNET-floor boundary is proven separately, against a node started at
-# `-minrelaytxfee=0.10`, in tests/test_fee_floor_boundary_regtest_e2e.py.
+# floor: this node is exactly the case the escape hatch exists for.
 _NODE_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1_000_000, allow_below_protocol_floor=True)
 _RXD_TOKEN_HEX = "00" * 32
 
@@ -139,6 +149,7 @@ class _Node:
                 "-swapindex=1",
                 "-disablewallet=0",
                 "-fallbackfee=0.001",
+                f"-minrelaytxfee={_MIN_RELAY_RXD_PER_KB}",
                 f"-rpcuser={self.user}",
                 f"-rpcpassword={self.password}",
                 "-rpcbind=0.0.0.0",
@@ -160,6 +171,14 @@ class _Node:
         else:
             raise RuntimeError("regtest RPC did not become ready")
         assert self.cli("getblockchaininfo")["chain"] == "regtest", "node is NOT regtest — aborting"
+        # The rate `_FEE` and `_NODE_POLICY` are sized for, confirmed by the node itself
+        # before anything is proved against it. `effective_minrelaytxfee`, not
+        # `minrelaytxfee`: only the first is what AcceptToMemoryPool checks.
+        advertised = float(self.cli("getmempoolinfo")["effective_minrelaytxfee"])
+        assert advertised == float(_MIN_RELAY_RXD_PER_KB), (
+            f"node advertises effective_minrelaytxfee {advertised} RXD/kB, not the "
+            f"{_MIN_RELAY_RXD_PER_KB} this suite's fees are sized for"
+        )
         info = self.cli("getswapindexinfo")
         assert info.get("enabled") is True, f"swap index not enabled: {info}"
         self.cli("createwallet", "rswp")

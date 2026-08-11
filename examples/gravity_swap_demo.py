@@ -70,6 +70,12 @@ import os
 import sys
 import time
 
+# hash160 from the SDK, not hashlib.new("ripemd160", ...): OpenSSL 3 ships
+# RIPEMD160 in the legacy provider and leaves it unloaded on most current
+# distros, where the direct call raises. pyrxd.hash falls back to a verified
+# pure-Python implementation.
+from pyrxd.hash import hash160
+
 # ─────────────────────────────────────────────────────────────
 # Configuration (from environment variables)
 # ─────────────────────────────────────────────────────────────
@@ -193,11 +199,11 @@ async def run_demo() -> None:
 
     maker_raw = maker_privkey.unsafe_raw_bytes()
     maker_pub = coincurve.PrivateKey(maker_raw).public_key.format(compressed=True)
-    maker_pkh = hashlib.new("ripemd160", hashlib.sha256(maker_pub).digest()).digest()
+    maker_pkh = hash160(maker_pub)
 
     taker_raw = taker_rxd_privkey.unsafe_raw_bytes()
     taker_pub = coincurve.PrivateKey(taker_raw).public_key.format(compressed=True)
-    taker_rxd_pkh = hashlib.new("ripemd160", hashlib.sha256(taker_pub).digest()).digest()
+    taker_rxd_pkh = hash160(taker_pub)
 
     _ok(f"Maker RXD PKH:  {maker_pkh.hex()}")
     _ok(f"Taker RXD PKH:  {taker_rxd_pkh.hex()}")

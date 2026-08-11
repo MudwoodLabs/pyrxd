@@ -77,6 +77,12 @@ import sys
 import time
 from pathlib import Path
 
+# hash160 from the SDK, not hashlib.new("ripemd160", ...): OpenSSL 3 ships
+# RIPEMD160 in the legacy provider and leaves it unloaded on most current
+# distros, where the direct call raises. pyrxd.hash falls back to a verified
+# pure-Python implementation.
+from pyrxd.hash import hash160
+
 # ─── Config ────────────────────────────────────────────────────────────────────
 
 GRAVITY_MODE: str = os.environ.get("GRAVITY_MODE", "offer")
@@ -166,7 +172,7 @@ async def mode_offer() -> None:
     maker_wif = None
     maker_raw = maker_pk_mat.unsafe_raw_bytes()
     maker_pub = coincurve.PrivateKey(maker_raw).public_key.format(compressed=True)
-    maker_pkh = hashlib.new("ripemd160", hashlib.sha256(maker_pub).digest()).digest()
+    maker_pkh = hash160(maker_pub)
     from pyrxd.base58 import base58check_encode
 
     maker_addr = base58check_encode(b"\x00" + maker_pkh)
@@ -178,7 +184,7 @@ async def mode_offer() -> None:
     taker_rxd_mat = PrivateKeyMaterial.generate()
     taker_raw = taker_rxd_mat.unsafe_raw_bytes()
     taker_pub = coincurve.PrivateKey(taker_raw).public_key.format(compressed=True)
-    taker_pkh = hashlib.new("ripemd160", hashlib.sha256(taker_pub).digest()).digest()
+    taker_pkh = hash160(taker_pub)
     taker_btc = generate_keypair(network=BTC_NETWORK)
     _ok(f"Taker RXD PKH: {taker_pkh.hex()}")
     _ok(f"Taker BTC p2wpkh: {taker_btc.p2wpkh_address}")

@@ -302,8 +302,12 @@ def test_inflating_an_airdrop_output_is_rejected(node, deployed):  # noqa: F811
                 Script(build_ft_locking_script(Hex20(fresh.key.public_key().hash160()), fresh.ref)),
                 fresh.value - 3_000_000,
             ),
+            # Overpay the fee by a wide margin. This control must be refused by the FT
+            # conservation rule, and a transaction that also happens to be under the
+            # node's relay floor would be refused for that instead — a false pass. At
+            # the mainnet floor this node runs, `_RELAY_FEE_SATS` alone covers 2 kB.
             TransactionOutput(
-                P2PKH().lock(funding.private_key.public_key().hash160()), funding.value - _RELAY_FEE_SATS * 10 - 1
+                P2PKH().lock(funding.private_key.public_key().hash160()), funding.value - _RELAY_FEE_SATS - 1
             ),
         ],
     )

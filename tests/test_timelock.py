@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from pyrxd.constants import SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_TYPE_FLAG
 from pyrxd.script.timelock import (
     LOCKTIME_THRESHOLD,
     CsvKind,
@@ -117,11 +118,11 @@ class TestBuildP2pkhWithCsvScript:
         """``CsvKind.TIME_512_SECONDS`` flips bit 22 of the encoded value
         per BIP-112. 1 hour ≈ 7 units of 512 seconds."""
         sequence = build_csv_sequence(units=7, kind=CsvKind.TIME_512_SECONDS)
-        assert sequence == (1 << 22) | 7
+        assert sequence == SEQUENCE_LOCKTIME_TYPE_FLAG | 7
 
     def test_block_count_clears_bit_22(self):
         sequence = build_csv_sequence(units=100, kind=CsvKind.BLOCKS)
-        assert sequence & (1 << 22) == 0
+        assert sequence & SEQUENCE_LOCKTIME_TYPE_FLAG == 0
         assert sequence == 100
 
     def test_max_unit_count(self):
@@ -142,7 +143,7 @@ class TestBuildP2pkhWithCsvScript:
         gets rejected — that bit means 'no relative lock' and would make
         the script a no-op."""
         with pytest.raises(ValidationError, match="disable bit"):
-            build_p2pkh_with_csv_script(_PKH, sequence=1 << 31)
+            build_p2pkh_with_csv_script(_PKH, sequence=SEQUENCE_LOCKTIME_DISABLE_FLAG)
 
     def test_sequence_overflow_rejected(self):
         with pytest.raises(ValidationError, match="sequence out of range"):

@@ -33,6 +33,7 @@ from dataclasses import dataclass
 
 from pyrxd.base58 import b58_encode
 from pyrxd.hash import hash160, hash256
+from pyrxd.hash import hash160 as pyrxd_hash160
 from pyrxd.security.errors import KeyMaterialError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial, secure_scalar_mod_n
 
@@ -211,6 +212,17 @@ def _build_keypair(
 #: pure-Python fallback at import time on exactly those platforms — which is the
 #: entire reason that module exists, and which this file used to bypass.
 _hash160 = hash160
+def _hash160(data: bytes) -> bytes:
+    """RIPEMD160(SHA256(data)) — Bitcoin's hash160.
+
+    Routed through :func:`pyrxd.hash.hash160` rather than ``hashlib.new`` so it
+    keeps working where OpenSSL 3 has moved RIPEMD160 into the legacy provider
+    and left it unloaded (Ubuntu 24.04, Debian 12, the python.org macOS
+    installer, Pyodide/WASM). ``pyrxd.hash`` selects a verified pure-Python
+    fallback at import time for exactly that case; calling ``hashlib`` directly
+    walks straight past it and raises ``ValueError`` on those hosts.
+    """
+    return pyrxd_hash160(data)
 
 
 def _taproot_tweak(x_only_pubkey: bytes) -> bytes:

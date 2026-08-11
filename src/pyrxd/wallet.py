@@ -29,6 +29,7 @@ Design notes
 
 from __future__ import annotations
 
+from .constants import DUST_THRESHOLD_PHOTONS
 from .fee_sizing import (
     SIG_SIZE_SLACK_BYTES,
     assert_fee_rate_clears_relay_floor,
@@ -51,15 +52,19 @@ from .utils import validate_address
 #
 # Radiant has no dust threshold: `GetDustThreshold` returns 1 satoshi
 # unconditionally and `IsDust` is `nValue <= 0` (Radiant-Core
-# `src/policy/policy.cpp:19-25`), so ANY output >= 1 photon is standard and
-# relays. This constant is a conservative wallet-level guard against creating
+# `src/policy/policy.cpp:19-25` @ v3.1.2), so ANY output >= 1 photon relays.
+# This constant is a conservative wallet-level guard against creating
 # uneconomic change, inherited from Bitcoin's 546-sat convention.
 #
 # The distinction matters: pyrxd itself depends on 1-photon outputs being
 # valid — a V1 dMint contract MUST be a 1-photon singleton (the covenant
 # enforces `OP_OUTPUTVALUE == 1`). Treating 546 as a chain rule would
 # contradict a consensus requirement this library already implements.
-DUST_THRESHOLD: int = 546
+#
+# Re-exported from :data:`pyrxd.constants.DUST_THRESHOLD_PHOTONS`, which is the
+# single definition; the alias is kept because ``pyrxd.wallet.DUST_THRESHOLD`` is
+# public API.
+DUST_THRESHOLD: int = DUST_THRESHOLD_PHOTONS
 
 # Default miner fee in photons-per-byte: Radiant's own effective relay floor,
 # DERIVED from it rather than written out again, so the default can never drift
@@ -257,8 +262,8 @@ class RxdWallet:
 
         Rules
         -----
-        * ``photons`` must be >= :data:`DUST_THRESHOLD` (546) — a pyrxd
-          send-policy floor, not a chain rule (Radiant's real floor is 1).
+        * ``photons`` must be >= :data:`DUST_THRESHOLD` — a pyrxd send-policy
+          floor of 546 photons, not a chain rule (Radiant's real floor is 1).
         * UTXOs are greedily selected in descending order of value.
         * A change output back to ``self.address`` is added only if the
           remainder after paying the fee exceeds the dust threshold; otherwise
@@ -269,7 +274,11 @@ class RxdWallet:
         if photons <= 0:
             raise ValidationError("photons must be > 0")
         if photons < DUST_THRESHOLD:
-            raise ValidationError(f"photons below dust threshold ({DUST_THRESHOLD})")
+            raise ValidationError(
+                f"photons ({photons}) is below pyrxd's {DUST_THRESHOLD}-photon send-policy floor. "
+                "This is a pyrxd guard against uneconomic outputs, NOT a Radiant rule: the chain "
+                "accepts any output of 1 photon or more."
+            )
         if not validate_address(to_address):
             raise ValidationError("to_address is not a valid P2PKH address")
         if not utxos:
@@ -396,7 +405,10 @@ class RxdWallet:
 
         total_in = sum(u.value for u in utxos)
         if total_in <= DUST_THRESHOLD:
-            raise ValidationError("Insufficient funds: total below dust threshold")
+            raise ValidationError(
+                "Insufficient funds: the selected UTXOs cannot pay the amount plus fee and still clear "
+                "pyrxd's send-policy floor (a pyrxd guard, not a Radiant rule)"
+            )
 
         recipient_script = P2PKH().lock(to_address)
         inputs = [self._make_input(u) for u in utxos]

@@ -73,6 +73,21 @@ class TransactionInput:
             if script_length is None:
                 raise ValueError("failed to read script length")
             unlocking_script_bytes = stream.read_bytes(script_length)
+            # ``read_bytes`` returns however many bytes are left at EOF rather than
+            # erroring, so a varint that over-claims used to yield an input whose
+            # unlocking script had swallowed the sequence field — and then
+            # ``read_int(4)`` zero-extended whatever fragment was left. The result
+            # was a TransactionInput that re-serialized to DIFFERENT bytes, so any
+            # txid taken over the parse described a transaction the input bytes do
+            # not encode. ``TransactionOutput.from_hex`` has always refused this;
+            # the two halves of the same wire format disagreeing about malformed
+            # input is how a transaction gets accepted by one and rejected by the
+            # other.
+            if len(unlocking_script_bytes) != script_length:
+                raise ValueError(
+                    f"truncated input script: varint claims {script_length} bytes, "
+                    f"only {len(unlocking_script_bytes)} available"
+                )
             sequence = stream.read_int(4)
             if sequence is None:
                 raise ValueError("failed to read sequence")
@@ -80,7 +95,13 @@ class TransactionInput:
             return TransactionInput(
                 source_txid=txid.hex(),
                 source_output_index=vout,
-                unlocking_script=Script(unlocking_script_bytes),
+                # Chain bytes: consensus permits a script that ``GetOp`` cannot
+                # walk to sit inside a perfectly valid transaction, because a
+                # script is only executed when it is spent. Refusing to
+                # deserialize one would make pyrxd unable to read real history —
+                # a worse bug than the one above. The leniency is confined here
+                # and is visible in ``Script.truncated_at``.
+                unlocking_script=Script(unlocking_script_bytes, allow_malformed=True),
                 sequence=sequence,
             )
 

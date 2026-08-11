@@ -83,6 +83,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, ClassVar
 
+from ..constants import DUST_THRESHOLD_PHOTONS
 from ..fee_models import SatoshisPerKilobyte
 from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, wait_for_confirmation
 from ..script.script import Script
@@ -118,10 +119,12 @@ __all__ = [
 ]
 
 
-# The reveal places the NFT singleton on a dust carrier; the rest of the commit value
-# comes back as change. 546 photons is the conventional dust limit, and the same number
-# ``pyrxd.cli.glyph_cmds`` uses.
-NFT_CARRIER_VALUE = 546
+# The reveal places the NFT singleton on a small carrier output; the rest of the commit
+# value comes back as change. 546 photons is a pyrxd CONVENTION (Bitcoin's dust figure),
+# not a chain minimum — Radiant's floor is 1 photon, which is what every mainnet dMint
+# contract singleton actually uses. Aliased from the one definition so this and
+# ``pyrxd.cli.glyph_cmds`` cannot drift.
+NFT_CARRIER_VALUE = DUST_THRESHOLD_PHOTONS
 
 # Confirmations required on the commit before the reveal is built.
 #
@@ -130,8 +133,10 @@ NFT_CARRIER_VALUE = 546
 #
 # * No doc, docstring or comment in this repository states a rule that the commit must
 #   be mined first. Every explanation of the wait gives an operational reason instead —
-#   block timing (``docs/tutorials/mint-a-glyph-nft.md``: "~2 minutes, so 90 seconds
-#   ... is usually enough"), propagation lag, or mempool eviction
+#   block timing (``docs/tutorials/mint-a-glyph-nft.md``, which sizes its wait against
+#   Radiant's ~5-minute target spacing — ``nPowTargetSpacing = 5 * 60`` in
+#   ``Radiant-Core/src/chainparams.cpp:117`` @ v3.1.2; the tutorial used to say
+#   "~2 minutes"), propagation lag, or mempool eviction
 #   (``pyrxd.glyph.dmint.chain``: an unconfirmed parent risks "missing inputs" rejection
 #   "when the parent tx hasn't propagated to all relays").
 # * The Radiant ref rule that IS documented, in ``pyrxd.glyph.script``, is purely
@@ -689,7 +694,8 @@ class GlyphMinter:
                 :meth:`~pyrxd.glyph.builder.GlyphBuilder.prepare_dmint_deploy`.
             supply: units issued, all placed on the reveal's token output. Radiant
                 convention is 1 photon = 1 FT unit, so this is also that output's
-                value, and it must clear the 546-photon dust limit.
+                value, and it must clear pyrxd's 546-unit decimals-mistake guard
+                (a pyrxd policy, not a chain limit — Radiant's output floor is 1 photon).
             treasury_pkh: who receives the premine. Defaults to the funding key's PKH.
 
         Raises:
@@ -702,13 +708,13 @@ class GlyphMinter:
         # ``GetDustThreshold`` returns 1 satoshi, ``IsDust`` is ``nValue <= 0``
         # (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is never
         # consulted (``fRequireStandard`` is hardcoded ``false``,
-        # Radiant-Core/src/validation.cpp:271 and src/init.cpp:1965). The previous
+        # Radiant-Core/src/validation.cpp:271 and src/init.cpp:1995). The previous
         # wording, "makes the reveal's token output non-standard", asserted a rule
         # that does not exist; ``build_airdrop_tx`` in this same package correctly
         # emits 1-unit FT outputs.
-        if not isinstance(supply, int) or isinstance(supply, bool) or supply < 546:
+        if not isinstance(supply, int) or isinstance(supply, bool) or supply < DUST_THRESHOLD_PHOTONS:
             raise ValidationError(
-                f"commit_ft supply must be an int >= 546; got {supply!r}. This is a pyrxd guard against a "
+                f"commit_ft supply must be an int >= {DUST_THRESHOLD_PHOTONS}; got {supply!r}. This is a pyrxd guard against a "
                 "decimals mistake, not a chain limit (Radiant's output floor is 1 photon) — a supply this "
                 "small is usually meant to be an NFT."
             )

@@ -32,6 +32,12 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 
 __all__ = ["BtcPaymentTx", "BtcUtxo", "build_payment_tx"]
 
+# BITCOIN's dust limit, and correct as stated: Bitcoin Core's `GetDustThreshold`
+# yields 546 sat for a P2PKH-sized output at the default 3000 sat/kB dustRelayFee,
+# and `IsStandardTx` rejects a below-threshold output. Deliberately NOT the same
+# number as :data:`pyrxd.constants.DUST_THRESHOLD_PHOTONS`, which is a pyrxd policy
+# floor on the RADIANT leg — Radiant's own dust threshold is 1 satoshi and its
+# standardness check never runs. Two chains, two rules; do not alias them.
 DUST_LIMIT = 546  # satoshis — below this, change output is swept into fee
 
 # Bitcoin SIGHASH_ALL = 0x01 (4-byte LE in preimage = 0x01000000)

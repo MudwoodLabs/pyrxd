@@ -16,6 +16,7 @@ import hashlib
 
 import pytest
 
+from pyrxd.constants import SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_TYPE_FLAG
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
 from pyrxd.transaction.transaction import Transaction
@@ -595,7 +596,7 @@ class TestTimelockScriptBytes:
 
         # blocks: the value IS the unit count; time: bit 22 set, per BIP-112.
         assert build_csv_sequence(144, CsvKind.BLOCKS) == 144
-        assert build_csv_sequence(144, CsvKind.TIME_512_SECONDS) == 144 | (1 << 22)
+        assert build_csv_sequence(144, CsvKind.TIME_512_SECONDS) == 144 | SEQUENCE_LOCKTIME_TYPE_FLAG
         assert build_csv_sequence(0xFFFF, CsvKind.BLOCKS) == 0xFFFF  # max units
 
     def test_csv_sequence_bounds(self):
@@ -624,7 +625,7 @@ class TestTimelockScriptBytes:
         pkh = b"\xaa" * 20
         assert build_p2pkh_with_csv_script(pkh, 144)  # valid sequence
         with pytest.raises(ValidationError, match="disable"):
-            build_p2pkh_with_csv_script(pkh, 144 | (1 << 31))
+            build_p2pkh_with_csv_script(pkh, 144 | SEQUENCE_LOCKTIME_DISABLE_FLAG)
 
     def test_pkh_length_guard(self):
         from pyrxd.script.timelock import build_p2pkh_with_cltv_script

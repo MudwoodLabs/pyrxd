@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from pyrxd.hash import hash256, sha256
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES
 from pyrxd.security.errors import (
     ContractExhaustedError,
     InvalidFundingUtxoError,
@@ -1534,8 +1535,17 @@ def build_dmint_mint_tx(
             "OP_PUSHINPUTREF-family opcode (token envelope) and cannot be spent as "
             "fee \u2014 that would silently destroy the token. Use a plain RXD UTXO."
         )
-    if op_return_msg is not None and len(op_return_msg) > 80:
-        raise ValidationError(f"op_return_msg too long ({len(op_return_msg)} bytes); standardness limit is 80 bytes")
+    # The cap is pyrxd's OP_PUSHDATA1 ENCODER limit, not a chain rule. It used to be
+    # 80 bytes, justified as a node standardness cap — a Bitcoin rule asserted on a
+    # chain that never consults standardness (`fRequireStandard` is hardcoded `false`;
+    # see :data:`pyrxd.constants.MAX_OP_RETURN_MSG_BYTES` for the full citation). The
+    # encoder below already emits OP_PUSHDATA1 above 75 bytes.
+    if op_return_msg is not None and len(op_return_msg) > MAX_OP_RETURN_MSG_BYTES:
+        raise ValidationError(
+            f"op_return_msg too long ({len(op_return_msg)} bytes); pyrxd encodes the message with "
+            f"OP_PUSHDATA1, whose length field is one byte, so the cap is {MAX_OP_RETURN_MSG_BYTES}. "
+            "This is an encoder limit, not a Radiant relay or consensus limit."
+        )
 
     # --- Updated state (redesign): height += 1, lastTime = locktime, target via
     # the DAA mirror (unchanged for FIXED). The covenant's Part C rebuilds this
@@ -1706,11 +1716,19 @@ def build_dmint_mint_tx(
     # The funding input pays the FT reward photons + the tx fee + change.
     fee = len(tx.serialize()) * fee_rate
     change_value = funding_utxo.value - state.reward - fee
-    if change_value < 546:
+    # pyrxd POLICY floor, not a node rule. Radiant would accept any change output of
+    # 1 photon or more (`GetDustThreshold` returns 1, `IsDust` is `nValue <= 0`) — the
+    # guard exists because a mint whose change is worth less than the fee to spend it
+    # has silently donated the remainder, and the miner should choose a bigger funding
+    # UTXO instead. The message used to name a 546-photon "dust limit", which is not a
+    # limit any Radiant node applies.
+    if change_value < DUST_THRESHOLD_PHOTONS:
         raise PoolTooSmallError(
             f"funding_utxo ({funding_utxo.value} photons) too small to cover "
             f"reward ({state.reward}) + fee ({fee}): change would be "
-            f"{change_value} photons, below 546 dust limit."
+            f"{change_value} photons, below pyrxd's {DUST_THRESHOLD_PHOTONS}-photon uneconomic-change "
+            "floor (a pyrxd send policy, NOT a Radiant relay limit — Radiant's floor is 1 photon). "
+            "Fund the mint from a larger UTXO."
         )
     change_output.satoshis = change_value
 
@@ -1798,9 +1816,13 @@ def _build_dmint_v1_mint_tx(
             f"as fee — that would silently destroy the token. Use a plain RXD UTXO."
         )
 
-    if op_return_msg is not None and len(op_return_msg) > 80:
-        # Standardness limit: most node policies cap OP_RETURN data at 80 bytes.
-        raise ValidationError(f"op_return_msg too long ({len(op_return_msg)} bytes); standardness limit is 80 bytes")
+    # See the V2 path above: this is the OP_PUSHDATA1 encoder limit, not a chain rule.
+    if op_return_msg is not None and len(op_return_msg) > MAX_OP_RETURN_MSG_BYTES:
+        raise ValidationError(
+            f"op_return_msg too long ({len(op_return_msg)} bytes); pyrxd encodes the message with "
+            f"OP_PUSHDATA1, whose length field is one byte, so the cap is {MAX_OP_RETURN_MSG_BYTES}. "
+            "This is an encoder limit, not a Radiant relay or consensus limit."
+        )
 
     # --- Compute updated state. V1 has no DAA, so target is unchanged. ---
     new_height = state.height + 1
@@ -1940,11 +1962,14 @@ def _build_dmint_v1_mint_tx(
     #   - the change output back to miner_pkh
     fee = len(tx.serialize()) * fee_rate
     change_value = funding_utxo.value - state.reward - fee
-    if change_value < 546:
+    # pyrxd POLICY floor — see the V2 path above. Radiant's own floor is 1 photon.
+    if change_value < DUST_THRESHOLD_PHOTONS:
         raise PoolTooSmallError(
             f"funding_utxo ({funding_utxo.value} photons) too small to cover "
             f"reward ({state.reward}) + fee ({fee}): change would be "
-            f"{change_value} photons, below 546 dust limit."
+            f"{change_value} photons, below pyrxd's {DUST_THRESHOLD_PHOTONS}-photon uneconomic-change "
+            "floor (a pyrxd send policy, NOT a Radiant relay limit — Radiant's floor is 1 photon). "
+            "Fund the mint from a larger UTXO."
         )
     change_output.satoshis = change_value
 

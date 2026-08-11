@@ -582,7 +582,7 @@ class TestNftDustLimit:
     def test_value_below_dust_raises(self):
         probe = GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params())
         under = probe.fee + 545 - self._SIG_MARGIN
-        with pytest.raises(ValueError, match="dust"):
+        with pytest.raises(ValueError, match="uneconomic-output floor"):
             GlyphBuilder().build_nft_transfer_tx(_nft_transfer_params(nft_value=under))
 
     def test_value_at_or_above_dust_succeeds(self):

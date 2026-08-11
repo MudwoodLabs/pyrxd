@@ -14,7 +14,6 @@ Bitcoin's legacy format (no SegWit, no EF extension).
 
 from __future__ import annotations
 
-import hashlib
 import time
 
 from pyrxd.compactsize import encode_compact_size
@@ -30,6 +29,7 @@ from .codehash import (
     compute_p2sh_address_from_redeem,
     compute_p2sh_code_hash,
     compute_p2sh_script_pubkey,
+    hash160,
     hash256,
 )
 from .fee_policy import (
@@ -217,9 +217,9 @@ def _assert_fee_clears_relay_floor(
     (:func:`_validate_fee_sats`), which catches an accounting impossibility but says
     nothing about viability. Radiant's ``AcceptToMemoryPool`` rejects
     ``nModifiedFees < GetEffectiveMinRelayFee(height).GetFee(tx.GetTotalSize())``
-    (``src/validation.cpp:778``) with ``66: min relay fee not met``, and **Radiant has
-    neither RBF nor CPFP** — ``src/validation.cpp:667``/``:856`` reject a mempool conflict
-    outright and ``src/miner.cpp:380`` selects on the transaction's own
+    (``src/validation.cpp:779``) with ``66: min relay fee not met``, and **Radiant has
+    neither RBF nor CPFP** — ``src/validation.cpp:667``/``:866`` reject a mempool conflict
+    outright and ``src/miner.cpp:404`` selects on the transaction's own
     ``GetModifiedFeeRate()``. So an under-fee'd Gravity tx cannot be replaced, cannot be
     bumped by a child, and squats on the UTXO it spends until ``DEFAULT_MEMPOOL_EXPIRY``
     (8h) frees it for a rebuild. Handing the caller a plausible ``txid`` and plausible
@@ -350,7 +350,9 @@ def build_maker_offer_tx(
     # Derive Maker's compressed pubkey and P2PKH scriptCode for signing.
     raw_key = maker_privkey.unsafe_raw_bytes()
     maker_pub = coincurve.PrivateKey(raw_key).public_key.format(compressed=True)
-    maker_pkh = hashlib.new("ripemd160", hashlib.sha256(maker_pub).digest()).digest()
+    # pyrxd.hash.hash160, not hashlib.new("ripemd160", ...): the latter raises on
+    # any OpenSSL-3 host whose legacy provider is unloaded.
+    maker_pkh = hash160(maker_pub)
     p2pkh_script_code = b"\x76\xa9\x14" + maker_pkh + b"\x88\xac"
 
     # Two output modes, selected by whether the caller provides change_address:

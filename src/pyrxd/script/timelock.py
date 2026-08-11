@@ -45,6 +45,14 @@ from enum import Enum
 
 from ..constants import LOCKTIME_THRESHOLD as _LOCKTIME_THRESHOLD
 from ..constants import PUBLIC_KEY_HASH_BYTE_LENGTH, OpCode
+from ..constants import (
+    PUBLIC_KEY_HASH_BYTE_LENGTH,
+    SEQUENCE_FINAL,
+    SEQUENCE_LOCKTIME_DISABLE_FLAG,
+    SEQUENCE_LOCKTIME_MASK,
+    SEQUENCE_LOCKTIME_TYPE_FLAG,
+    OpCode,
+)
 from ..security.errors import ValidationError
 from ..security.types import Hex20
 from ..utils import encode_int
@@ -59,14 +67,16 @@ from ..utils import encode_int
 # exported it since it was added.
 LOCKTIME_THRESHOLD = _LOCKTIME_THRESHOLD
 
-# Max nLockTime is a 32-bit field on the wire.
-_MAX_LOCKTIME = 0xFFFF_FFFF
+# Max nLockTime is a 32-bit field on the wire — the same 32-bit ceiling as
+# CTxIn::SEQUENCE_FINAL, taken from the one place that value is written down.
+_MAX_LOCKTIME = SEQUENCE_FINAL
 
-# BIP-112 OP_CHECKSEQUENCEVERIFY encoding constants.
-# A 32-bit value on the stack; only the low 17 bits are used at consensus.
-_CSV_TYPE_FLAG = 1 << 22  # bit 22: 0 = blocks, 1 = time (512-second units)
-_CSV_DISABLE_FLAG = 1 << 31  # bit 31: 1 = "no relative lock" (consensus-disabled bit)
-_CSV_VALUE_MASK = 0xFFFF  # low 16 bits hold the unit count
+# BIP-112 OP_CHECKSEQUENCEVERIFY encoding constants live in
+# :mod:`pyrxd.constants`, derived from Radiant's ``CTxIn`` and pinned to the
+# vendored header by the consensus differential. This module used to carry its
+# own copy of all three, as did ``btc_wallet/taproot.py`` — two independent
+# transcriptions of one consensus rule, which is the exact condition that
+# produced three ref-walker bugs in two days.
 
 
 class CsvKind(Enum):
@@ -83,11 +93,11 @@ def build_csv_sequence(units: int, kind: CsvKind) -> int:
     ``units`` is the BIP-112 unit count: blocks for ``CsvKind.BLOCKS``,
     or 512-second intervals for ``CsvKind.TIME_512_SECONDS``. Must be in
     the range ``[0, 65535]`` (16 bits)."""
-    if not (0 <= units <= _CSV_VALUE_MASK):
-        raise ValidationError(f"CSV unit count out of range: {units} not in [0, {_CSV_VALUE_MASK}]")
-    encoded = units & _CSV_VALUE_MASK
+    if not (0 <= units <= SEQUENCE_LOCKTIME_MASK):
+        raise ValidationError(f"CSV unit count out of range: {units} not in [0, {SEQUENCE_LOCKTIME_MASK}]")
+    encoded = units & SEQUENCE_LOCKTIME_MASK
     if kind is CsvKind.TIME_512_SECONDS:
-        encoded |= _CSV_TYPE_FLAG
+        encoded |= SEQUENCE_LOCKTIME_TYPE_FLAG
     elif kind is not CsvKind.BLOCKS:  # pragma: no cover — Enum exhausts the choices
         raise ValidationError(f"unknown CsvKind: {kind!r}")
     return encoded
@@ -140,7 +150,7 @@ def build_p2pkh_with_csv_script(owner_pkh: Hex20, sequence: int) -> bytes:
     """
     if not (0 <= sequence <= _MAX_LOCKTIME):
         raise ValidationError(f"sequence out of range: {sequence} not in [0, {_MAX_LOCKTIME}]")
-    if sequence & _CSV_DISABLE_FLAG:
+    if sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG:
         raise ValidationError(
             f"sequence has disable bit (1<<31) set ({sequence:#x}); this would make the relative time-lock a no-op"
         )

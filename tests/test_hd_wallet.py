@@ -1675,7 +1675,7 @@ class TestBuildSendTxOffline:
         w = HdWallet.from_mnemonic(MNEMONIC)
         _seed_wallet_with_used_addresses(w)
         triples = self._triples(w)
-        with pytest.raises(ValidationError, match="dust"):
+        with pytest.raises(ValidationError, match="send-policy floor"):
             w.build_send_tx(triples, _RECIPIENT_ADDR, photons=100)
 
     def test_negative_photons_raises(self):
@@ -1784,7 +1784,7 @@ class TestBuildSendMaxTxOffline:
         addr = w._derive_address(0, 0)
         pk = w._privkey_for(0, 0)
         triples = [(_utxo(value=500), addr, pk)]
-        with pytest.raises(ValidationError, match="dust"):
+        with pytest.raises(ValidationError, match="send-policy floor"):
             w.build_send_max_tx(triples, _RECIPIENT_ADDR)
 
     def test_total_under_fee_raises(self):

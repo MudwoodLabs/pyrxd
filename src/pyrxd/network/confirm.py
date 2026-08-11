@@ -39,7 +39,9 @@ __all__ = [
 
 logger = logging.getLogger(__name__)
 
-# Radiant blocks target ~5 minutes; a 10s poll is well inside one block and matches
+# Radiant blocks target ~5 minutes (`nPowTargetSpacing = 5 * 60`,
+# Radiant-Core/src/chainparams.cpp:117 @ v3.1.2 — mainnet; testnet, scalenet and
+# regtest use the same 300s); a 10s poll is well inside one block and matches
 # the interval the CLI has always used.
 DEFAULT_POLL_INTERVAL_S: float = 10.0
 DEFAULT_CONFIRMATION_TIMEOUT_S: float = 1800.0

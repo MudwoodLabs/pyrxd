@@ -6,6 +6,55 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-08-11
+
+A security release. Most of it was found by asking a different question.
+
+Nine transaction builders had never been put in front of a node — every test that covered them
+was offline. Putting them there found defects in five, including two that had shipped for
+several releases: **`glyph transfer-ft` could send the sender's entire balance**, and **every
+MUT and WAVE reveal was rejected by consensus**, so no WAVE name could ever be registered.
+Fixing the second exposed a defect in the core signing path — the BIP143 `hashOutputHashes`
+walker desynchronised on `OP_REQUIREINPUTREF`, producing an invalid signature on *every* input
+of a transaction paying to such a script.
+
+**Fees are the other half.** Radiant has neither RBF nor CPFP, so a transaction built below
+the relay floor cannot be repaired — it holds its inputs until the 8-hour mempool expiry. Ten
+builders accepted a fee on trust, and four more sized their fee from a *trial* signature and
+never re-measured the final one, so roughly a quarter of plain sends and NFT transfers were
+built below the floor. `pyrxd.fee_sizing` is now the single answer to "what fee must this
+transaction pay", and every builder binds to it.
+
+Hostile server responses now fail closed. Several guards read a field through Python
+truthiness, so a present-but-falsy value inverted their meaning: the watchtower could read an
+already-claimed HTLC as unclaimed and silently suppress its page, and a forged confirmation
+depth passed the gate before SPV finalize.
+
+**The most uncomfortable findings were about the tests, not the code.** A differential test
+whose purpose was catching sighash bugs carried the same wrong opcode set as the bug it
+guarded, and certified it as correct. A `conftest` marker silently excluded 26 of 55 security
+tests from every CI run, via a substring that never once matched what it was written for. Six
+guards could not detect the defect they existed to prevent. Those are fixed, and each fix was
+proved by planting the defect and watching the test go red.
+
+Consensus rules pyrxd re-implements are now pinned to Radiant Core source that is vendored,
+digest-checked, and *parsed* rather than transcribed — the ref-opcode family, the operand
+widths, and the script walkers.
+
+### Upgrade notes
+
+- **Fee floors are enforced, not advisory.** Builders that previously accepted any `fee` /
+  `fee_rate` now refuse one below Radiant's relay floor. If you were passing a low fee, you
+  were building transactions the network would not relay; they now raise instead. Legitimate
+  sub-floor cases (a lower-floor node, a trial sizing pass) take an explicit opt-out.
+- **`DeadlineFeePolicy.protocol_floor_per_kb` now defaults to the effective relay rate**
+  (10,000,000/kB), not the legacy 1,000,000. Pass `allow_below_protocol_floor=True` if you
+  genuinely target a lower-floor node.
+- **`GlyphBuilder.build_nft_transfer_tx` and the RSWP v3 covenant builders validate their fee
+  rate up front**, so a bad rate fails at the call rather than on broadcast.
+- A malformed WIF, xprv or signature no longer appears in an exception message. If you were
+  parsing error text to recover the offending value, it is gone deliberately.
+
 ### Security
 
 - **Four more CompactSize readers accepted non-canonical encodings; the audit that fixed
@@ -48,6 +97,90 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   claim path pays to, making this a hard failure rather than a degraded mode on every
   affected platform. Not reproducible on a box where OpenSSL still exposes RIPEMD160, which
   is why it survived; `tests/test_hash_single_source.py` simulates the refusing environment.
+- **Four parsers accepted input Radiant's consensus code rejects.** Each takes
+  attacker-controlled bytes — an advert's source transaction, an ElectrumX response, a
+  watchtower blob, a presigned recovery file — and each was more permissive than the node,
+  which is not a convenience: it reports "valid" for bytes that can never confirm, and
+  re-serializes them to *different* bytes, so a txid taken over the parse names a
+  transaction the input bytes do not encode.
+
+  - **`Script._build_chunks` clamped a truncated push and was blind to ref operands.** Where
+    Radiant's `GetScriptOp` (`script.cpp:662-731`) returns **false**, pyrxd read "as many
+    bytes as are left" and appended a chunk, so `Script(b"\x05\xaa\xbb")` — a push declaring
+    5 bytes with 2 present — parsed cleanly and `is_push_only()` returned `True`, while
+    `CScript::IsPushOnly` (`script.cpp:537-553`) returns `False` the moment `GetOp` fails.
+    `SCRIPT_VERIFY_SIGPUSHONLY` is applied to every connected block
+    (`validation.cpp::GetNextBlockScriptFlags`), so that answer called a scriptSig valid that
+    no block can contain. The walk was also ref-blind: `d0 <36-byte ref> ac` produced **7**
+    chunks instead of 2, reading the ref's own bytes as opcodes — the fourth instance of the
+    class that produced three bugs in two days. `_build_chunks` now mirrors `GetScriptOp`
+    exactly, using the shared `REF_OPERAND_OPCODES` / `REF_OPERAND_WIDTH`, and **refuses a
+    malformed script by default**. The one caller that legitimately needs leniency —
+    transaction deserialization, because a scriptPubKey is only executed when the output is
+    *spent*, so an unwalkable one is valid in a block — opts in explicitly with
+    `Script(..., allow_malformed=True)`, which stops the walk where `GetOp` does and records
+    the offset in `Script.truncated_at` instead of inventing a chunk. `is_push_only()` fails
+    closed on it and `to_asm()` appends `[error]`, as `ScriptToAsmStr` does
+    (`core_write.cpp:117-120`).
+  - **`Script.from_chunks` rewrote non-minimal pushes.** It ran every chunk through
+    `encode_pushdata`, which normalises, so `from_chunks(Script(x).chunks)` was not the
+    identity: `4c 02 aa bb` came back as `02 aa bb`. `find_and_delete` is built on it, so a
+    call that deleted nothing could still change a script's bytes — and its hash. Chunks now
+    re-emit their own declared encoding.
+  - **`TransactionInput.from_hex` failed open where `TransactionOutput.from_hex` fails
+    closed.** Same file, same wire format, opposite behaviour on a script-length varint that
+    over-claims. Inside a transaction such a varint does not run off the end — it eats the
+    fields that follow and every later boundary slides: a 63-byte blob parsed "successfully"
+    into a transaction with one input, **zero** outputs and 8 bytes left unread, which
+    re-serialized to 56 different bytes. The input parser now refuses the over-claim exactly
+    as the output parser does; `Transaction.from_hex` additionally requires a whole-buffer
+    parse to end at EOF (a `Reader` argument still streams, for `from_beef`).
+  - **`Reader`'s fixed-width reads zero-extended a short read.** `int.from_bytes` turned two
+    remaining bytes of a four-byte field into a plausible number rather than an error, so
+    version, vout, sequence, locktime and satoshis could each decode from a truncated
+    transaction. `read_exact` now backs all of them and returns `None` unless the full field
+    is present.
+  - **`deserialize_ecdsa_der` checked only the length arithmetic.** Encoding was enforced on
+    the way out and not on the way in, so a negative `r`/`s`, a non-minimally-encoded one, a
+    body over 72 bytes, or a **high-S** signature all decoded happily. `SCRIPT_VERIFY_LOW_S`
+    and `SCRIPT_VERIFY_STRICTENC` are both applied to every connected block
+    (`GetNextBlockScriptFlags`), and `VerifyScript` ORs `STRICTENC` in whenever
+    `SIGHASH_FORKID` is set, so these are consensus rules on this chain, not policy —
+    `fRequireStandard` is hardcoded `false` (`validation.cpp:271`), which makes the
+    policy/consensus distinction load-bearing. All of `IsValidDERSignatureEncoding`'s rules
+    plus `CheckLowS` are now applied on decode. `require_low_s=False` is the explicit
+    opt-out for inspecting a foreign or pre-BIP146 signature; the encoding rules are never
+    relaxed.
+
+- **BIP68 sequence-lock constants were defined in two modules and hand-typed in a third
+  place.** `script/timelock.py` and `btc_wallet/taproot.py` each carried a private copy of
+  `1 << 31` / `1 << 22` / `0xFFFF`, `gravity/eth_rxd_timelock.py` a fourth spelling of the
+  mask, and `tests/test_htlc_spend_productized.py` cited `interpreter.cpp` **in a comment**
+  while asserting a hand-typed `1 << 22` — a transcription cannot detect the constant it
+  transcribed moving. All five now come from `pyrxd.constants`
+  (`SEQUENCE_FINAL`, `SEQUENCE_LOCKTIME_DISABLE_FLAG`, `SEQUENCE_LOCKTIME_TYPE_FLAG`,
+  `SEQUENCE_LOCKTIME_MASK`, `SEQUENCE_LOCKTIME_GRANULARITY`, plus `BIP68_MIN_TX_VERSION`),
+  derived from Radiant's `CTxIn` and pinned to the vendored header the way the ref-opcode
+  constants are. This governs HTLC refund maturity, and Radiant has neither RBF nor CPFP: a
+  refund that misjudges maturity by one block cannot be repaired.
+
+- **`gravity/codehash.hash160` bypassed the OpenSSL-3 fallback `pyrxd.hash` exists to
+  provide**, as did `gravity/transactions.py`, `btc_wallet/keys.py` and three examples.
+  `hashlib.new("ripemd160", ...)` raises wherever OpenSSL 3 leaves RIPEMD160 in the unloaded
+  legacy provider — Ubuntu 24.04, Debian 12, the python.org macOS installer, Pyodide/WASM —
+  so Gravity's `expectedClaimedCodeHash` could not be computed at all there. **Not
+  reproducible on the machine this was found on** (its OpenSSL still exposes RIPEMD160), so
+  it is a portability defect rather than a live bug; `pyrxd.hash`'s own fallback was checked
+  first and is correct (published RIPEMD-160 vectors, `tests/test_ripemd160_fallback.py`).
+  All call sites now route through it.
+
+  Consensus ground truth for all of the above is derived by parsing pinned Radiant Core
+  sources rather than transcribing them. The vendored set grows from `script.h`/`script.cpp`
+  to also cover `primitives/transaction.h`, `script/interpreter.cpp`,
+  `script/sigencoding.cpp`, `script/script_flags.h`, `policy/policy.h` and `validation.cpp`;
+  `tests/consensus_oracle.py` gains extractors for the sequence constants, `CheckSequence`'s
+  semantics, the DER size bounds and encoding gates, and the consensus-vs-policy flag split.
+  New differential: `tests/test_consensus_parser_strictness.py`.
 
 - **`Reader.read_var_int_num` accepted non-canonical CompactSize, under `Transaction`
   deserialization.** `spv/proof.py` and `spv/witness.py` have rejected overlong encodings
@@ -293,8 +426,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`build_maker_offer_tx` and `build_payment_tx` now refuse a fee below the relay floor.**
   Both accepted any non-negative `fee_sats` and returned a fully-populated result —
   plausible `txid`, plausible accounting — for a transaction no node will relay. The
-  Radiant one is **fund safety**: Radiant has neither RBF (`validation.cpp:667`/`:856`
-  reject a mempool conflict outright) nor CPFP (`miner.cpp:380` selects on the
+  Radiant one is **fund safety**: Radiant has neither RBF (`validation.cpp:667`/`:866`
+  reject a mempool conflict outright) nor CPFP (`miner.cpp:404` selects on the
   transaction's own `GetModifiedFeeRate()`), so an under-fee'd offer cannot be replaced or
   bumped and squats on the Maker's funding UTXO until `DEFAULT_MEMPOOL_EXPIRY` (8h). The
   Bitcoin one is recoverable via RBF/CPFP and is guarded so the builder fails closed rather
@@ -421,6 +554,84 @@ a Radiant Core v3.1.1 regtest one.
   the value is already derived from source when an evaluator lands — not wired into a
   plausible-looking check, since a constant with a fake consumer pins nothing while reading
   as though it does.
+- **Bitcoin's rules were being asserted as Radiant's, in code and in comments; the false
+  ones are corrected against Radiant Core `v3.1.2`.** One had already produced a real
+  lockout (the 546-photon check that refused every RSWP v3 FT take whose change fell in
+  1–545 units). The rules, re-verified at source rather than from pyrxd's own docs:
+  `GetDustThreshold` returns **1 satoshi** and `IsDust` is `nValue <= 0`
+  (`src/policy/policy.cpp:19-25`); `fRequireStandard` is hardcoded **`false`**
+  (`src/validation.cpp:271`, re-set unconditionally at `src/init.cpp:1995`), so
+  standardness is **never consulted** — the only reason a 75-byte FT script relays at all,
+  since `Solver` classifies it `TX_NONSTANDARD`; the relay floor is 10,000 photons/byte
+  charged against `GetTotalSize()` (`src/policy/policy.h:49`, `src/validation.cpp:779`);
+  the target block time is **300 s** (`nPowTargetSpacing`, `src/chainparams.cpp:117`).
+
+  - **The dMint miner's OP_RETURN cap is 255 bytes, not 80.** `glyph/dmint/miner.py`
+    refused any `op_return_msg` over 80 bytes as a "standardness limit" — a Bitcoin number,
+    on a chain that never runs `IsStandardTx`, and not even Bitcoin's cap as Radiant would
+    apply it (`nMaxDatacarrierBytes` defaults to `DEFAULT_DATACARRIER_BYTES` = 1024, and
+    Radiant's `MAX_OP_RETURN_RELAY` is 223). The genuine bound is pyrxd's own encoder: it
+    emits `OP_PUSHDATA1`, whose length field is one byte. Both V1 and V2 mint paths, and
+    the `glyph deploy-dmint --op-return` CLI guard, now cap at
+    `pyrxd.constants.MAX_OP_RETURN_MSG_BYTES` = 255 and say why. **Behaviour change**: an
+    81–255-byte message now builds instead of raising.
+
+  - **546 has one definition and an honest label.** It was spelled out about ten times
+    across twelve modules, at least one still describing it as node-enforced.
+    `pyrxd.constants.DUST_THRESHOLD_PHOTONS` is now the single source; `wallet.DUST_THRESHOLD`,
+    `glyph.ft.DUST_LIMIT` (`FT_DUST_LIMIT`), `glyph.mint.NFT_CARRIER_VALUE`,
+    `gravity.htlc_spend.DUST_FLOOR_PHOTONS`, both `_DUST_PHOTONS` in the swap stack and
+    `CommitParams.dust_limit` all alias it. `btc_wallet.payment.DUST_LIMIT` is deliberately
+    **not** aliased — that 546 is Bitcoin's real rule on the BTC leg. The guards are kept
+    where they serve a user (a sub-546 FT *supply* is usually a decimals mistake; sub-546
+    change is uneconomic), but every message now says "pyrxd send-policy floor … Radiant's
+    floor is 1 photon" instead of naming a "dust limit" no node applies. A test fails if a
+    bare operational `546` reappears outside those two modules.
+
+  - **`Transaction.fee()` defaulted to 5 photons/kB — 2,000,000x under the relay floor.**
+    Measured on a two-output P2PKH spend: the default model paid **2 photons** where
+    `AcceptToMemoryPool` requires **2,260,000**. No internal caller used it, but it is
+    public API and Radiant has neither RBF nor CPFP to repair the result.
+    `TRANSACTION_FEE_RATE` now defaults to 10,000,000 photons/kB, the floor itself, and a
+    test pins it to `fee_sizing.RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB` so the two
+    cannot drift. **Behaviour change**; override with `RXD_PY_SDK_TRANSACTION_FEE_RATE`.
+
+  - **The BIP32 hardened-derivation error steered users to Bitcoin's coin type.** Its
+    worked example was `m/44'/0'/0'`; Radiant's SLIP-0044 coin type is **512**, which is
+    what `BIP44_DERIVATION_PATH` already used. Following the example derived a different
+    wallet from the one pyrxd's own default produces.
+
+  - **`num_contracts <= 250` is a pyrxd ergonomics ceiling, not "the standardness ceiling
+    for reveal size".** Kept at 250 (it bounds reveal size and therefore fee); relabelled.
+
+  - **The watchtower's autonomous-claim ceiling is not "the photon analogue" of the BTC
+    refund path's 10,000-sat one.** It is a numeric copy across incomparable units:
+    10,000 photons is *below the relay fee of the claim transaction itself* (~2,660,000
+    photons for a ~266-byte claim), so an un-tuned executor claims nothing rather than
+    "staying dust-only". The number is kept — it fails closed, and arming autonomy for real
+    value is the operator's decision — but the comment no longer implies it is a
+    market-value judgement.
+
+- **Radiant Core line citations are anchored to the tag this repo pins.** They were a mix
+  of unanchored numbers and numbers at `main@afdf57b1`, which left four several lines off
+  at `v3.1.2` — the tag in `tests/vendor/radiant_core/MANIFEST.json`: `init.cpp:1965`→`1995`,
+  `feerate.cpp:51`→`95`, `miner.cpp:380`→`404`, `validation.cpp:856`→`866` (plus
+  `validation.cpp:770`→`774` and `:778`→`779`, and `chainparams.cpp`'s genesis asserts in
+  `network/registry.py`). **Every underlying fact held at both revisions — only the line
+  numbers moved.** `tests/vendor/radiant_core/README.md` now states that the pin is the
+  anchor for citations repo-wide, and a test fails if a stale number reappears.
+- **`pyrxd regtest` now starts its node at Radiant mainnet's relay floor.**
+  `-minrelaytxfee=0.10` and `-fallbackfee=0.10`, instead of leaving `radiantd -regtest`
+  at its default `0.01` — a tenth of what mainnet enforces. Every pyrxd builder sizes
+  fees at 0.10 RXD/kB, so a devnet at 0.01 accepts a transaction one or two bytes short
+  of its own rate and cannot tell a developer that what they just built would be refused
+  on mainnet. A local chain that says yes to what mainnet says no to is worse than no
+  local chain. `-fallbackfee` moves with it because the node's own wallet uses it when it
+  has no fee estimates — which on a fresh regtest chain is always — and `pyrxd regtest
+  fund` goes through `sendtoaddress`; left at `0.001` the wallet would build transactions
+  below the floor it is enforcing. Verified end to end: `regtest up` → the Tier-1
+  quickstart mints and confirms a Glyph → `regtest fund` → `regtest info` → `regtest
+  down`.
 
 - **`radiant_relay_size` and `bitcoin_virtual_size` moved to `pyrxd.fee_sizing`**, which
   #405 established as the single home for fee-sizing rules (it exists at all to break the
@@ -527,7 +738,7 @@ a Radiant Core v3.1.1 regtest one.
   returns 1 satoshi and `IsDust` is `nValue <= 0` (`Radiant-Core/src/policy/policy.cpp:19-25`)
   — and standardness is never consulted at all, since `fRequireStandard` is hardcoded
   `false` (`Radiant-Core/src/validation.cpp:271`, re-set unconditionally at
-  `src/init.cpp:1965`), which is the only reason a 75-byte FT script relays in the first
+  `src/init.cpp:1995`), which is the only reason a 75-byte FT script relays in the first
   place: `Solver` classifies it `TX_NONSTANDARD`. A taker holding 80 units against a 50-unit
   demand could not fill a perfectly valid order, and the suggested workaround — "re-fund the
   exact demanded amount" — costs an extra transaction and an extra fee to split a UTXO for
@@ -580,7 +791,7 @@ a Radiant Core v3.1.1 regtest one.
 - **Two table-driven suites for the blind spots the fixes above came out of** — tests that
   assert exception *types* and supply *well-formed* inputs cannot see either class.
 
-  - `tests/security/test_hostile_server_responses.py` (442 cases) sweeps a named shape space
+  - `tests/security/test_hostile_server_responses.py` (459 collected cases) sweeps a named shape space
     — missing, present-but-falsy (`null` / `0` / `""` / `[]` / `{}`), wrong type, negative,
     non-integral, `Infinity` / `-Infinity` / `NaN`, absurd magnitude, and a response that
     does not correspond to the request — across every value-bearing field at every reachable
@@ -589,9 +800,18 @@ a Radiant Core v3.1.1 regtest one.
     covenant leg. One contract is asserted everywhere: *a value-bearing read either returns
     a correct, well-typed value or raises an `RxdSdkError`* — never a bare `OverflowError` /
     `TypeError` / `ValueError` / `ArithmeticError`, and never a value derived from a field it
-    could not interpret. 227 of the 442 failed before the fixes above.
+    could not interpret. 227 cases failed before the fixes above.
 
-  - `tests/security/test_secret_material_error_paths.py` (39 cases) extends
+    A "case" is one collected pytest item — 29 test functions expanded by
+    `@pytest.mark.parametrize`. This entry previously gave the total as **442** and
+    quoted the failure count as a fraction of it. 442 was never the collected count:
+    `pytest --collect-only` reports **452** at the commit that added the suite (#410)
+    and **459** on this branch (#413 added seven). The 227 figure was measured against
+    the 452-case snapshot before the fixes; it has not been re-measured, and is left
+    as the historical measurement it is rather than rescaled to a denominator it was
+    never taken against.
+
+  - `tests/security/test_secret_material_error_paths.py` (40 collected cases) extends
     `test_key_material_never_echoed.py`'s discipline from the base58/WIF path to every other
     entry point taking caller-supplied secret material — private keys, DER signatures,
     mnemonics in *every shipped wordlist language*, xprv/xpub/chain code, seeds,
@@ -741,6 +961,147 @@ both. It is fixed here.
   from the oracle rather than from `pyrxd.constants`, so it stays a differential rather than
   a restatement of the code it checks. Without it the model reported the guards' new
   strictness as a disagreement.
+- **`tests/test_false_consensus_premises.py` pins every corrected premise above.** Each
+  behaviour change was confirmed failing beforehand against the unmodified tree: the dMint
+  miner refused an 81-, 200- and 255-byte `op_return_msg` on both the V1 and V2 paths;
+  `PoolTooSmallError` read "below 546 dust limit"; `Transaction.fee()`'s default model paid
+  2 photons against a 2,260,000-photon requirement; the BIP32 error printed `m/44'/0'/0'`.
+  Alongside the behavioural cases the file carries three drift guards that read the tree
+  itself — no operational `546` outside the two modules allowed to define one, no
+  "standardness limit is 80" string, and no citation pointing at a line number stale for the
+  pinned Radiant Core tag.
+- **The node-backed lane now runs. It used to be two files out of thirty.** CI's
+  `-m integration` step ran exactly `test_htlc_regtest_e2e.py` and
+  `test_soulbound_covenant_regtest.py`; the other ~28 integration modules — wallet sends,
+  FT transfer and airdrop, MUT/WAVE, containers, the Gravity maker offer, cold recovery,
+  RSWP v2/v3, dMint, the builder fee floors, the BTC↔RXD and ETH↔RXD legs — were one-shot
+  manual and rotted accordingly:
+  `test_airdrop_with_an_advisory_royalty_output_is_accepted` sat broken on `main` from
+  #393 until #404 found it, because nothing ran it.
+
+  New workflow `.github/workflows/integration.yml`, split by cost rather than by
+  importance:
+
+  - `regtest-core` — per push/PR, path-filtered so a docs-only change starts no nodes.
+    The Tier-1 quickstart (moved verbatim from `ci.yml`'s `quickstart` job) plus eleven
+    Radiant covenant/builder suites. **Measured 119 s of pytest** across those eleven,
+    each standing up its own container.
+    Measured **on the runner**: **78 passed, 2 skipped in 135 s** of pytest, **3 m 31 s**
+    for the whole job including the docker build, `poetry install` and the quickstart.
+    (The 2 skips are the BTC half of `test_remaining_builder_floors_regtest_e2e`, which
+    runs in `nightly-btc-family` where a bitcoind exists.)
+  - Nightly (and `workflow_dispatch`), as parallel jobs so the wall-clock is the slowest
+    job and not their sum: RSWP (**42 s**, 11 cases), dMint's proof-of-work suites
+    (V1 **80-219 s**, V2 + premine **396 s**, on a 32-core box — the covenant's ~2⁻³³
+    per-nonce gate is baked into the contract, not a knob, so this is the one lane a
+    4-vCPU runner is materially slower at, and its `timeout-minutes` is wide to match),
+    the SPV covenant differential matrix (**9 s** for 22 cases) with its PoW pre-grind
+    (cached between runs), bitcoind (**14 s**) + litecoind (**7 s**), and the cross-chain
+    legs (BTC↔RXD **65 s**, ETH↔RXD **58 s**).
+  - `vendor-freshness` — `scripts/refresh_radiant_core_vendor.py --check`, which had no
+    scheduled owner at all despite the vendor README naming one.
+
+  `ci.yml` keeps only the fast offline gate. Neither new job is a required check;
+  `test (3.12)` and `lint` still are.
+
+- **The shared regtest node now runs at MAINNET's relay floor, and says so.**
+  `_RegtestNode` starts `radiantd` with `-minrelaytxfee=0.10` by default and asserts
+  `getmempoolinfo`'s `effective_minrelaytxfee` reports it back before the fixture yields.
+  A default `radiantd -regtest` advertises **0.01 RXD/kB, a tenth of mainnet**, while
+  every pyrxd builder sizes fees at the mainnet floor — so on a default node a
+  transaction one or two bytes short of its own rate is accepted anyway and the node
+  cannot contradict the builder. That is precisely how `build_nft_transfer_tx` shipped
+  under-fee'ing ~25% of NFT transfers through four releases with green regtest suites.
+  Every Radiant suite sharing the fixture is now judged at the rate it ships with.
+
+  What that surfaced, all of it in hand-rolled test constants rather than in shipped
+  code: `_pay_to_spk`'s plumbing fee (1 000 000 photons against a 2 260 000 requirement
+  on its own 226-byte transaction — it funds 14 suites, so every one of them failed in
+  setup) now sizes itself from the node's advertised rate and re-measures the signed
+  transaction; the dMint commit/reveal values were too small to pay a mainnet-floor fee
+  out of and were rescaled; the Gravity maker-offer `_FEE` was below the floor for its
+  own ~190-byte offer; and the two FT "inflating output" negative controls computed a
+  negative change output. No production builder needed a change — they already default
+  to 0.10.
+
+  Three suites deliberately stay at the legacy 0.01 floor — `test_rswp_regtest_e2e.py`,
+  `test_xchain_swap_regtest_e2e.py` and `test_xchain_eth_swap_regtest_e2e.py` — because
+  what they prove is orderbook, covenant and cross-chain-sequencing *semantics*, and
+  their carriers are sized around their own fee constants (one case asserts a remainder
+  on chain against `8_000_000 - _FEE`). Each now passes `-minrelaytxfee=0.01`
+  **explicitly** and asserts `getmempoolinfo` reports it back, so the rate their fees
+  assume can no longer silently desync from the rate the node enforces. Every Radiant
+  node the test tree starts therefore declares its floor and verifies it; none inherits
+  one. The fee floors of those same builders are proven at the mainnet floor in
+  `test_fee_floor_boundary_regtest_e2e.py` and
+  `test_remaining_builder_floors_regtest_e2e.py`.
+
+- **The first thing the lane caught: a 2.1%-per-run flake in
+  `test_fee_floor_boundary_regtest_e2e.py`.** `_covenant_boundary` searches for a build
+  that lands exactly on its own relay floor, and gave up after 12 tries with "no build
+  landed exactly on its own relay floor". It failed on this lane's very first CI run —
+  broken since #414 added it, invisible because the suite had never run in CI.
+
+  Measured offline over 400 draws: a single draw settles **31.5%** of the time (40%
+  oscillate on the fee↔size fixed point — the fee is part of the signed output value, so
+  changing it re-signs the input and can move the DER length between 71 and 72 bytes;
+  29% land the one-photon-under build on a different size). 12 tries therefore fail
+  `0.685**12` = **1.1% per test, 2.1% per run of the file**. Each try also rebuilt the
+  whole covenant — two chain operations — so the expensive part was the part that did
+  not help.
+
+  Fixed the way #413 fixed `_fee_at_exactly`: find a **size-neutral** redraw of the DER
+  length. A refund PKH is 20 bytes at every value, so it cannot change the transaction's
+  size, but it does change the sighash. The covenant is now drawn once and up to 40 fresh
+  refund PKHs are tried against it, at zero chain cost. Re-measured over 300 covenants:
+  **0 failures, median 2 redraws, worst case 20.**
+
+- **`build_finalize_tx`'s fee guard is now proved at a node, with a real SPV proof
+  (S-4).** It was offline-covered only, for a structural reason: the spend has to satisfy
+  the MakerClaimed covenant's committed `btcChainAnchor`, and a faked proof is refused at
+  the script level — a verdict that says nothing about the fee. A genuine proof *is*
+  constructible on regtest, and `test_spv_covenant_differential_regtest.py` already
+  grinds one that S-1 shows the deployed covenant accepts, so the new case reuses it:
+  exactly at the node's advertised floor the builder returns the transaction and the node
+  accepts it; one photon under, the builder raises `InsufficientFundsError` and the
+  transaction forced past the guard is refused by the node for `66: min relay fee not
+  met`. Measured: **11 950 bytes, floor 119 500 000 photons.** This is by far the largest
+  transaction the module builds — the 12 header slots, the 20-level branch, the whole BTC
+  payment tx and the unrolled covenant redeem script all go into one scriptSig — so its
+  floor is an order of magnitude above a claim's, and with neither RBF nor CPFP an
+  under-fee'd finalize cannot be bumped while the Taker's BTC is already spent. The
+  suite's own `_FEE_SATS` was 30 000 000, sized for a node relaying at a tenth of the
+  rate: a quarter of what the transaction actually needs.
+
+- **`tests/test_wallet_send_regtest_e2e.py`'s fee boundary control, confirmed on a node.**
+  #413 made `_fee_at_exactly` deterministic offline (nLockTime redraws the DER length
+  instead of hoping the size fixed point converges) and flagged that a regtest run was
+  still owed. Run: the whole module 17 passed, and the boundary control on its own
+  **20 times out of 20 on fresh keys**, with both DER outcomes represented (191 bytes 5
+  times, 192 bytes 15) — so the node saw both branches of the oscillation that used to
+  make this control fail ~44% of the time. The node's verdict each time:
+  `66: min relay fee not met` at one photon under, accepted at the floor. And now at the
+  mainnet rate rather than a tenth of it, since the node moved. Its `_relay_floor` also
+  stopped reading `getnetworkinfo`'s `relayfee` and reads `getmempoolinfo`'s
+  `effective_minrelaytxfee`, the field `AcceptToMemoryPool` actually applies; the two
+  agree on this node, which is exactly why the wrong one could sit there unnoticed.
+
+- **The vendored Radiant-Core consensus sources have a staleness owner.**
+  `tests/vendor/radiant_core/` is sha256-pinned and `refresh_radiant_core_vendor.py
+  --check` worked, but nothing anywhere ran it — the vendor README referred to a
+  scheduled job that did not exist. It is now the `vendor-freshness` job (nightly +
+  `workflow_dispatch`) and `task check-vendor` by hand; deliberately not a pytest test,
+  because it needs github.com and a test that skips or reddens when GitHub is
+  unreachable is worse than none.
+
+  `--check` also gained a second comparison. The manifest pins the tag the *source* came
+  from (`v3.1.2`) while `pyrxd.devnet.DEFAULT_RADIANT_VERSION` pins the release the
+  regtest image's *binary* is built from (`v3.1.1`), and the digest proves only that the
+  vendored bytes are self-consistent — not that they describe the interpreter the lane
+  runs. Measured: `script.h` (`3de78962…`) and `script.cpp` (`759ab524…`) are
+  byte-identical at both tags, so today's gap is immaterial and the opcode/ref oracle
+  does describe the node under test. `--check` now verifies that rather than assuming it,
+  and fails if a future image bump lands on a release whose consensus sources differ.
 
 - **Verification-integrity sweep: six guards that could not detect the bug they exist to
   catch.** Every fix below is proved by mutation — the defect is planted, the new test is

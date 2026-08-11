@@ -2,15 +2,17 @@
 
 Why this module exists (gap-closure plan A1, spike 2026-08-09)
 --------------------------------------------------------------
-**Radiant supports neither RBF nor CPFP.** Verified against ``Radiant-Core`` @
-``afdf57b1`` and the live mainnet node (Radiant Core 3.1.2):
+**Radiant supports neither RBF nor CPFP.** Verified against ``Radiant-Core`` @ tag
+``v3.1.2`` (the version pinned in ``tests/vendor/radiant_core/MANIFEST.json``; every
+``src/...:N`` line number in this module is at that tag) and the live mainnet node
+(Radiant Core 3.1.2):
 
-* **No RBF.** ``src/validation.cpp:667`` and ``:856`` reject any mempool conflict
+* **No RBF.** ``src/validation.cpp:667`` and ``:866`` reject any mempool conflict
   outright (``txn-mempool-conflict`` / ``REJECT_DUPLICATE``). The only ``bip125``
   string in the tree is a DEPRECATED help label; there is no ``bumpfee`` RPC.
   Radiant ships DSProof (double-spend *proofs*) — it treats a conflict as fraud to
   broadcast, the opposite of replacement.
-* **No CPFP.** ``src/miner.cpp:380`` selects on ``GetModifiedFeeRate()`` =
+* **No CPFP.** ``src/miner.cpp:404`` selects on ``GetModifiedFeeRate()`` =
   ``(nFee + feeDelta) / vsize`` — the transaction's OWN fee over its OWN size — and
   ``break``s at ``blockMinFeeRate``. The ``backlog`` queue is topological ordering
   only. A high-fee child cannot lift a low-fee parent into a block.
@@ -29,17 +31,17 @@ What the policy is, and is not
 :meth:`DeadlineFeePolicy.min_relay_fee` is a **derivation** of the node's own check,
 not an invention. ``AcceptToMemoryPool`` rejects with ``min relay fee not met`` when
 ``nModifiedFees < GetEffectiveMinRelayFee(height).GetFee(nSize)``
-(``src/validation.cpp:778``), where:
+(``src/validation.cpp:779``), where:
 
 * ``nSize = tx.GetTotalSize()`` — the **full serialized size**. The source carries an
   explicit "Do not change this to use virtualsize without coordinating a network
-  policy upgrade" (``src/validation.cpp:770``). So the correct input is
+  policy upgrade" (``src/validation.cpp:774``). So the correct input is
   ``len(tx.serialize())``, measured after signing, not an estimate and not a vsize.
 * the rate is ``RADIANT_CORE_2_MIN_RELAY_TX_FEE_PER_KB`` = **10,000,000 photons/kB**
   post-upgrade (``src/policy/policy.h:49``), vs the legacy 1,000,000
   (``:47``) — which is why ``getmempoolinfo`` reports ``effective_minrelaytxfee``
   0.10 RXD/kB alongside ``minrelaytxfee`` 0.01. **The effective one is what binds.**
-* ``CFeeRate::GetFee`` **truncates** (``ceil=false``, ``src/feerate.cpp:51``). We round
+* ``CFeeRate::GetFee`` **truncates** (``ceil=false``, ``src/feerate.cpp:95``). We round
   **up** instead, so this is at most one photon stricter than the node — deliberately,
   because being one photon short is a broadcast you cannot take back.
 

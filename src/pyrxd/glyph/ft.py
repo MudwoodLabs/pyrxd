@@ -67,6 +67,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.fee_sizing import (
     SIG_SIZE_SLACK_BYTES,
     assert_fee_rate_clears_relay_floor,
@@ -94,9 +95,10 @@ MIN_FEE_RATE: int = relay_floor_photons_per_byte()  # photons / byte
 # (Radiant-Core/src/policy/policy.cpp:19-25) — and standardness is not consulted
 # at all, since ``fRequireStandard`` is hardcoded ``false``
 # (Radiant-Core/src/validation.cpp:271, re-set unconditionally at
-# src/init.cpp:1965), which is the only reason a 75-byte FT script relays in the
+# src/init.cpp:1995), which is the only reason a 75-byte FT script relays in the
 # first place (``Solver`` classifies it ``TX_NONSTANDARD``). So there is no path
-# by which a sub-546 output is rejected.
+# by which a sub-546 output is rejected. (Line numbers are @ tag ``v3.1.2``, the
+# version pinned in ``tests/vendor/radiant_core/MANIFEST.json``.)
 #
 # It is used ONLY as a fold-to-fee threshold for the plain-RXD CHANGE output.
 # It is deliberately NOT a floor on a token output: an FT output's value IS its
@@ -104,10 +106,13 @@ MIN_FEE_RATE: int = relay_floor_photons_per_byte()  # photons / byte
 # and the comment that used to sit here, "standard relay dust threshold", is
 # exactly the false premise that produced that class of refusal elsewhere in
 # this SDK.
-DUST_LIMIT: int = 546  # photons — pyrxd change-output policy; see above
+#
+# Aliased from :data:`pyrxd.constants.DUST_THRESHOLD_PHOTONS` (the one definition);
+# the name is kept because it is public API and re-exported as ``FT_DUST_LIMIT``.
+DUST_LIMIT: int = DUST_THRESHOLD_PHOTONS  # photons — pyrxd change-output policy; see above
 
 # A pyrxd ergonomics guard, NOT a chain rule. Radiant's ``MAX_STANDARD_TX_SIZE``
-# is 20_000_000 bytes (``Radiant-Core/src/policy/policy.h:69`` @ ``afdf57b1``),
+# is 20_000_000 bytes (``Radiant-Core/src/policy/policy.h:69`` @ ``v3.1.2``),
 # so an airdrop is limited by what it costs, not by what relays: one FT output is
 # 84 serialised bytes (75-byte script + 8-byte value + 1-byte length), which at
 # the 10_000 photons/byte relay floor is ~840_000 photons — 0.0084 RXD — of fee
@@ -129,7 +134,7 @@ def _check_fee_rate(fee_rate: int) -> None:
     """Reject a fee rate the network will not relay.
 
     Radiant has neither RBF nor CPFP (threat-model S21, verified against
-    ``Radiant-Core`` @ ``afdf57b1``), so an under-fee'd transaction cannot be
+    ``Radiant-Core`` @ ``v3.1.2``), so an under-fee'd transaction cannot be
     bumped by any means: it squats on its own inputs until mempool expiry, 8
     hours later. That makes a sub-floor rate a fund-safety bug, not a tuning
     mistake, which is why this refuses rather than warns.

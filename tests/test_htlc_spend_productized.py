@@ -22,6 +22,12 @@ import hashlib
 
 import pytest
 
+from pyrxd.constants import (
+    BIP68_MIN_TX_VERSION,
+    SEQUENCE_FINAL,
+    SEQUENCE_LOCKTIME_DISABLE_FLAG,
+    SEQUENCE_LOCKTIME_TYPE_FLAG,
+)
 from pyrxd.gravity.htlc_covenant import (
     build_htlc_covenant_ft,
     build_htlc_covenant_nft,
@@ -154,20 +160,25 @@ def test_refund_scriptsig_is_op1_selector_only():
 def test_refund_is_v2_with_csv_nsequence():
     cov = _rxd_cov(csv=6)
     tx = build_htlc_refund_tx(covenant=cov, covenant_outpoint="cd" * 32 + ":0", carrier_value=100_000, fee=_fee())
-    assert tx.version == 2  # BIP68 requires v2
+    assert tx.version == BIP68_MIN_TX_VERSION  # CheckSequence returns false below v2
     assert tx.inputs[0].sequence == 6  # nSequence encodes refund_csv (block count)
     # The predicate that matters is the DISABLE BIT, not "< SEQUENCE_FINAL".
-    # CheckSequence fails only when bit 31 is set
-    # (Radiant-Core/src/script/interpreter.cpp:2802; SEQUENCE_LOCKTIME_DISABLE_FLAG
-    # = 1<<31, src/primitives/transaction.h:126) — and 0x80000000 is BOTH less
-    # than 0xFFFFFFFF and disabled, so the old `< 0xFFFFFFFF` check would have
+    # CheckSequence fails only when bit 31 is set — and 0x80000000 is BOTH less
+    # than SEQUENCE_FINAL and disabled, so the old `< 0xFFFFFFFF` check would have
     # passed a sequence that switches the relative lock off entirely. It also
     # could not fail here at all, since the line above already pins the value.
-    assert tx.inputs[0].sequence & (1 << 31) == 0  # relative lock engages
-    # Bit 22 clear = block units, not 512-second units (SEQUENCE_LOCKTIME_TYPE_FLAG,
-    # transaction.h:133): a "6" read as time would be 51 minutes, not 6 blocks.
-    assert tx.inputs[0].sequence & (1 << 22) == 0
-    assert tx.inputs[1].sequence == 0xFFFFFFFE  # fee input < FINAL, carries no lock
+    #
+    # These constants are IMPORTED, not hand-typed. Citing interpreter.cpp in a
+    # comment while asserting a literal `1 << 22` is the anti-pattern that let
+    # the ref-operand rule be wrong in four places at once: a transcription
+    # cannot detect the thing it transcribed moving. pyrxd.constants derives
+    # these from the vendored CTxIn header, and
+    # tests/test_consensus_parser_strictness.py re-checks them against it.
+    assert tx.inputs[0].sequence & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0  # relative lock engages
+    # Type flag clear = block units, not 512-second units: a "6" read as time
+    # would be 51 minutes, not 6 blocks.
+    assert tx.inputs[0].sequence & SEQUENCE_LOCKTIME_TYPE_FLAG == 0
+    assert tx.inputs[1].sequence == SEQUENCE_FINAL - 1  # fee input < FINAL, carries no lock
 
 
 def test_refund_single_output_to_maker_holder():

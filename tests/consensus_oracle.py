@@ -1,8 +1,14 @@
 """Derive Radiant consensus facts by parsing the vendored C++ sources.
 
 This module is the *oracle* half of the consensus differential tests. It reads
-``tests/vendor/radiant_core/script.h`` and ``script.cpp`` — verbatim, pinned
-copies of Radiant Core — and extracts the facts pyrxd re-implements in Python.
+the verbatim, pinned copies of Radiant Core under ``tests/vendor/radiant_core/``
+and extracts the facts pyrxd re-implements in Python: the opcode table and
+script-walking rules (``script.h``/``script.cpp``), the BIP68 sequence-lock
+constants (``primitives_transaction.h``) and how CSV consumes them
+(``interpreter.cpp``), the DER signature-encoding rules (``sigencoding.cpp``),
+and which verification flags are consensus rather than policy
+(``script_flags.h``, ``policy.h``, ``validation.cpp``). See the README beside
+those files for the full table.
 
 The point is that **no consensus fact in here is typed by a human.** Every value
 is recovered from the C++ that defines it. A hand-maintained Python table of the
@@ -49,7 +55,7 @@ def manifest() -> dict:
     return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
 
 
-@lru_cache(maxsize=4)
+@lru_cache(maxsize=16)  # >= the number of vendored files, or the cache thrashes
 def vendored_source(name: str) -> str:
     path = VENDOR_DIR / name
     if not path.is_file():
@@ -335,3 +341,280 @@ def ref_operand_opcodes() -> frozenset[int]:
 def push_ref_opcodes() -> frozenset[int]:
     table = opcode_table()
     return frozenset(table[n] for n in push_ref_opcode_names())
+
+
+# ---------------------------------------------------------------------------
+# Fact 4 — BIP68 sequence-lock constants (primitives/transaction.h, CTxIn)
+# ---------------------------------------------------------------------------
+
+_CTXIN_CONST = re.compile(
+    r"""
+    static \s+ const \s+ (?:uint32_t|int) \s+
+    (?P<name>SEQUENCE_\w+) \s* = \s* (?P<value>[^;]+) ;
+    """,
+    re.VERBOSE,
+)
+
+
+def _eval_int_literal(raw: str) -> int:
+    """Evaluate the tiny expression grammar the CTxIn constants use.
+
+    Exactly three shapes appear: a hex literal (``0xffffffff``), a decimal
+    literal (``9``), and a parenthesised shift (``(1U << 31)``). Anything else
+    raises rather than guessing, because a silently mis-evaluated consensus
+    constant is the failure mode this whole module exists to prevent.
+    """
+    text = raw.strip().strip("()").strip()
+    text = re.sub(r"\b(\d+)[uUlL]+\b", r"\1", text)  # drop U/L suffixes
+    shift = re.fullmatch(r"(\w+)\s*<<\s*(\w+)", text)
+    if shift:
+        return _eval_int_literal(shift.group(1)) << _eval_int_literal(shift.group(2))
+    if re.fullmatch(r"0[xX][0-9a-fA-F]+", text):
+        return int(text, 16)
+    if text.isdigit():
+        return int(text)
+    raise OracleParseError(f"unparsable integer expression in vendored source: {raw!r}")
+
+
+@lru_cache(maxsize=1)
+def sequence_locktime_constants() -> dict[str, int]:
+    """``{name: value}`` for every ``CTxIn::SEQUENCE_*`` constant.
+
+    These are the BIP68 relative-locktime encoding constants. pyrxd spelled
+    them by hand in two unrelated modules (``script/timelock.py`` and
+    ``btc_wallet/taproot.py``) and a third time inline in a test, which is the
+    same shape as the ref-operand bug: several transcriptions, no mechanism
+    tying any of them to the C++.
+    """
+    src = _strip_comments(vendored_source("primitives_transaction.h"))
+    start = src.find("class CTxIn")
+    if start < 0:
+        raise OracleParseError("could not locate `class CTxIn` in vendored primitives/transaction.h")
+    end = src.find("\nclass ", start + 1)
+    body = src[start : end if end > 0 else len(src)]
+
+    table = {m.group("name"): _eval_int_literal(m.group("value")) for m in _CTXIN_CONST.finditer(body)}
+    required = {
+        "SEQUENCE_FINAL",
+        "SEQUENCE_LOCKTIME_DISABLE_FLAG",
+        "SEQUENCE_LOCKTIME_TYPE_FLAG",
+        "SEQUENCE_LOCKTIME_MASK",
+        "SEQUENCE_LOCKTIME_GRANULARITY",
+    }
+    missing = required - table.keys()
+    if missing:
+        raise OracleParseError(f"CTxIn no longer defines {sorted(missing)} in the vendored primitives/transaction.h")
+    return table
+
+
+def _check_sequence_body() -> str:
+    src = _strip_comments(vendored_source("interpreter.cpp"))
+    start = src.find("GenericTransactionSignatureChecker<T>::CheckSequence(")
+    if start < 0:
+        raise OracleParseError("could not locate CheckSequence in vendored interpreter.cpp")
+    end = src.find("\n}\n", start)
+    if end < 0:
+        raise OracleParseError("could not delimit the body of CheckSequence")
+    return src[start:end]
+
+
+@lru_cache(maxsize=1)
+def check_sequence_min_tx_version() -> int:
+    """The transaction version at or above which BIP68 rules engage.
+
+    ``CheckSequence`` returns false outright below it, so a refund transaction
+    built at a lower version has no relative lock at all — the CSV simply fails.
+    """
+    body = _check_sequence_body()
+    match = re.search(r"txTo->nVersion\s*\)\s*<\s*(\d+)", body)
+    if not match:
+        raise OracleParseError("CheckSequence no longer gates on a minimum tx version")
+    return int(match.group(1))
+
+
+@lru_cache(maxsize=1)
+def check_sequence_disable_flag_name() -> str:
+    """The constant whose bit makes ``CheckSequence`` return false immediately."""
+    body = _check_sequence_body()
+    match = re.search(r"txToSequence\s*&\s*CTxIn::(SEQUENCE_\w+)", body)
+    if not match:
+        raise OracleParseError("CheckSequence no longer tests a disable bit on the input's nSequence")
+    return match.group(1)
+
+
+@lru_cache(maxsize=1)
+def check_sequence_mask_flag_names() -> frozenset[str]:
+    """The constants OR-ed into ``nLockTimeMask`` — the consensus-meaningful bits."""
+    body = _check_sequence_body()
+    match = re.search(r"nLockTimeMask\s*=\s*([^;]+);", body)
+    if not match:
+        raise OracleParseError("CheckSequence no longer builds an nLockTimeMask")
+    names = frozenset(re.findall(r"CTxIn::(SEQUENCE_\w+)", match.group(1)))
+    if not names:
+        raise OracleParseError("nLockTimeMask parsed to an empty constant set")
+    return names
+
+
+# ---------------------------------------------------------------------------
+# Fact 5 — script verification flags, and which of them are consensus
+# ---------------------------------------------------------------------------
+
+_FLAG_ENTRY = re.compile(r"^\s*(?P<name>SCRIPT_\w+)\s*=\s*(?P<value>[^,}]+)\s*,?", re.MULTILINE)
+
+
+@lru_cache(maxsize=1)
+def script_verify_flags() -> dict[str, int]:
+    """``{flag name: bit value}`` from ``script/script_flags.h``."""
+    src = _strip_comments(vendored_source("script_flags.h"))
+    brace = src.find("enum {")
+    end = src.find("};", brace)
+    if brace < 0 or end < 0:
+        raise OracleParseError("could not delimit the script-verification flag enum in vendored script_flags.h")
+    table = {m.group("name"): _eval_int_literal(m.group("value")) for m in _FLAG_ENTRY.finditer(src[brace:end])}
+    if "SCRIPT_VERIFY_LOW_S" not in table or "SCRIPT_VERIFY_STRICTENC" not in table:
+        raise OracleParseError(f"implausible script-flag table parsed ({len(table)} entries)")
+    return table
+
+
+def _flag_set_names(constant: str, *, _seen: frozenset[str] = frozenset()) -> frozenset[str]:
+    src = _strip_comments(vendored_source("policy.h"))
+    match = re.search(rf"{constant}\s*=\s*([^;]+);", src)
+    if not match:
+        raise OracleParseError(f"could not locate {constant} in vendored policy.h")
+    names: set[str] = set()
+    for token in re.findall(r"[A-Z0-9_]+", match.group(1)):
+        if token.startswith("SCRIPT_"):
+            names.add(token)
+        elif token.endswith("_SCRIPT_VERIFY_FLAGS") and token not in _seen:
+            names |= _flag_set_names(token, _seen=_seen | {constant})
+    if not names:
+        raise OracleParseError(f"{constant} parsed to an empty flag set")
+    return frozenset(names)
+
+
+@lru_cache(maxsize=1)
+def mandatory_script_verify_flag_names() -> frozenset[str]:
+    """The flags Radiant enforces at **consensus** (``MANDATORY_SCRIPT_VERIFY_FLAGS``).
+
+    A transaction violating one of these is invalid in a block, not merely
+    non-standard. ``fRequireStandard`` being false on this chain removes the
+    policy layer, so this set — not ``STANDARD_SCRIPT_VERIFY_FLAGS`` — is the
+    one pyrxd has to agree with.
+    """
+    return _flag_set_names("MANDATORY_SCRIPT_VERIFY_FLAGS")
+
+
+@lru_cache(maxsize=1)
+def standard_script_verify_flag_names() -> frozenset[str]:
+    """The flags a *standard* transaction complies with (policy, a superset)."""
+    return _flag_set_names("STANDARD_SCRIPT_VERIFY_FLAGS")
+
+
+@lru_cache(maxsize=1)
+def block_script_flag_names() -> frozenset[str]:
+    """Every flag ``GetNextBlockScriptFlags`` can set when connecting a block.
+
+    This — not ``MANDATORY_SCRIPT_VERIFY_FLAGS``, whose comment is about whether
+    to ban a peer — is the authority on what is consensus. Height-gated flags are
+    included: every activation height in this set is long past on mainnet, and a
+    flag that is off only for the first couple hundred blocks is not a rule pyrxd
+    can usefully diverge from.
+    """
+    src = _strip_comments(vendored_source("validation.cpp"))
+    start = src.find(
+        "static uint32_t GetNextBlockScriptFlags(", src.find("static uint32_t GetNextBlockScriptFlags(") + 1
+    )
+    if start < 0:
+        raise OracleParseError("could not locate the GetNextBlockScriptFlags definition in vendored validation.cpp")
+    end = src.find("\n}\n", start)
+    if end < 0:
+        raise OracleParseError("could not delimit the body of GetNextBlockScriptFlags")
+    names = frozenset(re.findall(r"flags\s*\|=\s*(SCRIPT_\w+)\s*;", src[start:end]))
+    if len(names) < 10:
+        raise OracleParseError(f"GetNextBlockScriptFlags parsed to an implausible flag set ({sorted(names)})")
+    return names
+
+
+@lru_cache(maxsize=1)
+def requires_standard_default() -> bool:
+    """The compiled-in value of ``fRequireStandard``.
+
+    False on this chain, which is why a *policy-only* flag is not a rule pyrxd
+    can rely on a node to apply — and equally why it must not be presented as
+    one.
+    """
+    src = _strip_comments(vendored_source("validation.cpp"))
+    match = re.search(r"\bbool\s+fRequireStandard\s*=\s*(true|false)\s*;", src)
+    if not match:
+        raise OracleParseError("could not locate the fRequireStandard definition in vendored validation.cpp")
+    return match.group(1) == "true"
+
+
+@lru_cache(maxsize=1)
+def verify_script_implied_flag_names() -> dict[str, str]:
+    """Flags ``VerifyScript`` turns on for you: ``{implied: because-this-is-set}``.
+
+    ``SCRIPT_ENABLE_SIGHASH_FORKID`` is mandatory on Radiant and VerifyScript
+    reacts to it by OR-ing in ``SCRIPT_VERIFY_STRICTENC``, so strict signature
+    encoding is consensus here even though the flag is not listed in
+    ``MANDATORY_SCRIPT_VERIFY_FLAGS`` for that reason.
+    """
+    src = _strip_comments(vendored_source("interpreter.cpp"))
+    start = src.find("bool VerifyScript(")
+    if start < 0:
+        raise OracleParseError("could not locate VerifyScript in vendored interpreter.cpp")
+    body = src[start : start + 2000]
+    implied: dict[str, str] = {}
+    for match in re.finditer(r"if\s*\(flags\s*&\s*(SCRIPT_\w+)\s*\)\s*\{\s*flags\s*\|=\s*(SCRIPT_\w+)\s*;", body):
+        implied[match.group(2)] = match.group(1)
+    if not implied:
+        raise OracleParseError("VerifyScript no longer implies any verification flag")
+    return implied
+
+
+# ---------------------------------------------------------------------------
+# Fact 6 — DER signature encoding rules (script/sigencoding.cpp)
+# ---------------------------------------------------------------------------
+
+
+def _is_valid_der_body() -> str:
+    src = _strip_comments(vendored_source("sigencoding.cpp"))
+    start = src.find("bool IsValidDERSignatureEncoding(")
+    if start < 0:
+        raise OracleParseError("could not locate IsValidDERSignatureEncoding in vendored sigencoding.cpp")
+    end = src.find("\nstatic bool ", start + 1)
+    return src[start : end if end > 0 else len(src)]
+
+
+@lru_cache(maxsize=1)
+def der_signature_size_bounds() -> tuple[int, int]:
+    """``(min, max)`` byte length consensus accepts for a DER signature body.
+
+    Excludes the trailing sighash byte: ``CheckTransactionSignatureEncoding``
+    slices that off before calling ``IsValidDERSignatureEncoding``.
+    """
+    body = _is_valid_der_body()
+    match = re.search(r"sig\.size\(\)\s*<\s*(\d+)\s*\|\|\s*sig\.size\(\)\s*>\s*(\d+)", body)
+    if not match:
+        raise OracleParseError("IsValidDERSignatureEncoding no longer bounds the signature size")
+    return int(match.group(1)), int(match.group(2))
+
+
+@lru_cache(maxsize=1)
+def der_encoding_gate_flag_names() -> frozenset[str]:
+    """The flags any one of which makes strict-DER encoding mandatory."""
+    src = _strip_comments(vendored_source("sigencoding.cpp"))
+    match = re.search(r"if\s*\(\(flags\s*&\s*\(([^)]+)\)\)\s*&&\s*\n?\s*!IsValidDERSignatureEncoding", src)
+    if not match:
+        raise OracleParseError("could not locate the flag gate on IsValidDERSignatureEncoding")
+    return frozenset(re.findall(r"SCRIPT_\w+", match.group(1)))
+
+
+@lru_cache(maxsize=1)
+def low_s_gate_flag_name() -> str:
+    """The flag that makes ``CheckLowS`` mandatory."""
+    src = _strip_comments(vendored_source("sigencoding.cpp"))
+    match = re.search(r"if\s*\(\(flags\s*&\s*(SCRIPT_\w+)\)\s*&&\s*!CPubKey::CheckLowS", src)
+    if not match:
+        raise OracleParseError("could not locate the low-S gate in sigencoding.cpp")
+    return match.group(1)
