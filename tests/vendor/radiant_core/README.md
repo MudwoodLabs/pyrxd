@@ -60,8 +60,28 @@ The cost is that the pin can go stale. That is handled explicitly rather than ig
   vendored bytes stop matching the recorded sha256, so a local edit or a botched refresh cannot go
   unnoticed.
 - `scripts/refresh_radiant_core_vendor.py --check` exits non-zero when upstream has moved. It needs
-  network, so it is **not** part of the offline test suite; run it on demand or from a scheduled
-  job, where a network failure is a job failure rather than a spurious PR red.
+  network, so it is **not** part of the offline test suite. Its scheduled owner is the
+  **`vendor-freshness` job in `.github/workflows/integration.yml`**, which runs nightly and on
+  `workflow_dispatch`; there, a network failure is a job failure rather than a spurious PR red.
+  By hand: `task check-vendor`.
+
+## What the digest proves, and what it does not
+
+The sha256 in `MANIFEST.json` proves these bytes are **self-consistent** — that nobody hand-edited
+the oracle and that a refresh landed intact. It is not an authenticity proof: it is computed from
+whatever GitHub served, so it attests to "what we fetched" and not to "what Radiant Core's
+maintainers signed". Upstream does not publish signed source digests to check against; the
+mitigation that actually exists is that the files are committed, so a change to them is a reviewable
+diff in a pull request rather than a silent fetch.
+
+It also does not prove these sources describe the node the integration lane runs. `MANIFEST.json`
+pins the tag the SOURCE came from; `pyrxd.devnet.DEFAULT_RADIANT_VERSION` pins the release the
+regtest image's BINARY is built from, and the two are bumped on different schedules — today the
+source is at `v3.1.2` and the image at `v3.1.1`. That gap is fine only while the two releases share
+these files, so `--check` verifies exactly that and fails if they ever diverge. (They are currently
+byte-identical: `script.h` `3de78962…` and `script.cpp` `759ab524…` at both tags.) If they do
+diverge, every parity assertion would be describing a different script interpreter than the one the
+lane asks — bump the image, or pin the source to the image's tag.
 
 ## Refreshing
 

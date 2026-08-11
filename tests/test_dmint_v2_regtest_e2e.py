@@ -100,6 +100,14 @@ if os.environ.get("DMINT_MINE_WORKERS"):
 _MINE_TIMEOUT_S = float(os.environ.get("DMINT_MINE_TIMEOUT_S", "1800"))
 _CONTRACT_VALUE = 1  # V2 contract is a value-1 singleton (covenant: OP_OUTPUTVALUE OP_1 OP_NUMEQUALVERIFY)
 
+# Plumbing values for the hand-built commit/reveal pair. The node runs at MAINNET's relay
+# floor (10 000 photons/byte), so `_RELAY_FEE_SATS` is 0.2 RXD and both commit outputs
+# have to be big enough to pay it out of the reveal and still leave a non-dust change.
+# Photon amounts on a throwaway chain; only `_CONTRACT_VALUE` is load-bearing.
+_SEED = 200_000_000  # 2 RXD funding the commit tx
+_COMMIT0 = 30_000_000  # FT-commit hashlock output -> tokenRef
+_COMMIT1 = 20_000_000  # ref-seed output -> contractRef genesis
+
 
 def _p2pkh_spk(key: PrivateKey) -> bytes:
     return b"\x76\xa9\x14" + bytes(Hex20(key.public_key().hash160())) + b"\x88\xac"
@@ -329,17 +337,17 @@ def _deploy_v2_via_api(node: _RegtestNode, owner: PrivateKey) -> DmintContractUt
     commit_script = deploy.commit_result.commit_script
 
     # commit tx: FT-commit (vout0) | ref-seed -> contractRef genesis (vout1) | change
-    seed_txid = _pay_to_spk(node, owner_spk, 10_000_000)
-    c0, c1 = 2_000_000, 1_000_000
+    seed_txid = _pay_to_spk(node, owner_spk, _SEED)
+    c0, c1 = _COMMIT0, _COMMIT1
     cin = TransactionInput(
-        source_transaction=_src(seed_txid, 0, owner_spk, 10_000_000),
+        source_transaction=_src(seed_txid, 0, owner_spk, _SEED),
         source_txid=seed_txid,
         source_output_index=0,
         unlocking_script_template=_p2pkh_unlock(owner),
     )
-    cin.satoshis = 10_000_000
+    cin.satoshis = _SEED
     cin.locking_script = Script(owner_spk)
-    commit_change = 10_000_000 - c0 - c1 - _RELAY_FEE_SATS
+    commit_change = _SEED - c0 - c1 - _RELAY_FEE_SATS
     commit_tx = Transaction(
         tx_inputs=[cin],
         tx_outputs=[

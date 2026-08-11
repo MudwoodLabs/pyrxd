@@ -9,10 +9,12 @@ advertises** rather than one assumed from mainnet:
   is rejected by the node, with the reason quoted verbatim;
 * exactly AT the floor — the builder returns it and the node accepts it.
 
-Reading the rate matters. A default regtest node advertises a **tenth** of the mainnet
-reference rate, so the builders' default policy would refuse fees this node would happily
-relay. That is precisely what the ``fee_policy`` parameter is for, and every case here
-passes one built from ``getmempoolinfo``/``getnetworkinfo``.
+Reading the rate matters, and it is what makes this file portable across node policies.
+The shared Radiant harness now starts its node at MAINNET's floor, so the Radiant cases
+below are measured at exactly the rate the builders ship with — but the BTC node in the
+same file advertises its own, unrelated rate, and a default ``radiantd -regtest`` would
+advertise a tenth of mainnet's. Every case therefore passes a ``fee_policy`` built from
+``getmempoolinfo``/``getnetworkinfo`` rather than assuming any of them.
 
 The under-floor transaction has to be FORCED into existence to ask the node about it — the
 guard would otherwise refuse and there would be nothing to submit. Every case does that

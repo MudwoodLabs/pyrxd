@@ -30,6 +30,11 @@ from pathlib import Path
 # the bump plan for the revalidation the version pin carries.
 DEFAULT_RADIANT_VERSION = "v3.1.1"
 
+#: Radiant MAINNET's minimum relay fee, in RXD per kB — what ``-minrelaytxfee`` and
+#: ``-fallbackfee`` are set to below. A default ``radiantd -regtest`` runs a tenth of
+#: this; see the comment at the flag for why the devnet does not.
+MAINNET_MIN_RELAY_RXD_PER_KB = "0.10"
+
 # Embedded copy of docker/regtest.Dockerfile so `pyrxd regtest setup` works for a
 # `pip install pyrxd` developer who has no repo checkout. A test
 # (tests/test_devnet.py) asserts this stays byte-identical to the committed file.
@@ -238,7 +243,22 @@ class RegtestNode:
                 "-server",
                 "-txindex=1",
                 "-disablewallet=0",
-                "-fallbackfee=0.001",
+                # MAINNET's relay floor, not the regtest default of a tenth of it.
+                #
+                # Every pyrxd builder sizes fees at 0.10 RXD/kB, so a devnet at 0.01 will
+                # accept a transaction one or two bytes short of its own rate — it cannot
+                # tell a developer that what they just built would be refused on mainnet.
+                # That blind spot is how `build_nft_transfer_tx` shipped under-fee'ing
+                # ~25% of NFT transfers for four releases. A local chain that says yes to
+                # things mainnet says no to is worse than no local chain.
+                #
+                # `-fallbackfee` has to clear the floor too: it is what the node's own
+                # wallet uses when it has no fee estimates, which on a fresh regtest chain
+                # is always, and `fund()` below goes through `sendtoaddress`. At 0.001 the
+                # wallet would build its own transactions below the floor it is enforcing
+                # and refuse them.
+                f"-minrelaytxfee={MAINNET_MIN_RELAY_RXD_PER_KB}",
+                f"-fallbackfee={MAINNET_MIN_RELAY_RXD_PER_KB}",
                 f"-rpcuser={self.RPC_USER}",
                 f"-rpcpassword={self.RPC_PASSWORD}",
                 "-rpcbind=127.0.0.1",

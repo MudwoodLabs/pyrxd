@@ -175,7 +175,10 @@ def _deploy_with_premine(node: _RegtestNode, owner: PrivateKey, *, v2: bool) -> 
     # an accounting entry, and the reveal has no other funding input.
     seed_value = 200_000_000
     seed_txid = _pay_to_spk(node, owner_spk, seed_value)
-    commit0, commit1 = _PREMINE + 2_000_000, 1_000_000
+    # The node runs at MAINNET's relay floor (10 000 photons/byte), so the reveal's own
+    # `_RELAY_FEE_SATS` (0.2 RXD) has to come out of these two outputs on top of the
+    # premine and the carrier, and still leave a non-dust change.
+    commit0, commit1 = _PREMINE + 30_000_000, 20_000_000
     cin = TransactionInput(
         source_transaction=_src(seed_txid, 0, owner_spk, seed_value),
         source_txid=seed_txid,

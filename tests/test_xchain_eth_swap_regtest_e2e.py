@@ -60,6 +60,7 @@ from tests.test_swap_coordinator import FakeIndexer
 
 # Reuse the BTC e2e's Radiant-side helpers (no value moved; one source of truth).
 from tests.test_xchain_swap_regtest_e2e import (
+    _RXD_MIN_RELAY_RXD_PER_KB,
     _RXD_RELAY_FEE,
     _FeeSource,
     _LiveRecordStore,
@@ -136,6 +137,10 @@ class _RxdNode:
                 "-txindex=1",
                 "-disablewallet=0",
                 "-fallbackfee=0.001",
+                # Declared, not inherited: `_RXD_RELAY_FEE` (imported from the BTC↔RXD
+                # suite) is sized for the LEGACY 0.01 RXD/kB floor, so say so and assert
+                # it below rather than relying on the node's default happening to match.
+                f"-minrelaytxfee={_RXD_MIN_RELAY_RXD_PER_KB}",
                 "-rpcuser=rt_user",
                 f"-rpcpassword={self.rpass}",
                 "-rpcbind=0.0.0.0",
@@ -156,6 +161,11 @@ class _RxdNode:
         else:
             raise RuntimeError("radiantd RPC did not become ready")
         assert self.rxd("getblockchaininfo")["chain"] == "regtest"
+        floor = float(self.rxd("getmempoolinfo")["effective_minrelaytxfee"])
+        assert floor == float(_RXD_MIN_RELAY_RXD_PER_KB), (
+            f"radiantd advertises effective_minrelaytxfee {floor} RXD/kB, not the "
+            f"{_RXD_MIN_RELAY_RXD_PER_KB} this suite's fees are sized for"
+        )
         self.rxd("createwallet", "gravity")
         self.raddr = str(self.rxd("getnewaddress", wallet="gravity"))
         self.rxd_mine(101)
