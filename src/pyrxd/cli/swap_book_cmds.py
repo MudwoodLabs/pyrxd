@@ -52,7 +52,7 @@ from dataclasses import dataclass
 
 import click
 
-from ..fee_sizing import SIG_SIZE_SLACK_BYTES
+from ..fee_sizing import SIG_SIZE_SLACK_BYTES, fee_never_below_relay_floor
 from ..glyph.types import GlyphRef
 from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY
 from ..keys import PrivateKey
@@ -116,10 +116,11 @@ _SIG_SIZE_SLACK_BYTES = SIG_SIZE_SLACK_BYTES
 _FEE_SIZING_PASSES = 4
 _MAX_FUNDING_INPUTS = 8
 
-# The relay floor is BOUND to :mod:`pyrxd.gravity.fee_policy` rather than restated, so
-# the swap CLI, the glyph builders and the HTLC stack cannot drift apart on what the
-# node actually demands (``ceil(size × effective_minrelaytxfee / 1000)``, sized against
-# ``tx.GetTotalSize()`` — the full serialized size, not vsize).
+# The relay floor is BOUND to :mod:`pyrxd.fee_sizing` (which ``gravity.fee_policy``
+# re-exports) rather than restated, so the swap CLI, the glyph builders, the plain-RXD
+# wallets and the HTLC stack cannot drift apart on what the node actually demands
+# (``ceil(size × effective_minrelaytxfee / 1000)``, sized against ``tx.GetTotalSize()``
+# — the full serialized size, not vsize).
 _RELAY_POLICY = DEFAULT_RADIANT_DEADLINE_FEE_POLICY
 
 
@@ -206,8 +207,13 @@ def _fee_for_size(ctx: CliContext, size_bytes: int) -> int:
     built outside :func:`pyrxd.cli.config.load` (tests, embedders) can carry a rate
     that never went through ``validated_fee_rate``, and an unrelayable swap
     transaction cannot be repaired on Radiant.
+
+    That no-opt-out variant is :func:`pyrxd.fee_sizing.fee_never_below_relay_floor` —
+    used here rather than :func:`~pyrxd.fee_sizing.required_fee`, which treats a
+    sub-floor rate as a caller's deliberate regtest choice. The distinction is the
+    trust boundary: a wallet's ``fee_rate`` is an argument, ``ctx.fee_rate`` is config.
     """
-    return max(ctx.fee_rate * size_bytes, _RELAY_POLICY.min_relay_fee(size_bytes))
+    return fee_never_below_relay_floor(size_bytes, ctx.fee_rate)
 
 
 def _seed_fee(ctx: CliContext, n_inputs: int, n_outputs: int, extra_bytes: int) -> int:
