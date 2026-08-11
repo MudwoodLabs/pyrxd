@@ -6,8 +6,7 @@ Port of ``reference/extract_p2sh_code_hash.js``.  Computes the
 
 from __future__ import annotations
 
-import hashlib
-
+from pyrxd.hash import hash160, hash256
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
@@ -19,12 +18,16 @@ __all__ = [
 ]
 
 
-def hash256(data: bytes) -> bytes:
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
-
-
-def hash160(data: bytes) -> bytes:
-    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
+# Both RE-EXPORTED from :mod:`pyrxd.hash` rather than re-defined here. They stay
+# in ``__all__`` because ``gravity/transactions.py`` and external callers import
+# them from this module.
+#
+# ``hash160`` in particular MUST come from ``pyrxd.hash``: that module falls back
+# to a pure-Python RIPEMD160 when OpenSSL refuses it, which is the default on
+# OpenSSL 3 — Ubuntu 24.04, Debian 12, the python.org macOS builds, Pyodide. The
+# direct ``hashlib.new("ripemd160", ...)`` that used to live here raised
+# ``ValueError`` on every one of them, and this is the function that derives the
+# P2SH scriptPubKey the Gravity claim path pays to.
 
 
 def compute_p2sh_script_pubkey(redeem_script: bytes) -> bytes:

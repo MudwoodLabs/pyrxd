@@ -40,15 +40,18 @@ rather than silently on-chain.
 
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from pyrxd.constants import REF_OPERAND_WIDTH
 from pyrxd.glyph.script import REF_OPCODES, count_input_refs
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.hash import hash256
+from pyrxd.script.consensus import has_valid_ops
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
+from pyrxd.utils import encode_data_push, encode_int, encode_script_num
 
 __all__ = [
     "FT_EPILOGUE",
@@ -112,35 +115,21 @@ class HtlcCovenant:
 # --------------------------------------------------------------------------- low-level encoders
 
 
-def _scriptnum(n: int) -> bytes:
-    """Minimal-magnitude little-endian CScriptNum encoding (sign-extended)."""
-    if n == 0:
-        return b""
-    neg = n < 0
-    n = abs(n)
-    out = bytearray()
-    while n:
-        out.append(n & 0xFF)
-        n >>= 8
-    if out[-1] & 0x80:
-        out.append(0x80 if neg else 0x00)
-    elif neg:
-        out[-1] |= 0x80
-    return bytes(out)
+#: CScriptNum body bytes, from the one definition in :mod:`pyrxd.utils`. This was
+#: a verbatim copy of it; ``tests/test_script_encoder_consolidation.py`` keeps the
+#: deleted version and asserts the two agree byte-for-byte across the range.
+_scriptnum = encode_script_num
 
 
 def _push(b: bytes) -> bytes:
-    """Length-prefixed data push (direct / OP_PUSHDATA1 / OP_PUSHDATA2)."""
-    n = len(b)
-    if n == 0:
-        return b"\x00"
-    if n <= 75:
-        return bytes([n]) + b
-    if n <= 255:
-        return b"\x4c" + bytes([n]) + b
-    if n <= 0xFFFF:
-        return b"\x4d" + n.to_bytes(2, "little") + b
-    raise ValidationError("push data exceeds 64 KB limit")
+    """Length-prefixed data push (direct / OP_PUSHDATA1 / OP_PUSHDATA2).
+
+    The 64 KB ceiling is this module's own policy and is passed explicitly. The
+    ENCODER is shared; the LIMIT is not, because the other call sites genuinely
+    differ — ``btc_wallet`` caps at 255, ``glyph/dmint`` does not cap at all —
+    and collapsing them onto one number would have loosened a guard somewhere.
+    """
+    return encode_data_push(b, max_len=0xFFFF)
 
 
 def _minimal_num_push(n: int) -> bytes:
@@ -149,18 +138,16 @@ def _minimal_num_push(n: int) -> bytes:
     A non-minimal push of a small int (e.g. ``0x0102`` for ``2``) trips 'Data push
     larger than necessary' and bricks the covenant — ``refundCsv`` is small so this
     is load-bearing.
+
+    The type and sign check stays local: :func:`~pyrxd.utils.encode_int` handles
+    negatives perfectly well, and it is *this* call site that must refuse them.
     """
     if not isinstance(n, int) or isinstance(n, bool) or n < 0:
         raise ValidationError("refund_csv must be a non-negative int")
-    if n == 0:
-        return b"\x00"  # OP_0
-    if 1 <= n <= 16:
-        return bytes([0x50 + n])  # OP_1 (0x51) .. OP_16 (0x60)
-    return _push(_scriptnum(n))
+    return encode_int(n)
 
 
-def _hash256(b: bytes) -> bytes:
-    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+_hash256 = hash256  # SHA-256d, from the one definition in pyrxd.hash
 
 
 # --------------------------------------------------------------------------- holder scripts
@@ -192,8 +179,8 @@ def holder_hash(pkh: bytes, *, variant: str, genesis_ref: bytes = b"") -> bytes:
     """
     if variant == "rxd":
         return _hash256(_rxd_holder_script(pkh))
-    if len(genesis_ref) != 36:
-        raise ValidationError(f"{variant} holder hash requires a 36-byte genesis_ref")
+    if len(genesis_ref) != REF_OPERAND_WIDTH:
+        raise ValidationError(f"{variant} holder hash requires a {REF_OPERAND_WIDTH}-byte genesis_ref")
     if variant == "ft":
         return _hash256(_ft_holder_script(pkh, genesis_ref))
     if variant == "nft":
@@ -221,7 +208,7 @@ def _opcode_bd_positions(spk: bytes) -> list[int]:
         if op == 0xBD:
             bds.append(i)
         if op in _REF_OPS:
-            i += 37  # 1 opcode + 36-byte ref operand
+            i += 1 + REF_OPERAND_WIDTH  # 1 opcode + its fixed-width ref operand
             continue
         if 0x01 <= op <= 0x4B:
             i += 1 + op
@@ -278,13 +265,29 @@ def _assert_minimal_pushes(spk: bytes, *, variant: str) -> None:
     non-minimal push fails at build time instead of silently on-chain. Mirrors
     Radiant-Core ``script.cpp`` ``CheckMinimalPush``. Ref operands (``d0/d8`` etc.)
     are 36-byte ref payloads, not data pushes, and are skipped.
+
+    Runs ``HasValidOps`` first. That is a *different* question — minimality is
+    about whether a push is the shortest form, ``HasValidOps`` is about whether
+    the bytes decode into instructions at all — and answering the second one
+    before the first matters, because a script that does not decode makes the
+    minimality walk's own offsets meaningless. Both are fail-closed at build
+    time: an SPK Radiant would refuse structurally must not become the
+    scriptPubKey of a UTXO holding an asset.
     """
+    if not has_valid_ops(spk):
+        raise ValidationError(
+            f"GUARD 3 FAIL ({variant}): assembled SPK is not structurally valid "
+            "(CScript::HasValidOps) — it contains a byte above MAX_OPCODE, an "
+            "oversized push, or an instruction whose operand runs off the end. "
+            "Radiant would reject it, so the asset would be locked into a script "
+            "no spend can satisfy."
+        )
     i = 0
     n = len(spk)
     while i < n:
         op = spk[i]
         if op in _REF_OPS:
-            i += 37  # ref opcode + 36-byte ref operand (not a data push)
+            i += 1 + REF_OPERAND_WIDTH  # ref opcode + its fixed-width operand (not a data push)
             continue
         if 0x01 <= op <= 0x4B:  # direct push of `op` bytes
             if i + 1 + op > n:

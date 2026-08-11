@@ -31,6 +31,8 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass
 
+from pyrxd.base58 import b58_encode
+from pyrxd.hash import hash160, hash256
 from pyrxd.security.errors import KeyMaterialError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial, secure_scalar_mod_n
 
@@ -120,7 +122,7 @@ class BtcKeypair:
         _, _, wif_version = _version_bytes_for(self.network)
         # WIF: version + privkey(32) + 0x01 (compressed) + checksum(4)
         payload = bytes([wif_version]) + raw + b"\x01"
-        checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+        checksum = hash256(payload)[:4]
         return _base58check_encode(payload + checksum)
 
 
@@ -201,9 +203,14 @@ def _build_keypair(
     )
 
 
-def _hash160(data: bytes) -> bytes:
-    """RIPEMD160(SHA256(data)) — Bitcoin's hash160."""
-    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
+#: Bitcoin's ``RIPEMD160(SHA256(data))``, from the one definition in
+#: :mod:`pyrxd.hash`. It MUST come from there rather than calling
+#: ``hashlib.new("ripemd160", ...)`` directly: OpenSSL 3 moved RIPEMD160 into the
+#: legacy provider, so the direct call raises ``ValueError`` on Ubuntu 24.04,
+#: Debian 12, the python.org macOS builds and Pyodide. ``pyrxd.hash`` picks a
+#: pure-Python fallback at import time on exactly those platforms — which is the
+#: entire reason that module exists, and which this file used to bypass.
+_hash160 = hash160
 
 
 def _taproot_tweak(x_only_pubkey: bytes) -> bytes:
@@ -244,28 +251,20 @@ def _taproot_tweak(x_only_pubkey: bytes) -> bytes:
 
 
 def _base58check_encode(payload_with_checksum: bytes) -> str:
-    """Base58 encode a payload that already has its 4-byte checksum appended."""
-    _B58 = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    data = payload_with_checksum
-    # Count leading zero bytes
-    pad = 0
-    for b in data:
-        if b == 0:
-            pad += 1
-        else:
-            break
-    num = int.from_bytes(data, "big")
-    result = ""
-    while num > 0:
-        num, rem = divmod(num, 58)
-        result = chr(_B58[rem]) + result
-    return "1" * pad + result
+    """Base58 encode a payload that already has its 4-byte checksum appended.
+
+    The codec is :func:`pyrxd.base58.b58_encode`; this module carried a third
+    copy of the alphabet and the divmod loop. The checksum is appended by the
+    caller, which is why this is ``b58_encode`` rather than
+    ``base58check_encode``.
+    """
+    return b58_encode(payload_with_checksum)
 
 
 def _p2pkh_address(pkh: bytes, version: int = _MAINNET_P2PKH) -> str:
     """Base58Check P2PKH for the given version byte (mainnet 0x00, testnet 0x6F)."""
     payload = bytes([version]) + pkh
-    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    checksum = hash256(payload)[:4]
     return _base58check_encode(payload + checksum)
 
 
@@ -277,7 +276,7 @@ def _p2wpkh_address(pkh: bytes, hrp: str = "bc") -> str:
 def _p2sh_address(script_hash: bytes, version: int = _MAINNET_P2SH) -> str:
     """Base58Check P2SH for the given version byte (mainnet 0x05, testnet 0xC4)."""
     payload = bytes([version]) + script_hash
-    checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
+    checksum = hash256(payload)[:4]
     return _base58check_encode(payload + checksum)
 
 

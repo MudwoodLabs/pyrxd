@@ -8,6 +8,47 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **Four more CompactSize readers accepted non-canonical encodings; the audit that fixed
+  the other three could not find them, because nothing in the tree could enumerate them.**
+  PR #413 fixed `utils.py` to match `spv/proof.py` and `spv/witness.py`. There were not three
+  copies — there were **seven**, and four of them lived in `btc_wallet/taproot.py`:
+  `_iter_witness_stack` (feeds `scrape_secret`, the cross-chain preimage reveal),
+  `btc_txid_from_raw`, and the byte-identical twins behind `btc_spend_fields_from_raw` and
+  `btc_input_outpoints_from_raw`. All four accepted overlong length prefixes.
+
+  `btc_txid_from_raw` is the sharpest: on mainnet there is no node to
+  `decoderawtransaction` against, so the reorg gate derives the txid from the exact bytes
+  `p` was scraped from. Consensus refuses a non-minimal CompactSize at deserialization, so
+  the function was handing the gate the id of a transaction that cannot exist on any chain
+  — while its own docstring promised to fail closed "on ANY structural problem". The
+  `btc_spend_fields_from_raw` pair is what the v2 autonomous-refund executor binds a
+  pre-signed refund blob against; a parser that disagrees with consensus about where a field
+  ends performs its binding check on the wrong bytes.
+
+  All six now call one codec, new module `pyrxd.compactsize`. `read_compact_size` owns the
+  rule (reject non-minimal, reject truncated); each call site keeps only its own error
+  policy — `SpvVerificationError` in `spv/proof.py`, end-of-input `None` in `Reader`,
+  never-raise in the witness walker. `encode_compact_size` replaces four hand-written
+  writers (`utils.unsigned_to_varint`, `gravity/transactions._varint`,
+  `btc_wallet/payment._encode_varint`, `btc_wallet/taproot._compact_size`), so the SDK can no
+  longer emit a length prefix it would itself refuse to read.
+
+  `tests/test_btc_txid_from_raw.py::test_multibyte_compactsize_input_count_parses` asserted
+  the *old* lenient behaviour — it required `fd 01 00` to parse. That expectation is now
+  inverted and the original intent (exercise the multi-byte path) is covered by a count of
+  300, which genuinely needs the three-byte form.
+
+- **`hash160` bypassed its own OpenSSL-3 fallback in three modules, including P2SH address
+  derivation on the Gravity claim path.** `pyrxd.hash` selects between
+  `hashlib.new("ripemd160")` and a pure-Python RIPEMD160 at import time, because OpenSSL 3
+  moved RIPEMD160 to the legacy provider and the `hashlib` call **raises `ValueError`** on
+  Ubuntu 24.04, Debian 12, the python.org macOS builds, and Pyodide. `gravity/codehash.py`,
+  `btc_wallet/keys.py` and `gravity/transactions.py` each called `hashlib.new` directly and
+  so had no fallback at all. `gravity/codehash.hash160` derives the P2SH scriptPubKey the
+  claim path pays to, making this a hard failure rather than a degraded mode on every
+  affected platform. Not reproducible on a box where OpenSSL still exposes RIPEMD160, which
+  is why it survived; `tests/test_hash_single_source.py` simulates the refusing environment.
+
 - **`Reader.read_var_int_num` accepted non-canonical CompactSize, under `Transaction`
   deserialization.** `spv/proof.py` and `spv/witness.py` have rejected overlong encodings
   since audit F-15, citing that Bitcoin rejects them at deserialization; this third copy —
@@ -300,6 +341,87 @@ a Radiant Core v3.1.1 regtest one.
 
 ### Changed
 
+- **Single-sourced eight primitives that were implemented between two and nineteen times
+  each.** Implementations and call sites are counted separately below because they are
+  different problems: many call sites through ONE implementation is normal, two
+  implementations is the bug. Call-site counts are `git grep` over `src/**/*.py` and are
+  unchanged by this work; implementation counts are hand-verified `def` sites plus inline
+  spellings.
+
+  | primitive | implementations before | after | call sites | home |
+  |---|---|---|---|---|
+  | CompactSize read | 7 | 1 | 55 | `pyrxd.compactsize.read_compact_size` |
+  | CompactSize write | 5 | 1 | 58 | `pyrxd.compactsize.encode_compact_size` |
+  | double SHA-256 | 19 (8 named defs + 11 inline) | 1 (+3 exempt) | 76 | `pyrxd.hash.hash256` |
+  | `hash160` | 4 | 1 | (in the 76) | `pyrxd.hash.hash160` |
+  | CScriptNum encode | 5 | 1 | 21 | `pyrxd.utils.encode_script_num` |
+  | CScriptNum decode | 2 | 1 | (in the 21) | `pyrxd.utils.decode_script_num` |
+  | length-prefixed data push | 5 | 1 | 110 | `pyrxd.utils.encode_data_push` |
+  | base58 codec | 3 | 1 | 30 | `pyrxd.base58` |
+
+  Every replaced implementation is preserved **verbatim** in
+  `tests/test_script_encoder_consolidation.py` as a frozen oracle, and the consolidated
+  encoders are asserted byte-identical to their predecessors across the input range. The
+  risk in this kind of change is never that the shared version is wrong — it is that it is
+  *subtly different* and the difference is then applied silently at every call site at once,
+  so a self-consistency test cannot see it.
+
+  Deliberately **not** merged, with the reason recorded in the code at each site:
+
+  - the three dMint proof-of-work grind loops (`contrib/miner/parallel.py`,
+    `glyph/dmint/estimate.py`, `glyph/dmint/miner.py`) keep their inline
+    `sha256(sha256(...))` with `sha256` rebound to a local. `estimate.py` *measures*
+    hashes/sec, so a per-hash Python call would skew every ETA and difficulty quantile it
+    reports;
+  - `btc_wallet/taproot._push_data` stays separate from the Radiant push encoders — it
+    builds for a chain where `MAX_SCRIPT_ELEMENT_SIZE` is 520, not 32,000,000;
+  - `swap/rswp/wire._scriptnum_push` shares the *number* encoding but keeps its own *push
+    policy*: the RSWP frame is read positionally by Photonic and the node, so folding 1..16
+    into `OP_1`..`OP_16` would change a wire format the network already accepts. That split
+    is why `encode_script_num` (number) and `encode_int` (minimal push) are separate;
+  - `glyph/script._MUTABLE_NFT_REF_OFFSET` stays the literal `36`. It equals
+    `REF_OPERAND_WIDTH` by coincidence — it is a byte *position*, and the two move for
+    unrelated reasons.
+
+- **Two annotations in `pyrxd.base58` / `pyrxd.hash` fixed** — `from_base58check`'s return
+  was written `-> (bytes, bytes)` (a tuple *expression*, not a type) and RIPEMD160's
+  chaining value was a bare `tuple`. Both were pre-existing and invisible: CI's mypy scope
+  is `src/pyrxd/security/`, and nothing under it reached these modules until the WIF decoder
+  was consolidated onto the shared base58 codec. Consolidating pulled them into the strict
+  scope, which is a side benefit worth naming — a second implementation is also a second
+  thing the type checker never sees.
+
+- **Wired four pinned consensus constants to real consumers.** `REF_OPERAND_WIDTH` was
+  parsed from Radiant Core by #408 and read by exactly one module, while all six ref walkers
+  hand-spelled `36`/`37`; mutating it to 35 killed 2 tests and no differential. All six now
+  import it — **the same mutation now kills 570 tests**. New `pyrxd.script.consensus` is a
+  faithful transcription of `GetScriptOp` and `CScript::HasValidOps`
+  (`script.cpp:662-744`) and is the first consumer of `MAX_OPCODE` and
+  `MAX_SCRIPT_ELEMENT_SIZE`. `LOCKTIME_THRESHOLD` now comes from `pyrxd.constants` instead of
+  being spelled again in `script/timelock.py`.
+
+  `has_valid_ops` has real callers, not just tests: the two build-time covenant guards,
+  `gravity/htlc_covenant._assert_minimal_pushes` and
+  `glyph/soulbound_covenant._assert_no_nonminimal_push`. Both already re-checked the fully
+  assembled scriptPubKey fail-closed before an asset is locked into it, and both **accepted
+  a byte above `MAX_OPCODE` and a truncated ref operand** (measured — the unknown opcode fell
+  through their `i += 1` default). It also has to run *first*: on a script that does not
+  decode into instructions, the minimality walk's offsets are reading arbitrary bytes.
+
+  Note for anyone wiring these further: **Radiant's `MAX_SCRIPT_ELEMENT_SIZE` is 32,000,000,
+  not 520.** Bitcoin's 520 survives upstream only as `MAX_SCRIPT_ELEMENT_SIZE_LEGACY`. A
+  push-encoder "hardened" to the number everyone remembers would reject scripts the chain
+  accepts. Both are now pinned, both oracle-checked, and `MAX_SCRIPT_SIZE`,
+  `MAX_OPS_PER_SCRIPT` and `MAX_STACK_SIZE` join them —
+  `test_consensus_opcode_parity.py::test_no_pinned_limit_is_unchecked` fails if a constant is
+  pinned without being compared against the vendored C++.
+
+  `MAX_OPS_PER_SCRIPT` and `MAX_STACK_SIZE` are recorded as having **no consumer**, in the
+  code, because pyrxd builds and parses scripts and never executes them. They are pinned so
+  the value is already derived from source when an evaluator lands — not wired into a
+  plausible-looking check, since a constant with a fake consumer pins nothing while reading
+  as though it does.
+
 - **`radiant_relay_size` and `bitcoin_virtual_size` moved to `pyrxd.fee_sizing`**, which
   #405 established as the single home for fee-sizing rules (it exists at all to break the
   `pyrxd.gravity.__init__` → `pyrxd.hd.wallet` → `pyrxd.wallet` import cycle).
@@ -582,6 +704,43 @@ both. It is fixed here.
   could ever fail, since the node would have nothing left to reject.
 
 ### Tests
+
+- **Extended `test_no_duplicate_consensus_constants.py` to the primitives consolidated
+  above, and proved every new detector by planting the duplicate it exists to catch.** The
+  previous version of this guard could not catch the very bug it was written for while
+  certifying a clean tree, so a detector that has not been *shown* to fire is treated as not
+  working. Five new detectors — hand-spelled ref-operand widths, `sha256(sha256(...))` in
+  any spelling, `hash256`/`hash160` re-definitions, the CompactSize prefix dispatch, and the
+  base58 alphabet — each with planted proofs drawn from the copies that actually existed
+  here (12 in total), plus 11 legitimate-shape cases asserting they do not false-positive.
+  `test_every_new_detector_has_at_least_one_planted_proof` fails if a sixth detector is
+  added without one.
+
+  Two of the detectors found real duplicates the manual sweep had missed while being
+  written: two further CompactSize readers in `btc_wallet/taproot.py` (bringing that
+  module's total to four), and a third base58 encoder in `btc_wallet/keys.py`.
+
+  Exceptions are narrow and reasoned rather than blanket file allowlists: a `#
+  not-a-ref-width:` comment exempts one line (used once, for a byte offset that happens to
+  equal 36), and `_PRIMITIVE_EXEMPTIONS` records the PoW grind loops with the reason.
+  `test_every_exemption_names_a_file_that_exists` stops an exemption outliving its file, and
+  `test_the_owning_module_still_implements_it` stops a detector going vacuous if the
+  canonical implementation is renamed.
+
+- **`test_script_consensus.py`** — `get_script_op` / `has_valid_ops` against the vendored
+  Radiant Core source, including a differential requiring the production Glyph walker
+  (`glyph.script.iter_input_refs`) and the transcribed consensus walk to agree on a corpus
+  that includes a ref operand carrying `76a914…` (opcode-shaped) bytes and an operand-less
+  `0xd4` adjacent to a real ref.
+
+- **`test_compactsize.py`** feeds one hostile encoding to every CompactSize reader in the SDK
+  and requires a single verdict, so a seventh reader is a one-line addition to that list —
+  or a failure.
+
+- **`test_ref_walker_differential.py`'s reference model grew a `HasValidOps` clause**, derived
+  from the oracle rather than from `pyrxd.constants`, so it stays a differential rather than
+  a restatement of the code it checks. Without it the model reported the guards' new
+  strictness as a disagreement.
 
 - **Verification-integrity sweep: six guards that could not detect the bug they exist to
   catch.** Every fix below is proved by mutation — the defect is planted, the new test is

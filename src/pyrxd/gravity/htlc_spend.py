@@ -50,6 +50,7 @@ from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
+from pyrxd.utils import encode_data_push
 
 __all__ = ["DUST_FLOOR_PHOTONS", "FeeInput", "build_htlc_claim_tx", "build_htlc_refund_tx"]
 
@@ -102,17 +103,14 @@ class FeeInput:
 
 
 def _push(b: bytes) -> bytes:
-    """Length-prefixed data push (direct / OP_PUSHDATA1 / OP_PUSHDATA2)."""
-    n = len(b)
-    if n == 0:
-        return b"\x00"
-    if n <= 75:
-        return bytes([n]) + b
-    if n <= 255:
-        return b"\x4c" + bytes([n]) + b
-    if n <= 0xFFFF:
-        return b"\x4d" + n.to_bytes(2, "little") + b
-    raise ValidationError("push data exceeds 64 KB limit")
+    """Length-prefixed data push (direct / OP_PUSHDATA1 / OP_PUSHDATA2).
+
+    Was byte-identical to ``gravity/htlc_covenant.py::_push``, docstring
+    included — the same six lines maintained twice. Both now call
+    :func:`~pyrxd.utils.encode_data_push`; the 64 KB ceiling stays here because
+    it is this module's policy rather than the encoder's.
+    """
+    return encode_data_push(b, max_len=0xFFFF)
 
 
 def _synthetic_source(txid: str, vout: int, spk: bytes, value: int) -> Transaction:

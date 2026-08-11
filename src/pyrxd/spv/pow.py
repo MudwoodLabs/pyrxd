@@ -8,18 +8,25 @@ compiler bugs). See docs/audits/02-bitcoin-spv-crypto-correctness.md.
 
 from __future__ import annotations
 
-import hashlib
 import struct
 
+from pyrxd.hash import hash256
 from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.security.types import Nbits
 
 __all__ = ["hash256", "verify_header_pow"]
 
-
-def hash256(data: bytes) -> bytes:
-    """Double SHA-256, Bitcoin's standard hash function."""
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+# ``hash256`` is RE-EXPORTED from :mod:`pyrxd.hash`, not re-defined. It stays in
+# ``__all__`` because ``spv/__init__.py`` publishes it and callers import it from
+# here.
+#
+# NOTE FOR ANYONE EXTENDING THIS MODULE: the headers below are **Bitcoin**
+# headers, and Bitcoin's header hash is SHA-256d. Radiant's is a double
+# SHA-512/256 (Radiant-Core ``primitives/block.h:129``, implemented in
+# ``pyrxd/network/registry.py``). The two are both "the double hash", both 32
+# bytes, and each looks perfectly reasonable where the other belongs. Feeding a
+# Radiant header through this function yields a value matching nothing on any
+# Radiant chain.
 
 
 def verify_header_pow(header: bytes) -> bytes:

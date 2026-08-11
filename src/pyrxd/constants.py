@@ -393,6 +393,47 @@ REF_OPERAND_WIDTH: int = 36
 # a table size.
 MAX_OPCODE: int = 0xEF
 
+# ---------------------------------------------------------------------------
+# Scalar consensus limits (Radiant-Core ``src/script/script.h:71-90``)
+# ---------------------------------------------------------------------------
+# READ THESE BEFORE ASSUMING BITCOIN'S VALUES. Radiant raised the script limits
+# by five orders of magnitude and kept Bitcoin's under ``*_LEGACY`` names. Code
+# that "knows" the push limit is 520 is describing a different chain, and a
+# builder that enforced 520 here would reject scripts Radiant accepts.
+#
+# Every value below is asserted against the vendored Radiant Core source by
+# ``tests/test_consensus_opcode_parity.py`` via ``consensus_oracle.script_limit``,
+# so none of them is a hand-maintained number.
+
+# Largest element pushable to the stack. ``CScript::HasValidOps`` rejects a
+# script containing a larger push, which is what makes this a real boundary and
+# not just a buffer size. Consumed by :func:`pyrxd.script.consensus.has_valid_ops`.
+MAX_SCRIPT_ELEMENT_SIZE: int = 32_000_000
+
+# Bitcoin's 520-byte push limit, which Radiant retains only under this name.
+# Kept because the BTC-side code in ``pyrxd.btc_wallet`` builds scripts for a
+# chain where 520 IS the live limit, and naming it here is what stops someone
+# "unifying" the two into one wrong number.
+MAX_SCRIPT_ELEMENT_SIZE_LEGACY: int = 520
+
+# Maximum serialized script length. Consumed by
+# :func:`pyrxd.script.consensus.has_valid_ops`.
+MAX_SCRIPT_SIZE: int = 32_000_000
+
+# NO CONSUMER IN PYRXD, DELIBERATELY. Both are limits the script *interpreter*
+# enforces while executing, and pyrxd has no interpreter — it builds and parses
+# scripts, it never runs them. They are pinned (and oracle-checked) so that
+# whoever adds an evaluator, or a stack-depth estimator, finds the value already
+# derived from source instead of retyping it from a Bitcoin tutorial. Recorded
+# as unconsumed rather than wired into a plausible-looking check, because a
+# constant with a fake consumer pins nothing and reads as though it does.
+MAX_OPS_PER_SCRIPT: int = 32_000_000
+MAX_STACK_SIZE: int = 32_000_000
+
+# Below this an nLockTime is a block height; at or above it, a Unix timestamp.
+# Consumed by :mod:`pyrxd.script.timelock`, which used to spell it out again.
+LOCKTIME_THRESHOLD: int = 500_000_000
+
 # The subset that contributes to an output's **push-ref set** — the set Radiant
 # hashes into the sighash's ``hashOutputHashes`` and returns from
 # ``OP_REFDATASUMMARY_OUTPUT``. ``CScript::GetPushRefs``

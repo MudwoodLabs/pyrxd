@@ -289,6 +289,40 @@ def _get_push_refs_body(src: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Fact 5 — the scalar consensus limits (script.h)
+# ---------------------------------------------------------------------------
+
+#: ``static const[expr] <type> NAME = <int>;`` — the shape every scalar limit in
+#: ``script.h`` is declared with. Deliberately anchored on ``=`` and a bare
+#: integer so a value that becomes an expression fails the parse loudly rather
+#: than being silently mis-read.
+_SCALAR_LIMIT = r"static\s+const(?:expr)?\s+(?:unsigned\s+)?(?:int|long)\s+{name}\s*=\s*(\d+)\s*;"
+
+
+@lru_cache(maxsize=16)
+def script_limit(name: str) -> int:
+    """A scalar consensus limit from ``script.h``, by its C++ name.
+
+    Covers ``MAX_SCRIPT_ELEMENT_SIZE``, ``MAX_SCRIPT_ELEMENT_SIZE_LEGACY``,
+    ``MAX_OPS_PER_SCRIPT``, ``MAX_SCRIPT_SIZE``, ``MAX_STACK_SIZE``,
+    ``MAX_PUBKEYS_PER_MULTISIG`` and ``LOCKTIME_THRESHOLD``.
+
+    Worth reading the values before assuming Bitcoin's: Radiant raised
+    ``MAX_SCRIPT_ELEMENT_SIZE`` to 32,000,000 and kept Bitcoin's 520 under the
+    separate name ``MAX_SCRIPT_ELEMENT_SIZE_LEGACY``. Code that "knows" the
+    push limit is 520 is describing the wrong chain.
+    """
+    src = _strip_comments(vendored_source("script.h"))
+    match = re.search(_SCALAR_LIMIT.format(name=re.escape(name)), src)
+    if not match:
+        raise OracleParseError(
+            f"{name} is no longer declared as a plain `static const <type> {name} = <int>;` "
+            "in the vendored script.h; re-derive it in tests/consensus_oracle.py."
+        )
+    return int(match.group(1))
+
+
+# ---------------------------------------------------------------------------
 # Byte-valued convenience views
 # ---------------------------------------------------------------------------
 

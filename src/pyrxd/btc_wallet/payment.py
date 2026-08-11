@@ -15,12 +15,13 @@ No assert in src/ — all invariants use explicit raises.
 
 from __future__ import annotations
 
-import hashlib
 import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pyrxd.compactsize import encode_compact_size
 from pyrxd.fee_sizing import bitcoin_virtual_size
+from pyrxd.hash import hash256
 from pyrxd.security.errors import ValidationError
 from pyrxd.spv.payment import P2PKH, P2SH, P2TR, P2WPKH
 
@@ -300,22 +301,14 @@ def build_payment_tx(
 # ---------------------------------------------------------------------------
 
 
-def _hash256(data: bytes) -> bytes:
-    """Double SHA-256."""
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+#: Bitcoin's SHA-256d, from the one definition in :mod:`pyrxd.hash`. Bound to the
+#: module-private name rather than imported under its own so the BIP143 code
+#: below reads unchanged.
+_hash256 = hash256
 
 
-def _encode_varint(n: int) -> bytes:
-    """Bitcoin variable-length integer encoding."""
-    if n < 0:
-        raise ValidationError(f"varint cannot be negative: {n}")
-    if n < 0xFD:
-        return bytes([n])
-    if n <= 0xFFFF:
-        return b"\xfd" + n.to_bytes(2, "little")
-    if n <= 0xFFFFFFFF:
-        return b"\xfe" + n.to_bytes(4, "little")
-    return b"\xff" + n.to_bytes(8, "little")
+#: Canonical CompactSize, from the one codec in :mod:`pyrxd.compactsize`.
+_encode_varint = encode_compact_size
 
 
 def _output_script(to_type: str, to_hash: bytes) -> bytes:

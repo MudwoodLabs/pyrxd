@@ -410,8 +410,12 @@ def test_scriptnum_and_push_encoder_edges():
     assert _push(b"") == b"\x00"
     assert _push(b"\x01" * 100)[:2] == b"\x4c\x64"  # PUSHDATA1
     assert _push(b"\x01" * 300)[:3] == b"\x4d\x2c\x01"  # PUSHDATA2
-    with pytest.raises(ValidationError, match="64 KB"):
+    # The 64 KB ceiling survived the move to the shared encoder. Matched on the
+    # numbers rather than the old "64 KB" wording: the shared encoder reports the
+    # actual size and the actual limit, which is a strictly more specific claim.
+    with pytest.raises(ValidationError, match=r"65536 bytes exceeds the 65535-byte limit"):
         _push(b"\x00" * 0x10000)
+    assert len(_push(b"\x00" * 0xFFFF)) == 0xFFFF + 3, "the byte at the limit must still encode"
 
 
 def test_nft_and_ft_bind_exactly_the_genesis_ref():

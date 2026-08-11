@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import pytest
 
+import pyrxd.constants as pyrxd_constants
 from pyrxd.constants import (
     MAX_OPCODE,
     OPCODE_VALUE_NAME_DICT,
@@ -51,6 +52,7 @@ from tests.consensus_oracle import (
     ref_operand_opcode_names,
     ref_operand_opcodes,
     ref_operand_width,
+    script_limit,
     vendored_digest,
 )
 
@@ -238,3 +240,57 @@ class TestOpcodeTableParity:
         """``OPCODE_VALUE_NAME_DICT`` is what disassembly and inspection use."""
         unnamed = sorted(v for v in _upstream_opcodes().values() if bytes([v]) not in OPCODE_VALUE_NAME_DICT)
         assert not unnamed, f"no name for consensus opcodes: {[hex(v) for v in unnamed]}"
+
+
+#: Every scalar limit pyrxd pins, mapped to the C++ name it comes from. Adding a
+#: constant to ``pyrxd.constants`` without adding it here is caught by
+#: ``test_no_pinned_limit_is_unchecked`` below.
+_PINNED_SCALAR_LIMITS = [
+    "LOCKTIME_THRESHOLD",
+    "MAX_OPS_PER_SCRIPT",
+    "MAX_SCRIPT_ELEMENT_SIZE",
+    "MAX_SCRIPT_ELEMENT_SIZE_LEGACY",
+    "MAX_SCRIPT_SIZE",
+    "MAX_STACK_SIZE",
+]
+
+
+class TestScalarConsensusLimits:
+    """The ``script.h`` limits, checked against the C++ that declares them.
+
+    Written as a table rather than one test per constant so that a constant
+    pinned without a check is a test failure, not an omission nobody notices —
+    which is the state ``MAX_OPCODE`` was in before it had a consumer.
+    """
+
+    @pytest.mark.parametrize("name", _PINNED_SCALAR_LIMITS)
+    def test_pinned_limit_matches_radiant(self, name):
+        pinned = getattr(pyrxd_constants, name)
+        upstream = script_limit(name)
+        assert pinned == upstream, f"pyrxd pins {name}={pinned:,} but Radiant's script.h declares {upstream:,}"
+
+    def test_no_pinned_limit_is_unchecked(self):
+        """Catch a seventh limit added to constants.py and never compared."""
+        declared = {
+            name
+            for name in dir(pyrxd_constants)
+            if (name.startswith("MAX_") or name.endswith("_THRESHOLD"))
+            and isinstance(getattr(pyrxd_constants, name), int)
+            and name != "MAX_OPCODE"  # derived, not a literal — checked separately above
+        }
+        unchecked = declared - set(_PINNED_SCALAR_LIMITS)
+        assert not unchecked, (
+            f"these pinned constants are never compared against Radiant Core: {sorted(unchecked)}. "
+            f"Add them to _PINNED_SCALAR_LIMITS (and to consensus_oracle.script_limit if the "
+            f"C++ declares them differently)."
+        )
+
+    def test_the_radiant_push_limit_is_not_bitcoins(self):
+        """Radiant raised it to 32,000,000 and kept 520 under a ``_LEGACY`` name.
+
+        Pinned as its own assertion because "MAX_SCRIPT_ELEMENT_SIZE is 520" is
+        the single most likely thing for someone to believe while wiring this
+        constant into a builder, and it would reject scripts the chain accepts.
+        """
+        assert script_limit("MAX_SCRIPT_ELEMENT_SIZE") == 32_000_000
+        assert script_limit("MAX_SCRIPT_ELEMENT_SIZE_LEGACY") == 520

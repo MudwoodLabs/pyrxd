@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from io import BytesIO
 
-from ..constants import PUSH_REF_OPCODES, REF_OPERAND_OPCODES, SIGHASH
+from ..constants import PUSH_REF_OPCODES, REF_OPERAND_OPCODES, REF_OPERAND_WIDTH, SIGHASH
 from ..hash import hash256
 from .transaction_input import TransactionInput
 from .transaction_output import TransactionOutput
@@ -61,14 +61,15 @@ def _get_push_refs(script_bytes: bytes) -> list:
         op = script_bytes[i]
         i += 1
         if op in REF_OPERAND_OPCODES:
-            if i + 36 > n_total:
+            if i + REF_OPERAND_WIDTH > n_total:
                 from pyrxd.security.errors import ValidationError
 
                 raise ValidationError(
-                    f"truncated pushref at offset {i - 1}: expected 36 bytes of ref data, only {n_total - i} available"
+                    f"truncated pushref at offset {i - 1}: expected {REF_OPERAND_WIDTH} bytes "
+                    f"of ref data, only {n_total - i} available"
                 )
-            ref = script_bytes[i : i + 36]
-            i += 36
+            ref = script_bytes[i : i + REF_OPERAND_WIDTH]
+            i += REF_OPERAND_WIDTH
             if op in PUSH_REF_OPCODES:
                 refs[ref.hex()] = ref
         elif 0x01 <= op <= 0x4B:

@@ -41,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from pyrxd.constants import REF_OPERAND_WIDTH
 from pyrxd.glyph.script import REF_OPCODES, TruncatedScriptError, count_input_refs
 
 __all__ = [
@@ -110,8 +111,8 @@ def _opcodes(script: bytes) -> list[int]:
     while pos < n:
         op = script[pos]
         ops.append(op)
-        if op in REF_OPCODES:  # {d0,d1,d2,d3,d8}: opcode + 36-byte ref operand
-            pos += 37
+        if op in REF_OPCODES:  # {d0,d1,d2,d3,d8}: opcode + fixed-width ref operand
+            pos += 1 + REF_OPERAND_WIDTH
             continue
         if 0x01 <= op <= 0x4B:
             pos += 1 + op

@@ -156,12 +156,11 @@ def _vi(n: int) -> bytes:
     return b"\xff" + n.to_bytes(8, "little")
 
 
-def test_multibyte_compactsize_input_count_parses():
-    """A 0xFD-prefixed (multi-byte CompactSize) input count is parsed correctly — the
-    txid still round-trips. Builds a legacy tx with 1 input declared via 0xFD,0x01."""
-    raw = (
+def _legacy_tx(input_count_field: bytes) -> bytes:
+    """A one-input, zero-output legacy tx whose input count uses ``input_count_field``."""
+    return (
         bytes.fromhex("02000000")
-        + b"\xfd\x01\x00"  # CompactSize 1 as 0xFD 0x0001 (multi-byte form)
+        + input_count_field
         + b"\x00" * 32
         + b"\x00\x00\x00\x00"
         + b"\x00"
@@ -169,8 +168,45 @@ def test_multibyte_compactsize_input_count_parses():
         + b"\x00"  # 0 outputs
         + bytes.fromhex("00000000")  # locktime
     )
+
+
+def test_multibyte_compactsize_input_count_parses():
+    """A genuinely multi-byte CompactSize input count parses and round-trips.
+
+    300 needs the ``0xFD`` form, so this exercises the multi-byte path with a
+    value that *requires* it — which is what the test was reaching for.
+    """
+    raw = (
+        bytes.fromhex("02000000")
+        + b"\xfd\x2c\x01"  # CompactSize 300 — the shortest form that fits
+        + (b"\x00" * 32 + b"\x00\x00\x00\x00" + b"\x00" + b"\xff\xff\xff\xff") * 300
+        + b"\x00"  # 0 outputs
+        + bytes.fromhex("00000000")  # locktime
+    )
     txid = t.btc_txid_from_raw(raw)
     assert len(txid) == 64
+
+
+def test_non_minimal_compactsize_input_count_is_refused():
+    """``fd 01 00`` — the value 1 in the 3-byte form — must FAIL CLOSED.
+
+    This test previously asserted the opposite, because ``btc_txid_from_raw``
+    carried its own CompactSize reader and that copy accepted overlong
+    encodings while the SPV, witness and ``Transaction`` readers rejected them.
+
+    Accepting it is not harmless leniency. Consensus refuses a non-minimal
+    CompactSize at deserialization, so no such transaction can exist on chain,
+    and this function's whole job is to hand the reorg gate the txid of a
+    transaction that does. The docstring already promised FAIL-CLOSED "on ANY
+    structural problem"; this is one.
+    """
+    with pytest.raises(ValidationError, match="non-canonical"):
+        t.btc_txid_from_raw(_legacy_tx(b"\xfd\x01\x00"))
+
+
+def test_the_canonical_spelling_of_that_same_tx_still_parses():
+    """Control for the test above — the rule must reject only the overlong form."""
+    assert len(t.btc_txid_from_raw(_legacy_tx(b"\x01"))) == 64
 
 
 def test_fail_closed_on_oversize_input_count():

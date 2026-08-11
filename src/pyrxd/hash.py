@@ -185,6 +185,13 @@ _K_RIGHT = (0x50A28BE6, 0x5C4DD124, 0x6D703EF3, 0x7A6D76E9, 0x00000000)
 # fmt: on
 
 
+#: RIPEMD160's chaining value: five 32-bit words. Spelled out rather than left
+#: as a bare ``tuple`` because ``pyrxd.security`` now reaches this module through
+#: ``pyrxd.base58`` (the WIF decoder was consolidated onto the one base58 codec),
+#: and that package is typechecked strictly.
+_ChainingValue = tuple[int, int, int, int, int]
+
+
 def _rol(x: int, n: int) -> int:
     """32-bit rotate left."""
     x &= 0xFFFFFFFF
@@ -246,7 +253,7 @@ class _RIPEMD160:
         self._h = self._compress_block(block, self._h)
 
     @staticmethod
-    def _compress_block(block: bytes, hin: tuple) -> tuple:
+    def _compress_block(block: bytes, hin: _ChainingValue) -> _ChainingValue:
         x = struct.unpack("<16I", block)
         a_l, b_l, c_l, d_l, e_l = hin
         a_r, b_r, c_r, d_r, e_r = hin

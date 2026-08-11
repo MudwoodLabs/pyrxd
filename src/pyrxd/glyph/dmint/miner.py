@@ -33,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from pyrxd.hash import hash256, sha256
 from pyrxd.security.errors import (
     ContractExhaustedError,
     InvalidFundingUtxoError,
@@ -130,15 +131,12 @@ def build_pow_preimage(
     if len(contract_ref_bytes) != 36:
         raise ValidationError("contract_ref_bytes must be 36 bytes")
 
-    def sha256(data: bytes) -> bytes:
-        return hashlib.sha256(data).digest()
-
-    def sha256d(data: bytes) -> bytes:
-        return sha256(sha256(data))
-
+    # Two SHA-256d calls per mint-tx build — not the grind loop, so these use
+    # the shared definitions. The grind itself (``verify_sha256d_solution`` and
+    # ``contrib/miner/parallel.py``) deliberately does not; see the note there.
     half1 = sha256(txid_le + contract_ref_bytes)
-    input_csh = sha256d(input_script)
-    output_csh = sha256d(output_script)
+    input_csh = hash256(input_script)
+    output_csh = hash256(output_script)
     half2 = sha256(input_csh + output_csh)
     return PowPreimageResult(preimage=half1 + half2, input_hash=input_csh, output_hash=output_csh)
 
