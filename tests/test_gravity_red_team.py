@@ -391,6 +391,17 @@ class TestParamEncodingEdges:
 # ===========================================================================
 
 
+#: Fees that clear Radiant's relay floor for the CLAIM and FORFEIT shapes, which are
+#: different sizes from the offer tx and so need their own numbers. Measured (reported by
+#: the guard when it first refused these fixtures): a claim is **259 bytes** -> 2,590,000
+#: photons, a forfeit **188 bytes** -> 1,880,000. Every site below used ``fee_sats=1_000``
+#: with a 1,000,000-photon input, i.e. between 1,880x and 2,590x under the floor, and
+#: asserted the resulting transaction was well-formed. It was — and no node would relay it.
+_CLAIM_FEE = 3_000_000
+_FORFEIT_FEE = 2_500_000
+_FUNDED = 50_000_000
+
+
 class TestMakerOfferTxSigning:
     FAKE_TXID = "aa" * 32
     #: Clears Radiant's relay floor for the ~190-byte offer tx (10,000 photons/byte of
@@ -645,9 +656,9 @@ class TestForfeit:
                 offer=offer,
                 funding_txid="aa" * 32,
                 funding_vout=0,
-                funding_photons=1_000_000,
+                funding_photons=_FUNDED,
                 maker_address=self.MAKER_ADDR,
-                fee_sats=1_000,
+                fee_sats=_FORFEIT_FEE,
             )
 
     def test_forfeit_tx_locktime_equals_claim_deadline(self):
@@ -656,9 +667,9 @@ class TestForfeit:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             maker_address=self.MAKER_ADDR,
-            fee_sats=1_000,
+            fee_sats=_FORFEIT_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         locktime = int.from_bytes(raw[-4:], "little")
@@ -671,9 +682,9 @@ class TestForfeit:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             maker_address=self.MAKER_ADDR,
-            fee_sats=1_000,
+            fee_sats=_FORFEIT_FEE,
         )
         # Read the FIELD, not the byte soup. This used to be
         # `assert b"\xfe\xff\xff\xff" in raw` plus a comment promising a check
@@ -991,8 +1002,8 @@ class TestClaimTxAttacks:
                 offer=offer,
                 funding_txid="aa" * 32,
                 funding_vout=0,
-                funding_photons=1_000_000,
-                fee_sats=1_000,
+                funding_photons=_FUNDED,
+                fee_sats=_CLAIM_FEE,
                 taker_privkey=self._taker(),
                 accept_short_deadline=False,
             )
@@ -1011,8 +1022,8 @@ class TestClaimTxAttacks:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
-            fee_sats=1_000,
+            funding_photons=_FUNDED,
+            fee_sats=_CLAIM_FEE,
             taker_privkey=self._taker(),
             accept_short_deadline=True,
         )
@@ -1044,8 +1055,8 @@ class TestClaimTxAttacks:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
-            fee_sats=1_000,
+            funding_photons=_FUNDED,
+            fee_sats=_CLAIM_FEE,
             taker_privkey=self._taker(),
             accept_short_deadline=True,
         )
@@ -1115,9 +1126,9 @@ class TestForfeitTxAttacks:
                 offer=offer,
                 funding_txid="aa" * 32,
                 funding_vout=0,
-                funding_photons=1_000_000,
+                funding_photons=_FUNDED,
                 maker_address=self.MAKER_ADDR,
-                fee_sats=1_000,
+                fee_sats=_FORFEIT_FEE,
             )
 
     def test_past_deadline_allows_forfeit(self):
@@ -1127,9 +1138,9 @@ class TestForfeitTxAttacks:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             maker_address=self.MAKER_ADDR,
-            fee_sats=1_000,
+            fee_sats=_FORFEIT_FEE,
         )
         assert result.tx_hex
 
@@ -1140,9 +1151,9 @@ class TestForfeitTxAttacks:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             maker_address=self.MAKER_ADDR,
-            fee_sats=1_000,
+            fee_sats=_FORFEIT_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         assert raw[-4:] == offer.claim_deadline.to_bytes(4, "little")
@@ -1154,9 +1165,9 @@ class TestForfeitTxAttacks:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             maker_address=self.MAKER_ADDR,
-            fee_sats=1_000,
+            fee_sats=_FORFEIT_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         # Parse to extract input sequence.
@@ -1179,9 +1190,9 @@ class TestForfeitTxAttacks:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             maker_address=self.MAKER_ADDR,
-            fee_sats=1_000,
+            fee_sats=_FORFEIT_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         pos = 4 + 1 + 32 + 4  # version + in_count + prevhash + vout

@@ -258,8 +258,12 @@ def test_rswp_nft_cancel_returns_singleton() -> None:
         offered_vout=0,
         maker_key=mk,
         refund_pkh=mk_pkh,
-        fee=300,
-        funding=[FundingInput(_rxd_src(mk_pkh, 1_000), 0, mk)],
+        # An NFT cancel returns the full carrier (a singleton has no change path), so the
+        # fee comes entirely from the plain-RXD funding input. Both are sized to clear
+        # Radiant's relay floor for this shape — the old 300-photon fee built a cancel no
+        # node would relay, which for the ONLY revocation mechanism is a fund-safety bug.
+        fee=5_000_000,
+        funding=[FundingInput(_rxd_src(mk_pkh, 10_000_000), 0, mk)],
     )
     out0 = tx.outputs[0].locking_script.serialize()
     assert is_nft_script(out0.hex()) and tx.outputs[0].satoshis == 600

@@ -171,11 +171,21 @@ def test_build_advert_tx_wraps_script_at_output0_value0() -> None:
     assert _classify(tx.outputs[1]) == ("rxd", 1600, None)  # change
 
 
+# Cancel fees that actually clear Radiant's relay floor for the shape being built.
+# MEASURED over 150 builds with fresh keys (DER signatures are 69-71 bytes, so the size
+# varies run to run): the RXD cancel is 190-192 B (floor <= 1,920,000 photons) and the
+# FT-with-funding cancel is 421-424 B (floor <= 4,240,000). The old fixtures paid 200 and
+# 300 photons — roughly 10,000x under — and asserted the result was fine, which is why
+# nothing offline caught the missing guard: they described a chain state that cannot exist.
+_CANCEL_FEE_RXD = 2_500_000
+_CANCEL_FEE_FT = 5_000_000
+
+
 def test_cancel_rxd_offer_returns_value_to_maker() -> None:
     mk, mk_pkh = _key()
-    src = _rxd_src(mk_pkh, 1000)
-    tx = build_cancel_tx(offered_source_tx=src, offered_vout=0, maker_key=mk, refund_pkh=mk_pkh, fee=200)
-    assert _classify(tx.outputs[0]) == ("rxd", 800, None)
+    src = _rxd_src(mk_pkh, 10_000_000)
+    tx = build_cancel_tx(offered_source_tx=src, offered_vout=0, maker_key=mk, refund_pkh=mk_pkh, fee=_CANCEL_FEE_RXD)
+    assert _classify(tx.outputs[0]) == ("rxd", 10_000_000 - _CANCEL_FEE_RXD, None)
 
 
 def test_cancel_ft_offer_conserves_token_with_rxd_fee_funding() -> None:
@@ -186,12 +196,12 @@ def test_cancel_ft_offer_conserves_token_with_rxd_fee_funding() -> None:
         offered_vout=0,
         maker_key=mk,
         refund_pkh=mk_pkh,
-        fee=300,
-        funding=[FundingInput(_rxd_src(mk_pkh, 1000), 0, mk)],
+        fee=_CANCEL_FEE_FT,
+        funding=[FundingInput(_rxd_src(mk_pkh, 10_000_000), 0, mk)],
     )
     kinds = [_classify(o) for o in tx.outputs]
     assert ("ft", 100, _REF_G) in kinds  # full token amount back — conservation
-    assert ("rxd", 700, None) in kinds
+    assert ("rxd", 10_000_000 - _CANCEL_FEE_FT, None) in kinds
 
 
 # ─────────────────────────────── adversarial ─────────────────────────────────

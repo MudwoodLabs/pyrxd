@@ -212,12 +212,14 @@ def _radiant_address_to_p2pkh_script(address: str) -> bytes:
     return b"\x76\xa9\x14" + pkh + b"\x88\xac"
 
 
-def _assert_offer_fee_clears_relay_floor(
+def _assert_fee_clears_relay_floor(
     raw_tx: bytes,
     fee_sats: int,
     fee_policy: DeadlineFeePolicy | None,
+    *,
+    what: str,
 ) -> None:
-    """Refuse to return a MakerOffer tx the chain would not relay. **Fund safety.**
+    """Refuse to return a Gravity tx the chain would not relay. **Fund safety.**
 
     ``fee_sats`` arrives from the caller with nothing but a ``>= 0`` check
     (:func:`_validate_fee_sats`), which catches an accounting impossibility but says
@@ -226,18 +228,39 @@ def _assert_offer_fee_clears_relay_floor(
     (``src/validation.cpp:778``) with ``66: min relay fee not met``, and **Radiant has
     neither RBF nor CPFP** — ``src/validation.cpp:667``/``:856`` reject a mempool conflict
     outright and ``src/miner.cpp:380`` selects on the transaction's own
-    ``GetModifiedFeeRate()``. So an under-fee'd offer cannot be replaced, cannot be
-    bumped by a child, and squats on the Maker's funding UTXO until
-    ``DEFAULT_MEMPOOL_EXPIRY`` (8h) frees it for a rebuild. Handing the caller a
-    plausible ``txid`` and plausible accounting for that transaction is the failure this
-    guard exists to prevent.
+    ``GetModifiedFeeRate()``. So an under-fee'd Gravity tx cannot be replaced, cannot be
+    bumped by a child, and squats on the UTXO it spends until ``DEFAULT_MEMPOOL_EXPIRY``
+    (8h) frees it for a rebuild. Handing the caller a plausible ``txid`` and plausible
+    accounting for that transaction is the failure this guard exists to prevent.
+
+    Every builder in this module is guarded, and the stakes differ per builder:
+
+    * ``build_maker_offer_tx`` — strands the Maker's funding UTXO (#407).
+    * ``build_claim_tx`` — the Taker has *already paid on Bitcoin* by the time this is
+      broadcast, or is about to. A claim that never relays leaves the MakerOffer live and
+      the Taker's only remaining exit is the ``forfeit`` deadline.
+    * ``build_cancel_tx`` — the Maker's revocation. Unrelayable means the offer stays
+      takeable while the caller has been told it was cancelled.
+    * ``build_finalize_tx`` — the Taker's payout leg, and by far the largest transaction
+      here: it pushes the whole BTC tx plus N block headers plus the Merkle branch into
+      one scriptSig, so its floor is an order of magnitude above the others' and a fee
+      that was ample for a claim is nowhere near enough.
+    * ``build_forfeit_tx`` — the Maker's post-deadline reclaim, the last exit from a
+      MakerClaimed UTXO.
 
     Measured **after signing**, against ``radiant_relay_size(raw_tx)`` — the exact bytes
     that go on the wire. A DER signature is 69-71 bytes run to run, so a pre-signing
     estimate is not a size, and one byte short of the real size is a fee under the floor.
+    (``build_finalize_tx`` and ``build_forfeit_tx`` carry no signature at all — their
+    scriptSigs are proof data and a selector — so their sizes are deterministic. Measuring
+    the real bytes is still right: it is one rule, and it does not have to know which
+    builder is asking.)
 
-    Deadline-unaware (``blocks_to_deadline=None``): deploying an offer races nothing. The
-    time-critical spends apply the urgency premium on top at broadcast — see
+    Deadline-unaware (``blocks_to_deadline=None``) for every builder here, including the
+    time-critical ones. That is deliberate: :func:`assert_fee_covers` only ever *hard-gates*
+    on the relay floor — the urgency premium is a pool-sizing target, and refusing to
+    return a claim that clears the floor but not a premium would refuse hardest exactly
+    when claiming matters most. The premium is applied on top at broadcast by
     :meth:`~pyrxd.gravity.radiant_leg.RadiantCovenantLeg._assert_affordable`.
 
     The check is :func:`~pyrxd.gravity.fee_policy.assert_fee_covers`, shared verbatim with
@@ -250,7 +273,7 @@ def _assert_offer_fee_clears_relay_floor(
         size_bytes=radiant_relay_size(raw_tx),
         policy=fee_policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
         blocks_to_deadline=None,
-        what="Gravity MakerOffer funding tx",
+        what=what,
         unit="photons",
     )
 
@@ -322,7 +345,7 @@ def build_maker_offer_tx(
     ------
     ~pyrxd.security.errors.InsufficientFundsError
         If ``fee_sats`` is below the node's min-relay floor for the transaction's
-        real, signed size. See :func:`_assert_offer_fee_clears_relay_floor`.
+        real, signed size. See :func:`_assert_fee_clears_relay_floor`.
     """
     _validate_txid(funding_txid)
     _validate_fee_sats(fee_sats)
@@ -422,7 +445,7 @@ def build_maker_offer_tx(
     # Post-assembly, post-SIGNING relay-floor gate. Deliberately here and not next to
     # `_validate_fee_sats`: the requirement is ceil(size x rate / 1000), and the size is
     # only knowable once the DER signature is in the scriptSig.
-    _assert_offer_fee_clears_relay_floor(raw_tx, fee_sats, fee_policy)
+    _assert_fee_clears_relay_floor(raw_tx, fee_sats, fee_policy, what="Gravity MakerOffer funding tx")
 
     txid = hash256(raw_tx)[::-1].hex()
     offer_p2sh_addr = compute_p2sh_address_from_redeem(offer_redeem)
@@ -447,12 +470,26 @@ def build_cancel_tx(
     maker_address: str,
     fee_sats: int,
     maker_privkey: PrivateKeyMaterial,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> CancelResult:
     """Build the Radiant cancel() tx: Maker reclaims a MakerOffer UTXO.
 
     MakerOffer.cancel() is function index 0 — selector OP_0 (empty push).
     Requires Maker signature. No deadline constraint.
     scriptSig: <makerSig+hashtype> OP_0 <offer_redeem>
+
+    ``fee_policy`` supplies the min-relay rate the assembled transaction is checked
+    against, defaulting to
+    :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`. Pass a policy
+    built from the target node's own ``getmempoolinfo``/``effective_minrelaytxfee`` when
+    it advertises something else, which regtest does.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee_sats`` is below the node's min-relay floor for the transaction's real,
+        signed size — a cancel that cannot relay leaves the offer takeable. See
+        :func:`_assert_fee_clears_relay_floor`.
     """
     _validate_txid(funding_txid)
     _validate_fee_sats(fee_sats)
@@ -486,6 +523,7 @@ def build_cancel_tx(
     raw_tx = (
         (2).to_bytes(4, "little") + _varint(1) + input_bytes + _varint(1) + output_bytes + (0).to_bytes(4, "little")
     )
+    _assert_fee_clears_relay_floor(raw_tx, fee_sats, fee_policy, what="Gravity MakerOffer cancel tx")
     txid = hash256(raw_tx)[::-1].hex()
     return CancelResult(
         tx_hex=raw_tx.hex(), txid=txid, tx_size=len(raw_tx), fee_sats=fee_sats, output_photons=output_photons
@@ -500,6 +538,7 @@ def build_claim_tx(
     fee_sats: int,
     taker_privkey: PrivateKeyMaterial,
     accept_short_deadline: bool = False,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> ClaimResult:
     """Build the Radiant ``claim()`` spending tx: MakerOffer → MakerClaimed.
 
@@ -531,6 +570,18 @@ def build_claim_tx(
         Taker's secp256k1 private key (wrapped in ``PrivateKeyMaterial``).
     accept_short_deadline:
         If ``True``, suppress the 24-hour deadline guard (audit 04-S1).
+    fee_policy:
+        The min-relay rate the assembled transaction is checked against. Defaults to
+        :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`. Pass a
+        policy built from the target node's own
+        ``getmempoolinfo``/``effective_minrelaytxfee`` when it advertises something
+        else, which regtest does.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee_sats`` is below the node's min-relay floor for the transaction's real,
+        signed size. See :func:`_assert_fee_clears_relay_floor`.
     """
     _validate_txid(funding_txid)
     _validate_fee_sats(fee_sats)
@@ -605,6 +656,8 @@ def build_claim_tx(
         + (0).to_bytes(4, "little")  # locktime
     )
 
+    _assert_fee_clears_relay_floor(raw_tx, fee_sats, fee_policy, what="Gravity claim tx")
+
     txid = hash256(raw_tx)[::-1].hex()
     offer_p2sh = compute_p2sh_address_from_redeem(offer_redeem)
     claimed_p2sh = compute_p2sh_address_from_redeem(claimed_redeem)
@@ -631,6 +684,7 @@ def build_finalize_tx(
     minimum_output_photons: int = 0,
     header_slots: int | None = None,
     branch_slots: int | None = None,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> FinalizeResult:
     """Build the Radiant ``finalize()`` tx: MakerClaimed → Taker's address.
 
@@ -670,6 +724,22 @@ def build_finalize_tx(
         before burning relay fees.  Pass ``offer.photons_offered`` when
         calling from :class:`GravityTrade`.  Defaults to 0 (no floor
         check) for callers that have already verified externally.
+    fee_policy:
+        The min-relay rate the assembled transaction is checked against. Defaults to
+        :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`. Pass a
+        policy built from the target node's own
+        ``getmempoolinfo``/``effective_minrelaytxfee`` when it advertises something
+        else, which regtest does.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee_sats`` is below the node's min-relay floor for the transaction's real
+        size. **This is the largest transaction in the module** — the whole BTC payment
+        tx, ``header_slots`` × 80-byte headers and a ``branch_slots``-level Merkle branch
+        all go into one scriptSig — so its floor is an order of magnitude above a claim's
+        and a fee that was ample there is not ample here. See
+        :func:`_assert_fee_clears_relay_floor`.
     """
     _validate_txid(funding_txid)
     _validate_fee_sats(fee_sats)
@@ -752,6 +822,8 @@ def build_finalize_tx(
         (2).to_bytes(4, "little") + _varint(1) + input_bytes + _varint(1) + output_bytes + (0).to_bytes(4, "little")
     )
 
+    _assert_fee_clears_relay_floor(raw_tx, fee_sats, fee_policy, what="Gravity finalize tx")
+
     txid = hash256(raw_tx)[::-1].hex()
 
     return FinalizeResult(
@@ -770,6 +842,7 @@ def build_forfeit_tx(
     funding_photons: int,
     maker_address: str,
     fee_sats: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> ForfeitResult:
     """Build the Radiant ``forfeit()`` tx: Maker reclaims after ``claimDeadline``.
 
@@ -800,6 +873,20 @@ def build_forfeit_tx(
         Maker's Radiant P2PKH address to receive the reclaimed photons.
     fee_sats:
         Miner fee in photons.
+    fee_policy:
+        The min-relay rate the assembled transaction is checked against. Defaults to
+        :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`. Pass a
+        policy built from the target node's own
+        ``getmempoolinfo``/``effective_minrelaytxfee`` when it advertises something
+        else, which regtest does.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee_sats`` is below the node's min-relay floor for the transaction's real
+        size — forfeit is the last exit from a MakerClaimed UTXO, so one that cannot
+        relay leaves the Maker with nothing else to try. See
+        :func:`_assert_fee_clears_relay_floor`.
     """
     _validate_txid(funding_txid)
     _validate_fee_sats(fee_sats)
@@ -842,6 +929,8 @@ def build_forfeit_tx(
         + output_bytes
         + offer.claim_deadline.to_bytes(4, "little")
     )
+
+    _assert_fee_clears_relay_floor(raw_tx, fee_sats, fee_policy, what="Gravity forfeit tx")
 
     txid = hash256(raw_tx)[::-1].hex()
 

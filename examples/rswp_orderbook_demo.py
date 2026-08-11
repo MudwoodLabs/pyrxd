@@ -126,13 +126,19 @@ def main() -> None:
     # ── Maker: cancel (the only hard revocation) ────────────────────────────
     # The 0xC3 signature never expires; self-spending the offered UTXO is what
     # kills the order. FT cancels conserve the token and fund the fee with RXD.
+    #
+    # The fee here is REAL, unlike the illustrative ones above: `build_cancel_tx`
+    # refuses anything below Radiant's relay floor. This shape (FT input + RXD funding
+    # input) measures 421-424 bytes over 150 builds, so its floor is up to 4,240,000
+    # photons at 10,000 photons/byte. The demo used to pass 400 — about 10,000x under —
+    # which would have produced a cancel no node relays while the order stayed takeable.
     cancel_tx = build_cancel_tx(
         offered_source_tx=ft_source,
         offered_vout=0,
         maker_key=maker,
         refund_pkh=maker_pkh,
-        fee=400,
-        funding=[FundingInput(_p2pkh_source(maker_pkh, 3_000), 0, maker)],
+        fee=5_000_000,
+        funding=[FundingInput(_p2pkh_source(maker_pkh, 10_000_000), 0, maker)],
     )
     print(f"cancel tx (broadcast INSTEAD of letting the order rest): {cancel_tx.txid()}")
 

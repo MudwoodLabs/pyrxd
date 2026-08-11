@@ -214,6 +214,33 @@ class TestGravityOffer:
 
 
 # ---------------------------------------------------------------------------
+# Fees that actually clear Radiant's relay floor for the shape each builder emits.
+#
+# Every one of these call sites used to pass `fee_sats=1_000` and assert the result was
+# fine. At the effective mainnet rate (10,000 photons/BYTE) that is between 1,880x and
+# 11,500x short, so each fixture described a transaction the chain would reject as
+# `66: min relay fee not met` — a chain state that cannot exist. That is exactly why
+# nothing offline caught the missing floor checks in these builders.
+#
+# The sizes below are MEASURED, reported by the guard itself when it first refused these
+# fixtures, not modelled:
+#
+#   forfeit   188 B   -> floor  1,880,000 photons   (no signature: scriptSig is OP_1 + redeem)
+#   claim     259 B   -> floor  2,590,000 photons   (DER sig, so +/- a byte or two run to run)
+#   finalize  971-1150 B -> floor up to 11,500,000  (the whole BTC tx + headers + branch
+#                                                    live in ONE scriptSig)
+#
+# Each constant sits above the worst measured floor for its shape with room for DER
+# variance. Funding values are raised alongside them: a fixture whose UTXO is smaller than
+# its own relay fee is not a fixture, it is an impossible transaction.
+# ---------------------------------------------------------------------------
+_FORFEIT_FEE = 2_500_000
+_CLAIM_FEE = 3_000_000
+_FINALIZE_FEE = 15_000_000
+_FUNDED = 50_000_000  # 0.5 RXD — comfortably covers any of the above plus an output
+
+
+# ---------------------------------------------------------------------------
 # build_finalize_tx tests
 # ---------------------------------------------------------------------------
 
@@ -226,9 +253,9 @@ class TestBuildFinalizeTx:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
         assert isinstance(result, FinalizeResult)
         assert result.tx_hex
@@ -242,9 +269,9 @@ class TestBuildFinalizeTx:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
         assert len(result.txid) == 64
 
@@ -255,12 +282,12 @@ class TestBuildFinalizeTx:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
-        assert result.output_photons == 999_000
-        assert result.fee_sats == 1_000
+        assert result.output_photons == _FUNDED - _FINALIZE_FEE
+        assert result.fee_sats == _FINALIZE_FEE
 
     def test_finalize_fee_exceeds_photons_rejected(self):
         proof = _make_spv_proof()
@@ -272,7 +299,7 @@ class TestBuildFinalizeTx:
                 funding_vout=0,
                 funding_photons=500,
                 to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-                fee_sats=1_000,
+                fee_sats=_FINALIZE_FEE,
             )
 
     def test_finalize_scriptsig_contains_header_bytes(self):
@@ -283,9 +310,9 @@ class TestBuildFinalizeTx:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         assert b"\xde\xad\xbe\xef" in raw
@@ -298,9 +325,9 @@ class TestBuildFinalizeTx:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         assert b"\x01" * 100 in raw
@@ -313,9 +340,9 @@ class TestBuildFinalizeTx:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         for h in headers:
@@ -328,9 +355,9 @@ class TestBuildFinalizeTx:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         version = int.from_bytes(raw[:4], "little")
@@ -344,9 +371,9 @@ class TestBuildFinalizeTx:
                 claimed_redeem_hex="ab" * 50,
                 funding_txid="cd" * 32,
                 funding_vout=0,
-                funding_photons=1_000_000,
+                funding_photons=_FUNDED,
                 to_address="notanaddress!!!",
-                fee_sats=1_000,
+                fee_sats=_FINALIZE_FEE,
             )
 
     def test_finalize_txid_is_hash256_of_raw(self):
@@ -359,9 +386,9 @@ class TestBuildFinalizeTx:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         h1 = hashlib.sha256(raw).digest()
@@ -416,9 +443,9 @@ class TestBuildForfeitTx:
                 offer,
                 "aa" * 32,
                 0,
-                1_000_000,
+                _FUNDED,
                 "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-                1_000,
+                _FORFEIT_FEE,
             )
 
     def test_forfeit_past_deadline_builds_tx(self):
@@ -427,9 +454,9 @@ class TestBuildForfeitTx:
             offer,
             "aa" * 32,
             0,
-            1_000_000,
+            _FUNDED,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            1_000,
+            _FORFEIT_FEE,
         )
         assert isinstance(result, ForfeitResult)
         assert result.tx_hex
@@ -441,9 +468,9 @@ class TestBuildForfeitTx:
             offer,
             "aa" * 32,
             0,
-            1_000_000,
+            _FUNDED,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            1_000,
+            _FORFEIT_FEE,
         )
         assert len(result.txid) == 64
 
@@ -453,12 +480,12 @@ class TestBuildForfeitTx:
             offer,
             "aa" * 32,
             0,
-            1_000_000,
+            _FUNDED,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            1_000,
+            _FORFEIT_FEE,
         )
-        assert result.output_photons == 999_000
-        assert result.fee_sats == 1_000
+        assert result.output_photons == _FUNDED - _FORFEIT_FEE
+        assert result.fee_sats == _FORFEIT_FEE
 
     def test_forfeit_fee_exceeds_photons_rejected(self):
         offer = self._past_offer()
@@ -469,7 +496,7 @@ class TestBuildForfeitTx:
                 0,
                 500,
                 "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-                1_000,
+                _FORFEIT_FEE,
             )
 
     def test_forfeit_locktime_equals_claim_deadline(self):
@@ -479,9 +506,9 @@ class TestBuildForfeitTx:
             offer,
             "aa" * 32,
             0,
-            1_000_000,
+            _FUNDED,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            1_000,
+            _FORFEIT_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         locktime = int.from_bytes(raw[-4:], "little")
@@ -494,9 +521,9 @@ class TestBuildForfeitTx:
             offer,
             "aa" * 32,
             0,
-            1_000_000,
+            _FUNDED,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            1_000,
+            _FORFEIT_FEE,
         )
         # Parse the field rather than scanning the serialized bytes for
         # \xfe\xff\xff\xff: those four bytes can appear in the pushed redeem
@@ -513,9 +540,9 @@ class TestBuildForfeitTx:
             offer,
             "aa" * 32,
             0,
-            1_000_000,
+            _FUNDED,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            1_000,
+            _FORFEIT_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         version = int.from_bytes(raw[:4], "little")
@@ -528,9 +555,9 @@ class TestBuildForfeitTx:
             offer,
             "aa" * 32,
             0,
-            1_000_000,
+            _FUNDED,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            1_000,
+            _FORFEIT_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         # version(4) + varint(1 input)(1) + prevhash(32) + vout(4) + scriptsig_len(varint)
@@ -548,9 +575,9 @@ class TestBuildForfeitTx:
                 offer,
                 "aa" * 32,
                 0,
-                1_000_000,
+                _FUNDED,
                 "not-valid!!!",
-                1_000,
+                _FORFEIT_FEE,
             )
 
     def test_forfeit_txid_is_hash256_of_raw(self):
@@ -561,9 +588,9 @@ class TestBuildForfeitTx:
             offer,
             "aa" * 32,
             0,
-            1_000_000,
+            _FUNDED,
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            1_000,
+            _FORFEIT_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         h1 = hashlib.sha256(raw).digest()
@@ -599,7 +626,7 @@ class TestBuildClaimTx:
                 funding_txid="aa" * 32,
                 funding_vout=0,
                 funding_photons=500,
-                fee_sats=1_000,
+                fee_sats=_CLAIM_FEE,
                 taker_privkey=self._make_privkey(),
                 accept_short_deadline=True,
             )
@@ -613,8 +640,8 @@ class TestBuildClaimTx:
                 offer=offer,
                 funding_txid="aa" * 32,
                 funding_vout=0,
-                funding_photons=1_000_000,
-                fee_sats=1_000,
+                funding_photons=_FUNDED,
+                fee_sats=_CLAIM_FEE,
                 taker_privkey=self._make_privkey(),
                 accept_short_deadline=False,  # guard active
             )
@@ -628,8 +655,8 @@ class TestBuildClaimTx:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
-            fee_sats=1_000,
+            funding_photons=_FUNDED,
+            fee_sats=_CLAIM_FEE,
             taker_privkey=self._make_privkey(),
             accept_short_deadline=True,
         )
@@ -637,8 +664,8 @@ class TestBuildClaimTx:
         assert result.tx_hex
         bytes.fromhex(result.tx_hex)
         assert len(result.txid) == 64
-        assert result.output_photons == 999_000
-        assert result.fee_sats == 1_000
+        assert result.output_photons == _FUNDED - _CLAIM_FEE
+        assert result.fee_sats == _CLAIM_FEE
         assert result.offer_p2sh
         assert result.claimed_p2sh
 
@@ -650,8 +677,8 @@ class TestBuildClaimTx:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
-            fee_sats=1_000,
+            funding_photons=_FUNDED,
+            fee_sats=_CLAIM_FEE,
             taker_privkey=self._make_privkey(),
             accept_short_deadline=True,
         )
@@ -668,8 +695,8 @@ class TestBuildClaimTx:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
-            fee_sats=1_000,
+            funding_photons=_FUNDED,
+            fee_sats=_CLAIM_FEE,
             taker_privkey=self._make_privkey(),
             accept_short_deadline=True,
         )
@@ -686,8 +713,8 @@ class TestBuildClaimTx:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
-            fee_sats=1_000,
+            funding_photons=_FUNDED,
+            fee_sats=_CLAIM_FEE,
             taker_privkey=self._make_privkey(),
             accept_short_deadline=True,
         )
@@ -709,8 +736,8 @@ class TestBuildClaimTx:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
-            fee_sats=1_000,
+            funding_photons=_FUNDED,
+            fee_sats=_CLAIM_FEE,
             taker_privkey=self._make_privkey(),
             accept_short_deadline=True,
         )
@@ -736,8 +763,8 @@ class TestBuildClaimTx:
                 offer=tampered,
                 funding_txid="aa" * 32,
                 funding_vout=0,
-                funding_photons=1_000_000,
-                fee_sats=1_000,
+                funding_photons=_FUNDED,
+                fee_sats=_CLAIM_FEE,
                 taker_privkey=self._make_privkey(),
                 accept_short_deadline=True,
             )

@@ -20,6 +20,7 @@ import struct
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from pyrxd.fee_sizing import bitcoin_virtual_size
 from pyrxd.security.errors import ValidationError
 from pyrxd.spv.payment import P2PKH, P2SH, P2TR, P2WPKH
 
@@ -84,9 +85,9 @@ def _assert_payment_fee_clears_relay_floor(
     Radiant's rule would over-charge every payment by about the witness discount and
     refuse transactions the node accepts; sizing Radiant against this one would let an
     unrelayable, un-bumpable covenant spend out the door. The two rules are kept apart in
-    :mod:`pyrxd.gravity.fee_policy` for exactly that reason — see
-    :func:`~pyrxd.gravity.fee_policy.bitcoin_virtual_size` and
-    :func:`~pyrxd.gravity.fee_policy.radiant_relay_size`.
+    :mod:`pyrxd.fee_sizing` for exactly that reason — see
+    :func:`~pyrxd.fee_sizing.bitcoin_virtual_size` and
+    :func:`~pyrxd.fee_sizing.radiant_relay_size`.
 
     Severity is genuinely lower here than on the Radiant side: Bitcoin has RBF and CPFP,
     so an under-fee'd payment is recoverable. It should still fail closed rather than hand
@@ -96,15 +97,15 @@ def _assert_payment_fee_clears_relay_floor(
     (``stripped_tx`` for the base size, ``segwit_tx`` for the total), never an estimate:
     a DER signature is 69-71 bytes run to run, and that byte moves the vsize.
 
-    Note the import is deferred: :mod:`pyrxd.gravity` eagerly imports
-    :mod:`pyrxd.btc_wallet.htlc_leg`, so a module-level import here would close a package
-    cycle. The guard is still the shared one — the rule is not restated in this module.
+    The **sizing rule** is now imported at module level: it moved to :mod:`pyrxd.fee_sizing`,
+    which is import-cycle-neutral. The **policy/assertion** half still has to be deferred —
+    :mod:`pyrxd.gravity.__init__` eagerly imports :mod:`pyrxd.btc_wallet.htlc_leg`, so
+    reaching :mod:`pyrxd.gravity.fee_policy` at module scope from here still raises
+    ``ImportError: cannot import name 'require_audit_cleared' from partially initialized
+    module`` (verified, not assumed). Both halves are still the shared ones — nothing about
+    the rule is restated in this module.
     """
-    from pyrxd.gravity.fee_policy import (
-        DEFAULT_BITCOIN_DEADLINE_FEE_POLICY,
-        assert_fee_covers,
-        bitcoin_virtual_size,
-    )
+    from pyrxd.gravity.fee_policy import DEFAULT_BITCOIN_DEADLINE_FEE_POLICY, assert_fee_covers
 
     assert_fee_covers(
         fee_value=fee_sats,

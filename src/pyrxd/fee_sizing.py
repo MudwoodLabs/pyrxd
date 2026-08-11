@@ -72,6 +72,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from .security.errors import ValidationError
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .transaction.transaction import Transaction
 
@@ -79,11 +81,14 @@ __all__ = [
     "RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB",
     "RADIANT_MIN_RELAY_PHOTONS_PER_KB",
     "SIG_SIZE_SLACK_BYTES",
+    "WITNESS_SCALE_FACTOR",
     "assert_pays_for_its_size",
     "assert_tx_pays_for_itself",
+    "bitcoin_virtual_size",
     "fee_for_kb_rate",
     "fee_never_below_relay_floor",
     "min_relay_fee",
+    "radiant_relay_size",
     "relay_floor_photons_per_byte",
     "required_fee",
     "trial_size_with_slack",
@@ -119,6 +124,83 @@ RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB = 10_000_000  # 0.10 RXD/kB (post-2.0
 # The slack is what should make :func:`assert_pays_for_its_size` unreachable; that
 # function is what proves it, rather than trusting it.
 SIG_SIZE_SLACK_BYTES: int = 3
+
+# BIP141 ``WITNESS_SCALE_FACTOR`` (Bitcoin Core ``src/consensus/consensus.h``). Only the
+# BTC side has one: Radiant has no segwit, so there is nothing to discount there.
+WITNESS_SCALE_FACTOR = 4
+
+
+# ---------------------------------------------------------------------------
+# THE SIZE A RELAY FLOOR IS MEASURED AGAINST IS PER-CHAIN. These two functions are
+# the only place that difference is expressed, so a caller picks a chain rather
+# than re-deriving a formula.
+#
+# Getting this wrong is not a rounding error. Applying Radiant's total-size rule to a
+# BTC transaction over-states its requirement by roughly the witness discount (measured:
+# 222 total bytes vs 141 vbytes on one real P2WPKH payment — 57% over); applying
+# Bitcoin's vsize rule to a Radiant transaction would under-state it, and Radiant is the
+# chain where under-fee'ing cannot be undone.
+#
+# They live HERE rather than in ``pyrxd.gravity.fee_policy`` where they were introduced,
+# for the same reason the relay-floor constants above moved: this is the single home for
+# fee-sizing rules, and ``pyrxd.gravity`` cannot be imported from ``pyrxd.wallet`` or
+# ``pyrxd.btc_wallet`` without closing a package cycle. ``pyrxd.gravity.fee_policy``
+# re-exports both, so its public surface is unchanged and there is still exactly one
+# definition of each. This module now imports ``pyrxd.security.errors`` — a leaf module
+# that imports nothing from pyrxd — so the "no pyrxd imports at all" property is
+# narrowed, not lost: nothing here can reach a builder.
+# ---------------------------------------------------------------------------
+
+
+def radiant_relay_size(raw_tx: bytes) -> int:
+    """Bytes Radiant charges the relay floor against: ``tx.GetTotalSize()``.
+
+    ``AcceptToMemoryPool`` compares against ``GetEffectiveMinRelayFee(height).GetFee(nSize)``
+    with ``nSize = tx.GetTotalSize()`` — the **full serialized size**, carrying an explicit
+    "Do not change this to use virtualsize without coordinating a network policy upgrade"
+    (Radiant-Core ``src/validation.cpp:770``). Radiant has no segwit, so total size is the
+    only size there is; this function exists to name the rule, not to compute anything.
+
+    Pass the **signed** transaction: a DER signature is 69-71 bytes run to run, so a size
+    taken before signing is an estimate, and an estimate one byte short is a fee below the
+    floor.
+    """
+    if not isinstance(raw_tx, (bytes, bytearray)):
+        raise ValidationError("raw_tx must be bytes (the SIGNED, serialized transaction)")
+    if not raw_tx:
+        raise ValidationError("raw_tx is empty; there is no transaction to measure")
+    return len(raw_tx)
+
+
+def bitcoin_virtual_size(*, stripped_size: int, total_size: int) -> int:
+    """Bytes Bitcoin charges the relay floor against: BIP141 ``vsize``.
+
+    ``vsize = ceil(weight / 4)`` where ``weight = stripped_size * 3 + total_size``
+    (BIP141; Bitcoin Core ``GetTransactionWeight`` / ``GetVirtualTransactionSize``).
+
+    * ``stripped_size`` — the serialization **without** marker, flag and witness (the
+      bytes the txid is hashed over).
+    * ``total_size`` — the full serialization **with** them, the bytes that go on the wire.
+
+    For a non-witness transaction the two are equal and ``vsize == total_size``.
+
+    Caveat, stated rather than silently assumed: Bitcoin Core's mempool actually uses
+    ``max(weight, nSigOpCost * nBytesPerSigOp * 4) / 4``, so a transaction with an unusually
+    high sigop-to-byte ratio is charged more than this returns. For the single-input
+    P2WPKH / P2SH-P2WPKH / P2TR shapes this SDK builds, weight dominates by an order of
+    magnitude and the two agree; a builder for sigop-dense scripts would need the fuller
+    form.
+    """
+    for name, value in (("stripped_size", stripped_size), ("total_size", total_size)):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValidationError(f"{name} must be a positive int")
+    if total_size < stripped_size:
+        raise ValidationError(
+            f"total_size ({total_size}) < stripped_size ({stripped_size}); the witness "
+            "serialization can never be shorter than the one it strips"
+        )
+    weight = stripped_size * (WITNESS_SCALE_FACTOR - 1) + total_size
+    return -(-weight // WITNESS_SCALE_FACTOR)  # ceil
 
 
 def fee_for_kb_rate(size_bytes: int, per_kb: int) -> int:

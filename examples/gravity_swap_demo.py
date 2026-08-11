@@ -87,10 +87,21 @@ MAKER_RXD_WIF: str | None = os.environ.get("MAKER_RXD_WIF")
 TAKER_RXD_WIF: str | None = os.environ.get("TAKER_RXD_WIF")
 TAKER_BTC_WIF: str | None = os.environ.get("TAKER_BTC_WIF")
 
-# Trade amounts
-PHOTONS_OFFERED: int = int(os.environ.get("PHOTONS_OFFERED", "100000"))  # 0.001 RXD
+# Trade amounts. The two chains' fees are SEPARATE constants on purpose: their relay
+# floors differ by about four orders of magnitude and are charged against different sizes
+# (Radiant: 10,000 photons per byte of tx.GetTotalSize(); Bitcoin: 1 sat per BIP141
+# vbyte). A single shared FEE_SATS used to stand in for both, and at 1,000 it was fine for
+# BTC and thousands of times short for Radiant — the builders now refuse that outright.
+PHOTONS_OFFERED: int = int(os.environ.get("PHOTONS_OFFERED", "10000000"))  # 0.1 RXD
 BTC_SATOSHIS: int = int(os.environ.get("BTC_SATOSHIS", "10000"))  # 0.0001 BTC
-FEE_SATS: int = int(os.environ.get("FEE_SATS", "1000"))  # photons/sats
+#: Radiant claim tx: measured 259 bytes x 10,000 photons/byte = 2,590,000 floor.
+RXD_CLAIM_FEE_PHOTONS: int = int(os.environ.get("RXD_CLAIM_FEE_PHOTONS", "3000000"))
+#: Radiant finalize tx: the whole BTC tx + headers + branch ride in one scriptSig, so this
+#: is an order of magnitude larger than the claim. Sized for the bundled flat_12x20
+#: artifact; raise it if you swap in a deeper covenant.
+RXD_FINALIZE_FEE_PHOTONS: int = int(os.environ.get("RXD_FINALIZE_FEE_PHOTONS", "60000000"))
+#: Bitcoin side: ~110-180 vbytes at 1 sat/vB.
+BTC_FEE_SATS: int = int(os.environ.get("BTC_FEE_SATS", "1000"))
 
 # Deadline: 25 hours from now (audit 04-S1 requires >= 24h)
 CLAIM_DEADLINE: int = int(time.time()) + 25 * 3600
@@ -285,14 +296,14 @@ async def run_demo() -> None:
     # tx and share txid/vout/photons with the Taker out-of-band)
     OFFER_TXID = "aa" * 32
     OFFER_VOUT = 0
-    OFFER_PHOTONS = PHOTONS_OFFERED + FEE_SATS  # offer UTXO covers fee
+    OFFER_PHOTONS = PHOTONS_OFFERED + RXD_CLAIM_FEE_PHOTONS  # offer UTXO covers fee
 
     claim_result = build_claim_tx(
         offer=offer,
         funding_txid=OFFER_TXID,
         funding_vout=OFFER_VOUT,
         funding_photons=OFFER_PHOTONS,
-        fee_sats=FEE_SATS,
+        fee_sats=RXD_CLAIM_FEE_PHOTONS,
         taker_privkey=taker_rxd_privkey,
         accept_short_deadline=True,  # demo: skip 24h guard
     )
@@ -318,7 +329,7 @@ async def run_demo() -> None:
     btc_utxo = BtcUtxo(
         txid="bb" * 32,
         vout=0,
-        value=BTC_SATOSHIS + FEE_SATS * 3,
+        value=BTC_SATOSHIS + BTC_FEE_SATS * 3,
     )
 
     btc_payment = build_payment_tx(
@@ -327,7 +338,7 @@ async def run_demo() -> None:
         to_hash=offer.btc_receive_hash,
         to_type=offer.btc_receive_type,
         amount_sats=BTC_SATOSHIS,
-        fee_sats=FEE_SATS,
+        fee_sats=BTC_FEE_SATS,
     )
 
     _ok(f"BTC payment tx built — txid: {btc_payment.txid}")
@@ -423,7 +434,7 @@ async def run_demo() -> None:
             funding_vout=0,
             funding_photons=claimed_photons,
             to_address=taker_rxd_address,
-            fee_sats=FEE_SATS,
+            fee_sats=RXD_FINALIZE_FEE_PHOTONS,
         )
         _ok(f"finalize tx built — txid: {finalize_result.txid}")
 
