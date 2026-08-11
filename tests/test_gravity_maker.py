@@ -152,6 +152,14 @@ def _make_offer(privkey: PrivateKeyMaterial, **kwargs) -> GravityOffer:
 #: mocked broadcaster happily accepted it. See ``tests/test_gravity_maker_offer.py::_FEE``.
 _FEE = 2_500_000
 
+#: The CANCEL tx is a different shape and needs its own number: it pushes the full
+#: MakerOffer redeem script into its scriptSig, measuring **284 bytes** (reported by the
+#: guard itself), so its floor is 2,840,000 photons — above ``_FEE``. These fixtures used
+#: ``1000``, ~2,840x under, against ``build_cancel_tx`` — the Maker's only way to reclaim
+#: an unclaimed offer. The mocked broadcaster accepted it, so the tests passed while
+#: describing a cancel no node would relay.
+_CANCEL_FEE = 3_500_000
+
 
 def _make_active_offer(
     privkey: PrivateKeyMaterial,
@@ -171,7 +179,8 @@ def _make_active_offer(
         maker_offer_result=result,
         offer_txid=offer_txid,
         offer_vout=0,
-        offer_photons=offer.photons_offered,
+        # Big enough to fund a cancel that clears the relay floor (see _CANCEL_FEE).
+        offer_photons=offer.photons_offered + _CANCEL_FEE,
     )
 
 
@@ -419,7 +428,7 @@ class TestCancelOffer:
         client = _make_mock_client(cancel_txid)
         session = GravityMakerSession(rxd_client=client, maker_priv=priv)
         addr = self._maker_address(priv)
-        result = await session.cancel_offer(active, fee_sats=1000, maker_address=addr)
+        result = await session.cancel_offer(active, fee_sats=_CANCEL_FEE, maker_address=addr)
         assert isinstance(result, str)
         assert len(result) == 64
 
@@ -430,7 +439,7 @@ class TestCancelOffer:
         client = _make_mock_client()
         session = GravityMakerSession(rxd_client=client, maker_priv=priv)
         with pytest.raises(ValidationError, match="maker_address"):
-            await session.cancel_offer(active, fee_sats=1000, maker_address="")
+            await session.cancel_offer(active, fee_sats=_CANCEL_FEE, maker_address="")
 
     @pytest.mark.asyncio
     async def test_cancel_calls_broadcast(self):
@@ -439,7 +448,7 @@ class TestCancelOffer:
         client = _make_mock_client("dd" * 32)
         session = GravityMakerSession(rxd_client=client, maker_priv=priv)
         addr = self._maker_address(priv)
-        await session.cancel_offer(active, fee_sats=1000, maker_address=addr)
+        await session.cancel_offer(active, fee_sats=_CANCEL_FEE, maker_address=addr)
         client.broadcast.assert_called_once()
 
 

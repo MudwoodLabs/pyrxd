@@ -21,6 +21,7 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from pyrxd.btc_wallet import taproot as t
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.gravity.watch import (
     Decision,
@@ -75,9 +76,18 @@ def _swap(
     funding_txid: str = _FUND_TXID,
     funding_vout: int = 0,
     state: SwapState = SwapState.BTC_LOCKED,
+    force_unrelayable: bool = False,
 ) -> tuple[SwapRecord, PresignedRefund]:
     """Build a consistent (record, pre-signed refund blob) pair via the REAL builders, so the executor
-    binds against a genuine refund tx (not a fixture stub)."""
+    binds against a genuine refund tx (not a fixture stub).
+
+    ``force_unrelayable`` opts ``build_refund_tx``'s relay-floor guard out so a blob paying a
+    fee no node would accept can be brought into existence at all. Only the tests that
+    exercise the executor's OWN affordability floor need it — that check exists precisely
+    for blobs the builder would now refuse to produce, e.g. one presigned by an older
+    version or by other software. It is the deliberate, greppable escape hatch that
+    already existed (``allow_below_protocol_floor``), not a weakening of the guard.
+    """
     taker_sk = coincurve.PrivateKey(os.urandom(32))
     maker_sk = coincurve.PrivateKey(os.urandom(32))
     timeout = t.Timelock(t_btc_blocks, t.TimeUnit.BLOCKS)
@@ -96,6 +106,9 @@ def _swap(
         to_scriptpubkey=refund_spk,
         fee_sats=fee_sats,
         aux_rand=os.urandom(32),
+        fee_policy=DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+        if force_unrelayable
+        else None,
     )
     rec = SwapRecord(
         state=state,
@@ -661,7 +674,11 @@ async def test_decline_blob_whose_fee_is_not_viable(tmp_path):
     to rebuild it, so broadcasting would burn the CSV window on a transaction that
     cannot confirm.
     """
-    rec, blob = _swap(fee_sats=1)
+    # `force_unrelayable`: `build_refund_tx` now refuses to emit a 1-sat refund at all, so the
+    # blob this check exists for has to be forced into existence. The executor's floor is not
+    # redundant with the builder's — it guards blobs the builder never produced (presigned by
+    # an older version, by other software, or hand-edited on disk).
+    rec, blob = _swap(fee_sats=1, force_unrelayable=True)
     _write(tmp_path, blob)
     b = _FakeBroadcaster()
     ex = _armed(tmp_path, b)
@@ -672,10 +689,17 @@ async def test_decline_blob_whose_fee_is_not_viable(tmp_path):
 async def test_a_normally_presigned_refund_is_not_falsely_declined(tmp_path):
     """The floor is a LOWER bound on min-relay, so it must never refuse a viable blob.
 
-    ``presign``'s own default (500 sats) and even a lean 1-sat/vB-ish fee must pass:
+    ``presign``'s own default (500 sats) and a lean but genuinely relayable fee must pass:
     a false decline would strand a refund the node would have accepted.
+
+    This case used to include ``120``, described as "a lean 1-sat/vB-ish fee". It is not:
+    this refund measures **138 vbytes**, so 120 sats is 0.87 sat/vB and Bitcoin Core would
+    reject it as ``min relay fee not met``. The fixture encoded a transaction that cannot
+    be broadcast, and `build_refund_tx`'s new relay-floor guard is what surfaced it. Replaced
+    with 138 — the exact floor for this shape, which is a strictly better boundary probe
+    than a number that was under it.
     """
-    for fee_sats in (500, 200, 120):
+    for fee_sats in (500, 200, 138):
         rec, blob = _swap(fee_sats=fee_sats)
         d = tmp_path / f"f{fee_sats}"
         d.mkdir()

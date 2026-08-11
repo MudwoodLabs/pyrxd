@@ -94,6 +94,76 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   valid base58, and it would swallow the public txids that `ConfirmationTimeoutError`
   deliberately keeps).
 
+- **The remaining six builders now refuse a fee below the relay floor.** #407 guarded
+  `build_maker_offer_tx` and `build_payment_tx` and flagged the rest; this closes them:
+  `taproot.build_claim_tx` and `taproot.build_refund_tx` (Bitcoin),
+  `rswp.orders.build_cancel_tx`, and `gravity.transactions`'s `build_claim_tx`,
+  `build_cancel_tx`, `build_finalize_tx` and `build_forfeit_tx` (Radiant). Each accepted
+  any non-negative fee and returned a fully-populated result — plausible `txid`, plausible
+  accounting — for a transaction no node will relay.
+
+  **The RSWP cancel is the fund-safety one.** On the v2 orderbook a cancel is the *only*
+  hard revocation: the `0xC3` advertisement signature stays valid until the offered UTXO is
+  spent. An unrelayable cancel cannot be replaced (no RBF) or bumped (no CPFP), so the
+  order stays takeable at the original price while the CLI reports success and hands back a
+  txid. That is a silent fund-safety failure, not a stuck transaction. `taproot`'s
+  `build_refund_tx` is the next most consequential: it is routinely **pre-signed** and
+  parked for a watchtower, so nothing re-checks it between signing and the moment it is
+  needed.
+
+  Every guard is the same shared `assert_fee_covers` call, on the same measured size, with
+  the per-chain rule chosen explicitly — Radiant against `tx.GetTotalSize()`, Bitcoin
+  against BIP141 `vsize`. The BTC guards pass `chain_has_fee_bumping=True`, so a Bitcoin
+  caller is not told Radiant's "no RBF, no CPFP, stuck 8h" story about their own chain.
+  Every builder takes an optional `fee_policy`.
+
+  Sized against the **final signed** transaction. The Radiant builders sign ECDSA/DER
+  (69-71 bytes, so their sizes move run to run); the taproot ones sign BIP340 Schnorr
+  (a fixed 64 bytes, so they do not) — both are measured rather than assumed, and the
+  test suite pins each expectation so neither can silently become the other.
+
+  Node-proved at the boundary in both directions, against the floor each node advertises
+  rather than an assumed one. Radiant Core v3.1.1 regtest advertised
+  `effective_minrelaytxfee` = **1,000,000 photons/kB** (a tenth of the mainnet reference
+  rate) and Bitcoin Core 24 regtest `relayfee` = **1,000 sats/kvB**:
+
+  | builder | size | one unit under | at the floor |
+  |---|---|---|---|
+  | `rswp.build_cancel_tx` | 191 B | 190,999 ph → `66: min relay fee not met` | 191,000 ph → accepted |
+  | `gravity.build_claim_tx` | 283 B | 282,999 ph → `66: min relay fee not met` | 283,000 ph → accepted |
+  | `gravity.build_cancel_tx` | 286 B | 285,999 ph → `66: min relay fee not met` | 286,000 ph → accepted |
+  | `gravity.build_forfeit_tx` | 10,219 B | 10,218,999 ph → `66: min relay fee not met` | 10,219,000 ph → accepted |
+  | `taproot.build_claim_tx` | 143 vB (323 B total) | 142 sat → `min relay fee not met` | 143 sat → accepted |
+  | `taproot.build_refund_tx` | 125 vB | 124 sat → `min relay fee not met` | 125 sat → accepted |
+
+  `gravity.build_finalize_tx` is **not** node-proved: its spend needs a real SPV proof
+  satisfying the MakerClaimed covenant's committed anchor, and a faked one produces a
+  script-level rejection that says nothing about the fee. Its guard is the identical shared
+  call on the identical measured input, covered offline. Stated rather than implied.
+
+  **51 fixture fee sites and 44 funding values across 8 test files described transactions
+  the chain would reject** — 1,000-photon fees against transactions whose floors run from
+  1,880,000 to 11,500,000, up to ~10,200x under. That is why nothing offline caught this:
+  the fixtures described chain states that cannot exist. All were raised to fees that
+  actually clear the measured floor; no guard was weakened to accommodate one. Two
+  `examples/` scripts were doing the same thing — `gravity_swap_demo.py` used a single
+  `FEE_SATS` for both chains (now split per chain, as #407 did for `gravity_live_test.py`)
+  and `rswp_orderbook_demo.py` cancelled an FT order at 400 photons against a 4,240,000
+  floor.
+
+  One legitimate caller genuinely conflicts with a hard guard and is handled rather than
+  forced: the swap CLI's `_build_at_measured_fee` loop **deliberately** builds sub-floor
+  trial transactions to measure a size it cannot model (an advert script's real length, an
+  FT output's 84 bytes), then rebuilds at the real fee. Its seed for a modelled 1-in/1-out
+  shape is 2,500,000 photons while a funded FT cancel measures ~424 bytes and needs
+  4,240,000, so an unconditional guard would refuse the trial pass and break `swap cancel`
+  for exactly the shape that needs the loop most. The loop now passes the existing
+  `allow_below_protocol_floor` escape hatch for trial builds only, and the transaction it
+  actually returns is still gated by `_assert_relayable`. The watchtower's
+  "decline a blob whose fee is not viable" test needs the same hatch for the same reason —
+  its floor guards blobs *other* software produced, so it cannot be made redundant by a
+  builder-side check.
+
 - **`build_maker_offer_tx` and `build_payment_tx` now refuse a fee below the relay floor.**
   Both accepted any non-negative `fee_sats` and returned a fully-populated result —
   plausible `txid`, plausible accounting — for a transaction no node will relay. The
@@ -142,6 +212,30 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   transaction being built, rather than the guard being weakened to accommodate them.
 Two consensus-level defects, both found by putting builders that had never seen a node to
 a Radiant Core v3.1.1 regtest one.
+
+### Changed
+
+- **`radiant_relay_size` and `bitcoin_virtual_size` moved to `pyrxd.fee_sizing`**, which
+  #405 established as the single home for fee-sizing rules (it exists at all to break the
+  `pyrxd.gravity.__init__` → `pyrxd.hd.wallet` → `pyrxd.wallet` import cycle).
+  `pyrxd.gravity.fee_policy` re-exports both — *the same function objects*, not copies — so
+  its public surface is unchanged and there is still exactly one definition of each.
+  `WITNESS_SCALE_FACTOR` moved with them.
+
+  This is not tidying. The per-chain "which size is the floor charged against" rule was
+  reachable from `btc_wallet` only through an inside-a-function import, and a rule you can
+  only reach that way is a rule that invites a second copy — which is where this repo's
+  worst bugs came from (four ref walkers split two-and-two on the correct opcode set; two
+  base58 implementations both leaking key material).
+
+  `btc_wallet/payment.py` now imports the sizing rule at **module level**; the cycle it was
+  dodging is only *partly* gone, and the deferred import remains for the rest. Verified,
+  not assumed: `assert_fee_covers` and `DEFAULT_BITCOIN_DEADLINE_FEE_POLICY` still live in
+  `pyrxd.gravity.fee_policy`, and reaching that package at module scope from `btc_wallet`
+  still raises `ImportError: cannot import name 'require_audit_cleared' from partially
+  initialized module`, because `pyrxd.gravity.__init__` eagerly imports
+  `pyrxd.btc_wallet.htlc_leg`. Moving the *policy* half as well would close it completely
+  and is a separate change.
 
 ### Fixed
 

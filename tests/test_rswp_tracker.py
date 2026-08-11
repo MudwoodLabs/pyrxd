@@ -46,6 +46,12 @@ def _key() -> tuple[PrivateKey, bytes]:
     return k, k.public_key().hash160()
 
 
+# A cancel fee that clears Radiant's relay floor for a 1-in/1-out RXD cancel (measured
+# 190-192 B over 150 builds => floor <= 1,920,000 photons). `build_cancel_tx` refuses
+# anything under it: an unrelayable cancel leaves the order takeable.
+_CANCEL_FEE = 2_500_000
+
+
 def _rxd_src(pkh: bytes, value: int) -> Transaction:
     tx = Transaction()
     tx.add_output(TransactionOutput(P2PKH().lock(pkh), value))
@@ -219,10 +225,13 @@ async def test_classify_unconfirmed_spender_stays_open_not_filled() -> None:
 
 async def test_classify_cancelled_offer_reports_settlement_txid() -> None:
     mk, mk_pkh = _key()
-    src = _rxd_src(mk_pkh, 1000)
+    # The offered UTXO has to be big enough for a cancel that clears Radiant's relay floor
+    # (measured 190-192 B => up to 1,920,000 photons). The old 1000-photon UTXO and
+    # 200-photon fee described a cancel no node would relay.
+    src = _rxd_src(mk_pkh, 10_000_000)
     post, _order, advert_tx = _post_offer(src, mk, Asset("rxd", 600), mk_pkh)
 
-    cancel_tx = build_cancel_tx(offered_source_tx=src, offered_vout=0, maker_key=mk, refund_pkh=mk_pkh, fee=200)
+    cancel_tx = build_cancel_tx(offered_source_tx=src, offered_vout=0, maker_key=mk, refund_pkh=mk_pkh, fee=_CANCEL_FEE)
     fake = FakeElectrumX()
     fake.add(src)
     fake.add(advert_tx)
@@ -341,10 +350,13 @@ async def test_classify_out_of_range_vout_rejected() -> None:
 async def test_offer_tracker_classify_all_preserves_order() -> None:
     mk, mk_pkh = _key()
     open_src = _rxd_src(mk_pkh, 700)
-    cancel_src = _rxd_src(mk_pkh, 800)
+    # Only `cancel_src` is actually cancelled, so only it needs to fund a relayable fee.
+    cancel_src = _rxd_src(mk_pkh, 10_000_000)
     post_open, _order_open, advert_open = _post_offer(open_src, mk, Asset("rxd", 500), mk_pkh)
     post_cancel, _order_cancel, advert_cancel = _post_offer(cancel_src, mk, Asset("rxd", 500), mk_pkh)
-    cancel_tx = build_cancel_tx(offered_source_tx=cancel_src, offered_vout=0, maker_key=mk, refund_pkh=mk_pkh, fee=200)
+    cancel_tx = build_cancel_tx(
+        offered_source_tx=cancel_src, offered_vout=0, maker_key=mk, refund_pkh=mk_pkh, fee=_CANCEL_FEE
+    )
 
     fake = FakeElectrumX()
     for tx in (open_src, advert_open, cancel_src, advert_cancel, cancel_tx):

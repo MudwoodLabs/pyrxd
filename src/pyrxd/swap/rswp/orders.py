@@ -22,6 +22,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ...constants import SIGHASH
+from ...fee_sizing import radiant_relay_size
+from ...gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy, assert_fee_covers
 from ...gravity.swap_order import DemandedOutput, RswpOrder
 from ...keys import PrivateKey
 from ...script.script import Script
@@ -357,6 +359,7 @@ def build_cancel_tx(
     refund_pkh: bytes | Hex20,
     fee: int,
     funding: list[FundingInput] | None = None,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """Cancel an order by self-spending the offered UTXO — the ONLY hard revocation in v2.
 
@@ -366,6 +369,29 @@ def build_cancel_tx(
     comes out of the refunded value; for an FT offer token conservation forces
     the full token amount back to ``refund_pkh``, so add plain-RXD ``funding``
     to cover the fee.
+
+    **The relay floor is fund safety on this builder specifically.** Cancel is the only
+    revocation there is: until it *confirms*, every copy of the signed advertisement is
+    still fillable at the original price. A cancel returned below Radiant's min-relay
+    floor never enters a mempool, cannot be replaced (no RBF) and cannot be bumped by a
+    child (no CPFP) — so the order stays takeable while the caller has been handed a
+    transaction and a txid and told the order was revoked. That is a silent fund-safety
+    failure, not a stuck transaction. Sized from the **signed** bytes and checked before
+    returning; see :func:`~pyrxd.gravity.fee_policy.assert_fee_covers`.
+
+    ``fee_policy`` overrides the rate that floor is derived from, defaulting to
+    :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY` (the reference
+    mainnet node's 0.10 RXD/kB effective rate). Two callers legitimately pass their own:
+    a regtest node advertises a tenth of that, and
+    :func:`~pyrxd.cli.swap_book_cmds._build_at_measured_fee` runs *deliberately* sub-floor
+    trial passes to measure a size it cannot model, then rebuilds at the real fee — its
+    final transaction is gated by ``_assert_relayable``.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee`` is below the node's min-relay floor for the transaction's real,
+        signed size.
     """
     if not 0 <= offered_vout < len(offered_source_tx.outputs):
         raise ValidationError("offered_vout out of range for the source transaction")
@@ -401,4 +427,15 @@ def build_cancel_tx(
     if not tx.outputs:
         raise ValidationError("cancel would produce no outputs — offered value does not cover the fee")
     tx.sign(bypass=True)
+    # Post-SIGNING relay-floor gate. After `sign`, not before: the requirement is
+    # ceil(size x rate / 1000) and the size is only knowable once the DER signatures are
+    # in the scriptSigs — 69-71 bytes each, run to run.
+    assert_fee_covers(
+        fee_value=fee,
+        size_bytes=radiant_relay_size(tx.serialize()),
+        policy=fee_policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
+        blocks_to_deadline=None,
+        what="RSWP order cancel tx (the only hard revocation — an unrelayable one leaves the order takeable)",
+        unit="photons",
+    )
     return tx

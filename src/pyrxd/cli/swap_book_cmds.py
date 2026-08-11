@@ -54,7 +54,7 @@ import click
 
 from ..fee_sizing import SIG_SIZE_SLACK_BYTES, fee_never_below_relay_floor
 from ..glyph.types import GlyphRef
-from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from ..keys import PrivateKey
 from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Txid
@@ -122,6 +122,21 @@ _MAX_FUNDING_INPUTS = 8
 # (``ceil(size × effective_minrelaytxfee / 1000)``, sized against ``tx.GetTotalSize()``
 # — the full serialized size, not vsize).
 _RELAY_POLICY = DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+
+# The fee-sizing loop below builds THROWAWAY trial transactions at a seed fee, purely to
+# learn a size it cannot model (an advert script's real length, an FT output's 84 bytes,
+# how many UTXOs the wallet had to scrape together). That seed is frequently BELOW the
+# real floor — a 1-input/1-output model seeds 2,500,000 photons while a funded FT cancel
+# measures ~424 bytes and needs 4,240,000 — so it is a legitimate, deliberate sub-floor
+# build, and `build_cancel_tx`'s own relay-floor guard would (correctly, for any other
+# caller) refuse it and break the loop before it ever reached the fee that works.
+#
+# So the loop opts the BUILDER's guard out, and keeps the gate on the transaction that is
+# actually returned: `_assert_relayable`, which every path already runs on the final tx
+# and which enforces the same floor from the same module. The opt-out is the existing
+# greppable escape hatch — `allow_below_protocol_floor=True` — not a new mechanism, and it
+# is scoped to trial builds rather than applied globally.
+_SIZING_TRIAL_POLICY = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
 
 
 # --------------------------------------------------------------------------- arg parsing
@@ -831,6 +846,10 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
                         refund_pkh=maker_key.public_key().hash160(),
                         fee=f,
                         funding=funding,
+                        # Trial builds are deliberately sub-floor; `_assert_relayable`
+                        # gates the transaction that is actually returned. See
+                        # `_SIZING_TRIAL_POLICY`.
+                        fee_policy=_SIZING_TRIAL_POLICY,
                     ),
                     seed_inputs=1,
                     seed_outputs=1,

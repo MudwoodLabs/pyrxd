@@ -43,10 +43,15 @@ import os
 import struct
 from dataclasses import dataclass
 from enum import Enum
+from typing import TYPE_CHECKING
 
+from pyrxd.fee_sizing import bitcoin_virtual_size
 from pyrxd.security.errors import ValidationError
 
 from .keys import _bech32_encode
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 
 __all__ = [
     "LEAF_VERSION_TAPSCRIPT",
@@ -800,6 +805,71 @@ def _serialize_witness(items: list[bytes]) -> bytes:
     return out
 
 
+def _assert_spend_fee_clears_relay_floor(
+    *,
+    fee_sats: int,
+    stripped_tx: bytes,
+    segwit_tx: bytes,
+    fee_policy: DeadlineFeePolicy | None,
+    what: str,
+) -> None:
+    """Refuse to return an HTLC spend no Bitcoin node would relay.
+
+    The fee here is implicit — ``locator.amount_sats - out_amount_sats`` — and the only
+    prior check is that it leaves a positive output. Bitcoin Core rejects
+    ``nModifiedFees < minRelayTxFee.GetFee(vsize)`` with ``min relay fee not met``, so a
+    fee below that produces a perfectly well-formed, correctly-signed transaction that
+    simply cannot be broadcast.
+
+    **Bitcoin's floor, not Radiant's.** The rate is
+    :data:`~pyrxd.gravity.fee_policy.BITCOIN_MIN_RELAY_SATS_PER_KB` (1 sat/vB), four
+    orders of magnitude below Radiant's effective 10,000 photons/**byte**, and it is
+    charged against BIP141 ``vsize``, not total size. A taproot script-path spend is the
+    shape where that difference is largest in this SDK: the witness carries the signature,
+    the preimage, the leaf script AND the control block, so almost the whole transaction
+    is witness and gets the 4x discount. Charging Radiant's total-size rule here would
+    refuse spends the node accepts, by a wide margin.
+
+    Both legs are guarded, and neither is a stuck-transaction annoyance:
+
+    * **claim** — the maker's spend, and the one that *reveals the preimage*. It is built
+      and broadcast immediately (:meth:`~pyrxd.btc_wallet.htlc_leg.BitcoinTaprootLeg.claim`).
+    * **refund** — the taker's CSV exit. This one is also built **ahead of time** and
+      persisted as a sidecar for a watchtower to broadcast later
+      (:func:`~pyrxd.gravity.watch.presign.presign_refund`), which makes an unrelayable
+      build *worse* here, not better: nothing re-checks it between signing and the moment
+      it is needed. ``presign_refund`` already fails closed on a wrong key, outpoint,
+      nSequence or output — the relay floor is the same class of check, and it was the
+      one missing.
+
+    Measured **after signing**, from the two serializations the assembler has just
+    produced. A BIP340 Schnorr signature is a fixed 64 bytes, so unlike the ECDSA/DER
+    builders this shape does not vary run to run — but ``to_scriptpubkey`` and the leaf
+    script do, so the size is still measured rather than assumed.
+
+    ``chain_has_fee_bumping=True``: Bitcoin has RBF and CPFP, and the claim leg explicitly
+    sets ``nSequence=0xFFFFFFFD`` to opt in. The shared guard's default consequence text is
+    Radiant's ("cannot be bumped, stuck for 8h") and would be false here.
+
+    The import is deferred: :mod:`pyrxd.gravity.__init__` eagerly imports
+    :mod:`pyrxd.btc_wallet.taproot` (via ``eth_rxd_timelock`` and ``swap_state``), so a
+    module-level import of :mod:`pyrxd.gravity.fee_policy` here closes a package cycle. The
+    *sizing* half — :func:`~pyrxd.fee_sizing.bitcoin_virtual_size` — has no such problem and
+    is imported at module level.
+    """
+    from pyrxd.gravity.fee_policy import DEFAULT_BITCOIN_DEADLINE_FEE_POLICY, assert_fee_covers
+
+    assert_fee_covers(
+        fee_value=fee_sats,
+        size_bytes=bitcoin_virtual_size(stripped_size=len(stripped_tx), total_size=len(segwit_tx)),
+        policy=fee_policy or DEFAULT_BITCOIN_DEADLINE_FEE_POLICY,
+        blocks_to_deadline=None,
+        what=what,
+        unit="satoshis",
+        chain_has_fee_bumping=True,
+    )
+
+
 def _build_spend_tx(
     *,
     locator: BtcHtlcLocator,
@@ -812,12 +882,18 @@ def _build_spend_tx(
     locktime: int,
     aux_rand: bytes,
     hash_type: int = SIGHASH_DEFAULT,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> bytes:
     """Shared script-path spend assembler.
 
     Builds a single-input, single-output v2 tx spending the HTLC, signs the
     chosen leaf, and returns the full segwit serialization. The witness is
     ``[<sig>, *witness_items_after_sig, <leaf_script>, <control_block>]``.
+
+    Gates the result on Bitcoin's min-relay floor before returning it — see
+    :func:`_assert_spend_fee_clears_relay_floor`. The fee is not a parameter here; it is
+    ``locator.amount_sats - out_amount_sats`` by construction, which is exactly the number
+    the node will compute.
     """
     tx_version = 2
     prevout = locator.funding_outpoint.prevout_bytes()
@@ -852,7 +928,21 @@ def _build_spend_tx(
     outputs_section = _compact_size(1) + out_b
     witness_section = _serialize_witness(witness)
 
-    return version_b + b"\x00\x01" + inputs_section + outputs_section + witness_section + locktime_b
+    segwit_tx = version_b + b"\x00\x01" + inputs_section + outputs_section + witness_section + locktime_b
+    # The txid serialization: no marker, flag or witness. vsize needs both, and this is
+    # the only point at which both exist.
+    stripped_tx = version_b + inputs_section + outputs_section + locktime_b
+
+    # Post-assembly, post-SIGNING relay-floor gate.
+    _assert_spend_fee_clears_relay_floor(
+        fee_sats=locator.amount_sats - out_amount_sats,
+        stripped_tx=stripped_tx,
+        segwit_tx=segwit_tx,
+        fee_policy=fee_policy,
+        what=f"BTC HTLC {leaf} tx",
+    )
+
+    return segwit_tx
 
 
 def build_claim_tx(
@@ -863,10 +953,19 @@ def build_claim_tx(
     to_scriptpubkey: bytes,
     fee_sats: int,
     aux_rand: bytes,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> bytes:
     """Build the maker's claim tx (spends the claim leaf, reveals ``p``).
 
     Witness: ``<sig> <preimage> <claim_script> <control_block>``.
+
+    ``fee_policy`` supplies the min-relay rate the assembled transaction is checked
+    against, defaulting to
+    :data:`~pyrxd.gravity.fee_policy.DEFAULT_BITCOIN_DEADLINE_FEE_POLICY` (Bitcoin Core's
+    ``DEFAULT_MIN_RELAY_TX_FEE``, 1 sat/vB). Pass a policy built from the target node's own
+    ``getnetworkinfo``/``relayfee`` when it advertises something else. Raises
+    :class:`~pyrxd.security.errors.InsufficientFundsError` below that floor — see
+    :func:`_assert_spend_fee_clears_relay_floor`.
     """
     p = _as_bytes(preimage, name="preimage", length=32)
     # Defensive: the preimage must actually open the hashlock embedded in the leaf.
@@ -885,6 +984,7 @@ def build_claim_tx(
         nsequence=0xFFFFFFFD,  # RBF-enabled, no relative lock on the claim leg
         locktime=0,
         aux_rand=aux_rand,
+        fee_policy=fee_policy,
     )
 
 
@@ -896,11 +996,17 @@ def build_refund_tx(
     to_scriptpubkey: bytes,
     fee_sats: int,
     aux_rand: bytes,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> bytes:
     """Build the taker's pre-signed refund tx (spends the refund leaf via CSV).
 
     v2 tx with nSequence encoding the relative timelock per BIP68; witness is
     ``<sig> <refund_script> <control_block>`` (the refund leaf has no preimage).
+
+    ``fee_policy`` supplies the min-relay rate the assembled transaction is checked
+    against — see :func:`_assert_spend_fee_clears_relay_floor`. It matters more here than
+    on the claim leg: this transaction is routinely built ahead of time and persisted for
+    a watchtower to broadcast later, so nothing re-checks it in between.
     """
     if not isinstance(timeout, Timelock):
         raise ValidationError("timeout must be a Timelock")
@@ -917,6 +1023,7 @@ def build_refund_tx(
         nsequence=timeout.to_nsequence(),  # BIP68: enables the relative lock
         locktime=0,
         aux_rand=aux_rand,
+        fee_policy=fee_policy,
     )
 
 

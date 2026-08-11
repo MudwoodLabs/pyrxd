@@ -973,6 +973,14 @@ def _build_p2pkh_spv_proof(hash160: bytes, satoshis: int):
     return proof
 
 
+#: A finalize fee that clears Radiant's relay floor. The finalize tx carries the whole BTC
+#: payment tx, 12 block headers and a 20-level Merkle branch in ONE scriptSig, so it
+#: measures **971 bytes** here (reported by the guard) -> a 9,710,000-photon floor. These
+#: fixtures paid 1,000 against a 1,000,000-photon input: ~9,710x under.
+_FINALIZE_FEE = 15_000_000
+_FUNDED = 50_000_000
+
+
 class TestGravityTradeP2PKH:
     """End-to-end P2PKH path: real SPV proof + finalize tx assembly.
 
@@ -1011,9 +1019,9 @@ class TestGravityTradeP2PKH:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
 
         # Functional assertions
@@ -1021,8 +1029,8 @@ class TestGravityTradeP2PKH:
         assert result.tx_hex
         bytes.fromhex(result.tx_hex)  # valid hex
         assert len(result.txid) == 64
-        assert result.output_photons == 999_000
-        assert result.fee_sats == 1_000
+        assert result.output_photons == _FUNDED - _FINALIZE_FEE
+        assert result.fee_sats == _FINALIZE_FEE
 
     def test_real_p2pkh_finalize_scriptsig_contains_p2pkh_evidence(self):
         """The serialized finalize tx must embed the P2PKH-shape raw_tx in scriptSig.
@@ -1038,9 +1046,9 @@ class TestGravityTradeP2PKH:
             claimed_redeem_hex="ab" * 50,
             funding_txid="cd" * 32,
             funding_vout=0,
-            funding_photons=1_000_000,
+            funding_photons=_FUNDED,
             to_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
-            fee_sats=1_000,
+            fee_sats=_FINALIZE_FEE,
         )
         raw = bytes.fromhex(result.tx_hex)
         # The P2PKH script prefix + hash160 + suffix must appear verbatim in
