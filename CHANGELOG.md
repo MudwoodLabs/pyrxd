@@ -6,6 +6,42 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.14.0] — 2026-08-10
+
+Specifications, token issuance, and the security work that writing the specifications
+caused.
+
+The headline additions are ecosystem-facing: a **normative Glyph token protocol
+specification**, a **cross-chain HTLC handshake wire format** with conformance vectors, and
+**output-script descriptor export** for watch-only import. Alongside them, multi-recipient FT
+airdrop, dMint deploy-with-premine, an offline swap-recovery toolkit, and an ElectrumX
+registry with request-level failover and optional TLS pinning.
+
+The larger part of this release is corrections, and most of them were found by writing the
+specs and by an eight-reviewer pre-release audit rather than by ordinary review of the diff.
+Several predate this release entirely:
+
+- **`glyph transfer-ft` could send the wrong number of FT units** — up to the sender's whole
+  balance. An FT output's value *is* its unit count, and the recipient output was sized from
+  the inputs' RXD rather than from the requested amount. The first fix was a tripwire on one
+  input shape and the loss was still reachable one photon either side of it; transfers are now
+  sized from the amount by construction.
+- **The ref-opcode walker diverged from Radiant consensus on `0xd4`–`0xd7`**, which carry no
+  operand. It could report a phantom ref while the real one stayed invisible. Four walkers
+  existed, split two-and-two on the correct opcode set; one of the wrong two backed a
+  credential gate and could name an attacker as owner.
+- **A malformed WIF was echoed back**, disclosing the key it failed to decode.
+- **`pyrxd swap` fee'd every transaction at one-thousandth of the relay floor**, so RSWP
+  orders could not relay — and a cancel that does not relay leaves the order takeable.
+
+On the swap stack, both sides of the "did my counterparty actually fund their leg?" check now
+live in the library rather than in an operator script: the maker's, and the taker's. Radiant
+has neither RBF nor CPFP, so a transaction built below the relay floor cannot be repaired —
+several fixes here exist because of that and not because of ordinary fee tuning.
+
+The swap stack remains **experimental and UNAUDITED**. An external audit and a live two-party
+adversarial run are still the hard gates before real value.
+
 ### Added
 
 - **Cross-chain HTLC swap-handshake wire format — `docs/htlc-handshake-wire-format.md` plus
