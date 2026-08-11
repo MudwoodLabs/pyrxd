@@ -244,20 +244,40 @@ class TestOutputLayout:
 
 class TestInputValidation:
     def test_value_and_ft_amount_must_agree(self):
-        """On chain they are the same number; a mismatch is a wrong transaction.
+        """On chain they are the same number; a mismatch is refused at construction.
 
         `ft_amount > value` materialises more of the ref than the inputs carry
         (consensus rejects it); `ft_amount < value` sends the surplus photons to
         change or fee, which for a real token means burning units.
         """
-        mismatched = FtUtxo(
+        with pytest.raises(ValidationError, match="cannot exist on chain"):
+            FtUtxo(
+                txid="a0" * 32,
+                vout=0,
+                value=50_000_000,
+                ft_amount=1_000,
+                ft_script=build_ft_locking_script(Hex20(_alice_pkh()), _token_ref()),
+            )
+
+    def test_airdrop_backstop_still_fires_if_the_type_guarantee_is_bypassed(self):
+        """DELIBERATELY IMPOSSIBLE FIXTURE — and it has to be, to test this.
+
+        ``FtUtxo.__post_init__`` makes ``value != ft_amount`` unconstructible, so
+        the only way to reach ``build_airdrop_tx``'s defence-in-depth check is to
+        force the field past the frozen dataclass with ``object.__setattr__``.
+        That is the point of this test: the backstop is a tripwire on somebody
+        later loosening the type, so it must be exercised through a bypass. Do
+        NOT copy this pattern into a test that is not specifically about the
+        tripwire — everywhere else, an impossible ``FtUtxo`` is a bug in the test.
+        """
+        u = FtUtxo.from_output(
             txid="a0" * 32,
             vout=0,
             value=50_000_000,
-            ft_amount=1_000,
             ft_script=build_ft_locking_script(Hex20(_alice_pkh()), _token_ref()),
         )
-        s = FtUtxoSet(ref=_token_ref(), utxos=[mismatched])
+        s = FtUtxoSet(ref=_token_ref(), utxos=[u])
+        object.__setattr__(u, "ft_amount", 1_000)  # bypass the frozen type on purpose
         with pytest.raises(ValidationError, match="ft_amount = value"):
             s.build_airdrop_tx(_recipients((_BOB_PKH, 10)), _alice_key(), funding=[_funding()])
 
@@ -560,23 +580,18 @@ class TestTransferBuilderIsTheAirdropBuilder:
     def test_decoupled_inputs_are_refused(self, delta: int):
         """`value != ft_amount` cannot exist on chain and is refused either way.
 
-        This is the fail-closed backstop, not the thing that makes the amount
-        correct — the recipient output above is `amount` regardless.
+        ``±1`` specifically: these are the deltas that defeated the first
+        attempted fix, an ``if value == ft_amount: raise`` guard inside the
+        builder. The refusal now happens before an ``FtUtxo`` exists at all, so
+        there is no expression left for a near-miss to slip through.
         """
-        utxo = FtUtxo(
-            txid="a0" * 32,
-            vout=0,
-            value=50_000_000 + delta,
-            ft_amount=50_000_000,
-            ft_script=build_ft_locking_script(Hex20(_alice_pkh()), _token_ref()),
-        )
-        s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         with pytest.raises(ValidationError, match="ft_amount"):
-            s.build_transfer_tx(
-                amount=250,
-                new_owner_pkh=Hex20(_BOB_PKH),
-                private_key=_alice_key(),
-                funding=[_funding()],
+            FtUtxo(
+                txid="a0" * 32,
+                vout=0,
+                value=50_000_000 + delta,
+                ft_amount=50_000_000,
+                ft_script=build_ft_locking_script(Hex20(_alice_pkh()), _token_ref()),
             )
 
     def test_transfer_and_one_recipient_airdrop_are_byte_identical(self):

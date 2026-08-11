@@ -371,13 +371,21 @@ class GlyphBuilder:
         if premine_amount < 0:
             raise ValidationError("premine_amount must be non-negative")
         if premine_amount < 546:
-            # Standard dust limit — under this, the reveal output is non-standard
-            # and will be rejected by most mempool policies. 546 photons is the
-            # conventional dust limit; callers wanting a smaller supply should
-            # choose a different token model (NFT) rather than a tiny FT.
+            # A pyrxd HEURISTIC, not a chain rule — the same one, and the same
+            # reasoning, as ``_validate_premine`` further down this file: a whole
+            # FT supply below 546 units is almost always a decimals mistake.
+            # Radiant would relay it. ``GetDustThreshold`` returns 1 satoshi and
+            # ``IsDust`` is ``nValue <= 0``
+            # (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is not
+            # consulted at all (``fRequireStandard`` hardcoded ``false``,
+            # Radiant-Core/src/validation.cpp:271, src/init.cpp:1965). The
+            # previous comment here — "non-standard and will be rejected by most
+            # mempool policies" — described a rule that does not exist on this
+            # chain.
             raise ValidationError(
-                f"premine_amount ({premine_amount}) is below the dust limit (546). "
-                "Use a larger supply or a different token model."
+                f"premine_amount ({premine_amount}) is below pyrxd's 546-unit guard. This is a guard "
+                "against a decimals mistake, not a chain limit (Radiant's output floor is 1 photon) — "
+                "use a larger supply, or an NFT if the token really is indivisible."
             )
         scripts = self.prepare_reveal(
             RevealParams(

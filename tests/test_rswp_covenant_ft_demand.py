@@ -102,8 +102,9 @@ def test_ft_demand_surplus_returns_as_ft_change() -> None:
     taker, tk_pkh = _key()
     reservation, order = _posted_ft_demand(maker)
 
-    # Fund with a surplus that clears the dust floor (a sub-dust FT change is un-relayable and now raises —
-    # see test_ft_demand_sub_dust_surplus_rejected): 600 funded, 50 demanded -> 550 change (>= 546).
+    # 600 funded, 50 demanded -> 550 change. Nothing about 550 is special; see
+    # test_ft_demand_sub_dust_surplus_is_returned_as_change for the sub-546 case,
+    # which is the one a 546 floor used to reject.
     tx = _take(
         order,
         reservation,
@@ -116,19 +117,35 @@ def test_ft_demand_surplus_returns_as_ft_change() -> None:
     assert total_in - sum(o.satoshis for o in tx.outputs) == 1_000  # fee exact
 
 
-def test_ft_demand_sub_dust_surplus_rejected() -> None:
-    """RM-8: an FT change surplus below the dust floor would make an un-relayable (opaquely-failing) take —
-    refuse with a clear error instead (folding to fee would burn tokens)."""
+@pytest.mark.parametrize("funded", [51, 80, 545, 546, 547])
+def test_ft_demand_sub_dust_surplus_is_returned_as_change(funded: int) -> None:
+    """A 1..545-unit FT surplus comes back as change — 546 is not a floor on this chain.
+
+    This used to raise. The rejection claimed the change output "would be
+    un-relayable", which is false twice over: ``GetDustThreshold`` returns 1
+    satoshi and ``IsDust`` is ``nValue <= 0``
+    (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is never
+    consulted — ``fRequireStandard`` is hardcoded ``false``
+    (Radiant-Core/src/validation.cpp:271, src/init.cpp:1965), which is the only
+    reason a 75-byte FT script relays at all. A taker holding 80 units against a
+    50-unit demand could not fill the order.
+
+    The parametrisation straddles 546 deliberately. The test that hid this bug
+    covered only ``funded=600`` — a surplus of 550, the one side of the boundary
+    where the false rule and the real rule agree, which is the same shape as the
+    FT-transfer bug whose single regtest test sent the whole balance.
+    """
     maker, _ = _key()
     taker, tk_pkh = _key()
     reservation, order = _posted_ft_demand(maker)  # demand = 50 FT
-    with pytest.raises(ValidationError, match="dust"):
-        _take(
-            order,
-            reservation,
-            taker,
-            [FundingInput(_ft_src(tk_pkh, _FT_REF, 80), 0, taker), FundingInput(_rxd_src(tk_pkh, 5_000), 0, taker)],
-        )
+    tx = _take(
+        order,
+        reservation,
+        taker,
+        [FundingInput(_ft_src(tk_pkh, _FT_REF, funded), 0, taker), FundingInput(_rxd_src(tk_pkh, 5_000), 0, taker)],
+    )
+    ft_outs = [o for o in tx.outputs if is_ft_script(o.locking_script.serialize().hex())]
+    assert [o.satoshis for o in ft_outs] == [50, funded - 50]  # demand + change, conserved exactly
 
 
 def test_covenant_order_nft_demand_rejected() -> None:

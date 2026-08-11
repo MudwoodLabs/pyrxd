@@ -30,6 +30,7 @@ from pyrxd.gravity.codehash import (
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.spv.proof import _BUILDER_TOKEN, CovenantParams, SpvProof
+from pyrxd.transaction.transaction import Transaction
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -497,9 +498,14 @@ class TestBuildForfeitTx:
             "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
             1_000,
         )
-        raw = bytes.fromhex(result.tx_hex)
-        # 0xFFFFFFFE as little-endian 4 bytes
-        assert b"\xfe\xff\xff\xff" in raw
+        # Parse the field rather than scanning the serialized bytes for
+        # \xfe\xff\xff\xff: those four bytes can appear in the pushed redeem
+        # script or an output value, so a substring hit does not establish that
+        # nSequence itself is CLTV-compatible. SEQUENCE_FINAL here would make the
+        # CLTV branch unspendable (Radiant-Core/src/script/interpreter.cpp:2779).
+        tx = Transaction.from_hex(result.tx_hex)
+        assert tx is not None
+        assert tx.inputs[0].sequence == 0xFFFFFFFE
 
     def test_forfeit_tx_version_is_2(self):
         offer = self._past_offer()

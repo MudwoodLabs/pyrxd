@@ -71,19 +71,19 @@ def _make_utxo(
     *,
     txid_byte: int = 0xA0,
     vout: int = 0,
-    value: int | None = None,
     owner_pkh: bytes | None = None,
     ref: GlyphRef | None = None,
 ) -> FtUtxo:
-    """``value`` defaults to ``ft_amount`` — the only relationship a real FT has.
+    """An FT UTXO of ``ft_amount`` units — which is also its photon value.
 
-    Pass ``value`` explicitly to construct an impossible UTXO on purpose.
+    No ``value`` override: an FT's quantity IS its output's photons, and
+    :class:`FtUtxo` refuses to hold the two apart, so there is nothing to
+    override with.
     """
-    return FtUtxo(
+    return FtUtxo.from_output(
         txid=bytes([txid_byte]).hex() * 32,
         vout=vout,
-        value=ft_amount if value is None else value,
-        ft_amount=ft_amount,
+        value=ft_amount,
         ft_script=_ft_script_for(owner_pkh or _alice_pkh(), ref),
     )
 
@@ -210,11 +210,10 @@ class TestFtMismatchedRef:
     def test_different_ref_utxo_rejected(self):
         other_ref = GlyphRef(txid=Txid("ff" * 32), vout=7)
         # Set's ref is _token_ref(); UTXO's script carries other_ref.
-        mismatched_utxo = FtUtxo(
+        mismatched_utxo = FtUtxo.from_output(
             txid="aa" * 32,
             vout=0,
-            value=_DEFAULT_RXD_VALUE,
-            ft_amount=100,
+            value=100,
             ft_script=_ft_script_for(_alice_pkh(), ref=other_ref),
         )
         with pytest.raises(ValidationError, match="differs from the set's ref"):
@@ -224,11 +223,10 @@ class TestFtMismatchedRef:
         """Even if only one of the UTXOs carries a foreign ref, reject the whole set."""
         other_ref = GlyphRef(txid=Txid("ff" * 32), vout=7)
         good = _make_utxo(60, txid_byte=0x01)
-        bad = FtUtxo(
+        bad = FtUtxo.from_output(
             txid="aa" * 32,
             vout=0,
-            value=_DEFAULT_RXD_VALUE,
-            ft_amount=50,
+            value=50,
             ft_script=_ft_script_for(_alice_pkh(), ref=other_ref),
         )
         with pytest.raises(ValidationError, match="differs from the set's ref"):
@@ -387,16 +385,30 @@ class TestFtAmountZeroUtxo:
             )
 
     def test_negative_ft_amount_rejected_at_construction(self):
-        """The FtUtxoSet constructor refuses negative ft_amount."""
-        bad = FtUtxo(
-            txid="aa" * 32,
-            vout=0,
-            value=_DEFAULT_RXD_VALUE,
-            ft_amount=-1,
-            ft_script=_ft_script_for(_alice_pkh()),
-        )
-        with pytest.raises(ValidationError, match="ft_amount"):
-            FtUtxoSet(ref=_token_ref(), utxos=[bad])
+        """``FtUtxo`` itself refuses a negative amount — no set needed.
+
+        A negative output value is the one thing Radiant's ``IsDust`` actually
+        rejects (``nValue <= 0``, ``Radiant-Core/src/policy/policy.cpp:23``), and
+        since an FT's units ARE its value there is no such UTXO to model.
+        """
+        with pytest.raises(ValidationError, match="must be >= 0"):
+            FtUtxo(
+                txid="aa" * 32,
+                vout=0,
+                value=-1,
+                ft_amount=-1,
+                ft_script=_ft_script_for(_alice_pkh()),
+            )
+        # And a negative amount paired with a plausible value is refused too —
+        # by the equality rule, before the sign rule ever matters.
+        with pytest.raises(ValidationError):
+            FtUtxo(
+                txid="aa" * 32,
+                vout=0,
+                value=_DEFAULT_RXD_VALUE,
+                ft_amount=-1,
+                ft_script=_ft_script_for(_alice_pkh()),
+            )
 
 
 class TestFtTwoPassSigningStale:
@@ -788,16 +800,22 @@ class TestAuditFindings2026:
             utxo.ft_amount = 9999  # type: ignore[misc]
 
     def test_ft_utxo_float_ft_amount_rejected(self):
-        """HIGH: ft_amount=1.5 must be rejected — float silently bypasses u.ft_amount < 0 check."""
-        from pyrxd.glyph.ft import FtUtxo, FtUtxoSet
+        """HIGH: ft_amount=1.5 must be rejected — float silently bypasses a ``< 0`` check.
+
+        The refusal is now at ``FtUtxo`` construction, so a float amount never
+        reaches a set, a selection, or a builder.
+        """
+        from pyrxd.glyph.ft import FtUtxo
         from pyrxd.glyph.script import build_ft_locking_script
 
         ref = _token_ref()
         pkh = Hex20(bytes(range(20)))
         script = build_ft_locking_script(pkh, ref)
-        bad_utxo = FtUtxo(txid="aa" * 32, vout=0, value=1_000_000, ft_amount=1.5, ft_script=script)  # type: ignore[arg-type]
         with pytest.raises(ValidationError, match="ft_amount must be int"):
-            FtUtxoSet(ref=ref, utxos=[bad_utxo])
+            FtUtxo(txid="aa" * 32, vout=0, value=1_000_000, ft_amount=1.5, ft_script=script)  # type: ignore[arg-type]
+        # ``bool`` is an ``int`` subclass and would arithmetic as 1 — also refused.
+        with pytest.raises(ValidationError, match="must be int"):
+            FtUtxo(txid="aa" * 32, vout=0, value=True, ft_amount=True, ft_script=script)  # type: ignore[arg-type]
 
     def test_glyphmetadata_protocol_none_rejected(self):
         """HIGH: protocol=None must raise ValidationError at construction."""

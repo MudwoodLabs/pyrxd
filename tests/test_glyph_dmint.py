@@ -395,35 +395,42 @@ class TestPrepareFtDeployReveal:
     def test_rejects_below_dust_premine(self):
         builder = GlyphBuilder()
         commit = self._build_commit(builder, [GlyphProtocol.FT, GlyphProtocol.DMINT])
-        with pytest.raises(ValidationError, match="dust"):
+        with pytest.raises(ValidationError, match="546-unit guard"):
             builder.prepare_ft_deploy_reveal(
                 commit_txid="ab" * 32,
                 commit_vout=0,
                 commit_value=1_000_001,
                 cbor_bytes=commit.cbor_bytes,
                 premine_pkh=TREASURY_PKH,
-                premine_amount=100,  # below 546 dust
+                premine_amount=100,  # below pyrxd's 546-unit guard
             )
 
     @pytest.mark.parametrize(
         "premine_amount,should_pass",
         [
-            (544, False),  # below dust
-            (545, False),  # one-photon-below dust — must reject
-            (546, True),  # exact dust limit — must accept
-            (547, True),  # one-photon-above dust — must accept
+            (544, False),  # below the guard
+            (545, False),  # one below the guard — must reject
+            (546, True),  # exactly the guard — must accept
+            (547, True),  # one above — must accept
             (1000, True),  # well above
         ],
     )
-    def test_premine_dust_boundary_545_546_547(self, premine_amount, should_pass):
-        """The dust limit is 546 photons. Test the exact boundary triple
-        plus 544 (definitely-below) and 1000 (definitely-above) so a future
-        off-by-one doesn't slip past.
+    def test_premine_guard_boundary_545_546_547(self, premine_amount, should_pass):
+        """546 is pyrxd's own guard against a decimals mistake, NOT a chain rule.
 
-        Prevents: the off-by-one that either (a) blocks a legitimate
-        546-photon premine, or (b) accepts a below-dust premine that
-        gets rejected by mempool relays after the deploy is partially
-        broadcast.
+        The boundary triple still matters — an off-by-one here would reject a
+        legitimate 546-unit premine — but the failure mode this test used to
+        claim ("accepts a below-dust premine that gets rejected by mempool
+        relays") does not exist on Radiant. ``GetDustThreshold`` returns 1
+        satoshi and ``IsDust`` is ``nValue <= 0``
+        (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is never
+        consulted at all — ``fRequireStandard`` is hardcoded ``false``
+        (Radiant-Core/src/validation.cpp:271, src/init.cpp:1965), which is the
+        only reason a 75-byte FT script relays. A 100-unit premine would be
+        relayed and mined; pyrxd refuses it as a probable user error, and
+        ``FtUtxoSet.build_airdrop_tx`` in the same package correctly emits
+        1-unit FT outputs. Stating the false rule here is what let the same
+        premise turn into a real functional lockout in the RSWP take path.
         """
         builder = GlyphBuilder()
         commit = self._build_commit(builder, [GlyphProtocol.FT, GlyphProtocol.DMINT])
@@ -439,7 +446,7 @@ class TestPrepareFtDeployReveal:
             assert result.premine_amount == premine_amount
             assert len(result.locking_script) == 75
         else:
-            with pytest.raises(ValidationError, match="dust"):
+            with pytest.raises(ValidationError, match="546-unit guard"):
                 builder.prepare_ft_deploy_reveal(
                     commit_txid="ab" * 32,
                     commit_vout=0,

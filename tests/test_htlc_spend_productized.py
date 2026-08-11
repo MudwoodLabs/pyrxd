@@ -156,7 +156,17 @@ def test_refund_is_v2_with_csv_nsequence():
     tx = build_htlc_refund_tx(covenant=cov, covenant_outpoint="cd" * 32 + ":0", carrier_value=100_000, fee=_fee())
     assert tx.version == 2  # BIP68 requires v2
     assert tx.inputs[0].sequence == 6  # nSequence encodes refund_csv (block count)
-    assert tx.inputs[0].sequence < 0xFFFFFFFF  # disable-flag clear -> lock engages
+    # The predicate that matters is the DISABLE BIT, not "< SEQUENCE_FINAL".
+    # CheckSequence fails only when bit 31 is set
+    # (Radiant-Core/src/script/interpreter.cpp:2802; SEQUENCE_LOCKTIME_DISABLE_FLAG
+    # = 1<<31, src/primitives/transaction.h:126) — and 0x80000000 is BOTH less
+    # than 0xFFFFFFFF and disabled, so the old `< 0xFFFFFFFF` check would have
+    # passed a sequence that switches the relative lock off entirely. It also
+    # could not fail here at all, since the line above already pins the value.
+    assert tx.inputs[0].sequence & (1 << 31) == 0  # relative lock engages
+    # Bit 22 clear = block units, not 512-second units (SEQUENCE_LOCKTIME_TYPE_FLAG,
+    # transaction.h:133): a "6" read as time would be 51 minutes, not 6 blocks.
+    assert tx.inputs[0].sequence & (1 << 22) == 0
     assert tx.inputs[1].sequence == 0xFFFFFFFE  # fee input < FINAL, carries no lock
 
 
