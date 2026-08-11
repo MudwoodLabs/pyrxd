@@ -903,21 +903,16 @@ async def _select_ft_inputs(
             ref_in_script = _try_extract_ft_ref(out_script)
             if ref_in_script != ref:
                 continue
-            ft_amount = utxo.value  # 1 photon = 1 FT unit
-            ft_inputs.append(
-                (
-                    FtUtxo(
-                        txid=utxo.tx_hash,
-                        vout=utxo.tx_pos,
-                        value=utxo.value,
-                        ft_amount=ft_amount,
-                        ft_script=out_script,
-                    ),
-                    addr,
-                    pk,
-                )
+            # 1 photon = 1 FT unit — ``from_output`` takes the number once so a
+            # future edit cannot reintroduce a second, divergent quantity.
+            ft_utxo = FtUtxo.from_output(
+                txid=utxo.tx_hash,
+                vout=utxo.tx_pos,
+                value=utxo.value,
+                ft_script=out_script,
             )
-            total_ft += ft_amount
+            ft_inputs.append((ft_utxo, addr, pk))
+            total_ft += ft_utxo.ft_amount
         except NetworkError:
             continue
 

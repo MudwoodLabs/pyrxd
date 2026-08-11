@@ -797,13 +797,66 @@ def electrumx_script_hash(spk: bytes | str) -> str:
 
 @dataclass(frozen=True)
 class CovenantChainState:
-    """The funded covenant UTXO as read from ElectrumX. Read-only, no mempool writes."""
+    """The funded covenant UTXO as read from ElectrumX. Read-only, no mempool writes.
+
+    The three depth fields are ONE measurement written three ways, and
+    ``__post_init__`` refuses any triple a chain could not produce:
+
+    * unconfirmed ⇔ ``funding_height is None`` **and** ``confirmations == 0``.
+      There is no such thing as a mempool UTXO that also names the block it is
+      in, nor a mined one with zero depth.
+    * confirmed ⇒ ``1 <= funding_height <= tip_height`` and
+      ``confirmations == tip_height - funding_height + 1`` — the same identity
+      :func:`read_covenant_chain_state` computes.
+
+    This is not bookkeeping. ``read_covenant_chain_state`` derives
+    ``confirmations`` by subtraction, so a server reporting a UTXO height ABOVE
+    the tip yields a NEGATIVE depth, and negative depth does not fail closed
+    everywhere it flows: :func:`build_cold_claim` computes
+    ``blocks_to_deadline = max(0, refund_csv - confirmations)``, so a depth of
+    ``-4`` against a 20-block CSV reports **24 blocks to the deadline** — more
+    headroom than the CSV total, and a *lower* urgency multiplier — to an
+    operator racing that deadline with no RBF and no CPFP to fix a slow
+    broadcast. Refusing to build the state at all turns a silently optimistic
+    number into a stopped run with a readable cause.
+    """
 
     outpoint: str  # "txid:vout"
     carrier_value: int
     funding_height: int | None
     tip_height: int
     confirmations: int
+
+    def __post_init__(self) -> None:
+        if self.tip_height < 0:
+            raise ValidationError(f"tip_height must be >= 0, got {self.tip_height}")
+        if self.funding_height is None:
+            if self.confirmations != 0:
+                raise ValidationError(
+                    f"chain state claims {self.confirmations} confirmations with no funding height. A UTXO "
+                    "is either in the mempool (no height, 0 confirmations) or in a block (both) — this "
+                    "pair describes neither."
+                )
+            return
+        if self.funding_height < 1:
+            raise ValidationError(
+                f"funding_height must be >= 1 when set, got {self.funding_height}; use None for a "
+                "mempool (0-confirmation) UTXO."
+            )
+        if self.funding_height > self.tip_height:
+            raise ValidationError(
+                f"the covenant UTXO reports funding height {self.funding_height} above the chain tip "
+                f"{self.tip_height}. That cannot happen on a consistent view — the server is lying, "
+                "lagging, or you are pointed at the wrong network. Refusing rather than deriving a "
+                "negative confirmation count, which would be reported to you as EXTRA time before the "
+                "CSV deadline."
+            )
+        expected = self.tip_height - self.funding_height + 1
+        if self.confirmations != expected:
+            raise ValidationError(
+                f"confirmations {self.confirmations} does not match tip {self.tip_height} minus funding "
+                f"height {self.funding_height} plus one ({expected})."
+            )
 
 
 async def read_covenant_chain_state(client: Any, spk_hex: str) -> CovenantChainState:

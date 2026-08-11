@@ -50,6 +50,7 @@ from pyrxd.gravity.covenant import (
 from pyrxd.gravity.types import MIN_CLAIM_DEADLINE
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
+from pyrxd.transaction.transaction import Transaction
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -674,12 +675,20 @@ class TestForfeit:
             maker_address=self.MAKER_ADDR,
             fee_sats=1_000,
         )
-        raw = bytes.fromhex(result.tx_hex)
-        # 0xFFFFFFFE as 4-byte LE = \xfe\xff\xff\xff
-        assert b"\xfe\xff\xff\xff" in raw
-        # And the forbidden 0xFFFFFFFF sequence must NOT appear as the input sequence.
-        # The input sequence is placed just before the varint output count.
-        # Simple heuristic: confirm the CLTV-compatible sequence is present.
+        # Read the FIELD, not the byte soup. This used to be
+        # `assert b"\xfe\xff\xff\xff" in raw` plus a comment promising a check
+        # for the forbidden 0xFFFFFFFF that was never written. A substring scan
+        # over a serialized transaction cannot tell nSequence from the same four
+        # bytes appearing inside the pushed redeem script, an output value, or a
+        # signature — so it passes whether or not the field it names is correct.
+        #
+        # 0xFFFFFFFF here would make the CLTV forfeit branch unspendable outright:
+        # CheckLockTime fails when the spending input is SEQUENCE_FINAL
+        # (Radiant-Core/src/script/interpreter.cpp:2779), which is exactly the
+        # bypass CLTV exists to close.
+        tx = Transaction.from_hex(result.tx_hex)
+        assert tx is not None
+        assert tx.inputs[0].sequence == 0xFFFFFFFE
 
 
 # ===========================================================================

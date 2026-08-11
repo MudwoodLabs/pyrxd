@@ -181,12 +181,14 @@ async def collect_ft_utxos(
             continue  # not an FT lock at all (probably plain P2PKH RXD)
         if extract_ref_from_ft_script(script) != token_ref:
             continue  # FT, but a different token
+        # 1 photon = 1 FT unit (the conservation epilogue sums output satoshis),
+        # so ``from_output`` takes the number once — there is no second field to
+        # get wrong, and ``FtUtxo`` refuses one that disagrees anyway.
         ft_utxos.append(
-            FtUtxo(
+            FtUtxo.from_output(
                 txid=u.tx_hash,
                 vout=u.tx_pos,
                 value=u.value,
-                ft_amount=u.value,  # 1 photon = 1 FT unit (consensus rule)
                 ft_script=script,
             )
         )
