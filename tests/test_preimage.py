@@ -8,7 +8,10 @@ dac1e2dfed64fbfd0f0fe6b925e144cfc32ef76803abc7a6a4058406d707b407.
 
 from __future__ import annotations
 
+import pytest
+
 from pyrxd.script.script import Script
+from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction_output import TransactionOutput
 from pyrxd.transaction.transaction_preimage import (
     _compute_hash_output_hashes,
@@ -92,6 +95,71 @@ class TestGetPushRefs:
 
     def test_empty_script(self):
         assert _get_push_refs(b"") == []
+
+    # -- ref-operand opcodes that are WALKED but not COLLECTED ---------------
+    #
+    # 0xd1/0xd2/0xd3 carry a 36-byte immediate operand exactly like 0xd0/0xd8
+    # (``GetScriptOp``, Radiant-Core src/script/script.cpp:710-726) but land in
+    # the *require* / *disallow-sibling* sets, not the push-ref set that the
+    # sighash hashes (``CScript::GetPushRefs``, :585-607). Through 0.15.0 this
+    # walker skipped them as bare one-byte opcodes and resumed INSIDE the ref,
+    # reading its bytes as opcodes — a divergence that produced the wrong ref
+    # set for ~80% of random refs and therefore an invalid signature on every
+    # input of any transaction paying to such a script. Node-proven in
+    # tests/test_mut_wave_regtest_e2e.py::test_signing_an_output_that_requires_a_ref.
+
+    # A ref chosen to make the old walker fail DETERMINISTICALLY: skipped as a
+    # bare opcode, the walk lands on four OP_1s and then a 0xd8, and collects
+    # the following 36 bytes as a phantom ref.
+    ADVERSARIAL_REF = b"\x51\x51\x51\x51\xd8" + bytes(range(1, 32))
+
+    @pytest.mark.parametrize("opcode", [0xD1, 0xD2, 0xD3])
+    def test_non_push_ref_operands_are_walked_but_not_collected(self, opcode):
+        script = bytes([opcode]) + self.ADVERSARIAL_REF + bytes.fromhex("75" + P2PKH_AA)
+        assert _get_push_refs(script) == [], (
+            f"opcode {opcode:#x} contributed a ref to the push-ref set that consensus does not see"
+        )
+
+    @pytest.mark.parametrize("opcode", [0xD1, 0xD2, 0xD3])
+    def test_a_real_ref_after_a_non_push_operand_is_still_found(self, opcode):
+        """The other half: desynchronising also LOSES the ref that is really there."""
+        real = bytes(range(100, 136))
+        script = bytes([opcode]) + self.ADVERSARIAL_REF + b"\x6d" + bytes([0xD8]) + real
+        assert _get_push_refs(script) == [real]
+
+    def test_photonic_auth_script_shape_has_exactly_one_ref(self):
+        """The concrete script that surfaced the bug: Photonic's ``nftAuthScript``.
+
+        ``OP_REQUIREINPUTREF <mutable_ref> <sha256> OP_2DROP OP_STATESEPARATOR
+        OP_PUSHINPUTREFSINGLETON <token_ref> OP_DROP <P2PKH>`` — one push ref
+        (the token singleton), never two, and never the mutable ref.
+        """
+        mutable_ref = bytes(range(36))
+        token_ref = bytes(range(100, 136))
+        script = (
+            bytes([0xD1])
+            + mutable_ref
+            + b"\x20"
+            + bytes(range(200, 232))
+            + b"\x6d\xbd"
+            + bytes([0xD8])
+            + token_ref
+            + b"\x75"
+            + bytes.fromhex(P2PKH_AA)
+        )
+        assert len(script) == 135
+        assert _get_push_refs(script) == [token_ref]
+
+    @pytest.mark.parametrize("opcode", [0xD0, 0xD1, 0xD2, 0xD3, 0xD8])
+    def test_a_truncated_ref_operand_fails_closed(self, opcode):
+        """All five operands, not just the collected two, must fail closed.
+
+        A script whose length is ambiguous must never be silently hashed as if
+        the missing bytes were absent — that is a signature over a script the
+        node reads differently.
+        """
+        with pytest.raises(ValidationError):
+            _get_push_refs(bytes([opcode]) + bytes(20))
 
 
 # ---------------------------------------------------------------------------

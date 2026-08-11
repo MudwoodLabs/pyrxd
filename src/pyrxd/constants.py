@@ -340,3 +340,30 @@ class OpCode(bytes, Enum):
 
 OPCODE_VALUE_NAME_DICT: dict[bytes, str] = {item.value: item.name for item in OpCode}
 OPCODE_VALUE_NAME_DICT[b"\x00"] = "OP_0"
+
+# ---------------------------------------------------------------------------
+# Ref-operand opcodes (Radiant)
+# ---------------------------------------------------------------------------
+# The opcodes that consensus follows with a **36-byte immediate operand** and no
+# length prefix. This is exactly the set ``GetScriptOp`` special-cases
+# (Radiant-Core ``src/script/script.cpp:710-726``); any script walker that does
+# not consume those 36 bytes desynchronises from consensus the moment one
+# appears, because it starts reading ref bytes as opcodes.
+#
+# It is NOT the contiguous range 0xd0-0xd8. The four opcodes in between —
+# 0xd4 OP_REFHASHDATASUMMARY_UTXO, 0xd5 OP_REFHASHVALUESUM_UTXOS,
+# 0xd6 OP_REFHASHDATASUMMARY_OUTPUT, 0xd7 OP_REFHASHVALUESUM_OUTPUTS — are pure
+# stack operations carrying NO operand.
+#
+# Lives here, in the bottom layer, because two different walkers need it: the
+# Glyph classifier (:data:`pyrxd.glyph.script.REF_OPCODES`) and the BIP143
+# preimage's ``hashOutputHashes`` field
+# (:func:`pyrxd.transaction.transaction_preimage._get_push_refs`).
+REF_OPERAND_OPCODES: frozenset[int] = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
+
+# The subset that contributes to an output's **push-ref set** — the set Radiant
+# hashes into the sighash's ``hashOutputHashes`` and returns from
+# ``OP_REFDATASUMMARY_OUTPUT``. ``CScript::GetPushRefs``
+# (``src/script/script.cpp:585-607``) files 0xd1/0xd2/0xd3 into the *require* and
+# *disallow-sibling* sets instead, so they must be WALKED but not COLLECTED.
+PUSH_REF_OPCODES: frozenset[int] = frozenset({0xD0, 0xD8})
