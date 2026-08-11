@@ -27,12 +27,15 @@ What each case proves:
    has an EMPTY UTXO set: every photon moved or became fee.
 5. **The fee actually paid equals the fee the builder reported**, derived by
    re-fetching each input's source transaction from the node.
-6. **DEFECT — both builders can emit a transaction below the relay floor.** The
-   fee is sized from a TRIAL signing pass and never re-measured after the final
-   pass, so whenever the final DER signature is longer than the trial one the
-   transaction pays for fewer bytes than it contains. The node refuses it with
-   ``66: min relay fee not met``. Radiant has neither RBF nor CPFP, so such a
-   transaction cannot be repaired. See the module-level note below.
+6. **Neither builder can emit a transaction below the relay floor.** It used to:
+   the fee was sized from a TRIAL signing pass and never re-measured after the
+   final pass, so whenever the final DER signature came out longer than the trial
+   one the transaction paid for fewer bytes than it contained — 25.4%-38.1% of
+   builds, measured. The node refused those with ``66: min relay fee not met``,
+   and Radiant has neither RBF nor CPFP, so they could not be repaired. The fee is
+   now sized with per-input signature headroom and the FINAL transaction is
+   re-measured and refused if it falls short (``pyrxd.fee_sizing``). Every build
+   below is put to the node.
 
 Negative controls, because a node that accepted everything would make every
 "accepted" above meaningless — each one quotes the node's own reject reason:
@@ -40,7 +43,9 @@ Negative controls, because a node that accepted everything would make every
 * mutating an output after signing → ``mandatory-script-verify-flag-failed``
 * re-signed outputs exceeding inputs → ``bad-txns-in-belowout``
 * a stranger's key over the wallet's coin → ``OP_EQUALVERIFY`` failure
-* a below-floor fee → ``min relay fee not met``
+* a hand-built fee ONE PHOTON under the floor → ``min relay fee not met``, with the
+  same transaction accepted at exactly the floor. Without this pair, "the wallet's
+  sends are accepted" would be equally true of a node that rejects nothing.
 
 Opt-in: ``@pytest.mark.integration`` + ``RADIANT_REGTEST=1``. Never runs in normal
 CI. Manages its own throwaway container; moves no real value; regtest only.
@@ -368,18 +373,26 @@ def test_change_below_the_send_policy_floor_is_burned_to_fee(node):  # noqa: F81
     recipient = PrivateKey().public_key().address()
     coin = _fund(node, wallet)
 
-    # Search offline for a send amount that leaves sub-floor change. The trial
-    # fee moves with the signed size, so some candidates overshoot the coin
-    # entirely (ValidationError) and some leave change well above the floor;
-    # probe the real coin until one lands in the sub-546 window.
+    # Search offline for a send amount that leaves sub-floor change. The window is
+    # only 546 photons wide and it sits just under whatever fee the build lands on,
+    # so calibrate from a real build rather than a hard-coded constant — the fee
+    # moves whenever the sizing changes, and a stale constant would turn this test
+    # into "could not land a sub-floor change amount" rather than a real failure.
+    # The probe's own fee can be a byte or two off the next build's (DER lengths
+    # vary), hence the small sweep around it.
+    probe_fee = wallet.build_send_tx([coin], recipient, _SEND).get_fee()
     tx = None
-    for slack in range(1, 546):
-        try:
-            candidate = wallet.build_send_tx([coin], recipient, _FUND - 2_260_000 - slack)
-        except ValidationError:
-            continue  # this slack put the fee above what the coin can pay
-        if len(candidate.outputs) == 1:
-            tx = candidate
+    for byte_delta in (0, 1, -1, 2, -2, 3):
+        base = probe_fee + byte_delta * wallet.fee_rate
+        for slack in range(1, 546):
+            try:
+                candidate = wallet.build_send_tx([coin], recipient, _FUND - base - slack)
+            except ValidationError:
+                continue  # this slack put the fee above what the coin can pay
+            if len(candidate.outputs) == 1:
+                tx = candidate
+                break
+        if tx is not None:
             break
     assert tx is not None, "could not land a sub-floor change amount against this coin"
 
@@ -479,109 +492,94 @@ def test_fee_paid_matches_the_fee_the_builder_reported(node, n_coins):  # noqa: 
     assert confirmed["size"] == len(tx.serialize())
 
 
-# --------------------------------------------------------------------------- DEFECT: below-floor fee
+# --------------------------------------------------------------------------- the relay floor
 
 
-def _find_below_floor_send(wallet: RxdWallet, coin: UtxoRecord, floor: int, attempts: int = 60) -> Transaction | None:
-    """Search for a ``build_send_tx`` result that pays under ``floor`` per byte.
+def _fee_at_exactly(wallet: RxdWallet, coin: UtxoRecord, recipient: str, fee_of_size) -> Transaction:
+    """A hand-built 1-in/1-out P2PKH send paying exactly ``fee_of_size(its own size)``.
 
-    Only the recipient varies, so a single funded coin backs the whole search and
-    just the one losing transaction is ever broadcast.
+    Built OUTSIDE ``RxdWallet``'s fee sizing on purpose: this is how the negative
+    control produces the below-floor transaction that the builders no longer will.
+    Signing is re-run until the assumed size matches the signed size, because the
+    DER signature length is not fixed — which is the very thing that made the
+    builders underpay.
     """
-    for _ in range(attempts):
-        tx = wallet.build_send_tx([coin], PrivateKey().public_key().address(), _SEND)
-        if _effective_rate(tx) < floor:
+    size = 226  # a plausible 1-in/2-out P2PKH send; only the first guess
+    for _ in range(60):
+        fee = fee_of_size(size)
+        tx = Transaction(
+            tx_inputs=[
+                TransactionInput(
+                    source_transaction=_src(coin.tx_hash, coin.tx_pos, _spk(wallet.address), coin.value),
+                    source_txid=coin.tx_hash,
+                    source_output_index=coin.tx_pos,
+                    unlocking_script_template=_p2pkh_unlock(wallet._private_key),
+                )
+            ],
+            tx_outputs=[TransactionOutput(P2PKH().lock(recipient), coin.value - fee)],
+        )
+        tx.sign()
+        signed_size = len(tx.serialize())
+        if signed_size == size:
             return tx
-    return None
+        size = signed_size
+    raise AssertionError("could not settle on a signed size — the DER length never repeated")
 
 
-def _find_below_floor_sweep(wallet: RxdWallet, coins: list[UtxoRecord], floor: int, attempts: int = 60):
-    for _ in range(attempts):
-        tx = wallet.build_send_max_tx(coins, PrivateKey().public_key().address())
-        if _effective_rate(tx) < floor:
-            return tx
-    return None
+def test_a_fee_one_photon_under_the_floor_is_rejected(node):  # noqa: F811
+    """Negative control for the whole fee story, and the boundary it turns on.
+
+    Hand-build the same transaction twice: once paying exactly ``size × floor`` and
+    once paying one photon less. The node must take the first and refuse the
+    second. Without this, "every wallet send is accepted" would be satisfied by a
+    node that never rejects anything, and the fix below would prove nothing.
+
+    One photon, not a round number, because that is the real margin: the node's
+    check is ``nModifiedFees < GetEffectiveMinRelayFee(height).GetFee(nSize)``.
+    """
+    floor = _relay_floor(node)
+    wallet = _wallet(fee_rate=floor)
+    recipient = PrivateKey().public_key().address()
+
+    at_floor = _fee_at_exactly(wallet, _fund(node, wallet), recipient, lambda s: s * floor)
+    ok = node.accepts(at_floor.serialize().hex())
+    assert ok.get("allowed") is True, (
+        f"node refused a fee EXACTLY at its own floor — the control is miscalibrated: {ok}"
+    )
+
+    short = _fee_at_exactly(wallet, _fund(node, wallet), recipient, lambda s: s * floor - 1)
+    size, fee = len(short.serialize()), short.get_fee()
+    assert fee == size * floor - 1, "the control did not land exactly one photon short"
+
+    res = node.accepts(short.serialize().hex())
+    assert res.get("allowed") is False, (
+        f"node ACCEPTED a fee one photon under its own floor ({fee} on {size} bytes at {floor}/byte): {res}"
+    )
+    reason = str(res.get("reject-reason", ""))
+    assert "min relay fee not met" in reason, f"rejected, but not for the fee: {res}"
+    print(f"one photon short: size={size} fee={fee} (floor {size * floor}) -> {reason}")
 
 
-def test_defect_build_send_tx_can_emit_a_below_relay_floor_transaction(node):  # noqa: F811
-    """DEFECT, node-proven: ``build_send_tx`` underpays the rate it was built for.
+def test_every_send_pays_at_least_the_rate_it_was_built_for(node):  # noqa: F811
+    """REGRESSION: the invariant both builders must hold, judged by the node.
 
-    The fee is ``trial_size * fee_rate`` where ``trial_size`` is measured on a
-    TRIAL signing pass (``wallet.py`` lines 244-247). The final pass re-signs over
-    different outputs, producing a different DER signature — 71 or 72 bytes,
-    roughly evenly split — and the final transaction is never re-measured. When
-    the final signature is the longer one the transaction contains more bytes
-    than it paid for.
+    Builds at the node's OWN advertised floor — so the node is the oracle for its
+    own policy — and requires every result to relay. This was a ``strict=True``
+    xfail while the fee was sized off the trial signing pass and the final signed
+    transaction was never re-measured; roughly a third of builds paid below the
+    requested rate. ``pyrxd.fee_sizing`` now adds per-input signature headroom and
+    re-measures the final transaction, and the marker is gone.
 
-    Measured offline over 2000 builds at the default rate: 27.1% of one-input
-    sends and 34.5% of three-input sends land short by at least a byte.
+    40 rounds each, with a different recipient every time. Signing is deterministic
+    (RFC 6979), so whether a transaction underpays is a fixed property of that
+    transaction rather than a per-run coin flip — one hard-coded send would have
+    passed forever while a third of real ones failed.
 
-    This test builds at the NODE'S OWN advertised floor so the node itself is the
-    judge, then asserts it refuses the result. ``DEFAULT_FEE_RATE`` is exactly the
-    mainnet relay floor, so on mainnet the same shortfall is the same rejection —
-    and with neither RBF nor CPFP on Radiant, an underpaid transaction cannot be
-    fee-bumped, only abandoned.
+    ``DEFAULT_FEE_RATE`` is exactly the mainnet relay floor, so what the regtest
+    node refuses here is what mainnet refuses — and with neither RBF nor CPFP,
+    such a transaction cannot be fee-bumped, only abandoned for 8 hours.
     """
     assert DEFAULT_FEE_RATE == 10_000, "the mainnet-floor assumption in this test's reasoning has moved"
-    floor = _relay_floor(node)
-    wallet = _wallet(fee_rate=floor)
-    coin = _fund(node, wallet)
-
-    tx = _find_below_floor_send(wallet, coin, floor)
-    assert tx is not None, "no below-floor build in 60 attempts — has the fee sizing been fixed?"
-
-    size, fee = len(tx.serialize()), tx.get_fee()
-    res = node.accepts(tx.serialize().hex())
-    assert res.get("allowed") is False, (
-        f"node accepted a {fee}-photon fee on {size} bytes at a {floor}/byte floor — expected a rejection: {res}"
-    )
-    reason = str(res.get("reject-reason", ""))
-    assert "min relay fee not met" in reason, f"rejected, but not for the fee: {res}"
-    print(f"build_send_tx below-floor: size={size} fee={fee} rate={fee / size:.2f} (floor {floor}) -> {reason}")
-
-
-def test_defect_build_send_max_tx_can_emit_a_below_relay_floor_transaction(node):  # noqa: F811
-    """DEFECT, node-proven: ``build_send_max_tx`` has the same unmeasured-final-pass bug.
-
-    Same mechanism as the send case (``wallet.py`` lines 295-302): the fee comes
-    from the trial serialisation and the final signed transaction is never
-    re-measured. Measured offline over 2000 two-input sweeps: 31.6% short.
-
-    This one is worse in practice — a sweep has no change output to absorb an
-    adjustment, so a caller who has been told "this is your whole balance" gets a
-    transaction the network will not carry.
-    """
-    floor = _relay_floor(node)
-    wallet = _wallet(fee_rate=floor)
-    coins = [_fund(node, wallet, 300_000_000), _fund(node, wallet, 200_000_000)]
-
-    tx = _find_below_floor_sweep(wallet, coins, floor)
-    assert tx is not None, "no below-floor sweep in 60 attempts — has the fee sizing been fixed?"
-
-    size, fee = len(tx.serialize()), tx.get_fee()
-    res = node.accepts(tx.serialize().hex())
-    assert res.get("allowed") is False, (
-        f"node accepted a {fee}-photon fee on {size} bytes at a {floor}/byte floor — expected a rejection: {res}"
-    )
-    reason = str(res.get("reject-reason", ""))
-    assert "min relay fee not met" in reason, f"rejected, but not for the fee: {res}"
-    print(f"build_send_max_tx below-floor: size={size} fee={fee} rate={fee / size:.2f} (floor {floor}) -> {reason}")
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "DEFECT: fee is sized off the trial signing pass and the final signed transaction is never "
-        "re-measured, so ~30% of builds pay below the requested rate. Remove this marker when fixed."
-    ),
-)
-def test_every_send_pays_at_least_the_rate_it_was_built_for(node):  # noqa: F811
-    """The invariant both builders SHOULD hold, stated as a strict xfail.
-
-    Builds at the node's own floor and requires every result to relay. When the
-    fee sizing is fixed this XPASSes, and ``strict=True`` turns that into a
-    failure so the marker gets removed rather than quietly outliving the bug.
-    """
     floor = _relay_floor(node)
     wallet = _wallet(fee_rate=floor)
     coin = _fund(node, wallet)
@@ -595,6 +593,42 @@ def test_every_send_pays_at_least_the_rate_it_was_built_for(node):  # noqa: F811
         sweep = wallet.build_send_max_tx(sweep_coins, PrivateKey().public_key().address())
         assert _effective_rate(sweep) >= floor, f"sweep paid {_effective_rate(sweep):.2f}/byte"
         assert node.accepts(sweep.serialize().hex()).get("allowed") is True
+
+
+@pytest.mark.parametrize("n_inputs", [1, 3])
+def test_multi_input_sends_and_sweeps_all_relay_at_the_floor(node, n_inputs):  # noqa: F811
+    """The same regression across input counts — the shortfall grew with them.
+
+    Offline measurement before the fix: 25.4% short at one input rising to 36.8%
+    at five, because each extra input is another signature that can change length.
+    Every build here is put to the node, and one of each is actually confirmed so
+    the acceptance is not only ``testmempoolaccept``.
+    """
+    floor = _relay_floor(node)
+    wallet = _wallet(fee_rate=floor)
+    coins = [_fund(node, wallet, 300_000_000) for _ in range(n_inputs)]
+    sweep_wallet = _wallet(fee_rate=floor)
+    sweep_coins = [_fund(node, sweep_wallet, 300_000_000) for _ in range(n_inputs)]
+
+    for _ in range(25):
+        tx = wallet.build_send_tx(coins, PrivateKey().public_key().address(), 200_000_000 * n_inputs)
+        res = node.accepts(tx.serialize().hex())
+        assert res.get("allowed") is True, (
+            f"node refused a {n_inputs}-input send built at its own floor: {res} "
+            f"(size {len(tx.serialize())}, fee {tx.get_fee()})"
+        )
+        sweep = sweep_wallet.build_send_max_tx(sweep_coins, PrivateKey().public_key().address())
+        res = node.accepts(sweep.serialize().hex())
+        assert res.get("allowed") is True, (
+            f"node refused a {n_inputs}-input sweep built at its own floor: {res} "
+            f"(size {len(sweep.serialize())}, fee {sweep.get_fee()})"
+        )
+
+    confirmed = _confirm(node, wallet.build_send_tx(coins, PrivateKey().public_key().address(), 200_000_000 * n_inputs))
+    assert _chain_fee(node, confirmed) >= confirmed["size"] * floor, "a CONFIRMED send was under the floor"
+
+    swept = _confirm(node, sweep_wallet.build_send_max_tx(sweep_coins, PrivateKey().public_key().address()))
+    assert _chain_fee(node, swept) >= swept["size"] * floor, "a CONFIRMED sweep was under the floor"
 
 
 def test_a_one_photon_output_relays_so_546_is_policy_not_consensus(node):  # noqa: F811

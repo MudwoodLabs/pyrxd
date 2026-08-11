@@ -67,6 +67,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from pyrxd.fee_sizing import (
+    SIG_SIZE_SLACK_BYTES,
+    assert_pays_for_its_size,
+    relay_floor_photons_per_byte,
+    trial_size_with_slack,
+)
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
 
@@ -74,10 +80,11 @@ from .royalty import RoyaltyPayout, royalty_output_scripts, royalty_payouts
 from .script import build_ft_locking_script, extract_ref_from_ft_script, is_ft_script
 from .types import GlyphRef, GlyphRoyalty
 
-# Post-V2 relay minimum — mirrored from builder.py to avoid an import cycle.
-# Numerically identical to ``gravity.fee_policy.RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB``
-# (10_000_000 per kB); see ``_check_fee_rate`` for the binding.
-MIN_FEE_RATE: int = 10_000  # photons / byte
+# Post-V2 relay minimum, DERIVED from the one definition of Radiant's effective
+# relay floor (10_000_000 photons/kB) rather than restated — see
+# :mod:`pyrxd.fee_sizing`, which now owns that constant precisely so the wallet,
+# the glyph builders and the swap stack cannot drift apart on it.
+MIN_FEE_RATE: int = relay_floor_photons_per_byte()  # photons / byte
 DUST_LIMIT: int = 546  # photons, standard relay dust threshold
 
 # A pyrxd ergonomics guard, NOT a chain rule. Radiant's ``MAX_STANDARD_TX_SIZE``
@@ -91,29 +98,12 @@ DUST_LIMIT: int = 546  # photons, standard relay dust threshold
 MAX_AIRDROP_RECIPIENTS: int = 1000
 
 # Per-input headroom added to the trial-pass size before the fee is computed.
-#
-# The trial and final passes sign DIFFERENT messages (the final commits to the
-# real output values), so their DER signatures can differ in length — low-S
-# normalisation puts a P2PKH sig at roughly 70-72 bytes, and the leading zero
-# byte on `r` or `s` comes and goes with the nonce. A fee sized purely off the
-# trial can therefore land 1-2 bytes per input BELOW the rate it was built for.
-# Under normal circumstances that is a rounding curiosity; at the relay floor it
-# is the difference between relayed and not, and Radiant has neither RBF nor
-# CPFP to fix it afterwards (threat-model S21) — the transaction would simply sit
-# on its inputs until mempool expiry, 8 hours later.
-#
-# 3 bytes per input, not 2: a DER signature is usually 71 or 72 bytes, but both
-# `r` and `s` can shed their leading zero at once, giving 69 — so the worst-case
-# growth from trial to final is 3 bytes per input, not 2. A review measured a
-# 1000-recipient/2-input build clearing the required fee by a factor of 1.000047
-# at 2 bytes: the whole margin was the slack, and one unlucky trial signature
-# would have consumed it. Overpaying by at most 3 * fee_rate photons per input is
-# the correct trade against a transaction that cannot be repaired.
-#
-# ``build_airdrop_tx`` re-checks the built transaction against the rate
-# afterwards, so this bound is asserted rather than assumed — if it is ever
-# wrong, the builder raises instead of returning something unbroadcastable.
-_SIG_SIZE_SLACK_BYTES: int = 3
+# The reasoning, the measurements and the value now live in :mod:`pyrxd.fee_sizing`,
+# which is the single implementation of this rule for every builder in the SDK —
+# this module, the swap CLI, and (as of the fee-undersizing fix) ``pyrxd.wallet``.
+# Re-bound here rather than re-derived so the name keeps working for callers and
+# tests that reference it.
+_SIG_SIZE_SLACK_BYTES: int = SIG_SIZE_SLACK_BYTES
 
 
 def _check_fee_rate(fee_rate: int) -> None:
@@ -125,19 +115,16 @@ def _check_fee_rate(fee_rate: int) -> None:
     hours later. That makes a sub-floor rate a fund-safety bug, not a tuning
     mistake, which is why this refuses rather than warns.
 
-    The floor is taken from :mod:`pyrxd.gravity.fee_policy` rather than restated,
-    so the glyph and swap stacks cannot drift apart. Imported lazily — the swap
-    stack is not otherwise on the glyph import path.
+    The floor is taken from :mod:`pyrxd.fee_sizing` rather than restated, so the
+    wallet, glyph and swap stacks cannot drift apart on it.
     """
     if isinstance(fee_rate, bool) or not isinstance(fee_rate, int):
         raise ValueError(f"fee_rate must be an int (photons/byte), got {type(fee_rate).__name__}")
-    from pyrxd.gravity.fee_policy import RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
-
-    floor_per_byte = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB // 1000
+    floor_per_byte = relay_floor_photons_per_byte()
     if fee_rate < floor_per_byte:
         raise ValueError(
             f"fee_rate must be >= {floor_per_byte} photons/byte (Radiant's effective relay floor of "
-            f"{RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB} per kB), got {fee_rate}. A transaction built "
+            f"{floor_per_byte * 1000} per kB), got {fee_rate}. A transaction built "
             "below the floor will not relay, and Radiant has no RBF and no CPFP — it cannot be "
             "fee-bumped and will hold its inputs until mempool expiry."
         )
@@ -708,7 +695,7 @@ class FtUtxoSet:
         #    fixed-width 8 bytes, so a provisional value does not change the size.
         trial_tx = Transaction(tx_inputs=_make_inputs(), tx_outputs=_make_outputs(dust_limit))
         trial_tx.sign()
-        size = trial_tx.byte_length() + _SIG_SIZE_SLACK_BYTES * (len(selected) + len(funding))
+        size = trial_size_with_slack(trial_tx.byte_length(), len(selected) + len(funding))
         fee = size * fee_rate
 
         remainder = rxd_budget - fee - royalty_total
@@ -737,16 +724,16 @@ class FtUtxoSet:
         #    a fee sized purely off the trial can land BELOW the floor. That is
         #    unfixable on Radiant — no RBF, no CPFP — so failing here beats
         #    broadcasting. `_SIG_SIZE_SLACK_BYTES` is what should make this
-        #    unreachable; this is what proves it, rather than trusting it.
-        final_size = final_tx.byte_length()
+        #    unreachable; this is what proves it, rather than trusting it. Shared
+        #    with ``pyrxd.wallet`` so the two builders cannot drift apart on the
+        #    check or on what it demands.
         actual_fee = ft_value_in + funding_total - sum(o.satoshis for o in final_tx.outputs)
-        if actual_fee < final_size * fee_rate:  # pragma: no cover — the slack bound should prevent this
-            raise ValueError(
-                f"internal fee-sizing invariant violated: the built transaction is {final_size} bytes "
-                f"and pays {actual_fee} photons, below {final_size * fee_rate} at {fee_rate} ph/B. "
-                "Refusing to return an unrelayable transaction — Radiant has no RBF and no CPFP, so "
-                "it could not be fee-bumped."
-            )
+        assert_pays_for_its_size(
+            size_bytes=final_tx.byte_length(),
+            fee_paid=actual_fee,
+            fee_rate=fee_rate,
+            what="build_airdrop_tx",
+        )
         return FtAirdropResult(
             tx=final_tx,
             recipient_scripts=recipient_scripts,
