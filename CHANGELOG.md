@@ -6,6 +6,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`web3` was required by five integration suites and declared nowhere**, so
+  `tests/test_xchain_eth_*.py` ran only if a developer happened to have it installed and
+  silently skipped otherwise. It is now declared in the `test` dependency group.
+
+  Declaring it exposed a real conflict: every `web3` 7.x caps `websockets<16.0.0`, while
+  pyrxd required `websockets>=16.1.1`. **The floor was not load-bearing.** 0.2.0 deliberately
+  widened this same constraint to `>=15.0.1`, recording that pyrxd uses only the stable
+  websockets API (`connect`/`send`/`recv`/`close`/`WebSocketException`) common to versions 13
+  through 16, and that a narrow floor "locked out coexistence with libraries pinned to
+  `websockets <=15.0.1`". A routine dependency-floor raise in #343 silently reverted that
+  decision, and web3 became the library it locked out.
+
+  The floor is restored to `>=15.0.1,<17.0.0`, now with the reason recorded in `pyproject.toml`
+  so the next floor bump does not repeat it. This is not a security regression: both websockets
+  advisories in OSV are fixed far below the floor (GHSA-6g87-ff9q-v847 in 5.0,
+  GHSA-8ch4-58qp-g3mp in 9.1). Verified by installing pyrxd, `web3` 7.16.0 and
+  `websockets` 15.0.1 into one environment — the combination resolves, all three import, and
+  the network suite passes (235 tests).
+
 ### Removed
 
 - **`GlyphBuilder.prepare_container_reveal(child_ref=...)` — breaking-class, fund-safety.**
