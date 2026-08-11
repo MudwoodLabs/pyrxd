@@ -502,7 +502,6 @@ def test_the_nft_output_is_spendable(node):  # noqa: F811
 
 
 def _mod_tx(
-    rt: _RegtestNode,
     minted: dict,
     new_cbor: bytes,
     *,
@@ -580,7 +579,7 @@ def test_mod_installs_a_new_payload_hash_on_chain(node, mut):  # noqa: F811
     new_cbor, new_hash = encode_payload(new_metadata)
     assert new_hash != hash_payload(mut["cbor"]), "the mutation must actually change the payload"
 
-    tx = _mod_tx(node, mut, new_cbor)
+    tx = _mod_tx(mut, new_cbor)
     raw = _assert_fee_covers(tx, _FEE)
     res = node.accepts(raw)
     assert res.get("allowed") is True, f"mod spend of the mutable contract REJECTED: {res}"
@@ -624,7 +623,7 @@ def test_mod_against_a_plain_nft_token_output_is_rejected(node):  # noqa: F811
         GlyphMetadata(protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT], name="REGTEST-MUTABLE", description="v2")
     )
     plain = build_nft_locking_script(Hex20(minted["key"].public_key().hash160()), minted["ref"])
-    tx = _mod_tx(node, minted, new_cbor, token_script_override=plain)
+    tx = _mod_tx(minted, new_cbor, token_script_override=plain)
 
     res = node.accepts(_assert_fee_covers(tx, _FEE))
     assert res.get("allowed") is False, f"consensus ACCEPTED a mod with a stateless token output: {res}"
@@ -651,7 +650,7 @@ def test_mod_that_lies_about_the_new_payload_hash_is_rejected(node):  # noqa: F8
     # scriptSig announces new_cbor; the contract output installs a hash of
     # something else entirely.
     liar = build_mutable_nft_script(minted["mutable_ref"], other_hash)
-    tx = _mod_tx(node, minted, new_cbor, contract_script_override=liar)
+    tx = _mod_tx(minted, new_cbor, contract_script_override=liar)
 
     res = node.accepts(_assert_fee_covers(tx, _FEE))
     assert res.get("allowed") is False, f"consensus ACCEPTED a mod whose state does not hash its own payload: {res}"
