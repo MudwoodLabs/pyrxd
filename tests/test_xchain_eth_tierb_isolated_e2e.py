@@ -144,12 +144,15 @@ class TestEthTierBIsolated:
             # 1. Maker publishes ONLY the public envelope (H, amounts, timelocks). No p.
             maker.publish_envelope(wire, terms)
 
-            # 2. Taker funds the ETH HTLC from the wire envelope.
-            await taker.fund_eth(wire, url)
-
-            # 3. Maker locks the RXD covenant; advertises ONLY its SPK. Taker re-reads the chain and
-            #    re-validates → BOTH_LOCKED.
+            # 2. Maker locks the RXD covenant (mined); advertises ONLY its SPK. HZ-1 puts this
+            #    BEFORE the taker's lock — and note the taker never has to trust the advertised SPK:
+            #    its pre-lock gate re-derives the covenant SPK from the wire ENVELOPE (terms) and
+            #    reads the chain for that. The advertised SPK is only what revalidate compares against.
             locked_at = maker.lock_rxd(node, wire, terms)
+
+            # 3. Taker funds the ETH HTLC from the wire envelope, then re-reads the chain and
+            #    re-validates the maker's advertised SPK → BOTH_LOCKED.
+            await taker.fund_eth(wire, url)
             assert await taker.revalidate_lock(wire, url) is SwapState.BOTH_LOCKED
 
             # 4. Maker claims the ETH, revealing p ON-CHAIN (p never crosses the wire).
@@ -181,9 +184,12 @@ class TestEthTierBIsolated:
         taker = _TakerContext(coord)
 
         try:
+            # HZ-1 order: the maker locks the covenant (mined) before the taker funds ETH. The
+            # scenario is a maker that stalls AFTER both legs are locked — it never claims and never
+            # reveals p; it does not (and post-HZ-1 could not usefully) skip its own lock.
             maker.publish_envelope(wire, terms)
-            await taker.fund_eth(wire, url)
             maker.lock_rxd(node, wire, terms)
+            await taker.fund_eth(wire, url)
             assert await taker.revalidate_lock(wire, url) is SwapState.BOTH_LOCKED
 
             # The maker STALLS (never calls claim_eth). The taker recovers safely: mature both legs

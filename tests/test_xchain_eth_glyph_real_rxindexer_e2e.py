@@ -472,18 +472,33 @@ class TestEthRealGlyphSwap:
             radiant_leg=rxd_leg,
             indexer=indexer,
             seen_store=_MemSeen(),
-            config=CoordinatorConfig(margin_policy=_eth_policy(), accept_nondurable_seen=True),
+            # accept_estimated_eth_margins: this e2e runs the estimated _eth_policy()
+            # (is_measured=False) on a value-bearing (anvil) counter-leg; the MEDIUM-1 guard (#192)
+            # refuses that unless the operator opts in — the same explicit hatch the sibling ETH
+            # e2e and the dust harnesses use. No real value moves (regtest + anvil devnet keys).
+            # NOTE: this opt-in was added to the sibling suite in #192 but missed here, so this
+            # suite has failed at coordinator construction ever since — unrelated to HZ-1 ordering.
+            config=CoordinatorConfig(
+                margin_policy=_eth_policy(),
+                accept_nondurable_seen=True,
+                accept_estimated_eth_margins=True,
+            ),
         )
 
         now_unix = _anvil_now(url)
-        # 3. Taker deploys + funds the ETH HTLC on Anvil.
-        rec = await coord.taker_funds_btc(terms, now_unix_s=now_unix)
-        assert rec.state is SwapState.BTC_LOCKED
-
-        # 4. Maker locks the REAL minted singleton into the covenant; taker re-validates SPK + REF
-        #    (through the REAL RXinDexer) + cross-clock.
+        # 3. MAKER locks the REAL minted singleton into the covenant FIRST, and it is mined (HZ-1).
+        #    The taker's pre-lock gate then reads the Radiant chain for this exact covenant SPK
+        #    before any ETH is deployed. Note this also means the gate's REF-authenticity step
+        #    (through the REAL RXinDexer) now resolves the genesis ref AFTER the singleton has moved
+        #    into the covenant — the ref is a genesis-outpoint IDENTITY, not the token's current
+        #    location, so it must still resolve; that is part of what this suite proves.
         asset_locked_at = int(node.rxd("getblockcount"))
         _spend_singleton_into_covenant(node, cov.funded_spk, carrier, minted=minted)
+
+        # 4. Taker deploys + funds the ETH HTLC on Anvil against the verified covenant, then
+        #    re-validates SPK + REF + cross-clock.
+        rec = await coord.taker_funds_btc(terms, now_unix_s=now_unix)
+        assert rec.state is SwapState.BTC_LOCKED
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
         assert rec.state is SwapState.BOTH_LOCKED
 

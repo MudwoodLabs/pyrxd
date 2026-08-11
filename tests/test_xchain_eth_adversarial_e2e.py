@@ -39,12 +39,13 @@ pytest.importorskip("eth_keys")
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import hashlib
+import json
 import os
 
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.swap_coordinator import taker_refund_window_open
 from pyrxd.gravity.swap_state import SwapState
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import ValidationError
 
 # Reuse the real chain harness from the happy-path e2e (one source of truth for the node/anvil/legs).
 from tests.test_xchain_eth_swap_regtest_e2e import (
@@ -110,11 +111,14 @@ class TestEthAdversarial:
         terms = coord.record.terms
 
         try:
-            # 1. Taker funds ETH; maker locks RXD → BOTH_LOCKED.
-            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
-            assert rec.state is SwapState.BTC_LOCKED
+            # 1. Maker locks RXD (mined) FIRST, then the taker funds ETH → BOTH_LOCKED. HZ-1: the
+            #    taker's pre-lock gate reads the covenant on the real Radiant chain before locking.
+            #    The scenario is a maker that STALLS AFTER both legs are locked — it must still lock,
+            #    which is precisely what makes the stall a grief rather than an outright theft.
             asset_locked_at = int(node.rxd("getblockcount"))
             _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BTC_LOCKED
             rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
             assert rec.state is SwapState.BOTH_LOCKED
 
@@ -178,10 +182,12 @@ class TestEthAdversarial:
         adversary = _AdversaryActor(coord, p_secret)
 
         try:
-            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
-            assert rec.state is SwapState.BTC_LOCKED
+            # HZ-1: maker locks RXD (mined) first, then the taker funds ETH against a verified
+            # covenant. The attack under test is the FINALITY of the maker's reveal, not its lock.
             asset_locked_at = int(node.rxd("getblockcount"))
             _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BTC_LOCKED
             rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
             assert rec.state is SwapState.BOTH_LOCKED
 
@@ -217,18 +223,25 @@ class TestEthAdversarial:
     async def test_S3_hostile_maker_wrong_covenant_taker_fails_closed(self, env):
         """S3: a hostile maker funds a covenant with the WRONG parameters (a different hashlock → a
         different SPK than the negotiated terms imply) instead of the agreed one. The honest taker
-        re-derives the EXPECTED SPK from terms and looks for THAT on-chain; the agreed covenant was
-        never funded, so the lookup fails closed — the taker never advances to BOTH_LOCKED and its
-        ETH stays refundable. (The narrower PARAMS_MISMATCH state is for an expected-SPK-funded-but-
-        mismatched lock; either way the safety invariant is: the taker does NOT enter BOTH_LOCKED.)"""
+        re-derives the EXPECTED SPK from terms and looks for THAT on-chain.
+
+        Post-HZ-1 this decoy is caught at TWO independent layers, and the test proves both:
+
+          A. the PRE-LOCK gate (``taker_funds_btc``) reads the Radiant chain for the agreed SPK,
+             finds nothing, and REFUSES to fund the ETH leg at all — so against a maker that only
+             ever funds a decoy the taker's ETH is never even locked (strictly stronger than the
+             pre-HZ-1 outcome, where the taker locked ETH and had to wait out the timeout);
+          B. if the maker then ALSO funds the agreed covenant (so the taker legitimately locks) but
+             keeps REPORTING the decoy SPK, ``post_asset_lock_revalidate`` still validates against
+             the taker's OWN re-derived SPK → PARAMS_MISMATCH, never BOTH_LOCKED, and the taker
+             refunds its ETH → ABORTED.
+
+        Either way the safety invariant is unchanged: the taker does NOT enter BOTH_LOCKED."""
         node, url = env
-        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, cov, _p, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
         terms = coord.record.terms
 
         try:
-            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
-            assert rec.state is SwapState.BTC_LOCKED
-
             # The hostile maker funds a DIFFERENT covenant (a fresh hashlock → a different SPK), NOT
             # the agreed one. The agreed-terms SPK (cov.funded_spk) is therefore never funded.
             wrong_h = hashlib.sha256(os.urandom(32)).digest()
@@ -242,10 +255,24 @@ class TestEthAdversarial:
             assert wrong_cov.funded_spk != cov.funded_spk
             _rxd_pay(node, wrong_cov.funded_spk, terms.radiant_amount)
 
-            # The honest taker validates against the AGREED terms (it re-derives the expected SPK and
-            # looks for it on-chain). The agreed covenant was never funded → fail closed.
-            with pytest.raises((ValidationError, NetworkError)):
-                await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
+            # LAYER A — the pre-lock gate refuses: the agreed SPK holds no funded UTXO, so the taker
+            # never locks ETH against the decoy. Nothing was deployed and the FSM never left
+            # NEGOTIATED, so the taker has NOTHING at risk and nothing to refund.
+            with pytest.raises(ValidationError, match="pre-BTC-lock gate refused funding"):
+                await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert coord.record.state is SwapState.NEGOTIATED
+            assert eth_leg.last_funded_locator is None, "the taker must not have deployed/funded any ETH HTLC"
+
+            # LAYER B — now the maker ALSO funds the AGREED covenant, so the gate legitimately passes
+            # and the taker locks. The maker still LIES about which SPK it used (it reports the
+            # decoy). The taker validates against its OWN re-derived SPK → PARAMS_MISMATCH.
+            _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BTC_LOCKED
+            rec = await coord.post_asset_lock_revalidate(wrong_cov.funded_spk, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.PARAMS_MISMATCH, (
+                f"a maker-reported SPK that != the taker's re-derived SPK must be PARAMS_MISMATCH, got {rec.state.value}"
+            )
 
             # SAFETY: the taker never reached BOTH_LOCKED. Its ETH HTLC is refundable once the ETH
             # timeout passes (the refund is timelocked — the decision to abort is immediate, the
@@ -268,10 +295,12 @@ class TestEthAdversarial:
         terms = coord.record.terms
 
         try:
-            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
-            assert rec.state is SwapState.BTC_LOCKED
+            # HZ-1: maker locks RXD (mined) first, then the taker funds ETH. The attack under test
+            # is the maker TIMING its reveal into the closing t_rxd window, not a missing lock.
             asset_locked_at = int(node.rxd("getblockcount"))
             _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            assert rec.state is SwapState.BTC_LOCKED
             rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
             assert rec.state is SwapState.BOTH_LOCKED
 
@@ -303,11 +332,15 @@ class TestEthAdversarial:
         terms = coord.record.terms
 
         try:
-            # The taker funds the ETH HTLC for real (deploy+verify against the true terms).
-            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
-            assert rec.state is SwapState.BTC_LOCKED
-            locator = eth_leg.last_funded_locator
+            # The HOSTILE taker funds the ETH HTLC for real, driving its OWN leg directly rather
+            # than the honest coordinator — which is what a hostile taker actually does, and which
+            # (post-HZ-1) is also the only way to get a taker-funded HTLC on chain without the
+            # maker having locked the asset first. The maker-side property under test is
+            # verify_funded's fail-closed behaviour; it reads only the ETH chain.
+            locator = await eth_leg.fund(terms)
             assert locator is not None
+            assert eth_leg.last_funded_locator is not None
+            assert coord.record.state is SwapState.NEGOTIATED, "the honest maker has locked nothing"
             # verify_funded lives on the inner EthHtlcContractLeg (EthLeg wraps it as ._leg; the
             # recorder wraps EthLeg as ._inner). The honest MAKER calls it to independently re-verify
             # the taker's on-chain HTLC before locking RXD.
@@ -325,28 +358,43 @@ class TestEthAdversarial:
             await rpc.close()
 
     async def test_S6_lying_counterparty_caught_by_own_chain_read(self, env):
-        """S6: the counterparty LIES about on-chain state — it claims the RXD asset is locked, but
-        reports a fabricated covenant SPK that was never funded. The honest taker re-reads the chain
-        ITSELF (never trusts the peer's word): the unfunded SPK has no covenant outpoint, so the
-        revalidate fails closed rather than advancing to BOTH_LOCKED."""
+        """S6: the counterparty LIES about on-chain state — it says "the RXD asset is locked" while
+        funding NOTHING. The honest taker re-reads the chain ITSELF and never trusts the peer's word.
+
+        Post-HZ-1 that chain read happens BEFORE the taker locks, not after: the pre-lock gate looks
+        for the agreed covenant SPK, finds no funded UTXO, and refuses to fund the ETH leg. So the
+        pure "I locked it (I didn't)" lie now costs the taker NOTHING — it never locks, rather than
+        locking and then discovering the lie with its ETH already committed. This is the same safety
+        property the test always encoded (own chain read beats the peer's claim), enforced one step
+        earlier and strictly more cheaply.
+
+        The later ``post_asset_lock_revalidate`` layer is still exercised as defence-in-depth: see
+        S3 layer B (maker-reported SPK != the taker's re-derived SPK → PARAMS_MISMATCH) and, offline,
+        tests/test_swap_coordinator.py."""
         node, url = env
-        coord, cov, _p, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
+        coord, cov, _p, eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12, asset_variant="rxd")
         terms = coord.record.terms
 
         try:
-            rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
-            assert rec.state is SwapState.BTC_LOCKED
-
             # The maker LIES: it never funds anything, but tells the taker "I locked it at <this SPK>".
-            # The honest taker observes the REAL chain for that SPK. The correct SPK was never funded,
-            # so there is no covenant outpoint → fail closed (the taker does NOT enter BOTH_LOCKED).
-            with pytest.raises((ValidationError, Exception)):
-                rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
-                # If it returned instead of raising, it must NOT be BOTH_LOCKED.
-                assert rec.state is not SwapState.BOTH_LOCKED
-            # SAFETY: the taker never advanced to BOTH_LOCKED on a fabricated lock; its ETH stays
-            # refundable.
-            assert coord.record.state is not SwapState.BOTH_LOCKED
+            # The honest taker reads the REAL chain for the SPK it re-derived from its OWN terms.
+            # Nothing is funded there → the gate fails closed and NO ETH is locked.
+            assert (
+                node.rxd("scantxoutset", "start", json.dumps([{"desc": f"raw({cov.funded_spk.hex()})"}]))["unspents"]
+                == []
+            ), "precondition: the agreed covenant SPK really is unfunded"
+
+            with pytest.raises(ValidationError, match="pre-BTC-lock gate refused funding") as exc:
+                await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
+            # The refusal names the covenant check specifically — not some unrelated gate step.
+            assert "covenant" in str(exc.value), f"gate must refuse on the covenant read, got: {exc.value}"
+
+            # SAFETY: nothing was locked. The FSM never left NEGOTIATED, no ETH HTLC was deployed or
+            # funded, so the taker has no exposure at all and nothing to refund. The maker's lie
+            # bought it nothing.
+            assert coord.record.state is SwapState.NEGOTIATED
+            assert coord.record.counterchain_locator is None
+            assert eth_leg.last_funded_locator is None, "the taker must not have deployed/funded any ETH HTLC"
         finally:
             await rpc.close()
 

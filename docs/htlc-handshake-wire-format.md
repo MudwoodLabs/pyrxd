@@ -524,8 +524,16 @@ implementation. Threat model: [S24](threat-model.md). Tests:
 The FSM ordering is left as-is deliberately: it records *transitions*, and the safety requirement is
 a precondition on the taker's transition, not a different edge. **Note for anyone driving the
 coordinator:** the maker's covenant must be funded and buried before `taker_funds_btc` is called.
-The `-m integration` end-to-end suites still fund the covenant *after* that call (the pre-HZ-1
-order) and must be reordered before they will pass — see the CHANGELOG entry.
+
+The six `-m integration` end-to-end suites have been reordered to that rule and now run green
+against live regtest nodes (`tests/test_xchain_swap_regtest_e2e.py`,
+`tests/test_xchain_eth_swap_regtest_e2e.py`, `tests/test_xchain_eth_adversarial_e2e.py`,
+`tests/test_xchain_eth_active_adversary_e2e.py`, `tests/test_xchain_eth_tierb_isolated_e2e.py`,
+`tests/test_xchain_eth_glyph_real_rxindexer_e2e.py`). Two adversarial scenarios moved to a stronger
+assertion in the process — a maker that funds only a decoy covenant, and one that merely *claims* to
+have locked, are both now refused **before** the taker locks anything, so neither costs the taker a
+timeout wait — and the later `post_asset_lock_revalidate` layer is still exercised where the maker
+funds the agreed covenant but misreports its scriptPubKey. See the CHANGELOG entry.
 
 ### HZ-2: The version tag is written but never read
 
