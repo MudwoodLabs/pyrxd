@@ -35,8 +35,10 @@ from hypothesis import strategies as st
 
 from pyrxd.constants import REF_OPERAND_OPCODES
 from pyrxd.glyph.script import TruncatedScriptError, count_input_refs, iter_input_refs
+from pyrxd.glyph.soulbound_covenant import _assert_no_nonminimal_push
 from pyrxd.glyph.soulbound_detect import _opcodes as soulbound_opcodes
-from pyrxd.gravity.htlc_covenant import _opcode_bd_positions
+from pyrxd.gravity.htlc_covenant import _assert_minimal_pushes, _opcode_bd_positions
+from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction_preimage import _get_push_refs
 from tests.consensus_oracle import (
     opcode_table,
@@ -325,6 +327,119 @@ class TestShippedBugRegressions:
         script = b"\x26" + bytes([0xD0]) * 0x26 + bytes([0xD0]) + _REAL_REF
         assert _get_push_refs(script) == [_REAL_REF]
         assert _get_push_refs(script) == _reference_push_refs(script)
+
+
+# ---------------------------------------------------------------------------
+# The MINIMALDATA guards — the two walkers that assert rather than return
+# ---------------------------------------------------------------------------
+#
+# ``soulbound_covenant._assert_no_nonminimal_push`` and
+# ``htlc_covenant._assert_minimal_pushes`` walk a script the same way as everything
+# above, but their output is an exception rather than a list, so the differentials in
+# this file did not reach them. Both were listed in the ``_REF_WALKERS`` registry, which
+# gave them a green tick from ``test_walker_references_the_shared_constant`` they had not
+# earned: mutating the soulbound walker's ``i += 37`` to ``i += 1`` left the whole suite
+# green (7596 passed, 44 skipped, measured).
+#
+# A stride bug here is not silent. The 36 operand bytes get read as opcodes, and any
+# ``0x01`` inside a ref followed by a byte in 1..16 becomes a "non-minimal push" — so the
+# guard REFUSES TO BUILD a perfectly valid covenant, for one ref in roughly every eight.
+
+
+def _pushdata_floor(op: int) -> int:
+    """Smallest payload size for which ``op`` is the minimal PUSHDATA encoding."""
+    return {0x4C: 76, 0x4D: 256, 0x4E: 0x10000}[op]
+
+
+def _reference_rejects(script: bytes, *, any_pushdata_is_a_violation: bool) -> bool:
+    """Does the CONSENSUS tokenisation contain a push these guards must reject?
+
+    Derived from ``_reference_walk``, so the ref operand is skipped as one unit by
+    construction rather than by the rule under test.
+    """
+    for _pos, op, operand in _reference_walk(script):
+        if op == 0x01 and (1 <= operand[0] <= 16 or operand[0] == 0x81):
+            return True  # a 1-byte push of a value OP_1..OP_16/OP_1NEGATE encodes
+        if op in (0x4C, 0x4D, 0x4E) and (any_pushdata_is_a_violation or len(operand) < _pushdata_floor(op)):
+            return True
+    return False
+
+
+def _refuses(guard) -> bool:
+    try:
+        guard()
+    except ValidationError:
+        return True
+    return False
+
+
+#: Ref operands whose bytes, if read as opcodes, look like a MINIMALDATA violation.
+#: These are what a stride bug turns into a spurious build-time refusal — the plain
+#: ``_ADVERSARIAL_REFS`` above cannot see it, because 36 bytes of ``0xd0`` (or ``0x00``,
+#: or ``0xff``) each advance a broken walk by one and land on the very same offset.
+_MINIMALDATA_TRAP_REFS = [
+    b"\x01\x05" * 18,  # 1-byte push of 5 -> "must be OP_5"
+    b"\x01\x81" * 18,  # 1-byte push of OP_1NEGATE's encoding
+    bytes(range(_OPERAND_WIDTH)),  # 0x01 followed by 0x02
+    b"\x4c" + bytes(_OPERAND_WIDTH - 1),  # PUSHDATA1 inside the operand
+    b"\x4d" + bytes(_OPERAND_WIDTH - 1),  # PUSHDATA2 inside the operand
+    b"\x4b" + bytes(_OPERAND_WIDTH - 1),  # a 75-byte direct push claiming past the end
+]
+
+_trap_ref_element = st.tuples(
+    st.sampled_from(sorted(_OPERAND_OPS)),
+    st.one_of(st.sampled_from(_MINIMALDATA_TRAP_REFS), _ref_bytes),
+).map(lambda t: bytes([t[0]]) + t[1])
+
+_minimaldata_script = st.lists(
+    st.one_of(_trap_ref_element, _trap_ref_element, _bare_element, _direct_push, _pushdata1),
+    min_size=1,
+    max_size=8,
+).map(b"".join)
+
+
+class TestMinimalDataGuardsWalkLikeConsensus:
+    @pytest.mark.parametrize("ref", _MINIMALDATA_TRAP_REFS, ids=range(len(_MINIMALDATA_TRAP_REFS)))
+    @pytest.mark.parametrize("op", sorted(_OPERAND_OPS))
+    def test_a_ref_operand_is_never_read_as_a_push(self, op, ref):
+        """The regression, stated directly: operand bytes are DATA, whatever they spell.
+
+        Every script here is valid — one ref opcode with a well-formed 36-byte operand,
+        after a P2PKH prologue — so both guards must accept it. Under ``i += 1`` the
+        walk resumes inside the ref and reports a non-minimal push that is not there.
+        """
+        script = _P2PKH + bytes([op]) + ref
+        assert not _reference_rejects(script, any_pushdata_is_a_violation=True), "fixture must be clean"
+
+        _assert_no_nonminimal_push(script)  # must not raise
+        _assert_minimal_pushes(script, variant="test")  # must not raise
+
+    @settings(max_examples=300 * _BUDGET, suppress_health_check=[HealthCheck.too_slow], deadline=None)
+    @given(script=_minimaldata_script)
+    def test_soulbound_guard_matches_the_reference_verdict(self, script):
+        assert _refuses(lambda: _assert_no_nonminimal_push(script)) == _reference_rejects(
+            script, any_pushdata_is_a_violation=True
+        )
+
+    @settings(max_examples=300 * _BUDGET, suppress_health_check=[HealthCheck.too_slow], deadline=None)
+    @given(script=_minimaldata_script)
+    def test_htlc_guard_matches_the_reference_verdict(self, script):
+        assert _refuses(lambda: _assert_minimal_pushes(script, variant="test")) == _reference_rejects(
+            script, any_pushdata_is_a_violation=False
+        )
+
+    def test_the_guards_still_catch_a_real_non_minimal_push(self):
+        """Negative control: the agreement above must not be "both accept everything"."""
+        assert _refuses(lambda: _assert_no_nonminimal_push(_P2PKH + b"\x01\x05"))
+        assert _refuses(lambda: _assert_minimal_pushes(_P2PKH + b"\x01\x05", variant="test"))
+        # ...and the F-001 shape that motivated the HTLC guard: PUSHDATA1 under 76 bytes.
+        assert _refuses(lambda: _assert_minimal_pushes(_P2PKH + b"\x4c\x02\xaa\xbb", variant="test"))
+
+    def test_a_real_ref_bearing_covenant_prefix_is_accepted(self):
+        """The shape both guards actually run on in production."""
+        script = bytes([0xD1]) + _REAL_REF + _P2PKH + bytes([0xD8]) + _REAL_REF
+        _assert_no_nonminimal_push(script)
+        _assert_minimal_pushes(script, variant="test")
 
 
 # ---------------------------------------------------------------------------

@@ -495,35 +495,73 @@ def test_fee_paid_matches_the_fee_the_builder_reported(node, n_coins):  # noqa: 
 # --------------------------------------------------------------------------- the relay floor
 
 
+#: How many distinct nLockTime values ``_fee_at_exactly`` may try before giving up.
+#: Each one is an independent redraw of the DER length; one attempt settles ~75% of
+#: the time, so 200 puts the give-up probability at 0.245**200 — nil.
+_FEE_GRIND_ATTEMPTS = 200
+
+#: Iterations of the size fixed point within a single nLockTime. The size can only
+#: move between two adjacent values (the DER length is 71 or 72 bytes), so a run that
+#: has not settled in this many steps is oscillating and never will.
+_FEE_SIZE_STEPS = 8
+
+
 def _fee_at_exactly(wallet: RxdWallet, coin: UtxoRecord, recipient: str, fee_of_size) -> Transaction:
     """A hand-built 1-in/1-out P2PKH send paying exactly ``fee_of_size(its own size)``.
 
     Built OUTSIDE ``RxdWallet``'s fee sizing on purpose: this is how the negative
     control produces the below-floor transaction that the builders no longer will.
-    Signing is re-run until the assumed size matches the signed size, because the
-    DER signature length is not fixed — which is the very thing that made the
-    builders underpay.
+
+    Why the nLockTime grind
+    -----------------------
+    The obvious construction — assume a size, derive the fee, sign, adopt the signed
+    size, repeat — has no fixed point for roughly a quarter of keys. The fee sets the
+    output value, the output value goes into the sighash, the sighash sets the
+    signature, and the DER signature length is 71 or 72 bytes. So the map can be a
+    two-cycle: assuming 191 signs to 192 and assuming 192 signs to 191, forever.
+    Measured offline over 400 fresh keys: 98 non-convergent (24.5%), 97 of them the
+    191/192 pair. This helper is called twice per run, so the negative control failed
+    about 44% of the time with ``AssertionError("could not settle on a signed size")``
+    — and it is the ONLY control proving the node rejects anything, so losing it
+    would leave "every wallet send is accepted" satisfiable by a node that accepts
+    everything.
+
+    nLockTime breaks the cycle. It is four bytes at every value, so it cannot change
+    the size; and every input carries ``TRANSACTION_SEQUENCE`` (0xFFFFFFFF), so the
+    transaction is final and the locktime is never enforced — it is valid at any
+    value. Each value is a fresh sighash and so an independent redraw of the DER
+    length. Signing is RFC 6979, so this is deterministic, not a retry loop: the same
+    coin and key always produce the same transaction. Offline over 800 calls: zero
+    give-ups, locktime 0 sufficed 604 times and 5 was the worst case.
+
+    The fee is still EXACTLY ``fee_of_size(len(tx.serialize()))`` — the boundary the
+    one-photon-short assertion turns on is not relaxed.
     """
-    size = 226  # a plausible 1-in/2-out P2PKH send; only the first guess
-    for _ in range(60):
-        fee = fee_of_size(size)
-        tx = Transaction(
-            tx_inputs=[
-                TransactionInput(
-                    source_transaction=_src(coin.tx_hash, coin.tx_pos, _spk(wallet.address), coin.value),
-                    source_txid=coin.tx_hash,
-                    source_output_index=coin.tx_pos,
-                    unlocking_script_template=_p2pkh_unlock(wallet._private_key),
-                )
-            ],
-            tx_outputs=[TransactionOutput(P2PKH().lock(recipient), coin.value - fee)],
-        )
-        tx.sign()
-        signed_size = len(tx.serialize())
-        if signed_size == size:
-            return tx
-        size = signed_size
-    raise AssertionError("could not settle on a signed size — the DER length never repeated")
+    for locktime in range(_FEE_GRIND_ATTEMPTS):
+        size = 226  # a plausible 1-in/2-out P2PKH send; only the first guess
+        for _ in range(_FEE_SIZE_STEPS):
+            fee = fee_of_size(size)
+            tx = Transaction(
+                tx_inputs=[
+                    TransactionInput(
+                        source_transaction=_src(coin.tx_hash, coin.tx_pos, _spk(wallet.address), coin.value),
+                        source_txid=coin.tx_hash,
+                        source_output_index=coin.tx_pos,
+                        unlocking_script_template=_p2pkh_unlock(wallet._private_key),
+                    )
+                ],
+                tx_outputs=[TransactionOutput(P2PKH().lock(recipient), coin.value - fee)],
+                locktime=locktime,
+            )
+            tx.sign()
+            signed_size = len(tx.serialize())
+            if signed_size == size:
+                return tx
+            size = signed_size
+    raise AssertionError(
+        f"could not settle on a signed size in {_FEE_GRIND_ATTEMPTS} nLockTime attempts — "
+        "the DER length never repeated at any of them"
+    )
 
 
 def test_a_fee_one_photon_under_the_floor_is_rejected(node):  # noqa: F811

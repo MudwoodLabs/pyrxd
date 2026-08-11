@@ -512,17 +512,54 @@ class TestWriterReader:
         data = w.to_bytes()
         assert data[0] == 0xFD
 
+    # These three used to assert that a NON-MINIMAL CompactSize decodes to 1 — pinning
+    # in place the very behaviour audit F-15 had already removed from the two SPV
+    # readers. They now pin the canonical value for each width, plus the refusal.
+    # (They were also invisible: the conftest hook auto-marked anything containing
+    # "_int_" as `integration`, so none of them had run in CI. See tests/conftest.py.)
+
     def test_reader_var_int_fd(self):
-        r = Reader(b"\xfd\x01\x00")
-        assert r.read_var_int_num() == 1
+        assert Reader(b"\xfd\xfd\x00").read_var_int_num() == 0xFD  # smallest legal 0xfd
 
     def test_reader_var_int_fe(self):
-        r = Reader(b"\xfe\x01\x00\x00\x00")
-        assert r.read_var_int_num() == 1
+        assert Reader(b"\xfe\x00\x00\x01\x00").read_var_int_num() == 0x10000  # smallest legal 0xfe
 
     def test_reader_var_int_ff(self):
-        r = Reader(b"\xff\x01\x00\x00\x00\x00\x00\x00\x00")
-        assert r.read_var_int_num() == 1
+        assert Reader(b"\xff\x00\x00\x00\x00\x01\x00\x00\x00").read_var_int_num() == 0x100000000
+
+    @pytest.mark.parametrize(
+        ("raw", "why"),
+        [
+            (b"\xfd\x01\x00", "0xfd encoding 1 — one byte would do"),
+            (b"\xfd\xfc\x00", "0xfd encoding 252 — the last single-byte value"),
+            (b"\xfe\x01\x00\x00\x00", "0xfe encoding 1"),
+            (b"\xfe\xff\xff\x00\x00", "0xfe encoding 65535 — 0xfd would do"),
+            (b"\xff\x01\x00\x00\x00\x00\x00\x00\x00", "0xff encoding 1"),
+            (b"\xff\xff\xff\xff\xff\x00\x00\x00\x00", "0xff encoding 2**32-1 — 0xfe would do"),
+        ],
+    )
+    def test_reader_var_int_refuses_non_canonical(self, raw, why):
+        """Bitcoin rejects an overlong CompactSize at deserialization; so must this.
+
+        Accepting them let a transaction the node refuses parse cleanly, and made
+        ``Transaction.from_hex(blob).serialize()`` return DIFFERENT bytes from ``blob``
+        (measured: 87 in, 85 out) while ``txid()`` reported an id those bytes do not
+        hash to.
+        """
+        with pytest.raises(ValidationError, match="non-canonical"):
+            Reader(raw).read_var_int_num()
+
+    @pytest.mark.parametrize(
+        "raw", [b"\xfd\x01", b"\xfd", b"\xfe\x01\x00", b"\xfe", b"\xff\x01", b"\xff"], ids=range(6)
+    )
+    def test_reader_var_int_refuses_truncated(self, raw):
+        """``int.from_bytes`` over a short read zero-extended silently: ``fd 01`` was 1."""
+        with pytest.raises(ValidationError, match="truncated"):
+            Reader(raw).read_var_int_num()
+
+    def test_reader_var_int_still_returns_none_at_end_of_input(self):
+        """The EOF contract ``Transaction.from_reader``/``from_beef`` test with."""
+        assert Reader(b"").read_var_int_num() is None
 
     def test_reader_read_int8(self):
         r = Reader(b"\xff")

@@ -43,12 +43,12 @@ from typing import Any
 import pytest
 
 from pyrxd import utils
-from pyrxd.aes_cbc import aes_decrypt_with_iv, aes_encrypt_with_iv
+from pyrxd.aes_cbc import InvalidPadding, aes_decrypt_with_iv, aes_encrypt_with_iv
 from pyrxd.crypto.aead import decrypt_xchacha20_poly1305, encrypt_xchacha20_poly1305
 from pyrxd.hd.bip32 import Xkey, Xprv, Xpub, master_xprv_from_seed
-from pyrxd.hd.bip39 import WordList, mnemonic_from_entropy, seed_from_mnemonic
+from pyrxd.hd.bip39 import WordList, mnemonic_from_entropy, seed_from_mnemonic, validate_mnemonic
 from pyrxd.keys import PrivateKey
-from pyrxd.security.errors import redact
+from pyrxd.security.errors import Base58Error, KeyMaterialError, ValidationError, redact
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 
 #: Shortest run of a secret we treat as a leak. A WIF is 51-52 chars, an xprv 111, and a
@@ -82,15 +82,54 @@ def assert_no_leak(renderings: list[str], secret: str, *, label: str) -> None:
             )
 
 
-def assert_call_never_echoes(fn: Callable[[], Any], secret: str, *, label: str) -> None:
-    """Call ``fn``; if it raises, no rendering of the exception may contain the secret.
+def assert_call_never_echoes(
+    fn: Callable[[], Any],
+    secret: str,
+    *,
+    label: str,
+    expect: type[BaseException] | tuple[type[BaseException], ...],
+) -> None:
+    """Call ``fn``, require it to fail with ``expect``, and check no rendering leaks ``secret``.
 
-    A call that *succeeds* is fine — this asserts about the failure path only.
+    ``expect`` is not decoration. This helper used to be a bare
+    ``try: fn() / except BaseException: assert_no_leak(...)`` with a docstring blessing a
+    call that succeeded, and that made two whole classes of dead test invisible — a
+    swallowed exception is indistinguishable from a redaction that works:
+
+    **The call never reached the branch.** ``seed_from_mnemonic(swapped, lang=lang,
+    validate=True)`` named a keyword argument that does not exist on
+    ``seed_from_mnemonic``, so CPython raised ``TypeError`` while *binding the
+    arguments* — before one line of the function body ran. The ``TypeError`` was caught,
+    plainly contained no mnemonic, and the test passed. The BIP-39 checksum-mismatch
+    redaction path it claimed to cover was untested in **every** shipped wordlist.
+
+    **The call never failed at all.** ``to_bytes(key_with_a_"!"_in_it, enc="hex")``
+    strips non-alphanumeric characters before parsing, so the "mistyped" key was
+    repaired and returned successfully; the ``ValueError`` branch the test named was
+    never reached, and ``assert_no_leak`` never ran, in all four parametrizations.
+
+    Naming the exception closes both. A signature that drifts raises ``TypeError``
+    instead of ``expect`` and is re-raised instead of laundered; a call that stops
+    failing is reported instead of passing silently.
+
+    The unexpected exception's *message* is deliberately withheld from the failure
+    report — this file exists because messages on these paths carry secret material.
     """
     try:
         fn()
-    except BaseException as exc:
+    except expect as exc:  # type: ignore[misc]
         assert_no_leak(every_rendering(exc), secret, label=label)
+        return
+    except BaseException as exc:
+        raise AssertionError(
+            f"{label}: expected {expect}, got {type(exc).__name__} — so the branch under "
+            "test was never reached and nothing about it was asserted. (Message withheld: "
+            "it may carry the secret.)"
+        ) from None
+    raise AssertionError(
+        f"{label}: the call SUCCEEDED. This asserts about a failure path, so a call that "
+        "does not fail asserts nothing — the input no longer reaches the branch."
+    )
 
 
 def corrupt(text: str, index: int) -> str:
@@ -109,10 +148,18 @@ def test_hex_private_key_is_never_echoed_by_to_bytes(bad_index: int) -> None:
     CPython's own message is ``invalid literal for int() with base 16: 'XY'`` — two
     characters of whatever was handed in. This is the only place in the SDK where
     ``int(x, 16)`` runs directly on a caller-supplied string that may be a private key.
+
+    The mistyped character must be **alphanumeric**. ``to_bytes`` sanitises with
+    ``"".join(filter(str.isalnum, msg))`` and then left-pads an odd length back to even,
+    so a ``"!"`` was silently stripped and the key repaired — the call returned
+    successfully and this test asserted nothing at all until ``expect=`` caught it.
+    ``"z"`` survives the filter and is still outside the hex alphabet.
     """
     key_hex = os.urandom(32).hex()
-    mistyped = key_hex[:bad_index] + "!" + key_hex[bad_index + 1 :]
-    assert_call_never_echoes(lambda: utils.to_bytes(mistyped, enc="hex"), key_hex, label=f"to_bytes[{bad_index}]")
+    mistyped = key_hex[:bad_index] + "z" + key_hex[bad_index + 1 :]
+    assert_call_never_echoes(
+        lambda: utils.to_bytes(mistyped, enc="hex"), key_hex, label=f"to_bytes[{bad_index}]", expect=ValueError
+    )
 
 
 def test_private_key_repr_and_str_never_carry_the_key() -> None:
@@ -130,7 +177,10 @@ def test_private_key_material_from_wif_never_echoes(bad_index: int) -> None:
     """``PrivateKeyMaterial.from_wif`` is the zeroing wrapper the CLI reaches for."""
     wif = PrivateKey().wif()
     assert_call_never_echoes(
-        lambda: PrivateKeyMaterial.from_wif(corrupt(wif, bad_index)), wif, label="PrivateKeyMaterial"
+        lambda: PrivateKeyMaterial.from_wif(corrupt(wif, bad_index)),
+        wif,
+        label="PrivateKeyMaterial",
+        expect=KeyMaterialError,
     )
 
 
@@ -201,11 +251,37 @@ def test_ordinary_der_rejections_never_echo_the_signature(mangle) -> None:
     signature = PrivateKey().sign(b"a message to sign")
     mangled = mangle(signature)
     assert_call_never_echoes(
-        lambda: utils.deserialize_ecdsa_der(mangled), bytes(mangled).hex(), label="deserialize_ecdsa_der"
+        lambda: utils.deserialize_ecdsa_der(mangled),
+        bytes(mangled).hex(),
+        label="deserialize_ecdsa_der",
+        expect=ValueError,
     )
 
 
 # ── BIP-39 mnemonics, in every wordlist the SDK ships ─────────────────────────
+
+
+def a_transcription_slip_that_really_breaks_the_checksum(words: list[str], lang: str) -> str:
+    """The same valid words in a wrong order, whose checksum is GENUINELY invalid.
+
+    Swapping one fixed pair is not enough. A 12-word mnemonic carries 4 checksum bits,
+    so a reordering leaves the checksum accidentally valid about one time in sixteen —
+    measured over 2000 draws per language: 6.65% (en), 5.80% (zh-cn). When that happens
+    ``seed_from_mnemonic`` SUCCEEDS and there is no error path to check at all.
+
+    Under the old swallow-everything helper that was invisible (a successful call
+    asserted nothing); with ``expect=`` it would be a ~6% flake. Neither is acceptable
+    for a test that is the only cover for this branch, so the mismatch is *confirmed*
+    here rather than assumed. Each adjacent swap is an independent ~15/16 chance of
+    breaking it, so the search effectively always succeeds on the first or second try.
+    """
+    for i in range(len(words) - 1):
+        candidate = " ".join([*words[:i], words[i + 1], words[i], *words[i + 2 :]])
+        try:
+            validate_mnemonic(candidate, lang)
+        except ValidationError:
+            return candidate
+    raise AssertionError(f"no adjacent swap in {len(words)} words broke the {lang} checksum")
 
 
 @pytest.mark.parametrize("lang", sorted(WordList.files))
@@ -219,14 +295,23 @@ def test_a_bad_mnemonic_is_never_echoed(lang: str) -> None:
     words = mnemonic.split()
     broken = " ".join([*words[:-1], "notarealbip39word"])
     assert_call_never_echoes(
-        lambda: seed_from_mnemonic(broken, lang=lang), mnemonic, label=f"seed_from_mnemonic[{lang}]"
+        lambda: seed_from_mnemonic(broken, lang=lang),
+        mnemonic,
+        label=f"seed_from_mnemonic[{lang}]",
+        expect=ValueError,
     )
     # Same phrase, valid words, wrong checksum: the classic single-word transcription slip.
-    swapped = " ".join([words[1], words[0], *words[2:]])
+    # NO ``validate=`` keyword — ``seed_from_mnemonic`` has never had one, and passing it
+    # made CPython raise TypeError at argument binding. The old helper swallowed that, so
+    # this branch (``validate_mnemonic`` -> "invalid mnemonic, checksum mismatch") was
+    # dead in every shipped language. Validation is unconditional; there is nothing to
+    # opt into.
+    swapped = a_transcription_slip_that_really_breaks_the_checksum(words, lang)
     assert_call_never_echoes(
-        lambda: seed_from_mnemonic(swapped, lang=lang, validate=True),
+        lambda: seed_from_mnemonic(swapped, lang=lang),
         mnemonic,
         label=f"seed_from_mnemonic checksum[{lang}]",
+        expect=ValidationError,
     )
 
 
@@ -293,7 +378,9 @@ def test_xpub_remains_printable() -> None:
 def test_a_mistyped_xprv_is_never_echoed(bad_index: int) -> None:
     """111 characters, of which a corrupted copy still gives away 110."""
     serialized = master_xprv_from_seed(os.urandom(64)).serialize()
-    assert_call_never_echoes(lambda: Xprv(corrupt(serialized, bad_index)), serialized, label=f"Xprv[{bad_index}]")
+    assert_call_never_echoes(
+        lambda: Xprv(corrupt(serialized, bad_index)), serialized, label=f"Xprv[{bad_index}]", expect=Base58Error
+    )
 
 
 @pytest.mark.parametrize("bad_index", [0, 4, 60, 110])
@@ -303,26 +390,49 @@ def test_a_mistyped_xpub_never_echoes_a_pasted_xprv(bad_index: int) -> None:
     So the xpub decoder must be as silent as the xprv one — it cannot know which it got.
     """
     serialized = master_xprv_from_seed(os.urandom(64)).serialize()
-    assert_call_never_echoes(lambda: Xpub(corrupt(serialized, bad_index)), serialized, label=f"Xpub[{bad_index}]")
+    assert_call_never_echoes(
+        lambda: Xpub(corrupt(serialized, bad_index)), serialized, label=f"Xpub[{bad_index}]", expect=Base58Error
+    )
 
 
 def test_ckd_derivation_failures_never_echo_the_parent_key() -> None:
     """A bad derivation path must not drag the parent xprv into the message."""
     xprv = master_xprv_from_seed(os.urandom(64))
     serialized = xprv.serialize()
-    for bad_index in ("not-a-path", b"\x00", 2**40):
-        assert_call_never_echoes(lambda i=bad_index: xprv.ckd(i), serialized, label="Xprv.ckd")
+    # Each bad index fails in a different layer, so each names its own exception rather
+    # than hiding behind a catch-all: hex decoding, the 4-byte width check, and int
+    # packing respectively.
+    for bad_index, expected in (
+        ("not-a-path", ValueError),
+        (b"\x00", ValidationError),
+        (2**40, OverflowError),
+    ):
+        assert_call_never_echoes(
+            lambda i=bad_index: xprv.ckd(i), serialized, label=f"Xprv.ckd[{expected.__name__}]", expect=expected
+        )
 
 
 def test_master_xprv_from_seed_never_echoes_the_seed() -> None:
-    """The seed is upstream of every key in the wallet."""
+    """The seed is upstream of every key in the wallet.
+
+    ``seed.hex()`` is deliberately NOT in this list: ``Xprv.from_seed`` accepts a ``str``
+    and hex-decodes it, so the hex form of a valid 64-byte seed is a valid seed and
+    derives successfully. It sat here as a third "bad seed" and asserted nothing.
+    """
     seed = os.urandom(64)
-    for bad_seed in (seed[:3], seed + seed, seed.hex()):
+    for bad_seed in (seed[:3], seed + seed):
         assert_call_never_echoes(
             lambda s=bad_seed: master_xprv_from_seed(s),
             seed.hex(),
             label="master_xprv_from_seed",
+            expect=ValidationError,
         )
+
+
+def test_the_hex_form_of_a_seed_is_accepted_rather_than_rejected() -> None:
+    """Pin the reason ``seed.hex()`` was removed above, so it is a decision and not a loss."""
+    seed = os.urandom(64)
+    assert master_xprv_from_seed(seed.hex()).serialize() == master_xprv_from_seed(seed).serialize()
 
 
 # ── passphrases ───────────────────────────────────────────────────────────────
@@ -337,6 +447,7 @@ def test_a_passphrase_is_never_echoed_by_seed_derivation() -> None:
         lambda: seed_from_mnemonic(broken.strip(), passphrase=passphrase),
         passphrase,
         label="seed_from_mnemonic passphrase",
+        expect=ValueError,
     )
 
 
@@ -355,10 +466,16 @@ def test_a_passphrase_is_never_echoed_by_seed_derivation() -> None:
 def test_aead_errors_never_echo_key_or_nonce(bad_key: bytes, bad_nonce: bytes) -> None:
     """AEAD rejections report lengths, never values. Pin that they keep doing so."""
     assert_call_never_echoes(
-        lambda: encrypt_xchacha20_poly1305(b"plaintext", bad_key, bad_nonce), bad_key.hex(), label="aead key"
+        lambda: encrypt_xchacha20_poly1305(b"plaintext", bad_key, bad_nonce),
+        bad_key.hex(),
+        label="aead key",
+        expect=ValueError,
     )
     assert_call_never_echoes(
-        lambda: encrypt_xchacha20_poly1305(b"plaintext", bad_key, bad_nonce), bad_nonce.hex(), label="aead nonce"
+        lambda: encrypt_xchacha20_poly1305(b"plaintext", bad_key, bad_nonce),
+        bad_nonce.hex(),
+        label="aead nonce",
+        expect=ValueError,
     )
 
 
@@ -371,6 +488,7 @@ def test_aead_decrypt_failure_never_echoes_the_key() -> None:
         lambda: decrypt_xchacha20_poly1305(ciphertext, wrong_key, nonce, b"aad"),
         wrong_key.hex(),
         label="aead_decrypt",
+        expect=ValueError,
     )
 
 
@@ -380,4 +498,6 @@ def test_aes_cbc_padding_errors_never_echo_key_iv_or_padding_bytes() -> None:
     ciphertext = aes_encrypt_with_iv(key, iv, b"a secret message")
     corrupted = bytes([ciphertext[0] ^ 0xFF]) + ciphertext[1:]
     for secret in (key.hex(), iv.hex()):
-        assert_call_never_echoes(lambda: aes_decrypt_with_iv(key, iv, corrupted), secret, label="aes_cbc padding")
+        assert_call_never_echoes(
+            lambda: aes_decrypt_with_iv(key, iv, corrupted), secret, label="aes_cbc padding", expect=InvalidPadding
+        )
