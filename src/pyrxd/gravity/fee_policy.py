@@ -63,6 +63,11 @@ import math
 from dataclasses import dataclass
 from fractions import Fraction
 
+from pyrxd.fee_sizing import (
+    RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB,
+    RADIANT_MIN_RELAY_PHOTONS_PER_KB,
+    fee_for_kb_rate,
+)
 from pyrxd.security.errors import InsufficientFundsError, ValidationError
 
 __all__ = [
@@ -80,6 +85,12 @@ __all__ = [
 
 PHOTONS_PER_RXD = 100_000_000
 
+# The two relay-floor constants are RE-EXPORTED from :mod:`pyrxd.fee_sizing`, not
+# defined here, so the plain-RXD wallet and the swap stack cannot drift apart on what
+# the node demands. They moved there rather than the other way round because
+# ``pyrxd.wallet`` cannot import this package at module scope:
+# ``pyrxd.gravity.__init__`` reaches ``pyrxd.hd.wallet``, which imports
+# ``pyrxd.wallet`` — a genuine import cycle. Nothing about their meaning changed:
 # Radiant-Core ``src/policy/policy.h``: ``LEGACY_MIN_RELAY_TX_FEE_PER_KB`` (:47) and
 # ``RADIANT_CORE_2_MIN_RELAY_TX_FEE_PER_KB`` (:49). ``GetEffectiveMinRelayFee`` returns
 # the legacy rate before the 2.0 activation + 5000-block grace period and the higher one
@@ -87,8 +98,6 @@ PHOTONS_PER_RXD = 100_000_000
 # 2026-08-09: ``minrelaytxfee`` 0.01, ``effective_minrelaytxfee`` 0.10 RXD/kB).
 # The EFFECTIVE rate is what ``AcceptToMemoryPool`` checks, and it is 10x the nominal
 # one — precisely why this is a default to override, not a constant to hardcode.
-RADIANT_MIN_RELAY_PHOTONS_PER_KB = 1_000_000  # 0.01 RXD/kB (legacy floor)
-RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB = 10_000_000  # 0.10 RXD/kB (post-2.0 floor)
 
 # Bitcoin Core's ``DEFAULT_MIN_RELAY_TX_FEE`` (1 sat/vB). Used by the BTC-side
 # pre-signed-refund affordability bind, which sizes against the blob's serialized
@@ -201,7 +210,9 @@ class DeadlineFeePolicy:
         """
         if not isinstance(size_bytes, int) or isinstance(size_bytes, bool) or size_bytes <= 0:
             raise ValidationError("size_bytes must be a positive int (the SERIALIZED transaction size)")
-        return -(-size_bytes * self.relay_fee_per_kb // 1000)  # ceil, integer-only
+        # One implementation of the node's derivation, shared with the wallet and glyph
+        # builders (:func:`pyrxd.fee_sizing.fee_for_kb_rate`) — see the constants note above.
+        return fee_for_kb_rate(size_bytes, self.relay_fee_per_kb)
 
     # -- the policy ---------------------------------------------------------
     def _urgency_fraction(self, blocks_to_deadline: int | None) -> Fraction:

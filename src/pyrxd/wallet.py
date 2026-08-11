@@ -11,6 +11,14 @@ Design notes
   → rebuild with real change). All input ``unlocking_script`` values are reset
   between passes so the final signature covers the final outputs; the
   ``test_preimage.py`` suite documents this stale-signature pitfall.
+* Because the two passes sign different messages their DER signatures differ in
+  length, so the trial measurement is padded by
+  :data:`~pyrxd.fee_sizing.SIG_SIZE_SLACK_BYTES` per input and the FINAL signed
+  transaction is re-measured and refused if it does not clear the rate it was
+  built for. Before that was added, 25-38% of builds paid below their own rate
+  (see :mod:`pyrxd.fee_sizing` for the measurements) — which at the default rate
+  is the mainnet relay floor, and Radiant can neither RBF nor CPFP a shortfall
+  away.
 * ElectrumX script-hash lookup uses ``sha256(locking_script)[::-1]`` (byte
   reverse). The bytes are wrapped in ``Hex32`` so the client validates length
   and re-serialises as the lowercase-hex string ElectrumX expects.
@@ -21,6 +29,7 @@ Design notes
 
 from __future__ import annotations
 
+from .fee_sizing import assert_tx_pays_for_itself, relay_floor_photons_per_byte, required_fee, trial_size_with_slack
 from .keys import PrivateKey
 from .network.electrumx import ElectrumXClient, UtxoRecord, script_hash_for_address
 from .script.type import P2PKH
@@ -45,10 +54,17 @@ from .utils import validate_address
 # contradict a consensus requirement this library already implements.
 DUST_THRESHOLD: int = 546
 
-# Default miner fee in photons-per-byte. Radiant mainnet currently accepts a
-# minimum relay fee of 10_000 photons/byte (see the preimage-fix regression
-# tests and ``examples/glyph_mint_demo.py``).
-DEFAULT_FEE_RATE: int = 10_000
+# Default miner fee in photons-per-byte: Radiant's own effective relay floor,
+# DERIVED from it rather than written out again, so the default can never drift
+# away from what ``AcceptToMemoryPool`` demands. It is currently 10_000/byte
+# (10_000_000 per kB — ``getmempoolinfo``'s ``effective_minrelaytxfee`` of
+# 0.10 RXD/kB).
+#
+# That the default IS the floor is why the fee sizing below re-measures the final
+# signed transaction: at this rate a one-byte shortfall is not a rounding
+# curiosity, it is ``66: min relay fee not met``, and Radiant has neither RBF nor
+# CPFP to repair it.
+DEFAULT_FEE_RATE: int = relay_floor_photons_per_byte()
 
 
 def greedy_select_count(values_desc: list[int], photons: int, *, base_cushion: int, per_input_cushion: int) -> int:
@@ -243,8 +259,11 @@ class RxdWallet:
         ]
         trial_tx = Transaction(tx_inputs=inputs, tx_outputs=trial_outputs)
         trial_tx.sign()
-        trial_size = trial_tx.byte_length()
-        fee = trial_size * self._fee_rate
+        # Pad the trial measurement by the most a signature can grow between passes
+        # (see :data:`pyrxd.fee_sizing.SIG_SIZE_SLACK_BYTES`). Without this the fee
+        # pays for the TRIAL bytes while the caller broadcasts the FINAL ones.
+        trial_size = trial_size_with_slack(trial_tx.byte_length(), len(inputs))
+        fee = required_fee(trial_size, self._fee_rate)
 
         if total_in < photons + fee:
             raise ValidationError("Insufficient funds after fee")
@@ -261,12 +280,23 @@ class RxdWallet:
             final_outputs.append(TransactionOutput(change_script, change_value))
         # else: burn dust remainder as fee (standard practice for tiny change).
 
-        # If we dropped the change output, the tx is SMALLER than the trial,
-        # so the previously-computed fee is an over-estimate; that is safe
-        # (we pay slightly more fee) but we can optionally tighten by
-        # re-measuring. For simplicity and determinism we keep the larger fee.
+        # Two ways the final transaction differs in size from the trial, and they
+        # point opposite ways:
+        #
+        # * Dropping the change output makes it SMALLER, so the fee over-estimates.
+        #   That is the safe direction and we keep the larger fee rather than
+        #   tighten — the remainder was below the send-policy floor anyway.
+        # * The final pass signs over different outputs, so its DER signatures can
+        #   be LONGER than the trial's. That direction is not safe, and it is not
+        #   rare: it happened on 25-38% of builds before the slack above existed.
+        #
+        # The slack covers the second case; this re-measurement PROVES it did,
+        # rather than trusting it. Fail closed: a transaction the node will reject
+        # is worse than an exception, because a below-floor broadcast cannot be
+        # replaced or fee-bumped on Radiant and squats on its inputs for 8 hours.
         final_tx = Transaction(tx_inputs=inputs, tx_outputs=final_outputs)
         final_tx.sign()
+        assert_tx_pays_for_itself(final_tx, self._fee_rate, what="build_send_tx", error_type=ValidationError)
         return final_tx
 
     def build_send_max_tx(
@@ -277,6 +307,32 @@ class RxdWallet:
         """Build and sign a tx sweeping *all* provided UTXOs to *to_address*.
 
         No change output. Single output value = ``sum(utxos) - fee``.
+
+        Where the fee headroom comes from
+        ---------------------------------
+        A sweep has no change output, so the only place an extra photon of fee can
+        come from is the single payout. Two options, and this method takes the
+        first deliberately:
+
+        1. **Size the fee with headroom up front**, so the payout is decided once,
+           before signing, and never moved afterwards. The caller asked for "my
+           whole balance, minus the fee" — an amount defined *by* the fee — so
+           sizing the fee conservatively is answering the question they asked, not
+           quietly shaving an amount they specified. The headroom is
+           ``SIG_SIZE_SLACK_BYTES × inputs × fee_rate``: at the default rate that
+           is 30_000 photons (0.0003 RXD) per input, worst case, and only the
+           unused part is surrendered to the miner.
+        2. Re-measure afterwards and shave the payout to cover a shortfall. Doing
+           that means signing a third time, whose signatures can again be longer,
+           so it either loops or needs its own headroom — and it changes an amount
+           after the caller has been shown it.
+
+        :meth:`build_send_tx` cannot take option 2 at all: there the recipient
+        amount is exact and the only adjustable output is change, so silently
+        reducing the payout would be sending less than was asked for.
+
+        The final signed transaction is re-measured either way and the build is
+        refused if it does not clear its own rate.
         """
         if not validate_address(to_address):
             raise ValidationError("to_address is not a valid P2PKH address")
@@ -297,8 +353,8 @@ class RxdWallet:
             tx_outputs=[TransactionOutput(recipient_script, total_in - DUST_THRESHOLD)],
         )
         trial_tx.sign()
-        size = trial_tx.byte_length()
-        fee = size * self._fee_rate
+        size = trial_size_with_slack(trial_tx.byte_length(), len(inputs))
+        fee = required_fee(size, self._fee_rate)
         out_value = total_in - fee
         if out_value < DUST_THRESHOLD:
             raise ValidationError("Insufficient funds to cover fee")
@@ -311,6 +367,7 @@ class RxdWallet:
             tx_outputs=[TransactionOutput(recipient_script, out_value)],
         )
         final_tx.sign()
+        assert_tx_pays_for_itself(final_tx, self._fee_rate, what="build_send_max_tx", error_type=ValidationError)
         return final_tx
 
     # ------------------------------------------------------------------ network

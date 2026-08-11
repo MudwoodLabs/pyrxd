@@ -52,6 +52,7 @@ from dataclasses import dataclass
 
 import click
 
+from ..fee_sizing import SIG_SIZE_SLACK_BYTES
 from ..glyph.types import GlyphRef
 from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY
 from ..keys import PrivateKey
@@ -106,10 +107,9 @@ _TX_BASE_BYTES = 10  # version 4 + locktime 4 + the two count varints
 _TX_PER_INPUT_BYTES = 150  # signed P2PKH input; measured 148 B
 _TX_PER_OUTPUT_BYTES = 90  # covers a Glyph FT output (measured 84 B); a P2PKH output is 34 B
 # Trial and final passes sign DIFFERENT messages, so their DER signatures can differ in
-# length by up to 3 bytes per input — both `r` and `s` can shed a leading zero at once.
-# Measured and reasoned in :data:`pyrxd.glyph.ft._SIG_SIZE_SLACK_BYTES`; mirrored here
-# because at the relay floor those bytes are the difference between relayed and stuck.
-_SIG_SIZE_SLACK_BYTES = 3
+# length. Bound to the one definition in :mod:`pyrxd.fee_sizing` — it used to be
+# mirrored here as a literal, which is exactly how a rule with three copies drifts.
+_SIG_SIZE_SLACK_BYTES = SIG_SIZE_SLACK_BYTES
 # Bound on the measure-and-rebuild loop: a larger fee can pull in another funding input,
 # which grows the transaction, which raises the fee again. Converges in 1-2 passes in
 # practice; the bound turns a pathological wallet into a clean error, not a hang.
