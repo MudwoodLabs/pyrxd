@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Documentation
+
+- **The threat model no longer claims the SPV sole-authority gate fails closed.**
+  `require_spv_sole_authority_cleared` has returned unconditionally since 0.9.0 — a deliberate
+  choice matching the project's posture that audit gates warn rather than hard-block. Three
+  places still described it as enforcing, which is the more dangerous direction of drift for a
+  document an external auditor reads: a covenant-less SPV use is restrained by documentation,
+  not by code, and the caller carries that obligation. Gap #7 also predated
+  `network/tls_pin.py`; TLS pinning now exists, opt-in and off by default, so the residual
+  stands only for operators who have not configured pins.
+
 ### Fixed
 
 - **The six `-m integration` cross-chain end-to-end suites now fund the maker's covenant before
