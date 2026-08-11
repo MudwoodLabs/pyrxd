@@ -108,4 +108,12 @@ class NodeRpcSource:
         # gettxout returns null for a spent/unknown outpoint — that IS the answer
         # (not a transport failure), so a None result maps to False here.
         out = await self._call("gettxout", [str(txid), int(vout), True])
-        return isinstance(out, dict)
+        # `isinstance(out, dict)` alone read a bare `{}` as LIVE. A real gettxout result always
+        # carries the output's scriptPubKey and value, so require both — a response that cannot
+        # describe the output it claims exists is not evidence the output exists. This mirrors
+        # `BitcoinCoreFundingReader.read_confirmed_unspent_output`, which has always required
+        # a non-empty `scriptPubKey.hex` and a `value` key.
+        if not isinstance(out, dict):
+            return False
+        spk = out.get("scriptPubKey")
+        return isinstance(spk, dict) and bool(spk.get("hex")) and "value" in out

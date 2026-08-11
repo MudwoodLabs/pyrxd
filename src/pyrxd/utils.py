@@ -150,7 +150,14 @@ def deserialize_ecdsa_der(signature: bytes) -> tuple[int, int]:
     except (ValueError, ValidationError):
         raise
     except Exception:
-        raise ValueError(f"invalid DER encoded {signature.hex()}")
+        # NEVER echo the signature. A signature made with a reused or leaked nonce ``k``
+        # (the R-puzzle path in ``keys.PrivateKey._sign_custom_k`` produces exactly that
+        # shape) plus the message hash recovers the private key, so ``r``/``s`` are key
+        # material. This previously raised ``ValueError(f"invalid DER encoded
+        # {signature.hex()}")`` — a bare ``ValueError``, so ``security.errors.redact``
+        # never ran on it, and ``cli/main.py``'s catch-all prints ``cause: {exc}`` to
+        # stderr. ``from None`` so it cannot resurface through ``__context__`` either.
+        raise ValueError("invalid DER encoding") from None
 
 
 def serialize_ecdsa_der(signature: tuple[int, int]) -> bytes:
@@ -343,7 +350,13 @@ def to_bytes(msg: bytes | str, enc: str | None = None) -> bytes:
             msg = "".join(filter(str.isalnum, msg))
             if len(msg) % 2 != 0:
                 msg = "0" + msg
-            return bytes(int(msg[i : i + 2], 16) for i in range(0, len(msg), 2))
+            try:
+                return bytes(int(msg[i : i + 2], 16) for i in range(0, len(msg), 2))
+            except ValueError:
+                # CPython's message is ``invalid literal for int() with base 16: 'XY'`` —
+                # two characters of whatever was handed in. Callers pass private-key hex
+                # here, so those two characters are key material. Static message instead.
+                raise ValueError("value is not valid hex") from None
         elif enc == "base64":
             import base64
 

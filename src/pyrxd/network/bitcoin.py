@@ -24,11 +24,10 @@ import asyncio
 import hashlib
 import json
 import logging
-import math
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Sequence
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import quote, urljoin, urlparse
 
@@ -36,7 +35,8 @@ import aiohttp
 
 from ..security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
-from ..security.types import BlockHeight, Hex32, RawTx, Txid
+from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
+from ._guards import finite_int, merkle_branch, nonneg_int, require_bool
 
 logger = logging.getLogger(__name__)
 
@@ -108,22 +108,10 @@ def _safe_int_path(value: int) -> str:
     return quote(str(int(value)), safe="")
 
 
-def _finite_int(value: Any) -> int:
-    """``int(value)`` for a JSON number, refusing the non-finite literals (audit B6).
-
-    ``json.loads`` accepts the non-standard ``Infinity`` / ``-Infinity`` / ``NaN`` literals, so a
-    hostile or broken server can hand back ``float('inf')``. ``int(inf)`` raises ``OverflowError``
-    — which is NOT a ``NetworkError`` and is absent from the fail-closed
-    ``(KeyError, IndexError, TypeError, ValueError)`` tuples the fund-safety reads catch — so it
-    escaped as a bare traceback through every ``except NetworkError`` on a value-moving path.
-    ``network/confirm.py`` already guards this shape; this is the same guard for the BTC reads.
-    Raises ``ValueError`` so existing fail-closed tuples catch it.
-    """
-    if isinstance(value, bool):
-        raise ValueError("a boolean is not a numeric value")
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError("non-finite numeric value (Infinity/NaN); fail-closed")
-    return int(value)
+#: Backwards-compatible alias. This guard used to live here and be applied at exactly three
+#: call sites; it now lives in :mod:`pyrxd.network._guards` so ``electrumx.py`` shares one
+#: implementation rather than growing a second, subtly different copy.
+_finite_int = finite_int
 
 
 def _assert_tx_identity(data: Any, txid: Txid) -> None:
@@ -140,6 +128,57 @@ def _assert_tx_identity(data: Any, txid: Txid) -> None:
             f"tx response does not identify the requested transaction {str(txid)[:16]}… "
             "(missing or mismatched txid — the source may be answering about a different transaction); fail-closed"
         )
+
+
+def _output_index(value: Any) -> int:
+    """Validate a caller-supplied output index (audit B7).
+
+    ``data["vout"][-1]`` silently WRAPS to the LAST output, so ``get_tx_output_script_type(txid, -1)``
+    reported the script type of a *different* output than the one named, with no error at all. An
+    index into someone else's transaction must be a real non-negative ``int``.
+    """
+    try:
+        return nonneg_int(value)
+    except ValueError as exc:
+        raise ValidationError("output index must be a non-negative int") from exc
+
+
+def _esplora_status_height(status: Any) -> int | None:
+    """Read an Esplora ``/tx/{txid}/status`` body into "confirmed at height N", or ``None``.
+
+    Returns ``None`` when the body unambiguously says the tx is not confirmed; the height when it
+    unambiguously says it is. Anything in between REFUSES (audit B7):
+
+    * ``confirmed`` must be a real JSON boolean. It was truthiness-tested, so the non-empty string
+      ``"false"`` read as CONFIRMED — the same shape as the ``spent`` bug one layer down.
+    * ``block_height`` must be a finite, non-negative, integral JSON number. It went into a bare
+      ``int()`` with **no** ``try`` around it in ``get_raw_tx``, so ``"twelve"`` escaped as
+      ``ValueError`` and ``Infinity`` as ``OverflowError`` — straight past the ``except NetworkError``
+      that every caller on the SPV/gravity finalize path relies on.
+    """
+    if not isinstance(status, dict):
+        raise NetworkError("Unexpected tx status response")
+    try:
+        confirmed = require_bool(status.get("confirmed", False))
+    except ValueError as exc:
+        raise NetworkError("tx status 'confirmed' is not a JSON boolean; fail-closed") from exc
+    raw_height = status.get("block_height")
+    if not confirmed or raw_height is None:
+        return None
+    try:
+        return nonneg_int(raw_height)
+    except ValueError as exc:
+        raise NetworkError("tx status 'block_height' is not a usable block height; fail-closed") from exc
+
+
+def _esplora_merkle_proof(data: Any) -> tuple[list[str], int]:
+    """Read an Esplora merkle-proof body, refusing a type-confused branch or an unusable position."""
+    if not isinstance(data, dict):
+        raise NetworkError("Malformed merkle proof response from server")
+    try:
+        return merkle_branch(data["merkle"]), nonneg_int(data["pos"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise NetworkError("Malformed merkle proof response from server") from exc
 
 
 async def _check_response_size(response: aiohttp.ClientResponse) -> bytes:
@@ -285,11 +324,8 @@ class MempoolSpaceSource(BtcDataSource):
         # Fetch tx status to check confirmations.
         status_url = self._url(f"tx/{_safe_txid_path(txid)}/status")
         status = await _get_json(session, status_url)
-        if not isinstance(status, dict):
-            raise NetworkError("Unexpected tx status response")
-        confirmed = status.get("confirmed", False)
-        block_height = status.get("block_height")
-        if not confirmed or block_height is None:
+        block_height = _esplora_status_height(status)
+        if block_height is None:
             raise InsufficientConfirmationsError(have=0, required=min_confirmations)
 
         if min_confirmations > 0:
@@ -299,12 +335,12 @@ class MempoolSpaceSource(BtcDataSource):
             # under-reports block_height inflates confs (an unburied/reorgable tx
             # looks final); a height above tip is inconsistent. Reject either rather
             # than trust the arithmetic (mirrors MempoolSpaceFundingReader.confirmations).
-            if int(block_height) < 1 or int(block_height) > int(tip):
+            if block_height < 1 or block_height > int(tip):
                 raise NetworkError(
                     f"inconsistent confirmation data: block_height={block_height}, tip={int(tip)} "
                     "(expected 1 <= block_height <= tip)"
                 )
-            confs = int(tip) - int(block_height) + 1
+            confs = int(tip) - block_height + 1
             if confs < min_confirmations:
                 raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
 
@@ -330,15 +366,12 @@ class MempoolSpaceSource(BtcDataSource):
         session = await self._get_session()
         status_url = self._url(f"tx/{_safe_txid_path(txid)}/status")
         status = await _get_json(session, status_url)
-        if not isinstance(status, dict):
-            raise NetworkError("Unexpected tx status response")
-        confirmed = status.get("confirmed", False)
-        block_height = status.get("block_height")
-        if not confirmed or block_height is None:
+        block_height = _esplora_status_height(status)
+        if block_height is None:
             raise NetworkError(f"tx {str(txid)[:16]}… is unconfirmed")
         try:
-            return BlockHeight(int(block_height))
-        except (TypeError, ValueError, ValidationError):
+            return BlockHeight(block_height)
+        except ValidationError:
             raise NetworkError("Invalid block_height in tx status response")
 
     async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
@@ -347,8 +380,13 @@ class MempoolSpaceSource(BtcDataSource):
         session = await self._get_session()
         url = self._url(f"tx/{_safe_txid_path(txid)}")
         data = await _get_json(session, url)
+        # audit B7: the body must be about the tx we ASKED for. `_assert_tx_identity` already
+        # guarded the funding-reader reads; this one never called it, so a malicious or MITM'd
+        # source could answer with ANOTHER transaction's outputs.
+        _assert_tx_identity(data, txid)
+        index = _output_index(output_index)
         try:
-            vout = data["vout"][output_index]
+            vout = data["vout"][index]
             script_type = vout.get("scriptpubkey_type", "unknown")
             # Map mempool.space types to canonical names.
             type_map = {
@@ -371,12 +409,7 @@ class MempoolSpaceSource(BtcDataSource):
         session = await self._get_session()
         url = self._url(f"tx/{_safe_txid_path(txid)}/merkleblock-proof")
         data = await _get_json(session, url)
-        try:
-            merkle: list[str] = data["merkle"]
-            pos: int = int(data["pos"])
-            return merkle, pos
-        except (KeyError, TypeError, ValueError):
-            raise NetworkError("Malformed merkle proof response from server")
+        return _esplora_merkle_proof(data)
 
 
 # ─────────────────────────────────────────────── BlockstreamSource
@@ -467,22 +500,19 @@ class BlockstreamSource(BtcDataSource):
 
         status_url = self._url(f"tx/{_safe_txid_path(txid)}/status")
         status = await _get_json(session, status_url)
-        if not isinstance(status, dict):
-            raise NetworkError("Unexpected tx status response")
-        confirmed = status.get("confirmed", False)
-        block_height = status.get("block_height")
-        if not confirmed or block_height is None:
+        block_height = _esplora_status_height(status)
+        if block_height is None:
             raise InsufficientConfirmationsError(have=0, required=min_confirmations)
 
         if min_confirmations > 0:
             tip = await self.get_tip_height()
             # Audit 2026-05-29 F-17: floor block_height to [1, tip] (see above).
-            if int(block_height) < 1 or int(block_height) > int(tip):
+            if block_height < 1 or block_height > int(tip):
                 raise NetworkError(
                     f"inconsistent confirmation data: block_height={block_height}, tip={int(tip)} "
                     "(expected 1 <= block_height <= tip)"
                 )
-            confs = int(tip) - int(block_height) + 1
+            confs = int(tip) - block_height + 1
             if confs < min_confirmations:
                 raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
 
@@ -507,15 +537,12 @@ class BlockstreamSource(BtcDataSource):
         session = await self._get_session()
         status_url = self._url(f"tx/{_safe_txid_path(txid)}/status")
         status = await _get_json(session, status_url)
-        if not isinstance(status, dict):
-            raise NetworkError("Unexpected tx status response")
-        confirmed = status.get("confirmed", False)
-        block_height = status.get("block_height")
-        if not confirmed or block_height is None:
+        block_height = _esplora_status_height(status)
+        if block_height is None:
             raise NetworkError(f"tx {str(txid)[:16]}… is unconfirmed")
         try:
-            return BlockHeight(int(block_height))
-        except (TypeError, ValueError, ValidationError):
+            return BlockHeight(block_height)
+        except ValidationError:
             raise NetworkError("Invalid block_height in tx status response")
 
     async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
@@ -524,8 +551,13 @@ class BlockstreamSource(BtcDataSource):
         session = await self._get_session()
         url = self._url(f"tx/{_safe_txid_path(txid)}")
         data = await _get_json(session, url)
+        # audit B7: the body must be about the tx we ASKED for. `_assert_tx_identity` already
+        # guarded the funding-reader reads; this one never called it, so a malicious or MITM'd
+        # source could answer with ANOTHER transaction's outputs.
+        _assert_tx_identity(data, txid)
+        index = _output_index(output_index)
         try:
-            vout = data["vout"][output_index]
+            vout = data["vout"][index]
             script_type = vout.get("scriptpubkey_type", "unknown")
             type_map = {
                 "p2pkh": "p2pkh",
@@ -547,12 +579,7 @@ class BlockstreamSource(BtcDataSource):
         session = await self._get_session()
         url = self._url(f"tx/{_safe_txid_path(txid)}/merkle-proof")
         data = await _get_json(session, url)
-        try:
-            merkle: list[str] = data["merkle"]
-            pos: int = int(data["pos"])
-            return merkle, pos
-        except (KeyError, TypeError, ValueError):
-            raise NetworkError("Malformed merkle proof response from server")
+        return _esplora_merkle_proof(data)
 
 
 # ─────────────────────────────────────────────── BitcoinCoreRpcSource
@@ -630,8 +657,8 @@ class BitcoinCoreRpcSource(BtcDataSource):
     async def get_tip_height(self) -> BlockHeight:
         result = await self._rpc("getblockcount", [])
         try:
-            return BlockHeight(int(result))
-        except (TypeError, ValueError, ValidationError):
+            return BlockHeight(nonneg_int(result))
+        except (ValueError, ValidationError):
             raise NetworkError("Invalid block count from Bitcoin Core")
 
     async def get_block_hash(self, height: BlockHeight) -> Hex32:
@@ -682,9 +709,17 @@ class BitcoinCoreRpcSource(BtcDataSource):
         data = await self._rpc("getrawtransaction", [str(txid), True])
         if not isinstance(data, dict):
             raise NetworkError("Unexpected raw tx response from Bitcoin Core")
-        confs = data.get("confirmations", 0)
+        # audit B7: `confs < min_confirmations` ran on a completely unvalidated field. A
+        # `{"confirmations": null}` or `"12"` raised a bare TypeError from the comparison, and —
+        # the fail-OPEN — `{"confirmations": Infinity}` compared False and the tx was accepted as
+        # sufficiently buried, forging the depth this gate exists to check. A MISSING key still
+        # means depth 0 (Bitcoin Core omits it for a mempool tx), which fails closed.
+        try:
+            confs = nonneg_int(data.get("confirmations", 0))
+        except ValueError as exc:
+            raise NetworkError("getrawtransaction 'confirmations' is not a usable depth; fail-closed") from exc
         if confs < min_confirmations:
-            raise InsufficientConfirmationsError(have=int(confs), required=min_confirmations)
+            raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
         hex_str = data.get("hex", "")
         if not isinstance(hex_str, str):
             raise NetworkError("Missing hex field in raw tx response")
@@ -705,16 +740,18 @@ class BitcoinCoreRpcSource(BtcDataSource):
         if block_height is None:
             raise NetworkError(f"tx {str(txid)[:16]}… is unconfirmed or blockheight missing")
         try:
-            return BlockHeight(int(block_height))
-        except (TypeError, ValueError, ValidationError):
+            return BlockHeight(nonneg_int(block_height))
+        except (ValueError, ValidationError):
             raise NetworkError("Invalid blockheight in getrawtransaction response")
 
     async def get_tx_output_script_type(self, txid: Txid, output_index: int) -> str:
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         data = await self._rpc("getrawtransaction", [str(txid), True])
+        _assert_tx_identity(data, txid)  # audit B7 — see the Esplora sibling
+        index = _output_index(output_index)
         try:
-            vout = data["vout"][output_index]
+            vout = data["vout"][index]
             script_type = vout["scriptPubKey"].get("type", "unknown")
             type_map = {
                 "pubkeyhash": "p2pkh",
@@ -1047,13 +1084,14 @@ class MempoolSpaceFundingReader:
     async def confirmations(self, txid: str) -> int:
         tx = txid if isinstance(txid, Txid) else Txid(txid)
         status = await self._http.tx_status(tx)
-        if not status.get("confirmed", False) or status.get("block_height") is None:
+        # `confirmed` was truthiness-tested, so the NON-EMPTY string `"false"` read as
+        # CONFIRMED — the same shape as the `spent` bug below. `_esplora_status_height`
+        # requires a real JSON boolean and a usable height, and still returns None (-> 0,
+        # the gate's fail-closed direction) for an honest "not confirmed yet".
+        block_height = _esplora_status_height(status)
+        if block_height is None:
             return 0  # unconfirmed / unknown -> 0 (the gate's >= N check fails closed)
         tip = await self._http.tip_height()
-        try:
-            block_height = _finite_int(status["block_height"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise NetworkError(f"unreadable block_height for {str(tx)[:16]}…; fail-closed") from exc
         # F-005: internal consistency check. A tx cannot be in a block above the tip, and
         # a real confirmed tx sits at height >= 1. An inverted/garbage response is a
         # confused or lying source — fail-closed LOUD (raise) rather than silently
@@ -1144,13 +1182,17 @@ class MempoolSpaceFundingReader:
         for u in data:
             try:
                 st = u.get("status", {}) if isinstance(u, dict) else {}
+                # audit B7: these were bare `int()`. A negative `value`/`vout` was returned
+                # verbatim, `1234.99` was silently truncated to `1234`, and `Infinity` escaped as
+                # OverflowError — absent from the tuple below. This is how the operator picks the
+                # funding outpoint to hand the BTC leg.
                 out.append(
                     {
                         "txid": str(Txid(u["txid"])),
-                        "vout": int(u["vout"]),
-                        "value_sats": int(u["value"]),
-                        "confirmed": bool(st.get("confirmed", False)),
-                        "height": int(st["block_height"]) if st.get("block_height") is not None else None,
+                        "vout": nonneg_int(u["vout"]),
+                        "value_sats": int(Satoshis(nonneg_int(u["value"]))),
+                        "confirmed": require_bool(st.get("confirmed", False)),
+                        "height": nonneg_int(st["block_height"]) if st.get("block_height") is not None else None,
                     }
                 )
             except (KeyError, TypeError, ValueError, ValidationError) as exc:
@@ -1223,14 +1265,27 @@ class BitcoinCoreFundingReader:
             # In the mempool / unconfirmed / unknown -> 0, so the reorg gate's ``>= N`` check
             # fails closed rather than treating an un-mined tx as buried.
             return 0
-        confs = int(confs)
+        try:
+            confs = finite_int(confs)
+        except ValueError as exc:
+            raise NetworkError("node reported an unreadable confirmation depth; fail-closed") from exc
         return confs if confs > 0 else 0
 
     @staticmethod
     def _btc_to_sats(btc_value) -> int:
         # BTC -> sats WITHOUT float error: str(value) is round-trip-safe for the node's ≤8-dp decimal,
         # and Decimal makes the *1e8 exact (a naive float *1e8 can land on 99999.999… and truncate).
-        sats = int((Decimal(str(btc_value)) * _SATS_PER_BTC).to_integral_value(rounding=ROUND_HALF_UP))
+        # audit B7: every failure mode here escaped as something the caller does not catch.
+        # `Decimal("twelve")` raises decimal.InvalidOperation (an ArithmeticError, NOT a
+        # ValueError); `Decimal("Infinity")` reaches int() as OverflowError and `Decimal("NaN")`
+        # as ValueError. All three left the maker's counter-funding gate as a bare traceback.
+        try:
+            amount = Decimal(str(btc_value))
+        except InvalidOperation as exc:
+            raise NetworkError("node reported an unreadable output value; fail-closed") from exc
+        if not amount.is_finite():
+            raise NetworkError("node reported a non-finite output value (Infinity/NaN); fail-closed")
+        sats = int((amount * _SATS_PER_BTC).to_integral_value(rounding=ROUND_HALF_UP))
         if sats < 0:
             raise NetworkError("node reported a negative output value; fail-closed")
         return sats

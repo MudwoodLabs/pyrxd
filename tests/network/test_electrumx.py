@@ -6,6 +6,7 @@ Uses lightweight asyncio mocks — no real network connections.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -18,7 +19,10 @@ from pyrxd.security.types import BlockHeight, RawTx, Txid
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-_VALID_TXID = "a" * 64
+# Derived from _VALID_RAW_TX below, not invented: `get_transaction` binds the returned
+# bytes to the requested txid (a server may return ANY transaction), so a fixture whose
+# hex does not hash to its txid is not a response an honest server can produce.
+_VALID_TXID = hashlib.sha256(hashlib.sha256(bytes(65)).digest()).digest()[::-1].hex()
 # A minimal but valid raw tx (65+ bytes so RawTx validates).
 _VALID_RAW_TX = bytes(65)
 _VALID_RAW_HEX = _VALID_RAW_TX.hex()

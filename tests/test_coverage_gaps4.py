@@ -8,6 +8,7 @@ Targets (from 2026-04-24 coverage report):
 from __future__ import annotations
 
 import asyncio
+import hashlib as _hashlib
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -338,8 +339,10 @@ class TestElectrumXClientConstruction:
 # ElectrumXClient — public API (mocked _call)
 # ---------------------------------------------------------------------------
 
-TXID_STR = "ab" * 32
 RAW_TX_HEX = "aa" * 65  # must be > 64 bytes for RawTx
+# Derived from RAW_TX_HEX: `get_transaction` binds the returned bytes to the requested
+# txid, so an honest server cannot answer with a tx that hashes to something else.
+TXID_STR = _hashlib.sha256(_hashlib.sha256(bytes.fromhex(RAW_TX_HEX)).digest()).digest()[::-1].hex()
 
 
 class TestElectrumXClientAPI:

@@ -8,6 +8,92 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **The watchtower's claim detection read `spent` through Python truthiness, so an
+  already-claimed BTC HTLC could read as unclaimed.** `mempool_space_outspend` used
+  `bool(data.get("spent"))` — the same defect as the fixed `bool(spend.get("spent", True))`
+  one layer down in `network/bitcoin.py`, pointing the other way. `{"spent": null}` (what a
+  broken or hostile Esplora-shaped server emits for "no data"), `{}`, `{"spent": 0}` and
+  `{"spent": ""}` all read as NOT SPENT. The multi-source fan-out could not rescue it: a
+  not-spent answer is a **successful** read, not an exception, so it never reached
+  `OutspendBtcClaimSource.claim_status`'s "every source failed" fail-closed branch. The
+  consequence is that the maker's on-chain claim goes undetected and `PAGE_CLAIM` is
+  silently suppressed — which that module's own docstring names as the forbidden failure for
+  an alert-only tower — and `swap_recovery`'s `read_btc_counter_leg` reports `state=LOCKED`,
+  "the counterparty has not claimed", to an operator mid-incident. `spent` must now be a real
+  JSON boolean; a source that cannot supply one fails and drops out of the fan-out, so a
+  tower blind across every source pages instead of reporting "not claimed". The spender txid
+  is now charset-checked as well as length-checked, because it is interpolated unquoted into
+  `/api/tx/{txid}/hex`.
+
+- **`BitcoinCoreRpcSource.get_raw_tx` accepted a forged confirmation depth.** `confs <
+  min_confirmations` ran on a completely unvalidated field: `{"confirmations": Infinity}`
+  compared `False` and the transaction passed the depth gate outright, and
+  `{"confirmations": null}` or `"12"` raised a bare `TypeError` from the comparison. This is
+  the confirmation gate `gravity/trade.py` uses before SPV finalize.
+
+- **`NodeRpcSource.is_unspent` read a bare `{}` as LIVE.** It was `isinstance(out, dict)`;
+  a real `gettxout` result always describes the output it claims exists, so a non-empty
+  `scriptPubKey.hex` and a `value` are now required — matching
+  `BitcoinCoreFundingReader.read_confirmed_unspent_output`, which has always required both.
+  This is the RSWP orderbook's `fillable` gate.
+
+- **`OverflowError` was absent from every fail-closed `except` tuple in the network layer.**
+  `json.loads` accepts the non-standard `Infinity` / `-Infinity` / `NaN` literals, and
+  `int(float("inf"))` raises `OverflowError`, which is not a `NetworkError` — so a single
+  hostile or broken response escaped as a bare traceback *past* the `except NetworkError`
+  that exists to contain it, on Esplora `block_height` / merkle `pos` / address-UTXO amounts,
+  ElectrumX balances / UTXOs / history / tip height / merkle, the Bitcoin Core funding
+  reader's depth, and the Radiant covenant leg's own depth read. `_btc_to_sats` was worse
+  still: `Decimal("twelve")` raises `decimal.InvalidOperation`, an `ArithmeticError` that no
+  caller catches, straight out of the maker's counter-funding gate.
+
+  The guard that already existed for this (`network/bitcoin._finite_int`, applied at exactly
+  three call sites) now lives in `pyrxd.network._guards` as `finite_int` / `nonneg_int` /
+  `require_bool` / `hex_str` / `merkle_branch` and is applied across both modules, so there
+  is one implementation rather than a second, subtly different copy — the shape that let two
+  independent base58 decoders each grow the same key-echo bug. Refusals raise `ValueError`
+  so every existing fail-closed tuple catches them unchanged. Alongside the non-finite guard
+  these also refuse `bool` (`int(True) == 1`), non-integral floats (`int(1234.99)` silently
+  truncates someone else's amount), stringly-typed numbers, and negative amounts, indices
+  and depths.
+
+- **Responses are now bound to the request they answer.** `get_tx_output_script_type` never
+  called `_assert_tx_identity` — which exists in the same module and guards the funding
+  reads — so a malicious or MITM'd source could answer `/tx/{txid}` with *another*
+  transaction's outputs. `ElectrumXClient.get_transaction` never re-derived the txid from the
+  bytes it was handed, and while `swap.resolve.fetch_transaction` and `failover._holds_tx`
+  each did their own check, `glyph/scanner.py` did not — so a hostile server could choose the
+  transaction whose Glyph metadata got parsed. `get_transaction_merkle` ignored the height it
+  asked about, letting the server pick which block it proved inclusion in. A negative output
+  index also silently *wrapped* (`vout[-1]` is the last output), reporting the script type of
+  a different output than the one named.
+
+- **`Xkey.__str__` serialised an xprv.** `Xprv` overrides it, but the base class is exported
+  and constructible, so `str(Xkey(xprv))` printed all 111 characters — master private key and
+  chain code, i.e. the whole wallet. The base class now redacts; `Xpub` opts back in, having
+  already proved in `__init__` that its payload carries a SEC1 public-key prefix, and
+  `serialize()` is the explicit way to get the string.
+
+- **`deserialize_ecdsa_der` echoed the signature** (`ValueError(f"invalid DER encoded
+  {signature.hex()}")`) on its catch-all branch. A signature is key material: `r` and `s`
+  produced with a reused or leaked nonce `k` — what the R-puzzle path in
+  `PrivateKey._sign_custom_k` yields — plus the message hash recover the private key. It was
+  a bare `ValueError`, so `security.errors.redact` never ran on it and `cli/main.py`'s
+  catch-all prints `cause: {exc}` to stderr. The branch is not reachable with a plain `bytes`
+  argument, so this was latent; the function is exported public API with no in-`src` callers.
+  `to_bytes(..., enc="hex")` likewise let CPython's `invalid literal for int() with base 16:
+  'XY'` through, two characters of a possibly-private key.
+
+- **`redact` never redacted a non-ASCII BIP-39 mnemonic.** Its heuristic required
+  `t.isascii()`, which exempted every non-Latin wordlist the SDK ships and supports —
+  `chinese_simplified` is a first-class `lang=` option of `mnemonic_from_entropy`. The
+  case test is now "contains no uppercase", which keeps the BIP-39 lowercase convention for
+  Latin wordlists while admitting caseless scripts. `redact`'s docstring now also states its
+  real limitation: it matches a value as a **whole**, so `redact(f"bad wif {wif}")` does
+  nothing, and per-token redaction is not the fix (most English words over 8 characters are
+  valid base58, and it would swallow the public txids that `ConfirmationTimeoutError`
+  deliberately keeps).
+
 - **`build_maker_offer_tx` and `build_payment_tx` now refuse a fee below the relay floor.**
   Both accepted any non-negative `fee_sats` and returned a fully-populated result —
   plausible `txid`, plausible accounting — for a transaction no node will relay. The
@@ -115,6 +201,31 @@ a Radiant Core v3.1.1 regtest one.
   aliases — one definition, two consumers.
 
 ### Added
+
+- **Two table-driven suites for the blind spots the fixes above came out of** — tests that
+  assert exception *types* and supply *well-formed* inputs cannot see either class.
+
+  - `tests/security/test_hostile_server_responses.py` (442 cases) sweeps a named shape space
+    — missing, present-but-falsy (`null` / `0` / `""` / `[]` / `{}`), wrong type, negative,
+    non-integral, `Infinity` / `-Infinity` / `NaN`, absurd magnitude, and a response that
+    does not correspond to the request — across every value-bearing field at every reachable
+    boundary: Esplora HTTP (mempool.space, blockstream.info), Bitcoin Core JSON-RPC,
+    ElectrumX WebSocket, the watchtower's outspend, the RSWP node source, and the Radiant
+    covenant leg. One contract is asserted everywhere: *a value-bearing read either returns
+    a correct, well-typed value or raises an `RxdSdkError`* — never a bare `OverflowError` /
+    `TypeError` / `ValueError` / `ArithmeticError`, and never a value derived from a field it
+    could not interpret. 227 of the 442 failed before the fixes above.
+
+  - `tests/security/test_secret_material_error_paths.py` (39 cases) extends
+    `test_key_material_never_echoed.py`'s discipline from the base58/WIF path to every other
+    entry point taking caller-supplied secret material — private keys, DER signatures,
+    mnemonics in *every shipped wordlist language*, xprv/xpub/chain code, seeds,
+    passphrases, AEAD and AES-CBC keys/IVs — checking every sink an operator can see: the
+    message, `repr`, `args`, the whole `__cause__`/`__context__` chain, and the `str`/`repr`
+    of anything holding the material. Keys are generated, never hand-written, and no
+    assertion prints one, including on failure.
+
+  - `tests/network/test_guards.py` covers the new `pyrxd.network._guards` primitives to 100%.
 
 - **Live-node consensus proofs for four builders that had none.** Each was covered only by
   offline tests, which re-hash a builder's own output and agree with it — a closed loop that

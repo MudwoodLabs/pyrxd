@@ -58,15 +58,22 @@ def _looks_like_key_material(value: str) -> bool:
     Checks for:
       * all hex characters (private keys, hashes, ciphertext)
       * all base58 characters (WIF, addresses, mnemonic seeds in base58)
-      * bip39-style all-lowercase ASCII words joined by spaces (>=8 tokens)
+      * bip39-style un-cased word lists joined by spaces (>=8 tokens), in ANY script
     """
     if _HEX_RE.match(value):
         return True
     if _BASE58_RE.match(value):
         return True
-    # BIP-39 mnemonic heuristic: >=8 space-separated ASCII lowercase tokens.
+    # BIP-39 mnemonic heuristic: >=8 space-separated alphabetic tokens with no uppercase.
+    #
+    # This used to require ``t.isascii()``, which silently exempted every non-Latin
+    # wordlist the SDK ships and supports — ``hd/wordlist/chinese_simplified.txt`` is a
+    # first-class ``lang=`` option, and a Chinese mnemonic passed through this function
+    # completely unredacted. ``str.islower()`` is also False for CJK (which has no case),
+    # so the case test is expressed as "contains no uppercase" instead: that keeps the
+    # BIP-39 lowercase convention for Latin wordlists while admitting caseless scripts.
     tokens = value.split()
-    return bool(len(tokens) >= 8 and all(t.isascii() and t.isalpha() and t.islower() for t in tokens))
+    return bool(len(tokens) >= 8 and all(t.isalpha() and not t.isupper() and t == t.lower() for t in tokens))
 
 
 def redact(value: Any) -> Any:
@@ -75,6 +82,23 @@ def redact(value: Any) -> Any:
     * ``str`` longer than 8 chars that looks like key material -> ``"<redacted>"``
     * ``bytes`` longer than 8 bytes -> ``"<redacted:Nb>"``
     * other types -> returned unchanged
+
+    .. warning::
+       This matches the value as a **whole**. ``redact(wif)`` redacts; ``redact(f"bad wif
+       {wif}")`` does **not** — the interpolated string is neither all-hex nor all-base58,
+       so the heuristic declines and the secret passes through verbatim. So the idiom at
+       the top of this module, ``raise KeyMaterialError(redact(bad_wif))``, is the *only*
+       defended shape, and ``raise ValidationError(f"bad wif {wif}")`` is undefended by
+       construction.
+
+       Making this per-token instead is not the fix: nearly every English word longer than
+       8 characters is also a valid base58 string (``"transaction"`` is), so per-token
+       redaction would replace ordinary prose with ``<redacted>``, and it would also
+       swallow the public txids that errors like :class:`ConfirmationTimeoutError`
+       deliberately keep verbatim because they are the only thing that makes the failure
+       actionable. The defence for the embedded shape is therefore the call-site
+       discipline this module documents, enforced by
+       ``tests/security/test_key_material_never_echoed.py`` — not a wider heuristic here.
     """
     if isinstance(value, bytes):
         if len(value) > 8:

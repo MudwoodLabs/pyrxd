@@ -60,6 +60,7 @@ from pyrxd.gravity.htlc_covenant import (
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.gravity.ref_authenticity import ResolvedRef
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord
+from pyrxd.network._guards import finite_int
 from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20
 
@@ -172,7 +173,17 @@ class RadiantChainIO:
         info = await self._client.get_transaction_verbose(txid)
         if not isinstance(info, dict):
             raise NetworkError("get_transaction_verbose did not return a dict")
-        return int(info.get("confirmations", 0) or 0)
+        # This is the RXD covenant leg's confirmation gate, and it was a bare
+        # `int(info.get("confirmations", 0) or 0)`: a string "999999" coerced to a depth, and a
+        # JSON `Infinity` raised OverflowError — not a NetworkError, so it escaped every
+        # `except NetworkError` on a value-moving path as a bare traceback. The `or 0` keeps a
+        # present-but-falsy value reading as depth 0, which is the fail-closed direction.
+        raw = info.get("confirmations", 0) or 0
+        try:
+            depth = finite_int(raw)
+        except ValueError as exc:
+            raise NetworkError("node reported an unreadable confirmation depth; fail-closed") from exc
+        return depth if depth > 0 else 0
 
     async def find_covenant_utxo(self, spk: bytes, *, expected_value: int | None = None) -> tuple[str, int, int]:
         """Locate the funded covenant UTXO for ``spk`` -> ``(outpoint, value, height)``.
