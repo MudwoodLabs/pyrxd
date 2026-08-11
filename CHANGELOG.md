@@ -6,6 +6,55 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.16.0] — 2026-08-11
+
+A security release. Most of it was found by asking a different question.
+
+Nine transaction builders had never been put in front of a node — every test that covered them
+was offline. Putting them there found defects in five, including two that had shipped for
+several releases: **`glyph transfer-ft` could send the sender's entire balance**, and **every
+MUT and WAVE reveal was rejected by consensus**, so no WAVE name could ever be registered.
+Fixing the second exposed a defect in the core signing path — the BIP143 `hashOutputHashes`
+walker desynchronised on `OP_REQUIREINPUTREF`, producing an invalid signature on *every* input
+of a transaction paying to such a script.
+
+**Fees are the other half.** Radiant has neither RBF nor CPFP, so a transaction built below
+the relay floor cannot be repaired — it holds its inputs until the 8-hour mempool expiry. Ten
+builders accepted a fee on trust, and four more sized their fee from a *trial* signature and
+never re-measured the final one, so roughly a quarter of plain sends and NFT transfers were
+built below the floor. `pyrxd.fee_sizing` is now the single answer to "what fee must this
+transaction pay", and every builder binds to it.
+
+Hostile server responses now fail closed. Several guards read a field through Python
+truthiness, so a present-but-falsy value inverted their meaning: the watchtower could read an
+already-claimed HTLC as unclaimed and silently suppress its page, and a forged confirmation
+depth passed the gate before SPV finalize.
+
+**The most uncomfortable findings were about the tests, not the code.** A differential test
+whose purpose was catching sighash bugs carried the same wrong opcode set as the bug it
+guarded, and certified it as correct. A `conftest` marker silently excluded 26 of 55 security
+tests from every CI run, via a substring that never once matched what it was written for. Six
+guards could not detect the defect they existed to prevent. Those are fixed, and each fix was
+proved by planting the defect and watching the test go red.
+
+Consensus rules pyrxd re-implements are now pinned to Radiant Core source that is vendored,
+digest-checked, and *parsed* rather than transcribed — the ref-opcode family, the operand
+widths, and the script walkers.
+
+### Upgrade notes
+
+- **Fee floors are enforced, not advisory.** Builders that previously accepted any `fee` /
+  `fee_rate` now refuse one below Radiant's relay floor. If you were passing a low fee, you
+  were building transactions the network would not relay; they now raise instead. Legitimate
+  sub-floor cases (a lower-floor node, a trial sizing pass) take an explicit opt-out.
+- **`DeadlineFeePolicy.protocol_floor_per_kb` now defaults to the effective relay rate**
+  (10,000,000/kB), not the legacy 1,000,000. Pass `allow_below_protocol_floor=True` if you
+  genuinely target a lower-floor node.
+- **`GlyphBuilder.build_nft_transfer_tx` and the RSWP v3 covenant builders validate their fee
+  rate up front**, so a bad rate fails at the call rather than on broadcast.
+- A malformed WIF, xprv or signature no longer appears in an exception message. If you were
+  parsing error text to recover the offending value, it is gone deliberately.
+
 ### Security
 
 - **`Reader.read_var_int_num` accepted non-canonical CompactSize, under `Transaction`
