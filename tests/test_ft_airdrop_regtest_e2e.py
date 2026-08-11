@@ -234,6 +234,11 @@ def test_airdrop_with_an_advisory_royalty_output_is_accepted(node, deployed):  #
     It is ADVISORY — nothing in this transaction, or in any script pyrxd builds,
     compels it. What this proves is only that adding it does not break the FT
     conservation the chain *does* enforce.
+
+    ``pay_royalty=True`` is required to make one appear at all: ``GlyphRoyalty``
+    defaults to ``enforced=False``, and since #393 the default (``None``)
+    consults that flag rather than paying regardless. Without the opt-in this
+    builds an airdrop with no royalty output and proves nothing.
     """
     fresh = _deploy_ft(node)
     royalty = GlyphRoyalty(bps=250, address=PrivateKey().public_key().address())
@@ -244,6 +249,7 @@ def test_airdrop_with_an_advisory_royalty_output_is_accepted(node, deployed):  #
         funding=[_plain_funding(node)],
         royalty=royalty,
         sale_price=40_000_000,
+        pay_royalty=True,
     )
     assert [p.photons for p in result.royalty_payouts] == [1_000_000]
 

@@ -6,6 +6,89 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Two consensus-level defects, both found by putting builders that had never seen a node to
+a Radiant Core v3.1.1 regtest one.
+
+### Fixed
+
+- **`prepare_mutable_reveal` / `prepare_wave_reveal` emitted a reveal no node would accept.**
+  Both output scripts carried the *same* 36-byte ref under `OP_PUSHINPUTREFSINGLETON`, and
+  a transaction may not have two outputs claiming one singleton ref — `CScript::GetPushRefs`
+  files a `0xd8` ref into `foundDisallowedSiblingRefs` as well as the push-ref set. Every MUT
+  and WAVE reveal built as the docstring described was rejected with
+  `bad-txns-inputs-outputs-invalid-transaction-reference-operations`, since 0.9.0. No MUT or
+  WAVE token could be minted at all. Nothing was at risk of loss — the reveal never reached
+  the chain and the commit output stayed spendable — but the two builders were unusable.
+
+  The contract's own body settles what the right ref is: it recomputes the token ref as
+  `mutable_ref.vout - 1` (`OP_DUP 20 OP_SPLIT OP_BIN2NUM OP_1SUB OP_4 OP_NUM2BIN OP_CAT`), so
+  the pairing is chain arithmetic, not convention. `prepare_mutable_reveal` now gives the
+  contract `commit_txid:(commit_vout + 1)` and returns it as `MutableRevealScripts.mutable_ref`.
+  The reveal accordingly needs **two inputs** — the commit outpoint and a plain seed output one
+  vout along, whose spend is what lets an output push the contract's ref. This matches Photonic
+  Wallet (`packages/lib/src/mint.ts`). Node-proven end to end, including a `mod` mutation that
+  installs a new payload hash: `tests/test_mut_wave_regtest_e2e.py`.
+
+- **The BIP143 preimage's ref walker desynchronised on `OP_REQUIREINPUTREF`.**
+  `hashOutputHashes` hashes each output's push-ref set, and `_get_push_refs` collected the
+  right two opcodes (`0xd0`, `0xd8`) but walked only those two. `OP_REQUIREINPUTREF` (`0xd1`),
+  `OP_DISALLOWPUSHINPUTREF` (`0xd2`) and `OP_DISALLOWPUSHINPUTREFSIBLING` (`0xd3`) carry a
+  36-byte immediate operand as well (`GetScriptOp`); skipping one as a bare opcode resumed the
+  walk inside the ref bytes and read them as opcodes. Measured over 2,000 random refs on a
+  Photonic-shaped auth script, that produced the wrong ref set **1,606 times**, raised 20 times,
+  and was accidentally right 374 times — so pyrxd could not reliably sign *any* transaction with
+  an output carrying one of those three opcodes, and the node rejected it with
+  `mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG
+  operation)`. Nothing pyrxd itself builds emits them today, so no shipped path was affected;
+  paying to a Photonic authority token, a delegate-burn output, or the auth-shaped token a MUT
+  mutation requires was. The walker now consumes all five operands and collects two, from the
+  single shared `pyrxd.constants.REF_OPERAND_OPCODES` that `pyrxd.glyph.script.REF_OPCODES` now
+  aliases — one definition, two consumers.
+
+### Added
+
+- **Live-node consensus proofs for four builders that had none.** Each was covered only by
+  offline tests, which re-hash a builder's own output and agree with it — a closed loop that
+  cannot answer whether a node accepts the bytes. All four are now exercised against real
+  regtest consensus, asserting on confirmed on-chain state rather than on return values, and
+  every case carries a negative control whose rejection reason is asserted by name.
+
+  - `tests/test_cold_recovery_regtest_e2e.py` — `build_cold_claim` / `build_cold_refund`
+    (the offline swap-recovery toolkit shipped in 0.14.0). The claim is **mined**, spends the
+    covenant, and pays the pinned taker holder script; redirecting `output[0]` at an attacker
+    and substituting a wrong preimage are both refused. The CSV refund's **same bytes** are
+    walked across the timelock boundary one block at a time — refused at 1 and 2
+    confirmations, accepted at 3 — then mined, with `version == 2` and the covenant input's
+    `nSequence` carrying the lock. A genuinely 0-conf covenant (funding invalidated back into
+    the mempool) is refused, which is the audit-B5 fix measured against real chain state.
+  - `tests/test_gravity_maker_offer_regtest_e2e.py` — `build_maker_offer_tx`. The offer
+    transaction confirms, the mined output is byte-equal to `P2SH(offer_redeem)`, and the
+    offer is then **taken** on chain by `build_claim_tx`. Controls: raising the offer output
+    by one photon after signing, and a stranger attempting the take.
+  - `tests/test_btc_payment_regtest_e2e.py` — `build_payment_tx` on bitcoind regtest. Both
+    input types (P2WPKH and P2SH-P2WPKH) and all four destination types confirm; change
+    returns to the sender's own script; sub-dust change is really swept into the fee (one
+    output on chain). Controls: a payment amount raised by one satoshi after signing, and a
+    wrapped-segwit UTXO spent as native.
+
+  The Radiant relay floor is measured at the boundary rather than assumed: a fee input worth
+  exactly `ceil(size x rate / 1000)` photons is accepted and one photon less is rejected with
+  `min relay fee not met`, confirming `DeadlineFeePolicy.min_relay_fee` reproduces the node's
+  own arithmetic against `GetTotalSize`. Because the fee value is part of the sighash, the
+  boundary value is searched for — a fixed-point iteration can two-cycle between adjacent DER
+  signature lengths.
+
+### Documented
+
+- **`build_maker_offer_tx` and `build_payment_tx` enforce no relay-fee floor**, unlike
+  `pyrxd.gravity.htlc_spend`, which refuses to return an under-fee'd spend. Both take
+  `fee_sats` on trust and return a fully-populated result — plausible `txid`, plausible
+  accounting — for a transaction no node will relay. Measured: a 190-byte maker-offer
+  transaction at `fee_sats=10_000` (the value the offline suite uses throughout) is rejected
+  with `66: min relay fee not met` against a node floor of 190,000 photons, and 1,900,000
+  photons at the reference mainnet node's effective rate. Radiant has neither RBF nor CPFP,
+  so the funding UTXO is then stuck until the 8h mempool expiry. Both behaviours are now
+  pinned by a test that says so; neither builder was changed.
 Plain RXD sends — the most-used path in the SDK — had never been put to a node. Every test
 covering `RxdWallet.build_send_tx` and `build_send_max_tx` asserted on the builder's own
 return value, which is the one witness that cannot tell a working transaction from a
@@ -103,6 +186,16 @@ both. It is fixed here.
   Opt-in like the other e2e suites (`@pytest.mark.integration` + `RADIANT_REGTEST=1`), reusing
   the throwaway-container fixture from `test_htlc_regtest_e2e`. Regtest only; moves no real
   value.
+- `tests/test_mut_wave_regtest_e2e.py` — live-regtest consensus proof for the MUT and WAVE
+  reveals: the rejected pre-fix shape, the ref arithmetic read off a confirmed transaction,
+  discovery through `find_glyphs`, an NFT output spent onward, a `mod` mutation with two
+  negative controls on the covenant's binds, the signing regression above, and WAVE name
+  recovery from the confirmed envelope.
+- `tests/test_ft_transfer_regtest_e2e.py` — live-regtest consensus proof for
+  `FtUtxoSet.build_transfer_tx`: a 250-unit transfer out of a 100,000,000-unit holding
+  delivering exactly 250 (the shape of the old balance-draining sizing bug), unit conservation,
+  the recipient spending onward, the whole-balance boundary, an inflating transfer rejected by
+  consensus, and the no-RXD-funding refusal.
 
 - **`tests/test_wallet_fee_sizing.py`** — the always-on half of the same proof: 69 offline
   tests, no docker. The invariant is asserted over 200 builds per cell across one/two/three/

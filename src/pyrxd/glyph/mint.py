@@ -167,9 +167,10 @@ _PLACEHOLDER_COMMIT_TXID = "00" * 32
 PENDING_MINT_SCHEMA_VERSION = 1
 
 # Protocol tags whose reveal is NOT the single-output shape this module builds. MUT and
-# WAVE need a second contract output (``prepare_mutable_reveal``), and DMINT needs the
-# parallel contract set (``prepare_dmint_deploy``). Minting one of those through here
-# would broadcast a commit whose reveal this module cannot build — i.e. strand it.
+# WAVE need a second contract output AND a second commit outpoint to seed its singleton
+# ref (``prepare_mutable_reveal``), and DMINT needs the parallel contract set
+# (``prepare_dmint_deploy``). Minting one of those through here would broadcast a commit
+# whose reveal this module cannot build — i.e. strand it.
 #
 # CONTAINER is deliberately ABSENT (0.15.0). A container's reveal is the ordinary
 # single-output NFT reveal — its locking script is the plain 63-byte singleton and
