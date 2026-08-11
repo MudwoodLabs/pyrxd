@@ -6,6 +6,66 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+Plain RXD sends — the most-used path in the SDK — had never been put to a node. Every test
+covering `RxdWallet.build_send_tx` and `build_send_max_tx` asserted on the builder's own
+return value, which is the one witness that cannot tell a working transaction from a
+plausible-looking one. Handing them to a Radiant Core v3.1.1 regtest node found a defect in
+both.
+
+### Known issues
+
+- **Both send builders can emit a transaction below the relay floor.** The fee is sized from
+  a *trial* signing pass (`src/pyrxd/wallet.py:244-247` for `build_send_tx`,
+  `295-302` for `build_send_max_tx`) and the final signed transaction is never re-measured.
+  The final pass signs over different outputs, so it produces a different DER signature —
+  71 or 72 bytes, split roughly evenly — and whenever the final signature is the longer one
+  the transaction contains more bytes than its fee paid for.
+
+  Measured over 2,000 builds per shape at the default rate: **27.1%** of one-input sends,
+  **34.5%** of three-input sends and **31.6%** of two-input sweeps land short by at least one
+  byte. `DEFAULT_FEE_RATE` is 10,000 photons/byte, which is *exactly* the mainnet relay floor,
+  so on mainnet a shortfall of one byte is a rejection. A regtest node built at its own
+  advertised floor refuses these with `66: min relay fee not met`.
+
+  Radiant has neither RBF nor CPFP, so an underpaid transaction cannot be repaired — it is
+  abandoned, or it holds its inputs until mempool expiry on any node whose floor let it in.
+  `build_send_max_tx` is the worse case of the two: a sweep has no change output to absorb an
+  adjustment, and the caller has been told this is their whole balance.
+
+  Not fixed here. The fix is to re-measure after the final signing pass and rebuild if the
+  size grew, which changes fee arithmetic and belongs in its own reviewed change. The
+  invariant is recorded as a `strict=True` xfail
+  (`test_every_send_pays_at_least_the_rate_it_was_built_for`) so a fix turns that test into a
+  failure and the marker gets removed rather than outliving the bug.
+
+### Tests
+
+- **`tests/test_wallet_send_regtest_e2e.py`** — live-regtest consensus coverage for
+  `build_send_tx` and `build_send_max_tx`, the two builders that had no node-level proof
+  anywhere in the suite. Every assertion reads a *confirmed* transaction or the node's own
+  UTXO set (`scantxoutset`), never the builder's return value. 15 passed, 1 xfailed.
+
+  Proven: an ordinary send with change lands the requested amount and returns the rest;
+  **the change output is spendable** (re-spent by a second builder call and confirmed — the
+  0.15.0 CONTAINER defect was an unspendable output that looked perfect from Python);
+  greedy selection spends exactly the coins it selected and leaves the rest unspent;
+  `send_max` empties the source script's UTXO set with nothing stranded; the fee reported by
+  the builder equals the fee the chain took at one, two and three inputs; sub-546 change is
+  burned to fee as a *pyrxd policy* choice, and a 1-photon output relays, confirming
+  `DUST_THRESHOLD` is a send policy and not a chain rule.
+
+  Each case carries a negative control quoting the node's reject reason: an output mutated
+  after signing →
+  `16: mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG operation)`;
+  re-signed outputs exceeding inputs → `16: bad-txns-in-belowout`; a stranger's key over the
+  wallet's coin →
+  `16: mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)`;
+  a below-floor fee → `66: min relay fee not met`.
+
+  Opt-in like the other e2e suites (`@pytest.mark.integration` + `RADIANT_REGTEST=1`), reusing
+  the throwaway-container fixture from `test_htlc_regtest_e2e`. Regtest only; moves no real
+  value.
+
 ## [0.15.0] — 2026-08-11
 
 Collections work, and the feature that claimed to build them is gone.
