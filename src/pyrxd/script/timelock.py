@@ -44,7 +44,6 @@ from __future__ import annotations
 from enum import Enum
 
 from ..constants import LOCKTIME_THRESHOLD as _LOCKTIME_THRESHOLD
-from ..constants import PUBLIC_KEY_HASH_BYTE_LENGTH, OpCode
 from ..constants import (
     PUBLIC_KEY_HASH_BYTE_LENGTH,
     SEQUENCE_FINAL,

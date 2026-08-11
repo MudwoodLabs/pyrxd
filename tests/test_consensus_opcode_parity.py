@@ -277,6 +277,12 @@ class TestScalarConsensusLimits:
             if (name.startswith("MAX_") or name.endswith("_THRESHOLD"))
             and isinstance(getattr(pyrxd_constants, name), int)
             and name != "MAX_OPCODE"  # derived, not a literal — checked separately above
+            # pyrxd's OWN encoder bound, not a Radiant limit: the miner emits the message
+            # with OP_PUSHDATA1, whose length field is one byte, so 255 is the most it can
+            # express. Radiant's would-be datacarrier limits (nMaxDatacarrierBytes=1024,
+            # MAX_OP_RETURN_RELAY=223) are standardness, and standardness never runs here
+            # (fRequireStandard is hardcoded false). There is nothing upstream to compare to.
+            and name != "MAX_OP_RETURN_MSG_BYTES"
         }
         unchecked = declared - set(_PINNED_SCALAR_LIMITS)
         assert not unchecked, (

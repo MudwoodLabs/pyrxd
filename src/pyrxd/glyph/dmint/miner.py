@@ -33,8 +33,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pyrxd.hash import hash256, sha256
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES
+from pyrxd.hash import hash256, sha256
 from pyrxd.security.errors import (
     ContractExhaustedError,
     InvalidFundingUtxoError,
