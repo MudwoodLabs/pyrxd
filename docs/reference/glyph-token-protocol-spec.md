@@ -1364,6 +1364,7 @@ integration`) reproduces every row.
 | Same, with the child **not** re-created (the child NFT is consumed) | **accepted** — which is the hazard | — |
 | Any spend of the resulting 100-byte output | rejected | `mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)` |
 | Re-minting the consumed child as `0xd8 <child_ref>` from that output | rejected | `bad-txns-inputs-outputs-invalid-transaction-reference-operations` |
+| Container naming an **FT** ref, with the FT kept alive in a sibling output | rejected | `mandatory-script-verify-flag-failed (Script failed an OP_NUMEQUALVERIFY operation)` |
 | A token claiming `in` for a container it never spent | **accepted** — membership is advisory (§9.4) | — |
 
 ## See also
