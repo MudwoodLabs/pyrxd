@@ -47,11 +47,13 @@ that matters parses v3.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 import click
 
 from ..glyph.types import GlyphRef
+from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY
 from ..keys import PrivateKey
 from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Txid
@@ -83,14 +85,42 @@ from .format import emit, sanitize_terminal
 from .glyph_helpers import _BroadcastSummary, _confirm_or_abort
 from .prompts import _load_wallet
 
-# Broadcast-tx size guesses for the single-pass fee estimate (photons = rate × size/1000,
-# floored at 1000). Deliberately generous — a slight overpay beats a stuck tx; use
-# --fee for exact control.
-_TX_BASE_BYTES = 220
-_TX_PER_INPUT_BYTES = 150
-_TX_PER_OUTPUT_BYTES = 40
-_MIN_FEE_PHOTONS = 1_000
+# Fee sizing ---------------------------------------------------------------------
+#
+# ``ctx.fee_rate`` is photons per **BYTE** (:func:`pyrxd.cli.config.validated_fee_rate`
+# enforces the relay floor in exactly those units, and the default 10_000 sits on it),
+# so a transaction's fee is ``rate × size`` — NOT ``rate × size / 1000``. An earlier
+# cut of this module divided by 1000, which fee'd every ``swap post``/``take``/
+# ``cancel`` at one-thousandth of Radiant's relay floor: unrelayable, and with neither
+# RBF nor CPFP (threat-model S21) unfixable for the 8-hour mempool expiry. On ``cancel``
+# — the ONLY hard revocation for a v2 order — that failed silently while the order
+# stayed takeable, so it is a fund-safety bug, not a tuning mistake.
+#
+# The fee is now sized from the transaction's OWN serialized length
+# (:func:`_build_at_measured_fee`), not from a byte model. The constants below only
+# SEED the first pass, which has to pick funding before there is a transaction to
+# measure; the loop then re-fees from the real bytes and rebuilds if the seed was low.
+# They are the minimum realistic shape, deliberately — over-seeding overpays, and the
+# loop already makes under-seeding impossible to broadcast.
+_TX_BASE_BYTES = 10  # version 4 + locktime 4 + the two count varints
+_TX_PER_INPUT_BYTES = 150  # signed P2PKH input; measured 148 B
+_TX_PER_OUTPUT_BYTES = 90  # covers a Glyph FT output (measured 84 B); a P2PKH output is 34 B
+# Trial and final passes sign DIFFERENT messages, so their DER signatures can differ in
+# length by up to 3 bytes per input — both `r` and `s` can shed a leading zero at once.
+# Measured and reasoned in :data:`pyrxd.glyph.ft._SIG_SIZE_SLACK_BYTES`; mirrored here
+# because at the relay floor those bytes are the difference between relayed and stuck.
+_SIG_SIZE_SLACK_BYTES = 3
+# Bound on the measure-and-rebuild loop: a larger fee can pull in another funding input,
+# which grows the transaction, which raises the fee again. Converges in 1-2 passes in
+# practice; the bound turns a pathological wallet into a clean error, not a hang.
+_FEE_SIZING_PASSES = 4
 _MAX_FUNDING_INPUTS = 8
+
+# The relay floor is BOUND to :mod:`pyrxd.gravity.fee_policy` rather than restated, so
+# the swap CLI, the glyph builders and the HTLC stack cannot drift apart on what the
+# node actually demands (``ceil(size × effective_minrelaytxfee / 1000)``, sized against
+# ``tx.GetTotalSize()`` — the full serialized size, not vsize).
+_RELAY_POLICY = DEFAULT_RADIANT_DEADLINE_FEE_POLICY
 
 
 # --------------------------------------------------------------------------- arg parsing
@@ -168,13 +198,95 @@ def _describe_asset(asset: Asset) -> str:
     return f"{asset.amount} units of FT {asset.ref.txid}:{asset.ref.vout}"
 
 
-def _estimate_fee(ctx: CliContext, n_inputs: int, n_outputs: int, override: int | None) -> int:
-    if override is not None:
-        if override < 0:
+def _fee_for_size(ctx: CliContext, size_bytes: int) -> int:
+    """Photons a *size_bytes* transaction must pay: the operator's rate, never below the relay floor.
+
+    ``ctx.fee_rate`` is photons per BYTE, so this is ``rate × size``. The floor is a
+    hard lower bound rather than an assumption about ``fee_rate``: a ``CliContext``
+    built outside :func:`pyrxd.cli.config.load` (tests, embedders) can carry a rate
+    that never went through ``validated_fee_rate``, and an unrelayable swap
+    transaction cannot be repaired on Radiant.
+    """
+    return max(ctx.fee_rate * size_bytes, _RELAY_POLICY.min_relay_fee(size_bytes))
+
+
+def _seed_fee(ctx: CliContext, n_inputs: int, n_outputs: int, extra_bytes: int) -> int:
+    """First-pass fee, from the modelled shape. Only used to pick funding — see the header note."""
+    size = _TX_BASE_BYTES + n_inputs * _TX_PER_INPUT_BYTES + n_outputs * _TX_PER_OUTPUT_BYTES + extra_bytes
+    return _fee_for_size(ctx, size)
+
+
+def _measured_fee(ctx: CliContext, tx: Transaction) -> int:
+    """The fee *tx* must pay, sized from its own serialized bytes plus per-input signature slack."""
+    return _fee_for_size(ctx, len(tx.serialize()) + _SIG_SIZE_SLACK_BYTES * len(tx.inputs))
+
+
+def _assert_relayable(tx: Transaction, fee: int) -> None:
+    """Refuse to hand back a transaction the node would reject as ``min relay fee not met``.
+
+    A backstop, not decoration. On the computed path the sizing loop should make this
+    unreachable; on the ``--fee`` path it is the whole check. Failing here costs an
+    aborted command — broadcasting instead costs the inputs for 8 hours (mempool
+    expiry) with no RBF and no CPFP to bump them, and on ``cancel`` it leaves the
+    order takeable while the CLI reports success.
+    """
+    size = len(tx.serialize())
+    floor = _RELAY_POLICY.min_relay_fee(size)
+    if fee < floor:
+        raise UserError(
+            f"a fee of {fee} photons is below Radiant's relay floor for this {size}-byte transaction ({floor} photons)",
+            cause="the node would reject it with 'min relay fee not met', and Radiant has no RBF "
+            "and no CPFP — it could not be bumped and would hold its inputs until mempool expiry",
+            fix=f"raise --fee to at least {floor}, or drop --fee and let the fee rate size it",
+        )
+
+
+async def _build_at_measured_fee(
+    ctx: CliContext,
+    fee_override: int | None,
+    *,
+    build: Callable[[list[FundingInput] | None, int], Transaction],
+    select_funding: Callable[[int], Awaitable[list[FundingInput] | None]] | None = None,
+    seed_inputs: int,
+    seed_outputs: int,
+    seed_extra_bytes: int = 0,
+) -> tuple[Transaction, int]:
+    """Build a transaction whose fee is sized from ITS OWN serialized length.
+
+    *build* takes ``(funding, fee)`` and returns the signed transaction; *select_funding*
+    takes the fee under consideration and returns the funding inputs to cover it (``None``
+    for the self-funded covenant spends, which take their fee out of the input's value).
+
+    Why a loop rather than a one-shot estimate: the modelled shape cannot see the advert
+    script's real length, an FT output's 84 bytes, or how many UTXOs the wallet had to
+    scrape together, and every one of those was under-counted by the old model. So the
+    first pass exists only to pick funding; the fee that ships is derived from
+    ``len(tx.serialize())``. A larger fee can pull in another funding input and grow the
+    transaction, so this iterates — upward only, since overpaying relays and underpaying
+    does not.
+    """
+    if fee_override is not None:
+        if fee_override < 0:
             raise UserError("--fee must be non-negative")
-        return override
-    size = _TX_BASE_BYTES + n_inputs * _TX_PER_INPUT_BYTES + n_outputs * _TX_PER_OUTPUT_BYTES
-    return max(_MIN_FEE_PHOTONS, (ctx.fee_rate * size + 999) // 1000)
+        funding = await select_funding(fee_override) if select_funding is not None else None
+        tx = build(funding, fee_override)
+        _assert_relayable(tx, fee_override)
+        return tx, fee_override
+
+    fee = _seed_fee(ctx, seed_inputs, seed_outputs, seed_extra_bytes)
+    for _ in range(_FEE_SIZING_PASSES):
+        funding = await select_funding(fee) if select_funding is not None else None
+        tx = build(funding, fee)
+        needed = _measured_fee(ctx, tx)
+        if needed <= fee:
+            _assert_relayable(tx, fee)
+            return tx, fee
+        fee = needed
+    raise UserError(
+        "could not settle on a fee for this transaction",
+        cause="each larger fee pulled in another funding input, which grew the transaction again",
+        fix="consolidate the wallet's small plain-RXD UTXOs, or pass an explicit --fee",
+    )
 
 
 def _cancel_needs_fee_funding(give_kind: str, give_value: int, fee: int) -> bool:
@@ -397,15 +509,20 @@ def swap_reserve_cmd(ctx: CliContext, amount: int, expiry_height: int, fee_overr
         async with ctx.make_client() as client:
             funds = await _collect_funds(ctx, client)
             owner_pkh = funds.change_pkh()
-            fee = _estimate_fee(ctx, 2, 2, fee_override)
-            funding = await _rxd_funding(client, funds, amount + fee)
-            reserve_tx = prepare_covenant_offer(
-                funding=funding,
-                photons=amount,
-                owner_pkh=owner_pkh,
-                expiry_height=expiry_height,
-                change_pkh=owner_pkh,
-                fee=fee,
+            reserve_tx, fee = await _build_at_measured_fee(
+                ctx,
+                fee_override,
+                select_funding=lambda f: _rxd_funding(client, funds, amount + f),
+                build=lambda funding, f: prepare_covenant_offer(
+                    funding=funding,
+                    photons=amount,
+                    owner_pkh=owner_pkh,
+                    expiry_height=expiry_height,
+                    change_pkh=owner_pkh,
+                    fee=f,
+                ),
+                seed_inputs=1,
+                seed_outputs=2,
             )
             _confirm_or_abort(
                 ctx,
@@ -495,10 +612,20 @@ def swap_post_cmd(ctx: CliContext, give_outpoint: str, receive_spec: str, fee_ov
                 )
                 title = "POST public swap order (no expiry — cancel is the only revocation)"
 
-            fee = _estimate_fee(ctx, 1, 2, fee_override)
-            funding = await _rxd_funding(client, funds, fee + _MIN_FEE_PHOTONS, exclude=(give_txid, give_vout))
-            advert_tx = build_advert_tx(
-                advert_script=post.advert_script, funding=funding, change_pkh=funds.change_pkh(), fee=fee
+            advert_tx, fee = await _build_at_measured_fee(
+                ctx,
+                fee_override,
+                select_funding=lambda f: _rxd_funding(client, funds, f, exclude=(give_txid, give_vout)),
+                build=lambda funding, f: build_advert_tx(
+                    advert_script=post.advert_script, funding=funding, change_pkh=funds.change_pkh(), fee=f
+                ),
+                seed_inputs=1,
+                seed_outputs=2,
+                # The advert OP_RETURN is the single biggest output in this transaction
+                # (measured 226-315 B depending on how many token ids it carries), and it
+                # is known exactly before the build — so seed with the real length rather
+                # than a per-output average that cannot possibly cover it.
+                seed_extra_bytes=len(post.advert_script) + 9,
             )
             _confirm_or_abort(
                 ctx,
@@ -566,35 +693,42 @@ def swap_take_cmd(ctx: CliContext, advert_arg: str, fee_override: int | None) ->
                 # expiry races the maker's live refund.
                 tip_height = int(await client.get_tip_height())
             funds = await _collect_funds(ctx, client)
-            fee = _estimate_fee(ctx, 1 + 2, 4, fee_override)
-            if demand_asset.kind == "ft":
-                # The demand is paid in tokens; plain RXD only needs to cover the
-                # fee (the library enforces per-ref conservation + emits change).
-                funding = await _ft_funding(client, funds, demand_asset.ref, demand_asset.amount)
-                funding += await _rxd_funding(client, funds, fee)
-            else:
-                funding = await _rxd_funding(client, funds, demand.value + fee)
             taker_pkh = funds.change_pkh()
-            if order.expiry_height is not None:
-                completion = take_covenant_order(
+
+            async def _funding(fee: int) -> list[FundingInput]:
+                if demand_asset.kind == "ft":
+                    # The demand is paid in tokens; plain RXD only needs to cover the
+                    # fee (the library enforces per-ref conservation + emits change).
+                    picked = await _ft_funding(client, funds, demand_asset.ref, demand_asset.amount)
+                    return picked + await _rxd_funding(client, funds, fee)
+                return await _rxd_funding(client, funds, demand.value + fee)
+
+            def _build(funding, fee: int) -> Transaction:
+                if order.expiry_height is not None:
+                    return take_covenant_order(
+                        order,
+                        give_source_tx=give_source,
+                        funding=funding,
+                        taker_receive_pkh=taker_pkh,
+                        taker_change_pkh=taker_pkh,
+                        fee=fee,
+                        current_height=tip_height,
+                    )
+                return take_rswp_order(
                     order,
                     give_source_tx=give_source,
                     funding=funding,
                     taker_receive_pkh=taker_pkh,
                     taker_change_pkh=taker_pkh,
                     fee=fee,
-                    current_height=tip_height,
                 )
+
+            completion, fee = await _build_at_measured_fee(
+                ctx, fee_override, select_funding=_funding, build=_build, seed_inputs=2, seed_outputs=3
+            )
+            if order.expiry_height is not None:
                 gives = Asset(kind="rxd", amount=give_source.outputs[order.offered_utxo_index].satoshis)
             else:
-                completion = take_rswp_order(
-                    order,
-                    give_source_tx=give_source,
-                    funding=funding,
-                    taker_receive_pkh=taker_pkh,
-                    taker_change_pkh=taker_pkh,
-                    fee=fee,
-                )
                 gives = _asset_of(
                     give_source.outputs[order.offered_utxo_index].satoshis,
                     give_source.outputs[order.offered_utxo_index].locking_script.serialize(),
@@ -653,30 +787,47 @@ def swap_cancel_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
                 owner_pkh, expiry = _inner_p2pkh_pkh(give_spk)
                 maker_key = funds.key_for_pkh(owner_pkh)
                 give_asset = Asset(kind="rxd", amount=give_out.satoshis)
-                fee = _estimate_fee(ctx, 1, 1, fee_override)
-                cancel = build_covenant_cancel_tx(
-                    covenant_source_tx=give_source,
-                    covenant_vout=give_vout,
-                    maker_key=maker_key,
-                    refund_pkh=owner_pkh,
-                    fee=fee,
+                cancel, fee = await _build_at_measured_fee(
+                    ctx,
+                    fee_override,
+                    build=lambda _funding, f: build_covenant_cancel_tx(
+                        covenant_source_tx=give_source,
+                        covenant_vout=give_vout,
+                        maker_key=maker_key,
+                        refund_pkh=owner_pkh,
+                        fee=f,
+                    ),
+                    seed_inputs=1,
+                    seed_outputs=1,
                 )
                 title = "CANCEL v3 covenant reservation (SWAP-branch self-spend, before OR after expiry)"
                 extra_lines = [f"covenant expiry: height {expiry} (informational — cancel works at Any height)"]
             else:
                 give_asset = _asset_of(give_out.satoshis, give_spk)
                 maker_key = funds.key_for_pkh(_owner_pkh_of(give_spk))
-                fee = _estimate_fee(ctx, 2, 2, fee_override)
-                funding = None
-                if _cancel_needs_fee_funding(give_asset.kind, give_out.satoshis, fee):
-                    funding = await _rxd_funding(client, funds, fee, exclude=(give_txid, give_vout))
-                cancel = build_cancel_tx(
-                    offered_source_tx=give_source,
-                    offered_vout=give_vout,
-                    maker_key=maker_key,
-                    refund_pkh=maker_key.public_key().hash160(),
-                    fee=fee,
-                    funding=funding,
+
+                async def _cancel_funding(fee: int) -> list[FundingInput] | None:
+                    # Re-decided on every sizing pass, not once: a bigger fee can push an
+                    # RXD offer past what its own value covers, and then the cancel needs
+                    # separate plain-RXD funding it did not need at the seed fee.
+                    if not _cancel_needs_fee_funding(give_asset.kind, give_out.satoshis, fee):
+                        return None
+                    return await _rxd_funding(client, funds, fee, exclude=(give_txid, give_vout))
+
+                cancel, fee = await _build_at_measured_fee(
+                    ctx,
+                    fee_override,
+                    select_funding=_cancel_funding,
+                    build=lambda funding, f: build_cancel_tx(
+                        offered_source_tx=give_source,
+                        offered_vout=give_vout,
+                        maker_key=maker_key,
+                        refund_pkh=maker_key.public_key().hash160(),
+                        fee=f,
+                        funding=funding,
+                    ),
+                    seed_inputs=1,
+                    seed_outputs=1,
                 )
                 title = "CANCEL posted order (self-spend; kills every copy of the signed offer)"
 
@@ -736,13 +887,18 @@ def swap_refund_cmd(ctx: CliContext, give_outpoint: str, fee_override: int | Non
             owner_pkh, expiry = _inner_p2pkh_pkh(give_spk)
             funds = await _collect_funds(ctx, client)
             maker_key = funds.key_for_pkh(owner_pkh)
-            fee = _estimate_fee(ctx, 1, 1, fee_override)
-            refund_tx = build_covenant_refund_tx(
-                covenant_source_tx=give_source,
-                covenant_vout=give_vout,
-                maker_key=maker_key,
-                refund_pkh=owner_pkh,
-                fee=fee,
+            refund_tx, fee = await _build_at_measured_fee(
+                ctx,
+                fee_override,
+                build=lambda _funding, f: build_covenant_refund_tx(
+                    covenant_source_tx=give_source,
+                    covenant_vout=give_vout,
+                    maker_key=maker_key,
+                    refund_pkh=owner_pkh,
+                    fee=f,
+                ),
+                seed_inputs=1,
+                seed_outputs=1,
             )
             _confirm_or_abort(
                 ctx,

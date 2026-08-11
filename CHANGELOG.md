@@ -398,6 +398,77 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`pyrxd swap` fee'd every transaction at one-thousandth of Radiant's relay floor — the RSWP
+  orderbook commands could not relay on mainnet.** Pre-existing, not a regression: the bug shipped
+  with the orderbook CLI and every release since. `swap_book_cmds._estimate_fee` computed
+  `(ctx.fee_rate * size + 999) // 1000`, treating `ctx.fee_rate` as photons per *kB*. It is photons
+  per **byte** — `cli/config.py`'s `validated_fee_rate` enforces the relay floor in exactly those
+  units, and every other call site in the tree agrees (`wallet.py` uses `size * fee_rate`,
+  `glyph_cmds.py` converts *up* with `SatoshisPerKilobyte(fee_rate * 1000)`). Measured against the
+  real `pyrxd.swap.rswp` builders at the default 10,000 photons/byte, comparing the fee the CLI paid
+  to `ceil(size × effective_minrelaytxfee / 1000)` on the transaction's `GetTotalSize()`:
+
+  ```
+  command                        size   fee paid  required    verdict
+  cancel v2 (RXD, self-funded)   192 B     6,000  1,920,000   320x short   WILL NOT RELAY
+  post v2 (RXD give, RXD want)   426 B     4,500  4,260,000   947x short   WILL NOT RELAY
+  post v2 (FT give, FT want)     512 B     4,500  5,120,000  1138x short   WILL NOT RELAY
+  take v2 (FT demand, 2 fund)    740 B     8,300  7,400,000   892x short   WILL NOT RELAY
+  ```
+
+  Radiant has **neither RBF nor CPFP** (threat model S21; source lines cited in
+  `gravity/fee_policy.py`), so such a transaction cannot be repaired by any means — it holds its
+  inputs until the 8-hour mempool expiry. The fund-safety edge is `cancel`, which is the **only**
+  hard revocation for a v2 order: a cancel that never relays leaves the order **still takeable at
+  the original price** while the CLI prints a txid and reports success, so the maker stops watching
+  an offer a counterparty can still accept.
+
+  Two further defects surfaced while fixing the units, both of which would have re-created an
+  under-fee by a different route once the ×1000 was corrected:
+
+  - **The size model under-counted the transactions it was modelling.** `_TX_BASE_BYTES = 220` was
+    smaller than the advert `OP_RETURN` alone (measured 226 B for an RXD/RXD order, 310 B for
+    FT/FT, 314 B for a v3 covenant advert), and `_TX_PER_OUTPUT_BYTES = 40` could not cover a
+    Glyph FT output (84 B). The modelled input/output counts were also fixed constants while
+    `_MAX_FUNDING_INPUTS` is 8, so a wallet paying from 8 UTXOs built a 1,541-byte transaction
+    against a 450-byte model — 3.4× under even with correct units.
+  - **`_MIN_FEE_PHOTONS = 1_000` could never bind.** Three orders of magnitude below the floor for
+    any real transaction, so it was not the safety net its placement in a `max()` implied.
+
+  The fee is now sized from **the transaction's own serialized length**, not from a byte model:
+  `_build_at_measured_fee` builds, measures `len(tx.serialize())` (plus 3 bytes per input of
+  signature slack, the bound `glyph/ft.py` already measured for trial-vs-final DER length variance),
+  and rebuilds if the seed was low. The size constants survive only to seed the first pass, which
+  must pick funding before there is a transaction to measure; `_MIN_FEE_PHOTONS` is removed in
+  favour of the size-derived floor. That floor is **bound to** `gravity.fee_policy`'s
+  `DeadlineFeePolicy.min_relay_fee` rather than restated, so the swap CLI, the glyph builders and
+  the HTLC stack cannot drift apart on what the node demands. A final `_assert_relayable` check
+  refuses to hand back a sub-floor transaction rather than broadcasting one — including on the
+  `--fee` path, which previously passed any operator-supplied number straight through. After the
+  fix, every command clears the floor with 1.02×–1.43× headroom:
+
+  ```
+  command                        size   fee paid  floor      relays
+  cancel v2 (RXD, self-funded)   192 B  2,500,000  1,920,000  yes (1.30x)
+  cancel v2 (FT + fee funding)   422 B  4,290,000  4,220,000  yes (1.02x)
+  post v2 (FT give, FT want)     511 B  6,580,000  5,110,000  yes (1.29x)
+  take v2 (RXD demand, 1 fund)   407 B  5,800,000  4,070,000  yes (1.43x)
+  ```
+
+  Regression cover is `tests/cli/test_swap_fee_sizing.py` (29 tests), which asserts against the
+  CLI's own surface — the fee printed in the confirmation summary versus the size of the bytes
+  handed to `broadcast` — so the tests are expressible against the buggy code too. 28 of the 29
+  fail on the pre-fix module. One existing fixture in `tests/cli/test_swap_covenant_cmds.py` was
+  built on the buggy magnitude (a 1,000,000-photon offer commented "well above the estimated fee",
+  which cannot in fact pay a ~1,920,000-photon cancel); it is re-funded rather than removed, with a
+  note recording why the original number looked generous.
+
+  **Operator note:** correct fees are ~1000× the previously-quoted ones, because the previous ones
+  were wrong, not because anything got more expensive. At the relay floor a v2 order below roughly
+  0.02 RXD can no longer pay for its own cancel from its own value and will draw a separate
+  plain-RXD funding input; a wallet with no plain RXD will now be told so instead of building a
+  transaction that could never confirm.
+
 - **A refused (never-broadcast) covenant spend no longer charges the fee pool's cap**
   (`CappedFeeWalletSource.release_unspent`, `RadiantCovenantLeg._unspent_on_failure`). The fee input
   has to be dispensed *before* the transaction can be built — its value and script are inputs to the
