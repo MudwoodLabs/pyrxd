@@ -3,7 +3,7 @@ from __future__ import annotations
 import struct
 from io import BytesIO
 
-from ..constants import SIGHASH
+from ..constants import PUSH_REF_OPCODES, REF_OPERAND_OPCODES, SIGHASH
 from ..hash import hash256
 from .transaction_input import TransactionInput
 from .transaction_output import TransactionOutput
@@ -11,16 +11,29 @@ from .transaction_output import TransactionOutput
 _ZERO_REF = b"\x00" * 32
 
 
-_OP_PUSHINPUTREF = 0xD0  # OP_PUSHINPUTREF
-_OP_PUSHINPUTREFSINGLETON = 0xD8  # OP_PUSHINPUTREFSINGLETON
-
-
 def _get_push_refs(script_bytes: bytes) -> list:
     """Return sorted, deduplicated list of 36-byte ref buffers found in script_bytes.
 
-    Scans for OP_PUSHINPUTREF (0xd0) and OP_PUSHINPUTREFSINGLETON (0xd8);
-    each is followed by exactly 36 bytes of ref data. All other opcodes are
-    skipped using their standard encoding (data-push length or single byte).
+    Collects OP_PUSHINPUTREF (0xd0) and OP_PUSHINPUTREFSINGLETON (0xd8) — the
+    two opcodes whose refs Radiant files into an output's *push-ref set*. All
+    other opcodes are skipped using their standard encoding (data-push length or
+    single byte).
+
+    **All five** ref-operand opcodes are WALKED, not just the two collected.
+    ``OP_REQUIREINPUTREF`` (0xd1), ``OP_DISALLOWPUSHINPUTREF`` (0xd2) and
+    ``OP_DISALLOWPUSHINPUTREFSIBLING`` (0xd3) carry a 36-byte immediate operand
+    too (Radiant-Core ``src/script/script.cpp:710-726``); they merely land in a
+    different set (``:585-607``). Treating one of them as a bare single-byte
+    opcode — which this function did through 0.15.0 — resumes the walk *inside*
+    the ref bytes and reads them as opcodes. On a Photonic ``nftAuthScript``
+    (``OP_REQUIREINPUTREF <ref> <sha256> OP_2DROP ... OP_PUSHINPUTREFSINGLETON
+    <tokenRef> ...``) that produced the wrong ref set for **~80% of refs**
+    measured over 2,000 random refs, and therefore a ``hashOutputHashes`` that
+    disagreed with consensus — an invalid signature on every input of any
+    transaction paying to such a script. See
+    ``tests/test_mut_wave_regtest_e2e.py::test_signing_an_output_that_requires_a_ref``.
+    The shared operand set is :data:`pyrxd.constants.REF_OPERAND_OPCODES`; never
+    hard-code a range, and never assume "not collected" means "no operand".
 
     The sort + dedup behavior is **consensus-required**, not a bug. Radiant
     consensus collects an output's refs into a ``std::set<uint288>`` and
@@ -47,7 +60,7 @@ def _get_push_refs(script_bytes: bytes) -> list:
     while i < n_total:
         op = script_bytes[i]
         i += 1
-        if op in (_OP_PUSHINPUTREF, _OP_PUSHINPUTREFSINGLETON):
+        if op in REF_OPERAND_OPCODES:
             if i + 36 > n_total:
                 from pyrxd.security.errors import ValidationError
 
@@ -56,7 +69,8 @@ def _get_push_refs(script_bytes: bytes) -> list:
                 )
             ref = script_bytes[i : i + 36]
             i += 36
-            refs[ref.hex()] = ref
+            if op in PUSH_REF_OPCODES:
+                refs[ref.hex()] = ref
         elif 0x01 <= op <= 0x4B:
             i += op  # direct push: skip data bytes
         elif op == 0x4C:  # OP_PUSHDATA1

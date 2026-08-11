@@ -167,13 +167,22 @@ class FtDeployRevealScripts:
 
 @dataclass
 class MutableRevealScripts:
-    """Scripts for a MUT reveal — two outputs required."""
+    """Scripts for a MUT reveal — two inputs and two outputs required.
+
+    See :meth:`GlyphBuilder.prepare_mutable_reveal` for the transaction shape.
+    ``ref`` and ``mutable_ref`` are two DIFFERENT outpoints on the same commit
+    transaction and both must be spent by the reveal.
+    """
 
     ref: GlyphRef
     nft_script: bytes  # 63-byte NFT singleton (vout[0] typically)
     contract_script: bytes  # 174-byte mutable contract (vout[1] typically)
     scriptsig_suffix: bytes  # 'gly' + CBOR; caller prepends sig + pubkey
     payload_hash: bytes  # sha256d of CBOR payload
+    # The contract's own singleton ref: ``commit_txid:(commit_vout + 1)``. A
+    # SEPARATE outpoint from ``ref`` — see the builder docstring for why it can
+    # never be the same one.
+    mutable_ref: GlyphRef | None = None
 
 
 @dataclass
@@ -657,14 +666,68 @@ class GlyphBuilder:
 
         Returns the two output locking scripts the caller must place in the
         reveal tx:
-        - ``nft_script``:      63-byte NFT singleton (token the owner holds)
-        - ``contract_script``: 174-byte mutable contract UTXO (holds state)
+
+        - ``nft_script``:      63-byte NFT singleton (token the owner holds),
+          carrying ``ref = commit_txid:commit_vout``
+        - ``contract_script``: 174-byte mutable contract UTXO (holds state),
+          carrying ``mutable_ref = commit_txid:(commit_vout + 1)``
 
         The reveal scriptSig suffix is also returned; the caller prepends
         ``<sig> <pubkey>`` to form the full scriptSig.
 
         Protocol field in ``cbor_bytes`` must include ``GlyphProtocol.MUT``
         (5). Use ``GlyphMetadata(protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT])``.
+
+        The reveal needs TWO inputs
+        ---------------------------
+
+        ==========  ==============================================================
+        input        outpoint
+        ==========  ==============================================================
+        ``0``        ``commit_txid:commit_vout`` — the commit (reveal scriptSig)
+        ``1``        ``commit_txid:(commit_vout + 1)`` — a plain seed output
+        ==========  ==============================================================
+
+        The commit transaction must therefore carry a **second, ordinary output
+        at ``commit_vout + 1``** (Photonic funds it with 1 photon; Radiant has no
+        dust rule). Spending it is what puts ``mutable_ref`` into the
+        transaction's input singleton-ref set, which is the only thing that lets
+        an output push it.
+
+        Why the two refs cannot be the same one
+        ---------------------------------------
+
+        pyrxd 0.9.0-0.15.0 used ``ref`` for *both* scripts. A reveal built as
+        documented above was **rejected by consensus every time** — confirmed
+        against a Radiant Core v3.1.1 regtest node
+        (``tests/test_mut_wave_regtest_e2e.py``), reject reason
+        ``bad-txns-inputs-outputs-invalid-transaction-reference-operations``.
+        Two independent chain rules forbid it:
+
+        * ``OP_PUSHINPUTREFSINGLETON`` files its ref into
+          ``foundDisallowedSiblingRefs`` as well as the push-ref set
+          (``CScript::GetPushRefs``), and ``validateTransactionReferenceOperations``
+          rejects a transaction where two outputs claim the same one. Both the
+          NFT script and the mutable contract lead with ``0xd8``, so they can
+          never carry the same ref.
+        * The contract's own body derives the token ref *from* its ref by
+          subtracting one from the vout (``OP_DUP 20 OP_SPLIT OP_BIN2NUM OP_1SUB
+          OP_4 OP_NUM2BIN OP_CAT``). ``mutable_ref.vout == ref.vout + 1`` is
+          therefore not a convention — the covenant computes it. With equal refs
+          the contract would look for ``commit_vout - 1`` and match nothing, so
+          even a repaired sibling rule would leave the contract unspendable.
+
+        This matches Photonic Wallet (``packages/lib/src/mint.ts``:
+        ``Outpoint.fromUTXO(mint.utxo.txid, mint.utxo.vout + 1)``).
+
+        .. note::
+           Spending the contract later (the ``mod`` / ``sl`` operations of
+           :func:`~pyrxd.glyph.payload.build_mutable_scriptsig`) additionally
+           requires the token output to be re-created in Photonic's
+           ``nftAuthScript`` shape — an ``OP_REQUIREINPUTREF <mutable_ref>
+           <sha256(contract scriptSig)> OP_2DROP`` state prefix ahead of the
+           singleton. pyrxd has no builder for that shape yet; the working
+           transaction is spelled out in ``tests/test_mut_wave_regtest_e2e.py``.
         """
         try:
             cbor_data = cbor2.loads(cbor_bytes)
@@ -679,9 +742,13 @@ class GlyphBuilder:
             raise ValidationError(f"Could not parse CBOR for MUT cross-check: {exc}") from exc
 
         ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        # NOT ``ref`` — see the docstring. The contract's singleton must be a
+        # different outpoint, and specifically the next one: its own body
+        # recomputes the token ref as ``mutable_ref.vout - 1``.
+        mutable_ref = GlyphRef(txid=commit_txid, vout=commit_vout + 1)
         payload_hash = hash_payload(cbor_bytes)
         nft_script = build_nft_locking_script(owner_pkh, ref)
-        contract_script = build_mutable_nft_script(ref, payload_hash)
+        contract_script = build_mutable_nft_script(mutable_ref, payload_hash)
         scriptsig_suffix = build_reveal_scriptsig_suffix(cbor_bytes)
         return MutableRevealScripts(
             ref=ref,
@@ -689,6 +756,7 @@ class GlyphBuilder:
             contract_script=contract_script,
             scriptsig_suffix=scriptsig_suffix,
             payload_hash=payload_hash,
+            mutable_ref=mutable_ref,
         )
 
     # ------------------------------------------------------------------

@@ -97,12 +97,36 @@ class TestPrepareMutableReveal:
         _, embedded_hash = parsed
         assert embedded_hash == result.payload_hash
 
-    def test_contract_ref_matches_nft_ref(self):
+    def test_contract_ref_is_the_next_outpoint_after_the_nft_ref(self):
+        """The two singletons must be DIFFERENT outpoints, one vout apart.
+
+        Through 0.15.0 this asserted ``contract_ref == result.ref``, and that is
+        precisely the bug: two outputs leading with ``0xd8 <same ref>`` are
+        rejected by consensus, and the contract's body recomputes the token ref
+        as ``mutable_ref.vout - 1`` so an equal pair matches nothing either.
+        Proven on a node in ``tests/test_mut_wave_regtest_e2e.py``.
+        """
         result = BUILDER.prepare_mutable_reveal(TXID, 0, MUT_CBOR, PKH)
         parsed = parse_mutable_nft_script(result.contract_script)
         assert parsed is not None
         contract_ref, _ = parsed
-        assert contract_ref == result.ref
+        assert contract_ref != result.ref
+        assert contract_ref == result.mutable_ref
+        assert contract_ref.txid == result.ref.txid
+        assert contract_ref.vout == result.ref.vout + 1
+
+    def test_the_two_output_scripts_never_share_a_ref(self):
+        """The consensus invariant, asserted directly on the emitted bytes.
+
+        ``build_nft_locking_script`` and ``build_mutable_nft_script`` both lead
+        their ref with ``OP_PUSHINPUTREFSINGLETON``, and a transaction may not
+        have two outputs claiming the same singleton ref.
+        """
+        for vout in (0, 1, 7):
+            result = BUILDER.prepare_mutable_reveal(TXID, vout, MUT_CBOR, PKH)
+            assert result.nft_script[0] == 0xD8
+            assert result.contract_script[35] == 0xD8
+            assert result.nft_script[1:37] != result.contract_script[36:72]
 
     def test_scriptsig_suffix_not_empty(self):
         result = BUILDER.prepare_mutable_reveal(TXID, 0, MUT_CBOR, PKH)
