@@ -59,6 +59,27 @@ a Radiant Core v3.1.1 regtest one.
 
 ### Fixed
 
+- **`take_covenant_order` refused any FT take leaving 1-545 units of change.** An RSWP v3
+  covenant take whose FT funding exceeded the demand by less than 546 units raised
+  `ValidationError` on the stated grounds that the change output "would be un-relayable".
+  That premise is false twice over. Radiant has no dust threshold — `GetDustThreshold`
+  returns 1 satoshi and `IsDust` is `nValue <= 0` (`Radiant-Core/src/policy/policy.cpp:19-25`)
+  — and standardness is never consulted at all, since `fRequireStandard` is hardcoded
+  `false` (`Radiant-Core/src/validation.cpp:271`, re-set unconditionally at
+  `src/init.cpp:1965`), which is the only reason a 75-byte FT script relays in the first
+  place: `Solver` classifies it `TX_NONSTANDARD`. A taker holding 80 units against a 50-unit
+  demand could not fill a perfectly valid order, and the suggested workaround — "re-fund the
+  exact demanded amount" — costs an extra transaction and an extra fee to split a UTXO for
+  no reason. Every surplus above zero is now returned as FT change; the floor on that output
+  is Radiant's real one of 1 photon, since an FT's units **are** its output's photons.
+
+  The test suite pinned the wrong behaviour rather than catching it, in both directions:
+  one test asserted the refusal was correct, and its sibling happy-path test funded
+  600 against a demand of 50 so the change was 550 — the one side of the boundary where the
+  false rule and the real rule agree. That is the same shape as the FT-transfer fund-loss
+  bug, whose only regtest test spent the balance in full. The replacement is parametrised
+  across 51/80/545/546/547 so it straddles the boundary.
+
 - **`prepare_mutable_reveal` / `prepare_wave_reveal` emitted a reveal no node would accept.**
   Both output scripts carried the *same* 36-byte ref under `OP_PUSHINPUTREFSINGLETON`, and
   a transaction may not have two outputs claiming one singleton ref — `CScript::GetPushRefs`
@@ -197,6 +218,64 @@ both. It is fixed here.
   could ever fail, since the node would have nothing left to reject.
 
 ### Tests
+
+- **Impossible-fixture sweep: three types now refuse to hold a state the chain cannot
+  produce, instead of a builder refusing it later.** This repo's two worst shipped bugs both
+  survived because the fixtures described chain states that cannot exist, so the tests
+  passed against impossible inputs while the only realistic input went untested. The pattern
+  is closed at the type, not at each caller — a guard someone can forget is weaker than a
+  type that cannot express the bad state, and the FT fund-loss bug was already "fixed" once
+  by a guard that tested only exact equality and left the loss reachable one photon either
+  side.
+
+  - **`FtUtxo` now validates on construction that `value == ft_amount`,** with
+    `FtUtxo.from_output(...)` as the constructor that takes the number once. The two fields
+    are one number: Radiant's FT conservation epilogue sums the *satoshi values* of the
+    outputs carrying the token's code-script hash (`OP_CODESCRIPTHASHVALUESUM_UTXOS` /
+    `_OUTPUTS` push `sumAmount / SATOSHI`, `Radiant-Core/src/script/interpreter.cpp:2196`
+    and `:2215`), so an FT's quantity is its output value at the consensus layer. `FtUtxo`
+    was the only class in the SDK carrying both a value field and an amount field (verified
+    by an AST sweep of `src/pyrxd/`). The previous check lived inside `build_airdrop_tx` and
+    covered only the UTXOs a build selected, so `FtUtxoSet.total()` (which sums `ft_amount`)
+    and `FtUtxoSet.select()` (which ranks and covers by it) could report a wrong balance and
+    pick the wrong inputs with nothing to stop them. The builder check is retained purely as
+    a tripwire on the type-level guarantee being loosened, and is now exercised through a
+    deliberate `object.__setattr__` bypass that says so.
+
+  - **`CovenantChainState` now refuses a depth triple no chain could report.** `confirmations`
+    is derived by subtraction in `read_covenant_chain_state`, so an ElectrumX server reporting
+    a covenant UTXO at a height *above* the tip yielded a negative depth — and negative depth
+    does not fail closed on the way out: `build_cold_claim` reports
+    `max(0, refund_csv - confirmations)` blocks to the deadline, so a depth of `-4` against a
+    20-block CSV read as **24 blocks of headroom**, more than the CSV total, with a lower
+    urgency multiplier, to an operator racing that deadline on a chain with neither RBF nor
+    CPFP. Unconfirmed is now exactly `funding_height is None` **and** `confirmations == 0`;
+    confirmed requires `1 <= funding_height <= tip_height` and the matching depth. The 0-conf
+    cold-recovery fixture had been passing `funding_height=100` with `tip_height=99` — a
+    covenant mined one block above the chain tip while reporting zero confirmations.
+
+  - **Two gravity forfeit tests asserted `b"\xfe\xff\xff\xff" in raw`** — a substring scan
+    over a serialized transaction, which cannot tell `nSequence` from the same four bytes
+    inside a pushed redeem script, an output value, or a signature. One of them carried a
+    trailing comment promising a check for the forbidden `0xFFFFFFFF` that was never written.
+    Both now parse the field. `SEQUENCE_FINAL` there would make the CLTV forfeit branch
+    unspendable outright (`Radiant-Core/src/script/interpreter.cpp:2779`), which is the exact
+    bypass CLTV exists to close. Likewise `test_htlc_spend_productized` asserted
+    `sequence < 0xFFFFFFFF` as if it established "disable-flag clear": `0x80000000` is both
+    less than `SEQUENCE_FINAL` and disabled, and the line above already pinned the value, so
+    the check could not fail. It now tests bit 31 (disable) and bit 22 (block-vs-512-second
+    units) directly.
+
+- **The 546 "dust limit" is labelled as pyrxd policy everywhere it is stated as a chain rule.**
+  Radiant has no dust threshold and does not consult standardness at all (see the
+  `take_covenant_order` entry above). `pyrxd.glyph.ft.DUST_LIMIT` described itself as the
+  "standard relay dust threshold" while being the value re-exported as `FT_DUST_LIMIT` into
+  every FT builder's default parameters; `commit_ft` and `prepare_ft_deploy_reveal` justified
+  their 546-unit supply guards with "non-standard" and "rejected by most mempool policies".
+  The guards are kept — a whole FT supply below 546 units is almost always a decimals
+  mistake — but they are now stated as pyrxd heuristics, and the boundary test that named a
+  non-existent mempool failure mode says what it actually pins. The same false premise is
+  what turned into the real functional lockout fixed above.
 
 - **`tests/test_wallet_send_regtest_e2e.py`** — live-regtest consensus coverage for
   `build_send_tx` and `build_send_max_tx`, the two builders that had no node-level proof

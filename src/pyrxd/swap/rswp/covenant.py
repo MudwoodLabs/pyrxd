@@ -442,15 +442,25 @@ def take_covenant_order(
             raise ValidationError(
                 f"funding lacks {-ft_surplus} units of the demanded FT {demanded_ref.txid}:{demanded_ref.vout}"
             )
-        if 0 < ft_surplus < _DUST_PHOTONS:
-            # An FT change output below the dust floor is relay-rejected, so the whole take would be an
-            # unbroadcastable tx that fails opaquely (review MEDIUM). Folding the surplus to fee would BURN
-            # tokens, so refuse and tell the taker to fund exact-or-dust-clear instead.
-            raise ValidationError(
-                f"FT funding surplus is {ft_surplus} units (< dust floor {_DUST_PHOTONS}); the change output "
-                "would be un-relayable — re-fund the exact demanded amount or leave a >= dust surplus"
-            )
         if ft_surplus > 0:
+            # EVERY surplus gets a change output, however small. There is no
+            # sub-dust case to handle: an FT's units ARE its output's photons, so
+            # the floor on this output is Radiant's real floor of 1 photon, not
+            # ``_DUST_PHOTONS``. This used to refuse any surplus of 1..545 units
+            # on the stated grounds that the change output "would be
+            # un-relayable" — which is false twice over. ``GetDustThreshold``
+            # returns 1 satoshi and ``IsDust`` is ``nValue <= 0``
+            # (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is not
+            # consulted at all on this chain: ``fRequireStandard`` is hardcoded
+            # ``false`` (Radiant-Core/src/validation.cpp:271, re-set
+            # unconditionally at src/init.cpp:1965), which is the only reason a
+            # 75-byte FT script relays in the first place — ``Solver`` classifies
+            # it ``TX_NONSTANDARD``. A taker holding 80 units against a 50-unit
+            # demand could not fill the order at all, on a chain where that
+            # transaction is valid. The fold-to-fee alternative is NOT available
+            # here and never was: folding an FT surplus into the fee burns the
+            # taker's tokens. ``pyrxd.glyph.ft.build_airdrop_tx`` already reasons
+            # this out correctly for the same output shape.
             tx.add_output(_build_ft_change(demanded_ref, ft_surplus, bytes(taker_change_pkh)))
     change = total_funding - demanded.value - ft_surplus - fee
     if change < 0:

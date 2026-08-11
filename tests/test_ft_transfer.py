@@ -80,20 +80,21 @@ def _make_utxo(
     *,
     txid_byte: int = 0xA0,
     vout: int = 0,
-    value: int | None = None,
     owner_pkh: bytes | None = None,
     ref: GlyphRef | None = None,
 ) -> FtUtxo:
     """Build a synthetic FT UTXO. ``txid_byte`` seeds a unique txid.
 
-    ``value`` defaults to ``ft_amount`` — the only relationship that exists on
-    chain. Pass it explicitly to construct an impossible UTXO on purpose.
+    There is no ``value`` override, because there is no ``value`` to override:
+    an FT's quantity IS its output's photons, so ``value == ft_amount`` on every
+    FT UTXO that has ever existed, and :class:`FtUtxo` now refuses to hold the
+    two apart. ``FtUtxo.from_output`` takes the number once and is the
+    constructor real callers should use.
     """
-    return FtUtxo(
+    return FtUtxo.from_output(
         txid=bytes([txid_byte]).hex() * 32,  # 64-hex txid (all the same byte)
         vout=vout,
-        value=ft_amount if value is None else value,
-        ft_amount=ft_amount,
+        value=ft_amount,
         ft_script=_ft_script_for(owner_pkh or _alice_pkh(), ref),
     )
 
@@ -304,24 +305,31 @@ class TestRecipientAmountIsExact:
         assert ft_outs[0].satoshis != 46_739_454  # the number the bug produced
 
     @pytest.mark.parametrize("delta", [-1_000_000, -1, 1, 1_000_000])
-    def test_impossible_value_ft_amount_mismatch_fails_closed(self, delta: int):
-        """``value != ft_amount`` cannot exist on chain, in EITHER direction.
+    def test_impossible_value_ft_amount_mismatch_is_unconstructible(self, delta: int):
+        """``value != ft_amount`` cannot exist on chain, and now cannot exist in memory.
 
         ``ft_amount > value`` would materialise more of the ref than the inputs
         carry and consensus rejects it; ``ft_amount < value`` means the caller
         built ``FtUtxo`` from the wrong field and the surplus photons would be
-        burned. Both refuse rather than guess which number the caller meant.
-        This is a backstop: the exactness above does not depend on it.
+        burned. The refusal is at CONSTRUCTION, not in a builder: the first
+        attempt at this fix was a guard inside ``build_transfer_tx``, and the
+        ``±1`` cases below are the exact deltas that walked straight past it
+        while still delivering ~46.7M units for a 250-unit request. A guard in
+        one caller is not a fix; a type that cannot hold the state is.
         """
-        utxo = _make_utxo(50_000_000, value=50_000_000 + delta)
-        s = FtUtxoSet(ref=_token_ref(), utxos=[utxo])
         with pytest.raises(ValidationError, match="value.*ft_amount|ft_amount.*value"):
-            s.build_transfer_tx(
-                amount=250,
-                new_owner_pkh=Hex20(_BOB_PKH),
-                private_key=_alice_key(),
-                funding=[_funding()],
+            FtUtxo(
+                txid="a0" * 32,
+                vout=0,
+                value=50_000_000 + delta,
+                ft_amount=50_000_000,
+                ft_script=_ft_script_for(_alice_pkh()),
             )
+
+    def test_from_output_cannot_desync_value_and_amount(self):
+        """The constructor real callers should use takes the number once."""
+        u = FtUtxo.from_output(txid="a0" * 32, vout=0, value=50_000_000, ft_script=_ft_script_for(_alice_pkh()))
+        assert u.value == u.ft_amount == 50_000_000
 
 
 # ---------------------------------------------------------------------------

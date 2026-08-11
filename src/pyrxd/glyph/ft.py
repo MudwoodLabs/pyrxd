@@ -85,7 +85,25 @@ from .types import GlyphRef, GlyphRoyalty
 # :mod:`pyrxd.fee_sizing`, which now owns that constant precisely so the wallet,
 # the glyph builders and the swap stack cannot drift apart on it.
 MIN_FEE_RATE: int = relay_floor_photons_per_byte()  # photons / byte
-DUST_LIMIT: int = 546  # photons, standard relay dust threshold
+
+# pyrxd POLICY, not a chain rule — and the distinction is load-bearing here,
+# because this is the value re-exported as ``FT_DUST_LIMIT`` and defaulted into
+# ``FtTransferParams``/``FtAirdropParams``. Radiant has NO dust threshold:
+# ``GetDustThreshold`` returns 1 satoshi and ``IsDust`` is ``nValue <= 0``
+# (Radiant-Core/src/policy/policy.cpp:19-25) — and standardness is not consulted
+# at all, since ``fRequireStandard`` is hardcoded ``false``
+# (Radiant-Core/src/validation.cpp:271, re-set unconditionally at
+# src/init.cpp:1965), which is the only reason a 75-byte FT script relays in the
+# first place (``Solver`` classifies it ``TX_NONSTANDARD``). So there is no path
+# by which a sub-546 output is rejected.
+#
+# It is used ONLY as a fold-to-fee threshold for the plain-RXD CHANGE output.
+# It is deliberately NOT a floor on a token output: an FT output's value IS its
+# unit count, so a 546 floor would forbid transferring 100 units of anything —
+# and the comment that used to sit here, "standard relay dust threshold", is
+# exactly the false premise that produced that class of refusal elsewhere in
+# this SDK.
+DUST_LIMIT: int = 546  # photons — pyrxd change-output policy; see above
 
 # A pyrxd ergonomics guard, NOT a chain rule. Radiant's ``MAX_STANDARD_TX_SIZE``
 # is 20_000_000 bytes (``Radiant-Core/src/policy/policy.h:69`` @ ``afdf57b1``),
@@ -134,12 +152,46 @@ def _check_fee_rate(fee_rate: int) -> None:
 class FtUtxo:
     """A single UTXO holding some quantity of one FT.
 
+    ``value`` and ``ft_amount`` are the SAME NUMBER, and this class refuses to
+    hold them apart. Radiant's FT conservation epilogue sums the *satoshi
+    values* of the outputs carrying the token's code-script hash
+    (``OP_CODESCRIPTHASHVALUESUM_UTXOS`` / ``_OUTPUTS`` push
+    ``sumAmount / SATOSHI`` — ``Radiant-Core/src/script/interpreter.cpp:2196``
+    and ``:2215``), so an FT's quantity is not merely *conventionally* its
+    output value, it **is** its output value at the consensus layer. There is no
+    second number to disagree with.
+
+    Why that is enforced *here*, in ``__post_init__``, rather than in the
+    builder that consumes it: an ``FtUtxo`` with ``value != ft_amount``
+    describes a UTXO that has never existed on Radiant and never can, and this
+    repo has already shipped the consequence twice. The transfer builder used to
+    size the recipient output from the inputs' RXD instead of the requested
+    amount and delivered 46,739,454 units for an ``amount=250`` request; the
+    first "fix" was an ``if value == ft_amount: raise`` guard *inside the
+    builder*, which left the fund loss reachable at ``value == ft_amount ± 1``.
+    A guard inside one caller only protects that caller. Refusing at
+    construction means no ``FtUtxo`` anywhere in the process can carry the bad
+    state, so no builder — including one not yet written — can be handed it.
+
+    It also fixes the two set-level queries that had no guard at all:
+    :meth:`FtUtxoSet.total` sums ``ft_amount`` and :meth:`FtUtxoSet.select`
+    ranks and covers by it, so a wrong ``ft_amount`` used to report a wrong
+    balance and pick the wrong inputs long before any builder's backstop ran.
+
+    Build one with :meth:`from_output` when reading a UTXO off chain — it takes
+    the output value once and there is no second field to get wrong.
+
     :param txid:        txid of the UTXO
     :param vout:        output index within that tx
-    :param value:       RXD value (photons) on the output
-    :param ft_amount:   token units held on the output
+    :param value:       photons on the output — which IS the token quantity
+    :param ft_amount:   token units held on the output. Must equal ``value``;
+                        kept as an explicit field only so existing callers and
+                        the ``u.ft_amount`` reading sites keep working.
     :param ft_script:   full FT locking script (75 bytes, see
                         :func:`pyrxd.glyph.script.build_ft_locking_script`)
+
+    :raises ValidationError: ``value`` or ``ft_amount`` is not a non-negative
+        ``int``, or the two differ.
     """
 
     txid: str
@@ -147,6 +199,33 @@ class FtUtxo:
     value: int
     ft_amount: int
     ft_script: bytes
+
+    def __post_init__(self) -> None:
+        # ``bool`` is an ``int`` subclass, and ``True`` would sail through every
+        # arithmetic check below as 1 — reject it by type, not by value. Same
+        # for ``float``: 1.5 passed the old ``ft_amount < 0`` check.
+        for name, v in (("value", self.value), ("ft_amount", self.ft_amount)):
+            if isinstance(v, bool) or not isinstance(v, int):
+                raise ValidationError(f"{name} must be int, got {type(v).__name__!r}: {v!r}")
+            if v < 0:
+                raise ValidationError(f"{name} must be >= 0, got {v}")
+        if self.value != self.ft_amount:
+            raise ValidationError(
+                f"FtUtxo {self.txid}:{self.vout} has value={self.value} but ft_amount={self.ft_amount}. "
+                "On Radiant an FT's quantity IS its output value (1 photon = 1 unit — the conservation "
+                "epilogue sums output satoshis, Radiant-Core src/script/interpreter.cpp:2215), so this "
+                "UTXO cannot exist on chain. You almost certainly meant FtUtxo.from_output(...), which "
+                "takes the value once."
+            )
+
+    @classmethod
+    def from_output(cls, *, txid: str, vout: int, value: int, ft_script: bytes) -> FtUtxo:
+        """An :class:`FtUtxo` read straight off a chain output.
+
+        The preferred constructor: the token quantity is taken from the output's
+        value rather than supplied a second time, so the two cannot disagree.
+        """
+        return cls(txid=txid, vout=vout, value=value, ft_amount=value, ft_script=ft_script)
 
 
 @dataclass
@@ -264,16 +343,15 @@ class FtUtxoSet:
         if not isinstance(utxos, list):
             raise ValidationError("utxos must be a list")
         for u in utxos:
+            # ``value``/``ft_amount`` type, sign and equality are not re-checked
+            # here: :meth:`FtUtxo.__post_init__` refuses to build an instance
+            # that fails any of them, so an ``FtUtxo`` that reaches this loop has
+            # already satisfied them. Re-stating the checks would be a second
+            # copy of a rule to drift, and this repo's FT fund-loss bug came from
+            # exactly that shape — a guard living in one caller instead of in the
+            # type.
             if not isinstance(u, FtUtxo):
                 raise ValidationError("utxos must contain FtUtxo instances")
-            if not isinstance(u.ft_amount, int) or isinstance(u.ft_amount, bool):
-                raise ValidationError(f"ft_amount must be int, got {type(u.ft_amount).__name__!r}: {u.ft_amount!r}")
-            if u.ft_amount < 0:
-                raise ValidationError("ft_amount must be >= 0")
-            if not isinstance(u.value, int) or isinstance(u.value, bool):
-                raise ValidationError(f"value must be int, got {type(u.value).__name__!r}: {u.value!r}")
-            if u.value < 0:
-                raise ValidationError("value must be >= 0")
             # Reject non-FT scripts (e.g. plain P2PKH) up front. The Radiant
             # node would later reject the broadcast with "bad-txns-inputs-
             # outputs-invalid-transaction-reference-operations" because no
@@ -590,25 +668,25 @@ class FtUtxoSet:
         total_out = sum(r.amount for r in recipients)
         selected = self.select(total_out)
 
-        # An airdrop is stricter than a transfer about the inputs it will spend:
-        # every output's value here is a token quantity, so `value` and
-        # `ft_amount` describing the same UTXO differently is not a modelling
-        # nuance, it is a wrong transaction. If `ft_amount > value` the outputs
-        # materialise more of the ref than the inputs carry and consensus
-        # rejects the broadcast; if `ft_amount < value` the surplus photons flow
-        # to change or fee, which for a real token means burning units. On chain
-        # the two are always equal — an FT's quantity IS its satoshis
-        # (``docs/concepts/radiant-fts-are-on-chain.md``) — so a mismatch means
-        # the caller built ``FtUtxo`` from the wrong field. Say so here rather
-        # than at a mempool rejection, or worse, silently.
+        # Defence in depth, and NOTHING MORE: :meth:`FtUtxo.__post_init__` now
+        # refuses to construct a UTXO whose `value` and `ft_amount` differ, so
+        # normal code cannot reach this raise at all. It survives because the
+        # consequence is severe and one-directional — `ft_amount > value`
+        # materialises more of the ref than the inputs carry and the node rejects
+        # the broadcast; `ft_amount < value` sends the surplus photons to change
+        # or fee, which for a real token BURNS units — and because a check that
+        # only ever fires if the type-level guarantee is later loosened is a
+        # cheap tripwire on exactly that regression. Do not treat it as the thing
+        # that makes the amounts correct: the recipient outputs are sized from
+        # `r.amount`, not from this.
         for u in selected:
             if u.value != u.ft_amount:
                 raise ValidationError(
                     f"UTXO {u.txid}:{u.vout} has value={u.value} but ft_amount={u.ft_amount}. On "
                     "Radiant an FT's quantity is its output value (1 photon = 1 unit), so an "
-                    "airdrop cannot reconcile the two: set ft_amount = value. (The single-recipient "
-                    "build_transfer_tx tolerates a mismatch because it does not size outputs from "
-                    "token amounts; this builder does.)"
+                    "airdrop cannot reconcile the two: set ft_amount = value, or use "
+                    "FtUtxo.from_output(). Reaching this message at all means FtUtxo's "
+                    "construction-time guarantee was bypassed."
                 )
 
         ft_in_total = sum(u.ft_amount for u in selected)

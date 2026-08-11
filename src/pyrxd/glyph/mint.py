@@ -697,10 +697,20 @@ class GlyphMinter:
             InsufficientFundsError: as :meth:`commit_nft`.
         """
         self._require_protocol(metadata, GlyphProtocol.FT, "commit_ft")
+        # 546 is a pyrxd HEURISTIC, not a chain rule: a whole FT supply below 546
+        # units is almost always a decimals mistake. Radiant would accept it —
+        # ``GetDustThreshold`` returns 1 satoshi, ``IsDust`` is ``nValue <= 0``
+        # (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is never
+        # consulted (``fRequireStandard`` is hardcoded ``false``,
+        # Radiant-Core/src/validation.cpp:271 and src/init.cpp:1965). The previous
+        # wording, "makes the reveal's token output non-standard", asserted a rule
+        # that does not exist; ``build_airdrop_tx`` in this same package correctly
+        # emits 1-unit FT outputs.
         if not isinstance(supply, int) or isinstance(supply, bool) or supply < 546:
             raise ValidationError(
-                f"commit_ft supply must be an int >= 546 (the dust limit); got {supply!r}. "
-                "A smaller supply makes the reveal's token output non-standard — use an NFT instead."
+                f"commit_ft supply must be an int >= 546; got {supply!r}. This is a pyrxd guard against a "
+                "decimals mistake, not a chain limit (Radiant's output floor is 1 photon) — a supply this "
+                "small is usually meant to be an NFT."
             )
         return await self._commit(
             metadata=metadata,

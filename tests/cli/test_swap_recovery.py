@@ -507,6 +507,40 @@ async def test_read_covenant_chain_state_distinguishes_settled_from_never_funded
 
 
 @pytest.mark.asyncio
+async def test_read_covenant_chain_state_refuses_a_utxo_above_the_tip() -> None:
+    """A server reporting a UTXO deeper than the chain is refused, not subtracted.
+
+    ``confirmations`` is derived as ``tip - height + 1``, so a height above the
+    tip produces a NEGATIVE depth, and negative depth does not fail closed on the
+    way out: ``build_cold_claim`` reports ``max(0, refund_csv - confirmations)``
+    blocks to the deadline, which for ``-4`` against a 20-block CSV reads as 24 —
+    MORE headroom than the CSV total — plus a lower urgency multiplier, to an
+    operator racing that deadline on a chain with no RBF and no CPFP.
+    """
+    sh = sr.electrumx_script_hash(COV_SPK)
+    client = _NoBroadcastClient({sh: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=110)]}, tip=105)
+    with pytest.raises(ValidationError, match="above the chain tip"):
+        await sr.read_covenant_chain_state(client, COV_SPK)
+
+
+def test_covenant_chain_state_refuses_impossible_depth_triples() -> None:
+    """The three depth fields are one measurement; a chain cannot disagree with itself."""
+    base = {"outpoint": "ab" * 32 + ":0", "carrier_value": 100_000}
+    # Mined, but claiming zero depth.
+    with pytest.raises(ValidationError, match="does not match tip"):
+        sr.CovenantChainState(**base, funding_height=100, tip_height=105, confirmations=0)
+    # In the mempool, but naming the block it is in.
+    with pytest.raises(ValidationError, match="describes neither"):
+        sr.CovenantChainState(**base, funding_height=None, tip_height=105, confirmations=6)
+    # Mined one block above the tip — the shape the 0-conf fixture used to use.
+    with pytest.raises(ValidationError, match="above the chain tip"):
+        sr.CovenantChainState(**base, funding_height=100, tip_height=99, confirmations=0)
+    # The two shapes a node really produces both construct.
+    assert sr.CovenantChainState(**base, funding_height=100, tip_height=105, confirmations=6).confirmations == 6
+    assert sr.CovenantChainState(**base, funding_height=None, tip_height=105, confirmations=0).confirmations == 0
+
+
+@pytest.mark.asyncio
 async def test_read_covenant_chain_state_refuses_an_ambiguous_covenant() -> None:
     sh = sr.electrumx_script_hash(COV_SPK)
     utxos = [
@@ -580,6 +614,23 @@ def swap_setup():
 
 
 def _chain(cov_conf: int) -> sr.CovenantChainState:
+    """A covenant chain state a real node could actually report.
+
+    ``cov_conf == 0`` means MEMPOOL, and a mempool UTXO has no funding height —
+    that is the shape ``read_covenant_chain_state`` emits (``funding_height =
+    int(u.height) if int(u.height) > 0 else None``). This helper used to hand
+    back ``funding_height=100`` with ``tip_height=99`` for the 0-conf case: a
+    covenant mined one block ABOVE the chain tip while simultaneously reporting
+    zero depth. ``CovenantChainState`` now refuses that triple outright.
+    """
+    if cov_conf == 0:
+        return sr.CovenantChainState(
+            outpoint="ab" * 32 + ":0",
+            carrier_value=100_000,
+            funding_height=None,
+            tip_height=100,
+            confirmations=0,
+        )
     return sr.CovenantChainState(
         outpoint="ab" * 32 + ":0",
         carrier_value=100_000,
