@@ -966,6 +966,13 @@ class GlyphBuilder:
         still works but emits a token RXinDexer will not index.
 
         Protocol requirement: ``[NFT(2), MUT(5), WAVE(11)]``.
+
+        The reveal shape is MUT's, including its **two-input** requirement: the
+        commit outpoint plus a seed outpoint at ``commit_vout + 1`` that gives
+        the mutable contract its own singleton ref. See
+        :meth:`prepare_mutable_reveal` — a WAVE registration built without the
+        seed input is rejected by consensus, as every one built through 0.15.0
+        was.
         """
         if not name or not name.isprintable() or len(name) > 255:
             raise ValidationError("WAVE name must be non-empty printable ASCII, max 255 characters")
