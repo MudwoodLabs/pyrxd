@@ -496,9 +496,13 @@ async def _setup_eth_both_locked(node, url, *, t_rxd_blocks):
     """Drive an ETH↔RXD (rxd) swap to BOTH_LOCKED on real anvil + regtest. Returns (coord, p_secret, rpc)."""
     coord, cov, p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=t_rxd_blocks)
     terms = coord.record.terms
+    # HZ-1: the maker locks the RXD covenant FIRST and it is mined; only then may the taker fund
+    # the ETH counter leg. taker_funds_btc reads the Radiant chain for this exact covenant SPK
+    # (value bound to terms.radiant_amount, min_confirmations of burial) and refuses otherwise.
+    # RXD-height-neutral vs the old order: the ETH leg mines no Radiant blocks.
+    _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
     rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
     assert rec.state is SwapState.BTC_LOCKED
-    _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
     assert rec.state is SwapState.BOTH_LOCKED
     return coord, p_secret, rpc
@@ -548,10 +552,16 @@ class TestWatchtowerEthIntentSequence:
         assert page.severity is Severity.CRITICAL
         assert page.low_corroboration is True  # single-source ETH RPC + RXD
 
-        # Dedup: re-ticking the same SAFE situation does not re-page.
+        # Re-page backoff: PAGE_CLAIM is CRITICAL, and a CRITICAL situation deliberately RE-pages on
+        # the tick-count backoff (default repage_critical_every_ticks=1) so a single missed page
+        # cannot silently lose funds. Was "must not re-page" — the pre-#239 semantics, never caught
+        # because this suite is -m integration. Authority:
+        # tests/test_watch_alerts.py::test_critical_intent_repages_each_tick_by_default.
         r = await self._tick(reconciler)
         assert r.decision.intent is Intent.PAGE_CLAIM
-        assert len(channel.pages) == 1, "DedupAlerter must not re-page an unchanged situation"
+        assert len(channel.pages) == 2, "a CRITICAL claim race must RE-page each tick, not dedup away"
+        assert channel.pages[1].intent is Intent.PAGE_CLAIM
+        assert channel.pages[1].severity is Severity.CRITICAL
         await rpc.close()
 
     async def test_eth_maker_stall_watch_then_page_mutual_refund(self, env):
@@ -610,17 +620,21 @@ class TestEthRxdSwap:
         terms = coord.record.terms
         now_unix = _anvil_now(url)
 
-        # 1. Taker deploys + funds the ETH HTLC on Anvil.
-        rec = await coord.taker_funds_btc(terms, now_unix_s=now_unix)
-        assert rec.state is SwapState.BTC_LOCKED
-        assert rec.counterchain_locator.amount_wei == _ETH_AMOUNT_WEI
-
-        # 2. Maker locks the asset covenant on regtest; taker re-validates SPK + ref + cross-clock.
+        # 1. MAKER locks the asset covenant on regtest FIRST, and it is mined (HZ-1) — the taker's
+        #    pre-lock gate reads this exact covenant SPK on the Radiant chain (value bound to
+        #    terms.radiant_amount, min_confirmations of burial) and refuses to fund ETH otherwise.
         asset_locked_at = int(node.rxd("getblockcount"))
         if ref_utxo is None:  # rxd: native photons
             _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
         else:  # nft/ft: spend the genesis-ref UTXO into the covenant (the singleton)
             _fund_spending_ref(node, cov.funded_spk, terms.radiant_amount, ref_utxo)
+
+        # 2. Taker deploys + funds the ETH HTLC on Anvil, against a verified covenant.
+        rec = await coord.taker_funds_btc(terms, now_unix_s=now_unix)
+        assert rec.state is SwapState.BTC_LOCKED
+        assert rec.counterchain_locator.amount_wei == _ETH_AMOUNT_WEI
+
+        # 3. Taker re-validates SPK + ref + cross-clock and advances to BOTH_LOCKED.
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
         assert rec.state is SwapState.BOTH_LOCKED
 
@@ -652,9 +666,12 @@ class TestEthRxdSwap:
         terms = coord.record.terms
         now_unix = _anvil_now(url)
 
+        # HZ-1: maker locks the covenant first (mined), then the taker funds ETH against it. The
+        # scenario under test is a maker that never CLAIMS — it still has to lock, exactly as a real
+        # stalling maker does; "never locks at all" is now refused before any taker value moves.
+        _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
         rec = await coord.taker_funds_btc(terms, now_unix_s=now_unix)
         assert rec.state is SwapState.BTC_LOCKED
-        _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
         assert rec.state is SwapState.BOTH_LOCKED
 

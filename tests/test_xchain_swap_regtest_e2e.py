@@ -4,9 +4,12 @@ The end-to-end proof that the production :class:`SwapCoordinator` drives a compl
 BTC<->RXD atomic swap across REAL consensus on both chains — not fakes. All paths
 branch from the same BOTH_LOCKED state (``_setup_locked_swap``):
 
-  taker_funds_btc            -> NEGOTIATED -> BTC_LOCKED   (BtcLeg funds P2TR HTLC)
-  post_asset_lock_revalidate -> BOTH_LOCKED                (maker locks RXD covenant;
-                                                            RadiantLeg locates it,
+  maker funds the RXD covenant, mined                      (HZ-1: the taker MUST NOT lock
+                                                            BTC against an unfunded maker)
+  taker_funds_btc            -> NEGOTIATED -> BTC_LOCKED   (BtcLeg funds P2TR HTLC, only
+                                                            after the HZ-1 gate reads the
+                                                            covenant on the Radiant chain)
+  post_asset_lock_revalidate -> BOTH_LOCKED                (RadiantLeg locates the covenant,
                                                             coordinator re-validates SPK)
 
 * HAPPY PATH: maker_claims_btc -> SECRET_REVEALED (reveals p); then
@@ -521,14 +524,25 @@ async def _setup_locked_swap(nodes: _Nodes, *, t_rxd_blocks: int = 3, role=None)
         config=CoordinatorConfig(margin_policy=MarginPolicy.estimated(block_interval_s=_BTC_INTERVAL_S), role=role),
     )
 
-    # 1. Taker funds the BTC HTLC.
+    # 1. MAKER locks the RXD asset FIRST, and it is mined (HZ-1). The taker's pre-BTC-lock
+    #    gate reads the Radiant chain for this exact covenant SPK, binds its on-chain value to
+    #    terms.radiant_amount, and requires min_confirmations of burial — so an unfunded or
+    #    mempool-only covenant refuses to let step 2 fund anything. ``_rxd_pay`` mines a block,
+    #    which satisfies the leg's min_confirmations=1 (the estimated test policy defers the
+    #    depth to the leg). Ordering per docs/htlc-handshake-wire-format.md HZ-1 and
+    #    scripts/btc_swap_two_host.py; the FSM still records the taker's lock as the first
+    #    TRANSITION, because the requirement is a precondition on that transition, not an edge.
+    rxd_locked_at = int(nodes.rxd("getblockcount"))
+    _rxd_pay(nodes, cov.funded_spk, rxd_photons)
+
+    # 2. Taker funds the BTC HTLC — this now runs the HZ-1 gate against a genuinely funded,
+    #    mined covenant (twice: once in pre_btc_lock_check, once re-run inside taker_funds_btc
+    #    immediately before the broadcast, which is what closes the verify->lock TOCTOU).
     rec = await coord.taker_funds_btc(terms)
     assert rec.state is SwapState.BTC_LOCKED
     assert rec.btc_locator.amount_sats == btc_sats
 
-    # 2. Maker locks the RXD asset; taker re-validates the on-chain covenant SPK.
-    rxd_locked_at = int(nodes.rxd("getblockcount"))
-    _rxd_pay(nodes, cov.funded_spk, rxd_photons)
+    # 3. Taker re-validates the on-chain covenant SPK and advances to BOTH_LOCKED.
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk)
     assert rec.state is SwapState.BOTH_LOCKED
 
@@ -969,10 +983,17 @@ class TestWatchtowerIntentSequence:
         assert page.low_corroboration is True  # RXD single-source in v1
         assert page.deadline_rxd_height == r.decision.deadline_rxd_height
 
-        # Dedup: re-ticking the same SAFE situation does not re-page (still 1).
+        # Re-page backoff: PAGE_CLAIM is CRITICAL, and a CRITICAL situation deliberately RE-pages
+        # on the tick-count backoff (default repage_critical_every_ticks=1) so a single missed page
+        # cannot silently lose funds. This assertion previously read "must not re-page an unchanged
+        # situation" — the pre-#239 semantics; the re-page backoff landed after this suite was
+        # written and, being -m integration, it never went red in CI. The authority for the
+        # behaviour is tests/test_watch_alerts.py::test_critical_intent_repages_each_tick_by_default.
         r = await self._tick_one(reconciler)
         assert r.decision.intent is Intent.PAGE_CLAIM
-        assert len(channel.pages) == 1, "DedupAlerter must not re-page an unchanged situation"
+        assert len(channel.pages) == 2, "a CRITICAL claim race must RE-page each tick, not dedup away"
+        assert channel.pages[1].intent is Intent.PAGE_CLAIM
+        assert channel.pages[1].severity is Severity.CRITICAL
 
     async def test_maker_stall_watch_then_page_refund(self, nodes):
         """Maker locks the asset then stalls (never reveals p). As t_rxd nears, the tower pages the

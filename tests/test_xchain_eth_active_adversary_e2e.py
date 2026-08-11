@@ -123,17 +123,21 @@ class TestEthActiveAdversary:
         adv = _ActiveAdversaryMaker(url, p_raw=p_secret.unsafe_raw_bytes(), eth_timeout_unix_s=terms.eth_timeout_unix_s)
 
         try:
-            # 1. Honest taker funds the ETH counter-leg (deploys the HTLC). Its locator (contract
-            #    address) is PUBLIC on-chain — the only thing the adversary needs to claim it.
+            # 1. The MAKER (adversary) funds the RXD covenant FIRST and it is mined (HZ-1). The
+            #    adversary still holds p and the ETH claim path — locking the asset buys it nothing
+            #    and is exactly what a real free-option attacker must do to get a taker to lock at
+            #    all. The honest taker's pre-lock gate reads this covenant on the real chain and
+            #    would refuse to fund ETH against an unfunded maker.
+            asset_locked_at = int(node.rxd("getblockcount"))
+            _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+
+            # 2. Honest taker funds the ETH counter-leg (deploys the HTLC). Its locator (contract
+            #    address) is PUBLIC on-chain — the only thing the adversary needs to claim it. The
+            #    taker then observes the covenant and advances to BOTH_LOCKED (re-deriving the SPK).
             rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
             assert rec.state is SwapState.BTC_LOCKED
             locator = eth_leg.last_funded_locator
             assert locator is not None
-
-            # 2. The MAKER (adversary) funds the RXD covenant; the honest taker observes it on the
-            #    real chain and advances to BOTH_LOCKED (it re-derives the expected covenant SPK).
-            asset_locked_at = int(node.rxd("getblockcount"))
-            _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
             rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
             assert rec.state is SwapState.BOTH_LOCKED
 
@@ -196,11 +200,13 @@ class TestEthActiveAdversary:
         adv = _ActiveAdversaryMaker(url, p_raw=p_secret.unsafe_raw_bytes(), eth_timeout_unix_s=terms.eth_timeout_unix_s)
 
         try:
+            # HZ-1: maker locks the covenant first (mined), then the honest taker funds ETH. The
+            # attack under test is the TIMING of the reveal, not a maker that never locks.
+            asset_locked_at = int(node.rxd("getblockcount"))
+            _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
             rec = await coord.taker_funds_btc(terms, now_unix_s=_anvil_now(url))
             assert rec.state is SwapState.BTC_LOCKED
             locator = eth_leg.last_funded_locator
-            asset_locked_at = int(node.rxd("getblockcount"))
-            _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
             rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_anvil_now(url))
             assert rec.state is SwapState.BOTH_LOCKED
 

@@ -6,6 +6,58 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **The six `-m integration` cross-chain end-to-end suites now fund the maker's covenant before
+  the taker locks, and pass.** 0.14.0 closed hazard **HZ-1** by making the taker verify the maker's
+  Radiant covenant on chain before locking its counter leg, and recorded that these suites still
+  used the pre-HZ-1 order and would have to be reordered — deferred at the time because they need
+  live bitcoind/radiantd/anvil nodes and editing adversarial tests one cannot watch go red or green
+  is its own failure mode. They have now been reordered *and run*.
+
+  In every suite the maker's covenant is funded and mined first, so the taker's gate
+  (`pre_btc_lock_check` step 5, re-run inside `taker_funds_btc`) runs against a genuinely funded,
+  sufficiently-buried covenant instead of an empty scriptPubKey. This is the order
+  `scripts/btc_swap_two_host.py` always used. The reorder is Radiant-height-neutral — neither the
+  BTC nor the ETH counter leg mines Radiant blocks — so every CSV-maturity and window-closing
+  computation in these tests is unchanged.
+
+  Two adversarial scenarios changed shape, both toward a stronger assertion, neither weakened:
+
+  - **S3 (hostile maker funds a decoy covenant)** now proves *two* independent layers: the pre-lock
+    gate refuses to fund the ETH leg at all while only the decoy exists — so the taker locks nothing
+    rather than locking and waiting out a timeout — and then, once the maker also funds the agreed
+    covenant, `post_asset_lock_revalidate` still returns `PARAMS_MISMATCH` when the maker *reports*
+    the decoy SPK.
+  - **S6 (counterparty lies about having locked)** is now caught before the taker locks rather than
+    after, so the lie costs the taker nothing at all. The later revalidate layer it used to exercise
+    is still covered by S3 layer B and by `tests/test_swap_coordinator.py`.
+
+  Every other scenario keeps its original premise: a maker that stalls, griefs, times a reveal
+  against a closing window, or actively claims to publish `p` must still *lock its asset* — that was
+  always true of a real attacker, and it is what makes those attacks griefs rather than outright
+  theft.
+
+- **Three pre-existing failures in those suites, unrelated to lock ordering**, surfaced once the
+  suites could run far enough to reach them. All three predate this change and were invisible only
+  because these suites sit outside default CI:
+
+  - **A stale watchtower dedup assertion** in the BTC and ETH e2e suites required that a repeated
+    `PAGE_CLAIM` *not* re-page. `DedupAlerter` has deliberately re-paged a CRITICAL situation on a
+    tick-count backoff since #239 — so a single missed page cannot silently lose funds — and
+    `tests/test_watch_alerts.py::test_critical_intent_repages_each_tick_by_default` asserts exactly
+    that. The assertion was written in #168, before the behaviour existed; it now matches the
+    contract.
+  - **The real-RXinDexer Glyph suite never opted in to `accept_estimated_eth_margins`.** The
+    MEDIUM-1 guard added in #192 refuses a value-bearing ETH counter leg under an estimated margin
+    policy; the sibling ETH e2e was updated then, this suite was not, so it has failed at
+    `SwapCoordinator` construction ever since — before reaching any swap step.
+  - **`web3` is required by five of these suites but declared in no dependency group**, and the
+    version that resolves (`web3` 7.16.0) caps `websockets<16.0.0` while pyrxd itself requires
+    `websockets>=16.1.1`. The suites that only need anvil are unaffected, but the Glyph suite also
+    drives pyrxd's ElectrumX client and fails to connect under the lower pin. Left undeclared here
+    rather than papered over: the conflict is real and wants a dependency decision, not a test edit.
+
 ## [0.14.0] — 2026-08-10
 
 Specifications, token issuance, and the security work that writing the specifications
