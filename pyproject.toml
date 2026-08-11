@@ -45,7 +45,14 @@ dependencies = [
     # tomllib backport for Python 3.10 (stdlib tomllib lands in 3.11).
     # pyrxd.cli.config falls back to this when running on 3.10.
     "tomli>=2.4,<3.0; python_version < '3.11'",
-    "websockets>=16.1.1,<17.0.0",
+    # Floor deliberately kept at 15.0.1, NOT the newest release. pyrxd uses only the stable
+    # websockets API (connect/send/recv/close/WebSocketException), identical from 13 through 16,
+    # so a higher floor buys nothing and costs coexistence: `web3` (every 7.x) caps
+    # websockets<16.0.0, and pyrxd's own ETH-leg integration suites import it. 0.2.0 widened this
+    # constraint for exactly this reason (then: solana-py); a routine floor raise in #343 undid it
+    # and locked web3 out. Both websockets advisories in OSV are fixed far below this floor
+    # (GHSA-6g87-ff9q-v847 in 5.0, GHSA-8ch4-58qp-g3mp in 9.1), so this is not a security floor.
+    "websockets>=15.0.1,<17.0.0",
 ]
 
 [project.urls]
@@ -284,6 +291,11 @@ test = [
     "pytest-mock<3.15.2",
     "pytest-runner",
     "shellcheck-py==0.11.0.1",
+    # ETH counter-chain integration suites (tests/test_xchain_eth_*.py) drive a live anvil node
+    # through web3. Previously undeclared: the suites were importable only if a developer happened
+    # to have web3 installed, so they silently skipped. web3 caps websockets<16.0.0 — see the
+    # runtime `websockets` floor above for why that constraint is compatible rather than a conflict.
+    "web3>=7.16.0,<8.0.0",
 ]
 docs = [
     "furo>=2025.12,<2026.0",
