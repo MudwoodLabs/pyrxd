@@ -259,7 +259,14 @@ class TestCancelRoutesOnCovenantDetection:
 
     def test_plain_give_routes_to_v2_cancel(self, runner: CliRunner, monkeypatch) -> None:
         mk, mk_pkh = _key()
-        give_src = _rxd_src(mk_pkh, 1_000_000)  # well above the estimated fee — no extra funding needed
+        # Was 1_000_000 with the comment "well above the estimated fee". That premise
+        # came from the fee bug this fixture predates: `_estimate_fee` divided a
+        # photons-per-BYTE rate by 1000, so a cancel "cost" ~6_000 photons and 1 RXD/100
+        # looked generous. The real relay floor for a ~192-byte cancel is ~1_920_000
+        # photons, which 1_000_000 cannot pay — the command correctly reaches for
+        # separate fee funding, which this fake wallet has none of. Funded properly so
+        # the test measures ROUTING, which is what it is for.
+        give_src = _rxd_src(mk_pkh, 100_000_000)  # 1 RXD — genuinely covers the relay-floor fee
         client = _fake_client(get_transaction=AsyncMock(return_value=give_src.serialize()))
         triples = [(UtxoRecord(tx_hash="00" * 32, tx_pos=0, value=0, height=0), "addr", mk)]
         monkeypatch.setattr(swap_book_cmds, "_load_wallet", lambda ctx, **kw: _FakeWallet(triples))
