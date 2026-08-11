@@ -410,6 +410,25 @@ async def test_list_address_utxos_fails_closed_on_hostile_amounts(field: str, sh
     await assert_fail_closed(coro, label=f"list_address_utxos[{field}={shape}]")
 
 
+@pytest.mark.parametrize(("shape", "value"), HOSTILE_BOOLEANS, ids=[s for s, _ in HOSTILE_BOOLEANS])
+async def test_funding_reader_confirmations_requires_a_real_confirmed_boolean(shape: str, value: Any) -> None:
+    """``MempoolSpaceFundingReader.confirmations`` is the reorg gate's depth oracle.
+
+    ``if not status.get("confirmed", False)`` is a truthiness test, so the NON-EMPTY string
+    ``"false"`` read as CONFIRMED — the same shape as the ``spent`` bug in the sibling read
+    two methods down. The height is set so a spoofed "confirmed" would otherwise yield a
+    healthy depth, and the honest falsy answers must still read as depth 0 rather than raise.
+    """
+    status = with_field({"confirmed": True, "block_height": 100}, "confirmed", value)
+    reader = esplora_reader([jbytes(status), http_response(200, b"140", "text/plain")])
+    coro = reader.confirmations(VALID_TXID)
+
+    if value is False or isinstance(value, _Missing):
+        assert await coro == 0  # an honest "not confirmed yet" is depth 0, not an error
+        return
+    await assert_fail_closed(coro, label=f"MempoolSpaceFundingReader.confirmations[confirmed={shape}]")
+
+
 # ── Bitcoin Core JSON-RPC ─────────────────────────────────────────────────────
 
 

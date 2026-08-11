@@ -1084,13 +1084,14 @@ class MempoolSpaceFundingReader:
     async def confirmations(self, txid: str) -> int:
         tx = txid if isinstance(txid, Txid) else Txid(txid)
         status = await self._http.tx_status(tx)
-        if not status.get("confirmed", False) or status.get("block_height") is None:
+        # `confirmed` was truthiness-tested, so the NON-EMPTY string `"false"` read as
+        # CONFIRMED — the same shape as the `spent` bug below. `_esplora_status_height`
+        # requires a real JSON boolean and a usable height, and still returns None (-> 0,
+        # the gate's fail-closed direction) for an honest "not confirmed yet".
+        block_height = _esplora_status_height(status)
+        if block_height is None:
             return 0  # unconfirmed / unknown -> 0 (the gate's >= N check fails closed)
         tip = await self._http.tip_height()
-        try:
-            block_height = _finite_int(status["block_height"])
-        except (KeyError, TypeError, ValueError) as exc:
-            raise NetworkError(f"unreadable block_height for {str(tx)[:16]}…; fail-closed") from exc
         # F-005: internal consistency check. A tx cannot be in a block above the tip, and
         # a real confirmed tx sits at height >= 1. An inverted/garbage response is a
         # confused or lying source — fail-closed LOUD (raise) rather than silently
