@@ -67,7 +67,13 @@ from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
 from ..transaction.transaction_output import TransactionOutput
 from ..utils import validate_address
-from ..wallet import DEFAULT_FEE_RATE, DUST_THRESHOLD, greedy_select_count
+from ..wallet import (
+    DEFAULT_FEE_RATE,
+    DUST_THRESHOLD,
+    SELECTION_BASE_BYTES,
+    SELECTION_INPUT_BYTES,
+    greedy_select_count,
+)
 
 if TYPE_CHECKING:
     from ..network.electrumx import ElectrumXClient
@@ -1105,34 +1111,44 @@ class HdWallet:
         recipient_script = P2PKH().lock(to_address)
         change_script = P2PKH().lock(change_address)
 
-        per_input_fee_cushion = 148 * fee_rate
-        base_fee_cushion = 80 * fee_rate
+        # Cushion constants shared with ``RxdWallet`` — including the per-input signature
+        # slack the FEE is sized with. Budgeting a bare 148/input left selection
+        # ``3n - 2`` bytes short of the fee it was about to be charged, so the build
+        # raised "Insufficient funds after fee" with UTXOs still unselected.
+        per_input_fee_cushion = SELECTION_INPUT_BYTES * fee_rate
+        base_fee_cushion = SELECTION_BASE_BYTES * fee_rate
         n_selected = greedy_select_count(
             [t[0].value for t in sorted_triples],
             photons,
             base_cushion=base_fee_cushion,
             per_input_cushion=per_input_fee_cushion,
         )
-        selected: list[tuple[UtxoRecord, str, PrivateKey]] = sorted_triples[:n_selected]
-        total_in = sum(t[0].value for t in selected)
 
-        # Trial pass.
-        inputs = [self._build_utxo_input(u, addr, pk) for u, addr, pk in selected]
-        trial_change = max(DUST_THRESHOLD, total_in - photons - base_fee_cushion)
-        trial_outputs = [
-            TransactionOutput(recipient_script, photons),
-            TransactionOutput(change_script, trial_change),
-        ]
-        trial_tx = Transaction(tx_inputs=inputs, tx_outputs=trial_outputs)
-        trial_tx.sign()
-        # Pad by the most a signature can grow between the trial and final passes —
-        # they sign different messages, so their DER lengths differ. See
-        # :mod:`pyrxd.fee_sizing`; without this the fee pays for the TRIAL bytes.
-        trial_size = trial_size_with_slack(trial_tx.byte_length(), len(inputs))
-        fee = required_fee(trial_size, fee_rate)
-
-        if total_in < photons + fee:
-            raise ValidationError("Insufficient funds after fee")
+        # Trial pass. The cushion is an ESTIMATE and ``fee`` is a MEASUREMENT; where they
+        # disagree, take one more UTXO and measure again rather than refusing a send the
+        # caller's coins can cover. Terminates: every pass returns or consumes a UTXO.
+        selected: list[tuple[UtxoRecord, str, PrivateKey]]
+        while True:
+            selected = sorted_triples[:n_selected]
+            total_in = sum(t[0].value for t in selected)
+            inputs = [self._build_utxo_input(u, addr, pk) for u, addr, pk in selected]
+            trial_change = max(DUST_THRESHOLD, total_in - photons - base_fee_cushion)
+            trial_outputs = [
+                TransactionOutput(recipient_script, photons),
+                TransactionOutput(change_script, trial_change),
+            ]
+            trial_tx = Transaction(tx_inputs=inputs, tx_outputs=trial_outputs)
+            trial_tx.sign()
+            # Pad by the most a signature can grow between the trial and final passes —
+            # they sign different messages, so their DER lengths differ. See
+            # :mod:`pyrxd.fee_sizing`; without this the fee pays for the TRIAL bytes.
+            trial_size = trial_size_with_slack(trial_tx.byte_length(), len(inputs))
+            fee = required_fee(trial_size, fee_rate)
+            if total_in >= photons + fee:
+                break
+            if n_selected >= len(sorted_triples):
+                raise ValidationError("Insufficient funds after fee")
+            n_selected += 1
 
         change_value = total_in - photons - fee
 

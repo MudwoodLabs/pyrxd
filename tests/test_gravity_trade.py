@@ -24,6 +24,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pyrxd.fee_sizing import RADIANT_MIN_RELAY_PHOTONS_PER_KB
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.gravity.trade import (
     GravityTrade,
     TradeConfig,
@@ -223,7 +225,7 @@ class TestGravityTradeClaim:
 
         assert result.txid == "cc" * 32
         rxd.broadcast.assert_awaited_once()
-        # Verify accept_short_deadline forwarded from config
+        # Verify accept_short_deadline and fee_policy are both forwarded from config
         mock_build.assert_called_once_with(
             offer=offer,
             funding_txid="aa" * 32,
@@ -232,6 +234,7 @@ class TestGravityTradeClaim:
             fee_sats=1000,
             taker_privkey=privkey,
             accept_short_deadline=False,
+            fee_policy=None,
         )
 
     @pytest.mark.asyncio
@@ -466,6 +469,73 @@ class TestGravityTradeFinalize:
 
         assert result.txid == "ee" * 32
         rxd.broadcast.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_finalize_forwards_the_config_fee_policy_to_the_builder(self):
+        """``fee_policy`` was threaded into all five builders but not into ``GravityTrade``.
+
+        The finalize tx is the largest in the module — the whole BTC transaction, N
+        headers and the Merkle branch in one scriptSig — so its floor is where a wrong
+        rate hurts most, and on regtest (a tenth of the mainnet floor) the orchestrator
+        had no way to say so.
+        """
+        regtest = DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB)
+        trade, _rxd, btc = self._make_trade(
+            cfg=TradeConfig(min_btc_confirmations=1, poll_interval_seconds=0.01, fee_policy=regtest)
+        )
+        offer = make_offer()
+
+        stripped_tx = _make_stripped_p2wpkh_tx()
+        btc.get_raw_tx.return_value = RawTx(stripped_tx)
+        btc.get_merkle_proof.return_value = (["cd" * 32], 1)
+        btc.get_header_chain.return_value = [b"\x00" * 80]
+
+        fake = FinalizeResult(tx_hex="deadbeef", txid="ee" * 32, tx_size=300, fee_sats=1000, output_photons=8_000_000)
+        with (
+            patch("pyrxd.gravity.trade.strip_witness", return_value=stripped_tx),
+            patch("pyrxd.gravity.trade.SpvProofBuilder") as MockBuilder,
+            patch("pyrxd.gravity.trade.build_finalize_tx", return_value=fake) as mock_build,
+        ):
+            MockBuilder.return_value.build.return_value = MagicMock()
+            await trade.finalize(
+                btc_txid=self.VALID_BTC_TXID,
+                offer=offer,
+                claimed_txid="cc" * 32,
+                claimed_vout=0,
+                claimed_photons=9_000_000,
+                taker_address="1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+                fee_sats=1000,
+                btc_tx_height=101,
+            )
+        assert mock_build.call_args.kwargs["fee_policy"] is regtest
+
+    @pytest.mark.asyncio
+    async def test_claim_forwards_a_per_call_fee_policy_over_the_config_one(self):
+        cfg_policy = DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB)
+        per_call = DeadlineFeePolicy(relay_fee_per_kb=20_000_000)
+        trade, _, _ = self._make_trade(
+            cfg=TradeConfig(min_btc_confirmations=1, poll_interval_seconds=0.01, fee_policy=cfg_policy)
+        )
+        fake = ClaimResult(
+            tx_hex="deadbeef",
+            txid="cc" * 32,
+            tx_size=200,
+            offer_p2sh="p",
+            claimed_p2sh="c",
+            fee_sats=3_000_000,
+            output_photons=7_000_000,
+        )
+        with patch("pyrxd.gravity.trade.build_claim_tx", return_value=fake) as mock_build:
+            await trade.claim(
+                offer=make_offer(),
+                offer_txid="aa" * 32,
+                offer_vout=0,
+                offer_photons=10_000_000,
+                fee_sats=3_000_000,
+                taker_privkey=make_taker_privkey(),
+                fee_policy=per_call,
+            )
+        assert mock_build.call_args.kwargs["fee_policy"] is per_call
 
     @pytest.mark.asyncio
     async def test_finalize_spv_failure_propagates(self):

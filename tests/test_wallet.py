@@ -132,6 +132,45 @@ class TestBuildSendTx:
         with pytest.raises(ValidationError, match="Insufficient"):
             wallet.build_send_tx(utxos, recipient_address, 1_000_000)
 
+    def test_selection_does_not_stop_short_of_the_fee_it_will_be_charged(
+        self, wallet: RxdWallet, recipient_address: str
+    ) -> None:
+        """ "Insufficient funds after fee" while UTXOs are still unselected.
+
+        The greedy cushion budgeted a bare 148 bytes per input, but the FEE is sized from
+        ``trial_size_with_slack`` — the trial bytes PLUS ``SIG_SIZE_SLACK_BYTES`` per
+        input. So selection stopped up to ``3n - 2`` bytes short of the requirement and
+        raised with coins left on the table. At three inputs the gap is 1..7 bytes
+        depending on DER lengths — i.e. ALWAYS short — which is what makes this shape
+        deterministic rather than a one-in-three flake.
+
+        The numbers: at 10,000 photons/byte the loop stops at three inputs
+        (3 x 1,780,000 = 5,340,000 >= 100,000 + 80x10,000 + 3x148x10,000) and the real
+        requirement is 100,000 + fee(>= 516 + 9 bytes) > 5,350,000. A fourth UTXO is
+        sitting right there.
+        """
+        utxos = [
+            _utxo("11" * 32, 0, 1_780_000),
+            _utxo("22" * 32, 0, 1_780_000),
+            _utxo("33" * 32, 0, 1_780_000),
+            _utxo("44" * 32, 0, 1_700_000),
+        ]
+        tx = wallet.build_send_tx(utxos, recipient_address, 100_000)
+        assert len(tx.inputs) == 4  # the fourth was reached, not refused
+        assert tx.outputs[0].satoshis == 100_000
+        # And it still pays for the bytes it actually contains.
+        assert tx.get_fee() >= tx.byte_length() * wallet.fee_rate
+
+    def test_a_genuine_shortfall_is_still_refused(self, wallet: RxdWallet, recipient_address: str) -> None:
+        """The top-up loop must not turn "cannot pay" into an endless walk or a bad tx.
+
+        Every UTXO here is worth less than the ~148 bytes of fee it adds, so no selection
+        can ever cover the send. That is a real refusal, and it must still arrive.
+        """
+        utxos = [_utxo(f"{i:02x}" * 32, 0, 400_000) for i in range(6)]
+        with pytest.raises(ValidationError, match="Insufficient funds after fee"):
+            wallet.build_send_tx(utxos, recipient_address, 1_000_000)
+
     def test_empty_utxo_list_raises(self, wallet: RxdWallet, recipient_address: str) -> None:
         with pytest.raises(ValidationError, match="Insufficient"):
             wallet.build_send_tx([], recipient_address, 1_000)
