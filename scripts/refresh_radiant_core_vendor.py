@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Refresh the vendored Radiant Core consensus sources used as a test oracle.
+
+``tests/test_consensus_opcode_parity.py`` derives Radiant's opcode table and
+ref-operand rules by parsing pinned copies of ``script.h`` and ``script.cpp``
+committed under ``tests/vendor/radiant_core/``. Vendoring keeps that test
+hermetic and offline (see the README there for why that is the right trade).
+The cost is that the pin can go stale — this script is how that is managed.
+
+    # what upstream release are we pinned to, and has upstream moved?
+    python scripts/refresh_radiant_core_vendor.py --check
+
+    # move the pin
+    python scripts/refresh_radiant_core_vendor.py --tag v3.2.0
+
+Both modes need network, which is exactly why neither is a pytest test: a
+GitHub outage should fail a job someone chose to run, not turn a pull request
+red for an unrelated change.
+
+After refreshing, run the parity test. If it now fails, that is the oracle
+working — upstream changed a consensus fact and pyrxd has not caught up. Fix
+``src/pyrxd/constants.py``; never edit the vendored files.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import subprocess  # nosec B404 -- invokes the `gh` CLI; no shell, fixed argv
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+REPO = "Radiant-Core/Radiant-Core"
+VENDOR_DIR = Path(__file__).resolve().parent.parent / "tests" / "vendor" / "radiant_core"
+MANIFEST_PATH = VENDOR_DIR / "MANIFEST.json"
+
+# local filename -> upstream path
+FILES = {
+    "script.h": "src/script/script.h",
+    "script.cpp": "src/script/script.cpp",
+}
+
+
+def _gh(*args: str) -> str:
+    """Run the `gh` CLI and return stdout."""
+    try:
+        result = subprocess.run(  # nosec B603 -- fixed argv, no shell
+            ["gh", *args], capture_output=True, text=True, check=True
+        )
+    except FileNotFoundError:
+        sys.exit("error: the `gh` CLI is required to refresh the vendored sources (https://cli.github.com)")
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f"error: gh {' '.join(args)} failed:\n{exc.stderr.strip()}")
+    return result.stdout
+
+
+def _resolve_commit(tag: str) -> str:
+    """Resolve a tag to a commit sha, dereferencing annotated tags."""
+    ref = json.loads(_gh("api", f"repos/{REPO}/git/ref/tags/{tag}"))["object"]
+    if ref["type"] == "commit":
+        return ref["sha"]
+    return json.loads(_gh("api", f"repos/{REPO}/git/tags/{ref['sha']}"))["object"]["sha"]
+
+
+def _fetch(path: str, ref: str) -> bytes:
+    import base64
+
+    content = json.loads(_gh("api", f"repos/{REPO}/contents/{path}?ref={ref}"))["content"]
+    return base64.b64decode(content)
+
+
+def _latest_tag() -> str:
+    tags = json.loads(_gh("api", f"repos/{REPO}/tags"))
+    if not tags:
+        sys.exit(f"error: {REPO} reported no tags")
+    return tags[0]["name"]
+
+
+def _load_manifest() -> dict:
+    return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+
+
+def check() -> int:
+    manifest = _load_manifest()
+    pinned_tag = manifest["tag"]
+    latest = _latest_tag()
+
+    print(f"pinned : {pinned_tag} ({manifest['commit'][:12]})")
+    print(f"latest : {latest}")
+
+    drift = 0
+    for name, upstream_path in FILES.items():
+        local = (VENDOR_DIR / name).read_bytes()
+        recorded = manifest["files"][name]["sha256"]
+        actual = hashlib.sha256(local).hexdigest()
+        if actual != recorded:
+            print(f"  ! {name}: local bytes do NOT match MANIFEST.json (hand-edited?)")
+            drift = 1
+            continue
+        remote = _fetch(upstream_path, latest)
+        if hashlib.sha256(remote).hexdigest() != actual:
+            print(f"  ! {name}: changed upstream between {pinned_tag} and {latest}")
+            drift = 1
+        else:
+            print(f"  = {name}: unchanged upstream at {latest}")
+
+    if drift:
+        print(f"\nUpstream moved. Refresh with:\n  python {Path(__file__).name} --tag {latest}")
+    else:
+        print("\nVendored consensus sources are current.")
+    return drift
+
+
+def refresh(tag: str) -> int:
+    commit = _resolve_commit(tag)
+    print(f"pinning {REPO} @ {tag} ({commit[:12]})")
+
+    files: dict[str, dict] = {}
+    changed = []
+    for name, upstream_path in FILES.items():
+        data = _fetch(upstream_path, commit)
+        target = VENDOR_DIR / name
+        if not target.exists() or target.read_bytes() != data:
+            changed.append(name)
+        target.write_bytes(data)
+        files[name] = {"upstream_path": upstream_path, "sha256": hashlib.sha256(data).hexdigest()}
+        print(f"  {name}: {len(data)} bytes, sha256 {files[name]['sha256'][:16]}…")
+
+    manifest = _load_manifest()
+    manifest.update(
+        {
+            "tag": tag,
+            "commit": commit,
+            "fetched_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+            "files": files,
+        }
+    )
+    MANIFEST_PATH.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+
+    if changed:
+        print(f"\nCONTENT CHANGED: {', '.join(changed)}")
+        print("Review the diff, then run:\n  .venv/bin/pytest tests/test_consensus_opcode_parity.py")
+        print("A failure there means a consensus fact moved and pyrxd must be updated to match.")
+    else:
+        print("\nFile contents unchanged; only the pin metadata moved.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--check", action="store_true", help="report whether upstream has moved (exit 1 if so)")
+    group.add_argument("--tag", metavar="TAG", help="re-vendor from this upstream tag, e.g. v3.2.0")
+    args = parser.parse_args()
+    return check() if args.check else refresh(args.tag)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

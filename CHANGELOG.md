@@ -198,6 +198,74 @@ both. It is fixed here.
 
 ### Tests
 
+- **Consensus differential oracles — pyrxd's re-implementations of Radiant consensus rules
+  are now pinned to the C++ that defines them, mechanically and offline.**
+
+  Three ref-walking bugs reached `main` within a day of each other, all the same shape: four
+  independent walkers each spelled the ref-operand rule by hand, two spelled it wrong, and
+  nothing in the tree could say which two. Centralising the rule on
+  `pyrxd.constants.REF_OPERAND_OPCODES` fixed the instances; these tests address the cause.
+
+  **A fresh divergence was found in the process, in the test layer.**
+  `tests/test_preimage_differential.py` — the FORKID differential whose whole purpose is to
+  catch sighash bugs — carried the *same* defect as the production code it checks. Its
+  "independent" reference walked only `0xd0`/`0xd8`, so when `_get_push_refs` had that bug
+  the two agreed and the differential reported green. It stayed green after the production
+  fix only because its Hypothesis generator emitted `0xd1`/`0xd2`/`0xd3` nowhere, so the now
+  out-of-sync reference was never exercised. On a Photonic `nftAuthScript` shape
+  (`OP_REQUIREINPUTREF <ref> … OP_PUSHINPUTREFSINGLETON <ref>`) the reference returned no
+  refs where production correctly returned one; given a `0xd3` whose operand is 36 `0xd0`
+  bytes it returned a fabricated ref and lost the real one — 2 of 4 probe cases diverged.
+  The reference now derives its rules from the vendored C++ and the generator emits all five
+  operand-carrying opcodes plus the operand-less `0xd4`–`0xd7`; the probe cases now agree
+  0 of 4. *Independent of the implementation* and *correct* are different properties, and
+  only the second one survives a shared misreading of the spec.
+
+- **`tests/consensus_oracle.py` + `tests/vendor/radiant_core/`** — consensus facts are now
+  parsed out of verbatim, sha256-pinned copies of Radiant Core `script.h` and `script.cpp`
+  (`Radiant-Core/Radiant-Core` v3.1.2, commit `45e0aa40`), never hand-transcribed: the
+  opcode table from `enum opcodetype`, `MAX_OPCODE` from `FIRST_UNDEFINED_OP_VALUE - 1`, the
+  operand-carrying opcode set from the `GetScriptOp` branch that does `pc += 36`, and the
+  push-ref subset from the `foundPushRefs.insert` calls in `GetPushRefs`. The two are
+  cross-checked against each other because they come from different C++ functions. Every
+  extractor raises rather than returning a partial set — an oracle that quietly yields
+  `set()` makes every test built on it vacuous.
+
+  Vendored rather than fetched at test time, deliberately: CI must not depend on
+  github.com, and a network-dependent test that skips when offline reports green while
+  checking nothing. `scripts/refresh_radiant_core_vendor.py --check` detects upstream drift
+  on demand (it needs network, so it is a script and not a test); `--tag` moves the pin.
+
+- **`tests/test_consensus_opcode_parity.py`** — 15 offline assertions, milliseconds, no skip
+  path. It found four live parity gaps on first run: `OP_PUSH_TX_STATE` (`0xed`), `OP_BLAKE3`
+  (`0xee`), `OP_K12` (`0xef`) and the aliases `OP_NOP2`/`OP_NOP3` were absent from
+  `constants.OpCode`, all now added. `OP_BLAKE3`/`OP_K12` were already being emitted as raw
+  bytes by `glyph/dmint/builders.py` with the names in a local comment — the same
+  spell-it-locally pattern that produced the ref bugs. The five Bitcoin-legacy pseudo-words
+  Radiant does not define (`OP_DATA`, `OP_SIG`, `OP_PUBKEYHASH`, `OP_PUBKEY`,
+  `OP_INVALIDOPCODE`) are allow-listed, and the exemption is itself checked: each must sit
+  above `MAX_OPCODE`, where Radiant can never accept it in a script.
+
+- **`tests/test_ref_walker_differential.py`** — every pyrxd script walker compared against a
+  `GetScriptOp` transcription driven by the parsed oracle, over each of the 256 byte values
+  in varied positions plus Hypothesis-generated scripts. Covers the adversarial shapes that
+  produced the shipped bugs: `0xd4`–`0xd7` immediately before a real pushref, operands and
+  push payloads made entirely of ref-opcode bytes, and the Photonic `nftAuthScript` layout.
+  Carries a negative control that re-creates the defective `0xd0 <= op <= 0xd8` walker and
+  asserts the reference disagrees with it, so the suite cannot pass by checking nothing.
+  Truncation behaviour is pinned in both directions: the consensus-visible walkers refuse a
+  truncated ref operand, the two structural classifiers stop early, and that divergence from
+  `GetScriptOp` is recorded rather than assumed away.
+
+- **`tests/test_no_duplicate_consensus_constants.py`** — fails if a guarded consensus
+  constant is defined anywhere but `pyrxd.constants`, if a literal collection of ref opcodes
+  appears outside it, if the banned `0xd0 <= op <= 0xd8` range comparison appears anywhere in
+  `src/` or `tests/`, or if a file advances a script pointer by 37 without being a registered
+  ref walker that uses the shared constant. Verified against a planted probe: all four checks
+  fire. `tests/test_glyph.py`'s hand-typed `_CONSENSUS_REF_OPERAND_OPCODES` — a fifth
+  spelling of the rule, living in the test meant to catch the first four — now comes from the
+  oracle.
+
 - **`tests/test_wallet_send_regtest_e2e.py`** — live-regtest consensus coverage for
   `build_send_tx` and `build_send_max_tx`, the two builders that had no node-level proof
   anywhere in the suite. Every assertion reads a *confirmed* transaction or the node's own
