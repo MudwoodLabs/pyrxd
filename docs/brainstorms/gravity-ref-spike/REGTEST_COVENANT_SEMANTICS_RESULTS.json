@@ -83,6 +83,18 @@
     "note": "forfeit reclaim after mature deadline",
     "reject_reason": null
   },
+  "S-4_fee_at_floor": {
+    "allowed": true,
+    "direction": "agreement",
+    "note": "finalize at exactly 10000 photons/byte x 11950 B accepted",
+    "reject_reason": null
+  },
+  "S-4_fee_one_photon_short": {
+    "allowed": false,
+    "direction": "agreement",
+    "note": "one photon under the node's own floor is refused by the node",
+    "reject_reason": "66: min relay fee not met"
+  },
   "V-1_5byte_2pow32": {
     "allowed": true,
     "direction": "A?",

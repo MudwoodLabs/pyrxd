@@ -43,6 +43,7 @@ import time
 
 import pytest
 
+from pyrxd.gravity.fee_policy import photons_per_kb_from_rxd_per_kb
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
@@ -57,7 +58,24 @@ pytestmark = pytest.mark.integration
 
 _IMAGE = "radiant-core:v3.1.1-amd64"
 _CONTAINER = "gravity-regtest-pytest"
-_RELAY_FEE_SATS = 1_000_000  # 0.01 RXD — >> relayfee (0.01 RXD/kB) for a sub-kB tx
+
+#: Radiant MAINNET's relay floor, spelled the way ``-minrelaytxfee`` wants it (RXD/kB).
+#:
+#: Every node this harness starts runs at THIS rate, not at the regtest default of
+#: ``0.01`` — a tenth of it. pyrxd's builders all default to the mainnet floor
+#: (``fee_sizing.relay_floor_photons_per_byte()`` = 10 000 photons/byte), so a node at a
+#: tenth of that cannot contradict them: a transaction one or two bytes short of its own
+#: rate is accepted anyway. That is how ``build_nft_transfer_tx`` shipped under-fee'ing
+#: ~25% of NFT transfers through four releases while its regtest suites stayed green.
+#: :func:`_RegtestNode.start` asserts the node advertises this back before any suite
+#: proves anything against it.
+MAINNET_MIN_RELAY_RXD_PER_KB = "0.10"
+
+#: Starting fee for the harness's own hand-built plumbing transactions (funding sends,
+#: commit/reveal carriers). 0.2 RXD covers a 2 kB transaction at the mainnet floor.
+#: :func:`_pay_to_spk` re-measures the signed transaction and raises this if the real
+#: size needs more, so the constant is a floor and not a silent ceiling.
+_RELAY_FEE_SATS = 20_000_000
 
 
 # --------------------------------------------------------------------------- node fixture
@@ -66,22 +84,35 @@ _RELAY_FEE_SATS = 1_000_000  # 0.01 RXD — >> relayfee (0.01 RXD/kB) for a sub-
 class _RegtestNode:
     """A self-managed isolated radiant-core regtest node (docker).
 
-    ``container`` and ``extra_args`` exist so a suite that needs a node with
-    DIFFERENT POLICY can stand one up without colliding with this module's. The
-    fee-floor boundary suite runs at ``-minrelaytxfee=0.10`` — the MAINNET floor,
-    which is also the rate pyrxd's builders default to — because a default regtest
-    node advertises a tenth of that, and at a tenth of the built rate a one- or
-    two-byte fee shortfall is structurally invisible. Both must be non-default
-    together: ``start()`` force-removes its container by name, so two suites sharing
-    one name would destroy each other's node.
+    Runs at MAINNET's relay floor by default (:data:`MAINNET_MIN_RELAY_RXD_PER_KB`) and
+    ASSERTS the node advertises it back before handing the node to a test — so what a
+    suite proves here is what mainnet would say, and the floor a suite runs at is a
+    declared, verified property rather than whatever the node happened to default to.
+
+    ``min_relay_rxd_per_kb`` may be lowered for a suite that genuinely needs a laxer
+    node, but only deliberately and with a reason in the fixture. ``None`` leaves the
+    node at its own default and skips the assertion entirely; nothing in the tree does
+    that, and new suites should not start.
+
+    ``container`` and ``extra_args`` exist so a suite that needs DIFFERENT POLICY can
+    stand a node up without colliding with this module's. Both must be non-default
+    together: ``start()`` force-removes its container by name, so two suites sharing one
+    name would destroy each other's node.
     """
 
-    def __init__(self, *, container: str = _CONTAINER, extra_args: tuple[str, ...] = ()) -> None:
+    def __init__(
+        self,
+        *,
+        container: str = _CONTAINER,
+        extra_args: tuple[str, ...] = (),
+        min_relay_rxd_per_kb: str | None = MAINNET_MIN_RELAY_RXD_PER_KB,
+    ) -> None:
         self.user = "rt_user"
         self.password = secrets.token_hex(12)
         self.mine_addr = ""
         self.container = container
         self.extra_args = tuple(extra_args)
+        self.min_relay_rxd_per_kb = min_relay_rxd_per_kb
 
     def cli(self, *args: str, wallet: bool = False) -> object:
         base = [
@@ -111,8 +142,19 @@ class _RegtestNode:
         res = self.cli("testmempoolaccept", json.dumps([raw_hex]))
         return res[0] if isinstance(res, list) else res
 
+    def relay_rate(self) -> int:
+        """Photons per BYTE this node enforces, read from the node itself.
+
+        ``effective_minrelaytxfee``, not ``minrelaytxfee``: the node reports both and
+        only the first is what ``AcceptToMemoryPool`` checks ``GetTotalSize()`` against.
+        """
+        info = self.cli("getmempoolinfo")
+        assert isinstance(info, dict), info
+        return photons_per_kb_from_rxd_per_kb(float(info["effective_minrelaytxfee"])) // 1000
+
     def start(self) -> None:
         subprocess.run(["docker", "rm", "-f", self.container], capture_output=True)
+        policy_args = () if self.min_relay_rxd_per_kb is None else (f"-minrelaytxfee={self.min_relay_rxd_per_kb}",)
         up = subprocess.run(
             [
                 "docker",
@@ -132,6 +174,7 @@ class _RegtestNode:
                 f"-rpcpassword={self.password}",
                 "-rpcbind=0.0.0.0",
                 "-rpcallowip=0.0.0.0/0",
+                *policy_args,
                 *self.extra_args,
             ],
             capture_output=True,
@@ -152,6 +195,17 @@ class _RegtestNode:
             raise RuntimeError("regtest RPC did not become ready")
         # Safety: refuse to proceed unless this is genuinely regtest.
         assert self.cli("getblockchaininfo")["chain"] == "regtest", "node is NOT regtest — aborting"
+        # And refuse to proceed unless the node enforces the floor we asked for. A suite
+        # that believes it is proving mainnet fee behaviour against a node quietly
+        # running at a tenth of the rate is the failure this assertion exists to stop.
+        if self.min_relay_rxd_per_kb is not None:
+            asked = photons_per_kb_from_rxd_per_kb(float(self.min_relay_rxd_per_kb))
+            advertised = self.relay_rate() * 1000
+            assert advertised == asked, (
+                f"node advertises effective_minrelaytxfee {advertised} photons/kB, "
+                f"but was started at -minrelaytxfee={self.min_relay_rxd_per_kb} "
+                f"({asked} photons/kB) — nothing proved against it means what it says"
+            )
         self.cli("createwallet", "gravity")
         self.mine_addr = str(self.cli("getnewaddress", wallet=True))
         self.mine(101)  # mature a coinbase
@@ -248,13 +302,28 @@ def _pay_to_spk(
     )
     fin.satoshis = in_sats
     fin.locking_script = Script(spk)
-    change = in_sats - amount - _RELAY_FEE_SATS
-    assert change > 546, f"change {change} too small"
-    tx = Transaction(
-        tx_inputs=[fin],
-        tx_outputs=[TransactionOutput(Script(dest_spk), amount), TransactionOutput(Script(change_spk), change)],
-    )
-    tx.sign()
+    # Size the plumbing fee against the NODE's own floor rather than trusting the
+    # constant. `_RELAY_FEE_SATS` is generous for the sub-kB sends this builds, but the
+    # same helper funds dMint commits and container reveals, and a plumbing transaction
+    # that quietly outgrew its fee would fail as an unexplained "min relay fee not met"
+    # in whatever suite happened to call it. Raising the fee shrinks the change output's
+    # VALUE, not its size, so one correction pass reaches the fixed point.
+    rate = node.relay_rate()
+    fee = _RELAY_FEE_SATS
+    for _ in range(2):
+        change = in_sats - amount - fee
+        assert change > 546, f"change {change} too small (fee {fee} at {rate} photons/byte)"
+        tx = Transaction(
+            tx_inputs=[fin],
+            tx_outputs=[TransactionOutput(Script(dest_spk), amount), TransactionOutput(Script(change_spk), change)],
+        )
+        tx.sign()
+        required = len(tx.serialize()) * rate
+        if fee >= required:
+            break
+        fee = required
+    else:
+        raise AssertionError(f"plumbing fee did not settle above the node's floor ({rate} photons/byte)")
     btxid = node.cli("sendrawtransaction", tx.serialize().hex())
     assert isinstance(btxid, str), f"pay_to_spk broadcast failed: {btxid}"
     node.mine(1)

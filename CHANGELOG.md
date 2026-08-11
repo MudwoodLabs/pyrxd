@@ -300,6 +300,19 @@ a Radiant Core v3.1.1 regtest one.
 
 ### Changed
 
+- **`pyrxd regtest` now starts its node at Radiant mainnet's relay floor.**
+  `-minrelaytxfee=0.10` and `-fallbackfee=0.10`, instead of leaving `radiantd -regtest`
+  at its default `0.01` — a tenth of what mainnet enforces. Every pyrxd builder sizes
+  fees at 0.10 RXD/kB, so a devnet at 0.01 accepts a transaction one or two bytes short
+  of its own rate and cannot tell a developer that what they just built would be refused
+  on mainnet. A local chain that says yes to what mainnet says no to is worse than no
+  local chain. `-fallbackfee` moves with it because the node's own wallet uses it when it
+  has no fee estimates — which on a fresh regtest chain is always — and `pyrxd regtest
+  fund` goes through `sendtoaddress`; left at `0.001` the wallet would build transactions
+  below the floor it is enforcing. Verified end to end: `regtest up` → the Tier-1
+  quickstart mints and confirms a Glyph → `regtest fund` → `regtest info` → `regtest
+  down`.
+
 - **`radiant_relay_size` and `bitcoin_virtual_size` moved to `pyrxd.fee_sizing`**, which
   #405 established as the single home for fee-sizing rules (it exists at all to break the
   `pyrxd.gravity.__init__` → `pyrxd.hd.wallet` → `pyrxd.wallet` import cycle).
@@ -582,6 +595,104 @@ both. It is fixed here.
   could ever fail, since the node would have nothing left to reject.
 
 ### Tests
+
+- **The node-backed lane now runs. It used to be two files out of thirty.** CI's
+  `-m integration` step ran exactly `test_htlc_regtest_e2e.py` and
+  `test_soulbound_covenant_regtest.py`; the other ~28 integration modules — wallet sends,
+  FT transfer and airdrop, MUT/WAVE, containers, the Gravity maker offer, cold recovery,
+  RSWP v2/v3, dMint, the builder fee floors, the BTC↔RXD and ETH↔RXD legs — were one-shot
+  manual and rotted accordingly:
+  `test_airdrop_with_an_advisory_royalty_output_is_accepted` sat broken on `main` from
+  #393 until #404 found it, because nothing ran it.
+
+  New workflow `.github/workflows/integration.yml`, split by cost rather than by
+  importance:
+
+  - `regtest-core` — per push/PR, path-filtered so a docs-only change starts no nodes.
+    The Tier-1 quickstart (moved verbatim from `ci.yml`'s `quickstart` job) plus eleven
+    Radiant covenant/builder suites. **Measured 119 s of pytest** across those eleven,
+    each standing up its own container.
+  - Nightly (and `workflow_dispatch`), as parallel jobs so the wall-clock is the slowest
+    job and not their sum: RSWP (**42 s**, 11 cases), dMint's proof-of-work suites
+    (**80-290 s each** on a 32-core box — the covenant's ~2⁻³³ per-nonce gate is baked
+    into the contract, not a knob, so this is the one lane a 4-vCPU runner is materially
+    slower at), the SPV covenant differential matrix with its PoW pre-grind, bitcoind +
+    litecoind (**14 s**), and the cross-chain legs (BTC↔RXD **30 s**, ETH↔RXD **25 s**).
+  - `vendor-freshness` — `scripts/refresh_radiant_core_vendor.py --check`, which had no
+    scheduled owner at all despite the vendor README naming one.
+
+  `ci.yml` keeps only the fast offline gate. Neither new job is a required check;
+  `test (3.12)` and `lint` still are.
+
+- **The shared regtest node now runs at MAINNET's relay floor, and says so.**
+  `_RegtestNode` starts `radiantd` with `-minrelaytxfee=0.10` by default and asserts
+  `getmempoolinfo`'s `effective_minrelaytxfee` reports it back before the fixture yields.
+  A default `radiantd -regtest` advertises **0.01 RXD/kB, a tenth of mainnet**, while
+  every pyrxd builder sizes fees at the mainnet floor — so on a default node a
+  transaction one or two bytes short of its own rate is accepted anyway and the node
+  cannot contradict the builder. That is precisely how `build_nft_transfer_tx` shipped
+  under-fee'ing ~25% of NFT transfers through four releases with green regtest suites.
+  Every Radiant suite sharing the fixture is now judged at the rate it ships with.
+
+  What that surfaced, all of it in hand-rolled test constants rather than in shipped
+  code: `_pay_to_spk`'s plumbing fee (1 000 000 photons against a 2 260 000 requirement
+  on its own 226-byte transaction — it funds 14 suites, so every one of them failed in
+  setup) now sizes itself from the node's advertised rate and re-measures the signed
+  transaction; the dMint commit/reveal values were too small to pay a mainnet-floor fee
+  out of and were rescaled; the Gravity maker-offer `_FEE` was below the floor for its
+  own ~190-byte offer; and the two FT "inflating output" negative controls computed a
+  negative change output. No production builder needed a change — they already default
+  to 0.10.
+
+  `tests/test_rswp_regtest_e2e.py` deliberately stays at the legacy 0.01 floor, because
+  what it proves is orderbook and covenant *semantics* and its carriers are sized around
+  `_FEE` — but it now passes `-minrelaytxfee=0.01` explicitly and asserts the node
+  reports it, so the rate its fees assume can no longer silently desync from the rate the
+  node enforces. The fee floors of those same v3 covenant builders are proven at the
+  mainnet floor in `test_fee_floor_boundary_regtest_e2e.py`.
+
+- **`build_finalize_tx`'s fee guard is now proved at a node, with a real SPV proof
+  (S-4).** It was offline-covered only, for a structural reason: the spend has to satisfy
+  the MakerClaimed covenant's committed `btcChainAnchor`, and a faked proof is refused at
+  the script level — a verdict that says nothing about the fee. A genuine proof *is*
+  constructible on regtest, and `test_spv_covenant_differential_regtest.py` already
+  grinds one that S-1 shows the deployed covenant accepts, so the new case reuses it:
+  exactly at the node's advertised floor the builder returns the transaction and the node
+  accepts it; one photon under, the builder raises `InsufficientFundsError` and the
+  transaction forced past the guard is refused by the node for `66: min relay fee not
+  met`. Measured: **11 950 bytes, floor 119 500 000 photons.** This is by far the largest
+  transaction the module builds — the 12 header slots, the 20-level branch, the whole BTC
+  payment tx and the unrolled covenant redeem script all go into one scriptSig — so its
+  floor is an order of magnitude above a claim's, and with neither RBF nor CPFP an
+  under-fee'd finalize cannot be bumped while the Taker's BTC is already spent. The
+  suite's own `_FEE_SATS` was 30 000 000, sized for a node relaying at a tenth of the
+  rate: a quarter of what the transaction actually needs.
+
+- **`tests/test_wallet_send_regtest_e2e.py`'s fee boundary control, confirmed on a node.**
+  #413 made `_fee_at_exactly` deterministic offline (nLockTime redraws the DER length
+  instead of hoping the size fixed point converges) and flagged that a regtest run was
+  still owed. Run: 17 passed, including the one-photon-under pair — and now at the
+  mainnet rate rather than a tenth of it, since the node moved. Its `_relay_floor` also
+  stopped reading `getnetworkinfo`'s `relayfee` and reads `getmempoolinfo`'s
+  `effective_minrelaytxfee`, the field `AcceptToMemoryPool` actually applies; the two
+  agree on this node, which is exactly why the wrong one could sit there unnoticed.
+
+- **The vendored Radiant-Core consensus sources have a staleness owner.**
+  `tests/vendor/radiant_core/` is sha256-pinned and `refresh_radiant_core_vendor.py
+  --check` worked, but nothing anywhere ran it — the vendor README referred to a
+  scheduled job that did not exist. It is now the `vendor-freshness` job (nightly +
+  `workflow_dispatch`) and `task check-vendor` by hand; deliberately not a pytest test,
+  because it needs github.com and a test that skips or reddens when GitHub is
+  unreachable is worse than none.
+
+  `--check` also gained a second comparison. The manifest pins the tag the *source* came
+  from (`v3.1.2`) while `pyrxd.devnet.DEFAULT_RADIANT_VERSION` pins the release the
+  regtest image's *binary* is built from (`v3.1.1`), and the digest proves only that the
+  vendored bytes are self-consistent — not that they describe the interpreter the lane
+  runs. Measured: `script.h` (`3de78962…`) and `script.cpp` (`759ab524…`) are
+  byte-identical at both tags, so today's gap is immaterial and the opcode/ref oracle
+  does describe the node under test. `--check` now verifies that rather than assuming it,
+  and fails if a future image bump lands on a release whose consensus sources differ.
 
 - **Verification-integrity sweep: six guards that could not detect the bug they exist to
   catch.** Every fix below is proved by mutation — the defect is planted, the new test is

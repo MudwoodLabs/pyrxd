@@ -119,6 +119,59 @@ poetry run task coverage-security    # security module coverage (must be 100%)
 poetry run task coverage-overall     # overall coverage (must be ≥85%)
 ```
 
+### Node-backed tests (the integration lane)
+
+`pytest` deselects `-m integration` by default, so `task ci` never starts a
+chain. Those suites need a real node and they run in their own workflow,
+`.github/workflows/integration.yml`:
+
+| When | What |
+| --- | --- |
+| every push/PR that touches code | `regtest-core`: the Tier-1 quickstart plus the fast Radiant covenant/builder suites |
+| nightly (and `workflow_dispatch`) | RSWP, dMint's proof-of-work suites, the SPV covenant differential matrix, bitcoind + litecoind, the BTC↔RXD and ETH↔RXD legs, and the vendored-source freshness check |
+
+Run the per-push set locally with:
+
+```bash
+pyrxd regtest setup                  # once: build the radiant-core regtest image
+poetry run task test-regtest         # ~2 min; needs docker
+```
+
+Two things to know before writing a node-backed test:
+
+- **The node runs at mainnet's relay floor.** `_RegtestNode` (in
+  `tests/test_htlc_regtest_e2e.py`) starts `radiantd` with
+  `-minrelaytxfee=0.10` and asserts `getmempoolinfo` reports it back before
+  handing the node over. A default `radiantd -regtest` advertises a *tenth* of
+  that, and pyrxd's builders all size fees at the mainnet rate — so on a default
+  node a transaction one or two bytes short of its own rate is accepted anyway,
+  and the node cannot contradict the builder. That is how
+  `build_nft_transfer_tx` shipped under-fee'ing ~25% of NFT transfers for four
+  releases with green regtest suites. Lower the floor only deliberately, via the
+  fixture's `min_relay_rxd_per_kb`, with the reason written down
+  (`tests/test_rswp_regtest_e2e.py` is the one place that does).
+- **Each module force-removes its container by name**, so two suites sharing a
+  container name destroy each other's node. Give a new node a distinct name.
+
+### Keeping the vendored consensus sources fresh
+
+`tests/vendor/radiant_core/` holds sha256-pinned copies of Radiant Core's
+`script.h`/`script.cpp`, parsed as the differential oracle in
+`tests/test_consensus_opcode_parity.py`. The pin can go stale silently, so:
+
+```bash
+poetry run task check-vendor         # has upstream moved? (needs network + `gh`)
+python scripts/refresh_radiant_core_vendor.py --tag v3.2.0   # move the pin
+```
+
+`check-vendor` also verifies that the pinned tag and the release the regtest
+image is built from (`pyrxd.devnet.DEFAULT_RADIANT_VERSION`) still share those
+files — the digest proves the vendored bytes are self-consistent, not that they
+describe the interpreter the integration lane actually runs. The scheduled owner
+is the `vendor-freshness` job in the integration workflow; it is deliberately
+not a pytest test, because one that skips or reddens when github.com is
+unreachable is worse than none.
+
 ### Pre-push hook
 
 To run `task ci` automatically before every `git push`, install the

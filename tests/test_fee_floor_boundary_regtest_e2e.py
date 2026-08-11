@@ -4,20 +4,24 @@ Why this file exists and the other regtest suites did not suffice
 ----------------------------------------------------------------
 A default ``radiantd -regtest`` advertises ``effective_minrelaytxfee`` **0.01
 RXD/kB** — a tenth of what mainnet enforces. pyrxd's builders default to
-``10_000`` photons/byte, which is *exactly* the mainnet floor (0.10 RXD/kB). So
-every existing regtest suite that broadcasts a builder's output is over-paying its
-node by 10x, and a transaction one or two bytes short of its own rate is accepted
-anyway. That is not a gap in those suites' assertions; it is a gap in what a node
-at a tenth of the rate is *able* to say.
+``10_000`` photons/byte, which is *exactly* the mainnet floor (0.10 RXD/kB). So a
+regtest suite that broadcasts a builder's output to a default node is over-paying it
+by 10x, and a transaction one or two bytes short of its own rate is accepted anyway.
+That is not a gap in those suites' assertions; it is a gap in what a node at a tenth
+of the rate is *able* to say.
 
-``tests/test_container_regtest_e2e.py`` is the concrete case: it builds NFT
-transfers at ``_MIN_FEE_RATE = 10_000`` and puts them to a node whose floor is
+``tests/test_container_regtest_e2e.py`` was the concrete case: it builds NFT
+transfers at ``_MIN_FEE_RATE = 10_000`` and put them to a node whose floor was
 1_000, so the ``build_nft_transfer_tx`` undersizing (24.9% of builds, measured over
 3000 fresh keys) could never surface there.
 
-This node therefore runs with ``-minrelaytxfee=0.10``, and every case asserts
-``getmempoolinfo`` reports that back before proving anything. What it rejects here
-is what mainnet rejects.
+This file was the first node started at ``-minrelaytxfee=0.10``. It is no longer the
+only one: the shared harness (``test_htlc_regtest_e2e._RegtestNode``) now defaults
+to the mainnet floor and asserts the node advertises it back, so every suite sharing
+that fixture — containers included — is judged at the rate its builders ship with.
+What this file keeps is the BOUNDARY: the pairs that prove the node genuinely
+refuses one photon under, without which every "accepted" elsewhere would be equally
+true of a node that rejects nothing.
 
 The defect, proven before the fix
 ---------------------------------
@@ -74,7 +78,7 @@ import pytest
 # Reuse the isolated-regtest harness wholesale (the house pattern). Bare module name,
 # NOT ``tests.X``: pytest's prepend import mode puts ``tests/`` on sys.path and there
 # is no ``tests/__init__.py``.
-from test_htlc_regtest_e2e import _IMAGE, _RegtestNode, _src
+from test_htlc_regtest_e2e import _IMAGE, MAINNET_MIN_RELAY_RXD_PER_KB, _RegtestNode, _src
 
 from pyrxd.fee_sizing import relay_floor_photons_per_byte
 from pyrxd.glyph.builder import MIN_FEE_RATE, GlyphBuilder, TransferParams
@@ -99,7 +103,12 @@ pytestmark = pytest.mark.integration
 _CONTAINER = "pyrxd-mainnet-floor-regtest-pytest"
 
 #: The node runs at MAINNET's relay floor, not regtest's default tenth of it.
-_MAINNET_FLOOR_RXD_PER_KB = "0.10"
+#:
+#: This is now the harness DEFAULT rather than something this suite alone opts into
+#: (``_RegtestNode``'s ``min_relay_rxd_per_kb``, which ``start()`` also asserts the node
+#: advertises back). Named here anyway because the cases below assert against it by
+#: value, and because this file is where the reasoning for the rate lives.
+_MAINNET_FLOOR_RXD_PER_KB = MAINNET_MIN_RELAY_RXD_PER_KB
 
 _PLUMBING_FEE = 30_000_000  # 0.3 RXD — generous, for the funding txs this suite builds
 _CARRIER = 100_000_000  # 1 RXD parked on each NFT so a real fee comes out of it
@@ -124,10 +133,7 @@ def node():
         pytest.skip("docker not available")
     if subprocess.run(["docker", "image", "inspect", _IMAGE], capture_output=True).returncode != 0:
         pytest.skip(f"{_IMAGE} image not available")
-    n = _RegtestNode(
-        container=_CONTAINER,
-        extra_args=(f"-minrelaytxfee={_MAINNET_FLOOR_RXD_PER_KB}",),
-    )
+    n = _RegtestNode(container=_CONTAINER, min_relay_rxd_per_kb=_MAINNET_FLOOR_RXD_PER_KB)
     n.start()
     try:
         yield n

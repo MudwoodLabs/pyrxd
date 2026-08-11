@@ -96,15 +96,14 @@ def _wallet(fee_rate: int = DEFAULT_FEE_RATE) -> RxdWallet:
     """A wallet on a freshly generated key. Never a hard-coded key: weak inline
     test keys in this repo were once swept by a live bot.
 
-    ``allow_below_relay_floor`` because every case here builds at the rate THIS NODE
-    advertises (``_relay_floor``), which on a default regtest node is a tenth of the
-    mainnet floor the constructor otherwise demands. That is the case the opt-out
-    exists for, and building at the node's own rate is what makes the node the oracle
-    for its own policy — the whole point of these cases. The mainnet-floor boundary
-    is proven separately, on a node started at ``-minrelaytxfee=0.10``, in
-    ``tests/test_fee_floor_boundary_regtest_e2e.py``.
+    No ``allow_below_relay_floor`` opt-out any more. The harness starts its node at
+    MAINNET's floor (``_RegtestNode``'s ``min_relay_rxd_per_kb``), so the rate this node
+    advertises IS ``DEFAULT_FEE_RATE`` and the constructor's guard is satisfied by the
+    same number the node enforces. That equality is the point: while the node ran at a
+    tenth of the mainnet rate these cases needed the opt-out, and a one- or two-byte fee
+    shortfall was structurally invisible to the node they were asking.
     """
-    return RxdWallet(PrivateKey(), _UNUSED_URL, fee_rate=fee_rate, allow_below_relay_floor=True)
+    return RxdWallet(PrivateKey(), _UNUSED_URL, fee_rate=fee_rate)
 
 
 def _spk(address: str) -> bytes:
@@ -174,13 +173,14 @@ def _outputs_by_script(confirmed: dict) -> dict[str, int]:
 def _relay_floor(rt: _RegtestNode) -> int:
     """The node's own minimum relay fee, in photons per byte.
 
-    Read from the node rather than assumed: the constant pyrxd builds against
-    (``DEFAULT_FEE_RATE`` = 10_000/byte) is the MAINNET floor, and a default
-    regtest node runs 10x lower. Reading it makes the node the oracle for its
-    own policy at whatever rate it happens to enforce.
+    Read from the node rather than assumed, so the node stays the oracle for its own
+    policy at whatever rate it happens to enforce. Via the harness helper, which reads
+    ``getmempoolinfo``'s ``effective_minrelaytxfee`` — the field
+    ``AcceptToMemoryPool`` actually checks ``GetTotalSize()`` against. This used to read
+    ``getnetworkinfo``'s ``relayfee`` instead; the two agree on this node, but only one
+    of them is the number the mempool applies.
     """
-    info = rt.cli("getnetworkinfo")
-    return round(info["relayfee"] * 100_000_000 / 1000)
+    return rt.relay_rate()
 
 
 def _effective_rate(tx: Transaction) -> float:

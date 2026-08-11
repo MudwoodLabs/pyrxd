@@ -23,9 +23,10 @@ often as it ran.
 That whole construction is pure: ``Transaction`` building and RFC 6979 signing need no
 node. Only ``_relay_floor`` and the broadcast do. So the determinism of the control is
 testable here, in the ordinary offline suite, while the integration module stays
-``-m integration``. A regtest run is still required to confirm the node's verdict on
-the resulting transactions; this file pins only that they can always be built, and that
-they pay exactly what they claim.
+``-m integration``. This file pins only that the transactions can always be built and
+that they pay exactly what they claim; the node's verdict on them is
+``test_a_fee_one_photon_under_the_floor_is_rejected``, confirmed on a regtest node
+started at the mainnet floor.
 """
 
 from __future__ import annotations
@@ -51,13 +52,16 @@ from pyrxd.script.type import P2PKH
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
-from pyrxd.wallet import RxdWallet
+from pyrxd.wallet import DEFAULT_FEE_RATE, RxdWallet
 
 pytestmark = pytest.mark.unit
 
-#: A default regtest node's relay floor, in photons per byte — the rate the control is
-#: actually built at (``DEFAULT_FEE_RATE`` = 10_000 is the mainnet floor, 10x higher).
-_REGTEST_FLOOR = 1_000
+#: The rate the control is actually built at, in photons per byte. It tracks the live
+#: control rather than being chosen here: that one reads the floor off its node, and the
+#: harness starts the node at MAINNET's floor — which is exactly ``DEFAULT_FEE_RATE``.
+#: (This used to be a hard-coded 1_000, the default regtest node's tenth of that; the
+#: mirror then exercised a different rate from the thing it mirrors.)
+_NODE_FLOOR = DEFAULT_FEE_RATE
 
 #: Enough draws that missing a 24.5%-likely event is a 0.755**60 ≈ 5e-8 accident.
 _DRAWS = 60
@@ -103,7 +107,7 @@ def _naive_size_fixed_point(wallet: RxdWallet, coin: UtxoRecord, recipient: str,
 def _a_case_the_naive_loop_cannot_settle(fee_of_size):
     """Draw fresh keys until one defeats the naive fixed point. ~1 in 4, so this is quick."""
     for _ in range(_DRAWS):
-        wallet = _wallet(fee_rate=_REGTEST_FLOOR)
+        wallet = _wallet(fee_rate=_NODE_FLOOR)
         coin = _offline_coin(wallet)
         recipient = PrivateKey().public_key().address()
         if not _naive_size_fixed_point(wallet, coin, recipient, fee_of_size):
@@ -118,7 +122,7 @@ def test_the_naive_size_fixed_point_really_does_oscillate() -> None:
     ``_fee_at_exactly`` no longer needs to grind; that is a fact worth failing over
     rather than silently carrying dead machinery.
     """
-    found = _a_case_the_naive_loop_cannot_settle(lambda s: s * _REGTEST_FLOOR)
+    found = _a_case_the_naive_loop_cannot_settle(lambda s: s * _NODE_FLOOR)
     assert found is not None, (
         f"no oscillating (key, coin) in {_DRAWS} draws — at the measured 24.5% rate that is "
         "a 5e-8 accident, so the signing behaviour has changed and this file's premise needs review"
@@ -128,8 +132,8 @@ def test_the_naive_size_fixed_point_really_does_oscillate() -> None:
 @pytest.mark.parametrize(
     ("label", "fee_of_size"),
     [
-        ("at the floor", lambda s: s * _REGTEST_FLOOR),
-        ("one photon under", lambda s: s * _REGTEST_FLOOR - 1),
+        ("at the floor", lambda s: s * _NODE_FLOOR),
+        ("one photon under", lambda s: s * _NODE_FLOOR - 1),
     ],
 )
 def test_fee_at_exactly_settles_where_the_naive_fixed_point_cannot(label: str, fee_of_size) -> None:
@@ -154,8 +158,8 @@ def test_fee_at_exactly_settles_where_the_naive_fixed_point_cannot(label: str, f
 @pytest.mark.parametrize(
     ("label", "fee_of_size"),
     [
-        ("at the floor", lambda s: s * _REGTEST_FLOOR),
-        ("one photon under", lambda s: s * _REGTEST_FLOOR - 1),
+        ("at the floor", lambda s: s * _NODE_FLOOR),
+        ("one photon under", lambda s: s * _NODE_FLOOR - 1),
     ],
 )
 def test_fee_at_exactly_always_settles_on_freshly_drawn_keys(label: str, fee_of_size) -> None:
@@ -166,7 +170,7 @@ def test_fee_at_exactly_always_settles_on_freshly_drawn_keys(label: str, fee_of_
     convergence half of this and still destroy the control, so both are asserted here.
     """
     for _ in range(_DRAWS):
-        wallet = _wallet(fee_rate=_REGTEST_FLOOR)
+        wallet = _wallet(fee_rate=_NODE_FLOOR)
         coin = _offline_coin(wallet)
         recipient = PrivateKey().public_key().address()
 
@@ -184,7 +188,7 @@ def test_the_grind_parameter_cannot_change_the_size_or_the_verdict() -> None:
     against; and every input is final (nSequence 0xFFFFFFFF), so a node never enforces
     it and the transaction is valid whichever value the grind lands on.
     """
-    wallet = _wallet(fee_rate=_REGTEST_FLOOR)
+    wallet = _wallet(fee_rate=_NODE_FLOOR)
     coin = _offline_coin(wallet)
     recipient = PrivateKey().public_key().address()
 
