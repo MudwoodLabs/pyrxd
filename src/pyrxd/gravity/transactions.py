@@ -30,6 +30,12 @@ from .codehash import (
     compute_p2sh_script_pubkey,
     hash256,
 )
+from .fee_policy import (
+    DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
+    DeadlineFeePolicy,
+    assert_fee_covers,
+    radiant_relay_size,
+)
 from .types import CancelResult, ClaimResult, FinalizeResult, ForfeitResult, GravityOffer, MakerOfferResult
 
 __all__ = ["build_cancel_tx", "build_claim_tx", "build_finalize_tx", "build_forfeit_tx", "build_maker_offer_tx"]
@@ -206,6 +212,49 @@ def _radiant_address_to_p2pkh_script(address: str) -> bytes:
     return b"\x76\xa9\x14" + pkh + b"\x88\xac"
 
 
+def _assert_offer_fee_clears_relay_floor(
+    raw_tx: bytes,
+    fee_sats: int,
+    fee_policy: DeadlineFeePolicy | None,
+) -> None:
+    """Refuse to return a MakerOffer tx the chain would not relay. **Fund safety.**
+
+    ``fee_sats`` arrives from the caller with nothing but a ``>= 0`` check
+    (:func:`_validate_fee_sats`), which catches an accounting impossibility but says
+    nothing about viability. Radiant's ``AcceptToMemoryPool`` rejects
+    ``nModifiedFees < GetEffectiveMinRelayFee(height).GetFee(tx.GetTotalSize())``
+    (``src/validation.cpp:778``) with ``66: min relay fee not met``, and **Radiant has
+    neither RBF nor CPFP** — ``src/validation.cpp:667``/``:856`` reject a mempool conflict
+    outright and ``src/miner.cpp:380`` selects on the transaction's own
+    ``GetModifiedFeeRate()``. So an under-fee'd offer cannot be replaced, cannot be
+    bumped by a child, and squats on the Maker's funding UTXO until
+    ``DEFAULT_MEMPOOL_EXPIRY`` (8h) frees it for a rebuild. Handing the caller a
+    plausible ``txid`` and plausible accounting for that transaction is the failure this
+    guard exists to prevent.
+
+    Measured **after signing**, against ``radiant_relay_size(raw_tx)`` — the exact bytes
+    that go on the wire. A DER signature is 69-71 bytes run to run, so a pre-signing
+    estimate is not a size, and one byte short of the real size is a fee under the floor.
+
+    Deadline-unaware (``blocks_to_deadline=None``): deploying an offer races nothing. The
+    time-critical spends apply the urgency premium on top at broadcast — see
+    :meth:`~pyrxd.gravity.radiant_leg.RadiantCovenantLeg._assert_affordable`.
+
+    The check is :func:`~pyrxd.gravity.fee_policy.assert_fee_covers`, shared verbatim with
+    the HTLC spend path (:func:`~pyrxd.gravity.htlc_spend._assert_fee_clears_relay_floor`)
+    and the pre-broadcast gate, rather than restated here — the rate, the rounding and the
+    RBF/CPFP reasoning all live in one module on purpose.
+    """
+    assert_fee_covers(
+        fee_value=fee_sats,
+        size_bytes=radiant_relay_size(raw_tx),
+        policy=fee_policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
+        blocks_to_deadline=None,
+        what="Gravity MakerOffer funding tx",
+        unit="photons",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public transaction builders
 # ---------------------------------------------------------------------------
@@ -219,6 +268,7 @@ def build_maker_offer_tx(
     fee_sats: int,
     maker_privkey: PrivateKeyMaterial,
     change_address: str | None = None,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> MakerOfferResult:
     """Build the Radiant funding tx that deploys a MakerOffer P2SH UTXO.
 
@@ -260,6 +310,19 @@ def build_maker_offer_tx(
         ``change_address``. Use the two-output form only when
         ``offer.photons_offered`` already includes a buffer for downstream
         claim/finalize fees — otherwise the covenant will reject those txs.
+    fee_policy:
+        The min-relay rate the assembled transaction is checked against. Defaults
+        to :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`
+        (the reference mainnet node's 0.10 RXD/kB effective rate). The rate is
+        **node policy, not a protocol constant** — pass a policy built from the
+        target node's own ``getmempoolinfo``/``effective_minrelaytxfee`` when it
+        advertises something else, which regtest does.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee_sats`` is below the node's min-relay floor for the transaction's
+        real, signed size. See :func:`_assert_offer_fee_clears_relay_floor`.
     """
     _validate_txid(funding_txid)
     _validate_fee_sats(fee_sats)
@@ -355,6 +418,11 @@ def build_maker_offer_tx(
         + outputs_serialized
         + (0).to_bytes(4, "little")
     )
+
+    # Post-assembly, post-SIGNING relay-floor gate. Deliberately here and not next to
+    # `_validate_fee_sats`: the requirement is ceil(size x rate / 1000), and the size is
+    # only knowable once the DER signature is in the scriptSig.
+    _assert_offer_fee_clears_relay_floor(raw_tx, fee_sats, fee_policy)
 
     txid = hash256(raw_tx)[::-1].hex()
     offer_p2sh_addr = compute_p2sh_address_from_redeem(offer_redeem)

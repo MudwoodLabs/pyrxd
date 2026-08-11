@@ -73,9 +73,12 @@ __all__ = [
     "PHOTONS_PER_RXD",
     "RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB",
     "RADIANT_MIN_RELAY_PHOTONS_PER_KB",
+    "WITNESS_SCALE_FACTOR",
     "DeadlineFeePolicy",
     "assert_fee_covers",
+    "bitcoin_virtual_size",
     "photons_per_kb_from_rxd_per_kb",
+    "radiant_relay_size",
 ]
 
 PHOTONS_PER_RXD = 100_000_000
@@ -99,6 +102,72 @@ BITCOIN_MIN_RELAY_SATS_PER_KB = 1_000
 # ``DEFAULT_MEMPOOL_EXPIRY`` (Radiant-Core ``src/validation.h:82``), in hours. How
 # long an under-fee'd, un-bumpable transaction squats on its own inputs.
 MEMPOOL_EXPIRY_HOURS = 8
+
+# BIP141 ``WITNESS_SCALE_FACTOR`` (Bitcoin Core ``src/consensus/consensus.h``). Only the
+# BTC side has one: Radiant has no segwit, so there is nothing to discount there.
+WITNESS_SCALE_FACTOR = 4
+
+
+# ---------------------------------------------------------------------------
+# THE SIZE A RELAY FLOOR IS MEASURED AGAINST IS PER-CHAIN. These two functions are
+# the only place that difference is expressed, so a caller picks a chain rather
+# than re-deriving a formula.
+#
+# Getting this wrong is not a rounding error. Applying Radiant's total-size rule to a
+# BTC transaction over-states its requirement by roughly the witness discount (~40% for
+# a 1-input P2WPKH spend); applying Bitcoin's vsize rule to a Radiant transaction would
+# under-state it, and Radiant is the chain where under-fee'ing cannot be undone.
+# ---------------------------------------------------------------------------
+
+
+def radiant_relay_size(raw_tx: bytes) -> int:
+    """Bytes Radiant charges the relay floor against: ``tx.GetTotalSize()``.
+
+    ``AcceptToMemoryPool`` compares against ``GetEffectiveMinRelayFee(height).GetFee(nSize)``
+    with ``nSize = tx.GetTotalSize()`` — the **full serialized size**, carrying an explicit
+    "Do not change this to use virtualsize without coordinating a network policy upgrade"
+    (Radiant-Core ``src/validation.cpp:770``). Radiant has no segwit, so total size is the
+    only size there is; this function exists to name the rule, not to compute anything.
+
+    Pass the **signed** transaction: a DER signature is 69-71 bytes run to run, so a size
+    taken before signing is an estimate, and an estimate one byte short is a fee below the
+    floor.
+    """
+    if not isinstance(raw_tx, (bytes, bytearray)):
+        raise ValidationError("raw_tx must be bytes (the SIGNED, serialized transaction)")
+    if not raw_tx:
+        raise ValidationError("raw_tx is empty; there is no transaction to measure")
+    return len(raw_tx)
+
+
+def bitcoin_virtual_size(*, stripped_size: int, total_size: int) -> int:
+    """Bytes Bitcoin charges the relay floor against: BIP141 ``vsize``.
+
+    ``vsize = ceil(weight / 4)`` where ``weight = stripped_size * 3 + total_size``
+    (BIP141; Bitcoin Core ``GetTransactionWeight`` / ``GetVirtualTransactionSize``).
+
+    * ``stripped_size`` — the serialization **without** marker, flag and witness (the
+      bytes the txid is hashed over).
+    * ``total_size`` — the full serialization **with** them, the bytes that go on the wire.
+
+    For a non-witness transaction the two are equal and ``vsize == total_size``.
+
+    Caveat, stated rather than silently assumed: Bitcoin Core's mempool actually uses
+    ``max(weight, nSigOpCost * nBytesPerSigOp * 4) / 4``, so a transaction with an unusually
+    high sigop-to-byte ratio is charged more than this returns. For the single-input
+    P2WPKH / P2SH-P2WPKH shapes this SDK builds, weight dominates by an order of magnitude
+    and the two agree; a builder for sigop-dense scripts would need the fuller form.
+    """
+    for name, value in (("stripped_size", stripped_size), ("total_size", total_size)):
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            raise ValidationError(f"{name} must be a positive int")
+    if total_size < stripped_size:
+        raise ValidationError(
+            f"total_size ({total_size}) < stripped_size ({stripped_size}); the witness "
+            "serialization can never be shorter than the one it strips"
+        )
+    weight = stripped_size * (WITNESS_SCALE_FACTOR - 1) + total_size
+    return -(-weight // WITNESS_SCALE_FACTOR)  # ceil
 
 
 def photons_per_kb_from_rxd_per_kb(rxd_per_kb: float) -> int:
@@ -257,6 +326,7 @@ def assert_fee_covers(
     blocks_to_deadline: int | None = None,
     what: str,
     unit: str = "photons",
+    chain_has_fee_bumping: bool = False,
 ) -> int:
     """Fail closed ONLY below the node's relay floor; the urgency premium is a target.
 
@@ -281,6 +351,12 @@ def assert_fee_covers(
     So: raise below the floor; return normally above it. A caller that wants to page on a
     thin premium can compare against :meth:`DeadlineFeePolicy.required_fee` itself.
 
+    ``chain_has_fee_bumping`` selects the CONSEQUENCE clause of the message, and defaults to
+    ``False`` because every original caller is on Radiant. The "no RBF, no CPFP, stuck for 8
+    hours" explanation is a fact about Radiant, not about under-fee'ing in general; repeating
+    it to a Bitcoin caller would be telling them something false about their own chain, and
+    the recovery advice differs accordingly. Pass ``True`` from a BTC-side guard.
+
     Returns the premium-inclusive target fee (for logging/pool sizing) when the floor is
     covered. Raises :class:`~pyrxd.security.errors.InsufficientFundsError` (a
     ``ValidationError`` subclass, so existing handlers still catch it) carrying the
@@ -293,14 +369,22 @@ def assert_fee_covers(
     mult = policy.urgency_multiplier(blocks_to_deadline)
     required = floor  # report the shortfall against the HARD requirement, not the target
     deadline = "no deadline" if blocks_to_deadline is None else f"{blocks_to_deadline} block(s) to deadline"
+    if chain_has_fee_bumping:
+        consequence = (
+            "Refusing to return it: no node will relay this transaction, so it cannot be "
+            "broadcast at all. Rebuild at a viable fee."
+        )
+    else:
+        consequence = (
+            "Refusing to broadcast: Radiant has no RBF and no CPFP, so an under-fee'd "
+            "time-critical spend cannot be bumped by any means and squats on its own inputs "
+            f"for up to {MEMPOOL_EXPIRY_HOURS}h (mempool expiry) before a rebuild is even possible. "
+            "Fund a larger fee input and retry."
+        )
     raise InsufficientFundsError(
         f"{what}: fee of {fee_value} {unit} is below the required {required} {unit} "
         f"(short by {required - fee_value} {unit}) for a {size_bytes}-byte transaction at "
-        f"{policy.relay_fee_per_kb} {unit}/kB x{mult:.2f} urgency ({deadline}). "
-        "Refusing to broadcast: Radiant has no RBF and no CPFP, so an under-fee'd "
-        f"time-critical spend cannot be bumped by any means and squats on its own inputs "
-        f"for up to {MEMPOOL_EXPIRY_HOURS}h (mempool expiry) before a rebuild is even possible. "
-        "Fund a larger fee input and retry.",
+        f"{policy.relay_fee_per_kb} {unit}/kB x{mult:.2f} urgency ({deadline}). " + consequence,
         available=fee_value,
         required=required,
     )

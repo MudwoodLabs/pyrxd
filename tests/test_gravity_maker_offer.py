@@ -77,6 +77,21 @@ def _make_offer(privkey: PrivateKeyMaterial, **kwargs) -> GravityOffer:
 FAKE_TXID = "aa" * 32
 FAKE_VOUT = 0
 
+#: A fee that actually clears Radiant's relay floor for the transactions built here.
+#:
+#: Every fixture in this file used to pass ``fee_sats=10_000``, and that number described a
+#: chain state that cannot exist. Radiant charges ``ceil(size x 10,000,000 / 1000)`` photons
+#: against ``tx.GetTotalSize()`` — 10,000 photons **per byte** — and ``build_maker_offer_tx``
+#: emits 188-190 bytes single-output and 223-224 bytes with a change output (MEASURED over
+#: 400 builds of each shape; the spread is DER signature length, 69-71 bytes). The floor is
+#: therefore 1,880,000-2,240,000 photons, so 10,000 was roughly 190x short: every assertion
+#: in this file was made about a transaction the node rejects with
+#: ``66: min relay fee not met``, which is exactly why no offline test here could ever have
+#: caught the missing guard.
+#:
+#: 2,500,000 clears the worst measured shape with margin for a DER byte either way.
+_FEE = 2_500_000
+
 
 # ---------------------------------------------------------------------------
 # Basic structure tests
@@ -91,8 +106,8 @@ class TestBuildMakerOfferTxStructure:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         assert isinstance(result, MakerOfferResult)
@@ -104,8 +119,8 @@ class TestBuildMakerOfferTxStructure:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         raw = bytes.fromhex(result.tx_hex)
@@ -119,8 +134,8 @@ class TestBuildMakerOfferTxStructure:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         assert result.tx_size == len(bytes.fromhex(result.tx_hex))
@@ -135,8 +150,8 @@ class TestBuildMakerOfferTxStructure:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 50_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE + 40_000,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         assert result.output_photons == offer.photons_offered + 40_000
@@ -150,8 +165,8 @@ class TestBuildMakerOfferTxStructure:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         assert result.output_photons == offer.photons_offered
@@ -163,11 +178,11 @@ class TestBuildMakerOfferTxStructure:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 15_000,
-            fee_sats=15_000,
+            funding_photons=offer.photons_offered + _FEE + 5_000,
+            fee_sats=_FEE + 5_000,
             maker_privkey=pk,
         )
-        assert result.fee_sats == 15_000
+        assert result.fee_sats == _FEE + 5_000
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +198,8 @@ class TestMakerOfferTxWireFormat:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
             **kwargs,
         ), offer
@@ -271,8 +286,8 @@ class TestMakerOfferTxChange:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 20_000,  # 10k surplus after fee
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE + 10_000,  # 10k surplus after fee
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         assert result.output_photons == offer.photons_offered + surplus
@@ -294,8 +309,8 @@ class TestMakerOfferTxChange:
                 offer=offer,
                 funding_txid=FAKE_TXID,
                 funding_vout=FAKE_VOUT,
-                funding_photons=offer.photons_offered + 5_000,  # fee 10k → output < floor
-                fee_sats=10_000,
+                funding_photons=offer.photons_offered + _FEE - 5_000,  # fee > surplus → output < floor
+                fee_sats=_FEE,
                 maker_privkey=pk,
             )
 
@@ -307,8 +322,8 @@ class TestMakerOfferTxChange:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 20_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE + 10_000,
+            fee_sats=_FEE,
             maker_privkey=pk,
             change_address=change_addr,
         )
@@ -328,7 +343,7 @@ class TestMakerOfferTxChange:
         offer = _make_offer(pk)
         change_addr = self._make_maker_address(pk)
         surplus = 30_000
-        fee = 10_000
+        fee = _FEE
         funding = offer.photons_offered + fee + surplus
         result = build_maker_offer_tx(
             offer=offer,
@@ -351,8 +366,8 @@ class TestMakerOfferTxChange:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=FAKE_VOUT,
-            funding_photons=offer.photons_offered + 10_000,  # exact: offer + fee
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,  # exact: offer + fee
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         assert isinstance(result, MakerOfferResult)
@@ -373,7 +388,7 @@ class TestMakerOfferTxValidation:
                 funding_txid=FAKE_TXID,
                 funding_vout=FAKE_VOUT,
                 funding_photons=offer.photons_offered - 1,  # too small
-                fee_sats=10_000,
+                fee_sats=_FEE,
                 maker_privkey=pk,
             )
 
@@ -386,7 +401,7 @@ class TestMakerOfferTxValidation:
                 funding_txid=FAKE_TXID,
                 funding_vout=FAKE_VOUT,
                 funding_photons=offer.photons_offered,  # nothing left for fee
-                fee_sats=10_000,
+                fee_sats=_FEE,
                 maker_privkey=pk,
             )
 
@@ -399,16 +414,16 @@ class TestMakerOfferTxValidation:
             offer=offer1,
             funding_txid=FAKE_TXID,
             funding_vout=0,
-            funding_photons=offer1.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer1.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk1,
         )
         r2 = build_maker_offer_tx(
             offer=offer2,
             funding_txid=FAKE_TXID,
             funding_vout=0,
-            funding_photons=offer2.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer2.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk2,
         )
         assert r1.tx_hex != r2.tx_hex
@@ -420,8 +435,8 @@ class TestMakerOfferTxValidation:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=0,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         r1 = build_maker_offer_tx(**kwargs)
@@ -442,8 +457,8 @@ class TestMakerOfferWithRealCovenant:
             offer=offer,
             funding_txid=FAKE_TXID,
             funding_vout=0,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         # Address should be a base58check string starting with '3' (P2SH mainnet)
@@ -462,16 +477,16 @@ class TestMakerOfferWithRealCovenant:
             offer=offer1,
             funding_txid=FAKE_TXID,
             funding_vout=0,
-            funding_photons=offer1.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer1.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         r2 = build_maker_offer_tx(
             offer=offer2,
             funding_txid=FAKE_TXID,
             funding_vout=0,
-            funding_photons=offer2.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer2.photons_offered + _FEE,
+            fee_sats=_FEE,
             maker_privkey=pk,
         )
         # Different offer redeem → different P2SH SPK → different output → different txid

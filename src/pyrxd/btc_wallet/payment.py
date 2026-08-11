@@ -18,11 +18,15 @@ from __future__ import annotations
 import hashlib
 import struct
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from pyrxd.security.errors import ValidationError
 from pyrxd.spv.payment import P2PKH, P2SH, P2TR, P2WPKH
 
 from .keys import BtcKeypair
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 
 __all__ = ["BtcPaymentTx", "BtcUtxo", "build_payment_tx"]
 
@@ -57,6 +61,65 @@ class BtcPaymentTx:
     output_type: str  # payment output type constant
 
 
+def _assert_payment_fee_clears_relay_floor(
+    *,
+    fee_sats: int,
+    stripped_tx: bytes,
+    segwit_tx: bytes,
+    fee_policy: DeadlineFeePolicy | None,
+) -> None:
+    """Refuse to return a payment tx no Bitcoin node would relay.
+
+    ``fee_sats`` arrives on trust — the only prior check is that it leaves non-negative
+    change. Bitcoin Core rejects ``nModifiedFees < minRelayTxFee.GetFee(vsize)`` with
+    ``min relay fee not met``, so a fee below that produces a fully-formed
+    :class:`BtcPaymentTx` — correct ``txid``, correct ``change_sats`` — that simply
+    cannot be broadcast.
+
+    **Bitcoin's floor, not Radiant's.** This is the single most important thing about this
+    function. The rate is
+    :data:`~pyrxd.gravity.fee_policy.BITCOIN_MIN_RELAY_SATS_PER_KB` (1 sat/vB), roughly
+    four orders of magnitude below Radiant's effective 10,000 photons/**byte**, and it is
+    charged against BIP141 ``vsize`` rather than total size. Sizing this builder against
+    Radiant's rule would over-charge every payment by about the witness discount and
+    refuse transactions the node accepts; sizing Radiant against this one would let an
+    unrelayable, un-bumpable covenant spend out the door. The two rules are kept apart in
+    :mod:`pyrxd.gravity.fee_policy` for exactly that reason — see
+    :func:`~pyrxd.gravity.fee_policy.bitcoin_virtual_size` and
+    :func:`~pyrxd.gravity.fee_policy.radiant_relay_size`.
+
+    Severity is genuinely lower here than on the Radiant side: Bitcoin has RBF and CPFP,
+    so an under-fee'd payment is recoverable. It should still fail closed rather than hand
+    back a transaction that cannot go on the wire.
+
+    Measured **after signing**, from the two serializations the builder has just produced
+    (``stripped_tx`` for the base size, ``segwit_tx`` for the total), never an estimate:
+    a DER signature is 69-71 bytes run to run, and that byte moves the vsize.
+
+    Note the import is deferred: :mod:`pyrxd.gravity` eagerly imports
+    :mod:`pyrxd.btc_wallet.htlc_leg`, so a module-level import here would close a package
+    cycle. The guard is still the shared one — the rule is not restated in this module.
+    """
+    from pyrxd.gravity.fee_policy import (
+        DEFAULT_BITCOIN_DEADLINE_FEE_POLICY,
+        assert_fee_covers,
+        bitcoin_virtual_size,
+    )
+
+    assert_fee_covers(
+        fee_value=fee_sats,
+        size_bytes=bitcoin_virtual_size(stripped_size=len(stripped_tx), total_size=len(segwit_tx)),
+        policy=fee_policy or DEFAULT_BITCOIN_DEADLINE_FEE_POLICY,
+        blocks_to_deadline=None,
+        what="BTC payment tx",
+        unit="satoshis",
+        # Bitcoin HAS RBF and CPFP. The shared guard's default consequence text is
+        # Radiant's ("cannot be bumped, stuck for 8h"); repeating it here would tell a
+        # Bitcoin caller something untrue about their own chain.
+        chain_has_fee_bumping=True,
+    )
+
+
 def build_payment_tx(
     keypair: BtcKeypair,
     utxo: BtcUtxo,
@@ -66,12 +129,21 @@ def build_payment_tx(
     fee_sats: int,
     input_type: str = "p2wpkh",  # "p2wpkh" or "p2sh_p2wpkh"
     change_address: str | None = None,  # unused for now — change goes to same keypair
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> BtcPaymentTx:
     """Build and sign a 1-input Bitcoin payment transaction for the Gravity Taker.
 
     Exactly 1 input is required — this is a covenant structural constraint.
     input_type controls whether the input is native segwit (empty scriptSig)
     or wrapped segwit (23-byte scriptSig with P2WPKH redeem push).
+
+    ``fee_policy`` supplies the min-relay rate the assembled transaction is checked
+    against, defaulting to
+    :data:`~pyrxd.gravity.fee_policy.DEFAULT_BITCOIN_DEADLINE_FEE_POLICY` (Bitcoin Core's
+    ``DEFAULT_MIN_RELAY_TX_FEE``, 1 sat/vB). Pass a policy built from the target node's
+    own ``getnetworkinfo``/``relayfee`` when it advertises something else. Raises
+    :class:`~pyrxd.security.errors.InsufficientFundsError` below that floor —
+    see :func:`_assert_payment_fee_clears_relay_floor`.
     """
     if to_type not in (P2PKH, P2WPKH, P2SH, P2TR):
         raise ValidationError(f"unknown to_type: {to_type!r}")
@@ -202,6 +274,15 @@ def build_payment_tx(
 
     non_witness_tx = version + inputs_section + outputs_bytes + locktime
     txid = _hash256(non_witness_tx)[::-1].hex()
+
+    # Post-assembly, post-SIGNING relay-floor gate. Both serializations exist only at
+    # this point, and vsize needs both.
+    _assert_payment_fee_clears_relay_floor(
+        fee_sats=fee_sats,
+        stripped_tx=non_witness_tx,
+        segwit_tx=segwit_tx,
+        fee_policy=fee_policy,
+    )
 
     return BtcPaymentTx(
         tx_hex=segwit_tx.hex(),

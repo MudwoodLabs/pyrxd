@@ -28,8 +28,10 @@ What each case proves against a real ``ruimarinho/bitcoin-core:24`` node:
    satoshi after signing.
 6. **The input type must match the UTXO.** Negative control: spend a P2SH-P2WPKH output
    with ``input_type="p2wpkh"``.
-7. **The builder enforces no relay floor** — a finding, not a pass, measured at the exact
-   ``vsize`` boundary. See that case's docstring.
+7. **The builder's relay-floor guard is the node's floor**, measured at the exact ``vsize``
+   boundary against the rate ``getnetworkinfo`` advertises: one satoshi under is refused by
+   the builder AND by the node, exactly at the floor is accepted by both. This case used to
+   pin the opposite — that the builder enforced no floor at all.
 
 Opt-in: ``@pytest.mark.integration`` + ``BTC_REGTEST=1``. Manages its own throwaway
 bitcoind container; never touches mainnet and moves no real value. Keys come from
@@ -49,6 +51,8 @@ from test_btc_htlc_regtest_e2e import btc  # noqa: F401  (btc = fixture)
 
 from pyrxd.btc_wallet import BtcUtxo, build_payment_tx, generate_keypair
 from pyrxd.btc_wallet.payment import DUST_LIMIT
+from pyrxd.gravity.fee_policy import BITCOIN_MIN_RELAY_SATS_PER_KB, DeadlineFeePolicy
+from pyrxd.security.errors import InsufficientFundsError
 from pyrxd.spv.payment import P2PKH, P2SH, P2TR, P2WPKH
 
 pytestmark = pytest.mark.integration
@@ -241,68 +245,96 @@ class TestBtcPaymentOnConsensus:
         right = build_payment_tx(kp, utxo, dest_spk[2:], P2WPKH, 500_000, _FEE, input_type="p2sh_p2wpkh")
         assert btc.accepts(right.tx_hex).get("allowed") is True
 
-    def test_build_payment_tx_enforces_no_relay_floor(self, btc):  # noqa: F811
-        """FINDING, pinned as a test: ``fee_sats`` is taken entirely on trust.
+    def test_build_payment_tx_refuses_a_fee_below_the_relay_floor(self, btc):  # noqa: F811
+        """The builder's floor guard, proved against the floor this node advertises.
 
-        There is no post-assembly fee check. ``build_payment_tx`` returns a well-formed
-        ``BtcPaymentTx`` — correct ``txid``, correct ``change_sats`` — for a zero-fee
-        transaction no node will relay. On Bitcoin that is recoverable (RBF, CPFP, or
-        simply rebuilding), so this is a lesser problem than the same gap on Radiant; it
-        is still the caller's job, and nothing in the signature says so.
+        This case previously pinned the opposite — that ``fee_sats`` was taken entirely on
+        trust, so ``build_payment_tx`` returned a well-formed ``BtcPaymentTx`` (correct
+        ``txid``, correct ``change_sats``) for a zero-fee transaction no node will relay.
+        That was recorded as a finding; it is now guarded, and this case asserts the guard.
 
-        The boundary is measured, not assumed: Bitcoin Core charges the relay floor
-        against ``vsize``, at ``DEFAULT_MIN_RELAY_TX_FEE`` = 1000 sat/kvB, so the floor
-        for these transactions is ``vsize`` satoshis. A fee of exactly ``vsize`` is
-        accepted and ``vsize - 1`` is not — which also demonstrates that sizing this
-        builder's fee against its **total** size (as Radiant requires) would over-pay
-        here by roughly the witness discount.
+        On Bitcoin an under-fee'd payment is recoverable — RBF, CPFP, or simply rebuilding
+        — so this is genuinely a lesser problem than the same gap on Radiant. It is still
+        the builder's job to fail closed rather than hand back unbroadcastable bytes.
+
+        The floor is read from the node (``getnetworkinfo.relayfee``), not assumed, and
+        the boundary is proved in both directions. Bitcoin Core charges against BIP141
+        ``vsize``, so at 1 sat/vB the floor in satoshis is numerically the vsize — which
+        is also the demonstration that sizing this builder against **total** size (what
+        Radiant requires) would over-charge here by roughly the witness discount.
         """
         kp = _keypair()
         dest_spk = _destination(btc, "bech32")
 
-        # Zero fee: returned without complaint, refused by the node.
-        utxo = _fund(btc, kp.p2wpkh_address)
-        free = build_payment_tx(kp, utxo, dest_spk[2:], P2WPKH, utxo.value, 0)
-        assert free.fee_sats == 0
-        res = btc.accepts(free.tx_hex)
-        assert res.get("allowed") is False
-        assert "min relay fee not met" in str(res.get("reject-reason", "")), res
-        print(f"zero-fee: {res.get('reject-reason', '')}")
+        node_relay_btc_per_kvb = float(btc.cli("getnetworkinfo")["relayfee"])
+        node_rate = round(node_relay_btc_per_kvb * 1e8)  # sats per kvB
+        print(f"node advertises relayfee = {node_relay_btc_per_kvb} BTC/kvB = {node_rate} sats/kvB")
+        assert node_rate == BITCOIN_MIN_RELAY_SATS_PER_KB, (
+            f"this node's floor ({node_rate} sats/kvB) differs from the builder default "
+            f"({BITCOIN_MIN_RELAY_SATS_PER_KB}); the boundary below would be proved at the wrong rate"
+        )
+        policy = DeadlineFeePolicy(
+            relay_fee_per_kb=node_rate,
+            protocol_floor_per_kb=BITCOIN_MIN_RELAY_SATS_PER_KB,
+        )
 
-        # Converge on a fee equal to the vsize the node reports for that very fee. The
-        # fee is part of the change output value, which is part of the BIP143 preimage,
-        # so changing it re-signs the input and can move the DER length by a byte.
-        def _vsize_of(fee: int, u: BtcUtxo) -> tuple[int, str]:
-            built = build_payment_tx(kp, u, dest_spk[2:], P2WPKH, u.value - fee - 100_000, fee)
+        # ---- a zero fee is now refused outright ----------------------------
+        utxo = _fund(btc, kp.p2wpkh_address)
+        with pytest.raises(InsufficientFundsError) as exc:
+            build_payment_tx(kp, utxo, dest_spk[2:], P2WPKH, utxo.value, 0)
+        print(f"builder refusal at a zero fee: {exc.value}")
+
+        # ---- the boundary, both sides --------------------------------------
+        # `permissive` exists only to FORCE the under-floor transaction into existence so
+        # the node can be asked about it; the guard would otherwise refuse and there would
+        # be nothing to submit.
+        permissive = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+
+        def _build(fee: int, u: BtcUtxo, pol) -> tuple[int, str]:
+            built = build_payment_tx(kp, u, dest_spk[2:], P2WPKH, u.value - fee - 100_000, fee, fee_policy=pol)
             probe = btc.accepts(built.tx_hex)
             # testmempoolaccept reports vsize on acceptance only; fall back to a decode.
             vsize = probe.get("vsize") or btc.cli("decoderawtransaction", built.tx_hex)["vsize"]
             return int(vsize), built.tx_hex
 
-        u_at = _fund(btc, kp.p2wpkh_address)
-        fee = 200
-        for _ in range(6):
-            vsize, tx_hex = _vsize_of(fee, u_at)
-            if fee == vsize:
+        # Searched, not solved: the fee is part of the change output value and therefore of
+        # the BIP143 preimage, so changing it re-signs the input and can move the DER length
+        # by a byte. A fresh funding UTXO each round re-rolls that independently.
+        at_floor_hex = under_hex = None
+        at_vsize = under_vsize = 0
+        for _ in range(10):
+            u = _fund(btc, kp.p2wpkh_address)
+            probe_vsize, _ = _build(400, u, policy)
+            fee = policy.min_relay_fee(probe_vsize)
+            u2 = _fund(btc, kp.p2wpkh_address)
+            vsize, tx_hex = _build(fee, u2, policy)
+            if fee != policy.min_relay_fee(vsize):
+                continue  # not on the boundary; the re-sign moved the size
+            at_floor_hex, at_vsize = tx_hex, vsize
+            u3 = _fund(btc, kp.p2wpkh_address)
+            v_u, tx_u = _build(fee - 1, u3, permissive)
+            if v_u == vsize:
+                under_hex, under_vsize = tx_u, v_u
                 break
-            fee = vsize
-        else:
-            raise AssertionError("fee/vsize fixed point did not converge")
-        res = btc.accepts(tx_hex)
-        assert res.get("allowed") is True, f"a fee of exactly vsize satoshis was REJECTED: {res}"
-        print(f"at-floor: vsize={vsize}vB fee={fee}sat -> accepted")
+        assert at_floor_hex is not None, "no payment reached a fee equal to its own vsize floor"
+        assert under_hex is not None, "could not build a same-vsize payment one satoshi under the floor"
 
-        u_under = _fund(btc, kp.p2wpkh_address)
-        under_fee = fee - 1
-        for _ in range(6):
-            vsize_u, tx_hex_u = _vsize_of(under_fee, u_under)
-            if under_fee == vsize_u - 1:
-                break
-            under_fee = vsize_u - 1
-        else:
-            raise AssertionError("under-fee/vsize fixed point did not converge")
-        res = btc.accepts(tx_hex_u)
+        # The guard itself refuses that fee.
+        with pytest.raises(InsufficientFundsError):
+            _build(policy.min_relay_fee(under_vsize) - 1, _fund(btc, kp.p2wpkh_address), policy)
+
+        res = btc.accepts(under_hex)
         assert res.get("allowed") is False, f"one satoshi below the vsize floor was ACCEPTED: {res}"
         reason = str(res.get("reject-reason", ""))
         assert "min relay fee not met" in reason, f"rejected, but not for the fee: {res}"
-        print(f"one-sat-under: vsize={vsize_u}vB fee={under_fee}sat -> {reason}")
+        print(f"one-sat-under: vsize={under_vsize}vB fee={policy.min_relay_fee(under_vsize) - 1}sat -> {reason}")
+
+        res = btc.accepts(at_floor_hex)
+        assert res.get("allowed") is True, f"a fee of exactly vsize satoshis was REJECTED: {res}"
+        print(f"at-floor: vsize={at_vsize}vB fee={policy.min_relay_fee(at_vsize)}sat -> accepted")
+
+        # And the total serialization really is larger than the vsize the floor used, so
+        # Radiant's total-size rule would have demanded strictly more here.
+        total = len(bytes.fromhex(at_floor_hex))
+        assert total > at_vsize, f"expected a witness discount: total={total}B vsize={at_vsize}vB"
+        print(f"witness discount on the at-floor tx: total={total}B vs vsize={at_vsize}vB")

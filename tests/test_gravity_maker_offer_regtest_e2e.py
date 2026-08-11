@@ -28,8 +28,10 @@ What each case proves against a real ``radiant-core:v3.1.1`` node:
    photon after signing and the node refuses it.
 4. **A stranger cannot take the offer.** Negative control for the audit-04-S3 taker-key
    requirement, measured at consensus rather than in the builder.
-5. **The builder enforces no relay floor** — a finding, not a pass. See that case's
-   docstring.
+5. **The builder's relay-floor guard is the node's floor.** Boundary proved in both
+   directions against the rate this node advertises: one photon under is refused by the
+   builder AND by the node, exactly at the floor is accepted by both. This case used to
+   pin the opposite — that the builder enforced no floor at all.
 
 Opt-in: ``@pytest.mark.integration`` + ``RADIANT_REGTEST=1``. Manages its own throwaway
 container; never touches a mainnet node and moves no real value. Every key is generated
@@ -62,6 +64,7 @@ from pyrxd.gravity.fee_policy import (
 )
 from pyrxd.gravity.transactions import build_claim_tx, build_maker_offer_tx
 from pyrxd.keys import PrivateKey
+from pyrxd.security.errors import InsufficientFundsError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 pytestmark = pytest.mark.integration
@@ -122,8 +125,15 @@ def _offer(maker: _Party, taker: _Party):
     )
 
 
-def _deploy(rt: _RegtestNode, maker: _Party, taker: _Party, *, fee: int = _FEE):
-    """Fund the Maker, build the offer tx, and return ``(offer, result)`` unbroadcast."""
+def _deploy(rt: _RegtestNode, maker: _Party, taker: _Party, *, fee: int = _FEE, policy=None):
+    """Fund the Maker, build the offer tx, and return ``(offer, result)`` unbroadcast.
+
+    ``policy`` defaults to THIS node's advertised rate. That is not a convenience: the
+    builder's relay-floor guard defaults to the reference *mainnet* rate, and a regtest
+    node advertises a lower one, so a fee that is perfectly viable here would otherwise be
+    refused before it ever reached the node. Reading ``getmempoolinfo`` and passing the
+    result is exactly what the ``fee_policy`` parameter exists for.
+    """
     offer = _offer(maker, taker)
     funding_txid = _pay_to_spk(rt, maker.p2pkh_spk, _FUNDING)
     result = build_maker_offer_tx(
@@ -133,6 +143,7 @@ def _deploy(rt: _RegtestNode, maker: _Party, taker: _Party, *, fee: int = _FEE):
         funding_photons=_FUNDING,
         fee_sats=fee,
         maker_privkey=maker.material,
+        fee_policy=policy if policy is not None else _node_policy(rt),
     )
     return offer, result
 
@@ -140,6 +151,11 @@ def _deploy(rt: _RegtestNode, maker: _Party, taker: _Party, *, fee: int = _FEE):
 def _node_relay_rate(rt: _RegtestNode) -> int:
     """The photons/kB rate THIS node advertises (node policy, not a protocol constant)."""
     return photons_per_kb_from_rxd_per_kb(float(rt.cli("getmempoolinfo")["effective_minrelaytxfee"]))
+
+
+def _node_policy(rt: _RegtestNode) -> DeadlineFeePolicy:
+    """A fee policy pinned to this node's own advertised floor."""
+    return DeadlineFeePolicy(relay_fee_per_kb=_node_relay_rate(rt), allow_below_protocol_floor=True)
 
 
 class TestMakerOfferOnConsensus:
@@ -254,61 +270,91 @@ class TestMakerOfferOnConsensus:
         )
         assert node.accepts(good.tx_hex).get("allowed") is True
 
-    def test_build_maker_offer_tx_enforces_no_relay_floor(self, node):  # noqa: F811
-        """FINDING, pinned as a test: the builder will return an unrelayable offer tx.
+    def test_build_maker_offer_tx_refuses_a_fee_below_the_relay_floor(self, node):  # noqa: F811
+        """The builder's floor guard, proved to be the NODE's floor and not merely a number.
 
-        ``fee_sats`` is taken on trust. There is no post-assembly floor check of the kind
-        :func:`pyrxd.gravity.htlc_spend._assert_fee_clears_relay_floor` performs, so
-        ``build_maker_offer_tx`` returns a fully-populated ``MakerOfferResult`` — plausible
-        ``txid``, plausible ``fee_sats`` — for a transaction no node will relay. Radiant has
-        neither RBF nor CPFP, so the funding UTXO is then stuck until the 8h mempool expiry.
+        This case previously pinned the opposite — that ``fee_sats`` was taken entirely on
+        trust and ``build_maker_offer_tx`` returned a fully-populated ``MakerOfferResult``
+        for a transaction no node would relay. That was a finding, deliberately recorded as
+        a passing test so it could not be lost. It is now a fund-safety guard, and this
+        case asserts the guard instead. Radiant has neither RBF nor CPFP, so the
+        transaction it used to hand back could not be replaced or bumped and squatted on
+        the Maker's funding UTXO until the 8h mempool expiry.
 
-        10,000 photons is not an arbitrary choice of underpayment: it is the fee the
-        offline suite (``tests/test_gravity_maker_offer.py``) uses throughout, which is
-        precisely why no existing test could have noticed.
+        10,000 photons was not an arbitrary underpayment: it was the fee the whole offline
+        suite used, which is precisely why nothing offline could have noticed.
 
-        This case asserts the CURRENT behaviour. If a floor guard is added to the builder,
-        it will fail — and the fix is to change this test, not to remove the guard.
+        The boundary is proved in BOTH directions against this node's own advertised floor
+        (read from ``getmempoolinfo``, not assumed — regtest advertises less than mainnet):
+
+        * one photon UNDER the floor: the builder refuses, and a transaction forced past the
+          guard with an explicitly permissive policy is refused by the node too, with the
+          reason quoted verbatim;
+        * exactly AT the floor: the builder returns it and the node accepts it.
         """
         rate = _node_relay_rate(node)
+        policy = DeadlineFeePolicy(relay_fee_per_kb=rate, allow_below_protocol_floor=True)
         maker, taker = _Party(), _Party()
-        _offer_obj, underfunded = _deploy(node, maker, taker, fee=10_000)
+        print(f"node advertises effective_minrelaytxfee = {rate} photons/kB")
 
-        node_floor = DeadlineFeePolicy(relay_fee_per_kb=rate).min_relay_fee(underfunded.tx_size)
-        mainnet_floor = DeadlineFeePolicy(relay_fee_per_kb=RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB).min_relay_fee(
-            underfunded.tx_size
-        )
-        assert underfunded.fee_sats == 10_000  # returned without complaint
-        assert underfunded.fee_sats < node_floor
+        # ---- the old fixture fee is now refused outright -------------------
+        with pytest.raises(InsufficientFundsError) as exc:
+            _deploy(node, maker, taker, fee=10_000, policy=policy)
+        print(f"builder refusal at the old fixture fee: {exc.value}")
+        # ...and a fortiori under the mainnet reference rate.
+        with pytest.raises(InsufficientFundsError):
+            _deploy(
+                node,
+                maker,
+                taker,
+                fee=10_000,
+                policy=DeadlineFeePolicy(relay_fee_per_kb=RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB),
+            )
 
-        res = node.accepts(underfunded.tx_hex)
-        assert res.get("allowed") is False
+        # ---- the boundary, both sides --------------------------------------
+        # Searched, not solved: the fee is subtracted from the signed output value, so
+        # changing it re-signs the input and can move the DER length — and with it the size
+        # the floor is derived from. Each attempt spends a fresh funding UTXO, which
+        # re-rolls that length independently of the fee.
+        #
+        # `permissive` exists only to FORCE the under-floor transaction into existence so
+        # the node can be asked about it. Without it the guard refuses and there would be
+        # nothing to submit — which is the point of the guard, but proves nothing about
+        # where the node's line actually is.
+        permissive = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+
+        at_floor = under = None
+        for _ in range(20):
+            _o, probe = _deploy(node, maker, taker, fee=policy.min_relay_fee(200), policy=policy)
+            floor = policy.min_relay_fee(probe.tx_size)
+            try:
+                _o, candidate = _deploy(node, maker, taker, fee=floor, policy=policy)
+            except InsufficientFundsError:
+                continue  # re-signing GREW the tx past the bid; the guard refusing is correct
+            if candidate.fee_sats != policy.min_relay_fee(candidate.tx_size):
+                continue  # re-signing shrank it; this build is not on the boundary
+            at_floor = candidate
+            # One photon under, at the same size, forced past the guard.
+            _o, u = _deploy(node, maker, taker, fee=floor - 1, policy=permissive)
+            if u.tx_size == candidate.tx_size:
+                under = u
+                break
+        assert at_floor is not None, "no offer tx reached a fee equal to its own relay floor"
+        assert under is not None, "could not build a same-size transaction one photon under the floor"
+
+        # The guard itself refuses that transaction.
+        with pytest.raises(InsufficientFundsError):
+            _deploy(node, maker, taker, fee=under.fee_sats, policy=policy)
+
+        res = node.accepts(under.tx_hex)
+        assert res.get("allowed") is False, f"the node ACCEPTED one photon under its own floor: {res}"
         reason = str(res.get("reject-reason", ""))
-        assert "min relay fee not met" in reason, f"expected a fee rejection, got: {res}"
+        assert "min relay fee not met" in reason, f"rejected, but not for the fee: {res}"
         print(
-            f"under-fee'd offer tx: size={underfunded.tx_size}B fee={underfunded.fee_sats}ph "
-            f"node_floor={node_floor}ph (at {rate}ph/kB) mainnet_reference_floor={mainnet_floor}ph "
-            f"-> {reason}"
+            f"one-photon-under: size={under.tx_size}B fee={under.fee_sats}ph "
+            f"(floor {policy.min_relay_fee(under.tx_size)}ph at {rate}ph/kB) -> {reason}"
         )
 
-        # The same transaction shape at exactly the node's floor IS accepted, so the
-        # rejection above is the fee and nothing else. The floor is searched for, not
-        # solved: the fee is subtracted from the signed output value, so changing it
-        # re-signs the input and can move the DER length — and therefore the size the
-        # floor is derived from — by a byte. Each attempt spends a fresh funding UTXO,
-        # which re-rolls that length independently of the fee.
-        policy = DeadlineFeePolicy(relay_fee_per_kb=rate)
-
-        def _at_own_floor():
-            sizes = {underfunded.tx_size}
-            for _ in range(12):
-                for size in sorted(sizes):
-                    _o2, built = _deploy(node, maker, taker, fee=policy.min_relay_fee(size))
-                    sizes.add(built.tx_size)
-                    if built.fee_sats == policy.min_relay_fee(built.tx_size):
-                        return built
-            raise AssertionError("no offer tx reached a fee equal to its own relay floor")
-
-        at_floor = _at_own_floor()
-        assert node.accepts(at_floor.tx_hex).get("allowed") is True, "a fee at exactly the node's floor was rejected"
-        print(f"at-floor offer tx: size={at_floor.tx_size}B fee={at_floor.fee_sats}ph -> accepted")
+        accepted = node.accepts(at_floor.tx_hex)
+        assert accepted.get("allowed") is True, f"a fee at exactly the node's floor was rejected: {accepted}"
+        print(f"at-floor: size={at_floor.tx_size}B fee={at_floor.fee_sats}ph -> accepted")
