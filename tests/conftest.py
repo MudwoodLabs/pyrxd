@@ -15,7 +15,6 @@ import pathlib
 import sys
 
 import pytest
-from _pytest.nodes import Item
 
 # Make ``from tests.X import ...`` resolvable for the integration e2e files that share helpers
 # across test modules. pytest's console-script entrypoint only puts ``src`` on sys.path (pyproject
@@ -71,10 +70,30 @@ except ImportError:
     pass
 
 
-def pytest_collection_modifyitems(items: list[Item]):
-    for item in items:
-        if "_int_" in item.nodeid:
-            item.add_marker(pytest.mark.integration)
+# NOTE: there is deliberately no auto-marking hook here.
+#
+# This used to be:
+#
+#     def pytest_collection_modifyitems(items):
+#         for item in items:
+#             if "_int_" in item.nodeid:
+#                 item.add_marker(pytest.mark.integration)
+#
+# ``"_int_"`` is a substring, not a word, so it matched any test whose name contained
+# ``..._int_...`` — ``test_finite_int_refuses...``, ``test_nonneg_int_accepts...``,
+# ``test_encode_int_zero_is_op_0``, ``test_reader_var_int_fd``, and so on. The default
+# ``-m 'not integration'`` in ``pyproject.toml`` then dropped every one of them from
+# every run: 55 pure-offline unit tests that had never executed in CI, including most of
+# ``tests/network/test_guards.py`` — the hostile-server coercions whose whole job is to
+# fail closed on an attacker-supplied number.
+#
+# It also never marked anything it was meant to: ``test_integration_*`` contains
+# ``_integration_``, which does NOT contain ``_int_``. Every real integration module
+# carries an explicit module-level ``pytestmark = pytest.mark.integration`` instead, so
+# nothing depended on this hook. Deselection count with it: 193; without: 138.
+#
+# If a marker is ever needed by name again, match a whole path/name component — never a
+# bare substring of an identifier.
 
 
 @pytest.fixture

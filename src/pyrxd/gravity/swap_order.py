@@ -129,12 +129,27 @@ def _decode_scriptnum(data: bytes) -> int:
     return n
 
 
+def _clean_var_int(r: Reader) -> int | None:
+    """``read_var_int_num`` adapted to this parser's "report, do not raise" contract.
+
+    ``read_var_int_num`` refuses non-canonical and truncated CompactSize (audit F-15),
+    which is right for ``Transaction`` deserialization but is not how this reader speaks:
+    a malformed length prefix simply means the blob is *not clean MultiTxOutV1*, and that
+    verdict is returned as ``None``. ``parse_price_terms_lenient`` is documented never to
+    raise, and ``decode_rswp_order`` documents ``ValidationError`` only.
+    """
+    try:
+        return r.read_var_int_num()
+    except ValidationError:
+        return None
+
+
 def parse_price_terms(blob: bytes) -> list[DemandedOutput] | None:
     """Parse a ``MultiTxOutV1`` ``price_terms`` blob into demanded outputs, or ``None`` if it is not
     clean MultiTxOutV1. (Photonic's reader has a bare ``value(8 LE) || script(rest)`` fallback — see
     :func:`parse_price_terms_lenient`.)"""
     r = Reader(blob)
-    count = r.read_var_int_num()
+    count = _clean_var_int(r)
     if count is None or count <= 0 or count > 10_000:
         return None
     outs: list[DemandedOutput] = []
@@ -142,7 +157,7 @@ def parse_price_terms(blob: bytes) -> list[DemandedOutput] | None:
         vb = r.read_bytes(8)
         if vb is None or len(vb) != 8:
             return None
-        slen = r.read_var_int_num()
+        slen = _clean_var_int(r)
         # Bound slen by the blob length: a script can never exceed the remaining blob, and an
         # unbounded slen (a 0xff varint up to 2**64-1) would otherwise reach BytesIO.read and raise
         # OverflowError — leaking out of the public decode_rswp_order, which documents ValidationError

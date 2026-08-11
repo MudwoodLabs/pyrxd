@@ -8,6 +8,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **`Reader.read_var_int_num` accepted non-canonical CompactSize, under `Transaction`
+  deserialization.** `spv/proof.py` and `spv/witness.py` have rejected overlong encodings
+  since audit F-15, citing that Bitcoin rejects them at deserialization; this third copy —
+  the one every hostile-bytes transaction parse goes through — did not. A transaction a node
+  refuses therefore parsed cleanly here, and the round trip was not a round trip: an 87-byte
+  blob whose input count was written `fd 01 00` came back from
+  `Transaction.from_hex(blob).serialize()` as 85 *different* bytes, with `txid()` reporting
+  the id of a transaction those bytes do not hash to. Anything binding a txid to bytes it was
+  handed was comparing against a value the bytes cannot produce. Truncation was silently
+  accepted too — `int.from_bytes` zero-extended a short read, so `fd 01` decoded as 1. Both
+  now raise `ValidationError`, matching the SPV readers exactly; end-of-input still returns
+  `None`, the contract `Transaction.from_reader` and `from_beef` test with.
+  `gravity/swap_order.parse_price_terms` maps the new refusal back to its documented "not
+  clean MultiTxOutV1" `None`, preserving `parse_price_terms_lenient`'s never-raises contract
+  (caught by the existing parser fuzz test).
+
 - **The watchtower's claim detection read `spent` through Python truthiness, so an
   already-claimed BTC HTLC could read as unclaimed.** `mempool_space_outspend` used
   `bool(data.get("spent"))` — the same defect as the fixed `bool(spend.get("spent", True))`
@@ -497,6 +513,87 @@ both. It is fixed here.
   could ever fail, since the node would have nothing left to reject.
 
 ### Tests
+
+- **Verification-integrity sweep: six guards that could not detect the bug they exist to
+  catch.** Every fix below is proved by mutation — the defect is planted, the new test is
+  watched going red, and the mutation is reverted. A guard nothing proves is a guard a
+  refactor silently deletes, and four of these were already in that state.
+
+  - **Two hostile-server bindings in `network/electrumx.py` survived the entire suite.**
+    Replacing the txid binding in `get_transaction` (`hash256(raw)[::-1] != txid`) or the
+    height binding in `get_transaction_merkle` (`block_height != height`) with `if False:`
+    left 7579 passed / 44 skipped. Every existing test handed back a value that already
+    matched what it asked for, so neither binding was ever exercised. The first is what
+    stops a server feeding `glyph/scanner.py` any transaction it likes; the second is what
+    stops a server choosing which block it proves inclusion in. Added a substitution of a
+    *different well-formed transaction*, and proofs for four other heights — 1 and 4
+    failures respectively. Same shape in `network/_guards.py`: `hex_str`'s
+    `len(value) != nbytes * 2` relaxed to `<` also survived, because only the under-length
+    case was covered; the over-length and doubled-hash cases now fail it (3 failures).
+
+  - **The duplication guard missed the bug it was built for.** `frozenset(range(0xD0, 0xD9))`
+    — the *original* four-walkers defect — was not matched by its own banned-range pattern,
+    nor were `op in range(0xD0, 0xD9)`, `0xD0 <= op < 0xD9` or `0xD0 <= op and op < 0xD9`.
+    Separately, a new walker written `_MY_REF_OPS = (0xD0, 0xD8)` with `i += 36` passed all
+    31 guard and parity tests: two opcodes sat under the "three or more" literal threshold
+    and `+= 36` was not the `+= 37` the fingerprint knew. The re-spelling checks are now
+    AST-based rather than regex-based — a comparison is a comparison however it is
+    punctuated — with the constant's *source spelling* still required to be a `0xdN` byte so
+    that Unicode codepoints (`0x00D0`) and decimal bounds (`210`) are not read as opcodes.
+    Every detector is a pure function of source text, and a new
+    `TestTheGuardCatchesTheBugsThatMotivatedIt` plants all ten historical spellings and
+    requires the guard to fire, alongside a false-positive suite for the legitimate shapes.
+    `glyph/dmint/chain.py`, which hand-spelled `0xd8`/`0xd0`/`36` in four places and was
+    caught by nothing, now uses `OP_PUSHINPUTREF_BYTE` / `OP_PUSHINPUTREFSINGLETON_BYTE` /
+    `REF_OPERAND_WIDTH` (new in `constants.py`, derived from the `OpCode` table).
+
+  - **The only node-rejection control in the suite was ~44% flaky.** `_fee_at_exactly` in
+    `test_wallet_send_regtest_e2e.py` iterated a size fixed point that, for about a quarter
+    of keys, has no fixed point at all: the fee sets the output value, which sets the
+    sighash, which sets the signature, whose DER length is 71 or 72 bytes, so assuming 191
+    signs to 192 and assuming 192 signs to 191. Measured offline over 400 fresh keys: 98
+    non-convergent (24.5%), 97 of them the 191/192 pair; called twice per run, ~44%. Without
+    it, "every wallet send is accepted" is satisfied by a node that accepts everything.
+    nLockTime is now ground instead — four bytes at every value so it cannot change the
+    size, never enforced because every input is final, and a fresh sighash each time.
+    Deterministic (RFC 6979), not a retry loop. Offline over 800 calls: zero give-ups.
+    The fee is still exactly `fee_of_size(len(tx.serialize()))`; the assertion is unchanged.
+    New `tests/test_wallet_send_fee_control_offline.py` proves this without a node, by
+    selecting a case the old loop provably cannot settle. **A regtest run is still required
+    to confirm the node's verdict on the resulting transactions.**
+
+  - **A registered walker had zero coverage.** Mutating `i += 37` to `i += 1` in
+    `glyph/soulbound_covenant.py` left 7596 passed / 44 skipped, while the walker registry
+    gave it a green tick it had not earned. Both MINIMALDATA guards (`soulbound_covenant`
+    and `gravity/htlc_covenant`, which was also uncovered) are now in the differential,
+    against ref operands whose bytes spell a non-minimal push — 32 failures each. The plain
+    adversarial refs cannot see this: 36 bytes of `0xd0` each advance a broken walk by one
+    and land on the same offset.
+
+  - **A secret-redaction test could never reach its branch, and the helper hid it.**
+    `seed_from_mnemonic(swapped, lang=lang, validate=True)` named a keyword argument that
+    does not exist, so CPython raised `TypeError` at argument binding;
+    `assert_call_never_echoes` caught `BaseException`, found no mnemonic in it, and passed.
+    The BIP-39 checksum-mismatch redaction path was untested in every shipped language —
+    demonstrated by making that branch embed the whole mnemonic and watching the suite stay
+    green at 39 passed. The helper now takes a required `expect=`, re-raising anything else
+    and failing on a call that does not fail at all. Auditing the other 12 call sites with
+    it found two more dead tests: `to_bytes(...!..., enc="hex")` never raised, because
+    `to_bytes` strips non-alphanumerics and repaired the "mistyped" key; and
+    `master_xprv_from_seed(seed.hex())` is a valid seed, not a bad one. Also fixed a
+    ~6%-per-language flake the old helper had been concealing: a 12-word mnemonic has 4
+    checksum bits, so swapping two words leaves the checksum accidentally valid about one
+    time in sixteen (measured 6.65% en / 5.80% zh-cn over 2000 draws) — the fixture now
+    confirms the mismatch instead of assuming it.
+
+  - **55 offline unit tests had never run in CI.** `tests/conftest.py` auto-marked any test
+    whose nodeid contained the substring `"_int_"` as `integration`, which the default
+    `-m 'not integration'` then dropped: `test_finite_int_*`, `test_nonneg_int_*`,
+    `test_encode_int_*`, `test_reader_var_int_*` and more — including most of
+    `tests/network/test_guards.py`, the hostile-server coercions from the first item above.
+    It never marked anything it was meant to (`_integration_` does not contain `_int_`), and
+    every real integration module carries an explicit module-level marker, so the hook was
+    pure harm. Removed. Deselected count 193 → 138.
 
 - **Impossible-fixture sweep: three types now refuse to hold a state the chain cannot
   produce, instead of a builder refusing it later.** This repo's two worst shipped bugs both

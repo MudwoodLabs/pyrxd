@@ -52,6 +52,7 @@ from pyrxd.security.errors import (
     ValidationError,
 )
 
+from ...constants import OP_PUSHINPUTREF_BYTE, OP_PUSHINPUTREFSINGLETON_BYTE, REF_OPERAND_WIDTH
 from ..script import TruncatedScriptError, iter_input_refs
 from ..types import GlyphRef  # ..types resolves to pyrxd.glyph.types
 from .builders import (
@@ -265,22 +266,22 @@ class DmintState:
         height, pos = _parse_script_int(script_bytes, pos)
 
         # --- Item 1: contractRef (0xd8 + 36 bytes wire ref)
-        if pos >= len(script_bytes) or script_bytes[pos] != 0xD8:
+        if pos >= len(script_bytes) or script_bytes[pos] != OP_PUSHINPUTREFSINGLETON_BYTE:
             raise ValidationError(f"DmintState.from_script: expected 0xd8 (OP_PUSHINPUTREFSINGLETON) at pos {pos}")
         pos += 1
-        if pos + 36 > len(script_bytes):
+        if pos + REF_OPERAND_WIDTH > len(script_bytes):
             raise ValidationError("DmintState.from_script: script truncated inside contractRef")
-        contract_ref = GlyphRef.from_bytes(script_bytes[pos : pos + 36])
-        pos += 36
+        contract_ref = GlyphRef.from_bytes(script_bytes[pos : pos + REF_OPERAND_WIDTH])
+        pos += REF_OPERAND_WIDTH
 
         # --- Item 2: tokenRef (0xd0 + 36 bytes wire ref)
-        if pos >= len(script_bytes) or script_bytes[pos] != 0xD0:
+        if pos >= len(script_bytes) or script_bytes[pos] != OP_PUSHINPUTREF_BYTE:
             raise ValidationError(f"DmintState.from_script: expected 0xd0 (OP_PUSHINPUTREF) at pos {pos}")
         pos += 1
-        if pos + 36 > len(script_bytes):
+        if pos + REF_OPERAND_WIDTH > len(script_bytes):
             raise ValidationError("DmintState.from_script: script truncated inside tokenRef")
-        token_ref = GlyphRef.from_bytes(script_bytes[pos : pos + 36])
-        pos += 36
+        token_ref = GlyphRef.from_bytes(script_bytes[pos : pos + REF_OPERAND_WIDTH])
+        pos += REF_OPERAND_WIDTH
 
         # --- Items 3–7: variable-length script integers
         max_height, pos = _parse_script_int(script_bytes, pos)
@@ -370,22 +371,22 @@ class DmintState:
         pos += 5
 
         # --- Item 1: contractRef
-        if pos >= len(script_bytes) or script_bytes[pos] != 0xD8:
+        if pos >= len(script_bytes) or script_bytes[pos] != OP_PUSHINPUTREFSINGLETON_BYTE:
             raise ValidationError(f"DmintState._from_v1_script: expected 0xd8 at pos {pos}")
         pos += 1
-        if pos + 36 > len(script_bytes):
+        if pos + REF_OPERAND_WIDTH > len(script_bytes):
             raise ValidationError("DmintState._from_v1_script: script truncated inside contractRef")
-        contract_ref = GlyphRef.from_bytes(script_bytes[pos : pos + 36])
-        pos += 36
+        contract_ref = GlyphRef.from_bytes(script_bytes[pos : pos + REF_OPERAND_WIDTH])
+        pos += REF_OPERAND_WIDTH
 
         # --- Item 2: tokenRef
-        if pos >= len(script_bytes) or script_bytes[pos] != 0xD0:
+        if pos >= len(script_bytes) or script_bytes[pos] != OP_PUSHINPUTREF_BYTE:
             raise ValidationError(f"DmintState._from_v1_script: expected 0xd0 at pos {pos}")
         pos += 1
-        if pos + 36 > len(script_bytes):
+        if pos + REF_OPERAND_WIDTH > len(script_bytes):
             raise ValidationError("DmintState._from_v1_script: script truncated inside tokenRef")
-        token_ref = GlyphRef.from_bytes(script_bytes[pos : pos + 36])
-        pos += 36
+        token_ref = GlyphRef.from_bytes(script_bytes[pos : pos + REF_OPERAND_WIDTH])
+        pos += REF_OPERAND_WIDTH
 
         # --- Items 3-4: maxHeight and reward (variable-length pushes)
         max_height, pos = _parse_script_int(script_bytes, pos)

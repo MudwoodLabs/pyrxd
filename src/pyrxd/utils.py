@@ -594,21 +594,51 @@ class Reader(BytesIO):
         data = self.read(4)
         return int.from_bytes(data, byteorder="little", signed=True) if data else None
 
+    #: CompactSize prefix -> (operand width, largest value the SHORTER encoding covers).
+    #: A value at or below the floor means a shorter encoding existed, so this one is
+    #: non-canonical. Mirrors ``spv/proof.py`` and ``spv/witness.py``.
+    _VAR_INT_WIDTHS: dict[int, tuple[int, int]] = {0xFD: (2, 0xFC), 0xFE: (4, 0xFFFF), 0xFF: (8, 0xFFFFFFFF)}
+
     def read_var_int_num(self) -> int | None:
+        """Read a Bitcoin CompactSize, refusing non-canonical and truncated encodings.
+
+        Returns ``None`` only at true end of input (nothing left to read at all) —
+        the contract ``Transaction.from_reader`` and ``from_beef`` test with
+        ``if count is None``.
+
+        Audit 2026-05-29 F-15, applied here to match ``spv/proof.py`` and
+        ``spv/witness.py``. This copy sits under ``Transaction`` deserialization —
+        every hostile-bytes parse in the SDK — and was the last one still accepting
+        overlong encodings. Two concrete consequences of accepting them:
+
+        * A node rejects a non-minimal CompactSize at deserialization, so the SDK
+          parsed transactions that can never exist on chain and reported them as
+          valid.
+        * ``Transaction.from_hex(blob).serialize()`` silently re-emitted the CANONICAL
+          encoding, so it did not round-trip: an 87-byte blob whose input count was
+          written ``fd 01 00`` came back as 85 different bytes, and ``txid()``
+          returned the id of a transaction those bytes are not. Anything binding a
+          txid to bytes it was handed was comparing against a value the bytes do not
+          hash to.
+
+        Truncation is refused for the same reason it is in the SPV readers: an operand
+        running off the end used to be zero-extended by ``int.from_bytes`` over a short
+        read, so ``fd 01`` silently decoded as 1.
+        """
         first_byte = self.read_uint8()
         if first_byte is None:
             return None
-        if first_byte < 253:
+        if first_byte < 0xFD:
             return first_byte
-        elif first_byte == 253:
-            return self.read_uint16_le()
-        elif first_byte == 254:
-            return self.read_uint32_le()
-        elif first_byte == 255:
-            data = self.read(8)
-            return int.from_bytes(data, byteorder="little") if data else None
-        else:
-            raise ValueError("Invalid varint encoding")
+
+        width, floor = self._VAR_INT_WIDTHS[first_byte]
+        data = self.read(width)
+        if data is None or len(data) != width:
+            raise ValidationError(f"truncated {width}-byte varint")
+        value = int.from_bytes(data, byteorder="little")
+        if value <= floor:
+            raise ValidationError(f"non-canonical varint: 0x{first_byte:02X} prefix encodes {value} (<= {floor})")
+        return value
 
     def read_var_int(self) -> bytes | None:
         first_byte = self.read(1)

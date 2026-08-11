@@ -399,3 +399,11 @@ MAX_OPCODE: int = 0xEF
 # (``src/script/script.cpp:585-607``) files 0xd1/0xd2/0xd3 into the *require* and
 # *disallow-sibling* sets instead, so they must be WALKED but not COLLECTED.
 PUSH_REF_OPCODES: frozenset[int] = frozenset({0xD0, 0xD8})
+
+# The same two opcodes as plain ints, for the FIXED-LAYOUT readers that expect one
+# specific opcode at one specific offset rather than testing set membership
+# (``glyph/dmint/chain.py`` parses ``0xd8 <ref> 0xd0 <ref>`` positionally). Derived from
+# the ``OpCode`` table rather than retyped, so there is still exactly one place any of
+# these bytes is written down.
+OP_PUSHINPUTREF_BYTE: int = OpCode.OP_PUSHINPUTREF.value[0]
+OP_PUSHINPUTREFSINGLETON_BYTE: int = OpCode.OP_PUSHINPUTREFSINGLETON.value[0]

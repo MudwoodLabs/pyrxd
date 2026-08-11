@@ -637,6 +637,64 @@ async def test_electrumx_get_history_fails_closed(shape: str, value: Any) -> Non
     await assert_fail_closed(coro, label=f"ElectrumX.get_history[height={shape}]")
 
 
+# ── answering a DIFFERENT question than the one asked ─────────────────────────
+#
+# The sweep above varies the SHAPE of a field. These two vary its VALUE, and they are
+# a different bug class: the response is perfectly well-formed, internally consistent,
+# and describes a real object — just not the one that was requested. Both guards were
+# invisible to mutation testing (``if False:`` left the whole suite green) precisely
+# because every test above hands back a value that already matches what it asked for.
+
+
+#: A second well-formed transaction, differing from ``_VALID_RAW`` only in nLockTime.
+#: Both parse; only the hash tells them apart, which is the entire point.
+_OTHER_VALID_RAW = _VALID_RAW[:-4] + bytes.fromhex("01000000")
+OTHER_VALID_TXID = hashlib.sha256(hashlib.sha256(_OTHER_VALID_RAW).digest()).digest()[::-1].hex()
+
+
+async def test_electrumx_get_transaction_refuses_a_transaction_that_is_not_the_one_asked_for() -> None:
+    """A server may answer ``blockchain.transaction.get`` with ANY transaction.
+
+    ``swap.resolve.fetch_transaction`` and ``failover._holds_tx`` re-derive the id
+    themselves; ``glyph/scanner.py`` did not, so a hostile server could hand it a
+    transaction of its choosing and have the token metadata parsed out of that. The
+    substituted transaction here is not malformed in any way — it is a valid
+    transaction, it simply is not the requested one, so nothing but the hash binding
+    can reject it.
+    """
+    assert OTHER_VALID_TXID != VALID_TXID, "the two fixtures must differ, or this proves nothing"
+
+    client = electrum_client(_OTHER_VALID_RAW.hex())
+    with pytest.raises(RxdSdkError, match="not the requested txid"):
+        await client.get_transaction(Txid(VALID_TXID))
+
+
+async def test_electrumx_get_transaction_still_accepts_the_transaction_it_asked_for() -> None:
+    """The binding must not be a blanket refusal — the honest answer still passes."""
+    got = await electrum_client(_VALID_RAW.hex()).get_transaction(Txid(VALID_TXID))
+    assert bytes(got) == _VALID_RAW
+
+
+@pytest.mark.parametrize("proved_height", [99, 101, 0, 999_999], ids=["one_below", "one_above", "genesis", "far"])
+async def test_electrumx_get_merkle_refuses_a_proof_for_a_different_block(proved_height: int) -> None:
+    """ElectrumX echoes ``block_height``; unbound, the SERVER picks which block it proves.
+
+    Inclusion in *some* block is not the claim being made — the caller asked whether
+    the transaction is in block N, and a proof for block M answers a question it did
+    not ask. Every other test in this file requests height 100 and is handed 100 back,
+    so the echo was never actually checked against the request.
+    """
+    result = {"block_height": proved_height, "merkle": ["ab" * 32], "pos": 3}
+    with pytest.raises(RxdSdkError, match="not the requested"):
+        await electrum_client(result).get_transaction_merkle(Txid(VALID_TXID), BlockHeight(100))
+
+
+async def test_electrumx_get_merkle_still_accepts_a_proof_for_the_requested_block() -> None:
+    """The height binding must not reject the honest answer."""
+    result = {"block_height": 100, "merkle": ["ab" * 32], "pos": 3}
+    assert await electrum_client(result).get_transaction_merkle(Txid(VALID_TXID), BlockHeight(100)) is not None
+
+
 # ── the watchtower's claim-detection outspend: the un-fixed twin of the bug ───
 
 

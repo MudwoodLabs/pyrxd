@@ -94,7 +94,14 @@ def test_hex_str_accepts_hex_of_the_right_length() -> None:
         (None, 32),
         (12, 32),
         (["ab" * 32], 32),
-        ("ab" * 31, 32),  # right charset, wrong length
+        ("ab" * 31, 32),  # right charset, SHORT
+        # ...and the other side of the equality. Only the short case was covered, so
+        # relaxing `!= nbytes * 2` to `< nbytes * 2` left the whole suite green — a
+        # 33-byte "hash" would then pass into an outpoint or a proof. An over-long
+        # value is the likelier hostile shape of the two: it is what a concatenation
+        # or an off-by-one length prefix produces.
+        ("ab" * 33, 32),  # right charset, LONG
+        ("ab" * 64, 32),  # exactly double — a doubled hash
         ("zz" * 32, 32),  # right length, wrong charset
         ("", None),  # empty
         ("abc", None),  # odd length
@@ -104,6 +111,16 @@ def test_hex_str_accepts_hex_of_the_right_length() -> None:
 def test_hex_str_refuses_anything_that_is_not_a_hash(value: Any, nbytes: int | None) -> None:
     with pytest.raises(ValueError):
         hex_str(value, nbytes=nbytes)
+
+
+def test_merkle_branch_refuses_an_over_long_sibling() -> None:
+    """The same boundary reached through the caller the guard exists to protect.
+
+    ``merkle_branch`` is the only production caller that passes ``nbytes``; a sibling
+    that is too LONG has to stop here rather than be truncated into a proof step.
+    """
+    with pytest.raises(ValueError):
+        merkle_branch(["ab" * 32, "cd" * 33])
 
 
 def test_merkle_branch_accepts_a_list_of_hashes() -> None:
