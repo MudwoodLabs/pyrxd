@@ -252,8 +252,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`build_maker_offer_tx` and `build_payment_tx` now refuse a fee below the relay floor.**
   Both accepted any non-negative `fee_sats` and returned a fully-populated result —
   plausible `txid`, plausible accounting — for a transaction no node will relay. The
-  Radiant one is **fund safety**: Radiant has neither RBF (`validation.cpp:667`/`:856`
-  reject a mempool conflict outright) nor CPFP (`miner.cpp:380` selects on the
+  Radiant one is **fund safety**: Radiant has neither RBF (`validation.cpp:667`/`:866`
+  reject a mempool conflict outright) nor CPFP (`miner.cpp:404` selects on the
   transaction's own `GetModifiedFeeRate()`), so an under-fee'd offer cannot be replaced or
   bumped and squats on the Maker's funding UTXO until `DEFAULT_MEMPOOL_EXPIRY` (8h). The
   Bitcoin one is recoverable via RBF/CPFP and is guarded so the builder fails closed rather
@@ -299,6 +299,73 @@ Two consensus-level defects, both found by putting builders that had never seen 
 a Radiant Core v3.1.1 regtest one.
 
 ### Changed
+
+- **Bitcoin's rules were being asserted as Radiant's, in code and in comments; the false
+  ones are corrected against Radiant Core `v3.1.2`.** One had already produced a real
+  lockout (the 546-photon check that refused every RSWP v3 FT take whose change fell in
+  1–545 units). The rules, re-verified at source rather than from pyrxd's own docs:
+  `GetDustThreshold` returns **1 satoshi** and `IsDust` is `nValue <= 0`
+  (`src/policy/policy.cpp:19-25`); `fRequireStandard` is hardcoded **`false`**
+  (`src/validation.cpp:271`, re-set unconditionally at `src/init.cpp:1995`), so
+  standardness is **never consulted** — the only reason a 75-byte FT script relays at all,
+  since `Solver` classifies it `TX_NONSTANDARD`; the relay floor is 10,000 photons/byte
+  charged against `GetTotalSize()` (`src/policy/policy.h:49`, `src/validation.cpp:779`);
+  the target block time is **300 s** (`nPowTargetSpacing`, `src/chainparams.cpp:117`).
+
+  - **The dMint miner's OP_RETURN cap is 255 bytes, not 80.** `glyph/dmint/miner.py`
+    refused any `op_return_msg` over 80 bytes as a "standardness limit" — a Bitcoin number,
+    on a chain that never runs `IsStandardTx`, and not even Bitcoin's cap as Radiant would
+    apply it (`nMaxDatacarrierBytes` defaults to `DEFAULT_DATACARRIER_BYTES` = 1024, and
+    Radiant's `MAX_OP_RETURN_RELAY` is 223). The genuine bound is pyrxd's own encoder: it
+    emits `OP_PUSHDATA1`, whose length field is one byte. Both V1 and V2 mint paths, and
+    the `glyph deploy-dmint --op-return` CLI guard, now cap at
+    `pyrxd.constants.MAX_OP_RETURN_MSG_BYTES` = 255 and say why. **Behaviour change**: an
+    81–255-byte message now builds instead of raising.
+
+  - **546 has one definition and an honest label.** It was spelled out about ten times
+    across twelve modules, at least one still describing it as node-enforced.
+    `pyrxd.constants.DUST_THRESHOLD_PHOTONS` is now the single source; `wallet.DUST_THRESHOLD`,
+    `glyph.ft.DUST_LIMIT` (`FT_DUST_LIMIT`), `glyph.mint.NFT_CARRIER_VALUE`,
+    `gravity.htlc_spend.DUST_FLOOR_PHOTONS`, both `_DUST_PHOTONS` in the swap stack and
+    `CommitParams.dust_limit` all alias it. `btc_wallet.payment.DUST_LIMIT` is deliberately
+    **not** aliased — that 546 is Bitcoin's real rule on the BTC leg. The guards are kept
+    where they serve a user (a sub-546 FT *supply* is usually a decimals mistake; sub-546
+    change is uneconomic), but every message now says "pyrxd send-policy floor … Radiant's
+    floor is 1 photon" instead of naming a "dust limit" no node applies. A test fails if a
+    bare operational `546` reappears outside those two modules.
+
+  - **`Transaction.fee()` defaulted to 5 photons/kB — 2,000,000x under the relay floor.**
+    Measured on a two-output P2PKH spend: the default model paid **2 photons** where
+    `AcceptToMemoryPool` requires **2,260,000**. No internal caller used it, but it is
+    public API and Radiant has neither RBF nor CPFP to repair the result.
+    `TRANSACTION_FEE_RATE` now defaults to 10,000,000 photons/kB, the floor itself, and a
+    test pins it to `fee_sizing.RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB` so the two
+    cannot drift. **Behaviour change**; override with `RXD_PY_SDK_TRANSACTION_FEE_RATE`.
+
+  - **The BIP32 hardened-derivation error steered users to Bitcoin's coin type.** Its
+    worked example was `m/44'/0'/0'`; Radiant's SLIP-0044 coin type is **512**, which is
+    what `BIP44_DERIVATION_PATH` already used. Following the example derived a different
+    wallet from the one pyrxd's own default produces.
+
+  - **`num_contracts <= 250` is a pyrxd ergonomics ceiling, not "the standardness ceiling
+    for reveal size".** Kept at 250 (it bounds reveal size and therefore fee); relabelled.
+
+  - **The watchtower's autonomous-claim ceiling is not "the photon analogue" of the BTC
+    refund path's 10,000-sat one.** It is a numeric copy across incomparable units:
+    10,000 photons is *below the relay fee of the claim transaction itself* (~2,660,000
+    photons for a ~266-byte claim), so an un-tuned executor claims nothing rather than
+    "staying dust-only". The number is kept — it fails closed, and arming autonomy for real
+    value is the operator's decision — but the comment no longer implies it is a
+    market-value judgement.
+
+- **Radiant Core line citations are anchored to the tag this repo pins.** They were a mix
+  of unanchored numbers and numbers at `main@afdf57b1`, which left four several lines off
+  at `v3.1.2` — the tag in `tests/vendor/radiant_core/MANIFEST.json`: `init.cpp:1965`→`1995`,
+  `feerate.cpp:51`→`95`, `miner.cpp:380`→`404`, `validation.cpp:856`→`866` (plus
+  `validation.cpp:770`→`774` and `:778`→`779`, and `chainparams.cpp`'s genesis asserts in
+  `network/registry.py`). **Every underlying fact held at both revisions — only the line
+  numbers moved.** `tests/vendor/radiant_core/README.md` now states that the pin is the
+  anchor for citations repo-wide, and a test fails if a stale number reappears.
 
 - **`radiant_relay_size` and `bitcoin_virtual_size` moved to `pyrxd.fee_sizing`**, which
   #405 established as the single home for fee-sizing rules (it exists at all to break the
@@ -405,7 +472,7 @@ a Radiant Core v3.1.1 regtest one.
   returns 1 satoshi and `IsDust` is `nValue <= 0` (`Radiant-Core/src/policy/policy.cpp:19-25`)
   — and standardness is never consulted at all, since `fRequireStandard` is hardcoded
   `false` (`Radiant-Core/src/validation.cpp:271`, re-set unconditionally at
-  `src/init.cpp:1965`), which is the only reason a 75-byte FT script relays in the first
+  `src/init.cpp:1995`), which is the only reason a 75-byte FT script relays in the first
   place: `Solver` classifies it `TX_NONSTANDARD`. A taker holding 80 units against a 50-unit
   demand could not fill a perfectly valid order, and the suggested workaround — "re-fund the
   exact demanded amount" — costs an extra transaction and an extra fee to split a UTXO for
@@ -458,7 +525,7 @@ a Radiant Core v3.1.1 regtest one.
 - **Two table-driven suites for the blind spots the fixes above came out of** — tests that
   assert exception *types* and supply *well-formed* inputs cannot see either class.
 
-  - `tests/security/test_hostile_server_responses.py` (442 cases) sweeps a named shape space
+  - `tests/security/test_hostile_server_responses.py` (459 collected cases) sweeps a named shape space
     — missing, present-but-falsy (`null` / `0` / `""` / `[]` / `{}`), wrong type, negative,
     non-integral, `Infinity` / `-Infinity` / `NaN`, absurd magnitude, and a response that
     does not correspond to the request — across every value-bearing field at every reachable
@@ -467,9 +534,18 @@ a Radiant Core v3.1.1 regtest one.
     covenant leg. One contract is asserted everywhere: *a value-bearing read either returns
     a correct, well-typed value or raises an `RxdSdkError`* — never a bare `OverflowError` /
     `TypeError` / `ValueError` / `ArithmeticError`, and never a value derived from a field it
-    could not interpret. 227 of the 442 failed before the fixes above.
+    could not interpret. 227 cases failed before the fixes above.
 
-  - `tests/security/test_secret_material_error_paths.py` (39 cases) extends
+    A "case" is one collected pytest item — 29 test functions expanded by
+    `@pytest.mark.parametrize`. This entry previously gave the total as **442** and
+    quoted the failure count as a fraction of it. 442 was never the collected count:
+    `pytest --collect-only` reports **452** at the commit that added the suite (#410)
+    and **459** on this branch (#413 added seven). The 227 figure was measured against
+    the 452-case snapshot before the fixes; it has not been re-measured, and is left
+    as the historical measurement it is rather than rescaled to a denominator it was
+    never taken against.
+
+  - `tests/security/test_secret_material_error_paths.py` (40 collected cases) extends
     `test_key_material_never_echoed.py`'s discipline from the base58/WIF path to every other
     entry point taking caller-supplied secret material — private keys, DER signatures,
     mnemonics in *every shipped wordlist language*, xprv/xpub/chain code, seeds,
@@ -582,6 +658,16 @@ both. It is fixed here.
   could ever fail, since the node would have nothing left to reject.
 
 ### Tests
+
+- **`tests/test_false_consensus_premises.py` pins every corrected premise above.** Each
+  behaviour change was confirmed failing beforehand against the unmodified tree: the dMint
+  miner refused an 81-, 200- and 255-byte `op_return_msg` on both the V1 and V2 paths;
+  `PoolTooSmallError` read "below 546 dust limit"; `Transaction.fee()`'s default model paid
+  2 photons against a 2,260,000-photon requirement; the BIP32 error printed `m/44'/0'/0'`.
+  Alongside the behavioural cases the file carries three drift guards that read the tree
+  itself — no operational `546` outside the two modules allowed to define one, no
+  "standardness limit is 80" string, and no citation pointing at a line number stale for the
+  pinned Radiant Core tag.
 
 - **Verification-integrity sweep: six guards that could not detect the bug they exist to
   catch.** Every fix below is proved by mutation — the defect is planted, the new test is

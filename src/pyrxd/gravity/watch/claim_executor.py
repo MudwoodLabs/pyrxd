@@ -74,9 +74,20 @@ __all__ = [
 # can raise* via ``claim_dust_ceiling`` — explicit per-value consent (you state the magnitude), not a hard
 # block. What it is NOT is waivable by the *blunt* ``accept_unbounded_reorg_risk`` flag (review MEDIUM): that
 # flag waives only the RELATIVE value-vs-reorg-cost ceiling and deliberately cannot cross whatever absolute
-# ceiling is configured, so a single boolean can never arm an arbitrary-value claim. The default — 10k photons,
-# the photon analogue of the refund path's MAINNET_DUST_CEILING_SATS — is dust by any market measure, so an
-# un-tuned executor stays dust-only; moving real value is a conscious, numeric opt-in.
+# ceiling is configured, so a single boolean can never arm an arbitrary-value claim.
+#
+# The default is 10_000 photons. It was described here as "the photon analogue of the refund path's
+# MAINNET_DUST_CEILING_SATS" — it is not an analogue, it is a numeric copy of a BITCOIN figure, and
+# photons and satoshis are not comparable units. The honest description of what 10_000 photons is:
+# it is BELOW THE FEE OF THE CLAIM ITSELF. Radiant's effective relay floor is 10_000 photons per byte
+# (``RADIANT_CORE_2_MIN_RELAY_TX_FEE_PER_KB``, Radiant-Core ``src/policy/policy.h:49`` @ v3.1.2), so a
+# ~266-byte RXD claim must pay ~2,660,000 photons — 266x this ceiling. An operator who leaves the
+# default therefore has autonomous RXD claiming effectively DISABLED, not "dust-only".
+#
+# That is deliberate and it fails closed, so the number is kept: arming autonomy for real value is a
+# security decision that belongs to the operator (and to the external audit), not to a default. But
+# do not read "10_000" as a market-value judgement — it is not one, and the previous comment implied
+# it was. Raise ``claim_dust_ceiling`` explicitly, with the magnitude you mean, to arm the executor.
 MAINNET_DUST_CEILING_PHOTONS = 10_000
 
 # Test/regtest networks (no real value) == the audit-cleared set. Aliased so the executor's value-bearing

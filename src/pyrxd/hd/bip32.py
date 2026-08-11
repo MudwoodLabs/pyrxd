@@ -110,7 +110,7 @@ class Xpub(Xkey):
                 "can't make hardened derivation from xpub. "
                 "If you use hardened key, please set xpub with path from xpriv first. Example:\n"
                 "  master_xprv = master_xprv_from_seed(seed)\n"
-                "  account_xprv = ckd(master_xprv, \"m/44'/0'/0'\")\n"
+                "  account_xprv = ckd(master_xprv, \"m/44'/512'/0'\")\n"
                 "  account_xpub = account_xprv.xpub()"
             )
 
@@ -252,7 +252,14 @@ def step_to_index(step: str | int) -> int:
 def ckd(xkey: Xprv | Xpub, path: str) -> Xprv | Xpub:
     """
     ckd = "Child Key Derivation"
-    derive an extended key according to path like "m/44'/0'/1'/0/10" (absolute) or "./0/10" (relative)
+    derive an extended key according to path like "m/44'/512'/1'/0/10" (absolute) or "./0/10" (relative)
+
+    512 is Radiant's SLIP-0044 coin type and is what :data:`pyrxd.constants.BIP44_DERIVATION_PATH`
+    uses. The examples here used to show coin type 0, which is BITCOIN's — following them derives
+    a wallet whose addresses are not the ones Photonic >= v3.0.0 or Tangem will show for the same
+    mnemonic. Coin types 0 (Photonic <= v2.x, Electron-Radiant, Chainbow) and 236 (pre-#14 pyrxd)
+    are also in use in the Radiant ecosystem for historical reasons — see
+    :mod:`pyrxd.hd.discovery`, which scans all three — but 512 is the one to derive NEW wallets at.
     """
     steps = path.strip(" ").strip("/").split("/")
     if not (steps and steps[0] in ["m", "."]):

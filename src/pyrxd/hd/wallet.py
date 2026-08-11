@@ -1102,7 +1102,11 @@ class HdWallet:
         if photons <= 0:
             raise ValidationError("photons must be > 0")
         if photons < DUST_THRESHOLD:
-            raise ValidationError(f"photons below dust threshold ({DUST_THRESHOLD})")
+            raise ValidationError(
+                f"photons ({photons}) is below pyrxd's {DUST_THRESHOLD}-photon send-policy floor. "
+                "This is a pyrxd guard against uneconomic outputs, NOT a Radiant rule: the chain "
+                "accepts any output of 1 photon or more."
+            )
         if not validate_address(to_address):
             raise ValidationError("to_address is not a valid P2PKH address")
         if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
@@ -1217,7 +1221,10 @@ class HdWallet:
 
         total_in = sum(t[0].value for t in triples)
         if total_in <= DUST_THRESHOLD:
-            raise ValidationError("Insufficient funds: total below dust threshold")
+            raise ValidationError(
+                "Insufficient funds: the selected UTXOs cannot pay the amount plus fee and still clear "
+                "pyrxd's send-policy floor (a pyrxd guard, not a Radiant rule)"
+            )
 
         recipient_script = P2PKH().lock(to_address)
         inputs = [self._build_utxo_input(u, addr, pk) for u, addr, pk in triples]

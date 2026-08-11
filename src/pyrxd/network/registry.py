@@ -24,10 +24,12 @@ Provenance of the genesis hashes
 --------------------------------
 Every value below was checked twice, from independent sources:
 
-* ``Radiant-Core`` @ ``afdf57b1`` (v3.0.0), ``src/chainparams.cpp`` — the
+* ``Radiant-Core`` @ tag ``v3.1.2`` (the pin in
+  ``tests/vendor/radiant_core/MANIFEST.json``), ``src/chainparams.cpp`` — the
   ``assert(consensus.hashGenesisBlock == uint256S(...))`` in each chainparams
-  class: ``CMainParams`` (:171-174), ``CTestNetParams`` (:288-291),
-  ``CRegTestParams`` (:484-487).
+  class: ``CMainParams`` (:182-185), ``CTestNetParams`` (:308-311),
+  ``CRegTestParams`` (:508-511). (Re-checked at v3.1.2; the values are unchanged
+  from v3.0.0 but the line numbers moved.)
 * A live node. mainnet: ``radiant-cli getblockhash 0`` against the reference
   mainnet node (Radiant Core 3.1.2). testnet + regtest: ``radiant-cli
   -testnet/-regtest getblockhash 0`` against a local ``radiant-core:v3.1.1``

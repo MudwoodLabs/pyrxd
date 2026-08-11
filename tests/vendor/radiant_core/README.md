@@ -7,6 +7,24 @@ test suite parses them as text to derive consensus facts.
 
 Distributed under the MIT license, as stated in the copyright header of each file.
 
+## This pin is also the anchor for every Radiant-Core line citation in the repo
+
+pyrxd's source comments, docs and tests cite Radiant Core by file and line
+(`src/policy/policy.cpp:19-25`, `src/validation.cpp:271`, and so on). **Those line
+numbers are at the tag recorded in `MANIFEST.json` — currently `v3.1.2`
+(`45e0aa40d6ae022ba69439a58b706748b083a35b`)** — even for files not vendored here.
+Cite that way in new comments: a bare line number with no version is unverifiable a
+release later.
+
+They were previously a mix of unanchored numbers and numbers at `main@afdf57b1`, which
+put four citations several lines off the version this repo actually pins
+(`init.cpp:1965`→`1995`, `feerate.cpp:51`→`95`, `miner.cpp:380`→`404`,
+`validation.cpp:856`→`866`; also `validation.cpp:770`→`774` and `:778`→`779`). Every
+underlying *fact* held at both revisions — only the line numbers had moved.
+
+When `scripts/refresh_radiant_core_vendor.py` moves the pin, re-check the cited line
+numbers along with the vendored bytes.
+
 ## Why these are here
 
 pyrxd re-implements Radiant consensus rules in Python. Every such re-implementation drifts unless

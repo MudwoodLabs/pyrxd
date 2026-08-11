@@ -425,7 +425,7 @@ class TestPrepareFtDeployReveal:
         satoshi and ``IsDust`` is ``nValue <= 0``
         (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is never
         consulted at all — ``fRequireStandard`` is hardcoded ``false``
-        (Radiant-Core/src/validation.cpp:271, src/init.cpp:1965), which is the
+        (Radiant-Core/src/validation.cpp:271, src/init.cpp:1995), which is the
         only reason a 75-byte FT script relays. A 100-unit premine would be
         relayed and mined; pyrxd refuses it as a probable user error, and
         ``FtUtxoSet.build_airdrop_tx`` in the same package correctly emits

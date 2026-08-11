@@ -6,7 +6,7 @@ An 8-reviewer panel found the same hole in three places, each reached from a
 different direction, all with the same consequence: a transaction that pays less
 than ``AcceptToMemoryPool`` demands. On Radiant that is not a stuck transaction to
 be bumped later — there is neither RBF nor CPFP (``Radiant-Core``
-``src/validation.cpp:667``/``:856`` reject any mempool conflict), so it holds its
+``src/validation.cpp:667``/``:866`` reject any mempool conflict), so it holds its
 own inputs until ``DEFAULT_MEMPOOL_EXPIRY``, 8 hours, before a rebuild is even
 possible.
 

@@ -195,8 +195,8 @@ class TestFee:
 
 class TestDust:
     def test_value_below_dust_after_fee_raises(self):
-        # Tiny UTXO that can't cover fee + 546 dust.
-        with pytest.raises(ValueError, match="dust"):
+        # Tiny UTXO that can't cover fee + pyrxd's 546-photon policy floor.
+        with pytest.raises(ValueError, match="uneconomic-output floor"):
             GlyphBuilder().build_nft_transfer_tx(_transfer_params(nft_value=1000))
 
     @staticmethod

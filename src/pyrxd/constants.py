@@ -8,7 +8,64 @@ NUMBER_BYTE_LENGTH: int = 32
 TRANSACTION_SEQUENCE: int = int(os.getenv("RXD_PY_SDK_TRANSACTION_SEQUENCE") or 0xFFFFFFFF)
 TRANSACTION_VERSION: int = int(os.getenv("RXD_PY_SDK_TRANSACTION_VERSION") or 1)
 TRANSACTION_LOCKTIME: int = int(os.getenv("RXD_PY_SDK_TRANSACTION_LOCKTIME") or 0)
-TRANSACTION_FEE_RATE: int = int(os.getenv("RXD_PY_SDK_TRANSACTION_FEE_RATE") or 5)  # satoshi per kilobyte
+# Default fee rate for :meth:`pyrxd.transaction.Transaction.fee`, in photons per KILOBYTE.
+#
+# This used to default to 5 photons/kB — inherited from a Bitcoin-shaped SDK and
+# 2_000_000x under what a Radiant node will relay. Radiant's effective minimum relay
+# rate is 10_000_000 photons/kB (`RADIANT_CORE_2_MIN_RELAY_TX_FEE_PER_KB`,
+# Radiant-Core `src/policy/policy.h:49` @ v3.1.2), charged against `GetTotalSize()`
+# in `AcceptToMemoryPool` (`src/validation.cpp:779` @ v3.1.2, reject reason
+# `min relay fee not met`). Any transaction built with the old default was
+# unrelayable, so this defaults to the floor itself.
+#
+# :data:`pyrxd.fee_sizing.RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB` is the OWNER of
+# this number; the literal is repeated here only because ``pyrxd.constants`` is the
+# leaf module every other module imports and must not import back into the tree.
+# ``tests/test_false_consensus_premises.py`` asserts the two cannot drift.
+TRANSACTION_FEE_RATE: int = int(os.getenv("RXD_PY_SDK_TRANSACTION_FEE_RATE") or 10_000_000)  # photons per kB
+
+# pyrxd's single uneconomic-change floor, in photons. THE ONE DEFINITION —
+# every other module that needs it imports this name rather than re-typing 546.
+#
+# It is pyrxd POLICY, not a Radiant rule. Radiant has no dust threshold:
+# `GetDustThreshold` returns 1 satoshi unconditionally and `IsDust` is
+# `nValue <= 0` (Radiant-Core `src/policy/policy.cpp:19-25` @ v3.1.2), and
+# standardness is never consulted at all — `fRequireStandard` is hardcoded
+# `false` (`src/validation.cpp:271`, re-set unconditionally at `src/init.cpp:1995`,
+# both @ v3.1.2). So ANY output of 1 photon or more relays, and pyrxd itself
+# depends on that: a dMint contract MUST be a 1-photon singleton because the
+# covenant enforces `OP_OUTPUTVALUE == 1`.
+#
+# 546 is Bitcoin's P2PKH dust convention, kept here only as a conservative
+# wallet-level guard against creating change too small to be worth spending.
+# It must never be used as a floor on a TOKEN output: an FT output's value IS
+# its unit count, so a 546 floor there forbids transferring 100 units of
+# anything. (See `pyrxd.btc_wallet.payment.DUST_LIMIT` for the separate,
+# genuinely-Bitcoin 546 that governs the BTC leg of a swap.)
+DUST_THRESHOLD_PHOTONS: int = 546
+
+# Largest OP_RETURN message body pyrxd will encode, in bytes. THE ONE DEFINITION.
+#
+# This is an ENCODER limit, not a chain rule and not a relay rule. pyrxd emits
+# `OP_RETURN [<"msg" marker>] <push> <message>` and switches to `OP_PUSHDATA1`
+# (0x4c) above 75 bytes; `OP_PUSHDATA1` carries a ONE-byte length, so 255 is the
+# largest body that encoding can express. Above it the builder must move to
+# `OP_PUSHDATA2`, which no pyrxd path emits and no ecosystem parser is known to
+# read for the Photonic `msg` convention.
+#
+# What it is NOT: Bitcoin's 80-byte OP_RETURN standardness cap. That number has
+# no force on Radiant twice over. (1) Standardness is never consulted:
+# `fRequireStandard` is hardcoded `false` (Radiant-Core `src/validation.cpp:271`,
+# re-set unconditionally at `src/init.cpp:1995`, both @ v3.1.2), so `IsStandardTx`
+# — the only caller of the OP_RETURN size rule — never runs. (2) Even if it did
+# run, the limit it applies is `nMaxDatacarrierBytes`, which defaults to
+# `DEFAULT_DATACARRIER_BYTES = 1024` (`src/script/standard.h:35`,
+# `src/script/standard.cpp:18` @ v3.1.2) — and Radiant's own
+# `MAX_OP_RETURN_RELAY` is 223 (`src/script/standard.h:33`), not 80.
+# Consensus caps a single push at `MAX_SCRIPT_ELEMENT_SIZE` = 32_000_000 bytes
+# (`src/script/script.h:74`, vendored at `tests/vendor/radiant_core/script.h`).
+MAX_OP_RETURN_MSG_BYTES: int = 255
+
 BIP32_DERIVATION_PATH = os.getenv("RXD_PY_SDK_BIP32_DERIVATION_PATH") or "m/"
 BIP39_ENTROPY_BIT_LENGTH: int = int(os.getenv("RXD_PY_SDK_BIP39_ENTROPY_BIT_LENGTH") or 128)
 BIP44_DERIVATION_PATH = os.getenv("RXD_PY_SDK_BIP44_DERIVATION_PATH") or "m/44'/512'/0'"

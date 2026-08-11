@@ -27,8 +27,8 @@ was the same, 26.2%-38.1%; ``HdWallet``'s copies of the same two builders,
 At the default rate that shortfall is fatal rather than cosmetic.
 :data:`RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB` is *exactly* the mainnet relay
 floor, so one byte short is ``66: min relay fee not met`` — and **Radiant has
-neither RBF nor CPFP** (``Radiant-Core`` ``src/validation.cpp:667``/``:856`` reject
-any mempool conflict; ``src/miner.cpp:380`` selects on the transaction's own
+neither RBF nor CPFP** (``Radiant-Core`` ``src/validation.cpp:667``/``:866`` reject
+any mempool conflict; ``src/miner.cpp:404`` selects on the transaction's own
 ``GetModifiedFeeRate()``), so the transaction cannot be bumped or replaced. It sits
 on its own inputs until ``DEFAULT_MEMPOOL_EXPIRY`` — 8 hours — before a rebuild is
 even possible.
@@ -159,7 +159,7 @@ def radiant_relay_size(raw_tx: bytes) -> int:
     ``AcceptToMemoryPool`` compares against ``GetEffectiveMinRelayFee(height).GetFee(nSize)``
     with ``nSize = tx.GetTotalSize()`` — the **full serialized size**, carrying an explicit
     "Do not change this to use virtualsize without coordinating a network policy upgrade"
-    (Radiant-Core ``src/validation.cpp:770``). Radiant has no segwit, so total size is the
+    (Radiant-Core ``src/validation.cpp:774``). Radiant has no segwit, so total size is the
     only size there is; this function exists to name the rule, not to compute anything.
 
     Pass the **signed** transaction: a DER signature is 69-71 bytes run to run, so a size
@@ -208,7 +208,7 @@ def fee_for_kb_rate(size_bytes: int, per_kb: int) -> int:
     """``ceil(size_bytes × per_kb / 1000)`` — a node's own fee derivation, rounded UP.
 
     ``CFeeRate::GetFee`` truncates (``ceil=false``, ``Radiant-Core``
-    ``src/feerate.cpp:51``). Rounding up instead makes this at most one photon
+    ``src/feerate.cpp:95``). Rounding up instead makes this at most one photon
     stricter than the node — deliberately, because being one photon short is a
     broadcast that cannot be taken back.
 

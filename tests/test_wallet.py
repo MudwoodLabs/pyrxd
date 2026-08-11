@@ -213,7 +213,7 @@ class TestBuildSendTx:
 
     def test_dust_value_raises(self, wallet: RxdWallet, recipient_address: str) -> None:
         utxos = [_utxo("aa" * 32, 0, 10_000_000)]
-        with pytest.raises(ValidationError, match="dust"):
+        with pytest.raises(ValidationError, match="send-policy floor"):
             wallet.build_send_tx(utxos, recipient_address, DUST_THRESHOLD - 1)
 
     def test_dust_threshold_exactly_allowed(self, wallet: RxdWallet, recipient_address: str) -> None:

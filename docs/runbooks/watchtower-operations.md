@@ -163,10 +163,10 @@ first, confirming a fresh heartbeat, then un-muting the watchdog. The swaps don'
 (verified against `Radiant-Core` @ `afdf57b1` and the live mainnet node, 2026-08-09):
 
 - **No RBF.** Any mempool conflict is rejected outright (`txn-mempool-conflict`,
-  `src/validation.cpp:667`/`:856`). There is **no `bumpfee` RPC**. Radiant ships DSProof —
+  `src/validation.cpp:667`/`:866`). There is **no `bumpfee` RPC**. Radiant ships DSProof —
   it treats a conflict as *fraud to broadcast*, the opposite of replacement.
 - **No CPFP.** The miner selects on each transaction's **own** fee over its **own** size
-  (`GetModifiedFeeRate()`, `src/miner.cpp:380`). Paying a high-fee child does **not** lift a
+  (`GetModifiedFeeRate()`, `src/miner.cpp:404`). Paying a high-fee child does **not** lift a
   low-fee parent into a block. `getmempoolancestors`/`getmempooldescendants` existing makes
   it *look* supported. It is not.
 - **The window.** `DEFAULT_MEMPOOL_EXPIRY` is **8 hours** (`src/validation.h:82`). An

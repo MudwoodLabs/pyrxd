@@ -6,6 +6,7 @@ from typing import Any, overload
 
 import cbor2
 
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.fee_sizing import (
     assert_fee_rate_clears_relay_floor,
     assert_pays_for_its_size,
@@ -123,7 +124,8 @@ class CommitParams:
     owner_pkh: Hex20  # who will own the NFT/FT after reveal
     change_pkh: Hex20  # change output recipient
     funding_satoshis: int  # total input satoshis available
-    dust_limit: int = 546  # minimum output value
+    # pyrxd's uneconomic-change floor, NOT a chain minimum (Radiant's is 1 photon).
+    dust_limit: int = DUST_THRESHOLD_PHOTONS
 
 
 @dataclass
@@ -385,7 +387,7 @@ class GlyphBuilder:
         """
         if premine_amount < 0:
             raise ValidationError("premine_amount must be non-negative")
-        if premine_amount < 546:
+        if premine_amount < DUST_THRESHOLD_PHOTONS:
             # A pyrxd HEURISTIC, not a chain rule — the same one, and the same
             # reasoning, as ``_validate_premine`` further down this file: a whole
             # FT supply below 546 units is almost always a decimals mistake.
@@ -393,12 +395,12 @@ class GlyphBuilder:
             # ``IsDust`` is ``nValue <= 0``
             # (Radiant-Core/src/policy/policy.cpp:19-25), and standardness is not
             # consulted at all (``fRequireStandard`` hardcoded ``false``,
-            # Radiant-Core/src/validation.cpp:271, src/init.cpp:1965). The
+            # Radiant-Core/src/validation.cpp:271, src/init.cpp:1995). The
             # previous comment here — "non-standard and will be rejected by most
             # mempool policies" — described a rule that does not exist on this
             # chain.
             raise ValidationError(
-                f"premine_amount ({premine_amount}) is below pyrxd's 546-unit guard. This is a guard "
+                f"premine_amount ({premine_amount}) is below pyrxd's {DUST_THRESHOLD_PHOTONS}-unit guard. This is a guard "
                 "against a decimals mistake, not a chain limit (Radiant's output floor is 1 photon) — "
                 "use a larger supply, or an NFT if the token really is indivisible."
             )
@@ -1066,7 +1068,9 @@ class GlyphBuilder:
         :param params: TransferParams — see dataclass docstring
         :returns: TransferResult — signed tx, new locking script, ref, fee
         :raises ValidationError: nft_script is not a valid 63-byte NFT script
-        :raises ValueError: nft_utxo_value - fee < 546 (dust limit)
+        :raises ValueError: nft_utxo_value - fee below pyrxd's uneconomic-output
+            floor :data:`pyrxd.constants.DUST_THRESHOLD_PHOTONS` — a pyrxd policy,
+            not a Radiant relay limit
         """
         # Local import to avoid circular import at module load (transaction/script
         # modules don't depend on glyph, but we keep builder.py import-time light).
@@ -1162,11 +1166,17 @@ class GlyphBuilder:
         fee = required_fee(size, params.fee_rate)
 
         output_value = params.nft_utxo_value - fee
-        if output_value < 546:
+        # pyrxd POLICY floor, not a node rule: Radiant would relay any output of 1
+        # photon or more. The guard stays because an NFT carrier left with less than
+        # this is worth less than the fee to move it again, and the caller should
+        # attach funding instead.
+        if output_value < DUST_THRESHOLD_PHOTONS:
             raise ValueError(
                 f"NFT UTXO value ({params.nft_utxo_value}) too small to cover transfer "
                 f"fee ({fee} for {size} bytes at {params.fee_rate} photons/byte): "
-                f"output would be {output_value}, below 546 dust limit."
+                f"output would be {output_value}, below pyrxd's {DUST_THRESHOLD_PHOTONS}-photon "
+                "uneconomic-output floor (a pyrxd policy, NOT a Radiant relay limit — "
+                "Radiant's floor is 1 photon)."
             )
 
         # 6. Final pass: rebuild from scratch so there's no stale signature. Don't
@@ -1280,7 +1290,7 @@ def _validate_premine(premine_amount: int | None, premine_pkh: Hex20 | None) -> 
 
     The floor is 1 photon, not 546. Radiant-Core has **no dust threshold**:
     ``GetDustThreshold`` returns 1 satoshi unconditionally and ``IsDust`` is
-    ``nValue <= 0`` (``src/policy/policy.cpp:19-25`` @ ``afdf57b1``), so any
+    ``nValue <= 0`` (``src/policy/policy.cpp:19-25`` @ ``v3.1.2``), so any
     output worth at least one photon is standard regardless of script shape.
     That is why every mainnet dMint contract sits at 1 photon. The 546 in
     :meth:`GlyphBuilder.prepare_ft_deploy_reveal` is a pyrxd-imposed guard on a
@@ -1347,10 +1357,15 @@ class DmintV1DeployParams:
         all ref-seed P2PKH inputs in the reveal.
     :param num_contracts:      Count of parallel V1 dMint contract UTXOs to
         emit. Total supply = ``reward_photons * max_height * num_contracts``.
-        Validated to ``[1, 250]`` at construction. The 250 ceiling is the
-        standardness limit for tx size at typical V1 contract bytes
-        (≈ 241 bytes/contract output + overhead → 250 contracts fits in
-        a ~64 KB reveal before the embedded media body).
+        Validated to ``[1, 250]`` at construction. 250 is a pyrxd ERGONOMICS
+        ceiling, not a node limit: at ≈ 241 bytes/contract output it keeps the
+        reveal near ~64 KB before the embedded media body. Radiant's own
+        ``MAX_STANDARD_TX_SIZE`` is 20_000_000 bytes
+        (``Radiant-Core/src/policy/policy.h:69`` @ v3.1.2) and is never even
+        consulted, since ``fRequireStandard`` is hardcoded ``false``
+        (``src/validation.cpp:271``, ``src/init.cpp:1995`` @ v3.1.2). What
+        actually bounds this is fee: every contract output costs ~241 bytes
+        × the 10_000 photons/byte relay floor.
     :param max_height:         Maximum mints per contract (3-byte ceiling).
     :param reward_photons:     Photons paid per successful mint (3-byte
         ceiling — see V1 contract state layout).
@@ -1391,7 +1406,8 @@ class DmintV1DeployParams:
         if not (1 <= self.num_contracts <= 250):
             raise ValidationError(
                 f"num_contracts must be in [1, 250], got {self.num_contracts} "
-                f"(250 is the standardness ceiling for V1 deploy reveal size)"
+                "(250 is a pyrxd ergonomics ceiling on the V1 deploy reveal size, not a node limit "
+                "— Radiant never consults standardness; raise it deliberately if you mean it)"
             )
         if self.max_height < 1:
             raise ValidationError(f"max_height must be >= 1, got {self.max_height}")
@@ -1471,7 +1487,8 @@ class DmintV2DeployParams:
         if not (1 <= self.num_contracts <= 250):
             raise ValidationError(
                 f"num_contracts must be in [1, 250], got {self.num_contracts} "
-                f"(250 is the standardness ceiling for the deploy reveal size)"
+                "(250 is a pyrxd ergonomics ceiling on the deploy reveal size, not a node limit "
+                "— Radiant never consults standardness; raise it deliberately if you mean it)"
             )
         if self.max_height < 1:
             raise ValidationError(f"max_height must be >= 1, got {self.max_height}")
