@@ -6,6 +6,51 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Live-node consensus proofs for four builders that had none.** Each was covered only by
+  offline tests, which re-hash a builder's own output and agree with it — a closed loop that
+  cannot answer whether a node accepts the bytes. All four are now exercised against real
+  regtest consensus, asserting on confirmed on-chain state rather than on return values, and
+  every case carries a negative control whose rejection reason is asserted by name.
+
+  - `tests/test_cold_recovery_regtest_e2e.py` — `build_cold_claim` / `build_cold_refund`
+    (the offline swap-recovery toolkit shipped in 0.14.0). The claim is **mined**, spends the
+    covenant, and pays the pinned taker holder script; redirecting `output[0]` at an attacker
+    and substituting a wrong preimage are both refused. The CSV refund's **same bytes** are
+    walked across the timelock boundary one block at a time — refused at 1 and 2
+    confirmations, accepted at 3 — then mined, with `version == 2` and the covenant input's
+    `nSequence` carrying the lock. A genuinely 0-conf covenant (funding invalidated back into
+    the mempool) is refused, which is the audit-B5 fix measured against real chain state.
+  - `tests/test_gravity_maker_offer_regtest_e2e.py` — `build_maker_offer_tx`. The offer
+    transaction confirms, the mined output is byte-equal to `P2SH(offer_redeem)`, and the
+    offer is then **taken** on chain by `build_claim_tx`. Controls: raising the offer output
+    by one photon after signing, and a stranger attempting the take.
+  - `tests/test_btc_payment_regtest_e2e.py` — `build_payment_tx` on bitcoind regtest. Both
+    input types (P2WPKH and P2SH-P2WPKH) and all four destination types confirm; change
+    returns to the sender's own script; sub-dust change is really swept into the fee (one
+    output on chain). Controls: a payment amount raised by one satoshi after signing, and a
+    wrapped-segwit UTXO spent as native.
+
+  The Radiant relay floor is measured at the boundary rather than assumed: a fee input worth
+  exactly `ceil(size x rate / 1000)` photons is accepted and one photon less is rejected with
+  `min relay fee not met`, confirming `DeadlineFeePolicy.min_relay_fee` reproduces the node's
+  own arithmetic against `GetTotalSize`. Because the fee value is part of the sighash, the
+  boundary value is searched for — a fixed-point iteration can two-cycle between adjacent DER
+  signature lengths.
+
+### Documented
+
+- **`build_maker_offer_tx` and `build_payment_tx` enforce no relay-fee floor**, unlike
+  `pyrxd.gravity.htlc_spend`, which refuses to return an under-fee'd spend. Both take
+  `fee_sats` on trust and return a fully-populated result — plausible `txid`, plausible
+  accounting — for a transaction no node will relay. Measured: a 190-byte maker-offer
+  transaction at `fee_sats=10_000` (the value the offline suite uses throughout) is rejected
+  with `66: min relay fee not met` against a node floor of 190,000 photons, and 1,900,000
+  photons at the reference mainnet node's effective rate. Radiant has neither RBF nor CPFP,
+  so the funding UTXO is then stuck until the 8h mempool expiry. Both behaviours are now
+  pinned by a test that says so; neither builder was changed.
+
 ## [0.15.0] — 2026-08-11
 
 Collections work, and the feature that claimed to build them is gone.
