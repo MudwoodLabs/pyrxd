@@ -131,6 +131,7 @@ from __future__ import annotations
 import hashlib
 import re
 
+from pyrxd.constants import REF_OPERAND_OPCODES
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
 
@@ -492,7 +493,13 @@ def parse_mutable_nft_script(script: bytes) -> tuple[GlyphRef, bytes] | None:
 # opcode-aware walk is correct. See
 # docs/solutions/logic-errors/funding-utxo-byte-scan-dos.md and
 # docs/solutions/logic-errors/ft-in-covenant-two-consensus-gates.md.
-REF_OPCODES = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
+#
+# Aliased from :data:`pyrxd.constants.REF_OPERAND_OPCODES` rather than re-spelled,
+# because a SECOND walker (the BIP143 preimage's ``hashOutputHashes`` field, in
+# ``pyrxd.transaction.transaction_preimage``) has to agree with this one byte for
+# byte, and it once did not — it omitted 0xd1/0xd2/0xd3 and desynchronised on any
+# output carrying an OP_REQUIREINPUTREF. One definition, two consumers.
+REF_OPCODES = REF_OPERAND_OPCODES
 
 
 class TruncatedScriptError(ValidationError):

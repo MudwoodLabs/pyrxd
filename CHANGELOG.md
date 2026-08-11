@@ -54,6 +54,44 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   was fine. That is why nothing offline caught this: the fixtures described a chain state
   that cannot exist. All 25 were raised to a fee that actually clears the floor for the
   transaction being built, rather than the guard being weakened to accommodate them.
+Two consensus-level defects, both found by putting builders that had never seen a node to
+a Radiant Core v3.1.1 regtest one.
+
+### Fixed
+
+- **`prepare_mutable_reveal` / `prepare_wave_reveal` emitted a reveal no node would accept.**
+  Both output scripts carried the *same* 36-byte ref under `OP_PUSHINPUTREFSINGLETON`, and
+  a transaction may not have two outputs claiming one singleton ref — `CScript::GetPushRefs`
+  files a `0xd8` ref into `foundDisallowedSiblingRefs` as well as the push-ref set. Every MUT
+  and WAVE reveal built as the docstring described was rejected with
+  `bad-txns-inputs-outputs-invalid-transaction-reference-operations`, since 0.9.0. No MUT or
+  WAVE token could be minted at all. Nothing was at risk of loss — the reveal never reached
+  the chain and the commit output stayed spendable — but the two builders were unusable.
+
+  The contract's own body settles what the right ref is: it recomputes the token ref as
+  `mutable_ref.vout - 1` (`OP_DUP 20 OP_SPLIT OP_BIN2NUM OP_1SUB OP_4 OP_NUM2BIN OP_CAT`), so
+  the pairing is chain arithmetic, not convention. `prepare_mutable_reveal` now gives the
+  contract `commit_txid:(commit_vout + 1)` and returns it as `MutableRevealScripts.mutable_ref`.
+  The reveal accordingly needs **two inputs** — the commit outpoint and a plain seed output one
+  vout along, whose spend is what lets an output push the contract's ref. This matches Photonic
+  Wallet (`packages/lib/src/mint.ts`). Node-proven end to end, including a `mod` mutation that
+  installs a new payload hash: `tests/test_mut_wave_regtest_e2e.py`.
+
+- **The BIP143 preimage's ref walker desynchronised on `OP_REQUIREINPUTREF`.**
+  `hashOutputHashes` hashes each output's push-ref set, and `_get_push_refs` collected the
+  right two opcodes (`0xd0`, `0xd8`) but walked only those two. `OP_REQUIREINPUTREF` (`0xd1`),
+  `OP_DISALLOWPUSHINPUTREF` (`0xd2`) and `OP_DISALLOWPUSHINPUTREFSIBLING` (`0xd3`) carry a
+  36-byte immediate operand as well (`GetScriptOp`); skipping one as a bare opcode resumed the
+  walk inside the ref bytes and read them as opcodes. Measured over 2,000 random refs on a
+  Photonic-shaped auth script, that produced the wrong ref set **1,606 times**, raised 20 times,
+  and was accidentally right 374 times — so pyrxd could not reliably sign *any* transaction with
+  an output carrying one of those three opcodes, and the node rejected it with
+  `mandatory-script-verify-flag-failed (Signature must be zero for failed CHECK(MULTI)SIG
+  operation)`. Nothing pyrxd itself builds emits them today, so no shipped path was affected;
+  paying to a Photonic authority token, a delegate-burn output, or the auth-shaped token a MUT
+  mutation requires was. The walker now consumes all five operands and collects two, from the
+  single shared `pyrxd.constants.REF_OPERAND_OPCODES` that `pyrxd.glyph.script.REF_OPCODES` now
+  aliases — one definition, two consumers.
 
 ### Added
 
@@ -99,40 +137,71 @@ Plain RXD sends — the most-used path in the SDK — had never been put to a no
 covering `RxdWallet.build_send_tx` and `build_send_max_tx` asserted on the builder's own
 return value, which is the one witness that cannot tell a working transaction from a
 plausible-looking one. Handing them to a Radiant Core v3.1.1 regtest node found a defect in
-both.
+both. It is fixed here.
 
-### Known issues
+### Fixed
 
-- **Both send builders can emit a transaction below the relay floor.** The fee is sized from
-  a *trial* signing pass (`src/pyrxd/wallet.py:244-247` for `build_send_tx`,
-  `295-302` for `build_send_max_tx`) and the final signed transaction is never re-measured.
-  The final pass signs over different outputs, so it produces a different DER signature —
-  71 or 72 bytes, split roughly evenly — and whenever the final signature is the longer one
-  the transaction contains more bytes than its fee paid for.
+- **All four send builders could emit a transaction below the relay floor** (fund-safety) —
+  `RxdWallet.build_send_tx` / `build_send_max_tx` and `HdWallet`'s copies of both. The fee
+  was sized from a *trial* signing pass and the final signed transaction was never
+  re-measured. The final pass signs over different outputs, so it produces a different DER
+  signature — 69, 70 or 71 bytes depending on how many leading zero bytes `r` and `s` carry
+  (17 / 1,457 / 1,526 over 3,000 measured signatures) — and whenever the final signature was
+  the longer one the transaction contained more bytes than its fee paid for.
 
-  Measured over 2,000 builds per shape at the default rate: **27.1%** of one-input sends,
-  **34.5%** of three-input sends and **31.6%** of two-input sweeps land short by at least one
-  byte. `DEFAULT_FEE_RATE` is 10,000 photons/byte, which is *exactly* the mainnet relay floor,
-  so on mainnet a shortfall of one byte is a rejection. A regtest node built at its own
-  advertised floor refuses these with `66: min relay fee not met`.
+  Signing is deterministic (RFC 6979), so this was **not** a flaky one-in-three: whether a
+  transaction underpays is a fixed property of that transaction, and retrying the same send
+  reproduces it exactly. Roughly a third of *distinct* sends fell on the wrong side.
+  Measured over 2,000 builds per shape at the default rate: **25.4%** of one-input sends,
+  31.8% at two inputs, 33.7% at three and **36.8%** at five; sweeps 26.2%–38.1%; the `HdWallet`
+  builders 23.6%–33.2%. `DEFAULT_FEE_RATE` is 10,000 photons/byte, which is *exactly* Radiant's
+  mainnet relay floor, so a one-byte shortfall is a mainnet rejection. Put to a Radiant Core
+  v3.1.1 regtest node at its own advertised floor, **26.7%** of sends and **33.3%** of sweeps
+  were refused with `66: min relay fee not met`. Radiant has neither RBF nor CPFP, so such a
+  transaction cannot be repaired — it is abandoned, or it holds its inputs until mempool expiry
+  (8 hours) on any node whose floor let it in. The sweeps were the worse case: no change output
+  to absorb an adjustment, and the caller has been told this is their whole balance.
 
-  Radiant has neither RBF nor CPFP, so an underpaid transaction cannot be repaired — it is
-  abandoned, or it holds its inputs until mempool expiry on any node whose floor let it in.
-  `build_send_max_tx` is the worse case of the two: a sweep has no change output to absorb an
-  adjustment, and the caller has been told this is their whole balance.
+  The fee is now sized from the trial measurement **plus three bytes of headroom per input**
+  (the most a DER signature can grow between passes), and the **final** signed transaction is
+  re-measured and the build refused if it does not clear the rate it was built for. Failing
+  closed is deliberate: returning a transaction the node will reject is worse than raising,
+  because the rejection cannot be fee-bumped away. After the fix, 0 of 16,000 offline
+  `RxdWallet` builds, 0 of 4,800 `HdWallet` builds and 0 of 120 node-judged builds underpaid.
 
-  Not fixed here. The fix is to re-measure after the final signing pass and rebuild if the
-  size grew, which changes fee arithmetic and belongs in its own reviewed change. The
-  invariant is recorded as a `strict=True` xfail
-  (`test_every_send_pays_at_least_the_rate_it_was_built_for`) so a fix turns that test into a
-  failure and the marker gets removed rather than outliving the bug.
+  `build_send_max_tx` takes its headroom out of the single payout, up front, before signing —
+  it has no change output, and "everything minus the fee" is the amount the caller asked for.
+  It does not shave the payout *after* the fact: that would need a third signing pass whose
+  signatures can again differ in length, and it would change an amount the caller has already
+  been shown. The give-up is bounded at `3 × inputs × fee_rate` photons (0.0003 RXD per input
+  at the default rate) and asserted as a bound in the tests. `build_send_tx` cannot make that
+  trade at all — the recipient amount there is exact — so it adjusts change or raises.
+
+### Changed
+
+- **`pyrxd.fee_sizing` is now the single implementation of "what fee must this transaction
+  pay".** The rule previously had three copies — `glyph/ft.py`, `cli/swap_book_cmds.py`, and
+  (absent, which was the bug) `wallet.py` — with the per-input signature headroom written out
+  as a literal `3` in two of them. Radiant's relay-floor constants moved there from
+  `gravity/fee_policy.py`, which re-exports them, so its public surface is unchanged and
+  there is exactly one definition; `DeadlineFeePolicy.min_relay_fee` and
+  `wallet.DEFAULT_FEE_RATE` and `glyph.ft.MIN_FEE_RATE` are all derived from it rather than
+  restating `10_000`. The constants had to move rather than be imported, because
+  `pyrxd.gravity.__init__` reaches `pyrxd.hd.wallet`, which imports `pyrxd.wallet` — importing
+  the other direction is a genuine cycle.
+
+  The module distinguishes the two floors that were previously conflated: the caller's chosen
+  `fee_rate`, always binding, and Radiant's protocol relay floor. A `fee_rate` *below* the
+  protocol floor is read as a deliberate opt-out (a default regtest node relays at a tenth of
+  mainnet's rate) rather than silently raised — otherwise no node-level test of this code
+  could ever fail, since the node would have nothing left to reject.
 
 ### Tests
 
 - **`tests/test_wallet_send_regtest_e2e.py`** — live-regtest consensus coverage for
   `build_send_tx` and `build_send_max_tx`, the two builders that had no node-level proof
   anywhere in the suite. Every assertion reads a *confirmed* transaction or the node's own
-  UTXO set (`scantxoutset`), never the builder's return value. 15 passed, 1 xfailed.
+  UTXO set (`scantxoutset`), never the builder's return value. 17 passed.
 
   Proven: an ordinary send with change lands the requested amount and returns the rest;
   **the change output is spendable** (re-spent by a second builder call and confirmed — the
@@ -149,11 +218,39 @@ both.
   re-signed outputs exceeding inputs → `16: bad-txns-in-belowout`; a stranger's key over the
   wallet's coin →
   `16: mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY operation)`;
-  a below-floor fee → `66: min relay fee not met`.
+  and, for the fee, a hand-built transaction paying **one photon** under the floor →
+  `66: min relay fee not met`, with the *same* transaction accepted at exactly the floor.
+  Without that pair, "every wallet send is accepted" would be equally true of a node that
+  rejects nothing.
+
+  `test_every_send_pays_at_least_the_rate_it_was_built_for` was a `strict=True` xfail while
+  the defect stood; it now passes against the node and the marker is gone, joined by a
+  multi-input send/sweep regression at one and three inputs.
 
   Opt-in like the other e2e suites (`@pytest.mark.integration` + `RADIANT_REGTEST=1`), reusing
   the throwaway-container fixture from `test_htlc_regtest_e2e`. Regtest only; moves no real
   value.
+- `tests/test_mut_wave_regtest_e2e.py` — live-regtest consensus proof for the MUT and WAVE
+  reveals: the rejected pre-fix shape, the ref arithmetic read off a confirmed transaction,
+  discovery through `find_glyphs`, an NFT output spent onward, a `mod` mutation with two
+  negative controls on the covenant's binds, the signing regression above, and WAVE name
+  recovery from the confirmed envelope.
+- `tests/test_ft_transfer_regtest_e2e.py` — live-regtest consensus proof for
+  `FtUtxoSet.build_transfer_tx`: a 250-unit transfer out of a 100,000,000-unit holding
+  delivering exactly 250 (the shape of the old balance-draining sizing bug), unit conservation,
+  the recipient spending onward, the whole-balance boundary, an inflating transfer rejected by
+  consensus, and the no-RXD-funding refusal.
+
+- **`tests/test_wallet_fee_sizing.py`** — the always-on half of the same proof: 69 offline
+  tests, no docker. The invariant is asserted over 200 builds per cell across one/two/three/
+  five inputs and four fee rates, each with a *different* recipient — because signing is
+  deterministic, one hard-coded send would have passed forever while a third of real ones
+  failed. Both `HdWallet` builders are held to the same corpus. Differential cases re-run the
+  same builds with the signature headroom removed and require the builders to *refuse* — so
+  the green cases cannot go quietly vacuous if a later change neuters the headroom, and the
+  fail-closed guard is shown to be load-bearing on its own. Also pins the anti-drift bindings
+  (`DEFAULT_FEE_RATE`, `glyph.ft.MIN_FEE_RATE` and `gravity.fee_policy`'s constants are all the
+  same object as `pyrxd.fee_sizing`'s) and the bound on `build_send_max_tx`'s payout give-up.
 
 ## [0.15.0] — 2026-08-11
 

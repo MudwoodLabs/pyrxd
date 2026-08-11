@@ -23,6 +23,7 @@ functions, and exceptions.
    crypto
    curve
    fee_models
+   fee_sizing
    btc_wallet
    devnet
    cli

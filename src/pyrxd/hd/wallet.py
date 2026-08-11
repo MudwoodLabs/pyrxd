@@ -54,6 +54,7 @@ from typing import TYPE_CHECKING
 
 from Cryptodome.Cipher import AES
 
+from ..fee_sizing import assert_tx_pays_for_itself, required_fee, trial_size_with_slack
 from ..hd.bip32 import Xprv, Xpub, ckd, master_xprv_from_seed
 from ..hd.bip39 import seed_from_mnemonic
 from ..hd.descriptor import AccountDescriptors, account_descriptors
@@ -1124,8 +1125,11 @@ class HdWallet:
         ]
         trial_tx = Transaction(tx_inputs=inputs, tx_outputs=trial_outputs)
         trial_tx.sign()
-        trial_size = trial_tx.byte_length()
-        fee = trial_size * fee_rate
+        # Pad by the most a signature can grow between the trial and final passes —
+        # they sign different messages, so their DER lengths differ. See
+        # :mod:`pyrxd.fee_sizing`; without this the fee pays for the TRIAL bytes.
+        trial_size = trial_size_with_slack(trial_tx.byte_length(), len(inputs))
+        fee = required_fee(trial_size, fee_rate)
 
         if total_in < photons + fee:
             raise ValidationError("Insufficient funds after fee")
@@ -1143,6 +1147,11 @@ class HdWallet:
 
         final_tx = Transaction(tx_inputs=inputs, tx_outputs=final_outputs)
         final_tx.sign()
+        # Prove the headroom was enough rather than trust it. Dropping the change
+        # output makes the transaction smaller than the fee paid for — safe — but
+        # a longer final signature makes it larger, which is not, and cannot be
+        # fee-bumped on Radiant. Fail closed.
+        assert_tx_pays_for_itself(final_tx, fee_rate, what="HdWallet.build_send_tx", error_type=ValidationError)
         return final_tx
 
     def build_send_max_tx(
@@ -1172,8 +1181,8 @@ class HdWallet:
             tx_outputs=[TransactionOutput(recipient_script, total_in - DUST_THRESHOLD)],
         )
         trial_tx.sign()
-        size = trial_tx.byte_length()
-        fee = size * fee_rate
+        size = trial_size_with_slack(trial_tx.byte_length(), len(inputs))
+        fee = required_fee(size, fee_rate)
         out_value = total_in - fee
         if out_value < DUST_THRESHOLD:
             raise ValidationError("Insufficient funds to cover fee")
@@ -1186,6 +1195,10 @@ class HdWallet:
             tx_outputs=[TransactionOutput(recipient_script, out_value)],
         )
         final_tx.sign()
+        # A sweep has no change output, so the headroom comes out of the payout —
+        # decided once, up front, never shaved after signing. See
+        # :meth:`RxdWallet.build_send_max_tx` for why that is the right trade here.
+        assert_tx_pays_for_itself(final_tx, fee_rate, what="HdWallet.build_send_max_tx", error_type=ValidationError)
         return final_tx
 
     async def send(

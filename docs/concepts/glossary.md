@@ -299,7 +299,10 @@ those for depth; use this page to look something up mid-task.
 - **MUT** — a Glyph protocol type (`GlyphProtocol.MUT = 5`, `glyph/types.py`)
   marking a mutable contract: metadata that can be rotated (`mod`) or whose
   issuance rights can be transferred (`sl`) without changing the
-  `contract_id`. Full builder: `prepare_mutable_reveal`.
+  `contract_id`. Full builder: `prepare_mutable_reveal`. Its reveal takes
+  **two inputs** — the commit outpoint and a seed outpoint one vout along —
+  because the contract's singleton ref must differ from the token's and the
+  contract itself derives the token ref as `mutable_ref.vout - 1`.
 
 ## N
 

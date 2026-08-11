@@ -169,6 +169,15 @@ allow the issuer to update the metadata (`mod` operation) or
 transfer issuance rights (`sl` operation) without changing the
 contract id.
 
+**Its ref is the token's ref plus one.** The contract carries
+`commit_txid:(commit_vout + 1)` while the token carries
+`commit_txid:commit_vout`, and they must differ: two outputs may
+not claim the same ref under `OP_PUSHINPUTREFSINGLETON`. The `+ 1`
+is not a convention — the contract's own body recomputes the token
+ref by subtracting one from its vout, so the reveal has to fund a
+second commit outpoint and spend it. Proven against a node in
+`tests/test_mut_wave_regtest_e2e.py`.
+
 ### `commit-ft` / `commit-nft` — deploy-time commits
 
 **Not a separate token output.** These are anchor outputs in the

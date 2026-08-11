@@ -52,6 +52,7 @@ from dataclasses import dataclass
 
 import click
 
+from ..fee_sizing import SIG_SIZE_SLACK_BYTES, fee_never_below_relay_floor
 from ..glyph.types import GlyphRef
 from ..gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY
 from ..keys import PrivateKey
@@ -106,20 +107,20 @@ _TX_BASE_BYTES = 10  # version 4 + locktime 4 + the two count varints
 _TX_PER_INPUT_BYTES = 150  # signed P2PKH input; measured 148 B
 _TX_PER_OUTPUT_BYTES = 90  # covers a Glyph FT output (measured 84 B); a P2PKH output is 34 B
 # Trial and final passes sign DIFFERENT messages, so their DER signatures can differ in
-# length by up to 3 bytes per input — both `r` and `s` can shed a leading zero at once.
-# Measured and reasoned in :data:`pyrxd.glyph.ft._SIG_SIZE_SLACK_BYTES`; mirrored here
-# because at the relay floor those bytes are the difference between relayed and stuck.
-_SIG_SIZE_SLACK_BYTES = 3
+# length. Bound to the one definition in :mod:`pyrxd.fee_sizing` — it used to be
+# mirrored here as a literal, which is exactly how a rule with three copies drifts.
+_SIG_SIZE_SLACK_BYTES = SIG_SIZE_SLACK_BYTES
 # Bound on the measure-and-rebuild loop: a larger fee can pull in another funding input,
 # which grows the transaction, which raises the fee again. Converges in 1-2 passes in
 # practice; the bound turns a pathological wallet into a clean error, not a hang.
 _FEE_SIZING_PASSES = 4
 _MAX_FUNDING_INPUTS = 8
 
-# The relay floor is BOUND to :mod:`pyrxd.gravity.fee_policy` rather than restated, so
-# the swap CLI, the glyph builders and the HTLC stack cannot drift apart on what the
-# node actually demands (``ceil(size × effective_minrelaytxfee / 1000)``, sized against
-# ``tx.GetTotalSize()`` — the full serialized size, not vsize).
+# The relay floor is BOUND to :mod:`pyrxd.fee_sizing` (which ``gravity.fee_policy``
+# re-exports) rather than restated, so the swap CLI, the glyph builders, the plain-RXD
+# wallets and the HTLC stack cannot drift apart on what the node actually demands
+# (``ceil(size × effective_minrelaytxfee / 1000)``, sized against ``tx.GetTotalSize()``
+# — the full serialized size, not vsize).
 _RELAY_POLICY = DEFAULT_RADIANT_DEADLINE_FEE_POLICY
 
 
@@ -206,8 +207,13 @@ def _fee_for_size(ctx: CliContext, size_bytes: int) -> int:
     built outside :func:`pyrxd.cli.config.load` (tests, embedders) can carry a rate
     that never went through ``validated_fee_rate``, and an unrelayable swap
     transaction cannot be repaired on Radiant.
+
+    That no-opt-out variant is :func:`pyrxd.fee_sizing.fee_never_below_relay_floor` —
+    used here rather than :func:`~pyrxd.fee_sizing.required_fee`, which treats a
+    sub-floor rate as a caller's deliberate regtest choice. The distinction is the
+    trust boundary: a wallet's ``fee_rate`` is an argument, ``ctx.fee_rate`` is config.
     """
-    return max(ctx.fee_rate * size_bytes, _RELAY_POLICY.min_relay_fee(size_bytes))
+    return fee_never_below_relay_floor(size_bytes, ctx.fee_rate)
 
 
 def _seed_fee(ctx: CliContext, n_inputs: int, n_outputs: int, extra_bytes: int) -> int:
