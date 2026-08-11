@@ -45,6 +45,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from pyrxd.constants import (
+    SEQUENCE_LOCKTIME_GRANULARITY,
+    SEQUENCE_LOCKTIME_MASK,
+    SEQUENCE_LOCKTIME_TYPE_FLAG,
+)
 from pyrxd.fee_sizing import bitcoin_virtual_size
 from pyrxd.security.errors import ValidationError
 
@@ -217,11 +222,13 @@ class TimeUnit(Enum):
     SECONDS = "seconds"
 
 
-# BIP68 relative-timelock encoding constants.
-_BIP68_SEQUENCE_LOCKTIME_DISABLE_FLAG = 1 << 31
-_BIP68_SEQUENCE_LOCKTIME_TYPE_FLAG = 1 << 22  # set => seconds (512s granularity)
-_BIP68_SEQUENCE_LOCKTIME_MASK = 0x0000FFFF
-_BIP68_SECONDS_GRANULARITY = 512
+# BIP68 relative-timelock encoding constants come from :mod:`pyrxd.constants`,
+# which derives them from Radiant Core's ``CTxIn`` and pins them to the vendored
+# header. BIP68 is chain-agnostic — Bitcoin and Radiant use identical values —
+# so the BTC leg and the RXD leg of a cross-chain swap now share one definition
+# and cannot drift apart. This module previously carried its own copy of the
+# same three numbers.
+_BIP68_SECONDS_GRANULARITY = 1 << SEQUENCE_LOCKTIME_GRANULARITY  # 512s per time unit
 
 
 @dataclass(frozen=True)
@@ -238,11 +245,11 @@ class Timelock:
             raise ValidationError("Timelock.value must be >= 0")
         if not isinstance(self.unit, TimeUnit):
             raise ValidationError("Timelock.unit must be a TimeUnit")
-        if self.unit is TimeUnit.BLOCKS and self.value > _BIP68_SEQUENCE_LOCKTIME_MASK:
-            raise ValidationError(f"Timelock blocks must fit in 16 bits (<= {_BIP68_SEQUENCE_LOCKTIME_MASK})")
+        if self.unit is TimeUnit.BLOCKS and self.value > SEQUENCE_LOCKTIME_MASK:
+            raise ValidationError(f"Timelock blocks must fit in 16 bits (<= {SEQUENCE_LOCKTIME_MASK})")
         if self.unit is TimeUnit.SECONDS:
             units = self.value // _BIP68_SECONDS_GRANULARITY
-            if units > _BIP68_SEQUENCE_LOCKTIME_MASK:
+            if units > SEQUENCE_LOCKTIME_MASK:
                 raise ValidationError("Timelock seconds too large to encode in BIP68 nSequence")
 
     def csv_script_operand(self) -> int:
@@ -257,9 +264,9 @@ class Timelock:
     def to_nsequence(self) -> int:
         """Encode this relative timelock as a BIP68 nSequence value."""
         if self.unit is TimeUnit.BLOCKS:
-            return self.value & _BIP68_SEQUENCE_LOCKTIME_MASK
+            return self.value & SEQUENCE_LOCKTIME_MASK
         units = self.value // _BIP68_SECONDS_GRANULARITY
-        return _BIP68_SEQUENCE_LOCKTIME_TYPE_FLAG | (units & _BIP68_SEQUENCE_LOCKTIME_MASK)
+        return SEQUENCE_LOCKTIME_TYPE_FLAG | (units & SEQUENCE_LOCKTIME_MASK)
 
     def normalize_to(self, unit: TimeUnit, *, block_interval_s: float) -> Timelock:
         """Return an equivalent ``Timelock`` in ``unit``.

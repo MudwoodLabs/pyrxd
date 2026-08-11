@@ -16,6 +16,57 @@ BIP44_DERIVATION_PATH = os.getenv("RXD_PY_SDK_BIP44_DERIVATION_PATH") or "m/44'/
 HTTP_REQUEST_TIMEOUT: int = int(os.getenv("RXD_PY_SDK_HTTP_REQUEST_TIMEOUT") or 30)
 THREAD_POOL_MAX_EXECUTORS: int = int(os.getenv("RXD_PY_SDK_THREAD_POOL_MAX_EXECUTORS") or 10)
 
+# ---------------------------------------------------------------------------
+# BIP68 relative time-lock (nSequence) encoding
+# ---------------------------------------------------------------------------
+# The five constants ``CTxIn`` declares in Radiant Core's
+# ``src/primitives/transaction.h`` (lines 119-149), consumed by
+# ``GenericTransactionSignatureChecker::CheckSequence`` in
+# ``src/script/interpreter.cpp``. ``tests/test_consensus_parser_strictness.py``
+# re-derives all five by parsing the vendored copy of that header, so they
+# cannot drift from upstream unnoticed.
+#
+# They live here rather than in the two modules that need them because they had
+# been spelled out twice — once in ``script/timelock.py`` (Radiant CSV locking
+# scripts) and once in ``btc_wallet/taproot.py`` (the BTC leg) — plus a third
+# time inline in a test. BIP68 is chain-agnostic: Bitcoin and Radiant use
+# identical values, so one definition serves both legs of a cross-chain swap
+# and removes the possibility of the two legs disagreeing.
+#
+# Why this matters more than it looks: CSV maturity governs HTLC refunds, and
+# Radiant supports neither RBF nor CPFP. A refund transaction that misjudges
+# maturity by a single block cannot be repaired — it can only be discarded and
+# rebuilt, by which time the counterparty's claim window may already be open.
+
+#: ``nSequence`` value that disables ``nLockTime`` for the whole transaction.
+SEQUENCE_FINAL: int = 0xFFFFFFFF
+
+#: Bit 31. Set on an input's ``nSequence`` means "not a relative lock-time" —
+#: ``CheckSequence`` returns false immediately, so the CSV in the script is
+#: satisfied by nothing and the branch is simply unspendable via that path.
+SEQUENCE_LOCKTIME_DISABLE_FLAG: int = 1 << 31
+
+#: Bit 22. Clear = the count is in blocks; set = the count is in 512-second
+#: units. Reading a block count as a time count (or the reverse) is a 512x
+#: error in the direction that matters.
+SEQUENCE_LOCKTIME_TYPE_FLAG: int = 1 << 22
+
+#: The low 16 bits, which hold the unit count itself.
+SEQUENCE_LOCKTIME_MASK: int = 0x0000FFFF
+
+#: Shift, not seconds: time-based units are ``1 << 9`` = 512 seconds each.
+#: Upstream stores the shift, so storing 512 under this name would be a 2**9
+#: error waiting for the first caller that used it as a shift.
+SEQUENCE_LOCKTIME_GRANULARITY: int = 9
+
+#: Everything ``CheckSequence`` compares. Bits outside this mask carry no
+#: consensus meaning and are stripped from both sides before the comparison.
+SEQUENCE_LOCKTIME_CONSENSUS_MASK: int = SEQUENCE_LOCKTIME_TYPE_FLAG | SEQUENCE_LOCKTIME_MASK
+
+#: BIP68 rules only engage at transaction version 2 or above; below it
+#: ``CheckSequence`` returns false regardless of the sequence value.
+BIP68_MIN_TX_VERSION: int = 2
+
 
 class Network(str, Enum):
     MAINNET = "mainnet"

@@ -3,7 +3,7 @@
     "Provenance for the vendored Radiant Core consensus sources used as the",
     "differential oracle in tests/test_consensus_opcode_parity.py.",
     "Regenerate with: python scripts/refresh_radiant_core_vendor.py",
-    "Do NOT hand-edit the .h/.cpp files — they are verbatim upstream copies and",
+    "Do NOT hand-edit the .h/.cpp files \u2014 they are verbatim upstream copies and",
     "the sha256 below is asserted by the test suite."
   ],
   "repo": "Radiant-Core/Radiant-Core",
@@ -20,6 +20,30 @@
     "script.cpp": {
       "upstream_path": "src/script/script.cpp",
       "sha256": "759ab52423cbdff91fdfa2429d87327d7fcffa8380c52169cdd0fac70cd8f91e"
+    },
+    "primitives_transaction.h": {
+      "upstream_path": "src/primitives/transaction.h",
+      "sha256": "5c2157e689434f684224c0aa222c7bee168be2e44e8e8f0c3f17599887ab1291"
+    },
+    "interpreter.cpp": {
+      "upstream_path": "src/script/interpreter.cpp",
+      "sha256": "86d663c5eff9e399ea44437abf1be09dca95666a6957fcd5d989ce7367fa35c6"
+    },
+    "sigencoding.cpp": {
+      "upstream_path": "src/script/sigencoding.cpp",
+      "sha256": "ac309f8db47890bf62cf043ff121cb8a8ee0c70e4125c3501163198cdaea629f"
+    },
+    "script_flags.h": {
+      "upstream_path": "src/script/script_flags.h",
+      "sha256": "cfecd8071d0196c5dc27b646d780d2c1cca938b80564313689b6ab6abe21f0ad"
+    },
+    "policy.h": {
+      "upstream_path": "src/policy/policy.h",
+      "sha256": "589eaf7fe58f872713b029e6ed61337bee8e042c8d0b7ceb6cd1aac41b0e966c"
+    },
+    "validation.cpp": {
+      "upstream_path": "src/validation.cpp",
+      "sha256": "c10f1c4beffd8b976a48c879415b5f58056f43550491d5be5440929e43a05c6e"
     }
   }
 }

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 
+from pyrxd.hash import hash160 as _hash160
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
@@ -24,7 +25,20 @@ def hash256(data: bytes) -> bytes:
 
 
 def hash160(data: bytes) -> bytes:
-    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()
+    """RIPEMD160(SHA256(data)).
+
+    Delegates to :func:`pyrxd.hash.hash160`, which exists precisely to survive
+    an OpenSSL 3 build with the legacy provider unloaded — the default on
+    Ubuntu 24.04, Debian 12, the python.org macOS installer, and Pyodide/WASM.
+    This called ``hashlib.new("ripemd160", ...)`` directly, walking past that
+    fallback and raising ``ValueError`` on every such host. Not reproducible on
+    a machine whose OpenSSL still exposes RIPEMD160, so it is a portability
+    defect rather than a live one — but the value it feeds
+    (``expectedClaimedCodeHash``) is what a Gravity covenant checks on chain,
+    so the failure mode is "cannot build or verify an offer at all" on those
+    platforms.
+    """
+    return _hash160(data)
 
 
 def compute_p2sh_script_pubkey(redeem_script: bytes) -> bytes:

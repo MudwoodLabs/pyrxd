@@ -64,6 +64,12 @@ import os
 import sys
 import time
 
+# hash160 from the SDK, not hashlib.new("ripemd160", ...): OpenSSL 3 ships
+# RIPEMD160 in the legacy provider and leaves it unloaded on most current
+# distros, where the direct call raises. pyrxd.hash falls back to a verified
+# pure-Python implementation.
+from pyrxd.hash import hash160
+
 # ─────────────────────────────────────────────────────────────
 # Configuration
 # ─────────────────────────────────────────────────────────────
@@ -156,7 +162,7 @@ async def phase_1_key_derivation():
     maker_rxd_wif = None  # clear from local scope immediately
     raw = pk.unsafe_raw_bytes()
     pub = coincurve.PrivateKey(raw).public_key.format(compressed=True)
-    pkh = hashlib.new("ripemd160", hashlib.sha256(pub).digest()).digest()
+    pkh = hash160(pub)
     addr = base58check_encode(b"\x00" + pkh)
 
     _ok(f"WIF -> PKH: {pkh.hex()}")
@@ -391,7 +397,7 @@ async def phase_4_gravity_tx_builders(pk, pkh, chain_anchor, anchor_height):
         pk = PrivateKeyMaterial.generate()
         raw = pk.unsafe_raw_bytes()
         pub = coincurve.PrivateKey(raw).public_key.format(compressed=True)
-        pkh = hashlib.new("ripemd160", hashlib.sha256(pub).digest()).digest()
+        pkh = hash160(pub)
 
     # Maker's compressed public key (needed for covenant constructor)
     maker_raw = pk.unsafe_raw_bytes()
@@ -401,7 +407,7 @@ async def phase_4_gravity_tx_builders(pk, pkh, chain_anchor, anchor_height):
     taker_rxd = PrivateKeyMaterial.generate()
     taker_raw = taker_rxd.unsafe_raw_bytes()
     taker_pub = coincurve.PrivateKey(taker_raw).public_key.format(compressed=True)
-    taker_pkh = hashlib.new("ripemd160", hashlib.sha256(taker_pub).digest()).digest()
+    taker_pkh = hash160(taker_pub)
 
     # BTC testnet keypair for Taker
     taker_btc = generate_keypair(network="tb")
@@ -547,7 +553,7 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
 
         maker_raw = pk_live.unsafe_raw_bytes()
         maker_pub_live = _cc.PrivateKey(maker_raw).public_key.format(compressed=True)
-        maker_pkh_live = _hl.new("ripemd160", _hl.sha256(maker_pub_live).digest()).digest()
+        maker_pkh_live = hash160(maker_pub_live)
         maker_btc = _gkp(network="bc")  # Maker's own BTC mainnet keypair for self-trade
 
         # Radiant min relay fee is 10,000 photons/byte. A MakerOffer tx is ~190 bytes,

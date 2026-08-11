@@ -1,6 +1,6 @@
 # Vendored Radiant Core consensus sources
 
-Verbatim, unmodified copies of two files from
+Verbatim, unmodified copies of a handful of files from
 [Radiant-Core/Radiant-Core](https://github.com/Radiant-Core/Radiant-Core), pinned at the tag and
 commit recorded in `MANIFEST.json`. They are **test fixtures**, never imported or compiled — the
 test suite parses them as text to derive consensus facts.
@@ -24,9 +24,20 @@ files**, not by trusting a Python transcription of them:
 | `MAX_OPCODE` | `FIRST_UNDEFINED_OP_VALUE - 1` in `script.h` |
 | which opcodes carry a 36-byte immediate operand | the `GetScriptOp` operand branch in `script.cpp` |
 | which of those land in an output's push-ref set | the `GetPushRefs` `foundPushRefs.insert` calls in `script.cpp` |
+| when a script walk must fail rather than clamp | the `return false` guards in `GetScriptOp`, `script.cpp` |
+| BIP68 `SEQUENCE_LOCKTIME_*` values | `class CTxIn` in `primitives_transaction.h` |
+| how CSV consumes them (disable bit, mask, min tx version) | `CheckSequence` in `interpreter.cpp` |
+| `SCRIPT_VERIFY_*` bit values | the flag enum in `script_flags.h` |
+| which flags are mandatory vs standard | `MANDATORY_/STANDARD_SCRIPT_VERIFY_FLAGS` in `policy.h` |
+| which flags a **block** is connected under, and `fRequireStandard` | `GetNextBlockScriptFlags` in `validation.cpp` |
+| DER signature size bounds and the flags gating strict-DER / low-S | `IsValidDERSignatureEncoding` and its callers in `sigencoding.cpp` |
 
 A hand-maintained Python table of the same facts would reintroduce exactly the transcription step
 that produced the bugs.
+
+Local filenames match upstream basenames except `primitives_transaction.h`, which is
+`src/primitives/transaction.h` renamed so it cannot be confused with a pyrxd module; `MANIFEST.json`
+records every `upstream_path` verbatim.
 
 ## Vendored, not fetched at test time
 

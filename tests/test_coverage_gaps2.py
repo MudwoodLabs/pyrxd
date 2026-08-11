@@ -241,12 +241,17 @@ class TestScript:
         assert isinstance(varint, bytes)
         assert varint[0] == 10
 
+    # `01 02 03` is not a walkable script — the 0x03 at the end declares a
+    # 3-byte push with nothing behind it — so it now needs the same
+    # allow_malformed as any other chain blob. `01 02 51` (push one byte,
+    # then OP_1) is the same length and does parse; both are used below so the
+    # size aliases are exercised on a real script, not only on a rejected one.
     def test_size_alias(self):
-        s = Script(b"\x01\x02\x03")
+        s = Script(b"\x01\x02\x51")
         assert s.size() == 3
 
     def test_size_varint_alias(self):
-        s = Script(b"\x01\x02\x03")
+        s = Script(b"\x01\x02\x03", allow_malformed=True)
         assert s.size_varint() == s.byte_length_varint()
 
     def test_is_push_only_true(self):
