@@ -7,7 +7,8 @@ _Written 2026-06-07; committed (sanitized for the public repo) 2026-06-11. Synth
 **Status delta (refreshed 2026-06-12):** Tier 0.1 done (#175 + the FT↔ETH swap PR merged); Tier 0.3
 (#44) has per-repo hardening PRs open across the four public repos. **Tier 1 shipped** — the dev
 on-ramp (#185) plus the committed regtest Dockerfile, `pyrxd regtest setup`, the CI North-Star
-`quickstart` job, the testnet how-to, and the Radiant-Core v3.1.1 bump with measured consensus
+quickstart gate (now the `regtest-core` job in `.github/workflows/integration.yml`, which also
+runs the rest of the node-backed lane), the testnet how-to, and the Radiant-Core v3.1.1 bump with measured consensus
 revalidation (#195). **Tier 2:** 2.1 cross-chain swap packaged as a library primitive (#196);
 2.2 was already shipped (#123/#177); 2.3 Base as an EVM counter-chain in review (#198); 2.4
 covenant building-block docs land with this change. Tier 3: 3.2/#158 and 3.3/#109 shipped;

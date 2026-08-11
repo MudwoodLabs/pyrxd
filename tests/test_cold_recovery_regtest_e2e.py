@@ -136,16 +136,16 @@ def _chain_state(rt: _RegtestNode, txid: str, vout: int = 0) -> sr.CovenantChain
 def _node_policy(rt: _RegtestNode) -> DeadlineFeePolicy:
     """A fee policy at the rate THIS node advertises, not a hardcoded default.
 
-    ``effective_minrelaytxfee`` is node policy and it moves — the reference mainnet node
-    reports 0.10 RXD/kB, this regtest build reports 0.01. Reading it is the only way the
-    boundary case below can claim to be measuring the node's real floor.
+    ``effective_minrelaytxfee`` is node policy and it moves: the shared harness starts
+    this node at MAINNET's 0.10 RXD/kB, a default ``radiantd -regtest`` would report a
+    tenth of that, and an operator can set anything. Reading it is the only way the
+    boundary case below can claim to be measuring the node's real floor rather than a
+    constant that happens to agree with it today.
     """
     rate = photons_per_kb_from_rxd_per_kb(float(rt.cli("getmempoolinfo")["effective_minrelaytxfee"]))
-    # `allow_below_protocol_floor` because that reading IS below the protocol floor:
-    # `protocol_floor_per_kb` now defaults to the EFFECTIVE mainnet rate (it used to
-    # default to the legacy one, which was 10x too low to bound anything), and a
-    # default regtest node advertises a tenth of it. Pointing at a node that really
-    # relays this low is exactly what the escape hatch is for.
+    # `allow_below_protocol_floor` so this helper keeps working if it is ever pointed at
+    # a node relaying BELOW the protocol floor — which is what a default regtest node
+    # does. It is a no-op against the mainnet-floor node the harness starts.
     return DeadlineFeePolicy(relay_fee_per_kb=rate, allow_below_protocol_floor=True)
 
 

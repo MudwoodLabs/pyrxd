@@ -70,46 +70,12 @@ jobs:
         if: matrix.python-version == '3.12'
         run: poetry run check-manifest
 
-  quickstart:
-    # Tier-1 North Star gate: a fresh dev goes from `pip install` to a minted Glyph
-    # token on a local regtest chain. This job builds the regtest image from the
-    # official Radiant-Core release (the same Dockerfile `pyrxd regtest setup` uses)
-    # and runs that exact path + the RXD covenant consensus suites, so the quickstart
-    # and the covenant validation can't silently rot between releases. Kept separate
-    # from `test` so the fast unit gate stays fast (this one builds a docker image).
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
-        with:
-          python-version: "3.12"
-      - name: Build the regtest node image (official Radiant-Core release binary)
-        run: |
-          docker build -f docker/regtest.Dockerfile \
-            --build-arg RADIANT_VERSION=v3.1.1 \
-            -t radiant-core:v3.1.1-amd64 .
-      - name: Install Poetry
-        run: pip install -r ci/poetry-pin.txt --require-hashes
-      - name: Install dependencies
-        run: poetry install --sync --no-interaction
-      - name: North Star — pip→regtest up→mint a Glyph→assert confirmed
-        run: |
-          set -euo pipefail
-          poetry run pyrxd regtest up --fresh
-          poetry run python examples/regtest_quickstart.py | tee /tmp/quickstart.out
-          grep -q "NFT minted on regtest" /tmp/quickstart.out
-          poetry run pyrxd regtest down
-      - name: RXD covenant spend under consensus on the pinned node
-        env:
-          RADIANT_REGTEST: "1"
-        # The covenant spend paths (HTLC + soulbound) validated against the real
-        # node's script interpreter — this is the gate that catches a Radiant-Core
-        # bump breaking covenant validation. The exhaustive nBits/bin2num
-        # differential matrix (test_spv_covenant_differential_regtest.py) is
-        # deliberately NOT run here: it needs pre-ground pure-Python PoW chains
-        # (tests/_regtest_grind_chains.py), the multi-minute cost PR #140 removed
-        # from CI on purpose. Run that matrix locally before a version bump.
-        run: |
-          poetry run pytest -o "addopts=" -m integration \
-            tests/test_htlc_regtest_e2e.py \
-            tests/test_soulbound_covenant_regtest.py
+  # The `quickstart` job that used to live here — build the regtest image, run the
+  # Tier-1 North Star, then `-m integration` on exactly two files — moved to
+  # `.github/workflows/integration.yml`.
+  #
+  # Two files was 2 of ~30 integration modules, and the other 28 were one-shot manual
+  # and rotting (see that file's header). Growing the list inside `ci.yml` would have
+  # meant node-backed work on every docs-only push, so the node lane got its own
+  # workflow: path-filtered on the per-push half, and a nightly matrix for the slow and
+  # multi-chain suites. Neither is a required check; `test (3.12)` and `lint` still are.

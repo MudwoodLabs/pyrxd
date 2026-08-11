@@ -78,8 +78,11 @@ _NBITS = b"\xff\xff\x7f\x1d"
 _PHOTONS_OFFERED = 10_000_000  # 0.1 RXD locked in the MakerOffer P2SH
 _FUNDING = 60_000_000  # 0.6 RXD of plain P2PKH the Maker spends
 #: Comfortably above this node's relay floor for a ~190-byte offer tx and a ~283-byte
-#: claim. The floor itself is the subject of its own case below.
-_FEE = 1_000_000
+#: claim. The node runs at MAINNET's floor (10 000 photons/byte), so a 500-byte
+#: transaction needs 5 000 000 and this covers every transaction the suite builds. The
+#: floor itself is the subject of its own case below, which derives its numbers from
+#: ``_node_relay_rate`` rather than from this constant.
+_FEE = 5_000_000
 
 
 class _Party:
@@ -188,8 +191,10 @@ class TestMakerOfferOnConsensus:
             funding_photons=result.output_photons,
             fee_sats=_FEE,
             taker_privkey=taker.material,
-            # `_FEE` is sized for THIS node (a tenth of the mainnet floor); the guard
-            # defaults to mainnet's, so it has to be told which node it is judging.
+            # Judge the fee against THIS node's advertised floor rather than the
+            # builder's compiled-in default. They agree today (the harness starts the
+            # node at the mainnet floor), and that is the point: the node is the
+            # oracle for its own policy, so the case still holds if either moves.
             fee_policy=_node_policy(node),
         )
         res = node.accepts(claim.tx_hex)
@@ -271,8 +276,10 @@ class TestMakerOfferOnConsensus:
             funding_photons=result.output_photons,
             fee_sats=_FEE,
             taker_privkey=taker.material,
-            # `_FEE` is sized for THIS node (a tenth of the mainnet floor); the guard
-            # defaults to mainnet's, so it has to be told which node it is judging.
+            # Judge the fee against THIS node's advertised floor rather than the
+            # builder's compiled-in default. They agree today (the harness starts the
+            # node at the mainnet floor), and that is the point: the node is the
+            # oracle for its own policy, so the case still holds if either moves.
             fee_policy=_node_policy(node),
         )
         assert node.accepts(good.tx_hex).get("allowed") is True

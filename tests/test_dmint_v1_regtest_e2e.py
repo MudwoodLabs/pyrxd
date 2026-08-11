@@ -83,6 +83,16 @@ _CARRIER = 1  # contract singleton carrier — the covenant HARDCODES vout0 valu
 _FUNDING = 50_000_000  # 0.5 RXD plain coin to fund the mint (reward + fee + change)
 _OP_RETURN = b"r2w"  # forces the 4-output shape the V1 mint preimage requires
 
+# --- plumbing values -----------------------------------------------------------------
+# The node runs at MAINNET's relay floor (10 000 photons/byte), so every hand-built
+# transaction below has to carry a real fee: `_RELAY_FEE_SATS` is 0.2 RXD, and both the
+# seed and the two commit outputs have to be large enough to pay it and still leave a
+# non-dust change. These are photon amounts on a throwaway chain; only `_CARRIER` is
+# load-bearing (the covenant hardcodes vout0 == 1).
+_SEED = 200_000_000  # 2 RXD funding the commit tx
+_COMMIT0 = 30_000_000  # FT-commit hashlock output -> tokenRef
+_COMMIT1 = 20_000_000  # ref-seed output -> contractRef genesis
+
 
 def _p2pkh(pkh: object) -> bytes:
     return b"\x76\xa9\x14" + bytes(pkh) + b"\x88\xac"
@@ -136,17 +146,17 @@ def _deploy_v1_dmint(node: _RegtestNode, owner: PrivateKey) -> DmintContractUtxo
     commit_script = deploy.commit_result.commit_script
 
     # --- commit tx: fund owner, then 3 outputs (FT-commit | ref-seed | change) ---
-    seed_txid = _pay_to_spk(node, owner_spk, 10_000_000)  # owner-controlled coin at vout 0
-    _commit0, _commit1 = 2_000_000, 1_000_000
+    seed_txid = _pay_to_spk(node, owner_spk, _SEED)  # owner-controlled coin at vout 0
+    _commit0, _commit1 = _COMMIT0, _COMMIT1
     cin = TransactionInput(
-        source_transaction=_src(seed_txid, 0, owner_spk, 10_000_000),
+        source_transaction=_src(seed_txid, 0, owner_spk, _SEED),
         source_txid=seed_txid,
         source_output_index=0,
         unlocking_script_template=_p2pkh_unlock(owner),
     )
-    cin.satoshis = 10_000_000
+    cin.satoshis = _SEED
     cin.locking_script = Script(owner_spk)
-    commit_change = 10_000_000 - _commit0 - _commit1 - _RELAY_FEE_SATS
+    commit_change = _SEED - _commit0 - _commit1 - _RELAY_FEE_SATS
     commit_tx = Transaction(
         tx_inputs=[cin],
         tx_outputs=[

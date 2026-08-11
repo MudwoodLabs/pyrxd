@@ -13,8 +13,16 @@ only way to pin behaviour that depends on the compiled script interpreter:
                0x20 while Python's ``Nbits`` rejects > 0x1d. Un-skips
                ``test_header_nbits_exponent_ceiling_divergence_needs_regtest``.
   * Group M  — 20-level merkle walk + sentinel (0x02) NO-OP handling.
-  * Group S  — baseline (S-1), multi-output finalize introspection arity (S-2), and
-               the compile-time ``claimDeadline`` floor 1774427796 (S-3).
+  * Group S  — baseline (S-1), multi-output finalize introspection arity (S-2), the
+               compile-time ``claimDeadline`` floor 1774427796 (S-3), and
+               ``build_finalize_tx``'s relay-fee guard measured against the node's own
+               floor (S-4).
+
+S-4 is here rather than in the offline suite for a structural reason. The fee guard's
+transaction has to satisfy the MakerClaimed covenant's committed ``btcChainAnchor``, and
+a faked proof is refused at the script level — a verdict that says nothing about the fee.
+This file is the only place that grinds a real anchored chain the deployed covenant
+accepts (S-1), so it is the only place the fee question can be put to consensus.
 
 Direction labels (per the differential test):
   A = Python ACCEPTS / covenant REJECTS  -> taker strands BTC on the no-refund
@@ -62,11 +70,13 @@ from test_spv_covenant_differential_deployed import (
     _vi,
 )
 
+from pyrxd.fee_sizing import relay_floor_photons_per_byte
 from pyrxd.gravity.codehash import compute_p2sh_code_hash, compute_p2sh_script_pubkey
 from pyrxd.gravity.covenant import CovenantArtifact, build_gravity_offer
+from pyrxd.gravity.fee_policy import DeadlineFeePolicy
 from pyrxd.gravity.transactions import build_finalize_tx, build_forfeit_tx
 from pyrxd.keys import PrivateKey
-from pyrxd.security.errors import ValidationError
+from pyrxd.security.errors import InsufficientFundsError, ValidationError
 from pyrxd.spv.merkle import build_branch, compute_root
 from pyrxd.spv.payment import P2WPKH
 from pyrxd.spv.pow import hash256
@@ -84,7 +94,16 @@ _BRANCH_SLOTS = 20
 _CLAIM_DEADLINE = 1_900_000_000  # year 2030; > the covenant's baked floor + now+24h
 _DEADLINE_FLOOR = 1_774_427_796  # baked covenant constant (ASM token 1: 949ec369 LE)
 _PHOTONS = 10_000_000  # 0.1 RXD locked in the MakerClaimed UTXO
-_FEE_SATS = 30_000_000  # 0.3 RXD — covers the ~12 KB finalize at the regtest relayfee
+#: 2 RXD. The finalize tx is by far the biggest transaction in the module — the 12
+#: header slots, the 20-level branch, the whole BTC payment tx and the unrolled covenant
+#: redeem script all go into one scriptSig, **11 950 bytes measured** — and the node runs
+#: at MAINNET's floor (10 000 photons/byte), so its floor alone is 119 500 000 photons.
+#: This is deliberately clear of that, so the accept/reject cases below turn on what they
+#: are testing rather than on the fee. (It was 30 000 000, sized for a node relaying at a
+#: tenth of the rate; at the real floor that is a quarter of what the transaction needs.)
+#: The fee BOUNDARY itself is S-4, which derives its numbers from the node's advertised
+#: rate and the transaction's measured size rather than from this constant.
+_FEE_SATS = 200_000_000
 
 _RESULTS_PATH = os.path.normpath(
     os.path.join(
@@ -586,3 +605,98 @@ def test_s3_forfeit_after_deadline(node: _RegtestNode):
     )
     _record("S-3_forfeit", res, direction="agreement", note="forfeit reclaim after mature deadline")
     assert res.get("allowed") is True, f"S-3 forfeit expected ACCEPT: {res.get('reject-reason')!r} | {res}"
+
+
+def test_s4_finalize_fee_floor_is_the_nodes_floor(node: _RegtestNode):
+    """S-4: ``build_finalize_tx``'s relay-floor guard, judged by the NODE, with a real proof.
+
+    The guard was offline-covered only, and for a real reason: the spend it produces has
+    to satisfy the MakerClaimed covenant's committed ``btcChainAnchor``, and a faked
+    proof is refused at the script level — a verdict that says nothing whatsoever about
+    the fee. That is why this case lives here and not in the offline suite: this file
+    already grinds an anchored 12-header PoW chain that S-1 proves the deployed covenant
+    ACCEPTS, so the same construction can carry the fee question to consensus.
+
+    Why the fee matters most on this builder: the finalize tx is the largest in the
+    module (~2.7 KB of scriptSig), so its floor is an order of magnitude above a claim's,
+    and Radiant has neither RBF nor CPFP — an under-fee'd finalize cannot be bumped and
+    squats on the MakerClaimed UTXO until mempool expiry, with the Taker's BTC already
+    spent and no refund path.
+
+    Both directions, against the rate the node itself advertises:
+
+    * exactly at the floor  → the builder returns it AND the node accepts it;
+    * one photon under      → the builder REFUSES to return it, and the transaction it
+      would have returned is refused by the node for ``min relay fee not met``.
+
+    The second half is what makes the first meaningful: without it "the node accepted
+    the finalize" would be equally true of a node that accepts anything.
+    """
+    rate = node.relay_rate()
+    assert rate == relay_floor_photons_per_byte(), (
+        f"this node advertises {rate} photons/byte; the case reasons about the mainnet floor"
+    )
+    offer = _make_offer()
+    spv = _proof(SATS)
+
+    # The finalize tx carries no signature — its scriptSig is proof data and a selector —
+    # so its size does not depend on the fee, and one build measures the floor exactly.
+    probe = build_finalize_tx(
+        spv_proof=spv,
+        claimed_redeem_hex=offer.claimed_redeem_hex,
+        funding_txid="11" * 32,
+        funding_vout=0,
+        funding_photons=offer.photons_offered + _FEE_SATS,
+        to_address=_TAKER_KEY.address(),
+        fee_sats=_FEE_SATS,
+        minimum_output_photons=offer.photons_offered,
+        header_slots=_HEADER_SLOTS,
+        branch_slots=_BRANCH_SLOTS,
+    )
+    at_floor = probe.tx_size * rate
+
+    # AT the floor: fund a carrier that leaves exactly totalPhotonsInOutput behind.
+    txid, vout, _ = _deploy(node, offer, extra=at_floor - _FEE_SATS)
+    photons = offer.photons_offered + at_floor
+    res_ok = node.accepts(_finalize(offer, spv, txid, vout, photons, fee=at_floor))
+    _record(
+        "S-4_fee_at_floor",
+        res_ok,
+        direction="agreement",
+        note=f"finalize at exactly {rate} photons/byte x {probe.tx_size} B accepted",
+    )
+    assert res_ok.get("allowed") is True, f"S-4 at-floor finalize REJECTED: {res_ok.get('reject-reason')!r} | {res_ok}"
+
+    # ONE PHOTON UNDER: the guard must refuse to hand it back at all.
+    with pytest.raises(InsufficientFundsError, match="Gravity finalize tx"):
+        _finalize(offer, spv, txid, vout, photons, fee=at_floor - 1)
+
+    # And the transaction it would have returned is refused by the node, for the fee.
+    forced = build_finalize_tx(
+        spv_proof=spv,
+        claimed_redeem_hex=offer.claimed_redeem_hex,
+        funding_txid=txid,
+        funding_vout=vout,
+        funding_photons=photons,
+        to_address=_TAKER_KEY.address(),
+        fee_sats=at_floor - 1,
+        minimum_output_photons=offer.photons_offered,
+        header_slots=_HEADER_SLOTS,
+        branch_slots=_BRANCH_SLOTS,
+        fee_policy=DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True),
+    )
+    assert forced.tx_size == probe.tx_size, "the fee changed the SIZE — the boundary moved"
+    res_short = node.accepts(forced.tx_hex)
+    _record(
+        "S-4_fee_one_photon_short",
+        res_short,
+        direction="agreement",
+        note="one photon under the node's own floor is refused by the node",
+    )
+    assert res_short.get("allowed") is False, (
+        f"node ACCEPTED a finalize one photon under its own floor "
+        f"({at_floor - 1} on {forced.tx_size} bytes at {rate}/byte): {res_short}"
+    )
+    reason = str(res_short.get("reject-reason", ""))
+    assert "min relay fee not met" in reason, f"rejected, but not for the fee: {res_short}"
+    print(f"S-4: size={probe.tx_size} floor={at_floor} one-photon-short -> {reason}")

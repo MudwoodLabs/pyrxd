@@ -1,0 +1,392 @@
+name: Integration (node-backed)
+
+# Everything in this repo that is only true once a REAL node says so.
+#
+# Why a separate workflow from ci.yml
+# -----------------------------------
+# `ci.yml` is the fast offline gate: unit tests, coverage, bandit, mypy. It runs on
+# every push and its two required checks (`test (3.12)`, `lint`) gate merges. Node-backed
+# proof is a different shape of work — it builds a docker image, starts chains, and the
+# slowest suites grind proof-of-work for tens of minutes — so it lives here, where it can
+# be path-filtered off docs-only changes and split across a cheap per-push job and a
+# nightly matrix.
+#
+# Before this file, `-m integration` ran on exactly TWO files (htlc + soulbound) inside
+# ci.yml's `quickstart` job, out of ~30 integration modules. Everything else — wallet
+# sends, FT transfer/airdrop, MUT/WAVE, containers, the maker offer, cold recovery, RSWP,
+# dMint, the builder fee floors, the whole cross-chain stack — was one-shot manual, and
+# rotted accordingly: `test_airdrop_with_an_advisory_royalty_output_is_accepted` sat
+# broken on `main` from #393 to #404 because nothing ran it.
+#
+# The split
+# ---------
+#   regtest-core  — per push/PR (path-filtered). One Radiant node image, one container
+#                   per module, the fast Radiant suites. Budget: a few minutes.
+#   nightly-*     — schedule + manual only. The slow and the multi-chain: dMint's PoW
+#                   grinds, the SPV covenant differential matrix, RSWP, bitcoind/litecoind,
+#                   and the cross-chain legs. Parallel jobs, so nightly wall-clock is the
+#                   slowest job and not their sum.
+#   vendor-freshness — `scripts/refresh_radiant_core_vendor.py --check`. Needs network, so
+#                   it is a scheduled job and deliberately NOT a pytest test (see
+#                   tests/vendor/radiant_core/README.md).
+#
+# The nodes run at MAINNET's relay floor (`-minrelaytxfee=0.10`), not the regtest default
+# of a tenth of that, and `_RegtestNode.start` asserts the node advertises it back before
+# any suite proves anything. A node at 0.01 RXD/kB cannot contradict a builder that sizes
+# fees at 0.10 — which is why `build_nft_transfer_tx` under-fee'd ~25% of NFT transfers
+# through four releases while its regtest suites passed.
+
+# The `paths` lists are duplicated verbatim rather than shared through a YAML anchor:
+# GitHub Actions does not expand anchors/aliases in workflow files. Keep them in sync.
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "scripts/**"
+      - "docker/**"
+      - "conformance/**"
+      - "pyproject.toml"
+      - "ci/poetry-pin.txt"
+      - ".github/workflows/integration.yml"
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "examples/**"
+      - "scripts/**"
+      - "docker/**"
+      - "conformance/**"
+      - "pyproject.toml"
+      - "ci/poetry-pin.txt"
+      - ".github/workflows/integration.yml"
+  schedule:
+    - cron: "17 6 * * *" # 06:17 UTC nightly
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# `github.event_name` is in the key on purpose: without it a push to `main` would share a
+# group with that night's scheduled run and cancel it, and the nightly matrix is the only
+# thing that runs the slow suites.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must equal `pyrxd.devnet.DEFAULT_RADIANT_VERSION` — `pyrxd regtest up` resolves its
+  # image tag from that constant, so a drift here means the quickstart looks for an image
+  # this workflow never built. `regtest-core` asserts the two agree.
+  RADIANT_VERSION: v3.1.1
+
+jobs:
+  # ---------------------------------------------------------------- per push
+  regtest-core:
+    name: regtest (core, per-push)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # `poetry.lock` is gitignored here (published library — deps resolve from
+      # pyproject.toml), so the key is keyed on `pyproject.toml` instead. `ci.yml` still
+      # hashes `poetry.lock`, which on a clean checkout is always absent and so always
+      # the same key — this one actually invalidates when the dependency set moves.
+      - name: Cache Poetry packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-py3.12-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-py3.12-
+      - name: The image tag this workflow builds is the one pyrxd will look for
+        run: |
+          python - <<'PY'
+          import pathlib, re, os, sys
+          src = pathlib.Path("src/pyrxd/devnet.py").read_text(encoding="utf-8")
+          pinned = re.search(r'^DEFAULT_RADIANT_VERSION\s*=\s*"([^"]+)"', src, re.M).group(1)
+          want = os.environ["RADIANT_VERSION"]
+          if pinned != want:
+              sys.exit(
+                  f"::error::workflow RADIANT_VERSION={want} but "
+                  f"pyrxd.devnet.DEFAULT_RADIANT_VERSION={pinned}; "
+                  "`pyrxd regtest up` would look for an image this job never built"
+              )
+          print(f"regtest image tag: {pinned}")
+          PY
+      - name: Build the regtest node image (official Radiant-Core release binary)
+        run: |
+          docker build -f docker/regtest.Dockerfile \
+            --build-arg RADIANT_VERSION=${RADIANT_VERSION} \
+            -t radiant-core:${RADIANT_VERSION}-amd64 .
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      # Tier-1 North Star: a fresh dev goes from `pip install` to a minted Glyph on a
+      # local regtest chain. Moved here verbatim from ci.yml's `quickstart` job.
+      - name: North Star — pip→regtest up→mint a Glyph→assert confirmed
+        run: |
+          set -euo pipefail
+          poetry run pyrxd regtest up --fresh
+          poetry run python examples/regtest_quickstart.py | tee /tmp/quickstart.out
+          grep -q "NFT minted on regtest" /tmp/quickstart.out
+          poetry run pyrxd regtest down
+      # The Radiant suites that are cheap enough to run on every push. Each module
+      # stands up its own container (the shared harness force-removes by name), so this
+      # is deliberately sequential. Measured on this runner: 78 passed, 2 skipped in
+      # 135 s; 3 m 31 s for the whole job including the image build and the quickstart.
+      # The 2 skips are the BTC half of test_remaining_builder_floors_regtest_e2e, which
+      # runs in `nightly-btc-family` where a bitcoind exists.
+      - name: Radiant covenant + builder suites under consensus
+        env:
+          RADIANT_REGTEST: "1"
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q \
+            tests/test_htlc_regtest_e2e.py \
+            tests/test_soulbound_covenant_regtest.py \
+            tests/test_wallet_send_regtest_e2e.py \
+            tests/test_container_regtest_e2e.py \
+            tests/test_mut_wave_regtest_e2e.py \
+            tests/test_ft_airdrop_regtest_e2e.py \
+            tests/test_ft_transfer_regtest_e2e.py \
+            tests/test_gravity_maker_offer_regtest_e2e.py \
+            tests/test_cold_recovery_regtest_e2e.py \
+            tests/test_remaining_builder_floors_regtest_e2e.py \
+            tests/test_fee_floor_boundary_regtest_e2e.py
+
+  # ---------------------------------------------------------------- nightly
+  nightly-rswp:
+    name: nightly — RSWP orderbook
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the regtest node image
+        run: |
+          docker build -f docker/regtest.Dockerfile \
+            --build-arg RADIANT_VERSION=${RADIANT_VERSION} \
+            -t radiant-core:${RADIANT_VERSION}-amd64 .
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      # These need `-swapindex=1` on the node (getopenorders / getopenordersbywant),
+      # which the suite's own `_Node` passes.
+      - name: RSWP v2/v3 orderbook on a swap-indexed node
+        env:
+          RSWP_REGTEST: "1"
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q \
+            tests/test_rswp_regtest_e2e.py \
+            tests/test_rswp_nft_regtest_e2e.py \
+            tests/test_rswp_v3_regtest_e2e.py \
+            tests/test_rswp_v3_ft_demand_regtest_e2e.py
+
+  nightly-dmint:
+    name: nightly — dMint (proof-of-work)
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    # The dMint covenant's gate is ~2**-33 per nonce at difficulty 1, and that is baked
+    # into the contract, not a knob — this job is CPU-bound on real proof-of-work and
+    # nothing else here is. Measured on a 32-core box: V1 deploy+mint 80 s and 219 s on
+    # two runs of the same code (the variance is the grind's, not the machine's), V2 +
+    # premine 396 s idle and 2826 s while that box was also running the rest of the
+    # suite. A 4-vCPU runner is several times slower again, so the ceiling is wide on
+    # purpose: a nightly that times out teaches people to ignore it.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the regtest node image
+        run: |
+          docker build -f docker/regtest.Dockerfile \
+            --build-arg RADIANT_VERSION=${RADIANT_VERSION} \
+            -t radiant-core:${RADIANT_VERSION}-amd64 .
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      - name: dMint V1 + V2 + premine, mined for real
+        env:
+          RADIANT_REGTEST: "1"
+          # Per-mine ceiling. The default 1800 s is sized for a developer box; a 4-vCPU
+          # runner is several times slower and the grind's variance is wide (the V1
+          # deploy+mint measured 80 s and 219 s on consecutive runs of the same box), so
+          # the default would turn a slow draw into a red nightly.
+          DMINT_MINE_TIMEOUT_S: "3600"
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q \
+            tests/test_dmint_v1_regtest_e2e.py \
+            tests/test_dmint_v2_regtest_e2e.py \
+            tests/test_dmint_premine_regtest_e2e.py
+
+  nightly-spv-differential:
+    name: nightly — SPV covenant differential
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    # The matrix itself is seconds (measured 9 s for 22 cases). The pre-grind is the
+    # whole cost, and it is proof-of-work: minutes on a many-core box, proportionally
+    # longer on a 4-vCPU runner. The cache below means only a cold run pays it.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # The ground chains are a pure function of the grinder + the builder it calls, so
+      # they are cacheable forever: same inputs, same anchored headers. Key on both files
+      # so a change to either re-grinds rather than replaying stale chains (the suite
+      # would fail loudly anyway — `_chain` looks the cache up by txid — but re-grinding
+      # is the useful behaviour).
+      - name: Restore the ground PoW chains
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/rgt_chain_*.json
+          key: rgt-chains-${{ hashFiles('tests/_regtest_grind_chains.py', 'tests/test_spv_covenant_differential_deployed.py') }}
+      - name: Build the regtest node image
+        run: |
+          docker build -f docker/regtest.Dockerfile \
+            --build-arg RADIANT_VERSION=${RADIANT_VERSION} \
+            -t radiant-core:${RADIANT_VERSION}-amd64 .
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      # The matrix reads pre-ground anchored PoW chains from /tmp; grinding them is
+      # the multi-minute cost PR #140 removed from the per-push path on purpose. The
+      # grinder is idempotent — it skips any chain whose cache file already exists — so
+      # on a cache hit this step is a no-op.
+      - name: Pre-grind the anchored PoW chains
+        run: poetry run python tests/_regtest_grind_chains.py
+      - name: nBits / bin2num / merkle-walk differential against the node
+        env:
+          RADIANT_REGTEST: "1"
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q \
+            tests/test_spv_covenant_differential_regtest.py
+
+  nightly-btc-family:
+    name: nightly — bitcoind + litecoind HTLC legs
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      - name: Build the regtest node image
+        # `test_remaining_builder_floors_regtest_e2e` spans both chains: its Radiant half
+        # needs a radiantd, its BTC half needs `BTC_REGTEST`. `regtest-core` runs it with
+        # only the former, so the two BTC boundary cases skip there and run here.
+        run: |
+          docker build -f docker/regtest.Dockerfile \
+            --build-arg RADIANT_VERSION=${RADIANT_VERSION} \
+            -t radiant-core:${RADIANT_VERSION}-amd64 .
+      - name: Taproot HTLC + BTC payment proof on Bitcoin Core regtest
+        env:
+          BTC_REGTEST: "1"
+          RADIANT_REGTEST: "1"
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q \
+            tests/test_btc_htlc_regtest_e2e.py \
+            tests/test_btc_payment_regtest_e2e.py \
+            tests/test_remaining_builder_floors_regtest_e2e.py
+      # Tier 2.3: the SAME consensus suite against Litecoin Core, proving the
+      # Taproot-HTLC leg is chain-agnostic across the Bitcoin family.
+      - name: Build the litecoind regtest image
+        run: |
+          docker build -f docker/litecoin-regtest.Dockerfile \
+            -t litecoin-core:v0.21.5.5-amd64 .
+      - name: The same HTLC leg on Litecoin Core regtest
+        env:
+          BTC_REGTEST: "1"
+          BTC_FAMILY_CHAIN: ltc
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q \
+            tests/test_btc_htlc_regtest_e2e.py
+
+  nightly-cross-chain:
+    name: nightly — cross-chain swap legs
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build the regtest node image
+        run: |
+          docker build -f docker/regtest.Dockerfile \
+            --build-arg RADIANT_VERSION=${RADIANT_VERSION} \
+            -t radiant-core:${RADIANT_VERSION}-amd64 .
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      # anvil for the ETH leg. Foundry's own installer action, hash-pinned.
+      - name: Install Foundry (anvil)
+        uses: foundry-rs/foundry-toolchain@908c540300062bd5a7e473851cdb4282204cee09 # v1.9.1
+        with:
+          version: stable
+      - name: BTC↔RXD HTLC, both chains, one coordinator
+        env:
+          XCHAIN_REGTEST: "1"
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q \
+            tests/test_xchain_swap_regtest_e2e.py
+      - name: ETH↔RXD HTLC + the adversarial scenarios
+        env:
+          XCHAIN_ETH_REGTEST: "1"
+        run: |
+          poetry run pytest -o "addopts=" -m integration -q \
+            tests/test_eth_leg_anvil_integration.py \
+            tests/test_xchain_eth_swap_regtest_e2e.py \
+            tests/test_xchain_eth_adversarial_e2e.py \
+            tests/test_xchain_eth_active_adversary_e2e.py \
+            tests/test_xchain_eth_tierb_isolated_e2e.py
+
+  # ---------------------------------------------------------------- vendor pin
+  vendor-freshness:
+    name: nightly — vendored Radiant-Core sources are current
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # `tests/vendor/radiant_core/` is the differential oracle for the opcode table
+      # and the 36-byte ref-operand rule. It is sha256-pinned and parsed offline, which
+      # is what keeps `tests/test_consensus_opcode_parity.py` hermetic — and what makes
+      # the pin able to go stale silently. This is where that is caught: it needs
+      # github.com, so a network failure fails a job someone scheduled rather than
+      # turning an unrelated PR red.
+      #
+      # `--check` also compares the pinned SOURCE tag against the release the regtest
+      # image is built from (`pyrxd.devnet.DEFAULT_RADIANT_VERSION`). The digest proves
+      # the vendored bytes are self-consistent, not that they describe the binary this
+      # lane actually runs.
+      - name: Vendored consensus sources vs upstream + the regtest image tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/refresh_radiant_core_vendor.py --check
