@@ -409,30 +409,40 @@ def _covenant(node: _RegtestNode, maker: PrivateKey) -> Transaction:
     return reserve
 
 
-def _covenant_boundary(node: _RegtestNode, builder, label: str) -> None:
-    """At the node's floor: accepted. One photon under: refused, reason quoted.
+#: Fresh refund PKHs to try per covenant before giving up on it.
+#:
+#: A PKH is 20 bytes at every value, so it cannot change the transaction's SIZE — but it
+#: does change the sighash, and so redraws the DER signature length, which is the only
+#: thing the fee↔size fixed point turns on. That makes it a free, size-neutral redraw:
+#: the same role nLockTime plays in ``test_wallet_send_regtest_e2e._fee_at_exactly``, and
+#: it costs no chain operations at all (the covenant is not rebuilt).
+#:
+#: Measured offline over 400 draws: a single draw settles BOTH halves 31.5% of the time
+#: (40% oscillate on the fee fixed point, 29% land the one-photon-under build on a
+#: different size). 40 draws put the give-up probability at 0.685**40 ~ 3e-7 per
+#: covenant, and ``_COVENANT_DRAWS`` covenants square it again.
+_PKH_REDRAWS = 40
 
-    Searched, not solved — the fee is part of the signed output value, so changing
-    it re-signs the input and can move the DER length and with it the size the floor
-    is derived from. The pair is built from the SAME covenant so "one under" is a
-    statement about the same transaction, not a differently sized sibling.
+#: Fresh covenants to draw if every PKH redraw on one of them fails. Belt and braces —
+#: at the measured rate one covenant is already enough.
+_COVENANT_DRAWS = 3
 
-    Two nested loops, both necessary. The inner one iterates the fee toward a fixed
-    point (``fee == floor(size(fee))``); the outer draws a fresh covenant when that
-    iteration oscillates between two sizes instead of settling, which it does for a
-    fair fraction of keys. A single-shot probe found the boundary about three runs
-    in four — good enough to look correct and bad enough to fail in CI.
+
+def _settle_boundary_pair(builder, reserved, maker, policy):
+    """A ``(at_floor, under, floor, pkh)`` pair on ONE covenant, or ``None``.
+
+    ``at_floor`` pays exactly ``size x rate``; ``under`` is the SAME transaction one
+    photon lighter, so "one under" is a statement about that transaction and not about a
+    differently sized sibling. Both come from the same covenant and the same refund PKH.
     """
-    rate = _node_rate(node)
-    policy = DeadlineFeePolicy(relay_fee_per_kb=rate * 1000)
-    for _ in range(12):
-        maker = PrivateKey()
-        reserved = _covenant(node, maker)
-        pkh = maker.public_key().hash160()
-
+    for _ in range(_PKH_REDRAWS):
+        # Never a hard-coded key — and a fresh one every draw is the whole mechanism.
+        pkh = PrivateKey().public_key().hash160()
         floor = policy.min_relay_fee(len(builder(reserved, maker, pkh, 20_000_000, _PERMISSIVE).serialize()))
         at_floor = None
-        for _ in range(6):
+        # The size can only take two adjacent values (DER is 71 or 72 bytes), so a run
+        # that has not settled in four steps is a two-cycle and never will.
+        for _ in range(4):
             try:
                 candidate = builder(reserved, maker, pkh, floor, policy)
             except InsufficientFundsError:
@@ -447,6 +457,32 @@ def _covenant_boundary(node: _RegtestNode, builder, label: str) -> None:
         under = builder(reserved, maker, pkh, floor - 1, _PERMISSIVE)
         if policy.min_relay_fee(len(under.serialize())) != floor:
             continue
+        return at_floor, under, floor, pkh
+    return None
+
+
+def _covenant_boundary(node: _RegtestNode, builder, label: str) -> None:
+    """At the node's floor: accepted. One photon under: refused, reason quoted.
+
+    Searched, not solved — the fee is part of the signed output value, so changing it
+    re-signs the input and can move the DER length and with it the size the floor is
+    derived from. What is searched is the refund PKH, which is size-neutral (see
+    :data:`_PKH_REDRAWS`); the covenant is drawn once, not once per attempt.
+
+    This used to redraw the whole COVENANT — two chain operations — up to 12 times and
+    then fail. At the measured 31.5% per-draw settle rate that is a **1.1% failure rate
+    per test, 2.1% per run of this file**, which is what it did on this lane's first CI
+    run. Flakiness at that level gets a lane switched off.
+    """
+    rate = _node_rate(node)
+    policy = DeadlineFeePolicy(relay_fee_per_kb=rate * 1000)
+    for _ in range(_COVENANT_DRAWS):
+        maker = PrivateKey()
+        reserved = _covenant(node, maker)
+        found = _settle_boundary_pair(builder, reserved, maker, policy)
+        if found is None:
+            continue
+        at_floor, under, floor, pkh = found
 
         # The builder itself refuses the under-floor fee...
         with pytest.raises(InsufficientFundsError, match="below the required"):
@@ -461,7 +497,10 @@ def _covenant_boundary(node: _RegtestNode, builder, label: str) -> None:
         assert ok.get("allowed") is True, f"{label}: node REJECTED a tx at exactly its floor: {ok}"
         print(f"{label} at-floor:          size={len(at_floor.serialize())}B fee={floor} -> accepted")
         return
-    raise AssertionError(f"{label}: no build landed exactly on its own relay floor")
+    raise AssertionError(
+        f"{label}: no build landed exactly on its own relay floor in "
+        f"{_COVENANT_DRAWS} covenants x {_PKH_REDRAWS} refund-PKH redraws"
+    )
 
 
 def test_covenant_cancel_boundary_is_the_nodes_own_floor(node):

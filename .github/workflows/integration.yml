@@ -194,10 +194,14 @@ jobs:
     name: nightly — dMint (proof-of-work)
     if: github.event_name != 'pull_request' && github.event_name != 'push'
     runs-on: ubuntu-latest
-    # The dMint covenant's gate is ~2**-33 per nonce at difficulty 1 and that is
-    # baked into the contract, not a knob. Measured 219 s for the v1 deploy+mint on
-    # a 32-core box; a 4-vCPU runner is proportionally slower, hence the ceiling.
-    timeout-minutes: 180
+    # The dMint covenant's gate is ~2**-33 per nonce at difficulty 1, and that is baked
+    # into the contract, not a knob — this job is CPU-bound on real proof-of-work and
+    # nothing else here is. Measured on a 32-core box: V1 deploy+mint 80 s and 219 s on
+    # two runs of the same code (the variance is the grind's, not the machine's), V2 +
+    # premine 396 s idle and 2826 s while that box was also running the rest of the
+    # suite. A 4-vCPU runner is several times slower again, so the ceiling is wide on
+    # purpose: a nightly that times out teaches people to ignore it.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0

@@ -612,12 +612,16 @@ both. It is fixed here.
     The Tier-1 quickstart (moved verbatim from `ci.yml`'s `quickstart` job) plus eleven
     Radiant covenant/builder suites. **Measured 119 s of pytest** across those eleven,
     each standing up its own container.
+    Measured **on the runner**: 161 s of pytest, **3 m 55 s** for the whole job including
+    the docker build, `poetry install` and the quickstart.
   - Nightly (and `workflow_dispatch`), as parallel jobs so the wall-clock is the slowest
     job and not their sum: RSWP (**42 s**, 11 cases), dMint's proof-of-work suites
-    (**80-290 s each** on a 32-core box — the covenant's ~2⁻³³ per-nonce gate is baked
-    into the contract, not a knob, so this is the one lane a 4-vCPU runner is materially
-    slower at), the SPV covenant differential matrix with its PoW pre-grind, bitcoind +
-    litecoind (**14 s**), and the cross-chain legs (BTC↔RXD **30 s**, ETH↔RXD **25 s**).
+    (V1 **80-219 s**, V2 + premine **396 s**, on a 32-core box — the covenant's ~2⁻³³
+    per-nonce gate is baked into the contract, not a knob, so this is the one lane a
+    4-vCPU runner is materially slower at, and its `timeout-minutes` is wide to match),
+    the SPV covenant differential matrix (**9 s** for 22 cases) with its PoW pre-grind
+    (cached between runs), bitcoind (**14 s**) + litecoind (**7 s**), and the cross-chain
+    legs (BTC↔RXD **65 s**, ETH↔RXD **58 s**).
   - `vendor-freshness` — `scripts/refresh_radiant_core_vendor.py --check`, which had no
     scheduled owner at all despite the vendor README naming one.
 
@@ -656,6 +660,26 @@ both. It is fixed here.
   `test_fee_floor_boundary_regtest_e2e.py` and
   `test_remaining_builder_floors_regtest_e2e.py`.
 
+- **The first thing the lane caught: a 2.1%-per-run flake in
+  `test_fee_floor_boundary_regtest_e2e.py`.** `_covenant_boundary` searches for a build
+  that lands exactly on its own relay floor, and gave up after 12 tries with "no build
+  landed exactly on its own relay floor". It failed on this lane's very first CI run —
+  broken since #414 added it, invisible because the suite had never run in CI.
+
+  Measured offline over 400 draws: a single draw settles **31.5%** of the time (40%
+  oscillate on the fee↔size fixed point — the fee is part of the signed output value, so
+  changing it re-signs the input and can move the DER length between 71 and 72 bytes;
+  29% land the one-photon-under build on a different size). 12 tries therefore fail
+  `0.685**12` = **1.1% per test, 2.1% per run of the file**. Each try also rebuilt the
+  whole covenant — two chain operations — so the expensive part was the part that did
+  not help.
+
+  Fixed the way #413 fixed `_fee_at_exactly`: find a **size-neutral** redraw of the DER
+  length. A refund PKH is 20 bytes at every value, so it cannot change the transaction's
+  size, but it does change the sighash. The covenant is now drawn once and up to 40 fresh
+  refund PKHs are tried against it, at zero chain cost. Re-measured over 300 covenants:
+  **0 failures, median 2 redraws, worst case 20.**
+
 - **`build_finalize_tx`'s fee guard is now proved at a node, with a real SPV proof
   (S-4).** It was offline-covered only, for a structural reason: the spend has to satisfy
   the MakerClaimed covenant's committed `btcChainAnchor`, and a faked proof is refused at
@@ -676,7 +700,11 @@ both. It is fixed here.
 - **`tests/test_wallet_send_regtest_e2e.py`'s fee boundary control, confirmed on a node.**
   #413 made `_fee_at_exactly` deterministic offline (nLockTime redraws the DER length
   instead of hoping the size fixed point converges) and flagged that a regtest run was
-  still owed. Run: 17 passed, including the one-photon-under pair — and now at the
+  still owed. Run: the whole module 17 passed, and the boundary control on its own
+  **20 times out of 20 on fresh keys**, with both DER outcomes represented (191 bytes 5
+  times, 192 bytes 15) — so the node saw both branches of the oscillation that used to
+  make this control fail ~44% of the time. The node's verdict each time:
+  `66: min relay fee not met` at one photon under, accepted at the floor. And now at the
   mainnet rate rather than a tenth of it, since the node moved. Its `_relay_floor` also
   stopped reading `getnetworkinfo`'s `relayfee` and reads `getmempoolinfo`'s
   `effective_minrelaytxfee`, the field `AcceptToMemoryPool` actually applies; the two
