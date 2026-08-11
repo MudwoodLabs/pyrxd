@@ -1,0 +1,25 @@
+{
+  "_comment": [
+    "Provenance for the vendored Radiant Core consensus sources used as the",
+    "differential oracle in tests/test_consensus_opcode_parity.py.",
+    "Regenerate with: python scripts/refresh_radiant_core_vendor.py",
+    "Do NOT hand-edit the .h/.cpp files — they are verbatim upstream copies and",
+    "the sha256 below is asserted by the test suite."
+  ],
+  "repo": "Radiant-Core/Radiant-Core",
+  "url": "https://github.com/Radiant-Core/Radiant-Core",
+  "tag": "v3.1.2",
+  "commit": "45e0aa40d6ae022ba69439a58b706748b083a35b",
+  "license": "MIT",
+  "fetched_utc": "2026-08-11",
+  "files": {
+    "script.h": {
+      "upstream_path": "src/script/script.h",
+      "sha256": "3de78962b07f9fbaada512a2f2f30ab70aab9742801b263fdba28a81219f36ae"
+    },
+    "script.cpp": {
+      "upstream_path": "src/script/script.cpp",
+      "sha256": "759ab52423cbdff91fdfa2429d87327d7fcffa8380c52169cdd0fac70cd8f91e"
+    }
+  }
+}
