@@ -151,8 +151,14 @@ def test_transaction_output_satoshis_roundtrip(satoshis):
 @given(script_data=_script_bytes)
 @settings(max_examples=200, suppress_health_check=[HealthCheck.too_slow])
 def test_transaction_locking_script_roundtrip(script_data):
-    """Locking script bytes must survive serialize → deserialize unchanged."""
-    locking = Script(script_data)
+    """Locking script bytes must survive serialize → deserialize unchanged.
+
+    ``allow_malformed`` on the way in: a scriptPubKey that ``GetOp`` cannot
+    walk is still valid in a block (nothing executes it until the output is
+    spent), so this is exactly the case ``Transaction.from_hex`` must keep
+    round-tripping. The assertion at the bottom is what proves it does.
+    """
+    locking = Script(script_data, allow_malformed=True)
     src_txid = "c" * 64
     tx_input = TransactionInput(
         source_txid=src_txid,
@@ -386,8 +392,15 @@ def test_encode_int_produces_valid_pushdata(num):
 @given(data=st.binary(min_size=0, max_size=75))
 @settings(max_examples=200)
 def test_script_serialize_roundtrip_raw_bytes(data):
-    """Script constructed from bytes must round-trip through serialize()."""
-    s = Script(data)
+    """Script constructed from bytes must round-trip through serialize().
+
+    ``allow_malformed`` because arbitrary bytes are usually not a walkable
+    script — ``Script`` now refuses one by default, matching ``GetScriptOp``.
+    The property under test is about byte custody, not walkability, and it
+    still holds exactly: leniency changes what the chunk walk reports, never
+    what ``serialize()`` returns.
+    """
+    s = Script(data, allow_malformed=True)
     assert s.serialize() == data
 
 
@@ -395,8 +408,22 @@ def test_script_serialize_roundtrip_raw_bytes(data):
 @settings(max_examples=200)
 def test_script_byte_length_matches_data(data):
     """Script.byte_length() must equal len(data) for any raw byte input."""
-    s = Script(data)
+    s = Script(data, allow_malformed=True)
     assert s.byte_length() == len(data)
+
+
+@given(data=st.binary(min_size=0, max_size=520))
+@settings(max_examples=200)
+def test_script_strict_parse_never_panics(data):
+    """Strict construction over arbitrary bytes must either succeed or raise
+    ``ValueError`` — never a TypeError, IndexError, or anything else that
+    would escape a caller's ``except ValueError``."""
+    try:
+        script = Script(data)
+    except ValueError:
+        return
+    assert script.serialize() == data
+    assert script.truncated_at is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

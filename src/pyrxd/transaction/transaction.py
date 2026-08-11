@@ -225,11 +225,32 @@ class Transaction:
 
     @classmethod
     def from_hex(cls, stream: str | bytes | Reader) -> Transaction | None:
+        """Deserialize a transaction.
+
+        Given a whole buffer (``str``/``bytes``) the parse must consume ALL of
+        it. An input whose script-length varint over-claims does not run off
+        the end of a *transaction* — it steals bytes from the fields that
+        follow, and the field boundaries slide until the tail comes up short.
+        The result parsed "successfully" into a different transaction: a
+        63-byte blob re-serialized to 56 bytes, so ``txid()`` returned the id
+        of a transaction those bytes do not encode. Requiring the reader to
+        finish at EOF is what makes ``from_hex`` -> ``serialize`` an identity
+        instead of a rewrite.
+
+        Given a ``Reader``, the caller is streaming (``from_beef`` reads a
+        sequence of transactions from one buffer) and owns the remaining
+        bytes, so no EOF check applies.
+        """
         with suppress(Exception):
-            if isinstance(stream, str):
-                return cls.from_reader(Reader(bytes.fromhex(stream)))
-            elif isinstance(stream, bytes):
-                return cls.from_reader(Reader(stream))
+            if isinstance(stream, (str, bytes)):
+                reader = Reader(bytes.fromhex(stream) if isinstance(stream, str) else stream)
+                transaction = cls.from_reader(reader)
+                if not reader.eof():
+                    raise ValueError(
+                        f"trailing bytes after transaction: {len(reader.getvalue()) - reader.tell()} "
+                        f"byte(s) unconsumed — the field boundaries do not line up with these bytes"
+                    )
+                return transaction
             return cls.from_reader(stream)
         return None
 

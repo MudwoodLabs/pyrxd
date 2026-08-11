@@ -53,6 +53,7 @@ import math
 from dataclasses import dataclass
 
 from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
+from pyrxd.constants import SEQUENCE_LOCKTIME_MASK
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
@@ -62,8 +63,10 @@ __all__ = [
 ]
 
 # BIP68 relative-block fields are 16 bits; mirrors Timelock's own guard so the converter
-# fails with a domain-specific message instead of a generic encoding error.
-_MAX_RXD_CSV_BLOCKS = 0xFFFF
+# fails with a domain-specific message instead of a generic encoding error. Taken from
+# the shared consensus constant rather than re-typed as 0xFFFF — a fourth spelling of
+# SEQUENCE_LOCKTIME_MASK is a fourth place for it to be wrong.
+_MAX_RXD_CSV_BLOCKS = SEQUENCE_LOCKTIME_MASK
 
 
 @dataclass(frozen=True)
