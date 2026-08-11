@@ -288,7 +288,9 @@ class TestBitcoinCoreRpcSource:
     @pytest.mark.asyncio
     async def test_get_tx_output_script_type_p2pkh(self):
         src = self._src()
-        data = {"vout": [{"scriptPubKey": {"type": "pubkeyhash"}}]}
+        # `_assert_tx_identity` now binds the response to the requested txid, so the body
+        # has to be about that transaction — a source cannot answer about another one.
+        data = {"txid": "ab" * 32, "vout": [{"scriptPubKey": {"type": "pubkeyhash"}}]}
         session = _make_session(_rpc_resp(data))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
             result = await src.get_tx_output_script_type(Txid("ab" * 32), 0)
@@ -297,7 +299,7 @@ class TestBitcoinCoreRpcSource:
     @pytest.mark.asyncio
     async def test_get_tx_output_script_type_unknown(self):
         src = self._src()
-        data = {"vout": [{"scriptPubKey": {"type": "nulldata"}}]}
+        data = {"txid": "ab" * 32, "vout": [{"scriptPubKey": {"type": "nulldata"}}]}
         session = _make_session(_rpc_resp(data))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):
             result = await src.get_tx_output_script_type(Txid("ab" * 32), 0)
@@ -306,7 +308,7 @@ class TestBitcoinCoreRpcSource:
     @pytest.mark.asyncio
     async def test_get_tx_output_script_type_bad_index_raises(self):
         src = self._src()
-        data = {"vout": []}  # empty vout
+        data = {"txid": "ab" * 32, "vout": []}  # empty vout
         session = _make_session(_rpc_resp(data))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)), pytest.raises(NetworkError):
             await src.get_tx_output_script_type(Txid("ab" * 32), 5)
@@ -406,7 +408,7 @@ class TestBlockstreamSourceAdditional:
     @pytest.mark.asyncio
     async def test_get_tx_output_script_type_unknown(self):
         src = self._src()
-        data = {"vout": [{"scriptpubkey_type": "nonstandard"}]}
+        data = {"txid": "ab" * 32, "vout": [{"scriptpubkey_type": "nonstandard"}]}
         session = MagicMock()
         session.get = MagicMock(return_value=_json_resp(data))
         with patch.object(src, "_get_session", AsyncMock(return_value=session)):

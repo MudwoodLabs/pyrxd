@@ -60,6 +60,19 @@ class Xkey:
     __hash__ = None  # type: ignore[assignment]
 
     def __str__(self) -> str:
+        """Redacted by default — the base class cannot know it is holding a public key.
+
+        This used to return ``base58check_encode(self.payload)`` unconditionally. ``Xprv``
+        overrides it, but the base class is exported and constructible, so
+        ``str(Xkey(some_xprv))`` printed the full 111-character xprv — the master private
+        key AND the chain code, i.e. the whole wallet. Serialising is now an explicit act
+        (:meth:`serialize`); only :class:`Xpub`, which has *proved* its payload carries a
+        SEC1 public key, opts back in to a readable ``__str__``.
+        """
+        return f"<{type(self).__name__}:redacted>"
+
+    def serialize(self) -> str:
+        """The base58check extended-key string. Explicit, so it can never happen by accident."""
         return base58check_encode(self.payload)
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -78,6 +91,12 @@ class Xpub(Xkey):
 
     # network and key are derived from payload, so Xkey.__eq__ (compares payload) is correct.
     __eq__ = Xkey.__eq__
+
+    def __str__(self) -> str:
+        """The xpub string. Safe to print, and safe *only here*: ``Xpub.__init__`` has already
+        proved this payload's key byte is a SEC1 **public**-key prefix, which the redacted base
+        :meth:`Xkey.__str__` cannot assume about an arbitrary extended key."""
+        return self.serialize()
 
     def ckd(self, index: int | str | bytes) -> Xpub:
         if isinstance(index, int):

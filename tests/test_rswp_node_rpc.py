@@ -59,7 +59,10 @@ def stub_url():
 async def test_results_pass_through(stub_url) -> None:
     _RESPONSES["getopenorders"] = [{"version": 2}]
     _RESPONSES["getrawtransaction"] = "beef"
-    _RESPONSES["gettxout"] = {"value": 1.0}
+    # A real gettxout result describes the output it says is live. `is_unspent` no longer
+    # accepts a bare dict — `{}` used to read as UNSPENT, which is the orderbook's
+    # `fillable` gate answering "yes" off a response that describes nothing.
+    _RESPONSES["gettxout"] = {"value": 1.0, "scriptPubKey": {"hex": "76a914" + "11" * 20 + "88ac"}}
     async with NodeRpcSource(stub_url) as src:
         assert await src.get_open_orders("00" * 32) == [{"version": 2}]
         assert await src.get_transaction("ab" * 32) == b"\xbe\xef"

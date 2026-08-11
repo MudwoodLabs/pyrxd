@@ -34,11 +34,12 @@ from typing import Any
 import websockets
 from websockets.exceptions import WebSocketException
 
-from ..hash import sha256
+from ..hash import hash256, sha256
 from ..merkle_path import MerklePath
 from ..script.type import P2PKH
 from ..security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError, redact
 from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
+from ._guards import finite_int, hex_str, merkle_branch, nonneg_int
 from .registry import block_hash_hex
 from .tls_pin import normalize_pin, verify_connection_pin
 
@@ -395,6 +396,16 @@ class ElectrumXClient:
             raw = bytes.fromhex(result)
         except ValueError:
             raise NetworkError("Server returned invalid hex for transaction")
+        # Serialize, don't trust: a server may return ANY transaction for a
+        # ``blockchain.transaction.get``. ``swap.resolve.fetch_transaction`` and
+        # ``failover._holds_tx`` each re-derived the id themselves, but the Glyph scanner
+        # (``glyph/scanner.py``) did not — so a hostile server could feed it a transaction of
+        # its choosing and have the token metadata parsed out of it. The txid is
+        # ``hash256(raw)`` reversed, so binding needs no parser and cannot itself fail.
+        if hash256(raw)[::-1].hex() != str(txid):
+            raise NetworkError(
+                f"server returned a transaction whose hash is not the requested txid {str(txid)[:16]}…; fail-closed"
+            )
         return RawTx(raw)
 
     async def get_transaction_verbose(self, txid: Txid) -> dict[str, Any]:
@@ -432,16 +443,26 @@ class ElectrumXClient:
         if not isinstance(result, dict):
             raise NetworkError("Unexpected response type for transaction merkle")
         try:
-            block_height = BlockHeight(int(result["block_height"]))
-            merkle_hashes: list[str] = result["merkle"]
-            pos: int = int(result["pos"])
-        except (KeyError, TypeError, ValueError):
+            # `merkle` had NO type check: a JSON string passed through as "the branch", and
+            # iterating "deadbeef" yields eight one-character "hashes". `pos` had no sign check
+            # and both int() calls could raise OverflowError on a JSON `Infinity` — a class
+            # absent from the tuple below, so it escaped past every `except NetworkError`.
+            block_height = BlockHeight(nonneg_int(result["block_height"]))
+            merkle_hashes: list[str] = merkle_branch(result["merkle"])
+            pos: int = nonneg_int(result["pos"])
+        except (KeyError, TypeError, ValueError, ValidationError):
             raise NetworkError("Malformed merkle response from server")
+
+        # The proof must be for the block we ASKED about. ElectrumX echoes `block_height`, and
+        # without binding it the server chooses which block it proves inclusion in.
+        if int(block_height) != int(height):
+            raise NetworkError(
+                f"merkle proof is for block {int(block_height)}, not the requested {int(height)}; fail-closed"
+            )
 
         # Build a MerklePath from the ElectrumX branch format.
         # ElectrumX returns hashes in display (reversed) order; we pass the
         # txid as the leaf and build a linear proof path.
-        2 ** len(merkle_hashes)
         path: list = [[{"offset": pos, "hash_str": str(txid), "txid": True}]]
         current_pos = pos
         for _h, sibling_hex in enumerate(merkle_hashes):
@@ -493,9 +514,9 @@ class ElectrumXClient:
         if not isinstance(result, dict):
             raise NetworkError("Unexpected response type for balance")
         try:
-            confirmed = Satoshis(int(result["confirmed"]))
-            unconfirmed = Satoshis(int(result["unconfirmed"]))
-        except (KeyError, TypeError, ValueError):
+            confirmed = Satoshis(nonneg_int(result["confirmed"]))
+            unconfirmed = Satoshis(nonneg_int(result["unconfirmed"]))
+        except (KeyError, TypeError, ValueError, ValidationError):
             raise NetworkError("Malformed balance response from server")
         return confirmed, unconfirmed
 
@@ -510,16 +531,20 @@ class ElectrumXClient:
         if not isinstance(result, list):
             raise NetworkError("Unexpected response type for UTXOs")
         try:
+            # `listunspent` feeds coin selection. `tx_hash` was assigned with no validation at
+            # all (a `null` propagated into the outpoint of a tx the wallet was about to sign),
+            # a negative `value`/`tx_pos` was returned verbatim, `1.9` was truncated to `1`, and
+            # `Infinity` escaped as OverflowError — absent from the tuple below.
             return [
                 UtxoRecord(
-                    tx_hash=item["tx_hash"],
-                    tx_pos=int(item["tx_pos"]),
-                    value=int(item["value"]),
-                    height=int(item["height"]),
+                    tx_hash=hex_str(item["tx_hash"], nbytes=32),
+                    tx_pos=nonneg_int(item["tx_pos"]),
+                    value=int(Satoshis(nonneg_int(item["value"]))),
+                    height=nonneg_int(item["height"]),
                 )
                 for item in result
             ]
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, ValidationError):
             raise NetworkError("Malformed UTXO entry in server response")
 
     async def get_history(self, script_hash: Hex32 | bytes | str) -> list[dict]:
@@ -533,7 +558,13 @@ class ElectrumXClient:
         if not isinstance(result, list):
             raise NetworkError("Unexpected response type for history")
         try:
-            return [{"tx_hash": str(item["tx_hash"]), "height": int(item["height"])} for item in result]
+            # `height` is the one field where a negative value is protocol-legitimate (ElectrumX
+            # reports 0 / -1 for an unconfirmed tx), so only non-numeric and non-finite shapes
+            # are refused here.
+            return [
+                {"tx_hash": hex_str(item["tx_hash"], nbytes=32), "height": finite_int(item["height"])}
+                for item in result
+            ]
         except (KeyError, TypeError, ValueError):
             raise NetworkError("Malformed history entry in server response")
 
@@ -570,8 +601,8 @@ class ElectrumXClient:
         if not isinstance(result, dict):
             raise NetworkError("Unexpected response type for tip height")
         try:
-            height = BlockHeight(int(result["height"]))
-        except (KeyError, TypeError, ValueError):
+            height = BlockHeight(nonneg_int(result["height"]))
+        except (KeyError, TypeError, ValueError, ValidationError):
             raise NetworkError("Malformed tip height response from server")
         return height
 

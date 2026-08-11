@@ -255,6 +255,11 @@ class MultiSourceRxdChainSource:
 OutspendFn = Callable[[str, int], Awaitable[tuple[bool, "str | None"]]]
 
 
+def _is_hex64(value: str) -> bool:
+    """True for exactly 64 hex characters — a txid, and nothing that can escape a URL path."""
+    return len(value) == 64 and all(c in "0123456789abcdefABCDEF" for c in value)
+
+
 class OutspendBtcClaimSource:
     """``BtcClaimSource`` = injected outspend backend(s) (claim DETECTION) + a ``BtcFundingReader``
     for the quorum-agreed depth (wire ``MultiSourceBtcFundingReader``).
@@ -321,9 +326,22 @@ async def mempool_space_outspend(
     async with session.get(url, timeout=aiohttp_timeout(timeout_s)) as resp:
         resp.raise_for_status()
         data = await resp.json()
-    spent = bool(data.get("spent"))
+    # `spent` MUST be a real JSON boolean. This was `bool(data.get("spent"))`, the same defect
+    # as the fixed `bool(spend.get("spent", True))` in network/bitcoin.py but pointing the other
+    # way: `{"spent": null}`, `{}`, `{"spent": 0}` — what a broken or hostile Esplora-shaped
+    # server emits for "no data" — all read as NOT SPENT, and a NOT-SPENT answer is a
+    # *successful* read, so it never reaches `claim_status`'s all-sources-failed fail-closed
+    # branch. That silently suppresses PAGE_CLAIM, which this module's own docstring names as
+    # the forbidden failure for an alert-only tower. Raising instead makes the source drop out,
+    # and a tower blind across every source then pages.
+    if not isinstance(data, dict) or not isinstance(data.get("spent"), bool):
+        raise NetworkError(f"outspend response for {funding_txid}:{vout} has no boolean 'spent'; fail-closed")
+    spent = data["spent"]
     spender = data.get("txid") if spent else None
-    if not (isinstance(spender, str) and len(spender) == 64):
+    # Charset-check, not just length: `spender` is interpolated unquoted into the
+    # `/api/tx/{txid}/hex` path by `mempool_space_tx_hex`, so a 64-character value containing
+    # `/`, `?` or `#` is a path-injection primitive.
+    if not (isinstance(spender, str) and len(spender) == 64 and _is_hex64(spender)):
         spender = None
     return spent, spender
 

@@ -348,7 +348,9 @@ class TestMempoolSpaceSource:
     @pytest.mark.asyncio
     async def test_get_tx_output_script_type_p2pkh(self):
         src = self._src()
-        data = {"vout": [{"scriptpubkey_type": "p2pkh"}]}
+        # The body must identify the tx we asked for: `_assert_tx_identity` now binds
+        # `/tx/{txid}` responses, so a source cannot answer about a different transaction.
+        data = {"txid": str(TXID), "vout": [{"scriptpubkey_type": "p2pkh"}]}
         resp = _json_resp(data)
         session = MagicMock()
         session.get = MagicMock(side_effect=[resp])
@@ -359,7 +361,7 @@ class TestMempoolSpaceSource:
     @pytest.mark.asyncio
     async def test_get_tx_output_script_type_unknown(self):
         src = self._src()
-        data = {"vout": [{"scriptpubkey_type": "future_type"}]}
+        data = {"txid": str(TXID), "vout": [{"scriptpubkey_type": "future_type"}]}
         resp = _json_resp(data)
         session = MagicMock()
         session.get = MagicMock(side_effect=[resp])
@@ -370,7 +372,7 @@ class TestMempoolSpaceSource:
     @pytest.mark.asyncio
     async def test_get_tx_output_script_type_bad_index_raises(self):
         src = self._src()
-        data = {"vout": []}
+        data = {"txid": str(TXID), "vout": []}
         resp = _json_resp(data)
         session = MagicMock()
         session.get = MagicMock(side_effect=[resp])
