@@ -151,6 +151,14 @@ def prepare_offered_utxo(
     offered input gives its WHOLE value — so both sides of the book run on
     exact-amount UTXOs. Token conservation and change are handled as in
     :func:`pyrxd.swap.partial.accept_offer`.
+
+    **No relay-floor guard, deliberately** — for the reason set out at length in
+    :func:`build_advert_tx`. This is a self-send: if it does not relay, the
+    maker's asset simply stays in the UTXO it is already in, the offered UTXO the
+    order needs is never minted, and the failure surfaces at broadcast. Nothing is
+    reported as done, and no counterparty is relying on it. Contrast
+    :func:`build_cancel_tx`, which is guarded because an unrelayable revocation is
+    reported as a successful one.
     """
     tx = Transaction()
     for f in funding:
@@ -181,6 +189,32 @@ def build_advert_tx(
 
     Funding must be plain RXD (P2PKH) — an FT funding input would strand token
     value in the fee/change math of a transaction that has no token outputs.
+
+    **No relay-floor guard, deliberately** — do not read the gap as an oversight.
+    The floor sweep that guarded :func:`build_cancel_tx` (and the twelve other
+    builders) skipped this one on purpose, and the asymmetry is the point:
+
+    * An advert that does not relay is **an order that never appears**. Nothing
+      is reported as having succeeded, no counterparty can act on it, and the
+      maker sees the failure at broadcast — the node rejects it outright with
+      "min relay fee not met". The loud, immediate failure IS the report.
+    * An unrelayable :func:`build_cancel_tx` is the opposite shape: cancel is the
+      only hard revocation in v2, so a caller handed a cancel tx and a txid has
+      been told the order is revoked while every copy of the signed advertisement
+      stays fillable at the original price. That divergence between reported and
+      actual state is why it is guarded and this is not.
+
+    Nor is an asset ever at risk here: this transaction spends **plain RXD only**
+    (enforced below) and never the offered UTXO, whose advertisement it merely
+    carries at output 0 with value 0. The advert is a discovery artifact — a
+    taker who already saw the order can still complete the trade against the
+    offered UTXO if the advert never confirms.
+
+    The residual, stated plainly: on a node that relays below the reference floor
+    the under-fee'd advert can enter *that* mempool without propagating, holding
+    the caller's own RXD funding UTXO until mempool expiry, 8 hours later. That
+    is an availability cost on the caller's own change, not a loss and not a
+    counterparty risk — which is why it does not buy a guard here.
     """
     if not funding:
         raise ValidationError("at least one funding input is required")

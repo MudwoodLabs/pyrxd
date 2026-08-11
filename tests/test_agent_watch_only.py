@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from pyrxd.agent import AgentSigner, ChangeClaim, WatchOnlyTxBuilder, WatchOnlyUtxo
+from pyrxd.fee_sizing import relay_floor_photons_per_byte
 from pyrxd.hd.bip32 import Xpub
 from pyrxd.hd.wallet import HdWallet
 from pyrxd.keys import PrivateKey
@@ -20,6 +21,7 @@ from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
 
 TEST_MNEMONIC = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+RELAY_FLOOR_PER_BYTE = relay_floor_photons_per_byte()
 _ACCEPT = lambda _summary: True  # noqa: E731 — terse confirm stub for tests
 _RECIPIENT_ADDR = PrivateKey().public_key().address()  # arbitrary external payee
 
@@ -140,9 +142,20 @@ def test_dust_change_is_burned_to_fee() -> None:
     claim), matching build_send_tx — and the agent still signs it."""
     w = _wallet()
     builder = WatchOnlyTxBuilder(_account_xpub(w))
-    utxos = [_utxo(w, 0, 0, 10_000_000)]
-    # fee_rate=1: 1-input/2-output estimate ≈ 226; pick photons so the residual < DUST(546).
-    built = builder.build_send(utxos, _RECIPIENT_ADDR, photons=9_999_700, change_index=0, fee_rate=1)
+    utxos = [_utxo(w, 0, 0, 10_000_000_000)]
+    # At the relay floor the 1-input/2-output estimate is 226 bytes × 10_000 =
+    # 2_260_000 photons; pick photons so the residual is under DUST(546). This
+    # used to run at fee_rate=1 — a rate 10_000x under the floor, which the
+    # builder now refuses. Rescaled rather than opted out: the dust-burn branch
+    # is worth exercising at a rate the network would actually relay.
+    fee = 226 * RELAY_FLOOR_PER_BYTE
+    built = builder.build_send(
+        utxos,
+        _RECIPIENT_ADDR,
+        photons=10_000_000_000 - fee - 300,
+        change_index=0,
+        fee_rate=RELAY_FLOOR_PER_BYTE,
+    )
 
     assert len(built.transaction.outputs) == 1, "dust change must be burned to fee"
     assert built.request.change_claims == ()
@@ -175,3 +188,48 @@ def test_rejects_bad_photons(bad: int) -> None:
     utxos = [_utxo(w, 0, 0, 100_000_000)]
     with pytest.raises(ValidationError):
         builder.build_send(utxos, _RECIPIENT_ADDR, photons=bad, change_index=0)
+
+
+# ───────────────────────────── relay-floor guard ──────────────────────────────
+# `build_send` is the key-free mirror of `HdWallet.build_send_tx`, and the thing
+# it hands back is broadcast after the agent signs it. A sub-floor rate here is
+# the same fund-safety bug it is there: Radiant has neither RBF nor CPFP, so the
+# signed result cannot be bumped and holds its inputs until mempool expiry (8h).
+# The builder shipped with only a `fee_rate > 0` check while the sibling it
+# documents itself as mirroring was guarded.
+
+
+@pytest.mark.parametrize("rate", [1, 5, RELAY_FLOOR_PER_BYTE - 1])
+def test_build_send_refuses_sub_floor_fee_rate(rate: int) -> None:
+    w = _wallet()
+    builder = WatchOnlyTxBuilder(_account_xpub(w))
+    utxos = [_utxo(w, 0, 0, 1_000_000_000)]
+    with pytest.raises(ValidationError, match="relay floor"):
+        builder.build_send(utxos, _RECIPIENT_ADDR, photons=10_000_000, change_index=0, fee_rate=rate)
+
+
+def test_build_send_accepts_the_floor_itself() -> None:
+    """The boundary is inclusive — exactly the floor must build."""
+    w = _wallet()
+    builder = WatchOnlyTxBuilder(_account_xpub(w))
+    utxos = [_utxo(w, 0, 0, 1_000_000_000)]
+    built = builder.build_send(
+        utxos, _RECIPIENT_ADDR, photons=10_000_000, change_index=0, fee_rate=RELAY_FLOOR_PER_BYTE
+    )
+    assert built.transaction.outputs
+
+
+def test_sub_floor_rate_still_reachable_through_the_documented_opt_out() -> None:
+    """The escape hatch is the same greppable one every other builder uses."""
+    w = _wallet()
+    builder = WatchOnlyTxBuilder(_account_xpub(w))
+    utxos = [_utxo(w, 0, 0, 10_000_000)]
+    built = builder.build_send(
+        utxos,
+        _RECIPIENT_ADDR,
+        photons=1_000_000,
+        change_index=0,
+        fee_rate=1,
+        allow_below_relay_floor=True,
+    )
+    assert built.transaction.outputs
