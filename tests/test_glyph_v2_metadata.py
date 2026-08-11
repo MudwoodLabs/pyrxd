@@ -1,8 +1,10 @@
 """Tests for Glyph V2 metadata sub-objects: GlyphCreator, GlyphRoyalty, GlyphPolicy,
-GlyphRights, and sign_metadata / verify_creator_signature."""
+GlyphRights, the ``in``/``by`` relationship fields, and sign_metadata /
+verify_creator_signature."""
 
 from __future__ import annotations
 
+import cbor2
 import pytest
 
 from pyrxd.glyph.creator import sign_metadata, verify_creator_signature
@@ -10,13 +12,16 @@ from pyrxd.glyph.payload import decode_payload, encode_payload
 from pyrxd.glyph.types import (
     GlyphCreator,
     GlyphMetadata,
+    GlyphNft,
     GlyphPolicy,
     GlyphProtocol,
+    GlyphRef,
     GlyphRights,
     GlyphRoyalty,
 )
 from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.types import Hex20, Txid
 
 # ---------------------------------------------------------------------------
 # GlyphCreator
@@ -382,3 +387,102 @@ def test_sign_verify_round_trip_with_dmint():
     signed = sign_metadata(meta, key)
     valid, err = verify_creator_signature(signed)
     assert valid is True, f"dMint round-trip sig failed: {err}"
+
+
+# ---------------------------------------------------------------------------
+# Container / author relationships ('in' / 'by')
+# ---------------------------------------------------------------------------
+#
+# These two fields are how a Glyph declares collection membership and
+# authorship. Until 0.15.0 pyrxd had no representation for either, so both were
+# silently discarded on decode — observable on the reference mainnet Glyph,
+# whose ``by`` refs vanished. The encoding must match Photonic Wallet's byte for
+# byte: the 36-byte ref in the SAME wire form the locking script uses, because
+# Photonic's indexer compares these bytes directly against the refs it parses
+# out of the reveal's output scripts before it will honour the claim.
+
+_CONTAINER_REF = GlyphRef(txid=Txid("11" * 32), vout=3)
+_AUTHOR_REF = GlyphRef(txid=Txid("22" * 32), vout=0)
+
+
+def test_container_refs_encode_as_wire_form_byte_strings():
+    meta = GlyphMetadata(protocol=[GlyphProtocol.NFT], container_refs=(_CONTAINER_REF,))
+    raw = cbor2.loads(encode_payload(meta)[0])
+    assert raw["in"] == [_CONTAINER_REF.to_bytes()]
+    # Wire form, not display form: txid reversed, vout little-endian.
+    assert raw["in"][0][:32] == bytes.fromhex("11" * 32)[::-1]
+    assert raw["in"][0][32:] == (3).to_bytes(4, "little")
+
+
+def test_author_refs_encode_under_by():
+    meta = GlyphMetadata(protocol=[GlyphProtocol.NFT], author_refs=(_AUTHOR_REF,))
+    assert cbor2.loads(encode_payload(meta)[0])["by"] == [_AUTHOR_REF.to_bytes()]
+
+
+def test_empty_relationships_emit_no_keys():
+    """An NFT with no collection must not carry empty ``in``/``by`` — the payload
+    hash is committed on chain, so a spurious key changes the token's identity."""
+    raw = cbor2.loads(encode_payload(GlyphMetadata(protocol=[GlyphProtocol.NFT]))[0])
+    assert "in" not in raw and "by" not in raw
+
+
+def test_relationships_round_trip():
+    meta = GlyphMetadata(
+        protocol=[GlyphProtocol.NFT],
+        container_refs=(_CONTAINER_REF,),
+        author_refs=(_AUTHOR_REF,),
+    )
+    decoded = decode_payload(encode_payload(meta)[0])
+    assert decoded.container_refs == (_CONTAINER_REF,)
+    assert decoded.author_refs == (_AUTHOR_REF,)
+
+
+def test_decodes_tag64_wrapped_refs():
+    """Some cbor-x configurations wrap byte strings in CBOR tag 64 (uint8-array);
+    the reference mainnet Glyph carries its ``by`` refs that way. Refusing them
+    would make pyrxd unable to read real tokens."""
+    payload = cbor2.dumps({"p": [2], "in": [cbor2.CBORTag(64, _CONTAINER_REF.to_bytes())]})
+    assert decode_payload(payload).container_refs == (_CONTAINER_REF,)
+
+
+def test_malformed_entries_are_dropped_not_fatal():
+    """One bad entry in an attacker-controlled envelope must not make an
+    otherwise readable token undecodable."""
+    payload = cbor2.dumps({"p": [2], "in": [b"too-short", 42, _CONTAINER_REF.to_bytes()]})
+    assert decode_payload(payload).container_refs == (_CONTAINER_REF,)
+
+
+def test_non_list_relationship_field_is_ignored():
+    assert decode_payload(cbor2.dumps({"p": [2], "in": "not-a-list"})).container_refs == ()
+
+
+def test_relationship_fields_reject_a_bare_ref():
+    """``container_refs=ref`` instead of ``[ref]`` would otherwise iterate the
+    dataclass and produce nonsense."""
+    with pytest.raises(ValidationError, match="not a bare GlyphRef"):
+        GlyphMetadata(protocol=[GlyphProtocol.NFT], container_refs=_CONTAINER_REF)
+
+
+def test_relationship_fields_reject_non_refs():
+    with pytest.raises(ValidationError, match="must be GlyphRef"):
+        GlyphMetadata(protocol=[GlyphProtocol.NFT], author_refs=["ab" * 18])
+
+
+def test_is_container_reads_the_protocol_marker():
+    assert GlyphMetadata(protocol=[GlyphProtocol.NFT, GlyphProtocol.CONTAINER]).is_container is True
+    assert GlyphMetadata(protocol=[GlyphProtocol.NFT]).is_container is False
+
+
+def test_glyph_nft_surfaces_membership_and_tolerates_missing_metadata():
+    """``GlyphScanner`` hands back tokens whose reveal it could not locate; the
+    convenience accessors must not raise on those."""
+    child = GlyphNft(
+        ref=GlyphRef(txid=Txid("33" * 32), vout=0),
+        owner_pkh=Hex20(bytes(20)),
+        metadata=GlyphMetadata(protocol=[GlyphProtocol.NFT], container_refs=(_CONTAINER_REF,)),
+    )
+    assert child.container_refs == (_CONTAINER_REF,)
+    assert child.is_container is False
+
+    unknown = GlyphNft(ref=child.ref, owner_pkh=Hex20(bytes(20)), metadata=None)
+    assert unknown.container_refs == () and unknown.author_refs == () and unknown.is_container is False

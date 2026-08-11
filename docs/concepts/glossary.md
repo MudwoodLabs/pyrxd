@@ -87,8 +87,11 @@ those for depth; use this page to look something up mid-task.
   output. See [Glyph structures and terminology](glyph-structures-and-terminology.md)
   and [V1 dMint deploys](dmint-v1-deploy.md).
 - **CONTAINER** — a Glyph protocol type (`GlyphProtocol.CONTAINER = 7`,
-  `glyph/types.py`) for a collection. pyrxd ships a full builder,
-  `prepare_container_reveal`.
+  `glyph/types.py`) marking a token as a collection. A container is an
+  **ordinary NFT** — same 63-byte locking script, same transfer path; the
+  marker lives only in the metadata envelope. Membership points child → parent
+  and lives in the *child's* envelope (`in`), never in a script. See
+  [Create a token collection](../how-to/create-a-token-collection.md).
 - **contract_id** — the wallet-facing display form of a token's *deploy*
   outpoint: 64 hex chars (txid, display order) + 8 hex chars (vout,
   big-endian). **It identifies the token, not your holding of it** — pasting

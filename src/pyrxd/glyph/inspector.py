@@ -13,7 +13,9 @@ from .script import (
     extract_ref_from_ft_script,
     extract_ref_from_nft_script,
     is_ft_script,
+    is_legacy_container_script,
     is_nft_script,
+    parse_legacy_container_script,
     parse_mutable_nft_script,
 )
 from .types import GlyphMetadata, GlyphRef
@@ -39,12 +41,18 @@ class GlyphOutput:
     """
 
     vout: int
-    glyph_type: str  # "nft", "ft", "mut", "dmint"
+    glyph_type: str  # "nft", "ft", "mut", "dmint", "container-legacy"
     ref: GlyphRef
     metadata: GlyphMetadata | None  # None if this is a transfer (no reveal)
     script: bytes
-    owner_pkh: Hex20 | None = None  # set for nft/ft/mut (None for dmint)
+    owner_pkh: Hex20 | None = None  # set for nft/ft/mut/container-legacy (None for dmint)
     dmint_state: DmintState | None = field(default=None)  # set for dmint outputs
+    # Only ``container-legacy`` outputs set these. ``spendable=False`` means the
+    # output is dead — no scriptSig can satisfy it (see
+    # :func:`pyrxd.glyph.script.is_legacy_container_script`). Every other
+    # ``glyph_type`` leaves it ``True``.
+    spendable: bool = True
+    child_ref: GlyphRef | None = None
 
 
 class GlyphInspector:
@@ -57,10 +65,20 @@ class GlyphInspector:
         """
         Given list of (satoshis, script_bytes) outputs, return detected Glyphs.
 
-        Detects NFT singletons, FT locks, mutable NFTs, and dMint contract
-        outputs. Plain P2PKH and unrecognised scripts are silently skipped.
-        Commit-output classification lives outside ``find_glyphs`` because a
-        commit has no meaningful ``ref`` until its reveal lands.
+        Detects NFT singletons, FT locks, mutable NFTs, dMint contract outputs,
+        and the dead pre-0.15.0 container-with-child-ref shape. Plain P2PKH and
+        unrecognised scripts are silently skipped. Commit-output classification
+        lives outside ``find_glyphs`` because a commit has no meaningful ``ref``
+        until its reveal lands.
+
+        A **CONTAINER** reports as ``"nft"``: its locking script *is* the NFT
+        singleton, so no script-level classifier can distinguish one, here or in
+        any other implementation. Container-ness is an envelope property — read
+        it from the reveal metadata (``GlyphProtocol.CONTAINER`` in
+        :attr:`~pyrxd.glyph.types.GlyphMetadata.protocol`, surfaced by
+        :attr:`GlyphMetadata.is_container` and
+        :func:`pyrxd.glyph.wave.classify_glyph_metadata`). ``GlyphScanner``
+        does this join for you.
         """
         # Local import: dmint.py imports from .script which imports from
         # .types — pulling DmintState in at module load completes the cycle.
@@ -91,6 +109,25 @@ class GlyphInspector:
                         owner_pkh=extract_owner_pkh_from_ft_script(script),
                     )
                 )
+            elif is_legacy_container_script(script_hex):
+                # Reported so a holder of one is told what it is. It is NOT a
+                # routable token: `spendable=False`, and GlyphScanner will not
+                # hand it back as a GlyphNft.
+                parsed_container = parse_legacy_container_script(script)
+                if parsed_container is not None:
+                    container_ref, child_ref, owner = parsed_container
+                    results.append(
+                        GlyphOutput(
+                            vout=vout,
+                            glyph_type="container-legacy",
+                            ref=container_ref,
+                            metadata=None,
+                            script=script,
+                            owner_pkh=owner,
+                            spendable=False,
+                            child_ref=child_ref,
+                        )
+                    )
             elif MUTABLE_NFT_SCRIPT_RE.fullmatch(script_hex):
                 parsed = parse_mutable_nft_script(script)
                 if parsed is not None:

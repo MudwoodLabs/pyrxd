@@ -167,13 +167,18 @@ _PLACEHOLDER_COMMIT_TXID = "00" * 32
 PENDING_MINT_SCHEMA_VERSION = 1
 
 # Protocol tags whose reveal is NOT the single-output shape this module builds. MUT and
-# WAVE need a second contract output (``prepare_mutable_reveal``), CONTAINER needs the
-# child-ref prefix (``prepare_container_reveal``), and DMINT needs the parallel contract
-# set (``prepare_dmint_deploy``). Minting one of those through here would broadcast a
-# commit whose reveal this module cannot build — i.e. strand it.
+# WAVE need a second contract output (``prepare_mutable_reveal``), and DMINT needs the
+# parallel contract set (``prepare_dmint_deploy``). Minting one of those through here
+# would broadcast a commit whose reveal this module cannot build — i.e. strand it.
+#
+# CONTAINER is deliberately ABSENT (0.15.0). A container's reveal is the ordinary
+# single-output NFT reveal — its locking script is the plain 63-byte singleton and
+# container-ness lives in the envelope's ``p`` field, so ``mint_nft`` builds it
+# correctly with no special case. Before 0.15.0 it was listed here because
+# ``prepare_container_reveal`` could emit a 100-byte child-ref prefix; that shape was
+# unspendable and has been removed.
 _UNSUPPORTED_PROTOCOLS = {
     GlyphProtocol.MUT: "prepare_mutable_reveal",
-    GlyphProtocol.CONTAINER: "prepare_container_reveal",
     GlyphProtocol.WAVE: "prepare_wave_reveal",
     GlyphProtocol.DMINT: "prepare_dmint_deploy",
 }
@@ -648,9 +653,10 @@ class GlyphMinter:
 
         Args:
             metadata: must carry :attr:`~pyrxd.glyph.types.GlyphProtocol.NFT` and none
-                of the tags whose reveal has a different shape (MUT, CONTAINER, WAVE,
-                DMINT) — those are refused rather than committed to a reveal this
-                module cannot build.
+                of the tags whose reveal has a different shape (MUT, WAVE, DMINT) —
+                those are refused rather than committed to a reveal this module cannot
+                build. ``CONTAINER`` **is** supported: a collection's reveal is this
+                same single-output NFT shape.
             owner_pkh: recipient. Defaults to the funding key's own PKH.
 
         Raises:

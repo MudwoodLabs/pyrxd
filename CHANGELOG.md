@@ -6,6 +6,53 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **`GlyphBuilder.prepare_container_reveal(child_ref=...)` — breaking-class, fund-safety.**
+  Passing `child_ref` now raises `ValidationError`. From 0.9.0 through 0.14.0 it prefixed the
+  NFT body with `OP_PUSHINPUTREF <child_ref>` and produced a 100-byte output. That output was
+  **permanently unspendable**: the ref push is never dropped, so the P2PKH tail ran
+  `OP_DUP OP_HASH160` over the ref instead of the pubkey and `OP_EQUALVERIFY` failed for every
+  possible scriptSig — the failing item comes from the *locking* script, so no unlock could
+  change it. Worse, the only way to create one at all was to **consume the child NFT's
+  singleton ref without re-creating it**: `OP_PUSHINPUTREFSINGLETON` registers its ref as a
+  disallowed sibling, so the child cannot survive the transaction that names it, and a
+  singleton consumed into a `0xd0` push never re-enters `inputSingletonRefSet` and can never
+  be minted again. Building a "collection" this way silently destroyed the token being added
+  to it and burned the carrier photons on the container.
+
+  Both failures are proven against a Radiant Core v3.1.1 regtest node in
+  `tests/test_container_regtest_e2e.py`, with the node's reject reasons recorded in
+  §17.1 of the protocol specification. No mitigation is possible for an output already
+  created this way — it cannot be spent. `is_legacy_container_script` /
+  `parse_legacy_container_script` exist so such an output is *identified* rather than
+  reported as `unknown`.
+
+### Added
+
+- **CONTAINER (collection) tokens work end to end.** A container is an ordinary NFT — the
+  plain 63-byte singleton, container-ness carried by the `7` marker in the envelope — which
+  is Photonic Wallet's model and what makes it routable by every existing code path: it is
+  classified by `find_glyphs`, surfaced by `GlyphScanner`, and moved by `build_nft_transfer_tx`
+  with no special case. `GlyphMinter.commit_nft` / `pyrxd glyph mint-nft` now accept a
+  CONTAINER instead of refusing it.
+- **Collection membership in the envelope: `GlyphMetadata.container_refs` / `.author_refs`**,
+  encoded as the Glyph `in` / `by` fields. Refs are 36-byte byte strings in the same wire form
+  the locking script uses, which is what lets a reader check a claim; CBOR tag 64-wrapped
+  entries are accepted on decode. This also closes a decode gap: `by` refs on real mainnet
+  tokens were previously discarded.
+- **`GlyphBuilder.prepare_container_child_reveal`** builds the reveal that mints a token into
+  a collection — the child NFT plus a byte-identical re-creation of the container UTXO, so the
+  container's ref appears among the reveal's output refs and the membership claim is
+  checkable rather than merely asserted (the condition Photonic's indexer applies). It refuses
+  an envelope whose `in` does not name the container.
+- `GlyphNft.is_container` / `.container_refs` / `.author_refs`, and `GlyphMetadata.is_container`.
+- `GlyphOutput.spendable` and `GlyphOutput.child_ref`; `_inspect_script` reports
+  `type: "container-legacy"` with the reason it cannot be spent. `GlyphScanner` logs and skips
+  such an output instead of returning it as a transferable token.
+- Frozen golden vectors pinning the container locking script and the `in` envelope bytes, so
+  the removed prefix cannot return unnoticed (`tests/test_golden_vectors.py`).
+
 ### Documentation
 
 - **The threat model no longer claims the SPV sole-authority gate fails closed.**
@@ -107,6 +154,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   `tests/test_residual_register_traceability.py` machine-checks that every code/test path the
   revised register cites exists.
+
+- [Create a token collection](docs/how-to/create-a-token-collection.md) — new how-to.
+- Glyph token protocol specification revised to revision 2: §7.5 rewritten (including *why*
+  a script-level container→child link is impossible on Radiant), `in` / `by` documented in
+  §4.3, §16.2 retired, and §17.1 added with the regtest reject reasons.
 
 ## [0.14.0] — 2026-08-10
 

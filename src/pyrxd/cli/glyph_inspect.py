@@ -223,6 +223,10 @@ def _render_txid_human(payload: dict) -> str:
                     f"            height={row.get('height')}/{row.get('max_height')} "
                     f"reward={row.get('reward')} algo={row.get('algo')}"
                 )
+            elif type_ == "container-legacy":
+                lines.append(f"            ref={row.get('ref_outpoint', '')}")
+                lines.append(f"            child_ref={row.get('child_ref_outpoint', '')}")
+                lines.append("            UNSPENDABLE — see `pyrxd glyph inspect <script>` for why")
             elif type_ == "p2pkh":
                 lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
             elif type_ == "error":
@@ -314,6 +318,17 @@ def _render_script_human(payload: dict) -> str:
         body.append(f"  owner_pkh:    {payload['owner_pkh']}")
         body.append("  (structural pattern match; payload_hash is an opaque commitment")
         body.append("   to the reveal-tx CBOR)")
+    elif type_ == "container-legacy":
+        body.append(f"  ref:          {payload['ref_outpoint']}")
+        body.append(f"  child_ref:    {payload['child_ref_outpoint']}")
+        body.append(f"  owner_pkh:    {payload['owner_pkh']}")
+        body.append("  *** UNSPENDABLE ***")
+        body.append("  A pre-0.15.0 CONTAINER-with-child-ref output. OP_PUSHINPUTREF leaves")
+        body.append("  the child ref on the stack, so the P2PKH tail hashes the ref instead of")
+        body.append("  the pubkey and OP_EQUALVERIFY fails for every possible scriptSig. The")
+        body.append("  photons on this output cannot be recovered, and the child NFT whose ref")
+        body.append("  it names was consumed to create it and cannot be re-minted.")
+        body.append("  Collection membership now lives in the envelope's 'in' field.")
     elif type_ == "dmint":
         version = payload.get("version", "?")
         body.append(f"  version:      dMint {version}")
@@ -376,6 +391,9 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool)
         type=dmint        → version (v1|v2), contract_ref_outpoint,
                             token_ref_outpoint, height, max_height, reward,
                             algo, daa_mode
+        type=container-legacy → spendable (always false), ref_outpoint,
+                            child_ref_outpoint, owner_pkh, note. A dead
+                            pre-0.15.0 CONTAINER output; nothing can spend it.
         type=unknown      → (no extra fields)
       txid (--fetch)   → {form, txid, byte_length, input_count, output_count,
                           outputs[], metadata, mint_scriptsig}

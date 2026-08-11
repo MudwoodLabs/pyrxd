@@ -234,8 +234,11 @@ result = await minter.deploy_ft(metadata, supply=1_000_000)
 ```
 
 `GlyphBuilder` remains the lower-level API when you need to compose the
-transactions yourself (mutable NFTs, containers, WAVE names and dMint deploys
-have different reveal shapes and are built through it directly).
+transactions yourself (mutable NFTs, WAVE names, dMint deploys and minting into
+a collection have different reveal shapes and are built through it directly).
+A collection itself (`CONTAINER`) is an ordinary NFT and mints through
+`GlyphMinter` — see
+[Create a token collection](https://mudwoodlabs.github.io/pyrxd/how-to/create-a-token-collection.html).
 
 See [`examples/glyph_mint_demo.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/glyph_mint_demo.py) for a
 complete end-to-end NFT mint, and [`examples/ft_deploy_premine.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/examples/ft_deploy_premine.py)

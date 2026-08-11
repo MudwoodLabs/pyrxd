@@ -1102,6 +1102,7 @@ function renderScriptCard(payload) {
     dmint: "dMint contract output",
     "commit-ft": "FT commit script",
     "commit-nft": "NFT commit script",
+    "container-legacy": "Dead container output (unspendable)",
     p2pkh: "P2PKH locking script",
     op_return: "OP_RETURN data output",
     unknown: "Unrecognised script",
@@ -1117,6 +1118,9 @@ function renderScriptCard(payload) {
   if (payload.ref_txid) dl.appendChild(kv("ref txid", payload.ref_txid));
   if (payload.ref_vout !== undefined) dl.appendChild(kv("ref vout", payload.ref_vout));
   if (payload.ref_outpoint) dl.appendChild(kv("ref outpoint", payload.ref_outpoint));
+  if (payload.child_ref_outpoint) {
+    dl.appendChild(kv("child ref outpoint", payload.child_ref_outpoint));
+  }
   if (payload.payload_hash) dl.appendChild(kv("payload hash (sha256)", payload.payload_hash));
 
   // dMint-specific fields
@@ -1148,6 +1152,14 @@ function renderScriptCard(payload) {
     }));
   }
 
+  // A dead pre-0.15.0 container output. The `note` the classifier attaches is
+  // the whole value of recognising the shape at all — without it the holder
+  // just sees an unfamiliar type and goes looking for a wallet that can move
+  // it. None can.
+  if (payload.spendable === false && payload.note) {
+    wrapper.appendChild(el("p", { class: "card-note", text: payload.note }));
+  }
+
   // Structural-match qualifier (issue #53 / PR #58). Same wording the
   // CLI's _render_script_human emits.
   const qualifier = _structuralQualifierNote(type);
@@ -1163,6 +1175,9 @@ function renderScriptCard(payload) {
 // `commit` badge colour.
 function scriptBadgeKind(type) {
   if (type.startsWith("commit")) return "commit";
+  // No badge colour is defined for the dead container shape; reuse the
+  // `unknown` styling rather than emitting a class the stylesheet lacks.
+  if (type === "container-legacy") return "unknown";
   return type;
 }
 

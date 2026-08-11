@@ -21,6 +21,7 @@ from .script import (
     build_nft_locking_script,
     extract_ref_from_nft_script,
     hash_payload,
+    is_legacy_container_script,
 )
 from .types import GlyphMetadata, GlyphProtocol, GlyphRef, GlyphRoyalty
 
@@ -177,12 +178,33 @@ class MutableRevealScripts:
 
 @dataclass
 class ContainerRevealScripts:
-    """Scripts for a CONTAINER reveal."""
+    """Scripts for a CONTAINER reveal.
+
+    ``locking_script`` is the plain 63-byte NFT singleton — a container has no
+    distinct script shape (see :meth:`GlyphBuilder.prepare_container_reveal`).
+    """
 
     ref: GlyphRef
-    locking_script: bytes  # NFT body, optionally prefixed with child ref
+    locking_script: bytes  # 63-byte NFT singleton
     scriptsig_suffix: bytes
-    child_ref: GlyphRef | None
+    # Always ``None``. Retained so callers that destructure this dataclass keep
+    # working; the child-ref prefix it used to describe was removed in 0.15.0.
+    child_ref: GlyphRef | None = None
+
+
+@dataclass
+class ContainerChildRevealScripts:
+    """Scripts for revealing a token as a member of a container.
+
+    See :meth:`GlyphBuilder.prepare_container_child_reveal` for the two-input /
+    two-output reveal shape these must be placed in.
+    """
+
+    ref: GlyphRef  # the child's own genesis ref (its commit outpoint)
+    nft_script: bytes  # 63-byte NFT singleton for the child (output 0)
+    container_script: bytes  # 63-byte NFT singleton re-creating the container (output 1)
+    scriptsig_suffix: bytes  # 'gly' + CBOR; caller prepends sig + pubkey
+    container_ref: GlyphRef  # the container this child declares membership in
 
 
 class GlyphBuilder:
@@ -212,6 +234,8 @@ class GlyphBuilder:
     | Mint a mutable NFT       | ``[NFT, MUT]``    | :meth:`prepare_mutable_reveal`        |
     +--------------------------+-------------------+---------------------------------------+
     | Mint a collection        | ``[NFT,CONTAINER]`| :meth:`prepare_container_reveal`      |
+    +--------------------------+-------------------+---------------------------------------+
+    | Mint into a collection   | ``[NFT]`` + ``in``| :meth:`prepare_container_child_reveal`|
     +--------------------------+-------------------+---------------------------------------+
     | Mint a WAVE name         | ``[NFT,MUT,WAVE]``| :meth:`prepare_wave_reveal`           |
     +--------------------------+-------------------+---------------------------------------+
@@ -678,43 +702,154 @@ class GlyphBuilder:
         owner_pkh: Hex20,
         child_ref: GlyphRef | None = None,
     ) -> ContainerRevealScripts:
-        """Prepare scripts for a CONTAINER reveal.
+        """Prepare scripts for a CONTAINER (collection) reveal.
 
-        A container is an NFT with an additional ``OP_PUSHINPUTREF <child_ref>``
-        prefix that links it to a child token ref.  When ``child_ref`` is
-        ``None`` the container is created empty (no child ref in locking script).
+        A container's locking script is the **plain 63-byte NFT singleton** of
+        :func:`~pyrxd.glyph.script.build_nft_locking_script`. Container-ness is
+        carried by the ``7`` marker in the envelope's ``p`` field, exactly as in
+        Photonic Wallet (``packages/lib/src/script.ts`` has one ``nftScript``
+        and no container variant). That is what makes a container a first-class
+        token: every NFT classifier, the scanner, and
+        :meth:`build_nft_transfer_tx` handle it unchanged.
+
+        Membership points **child → parent** and lives in the *child's*
+        envelope, in the ``in`` field
+        (:attr:`~pyrxd.glyph.types.GlyphMetadata.container_refs`). Use
+        :meth:`prepare_container_child_reveal` to mint a member.
 
         Protocol field must include ``GlyphProtocol.CONTAINER`` (7).
+
+        :param child_ref: **Removed.** Passing anything but ``None`` raises
+            :class:`~pyrxd.security.errors.ValidationError`; see below.
+
+        The ``child_ref`` prefix (removed in 0.15.0)
+        -------------------------------------------
+
+        pyrxd 0.9.0–0.14.0 prefixed the NFT body with ``OP_PUSHINPUTREF
+        <child_ref>`` when ``child_ref`` was given. That 100-byte script was
+        never a working token, and both defects were confirmed against a
+        Radiant Core v3.1.1 regtest node
+        (``tests/test_container_regtest_e2e.py``):
+
+        * **The output could not be spent.** ``OP_PUSHINPUTREF`` leaves the ref
+          on the stack and nothing drops it, so the P2PKH tail hashed the *ref*
+          and ``OP_EQUALVERIFY`` failed for every possible scriptSig. Any
+          photons placed on it were unrecoverable.
+        * **Creating one destroyed the child NFT.** ``OP_PUSHINPUTREFSINGLETON``
+          also registers its ref as a disallowed *sibling*
+          (``CScript::GetPushRefs``), so the child could not be re-created
+          alongside the container — and a singleton consumed into a ``0xd0``
+          push never re-enters ``inputSingletonRefSet``, so it can never be
+          minted again.
+
+        Even with the missing ``OP_DROP`` repaired, a script-level link to a
+        live NFT is impossible on Radiant for the second reason, and a repaired
+        link would still be droppable by the holder at any transfer. Membership
+        is therefore metadata, here as in Photonic.
         """
+        if child_ref is not None:
+            raise ValidationError(
+                "prepare_container_reveal(child_ref=...) was removed in pyrxd 0.15.0: the 100-byte script it "
+                "built was permanently unspendable (OP_PUSHINPUTREF left the ref on the stack, so the P2PKH "
+                "OP_EQUALVERIFY could never pass) and creating it destroyed the child NFT's singleton ref "
+                "irrecoverably. Collection membership lives in the CHILD's envelope: mint the child with "
+                "GlyphMetadata(container_refs=[<container ref>]) and build its reveal with "
+                "prepare_container_child_reveal(). See docs/reference/glyph-token-protocol-spec.md."
+            )
+        self._assert_protocol(cbor_bytes, GlyphProtocol.CONTAINER, "CONTAINER")
+
+        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        return ContainerRevealScripts(
+            ref=ref,
+            locking_script=build_nft_locking_script(owner_pkh, ref),
+            scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
+            child_ref=None,
+        )
+
+    def prepare_container_child_reveal(
+        self,
+        commit_txid: str,
+        commit_vout: int,
+        cbor_bytes: bytes,
+        owner_pkh: Hex20,
+        container_ref: GlyphRef,
+        container_owner_pkh: Hex20,
+    ) -> ContainerChildRevealScripts:
+        """Prepare scripts for revealing a token **into** a container.
+
+        The child is an ordinary NFT. What makes its membership *checkable* is
+        the transaction shape: the reveal spends the container's own NFT UTXO
+        and re-creates it unchanged, so the container ref appears among the
+        reveal's output-script refs. Photonic's indexer only honours an ``in``
+        entry that it can find there (``filterRels``,
+        ``packages/app/src/electrum/worker/NFT.ts``) — a claimed ``in`` ref with
+        no matching output ref is dropped, which is what stops anyone declaring
+        their token part of someone else's collection.
+
+        Build the reveal with **two** inputs — the commit outpoint and the
+        container NFT UTXO — and **two** token outputs:
+
+        =========  ==================================================
+        output      script
+        =========  ==================================================
+        ``0``       :attr:`~ContainerChildRevealScripts.nft_script`
+        ``1``       :attr:`~ContainerChildRevealScripts.container_script`
+        =========  ==================================================
+
+        (plus any change). The container output is byte-identical to the one
+        being spent when ``container_owner_pkh`` is unchanged, so the container
+        neither moves nor changes hands.
+
+        ``cbor_bytes`` MUST already declare the membership — encode the child's
+        metadata with ``container_refs=[container_ref]``. This method
+        cross-checks it rather than editing the payload, because the payload
+        hash is already committed to on chain by the commit output.
+
+        :raises ValidationError: the envelope is unparseable, does not include
+            ``GlyphProtocol.NFT``, or its ``in`` list does not contain
+            ``container_ref``.
+        """
+        self._assert_protocol(cbor_bytes, GlyphProtocol.NFT, "container child")
         try:
-            cbor_data = cbor2.loads(cbor_bytes)
-            protocol = cbor_data.get("p", [])
-            if GlyphProtocol.CONTAINER not in protocol:
+            declared = cbor2.loads(cbor_bytes).get("in") or []
+        except Exception as exc:
+            raise ValidationError(f"Could not parse CBOR for container-membership cross-check: {exc}") from exc
+        wanted = container_ref.to_bytes()
+        found = [
+            bytes(i.value if isinstance(i, cbor2.CBORTag) else i)
+            for i in declared
+            if isinstance(i, (bytes, bytearray, cbor2.CBORTag))
+        ]
+        if wanted not in found:
+            raise ValidationError(
+                f"child envelope's 'in' list does not contain the container ref "
+                f"{container_ref.txid}:{container_ref.vout}. Encode the child metadata with "
+                f"container_refs=[GlyphRef(txid={container_ref.txid!r}, vout={container_ref.vout})] — an 'in' "
+                "entry with no matching ref in the reveal's outputs is discarded by indexers."
+            )
+
+        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
+        return ContainerChildRevealScripts(
+            ref=ref,
+            nft_script=build_nft_locking_script(owner_pkh, ref),
+            container_script=build_nft_locking_script(container_owner_pkh, container_ref),
+            scriptsig_suffix=build_reveal_scriptsig_suffix(cbor_bytes),
+            container_ref=container_ref,
+        )
+
+    @staticmethod
+    def _assert_protocol(cbor_bytes: bytes, marker: GlyphProtocol, label: str) -> None:
+        """Cross-check that ``cbor_bytes`` declares *marker* in its ``p`` field."""
+        try:
+            protocol = cbor2.loads(cbor_bytes).get("p", [])
+            if marker not in protocol:
                 raise ValidationError(
-                    f"CBOR protocol field {protocol!r} must include GlyphProtocol.CONTAINER ({GlyphProtocol.CONTAINER})"
+                    f"CBOR protocol field {protocol!r} must include GlyphProtocol.{marker.name} ({int(marker)})"
                 )
         except ValidationError:
             raise
         except Exception as exc:
-            raise ValidationError(f"Could not parse CBOR for CONTAINER cross-check: {exc}") from exc
-
-        ref = GlyphRef(txid=commit_txid, vout=commit_vout)
-        nft_body = build_nft_locking_script(owner_pkh, ref)
-
-        if child_ref is not None:
-            # Prefix: OP_PUSHINPUTREF (0xd0) + 36-byte child ref wire bytes
-            prefix = bytes([0xD0]) + child_ref.to_bytes()
-            locking_script = prefix + nft_body
-        else:
-            locking_script = nft_body
-
-        scriptsig_suffix = build_reveal_scriptsig_suffix(cbor_bytes)
-        return ContainerRevealScripts(
-            ref=ref,
-            locking_script=locking_script,
-            scriptsig_suffix=scriptsig_suffix,
-            child_ref=child_ref,
-        )
+            raise ValidationError(f"Could not parse CBOR for {label} cross-check: {exc}") from exc
 
     # ------------------------------------------------------------------
     # WAVE reveal
@@ -820,6 +955,10 @@ class GlyphBuilder:
         The trial signature is discarded (reset unlocking_script = None before final sign)
         so the final tx carries a signature over the *final* outputs, not the trial ones.
 
+        A CONTAINER is transferred by this method too — its locking script *is*
+        the 63-byte NFT singleton, and its collection membership lives in the
+        envelope, so a transfer cannot drop it. Nothing extra to do.
+
         :param params: TransferParams — see dataclass docstring
         :returns: TransferResult — signed tx, new locking script, ref, fee
         :raises ValidationError: nft_script is not a valid 63-byte NFT script
@@ -838,6 +977,16 @@ class GlyphBuilder:
         #    first byte != 0xd8.
         if not isinstance(params.nft_script, (bytes, bytearray)):
             raise ValidationError("nft_script must be bytes")
+        if is_legacy_container_script(bytes(params.nft_script).hex()):
+            # Say WHY rather than "not a valid NFT script": this output cannot be
+            # spent by anyone, and the holder needs to know that instead of
+            # hunting for a builder that would move it.
+            raise ValidationError(
+                "this is a pre-0.15.0 CONTAINER-with-child-ref output (100 bytes) and it is permanently "
+                "unspendable: OP_PUSHINPUTREF leaves the child ref on the stack, so the P2PKH tail hashes "
+                "the ref and OP_EQUALVERIFY fails for every scriptSig. No transfer of it can succeed. See "
+                "pyrxd.glyph.script.is_legacy_container_script."
+            )
         ref = extract_ref_from_nft_script(bytes(params.nft_script))
 
         # 2. Build the new NFT locking script for the recipient (ref unchanged).

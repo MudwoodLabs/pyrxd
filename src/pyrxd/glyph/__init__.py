@@ -16,6 +16,7 @@ from __future__ import annotations
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "AirdropFunding": ("pyrxd.glyph.ft", "AirdropFunding"),
     "AirdropRecipient": ("pyrxd.glyph.ft", "AirdropRecipient"),
+    "ContainerChildRevealScripts": ("pyrxd.glyph.builder", "ContainerChildRevealScripts"),
     "ContainerRevealScripts": ("pyrxd.glyph.builder", "ContainerRevealScripts"),
     "DaaMode": ("pyrxd.glyph.dmint", "DaaMode"),
     "DmintAlgo": ("pyrxd.glyph.dmint", "DmintAlgo"),

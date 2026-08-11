@@ -141,6 +141,13 @@ from .types import GlyphRef
 # ---------------------------------------------------------------------------
 
 NFT_SCRIPT_RE = re.compile(r"^d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$")
+# The 100-byte shape ``prepare_container_reveal(child_ref=...)`` emitted in
+# pyrxd 0.9.0 through 0.14.0. It is recognised ONLY so that a holder of one can
+# be told what it is; it is NOT a token shape pyrxd builds any more, and any
+# output carrying it is permanently unspendable. See
+# :func:`is_legacy_container_script`.
+LEGACY_CONTAINER_SCRIPT_RE = re.compile(r"^d0[0-9a-f]{72}d8[0-9a-f]{72}7576a914[0-9a-f]{40}88ac$")
+LEGACY_CONTAINER_SCRIPT_SIZE = 100
 FT_SCRIPT_RE = re.compile(r"^76a914[0-9a-f]{40}88acbdd0[0-9a-f]{72}dec0e9aa76e378e4a269e69d$")
 # NFT commit uses OP_2 (52) for SINGLETON ref type; FT commit uses OP_1 (51) for NORMAL ref type.
 COMMIT_SCRIPT_NFT_RE = re.compile(r"^aa20[0-9a-f]{64}8803676c7988c0c8c0c954807eda529d76a914[0-9a-f]{40}88ac$")
@@ -234,6 +241,52 @@ def is_nft_script(script_hex: str) -> bool:
 def is_ft_script(script_hex: str) -> bool:
     """Return True if script_hex matches the FT locking pattern."""
     return bool(FT_SCRIPT_RE.fullmatch(script_hex.lower()))
+
+
+def is_legacy_container_script(script_hex: str) -> bool:
+    """Return True for the 100-byte "CONTAINER with a child ref" script.
+
+    ``d0 <child_ref:36> d8 <container_ref:36> 75 76 a9 14 <pkh:20> 88 ac``
+
+    pyrxd 0.9.0–0.14.0 built this from
+    ``GlyphBuilder.prepare_container_reveal(..., child_ref=...)``. It is not a
+    working token and pyrxd no longer builds it. Two independent defects, both
+    confirmed against a Radiant Core v3.1.1 regtest node
+    (``tests/test_container_regtest_e2e.py``):
+
+    1. **The output is permanently unspendable.** ``OP_PUSHINPUTREF`` pushes the
+       child ref and nothing drops it, so the P2PKH tail runs ``OP_DUP
+       OP_HASH160`` over the *ref* instead of the pubkey and
+       ``OP_EQUALVERIFY`` can never succeed. Rejected with
+       ``mandatory-script-verify-flag-failed (Script failed an OP_EQUALVERIFY
+       operation)``. Whatever photons sit on the output are unrecoverable.
+    2. **Creating one destroys the child NFT.** A ref pushed by
+       ``OP_PUSHINPUTREFSINGLETON`` in one output may not appear in any sibling
+       output (``CScript::GetPushRefs`` files a singleton into
+       ``foundDisallowedSiblingRefs``), so the child cannot be re-created in the
+       same transaction — and once the singleton has been consumed into a
+       ``0xd0`` push it is absent from ``inputSingletonRefSet`` forever, so it
+       can never be re-minted either.
+
+    This predicate exists so a holder of such an output gets told that, rather
+    than seeing ``unknown``. Membership now lives in the envelope's ``in``
+    field; see :attr:`~pyrxd.glyph.types.GlyphMetadata.container_refs`.
+    """
+    return bool(LEGACY_CONTAINER_SCRIPT_RE.fullmatch(script_hex.lower()))
+
+
+def parse_legacy_container_script(script: bytes) -> tuple[GlyphRef, GlyphRef, Hex20] | None:
+    """Parse a legacy container script into ``(container_ref, child_ref, owner_pkh)``.
+
+    Returns ``None`` if *script* is not that shape. See
+    :func:`is_legacy_container_script` for why such an output is dead.
+    """
+    if len(script) != LEGACY_CONTAINER_SCRIPT_SIZE or not LEGACY_CONTAINER_SCRIPT_RE.fullmatch(script.hex()):
+        return None
+    child_ref = GlyphRef.from_bytes(script[1:37])
+    container_ref = GlyphRef.from_bytes(script[38:74])
+    owner_pkh = Hex20(script[78:98])
+    return container_ref, child_ref, owner_pkh
 
 
 def is_commit_script(script_hex: str) -> bool:

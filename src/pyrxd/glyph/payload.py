@@ -9,7 +9,7 @@ from pyrxd.security.errors import ValidationError
 
 from .dmint import DmintCborPayload
 from .script import hash_payload
-from .types import GlyphCreator, GlyphMedia, GlyphMetadata, GlyphPolicy, GlyphRights, GlyphRoyalty
+from .types import GlyphCreator, GlyphMedia, GlyphMetadata, GlyphPolicy, GlyphRef, GlyphRights, GlyphRoyalty
 
 _log = logging.getLogger(__name__)
 
@@ -74,6 +74,48 @@ def _decode_attrs(raw: object) -> dict[str, str]:
     if len(raw) > _MAX_ATTRS_COUNT:
         raise ValidationError(f"'attrs' map too large: {len(raw)} entries > {_MAX_ATTRS_COUNT}")
     return {str(k): str(v) for k, v in raw.items()}
+
+
+def _decode_rel_refs(raw: object, key: str) -> tuple[GlyphRef, ...]:
+    """Decode a CBOR relationship list (``in`` / ``by``) into ``GlyphRef``\\ s.
+
+    Each entry is a 36-byte ref in the SAME wire form the locking script uses
+    (``txid`` reversed || ``vout`` little-endian) — Photonic Wallet's
+    ``filterRels`` (``packages/app/src/electrum/worker/NFT.ts``) compares these
+    bytes directly against the refs it parsed out of the reveal's *output*
+    scripts, so any other encoding makes the relationship unverifiable.
+
+    Two producer shapes exist in the wild and both are accepted:
+
+    * a plain CBOR byte string (what Photonic's ``Mint.tsx`` writes, and what
+      :meth:`~pyrxd.glyph.types.GlyphMetadata.to_cbor_dict` emits);
+    * a byte string wrapped in **CBOR tag 64** (uint8-array), which some
+      cbor-x configurations emit — the reference mainnet Glyph carries its
+      ``by`` refs this way.
+
+    Malformed entries (wrong length, wrong type) are dropped with a warning
+    rather than failing the whole decode: this field is advisory metadata on an
+    attacker-controlled envelope, and one bad entry must not make an otherwise
+    readable token undecodable. Nothing downstream treats a decoded ref as
+    proof of membership — see the CONTAINER section of the protocol spec.
+    """
+    if raw is None:
+        return ()
+    if not isinstance(raw, (list, tuple)):
+        _log.warning("decode_payload: CBOR field %r is not a list; ignored", key)
+        return ()
+    refs: list[GlyphRef] = []
+    for item in raw:
+        if isinstance(item, cbor2.CBORTag):
+            item = item.value
+        if not isinstance(item, (bytes, bytearray)) or len(item) != 36:
+            _log.warning("decode_payload: dropping malformed %r entry (%r)", key, type(item).__name__)
+            continue
+        try:
+            refs.append(GlyphRef.from_bytes(bytes(item)))
+        except ValidationError as exc:  # pragma: no cover — length already checked
+            _log.warning("decode_payload: dropping undecodable %r entry: %s", key, exc)
+    return tuple(refs)
 
 
 def _decode_decimals(raw: object) -> int:
@@ -166,6 +208,8 @@ def decode_payload(cbor_bytes: bytes) -> GlyphMetadata:
 
     return GlyphMetadata(
         protocol=d["p"],
+        container_refs=_decode_rel_refs(d.get("in"), "in"),
+        author_refs=_decode_rel_refs(d.get("by"), "by"),
         name=_cbor_str(d, "name", 64),
         ticker=_cbor_str(d, "ticker", 16),
         description=_cbor_str(d, "desc", 1000),

@@ -36,8 +36,9 @@ from pyrxd.glyph.payload import (
     decode_payload,
     encode_payload,
 )
-from pyrxd.glyph.types import GlyphMedia, GlyphMetadata
+from pyrxd.glyph.types import GlyphMedia, GlyphMetadata, GlyphRef
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.types import Txid
 
 _BUDGET_MULT = int(os.environ.get("FUZZ_BUDGET_MULTIPLIER", "1"))
 
@@ -102,11 +103,24 @@ def _dmint_payload(draw) -> DmintCborPayload:
     )
 
 
+_ref = st.builds(
+    GlyphRef,
+    txid=st.binary(min_size=32, max_size=32).map(lambda b: Txid(b.hex())),
+    vout=st.integers(min_value=0, max_value=0xFFFFFFFF),
+)
+# ``in`` / ``by`` are lists of 36-byte wire refs. Kept short: the property under
+# test is that each entry survives encode→decode intact, not that long lists do
+# something different.
+_rel_refs = st.lists(_ref, max_size=3).map(tuple)
+
+
 @st.composite
 def _metadata(draw) -> GlyphMetadata:
     protocol = draw(st.sampled_from(_PROTOCOL_COMBOS))
     dmint = draw(_dmint_payload()) if 4 in protocol else None
     return GlyphMetadata(
+        container_refs=draw(_rel_refs),
+        author_refs=draw(_rel_refs),
         protocol=list(protocol),
         name=draw(_text),
         ticker=draw(st.text(max_size=16)),

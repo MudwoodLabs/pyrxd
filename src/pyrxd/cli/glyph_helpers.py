@@ -329,7 +329,11 @@ def _scaffold_for(kind: str) -> dict:
     if kind == "mutable-nft":
         return {**base, "protocol": ["NFT", "MUT"], "token_type": "mutable"}  # nosec B105 — token-type tag
     if kind == "container-nft":
-        return {**base, "protocol": ["NFT", "CONTAINER"], "token_type": "collection"}  # nosec B105 — token-type tag
+        # ``token_type`` is Photonic's ``type`` field, and its container value is
+        # the literal string "container" (packages/app/src/pages/Mint.tsx:
+        # ``TokenType = "object" | "container" | "user" | "fungible"``). Emitting
+        # "collection" here produced a token Photonic renders as a plain object.
+        return {**base, "protocol": ["NFT", "CONTAINER"], "token_type": "container"}  # nosec B105 — token-type tag
     # Should be unreachable thanks to click.Choice.
     raise UserError(f"unknown template type: {kind}")  # pragma: no cover
 

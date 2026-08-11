@@ -349,7 +349,6 @@ class TestProtocolGuards:
         "tag, builder_method",
         [
             (GlyphProtocol.MUT, "prepare_mutable_reveal"),
-            (GlyphProtocol.CONTAINER, "prepare_container_reveal"),
         ],
     )
     async def test_commit_nft_refuses_other_reveal_shapes(self, tag, builder_method):
@@ -357,6 +356,21 @@ class TestProtocolGuards:
         metadata = GlyphMetadata(protocol=[GlyphProtocol.NFT, tag], name="x")
         with pytest.raises(ValidationError, match=builder_method):
             await minter.commit_nft(metadata)
+
+    async def test_commit_nft_accepts_a_container(self):
+        """A CONTAINER's reveal IS the single-output NFT shape this facade builds.
+
+        Its locking script is the plain 63-byte singleton; container-ness lives in
+        the envelope's ``p`` field. Refusing it (as pyrxd did through 0.14.0) was a
+        leftover from the removed child-ref prefix, and it meant collections could
+        not be minted through the facade or the CLI at all.
+        """
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore())
+        metadata = GlyphMetadata(
+            protocol=[GlyphProtocol.NFT, GlyphProtocol.CONTAINER], name="collection", token_type="container"
+        )
+        pending = await minter.commit_nft(metadata)
+        assert pending.is_nft is True
 
     async def test_commit_nft_refuses_a_wave_name(self):
         """WAVE is [NFT, MUT, WAVE] — a two-output reveal, like MUT."""
