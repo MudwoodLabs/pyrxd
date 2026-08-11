@@ -6,6 +6,8 @@ import pytest
 
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import (
+    BTC_MAX_SATS,
+    RADIANT_MAX_PHOTONS,
     BlockHeight,
     Hex20,
     Hex32,
@@ -130,10 +132,22 @@ class TestPhotons:
     def test_valid_zero(self) -> None:
         assert Photons(0) == 0
 
-    def test_valid_large(self) -> None:
-        # No hard cap; just >= 0.
-        p = Photons(10**20)
-        assert p == 10**20
+    def test_accepts_every_value_the_radiant_chain_can_hold(self) -> None:
+        """Up to and including Radiant ``MAX_MONEY`` — which is 1000x Bitcoin's supply.
+
+        The number matters more than the boundary: ``Satoshis`` (cap 2.1e15) was applied to
+        Radiant photon values on the ElectrumX read path, so every legitimate holding above
+        21,000,000 RXD was reported as a malformed server response. A cap set to another
+        chain's supply is not conservative; it rejects the truth.
+        """
+        assert Photons(RADIANT_MAX_PHOTONS) == RADIANT_MAX_PHOTONS
+        # 1000x above the Bitcoin cap that used to be applied here, and still legal.
+        assert Photons(BTC_MAX_SATS * 1000) == RADIANT_MAX_PHOTONS
+        assert Photons(BTC_MAX_SATS + 1) == BTC_MAX_SATS + 1
+
+    def test_rejects_above_radiant_max_money(self) -> None:
+        with pytest.raises(ValidationError, match="Radiant MAX_MONEY"):
+            Photons(RADIANT_MAX_PHOTONS + 1)
 
     def test_rejects_negative(self) -> None:
         with pytest.raises(ValidationError):
@@ -142,6 +156,19 @@ class TestPhotons:
     def test_rejects_float(self) -> None:
         with pytest.raises(ValidationError):
             Photons(0.5)  # type: ignore[arg-type]
+
+
+def test_the_two_supply_caps_are_not_the_same_number() -> None:
+    """The premise the ``Satoshis``-on-Radiant bug rested on, pinned.
+
+    ``Satoshis`` carried a comment claiming Radiant *inherits* Bitcoin's supply bound.
+    It does not: 21,000,000,000 RXD vs 21,000,000 BTC, both at 1e8 sub-units.
+    """
+    assert BTC_MAX_SATS == 21_000_000 * 100_000_000
+    assert RADIANT_MAX_PHOTONS == 21_000_000_000 * 100_000_000
+    assert RADIANT_MAX_PHOTONS == BTC_MAX_SATS * 1000
+    assert Satoshis.MAX == BTC_MAX_SATS
+    assert Photons.MAX == RADIANT_MAX_PHOTONS
 
 
 class TestBlockHeight:

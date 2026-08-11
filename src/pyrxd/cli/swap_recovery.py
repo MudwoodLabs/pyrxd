@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -100,6 +101,13 @@ from pyrxd.gravity.htlc_covenant import (
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
 from pyrxd.security.errors import KeyMaterialError, ValidationError
+
+logger = logging.getLogger(__name__)
+
+#: Extra ``get_tip_height`` reads attempted when the tip a first read returned is BELOW
+#: the funding height the UTXO read reported. Two, not one: with per-call failover the
+#: first re-read can land on the same lagging endpoint that caused the disagreement.
+_TIP_REREAD_ATTEMPTS = 2
 
 __all__ = [
     "ETH_READ_ONLY_RPC_METHODS",
@@ -817,8 +825,27 @@ class CovenantChainState:
     ``-4`` against a 20-block CSV reports **24 blocks to the deadline** — more
     headroom than the CSV total, and a *lower* urgency multiplier — to an
     operator racing that deadline with no RBF and no CPFP to fix a slow
-    broadcast. Refusing to build the state at all turns a silently optimistic
-    number into a stopped run with a readable cause.
+    broadcast.
+
+    ``depth_unresolved``
+    --------------------
+    The one triple that is *not* self-contradictory but also not a depth is
+    ``funding_height > tip_height`` reached honestly. ``read_covenant_chain_state``
+    makes TWO round trips — ``listunspent`` then ``get_tip_height`` — and failover is
+    per call, so the tip can come from a different, lagging endpoint than the one that
+    answered ``listunspent``, and a reorg can land between them. That is not a lying
+    server; it is two reads of a moving chain.
+
+    Refusing to construct at all was wrong for that case: it fired inside the
+    constructor, before ``--allow-unconfirmed`` could be consulted, on the COLD-RECOVERY
+    path, during a CSV race, on a chain with no second chance. So the reader
+    re-reads the tip first (see :func:`read_covenant_chain_state`), and only if the
+    views still disagree records ``depth_unresolved=True``, keeping BOTH real numbers
+    rather than inventing a third. Nothing downstream then reads a depth it did not
+    measure: :func:`_assert_covenant_confirmed` refuses (overridably, same escape hatch),
+    :func:`build_cold_refund` refuses because CSV maturity cannot be shown, and
+    :func:`build_cold_claim` takes ``blocks_to_deadline = 0`` — MAXIMUM urgency, the
+    conservative direction, never the optimistic one this class exists to prevent.
     """
 
     outpoint: str  # "txid:vout"
@@ -826,10 +853,27 @@ class CovenantChainState:
     funding_height: int | None
     tip_height: int
     confirmations: int
+    #: Set only by :func:`read_covenant_chain_state` when a re-read could not reconcile
+    #: a funding height above the tip. Never a value an operator should pass by hand.
+    depth_unresolved: bool = False
 
     def __post_init__(self) -> None:
         if self.tip_height < 0:
             raise ValidationError(f"tip_height must be >= 0, got {self.tip_height}")
+        if self.depth_unresolved:
+            # The ONLY shape this flag describes: a real funding height, a real tip
+            # below it, and no depth claimed from the pair.
+            if self.funding_height is None or self.funding_height <= self.tip_height:
+                raise ValidationError(
+                    "depth_unresolved is only for a funding height that a re-read still put ABOVE the "
+                    f"tip; got funding_height={self.funding_height}, tip_height={self.tip_height}."
+                )
+            if self.confirmations != 0:
+                raise ValidationError(
+                    f"depth_unresolved claims {self.confirmations} confirmations. An unresolved depth is "
+                    "not a measured one — it must be 0."
+                )
+            return
         if self.funding_height is None:
             if self.confirmations != 0:
                 raise ValidationError(
@@ -849,7 +893,8 @@ class CovenantChainState:
                 f"{self.tip_height}. That cannot happen on a consistent view — the server is lying, "
                 "lagging, or you are pointed at the wrong network. Refusing rather than deriving a "
                 "negative confirmation count, which would be reported to you as EXTRA time before the "
-                "CSV deadline."
+                "CSV deadline. (Reached through a lagging endpoint or a reorg between two reads, this "
+                "is what read_covenant_chain_state's tip re-read and depth_unresolved are for.)"
             )
         expected = self.tip_height - self.funding_height + 1
         if self.confirmations != expected:
@@ -859,12 +904,26 @@ class CovenantChainState:
             )
 
 
-async def read_covenant_chain_state(client: Any, spk_hex: str) -> CovenantChainState:
+async def read_covenant_chain_state(
+    client: Any, spk_hex: str, *, tip_reread_attempts: int = _TIP_REREAD_ATTEMPTS
+) -> CovenantChainState:
     """Locate the live covenant UTXO for ``spk_hex`` and measure its depth.
 
     Refuses ambiguity rather than guessing: a covenant SPK that holds more than one
     UTXO cannot be resolved to "the" covenant outpoint, and picking one silently could
     build a spend of the wrong output.
+
+    **Two round trips, one moving chain.** ``listunspent`` and ``get_tip_height`` are
+    separate calls, and :class:`~pyrxd.network.failover.FailoverElectrumXClient` picks
+    an endpoint *per call* — so the tip can arrive from a different, lagging server than
+    the one that reported the UTXO, and a reorg can land between the two. Either
+    produces ``funding_height > tip_height``, which :class:`CovenantChainState` refuses.
+    That refusal is right about a single consistent view and wrong about this one, and
+    it fired in a constructor, ahead of ``--allow-unconfirmed``, on the cold-recovery
+    path. So the tip is re-read up to ``tip_reread_attempts`` times (the highest reading
+    wins — a tip only moves forward) before any conclusion is drawn. Only if the views
+    still disagree is ``depth_unresolved`` set, which every consumer treats
+    conservatively; see :class:`CovenantChainState`.
     """
     sh = electrumx_script_hash(spk_hex)
     utxos = list(await client.get_utxos(sh))
@@ -886,6 +945,32 @@ async def read_covenant_chain_state(client: Any, spk_hex: str) -> CovenantChainS
         )
     u = utxos[0]
     height = int(u.height) if int(u.height) > 0 else None
+    if height is not None and height > tip:
+        for _ in range(max(0, tip_reread_attempts)):
+            tip = max(tip, int(await client.get_tip_height()))
+            if height <= tip:
+                break
+    if height is not None and height > tip:
+        logger.warning(
+            "covenant %s:%s reports funding height %d but the best tip read across %d attempt(s) is %d. "
+            "Two reads of a moving chain (per-call failover, or a reorg between them) disagree, so the "
+            "confirmation depth is UNKNOWN — not zero. Treating it as unresolved: this run will assume "
+            "the deadline is imminent rather than assume time it has not measured. Re-run against a "
+            "single, caught-up endpoint to get a real depth.",
+            u.tx_hash,
+            u.tx_pos,
+            height,
+            max(0, tip_reread_attempts),
+            tip,
+        )
+        return CovenantChainState(
+            outpoint=f"{u.tx_hash}:{u.tx_pos}",
+            carrier_value=int(u.value),
+            funding_height=height,
+            tip_height=tip,
+            confirmations=0,
+            depth_unresolved=True,
+        )
     return CovenantChainState(
         outpoint=f"{u.tx_hash}:{u.tx_pos}",
         carrier_value=int(u.value),
@@ -1088,6 +1173,10 @@ class ColdSpend:
     overpay_multiple: float = 1.0
     #: True when the fee exceeds :func:`fee_overpay_ceiling` — reachable only via --allow-overpay.
     is_overpay: bool = False
+    #: True when ``csv_confirmations`` is 0 because the depth could not be MEASURED, not
+    #: because the covenant is 0-conf. Without it the payload would report "0 confirmations"
+    #: for a covenant that is almost certainly mined — a number nothing established.
+    depth_unresolved: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1108,6 +1197,7 @@ class ColdSpend:
             "csv_required": self.csv_required,
             "csv_confirmations": self.csv_confirmations,
             "csv_mature": self.csv_mature,
+            "depth_unresolved": self.depth_unresolved,
             "outputs": list(self.outputs),
             "overpay_multiple": self.overpay_multiple,
             "is_overpay": self.is_overpay,
@@ -1182,9 +1272,26 @@ def _assert_covenant_confirmed(chain: CovenantChainState, *, allow_unconfirmed: 
     nor CPFP on Radiant its own fee input is then squatted on until the 8h mempool expiry —
     inside the ``t_rxd`` window this claim exists to beat. The automated path already enforces
     this (``radiant_leg.RadiantCovenantLeg._resolve_covenant``); the cold path is now the same.
+
+    An UNRESOLVED depth (``depth_unresolved``) is refused by the same gate but for a
+    different reason and with a different message: the funding is almost certainly mined,
+    but two reads of the chain disagreed about how deep, so no depth was measured. The
+    ``--allow-unconfirmed`` override covers both — it is the operator saying "I know what
+    I am building on" — and this used to be reachable only because the pre-guard code
+    silently reported such a state as 0 confirmations.
     """
     if chain.confirmations >= 1 or allow_unconfirmed:
         return
+    if chain.depth_unresolved:
+        raise ValidationError(
+            f"the covenant's confirmation depth could not be established — refusing to build a cold "
+            f"{kind}. The UTXO reports funding height {chain.funding_height} while the best chain tip "
+            f"read was {chain.tip_height}: two reads of a moving chain disagree (a lagging endpoint, or "
+            "a reorg between them). Depth drives the CSV deadline arithmetic, and guessing it low would "
+            "report MORE time than you have. Re-run against a single, caught-up endpoint, or pass "
+            "--allow-unconfirmed to build anyway — the fee will then be sized as if the deadline were "
+            "imminent."
+        )
     raise ValidationError(
         f"the covenant funding is UNCONFIRMED (0 confirmations, mempool only) — refusing to build a cold "
         f"{kind}. A spend of an unconfirmed parent dies with it, and Radiant has neither RBF nor CPFP, so "
@@ -1210,7 +1317,8 @@ def build_cold_claim(
     which this claim must be **mined**, not merely broadcast. Clamped at 0 — a deadline
     already passed takes the maximum premium, never a negative one.
 
-    Refuses a 0-conf (mempool-only) covenant unless ``allow_unconfirmed`` — see
+    Refuses a 0-conf (mempool-only) covenant, and a covenant whose depth two chain reads
+    could not agree on, unless ``allow_unconfirmed`` — see
     :func:`_assert_covenant_confirmed`.
     """
     pol = policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY
@@ -1224,7 +1332,12 @@ def build_cold_claim(
         fee=fee,
         fee_policy=pol,
     )
-    blocks_to_deadline = max(0, covenant.refund_csv - chain.confirmations)
+    # An unresolved depth is not a depth of zero. ``chain.confirmations`` is 0 there only
+    # because there is nothing honest to put in it, and feeding that 0 into the
+    # subtraction below would report the FULL CSV window as remaining — the optimistic
+    # direction, on the path where being late is unrecoverable. Take 0 blocks to the
+    # deadline instead: maximum urgency premium, which costs fee and never time.
+    blocks_to_deadline = 0 if chain.depth_unresolved else max(0, covenant.refund_csv - chain.confirmations)
     size, floor, target, mult = _measure(tx, fee, pol, blocks_to_deadline=blocks_to_deadline)
     return ColdSpend(
         kind="claim",
@@ -1243,7 +1356,8 @@ def build_cold_claim(
         clears_target=fee.value >= target,
         csv_required=covenant.refund_csv,
         csv_confirmations=chain.confirmations,
-        csv_mature=chain.confirmations >= covenant.refund_csv,
+        csv_mature=not chain.depth_unresolved and chain.confirmations >= covenant.refund_csv,
+        depth_unresolved=chain.depth_unresolved,
         outputs=_decode_outputs(tx, covenant, "claim"),
         overpay_multiple=fee_overpay_multiple(fee.value, floor=floor, target=target),
         is_overpay=fee.value > fee_overpay_ceiling(floor=floor, target=target),
@@ -1274,12 +1388,22 @@ def build_cold_refund(
     RBF, that transaction would then squat on the covenant for up to 8 hours.
 
     ``allow_immature`` is about the CSV, NOT about the parent's existence on-chain: a 0-conf
-    covenant is still refused unless ``allow_unconfirmed`` is also passed.
+    covenant is still refused unless ``allow_unconfirmed`` is also passed. A covenant whose
+    depth is UNRESOLVED reads as immature here, which is the fail-closed direction — CSV
+    maturity is the one thing an unmeasured depth cannot be used to claim.
     """
     pol = policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY
     _assert_covenant_confirmed(chain, allow_unconfirmed=allow_unconfirmed, kind="refund")
-    mature = chain.confirmations >= covenant.refund_csv
+    mature = not chain.depth_unresolved and chain.confirmations >= covenant.refund_csv
     if not mature and not allow_immature:
+        if chain.depth_unresolved:
+            raise ValidationError(
+                f"the covenant's CSV maturity cannot be shown: it needs {covenant.refund_csv} "
+                f"confirmations and its depth is UNRESOLVED (funding height {chain.funding_height} vs "
+                f"best tip read {chain.tip_height} — two reads of a moving chain disagree). Re-run "
+                "against a single, caught-up endpoint, or pass --allow-immature to pre-build it anyway "
+                "(build now, broadcast at maturity) — but do NOT broadcast it before then."
+            )
         raise ValidationError(
             f"the covenant's CSV refund is not yet mature: it needs {covenant.refund_csv} confirmations "
             f"and has {chain.confirmations} ({covenant.refund_csv - chain.confirmations} block(s) to go). "
@@ -1313,6 +1437,7 @@ def build_cold_refund(
         csv_required=covenant.refund_csv,
         csv_confirmations=chain.confirmations,
         csv_mature=mature,
+        depth_unresolved=chain.depth_unresolved,
         outputs=_decode_outputs(tx, covenant, "refund"),
         overpay_multiple=fee_overpay_multiple(fee.value, floor=floor, target=target),
         is_overpay=fee.value > fee_overpay_ceiling(floor=floor, target=target),

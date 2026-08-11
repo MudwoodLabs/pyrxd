@@ -40,6 +40,7 @@ from pyrxd.security.types import BlockHeight, Txid
 from pyrxd.spv.proof import CovenantParams, SpvProofBuilder
 from pyrxd.spv.witness import strip_witness
 
+from .fee_policy import DeadlineFeePolicy
 from .transactions import build_claim_tx, build_finalize_tx
 from .types import ClaimResult, FinalizeResult, GravityOffer
 
@@ -85,6 +86,13 @@ class TradeConfig:
         is less than this many seconds away. Default 7200 (2 hours). Set to 0
         to disable. Takers should finalize immediately if this fires (audit
         04-S1 forfeit race).
+    fee_policy:
+        Min-relay rate ``claim`` and ``finalize`` size their transactions against.
+        ``None`` uses :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`
+        (mainnet). The builders have taken this since #407/#411; without it on the
+        config the high-level orchestrator could not reach the escape hatch at all,
+        so a regtest node — which advertises a tenth of the mainnet floor — had no
+        way to opt out.
     """
 
     min_btc_confirmations: int = 6  # MUST equal the covenant's header-depth N (default N=6)
@@ -92,6 +100,7 @@ class TradeConfig:
     max_poll_attempts: int = _DEFAULT_MAX_POLLS
     accept_short_deadline: bool = False
     deadline_warning_seconds: int = 7200
+    fee_policy: DeadlineFeePolicy | None = None
 
     def __post_init__(self) -> None:
         if self.deadline_warning_seconds < 0:
@@ -139,7 +148,9 @@ class GravityTrade:
                 offer_txid="...",
                 offer_vout=0,
                 offer_photons=10_000_000,
-                fee_sats=1000,
+                # Photons, at the 10,000/byte mainnet floor: size it from the tx you
+                # actually build. These are worked examples, not constants to copy.
+                fee_sats=3_000_000,  # ~300-byte claim
                 taker_privkey=privkey,
             )
             btc_txid = "..."  # broadcast BTC payment externally
@@ -151,7 +162,7 @@ class GravityTrade:
                 claimed_vout=0,
                 claimed_photons=claim.output_photons,
                 taker_address="...",
-                fee_sats=1000,
+                fee_sats=30_000_000,  # finalize carries the SPV proof: ~10x the claim
             )
     """
 
@@ -178,6 +189,7 @@ class GravityTrade:
         offer_photons: int,
         fee_sats: int,
         taker_privkey: PrivateKeyMaterial,
+        fee_policy: DeadlineFeePolicy | None = None,
     ) -> ClaimResult:
         """Spend the MakerOffer UTXO, creating a MakerClaimed UTXO.
 
@@ -199,9 +211,14 @@ class GravityTrade:
         offer_photons:
             Value of the MakerOffer UTXO in photons.
         fee_sats:
-            Radiant miner fee in photons.
+            Radiant miner fee in photons. Must clear the relay floor for the assembled
+            transaction's real size — at the mainnet floor of 10,000 photons/byte a
+            ~300-byte claim needs ~3,000,000 photons, not the ``1000`` this docstring
+            used to show.
         taker_privkey:
             Taker's secp256k1 private key.
+        fee_policy:
+            Per-call override of :attr:`TradeConfig.fee_policy`.
         """
         result = build_claim_tx(
             offer=offer,
@@ -211,6 +228,7 @@ class GravityTrade:
             fee_sats=fee_sats,
             taker_privkey=taker_privkey,
             accept_short_deadline=self._cfg.accept_short_deadline,
+            fee_policy=fee_policy or self._cfg.fee_policy,
         )
         await self._broadcast_radiant(result.tx_hex)
         logger.info("claim tx broadcast: %s", result.txid)
@@ -307,6 +325,7 @@ class GravityTrade:
         taker_address: str,
         fee_sats: int,
         btc_tx_height: int | None = None,
+        fee_policy: DeadlineFeePolicy | None = None,
     ) -> FinalizeResult:
         """Fetch the BTC SPV proof, verify it, and broadcast the finalize tx.
 
@@ -329,10 +348,15 @@ class GravityTrade:
         taker_address:
             Taker's Radiant P2PKH address to receive the photons.
         fee_sats:
-            Radiant miner fee in photons.
+            Radiant miner fee in photons. The finalize tx is by far the largest in this
+            module — it pushes the whole BTC transaction, N block headers and the Merkle
+            branch into one scriptSig — so its relay floor is an order of magnitude above
+            the claim's. A fee that was ample for a claim is nowhere near enough here.
         btc_tx_height:
             Optional: Bitcoin block height where *btc_txid* was confirmed.
             If not provided, the orchestrator will determine it automatically.
+        fee_policy:
+            Per-call override of :attr:`TradeConfig.fee_policy`.
 
         Raises
         ------
@@ -456,6 +480,7 @@ class GravityTrade:
             to_address=taker_address,
             fee_sats=fee_sats,
             minimum_output_photons=offer.photons_offered,
+            fee_policy=fee_policy or self._cfg.fee_policy,
         )
         await self._broadcast_radiant(result.tx_hex)
         logger.info("finalize tx broadcast: %s", result.txid)

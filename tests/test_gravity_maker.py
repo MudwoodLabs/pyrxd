@@ -11,17 +11,20 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pyrxd.fee_sizing import RADIANT_MIN_RELAY_PHOTONS_PER_KB, SIG_SIZE_SLACK_BYTES
 from pyrxd.gravity.codehash import compute_p2sh_script_pubkey
 from pyrxd.gravity.covenant import build_gravity_offer
+from pyrxd.gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from pyrxd.gravity.maker import (
     ActiveOffer,
     GravityMakerSession,
     GravityOfferParams,
     _p2sh_script_hash,
 )
+from pyrxd.gravity.transactions import build_cancel_tx
 from pyrxd.gravity.types import GravityOffer, MakerOfferResult
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.transaction.transaction import Transaction
 
@@ -450,6 +453,99 @@ class TestCancelOffer:
         addr = self._maker_address(priv)
         await session.cancel_offer(active, fee_sats=_CANCEL_FEE, maker_address=addr)
         client.broadcast.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_the_documented_flow_with_no_fee_argument_builds(self):
+        """``cancel_offer(active, maker_address=...)`` — the module's own example.
+
+        It carried ``fee_sats: int = 1000`` while the relay-floor gate demanded
+        2,850,000 for the 285-byte transaction it builds, so the documented call was
+        guaranteed to raise ``InsufficientFundsError``. The fixtures in this file were
+        updated to pass ``_CANCEL_FEE``; the production default was not, and nothing
+        exercised it. This test is that missing exercise.
+        """
+        priv = _make_privkey()
+        active = _make_active_offer(priv)
+        client = _make_mock_client("dd" * 32)
+        session = GravityMakerSession(rxd_client=client, maker_priv=priv)
+        txid = await session.cancel_offer(active, maker_address=self._maker_address(priv))
+        assert len(txid) == 64
+        client.broadcast.assert_called_once()
+
+    def test_the_auto_sized_fee_is_the_floor_for_the_bytes_actually_built(self):
+        """Not a constant that happens to be big enough — the tx's own measured floor.
+
+        The cancel scriptSig carries the whole MakerOffer redeem script, so its size is a
+        property of the offer. Any hard-coded default is either short for a large offer or
+        wasteful for a small one; the only right answer is measured.
+        """
+        priv = _make_privkey()
+        active = _make_active_offer(priv)
+        result = build_cancel_tx(
+            offer=active.offer,
+            funding_txid=active.offer_txid,
+            funding_vout=active.offer_vout,
+            funding_photons=active.offer_photons,
+            maker_address=TestCancelOffer()._maker_address(priv),
+            maker_privkey=priv,
+        )
+        policy = DEFAULT_RADIANT_DEADLINE_FEE_POLICY
+        assert result.fee_sats >= policy.min_relay_fee(result.tx_size)
+        # And tight, not merely sufficient: sized off the TRIAL pass, which can be up to 2
+        # bytes longer than the final one (a DER signature is 69-71 bytes and the two
+        # passes sign different messages), plus 3 bytes of slack for the single input. So
+        # the overpay is bounded by 5 bytes of fee — never a round number somebody guessed.
+        assert result.fee_sats <= policy.min_relay_fee(result.tx_size + 2 + SIG_SIZE_SLACK_BYTES)
+        assert result.output_photons == active.offer_photons - result.fee_sats
+
+    @pytest.mark.asyncio
+    async def test_a_regtest_fee_policy_reaches_the_builder(self):
+        """The escape hatch the builders already had, now reachable from the session.
+
+        ``fee_policy`` was threaded into all five builders but not into
+        ``GravityMakerSession``, so on regtest — which advertises a tenth of the mainnet
+        floor — the high-level API had no way to opt out of the mainnet number.
+        """
+        priv = _make_privkey()
+        active = _make_active_offer(priv)
+        # What a default regtest node advertises: a tenth of the mainnet effective floor
+        # (and exactly Radiant's legacy 0.01 RXD/kB, so no opt-out flag is needed).
+        regtest = DeadlineFeePolicy(relay_fee_per_kb=RADIANT_MIN_RELAY_PHOTONS_PER_KB)
+        session = GravityMakerSession(rxd_client=_make_mock_client("dd" * 32), maker_priv=priv, fee_policy=regtest)
+        addr = self._maker_address(priv)
+
+        with patch("pyrxd.gravity.maker.build_cancel_tx", wraps=build_cancel_tx) as spy:
+            await session.cancel_offer(active, maker_address=addr)
+        assert spy.call_args.kwargs["fee_policy"] is regtest
+
+        # And it is not decoration: the regtest floor really is a tenth of mainnet's.
+        cheap = build_cancel_tx(
+            offer=active.offer,
+            funding_txid=active.offer_txid,
+            funding_vout=active.offer_vout,
+            funding_photons=active.offer_photons,
+            maker_address=addr,
+            maker_privkey=priv,
+            fee_policy=regtest,
+        )
+        dear = build_cancel_tx(
+            offer=active.offer,
+            funding_txid=active.offer_txid,
+            funding_vout=active.offer_vout,
+            funding_photons=active.offer_photons,
+            maker_address=addr,
+            maker_privkey=priv,
+        )
+        assert cheap.fee_sats * 10 == dear.fee_sats
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_sub_floor_fee_is_still_refused(self):
+        """Auto-sizing is a default, not a bypass: an explicit bad number still fails."""
+        priv = _make_privkey()
+        active = _make_active_offer(priv)
+        session = GravityMakerSession(rxd_client=_make_mock_client(), maker_priv=priv)
+        with pytest.raises(InsufficientFundsError, match="below the required"):
+            await session.cancel_offer(active, fee_sats=1000, maker_address=self._maker_address(priv))
 
 
 # ---------------------------------------------------------------------------

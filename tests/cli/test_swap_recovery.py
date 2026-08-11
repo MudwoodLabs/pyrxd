@@ -507,20 +507,27 @@ async def test_read_covenant_chain_state_distinguishes_settled_from_never_funded
 
 
 @pytest.mark.asyncio
-async def test_read_covenant_chain_state_refuses_a_utxo_above_the_tip() -> None:
-    """A server reporting a UTXO deeper than the chain is refused, not subtracted.
+async def test_read_covenant_chain_state_records_an_unreconcilable_tip_as_unresolved() -> None:
+    """A funding height a re-read still puts above the tip yields ``depth_unresolved``.
 
-    ``confirmations`` is derived as ``tip - height + 1``, so a height above the
-    tip produces a NEGATIVE depth, and negative depth does not fail closed on the
-    way out: ``build_cold_claim`` reports ``max(0, refund_csv - confirmations)``
-    blocks to the deadline, which for ``-4`` against a 20-block CSV reads as 24 —
-    MORE headroom than the CSV total — plus a lower urgency multiplier, to an
-    operator racing that deadline on a chain with no RBF and no CPFP.
+    ``confirmations`` is derived as ``tip - height + 1``, so a height above the tip
+    produces a NEGATIVE depth, and negative depth does not fail closed on the way out:
+    ``build_cold_claim`` reports ``max(0, refund_csv - confirmations)`` blocks to the
+    deadline, which for ``-4`` against a 20-block CSV reads as 24 — MORE headroom than the
+    CSV total. So no depth is derived. Both real numbers are kept, and the flag makes every
+    consumer treat the depth as unknown rather than as zero (which is equally a guess, just
+    a smaller one).
     """
     sh = sr.electrumx_script_hash(COV_SPK)
     client = _NoBroadcastClient({sh: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=110)]}, tip=105)
-    with pytest.raises(ValidationError, match="above the chain tip"):
-        await sr.read_covenant_chain_state(client, COV_SPK)
+    state = await sr.read_covenant_chain_state(client, COV_SPK)
+    assert state.depth_unresolved is True
+    assert state.funding_height == 110
+    assert state.tip_height == 105
+    assert state.confirmations == 0
+    # The tip was re-read before that conclusion was drawn, not accepted on one look.
+    assert client.calls.count("get_tip_height") == 1 + sr._TIP_REREAD_ATTEMPTS
+    assert "broadcast" not in client.calls
 
 
 def test_covenant_chain_state_refuses_impossible_depth_triples() -> None:
@@ -704,6 +711,181 @@ def test_cold_refund_at_maturity_pays_the_maker_with_no_urgency_premium(swap_set
     assert spend.target_photons == spend.relay_floor_photons  # no premium on a refund
     assert spend.outputs[0]["scriptpubkey_hex"] == cov.maker_holder_script.hex()
     assert spend.outputs[0]["pays"].startswith("MAKER holder script")
+
+
+# --------------------------------------------------------------------------- lagging tip / reorg
+#
+# ``read_covenant_chain_state`` makes TWO round trips and failover picks an endpoint PER
+# CALL, so the tip can come from a lagging server and a reorg can land between the reads.
+# That produced ``funding_height > tip_height``, which ``CovenantChainState`` refused —
+# inside a constructor, ahead of ``--allow-unconfirmed``, on the cold-recovery path during
+# a CSV race. These cover the whole shape, not just the constructor.
+
+
+class _LaggingTipClient(_NoBroadcastClient):
+    """Answers ``listunspent`` from a caught-up view and the FIRST tip read from a stale one.
+
+    Exactly what a per-call-failover client produces when the two calls land on different
+    endpoints, and what a reorg between them looks like from the caller's side.
+    """
+
+    def __init__(self, utxos, *, stale_tip: int, real_tip: int, stale_reads: int) -> None:
+        super().__init__(utxos, tip=stale_tip)
+        self._real_tip = real_tip
+        self._stale_reads = stale_reads
+
+    async def get_tip_height(self):
+        self.calls.append("get_tip_height")
+        if self._stale_reads > 0:
+            self._stale_reads -= 1
+            return self._tip
+        return self._real_tip
+
+
+@pytest.mark.asyncio
+async def test_a_lagging_first_tip_read_is_reconciled_not_refused() -> None:
+    """The common case: one stale endpoint, then a caught-up one. Depth is REAL, not lost."""
+    sh = sr.electrumx_script_hash(COV_SPK)
+    client = _LaggingTipClient(
+        {sh: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=110)]},
+        stale_tip=105,
+        real_tip=112,
+        stale_reads=1,
+    )
+    state = await sr.read_covenant_chain_state(client, COV_SPK)
+    assert state.depth_unresolved is False
+    assert state.tip_height == 112
+    assert state.confirmations == 3  # 112 - 110 + 1
+    # It cost exactly one extra read, and only because the first one disagreed.
+    assert client.calls.count("get_tip_height") == 2
+
+
+@pytest.mark.asyncio
+async def test_a_consistent_first_read_costs_no_extra_round_trip() -> None:
+    """The re-read is a repair path, not a tax on every call."""
+    sh = sr.electrumx_script_hash(COV_SPK)
+    client = _NoBroadcastClient({sh: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=100)]}, tip=105)
+    await sr.read_covenant_chain_state(client, COV_SPK)
+    assert client.calls.count("get_tip_height") == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unresolved_depth_is_refused_but_the_operator_can_still_override(swap_setup) -> None:
+    """The regression, end to end.
+
+    At v0.15.0 this shape produced ``confirmations == 0``, which ``_assert_covenant_confirmed``
+    refused and ``--allow-unconfirmed`` could override. The constructor guard moved the
+    refusal EARLIER than the override — so the cold builders became unreachable during a CSV
+    race on a chain with no RBF and no CPFP. The override is reachable again.
+    """
+    cov, _t, _m, fee_key = swap_setup
+    sh = sr.electrumx_script_hash(COV_SPK)
+    client = _LaggingTipClient(
+        {sh: [UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=100_000, height=110)]},
+        stale_tip=105,
+        real_tip=105,
+        stale_reads=99,
+    )
+    chain = await sr.read_covenant_chain_state(client, COV_SPK)
+    assert chain.depth_unresolved is True
+
+    with pytest.raises(ValidationError, match="depth could not be established"):
+        sr.build_cold_claim(covenant=cov, chain=chain, preimage=P, fee_wif=fee_key.wif(), fee_utxo=_utxo(9_000_000))
+
+    spend = sr.build_cold_claim(
+        covenant=cov,
+        chain=chain,
+        preimage=P,
+        fee_wif=fee_key.wif(),
+        fee_utxo=_utxo(9_000_000),
+        allow_unconfirmed=True,
+    )
+    assert bytes.fromhex(spend.raw_hex)  # a real, decodable transaction
+
+
+def test_an_unresolved_depth_fees_as_if_the_deadline_were_imminent(swap_setup) -> None:
+    """The direction of the guess matters more than that a guess is made.
+
+    Reporting the unknown depth as 0 would put ``refund_csv - 0`` blocks on the clock — the
+    FULL CSV window, more headroom than any real state has — and hand the operator a lower
+    urgency multiplier precisely when the truth is unknown. So the deadline is taken as
+    already here: maximum premium, which costs fee and never time.
+    """
+    cov, _t, _m, fee_key = swap_setup
+    unresolved = sr.CovenantChainState(
+        outpoint="ab" * 32 + ":0",
+        carrier_value=100_000,
+        funding_height=110,
+        tip_height=105,
+        confirmations=0,
+        depth_unresolved=True,
+    )
+    spend = sr.build_cold_claim(
+        covenant=cov,
+        chain=unresolved,
+        preimage=P,
+        fee_wif=fee_key.wif(),
+        fee_utxo=_utxo(9_000_000),
+        allow_unconfirmed=True,
+    )
+    assert spend.blocks_to_deadline == 0
+    assert spend.urgency_multiplier == DeadlineFeePolicy().max_urgency_multiplier
+    # And the payload says the depth was never measured, rather than reporting the 0 as a fact.
+    assert spend.depth_unresolved is True
+    assert spend.to_dict()["depth_unresolved"] is True
+    assert spend.csv_mature is False
+    # A 0-conf mempool covenant, by contrast, really does have the whole window left.
+    mempool = sr.build_cold_claim(
+        covenant=cov,
+        chain=_chain(0),
+        preimage=P,
+        fee_wif=fee_key.wif(),
+        fee_utxo=_utxo(9_000_000),
+        allow_unconfirmed=True,
+    )
+    assert mempool.blocks_to_deadline == cov.refund_csv
+    assert spend.target_photons > mempool.target_photons
+
+
+def test_an_unresolved_depth_can_never_be_used_to_claim_csv_maturity(swap_setup) -> None:
+    """Fail-closed on the refund side: maturity is the one thing an unmeasured depth cannot show."""
+    cov, _t, _m, fee_key = swap_setup
+    unresolved = sr.CovenantChainState(
+        outpoint="ab" * 32 + ":0",
+        carrier_value=100_000,
+        # A funding height that, taken against a REAL tip, would be far past maturity.
+        funding_height=500,
+        tip_height=105,
+        confirmations=0,
+        depth_unresolved=True,
+    )
+    with pytest.raises(ValidationError, match="maturity cannot be shown"):
+        sr.build_cold_refund(
+            covenant=cov, chain=unresolved, fee_wif=fee_key.wif(), fee_utxo=_utxo(9_000_000), allow_unconfirmed=True
+        )
+    prebuilt = sr.build_cold_refund(
+        covenant=cov,
+        chain=unresolved,
+        fee_wif=fee_key.wif(),
+        fee_utxo=_utxo(9_000_000),
+        allow_unconfirmed=True,
+        allow_immature=True,
+    )
+    assert prebuilt.csv_mature is False
+
+
+def test_depth_unresolved_is_not_a_flag_an_operator_can_use_to_launder_a_bad_triple() -> None:
+    """The escape hatch is narrow: it describes ONE shape and claims no depth."""
+    base = {"outpoint": "ab" * 32 + ":0", "carrier_value": 100_000}
+    # Not above the tip — nothing to be unresolved about.
+    with pytest.raises(ValidationError, match="still put ABOVE the tip"):
+        sr.CovenantChainState(**base, funding_height=100, tip_height=105, confirmations=0, depth_unresolved=True)
+    # No funding height at all — that is the mempool shape, not this one.
+    with pytest.raises(ValidationError, match="still put ABOVE the tip"):
+        sr.CovenantChainState(**base, funding_height=None, tip_height=105, confirmations=0, depth_unresolved=True)
+    # Above the tip AND claiming a depth.
+    with pytest.raises(ValidationError, match="not a measured one"):
+        sr.CovenantChainState(**base, funding_height=110, tip_height=105, confirmations=6, depth_unresolved=True)
 
 
 def test_cold_spend_payload_never_carries_the_fee_key(swap_setup) -> None:

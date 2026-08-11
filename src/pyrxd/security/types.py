@@ -25,6 +25,8 @@ from typing import Any, ClassVar
 from .errors import ValidationError
 
 __all__ = [
+    "BTC_MAX_SATS",
+    "RADIANT_MAX_PHOTONS",
     "BlockHeight",
     "Hex20",
     "Hex32",
@@ -108,17 +110,45 @@ class Hex20(_FixedBytes):
 
 
 # --------------------------------------------------------------------------- Satoshis / Photons
+#
+# THESE TWO CAPS ARE NOT THE SAME NUMBER AND THE TYPES ARE NOT INTERCHANGEABLE.
+#
+# ``Satoshis`` once carried the comment "Radiant inherits Bitcoin's 21,000,000 * 10^8
+# hard supply upper bound", which is false: Radiant's ``MAX_MONEY`` is 21,000,000,000 RXD
+# — a THOUSAND times Bitcoin's supply — and this repo states that number in
+# ``pyrxd.glyph.builder`` and ``pyrxd.swap.rswp.orders``, which both derive it here now
+# rather than restating it. Acting on the false version made ``Satoshis`` reject
+# legitimate on-chain Radiant values: it was applied to ``blockchain.scripthash.listunspent``
+# in the RADIANT ElectrumX client, where a single UTXO above 21,000,000 RXD raised inside a
+# list comprehension and took every sibling UTXO on that address down with it, surfacing as
+# a ``NetworkError`` that the failover layer then read as a transport fault and used to
+# evict one healthy endpoint after another. A cap set to the wrong chain's supply is not a
+# conservative choice; it is an availability bug that fires hardest on the largest balances.
+#
+# Pick by CHAIN, never by which name reads better:
+#   * ``Satoshis`` — Bitcoin amounts only (``pyrxd.network.bitcoin``, ``pyrxd.btc_wallet``).
+#   * ``Photons``  — Radiant amounts, including Glyph FT unit counts, whose value IS the
+#     output's photon value (``glyph/builder.py``: 1 photon = 1 FT unit).
 
-# BTC-max cap. Radiant inherits Bitcoin's 21,000,000 * 10^8 = 2.1e15 sats hard
-# supply upper bound for validation purposes.
-_BTC_MAX_SATS: int = 2_100_000_000_000_000
+#: Bitcoin ``MAX_MONEY``: 21,000,000 BTC x 100,000,000 sats.
+BTC_MAX_SATS: int = 21_000_000 * 100_000_000
+
+#: Radiant ``MAX_MONEY``: 21,000,000,000 RXD x 100,000,000 photons. ``CheckTransaction``
+#: enforces ``MoneyRange`` on every output on every network, so no output, and no sum of
+#: outputs, can exceed this — a value above it did not come from the chain.
+RADIANT_MAX_PHOTONS: int = 21_000_000_000 * 100_000_000
+
+_BTC_MAX_SATS: int = BTC_MAX_SATS  # retained: referenced by name in older call sites
 
 
 class Satoshis(int):
-    """Non-negative integer amount in satoshis, capped at Bitcoin max supply."""
+    """Non-negative integer amount in **Bitcoin** satoshis, capped at Bitcoin max supply.
+
+    Not for Radiant values — see :data:`RADIANT_MAX_PHOTONS` and :class:`Photons`.
+    """
 
     __slots__ = ()
-    MAX: ClassVar[int] = _BTC_MAX_SATS
+    MAX: ClassVar[int] = BTC_MAX_SATS
 
     def __new__(cls, value: Any) -> Satoshis:
         # Reject bool (which is an int subclass) and non-int types like float.
@@ -126,21 +156,30 @@ class Satoshis(int):
             raise ValidationError(f"Satoshis must be int, got {type(value).__name__}")
         if value < 0:
             raise ValidationError(f"Satoshis must be >= 0, got {value}")
-        if value > _BTC_MAX_SATS:
-            raise ValidationError(f"Satoshis must be <= {_BTC_MAX_SATS}, got {value}")
+        if value > BTC_MAX_SATS:
+            raise ValidationError(f"Satoshis must be <= {BTC_MAX_SATS}, got {value}")
         return int.__new__(cls, value)
 
 
 class Photons(int):
-    """Non-negative integer amount in photons (RXD smallest unit)."""
+    """Non-negative integer amount in photons (RXD smallest unit), capped at Radiant max supply.
+
+    The cap is :data:`RADIANT_MAX_PHOTONS`, so every value a Radiant node can put in an
+    output constructs. It exists to catch the shapes a hostile or broken server can inject
+    that an unbounded ``int`` would carry into coin selection — a value large enough to
+    swamp any subtraction, or one parsed out of a field that was never a number.
+    """
 
     __slots__ = ()
+    MAX: ClassVar[int] = RADIANT_MAX_PHOTONS
 
     def __new__(cls, value: Any) -> Photons:
         if not isinstance(value, int) or isinstance(value, bool):
             raise ValidationError(f"Photons must be int, got {type(value).__name__}")
         if value < 0:
             raise ValidationError(f"Photons must be >= 0, got {value}")
+        if value > RADIANT_MAX_PHOTONS:
+            raise ValidationError(f"Photons must be <= {RADIANT_MAX_PHOTONS} (Radiant MAX_MONEY), got {value}")
         return int.__new__(cls, value)
 
 

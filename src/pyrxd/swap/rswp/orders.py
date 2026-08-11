@@ -29,7 +29,7 @@ from ...keys import PrivateKey
 from ...script.script import Script
 from ...script.type import P2PKH
 from ...security.errors import ValidationError
-from ...security.types import Hex20
+from ...security.types import RADIANT_MAX_PHOTONS, Hex20
 from ...transaction.transaction import Transaction
 from ...transaction.transaction_input import TransactionInput
 from ...transaction.transaction_output import TransactionOutput
@@ -57,7 +57,9 @@ from .wire import (
 
 # Radiant MAX_MONEY: 21,000,000,000 RXD × 100,000,000 photons. A demanded value above
 # this can never be funded; reporting such an order "fillable" would be a lie.
-_MAX_PHOTONS = 21_000_000_000 * 100_000_000
+# Derived from ``pyrxd.security.types`` rather than restated: the same number written out
+# in three places is how a BTC supply cap ended up on the Radiant ElectrumX client.
+_MAX_PHOTONS = RADIANT_MAX_PHOTONS
 
 
 def _contract_type_of(asset: Asset) -> int:

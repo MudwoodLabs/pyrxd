@@ -51,7 +51,7 @@ from typing import Any, TypeVar
 from ..hash import double_sha256
 from ..merkle_path import MerklePath
 from ..security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError
-from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
+from ..security.types import BlockHeight, Hex32, Photons, RawTx, Txid
 from .electrumx import ElectrumXClient, UtxoRecord
 from .registry import Endpoint, NetworkProfile
 
@@ -214,7 +214,7 @@ class FailoverElectrumXClient:
     async def get_transaction_merkle(self, txid: Txid, height: BlockHeight) -> MerklePath:
         return await self._run("get_transaction_merkle", lambda c: c.get_transaction_merkle(txid, height))
 
-    async def get_balance(self, script_hash: Hex32 | bytes | str) -> tuple[Satoshis, Satoshis]:
+    async def get_balance(self, script_hash: Hex32 | bytes | str) -> tuple[Photons, Photons]:
         return await self._run("get_balance", lambda c: c.get_balance(script_hash))
 
     async def get_utxos(self, script_hash: Hex32 | bytes | str) -> list[UtxoRecord]:

@@ -11,13 +11,16 @@ Three properties are worth more than the rest:
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock
+
 import pytest
 
 from pyrxd.hash import double_sha256
+from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.network.failover import FailoverElectrumXClient
 from pyrxd.network.registry import Endpoint, NetworkProfile
 from pyrxd.security.errors import NetworkError, PolicyRejection, TlsPinMismatchError, ValidationError
-from pyrxd.security.types import BlockHeight, RawTx, Txid
+from pyrxd.security.types import BTC_MAX_SATS, BlockHeight, RawTx, Txid
 
 pytestmark = pytest.mark.asyncio
 
@@ -426,3 +429,46 @@ async def test_urls_property_reflects_preference_order() -> None:
     fakes[A].tip_error = NetworkError("down")
     await client.get_tip_height()
     assert client.urls[0] == B
+
+
+# ── a truthful large balance must not look like a broken endpoint ─────────────
+
+
+async def test_a_whale_utxo_does_not_evict_every_healthy_endpoint() -> None:
+    """The second-order damage of applying Bitcoin's supply cap to Radiant photons.
+
+    ``ElectrumXClient.get_utxos`` bounded ``value`` with ``Satoshis`` (2.1e15 = 21,000,000
+    BTC) on the RADIANT read path, where MAX_MONEY is 2.1e18. A UTXO above 21,000,000 RXD
+    therefore raised, and the raise surfaced as ``NetworkError`` — indistinguishable, here,
+    from a dropped socket. ``_run`` reads that as a transport fault and ``_discard``s the
+    endpoint, so a wallet holding one large coin walked its whole endpoint list, closing
+    each healthy server in turn, and finished with "failed on all N endpoints".
+
+    Uses REAL ``ElectrumXClient`` instances (only the wire call is stubbed), because the
+    parsing under test is exactly what a fake would have to reimplement.
+    """
+    whale = BTC_MAX_SATS + 1
+    payload = [
+        {"tx_hash": "11" * 32, "tx_pos": 0, "value": 100_000, "height": 900},
+        {"tx_hash": "22" * 32, "tx_pos": 1, "value": whale, "height": 901},
+    ]
+    profile = NetworkProfile(
+        network="regtest",
+        endpoints=tuple(Endpoint(url=u, allow_insecure=False) for u in (A, B, C)),
+        genesis_hash=None,
+    )
+    reals: dict[str, ElectrumXClient] = {}
+
+    def factory(endpoint: Endpoint) -> ElectrumXClient:
+        real = ElectrumXClient([endpoint.url])
+        real._call = AsyncMock(return_value=payload)  # type: ignore[method-assign]
+        reals[endpoint.url] = real
+        return real
+
+    client = FailoverElectrumXClient(profile, client_factory=factory, verify_chain=False)
+    got = await client.get_utxos("ab" * 32)
+
+    assert [u.value for u in got] == [100_000, whale]
+    # One endpoint answered; the other two were never even built, let alone discarded.
+    assert list(reals) == [A]
+    assert client.active_url == A

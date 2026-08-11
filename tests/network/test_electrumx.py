@@ -15,7 +15,7 @@ import pytest
 
 from pyrxd.network.electrumx import ElectrumXClient
 from pyrxd.security.errors import NetworkError, ValidationError
-from pyrxd.security.types import BlockHeight, RawTx, Txid
+from pyrxd.security.types import BTC_MAX_SATS, RADIANT_MAX_PHOTONS, BlockHeight, RawTx, Txid
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -316,6 +316,81 @@ async def test_get_balance_accepts_raw_bytes():
             confirmed, unconfirmed = await client.get_balance(b"\x11" * 32)
     assert int(confirmed) == 0
     assert int(unconfirmed) == 0
+
+
+# ---------------------------------------------------------------------------
+# Amounts on THIS client are photons, and Radiant's MAX_MONEY is 1000x Bitcoin's.
+#
+# `listunspent`/`get_balance` were bounded by `Satoshis` (cap 2.1e15 = 21,000,000 BTC).
+# Radiant's cap is 2.1e18. Anything above 21,000,000 RXD — a whale, an exchange, a
+# funded covenant, or a Glyph FT whose UNIT COUNT is its photon value — was reported to
+# the caller as a malformed server response.
+# ---------------------------------------------------------------------------
+
+_WHALE_PHOTONS = BTC_MAX_SATS + 1  # one photon past the cap that used to be applied here
+
+
+def _utxo_entry(tx_hash_byte: str, pos: int, value: int, height: int) -> dict:
+    return {"tx_hash": tx_hash_byte * 32, "tx_pos": pos, "value": value, "height": height}
+
+
+async def _utxos_from(items: list[dict]):
+    client = ElectrumXClient(["wss://example.com"])
+    with patch.object(client, "_call", new=AsyncMock(return_value=items)):
+        return await client.get_utxos("ab" * 32)
+
+
+async def test_get_utxos_accepts_a_utxo_above_the_bitcoin_supply_cap():
+    """21,000,000 RXD is 0.1% of Radiant's supply, not an impossible number."""
+    got = await _utxos_from([_utxo_entry("22", 1, _WHALE_PHOTONS, 901)])
+    assert [u.value for u in got] == [_WHALE_PHOTONS]
+
+
+async def test_get_utxos_accepts_a_utxo_at_radiant_max_money():
+    got = await _utxos_from([_utxo_entry("22", 0, RADIANT_MAX_PHOTONS, 901)])
+    assert [u.value for u in got] == [RADIANT_MAX_PHOTONS]
+
+
+async def test_one_large_utxo_does_not_take_its_siblings_with_it():
+    """The blast radius, not just the boundary.
+
+    The bound was applied inside a LIST COMPREHENSION, so a single over-cap entry
+    aborted the whole list: every other UTXO on that address vanished and the address
+    became unspendable, not merely under-reported.
+    """
+    small = _utxo_entry("11", 0, 100_000, 900)
+    got = await _utxos_from([small, _utxo_entry("22", 1, _WHALE_PHOTONS, 901)])
+    assert [u.value for u in got] == [100_000, _WHALE_PHOTONS]
+    assert got[0].tx_hash == "11" * 32
+
+
+async def test_get_utxos_still_refuses_what_no_radiant_node_can_produce():
+    """The guard is narrowed to the right chain, not removed."""
+    for bad in (RADIANT_MAX_PHOTONS + 1, -1, 1.9, "100", None, True):
+        with pytest.raises(NetworkError, match="Malformed UTXO entry"):
+            await _utxos_from([_utxo_entry("11", 0, bad, 900)])  # type: ignore[arg-type]
+
+
+async def test_get_balance_accepts_a_balance_above_the_bitcoin_supply_cap():
+    """Pre-existing at v0.15.0 rather than newly introduced — and the same bug.
+
+    An address balance is a SUM, so it crosses 21,000,000 RXD sooner than any single
+    UTXO does.
+    """
+    ws = _make_ws_mock({"id": 1, "result": {"confirmed": _WHALE_PHOTONS, "unconfirmed": 0}})
+    with _patch_connect(ws):
+        async with ElectrumXClient(["wss://example.com"]) as client:
+            confirmed, unconfirmed = await client.get_balance(b"\x11" * 32)
+    assert int(confirmed) == _WHALE_PHOTONS
+    assert int(unconfirmed) == 0
+
+
+async def test_get_balance_still_refuses_a_balance_above_radiant_max_money():
+    ws = _make_ws_mock({"id": 1, "result": {"confirmed": RADIANT_MAX_PHOTONS + 1, "unconfirmed": 0}})
+    with _patch_connect(ws):
+        async with ElectrumXClient(["wss://example.com"]) as client:
+            with pytest.raises(NetworkError, match="Malformed balance"):
+                await client.get_balance(b"\x11" * 32)
 
 
 # ---------------------------------------------------------------------------

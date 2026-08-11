@@ -37,6 +37,7 @@ from pyrxd.security.errors import NetworkError, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 from .codehash import compute_p2sh_script_pubkey
+from .fee_policy import DeadlineFeePolicy
 from .transactions import build_cancel_tx, build_maker_offer_tx
 from .types import CancelResult, GravityOffer, MakerOfferResult
 
@@ -150,6 +151,13 @@ class GravityMakerSession:
         Maker's secp256k1 private key wrapped in ``PrivateKeyMaterial``.
     poll_interval_seconds:
         Seconds between UTXO polls in ``wait_for_claim``. Default 30.
+    fee_policy:
+        Min-relay rate every transaction this session builds is sized and checked
+        against. Defaults to
+        :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY` (mainnet).
+        **Set this on regtest**, whose node advertises a tenth of the mainnet floor —
+        without it the high-level API has no way to reach the escape hatch the
+        builders already accept.
 
     Examples
     --------
@@ -161,13 +169,14 @@ class GravityMakerSession:
                 offer=offer,
                 funding_txid="...",
                 funding_vout=0,
-                funding_photons=5_100_000,
-                fee_sats=100_000,
+                funding_photons=12_000_000,
+                fee_sats=2_500_000,  # ~250-byte funding tx at the 10_000 photons/byte floor
             )
             active = await session.create_offer(params)
             claim_txid = await session.wait_for_claim(active, timeout_seconds=3600)
             if claim_txid is None:
-                cancel_txid = await session.cancel_offer(active)
+                # fee omitted: sized from the cancel tx's own measured bytes.
+                cancel_txid = await session.cancel_offer(active, maker_address=maker_addr)
     """
 
     def __init__(
@@ -176,11 +185,13 @@ class GravityMakerSession:
         maker_priv: PrivateKeyMaterial,
         btc_source: BtcDataSource | None = None,
         poll_interval_seconds: int = _DEFAULT_POLL_INTERVAL,
+        fee_policy: DeadlineFeePolicy | None = None,
     ) -> None:
         self._rxd = rxd_client
         self._priv = maker_priv
         self._btc = btc_source
         self._poll_interval = poll_interval_seconds
+        self._fee_policy = fee_policy
 
     # ------------------------------------------------------------------
     # Step 1: Build + broadcast the MakerOffer tx
@@ -218,6 +229,7 @@ class GravityMakerSession:
             fee_sats=offer_params.fee_sats,
             maker_privkey=self._priv,
             change_address=offer_params.change_address,
+            fee_policy=self._fee_policy,
         )
 
         raw = bytes.fromhex(result.tx_hex)
@@ -330,7 +342,13 @@ class GravityMakerSession:
     # Cancel: Maker reclaims before deadline
     # ------------------------------------------------------------------
 
-    async def cancel_offer(self, offer: ActiveOffer, fee_sats: int = 1000, maker_address: str = "") -> str:
+    async def cancel_offer(
+        self,
+        offer: ActiveOffer,
+        fee_sats: int | None = None,
+        maker_address: str = "",
+        fee_policy: DeadlineFeePolicy | None = None,
+    ) -> str:
         """Broadcast the cancel (MakerOffer.cancel()) transaction.
 
         Reclaims the MakerOffer UTXO before the claim deadline using
@@ -342,10 +360,19 @@ class GravityMakerSession:
         offer:
             The :class:`ActiveOffer` to cancel.
         fee_sats:
-            Miner fee in photons for the cancel tx. Default 1000.
+            Miner fee in photons for the cancel tx. ``None`` (the default) sizes it
+            from the assembled transaction's own bytes at the relay floor — the only
+            correct default, because the cancel scriptSig carries the whole MakerOffer
+            redeem script and its size therefore varies per offer. This parameter
+            previously defaulted to ``1000``, ~2,840x under the floor for a 285-byte
+            cancel, which made the documented ``cancel_offer(active)`` flow raise on
+            first use and left the Maker with no revocation path.
         maker_address:
             Maker's Radiant P2PKH address to receive the reclaimed photons.
             Required — must be a valid Radiant address.
+        fee_policy:
+            Per-call override of the session's policy. Set on regtest, which advertises
+            a tenth of the mainnet relay floor.
 
         Returns
         -------
@@ -373,6 +400,7 @@ class GravityMakerSession:
             maker_address=maker_address,
             fee_sats=fee_sats,
             maker_privkey=self._priv,
+            fee_policy=fee_policy or self._fee_policy,
         )
 
         raw = bytes.fromhex(result.tx_hex)
