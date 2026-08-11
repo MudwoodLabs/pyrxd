@@ -8,14 +8,27 @@ hermetic and offline (see the README there for why that is the right trade).
 The cost is that the pin can go stale — this script is how that is managed.
 
     # what upstream release are we pinned to, and has upstream moved?
-    python scripts/refresh_radiant_core_vendor.py --check
+    python scripts/refresh_radiant_core_vendor.py --check      # or: task check-vendor
 
     # move the pin
     python scripts/refresh_radiant_core_vendor.py --tag v3.2.0
 
+``--check`` answers two questions, not one:
+
+1. have the vendored files changed upstream since the pinned tag?
+2. does the pinned tag still share those files with the release the regtest
+   image's binary is built from (``pyrxd.devnet.DEFAULT_RADIANT_VERSION``)?
+
+The second matters because the sha256 in ``MANIFEST.json`` proves the vendored
+bytes are self-consistent, not that they describe the interpreter the
+integration lane actually runs. The two pins move on different schedules and
+are allowed to differ — but only while the consensus files are identical
+between them.
+
 Both modes need network, which is exactly why neither is a pytest test: a
 GitHub outage should fail a job someone chose to run, not turn a pull request
-red for an unrelated change.
+red for an unrelated change. The scheduled owner is the ``vendor-freshness``
+job in ``.github/workflows/integration.yml``.
 
 After refreshing, run the parity test. If it now fails, that is the oracle
 working — upstream changed a consensus fact and pyrxd has not caught up. Fix

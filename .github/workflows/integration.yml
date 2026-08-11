@@ -49,7 +49,7 @@ on:
       - "docker/**"
       - "conformance/**"
       - "pyproject.toml"
-      - "poetry.lock"
+      - "ci/poetry-pin.txt"
       - ".github/workflows/integration.yml"
   pull_request:
     branches: [main, dev]
@@ -61,7 +61,7 @@ on:
       - "docker/**"
       - "conformance/**"
       - "pyproject.toml"
-      - "poetry.lock"
+      - "ci/poetry-pin.txt"
       - ".github/workflows/integration.yml"
   schedule:
     - cron: "17 6 * * *" # 06:17 UTC nightly
@@ -94,11 +94,15 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      # `poetry.lock` is gitignored here (published library — deps resolve from
+      # pyproject.toml), so the key is keyed on `pyproject.toml` instead. `ci.yml` still
+      # hashes `poetry.lock`, which on a clean checkout is always absent and so always
+      # the same key — this one actually invalidates when the dependency set moves.
       - name: Cache Poetry packages
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/pypoetry
-          key: poetry-${{ runner.os }}-py3.12-${{ hashFiles('poetry.lock') }}
+          key: poetry-${{ runner.os }}-py3.12-${{ hashFiles('pyproject.toml') }}
           restore-keys: |
             poetry-${{ runner.os }}-py3.12-
       - name: The image tag this workflow builds is the one pyrxd will look for
@@ -211,6 +215,11 @@ jobs:
       - name: dMint V1 + V2 + premine, mined for real
         env:
           RADIANT_REGTEST: "1"
+          # Per-mine ceiling. The default 1800 s is sized for a developer box; a 4-vCPU
+          # runner is several times slower and the grind's variance is wide (the V1
+          # deploy+mint measured 80 s and 219 s on consecutive runs of the same box), so
+          # the default would turn a slow draw into a red nightly.
+          DMINT_MINE_TIMEOUT_S: "3600"
         run: |
           poetry run pytest -o "addopts=" -m integration -q \
             tests/test_dmint_v1_regtest_e2e.py \
@@ -221,12 +230,25 @@ jobs:
     name: nightly — SPV covenant differential
     if: github.event_name != 'pull_request' && github.event_name != 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    # The matrix itself is seconds (measured 9 s for 22 cases). The pre-grind is the
+    # whole cost, and it is proof-of-work: minutes on a many-core box, proportionally
+    # longer on a 4-vCPU runner. The cache below means only a cold run pays it.
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
+      # The ground chains are a pure function of the grinder + the builder it calls, so
+      # they are cacheable forever: same inputs, same anchored headers. Key on both files
+      # so a change to either re-grinds rather than replaying stale chains (the suite
+      # would fail loudly anyway — `_chain` looks the cache up by txid — but re-grinding
+      # is the useful behaviour).
+      - name: Restore the ground PoW chains
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/rgt_chain_*.json
+          key: rgt-chains-${{ hashFiles('tests/_regtest_grind_chains.py', 'tests/test_spv_covenant_differential_deployed.py') }}
       - name: Build the regtest node image
         run: |
           docker build -f docker/regtest.Dockerfile \
@@ -237,7 +259,9 @@ jobs:
       - name: Install dependencies
         run: poetry install --sync --no-interaction
       # The matrix reads pre-ground anchored PoW chains from /tmp; grinding them is
-      # the multi-minute cost PR #140 removed from the per-push path on purpose.
+      # the multi-minute cost PR #140 removed from the per-push path on purpose. The
+      # grinder is idempotent — it skips any chain whose cache file already exists — so
+      # on a cache hit this step is a no-op.
       - name: Pre-grind the anchored PoW chains
         run: poetry run python tests/_regtest_grind_chains.py
       - name: nBits / bin2num / merkle-walk differential against the node

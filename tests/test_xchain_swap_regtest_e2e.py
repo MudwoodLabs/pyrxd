@@ -98,6 +98,16 @@ _RXD_CT = "xchain-rxd-pytest"
 _BTC_CT = "xchain-btc-pytest"
 _RXD_RELAY_FEE = 1_000_000  # 0.01 RXD per sub-kB tx
 
+#: The Radiant relay floor this suite's fees are sized for, in RXD/kB — the LEGACY 0.01,
+#: a tenth of mainnet's. Passed to `radiantd` and asserted back below rather than
+#: inherited from the node's default, so `_RXD_RELAY_FEE` cannot silently stop clearing
+#: the rate the node enforces. (The shared Radiant harness in `test_htlc_regtest_e2e`
+#: runs at the MAINNET floor; this suite proves cross-chain HTLC *sequencing*, and its
+#: carriers are sized around `_RXD_RELAY_FEE`. The Radiant-side fee floors themselves are
+#: proven at the mainnet rate in `tests/test_fee_floor_boundary_regtest_e2e.py` and
+#: `tests/test_remaining_builder_floors_regtest_e2e.py`.)
+_RXD_MIN_RELAY_RXD_PER_KB = "0.01"
+
 
 # --------------------------------------------------------------------------- node mgmt
 
@@ -164,6 +174,7 @@ class _Nodes:
                 "-txindex=1",
                 "-disablewallet=0",
                 "-fallbackfee=0.001",
+                f"-minrelaytxfee={_RXD_MIN_RELAY_RXD_PER_KB}",
                 "-rpcuser=rt_user",
                 f"-rpcpassword={self.rpass}",
                 "-rpcbind=0.0.0.0",
@@ -208,6 +219,14 @@ class _Nodes:
         )
         assert self.rxd("getblockchaininfo")["chain"] == "regtest"
         assert self.btc("getblockchaininfo")["chain"] == "regtest"
+        # The rate `_RXD_RELAY_FEE` is sized for, confirmed by the node itself before
+        # anything is proved against it. `effective_minrelaytxfee`, not `minrelaytxfee`:
+        # only the first is what AcceptToMemoryPool checks GetTotalSize() against.
+        _rxd_floor = float(self.rxd("getmempoolinfo")["effective_minrelaytxfee"])
+        assert _rxd_floor == float(_RXD_MIN_RELAY_RXD_PER_KB), (
+            f"radiantd advertises effective_minrelaytxfee {_rxd_floor} RXD/kB, not the "
+            f"{_RXD_MIN_RELAY_RXD_PER_KB} this suite's fees are sized for"
+        )
         self.rxd("createwallet", "gravity")
         self.raddr = str(self.rxd("getnewaddress", wallet="gravity"))
         self.rxd_mine(101)

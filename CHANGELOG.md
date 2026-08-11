@@ -644,12 +644,17 @@ both. It is fixed here.
   negative change output. No production builder needed a change — they already default
   to 0.10.
 
-  `tests/test_rswp_regtest_e2e.py` deliberately stays at the legacy 0.01 floor, because
-  what it proves is orderbook and covenant *semantics* and its carriers are sized around
-  `_FEE` — but it now passes `-minrelaytxfee=0.01` explicitly and asserts the node
-  reports it, so the rate its fees assume can no longer silently desync from the rate the
-  node enforces. The fee floors of those same v3 covenant builders are proven at the
-  mainnet floor in `test_fee_floor_boundary_regtest_e2e.py`.
+  Three suites deliberately stay at the legacy 0.01 floor — `test_rswp_regtest_e2e.py`,
+  `test_xchain_swap_regtest_e2e.py` and `test_xchain_eth_swap_regtest_e2e.py` — because
+  what they prove is orderbook, covenant and cross-chain-sequencing *semantics*, and
+  their carriers are sized around their own fee constants (one case asserts a remainder
+  on chain against `8_000_000 - _FEE`). Each now passes `-minrelaytxfee=0.01`
+  **explicitly** and asserts `getmempoolinfo` reports it back, so the rate their fees
+  assume can no longer silently desync from the rate the node enforces. Every Radiant
+  node the test tree starts therefore declares its floor and verifies it; none inherits
+  one. The fee floors of those same builders are proven at the mainnet floor in
+  `test_fee_floor_boundary_regtest_e2e.py` and
+  `test_remaining_builder_floors_regtest_e2e.py`.
 
 - **`build_finalize_tx`'s fee guard is now proved at a node, with a real SPV proof
   (S-4).** It was offline-covered only, for a structural reason: the spend has to satisfy
