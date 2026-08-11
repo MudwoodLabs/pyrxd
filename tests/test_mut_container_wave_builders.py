@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 
+import cbor2
 import pytest
 
 from pyrxd.glyph._inspect_core import _inspect_script
@@ -247,6 +248,32 @@ class TestPrepareContainerChildReveal:
         ft = _cbor([GlyphProtocol.FT], "ft")
         with pytest.raises(ValidationError, match="NFT"):
             BUILDER.prepare_container_child_reveal(TXID2, 1, ft, PKH, REF, PKH)
+
+    def test_accepts_a_tag64_wrapped_membership_entry(self):
+        """Some cbor-x producers tag byte strings; the cross-check must see
+        through that rather than reject a valid envelope."""
+        payload = cbor2.dumps({"p": [int(GlyphProtocol.NFT)], "in": [cbor2.CBORTag(64, REF.to_bytes())]})
+        result = BUILDER.prepare_container_child_reveal(TXID2, 1, payload, PKH, REF, PKH)
+        assert result.container_ref == REF
+
+    @pytest.mark.parametrize(
+        "bad_in",
+        [
+            [None],
+            [42],
+            [cbor2.CBORTag(64, None)],
+            [cbor2.CBORTag(64, 42)],
+            "not-a-list",
+            {"in": "map"},
+        ],
+    )
+    def test_malformed_membership_entries_raise_validation_error_not_typeerror(self, bad_in):
+        """The cross-check must not coerce junk. ``bytes(42)`` silently makes 42
+        zero bytes and ``bytes(None)`` raises TypeError out of a builder whose
+        contract is ValidationError — either way the caller learns nothing."""
+        payload = cbor2.dumps({"p": [int(GlyphProtocol.NFT)], "in": bad_in})
+        with pytest.raises(ValidationError, match="does not contain the container ref"):
+            BUILDER.prepare_container_child_reveal(TXID2, 1, payload, PKH, REF, PKH)
 
     def test_scriptsig_suffix_contains_gly(self):
         result = BUILDER.prepare_container_child_reveal(TXID2, 1, CHILD_CBOR, PKH, REF, PKH)

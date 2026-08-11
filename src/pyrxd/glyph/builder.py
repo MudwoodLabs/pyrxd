@@ -814,12 +814,18 @@ class GlyphBuilder:
             declared = cbor2.loads(cbor_bytes).get("in") or []
         except Exception as exc:
             raise ValidationError(f"Could not parse CBOR for container-membership cross-check: {exc}") from exc
+        # Compare the raw wire bytes, unwrapping CBOR tag 64 the way
+        # ``decode_payload`` does. Anything that is not a byte string is skipped
+        # rather than coerced — ``bytes(<int>)`` would silently manufacture a
+        # zero-filled value, and ``bytes(None)`` would raise a TypeError out of
+        # a builder whose whole contract is ValidationError.
         wanted = container_ref.to_bytes()
-        found = [
-            bytes(i.value if isinstance(i, cbor2.CBORTag) else i)
-            for i in declared
-            if isinstance(i, (bytes, bytearray, cbor2.CBORTag))
-        ]
+        found = []
+        for item in declared if isinstance(declared, (list, tuple)) else []:
+            if isinstance(item, cbor2.CBORTag):
+                item = item.value
+            if isinstance(item, (bytes, bytearray)):
+                found.append(bytes(item))
         if wanted not in found:
             raise ValidationError(
                 f"child envelope's 'in' list does not contain the container ref "
