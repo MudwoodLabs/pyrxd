@@ -19,6 +19,7 @@ import hashlib
 
 import cbor2
 
+from pyrxd.hash import hash256
 from pyrxd.keys import PrivateKey, PublicKey
 
 from .types import GlyphCreator, GlyphMetadata
@@ -28,7 +29,7 @@ _CREATOR_PREFIX = b"glyph-v2-creator:"
 
 def _commit_hash(cbor_bytes: bytes) -> bytes:
     """SHA256d of CBOR bytes (matches Photonic sha256(sha256(encoded)))."""
-    return hashlib.sha256(hashlib.sha256(cbor_bytes).digest()).digest()
+    return hash256(cbor_bytes)
 
 
 def _signing_message(commit_hash: bytes) -> bytes:

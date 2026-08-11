@@ -8,55 +8,19 @@ and all witness stacks before hashing. This matches ``bitcoinjs-lib``'s
 
 from __future__ import annotations
 
+from pyrxd.compactsize import encode_compact_size, read_compact_size
 from pyrxd.security.errors import ValidationError
 
 __all__ = ["strip_witness"]
 
-
-def _read_varint(data: bytes, pos: int) -> tuple[int, int]:
-    """Read a Bitcoin varint from ``data`` at ``pos``. Return ``(value, new_pos)``."""
-    if pos >= len(data):
-        raise ValidationError("unexpected end of data reading varint")
-    first = data[pos]
-    if first < 0xFD:
-        return first, pos + 1
-    # Audit 2026-05-29 F-15: reject non-canonical (overlong) CompactSize. Bitcoin
-    # consensus rejects these at deserialization, and the covenant reads counts
-    # as a single byte — accepting an overlong encoding here diverges from both.
-    if first == 0xFD:
-        if pos + 3 > len(data):
-            raise ValidationError("truncated 2-byte varint")
-        value = int.from_bytes(data[pos + 1 : pos + 3], "little")
-        if value < 0xFD:
-            raise ValidationError(f"non-canonical varint: 0xFD prefix encodes {value} (< 0xFD)")
-        return value, pos + 3
-    if first == 0xFE:
-        if pos + 5 > len(data):
-            raise ValidationError("truncated 4-byte varint")
-        value = int.from_bytes(data[pos + 1 : pos + 5], "little")
-        if value <= 0xFFFF:
-            raise ValidationError(f"non-canonical varint: 0xFE prefix encodes {value} (<= 0xFFFF)")
-        return value, pos + 5
-    # 0xFF
-    if pos + 9 > len(data):
-        raise ValidationError("truncated 8-byte varint")
-    value = int.from_bytes(data[pos + 1 : pos + 9], "little")
-    if value <= 0xFFFFFFFF:
-        raise ValidationError(f"non-canonical varint: 0xFF prefix encodes {value} (<= 0xFFFFFFFF)")
-    return value, pos + 9
-
-
-def _encode_varint(n: int) -> bytes:
-    """Encode ``n`` as a Bitcoin varint."""
-    if n < 0:
-        raise ValidationError(f"varint cannot be negative: {n}")
-    if n < 0xFD:
-        return bytes([n])
-    if n <= 0xFFFF:
-        return b"\xfd" + n.to_bytes(2, "little")
-    if n <= 0xFFFFFFFF:
-        return b"\xfe" + n.to_bytes(4, "little")
-    return b"\xff" + n.to_bytes(8, "little")
+# Thin aliases onto the one CompactSize codec (:mod:`pyrxd.compactsize`), kept as
+# module-private names because the rest of this file and its tests read better
+# with them. Audit 2026-05-29 F-15 — rejecting non-canonical CompactSize — now
+# lives in exactly one place. This module used to state it a second time, and
+# four further statements in ``btc_wallet/taproot.py`` had drifted to the
+# opposite verdict without anything noticing.
+_read_varint = read_compact_size
+_encode_varint = encode_compact_size
 
 
 def strip_witness(raw_tx: bytes) -> bytes:

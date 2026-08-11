@@ -45,12 +45,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from pyrxd.compactsize import encode_compact_size, read_compact_size
 from pyrxd.constants import (
     SEQUENCE_LOCKTIME_GRANULARITY,
     SEQUENCE_LOCKTIME_MASK,
     SEQUENCE_LOCKTIME_TYPE_FLAG,
 )
 from pyrxd.fee_sizing import bitcoin_virtual_size
+from pyrxd.hash import hash256
 from pyrxd.security.errors import ValidationError
 
 from .keys import _bech32_encode
@@ -350,17 +352,10 @@ def tapbranch_hash(a: bytes, b: bytes) -> bytes:
     return _tagged_taphash("TapBranch", lo + hi)
 
 
-def _compact_size(n: int) -> bytes:
-    """Bitcoin compact-size (varint) encoding."""
-    if n < 0:
-        raise ValidationError("compact_size cannot be negative")
-    if n < 0xFD:
-        return bytes([n])
-    if n <= 0xFFFF:
-        return b"\xfd" + n.to_bytes(2, "little")
-    if n <= 0xFFFFFFFF:
-        return b"\xfe" + n.to_bytes(4, "little")
-    return b"\xff" + n.to_bytes(8, "little")
+#: Canonical CompactSize, from the one codec in :mod:`pyrxd.compactsize` — the
+#: same module whose reader ``_iter_witness_stack`` now uses, so this file can no
+#: longer write a length prefix it would refuse to read.
+_compact_size = encode_compact_size
 
 
 # ---------------------------------------------------------------------------
@@ -693,8 +688,7 @@ def build_htlc(
 # ---------------------------------------------------------------------------
 
 
-def _hash256(b: bytes) -> bytes:
-    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+_hash256 = hash256  # Bitcoin SHA-256d, from the one definition in pyrxd.hash
 
 
 def taproot_sighash(
@@ -1067,14 +1061,21 @@ def btc_txid_from_raw(raw_tx: bytes) -> str:
         return out
 
     def take_compact() -> tuple[int, bytes]:
-        """Read a CompactSize; return (value, the exact bytes consumed)."""
-        first = take(1)
-        v = first[0]
-        if v < 0xFD:
-            return v, first
-        size = {0xFD: 2, 0xFE: 4, 0xFF: 8}[v]
-        rest = take(size)
-        return int.from_bytes(rest, "little"), first + rest
+        """Read a CompactSize; return (value, the exact bytes consumed).
+
+        One of the four copies this module held, and — like the witness walker
+        above it — one that used to accept non-minimal encodings. That matters
+        here specifically: this function's contract is FAIL-CLOSED on any
+        structural problem, and it re-serialises the consumed bytes verbatim into
+        the txid preimage. A transaction with an overlong length prefix is
+        refused by consensus at deserialization, so the txid it produced was the
+        id of a transaction that cannot exist on any chain — handed to the reorg
+        gate as if it were real.
+        """
+        nonlocal pos
+        start = pos
+        value, pos = read_compact_size(b, pos)
+        return value, b[start:pos]
 
     version = take(4)
     # Segwit marker/flag? Peek; only 0x00 0x01 is the segwit signal.
@@ -1162,10 +1163,18 @@ def btc_spend_fields_from_raw(raw_tx: bytes) -> BtcSpendFields:
         return out
 
     def take_compact() -> int:
-        first = take(1)[0]
-        if first < 0xFD:
-            return first
-        return int.from_bytes(take({0xFD: 2, 0xFE: 4, 0xFF: 8}[first]), "little")
+        """The shared CompactSize reader — see :mod:`pyrxd.compactsize`.
+
+        This module alone held four of the SDK's seven hand-written copies (this
+        one, its byte-identical twin in the sibling parser, ``btc_txid_from_raw``,
+        and the witness walker), none of which rejected the non-minimal encodings
+        the SPV and transaction readers rejected. These parsers feed FAIL-CLOSED binding checks, so a
+        field-boundary disagreement with consensus is a check made against the
+        wrong bytes.
+        """
+        nonlocal pos
+        value, pos = read_compact_size(b, pos)
+        return value
 
     take(4)  # version
     is_segwit = pos + 2 <= n and b[pos] == 0x00 and b[pos + 1] == 0x01
@@ -1235,10 +1244,18 @@ def btc_input_outpoints_from_raw(raw_tx: bytes) -> list[bytes]:
         return out
 
     def take_compact() -> int:
-        first = take(1)[0]
-        if first < 0xFD:
-            return first
-        return int.from_bytes(take({0xFD: 2, 0xFE: 4, 0xFF: 8}[first]), "little")
+        """The shared CompactSize reader — see :mod:`pyrxd.compactsize`.
+
+        This module alone held four of the SDK's seven hand-written copies (this
+        one, its byte-identical twin in the sibling parser, ``btc_txid_from_raw``,
+        and the witness walker), none of which rejected the non-minimal encodings
+        the SPV and transaction readers rejected. These parsers feed FAIL-CLOSED binding checks, so a
+        field-boundary disagreement with consensus is a check made against the
+        wrong bytes.
+        """
+        nonlocal pos
+        value, pos = read_compact_size(b, pos)
+        return value
 
     take(4)  # version
     if pos + 2 <= n and b[pos] == 0x00 and b[pos + 1] == 0x01:
@@ -1277,18 +1294,25 @@ def _iter_witness_stack(claim_tx_bytes: bytes) -> list[list[bytes]]:
         return out
 
     def read_compact() -> int | None:
+        """The shared CompactSize rule, with this walker's tolerant error policy.
+
+        The RULE is :func:`pyrxd.compactsize.read_compact_size` — one answer for
+        the whole SDK. What stays local is only what to do when it says no: this
+        walker must never raise (see the docstring above), so a rejection becomes
+        ``None`` and the caller returns the stacks parsed so far.
+
+        This copy previously ACCEPTED non-minimal CompactSize while the SPV and
+        transaction readers rejected it. Rejecting is the correct verdict here
+        too: a transaction with an overlong length prefix is refused by consensus
+        at deserialization, so it cannot be a claim transaction anyone relayed,
+        and ``scrape_secret`` has nothing to learn from it.
+        """
         nonlocal pos
-        first = read(1)
-        if first is None:
+        try:
+            value, pos = read_compact_size(b, pos)
+        except ValidationError:
             return None
-        v = first[0]
-        if v < 0xFD:
-            return v
-        size = {0xFD: 2, 0xFE: 4, 0xFF: 8}[v]
-        raw = read(size)
-        if raw is None:
-            return None
-        return int.from_bytes(raw, "little")
+        return value
 
     if read(4) is None:  # version
         return []

@@ -26,7 +26,7 @@ from dataclasses import dataclass
 
 from ..constants import OpCode
 from ..security.errors import ValidationError
-from ..utils import Reader
+from ..utils import Reader, decode_script_num
 
 _RSWP_MAGIC = b"RSWP"
 _FLAG_HAS_WANT = 0x01
@@ -118,15 +118,11 @@ def _items(op_return_script: bytes) -> list:
     return out
 
 
-def _decode_scriptnum(data: bytes) -> int:
-    """Decode a minimal ``CScriptNum`` (little-endian, sign bit in the MSB)."""
-    if not data:
-        return 0
-    n = int.from_bytes(data, "little")
-    if data[-1] & 0x80:  # negative
-        n &= ~(0x80 << (8 * (len(data) - 1)))
-        return -n
-    return n
+#: CScriptNum decode, from the one definition in :mod:`pyrxd.utils`, and the
+#: exact inverse of the ``encode_script_num`` the RSWP writer uses. Keeping the
+#: two halves of one wire format as separate hand-written copies is how a reader
+#: and a writer get to disagree about the format they share.
+_decode_scriptnum = decode_script_num
 
 
 def _clean_var_int(r: Reader) -> int | None:

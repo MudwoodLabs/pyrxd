@@ -43,6 +43,7 @@ from __future__ import annotations
 
 from enum import Enum
 
+from ..constants import LOCKTIME_THRESHOLD as _LOCKTIME_THRESHOLD
 from ..constants import (
     PUBLIC_KEY_HASH_BYTE_LENGTH,
     SEQUENCE_FINAL,
@@ -55,10 +56,15 @@ from ..security.errors import ValidationError
 from ..security.types import Hex20
 from ..utils import encode_int
 
-# BIP-65 boundary between height-based and time-based locktime.
-# Values below this are interpreted as block heights; values at or above
-# this are interpreted as Unix timestamps (seconds since epoch).
-LOCKTIME_THRESHOLD = 500_000_000
+# BIP-65 boundary between height-based and time-based locktime. Values below
+# this are block heights; values at or above it are Unix timestamps.
+#
+# Re-exported from :mod:`pyrxd.constants` rather than spelled out again: that
+# copy is checked against Radiant Core's ``script.h`` by
+# ``tests/test_consensus_opcode_parity.py``, and this module is the constant's
+# only consumer. The name stays public here because ``pyrxd.script`` has
+# exported it since it was added.
+LOCKTIME_THRESHOLD = _LOCKTIME_THRESHOLD
 
 # Max nLockTime is a 32-bit field on the wire — the same 32-bit ceiling as
 # CTxIn::SEQUENCE_FINAL, taken from the one place that value is written down.

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from pyrxd.compactsize import read_compact_size
 from pyrxd.security.errors import SpvVerificationError, ValidationError
 from pyrxd.security.types import Nbits
 
@@ -55,35 +56,19 @@ def require_spv_sole_authority_cleared(network: str, *, audit_cleared: bool) -> 
 
 
 def _read_varint(buf: bytes, pos: int) -> tuple[int, int]:
-    """Read a Bitcoin CompactSize varint at ``pos``; return (value, next_pos)."""
-    if pos >= len(buf):
-        raise SpvVerificationError("varint read past end of tx")
-    first = buf[pos]
-    if first < 0xFD:
-        return first, pos + 1
-    # Audit 2026-05-29 F-15: reject non-canonical (overlong) CompactSize — these
-    # are rejected by Bitcoin consensus at deserialization and read as a single
-    # byte by the covenant; accepting them diverges from both.
-    if first == 0xFD:
-        if pos + 3 > len(buf):
-            raise SpvVerificationError("truncated 2-byte varint")
-        value = int.from_bytes(buf[pos + 1 : pos + 3], "little")
-        if value < 0xFD:
-            raise SpvVerificationError(f"non-canonical varint: 0xFD prefix encodes {value} (< 0xFD)")
-        return value, pos + 3
-    if first == 0xFE:
-        if pos + 5 > len(buf):
-            raise SpvVerificationError("truncated 4-byte varint")
-        value = int.from_bytes(buf[pos + 1 : pos + 5], "little")
-        if value <= 0xFFFF:
-            raise SpvVerificationError(f"non-canonical varint: 0xFE prefix encodes {value} (<= 0xFFFF)")
-        return value, pos + 5
-    if pos + 9 > len(buf):
-        raise SpvVerificationError("truncated 8-byte varint")
-    value = int.from_bytes(buf[pos + 1 : pos + 9], "little")
-    if value <= 0xFFFFFFFF:
-        raise SpvVerificationError(f"non-canonical varint: 0xFF prefix encodes {value} (<= 0xFFFFFFFF)")
-    return value, pos + 9
+    """Read a Bitcoin CompactSize varint at ``pos``; return (value, next_pos).
+
+    The *rule* — audit 2026-05-29 F-15, reject non-canonical and truncated
+    CompactSize — is :func:`pyrxd.compactsize.read_compact_size`, stated once for
+    the whole SDK. All this wrapper adds is the error type: everything the SPV
+    verifier rejects must surface as :class:`SpvVerificationError`, because
+    ``SpvProofBuilder.build`` and its callers catch exactly that. Re-raising is
+    the whole reason this function still exists rather than being an alias.
+    """
+    try:
+        return read_compact_size(buf, pos)
+    except ValidationError as exc:
+        raise SpvVerificationError(str(exc)) from None
 
 
 def _output_offsets(stripped_tx: bytes) -> set[int]:

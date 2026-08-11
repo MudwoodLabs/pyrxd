@@ -36,8 +36,18 @@ def test_base58check_decode():
     assert base58check_decode(ADDRESS) == MAIN_ADDRESS_PREFIX + PUBLIC_KEY_HASH
     with pytest.raises(ValueError, match=r"invalid base58 encoding"):
         base58check_decode("l")
-    with pytest.raises(ValueError, match=r"unmatched base58 checksum"):
+    # "L" decodes to a single byte — too short to contain a 4-byte checksum at
+    # all. It used to reach the checksum comparison and be rejected there by
+    # accident of slice arithmetic; the length is now checked first, which is
+    # the rejection `security/secrets.py`'s (now deleted) second implementation
+    # had and this one did not.
+    with pytest.raises(ValueError, match=r"base58check payload too short"):
         base58check_decode("L")
+    # A payload long enough to HAVE a checksum, with a wrong one, must still be
+    # rejected by the checksum branch — the "too short" check must not have
+    # swallowed the case it was inserted in front of.
+    with pytest.raises(ValueError, match=r"unmatched base58 checksum"):
+        base58check_decode("3vQB7B6MrGQZaxCuFg4oi")
 
 
 def test_to_base58check():

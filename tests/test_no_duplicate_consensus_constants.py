@@ -315,6 +315,61 @@ _REF_WALKERS = {
 }
 
 
+#: The ref-operand WIDTH as a walker would hand-spell it: the width itself, or the
+#: width plus the opcode byte. Both are the constant, one addition apart.
+_HAND_SPELLED_WIDTHS = frozenset({REF_OPERAND_WIDTH, REF_OPERAND_WIDTH + 1})
+
+
+#: Per-line opt-out for a ``36``/``37`` that genuinely is not the ref width — a byte
+#: OFFSET that happens to equal it, most often. Deliberately narrow: it exempts one
+#: line and demands a written reason, so the exception is reviewed rather than a
+#: blanket file allowlist. Its correctness is tested both ways below.
+_NOT_A_REF_WIDTH = re.compile(r"#\s*not-a-ref-width:\s*\S")
+
+
+def hand_spelled_ref_widths(source: str) -> list[str]:
+    """Bare ``36``/``37`` integer literals in a file that walks ref operands.
+
+    Takes RAW source (comments intact) because the per-line opt-out is a comment.
+    Comments are not AST nodes and a docstring saying "36-byte ref" is a ``str``,
+    not an ``int``, so neither can trip an integer-constant rule.
+
+    The companion to :func:`ref_walk_strides`, and it exists because that one
+    could not see this: it fires only on files naming a ref opcode as a HEX BYTE,
+    and every walker in this tree correctly imports ``REF_OPERAND_OPCODES``
+    instead — so all six sailed past it while hand-spelling the width.
+
+    That left ``REF_OPERAND_WIDTH`` pinned from Radiant Core and read by exactly
+    one module. Mutating it to 35 changed no walker's behaviour, which is the
+    same as not having pinned it: a constant with no consumer pins nothing.
+
+    Every spelling counts, not just the stride — ``i += 37``, ``script[p:p+37]``,
+    ``len(operand) != 36`` and ``script[p:p+37]`` are all the same number written
+    by hand, and any one of them can drift.
+    """
+    tree = _parse(source)
+    lines = source.splitlines()
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, int)
+            and not isinstance(node.value, bool)
+            and node.value in _HAND_SPELLED_WIDTHS
+        ):
+            # Written as a plain decimal? A hex or otherwise-spelled 36 is not
+            # what a hand-rolled walk looks like, and demanding the spelling is
+            # how the sibling detectors avoid AST false positives.
+            segment = ast.get_source_segment(source, node)
+            if not segment or segment.strip() != str(node.value):
+                continue
+            line = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+            if _NOT_A_REF_WIDTH.search(line):
+                continue
+            offenders.append(f"line {node.lineno}: bare {node.value}")
+    return offenders
+
+
 class TestWalkersShareTheConstant:
     @pytest.mark.parametrize("rel_path", sorted(_REF_WALKERS))
     def test_walker_references_the_shared_constant(self, rel_path):
@@ -323,6 +378,18 @@ class TestWalkersShareTheConstant:
             f"src/pyrxd/{rel_path} walks scripts but does not reference the shared "
             f"ref-operand constant. Import REF_OPERAND_OPCODES (or the REF_OPCODES alias) "
             f"rather than spelling the rule again."
+        )
+
+    @pytest.mark.parametrize("rel_path", sorted(_REF_WALKERS))
+    def test_walker_does_not_hand_spell_the_operand_width(self, rel_path):
+        """The width is a consensus fact too, and it was the one nobody imported."""
+        offenders = hand_spelled_ref_widths((SRC_ROOT / rel_path).read_text(encoding="utf-8"))
+        assert not offenders, (
+            f"src/pyrxd/{rel_path} spells the ref-operand width by hand:\n  "
+            + "\n  ".join(offenders)
+            + f"\nUse REF_OPERAND_WIDTH (currently {REF_OPERAND_WIDTH}) — it is derived from "
+            f"Radiant Core's GetScriptOp by tests/consensus_oracle.py, and a hand-written "
+            f"copy is a copy that can disagree with it."
         )
 
     def test_walker_registry_is_complete(self):
@@ -348,6 +415,251 @@ class TestWalkersShareTheConstant:
             + "\n  ".join(unregistered)
             + "\nRegister them and make them use REF_OPERAND_OPCODES."
         )
+
+
+# ---------------------------------------------------------------------------
+# One implementation per primitive
+# ---------------------------------------------------------------------------
+#
+# The ref-operand rule was the first consensus rule found in four copies; it was
+# not the last. Each detector below covers a primitive that was independently
+# re-implemented somewhere in this tree, and each names the module that owns it.
+#
+# The shape is deliberately the same every time: find the *spelling* a
+# hand-rolled copy has, allow-list the module that is allowed to have it, and
+# prove the detector fires by planting the duplicate.
+
+#: primitive -> (owning module relative to src/pyrxd, detector, human name)
+#: Entries are consumed by :class:`TestOneImplementationPerPrimitive` and by
+#: :class:`TestEachNewDetectorFiresOnAPlantedDuplicate`, so a detector cannot be
+#: added without a proof that it works.
+
+
+def double_sha256_spellings(source: str) -> list[str]:
+    """Hand-written ``sha256(sha256(x))``, in any of its spellings.
+
+    Matches the nesting structurally — ``hashlib.sha256(hashlib.sha256(x)
+    .digest()).digest()``, ``sha256(sha256(x))`` with locally-bound names, and
+    the ``.digest()`` / no-``.digest()`` mixtures in between — because the tree
+    contained all three.
+
+    Nineteen sites spelled this out. That was survivable only because they all
+    happened to agree; the same nesting written for Radiant's **block** hash is
+    ``sha512_256(sha512_256(x))``, and the two are indistinguishable at a glance.
+    """
+    tree = _parse(source)
+    offenders: list[str] = []
+
+    def _sha256_call(node: ast.AST) -> bool:
+        """Is ``node`` a call to something named ``sha256`` (however qualified)?"""
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Attribute) and func.attr == "digest":
+            # ``<call>.digest()`` — unwrap and test the receiver.
+            return _sha256_call(func.value)
+        if isinstance(func, ast.Attribute):
+            return func.attr == "sha256"
+        return isinstance(func, ast.Name) and func.id == "sha256"
+
+    for node in ast.walk(tree):
+        if not _sha256_call(node) or not isinstance(node, ast.Call):
+            continue
+        inner = node.func.value if isinstance(node.func, ast.Attribute) and node.func.attr == "digest" else node
+        if not isinstance(inner, ast.Call):
+            continue
+        for arg in inner.args:
+            if _sha256_call(arg):
+                offenders.append(f"line {node.lineno}: nested sha256(sha256(...))")
+                break
+    return offenders
+
+
+def local_hash_definitions(source: str) -> list[str]:
+    """``def hash256`` / ``def _hash256`` / ``def sha256d`` / ``def hash160`` and friends.
+
+    A re-DEFINITION, not a re-binding: ``_hash256 = hash256`` is fine (it is the
+    same object and cannot drift), ``def _hash256(...)`` is not.
+
+    ``hash160`` matters as much as ``hash256`` here for a reason that is not
+    about drift at all: :mod:`pyrxd.hash` falls back to a pure-Python RIPEMD160
+    when OpenSSL refuses it, and three modules that defined their own went
+    straight to ``hashlib.new("ripemd160", ...)`` — which raises on every
+    OpenSSL-3 distro.
+
+    METHODS ARE EXEMPT. ``PublicKey.hash160()`` is an accessor on a key object —
+    an API surface that delegates to the shared function — not a second
+    implementation. Functions nested inside other FUNCTIONS are NOT exempt:
+    ``glyph/dmint/miner.py`` hid a ``sha256d`` there.
+    """
+    banned = {"hash256", "_hash256", "sha256d", "_sha256d", "double_sha256", "hash160", "_hash160"}
+    tree = _parse(source)
+    methods = {
+        id(child)
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef)
+        for child in node.body
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    return [
+        f"line {node.lineno}: def {node.name}(...)"
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in banned and id(node) not in methods
+    ]
+
+
+def compact_size_width_tables(source: str) -> list[str]:
+    """The ``0xFD``/``0xFE``/``0xFF`` prefix dispatch, written out by hand.
+
+    Any construct naming two or more of the three CompactSize prefix bytes is a
+    re-statement of :data:`pyrxd.compactsize.PREFIX_WIDTHS`. Four readers and
+    four writers each had their own; three readers rejected non-minimal
+    encodings and the fourth accepted them, and nothing could tell.
+
+    Requires the two-digit hex spelling for the same reason the ref detectors do
+    — ``253``/``254``/``255`` are ordinary numbers everywhere else in the tree.
+    """
+    prefixes = {0xFD, 0xFE, 0xFF}
+    tree = _parse(source)
+    offenders: list[str] = []
+
+    def _named_prefix(child: ast.AST) -> int | None:
+        """The CompactSize prefix ``child`` names, if it names one AS a prefix.
+
+        Two spellings, because the tree contained both: the int ``0xFD`` (a
+        dispatch on the byte just read) and the one-byte literal ``b"\\xfd"``
+        (the byte being written). An encoder written as an ``if``/``elif`` chain
+        uses the second almost exclusively, which is how the fourth CompactSize
+        writer slipped past the first version of this detector.
+        """
+        if not isinstance(child, ast.Constant):
+            return None
+        segment = ast.get_source_segment(source, child)
+        if segment is None:
+            return None
+        segment = segment.strip()
+        is_int = isinstance(child.value, int) and not isinstance(child.value, bool)
+        if is_int and child.value in prefixes and re.fullmatch(r"0[xX][fF][dDeEfF]", segment):
+            return child.value
+        is_prefix_byte = isinstance(child.value, bytes) and len(child.value) == 1 and child.value[0] in prefixes
+        if is_prefix_byte and re.fullmatch(r"b[\"']\\x[fF][dDeEfF][\"']", segment):
+            return child.value[0]
+        return None
+
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Dict, ast.Set, ast.List, ast.Tuple, ast.If, ast.Compare, ast.FunctionDef)):
+            continue
+        found = {v for child in ast.walk(node) if (v := _named_prefix(child)) is not None}
+        if len(found) >= 2:
+            offenders.append(f"line {node.lineno}: CompactSize prefixes {sorted(hex(v) for v in found)}")
+            break  # one report per file is enough; nested nodes would repeat it
+    return offenders
+
+
+def base58_alphabet_literals(source: str) -> list[str]:
+    """The base58 alphabet, retyped.
+
+    Two copies existed, and the WIF decoder each one backed could have come to
+    disagree about what a given string decodes to. The alphabet is the
+    fingerprint of a third: it is 58 characters nobody types by accident.
+    """
+    tree = _parse(source)
+    return [
+        f"line {node.lineno}: base58 alphabet literal"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, (str, bytes))
+        and (node.value if isinstance(node.value, str) else node.value.decode("latin-1")).startswith("123456789ABCDEF")
+        and len(node.value) == 58
+    ]
+
+
+#: name -> (detector, module allowed to hold the one implementation, why)
+_PRIMITIVE_GUARDS = {
+    "double SHA-256": (
+        double_sha256_spellings,
+        {"hash.py"},
+        "import hash256 from pyrxd.hash",
+    ),
+    "hash256/hash160 definitions": (
+        local_hash_definitions,
+        {"hash.py"},
+        "import hash256/hash160 from pyrxd.hash (an ``x = hash256`` alias is fine)",
+    ),
+    "CompactSize prefix table": (
+        compact_size_width_tables,
+        {"compactsize.py"},
+        "use pyrxd.compactsize.read_compact_size / encode_compact_size",
+    ),
+    "base58 alphabet": (
+        base58_alphabet_literals,
+        {"base58.py", "utils.py"},
+        "use pyrxd.base58",
+    ),
+}
+
+#: Files exempt from a specific detector, each with the reason recorded here AND
+#: in the code. These are the deliberate non-consolidations: merging them would
+#: be wrong, not merely unnecessary.
+_PRIMITIVE_EXEMPTIONS = {
+    # The dMint proof-of-work grind. These three run ``sha256(sha256(...))``
+    # once per nonce — tens of millions of times per mint — with ``sha256``
+    # rebound to a local to skip the attribute lookup. Routing them through a
+    # shared function adds a Python call per hash, and ``estimate.py`` is worse
+    # than slow: it MEASURES hashes/sec, so the indirection would skew every ETA
+    # and difficulty quantile the miner reports to the user. The digest is
+    # identical either way; ``tests/test_hash_single_source.py`` pins that.
+    "double SHA-256": {
+        "contrib/miner/parallel.py",
+        "glyph/dmint/estimate.py",
+        "glyph/dmint/miner.py",
+    },
+    # ``utils.py`` keeps ``base58chars`` for ``from_base58``/``to_base58``, a
+    # separate list-of-ints API used by the BEEF/BRC-style helpers. Folding it
+    # into pyrxd.base58's str-based codec is a real refactor with its own risk,
+    # not a de-duplication; recorded rather than done.
+    "base58 alphabet": set(),
+}
+
+
+class TestOneImplementationPerPrimitive:
+    @pytest.mark.parametrize("primitive", sorted(_PRIMITIVE_GUARDS))
+    def test_only_the_owning_module_implements_it(self, primitive):
+        detector, owners, remedy = _PRIMITIVE_GUARDS[primitive]
+        exempt = _PRIMITIVE_EXEMPTIONS.get(primitive, set())
+        offenders = []
+        for path in _python_files(SRC_ROOT):
+            rel = str(path.relative_to(SRC_ROOT))
+            if rel in owners or rel in exempt:
+                continue
+            source = path.read_text(encoding="utf-8")
+            offenders += [f"{_rel(path)}: {hit}" for hit in detector(source)]
+        assert not offenders, (
+            f"{primitive} is implemented outside {sorted(owners)}:\n  "
+            + "\n  ".join(offenders)
+            + f"\nThere must be exactly one — {remedy}."
+        )
+
+    @pytest.mark.parametrize("primitive", sorted(_PRIMITIVE_GUARDS))
+    def test_the_owning_module_still_implements_it(self, primitive):
+        """The other half. If the canonical implementation is moved or renamed,
+        the guard above silently starts passing on an empty tree."""
+        detector, owners, _ = _PRIMITIVE_GUARDS[primitive]
+        found = any(detector((SRC_ROOT / owner).read_text(encoding="utf-8")) for owner in owners)
+        assert found, (
+            f"none of {sorted(owners)} contains an implementation of {primitive} any more. "
+            f"Either it moved (update _PRIMITIVE_GUARDS) or the guard is now vacuous."
+        )
+
+    def test_every_exemption_names_a_file_that_exists(self):
+        """An exemption for a deleted file is a hole nobody notices."""
+        missing = [
+            f"{primitive}: {rel}"
+            for primitive, rels in _PRIMITIVE_EXEMPTIONS.items()
+            for rel in rels
+            if not (SRC_ROOT / rel).is_file()
+        ]
+        assert not missing, f"stale exemptions in _PRIMITIVE_EXEMPTIONS: {missing}"
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +730,143 @@ class TestTheGuardCatchesTheBugsThatMotivatedIt:
         that motivated it is worse than none, because it certifies safety.
         """
         assert contiguous_ref_range_tests("REF = frozenset(range(0xD0, 0xD9))\n")
+
+
+# ---------------------------------------------------------------------------
+# Every NEW detector, proved by planting the duplicate it exists to catch
+# ---------------------------------------------------------------------------
+
+#: (detector, label, source) — each source is the duplicate as it actually
+#: appeared in this tree before the consolidation, or as the next person would
+#: plausibly write it. An entry here is the only evidence a detector works: the
+#: previous version of this guard was blind to the very bug it was written for,
+#: and passed a clean tree the whole time.
+_PLANTED_DUPLICATES = [
+    (
+        double_sha256_spellings,
+        "the hashlib.new-style spelling from network/bitcoin.py",
+        "def _hash256(data):\n    return hashlib.sha256(hashlib.sha256(data).digest()).digest()\n",
+    ),
+    (
+        double_sha256_spellings,
+        "the locally-bound spelling from glyph/dmint/miner.py",
+        "def sha256d(data):\n    return sha256(sha256(data))\n",
+    ),
+    (
+        double_sha256_spellings,
+        "a checksum slice, as in btc_wallet/keys.py",
+        "checksum = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]\n",
+    ),
+    (
+        double_sha256_spellings,
+        "a from-import spelling nobody has written yet",
+        "from hashlib import sha256\nd = sha256(sha256(x).digest()).digest()\n",
+    ),
+    (
+        local_hash_definitions,
+        "a private hash256 re-definition",
+        "def _hash256(b):\n    return other(b)\n",
+    ),
+    (
+        local_hash_definitions,
+        "a hash160 re-definition — the one that had no OpenSSL-3 fallback",
+        'def hash160(data):\n    return hashlib.new("ripemd160", hashlib.sha256(data).digest()).digest()\n',
+    ),
+    (
+        local_hash_definitions,
+        "a nested sha256d helper",
+        "def f():\n    def sha256d(x):\n        return x\n    return sha256d\n",
+    ),
+    (
+        compact_size_width_tables,
+        "the width dict from utils.py",
+        "W = {0xFD: (2, 0xFC), 0xFE: (4, 0xFFFF), 0xFF: (8, 0xFFFFFFFF)}\n",
+    ),
+    (
+        compact_size_width_tables,
+        "the if/elif chain from gravity/transactions.py",
+        (
+            "def _varint(n):\n"
+            "    if n < 0xFD:\n"
+            "        return bytes([n])\n"
+            "    elif n <= 0xFFFF:\n"
+            '        return b"\\xfd" + n.to_bytes(2, "little")\n'
+            "    elif n <= 0xFFFFFFFF:\n"
+            '        return b"\\xfe" + n.to_bytes(4, "little")\n'
+            '    return b"\\xff" + n.to_bytes(8, "little")\n'
+        ),
+    ),
+    (
+        compact_size_width_tables,
+        "the tolerant size map from btc_wallet/taproot.py — the copy that ACCEPTED non-minimal",
+        "def read_compact():\n    size = {0xFD: 2, 0xFE: 4, 0xFF: 8}[v]\n    return size\n",
+    ),
+    (
+        base58_alphabet_literals,
+        "the bytes alphabet from security/secrets.py",
+        '_B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"\n',
+    ),
+    (
+        base58_alphabet_literals,
+        "the str alphabet from base58.py",
+        'ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"\n',
+    ),
+]
+
+
+class TestEachNewDetectorFiresOnAPlantedDuplicate:
+    """A detector that has not been SHOWN to fire is worthless.
+
+    Every entry plants the duplicate into a throwaway source string and requires
+    the detector to name it. This is the same discipline as
+    :class:`TestTheGuardCatchesTheBugsThatMotivatedIt`, applied to the detectors
+    added alongside it.
+    """
+
+    @pytest.mark.parametrize(
+        ("detector", "label", "source"),
+        _PLANTED_DUPLICATES,
+        ids=[label for _, label, _ in _PLANTED_DUPLICATES],
+    )
+    def test_planted_duplicate_is_caught(self, detector, label, source):
+        assert detector(source), f"{detector.__name__} does not catch {label!r}:\n{source}"
+
+    def test_every_new_detector_has_at_least_one_planted_proof(self):
+        """Adding a detector without a proof is the failure mode this prevents."""
+        proved = {detector for detector, _, _ in _PLANTED_DUPLICATES}
+        unproved = {detector for detector, _, _ in _PRIMITIVE_GUARDS.values()} - proved
+        assert not unproved, (
+            f"these detectors have no planted-duplicate proof: {sorted(d.__name__ for d in unproved)}. "
+            f"Add one to _PLANTED_DUPLICATES — an unproved detector may pass a clean tree while "
+            f"being blind to the duplicate it exists to catch."
+        )
+
+
+class TestTheNewDetectorsDoNotFireOnLegitimateCode:
+    """The other half, again: a guard nobody can satisfy gets allowlisted away."""
+
+    @pytest.mark.parametrize(
+        ("detector", "label", "source"),
+        [
+            (double_sha256_spellings, "a single sha256", "d = hashlib.sha256(x).digest()\n"),
+            (double_sha256_spellings, "sha256 then ripemd160", "d = hashlib.new('ripemd160', sha256(x))\n"),
+            (
+                double_sha256_spellings,
+                "the SHA-512/256 block hash — a DIFFERENT function, and it must stay one",
+                "once = hashlib.new('sha512_256', h).digest()\ntwice = hashlib.new('sha512_256', once).digest()\n",
+            ),
+            (double_sha256_spellings, "sha256 of a concatenation of two digests", "d = sha256(a_digest + b_digest)\n"),
+            (local_hash_definitions, "an alias, which cannot drift", "_hash256 = hash256\n"),
+            (local_hash_definitions, "an unrelated function", "def hash_payload(b):\n    return hash256(b)\n"),
+            (compact_size_width_tables, "one prefix named alone", "if first == 0xFD:\n    pass\n"),
+            (compact_size_width_tables, "decimal 253/254/255", "LIMITS = (253, 254, 255)\n"),
+            (compact_size_width_tables, "a 0xff byte mask", "masked = value & 0xFF\n"),
+            (base58_alphabet_literals, "a 58-char string that is not the alphabet", f'S = "{"a" * 58}"\n'),
+            (base58_alphabet_literals, "the alphabet's prefix only", 'S = "123456789ABCDEF"\n'),
+        ],
+    )
+    def test_legitimate_shapes_are_not_flagged(self, detector, label, source):
+        assert not detector(source), f"{detector.__name__} false-positives on {label}"
 
 
 class TestTheGuardDoesNotFireOnLegitimateCode:

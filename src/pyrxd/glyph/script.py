@@ -128,10 +128,10 @@ See ``examples/ft_transfer_demo.py`` for the canonical filter pattern.
 
 from __future__ import annotations
 
-import hashlib
 import re
 
-from pyrxd.constants import REF_OPERAND_OPCODES
+from pyrxd.constants import REF_OPERAND_OPCODES, REF_OPERAND_WIDTH
+from pyrxd.hash import hash256
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
 
@@ -226,7 +226,7 @@ def build_commit_locking_script(
 
 def hash_payload(cbor_bytes: bytes) -> bytes:
     """SHA256d of CBOR payload bytes (NOT including 'gly' marker)."""
-    return hashlib.sha256(hashlib.sha256(cbor_bytes).digest()).digest()
+    return hash256(cbor_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -284,8 +284,8 @@ def parse_legacy_container_script(script: bytes) -> tuple[GlyphRef, GlyphRef, He
     """
     if len(script) != LEGACY_CONTAINER_SCRIPT_SIZE or not LEGACY_CONTAINER_SCRIPT_RE.fullmatch(script.hex()):
         return None
-    child_ref = GlyphRef.from_bytes(script[1:37])
-    container_ref = GlyphRef.from_bytes(script[38:74])
+    child_ref = GlyphRef.from_bytes(script[1 : 1 + REF_OPERAND_WIDTH])
+    container_ref = GlyphRef.from_bytes(script[38 : 38 + REF_OPERAND_WIDTH])
     owner_pkh = Hex20(script[78:98])
     return container_ref, child_ref, owner_pkh
 
@@ -343,14 +343,14 @@ def extract_ref_from_nft_script(script: bytes) -> GlyphRef:
     """Extract 36-byte ref from a 63-byte NFT script."""
     if len(script) != 63 or script[0] != 0xD8:
         raise ValidationError("Not a valid NFT script")
-    return GlyphRef.from_bytes(script[1:37])
+    return GlyphRef.from_bytes(script[1 : 1 + REF_OPERAND_WIDTH])
 
 
 def extract_ref_from_ft_script(script: bytes) -> GlyphRef:
     """Extract 36-byte ref from a 75-byte FT script."""
     if len(script) != 75 or script[25] != 0xBD or script[26] != 0xD0:
         raise ValidationError("Not a valid FT script")
-    return GlyphRef.from_bytes(script[27:63])
+    return GlyphRef.from_bytes(script[27 : 27 + REF_OPERAND_WIDTH])
 
 
 def extract_owner_pkh_from_nft_script(script: bytes) -> Hex20:
@@ -418,6 +418,14 @@ _MUTABLE_NFT_BODY = bytes.fromhex(
 # Note: Photonic Wallet documents 175, but the actual script is 174 bytes per regex.
 MUTABLE_NFT_SCRIPT_SIZE = 174
 
+# Byte offset at which the ref operand starts: 1 (push32 opcode) + 32 (hash) +
+# 1 (OP_DROP) + 1 (OP_STATESEPARATOR) + 1 (OP_PUSHINPUTREFSINGLETON).
+# It equals REF_OPERAND_WIDTH by coincidence and must not be replaced with it —
+# these two numbers move for entirely unrelated reasons, and folding a position
+# into a width is precisely the kind of "same number, different meaning" merge
+# that turns a tidy-up into a parser bug.
+_MUTABLE_NFT_REF_OFFSET = 36  # not-a-ref-width: this is a position, not a width
+
 MUTABLE_NFT_SCRIPT_RE = re.compile(r"^20[0-9a-f]{64}75bdd8[0-9a-f]{72}" + _MUTABLE_NFT_BODY.hex() + r"$")
 
 
@@ -457,7 +465,7 @@ def parse_mutable_nft_script(script: bytes) -> tuple[GlyphRef, bytes] | None:
     if script[72:] != _MUTABLE_NFT_BODY:
         return None
     payload_hash = script[1:33]
-    mutable_ref = GlyphRef.from_bytes(script[36:72])
+    mutable_ref = GlyphRef.from_bytes(script[_MUTABLE_NFT_REF_OFFSET : _MUTABLE_NFT_REF_OFFSET + REF_OPERAND_WIDTH])
     return mutable_ref, payload_hash
 
 
@@ -541,11 +549,11 @@ def iter_input_refs(script: bytes):
     while pos < n:
         op = script[pos]
         if op in REF_OPCODES:
-            operand = script[pos + 1 : pos + 37]
-            if len(operand) != 36:
-                raise TruncatedScriptError("ref opcode operand truncated (< 36 bytes)")
+            operand = script[pos + 1 : pos + 1 + REF_OPERAND_WIDTH]
+            if len(operand) != REF_OPERAND_WIDTH:
+                raise TruncatedScriptError(f"ref opcode operand truncated (< {REF_OPERAND_WIDTH} bytes)")
             yield op, operand
-            pos += 37
+            pos += 1 + REF_OPERAND_WIDTH
             continue
         if 0x01 <= op <= 0x4B:
             new_pos = 1 + pos + op

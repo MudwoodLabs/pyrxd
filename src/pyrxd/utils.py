@@ -10,25 +10,27 @@ from secrets import randbits
 from typing import Literal
 
 from .base58 import base58check_decode
+from .compactsize import COMPACT_SIZE_MAX, PREFIX_WIDTHS, encode_compact_size, read_compact_size
 from .constants import ADDRESS_PREFIX_NETWORK_DICT, NUMBER_BYTE_LENGTH, WIF_PREFIX_NETWORK_DICT, Network, OpCode
 from .curve import curve
+from .hash import hash256
 from .security.errors import Base58Error, ValidationError
 
 
 def unsigned_to_varint(num: int) -> bytes:
     """
     convert an unsigned int to varint.
+
+    The encoding is :func:`pyrxd.compactsize.encode_compact_size`, which is also
+    what the SDK's readers accept — that mutual property is the whole reason a
+    non-minimal encoding is detectable. Only the out-of-range exception type is
+    local: this function has raised ``OverflowError`` for its entire history and
+    callers across ``transaction/`` catch it, so the range check stays here
+    rather than surfacing the shared codec's ``ValidationError``.
     """
-    if num < 0 or num > 0xFFFFFFFFFFFFFFFF:
+    if num < 0 or num > COMPACT_SIZE_MAX:
         raise OverflowError(f"can't convert {num} to varint")
-    if num <= 0xFC:
-        return num.to_bytes(1, "little")
-    elif num <= 0xFFFF:
-        return b"\xfd" + num.to_bytes(2, "little")
-    elif num <= 0xFFFFFFFF:
-        return b"\xfe" + num.to_bytes(4, "little")
-    else:
-        return b"\xff" + num.to_bytes(8, "little")
+    return encode_compact_size(num)
 
 
 def unsigned_to_bytes(num: int, byteorder: Literal["big", "little"] = "big") -> bytes:
@@ -371,19 +373,81 @@ def encode_pushdata(pushdata: bytes, minimal_push: bool = True) -> bytes:
     return get_pushdata_code(len(pushdata)) + pushdata
 
 
-def encode_int(num: int) -> bytes:
+def encode_data_push(data: bytes, *, max_len: int | None = None) -> bytes:
+    """A length-prefixed data push, with NO minimal-integer folding.
+
+    ``OP_0`` for empty data; otherwise the direct-length / ``OP_PUSHDATA1`` /
+    ``OP_PUSHDATA2`` / ``OP_PUSHDATA4`` form for ``len(data)``.
+
+    Distinct from :func:`encode_pushdata` in exactly one way, and it is the
+    difference that matters: this NEVER folds a one-byte value into ``OP_1``..
+    ``OP_16``. ``encode_data_push(b"\\x05")`` is ``01 05``; ``encode_pushdata``
+    would give ``OP_5``. Covenant scriptSigs whose fields are read positionally
+    depend on the un-folded form, so the two are not interchangeable and the
+    choice is deliberate at each call site.
+
+    ``max_len`` caps the payload. It exists because the five hand-written copies
+    this replaced each carried a different ceiling — 255 in one, 65,535 in three,
+    unbounded in one — and folding them into a single number would have loosened
+    a guard somewhere. Passing the cap keeps every original limit intact and,
+    unlike a limit buried inside five near-identical helpers, visible.
     """
-    encode a signed integer you want to push onto the stack in bitcoin script, following the minimal push rule
+    n = len(data)
+    if max_len is not None and n > max_len:
+        raise ValidationError(f"push data too large: {n} bytes exceeds the {max_len}-byte limit")
+    if n == 0:
+        return OpCode.OP_0
+    return get_pushdata_code(n) + data
+
+
+def encode_script_num(num: int) -> bytes:
+    """A signed integer as CScriptNum BODY bytes — little-endian, sign in the MSB.
+
+    No push opcode: this is the number, not the instruction that pushes it. That
+    split is what lets the two different push policies in this SDK share one
+    number encoding — :func:`encode_int` folds small values into ``OP_N``,
+    while the RSWP order wire format must emit a direct push of the same bytes
+    (Photonic's ``encodeScriptNum``). They previously carried a copy each.
+
+    Zero encodes as ``b""``, matching Radiant's ``CScriptNum::serialize``: an
+    empty stack element IS zero, which is why ``encode_pushdata(b"")`` yields
+    ``OP_0`` and the round trip closes.
     """
     if num == 0:
-        return OpCode.OP_0
+        return b""
     negative: bool = num < 0
     octets: bytearray = bytearray(unsigned_to_bytes(-num if negative else num, "little"))
+    # If the top bit of the most-significant byte is set it would be read as the
+    # sign bit, so the magnitude needs one more byte to stay unambiguous.
     if octets[-1] & 0x80:
         octets += b"\x00"
     if negative:
         octets[-1] |= 0x80
-    return encode_pushdata(octets)
+    return bytes(octets)
+
+
+def decode_script_num(octets: bytes) -> int:
+    """The inverse of :func:`encode_script_num`.
+
+    ``b""`` is zero. Does NOT enforce minimal encoding — callers parsing an
+    attacker-supplied script that must be minimal should compare against
+    ``encode_script_num(decode_script_num(b))`` themselves, which is a cheaper
+    and more obvious check than a flag on this function.
+    """
+    if not octets:
+        return 0
+    magnitude = int.from_bytes(octets, "little")
+    if octets[-1] & 0x80:  # negative: clear the sign bit out of the top byte
+        magnitude &= ~(0x80 << (8 * (len(octets) - 1)))
+        return -magnitude
+    return magnitude
+
+
+def encode_int(num: int) -> bytes:
+    """
+    encode a signed integer you want to push onto the stack in bitcoin script, following the minimal push rule
+    """
+    return encode_pushdata(encode_script_num(num))
 
 
 def to_hex(byte_array: bytes) -> str:
@@ -492,11 +556,10 @@ def to_base58(bin_: list[int]) -> str:
 
 def to_base58_check(bin_: list[int], prefix: list[int] | None = None) -> str:
     """Converts a binary array into a base58check string with a checksum."""
-    import hashlib
 
     if prefix is None:
         prefix = [0]
-    hash_ = hashlib.sha256(hashlib.sha256(bytes(prefix + bin_)).digest()).digest()
+    hash_ = hash256(bytes(prefix + bin_))
     return to_base58(prefix + bin_ + list(hash_[:4]))
 
 
@@ -507,9 +570,7 @@ def from_base58_check(str_: str, enc: str | None = None, prefix_length: int = 1)
     data = bin_[prefix_length:-4]
     checksum = bin_[-4:]
 
-    import hashlib
-
-    hash_ = hashlib.sha256(hashlib.sha256(bytes(prefix + data)).digest()).digest()
+    hash_ = hash256(bytes(prefix + data))
     if list(hash_[:4]) != checksum:
         raise Base58Error("invalid base58 checksum")
 
@@ -660,22 +721,15 @@ class Reader(BytesIO):
         data = self.read_exact(4)
         return int.from_bytes(data, byteorder="little", signed=True) if data else None
 
-    #: CompactSize prefix -> (operand width, largest value the SHORTER encoding covers).
-    #: A value at or below the floor means a shorter encoding existed, so this one is
-    #: non-canonical. Mirrors ``spv/proof.py`` and ``spv/witness.py``.
-    _VAR_INT_WIDTHS: dict[int, tuple[int, int]] = {0xFD: (2, 0xFC), 0xFE: (4, 0xFFFF), 0xFF: (8, 0xFFFFFFFF)}
-
     def read_var_int_num(self) -> int | None:
         """Read a Bitcoin CompactSize, refusing non-canonical and truncated encodings.
 
         Returns ``None`` only at true end of input (nothing left to read at all) —
         the contract ``Transaction.from_reader`` and ``from_beef`` test with
-        ``if count is None``.
-
-        Audit 2026-05-29 F-15, applied here to match ``spv/proof.py`` and
-        ``spv/witness.py``. This copy sits under ``Transaction`` deserialization —
-        every hostile-bytes parse in the SDK — and was the last one still accepting
-        overlong encodings. Two concrete consequences of accepting them:
+        ``if count is None``. That end-of-stream signal is the *only* thing this
+        method adds over :func:`pyrxd.compactsize.read_compact_size`, which owns
+        the consensus rule for the whole SDK (audit 2026-05-29 F-15). Two
+        concrete consequences of the accepting behaviour this replaced:
 
         * A node rejects a non-minimal CompactSize at deserialization, so the SDK
           parsed transactions that can never exist on chain and reported them as
@@ -686,38 +740,38 @@ class Reader(BytesIO):
           returned the id of a transaction those bytes are not. Anything binding a
           txid to bytes it was handed was comparing against a value the bytes do not
           hash to.
-
-        Truncation is refused for the same reason it is in the SPV readers: an operand
-        running off the end used to be zero-extended by ``int.from_bytes`` over a short
-        read, so ``fd 01`` silently decoded as 1.
         """
-        first_byte = self.read_uint8()
-        if first_byte is None:
-            return None
-        if first_byte < 0xFD:
-            return first_byte
-
-        width, floor = self._VAR_INT_WIDTHS[first_byte]
-        data = self.read(width)
-        if data is None or len(data) != width:
-            raise ValidationError(f"truncated {width}-byte varint")
-        value = int.from_bytes(data, byteorder="little")
-        if value <= floor:
-            raise ValidationError(f"non-canonical varint: 0x{first_byte:02X} prefix encodes {value} (<= {floor})")
-        return value
-
-    def read_var_int(self) -> bytes | None:
         first_byte = self.read(1)
         if not first_byte:
             return None
-        if first_byte[0] == 0xFD:
-            return first_byte + (self.read(2) or b"")
-        elif first_byte[0] == 0xFE:
-            return first_byte + (self.read(4) or b"")
-        elif first_byte[0] == 0xFF:
-            return first_byte + (self.read(8) or b"")
-        else:
+        width_and_floor = PREFIX_WIDTHS.get(first_byte[0])
+        if width_and_floor is None:
+            return first_byte[0]
+        # Hand the shared reader exactly the bytes of this one field. Slicing the
+        # field out (rather than passing the whole buffer with an offset) keeps
+        # this O(1) per varint: ``BytesIO.getvalue()`` copies the entire buffer,
+        # which would make parsing an n-input transaction quadratic.
+        field = first_byte + (self.read(width_and_floor[0]) or b"")
+        return read_compact_size(field, 0)[0]
+
+    def read_var_int(self) -> bytes | None:
+        """The CompactSize field at the cursor, as RAW BYTES, advancing past it.
+
+        Deliberately NOT a decoder: it hands back whatever was written, including
+        a non-canonical encoding, because its only job is to re-serialise a field
+        verbatim. The width dispatch comes from
+        :data:`pyrxd.compactsize.PREFIX_WIDTHS` so it cannot disagree with the
+        decoder about how many bytes the field occupies — disagreeing about the
+        LENGTH would desynchronise the caller's parse, which is a different and
+        worse failure than tolerating an overlong value.
+        """
+        first_byte = self.read(1)
+        if not first_byte:
+            return None
+        width_and_floor = PREFIX_WIDTHS.get(first_byte[0])
+        if width_and_floor is None:
             return first_byte
+        return first_byte + (self.read(width_and_floor[0]) or b"")
 
     def read_bytes(self, byte_length: int | None = None) -> bytes:
         result = self.read(byte_length)

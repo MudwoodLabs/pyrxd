@@ -11,6 +11,8 @@ concrete leak this closes.
 
 from __future__ import annotations
 
+import hmac
+
 from .hash import hash256
 from .security.errors import Base58Error
 
@@ -51,7 +53,7 @@ def to_base58check(payload: bytes, prefix: bytes) -> str:
     return base58check_encode(prefix + payload)
 
 
-def from_base58check(encoded: str, prefix_len: int = 1) -> (bytes, bytes):
+def from_base58check(encoded: str, prefix_len: int = 1) -> tuple[bytes, bytes]:
     """
     Converts a base58check string into payload and prefix
     :param encoded: The base58check string to convert
@@ -86,10 +88,22 @@ def b58_decode(encoded: str) -> bytes:
 
 def base58check_decode(encoded: str) -> bytes:
     decoded = b58_decode(encoded)
+    if len(decoded) < 5:
+        # A payload shorter than checksum+1 has nothing to check. Without this,
+        # ``decoded[:-4]`` on three bytes yields an empty payload and the slice
+        # arithmetic still "works", so the rejection came out of the checksum
+        # comparison by accident rather than by decision. Inherited from the
+        # second implementation this function absorbed
+        # (``security/secrets.py``), which had it and this one did not.
+        raise Base58Error("base58check payload too short")
     payload = decoded[:-4]
     decoded_checksum = decoded[-4:]
     hash_checksum = _checksum(payload)
-    if decoded_checksum != hash_checksum:
+    # Constant-time: for a mistyped WIF the payload IS the private key, so both
+    # of these four-byte values are functions of key material and a timing
+    # oracle on the comparison is a (weak, but free to remove) leak. Also
+    # inherited from the implementation this absorbed.
+    if not hmac.compare_digest(decoded_checksum, hash_checksum):
         # Neither checksum is reported. The trailing four bytes come straight out
         # of the caller's string and the computed four are hash256 over the
         # decoded payload — for a mistyped WIF that payload IS the private key,

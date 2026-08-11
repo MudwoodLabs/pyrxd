@@ -17,7 +17,6 @@ Design rules
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import hmac
 from typing import Any, SupportsIndex
 
@@ -29,45 +28,35 @@ __all__ = ["PrivateKeyMaterial", "SecretBytes", "secure_scalar_mod_n"]
 # secp256k1 curve order
 _SECP256K1_N: int = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
 
+
 # --------------------------------------------------------------------------- base58check
-# Self-contained implementation so the security module has no heavy deps.
-_B58_ALPHABET: bytes = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-_B58_INDEX: dict[int, int] = {c: i for i, c in enumerate(_B58_ALPHABET)}
-
-
-def _base58_decode(s: str) -> bytes:
-    if not s:
-        raise ValueError("empty base58 input")
-    n = 0
-    for ch in s:
-        idx = _B58_INDEX.get(ord(ch))
-        if idx is None:
-            raise ValueError("invalid base58 character")
-        n = n * 58 + idx
-    # Reconstruct bytes big-endian.
-    if n == 0:
-        body = b""
-    else:
-        body = n.to_bytes((n.bit_length() + 7) // 8, "big")
-    # Preserve leading '1' -> 0x00 bytes.
-    pad = 0
-    for ch in s:
-        if ch == "1":
-            pad += 1
-        else:
-            break
-    return b"\x00" * pad + body
-
-
 def _base58check_decode(s: str) -> bytes:
-    raw = _base58_decode(s)
-    if len(raw) < 5:
-        raise ValueError("base58check payload too short")
-    payload, checksum = raw[:-4], raw[-4:]
-    expected = hashlib.sha256(hashlib.sha256(payload).digest()).digest()[:4]
-    if not hmac.compare_digest(checksum, expected):
-        raise ValueError("base58check checksum mismatch")
-    return payload
+    """Decode a base58check string via the SDK's one base58 codec.
+
+    This module used to carry a second, self-contained implementation "so the
+    security module has no heavy deps". The dependency was never heavy —
+    :mod:`pyrxd.base58` imports ``hashlib`` and one exception class — and the
+    cost of the second copy was real: two independent WIF decoders, either of
+    which could come to accept a string the other rejects. Since
+    :meth:`PrivateKeyMaterial.from_wif` and :func:`pyrxd.utils.decode_wif` are
+    both entry points for the same private keys, a divergence between them is a
+    divergence about what somebody's key *is*.
+
+    The import is function-local because :mod:`pyrxd.base58` imports
+    ``pyrxd.security.errors``, and ``pyrxd/security/__init__.py`` imports THIS
+    module. A module-scope import would work today only because ``.errors``
+    happens to be imported before ``.secrets`` in that ``__init__``; deferring
+    it means the import graph does not depend on that ordering. (The same
+    function-local pattern is already used in ``gravity/codehash.py`` and
+    ``gravity/transactions.py``.)
+
+    Everything this copy did that the shared codec did not now lives in the
+    shared codec: constant-time checksum comparison, and rejecting a payload too
+    short to contain one. Both were strengthenings, applied to every caller.
+    """
+    from ..base58 import base58check_decode
+
+    return base58check_decode(s)
 
 
 class SecretBytes:

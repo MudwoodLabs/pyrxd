@@ -41,10 +41,12 @@ from pyrxd.gravity.htlc_covenant import _assert_minimal_pushes, _opcode_bd_posit
 from pyrxd.security.errors import ValidationError
 from pyrxd.transaction.transaction_preimage import _get_push_refs
 from tests.consensus_oracle import (
+    max_opcode,
     opcode_table,
     push_ref_opcodes,
     ref_operand_opcodes,
     ref_operand_width,
+    script_limit,
 )
 
 pytestmark = pytest.mark.unit
@@ -351,12 +353,39 @@ def _pushdata_floor(op: int) -> int:
     return {0x4C: 76, 0x4D: 256, 0x4E: 0x10000}[op]
 
 
+def _reference_has_valid_ops(script: bytes) -> bool:
+    """``CScript::HasValidOps``, from the oracle rather than from pyrxd.
+
+    Both build-time guards now answer this BEFORE asking about minimality, so
+    the reference has to model it or the differential reports a disagreement
+    that is really just the guards being stricter than the model.
+
+    Independently derived on purpose: ``max_opcode()`` and ``script_limit()``
+    come from the vendored C++, not from ``pyrxd.constants``, so this stays a
+    differential and not a restatement of the code under test.
+    """
+    try:
+        ops = _reference_walk(script)
+    except RefWalkTruncated:
+        return False  # GetScriptOp returned false — HasValidOps returns false
+    limit = script_limit("MAX_SCRIPT_ELEMENT_SIZE")
+    return all(op <= max_opcode() and len(operand) <= limit for _pos, op, operand in ops)
+
+
 def _reference_rejects(script: bytes, *, any_pushdata_is_a_violation: bool) -> bool:
-    """Does the CONSENSUS tokenisation contain a push these guards must reject?
+    """Does the CONSENSUS tokenisation give these guards a reason to refuse?
 
     Derived from ``_reference_walk``, so the ref operand is skipped as one unit by
     construction rather than by the rule under test.
+
+    Two independent reasons, matching the two the guards check: the script is not
+    structurally valid at all (``HasValidOps``), or it contains a non-minimal
+    push. The first was added when the guards started running ``HasValidOps`` as
+    a precondition — a script whose bytes do not decode into instructions makes
+    the minimality walk\'s offsets meaningless, so it has to be settled first.
     """
+    if not _reference_has_valid_ops(script):
+        return True
     for _pos, op, operand in _reference_walk(script):
         if op == 0x01 and (1 <= operand[0] <= 16 or operand[0] == 0x81):
             return True  # a 1-byte push of a value OP_1..OP_16/OP_1NEGATE encodes

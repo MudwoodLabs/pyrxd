@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import time
 
+from pyrxd.compactsize import encode_compact_size
 from pyrxd.fee_sizing import trial_size_with_slack
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 from pyrxd.spv.proof import SpvProof
 from pyrxd.transaction.transaction_output import TransactionOutput
 from pyrxd.transaction.transaction_preimage import _compute_hash_output_hashes as _general_hash_output_hashes
-from pyrxd.utils import Reader
+from pyrxd.utils import Reader, encode_data_push
 
 from .codehash import (
     compute_p2sh_address_from_redeem,
@@ -46,16 +47,11 @@ __all__ = ["build_cancel_tx", "build_claim_tx", "build_finalize_tx", "build_forf
 # ---------------------------------------------------------------------------
 
 
-def _varint(n: int) -> bytes:
-    """Encode an integer as a Bitcoin-compatible varint."""
-    if n < 0xFD:
-        return bytes([n])
-    elif n <= 0xFFFF:
-        return b"\xfd" + n.to_bytes(2, "little")
-    elif n <= 0xFFFFFFFF:
-        return b"\xfe" + n.to_bytes(4, "little")
-    else:
-        return b"\xff" + n.to_bytes(8, "little")
+#: Canonical CompactSize, from the one codec in :mod:`pyrxd.compactsize`. This
+#: was a fourth hand-written encoder; the shared one additionally refuses
+#: negatives and values past 64 bits rather than raising ``ValueError`` /
+#: ``OverflowError`` out of ``to_bytes`` by accident.
+_varint = encode_compact_size
 
 
 def _validate_txid(txid: str) -> None:
@@ -81,18 +77,13 @@ def _validate_fee_sats(fee_sats: int) -> None:
 
 
 def _push_data(data: bytes) -> bytes:
-    """Encode a data push op for a scriptSig."""
-    n = len(data)
-    if n == 0:
-        return b"\x00"  # OP_0 — selector 0 (finalize function)
-    elif n <= 75:
-        return bytes([n]) + data
-    elif n <= 255:
-        return b"\x4c" + bytes([n]) + data  # OP_PUSHDATA1
-    elif n <= 65535:
-        return b"\x4d" + n.to_bytes(2, "little") + data  # OP_PUSHDATA2
-    else:
-        raise ValidationError(f"push data too large: {n} bytes")
+    """Encode a data push op for a scriptSig.
+
+    Empty data becomes ``OP_0``, which this module relies on for selector 0 (the
+    finalize function). Shares :func:`~pyrxd.utils.encode_data_push` with the two
+    HTLC modules; the 64 KB ceiling is passed rather than baked into the encoder.
+    """
+    return encode_data_push(data, max_len=0xFFFF)
 
 
 # ---------------------------------------------------------------------------

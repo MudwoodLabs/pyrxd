@@ -34,7 +34,7 @@ from ...glyph.types import GlyphRef
 from ...gravity.swap_order import DemandedOutput
 from ...security.errors import ValidationError
 from ...security.types import Txid
-from ...utils import encode_pushdata, unsigned_to_varint
+from ...utils import encode_pushdata, encode_script_num, unsigned_to_varint
 
 RSWP_MAGIC = b"RSWP"
 RSWP_VERSION_V2 = 0x02
@@ -95,17 +95,19 @@ def encode_price_terms(outputs: Sequence[DemandedOutput]) -> bytes:
 
 
 def _scriptnum_push(n: int) -> bytes:
-    """``OP_0`` for 0, else a minimal-CScriptNum direct data push (Photonic ``encodeScriptNum``)."""
+    """``OP_0`` for 0, else a minimal-CScriptNum DIRECT data push (Photonic ``encodeScriptNum``).
+
+    Shares the number encoding with the rest of the SDK
+    (:func:`~pyrxd.utils.encode_script_num`) and deliberately NOT the push
+    policy: ``minimal_push=False`` keeps 1..16 as ``01 0n`` instead of folding
+    them into ``OP_1``..``OP_16``. Photonic's reader takes these fields
+    positionally, so folding would change a frame the network already accepts.
+    That split — one number encoder, two push policies — is exactly why the two
+    are separate functions rather than one "obvious" merge.
+    """
     if n == 0:
         return _OP_0
-    octets = bytearray()
-    remaining = n
-    while remaining > 0:
-        octets.append(remaining & 0xFF)
-        remaining >>= 8
-    if octets[-1] & 0x80:
-        octets.append(0x00)
-    return encode_pushdata(bytes(octets), minimal_push=False)
+    return encode_pushdata(encode_script_num(n), minimal_push=False)
 
 
 def _byte_push(field: str, value: int) -> bytes:

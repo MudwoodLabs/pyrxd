@@ -74,9 +74,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pyrxd.constants import REF_OPERAND_WIDTH
 from pyrxd.constants import OpCode as OP
 from pyrxd.glyph.script import REF_OPCODES, count_input_refs
 from pyrxd.glyph.types import GlyphRef
+from pyrxd.script.consensus import has_valid_ops
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
@@ -126,13 +128,22 @@ def _assert_no_nonminimal_push(spk: bytes) -> None:
     single 20-byte ``pkh`` direct push, so this is normally trivially satisfied —
     but we re-check the whole assembled script so a future edit that introduces a
     non-minimal push fails at build time rather than silently on-chain. Mirrors
-    the equivalent guard in ``gravity/htlc_covenant.py``.
+    the equivalent guard in ``gravity/htlc_covenant.py``, including its
+    ``HasValidOps`` precondition: a script that does not decode into instructions
+    makes this walk's offsets meaningless, so structural validity is settled
+    first.
     """
+    if not has_valid_ops(spk):
+        raise ValidationError(
+            "assembled soulbound SPK is not structurally valid (CScript::HasValidOps) — "
+            "Radiant would reject it, so the singleton would be locked into a script "
+            "no spend can satisfy"
+        )
     i, n = 0, len(spk)
     while i < n:
         op = spk[i]
         if op in _REF_OPS:
-            i += 37  # ref opcode + 36-byte ref operand (not a data push)
+            i += 1 + REF_OPERAND_WIDTH  # ref opcode + its fixed-width operand (not a data push)
             continue
         if 0x01 <= op <= 0x4B:
             if i + 1 + op > n:
@@ -173,9 +184,9 @@ def build_soulbound_nft_covenant(genesis_ref: GlyphRef, owner_pkh: bytes) -> Sou
     """
     if not isinstance(owner_pkh, (bytes, bytearray)) or len(owner_pkh) != 20:
         raise ValidationError("owner_pkh must be 20 bytes (hash160)")
-    ref = genesis_ref.to_bytes()  # 36-byte wire format
-    if len(ref) != 36:  # defensive; GlyphRef.to_bytes already guarantees this
-        raise ValidationError("genesis ref must encode to 36 bytes")
+    ref = genesis_ref.to_bytes()  # wire format: exactly REF_OPERAND_WIDTH bytes
+    if len(ref) != REF_OPERAND_WIDTH:  # defensive; GlyphRef.to_bytes already guarantees this
+        raise ValidationError(f"genesis ref must encode to {REF_OPERAND_WIDTH} bytes")
 
     spk = b"".join(
         [
@@ -255,8 +266,8 @@ def build_composable_soulbound_nft_covenant(genesis_ref: GlyphRef, owner_pkh: by
     if not isinstance(owner_pkh, (bytes, bytearray)) or len(owner_pkh) != 20:
         raise ValidationError("owner_pkh must be 20 bytes (hash160)")
     ref = genesis_ref.to_bytes()
-    if len(ref) != 36:
-        raise ValidationError("genesis ref must encode to 36 bytes")
+    if len(ref) != REF_OPERAND_WIDTH:
+        raise ValidationError(f"genesis ref must encode to {REF_OPERAND_WIDTH} bytes")
 
     spk = b"".join(
         [

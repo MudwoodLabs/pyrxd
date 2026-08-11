@@ -21,7 +21,6 @@ Security notes
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 from abc import ABC, abstractmethod
@@ -33,6 +32,7 @@ from urllib.parse import quote, urljoin, urlparse
 
 import aiohttp
 
+from ..hash import hash256
 from ..security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
 from ..security.types import BlockHeight, Hex32, RawTx, Satoshis, Txid
@@ -775,8 +775,7 @@ class BitcoinCoreRpcSource(BtcDataSource):
 # ─────────────────────────────────────────────── MultiSourceBtcDataSource
 
 
-def _hash256(data: bytes) -> bytes:
-    return hashlib.sha256(hashlib.sha256(data).digest()).digest()
+_hash256 = hash256  # Bitcoin SHA-256d, from the one definition in pyrxd.hash
 
 
 def _verify_raw_matches_txid(raw: bytes, txid: Txid) -> None:
