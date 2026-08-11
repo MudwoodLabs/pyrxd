@@ -369,9 +369,12 @@ class TestBuildPaymentTx:
     def test_change_below_dust_swept_into_fee(self):
         """When change < 546 sats, it is swept into the miner fee."""
         kp = generate_keypair()
-        # change = 50_400 - 50_000 - 1 = 399 < 546 = dust
-        utxo = BtcUtxo(txid="aa" * 32, vout=0, value=50_400)
-        result = build_payment_tx(kp, utxo, b"\xbb" * 20, P2WPKH, 50_000, 1)
+        # change = 50_599 - 50_000 - 200 = 399 < 546 = dust.
+        # The fee was 1 sat here, which is below the 1 sat/vB relay floor for the ~110
+        # vbyte swept shape — the sweep was being demonstrated on a transaction no node
+        # would relay. 200 sats keeps the change sub-dust while clearing the floor.
+        utxo = BtcUtxo(txid="aa" * 32, vout=0, value=50_599)
+        result = build_payment_tx(kp, utxo, b"\xbb" * 20, P2WPKH, 50_000, 200)
         assert result.change_sats == 0
 
         # Tx should have only 1 output (no change)

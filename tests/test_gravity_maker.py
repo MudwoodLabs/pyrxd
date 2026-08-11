@@ -145,6 +145,14 @@ def _make_offer(privkey: PrivateKeyMaterial, **kwargs) -> GravityOffer:
     return build_gravity_offer(**defaults)
 
 
+#: A fee that clears Radiant's relay floor for the ~190-byte MakerOffer funding tx
+#: ``create_offer`` builds. These fixtures used ``10_000``, which is ~190x under the floor
+#: (Radiant charges 10,000 photons per byte of ``tx.GetTotalSize()``): they exercised
+#: ``GravityMakerSession.create_offer`` against a transaction no node would relay, and the
+#: mocked broadcaster happily accepted it. See ``tests/test_gravity_maker_offer.py::_FEE``.
+_FEE = 2_500_000
+
+
 def _make_active_offer(
     privkey: PrivateKeyMaterial,
     offer_txid: str = "aa" * 32,
@@ -227,8 +235,8 @@ class TestCreateOffer:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
         )
         active = await session.create_offer(params)
         assert isinstance(active, ActiveOffer)
@@ -243,8 +251,8 @@ class TestCreateOffer:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
         )
         await session.create_offer(params)
         client.broadcast.assert_called_once()
@@ -259,8 +267,8 @@ class TestCreateOffer:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
         )
         active = await session.create_offer(params)
         assert active.offer_vout == 0
@@ -275,8 +283,8 @@ class TestCreateOffer:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
         )
         active = await session.create_offer(params)
         # Single-output mode: output_photons = funding - fee = photons_offered
@@ -293,8 +301,8 @@ class TestCreateOffer:
             offer=offer,
             funding_txid="aa" * 32,
             funding_vout=0,
-            funding_photons=offer.photons_offered + 10_000,
-            fee_sats=10_000,
+            funding_photons=offer.photons_offered + _FEE,
+            fee_sats=_FEE,
         )
         with pytest.raises(NetworkError):
             await session.create_offer(params)
@@ -522,9 +530,9 @@ class TestGravityOfferParams:
             funding_txid="aa" * 32,
             funding_vout=0,
             funding_photons=600_000,
-            fee_sats=10_000,
+            fee_sats=_FEE,
         )
-        assert params.fee_sats == 10_000
+        assert params.fee_sats == _FEE
         assert params.change_address is None
 
     def test_construction_with_change_address(self):
@@ -535,7 +543,7 @@ class TestGravityOfferParams:
             funding_txid="aa" * 32,
             funding_vout=0,
             funding_photons=600_000,
-            fee_sats=10_000,
+            fee_sats=_FEE,
             change_address="1FakeAddress",
         )
         assert params.change_address == "1FakeAddress"

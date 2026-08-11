@@ -392,7 +392,10 @@ class TestParamEncodingEdges:
 
 class TestMakerOfferTxSigning:
     FAKE_TXID = "aa" * 32
-    FEE = 1_000
+    #: Clears Radiant's relay floor for the ~190-byte offer tx (10,000 photons/byte of
+    #: ``tx.GetTotalSize()``). Was 1,000 — ~1,900x short, i.e. a transaction the node
+    #: rejects with ``66: min relay fee not met``. See ``test_gravity_maker_offer.py::_FEE``.
+    FEE = 2_500_000
 
     def test_exact_funding_no_change_succeeds(self):
         pk = _make_privkey()
@@ -809,7 +812,8 @@ class TestHardenedBuildGravityOffer:
 class TestMakerOfferTxWireBinding:
     """Parse the raw tx bytes and prove load-bearing fields are correct."""
 
-    FEE = 10_000
+    #: Clears Radiant's relay floor for the ~190-byte offer tx. Was 10,000 — ~190x short.
+    FEE = 2_500_000
 
     def _build_result(self, pk=None, **overrides):
         pk = pk or _make_privkey(0x12)
@@ -1188,7 +1192,8 @@ class TestSigningIntegrity:
     needs to be bound to: outpoint, input value, scriptCode, outputs.
     """
 
-    FEE = 10_000
+    #: Clears Radiant's relay floor for the ~190-byte offer tx. Was 10,000 — ~190x short.
+    FEE = 2_500_000
 
     def test_sig_binds_to_output_script_via_hashoutputhashes(self):
         """Scenario 26: changing the P2SH output script changes the signature.

@@ -6,6 +6,54 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **`build_maker_offer_tx` and `build_payment_tx` now refuse a fee below the relay floor.**
+  Both accepted any non-negative `fee_sats` and returned a fully-populated result —
+  plausible `txid`, plausible accounting — for a transaction no node will relay. The
+  Radiant one is **fund safety**: Radiant has neither RBF (`validation.cpp:667`/`:856`
+  reject a mempool conflict outright) nor CPFP (`miner.cpp:380` selects on the
+  transaction's own `GetModifiedFeeRate()`), so an under-fee'd offer cannot be replaced or
+  bumped and squats on the Maker's funding UTXO until `DEFAULT_MEMPOOL_EXPIRY` (8h). The
+  Bitcoin one is recoverable via RBF/CPFP and is guarded so the builder fails closed rather
+  than handing back bytes that cannot go on the wire.
+
+  Both bind to the existing `pyrxd.gravity.fee_policy.assert_fee_covers` — the same check
+  `htlc_spend` and the `RadiantCovenantLeg` pre-broadcast gate already use — rather than
+  restating a rate or a rounding rule. **The floor is per-chain and stays per-chain.**
+  Radiant charges `ceil(size x rate / 1000)` against `tx.GetTotalSize()` at an effective
+  10,000 photons/byte; Bitcoin charges against BIP141 `vsize` at 1 sat/vB. Two named
+  functions now hold that difference, `radiant_relay_size` and `bitcoin_virtual_size`, so a
+  caller picks a chain instead of re-deriving a formula. Measured on the same P2WPKH
+  payment: 222 total bytes vs 141 vbytes, so applying Radiant's rule to the BTC path would
+  over-charge by 57%.
+
+  Sized against the **final signed** transaction, never an estimate: coincurve DER
+  signatures are 69-71 bytes, so the offer transaction is 188-190 bytes single-output and
+  223-224 with change (measured over 400 builds of each shape), and a pre-signing estimate
+  is wrong for some fraction of builds. This is the defect `wallet.py`'s send builders still
+  carry, recorded under *Known issues* below.
+
+  Node-proved at the boundary in both directions, against the floor each node advertises
+  rather than an assumed one:
+
+  - Radiant Core v3.1.1 regtest (`getmempoolinfo.effective_minrelaytxfee` = 1,000,000
+    photons/kB, a tenth of the mainnet reference rate): a 189-byte offer at 188,999 photons
+    → `66: min relay fee not met`; the same shape at 189,000 → accepted.
+  - Bitcoin Core 24 regtest (`getnetworkinfo.relayfee` = 1,000 sats/kvB): a 141-vbyte
+    payment at 140 sats → `min relay fee not met`; the same shape at 141 → accepted.
+
+  Both builders take a new optional `fee_policy: DeadlineFeePolicy | None` — the rate is
+  node policy, not a protocol constant, and a regtest node advertises less than mainnet.
+  `assert_fee_covers` gains `chain_has_fee_bumping` (default `False`, so every existing
+  caller's message is byte-identical) because its "no RBF, no CPFP, stuck for 8h"
+  explanation is a fact about Radiant and would be a false statement about Bitcoin.
+
+  **`fee_sats=10_000` appeared at 25 offline call sites**, every one of them building an
+  offer transaction the chain would reject — roughly 190x under the floor — and asserting it
+  was fine. That is why nothing offline caught this: the fixtures described a chain state
+  that cannot exist. All 25 were raised to a fee that actually clears the floor for the
+  transaction being built, rather than the guard being weakened to accommodate them.
 Two consensus-level defects, both found by putting builders that had never seen a node to
 a Radiant Core v3.1.1 regtest one.
 
@@ -80,15 +128,11 @@ a Radiant Core v3.1.1 regtest one.
 
 ### Documented
 
-- **`build_maker_offer_tx` and `build_payment_tx` enforce no relay-fee floor**, unlike
-  `pyrxd.gravity.htlc_spend`, which refuses to return an under-fee'd spend. Both take
-  `fee_sats` on trust and return a fully-populated result — plausible `txid`, plausible
-  accounting — for a transaction no node will relay. Measured: a 190-byte maker-offer
-  transaction at `fee_sats=10_000` (the value the offline suite uses throughout) is rejected
-  with `66: min relay fee not met` against a node floor of 190,000 photons, and 1,900,000
-  photons at the reference mainnet node's effective rate. Radiant has neither RBF nor CPFP,
-  so the funding UTXO is then stuck until the 8h mempool expiry. Both behaviours are now
-  pinned by a test that says so; neither builder was changed.
+- **`build_maker_offer_tx` and `build_payment_tx` enforced no relay-fee floor** — found by
+  the live-node work above, recorded here as a finding and pinned by two tests that asserted
+  the defective behaviour so it could not be lost. **Both are now fixed**; see *Security*
+  above, which supersedes this entry. The two pinning cases were rewritten to assert the
+  guard rather than deleted, and each carries a note that it previously described the defect.
 Plain RXD sends — the most-used path in the SDK — had never been put to a node. Every test
 covering `RxdWallet.build_send_tx` and `build_send_max_tx` asserted on the builder's own
 return value, which is the one witness that cannot tell a working transaction from a

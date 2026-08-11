@@ -86,10 +86,18 @@ BTC_SOURCE_KIND: str = os.environ.get("BTC_SOURCE_KIND", "blockstream")
 # It is read inside the functions that need it to avoid the key material
 # living as a module-level string for the lifetime of the process.
 
-# Small amounts — the user's session constraint (< 100k photons on RXD side)
-PHOTONS_OFFERED: int = int(os.environ.get("PHOTONS_OFFERED", "10000"))  # 0.0001 RXD
+# Small amounts. The two chains' fees are SEPARATE constants on purpose: their relay
+# floors differ by about four orders of magnitude and are charged against different
+# sizes (Radiant: 10,000 photons per byte of tx.GetTotalSize(); Bitcoin: 1 sat per
+# BIP141 vbyte). A single shared FEE_SATS used to stand in for both, and at 1,000 it was
+# fine for BTC and ~1,900x short for Radiant — the builders now refuse that outright.
+PHOTONS_OFFERED: int = int(os.environ.get("PHOTONS_OFFERED", "10000000"))  # 0.1 RXD
 BTC_SATOSHIS: int = int(os.environ.get("BTC_SATOSHIS", "1000"))  # 1000 sats
-FEE_SATS: int = int(os.environ.get("FEE_SATS", "1000"))
+#: Radiant side. ~190-byte offer tx x 10,000 photons/byte = 1,900,000 floor; 250 bytes of
+#: headroom, the same figure the live path below derives.
+RXD_FEE_PHOTONS: int = int(os.environ.get("RXD_FEE_PHOTONS", "2500000"))
+#: Bitcoin side. ~110-180 vbytes at 1 sat/vB.
+BTC_FEE_SATS: int = int(os.environ.get("BTC_FEE_SATS", "1000"))
 
 # Optional real BTC testnet txid to SPV-prove. If unset, the script scans
 # recent blocks for a suitable P2WPKH payment tx.
@@ -440,8 +448,8 @@ async def phase_4_gravity_tx_builders(pk, pkh, chain_anchor, anchor_height):
         offer=offer,
         funding_txid=FAKE_FUNDING_TXID,
         funding_vout=0,
-        funding_photons=PHOTONS_OFFERED + FEE_SATS,
-        fee_sats=FEE_SATS,
+        funding_photons=PHOTONS_OFFERED + RXD_FEE_PHOTONS,
+        fee_sats=RXD_FEE_PHOTONS,
         maker_privkey=pk,
     )
     _ok(f"build_maker_offer_tx: {maker_offer_result.txid[:16]}...  {maker_offer_result.tx_size} bytes")
@@ -454,8 +462,8 @@ async def phase_4_gravity_tx_builders(pk, pkh, chain_anchor, anchor_height):
         offer=offer,
         funding_txid=maker_offer_result.txid,
         funding_vout=0,
-        funding_photons=PHOTONS_OFFERED,
-        fee_sats=FEE_SATS,
+        funding_photons=maker_offer_result.output_photons,
+        fee_sats=RXD_FEE_PHOTONS,
         taker_privkey=taker_rxd,
     )
     _ok(f"build_claim_tx:       {claim.txid[:16]}...  {claim.tx_size} bytes")
@@ -463,14 +471,14 @@ async def phase_4_gravity_tx_builders(pk, pkh, chain_anchor, anchor_height):
     _ok(f"  claimed P2SH: {claim.claimed_p2sh}")
 
     # BTC payment tx (Taker side — no broadcast)
-    btc_utxo = BtcUtxo(txid="bb" * 32, vout=0, value=BTC_SATOSHIS + FEE_SATS * 3)
+    btc_utxo = BtcUtxo(txid="bb" * 32, vout=0, value=BTC_SATOSHIS + BTC_FEE_SATS * 3)
     btc_tx = build_payment_tx(
         keypair=taker_btc,
         utxo=btc_utxo,
         to_hash=offer.btc_receive_hash,
         to_type=offer.btc_receive_type,
         amount_sats=BTC_SATOSHIS,
-        fee_sats=FEE_SATS,
+        fee_sats=BTC_FEE_SATS,
     )
     _ok(f"BTC payment tx:       {btc_tx.txid[:16]}...  size: {len(bytes.fromhex(btc_tx.tx_hex))} bytes")
 
@@ -518,11 +526,11 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
         utxos_sorted = sorted(utxos, key=lambda u: u["value"], reverse=True)
         utxo = utxos_sorted[0]
         _info(f"Using UTXO: {utxo['tx_hash']}:{utxo['tx_pos']} ({utxo['value']} photons)")
-        min_needed = FEE_SATS + 1  # at minimum, fee + 1 photon output
+        min_needed = RXD_FEE_PHOTONS + 1  # at minimum, fee + 1 photon output
         if utxo["value"] < min_needed:
             _fail(
                 f"Largest UTXO ({utxo['value']} photons) is below minimum "
-                f"needed ({min_needed} = fee {FEE_SATS} + 1 photon output)."
+                f"needed ({min_needed} = fee {RXD_FEE_PHOTONS} + 1 photon output)."
             )
 
         from pyrxd.security.secrets import PrivateKeyMaterial
