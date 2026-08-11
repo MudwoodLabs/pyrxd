@@ -35,8 +35,18 @@ even possible.
 
 This module exists so that rule has ONE implementation. It previously had three
 (``glyph/ft.py``, ``cli/swap_book_cmds.py``, and — absent, which was the bug —
-``wallet.py``), and this repo has a measured history of the same rule drifting
-apart across copies.
+``wallet.py`` and ``hd/wallet.py``), and this repo has a measured history of the
+same rule drifting apart across copies.
+
+Not to be confused with ``pyrxd.fee_models``
+--------------------------------------------
+``pyrxd.fee_models.SatoshisPerKilobyte`` is a :class:`~pyrxd.fee_model.FeeModel`
+for ``Transaction.fee()``: it *models* a transaction's size from its shape
+(counting inputs, outputs and varints) so a fee can be estimated before signing.
+This module works the other way round — from the **measured serialized length of
+an already-signed transaction** — and is what decides whether a build is allowed
+to be returned at all. Estimating a size and proving a signed transaction pays
+for its own bytes are different jobs; only the second one can fail closed.
 
 The two floors are different things
 -----------------------------------
