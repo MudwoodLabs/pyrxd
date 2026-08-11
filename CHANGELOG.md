@@ -57,6 +57,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     `websockets>=16.1.1`. The suites that only need anvil are unaffected, but the Glyph suite also
     drives pyrxd's ElectrumX client and fails to connect under the lower pin. Left undeclared here
     rather than papered over: the conflict is real and wants a dependency decision, not a test edit.
+### Documentation
+
+- **The external-audit scoping brief is brought current to 0.14.0**
+  (`docs/security-audit-scope.md`). It had not been revised since 2026-06-20 (pre-0.10.0), so
+  the residual register was missing threat-model **S21–S24** entirely and still described the
+  threat model as "S1..S19 + R1". The revision reconciles the register against
+  `docs/threat-model.md` (now S1..S24) and re-verifies every carried-forward claim against the
+  code rather than against prior prose. Substantive corrections beyond the four new scenarios:
+
+  - **Scope table updated for five releases of new attack surface**: both counterparty-funding
+    gates in `SwapCoordinator`, `gravity/fee_policy.py`, the offline/cold recovery toolkit
+    (`cli/swap_recovery.py`), the ElectrumX registry/failover/SPKI-pinning stack
+    (`network/registry.py`, `failover.py`, `tls_pin.py`), `hd/descriptor.py`, the two-phase
+    Glyph minter, FT airdrop + royalty, dMint deploy-with-premine, the RSWP orderbook, the
+    handshake wire-format + Glyph protocol specs with their conformance vectors, and the
+    watchtower entrypoints that now ship in the wheel.
+  - **Stale register entries corrected against the code**: `KEY-COINTYPE-LOAD` (the load path
+    now requires and pins the persisted coin type — was "open"), `GLYPH-DUAL-WALKER` (single
+    consensus-correct `REF_OPCODES`, differential-locked — this was the live 0.14.0 panel
+    finding), `GLYPH-PARSER-FUZZ` (atheris harnesses + a weekly lane exist — was "not yet
+    fuzzed"), `NET-TLS-PINNING` (opt-in SPKI pinning shipped — TM gap #7 wording predates it),
+    `WATCH-STALLTRACKER` (now wired per-swap in `watch/quorum.py`), `DMINT-V2-GOLDEN` (mainnet
+    anchors now cover FT/NFT/commit/envelope/V1/V2-FIXED; LWMA deliberately unpinned), and
+    `SPV-SOLE-AUTHORITY` (the sole-authority "gate" is an advisory no-op as of 0.9.0 — the
+    covenant nBits pin is the defense; the threat model's "fails closed" wording is flagged as
+    stale). The earlier "SBOM now ships" claim is corrected: generation silently failed from
+    v0.9.0 through 0.11.1, and 0.11.2 was the first release to attach one.
+  - **New sections an auditor needs**: what is and is not proven (the Radiant HTLC leg and
+    dust-value cross-chain swaps are real; every run so far is single-operator — the two-party
+    adversarial run has NOT happened); where internal review has actually found fund-safety
+    bugs (the 0.14.0 eight-reviewer panel's four findings, all pre-existing, none in the
+    release diff — diff review would not have found any of them); and the known-open items at
+    0.14.0 (the six `-m integration` suites red pending the HZ-1 reordering, the unroutable
+    CONTAINER-with-child-ref, the versionless handshake, lossy envelope decode, and the
+    non-canonical creator-signature encoding) so the audit does not spend budget rediscovering
+    them.
+
+  `tests/test_residual_register_traceability.py` machine-checks that every code/test path the
+  revised register cites exists.
 
 ## [0.14.0] — 2026-08-10
 
