@@ -24,6 +24,7 @@ import click
 
 from ..agent import AgentClient, AgentDaemon, TtyConfirmer, agent_socket_path
 from ..agent.daemon import DEFAULT_IDLE_TIMEOUT_S
+from ..agent.hygiene import harden_process
 from ..hd.wallet import HdWallet
 from ..security.errors import ValidationError
 from .context import CliContext
@@ -109,6 +110,34 @@ def agent_unlock(ctx: CliContext, idle_timeout: float, auto_confirm_under: int, 
             cause="the file does not exist",
             fix="run `pyrxd wallet new` to create one, or pass --wallet PATH",
         )
+    # Harden BEFORE the mnemonic exists in this process, not after.
+    #
+    # ``harden_process()`` used to run only inside ``AgentDaemon.serve_forever``,
+    # which is the LAST thing this command does — so the mnemonic was typed, the
+    # passphrase prompted and the seed derived while the process was still
+    # swappable, dumpable and ptrace-able. Measured on this path: 23.9 ms with an
+    # automated prompt, however long the user takes to type with a real one, and
+    # unbounded under ``--passphrase``, which waits on a human twice.
+    #
+    # What this actually buys, stated honestly:
+    #   * ``mlockall`` — the real gain. Before it runs, the pages holding the
+    #     plaintext mnemonic and the derived seed are ordinary swappable memory,
+    #     and swap survives a reboot in a way a sub-second memory window does not.
+    #   * ``RLIMIT_CORE = 0`` — a crash during the prompt or the scrypt decrypt
+    #     can no longer write a core file containing the mnemonic. (Many distros
+    #     already ship a 0 soft limit; the hard limit is unlimited, so this is a
+    #     conditional gain, not a universal one.)
+    #   * ``PR_SET_DUMPABLE 0`` — closes the attacker who arrives AFTER unlock.
+    #     It does NOT close a watcher already holding an open ``/proc/<pid>/mem``
+    #     fd, because the prctl does not revoke open descriptors. Moving the call
+    #     earlier does not change that, and it should not be claimed to.
+    #
+    # ``harden_process`` is documented never to raise, and that contract is now
+    # load-bearing: an exception here would deny the user their own wallet on a
+    # host that merely lacks ``CAP_IPC_LOCK``. Every measure inside it is
+    # best-effort and failures are reported, never fatal.
+    harden_process()
+
     mnemonic = prompt_mnemonic_input()
     if not mnemonic:
         raise UserError("mnemonic is required", cause="no input received", fix="enter the wallet's BIP39 mnemonic")

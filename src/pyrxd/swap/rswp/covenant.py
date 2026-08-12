@@ -45,7 +45,7 @@ asset classification, as before).
 
 from __future__ import annotations
 
-from ...constants import DUST_THRESHOLD_PHOTONS, SIGHASH
+from ...constants import DUST_THRESHOLD_PHOTONS, LOCKTIME_THRESHOLD, SIGHASH
 from ...fee_sizing import radiant_relay_size
 from ...gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy, assert_fee_covers
 from ...gravity.swap_order import DemandedOutput
@@ -76,7 +76,16 @@ REFUND_SEQUENCE = 0xFFFFFFFE
 
 #: nLockTime/CLTV values at/above this are UNIX timestamps, not heights. The
 #: swap expiry is always a HEIGHT; reject anything at/above the threshold.
-LOCKTIME_HEIGHT_THRESHOLD = 500_000_000
+#:
+#: A re-binding of the canonical constant, not a second literal. It used to be
+#: its own ``500_000_000`` — which survived the centralisation precisely because
+#: it was spelled under a different NAME, so a name-based duplicate check looked
+#: past it. Only ``constants.LOCKTIME_THRESHOLD`` is pinned to the vendored
+#: Radiant Core ``script.h:90`` (``test_consensus_opcode_parity.py``); the copy
+#: here was pinned to nothing, and drifting it UPWARD passed the whole suite.
+#: The alias inherits the pin. ``tests/test_no_duplicate_consensus_constants.py``
+#: now fails on a third copy under any name.
+LOCKTIME_HEIGHT_THRESHOLD = LOCKTIME_THRESHOLD
 # A real swap-refund covenant SPK is ~62-67 bytes (OP_IF + 25B P2PKH + OP_ELSE + <=6B expiry push +
 # CLTV DROP + 25B P2PKH + OP_ENDIF). The parser's nested marker scan is ~O(len^2) in the worst case, and a
 # griefer picks the advertised covenant txid (fetch_transaction has no size cap), so bound the input before

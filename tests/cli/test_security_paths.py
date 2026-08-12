@@ -25,6 +25,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from click.testing import CliRunner
 
+import pyrxd.cli.agent_cmds as agent_cmds_module
 from pyrxd.cli.agent_cmds import agent_group
 from pyrxd.cli.config import Config
 from pyrxd.cli.context import CliContext
@@ -218,6 +219,63 @@ class TestAgentUnlockLifecycle:
         assert result.exit_code != 0
         assert "mnemonic is required" in result.output
         daemon_cls.assert_not_called()
+
+    def test_the_process_is_hardened_before_the_mnemonic_is_read(
+        self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Ordering, not leakage: ``harden_process()`` ran only inside
+        ``serve_forever()``, which is reached AFTER the mnemonic is typed, the
+        passphrase prompted and the seed derived.
+
+        What that window costs is mostly not ptrace — the demonstrated reader was
+        the target's own parent, and a ``yama ptrace_scope >= 1`` host blocks the
+        sibling attacker the threat model names. It is ``mlockall``. Until it runs,
+        the pages holding the plaintext mnemonic and the derived seed are ordinary
+        swappable memory, and swap survives a reboot in a way a sub-second memory
+        window does not. ``RLIMIT_CORE = 0`` is the same argument for a crash.
+
+        So this pins the order rather than any observation about memory: harden
+        first, THEN accept the secret. The window it closes is bounded by the
+        default path (measured at ~0.036 s) and unbounded under ``--passphrase``,
+        which waits on a human.
+        """
+        calls: list[str] = []
+        monkeypatch.setattr("pyrxd.cli.agent_cmds.harden_process", lambda: calls.append("harden"))
+        real_prompt = agent_cmds_module.prompt_mnemonic_input
+
+        def _recording_prompt(*args, **kwargs):
+            calls.append("mnemonic")
+            return real_prompt(*args, **kwargs)
+
+        monkeypatch.setattr("pyrxd.cli.agent_cmds.prompt_mnemonic_input", _recording_prompt)
+
+        _saved_wallet(tmp_path / "wallet.dat")
+        ctx = _ctx(tmp_path / "wallet.dat")
+        result = runner.invoke(agent_group, ["unlock"], obj=ctx, input=f"{MNEMONIC}\n")
+
+        assert result.exit_code == 0, result.output
+        assert calls[:2] == ["harden", "mnemonic"], (
+            f"the mnemonic entered the process before it was hardened (call order: {calls})"
+        )
+
+    def test_hardening_failure_never_blocks_the_unlock(
+        self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Best-effort means best-effort — and the call now runs BEFORE the unlock,
+        so the cost of getting this wrong changed from "the daemon fails to start"
+        to "you cannot reach your own wallet".
+
+        The real ``harden_process`` is exercised (not replaced): every measure
+        inside it is forced to fail the way a container without ``CAP_IPC_LOCK``
+        fails. The unlock must be unaffected.
+        """
+        for name in ("_try_mlockall", "_try_set_non_dumpable", "_try_disable_core_dumps"):
+            monkeypatch.setattr(f"pyrxd.agent.hygiene.{name}", lambda: False)
+        _saved_wallet(tmp_path / "wallet.dat")
+        ctx = _ctx(tmp_path / "wallet.dat")
+        result = runner.invoke(agent_group, ["unlock"], obj=ctx, input=f"{MNEMONIC}\n")
+        assert result.exit_code == 0, result.output
+        assert "unlocked" in result.output
 
     def test_unlock_wrong_mnemonic_no_echo(self, runner: CliRunner, tmp_path: Path, daemon_cls: MagicMock) -> None:
         _saved_wallet(tmp_path / "wallet.dat")

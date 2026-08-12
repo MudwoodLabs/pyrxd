@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import secrets
 import tempfile
@@ -66,7 +67,7 @@ from ..hd.descriptor import AccountDescriptors, account_descriptors
 from ..keys import PrivateKey
 from ..network.electrumx import UtxoRecord, script_hash_for_address
 from ..script.type import P2PKH
-from ..security.errors import KeyMaterialError, ValidationError
+from ..security.errors import KeyMaterialError, NetworkError, ValidationError
 from ..security.secrets import SecretBytes
 from ..transaction.transaction import Transaction
 from ..transaction.transaction_input import TransactionInput
@@ -81,7 +82,11 @@ from ..wallet import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
     from ..network.electrumx import ElectrumXClient
+
+logger = logging.getLogger(__name__)
 
 _GAP_LIMIT = 20
 
@@ -830,33 +835,95 @@ class HdWallet:
             recs = [r for r in recs if r.change == change]
         return recs
 
-    async def get_utxos(self, client: ElectrumXClient) -> list[UtxoRecord]:
-        """Return all UTXOs across all known addresses."""
+    async def _read_per_address(
+        self,
+        used: list[AddressRecord],
+        read: Callable[[str], Awaitable[object]],
+        *,
+        what: str,
+        strict: bool,
+    ) -> list[object | None]:
+        """Fan a per-address read across *used*; ``None`` marks an address that failed.
+
+        The one place the three readers below share, because they were three
+        spellings of one rule and the rule was wrong in all three. Each gathered
+        its own results with ``return_exceptions=True`` and then filtered by
+        ``isinstance(result, list | tuple)`` — which silently reads "this address
+        could not be read" as "this address holds nothing".
+
+        ``_scan_chain`` refuses to do that, in as many words: *"A failed lookup
+        cannot be safely interpreted as 'unused'."* Two rules, one truth, and the
+        half without the comment was the half that swallowed it.
+
+        Whole-connection loss is not the interesting case — that fails every read,
+        yields nothing, and the callers refuse loudly. The reachable one is
+        partial: ``electrumx.py`` raises "Malformed UTXO entry in server response"
+        from ``listunspent`` content validation alone, so ``get_history`` keeps
+        answering and ``refresh()``'s own fail-closed gate sees a clean scan.
+
+        ``strict`` raises instead of returning a short list. It is for callers
+        whose result is a completeness CLAIM (see :meth:`send_max`); an ordinary
+        spend only needs *enough*, and refusing it over one unreadable address
+        would be a fail-closed refusal to move funds — worse than the partial view
+        whenever a deadline is running.
+        """
+        results = await asyncio.gather(*[read(r.address) for r in used], return_exceptions=True)
+        failures = [r for r in results if isinstance(r, BaseException)]
+        if failures:
+            summary = f"{len(failures)} of {len(used)} address reads failed during {what}"
+            if strict:
+                raise NetworkError(
+                    f"{summary} — refusing to report a partial view as a complete one. "
+                    "Retry, or use a different ElectrumX endpoint."
+                ) from failures[0]
+            logger.warning(
+                "%s; the returned view is INCOMPLETE (first error: %s: %s)",
+                summary,
+                type(failures[0]).__name__,
+                failures[0],
+            )
+        return [None if isinstance(r, BaseException) else r for r in results]
+
+    async def get_utxos(self, client: ElectrumXClient, *, strict: bool = False) -> list[UtxoRecord]:
+        """Return all UTXOs across all known addresses.
+
+        A per-address read that fails is logged and contributes nothing; pass
+        ``strict=True`` to refuse a partial answer instead (see
+        :meth:`_read_per_address`).
+        """
         all_utxos: list[UtxoRecord] = []
         used = [r for r in self.addresses.values() if r.used]
         if not used:
             return []
-        results = await asyncio.gather(
-            *[client.get_utxos(script_hash_for_address(r.address)) for r in used],
-            return_exceptions=True,
+        results = await self._read_per_address(
+            used,
+            lambda address: client.get_utxos(script_hash_for_address(address)),
+            what="get_utxos",
+            strict=strict,
         )
         for result in results:
             if isinstance(result, list):
                 all_utxos.extend(result)
         return all_utxos
 
-    async def get_balance(self, client: ElectrumXClient) -> int:
+    async def get_balance(self, client: ElectrumXClient, *, strict: bool = False) -> int:
         """Return total confirmed + unconfirmed satoshis across all known addresses.
 
         Uses ``ElectrumXClient.get_balance`` per address.  Call ``refresh()``
         first to ensure the address set is current.
+
+        A per-address read that fails is logged and contributes zero — so the
+        total is a LOWER BOUND, not a balance. Pass ``strict=True`` when the
+        number is being shown to somebody or compared against a threshold.
         """
         used = [r for r in self.addresses.values() if r.used]
         if not used:
             return 0
-        results = await asyncio.gather(
-            *[client.get_balance(script_hash_for_address(r.address)) for r in used],
-            return_exceptions=True,
+        results = await self._read_per_address(
+            used,
+            lambda address: client.get_balance(script_hash_for_address(address)),
+            what="get_balance",
+            strict=strict,
         )
         total = 0
         for result in results:
@@ -1038,14 +1105,18 @@ class HdWallet:
         tx_input.source_transaction = _SrcTx()
         return tx_input
 
-    async def collect_spendable(self, client: ElectrumXClient) -> list[tuple[UtxoRecord, str, PrivateKey]]:
+    async def collect_spendable(
+        self, client: ElectrumXClient, *, strict: bool = False
+    ) -> list[tuple[UtxoRecord, str, PrivateKey]]:
         """Return ``(utxo, address, privkey)`` triples for every UTXO across known addresses.
 
-        Address→key mapping is preserved so signing works correctly per
-        UTXO. Falls back gracefully if any per-address fetch fails (the
-        failed address contributes nothing rather than crashing the whole
-        collection — the caller decides whether the resulting balance is
-        enough).
+        Address→key mapping is preserved so signing works correctly per UTXO.
+
+        A per-address fetch that fails contributes nothing rather than crashing
+        the whole collection — the caller decides whether the resulting balance is
+        enough — but it is now LOGGED rather than dropped in silence, and
+        ``strict=True`` refuses the partial result outright. Use ``strict`` when
+        the answer is a claim about *all* the funds; :meth:`send_max` does.
         """
         used = [r for r in self.addresses.values() if r.used]
         if not used:
@@ -1053,9 +1124,11 @@ class HdWallet:
 
         # Fan out one get_utxos call per used address; preserve the
         # address (and therefore the key derivation path) per result.
-        results = await asyncio.gather(
-            *[client.get_utxos(script_hash_for_address(r.address)) for r in used],
-            return_exceptions=True,
+        results = await self._read_per_address(
+            used,
+            lambda address: client.get_utxos(script_hash_for_address(address)),
+            what="collect_spendable",
+            strict=strict,
         )
 
         # Bind the account xprv once for the whole collection (avoid re-deriving the master per
@@ -1064,9 +1137,7 @@ class HdWallet:
         triples: list[tuple[UtxoRecord, str, PrivateKey]] = []
         for rec, result in zip(used, results, strict=True):
             if not isinstance(result, list):
-                # Network error for this one address — log via the
-                # client's own error handling, drop on the floor here.
-                continue
+                continue  # already reported by _read_per_address
             privkey = self._privkey_for(rec.change, rec.index, account_xprv)
             for utxo in result:
                 triples.append((utxo, rec.address, privkey))
@@ -1289,8 +1360,16 @@ class HdWallet:
         fee_rate: int = DEFAULT_FEE_RATE,
         allow_below_relay_floor: bool = False,
     ) -> str:
-        """Sweep all UTXOs to *to_address* minus fee. Returns broadcast txid."""
-        triples = await self.collect_spendable(client)
+        """Sweep all UTXOs to *to_address* minus fee. Returns broadcast txid.
+
+        Collection is ``strict``: "sweep everything" is a completeness claim, and
+        a sweep built from a view that silently lost an address moves *most* of
+        the funds while reporting that it moved all of them. Raises
+        :class:`NetworkError` if any per-address read failed — nothing is
+        broadcast, and a retry (or a different endpoint) sweeps the whole set.
+        Use :meth:`send` for an amount, which does not make that claim.
+        """
+        triples = await self.collect_spendable(client, strict=True)
         tx = self.build_send_max_tx(
             triples,
             to_address,
