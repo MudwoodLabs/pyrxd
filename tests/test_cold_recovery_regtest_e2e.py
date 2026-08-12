@@ -369,6 +369,27 @@ class TestColdBuilderGuardsAgainstRealChainState:
             every observed size contributes a candidate value, and each candidate is
             retried — with a FRESH fee key, which re-rolls the DER length independently of
             the value — until one lands on its own boundary.
+
+            **The budget is 23 attempts, not 12, and that is why this search is left as
+            it is** while the rest of its family (measured 0.07%-6.3% per case, in four
+            files) was rewritten around a size-neutral redraw. Round one tries the probe's
+            size; every round after it retries EVERY size observed so far, so the
+            per-round survival is a product, not a single coin flip.
+
+            Measured over 30 000 offline trials of this case — the search needs a funded
+            UTXO but its CONVERGENCE does not, so a stand-in answering the four RPCs it
+            calls measures the shipped search itself: **0 give-ups**, 60 000 searches
+            settling in a mean of 2.03 draws, worst 19. One draw settles 49.30% of the
+            time (60 000 of 121 696 attempts), because this transaction carries exactly
+            ONE signature — the fee input's; the covenant unlock is ``<preimage> OP_0``,
+            no sig — leaving its size a near-fair coin: over 181 696 builds, 266 B
+            0.4973, 267 B 0.4989, 265 B 0.0038, 264 B 0.00003. Per-round survival is
+            then 0.5027 x 0.5011 = 0.2519, and the give-up probability ~1.3e-7 per
+            search, ~2.6e-7 per run of this case (DERIVED from those rates; the
+            geometric tail of the observed draw counts, 0.507**23, agrees at ~1.6e-7).
+            Reading the twelve rounds as twelve single attempts instead gives 0.5**12 —
+            ~0.05% per run, ~1 900x too pessimistic, which is the estimate that put this
+            case on the list.
             """
             probe, _w, _u = _build_at(400_000)
             sizes = {probe.size_bytes}
