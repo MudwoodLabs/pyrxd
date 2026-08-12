@@ -40,6 +40,34 @@ structure, source spelling for intent.
 Every detector is a pure function of source text, so
 :class:`TestTheGuardCatchesTheBugsThatMotivatedIt` can plant each historical defect
 verbatim and prove the guard fires — rather than trusting that it would.
+
+The three questions each detector has to answer
+-----------------------------------------------
+The sections below grew as the failure mode was found in new shapes, and each
+addition had to answer the same three questions. They are worth stating once,
+because a fourth section will have to answer them too.
+
+**What is the OWNER?** Sometimes a constant in ``pyrxd.constants``; sometimes a
+*derivation* that lives elsewhere — ``relay_floor_photons_per_byte()``,
+``BTC_MAX_SATS`` as ``supply x subunit``, ``SEQUENCE_FINAL - 1``. Where the owner is
+a derivation, "does ``constants.py`` still spell this number" cannot be the
+not-vacuous check; ``TestDerivedRulesAreNotRetyped.test_the_owning_derivations_still_exist``
+asserts each is still *computed from its inputs* instead.
+
+**Is the ban SATISFIABLE, and where?** A blanket ban on ``10_000`` or ``768`` is not
+— 10,000 is also a basis-point denominator, 768 a legitimate registry datum — so the
+narrow detectors key on the value AND the role the site puts it in. Scope differs per
+detector for measured reasons, not by default: the value scan skips ``tests`` (19
+legitimate ``500_000_000`` amounts) but covers ``scripts`` and ``examples``, which had
+no such collisions and had been excluded only by where the scan happened to start.
+
+**How is it PROVED?** Two ways, and both are required. A detector must fire on a
+planted duplicate (:class:`TestEachNewDetectorFiresOnAPlantedDuplicate`) and must NOT
+fire on the coincidental shapes (:class:`TestTheNewDetectorsDoNotFireOnLegitimateCode`)
+— the second is what stops a guard nobody can satisfy from being allowlisted away, and
+it is where the deliberate non-consolidations are recorded as executable claims rather
+than as comments. Where a guard uses object identity rather than source text, the
+premise that makes identity meaningful is asserted too, not assumed.
 """
 
 from __future__ import annotations
