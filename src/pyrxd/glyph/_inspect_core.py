@@ -48,8 +48,12 @@ from .types import GlyphProtocol
 # here so a single change updates both surfaces.
 _TXID_HEX_LEN = 64
 _CONTRACT_HEX_LEN = 72
-# The minimum script we'd reasonably classify is plain P2PKH (25 bytes / 50 hex).
-_MIN_SCRIPT_HEX_LEN = 50
+# The smallest script we classify is P2SH — ``OP_HASH160 <20> OP_EQUAL``, 23
+# bytes / 46 hex. It used to be plain P2PKH (25 bytes / 50 hex), which meant a
+# pasted P2SH scriptPubKey was rejected by the input dispatcher before any
+# classifier saw it. Lowering the floor only widens what reaches
+# ``_inspect_script``; anything it cannot name still comes back ``unknown``.
+_MIN_SCRIPT_HEX_LEN = 46
 # Cap accidental "paste a whole tx" before running every classifier on it.
 _MAX_SCRIPT_HEX_LEN = 20_000
 
@@ -127,7 +131,7 @@ def _classify_input(s: str) -> tuple[str, str]:
       * 64 hex → txid
       * 72 hex → contract
       * contains ":" → outpoint (validated downstream)
-      * 50–20_000 even-length hex → script
+      * 46–20_000 even-length hex → script
 
     A bare 64-hex string is always treated as a txid even though it could
     structurally also be a 32-byte payload-hash push prefix; the txid form
@@ -207,8 +211,41 @@ def _inspect_outpoint(s: str) -> dict:
     }
 
 
+def _ref_summary(script: bytes) -> dict:
+    """The OP_PUSHINPUTREF-family refs an unrecognised script carries.
+
+    Attached to ``type: "unknown"`` results so a shape the classifier cannot
+    name is still not a black box: the one fact that matters most about an
+    unknown Radiant script is whether it is **token-bearing**, because a
+    ref-carrying UTXO fed into a wallet as plain funding gets burned as a fee
+    input (docs/solutions/logic-errors/funding-utxo-byte-scan-dos.md).
+
+    Uses the shared consensus walk, so a ref byte sitting inside push-data is
+    never counted. A script that will not decode reports
+    ``token_bearing: null`` — unknown, not ``false`` — because a walk that
+    cannot finish has not proven the absence of anything.
+    """
+    from .script import TruncatedScriptError, iter_input_refs
+    from .types import GlyphRef
+
+    try:
+        refs = list(iter_input_refs(script))
+    except TruncatedScriptError:
+        return {"token_bearing": None, "input_refs": []}  # nosec B105 — a Glyph token, not a credential
+    rows = []
+    for opcode, operand in refs:
+        try:
+            ref = GlyphRef.from_bytes(operand)
+            outpoint = f"{ref.txid}:{ref.vout}"
+        except ValidationError:  # pragma: no cover — 36 bytes always decode
+            outpoint = ""
+        rows.append({"opcode": f"0x{opcode:02x}", "ref_outpoint": outpoint})
+    return {"token_bearing": bool(rows), "input_refs": rows}
+
+
 def _inspect_script(script_hex: str) -> dict:
     """Classify a single hex-encoded locking script. Returns a flat dict."""
+    from ..script.timelock import parse_p2pkh_timelock_script
     from .dmint import DmintState
     from .script import (
         MUTABLE_NFT_SCRIPT_RE,
@@ -236,6 +273,14 @@ def _inspect_script(script_hex: str) -> dict:
     # Plain P2PKH check first (cheapest, common).
     if len(script) == 25 and script[:3] == b"\x76\xa9\x14" and script[23:] == b"\x88\xac":
         return {**base, "type": "p2pkh", "owner_pkh": script[3:23].hex()}
+
+    # P2SH — ``OP_HASH160 <20> OP_EQUAL``. Radiant Core's own ``Solver``
+    # recognises this one (``TX_SCRIPTHASH``); the redeem script it commits to
+    # is not on-chain until the output is spent, so there is nothing further to
+    # report. The Gravity SPV maker covenant funds a P2SH output, which is how
+    # this shape reaches the inspector in practice.
+    if len(script) == 23 and script[:2] == b"\xa9\x14" and script[22:] == b"\x87":
+        return {**base, "type": "p2sh", "script_hash": script[2:22].hex()}
 
     # OP_RETURN data output. ``\x6a`` is OP_RETURN; whatever follows is
     # an unspendable data carrier — used by some legacy Radiant tools
@@ -323,24 +368,127 @@ def _inspect_script(script_hex: str) -> dict:
             "owner_pkh": bytes(extract_owner_pkh_from_commit_script(script)).hex(),
         }
 
-    # dMint contract is variable-length and parser-only; try last.
+    # Time-locked P2PKH (CLTV absolute / CSV relative). Exact template parse
+    # against pyrxd.script.timelock's builders — these are the HTLC refund
+    # outputs, so the person inspecting one is usually the person who cannot
+    # spend it yet and wants to know when they can.
+    timelock = parse_p2pkh_timelock_script(script)
+    if timelock is not None:
+        row = {
+            **base,
+            "type": f"p2pkh-{timelock.kind}",
+            "owner_pkh": timelock.owner_pkh.hex(),
+            "locktime_value": timelock.value,
+            "locktime_basis": timelock.basis,
+            "locktime_units": timelock.units,
+        }
+        if timelock.kind == "csv":
+            row["relative_lock_disabled"] = timelock.relative_lock_disabled
+        return row
+
+    # dMint contract is variable-length and parser-only. It MUST be tried
+    # before the soulbound fallbacks below: a dMint contract script (V1 and V2)
+    # binds a singleton ref AND carries a self-replication-or-burn structure,
+    # so it trips every marker ``classify_soulbound`` looks for. Same for the
+    # mutable-NFT shape, matched further above. Ordering is what keeps those
+    # from being reported as soulbound.
     try:
         state = DmintState.from_script(script)
     except ValidationError:
-        return {**base, "type": "unknown"}
+        pass
+    else:
+        return {
+            **base,
+            "type": "dmint",
+            "version": "v1" if state.is_v1 else "v2",
+            "contract_ref_outpoint": f"{state.contract_ref.txid}:{state.contract_ref.vout}",
+            "token_ref_outpoint": f"{state.token_ref.txid}:{state.token_ref.vout}",
+            "height": state.height,
+            "max_height": state.max_height,
+            "reward": state.reward,
+            "algo": state.algo.name,
+            "daa_mode": state.daa_mode.name,
+        }
 
-    return {
-        **base,
-        "type": "dmint",
-        "version": "v1" if state.is_v1 else "v2",
-        "contract_ref_outpoint": f"{state.contract_ref.txid}:{state.contract_ref.vout}",
-        "token_ref_outpoint": f"{state.token_ref.txid}:{state.token_ref.vout}",
-        "height": state.height,
-        "max_height": state.max_height,
-        "reward": state.reward,
-        "algo": state.algo.name,
-        "daa_mode": state.daa_mode.name,
-    }
+    return _classify_self_replicating(script, base)
+
+
+def _classify_self_replicating(script: bytes, base: dict) -> dict:
+    """Soulbound / self-replication fallbacks, then ``unknown``.
+
+    Two tiers, deliberately kept apart because they carry different amounts of
+    certainty and collapsing them would overstate the weaker one:
+
+    ``soulbound-covenant``
+        An **exact** round-trip against one of pyrxd's two soulbound builders
+        (:func:`~pyrxd.glyph.soulbound_covenant.parse_soulbound_nft_covenant`).
+        The parameters are recovered and the builder re-run; the bytes match or
+        they do not.
+
+    ``self-replicating-covenant``
+        The semantic markers ``classify_soulbound`` looks for are present — the
+        script binds a singleton ref and contains a self-replication equality
+        (or code-script-hash count) — but the bytes are not a shape pyrxd
+        builds. That is a true statement about the structure and a useful one,
+        but it is NOT "this is soulbound": container and vault covenants
+        self-replicate too. The label says what was observed and the note says
+        what it does not prove.
+
+    Neither tier proves the covenant is *correct* or that it is enforceable for
+    the token a caller cares about — that needs the on-chain differential, not
+    a locking script.
+    """
+    from .soulbound_covenant import parse_soulbound_nft_covenant
+    from .soulbound_detect import Transferability, classify_soulbound
+
+    parsed = parse_soulbound_nft_covenant(script)
+    if parsed is not None:
+        ref, owner_pkh, variant = parsed
+        detected = classify_soulbound(script)
+        return {
+            **base,
+            "type": "soulbound-covenant",
+            "variant": variant,
+            "transferability": detected.transferability.value,
+            "bound_ref_txid": ref.txid,
+            "bound_ref_vout": ref.vout,
+            "bound_ref_outpoint": f"{ref.txid}:{ref.vout}",
+            "owner_pkh": owner_pkh.hex(),
+            "has_self_replication": detected.has_self_replication,
+            "has_burn_branch": detected.has_burn_branch,
+            "note": (
+                "exact match against pyrxd's soulbound covenant builder. The lock permits only a "
+                "self-clone or a burn, so it is non-transferable AT CONSENSUS for whatever singleton "
+                "the bound ref names. It does NOT verify that ref names a live Glyph singleton, that "
+                "the singleton is actually held here, or that the covenant is free of defects — the "
+                "covenant is a pre-external-audit prototype."
+            ),
+        }
+
+    detected = classify_soulbound(script)
+    if detected.transferability is Transferability.SOULBOUND_COVENANT:
+        row = {
+            **base,
+            "type": "self-replicating-covenant",
+            "transferability": detected.transferability.value,
+            "has_self_replication": detected.has_self_replication,
+            "has_burn_branch": detected.has_burn_branch,
+            "note": (
+                "structural marker match only: the script binds a singleton ref and contains a "
+                "self-replication-or-burn constraint. That is NOT proof it is a soulbound token — "
+                "container and vault covenants replicate themselves too, and the bytes do not match "
+                "any covenant pyrxd builds. Read the script before trusting it as a credential."
+            ),
+            **_ref_summary(script),
+        }
+        if detected.bound_ref is not None:
+            from .types import GlyphRef
+
+            ref = GlyphRef.from_bytes(detected.bound_ref)
+            row["bound_ref_outpoint"] = f"{ref.txid}:{ref.vout}"
+        return row
+
+    return {**base, "type": "unknown", **_ref_summary(script)}
 
 
 def _classify_metadata_protocol(metadata) -> str:

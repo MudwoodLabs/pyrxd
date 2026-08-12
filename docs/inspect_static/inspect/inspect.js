@@ -1057,6 +1057,17 @@ function _structuralQualifierNote(type) {
         "non-Glyph protocols (legacy Atomicals-style markers, " +
         "third-party tooling) to embed arbitrary bytes on-chain. " +
         "Does NOT carry value and is not part of the Glyph protocol.",
+    p2sh: "Pay-to-script-hash. The redeem script this commits to is not " +
+        "on-chain until the output is spent, so nothing further can be " +
+        "said about what it does.",
+    "p2pkh-cltv": "Structural pattern match. The tool cannot tell you whether " +
+        "the lock has elapsed — that needs the chain tip. A spending tx " +
+        "must set nLockTime to at least this value and use a non-final " +
+        "nSequence on the input.",
+    "p2pkh-csv": "Structural pattern match. The tool cannot tell you whether " +
+        "the lock has elapsed — that needs this output's confirmation " +
+        "height. The spending input's nSequence must carry at least this " +
+        "delay and the tx must be version 2 or later.",
   };
   return NOTES[type] || "";
 }
@@ -1104,6 +1115,11 @@ function renderScriptCard(payload) {
     "commit-nft": "NFT commit script",
     "container-legacy": "Dead container output (unspendable)",
     p2pkh: "P2PKH locking script",
+    p2sh: "P2SH locking script",
+    "p2pkh-cltv": "Time-locked P2PKH (absolute / CLTV)",
+    "p2pkh-csv": "Time-locked P2PKH (relative / CSV)",
+    "soulbound-covenant": "Soulbound NFT covenant",
+    "self-replicating-covenant": "Self-replicating covenant",
     op_return: "OP_RETURN data output",
     unknown: "Unrecognised script",
   };
@@ -1122,6 +1138,42 @@ function renderScriptCard(payload) {
     dl.appendChild(kv("child ref outpoint", payload.child_ref_outpoint));
   }
   if (payload.payload_hash) dl.appendChild(kv("payload hash (sha256)", payload.payload_hash));
+  if (payload.script_hash) dl.appendChild(kv("script hash (20 hex)", payload.script_hash));
+
+  // Time-lock fields. `locktime_units` is the count in whatever unit
+  // `locktime_basis` names, which is the number a reader actually wants;
+  // `locktime_value` is the raw on-stack integer and differs from it for CSV
+  // (it carries the type flag in bit 22).
+  if (payload.locktime_basis) {
+    dl.appendChild(kv("lock basis", payload.locktime_basis));
+    dl.appendChild(kv("lock units", payload.locktime_units));
+    dl.appendChild(kv("raw value", payload.locktime_value));
+  }
+
+  // Soulbound / self-replicating covenant fields.
+  if (payload.variant) dl.appendChild(kv("covenant variant", payload.variant));
+  if (payload.transferability) dl.appendChild(kv("transferability", payload.transferability));
+  if (payload.bound_ref_outpoint) dl.appendChild(kv("bound ref", payload.bound_ref_outpoint));
+  if (payload.has_self_replication !== undefined) {
+    dl.appendChild(kv("self-replication branch", String(payload.has_self_replication)));
+  }
+  if (payload.has_burn_branch !== undefined) {
+    dl.appendChild(kv("burn branch", String(payload.has_burn_branch)));
+  }
+
+  // Token-bearing summary on an unnamed script. Whether a shape nobody
+  // recognises carries a ref is the fact worth surfacing: spending such a
+  // UTXO as plain funding destroys the token it carries. `null` means the
+  // script did not decode, so absence was never established.
+  if (payload.token_bearing !== undefined) {
+    dl.appendChild(kv(
+      "token-bearing",
+      payload.token_bearing === null ? "unknown (script does not decode)" : String(payload.token_bearing),
+    ));
+    for (const row of payload.input_refs || []) {
+      dl.appendChild(kv(`input ref (${row.opcode})`, row.ref_outpoint));
+    }
+  }
 
   // dMint-specific fields
   if (payload.version) dl.appendChild(kv("dmint version", payload.version));
@@ -1152,11 +1204,27 @@ function renderScriptCard(payload) {
     }));
   }
 
-  // A dead pre-0.15.0 container output. The `note` the classifier attaches is
-  // the whole value of recognising the shape at all — without it the holder
-  // just sees an unfamiliar type and goes looking for a wallet that can move
-  // it. None can.
-  if (payload.spendable === false && payload.note) {
+  if (payload.token_bearing === true) {
+    wrapper.appendChild(el("p", {
+      class: "card-note",
+      text: "TOKEN-BEARING: the opcode-aware walk found OP_PUSHINPUTREF-family " +
+            "refs in this script. Do not spend it as plain funding — a " +
+            "ref-carrying UTXO fed in as a fee input destroys the token it carries.",
+    }));
+  } else if (payload.token_bearing === null) {
+    wrapper.appendChild(el("p", {
+      class: "card-note",
+      text: "The script does not decode as an opcode stream, so the walk could " +
+            "not rule out an input ref. Treat it as token-bearing.",
+    }));
+  }
+
+  // The classifier attaches a `note` to the shapes where recognising the shape
+  // is only half the answer: the dead pre-0.15.0 container (whose holder would
+  // otherwise go hunting for a wallet that can move it — none can) and the two
+  // covenant tiers (where the note is what keeps a marker match from reading as
+  // proof). The text comes from a fixed internal vocabulary, never from CBOR.
+  if (payload.note) {
     wrapper.appendChild(el("p", { class: "card-note", text: payload.note }));
   }
 
@@ -1170,15 +1238,25 @@ function renderScriptCard(payload) {
   return wrapper;
 }
 
+// Every badge kind the stylesheet actually defines (inspect.css
+// `.badge-*`). Anything outside this set would emit a class with no rule
+// and render unstyled, so `scriptBadgeKind` maps to the nearest one that
+// exists instead of passing the raw type through.
+const _BADGE_KINDS = new Set(["ft", "nft", "mut", "dmint", "commit", "p2pkh", "unknown"]);
+
 // Map a script `type` value (which may include a hyphen, e.g. "commit-ft")
 // to a CSS-safe badge kind. Hyphenated commit variants share the
 // `commit` badge colour.
 function scriptBadgeKind(type) {
   if (type.startsWith("commit")) return "commit";
-  // No badge colour is defined for the dead container shape; reuse the
-  // `unknown` styling rather than emitting a class the stylesheet lacks.
-  if (type === "container-legacy") return "unknown";
-  return type;
+  // Time-locked P2PKH is still P2PKH-shaped at the tail; borrow its colour.
+  if (type === "p2pkh-cltv" || type === "p2pkh-csv") return "p2pkh";
+  // The covenant shapes bind an NFT singleton; borrow the NFT colour.
+  if (type === "soulbound-covenant" || type === "self-replicating-covenant") return "nft";
+  // No badge colour is defined for the dead container shape or for P2SH;
+  // reuse the `unknown` styling rather than emitting a class the stylesheet
+  // lacks.
+  return _BADGE_KINDS.has(type) ? type : "unknown";
 }
 
 function renderErrorCard(payload) {

@@ -482,9 +482,13 @@ class TestTruncation:
 
     pyrxd has two behaviours here and the split is intentional: walkers whose
     output is consensus-visible (the sighash ref set; ref extraction used to
-    gate spends) refuse the script, while the two structural classifiers stop
-    early. These tests pin both, so a change to either is a decision rather
-    than a drift.
+    gate spends) refuse the script, while ``htlc_covenant._opcode_bd_positions``
+    — the one remaining structural classifier with its own walk — stops early.
+    These tests pin both, so a change to either is a decision rather than a
+    drift.
+
+    ``soulbound_detect._opcodes`` was on the lenient side of that split until
+    it was collapsed onto the shared walk; it is now on the refusing side.
     """
 
     @pytest.mark.parametrize("op", sorted(_OPERAND_OPS))
@@ -505,18 +509,33 @@ class TestTruncation:
             list(iter_input_refs(script))
 
     @pytest.mark.parametrize("op", sorted(_OPERAND_OPS))
-    def test_structural_classifiers_stop_at_a_truncated_ref(self, op):
-        """Documented leniency, not agreement with consensus.
+    def test_soulbound_opcodes_refuses_a_truncated_ref(self, op):
+        """``_opcodes`` agrees with ``GetScriptOp`` and refuses the script.
 
-        ``_opcodes`` and ``_opcode_bd_positions`` record the opcode then run off
-        the end, so they yield a prefix rather than raising. Both feed
-        fail-closed comparisons (an exact position list, an exact
-        classification), so a truncated script fails those checks anyway — but
-        the divergence from ``GetScriptOp`` is real and is pinned here rather
-        than assumed away.
+        This used to be pinned as *documented leniency*: the helper carried its
+        own transcription of the walk, recorded the opcode, then ran off the
+        end and returned a prefix. It now delegates to
+        ``glyph.script.iter_script_ops_strict`` — one walk, and a script that
+        does not decode is an error rather than a short answer. Fewer walkers,
+        and the surviving one fails closed.
         """
         script = bytes([op]) + _REAL_REF[:20]
-        assert soulbound_opcodes(script) == [op]
+        with pytest.raises(TruncatedScriptError):
+            soulbound_opcodes(script)
+        with pytest.raises(RefWalkTruncated):
+            _reference_walk(script)
+
+    @pytest.mark.parametrize("op", sorted(_OPERAND_OPS))
+    def test_htlc_bd_positions_still_stops_at_a_truncated_ref(self, op):
+        """Documented leniency, not agreement with consensus.
+
+        ``_opcode_bd_positions`` records the opcode then runs off the end, so
+        it yields a prefix rather than raising. It feeds a fail-closed
+        comparison (an exact position list), so a truncated script fails that
+        check anyway — but the divergence from ``GetScriptOp`` is real and is
+        pinned here rather than assumed away.
+        """
+        script = bytes([op]) + _REAL_REF[:20]
         assert _opcode_bd_positions(script) == []
         with pytest.raises(RefWalkTruncated):
             _reference_walk(script)

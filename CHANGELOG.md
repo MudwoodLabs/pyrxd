@@ -6,6 +6,96 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`pyrxd glyph inspect` now names four script shapes it previously called
+  `unknown`.** `inspect` is the only tool that names Radiant script shapes —
+  Radiant Core's own `Solver` recognises five Bitcoin-era templates and calls
+  every Glyph output `TX_NONSTANDARD` (verified against v3.1.2: zero hits for
+  `pushinputref` / `0xd0` / `0xd8` in `src/script/standard.cpp`), so there is no
+  upstream classifier to defer to. Newly classified:
+
+  - `type=soulbound-covenant` for both soulbound covenant variants (73 B
+    fixed-index, 78 B composable), reporting the bound ref, the immutable
+    owner pkh, which variant, and the self-replication / burn-branch flags.
+    The detection logic (`glyph.soulbound_detect.classify_soulbound`) already
+    existed and was simply never wired in.
+  - `type=p2pkh-cltv` and `type=p2pkh-csv` for the BIP-65 / BIP-112 time-lock
+    scripts — **these are the HTLC refund legs**, so the person inspecting one
+    is usually the person who cannot spend it yet. The decoded locktime is
+    reported in the unit it is denominated in: an absolute block height or
+    Unix time for CLTV (`LOCKTIME_THRESHOLD` decides which), a relative block
+    or 512-second count for CSV.
+  - `type=p2sh`, the one shape Radiant Core *does* recognise
+    (`TX_SCRIPTHASH`). The Gravity SPV maker covenant funds one.
+
+  A CSV script with bit 31 (`SEQUENCE_LOCKTIME_DISABLE_FLAG`) set is reported
+  as `relative_lock_disabled: true` and rendered with the disable notice
+  *above* the decoded delay: consensus ignores the lock entirely, so the
+  output is spendable immediately, and printing the delay first is how a
+  reader walks away with the opposite of the truth. `build_p2pkh_with_csv_script`
+  refuses to emit that shape, but one can exist on-chain.
+
+- **`type=unknown` now reports whether the script is token-bearing.** An
+  unnamed script still gets `token_bearing` plus an `input_refs[]` list from
+  the shared opcode-aware walk. This is the one fact worth having about a
+  shape no classifier claims: spending a ref-carrying UTXO as plain funding
+  destroys the token it carries. A script that does not decode reports
+  `token_bearing: null` — unknown, not `false`, because a walk that could not
+  finish never proved a ref was absent. This makes the HTLC covenants and the
+  partial dMint state/code scripts informative without claiming a shape for
+  them.
+
+- `parse_p2pkh_timelock_script` (`pyrxd.script.timelock`) and
+  `parse_soulbound_nft_covenant` (`pyrxd.glyph.soulbound_covenant`) — exact
+  inverses living next to the builders they invert. Neither raises, so both
+  are safe over arbitrary chain bytes.
+
+  All `--json` additions are additive; no existing key changed name or meaning.
+
+### Changed
+
+- **The soulbound classification is split into two tiers so the weaker one is
+  never sold as the stronger.** `classify_soulbound` matches on semantic
+  markers, which is right for its own job but too loose to drive a label:
+  measured against every locking-script builder in `src/`, a **dMint V1
+  contract, a dMint V2 contract, and a mutable-NFT script all return
+  `SOULBOUND_COVENANT`** — they bind a singleton ref and self-replicate, which
+  is every marker it looks for. So `inspect` reports `soulbound-covenant` only
+  on an **exact** round-trip against pyrxd's builder (parameters recovered,
+  builder re-run, bytes compared), and `self-replicating-covenant` when only
+  the markers are present, with a note saying plainly that container and vault
+  covenants self-replicate too. The dMint and `mut` parsers run *before* both,
+  and `tests/test_inspect_script_shapes.py` pins that ordering — move the
+  fallback above them and a token contract starts reading as a credential.
+
+- **`soulbound_detect._opcodes` no longer carries its own script walk.** It was
+  a fifth hand-written transcription of "how many bytes does this opcode
+  consume"; it is now a one-line projection over
+  `glyph.script.iter_script_ops_strict`, which is a filter over
+  `script/consensus.py`'s `get_script_op` — the `GetScriptOp` transcription
+  that was already the canonical answer. `glyph.script.iter_input_refs` was
+  collapsed onto the same primitive, removing a second copy. Behaviour change:
+  the helper now raises `TruncatedScriptError` on a script that does not
+  decode where it used to return a silent prefix. `classify_soulbound` already
+  returned `UNKNOWN` for those scripts via its `count_input_refs` pre-check, so
+  its verdicts are unchanged — but both paths now fail closed, and
+  `tests/test_ref_walker_differential.py` records the divergence from
+  `GetScriptOp` as *removed* rather than as documented leniency.
+
+### Documentation
+
+- `docs/concepts/glyph-inspect-tool.md` now states which of the two
+  classifiers sees what. Script-level reads a locking script and reports
+  `type`; envelope-level reads the reveal CBOR and reports
+  `metadata.classification`. TIMELOCK and ENCRYPTED *tokens* are
+  envelope-level only — their locking script is an ordinary singleton, so
+  there is no script pattern to find, and people were hunting for one. The
+  new `p2pkh-cltv` / `p2pkh-csv` types are genuinely script-level and are
+  unrelated to the TIMELOCK protocol. A `policy.transferable: false` flag in
+  the envelope is advisory; only the script-level `soulbound-covenant` type
+  reflects a restriction consensus enforces.
+
 ### Tests
 
 - **The relay-floor boundary searches in `test_remaining_builder_floors_regtest_e2e.py`

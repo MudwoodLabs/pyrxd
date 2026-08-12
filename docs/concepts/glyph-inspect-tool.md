@@ -108,12 +108,54 @@ tell you:
 | `type=commit-ft, payload_hash=…`                                             | The script matches the commit-ft hashlock template.                                                         | That a reveal tx exists or that the CBOR behind the hashlock decodes to anything valid.                 |
 | Tx-shape banner: "V1 dMint deploy commit"                                    | The tx outputs match the commit shape: one commit-ft, one commit-nft, N P2PKH ref-seeds, change.            | That a successful reveal followed, that the deployer broadcast valid CBOR, or that any mining will happen. |
 | Tx-shape banner: "dMint claim at height 41/625000"                           | `vin[0]` carries a 4-push scriptSig matching V1/V2 mint shape and the spent contract advanced its height.   | That the on-chain covenant *accepted* this spend — the covenant has runtime conditions (PoW, FT conservation, reward output shape) the byte-level classifier cannot evaluate without re-executing the script. |
+| `type=soulbound-covenant, variant=fixed-index`                               | The bytes are an **exact** round-trip against pyrxd's soulbound covenant builder for the reported ref and owner. The only spends the lock permits are a byte-identical self-clone or a burn. | That the bound ref names a live Glyph singleton, that the singleton is actually held at this output, or that the covenant is free of defects — it is a pre-external-audit prototype. |
+| `type=self-replicating-covenant`                                             | The script binds a singleton ref **and** contains a self-replication-or-burn structure.                     | That it is a soulbound token. Container and vault covenants self-replicate too, and these bytes match no covenant pyrxd builds. This tier is markers, not identification. |
+| `type=p2pkh-csv, locktime_units=144, locktime_basis=blocks`                   | The script is `<144> OP_CHECKSEQUENCEVERIFY OP_DROP <P2PKH>`; the encoded relative delay is 144 blocks from this output's confirmation. | Whether the delay has elapsed — that needs this output's confirmation height, which a locking script does not carry. |
+| `type=unknown, token_bearing=true`                                           | No classifier claims the shape, but the opcode-aware walk found OP_PUSHINPUTREF-family refs in it.          | What the script does. It says only that spending this UTXO as plain funding would destroy the token it carries. `token_bearing=null` means the script did not decode, so the *absence* of a ref was never proven either. |
 
 The boundary is intentional. `inspect` reads bytes; it does not
 execute scripts and it does not contact an indexer. If you need
 "this UTXO is *really* the head of this mint chain" or "this FT
 output will be accepted by the network when spent," that's a
 different tool.
+
+---
+
+## Two classifiers: script-level and envelope-level
+
+`inspect` runs **two** independent classifiers, and confusing them
+sends people hunting for byte patterns that cannot exist.
+
+**Script-level** — reads a locking script and reports a `type`. This
+is what you get from `pyrxd glyph inspect <hex>`, and what fills each
+row of the `outputs[]` list on a fetched transaction. It sees:
+`p2pkh`, `p2sh`, `nft`, `ft`, `mut`, `commit-nft`, `commit-ft`,
+`dmint`, `container-legacy`, `soulbound-covenant`,
+`self-replicating-covenant`, `p2pkh-cltv`, `p2pkh-csv`, `op_return`,
+`unknown`.
+
+**Envelope-level** — reads the CBOR payload out of the reveal
+transaction's scriptSig and reports the highest-specificity Glyph
+protocol label under `metadata.classification`. It sees: `wave`,
+`container`, `authority`, `timelock`, `encrypted`, `dmint`, `mut`,
+`dat`, `ft`, `nft`. This only appears on the `--fetch` (txid) form,
+because there is no envelope to read without the reveal transaction.
+
+The distinction that trips people:
+
+- A **TIMELOCK token** and an **ENCRYPTED token** are envelope-level
+  only. Their protocol flags live in the CBOR; their locking script is
+  an ordinary NFT/MUT singleton. There is no script pattern to detect,
+  so no amount of staring at the scriptPubKey will find one.
+- `p2pkh-cltv` / `p2pkh-csv` are script-level, and are **unrelated** to
+  the TIMELOCK protocol. They are plain BIP-65 / BIP-112 time-locked
+  P2PKH outputs — in this codebase, most often an HTLC refund leg.
+- A "soulbound" NFT can be either. `policy.transferable: false` in the
+  envelope is **advisory** — a flag an honest wallet may choose to
+  respect and any other wallet ignores. Only the script-level
+  `soulbound-covenant` type reflects a restriction consensus enforces.
+  A token can carry the metadata flag with a plain `nft` locking
+  script, and that combination restricts nothing.
 
 ---
 
