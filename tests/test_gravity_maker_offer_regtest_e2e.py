@@ -84,6 +84,22 @@ _FUNDING = 60_000_000  # 0.6 RXD of plain P2PKH the Maker spends
 #: ``_node_relay_rate`` rather than from this constant.
 _FEE = 5_000_000
 
+#: Fresh offers the relay-floor boundary search may draw before giving up.
+#:
+#: A redraw costs nothing — ``_offer`` re-rolls fields the transaction only commits to
+#: through a 23-byte P2SH — so the budget is set by the give-up probability rather than
+#: by expense. Measured offline (the search never consults the node, so its convergence
+#: is a property of the search alone): with the fee↔size fixed point iterated, a single
+#: draw settles 30.8% of the time over 30 000 trials, putting 40 draws at 0.692**40 ~
+#: 1e-6. The same 30 000 trials of the whole search gave up 0 times, needing a mean of
+#: 3.23 draws and 30 at worst — no trial came within ten draws of the budget.
+_OFFER_REDRAWS = 40
+
+#: Steps of the fee↔size fixed point to take within ONE offer. Measured over 20 000
+#: draws, a draw that settles does so at step 1 or 2 and never later, so this is twice
+#: the depth ever observed; see the comment at the loop itself.
+_SETTLE_STEPS = 4
+
 
 class _Party:
     """A freshly generated party. No literal keys — the swap stack's standing rule."""
@@ -128,6 +144,25 @@ def _offer(maker: _Party, taker: _Party):
     )
 
 
+def _offer_tx(maker: _Party, offer, funding_txid: str, *, fee: int, policy):
+    """``build_maker_offer_tx`` over an offer and a funding UTXO the caller already has.
+
+    Signing is RFC 6979, so this is a pure function of ``(offer, funding_txid, fee)``:
+    the same three reproduce the same bytes, and changing any one of them re-rolls the
+    DER length. That is what lets the boundary search below hold two of them fixed and
+    redraw the third.
+    """
+    return build_maker_offer_tx(
+        offer=offer,
+        funding_txid=funding_txid,
+        funding_vout=0,
+        funding_photons=_FUNDING,
+        fee_sats=fee,
+        maker_privkey=maker.material,
+        fee_policy=policy,
+    )
+
+
 def _deploy(rt: _RegtestNode, maker: _Party, taker: _Party, *, fee: int = _FEE, policy=None):
     """Fund the Maker, build the offer tx, and return ``(offer, result)`` unbroadcast.
 
@@ -139,16 +174,13 @@ def _deploy(rt: _RegtestNode, maker: _Party, taker: _Party, *, fee: int = _FEE, 
     """
     offer = _offer(maker, taker)
     funding_txid = _pay_to_spk(rt, maker.p2pkh_spk, _FUNDING)
-    result = build_maker_offer_tx(
-        offer=offer,
-        funding_txid=funding_txid,
-        funding_vout=0,
-        funding_photons=_FUNDING,
-        fee_sats=fee,
-        maker_privkey=maker.material,
-        fee_policy=policy if policy is not None else _node_policy(rt),
+    return offer, _offer_tx(
+        maker,
+        offer,
+        funding_txid,
+        fee=fee,
+        policy=policy if policy is not None else _node_policy(rt),
     )
-    return offer, result
 
 
 def _node_relay_rate(rt: _RegtestNode) -> int:
@@ -327,61 +359,87 @@ class TestMakerOfferOnConsensus:
 
         # ---- the boundary, both sides --------------------------------------
         # Searched, not solved: the fee is subtracted from the signed output value, so
-        # changing it re-signs the input and can move the DER length — and with it the size
-        # the floor is derived from. Each attempt spends a fresh funding UTXO, which
-        # re-rolls that length independently of the fee.
+        # changing it re-signs the input and can move the DER length (69-71 bytes) — and
+        # with it the size the floor is derived from.
+        #
+        # What is redrawn is the OFFER. `_offer` already re-rolls a 20-byte BTC receive
+        # hash and a 32-byte chain anchor per call, and the offer tx commits to all of it
+        # through a 23-byte P2SH scriptPubKey — so a redraw moves the sighash without
+        # moving a single byte of the transaction's own shape. The funding UTXO is drawn
+        # ONCE and reused: nothing built in this search is broadcast, so one UTXO serves
+        # every draw. It used to draw a fresh funding UTXO per build instead — a broadcast
+        # and a block each, 21.95 per run on average and 64 at worst — which bought the
+        # same redraw at a chain operation's price and still gave up 0.36% of the time
+        # (108 of 30 000 offline trials of this search).
         #
         # `permissive` exists only to FORCE the under-floor transaction into existence so
         # the node can be asked about it. Without it the guard refuses and there would be
         # nothing to submit — which is the point of the guard, but proves nothing about
         # where the node's line actually is.
         permissive = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+        funding_txid = _pay_to_spk(node, maker.p2pkh_spk, _FUNDING)
 
-        at_floor = under = None
-        for _ in range(20):
-            _o, probe = _deploy(node, maker, taker, fee=policy.min_relay_fee(200), policy=policy)
+        at_floor = under = won = None
+        for _ in range(_OFFER_REDRAWS):
+            offer = _offer(maker, taker)
+            probe = _offer_tx(maker, offer, funding_txid, fee=policy.min_relay_fee(200), policy=policy)
             floor = policy.min_relay_fee(probe.tx_size)
-            try:
-                _o, candidate = _deploy(node, maker, taker, fee=floor, policy=policy)
-            except InsufficientFundsError:
-                continue  # re-signing GREW the tx past the bid; the guard refusing is correct
-            if candidate.fee_sats != policy.min_relay_fee(candidate.tx_size):
-                continue  # re-signing shrank it; this build is not on the boundary
-            at_floor = candidate
-            # One photon under, at the same size, forced past the guard.
-            _o, u = _deploy(node, maker, taker, fee=floor - 1, policy=permissive)
+            candidate = None
+            # Iterate the fee↔size fixed point instead of trusting the probe. Within one
+            # offer the state is fixed and signing is RFC 6979, so `floor -> size` is a
+            # DETERMINISTIC map — it settles or it does not, and repeating a step changes
+            # nothing. Measured over 20 000 draws: every draw that settles does so at step
+            # 1 (50.3%) or step 2 (12.6%), never later; the other 37.1% end at the
+            # builder's own refusal because the re-sign grew the tx past the bid. So
+            # `_SETTLE_STEPS` is twice the depth ever observed, and a draw that has not
+            # settled by then is a cycle — draw a fresh offer instead.
+            for _ in range(_SETTLE_STEPS):
+                try:
+                    c = _offer_tx(maker, offer, funding_txid, fee=floor, policy=policy)
+                except InsufficientFundsError:
+                    break  # re-signing GREW the tx past the bid; the guard refusing is correct
+                settled = policy.min_relay_fee(c.tx_size)
+                if settled == floor:
+                    candidate = c
+                    break
+                floor = settled
+            if candidate is None:
+                continue
+            # One photon under, from the SAME offer and the SAME funding UTXO, forced past
+            # the guard — so "one under" is a statement about this transaction and not
+            # about a differently sized sibling.
+            u = _offer_tx(maker, offer, funding_txid, fee=floor - 1, policy=permissive)
             if u.tx_size == candidate.tx_size:
-                under = u
+                at_floor, under, won = candidate, u, offer
                 break
         assert at_floor is not None, "no offer tx reached a fee equal to its own relay floor"
         assert under is not None, "could not build a same-size transaction one photon under the floor"
 
-        # The guard itself refuses that fee. Stated in two parts, because a single
-        # `pytest.raises(_deploy(fee=under.fee_sats))` is NOT a deterministic
-        # assertion and was failing roughly one run in four: `_deploy` spends a fresh
-        # funding UTXO, so the rebuild re-rolls its own DER length, and a rebuild that
-        # comes out SMALLER legitimately clears its own floor at this fee — the guard
-        # allowing it is correct, not a miss. (Same failure mode as the covenant
-        # boundary search in tests/test_fee_floor_boundary_regtest_e2e.py, which
-        # avoids it by holding the state fixed across the pair.)
-        #
         # (a) Deterministic, on the bytes actually in hand: the guard's own condition
         #     holds for this transaction at this size.
         assert under.fee_sats < policy.min_relay_fee(under.tx_size)
-        # (b) Reached through the public builder: over several rebuilds at that fee,
-        #     at least one must be refused, and anything RETURNED must clear its own
-        #     floor — so no build slips through underpaying.
-        refused = 0
-        for _ in range(12):
+        # (b) Reached through the public builder, and now deterministically. The offer and
+        #     the funding UTXO are pinned and signing is RFC 6979, so this rebuild
+        #     reproduces `under` byte for byte and the guard has to refuse it. This was
+        #     "at least one of 12 rebuilds is refused" only because each rebuild drew a
+        #     fresh funding UTXO and so re-rolled its own DER length: a rebuild that came
+        #     out SMALLER cleared its own floor at this fee, and the guard allowing it was
+        #     correct rather than a miss.
+        with pytest.raises(InsufficientFundsError):
+            _offer_tx(maker, won, funding_txid, fee=under.fee_sats, policy=policy)
+        # (c) And nothing the guard DOES return at that fee underpays, over fresh offers —
+        #     the property (b) used to carry, kept, now at no chain cost.
+        returned = 0
+        for _ in range(_OFFER_REDRAWS):
             try:
-                _o, rebuilt = _deploy(node, maker, taker, fee=under.fee_sats, policy=policy)
+                rebuilt = _offer_tx(maker, _offer(maker, taker), funding_txid, fee=under.fee_sats, policy=policy)
             except InsufficientFundsError:
-                refused += 1
                 continue
+            returned += 1
             assert rebuilt.fee_sats >= policy.min_relay_fee(rebuilt.tx_size), (
                 f"the guard returned an underpaying offer: {rebuilt.fee_sats} for {rebuilt.tx_size} bytes"
             )
-        assert refused > 0, "12 rebuilds at a sub-floor fee and the guard refused none of them"
+        print(f"at that fee: {_OFFER_REDRAWS - returned}/{_OFFER_REDRAWS} refused, {returned} returned and all clear")
 
         res = node.accepts(under.tx_hex)
         assert res.get("allowed") is False, f"the node ACCEPTED one photon under its own floor: {res}"

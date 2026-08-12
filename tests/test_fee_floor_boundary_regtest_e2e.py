@@ -427,42 +427,56 @@ def _covenant(node: _RegtestNode, maker: PrivateKey) -> Transaction:
     return reserve
 
 
-#: Fresh refund PKHs to try per covenant before giving up on it.
+#: Fresh PKHs to try per fixture before giving up on that fixture.
 #:
 #: A PKH is 20 bytes at every value, so it cannot change the transaction's SIZE — but it
 #: does change the sighash, and so redraws the DER signature length, which is the only
 #: thing the fee↔size fixed point turns on. That makes it a free, size-neutral redraw:
 #: the same role nLockTime plays in ``test_wallet_send_regtest_e2e._fee_at_exactly``, and
-#: it costs no chain operations at all (the covenant is not rebuilt).
+#: it costs no chain operations at all (the fixture is not rebuilt).
 #:
-#: Measured offline over 400 draws: a single draw settles BOTH halves 31.5% of the time
-#: (40% oscillate on the fee fixed point, 29% land the one-photon-under build on a
-#: different size). 40 draws put the give-up probability at 0.685**40 ~ 3e-7 per
-#: covenant, and ``_COVENANT_DRAWS`` covenants square it again.
+#: Measured offline — the search never consults the node, so its convergence is a
+#: property of the search alone — a single draw settles BOTH halves 29.4-33.7% of the
+#: time across the four searches below (the rest either oscillate on the fee fixed point
+#: or land the one-photon-under build on a different size). 40 draws put the give-up
+#: probability at ~0.70**40 ~ 1e-6 per fixture, and ``_FIXTURE_DRAWS`` fixtures cube it.
+#: With the budget lifted entirely and 30 000 trials of each search, a fixture settled in
+#: a mean of 3.23 draws, the worst took 34, and **none of the 120 000 needed more than
+#: 40** — so the budget is generous rather than nearly-spent, and no run needed a second
+#: fixture.
 _PKH_REDRAWS = 40
 
-#: Fresh covenants to draw if every PKH redraw on one of them fails. Belt and braces —
-#: at the measured rate one covenant is already enough.
-_COVENANT_DRAWS = 3
+#: Fresh fixtures — a covenant reservation, or a funding UTXO — to draw if every PKH
+#: redraw on one of them fails. Belt and braces; at the measured rate one is enough.
+_FIXTURE_DRAWS = 3
 
 
-def _settle_boundary_pair(builder, reserved, maker, policy):
-    """A ``(at_floor, under, floor, pkh)`` pair on ONE covenant, or ``None``.
+def _settle_boundary_pair(build, policy):
+    """A ``(at_floor, under, floor, pkh)`` pair on ONE fixture, or ``None``.
+
+    ``build(pkh, fee, policy)`` closes over whatever chain state the case needed — a
+    confirmed covenant, a funded UTXO — so that state is drawn once and every redraw here
+    is free.
 
     ``at_floor`` pays exactly ``size x rate``; ``under`` is the SAME transaction one
     photon lighter, so "one under" is a statement about that transaction and not about a
-    differently sized sibling. Both come from the same covenant and the same refund PKH.
+    differently sized sibling. Both come from the same fixture and the same PKH.
     """
     for _ in range(_PKH_REDRAWS):
         # Never a hard-coded key — and a fresh one every draw is the whole mechanism.
         pkh = PrivateKey().public_key().hash160()
-        floor = policy.min_relay_fee(len(builder(reserved, maker, pkh, 20_000_000, _PERMISSIVE).serialize()))
+        floor = policy.min_relay_fee(len(build(pkh, 20_000_000, _PERMISSIVE).serialize()))
         at_floor = None
-        # The size can only take two adjacent values (DER is 71 or 72 bytes), so a run
-        # that has not settled in four steps is a two-cycle and never will.
+        # Within one PKH the state is fixed and signing is RFC 6979, so `floor -> size` is
+        # a DETERMINISTIC map: iterating it settles or it does not, and repeating a step
+        # changes nothing. Measured over 20 000 draws of each of the four searches below,
+        # every draw that settles does so at step 1 (~50%) or step 2 (~12%) — never step 3
+        # or later — and the remaining ~38% end at the builder's own refusal, because the
+        # re-sign grew the transaction past the bid. So four is twice the depth ever
+        # observed, and a draw that has not settled by then is a cycle: redraw the PKH.
         for _ in range(4):
             try:
-                candidate = builder(reserved, maker, pkh, floor, policy)
+                candidate = build(pkh, floor, policy)
             except InsufficientFundsError:
                 break
             settled = policy.min_relay_fee(len(candidate.serialize()))
@@ -472,39 +486,41 @@ def _settle_boundary_pair(builder, reserved, maker, policy):
             floor = settled
         if at_floor is None:
             continue
-        under = builder(reserved, maker, pkh, floor - 1, _PERMISSIVE)
+        under = build(pkh, floor - 1, _PERMISSIVE)
         if policy.min_relay_fee(len(under.serialize())) != floor:
             continue
         return at_floor, under, floor, pkh
     return None
 
 
-def _covenant_boundary(node: _RegtestNode, builder, label: str) -> None:
+def _boundary_is_the_nodes_floor(node: _RegtestNode, draw_fixture, label: str) -> None:
     """At the node's floor: accepted. One photon under: refused, reason quoted.
 
     Searched, not solved — the fee is part of the signed output value, so changing it
     re-signs the input and can move the DER length and with it the size the floor is
-    derived from. What is searched is the refund PKH, which is size-neutral (see
-    :data:`_PKH_REDRAWS`); the covenant is drawn once, not once per attempt.
+    derived from. What is searched is a PKH, which is size-neutral (see
+    :data:`_PKH_REDRAWS`); ``draw_fixture()`` — the part that costs chain operations —
+    runs once, not once per attempt.
 
-    This used to redraw the whole COVENANT — two chain operations — up to 12 times and
-    then fail. At the measured 31.5% per-draw settle rate that is a **1.1% failure rate
-    per test, 2.1% per run of this file**, which is what it did on this lane's first CI
-    run. Flakiness at that level gets a lane switched off.
+    Both callers used to redraw their whole fixture instead, and both flaked for it. At
+    the measured ~31% per-draw settle rate, the covenant cases' 12 fixture redraws were
+    a 1.1% failure rate per test; the RSWP cases' 12 were 1.07% and 1.13% (measured over
+    30 000 offline trials each), i.e. **2.2% per run of this file** — which is what CI
+    caught on ``build_advert_tx``, in the very PR that fixed the same shape in three
+    other files. Flakiness at that level gets a lane switched off.
     """
     rate = _node_rate(node)
     policy = DeadlineFeePolicy(relay_fee_per_kb=rate * 1000)
-    for _ in range(_COVENANT_DRAWS):
-        maker = PrivateKey()
-        reserved = _covenant(node, maker)
-        found = _settle_boundary_pair(builder, reserved, maker, policy)
+    for _ in range(_FIXTURE_DRAWS):
+        build = draw_fixture()
+        found = _settle_boundary_pair(build, policy)
         if found is None:
             continue
         at_floor, under, floor, pkh = found
 
         # The builder itself refuses the under-floor fee...
         with pytest.raises(InsufficientFundsError, match="below the required"):
-            builder(reserved, maker, pkh, floor - 1, policy)
+            build(pkh, floor - 1, policy)
         # ...and so does the node, for the same reason.
         res = node.accepts(under.serialize().hex())
         assert res.get("allowed") is False, f"{label}: node ACCEPTED one photon under its floor: {res}"
@@ -517,8 +533,19 @@ def _covenant_boundary(node: _RegtestNode, builder, label: str) -> None:
         return
     raise AssertionError(
         f"{label}: no build landed exactly on its own relay floor in "
-        f"{_COVENANT_DRAWS} covenants x {_PKH_REDRAWS} refund-PKH redraws"
+        f"{_FIXTURE_DRAWS} fixtures x {_PKH_REDRAWS} size-neutral PKH redraws"
     )
+
+
+def _covenant_boundary(node: _RegtestNode, builder, label: str) -> None:
+    """:func:`_boundary_is_the_nodes_floor` over a covenant reservation confirmed on chain."""
+
+    def draw():
+        maker = PrivateKey()
+        reserved = _covenant(node, maker)
+        return lambda pkh, fee, policy: builder(reserved, maker, pkh, fee, policy)
+
+    _boundary_is_the_nodes_floor(node, draw, label)
 
 
 def test_covenant_cancel_boundary_is_the_nodes_own_floor(node):
@@ -758,54 +785,28 @@ def test_the_old_transfer_nft_bar_produced_bytes_the_node_refuses(node, monkeypa
 
 
 def _rswp_boundary(node: _RegtestNode, build, label: str) -> None:
-    """At the node's floor: accepted. One photon under: refused, reason quoted.
+    """:func:`_boundary_is_the_nodes_floor` over a funded plain-RXD UTXO.
 
-    The funding UTXO is drawn fresh each attempt, so each build signs a different message
-    and the DER length (69-71 B) moves the size the floor comes from. Same
-    settle-then-compare shape as ``_covenant_boundary`` above, and for the same reason.
+    The redraw is ``change_pkh`` (and, for ``prepare_offered_utxo``, ``owner_pkh``): a
+    P2PKH output script is 25 bytes at every PKH, so it cannot move the size, but it is
+    in the sighash and so redraws the DER length. That is the free knob these two
+    builders have and the covenant ones have as their refund PKH.
+
+    It used to draw a fresh FUNDING UTXO per attempt instead — a broadcast and a block
+    each, 12 of them — which bought the same redraw at a chain operation's price and
+    still gave up 1.07% (``build_advert_tx``) and 1.13% (``prepare_offered_utxo``) of
+    the time.
     """
-    rate = _node_rate(node)
-    policy = DeadlineFeePolicy(relay_fee_per_kb=rate * 1000)
-    for _ in range(12):
+
+    def draw():
         maker = PrivateKey()
-        pkh = maker.public_key().hash160()
         spk = bytes(P2PKH().lock(maker.public_key().address()).serialize())
         value = 900_000_000
         txid = _pay_to_spk(node, spk, value)
         funding = [FundingInput(_src(txid, 0, spk, value), 0, maker)]
+        return lambda pkh, fee, policy: build(funding, pkh, fee, policy)
 
-        floor = policy.min_relay_fee(len(build(funding, pkh, 20_000_000, _PERMISSIVE).serialize()))
-        at_floor = None
-        for _ in range(4):
-            try:
-                candidate = build(funding, pkh, floor, policy)
-            except InsufficientFundsError:
-                break
-            settled = policy.min_relay_fee(len(candidate.serialize()))
-            if settled == floor:
-                at_floor = candidate
-                break
-            floor = settled
-        if at_floor is None:
-            continue
-        under = build(funding, pkh, floor - 1, _PERMISSIVE)
-        if policy.min_relay_fee(len(under.serialize())) != floor:
-            continue
-
-        # The builder refuses it...
-        with pytest.raises(InsufficientFundsError, match="below the required"):
-            build(funding, pkh, floor - 1, policy)
-        # ...and so does the node, for the same reason.
-        res = node.accepts(under.serialize().hex())
-        assert res.get("allowed") is False, f"{label}: node ACCEPTED one photon under its floor: {res}"
-        assert "min relay fee not met" in _reason(res), f"{label}: rejected, but not for the fee: {res}"
-        print(f"\n{label} one-photon-under: size={len(under.serialize())}B fee={floor - 1} -> {_reason(res)}")
-
-        ok = node.accepts(at_floor.serialize().hex())
-        assert ok.get("allowed") is True, f"{label}: node REJECTED a tx at exactly its floor: {ok}"
-        print(f"{label} at-floor:          size={len(at_floor.serialize())}B fee={floor} -> accepted")
-        return
-    raise AssertionError(f"{label}: no build landed exactly on its own relay floor in 12 draws")
+    _boundary_is_the_nodes_floor(node, draw, label)
 
 
 def test_prepare_offered_utxo_boundary_is_the_nodes_own_floor(node):
