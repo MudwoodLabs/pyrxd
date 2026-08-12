@@ -46,9 +46,9 @@ from pyrxd.glyph.timelock import (
 )
 from pyrxd.glyph.types import GlyphProtocol
 from pyrxd.hd.bip32 import Xprv, master_xprv_from_seed
-from pyrxd.hd.bip39 import mnemonic_from_entropy, seed_from_mnemonic
+from pyrxd.hd.bip39 import mnemonic_from_entropy, seed_from_mnemonic, validate_mnemonic
 from pyrxd.keys import PrivateKey
-from pyrxd.security.errors import Base58Error, RxdSdkError
+from pyrxd.security.errors import Base58Error, KeyMaterialError, RxdSdkError, ValidationError, redact
 from pyrxd.utils import decode_address, decode_wif, from_base58
 
 #: Shortest run of the secret we treat as a leak. A WIF is 51-52 chars and an
@@ -338,3 +338,85 @@ def test_an_exception_carrying_the_result_does_not_echo_the_key() -> None:
     exc = RuntimeError("timelock mint failed", result)
     leak = _describe_echo(_every_rendering(exc), cek)
     assert leak is None, leak
+
+
+# ── the redaction heuristic's case assumption ────────────────────────────────
+#
+# ``redact`` is the SDK's declared defence: ``RxdSdkError.__init__`` runs every
+# positional arg through it, so it is what stands between an embedder's
+# ``raise ValidationError(mnemonic)`` and a seed phrase in a stack trace.
+#
+# Its BIP-39 branch used to require ``t.isascii()``, which exempted every
+# non-Latin wordlist the SDK ships. That was fixed. The SAME predicate carried a
+# second, independent assumption that was not: that a mnemonic is written in
+# lowercase. It is not. Steel backup plates (Cryptosteel, Billfodl, and every
+# stamped-tile product) are UPPERCASE-only, and a mobile keyboard or a
+# spreadsheet autocapitalises the first word. Those are not exotic inputs — they
+# are what an operator has in hand at exactly the moment they are typing a seed
+# phrase into something that then errors.
+#
+# The recovery is trivial and total: BIP-39 wordlists are lowercase, so
+# lowercasing a disclosed uppercase phrase yields the original mnemonic
+# verbatim. There is no partial-disclosure argument to make here.
+
+
+def _generated_mnemonic(words: int = 12) -> str:
+    """A real, checksum-valid mnemonic from fresh entropy. Never printed."""
+    return mnemonic_from_entropy(os.urandom(16 if words == 12 else 32))
+
+
+@pytest.mark.parametrize(
+    ("label", "transform"),
+    [
+        ("as-generated lowercase", lambda m: m),
+        ("uppercase (steel backup plate)", str.upper),
+        ("title case (autocapitalised)", lambda m: " ".join(w.capitalize() for w in m.split())),
+        ("first word capitalised", lambda m: m[0].upper() + m[1:]),
+        ("mixed case", lambda m: " ".join(w.upper() if i % 2 else w for i, w in enumerate(m.split()))),
+    ],
+)
+@pytest.mark.parametrize("word_count", [12, 24])
+def test_a_mnemonic_is_redacted_whatever_its_case(label: str, transform, word_count: int) -> None:
+    """Case is a transcription convention, not a signal about secrecy."""
+    written = transform(_generated_mnemonic(word_count))
+    # Collapse to a bool BEFORE asserting: a bare ``assert redact(x) == "..."``
+    # makes pytest print both operands, i.e. the phrase, on failure.
+    was_redacted = redact(written) == "<redacted>"
+    assert was_redacted, f"redact() passed a {word_count}-word mnemonic through verbatim ({label})"
+
+
+@pytest.mark.parametrize("transform", [str.upper, lambda m: " ".join(w.capitalize() for w in m.split())])
+def test_a_non_lowercase_mnemonic_does_not_reach_exception_args(transform) -> None:
+    """The sink that matters: ``RxdSdkError`` redacts every positional arg."""
+    written = transform(_generated_mnemonic())
+    _assert_no_leak(KeyMaterialError(written), written)
+    _assert_no_leak(ValidationError(f"{written}"), written)
+
+
+def test_the_disclosed_form_would_have_restored_the_wallet() -> None:
+    """Why the above is a total disclosure and not a partial one.
+
+    Asserts on the *recovery*, not on the redaction: if an uppercase phrase ever
+    escapes, lowercasing it is the whole attack. Uses a locally-built uppercase
+    string so the test states the threat without depending on the guard it guards.
+    """
+    mnemonic = _generated_mnemonic()
+    recovered = " ".join(w.lower() for w in mnemonic.upper().split())
+    validate_mnemonic(recovered)  # raises if it is not a valid BIP-39 phrase
+    round_trips = recovered == mnemonic
+    assert round_trips, "lowercasing an uppercase phrase did not reproduce the original"
+
+
+def test_redaction_did_not_widen_into_ordinary_prose() -> None:
+    """The counterweight. ``redact`` runs on EVERY SDK exception arg, so a
+    heuristic that swallows ordinary sentences replaces actionable errors with
+    ``<redacted>``. These are real messages raised in this tree."""
+    for message in (
+        "Wallet file too short to contain header",
+        "tx has 0 confirmations, required 6",
+        "invalid mnemonic, checksum mismatch",
+        "Could not connect to the remote peer at this time",
+        "Wallet file decrypted but contains invalid JSON — disk corruption?",
+        "descriptor key must be an extended PUBLIC key",
+    ):
+        assert redact(message) == message, "redact() swallowed an ordinary error message"

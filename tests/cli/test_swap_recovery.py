@@ -360,7 +360,11 @@ def _keys_file(tmp_path: Path, **extra) -> Path:
     }
     doc.update(extra)
     p = tmp_path / "keys.json"
+    # 0600, as scripts/_dust_swap_shared.atomic_write_mode_600 writes it. A recovery
+    # file holding both counterparties' WIFs at umask mode is refused by
+    # load_recovery_json — asserted directly below, not modelled by accident here.
     p.write_text(json.dumps(doc))
+    p.chmod(0o600)
     return p
 
 
@@ -438,6 +442,7 @@ def test_covenant_pkhs_accept_explicit_overrides(tmp_path: Path) -> None:
 def test_covenant_pkhs_explain_themselves_when_a_two_host_file_lacks_the_peer_key(tmp_path: Path) -> None:
     p = tmp_path / "local.json"
     p.write_text(json.dumps({"hashlock_H": H.hex(), "maker_rxd_wif": PrivateKey().wif()}))
+    p.chmod(0o600)
     with pytest.raises(ValidationError, match="--taker-pkh"):
         sr.covenant_pkhs(p)
 
@@ -1345,3 +1350,151 @@ def test_cold_refund_refuses_an_unconfirmed_covenant_even_with_allow_immature(sw
         sr.build_cold_refund(
             covenant=cov, chain=_chain(0), fee_wif=fee_key.wif(), fee_utxo=_utxo(4_000_000), allow_immature=True
         )
+
+
+# ── the recovery file's own permissions ──────────────────────────────────────
+#
+# ``--fee-wif-file`` holds ONE key, for fees, and has always gone through
+# ``read_secret_file``: symlink refused, fstat on the read fd, owner-only mode,
+# ownership, size bound. The recovery file holds ``taker_rxd_wif`` AND
+# ``maker_rxd_wif`` — both counterparties' spending authority — and was read with a
+# bare ``json.loads(path.read_text())``. The care in this module went entirely into
+# never letting a WIF into an error message; nothing looked at the file those keys
+# sit in at rest.
+#
+# The writer (``scripts/_dust_swap_shared.atomic_write_mode_600``) gets this right:
+# O_EXCL at 0600. The gate is for every way a correct file stops being one — cp,
+# rsync -p from a looser source, an unzip, a restore from backup, an editor that
+# writes-new-then-renames at umask.
+
+
+def _public_only_doc() -> dict:
+    """A recovery file with no spending authority in it — the two-host shape."""
+    return {
+        "hashlock_H": H.hex(),
+        "rxd_covenant_spk": "76a914" + "11" * 20 + "88ac",
+        "t_rxd_blocks": 20,
+        "rxd_network": "bc",
+        "taker_rxd_pkh": "ab" * 20,
+        "maker_rxd_pkh": "cd" * 20,
+    }
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o666, 0o660])
+def test_a_group_or_world_readable_file_holding_a_wif_is_refused(tmp_path: Path, mode: int) -> None:
+    """The whole point. Any bit outside owner is a refusal when keys are present."""
+    p = _keys_file(tmp_path)
+    p.chmod(mode)
+    with pytest.raises(ValidationError, match="chmod 600"):
+        sr.load_recovery_json(p)
+
+
+def test_the_refusal_names_the_remedy_not_the_key(tmp_path: Path) -> None:
+    """A permissions error is useless if it does not say what to run, and dangerous
+    if it quotes the document it is complaining about."""
+    p = _keys_file(tmp_path)
+    p.chmod(0o644)
+    with pytest.raises(ValidationError) as exc:
+        sr.load_recovery_json(p)
+    message = str(exc.value)
+    assert "chmod 600" in message
+    assert "0o644" in message
+    doc = json.loads(p.read_text())
+    for key in ("taker_rxd_wif", "maker_rxd_wif"):
+        leaked = doc[key][:8] in message
+        assert not leaked, f"the mode-refusal message quoted {key}"
+
+
+def test_a_public_only_file_is_not_refused_for_its_mode(tmp_path: Path) -> None:
+    """No false alarms. The two-host harnesses persist only public locators, which is
+    why --taker-pkh/--maker-pkh exist; demanding 0600 of a public document would
+    reject the exact workflow those flags were added for."""
+    p = tmp_path / "public.json"
+    p.write_text(json.dumps(_public_only_doc()))
+    p.chmod(0o644)
+    assert sr.load_recovery_json(p)["t_rxd_blocks"] == 20
+
+
+def test_an_empty_key_field_does_not_trip_the_gate(tmp_path: Path) -> None:
+    """A writer that emits an empty ``taker_rxd_wif`` for the peer's absent key has not
+    put a key in the file, and must not be told to chmod because of a marker name."""
+    doc = _public_only_doc() | {"taker_rxd_wif": "", "maker_rxd_wif": None}
+    p = tmp_path / "empty_keys.json"
+    p.write_text(json.dumps(doc))
+    p.chmod(0o644)
+    assert sr.load_recovery_json(p)["t_rxd_blocks"] == 20
+
+
+def test_a_correctly_permissioned_key_file_still_loads(tmp_path: Path) -> None:
+    """The gate must not break the path the real writer produces."""
+    p = _keys_file(tmp_path)
+    assert sr.load_recovery_json(p)["rxd_network"] == "bc"
+
+
+def test_a_symlinked_recovery_file_is_refused(tmp_path: Path) -> None:
+    """O_NOFOLLOW. A symlink is the substitution primitive: the mode you check is the
+    link target's, and the target can change between one open and the next."""
+    real = _keys_file(tmp_path)
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    with pytest.raises(ValidationError):
+        sr.load_recovery_json(link)
+
+
+def test_a_recovery_file_that_is_not_a_regular_file_is_refused(tmp_path: Path) -> None:
+    """A FIFO at the recovery path would otherwise block the read forever."""
+    fifo = tmp_path / "fifo.json"
+    os.mkfifo(fifo)
+    fifo.chmod(0o600)
+    with pytest.raises(ValidationError):
+        sr.load_recovery_json(fifo)
+
+
+def test_an_oversized_recovery_file_is_refused(tmp_path: Path) -> None:
+    """Bounded read: a wrong path (a disk image, a log) must not be slurped."""
+    from pyrxd.gravity.watch.cli_secrets import MAX_SECRET_FILE_BYTES
+
+    p = tmp_path / "huge.json"
+    p.write_text("[" + "0," * MAX_SECRET_FILE_BYTES + "0]")
+    p.chmod(0o600)
+    with pytest.raises(ValidationError, match="larger than"):
+        sr.load_recovery_json(p)
+
+
+def test_malformed_json_does_not_echo_the_offending_line(tmp_path: Path) -> None:
+    """``JSONDecodeError`` renders the line it failed on. In this file that line may
+    be the one holding a WIF, so the parse error is re-raised ``from None`` with only
+    a line NUMBER."""
+    wif = PrivateKey().wif()
+    p = tmp_path / "broken.json"
+    p.write_text('{"taker_rxd_wif": "' + wif + '" ')
+    p.chmod(0o600)
+    with pytest.raises(ValidationError) as exc:
+        sr.load_recovery_json(p)
+    node: BaseException | None = exc.value
+    while node is not None:
+        for text in (str(node), repr(node), repr(node.args)):
+            for i in range(len(wif) - 8 + 1):
+                assert wif[i : i + 8] not in text, f"the JSON parse error leaked the WIF at offset {i}"
+        node = node.__cause__ or node.__context__
+
+
+@pytest.mark.parametrize("entry", ["parse_recovery_extras", "covenant_pkhs"])
+def test_every_public_reader_goes_through_the_gate(tmp_path: Path, entry: str) -> None:
+    """Both public entry points, not just the one that happened to get fixed."""
+    p = _keys_file(tmp_path)
+    p.chmod(0o644)
+    with pytest.raises(ValidationError, match="chmod 600"):
+        getattr(sr, entry)(p)
+
+
+def test_the_swap_status_reader_goes_through_the_gate_too(tmp_path: Path) -> None:
+    """``swap_cmds.parse_recovery_file`` reports ``has_keys`` to the operator. Telling
+    someone their file contains private keys while reading it out of a 0644 file
+    without comment was the wrong half of the job."""
+    from pyrxd.cli.swap_cmds import parse_recovery_file
+
+    p = _keys_file(tmp_path)
+    p.chmod(0o644)
+    with pytest.raises(ValidationError, match="chmod 600"):
+        parse_recovery_file(p)

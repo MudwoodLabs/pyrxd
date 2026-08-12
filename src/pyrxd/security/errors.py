@@ -52,28 +52,95 @@ _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 _BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]+$")
 
 
+#: Every word of every BIP-39 wordlist the SDK ships, casefolded. Populated on
+#: first use by :func:`_bip39_vocabulary`; ``None`` until then.
+_BIP39_VOCABULARY: frozenset[str] | None = None
+
+
+def _bip39_vocabulary() -> frozenset[str]:
+    """Return the shipped BIP-39 words, casefolded, or an empty set if unavailable.
+
+    Imported lazily and function-locally, for the same reason
+    :func:`pyrxd.security.secrets._base58check_decode` does it: ``pyrxd.hd.bip39``
+    imports THIS module, so a module-scope import would be a cycle.
+
+    Two properties this must hold, because it runs inside exception construction:
+
+    * **It never raises.** ``redact`` is called from ``RxdSdkError.__init__``; an
+      exception raised while building an exception replaces a real error with an
+      unrelated one. Any failure degrades to the generic heuristic below.
+    * **Failure is not cached.** Only a non-empty result is memoised. Caching an
+      empty set from a transient failure — most plausibly a partially-initialised
+      ``pyrxd.hd.bip39`` during a circular import — would silently disable this
+      branch for the life of the process.
+    """
+    global _BIP39_VOCABULARY
+    if _BIP39_VOCABULARY is not None:
+        return _BIP39_VOCABULARY
+    try:
+        from ..hd.bip39 import WordList
+
+        WordList.load()
+        vocabulary = frozenset(word.casefold() for words in WordList.wordlist.values() for word in words)
+    except Exception:  # nosec B110 — see "never raises" above
+        return frozenset()
+    if vocabulary:
+        _BIP39_VOCABULARY = vocabulary
+    return vocabulary
+
+
+def _looks_like_mnemonic(value: str) -> bool:
+    """Return True if ``value`` looks like a BIP-39 seed phrase.
+
+    Two branches, because neither alone is sufficient:
+
+    1. **Shape** — >=8 space-separated alphabetic tokens carrying no uppercase.
+       This is the BIP-39 lowercase convention, and it holds for wordlists this
+       SDK does not ship (fr/es/it/ja/ko/cs/pt) as well as the two it does.
+       It used to additionally require ``t.isascii()``, which silently exempted
+       every non-Latin wordlist — ``hd/wordlist/chinese_simplified.txt`` is a
+       first-class ``lang=`` option, and a Chinese mnemonic passed through
+       completely unredacted. ``str.islower()`` is False for CJK (no case at all),
+       so the test is "contains no uppercase" rather than "is lowercase".
+
+    2. **Vocabulary, case-insensitively** — all tokens are real BIP-39 words.
+       Branch 1 assumed a mnemonic is *written* in the case the spec stores it in.
+       Operators do not: every stamped-tile steel backup product (Cryptosteel,
+       Billfodl, …) is UPPERCASE-only, and phone keyboards and spreadsheets
+       autocapitalise the first word. Those phrases sailed through branch 1 and
+       were interpolated verbatim. The disclosure is total, not partial —
+       wordlists are lowercase, so lowercasing a leaked phrase reproduces the
+       mnemonic exactly.
+
+    Branch 2 is a vocabulary test rather than a second shape test on purpose.
+    Simply dropping branch 1's case condition would redact ordinary prose:
+    ``"Could not connect to the remote peer at this time"`` is eight alphabetic
+    tokens, and ``redact`` runs over the args of EVERY exception this SDK raises.
+    Requiring every token to be an actual BIP-39 word cannot match a sentence.
+    """
+    tokens = value.split()
+    if len(tokens) < 8 or not all(t.isalpha() for t in tokens):
+        return False
+    if all(not t.isupper() and t == t.lower() for t in tokens):
+        return True
+    vocabulary = _bip39_vocabulary()
+    return bool(vocabulary) and all(t.casefold() in vocabulary for t in tokens)
+
+
 def _looks_like_key_material(value: str) -> bool:
     """Return True if ``value`` looks like it could be key material.
 
     Checks for:
       * all hex characters (private keys, hashes, ciphertext)
       * all base58 characters (WIF, addresses, mnemonic seeds in base58)
-      * bip39-style un-cased word lists joined by spaces (>=8 tokens), in ANY script
+      * a BIP-39 seed phrase, in any script and any case (see
+        :func:`_looks_like_mnemonic`)
     """
     if _HEX_RE.match(value):
         return True
     if _BASE58_RE.match(value):
         return True
-    # BIP-39 mnemonic heuristic: >=8 space-separated alphabetic tokens with no uppercase.
-    #
-    # This used to require ``t.isascii()``, which silently exempted every non-Latin
-    # wordlist the SDK ships and supports — ``hd/wordlist/chinese_simplified.txt`` is a
-    # first-class ``lang=`` option, and a Chinese mnemonic passed through this function
-    # completely unredacted. ``str.islower()`` is also False for CJK (which has no case),
-    # so the case test is expressed as "contains no uppercase" instead: that keeps the
-    # BIP-39 lowercase convention for Latin wordlists while admitting caseless scripts.
-    tokens = value.split()
-    return bool(len(tokens) >= 8 and all(t.isalpha() and not t.isupper() and t == t.lower() for t in tokens))
+    return _looks_like_mnemonic(value)
 
 
 def redact(value: Any) -> Any:

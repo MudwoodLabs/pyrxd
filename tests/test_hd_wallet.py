@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import os
 import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -12,6 +13,8 @@ import pytest
 
 import pyrxd.constants
 import pyrxd.hd.wallet
+from pyrxd.hd import wallet as hd_wallet_module
+from pyrxd.hd.bip39 import mnemonic_from_entropy
 from pyrxd.hd.wallet import _GAP_LIMIT, AddressRecord, HdWallet
 from pyrxd.network.electrumx import ElectrumXClient, UtxoRecord
 from pyrxd.security.errors import ValidationError
@@ -2053,3 +2056,103 @@ class TestAFailedReadIsNotAnAnswer:
 
         client.broadcast = _broadcast
         assert asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000)) == "ab" * 32
+
+
+# ── the seed file's permission check must bind to the bytes read ─────────────
+#
+# ``_load_existing`` refuses a group/world-readable wallet file. The check was
+# ``path.stat()``; the read was ``path.read_bytes()`` eleven lines later — and the
+# two were separated by ``seed_from_mnemonic``, i.e. 2048 rounds of PBKDF2-HMAC-SHA512
+# chosen to be slow. That is a check-then-use pair on a path, with the widest possible
+# window wedged into the middle of it. The verdict described a file that was never
+# read.
+#
+# The test below does not race anything. It replaces the file at the exact point the
+# original code left open, which is what a race would achieve, deterministically.
+
+
+def _swap_in(target: Path, replacement: Path):
+    """Return a ``seed_from_mnemonic`` stand-in that swaps the wallet file mid-load.
+
+    Hooks the one call the original implementation made BETWEEN its ``stat`` and its
+    ``read`` — occupying the window rather than simulating it.
+    """
+    real = hd_wallet_module.seed_from_mnemonic
+
+    def _hooked(*args, **kwargs):
+        os.replace(replacement, target)
+        return real(*args, **kwargs)
+
+    return _hooked
+
+
+def test_the_wallet_loaded_is_the_wallet_whose_mode_was_approved(tmp_path, monkeypatch) -> None:
+    """The invariant, stated as an identity: approve one file, decrypt that same file.
+
+    Two valid wallets from the SAME mnemonic (so decryption can never be what
+    distinguishes them) at DIFFERENT accounts, so the loaded object says which file it
+    came from. The 0600 one is at account 0; the 0644 one at account 7.
+
+    Under the old ``stat``-then-``read`` pair the gate approved the 0600 file, the
+    swap landed during the PBKDF2, and the loader decrypted the 0644 one — the wallet
+    came back at account 7, having passed a permission check performed on a different
+    inode. Reading and stat-ing one descriptor makes the swap arrive too late to
+    matter: it lands after the bytes are already in hand.
+    """
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    path = tmp_path / "wallet.dat"
+    HdWallet.from_mnemonic(mnemonic, account=0).save(path)
+    assert path.stat().st_mode & 0o777 == 0o600
+
+    world_readable = tmp_path / "swapped.dat"
+    HdWallet.from_mnemonic(mnemonic, account=7).save(world_readable)
+    world_readable.chmod(0o644)
+
+    monkeypatch.setattr(hd_wallet_module, "seed_from_mnemonic", _swap_in(path, world_readable))
+    loaded = HdWallet.load(path, mnemonic)
+    assert loaded.account == 0, "the mode gate approved one file and the loader decrypted another"
+
+
+def test_a_symlinked_wallet_is_judged_by_its_targets_mode(tmp_path) -> None:
+    """Symlinks stay supported (a wallet on an encrypted mount is a real setup), but
+    the gate reports on the target — the file whose permissions actually matter."""
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    real = tmp_path / "real.dat"
+    HdWallet.from_mnemonic(mnemonic).save(real)
+    link = tmp_path / "link.dat"
+    link.symlink_to(real)
+
+    assert HdWallet.load(link, mnemonic).coin_type == HdWallet.from_mnemonic(mnemonic).coin_type
+
+    real.chmod(0o644)
+    with pytest.raises(ValidationError, match="0o644"):
+        HdWallet.load(link, mnemonic)
+
+
+def test_a_wallet_path_that_is_not_a_regular_file_is_refused(tmp_path) -> None:
+    """A FIFO at the wallet path would block the read forever."""
+    fifo = tmp_path / "wallet.dat"
+    os.mkfifo(fifo)
+    fifo.chmod(0o600)
+    with pytest.raises(ValidationError, match="not a regular file"):
+        HdWallet.load(fifo, mnemonic_from_entropy(os.urandom(16)))
+
+
+@pytest.mark.parametrize("mode", [0o644, 0o640, 0o604, 0o666, 0o660])
+def test_every_non_owner_bit_is_still_refused(tmp_path, mode: int) -> None:
+    """The original check's substance, retained: any bit outside owner is a refusal."""
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    path = tmp_path / "wallet.dat"
+    HdWallet.from_mnemonic(mnemonic).save(path)
+    path.chmod(mode)
+    with pytest.raises(ValidationError, match=oct(mode)):
+        HdWallet.load(path, mnemonic)
+
+
+def test_a_correctly_permissioned_wallet_still_loads(tmp_path) -> None:
+    """The gate must not break the path ``save()`` produces."""
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    path = tmp_path / "wallet.dat"
+    saved = HdWallet.from_mnemonic(mnemonic)
+    saved.save(path)
+    assert HdWallet.load(path, mnemonic).account_xpub().serialize() == saved.account_xpub().serialize()

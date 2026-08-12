@@ -6,6 +6,7 @@
 #   scripts/mutation_test.sh script         # script/ primitives
 #   scripts/mutation_test.sh transaction    # transaction/ incl. FORKID sighash preimage
 #   scripts/mutation_test.sh dmint          # glyph/dmint/ covenant builders + DAA + parser
+#   scripts/mutation_test.sh keys           # key-material + operator-input guards
 #   scripts/mutation_test.sh all            # every group, sequentially
 #
 # Scope by group (why these files — the verification/byte-exact arithmetic):
@@ -20,6 +21,17 @@
 #   dmint        builders.py (covenant script bytes), chain.py (state re-derivation parse),
 #                types.py (params validation/CBOR), miner.py (DAA target arithmetic + mint
 #                tx/preimage construction).
+#   keys         the guards standing between key material / operator input and a sink:
+#                security/errors.py (the `redact` heuristic every SDK exception arg passes
+#                through), security/secrets.py (SecretBytes/PrivateKeyMaterial repr, pickle
+#                and WIF decode), base58.py (the single choke point every WIF/xprv/address
+#                is parsed by, which cannot tell them apart and so treats all as secret),
+#                hd/bip32.py (Xkey/Xprv __str__ redaction), hd/descriptor.py (the
+#                xprv-in-a-descriptor refusal), gravity/watch/cli_secrets.py (the 0600 +
+#                owner + no-symlink + bounded-read credential-file gate).
+#                These are pure predicates with cheap tests — exactly the shape where 100%
+#                line coverage is least informative about whether anything would notice a
+#                guard being removed.
 #
 # Mechanism: cosmic-ray mutates src/pyrxd/<path>.py IN PLACE (the editable install picks it up),
 # runs the module-targeted tests, then we restore the file via git. A trap restores the whole
@@ -47,6 +59,7 @@ group_files() {
     script)      echo "script/script script/timelock script/type" ;;
     transaction) echo "transaction/transaction transaction/transaction_input transaction/transaction_output transaction/transaction_preimage" ;;
     dmint)       echo "glyph/dmint/builders glyph/dmint/chain glyph/dmint/types glyph/dmint/miner" ;;
+    keys)        echo "security/errors security/secrets base58 hd/bip32 hd/descriptor gravity/watch/cli_secrets" ;;
     *)           return 1 ;;
   esac
 }
@@ -60,6 +73,7 @@ group_tests() {
     spv)         echo "tests/test_spv.py tests/test_merkle_path.py tests/test_spv_validation_hardening.py" ;;
     script)      echo "tests/test_mutation_hardening.py tests/test_script.py tests/test_timelock.py tests/test_covenant.py tests/test_glyph_timelock.py tests/test_transaction.py tests/test_preimage.py tests/test_htlc_spend.py $GAPS" ;;
     transaction) echo "tests/test_mutation_hardening.py tests/test_transaction.py tests/test_preimage.py tests/test_htlc_spend.py tests/test_glyph_transfer.py tests/test_ft_transfer.py tests/test_swap_partial.py tests/test_swap_resolve.py $GAPS tests/test_fuzz_parsers.py tests/test_preimage_differential.py" ;;
+    keys)        echo "tests/security/ tests/test_keys.py tests/test_base58.py tests/test_hd_wallet.py tests/test_hd_descriptor.py tests/cli/test_swap_recovery.py tests/cli/test_swap_cmds.py tests/test_watch_secret_and_ack_hardening.py" ;;
     dmint)       echo "tests/test_mutation_hardening.py tests/test_dmint_module.py tests/test_glyph_dmint.py tests/test_dmint_v2_canonical.py tests/test_dmint_v2_daa_canonical.py tests/test_dmint_conformance_vectors.py tests/test_dmint_v2_mainnet_golden.py tests/test_dmint_daa_offchain_onchain_differential.py tests/test_dmint_v1_deploy.py tests/test_dmint_v1_mint.py tests/test_dmint_end_to_end.py tests/test_dmint_deploy_integration.py $GAPS tests/test_dmint_vector_derivations.py" ;;
   esac
 }
@@ -84,6 +98,7 @@ WORK="${MUTATION_SESSION_DIR:-$(mktemp -d)}"
 mkdir -p "$WORK"
 cleanup() {
   git checkout -- src/pyrxd/spv/ src/pyrxd/script/ src/pyrxd/transaction/ src/pyrxd/glyph/dmint/ 2>/dev/null
+  git checkout -- src/pyrxd/security/ src/pyrxd/base58.py src/pyrxd/hd/ src/pyrxd/gravity/watch/cli_secrets.py 2>/dev/null
   [ -z "${MUTATION_SESSION_DIR:-}" ] && rm -rf "$WORK"
 }
 trap cleanup EXIT
