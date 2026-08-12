@@ -137,6 +137,36 @@ def _parse_p2pkh_scriptsig(unlocking: bytes) -> tuple[bytes, bytes]:
     return pushes[0], pushes[1]
 
 
+def require_offer_sighash(sig_with_flag: bytes, *, where: str) -> int:
+    """The single place the offer sighash pin is spelled. Returns the validated flag.
+
+    A maker's offer input must be signed EXACTLY ``SINGLE|ANYONECANPAY|FORKID`` (0xC3).
+    The flag byte rides in the untrusted scriptSig, and ``NONE|ANYONECANPAY|FORKID``
+    (0xC2) is the one value that verifies both **before** and **after** the taker
+    completes the transaction while committing to no outputs at all — so the offer's
+    receive terms would not be bound by the signature that "verifies" them. A transport
+    attacker who cannot re-sign could then inflate output[0] and the advertised terms
+    together and the taker would overpay.
+
+    This rule used to be spelled three times — here, in ``rswp/orders.py`` and in
+    ``rswp/covenant.py`` — and the test that named 0xC2 exercised only the
+    ``orders.py`` copy, so the pin on the direct ``accept_offer`` path could be deleted
+    with the whole suite green (its raise branch executed zero times across 8472 tests).
+    That is this repo's signature defect class: one rule, several spellings, the test
+    attached to the copy that is not load-bearing. Every caller now routes through this
+    function, so one test covers every path and deleting the rule cannot be silent.
+    """
+    if len(sig_with_flag) < 2:
+        raise ValidationError(f"{where}: malformed signature push carries no sighash flag byte")
+    flag = sig_with_flag[-1]
+    if flag != _OFFER_SIGHASH:
+        raise ValidationError(
+            f"{where} is signed with sighash 0x{flag:02x}; only "
+            f"SINGLE|ANYONECANPAY|FORKID (0x{int(_OFFER_SIGHASH):02x}) binds the offer terms"
+        )
+    return flag
+
+
 def _verify_owner_signature(tx: Transaction, index: int) -> None:
     """Re-verify that input *index* carries a valid owner signature for the current tx.
 
@@ -150,19 +180,8 @@ def _verify_owner_signature(tx: Transaction, index: int) -> None:
     if inp.unlocking_script is None or inp.locking_script is None or inp.satoshis is None:
         raise ValidationError(f"input {index} is not ready for signature verification")
     sig_with_flag, pubkey = _parse_p2pkh_scriptsig(inp.unlocking_script.serialize())
-    if len(sig_with_flag) < 2:
-        raise ValidationError("malformed signature push")
-    der, flag = sig_with_flag[:-1], sig_with_flag[-1]  # signature + its trailing sighash-type byte
-    # The maker input of an offer must be signed EXACTLY SINGLE|ANYONECANPAY|FORKID.
-    # The flag byte comes from the untrusted scriptSig, and NONE|ANYONECANPAY|FORKID
-    # (0xC2) is the one flag that verifies both before AND after the taker completes
-    # the transaction while committing to NO outputs at all — i.e. the offer's
-    # receive terms would not be bound by the signature it "verifies" under.
-    if flag != _OFFER_SIGHASH:
-        raise ValidationError(
-            f"offer input {index} is signed with sighash 0x{flag:02x}; only "
-            f"SINGLE|ANYONECANPAY|FORKID (0x{int(_OFFER_SIGHASH):02x}) binds the offer terms"
-        )
+    flag = require_offer_sighash(sig_with_flag, where=f"offer input {index}")
+    der = sig_with_flag[:-1]  # signature, minus its trailing sighash-type byte
     # The sighash type is NOT carried in the tx wire format (it lives only in
     # the signature byte), so a parsed input always reports the default flag.
     # Restore the actual flag from the signature before computing the preimage,

@@ -294,9 +294,20 @@ def test_tampered_declared_give_terms_rejected() -> None:
         )
 
 
-def test_tampered_receive_output_breaks_maker_signature() -> None:
-    """Editing the maker's receive output (to extract more from the taker)
-    invalidates the maker's SINGLE signature → rejected."""
+def test_tampered_receive_output_is_caught_by_the_receive_terms_gate() -> None:
+    """Editing the maker's receive output (to extract more from the taker) is rejected.
+
+    Named for the gate that actually fires. This test used to be called
+    ``..._breaks_maker_signature`` and matched the alternation
+    ``"signature does not validate|receive terms do not match"``, which cannot
+    distinguish the two gates — and it was the wrong one: the receive-terms
+    reconciliation runs BEFORE ``_verify_owner_signature``, so editing output[0]
+    trips the terms gate first and the signature gate is never reached. The
+    alternation hid that, and it also let the terms gate be deleted with the suite
+    green. The signature gate is exercised on its own in the test below, and the
+    terms gate's non-redundant duty (a valid signature over terms that do not match
+    what was advertised) in ``test_advertised_receive_cheaper_than_signed_is_refused``.
+    """
     mk, mk_pkh = _key()
     tk, tk_pkh = _key()
     offer = create_offer(
@@ -314,7 +325,7 @@ def test_tampered_receive_output_breaks_maker_signature() -> None:
         give_vout=offer.give_vout,
         terms=offer.terms,
     )
-    with pytest.raises(ValidationError, match="signature does not validate|receive terms do not match"):
+    with pytest.raises(ValidationError, match="receive terms do not match"):
         accept_offer(
             tampered,
             funding=[FundingInput(_rxd_src(tk_pkh, 9000), 0, tk)],
@@ -323,6 +334,208 @@ def test_tampered_receive_output_breaks_maker_signature() -> None:
             fee=300,
             fee_policy=_TOY_FEE_POLICY,
         )
+
+
+def test_tampered_receive_output_also_breaks_the_maker_signature() -> None:
+    """The signature gate, isolated: keep the DECLARED terms in step with the edit so the
+    receive-terms gate passes, and the maker's SINGLE signature — which commits to
+    output[0] — is what refuses it. No alternation: this asserts the signature message
+    only, so it can only pass if `_verify_owner_signature` is genuinely reached and fires.
+    """
+    mk, mk_pkh = _key()
+    tk, tk_pkh = _key()
+    offer = create_offer(
+        give_source_tx=_ft_src(mk_pkh, _REF_G, 1000),
+        give_vout=0,
+        maker_key=mk,
+        receive=Asset("rxd", 800),
+        maker_receive_pkh=mk_pkh,
+    )
+    partial = Transaction.from_hex(bytes.fromhex(offer.partial_tx_hex))
+    partial.outputs[0].satoshis = 5000  # maker now appears to demand 5000
+    d = offer.to_dict()
+    d["terms"]["receive"]["amount"] = 5000  # ...and the advert is updated to agree
+    d["partial_tx_hex"] = partial.serialize().hex()
+    with pytest.raises(ValidationError, match="signature does not validate"):
+        accept_offer(
+            SwapOffer.from_dict(d),
+            funding=[FundingInput(_rxd_src(tk_pkh, 9000), 0, tk)],
+            taker_receive_pkh=tk_pkh,
+            taker_change_pkh=tk_pkh,
+            fee=300,
+            fee_policy=_TOY_FEE_POLICY,
+        )
+
+
+def test_advertised_receive_cheaper_than_signed_is_refused() -> None:
+    """FALS-02: the maker SIGNS an expensive demand and ADVERTISES a cheap one.
+
+    This is the case the receive-terms reconciliation exists for, and the only one that
+    detects its removal. The partial transaction is untouched, so the maker's signature
+    over the 9,000-photon output is perfectly valid — every signature check passes. The
+    sole thing binding the advertised price to the signed price is the comparison of
+    ``offer.terms.receive`` against the asset actually sitting in ``partial.outputs[0]``.
+    Delete it and the taker funds 9,000 photons believing the price is 600, overpaying by
+    8,400.
+
+    Reachable on the direct/hand-delivered ``pyrxd.swap.accept_offer`` path that
+    third-party integrators drive over their own transport, where a hostile maker's
+    signature over the expensive demand is genuine. (The CLI's book path derives both
+    sides from one object, so the comparison is tautological there — which is exactly why
+    no existing test covered this.)
+    """
+    mk, mk_pkh = _key()
+    tk, tk_pkh = _key()
+    offer = create_offer(
+        give_source_tx=_ft_src(mk_pkh, _REF_G, 1000),
+        give_vout=0,
+        maker_key=mk,
+        receive=Asset("rxd", 9000),  # what the maker actually SIGNED
+        maker_receive_pkh=mk_pkh,
+    )
+    d = offer.to_dict()
+    d["terms"]["receive"]["amount"] = 600  # what the maker ADVERTISES
+    cheap = SwapOffer.from_dict(d)
+
+    # The signature is untouched and valid — prove it, so a failure below cannot be
+    # mistaken for the signature gate firing.
+    from pyrxd.swap.rswp import verify_offer_signature
+
+    verify_offer_signature(offer)
+
+    with pytest.raises(ValidationError, match="receive terms do not match"):
+        accept_offer(
+            cheap,
+            funding=[FundingInput(_rxd_src(tk_pkh, 20_000), 0, tk)],
+            taker_receive_pkh=tk_pkh,
+            taker_change_pkh=tk_pkh,
+            fee=300,
+            fee_policy=_TOY_FEE_POLICY,
+        )
+
+
+def _offer_signed_with(*, src: Transaction, key, sighash, receive_pkh: bytes, receive_value: int, terms):
+    """Build an offer whose maker input is signed with an arbitrary key and sighash flag.
+
+    Bypasses ``create_offer`` (which hardcodes the correct key and 0xC3) so the taker-side
+    gates can be tested against an offer pyrxd itself would never emit — the case that
+    matters, since a hostile maker signs with their own tooling.
+    """
+    from pyrxd.transaction.transaction_input import TransactionInput
+
+    tx = Transaction()
+    tx.add_input(
+        TransactionInput(
+            source_transaction=src,
+            source_output_index=0,
+            unlocking_script_template=P2PKH().unlock(key),
+            sighash=sighash,
+        )
+    )
+    tx.add_output(TransactionOutput(P2PKH().lock(receive_pkh), receive_value))
+    tx.sign(bypass=True)
+    return SwapOffer(
+        partial_tx_hex=tx.serialize().hex(),
+        give_source_tx_hex=src.serialize().hex(),
+        give_vout=0,
+        terms=terms,
+    )
+
+
+def test_offer_signed_0xc2_is_refused_on_the_direct_accept_path() -> None:
+    """FALS-03: the offer sighash pin, exercised on the path where it is load-bearing.
+
+    ``NONE|ANYONECANPAY|FORKID`` (0xC2) is the one flag that verifies both before AND
+    after the taker completes the transaction while committing to no outputs at all — so
+    the "verified" signature binds nothing about the price. A flag matrix through
+    ``accept_offer`` with the pin disabled showed 0x41/0x42/0x43/0xC1 are still caught by
+    the post-completion re-verification; only 0xC2 gets through, letting a transport
+    attacker inflate output[0] and the advertised terms together while the taker overpays.
+
+    The rule used to be spelled in three places. The test that named 0xC2
+    (``tests/test_rswp_orders.py::test_sighash_flag_0xc2_rejected``) went through
+    ``rswp_order_to_swap_offer`` and so hit the ``rswp/orders.py`` copy; the copy in
+    ``swap/partial.py`` — the one guarding the direct ``accept_offer`` and
+    ``verify_offer_signature`` entry points — had its raise branch execute zero times
+    across the whole suite and could be deleted silently. All three now delegate to
+    ``swap.partial.require_offer_sighash``; this test covers the direct path.
+    """
+    from pyrxd.constants import SIGHASH
+    from pyrxd.swap.rswp import verify_offer_signature
+
+    mk, mk_pkh = _key()
+    tk, tk_pkh = _key()
+    src = _rxd_src(mk_pkh, 1000)
+    honest = create_offer(
+        give_source_tx=src, give_vout=0, maker_key=mk, receive=Asset("rxd", 600), maker_receive_pkh=mk_pkh
+    )
+    forged = _offer_signed_with(
+        src=src,
+        key=mk,
+        sighash=SIGHASH.NONE_ANYONECANPAY_FORKID,  # 0xC2
+        receive_pkh=mk_pkh,
+        receive_value=600,
+        terms=honest.terms,
+    )
+
+    with pytest.raises(ValidationError, match="sighash 0xc2"):
+        accept_offer(
+            forged,
+            funding=[FundingInput(_rxd_src(tk_pkh, 2000), 0, tk)],
+            taker_receive_pkh=tk_pkh,
+            taker_change_pkh=tk_pkh,
+            fee=300,
+            fee_policy=_TOY_FEE_POLICY,
+        )
+    # The read-only pre-check a browser uses must refuse it too — otherwise the order
+    # would be labelled fillable.
+    with pytest.raises(ValidationError, match="sighash 0xc2"):
+        verify_offer_signature(forged)
+
+
+def test_maker_pubkey_must_own_the_prevout() -> None:
+    """FALS-08: the maker's pubkey must hash to the prevout's owner PKH.
+
+    An impostor can produce a signature that VALIDATES — they sign the same preimage with
+    their own key — so the signature check alone cannot tell an owner from a stranger.
+    This binding is the only thing that does. With it disabled,
+    ``verify_offer_signature`` labels a forged offer fillable and ``accept_offer`` returns
+    a signed, broadcast-ready transaction for an offer whose maker input is signed by a
+    key that does not own the prevout. (Consensus would still reject it at
+    OP_EQUALVERIFY, so the harm is a wasted round trip and a forged row shown as
+    fillable — bounded, but nothing in the suite noticed the gate was gone.)
+    """
+    from pyrxd.constants import SIGHASH
+    from pyrxd.swap.rswp import verify_offer_signature
+
+    mk, mk_pkh = _key()
+    impostor, impostor_pkh = _key()  # a valid signature, from the wrong key
+    tk, tk_pkh = _key()
+    assert impostor_pkh != mk_pkh
+    src = _rxd_src(mk_pkh, 1000)  # prevout owned by mk
+    honest = create_offer(
+        give_source_tx=src, give_vout=0, maker_key=mk, receive=Asset("rxd", 600), maker_receive_pkh=mk_pkh
+    )
+    forged = _offer_signed_with(
+        src=src,
+        key=impostor,
+        sighash=SIGHASH.SINGLE_ANYONECANPAY_FORKID,  # correct flag; wrong signer
+        receive_pkh=mk_pkh,
+        receive_value=600,
+        terms=honest.terms,
+    )
+
+    with pytest.raises(ValidationError, match="pubkey does not match the prevout owner"):
+        accept_offer(
+            forged,
+            funding=[FundingInput(_rxd_src(tk_pkh, 2000), 0, tk)],
+            taker_receive_pkh=tk_pkh,
+            taker_change_pkh=tk_pkh,
+            fee=300,
+            fee_policy=_TOY_FEE_POLICY,
+        )
+    with pytest.raises(ValidationError, match="pubkey does not match the prevout owner"):
+        verify_offer_signature(forged)
 
 
 def test_injected_extra_output_rejected() -> None:

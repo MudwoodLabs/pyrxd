@@ -204,6 +204,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The offer sighash pin existed in three places and the test that named `0xC2` exercised
+  the copy that was not load-bearing.** `swap/partial.py`, `swap/rswp/orders.py` and
+  `swap/rswp/covenant.py` each spelled the rule; `test_sighash_flag_0xc2_rejected` goes
+  through `rswp_order_to_swap_offer`, so it hit the `orders.py` copy. The `partial.py`
+  copy — the one guarding the direct `accept_offer` and `verify_offer_signature` entry
+  points — had its raise branch execute **zero times** across the whole suite and could be
+  deleted with everything green.
+
+  All three now delegate to one implementation, `swap.partial.require_offer_sighash`, so
+  the rule cannot be removed from one path while a test on another keeps reporting green.
+  Fixing only the test would have left the same trap for the next reader; this is the
+  repo's signature defect class (compare the *Security* entry above, where four hunters
+  independently found four separate instances of one rule spelled twice). Error messages
+  gain a caller-supplied prefix and are otherwise unchanged in substance.
 - **`HdWallet` treated a failed per-address chain read as "this address holds nothing".**
   `collect_spendable`, `get_utxos` and `get_balance` each gathered per-address reads with
   `return_exceptions=True` and then filtered by `isinstance(result, list | tuple)`, silently
@@ -408,6 +422,71 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   down`.
 
 ### Tests
+
+- **Sixteen golden-vector tests had skipped on every clean checkout since they were
+  written — including CI — and one of the clusters was the only cover for a fail-closed
+  broadcast guard.** They read
+  `docs/brainstorms/gravity-ref-spike/.live_swap_{nft,ft}.json`, which `.gitignore:208`
+  excludes and must keep excluding: it holds six live mainnet WIFs and an HTLC preimage.
+  So CI was green on tests that had never run anywhere but one developer's machine, and
+  `pyproject.toml` ships `tests` in the sdist, handing downstream packagers the same
+  silent skip.
+
+  The consequence was measured, not assumed. Widening `MempoolSpaceBroadcaster`'s
+  idempotency match (`network/bitcoin.py`) from its explicit phrase list to a bare
+  `"already"` — so that *"inputs already spent by another transaction"*, meaning a
+  counterparty front-ran the HTLC output, reads as a **successful** broadcast and returns
+  a locally-derived txid for a transaction that never entered a mempool — passed the
+  entire 8456-test clean suite with zero failures.
+
+  Fixed by committing a **sanitized** vector, `tests/fixtures/mainnet_btc_segwit_tx.json`:
+  one real Bitcoin mainnet segwit transaction and its canonical txid, public on-chain data,
+  built by copying exactly two whitelisted fields. It uses the swap's **funding**
+  transaction rather than its claim, because an HTLC claim reveals the preimage in its
+  witness. The eight mempool-adapter tests now load it directly — a missing file is a hard
+  error, not a skip — and the widened-match mutation now fails
+  `test_broadcast_already_spent_conflict_is_fail_closed`.
+
+- **A CI guard that fails the build on an undeclared skip** (`tests/conftest.py` +
+  `tests/expected_skips.py`). A skip reports as green, so a test that quietly stops running
+  is indistinguishable from one that passes — the same reporting blind spot as the `"_int_"`
+  collection hook that silently deselected 55 offline unit tests. Deliberate skips still
+  pass: each is declared with a reason, and entries may be scoped by node id so an
+  allowlisted reason arising in a *new* test is still reported. Proven by running the guard
+  against the pre-fix tree, where it names all eight silent skips and exits non-zero while
+  pytest itself reports "44 passed, 8 skipped".
+
+- **Tests for six guards that were present and correct in shipped code with nothing able to
+  detect their removal.** All six were confirmed by planting the defect first: with every
+  one of them disabled simultaneously, the suite returned 8456 passed / 0 failures,
+  identical to the untouched baseline. Each is now killed by a named test.
+  - `accept_offer`'s advertised-vs-signed receive-terms reconciliation. A maker who signs
+    a 9,000-photon demand while advertising 600 has a perfectly valid signature, so this
+    comparison is the only thing binding advertised price to signed price on the direct
+    `pyrxd.swap.accept_offer` path third-party integrators drive over their own transport.
+  - The offer sighash pin against 0xC2 (`NONE|ANYONECANPAY|FORKID` verifies both before and
+    after completion while committing to no outputs). See *Changed* below — the rule was
+    spelled three times and the test that named 0xC2 exercised the copy that was not
+    load-bearing.
+  - The maker pubkey → prevout-PKH binding. An impostor's signature *validates*; only this
+    binding distinguishes an owner from a stranger.
+  - The agent signer's over-spend guard — the sole conservation check on the signing path.
+    Reachable from a value-inflating ElectrumX server, not just local malware. The test also
+    asserts the operator is never asked to confirm a money-creating spend.
+  - The claim executor's network-consistency guard, which was **structurally unreachable**:
+    the test double defined no `network` attribute, so `getattr(leg, "network", None)` was
+    `None` in all 38 leg resolutions and the comparison never evaluated. The double now
+    carries a network matching its executor.
+  - The BIP39 wordlist, whose only integrity check was `len(words) != 2048`. Corrupting
+    `english.txt[1000]` `laptop`→`lapt0p` left the suite green. Both shipped wordlists now
+    have a content digest pinned over *normalized parsed words* (immune to the CRLF/LF
+    checkout difference), plus the English list's structural invariants.
+
+- **Split a test whose `match=` alternation could not tell which of two gates fired.**
+  `test_tampered_receive_output_breaks_maker_signature` matched
+  `"signature does not validate|receive terms do not match"` and was named for the wrong
+  one — the receive-terms gate runs first, so the signature gate it claimed to test was
+  never reached. It is now two tests, each asserting a single gate with no alternation.
 
 - **Extended `test_no_duplicate_consensus_constants.py` to the primitives consolidated
   above, and proved every new detector by planting the duplicate it exists to catch.** The

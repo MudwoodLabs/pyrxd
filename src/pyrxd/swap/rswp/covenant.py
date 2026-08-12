@@ -414,7 +414,7 @@ def take_covenant_order(
         If ``fee`` is below the node's min-relay floor for the completed,
         signed, selector-appended size — see :func:`_assert_relayable`.
     """
-    from ..partial import _asset_of, _parse_p2pkh_scriptsig
+    from ..partial import _asset_of, _parse_p2pkh_scriptsig, require_offer_sighash
 
     if order.expiry_height is None:
         raise ValidationError("not a v3 order (no expiry) — use take_rswp_order")
@@ -439,9 +439,10 @@ def take_covenant_order(
     if order.offered_type != CONTRACT_TYPE_RXD:
         raise ValidationError("advertised offeredType does not match the RXD covenant reservation")
 
+    # Same pin as the v2 bridge and the direct accept_offer path, via the one
+    # implementation (see swap.partial.require_offer_sighash, finding F1).
     sig_with_flag, pubkey = _parse_p2pkh_scriptsig(order.signature)
-    if len(sig_with_flag) < 2 or sig_with_flag[-1] != int(SIGHASH.SINGLE_ANYONECANPAY_FORKID):
-        raise ValidationError("order signature does not carry sighash 0xc3 (see v2 bridge, finding F1)")
+    require_offer_sighash(sig_with_flag, where="order signature")
 
     if give_source_tx.txid() != order.offered_txid:
         raise ValidationError("give_source_tx does not hash to the advertised offered outpoint")

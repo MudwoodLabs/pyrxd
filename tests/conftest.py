@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import re
 import sys
 
 import pytest
@@ -100,3 +101,70 @@ except ImportError:
 def unit_test_mocks(monkeypatch: None):
     """Include Mocks here to execute all commands offline and fast."""
     pass
+
+
+# ---------------------------------------------------------------------------------
+# Unexpected-skip guard
+#
+# A skip reports as green, so a test that stops running for an accidental reason is
+# indistinguishable from one that passes. That is not hypothetical here: sixteen
+# golden-vector tests skipped on every clean checkout including CI — because the
+# fixture they read is gitignored — and among them were the only tests covering a
+# fail-closed broadcast guard. See tests/expected_skips.py for the full account.
+#
+# Every skip must be declared in EXPECTED_SKIPS with a reason. Anything else fails the
+# run. Deliberate skips (optional dependency, artifact built by another CI job) pass
+# untouched; a fixture that quietly vanishes does not.
+# ---------------------------------------------------------------------------------
+
+_unexpected_skips: list[tuple[str, str]] = []
+_seen_skips: set[str] = set()
+
+
+def _skip_reason(report: pytest.TestReport) -> str:
+    """Best-effort reason text from a skip report (``(path, lineno, "Skipped: why")``)."""
+    longrepr = getattr(report, "longrepr", None)
+    if isinstance(longrepr, tuple) and len(longrepr) == 3:
+        text = str(longrepr[2])
+        return text[len("Skipped: ") :] if text.startswith("Skipped: ") else text
+    return str(longrepr) if longrepr is not None else ""
+
+
+def pytest_runtest_logreport(report: pytest.TestReport) -> None:
+    if not report.skipped:
+        return
+    if hasattr(report, "wasxfail"):
+        return  # an xfail is a recorded expected failure, not a skipped test
+    if report.nodeid in _seen_skips:
+        return  # setup+call can both report; count each test once
+    _seen_skips.add(report.nodeid)
+
+    from tests.expected_skips import EXPECTED_SKIPS
+
+    reason = _skip_reason(report)
+    for entry in EXPECTED_SKIPS:
+        if re.search(entry.reason, reason) and (not entry.nodeid or re.search(entry.nodeid, report.nodeid)):
+            return
+    _unexpected_skips.append((report.nodeid, reason))
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config) -> None:
+    if not _unexpected_skips:
+        return
+    write = terminalreporter.write_line
+    terminalreporter.section("UNEXPECTED SKIPS", sep="=", red=True, bold=True)
+    write(f"{len(_unexpected_skips)} test(s) skipped without an entry in tests/expected_skips.py.")
+    write("A skip reports as green, so an undeclared skip is a silent hole in the suite.")
+    write("")
+    for nodeid, reason in _unexpected_skips:
+        write(f"  {nodeid}")
+        write(f"      reason: {reason}")
+    write("")
+    write("If the skip is accidental (a fixture went missing), restore it — and prefer")
+    write("committing a sanitized vector so the test cannot skip at all.")
+    write("If it is deliberate, add an ExpectedSkip to tests/expected_skips.py saying why.")
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if _unexpected_skips:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED

@@ -133,8 +133,16 @@ class _FakeChainIO:
 
 
 class _FakeRadiantLeg:
-    def __init__(self, chain_io, *, claim_txid="dd" * 32):
+    #: Production ``RadiantCovenantLeg`` sets ``.network`` (radiant_leg.py:426), and the
+    #: executor's network-consistency guard reads it via ``getattr(leg, "network", None)``.
+    #: This double used to omit the attribute entirely, so ``leg_net`` was ``None`` in all
+    #: 38 leg resolutions across the suite and the comparison was structurally unreachable
+    #: — the guard could be deleted with every test still green. Every construction now
+    #: carries a network matching its executor, so the comparison actually runs, and
+    #: ``test_leg_on_a_different_network_is_declined`` drives it apart.
+    def __init__(self, chain_io, *, claim_txid="dd" * 32, network="bcrt"):
         self.chain_io = chain_io
+        self.network = network
         self._claim_txid = claim_txid
         self.claimed_with: bytes | None = None
         self.claim_calls = 0  # spy: number of times claim_asset actually broadcast
@@ -207,7 +215,8 @@ async def _armed_executor(
         variant=kw.pop("variant", "rxd"), radiant_amount=kw.pop("radiant_amount", 1_000)
     )
     chain_io = _FakeChainIO(value=terms.radiant_amount, confs=confs, missing=missing, mempool_unspent=mempool_unspent)
-    leg = _FakeRadiantLeg(chain_io)
+    # The leg's network matches the executor's unless a test deliberately drives them apart.
+    leg = _FakeRadiantLeg(chain_io, network=kw.pop("leg_network", network))
     # "armed" fixture: arm mainnet custody by default so the value-bearing tests exercise the claim path.
     # (No effect on audit-cleared networks like bcrt, where _value_bearing is False.) Override via kw.
     kw.setdefault("enable_autonomous_mainnet_custody", True)
@@ -244,6 +253,26 @@ async def test_dormant_when_leg_or_sources_missing():
     )
     rec = SwapRecord(state=SwapState.SECRET_REVEALED, terms=terms, counterchain_locator=locator)
     assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+
+
+async def test_leg_on_a_different_network_is_declined():
+    """FALS-06: the network-consistency guard, made reachable.
+
+    The arming latch and the value cap key on the EXECUTOR's network; the leg broadcasts
+    on ITS own (set independently by the sidecar resolver). A divergence means both
+    guards were evaluated against a network the transaction will not be sent to, so the
+    executor must fail closed rather than claim.
+
+    The guard shipped correct but untestable: ``_FakeRadiantLeg`` had no ``network``
+    attribute, so ``getattr(leg, "network", None)`` returned ``None`` in every one of the
+    suite's 38 leg resolutions and the comparison was never evaluated. Mutating the
+    condition left the whole suite green. The double now carries a network, so the
+    comparison runs everywhere and this test drives the two apart.
+    """
+    ex, leg, rec, _ = await _armed_executor(network="bcrt", leg_network="bc")
+    assert await ex.execute("s1", rec, _claim_decision()) is ExecOutcome.DECLINED
+    assert leg.claim_calls == 0
+    assert leg.claimed_with is None
 
 
 async def test_resolver_returning_none_is_dormant_for_that_swap():
@@ -307,7 +336,7 @@ async def test_value_bearing_default_is_unarmed_declines():
     # declines on a value-bearing network. Built directly to bypass the fixture's setdefault(..., True),
     # so flipping the production default to True would fail this test.
     terms, _p, raw, claim_txid, locator, _ = await _build_real_claim()
-    leg = _FakeRadiantLeg(_FakeChainIO(value=terms.radiant_amount))
+    leg = _FakeRadiantLeg(_FakeChainIO(value=terms.radiant_amount), network="bc")
     ex = ClaimExecutor(
         resolve_leg=_resolver(leg),
         claim_status_source=_FakeStatusSource(claim_txid=claim_txid, claimed=True, confs=10),
@@ -326,7 +355,7 @@ async def test_arming_flag_rejects_non_bool():
     # can never silently arm unattended mainnet custody (security panel #244).
     with pytest.raises(ValidationError):
         ClaimExecutor(
-            resolve_leg=_resolver(_FakeRadiantLeg(_FakeChainIO(value=1_000))),
+            resolve_leg=_resolver(_FakeRadiantLeg(_FakeChainIO(value=1_000), network="bc")),
             claim_status_source=None,
             claim_bytes_source=None,
             policy=MarginPolicy.estimated(),

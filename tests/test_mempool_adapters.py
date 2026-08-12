@@ -7,7 +7,7 @@ Protocol conformance the leg relies on.
 
 from __future__ import annotations
 
-# A real mainnet segwit tx (the spike's P2TR HTLC claim) + its txid — so the
+# A real mainnet segwit tx (the spike's P2TR HTLC funding tx) + its txid — so the
 # broadcaster's local txid derivation has a real round-trip.
 import json as _json
 from pathlib import Path as _Path
@@ -23,19 +23,23 @@ from pyrxd.network.bitcoin import (
 )
 from pyrxd.security.errors import InsufficientConfirmationsError, NetworkError, ValidationError
 
-_SPIKE = _Path(__file__).resolve().parent.parent / "docs" / "brainstorms" / "gravity-ref-spike"
+#: Committed, sanitized golden vector: a real Bitcoin mainnet segwit transaction and its
+#: canonical txid (public on-chain data — no key material, no HTLC preimage). This used to
+#: read a gitignored developer-only file, so all eight tests below skipped on every clean
+#: checkout including CI, and a widened idempotency match in ``MempoolSpaceBroadcaster``
+#: could ship unnoticed. The vector is now in-tree: it must never be absent, so a missing
+#: file is a hard error, not a skip.
+_VECTOR = _Path(__file__).resolve().parent / "fixtures" / "mainnet_btc_segwit_tx.json"
 
 #: The txid every scripted reader below is asked about. Esplora echoes it back in ``/tx/{txid}``,
 #: and the reader binds the echo (a source that answers about a DIFFERENT tx is refused).
 _TXID = "ab" * 32
 
 
-def _claim_vec():
-    p = _SPIKE / ".live_swap_nft.json"
-    if not p.exists():
-        pytest.skip("mainnet golden vector not present")
-    d = _json.loads(p.read_text())
-    return bytes.fromhex(d["btc_claim_tx_hex"]), d["btc_claim_txid"]
+def _mainnet_vec():
+    """Real mainnet witness-bearing bytes + the canonical txid they must derive to."""
+    d = _json.loads(_VECTOR.read_text())
+    return bytes.fromhex(d["tx_hex"]), d["txid"]
 
 
 def _post_resp(status: int, body: str) -> MagicMock:
@@ -66,14 +70,14 @@ def test_adapters_satisfy_leg_protocols():
 
 
 async def test_broadcast_success_returns_node_txid():
-    raw, txid = _claim_vec()
+    raw, txid = _mainnet_vec()
     b = MempoolSpaceBroadcaster()
     b._http.session = AsyncMock(return_value=_session_posting(_post_resp(200, txid)))
     assert await b.broadcast(raw) == txid
 
 
 async def test_broadcast_idempotent_already_known_derives_txid_locally():
-    raw, txid = _claim_vec()
+    raw, txid = _mainnet_vec()
     b = MempoolSpaceBroadcaster()
     b._http.session = AsyncMock(return_value=_session_posting(_post_resp(400, "sendrawtransaction: txn-already-known")))
     # Idempotent: derives the canonical txid locally from raw -> matches the real txid.
@@ -82,7 +86,7 @@ async def test_broadcast_idempotent_already_known_derives_txid_locally():
 
 async def test_broadcast_present_phrases_are_idempotent_success():
     # LOW-R4: the specific "already present" phrases each derive the txid locally (no-op re-broadcast).
-    raw, txid = _claim_vec()
+    raw, txid = _mainnet_vec()
     for body in (
         "sendrawtransaction: txn-already-known",
         "Transaction already in block chain",
@@ -97,7 +101,7 @@ async def test_broadcast_already_spent_conflict_is_fail_closed():
     # LOW-R4: a rejection containing the bare word "already" but meaning a DOUBLE-SPEND/conflict
     # (the counterparty spent the HTLC output first) must NOT be misread as idempotent success —
     # else broadcast() would return a txid for a tx that never landed. Fail-closed.
-    raw, _ = _claim_vec()
+    raw, _ = _mainnet_vec()
     for body in (
         "bad-txns-inputs-missingorspent",
         "sendrawtransaction: inputs already spent by another transaction",
@@ -116,7 +120,7 @@ async def test_broadcast_rejects_empty():
 
 
 async def test_broadcast_real_error_fail_closed():
-    raw, _ = _claim_vec()
+    raw, _ = _mainnet_vec()
     b = MempoolSpaceBroadcaster()
     b._http.session = AsyncMock(
         return_value=_session_posting(_post_resp(400, "non-mandatory-script-verify-flag (...)"))
@@ -126,7 +130,7 @@ async def test_broadcast_real_error_fail_closed():
 
 
 async def test_broadcast_non_txid_success_body_fail_closed():
-    raw, _ = _claim_vec()
+    raw, _ = _mainnet_vec()
     b = MempoolSpaceBroadcaster()
     b._http.session = AsyncMock(return_value=_session_posting(_post_resp(200, "not-a-txid")))
     with pytest.raises(NetworkError, match="non-txid body"):
@@ -361,7 +365,7 @@ async def test_read_output_amount_rejects_a_different_txs_answer():
 
 
 async def test_txid_of_derives_locally():
-    raw, txid = _claim_vec()
+    raw, txid = _mainnet_vec()
     assert await MempoolSpaceFundingReader().txid_of(raw) == txid
 
 
@@ -464,7 +468,7 @@ async def test_http_client_tx_status_and_json_require_dict():
 async def test_broadcast_http_clienterror_fail_closed():
     import aiohttp
 
-    raw, _ = _claim_vec()
+    raw, _ = _mainnet_vec()
     b = MempoolSpaceBroadcaster()
     bad_session = MagicMock()
     bad_session.post = MagicMock(side_effect=aiohttp.ClientError("boom"))
