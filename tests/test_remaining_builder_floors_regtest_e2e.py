@@ -23,9 +23,9 @@ deliberate, greppable escape hatch that already existed.
 
 The boundary is SEARCHED FOR, not solved, on the Radiant side: the fee is part of the
 signed output value, so changing it re-signs the input and can move the DER length — and
-with it the size the floor is derived from. Cases retry with fresh keys until a build lands
-exactly on the boundary. The BTC side needs no search: BIP340 signatures are a fixed 64
-bytes, so the size does not move with the fee.
+with it the size the floor is derived from. What the cases search is a **size-neutral
+redraw** — see :data:`_REDRAWS`. The BTC side needs no search: BIP340 signatures are a
+fixed 64 bytes, so the size does not move with the fee.
 
 Coverage and its limits, stated rather than implied:
 
@@ -180,52 +180,33 @@ class TestRswpCancelFloorAtTheNode:
             )
         print(f"builder refusal at the old fixture fee: {ei.value}")
 
-        def build(fee: int, pol):
-            k = PrivateKey()
-            s, v = _fund_p2pkh(node, k, _FUNDING)
-            return rswp_build_cancel_tx(
-                offered_source_tx=s,
-                offered_vout=v,
-                maker_key=k,
-                refund_pkh=k.public_key().hash160(),
-                fee=fee,
-                fee_policy=pol,
-            )
+        # The redraw is the REFUND PKH: twenty bytes at every value, so it moves the
+        # sighash and not the size, and this builder does not pin it (the offered UTXO is
+        # the maker's own, so where the refund goes is the maker's business). It costs no
+        # chain operations at all — the offered UTXO above is funded ONCE and every draw
+        # self-spends that same UTXO. The old loop funded a fresh UTXO for all three
+        # builds of every attempt: 36 chain round trips in the worst case, to compare
+        # transactions that were not even the same transaction.
+        def draw():
+            refund_pkh = PrivateKey().public_key().hash160()
 
-        at_floor = under = None
-        for _ in range(12):
-            probe = build(policy.min_relay_fee(200), policy)
-            floor = policy.min_relay_fee(len(probe.serialize()))
-            try:
-                cand = build(floor, policy)
-            except InsufficientFundsError:
-                continue
-            if policy.min_relay_fee(len(cand.serialize())) != floor:
-                continue
-            at_floor = cand
-            u = build(floor - 1, _PERMISSIVE)
-            if policy.min_relay_fee(len(u.serialize())) == floor:
-                under = u
-                break
-        assert at_floor is not None, "no cancel landed exactly on its own relay floor"
-        assert under is not None, "could not build a same-size cancel one photon under the floor"
+            def make(fee: int, pol) -> bytes:
+                return rswp_build_cancel_tx(
+                    offered_source_tx=src,
+                    offered_vout=vout,
+                    maker_key=key,
+                    refund_pkh=refund_pkh,
+                    fee=fee,
+                    fee_policy=pol,
+                ).serialize()
 
-        res = node.accepts(under.serialize().hex())
-        assert res.get("allowed") is False, f"the node ACCEPTED one photon under its own floor: {res}"
-        reason = _reason(res)
-        assert "min relay fee not met" in reason, f"rejected, but not for the fee: {res}"
-        floor = policy.min_relay_fee(len(under.serialize()))
-        print(
-            f"one-photon-under: size={len(under.serialize())}B fee={floor - 1}ph "
-            f"(floor {floor}ph at {rate}ph/kB) -> {reason}"
-        )
+            return make
 
-        ok = node.accepts(at_floor.serialize().hex())
-        assert ok.get("allowed") is True, f"the node REJECTED a cancel at exactly its floor: {ok}"
-        print(f"at-floor:         size={len(at_floor.serialize())}B fee={floor}ph -> accepted")
+        at_floor, under, floor = _boundary(policy, draw, "rswp cancel")
+        _assert_boundary_at_node(node, at_floor, under, floor, rate, "rswp cancel")
 
         # And it really does revoke: broadcasting it spends the offered UTXO for good.
-        txid = str(node.cli("sendrawtransaction", at_floor.serialize().hex()))
+        txid = str(node.cli("sendrawtransaction", at_floor.hex()))
         node.mine(1)
         assert node.cli("gettxout", txid, "0") is not None
 
@@ -276,29 +257,96 @@ def _deploy_offer(rt: _RegtestNode, maker: _Party, taker: _Party, deadline: int,
     return offer, txid, 0, res.output_photons
 
 
-def _boundary(rt: _RegtestNode, policy, make, label: str):
+#: Size-neutral redraws a boundary search may take before giving up.
+#:
+#: Landing exactly on the boundary is a SEARCH, not a solve. The fee is part of the
+#: signed output value, so changing it re-signs the input, which can change the DER
+#: signature length (69/70/71 bytes — 17/1457/1526 over 3 000 messages, measured in
+#: :mod:`pyrxd.fee_sizing`), which changes the size the floor is derived from. Signing is
+#: RFC 6979, so rebuilding on the same inputs is byte-identical: the ONLY way to redraw
+#: the length is to change the sighash.
+#:
+#: Each draw does exactly that WITHOUT changing the byte count, so the boundary is still
+#: hit exactly — no assertion is widened, retried or dropped. Same device as
+#: ``test_wallet_send_regtest_e2e._fee_at_exactly`` (nLockTime: four bytes at every
+#: value, and never enforced when every input is final) and
+#: ``test_fee_floor_boundary_regtest_e2e._PKH_REDRAWS`` (a payout PKH: twenty bytes at
+#: every value).
+#:
+#: What this replaced, measured over 3 000 offline trials of each shipped search — the
+#: builds never consult the node, so the rate is a property of the search alone:
+#: **2.9%** of runs (rswp cancel), **6.3%** (gravity claim) and **5.6%** (gravity cancel)
+#: never landed on the boundary, for **14.1% per run of this file** — and on a live
+#: regtest node at the mainnet floor, **5 failures in 40 consecutive runs**, spread across
+#: all three cases and every one of them this assertion.
+#:
+#: With the fixed point iterated (:data:`_SETTLE_STEPS`), the same 3 000 offline trials of
+#: THIS search give **0 non-convergent on all four cases**, a mean of 2.7 draws and a worst
+#: case of 21 — so a draw settles about 37% of the time and this budget is roughly twice
+#: the worst run ever observed, putting the give-up probability near 1e-8 per case. Live:
+#: **40 consecutive green runs**, and the file got ~3.7x faster (17.4 s → 4.7 s) because a
+#: draw is now one chain round trip instead of one per build.
+_REDRAWS = 40
+
+#: Steps of the fee↔size fixed point to take within ONE draw.
+#:
+#: The old search took a single probe and demanded that the candidate AND the one-photon-
+#: under build both come out the probe's size — three independent DER draws that had to
+#: agree, which is where most of the 14% went. Iterating instead means only the
+#: one-photon-under build is an independent draw. For a given draw the size can take only
+#: two adjacent values, so a run that has not settled in four steps is a two-cycle and
+#: never will; the draw is abandoned rather than the assertion.
+_SETTLE_STEPS = 4
+
+
+def _settle_pair(make, policy):
+    """``(at_floor_raw, under_raw, floor)`` for ONE size-neutral draw, or ``None``.
+
+    ``make(fee, fee_policy) -> raw bytes`` with the draw already bound, so every build in
+    here is the SAME transaction at a different fee. That is what makes "one photon
+    under" a statement about *this* transaction rather than about a differently sized
+    sibling that happened to be built next — the old search threaded fresh keys through
+    every call and compared two unrelated transactions.
+    """
+    size = len(make(policy.min_relay_fee(400), _PERMISSIVE))
+    for _ in range(_SETTLE_STEPS):
+        floor = policy.min_relay_fee(size)
+        settled = len(make(floor, _PERMISSIVE))
+        if settled == size:
+            break
+        size = settled
+    else:
+        return None  # the fee↔size map is a two-cycle on this draw
+    # Built through the REAL policy, not the escape hatch: half of what this file proves
+    # is that the builder's own guard returns the transaction at exactly the node's floor.
+    at_floor = make(floor, policy)
+    # An invariant, not a draw outcome: a fee policy only ever GATES a build, it never
+    # changes its bytes. If that stopped being true, "one photon under" would silently be
+    # a statement about a different-sized transaction again.
+    assert len(at_floor) == size, f"the fee policy moved the bytes ({len(at_floor)}B vs {size}B measured)"
+    under = make(floor - 1, _PERMISSIVE)
+    if len(under) != size:
+        return None
+    # Same draw, same transaction, real policy: the builder's own guard has to refuse it.
+    # Free to assert here — ``under`` is already known to be exactly one photon under its
+    # own floor — and it keeps ``_PERMISSIVE`` honest: if the escape hatch ever stopped
+    # being an escape hatch, ``under`` would be a transaction the guard was happy with.
+    with pytest.raises(InsufficientFundsError, match="below the required"):
+        make(floor - 1, policy)
+    return at_floor, under, floor
+
+
+def _boundary(policy, draw, label: str):
     """Shared search: return (at_floor_raw, under_raw, floor) for a Radiant builder.
 
-    ``make(fee, policy) -> raw bytes``. Retries with fresh state until one build lands
-    exactly on its own floor and a same-size build sits one photon under it.
+    ``draw()`` returns a fresh ``make(fee, fee_policy) -> raw bytes`` bound to one
+    size-neutral redraw (see :data:`_REDRAWS`).
     """
-    at_floor = under = floor = None
-    for _ in range(10):
-        probe = make(policy.min_relay_fee(400), _PERMISSIVE)
-        f = policy.min_relay_fee(len(probe))
-        try:
-            cand = make(f, policy)
-        except InsufficientFundsError:
-            continue
-        if policy.min_relay_fee(len(cand)) != f:
-            continue
-        u = make(f - 1, _PERMISSIVE)
-        if policy.min_relay_fee(len(u)) != f:
-            continue
-        at_floor, under, floor = cand, u, f
-        break
-    assert at_floor is not None, f"{label}: no build landed exactly on its own relay floor"
-    return at_floor, under, floor
+    for _ in range(_REDRAWS):
+        found = _settle_pair(draw(), policy)
+        if found is not None:
+            return found
+    raise AssertionError(f"{label}: no build landed exactly on its own relay floor in {_REDRAWS} size-neutral redraws")
 
 
 def _assert_boundary_at_node(rt: _RegtestNode, at_floor: bytes, under: bytes, floor: int, rate: int, label: str):
@@ -319,44 +367,63 @@ class TestGravitySpendFloorsAtTheNode:
     def test_claim_boundary_is_the_nodes_own_floor(self, node):  # noqa: F811
         rate, policy = _node_relay_rate(node), _node_policy(node)
 
-        def make(fee: int, pol) -> bytes:
+        # The ONLY case here whose redraw costs a chain round trip. A claim pins
+        # everything a free redraw could otherwise move: its single output is the P2SH of
+        # the claimed redeem script committed in the offer, its signer is the taker key
+        # the covenant checks, its locktime and sequence are fixed by the branch. So the
+        # draw is a freshly DEPLOYED offer — but only ONE per draw, reused by all four
+        # builds, where the old search deployed a fresh offer for every build.
+        def draw():
             maker, taker = _Party(), _Party()
             offer, txid, vout, photons = _deploy_offer(node, maker, taker, _CLAIM_DEADLINE, policy)
-            r = build_claim_tx(
-                offer=offer,
-                funding_txid=txid,
-                funding_vout=vout,
-                funding_photons=photons,
-                fee_sats=fee,
-                taker_privkey=taker.material,
-                accept_short_deadline=True,
-                fee_policy=pol,
-            )
-            return bytes.fromhex(r.tx_hex)
 
-        at_floor, under, floor = _boundary(node, policy, make, "claim")
+            def make(fee: int, pol) -> bytes:
+                r = build_claim_tx(
+                    offer=offer,
+                    funding_txid=txid,
+                    funding_vout=vout,
+                    funding_photons=photons,
+                    fee_sats=fee,
+                    taker_privkey=taker.material,
+                    accept_short_deadline=True,
+                    fee_policy=pol,
+                )
+                return bytes.fromhex(r.tx_hex)
+
+            return make
+
+        at_floor, under, floor = _boundary(policy, draw, "claim")
         _assert_boundary_at_node(node, at_floor, under, floor, rate, "gravity claim")
 
     def test_cancel_boundary_is_the_nodes_own_floor(self, node):  # noqa: F811
         rate, policy = _node_relay_rate(node), _node_policy(node)
-        addr = _mainnet_p2pkh_address(_Party().pkh)
+        maker, taker = _Party(), _Party()
+        offer, txid, vout, photons = _deploy_offer(node, maker, taker, _CLAIM_DEADLINE, policy)
 
-        def make(fee: int, pol) -> bytes:
-            maker, taker = _Party(), _Party()
-            offer, txid, vout, photons = _deploy_offer(node, maker, taker, _CLAIM_DEADLINE, policy)
-            r = build_cancel_tx(
-                offer=offer,
-                funding_txid=txid,
-                funding_vout=vout,
-                funding_photons=photons,
-                maker_address=addr,
-                fee_sats=fee,
-                maker_privkey=maker.material,
-                fee_policy=pol,
-            )
-            return bytes.fromhex(r.tx_hex)
+        # The redraw is the PAYOUT ADDRESS: a P2PKH script is twenty-five bytes at every
+        # value, and the cancel branch does not pin it — it demands the maker's signature,
+        # so where the maker sends the refund is the maker's business (this case already
+        # paid out to an unrelated party's PKH and the node accepted it). Free, so the
+        # offer above is deployed ONCE for every draw.
+        def draw():
+            addr = _mainnet_p2pkh_address(_Party().pkh)
 
-        at_floor, under, floor = _boundary(node, policy, make, "cancel")
+            def make(fee: int, pol) -> bytes:
+                r = build_cancel_tx(
+                    offer=offer,
+                    funding_txid=txid,
+                    funding_vout=vout,
+                    funding_photons=photons,
+                    maker_address=addr,
+                    fee_sats=fee,
+                    maker_privkey=maker.material,
+                    fee_policy=pol,
+                )
+                return bytes.fromhex(r.tx_hex)
+
+            return make
+
+        at_floor, under, floor = _boundary(policy, draw, "cancel")
         _assert_boundary_at_node(node, at_floor, under, floor, rate, "gravity cancel")
 
     def test_forfeit_boundary_is_the_nodes_own_floor(self, node):  # noqa: F811
@@ -369,12 +436,17 @@ class TestGravitySpendFloorsAtTheNode:
         """
         rate, policy = _node_relay_rate(node), _node_policy(node)
 
-        def make(fee: int, pol) -> bytes:
+        # Forfeit needs no redraw and never takes a second one: its scriptSig is
+        # ``OP_1 <claimed redeem>`` — a selector and a script, no signature — so nothing
+        # in it moves with the fee and the first draw always settles (0 non-convergent
+        # over 3 000 offline trials). It goes through the same search anyway so that the
+        # day it grows a signature it is already covered. The payout MUST go to the
+        # maker's own committed pkh: the MakerClaimed covenant's forfeit branch checks it
+        # (an arbitrary address gets `mandatory-script-verify-flag-failed
+        # (OP_EQUALVERIFY)`, which would be a script rejection masquerading as a fee
+        # result), so a fresh claimed UTXO is the only redraw available here.
+        def draw():
             maker, taker = _Party(), _Party()
-            # The payout MUST go to the maker's own committed pkh: the MakerClaimed
-            # covenant's forfeit branch checks it (an arbitrary address gets
-            # `mandatory-script-verify-flag-failed (OP_EQUALVERIFY)`, which would be a
-            # script rejection masquerading as a fee result).
             addr = _mainnet_p2pkh_address(maker.pkh)
             offer, txid, vout, photons = _deploy_offer(node, maker, taker, _PAST_DEADLINE, policy)
             claim = build_claim_tx(
@@ -389,18 +461,22 @@ class TestGravitySpendFloorsAtTheNode:
             )
             claimed_txid = str(node.cli("sendrawtransaction", claim.tx_hex))
             node.mine(1)
-            r = build_forfeit_tx(
-                offer,
-                claimed_txid,
-                0,
-                claim.output_photons,
-                addr,
-                fee,
-                fee_policy=pol,
-            )
-            return bytes.fromhex(r.tx_hex)
 
-        at_floor, under, floor = _boundary(node, policy, make, "forfeit")
+            def make(fee: int, pol) -> bytes:
+                r = build_forfeit_tx(
+                    offer,
+                    claimed_txid,
+                    0,
+                    claim.output_photons,
+                    addr,
+                    fee,
+                    fee_policy=pol,
+                )
+                return bytes.fromhex(r.tx_hex)
+
+            return make
+
+        at_floor, under, floor = _boundary(policy, draw, "forfeit")
         _assert_boundary_at_node(node, at_floor, under, floor, rate, "gravity forfeit")
 
 

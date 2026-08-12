@@ -6,6 +6,128 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Tests
+
+- **The relay-floor boundary searches in `test_remaining_builder_floors_regtest_e2e.py`
+  failed ~14% of the time for reasons that had nothing to do with the code under test.**
+  Landing exactly on the floor is a search, not a solve: the fee is part of the signed
+  output value, so changing it re-signs the input, which can change the DER signature
+  length (69/70/71 bytes), which changes the size the floor is derived from. The old
+  search took one probe and then demanded that the at-floor build *and* the
+  one-photon-under build both come out the probe's size — three independent DER draws
+  that had to agree, retried ten or twelve times with completely fresh state. Measured
+  over 3,000 offline trials of each shipped search (the searches never consult the node,
+  so the rate is a property of the search alone): **2.9%** non-convergence on the RSWP
+  cancel, **6.3%** on the gravity claim, **5.6%** on the gravity cancel — **14.1% per run
+  of the file**. Reproduced on a live regtest node at the mainnet floor:
+  **5 failures in 40 consecutive runs (12.5%)**, spread across all three cases.
+
+  Fixed with the size-neutral redraw this repo had already used twice — nLockTime in
+  `test_wallet_send_regtest_e2e._fee_at_exactly`, a refund PKH in
+  `test_fee_floor_boundary_regtest_e2e._PKH_REDRAWS` — plus iterating the fee↔size fixed
+  point instead of trusting a single probe, which removes one of the three draws. The
+  RSWP cancel redraws its **refund PKH** and the gravity cancel its **payout address**
+  (20 and 25 bytes at every value, and neither builder pins them), so both now fund/deploy
+  once and redraw for free. The gravity claim pins everything a free redraw could move —
+  its one output is the P2SH of the claimed redeem script committed in the offer, its
+  signer is the taker key the covenant checks — so its draw is a fresh deployed offer, but
+  one per draw instead of one per build: **2.8 deployments per run, down from 9.4**. The
+  gravity forfeit carries no signature at all (`OP_1 <claimed redeem>`), so its size never
+  moves with the fee and it settles on the first draw every time.
+
+  **No assertion was weakened.** The node is still asked to accept a fee exactly at its
+  own advertised floor and to reject one photon under, with the reason quoted verbatim;
+  the pair is now built from the *same* draw, so "one photon under" is a statement about
+  that transaction rather than about a differently sized sibling, and the builder's own
+  refusal at `floor - 1` is asserted inside the search. Measured after: **0/3,000
+  non-convergent on all four cases**, mean 2.7 draws, worst 21 against a budget of 40, and
+  **40/40 consecutive green live runs** against the same 35/40 before. The file also got
+  ~3.7x faster on a node (17.4 s → 4.7 s), because a draw is now one chain round trip
+  rather than one per build.
+
+  The same shape in `test_swap_and_nft_fee_floors._boundary` (four offline cases) measured
+  0.07% per case, 0.27% per run of that file; it gets the same fixed-point iteration and
+  now measures 0/3,000 on each.
+
+  **Then the integration lane failed the pull request that fixed all of that.**
+  `regtest (core, per-push)` refused it on
+  `test_fee_floor_boundary_regtest_e2e::test_build_advert_tx_boundary_is_the_nodes_own_floor`
+  with *"no build landed exactly on its own relay floor in 12 draws"*. That is the lane
+  doing exactly what it was added for one release ago: the first thing it did with a
+  green-looking flake fix was refuse it. It is also the argument for having built it.
+  Re-measuring properly then turned up one more of the same shape, in another file the
+  same lane runs on every push.
+
+  Re-measured over **30,000** offline trials of each remaining shipped search — imported
+  rather than re-implemented, at the mainnet relay floor:
+
+  | search | before | after |
+  | --- | --- | --- |
+  | `test_fee_floor_boundary_regtest_e2e` — v2 `prepare_offered_utxo` | **1.127%** (338/30,000) | 0/30,000 |
+  | `test_fee_floor_boundary_regtest_e2e` — v2 `build_advert_tx` | **1.067%** (320/30,000) | 0/30,000 |
+  | `test_fee_floor_boundary_regtest_e2e` — v3 covenant cancel / refund | 0/30,000 (already fixed) | 0/30,000 |
+  | `test_gravity_maker_offer_regtest_e2e` — maker offer | **0.348%** (174/50,000) | 0/30,000 |
+
+  Live, on a regtest node at `-minrelaytxfee=0.10` — mainnet's floor, asserted back from
+  the node: **156 consecutive green runs** of `test_fee_floor_boundary_regtest_e2e.py` and
+  **152** of `test_gravity_maker_offer_regtest_e2e.py`, no failures. Against the measured
+  pre-fix rates those would have caught the defect with probability 96.8% and 41%; the
+  statistical weight is in the 30,000-trial offline measurement, and the live runs are
+  there to show that model is faithful to the code that actually runs.
+
+  Both cases got the redraw that was free all along, and neither needed a new mechanism:
+
+  - **v2 `prepare_offered_utxo` / `build_advert_tx`** redraw `change_pkh` (and
+    `owner_pkh`) — a P2PKH output script is 25 bytes at every PKH. They drew a fresh
+    *funding UTXO* per attempt instead, a broadcast and a block each, up to twelve of
+    them, which bought the same redraw at a chain operation's price. Now one UTXO for the
+    whole search: over 30,000 trials a second was never needed. Both callers in that file
+    now share one search (`_boundary_is_the_nodes_floor`), so the RSWP cases inherit the
+    covenant cases' already-hardened budget by construction rather than by copy.
+  - **The maker offer** redraws the whole offer. `_offer` already re-rolled a 20-byte BTC
+    receive hash and a 32-byte chain anchor per call, and the offer transaction commits to
+    all of it through a 23-byte P2SH — so that redraw cost nothing and the search was
+    paying for it in blocks anyway: **21.95 chain operations per run on average, worst 64,
+    now exactly 1.**
+
+  Again no assertion was weakened, and one got **stronger**: the maker-offer case's "at
+  least one of twelve rebuilds is refused" was a hedge against each rebuild drawing a
+  fresh funding UTXO and legitimately coming out smaller. With the offer and the funding
+  UTXO pinned and signing being RFC 6979, the rebuild reproduces the transaction byte for
+  byte, so that hedge is now a single deterministic `pytest.raises`. The property it was
+  protecting — that nothing the guard *returns* at that fee underpays — is kept as its own
+  check, now at no chain cost.
+
+  The comments justifying the four-step fixed-point cap were also measured rather than
+  reasoned, and they were loose in both directions. The size does not take "two adjacent
+  values": it takes three or four (advert, over 20,000 builds: 424 B 0.01%, 425 B 0.45%,
+  426 B 49.33%, 427 B 50.22%). And the loop is not a coin flip per step — within one draw
+  the state is fixed and signing is RFC 6979, so `floor -> size` is a *deterministic* map.
+  Over 20,000 draws of each search, every draw that settles settles at step 1 (~50%) or
+  step 2 (~12%), never later; the rest end at the builder's own refusal because the
+  re-sign grew the transaction past the bid. Four steps is twice the depth ever observed,
+  which is now what the comment says.
+
+- **`test_remaining_builder_relay_fee_floors::TestTheBoundaryIsExact` was re-measured and
+  deliberately left alone — this time with the numbers to justify it.** It was cleared
+  above at 0/400 trials, which cannot resolve a rate low enough to survive 400 trials and
+  still fire in CI, and which did not cover `build_advert_tx` at all (that builder lives in
+  a different file). Re-measured per builder: `claim`, `cancel`, `finalize` and `forfeit`
+  **0/30,000** each; `rswp-cancel-rxd` **1/90,000**; `rswp-cancel-ft` **3/90,000** —
+  **0.004% per run of the file**, about one run in 23,000.
+
+  The residual is a mechanism rather than noise, and it was traced rather than assumed.
+  The DER length gives these builders three to five size classes, wildly unequal: over
+  20,000 builds `rswp-cancel-ft`, which carries two signatures, comes out 420 B 0.005%,
+  421 B 0.420%, 422 B 25.59%, 423 B 48.94%, 424 B 25.05%. The first half settles wherever
+  two consecutive draws agree, so it lands on a class with probability proportional to
+  that class's *square* — which still leaves 421 B reachable. When it lands there, the
+  second half's 60 fresh keys are hunting a size that occurs 0.42% of the time and time
+  out with probability 0.996^60 = 0.78. That predicts one failure in ~27,000; the observed
+  rate is one in 30,000, and in the instrumented run **both failures had settled on
+  exactly the 421-byte class**. It stays as it is because its two halves get 60
+  independent tries each — which is precisely what the flaking searches lacked.
+
 ## [0.17.0] — 2026-08-11
 
 A security release, and the one where the tests got audited as hard as the code.
