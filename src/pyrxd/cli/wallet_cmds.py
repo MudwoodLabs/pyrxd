@@ -595,7 +595,12 @@ def wallet_sweep(
         client = ctx.make_client()
         async with client:
             await wallet.refresh(client)
-            triples = await wallet.collect_spendable(client)
+            # strict: this command's contract is "moves EVERYTHING under that path"
+            # (docs/how-to/recover-funds-across-wallet-paths.md). A per-address read
+            # that failed makes that false, and the confirmation block below would
+            # still print a total and a fee as though the view were complete.
+            # NetworkError is already mapped to a retry-shaped message downstream.
+            triples = await wallet.collect_spendable(client, strict=True)
             if not triples:
                 raise UserError(
                     f"no spendable funds at {path}",

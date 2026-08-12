@@ -9,10 +9,24 @@ process:
   the process non-dumpable.
 * ``RLIMIT_CORE = 0`` — no core dump (which would contain the seed) on crash.
 
+WHEN it runs matters as much as what it does. ``pyrxd agent unlock`` calls
+:func:`harden_process` BEFORE prompting for the mnemonic, not after — it used to
+run only inside ``AgentDaemon.serve_forever``, the last step of the command, so
+the mnemonic was typed, the passphrase prompted and the seed derived in a process
+that was still swappable and dumpable. ``mlockall`` is the measure that gain is
+about: swap persists across a reboot, and a sub-second memory window does not.
+
 All are BEST-EFFORT: a container without ``CAP_IPC_LOCK`` can't ``mlock``, etc.
-Failures are reported, never fatal. The honest limit (documented in the threat
-model): ``SIGKILL`` and hardware faults cannot be scrubbed — these reduce, not
-eliminate, residency risk.
+Failures are reported, never fatal — and because the call now precedes the
+unlock, "never fatal" is a contract the CLI depends on rather than a nicety.
+
+The honest limits, none of which this closes:
+* ``SIGKILL`` and hardware faults cannot be scrubbed — these reduce, not
+  eliminate, residency risk.
+* ``PR_SET_DUMPABLE 0`` does not revoke ALREADY-OPEN descriptors, so a watcher
+  that opened ``/proc/<pid>/mem`` before the prctl keeps its read. Hardening
+  earlier narrows the race but cannot win it; it closes the attacker who arrives
+  after unlock, not one already in position.
 """
 
 from __future__ import annotations
@@ -43,12 +57,34 @@ class HardeningReport:
         }
 
 
+def _never_raises(attempt) -> bool:
+    """Run *attempt*, reporting any failure as ``False`` rather than propagating it.
+
+    The three helpers below already catch ``OSError``, which is what these calls
+    fail with in practice. This is the backstop for what they cannot anticipate —
+    a ``ctypes`` argument/marshalling error, a libc without the symbol, a
+    platform where ``prctl`` means something else. Hardening is defence in depth;
+    failing to apply it must never be worse than not attempting it.
+    """
+    try:
+        return attempt()
+    except Exception:
+        return False
+
+
 def harden_process() -> HardeningReport:
-    """Apply the hardening measures; return which ones succeeded. Never raises."""
+    """Apply the hardening measures; return which ones succeeded. Never raises.
+
+    "Never raises" is a load-bearing contract, not a courtesy: ``pyrxd agent
+    unlock`` calls this BEFORE prompting for the mnemonic, so that ``mlockall``
+    is in effect before any secret can be paged to swap. An exception here would
+    therefore deny a user their own wallet on a host that merely lacks
+    ``CAP_IPC_LOCK`` — trading a real lockout for a speculative one.
+    """
     return HardeningReport(
-        mlock=_try_mlockall(),
-        non_dumpable=_try_set_non_dumpable(),
-        core_dumps_disabled=_try_disable_core_dumps(),
+        mlock=_never_raises(_try_mlockall),
+        non_dumpable=_never_raises(_try_set_non_dumpable),
+        core_dumps_disabled=_never_raises(_try_disable_core_dumps),
     )
 
 

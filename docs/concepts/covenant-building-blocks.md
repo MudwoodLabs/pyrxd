@@ -96,9 +96,19 @@ from pyrxd.glyph.credential_binding import assert_soulbound_credential, verify_c
 
 The blocks compose: a swap's `NegotiatedTerms.credential_ref` can require the
 counterparty to hold a **soulbound credential** (block 2) whose authenticity is resolved
-through the same indexer discipline as block 3 — giving an HTLC swap (block 1) a
-consensus-anchored "only credentialed counterparties" gate. `tests/test_credential_binding.py`
+through the same indexer discipline as block 3 — giving an HTLC swap (block 1) an
+"only credentialed counterparties" gate. `tests/test_credential_binding.py`
 pins the binding rules; the swap coordinator consumes it via `CredentialResolver`.
+
+**`credential_ref` is off-chain policy, not a covenant binding.** The credential the
+counterparty holds *is* consensus-enforced — that is block 2, and the covenant is what
+makes the owner immutable. The **gate** is not: `credential_ref` never enters the HTLC
+covenant bytecode (`tests/test_htlc_handshake_conformance_vectors.py` asserts its
+absence), so nothing on-chain refuses a claim by an uncredentialed party. What enforces
+it is both coordinators declining to proceed — the taker's `pre_btc_lock_check` before
+it funds, and the maker's transition into `BOTH_LOCKED`, which is the precondition for
+the `p` reveal. A counterparty running neither is bound by neither, which is what
+"off-chain policy" means. See `CHANGELOG.md` and `docs/htlc-handshake-wire-format.md` §4.
 
 ## Where everything lives
 

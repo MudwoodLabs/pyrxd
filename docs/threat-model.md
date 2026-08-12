@@ -421,7 +421,7 @@ Cross-reference of controls and the threats they address:
 | Agent never returns key material (conformance-tested) | S18 | `src/pyrxd/agent/signer.py`, `tests/test_agent_signer.py` |
 | Agent socket: `0700` dir + `0600` socket + `SO_PEERCRED` uid==owner; per-conn recv timeout (anti-slow-loris) | TA1 (other-uid) | `src/pyrxd/agent/daemon.py:_bind/_read_peer_uid/_serve_conn` |
 | Agent lock scrubs the seed (the only long-lived secret — the account xprv is re-derived transiently, never stored, #8/H1) and fails the derivation seam closed; idle auto-lock + on-demand `lock` + SIGTERM/SIGHUP/atexit | A11 window | `src/pyrxd/agent/daemon.py:lock`, `hd/wallet.py:zeroize`/`_xprv`, `cli/agent_cmds.py` |
-| Agent process hygiene (mlock, PR_SET_DUMPABLE 0, no core dumps; best-effort) | A11 residency | `src/pyrxd/agent/hygiene.py` |
+| Agent process hygiene (mlock, PR_SET_DUMPABLE 0, no core dumps; best-effort), applied **before** the mnemonic prompt so the seed is never in swappable memory | A11 residency | `src/pyrxd/agent/hygiene.py`, `cli/agent_cmds.py:agent_unlock` |
 | Min-relay fee floor derived from the REAL serialized size (not a flat dust constant) | S21 | `src/pyrxd/gravity/fee_policy.py`, `htlc_spend.py:_assert_fee_clears_relay_floor` |
 | Deadline-aware pre-broadcast affordability gate (refuse + page, never an unfixable broadcast) | S21 | `src/pyrxd/gravity/radiant_leg.py:_assert_affordable`, `watch/claim_executor.py` |
 | CodeQL on every push | static analysis | `.github/workflows/codeql.yml` |

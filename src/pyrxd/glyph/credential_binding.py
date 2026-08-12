@@ -217,12 +217,22 @@ def verify_credential_binding(
     min_confirmations: int,
     expected_credential_ref: bytes | None = None,
 ) -> None:
-    """Fail-closed gate: confirm a credential binds to the swap's payout owner.
+    """Fail-closed gate: confirm a credential binds to a payout owner by **pkh**.
 
     Runs :func:`assert_soulbound_credential` (genuine soulbound + confirmations +
     optional ref) and additionally requires the credential's owner pkh to equal
-    ``recipient_pkh`` (the pkh the swap pays) — so the asset lands with the
-    credential owner. Call this BEFORE locking the asset.
+    ``recipient_pkh`` — so the asset lands with the credential owner.
+
+    NOT the swap gate, despite the shape. ``SwapCoordinator`` compares
+    ``holder_hash(owner, variant, genesis_ref)`` against ``terms.taker_dest_hash``,
+    because what a swap pins is a 32-byte covenant destination hash, not a bare
+    20-byte pkh; the coordinator's own ``_credential_binding_failure`` is the
+    single spelling of that rule and it runs on BOTH parties' paths. This helper
+    is for a caller holding a raw pkh (a direct transfer, a non-swap policy check).
+    Reaching for it to gate a swap re-implements the coordinator's rule one layer
+    too low — which is how the maker-side gap this docstring used to advertise
+    ("Call this BEFORE locking the asset") went unnoticed: the maker-shaped API
+    existed and nothing called it.
     """
     if not isinstance(recipient_pkh, (bytes, bytearray)) or len(recipient_pkh) != 20:
         raise CredentialBindingError("recipient_pkh must be 20 bytes (hash160)")
