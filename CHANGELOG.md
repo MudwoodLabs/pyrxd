@@ -98,6 +98,36 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tests
 
+- **`pyrxd.network` is now in mutation-testing scope, and the guards there are pinned by
+  tests that die when they are removed.** `task mutate` covered `spv/`, `script/`,
+  `transaction/` and `glyph/dmint/`; the modules that decide whether a lying server can
+  move value had never been mutation-tested at all. `scripts/mutation_test.sh network`
+  now mutates `_guards`, `confirm`, `tls_pin`, `registry`, `failover`, `electrumx` and
+  `bitcoin` (2,631 mutants) against a targeted test list.
+
+  A hand-mutation sweep of 77 load-bearing guards across the whole boundary —
+  `network/`, `swap/rswp/node_rpc.py`, `gravity/watch/adapters.py` — neutered each one in
+  turn (`if False:`, an inverted comparison, a widened match) and ran the suite. Seven
+  survived. The sharpest was `_verify_raw_matches_txid`, the audit-F-004 binding that
+  makes a source prove the bytes it returned really are the transaction that was asked
+  for: setting its comparison to `if False:` left the entire suite green at all four call
+  sites. Also unpinned: ElectrumX's 80-byte block-header length check, `normalize_pin`'s
+  `validate=True` (without it a mistyped pin silently decodes to a well-formed pin for a
+  key nobody holds), the empty-scriptPubKey / negative-value refusal in
+  `read_confirmed_unspent_output`, and `MultiSourceRxdChainSource.corroborated` — the
+  property the `ChainObserver` reads to justify `rxd_corroborated=True`, which could be
+  made to return `True` over a single source with nothing objecting.
+
+  `tests/security/test_untrusted_server_invariants.py` (65 tests) is the sibling of
+  `test_hostile_server_responses.py`: that file sweeps the *shape* of a field, this one
+  asks whether a well-formed response is an answer to the question that was actually
+  asked. Every refusal is paired with an honest response that must still be accepted — a
+  guard that refuses a legitimate server answer costs funds too, and during a timelock
+  race it costs them faster. The one remaining survivor is a confirmed equivalent mutant:
+  removing `finite_int`'s `math.isfinite` check changes which `ValueError` is raised, not
+  whether one is (`float("inf").is_integer()` is `False`, so the next branch still
+  refuses).
+
 - **The relay-floor boundary searches in `test_remaining_builder_floors_regtest_e2e.py`
   failed ~14% of the time for reasons that had nothing to do with the code under test.**
   Landing exactly on the floor is a search, not a solve: the fee is part of the signed
@@ -290,6 +320,71 @@ same by coincidence rather than by rule, it is left alone and pinned as must-not
 - Several `# Keep in sync with` comments are gone, replaced by the derivation they described.
 
 ### Security
+
+- **Six reads from a server we do not control were not bound to the request that asked
+  for them.** A lying endpoint's cheapest move is not to fabricate a field — it is to
+  return a completely truthful answer to a *different* question. No type check, range
+  check or fail-closed `except` tuple rejects a well-formed document; only a binding
+  does. Each of these now refuses a mismatched echo, and refuses a *missing* one just as
+  hard ("I cannot check" is not "it passed"):
+
+  - `ElectrumXClient.get_transaction_verbose` had no binding of any kind, and it is the
+    read every confirmation gate in the SDK sits on — `wait_for_confirmation`,
+    `RadiantCovenantLeg.confirmations`, the watchtower's `ElectrumRxdChainSource`. A
+    server could answer with a different, deeply-buried transaction's body and satisfy
+    the depth threshold without inventing a single value. Its raw sibling
+    `get_transaction` has recomputed `hash256(raw)` since the Glyph-scanner fix; the
+    verbose form now binds the `txid` the node echoes.
+  - `MempoolSpaceBroadcaster.broadcast` returned the endpoint's *echoed* txid on HTTP
+    200. The txid is a pure function of the bytes posted, so it is now derived locally
+    before the request and the echo must match it. `BitcoinTaprootLeg.claim()` and
+    `.refund()` return this value to their caller unbound — an endpoint answering 200
+    with someone else's id, or never relaying at all, had the operator record and watch
+    a transaction that does not exist while believing the leg was broadcast. (`fund()`
+    survived only because it re-binds against the builder's txid one layer up.)
+  - `BitcoinCoreFundingReader._verbose_tx` fed both the confirmation depth **and** the
+    funded amount from an unbound `getrawtransaction` object, and
+    `BitcoinCoreRpcSource.get_tx_block_height` picked the header an SPV proof is verified
+    against from another unbound one. The sibling `get_tx_output_script_type` has bound
+    the same echo since audit B7.
+  - `_esplora_merkle_proof` ignored the `block_height` Esplora echoes, so the server chose
+    which block it proved inclusion in. The ElectrumX sibling
+    (`get_transaction_merkle`) has always bound it.
+
+- **The audit-B7 output-index fix reached three of five call sites.** `data["vout"][-1]`
+  silently WRAPS to the last output, and both `read_output_amount_sats` implementations
+  (Esplora and Bitcoin Core) still took the caller's `vout` raw — the read a maker's
+  counter-funding gate uses to decide whether the BTC it is about to lock against is
+  really at the outpoint it was told about. Both now go through `_output_index`.
+
+- **`MultiSourceBtcDataSource` resolved its quorum by list position, not by agreement.**
+  `_require_quorum` returned the first group *in insertion order* that reached the quorum,
+  and insertion order is source order — so with five sources at `quorum=2`, two colluding
+  sources at the head of the list decided the answer while three honest sources disagreed
+  in silence. Every value read through it (block hash, header, header chain, raw
+  transaction, tx height, output script type, Merkle proof) is deterministic, so two
+  different values both reaching the quorum means at least one source is lying or forked;
+  that now fails closed and says so, rather than picking one. `quorum` was also completely
+  unvalidated here while both sibling quorum readers refuse `quorum < 1` — a `0` made
+  `len(group) >= self._quorum` vacuous, switching corroboration off by typo.
+
+- **A `NetworkProfile` could mix security postures, and failover would quietly take the
+  weaker one.** `FailoverElectrumXClient` moves to the next endpoint on one transport
+  error; nothing compared what that move costs. A profile of
+  `[wss:// + SPKI pins, wss:// unpinned]` therefore ran **unpinned** the first time the
+  pinned primary hiccupped, and one mixing `wss://` with `ws://` ran **plaintext** — no
+  error, no warning, and the operator still believing the control they configured was in
+  force, which is worse than never configuring it. A mixed profile is now refused at
+  construction, where a malformed pin is already refused. Uniformly-pinned,
+  uniformly-unpinned, uniformly-plaintext and single-endpoint profiles are unaffected;
+  one pin list may still hold several servers' pins, which is how a failover set is
+  pinned and how a key rotation stays deployable.
+
+- **A JSON-RPC message carrying `"id": true` was dispatched to pending request 1.**
+  `isinstance(True, int)` is `True` and `hash(True) == hash(1)`, so the reader loop's id
+  check passed it through and `_pending.pop(True)` popped the future for request id 1 —
+  the first RPC of every connection, which is the genesis read `assert_chain` is built
+  on. Same bool exclusion `_guards.finite_int` makes, for the same reason.
 
 - **`glyph transfer-nft` signed and broadcast transactions below Radiant's relay floor.**
   Its fee-funding bar was the flat literal `needed=100_000`, which never multiplied by
