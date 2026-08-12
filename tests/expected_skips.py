@@ -62,6 +62,23 @@ EXPECTED_SKIPS: tuple[ExpectedSkip, ...] = (
             "variable that would run them."
         ),
     ),
+    ExpectedSkip(
+        reason=r"^(docker|anvil)\b.*not available|^anvil binary not available",
+        why=(
+            "An external tool the live lanes drive (docker for the regtest node images, anvil "
+            "for the ETH leg) is absent. Only reachable from integration-marked tests, which "
+            "the default run never selects."
+        ),
+    ),
+    ExpectedSkip(
+        reason=r"image not available|could not (build|obtain)\b",
+        why=(
+            "A regtest node image could not be built or pulled, so the live e2e cannot run. "
+            "Integration-marked only. NOTE: this one is a gate on an unavailable environment "
+            "AND a place a genuine build failure would read as a skip — a pre-existing property "
+            "of the live lanes, recorded here rather than silently inherited."
+        ),
+    ),
     # --- artifact only produced by another CI job ---------------------------------------
     ExpectedSkip(
         reason=r"wheel \+ manifest only built by docs\.yml CI step",
