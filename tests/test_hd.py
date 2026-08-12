@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unicodedata
-from hashlib import pbkdf2_hmac
+from hashlib import pbkdf2_hmac, sha256
 
 import pytest
 
@@ -147,6 +147,63 @@ def test_ckd():
 
     with pytest.raises(ValidationError, match=r"can't make hardened derivation from xpub"):
         ckd(Xpub(master_xpub), "m/0'")
+
+
+#: Digest of each shipped wordlist, over NORMALIZED content — ``"\n".join(words)`` of the
+#: PARSED list plus a trailing newline, not the raw file bytes. Hashing parsed words makes
+#: the pin immune to the CRLF/LF difference a checkout can introduce (``core.autocrlf``),
+#: which would otherwise make this test pass or fail depending on the developer's git
+#: config rather than on the content. The English value is the widely published
+#: BIP39 ``english.txt`` sha256.
+_WORDLIST_DIGESTS = {
+    "en": "2f5eed53a4727b4bf8880d8f3f199efc90e58503646d9ff8eff3a2ed3b24dbda",
+    "zh-cn": "5c5942792bd8340cb8b27cd592f1015edf56a8c5b26276ee18a482428e7c5726",
+}
+
+
+@pytest.mark.parametrize("lang", ["en", "zh-cn"])
+def test_wordlist_content_is_pinned(lang: str) -> None:
+    """FALS-05: pin the wordlist's content, not just its length.
+
+    The loader's only integrity check is ``len(words) != 2048``, and coverage of the
+    words themselves was incidental — whichever words the fixed BIP44 vectors happen to
+    contain. Corrupting ``en[1000]`` ``laptop``->``lapt0p`` (or ``en[1500]``) left the
+    entire suite green.
+
+    The direction that matters is GENERATION: a phrase containing a visible non-word
+    derives a seed pyrxd can restore but no other BIP39 wallet can, so a user who wrote
+    the phrase down would find it rejected everywhere else. (Import is safer by
+    construction — the seed is PBKDF2 over the mnemonic *string*, so the wordlist is only
+    a validation gate there.)
+    """
+    WordList.load()
+    words = WordList.wordlist[lang]
+
+    assert len(words) == 2048, "BIP39 indexes 11 bits per word"
+    assert len(set(words)) == len(words), "a duplicate word makes an index ambiguous"
+
+    normalized = ("\n".join(words)).encode("utf-8") + b"\n"
+    assert sha256(normalized).hexdigest() == _WORDLIST_DIGESTS[lang], (
+        f"{lang} wordlist content changed — any edit here silently changes which phrases pyrxd generates and accepts"
+    )
+
+
+def test_english_wordlist_structural_invariants() -> None:
+    """The BIP39 English list's own rules, asserted directly.
+
+    These are what give a corruption a legible failure instead of a bare digest
+    mismatch, and each catches a distinct class: a non-letter (``lapt0p``) fails the
+    alphabet check, an adjacent swap (``enrich``/``enroll``) fails sortedness, and a
+    typo that collides with a neighbour fails the four-letter-prefix rule that lets
+    BIP39 wallets disambiguate a phrase from its first four characters.
+    """
+    WordList.load()
+    words = WordList.wordlist["en"]
+
+    assert words == sorted(words), "the English list is sorted; index_word relies on the order being stable"
+    assert all(w.isascii() and w.isalpha() and w.islower() for w in words), "ASCII lowercase letters only"
+    assert all(3 <= len(w) <= 8 for w in words), "BIP39 English words are 3-8 letters"
+    assert len({w[:4] for w in words}) == len(words), "first four letters must identify a word uniquely"
 
 
 def test_wordlist():

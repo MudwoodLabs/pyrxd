@@ -273,3 +273,44 @@ def test_refuses_absurd_derivation_index() -> None:
     )
     with pytest.raises(SignerError, match="index out of range"):
         AgentSigner(w).sign(bad, confirm=_ACCEPT)
+
+
+def test_refuses_to_sign_a_transaction_that_spends_more_than_its_inputs() -> None:
+    """FALS-10: the over-spend guard — the only conservation check on the signing path.
+
+    Every sibling gate in the signer (source-tx binding, key ownership, sighash pin,
+    change-claim re-derivation) was covered; this one was not, and instrumenting
+    ``_summarize`` across the whole suite showed its true branch executing zero times —
+    so the guard was behaviourally identical to its own removal.
+
+    It is not only reachable by local malware: ``WatchOnlyUtxo.value`` comes from an
+    untrusted ElectrumX server while the agent binds the real value from the
+    hash-authenticated source transaction, so a value-inflating server can drive
+    ``fee < 0``. That makes this the residual tripwire for a lying UTXO source. The
+    signature would be ALL_FORKID (committing to every output, so not recombinable) and
+    consensus would reject the result — but the agent must refuse to produce it at all,
+    and must refuse BEFORE asking the operator to confirm.
+    """
+    w = _wallet()
+    src0 = _src(w, 0, 0, 100_000)
+    src1 = _src(w, 0, 1, 50_000)  # 150,000 photons in, total
+    payee_pkh = PrivateKey().public_key().hash160()
+
+    unsigned = Transaction()
+    unsigned.add_input(_unsigned_input(src0, 0))
+    unsigned.add_input(_unsigned_input(src1, 0))
+    unsigned.add_output(TransactionOutput(P2PKH().lock(payee_pkh), 200_000))  # ...200,000 out
+
+    req = SigningRequest(
+        unsigned_tx_hex=unsigned.serialize().hex(),
+        inputs=(
+            InputToSign(0, 0, 0, src0.serialize().hex()),
+            InputToSign(1, 0, 1, src1.serialize().hex()),
+        ),
+        change_claims=(),
+    )
+
+    shown: list[SpendSummary] = []
+    with pytest.raises(SignerError, match="negative fee"):
+        AgentSigner(w).sign(req, confirm=lambda s: (shown.append(s), True)[1])
+    assert shown == [], "must refuse before the operator is asked to confirm a money-creating spend"

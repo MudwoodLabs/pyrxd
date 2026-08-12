@@ -1,0 +1,6 @@
+{
+  "_comment": "Sanitized golden vector: one REAL Bitcoin mainnet segwit transaction and its canonical txid. Public on-chain data only. Derived from a developer-only swap record by copying exactly two whitelisted fields; carries no WIF, no private key and no HTLC preimage (the claim tx was deliberately NOT used -- an HTLC claim reveals the preimage in its witness). Used by tests/test_mempool_adapters.py so the broadcaster's local txid derivation runs against real witness-bearing bytes on every clean checkout.",
+  "network": "mainnet",
+  "tx_hex": "020000000001019452d7400b86c3a05d399df2618e3e2cb30ffff42dbbdeb988c92277dd309fd70100000000ffffffff0126020000000000002251200a4bd815cdfa7a1dd8b6250ed400f101ac1459abb17cf2d467d3346a0bed490e0247304402207d79ee1c6de6b245c7828246c0bc6ecb926afd894bd31093ac1e9dbcb34b286a022042869262fe36b06dd9b2f3887717a0d4bd1ef8935aca9e735401e42e58c0644c01210278d9c9b464fba47495f1eed3ecbbd3544ede80fd7fb6e6c7af0e4db0d4ca1eea00000000",
+  "txid": "e7f02c40b04b4a6933615eb7cb969016b9187ae43b2d9f14beb0c8a1d2dc28dc"
+}

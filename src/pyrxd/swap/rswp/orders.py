@@ -43,6 +43,7 @@ from ..partial import (
     _verify_owner_signature,
     accept_offer,
     create_offer,
+    require_offer_sighash,
 )
 from ..types import Asset, SwapOffer, SwapTerms
 from .wire import (
@@ -278,17 +279,13 @@ def rswp_order_to_swap_offer(order: RswpOrder, *, give_source_tx: Transaction) -
         )
     demanded = order.demanded_outputs[0]
 
-    # Early, explicit sighash pin (security review F1): the flag byte rides in the
-    # untrusted signature push, and 0xC2 (NONE|ANYONECANPAY|FORKID) would verify both
-    # pre- and post-completion while binding NO outputs. _verify_owner_signature
-    # enforces this too; checking here gives the book a precise "why" message.
+    # Early sighash pin (security review F1), so the book gets a precise "why" before it
+    # does any further work. This is NOT a second spelling of the rule: it delegates to
+    # the one implementation in ``swap.partial``, which ``_verify_owner_signature`` also
+    # calls — so the pin cannot be removed from one path while a test on another path
+    # keeps reporting green.
     sig_with_flag, _pubkey = _parse_p2pkh_scriptsig(order.signature)
-    if len(sig_with_flag) < 2 or sig_with_flag[-1] != int(SIGHASH.SINGLE_ANYONECANPAY_FORKID):
-        flag = sig_with_flag[-1] if sig_with_flag else None
-        raise ValidationError(
-            f"order signature carries sighash {flag!r}; only SINGLE|ANYONECANPAY|FORKID (0xc3) "
-            "binds the maker's demanded output"
-        )
+    require_offer_sighash(sig_with_flag, where="order signature")
 
     if give_source_tx.txid() != order.offered_txid:
         raise ValidationError("give_source_tx does not hash to the advertised offered outpoint")
