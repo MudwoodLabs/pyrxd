@@ -13,6 +13,7 @@ poetry run task mutate                    # default scope: spv (the original gat
 poetry run task mutate script             # script/ primitives
 poetry run task mutate transaction        # transaction/ incl. the FORKID sighash preimage
 poetry run task mutate dmint              # glyph/dmint/ covenant builders + DAA + parser
+poetry run task mutate builders           # fee sizing + the FT/NFT/RXD transaction builders
 poetry run task mutate all                # everything, sequentially (hours)
 ```
 
@@ -126,6 +127,50 @@ it kills. The genuine gaps were real and some were consensus-adjacent:
   arithmetic, minimal-push sign-bit padding (`0x90` → `90 00`).
 - **dMint state re-derivation guards** — the script-number parser pinned to the encoding spec from both
   sides (parse + encode), and surgical corruption of valid contracts at documented layout offsets.
+
+## The `builders` scope (added 2026-08) — and its honest coverage boundary
+
+`fee_sizing.py`, `glyph/ft.py`, `glyph/royalty.py`, `glyph/builder.py`, `wallet.py` and `hd/wallet.py` were
+**never in a mutation scope** before this. They are ~5,100 statements of fee sizing and value arithmetic —
+the surface every fee defect of the 2026-08 audit week lived on — and the scope exists so that stops being
+true. `scripts/mutation_test.sh builders` runs them; the group's clean test list measures 9.3 s, so a full
+cosmic-ray sweep of all six files is a multi-hour job.
+
+The **first pass over this scope was hand-mutation, not cosmic-ray**: 59 mutants chosen for consequence
+rather than for coverage, planted one at a time against the full offline suite. That is a deliberately
+partial method and it is recorded as such — it says nothing about the mutants nobody wrote. What it does
+say is precise, because every verdict came from a real run:
+
+| Module | Hand-mutants planted | Killed | Survived |
+|---|---|---|---|
+| `glyph/ft.py` | 20 | 19 | 1 |
+| `glyph/royalty.py` | 8 | 8 | 0 |
+| `wallet.py` | 11 | 9 | 2 |
+| `hd/wallet.py` | 7 | 6 | 1 |
+| `glyph/builder.py` | 6 | 4 | 2 |
+| `fee_sizing.py` | 6 (of the survivors already suspected) | 0 | 6 |
+
+The conservation and "1 photon = 1 unit" arithmetic came out **strong**: over-delivering a recipient by one
+unit is caught by 44 tests, burning one unit of FT change by 25, letting the token pay its own fee by 19,
+and dropping the two-pass signature headroom by 57. The gaps clustered in two places instead —
+
+1. **the fail-closed backstops themselves**, which every builder has and only some builders prove: the FT
+   airdrop's and `HdWallet.build_send_max_tx`'s final assertions could be defeated with the whole suite
+   green, because the differentials that exercise them were written for their siblings;
+2. **`fee_sizing`'s less-travelled helpers** — `WITNESS_SCALE_FACTOR`, the strict
+   `fee_never_below_relay_floor`, `radiant_relay_size`'s type gate, `fee_overpay_ceiling` — where the
+   existing tests happened to sit on inputs for which the mutation makes no numerical difference.
+
+All of those are now pinned in `tests/test_builder_mutation_hardening.py`, each test proved by planting its
+own mutant and watching it go red.
+
+**What this pass did NOT do:** run cosmic-ray over the scope. `required_fee`'s `max(at_rate, floor)` arm
+stays a documented dead branch (`fee_sizing.py` says so and
+`tests/test_swap_and_nft_fee_floors.py` proves it), and the two `wallet.py` survivors —
+`SELECTION_INPUT_BYTES` and `greedy_select_count`'s cushion — are equivalent *through the builders*,
+because the re-selection loop re-measures and takes another coin. They are pinned as a direct
+contract on the function rather than through a builder, since that equivalence is a property of today's
+callers and not of the algorithm.
 
 ## Known remaining survivors (deferred)
 

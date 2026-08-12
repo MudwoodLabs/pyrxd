@@ -6,6 +6,7 @@
 #   scripts/mutation_test.sh script         # script/ primitives
 #   scripts/mutation_test.sh transaction    # transaction/ incl. FORKID sighash preimage
 #   scripts/mutation_test.sh dmint          # glyph/dmint/ covenant builders + DAA + parser
+#   scripts/mutation_test.sh builders       # fee sizing + the FT/NFT/RXD tx builders
 #   scripts/mutation_test.sh all            # every group, sequentially
 #
 # Scope by group (why these files — the verification/byte-exact arithmetic):
@@ -20,6 +21,12 @@
 #   dmint        builders.py (covenant script bytes), chain.py (state re-derivation parse),
 #                types.py (params validation/CBOR), miner.py (DAA target arithmetic + mint
 #                tx/preimage construction).
+#   builders     fee_sizing.py (THE fee rule: relay floor, trial slack, pays-for-its-size),
+#                glyph/royalty.py (payout arithmetic + the sale_price cap), glyph/ft.py
+#                (FT conservation + "1 photon = 1 unit" output sizing), wallet.py and
+#                hd/wallet.py (coin selection + two-pass fee), glyph/builder.py (NFT
+#                transfer, deploy/reveal scripts). These modules were NOT mutation-tested
+#                before 2026-08 — which is where every fee defect of that week lived.
 #
 # Mechanism: cosmic-ray mutates src/pyrxd/<path>.py IN PLACE (the editable install picks it up),
 # runs the module-targeted tests, then we restore the file via git. A trap restores the whole
@@ -47,6 +54,10 @@ group_files() {
     script)      echo "script/script script/timelock script/type" ;;
     transaction) echo "transaction/transaction transaction/transaction_input transaction/transaction_output transaction/transaction_preimage" ;;
     dmint)       echo "glyph/dmint/builders glyph/dmint/chain glyph/dmint/types glyph/dmint/miner" ;;
+    # Ordered cheapest-first (statement count), so a time-boxed run gets the highest
+    # consequence-per-minute files done: fee_sizing is the rule every other builder
+    # depends on, royalty is the only unbounded-spend arithmetic in the group.
+    builders)    echo "fee_sizing glyph/royalty glyph/ft wallet glyph/builder hd/wallet" ;;
     *)           return 1 ;;
   esac
 }
@@ -60,6 +71,12 @@ group_tests() {
     spv)         echo "tests/test_spv.py tests/test_merkle_path.py tests/test_spv_validation_hardening.py" ;;
     script)      echo "tests/test_mutation_hardening.py tests/test_script.py tests/test_timelock.py tests/test_covenant.py tests/test_glyph_timelock.py tests/test_transaction.py tests/test_preimage.py tests/test_htlc_spend.py $GAPS" ;;
     transaction) echo "tests/test_mutation_hardening.py tests/test_transaction.py tests/test_preimage.py tests/test_htlc_spend.py tests/test_glyph_transfer.py tests/test_ft_transfer.py tests/test_swap_partial.py tests/test_swap_resolve.py $GAPS tests/test_fuzz_parsers.py tests/test_preimage_differential.py" ;;
+    # `tests/test_no_duplicate_consensus_constants.py` is deliberately NOT here even
+    # though it is the densest fee-constant file in the suite. It greps SOURCE TEXT
+    # rather than calling anything, so a mutant that rewrites a line can trip it while
+    # changing no behaviour — a false kill, which is worse than a survivor because it
+    # reports coverage that does not exist. (It also costs 35s of the 9s list.)
+    builders)    echo "tests/test_mutation_hardening.py tests/test_wallet_fee_sizing.py tests/test_glyph_royalty.py tests/test_ft_airdrop.py tests/test_ft_transfer.py tests/test_glyph_ft_red_team.py tests/test_glyph_transfer.py tests/test_wallet.py tests/test_wallet_send_fee_control_offline.py tests/test_hd_wallet.py tests/test_swap_and_nft_fee_floors.py tests/test_builder_relay_fee_floors.py tests/test_remaining_builder_relay_fee_floors.py tests/test_htlc_spend_fee_floor.py tests/test_gravity_fee_policy.py tests/test_capped_fee_source.py tests/test_glyph_reveal_fees.py tests/test_false_consensus_premises.py $GAPS" ;;
     dmint)       echo "tests/test_mutation_hardening.py tests/test_dmint_module.py tests/test_glyph_dmint.py tests/test_dmint_v2_canonical.py tests/test_dmint_v2_daa_canonical.py tests/test_dmint_conformance_vectors.py tests/test_dmint_v2_mainnet_golden.py tests/test_dmint_daa_offchain_onchain_differential.py tests/test_dmint_v1_deploy.py tests/test_dmint_v1_mint.py tests/test_dmint_end_to_end.py tests/test_dmint_deploy_integration.py $GAPS tests/test_dmint_vector_derivations.py" ;;
   esac
 }
@@ -68,22 +85,28 @@ group_tests() {
 # mutant still gets a fair run while true hangs are bounded.
 group_timeout() {
   case "$1" in
-    spv)    echo "30.0" ;;
-    script) echo "30.0" ;;
-    *)      echo "45.0" ;;
+    spv)      echo "30.0" ;;
+    script)   echo "30.0" ;;
+    builders) echo "60.0" ;;  # clean list measured at 9.3s
+    *)        echo "45.0" ;;
   esac
 }
 
 GROUPS_REQUESTED="${*:-spv}"
-[ "$GROUPS_REQUESTED" = "all" ] && GROUPS_REQUESTED="spv script transaction dmint"
+[ "$GROUPS_REQUESTED" = "all" ] && GROUPS_REQUESTED="spv script transaction dmint builders"
 for g in $GROUPS_REQUESTED; do
-  group_files "$g" >/dev/null || { echo "unknown group: $g (use spv|script|transaction|dmint|all)"; exit 2; }
+  group_files "$g" >/dev/null || { echo "unknown group: $g (use spv|script|transaction|dmint|builders|all)"; exit 2; }
 done
 
 WORK="${MUTATION_SESSION_DIR:-$(mktemp -d)}"
 mkdir -p "$WORK"
 cleanup() {
   git checkout -- src/pyrxd/spv/ src/pyrxd/script/ src/pyrxd/transaction/ src/pyrxd/glyph/dmint/ 2>/dev/null
+  # The `builders` scope reaches outside those four directories, so restore its files
+  # by name. A missed entry here leaves a MUTANT in the tree, which is the one failure
+  # mode of this script that is worse than a bad score.
+  git checkout -- src/pyrxd/fee_sizing.py src/pyrxd/wallet.py src/pyrxd/hd/wallet.py \
+    src/pyrxd/glyph/ft.py src/pyrxd/glyph/royalty.py src/pyrxd/glyph/builder.py 2>/dev/null
   [ -z "${MUTATION_SESSION_DIR:-}" ] && rm -rf "$WORK"
 }
 trap cleanup EXIT
