@@ -6,6 +6,51 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.17.0] — 2026-08-11
+
+A security release, and the one where the tests got audited as hard as the code.
+
+**Upgrade if you use `glyph transfer-nft`, the RSWP orderbook, or credential-gated swaps.**
+Three of the fixes here are fund-safety: a CLI command that signed and broadcast transactions
+below Radiant's relay floor, two exported RSWP builders that took a fee entirely on trust, and
+a soulbound-credential gate an adversary could route around without ever calling it. Radiant
+has neither RBF nor CPFP, so a sub-floor transaction cannot be repaired — it holds its inputs
+until the 8-hour mempool expiry.
+
+The credential gate is the **third** instance of one pattern: a safety check placed where the
+honest caller passes through rather than where the state actually advances. The first two were
+the maker-side and taker-side counterparty-funding checks. All three now sit beside each other
+as preconditions for the state transition they protect.
+
+**The uncomfortable half of this release is about verification, not code.** A 97-agent
+adversarial audit — every finding re-run under three independent lenses — returned no
+fund-safety blocker, and its largest cluster was guards that shipped *correct* with nothing
+able to detect their removal. With six of them disabled simultaneously, the suite returned
+`8456 passed, 0 failures`, byte-identical to baseline. Sixteen golden-vector tests had skipped
+on every clean checkout since they were written, because their fixtures are gitignored — and
+correctly so, since they carry live mainnet keys. A sanitized fixture and a CI guard that fails
+on an undeclared skip close that; every new test here was proved by planting the defect and
+watching it go red.
+
+Consensus parity is now mechanical rather than diligent. Rules pyrxd re-implements are pinned
+to vendored, digest-checked Radiant Core sources that are **parsed** rather than transcribed,
+eight primitives implemented between two and nineteen times were single-sourced, and an AST
+sweep of 11,303 numeric literals found the four rules still hand-written. Where a value is the
+same by coincidence rather than by rule, it is left alone and pinned as must-not-flag.
+
+### Upgrade notes
+
+- **Fee floors are enforced at both ends.** Builders that previously accepted any fee now
+  refuse one below the relay floor, and warn above 10x the requirement. Legitimate sub-floor
+  cases (a lower-floor node, a trial sizing pass) take an explicit opt-out.
+- **`pyrxd regtest` now starts its node at mainnet's relay floor** (`-minrelaytxfee=0.10`)
+  rather than the regtest default of a tenth of it. A local chain that accepts what mainnet
+  refuses is worse than no local chain.
+- **Parsers reject input Radiant's consensus code rejects** — non-canonical CompactSize, an
+  over-declared push, a truncated input script. If you were relying on lenient parsing of
+  malformed bytes, that is now an explicit opt-in.
+- Several `# Keep in sync with` comments are gone, replaced by the derivation they described.
+
 ### Security
 
 - **`glyph transfer-nft` signed and broadcast transactions below Radiant's relay floor.**
