@@ -122,6 +122,22 @@ def _truncate_for_human(s: str, cap: int = _HUMAN_STRING_CAP) -> str:
     return s[: cap - 1] + "…"
 
 
+def _is_exact_timelock_script(hex_str: str) -> bool:
+    """Does *hex_str* parse as an exact CLTV / CSV P2PKH template?
+
+    The single disambiguator ``_classify_input`` is allowed to consult before
+    claiming a 64-hex string as a txid. Kept as its own named predicate so the
+    narrowness is auditable: it is the production parser, not a prefix test.
+    """
+    from ..script.timelock import parse_p2pkh_timelock_script
+
+    try:
+        script = bytes.fromhex(hex_str)
+    except ValueError:  # pragma: no cover — caller has already checked the alphabet
+        return False
+    return parse_p2pkh_timelock_script(script) is not None
+
+
 def _classify_input(s: str) -> tuple[str, str]:
     """Dispatch on input shape. Returns (form, normalised_value).
 
@@ -133,9 +149,31 @@ def _classify_input(s: str) -> tuple[str, str]:
       * contains ":" → outpoint (validated downstream)
       * 46–20_000 even-length hex → script
 
-    A bare 64-hex string is always treated as a txid even though it could
-    structurally also be a 32-byte payload-hash push prefix; the txid form
-    is the only one users hit in practice from a block explorer.
+    A bare 64-hex string is treated as a txid — that is what users paste from a
+    block explorer — with ONE exception, below.
+
+    The 64-hex collision
+    --------------------
+
+    A 32-byte locking script is also 64 hex, and one real shape lands exactly
+    there: an absolute time-lock whose deadline is a wall-clock time. Any CLTV
+    value in ``[LOCKTIME_THRESHOLD, 2**31)`` — every Unix deadline from 1985 to
+    2038 — encodes as a minimal 4-byte push, giving
+    ``05 bytes push + OP_CLTV + OP_DROP + 25-byte P2PKH tail = 32 bytes``. Those
+    are the wall-clock HTLC refund legs, so the shape the inspector most needs
+    to explain was the one shape it refused to look at: the CLI answered
+    "this looks like a txid (64 hex chars)" and ``--fetch`` would have sent the
+    script bytes to an ElectrumX server as a transaction id.
+
+    So a 64-hex string that parses as an EXACT time-lock template is claimed as
+    a script. The preference is deliberately narrow — ``parse_p2pkh_timelock_script``
+    is not a heuristic: it pins the 25-byte P2PKH tail (``76 a9 14 … 88 ac``),
+    the ``OP_DROP``, the CLTV/CSV opcode and a minimally-encoded value push, and
+    returns ``None`` on any near miss. That is 7 bytes at fixed offsets plus a
+    minimality check, so a real txid colliding with it is a ~2^-56 event, and it
+    would have to be a txid whose bytes are a spendable time-lock script.
+    Nothing wider is preferred: ``op_return`` would match any 64-hex string
+    beginning ``6a``, which is 1 txid in 256.
 
     Leading/trailing whitespace is stripped here (ergonomics — users paste
     from explorers and shells often add a newline). This is BEFORE the
@@ -151,7 +189,7 @@ def _classify_input(s: str) -> tuple[str, str]:
         return ("outpoint", s)
     lowered = s.lower()
     if len(lowered) == _TXID_HEX_LEN and all(c in "0123456789abcdef" for c in lowered):
-        return ("txid", lowered)
+        return ("script", lowered) if _is_exact_timelock_script(lowered) else ("txid", lowered)
     if len(lowered) == _CONTRACT_HEX_LEN and all(c in "0123456789abcdef" for c in lowered):
         return ("contract", lowered)
     if (
@@ -212,7 +250,8 @@ def _inspect_outpoint(s: str) -> dict:
 
 
 def _ref_summary(script: bytes) -> dict:
-    """The OP_PUSHINPUTREF-family refs an unrecognised script carries.
+    """The OP_PUSHINPUTREF-family refs an unrecognised script carries — and,
+    separately, the ones it merely names.
 
     Attached to ``type: "unknown"`` results so a shape the classifier cannot
     name is still not a black box: the one fact that matters most about an
@@ -220,27 +259,57 @@ def _ref_summary(script: bytes) -> dict:
     ref-carrying UTXO fed into a wallet as plain funding gets burned as a fee
     input (docs/solutions/logic-errors/funding-utxo-byte-scan-dos.md).
 
+    WALK the whole operand family, COLLECT only the push half. The walk must
+    see all five operand-carrying opcodes or the program counter desynchronises
+    (that is the bug :data:`pyrxd.glyph.script.REF_OPCODES` documents at
+    length), but "does this output hold a token?" is answered by
+    ``foundPushRefs`` alone — ``CScript::GetPushRefs``
+    (``tests/vendor/radiant_core/script.cpp:586-607``) files 0xd0
+    ``OP_PUSHINPUTREF`` and 0xd8 ``OP_PUSHINPUTREFSINGLETON`` there and files
+    0xd1 / 0xd2 / 0xd3 into the *required* and *disallowed-sibling* sets
+    instead. Those three are gates, not carriers: a covenant that
+    ``OP_REQUIREINPUTREF``\\ s a credential (the idiom at
+    :mod:`pyrxd.glyph.soulbound_covenant`) demands the ref be live somewhere in
+    the spending transaction's inputs — it does not hold it, and spending such
+    an output destroys nothing. Counting it as token-bearing turned every
+    credential gate into a fake burn warning, which is the way to teach a
+    reader to ignore the real one.
+
+    Reported under ``referenced_refs`` rather than dropped: "this script names
+    ref X" is true and useful, it is just not "this output holds ref X".
+
+    Note the deliberate asymmetry with
+    :func:`pyrxd.glyph.dmint.chain.is_token_bearing_script`, which keeps
+    counting the whole family. That one decides whether a UTXO may be spent as
+    a **fee input**, where over-refusing is free and under-refusing burns a
+    token; this one *describes* a script to a reader, where a false positive
+    costs credibility. Different question, different safe direction.
+
     Uses the shared consensus walk, so a ref byte sitting inside push-data is
     never counted. A script that will not decode reports
     ``token_bearing: null`` — unknown, not ``false`` — because a walk that
     cannot finish has not proven the absence of anything.
     """
+    from ..constants import PUSH_REF_OPCODES
     from .script import TruncatedScriptError, iter_input_refs
     from .types import GlyphRef
 
     try:
         refs = list(iter_input_refs(script))
     except TruncatedScriptError:
-        return {"token_bearing": None, "input_refs": []}  # nosec B105 — a Glyph token, not a credential
-    rows = []
+        # B105 reads the "token" in the key name as a credential. It is a Glyph token.
+        return {"token_bearing": None, "input_refs": [], "referenced_refs": []}  # nosec B105
+    carried: list[dict] = []
+    named: list[dict] = []
     for opcode, operand in refs:
         try:
             ref = GlyphRef.from_bytes(operand)
             outpoint = f"{ref.txid}:{ref.vout}"
         except ValidationError:  # pragma: no cover — 36 bytes always decode
             outpoint = ""
-        rows.append({"opcode": f"0x{opcode:02x}", "ref_outpoint": outpoint})
-    return {"token_bearing": bool(rows), "input_refs": rows}
+        row = {"opcode": f"0x{opcode:02x}", "ref_outpoint": outpoint}
+        (carried if opcode in PUSH_REF_OPCODES else named).append(row)
+    return {"token_bearing": bool(carried), "input_refs": carried, "referenced_refs": named}  # nosec B105
 
 
 def _inspect_script(script_hex: str) -> dict:
@@ -384,6 +453,26 @@ def _inspect_script(script_hex: str) -> dict:
         }
         if timelock.kind == "csv":
             row["relative_lock_disabled"] = timelock.relative_lock_disabled
+        else:
+            # The encoded CLTV value is the floor on the SPENDING TX's
+            # nLockTime, not a height at which the output becomes spendable —
+            # those differ by one and the difference is the whole answer to
+            # "when can I spend this?".  ``IsFinalTx``
+            # (Radiant-Core src/consensus/tx_verify.cpp at the vendored pin
+            # 45e0aa4 / v3.1.2) returns final only when
+            # ``lockTime < lockTimeLimit``, where ``lockTimeLimit`` is the
+            # height (or time) of the block CONTAINING the spend — see
+            # ``ContextualCheckTransactionForCurrentBlock``
+            # (tests/vendor/radiant_core/validation.cpp:3969-3975) for the
+            # "height of the block *being* evaluated" convention.  Strictly
+            # greater, so the first block that can carry the spend is
+            # ``units + 1``.
+            #
+            # Derived HERE, on the Python side, so the CLI, the --json output
+            # and the browser renderer cannot disagree about it: the browser
+            # inspect tool is a pure renderer by design and must never
+            # re-derive a consensus fact of its own.
+            row["locktime_earliest"] = timelock.units + 1
         return row
 
     # dMint contract is variable-length and parser-only. It MUST be tried
@@ -469,8 +558,17 @@ def _classify_self_replicating(script: bytes, base: dict) -> dict:
     if detected.transferability is Transferability.SOULBOUND_COVENANT:
         row = {
             **base,
+            # NO ``transferability`` key on this tier, deliberately. The whole
+            # point of the two-tier split is to withhold the soulbound claim
+            # from a marker-only match — and ``transferability:
+            # "soulbound_covenant"`` IS that claim, stated in the one field a
+            # machine consumer reads. The caveat lives in ``note``, which no
+            # machine consumer reads. A JSON reader that keys on
+            # ``transferability`` now sees the key absent for this tier and
+            # gets no verdict at all, which is the honest answer; the markers
+            # it *is* entitled to are ``has_self_replication`` /
+            # ``has_burn_branch`` right below.
             "type": "self-replicating-covenant",
-            "transferability": detected.transferability.value,
             "has_self_replication": detected.has_self_replication,
             "has_burn_branch": detected.has_burn_branch,
             "note": (

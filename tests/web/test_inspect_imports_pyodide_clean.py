@@ -54,6 +54,35 @@ def _clear_relevant_modules() -> None:
             sys.modules.pop(name)
 
 
+@pytest.fixture(autouse=True)
+def _restore_module_table():
+    """Put ``sys.modules`` back exactly as it was found, after every test here.
+
+    These tests measure a COLD import graph, so they must evict every
+    ``pyrxd.*`` entry first. Without a restore that eviction leaks into whatever
+    runs next **in the same process**: a module that already did
+    ``from pyrxd.security.errors import ValidationError`` keeps a reference to
+    the OLD class, while the lazy ``from .dmint import DmintState`` inside
+    ``_inspect_script`` re-imports and raises the FRESH one — so
+    ``except ValidationError`` stops catching the exception it was written for
+    and a classifier that returns ``self-replicating-covenant`` starts raising
+    instead.
+
+    Alphabetical collection hides this today (``tests/web`` sorts after every
+    ``tests/test_*.py``), which is a property of the file name, not a guarantee.
+    Running ``pytest tests/web tests/test_inspect_script_shapes.py`` by hand
+    reddened 47 unrelated tests before this fixture existed.
+    """
+    snapshot = dict(sys.modules)
+    try:
+        yield
+    finally:
+        for name in list(sys.modules):
+            if name not in snapshot:
+                del sys.modules[name]
+        sys.modules.update(snapshot)
+
+
 @pytest.fixture
 def heavy_dep_tracker():
     """Yield a list that gets every heavy-dep import attempt

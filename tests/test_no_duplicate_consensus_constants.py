@@ -467,14 +467,43 @@ def contiguous_ref_range_tests(source: str) -> list[str]:
     return offenders
 
 
+#: The operand width as a walker NAMES it rather than types it. Importing the shared
+#: constant is the right thing to do and is not itself the defect — but advancing a
+#: cursor by it, in a file that names a ref opcode byte, is still a hand-rolled walk,
+#: and the registry check has to see it. The detector used to look only for the bare
+#: integers, which is how ``glyph/soulbound_detect.py``'s pre-consolidation walker
+#: (``pos += 1 + REF_OPERAND_WIDTH``) sat unregistered without ever tripping it.
+_WIDTH_NAMES = frozenset({"REF_OPERAND_WIDTH", "_REF_OPERAND_WIDTH"})
+
+
+def _is_walk_stride(node: ast.AST) -> str | None:
+    """Describe *node* if it is a ref-walk stride — the literal or the named width."""
+    if isinstance(node, ast.Constant) and node.value in _WALK_STRIDES:
+        return str(node.value)
+    if isinstance(node, ast.Name) and node.id in _WIDTH_NAMES:
+        return node.id
+    if isinstance(node, ast.Attribute) and node.attr in _WIDTH_NAMES:
+        return node.attr
+    return None
+
+
 def ref_walk_strides(source: str) -> list[str]:
-    """Walk-stride fingerprints (``+= 36`` / ``+= 37`` / ``x + 37``) in a ref-aware file.
+    """Walk-stride fingerprints (``+= 36`` / ``+= 37`` / ``x + REF_OPERAND_WIDTH``) in a
+    ref-aware file.
 
     The stride alone is not evidence — ``spv/proof.py`` and ``gravity/trade.py`` step
     over 36-byte outpoints and merkle nodes and have nothing to do with refs. The
     fingerprint is a stride **in a file that also names a ref opcode byte**, which is
     what a hand-rolled walker looks like and what the shared-constant users no longer
     look like.
+
+    Both spellings of the stride count — the bare ``36`` / ``37`` and the imported
+    ``REF_OPERAND_WIDTH``. Only the first was checked until it was measured that
+    ``ref_walk_strides`` returned ``[]`` for the pre-consolidation
+    ``glyph/soulbound_detect.py``, whose walk advanced by ``1 + REF_OPERAND_WIDTH``.
+    That file was cited as a module the registry check would put back if it ever
+    hand-rolled a walk again; it would not have. Sweeping ``src/`` with the widened
+    detector flags exactly one file, ``glyph/script.py``, which is registered.
     """
     tree = _parse(source)
     if not _hex_ref_opcodes(tree, source):
@@ -482,12 +511,14 @@ def ref_walk_strides(source: str) -> list[str]:
     offenders: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Add):
-            if isinstance(node.value, ast.Constant) and node.value.value in _WALK_STRIDES:
-                offenders.append(f"line {node.lineno}: += {node.value.value}")
+            described = _is_walk_stride(node.value)
+            if described is not None:
+                offenders.append(f"line {node.lineno}: += {described}")
         elif isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
             for side in (node.left, node.right):
-                if isinstance(side, ast.Constant) and side.value in _WALK_STRIDES:
-                    offenders.append(f"line {node.lineno}: + {side.value}")
+                described = _is_walk_stride(side)
+                if described is not None:
+                    offenders.append(f"line {node.lineno}: + {described}")
                     break
     return offenders
 
@@ -542,8 +573,23 @@ class TestNoRespelledRefOperandSet:
 # ``script/consensus.py``'s ``get_script_op`` (the ``GetScriptOp``
 # transcription). Registering a module that does not walk would demand it
 # import a constant it has no use for, which is the opposite of the rule this
-# file exists to enforce. If it ever hand-rolls a walk again,
-# test_walker_registry_is_complete puts it straight back.
+# file exists to enforce.
+#
+# This comment used to end "if it ever hand-rolls a walk again,
+# test_walker_registry_is_complete puts it straight back." That was measured and
+# was FALSE: the pre-consolidation walker advanced by ``1 + REF_OPERAND_WIDTH``,
+# and ``ref_walk_strides`` only looked for the bare literals ``36`` / ``37``, so
+# it returned ``[]`` for that file — copying it back into the tree passed all 46
+# walker/respell tests here. ``ref_walk_strides`` now also counts the NAMED width
+# (see ``_WIDTH_NAMES``), which makes the sentence true: the old file trips it,
+# the current one does not, and sweeping ``src/`` flags nothing unregistered.
+#
+# The regression itself was never unguarded, whatever this comment claimed —
+# ``tests/test_ref_walker_differential.py::TestTruncation::
+# test_soulbound_opcodes_refuses_a_truncated_ref`` fails 5 ways on the old file,
+# because the hand-rolled walk returned a silent prefix where the shared walk
+# raises ``TruncatedScriptError``. That is the backstop with teeth; the registry
+# check is the one that says "and register it".
 _REF_WALKERS = {
     "transaction/transaction_preimage.py",
     "glyph/script.py",
@@ -1231,6 +1277,29 @@ def walk(script):
 """
 
 
+#: The shape ``ref_walk_strides`` used to miss: a hand-rolled walk that imports the
+#: shared width instead of typing ``36``. Verbatim from ``glyph/soulbound_detect.py``
+#: before the consolidation (commit ac2fa13^), minus the unrelated branches.
+_NAMED_WIDTH_WALKER = """
+from ..constants import REF_OPERAND_WIDTH
+
+REF_OPCODES = frozenset({0xD0, 0xD1, 0xD2, 0xD3, 0xD8})
+
+
+def _opcodes(script):
+    ops = []
+    pos, n = 0, len(script)
+    while pos < n:
+        op = script[pos]
+        ops.append(op)
+        if op in REF_OPCODES:
+            pos += 1 + REF_OPERAND_WIDTH
+            continue
+        pos += 1
+    return ops
+"""
+
+
 def _any_detector_fires(source: str) -> list[str]:
     return respelled_ref_collections(source) + contiguous_ref_range_tests(source) + ref_walk_strides(source)
 
@@ -1252,6 +1321,25 @@ class TestTheGuardCatchesTheBugsThatMotivatedIt:
         """Both of its evasions are closed, and each independently."""
         assert respelled_ref_collections(_UNREGISTERED_WALKER), "the 2-opcode tuple must be flagged"
         assert ref_walk_strides(_UNREGISTERED_WALKER), "the 36-byte stride must be flagged"
+
+    def test_a_walk_that_imports_the_width_is_still_a_walk(self):
+        """The evasion this file's own comment claimed was covered and was not.
+
+        A hand-rolled walker that advances by the IMPORTED ``REF_OPERAND_WIDTH``
+        passes every "did you respell the constant?" check by construction — it
+        respelled nothing. It is still a sixth transcription of the walk, and
+        ``glyph/soulbound_detect.py`` sat unregistered in exactly this shape
+        while the comment above ``_REF_WALKERS`` asserted the registry check
+        would catch it. Measured: it returned no offenders at all.
+        """
+        assert ref_walk_strides(_NAMED_WIDTH_WALKER), (
+            "a walk that advances by the imported REF_OPERAND_WIDTH must be flagged — "
+            "importing the constant is right, but stepping a cursor by it in a file that "
+            "names a ref opcode is still a hand-rolled walk that has to be registered"
+        )
+        # …and the projection that replaced it must NOT be flagged, or the
+        # detector just bans the correct fix.
+        assert not ref_walk_strides((SRC_ROOT / "glyph" / "soulbound_detect.py").read_text(encoding="utf-8"))
 
     def test_the_original_bugs_own_spelling_is_caught(self):
         """``frozenset(range(0xD0, 0xD9))`` — the literal source of the whole incident.
