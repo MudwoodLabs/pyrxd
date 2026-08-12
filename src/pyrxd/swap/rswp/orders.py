@@ -84,6 +84,44 @@ def _pushed_token_id(asset: Asset) -> bytes:
     return tid if tid == RXD_TOKEN_ID else tid[::-1]
 
 
+def _assert_relayable(tx: Transaction, fee: int, policy: DeadlineFeePolicy | None, what: str) -> None:
+    """Refuse to return a v2 transaction the node will reject as ``min relay fee not met``.
+
+    ONE gate for every builder in this module, the shape ``rswp/covenant.py`` already
+    uses for v3 (:func:`pyrxd.swap.rswp.covenant._assert_relayable`). The v2 side used to
+    have the rule spelled once inline on ``build_cancel_tx`` and simply absent from its
+    two siblings; a fee rule with one copy per call site is how this repo's measured
+    defects have started.
+
+    Sized from the **signed** bytes, after the last ``sign()``: a DER signature is 69-71
+    bytes run to run, so a size taken before signing is an estimate, and an estimate one
+    byte short is a fee under the floor. Measured against ``GetTotalSize()``
+    (:func:`~pyrxd.fee_sizing.radiant_relay_size`) because that — not vsize — is what
+    Radiant's ``AcceptToMemoryPool`` charges the floor against.
+
+    Why refusing beats returning, on every builder here and not just ``cancel``: Radiant
+    has neither RBF nor CPFP, so a sub-floor transaction cannot be replaced or bumped by
+    a child. On a node that relays below the reference floor it enters *that* mempool
+    without propagating and squats on the caller's own funding UTXO until mempool expiry,
+    8 hours later. An aborted build costs nothing by comparison.
+
+    ``policy`` defaults to :data:`~pyrxd.gravity.fee_policy.DEFAULT_RADIANT_DEADLINE_FEE_POLICY`
+    (the reference mainnet node's 0.10 RXD/kB effective rate). Callers that legitimately
+    run lower pass their own: a regtest node advertises a tenth of it, and
+    :func:`~pyrxd.cli.swap_book_cmds._build_at_measured_fee` runs *deliberately* sub-floor
+    trial passes to measure a size it cannot model, then rebuilds at the real fee (its
+    final transaction is gated by that module's own ``_assert_relayable``).
+    """
+    assert_fee_covers(
+        fee_value=fee,
+        size_bytes=radiant_relay_size(tx.serialize()),
+        policy=policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
+        blocks_to_deadline=None,
+        what=what,
+        unit="photons",
+    )
+
+
 @dataclass(frozen=True)
 class RswpOrderPost:
     """A maker's ready-to-advertise order: the signed offer plus its RSWP OP_RETURN script.
@@ -145,6 +183,7 @@ def prepare_offered_utxo(
     owner_pkh: bytes | Hex20,
     change_pkh: bytes | Hex20,
     fee: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """Exact-amount self-send minting the clean UTXO an offer requires, at output 0.
 
@@ -153,13 +192,22 @@ def prepare_offered_utxo(
     exact-amount UTXOs. Token conservation and change are handled as in
     :func:`pyrxd.swap.partial.accept_offer`.
 
-    **No relay-floor guard, deliberately** — for the reason set out at length in
-    :func:`build_advert_tx`. This is a self-send: if it does not relay, the
-    maker's asset simply stays in the UTXO it is already in, the offered UTXO the
-    order needs is never minted, and the failure surfaces at broadcast. Nothing is
-    reported as done, and no counterparty is relying on it. Contrast
-    :func:`build_cancel_tx`, which is guarded because an unrelayable revocation is
-    reported as a successful one.
+    Relay-floor gated (:func:`_assert_relayable`), like its direct v3 analog
+    :func:`pyrxd.swap.rswp.covenant.prepare_covenant_offer`. This previously carried a
+    note saying the gap was deliberate — that "failing loudly at broadcast IS the
+    report" — and that reasoning does not survive contact with what this builder returns:
+    a **fully signed transaction and a txid**, from public SDK surface
+    (``pyrxd.swap.rswp``) with no CLI caller in front of it to re-check anything. There
+    is no downstream guard on any broadcast path in ``pyrxd.network``. Refusing here
+    costs an aborted build; the alternative costs the maker's own funding UTXO for up to
+    8 hours on a node that relays below the reference floor, because Radiant has neither
+    RBF nor CPFP.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee`` is below the node's min-relay floor for the transaction's real,
+        signed size.
     """
     tx = Transaction()
     for f in funding:
@@ -176,6 +224,7 @@ def prepare_offered_utxo(
     tx.add_output(_build_asset_output(asset, bytes(owner_pkh)))
     _balance_and_add_change(tx, bytes(change_pkh), fee)
     tx.sign(bypass=True)
+    _assert_relayable(tx, fee, fee_policy, "RSWP offered-UTXO split (prepare_offered_utxo)")
     return tx
 
 
@@ -185,37 +234,44 @@ def build_advert_tx(
     funding: list[FundingInput],
     change_pkh: bytes | Hex20,
     fee: int,
+    fee_policy: DeadlineFeePolicy | None = None,
 ) -> Transaction:
     """Wrap an advertisement script in an ordinary funded transaction (advert at output 0, value 0).
 
     Funding must be plain RXD (P2PKH) — an FT funding input would strand token
     value in the fee/change math of a transaction that has no token outputs.
 
-    **No relay-floor guard, deliberately** — do not read the gap as an oversight.
-    The floor sweep that guarded :func:`build_cancel_tx` (and the twelve other
-    builders) skipped this one on purpose, and the asymmetry is the point:
+    Relay-floor gated (:func:`_assert_relayable`). This carried a note saying the gap was
+    deliberate, on the argument that "an advert that does not relay is an order that
+    never appears" and the loud failure at broadcast IS the report. Two things are wrong
+    with that as a reason to skip the gate, and neither is about the advert's importance:
 
-    * An advert that does not relay is **an order that never appears**. Nothing
-      is reported as having succeeded, no counterparty can act on it, and the
-      maker sees the failure at broadcast — the node rejects it outright with
-      "min relay fee not met". The loud, immediate failure IS the report.
-    * An unrelayable :func:`build_cancel_tx` is the opposite shape: cancel is the
-      only hard revocation in v2, so a caller handed a cancel tx and a txid has
-      been told the order is revoked while every copy of the signed advertisement
-      stays fillable at the original price. That divergence between reported and
-      actual state is why it is guarded and this is not.
+    * The failure is only loud if a node is reached. This returns a **signed transaction
+      and a txid** to public SDK surface, and there is no relay-floor check on any
+      broadcast path in ``pyrxd.network`` — so the caller holds an artifact that looks
+      exactly like a posted order until something else disagrees.
+    * The residual the note itself recorded is the actual cost, and it is not zero: on a
+      node relaying below the reference floor the under-fee'd advert enters *that*
+      mempool without propagating and holds the caller's own RXD funding UTXO until
+      mempool expiry, 8 hours later, with no RBF and no CPFP to shorten it.
 
-    Nor is an asset ever at risk here: this transaction spends **plain RXD only**
-    (enforced below) and never the offered UTXO, whose advertisement it merely
-    carries at output 0 with value 0. The advert is a discovery artifact — a
-    taker who already saw the order can still complete the trade against the
-    offered UTXO if the advert never confirms.
+    What remains true from that note is the *severity* ordering, not the conclusion: an
+    unrelayable :func:`build_cancel_tx` is worse, because cancel is the only hard
+    revocation in v2 and the caller is told the order is revoked while every copy of the
+    signed advertisement stays fillable. Both are now gated; the ordering just decides
+    which one would have been fixed first.
 
-    The residual, stated plainly: on a node that relays below the reference floor
-    the under-fee'd advert can enter *that* mempool without propagating, holding
-    the caller's own RXD funding UTXO until mempool expiry, 8 hours later. That
-    is an availability cost on the caller's own change, not a loss and not a
-    counterparty risk — which is why it does not buy a guard here.
+    ``fee_policy`` is the escape hatch that keeps this from refusing legitimate work: the
+    CLI's ``swap post`` measures a size it cannot model by building deliberately
+    sub-floor trial passes and re-feeing from the real bytes, so it passes
+    ``_SIZING_TRIAL_POLICY`` on the trial builds and gates the transaction it actually
+    returns. A regtest node relaying at a tenth of the reference rate passes its own.
+
+    Raises
+    ------
+    ~pyrxd.security.errors.InsufficientFundsError
+        If ``fee`` is below the node's min-relay floor for the transaction's real,
+        signed size.
     """
     if not funding:
         raise ValidationError("at least one funding input is required")
@@ -245,6 +301,7 @@ def build_advert_tx(
     if change >= _DUST_PHOTONS:
         tx.add_output(TransactionOutput(P2PKH().lock(bytes(change_pkh)), change))
     tx.sign(bypass=True)
+    _assert_relayable(tx, fee, fee_policy, "RSWP order advert tx (build_advert_tx)")
     return tx
 
 
@@ -463,15 +520,10 @@ def build_cancel_tx(
     if not tx.outputs:
         raise ValidationError("cancel would produce no outputs — offered value does not cover the fee")
     tx.sign(bypass=True)
-    # Post-SIGNING relay-floor gate. After `sign`, not before: the requirement is
-    # ceil(size x rate / 1000) and the size is only knowable once the DER signatures are
-    # in the scriptSigs — 69-71 bytes each, run to run.
-    assert_fee_covers(
-        fee_value=fee,
-        size_bytes=radiant_relay_size(tx.serialize()),
-        policy=fee_policy or DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
-        blocks_to_deadline=None,
-        what="RSWP order cancel tx (the only hard revocation — an unrelayable one leaves the order takeable)",
-        unit="photons",
+    _assert_relayable(
+        tx,
+        fee,
+        fee_policy,
+        "RSWP order cancel tx (the only hard revocation — an unrelayable one leaves the order takeable)",
     )
     return tx

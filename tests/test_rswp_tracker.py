@@ -146,6 +146,7 @@ def _post_offer(src: Transaction, maker_key, receive: Asset, maker_pkh: bytes):
         funding=[FundingInput(_rxd_src(maker_pkh, 5000), 0, maker_key)],
         change_pkh=maker_pkh,
         fee=400,
+        fee_policy=_TOY_FEE_POLICY,
     )
     return post, order, advert_tx
 

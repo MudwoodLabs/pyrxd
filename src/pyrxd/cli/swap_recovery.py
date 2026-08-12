@@ -91,6 +91,8 @@ from pyrxd.btc_wallet.taproot import (
     scrape_secret,
 )
 from pyrxd.eth_wallet.secret import recover_secret
+from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE as MAX_FEE_OVERPAY_MULTIPLE  # re-export
+from pyrxd.fee_sizing import fee_overpay_ceiling, fee_overpay_multiple
 from pyrxd.gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy
 from pyrxd.gravity.htlc_covenant import (
     HtlcCovenant,
@@ -994,25 +996,16 @@ async def read_fee_utxos(client: Any, wif: str) -> list[Any]:
     return list(await client.get_utxos(electrumx_script_hash(fee_scriptpubkey(wif))))
 
 
-#: How many times the fee requirement a single input may exceed before it is treated as a
-#: mistake rather than a choice. The covenant permits ONE output, so there is no change and the
-#: ENTIRE input becomes the miner fee — an operator who points the cold toolkit at an ordinary
-#: funded key (one 500 RXD UTXO) was burning ~18,700x the ~2.66M-photon requirement while the
-#: CLI reported that the fee "clears the deadline-aware TARGET" (audit B4). 10x leaves generous
-#: headroom for a deadline-critical spend and still catches a whole-wallet UTXO by three orders
-#: of magnitude. It is a MULTIPLE, not an absolute: a genuinely large requirement scales with it.
-MAX_FEE_OVERPAY_MULTIPLE: int = 10
-
-
-def fee_overpay_ceiling(*, floor: int, target: int) -> int:
-    """The largest fee input the cold path will burn without an explicit ``--allow-overpay``."""
-    return max(int(floor), int(target)) * MAX_FEE_OVERPAY_MULTIPLE
-
-
-def fee_overpay_multiple(fee_photons: int, *, floor: int, target: int) -> float:
-    """How many times the fee requirement this input actually pays (>= 1.0 is normal)."""
-    requirement = max(int(floor), int(target), 1)
-    return int(fee_photons) / requirement
+# The overpay bound (`MAX_FEE_OVERPAY_MULTIPLE`, `fee_overpay_ceiling`,
+# `fee_overpay_multiple`) is defined ONCE, in `pyrxd.fee_sizing`, and imported at the
+# top of this module. It started life here, but a rule only the CLI could reach is a
+# rule the BUILDERS could not: `gravity.htlc_spend` has the same
+# single-output/whole-input-is-the-fee shape and cannot import a `pyrxd.cli` module to
+# find the number. It now warns on the same ceiling this path refuses on — see
+# `MAX_FEE_OVERPAY_MULTIPLE`'s own note for why those two responses differ.
+#
+# `fee_overpay_ceiling` is what the cold path will burn without an explicit
+# `--allow-overpay`.
 
 
 def select_fee_utxo(
@@ -1032,11 +1025,17 @@ def select_fee_utxo(
     :func:`~pyrxd.gravity.fee_policy.assert_fee_covers`).
 
     Both ends are bounded. Below the floor the node rejects outright; ABOVE
-    :func:`fee_overpay_ceiling` the input is refused as an overpay (audit B4) — the
-    dust-floor check in :func:`pyrxd.gravity.htlc_spend._check_carrier` claims to guard "a
-    mistakenly-huge UTXO" but only ever checked the small end. ``allow_overpay=True`` is the
-    deliberate override, and it applies to an explicitly named ``--fee-utxo`` too: naming a
-    UTXO by hand is not consent to burn 500 RXD on a 0.0266 RXD fee.
+    :func:`~pyrxd.fee_sizing.fee_overpay_ceiling` the input is refused as an overpay
+    (audit B4) — :func:`pyrxd.gravity.htlc_spend._check_carrier`'s dust check claimed to
+    guard "a mistakenly-huge UTXO" and only ever checked the small end.
+    ``allow_overpay=True`` is the deliberate override, and it applies to an explicitly
+    named ``--fee-utxo`` too: naming a UTXO by hand is not consent to burn 500 RXD on a
+    0.0266 RXD fee.
+
+    The builders now bound the same end on the same ceiling, but they WARN where this
+    REFUSES (:func:`pyrxd.gravity.htlc_spend._warn_if_fee_is_an_overpay`). Deliberate: here
+    an operator is present and ``--allow-overpay`` is one flag away, while an autonomous
+    claim executor racing a CSV refund would lose the asset outright if the build failed.
     """
     ceiling = fee_overpay_ceiling(floor=floor, target=target)
 

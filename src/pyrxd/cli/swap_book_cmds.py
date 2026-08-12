@@ -642,7 +642,14 @@ def swap_post_cmd(ctx: CliContext, give_outpoint: str, receive_spec: str, fee_ov
                 fee_override,
                 select_funding=lambda f: _rxd_funding(client, funds, f, exclude=(give_txid, give_vout)),
                 build=lambda funding, f: build_advert_tx(
-                    advert_script=post.advert_script, funding=funding, change_pkh=funds.change_pkh(), fee=f
+                    advert_script=post.advert_script,
+                    funding=funding,
+                    change_pkh=funds.change_pkh(),
+                    fee=f,
+                    # Trial builds are deliberately sub-floor; `_assert_relayable`
+                    # gates the transaction that is actually returned. See
+                    # `_SIZING_TRIAL_POLICY`.
+                    fee_policy=_SIZING_TRIAL_POLICY,
                 ),
                 seed_inputs=1,
                 seed_outputs=2,

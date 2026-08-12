@@ -15,9 +15,13 @@ than silently.
 from __future__ import annotations
 
 import hashlib
+import logging
+import os
+import secrets
 
 import pytest
 
+from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE
 from pyrxd.gravity.fee_policy import (
     DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
     DeadlineFeePolicy,
@@ -52,6 +56,11 @@ _OUTPOINT = "cd" * 32 + ":0"
 # production it can only come from a lying or misconfigured node (security review).
 # Opting out here is exactly the deliberate, greppable act the flag exists for.
 _NEGLIGIBLE_RATE = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
+
+
+def _rand_below(n: int) -> int:
+    """A uniform draw in ``[0, n)`` from the OS CSPRNG — no seeded/global RNG state."""
+    return secrets.randbelow(n)
 
 
 def _fee(value: int) -> FeeInput:
@@ -339,3 +348,149 @@ def test_an_explicit_low_rate_policy_is_the_documented_escape_hatch():
         fee_policy=_NEGLIGIBLE_RATE,
     )
     assert len(tx.outputs) == 1
+
+
+# ------------------------------------------------------- the OTHER end of the rule
+
+
+class TestTheFeeInputHasAnUpperBoundToo:
+    """FO-2. A guard that only checks the lower bound is half a guard.
+
+    ``_check_carrier``'s comment promised a guard against "a mistakenly-huge UTXO or a
+    sub-dust one" and only the sub-dust half existed. The covenant enforces exactly one
+    output, so there is no change and the **whole fee input is paid to the miner** —
+    "choosing the fee" here means choosing which UTXO to burn. Reproduced on this
+    builder before the fix, a real RXD HTLC claim with a 500 RXD fee input::
+
+        built OK: 266 bytes, 1 output(s)
+        fee actually paid: 50000000000 photons (500.00 RXD)
+        relay floor for 266 bytes: 2660000 photons
+        OVERPAY MULTIPLE: 18797x            -> no exception, no warning, no log line
+
+    The same shape burned 500 RXD through the cold-recovery toolkit (audit B4), which
+    is where the 10x ceiling came from. WARN, never raise: refusing a spend the node
+    would have accepted forfeits the asset to the counterparty's CSV refund
+    (``docs/threat-model.md`` S21), and that is strictly worse than an overpaid fee.
+    """
+
+    #: Draws per property case. Every draw is a fresh key, a fresh hashlock, a fresh
+    #: covenant and a fresh outpoint, so each build signs a different message and the
+    #: DER length (69-71 bytes) moves the measured size the ceiling is derived from.
+    ROUNDS = 25
+
+    @staticmethod
+    def _fresh_fee(value: int) -> FeeInput:
+        key = PrivateKey()
+        pkh = bytes(Hex20(key.public_key().hash160()))
+        return FeeInput(
+            txid=os.urandom(32).hex(),
+            vout=0,
+            value=value,
+            scriptpubkey=b"\x76\xa9\x14" + pkh + b"\x88\xac",
+            wif=key.wif(),
+        )
+
+    @classmethod
+    def _fresh_claim(cls, value: int):
+        """A genuinely fresh RXD HTLC claim. Returns ``(tx, floor, multiple)``."""
+        preimage = os.urandom(32)
+        cov = build_htlc_covenant_rxd(
+            amount=100_000,
+            taker_pkh=os.urandom(20),
+            maker_pkh=os.urandom(20),
+            hashlock=hashlib.sha256(preimage).digest(),
+            refund_csv=6,
+        )
+        tx = build_htlc_claim_tx(
+            covenant=cov,
+            covenant_outpoint=os.urandom(32).hex() + ":0",
+            carrier_value=100_000,
+            preimage=preimage,
+            fee=cls._fresh_fee(value),
+        )
+        floor = DEFAULT_RADIANT_DEADLINE_FEE_POLICY.min_relay_fee(len(tx.serialize()))
+        return tx, floor, value / floor
+
+    def test_a_500_rxd_fee_input_is_warned_about_and_still_built(self, caplog) -> None:
+        """The verbatim reproduction, and both halves of the decision in one case."""
+        with caplog.at_level(logging.WARNING, logger="pyrxd.gravity.htlc_spend"):
+            tx, floor, multiple = self._fresh_claim(50_000_000_000)  # 500 RXD
+        assert multiple > 18_000, multiple
+        assert len(tx.outputs) == 1, "the build still succeeds — refusing would forfeit the asset"
+        assert tx.get_fee() == 50_000_000_000
+        text = caplog.text
+        assert "ENTIRE input is paid to the miner" in text, text
+        assert str(floor) in text, text
+        # The multiple is REPORTED, not pinned to one digit string: the spend is 265-267
+        # bytes depending on the DER length, so 500 RXD is 18,727x-18,797x of it. A test
+        # that pinned "18797x" would pass on one signature and fail on the next.
+        assert f"{multiple:.0f}x" in text, text
+        assert "50000000000 photons" in text, text
+
+    def test_the_refund_path_is_bounded_too(self, caplog) -> None:
+        """``build_htlc_refund_tx`` reaches the same gate — it is the maker's exit."""
+        preimage = os.urandom(32)
+        cov = build_htlc_covenant_rxd(
+            amount=100_000,
+            taker_pkh=os.urandom(20),
+            maker_pkh=os.urandom(20),
+            hashlock=hashlib.sha256(preimage).digest(),
+            refund_csv=6,
+        )
+        with caplog.at_level(logging.WARNING, logger="pyrxd.gravity.htlc_spend"):
+            tx = build_htlc_refund_tx(
+                covenant=cov,
+                covenant_outpoint=os.urandom(32).hex() + ":0",
+                carrier_value=100_000,
+                fee=self._fresh_fee(50_000_000_000),
+            )
+        assert len(tx.outputs) == 1
+        assert "HTLC covenant refund" in caplog.text, caplog.text
+
+    def test_a_normal_fee_is_silent_over_fresh_keys(self, caplog) -> None:
+        """The half that matters as much: an ordinary fee must not page anyone.
+
+        A warning that fires on routine work is a warning nobody reads, and the next
+        real 500 RXD burn goes past it. Swept at 1x-10x the floor over fresh keys.
+        """
+        for _ in range(self.ROUNDS):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="pyrxd.gravity.htlc_spend"):
+                _tx, _floor, multiple = self._fresh_claim(int(2_700_000 * (1 + _rand_below(9))))
+            assert multiple <= MAX_FEE_OVERPAY_MULTIPLE + 0.05, multiple
+            assert caplog.text == "", f"warned at {multiple:.2f}x: {caplog.text}"
+
+    def test_the_warning_fires_above_the_ceiling_over_fresh_keys(self, caplog) -> None:
+        """The differential: same builder, fee over the ceiling, opposite verdict."""
+        fired = 0
+        for _ in range(self.ROUNDS):
+            caplog.clear()
+            with caplog.at_level(logging.WARNING, logger="pyrxd.gravity.htlc_spend"):
+                _tx, _floor, multiple = self._fresh_claim(int(2_700_000 * (11 + _rand_below(20))))
+            assert multiple > MAX_FEE_OVERPAY_MULTIPLE
+            assert "photons — " in caplog.text, f"no warning at {multiple:.1f}x"
+            fired += 1
+        assert fired == self.ROUNDS
+
+    def test_the_builder_never_refuses_for_being_over_the_ceiling(self) -> None:
+        """A hard refusal here would be fail-closed on a deadline-racing claim.
+
+        ``test_measured_covenant_spend_sizes`` above already routes ~19x headroom
+        through this path, which is why the cold CLI's 10x REFUSAL cannot simply be
+        lifted into the builder.
+        """
+        for value in (26_600_000, 50_000_000, 500_000_000, 50_000_000_000):
+            tx, _floor, _mult = self._fresh_claim(value)
+            assert tx.get_fee() == value
+
+    def test_the_ceiling_is_the_one_the_cold_cli_refuses_on(self) -> None:
+        """One definition, two responses — not two numbers that can drift apart."""
+        from pyrxd.cli import swap_recovery
+        from pyrxd.fee_sizing import fee_overpay_ceiling as canonical
+
+        assert swap_recovery.MAX_FEE_OVERPAY_MULTIPLE is MAX_FEE_OVERPAY_MULTIPLE
+        assert swap_recovery.fee_overpay_ceiling is canonical
+        assert canonical(floor=2_660_000, target=2_660_000) == 26_600_000
+        # The ceiling tracks the deadline-aware TARGET when that is higher, so urgency
+        # raises the bar instead of making an urgent fee look like a mistake.
+        assert canonical(floor=2_660_000, target=8_000_000) == 80_000_000

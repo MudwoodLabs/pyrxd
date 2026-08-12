@@ -1165,6 +1165,177 @@ class TestTransferNftAssembly:
         assert result["txid"] == "ff" * 32
 
 
+def _run_transfer_nft(cli_context, *, fund_value: int) -> tuple[list[bytes], object]:
+    """Drive ``_transfer_nft_inner`` once over FRESH keys. Returns (broadcast bytes, result).
+
+    Fresh keys every call on purpose. Signing is RFC 6979, so whether a *given*
+    transaction underpays is a fixed property of it, not a flake — a fixed-key fixture
+    signs one message forever and can never see a defect that lands on a quarter of
+    real sends. The property below therefore redraws.
+    """
+    from pyrxd.cli.glyph_cmds import _transfer_nft_inner
+    from pyrxd.glyph.script import build_nft_locking_script
+    from pyrxd.script.type import P2PKH
+
+    ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+
+    def _src_hex(vout: int, spk: bytes, value: int) -> bytes:
+        outs = [TransactionOutput(Script(b""), 0) for _ in range(vout)]
+        outs.append(TransactionOutput(Script(spk), value))
+        return Transaction(tx_inputs=[], tx_outputs=outs).serialize()
+
+    owner_key = PrivateKey()
+    ref = GlyphRef(txid="aa" * 32, vout=0)
+    nft_script = build_nft_locking_script(Hex20(owner_key.public_key().hash160()), ref)
+    nft_utxo = UtxoRecord(tx_hash="bb" * 32, tx_pos=1, value=1000, height=100)
+    fund_key = PrivateKey()
+    fund_spk = P2PKH().lock(fund_key.address()).serialize()
+    fund_utxo = UtxoRecord(tx_hash="cc" * 32, tx_pos=1, value=fund_value, height=100)
+
+    txmap = {"bb" * 32: _src_hex(1, nft_script, 1000), "cc" * 32: _src_hex(1, fund_spk, fund_value)}
+
+    class _Wallet:
+        async def collect_spendable(self, client):
+            return [(nft_utxo, owner_key.address(), owner_key), (fund_utxo, fund_key.address(), fund_key)]
+
+    captured: list[bytes] = []
+
+    async def _bcast(raw: bytes) -> str:
+        captured.append(raw)
+        return "ff" * 32
+
+    client = MagicMock()
+    client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+    client.broadcast = _bcast
+
+    to_key = PrivateKey()
+    result = asyncio.run(
+        _transfer_nft_inner(ctx, _Wallet(), ref, Hex20(to_key.public_key().hash160()), to_key.address(), client)
+    )
+    return captured, result
+
+
+class TestTransferNftPaysTheRelayFloor:
+    """FS-1. ``transfer-nft`` signed and broadcast transactions below Radiant's relay floor.
+
+    ``needed=100_000`` was a flat literal that never multiplied by ``ctx.fee_rate``, so it
+    could not cover a ~377-byte transfer at *any* rate at or above the floor — raising the
+    rate widened the gap. When funding fell short, ``Transaction.fee()`` silently dropped
+    the change output rather than failing, converting the shortfall into "the whole UTXO
+    is the fee", and the CLI signed and broadcast the result. Measured on this fixture
+    before the fix, at the CLI's default 10_000 photons/byte::
+
+        funding=  100000  size=377B  fee=  100000  floor=3770000  -> REJECTED BY EVERY NODE
+        funding= 1000000  size=376B  fee= 1000000  floor=3760000  -> REJECTED BY EVERY NODE
+        funding= 3000000  size=378B  fee= 3000000  floor=3780000  -> REJECTED BY EVERY NODE
+        40/40 fresh-key builds at funding=1_000_000 broadcast below the floor
+
+    Radiant has neither RBF nor CPFP, so such a broadcast cannot be bumped or replaced.
+    """
+
+    #: Draws per property case. Roughly a third of DISTINCT sends land on the wrong side
+    #: of a signature-length shortfall, so 40 puts the chance of a sweep seeing none at
+    #: ~1e-7; the whole class still runs in about a second.
+    ROUNDS = 40
+
+    def test_a_funding_utxo_that_cannot_pay_the_floor_is_refused_not_broadcast(self, cli_context) -> None:
+        """The case the old bar admitted: 1_000_000 photons, 41x under a ~3.78M requirement."""
+        from pyrxd.cli.errors import UserError
+
+        for _ in range(self.ROUNDS):
+            with pytest.raises(UserError, match="no plain-RXD UTXO large enough"):
+                _run_transfer_nft(cli_context, fund_value=1_000_000)
+
+    def test_every_build_that_is_returned_pays_for_its_own_signed_bytes(self, cli_context) -> None:
+        """The property, swept across the funding range the old bar accepted.
+
+        For every funding value the command either refuses (no broadcast) or returns a
+        transaction whose fee covers ``min_relay_fee`` of its FINAL SIGNED length. There
+        is no third outcome — and "signed and broadcast anyway" was the only outcome
+        before the fix for everything under ~3.78M.
+        """
+        from pyrxd.cli.errors import UserError
+        from pyrxd.fee_sizing import min_relay_fee
+
+        relayed = 0
+        for value in (100_000, 1_000_000, 3_000_000, 3_779_999, 3_780_000, 4_200_000, 50_000_000):
+            for _ in range(6):
+                try:
+                    captured, result = _run_transfer_nft(cli_context, fund_value=value)
+                except UserError:
+                    continue  # refused before signing: the safe outcome
+                assert len(captured) == 1
+                raw = captured[0]
+                assert result["fee"] >= min_relay_fee(len(raw)), (
+                    f"broadcast {len(raw)} B paying {result['fee']} photons, below the "
+                    f"{min_relay_fee(len(raw))} photon floor, from a {value} photon funding UTXO"
+                )
+                relayed += 1
+        assert relayed > 0, "every case refused — the property is vacuous"
+
+    def test_the_bar_does_not_refuse_a_utxo_that_would_have_relayed(self, cli_context) -> None:
+        """The other half: a guard that refuses a legitimate action is its own bug.
+
+        At EXACTLY the bar the build must go through, over fresh keys — the no-change
+        shape (``Transaction.fee()`` drops change it cannot fund) is the smallest
+        transaction this command can produce, so sizing the bar against the two-output
+        shape would refuse funding that in fact relays.
+        """
+        from pyrxd.cli.glyph_cmds import _nft_transfer_funding_bar
+        from pyrxd.fee_sizing import min_relay_fee
+        from pyrxd.glyph.script import build_nft_locking_script
+
+        locking = build_nft_locking_script(Hex20(PrivateKey().public_key().hash160()), GlyphRef(txid="aa" * 32, vout=0))
+        bar = _nft_transfer_funding_bar(locking, cli_context.fee_rate)
+        for _ in range(self.ROUNDS):
+            captured, result = _run_transfer_nft(cli_context, fund_value=bar)
+            assert result["fee"] >= min_relay_fee(len(captured[0]))
+
+    def test_the_bar_scales_with_the_fee_rate(self, cli_context) -> None:
+        """The defining property the flat literal lacked: it multiplies by the rate."""
+        from pyrxd.cli.glyph_cmds import _nft_transfer_funding_bar
+        from pyrxd.glyph.script import build_nft_locking_script
+
+        locking = build_nft_locking_script(Hex20(PrivateKey().public_key().hash160()), GlyphRef(txid="aa" * 32, vout=0))
+        at_floor = _nft_transfer_funding_bar(locking, 10_000)
+        assert _nft_transfer_funding_bar(locking, 20_000) == 2 * at_floor
+        assert at_floor > 100_000, "the bar this replaced was a flat 100_000 photons"
+
+    def test_a_node_rejection_is_not_reported_as_an_unreachable_server(
+        self, runner, tmp_wallet_path, monkeypatch
+    ) -> None:
+        """``PolicyRejection`` subclasses ``NetworkError``, so a node VERDICT was being
+        relabelled "could not reach ElectrumX — check that <url> is reachable", sending
+        the operator to debug connectivity for a transaction the node had evaluated."""
+        import pyrxd.cli.glyph_cmds as gc
+        from pyrxd.security.errors import PolicyRejection
+
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        monkeypatch.setattr(gc, "_load_wallet", lambda ctx, **kw: object())
+
+        async def _boom(*_a, **_k):
+            raise PolicyRejection("66: min relay fee not met", code=1, reason="min relay fee not met")
+
+        monkeypatch.setattr(gc, "_transfer_nft_inner", _boom)
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "--yes",
+                "glyph",
+                "transfer-nft",
+                f"{'aa' * 32}:0",
+                "--to",
+                PrivateKey().address(),
+            ],
+        )
+        assert "could not reach ElectrumX" not in result.output, result.output
+        assert "the node rejected the NFT transfer" in result.output, result.output
+        assert "min relay fee not met" in result.output, result.output
+        assert result.exit_code == 1, result.output
+
+
 class TestDmintV2CliPaths:
     """V2 deploy/claim CLI wiring (#219) — pure helpers + the version-agnostic deploy inner."""
 

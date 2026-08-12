@@ -79,6 +79,7 @@ async def test_nft_order_post_browse_take_settle(node) -> None:
             funding=[FundingInput(advert_fund, af_vout, maker)],
             change_pkh=mk_pkh,
             fee=_FEE,
+            fee_policy=_NODE_POLICY,
         )
     )
 

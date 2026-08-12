@@ -159,7 +159,12 @@ def test_prepare_offered_utxo_mints_exact_amount_at_vout0() -> None:
     mk, mk_pkh = _key()
     funding = [FundingInput(_ft_src(mk_pkh, _REF_G, 120), 0, mk), FundingInput(_rxd_src(mk_pkh, 3000), 0, mk)]
     tx = prepare_offered_utxo(
-        funding=funding, asset=Asset("ft", 100, _REF_G), owner_pkh=mk_pkh, change_pkh=mk_pkh, fee=200
+        funding=funding,
+        asset=Asset("ft", 100, _REF_G),
+        owner_pkh=mk_pkh,
+        change_pkh=mk_pkh,
+        fee=200,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert _classify(tx.outputs[0]) == ("ft", 100, _REF_G)
     kinds = [_classify(o) for o in tx.outputs]
@@ -177,6 +182,7 @@ def test_build_advert_tx_wraps_script_at_output0_value0() -> None:
         funding=[FundingInput(_rxd_src(mk_pkh, 2000), 0, mk)],
         change_pkh=mk_pkh,
         fee=400,
+        fee_policy=_TOY_FEE_POLICY,
     )
     assert tx.outputs[0].satoshis == 0
     assert tx.outputs[0].locking_script.serialize() == post.advert_script
@@ -400,4 +406,5 @@ def test_advert_tx_refuses_ft_funding() -> None:
             funding=[FundingInput(_ft_src(mk_pkh, _REF_G, 100), 0, mk)],
             change_pkh=mk_pkh,
             fee=50,
+            fee_policy=_TOY_FEE_POLICY,
         )

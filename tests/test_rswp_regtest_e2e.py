@@ -289,6 +289,7 @@ def _post_ft_for_rxd_order(node: _Node, maker: PrivateKey, units: int, demand_ph
         funding=[FundingInput(advert_fund_tx, advert_vout, maker)],
         change_pkh=mk_pkh,
         fee=_FEE,
+        fee_policy=_NODE_POLICY,
     )
     node.send_and_mine(advert)
     return decode_rswp_order(post.advert_script), ft_tx, ref
@@ -353,6 +354,7 @@ async def test_happy_path_rxd_for_ft_mirror(node) -> None:
             funding=[FundingInput(advert_fund, af_vout, maker)],
             change_pkh=mk_pkh,
             fee=_FEE,
+            fee_policy=_NODE_POLICY,
         )
     )
 

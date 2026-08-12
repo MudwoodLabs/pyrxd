@@ -34,9 +34,11 @@ OP_1 OP_NUMEQUALVERIFY <refund>``):
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS, SIGHASH
+from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, fee_overpay_ceiling, fee_overpay_multiple
 from pyrxd.gravity.fee_policy import (
     DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
     DeadlineFeePolicy,
@@ -53,6 +55,8 @@ from pyrxd.transaction.transaction_output import TransactionOutput
 from pyrxd.utils import encode_data_push
 
 __all__ = ["DUST_FLOOR_PHOTONS", "FeeInput", "build_htlc_claim_tx", "build_htlc_refund_tx"]
+
+logger = logging.getLogger(__name__)
 
 # Function-index selectors in the multi-function HTLC covenant dispatch.
 _CLAIM_SELECTOR = b"\x00"  # OP_0 (function index 0)
@@ -77,9 +81,12 @@ class FeeInput:
     (``value - out0_value``) is consumed as the miner fee — there is no change
     output (the covenant forbids a second output), so ``value`` IS the miner fee.
     Size it upstream to clear the per-kB min-relay fee without being wastefully
-    large; the builders refuse to return an under-fee'd transaction
-    (:func:`_assert_fee_clears_relay_floor`), because Radiant has neither RBF nor
-    CPFP and an under-fee'd time-critical spend cannot be repaired after broadcast.
+    large. Both ends are bounded, differently on purpose: the builders REFUSE an
+    under-fee'd transaction (:func:`_assert_fee_clears_relay_floor`), because Radiant
+    has neither RBF nor CPFP and an under-fee'd time-critical spend cannot be repaired
+    after broadcast; they only WARN on a wildly over-large one
+    (:func:`_warn_if_fee_is_an_overpay`), because refusing a spend the node would have
+    accepted can forfeit the asset to the counterparty's refund.
     """
 
     txid: str
@@ -185,12 +192,17 @@ def _check_carrier(carrier_value: int, fee: FeeInput) -> int:
     floor as a floor — a sub-dust fee input cannot pay any relay fee on any chain —
     but it is deliberately NOT the fee guard. The real requirement scales with the
     serialized transaction size, which does not exist yet at this point in the
-    build; :func:`_assert_fee_clears_relay_floor` enforces it after assembly.
+    build; :func:`_assert_fee_clears_relay_floor` enforces it after assembly, and
+    :func:`_warn_if_fee_is_an_overpay` bounds the other end there for the same reason.
     """
     if not isinstance(carrier_value, int) or isinstance(carrier_value, bool) or carrier_value <= 0:
         raise ValidationError("carrier_value (the funded covenant output value) must be a positive int")
-    # The fee input is consumed ENTIRELY as fee (no change output). Guard that it is
-    # a plausible fee, not a mistakenly-huge UTXO or a sub-dust one.
+    # The fee input is consumed ENTIRELY as fee (no change output). This checks the
+    # SMALL end only, and says so: for years the comment here promised a guard against
+    # "a mistakenly-huge UTXO or a sub-dust one" while only the sub-dust half existed,
+    # and `cli/swap_recovery.py` had to name this function by name when it added the
+    # missing half for the cold path. The huge end cannot be judged here at all — it is
+    # a MULTIPLE of a size-dependent requirement, and there are no bytes yet.
     if fee.value < DUST_FLOOR_PHOTONS:
         raise ValidationError("fee input is below the dust floor; it cannot pay a relay fee")
     return carrier_value
@@ -214,12 +226,57 @@ def _assert_fee_clears_relay_floor(tx: Transaction, fee: FeeInput, policy: Deadl
     :class:`~pyrxd.gravity.radiant_leg.RadiantCovenantLeg` — applies the
     deadline-aware requirement on top, immediately before broadcasting.
     """
-    assert_fee_covers(
+    size_bytes = len(tx.serialize())
+    target = assert_fee_covers(
         fee_value=fee.value,
-        size_bytes=len(tx.serialize()),
+        size_bytes=size_bytes,
         policy=policy,
         blocks_to_deadline=None,
         what=f"HTLC covenant {kind}",
+    )
+    _warn_if_fee_is_an_overpay(fee, kind, floor=policy.min_relay_fee(size_bytes), target=target)
+
+
+def _warn_if_fee_is_an_overpay(fee: FeeInput, kind: str, *, floor: int, target: int) -> None:
+    """The UPPER bound: WARN — never raise — when the fee input dwarfs the requirement.
+
+    The covenant enforces exactly one output, so there is no change and **the whole fee
+    input is paid to the miner**. Pointing this at an ordinary funded key is therefore
+    not "a generous fee", it is burning that UTXO: measured on a real RXD HTLC claim, a
+    500 RXD fee input against a 266-byte spend paid **18,796x** the 2,660,000-photon
+    relay floor, and nothing anywhere raised, warned or logged.
+
+    Warn rather than refuse, deliberately, and this is the half of the decision that
+    needs stating: on the claim path the clock to the counterparty's CSV refund is
+    running, and forfeiting the asset is strictly worse than overpaying a fee
+    (``docs/threat-model.md`` S21). A legitimate deadline-racing spend can also carry
+    far more than :data:`~pyrxd.fee_sizing.MAX_FEE_OVERPAY_MULTIPLE` on purpose —
+    ``tests/test_htlc_spend_fee_floor.py`` already routes 19x headroom through this
+    exact path — so the cold CLI's hard 10x ceiling cannot simply be lifted into the
+    builder. There an operator is present and ``--allow-overpay`` is one flag away;
+    here the caller may be an autonomous claim executor with a deadline.
+
+    Same constant, same ceiling, one definition (:func:`~pyrxd.fee_sizing.fee_overpay_ceiling`).
+    Only the response differs, and the difference is the point.
+    """
+    ceiling = fee_overpay_ceiling(floor=floor, target=target)
+    if fee.value <= ceiling:
+        return
+    multiple = fee_overpay_multiple(fee.value, floor=floor, target=target)
+    logger.warning(
+        "HTLC covenant %s: fee input %s:%s is %s photons — %.0fx the %s-photon requirement "
+        "(ceiling %s at %dx). The covenant permits ONE output, so there is no change and the "
+        "ENTIRE input is paid to the miner. Building anyway (refusing a spend the node would "
+        "accept can forfeit the asset to the counterparty's refund), but carve a smaller fee "
+        "UTXO — this is almost always a photons/RXD unit slip or a whole-wallet UTXO.",
+        kind,
+        fee.txid,
+        fee.vout,
+        fee.value,
+        multiple,
+        max(floor, target),
+        ceiling,
+        MAX_FEE_OVERPAY_MULTIPLE,
     )
 
 
