@@ -50,7 +50,15 @@ from pathlib import Path
 
 import pytest
 
-from pyrxd.constants import PUSH_REF_OPCODES, REF_OPERAND_OPCODES, REF_OPERAND_WIDTH
+from pyrxd.constants import (
+    DUST_THRESHOLD_PHOTONS,
+    LOCKTIME_THRESHOLD,
+    MAX_SCRIPT_ELEMENT_SIZE,
+    MAX_SCRIPT_ELEMENT_SIZE_LEGACY,
+    PUSH_REF_OPCODES,
+    REF_OPERAND_OPCODES,
+    REF_OPERAND_WIDTH,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -98,26 +106,55 @@ def _rel(path: Path) -> str:
 # One assignment per consensus constant
 # ---------------------------------------------------------------------------
 
-_GUARDED_NAMES = ["REF_OPERAND_OPCODES", "PUSH_REF_OPCODES", "REF_OPERAND_WIDTH", "MAX_OPCODE"]
+#: The ref-opcode names the guard was written for, plus the consensus numbers
+#: #418 and #419 centralised. Adding a name here is cheap and worth doing — but
+#: it is NOT sufficient on its own, and REG-2 is the proof: a second copy of
+#: ``LOCKTIME_THRESHOLD`` survived that consolidation spelled
+#: ``LOCKTIME_HEIGHT_THRESHOLD``, and this check builds its pattern FROM the
+#: name, so it looked straight past it. The value guard below is what closes
+#: that; both are needed, and neither subsumes the other.
+_GUARDED_NAMES = [
+    "REF_OPERAND_OPCODES",
+    "PUSH_REF_OPCODES",
+    "REF_OPERAND_WIDTH",
+    "MAX_OPCODE",
+    "LOCKTIME_THRESHOLD",
+    "DUST_THRESHOLD_PHOTONS",
+    "MAX_SCRIPT_ELEMENT_SIZE",
+    "MAX_SCRIPT_ELEMENT_SIZE_LEGACY",
+    "MAX_SCRIPT_SIZE",
+    "MAX_OPS_PER_SCRIPT",
+    "MAX_STACK_SIZE",
+    "MAX_OP_RETURN_MSG_BYTES",
+]
 
 
 class TestSingleDefinition:
     @pytest.mark.parametrize("name", _GUARDED_NAMES)
-    def test_constant_is_assigned_exactly_once_in_src(self, name):
+    @pytest.mark.parametrize("root_name", ["src", "tests"])
+    def test_constant_is_assigned_exactly_once(self, name, root_name):
         """Only ``pyrxd/constants.py`` may assign it; everyone else imports.
 
         An alias (``REF_OPCODES = REF_OPERAND_OPCODES``) is fine — it binds a
         second name to the same object and cannot drift. A second *literal* is
         not.
+
+        ``tests`` is in scope as well as ``src``. It used to be src-only, which
+        left the fixtures free to re-type the very numbers the shipped code is
+        forbidden to re-type — and a test asserting against its own second copy
+        of a constant passes whatever the first copy says. The oracle and
+        differential files are allowlisted because deriving the values from the
+        vendored C++ is their entire job.
         """
+        root = REPO_ROOT / root_name
         assignment = re.compile(rf"^\s*{name}\s*(?::[^=\n]+)?=\s*(?P<rhs>.+)$", re.MULTILINE)
         offenders = []
-        for path in _python_files(SRC_ROOT):
+        for path in _python_files(root):
+            if path == CANONICAL_MODULE or (root_name == "tests" and path.name in _TEST_ALLOWLIST):
+                continue
             body = _strip_comments_and_docstrings(path.read_text(encoding="utf-8"))
             for match in assignment.finditer(body):
                 rhs = match.group("rhs").strip()
-                if path == CANONICAL_MODULE:
-                    continue
                 # Re-binding to the canonical object is allowed.
                 if re.fullmatch(r"[A-Za-z_][\w.]*", rhs):
                     continue
@@ -133,6 +170,142 @@ class TestSingleDefinition:
             assert re.search(rf"^{name}\s*[:=]", body, re.MULTILINE), (
                 f"{name} is guarded but no longer defined in src/pyrxd/constants.py"
             )
+
+
+# ---------------------------------------------------------------------------
+# No re-spelling of a centralised VALUE, under any name
+# ---------------------------------------------------------------------------
+#
+# The check above builds its pattern from a NAME, so it can only find a copy
+# that agreed to be called the same thing. REG-2 is what that misses:
+#
+#     src/pyrxd/constants.py:543          LOCKTIME_THRESHOLD       = 500_000_000
+#     src/pyrxd/swap/rswp/covenant.py:79  LOCKTIME_HEIGHT_THRESHOLD = 500_000_000
+#
+# Two independent literals — ``LOCKTIME_THRESHOLD is LOCKTIME_HEIGHT_THRESHOLD``
+# was False — and adding ``LOCKTIME_HEIGHT_THRESHOLD`` to ``_GUARDED_NAMES``
+# would not have helped either, because then the guard looks for THAT spelling
+# and the next copy picks a third. The only property both copies share is the
+# number, so the number is what this looks for.
+#
+# The asymmetry that made it worth finding: ``constants.py``'s copy is pinned to
+# the vendored ``script.h:90`` by ``test_consensus_opcode_parity.py``, and the
+# second copy was pinned to nothing. Drifting it DOWN to 400_000_000 was caught
+# by two boundary vectors; drifting it UP to 600_000_000 passed the entire
+# offline suite.
+#
+# Values, not names, and derived from ``pyrxd.constants`` rather than retyped —
+# a guard that spells the number itself is one more copy of the number.
+
+#: value -> the canonical name(s) that hold it. Several script limits share
+#: 32_000_000, so the label names all of them.
+_GUARDED_VALUES: dict[int, str] = {
+    LOCKTIME_THRESHOLD: "LOCKTIME_THRESHOLD",
+    DUST_THRESHOLD_PHOTONS: "DUST_THRESHOLD_PHOTONS",
+    MAX_SCRIPT_ELEMENT_SIZE_LEGACY: "MAX_SCRIPT_ELEMENT_SIZE_LEGACY",
+    MAX_SCRIPT_ELEMENT_SIZE: "MAX_SCRIPT_ELEMENT_SIZE / MAX_SCRIPT_SIZE / MAX_OPS_PER_SCRIPT / MAX_STACK_SIZE",
+}
+
+#: Files allowed to spell a guarded value, each a deliberate non-consolidation
+#: recorded BOTH here and at the site. Merging these would be wrong, not merely
+#: unnecessary.
+_VALUE_EXEMPTIONS: dict[int, set[str]] = {
+    # Bitcoin's dust limit is 546 satoshis and Radiant's policy floor is 546
+    # photons; the same number expresses two unrelated rules on two chains, and
+    # ``btc_wallet/payment.py`` says so in five lines of comment ending "Two
+    # chains, two rules; do not alias them." Aliasing them would make a change
+    # to Radiant policy silently move Bitcoin's dust limit.
+    DUST_THRESHOLD_PHOTONS: {"btc_wallet/payment.py"},
+}
+
+#: A plain decimal integer, with or without ``_`` grouping. Hex and binary are
+#: NOT this: ``glyph/_confusables.py`` holds the Unicode codepoint ``0x0222``,
+#: which is 546, and a mask written ``0xFF`` is not a length limit. Same
+#: "AST for structure, source spelling for intent" rule the ref detectors use.
+_DECIMAL_INT = re.compile(r"\d[\d_]*")
+
+
+def respelled_centralised_value(source: str) -> list[str]:
+    """Any guarded consensus value, written out as a decimal literal.
+
+    Deliberately flags the value ANYWHERE, not just on the right-hand side of an
+    assignment: ``if height >= 500_000_000:`` is the same rule re-typed, and it
+    drifts exactly as easily as a named copy does.
+    """
+    tree = _parse(source)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or isinstance(node.value, bool) or not isinstance(node.value, int):
+            continue
+        name = _GUARDED_VALUES.get(node.value)
+        if name is None:
+            continue
+        segment = ast.get_source_segment(source, node)
+        if segment is None or not _DECIMAL_INT.fullmatch(segment.strip()):
+            continue
+        offenders.append(f"line {node.lineno}: {segment.strip()} is {name}")
+    return offenders
+
+
+class TestNoRespelledCentralisedValue:
+    @pytest.mark.parametrize("value", sorted(_GUARDED_VALUES))
+    def test_no_second_literal_in_src(self, value):
+        """``src`` only. ``tests`` is measured to hold 19 legitimate
+        ``500_000_000`` photon amounts (5 RXD is a natural fixture size), so a
+        value scan there would be unsatisfiable — which is why the NAME check
+        above is the one that covers ``tests``. The two guards have different
+        blind spots on purpose."""
+        name = _GUARDED_VALUES[value]
+        exempt = _VALUE_EXEMPTIONS.get(value, set())
+        offenders = []
+        for path in _python_files(SRC_ROOT):
+            rel = str(path.relative_to(SRC_ROOT))
+            if path == CANONICAL_MODULE or rel in exempt:
+                continue
+            source = path.read_text(encoding="utf-8")
+            offenders += [f"{_rel(path)}: {hit}" for hit in respelled_centralised_value(source)]
+        # Another value's literal in this file is that value's failure, not this one's.
+        offenders = [o for o in offenders if o.endswith(name)]
+        assert not offenders, (
+            f"{name} is spelled out again outside src/pyrxd/constants.py:\n  "
+            + "\n  ".join(offenders)
+            + f"\nImport it — `from ...constants import {name.split(' / ')[0]}` — and alias if a local "
+            "name reads better. A second literal inherits none of the pins the canonical one carries."
+        )
+
+    def test_the_canonical_module_still_spells_each_value(self):
+        """The other half. If ``constants.py`` stops holding these numbers, the
+        scan above starts passing on a tree that lost the constant entirely."""
+        source = CANONICAL_MODULE.read_text(encoding="utf-8")
+        found = {hit.split(" is ")[1] for hit in respelled_centralised_value(source)}
+        missing = sorted(set(_GUARDED_VALUES.values()) - found)
+        assert not missing, f"src/pyrxd/constants.py no longer spells: {missing} — the value guard is now vacuous"
+
+    def test_every_value_exemption_names_a_file_that_exists(self):
+        missing = [
+            f"{value}: {rel}"
+            for value, rels in _VALUE_EXEMPTIONS.items()
+            for rel in rels
+            if not (SRC_ROOT / rel).is_file()
+        ]
+        assert not missing, f"stale exemptions in _VALUE_EXEMPTIONS: {missing}"
+
+    def test_every_exemption_still_holds_the_value_it_is_exempt_for(self):
+        """An exemption that no longer covers anything is a standing hole.
+
+        If ``btc_wallet/payment.py`` ever stops spelling 546, the exemption must
+        go with it — otherwise it silently licenses the NEXT copy to appear there.
+        """
+        stale = [
+            f"{value}: {rel}"
+            for value, rels in _VALUE_EXEMPTIONS.items()
+            for rel in rels
+            if not any(
+                hit.endswith(_GUARDED_VALUES[value])
+                for hit in respelled_centralised_value((SRC_ROOT / rel).read_text(encoding="utf-8"))
+            )
+        ]
+        assert not stale, f"these exemptions no longer cover anything: {stale}"
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +984,31 @@ _PLANTED_DUPLICATES = [
         "the str alphabet from base58.py",
         'ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"\n',
     ),
+    (
+        respelled_centralised_value,
+        "REG-2 verbatim: the locktime threshold under a DIFFERENT name",
+        "LOCKTIME_HEIGHT_THRESHOLD = 500_000_000\n",
+    ),
+    (
+        respelled_centralised_value,
+        "the same value with no underscores, which grep for `500_000_000` misses",
+        "THRESHOLD = 500000000\n",
+    ),
+    (
+        respelled_centralised_value,
+        "no name at all — the rule re-typed inline, which a name-based guard cannot see",
+        "def is_height(locktime):\n    return locktime < 500_000_000\n",
+    ),
+    (
+        respelled_centralised_value,
+        "a second dust floor",
+        "_MIN_CHANGE = 546\n",
+    ),
+    (
+        respelled_centralised_value,
+        "a hand-typed script-element cap",
+        "MAX_PUSH = 32_000_000\n",
+    ),
 ]
 
 
@@ -834,7 +1032,8 @@ class TestEachNewDetectorFiresOnAPlantedDuplicate:
     def test_every_new_detector_has_at_least_one_planted_proof(self):
         """Adding a detector without a proof is the failure mode this prevents."""
         proved = {detector for detector, _, _ in _PLANTED_DUPLICATES}
-        unproved = {detector for detector, _, _ in _PRIMITIVE_GUARDS.values()} - proved
+        registered = {detector for detector, _, _ in _PRIMITIVE_GUARDS.values()} | {respelled_centralised_value}
+        unproved = registered - proved
         assert not unproved, (
             f"these detectors have no planted-duplicate proof: {sorted(d.__name__ for d in unproved)}. "
             f"Add one to _PLANTED_DUPLICATES — an unproved detector may pass a clean tree while "
@@ -863,6 +1062,26 @@ class TestTheNewDetectorsDoNotFireOnLegitimateCode:
             (compact_size_width_tables, "a 0xff byte mask", "masked = value & 0xFF\n"),
             (base58_alphabet_literals, "a 58-char string that is not the alphabet", f'S = "{"a" * 58}"\n'),
             (base58_alphabet_literals, "the alphabet's prefix only", 'S = "123456789ABCDEF"\n'),
+            (
+                respelled_centralised_value,
+                "the Unicode codepoint 0x0222 — 546 as an integer, not as a dust rule",
+                "TABLE = {0x0222: 'O', 0x0223: 'o'}\n",
+            ),
+            (
+                respelled_centralised_value,
+                "a value one off the threshold: a boundary vector, not a second copy",
+                "BOUNDARY = 499_999_999\n",
+            ),
+            (
+                respelled_centralised_value,
+                "the constant used by NAME, which is the whole point",
+                "from pyrxd.constants import LOCKTIME_THRESHOLD\n\nif t < LOCKTIME_THRESHOLD:\n    pass\n",
+            ),
+            (
+                respelled_centralised_value,
+                "an unrelated ordinary number",
+                "TIMEOUT_MS = 30_000\n",
+            ),
         ],
     )
     def test_legitimate_shapes_are_not_flagged(self, detector, label, source):
