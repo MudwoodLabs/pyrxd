@@ -132,6 +132,7 @@ import re
 
 from pyrxd.constants import REF_OPERAND_OPCODES, REF_OPERAND_WIDTH
 from pyrxd.hash import hash256
+from pyrxd.script.consensus import get_script_op
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
 
@@ -519,6 +520,39 @@ class TruncatedScriptError(ValidationError):
     """
 
 
+def iter_script_ops_strict(script: bytes):
+    """Yield every :class:`~pyrxd.script.consensus.ScriptOp` in *script*,
+    raising :class:`TruncatedScriptError` at the first instruction that will
+    not decode.
+
+    The byte-consumption rules — how far each opcode advances the walk, and
+    which opcodes carry the fixed-width 36-byte ref operand — are **not**
+    written here. They come from :func:`pyrxd.script.consensus.get_script_op`,
+    the transcription of Radiant's ``GetScriptOp``. This function adds exactly
+    one thing to :func:`pyrxd.script.consensus.iter_script_ops`: a malformed
+    instruction is an *error* rather than a silent stop, because the callers
+    here classify chain scripts for spend decisions and a script of ambiguous
+    length must be refused, not truncated to whatever parsed.
+
+    Every opcode-aware walk in this package goes through here — ref extraction
+    (:func:`iter_input_refs`) and soulbound structural detection
+    (:mod:`pyrxd.glyph.soulbound_detect`). Independent transcriptions of this
+    loop produced the worst parser bugs in this repo (see :data:`REF_OPCODES`
+    above); do not write another one.
+    """
+    pos = 0
+    n = len(script)
+    while pos < n:
+        op = get_script_op(script, pos)
+        if op is None:
+            raise TruncatedScriptError(
+                f"script does not decode at offset {pos} (truncated push, "
+                f"truncated length prefix, or truncated {REF_OPERAND_WIDTH}-byte ref operand)"
+            )
+        yield op
+        pos = op.next_pos
+
+
 def iter_input_refs(script: bytes):
     """Yield ``(opcode, ref_operand)`` for each OP_PUSHINPUTREF-family opcode
     in *script*, walking it as an opcode stream the way Radiant consensus does
@@ -534,46 +568,14 @@ def iter_input_refs(script: bytes):
     opcode's 36-byte operand is truncated — the script's structure is
     ambiguous and callers should refuse it.
 
-    Push opcode encoding (Bitcoin/Radiant script):
-
-    - ``0x01..0x4b``: push the next N bytes (N == opcode value)
-    - ``0x4c`` PUSHDATA1 / ``0x4d`` PUSHDATA2 / ``0x4e`` PUSHDATA4
-    - everything else: opcode with no payload
-
+    A thin filter over :func:`iter_script_ops_strict`, which owns the walk.
     This is the single source of truth for ref detection; build
     :func:`count_input_refs` and ``is_token_bearing_script`` on it rather than
     re-implementing the walk.
     """
-    pos = 0
-    n = len(script)
-    while pos < n:
-        op = script[pos]
-        if op in REF_OPCODES:
-            operand = script[pos + 1 : pos + 1 + REF_OPERAND_WIDTH]
-            if len(operand) != REF_OPERAND_WIDTH:
-                raise TruncatedScriptError(f"ref opcode operand truncated (< {REF_OPERAND_WIDTH} bytes)")
-            yield op, operand
-            pos += 1 + REF_OPERAND_WIDTH
-            continue
-        if 0x01 <= op <= 0x4B:
-            new_pos = 1 + pos + op
-        elif op == 0x4C:  # PUSHDATA1
-            if pos + 1 >= n:
-                raise TruncatedScriptError("PUSHDATA1 length byte truncated")
-            new_pos = pos + 2 + script[pos + 1]
-        elif op == 0x4D:  # PUSHDATA2
-            if pos + 2 >= n:
-                raise TruncatedScriptError("PUSHDATA2 length truncated")
-            new_pos = pos + 3 + int.from_bytes(script[pos + 1 : pos + 3], "little")
-        elif op == 0x4E:  # PUSHDATA4
-            if pos + 4 >= n:
-                raise TruncatedScriptError("PUSHDATA4 length truncated")
-            new_pos = pos + 5 + int.from_bytes(script[pos + 1 : pos + 5], "little")
-        else:
-            new_pos = pos + 1
-        if new_pos > n:
-            raise TruncatedScriptError("push operand truncated")
-        pos = new_pos
+    for op in iter_script_ops_strict(script):
+        if op.opcode in REF_OPCODES:
+            yield op.opcode, op.operand
 
 
 def count_input_refs(script: bytes) -> dict[bytes, int]:

@@ -534,12 +534,20 @@ class TestNoRespelledRefOperandSet:
 # ---------------------------------------------------------------------------
 
 # Modules that walk a script and must consume ref operands. Adding a walker
-# without adding it here is caught by test_no_unregistered_ref_walkers below.
+# without adding it here is caught by test_walker_registry_is_complete below.
+#
+# ``glyph/soulbound_detect.py`` used to be on this list and is deliberately off
+# it now: it no longer walks. Its ``_opcodes`` helper is a one-line projection
+# over ``glyph.script.iter_script_ops_strict``, which is itself a filter over
+# ``script/consensus.py``'s ``get_script_op`` (the ``GetScriptOp``
+# transcription). Registering a module that does not walk would demand it
+# import a constant it has no use for, which is the opposite of the rule this
+# file exists to enforce. If it ever hand-rolls a walk again,
+# test_walker_registry_is_complete puts it straight back.
 _REF_WALKERS = {
     "transaction/transaction_preimage.py",
     "glyph/script.py",
     "glyph/credential_binding.py",
-    "glyph/soulbound_detect.py",
     "glyph/soulbound_covenant.py",
     "gravity/htlc_covenant.py",
 }

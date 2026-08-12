@@ -35,6 +35,7 @@ from ..glyph._inspect_core import _inspect_outpoint as _inspect_outpoint_core
 from ..glyph._inspect_core import _inspect_script as _inspect_script_core
 from ..glyph._inspect_core import _sanitize_display_string as _sanitize_display_string
 from ..glyph._inspect_core import _truncate_for_human
+from ..script.timelock import LOCKTIME_THRESHOLD
 from ..security.errors import NetworkError, ValidationError
 from ..security.types import Txid
 from .context import CliContext
@@ -53,7 +54,7 @@ __all__ = [
 #   txid       — exactly 64 lowercase-hex chars
 #   contract   — exactly 72 lowercase-hex chars (txid + BE vout)
 #   outpoint   — anything containing ":"
-#   script     — any other hex string of even length (>= 50 chars / 25 bytes)
+#   script     — any other hex string of even length (>= 46 chars / 23 bytes)
 # Everything else is a UserError.
 
 
@@ -69,7 +70,7 @@ def _classify_input(s: str) -> tuple[str, str]:
         # message; the original CLI exposed that plus a cause/fix pair.
         raise UserError(
             msg,
-            cause="input is not a 64-char txid, 72-char contract id, txid:vout outpoint, or 50-20000 char hex script",
+            cause="input is not a 64-char txid, 72-char contract id, txid:vout outpoint, or 46-20000 char hex script",
             fix="paste a 64-char txid (with --fetch), 72-char contract id, txid:vout, or hex script",
         ) from exc
 
@@ -229,6 +230,24 @@ def _render_txid_human(payload: dict) -> str:
                 lines.append("            UNSPENDABLE — see `pyrxd glyph inspect <script>` for why")
             elif type_ == "p2pkh":
                 lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
+            elif type_ == "p2sh":
+                lines.append(f"            script_hash={row.get('script_hash', '')}")
+            elif type_ in ("p2pkh-cltv", "p2pkh-csv"):
+                lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
+                lines.append(
+                    f"            lock={row.get('locktime_units')} {row.get('locktime_basis')}"
+                    + ("  *** DISABLED ***" if row.get("relative_lock_disabled") else "")
+                )
+            elif type_ == "soulbound-covenant":
+                lines.append(f"            bound_ref={row.get('bound_ref_outpoint', '')}")
+                lines.append(f"            owner_pkh={row.get('owner_pkh', '')}")
+                lines.append(f"            variant={row.get('variant', '')} (non-transferable at consensus)")
+            elif type_ == "self-replicating-covenant":
+                lines.append(f"            bound_ref={row.get('bound_ref_outpoint', '(multiple)')}")
+                lines.append("            markers only — NOT proof of soulbound")
+            elif type_ == "unknown" and row.get("token_bearing"):
+                for ref_row in row.get("input_refs") or []:
+                    lines.append(f"            ref={ref_row['ref_outpoint']} ({ref_row['opcode']}) TOKEN-BEARING")
             elif type_ == "error":
                 lines.append(f"            (classifier error: {row.get('error')})")
     metadata = payload.get("metadata")
@@ -343,9 +362,108 @@ def _render_script_human(payload: dict) -> str:
         body.append(f"  daa_mode:     {payload['daa_mode']}")
         body.append("  (structural pattern match; does NOT verify the contract_ref points")
         body.append("   to a valid mint chain or that the parameters match a deployed token)")
+    elif type_ == "p2sh":
+        body.append(f"  script_hash: {payload['script_hash']}")
+        body.append("  (pay-to-script-hash. The redeem script is not on-chain until this")
+        body.append("   output is spent, so nothing further can be said about it here.)")
+    elif type_ in ("p2pkh-cltv", "p2pkh-csv"):
+        body.extend(_render_timelock_body(payload, type_))
+    elif type_ == "soulbound-covenant":
+        body.append(f"  variant:      {payload.get('variant', '?')}")
+        body.append(f"  bound_ref:    {payload['bound_ref_outpoint']}")
+        body.append(f"  owner_pkh:    {payload['owner_pkh']}")
+        body.append(f"  self-replication branch: {payload['has_self_replication']}")
+        body.append(f"  burn branch:             {payload['has_burn_branch']}")
+        body.append("  NON-TRANSFERABLE AT CONSENSUS — the only spends this lock permits are")
+        body.append("  a byte-identical self-clone or a burn. There is no transfer path.")
+        body.append("  (exact match against pyrxd's soulbound covenant builder. It does NOT")
+        body.append("   verify the bound ref names a live Glyph singleton, that the singleton")
+        body.append("   is actually held here, or that the covenant is defect-free — the")
+        body.append("   covenant is a pre-external-audit prototype.)")
+    elif type_ == "self-replicating-covenant":
+        body.append(f"  bound_ref:    {payload.get('bound_ref_outpoint', '(more than one ref)')}")
+        body.append(f"  self-replication branch: {payload['has_self_replication']}")
+        body.append(f"  burn branch:             {payload['has_burn_branch']}")
+        body.append("  (structural marker match ONLY: this script binds a singleton ref and")
+        body.append("   contains a self-replication-or-burn constraint, but its bytes are not")
+        body.append("   a covenant pyrxd builds. That is NOT proof it is soulbound — container")
+        body.append("   and vault covenants replicate themselves too. Read the script before")
+        body.append("   trusting it as a credential.)")
+        body.extend(_render_ref_summary_body(payload))
     elif type_ == "unknown":
         body.append("  (script does not match any known Glyph or P2PKH layout)")
+        body.extend(_render_ref_summary_body(payload))
     return "\n".join([head, *body])
+
+
+def _render_timelock_body(payload: dict, type_: str) -> list[str]:
+    """The CLTV / CSV time-lock detail lines.
+
+    These outputs are HTLC refund legs in practice, so the reader is usually
+    asking "when can I spend this?". Say what the encoded value means in the
+    unit it is actually denominated in, and never imply the lock has elapsed —
+    that needs a chain tip (CLTV) or the funding output's confirmation height
+    (CSV), neither of which a locking script carries.
+    """
+    body = [f"  owner_pkh:    {payload['owner_pkh']}"]
+    basis = payload["locktime_basis"]
+    units = payload["locktime_units"]
+    if type_ == "p2pkh-cltv":
+        body.append("  lock:         ABSOLUTE (OP_CHECKLOCKTIMEVERIFY)")
+        if basis == "height":
+            body.append(f"  spendable at: block height >= {units:,}")
+        else:
+            body.append(f"  spendable at: Unix time >= {units} (locktime >= {LOCKTIME_THRESHOLD:,})")
+        body.append("  A spending tx must set nLockTime to at least this value (and a")
+        body.append("  non-final nSequence on the input) or consensus rejects it.")
+    else:
+        body.append("  lock:         RELATIVE (OP_CHECKSEQUENCEVERIFY, BIP-68/112)")
+        body.append(f"  raw sequence: {payload['locktime_value']} (0x{payload['locktime_value']:x})")
+        disabled = bool(payload.get("relative_lock_disabled"))
+        # State the disable bit BEFORE the decoded delay. Printing "delay: 144
+        # blocks" first and the "…but it is ignored" line after is how a reader
+        # skimming the top of the block walks away with the opposite of the
+        # truth.
+        if disabled:
+            body.append("  *** RELATIVE LOCK DISABLED — SPENDABLE IMMEDIATELY ***")
+            body.append("  Bit 31 (SEQUENCE_LOCKTIME_DISABLE_FLAG) is set, so consensus ignores")
+            body.append("  the relative lock entirely. The delay below is encoded in the script")
+            body.append("  but enforces nothing. pyrxd's builder refuses to emit this shape.")
+        prefix = "  delay (ignored):" if disabled else "  delay:       "
+        if basis == "blocks":
+            body.append(f"{prefix} {units:,} block(s) after this output confirms")
+        else:
+            body.append(f"{prefix} {units:,} x 512s = {units * 512:,}s after this output confirms")
+        if not disabled:
+            body.append("  The spending input's nSequence must carry at least this delay, and")
+            body.append("  the spending tx must be version 2 or later.")
+    body.append("  (structural pattern match; inspect cannot tell you whether the lock has")
+    body.append("   already elapsed — that needs the chain tip / this output's confirmation)")
+    return body
+
+
+def _render_ref_summary_body(payload: dict) -> list[str]:
+    """Report the input refs an unnamed script carries, if any.
+
+    The one fact worth surfacing about a script no classifier claims: whether
+    it is token-bearing. Spending a ref-carrying UTXO as plain funding burns
+    the token it carries.
+    """
+    token_bearing = payload.get("token_bearing")
+    refs = payload.get("input_refs") or []
+    if token_bearing is None:
+        return [
+            "  token-bearing: UNKNOWN — the script does not decode as an opcode stream,",
+            "  so the walk could not rule out an input ref. Treat it as token-bearing.",
+        ]
+    if not refs:
+        return ["  token-bearing: no (the opcode-aware walk found no OP_PUSHINPUTREF-family ref)"]
+    body = [f"  token-bearing: YES — carries {len(refs)} input ref(s):"]
+    for row in refs:
+        body.append(f"      {row['opcode']}  {row['ref_outpoint']}")
+    body.append("  Do NOT spend this as plain funding: a ref-carrying UTXO fed in as a fee")
+    body.append("  input destroys the token it carries.")
+    return body
 
 
 @click.command(name="inspect")
@@ -385,16 +503,48 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool)
       outpoint  → {form, txid, vout, outpoint, wire_hex}
       script    → {form, length, hex, type, ...type-specific fields}
         type=p2pkh        → owner_pkh
+        type=p2sh         → script_hash
         type=nft / ft     → ref_txid, ref_vout, ref_outpoint, owner_pkh
         type=mut          → ref_txid, ref_vout, ref_outpoint, payload_hash
         type=commit-nft / commit-ft → payload_hash, owner_pkh
         type=dmint        → version (v1|v2), contract_ref_outpoint,
                             token_ref_outpoint, height, max_height, reward,
                             algo, daa_mode
+        type=p2pkh-cltv   → owner_pkh, locktime_value, locktime_basis
+                            ("height"|"unix_time"), locktime_units. Absolute
+                            time-lock (BIP-65); basis is decided by
+                            LOCKTIME_THRESHOLD (500,000,000).
+        type=p2pkh-csv    → owner_pkh, locktime_value, locktime_basis
+                            ("blocks"|"time_512s"), locktime_units,
+                            relative_lock_disabled. Relative time-lock
+                            (BIP-68/112); relative_lock_disabled=true means
+                            bit 31 is set and consensus ignores the lock.
+        type=soulbound-covenant → variant ("fixed-index"|"composable"),
+                            transferability, bound_ref_txid, bound_ref_vout,
+                            bound_ref_outpoint, owner_pkh,
+                            has_self_replication, has_burn_branch, note.
+                            An EXACT match against pyrxd's soulbound builder:
+                            the lock permits only a self-clone or a burn.
+        type=self-replicating-covenant → transferability,
+                            has_self_replication, has_burn_branch,
+                            bound_ref_outpoint (only when the script binds
+                            exactly one ref), note, token_bearing,
+                            input_refs[]. Structural MARKERS only — not proof
+                            the script is a soulbound token.
         type=container-legacy → spendable (always false), ref_outpoint,
                             child_ref_outpoint, owner_pkh, note. A dead
                             pre-0.15.0 CONTAINER output; nothing can spend it.
-        type=unknown      → (no extra fields)
+        type=unknown      → token_bearing (true|false|null), input_refs[]:
+                            {opcode, ref_outpoint}. null means the script does
+                            not decode, so the absence of a ref is NOT proven.
+
+    Script-level vs envelope-level: the type above is read from the LOCKING
+    SCRIPT. The Glyph protocol labels that live in the reveal transaction's
+    CBOR envelope — dat / container / authority / encrypted / timelock / wave —
+    are a different classifier, reported under metadata.classification on the
+    txid form only. A TIMELOCK *token* has no script signature to find; the
+    p2pkh-cltv / p2pkh-csv types above are ordinary BIP-65/112 script locks and
+    are unrelated to it.
       txid (--fetch)   → {form, txid, byte_length, input_count, output_count,
                           outputs[], metadata, mint_scriptsig}
         outputs[]: {vout, type, satoshis, ...same per-type fields as script form}

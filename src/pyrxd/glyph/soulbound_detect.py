@@ -25,15 +25,34 @@ recognises both known covenant shapes (and reasonable variants):
 * the pyrxd prototype shape — ``OP_OUTPUTBYTECODE … OP_UTXOBYTECODE OP_EQUALVERIFY``
   (full-bytecode self-equality).
 
-The rule: a SPK is covenant-enforced soulbound iff it (1) binds a singleton ref
+The rule: a SPK gets ``SOULBOUND_COVENANT`` when it (1) binds a singleton ref
 (``d8``), (2) contains a *self-replication equality* — an output-bytecode opcode
 AND an own/input-bytecode opcode joined by ``OP_EQUAL``/``OP_EQUALVERIFY`` — and
-(3) has a *burn branch* (``OP_REFOUTPUTCOUNT_OUTPUTS`` compared against 0). A
-``d8 … OP_DROP P2PKH`` with none of these is a plain transferable NFT.
+optionally (3) has a *burn branch* (``OP_REFOUTPUTCOUNT_OUTPUTS`` compared
+against 0). A ``d8 … OP_DROP P2PKH`` with none of these is a plain transferable
+NFT.
 
 This is a heuristic over consensus-visible structure; it cannot prove the
 covenant is *correct* (that needs the regtest differential test), only that the
 locking script imposes a self-replication-or-burn constraint rather than none.
+
+**Those markers are necessary, not sufficient — read this before using the
+verdict as a label.** Measured against every locking-script builder in ``src``:
+a **dMint V1 contract**, a **dMint V2 contract**, and a **mutable-NFT script**
+all return ``SOULBOUND_COVENANT``. They are not soulbound NFTs; they bind a
+singleton ref and self-replicate because that is how a Radiant covenant carries
+state forward, which is every marker this module looks for. Container and vault
+covenants have the same shape. That looseness is correct for the question this
+module answers — *"does this lock restrict transfer at all, or is 'soulbound'
+just a metadata flag?"* — and wrong for the question *"is this a soulbound
+token?"*.
+
+For the second question use
+:func:`pyrxd.glyph.soulbound_covenant.parse_soulbound_nft_covenant`, an exact
+builder round-trip, and rule out the specific token shapes first.
+``pyrxd.glyph._inspect_core`` does both: it runs the dMint and mutable-NFT
+parsers before either of these, reports ``soulbound-covenant`` only on the
+exact match, and reports a marker-only hit as ``self-replicating-covenant``.
 """
 
 from __future__ import annotations
@@ -41,8 +60,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from pyrxd.constants import REF_OPERAND_WIDTH
-from pyrxd.glyph.script import REF_OPCODES, TruncatedScriptError, count_input_refs
+from pyrxd.glyph.script import TruncatedScriptError, count_input_refs, iter_script_ops_strict
 
 __all__ = [
     "SoulboundClassification",
@@ -104,36 +122,20 @@ class SoulboundClassification:
 
 def _opcodes(script: bytes) -> list[int]:
     """Return the script's opcodes (at opcode positions only), skipping the
-    operands of pushes and 36-byte ref opcodes. Mirrors the consensus-accurate
-    walk in :func:`pyrxd.glyph.script.iter_input_refs`."""
-    ops: list[int] = []
-    pos, n = 0, len(script)
-    while pos < n:
-        op = script[pos]
-        ops.append(op)
-        if op in REF_OPCODES:  # {d0,d1,d2,d3,d8}: opcode + fixed-width ref operand
-            pos += 1 + REF_OPERAND_WIDTH
-            continue
-        if 0x01 <= op <= 0x4B:
-            pos += 1 + op
-            continue
-        if op == 0x4C:  # PUSHDATA1
-            if pos + 1 >= n:
-                break
-            pos += 2 + script[pos + 1]
-            continue
-        if op == 0x4D:  # PUSHDATA2
-            if pos + 2 >= n:
-                break
-            pos += 3 + int.from_bytes(script[pos + 1 : pos + 3], "little")
-            continue
-        if op == 0x4E:  # PUSHDATA4
-            if pos + 4 >= n:
-                break
-            pos += 5 + int.from_bytes(script[pos + 1 : pos + 5], "little")
-            continue
-        pos += 1
-    return ops
+    operands of pushes and 36-byte ref opcodes.
+
+    A thin projection of the shared walk
+    (:func:`pyrxd.glyph.script.iter_script_ops_strict`, which is itself
+    Radiant's ``GetScriptOp`` via :mod:`pyrxd.script.consensus`). This module
+    used to carry its own transcription of that loop — a fifth copy of the
+    rules that decide how many bytes an opcode consumes, and exactly the drift
+    that produced this repo's ref-walker bugs. The shared walk raises
+    :class:`~pyrxd.glyph.script.TruncatedScriptError` where the old local copy
+    silently ``break``-ed; :func:`classify_soulbound` already returned
+    ``UNKNOWN`` for those scripts via its ``count_input_refs`` pre-check, so
+    the visible behaviour is unchanged and now fails closed in both paths.
+    """
+    return [op.opcode for op in iter_script_ops_strict(script)]
 
 
 def classify_soulbound(script: bytes) -> SoulboundClassification:
@@ -141,13 +143,21 @@ def classify_soulbound(script: bytes) -> SoulboundClassification:
 
     Returns a :class:`SoulboundClassification`; check ``.is_consensus_soulbound``
     to decide whether the lock genuinely forbids transfer (vs a metadata flag).
+
+    ``SOULBOUND_COVENANT`` means *this lock imposes a self-replication-or-burn
+    constraint*, NOT *this is a soulbound NFT*. dMint contracts and mutable-NFT
+    scripts return it too — see the module docstring for why, and for what to
+    use instead when a wrong yes is expensive.
     """
+    # Both calls consume the same shared walk, so either both succeed or the
+    # first one raises; keeping them under one guard makes that explicit
+    # rather than relying on the coupling.
     try:
         ref_counts = count_input_refs(script)
+        ops = _opcodes(script)
     except TruncatedScriptError:
         return SoulboundClassification(Transferability.UNKNOWN, None, False, False)
 
-    ops = _opcodes(script)
     op_set = set(ops)
 
     is_singleton = _OP_PUSHINPUTREFSINGLETON in op_set

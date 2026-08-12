@@ -82,10 +82,18 @@ from pyrxd.script.consensus import has_valid_ops
 from pyrxd.security.errors import ValidationError
 
 __all__ = [
+    "SOULBOUND_VARIANT_COMPOSABLE",
+    "SOULBOUND_VARIANT_FIXED_INDEX",
     "SoulboundNftCovenant",
     "build_composable_soulbound_nft_covenant",
     "build_soulbound_nft_covenant",
+    "parse_soulbound_nft_covenant",
 ]
+
+#: The ``output[0]``-pinned shape from :func:`build_soulbound_nft_covenant`.
+SOULBOUND_VARIANT_FIXED_INDEX = "fixed-index"
+#: The index-independent shape from :func:`build_composable_soulbound_nft_covenant`.
+SOULBOUND_VARIANT_COMPOSABLE = "composable"
 
 # Ref-carrying opcodes consume a 36-byte operand (used by the opcode walk).
 # Single source of truth so this walk cannot drift from the consensus set.
@@ -307,3 +315,66 @@ def build_composable_soulbound_nft_covenant(genesis_ref: GlyphRef, owner_pkh: by
     _assert_no_nonminimal_push(spk)
 
     return SoulboundNftCovenant(funded_spk=spk, genesis_ref=ref, owner_pkh=bytes(owner_pkh))
+
+
+# --------------------------------------------------------------------------- inverse
+
+
+# Both variants end in the same 25-byte P2PKH tail and start with
+# ``OP_PUSHINPUTREFSINGLETON <ref:36>``; the fields are at fixed offsets in
+# both. The lengths are asserted against the builders by the test suite rather
+# than spelled as magic numbers here.
+_SB_REF_OFFSET = 1
+_SB_PKH_TAIL_LEN = 25
+
+
+def parse_soulbound_nft_covenant(script: bytes) -> tuple[GlyphRef, bytes, str] | None:
+    """Recover ``(genesis_ref, owner_pkh, variant)`` from a soulbound covenant
+    SPK, or ``None`` if *script* is not one.
+
+    **Exact** inverse of the two builders in this module: it lifts the ref and
+    owner pkh out of the candidate, re-runs the builder on them, and requires
+    the result to equal *script* byte for byte. Nothing is matched
+    approximately, so this cannot drift from what the builders emit and cannot
+    claim a script the builders would not produce.
+
+    That strictness is deliberate and is **narrower** than
+    :func:`pyrxd.glyph.soulbound_detect.classify_soulbound`, which matches on
+    semantic markers so it also recognises the shape deployed on mainnet and
+    reasonable variants. The two answer different questions:
+
+    * this function — "is this exactly a pyrxd soulbound covenant, and with
+      which parameters?"
+    * ``classify_soulbound`` — "does this lock impose a
+      self-replication-or-burn constraint at all?"
+
+    Use this one when a wrong *yes* is expensive. ``classify_soulbound``'s
+    marker set is intentionally loose enough that a dMint contract script and a
+    mutable-NFT script both trip it (they self-replicate too), so a caller that
+    treats its verdict as "this is a soulbound NFT" without first ruling out
+    the specific token shapes will mislabel them.
+
+    Never raises — safe to run over arbitrary chain bytes.
+    """
+    if len(script) < _SB_REF_OFFSET + REF_OPERAND_WIDTH + _SB_PKH_TAIL_LEN:
+        return None
+    if script[0] != OP.OP_PUSHINPUTREFSINGLETON[0]:
+        return None
+    tail = script[-_SB_PKH_TAIL_LEN:]
+    if tail[:3] != b"\x76\xa9\x14" or tail[23:] != b"\x88\xac":
+        return None
+    owner_pkh = tail[3:23]
+    try:
+        ref = GlyphRef.from_bytes(script[_SB_REF_OFFSET : _SB_REF_OFFSET + REF_OPERAND_WIDTH])
+    except ValidationError:
+        return None
+    for variant, builder in (
+        (SOULBOUND_VARIANT_FIXED_INDEX, build_soulbound_nft_covenant),
+        (SOULBOUND_VARIANT_COMPOSABLE, build_composable_soulbound_nft_covenant),
+    ):
+        try:
+            if builder(ref, owner_pkh).funded_spk == script:
+                return ref, owner_pkh, variant
+        except ValidationError:  # pragma: no cover — inputs are already shape-checked
+            continue
+    return None
