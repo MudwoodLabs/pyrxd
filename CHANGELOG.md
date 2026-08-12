@@ -284,8 +284,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Swept the tree for numeric literals that should have been derived, and found four rules
   still written out by hand.** Every previous instance of this class was found incidentally,
   while chasing something else; this was a deliberate AST inventory of all 11,303 numeric
-  literals in `src/`, `scripts/` and `examples/` (7,994 after excluding the trivial ones).
-  **No behaviour changed** — every consolidation below is value-identical today, verified site
+  literals in `src/`, `scripts/` and `examples/` — 7,994 after excluding `0`/`1`/`-1`, small
+  loop bounds and array indices, and **1,854 once the generated Unicode confusables table is
+  set aside**, holding 125 distinct values that appear in two or more files. That was the
+  population actually classified. **No behaviour changed** — every consolidation below is
+  value-identical today, verified site
   by site — so what these buy is that the *next* change to one of these rules moves all of its
   users, instead of the subset that happened to import it.
 
