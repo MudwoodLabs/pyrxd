@@ -634,8 +634,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   additionally carries an identity check (`is`, not `==`) that catches a third spelling the
   name-based detector cannot see — `2 * 32 * 12` is a `BinOp`, not a literal — and the premise
   that makes it non-vacuous, that a separately compiled `768` is a distinct object, is itself
-  asserted rather than assumed. 17 new planted-duplicate proofs and 14 legitimate-shape cases
+  asserted rather than assumed. 20 new planted-duplicate proofs and 14 legitimate-shape cases
   pinning the coincidental matches as *not* flagged.
+
+  The detectors were additionally swept against their own edge cases — `**`-unpacked dicts
+  (whose keys are `None`), position-only and keyword-only defaults, attribute targets,
+  lambdas, augmented and chained assignment, annotation-without-value — plus every `.py` in
+  the tree, because a guard that *raises* on valid source is worse than one that misses: it
+  takes the suite down and gets deleted. That sweep found the one spelling that slipped past,
+  the walrus (`if (fee_rate := 10_000) > 0:`), which binds the rule exactly as an assignment
+  does. Now covered, with its own planted proof.
 
 - **Extended `test_no_duplicate_consensus_constants.py` to the primitives consolidated
   above, and proved every new detector by planting the duplicate it exists to catch.** The

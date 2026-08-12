@@ -808,9 +808,16 @@ def _decimal_int_constant(node: ast.AST, source: str, wanted: int) -> bool:
     return bool(segment and _DECIMAL_INT.fullmatch(segment.strip()))
 
 
+#: Every node type that BINDS a name to a value. ``NamedExpr`` (the walrus) is in the
+#: list because an edge-case sweep found it was the one spelling that slipped past:
+#: ``if (fee_rate := 10_000) > 0:`` binds the rule exactly as an assignment does, and a
+#: detector that only knew ``Assign``/``AnnAssign`` reported the file clean.
+_BINDING_NODES = (ast.Assign, ast.AnnAssign, ast.NamedExpr)
+
+
 def _binding_name(node: ast.AST) -> str | None:
     """The name a statement binds, for the statement kinds a constant hides in."""
-    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+    if isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and isinstance(node.target, ast.Name):
         return node.target.id
     if isinstance(node, ast.Assign):
         for t in node.targets:
@@ -851,7 +858,7 @@ def respelled_relay_floor(source: str) -> list[str]:
         return bool(name) and "fee_rate" in name.lower()
 
     for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+        if isinstance(node, _BINDING_NODES):
             name = _binding_name(node)
             if _is_fee_rate(name) and node.value is not None and _decimal_int_constant(node.value, source, floor):
                 offenders.append(f"line {node.lineno}: {name} = {floor}")
@@ -960,7 +967,7 @@ def restated_eth_finalization_floor(source: str) -> list[str]:
     tree = _parse(source)
     offenders: list[str] = []
     for node in ast.walk(tree):
-        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+        if not isinstance(node, _BINDING_NODES):
             continue
         name = _binding_name(node)
         if not name or not _FLOOR_SHAPED_NAME.search(name):
@@ -1358,6 +1365,21 @@ _PLANTED_DUPLICATES = [
         respelled_relay_floor,
         "the same value with no underscores, which a grep for `10_000` misses",
         "DEFAULT_FEE_RATE = 10000\n",
+    ),
+    (
+        respelled_relay_floor,
+        "a walrus binding — found by sweeping the detector's own edge cases, not the tree",
+        "if (fee_rate := 10_000) > 0:\n    pass\n",
+    ),
+    (
+        respelled_relay_floor,
+        "an attribute target, which a Name-only binding check would miss",
+        "class C:\n    def __init__(self):\n        self.fee_rate = 10_000\n",
+    ),
+    (
+        restated_eth_finalization_floor,
+        "the same floor bound by a walrus",
+        "if (_min_eth_finalization_window := 768) > 0:\n    pass\n",
     ),
     # --- the non-final nSequence, in both spellings ---
     (
