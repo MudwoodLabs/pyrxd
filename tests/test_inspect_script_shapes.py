@@ -38,6 +38,7 @@ from pyrxd.glyph.soulbound_covenant import (
     build_soulbound_nft_covenant,
     parse_soulbound_nft_covenant,
 )
+from pyrxd.glyph.soulbound_detect import Transferability, classify_soulbound
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.keys import PrivateKey
 from pyrxd.script.timelock import (
@@ -243,7 +244,16 @@ class TestSelfReplicatingTier:
         They must still be reported as what they are. This is the regression
         guard on classifier ORDERING: move the soulbound fallback above the
         dMint / mut parsers and a token contract starts reading as a credential.
+
+        The premise is asserted first, deliberately. Without it this test would
+        keep passing if ``classify_soulbound`` stopped matching these shapes —
+        still green, but no longer guarding anything, and the docstring above
+        would quietly become false.
         """
+        assert classify_soulbound(bytes(script)).transferability is Transferability.SOULBOUND_COVENANT, (
+            "premise broken: this shape no longer trips the soulbound markers, so this test "
+            "is not exercising the ordering it claims to guard"
+        )
         row = _classify(script)
         assert row["type"] == ("mut" if label == "mut" else "dmint")
         assert row["type"] not in ("soulbound-covenant", "self-replicating-covenant")
