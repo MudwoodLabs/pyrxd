@@ -45,7 +45,7 @@ asset classification, as before).
 
 from __future__ import annotations
 
-from ...constants import DUST_THRESHOLD_PHOTONS, LOCKTIME_THRESHOLD, SIGHASH
+from ...constants import DUST_THRESHOLD_PHOTONS, LOCKTIME_THRESHOLD, SEQUENCE_LOCKTIME_ENABLED, SIGHASH
 from ...fee_sizing import radiant_relay_size
 from ...gravity.fee_policy import DEFAULT_RADIANT_DEADLINE_FEE_POLICY, DeadlineFeePolicy, assert_fee_covers
 from ...gravity.swap_order import DemandedOutput
@@ -71,8 +71,12 @@ _OP_CLTV_DROP = b"\xb1\x75"  # OP_CHECKLOCKTIMEVERIFY OP_DROP
 SWAP_SELECTOR = b"\x51"  # OP_1  -> OP_IF branch (fill / cancel-before-expiry)
 REFUND_SELECTOR = b"\x00"  # OP_0 -> OP_ELSE branch (CLTV refund)
 
-#: nSequence that keeps nLockTime/CLTV active (must be < 0xFFFFFFFF).
-REFUND_SEQUENCE = 0xFFFFFFFE
+#: nSequence that keeps nLockTime/CLTV active (must be < ``SEQUENCE_FINAL``).
+#:
+#: A re-binding of the canonical constant, not a second literal — the same treatment
+#: :data:`LOCKTIME_HEIGHT_THRESHOLD` below already got, and for the same reason: this
+#: rule had three independent copies across the RSWP and Gravity spend paths.
+REFUND_SEQUENCE = SEQUENCE_LOCKTIME_ENABLED
 
 #: nLockTime/CLTV values at/above this are UNIX timestamps, not heights. The
 #: swap expiry is always a HEIGHT; reject anything at/above the threshold.

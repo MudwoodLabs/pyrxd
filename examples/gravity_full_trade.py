@@ -81,6 +81,7 @@ from pathlib import Path
 # RIPEMD160 in the legacy provider and leaves it unloaded on most current
 # distros, where the direct call raises. pyrxd.hash falls back to a verified
 # pure-Python implementation.
+from pyrxd.fee_sizing import relay_floor_photons_per_byte
 from pyrxd.hash import hash160
 
 # ─── Config ────────────────────────────────────────────────────────────────────
@@ -92,8 +93,10 @@ RXD_ELECTRUMX_URL: str = os.environ.get("RXD_ELECTRUMX_URL", "wss://electrumx.ra
 BTC_API_URL: str = os.environ.get("BTC_API_URL", "https://blockstream.info/api")
 BTC_NETWORK: str = os.environ.get("BTC_NETWORK", "bc")  # "bc" = mainnet, "tb" = testnet
 
-# Fee rate — 10,000 photons/byte
-FEE_RATE_PH_PER_BYTE = 10_000
+# Fee rate, photons per byte. DERIVED from Radiant's effective relay floor rather
+# than typed — an example is copied, so a stale literal here becomes a stale literal
+# in someone else's wallet, building transactions the network will not relay.
+FEE_RATE_PH_PER_BYTE = relay_floor_photons_per_byte()
 MAKER_OFFER_TX_BYTES = 200  # P2PKH → P2SH
 CLAIM_TX_BYTES = 300  # P2SH unlock with offer redeem + sig
 FINALIZE_TX_BYTES = 12_500  # sentinel artifact: ~10.2KB redeem + 12×80B headers + 20×33B branch + 113B rawTx + overhead

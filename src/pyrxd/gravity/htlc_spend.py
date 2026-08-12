@@ -37,7 +37,7 @@ import hashlib
 import logging
 from dataclasses import dataclass, field
 
-from pyrxd.constants import DUST_THRESHOLD_PHOTONS, SIGHASH
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS, SEQUENCE_LOCKTIME_ENABLED, SIGHASH
 from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, fee_overpay_ceiling, fee_overpay_multiple
 from pyrxd.gravity.fee_policy import (
     DEFAULT_RADIANT_DEADLINE_FEE_POLICY,
@@ -386,7 +386,7 @@ def build_htlc_refund_tx(
     cov_in = _covenant_input(covenant, covenant_outpoint, out0_value, _REFUND_SELECTOR, sequence=covenant.refund_csv)
     # The fee input need not carry the relative lock, but must be < FINAL so the tx
     # is BIP68-final-evaluated (mirrors the proven spike: 0xFFFFFFFE).
-    fee_in = _fee_input(fee, sequence=0xFFFFFFFE)
+    fee_in = _fee_input(fee, sequence=SEQUENCE_LOCKTIME_ENABLED)
     tx = Transaction(
         tx_inputs=[cov_in, fee_in],
         tx_outputs=[TransactionOutput(Script(covenant.maker_holder_script), out0_value)],

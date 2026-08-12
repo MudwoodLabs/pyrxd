@@ -31,6 +31,7 @@ import time
 
 from radiant_mainnet_chainio import SshTrRadiantClient
 
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.glyph.dmint import (
     DaaMode,
     DmintAlgo,
@@ -153,7 +154,7 @@ def _fanout(c: SshTrRadiantClient, amounts: list[int]) -> tuple[list[dict], byte
     in_sats = round(u["amount"] * 1e8)
     fee = 4_000_000
     change = in_sats - sum(amounts) - fee
-    if change <= 546:
+    if change <= DUST_THRESHOLD_PHOTONS:
         raise RuntimeError(f"source UTXO {in_sats} too small for {sum(amounts)} + fee {fee}")
     seed = secrets.token_bytes(32)
     fresh_spk = _p2pkh_spk(PrivateKey(seed))
@@ -201,7 +202,7 @@ def prepare() -> None:
     # deploy fee: at 0.10 RXD/kB a ~720B tx ≈ 7.2M photons; budget 8M. Change -> wallet.
     deploy_fee = 8_000_000
     change_val = g_tok["value"] + g_con["value"] - 1 - deploy_fee
-    if change_val <= 546:
+    if change_val <= DUST_THRESHOLD_PHOTONS:
         raise RuntimeError(f"genesis outputs too small: change would be {change_val}")
     deploy = Transaction(
         tx_inputs=[

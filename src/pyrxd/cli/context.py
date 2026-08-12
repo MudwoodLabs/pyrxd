@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .config import Config
+from .config import DEFAULT_FEE_RATE_PHOTONS_PER_BYTE, Config
 from .errors import UserError
 
 if TYPE_CHECKING:
@@ -36,7 +36,12 @@ class CliContext:
     config: Config
     network: str = "mainnet"
     electrumx_url: str = ""
-    fee_rate: int = 10_000
+    #: Bound to :data:`pyrxd.cli.config.DEFAULT_FEE_RATE_PHOTONS_PER_BYTE`, which is
+    #: derived from Radiant's relay floor. A ``CliContext`` built without going through
+    #: :func:`pyrxd.cli.config.load` never sees ``validated_fee_rate``, so a literal
+    #: here is the one that fails OPEN: it would build sub-floor, un-bumpable
+    #: transactions rather than refusing.
+    fee_rate: int = DEFAULT_FEE_RATE_PHOTONS_PER_BYTE
     wallet_path: Path = field(default_factory=Path)
     output_mode: str = "human"  # human | json | quiet
     no_color: bool = False

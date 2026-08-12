@@ -98,6 +98,26 @@ THREAD_POOL_MAX_EXECUTORS: int = int(os.getenv("RXD_PY_SDK_THREAD_POOL_MAX_EXECU
 #: ``nSequence`` value that disables ``nLockTime`` for the whole transaction.
 SEQUENCE_FINAL: int = 0xFFFFFFFF
 
+#: The largest ``nSequence`` that is still NON-final: ``0xFFFFFFFE``. THE ONE
+#: DEFINITION — derived from :data:`SEQUENCE_FINAL` rather than typed, so the two
+#: cannot be one apart by accident.
+#:
+#: Why it needs a name. An input is final iff ``nSequence == SEQUENCE_FINAL``, and a
+#: transaction whose inputs are all final skips ``nLockTime`` entirely
+#: (``CTransaction::IsFinalTx``). ``OP_CHECKLOCKTIMEVERIFY`` therefore *requires* the
+#: spending input to be non-final — it fails outright otherwise — and so does the
+#: BIP68 evaluation a CSV refund depends on. This value is the "non-final, but as
+#: close to final as possible" choice every timelocked spend in this SDK wants: bit 31
+#: is still set, so it disables the BIP68 RELATIVE lock on that input without
+#: disabling the absolute one on the transaction.
+#:
+#: It was written out three times — the RSWP refund spend, the Gravity ``forfeit()``
+#: CLTV input, and the HTLC refund's fee input. All three are the same rule, and the
+#: one-character slip to ``0xFFFFFFFF`` is silent at build time and fatal at spend
+#: time: the refund branch stops being satisfiable, on a chain with no RBF and no
+#: CPFP, in the one path a counterparty stall makes load-bearing.
+SEQUENCE_LOCKTIME_ENABLED: int = SEQUENCE_FINAL - 1
+
 #: Bit 31. Set on an input's ``nSequence`` means "not a relative lock-time" —
 #: ``CheckSequence`` returns false immediately, so the CSV in the script is
 #: satisfied by nothing and the branch is simply unspendable via that path.

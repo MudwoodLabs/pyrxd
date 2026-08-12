@@ -281,6 +281,61 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   repo's signature defect class (compare the *Security* entry above, where four hunters
   independently found four separate instances of one rule spelled twice). Error messages
   gain a caller-supplied prefix and are otherwise unchanged in substance.
+- **Swept the tree for numeric literals that should have been derived, and found four rules
+  still written out by hand.** Every previous instance of this class was found incidentally,
+  while chasing something else; this was a deliberate AST inventory of all 11,303 numeric
+  literals in `src/`, `scripts/` and `examples/` — 7,994 after excluding `0`/`1`/`-1`, small
+  loop bounds and array indices, and **1,854 once the generated Unicode confusables table is
+  set aside**, holding 125 distinct values that appear in two or more files. That was the
+  population actually classified. **No behaviour changed** — every consolidation below is
+  value-identical today, verified site
+  by site — so what these buy is that the *next* change to one of these rules moves all of its
+  users, instead of the subset that happened to import it.
+
+  - **Radiant's per-byte relay floor, spelled out at seven sites.** `relay_floor_photons_per_byte()`
+    has been the owner since `fee_sizing` was introduced, and `glyph.builder`, `glyph.ft` and
+    `wallet` all bind to it — but `cli.config` (`_DEFAULTS` and the `Config` field), `cli.context`,
+    `glyph.dmint.miner.build_dmint_mint_tx` and three examples each kept a literal `10_000`. The
+    sharpest of these is `cli/config.py`, where `validated_fee_rate` **rejects** any rate below the
+    floor and reads that floor from `fee_sizing`, ~270 lines from the default it validates: the
+    value and the rule that judges it were derived independently and agreed by coincidence. A
+    floor increase would make `load()` raise on a machine with no config file at all. The
+    `CliContext` field is the opposite and worse: nothing validates it, so a stale literal there
+    fails *open* into sub-floor transactions, and Radiant has neither RBF nor CPFP — they cannot
+    be bumped and hold their inputs until mempool expiry. The floor is not hypothetical: Radiant
+    ships both `LEGACY_MIN_RELAY_TX_FEE_PER_KB` and `RADIANT_CORE_2_MIN_RELAY_TX_FEE_PER_KB`, and
+    `GetEffectiveMinRelayFee` already stepped between them once, by 10x.
+  - **The non-final `nSequence` (`0xFFFFFFFE`), spelled out three times** — the RSWP refund, the
+    Gravity `forfeit()` CLTV input, and the HTLC refund's fee input. Now
+    `constants.SEQUENCE_LOCKTIME_ENABLED`, derived as `SEQUENCE_FINAL - 1` rather than typed, so
+    the two cannot be one apart by accident. All three sites were checked to mean the same thing
+    (the maximal `nSequence` that is still non-final, so `nLockTime`/BIP68 are evaluated at all);
+    the one-character slip to `0xFFFFFFFF` is silent at build time and leaves the refund branch
+    unsatisfiable at spend time.
+  - **Bitcoin's `MAX_MONEY`, retyped in `btc_wallet/validate.py`** as a bare
+    `2_100_000_000_000_000` while `security.types.BTC_MAX_SATS` derives it as `21_000_000 *
+    100_000_000`. Not a drift risk — a supply cap does not move — but a *chain* risk, and this
+    repo has already paid it: Bitcoin's cap applied to Radiant amounts made one legitimate UTXO
+    above 21,000,000 RXD take every sibling UTXO on its address down with it. An anonymous
+    literal is the copy that gets pasted onto the wrong chain, because nothing about it says
+    which chain it came from.
+  - **The 2-epoch ETH finality floor, declared twice** — `eth_wallet.chains._FLOOR_S` and
+    `swap_coordinator._MIN_ETH_FINALIZATION_WINDOW_S` — joined by a `# Keep in sync with …`
+    comment, which is this failure mode written into the source: it names the obligation and
+    supplies nothing that can discharge it. Both gate the same rule at different boundaries, so
+    raising one for a real consensus change and missing the other leaves a cross-chain swap
+    claiming against a finalization reserve the chain no longer honours. Now one
+    `ETH_FINALIZATION_WINDOW_FLOOR_S`, derived as `2 * 32 * 12`.
+
+  Deliberately **not** consolidated, and now commented where a reader would reasonably suspect
+  duplication: the several coincidental matches. `_BPS_DENOMINATOR`/`_BPS` (10,000 basis points
+  = 100%) and `MAINNET_DUST_CEILING_PHOTONS` are the same integer as the relay floor for
+  unrelated reasons; `PHOTONS_PER_RXD` and `_SATS_PER_BTC` are both 100,000,000 on two different
+  chains; `EvmChain(finalization_window_s=768)` in the registry is Ethereum L1's actual window
+  (data) rather than the floor (the rule), and coupling them would tie "what this chain does" to
+  "what we refuse to go below". Each is asserted *unflagged* by the new guards, so the
+  non-consolidation is recorded as a test rather than as a hope.
+
 - **`HdWallet` treated a failed per-address chain read as "this address holds nothing".**
   `collect_spendable`, `get_utxos` and `get_balance` each gathered per-address reads with
   `return_exceptions=True` and then filtered by `isinstance(result, list | tuple)`, silently
@@ -550,6 +605,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `"signature does not validate|receive terms do not match"` and was named for the wrong
   one — the receive-terms gate runs first, so the signature gate it claimed to test was
   never reached. It is now two tests, each asserting a single gate with no alternation.
+- **Closed the duplicate-constant guard's remaining blind spot: it never looked outside
+  `src/`.** The value-based scan in `test_no_duplicate_consensus_constants.py` started at
+  `src` and stopped there — not by argument, just by where it was first written — so five
+  hand-written `546`s sat in shipped examples and mainnet run scripts the entire time it was
+  passing green. `examples/` is the code readers copy, which makes a stale literal there
+  strictly worse than one in `src/`. The scan now covers `src`, `scripts` and `examples`;
+  `tests/` stays excluded on the existing measured grounds (19 legitimate `500_000_000`
+  photon amounts, plus boundary vectors like `2_100_000_000_000_001`), and remains covered by
+  the name-based check instead — the two guards keep different blind spots on purpose.
+
+- **Four new detectors for rules that are DERIVED somewhere and were retyped anyway**, each
+  narrow by construction: a blanket ban on the underlying number would be unsatisfiable and
+  allow-listed away within a release, so each keys on the value *and* the role the site puts
+  it in. `respelled_relay_floor` fires only where the number is playing the part of a fee rate
+  (a binding, parameter default or dict entry whose name says `fee_rate`);
+  `restated_eth_finalization_floor` only on floor-shaped names, covering both spellings the
+  real duplicate used — a guard keyed on only `_FLOOR_S` would have missed
+  `_MIN_ETH_FINALIZATION_WINDOW_S`, the same mistake `_GUARDED_NAMES` made with
+  `LOCKTIME_HEIGHT_THRESHOLD`. Plus `respelled_non_final_sequence` and
+  `respelled_money_supply_cap`, and `SEQUENCE_LOCKTIME_ENABLED` added to `_GUARDED_NAMES`.
+
+  **Every one was proved by planting the duplicate back into the real tree and watching the
+  guard go red** — not only against throwaway source strings — because this repo has shipped a
+  guard that could not catch the bug it was written for. `respelled_relay_floor` did not need a
+  planted proof to earn its place: on first run it found two more live copies
+  (`FEE_RATE_PH_PER_BYTE` in two examples) that the manual sweep had missed. The ETH floor
+  additionally carries an identity check (`is`, not `==`) that catches a third spelling the
+  name-based detector cannot see — `2 * 32 * 12` is a `BinOp`, not a literal — and the premise
+  that makes it non-vacuous, that a separately compiled `768` is a distinct object, is itself
+  asserted rather than assumed. 20 new planted-duplicate proofs and 14 legitimate-shape cases
+  pinning the coincidental matches as *not* flagged.
+
+  The detectors were additionally swept against their own edge cases — `**`-unpacked dicts
+  (whose keys are `None`), position-only and keyword-only defaults, attribute targets,
+  lambdas, augmented and chained assignment, annotation-without-value — plus every `.py` in
+  the tree, because a guard that *raises* on valid source is worse than one that misses: it
+  takes the suite down and gets deleted. That sweep found the one spelling that slipped past,
+  the walrus (`if (fee_rate := 10_000) > 0:`), which binds the rule exactly as an assignment
+  does. Now covered, with its own planted proof.
 
 - **Extended `test_no_duplicate_consensus_constants.py` to the primitives consolidated
   above, and proved every new detector by planting the duplicate it exists to catch.** The
