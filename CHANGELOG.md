@@ -55,6 +55,56 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The shared fee-rate gate now judges a rate from BOTH ends.**
+  `assert_fee_rate_clears_relay_floor` — the one check every builder runs on a
+  caller-supplied `fee_rate` — refused a rate below Radiant's relay floor and
+  accepted *anything* above it. A fee is `size × fee_rate`, so a rate `k` times
+  the floor pays `k` times the requirement, and the builders behind this gate
+  spend the difference irreversibly: an NFT transfer and a sweep have **no change
+  output at all**, so the whole overpay leaves with the miner. Measured on
+  `build_nft_transfer_tx` before the bound existed: `fee_rate=10_000_000` —
+  which is literally `RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`, the
+  per-**kB** constant `pyrxd.fee_sizing` exports one import away from the
+  per-**byte** one — burned **2,320,000,000 photons (23.2 RXD)** off a 229-byte
+  transfer at a **1009x** overpay, silently, with the build reporting success.
+
+  The ceiling is `MAX_FEE_OVERPAY_MULTIPLE × relay_floor_photons_per_byte()` =
+  100_000 photons/byte. That constant is reused rather than a new number
+  invented, because `fee / requirement` and `fee_rate / floor` are the *same
+  ratio*. The highest deliberate rate anywhere in `src/` or `tests/` is 90_000
+  (9x), measured over every `fee_rate=` literal, so the bound has room; it is a
+  multiple, so it tracks the floor if the floor moves. `allow_overpay=True`
+  mirrors the existing `allow_below_relay_floor` hatch, and each skips only its
+  own bound. Stated rather than left to be discovered: one extra zero on a rate
+  that is already the floor lands on **exactly** 100_000, which is permitted —
+  the bound catches the 100x and 1000x slips, not every fat finger.
+  `RxdWallet`, `HdWallet`, the FT airdrop/transfer builders,
+  `build_nft_transfer_tx` and the watch-only builder all inherit it from the one
+  gate.
+
+- **No builder rejected a repeated outpoint; three now do.** An outpoint is
+  unique on chain, so the same `(txid, vout)` twice is always a caller mistake —
+  and nothing downstream noticed. Measured before the checks: an `FtUtxoSet`
+  holding one UTXO twice reported **double** the real balance from `total()` and
+  let `select()` hand the same outpoint back twice; `FtUtxoSet.build_airdrop_tx`
+  with one funding UTXO passed twice signed a transaction carrying a duplicate
+  input — rejected by every node as `bad-txns-inputs-duplicate` — and reported a
+  fee **4x** the real one, because `funding_total` and the final
+  `assert_pays_for_its_size` are handed the same double-counted number.
+  `FtUtxoSet.__init__` now refuses a repeated token outpoint,
+  `build_airdrop_tx` refuses a repeated funding outpoint and refuses an outpoint
+  listed as both token and funding (the seam neither list can see on its own).
+  All three key on `(txid, vout)` and not on `txid`: one transaction paying a
+  holder at several output indexes is ordinary and still builds.
+
+- **`AirdropFunding.value` is validated at construction**, the way
+  `FtUtxo.value` already was. It is summed into the RXD budget the fee comes out
+  of and was the only unchecked number there; a wrong one surfaced late and
+  unhelpfully — measured as `'float' object has no attribute 'to_bytes'` from
+  the middle of output serialisation, `OverflowError` for a negative, and for
+  `True` a nonsense "budget 1 photons" in the insufficient-funding message. The
+  floor is 1 photon, not 546: Radiant's real output rule is `nValue <= 0`.
+
 - **The soulbound classification is split into two tiers so the weaker one is
   never sold as the stronger.** `classify_soulbound` matches on semantic
   markers, which is right for its own job but too loose to drive a label:
@@ -97,6 +147,60 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reflects a restriction consensus enforces.
 
 ### Tests
+
+- **Mutation testing reaches the transaction builders for the first time
+  (`task mutate builders`).** `fee_sizing.py`, `glyph/ft.py`,
+  `glyph/royalty.py`, `glyph/builder.py`, `wallet.py` and `hd/wallet.py` — ~5,100
+  statements of fee sizing and value arithmetic — had never been in a mutation
+  scope, which is the surface every fee defect of the recent audit week lived
+  on. The new group is registered in `scripts/mutation_test.sh` (its clean test
+  list measures 9.3 s, and the cleanup trap now restores its files by name so a
+  mutant cannot be left in the tree).
+
+  The first pass was **hand-mutation, not cosmic-ray**: 59 mutants chosen for
+  consequence, planted one at a time against the full offline suite. That is a
+  deliberately partial method and `docs/how-to/mutation-testing.md` records it
+  as one — it says nothing about the mutants nobody wrote.
+
+  The conservation and "1 photon = 1 unit" arithmetic came out **strong**:
+  over-delivering an FT recipient by one unit is caught by 44 tests, burning one
+  unit of FT change by 25, letting the token pay its own fee by 19, dropping the
+  two-pass DER signature headroom by 57, and all 8 royalty-arithmetic mutants
+  die. The gaps clustered elsewhere — in the fail-closed backstops themselves,
+  which every builder has and only some builders prove, and in `fee_sizing`'s
+  less-travelled helpers, where the existing tests happened to sit on inputs for
+  which the mutation makes no numerical difference.
+
+  Twelve guards were **correct but unverified** — each could be deleted or
+  inverted with the whole offline suite staying green — and are now pinned in
+  `tests/test_builder_mutation_hardening.py`:
+
+  - `FtUtxoSet.build_airdrop_tx`'s and `HdWallet.build_send_max_tx`'s final
+    "does this transaction pay for its own bytes" assertions. The differentials
+    that exercise those exist, but were written for their siblings: the
+    `RxdWallet` one is parametrized over `send` and `send_max`, the `HdWallet`
+    one only ever called `build_send_tx`.
+  - `build_nft_transfer_tx`'s uneconomic-output floor. Without it a carrier too
+    small for its own fee yields a **negative** output value and is signed
+    anyway — `assert_pays_for_its_size` is handed `nft_utxo_value -
+    output_value`, which is the fee by construction and stays correct however
+    absurd the output becomes.
+  - `build_nft_transfer_tx`'s legacy-CONTAINER refusal, whose only existing test
+    is regtest-gated.
+  - `WITNESS_SCALE_FACTOR == 4`. Both existing `bitcoin_virtual_size` cases are
+    algebraically invariant to it, so raising it to 5 — which *under*-states a
+    BTC transaction's size and therefore its fee — survived everything offline.
+  - `fee_never_below_relay_floor`'s `size × rate` arm and its rate validation:
+    every prior test ran at or below the floor, where both arms of the `max`
+    give the same number.
+  - `radiant_relay_size`'s bytes-only gate, `fee_overpay_ceiling`'s `max`, and
+    `fee_overpay_multiple`'s divide-by-zero clamp.
+
+  Every test in the new file was proved by planting its own mutant and watching
+  it go red, and every one is paired with its inverse-bug half — the ceiling
+  itself must pass, two vouts of one transaction must still build, a `bytearray`
+  must still be measured — because a guard that refuses valid work is its own
+  fund-safety defect.
 
 - **The relay-floor boundary searches in `test_remaining_builder_floors_regtest_e2e.py`
   failed ~14% of the time for reasons that had nothing to do with the code under test.**
