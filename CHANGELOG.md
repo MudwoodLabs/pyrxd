@@ -128,6 +128,32 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exactly the 421-byte class**. It stays as it is because its two halves get 60
   independent tries each — which is precisely what the flaking searches lacked.
 
+- **The family's last unmeasured search — the cold-recovery fee boundary — was measured,
+  and deliberately left alone.**
+  `test_cold_recovery_regtest_e2e::test_the_builders_relay_floor_is_the_nodes_relay_floor`
+  carried an ESTIMATED ~0.05%-per-run give-up probability, arrived at structurally by
+  reading its twelve rounds as twelve single attempts. Measured over **30,000 offline
+  trials of the shipped case** — imported and driven rather than re-implemented; the
+  search needs a funded UTXO, but its *convergence* does not — it gave up **0 times**,
+  with its 60,000 searches settling in a mean of **2.03 draws** and a worst of **19**.
+  Live: **40 consecutive green runs** of the file on a regtest node at
+  `-minrelaytxfee=0.10`, mainnet's floor, asserted back from the node — which reported
+  the same two size classes the offline model did.
+
+  The estimate was ~1,900x too pessimistic, and the reason is that the budget is **23
+  attempts, not 12**: round one tries the probe's size, and every round after it retries
+  *every* size observed so far, so per-round survival is a product rather than one coin
+  flip. The cold claim also carries exactly **one** signature — the covenant unlock is
+  `<preimage> OP_0`, no sig — so its size is a near-fair coin rather than a lopsided
+  five-class spread: over 181,696 builds, 266 B 49.73%, 267 B 49.89%, 265 B 0.38%,
+  264 B 0.003%. One draw settles 49.30% of the time (60,000 of 121,696 attempts), which
+  puts per-round survival at 0.2519 and the give-up probability at **~1.3e-7 per search,
+  ~2.6e-7 per run** — ~150x below the 0.004%-per-run residual left alone just above, and
+  ~40,000x below the ~1% rates that were fixed. The measurement and its mechanism now sit
+  in the search's docstring, where the estimate used to be; **no code changed, and no
+  assertion moved.** There is no sibling search in that file — the case calls this one
+  search twice, at the floor and one photon under, and both are inside the 30,000 trials.
+
 ## [0.17.0] — 2026-08-11
 
 A security release, and the one where the tests got audited as hard as the code.
