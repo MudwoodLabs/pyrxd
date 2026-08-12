@@ -22,11 +22,29 @@ the material itself.
 
 from __future__ import annotations
 
+import ast
+import hashlib
+import hmac
 import os
+import re
 
 import pytest
 
 from pyrxd.base58 import b58_decode, base58check_decode
+from pyrxd.glyph.encrypted_content import (
+    KEY_FORMAT_WRAPPED,
+    SCHEME_CHUNKED_AEAD_V1,
+    CryptoMetadata,
+    EncryptedContentStub,
+    EncryptionMetadata,
+)
+from pyrxd.glyph.timelock import (
+    TimelockParams,
+    add_timelock_to_metadata,
+    format_cek_hash,
+    verify_cek_reveal,
+)
+from pyrxd.glyph.types import GlyphProtocol
 from pyrxd.hd.bip32 import Xprv, master_xprv_from_seed
 from pyrxd.hd.bip39 import mnemonic_from_entropy, seed_from_mnemonic
 from pyrxd.keys import PrivateKey
@@ -179,3 +197,144 @@ def test_no_cause_chain_is_left_to_resurface_the_input() -> None:
         b58_decode(_corrupt(secret, 20))
     assert exc.value.__cause__ is None
     assert exc.value.__suppress_context__ is True
+
+
+# ── the other direction: a secret handed BACK on a result object ──────────────
+#
+# Everything above is a secret ARRIVING as input, echoed by a decoder that could
+# not know what it was handed. This section is the return path, and it has a sink
+# the decoders do not: ``@dataclass`` writes a ``__repr__`` for you, over every
+# field, and nobody reviews a method nobody wrote. Two carriers in this tree
+# already opt out by hand (``FeeInput.wif``, ``HdWallet._seed``); a third did not.
+#
+# The assertions below are byte-level rather than character-level because a
+# ``bytes`` field renders as ``b'\\x8f\\xa2...'``, not as hex — a hex-window
+# search would pass over a full disclosure without seeing it.
+
+
+def _renderings_of(obj: object) -> list[str]:
+    """Every way an operator's code could turn *obj* into text.
+
+    ``print``, ``logging.info("%s", obj)`` and an f-string all land on ``__str__``;
+    ``%r``, ``repr()`` and the interactive echo land on ``__repr__``; a dataclass
+    without an explicit ``__str__`` routes both to the generated ``__repr__``.
+    """
+    return [repr(obj), str(obj), f"{obj}", f"{obj!r}", "%s" % (obj,), "%r" % (obj,)]  # noqa: UP031
+
+
+def _bytes_literals_in(text: str) -> list[bytes]:
+    """Every ``b'...'`` literal in *text*, evaluated back to the bytes it denotes.
+
+    This is the recovery an attacker actually performs on a log line: the repr of
+    a ``bytes`` field is valid Python source for the value it discloses.
+    """
+    found: list[bytes] = []
+    for match in re.finditer(r"""b'(?:[^'\\]|\\.)*'|b"(?:[^"\\]|\\.)*\"""", text):
+        try:
+            value = ast.literal_eval(match.group(0))
+        except (ValueError, SyntaxError):  # pragma: no cover - malformed slice
+            continue
+        if isinstance(value, bytes):
+            found.append(value)
+    return found
+
+
+def _describe_echo(renderings: list[str], secret: bytes) -> str | None:
+    """A description of the first leak found, or ``None``.
+
+    Two independent checks, because either alone can be evaded: a full literal
+    that ``ast.literal_eval`` reconstructs (compared by digest, so the comparison
+    itself never holds the material next to a description of it), and any
+    ``_LEAK_WINDOW``-char run of the escaped form, which catches a truncated or
+    reformatted disclosure.
+
+    Returning a string rather than asserting inline is not style, and the callers
+    below invoke it from the test body rather than through an assertion helper for
+    the same reason. ``assert window not in text`` hands pytest's assertion
+    rewriting both operands; an assertion helper hands pytest the secret as a
+    displayed frame argument. The first two drafts of this file did each in turn,
+    and both printed a CEK into the log the test exists to keep it out of.
+    """
+    digest = hashlib.sha256(secret).digest()
+    escaped = repr(secret)[2:-1]  # strip the b'' wrapper; keep the escaping
+    windows = [escaped[i : i + _LEAK_WINDOW] for i in range(len(escaped) - _LEAK_WINDOW + 1)]
+    for text in renderings:
+        for candidate in _bytes_literals_in(text):
+            if hmac.compare_digest(hashlib.sha256(candidate).digest(), digest):
+                return "a bytes literal in a rendering evaluates to the secret itself — directly recoverable"
+        for index, window in enumerate(windows):
+            # Report the position only. Returning the window would defeat the test.
+            if window in text:
+                return (
+                    f"a {_LEAK_WINDOW}-char run of the secret's escaped form is visible "
+                    f"at offset {index} (of {len(escaped)} chars)"
+                )
+    return None
+
+
+def _encrypted_stub() -> EncryptedContentStub:
+    """The minimum an ENCRYPTED stub needs for TIMELOCK to attach to it."""
+    payload = b"sealed until the unlock height"
+    return EncryptedContentStub(
+        p=[GlyphProtocol.NFT, GlyphProtocol.ENCRYPTED],
+        type="image/png",
+        name="sealed",
+        main=EncryptionMetadata(
+            type="image/png",
+            hash=format_cek_hash(hashlib.sha256(payload).digest()),
+            size=len(payload),
+            chunks=1,
+            scheme=SCHEME_CHUNKED_AEAD_V1,
+        ),
+        crypto=CryptoMetadata(mode="encrypted", key_format=KEY_FORMAT_WRAPPED),
+    )
+
+
+def test_the_timelock_mint_result_never_echoes_the_content_key() -> None:
+    """The CEK decrypts a TIMELOCK payload BEFORE its unlock height.
+
+    That is the whole protocol: the chain carries only ``sha256(cek)``, and the
+    key stays off-chain until the reveal transaction publishes it. A result
+    object that prints it verbatim collapses the wait to whoever reads the log.
+    """
+    cek = os.urandom(32)
+    result = add_timelock_to_metadata(_encrypted_stub(), cek, TimelockParams(mode="block", unlock_at=900_000))
+    leak = _describe_echo(_renderings_of(result), cek)
+    assert leak is None, leak
+
+
+def test_the_recovered_key_would_have_been_a_working_one() -> None:
+    """The counterfactual, stated so the severity is not re-argued later.
+
+    If the field is ever echoed again, what leaks is not a fingerprint of the key
+    but the key: it verifies against the on-chain commitment and decrypts. This
+    test pins that the commitment in the metadata is the CEK's, so the leak test
+    above is guarding a live secret rather than an opaque blob.
+    """
+    cek = os.urandom(32)
+    result = add_timelock_to_metadata(_encrypted_stub(), cek, TimelockParams(mode="block", unlock_at=900_000))
+    assert result.metadata.crypto.timelock is not None
+    assert verify_cek_reveal(cek, result.metadata.crypto.timelock.cek_hash)
+
+
+def test_the_key_is_still_reachable_through_the_field() -> None:
+    """Hiding it from ``repr`` must not hide it from the caller.
+
+    The CEK is the ONLY way to broadcast the reveal later; a fix that dropped it
+    would destroy the payload rather than protect it.
+    """
+    cek = os.urandom(32)
+    result = add_timelock_to_metadata(_encrypted_stub(), cek, TimelockParams(mode="block", unlock_at=900_000))
+    assert result.cek_for_caller_to_store == cek
+
+
+def test_an_exception_carrying_the_result_does_not_echo_the_key() -> None:
+    """The error boundary in ``cli/main.py`` prints ``cause: {exc}``, and an
+    exception built with the result object in its args renders through the same
+    ``__repr__``. This is the path that turned a mistyped WIF into 51 disclosed
+    characters."""
+    cek = os.urandom(32)
+    result = add_timelock_to_metadata(_encrypted_stub(), cek, TimelockParams(mode="block", unlock_at=900_000))
+    exc = RuntimeError("timelock mint failed", result)
+    leak = _describe_echo(_every_rendering(exc), cek)
+    assert leak is None, leak

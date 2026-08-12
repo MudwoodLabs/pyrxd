@@ -206,6 +206,38 @@ def test_harden_process_returns_report_without_raising() -> None:
     assert all(isinstance(v, bool) for v in d.values())
 
 
+@pytest.mark.parametrize("failing", ["_try_mlockall", "_try_set_non_dumpable", "_try_disable_core_dumps"])
+def test_harden_process_never_raises_even_when_a_measure_explodes(
+    failing: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The "never raises" line in the docstring is now load-bearing.
+
+    ``pyrxd agent unlock`` calls ``harden_process()`` BEFORE prompting for the
+    mnemonic, so ``mlockall`` is in effect before a secret can be paged to swap.
+    That ordering means an exception out of here does not merely skip hardening —
+    it denies the user their own wallet, on a host whose only sin might be a
+    missing ``CAP_IPC_LOCK``. The individual helpers catch ``OSError``; this pins
+    the backstop for everything they cannot anticipate (a ``ctypes`` marshalling
+    error, a libc without the symbol).
+    """
+
+    def _explode():
+        raise RuntimeError("ctypes marshalling failed in a way nobody predicted")
+
+    monkeypatch.setattr(f"pyrxd.agent.hygiene.{failing}", _explode)
+    report = harden_process()
+    assert (
+        report.as_dict()[
+            {
+                "_try_mlockall": "mlock",
+                "_try_set_non_dumpable": "non_dumpable",
+                "_try_disable_core_dumps": "core_dumps_disabled",
+            }[failing]
+        ]
+        is False
+    )
+
+
 # ──────────────────────────── daemon policy (pure) ─────────────────────────────
 
 

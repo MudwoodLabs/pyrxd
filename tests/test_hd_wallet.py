@@ -1897,3 +1897,159 @@ class TestSendBroadcast:
         client = _mock_client()
         with pytest.raises(ValidationError, match="Insufficient"):
             asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000))
+
+
+# ---------------------------------------------------------------------------
+# A failed per-address read is not an answer
+# ---------------------------------------------------------------------------
+
+
+def _client_failing_on(addresses: set[str], *, utxo_map: dict) -> MagicMock:
+    """A client that serves ``get_history`` for everything but errors on
+    ``get_utxos``/``get_balance`` for *addresses*.
+
+    This split is not contrived: ``electrumx.py`` raises "Malformed UTXO entry in
+    server response" purely from ``listunspent`` content validation, which cannot
+    affect ``get_history`` — so ``refresh()``'s fail-closed gate sees a clean scan
+    while the UTXO read for one address is failing.
+    """
+    from pyrxd.network.electrumx import script_hash_for_address
+    from pyrxd.security.errors import NetworkError
+
+    failing = {script_hash_for_address(a) for a in addresses}
+    client = MagicMock(spec=ElectrumXClient)
+
+    async def _get_history(script_hash):
+        return [{"tx_hash": "aa" * 32, "height": 100}]
+
+    async def _get_utxos(script_hash):
+        if script_hash in failing:
+            raise NetworkError("malformed UTXO entry in server response")
+        for addr, utxos in utxo_map.items():
+            if script_hash_for_address(addr) == script_hash:
+                return utxos
+        return []
+
+    async def _get_balance(script_hash):
+        if script_hash in failing:
+            raise NetworkError("malformed UTXO entry in server response")
+        return (100_000_000, 0)
+
+    client.get_history = _get_history
+    client.get_utxos = _get_utxos
+    client.get_balance = _get_balance
+    return client
+
+
+def _three_used_addresses(w: HdWallet) -> list[str]:
+    for i in range(3):
+        addr = w._derive_address(0, i)
+        w.addresses[w._path_key(0, i)] = AddressRecord(address=addr, change=0, index=i, used=True)
+    w.external_tip = 3
+    return [w._derive_address(0, i) for i in range(3)]
+
+
+class TestAFailedReadIsNotAnAnswer:
+    """``_scan_chain`` refuses to read a failed lookup as "unused" — "A failed
+    lookup cannot be safely interpreted as 'unused'", it says, closing N5. The
+    three UTXO/balance readers were doing exactly that, one rule spelled two ways.
+
+    The dividing line drawn here is what the caller CLAIMS. "Spend 10 RXD" only
+    needs enough, and refusing it because one address was unreadable would be a
+    fail-closed refusal of a legitimate spend — potentially during a timelock
+    race. "Sweep everything" is a completeness claim, and a partial view makes it
+    a false one. So: warn on the first, refuse on the second.
+    """
+
+    def test_a_partial_read_is_reported_not_swallowed(self, caplog):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on(
+            {addrs[1]},
+            utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=100_000_000)] for i, a in enumerate(addrs)},
+        )
+        with caplog.at_level("WARNING"):
+            triples = asyncio.run(w.collect_spendable(client))
+        assert len(triples) == 2  # the tolerant default is preserved
+        assert any("1 of 3" in r.message for r in caplog.records), (
+            "a dropped address must leave a trace — the SDK path had no logging at all, "
+            "so the only signal was a balance that quietly came back smaller"
+        )
+
+    def test_get_utxos_reports_a_partial_read(self, caplog):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on({addrs[2]}, utxo_map={a: [_utxo(value=100_000_000)] for a in addrs})
+        with caplog.at_level("WARNING"):
+            asyncio.run(w.get_utxos(client))
+        assert any("1 of 3" in r.message for r in caplog.records)
+
+    def test_get_balance_reports_a_partial_read(self, caplog):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on({addrs[0]}, utxo_map={})
+        with caplog.at_level("WARNING"):
+            total = asyncio.run(w.get_balance(client))
+        assert total == 200_000_000  # 2 of 3 answered
+        assert any("1 of 3" in r.message for r in caplog.records)
+
+    @pytest.mark.parametrize("reader", ["collect_spendable", "get_utxos", "get_balance"])
+    def test_strict_refuses_a_partial_read(self, reader):
+        from pyrxd.security.errors import NetworkError
+
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on({addrs[1]}, utxo_map={a: [_utxo(value=100_000_000)] for a in addrs})
+        with pytest.raises(NetworkError, match="1 of 3"):
+            asyncio.run(getattr(w, reader)(client, strict=True))
+
+    def test_strict_is_satisfied_when_every_read_answers(self):
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on(set(), utxo_map={a: [_utxo(value=100_000_000)] for a in addrs})
+        assert len(asyncio.run(w.collect_spendable(client, strict=True))) == 3
+
+    def test_send_max_refuses_to_sweep_a_partial_view(self):
+        """THE regression. ``send_max`` swept 2 of 3 addresses, returned a txid,
+        and reported nothing — 100,000,000 photons left behind, unswept and
+        unmentioned, while ``docs/how-to/recover-funds-across-wallet-paths.md``
+        promises the sweep "moves **everything** under that path".
+
+        Recoverable by re-running, but only by someone who knows to."""
+        from pyrxd.security.errors import NetworkError
+
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on(
+            {addrs[1]},
+            utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=100_000_000)] for i, a in enumerate(addrs)},
+        )
+        broadcast_calls = []
+
+        async def _broadcast(raw):
+            broadcast_calls.append(raw)
+            return "cd" * 32
+
+        client.broadcast = _broadcast
+
+        with pytest.raises(NetworkError, match="1 of 3"):
+            asyncio.run(w.send_max(client, _RECIPIENT_ADDR))
+        assert not broadcast_calls, "a sweep built from an incomplete view must not reach the wire"
+
+    def test_send_still_works_on_a_partial_view(self):
+        """The other half, and the reason ``send`` is NOT strict: an amount send
+        needs *enough*, not *all*. Refusing it because one address was unreadable
+        would turn a recoverable read fault into a refusal to move funds — which
+        on a deadline-racing spend is the more expensive failure."""
+        w = HdWallet.from_mnemonic(MNEMONIC)
+        addrs = _three_used_addresses(w)
+        client = _client_failing_on(
+            {addrs[1]},
+            utxo_map={a: [_utxo(tx_hash=bytes([i + 1]).hex() * 32, value=1_000_000_000)] for i, a in enumerate(addrs)},
+        )
+
+        async def _broadcast(raw):
+            return "ab" * 32
+
+        client.broadcast = _broadcast
+        assert asyncio.run(w.send(client, _RECIPIENT_ADDR, photons=10_000_000)) == "ab" * 32

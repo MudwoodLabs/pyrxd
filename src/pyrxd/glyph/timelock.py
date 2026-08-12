@@ -26,7 +26,7 @@ builder + parser lives in :mod:`pyrxd.glyph.timelock_reveal_tx`.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from ..security.errors import ValidationError
@@ -63,10 +63,20 @@ class TimelockMintResult:
     - ``cek_for_caller_to_store``: the 32-byte CEK the caller MUST persist
       off-chain (encrypted at rest, paired with this wallet's mnemonic, etc.)
       until reveal time. Without it the reveal cannot be broadcast.
+
+    ``cek_for_caller_to_store`` is ``repr=False`` because the CEK is a PRE-reveal
+    secret: the chain carries only ``sha256(cek)``, and the whole point of the
+    protocol is that the payload cannot be decrypted until the reveal publishes
+    the key. A default dataclass ``repr`` put it verbatim into every ``print``,
+    f-string, ``%s``, ``logging`` call and exception message that touched this
+    object, and the printed form is valid Python for the key itself — a log line
+    was a working decryption key. Same reason and same shape as
+    ``FeeInput.wif`` (``gravity/htlc_spend.py``) and ``HdWallet._seed``.
+    ``tests/security/test_key_material_never_echoed.py`` pins it.
     """
 
     metadata: EncryptedContentStub
-    cek_for_caller_to_store: bytes
+    cek_for_caller_to_store: bytes = field(repr=False)
 
 
 # ──────────────────────────────────────────────────── core helpers ──

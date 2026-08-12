@@ -8,6 +8,64 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **The soulbound-credential gate ran only inside the taker's own pre-fund method — the third
+  instance of one defect class.** A swap that sets `NegotiatedTerms.credential_ref` requires the
+  payout recipient to hold a genuine consensus-soulbound credential. The only enforcement lived
+  in `pre_btc_lock_check`, called from exactly one place: `taker_funds_btc`. That is the TAKER's
+  method, and the party the gate protects is the MAKER — `credential_binding` names the
+  asset-locker as the one who runs it. An uncredentialed taker therefore declines to call the
+  method holding the check and funds the freely-derivable HTLC address directly; the honest
+  maker, **with a correct `credential_resolver` wired**, then walked `BTC_LOCKED` →
+  `BOTH_LOCKED` → `maker_claims_btc` and revealed `p` with the resolver call count still at
+  **zero** (reproduced, then re-run against the fix).
+
+  This is the same shape as the maker-side and taker-side counter-funding gaps (HZ-1, HZ-3),
+  which each lived only inside the *other* party's method, and it is fixed the same way: the
+  rule is now one private coroutine (`_credential_binding_failure`) with two entry points — the
+  taker's pre-fund gate, which reports it, and `_assert_credential_binding_verified`, a
+  precondition for `BOTH_LOCKED` alongside the two counter-funding assertions, which raises. A
+  gated swap cannot reach the state that enables the `p` reveal unverified. Refusing there leaves
+  the maker at `BTC_LOCKED` with its CSV asset refund still open, so the fail-closed direction
+  costs a swap, never an asset. **No behaviour change for any swap without `credential_ref`**,
+  which is every swap this repo's CLI, scripts and examples can construct.
+
+  The audit's separate suggestion — warn when a MAKER-role coordinator is handed a resolver it
+  will never call — is moot: the maker now calls it.
+
+- **A pre-reveal content-encryption key was printed verbatim by a default dataclass `repr`.**
+  `TimelockMintResult.cek_for_caller_to_store` is the 32-byte CEK that decrypts a TIMELOCK
+  payload *before* its unlock height; the chain carries only `sha256(cek)`. Every stringification
+  disclosed it — `print`, f-string, `%s`, `%r`, `logging`, and any exception carrying the result
+  object — and the printed form is valid Python for the key, so a log line was a working
+  decryption key, verifiable against the on-chain commitment. Now `field(repr=False)`, matching
+  `FeeInput.wif` and `HdWallet._seed`. The value is unchanged and still reachable through the
+  field; only its rendering changed.
+
+  A dataclass `repr` is the leak sink nobody reviews, because nobody writes it. All 21
+  secret-named dataclass fields in `src/` were triaged: this was the only pre-reveal secret
+  carried as raw bytes behind a generated `repr` (the rest are wrapped types with safe reprs,
+  public commitments, wrapped keys, PoW preimages, or already `repr=False`).
+
+- **`pyrxd agent unlock` hardened the process after the mnemonic and seed were already
+  resident.** `harden_process()` ran only inside `AgentDaemon.serve_forever` — the last step of
+  the command — so the mnemonic was typed, the passphrase prompted and the seed derived in a
+  process that was still swappable and dumpable. Measured on the real path: **23.9 ms** with an
+  automated prompt, however long a human takes to type with a real one, and unbounded under
+  `--passphrase`. The call now runs before the prompt.
+
+  Stated honestly, because the ptrace framing does not survive scrutiny: the gain is
+  **`mlockall`**, since swap persists across a reboot in a way a sub-second memory window does
+  not, plus `RLIMIT_CORE = 0` covering a crash during the prompt or the scrypt decrypt (a
+  conditional gain — many distros already ship a 0 soft limit). `PR_SET_DUMPABLE 0` closes only
+  the attacker who arrives *after* unlock; it does not revoke an already-open `/proc/<pid>/mem`
+  descriptor, and moving the call earlier does not change that. `docs/threat-model.md` and
+  `agent/hygiene.py` previously overstated the control's scope and now say what it covers.
+
+  Moving the call in front of the unlock made `harden_process`'s "never raises" docstring
+  load-bearing — an exception there would now deny a user their own wallet on a host that merely
+  lacks `CAP_IPC_LOCK`. The contract is now enforced rather than asserted, with a test per
+  measure.
+
 - **Four more CompactSize readers accepted non-canonical encodings; the audit that fixed
   the other three could not find them, because nothing in the tree could enumerate them.**
   PR #413 fixed `utils.py` to match `spv/proof.py` and `spv/witness.py`. There were not three
@@ -145,6 +203,50 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   re-measuring a stale audit inventory (below), not by the original sweep, which missed it.
 
 ### Changed
+
+- **`HdWallet` treated a failed per-address chain read as "this address holds nothing".**
+  `collect_spendable`, `get_utxos` and `get_balance` each gathered per-address reads with
+  `return_exceptions=True` and then filtered by `isinstance(result, list | tuple)`, silently
+  reading an error as an empty answer. The sibling `_scan_chain` refuses to do exactly this, in
+  as many words — *"A failed lookup cannot be safely interpreted as 'unused'"* — so it was one
+  rule spelled two ways, and the half without the comment was the half that swallowed it. The
+  reachable case is a partial fault, not a dead connection: `electrumx.py` raises "Malformed UTXO
+  entry in server response" from `listunspent` content validation alone, so `get_history` keeps
+  answering and `refresh()`'s own fail-closed gate sees a clean scan.
+
+  The dividing line is what the caller *claims*. Raising everywhere would have been its own
+  fund-safety bug — refusing an ordinary spend because one address was unreadable is a
+  fail-closed refusal to move funds, worse than a partial view whenever a deadline is running.
+  So the three readers now log the incompleteness (the module previously had no logging at all)
+  and take `strict=True` to refuse it; `send_max` and `pyrxd wallet sweep` pass `strict` because
+  "sweep everything" is a completeness claim and
+  `docs/how-to/recover-funds-across-wallet-paths.md` promises exactly that word. `send` is
+  deliberately not strict. Previously, a sweep across three addresses with one unreadable
+  broadcast a transaction spending two of them, returned a txid, and left the third behind
+  unswept and unmentioned.
+
+- **A second `500_000_000` literal survived the `LOCKTIME_THRESHOLD` centralisation**, spelled
+  `LOCKTIME_HEIGHT_THRESHOLD` in `swap/rswp/covenant.py` — two independent literals, not an
+  alias (`LOCKTIME_THRESHOLD is LOCKTIME_HEIGHT_THRESHOLD` was `False`). Only the canonical copy
+  is pinned to the vendored Radiant Core `script.h:90`; the second was pinned to nothing, so
+  drifting it *downward* was caught by boundary vectors while drifting it *upward* passed the
+  entire offline suite. Now a re-binding, which inherits the pin.
+
+  The guard is extended so a third copy fails CI, and extended in the direction that actually
+  catches this one: adding the name to `_GUARDED_NAMES` would not have helped, because that check
+  builds its pattern *from* the name and the copy was spelled differently — so the next copy
+  picks a third spelling. The new detector matches on the **value**, derived from
+  `pyrxd.constants` rather than retyped, and flags a guarded consensus number written as a
+  decimal literal anywhere in `src/` — including inline in a comparison, with no name at all.
+  Proved by planting a third copy under a third name (`_CLTV_HEIGHT_CEILING`) in a real module:
+  the value guard fired, all twelve name checks passed. Hex spellings are excluded so the Unicode
+  codepoint `0x0222` is not read as a dust threshold, and `btc_wallet/payment.py`'s Bitcoin
+  `DUST_LIMIT = 546` is a recorded exemption — the same number expressing a different chain's
+  rule, which the file already says in five lines of comment.
+
+  Separately, `TestSingleDefinition` now scans `tests/` as well as `src/`. It was src-only, which
+  left the fixtures free to re-type the numbers the shipped code is forbidden to re-type, and a
+  test asserting against its own copy of a constant passes whatever the real one says.
 
 - **Single-sourced eight primitives that were implemented between two and nineteen times
   each.** Implementations and call sites are counted separately below because they are
@@ -509,6 +611,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before opening any connection.
 
 ### Documented
+
+- **`credential_ref` was advertised as a "consensus-anchored" gate; it is not.**
+  `docs/concepts/covenant-building-blocks.md` claimed composing the soulbound-credential block
+  into a swap gives it a consensus-anchored "only credentialed counterparties" gate, directly
+  contradicting this changelog's own earlier correction and the wire-format doc. The
+  *credential* is consensus-enforced — that is what makes the owner immutable — but the *gate*
+  is not: `credential_ref` never enters the HTLC covenant bytecode (a conformance vector asserts
+  its absence), so nothing on-chain refuses a claim by an uncredentialed party. What enforces it
+  is both coordinators declining to proceed, which is now what the page says.
+
+- **`verify_credential_binding` said "Call this BEFORE locking the asset" and had zero callers.**
+  It compares a credential owner against a raw 20-byte pkh, while a swap pins a 32-byte
+  `holder_hash(owner, variant, genesis_ref)` — so it is not, and was never, the swap gate its
+  docstring advertised. A maker-shaped API with no callers is what let the asymmetry above hide
+  in plain sight. Kept (it is a valid non-swap helper) with the false direction removed and a
+  pointer to the coordinator's single spelling of the swap rule.
 
 - **`rswp.build_advert_tx` and `prepare_offered_utxo` have no relay-floor guard on purpose,
   and now say so.** They were skipped by the sweep that guarded `build_cancel_tx`, and the

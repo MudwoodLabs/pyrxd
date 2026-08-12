@@ -1239,37 +1239,12 @@ class SwapCoordinator:
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"REF authenticity failed; fail-closed ({exc})")
 
-        # 1b. Credential binding (only when the swap is credential-gated). Confirms the
-        #     taker holds a GENUINE consensus-soulbound credential (not a metadata flag)
-        #     AND that the swap's pinned payout (taker_dest_hash) pays the credential's
-        #     owner. Soulbound permanence => owner is immutable, so binding the payout to
-        #     it defeats both resale and rental without co-spending. Fail-closed.
-        if terms.credential_ref:
-            if self._credential_resolver is None:
-                return PreBtcLockGate(
-                    ok=False, reason="swap is credential-gated but no credential_resolver is wired; fail-closed"
-                )
-            try:
-                cred = await self._credential_resolver.resolve_credential(terms.credential_ref)
-                if cred is None:
-                    return PreBtcLockGate(
-                        ok=False, reason="credential ref did not resolve (unknown/spent); fail-closed"
-                    )
-                owner = assert_soulbound_credential(
-                    cred,
-                    min_confirmations=self.config.min_credential_confirmations,
-                    expected_credential_ref=terms.credential_ref,
-                )
-                expected = holder_hash(owner, variant=terms.asset_variant, genesis_ref=terms.genesis_ref)
-                if expected != terms.taker_dest_hash:
-                    return PreBtcLockGate(
-                        ok=False,
-                        reason="credential owner is not the swap payout recipient (taker_dest_hash); rental would pass — fail-closed",
-                    )
-            except (CredentialBindingError, ValidationError) as exc:
-                return PreBtcLockGate(ok=False, reason=f"credential binding failed; fail-closed ({exc})")
-            except Exception as exc:
-                return PreBtcLockGate(ok=False, reason=f"credential resolver unavailable; fail-closed ({exc})")
+        # 1b. Credential binding (only when the swap is credential-gated). The rule
+        #     itself lives in _credential_binding_failure, because it is also a
+        #     precondition for BOTH_LOCKED on the MAKER's path — see there for why.
+        credential_failure = await self._credential_binding_failure(terms)
+        if credential_failure is not None:
+            return PreBtcLockGate(ok=False, reason=credential_failure)
 
         # 2. H freshness — advisory read-only probe for a clean early reject; the
         #    authoritative atomic reserve is in taker_funds_btc, pre-broadcast.
@@ -1567,9 +1542,86 @@ class SwapCoordinator:
             await self._assert_btc_counter_funding_verified()
         else:
             await self._assert_eth_counter_funding_verified(now_unix_s=now_unix_s)
+        # The credential gate is a precondition for the reveal too, and for the same
+        # structural reason: its only enforcement lived inside the TAKER's own
+        # pre-fund method, which the party it protects never calls.
+        await self._assert_credential_binding_verified()
         self._advance(SwapEvent.MAKER_LOCKS_ASSET)
         await self._persist_record(self.record, shield=True)
         return self.record
+
+    async def _credential_binding_failure(self, terms: NegotiatedTerms) -> str | None:
+        """The credential rule, in one place. Returns a fail-closed reason, or ``None``.
+
+        Confirms the payee holds a GENUINE consensus-soulbound credential (not a
+        metadata flag) AND that the swap's pinned payout (``taker_dest_hash``) pays
+        that credential's owner. Soulbound permanence => the owner is immutable, so
+        binding the payout to it defeats both resale and rental without co-spending.
+        A no-op when ``terms.credential_ref`` is empty, which is every swap this
+        repo's CLI, scripts and examples can currently construct.
+
+        Returned rather than raised because it has two callers that need different
+        shapes: the taker's pre-fund gate reports it as a
+        :class:`PreBtcLockGate`, and :meth:`_assert_credential_binding_verified`
+        raises it. What must NOT differ between them is the rule — the
+        counter-funding checks beside this one were each written out twice before
+        being folded into one assertion, and a second copy is where drift starts.
+        """
+        if not terms.credential_ref:
+            return None
+        if self._credential_resolver is None:
+            return "swap is credential-gated but no credential_resolver is wired; fail-closed"
+        try:
+            cred = await self._credential_resolver.resolve_credential(terms.credential_ref)
+            if cred is None:
+                return "credential ref did not resolve (unknown/spent); fail-closed"
+            owner = assert_soulbound_credential(
+                cred,
+                min_confirmations=self.config.min_credential_confirmations,
+                expected_credential_ref=terms.credential_ref,
+            )
+            expected = holder_hash(owner, variant=terms.asset_variant, genesis_ref=terms.genesis_ref)
+            if expected != terms.taker_dest_hash:
+                return (
+                    "credential owner is not the swap payout recipient (taker_dest_hash); "
+                    "rental would pass — fail-closed"
+                )
+        except (CredentialBindingError, ValidationError) as exc:
+            return f"credential binding failed; fail-closed ({exc})"
+        except Exception as exc:
+            return f"credential resolver unavailable; fail-closed ({exc})"
+        return None
+
+    async def _assert_credential_binding_verified(self) -> None:
+        """Credential precondition for BOTH_LOCKED — the third gate in this group,
+        and the third instance of one defect class.
+
+        Enforcement used to exist ONLY inside :meth:`pre_btc_lock_check`, called
+        from exactly one place: ``taker_funds_btc``. That is the TAKER's own
+        method, and the party the gate protects is the MAKER — ``credential_binding``
+        names the asset-locker as the one who runs it, and "only credentialed
+        counterparties may take my asset" is the maker's policy. So an
+        uncredentialed taker declined to call the method holding the check, funded
+        the freely-derivable HTLC address directly, and an honest MAKER-role
+        coordinator — with a correct ``credential_resolver`` wired — walked
+        BTC_LOCKED -> BOTH_LOCKED -> ``maker_claims_btc`` and revealed ``p`` with
+        the resolver call count still at zero. Measured, not argued.
+
+        This is exactly the shape of :meth:`_assert_btc_counter_funding_verified`
+        and its ETH twin, and it is fixed the same way: the check belongs on the
+        transition into BOTH_LOCKED, which is the precondition for the reveal, not
+        on whichever method the honest party happens to pass through. Refusing here
+        leaves the maker at BTC_LOCKED with its CSV asset refund still open, so the
+        fail-closed direction costs a swap, never an asset.
+        """
+        reason = await self._credential_binding_failure(self.record.terms)
+        if reason is None:
+            return
+        await self._persist_record(self.record, shield=True)
+        raise ValidationError(
+            f"credential-gated swap failed its binding at lock time — refusing BOTH_LOCKED "
+            f"(the maker should refund the covenant via CSV): {reason}"
+        )
 
     def _counter_verify_callable(self):
         """The counter leg's maker-side verification entry point, or fail-closed.
