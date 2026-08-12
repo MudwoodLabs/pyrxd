@@ -421,7 +421,6 @@ def _offer_signed_with(*, src: Transaction, key, sighash, receive_pkh: bytes, re
     gates can be tested against an offer pyrxd itself would never emit — the case that
     matters, since a hostile maker signs with their own tooling.
     """
-    from pyrxd.constants import SIGHASH  # noqa: F401  (re-exported for clarity at call sites)
     from pyrxd.transaction.transaction_input import TransactionInput
 
     tx = Transaction()
