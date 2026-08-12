@@ -8,6 +8,70 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **`glyph transfer-nft` signed and broadcast transactions below Radiant's relay floor.**
+  Its fee-funding bar was the flat literal `needed=100_000`, which never multiplied by
+  `ctx.fee_rate` — so it could not cover a ~377-byte transfer at *any* rate at or above the
+  floor, and raising the rate widened the gap. When the funding fell short,
+  `Transaction.fee()` silently **dropped the change output** rather than failing
+  (`if change <= change_count: ... return`), converting the shortfall into "the whole UTXO
+  is the fee", and the command signed and broadcast the result. Measured at the CLI default
+  of 10,000 photons/byte: funding of 100,000 / 1,000,000 / 3,000,000 photons all produced
+  ~376-byte transactions paying exactly that, against floors of 3,760,000-3,780,000, and
+  **40/40 fresh-key builds at 1,000,000 went out under the floor**. It was the one
+  fund-moving builder in the tree that did not end in a relay-floor assertion on its final
+  signed bytes; every sibling funding bar in the same module was already size- and
+  rate-aware.
+
+  The bar is now `required_fee(modelled_size, ctx.fee_rate)` sized from the transaction's
+  real shape (and from the **no-change** shape deliberately — that is the smallest
+  transaction this command can produce, so sizing against the two-output one would refuse
+  funding that in fact relays), and the build ends in `assert_pays_for_its_size` on the
+  signed bytes. Node-proved at `-minrelaytxfee=0.10` — **the mainnet floor, not a default
+  regtest node's tenth of it**: at the bar (3,780,000 photons) the node accepts the CLI's
+  own broadcast bytes; one photon under, the command refuses before signing; with the old
+  flat bar restored the node answers `66: min relay fee not met`. The confirmation block now
+  shows the fee and says when there will be no change, and a `PolicyRejection` on this path
+  is no longer relabelled "could not reach ElectrumX" — it subclasses `NetworkError`, so a
+  node *verdict* was sending operators to debug connectivity.
+
+- **Two exported RSWP v2 builders returned signed sub-floor transactions with no fee gate.**
+  `prepare_offered_utxo` and `build_advert_tx` (both re-exported from `pyrxd.swap.rswp`)
+  validated `fee >= 0` and nothing else. Called with `fee=1` they each returned a fully
+  signed transaction and a txid — 225 B against a 2,250,000-photon floor, 427 B against
+  4,270,000 — while their v2 sibling `build_cancel_tx` and their direct v3 analog
+  `prepare_covenant_offer` refused. Nothing downstream could catch it: there is no
+  relay-floor check on any broadcast path in `pyrxd.network`. Both now go through one
+  `_assert_relayable` in `orders.py` (which `build_cancel_tx` was rewired to use as well, so
+  the v2 side has one implementation rather than one per call site), sized from the signed
+  bytes against `GetTotalSize()`. `fee_policy` keeps the CLI's deliberately sub-floor sizing
+  passes working — `swap post` now passes `_SIZING_TRIAL_POLICY` on trial builds exactly as
+  the cancel paths already did — and that opt-out is asserted, because a gate that refused
+  `swap post` would be its own fund-safety bug. Node-proved at the mainnet floor: one photon
+  under each builder's own signed size is `66: min relay fee not met`, exactly at it is
+  accepted.
+
+- **The HTLC covenant spend builders bounded only the LOW end of the fee input.**
+  `_check_carrier`'s comment promised a guard against "a mistakenly-huge UTXO or a sub-dust
+  one" and only the sub-dust half existed — `cli/swap_recovery.py` had to name this function
+  by name when it added the missing half for the cold path (audit B4, where an operator
+  pointing the toolkit at an ordinary funded key burned 500 RXD). The covenant enforces
+  exactly one output, so there is no change and the **whole fee input is paid to the miner**:
+  reproduced on the builder itself, a 500 RXD fee input on a real 266-byte RXD claim paid
+  **18,796x** the 2,660,000-photon floor with no exception, no warning and no log line.
+
+  It now WARNS above `MAX_FEE_OVERPAY_MULTIPLE` (10x) and never raises. That asymmetry is the
+  design, not an omission: node-proved at the mainnet floor, the node **accepts** the
+  overpaying claim, so a builder that refused it would be refusing a spend consensus would
+  have taken — and on the claim path that hands the asset to the counterparty's CSV refund,
+  which `docs/threat-model.md` S21 prices as strictly worse than an overpaid fee. A
+  legitimate deadline-racing spend can also carry more than 10x on purpose;
+  `tests/test_htlc_spend_fee_floor.py` already routes ~19x through this exact path. The cold
+  CLI still refuses, because an operator is present and `--allow-overpay` is one flag away.
+  `MAX_FEE_OVERPAY_MULTIPLE` / `fee_overpay_ceiling` / `fee_overpay_multiple` moved from
+  `cli/swap_recovery.py` to `pyrxd.fee_sizing` (re-exported, so that module's surface is
+  unchanged): a rule only the CLI could reach was a rule the builders could not, and
+  `gravity.htlc_spend` cannot import a `pyrxd.cli` module. One ceiling, two responses.
+
 - **Four more CompactSize readers accepted non-canonical encodings; the audit that fixed
   the other three could not find them, because nothing in the tree could enumerate them.**
   PR #413 fixed `utils.py` to match `spv/proof.py` and `spv/witness.py`. There were not three
@@ -510,15 +574,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Documented
 
-- **`rswp.build_advert_tx` and `prepare_offered_utxo` have no relay-floor guard on purpose,
-  and now say so.** They were skipped by the sweep that guarded `build_cancel_tx`, and the
-  gap read as an oversight. It is not, and the asymmetry is the point: an advert that does not
-  relay is *an order that never appears*, failing loudly at broadcast with nothing reported as
-  having succeeded — whereas an unrelayable cancel hands the caller a txid and tells them the
-  order is revoked while every copy of the signed advertisement stays fillable. Neither
-  builder can put an asset at risk (the advert spends plain RXD only, never the offered UTXO;
-  `prepare_offered_utxo` is a self-send). The residual is recorded too: on a node relaying
-  below the reference floor, the caller's own funding UTXO can be held until mempool expiry.
+- ~~**`rswp.build_advert_tx` and `prepare_offered_utxo` have no relay-floor guard on purpose,
+  and now say so.**~~ **Reversed in the same Unreleased cycle — both are now gated** (see
+  Security, above). The note argued that "an advert that does not relay is an order that never
+  appears", failing loudly at broadcast. The severity ordering it drew against `build_cancel_tx`
+  still holds; the conclusion did not. The failure is only loud if a node is reached, and both
+  functions return a **signed transaction and a txid** to public SDK surface with no
+  relay-floor check anywhere in `pyrxd.network`. The residual the note itself recorded — the
+  caller's own funding UTXO held until mempool expiry on a node relaying below the reference
+  floor — is the cost, and it does not need an asset at risk to be worth one `if`.
 
 - **`MAX_OPS_PER_SCRIPT` / `MAX_STACK_SIZE` were already recorded as deliberately unconsumed**
   — verified, not changed. `constants.py` carries a "NO CONSUMER IN PYRXD, DELIBERATELY" note

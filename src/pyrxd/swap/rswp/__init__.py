@@ -17,8 +17,13 @@ Quick start (regtest — the library never broadcasts by itself)::
         receive=Asset(kind="ft", amount=50, ref=ft_ref),
         maker_receive_pkh=maker_pkh,
     )
+    # Every `fee` here is a REAL Radiant fee: photons for the transaction's SERIALIZED
+    # size at the relay floor of 10_000 photons/byte. An advert measures ~430 bytes, so
+    # ~4_300_000 photons; a completion is larger again. Illustrative three-digit numbers
+    # taught the wrong order of magnitude, and every builder below now refuses one —
+    # sized from its own signed bytes, because Radiant has no RBF and no CPFP.
     advert_tx = build_advert_tx(
-        advert_script=post.advert_script, funding=[...], change_pkh=maker_pkh, fee=500,
+        advert_script=post.advert_script, funding=[...], change_pkh=maker_pkh, fee=5_000_000,
     )
     # broadcast advert_tx through your own node → the order is on the book.
 
@@ -26,7 +31,7 @@ Quick start (regtest — the library never broadcasts by itself)::
     order = decode_rswp_order(op_return_script)
     tx = take_rswp_order(
         order, give_source_tx=fetched_and_txid_verified_source,
-        funding=[...], taker_receive_pkh=taker_pkh, taker_change_pkh=taker_pkh, fee=500,
+        funding=[...], taker_receive_pkh=taker_pkh, taker_change_pkh=taker_pkh, fee=6_000_000,
     )
 
 Design + byte-level authority: ``docs/plans/2026-07-05-rswp-orderbook-design.md``

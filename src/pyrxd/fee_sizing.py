@@ -78,6 +78,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from .transaction.transaction import Transaction
 
 __all__ = [
+    "MAX_FEE_OVERPAY_MULTIPLE",
     "RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB",
     "RADIANT_MIN_RELAY_PHOTONS_PER_KB",
     "SIG_SIZE_SLACK_BYTES",
@@ -88,6 +89,8 @@ __all__ = [
     "bitcoin_virtual_size",
     "fee_for_kb_rate",
     "fee_never_below_relay_floor",
+    "fee_overpay_ceiling",
+    "fee_overpay_multiple",
     "min_relay_fee",
     "radiant_relay_size",
     "relay_floor_photons_per_byte",
@@ -380,6 +383,59 @@ def assert_pays_for_its_size(
         f"'min relay fee not met': Radiant has neither RBF nor CPFP, so it could not be "
         f"fee-bumped and would hold its inputs until mempool expiry, 8 hours later."
     )
+
+
+# ---------------------------------------------------------------------------
+# THE OTHER END OF THE SAME RULE. Everything above is a LOWER bound: pay for the
+# bytes you contain. This is the UPPER one, and it exists because a guard that only
+# checks the low end is half a guard.
+#
+# It binds only where there is no change output — a single-output covenant spend
+# consumes its whole fee input, so "choosing the fee" means choosing which UTXO to
+# burn. An operator who pointed the cold-recovery toolkit at an ordinary funded key
+# (one 500 RXD UTXO) burned ~18,700x a 2,660,000-photon requirement while the CLI
+# reported the fee "clears the deadline-aware TARGET" (audit B4). Reproduced again at
+# 18,796x on the builder itself, which had no bound at all.
+#
+# It lives HERE rather than in ``pyrxd.cli.swap_recovery`` where it was introduced,
+# for the reason the relay-floor constants moved here before it: fee sizing has ONE
+# home, and ``pyrxd.gravity.htlc_spend`` cannot import a ``pyrxd.cli`` module to reach
+# a number the CLI happened to define first. ``swap_recovery`` re-exports all three
+# names, so its public surface is unchanged and there is still one definition of each.
+# ---------------------------------------------------------------------------
+
+#: How many times the fee requirement a single input may exceed before it is treated
+#: as a mistake rather than a choice.
+#:
+#: 10x leaves generous headroom for a deadline-critical spend and still catches a
+#: whole-wallet UTXO by three orders of magnitude. It is a MULTIPLE, not an absolute:
+#: a genuinely large requirement scales with it.
+#:
+#: What crossing it means is deliberately NOT uniform, and that is the whole design.
+#: The cold-recovery CLI REFUSES above it (an operator is present, ``--allow-overpay``
+#: is one flag away, and nothing is racing). The builders in
+#: :mod:`pyrxd.gravity.htlc_spend` only WARN, because refusing a claim that the node
+#: would have accepted hands the asset to the counterparty's CSV refund — strictly
+#: worse than overpaying a fee (``docs/threat-model.md`` S21) — and because a
+#: legitimate deadline-racing spend can carry more than 10x headroom on purpose.
+MAX_FEE_OVERPAY_MULTIPLE: int = 10
+
+
+def fee_overpay_ceiling(*, floor: int, target: int) -> int:
+    """The largest fee an operator can plausibly have MEANT, given this requirement.
+
+    ``max(floor, target) x`` :data:`MAX_FEE_OVERPAY_MULTIPLE`. ``floor`` is what the
+    node demands; ``target`` is the deadline-aware pool-sizing figure, which can be
+    higher. Taking the max means urgency raises the ceiling with it rather than making
+    a legitimately urgent fee look like a mistake.
+    """
+    return max(int(floor), int(target)) * MAX_FEE_OVERPAY_MULTIPLE
+
+
+def fee_overpay_multiple(fee_photons: int, *, floor: int, target: int) -> float:
+    """How many times the fee requirement this input actually pays (>= 1.0 is normal)."""
+    requirement = max(int(floor), int(target), 1)
+    return int(fee_photons) / requirement
 
 
 def assert_tx_pays_for_itself(

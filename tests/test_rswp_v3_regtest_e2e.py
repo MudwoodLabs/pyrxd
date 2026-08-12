@@ -81,6 +81,7 @@ def _reserve_and_post(
             funding=[FundingInput(advert_fund, af_vout, maker)],
             change_pkh=mk_pkh,
             fee=_FEE,
+            fee_policy=_NODE_POLICY,
         )
     )
     return reserved, decode_rswp_order(post.advert_script)

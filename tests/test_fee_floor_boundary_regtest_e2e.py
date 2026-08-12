@@ -54,6 +54,16 @@ What each case proves
    changed, opposite verdict from consensus.
 5. The v3 covenant cancel and refund builders' floors are the NODE's floor: at the
    floor accepted, one photon under refused.
+6. ``glyph transfer-nft``'s funding bar (FS-1) is the node's floor: at the bar the
+   node accepts the CLI's own broadcast bytes, one photon under the command refuses
+   before signing, and the OLD flat ``needed=100_000`` bar restored produces bytes
+   the node refuses — measured here, reason quoted.
+7. ``prepare_offered_utxo`` and ``build_advert_tx`` (FS-2), the two v2 RSWP builders
+   the earlier floor sweep skipped: same boundary pair, same reason.
+8. The OTHER end (FO-2): a 500 RXD fee input on a 266-byte HTLC claim — 18,796x its
+   floor — is **accepted** by the node. That is the evidence for warning rather than
+   refusing: refusing a spend consensus would have taken hands the asset to the
+   counterparty's refund.
 
 Opt-in: ``@pytest.mark.integration`` + ``RADIANT_REGTEST=1``. Manages its own
 throwaway container under a DISTINCT name (the shared one is force-removed by name
@@ -72,6 +82,7 @@ import json
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -89,8 +100,15 @@ from pyrxd.keys import PrivateKey
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
 from pyrxd.security.errors import InsufficientFundsError
-from pyrxd.swap import FundingInput
-from pyrxd.swap.rswp import build_covenant_cancel_tx, build_covenant_refund_tx, prepare_covenant_offer
+from pyrxd.swap import Asset, FundingInput
+from pyrxd.swap.rswp import (
+    build_advert_tx,
+    build_covenant_cancel_tx,
+    build_covenant_refund_tx,
+    create_rswp_order,
+    prepare_covenant_offer,
+    prepare_offered_utxo,
+)
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_input import TransactionInput
 from pyrxd.transaction.transaction_output import TransactionOutput
@@ -581,3 +599,298 @@ def test_no_case_here_touched_anything_but_regtest(node):
     """Belt-and-braces: assert the chain, out loud, in an assertion that can fail."""
     assert node.cli("getblockchaininfo")["chain"] == "regtest"
     assert json.loads(json.dumps(node.cli("getmempoolinfo")))["effective_minrelaytxfee"] == 0.1
+
+
+# --------------------------------------------------------------------------- 6-8. audit
+# FS-1 (glyph transfer-nft), FS-2 (the two v2 RSWP builders), FO-2 (the upper bound).
+#
+# All three are judged by the SAME node started above, at 0.10 RXD/kB. That is the whole
+# point of putting them here rather than in a suite of their own: the container is
+# force-removed by name at start, so a second suite sharing this node would destroy it,
+# and a node of its own at a laxer rate could not tell any of these cases apart.
+
+
+class _NodeClient:
+    """The slice of ``ElectrumXClient`` ``_transfer_nft_inner`` actually uses, over the node.
+
+    ``get_transaction`` reads real bytes back off the chain and ``broadcast`` puts them to
+    the node, so the CLI path under test is judged by consensus rather than by a mock that
+    agrees with it. ``verdict`` records the node's answer for the caller to assert on.
+    """
+
+    def __init__(self, node: _RegtestNode) -> None:
+        self.node = node
+        self.verdict: dict = {}
+
+    async def get_transaction(self, txid) -> bytes:
+        return bytes.fromhex(str(self.node.cli("getrawtransaction", str(txid))))
+
+    async def broadcast(self, raw: bytes) -> str:
+        self.verdict = self.node.accepts(raw.hex())
+        if self.verdict.get("allowed") is not True:
+            raise _NodeRefused(f"node refused: {self.verdict}")
+        return str(self.node.cli("sendrawtransaction", raw.hex()))
+
+
+class _NodeRefused(Exception):
+    """The node's verdict on bytes a builder returned, raised where the CLI broadcasts."""
+
+
+def _cli_ctx(fee_rate: int = MIN_FEE_RATE):
+    from pyrxd.cli.config import Config
+    from pyrxd.cli.context import CliContext
+
+    cfg = Config(fee_rate=fee_rate)
+    return CliContext(
+        config=cfg,
+        network="mainnet",  # display only; every byte here goes to the regtest node above
+        electrumx_url=cfg.electrumx,
+        fee_rate=fee_rate,
+        wallet_path=Path("/nonexistent-no-wallet-is-loaded-on-this-path"),
+        output_mode="json",
+        yes=True,
+        client_factory=lambda *a, **k: None,
+    )
+
+
+def _transfer_nft_via_cli(node: _RegtestNode, *, funding_photons: int):
+    """Mint a real singleton, fund a real plain-RXD UTXO, run the CLI's transfer path.
+
+    Returns ``(client, result)``; the client carries the node's verdict on the broadcast
+    bytes. Raises whatever the CLI raises — a refusal is an outcome this suite asserts on.
+    """
+    import asyncio
+
+    from pyrxd.cli.glyph_cmds import _transfer_nft_inner
+    from pyrxd.network.electrumx import UtxoRecord
+    from pyrxd.security.types import Hex20
+
+    owner = PrivateKey()
+    nft_txid, _nft_spk, ref = _mint_nft(node, owner)
+
+    fund_key = PrivateKey()
+    fund_spk = bytes(P2PKH().lock(fund_key.public_key().address()).serialize())
+    fund_txid = _pay_to_spk(node, fund_spk, funding_photons)
+
+    triples = [
+        (UtxoRecord(tx_hash=nft_txid, tx_pos=0, value=_CARRIER, height=1), owner.public_key().address(), owner),
+        (
+            UtxoRecord(tx_hash=fund_txid, tx_pos=0, value=funding_photons, height=1),
+            fund_key.public_key().address(),
+            fund_key,
+        ),
+    ]
+
+    class _Wallet:
+        async def collect_spendable(self, _client):
+            return triples
+
+    client = _NodeClient(node)
+    to_key = PrivateKey()
+    result = asyncio.run(
+        _transfer_nft_inner(
+            _cli_ctx(),
+            _Wallet(),
+            ref,
+            Hex20(to_key.public_key().hash160()),
+            to_key.public_key().address(),
+            client,
+        )
+    )
+    return client, result
+
+
+def test_transfer_nft_cli_relays_at_the_funding_bar_and_below_it_refuses(node):
+    """Case 6 (FS-1). The CLI's own funding bar, judged by the node at both ends.
+
+    Before the fix the bar was a flat ``needed=100_000`` that never multiplied by the fee
+    rate, so a 1_000_000-photon UTXO was accepted as funding, the change output was
+    silently dropped, and a ~376-byte transaction paying 1_000_000 photons against a
+    3_760_000 floor was SIGNED AND BROADCAST. Offline, 40/40 fresh-key builds at that
+    funding value went out under the floor.
+
+    Both halves are proved here: exactly at the bar the node takes it, and one photon
+    under it the command refuses before anything is signed.
+    """
+    from pyrxd.cli.errors import UserError
+    from pyrxd.cli.glyph_cmds import _nft_transfer_funding_bar
+
+    rate = _node_rate(node)
+    assert rate == MIN_FEE_RATE, "not at the mainnet floor; this proves nothing"
+    bar = _nft_transfer_funding_bar(
+        build_nft_locking_script(PrivateKey().public_key().hash160(), GlyphRef(txid="aa" * 32, vout=0)),
+        MIN_FEE_RATE,
+    )
+    print(f"\ntransfer-nft funding bar at {MIN_FEE_RATE:,} photons/B: {bar:,} photons")
+
+    # a. EXACTLY at the bar: the node accepts it. A bar that refused work the node would
+    #    have taken would be its own fund-safety bug.
+    client, result = _transfer_nft_via_cli(node, funding_photons=bar)
+    assert client.verdict.get("allowed") is True, client.verdict
+    print(f"at the bar ({bar:,}): accepted by the node, fee={result['fee']:,}")
+
+    # b. One photon under the bar: refused BEFORE anything is signed.
+    with pytest.raises(UserError, match="no plain-RXD UTXO large enough"):
+        _transfer_nft_via_cli(node, funding_photons=bar - 1)
+    print(f"one photon under ({bar - 1:,}): refused before signing")
+
+    # c. What the OLD flat bar admitted is now refused too.
+    with pytest.raises(UserError, match="no plain-RXD UTXO large enough"):
+        _transfer_nft_via_cli(node, funding_photons=1_000_000)
+
+
+def test_the_old_transfer_nft_bar_produced_bytes_the_node_refuses(node, monkeypatch):
+    """Case 6b (FS-1). The differential: same command, old bar restored, consensus disagrees.
+
+    Neutralises BOTH halves of the fix — the size/rate-aware bar and the post-signing
+    assertion — and asks the node about whatever comes out. Without this the green run
+    above would be equally true of a command that was never broken.
+    """
+    monkeypatch.setattr("pyrxd.cli.glyph_cmds._nft_transfer_funding_bar", lambda _script, _rate: 100_000)
+    monkeypatch.setattr("pyrxd.cli.glyph_cmds.assert_pays_for_its_size", lambda **kw: kw["fee_paid"])
+
+    rate = _node_rate(node)
+    with pytest.raises(_NodeRefused) as ei:
+        _transfer_nft_via_cli(node, funding_photons=1_000_000)
+    reason = str(ei.value)
+    assert "min relay fee not met" in reason, f"refused, but not for the fee: {reason}"
+    print(f"\nold bar restored, funding=1,000,000 at {rate:,}/B -> {reason}")
+
+
+def _rswp_boundary(node: _RegtestNode, build, label: str) -> None:
+    """At the node's floor: accepted. One photon under: refused, reason quoted.
+
+    The funding UTXO is drawn fresh each attempt, so each build signs a different message
+    and the DER length (69-71 B) moves the size the floor comes from. Same
+    settle-then-compare shape as ``_covenant_boundary`` above, and for the same reason.
+    """
+    rate = _node_rate(node)
+    policy = DeadlineFeePolicy(relay_fee_per_kb=rate * 1000)
+    for _ in range(12):
+        maker = PrivateKey()
+        pkh = maker.public_key().hash160()
+        spk = bytes(P2PKH().lock(maker.public_key().address()).serialize())
+        value = 900_000_000
+        txid = _pay_to_spk(node, spk, value)
+        funding = [FundingInput(_src(txid, 0, spk, value), 0, maker)]
+
+        floor = policy.min_relay_fee(len(build(funding, pkh, 20_000_000, _PERMISSIVE).serialize()))
+        at_floor = None
+        for _ in range(4):
+            try:
+                candidate = build(funding, pkh, floor, policy)
+            except InsufficientFundsError:
+                break
+            settled = policy.min_relay_fee(len(candidate.serialize()))
+            if settled == floor:
+                at_floor = candidate
+                break
+            floor = settled
+        if at_floor is None:
+            continue
+        under = build(funding, pkh, floor - 1, _PERMISSIVE)
+        if policy.min_relay_fee(len(under.serialize())) != floor:
+            continue
+
+        # The builder refuses it...
+        with pytest.raises(InsufficientFundsError, match="below the required"):
+            build(funding, pkh, floor - 1, policy)
+        # ...and so does the node, for the same reason.
+        res = node.accepts(under.serialize().hex())
+        assert res.get("allowed") is False, f"{label}: node ACCEPTED one photon under its floor: {res}"
+        assert "min relay fee not met" in _reason(res), f"{label}: rejected, but not for the fee: {res}"
+        print(f"\n{label} one-photon-under: size={len(under.serialize())}B fee={floor - 1} -> {_reason(res)}")
+
+        ok = node.accepts(at_floor.serialize().hex())
+        assert ok.get("allowed") is True, f"{label}: node REJECTED a tx at exactly its floor: {ok}"
+        print(f"{label} at-floor:          size={len(at_floor.serialize())}B fee={floor} -> accepted")
+        return
+    raise AssertionError(f"{label}: no build landed exactly on its own relay floor in 12 draws")
+
+
+def test_prepare_offered_utxo_boundary_is_the_nodes_own_floor(node):
+    """Case 7a (FS-2). The v2 offered-UTXO split — ungated until now, unlike its v3 analog."""
+    _rswp_boundary(
+        node,
+        lambda funding, pkh, fee, policy: prepare_offered_utxo(
+            funding=funding,
+            asset=Asset("rxd", 100_000_000),
+            owner_pkh=pkh,
+            change_pkh=pkh,
+            fee=fee,
+            fee_policy=policy,
+        ),
+        "v2 prepare_offered_utxo",
+    )
+
+
+def test_build_advert_tx_boundary_is_the_nodes_own_floor(node):
+    """Case 7b (FS-2). The advert — the transaction that puts an order on the book."""
+    maker = PrivateKey()
+    give_src = Transaction(
+        tx_inputs=[],
+        tx_outputs=[TransactionOutput(P2PKH().lock(maker.public_key().address()), 400_000_000)],
+    )
+    advert = create_rswp_order(
+        give_source_tx=give_src,
+        give_vout=0,
+        maker_key=maker,
+        receive=Asset("rxd", 100_000_000),
+        maker_receive_pkh=maker.public_key().hash160(),
+    ).advert_script
+    _rswp_boundary(
+        node,
+        lambda funding, pkh, fee, policy: build_advert_tx(
+            advert_script=advert, funding=funding, change_pkh=pkh, fee=fee, fee_policy=policy
+        ),
+        "v2 build_advert_tx",
+    )
+
+
+def test_an_overpaying_htlc_claim_is_accepted_by_the_node(node):
+    """Case 8 (FO-2). Why the upper bound WARNS instead of refusing.
+
+    The 500 RXD fee input the cold toolkit once burned is not something the node objects
+    to — it takes it, and the miner keeps it. So a builder that REFUSED it would be
+    refusing a spend consensus would have accepted, and on the claim path that hands the
+    asset to the counterparty's CSV refund. This case is the evidence for that choice:
+    the node's own verdict on the overpaying bytes, at the mainnet floor.
+    """
+    import hashlib
+
+    from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
+    from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx
+
+    rate = _node_rate(node)
+    taker, maker = PrivateKey(), PrivateKey()
+    preimage = os.urandom(32)
+    cov = build_htlc_covenant_rxd(
+        amount=_CARRIER,
+        taker_pkh=taker.public_key().hash160(),
+        maker_pkh=maker.public_key().hash160(),
+        hashlock=hashlib.sha256(preimage).digest(),
+        refund_csv=6,
+    )
+    cov_txid = _pay_to_spk(node, cov.funded_spk, _CARRIER)
+    overpay = 50_000_000_000  # 500 RXD — the audit-B4 figure, reproduced at 18,700x+
+    fee_key = PrivateKey()
+    fee_spk = bytes(P2PKH().lock(fee_key.public_key().address()).serialize())
+    fee_txid = _pay_to_spk(node, fee_spk, overpay)
+
+    tx = build_htlc_claim_tx(
+        covenant=cov,
+        covenant_outpoint=f"{cov_txid}:0",
+        carrier_value=_CARRIER,
+        preimage=preimage,
+        fee=FeeInput(txid=fee_txid, vout=0, value=overpay, scriptpubkey=fee_spk, wif=fee_key.wif()),
+    )
+    raw = tx.serialize()
+    res = node.accepts(raw.hex())
+    floor = len(raw) * rate
+    assert res.get("allowed") is True, (
+        f"the node REFUSED a {overpay}-photon fee on a {len(raw)}-byte spend — if this is ever "
+        f"false, the warn-don't-refuse decision has to be revisited: {res}"
+    )
+    assert len(tx.outputs) == 1, "the covenant permits ONE output, so the whole input IS the fee"
+    print(f"\nHTLC claim, 500 RXD fee input: size={len(raw)}B floor={floor} paid={overpay} ({overpay // floor}x)")
+    print("  node verdict: ACCEPTED — refusing this would forfeit the asset, so the builder WARNS")

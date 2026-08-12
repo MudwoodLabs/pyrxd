@@ -102,6 +102,7 @@ $ pyrxd glyph transfer-nft 7a0c…42:0 --to 1Rr…recipient
   NFT transfer
     ref:          7a0c…42:0
     recipient:    1Rr…recipient
+    fee:          4,120,000 photons (412 B @ 10,000/B)
     network:      mainnet
 
 Broadcast this transfer? [y/N]: y
@@ -109,11 +110,19 @@ Broadcast this transfer? [y/N]: y
 NFT transfer broadcast: c88a…91
 ```
 
-> **You need a little plain RXD to pay the fee.** An NFT singleton carries only
-> dust, so the transfer pulls the network fee from a separate plain-RXD UTXO in
-> the same wallet. If the wallet has no spendable RXD, the command stops with
-> *"no plain-RXD UTXO to fund the NFT transfer fee"* — fund the wallet with a
-> small amount of RXD and retry. The fee change returns to you.
+> **You need plain RXD to pay the fee, and it is not a token amount.** An NFT
+> singleton carries only dust, so the transfer pulls the network fee from a
+> separate plain-RXD UTXO in the same wallet. That UTXO has to be big enough on
+> its own: at the default rate a transfer is roughly 380–410 bytes and Radiant's
+> relay floor is 10,000 photons/byte, so the command needs a **single**
+> non-token UTXO of about **0.038 RXD** — not "a small amount". Below that it
+> stops before signing with *"no plain-RXD UTXO large enough to fund the NFT
+> transfer fee"* and prints the exact number it needs.
+>
+> Change returns to you **when there is room for it**. If the funding UTXO only
+> just covers the fee, there is no change output and the whole UTXO is paid to
+> the miner; the confirmation block says so on the `fee:` line before you
+> confirm. Fund with a comfortable margin if that matters to you.
 
 ---
 

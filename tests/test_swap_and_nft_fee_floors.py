@@ -74,11 +74,14 @@ from pyrxd.security.errors import InsufficientFundsError, ValidationError
 from pyrxd.security.types import Hex20
 from pyrxd.swap import Asset, FundingInput, accept_offer, create_offer
 from pyrxd.swap.rswp import (
+    build_advert_tx,
     build_covenant_cancel_tx,
     build_covenant_refund_tx,
     create_covenant_order,
+    create_rswp_order,
     decode_rswp_order,
     prepare_covenant_offer,
+    prepare_offered_utxo,
     take_covenant_order,
 )
 from pyrxd.transaction.transaction import Transaction
@@ -537,6 +540,138 @@ class TestPartialSwapAcceptGatesTheFee:
         ]
         with pytest.raises(InsufficientFundsError, match="below the required"):
             accept_offer(offer, funding=funding, taker_receive_pkh=tk_pkh, taker_change_pkh=tk_pkh, fee=300)
+
+
+# ===========================================================================
+# 3b. the two v2 RSWP builders the floor sweep skipped (FS-2)
+# ===========================================================================
+
+
+class TestV2RswpBuildersGateTheFee:
+    """``prepare_offered_utxo`` and ``build_advert_tx`` returned SIGNED sub-floor txs.
+
+    Both are exported from ``pyrxd.swap.rswp``. Called with ``fee=1`` from the public
+    package before this change, they each returned a fully signed transaction and a
+    txid while their v2 sibling ``build_cancel_tx`` and their v3 analog
+    ``prepare_covenant_offer`` refused::
+
+        prepare_offered_utxo    RETURNED a tx: size=225 declared_fee=1 floor=2250000
+        build_advert_tx         RETURNED a tx: size=246 declared_fee=1 floor=2460000
+        build_cancel_tx  (v2 sibling)       refused: InsufficientFundsError
+        prepare_covenant_offer (v3 sibling) refused: InsufficientFundsError
+
+    There is no downstream guard: nothing in ``pyrxd.network`` checks a relay floor on
+    any broadcast path.
+    """
+
+    @staticmethod
+    def _split_state():
+        maker, pkh = _key()
+        return maker, pkh
+
+    @staticmethod
+    def _advert_state():
+        maker, pkh = _key()
+        post = create_rswp_order(
+            give_source_tx=_rxd_src(pkh, 400_000_000),
+            give_vout=0,
+            maker_key=maker,
+            receive=Asset("rxd", 100_000_000),
+            maker_receive_pkh=pkh,
+        )
+        return maker, pkh, post
+
+    def test_prepare_offered_utxo_refuses_a_sub_floor_fee(self) -> None:
+        maker, pkh = self._split_state()
+        with pytest.raises(InsufficientFundsError, match="below the required"):
+            prepare_offered_utxo(
+                funding=[FundingInput(_rxd_src(pkh, 900_000_000), 0, maker)],
+                asset=Asset("rxd", 100_000_000),
+                owner_pkh=pkh,
+                change_pkh=pkh,
+                fee=1,
+            )
+
+    def test_build_advert_tx_refuses_a_sub_floor_fee(self) -> None:
+        maker, pkh, post = self._advert_state()
+        with pytest.raises(InsufficientFundsError, match="below the required"):
+            build_advert_tx(
+                advert_script=post.advert_script,
+                funding=[FundingInput(_rxd_src(pkh, 900_000_000), 0, maker)],
+                change_pkh=pkh,
+                fee=1,
+            )
+
+    def test_prepare_offered_utxo_boundary_is_its_own_signed_size(self) -> None:
+        def make(state, fee: int, policy):
+            maker, pkh = state
+            return prepare_offered_utxo(
+                funding=[FundingInput(_rxd_src(pkh, 900_000_000), 0, maker)],
+                asset=Asset("rxd", 100_000_000),
+                owner_pkh=pkh,
+                change_pkh=pkh,
+                fee=fee,
+                fee_policy=policy,
+            ).serialize()
+
+        raw, floor = _boundary(self._split_state, make, "prepare_offered_utxo")
+        assert floor == len(raw) * _RATE
+
+    def test_build_advert_tx_boundary_is_its_own_signed_size(self) -> None:
+        def make(state, fee: int, policy):
+            maker, pkh, post = state
+            return build_advert_tx(
+                advert_script=post.advert_script,
+                funding=[FundingInput(_rxd_src(pkh, 900_000_000), 0, maker)],
+                change_pkh=pkh,
+                fee=fee,
+                fee_policy=policy,
+            ).serialize()
+
+        raw, floor = _boundary(self._advert_state, make, "build_advert_tx")
+        assert floor == len(raw) * _RATE
+
+    def test_the_trial_pass_the_cli_needs_is_still_expressible(self) -> None:
+        """The guard must not break ``pyrxd swap post``.
+
+        The CLI cannot model the advert's size, so it builds deliberately sub-floor
+        trial passes, measures the real bytes and rebuilds — passing
+        ``swap_book_cmds._SIZING_TRIAL_POLICY`` exactly as it already does for the
+        cancel builders. A gate with no opt-out would refuse the trial and the command
+        would never reach its own ``_assert_relayable``. Refusing a legitimate action
+        is its own fund-safety bug, so this is asserted, not assumed.
+        """
+        from pyrxd.cli.swap_book_cmds import _SIZING_TRIAL_POLICY
+
+        maker, pkh, post = self._advert_state()
+        trial = build_advert_tx(
+            advert_script=post.advert_script,
+            funding=[FundingInput(_rxd_src(pkh, 900_000_000), 0, maker)],
+            change_pkh=pkh,
+            fee=1,
+            fee_policy=_SIZING_TRIAL_POLICY,
+        )
+        assert trial.outputs[0].locking_script.serialize() == post.advert_script
+        # ...and the SAME fee is refused under the mainnet default.
+        with pytest.raises(InsufficientFundsError):
+            build_advert_tx(
+                advert_script=post.advert_script,
+                funding=[FundingInput(_rxd_src(pkh, 900_000_000), 0, maker)],
+                change_pkh=pkh,
+                fee=1,
+            )
+
+    def test_a_fee_that_clears_the_floor_is_never_refused(self) -> None:
+        """The other half of the guard, over fresh keys: it admits what the node admits."""
+        for _ in range(50):
+            maker, pkh, post = self._advert_state()
+            tx = build_advert_tx(
+                advert_script=post.advert_script,
+                funding=[FundingInput(_rxd_src(pkh, 900_000_000), 0, maker)],
+                change_pkh=pkh,
+                fee=6_000_000,  # ~460 B advert => floor ~4_600_000
+            )
+            assert tx.get_fee() >= min_relay_fee(len(tx.serialize()))
 
 
 # ===========================================================================
