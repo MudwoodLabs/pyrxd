@@ -301,6 +301,11 @@ def _reserved_state():
 #: Same escape hatch, same spelling, as tests/test_remaining_builder_floors_regtest_e2e.
 _PERMISSIVE = DeadlineFeePolicy(relay_fee_per_kb=1, allow_below_protocol_floor=True)
 
+#: Steps of the fee↔size fixed point to take within ONE attempt. For a fixed state the
+#: size can take only two adjacent values (the DER signature is 69-71 bytes), so a run
+#: that has not settled in four steps is a two-cycle and never will.
+_SETTLE_STEPS = 4
+
 
 def _boundary(setup, make, label: str, policy: DeadlineFeePolicy = DEFAULT_RADIANT_DEADLINE_FEE_POLICY):
     """Find a fee that is EXACTLY this transaction's floor, and prove one under fails.
@@ -319,18 +324,30 @@ def _boundary(setup, make, label: str, policy: DeadlineFeePolicy = DEFAULT_RADIA
     instead makes this test pass or fail on which DER length turned up — measured at
     roughly 40% spurious failures before the split.
 
+    A fresh ``state`` is also a **size-neutral redraw**: the keys it draws contribute a
+    fixed 33-byte pubkey and a fixed 20-byte PKH, so a new attempt changes the sighash
+    and not the byte count. What it cannot do is make the probe agree with the
+    candidate, so the fee↔size fixed point is ITERATED rather than taken from a single
+    probe — the same change made to
+    ``test_remaining_builder_floors_regtest_e2e._settle_pair``. Demanding that three
+    independent DER draws agree left a measured 0.07% non-convergence per case here
+    (1/1500 trials, on each of the three cases that flaked), which is 0.27% per run of
+    this file. Iterating leaves only ``under`` as an independent draw.
+
     :returns: ``(at_floor_raw, floor)``.
     """
     for _ in range(25):
         state = setup()
-        probe = make(state, policy.min_relay_fee(400), _PERMISSIVE)
-        floor = policy.min_relay_fee(len(probe))
-        try:
-            cand = make(state, floor, policy)
-        except InsufficientFundsError:
-            continue
-        if policy.min_relay_fee(len(cand)) != floor:
-            continue
+        size = len(make(state, policy.min_relay_fee(400), _PERMISSIVE))
+        for _ in range(_SETTLE_STEPS):
+            floor = policy.min_relay_fee(size)
+            settled = len(make(state, floor, _PERMISSIVE))
+            if settled == size:
+                break
+            size = settled
+        else:
+            continue  # the fee↔size map is a two-cycle on this state
+        cand = make(state, floor, policy)
         # One photon under, forced past the guard, must be the SAME size — otherwise
         # "under" would be a statement about a different transaction.
         under = make(state, floor - 1, _PERMISSIVE)

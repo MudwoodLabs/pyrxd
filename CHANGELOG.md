@@ -541,6 +541,49 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tests
 
+- **The relay-floor boundary searches in `test_remaining_builder_floors_regtest_e2e.py`
+  failed ~14% of the time for reasons that had nothing to do with the code under test.**
+  Landing exactly on the floor is a search, not a solve: the fee is part of the signed
+  output value, so changing it re-signs the input, which can change the DER signature
+  length (69/70/71 bytes), which changes the size the floor is derived from. The old
+  search took one probe and then demanded that the at-floor build *and* the
+  one-photon-under build both come out the probe's size — three independent DER draws
+  that had to agree, retried ten or twelve times with completely fresh state. Measured
+  over 3,000 offline trials of each shipped search (the searches never consult the node,
+  so the rate is a property of the search alone): **2.9%** non-convergence on the RSWP
+  cancel, **6.3%** on the gravity claim, **5.6%** on the gravity cancel — **14.1% per run
+  of the file**. Reproduced on a live regtest node at the mainnet floor:
+  **5 failures in 40 consecutive runs (12.5%)**, spread across all three cases.
+
+  Fixed with the size-neutral redraw this repo had already used twice — nLockTime in
+  `test_wallet_send_regtest_e2e._fee_at_exactly`, a refund PKH in
+  `test_fee_floor_boundary_regtest_e2e._PKH_REDRAWS` — plus iterating the fee↔size fixed
+  point instead of trusting a single probe, which removes one of the three draws. The
+  RSWP cancel redraws its **refund PKH** and the gravity cancel its **payout address**
+  (20 and 25 bytes at every value, and neither builder pins them), so both now fund/deploy
+  once and redraw for free. The gravity claim pins everything a free redraw could move —
+  its one output is the P2SH of the claimed redeem script committed in the offer, its
+  signer is the taker key the covenant checks — so its draw is a fresh deployed offer, but
+  one per draw instead of one per build: **2.8 deployments per run, down from 9.4**. The
+  gravity forfeit carries no signature at all (`OP_1 <claimed redeem>`), so its size never
+  moves with the fee and it settles on the first draw every time.
+
+  **No assertion was weakened.** The node is still asked to accept a fee exactly at its
+  own advertised floor and to reject one photon under, with the reason quoted verbatim;
+  the pair is now built from the *same* draw, so "one photon under" is a statement about
+  that transaction rather than about a differently sized sibling, and the builder's own
+  refusal at `floor - 1` is asserted inside the search. Measured after: **0/3,000
+  non-convergent on all four cases**, mean 2.7 draws, worst 21 against a budget of 40, and
+  **40/40 consecutive green live runs** against the same 35/40 before. The file also got
+  ~3.7x faster on a node (17.4 s → 4.7 s), because a draw is now one chain round trip
+  rather than one per build.
+
+  The same shape in `test_swap_and_nft_fee_floors._boundary` (four offline cases) measured
+  0.07% per case, 0.27% per run of that file; it gets the same fixed-point iteration and
+  now measures 0/3,000 on each. `test_remaining_builder_relay_fee_floors::TestTheBoundaryIsExact`
+  looks similar but already splits its two halves into 60 tries each and measured 0/400 on
+  every builder — left alone.
+
 - **Sixteen golden-vector tests had skipped on every clean checkout since they were
   written — including CI — and one of the clusters was the only cover for a fail-closed
   broadcast guard.** They read
