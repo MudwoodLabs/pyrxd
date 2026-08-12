@@ -33,6 +33,7 @@ import json
 import shlex
 import subprocess
 
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.network.electrumx import UtxoRecord
 
 
@@ -179,7 +180,7 @@ class SshTrRadiantClient:
         spk = bytes.fromhex(u["scriptPubKey"])
         in_sats = round(u["amount"] * 1e8)
         change = in_sats - amount_photons - fee_photons
-        if change <= 546:
+        if change <= DUST_THRESHOLD_PHOTONS:
             raise RuntimeError(f"selected UTXO too small to carve {amount_photons} + fee {fee_photons}")
 
         def _src(txid, vout, s, v):

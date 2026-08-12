@@ -58,6 +58,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
+from ..fee_sizing import relay_floor_photons_per_byte
 from ..gravity.fee_policy import RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
 from ..network.registry import (
     DEFAULT_ENDPOINTS,
@@ -80,6 +81,27 @@ DEFAULT_CONFIG_DIR = Path.home() / ".pyrxd"
 DEFAULT_CONFIG_PATH = DEFAULT_CONFIG_DIR / "config.toml"
 DEFAULT_WALLET_PATH = DEFAULT_CONFIG_DIR / "wallet.dat"
 
+# The CLI's default fee rate, in photons per BYTE. DERIVED from the one definition
+# of Radiant's effective relay floor, not written out — and this file is why that
+# matters: :func:`validated_fee_rate` below REJECTS any rate under the floor, and it
+# reads the floor from :mod:`pyrxd.fee_sizing`. The default it validates was a
+# separate literal ``10_000``, so the value and the rule that judges it were derived
+# independently, ~270 lines apart, and agreed only by coincidence.
+#
+# Both directions of a floor change were broken by that:
+#
+# * floor UP — ``load()`` starts raising ``ValidationError`` on a machine with no
+#   config file at all, because pyrxd's own default is now sub-floor. Every CLI
+#   command fails, and ``setup`` writes a config the loader then rejects.
+# * ``Config()`` / ``CliContext()`` constructed directly do NOT pass through
+#   ``validated_fee_rate`` — they take the dataclass default. A stale literal there
+#   is a silent sub-floor build, and Radiant has neither RBF nor CPFP, so the
+#   transaction cannot be bumped; it holds its inputs until mempool expiry.
+#
+# The floor has already moved once (the 2.0 activation raised it 10x), so this is a
+# change that has happened, not one that might.
+DEFAULT_FEE_RATE_PHOTONS_PER_BYTE: int = relay_floor_photons_per_byte()
+
 # Built-in defaults — used if config file is missing.
 #
 # NOTE there is deliberately no "electrumx" key here any more. A single default
@@ -88,7 +110,7 @@ DEFAULT_WALLET_PATH = DEFAULT_CONFIG_DIR / "wallet.dat"
 # mainnet. Endpoints now come from the per-network registry instead.
 _DEFAULTS: dict[str, Any] = {
     "network": "mainnet",
-    "fee_rate": 10_000,
+    "fee_rate": DEFAULT_FEE_RATE_PHOTONS_PER_BYTE,
     "wallet_path": str(DEFAULT_WALLET_PATH),
     # SLIP-0044 coin type used when `wallet new` derives a fresh wallet.
     # 512 = Radiant Standard (SLIP-0044). `setup --coin-type` writes this.
@@ -159,7 +181,7 @@ class Config:
     electrumx_servers: tuple[str, ...] = ()
     allow_insecure: bool = False
     spki_pins: tuple[str, ...] = ()
-    fee_rate: int = 10_000
+    fee_rate: int = DEFAULT_FEE_RATE_PHOTONS_PER_BYTE
     wallet_path: Path = field(default_factory=lambda: DEFAULT_WALLET_PATH)
     coin_type: int = 512
     networks: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -359,7 +381,11 @@ def validated_fee_rate(
         table: the TOML table the value came from (e.g. ``networks.regtest``),
             when it is not the top-level key.
     """
-    floor_per_byte = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB // 1000
+    # The per-kB -> per-byte conversion is :func:`relay_floor_photons_per_byte`'s job,
+    # not a division repeated at each call site: ``fee_for_kb_rate`` rounds UP and this
+    # rounds DOWN, so a floor that is not an exact multiple of 1000 makes a hand-written
+    # ``// 1000`` disagree with the module that owns the rule by one photon per byte.
+    floor_per_byte = relay_floor_photons_per_byte()
     if rate < floor_per_byte:
         # Name the ACTUAL source. An env override with a config file present would
         # otherwise send the operator to edit a file that does not contain the value,

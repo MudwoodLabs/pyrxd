@@ -58,13 +58,29 @@ from pyrxd.constants import (
     PUSH_REF_OPCODES,
     REF_OPERAND_OPCODES,
     REF_OPERAND_WIDTH,
+    SEQUENCE_FINAL,
+    SEQUENCE_LOCKTIME_ENABLED,
 )
+from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
+from pyrxd.fee_sizing import relay_floor_photons_per_byte
+from pyrxd.security.types import BTC_MAX_SATS, RADIANT_MAX_PHOTONS
 
 pytestmark = pytest.mark.unit
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SRC_ROOT = REPO_ROOT / "src" / "pyrxd"
 TESTS_ROOT = REPO_ROOT / "tests"
+SCRIPTS_ROOT = REPO_ROOT / "scripts"
+EXAMPLES_ROOT = REPO_ROOT / "examples"
+
+#: The roots a VALUE scan covers. ``tests`` is deliberately absent — see
+#: :meth:`TestNoRespelledCentralisedValue.test_no_second_literal`. ``scripts`` and
+#: ``examples`` are present because they were the tree's remaining blind spot: the
+#: value guard was ``src``-only, and five hand-written ``546``s were sitting in
+#: shipped examples and mainnet run scripts the whole time it was passing. An example
+#: is a file people COPY, so a literal there propagates into code this repo will
+#: never see.
+_VALUE_SCAN_ROOTS = {"src": SRC_ROOT, "scripts": SCRIPTS_ROOT, "examples": EXAMPLES_ROOT}
 
 # The one module allowed to state each rule.
 CANONICAL_MODULE = SRC_ROOT / "constants.py"
@@ -126,6 +142,7 @@ _GUARDED_NAMES = [
     "MAX_OPS_PER_SCRIPT",
     "MAX_STACK_SIZE",
     "MAX_OP_RETURN_MSG_BYTES",
+    "SEQUENCE_LOCKTIME_ENABLED",
 ]
 
 
@@ -249,17 +266,29 @@ def respelled_centralised_value(source: str) -> list[str]:
 
 class TestNoRespelledCentralisedValue:
     @pytest.mark.parametrize("value", sorted(_GUARDED_VALUES))
-    def test_no_second_literal_in_src(self, value):
-        """``src`` only. ``tests`` is measured to hold 19 legitimate
-        ``500_000_000`` photon amounts (5 RXD is a natural fixture size), so a
-        value scan there would be unsatisfiable — which is why the NAME check
-        above is the one that covers ``tests``. The two guards have different
-        blind spots on purpose."""
+    @pytest.mark.parametrize("root_name", sorted(_VALUE_SCAN_ROOTS))
+    def test_no_second_literal(self, value, root_name):
+        """``src``, ``scripts`` and ``examples`` — but NOT ``tests``.
+
+        ``tests`` is measured to hold 19 legitimate ``500_000_000`` photon amounts
+        (5 RXD is a natural fixture size) plus boundary vectors like
+        ``2_100_000_000_000_001``, so a value scan there would be unsatisfiable —
+        which is why the NAME check above is the one that covers ``tests``. The two
+        guards have different blind spots on purpose.
+
+        ``scripts`` and ``examples`` used to share ``tests``' exemption by accident
+        rather than by argument: the scan simply started at ``src`` and stopped
+        there. They hold no such legitimate collisions — measured, five hits, all
+        five a hand-written dust floor — so there was never a reason to exclude
+        them, and every reason not to: ``examples`` is the code readers copy.
+        """
+        root = _VALUE_SCAN_ROOTS[root_name]
         name = _GUARDED_VALUES[value]
-        exempt = _VALUE_EXEMPTIONS.get(value, set())
+        # Exemptions are recorded relative to ``src``; the other roots have none.
+        exempt = _VALUE_EXEMPTIONS.get(value, set()) if root_name == "src" else set()
         offenders = []
-        for path in _python_files(SRC_ROOT):
-            rel = str(path.relative_to(SRC_ROOT))
+        for path in _python_files(root):
+            rel = str(path.relative_to(root))
             if path == CANONICAL_MODULE or rel in exempt:
                 continue
             source = path.read_text(encoding="utf-8")
@@ -747,6 +776,200 @@ def base58_alphabet_literals(source: str) -> list[str]:
     ]
 
 
+# ---------------------------------------------------------------------------
+# Rules that are DERIVED somewhere, and were written out by hand anyway
+# ---------------------------------------------------------------------------
+#
+# The detectors above cover values that live in ``pyrxd.constants``. These four
+# cover the other half of the same failure mode: a rule that already has an owner
+# — a function that computes it, or a constant in the module that owns the
+# subject — and a second copy typed out somewhere the owner was not imported.
+#
+# Each one exists because the sweep found live copies, and each is deliberately
+# NARROW. A blanket ban on the underlying number would be unsatisfiable and would
+# be allow-listed away within a release: 10_000 is also a basis-point denominator
+# and a dust ceiling, 768 is also a legitimate registry datum. So each detector
+# keys on the number AND on the role the site puts it in, which is what separates
+# "the rule, restated" from "the same integer, for an unrelated reason".
+
+
+def _decimal_int_constant(node: ast.AST, source: str, wanted: int) -> bool:
+    """Is ``node`` the int ``wanted``, WRITTEN as a plain decimal literal?
+
+    Same "AST for structure, source spelling for intent" rule the ref detectors
+    use, for the same reason: ``0x0300`` is 768 and has nothing to do with
+    Ethereum finality.
+    """
+    if not isinstance(node, ast.Constant) or isinstance(node.value, bool) or not isinstance(node.value, int):
+        return False
+    if node.value != wanted:
+        return False
+    segment = ast.get_source_segment(source, node)
+    return bool(segment and _DECIMAL_INT.fullmatch(segment.strip()))
+
+
+def _binding_name(node: ast.AST) -> str | None:
+    """The name a statement binds, for the statement kinds a constant hides in."""
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+        return node.target.id
+    if isinstance(node, ast.Assign):
+        for t in node.targets:
+            if isinstance(t, ast.Name):
+                return t.id
+            if isinstance(t, ast.Attribute):
+                return t.attr
+    return None
+
+
+def respelled_relay_floor(source: str) -> list[str]:
+    """Radiant's per-BYTE relay floor, typed out as a fee rate.
+
+    The owner is :func:`pyrxd.fee_sizing.relay_floor_photons_per_byte`, and
+    ``glyph.builder``, ``glyph.ft``, ``glyph.dmint.miner`` and ``wallet`` all bind
+    their default to that call. Four sites did not: both CLI config defaults, the
+    ``CliContext`` field, and ``build_dmint_mint_tx``'s parameter.
+
+    Why the floor moving is not hypothetical: Radiant ships TWO floors, the legacy
+    ``LEGACY_MIN_RELAY_TX_FEE_PER_KB`` and the post-2.0
+    ``RADIANT_CORE_2_MIN_RELAY_TX_FEE_PER_KB``, and ``GetEffectiveMinRelayFee``
+    already switched between them once — a 10x step. A stale literal on a *default*
+    is the worst place for it: nobody passed the value, so nobody reviews it, and
+    Radiant has neither RBF nor CPFP, so the resulting transaction cannot be
+    bumped. It holds its inputs until mempool expiry.
+
+    NARROW BY DESIGN. It fires only where the number is playing the role of a fee
+    rate — a binding, parameter default, or dict entry whose NAME says ``fee_rate``.
+    ``_BPS_DENOMINATOR = 10_000`` (basis points) and
+    ``MAINNET_DUST_CEILING_PHOTONS = 10_000`` are the same integer for unrelated
+    reasons and must not be swept in; both are proved unflagged below.
+    """
+    floor = relay_floor_photons_per_byte()
+    tree = _parse(source)
+    offenders: list[str] = []
+
+    def _is_fee_rate(name: str | None) -> bool:
+        return bool(name) and "fee_rate" in name.lower()
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Assign, ast.AnnAssign)):
+            name = _binding_name(node)
+            if _is_fee_rate(name) and node.value is not None and _decimal_int_constant(node.value, source, floor):
+                offenders.append(f"line {node.lineno}: {name} = {floor}")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = node.args
+            positional = a.posonlyargs + a.args
+            for arg, default in zip(positional[len(positional) - len(a.defaults) :], a.defaults, strict=True):
+                if _is_fee_rate(arg.arg) and _decimal_int_constant(default, source, floor):
+                    offenders.append(f"line {default.lineno}: parameter {arg.arg}={floor}")
+            for arg, default in zip(a.kwonlyargs, a.kw_defaults, strict=True):
+                if default is not None and _is_fee_rate(arg.arg) and _decimal_int_constant(default, source, floor):
+                    offenders.append(f"line {default.lineno}: parameter {arg.arg}={floor}")
+        elif isinstance(node, ast.Dict):
+            for key, value in zip(node.keys, node.values, strict=True):
+                is_fee_key = isinstance(key, ast.Constant) and isinstance(key.value, str) and _is_fee_rate(key.value)
+                if is_fee_key and _decimal_int_constant(value, source, floor):
+                    offenders.append(f'line {value.lineno}: "{key.value}": {floor}')
+    return offenders
+
+
+def respelled_non_final_sequence(source: str) -> list[str]:
+    """``0xFFFFFFFE`` — :data:`pyrxd.constants.SEQUENCE_LOCKTIME_ENABLED` — retyped.
+
+    An input is final iff ``nSequence == SEQUENCE_FINAL``, and a transaction whose
+    inputs are all final skips ``nLockTime`` altogether. So every CLTV spend and
+    every BIP68-evaluated refund in this SDK needs exactly this value, and three
+    of them wrote it out: the RSWP refund, the Gravity ``forfeit()`` CLTV input,
+    and the HTLC refund's fee input.
+
+    The one-character slip to ``0xFFFFFFFF`` is silent at build time and fatal at
+    spend time — the refund branch simply stops being satisfiable, on a chain with
+    no RBF and no CPFP, in the path a stalled counterparty makes load-bearing.
+
+    Any spelling counts here, unlike the ref-opcode detectors: there is no
+    plausible unrelated 4294967294 in this tree, so requiring the hex form would
+    only leave the decimal one as a way through. ``SEQUENCE_FINAL - 1`` is a
+    ``BinOp``, not a constant, so the canonical derivation does not trip it.
+    """
+    tree = _parse(source)
+    return [
+        f"line {node.lineno}: {ast.get_source_segment(source, node) or node.value} is SEQUENCE_LOCKTIME_ENABLED"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and not isinstance(node.value, bool)
+        and isinstance(node.value, int)
+        and node.value == SEQUENCE_LOCKTIME_ENABLED
+    ]
+
+
+def respelled_money_supply_cap(source: str) -> list[str]:
+    """A chain's ``MAX_MONEY``, written out instead of imported.
+
+    ``pyrxd.security.types`` owns both, and derives each as ``supply x subunit``
+    rather than as a flat literal — so a bare ``2_100_000_000_000_000`` anywhere is
+    a second copy by construction.
+
+    This one is not about drift, because a supply cap does not change. It is about
+    which CHAIN the number belongs to. ``security/types.py`` records what that
+    costs: Bitcoin's cap was applied to Radiant amounts, where the real limit is a
+    thousand times larger, and one legitimate UTXO above 21,000,000 RXD then raised
+    inside a list comprehension, took every sibling UTXO on the address with it,
+    and surfaced as a transport fault that evicted healthy endpoints. An anonymous
+    literal is precisely the copy that gets pasted onto the wrong chain, because
+    nothing about it says which chain it came from.
+    """
+    caps = {BTC_MAX_SATS: "BTC_MAX_SATS", RADIANT_MAX_PHOTONS: "RADIANT_MAX_PHOTONS"}
+    tree = _parse(source)
+    return [
+        f"line {node.lineno}: {ast.get_source_segment(source, node)} is {caps[node.value]}"
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and not isinstance(node.value, bool)
+        and isinstance(node.value, int)
+        and node.value in caps
+        and _decimal_int_constant(node, source, node.value)
+    ]
+
+
+#: A name that declares a LOWER BOUND rather than a measurement: ``_FLOOR_S`` and
+#: ``_MIN_ETH_FINALIZATION_WINDOW_S``, the two spellings the duplicate actually used.
+_FLOOR_SHAPED_NAME = re.compile(r"floor|min.*final|final.*min", re.IGNORECASE)
+
+
+def restated_eth_finalization_floor(source: str) -> list[str]:
+    """The 2-epoch ETH finality FLOOR, declared a second time under a floor name.
+
+    :data:`pyrxd.eth_wallet.chains.ETH_FINALIZATION_WINDOW_FLOOR_S` owns it. It was
+    two literals joined by a ``# Keep in sync with ...`` comment — which is this
+    whole failure mode written down in the source: the comment names the obligation
+    and supplies nothing that can discharge it. Both copies gate the SAME rule at
+    different boundaries (registry construction, ``MarginPolicy`` construction), so
+    raising one for a real consensus change and missing the other leaves a
+    cross-chain swap claiming against a finalization reserve the chain no longer
+    honours — which is the reorg gate's entire purpose.
+
+    Keyed on a FLOOR-shaped name, not on the number. ``EvmChain(...,
+    finalization_window_s=768)`` in the registry is Ethereum L1's actual window —
+    data, not the rule — and collapsing the two would couple "what this chain does"
+    to "what we refuse to go below". Proved unflagged below.
+
+    "Floor-shaped" covers both spellings the two copies actually used: ``_FLOOR_S``
+    and ``_MIN_ETH_FINALIZATION_WINDOW_S``. A guard keyed on only the first would
+    have missed the second — which is the same mistake ``_GUARDED_NAMES`` made with
+    ``LOCKTIME_HEIGHT_THRESHOLD``, one section up.
+    """
+    tree = _parse(source)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        name = _binding_name(node)
+        if not name or not _FLOOR_SHAPED_NAME.search(name):
+            continue
+        if node.value is not None and _decimal_int_constant(node.value, source, ETH_FINALIZATION_WINDOW_FLOOR_S):
+            offenders.append(f"line {node.lineno}: {name} = {ETH_FINALIZATION_WINDOW_FLOOR_S}")
+    return offenders
+
+
 #: name -> (detector, module allowed to hold the one implementation, why)
 _PRIMITIVE_GUARDS = {
     "double SHA-256": (
@@ -833,6 +1056,97 @@ class TestOneImplementationPerPrimitive:
             if not (SRC_ROOT / rel).is_file()
         ]
         assert not missing, f"stale exemptions in _PRIMITIVE_EXEMPTIONS: {missing}"
+
+
+# ---------------------------------------------------------------------------
+# The derived-rule detectors, run over the tree
+# ---------------------------------------------------------------------------
+
+#: rule -> (detector, scan roots, the remedy to print). ``tests`` is out of scope for
+#: all four for the reason given on
+#: :meth:`TestNoRespelledCentralisedValue.test_no_second_literal`: a test that
+#: asserts against an INDEPENDENTLY spelled expected value is doing its job, and is
+#: the only thing that can catch the canonical constant being mutated.
+_DERIVED_RULE_GUARDS = {
+    "Radiant's per-byte relay floor": (
+        respelled_relay_floor,
+        ("src", "scripts", "examples"),
+        "bind it to pyrxd.fee_sizing.relay_floor_photons_per_byte() — as glyph.builder, "
+        "glyph.ft, glyph.dmint.miner, wallet and cli.config all do",
+    ),
+    "the non-final nSequence": (
+        respelled_non_final_sequence,
+        ("src", "scripts", "examples"),
+        "import SEQUENCE_LOCKTIME_ENABLED from pyrxd.constants",
+    ),
+    "a chain's MAX_MONEY": (
+        respelled_money_supply_cap,
+        ("src", "scripts", "examples"),
+        "import BTC_MAX_SATS or RADIANT_MAX_PHOTONS from pyrxd.security.types — and "
+        "pick by CHAIN, never by which name reads better",
+    ),
+    "the ETH 2-epoch finality floor": (
+        restated_eth_finalization_floor,
+        ("src",),
+        "import ETH_FINALIZATION_WINDOW_FLOOR_S from pyrxd.eth_wallet.chains",
+    ),
+}
+
+#: Files allowed to hold one of these, each a deliberate non-consolidation.
+#: Empty today: every site the sweep found was a real duplicate, and every one was
+#: consolidated. Kept as the recorded place for the first genuine exception.
+_DERIVED_RULE_EXEMPTIONS: dict[str, set[str]] = {}
+
+
+class TestDerivedRulesAreNotRetyped:
+    @pytest.mark.parametrize("rule", sorted(_DERIVED_RULE_GUARDS))
+    def test_no_hand_written_copy(self, rule):
+        detector, root_names, remedy = _DERIVED_RULE_GUARDS[rule]
+        exempt = _DERIVED_RULE_EXEMPTIONS.get(rule, set())
+        offenders = []
+        for root_name in root_names:
+            root = _VALUE_SCAN_ROOTS[root_name]
+            for path in _python_files(root):
+                if path == CANONICAL_MODULE or str(path.relative_to(root)) in exempt:
+                    continue
+                source = path.read_text(encoding="utf-8")
+                offenders += [f"{_rel(path)}: {hit}" for hit in detector(source)]
+        assert not offenders, (
+            f"{rule} is written out by hand:\n  " + "\n  ".join(offenders) + f"\nInstead: {remedy}. "
+            "A second literal inherits none of the pins the canonical one carries."
+        )
+
+    def test_the_owning_derivations_still_exist(self):
+        """The other half. Each of these guards is vacuous if the owner is gone,
+        and unlike the ``constants.py`` values these owners are DERIVED expressions
+        — so 'does the canonical module still spell the number' cannot be the check.
+        What must hold is that each is still computed from its inputs."""
+        assert relay_floor_photons_per_byte() * 1000 == 10_000_000, (
+            "the relay floor is no longer derived from RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB"
+        )
+        assert SEQUENCE_LOCKTIME_ENABLED == SEQUENCE_FINAL - 1, (
+            "SEQUENCE_LOCKTIME_ENABLED must stay derived from SEQUENCE_FINAL, not become its own literal"
+        )
+        assert ETH_FINALIZATION_WINDOW_FLOOR_S == 2 * 32 * 12, "the ETH floor is no longer 2 epochs x 32 slots x 12 s"
+        types_src = (SRC_ROOT / "security" / "types.py").read_text(encoding="utf-8")
+        for name in ("BTC_MAX_SATS", "RADIANT_MAX_PHOTONS"):
+            assert re.search(rf"^{name}: int = [\d_]+ \* [\d_]+$", types_src, re.MULTILINE), (
+                f"{name} must stay a supply x subunit product. Flattening it to one literal makes "
+                f"respelled_money_supply_cap unable to tell the definition from a copy."
+            )
+
+    def test_the_eth_floor_has_exactly_one_definition(self):
+        """``restated_eth_finalization_floor`` keys on a name, so it cannot see a
+        copy that picks a third spelling — the same blind spot ``_GUARDED_NAMES``
+        has. This closes it from the other side: the coordinator's floor must BE
+        the chains module's object, not merely equal to it."""
+        from pyrxd.gravity import swap_coordinator
+
+        assert swap_coordinator._MIN_ETH_FINALIZATION_WINDOW_S is ETH_FINALIZATION_WINDOW_FLOOR_S, (
+            "MarginPolicy's ETH finalization floor is no longer the same object as "
+            "pyrxd.eth_wallet.chains.ETH_FINALIZATION_WINDOW_FLOOR_S — it has been given its own "
+            "literal again, and the two can now drift apart silently."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1009,6 +1323,95 @@ _PLANTED_DUPLICATES = [
         "a hand-typed script-element cap",
         "MAX_PUSH = 32_000_000\n",
     ),
+    # --- the relay floor, in each of the four shapes the sweep actually found ---
+    (
+        respelled_relay_floor,
+        "cli/config.py's _DEFAULTS entry — a dict value under a 'fee_rate' key",
+        '_DEFAULTS = {"network": "mainnet", "fee_rate": 10_000, "coin_type": 512}\n',
+    ),
+    (
+        respelled_relay_floor,
+        "cli/config.py's dataclass field — the one load() validates against the floor",
+        "@dataclass\nclass Config:\n    fee_rate: int = 10_000\n",
+    ),
+    (
+        respelled_relay_floor,
+        "cli/context.py's field — the one NOTHING validates, so it fails open",
+        "@dataclass\nclass CliContext:\n    fee_rate: int = 10_000\n",
+    ),
+    (
+        respelled_relay_floor,
+        "build_dmint_mint_tx's parameter default — a lost PoW grind if it goes stale",
+        "def build_dmint_mint_tx(utxo, nonce, pkh, current_time, fee_rate: int = 10_000):\n    return utxo\n",
+    ),
+    (
+        respelled_relay_floor,
+        "a keyword-only parameter default, which the positional zip alone would miss",
+        "def build(*, fee_rate: int = 10_000):\n    return fee_rate\n",
+    ),
+    (
+        respelled_relay_floor,
+        "examples/dmint_v1_deploy_demo.py's module constant, under a DIFFERENT name",
+        "MIN_FEE_RATE = 10_000  # photons per byte\n",
+    ),
+    (
+        respelled_relay_floor,
+        "the same value with no underscores, which a grep for `10_000` misses",
+        "DEFAULT_FEE_RATE = 10000\n",
+    ),
+    # --- the non-final nSequence, in both spellings ---
+    (
+        respelled_non_final_sequence,
+        "swap/rswp/covenant.py's REFUND_SEQUENCE, verbatim",
+        "REFUND_SEQUENCE = 0xFFFFFFFE\n",
+    ),
+    (
+        respelled_non_final_sequence,
+        "gravity/transactions.py's inline CLTV sequence",
+        'seq = (0xFFFFFFFE).to_bytes(4, "little")\n',
+    ),
+    (
+        respelled_non_final_sequence,
+        "gravity/htlc_spend.py's fee-input keyword argument",
+        "fee_in = _fee_input(fee, sequence=0xFFFFFFFE)\n",
+    ),
+    (
+        respelled_non_final_sequence,
+        "the decimal spelling, which a grep for the hex form misses",
+        "SEQ = 4294967294\n",
+    ),
+    # --- money supply caps ---
+    (
+        respelled_money_supply_cap,
+        "btc_wallet/validate.py's bare BTC cap — the anonymous literal that gets pasted onto the wrong chain",
+        "def validate_satoshis(v):\n    return v <= 2_100_000_000_000_000\n",
+    ),
+    (
+        respelled_money_supply_cap,
+        "the same cap without underscores",
+        "MAX = 2100000000000000\n",
+    ),
+    (
+        respelled_money_supply_cap,
+        "Radiant's cap, retyped",
+        "RADIANT_MAX = 2_100_000_000_000_000_000\n",
+    ),
+    # --- the ETH finality floor ---
+    (
+        restated_eth_finalization_floor,
+        "eth_wallet/chains.py's _FLOOR_S, verbatim",
+        "_FLOOR_S = 768\n",
+    ),
+    (
+        restated_eth_finalization_floor,
+        "swap_coordinator.py's copy, under the OTHER name the pair actually used",
+        "_MIN_ETH_FINALIZATION_WINDOW_S = 768\n",
+    ),
+    (
+        restated_eth_finalization_floor,
+        "an annotated third spelling nobody has written yet",
+        "ETH_FINALITY_FLOOR_SECONDS: int = 768\n",
+    ),
 ]
 
 
@@ -1032,7 +1435,11 @@ class TestEachNewDetectorFiresOnAPlantedDuplicate:
     def test_every_new_detector_has_at_least_one_planted_proof(self):
         """Adding a detector without a proof is the failure mode this prevents."""
         proved = {detector for detector, _, _ in _PLANTED_DUPLICATES}
-        registered = {detector for detector, _, _ in _PRIMITIVE_GUARDS.values()} | {respelled_centralised_value}
+        registered = (
+            {detector for detector, _, _ in _PRIMITIVE_GUARDS.values()}
+            | {detector for detector, _, _ in _DERIVED_RULE_GUARDS.values()}
+            | {respelled_centralised_value}
+        )
         unproved = registered - proved
         assert not unproved, (
             f"these detectors have no planted-duplicate proof: {sorted(d.__name__ for d in unproved)}. "
@@ -1082,10 +1489,103 @@ class TestTheNewDetectorsDoNotFireOnLegitimateCode:
                 "an unrelated ordinary number",
                 "TIMEOUT_MS = 30_000\n",
             ),
+            # --- the COINCIDENTAL 10_000s. Each is the same integer for an
+            # --- unrelated reason, and collapsing any of them into the relay floor
+            # --- would couple two things that have no business moving together.
+            (
+                respelled_relay_floor,
+                "glyph/royalty.py's basis-point denominator — 10_000 bps is 100%, not a fee rate",
+                "_BPS_DENOMINATOR = 10_000\n",
+            ),
+            (
+                respelled_relay_floor,
+                "swap/rswp/quoting.py's _BPS, the same denominator under a shorter name",
+                "_BPS = 10_000\n",
+            ),
+            (
+                respelled_relay_floor,
+                "gravity/watch's dust ceiling — photons of VALUE, not photons per byte",
+                "MAINNET_DUST_CEILING_PHOTONS = 10_000\n",
+            ),
+            (
+                respelled_relay_floor,
+                "eth_wallet/rpc.py's log cap — a count, and it is not even a currency",
+                "_MAX_LOG_ENTRIES = 10_000\n",
+            ),
+            (
+                respelled_relay_floor,
+                "a royalty bounds check, where 10_000 is the top of the bps range",
+                "def check(bps):\n    return 0 <= bps <= 10_000\n",
+            ),
+            (
+                respelled_relay_floor,
+                "a CALL passing the rate — the caller chose it, this is a use not a definition",
+                "tx = wallet.build_send_tx(dest, photons=1, fee_rate=10_000)\n",
+            ),
+            (
+                respelled_relay_floor,
+                "the rate bound to the owning derivation, which is the whole point",
+                "from pyrxd.fee_sizing import relay_floor_photons_per_byte\n\nMIN_FEE_RATE = relay_floor_photons_per_byte()\n",
+            ),
+            (
+                respelled_non_final_sequence,
+                "SEQUENCE_FINAL itself — one greater, and a different rule",
+                "SEQUENCE_FINAL = 0xFFFFFFFF\n",
+            ),
+            (
+                respelled_non_final_sequence,
+                "the canonical derivation, which is a BinOp and not a literal",
+                "SEQUENCE_LOCKTIME_ENABLED = SEQUENCE_FINAL - 1\n",
+            ),
+            (
+                respelled_money_supply_cap,
+                "a boundary vector one above the cap, which is a test doing its job",
+                "OVER = 2_100_000_000_000_001\n",
+            ),
+            (
+                respelled_money_supply_cap,
+                "the canonical supply x subunit derivation",
+                "BTC_MAX_SATS: int = 21_000_000 * 100_000_000\n",
+            ),
+            (
+                restated_eth_finalization_floor,
+                "the registry datum — Ethereum L1's ACTUAL window, not the floor",
+                'CHAINS = {"ethereum": EvmChain(name="ethereum", chain_id=1, finalization_window_s=768)}\n',
+            ),
+            (
+                restated_eth_finalization_floor,
+                "a floor-named binding holding an unrelated number",
+                "_FLOOR_S = 900\n",
+            ),
+            (
+                restated_eth_finalization_floor,
+                "the floor bound to the owning constant",
+                "_MIN_ETH_FINALIZATION_WINDOW_S = ETH_FINALIZATION_WINDOW_FLOOR_S\n",
+            ),
         ],
     )
     def test_legitimate_shapes_are_not_flagged(self, detector, label, source):
         assert not detector(source), f"{detector.__name__} false-positives on {label}"
+
+    def test_a_separately_compiled_literal_is_a_DIFFERENT_int_object(self):
+        """The premise ``test_the_eth_floor_has_exactly_one_definition`` rests on.
+
+        That test uses ``is``, so it is worth nothing unless a re-introduced literal
+        really does produce a distinct object. Two independently compiled modules,
+        one deriving the value and one typing it, are exactly the situation — and
+        CPython's small-int cache stops at 256, so 768 is not shared.
+        """
+        derived: dict = {}
+        retyped: dict = {}
+        exec(compile("FLOOR = 2 * 32 * 12\n", "<chains>", "exec"), derived)
+        exec(compile("MIN_WINDOW = 768\n", "<coordinator>", "exec"), retyped)
+        assert derived["FLOOR"] == retyped["MIN_WINDOW"], "premise check: the values must be equal"
+        assert derived["FLOOR"] is not retyped["MIN_WINDOW"], (
+            "a re-typed 768 is the SAME object as the derived one, so the identity guard cannot fire"
+        )
+        imported: dict = {"FLOOR": derived["FLOOR"]}
+        exec(compile("MIN_WINDOW = FLOOR\n", "<coordinator>", "exec"), imported)
+        assert imported["MIN_WINDOW"] is derived["FLOOR"], "an imported name must stay the same object"
 
 
 class TestTheGuardDoesNotFireOnLegitimateCode:

@@ -66,11 +66,26 @@ from dataclasses import dataclass
 
 from pyrxd.security.errors import ValidationError
 
-__all__ = ["KNOWN_EVM_CHAINS", "EvmChain", "evm_chain_by_id"]
+__all__ = ["ETH_FINALIZATION_WINDOW_FLOOR_S", "KNOWN_EVM_CHAINS", "EvmChain", "evm_chain_by_id"]
 
-# Keep in sync with MarginPolicy._MIN_ETH_FINALIZATION_WINDOW_S (the consensus-derived
-# 2-epoch floor); re-declared here so registry entries fail fast at import time.
-_FLOOR_S = 768
+#: Hard floor (SECONDS) on any chain's ``finalization_window_s``. THE ONE DEFINITION —
+#: :class:`pyrxd.gravity.swap_coordinator.MarginPolicy` imports this name rather than
+#: holding its own copy.
+#:
+#: Post-Merge Ethereum finality is two epochs: ``2 x 32 slots x 12 s``. Every EVM chain
+#: here settles to Ethereum L1, so none of them can finalize faster than the L1
+#: checkpoint they anchor to, which makes this a floor for L2s as much as for L1.
+#:
+#: It was two independent literals — this one and ``MarginPolicy``'s — joined by a
+#: "Keep in sync with" comment. That comment is the whole failure mode written down: it
+#: names the obligation and provides nothing that can discharge it. The two guard the
+#: SAME rule at two different boundaries (registry construction here, ``MarginPolicy``
+#: construction there), so raising one to reflect a real consensus change and missing
+#: the other leaves a cross-chain swap claiming against a finalization reserve that the
+#: chain no longer honours — the reorg gate's entire purpose.
+ETH_FINALIZATION_WINDOW_FLOOR_S: int = 2 * 32 * 12
+
+_FLOOR_S = ETH_FINALIZATION_WINDOW_FLOOR_S  # retained: shorter name, same object
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,7 @@ from __future__ import annotations
 import time
 
 from pyrxd.compactsize import encode_compact_size
+from pyrxd.constants import SEQUENCE_LOCKTIME_ENABLED
 from pyrxd.fee_sizing import trial_size_with_slack
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
@@ -941,7 +942,7 @@ def build_forfeit_tx(
         + funding_vout.to_bytes(4, "little")
         + _varint(len(script_sig))
         + script_sig
-        + (0xFFFFFFFE).to_bytes(4, "little")  # sequence for CLTV
+        + SEQUENCE_LOCKTIME_ENABLED.to_bytes(4, "little")  # sequence for CLTV
     )
 
     output_bytes = output_photons.to_bytes(8, "little") + _varint(len(maker_spk)) + maker_spk

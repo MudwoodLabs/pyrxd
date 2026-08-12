@@ -79,6 +79,7 @@ import websockets
 
 from pyrxd.fee_models import SatoshisPerKilobyte
 from pyrxd.glyph import GlyphBuilder, GlyphMetadata, GlyphProtocol
+from pyrxd.glyph.builder import MIN_FEE_RATE as _BUILDER_MIN_FEE_RATE
 from pyrxd.glyph.builder import DmintV1DeployParams
 from pyrxd.glyph.dmint import is_token_bearing_script
 from pyrxd.hash import sha256
@@ -111,7 +112,10 @@ RESUME_COMMIT_VOUT = int(os.environ.get("COMMIT_VOUT", "0"))
 RESUME_COMMIT_VALUE = int(os.environ.get("COMMIT_VALUE", "0")) if RESUME_COMMIT_TXID else 0
 RESUME_FILE = ".dmint_v1_deploy_demo.resume.json"
 
-MIN_FEE_RATE = 10_000  # photons per byte (post-V2 mainnet)
+# Photons per byte. IMPORTED from the builder that owns it, not retyped: the post-V2
+# mainnet floor is 10x the pre-2.0 one, and a demo that ships a stale literal teaches
+# every reader to build transactions the network will not relay.
+MIN_FEE_RATE = _BUILDER_MIN_FEE_RATE
 
 # ---------------------------------------------------------------------------
 # ElectrumX client (minimal — matches ft_deploy_premine.py's helpers)

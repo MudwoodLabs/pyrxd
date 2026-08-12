@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES
+from pyrxd.fee_sizing import relay_floor_photons_per_byte
 from pyrxd.hash import hash256, sha256
 from pyrxd.security.errors import (
     ContractExhaustedError,
@@ -74,6 +75,20 @@ from .types import (
 #: Feed the pair to :func:`~pyrxd.glyph.dmint.live_stats` to turn it into an
 #: observed rate plus remaining-time quantiles.
 ProgressCallback = Callable[[int, float], None]
+
+#: Default fee rate for :func:`build_dmint_mint_tx`, in photons per byte. DERIVED
+#: from the single definition of Radiant's effective relay floor in
+#: :mod:`pyrxd.fee_sizing`, exactly as ``pyrxd.glyph.builder.MIN_FEE_RATE``,
+#: ``pyrxd.glyph.ft.MIN_FEE_RATE`` and ``pyrxd.wallet.DEFAULT_FEE_RATE`` are.
+#:
+#: It was a hardcoded ``10_000``, and this is the call site where that costs the
+#: most: a mint transaction is the end of a multi-minute PoW grind, Radiant has
+#: neither RBF nor CPFP, and a rate below the floor cannot be bumped — the
+#: transaction squats on its inputs until mempool expiry while the contract's
+#: height advances and another miner takes the slot. The floor has already moved
+#: once (``LEGACY_MIN_RELAY_TX_FEE_PER_KB`` -> ``RADIANT_CORE_2_MIN_RELAY_TX_FEE_PER_KB``,
+#: a 10x step); a literal here would have silently kept the pre-2.0 rate.
+MIN_FEE_RATE: int = relay_floor_photons_per_byte()
 
 # ---------------------------------------------------------------------------
 # PoW preimage (same structure as V1 — §2.5 / Appendix B)
@@ -1337,7 +1352,7 @@ def build_dmint_mint_tx(
     nonce: bytes,
     miner_pkh: bytes,
     current_time: int,
-    fee_rate: int = 10_000,
+    fee_rate: int = MIN_FEE_RATE,
     *,
     funding_utxo: DmintMinerFundingUtxo | None = None,
     op_return_msg: bytes | None = None,

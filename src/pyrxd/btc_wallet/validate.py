@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 
 from pyrxd.security.errors import ValidationError
+from pyrxd.security.types import BTC_MAX_SATS
 
 __all__ = ["validate_btc_address", "validate_satoshis"]
 
@@ -42,7 +43,16 @@ def validate_satoshis(value: int, name: str = "value") -> None:
     Rules:
       - Must be a plain int (not bool, not float).
       - Must be > 0.
-      - Must not exceed max BTC supply (21M BTC = 2.1e15 sats).
+      - Must not exceed :data:`~pyrxd.security.types.BTC_MAX_SATS` (21M BTC).
+
+    The cap is IMPORTED, not written out. It used to be a bare
+    ``2_100_000_000_000_000`` here — a second, unnamed copy of a chain's MAX_MONEY,
+    which is the exact shape of a bug this SDK has already had: Bitcoin's supply cap
+    was applied to a RADIANT amount, where the real limit is a thousand times larger
+    (``RADIANT_MAX_PHOTONS``), and a single legitimate UTXO above 21,000,000 RXD then
+    raised inside a list comprehension and took every sibling UTXO on that address
+    down with it. An anonymous literal is the copy that gets pasted onto the wrong
+    chain, because nothing about it says which chain it belongs to.
 
     Raises:
         ValidationError: on any violation.
@@ -53,5 +63,5 @@ def validate_satoshis(value: int, name: str = "value") -> None:
         raise ValidationError(f"{name} must be an integer")
     if value <= 0:
         raise ValidationError(f"{name} must be > 0")
-    if value > 2_100_000_000_000_000:
+    if value > BTC_MAX_SATS:
         raise ValidationError(f"{name} exceeds max BTC supply")

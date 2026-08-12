@@ -49,6 +49,7 @@ from pyrxd.btc_wallet.taproot import (
     TimeUnit,
     btc_input_outpoints_from_raw,
 )
+from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
@@ -149,12 +150,15 @@ ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS = 6
 # even a dust run must use >= 2. NOT a configurable knob — it is the fail-closed floor.
 _MIN_REORG_DEPTH_BLOCKS = 2
 
-# Hard safety floor (SECONDS) for the ETH/PoS finalization window. Post-Merge finality is two
-# epochs (2 * 32 slots * 12 s = 768 s) in the steady state; a smaller window collapses the
-# reorg-gate's finalization reserve toward zero. Enforced at MarginPolicy construction whenever
-# eth_finalization_window_s is set (the ETH-swap PRESENCE of the field is enforced fail-closed
-# at SwapCoordinator construction, where the counter chain is known).
-_MIN_ETH_FINALIZATION_WINDOW_S = 768
+# Hard safety floor (SECONDS) for the ETH/PoS finalization window. A smaller window collapses
+# the reorg-gate's finalization reserve toward zero. Enforced at MarginPolicy construction
+# whenever eth_finalization_window_s is set (the ETH-swap PRESENCE of the field is enforced
+# fail-closed at SwapCoordinator construction, where the counter chain is known).
+#
+# IMPORTED, not restated. This was a second literal 768 kept beside a "Keep in sync with"
+# comment in eth_wallet.chains; the same rule is enforced at both boundaries, so the two
+# copies had to agree and nothing made them.
+_MIN_ETH_FINALIZATION_WINDOW_S = ETH_FINALIZATION_WINDOW_FLOOR_S
 
 
 @dataclass(frozen=True)

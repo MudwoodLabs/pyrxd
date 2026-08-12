@@ -68,6 +68,7 @@ import time
 # RIPEMD160 in the legacy provider and leaves it unloaded on most current
 # distros, where the direct call raises. pyrxd.hash falls back to a verified
 # pure-Python implementation.
+from pyrxd.fee_sizing import relay_floor_photons_per_byte
 from pyrxd.hash import hash160
 
 # ─────────────────────────────────────────────────────────────
@@ -556,9 +557,11 @@ async def phase_5_broadcast_guard(offer=None, maker_offer_result=None):
         maker_pkh_live = hash160(maker_pub_live)
         maker_btc = _gkp(network="bc")  # Maker's own BTC mainnet keypair for self-trade
 
-        # Radiant min relay fee is 10,000 photons/byte. A MakerOffer tx is ~190 bytes,
-        # so minimum fee is ~1,900,000 photons. Use 10,000 ph/byte with 250-byte headroom.
-        FEE_RATE_PH_PER_BYTE = 10_000
+        # A MakerOffer tx is ~190 bytes, so the minimum fee is ~1,900,000 photons at
+        # the relay floor. Take the floor from the module that owns it, with 250-byte
+        # headroom — this script broadcasts to MAINNET, so a stale rate is a real
+        # transaction that cannot be bumped (Radiant has no RBF and no CPFP).
+        FEE_RATE_PH_PER_BYTE = relay_floor_photons_per_byte()
         ESTIMATED_TX_BYTES = 250
         live_fee = FEE_RATE_PH_PER_BYTE * ESTIMATED_TX_BYTES  # 2,500,000 photons
         photons_live = utxo["value"] - live_fee

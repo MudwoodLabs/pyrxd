@@ -97,6 +97,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.glyph.dmint import (
     DEFAULT_MAX_ATTEMPTS,
     DmintContractUtxo,
@@ -137,8 +138,9 @@ OP_RETURN_MSG: str = os.environ.get("OP_RETURN_MSG", "")
 MAX_ATTEMPTS: int = int(os.environ.get("MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS)))
 EXTERNAL_MINER: str = os.environ.get("EXTERNAL_MINER", "")
 
-# Standard relay-policy dust floor (matches build_dmint_mint_tx's check).
-_DUST_LIMIT = 546
+# pyrxd's uneconomic-change floor. IMPORTED, not retyped — an example is a file
+# people copy, so a literal here propagates a second copy into their code.
+_DUST_LIMIT = DUST_THRESHOLD_PHOTONS
 
 
 # ---------------------------------------------------------------------------

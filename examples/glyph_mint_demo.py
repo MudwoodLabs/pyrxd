@@ -41,6 +41,7 @@ import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.glyph import GlyphMetadata, GlyphProtocol
 from pyrxd.glyph.fees import estimate_reveal_fee_for_metadata
 from pyrxd.glyph.mint import GlyphMinter, JsonFilePendingStore
@@ -104,7 +105,7 @@ async def main() -> None:
         print()
         print(f"reveal size:  {estimate.size_bytes:,} bytes ({estimate.cbor_bytes_len:,} bytes of CBOR)")
         print(f"reveal fee:   {estimate.fee:,} photons at {estimate.fee_rate:,}/byte")
-        print(f"commit needs: {estimate.required_commit_value(546):,} photons")
+        print(f"commit needs: {estimate.required_commit_value(DUST_THRESHOLD_PHOTONS):,} photons")
         print("\n[DRY RUN] nothing broadcast. Set DRY_RUN=0 to mint.")
         return
 
