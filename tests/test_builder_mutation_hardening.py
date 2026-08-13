@@ -41,12 +41,13 @@ from pyrxd.fee_sizing import (
 )
 from pyrxd.glyph.builder import GlyphBuilder, TransferParams
 from pyrxd.glyph.ft import AirdropFunding, AirdropRecipient, FtUtxo, FtUtxoSet
+from pyrxd.glyph.royalty import royalty_due, royalty_payouts
 from pyrxd.glyph.script import (
     build_ft_locking_script,
     build_nft_locking_script,
     is_legacy_container_script,
 )
-from pyrxd.glyph.types import GlyphRef
+from pyrxd.glyph.types import GlyphRef, GlyphRoyalty
 from pyrxd.hd.bip39 import mnemonic_from_entropy
 from pyrxd.hd.wallet import HdWallet
 from pyrxd.keys import PrivateKey
@@ -160,12 +161,17 @@ class TestFeeNeverBelowRelayFloor:
 
 class TestFeeOverpayBound:
     def test_ceiling_takes_the_LARGER_of_floor_and_target(self) -> None:
-        """Kills ``max(floor, target)`` → ``min(floor, target)``.
+        """Pins ``max(floor, target)`` against ``min(floor, target)``.
 
         Taking the min is the inverse bug in its purest form: a
         deadline-critical spend whose target legitimately sits far above the
         node's floor would be refused as an "overpay" by the cold-recovery
         CLI, which is the one caller that REFUSES rather than warns.
+
+        NOT a survivor — ``tests/test_htlc_spend_fee_floor.py`` already kills
+        this mutant (2 failures against the full offline suite). Kept as a
+        direct unit pin next to the other ``fee_sizing`` bounds, because the
+        existing cover reaches it through an HTLC builder several layers away.
         """
         assert fee_overpay_ceiling(floor=1_000, target=8_000_000) == 8_000_000 * MAX_FEE_OVERPAY_MULTIPLE
         assert fee_overpay_ceiling(floor=8_000_000, target=1_000) == 8_000_000 * MAX_FEE_OVERPAY_MULTIPLE
@@ -381,13 +387,16 @@ class TestNftTransferRefusals:
         assert refused > 0, "no carrier in the sweep was too small — the guard is not being exercised"
 
     def test_a_legacy_container_output_is_named_as_unspendable(self) -> None:
-        """Kills the ``is_legacy_container_script`` guard.
+        """Pins the ``is_legacy_container_script`` guard.
 
-        The only test that builds one of these scripts is regtest-gated, so
-        offline the guard could be deleted silently. A pre-0.15.0
-        CONTAINER-with-child-ref output is permanently unspendable; the holder
-        needs to be told that rather than handed a transfer that every node
-        rejects with an OP_EQUALVERIFY failure.
+        NOT a survivor — ``tests/test_mut_container_wave_builders.py:350``
+        already kills this mutant. Kept because it builds the 100-byte dead
+        shape from the documented byte layout
+        (``d0 <child_ref> d8 <container_ref> 75 76 a9 14 <pkh> 88 ac``) rather
+        than from that module's shared fixture, so the two cannot go wrong
+        together. A pre-0.15.0 CONTAINER-with-child-ref output is permanently
+        unspendable; the holder needs to be told that rather than handed a
+        transfer every node rejects with an OP_EQUALVERIFY failure.
         """
         dead = (
             b"\xd0"
@@ -617,6 +626,187 @@ class TestAirdropFundingValidatesItsValue:
     def test_accepts_one_photon(self) -> None:
         """Radiant's real output floor is 1 photon; the guard must not invent 546."""
         assert AirdropFunding(txid="bb" * 32, vout=0, value=1, private_key=PrivateKey()).value == 1
+
+
+class TestRoyaltySplitsGuardsThatNothingReached:
+    """``royalty_payouts`` branches no offline test executed.
+
+    The royalty *arithmetic* is well covered — the ``sale_price`` cap, the
+    ``minimum`` floor, the flooring direction, the residue and the
+    ``sum(payouts) == royalty_due`` identity all die under mutation. These two
+    guards are the exceptions, and the first is not a dead branch: it is the
+    only thing standing between a legal royalty and a crash.
+    """
+
+    @staticmethod
+    def _addr() -> str:
+        return PrivateKey().public_key().address()
+
+    def test_a_zero_bps_royalty_with_splits_pays_rather_than_crashing(self) -> None:
+        """Kills the ``and royalty.bps > 0`` half of the splits branch.
+
+        ``GlyphRoyalty`` requires ``sum(split.bps) <= bps``, so ``bps=0`` forces
+        every split to 0 — but that shape is *constructible and legal*, and with
+        a ``minimum`` set it resolves to a real payment. Measured against the
+        live module: ``GlyphRoyalty(bps=0, minimum=1000, splits=((addr, 0),))``
+        at ``sale_price=5000`` yields ``royalty_due == 1000`` and one payout.
+        Delete the ``bps > 0`` half and the very next line divides by
+        ``royalty.bps`` — ``ZeroDivisionError`` on a token whose terms are
+        perfectly valid. Nothing offline executed this branch.
+        """
+        creator, split = self._addr(), self._addr()
+        r = GlyphRoyalty(address=creator, bps=0, minimum=1_000, splits=((split, 0),))
+        assert royalty_due(r, 5_000) == 1_000
+        payouts = royalty_payouts(r, 5_000)
+        assert [p.photons for p in payouts] == [1_000]
+        assert [p.address for p in payouts] == [creator], "a 0-bps split is entitled to nothing"
+
+    def test_a_positive_bps_royalty_still_divides_by_bps(self) -> None:
+        """The other half of the same branch, so the fix cannot be "always take
+        the non-splits path"."""
+        creator, split = self._addr(), self._addr()
+        r = GlyphRoyalty(address=creator, bps=1_000, minimum=0, splits=((split, 500),))
+        payouts = royalty_payouts(r, 100_000)
+        assert sum(p.photons for p in payouts) == royalty_due(r, 100_000) == 10_000
+        assert dict((p.address, p.photons) for p in payouts) == {split: 5_000, creator: 5_000}
+
+    def test_a_recipient_address_that_decodes_to_the_wrong_length_is_refused(self) -> None:
+        """Kills the ``len(pkh) != 20`` guard.
+
+        ``address_to_public_key_hash`` validates the base58check *shape*, not
+        the payload length, so this is reachable rather than defensive — and a
+        payout built on a short hash produces a locking script that is not
+        P2PKH and cannot be spent by the recipient. No offline test reached it.
+        """
+        import pyrxd.utils
+
+        r = GlyphRoyalty(address=self._addr(), bps=1_000, minimum=0)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(pyrxd.utils, "address_to_public_key_hash", lambda _a: b"\x11" * 19)
+            with pytest.raises(ValidationError, match="decoded to 19 bytes, expected 20"):
+                royalty_payouts(r, 100_000)
+
+
+class TestFtUtxoSetTypeGuards:
+    """``FtUtxoSet.__init__``'s three constructor type checks.
+
+    All three could be deleted with the whole offline suite green — every test
+    builds the set correctly, so nothing ever exercised the refusals. They are
+    not cosmetic: a duck-typed stand-in that reaches ``total()`` and
+    ``select()`` reports a balance and picks inputs, and the FT fund-loss
+    history in this module is precisely about a wrong number arriving from a
+    caller and being believed.
+    """
+
+    @staticmethod
+    def _utxo(ref: GlyphRef, key: PrivateKey) -> FtUtxo:
+        return FtUtxo.from_output(
+            txid=os.urandom(32).hex(),
+            vout=0,
+            value=1_000_000,
+            ft_script=build_ft_locking_script(_pkh(key), ref),
+        )
+
+    def test_refuses_a_ref_that_is_not_a_GlyphRef(self) -> None:
+        with pytest.raises(ValidationError, match="ref must be a GlyphRef"):
+            FtUtxoSet("ab" * 32, [])  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad", [(), None, "utxos"])
+    def test_refuses_a_utxos_argument_that_is_not_a_list(self, bad: object) -> None:
+        """A tuple is the tempting one: it is the natural thing to pass and
+        would otherwise iterate fine, so the guard has to name the type."""
+        with pytest.raises(ValidationError, match="utxos must be a list"):
+            FtUtxoSet(_ref(), bad)  # type: ignore[arg-type]
+
+    def test_refuses_an_element_that_is_not_an_FtUtxo(self) -> None:
+        key, ref = PrivateKey(), _ref()
+
+        class LooksLikeOne:
+            txid = "aa" * 32
+            vout = 0
+            value = 10**9
+            ft_amount = 10**9
+            ft_script = b""
+
+        with pytest.raises(ValidationError, match="must contain FtUtxo instances"):
+            FtUtxoSet(ref, [self._utxo(ref, key), LooksLikeOne()])  # type: ignore[list-item]
+
+    def test_a_correctly_built_set_is_still_accepted(self) -> None:
+        key, ref = PrivateKey(), _ref()
+        assert FtUtxoSet(ref, [self._utxo(ref, key)]).total() == 1_000_000
+        assert FtUtxoSet(ref, []).total() == 0, "an empty holding is a legal set, not an error"
+
+
+class TestFtTransferAmountTypeGuard:
+    def test_build_transfer_tx_rejects_a_bool_amount_as_ValueError(self) -> None:
+        """Kills ``build_transfer_tx``'s own ``amount`` int/bool check.
+
+        Deleting it is not silent-but-harmless: a ``bool`` amount is still
+        refused one layer down by ``build_airdrop_tx``, but as
+        ``ValidationError`` — while this method's docstring documents
+        ``ValueError`` for a bad ``amount``. A caller catching what the API
+        promises would stop catching it.
+        """
+        key, ref = PrivateKey(), _ref()
+        ft_set = FtUtxoSet(
+            ref,
+            [
+                FtUtxo.from_output(
+                    txid=os.urandom(32).hex(),
+                    vout=0,
+                    value=1_000_000,
+                    ft_script=build_ft_locking_script(_pkh(key), ref),
+                )
+            ],
+        )
+        for bad in (True, 250.0, "250"):
+            with pytest.raises(ValueError, match="amount must be an int"):
+                ft_set.build_transfer_tx(bad, _pkh(), key)  # type: ignore[arg-type]
+
+
+def test_max_airdrop_recipients_is_the_documented_thousand() -> None:
+    """Pins the VALUE of ``MAX_AIRDROP_RECIPIENTS``.
+
+    Measured: changing it to 3 leaves the entire offline suite green, because
+    the only test that exercises the cap derives its own list length from the
+    symbol (``range(MAX_AIRDROP_RECIPIENTS + 1)``). The number is a deliberate
+    cost decision documented in ``glyph/ft.py`` — one FT output is 84
+    serialised bytes, so 1000 recipients is ~8.4 RXD of fee at the relay floor —
+    and a cap that can drift to 3 refuses ordinary work, while one that can
+    drift to 10**6 stops being the "deliberate decision" check it claims to be.
+    """
+    from pyrxd.glyph.ft import MAX_AIRDROP_RECIPIENTS
+
+    assert MAX_AIRDROP_RECIPIENTS == 1000
+
+
+def test_ft_change_can_never_be_negative_through_the_public_builder() -> None:
+    """The honest form of ``build_airdrop_tx``'s ``ft_change < 0`` guard.
+
+    That raise is **unreachable** through the public API: ``select()`` refuses
+    when ``total() < amount`` and otherwise stops only once ``running >=
+    amount``, so ``ft_in_total - total_out`` is non-negative by construction.
+    ``tests/test_glyph_ft_red_team.py:859`` names the guard but dies in
+    ``select()`` before reaching it — a tautological test, which is worse than
+    none because it reports coverage that does not exist.
+
+    So this pins the PROPERTY that makes the guard unreachable rather than
+    pretending to reach it. If a future change to ``select()`` breaks the
+    property, this fails here — and the guard behind it is the backstop.
+    """
+    key, ref = PrivateKey(), _ref()
+    spk = build_ft_locking_script(_pkh(key), ref)
+    utxos = [
+        FtUtxo.from_output(txid=os.urandom(32).hex(), vout=i, value=v, ft_script=spk)
+        for i, v in enumerate((1, 7, 250, 1_000, 50_000_000))
+    ]
+    ft_set = FtUtxoSet(ref, utxos)
+    total = ft_set.total()
+    for amount in (1, 2, 8, 249, 251, 1_257, 1_258, total - 1, total):
+        selected = ft_set.select(amount)
+        assert sum(u.ft_amount for u in selected) - amount >= 0, f"select() under-covered {amount}"
+    with pytest.raises(ValueError, match="Insufficient FT balance"):
+        ft_set.select(total + 1)
 
 
 def test_the_per_byte_floor_is_the_per_kb_floor_divided_by_a_thousand() -> None:

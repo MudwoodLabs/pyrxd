@@ -136,41 +136,61 @@ the surface every fee defect of the 2026-08 audit week lived on — and the scop
 true. `scripts/mutation_test.sh builders` runs them; the group's clean test list measures 9.3 s, so a full
 cosmic-ray sweep of all six files is a multi-hour job.
 
-The **first pass over this scope was hand-mutation, not cosmic-ray**: 59 mutants chosen for consequence
-rather than for coverage, planted one at a time against the full offline suite. That is a deliberately
-partial method and it is recorded as such — it says nothing about the mutants nobody wrote. What it does
-say is precise, because every verdict came from a real run:
+The **first pass over this scope was hand-mutation, not cosmic-ray**: mutants chosen for consequence rather
+than for coverage, planted one at a time. That is a deliberately partial method and it is recorded as such
+— it says nothing about the mutants nobody wrote. What it does say is precise, because every verdict came
+from a real run.
 
-| Module | Hand-mutants planted | Killed | Survived |
-|---|---|---|---|
-| `glyph/ft.py` | 20 | 19 | 1 |
-| `glyph/royalty.py` | 8 | 8 | 0 |
-| `wallet.py` | 11 | 9 | 2 |
-| `hd/wallet.py` | 7 | 6 | 1 |
-| `glyph/builder.py` | 6 | 4 | 2 |
-| `fee_sizing.py` | 6 (of the survivors already suspected) | 0 | 6 |
+### A methodology warning worth more than the numbers
 
-The conservation and "1 photon = 1 unit" arithmetic came out **strong**: over-delivering a recipient by one
-unit is caught by 44 tests, burning one unit of FT change by 25, letting the token pay its own fee by 19,
-and dropping the two-pass signature headroom by 57. The gaps clustered in two places instead —
+The first sweep ran against a **targeted** test list, the way the other scopes do, and produced **three
+false survivors**: `greedy_select_count`'s cushion, the NFT builder's legacy-CONTAINER refusal and
+`fee_overpay_ceiling`'s `max` were all reported as unbound and are all killed by tests that were simply not
+on that list (`test_mut_container_wave_builders.py`, `test_htlc_spend_fee_floor.py`). A targeted list is
+right for *cost*; it is wrong for *verdicts*. **Confirm any survivor against the whole offline suite before
+believing it** — that is a 2-minute run per mutant here, and it is the difference between a finding and a
+guess.
+
+A second trap, also paid for: the harness restored each file with `git checkout -- <path>`, which restores
+**HEAD** and silently destroyed uncommitted fixes in the working tree, invalidating every verdict after the
+first mutant. Snapshot the file contents and write them back instead. And do not let anything else run
+`pytest` against the worktree while a sweep is in flight — a `task ci` that lands mid-mutant fails for
+reasons that have nothing to do with the change under test.
+
+### What the confirmed pass found
+
+The conservation and "1 photon = 1 unit" arithmetic came out **strong**: over-delivering an FT recipient by
+one unit is caught by 44 tests, burning one unit of FT change by 25, letting the token pay its own fee by
+19, dropping the two-pass signature headroom by 57, and every royalty-arithmetic mutant dies — including
+removal of the `sale_price` cap (6 tests). The gaps clustered elsewhere:
 
 1. **the fail-closed backstops themselves**, which every builder has and only some builders prove: the FT
-   airdrop's and `HdWallet.build_send_max_tx`'s final assertions could be defeated with the whole suite
+   airdrop's and `HdWallet.build_send_max_tx`'s final fee assertions could be defeated with the whole suite
    green, because the differentials that exercise them were written for their siblings;
 2. **`fee_sizing`'s less-travelled helpers** — `WITNESS_SCALE_FACTOR`, the strict
-   `fee_never_below_relay_floor`, `radiant_relay_size`'s type gate, `fee_overpay_ceiling` — where the
-   existing tests happened to sit on inputs for which the mutation makes no numerical difference.
+   `fee_never_below_relay_floor`, `radiant_relay_size`'s type gate, `fee_overpay_multiple`'s zero clamp —
+   where the existing tests happened to sit on inputs for which the mutation makes no numerical difference;
+3. **branches nothing ever executed** — `FtUtxoSet.__init__`'s three constructor type checks,
+   `build_transfer_tx`'s own `amount` check, `royalty_payouts`'s 20-byte pkh check, the *value* of
+   `MAX_AIRDROP_RECIPIENTS` (it could be changed to 3 with the whole suite green), and
+   `royalty_payouts`'s `and royalty.bps > 0`, which is not a dead branch at all: delete it and
+   `GlyphRoyalty(bps=0, minimum=1000, splits=((addr, 0),))` — a legal, constructible shape that pays 1000
+   photons today — raises `ZeroDivisionError`.
 
 All of those are now pinned in `tests/test_builder_mutation_hardening.py`, each test proved by planting its
-own mutant and watching it go red.
+own mutant and watching it go red, and each paired with its inverse-bug half.
+
+One guard is **unreachable** and now says so: `build_airdrop_tx`'s `ft_change < 0` raise cannot fire
+through the public API, because `select()` refuses first. The test that named it
+(`test_glyph_ft_red_team.py:859`) never reached it — a tautological test, which is worse than none. What is
+pinned instead is the `select()` property that makes the guard unreachable.
 
 **What this pass did NOT do:** run cosmic-ray over the scope. `required_fee`'s `max(at_rate, floor)` arm
-stays a documented dead branch (`fee_sizing.py` says so and
-`tests/test_swap_and_nft_fee_floors.py` proves it), and the two `wallet.py` survivors —
-`SELECTION_INPUT_BYTES` and `greedy_select_count`'s cushion — are equivalent *through the builders*,
-because the re-selection loop re-measures and takes another coin. They are pinned as a direct
-contract on the function rather than through a builder, since that equivalence is a property of today's
-callers and not of the algorithm.
+stays a documented dead branch (`fee_sizing.py` says so and `tests/test_swap_and_nft_fee_floors.py` proves
+it), and the two `wallet.py` selection survivors — `SELECTION_INPUT_BYTES` and `greedy_select_count`'s
+cushion — are equivalent *through the builders*, because the re-selection loop re-measures and takes
+another coin. They are pinned as a direct contract on the function rather than through a builder, since
+that equivalence is a property of today's callers and not of the algorithm.
 
 ## Known remaining survivors (deferred)
 

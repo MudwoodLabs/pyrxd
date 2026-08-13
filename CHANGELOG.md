@@ -157,22 +157,26 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   list measures 9.3 s, and the cleanup trap now restores its files by name so a
   mutant cannot be left in the tree).
 
-  The first pass was **hand-mutation, not cosmic-ray**: 59 mutants chosen for
-  consequence, planted one at a time against the full offline suite. That is a
-  deliberately partial method and `docs/how-to/mutation-testing.md` records it
-  as one — it says nothing about the mutants nobody wrote.
+  The first pass was **hand-mutation, not cosmic-ray**: mutants chosen for
+  consequence, planted one at a time. That is a deliberately partial method and
+  `docs/how-to/mutation-testing.md` records it as one — it says nothing about
+  the mutants nobody wrote. Every survivor below was confirmed against the
+  **whole** offline suite, because the first sweep ran a targeted test list and
+  produced three *false* survivors that a full-suite re-run disproved; that
+  lesson is written up in the how-to alongside the numbers.
 
   The conservation and "1 photon = 1 unit" arithmetic came out **strong**:
   over-delivering an FT recipient by one unit is caught by 44 tests, burning one
   unit of FT change by 25, letting the token pay its own fee by 19, dropping the
-  two-pass DER signature headroom by 57, and all 8 royalty-arithmetic mutants
-  die. The gaps clustered elsewhere — in the fail-closed backstops themselves,
-  which every builder has and only some builders prove, and in `fee_sizing`'s
-  less-travelled helpers, where the existing tests happened to sit on inputs for
-  which the mutation makes no numerical difference.
+  two-pass DER signature headroom by 57, and every royalty-arithmetic mutant
+  dies, including removal of the `sale_price` cap (6 tests). The gaps clustered
+  elsewhere — in the fail-closed backstops themselves, which every builder has
+  and only some builders prove; in `fee_sizing`'s less-travelled helpers, where
+  the existing tests happened to sit on inputs for which the mutation makes no
+  numerical difference; and in branches nothing ever executed.
 
-  Twelve guards were **correct but unverified** — each could be deleted or
-  inverted with the whole offline suite staying green — and are now pinned in
+  Guards that were **correct but unverified** — each deletable or invertible
+  with the whole offline suite staying green — now pinned in
   `tests/test_builder_mutation_hardening.py`:
 
   - `FtUtxoSet.build_airdrop_tx`'s and `HdWallet.build_send_max_tx`'s final
@@ -185,22 +189,38 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     anyway — `assert_pays_for_its_size` is handed `nft_utxo_value -
     output_value`, which is the fee by construction and stays correct however
     absurd the output becomes.
-  - `build_nft_transfer_tx`'s legacy-CONTAINER refusal, whose only existing test
-    is regtest-gated.
   - `WITNESS_SCALE_FACTOR == 4`. Both existing `bitcoin_virtual_size` cases are
     algebraically invariant to it, so raising it to 5 — which *under*-states a
     BTC transaction's size and therefore its fee — survived everything offline.
   - `fee_never_below_relay_floor`'s `size × rate` arm and its rate validation:
     every prior test ran at or below the floor, where both arms of the `max`
     give the same number.
-  - `radiant_relay_size`'s bytes-only gate, `fee_overpay_ceiling`'s `max`, and
-    `fee_overpay_multiple`'s divide-by-zero clamp.
+  - `radiant_relay_size`'s bytes-only gate and `fee_overpay_multiple`'s
+    divide-by-zero clamp.
+  - `royalty_payouts`'s `and royalty.bps > 0`, which is **not** a dead branch:
+    delete it and `GlyphRoyalty(bps=0, minimum=1000, splits=((addr, 0),))` — a
+    legal, constructible shape that pays 1000 photons today — raises
+    `ZeroDivisionError`. Also its 20-byte pkh check;
+    `address_to_public_key_hash` validates the base58check shape, not the
+    payload length.
+  - `FtUtxoSet.__init__`'s three constructor type checks, `build_transfer_tx`'s
+    own `amount` check (deleting it changes the documented `ValueError` into a
+    `ValidationError` one layer down), and the *value* of
+    `MAX_AIRDROP_RECIPIENTS` — changing 1000 to 3 left the entire offline suite
+    green, because the only test exercising the cap derives its list length from
+    the symbol.
+
+  One guard is **unreachable and now says so**: `build_airdrop_tx`'s
+  `ft_change < 0` raise cannot fire through the public API, because `select()`
+  refuses first. The test that named it never reached it — a tautological test,
+  which is worse than none because it reports coverage that does not exist. What
+  is pinned instead is the `select()` property that makes the guard unreachable.
 
   Every test in the new file was proved by planting its own mutant and watching
-  it go red, and every one is paired with its inverse-bug half — the ceiling
-  itself must pass, two vouts of one transaction must still build, a `bytearray`
-  must still be measured — because a guard that refuses valid work is its own
-  fund-safety defect.
+  it go red, and every one is paired with its inverse-bug half — the fee-rate
+  ceiling itself must pass, two vouts of one transaction must still build, a
+  `bytearray` must still be measured, an empty FT holding must still be a legal
+  set — because a guard that refuses valid work is its own fund-safety defect.
 
 - **The relay-floor boundary searches in `test_remaining_builder_floors_regtest_e2e.py`
   failed ~14% of the time for reasons that had nothing to do with the code under test.**
