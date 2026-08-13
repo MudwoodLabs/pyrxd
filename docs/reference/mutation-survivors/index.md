@@ -1,5 +1,17 @@
 # Surviving mutants — value-moving modules
 
+```{toctree}
+:maxdepth: 1
+
+fee
+wallet
+hdwallet
+glyph
+swap
+coordinator
+network
+```
+
 Each file here lists the mutants that **survived** a cosmic-ray run: the suite executed that
 mutated line and no assertion failed. They are the raw output of
 [`scripts/mutation_survivors.py`](https://github.com/MudwoodLabs/pyrxd/blob/main/scripts/mutation_survivors.py),
@@ -35,9 +47,13 @@ commit that removes it from the worklist. If the answer is anything else, it nee
 
 ## Provenance
 
+Produced 2026-08-12 from a full sweep of all seven value groups — **8 171 mutants, 5 049 killed,
+3 122 survived (61%)** — against the module sources at commit `3115028`, which are byte-identical to
+those at `724fe92`. Per-module rates and wall times are in
+[`../../how-to/mutation-testing.md`](../../how-to/mutation-testing.md).
+
 These lists are **generated**, and they go stale the moment the source or the tests move. Line
-numbers are only meaningful at the commit they were produced from, recorded in the header of each
-file's parent run and in `docs/how-to/mutation-testing.md`'s baseline table.
+numbers are only meaningful at the commit above.
 
 Regenerate them with:
 

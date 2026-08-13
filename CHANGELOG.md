@@ -19,11 +19,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the old and new sets; existing groups keep their file lists, test commands
   and timeouts verbatim so their published baselines stay comparable.
 
-  Measured baselines per module, and the equivalent-mutant classes that explain
-  the raw scores, are in
-  [`docs/how-to/mutation-testing.md`](docs/how-to/mutation-testing.md); the
-  surviving mutants themselves are listed file-by-line in
-  [`docs/reference/mutation-survivors/`](docs/reference/mutation-survivors/).
+  First full baseline: **8 171 mutants, 5 049 killed, 3 122 survived — 61%
+  killed**, 5 h 36 m of compute (1 h 44 m wall clock with one runner per group).
+  Per-module rates range from `fee_sizing.py` at 89% down to `glyph/builder.py`
+  at 24%, whose offline coverage is 66% because its remaining paths belong to
+  the regtest suites. Measured baselines and the equivalent-mutant classes that
+  explain the raw scores are in
+  [`docs/how-to/mutation-testing.md`](docs/how-to/mutation-testing.md); all
+  3 122 survivors are listed with file:line in
+  [`docs/reference/mutation-survivors/`](docs/reference/mutation-survivors/),
+  with the 1 045 annotation-equivalent ones marked so triage can skip them.
 
 - **`.github/workflows/mutation.yml`** — a weekly scheduled lane, one parallel
   job per group, uploading the survivor list and session databases as

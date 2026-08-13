@@ -147,15 +147,39 @@ Every module below ran to completion; the kill rate is over mutants that actuall
 
 | Group | Module | Mutants | Killed | Survived | Killed | …annotation-equivalent | Wall time |
 |---|---|---|---|---|---|---|---|
-| `fee` | `fee_sizing.py` | 362 | 322 | 40 | **89%** | 0 | ~16 min |
+| `fee` | `fee_sizing.py` | 362 | 322 | 40 | **89%** | 0 | 16 min |
 | `wallet` | `wallet.py` | 295 | 176 | 119 | 59% | 0 | 26 min |
-| `hdwallet` | `hd/wallet.py` | 1201 | — | — | — | — | — |
+| `hdwallet` | `hd/wallet.py` | 1201 | 776 | 425 | 65% | 132 | 89 min |
 | `glyph` | `glyph/ft.py` | 453 | 318 | 135 | 70% | 77 | 13 min |
 | `glyph` | `glyph/builder.py` | 736 | 177 | 559 | **24%** | 88 | 24 min |
 | `swap` | `gravity/htlc_spend.py` | 277 | 205 | 72 | 74% | 22 | 7 min |
 | `swap` | `swap/rswp/orders.py` | 529 | 282 | 247 | 53% | 143 | 15 min |
 | `coordinator` | `gravity/swap_coordinator.py` | 1657 | 1162 | 495 | 70% | 187 | 42 min |
 | `network` | `network/bitcoin.py` | 1288 | 840 | 448 | 65% | 77 | 47 min |
+| `network` | `network/electrumx.py` | 557 | 301 | 256 | 54% | 110 | 26 min |
+| `network` | `network/failover.py` | 251 | 118 | 133 | 47% | 88 | 8 min |
+| `network` | `network/confirm.py` | 171 | 132 | 39 | 77% | 22 | 16 min |
+| `network` | `network/registry.py` | 100 | 67 | 33 | 67% | 22 | 3 min |
+| `network` | `network/rxindexer.py` | 95 | 10 | 85 | **10%** | 55 | 1 min |
+| `network` | `network/tls_pin.py` | 93 | 76 | 17 | 81% | 11 | 2 min |
+| `network` | `network/_guards.py` | 85 | 70 | 15 | 82% | 11 | 2 min |
+| `network` | `network/chaintracker.py` | 21 | 17 | 4 | 80% | 0 | <1 min |
+| **total** | | **8171** | **5049** | **3122** | **61%** | **1045** | **5 h 36 m** |
+
+Per group, which is the unit a runner executes:
+
+| Group | Mutants | Killed | Wall time |
+|---|---|---|---|
+| `fee` | 362 | 89% | 16 min |
+| `wallet` | 295 | 59% | 26 min |
+| `hdwallet` | 1201 | 65% | 89 min |
+| `glyph` | 1189 | 42% | 37 min |
+| `swap` | 806 | 60% | 22 min |
+| `coordinator` | 1657 | 70% | 42 min |
+| `network` | 2661 | 61% | 104 min |
+
+**5 h 36 m serially; 1 h 44 m as wall clock** when each group gets its own runner, which is the
+shape the scheduled workflow uses. That difference is the whole argument for one job per group.
 
 > **Wall times are upper bounds, not clean measurements.** They were taken on a 32-core workstation
 > running six to eight of these groups concurrently *and* an unrelated parallel mutation workload —
@@ -163,15 +187,22 @@ Every module below ran to completion; the kill rate is over mutants that actuall
 > runner will be slower. Treat them as "what a group costs when the box is busy", which is the number
 > that decides whether anyone can afford to run it.
 
-Two results stand out, and neither is a scheduling artifact:
+Three results stand out, and none is a scheduling artifact:
 
-- **`glyph/builder.py` kills 24% of its mutants.** It is the largest module in the new scope and the
-  lowest-scoring by a wide margin. Line coverage from the offline suite is 66%, so a third of the file
-  is not executed at all — the regtest end-to-end suites cover those paths, and they do not run here.
-  The honest reading is that this module's *offline* tests are close to a smoke test.
+- **`glyph/builder.py` kills 24% of its mutants** — the lowest score in the scope, on the largest
+  module in it. Line coverage from the offline suite is 66%, so a third of the file never executes
+  here; the regtest end-to-end suites cover those paths and they do not run in this lane. The honest
+  reading is that this module's *offline* tests are close to a smoke test.
 - **`wallet.py` kills 59% with zero annotation-equivalent survivors.** Unlike the other low scorers it
-  has no annotation noise inflating the survivor count: those 119 survivors are real assertions that
-  nobody wrote, in the module that builds ordinary sends.
+  has no annotation noise inflating the count: those 119 survivors are all real assertions nobody
+  wrote, in the module that builds ordinary sends.
+- **`network/rxindexer.py` kills 10%**, but 55 of its 85 survivors are annotations — the module is
+  small and heavily typed. Adjusted, it is 30 genuine survivors out of 40 non-annotation mutants,
+  which is still the weakest ratio in `network/` and the one to look at first.
+
+For contrast, the small guard modules score well: `_guards.py` 82%, `tls_pin.py` 81%,
+`chaintracker.py` 80%, `confirm.py` 77%. Test quality here is not uniformly low — it is low
+specifically where the module is large and its coverage comes from regtest rather than unit tests.
 
 ## Reading the score — survivors are not all bugs
 
@@ -286,8 +317,8 @@ Three places, deliberately, and **not** on the per-push path:
 | pre-release | `task mutate value` over the groups touching what shipped | the release checklist's slot for "did the new tests actually assert anything" |
 
 The per-push gate is `ci.yml`, whose required checks must stay fast enough that people do not learn
-to route around them; the measured cost here is 7-47 minutes **per group** on a loaded 32-core box,
-which is not a per-push shape at any budget. The scheduled lane is modelled on the existing
+to route around them; the measured cost here is **5 h 36 m of compute**, 16-104 minutes per group on
+a loaded 32-core box. That is not a per-push shape at any budget. The scheduled lane is modelled on the existing
 `Fuzz (scheduled)` workflow — Tuesday cron so it does not collide with Monday's fuzz run, forks
 excluded from the schedule, manual `workflow_dispatch` retained.
 
@@ -298,7 +329,7 @@ group rather than the sum. The repo is public, so these are free-tier minutes ra
 the private Actions pool.
 
 The lane is **report-only** — no `MUTATION_MIN_KILL_PCT`. A third of the survivors in this scope are
-equivalent mutants (594 of 2 115 are annotation-only by the conservative count), so a raw kill-rate
+equivalent mutants (1 045 of 3 122 are annotation-only by the conservative count), so a raw kill-rate
 threshold would either sit below the real quality bar or fail the build on untriaged noise. Its
 output is the uploaded survivor list; triage is the human step, and the tests it produces belong in
 `tests/test_mutation_hardening.py`. Set a per-group threshold once that group's equivalent classes
