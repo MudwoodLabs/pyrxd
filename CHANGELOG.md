@@ -165,6 +165,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A dead tip-height read could abort the BTC confirmation wait.**
+  `GravityTrade.wait_confirmations` — the poll a taker sits in while its BTC
+  payment buries — opened every attempt with `await self._btc.get_tip_height()`,
+  discarded the result, and did it **outside** the `try` guarding the very next
+  line. So a source that could not answer that one call raised straight out of
+  the wait, while the identical failure one line later was caught and retried.
+  Measured against the pre-fix source: a source with a failing tip read but
+  working tx reads ends the wait with `NetworkError: tip unavailable` instead of
+  returning the confirmation it could have proved.
+
+  Aborting there is not a safe default. The caller is racing a timelock on a
+  chain with neither RBF nor CPFP, so an abort mid-race costs the funds the poll
+  was watching over — the same "a guard that refuses valid work is its own
+  fund-safety bug" shape as the source-quorum fixes above, except this one was
+  not even a guard. The call was vestigial: the comment beneath it described
+  computing depth as `tip - block_height`, which the code does not do. It
+  re-requests the tx at `min_confirmations` and lets the source apply its own
+  quorum-checked view of the tip, in one read rather than two. Call and stale
+  comment both removed.
+
+  `wait_confirmations` had **no test at all** before this, which is why the
+  defect survived — `tests/gravity/test_trade_wait_confirmations.py` now covers
+  it from both sides: the wait survives a source that cannot report a tip, and
+  still refuses to report a depth it was never told about. The two tests naming
+  the defect were confirmed red against the pre-fix source; the four controls
+  pass both before and after, which is what a control is for.
+
 - **The duplicate-outpoint guards in the FT builders were bypassable by letter
   case.** All three — `FtUtxoSet.__init__`, the airdrop's funding-list check and
   the cross-seam check — keyed on `(u.txid, u.vout)` with `txid` an unnormalised
