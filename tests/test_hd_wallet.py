@@ -2156,3 +2156,38 @@ def test_a_correctly_permissioned_wallet_still_loads(tmp_path) -> None:
     saved = HdWallet.from_mnemonic(mnemonic)
     saved.save(path)
     assert HdWallet.load(path, mnemonic).account_xpub().serialize() == saved.account_xpub().serialize()
+
+
+def test_the_load_path_never_stats_the_path_to_decide_the_mode(tmp_path, monkeypatch) -> None:
+    """MUTANT: re-deriving `mode` from `path.stat()` right after `_read_wallet_file`
+    survived the swap test above, because that test's swap lands later (inside
+    `seed_from_mnemonic`) than the re-stat does.
+
+    So the swap test pins "the bytes are the approved file's" but not "the verdict
+    came from the same descriptor". This one pins the second half structurally: the
+    load must reach its permission decision without consulting the path at all. Any
+    reintroduced `path.stat()` — the exact shape of the original defect — trips it,
+    whatever the timing.
+
+    `_load_existing` is called directly because `HdWallet.load`'s own `path.exists()`
+    is a legitimate path stat that happens before the file is ever opened.
+    """
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    path = tmp_path / "wallet.dat"
+    HdWallet.from_mnemonic(mnemonic).save(path)
+
+    calls: list[str] = []
+    real_stat = Path.stat
+
+    def _recording_stat(self, *a, **kw):
+        calls.append(str(self))
+        return real_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", _recording_stat)
+    HdWallet._load_existing(path, mnemonic, "")
+
+    stats_of_the_wallet = [c for c in calls if c == str(path)]
+    assert not stats_of_the_wallet, (
+        "the wallet load stat()ed the path; the mode verdict must come from fstat on "
+        "the descriptor the bytes were read from"
+    )

@@ -61,9 +61,18 @@ def test_secret_file_0600_is_read_and_stripped(tmp_path):
 
 
 @posix_only
-def test_group_readable_secret_file_is_refused(tmp_path):
-    """NEGATIVE: 0644 must fail closed, and as a CATCHABLE error (was a bare SystemExit)."""
-    p = _secret_file(tmp_path, "s3cr3t", mode=0o644)
+@pytest.mark.parametrize("mode", [0o640, 0o620, 0o610, 0o604, 0o602, 0o601, 0o644, 0o660, 0o666])
+def test_a_secret_file_readable_by_anyone_but_the_owner_is_refused(tmp_path, mode: int):
+    """NEGATIVE: every bit outside owner must fail closed, and as a CATCHABLE error
+    (it was a bare SystemExit).
+
+    Parametrised per bit-position because it was not. This test used to assert only
+    0o644 — despite being named for the *group* case — so mutating the gate's mask
+    from ``0o077`` to ``0o007`` (i.e. "ignore the group bits entirely") left the suite
+    green. A 0o640 secret file is readable by every account in the owner's group,
+    which on a shared host is the whole point of the check.
+    """
+    p = _secret_file(tmp_path, "s3cr3t", mode=mode)
     with pytest.raises(ValidationError, match="must be 0o600"):
         resolve_secret(None, str(p), _ENV, flag="--webhook-secret")
 

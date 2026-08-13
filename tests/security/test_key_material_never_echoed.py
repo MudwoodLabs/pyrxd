@@ -48,6 +48,7 @@ from pyrxd.glyph.types import GlyphProtocol
 from pyrxd.hd.bip32 import Xprv, master_xprv_from_seed
 from pyrxd.hd.bip39 import mnemonic_from_entropy, seed_from_mnemonic, validate_mnemonic
 from pyrxd.keys import PrivateKey
+from pyrxd.security import errors as errors_module
 from pyrxd.security.errors import Base58Error, KeyMaterialError, RxdSdkError, ValidationError, redact
 from pyrxd.utils import decode_address, decode_wif, from_base58
 
@@ -420,3 +421,153 @@ def test_redaction_did_not_widen_into_ordinary_prose() -> None:
         "descriptor key must be an extended PUBLIC key",
     ):
         assert redact(message) == message, "redact() swallowed an ordinary error message"
+
+
+# ── mutants that survived, and the assertions that kill them ─────────────────
+#
+# Mutation-testing `security/errors.py` (the new `keys` group in
+# scripts/mutation_test.sh) found live mutants in exactly the predicate this file
+# exists to defend. Each test below was written against a specific surviving mutant
+# and re-checked by re-planting it.
+
+
+def _tokens_outside_every_shipped_wordlist(count: int) -> list[str]:
+    """`count` lowercase alphabetic tokens guaranteed not to be BIP-39 words.
+
+    Built from a consonant pattern no wordlist uses, then asserted absent — so the
+    test cannot silently degrade into "these happen to be real words" if a wordlist
+    is ever added.
+    """
+    from pyrxd.hd.bip39 import WordList
+
+    WordList.load()
+    shipped = {w.casefold() for words in WordList.wordlist.values() for w in words}
+    tokens = [f"zqx{'v' * (i + 1)}wk" for i in range(count)]
+    assert not (set(tokens) & shipped), "the fixture accidentally used real BIP-39 words"
+    return tokens
+
+
+def test_a_mnemonic_from_a_wordlist_we_do_not_ship_is_still_redacted() -> None:
+    """MUTANT: inverting or weakening the lowercase-shape branch of
+    ``_looks_like_mnemonic`` (``not t.isupper()`` -> ``t.isupper()``,
+    ``t == t.lower()`` -> ``t < t.lower()`` / ``t is t.lower()``) survived, because
+    the vocabulary branch added alongside it catches every phrase from the two
+    wordlists the SDK ships — which is all any other test uses.
+
+    The shape branch is not redundant: it is the ONLY thing covering the wordlists
+    pyrxd does not ship but BIP-39 defines (fr/es/it/ja/ko/cs/pt). A user restoring a
+    French phrase into an embedding application still gets it redacted, and nothing
+    pinned that. Uses invented tokens rather than a real foreign phrase so no genuine
+    seed words appear in this repo.
+    """
+    phrase = " ".join(_tokens_outside_every_shipped_wordlist(12))
+    was_redacted = redact(phrase) == "<redacted>"
+    assert was_redacted, "a lowercase phrase from an unshipped wordlist was not redacted"
+
+
+def test_the_shape_branch_still_requires_lowercase_for_unknown_words() -> None:
+    """The other side of the same branch: unknown words in mixed case are NOT a
+    mnemonic by any evidence available, and redacting them would swallow prose."""
+    tokens = _tokens_outside_every_shipped_wordlist(12)
+    shouty = " ".join(t.upper() for t in tokens)
+    assert redact(shouty) == shouty
+
+
+@pytest.mark.parametrize(
+    ("length", "should_redact"),
+    [(8, False), (9, True), (16, True), (64, True)],
+)
+def test_the_eight_character_threshold_is_exact(length: int, should_redact: bool) -> None:
+    """MUTANT: ``len(value) > 8`` -> ``len(value) > 9`` survived in ``redact``.
+
+    The module docstring promises "longer than 8 characters"; nothing tested the
+    value that distinguishes 8 from 9. A 9-character run of hex is a real disclosure
+    — it is more than a third of a 64-character private key.
+    """
+    value = os.urandom(64).hex()[:length]
+    assert len(value) == length
+    was_redacted = redact(value) == "<redacted>"
+    assert was_redacted is should_redact
+
+
+@pytest.mark.parametrize(("length", "should_redact"), [(8, False), (9, True), (32, True)])
+def test_the_eight_byte_threshold_is_exact(length: int, should_redact: bool) -> None:
+    """MUTANT: the same ``> 8`` -> ``> 9`` mutation on the ``bytes`` branch."""
+    value = os.urandom(length)
+    was_redacted = redact(value) == f"<redacted:{length}b>"
+    assert was_redacted is should_redact
+    if not should_redact:
+        assert redact(value) == value
+
+
+def test_redaction_survives_an_unloadable_wordlist(monkeypatch) -> None:
+    """MUTANT: the ``except Exception`` in ``_bip39_vocabulary`` survived.
+
+    That handler is the "never raises" half of a function called from
+    ``RxdSdkError.__init__``. If it stops catching, a broken install turns every SDK
+    exception construction into an unrelated crash — the failure mode where the real
+    error is replaced by a stack trace about a wordlist. The lowercase-shape branch
+    must still redact with the vocabulary unavailable.
+    """
+    from pyrxd.hd.bip39 import WordList
+
+    # Generate BEFORE breaking the loader — mnemonic_from_entropy needs it too.
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    monkeypatch.setattr(errors_module, "_BIP39_VOCABULARY", None)
+
+    def _explode() -> None:
+        raise OSError("wordlist file is unreadable")
+
+    monkeypatch.setattr(WordList, "load", staticmethod(_explode))
+
+    was_redacted = redact(mnemonic) == "<redacted>"
+    assert was_redacted, "the lowercase-shape branch must hold up with no vocabulary"
+    # And the uppercase form degrades to passing through rather than raising.
+    assert redact(mnemonic.upper()) == mnemonic.upper()
+    assert str(KeyMaterialError("plain message")) == "plain message"
+
+
+def test_a_transient_vocabulary_failure_is_not_cached(monkeypatch) -> None:
+    """A failure must not permanently disable the vocabulary branch.
+
+    ``_bip39_vocabulary`` memoises only non-empty results, so a partially-initialised
+    ``pyrxd.hd.bip39`` during a circular import cannot leave the guard switched off
+    for the life of the process. Caching the empty set would make this test's second
+    half fail.
+    """
+    from pyrxd.hd.bip39 import WordList
+
+    mnemonic = mnemonic_from_entropy(os.urandom(16))  # before breaking the loader
+    monkeypatch.setattr(errors_module, "_BIP39_VOCABULARY", None)
+    real_load = WordList.load
+
+    def _explode() -> None:
+        raise OSError("transient")
+
+    monkeypatch.setattr(WordList, "load", staticmethod(_explode))
+    assert redact(mnemonic.upper()) == mnemonic.upper()  # degraded
+
+    monkeypatch.setattr(WordList, "load", staticmethod(real_load))
+    was_redacted = redact(mnemonic.upper()) == "<redacted>"
+    assert was_redacted, "a transient wordlist failure permanently disabled the vocabulary branch"
+
+
+def test_an_empty_vocabulary_is_not_memoised(monkeypatch) -> None:
+    """The other edge of the same cache guard: ``load()`` SUCCEEDS but yields nothing.
+
+    Distinct from the raising case above — no exception, just an empty wordlist (a
+    truncated install, a wordlist dict that has not been populated yet). It must not be
+    memoised either, or the first such call disables the vocabulary branch permanently.
+    """
+    from pyrxd.hd.bip39 import WordList
+
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    monkeypatch.setattr(errors_module, "_BIP39_VOCABULARY", None)
+    monkeypatch.setattr(WordList, "load", staticmethod(lambda: None))
+    monkeypatch.setattr(WordList, "wordlist", {})
+
+    assert errors_module._bip39_vocabulary() == frozenset()
+    assert errors_module._BIP39_VOCABULARY is None, "an empty vocabulary was cached"
+    assert redact(mnemonic.upper()) == mnemonic.upper()  # branch 2 unavailable
+    was_redacted = redact(mnemonic) == "<redacted>"
+    assert was_redacted, "branch 1 must still cover the lowercase form"

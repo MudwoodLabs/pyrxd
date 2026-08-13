@@ -13,6 +13,7 @@ poetry run task mutate                    # default scope: spv (the original gat
 poetry run task mutate script             # script/ primitives
 poetry run task mutate transaction        # transaction/ incl. the FORKID sighash preimage
 poetry run task mutate dmint              # glyph/dmint/ covenant builders + DAA + parser
+poetry run task mutate keys               # key-material + operator-input guards
 poetry run task mutate all                # everything, sequentially (hours)
 ```
 
@@ -33,6 +34,53 @@ Useful environment knobs:
 > slower per mutant), `__init__.py` re-export shims, `script/unlocking_template.py` (17-line ABC), and
 > `glyph/dmint/__init__.py`. The whole-file scope for `glyph/dmint/miner.py` includes the mining
 > dispatch loops; their kills come mostly from the DAA/preimage tests, not the multiprocessing paths.
+
+## The `keys` scope (2026-08)
+
+Every scope above mutates *arithmetic* — difficulty, Merkle paths, sighash preimages, covenant
+bytes. None of them mutates the code standing between key material or operator input and a sink:
+the redaction heuristic, the WIF/xprv decoders, the extended-key `__str__` overrides, the
+xprv-in-a-descriptor refusal, the credential-file permission gate.
+
+That gap mattered because those modules look the *most* tested by the usual measure.
+`pyrxd.security` is held at 100% line and branch coverage — and 100% coverage says every line ran,
+not that any assertion would notice if the line were wrong. A guard is a pure predicate over cheap
+inputs: exercising it is nearly free, and asserting its *boundary* is a separate act that coverage
+cannot distinguish from not asserting it.
+
+The first sweep of `security/errors.py` bore that out. Excluding the annotation-equivalent class
+below, the live mutants were all in guard predicates that every existing test walked through
+without pinning:
+
+| Mutant | Why it survived |
+|---|---|
+| `not t.isupper()` → `t.isupper()` | every test phrase came from a wordlist the SDK ships, which the *other* branch already catches |
+| `t == t.lower()` → `t < t.lower()` | same |
+| `len(value) > 8` → `> 9` (str, and again for bytes) | the documented "longer than 8 characters" threshold had no test at the value that distinguishes 8 from 9 |
+| `except Exception:` stops catching | the "never raises" contract in a function called from `RxdSdkError.__init__` was documented, not tested |
+
+Each is now pinned by a named test in `tests/security/test_key_material_never_echoed.py`, and each
+was re-checked by re-planting the mutant.
+
+Two more survivors turned up in the file-permission gates and are worth recording because neither
+is about arithmetic:
+
+- **`mode & 0o077` → `mode & 0o007`** in `cli_secrets.read_file_guarded` survived because the test
+  that existed for it asserted only `0o644` — despite being *named* for the group case. A `0o640`
+  secret file is readable by every account in the owner's group. Now parametrised per bit position.
+- **Re-deriving the wallet file's mode from `path.stat()`** after reading it survived the
+  swap-the-file test, because that test's swap lands later than the re-stat does. Timing tests pin
+  timing; the structural property ("the verdict never consults the path") needed its own assertion.
+
+### A methodology note that cost an hour
+
+A hand-mutation harness that edits a file, runs pytest, then restores the original **must**
+invalidate `__pycache__`. `0o077` → `0o007` is a same-length edit, so the restored file can keep the
+same size and (at filesystem mtime granularity) the same timestamp — CPython then reuses the
+mutated `.pyc` and every *subsequent* run silently executes the mutant. That produced four failures
+in a file nobody had touched, against source that was provably correct on disk. `cosmic-ray` is not
+affected (it re-inits per mutant), but any bespoke harness is. Set `PYTHONDONTWRITEBYTECODE=1` and
+purge `__pycache__` between mutants.
 
 ## Scopes and test commands
 
