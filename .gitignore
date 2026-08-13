@@ -53,6 +53,9 @@ coverage.xml
 # Atheris libFuzzer crash reproducers (ad-hoc harness runs drop these in cwd;
 # the overnight script writes them under logs/).
 crash-*
+# Per-run mutation survivor lists written by scripts/mutation_test.sh. The committed
+# baseline lives in docs/reference/mutation-survivors.md; these are working copies.
+.mutation-reports/
 
 
 # Translations

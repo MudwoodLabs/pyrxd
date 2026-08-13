@@ -8,6 +8,42 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Mutation testing now covers the value-moving modules, not just the
+  consensus-critical ones.** `task mutate` measured `spv/`, `script/`,
+  `transaction/` and `glyph/dmint/` — the byte-exact arithmetic — and nothing
+  that decides *how much* value moves or *to whom*. Seven new groups close that:
+  `fee` (`fee_sizing.py`), `wallet` (`wallet.py`), `hdwallet` (`hd/wallet.py`),
+  `glyph` (`glyph/ft.py` + `glyph/builder.py`), `swap` (`gravity/htlc_spend.py`
+  + `swap/rswp/orders.py`), `coordinator` (`gravity/swap_coordinator.py`) and
+  `network` (`network/`). `task mutate consensus` and `task mutate value` run
+  the old and new sets; existing groups keep their file lists, test commands
+  and timeouts verbatim so their published baselines stay comparable.
+
+  First full baseline: **8 171 mutants, 5 049 killed, 3 122 survived — 61%
+  killed**, 5 h 36 m of compute (1 h 44 m wall clock with one runner per group).
+  Per-module rates range from `fee_sizing.py` at 89% down to `glyph/builder.py`
+  at 24%, whose offline coverage is 66% because its remaining paths belong to
+  the regtest suites. Measured baselines and the equivalent-mutant classes that
+  explain the raw scores are in
+  [`docs/how-to/mutation-testing.md`](docs/how-to/mutation-testing.md); all
+  3 122 survivors are listed with file:line in
+  [`docs/reference/mutation-survivors/`](docs/reference/mutation-survivors/),
+  with the 1 045 annotation-equivalent ones marked so triage can skip them.
+
+- **`.github/workflows/mutation.yml`** — a weekly scheduled lane, one parallel
+  job per group, uploading the survivor list and session databases as
+  artifacts. Deliberately not per-push: the measured cost is 5 h 36 m of compute,
+  16-104 minutes per group. One job per group because cosmic-ray edits
+  `src/pyrxd` in place, so groups cannot share a checkout — separate runners also
+  turn 5 h 36 m of compute into 1 h 44 m of wall clock. Report-only, with no
+  kill-rate threshold, because a third of the survivors are equivalent mutants
+  that cannot be killed.
+
+- **`scripts/mutation_survivors.py`** — renders a cosmic-ray session database as
+  a triage table: file, line, enclosing definition, operator and the exact source
+  change. `cr-report` prints job ids and operator names with no location, which
+  is enough to count survivors and useless for fixing them.
+
 - **`pyrxd glyph inspect` now names four script shapes it previously called
   `unknown`.** `inspect` is the only tool that names Radiant script shapes —
   Radiant Core's own `Solver` recognises five Bitcoin-era templates and calls
@@ -163,6 +199,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `has_burn_branch` carry the markers it *is* entitled to. The exact-match
   `soulbound-covenant` tier is unchanged.
 
+- **`scripts/mutation_test.sh` no longer leaves mutated sources in the tree when
+  it is killed.** bash skips an `EXIT` trap when killed by an untrapped signal,
+  so a run stopped mid-sweep left `src/pyrxd/…` mutated — indistinguishable from
+  a hand edit. `INT`/`TERM`/`HUP` are now trapped and restore before re-raising.
+  The script also refuses to start when a target source is dirty (cleanup is
+  `git checkout --`, which would discard the work) and refuses to mutate when the
+  group's clean suite is not green — cosmic-ray reads a non-zero exit as *mutant
+  killed*, so a red test list scores **100% killed on every module**.
+
+- **The `wallet` mutation test list keeps `tests/cli/*` contiguous.** Splitting
+  files from a sub-package across the pytest arg list makes pytest 9.1.1 drop
+  that directory's `conftest.py` for the later ones; `tests/cli/`'s `runner`
+  fixture went missing and 32 tests ERRORed. Reproducible outside the mutation
+  harness, so it is a suite-wide ordering hazard for any explicit multi-file
+  `pytest` invocation.
+
 ### Changed
 
 - **The soulbound classification is split into two tiers so the weaker one is
@@ -247,6 +299,54 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   No assertion was weakened and no production behaviour changed — these are tests for
   checks that were already correct. Each guard group carries an honest-path control, so a
   guard that refused *valid* work would fail too.
+- **`pyrxd.network` is now in mutation-testing scope, and the guards there are pinned by
+  tests that die when they are removed.** `task mutate` covered `spv/`, `script/`,
+  `transaction/` and `glyph/dmint/`; the modules that decide whether a lying server can
+  move value had never been mutation-tested at all. `scripts/mutation_test.sh network`
+  now mutates `_guards`, `confirm`, `tls_pin`, `registry`, `failover`, `electrumx` and
+  `bitcoin` (2,631 mutants) against a targeted test list.
+
+  A hand-mutation sweep of **113 load-bearing guards** across the whole boundary —
+  `network/`, `swap/rswp/node_rpc.py`, `swap/rswp/rxindexer_source.py`,
+  `gravity/watch/adapters.py` — neutered each one in turn (`if False:`, an inverted
+  comparison, a widened match) and ran the suite. **Twelve survived; eleven were real.**
+  The sharpest was `_verify_raw_matches_txid`, the audit-F-004 binding that makes a source
+  prove the bytes it returned really are the transaction that was asked for: setting its
+  comparison to `if False:` left the entire suite green at all four call sites. Also
+  unpinned:
+
+  - ElectrumX's 80-byte block-header length check, and the 10 MB frame cap on both
+    branches of the reader loop;
+  - the reader loop's integer-id check (which also turned out to have the `"id": true`
+    hole above);
+  - `normalize_pin`'s `validate=True` — without it a mistyped pin silently decodes to a
+    well-formed pin for a key nobody holds;
+  - the empty-scriptPubKey / negative-value refusal in `read_confirmed_unspent_output`;
+  - `MultiSourceRxdChainSource.corroborated`, the property the `ChainObserver` reads to
+    justify `rxd_corroborated=True`, which could be made to return `True` over a single
+    source with nothing objecting;
+  - `RxindexerOrderbookSource.is_unspent`'s `(tx_hash, tx_pos)` match — relaxing it to
+    "is anything live on this script?" passed, so a maker who spent the offered output and
+    re-funded the same address would still have shown as fillable — and its `limit` clamp;
+  - `NodeRpcSource`'s non-string `getrawtransaction` guard (a raw `TypeError` from
+    `bytes.fromhex(None)` escapes every `except NetworkError` above it) and its HTTP-status
+    check (a 5xx body carrying a `result` and no `error` was read as an answer).
+
+  A full cosmic-ray sweep of `_guards.py` (85 mutants) scored 70 killed / 15 survived;
+  all 15 triaged as benign — 12 mutate the `int | None` *annotation*, which
+  `from __future__ import annotations` never evaluates, and the other 3 are unreachable
+  from any call site (`len(value) % 2` with `nbytes` always 32, `!=` → `is not` on
+  CPython-interned small ints).
+
+  `tests/security/test_untrusted_server_invariants.py` (67 tests) is the sibling of
+  `test_hostile_server_responses.py`: that file sweeps the *shape* of a field, this one
+  asks whether a well-formed response is an answer to the question that was actually
+  asked. Every refusal is paired with an honest response that must still be accepted — a
+  guard that refuses a legitimate server answer costs funds too, and during a timelock
+  race it costs them faster. The one remaining survivor is a confirmed equivalent mutant:
+  removing `finite_int`'s `math.isfinite` check changes which `ValueError` is raised, not
+  whether one is (`float("inf").is_integer()` is `False`, so the next branch still
+  refuses).
 - **A drift guard now executes `docs/inspect_static/inspect/inspect.js`.**
   Nothing ran that file outside a browser, so both renderer findings above
   accumulated silently and an earlier `payload.note` gating bug was the same
@@ -487,6 +587,71 @@ same by coincidence rather than by rule, it is left alone and pinned as must-not
 - Several `# Keep in sync with` comments are gone, replaced by the derivation they described.
 
 ### Security
+
+- **Six reads from a server we do not control were not bound to the request that asked
+  for them.** A lying endpoint's cheapest move is not to fabricate a field — it is to
+  return a completely truthful answer to a *different* question. No type check, range
+  check or fail-closed `except` tuple rejects a well-formed document; only a binding
+  does. Each of these now refuses a mismatched echo, and refuses a *missing* one just as
+  hard ("I cannot check" is not "it passed"):
+
+  - `ElectrumXClient.get_transaction_verbose` had no binding of any kind, and it is the
+    read every confirmation gate in the SDK sits on — `wait_for_confirmation`,
+    `RadiantCovenantLeg.confirmations`, the watchtower's `ElectrumRxdChainSource`. A
+    server could answer with a different, deeply-buried transaction's body and satisfy
+    the depth threshold without inventing a single value. Its raw sibling
+    `get_transaction` has recomputed `hash256(raw)` since the Glyph-scanner fix; the
+    verbose form now binds the `txid` the node echoes.
+  - `MempoolSpaceBroadcaster.broadcast` returned the endpoint's *echoed* txid on HTTP
+    200. The txid is a pure function of the bytes posted, so it is now derived locally
+    before the request and the echo must match it. `BitcoinTaprootLeg.claim()` and
+    `.refund()` return this value to their caller unbound — an endpoint answering 200
+    with someone else's id, or never relaying at all, had the operator record and watch
+    a transaction that does not exist while believing the leg was broadcast. (`fund()`
+    survived only because it re-binds against the builder's txid one layer up.)
+  - `BitcoinCoreFundingReader._verbose_tx` fed both the confirmation depth **and** the
+    funded amount from an unbound `getrawtransaction` object, and
+    `BitcoinCoreRpcSource.get_tx_block_height` picked the header an SPV proof is verified
+    against from another unbound one. The sibling `get_tx_output_script_type` has bound
+    the same echo since audit B7.
+  - `_esplora_merkle_proof` ignored the `block_height` Esplora echoes, so the server chose
+    which block it proved inclusion in. The ElectrumX sibling
+    (`get_transaction_merkle`) has always bound it.
+
+- **The audit-B7 output-index fix reached three of five call sites.** `data["vout"][-1]`
+  silently WRAPS to the last output, and both `read_output_amount_sats` implementations
+  (Esplora and Bitcoin Core) still took the caller's `vout` raw — the read a maker's
+  counter-funding gate uses to decide whether the BTC it is about to lock against is
+  really at the outpoint it was told about. Both now go through `_output_index`.
+
+- **`MultiSourceBtcDataSource` resolved its quorum by list position, not by agreement.**
+  `_require_quorum` returned the first group *in insertion order* that reached the quorum,
+  and insertion order is source order — so with five sources at `quorum=2`, two colluding
+  sources at the head of the list decided the answer while three honest sources disagreed
+  in silence. Every value read through it (block hash, header, header chain, raw
+  transaction, tx height, output script type, Merkle proof) is deterministic, so two
+  different values both reaching the quorum means at least one source is lying or forked;
+  that now fails closed and says so, rather than picking one. `quorum` was also completely
+  unvalidated here while both sibling quorum readers refuse `quorum < 1` — a `0` made
+  `len(group) >= self._quorum` vacuous, switching corroboration off by typo.
+
+- **A `NetworkProfile` could mix security postures, and failover would quietly take the
+  weaker one.** `FailoverElectrumXClient` moves to the next endpoint on one transport
+  error; nothing compared what that move costs. A profile of
+  `[wss:// + SPKI pins, wss:// unpinned]` therefore ran **unpinned** the first time the
+  pinned primary hiccupped, and one mixing `wss://` with `ws://` ran **plaintext** — no
+  error, no warning, and the operator still believing the control they configured was in
+  force, which is worse than never configuring it. A mixed profile is now refused at
+  construction, where a malformed pin is already refused. Uniformly-pinned,
+  uniformly-unpinned, uniformly-plaintext and single-endpoint profiles are unaffected;
+  one pin list may still hold several servers' pins, which is how a failover set is
+  pinned and how a key rotation stays deployable.
+
+- **A JSON-RPC message carrying `"id": true` was dispatched to pending request 1.**
+  `isinstance(True, int)` is `True` and `hash(True) == hash(1)`, so the reader loop's id
+  check passed it through and `_pending.pop(True)` popped the future for request id 1 —
+  the first RPC of every connection, which is the genesis read `assert_chain` is built
+  on. Same bool exclusion `_guards.finite_int` makes, for the same reason.
 
 - **`glyph transfer-nft` signed and broadcast transactions below Radiant's relay floor.**
   Its fee-funding bar was the flat literal `needed=100_000`, which never multiplied by
