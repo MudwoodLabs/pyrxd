@@ -247,9 +247,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `gravity/watch/adapters.py` — neutered each one in turn (`if False:`, an inverted
   comparison, a widened match) and ran the suite. **Twelve survived; eleven were real.**
   The sharpest was `_verify_raw_matches_txid`, the audit-F-004 binding that makes a source
-  prove the bytes it returned really are the transaction that was asked for: setting its
-  comparison to `if False:` left the entire suite green at all four call sites. Also
-  unpinned:
+  prove the bytes it returned really are the transaction that was asked for — and the
+  interesting part is *where* it was unpinned. The function itself was well tested: setting
+  its comparison to `if False:` is killed by the pre-existing
+  `tests/test_btc_txid_from_raw.py::test_verify_raw_matches_txid_binds_returned_bytes_f004`.
+  Its **wiring** was not. Deleting the call outright at the Bitcoin Core call site
+  (`bitcoin.py:730`) left all **8,777** offline tests green — a guard can be thoroughly
+  tested in isolation and still be absent from a path that needs it, and only a mutation
+  that removes the *call* can see that. Also unpinned:
 
   - ElectrumX's 80-byte block-header length check, and the 10 MB frame cap on both
     branches of the reader loop;
