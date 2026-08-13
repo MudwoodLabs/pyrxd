@@ -81,6 +81,23 @@ That is how the baseline below was measured.
 > slower per mutant), `__init__.py` re-export shims, `script/unlocking_template.py` (17-line ABC), and
 > `glyph/dmint/__init__.py`. The whole-file scope for `glyph/dmint/miner.py` includes the mining
 > dispatch loops; their kills come mostly from the DAA/preimage tests, not the multiprocessing paths.
+> In `network`, `rxindexer.py` and `chaintracker.py` ARE in scope but score low by design
+> (`rxindexer.py` killed 10%) — they are thin passthroughs with no decision in them, so their
+> survivors are expected rather than actionable.
+
+### Why `network` is in scope
+
+The other four scopes protect arithmetic a *node* would eventually reject. `network` protects the
+one place where nothing else will: consensus does not defend an SPV client against a server that
+answers truthfully but about the wrong thing. Whether a lying ElectrumX / Esplora / Bitcoin Core
+endpoint can move value rests entirely on `_guards.py` (fail-closed coercions), the
+request↔response bindings in `electrumx.py` and `bitcoin.py`, `confirm.py`'s depth gate,
+`tls_pin.py` + `registry.py` (which server, on which chain, under which pin) and `failover.py`
+(which of those may be relaxed on a retry).
+
+Two files that are part of the same trust boundary sit outside the group because they are not under
+`network/`: `swap/rswp/node_rpc.py` and `gravity/watch/adapters.py`. Both were hand-mutated in the
+2026-08 sweep (see below); a future scope extension should fold them in.
 
 ## Scopes and test commands
 

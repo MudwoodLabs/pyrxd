@@ -171,14 +171,28 @@ def _esplora_status_height(status: Any) -> int | None:
         raise NetworkError("tx status 'block_height' is not a usable block height; fail-closed") from exc
 
 
-def _esplora_merkle_proof(data: Any) -> tuple[list[str], int]:
-    """Read an Esplora merkle-proof body, refusing a type-confused branch or an unusable position."""
+def _esplora_merkle_proof(data: Any, height: BlockHeight) -> tuple[list[str], int]:
+    """Read an Esplora merkle-proof body, bound to the block we asked about.
+
+    Refuses a type-confused branch or an unusable position — and refuses a proof for a
+    DIFFERENT block. Esplora's ``/tx/{txid}/merkle-proof`` returns electrum's
+    ``blockchain.transaction.get_merkle`` shape, so it echoes ``block_height``; that echo went
+    unread, and the ``height`` argument the callers passed in was used only to build the URL of
+    a *sibling* call. The server therefore chose which block it proved inclusion in, exactly the
+    gap :meth:`pyrxd.network.electrumx.ElectrumXClient.get_transaction_merkle` closes on the
+    ElectrumX side. A missing echo is equally un-verifiable, so it also refuses.
+    """
     if not isinstance(data, dict):
         raise NetworkError("Malformed merkle proof response from server")
     try:
-        return merkle_branch(data["merkle"]), nonneg_int(data["pos"])
+        proved_height = nonneg_int(data["block_height"])
+        branch = merkle_branch(data["merkle"])
+        pos = nonneg_int(data["pos"])
     except (KeyError, TypeError, ValueError) as exc:
         raise NetworkError("Malformed merkle proof response from server") from exc
+    if proved_height != int(height):
+        raise NetworkError(f"merkle proof is for block {proved_height}, not the requested {int(height)}; fail-closed")
+    return branch, pos
 
 
 async def _check_response_size(response: aiohttp.ClientResponse) -> bytes:
@@ -409,7 +423,7 @@ class MempoolSpaceSource(BtcDataSource):
         session = await self._get_session()
         url = self._url(f"tx/{_safe_txid_path(txid)}/merkleblock-proof")
         data = await _get_json(session, url)
-        return _esplora_merkle_proof(data)
+        return _esplora_merkle_proof(data, height)
 
 
 # ─────────────────────────────────────────────── BlockstreamSource
@@ -579,7 +593,7 @@ class BlockstreamSource(BtcDataSource):
         session = await self._get_session()
         url = self._url(f"tx/{_safe_txid_path(txid)}/merkle-proof")
         data = await _get_json(session, url)
-        return _esplora_merkle_proof(data)
+        return _esplora_merkle_proof(data, height)
 
 
 # ─────────────────────────────────────────────── BitcoinCoreRpcSource
@@ -736,6 +750,9 @@ class BitcoinCoreRpcSource(BtcDataSource):
         data = await self._rpc("getrawtransaction", [str(txid), True])
         if not isinstance(data, dict):
             raise NetworkError("Unexpected raw tx response from Bitcoin Core")
+        # audit B7, missed site: the height this returns picks the header the SPV proof is
+        # verified against, so it must come from the transaction we asked about.
+        _assert_tx_identity(data, txid)
         block_height = data.get("blockheight")
         if block_height is None:
             raise NetworkError(f"tx {str(txid)[:16]}… is unconfirmed or blockheight missing")
@@ -816,6 +833,14 @@ class MultiSourceBtcDataSource(BtcDataSource):
     def __init__(self, sources: list[BtcDataSource], quorum: int = 2) -> None:
         if not sources:
             raise ValidationError("MultiSourceBtcDataSource requires at least one source")
+        # `quorum` went unvalidated here while both sibling quorum readers
+        # (:class:`MultiSourceBtcFundingReader`, :class:`~pyrxd.gravity.watch.adapters.
+        # MultiSourceRxdChainSource`) refuse `quorum < 1`. A 0 or negative quorum makes
+        # `_require_quorum`'s `len(group) >= self._quorum` vacuously true, so the FIRST
+        # source's answer is returned as "the quorum's" — corroboration silently switched off
+        # by a typo, which is the failure this class exists to prevent.
+        if not isinstance(quorum, int) or isinstance(quorum, bool) or quorum < 1:
+            raise ValidationError("quorum must be an int >= 1")
         self._sources = sources
         self._quorum = quorum
 
@@ -835,7 +860,24 @@ class MultiSourceBtcDataSource(BtcDataSource):
         return list(results)
 
     def _require_quorum(self, results: list[Any], key_fn) -> Any:
-        """Return value agreed on by ≥ quorum sources; raise NetworkError otherwise."""
+        """Return the value agreed on by ≥ quorum sources; raise ``NetworkError`` otherwise.
+
+        The agreement must be **unambiguous**. This returned the FIRST group that reached the
+        quorum, in source order — so with five sources at ``quorum=2``, two colluding sources
+        placed early beat three honest ones simply by being listed first, and the caller was
+        handed the minority answer with no signal that anything disagreed. Every value read
+        through here (a block hash, a header, a header chain, a raw transaction, a tx height, an
+        output script type, a merkle proof) is *deterministic*: honest sources on the same chain
+        cannot disagree about it, so two different values BOTH reaching the quorum means at
+        least one source is lying or forked, and picking either is guessing. Fail closed and
+        name it — that is the signal the operator needs to find the bad endpoint.
+
+        (Tip height is the one value where honest sources legitimately differ, by a block, at a
+        propagation boundary; it is read through here too, and an even split will now refuse
+        rather than pick arbitrarily. For a value where lag is expected, prefer
+        :class:`MultiSourceBtcFundingReader`, whose depth read takes the conservative MINIMUM
+        across sources instead of demanding they agree.)
+        """
         counts: dict = {}
         for r in results:
             if isinstance(r, Exception):
@@ -843,9 +885,16 @@ class MultiSourceBtcDataSource(BtcDataSource):
             k = key_fn(r)
             counts[k] = [*counts.get(k, []), r]
 
-        for group in counts.values():
-            if len(group) >= self._quorum:
-                return group[0]
+        agreed = [group for group in counts.values() if len(group) >= self._quorum]
+        if len(agreed) == 1:
+            return agreed[0][0]
+        if len(agreed) > 1:
+            raise NetworkError(
+                f"Sources disagree: {len(agreed)} DIFFERENT values each reached quorum "
+                f"{self._quorum} of {len(self._sources)}. These reads are deterministic, so a "
+                "split means at least one source is lying or on another chain; refusing to pick "
+                "one. Fail-closed."
+            )
 
         successful = sum(1 for r in results if not isinstance(r, Exception))
         raise NetworkError(
@@ -1032,16 +1081,32 @@ class MempoolSpaceBroadcaster:
         if not isinstance(raw_tx, (bytes, bytearray)) or len(raw_tx) == 0:
             raise ValidationError("raw_tx must be non-empty bytes")
         raw = bytes(raw_tx)
+        # The txid is a pure function of the bytes we are about to post, so it is derived
+        # BEFORE the request and the server is never asked what it is.
+        expected_txid = btc_txid_from_raw(raw)
         s = await self._http.session()
         try:
             async with s.post(self._http.url("tx"), data=raw.hex(), allow_redirects=False) as resp:
                 body = (await _check_response_size(resp)).decode("ascii", "replace").strip()
                 if resp.status == 200:
-                    # mempool.space returns the txid as the body on success.
+                    # mempool.space echoes the txid as the body. That echo is a CLAIM, not
+                    # evidence, and it was returned to the caller verbatim: an endpoint that
+                    # answers 200 with a different id — or that never relayed anything — had
+                    # `BitcoinTaprootLeg.claim()` / `.refund()` return, record and watch a txid
+                    # that does not exist, while the operator believes the leg is broadcast.
+                    # (`fund()` was safe only because it re-binds against the builder's txid one
+                    # layer up; claim/refund return this value unbound.) Bind it here, the same
+                    # way `FailoverElectrumXClient.broadcast` binds the RXD side.
                     try:
-                        return str(Txid(body))
+                        echoed = str(Txid(body))
                     except ValidationError:
                         raise NetworkError("broadcast returned a non-txid body")
+                    if echoed.lower() != expected_txid.lower():
+                        raise NetworkError(
+                            f"broadcast echoed txid {echoed[:16]}… for a transaction whose id is "
+                            f"{expected_txid[:16]}…; fail-closed"
+                        )
+                    return expected_txid
                 low = body.lower()
                 # Idempotent success = the tx is ALREADY PRESENT (re-broadcast is a no-op). Match only
                 # SPECIFIC present-phrases, NOT a bare "already" (audit LOW-R4): a conflict/rejection like
@@ -1112,10 +1177,17 @@ class MempoolSpaceFundingReader:
             raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
         data = await self._http.tx_json(tx)
         _assert_tx_identity(data, tx)
+        # audit B7, missed site: `data["vout"][vout]` WRAPS on a negative index, so
+        # `read_output_amount_sats(txid, -1)` returned the LAST output's amount as if it were
+        # output -1's — the sibling `read_confirmed_unspent_output` and every
+        # `get_tx_output_script_type` already refuse that, this one did not. The value read here
+        # is what a maker's counter-funding gate compares against the amount it expects at a
+        # SPECIFIC outpoint, so binding the amount to the wrong output is the whole failure.
+        index = _output_index(vout)
         try:
-            return _finite_int(data["vout"][vout]["value"])  # mempool.space vout value is in sats
+            return _finite_int(data["vout"][index]["value"])  # mempool.space vout value is in sats
         except (KeyError, IndexError, TypeError, ValueError, OverflowError) as exc:
-            raise NetworkError(f"could not read output value for {str(tx)[:16]}…:{vout}") from exc
+            raise NetworkError(f"could not read output value for {str(tx)[:16]}…:{index}") from exc
 
     async def read_confirmed_unspent_output(self, txid: str, vout: int) -> tuple[bytes, int]:
         """Return the ``(scriptPubKey, value_sats)`` of a CONFIRMED, UNSPENT output — the
@@ -1247,10 +1319,17 @@ class BitcoinCoreFundingReader:
         self._rpc = rpc
 
     async def _verbose_tx(self, txid: str) -> dict:
-        tx = str(txid if isinstance(txid, Txid) else Txid(txid))
-        data = await self._rpc("getrawtransaction", [tx, True])
+        tx = txid if isinstance(txid, Txid) else Txid(txid)
+        data = await self._rpc("getrawtransaction", [str(tx), True])
         if not isinstance(data, dict):
             raise NetworkError("getrawtransaction did not return a verbose object; fail-closed")
+        # Bind the body to the request. `getrawtransaction ... true` echoes `txid`, and both
+        # readers built on this helper — the confirmation depth AND the funded amount — are
+        # value gates: an endpoint answering with a DIFFERENT (deeper, or differently-valued)
+        # transaction's verbose body satisfies both without fabricating a single field. The
+        # sibling `BitcoinCoreRpcSource.get_tx_output_script_type` has bound this since audit B7;
+        # this path never did.
+        _assert_tx_identity(data, tx)
         return data
 
     async def confirmations(self, txid: str) -> int:
@@ -1294,10 +1373,11 @@ class BitcoinCoreFundingReader:
         if confs < min_confirmations:
             raise InsufficientConfirmationsError(have=confs, required=min_confirmations)
         data = await self._verbose_tx(txid)
+        index = _output_index(vout)  # audit B7, missed site — see MempoolSpaceFundingReader
         try:
-            btc_value = data["vout"][int(vout)]["value"]  # Bitcoin Core reports the output value in BTC
+            btc_value = data["vout"][index]["value"]  # Bitcoin Core reports the output value in BTC
         except (KeyError, IndexError, TypeError) as exc:
-            raise NetworkError(f"could not read output value for {str(txid)[:16]}…:{vout}") from exc
+            raise NetworkError(f"could not read output value for {str(txid)[:16]}…:{index}") from exc
         return self._btc_to_sats(btc_value)
 
     async def read_confirmed_unspent_output(self, txid: str, vout: int) -> tuple[bytes, int]:
