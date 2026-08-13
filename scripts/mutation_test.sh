@@ -7,7 +7,8 @@
 #   scripts/mutation_test.sh transaction    # transaction/ incl. FORKID sighash preimage
 #   scripts/mutation_test.sh dmint          # glyph/dmint/ covenant builders + DAA + parser
 #   scripts/mutation_test.sh fee            # fee_sizing.py — the one fee-sizing rule
-#   scripts/mutation_test.sh wallet         # wallet.py + hd/wallet.py — send/sweep builders
+#   scripts/mutation_test.sh wallet         # wallet.py — the flat-key send/sweep builders
+#   scripts/mutation_test.sh hdwallet       # hd/wallet.py — the BIP32/44 send/sweep builders
 #   scripts/mutation_test.sh glyph          # glyph/ft.py + glyph/builder.py — token builders
 #   scripts/mutation_test.sh swap           # gravity/htlc_spend.py + swap/rswp/orders.py
 #   scripts/mutation_test.sh coordinator    # gravity/swap_coordinator.py — the swap state machine
@@ -37,8 +38,10 @@
 #   fee          fee_sizing.py — the single implementation of "how many photons must this tx pay".
 #                Radiant has neither RBF nor CPFP, so an under-sized fee strands the inputs for
 #                8 hours; this rule previously existed as three drifting copies.
-#   wallet       wallet.py + hd/wallet.py — the send/send-max/sweep builders: input selection,
-#                change, and the two-pass trial/final fee sizing.
+#   wallet       wallet.py — the flat-key send/send-max/sweep builders: input selection, change,
+#                and the two-pass trial/final fee sizing.
+#   hdwallet     hd/wallet.py — the same builders over BIP32/44 derivation, plus gap-limit
+#                discovery and the change/receive chain split.
 #   glyph        glyph/ft.py + glyph/builder.py — FT/NFT transfer and mint builders. ft.py is the
 #                module the 0.15.0 whole-balance-send fund-safety bug lived in.
 #   swap         gravity/htlc_spend.py (hashlock claim + CSV refund spends) and
@@ -79,7 +82,8 @@ group_files() {
     transaction) echo "transaction/transaction transaction/transaction_input transaction/transaction_output transaction/transaction_preimage" ;;
     dmint)       echo "glyph/dmint/builders glyph/dmint/chain glyph/dmint/types glyph/dmint/miner" ;;
     fee)         echo "fee_sizing" ;;
-    wallet)      echo "wallet hd/wallet" ;;
+    wallet)      echo "wallet" ;;
+    hdwallet)    echo "hd/wallet" ;;
     glyph)       echo "glyph/ft glyph/builder" ;;
     swap)        echo "gravity/htlc_spend swap/rswp/orders" ;;
     coordinator) echo "gravity/swap_coordinator" ;;
@@ -105,7 +109,14 @@ group_tests() {
     # makes pytest 9.1.1 drop that directory's conftest.py for the later ones — `tests/cli/`'s
     # `runner` fixture goes missing and 32 tests ERROR. Green suite, wrong reason: cosmic-ray reads
     # the non-zero exit as "killed" and would have scored hd/wallet.py 100%.
-    wallet)      echo "tests/test_keys.py tests/test_hd.py tests/test_wallet.py tests/test_hd_descriptor.py tests/test_bip44_conformance_vectors.py tests/test_hd_discovery.py $GAPS tests/test_wallet_fee_sizing.py tests/test_hd_wallet.py tests/cli/test_wallet_sweep.py tests/cli/test_wallet_recover.py tests/cli/test_wallet_send.py tests/cli/test_wallet_cmds.py" ;;
+    #
+    # wallet.py and hd/wallet.py are separate groups, not one: their decisive suites are nearly
+    # disjoint (test_wallet.py vs test_hd_wallet.py + the BIP44 vectors), so a combined list made
+    # every hd/wallet.py mutant pay for the wallet.py tests and vice versa — a 15s clean suite
+    # instead of ~8s, on 1 496 mutants. Split, each keeps its coverage (96% / 93%) and the two
+    # halves can run on separate runners.
+    wallet)      echo "tests/test_wallet.py tests/test_wallet_send_fee_control_offline.py tests/test_wallet_fee_sizing.py $GAPS tests/cli/test_wallet_send.py tests/cli/test_wallet_sweep.py tests/cli/test_wallet_cmds.py" ;;
+    hdwallet)    echo "tests/test_keys.py tests/test_hd.py tests/test_hd_descriptor.py tests/test_bip44_conformance_vectors.py tests/test_hd_discovery.py $GAPS tests/test_hd_wallet.py tests/cli/test_wallet_recover.py tests/cli/test_wallet_cmds.py" ;;
     glyph)       echo "tests/test_ft_transfer.py tests/test_ft_airdrop.py tests/test_glyph_ft_red_team.py tests/test_glyph.py tests/test_glyph_transfer.py tests/test_glyph_red_team.py tests/test_mut_container_wave_builders.py tests/test_glyph_reveal_fees.py tests/test_glyph_dmint.py tests/test_glyph_scanner.py $GAPS tests/test_golden_vectors.py" ;;
     swap)        echo "tests/test_htlc_spend_productized.py tests/test_htlc_spend_fee_floor.py tests/test_rswp_orders.py tests/test_rswp_wire.py tests/test_rswp_book.py tests/test_rswp_quoting.py tests/test_rswp_tracker.py tests/test_swap_order.py tests/test_htlc_covenant.py tests/test_rswp_covenant.py $GAPS tests/test_rswp_conformance_vectors.py" ;;
     coordinator) echo "tests/test_swap_coordinator.py tests/test_swap_coordinator_credential_gate.py tests/test_max_protected_value.py tests/test_finality_verdict.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_radiant_leg.py tests/test_btc_htlc_leg.py $GAPS tests/test_htlc_handshake_conformance_vectors.py" ;;
@@ -123,6 +134,7 @@ group_timeout() {
     script) echo "30.0" ;;
     fee)         echo "60.0" ;;
     wallet)      echo "60.0" ;;
+    hdwallet)    echo "60.0" ;;
     glyph)       echo "30.0" ;;
     swap)        echo "30.0" ;;
     coordinator) echo "30.0" ;;
@@ -145,7 +157,7 @@ group_marker() {
 }
 
 CONSENSUS_GROUPS="spv script transaction dmint"
-VALUE_GROUPS="fee wallet glyph swap coordinator network"
+VALUE_GROUPS="fee wallet hdwallet glyph swap coordinator network"
 
 GROUPS_REQUESTED="${*:-spv}"
 case "$GROUPS_REQUESTED" in

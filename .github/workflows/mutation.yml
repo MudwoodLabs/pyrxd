@@ -1,0 +1,108 @@
+name: Mutation (scheduled)
+
+# Mutation testing over the consensus-critical and value-moving modules.
+#
+# Why scheduled and not per-push
+# ------------------------------
+# The cost is (number of mutants) x (test-suite wall time), and the value scope alone is
+# ~5 500 mutants. Measured serially on a 32-core box, the six value groups take hours; no
+# per-push gate can absorb that, and `ci.yml`'s required checks must stay fast enough that
+# people do not learn to ignore them. This follows the same split the fuzz and integration
+# lanes already use (docs/security-review-playbook.md): the fast offline gate runs on every
+# push, the slow exploration runs on a schedule.
+#
+# Weekly, not nightly. A mutation score moves when tests change, which is a slower signal
+# than a regression — and unlike the nightly integration matrix this lane cannot tell you
+# "main is broken", only "these lines are untested". Weekly keeps it current without turning
+# it into noise nobody reads.
+#
+# One job per group, in parallel
+# ------------------------------
+# cosmic-ray mutates `src/pyrxd` IN PLACE, so two groups CANNOT share a checkout — the second
+# group's tests would import the first group's mutant and mis-score it. Separate runners give
+# each group its own checkout for free, and make the wall-clock the slowest group rather than
+# the sum of all of them. `fail-fast: false` because one group's score says nothing about
+# another's, and a survivor list is worth having even when a sibling job died.
+#
+# Report-only on purpose
+# ----------------------
+# No `MUTATION_MIN_KILL_PCT` threshold here. A large share of survivors are equivalent
+# mutants that cannot be killed (type annotations, error-message f-strings — see
+# docs/how-to/mutation-testing.md), so a raw kill-rate gate would either sit below the real
+# quality bar or fail on untriaged noise. The job's output is the uploaded survivor list;
+# triaging it is the human step, and the killers it produces land in
+# tests/test_mutation_hardening.py. Set a threshold per group only once its equivalent-mutant
+# classes have been triaged out.
+#
+# Manual runs: gh workflow run "Mutation (scheduled)" -f groups=fee
+
+on:
+  schedule:
+    - cron: "41 4 * * 2" # Tuesdays 04:41 UTC — off the Monday fuzz lane
+  workflow_dispatch:
+    inputs:
+      groups:
+        description: "Space-separated groups to run (default: all six value groups)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  mutate:
+    # Don't burn scheduled minutes on forks; manual dispatch still works anywhere.
+    if: github.event_name != 'schedule' || github.repository == 'MudwoodLabs/pyrxd'
+    name: mutate (${{ matrix.group }})
+    runs-on: ubuntu-latest
+    # Generous but bounded. `hdwallet` and `network` are the long poles; a group that blows
+    # this budget should be split in scripts/mutation_test.sh, not given more hours — that is
+    # how `wallet` and `hdwallet` came to be two groups instead of one.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [fee, wallet, hdwallet, glyph, swap, coordinator, network]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      # `poetry.lock` is gitignored here (published library — deps resolve from
+      # pyproject.toml), so key the cache on pyproject.toml.
+      - name: Cache Poetry packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pypoetry
+          key: poetry-${{ runner.os }}-py3.12-${{ hashFiles('pyproject.toml') }}
+          restore-keys: |
+            poetry-${{ runner.os }}-py3.12-
+      - name: Install Poetry
+        run: pip install -r ci/poetry-pin.txt --require-hashes
+      - name: Install dependencies
+        run: poetry install --sync --no-interaction
+      - name: Run mutation testing
+        env:
+          # Keep the session databases: the survivor Markdown is generated from them, and
+          # they are what a reviewer re-queries when a row needs more context than the table.
+          MUTATION_SESSION_DIR: ${{ github.workspace }}/.mutation-sessions
+          MUTATION_REPORT_DIR: ${{ github.workspace }}/.mutation-reports
+        run: |
+          mkdir -p "$MUTATION_SESSION_DIR" "$MUTATION_REPORT_DIR"
+          poetry run bash scripts/mutation_test.sh "${{ matrix.group }}" | tee mutation-${{ matrix.group }}.log
+      - name: Upload survivor list and session databases
+        # `always()`: a timed-out or failed group still produced partial sessions, and the
+        # survivors found before it stopped are still real.
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mutation-${{ matrix.group }}
+          path: |
+            mutation-${{ matrix.group }}.log
+            .mutation-reports/
+            .mutation-sessions/*.sqlite
+          retention-days: 90
