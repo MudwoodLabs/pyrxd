@@ -12,6 +12,7 @@ For the narrative versions of the same material, see
 :maxdepth: 1
 
 glyph-token-protocol-spec
+mutation-survivors/index
 ```
 
 ## Machine-readable companions

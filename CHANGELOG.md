@@ -8,6 +8,42 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Mutation testing now covers the value-moving modules, not just the
+  consensus-critical ones.** `task mutate` measured `spv/`, `script/`,
+  `transaction/` and `glyph/dmint/` — the byte-exact arithmetic — and nothing
+  that decides *how much* value moves or *to whom*. Seven new groups close that:
+  `fee` (`fee_sizing.py`), `wallet` (`wallet.py`), `hdwallet` (`hd/wallet.py`),
+  `glyph` (`glyph/ft.py` + `glyph/builder.py`), `swap` (`gravity/htlc_spend.py`
+  + `swap/rswp/orders.py`), `coordinator` (`gravity/swap_coordinator.py`) and
+  `network` (`network/`). `task mutate consensus` and `task mutate value` run
+  the old and new sets; existing groups keep their file lists, test commands
+  and timeouts verbatim so their published baselines stay comparable.
+
+  First full baseline: **8 171 mutants, 5 049 killed, 3 122 survived — 61%
+  killed**, 5 h 36 m of compute (1 h 44 m wall clock with one runner per group).
+  Per-module rates range from `fee_sizing.py` at 89% down to `glyph/builder.py`
+  at 24%, whose offline coverage is 66% because its remaining paths belong to
+  the regtest suites. Measured baselines and the equivalent-mutant classes that
+  explain the raw scores are in
+  [`docs/how-to/mutation-testing.md`](docs/how-to/mutation-testing.md); all
+  3 122 survivors are listed with file:line in
+  [`docs/reference/mutation-survivors/`](docs/reference/mutation-survivors/),
+  with the 1 045 annotation-equivalent ones marked so triage can skip them.
+
+- **`.github/workflows/mutation.yml`** — a weekly scheduled lane, one parallel
+  job per group, uploading the survivor list and session databases as
+  artifacts. Deliberately not per-push: the measured cost is 5 h 36 m of compute,
+  16-104 minutes per group. One job per group because cosmic-ray edits
+  `src/pyrxd` in place, so groups cannot share a checkout — separate runners also
+  turn 5 h 36 m of compute into 1 h 44 m of wall clock. Report-only, with no
+  kill-rate threshold, because a third of the survivors are equivalent mutants
+  that cannot be killed.
+
+- **`scripts/mutation_survivors.py`** — renders a cosmic-ray session database as
+  a triage table: file, line, enclosing definition, operator and the exact source
+  change. `cr-report` prints job ids and operator names with no location, which
+  is enough to count survivors and useless for fixing them.
+
 - **`pyrxd glyph inspect` now names four script shapes it previously called
   `unknown`.** `inspect` is the only tool that names Radiant script shapes —
   Radiant Core's own `Solver` recognises five Bitcoin-era templates and calls
@@ -137,6 +173,22 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the caveat. The key is now absent on that tier; `has_self_replication` and
   `has_burn_branch` carry the markers it *is* entitled to. The exact-match
   `soulbound-covenant` tier is unchanged.
+
+- **`scripts/mutation_test.sh` no longer leaves mutated sources in the tree when
+  it is killed.** bash skips an `EXIT` trap when killed by an untrapped signal,
+  so a run stopped mid-sweep left `src/pyrxd/…` mutated — indistinguishable from
+  a hand edit. `INT`/`TERM`/`HUP` are now trapped and restore before re-raising.
+  The script also refuses to start when a target source is dirty (cleanup is
+  `git checkout --`, which would discard the work) and refuses to mutate when the
+  group's clean suite is not green — cosmic-ray reads a non-zero exit as *mutant
+  killed*, so a red test list scores **100% killed on every module**.
+
+- **The `wallet` mutation test list keeps `tests/cli/*` contiguous.** Splitting
+  files from a sub-package across the pytest arg list makes pytest 9.1.1 drop
+  that directory's `conftest.py` for the later ones; `tests/cli/`'s `runner`
+  fixture went missing and 32 tests ERRORed. Reproducible outside the mutation
+  harness, so it is a suite-wide ordering hazard for any explicit multi-file
+  `pytest` invocation.
 
 ### Changed
 
