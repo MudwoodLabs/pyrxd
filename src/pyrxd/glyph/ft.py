@@ -130,7 +130,7 @@ MAX_AIRDROP_RECIPIENTS: int = 1000
 _SIG_SIZE_SLACK_BYTES: int = SIG_SIZE_SLACK_BYTES
 
 
-def _check_fee_rate(fee_rate: int) -> None:
+def _check_fee_rate(fee_rate: int, *, allow_overpay: bool = False) -> None:
     """Reject a fee rate the network will not relay.
 
     Radiant has neither RBF nor CPFP (threat-model S21, verified against
@@ -144,7 +144,29 @@ def _check_fee_rate(fee_rate: int) -> None:
     next door had a third copy of *nothing*, which is the bug that made this shared.
     Kept as a named function because its callers document it by name.
     """
-    assert_fee_rate_clears_relay_floor(fee_rate, what="FT builder")
+    assert_fee_rate_clears_relay_floor(fee_rate, what="FT builder", allow_overpay=allow_overpay)
+
+
+def outpoint_key(txid: str, vout: int) -> tuple[str, int]:
+    """Canonical identity of an outpoint, for comparing one against another.
+
+    A txid is a 32-byte hash *rendered* as hex, and hex has no case: the wire form is
+    ``bytes.fromhex(txid)[::-1]``, which is byte-identical for ``"ab…"`` and ``"AB…"``.
+    Every duplicate-outpoint guard in this module compared the rendering instead of the
+    identity, so a caller who mixed cases — trivially, one txid from a JSON API that
+    upper-cases and one from a local read — walked straight through all three of them.
+
+    Measured before this existed, with one 1,000-photon UTXO listed twice, the second
+    time upper-cased: :class:`FtUtxoSet` accepted the set, ``total()`` reported
+    **2,000**, and the builder went on to sign a transaction with a duplicate input that
+    no node accepts. That is precisely the failure the guards were added to stop; they
+    simply were not looking at the outpoint.
+
+    Case-folding is a canonicalisation, not a validation — it cannot refuse anything
+    that used to work, and a non-hex ``txid`` is left to the caller and the serialiser
+    to reject as before.
+    """
+    return (txid.lower() if isinstance(txid, str) else txid, vout)
 
 
 @dataclass(frozen=True)
@@ -200,6 +222,13 @@ class FtUtxo:
     ft_script: bytes
 
     def __post_init__(self) -> None:
+        # Canonicalise the txid's case at construction, so no comparison anywhere —
+        # including one not yet written — can be fooled by the rendering. The guards
+        # in this module also fold through ``outpoint_key``, because a guard living in
+        # one caller only protects that caller (the lesson this class's own docstring
+        # records). Hex has no case, so this cannot refuse anything.
+        if isinstance(self.txid, str):
+            object.__setattr__(self, "txid", self.txid.lower())
         # ``bool`` is an ``int`` subclass, and ``True`` would sail through every
         # arithmetic check below as 1 — reject it by type, not by value. Same
         # for ``float``: 1.5 passed the old ``ft_amount < 0`` check.
@@ -302,6 +331,11 @@ class AirdropFunding:
     private_key: Any
 
     def __post_init__(self) -> None:
+        # Same canonicalisation as :class:`FtUtxo`, for the same reason: the funding
+        # list and the FT list are compared against each other across the seam in
+        # ``estimate_airdrop``, so they have to agree on what an outpoint IS.
+        if isinstance(self.txid, str):
+            object.__setattr__(self, "txid", self.txid.lower())
         # ``bool`` first: it is an ``int`` subclass, so ``True`` would pass every
         # arithmetic check below as 1.
         if isinstance(self.value, bool) or not isinstance(self.value, int):
@@ -374,6 +408,10 @@ class FtUtxoSet:
         # ``bad-txns-inputs-duplicate``) while reporting a fee 4x the real one. The
         # check is on ``(txid, vout)`` and not on ``txid`` alone: one transaction
         # paying a holder at several output indexes is ordinary.
+        #
+        # The key goes through ``outpoint_key`` rather than using ``u.txid`` raw:
+        # a txid is case-insensitive hex, so the guard has to compare it the way
+        # the WIRE does. See ``outpoint_key`` for the measurement.
         seen_outpoints: set[tuple[str, int]] = set()
         for u in utxos:
             # ``value``/``ft_amount`` type, sign and equality are not re-checked
@@ -407,7 +445,7 @@ class FtUtxoSet:
                 raise ValidationError(
                     f"UTXO {u.txid}:{u.vout} carries ref {input_ref} which differs from the set's ref {ref}"
                 )
-            outpoint = (u.txid, u.vout)
+            outpoint = outpoint_key(u.txid, u.vout)
             if outpoint in seen_outpoints:
                 raise ValidationError(
                     f"UTXO {u.txid}:{u.vout} appears more than once in this set. An outpoint is unique on "
@@ -492,6 +530,8 @@ class FtUtxoSet:
         change_pkh: Hex20 | None = None,
         dust_limit: int = DUST_LIMIT,
         funding: Sequence[AirdropFunding] = (),
+        *,
+        allow_overpay: bool = False,
     ) -> FtTransferResult:
         """Build a signed FT transfer: ``amount`` units of this token to one PKH.
 
@@ -540,6 +580,12 @@ class FtUtxoSet:
                                threshold is 1 photon, and a 546 floor would
                                forbid transferring 100 units of anything.
         :param funding:        plain-P2PKH RXD UTXOs paying the fee.
+        :param allow_overpay:  accept a ``fee_rate`` above the overpay ceiling.
+                               The deliberate, greppable opt-out, mirroring
+                               ``allow_below_relay_floor`` at the other end — a
+                               ceiling with no reachable override refuses valid
+                               work, and on a chain with neither RBF nor CPFP a
+                               refusal can cost the funds it was protecting.
 
         :raises ValidationError: ``new_owner_pkh`` is not 20 bytes, or a selected
             UTXO has ``value != ft_amount`` (the fail-closed backstop — see
@@ -564,6 +610,7 @@ class FtUtxoSet:
             fee_rate=fee_rate,
             change_pkh=change_pkh,
             dust_limit=dust_limit,
+            allow_overpay=allow_overpay,
         )
         return FtTransferResult(
             tx=result.tx,
@@ -587,6 +634,7 @@ class FtUtxoSet:
         royalty: GlyphRoyalty | None = None,
         sale_price: int = 0,
         pay_royalty: bool | None = None,
+        allow_overpay: bool = False,
     ) -> FtAirdropResult:
         """Build one signed transaction paying FT units to N recipients.
 
@@ -668,7 +716,7 @@ class FtUtxoSet:
         # 1. Validate. Fee rate first — the recipient-cap message quotes it, and
         #    quoting an unvalidated value produces a nonsense number in the one
         #    place a caller is being asked to reconsider a cost.
-        _check_fee_rate(fee_rate)
+        _check_fee_rate(fee_rate, allow_overpay=allow_overpay)
         if dust_limit < 1:
             raise ValueError(f"dust_limit must be >= 1, got {dust_limit}")
 
@@ -717,7 +765,7 @@ class FtUtxoSet:
         # reported fee 4x the real one.
         funding_outpoints: set[tuple[str, int]] = set()
         for i, f in enumerate(funding):
-            outpoint = (f.txid, f.vout)
+            outpoint = outpoint_key(f.txid, f.vout)
             if outpoint in funding_outpoints:
                 raise ValidationError(
                     f"funding[{i}] repeats outpoint {f.txid}:{f.vout}, which already appears earlier in "
@@ -734,7 +782,7 @@ class FtUtxoSet:
         # outpoint appearing in BOTH is the same duplicate-input defect across the
         # seam that neither list can see on its own.
         for u in selected:
-            if (u.txid, u.vout) in funding_outpoints:
+            if outpoint_key(u.txid, u.vout) in funding_outpoints:
                 raise ValidationError(
                     f"outpoint {u.txid}:{u.vout} is listed both as an FT UTXO and as plain-RXD funding. "
                     "It can only be one of the two, and spending it twice in one transaction is a "

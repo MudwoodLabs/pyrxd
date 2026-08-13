@@ -320,8 +320,14 @@ def assert_fee_rate_clears_relay_floor(
     ``build_nft_transfer_tx`` before this bound existed: ``fee_rate=10_000_000`` —
     which is literally :data:`RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`, the
     per-**kB** constant this module exports one import away from the per-**byte**
-    one — burned **2,320,000,000 photons (23.2 RXD)** off a 229-byte transfer at a
-    1009x overpay, silently, with the build reporting success.
+    one — burned **2.32-2.33 BILLION photons (23.2-23.3 RXD)** off a 229-230 byte
+    transfer, silently, with the build reporting success. That is a **1000-1004x**
+    overpay against the same transaction's floor-rate fee. The figures are ranges
+    because the fee tracks the DER signature length, which is 71 or 72 bytes
+    run to run; re-measured over 40 builds on 2026-08-12, the fee was
+    2_320_000_000 or 2_330_000_000, never a single value. (An earlier note here
+    quoted a single "2,320,000,000 ... at a 1009x overpay"; the magnitude is
+    right, the precision was not, and 1009x did not reproduce.)
 
     The ceiling is ``MAX_FEE_OVERPAY_MULTIPLE × relay_floor_photons_per_byte()`` =
     100_000 photons/byte: 1.0 RXD/kB against a chain whose floor is 0.10 and which
@@ -340,17 +346,44 @@ def assert_fee_rate_clears_relay_floor(
     — for regtest and for chains the caller controls, which legitimately relay
     lower. ``allow_overpay`` is its mirror, for a caller who means an unusually high
     rate. Each skips only its own bound: the rate still has to be a positive int, and
-    opting out of one never opts out of the other.
+    opting out of one never opts out of the other. **Both overrides are reachable
+    from every public builder behind this gate** — ``RxdWallet.__init__``,
+    ``HdWallet.build_send_tx`` / ``build_send_max_tx`` / ``send`` / ``send_max``,
+    ``WatchOnlyTxBuilder.build_send``, ``FtUtxoSet.build_transfer_tx`` /
+    ``build_airdrop_tx``, and ``TransferParams.allow_overpay``. A ceiling with no
+    reachable override is not a stricter guard, it is a guard that refuses valid
+    work, and this chain has neither RBF nor CPFP to repair the refusal.
+
+    **Why this is not the same bound as**
+    :attr:`~pyrxd.gravity.fee_policy.DeadlineFeePolicy.max_urgency_multiplier`, which
+    is validated only ``>= 1.0``. They act on different things and compose rather than
+    compete. This one bounds a **rate the caller passes in**, in photons per BYTE,
+    where the failure being caught is a *unit slip* — the per-kB constant handed to a
+    per-byte parameter — which the caller did not intend and cannot see. The urgency
+    multiplier is not an input rate at all: it scales a fee already bound below by
+    ``protocol_floor_per_kb``, it is an explicitly named policy field whose value IS
+    the caller's statement of intent (the same statement ``allow_overpay=True`` makes
+    here), and :func:`fee_overpay_ceiling` deliberately takes
+    ``max(floor, target)`` so that a raised urgency target RAISES the overpay ceiling
+    with it — a legitimately urgent fee must not read as a mistake. Bounding the
+    multiplier would therefore cap a deliberate deadline-racing spend, which is the
+    one place this repository has decided (``docs/threat-model.md`` S21) that
+    overpaying beats being refused.
     """
     _check_rate(fee_rate)
     floor_per_byte = relay_floor_photons_per_byte()
     ceiling_per_byte = floor_per_byte * MAX_FEE_OVERPAY_MULTIPLE
     if not allow_overpay and fee_rate > ceiling_per_byte:
+        # Rendered to one decimal, NOT floor-divided. `fee_rate // floor` truncates, so
+        # 100_001 — the smallest rate this refuses — reported "is 10x ... above the 10x
+        # ceiling", an error that reads as self-contradictory at exactly the boundary a
+        # caller is most likely to be standing on.
+        multiple = f"{fee_rate / floor_per_byte:.1f}"
         raise error_type(
-            f"{what}: fee_rate of {fee_rate} photons/byte is {fee_rate // floor_per_byte}x Radiant's "
+            f"{what}: fee_rate of {fee_rate} photons/byte is {multiple}x Radiant's "
             f"effective relay floor of {floor_per_byte}, above the {MAX_FEE_OVERPAY_MULTIPLE}x ceiling "
             f"({ceiling_per_byte} photons/byte). A fee is size x fee_rate, so this pays "
-            f"{fee_rate // floor_per_byte}x what the network asks and the difference is gone: an NFT "
+            f"{multiple}x what the network asks and the difference is gone: an NFT "
             "transfer and a sweep have no change output, so the whole overpay leaves with the miner. "
             f"Check whether you meant {floor_per_byte} photons per BYTE rather than "
             f"{floor_per_byte * 1000} per kB — they are the same fee rate written two ways, and passing "

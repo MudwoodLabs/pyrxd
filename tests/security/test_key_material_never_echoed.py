@@ -423,6 +423,46 @@ def test_redaction_did_not_widen_into_ordinary_prose() -> None:
         assert redact(message) == message, "redact() swallowed an ordinary error message"
 
 
+# ── what the heuristic really does, measured rather than asserted from its docstring ──
+#
+# The module note used to claim the vocabulary branch "cannot match a sentence". It can,
+# and the shape branch over-matches too. Both are the intended direction of error — a
+# false positive costs one `<redacted>` message, a false negative costs a seed phrase in
+# a log — but a claim that is not true is worse than no claim, so the behaviour is pinned
+# here in both directions and the docstring now states it.
+
+
+def test_the_shape_branch_does_match_all_lowercase_prose() -> None:
+    """Not a bug, and not what the docstring implied. Any run of >= 8 lowercase
+    alphabetic tokens is redacted, prose included — the capitalisation is the only
+    thing that saves the same sentence in the test above."""
+    assert redact("could not connect to the remote peer at this time") == "<redacted>"
+
+
+def test_the_vocabulary_branch_does_match_a_sentence_of_bip39_words() -> None:
+    """BIP-39's English list is 2048 common English words, so English sentences built
+    entirely from it exist, and this is one. Documented as accepted over-matching."""
+    from pyrxd.security.errors import _bip39_vocabulary
+
+    sentence = "Client Must Supply Valid Input Before Program Can Process Order"
+    vocabulary = _bip39_vocabulary()
+    assert all(t.casefold() in vocabulary for t in sentence.split()), "the fixture drifted off the wordlist"
+    assert redact(sentence) == "<redacted>"
+
+
+def test_the_known_gap_is_an_uppercase_phrase_from_an_unshipped_wordlist() -> None:
+    """The honest limit, pinned so it cannot be quietly believed away: neither branch
+    reaches it — the shape branch sees the case, the vocabulary branch has never read
+    those words. Closing it means SHIPPING those wordlists.
+
+    Uses invented tokens rather than a real foreign phrase so no genuine seed words
+    appear in this repo. If a future change ever covers this case, this test fails and
+    the docstring's "residual gap" paragraph has to be revisited — which is the point.
+    """
+    phrase = " ".join(_tokens_outside_every_shipped_wordlist(12)).upper()
+    assert redact(phrase) == phrase, "the gap closed — update the docstring that documents it"
+
+
 # ── mutants that survived, and the assertions that kill them ─────────────────
 #
 # Mutation-testing `security/errors.py` (the new `keys` group in

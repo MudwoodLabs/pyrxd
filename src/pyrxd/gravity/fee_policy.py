@@ -178,6 +178,19 @@ class DeadlineFeePolicy:
         Radiant fee/confirmation curve has been measured, so this buys headroom
         against a relay-policy change or mempool competition, and claims nothing
         about inclusion latency.
+
+        Validated as a finite float ``>= 1.0`` and deliberately NOT capped above,
+        which is not an oversight and is not in tension with the per-byte overpay
+        ceiling in :func:`~pyrxd.fee_sizing.assert_fee_rate_clears_relay_floor`.
+        That ceiling catches a *unit slip* in a rate a caller passed without
+        meaning to (per-kB where per-byte belonged). This field is the opposite:
+        naming it is the statement of intent, it scales a fee already bound below
+        by ``protocol_floor_per_kb``, and :func:`~pyrxd.fee_sizing.fee_overpay_ceiling`
+        takes ``max(floor, target)`` precisely so that raising it RAISES the overpay
+        ceiling rather than turning a legitimately urgent fee into a "mistake".
+        Capping it would cap the deadline-racing spend, and losing a claim to the
+        counterparty's CSV refund is strictly worse than overpaying a fee
+        (``docs/threat-model.md`` S21).
     """
 
     relay_fee_per_kb: int = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB

@@ -1431,14 +1431,120 @@ def test_a_correctly_permissioned_key_file_still_loads(tmp_path: Path) -> None:
     assert sr.load_recovery_json(p)["rxd_network"] == "bc"
 
 
-def test_a_symlinked_recovery_file_is_refused(tmp_path: Path) -> None:
-    """O_NOFOLLOW. A symlink is the substitution primitive: the mode you check is the
-    link target's, and the target can change between one open and the next."""
+def test_a_symlinked_recovery_file_is_read_and_judged_by_its_TARGET(tmp_path: Path) -> None:
+    """A recovery path is operator-chosen, and symlinking one into external storage (a
+    removable volume, an encrypted mount) is ordinary — the same call
+    ``pyrxd.hd.wallet`` already made for a BIP39 seed, a file of at least equal value.
+    Refusing here answered one question two ways.
+
+    It is safe because every verdict comes from ``fstat`` on the fd actually opened, so
+    the mode and owner judged are the TARGET's — the file whose permissions matter. The
+    next test pins that half: a symlink to a 0644 keyful file is still refused.
+    """
     real = _keys_file(tmp_path)
     link = tmp_path / "link.json"
     link.symlink_to(real)
-    with pytest.raises(ValidationError):
+    assert sr.load_recovery_json(link)["rxd_network"] == "bc"
+
+
+def test_a_symlink_cannot_launder_a_world_readable_key_file(tmp_path: Path) -> None:
+    """The refuse direction the symlink relaxation must not cost: the mode gate follows
+    the link to the real file, so pointing a link at a 0644 keyful file changes nothing."""
+    real = _keys_file(tmp_path)
+    real.chmod(0o644)
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    with pytest.raises(ValidationError, match="contains a private key"):
         sr.load_recovery_json(link)
+
+
+def test_a_recovery_file_owned_by_a_peer_uid_is_still_refused(tmp_path: Path, monkeypatch) -> None:
+    """Root is not a peer; another unprivileged user is. A peer who owns the file
+    chooses what the claim is built from, and nothing downstream re-authenticates a
+    plaintext recovery JSON."""
+    p = _keys_file(tmp_path)
+    real_fstat = os.fstat
+    peer_uid = os.geteuid() + 1000
+
+    def fake_fstat(fd):
+        st = real_fstat(fd)
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, peer_uid, *tuple(st)[5:]))
+
+    monkeypatch.setattr(os, "fstat", fake_fstat)
+    with pytest.raises(ValidationError, match="owned by uid"):
+        sr.load_recovery_json(p)
+
+
+def test_a_root_written_recovery_file_is_accepted(tmp_path: Path, monkeypatch) -> None:
+    """The measured lockout: the harnesses run their nodes in Docker, so a recovery JSON
+    written by a root process onto a bind mount was refused outright, mid-incident, with
+    no override. Root can substitute the interpreter and the file's contents regardless
+    of what this check says, so refusing bought nothing and cost the recovery."""
+    p = _keys_file(tmp_path)
+    real_fstat = os.fstat
+
+    def fake_fstat(fd):
+        st = real_fstat(fd)
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, *tuple(st)[5:]))
+
+    monkeypatch.setattr(os, "fstat", fake_fstat)
+    assert sr.load_recovery_json(p)["rxd_network"] == "bc"
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        pytest.param({"parties": {"taker_rxd_wif": "L" + "1" * 51}}, id="nested-one-deep"),
+        pytest.param({"a": {"b": {"c": {"maker_rxd_wif": "L" + "1" * 51}}}}, id="nested-four-deep"),
+        pytest.param({"roles": [{"private_key": "abc"}]}, id="inside-a-list"),
+        pytest.param({"mnemonic": "abandon " * 11 + "about"}, id="mnemonic"),
+        pytest.param({"wallet": {"seed_hex": "aa" * 64}}, id="nested-seed"),
+        pytest.param({"xprv": "xprv9s21ZrQH143K3"}, id="xprv"),
+    ],
+)
+def test_key_material_is_found_at_any_depth_and_under_every_marker(tmp_path: Path, doc: dict) -> None:
+    """The gate asks "does this document hold a key?", and a document holds what it holds
+    at ANY depth. It walked only the top level, so ``{"parties": {"taker_rxd_wif": ...}}``
+    at 0644 was accepted as a public file; and its marker list omitted ``mnemonic``,
+    ``seed`` and ``xprv`` — a mnemonic is every key the wallet will ever derive.
+    """
+    p = tmp_path / "nested.json"
+    p.write_text(json.dumps(_public_only_doc() | doc))
+    p.chmod(0o644)
+    with pytest.raises(ValidationError, match="contains a private key"):
+        sr.load_recovery_json(p)
+
+
+def test_the_deep_walk_does_not_refuse_a_nested_PUBLIC_document(tmp_path: Path) -> None:
+    """The accept direction, and the one that matters: widening the search must not turn
+    a two-host harness's public locator file into a false alarm. Nested, and every
+    marker-named field either absent or empty."""
+    doc = _public_only_doc() | {
+        "parties": {"taker_rxd_pkh": "11" * 20, "taker_rxd_wif": "", "maker_rxd_wif": None},
+        "locators": [{"btc_funding_outpoint": "cc" * 32 + ":3"}],
+    }
+    p = tmp_path / "nested_public.json"
+    p.write_text(json.dumps(doc))
+    p.chmod(0o644)
+    assert sr.load_recovery_json(p)["t_rxd_blocks"] == 20
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write a 0444 file, so the unrunnable-remedy case cannot arise")
+def test_the_mode_remedy_is_one_the_operator_can_actually_run(tmp_path: Path) -> None:
+    """``chmod 600 <path>`` cannot succeed on read-only media or a root-written bind
+    mount — the two places this gate most often fires. A remedy that cannot succeed
+    reads as the tool being broken, so the message names the one that works."""
+    p = _keys_file(tmp_path)
+    p.chmod(0o444)
+    tmp_path.chmod(0o555)  # no unlink/rename either — the archived-media shape
+    try:
+        with pytest.raises(ValidationError) as exc:
+            sr.load_recovery_json(p)
+    finally:
+        tmp_path.chmod(0o755)
+    message = str(exc.value)
+    assert "cannot succeed" in message
+    assert "install -m 600" in message
 
 
 def test_a_recovery_file_that_is_not_a_regular_file_is_refused(tmp_path: Path) -> None:

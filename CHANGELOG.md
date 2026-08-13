@@ -165,6 +165,63 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The duplicate-outpoint guards in the FT builders were bypassable by letter
+  case.** All three — `FtUtxoSet.__init__`, the airdrop's funding-list check and
+  the cross-seam check — keyed on `(u.txid, u.vout)` with `txid` an unnormalised
+  `str`. A txid is a 32-byte hash *rendered* as hex, and hex has no case: the
+  wire form is `bytes.fromhex(txid)[::-1]`, byte-identical for `"ab…"` and
+  `"AB…"`. So a caller who mixed cases — one txid from an API that upper-cases,
+  one from a local read — walked through all three. Measured: one 1,000-photon
+  outpoint listed twice, the second time upper-cased, was accepted and
+  `total()` reported **2,000**, with the builder still willing to sign a
+  duplicate input that no node accepts. `FtUtxo` and `AirdropFunding` now
+  canonicalise the case at construction, and the guards compare through a shared
+  `outpoint_key` so a future comparison cannot re-open it. Case-folding is a
+  canonicalisation, not a validation — it refuses nothing that worked before.
+
+- **The fee-overpay ceiling had no reachable override.** `allow_overpay` existed
+  on `assert_fee_rate_clears_relay_floor` and was passed by **none** of its six
+  call sites, so no public signature exposed it and 100,000 photons/byte was an
+  absolute wall — `RxdWallet(pk, url, fee_rate=150_000)` was refused with
+  nowhere to go. It is now plumbed the way `allow_below_relay_floor` already is:
+  `RxdWallet.__init__`, `HdWallet.build_send_tx` / `build_send_max_tx` / `send` /
+  `send_max`, `WatchOnlyTxBuilder.build_send`, `FtUtxoSet.build_transfer_tx` /
+  `build_airdrop_tx`, and a new `TransferParams.allow_overpay`. The ceiling still
+  refuses the measured overpay by default. `DeadlineFeePolicy.max_urgency_multiplier`
+  is deliberately left uncapped, and both docstrings now say why: it scales a fee
+  already bound below, naming it IS the statement of intent, and
+  `fee_overpay_ceiling` takes `max(floor, target)` precisely so a raised urgency
+  target raises the overpay ceiling rather than reading as a mistake.
+
+  The ceiling's own error message also stopped contradicting itself: `fee_rate //
+  floor` truncated, so `100_001` reported *"is 10x … above the 10x ceiling"* at
+  exactly the boundary a caller is most likely standing on. It now renders one
+  decimal.
+
+- **The recovery-file and wallet-file permission gates gave opposite answers.**
+  Both hold spending authority; `cli/swap_recovery.py` refused a symlink and any
+  file owned by another uid, while `hd/wallet.py` deliberately exempted both. The
+  refusal is a realistic mid-incident lockout — the harnesses run their nodes in
+  Docker, so a recovery JSON written by a root process onto a bind mount was
+  refused outright with no override. Reconciled by the property that governs each
+  check rather than by making the two files identical (a wallet file is
+  AES-256-GCM sealed, so a substituted one fails the tag; a recovery JSON is
+  plaintext): a symlink is now allowed, because every verdict comes from `fstat`
+  on the opened fd and therefore describes the target; a **root**-owned file is
+  accepted, because root can substitute the interpreter and the contents anyway;
+  a file owned by any other unprivileged uid is still refused, because a peer user
+  would be choosing what the claim is built from. A keyful file at 0444 on
+  read-only media is no longer told to `chmod 600`, which cannot succeed there —
+  the message now offers `install -m 600` to a path the operator owns.
+
+- **The recovery-file key gate only inspected top-level keys.**
+  `_carries_private_key` walked one level, so `{"parties": {"taker_rxd_wif": …}}`
+  at mode 0644 was accepted as a public file; and its marker list omitted
+  `mnemonic`, `seed` and `xprv` — a recovery file carrying a mnemonic carries every
+  key the wallet will ever derive. It now walks dicts and lists to any depth and
+  matches all three. Truthiness is still required, so the empty `taker_rxd_wif`
+  a two-host harness writes for the role it does not hold is still not a key.
+
 - **The BTC tip-height quorum refused ordinary block propagation.** Tip height
   is the one value in `BtcDataSource` that honest sources on the same chain
   legitimately disagree about — a block takes time to reach every endpoint — yet
@@ -318,8 +375,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `build_nft_transfer_tx` before the bound existed: `fee_rate=10_000_000` —
   which is literally `RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`, the
   per-**kB** constant `pyrxd.fee_sizing` exports one import away from the
-  per-**byte** one — burned **2,320,000,000 photons (23.2 RXD)** off a 229-byte
-  transfer at a **1009x** overpay, silently, with the build reporting success.
+  per-**byte** one — burned **2.32-2.33 billion photons (23.2-23.3 RXD)** off a
+  229-230 byte transfer, silently, with the build reporting success: a
+  **1000-1004x** overpay against that transaction's own floor-rate fee. Ranges,
+  not single figures, because the fee tracks the 71-or-72-byte DER signature;
+  re-measured over 40 builds on 2026-08-12.
 
   The ceiling is `MAX_FEE_OVERPAY_MULTIPLE × relay_floor_photons_per_byte()` =
   100_000 photons/byte. That constant is reused rather than a new number
@@ -388,6 +448,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Documentation
 
+- **Three claims corrected where the code did not match the note.** Each was
+  re-measured rather than reasoned about:
+  - `redact`'s note said requiring real BIP-39 words "cannot match a sentence".
+    It can: `"Client Must Supply Valid Input Before Program Can Process Order"`
+    is ten words, every one on the English list, and IS redacted — as is any run
+    of >= 8 lowercase alphabetic tokens, prose included. The over-matching is the
+    intended direction of error (a false positive costs one `<redacted>`
+    message; a false negative costs a seed phrase in a log) and is kept, but it
+    is now stated, along with the residual gap the note implied away: an
+    UPPERCASE phrase from a wordlist pyrxd does not SHIP passes both branches
+    unredacted. All three behaviours are now pinned by tests.
+  - `parse_recovery_file`'s docstring promised only `ValueError` after its read
+    moved behind `load_recovery_json`, which raises `ValidationError`. Both
+    in-repo callers already catch the wider type; the docstring was the wrong
+    half.
+  - The 23.2 RXD overpay measurement is a **range**, not a figure: the fee tracks
+    the 71-or-72-byte DER signature, so it is 2.32 or 2.33 billion photons on a
+    229-230 byte transfer (re-measured over 40 builds, 2026-08-12). The quoted
+    "1009x" did not reproduce; the measured overpay against that transaction's
+    own floor-rate fee is 1000-1004x.
+
 - `docs/concepts/glyph-inspect-tool.md` now states which of the two
   classifiers sees what. Script-level reads a locking script and reports
   `type`; envelope-level reads the reveal CBOR and reports
@@ -451,9 +532,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `radiant_relay_size`'s bytes-only gate and `fee_overpay_multiple`'s
     divide-by-zero clamp.
   - `royalty_payouts`'s `and royalty.bps > 0`, which is **not** a dead branch:
-    delete it and `GlyphRoyalty(bps=0, minimum=1000, splits=((addr, 0),))` — a
-    legal, constructible shape that pays 1000 photons today — raises
-    `ZeroDivisionError`. Also its 20-byte pkh check;
+    delete it and `GlyphRoyalty(address=addr, bps=0, minimum=1000,
+    splits=((addr, 0),))` — a legal, constructible shape that pays 1000 photons
+    today — raises `ZeroDivisionError`. Re-verified 2026-08-12; note this is a
+    **test** added for a guard that already shipped in #385, not a fix — no
+    royalty code changed here, and none needed to. (An earlier draft of this
+    entry wrote the shape without its required `address`, which raises
+    `TypeError` rather than demonstrating anything.) Also its 20-byte pkh check;
     `address_to_public_key_hash` validates the base58check shape, not the
     payload length.
   - `FtUtxoSet.__init__`'s three constructor type checks, `build_transfer_tx`'s

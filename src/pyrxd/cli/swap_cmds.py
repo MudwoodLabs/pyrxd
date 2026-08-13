@@ -69,13 +69,21 @@ _SECRET_KEY_MARKERS = ("wif", "key_hex", "secret", "preimage", "privkey")
 
 
 def parse_recovery_file(path: Path) -> SwapFacts:
-    """Parse a harness recovery JSON into public :class:`SwapFacts`. Raises ``ValueError`` on a file
-    that does not look like a swap recovery file (missing the covenant SPK + hashlock).
+    """Parse a harness recovery JSON into public :class:`SwapFacts`.
 
     Reads through :func:`~pyrxd.cli.swap_recovery.load_recovery_json`, so the same file
     that gets ``has_keys=True`` reported about it is also refused if it holds those keys
     at a group/world-readable mode. Telling an operator their file contains private keys
     while reading it out of a 0644 file without comment was the wrong half of the job.
+
+    Raises:
+        ValueError: the document parses but does not look like a swap recovery file
+            (missing the covenant SPK + hashlock, or a non-integer ``t_rxd_blocks``).
+        ValidationError: raised by ``load_recovery_json`` before this function sees
+            anything — the file is unreadable, oversized, not JSON, not an object, or
+            holds a key at a group/world-readable mode. This docstring promised only
+            ``ValueError`` after the read moved behind that gate; both in-repo callers
+            already catch the wider type, so the promise was the thing that was wrong.
     """
     from .swap_recovery import load_recovery_json
 

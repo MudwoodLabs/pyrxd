@@ -1215,6 +1215,7 @@ class HdWallet:
         *,
         fee_rate: int = DEFAULT_FEE_RATE,
         allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
         change_address: str | None = None,
     ) -> Transaction:
         """Build and sign a P2PKH transfer from HD UTXOs to *to_address*.
@@ -1231,6 +1232,12 @@ class HdWallet:
         ``allow_below_relay_floor`` is set — the deliberate opt-out for regtest
         and chains you control. Unlike :class:`~pyrxd.wallet.RxdWallet`, the rate
         arrives per CALL here, so this is where it has to be judged.
+
+        ``allow_overpay`` is the mirror opt-out for a rate above the overpay
+        ceiling. A ceiling with no reachable override is its own fund-safety bug:
+        a caller who genuinely means a high rate would be refused outright, and
+        Radiant has neither RBF nor CPFP, so a refusal during a timelock race
+        costs the funds the ceiling was protecting.
         """
         if not isinstance(photons, int) or isinstance(photons, bool):
             raise ValidationError("photons must be int")
@@ -1252,6 +1259,7 @@ class HdWallet:
             fee_rate,
             what="HdWallet.build_send_tx",
             allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
             error_type=ValidationError,
         )
         if not triples:
@@ -1335,11 +1343,15 @@ class HdWallet:
         *,
         fee_rate: int = DEFAULT_FEE_RATE,
         allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
     ) -> Transaction:
         """Sweep all *triples* to *to_address* minus fee. No change output.
 
         ``fee_rate`` is refused below Radiant's effective relay floor unless
-        ``allow_below_relay_floor`` is set — see :meth:`build_send_tx`.
+        ``allow_below_relay_floor`` is set, and above the overpay ceiling unless
+        ``allow_overpay`` is — see :meth:`build_send_tx`. A sweep has NO change
+        output, so an unintended overpay leaves entirely with the miner, which is
+        why the ceiling exists; it is also why the override has to be reachable.
         """
         if not validate_address(to_address):
             raise ValidationError("to_address is not a valid P2PKH address")
@@ -1349,6 +1361,7 @@ class HdWallet:
             fee_rate,
             what="HdWallet.build_send_max_tx",
             allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
             error_type=ValidationError,
         )
         if not triples:
@@ -1397,6 +1410,7 @@ class HdWallet:
         *,
         fee_rate: int = DEFAULT_FEE_RATE,
         allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
         change_address: str | None = None,
     ) -> str:
         """Fetch UTXOs, build, sign, broadcast. Returns broadcast txid.
@@ -1411,6 +1425,7 @@ class HdWallet:
             photons,
             fee_rate=fee_rate,
             allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
             change_address=change_address,
         )
         txid = await client.broadcast(tx.serialize())
@@ -1423,6 +1438,7 @@ class HdWallet:
         *,
         fee_rate: int = DEFAULT_FEE_RATE,
         allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
     ) -> str:
         """Sweep all UTXOs to *to_address* minus fee. Returns broadcast txid.
 
@@ -1439,6 +1455,7 @@ class HdWallet:
             to_address,
             fee_rate=fee_rate,
             allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
         )
         txid = await client.broadcast(tx.serialize())
         return str(txid)
