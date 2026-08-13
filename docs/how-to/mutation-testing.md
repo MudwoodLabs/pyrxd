@@ -15,14 +15,15 @@ poetry run task mutate transaction        # transaction/ incl. the FORKID sighas
 poetry run task mutate dmint              # glyph/dmint/ covenant builders + DAA + parser
 
 poetry run task mutate fee                # fee_sizing.py — the one fee-sizing rule
-poetry run task mutate wallet             # wallet.py + hd/wallet.py — send/sweep builders
+poetry run task mutate wallet             # wallet.py — the flat-key send/sweep builders
+poetry run task mutate hdwallet           # hd/wallet.py — the BIP32/44 send/sweep builders
 poetry run task mutate glyph              # glyph/ft.py + glyph/builder.py — token builders
 poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
 poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
 poetry run task mutate network            # network/ — remote-response parsing + failover
 
 poetry run task mutate consensus          # the original four groups
-poetry run task mutate value              # the six value-moving groups
+poetry run task mutate value              # the seven value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
 
