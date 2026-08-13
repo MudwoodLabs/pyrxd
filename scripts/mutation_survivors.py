@@ -24,6 +24,7 @@ the mutation operator, and the changed source line (``-`` original, ``+`` mutant
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import sys
 from collections import defaultdict
@@ -32,6 +33,19 @@ from pathlib import Path
 # The cosmic-ray operator names are long and repetitive ("core/ReplaceComparisonOperator_Eq_NotEq").
 # Strip the namespace so the table stays readable; the full name is recoverable from the diff.
 _PREFIX = "core/"
+
+# The single largest equivalent-mutant class: `X | None` in a type annotation rewritten to
+# `X + None`, `X & None` &c. `from __future__ import annotations` makes annotations strings that
+# are never evaluated, so these cannot be killed and are pure noise in a triage list. Flagging
+# rather than dropping them keeps the file a complete record — the reader can skip the marked rows,
+# but nothing is silently missing if the heuristic is ever wrong.
+_ANNOTATION_CONTEXT = re.compile(r"(->|:\s*[\w\.\[\]\"' ]+\s*[|+\-*/&^%<>])")
+
+
+def _likely_annotation_equivalent(operator: str, original: str) -> bool:
+    if not operator.startswith("ReplaceBinaryOperator_BitOr_"):
+        return False
+    return bool(_ANNOTATION_CONTEXT.search(original))
 
 
 def _mutation_lines(diff: str) -> tuple[str, str]:
@@ -105,20 +119,33 @@ def render(by_module: dict[str, list[tuple[int, str, str, str, str]]]) -> str:
         return "\n".join(out)
 
     total = sum(len(v) for v in by_module.values())
-    out += [f"**{total} surviving mutants across {len(by_module)} modules.**", ""]
+    flagged = sum(
+        1
+        for rows in by_module.values()
+        for _, _, operator, original, _ in rows
+        if _likely_annotation_equivalent(operator, original)
+    )
+    out += [
+        f"**{total} surviving mutants across {len(by_module)} modules**, "
+        f"of which {flagged} are marked `annot` — a type annotation rewritten by a BitOr-family "
+        "operator, which cannot change behaviour. Start with the unmarked rows.",
+        "",
+    ]
 
     for module_path in sorted(by_module):
         survivors = sorted(by_module[module_path], key=lambda r: (r[0], r[2]))
+        marked = sum(1 for _, _, op, orig, _ in survivors if _likely_annotation_equivalent(op, orig))
         out += [
-            f"## `{module_path}` — {len(survivors)} survivors",
+            f"## `{module_path}` — {len(survivors)} survivors ({marked} `annot`)",
             "",
-            "| Line | Definition | Operator | Original | Mutant |",
-            "|---|---|---|---|---|",
+            "| Line | Definition | Operator | Original | Mutant | |",
+            "|---|---|---|---|---|---|",
         ]
         for line, definition, operator, original, mutant in survivors:
+            flag = "`annot`" if _likely_annotation_equivalent(operator, original) else ""
             out.append(
                 f"| {line} | `{_escape(definition)}` | `{_escape(operator)}` "
-                f"| `{_escape(original)}` | `{_escape(mutant)}` |"
+                f"| `{_escape(original)}` | `{_escape(mutant)}` | {flag} |"
             )
         out.append("")
     return "\n".join(out)

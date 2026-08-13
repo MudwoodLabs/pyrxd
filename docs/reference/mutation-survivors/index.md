@@ -27,6 +27,7 @@ is a judgement call a human has to make:
 | Definition | the enclosing function or method — `(module level)` when there is none |
 | Operator | the cosmic-ray operator, with its `core/` prefix stripped |
 | Original / Mutant | the single source line before and after the mutation |
+| (last) | `annot` marks a BitOr-family rewrite of a **type annotation** — `X \| None` becoming `X + None`. These cannot be killed: `from __future__ import annotations` makes annotations strings that are never evaluated. **Start with the unmarked rows.** They are flagged rather than dropped so the file stays a complete record if the heuristic is ever wrong. |
 
 A row is triaged by answering one question: **if this mutant shipped, what would go wrong, and why
 did no test see it?** If the answer is "nothing would go wrong", it is equivalent — say so in the

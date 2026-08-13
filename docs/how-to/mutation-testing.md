@@ -89,6 +89,17 @@ tractable — the per-mutant cost is the test command's wall time. `tests/test_m
 property/differential suites (`test_preimage_differential.py`, `test_dmint_vector_derivations.py`)
 close the transaction/dmint lists as the wide net.
 
+Two constraints shape the value-group lists specifically:
+
+- **Files from the same sub-package stay contiguous.** Splitting `tests/cli/*` across the arg list
+  makes pytest 9.1.1 stop applying `tests/cli/conftest.py` to the later ones — the `runner` fixture
+  disappears and 32 tests ERROR. Because cosmic-ray scores a non-zero exit as *killed*, that reads as
+  a perfect score. This is a property of the suite, not of the harness: it reproduces with a plain
+  `pytest a b c` invocation.
+- **Group by the tests that decide, not by directory.** `wallet.py` and `hd/wallet.py` started as one
+  group and their decisive suites turned out to be nearly disjoint, so each file's mutants were paying
+  for the other file's tests — a ~15s clean suite where each half needs ~8s. They are two groups now.
+
 ## Baseline results — spv (2026-06)
 
 | Module | Mutants | Killed | Survived | Killed |
@@ -128,6 +139,39 @@ type.py 95%, transaction_output 95% — the honest view of files whose raw score
 **Spot-check:** a full fresh sweep of the `script` scope at the same commit reported 92 / 4 / 68
 survivors for script.py / timelock.py / type.py — identical, file for file, to the per-survivor
 re-check's prediction.
+
+## Baseline results — value-moving modules (2026-08)
+
+First measurement of the new scope, at commit `3115028` (module sources identical to `724fe92`).
+Every module below ran to completion; the kill rate is over mutants that actually executed.
+
+| Group | Module | Mutants | Killed | Survived | Killed | …annotation-equivalent | Wall time |
+|---|---|---|---|---|---|---|---|
+| `fee` | `fee_sizing.py` | 362 | 322 | 40 | **89%** | 0 | ~16 min |
+| `wallet` | `wallet.py` | 295 | 176 | 119 | 59% | 0 | 26 min |
+| `hdwallet` | `hd/wallet.py` | 1201 | — | — | — | — | — |
+| `glyph` | `glyph/ft.py` | 453 | 318 | 135 | 70% | 77 | 13 min |
+| `glyph` | `glyph/builder.py` | 736 | 177 | 559 | **24%** | 88 | 24 min |
+| `swap` | `gravity/htlc_spend.py` | 277 | 205 | 72 | 74% | 22 | 7 min |
+| `swap` | `swap/rswp/orders.py` | 529 | 282 | 247 | 53% | 143 | 15 min |
+| `coordinator` | `gravity/swap_coordinator.py` | 1657 | 1162 | 495 | 70% | 187 | 42 min |
+| `network` | `network/bitcoin.py` | 1288 | 840 | 448 | 65% | 77 | 47 min |
+
+> **Wall times are upper bounds, not clean measurements.** They were taken on a 32-core workstation
+> running six to eight of these groups concurrently *and* an unrelated parallel mutation workload —
+> load average 12-16 throughout. A single group run on an idle machine will be faster; a 2-core CI
+> runner will be slower. Treat them as "what a group costs when the box is busy", which is the number
+> that decides whether anyone can afford to run it.
+
+Two results stand out, and neither is a scheduling artifact:
+
+- **`glyph/builder.py` kills 24% of its mutants.** It is the largest module in the new scope and the
+  lowest-scoring by a wide margin. Line coverage from the offline suite is 66%, so a third of the file
+  is not executed at all — the regtest end-to-end suites cover those paths, and they do not run here.
+  The honest reading is that this module's *offline* tests are close to a smoke test.
+- **`wallet.py` kills 59% with zero annotation-equivalent survivors.** Unlike the other low scorers it
+  has no annotation noise inflating the survivor count: those 119 survivors are real assertions that
+  nobody wrote, in the module that builds ordinary sends.
 
 ## Reading the score — survivors are not all bugs
 
@@ -174,6 +218,47 @@ it kills. The genuine gaps were real and some were consensus-adjacent:
 - **dMint state re-derivation guards** — the script-number parser pinned to the encoding spec from both
   sides (parse + encode), and surgical corruption of valid contracts at documented layout offsets.
 
+## What the 2026-08 run found (open — not yet closed)
+
+The full survivor lists are in [`../reference/mutation-survivors/`](../reference/mutation-survivors/index.md),
+one file per group, with file:line and the exact source change. These are the entries whose *meaning* is
+worth stating up front, because in each case the guard is load-bearing and its removal is invisible:
+
+- **The relay-floor comparison has no equality test.** `fee_sizing.required_fee` line 284,
+  `if fee_rate < relay_floor_photons_per_byte()`, survives being rewritten to `<=`, `!=` and `is not`.
+  Those differ from `<` only when `fee_rate == floor` — the single most common production value, and
+  the case that decides whether a caller's sub-floor rate is honoured verbatim or raised.
+- **`fee_never_below_relay_floor`'s rate arithmetic is never decisive.** Line 336's
+  `size_bytes * fee_rate` survives `-`, `//`, `%`, `>>` and `&`: every test of this function lands on
+  the `min_relay_fee` side of the `max()`. This is the "no opt-out" API documented for callers whose
+  fee rate crosses a trust boundary.
+- **Two exported consensus constants are unpinned.** `WITNESS_SCALE_FACTOR = 4` (BIP141, used by
+  `bitcoin_virtual_size` and re-exported through `gravity/fee_policy.py`) survives becoming 3 or 5;
+  `RADIANT_MIN_RELAY_PHOTONS_PER_KB` survives ±1. No test states either value.
+- **HTLC unlocking-script size estimates are unpinned.** In `gravity/htlc_spend.py`, `lambda: 110`
+  (P2PKH fee input) survives 109 and 111, and `lambda: len(selector) + 80` (covenant input) survives
+  every binary-operator rewrite including `-`. These estimates are what the fee is sized from before
+  the real signature exists. Radiant has neither RBF nor CPFP, so an under-estimate is the documented
+  failure: rejected for `min relay fee not met`, holding its inputs until mempool expiry — on a claim,
+  against a deadline. The same file's line 149 appends the sighash flag with `to_bytes(1, "little")`
+  and survives a width of 2, which would emit a scriptSig consensus rejects; nothing asserts the bytes.
+- **The cross-chain timelock ordering guard is not boundary-tested.** `swap_coordinator`'s
+  `assert_timelock_margin` line 510, `if btc_blocks <= rxd_blocks`, survives rewriting, as does the
+  margin comparison on line 514. The equal-timelock case is exactly the unsafe one.
+- **Validation loops can be made to iterate zero times.** `ZeroIterationForLoop` survives on
+  `swap_coordinator`'s `__post_init__` and `taker_refund_window_open` parameter-validation loops —
+  every guard inside them is unexercised. `accept_flat_burial: bool = False` also survives flipping to
+  `True` at all three of its declarations, a safety-posture default nothing pins.
+- **RSWP order/asset binding guards survive.** In `swap/rswp/orders.py`, the checks that the offered
+  UTXO belongs to the order (`give_source_tx.txid() != order.offered_txid`) and that the advertised
+  token id and contract type match what is actually offered (`order.token_id != _pushed_token_id(give)`,
+  `order.offered_type != _contract_type_of(give)`) all survive operator rewrites, as does
+  `change = total_in - fee`. `tx.sign(bypass=True)` survives flipping to `False` in three builders.
+
+Nothing here is a demonstrated exploit, and several may prove equivalent on inspection. What the run
+establishes is narrower and still worth having: **these lines can be changed without any test
+objecting**, in modules that decide how much value moves and to whom.
+
 ## Known remaining survivors (deferred)
 
 - `spv/merkle.py` — the `i * 33` branch-index arithmetic needs a **multi-level** proof fixture;
@@ -185,3 +270,36 @@ it kills. The genuine gaps were real and some were consensus-adjacent:
 - `glyph/dmint/chain.py` async ElectrumX discovery flows and `glyph/dmint/miner.py` mining-dispatch
   loops — operational (not byte-consensus) paths whose remaining survivors are timing/IO-shaped; the
   regtest e2e suites cover them end-to-end.
+- `glyph/builder.py`'s uncovered third — the offline suite never executes it, so those survivors say
+  "not tested offline", which is already known from the 66% line coverage. Closing them means either
+  offline fixtures for the builder paths or accepting that the regtest suites own them; that is a
+  scope decision, not a triage one.
+
+## Where this runs
+
+Three places, deliberately, and **not** on the per-push path:
+
+| Where | What | Why |
+|---|---|---|
+| `task mutate <group>` | on demand, locally | the loop you use while writing killer tests |
+| [`Mutation (scheduled)`](https://github.com/MudwoodLabs/pyrxd/blob/main/.github/workflows/mutation.yml) | weekly, one parallel job per group | keeps the survivor list current without anyone remembering to run it |
+| pre-release | `task mutate value` over the groups touching what shipped | the release checklist's slot for "did the new tests actually assert anything" |
+
+The per-push gate is `ci.yml`, whose required checks must stay fast enough that people do not learn
+to route around them; the measured cost here is 7-47 minutes **per group** on a loaded 32-core box,
+which is not a per-push shape at any budget. The scheduled lane is modelled on the existing
+`Fuzz (scheduled)` workflow — Tuesday cron so it does not collide with Monday's fuzz run, forks
+excluded from the schedule, manual `workflow_dispatch` retained.
+
+One job per group, `fail-fast: false`. Groups **cannot** share a runner: cosmic-ray edits
+`src/pyrxd` in place, so a second group's tests would import the first group's mutant and mis-score
+it. Separate runners give each group its own checkout for free and make the wall clock the slowest
+group rather than the sum. The repo is public, so these are free-tier minutes rather than a draw on
+the private Actions pool.
+
+The lane is **report-only** — no `MUTATION_MIN_KILL_PCT`. A third of the survivors in this scope are
+equivalent mutants (594 of 2 115 are annotation-only by the conservative count), so a raw kill-rate
+threshold would either sit below the real quality bar or fail the build on untriaged noise. Its
+output is the uploaded survivor list; triage is the human step, and the tests it produces belong in
+`tests/test_mutation_hardening.py`. Set a per-group threshold once that group's equivalent classes
+have been triaged out — `fee` at 89% is the closest to ready.
