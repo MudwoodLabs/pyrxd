@@ -80,6 +80,88 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   Found by asking one structural question of the whole surface — *is there a check
   present in one arm and absent in its twin?* — rather than by testing behaviour.
+- **The browser inspect tool told readers the opposite of the truth about a
+  disabled relative lock.** For a CSV script carrying bit 31
+  (`SEQUENCE_LOCKTIME_DISABLE_FLAG`) consensus ignores the relative lock
+  entirely, so the output is spendable immediately. The CLI has always printed
+  `*** RELATIVE LOCK DISABLED — SPENDABLE IMMEDIATELY ***` *before* the decoded
+  delay; `docs/inspect_static/inspect/inspect.js` never read
+  `relative_lock_disabled` at all and instead appended *"The spending input's
+  nSequence must carry at least this delay."* These shapes are HTLC refund
+  legs, so the browser was telling a user they had N blocks of protection that
+  nothing enforces. The warning is now rendered on both surfaces, above the
+  delay, in the CLI's wording, with the delay relabelled `(ignored)` and the
+  contradicting structural-match footnote suppressed.
+
+- **The fetched-transaction rows in the browser tool dropped every field added
+  since they were written.** `renderOutputRow` — the path most people reach the
+  tool through — read none of `token_bearing`, `input_refs`, `note`,
+  `child_ref_outpoint`, `script_hash`, `locktime_*`, `variant`,
+  `transferability`, `spendable` or `bound_ref_outpoint`, although a row is the
+  same dict a pasted script produces. A token-bearing `unknown` output rendered
+  as a badge and a sats figure with no burn warning; a dead `container-legacy`
+  output rendered without `child_ref` or `UNSPENDABLE`; a `p2sh` output showed
+  no script hash; a time-lock showed no lock. All are rendered now, with the
+  CLI's wording.
+
+- **`inspect` reported a script as token-bearing when it only *names* a ref.**
+  `_ref_summary` counted the whole ref-operand family
+  `{0xd0, 0xd1, 0xd2, 0xd3, 0xd8}` as evidence the output holds a token. Only
+  `0xd0` `OP_PUSHINPUTREF` and `0xd8` `OP_PUSHINPUTREFSINGLETON` do:
+  `CScript::GetPushRefs` files those into `foundPushRefs` and files
+  `OP_REQUIREINPUTREF` / the two `DISALLOW*` opcodes into the *required* and
+  *disallowed-sibling* sets instead (verified against
+  `tests/vendor/radiant_core/script.cpp:586-607`, v3.1.2). `pyrxd.constants`
+  already drew the distinction — `PUSH_REF_OPCODES` documents that
+  `0xd1/0xd2/0xd3` "must be WALKED but not COLLECTED" — and the code took the
+  walk set. A credential-gate covenant (`OP_REQUIREINPUTREF <ref>`, the idiom
+  in `glyph/soulbound_covenant.py`) therefore came back *"token-bearing: YES —
+  Do NOT spend this as plain funding"* while holding nothing, which is how a
+  reader learns to ignore the warning that is real. The walk still covers all
+  five opcodes — dropping one desynchronises the program counter — but the
+  verdict now counts `PUSH_REF_OPCODES` only, and the gate/disallow refs are
+  reported separately under a new `referenced_refs[]` key as named-not-carried.
+  `dmint.chain.is_token_bearing_script` deliberately keeps counting the whole
+  family: it decides whether a UTXO may be spent as a *fee input*, where
+  over-refusing is free and under-refusing burns a token.
+
+- **`p2pkh-cltv` reported the encoded value as a spendable height; it is one
+  block short.** The value a CLTV script pushes is a floor on the *spending
+  transaction's* `nLockTime`, and `IsFinalTx` is `lockTime < lockTimeLimit`
+  against the height/time of the block *containing* the spend (verified in
+  Radiant-Core `src/consensus/tx_verify.cpp` at commit `45e0aa4`, the tag the
+  vendored consensus corpus pins; `tx_verify.cpp` itself is not part of that
+  corpus, and `ContextualCheckTransactionForCurrentBlock` in
+  `tests/vendor/radiant_core/validation.cpp:3969-3975` documents the
+  containing-block convention). So `spendable at: block height >= H` was wrong
+  by one in the direction that makes a refund leg look available before it is.
+  A new `locktime_earliest` field (`= locktime_units + 1`) carries the first
+  block that can hold the spend, derived once in Python so the CLI, `--json`
+  and the browser cannot disagree about a consensus rule.
+
+- **Wall-clock CLTV scripts were unreachable from both the CLI and the
+  browser.** A CLTV deadline in `[LOCKTIME_THRESHOLD, 2**31)` — every Unix
+  deadline from 1985 to 2038 — encodes as a minimal 4-byte push, making the
+  script exactly 32 bytes, which is 64 hex, which `_classify_input` claimed as
+  a txid before any classifier ran. So `pyrxd glyph inspect
+  0400b955…88ac` answered *"this looks like a txid (64 hex chars)"* for the
+  precise shape the new time-lock classifier exists to explain, and `--fetch`
+  would have sent script bytes to an ElectrumX server as a transaction id. A
+  64-hex string that parses as an **exact** CLTV/CSV P2PKH template is now read
+  as a script. The preference runs the production template parser, not a
+  heuristic: 7 bytes at fixed offsets plus push minimality, so a real txid
+  colliding is ~2^-56 (measured: 0 misroutes in 20,000 random draws). Nothing
+  wider is preferred — `op_return` matches on its first byte alone and would
+  have misrouted 1 txid in 256. One Python-side change; the CLI and the browser
+  both pick it up because both dispatch through `classify_input`.
+
+- **`type=self-replicating-covenant` no longer emits `transferability`.** The
+  two-tier split exists to withhold the soulbound verdict from a marker-only
+  match, and `transferability: "soulbound_covenant"` handed that exact verdict
+  to the only reader — a machine consumer — that never sees the `note` holding
+  the caveat. The key is now absent on that tier; `has_self_replication` and
+  `has_burn_branch` carry the markers it *is* entitled to. The exact-match
+  `soulbound-covenant` tier is unchanged.
 
 ### Changed
 
@@ -165,6 +247,53 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   No assertion was weakened and no production behaviour changed — these are tests for
   checks that were already correct. Each guard group carries an honest-path control, so a
   guard that refused *valid* work would fail too.
+- **A drift guard now executes `docs/inspect_static/inspect/inspect.js`.**
+  Nothing ran that file outside a browser, so both renderer findings above
+  accumulated silently and an earlier `payload.note` gating bug was the same
+  shape. `tests/web/inspect_render_harness.mjs` loads it **verbatim** in a Node
+  `vm` against a stub DOM, and `tests/web/test_inspect_js_render_drift.py`
+  drives 23 shapes — each built by its own production builder, then put through
+  the real `_classify_raw_tx` transaction path — through `renderScriptCard` and
+  `renderOutputRow` and asserts that **every key the Python emits appears in the
+  rendered text**. Deliberate omissions are named with a reason in two tables
+  (`form`, `hex`, `length`); anything else is a test failure. Proved by planting
+  each finding back: deleting the disable warning reddens 6 tests, dropping
+  `script_hash` / `note` / the token-bearing block from `renderOutputRow` reddens
+  14, and adding a brand-new field to the Python that the JS has never heard of
+  reddens 2. Requires `node`; without it the guard **fails** rather than skips
+  unless `PYRXD_SKIP_JS_RENDER_GUARD=1` is set explicitly.
+
+- **`ref_walk_strides` now counts the NAMED operand width, not just the literal.**
+  The comment above `_REF_WALKERS` justified dropping `glyph/soulbound_detect.py`
+  from the registry by saying `test_walker_registry_is_complete` would put it
+  straight back if it hand-rolled a walk again. Measured false: the
+  pre-consolidation walker advanced by `1 + REF_OPERAND_WIDTH`, and the detector
+  only looked for bare `36` / `37`, so it returned **no offenders at all** —
+  copying the old file back passed all 46 walker/respell tests. The detector now
+  also flags a cursor advanced by `REF_OPERAND_WIDTH` in a file that names a ref
+  opcode byte, which makes the claim true (sweeping `src/` flags exactly one
+  file, `glyph/script.py`, which is registered). The comment is corrected to name
+  the test that actually has teeth here —
+  `test_soulbound_opcodes_refuses_a_truncated_ref`, which fails 5 ways on the old
+  file — so the reasoning is kept and accurate rather than deleted.
+
+- **A time-lock parser test could not fail.** `test_parser_returns_none_on_junk_and_never_raises`
+  asserted `result is None or result.kind in ("cltv", "csv")`; `kind` is only ever
+  assigned those two strings, so a parser that fabricated a time-lock for *every*
+  input including `b""` still passed. Split into per-input `is None` assertions
+  and, for the random-bytes half, a property that a fabricator fails: anything
+  the parser claims must be readable back out of the bytes at the offsets the
+  template pins. Verified by planting exactly that fabricating parser — 7 tests
+  go red.
+
+- `tests/web/test_inspect_imports_pyodide_clean.py` now restores `sys.modules`
+  after each test. It evicts every `pyrxd.*` entry to measure a cold import
+  graph, and the eviction leaked: a module holding a pre-clear
+  `ValidationError` no longer catches the post-clear one raised through a lazy
+  import, so `_inspect_script` **raised** instead of classifying. Alphabetical
+  collection hid it (`tests/web` sorts last), which is a property of the
+  directory name; running `pytest tests/web tests/test_inspect_script_shapes.py`
+  by hand reddened 47 unrelated tests.
 
 - **The relay-floor boundary searches in `test_remaining_builder_floors_regtest_e2e.py`
   failed ~14% of the time for reasons that had nothing to do with the code under test.**
