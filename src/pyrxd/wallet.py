@@ -142,6 +142,14 @@ class RxdWallet:
         of mainnet's rate. Never a way to make a mainnet wallet stop
         complaining: every send it builds would be refused by every node, and
         with no RBF and no CPFP could not be repaired.
+    allow_overpay:
+        The mirror opt-out, for a ``fee_rate`` above the overpay ceiling
+        (:data:`~pyrxd.fee_sizing.MAX_FEE_OVERPAY_MULTIPLE` x the relay floor).
+        Without it the ceiling is absolute, which is its own fund-safety bug: a
+        deliberate high rate — a fee war, a chain whose floor pyrxd has not been
+        taught, a caller who genuinely wants to outbid — would be refused with no
+        way through, and on a chain with neither RBF nor CPFP a refusal during a
+        timelock race costs the funds the ceiling was protecting.
     allow_insecure:
         Pass-through to :class:`ElectrumXClient`. Only set for local dev.
     """
@@ -153,6 +161,7 @@ class RxdWallet:
         fee_rate: int = DEFAULT_FEE_RATE,
         *,
         allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
         allow_insecure: bool = False,
     ) -> None:
         if not isinstance(private_key, PrivateKey):
@@ -174,6 +183,7 @@ class RxdWallet:
             fee_rate,
             what="RxdWallet",
             allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
             error_type=ValidationError,
         )
 

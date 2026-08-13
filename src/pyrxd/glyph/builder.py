@@ -1086,7 +1086,11 @@ class GlyphBuilder:
         #    transaction that is internally consistent, passes every later assertion,
         #    and is refused by every node on the network. Same no-opt-out refusal the
         #    FT builders next door already make, via the same shared implementation.
-        assert_fee_rate_clears_relay_floor(params.fee_rate, what="build_nft_transfer_tx")
+        assert_fee_rate_clears_relay_floor(
+            params.fee_rate,
+            what="build_nft_transfer_tx",
+            allow_overpay=params.allow_overpay,
+        )
 
         # 1. Validate input script shape and extract ref.
         #    extract_ref_from_nft_script raises ValidationError if len != 63 or
@@ -1845,6 +1849,15 @@ class TransferParams:
     :param new_owner_pkh:  recipient's 20-byte public-key hash
     :param private_key:    pyrxd.keys.PrivateKey — current owner's signing key
     :param fee_rate:       photons per byte (Radiant post-V2 minimum is 10_000)
+    :param allow_overpay:  accept a ``fee_rate`` above the overpay ceiling
+                           (:data:`~pyrxd.fee_sizing.MAX_FEE_OVERPAY_MULTIPLE` x the
+                           relay floor). The deliberate, greppable opt-out — the
+                           ceiling is here because THIS builder has no change
+                           output, so a mistaken rate leaves entirely with the
+                           miner (measured: 23.2 RXD off a 229-byte transfer at
+                           ``fee_rate=10_000_000``), but a ceiling with no way
+                           through refuses valid work, and Radiant has neither RBF
+                           nor CPFP to repair a refusal that came too late.
 
     .. note::
        There is no ``royalty`` here, unlike :class:`FtTransferParams`. This
@@ -1864,6 +1877,7 @@ class TransferParams:
     new_owner_pkh: Hex20
     private_key: Any
     fee_rate: int = MIN_FEE_RATE
+    allow_overpay: bool = False
 
 
 @dataclass
