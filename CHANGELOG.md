@@ -98,6 +98,46 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tests
 
+- **Fourteen fund-safety guards in the HTLC atomic-swap stack could be deleted with the
+  suite staying green; `tests/test_swap_gate_binding.py` now pins each one.** The swap
+  modules (`gravity/`, `swap/rswp/`, `btc_wallet/htlc_leg.py`) had never been
+  mutation-tested — `task mutate` covers only `spv/`, `script/`, `transaction/` and
+  `glyph/dmint/`. A hand-mutation sweep planted 104 defects across the surface and ran the
+  1,606-test swap suite against each; 14 of them survived a check that a real caller
+  depends on. Every new test names the mutant it kills, and each was proved by planting
+  that defect and watching the suite go from green to red.
+
+  The pattern behind the worst of them: several coordinator steps **broadcast before they
+  advance the FSM**, so `advance()` is not a backstop — it raises only after the on-chain
+  effect. On those paths the method's own `state is …` precondition is the only thing
+  between a wrong-state call and an irreversible broadcast. In `maker_claims_btc` that
+  broadcast publishes the preimage `p`: with the precondition removed, a maker at
+  `BTC_LOCKED` — its own asset not yet locked, and therefore never through
+  `post_asset_lock_revalidate`'s counter-funding and credential gates — reveals `p` and
+  sweeps the taker's HTLC, a one-sided taker loss of the full `btc_sats`. Nothing tested
+  it. The same shape held for `maybe_refund_asset_on_maker_stall` (broadcasts the covenant
+  CSV refund first), `mutual_refund` and `taker_refund_btc`.
+
+  The other survivors: the taker's asset-funding re-verification *after*
+  `pre_btc_lock_check` returns (the existing TOCTOU test is satisfied by the gate call
+  inside `taker_funds_btc`, so deleting the re-run left it green — the new test vanishes
+  the covenant during the intent-persist await, which is the window the re-run actually
+  owns); `taker_funds_btc`'s `NEGOTIATED` precondition, whose apparent backstop — the
+  H reserve — is only as durable as the explicitly non-durable seen-store, so a restart
+  re-funds; the lock-time re-verify's replacement of the recorded counter locator with the
+  leg's own re-derivation; the `finalized`-checkpoint pin on a **measured** ETH policy (only
+  the estimated `latest` half was covered); the claim-tx provenance bind in
+  `taker_observed_reveal` and `taker_claim_asset_from_vulnerable` (the existing foreign-reveal
+  test uses a different `H`, so the scrape fails before provenance is reached — the new tests
+  use a genuine same-`H` claim from another outpoint, which only the outpoint bind can
+  reject); the `sha256(p) == H` re-derivation over the leg's `scrape_secret` answer; and two
+  `NegotiatedTerms` construction guards (BTC `value_amount` diverging from `btc_sats`, and a
+  `credential_ref` that is neither empty nor a full 36-byte singleton ref).
+
+  No assertion was weakened and no production behaviour changed — these are tests for
+  checks that were already correct. Each guard group carries an honest-path control, so a
+  guard that refused *valid* work would fail too.
+
 - **The relay-floor boundary searches in `test_remaining_builder_floors_regtest_e2e.py`
   failed ~14% of the time for reasons that had nothing to do with the code under test.**
   Landing exactly on the floor is a search, not a solve: the fee is part of the signed
