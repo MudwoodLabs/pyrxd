@@ -264,6 +264,31 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `localhost.evil.com`, `0.0.0.0`, `127.1` and LAN addresses keep the rule, and
   a *remote* plaintext or unpinned endpoint is still refused.
 
+- **The watchtower never told an ETH↔RXD taker that its counter-leg refund was
+  due.** `decide()`'s BTC arm has a `BTC_LOCKED` branch — maker never locked the
+  asset, so page `PAGE_REFUND` once the taker's BTC funding buries past `t_btc`
+  — and `_decide_eth` had no such branch at all. Since `taker_funds_btc` is the
+  funding step for **both** counter-chains and advances to `BTC_LOCKED`, an ETH
+  swap whose maker locks nothing sits in exactly that state with the taker's ETH
+  HTLC funded. It fell through to the catch-all `Intent.WATCH`, which the
+  reconciler does not route to any handler: no page, no webhook, no heartbeat
+  count — silence, every tick, for the whole life of the swap, while
+  `taker_refund_btc` (valid from `BTC_LOCKED`) sat unrecommended.
+
+  Fixed by giving the ETH arm the branch its BTC twin always had. ETH maturity is
+  the **absolute** `eth_timeout_unix_s` contract immutable rather than a
+  confirmation depth, so `Observations` gained an optional `now_unix_s` — the ETH
+  analogue of `btc_funding_confirmations` — populated by `ChainObserver` from an
+  injectable clock (defaulting to `time.time`, read only on the ETH path).
+  Fail-closed in the *same direction* as the BTC arm, which watches rather than
+  pages on an unread funding depth: an absent clock, terms without a deadline, or
+  an on-chain asset lock observed despite the stale record all yield `WATCH`, so
+  an alert-only tower cannot be made to cry wolf on every healthy pre-lock tick.
+  `autonomous_btc_refund` stays `False` — that discriminator arms the BTC keyless
+  pre-signed refund and has no ETH counterpart, so this remains alert-only.
+
+  Found by asking one structural question of the whole surface — *is there a check
+  present in one arm and absent in its twin?* — rather than by testing behaviour.
 - **The browser inspect tool told readers the opposite of the truth about a
   disabled relative lock.** For a CSV script carrying bit 31
   (`SEQUENCE_LOCKTIME_DISABLE_FLAG`) consensus ignores the relative lock
@@ -482,6 +507,45 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Tests
 
+- **Fourteen fund-safety guards in the HTLC atomic-swap stack could be deleted with the
+  suite staying green; `tests/test_swap_gate_binding.py` now pins each one.** The swap
+  modules (`gravity/`, `swap/rswp/`, `btc_wallet/htlc_leg.py`) had never been
+  mutation-tested — `task mutate` covers only `spv/`, `script/`, `transaction/` and
+  `glyph/dmint/`. A hand-mutation sweep planted 104 defects across the surface and ran the
+  1,606-test swap suite against each; 14 of them survived a check that a real caller
+  depends on. Every new test names the mutant it kills, and each was proved by planting
+  that defect and watching the suite go from green to red.
+
+  The pattern behind the worst of them: several coordinator steps **broadcast before they
+  advance the FSM**, so `advance()` is not a backstop — it raises only after the on-chain
+  effect. On those paths the method's own `state is …` precondition is the only thing
+  between a wrong-state call and an irreversible broadcast. In `maker_claims_btc` that
+  broadcast publishes the preimage `p`: with the precondition removed, a maker at
+  `BTC_LOCKED` — its own asset not yet locked, and therefore never through
+  `post_asset_lock_revalidate`'s counter-funding and credential gates — reveals `p` and
+  sweeps the taker's HTLC, a one-sided taker loss of the full `btc_sats`. Nothing tested
+  it. The same shape held for `maybe_refund_asset_on_maker_stall` (broadcasts the covenant
+  CSV refund first), `mutual_refund` and `taker_refund_btc`.
+
+  The other survivors: the taker's asset-funding re-verification *after*
+  `pre_btc_lock_check` returns (the existing TOCTOU test is satisfied by the gate call
+  inside `taker_funds_btc`, so deleting the re-run left it green — the new test vanishes
+  the covenant during the intent-persist await, which is the window the re-run actually
+  owns); `taker_funds_btc`'s `NEGOTIATED` precondition, whose apparent backstop — the
+  H reserve — is only as durable as the explicitly non-durable seen-store, so a restart
+  re-funds; the lock-time re-verify's replacement of the recorded counter locator with the
+  leg's own re-derivation; the `finalized`-checkpoint pin on a **measured** ETH policy (only
+  the estimated `latest` half was covered); the claim-tx provenance bind in
+  `taker_observed_reveal` and `taker_claim_asset_from_vulnerable` (the existing foreign-reveal
+  test uses a different `H`, so the scrape fails before provenance is reached — the new tests
+  use a genuine same-`H` claim from another outpoint, which only the outpoint bind can
+  reject); the `sha256(p) == H` re-derivation over the leg's `scrape_secret` answer; and two
+  `NegotiatedTerms` construction guards (BTC `value_amount` diverging from `btc_sats`, and a
+  `credential_ref` that is neither empty nor a full 36-byte singleton ref).
+
+  No assertion was weakened and no production behaviour changed — these are tests for
+  checks that were already correct. Each guard group carries an honest-path control, so a
+  guard that refused *valid* work would fail too.
 - **Mutation testing reaches the transaction builders for the first time
   (`task mutate builders`).** `fee_sizing.py`, `glyph/ft.py`,
   `glyph/royalty.py`, `glyph/builder.py`, `wallet.py` and `hd/wallet.py` — 1,479
