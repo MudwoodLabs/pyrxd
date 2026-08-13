@@ -6,6 +6,7 @@
 #   scripts/mutation_test.sh script         # script/ primitives
 #   scripts/mutation_test.sh transaction    # transaction/ incl. FORKID sighash preimage
 #   scripts/mutation_test.sh dmint          # glyph/dmint/ covenant builders + DAA + parser
+#   scripts/mutation_test.sh network        # network/ trust boundary with an untrusted server
 #   scripts/mutation_test.sh all            # every group, sequentially
 #
 # Scope by group (why these files — the verification/byte-exact arithmetic):
@@ -20,6 +21,13 @@
 #   dmint        builders.py (covenant script bytes), chain.py (state re-derivation parse),
 #                types.py (params validation/CBOR), miner.py (DAA target arithmetic + mint
 #                tx/preimage construction).
+#   network      the trust boundary with a server we do not control. Consensus protects
+#                nothing here: whether a lying ElectrumX / Esplora / Bitcoin Core endpoint can
+#                move value rests entirely on _guards.py (fail-closed coercions), the
+#                request<->response bindings in electrumx.py + bitcoin.py, confirm.py's depth
+#                gate, tls_pin.py + registry.py (which server, on which chain, under which
+#                pin), and failover.py (which of those may be relaxed on a retry). rxindexer.py
+#                and chaintracker.py are excluded: thin passthroughs with no decision in them.
 #
 # Mechanism: cosmic-ray mutates src/pyrxd/<path>.py IN PLACE (the editable install picks it up),
 # runs the module-targeted tests, then we restore the file via git. A trap restores the whole
@@ -47,6 +55,7 @@ group_files() {
     script)      echo "script/script script/timelock script/type" ;;
     transaction) echo "transaction/transaction transaction/transaction_input transaction/transaction_output transaction/transaction_preimage" ;;
     dmint)       echo "glyph/dmint/builders glyph/dmint/chain glyph/dmint/types glyph/dmint/miner" ;;
+    network)     echo "network/_guards network/confirm network/tls_pin network/registry network/failover network/electrumx network/bitcoin" ;;
     *)           return 1 ;;
   esac
 }
@@ -61,6 +70,7 @@ group_tests() {
     script)      echo "tests/test_mutation_hardening.py tests/test_script.py tests/test_timelock.py tests/test_covenant.py tests/test_glyph_timelock.py tests/test_transaction.py tests/test_preimage.py tests/test_htlc_spend.py $GAPS" ;;
     transaction) echo "tests/test_mutation_hardening.py tests/test_transaction.py tests/test_preimage.py tests/test_htlc_spend.py tests/test_glyph_transfer.py tests/test_ft_transfer.py tests/test_swap_partial.py tests/test_swap_resolve.py $GAPS tests/test_fuzz_parsers.py tests/test_preimage_differential.py" ;;
     dmint)       echo "tests/test_mutation_hardening.py tests/test_dmint_module.py tests/test_glyph_dmint.py tests/test_dmint_v2_canonical.py tests/test_dmint_v2_daa_canonical.py tests/test_dmint_conformance_vectors.py tests/test_dmint_v2_mainnet_golden.py tests/test_dmint_daa_offchain_onchain_differential.py tests/test_dmint_v1_deploy.py tests/test_dmint_v1_mint.py tests/test_dmint_end_to_end.py tests/test_dmint_deploy_integration.py $GAPS tests/test_dmint_vector_derivations.py" ;;
+    network)     echo "tests/security/test_untrusted_server_invariants.py tests/security/test_hostile_server_responses.py tests/network/ tests/test_network_bitcoin.py tests/test_mempool_adapters.py tests/test_watch_adapters.py tests/test_watch_rxd_quorum.py tests/test_endpoint_diversity.py tests/test_rswp_rxindexer_source.py tests/test_swap_resolve.py tests/test_coverage_gaps6.py" ;;
   esac
 }
 
@@ -68,22 +78,23 @@ group_tests() {
 # mutant still gets a fair run while true hangs are bounded.
 group_timeout() {
   case "$1" in
-    spv)    echo "30.0" ;;
-    script) echo "30.0" ;;
+    spv)     echo "30.0" ;;
+    script)  echo "30.0" ;;
+    network) echo "30.0" ;;
     *)      echo "45.0" ;;
   esac
 }
 
 GROUPS_REQUESTED="${*:-spv}"
-[ "$GROUPS_REQUESTED" = "all" ] && GROUPS_REQUESTED="spv script transaction dmint"
+[ "$GROUPS_REQUESTED" = "all" ] && GROUPS_REQUESTED="spv script transaction dmint network"
 for g in $GROUPS_REQUESTED; do
-  group_files "$g" >/dev/null || { echo "unknown group: $g (use spv|script|transaction|dmint|all)"; exit 2; }
+  group_files "$g" >/dev/null || { echo "unknown group: $g (use spv|script|transaction|dmint|network|all)"; exit 2; }
 done
 
 WORK="${MUTATION_SESSION_DIR:-$(mktemp -d)}"
 mkdir -p "$WORK"
 cleanup() {
-  git checkout -- src/pyrxd/spv/ src/pyrxd/script/ src/pyrxd/transaction/ src/pyrxd/glyph/dmint/ 2>/dev/null
+  git checkout -- src/pyrxd/spv/ src/pyrxd/script/ src/pyrxd/transaction/ src/pyrxd/glyph/dmint/ src/pyrxd/network/ 2>/dev/null
   [ -z "${MUTATION_SESSION_DIR:-}" ] && rm -rf "$WORK"
 }
 trap cleanup EXIT
