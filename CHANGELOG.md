@@ -91,6 +91,48 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **The BTC tip-height quorum refused ordinary block propagation.** Tip height
+  is the one value in `BtcDataSource` that honest sources on the same chain
+  legitimately disagree about — a block takes time to reach every endpoint — yet
+  it was read through `_require_quorum`, which demands an EXACT match. Measured:
+  `quorum=1` with `[900000, 900001]`, and `quorum=2` with
+  `[900000, 900000, 900001, 900001]`, both raised `NetworkError: Sources
+  disagree`. The caller is `gravity.trade`'s BTC confirmation-wait loop on a
+  chain with neither RBF nor CPFP, so a one-block skew aborted an HTLC
+  confirmation wait — a guard refusing valid work, during a timelock race, over
+  the funds it was protecting. `get_tip_height` no longer demands an exact
+  match: heights are monotone (reporting `H` asserts "the chain reached at least
+  `H`"), so it returns the largest height a strict **majority** of the
+  responding sources corroborate, floored at `quorum`. A lying minority still
+  cannot inflate the tip (an inflated tip overstates confirmation depth) — and,
+  unlike a plain `min()`, still cannot deflate it either, so one stuck source
+  reporting height 0 can no longer stall every wait behind it.
+
+- **`_require_quorum` never implemented a majority, and its fix handed a
+  colluding pair a veto.** It originally returned the FIRST group to reach the
+  quorum in source order, so two colluding sources placed early beat three
+  honest ones. Closing that by refusing whenever more than one group reached the
+  quorum swapped a wrong answer for no answer: measured, three honest sources at
+  height 100 against two colluding at 999 raised `NetworkError` at `quorum=2`
+  **regardless of order** — still a minority deciding the outcome, and
+  availability is an attack surface. The largest qualifying group now wins.
+  An exact tie still fails closed, deliberately: a lying source chooses what it
+  reports, so any tie-break on the value itself is grindable, and the refusal
+  depends only on the multiset of answers, never on source order.
+
+- **`NetworkProfile` refused a local indexer beside a public endpoint.** The
+  uniformity rule that stops failover silently downgrading `wss://` to plaintext
+  (or dropping an SPKI pin) counted `ws://127.0.0.1` as the downgrade, so
+  `["ws://127.0.0.1:50001", "wss://public:50022"]` was rejected even with
+  `allow_insecure=True` — the ordinary developer and operator layout. Loopback
+  endpoints are now exempt from both halves of the rule, and are the only
+  exemption: a loopback session never leaves the host, so there is no link to
+  eavesdrop and no remote identity for TLS or a pin to authenticate (the same
+  judgement `Endpoint` already encodes by calling `spki_pins` on a plaintext URL
+  "meaningless"). The check fails closed — `127.0.0.1.evil.com`,
+  `localhost.evil.com`, `0.0.0.0`, `127.1` and LAN addresses keep the rule, and
+  a *remote* plaintext or unpinned endpoint is still refused.
+
 - **The browser inspect tool told readers the opposite of the truth about a
   disabled relative lock.** For a CSV script carrying bit 31
   (`SEQUENCE_LOCKTIME_DISABLE_FLAG`) consensus ignores the relative lock
