@@ -11,10 +11,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Mutation testing now covers the value-moving modules, not just the
   consensus-critical ones.** `task mutate` measured `spv/`, `script/`,
   `transaction/` and `glyph/dmint/` — the byte-exact arithmetic — and nothing
-  that decides *how much* value moves or *to whom*. Six new groups close that:
-  `fee` (`fee_sizing.py`), `wallet` (`wallet.py` + `hd/wallet.py`), `glyph`
-  (`glyph/ft.py` + `glyph/builder.py`), `swap` (`gravity/htlc_spend.py` +
-  `swap/rswp/orders.py`), `coordinator` (`gravity/swap_coordinator.py`) and
+  that decides *how much* value moves or *to whom*. Seven new groups close that:
+  `fee` (`fee_sizing.py`), `wallet` (`wallet.py`), `hdwallet` (`hd/wallet.py`),
+  `glyph` (`glyph/ft.py` + `glyph/builder.py`), `swap` (`gravity/htlc_spend.py`
+  + `swap/rswp/orders.py`), `coordinator` (`gravity/swap_coordinator.py`) and
   `network` (`network/`). `task mutate consensus` and `task mutate value` run
   the old and new sets; existing groups keep their file lists, test commands
   and timeouts verbatim so their published baselines stay comparable.
@@ -32,9 +32,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **`.github/workflows/mutation.yml`** — a weekly scheduled lane, one parallel
   job per group, uploading the survivor list and session databases as
-  artifacts. Deliberately not per-push: the cost is (mutant count) × (suite wall
-  time) and the value scope alone is ~5 500 mutants. Report-only, with no
-  kill-rate threshold, because a large share of survivors are equivalent mutants
+  artifacts. Deliberately not per-push: the measured cost is 5 h 36 m of compute,
+  16-104 minutes per group. One job per group because cosmic-ray edits
+  `src/pyrxd` in place, so groups cannot share a checkout — separate runners also
+  turn 5 h 36 m of compute into 1 h 44 m of wall clock. Report-only, with no
+  kill-rate threshold, because a third of the survivors are equivalent mutants
   that cannot be killed.
 
 - **`scripts/mutation_survivors.py`** — renders a cosmic-ray session database as
