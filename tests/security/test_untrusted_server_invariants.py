@@ -443,6 +443,38 @@ async def test_electrumx_reader_still_dispatches_a_real_integer_id() -> None:
             assert int(await client.get_tip_height()) == 840_000
 
 
+# ── an unbounded frame is not a response ─────────────────────────────────────
+
+
+@pytest.mark.parametrize("as_bytes", [False, True], ids=["text_frame", "binary_frame"])
+async def test_electrumx_reader_refuses_an_oversized_frame(as_bytes: bool) -> None:
+    """The 10 MB cap is checked before ``json.loads``, on BOTH frame types, and neither
+    branch had a test.
+
+    A server that answers one RPC with an arbitrarily large frame otherwise gets that whole
+    frame decoded and parsed in the client's process — and it is a *read*, so the cost lands
+    on any wallet that merely queries a balance. Over the cap the connection is dropped and
+    every in-flight call fails; it must not be parsed and must not hang.
+    """
+    ws = AsyncMock()
+    ws.send = AsyncMock(return_value=None)
+    oversized: Any = b"a" * (10 * 1024 * 1024 + 1) if as_bytes else "a" * (10 * 1024 * 1024 + 1)
+    frames = [oversized]
+
+    async def _recv(*_a, **_kw):
+        if frames:
+            return frames.pop(0)
+        await asyncio.Event().wait()
+        return None  # pragma: no cover - unreachable
+
+    ws.recv = _recv
+    ws.close = AsyncMock(return_value=None)
+    with patch_connect(ws):
+        async with ElectrumXClient(["wss://example.com"], timeout=5.0) as client:
+            with pytest.raises(NetworkError, match="exceeds maximum allowed size"):
+                await client.get_tip_height()
+
+
 # ── a block header is 80 bytes or it is not a block header ───────────────────
 
 

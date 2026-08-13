@@ -105,20 +105,39 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   now mutates `_guards`, `confirm`, `tls_pin`, `registry`, `failover`, `electrumx` and
   `bitcoin` (2,631 mutants) against a targeted test list.
 
-  A hand-mutation sweep of 77 load-bearing guards across the whole boundary —
-  `network/`, `swap/rswp/node_rpc.py`, `gravity/watch/adapters.py` — neutered each one in
-  turn (`if False:`, an inverted comparison, a widened match) and ran the suite. Seven
-  survived. The sharpest was `_verify_raw_matches_txid`, the audit-F-004 binding that
-  makes a source prove the bytes it returned really are the transaction that was asked
-  for: setting its comparison to `if False:` left the entire suite green at all four call
-  sites. Also unpinned: ElectrumX's 80-byte block-header length check, `normalize_pin`'s
-  `validate=True` (without it a mistyped pin silently decodes to a well-formed pin for a
-  key nobody holds), the empty-scriptPubKey / negative-value refusal in
-  `read_confirmed_unspent_output`, and `MultiSourceRxdChainSource.corroborated` — the
-  property the `ChainObserver` reads to justify `rxd_corroborated=True`, which could be
-  made to return `True` over a single source with nothing objecting.
+  A hand-mutation sweep of **113 load-bearing guards** across the whole boundary —
+  `network/`, `swap/rswp/node_rpc.py`, `swap/rswp/rxindexer_source.py`,
+  `gravity/watch/adapters.py` — neutered each one in turn (`if False:`, an inverted
+  comparison, a widened match) and ran the suite. **Twelve survived; eleven were real.**
+  The sharpest was `_verify_raw_matches_txid`, the audit-F-004 binding that makes a source
+  prove the bytes it returned really are the transaction that was asked for: setting its
+  comparison to `if False:` left the entire suite green at all four call sites. Also
+  unpinned:
 
-  `tests/security/test_untrusted_server_invariants.py` (65 tests) is the sibling of
+  - ElectrumX's 80-byte block-header length check, and the 10 MB frame cap on both
+    branches of the reader loop;
+  - the reader loop's integer-id check (which also turned out to have the `"id": true`
+    hole above);
+  - `normalize_pin`'s `validate=True` — without it a mistyped pin silently decodes to a
+    well-formed pin for a key nobody holds;
+  - the empty-scriptPubKey / negative-value refusal in `read_confirmed_unspent_output`;
+  - `MultiSourceRxdChainSource.corroborated`, the property the `ChainObserver` reads to
+    justify `rxd_corroborated=True`, which could be made to return `True` over a single
+    source with nothing objecting;
+  - `RxindexerOrderbookSource.is_unspent`'s `(tx_hash, tx_pos)` match — relaxing it to
+    "is anything live on this script?" passed, so a maker who spent the offered output and
+    re-funded the same address would still have shown as fillable — and its `limit` clamp;
+  - `NodeRpcSource`'s non-string `getrawtransaction` guard (a raw `TypeError` from
+    `bytes.fromhex(None)` escapes every `except NetworkError` above it) and its HTTP-status
+    check (a 5xx body carrying a `result` and no `error` was read as an answer).
+
+  A full cosmic-ray sweep of `_guards.py` (85 mutants) scored 70 killed / 15 survived;
+  all 15 triaged as benign — 12 mutate the `int | None` *annotation*, which
+  `from __future__ import annotations` never evaluates, and the other 3 are unreachable
+  from any call site (`len(value) % 2` with `nbytes` always 32, `!=` → `is not` on
+  CPython-interned small ints).
+
+  `tests/security/test_untrusted_server_invariants.py` (67 tests) is the sibling of
   `test_hostile_server_responses.py`: that file sweeps the *shape* of a field, this one
   asks whether a well-formed response is an answer to the question that was actually
   asked. Every refusal is paired with an honest response that must still be accepted — a

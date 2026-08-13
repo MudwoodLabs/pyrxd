@@ -13,6 +13,7 @@ poetry run task mutate                    # default scope: spv (the original gat
 poetry run task mutate script             # script/ primitives
 poetry run task mutate transaction        # transaction/ incl. the FORKID sighash preimage
 poetry run task mutate dmint              # glyph/dmint/ covenant builders + DAA + parser
+poetry run task mutate network            # network/ trust boundary with an untrusted server
 poetry run task mutate all                # everything, sequentially (hours)
 ```
 
@@ -33,6 +34,22 @@ Useful environment knobs:
 > slower per mutant), `__init__.py` re-export shims, `script/unlocking_template.py` (17-line ABC), and
 > `glyph/dmint/__init__.py`. The whole-file scope for `glyph/dmint/miner.py` includes the mining
 > dispatch loops; their kills come mostly from the DAA/preimage tests, not the multiprocessing paths.
+> In `network`, `rxindexer.py` and `chaintracker.py` are excluded as thin passthroughs with no
+> decision in them.
+
+### Why `network` is in scope
+
+The other four scopes protect arithmetic a *node* would eventually reject. `network` protects the
+one place where nothing else will: consensus does not defend an SPV client against a server that
+answers truthfully but about the wrong thing. Whether a lying ElectrumX / Esplora / Bitcoin Core
+endpoint can move value rests entirely on `_guards.py` (fail-closed coercions), the
+request↔response bindings in `electrumx.py` and `bitcoin.py`, `confirm.py`'s depth gate,
+`tls_pin.py` + `registry.py` (which server, on which chain, under which pin) and `failover.py`
+(which of those may be relaxed on a retry).
+
+Two files that are part of the same trust boundary sit outside the group because they are not under
+`network/`: `swap/rswp/node_rpc.py` and `gravity/watch/adapters.py`. Both were hand-mutated in the
+2026-08 sweep (see below); a future scope extension should fold them in.
 
 ## Scopes and test commands
 

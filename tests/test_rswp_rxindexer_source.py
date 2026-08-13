@@ -393,3 +393,49 @@ async def test_end_to_end_through_orderbook_client_is_fillable() -> None:
         fee_policy=_TOY_FEE_POLICY,
     )
     assert tx_out is not None
+
+
+# --------------------------------------------------------------------------- liveness binds to the OUTPOINT
+
+
+async def test_is_unspent_false_for_a_different_outpoint_on_the_same_script() -> None:
+    """The liveness gate must answer about the OFFERED outpoint, not about its script.
+
+    ``is_unspent`` derives the ElectrumX script hash from the offered output's locking
+    script and then reads ``listunspent`` for it — so every UTXO paying that same script
+    comes back, including ones that have nothing to do with this order. A maker can spend
+    the offered output and re-fund the same address (that is one ordinary transaction),
+    and a gate that only asked "is anything live here?" would still report the consumed
+    offer as fillable. Neutering the ``(tx_hash, tx_pos)`` match to ``len(utxos) > 0``
+    left the whole suite green, so this pins it.
+    """
+    _mk, mk_pkh = _key()
+    src = _rxd_src(mk_pkh, 1000)
+    transport = FakeTransport()
+    transport.add_tx(src)
+    # Same locking script, DIFFERENT outpoints — the shape a re-funded address produces.
+    transport.utxos[bytes(_script_hash_of(src, 0))] = [
+        UtxoRecord(tx_hash="ff" * 32, tx_pos=0, value=1000, height=9),
+        UtxoRecord(tx_hash=src.txid(), tx_pos=7, value=1000, height=9),
+    ]
+    source = RxindexerOrderbookSource(transport=transport)
+    assert await source.is_unspent(src.txid(), 0) is False
+
+
+async def test_get_open_orders_clamps_to_the_requested_limit() -> None:
+    """RM-1: a source that ignores ``limit`` must not set the per-row fetch+decode workload.
+
+    Every discovery row costs an independent transaction fetch and a full RSWP decode, so
+    an index answering a ``limit=1`` browse with 500 rows would buy unbounded work with one
+    request. The clamp is client-side for exactly that reason.
+    """
+    tx, _order, _src = _make_rxd_offer_ft_want_order()
+    transport = FakeTransport()
+    transport.add_tx(tx)
+    transport.extension_responses["swap.get_orders"] = [
+        {"tx_hash": tx.txid(), "vout": 0, "height": 1} for _ in range(5)
+    ]
+    source = RxindexerOrderbookSource(transport=transport)
+
+    assert len(await source.get_open_orders(RXD_TOKEN_ID.hex(), limit=2)) == 2
+    assert len(await source.get_open_orders(RXD_TOKEN_ID.hex(), limit=0)) == 0
