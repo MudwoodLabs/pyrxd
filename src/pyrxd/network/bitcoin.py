@@ -896,6 +896,7 @@ class MultiSourceBtcDataSource(BtcDataSource):
         construction.)
         """
         counts: dict = {}
+        non_responders = sum(1 for r in results if isinstance(r, Exception))
         for r in results:
             if isinstance(r, Exception):
                 continue
@@ -906,15 +907,31 @@ class MultiSourceBtcDataSource(BtcDataSource):
         if agreed:
             best = max(len(group) for group in agreed)
             winners = [group for group in agreed if len(group) == best]
-            if len(winners) == 1:
-                return winners[0][0]
-            raise NetworkError(
-                f"Sources disagree: {len(winners)} DIFFERENT values are tied at {best} source(s) "
-                f"each (quorum {self._quorum} of {len(self._sources)}). These reads are "
-                "deterministic, so a tie means half the sources are lying or on another chain; "
-                "refusing to pick one, because a lying source chooses what it reports and would "
-                "win any tie-break on the value itself. Fail-closed."
-            )
+            if len(winners) != 1:
+                raise NetworkError(
+                    f"Sources disagree: {len(winners)} DIFFERENT values are tied at {best} source(s) "
+                    f"each (quorum {self._quorum} of {len(self._sources)}). These reads are "
+                    "deterministic, so a tie means half the sources are lying or on another chain; "
+                    "refusing to pick one, because a lying source chooses what it reports and would "
+                    "win any tie-break on the value itself. Fail-closed."
+                )
+            # SILENCE IS NOT CORROBORATION. The winning group must outvote every source that did
+            # not back it — including the ones that answered nothing. A source that failed to
+            # respond might have disagreed, and an attacker does not have to out-argue an honest
+            # endpoint it can simply make unreachable (public endpoints rate-limit; a network
+            # partition is indistinguishable from an outage). Counting only RESPONDERS let a
+            # minority of the configured set win by attrition: measured, 3 lying sources of 7 at
+            # quorum=2 returned their forged value once 2 honest endpoints were down.
+            if best <= len(self._sources) - best:
+                raise NetworkError(
+                    f"Source quorum not reached: the leading value is backed by {best} of "
+                    f"{len(self._sources)} configured sources, which is not a majority "
+                    f"({non_responders} did not respond). These reads are deterministic, so a "
+                    "source that did not answer cannot be counted as agreeing — refusing rather "
+                    "than letting a minority decide a value while the rest are unreachable. "
+                    "Fail-closed."
+                )
+            return winners[0][0]
 
         successful = sum(1 for r in results if not isinstance(r, Exception))
         raise NetworkError(
@@ -961,23 +978,49 @@ class MultiSourceBtcDataSource(BtcDataSource):
           :meth:`MultiSourceBtcFundingReader.confirmations`, applied to whichever block the
           majority has actually seen.
 
-        Availability is unchanged: fewer than ``quorum`` sources answering at all still fails
-        closed, and ``quorum`` remains a floor, so ``quorum == len(sources)`` still means
-        unanimity-or-nothing (there, ``r`` is every source and the answer is the minimum).
+        **The majority is over the CONFIGURED sources, not the ones that answered.** Counting
+        only responders let an attacker win by attrition rather than by argument: it does not
+        have to out-vote an honest endpoint it can make unreachable, and a rate-limited public
+        endpoint is indistinguishable from a suppressed one. ``quorum`` stays as the availability
+        gate — that many sources must answer — but it no longer decides the *value*, because
+        raising it above a majority used to make the result MORE deflatable, not less: at 5
+        sources with ``quorum=5`` the answer was ``heights[4]``, the minimum, so one source
+        reporting 0 returned 0. That is the exact ``min()`` failure this method was written to
+        avoid, reappearing in the configuration an operator would choose for *more* assurance.
+
+        **The cost, stated rather than buried.** Discarding the lowest ``len(sources) - r``
+        readings is what makes a stuck or lying source unable to drag the tip down — but those
+        same readings are where genuine pessimism lives. Three honest sources reporting
+        900_002 / 900_001 / 900_000 now yield **900_001**, not the minimum 900_000, so a depth
+        computed as ``tip - tx_height`` can read one block deeper than the most cautious source
+        would say. That is the exchange: tolerate up to ``len(sources) - r`` malicious or stuck
+        sources, and accept a tip up to that many propagation steps above the absolute floor.
+        It cannot be had both ways — honouring the lowest reading *is* what let one source
+        reporting 0 return 0. A caller wanting more conservatism should require more
+        confirmations, which is the knob that exists for it.
+
+        Two further consequences worth knowing:
+
+        * At ``len(sources) == 2`` a majority is both of them, so one unreachable source fails
+          the read. Two endpoints cannot tell a liar from a laggard. An operator who genuinely
+          wants to trust a single source should configure ONE source, where the majority is
+          that source and the read succeeds; configuring two is a request for cross-checking,
+          and losing one means the cross-check cannot be performed.
+        * ``quorum`` below the majority no longer buys availability, because the majority
+          governs. It still governs :meth:`_require_quorum`'s minimum group size.
         """
         self._check_quorum_possible()
         results = await self._gather_results(lambda s: s.get_tip_height())
         heights = sorted((int(r) for r in results if not isinstance(r, Exception)), reverse=True)
-        if len(heights) < self._quorum:
+        required = len(self._sources) // 2 + 1
+        if len(heights) < max(self._quorum, required):
             raise NetworkError(
                 f"Source quorum not reached: {len(heights)}/{len(self._sources)} sources responded, "
-                f"quorum is {self._quorum}"
+                f"quorum is {self._quorum} and a majority of the configured sources is {required}. "
+                "A source that did not answer cannot be counted as corroborating a height."
             )
-        # Strict majority of the sources that ANSWERED, floored at the configured quorum. Both
-        # bounds matter: the majority is what stops a colluding pair outvoting three honest
-        # sources, and the quorum floor is what stops a 1-of-N configuration from accepting a
-        # single source's word when more were reachable.
-        required = max(self._quorum, len(heights) // 2 + 1)
+        # heights is sorted DESCENDING and a reported tip H asserts "the chain reached at least
+        # H", so the value at index required-1 is the largest height `required` sources back.
         return BlockHeight(heights[required - 1])
 
     async def get_block_hash(self, height: BlockHeight) -> Hex32:

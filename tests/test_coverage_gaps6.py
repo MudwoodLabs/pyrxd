@@ -619,13 +619,21 @@ class TestMultiSourceAdditional:
 
     @pytest.mark.asyncio
     async def test_require_quorum_with_exceptions(self):
-        """One source raises, one succeeds — with quorum=1 should return the value."""
+        """One of two sources raises — the surviving one cannot be cross-checked.
+
+        This asserted that ``quorum=1`` was enough to return the survivor's
+        value. The majority is now taken over the CONFIGURED sources, because
+        counting only responders let a minority win by making the others
+        unreachable, so one of two answering fails closed. Three sources
+        tolerate the same outage; see ``test_three_sources_tolerate_one_outage``
+        in ``tests/test_network_bitcoin.py``.
+        """
         s1 = self._make_mock_source()
         s2 = self._make_mock_source()
         s2.get_tip_height = AsyncMock(side_effect=NetworkError("down"))
         multi = MultiSourceBtcDataSource([s1, s2], quorum=1)
-        result = await multi.get_tip_height()
-        assert int(result) == 840000
+        with pytest.raises(NetworkError, match="majority of the configured sources"):
+            await multi.get_tip_height()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
