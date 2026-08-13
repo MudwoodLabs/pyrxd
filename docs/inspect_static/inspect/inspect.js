@@ -731,10 +731,69 @@ function renderOutputRow(row) {
   head.appendChild(el("span", { class: "output-sats", text: `${row.satoshis} sats` }));
   wrapper.appendChild(head);
 
+  // A fetched-tx row is the SAME dict a pasted script produces, minus
+  // `form` and plus `vout` / `satoshis` (_inspect_core `_classify_raw_tx`).
+  // Every field the classifier can emit therefore has to be rendered here
+  // too — this path is how most people meet the tool, and a field that only
+  // the standalone-script card shows is a field most readers never see.
+  // Dropping them is what let a token-bearing `unknown` output, a dead
+  // container and a DISABLED relative lock all render as a bare badge.
+  //
+  // Only `form`, `hex` and `length` are deliberately absent: `form` is
+  // constant inside a tx listing, and the full script hex plus its byte
+  // count belong to the JSON drawer, not to a scannable row (the CLI's
+  // `_render_txid_human` omits both for the same reason).
+  const relativeLockDisabled = row.relative_lock_disabled === true;
   const dl = el("dl", { class: "kv-list" });
   if (row.owner_pkh) dl.appendChild(kv("owner pkh", row.owner_pkh));
   if (row.ref_outpoint) dl.appendChild(kv("ref", row.ref_outpoint));
+  // Dead pre-0.15.0 CONTAINER output. The child ref is the reason it cannot
+  // be spent, so the two travel together, and the verdict is stated in the
+  // row rather than left to the note the reader may not open. CLI parity:
+  // `child_ref=` + `UNSPENDABLE`.
+  if (row.child_ref_outpoint) dl.appendChild(kv("child ref", row.child_ref_outpoint));
+  if (row.spendable === false) {
+    dl.appendChild(kv("spendable", "*** UNSPENDABLE ***", "kv-warning"));
+  }
   if (row.payload_hash) dl.appendChild(kv("payload hash", row.payload_hash));
+  if (row.script_hash) dl.appendChild(kv("script hash", row.script_hash));
+
+  // Time-locks. Same ordering rule as the standalone card: the disable
+  // warning comes BEFORE the delay it invalidates. CLI parity:
+  // `lock=<units> <basis>  *** DISABLED ***`.
+  if (row.locktime_basis) {
+    if (relativeLockDisabled) {
+      dl.appendChild(kv(
+        "relative lock",
+        "*** RELATIVE LOCK DISABLED — SPENDABLE IMMEDIATELY ***",
+        "kv-warning",
+      ));
+    }
+    dl.appendChild(kv(
+      relativeLockDisabled ? "lock (ignored)" : "lock",
+      `${row.locktime_units} ${row.locktime_basis} (raw ${row.locktime_value})`,
+      relativeLockDisabled ? "kv-warning" : undefined,
+    ));
+    if (row.locktime_earliest !== undefined) {
+      dl.appendChild(kv("earliest spend", row.locktime_earliest));
+    }
+  }
+
+  // Covenant tiers. `transferability` is present only on the EXACT-match
+  // tier — the weaker `self-replicating-covenant` withholds it on purpose,
+  // so rendering it conditionally is what keeps the two tiers distinct here.
+  if (row.bound_ref_outpoint) dl.appendChild(kv("bound ref", row.bound_ref_outpoint));
+  if (row.variant) dl.appendChild(kv("covenant variant", row.variant));
+  if (row.transferability) {
+    dl.appendChild(kv("transferability", `${row.transferability} (non-transferable at consensus)`));
+  }
+  if (row.has_self_replication !== undefined) {
+    dl.appendChild(kv("self-replication branch", String(row.has_self_replication)));
+  }
+  if (row.has_burn_branch !== undefined) {
+    dl.appendChild(kv("burn branch", String(row.has_burn_branch)));
+  }
+
   if (row.contract_ref_outpoint) dl.appendChild(kv("contract ref", row.contract_ref_outpoint));
   if (row.token_ref_outpoint) dl.appendChild(kv("token ref", row.token_ref_outpoint));
   if (row.height !== undefined) dl.appendChild(kv("height", row.height));
@@ -743,6 +802,29 @@ function renderOutputRow(row) {
   if (row.algo) dl.appendChild(kv("algo", row.algo));
   if (row.daa_mode) dl.appendChild(kv("daa mode", row.daa_mode));
   if (row.version) dl.appendChild(kv("version", row.version));
+
+  // Token-bearing verdict on a shape nobody named. This is the row that
+  // matters most and the one the tx path used to drop entirely: a
+  // ref-carrying UTXO spent as plain funding BURNS its token, and the
+  // warning was invisible on the exact screen where users meet these
+  // outputs. CLI parity: `ref=… (0xd0) TOKEN-BEARING`.
+  if (row.token_bearing !== undefined) {
+    dl.appendChild(kv(
+      "token-bearing",
+      row.token_bearing === null ? "unknown (script does not decode)" : String(row.token_bearing),
+      row.token_bearing === false ? undefined : "kv-warning",
+    ));
+    for (const ref of row.input_refs || []) {
+      dl.appendChild(kv(`ref (${ref.opcode})`, `${ref.ref_outpoint} TOKEN-BEARING`, "kv-warning"));
+    }
+    // 0xd1/0xd2/0xd3 name a ref without holding one — a gate, not a
+    // carrier. Kept visually apart from the line above so it never reads
+    // as a burn warning.
+    for (const ref of row.referenced_refs || []) {
+      dl.appendChild(kv(`ref (${ref.opcode})`, `${ref.ref_outpoint} — named, not carried`));
+    }
+  }
+
   if (row.data_hex !== undefined) {
     // OP_RETURN data — show truncated for long blobs to keep the
     // row scannable; the JSON drawer carries the full bytes.
@@ -755,6 +837,15 @@ function renderOutputRow(row) {
   }
   wrapper.appendChild(dl);
 
+  // The classifier's own caveat for the shapes where naming them is only
+  // half the answer (dead container, both covenant tiers). It is a fixed
+  // internal vocabulary, never CBOR — and dropping it here was how a row
+  // could say "SOULBOUND-COVENANT" with nothing saying what that does and
+  // does not prove.
+  if (row.note) {
+    wrapper.appendChild(el("p", { class: "card-note", text: row.note }));
+  }
+
   // Structural-match qualifier — parity with the CLI human renderer
   // (issue #53 / PR #58). The script classifier matches by hex
   // pattern, not by cryptographic provenance — a custom locking
@@ -762,7 +853,7 @@ function renderOutputRow(row) {
   // also classify as ft/nft/mut/dmint/commit. The qualifier nudges
   // the user to verify by ref / outpoint, not by the type badge
   // alone.
-  const qualifier = _structuralQualifierNote(type);
+  const qualifier = _structuralQualifierNote(type, row);
   if (qualifier) {
     wrapper.appendChild(el("p", { class: "structural-note", text: qualifier }));
   }
@@ -1033,7 +1124,21 @@ function _detectTxShape(payload) {
 // in a fetched-tx card) and ``renderScriptCard`` (when the user pastes
 // a standalone script). Wording matches the CLI's
 // ``_render_script_human`` for cross-tool consistency.
-function _structuralQualifierNote(type) {
+//
+// ``payload`` is the classified row/script dict. It exists solely for the
+// CSV disable-bit case: the stock p2pkh-csv qualifier tells the reader their
+// spending input "must carry at least this delay", which is FALSE when bit 31
+// is set — consensus ignores the lock. The CLI suppresses that sentence for
+// the disabled shape (``_render_timelock_body``); so does this. Nothing here
+// re-derives the flag: ``relative_lock_disabled`` is decided in Python.
+function _structuralQualifierNote(type, payload) {
+  if (type === "p2pkh-csv" && payload && payload.relative_lock_disabled === true) {
+    return "Structural pattern match. Bit 31 of the sequence " +
+           "(SEQUENCE_LOCKTIME_DISABLE_FLAG) is set, so consensus enforces no " +
+           "relative lock at all and this output is spendable immediately — " +
+           "the decoded delay is inert script bytes. pyrxd's builder refuses " +
+           "to emit this shape.";
+  }
   const NOTES = {
     ft: "Structural pattern match: bytes match the FT script template; " +
         "does NOT verify the ref points to a valid Glyph contract.",
@@ -1063,7 +1168,10 @@ function _structuralQualifierNote(type) {
     "p2pkh-cltv": "Structural pattern match. The tool cannot tell you whether " +
         "the lock has elapsed — that needs the chain tip. A spending tx " +
         "must set nLockTime to at least this value and use a non-final " +
-        "nSequence on the input.",
+        "nSequence on the input. The encoded value is a floor on that " +
+        "nLockTime, not a height at which the output turns spendable — " +
+        "consensus requires nLockTime to be strictly less than the " +
+        "containing block's height, so see 'earliest spend'.",
     "p2pkh-csv": "Structural pattern match. The tool cannot tell you whether " +
         "the lock has elapsed — that needs this output's confirmation " +
         "height. The spending input's nSequence must carry at least this " +
@@ -1137,17 +1245,47 @@ function renderScriptCard(payload) {
   if (payload.child_ref_outpoint) {
     dl.appendChild(kv("child ref outpoint", payload.child_ref_outpoint));
   }
+  // The dead pre-0.15.0 container. The title and the note both say so, but
+  // the verdict also belongs in the field list where a reader scanning
+  // key/value pairs will meet it. CLI parity: `*** UNSPENDABLE ***`.
+  if (payload.spendable === false) {
+    dl.appendChild(kv("spendable", "*** UNSPENDABLE ***", "kv-warning"));
+  }
   if (payload.payload_hash) dl.appendChild(kv("payload hash (sha256)", payload.payload_hash));
   if (payload.script_hash) dl.appendChild(kv("script hash (20 hex)", payload.script_hash));
 
   // Time-lock fields. `locktime_units` is the count in whatever unit
   // `locktime_basis` names, which is the number a reader actually wants;
   // `locktime_value` is the raw on-stack integer and differs from it for CSV
-  // (it carries the type flag in bit 22).
+  // (it carries the type flag in bit 22). `locktime_earliest` is CLTV-only
+  // and is DERIVED IN PYTHON (_inspect_core) — the encoded value is a floor
+  // on the spending tx's nLockTime, and IsFinalTx wants that strictly less
+  // than the containing block's height, so the first block that can carry the
+  // spend is one past it. This renderer must not re-derive consensus facts.
+  //
+  // ORDERING IS LOAD-BEARING here, and it mirrors the CLI's
+  // `_render_timelock_body` deliberately: when bit 31
+  // (SEQUENCE_LOCKTIME_DISABLE_FLAG) is set, consensus ignores the relative
+  // lock entirely, and a reader who meets "delay: 144 blocks" before the
+  // "…but it enforces nothing" line leaves believing the opposite of the
+  // truth. These shapes are HTLC refund legs. Warning first (as a banner
+  // above the whole list), delay second, and the delay relabelled "(ignored)"
+  // so a row read in isolation still cannot mislead.
+  const relativeLockDisabled = payload.relative_lock_disabled === true;
   if (payload.locktime_basis) {
     dl.appendChild(kv("lock basis", payload.locktime_basis));
-    dl.appendChild(kv("lock units", payload.locktime_units));
     dl.appendChild(kv("raw value", payload.locktime_value));
+    if (relativeLockDisabled) {
+      dl.appendChild(kv(
+        "relative lock",
+        "*** RELATIVE LOCK DISABLED — SPENDABLE IMMEDIATELY ***",
+        "kv-warning",
+      ));
+    }
+    dl.appendChild(kv(relativeLockDisabled ? "delay (ignored)" : "lock units", payload.locktime_units));
+    if (payload.locktime_earliest !== undefined) {
+      dl.appendChild(kv("earliest spend", payload.locktime_earliest));
+    }
   }
 
   // Soulbound / self-replicating covenant fields.
@@ -1165,6 +1303,11 @@ function renderScriptCard(payload) {
   // recognises carries a ref is the fact worth surfacing: spending such a
   // UTXO as plain funding destroys the token it carries. `null` means the
   // script did not decode, so absence was never established.
+  //
+  // `input_refs` is the CARRIED set (0xd0 / 0xd8) and `referenced_refs` the
+  // set the script only names (0xd1 require, 0xd2 / 0xd3 disallow). Python
+  // splits them; this side must keep them apart, because only the first
+  // burns when the output is spent.
   if (payload.token_bearing !== undefined) {
     dl.appendChild(kv(
       "token-bearing",
@@ -1172,6 +1315,9 @@ function renderScriptCard(payload) {
     ));
     for (const row of payload.input_refs || []) {
       dl.appendChild(kv(`input ref (${row.opcode})`, row.ref_outpoint));
+    }
+    for (const row of payload.referenced_refs || []) {
+      dl.appendChild(kv(`referenced ref (${row.opcode})`, `${row.ref_outpoint} — named, not carried`));
     }
   }
 
@@ -1192,6 +1338,19 @@ function renderScriptCard(payload) {
   // OP_RETURN data carrier
   if (payload.data_hex !== undefined) {
     dl.appendChild(kv("data (hex)", payload.data_hex || "(empty)"));
+  }
+
+  // BEFORE the list, not after it. The delay this qualifies is rendered
+  // below, and "the delay below … enforces nothing" is only true — and only
+  // read in time — in this position. Wording is the CLI's verbatim.
+  if (relativeLockDisabled) {
+    wrapper.appendChild(el("p", {
+      class: "warning-banner warning-banner-lead",
+      text: "Bit 31 (SEQUENCE_LOCKTIME_DISABLE_FLAG) is set, so consensus " +
+            "ignores the relative lock entirely. The delay below is encoded " +
+            "in the script but enforces nothing. pyrxd's builder refuses to " +
+            "emit this shape.",
+    }));
   }
 
   wrapper.appendChild(dl);
@@ -1230,7 +1389,7 @@ function renderScriptCard(payload) {
 
   // Structural-match qualifier (issue #53 / PR #58). Same wording the
   // CLI's _render_script_human emits.
-  const qualifier = _structuralQualifierNote(type);
+  const qualifier = _structuralQualifierNote(type, payload);
   if (qualifier) {
     wrapper.appendChild(el("p", { class: "structural-note", text: qualifier }));
   }
