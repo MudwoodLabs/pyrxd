@@ -36,6 +36,7 @@ def _btc_file(tmp_path):
             }
         )
     )
+    p.chmod(0o600)  # a file carrying taker_rxd_wif; the real writer creates it 0600
     return p
 
 
@@ -59,6 +60,7 @@ def _eth_file(tmp_path):
             }
         )
     )
+    p.chmod(0o600)  # a file carrying eth_key_hex; the real writer creates it 0600
     return p
 
 

@@ -6,6 +6,80 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **A swap recovery file's private keys are now read under the same gate its fee
+  key already got.** `pyrxd swap build-claim` / `build-refund` / `status` take two
+  files. `--fee-wif-file` holds ONE key, for fees, and has always gone through
+  `read_secret_file`: symlink refused, `fstat` on the read fd, owner-only mode,
+  ownership, bounded size. The recovery file — which in a single-operator harness
+  run carries `taker_rxd_wif` **and** `maker_rxd_wif`, i.e. both counterparties'
+  spending authority — was read with a bare `json.loads(path.read_text())`: no mode
+  check, no ownership check, no symlink refusal, no size bound.
+
+  The care in that module had all gone into never letting a WIF into an *error
+  message* (`_pkh_from_wif` is meticulous about it, and rightly). Nothing looked at
+  the file those keys sit in at rest. The writer
+  (`scripts/_dust_swap_shared.atomic_write_mode_600`) creates it `O_EXCL` at 0600
+  and always has; the gap was every way a correct file stops being one — `cp`,
+  `rsync -p` from a looser source, an unzip, a restore from backup, an editor that
+  writes-new-then-renames at umask.
+
+  `pyrxd.cli.swap_recovery.load_recovery_json` now backs all three readers
+  (`parse_recovery_extras`, `covenant_pkhs`, `swap_cmds.parse_recovery_file`). The
+  mode requirement is **conditional on content**: a file is refused for being
+  group/world-readable only if it actually contains a private key, because the
+  two-host harnesses persist only public locators and pkhs and demanding 0600 of a
+  public document would reject the workflow `--taker-pkh` / `--maker-pkh` exist for.
+  Reading first and judging after is not a check-then-use race — the mode is
+  `fstat`-ed from the descriptor the bytes came from.
+
+- **The wallet seed file's permission check no longer has a TOCTOU.**
+  `HdWallet._load_existing` refused a group/world-readable wallet file by calling
+  `path.stat()`, then read it eleven lines later with `path.read_bytes()` — a
+  check-then-use pair on a *path*, which says nothing about the file that actually
+  gets read. The two calls were separated by `seed_from_mnemonic`, i.e. 2048 rounds
+  of PBKDF2-HMAC-SHA512 chosen to be slow, making that the widest race window in the
+  wallet path. Anyone able to replace the path during it had the mode gate report on
+  a file that was never opened.
+
+  Mode and bytes now come from one descriptor (`_read_wallet_file`: `fstat` on the
+  read fd, `S_ISREG`, `O_NONBLOCK` so a FIFO is rejected instead of hanging the
+  process, bounded read). Symlinked wallet paths keep working — a wallet on an
+  encrypted or removable mount is a legitimate setup — and the gate now correctly
+  judges the symlink's *target*, which is the file whose permissions matter.
+
+- **`redact()` no longer exempts a mnemonic that is not written in lowercase.**
+  `RxdSdkError.__init__` runs every positional argument through `redact`, so it is
+  what stands between an embedder's `raise ValidationError(mnemonic)` and a seed
+  phrase in a stack trace. Its BIP-39 branch required every token to carry no
+  uppercase. Steel backup plates (Cryptosteel, Billfodl, every stamped-tile product)
+  are UPPERCASE-only, and phone keyboards and spreadsheets autocapitalise the first
+  word — so an UPPERCASE, Title Case, or first-word-capitalised phrase passed
+  through **verbatim**. The disclosure is total rather than partial: wordlists are
+  lowercase, so lowercasing a leaked phrase reproduces the mnemonic exactly.
+
+  This is the second assumption in that one predicate; the first — `t.isascii()`,
+  which exempted every non-Latin wordlist the SDK ships — was fixed earlier. A
+  case-insensitive check against the shipped BIP-39 vocabularies is now tried when
+  the lowercase-shape branch declines. It is a *vocabulary* test rather than a
+  second shape test on purpose: simply dropping the case condition would redact
+  ordinary prose, since `"Could not connect to the remote peer at this time"` is
+  eight alphabetic tokens and `redact` runs over the arguments of every exception
+  this SDK raises.
+
+### Changed
+
+- **`scripts/mutation_test.sh` gained a `keys` group.** Mutation testing covered
+  `spv/`, `script/`, `transaction/` and `glyph/dmint/` — the consensus-critical
+  arithmetic — and none of the code standing between key material or operator input
+  and a sink. The new group mutates `security/errors.py`, `security/secrets.py`,
+  `base58.py`, `hd/bip32.py`, `hd/descriptor.py` and
+  `gravity/watch/cli_secrets.py`. These are cheap-to-test pure predicates, which is
+  exactly the shape where line coverage is least informative: `pyrxd.security` sits
+  at 100% line and branch coverage, and that number cannot distinguish a guard whose
+  removal a test would notice from one whose removal nothing would.
+
 ### Added
 
 - **Mutation testing now covers the value-moving modules, not just the

@@ -47,6 +47,7 @@ import json
 import logging
 import os
 import secrets
+import stat
 import tempfile
 import unicodedata
 from dataclasses import dataclass, field
@@ -209,6 +210,66 @@ _HEADER_LEN = 1 + _SALT_LEN + _NONCE_LEN + _TAG_LEN  # 45
 _SCRYPT_N = 2**14
 _SCRYPT_R = 8
 _SCRYPT_P = 1
+
+#: Ceiling on a wallet-file read. The blob is a 45-byte header plus a JSON address
+#: book; a wallet approaching this is a wrong path, not a wallet.
+_MAX_WALLET_FILE_BYTES = 8 * 1024 * 1024
+
+
+def _read_wallet_file(path: Path) -> tuple[bytes, int | None]:
+    """Return ``(contents, posix_mode)`` read and stat-ed through ONE descriptor.
+
+    ``fstat`` on the fd the bytes are read from is the whole point: it makes the
+    permission verdict a statement about the file that was actually opened, not about
+    whatever the path resolved to at some earlier instant. The pattern (and this
+    function's shape) mirrors
+    :func:`pyrxd.gravity.watch.cli_secrets.read_secret_file`, which has always done it
+    this way for a webhook secret — a far less valuable thing than a BIP39 seed.
+
+    Two deliberate differences from that function:
+
+    * **No ``O_NOFOLLOW``.** A watchtower credential path is machine-managed and a
+      symlink there is a red flag. A wallet path is operator-chosen and symlinking it
+      into external storage (a removable volume, an encrypted mount, a synced
+      directory) is a legitimate and common setup. Refusing outright would break it —
+      and with ``fstat`` the mode gate now reports on the symlink's *target*, which is
+      the file whose permissions actually matter, so allowing the symlink no longer
+      weakens the check.
+    * **No owner check.** Loading a wallet file owned by another uid is odd but not
+      obviously wrong (a shared recovery host, a root-owned read-only restore mount),
+      and unlike a credential file the contents are AES-256-GCM sealed under a key
+      derived from the operator's own mnemonic — a substituted file fails the tag
+      rather than being trusted. Left out on purpose rather than by omission.
+
+    Returns ``mode=None`` on a non-POSIX platform, where the bits are dummy values and
+    a check on them would be superstition.
+    """
+    if os.name != "posix":
+        return path.read_bytes(), None
+    # ``O_NONBLOCK`` is inert for a regular file and load-bearing for everything else:
+    # without it, ``os.open`` on a FIFO parks forever waiting for a writer, so a FIFO
+    # at the wallet path hangs the process before ``S_ISREG`` ever gets to reject it.
+    # A check that cannot be reached is not a check.
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    fd = os.open(str(path), flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValidationError(f"Wallet file at {path} is not a regular file — refusing to read a seed from it")
+        chunks: list[bytes] = []
+        remaining = _MAX_WALLET_FILE_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 1 << 16))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(fd)
+    raw = b"".join(chunks)
+    if len(raw) > _MAX_WALLET_FILE_BYTES:
+        raise ValidationError(f"Wallet file at {path} is larger than {_MAX_WALLET_FILE_BYTES} bytes — refusing to read")
+    return raw, st.st_mode & 0o777
 
 
 @dataclass
@@ -497,14 +558,18 @@ class HdWallet:
         # backup with ``cp`` or ``rsync`` might end up with a wider
         # mode and not realize it. Catch it at load rather than silently
         # operating with a world-readable seed file.
-        # Skipped on platforms without POSIX mode bits (Windows: stat.st_mode
-        # returns dummy values, so the check is meaningless). We fall back to
-        # warning-via-exception only when stat reports POSIX-shaped bits.
-        try:
-            mode = path.stat().st_mode & 0o777
-        except OSError:
-            mode = None
-        if mode is not None and (mode & 0o077) and os.name == "posix":
+        #
+        # The mode and the bytes come from ONE descriptor (see
+        # :func:`_read_wallet_file`). This used to be ``path.stat()`` on line A and
+        # ``path.read_bytes()`` on line B — a check-then-use pair on a *path*, which
+        # tests nothing about the file that actually gets read. Worse, the two were
+        # separated by ``seed_from_mnemonic``, i.e. 2048 rounds of PBKDF2-HMAC-SHA512
+        # deliberately tuned to be slow: the gap between checking the permissions and
+        # reading the bytes was the single widest race window in the wallet path.
+        # Anyone able to replace the path in that window had the mode gate report on a
+        # file that was never read.
+        raw, mode = _read_wallet_file(path)
+        if mode is not None and (mode & 0o077):
             raise ValidationError(
                 f"Wallet file at {path} has mode {oct(mode)}; "
                 "must be 0o600 (owner-only). Run `chmod 0600 <path>` and retry."
@@ -512,7 +577,6 @@ class HdWallet:
 
         seed = seed_from_mnemonic(mnemonic, passphrase=passphrase, normalize=normalize)
 
-        raw = path.read_bytes()
         if len(raw) < _HEADER_LEN:
             raise ValidationError("Wallet file too short to contain header")
 

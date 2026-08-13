@@ -70,10 +70,16 @@ _SECRET_KEY_MARKERS = ("wif", "key_hex", "secret", "preimage", "privkey")
 
 def parse_recovery_file(path: Path) -> SwapFacts:
     """Parse a harness recovery JSON into public :class:`SwapFacts`. Raises ``ValueError`` on a file
-    that does not look like a swap recovery file (missing the covenant SPK + hashlock)."""
-    d = json.loads(path.read_text())
-    if not isinstance(d, dict):
-        raise ValueError("recovery file is not a JSON object")
+    that does not look like a swap recovery file (missing the covenant SPK + hashlock).
+
+    Reads through :func:`~pyrxd.cli.swap_recovery.load_recovery_json`, so the same file
+    that gets ``has_keys=True`` reported about it is also refused if it holds those keys
+    at a group/world-readable mode. Telling an operator their file contains private keys
+    while reading it out of a 0644 file without comment was the wrong half of the job.
+    """
+    from .swap_recovery import load_recovery_json
+
+    d = load_recovery_json(path)
     hashlock = d.get("hashlock_H")
     spk = d.get("rxd_covenant_spk")
     if not hashlock or not spk:
