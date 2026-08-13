@@ -105,6 +105,13 @@ class Observations:
     # this state (so it consumes the audited gate verdict and never re-derives finality).
     eth_claim_detected: bool = False
     eth_claim_finality: CounterClaimState | None = None
+    # Wall-clock (unix seconds) for the ETH counter leg, whose refund deadline is the ABSOLUTE
+    # ``terms.eth_timeout_unix_s`` contract immutable rather than a confirmation depth. It is the
+    # ETH analogue of ``btc_funding_confirmations``: the one reading that lets the maker-never-locks
+    # branch prove the taker's counter-leg refund is DUE. ``None`` (the default, and every
+    # pre-existing caller) keeps that branch fail-closed to WATCH — exactly as the BTC branch
+    # watches on an unread funding depth — so an absent clock can never manufacture a page.
+    now_unix_s: int | None = None
     low_corroboration: bool = False
 
     def __post_init__(self) -> None:
@@ -116,6 +123,7 @@ class Observations:
             ("asset_locked_at_height", self.asset_locked_at_height),
             ("btc_claim_confirmations", self.btc_claim_confirmations),
             ("btc_funding_confirmations", self.btc_funding_confirmations),
+            ("now_unix_s", self.now_unix_s),
         ):
             if val is not None and (not isinstance(val, int) or isinstance(val, bool) or val < 0):
                 raise ValidationError(f"Observations.{label} must be a non-negative int or None")
@@ -584,5 +592,44 @@ def _decide_eth(
             low_corroboration=corr,
         )
 
-    # Pre-lock states (NEGOTIATED, ETH funded but asset not yet locked): nothing time-critical.
+    # Maker never locks the asset. The ETH mirror of the BTC branch in :func:`decide` — and until
+    # now the ONLY state the two arms did not both handle. ``taker_funds_btc`` is the funding step
+    # for BOTH counter-chains and advances to BTC_LOCKED, so an ETH swap sits here with the taker's
+    # ETH HTLC funded and the maker's covenant absent. The BTC arm pages PAGE_REFUND once maturity
+    # is provable; this arm had no branch at all and fell through to the silent WATCH catch-all
+    # below, every tick, forever — the taker is never told its counter-leg refund is due.
+    #
+    # ETH maturity is the ABSOLUTE ``eth_timeout_unix_s`` (a contract immutable), not a depth, so it
+    # needs ``obs.now_unix_s``. Fail-closed in the SAME direction as the BTC arm: an unread clock, or
+    # terms without a deadline, WATCHes rather than pages — an alert-only tower that cries wolf on
+    # every healthy pre-lock tick is its own failure. ``autonomous_btc_refund`` stays False: that
+    # discriminator arms the BTC keyless pre-signed refund and has no ETH counterpart.
+    if state is SwapState.BTC_LOCKED:
+        if obs.asset_locked_at_height is not None:
+            return Decision(
+                Intent.WATCH,
+                reason="asset lock observed on-chain despite a BTC_LOCKED record — the maker locked; not refunding",
+                low_corroboration=corr,
+            )
+        deadline_s = terms.eth_timeout_unix_s
+        if obs.now_unix_s is not None and deadline_s is not None and obs.now_unix_s >= deadline_s:
+            return Decision(
+                Intent.PAGE_REFUND,
+                reason=(
+                    f"maker never locked the asset; the ETH HTLC timeout {deadline_s} has passed "
+                    f"(now {obs.now_unix_s}) — refund the ETH counter-leg HTLC"
+                ),
+                recommended_action="taker_refund_btc",
+                low_corroboration=corr,
+            )
+        return Decision(
+            Intent.WATCH,
+            reason=(
+                f"BTC_LOCKED on an ETH swap; awaiting the eth_timeout_unix_s deadline ({deadline_s}) "
+                f"or an asset lock (clock read: {obs.now_unix_s})"
+            ),
+            low_corroboration=corr,
+        )
+
+    # Pre-lock states (NEGOTIATED): nothing time-critical.
     return Decision(Intent.WATCH, reason=f"no action due in {state.value}", low_corroboration=corr)

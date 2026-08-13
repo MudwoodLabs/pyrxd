@@ -593,3 +593,69 @@ def test_watchtower_ft_swap_with_value_scaling_fails_closed():
     obs = _eth_obs(detected=True, finality=CounterClaimState.FINAL, now=150)
     d = _decide_e(_eth(SwapState.SECRET_REVEALED), obs, policy=vs_policy)
     assert d.intent is Intent.PAGE_SQUEEZED
+
+
+# ---------------------------------------------------------------------------
+# ETH arm: maker never locks the asset (the branch the BTC arm always had)
+# ---------------------------------------------------------------------------
+#
+# `taker_funds_btc` is the funding step for BOTH counter-chains and advances to BTC_LOCKED, so an
+# ETH swap sits at BTC_LOCKED with the taker's ETH HTLC funded and the maker's covenant absent.
+# `decide`'s BTC arm pages PAGE_REFUND there once maturity is provable; `_decide_eth` had no
+# BTC_LOCKED branch at all and fell through to the silent WATCH catch-all — every tick, forever.
+
+
+def _eth_btc_locked_obs(*, now_unix_s=None, lock=None):
+    return Observations(
+        maker_has_claimed_btc=False,
+        now_rxd_height=150,
+        asset_locked_at_height=lock,
+        eth_claim_detected=False,
+        eth_claim_finality=None,
+        now_unix_s=now_unix_s,
+    )
+
+
+def test_eth_maker_never_locks_pages_refund_once_the_timeout_passes():
+    """MUTANT: delete the ``state is SwapState.BTC_LOCKED`` branch in ``_decide_eth``.
+
+    The taker's ETH HTLC is funded, the maker locked nothing, and ``eth_timeout_unix_s``
+    (4_000_000_000 in ``_eth_terms``) has passed — the counter-leg refund is DUE and the operator
+    must be told. Without the branch this is an ``Intent.WATCH``, which the reconciler does not
+    route to any handler: no page, no webhook, no heartbeat count.
+    """
+    d = _decide_e(_eth(SwapState.BTC_LOCKED), _eth_btc_locked_obs(now_unix_s=4_000_000_001))
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.recommended_action == "taker_refund_btc"
+    # The autonomous discriminator arms the BTC keyless pre-signed refund; it has no ETH counterpart.
+    assert d.autonomous_btc_refund is False
+
+
+def test_eth_maker_never_locks_watches_before_the_timeout():
+    """The honest-path control: a maker that has simply not locked YET must not be paged. A guard
+    that fires on every healthy pre-lock tick is its own failure for an alert-only tower."""
+    d = _decide_e(_eth(SwapState.BTC_LOCKED), _eth_btc_locked_obs(now_unix_s=3_999_999_999))
+    assert d.intent is Intent.WATCH
+
+
+def test_eth_maker_never_locks_watches_when_the_clock_is_unread():
+    """Fail-closed in the SAME direction as the BTC arm, which watches on an unread funding depth:
+    an absent ``now_unix_s`` (every pre-existing caller) can never manufacture a page."""
+    d = _decide_e(_eth(SwapState.BTC_LOCKED), _eth_btc_locked_obs(now_unix_s=None))
+    assert d.intent is Intent.WATCH
+
+
+def test_eth_stale_btc_locked_record_with_an_observed_asset_lock_does_not_page_refund():
+    """Mirrors the BTC arm's fail-closed: an asset lock seen on-chain means the maker DID lock, so a
+    stale BTC_LOCKED record must not be turned into a refund recommendation."""
+    d = _decide_e(
+        _eth(SwapState.BTC_LOCKED),
+        _eth_btc_locked_obs(now_unix_s=4_000_000_001, lock=LOCK),
+    )
+    assert d.intent is Intent.WATCH
+    assert "maker locked" in d.reason
+
+
+def test_observations_rejects_a_negative_clock():
+    with pytest.raises(ValidationError):
+        Observations(maker_has_claimed_btc=False, now_rxd_height=10, now_unix_s=-1)

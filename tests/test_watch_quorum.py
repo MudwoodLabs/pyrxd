@@ -474,3 +474,36 @@ async def test_eth_point_in_time_only_source_without_checkpoint_keeps_fast_path(
     for _ in range(5):  # many ticks, still no stall judgment available → stays the point-in-time state
         obs = await observer.observe("swap-A", rec)
         assert obs.eth_claim_finality is CounterClaimState.NOT_YET_FINAL_LIVE
+
+
+# ---------------------------------------------------------------------------
+# The ETH wall clock (the input the maker-never-locks branch needs)
+# ---------------------------------------------------------------------------
+
+
+async def test_eth_observation_carries_the_wall_clock():
+    """``decide``'s ETH maker-never-locks branch proves maturity against the ABSOLUTE
+    ``eth_timeout_unix_s``, so it needs a clock reading — the ETH analogue of
+    ``btc_funding_confirmations``. Without this the branch is dead code and the taker is never
+    paged that its counter-leg refund is due."""
+    eth = FakeEth(EthClaimStatus(claimed=False, claim_tx_hash=None), None)
+    observer = ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51), clock=lambda: 4_000_000_123.9)
+    obs = await observer.observe("s", _eth_record(state=SwapState.BTC_LOCKED, with_covenant=False))
+    assert obs.now_unix_s == 4_000_000_123  # int-truncated, never rounded up past the deadline
+
+
+async def test_eth_observation_to_decide_pages_the_overdue_counter_leg_refund():
+    """End-to-end through the REAL observer: an ETH swap whose maker never locked, observed after
+    ``eth_timeout_unix_s``, reaches PAGE_REFUND rather than the silent WATCH catch-all."""
+    eth = FakeEth(EthClaimStatus(claimed=False, claim_tx_hash=None), None)
+    rec = _eth_record(state=SwapState.BTC_LOCKED, with_covenant=False)
+    observer = ChainObserver(eth=eth, rxd=FakeRxd(tip=150, cov_confs=51), clock=lambda: 4_000_000_001)
+    obs = await observer.observe("s", rec)
+    d = decide(record=rec, observations=obs, policy=_eth_policy(), safety_window_blocks=6)
+    assert d.intent is Intent.PAGE_REFUND
+    assert d.recommended_action == "taker_refund_btc"
+
+
+def test_chain_observer_rejects_a_non_callable_clock():
+    with pytest.raises(ValidationError):
+        ChainObserver(eth=FakeEth(EthClaimStatus(claimed=False, claim_tx_hash=None), None), rxd=FakeRxd(tip=1), clock=5)

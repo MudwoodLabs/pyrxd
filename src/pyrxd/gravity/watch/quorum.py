@@ -22,6 +22,7 @@ the daemon shell so the brain stays unit-testable with fakes.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -180,9 +181,12 @@ class ChainObserver(Observer):
         btc: BtcClaimSource | None = None,
         eth: EthChainSource | None = None,
         rxd_corroborated: bool = False,
+        clock=None,
     ) -> None:
         if not isinstance(rxd_corroborated, bool):
             raise ValidationError("ChainObserver.rxd_corroborated must be bool")
+        if clock is not None and not callable(clock):
+            raise ValidationError("ChainObserver.clock must be a callable returning unix seconds, or None")
         # LOW-R2: bind corroboration to STRUCTURE, not just a free bool. Asserting
         # rxd_corroborated=True clears low_corroboration on every observation (which lets the
         # autonomous refund act on a single RXD read), so it must be backed by an actual
@@ -202,6 +206,11 @@ class ChainObserver(Observer):
         self._eth = eth
         self._rxd = rxd
         self._rxd_corroborated = rxd_corroborated
+        # Wall clock for the ETH counter leg only, whose refund deadline is the ABSOLUTE
+        # eth_timeout_unix_s rather than a confirmation depth. Injectable so a test can drive the
+        # deadline without sleeping; the local clock is adequate because it is compared against a
+        # deadline measured in HOURS and only ever decides whether to PAGE (never to broadcast).
+        self._clock = clock if clock is not None else time.time
         # Per-swap-id RF-06 finality-stall trackers (ETH only), created lazily on first observation of
         # each swap. STATEFUL across ticks; isolated per swap_id so one stall run cannot bleed into
         # another. Only consulted when the ETH source exposes finality_checkpoint() (see below).
@@ -229,6 +238,10 @@ class ChainObserver(Observer):
                 asset_locked_at_height=asset_locked,
                 eth_claim_detected=eth_detected,
                 eth_claim_finality=eth_finality,
+                # The ETH analogue of btc_funding_confirmations: what lets decide()'s
+                # maker-never-locks branch prove the taker's counter-leg refund is due. Read only
+                # on the ETH path; the BTC arm's deadline is a depth and needs no clock.
+                now_unix_s=int(self._clock()),
                 low_corroboration=low_corr,
             )
 
