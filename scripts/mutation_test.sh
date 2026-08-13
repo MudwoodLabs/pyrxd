@@ -225,7 +225,7 @@ for sig in INT TERM HUP; do
   trap "cleanup; trap - $sig EXIT; kill -s $sig \$\$" "$sig"
 done
 
-total=0; killed=0; surv=0
+total=0; killed=0; surv=0; incomplete=0
 for g in $GROUPS_REQUESTED; do
   TESTS="$(group_tests "$g")"
   TIMEOUT="$(group_timeout "$g")"
@@ -282,16 +282,30 @@ EOF
     cosmic-ray exec "$cfg" "$sess" >/dev/null 2>&1
     git checkout -- "src/pyrxd/$path.py" 2>/dev/null
     f_t1=$(date +%s)
-    t="$(cr-report "$sess" 2>/dev/null | grep -oE 'total jobs: [0-9]+' | grep -oE '[0-9]+')"
-    s="$(cr-report "$sess" 2>/dev/null | grep -oE 'surviving mutants: [0-9]+' | grep -oE '[0-9]+' | head -1)"
-    : "${t:=0}"; : "${s:=0}"
-    pct=0; [ "$t" -gt 0 ] && pct=$(( (t - s) * 100 / t ))
-    printf '  %-28s %4d mutants  %4d killed  %4d survived  (%d%% killed)  %ds\n' \
-      "$path" "$t" "$((t - s))" "$s" "$pct" "$((f_t1 - f_t0))"
-    g_total=$((g_total + t)); g_surv=$((g_surv + s))
+    rep="$(cr-report "$sess" 2>/dev/null)"
+    t="$(echo "$rep" | grep -oE 'total jobs: [0-9]+' | grep -oE '[0-9]+')"
+    # `complete` is the number of mutants that actually RAN. It is not the same as `total jobs`
+    # whenever a run was interrupted — and killed MUST be derived from it. Deriving killed as
+    # (total - survived), as this script used to, counts every mutant that never executed as a
+    # kill: a sweep stopped at 34% reported "87% killed" instead of the true 64% over the third
+    # of the file it had reached. Observed on hd/wallet.py, 411 of 1201 complete.
+    c="$(echo "$rep" | grep -oE 'complete: [0-9]+' | grep -oE '[0-9]+' | head -1)"
+    s="$(echo "$rep" | grep -oE 'surviving mutants: [0-9]+' | grep -oE '[0-9]+' | head -1)"
+    : "${t:=0}"; : "${c:=0}"; : "${s:=0}"
+    pct=0; [ "$c" -gt 0 ] && pct=$(( (c - s) * 100 / c ))
+    if [ "$c" -lt "$t" ]; then
+      printf '  %-28s %4d/%d RAN  %4d killed  %4d survived  (%d%% of those run)  %ds  ** INCOMPLETE **\n' \
+        "$path" "$c" "$t" "$((c - s))" "$s" "$pct" "$((f_t1 - f_t0))"
+      incomplete=$((incomplete + 1))
+    else
+      printf '  %-28s %4d mutants  %4d killed  %4d survived  (%d%% killed)  %ds\n' \
+        "$path" "$t" "$((c - s))" "$s" "$pct" "$((f_t1 - f_t0))"
+    fi
+    g_total=$((g_total + c)); g_surv=$((g_surv + s))
   done
+  # g_total is the count that RAN, not the count that exists — see the per-file note above.
   gpct=0; [ "$g_total" -gt 0 ] && gpct=$(( (g_total - g_surv) * 100 / g_total ))
-  printf '  %-28s %4d mutants  %4d killed  %4d survived  (%d%% killed)\n' "[$g total]" "$g_total" "$((g_total - g_surv))" "$g_surv" "$gpct"
+  printf '  %-28s %4d ran      %4d killed  %4d survived  (%d%% killed)\n' "[$g total]" "$g_total" "$((g_total - g_surv))" "$g_surv" "$gpct"
   total=$((total + g_total)); killed=$((killed + g_total - g_surv)); surv=$((surv + g_surv))
 
   # Persist the survivors. A count in a terminal tells the next person nothing actionable; this
@@ -309,7 +323,19 @@ if [ "$total" -eq 0 ]; then
   exit 1
 fi
 tpct=$(( killed * 100 / total ))
-printf 'TOTAL: %d mutants, %d killed, %d survived (%d%% killed)\n' "$total" "$killed" "$surv" "$tpct"
+printf 'TOTAL: %d mutants run, %d killed, %d survived (%d%% killed)\n' "$total" "$killed" "$surv" "$tpct"
+
+# An interrupted sweep is not a baseline. The numbers above are honest about the mutants that ran,
+# but they describe a fraction of the file, and cosmic-ray executes jobs grouped by operator rather
+# than at random — so the fraction is not a representative sample and the rate cannot be quoted as
+# the module's score. Fail, so a CI consumer cannot mistake a truncated run for a passing one;
+# MUTATION_RESUME=1 picks the session back up rather than starting over.
+if [ "$incomplete" -gt 0 ]; then
+  echo "ERROR: $incomplete module(s) did not run to completion — the rates above cover only the" >&2
+  echo "       mutants that ran and are NOT the modules' scores. Re-run with MUTATION_RESUME=1" >&2
+  echo "       (and MUTATION_SESSION_DIR set) to finish them." >&2
+  exit 1
+fi
 
 # Opt-in gate: when MUTATION_MIN_KILL_PCT is set, exit non-zero if the total kill rate is below it.
 # Unset (the default) => report-only measurement. The score includes known equivalent mutants that
