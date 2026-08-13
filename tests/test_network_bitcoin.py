@@ -615,12 +615,30 @@ class TestMultiSourceBtcDataSource:
         assert int(await multi.get_tip_height()) == 900_000
 
     @pytest.mark.asyncio
-    async def test_get_tip_height_at_full_quorum_takes_the_minimum(self):
-        """quorum == len(sources) is unanimity-or-nothing, so the answer is the most
-        pessimistic source — the same rule ``MultiSourceBtcFundingReader`` uses for depth."""
+    async def test_get_tip_height_at_full_quorum_takes_the_majority_not_the_minimum(self):
+        """Raising ``quorum`` must not make the tip more deflatable — it used to.
+
+        This test previously asserted the minimum, on the reasoning that
+        ``quorum == len(sources)`` means unanimity-or-nothing and the most
+        pessimistic source should win. That reasoning is what let a single
+        source reporting 0 return 0: at five sources with ``quorum=5`` the
+        answer was ``heights[4]``, the minimum, so the configuration an
+        operator picks for MORE assurance was the one a lone liar could
+        deflate. See the companion assertion below.
+
+        The majority is now over the configured sources regardless of quorum,
+        so with three honest sources one propagation step apart the answer is
+        the height two of the three corroborate. The cost is real and
+        deliberate: this reads one block less pessimistic than the lowest
+        source. Discarding the bottom reading is exactly what makes a stuck
+        source harmless, and it cannot be had both ways.
+        """
         srcs = [self._make_source(h) for h in (900_002, 900_001, 900_000)]
         multi = MultiSourceBtcDataSource(srcs, quorum=3)
-        assert int(await multi.get_tip_height()) == 900_000
+        assert int(await multi.get_tip_height()) == 900_001
+
+        deflating = [self._make_source(h) for h in (900_000, 900_000, 0)]
+        assert int(await MultiSourceBtcDataSource(deflating, quorum=3).get_tip_height()) == 900_000
 
     # -- deterministic reads: the largest group wins, and a tie fails closed ----------------
 
@@ -730,13 +748,39 @@ class TestMultiSourceBtcDataSource:
             await multi.get_tip_height()
 
     @pytest.mark.asyncio
-    async def test_one_source_fails_still_reaches_quorum(self):
+    async def test_two_configured_sources_with_one_down_cannot_cross_check(self):
+        """Two sources is a request for cross-checking; losing one loses the check.
+
+        This previously returned the surviving source's word on the strength of
+        ``quorum=1``. A tip height is fund-critical — it is the numerator of
+        confirmation depth — and one unverified source's claim is exactly what
+        the multi-source class exists to avoid. Since the majority is now over
+        the CONFIGURED sources, one of two answering fails closed.
+
+        An operator who genuinely wants single-source trust configures a single
+        source, where the majority is that source; the case below shows that
+        still works, so this is not a guard refusing valid work.
+        """
         s1 = self._make_source()
         s2 = AsyncMock()
         s2.get_tip_height = AsyncMock(side_effect=NetworkError("timeout"))
         multi = MultiSourceBtcDataSource([s1, s2], quorum=1)
-        h = await multi.get_tip_height()
-        assert int(h) == 800000
+        with pytest.raises(NetworkError, match="majority of the configured sources"):
+            await multi.get_tip_height()
+
+    @pytest.mark.asyncio
+    async def test_a_deliberately_single_source_still_works(self):
+        """The honest-path pair for the refusal above."""
+        multi = MultiSourceBtcDataSource([self._make_source()], quorum=1)
+        assert int(await multi.get_tip_height()) == 800000
+
+    @pytest.mark.asyncio
+    async def test_three_sources_tolerate_one_outage(self):
+        """Outage tolerance is what a third source buys."""
+        s3 = AsyncMock()
+        s3.get_tip_height = AsyncMock(side_effect=NetworkError("timeout"))
+        multi = MultiSourceBtcDataSource([self._make_source(), self._make_source(), s3], quorum=2)
+        assert int(await multi.get_tip_height()) == 800000
 
 
 # ---------------------------------------------------------------------------
