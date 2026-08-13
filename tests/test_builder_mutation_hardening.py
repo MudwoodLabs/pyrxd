@@ -810,8 +810,30 @@ def test_ft_change_can_never_be_negative_through_the_public_builder() -> None:
 
 
 def test_the_per_byte_floor_is_the_per_kb_floor_divided_by_a_thousand() -> None:
-    """A cheap cross-check that survives a change to either constant: 10_000_000
-    photons/kB is 10_000/byte, and ``min_relay_fee`` must agree with both."""
+    """The internal consistency of the two floor accessors.
+
+    Note what this does **not** do: it does not pin the constant. Both helpers
+    derive from ``RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`` by ``// 1000``, so
+    all three assertions below are true by construction for any value divisible
+    by 1000 — measured: doubling the constant to ``20_000_000`` leaves every test
+    in this file green. They catch a *decoupling* of the two accessors, nothing
+    more. The constant's actual value is pinned by ``test_the_floor_is_radiants``
+    below, which is the test to update if Radiant's relay policy ever moves.
+    """
     assert relay_floor_photons_per_byte() * 1000 == RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
     assert min_relay_fee(1000) == RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
     assert min_relay_fee(1) == relay_floor_photons_per_byte()
+
+
+def test_the_floor_is_radiants() -> None:
+    """Pins the chain constant itself, in the direction that loses money.
+
+    ``fRequireStandard`` is hardcoded false on Radiant, so the relay floor is the
+    only thing standing between a build and an unrelayable transaction — and with
+    neither RBF nor CPFP a sub-floor transaction cannot be repaired, it just
+    squats on its inputs until mempool expiry. A floor set too *low* is therefore
+    the fund-losing direction, and it is the one to assert literally.
+    """
+    assert RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB == 10_000_000, "0.10 RXD/kB"
+    assert relay_floor_photons_per_byte() == 10_000
+    assert min_relay_fee(230) == 2_300_000

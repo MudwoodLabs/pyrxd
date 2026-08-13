@@ -287,10 +287,10 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Mutation testing reaches the transaction builders for the first time
   (`task mutate builders`).** `fee_sizing.py`, `glyph/ft.py`,
-  `glyph/royalty.py`, `glyph/builder.py`, `wallet.py` and `hd/wallet.py` — ~5,100
-  statements of fee sizing and value arithmetic — had never been in a mutation
-  scope, which is the surface every fee defect of the recent audit week lived
-  on. The new group is registered in `scripts/mutation_test.sh` (its clean test
+  `glyph/royalty.py`, `glyph/builder.py`, `wallet.py` and `hd/wallet.py` — 1,479
+  statements of fee sizing and value arithmetic (5,517 lines; the count is by
+  `ast` statement node, not by line) — had never been in a mutation scope, which
+  is the surface every fee defect of the recent audit week lived on. The new group is registered in `scripts/mutation_test.sh` (its clean test
   list measures 9.3 s, and the cleanup trap now restores its files by name so a
   mutant cannot be left in the tree).
 
