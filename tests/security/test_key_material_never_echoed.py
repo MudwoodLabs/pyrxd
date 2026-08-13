@@ -500,7 +500,31 @@ def test_the_eight_byte_threshold_is_exact(length: int, should_redact: bool) -> 
         assert redact(value) == value
 
 
-def test_redaction_survives_an_unloadable_wordlist(monkeypatch) -> None:
+def test_the_vocabulary_matches_what_bip39_itself_loads() -> None:
+    """Pins the one duplication the vocabulary branch costs.
+
+    ``security/errors.py`` reads ``hd/wordlist/*.txt`` as DATA rather than importing
+    ``pyrxd.hd.bip39``, because this package is the SDK's dependency leaf: that import
+    made ``mypy src/pyrxd/security/`` (what ``task ci`` runs) follow the whole tree and
+    report 266 pre-existing errors from 36 unrelated modules.
+
+    The cost is that two places now know where the wordlists live. This test is the
+    seam: every word ``WordList`` serves must be in the redaction vocabulary. Globbing
+    the directory means the redactor is the more inclusive of the two — ``WordList.files``
+    hardcodes ``en``/``zh-cn``, so a newly-shipped list would be redacted before it was
+    selectable, which is the safe direction for the discrepancy to run.
+    """
+    from pyrxd.hd.bip39 import WordList
+
+    WordList.load()
+    vocabulary = errors_module._bip39_vocabulary()
+    assert vocabulary, "the redaction vocabulary is empty"
+    for lang, words in WordList.wordlist.items():
+        missing = [w for w in words if w.casefold() not in vocabulary]
+        assert not missing, f"{len(missing)} words of the {lang} wordlist are not in the redaction vocabulary"
+
+
+def test_redaction_survives_an_unreadable_wordlist_directory(monkeypatch, tmp_path) -> None:
     """MUTANT: the ``except Exception`` in ``_bip39_vocabulary`` survived.
 
     That handler is the "never raises" half of a function called from
@@ -508,63 +532,52 @@ def test_redaction_survives_an_unloadable_wordlist(monkeypatch) -> None:
     exception construction into an unrelated crash — the failure mode where the real
     error is replaced by a stack trace about a wordlist. The lowercase-shape branch
     must still redact with the vocabulary unavailable.
+
+    The failure is real rather than mocked: a *directory* named ``english.txt`` matches
+    the glob and raises ``IsADirectoryError`` on read.
     """
-    from pyrxd.hd.bip39 import WordList
-
-    # Generate BEFORE breaking the loader — mnemonic_from_entropy needs it too.
     mnemonic = mnemonic_from_entropy(os.urandom(16))
+    (tmp_path / "english.txt").mkdir()
     monkeypatch.setattr(errors_module, "_BIP39_VOCABULARY", None)
-
-    def _explode() -> None:
-        raise OSError("wordlist file is unreadable")
-
-    monkeypatch.setattr(WordList, "load", staticmethod(_explode))
+    monkeypatch.setattr(errors_module, "_WORDLIST_DIR", tmp_path)
 
     was_redacted = redact(mnemonic) == "<redacted>"
     assert was_redacted, "the lowercase-shape branch must hold up with no vocabulary"
-    # And the uppercase form degrades to passing through rather than raising.
+    # The uppercase form degrades to passing through rather than raising.
     assert redact(mnemonic.upper()) == mnemonic.upper()
     assert str(KeyMaterialError("plain message")) == "plain message"
 
 
-def test_a_transient_vocabulary_failure_is_not_cached(monkeypatch) -> None:
+def test_a_transient_vocabulary_failure_is_not_cached(monkeypatch, tmp_path) -> None:
     """A failure must not permanently disable the vocabulary branch.
 
-    ``_bip39_vocabulary`` memoises only non-empty results, so a partially-initialised
-    ``pyrxd.hd.bip39`` during a circular import cannot leave the guard switched off
-    for the life of the process. Caching the empty set would make this test's second
-    half fail.
+    ``_bip39_vocabulary`` memoises only non-empty results, so one unreadable moment —
+    a not-yet-mounted install directory, a transient EIO — cannot leave the guard
+    switched off for the life of the process. Caching the empty set would make this
+    test's second half fail.
     """
-    from pyrxd.hd.bip39 import WordList
-
-    mnemonic = mnemonic_from_entropy(os.urandom(16))  # before breaking the loader
+    mnemonic = mnemonic_from_entropy(os.urandom(16))
+    real_dir = errors_module._WORDLIST_DIR
+    (tmp_path / "english.txt").mkdir()
     monkeypatch.setattr(errors_module, "_BIP39_VOCABULARY", None)
-    real_load = WordList.load
-
-    def _explode() -> None:
-        raise OSError("transient")
-
-    monkeypatch.setattr(WordList, "load", staticmethod(_explode))
+    monkeypatch.setattr(errors_module, "_WORDLIST_DIR", tmp_path)
     assert redact(mnemonic.upper()) == mnemonic.upper()  # degraded
 
-    monkeypatch.setattr(WordList, "load", staticmethod(real_load))
+    monkeypatch.setattr(errors_module, "_WORDLIST_DIR", real_dir)
     was_redacted = redact(mnemonic.upper()) == "<redacted>"
     assert was_redacted, "a transient wordlist failure permanently disabled the vocabulary branch"
 
 
-def test_an_empty_vocabulary_is_not_memoised(monkeypatch) -> None:
-    """The other edge of the same cache guard: ``load()`` SUCCEEDS but yields nothing.
+def test_an_empty_vocabulary_is_not_memoised(monkeypatch, tmp_path) -> None:
+    """The other edge of the same cache guard: the read SUCCEEDS but yields nothing.
 
-    Distinct from the raising case above — no exception, just an empty wordlist (a
-    truncated install, a wordlist dict that has not been populated yet). It must not be
-    memoised either, or the first such call disables the vocabulary branch permanently.
+    Distinct from the raising case above — no exception, just an empty directory (a
+    wheel built without package data, a partial install). It must not be memoised
+    either, or the first such call disables the vocabulary branch permanently.
     """
-    from pyrxd.hd.bip39 import WordList
-
     mnemonic = mnemonic_from_entropy(os.urandom(16))
     monkeypatch.setattr(errors_module, "_BIP39_VOCABULARY", None)
-    monkeypatch.setattr(WordList, "load", staticmethod(lambda: None))
-    monkeypatch.setattr(WordList, "wordlist", {})
+    monkeypatch.setattr(errors_module, "_WORDLIST_DIR", tmp_path)  # empty
 
     assert errors_module._bip39_vocabulary() == frozenset()
     assert errors_module._BIP39_VOCABULARY is None, "an empty vocabulary was cached"

@@ -23,6 +23,7 @@ than a private key in a stack trace.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Any
 
 __all__ = [
@@ -57,33 +58,45 @@ _BASE58_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]+$")
 _BIP39_VOCABULARY: frozenset[str] | None = None
 
 
+#: Where :mod:`pyrxd.hd.bip39` keeps its wordlists. Reached as *data*, deliberately
+#: not by importing that module: this package is the SDK's dependency leaf, and
+#: ``pyrxd.hd.bip39`` pulls in ``pyrxd.utils``, ``pyrxd.constants`` and from there most
+#: of the tree. That is not only an architectural smell — ``task ci`` type-checks
+#: ``src/pyrxd/security/`` and mypy follows function-local imports, so the import turned
+#: a 5-file check into a 36-file one and reported 266 pre-existing errors from modules
+#: this package has nothing to do with.
+#:
+#: Globbing beats naming the files: ``WordList.files`` hardcodes ``en``/``zh-cn``, so a
+#: newly-shipped wordlist would be covered here automatically but not there.
+#: ``tests/security/test_key_material_never_echoed.py`` pins the two together.
+_WORDLIST_DIR = Path(__file__).resolve().parent.parent / "hd" / "wordlist"
+
+
 def _bip39_vocabulary() -> frozenset[str]:
     """Return the shipped BIP-39 words, casefolded, or an empty set if unavailable.
-
-    Imported lazily and function-locally, for the same reason
-    :func:`pyrxd.security.secrets._base58check_decode` does it: ``pyrxd.hd.bip39``
-    imports THIS module, so a module-scope import would be a cycle.
 
     Two properties this must hold, because it runs inside exception construction:
 
     * **It never raises.** ``redact`` is called from ``RxdSdkError.__init__``; an
       exception raised while building an exception replaces a real error with an
-      unrelated one. Any failure degrades to the generic heuristic below.
-    * **Failure is not cached.** Only a non-empty result is memoised. Caching an
-      empty set from a transient failure — most plausibly a partially-initialised
-      ``pyrxd.hd.bip39`` during a circular import — would silently disable this
-      branch for the life of the process.
+      unrelated one. Any failure degrades to the shape heuristic in
+      :func:`_looks_like_mnemonic`.
+    * **Failure is not cached.** Only a non-empty result is memoised, so a transient
+      read failure cannot silently disable this branch for the life of the process.
     """
     global _BIP39_VOCABULARY
     if _BIP39_VOCABULARY is not None:
         return _BIP39_VOCABULARY
+    words: set[str] = set()
     try:
-        from ..hd.bip39 import WordList
-
-        WordList.load()
-        vocabulary = frozenset(word.casefold() for words in WordList.wordlist.values() for word in words)
-    except Exception:  # nosec B110 — see "never raises" above
+        for path in sorted(_WORDLIST_DIR.glob("*.txt")):
+            words.update(path.read_text(encoding="utf-8").split())
+    except Exception:
+        # Deliberately broad, and it RETURNS rather than swallowing: see "never raises"
+        # above. Any failure degrades this branch, it does not break the exception being
+        # constructed. (No `nosec` needed — bandit's B110 is about a bare `pass`.)
         return frozenset()
+    vocabulary = frozenset(word.casefold() for word in words)
     if vocabulary:
         _BIP39_VOCABULARY = vocabulary
     return vocabulary
