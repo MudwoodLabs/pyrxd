@@ -208,6 +208,80 @@ def _opt_int(d: dict[str, Any], key: str) -> int | None:
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
+#: Field-name substrings that mean "this document contains spending authority".
+#:
+#: Deliberately NARROWER than ``swap_cmds._SECRET_KEY_MARKERS``, which also lists
+#: ``"preimage"``. That marker is right for that function's job (telling an operator
+#: their file is not safe to hand to a counterparty) and wrong for this one: the
+#: hashlock preimage ``p`` is published on-chain by the claim that reveals it, so a
+#: file carrying only ``p`` is not a key file and demanding 0600 of it would be a
+#: spurious refusal on a public document.
+_PRIVATE_KEY_MARKERS = ("wif", "privkey", "private_key", "key_hex", "secret")
+
+
+def _carries_private_key(d: dict[str, Any]) -> bool:
+    """True if any populated field of *d* names spending authority."""
+    return any(any(marker in key.lower() for marker in _PRIVATE_KEY_MARKERS) and d[key] for key in d)
+
+
+def load_recovery_json(path: Path) -> dict[str, Any]:
+    """Read a recovery file under the same gate its fee-key sibling already gets.
+
+    The asymmetry this closes
+    -------------------------
+    ``swap build-claim`` took two files. The ``--fee-wif-file`` — ONE key, for fees —
+    went through :func:`~pyrxd.gravity.watch.cli_secrets.read_secret_file`: symlink
+    refused, ``fstat`` on the read fd, owner-only mode, ownership, bounded size. The
+    recovery file — which in a single-operator harness run carries ``taker_rxd_wif``
+    AND ``maker_rxd_wif``, i.e. BOTH counterparties' spending keys — was read with a
+    bare ``json.loads(path.read_text())``: no mode check, no ownership check, no
+    symlink refusal, no size bound.
+
+    The care in this module went into never letting a WIF into an error message
+    (:func:`_pkh_from_wif` is meticulous about it) — a leak-on-error defence, with
+    nothing behind it about the file those keys sit in at rest. A recovery file left
+    at the default 0644 by ``cp``, ``rsync``, an editor's write-new-then-rename, or an
+    unzip is world-readable, and nothing told the operator.
+
+    Why the mode check is conditional
+    ---------------------------------
+    A recovery file is not always a key file. The two-host harnesses persist only
+    public locators and pkhs (which is why ``--taker-pkh``/``--maker-pkh`` exist), and
+    refusing to read a public file because it is 0644 would be a false alarm on the
+    exact workflow the pkh flags were added for. So: read under the always-on half of
+    the gate, then require owner-only mode only if the document actually contains a
+    key. The mode is ``fstat``-ed from the fd the bytes came from, so judging it after
+    parsing is not a check-then-use race.
+
+    Raises:
+        ValidationError: the file is a symlink, not a regular file, owned by another
+            user, oversized, not UTF-8, not JSON, not a JSON object, or carries a
+            private key at a group/world-accessible mode.
+    """
+    # Local import: ``cli_secrets`` is package code with a deliberately small
+    # dependency graph, and ``swap_recovery_cmds`` already reaches it this way.
+    from ..gravity.watch.cli_secrets import read_file_guarded
+
+    text, mode = read_file_guarded(path, label="recovery file", require_owner_only=False)
+    try:
+        d = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # ``from None``: JSONDecodeError renders the offending line, and that line
+        # may be the one holding a WIF.
+        raise ValidationError(f"recovery file {path} is not valid JSON (line {exc.lineno})") from None
+    if not isinstance(d, dict):
+        raise ValidationError("recovery file is not a JSON object")
+    if mode is not None and mode & 0o077 and _carries_private_key(d):
+        # Action first: this message is rendered through ``sanitize_terminal(..., max_len=200)``
+        # at both CLI call sites, so the remedy must survive truncation.
+        raise ValidationError(
+            f"recovery file has mode {oct(mode)} and contains a private key — "
+            f"run `chmod 600 {path}` and retry. Treat those keys as exposed: at this mode "
+            "anyone with an account on this host could already have read them."
+        )
+    return d
+
+
 def parse_recovery_extras(path: Path) -> RecoveryExtras:
     """Parse the OPTIONAL locator fields out of a recovery JSON (never any secret).
 
@@ -215,9 +289,7 @@ def parse_recovery_extras(path: Path) -> RecoveryExtras:
     ``None`` so the CLI can ask for it via a flag. It deliberately does NOT read
     ``preimage_p_hex`` — see the module docstring for why that copy is not legitimate.
     """
-    d = json.loads(path.read_text())
-    if not isinstance(d, dict):
-        raise ValidationError("recovery file is not a JSON object")
+    d = load_recovery_json(path)
     return RecoveryExtras(
         btc_funding_outpoint=_opt_str(d, "btc_funding_outpoint"),
         eth_contract_address=_opt_str(d, "eth_contract_address"),
@@ -265,9 +337,7 @@ def covenant_pkhs(
     pkh flags exist: a maker recovering alone still needs the taker's pkh to rebuild the
     covenant, and a pkh is public.
     """
-    d = json.loads(path.read_text())
-    if not isinstance(d, dict):
-        raise ValidationError("recovery file is not a JSON object")
+    d = load_recovery_json(path)
 
     def _resolve(role: str, override: str | None) -> bytes:
         if override:

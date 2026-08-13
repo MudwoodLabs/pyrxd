@@ -89,6 +89,11 @@ def swap(tmp_path: Path):
             }
         )
     )
+    # Both counterparties' WIFs live in this file. The fee-key file below has been
+    # chmod 0600 since it was written; this one was not — the same asymmetry the
+    # library had, mirrored in the fixture. Later `swap["keys"].write_text(...)`
+    # rewrites truncate in place and inherit this mode.
+    keys.chmod(0o600)
     fee_file = tmp_path / "fee.wif"
     fee_file.write_text(fee_key.wif())
     fee_file.chmod(0o600)
