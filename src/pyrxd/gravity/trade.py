@@ -268,7 +268,6 @@ class GravityTrade:
         validated_txid = Txid(btc_txid)
 
         for attempt in range(self._cfg.max_poll_attempts):
-            await self._btc.get_tip_height()
             try:
                 await self._btc.get_raw_tx(validated_txid, min_confirmations=0)
             except NetworkError:
@@ -278,11 +277,11 @@ class GravityTrade:
                     continue
                 raise NetworkError(f"BTC tx {btc_txid[:16]}… not found after {self._cfg.max_poll_attempts} polls")
 
-            # Estimate confirmations from tip height minus tx block height.
-            # BtcDataSource.get_raw_tx with min_confirmations=0 returns mempool
-            # txs too; we need to determine confirmed height separately.
-            # We use get_tip_height vs get_tx_block_height via a minimal approach:
-            # try fetching with increasing min_conf until we know it's confirmed.
+            # Depth is asked of the source rather than computed here: re-requesting
+            # the tx at min_confirmations=min_conf succeeds only once it is buried
+            # that deep, so the source applies its own (quorum-checked) view of the
+            # tip. Subtracting a separately-fetched tip height from a block height
+            # would reintroduce the two-read race this avoids.
             try:
                 _ = await self._btc.get_raw_tx(validated_txid, min_confirmations=min_conf)
                 # Success means it has at least min_conf confirmations.
