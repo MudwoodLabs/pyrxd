@@ -30,6 +30,74 @@ _module_logger = logging.getLogger("pyrxd.watchtower")
 MAX_SECRET_FILE_BYTES = 64 * 1024
 
 
+def read_file_guarded(
+    path: str | Path,
+    *,
+    label: str,
+    max_bytes: int = MAX_SECRET_FILE_BYTES,
+    require_owner_only: bool = True,
+) -> tuple[str, int | None]:
+    """:func:`read_secret_file`, but returning the mode so a caller can judge it itself.
+
+    Same single-fd gate; the only thing ``require_owner_only=False`` relaxes is the
+    ``mode & 0o077`` rejection. Symlink refusal, ``S_ISREG``, the ownership check and
+    the size bound always apply — those are not hygiene advice, they are the difference
+    between reading the file you named and reading something somebody else chose.
+
+    Exists for a file whose *sensitivity depends on its contents*: a swap recovery
+    JSON carries private keys in a single-operator harness run and only public
+    locators in a two-host one. Demanding 0600 unconditionally would reject a
+    perfectly safe public file; skipping the check would let a world-readable file
+    full of WIFs through silently. The caller reads first, then decides — and because
+    the returned mode came from ``fstat`` on the fd the bytes were read from, deciding
+    later is not a TOCTOU.
+
+    Returns:
+        ``(text, mode)`` where ``mode`` is the POSIX permission bits, or ``None`` on a
+        platform where they are not meaningful (and where, correspondingly, nothing
+        was gated).
+    """
+    file_path = Path(path)
+    if os.name != "posix":  # no POSIX mode bits / no O_NOFOLLOW — bounded read only
+        try:
+            data = file_path.read_bytes()
+        except OSError as exc:
+            raise ValidationError(f"{label} {file_path}: {exc}") from exc
+        if len(data) > max_bytes:
+            raise ValidationError(f"{label} {file_path} is larger than {max_bytes} bytes — refusing to read")
+        return _decode(data, label=label, file_path=file_path), None
+
+    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(str(file_path), flags)
+    except OSError as exc:
+        hint = (
+            " (it is a symlink; pass the real file — a symlinked secret is refused)" if exc.errno == errno.ELOOP else ""
+        )
+        raise ValidationError(f"{label} {file_path}: {exc}{hint}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise ValidationError(f"{label} {file_path} is not a regular file — refusing to read a secret from it")
+        mode = st.st_mode & 0o777
+        if require_owner_only and mode & 0o077:
+            raise ValidationError(
+                f"{label} {file_path} has mode {oct(mode)}; must be 0o600 (owner-only). "
+                f"Run `chmod 600 {file_path}` and retry."
+            )
+        if st.st_uid != os.geteuid():
+            raise ValidationError(
+                f"{label} {file_path} is owned by uid {st.st_uid}, not this process's uid {os.geteuid()} — "
+                "refusing to read a credential owned by another user"
+            )
+        data = os.read(fd, max_bytes + 1)
+    finally:
+        os.close(fd)
+    if len(data) > max_bytes:
+        raise ValidationError(f"{label} {file_path} is larger than {max_bytes} bytes — refusing to read")
+    return _decode(data, label=label, file_path=file_path), mode
+
+
 def read_secret_file(
     path: str | Path,
     *,
@@ -68,45 +136,8 @@ def read_secret_file(
         ValidationError: the file is missing/unreadable, a symlink, not a regular file,
             group/world-accessible, owned by another user, oversized, or not UTF-8.
     """
-    file_path = Path(path)
-    if os.name != "posix":  # no POSIX mode bits / no O_NOFOLLOW — bounded read only
-        try:
-            data = file_path.read_bytes()
-        except OSError as exc:
-            raise ValidationError(f"{label} {file_path}: {exc}") from exc
-        if len(data) > max_bytes:
-            raise ValidationError(f"{label} {file_path} is larger than {max_bytes} bytes — refusing to read")
-        return _decode(data, label=label, file_path=file_path)
-
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
-    try:
-        fd = os.open(str(file_path), flags)
-    except OSError as exc:
-        hint = (
-            " (it is a symlink; pass the real file — a symlinked secret is refused)" if exc.errno == errno.ELOOP else ""
-        )
-        raise ValidationError(f"{label} {file_path}: {exc}{hint}") from exc
-    try:
-        st = os.fstat(fd)
-        if not stat.S_ISREG(st.st_mode):
-            raise ValidationError(f"{label} {file_path} is not a regular file — refusing to read a secret from it")
-        mode = st.st_mode & 0o777
-        if mode & 0o077:
-            raise ValidationError(
-                f"{label} {file_path} has mode {oct(mode)}; must be 0o600 (owner-only). "
-                f"Run `chmod 600 {file_path}` and retry."
-            )
-        if st.st_uid != os.geteuid():
-            raise ValidationError(
-                f"{label} {file_path} is owned by uid {st.st_uid}, not this process's uid {os.geteuid()} — "
-                "refusing to read a credential owned by another user"
-            )
-        data = os.read(fd, max_bytes + 1)
-    finally:
-        os.close(fd)
-    if len(data) > max_bytes:
-        raise ValidationError(f"{label} {file_path} is larger than {max_bytes} bytes — refusing to read")
-    return _decode(data, label=label, file_path=file_path)
+    text, _mode = read_file_guarded(path, label=label, max_bytes=max_bytes, require_owner_only=True)
+    return text
 
 
 def _decode(data: bytes, *, label: str, file_path: Path) -> str:

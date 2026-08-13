@@ -6,6 +6,80 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Security
+
+- **A swap recovery file's private keys are now read under the same gate its fee
+  key already got.** `pyrxd swap build-claim` / `build-refund` / `status` take two
+  files. `--fee-wif-file` holds ONE key, for fees, and has always gone through
+  `read_secret_file`: symlink refused, `fstat` on the read fd, owner-only mode,
+  ownership, bounded size. The recovery file — which in a single-operator harness
+  run carries `taker_rxd_wif` **and** `maker_rxd_wif`, i.e. both counterparties'
+  spending authority — was read with a bare `json.loads(path.read_text())`: no mode
+  check, no ownership check, no symlink refusal, no size bound.
+
+  The care in that module had all gone into never letting a WIF into an *error
+  message* (`_pkh_from_wif` is meticulous about it, and rightly). Nothing looked at
+  the file those keys sit in at rest. The writer
+  (`scripts/_dust_swap_shared.atomic_write_mode_600`) creates it `O_EXCL` at 0600
+  and always has; the gap was every way a correct file stops being one — `cp`,
+  `rsync -p` from a looser source, an unzip, a restore from backup, an editor that
+  writes-new-then-renames at umask.
+
+  `pyrxd.cli.swap_recovery.load_recovery_json` now backs all three readers
+  (`parse_recovery_extras`, `covenant_pkhs`, `swap_cmds.parse_recovery_file`). The
+  mode requirement is **conditional on content**: a file is refused for being
+  group/world-readable only if it actually contains a private key, because the
+  two-host harnesses persist only public locators and pkhs and demanding 0600 of a
+  public document would reject the workflow `--taker-pkh` / `--maker-pkh` exist for.
+  Reading first and judging after is not a check-then-use race — the mode is
+  `fstat`-ed from the descriptor the bytes came from.
+
+- **The wallet seed file's permission check no longer has a TOCTOU.**
+  `HdWallet._load_existing` refused a group/world-readable wallet file by calling
+  `path.stat()`, then read it eleven lines later with `path.read_bytes()` — a
+  check-then-use pair on a *path*, which says nothing about the file that actually
+  gets read. The two calls were separated by `seed_from_mnemonic`, i.e. 2048 rounds
+  of PBKDF2-HMAC-SHA512 chosen to be slow, making that the widest race window in the
+  wallet path. Anyone able to replace the path during it had the mode gate report on
+  a file that was never opened.
+
+  Mode and bytes now come from one descriptor (`_read_wallet_file`: `fstat` on the
+  read fd, `S_ISREG`, `O_NONBLOCK` so a FIFO is rejected instead of hanging the
+  process, bounded read). Symlinked wallet paths keep working — a wallet on an
+  encrypted or removable mount is a legitimate setup — and the gate now correctly
+  judges the symlink's *target*, which is the file whose permissions matter.
+
+- **`redact()` no longer exempts a mnemonic that is not written in lowercase.**
+  `RxdSdkError.__init__` runs every positional argument through `redact`, so it is
+  what stands between an embedder's `raise ValidationError(mnemonic)` and a seed
+  phrase in a stack trace. Its BIP-39 branch required every token to carry no
+  uppercase. Steel backup plates (Cryptosteel, Billfodl, every stamped-tile product)
+  are UPPERCASE-only, and phone keyboards and spreadsheets autocapitalise the first
+  word — so an UPPERCASE, Title Case, or first-word-capitalised phrase passed
+  through **verbatim**. The disclosure is total rather than partial: wordlists are
+  lowercase, so lowercasing a leaked phrase reproduces the mnemonic exactly.
+
+  This is the second assumption in that one predicate; the first — `t.isascii()`,
+  which exempted every non-Latin wordlist the SDK ships — was fixed earlier. A
+  case-insensitive check against the shipped BIP-39 vocabularies is now tried when
+  the lowercase-shape branch declines. It is a *vocabulary* test rather than a
+  second shape test on purpose: simply dropping the case condition would redact
+  ordinary prose, since `"Could not connect to the remote peer at this time"` is
+  eight alphabetic tokens and `redact` runs over the arguments of every exception
+  this SDK raises.
+
+### Changed
+
+- **`scripts/mutation_test.sh` gained a `keys` group.** Mutation testing covered
+  `spv/`, `script/`, `transaction/` and `glyph/dmint/` — the consensus-critical
+  arithmetic — and none of the code standing between key material or operator input
+  and a sink. The new group mutates `security/errors.py`, `security/secrets.py`,
+  `base58.py`, `hd/bip32.py`, `hd/descriptor.py` and
+  `gravity/watch/cli_secrets.py`. These are cheap-to-test pure predicates, which is
+  exactly the shape where line coverage is least informative: `pyrxd.security` sits
+  at 100% line and branch coverage, and that number cannot distinguish a guard whose
+  removal a test would notice from one whose removal nothing would.
+
 ### Added
 
 - **Mutation testing now covers the value-moving modules, not just the
@@ -217,6 +291,56 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The shared fee-rate gate now judges a rate from BOTH ends.**
+  `assert_fee_rate_clears_relay_floor` — the one check every builder runs on a
+  caller-supplied `fee_rate` — refused a rate below Radiant's relay floor and
+  accepted *anything* above it. A fee is `size × fee_rate`, so a rate `k` times
+  the floor pays `k` times the requirement, and the builders behind this gate
+  spend the difference irreversibly: an NFT transfer and a sweep have **no change
+  output at all**, so the whole overpay leaves with the miner. Measured on
+  `build_nft_transfer_tx` before the bound existed: `fee_rate=10_000_000` —
+  which is literally `RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`, the
+  per-**kB** constant `pyrxd.fee_sizing` exports one import away from the
+  per-**byte** one — burned **2,320,000,000 photons (23.2 RXD)** off a 229-byte
+  transfer at a **1009x** overpay, silently, with the build reporting success.
+
+  The ceiling is `MAX_FEE_OVERPAY_MULTIPLE × relay_floor_photons_per_byte()` =
+  100_000 photons/byte. That constant is reused rather than a new number
+  invented, because `fee / requirement` and `fee_rate / floor` are the *same
+  ratio*. The highest deliberate rate anywhere in `src/` or `tests/` is 90_000
+  (9x), measured over every `fee_rate=` literal, so the bound has room; it is a
+  multiple, so it tracks the floor if the floor moves. `allow_overpay=True`
+  mirrors the existing `allow_below_relay_floor` hatch, and each skips only its
+  own bound. Stated rather than left to be discovered: one extra zero on a rate
+  that is already the floor lands on **exactly** 100_000, which is permitted —
+  the bound catches the 100x and 1000x slips, not every fat finger.
+  `RxdWallet`, `HdWallet`, the FT airdrop/transfer builders,
+  `build_nft_transfer_tx` and the watch-only builder all inherit it from the one
+  gate.
+
+- **No builder rejected a repeated outpoint; three now do.** An outpoint is
+  unique on chain, so the same `(txid, vout)` twice is always a caller mistake —
+  and nothing downstream noticed. Measured before the checks: an `FtUtxoSet`
+  holding one UTXO twice reported **double** the real balance from `total()` and
+  let `select()` hand the same outpoint back twice; `FtUtxoSet.build_airdrop_tx`
+  with one funding UTXO passed twice signed a transaction carrying a duplicate
+  input — rejected by every node as `bad-txns-inputs-duplicate` — and reported a
+  fee **4x** the real one, because `funding_total` and the final
+  `assert_pays_for_its_size` are handed the same double-counted number.
+  `FtUtxoSet.__init__` now refuses a repeated token outpoint,
+  `build_airdrop_tx` refuses a repeated funding outpoint and refuses an outpoint
+  listed as both token and funding (the seam neither list can see on its own).
+  All three key on `(txid, vout)` and not on `txid`: one transaction paying a
+  holder at several output indexes is ordinary and still builds.
+
+- **`AirdropFunding.value` is validated at construction**, the way
+  `FtUtxo.value` already was. It is summed into the RXD budget the fee comes out
+  of and was the only unchecked number there; a wrong one surfaced late and
+  unhelpfully — measured as `'float' object has no attribute 'to_bytes'` from
+  the middle of output serialisation, `OverflowError` for a negative, and for
+  `True` a nonsense "budget 1 photons" in the insufficient-funding message. The
+  floor is 1 photon, not 546: Radiant's real output rule is `nValue <= 0`.
+
 - **The soulbound classification is split into two tiers so the weaker one is
   never sold as the stronger.** `classify_soulbound` matches on semantic
   markers, which is right for its own job but too loose to drive a label:
@@ -299,6 +423,79 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   No assertion was weakened and no production behaviour changed — these are tests for
   checks that were already correct. Each guard group carries an honest-path control, so a
   guard that refused *valid* work would fail too.
+- **Mutation testing reaches the transaction builders for the first time
+  (`task mutate builders`).** `fee_sizing.py`, `glyph/ft.py`,
+  `glyph/royalty.py`, `glyph/builder.py`, `wallet.py` and `hd/wallet.py` — 1,479
+  statements of fee sizing and value arithmetic (5,517 lines; the count is by
+  `ast` statement node, not by line) — had never been in a mutation scope, which
+  is the surface every fee defect of the recent audit week lived on. The new group is registered in `scripts/mutation_test.sh` (its clean test
+  list measures 9.3 s, and the cleanup trap now restores its files by name so a
+  mutant cannot be left in the tree).
+
+  The first pass was **hand-mutation, not cosmic-ray**: mutants chosen for
+  consequence, planted one at a time. That is a deliberately partial method and
+  `docs/how-to/mutation-testing.md` records it as one — it says nothing about
+  the mutants nobody wrote. Every survivor below was confirmed against the
+  **whole** offline suite, because the first sweep ran a targeted test list and
+  produced three *false* survivors that a full-suite re-run disproved; that
+  lesson is written up in the how-to alongside the numbers.
+
+  The conservation and "1 photon = 1 unit" arithmetic came out **strong**:
+  over-delivering an FT recipient by one unit is caught by 44 tests, burning one
+  unit of FT change by 25, letting the token pay its own fee by 19, dropping the
+  two-pass DER signature headroom by 57, and every royalty-arithmetic mutant
+  dies, including removal of the `sale_price` cap (6 tests). The gaps clustered
+  elsewhere — in the fail-closed backstops themselves, which every builder has
+  and only some builders prove; in `fee_sizing`'s less-travelled helpers, where
+  the existing tests happened to sit on inputs for which the mutation makes no
+  numerical difference; and in branches nothing ever executed.
+
+  Guards that were **correct but unverified** — each deletable or invertible
+  with the whole offline suite staying green — now pinned in
+  `tests/test_builder_mutation_hardening.py`:
+
+  - `FtUtxoSet.build_airdrop_tx`'s and `HdWallet.build_send_max_tx`'s final
+    "does this transaction pay for its own bytes" assertions. The differentials
+    that exercise those exist, but were written for their siblings: the
+    `RxdWallet` one is parametrized over `send` and `send_max`, the `HdWallet`
+    one only ever called `build_send_tx`.
+  - `build_nft_transfer_tx`'s uneconomic-output floor. Without it a carrier too
+    small for its own fee yields a **negative** output value and is signed
+    anyway — `assert_pays_for_its_size` is handed `nft_utxo_value -
+    output_value`, which is the fee by construction and stays correct however
+    absurd the output becomes.
+  - `WITNESS_SCALE_FACTOR == 4`. Both existing `bitcoin_virtual_size` cases are
+    algebraically invariant to it, so raising it to 5 — which *under*-states a
+    BTC transaction's size and therefore its fee — survived everything offline.
+  - `fee_never_below_relay_floor`'s `size × rate` arm and its rate validation:
+    every prior test ran at or below the floor, where both arms of the `max`
+    give the same number.
+  - `radiant_relay_size`'s bytes-only gate and `fee_overpay_multiple`'s
+    divide-by-zero clamp.
+  - `royalty_payouts`'s `and royalty.bps > 0`, which is **not** a dead branch:
+    delete it and `GlyphRoyalty(bps=0, minimum=1000, splits=((addr, 0),))` — a
+    legal, constructible shape that pays 1000 photons today — raises
+    `ZeroDivisionError`. Also its 20-byte pkh check;
+    `address_to_public_key_hash` validates the base58check shape, not the
+    payload length.
+  - `FtUtxoSet.__init__`'s three constructor type checks, `build_transfer_tx`'s
+    own `amount` check (deleting it changes the documented `ValueError` into a
+    `ValidationError` one layer down), and the *value* of
+    `MAX_AIRDROP_RECIPIENTS` — changing 1000 to 3 left the entire offline suite
+    green, because the only test exercising the cap derives its list length from
+    the symbol.
+
+  One guard is **unreachable and now says so**: `build_airdrop_tx`'s
+  `ft_change < 0` raise cannot fire through the public API, because `select()`
+  refuses first. The test that named it never reached it — a tautological test,
+  which is worse than none because it reports coverage that does not exist. What
+  is pinned instead is the `select()` property that makes the guard unreachable.
+
+  Every test in the new file was proved by planting its own mutant and watching
+  it go red, and every one is paired with its inverse-bug half — the fee-rate
+  ceiling itself must pass, two vouts of one transaction must still build, a
+  `bytearray` must still be measured, an empty FT holding must still be a legal
+  set — because a guard that refuses valid work is its own fund-safety defect.
 - **`pyrxd.network` is now in mutation-testing scope, and the guards there are pinned by
   tests that die when they are removed.** `task mutate` covered `spv/`, `script/`,
   `transaction/` and `glyph/dmint/`; the modules that decide whether a lying server can
@@ -311,9 +508,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `gravity/watch/adapters.py` — neutered each one in turn (`if False:`, an inverted
   comparison, a widened match) and ran the suite. **Twelve survived; eleven were real.**
   The sharpest was `_verify_raw_matches_txid`, the audit-F-004 binding that makes a source
-  prove the bytes it returned really are the transaction that was asked for: setting its
-  comparison to `if False:` left the entire suite green at all four call sites. Also
-  unpinned:
+  prove the bytes it returned really are the transaction that was asked for — and the
+  interesting part is *where* it was unpinned. The function itself was well tested: setting
+  its comparison to `if False:` is killed by the pre-existing
+  `tests/test_btc_txid_from_raw.py::test_verify_raw_matches_txid_binds_returned_bytes_f004`.
+  Its **wiring** was not. Deleting the call outright at the Bitcoin Core call site
+  (`bitcoin.py:730`) left all **8,777** offline tests green — a guard can be thoroughly
+  tested in isolation and still be absent from a path that needs it, and only a mutation
+  that removes the *call* can see that. Also unpinned:
 
   - ElectrumX's 80-byte block-header length check, and the 10 MB frame cap on both
     branches of the reader loop;
