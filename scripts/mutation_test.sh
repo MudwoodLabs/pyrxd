@@ -130,8 +130,8 @@ group_tests() {
 # the slow lists (~9-11s clean) because ECDSA signing dominates them.
 group_timeout() {
   case "$1" in
-    spv)    echo "30.0" ;;
-    script) echo "30.0" ;;
+    spv)         echo "30.0" ;;
+    script)      echo "30.0" ;;
     fee)         echo "60.0" ;;
     wallet)      echo "60.0" ;;
     hdwallet)    echo "60.0" ;;
@@ -139,7 +139,7 @@ group_timeout() {
     swap)        echo "30.0" ;;
     coordinator) echo "30.0" ;;
     network)     echo "30.0" ;;
-    *)      echo "45.0" ;;
+    *)           echo "45.0" ;;
   esac
 }
 
@@ -252,7 +252,17 @@ for g in $GROUPS_REQUESTED; do
   for path in $(group_files "$g"); do
     name="${path//\//-}"
     cfg="$WORK/cr-$name.toml"; sess="$WORK/$name.sqlite"
-    rm -f "$sess"
+    # `cosmic-ray exec` only runs jobs that have no result yet, so an existing session resumes
+    # where it stopped. That is opt-in (MUTATION_RESUME=1) rather than automatic because the
+    # session's mutation specs were computed from the source as it was at `init` time: resuming
+    # across an edit to the module would mix results from two different files under one score.
+    # Default is wipe-and-init, which is always correct. Resume is for picking a multi-hour group
+    # back up after a timeout or a kill, when the tree has not moved.
+    if [ -z "${MUTATION_RESUME:-}" ] || [ ! -s "$sess" ]; then
+      rm -f "$sess"
+    else
+      echo "  (resuming existing session $sess)"
+    fi
     cat > "$cfg" <<EOF
 [cosmic-ray]
 module-path = "src/pyrxd/$path.py"
@@ -264,7 +274,11 @@ test-command = "$PYTEST $TESTS -x -q -p no:randomly -p no:cacheprovider -o addop
 name = "local"
 EOF
     f_t0=$(date +%s)
-    cosmic-ray init "$cfg" "$sess" >/dev/null 2>&1
+    # Skip `init` when the session already exists. cosmic-ray 8.4.6 was observed to leave both the
+    # specs and the stored results intact when re-init'd over a populated session, so this is
+    # belt-and-braces rather than a fix for a known wipe — but re-deriving specs is exactly the
+    # step that would silently renumber them if the module had changed, so don't run it.
+    [ -s "$sess" ] || cosmic-ray init "$cfg" "$sess" >/dev/null 2>&1
     cosmic-ray exec "$cfg" "$sess" >/dev/null 2>&1
     git checkout -- "src/pyrxd/$path.py" 2>/dev/null
     f_t1=$(date +%s)

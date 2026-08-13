@@ -1,4 +1,4 @@
-# Mutation testing the consensus-critical modules
+# Mutation testing the consensus-critical and value-moving modules
 
 Mutation testing measures **test quality**, not just line coverage: it mutates the source (e.g. flips
 `!= 80` to `< 80`, `i - 1` to `i + 1`) and checks whether the suite *catches* each change. A **killed**
@@ -13,21 +13,68 @@ poetry run task mutate                    # default scope: spv (the original gat
 poetry run task mutate script             # script/ primitives
 poetry run task mutate transaction        # transaction/ incl. the FORKID sighash preimage
 poetry run task mutate dmint              # glyph/dmint/ covenant builders + DAA + parser
-poetry run task mutate all                # everything, sequentially (hours)
+
+poetry run task mutate fee                # fee_sizing.py — the one fee-sizing rule
+poetry run task mutate wallet             # wallet.py + hd/wallet.py — send/sweep builders
+poetry run task mutate glyph              # glyph/ft.py + glyph/builder.py — token builders
+poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
+poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
+poetry run task mutate network            # network/ — remote-response parsing + failover
+
+poetry run task mutate consensus          # the original four groups
+poetry run task mutate value              # the six value-moving groups
+poetry run task mutate all                # everything, sequentially (many hours)
 ```
 
 This runs [`scripts/mutation_test.sh`](../../scripts/mutation_test.sh). It mutates
 `src/pyrxd/<scope>/<file>.py` **in place** (the editable install picks it up), runs a scope-targeted
-fast test command per mutant, and restores via `git` (a trap restores on any exit). It is an
-**occasional gate, not part of `task ci`** (slow). Don't run concurrent git ops on `src/pyrxd` while it
-runs — when other sessions/worktrees are active, run the whole thing in a detached worktree (see
+fast test command per mutant, and restores via `git`. It is an **occasional gate, not part of
+`task ci`** (slow). Don't run concurrent git ops on `src/pyrxd` while it runs — when other
+sessions/worktrees are active, run the whole thing in a detached worktree (see
 `docs/solutions/integration-issues/task-ci-spurious-failures-from-concurrent-worktrees.md`).
 
 Useful environment knobs:
 
 - `MUTATION_SESSION_DIR=dir` — keep the cosmic-ray session `.sqlite` files for survivor triage
   (query them with `cr-report`, `cr-html`, or a `mutation_specs ⋈ work_results` join for diffs).
+- `MUTATION_REPORT_DIR=dir` — where the per-group Markdown survivor lists land
+  (default `.mutation-reports/`, gitignored).
 - `MUTATION_MIN_KILL_PCT=N` — opt-in gate: exit non-zero below N% total kill rate.
+- `MUTATION_RESUME=1` — keep an existing session and pick up where it stopped. `cosmic-ray exec`
+  only runs jobs with no result yet, so a group killed at 90% resumes instead of restarting. Use it
+  with `MUTATION_SESSION_DIR` and **only when the module has not changed since the session was
+  created** — the session's mutation specs were derived from the source at `init` time, so resuming
+  across an edit would score two different versions of the file under one number.
+
+### Before it mutates anything
+
+Three preflight checks run first, each for a failure mode that otherwise produces a confident,
+meaningless number:
+
+1. **Target sources must be clean.** Cleanup is `git checkout -- <files>`; with uncommitted work in
+   a target file that is data loss, and the "baseline" would not be the committed code.
+2. **`import pyrxd` must resolve to this checkout.** A shared virtualenv whose editable install
+   points at a different clone (a `.pth` naming another repo root) would have cosmic-ray mutate files
+   the tests never import — every mutant "survives" and a healthy module scores ~0% killed.
+3. **The group's clean suite must be green.** cosmic-ray reads a non-zero exit as *mutant killed*, so
+   a red or uncollectable test list scores **100% killed on every module**. That is the most
+   flattering number the tool can produce and it is entirely fiction.
+
+The run also restores on `INT`/`TERM`/`HUP`, not just `EXIT`: bash skips an `EXIT` trap when killed by
+an untrapped signal, and a run killed mid-sweep used to leave a mutated source file in the tree
+looking exactly like a hand edit.
+
+### Parallelism
+
+cosmic-ray's `local` distributor is serial, and two groups **cannot** share one checkout — the mutation
+is a real edit to `src/pyrxd`, so a second group's tests would import the first group's mutant and
+mis-score it. To use more cores, give each group its own clone and run one group per clone:
+
+```bash
+git clone --local --no-hardlinks . /tmp/lane-$g && cd /tmp/lane-$g && task mutate $g
+```
+
+That is how the baseline below was measured.
 
 > Scope exclusions, on purpose: `spv/proof.py` / `spv/witness.py` (covered by the fuzz harness, ~30×
 > slower per mutant), `__init__.py` re-export shims, `script/unlocking_template.py` (17-line ABC), and
