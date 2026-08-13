@@ -440,6 +440,17 @@ textarea#paste-input:disabled {
   line-height: 1.4;
 }
 
+/* A warning that has to be read BEFORE the values it qualifies, rather than
+   after them. Used for the CSV disable-bit case: bit 31 makes consensus
+   ignore the relative lock, so the decoded delay rendered below this banner
+   enforces nothing, and a reader who meets the delay first walks away with
+   the opposite of the truth. Same look as .warning-banner, spaced to lead
+   the card instead of trailing it. */
+.warning-banner-lead {
+  margin-top: 0.75rem;
+  margin-bottom: 0.75rem;
+}
+
 .kv-warning {
   /* The value text itself is unchanged — colour cue only. */
   color: var(--error-fg);

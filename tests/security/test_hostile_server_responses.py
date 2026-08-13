@@ -308,7 +308,7 @@ async def test_get_merkle_proof_fails_closed_on_hostile_pos(cls, shape: str, val
     negative leaf index has already failed to fail closed, and the ``OverflowError`` never
     reaches the verifier at all.
     """
-    body = with_field({"merkle": ["ab" * 32], "pos": 3}, "pos", value)
+    body = with_field({"block_height": 100, "merkle": ["ab" * 32], "pos": 3}, "pos", value)
     source = esplora_source(cls, [jbytes(body)])
     coro = source.get_merkle_proof(Txid(VALID_TXID), BlockHeight(100))
 
@@ -331,7 +331,7 @@ async def test_get_merkle_proof_fails_closed_on_hostile_branch(cls, merkle: Any)
     A JSON string passes straight through as the "branch": iterating ``"deadbeef"`` yields
     eight one-character "hashes". A boundary must not hand its caller a type-confused proof.
     """
-    source = esplora_source(cls, [jbytes({"merkle": merkle, "pos": 3})])
+    source = esplora_source(cls, [jbytes({"block_height": 100, "merkle": merkle, "pos": 3})])
     await assert_fail_closed(
         source.get_merkle_proof(Txid(VALID_TXID), BlockHeight(100)),
         label=f"{cls.__name__}.get_merkle_proof[merkle={type(merkle).__name__}]",
@@ -477,7 +477,7 @@ async def test_core_funding_reader_confirmations_fails_closed(shape: str, value:
     A MISSING key is the one legitimate falsy answer (Bitcoin Core omits
     ``confirmations`` for a mempool tx), and must read as depth 0 — never as confirmed.
     """
-    data = with_field({"confirmations": 3, "hex": _VALID_RAW.hex()}, "confirmations", value)
+    data = with_field({"confirmations": 3, "hex": _VALID_RAW.hex(), "txid": VALID_TXID}, "confirmations", value)
     coro = core_reader(data).confirmations(VALID_TXID)
 
     if isinstance(value, _Missing) or value is None:

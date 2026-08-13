@@ -245,9 +245,17 @@ def _render_txid_human(payload: dict) -> str:
             elif type_ == "self-replicating-covenant":
                 lines.append(f"            bound_ref={row.get('bound_ref_outpoint', '(multiple)')}")
                 lines.append("            markers only — NOT proof of soulbound")
-            elif type_ == "unknown" and row.get("token_bearing"):
+            elif type_ == "unknown":
+                # Carried (0xd0/0xd8) vs merely named (0xd1/0xd2/0xd3). Only the
+                # first burns when this output is spent as plain funding.
                 for ref_row in row.get("input_refs") or []:
                     lines.append(f"            ref={ref_row['ref_outpoint']} ({ref_row['opcode']}) TOKEN-BEARING")
+                for ref_row in row.get("referenced_refs") or []:
+                    lines.append(
+                        f"            ref={ref_row['ref_outpoint']} ({ref_row['opcode']}) referenced, not carried"
+                    )
+                if row.get("token_bearing") is None:
+                    lines.append("            token-bearing UNKNOWN (does not decode) — treat as token-bearing")
             elif type_ == "error":
                 lines.append(f"            (classifier error: {row.get('error')})")
     metadata = payload.get("metadata")
@@ -409,13 +417,28 @@ def _render_timelock_body(payload: dict, type_: str) -> list[str]:
     basis = payload["locktime_basis"]
     units = payload["locktime_units"]
     if type_ == "p2pkh-cltv":
+        # Two different numbers, one block apart, and printing only the first
+        # answers a question nobody asked. OP_CLTV constrains the SPENDING TX's
+        # nLockTime (>= the encoded value); IsFinalTx then requires that
+        # nLockTime be STRICTLY LESS than the containing block's height/time.
+        # So the encoded value is a floor on a tx field, and the earliest block
+        # that can carry the spend is one past it. ``locktime_earliest`` is
+        # derived in _inspect_core so every surface prints the same number.
+        earliest = payload.get("locktime_earliest")
         body.append("  lock:         ABSOLUTE (OP_CHECKLOCKTIMEVERIFY)")
         if basis == "height":
-            body.append(f"  spendable at: block height >= {units:,}")
+            body.append(f"  requires:     spending tx nLockTime >= {units:,} (block height)")
+            if earliest is not None:
+                body.append(f"  earliest spend: a block at height {earliest:,} or later")
         else:
-            body.append(f"  spendable at: Unix time >= {units} (locktime >= {LOCKTIME_THRESHOLD:,})")
-        body.append("  A spending tx must set nLockTime to at least this value (and a")
-        body.append("  non-final nSequence on the input) or consensus rejects it.")
+            body.append(f"  requires:     spending tx nLockTime >= {units} (Unix time; >= {LOCKTIME_THRESHOLD:,})")
+            if earliest is not None:
+                body.append(f"  earliest spend: the first block whose time-lock clock passes {earliest}")
+        body.append("  The encoded value is a floor on the transaction's nLockTime, NOT a")
+        body.append("  height at which this output turns spendable: consensus (IsFinalTx)")
+        body.append("  requires nLockTime to be STRICTLY LESS than the height/time of the")
+        body.append("  block containing the spend, so the encoded value itself is one block")
+        body.append("  too early. The spending input's nSequence must also be non-final.")
     else:
         body.append("  lock:         RELATIVE (OP_CHECKSEQUENCEVERIFY, BIP-68/112)")
         body.append(f"  raw sequence: {payload['locktime_value']} (0x{payload['locktime_value']:x})")
@@ -448,21 +471,39 @@ def _render_ref_summary_body(payload: dict) -> list[str]:
     The one fact worth surfacing about a script no classifier claims: whether
     it is token-bearing. Spending a ref-carrying UTXO as plain funding burns
     the token it carries.
+
+    ``input_refs`` is the CARRIED set (0xd0 / 0xd8 — Radiant's
+    ``foundPushRefs``); ``referenced_refs`` is the set the script merely names
+    (0xd1 require / 0xd2, 0xd3 disallow). Only the first burns when spent, so
+    only the first gets the warning — see :func:`._ref_summary`.
     """
     token_bearing = payload.get("token_bearing")
     refs = payload.get("input_refs") or []
+    named = payload.get("referenced_refs") or []
+    # A script that merely gates on a ref is worth reporting, but never under
+    # the burn warning — that is the false positive that trains readers to
+    # ignore the real one.
+    named_body: list[str] = []
+    if named:
+        named_body.append(f"  references (does NOT carry) {len(named)} ref(s):")
+        for row in named:
+            named_body.append(f"      {row['opcode']}  {row['ref_outpoint']}")
+        named_body.append("  0xd1 OP_REQUIREINPUTREF gates on a ref being live among the spending")
+        named_body.append("  tx's inputs; 0xd2/0xd3 forbid one. Neither holds a token here, so")
+        named_body.append("  spending this output destroys nothing.")
     if token_bearing is None:
         return [
             "  token-bearing: UNKNOWN — the script does not decode as an opcode stream,",
             "  so the walk could not rule out an input ref. Treat it as token-bearing.",
         ]
     if not refs:
-        return ["  token-bearing: no (the opcode-aware walk found no OP_PUSHINPUTREF-family ref)"]
+        return ["  token-bearing: no (the opcode-aware walk found no OP_PUSHINPUTREF/SINGLETON)", *named_body]
     body = [f"  token-bearing: YES — carries {len(refs)} input ref(s):"]
     for row in refs:
         body.append(f"      {row['opcode']}  {row['ref_outpoint']}")
     body.append("  Do NOT spend this as plain funding: a ref-carrying UTXO fed in as a fee")
     body.append("  input destroys the token it carries.")
+    body.extend(named_body)
     return body
 
 
@@ -511,9 +552,15 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool)
                             token_ref_outpoint, height, max_height, reward,
                             algo, daa_mode
         type=p2pkh-cltv   → owner_pkh, locktime_value, locktime_basis
-                            ("height"|"unix_time"), locktime_units. Absolute
-                            time-lock (BIP-65); basis is decided by
-                            LOCKTIME_THRESHOLD (500,000,000).
+                            ("height"|"unix_time"), locktime_units,
+                            locktime_earliest. Absolute time-lock (BIP-65);
+                            basis is decided by LOCKTIME_THRESHOLD
+                            (500,000,000). locktime_units is the FLOOR on the
+                            spending tx's nLockTime; locktime_earliest
+                            (= locktime_units + 1) is the first block
+                            height/time that can carry the spend, because
+                            IsFinalTx requires nLockTime < the containing
+                            block's height/time.
         type=p2pkh-csv    → owner_pkh, locktime_value, locktime_basis
                             ("blocks"|"time_512s"), locktime_units,
                             relative_lock_disabled. Relative time-lock
@@ -525,18 +572,28 @@ def inspect_cmd(ctx: CliContext, inspect_input: str, fetch: bool, resolve: bool)
                             has_self_replication, has_burn_branch, note.
                             An EXACT match against pyrxd's soulbound builder:
                             the lock permits only a self-clone or a burn.
-        type=self-replicating-covenant → transferability,
-                            has_self_replication, has_burn_branch,
-                            bound_ref_outpoint (only when the script binds
-                            exactly one ref), note, token_bearing,
-                            input_refs[]. Structural MARKERS only — not proof
-                            the script is a soulbound token.
+        type=self-replicating-covenant → has_self_replication,
+                            has_burn_branch, bound_ref_outpoint (only when the
+                            script binds exactly one ref), note,
+                            token_bearing, input_refs[], referenced_refs[].
+                            Structural MARKERS only — not proof the script is
+                            a soulbound token. Carries NO transferability key,
+                            deliberately: that field is the soulbound verdict
+                            and this tier has not earned it.
         type=container-legacy → spendable (always false), ref_outpoint,
                             child_ref_outpoint, owner_pkh, note. A dead
                             pre-0.15.0 CONTAINER output; nothing can spend it.
-        type=unknown      → token_bearing (true|false|null), input_refs[]:
-                            {opcode, ref_outpoint}. null means the script does
-                            not decode, so the absence of a ref is NOT proven.
+        type=unknown      → token_bearing (true|false|null), input_refs[],
+                            referenced_refs[]; each entry {opcode,
+                            ref_outpoint}. token_bearing=null means the script
+                            does not decode, so the absence of a ref is NOT
+                            proven. input_refs[] is the CARRIED set (0xd0
+                            OP_PUSHINPUTREF / 0xd8 OP_PUSHINPUTREFSINGLETON —
+                            Radiant's foundPushRefs), and only those make an
+                            output token-bearing. referenced_refs[] is the set
+                            the script names without holding (0xd1
+                            OP_REQUIREINPUTREF gates on one; 0xd2/0xd3 forbid
+                            one); spending such an output destroys nothing.
 
     Script-level vs envelope-level: the type above is read from the LOCKING
     SCRIPT. The Glyph protocol labels that live in the reveal transaction's

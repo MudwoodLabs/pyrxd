@@ -190,6 +190,45 @@ class Endpoint:
         return self.url.rstrip("/").lower()
 
 
+def _assert_uniform_posture(network: str, endpoints: Sequence[Endpoint]) -> None:
+    """Refuse a profile whose endpoints do not all carry the same security posture.
+
+    A profile is the statement "these servers are interchangeable for this network", and
+    :class:`~pyrxd.network.failover.FailoverElectrumXClient` acts on it: one transport error and
+    the next call silently runs against the next endpoint in the list. Nothing compared what that
+    move costs. So a profile of ``[wss:// + SPKI pins, wss:// unpinned]`` degraded to *unpinned*
+    the first time the pinned primary hiccupped — and a profile mixing ``wss://`` with
+    ``ws://`` degraded to *plaintext* — with no error, no warning, and the operator still
+    believing the control they configured was in force. That is worse than never configuring it,
+    because it is believed.
+
+    Failing here, at wiring time, is the point: the same argument
+    :func:`pyrxd.network.tls_pin.normalize_pin` makes for a malformed pin. An operator whose
+    endpoints genuinely differ has two honest options — level them up (pin both, or publish both
+    pins in one list), or split them into separate profiles and choose deliberately.
+
+    A profile where NO endpoint is pinned is fine (pinning is opt-in, see
+    :mod:`pyrxd.network.tls_pin`); the refusal is only for a MIX, where failover would relax.
+    """
+    if len(endpoints) < 2:
+        return
+    plaintext = [e.url for e in endpoints if e.url.startswith("ws://")]
+    if plaintext and len(plaintext) != len(endpoints):
+        raise ValidationError(
+            f"network {network!r} mixes TLS and plaintext endpoints ({len(plaintext)} of "
+            f"{len(endpoints)} are ws://). Failover between them silently downgrades a wss:// "
+            "session to plaintext on the first transport error. Use one transport per profile."
+        )
+    pinned = [e.url for e in endpoints if e.spki_pins]
+    if pinned and len(pinned) != len(endpoints):
+        raise ValidationError(
+            f"network {network!r} mixes TLS-pinned and unpinned endpoints ({len(pinned)} of "
+            f"{len(endpoints)} carry spki_pins). Failover to an unpinned endpoint silently drops "
+            "the pin, so the check reads as enabled while not being in force. Pin every endpoint "
+            "in the profile (one pin list may hold several servers' pins), or none of them."
+        )
+
+
 @dataclass(frozen=True)
 class NetworkProfile:
     """An ordered endpoint list bound to one network, plus its chain fingerprint.
@@ -228,6 +267,7 @@ class NetworkProfile:
             seen.add(endpoint.key)
             deduped.append(endpoint)
         object.__setattr__(self, "endpoints", tuple(deduped))
+        _assert_uniform_posture(self.network, deduped)
         if self.genesis_hash is not None:
             genesis = str(self.genesis_hash).strip().lower()
             if len(genesis) != 64:

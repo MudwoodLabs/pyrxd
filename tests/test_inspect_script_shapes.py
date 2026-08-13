@@ -214,6 +214,17 @@ class TestSelfReplicatingTier:
         assert row["has_self_replication"] is True
         assert "NOT proof" in row["note"]
 
+    def test_weak_tier_withholds_the_transferability_verdict(self):
+        """The caveat lives in ``note``; a machine consumer reads
+        ``transferability``. Emitting ``soulbound_covenant`` there handed the
+        exact claim this tier exists to withhold to the only reader that cannot
+        see the caveat, so the key is absent instead."""
+        row = _classify(_DEPLOYED_SOULBOUND_SPK)
+        assert "transferability" not in row
+        # The exact tier still states its verdict — that one is earned.
+        exact = _classify(build_soulbound_nft_covenant(_REF, _PKH).funded_spk)
+        assert exact["transferability"] == "soulbound_covenant"
+
     @pytest.mark.parametrize(
         ("label", "script"),
         [
@@ -280,6 +291,76 @@ class TestTimelockScripts:
         assert row["type"] == "p2pkh-cltv"
         assert row["locktime_basis"] == "unix_time"
         assert row["locktime_units"] == locktime
+
+    @pytest.mark.parametrize("locktime", [0, 144, 800_000, LOCKTIME_THRESHOLD, 1_800_000_000])
+    def test_cltv_reports_the_earliest_block_not_the_encoded_value(self, locktime):
+        """The encoded value is a floor on the SPENDING TX's nLockTime, and
+        ``IsFinalTx`` (Radiant-Core src/consensus/tx_verify.cpp at the vendored
+        pin 45e0aa4 / v3.1.2) is ``lockTime < lockTimeLimit`` — strictly less
+        than the CONTAINING block's height/time. So the first block that can
+        carry the spend is one past the encoded value, and reporting the
+        encoded value as "spendable at" was off by one block in the direction
+        that makes a refund leg look available before it is.
+
+        Derived on the Python side on purpose: the CLI, ``--json`` and the
+        browser renderer all print this number and must not each compute it."""
+        row = _classify(build_p2pkh_with_cltv_script(_PKH, locktime))
+        assert row["locktime_earliest"] == locktime + 1
+
+    def test_csv_has_no_absolute_earliest(self):
+        """A relative lock has no absolute answer — it is measured from a
+        confirmation height the locking script does not carry."""
+        row = _classify(build_p2pkh_with_csv_script(_PKH, build_csv_sequence(144, CsvKind.BLOCKS)))
+        assert "locktime_earliest" not in row
+
+
+class TestWallClockCltvIsReachable:
+    """A 32-byte script is 64 hex, and so is a txid.
+
+    Every CLTV deadline in ``[LOCKTIME_THRESHOLD, 2**31)`` — every Unix deadline
+    from 1985 to 2038 — encodes as a minimal 4-byte push, so the script is
+    exactly 32 bytes. ``_classify_input`` claimed all 64-hex input as a txid, so
+    the CLI answered "this looks like a txid (64 hex chars)" and the browser did
+    the same, for precisely the shape the time-lock classifier exists to
+    explain: the wall-clock HTLC refund leg. ``--fetch`` would have sent the
+    script bytes to an ElectrumX server as a transaction id.
+    """
+
+    @pytest.mark.parametrize("locktime", [LOCKTIME_THRESHOLD, 1_767_225_600, 2**31 - 1])
+    def test_a_wall_clock_cltv_script_is_read_as_a_script(self, locktime):
+        script = build_p2pkh_with_cltv_script(_PKH, locktime)
+        assert len(script.hex()) == 64, "premise: this shape is exactly txid-length"
+        form, value = _classify_input(script.hex())
+        assert form == "script"
+        assert _inspect_script(value)["type"] == "p2pkh-cltv"
+
+    def test_a_height_based_cltv_that_happens_to_be_64_hex_also_works(self):
+        """Not only the unix-time basis: any 4-byte minimal push lands here.
+        ``0x01000000`` is 16,777,216 — below LOCKTIME_THRESHOLD, so a height."""
+        script = build_p2pkh_with_cltv_script(_PKH, 0x01000000)
+        assert len(script.hex()) == 64
+        assert _classify_input(script.hex())[0] == "script"
+        assert _inspect_script(script.hex())["locktime_basis"] == "height"
+
+    def test_random_txids_are_still_txids(self):
+        """The preference must be narrow enough that it cannot swallow the form
+        it shares a length with. 20,000 draws, zero misroutes; the template
+        parse pins 7 bytes at fixed offsets plus push minimality, so a real
+        collision is a ~2**-56 event."""
+        assert all(_classify_input(os.urandom(32).hex())[0] == "txid" for _ in range(20_000))
+
+    def test_an_op_return_shaped_txid_is_still_a_txid(self):
+        """The counter-example that rules out a wider rule: ``op_return``
+        classifies on the FIRST BYTE alone, so preferring "any 64 hex that
+        classifies" would misroute 1 txid in 256."""
+        assert _classify_input("6a" + os.urandom(31).hex())[0] == "txid"
+
+    def test_a_near_miss_timelock_of_txid_length_is_still_a_txid(self):
+        """One byte off the template and the preference must not fire."""
+        broken = bytearray(build_p2pkh_with_cltv_script(_PKH, 1_767_225_600))
+        broken[-1] ^= 0xFF  # OP_CHECKSIG -> something else
+        assert len(bytes(broken).hex()) == 64
+        assert _classify_input(bytes(broken).hex())[0] == "txid"
 
     @pytest.mark.parametrize("blocks", [0, 1, 16, 144, 65535])
     def test_csv_blocks(self, blocks):
@@ -354,18 +435,42 @@ class TestTimelockScripts:
     def test_plain_p2pkh_is_not_a_timelock(self):
         assert _classify(b"\x76\xa9\x14" + _PKH + b"\x88\xac")["type"] == "p2pkh"
 
-    def test_parser_returns_none_on_junk_and_never_raises(self):
-        junk = [
-            b"",
-            b"\x4b",  # a direct push whose data is entirely missing
-            b"\xff" * 28,
-            b"\x76\xa9\x14" + _PKH + b"\x88\xac",
-            os.urandom(28),
-            os.urandom(31),
-        ]
-        for script in junk:
-            result = parse_p2pkh_timelock_script(script)
-            assert result is None or result.kind in ("cltv", "csv")
+    @pytest.mark.parametrize(
+        ("label", "script"),
+        [
+            ("empty", b""),
+            ("a direct push whose data is entirely missing", b"\x4b"),
+            ("all 0xff", b"\xff" * 28),
+            ("plain p2pkh", b"\x76\xa9\x14" + _PKH + b"\x88\xac"),
+            ("a cltv script one byte short", build_p2pkh_with_cltv_script(_PKH, 144)[:-1]),
+            ("no value push at all", bytes([_OP_CLTV, _OP_DROP]) + b"\x76\xa9\x14" + _PKH + b"\x88\xac"),
+        ],
+    )
+    def test_parser_returns_none_on_junk(self, label, script):
+        assert parse_p2pkh_timelock_script(script) is None, label
+
+    def test_parser_never_raises_and_can_only_claim_what_the_bytes_say(self):
+        """Runs over arbitrary chain bytes, so a raise would be a crash in the
+        inspector rather than a classification.
+
+        The second half used to read ``result is None or result.kind in
+        ("cltv", "csv")`` — which cannot fail: ``kind`` is only ever assigned
+        those two strings, so a parser that fabricated a time-lock for **every**
+        input, ``b""`` included, still passed. What is checked instead is that
+        anything the parser DOES claim is readable back out of the bytes at the
+        fixed offsets the template pins. A fabricating parser fails on the first
+        short input."""
+        for size in (0, 1, 26, 27, 28, 31, 32, 64, 200):
+            for _ in range(200):
+                script = os.urandom(size)
+                parsed = parse_p2pkh_timelock_script(script)
+                if parsed is None:
+                    continue
+                assert script[-25:-22] == b"\x76\xa9\x14"  # OP_DUP OP_HASH160 PUSH20
+                assert script[-2:] == b"\x88\xac"  # OP_EQUALVERIFY OP_CHECKSIG
+                assert script[-26] == _OP_DROP
+                assert script[-27] == (_OP_CLTV if parsed.kind == "cltv" else _OP_CSV)
+                assert parsed.owner_pkh == script[-22:-2]
 
     def test_two_value_pushes_is_not_a_timelock(self):
         """The prologue must be exactly ONE push — a script with junk in front
@@ -446,6 +551,63 @@ class TestUnknownReportsRefs:
         assert row["type"] == "unknown"
         assert row["token_bearing"] is None
         assert row["input_refs"] == []
+        assert row["referenced_refs"] == []
+
+
+class TestWalkSetIsNotTheCollectSet:
+    """Carrying a ref and naming one are different facts, and only the first
+    burns.
+
+    ``CScript::GetPushRefs`` (tests/vendor/radiant_core/script.cpp:586-607)
+    files 0xd0 ``OP_PUSHINPUTREF`` and 0xd8 ``OP_PUSHINPUTREFSINGLETON`` into
+    ``foundPushRefs``; 0xd1 ``OP_REQUIREINPUTREF`` goes to ``foundRequiredRefs``
+    and 0xd2 / 0xd3 to the disallow sets. All five must be **walked** (skip one
+    and the program counter desynchronises — the 2026 sighash bug), but only
+    the first two are **collected** as evidence the output holds a token.
+
+    The inspector used to collect the whole walk set, so every credential-gate
+    covenant (``OP_REQUIREINPUTREF <ref>``, the idiom in
+    ``glyph/soulbound_covenant.py``) came back "token-bearing: YES — Do NOT
+    spend this as plain funding". It carries nothing. These four cases pin the
+    boundary in both directions.
+    """
+
+    @pytest.mark.parametrize("opcode", [0xD0, 0xD8])
+    def test_push_ref_opcodes_are_token_bearing(self, opcode):
+        row = _classify(bytes([opcode]) + _REF.to_bytes() + b"\x51" * 25)
+        assert row["type"] == "unknown"
+        assert row["token_bearing"] is True
+        assert row["input_refs"] == [{"opcode": f"0x{opcode:02x}", "ref_outpoint": f"{_REF.txid}:{_REF.vout}"}]
+        assert row["referenced_refs"] == []
+
+    @pytest.mark.parametrize("opcode", [0xD1, 0xD2, 0xD3])
+    def test_require_and_disallow_opcodes_are_not_token_bearing(self, opcode):
+        """The regression. A script whose only ref opcode is a gate holds no
+        token, and saying it does is a burn warning that cannot come true."""
+        row = _classify(bytes([opcode]) + _REF.to_bytes() + b"\x51" * 25)
+        assert row["type"] == "unknown"
+        assert row["token_bearing"] is False
+        assert row["input_refs"] == []
+        assert row["referenced_refs"] == [{"opcode": f"0x{opcode:02x}", "ref_outpoint": f"{_REF.txid}:{_REF.vout}"}]
+
+    def test_gate_plus_carrier_reports_both_separately(self):
+        """The realistic shape: a covenant that requires one credential ref and
+        carries its own singleton. Both are reported; only one is the token."""
+        script = b"\xd1" + _REF2.to_bytes() + b"\xd8" + _REF.to_bytes() + b"\x51" * 20
+        row = _classify(script)
+        assert row["token_bearing"] is True
+        assert row["input_refs"] == [{"opcode": "0xd8", "ref_outpoint": f"{_REF.txid}:{_REF.vout}"}]
+        assert row["referenced_refs"] == [{"opcode": "0xd1", "ref_outpoint": f"{_REF2.txid}:{_REF2.vout}"}]
+
+    def test_the_walk_still_advances_past_a_gate_opcode(self):
+        """Not collecting 0xd1 must not mean not walking it. If the walk
+        skipped its 36-byte operand it would resynchronise inside the operand
+        and report a phantom ref — the failure mode that is worse than either
+        of the above."""
+        script = b"\xd1" + _REF2.to_bytes() + b"\xd0" + _REF.to_bytes()
+        row = _classify(script)
+        assert [r["ref_outpoint"] for r in row["input_refs"]] == [f"{_REF.txid}:{_REF.vout}"]
+        assert [r["ref_outpoint"] for r in row["referenced_refs"]] == [f"{_REF2.txid}:{_REF2.vout}"]
 
 
 # ──────────────────────────────────────── existing shapes are unchanged ──

@@ -419,12 +419,31 @@ class ElectrumXClient:
         Distinct from :meth:`get_transaction` (which returns raw bytes
         for cryptographic operations like merkle-proof checks). Callers
         polling for "is this tx confirmed yet?" want THIS one.
+
+        Bound to the request the same way :meth:`get_transaction` is. The raw form recomputes
+        ``hash256(raw)``; the verbose form has no bytes to hash, so it binds the ``txid`` the
+        node echoes (``getrawtransaction <txid> true`` always returns it — Radiant-Core
+        ``src/rpc/rawtransaction.cpp``, and ElectrumX's ``blockchain.transaction.get`` passes
+        the daemon object through verbatim). Without this the ONLY untethered transaction read
+        in the client was the one every confirmation gate is built on
+        (:func:`pyrxd.network.confirm.wait_for_confirmation`,
+        :meth:`pyrxd.gravity.radiant_leg.RadiantCovenantLeg.confirmations`,
+        :class:`pyrxd.gravity.watch.adapters.ElectrumRxdChainSource`): a server could answer
+        with a DIFFERENT, deeply-buried transaction's body and satisfy the depth threshold
+        without fabricating a single field — it just returns a true answer to a question nobody
+        asked.
         """
         if not isinstance(txid, Txid):
             txid = Txid(txid)
         result = await self._call("blockchain.transaction.get", [str(txid), True])
         if not isinstance(result, dict):
             raise NetworkError("Unexpected response type for verbose transaction")
+        echoed = result.get("txid")
+        if not isinstance(echoed, str) or echoed.strip().lower() != str(txid).lower():
+            raise NetworkError(
+                f"verbose transaction response does not identify the requested txid {str(txid)[:16]}… "
+                "(missing or mismatched 'txid'); fail-closed"
+            )
         return result
 
     async def get_transaction_merkle(self, txid: Txid, height: BlockHeight) -> MerklePath:
@@ -837,9 +856,15 @@ class ElectrumXClient:
                     continue
 
                 req_id = data.get("id")
-                if not isinstance(req_id, int):
+                if not isinstance(req_id, int) or isinstance(req_id, bool):
                     # Server pushes (no id) or malformed — drop. Subscribed
                     # notifications are out of scope for this client.
+                    #
+                    # `isinstance(True, int)` is True and `hash(True) == hash(1)`, so a message
+                    # carrying `"id": true` passed this check and then popped the future for
+                    # request id **1** — the first RPC of every connection, which is the tip-height
+                    # or genesis read `assert_chain` is built on. The bool exclusion is the same
+                    # one `_guards.finite_int` makes for the same reason.
                     logger.debug("ElectrumX reader dropped message without int id")
                     continue
 

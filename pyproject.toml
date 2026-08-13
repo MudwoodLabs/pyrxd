@@ -251,10 +251,13 @@ check-manifest = "check-manifest"
 # push-fail-fix-push loop. ~3-5 min.
 # For a faster pre-commit pass, just run `task lint && task format-check && task test`.
 ci = "task lint && task format-check && task test && task coverage-security && task coverage-overall && task typecheck && task check-private-links"
-# `task mutate` runs cosmic-ray mutation testing on the consensus-critical SPV
-# verification modules (pow/merkle/chain/payment). Slow + mutates src/pyrxd/spv in
-# place (restored via git on exit) — an occasional gate, NOT part of `task ci`. See
-# docs/how-to/mutation-testing.md. Don't run concurrent git ops while it's running.
+# `task mutate [group...]` runs cosmic-ray mutation testing. Default group is `spv`
+# (pow/merkle/chain/payment). `consensus` = the byte-exact groups (spv/script/
+# transaction/dmint); `value` = the value-moving ones (fee/wallet/glyph/swap/
+# coordinator/network); `all` = every group, many hours. Slow, and it mutates
+# src/pyrxd IN PLACE (restored via git on exit and on INT/TERM/HUP) — an occasional
+# gate, NOT part of `task ci`; CI runs it weekly via .github/workflows/mutation.yml.
+# See docs/how-to/mutation-testing.md. Don't run concurrent git ops while it runs.
 mutate = "bash scripts/mutation_test.sh"
 docs = "sphinx-build -b html docs docs/_build/html"
 docs-clean = "rm -rf docs/_build"
