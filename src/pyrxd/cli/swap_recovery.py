@@ -291,6 +291,21 @@ _PUBLIC_32_BYTE_FIELD_MARKERS = (
 )
 
 
+#: Longest string that could still BE a base58check-encoded key, so the longest one
+#: worth attempting to decode. A WIF is 51-52 characters; the longest thing this
+#: predicate looks for, a BIP-32 extended key (78 payload + 4 checksum bytes), is ~112.
+#:
+#: This is a bound on work, not on correctness. ``b58_decode`` builds one big integer a
+#: character at a time, which is O(n^2): measured on this branch, a single 65 000-char
+#: base58-valid string (just inside ``MAX_SECRET_FILE_BYTES``) took **0.65 s** to decode
+#: and reject, against 0.012 s for a realistic document of 600 hundred-character fields.
+#: Bounded and local, so not a DoS — but there is no reason to pay it, and refusing to
+#: even try above this length cannot hide a key, because no key encodes that long.
+#: The mnemonic branch is deliberately NOT bounded by it: a 24-word phrase is ~190
+#: characters.
+_MAX_ENCODED_KEY_CHARS = 128
+
+
 def _is_wif(text: str) -> bool:
     """True if *text* decodes as a WIF. Broad ``except`` — any failure means "no".
 
@@ -339,11 +354,12 @@ def _value_is_spending_authority(text: str) -> bool:
     # (``"bc"``, a stage name) without paying for a base58 decode.
     if len(text) < 16:
         return False
-    if _is_wif(text):
-        return True
-    raw = _base58check_payload(text)
-    if len(raw) == 78 and raw[45] == 0:
-        return True
+    if len(text) <= _MAX_ENCODED_KEY_CHARS:
+        if _is_wif(text):
+            return True
+        raw = _base58check_payload(text)
+        if len(raw) == 78 and raw[45] == 0:
+            return True
     return _looks_like_mnemonic(text)
 
 
