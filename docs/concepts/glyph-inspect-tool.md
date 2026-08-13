@@ -24,6 +24,15 @@ You hand it one of four inputs:
 | Outpoint       | `b45dc453…a2a8:0`                                                    | no (`--resolve` to fetch source tx) |
 | Txid           | 64 hex chars                                                         | yes (`--fetch`) |
 
+A 32-byte locking script is also 64 hex, and one real shape lands there: a CLTV
+time-lock whose deadline is a wall-clock time (every Unix deadline from 1985 to
+2038 encodes as a 4-byte push, giving a 32-byte script). Those are the
+wall-clock HTLC refund legs, so 64 hex that parses as an **exact** CLTV/CSV
+P2PKH template is read as a script rather than a txid. The preference is
+deliberately narrow: it runs the production template parser, which pins the
+P2PKH tail, the `OP_DROP`, the time-lock opcode and a minimal value push, so a
+real txid cannot fall into it by accident.
+
 It runs the bytes through the structural classifier in
 [`src/pyrxd/glyph/_inspect_core.py`](../../src/pyrxd/glyph/_inspect_core.py)
 and returns one of the recognised shapes: `ft`, `nft`, `mut`, `dmint`,
