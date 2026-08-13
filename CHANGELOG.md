@@ -185,12 +185,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   quorum-checked view of the tip, in one read rather than two. Call and stale
   comment both removed.
 
-  `wait_confirmations` had **no test at all** before this, which is why the
-  defect survived — `tests/gravity/test_trade_wait_confirmations.py` now covers
-  it from both sides: the wait survives a source that cannot report a tip, and
-  still refuses to report a depth it was never told about. The two tests naming
-  the defect were confirmed red against the pre-fix source; the four controls
-  pass both before and after, which is what a control is for.
+  Why it survived is the more useful half, and the first version of this entry
+  got it wrong. It claimed `wait_confirmations` "had no test at all" — it had
+  **six**, in `tests/test_gravity_trade.py::TestWaitConfirmations`, covering
+  first-poll success, success after N polls, both timeout paths, an invalid
+  txid and an explicit `min_confirmations`. All six were green, and none of
+  them could ever have failed on this defect: they share
+  `mock_btc_source()`, an `AsyncMock(spec=BtcDataSource)` whose
+  `get_tip_height` is hardwired to return `BlockHeight(900_000)` and therefore
+  **cannot raise**. The one input that discriminates — a source whose tip read
+  fails while its tx reads succeed — was not constructible from that fixture,
+  so the call could be moved, discarded, or left outside the `try` with the
+  suite staying green either way. A mock that never fails cannot test a failure
+  path; this is the same shape as a regtest node at a tenth of mainnet's fee
+  floor being unable to observe a fee defect.
+
+  `tests/gravity/test_trade_wait_confirmations.py` adds a stub whose tip read
+  *can* fail, and covers both sides: the wait survives a source that cannot
+  report a tip, and still refuses to report a depth it was never told about.
+  The two tests naming the defect were confirmed red against the pre-fix
+  source; the four controls pass both before and after, which is what a control
+  is for.
 
 - **The duplicate-outpoint guards in the FT builders were bypassable by letter
   case.** All three — `FtUtxoSet.__init__`, the airdrop's funding-list check and
