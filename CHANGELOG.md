@@ -53,6 +53,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
   All `--json` additions are additive; no existing key changed name or meaning.
 
+### Fixed
+
+- **The watchtower never told an ETH↔RXD taker that its counter-leg refund was
+  due.** `decide()`'s BTC arm has a `BTC_LOCKED` branch — maker never locked the
+  asset, so page `PAGE_REFUND` once the taker's BTC funding buries past `t_btc`
+  — and `_decide_eth` had no such branch at all. Since `taker_funds_btc` is the
+  funding step for **both** counter-chains and advances to `BTC_LOCKED`, an ETH
+  swap whose maker locks nothing sits in exactly that state with the taker's ETH
+  HTLC funded. It fell through to the catch-all `Intent.WATCH`, which the
+  reconciler does not route to any handler: no page, no webhook, no heartbeat
+  count — silence, every tick, for the whole life of the swap, while
+  `taker_refund_btc` (valid from `BTC_LOCKED`) sat unrecommended.
+
+  Fixed by giving the ETH arm the branch its BTC twin always had. ETH maturity is
+  the **absolute** `eth_timeout_unix_s` contract immutable rather than a
+  confirmation depth, so `Observations` gained an optional `now_unix_s` — the ETH
+  analogue of `btc_funding_confirmations` — populated by `ChainObserver` from an
+  injectable clock (defaulting to `time.time`, read only on the ETH path).
+  Fail-closed in the *same direction* as the BTC arm, which watches rather than
+  pages on an unread funding depth: an absent clock, terms without a deadline, or
+  an on-chain asset lock observed despite the stale record all yield `WATCH`, so
+  an alert-only tower cannot be made to cry wolf on every healthy pre-lock tick.
+  `autonomous_btc_refund` stays `False` — that discriminator arms the BTC keyless
+  pre-signed refund and has no ETH counterpart, so this remains alert-only.
+
+  Found by asking one structural question of the whole surface — *is there a check
+  present in one arm and absent in its twin?* — rather than by testing behaviour.
+
 ### Changed
 
 - **The soulbound classification is split into two tiers so the weaker one is
