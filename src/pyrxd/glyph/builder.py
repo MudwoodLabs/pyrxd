@@ -1249,6 +1249,7 @@ class GlyphBuilder:
             fee_rate=params.fee_rate,
             change_pkh=params.change_pkh,
             dust_limit=params.dust_limit,
+            allow_overpay=params.allow_overpay,
         )
 
     def build_ft_airdrop_tx(self, params: FtAirdropParams) -> FtAirdropResult:
@@ -1279,6 +1280,7 @@ class GlyphBuilder:
             royalty=params.royalty,
             sale_price=params.sale_price,
             pay_royalty=params.pay_royalty,
+            allow_overpay=params.allow_overpay,
         )
 
 
@@ -1937,6 +1939,17 @@ class FtTransferParams:
                            sender's PKH when ``None``.
     :param dust_limit:     fold-to-fee threshold for the plain-RXD change
                            output. Not a floor on the token output.
+    :param allow_overpay:  accept a ``fee_rate`` above the overpay ceiling
+                           (:data:`~pyrxd.fee_sizing.MAX_FEE_OVERPAY_MULTIPLE` x the
+                           relay floor), forwarded to
+                           :meth:`~pyrxd.glyph.ft.FtUtxoSet.build_transfer_tx`.
+                           This dataclass had no such field, so the ceiling was
+                           unreachable through this API: ``fee_rate=100_001`` raised
+                           with no way through, while the identical build via
+                           ``FtUtxoSet.build_transfer_tx(..., allow_overpay=True)``
+                           succeeded. A bound with no reachable override is a guard
+                           that refuses valid work, and Radiant has neither RBF nor
+                           CPFP to repair a late refusal.
 
     .. note::
        No ``royalty`` here, unlike :class:`FtAirdropParams`.
@@ -1954,6 +1967,7 @@ class FtTransferParams:
     fee_rate: int = MIN_FEE_RATE
     change_pkh: Hex20 | None = None
     dust_limit: int = FT_DUST_LIMIT
+    allow_overpay: bool = False
 
 
 @dataclass
@@ -1981,6 +1995,11 @@ class FtAirdropParams:
     :param pay_royalty:  ``None`` (default) pays iff ``royalty.enforced``;
                          ``True`` pays an advisory royalty anyway; ``False``
                          never pays.
+    :param allow_overpay: accept a ``fee_rate`` above the overpay ceiling,
+                         forwarded to
+                         :meth:`~pyrxd.glyph.ft.FtUtxoSet.build_airdrop_tx`. Same
+                         omission, and the same reason it matters, as
+                         :class:`FtTransferParams` — see its note.
     """
 
     ref: GlyphRef
@@ -1994,3 +2013,4 @@ class FtAirdropParams:
     royalty: GlyphRoyalty | None = None
     sale_price: int = 0
     pay_royalty: bool | None = None
+    allow_overpay: bool = False

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -718,3 +719,63 @@ def test_an_ft_swap_without_a_persisted_amount_asks_for_the_flag(swap) -> None:
     res = _build(swap, "build-claim", "--preimage", P.hex())
     assert res.exit_code == 1
     assert "--covenant-amount" in res.output
+
+
+# --------------------------------------------------------------------------- the RENDERED remedy
+#
+# The mode refusal from ``load_recovery_json`` is the one error here that carries a
+# command the operator has to run, and ``_load`` renders it through
+# ``sanitize_terminal(str(exc), max_len=…)``, which truncates from the right. Measured
+# at the previous ``max_len=200`` with a ``/tmp`` path: a 446-character message became
+# 200 characters and the workable ``install -m 600 …`` suggestion (index 238) was cut
+# off entirely, so the operator was shown ONLY the ``chmod`` that cannot succeed.
+#
+# The existing coverage asserted on ``str(exc.value)`` — the message the library builds,
+# not the one the CLI prints — which is exactly why it passed while the CLI was a dead
+# end. These assert on what is actually rendered.
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can chmod a 0444 file, so the unrunnable-remedy case cannot arise")
+def test_the_CLI_PRINTS_a_remedy_the_operator_can_actually_run(swap, tmp_path: Path) -> None:
+    archived = tmp_path / "archived"
+    archived.mkdir()
+    keys = archived / "keys.json"
+    keys.write_text(swap["keys"].read_text())
+    keys.chmod(0o444)
+    archived.chmod(0o555)  # no unlink/rename either — the read-only-media shape
+    try:
+        res = _invoke(
+            ["build-claim", "--swap-file", str(keys), "--fee-wif-file", str(swap["fee_file"]), "--preimage", P.hex()],
+            _ctx(_client(swap)),
+        )
+    finally:
+        archived.chmod(0o755)
+    assert res.exit_code == 1
+    assert "could not parse the swap recovery file" in res.output
+    assert "install -m 600" in res.output, f"the runnable remedy was truncated away:\n{res.output}"
+    assert str(keys) in res.output  # and it names the file, so it is copy-pasteable
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can chmod a 0444 file, so the unrunnable-remedy case cannot arise")
+def test_the_runnable_remedy_survives_even_a_hard_truncation(swap, tmp_path: Path) -> None:
+    """Ordering, not just the raised limit. ``install -m 600`` leads the hint, so a
+    future caller that picks a smaller ``max_len`` loses the explanation and keeps the
+    command — the failure mode this had was the other way round."""
+    from pyrxd.cli.format import sanitize_terminal
+    from pyrxd.cli.swap_recovery import load_recovery_json
+    from pyrxd.security.errors import ValidationError
+
+    archived = tmp_path / "archived2"
+    archived.mkdir()
+    keys = archived / "keys.json"
+    keys.write_text(swap["keys"].read_text())
+    keys.chmod(0o444)
+    archived.chmod(0o555)
+    try:
+        with pytest.raises(ValidationError) as exc:
+            load_recovery_json(keys)
+    finally:
+        archived.chmod(0o755)
+    message = str(exc.value)
+    assert "install -m 600" in sanitize_terminal(message, max_len=200)
+    assert message.index("install -m 600") < message.index("cannot succeed")

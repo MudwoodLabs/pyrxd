@@ -250,7 +250,16 @@ class GravityTrade:
         btc_txid:
             Bitcoin transaction ID (64 hex chars, big-endian).
         min_confirmations:
-            Override ``config.min_btc_confirmations`` for this call.
+            Override ``config.min_btc_confirmations`` for this call. Bound the same way
+            the config field is (``>= 1``), which it was not: ``TradeConfig``
+            has refused ``min_btc_confirmations < 1`` since it was written, but the
+            per-call override went straight to the source. Measured against a source
+            holding the tx in the mempool only, ``min_confirmations=0`` returned
+            ``confirmed=True, confirmations=0`` on the FIRST poll and ``-5`` returned
+            ``confirmations=-5`` — a "confirmed" verdict for a transaction with no
+            depth at all, handed to the caller who is about to release the other leg.
+            Zero is not a weaker policy here, it is no policy: the depth this waits for
+            MUST equal the covenant's header-depth ``N``.
 
         Returns
         -------
@@ -262,8 +271,15 @@ class GravityTrade:
         NetworkError
             If polling exceeds ``config.max_poll_attempts``.
         ValidationError
-            If *btc_txid* is not a valid 64-char hex string.
+            If *btc_txid* is not a valid 64-char hex string, or *min_confirmations* is
+            given and is below 1.
         """
+        if min_confirmations is not None and min_confirmations < 1:
+            raise ValidationError(
+                f"min_confirmations must be >= 1, got {min_confirmations}. It must equal the covenant's "
+                "header-depth N; a 0- or negative-confirmation wait reports a mempool transaction as "
+                "confirmed."
+            )
         min_conf = min_confirmations if min_confirmations is not None else self._cfg.min_btc_confirmations
         validated_txid = Txid(btc_txid)
 
@@ -277,11 +293,23 @@ class GravityTrade:
                     continue
                 raise NetworkError(f"BTC tx {btc_txid[:16]}… not found after {self._cfg.max_poll_attempts} polls")
 
-            # Depth is asked of the source rather than computed here: re-requesting
-            # the tx at min_confirmations=min_conf succeeds only once it is buried
-            # that deep, so the source applies its own (quorum-checked) view of the
-            # tip. Subtracting a separately-fetched tip height from a block height
-            # would reintroduce the two-read race this avoids.
+            # Depth is asked of the source rather than computed here: re-requesting the
+            # tx at min_confirmations=min_conf succeeds only once the source considers
+            # it buried that deep. Subtracting a separately-fetched tip height from a
+            # block height would reintroduce the two-read race this avoids.
+            #
+            # What the quorum does and does not cover, on the
+            # `MultiSourceBtcDataSource` path (`network/bitcoin.py`): `min_conf` is
+            # forwarded to EVERY leaf source, and each leaf applies the depth check
+            # against ITS OWN, un-quorumed view of the tip — the majority rule in
+            # `get_tip_height` is not consulted by `get_raw_tx`. `_require_quorum` then
+            # agrees on the hash256 of the raw BYTES returned by the leaves that did not
+            # raise. So the quorum covers the bytes, plus the fact that at least
+            # `quorum` sources independently judged the tx deep enough; it does not
+            # establish a single agreed tip height. That is at least as strict as a
+            # quorum-checked tip would be (every counted source had to pass on its own),
+            # but it is not the same statement, and the comment used to make the other
+            # one.
             try:
                 _ = await self._btc.get_raw_tx(validated_txid, min_confirmations=min_conf)
                 # Success means it has at least min_conf confirmations.

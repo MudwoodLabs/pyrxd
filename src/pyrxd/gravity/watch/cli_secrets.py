@@ -45,6 +45,17 @@ def _tighten_hint(file_path: Path) -> str:
     Detection is best-effort and never raises: this runs inside the construction of an
     error message, and an exception there would replace a useful diagnostic with a
     stack trace.
+
+    **The runnable command comes FIRST in the string.** These messages are rendered to
+    the terminal through ``sanitize_terminal(..., max_len=…)``, which truncates from the
+    right. In the unrunnable-``chmod`` branch the message used to open by explaining
+    that ``chmod`` would fail and only reach ``install -m 600`` afterwards; measured
+    against ``pyrxd swap`` at the ``max_len=200`` in force at the time, the operator saw
+    446 characters cut to 200 with the usable suggestion (index 238) entirely off the
+    end — a message whose whole content was a dead end. Leading with the command that
+    works means truncation removes the explanation, never the remedy. The render limit
+    was raised to 400 as well, but the ordering is what makes this robust to the next
+    caller that picks a smaller one.
     """
     remedy = f"Run `chmod 600 {file_path}` and retry"
     try:
@@ -55,9 +66,9 @@ def _tighten_hint(file_path: Path) -> str:
     if not writable or not owned:
         why = "the file is not writable by this process" if not writable else "it is owned by another user"
         return (
-            f"`chmod 600 {file_path}` cannot succeed here — {why} (read-only media, or a "
-            f"root-written bind mount). Take a private copy instead: "
-            f"`install -m 600 {file_path} ./recovery.json` (or `cp` then `chmod 600`), and pass that"
+            f"Take a private copy and pass that: `install -m 600 {file_path} ./recovery.json` "
+            f"(or `cp` then `chmod 600`). `chmod 600 {file_path}` cannot succeed here — {why} "
+            "(read-only media, or a root-written bind mount)"
         )
     return remedy
 

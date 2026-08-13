@@ -79,11 +79,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pyrxd.base58 import base58check_decode
 from pyrxd.btc_wallet.taproot import (
     BtcOutpoint,
     btc_input_outpoints_from_raw,
@@ -102,7 +104,13 @@ from pyrxd.gravity.htlc_covenant import (
 )
 from pyrxd.gravity.htlc_spend import FeeInput, build_htlc_claim_tx, build_htlc_refund_tx
 from pyrxd.keys import PrivateKey
-from pyrxd.security.errors import KeyMaterialError, ValidationError
+
+# ``_looks_like_mnemonic`` is private to ``security.errors`` but is THE definition of
+# "this string is a seed phrase" in this SDK, and the gate below must agree with the
+# redactor rather than grow a second, drifting copy of the test. Reached by name for the
+# same reason ``load_recovery_json`` reaches ``cli_secrets._tighten_hint``.
+from pyrxd.security.errors import KeyMaterialError, ValidationError, _looks_like_mnemonic
+from pyrxd.utils import decode_wif
 
 logger = logging.getLogger(__name__)
 
@@ -208,20 +216,26 @@ def _opt_int(d: dict[str, Any], key: str) -> int | None:
     return v if isinstance(v, int) and not isinstance(v, bool) else None
 
 
-#: Field-name substrings that mean "this document contains spending authority".
+#: Field-name fragments that mean "this value is spending authority" — the CHEAP
+#: FAST PATH, not the gate.
 #:
-#: Deliberately NARROWER than ``swap_cmds._SECRET_KEY_MARKERS``, which also lists
-#: ``"preimage"``. That marker is right for that function's job (telling an operator
-#: their file is not safe to hand to a counterparty) and wrong for this one: the
-#: hashlock preimage ``p`` is published on-chain by the claim that reveals it, so a
-#: file carrying only ``p`` is not a key file and demanding 0600 of it would be a
-#: spurious refusal on a public document.
-#: Field-name fragments that mean "this value is spending authority".
+#: A name list can only ever recognise the names somebody thought of, and this one
+#: measurably did not: with a real 52-character WIF as the value, every one of
+#: ``{"key": …}``, ``{"signing_key": …}``, ``{"priv": …}``, ``{"taker": …}``,
+#: ``{"parties": [wif, wif]}`` (a bare list, no field name at all) and
+#: ``{"recovery_phrase": "<12 BIP-39 words>"}`` was judged keyless and accepted at mode
+#: 0644. Note ``key_hex`` IS here while a bare ``key`` is not, which is the shape of the
+#: problem rather than an oversight to patch: the list cannot be finished. The gate is
+#: :func:`_value_is_spending_authority`, which decodes the VALUE and does not care what
+#: field it sits in; these fragments only let the common case answer without decoding.
 #:
-#: ``mnemonic`` / ``seed`` / ``xprv`` were missing, which is not a lesser omission than
-#: the others: a recovery file carrying a mnemonic is carrying EVERY key the wallet will
-#: ever derive, and it was accepted at 0644 in silence. A false positive here costs one
-#: ``chmod``; a false negative costs the keys.
+#: ``mnemonic`` / ``seed`` / ``xprv`` are here because a recovery file carrying a
+#: mnemonic is carrying EVERY key the wallet will ever derive. A false positive costs
+#: one ``chmod``; a false negative costs the keys.
+#:
+#: Deliberately does NOT list ``"preimage"``: the hashlock preimage ``p`` is published
+#: on-chain by the claim that reveals it, so a file carrying only ``p`` is not a key
+#: file and demanding 0600 of it would be a spurious refusal on a public document.
 _PRIVATE_KEY_MARKERS = (
     "wif",
     "privkey",
@@ -233,31 +247,146 @@ _PRIVATE_KEY_MARKERS = (
     "xprv",
 )
 
+#: 64 hex characters — a raw 32-byte value written the way a private key is written.
+_BARE_32_BYTE_HEX = re.compile(r"^[0-9a-fA-F]{64}$")
+
+#: Field-name fragments under which a 64-hex value is a PUBLIC 32-byte quantity.
+#:
+#: This is the one place a NAME still decides anything about a hex value, and it has to,
+#: because a 32-byte secret and a 32-byte hash are the same 64 characters. The polarity
+#: is the point: this is an allowlist, so an unrecognised field holding 64 hex chars —
+#: ``{"k": "<32 bytes of key>"}`` — is treated as a key, and a name nobody thought of
+#: fails CLOSED instead of open.
+#:
+#: Every entry was measured against a writer or a reader in this repository, not
+#: guessed:
+#:
+#: * ``hashlock`` — ``hashlock_H`` / ``hashlock_H_hex``. Required in EVERY recovery file
+#:   (``swap_cmds.parse_recovery_file`` refuses a document without it), so without this
+#:   entry the 64-hex rule would make every recovery file keyful and the 0644
+#:   public-locator workflow that ``--taker-pkh`` / ``--maker-pkh`` exist for would stop
+#:   working entirely. Measured on the fixture in ``tests/cli/test_swap_recovery.py``.
+#: * ``preimage`` — ``preimage_p_hex``; public by the time it matters, see above.
+#: * ``xonly`` — ``btc_claim_xonly_hex`` / ``taker_btc_refund_xonly_hex``
+#:   (``scripts/btc_swap_two_host.py``): x-only PUBLIC keys, exactly 64 hex.
+#: * ``pubkey`` / ``public_key`` — public keys.
+#: * ``txid`` / ``tx_hash`` / ``outpoint`` / ``block_hash`` / ``blockhash`` / ``merkle``
+#:   — chain identifiers, all 32-byte hashes.
+#: * ``spk`` / ``script`` — scriptPubKeys, which are hex of arbitrary length and can be
+#:   64 characters.
+_PUBLIC_32_BYTE_FIELD_MARKERS = (
+    "hashlock",
+    "preimage",
+    "xonly",
+    "pubkey",
+    "public_key",
+    "txid",
+    "tx_hash",
+    "outpoint",
+    "block_hash",
+    "blockhash",
+    "merkle",
+    "spk",
+    "script",
+)
+
+
+def _is_wif(text: str) -> bool:
+    """True if *text* decodes as a WIF. Broad ``except`` — any failure means "no".
+
+    Split out rather than inlined so the failure path is a ``return`` and not a bare
+    ``pass``: this runs inside a security gate and must never raise, and a
+    ``try/except/pass`` is both harder to read and what bandit's B110 flags.
+    """
+    try:
+        decode_wif(text)
+    except Exception:
+        return False
+    return True
+
+
+def _base58check_payload(text: str) -> bytes:
+    """The base58check payload of *text*, or empty if it is not base58check."""
+    try:
+        return base58check_decode(text)
+    except Exception:
+        return b""
+
+
+def _value_is_spending_authority(text: str) -> bool:
+    """True if *text* IS a private key, decided by DECODING it — never by its name.
+
+    Three tests, in cost order. Each is a decode rather than a shape guess, so a false
+    positive needs a public value that is simultaneously a checksum-valid encoding of a
+    key, which is not a thing a locator can accidentally be:
+
+    1. **WIF** — :func:`~pyrxd.utils.decode_wif` verifies the base58check checksum AND
+       requires a known WIF version byte. A Radiant address is base58check too but
+       carries an address version and a 20-byte payload, so it does not pass.
+    2. **BIP-32 extended PRIVATE key** — 78 payload bytes with ``0x00`` at index 45.
+       That byte is the serialisation's discriminator: an ``xpub``/``tpub`` carries a
+       ``0x02``/``0x03`` SEC prefix there, so this matches ``xprv``/``tprv`` (and the
+       ``yprv``/``zprv`` variants) without enumerating version bytes.
+    3. **BIP-39 mnemonic** — the SDK's own redaction test, so the phrase this refuses to
+       leave at 0644 is exactly the phrase :func:`pyrxd.security.errors.redact` refuses
+       to print.
+
+    Deliberately NOT here: bare 64-hex. It is handled by :func:`_carries_private_key`
+    with the field name in hand, because a 32-byte secret and a 32-byte hash are
+    indistinguishable as values — see :data:`_PUBLIC_32_BYTE_FIELD_MARKERS`.
+    """
+    # Nothing shorter can encode a 32-byte key; skips the ordinary short scalars
+    # (``"bc"``, a stage name) without paying for a base58 decode.
+    if len(text) < 16:
+        return False
+    if _is_wif(text):
+        return True
+    raw = _base58check_payload(text)
+    if len(raw) == 78 and raw[45] == 0:
+        return True
+    return _looks_like_mnemonic(text)
+
 
 def _carries_private_key(value: Any) -> bool:
-    """True if any populated field ANYWHERE in *value* names spending authority.
+    """True if *value* holds spending authority ANYWHERE in it, at any depth.
 
-    Walks the whole structure rather than the top-level keys. The gate this feeds is
-    "does this document hold a key?", and a document holds what it holds at any depth —
-    but the check only ever looked one level down, so ``{"parties": {"taker_rxd_wif":
-    ...}}`` at mode 0644 was accepted as a public file. Nothing about the harnesses
-    guarantees a flat document, and the nesting an operator's own tooling introduces is
-    precisely what nobody thinks to re-check.
+    The gate this feeds asks "does this document hold a key?", and a document holds what
+    it holds regardless of where it sits or what the field is called. So every string in
+    the structure is DECODED (:func:`_value_is_spending_authority`) rather than judged by
+    its field name; the name markers remain only as a fast path for the common case, and
+    the one place a name still matters is the bare-64-hex rule, where it is an allowlist
+    of public quantities and an unknown name fails closed.
 
-    Truthiness is still required, so a present-but-empty ``"taker_rxd_wif": ""`` (what a
-    two-host harness writes for the role it does not hold) is not a key — that is the
-    half that keeps this from refusing the public-file workflow the ``--taker-pkh`` /
-    ``--maker-pkh`` flags exist for.
+    Iterative, not recursive. The recursive version raised an uncaught
+    ``RecursionError`` — surfaced by the CLI as "unexpected failure (RecursionError)" —
+    on a ~1 KB file of ~500 nested JSON lists, well inside the 64 KB read bound, while
+    ``json.loads`` itself parsed the same file happily. An explicit stack has no depth
+    limit to exceed; the node count is bounded by the file-size gate that already ran.
+
+    Truthiness is still required for the name markers, so a present-but-empty
+    ``"taker_rxd_wif": ""`` (what a two-host harness writes for the role it does not
+    hold) is not a key — that, plus the public-field allowlist, is what keeps this from
+    refusing the public-locator workflow the ``--taker-pkh`` / ``--maker-pkh`` flags
+    exist for.
     """
-    if isinstance(value, dict):
-        for key, sub in value.items():
-            if isinstance(key, str) and any(marker in key.lower() for marker in _PRIVATE_KEY_MARKERS) and sub:
+    # Each entry is (enclosing field name, node). List items inherit the enclosing name,
+    # so ``{"preimages": ["<64 hex>", …]}`` is judged the way ``preimage_p_hex`` is.
+    stack: list[tuple[str, Any]] = [("", value)]
+    while stack:
+        field, node = stack.pop()
+        if isinstance(node, dict):
+            for key, sub in node.items():
+                name = key.lower() if isinstance(key, str) else ""
+                if name and sub and any(marker in name for marker in _PRIVATE_KEY_MARKERS):
+                    return True
+                stack.append((name, sub))
+        elif isinstance(node, (list, tuple)):
+            stack.extend((field, item) for item in node)
+        elif isinstance(node, str) and node:
+            if _value_is_spending_authority(node):
                 return True
-            if _carries_private_key(sub):
+            if _BARE_32_BYTE_HEX.match(node) and not any(m in field for m in _PUBLIC_32_BYTE_FIELD_MARKERS):
                 return True
-        return False
-    if isinstance(value, (list, tuple)):
-        return any(_carries_private_key(item) for item in value)
     return False
 
 
@@ -317,13 +446,24 @@ def load_recovery_json(path: Path) -> dict[str, Any]:
         # ``from None``: JSONDecodeError renders the offending line, and that line
         # may be the one holding a WIF.
         raise ValidationError(f"recovery file {path} is not valid JSON (line {exc.lineno})") from None
+    except RecursionError:
+        # ``json.loads`` recurses per nesting level. Measured: it parses ~5,000 nested
+        # lists and raises at ~16,000, which is 32 KB of ``[`` — half the 64 KB this
+        # gate already allows, so the bound above does not exclude it. Uncaught, the CLI
+        # renders it as "unexpected failure (RecursionError)" and the operator learns
+        # nothing about their file. Fails closed either way; this only says why.
+        raise ValidationError(
+            f"recovery file {path} is nested too deeply to parse. A recovery file is a flat "
+            "JSON object of locators; this is not one."
+        ) from None
     if not isinstance(d, dict):
         raise ValidationError("recovery file is not a JSON object")
     if mode is not None and mode & 0o077 and _carries_private_key(d):
-        # Action first: this message is rendered through ``sanitize_terminal(..., max_len=200)``
-        # at both CLI call sites, so the remedy must survive truncation — and the remedy
-        # has to be one that can actually run, which `chmod` is not on read-only media or
-        # a root-written bind mount (`_tighten_hint` picks the workable one).
+        # Action first: `swap_recovery_cmds._load` renders this through
+        # ``sanitize_terminal(..., max_len=400)``, so the remedy must survive truncation
+        # — and the remedy has to be one that can actually run, which `chmod` is not on
+        # read-only media or a root-written bind mount (`_tighten_hint` picks the
+        # workable one and leads with it).
         from ..gravity.watch.cli_secrets import _tighten_hint
 
         raise ValidationError(

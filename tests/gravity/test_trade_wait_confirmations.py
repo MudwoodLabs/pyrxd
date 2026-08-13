@@ -103,9 +103,15 @@ class TestTheWaitSurvivesWhatItShould:
     async def test_the_tip_height_is_never_read_at_all(self) -> None:
         """Depth comes from the source, not from arithmetic on a separate read.
 
-        Re-requesting at ``min_confirmations`` lets the source apply its own
-        quorum-checked view of the tip in one read. Subtracting a separately
-        fetched tip from a block height would reintroduce a two-read race.
+        Re-requesting at ``min_confirmations`` lets the source apply its own view
+        of the tip in one read. Subtracting a separately fetched tip from a block
+        height would reintroduce a two-read race.
+
+        Precisely what "its own view" means, since this used to say
+        "quorum-checked": on the ``MultiSourceBtcDataSource`` path the depth is
+        judged by each LEAF against its own un-quorumed tip, and the quorum then
+        covers the returned bytes plus the count of leaves that independently
+        passed. At least as strict, but not a single agreed tip height.
         """
         btc = _Btc(confirmed_at=3)
         await _trade(btc).wait_confirmations(_TXID, min_confirmations=3)

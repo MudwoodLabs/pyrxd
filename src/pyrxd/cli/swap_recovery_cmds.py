@@ -77,7 +77,17 @@ _NEVER_BROADCAST = (
 
 
 def _load(swap_file: Path) -> tuple[Any, Any]:
-    """Parse the recovery file into (public facts, optional locator extras)."""
+    """Parse the recovery file into (public facts, optional locator extras).
+
+    ``max_len=400`` and not 200. The permissions refusal from ``load_recovery_json`` is
+    the longest message that reaches here, and it is the only one that carries a command
+    the operator has to run. Measured at 200 with a ``/tmp`` path: a 446-character
+    message rendered as 200 characters ending mid-word, with the workable
+    ``install -m 600 …`` suggestion (index 238) cut off entirely — so the operator was
+    shown only the remedy that could NOT succeed. ``_tighten_hint`` now leads with the
+    runnable command as well; both halves are needed, because the ordering survives a
+    future caller picking a smaller limit and the limit covers a longer path.
+    """
     try:
         # ValidationError is NOT a ValueError subclass (it derives from RxdSdkError), so the
         # extras parser has to be named in the tuple below explicitly.
@@ -85,7 +95,7 @@ def _load(swap_file: Path) -> tuple[Any, Any]:
     except (ValueError, ValidationError, json.JSONDecodeError, OSError) as exc:
         raise UserError(
             "could not parse the swap recovery file",
-            cause=sanitize_terminal(str(exc), max_len=200),
+            cause=sanitize_terminal(str(exc), max_len=400),
             fix="point --swap-file at the JSON a swap harness wrote (it must carry hashlock_H + rxd_covenant_spk)",
         ) from exc
 
