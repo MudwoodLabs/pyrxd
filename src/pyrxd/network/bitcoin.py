@@ -860,23 +860,40 @@ class MultiSourceBtcDataSource(BtcDataSource):
         return list(results)
 
     def _require_quorum(self, results: list[Any], key_fn) -> Any:
-        """Return the value agreed on by ≥ quorum sources; raise ``NetworkError`` otherwise.
+        """Return the value backed by the LARGEST group of ≥ quorum sources; raise otherwise.
 
-        The agreement must be **unambiguous**. This returned the FIRST group that reached the
-        quorum, in source order — so with five sources at ``quorum=2``, two colluding sources
-        placed early beat three honest ones simply by being listed first, and the caller was
-        handed the minority answer with no signal that anything disagreed. Every value read
-        through here (a block hash, a header, a header chain, a raw transaction, a tx height, an
-        output script type, a merkle proof) is *deterministic*: honest sources on the same chain
-        cannot disagree about it, so two different values BOTH reaching the quorum means at
-        least one source is lying or forked, and picking either is guessing. Fail closed and
-        name it — that is the signal the operator needs to find the bad endpoint.
+        Every value read through here (a block hash, a header, a header chain, a raw transaction,
+        a tx height, an output script type, a merkle proof) is *deterministic*: honest sources on
+        the same chain cannot disagree about it. So the counting rule is a majority vote, and it
+        has had two different bugs:
+
+        1. It returned the FIRST group to reach the quorum, in source order. With five sources at
+           ``quorum=2``, two colluding sources placed early beat three honest ones simply by
+           being listed first, and the caller was handed the minority answer with no signal that
+           anything disagreed.
+        2. Closing (1) by refusing whenever more than one group reached the quorum swapped a
+           wrong answer for no answer, and handed the same two colluding sources a **veto** over
+           the three honest ones: 3-vs-2 at ``quorum=2`` raised, regardless of order. That is
+           still a minority deciding the outcome — availability is an attack surface, and on a
+           chain with no RBF or CPFP an aborted confirmation wait can cost funds.
+
+        Neither the position nor the mere existence of a rival group is evidence. The *size* of
+        the group is, so the largest qualifying group wins: a lying minority can no longer
+        inflate a value (it is outvoted) and can no longer deny one (it is outvoted).
+
+        **The tie-break is deliberately not content-derived.** On an exact tie the caller gets a
+        ``NetworkError``, which is deterministic — it depends only on the multiset of answers,
+        never on source order. Every content-based alternative (smallest hash, first seen) is
+        worse than refusing: a source that is lying is free to *choose* what it reports, so it
+        can trivially grind a value that wins any ordering on the bytes. A genuine tie means half
+        the sources are lying or forked and there is no majority truth to find; naming that is
+        the signal the operator needs to find the bad endpoint.
 
         (Tip height is the one value where honest sources legitimately differ, by a block, at a
-        propagation boundary; it is read through here too, and an even split will now refuse
-        rather than pick arbitrarily. For a value where lag is expected, prefer
-        :class:`MultiSourceBtcFundingReader`, whose depth read takes the conservative MINIMUM
-        across sources instead of demanding they agree.)
+        propagation boundary, so it is deliberately NOT read through here — see
+        :meth:`get_tip_height`, which applies the same majority rule to a *lower bound* instead
+        of demanding an exact match. Everything still routed here is exact-match by
+        construction.)
         """
         counts: dict = {}
         for r in results:
@@ -886,14 +903,17 @@ class MultiSourceBtcDataSource(BtcDataSource):
             counts[k] = [*counts.get(k, []), r]
 
         agreed = [group for group in counts.values() if len(group) >= self._quorum]
-        if len(agreed) == 1:
-            return agreed[0][0]
-        if len(agreed) > 1:
+        if agreed:
+            best = max(len(group) for group in agreed)
+            winners = [group for group in agreed if len(group) == best]
+            if len(winners) == 1:
+                return winners[0][0]
             raise NetworkError(
-                f"Sources disagree: {len(agreed)} DIFFERENT values each reached quorum "
-                f"{self._quorum} of {len(self._sources)}. These reads are deterministic, so a "
-                "split means at least one source is lying or on another chain; refusing to pick "
-                "one. Fail-closed."
+                f"Sources disagree: {len(winners)} DIFFERENT values are tied at {best} source(s) "
+                f"each (quorum {self._quorum} of {len(self._sources)}). These reads are "
+                "deterministic, so a tie means half the sources are lying or on another chain; "
+                "refusing to pick one, because a lying source chooses what it reports and would "
+                "win any tie-break on the value itself. Fail-closed."
             )
 
         successful = sum(1 for r in results if not isinstance(r, Exception))
@@ -902,9 +922,63 @@ class MultiSourceBtcDataSource(BtcDataSource):
         )
 
     async def get_tip_height(self) -> BlockHeight:
+        """Highest tip a strict MAJORITY of the responding sources corroborate (never fewer than
+        ``quorum`` of them).
+
+        Tip height is the ONE value in this interface that honest, non-malicious sources on the
+        same chain legitimately disagree about: a block takes time to propagate, so at any moment
+        some endpoints are one (occasionally two) blocks ahead of the others. Routing it through
+        :meth:`_require_quorum`, which demands an EXACT match, therefore refused a completely
+        ordinary reading — ``[900000, 900001]`` at ``quorum=1``, or an even 2/2 split at
+        ``quorum=2`` — and a refusal here is not a safe default. The caller is a confirmation
+        wait on a chain with neither RBF nor CPFP (``gravity.trade``), so an abort during a
+        timelock race costs the funds the check was protecting. A guard that refuses valid work
+        is its own fund-safety bug.
+
+        **Why dropping the exact-match rule is safe here, and what replaces it.** Heights are
+        *monotone and cumulative*: a source reporting tip ``H`` asserts "the chain has reached at
+        least ``H``", which implies every weaker claim ``tip >= h`` for ``h <= H``. Corroboration
+        therefore does not need identical replies — the count backing a candidate ``H`` is simply
+        how many sources reported at least ``H``. Sorting the answers descending, the value at
+        index ``r - 1`` is the largest ``H`` that ``r`` sources back. Set ``r`` to a strict
+        majority of the sources that answered, floored at ``quorum``:
+
+        * **Inflation is refused.** A minority reporting a high tip sits above index ``r - 1``
+          and never moves the answer — and it is discarded silently, with no DoS. This is the
+          attack that matters, because an inflated tip overstates confirmation depth and can talk
+          a caller into treating a shallow or absent transaction as buried. Two colluding sources
+          out of five lose to the three honest ones (the same majority rule
+          :meth:`_require_quorum` applies to exact-match values), rather than winning by being
+          the ``quorum``-th answer.
+        * **Deflation is refused too** — which a plain ``min()`` across all sources would NOT be.
+          One stuck or lying source reporting height 0 would drag ``min()`` to 0 forever and
+          stall every confirmation wait behind it. A minority low answer sits below index
+          ``r - 1`` and is discarded just the same. (This is the one property the old exact-match
+          gate did have, and losing it would have traded one refusal bug for another.)
+        * **Honest skew is tolerated**, because a one-block spread is no longer a disagreement to
+          adjudicate. It just means the corroborated lower bound is the older block — the same
+          "only as buried as the most pessimistic source" conservatism as
+          :meth:`MultiSourceBtcFundingReader.confirmations`, applied to whichever block the
+          majority has actually seen.
+
+        Availability is unchanged: fewer than ``quorum`` sources answering at all still fails
+        closed, and ``quorum`` remains a floor, so ``quorum == len(sources)`` still means
+        unanimity-or-nothing (there, ``r`` is every source and the answer is the minimum).
+        """
         self._check_quorum_possible()
         results = await self._gather_results(lambda s: s.get_tip_height())
-        return self._require_quorum(results, int)
+        heights = sorted((int(r) for r in results if not isinstance(r, Exception)), reverse=True)
+        if len(heights) < self._quorum:
+            raise NetworkError(
+                f"Source quorum not reached: {len(heights)}/{len(self._sources)} sources responded, "
+                f"quorum is {self._quorum}"
+            )
+        # Strict majority of the sources that ANSWERED, floored at the configured quorum. Both
+        # bounds matter: the majority is what stops a colluding pair outvoting three honest
+        # sources, and the quorum floor is what stops a 1-of-N configuration from accepting a
+        # single source's word when more were reachable.
+        required = max(self._quorum, len(heights) // 2 + 1)
+        return BlockHeight(heights[required - 1])
 
     async def get_block_hash(self, height: BlockHeight) -> Hex32:
         if not isinstance(height, BlockHeight):

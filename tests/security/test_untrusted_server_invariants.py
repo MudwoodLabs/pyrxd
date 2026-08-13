@@ -553,25 +553,42 @@ def fake_source(**answers) -> MagicMock:
     return source
 
 
-async def test_quorum_is_about_agreement_not_list_position() -> None:
-    """Two colluding sources listed FIRST beat three honest ones listed after them.
+@pytest.mark.parametrize("hostile_first", [True, False], ids=["hostile-first", "honest-first"])
+async def test_quorum_is_about_agreement_not_list_position(hostile_first: bool) -> None:
+    """Three honest sources beat two colluding ones, at either position.
 
-    ``_require_quorum`` returned the first group in insertion order that reached the quorum,
-    and insertion order is source order. With ``quorum=2`` a hostile pair at the head of the
-    list therefore decided the answer while three honest sources disagreed in silence.
+    Two bugs, one test. ``_require_quorum`` first returned the first group in insertion order to
+    reach the quorum, and insertion order is source order — so a hostile pair at the head of the
+    list decided the answer while three honest sources disagreed in silence. Closing that by
+    refusing whenever more than one group reached the quorum then handed the same pair a VETO:
+    3-vs-2 raised regardless of order, so a minority still decided the outcome, and on a chain
+    with no RBF or CPFP an aborted wait is not a safe default.
+
+    The size of the group is the only evidence there is, so the largest one wins.
     """
     hostile = [fake_source(get_tx_block_height=BlockHeight(1)) for _ in range(2)]
     honest = [fake_source(get_tx_block_height=BlockHeight(800_000)) for _ in range(3)]
-    multi = MultiSourceBtcDataSource([*hostile, *honest], quorum=2)
-    with pytest.raises(NetworkError, match="Sources disagree"):
-        await multi.get_tx_block_height(Txid(REAL_TXID))
+    ordered = [*hostile, *honest] if hostile_first else [*honest, *hostile]
+    multi = MultiSourceBtcDataSource(ordered, quorum=2)
+    assert int(await multi.get_tx_block_height(Txid(REAL_TXID))) == 800_000
+
+
+async def test_quorum_still_refuses_a_value_a_lying_minority_alone_backs() -> None:
+    """The refuse direction that must survive the majority rule: a sub-quorum minority can
+    neither win nor deny. Two liars at ``quorum=3`` are simply outvoted."""
+    hostile = [fake_source(get_tx_block_height=BlockHeight(1)) for _ in range(2)]
+    honest = [fake_source(get_tx_block_height=BlockHeight(800_000)) for _ in range(3)]
+    multi = MultiSourceBtcDataSource([*hostile, *honest], quorum=3)
+    assert int(await multi.get_tx_block_height(Txid(REAL_TXID))) == 800_000
 
 
 async def test_quorum_refuses_an_even_split() -> None:
+    """No majority exists, so there is nothing to prefer. The tie-break is a refusal on
+    purpose: a lying source chooses what it reports and would win any tie-break on the value."""
     a = [fake_source(get_block_hash=b"\xaa" * 32) for _ in range(2)]
     b = [fake_source(get_block_hash=b"\xbb" * 32) for _ in range(2)]
     multi = MultiSourceBtcDataSource([*a, *b], quorum=2)
-    with pytest.raises(NetworkError, match="Sources disagree"):
+    with pytest.raises(NetworkError, match="tied at 2 source"):
         await multi.get_block_hash(BlockHeight(100))
 
 
@@ -641,12 +658,87 @@ def test_profile_refuses_to_mix_pinned_and_unpinned_endpoints() -> None:
 
 
 def test_profile_refuses_to_mix_tls_and_plaintext_endpoints() -> None:
+    """The refuse direction: a REMOTE plaintext endpoint alongside a wss:// one.
+
+    Previously written with ``ws://127.0.0.1``, which made the test assert the exemption below
+    was absent rather than assert the downgrade was caught. The downgrade this rule exists for
+    needs a link to eavesdrop, so the case has to be remote to be the case at all.
+    """
     with pytest.raises(ValidationError, match="mixes TLS and plaintext"):
         NetworkProfile(
             network="regtest",
             endpoints=(
                 Endpoint(url="wss://a.example/"),
+                Endpoint(url="ws://b.example:50022/", allow_insecure=True),
+            ),
+            genesis_hash=None,
+        )
+
+
+@pytest.mark.parametrize(
+    "loopback_url",
+    ["ws://127.0.0.1:50022/", "ws://localhost:50022/", "ws://[::1]:50022/", "ws://127.5.6.7:50022/"],
+)
+def test_profile_accepts_a_loopback_endpoint_beside_a_public_one(loopback_url: str) -> None:
+    """Accept direction: a local indexer beside a public server is the ordinary layout.
+
+    Failing over to loopback is not the downgrade the uniformity rule defends against — that
+    session never leaves the host, so there is no link to eavesdrop and no remote identity for
+    TLS to authenticate. Refusing it refused valid work.
+    """
+    profile = NetworkProfile(
+        network="mainnet",
+        endpoints=(Endpoint(url=loopback_url, allow_insecure=True), Endpoint(url="wss://a.example/")),
+        genesis_hash=None,
+    )
+    assert len(profile.endpoints) == 2
+
+
+def test_profile_accepts_a_loopback_endpoint_beside_a_pinned_one() -> None:
+    """Same reasoning for the pin rule: an SPKI pin authenticates a REMOTE server's key.
+
+    ``Endpoint`` already refuses ``spki_pins`` on a plaintext URL as meaningless, so a loopback
+    endpoint can never carry one and must not be counted as "the unpinned one".
+    """
+    profile = NetworkProfile(
+        network="mainnet",
+        endpoints=(
+            Endpoint(url="wss://a.example/", spki_pins=(PIN_A,)),
+            Endpoint(url="ws://127.0.0.1:50022/", allow_insecure=True),
+        ),
+        genesis_hash=None,
+    )
+    assert len(profile.endpoints) == 2
+
+
+@pytest.mark.parametrize(
+    "lookalike_url",
+    [
+        "ws://127.0.0.1.evil.example/",  # loopback IP as a LABEL of a public name
+        "ws://localhost.evil.example/",  # "localhost" as a label, not the host
+        "ws://0.0.0.0:50022/",  # unspecified, not loopback
+        "ws://10.0.0.5:50022/",  # LAN — a real link, a real MITM position
+    ],
+)
+def test_loopback_exemption_does_not_extend_to_lookalike_hosts(lookalike_url: str) -> None:
+    """The exemption fails closed: anything not provably this host keeps the rule."""
+    with pytest.raises(ValidationError, match="mixes TLS and plaintext"):
+        NetworkProfile(
+            network="mainnet",
+            endpoints=(Endpoint(url=lookalike_url, allow_insecure=True), Endpoint(url="wss://a.example/")),
+            genesis_hash=None,
+        )
+
+
+def test_profile_still_refuses_two_remote_plaintext_against_one_tls() -> None:
+    """A loopback endpoint in the set does not disarm the rule for the remote ones."""
+    with pytest.raises(ValidationError, match="mixes TLS and plaintext"):
+        NetworkProfile(
+            network="mainnet",
+            endpoints=(
                 Endpoint(url="ws://127.0.0.1:50022/", allow_insecure=True),
+                Endpoint(url="ws://b.example:50022/", allow_insecure=True),
+                Endpoint(url="wss://a.example/"),
             ),
             genesis_hash=None,
         )

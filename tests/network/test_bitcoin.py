@@ -188,13 +188,24 @@ async def test_multi_source_agrees_returns_result():
     assert result == 840000
 
 
-async def test_multi_source_disagrees_raises_network_error():
-    """Two sources returning different heights must raise NetworkError."""
+async def test_multi_source_one_block_apart_returns_the_corroborated_lower_bound():
+    """Two sources one block apart are BOTH honest — that is block propagation, not a lie.
+
+    This asserted a refusal, which made ordinary skew abort a caller (an HTLC confirmation wait
+    on a chain with no RBF or CPFP). The answer is the height both sources corroborate.
+    """
     s1 = _MockSource(tip=840000)
     s2 = _MockSource(tip=840001)
     multi = MultiSourceBtcDataSource([s1, s2], quorum=2)
-    with pytest.raises(NetworkError, match="quorum"):
-        await multi.get_tip_height()
+    assert await multi.get_tip_height() == 840000
+
+
+async def test_multi_source_tip_ignores_a_lying_minority_in_both_directions():
+    """The property the quorum gate exists for, kept: a minority moves the answer neither up
+    (an inflated tip overstates confirmation depth) nor down (a stuck source stalls the wait)."""
+    honest = [_MockSource(tip=840000), _MockSource(tip=840000)]
+    assert await MultiSourceBtcDataSource([*honest, _MockSource(tip=999999)], quorum=2).get_tip_height() == 840000
+    assert await MultiSourceBtcDataSource([*honest, _MockSource(tip=0)], quorum=2).get_tip_height() == 840000
 
 
 async def test_multi_source_insufficient_sources_raises_network_error():
