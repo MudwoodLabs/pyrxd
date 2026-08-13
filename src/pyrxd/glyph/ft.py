@@ -282,14 +282,38 @@ class AirdropFunding:
 
     :param txid:        txid of the plain-P2PKH UTXO
     :param vout:        output index within that tx
-    :param value:       photons available
+    :param value:       photons available. Must be a positive ``int``, checked
+                        here for the same reason :class:`FtUtxo` checks its own:
+                        this number is summed into the RXD budget the fee comes
+                        out of, and a wrong one used to be noticed only much
+                        later and unhelpfully — measured as
+                        ``'float' object has no attribute 'to_bytes'`` from the
+                        middle of output serialisation for ``1_000_000.5``,
+                        ``OverflowError`` for a negative, and for ``True`` a
+                        nonsense "budget 1 photons" in the funding error.
     :param private_key: :class:`pyrxd.keys.PrivateKey` that unlocks it
+
+    :raises ValidationError: ``value`` is not a positive ``int``.
     """
 
     txid: str
     vout: int
     value: int
     private_key: Any
+
+    def __post_init__(self) -> None:
+        # ``bool`` first: it is an ``int`` subclass, so ``True`` would pass every
+        # arithmetic check below as 1.
+        if isinstance(self.value, bool) or not isinstance(self.value, int):
+            raise ValidationError(
+                f"AirdropFunding {self.txid}:{self.vout} value must be int (photons), "
+                f"got {type(self.value).__name__!r}: {self.value!r}"
+            )
+        if self.value <= 0:
+            raise ValidationError(
+                f"AirdropFunding {self.txid}:{self.vout} value must be > 0 photons, got {self.value}. "
+                "A funding input exists to pay the fee; one worth nothing cannot."
+            )
 
 
 @dataclass
@@ -341,6 +365,16 @@ class FtUtxoSet:
             raise ValidationError("ref must be a GlyphRef")
         if not isinstance(utxos, list):
             raise ValidationError("utxos must be a list")
+        # An outpoint is unique on chain, so the same ``(txid, vout)`` twice is
+        # always a caller mistake — and an expensive one, because nothing further
+        # down notices. Measured before this check: a set holding one UTXO twice
+        # reported DOUBLE the real balance from :meth:`total`, :meth:`select`
+        # returned the same outpoint twice, and :meth:`build_airdrop_tx` went on to
+        # sign a transaction carrying a duplicate input (rejected by every node as
+        # ``bad-txns-inputs-duplicate``) while reporting a fee 4x the real one. The
+        # check is on ``(txid, vout)`` and not on ``txid`` alone: one transaction
+        # paying a holder at several output indexes is ordinary.
+        seen_outpoints: set[tuple[str, int]] = set()
         for u in utxos:
             # ``value``/``ft_amount`` type, sign and equality are not re-checked
             # here: :meth:`FtUtxo.__post_init__` refuses to build an instance
@@ -373,6 +407,15 @@ class FtUtxoSet:
                 raise ValidationError(
                     f"UTXO {u.txid}:{u.vout} carries ref {input_ref} which differs from the set's ref {ref}"
                 )
+            outpoint = (u.txid, u.vout)
+            if outpoint in seen_outpoints:
+                raise ValidationError(
+                    f"UTXO {u.txid}:{u.vout} appears more than once in this set. An outpoint is unique on "
+                    "chain, so a repeat is a duplicated read rather than a second holding: it would report "
+                    "twice the real balance from total(), let select() return the same outpoint twice, and "
+                    "produce a transaction with a duplicate input that no node will accept."
+                )
+            seen_outpoints.add(outpoint)
         self.ref = ref
         self.utxos = list(utxos)
 
@@ -663,9 +706,40 @@ class FtUtxoSet:
                 )
             seen_pkh.add(pkh)
 
+        # Every input this builder signs must be a DISTINCT outpoint, and the
+        # funding side is the half no other check reaches: :meth:`FtUtxoSet.__init__`
+        # now refuses a repeated token UTXO, but ``funding`` arrives here directly.
+        # A repeat is not merely redundant — ``funding_total`` counts it twice, so
+        # the builder sizes change and reports a fee against RXD that exists once,
+        # and the final ``assert_pays_for_its_size`` agrees, because it is handed the
+        # same double-counted total. Measured before this check: one funding UTXO
+        # passed twice produced a signed transaction with a duplicate input and a
+        # reported fee 4x the real one.
+        funding_outpoints: set[tuple[str, int]] = set()
+        for i, f in enumerate(funding):
+            outpoint = (f.txid, f.vout)
+            if outpoint in funding_outpoints:
+                raise ValidationError(
+                    f"funding[{i}] repeats outpoint {f.txid}:{f.vout}, which already appears earlier in "
+                    "the list. An outpoint is unique on chain, so this would double-count the RXD budget "
+                    "and sign a transaction with a duplicate input that no node will accept."
+                )
+            funding_outpoints.add(outpoint)
+
         # 2. Selection + conservation — the same two calls build_transfer_tx makes.
         total_out = sum(r.amount for r in recipients)
         selected = self.select(total_out)
+
+        # The two input lists are built independently and concatenated, so an
+        # outpoint appearing in BOTH is the same duplicate-input defect across the
+        # seam that neither list can see on its own.
+        for u in selected:
+            if (u.txid, u.vout) in funding_outpoints:
+                raise ValidationError(
+                    f"outpoint {u.txid}:{u.vout} is listed both as an FT UTXO and as plain-RXD funding. "
+                    "It can only be one of the two, and spending it twice in one transaction is a "
+                    "duplicate input that no node will accept."
+                )
 
         # Defence in depth, and NOTHING MORE: :meth:`FtUtxo.__post_init__` now
         # refuses to construct a UTXO whose `value` and `ft_amount` differ, so
