@@ -227,12 +227,27 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   quorum-checked view of the tip, in one read rather than two. Call and stale
   comment both removed.
 
-  `wait_confirmations` had **no test at all** before this, which is why the
-  defect survived — `tests/gravity/test_trade_wait_confirmations.py` now covers
-  it from both sides: the wait survives a source that cannot report a tip, and
-  still refuses to report a depth it was never told about. The two tests naming
-  the defect were confirmed red against the pre-fix source; the four controls
-  pass both before and after, which is what a control is for.
+  Why it survived is the more useful half, and the first version of this entry
+  got it wrong. It claimed `wait_confirmations` "had no test at all" — it had
+  **six**, in `tests/test_gravity_trade.py::TestWaitConfirmations`, covering
+  first-poll success, success after N polls, both timeout paths, an invalid
+  txid and an explicit `min_confirmations`. All six were green, and none of
+  them could ever have failed on this defect: they share
+  `mock_btc_source()`, an `AsyncMock(spec=BtcDataSource)` whose
+  `get_tip_height` is hardwired to return `BlockHeight(900_000)` and therefore
+  **cannot raise**. The one input that discriminates — a source whose tip read
+  fails while its tx reads succeed — was not constructible from that fixture,
+  so the call could be moved, discarded, or left outside the `try` with the
+  suite staying green either way. A mock that never fails cannot test a failure
+  path; this is the same shape as a regtest node at a tenth of mainnet's fee
+  floor being unable to observe a fee defect.
+
+  `tests/gravity/test_trade_wait_confirmations.py` adds a stub whose tip read
+  *can* fail, and covers both sides: the wait survives a source that cannot
+  report a tip, and still refuses to report a depth it was never told about.
+  The two tests naming the defect were confirmed red against the pre-fix
+  source; the four controls pass both before and after, which is what a control
+  is for.
 
 - **The duplicate-outpoint guards in the FT builders were bypassable by letter
   case.** All three — `FtUtxoSet.__init__`, the airdrop's funding-list check and
@@ -469,11 +484,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `build_nft_transfer_tx` before the bound existed: `fee_rate=10_000_000` —
   which is literally `RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`, the
   per-**kB** constant `pyrxd.fee_sizing` exports one import away from the
-  per-**byte** one — burned **2.32-2.33 billion photons (23.2-23.3 RXD)** off a
-  229-230 byte transfer, silently, with the build reporting success: a
-  **1000-1004x** overpay against that transaction's own floor-rate fee. Ranges,
-  not single figures, because the fee tracks the 71-or-72-byte DER signature;
-  re-measured over 40 builds on 2026-08-12.
+  per-**byte** one — burned **2.31-2.33 billion photons (23.1-23.3 RXD)** off a
+  228-230 byte transfer, silently, with the build reporting success. Ranges, not
+  single figures, because the fee tracks the DER signature length (228 B ↔ 70,
+  229 ↔ 71, 230 ↔ 72, one-to-one); re-measured over 400 builds.
+
+  The overpay *multiple* depends on which ratio is meant, so both are given
+  rather than one presented as the number. Against the caller's own rate the
+  slip is **exactly 1000x** by construction (`10_000_000 / 10_000`). Against the
+  relay fee the *final* transaction actually owed it reaches about **1009x**,
+  because the fee was sized from the trial signing pass and the final signature
+  can be a byte or two shorter. An earlier revision of this entry said the 1009x
+  figure "did not reproduce" — it does, under the second ratio; what did not
+  reproduce was 1009x as a single universal value.
 
   The ceiling is `MAX_FEE_OVERPAY_MULTIPLE × relay_floor_photons_per_byte()` =
   100_000 photons/byte. That constant is reused rather than a new number
@@ -558,10 +581,14 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     in-repo callers already catch the wider type; the docstring was the wrong
     half.
   - The 23.2 RXD overpay measurement is a **range**, not a figure: the fee tracks
-    the 71-or-72-byte DER signature, so it is 2.32 or 2.33 billion photons on a
-    229-230 byte transfer (re-measured over 40 builds, 2026-08-12). The quoted
-    "1009x" did not reproduce; the measured overpay against that transaction's
-    own floor-rate fee is 1000-1004x.
+    the DER signature length one-to-one (228 B ↔ 70, 229 ↔ 71, 230 ↔ 72), so it
+    is 2.31-2.33 billion photons on a 228-230 byte transfer, re-measured over
+    400 builds. This entry previously said the quoted "1009x" did not
+    reproduce, on a 40-build sample. That was wrong: 1009x reproduces against
+    the relay fee the *final* transaction owed, because the fee is sized from
+    the trial signing pass. Against the caller's own rate the multiple is
+    exactly 1000x by construction. Both are now stated above, since "the
+    overpay multiple" is ambiguous between them.
 
 - `docs/concepts/glyph-inspect-tool.md` now states which of the two
   classifiers sees what. Script-level reads a locking script and reports
