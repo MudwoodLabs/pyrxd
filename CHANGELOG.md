@@ -8,6 +8,48 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Security
 
+- **A minority of BTC sources could win a quorum read by making the honest ones
+  unreachable.** `MultiSourceBtcDataSource` is exported public API — the class an
+  embedder builds to check BTC facts against several endpoints during an atomic
+  swap — and seven fund-critical reads route through `_require_quorum`: block
+  hash, header, header chain, **raw transaction**, tx height, output script type
+  and **merkle proof**.
+
+  The previous release changed the rule to "the largest group of at least
+  `quorum` sources wins", counted over the sources that RESPONDED. That fixed a
+  real refusal bug (a colluding pair could veto three honest sources) and
+  introduced a worse one, because an attacker never has to out-argue an endpoint
+  it can simply make unreachable — public endpoints rate-limit, and a partition
+  is indistinguishable from an outage. Measured against the previous source:
+  **three lying sources of seven, at the default `quorum=2`, had their forged
+  value returned once two honest endpoints were down.** The same shape also made
+  two liars beat five honest sources whenever the honest ones *refused* a read,
+  since a refusal raises and was counted as absence rather than dissent — that
+  half was pre-existing, not new.
+
+  Silence is no longer corroboration: the winning group must outvote every
+  source that did not back it, the ones that answered nothing included.
+
+  `get_tip_height` got the matching correction, and one more. Its majority was
+  over responders too, and because the configured `quorum` also floored the
+  index, **raising `quorum` made the tip MORE deflatable, not less**: at five
+  sources with `quorum=5` the answer was the minimum, so a single source
+  reporting 0 returned 0 — the exact `min()` failure that method was written to
+  avoid, reappearing in the configuration an operator would pick for *more*
+  assurance. The majority is now over the configured sources; `quorum` stays as
+  the availability gate and no longer decides the value.
+
+  Unavoidable and now documented: at two sources a majority is both of them, so
+  the answer is the lower and one stuck source stalls the wait. Two endpoints
+  cannot tell a liar from a laggard; three is the smallest configuration that
+  can.
+
+  Every honest case still works — an honest majority outvoting liars, a majority
+  answering while the rest are down, and the one-block propagation skew whose
+  refusal started this whole thread. `tests/network/test_quorum_counts_silence_as_disagreement.py`
+  pins both directions: 5 of its 12 tests go red against the previous source and
+  7 are honest-path controls that pass either way.
+
 - **A swap recovery file's private keys are now read under the same gate its fee
   key already got.** `pyrxd swap build-claim` / `build-refund` / `status` take two
   files. `--fee-wif-file` holds ONE key, for fees, and has always gone through
