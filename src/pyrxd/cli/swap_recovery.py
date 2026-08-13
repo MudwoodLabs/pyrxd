@@ -216,12 +216,49 @@ def _opt_int(d: dict[str, Any], key: str) -> int | None:
 #: hashlock preimage ``p`` is published on-chain by the claim that reveals it, so a
 #: file carrying only ``p`` is not a key file and demanding 0600 of it would be a
 #: spurious refusal on a public document.
-_PRIVATE_KEY_MARKERS = ("wif", "privkey", "private_key", "key_hex", "secret")
+#: Field-name fragments that mean "this value is spending authority".
+#:
+#: ``mnemonic`` / ``seed`` / ``xprv`` were missing, which is not a lesser omission than
+#: the others: a recovery file carrying a mnemonic is carrying EVERY key the wallet will
+#: ever derive, and it was accepted at 0644 in silence. A false positive here costs one
+#: ``chmod``; a false negative costs the keys.
+_PRIVATE_KEY_MARKERS = (
+    "wif",
+    "privkey",
+    "private_key",
+    "key_hex",
+    "secret",
+    "mnemonic",
+    "seed",
+    "xprv",
+)
 
 
-def _carries_private_key(d: dict[str, Any]) -> bool:
-    """True if any populated field of *d* names spending authority."""
-    return any(any(marker in key.lower() for marker in _PRIVATE_KEY_MARKERS) and d[key] for key in d)
+def _carries_private_key(value: Any) -> bool:
+    """True if any populated field ANYWHERE in *value* names spending authority.
+
+    Walks the whole structure rather than the top-level keys. The gate this feeds is
+    "does this document hold a key?", and a document holds what it holds at any depth —
+    but the check only ever looked one level down, so ``{"parties": {"taker_rxd_wif":
+    ...}}`` at mode 0644 was accepted as a public file. Nothing about the harnesses
+    guarantees a flat document, and the nesting an operator's own tooling introduces is
+    precisely what nobody thinks to re-check.
+
+    Truthiness is still required, so a present-but-empty ``"taker_rxd_wif": ""`` (what a
+    two-host harness writes for the role it does not hold) is not a key — that is the
+    half that keeps this from refusing the public-file workflow the ``--taker-pkh`` /
+    ``--maker-pkh`` flags exist for.
+    """
+    if isinstance(value, dict):
+        for key, sub in value.items():
+            if isinstance(key, str) and any(marker in key.lower() for marker in _PRIVATE_KEY_MARKERS) and sub:
+                return True
+            if _carries_private_key(sub):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_carries_private_key(item) for item in value)
+    return False
 
 
 def load_recovery_json(path: Path) -> dict[str, Any]:
@@ -253,8 +290,19 @@ def load_recovery_json(path: Path) -> dict[str, Any]:
     key. The mode is ``fstat``-ed from the fd the bytes came from, so judging it after
     parsing is not a check-then-use race.
 
+    Why the path gate is the wallet's and not the watchtower's
+    ----------------------------------------------------------
+    ``operator_chosen_path=True``. A recovery-file path is typed by a person, like a
+    wallet path and unlike a machine-managed watchtower credential, so it allows a
+    symlink (external storage is an ordinary place to keep one) and a ROOT-owned file
+    (the harnesses run their nodes in Docker; a root-written JSON on a bind mount was
+    refused outright, mid-incident, with no override). A file owned by any other
+    unprivileged uid is still refused. See
+    :func:`~pyrxd.gravity.watch.cli_secrets.read_file_guarded` for why those two checks
+    get different answers.
+
     Raises:
-        ValidationError: the file is a symlink, not a regular file, owned by another
+        ValidationError: the file is not a regular file, owned by another unprivileged
             user, oversized, not UTF-8, not JSON, not a JSON object, or carries a
             private key at a group/world-accessible mode.
     """
@@ -262,7 +310,7 @@ def load_recovery_json(path: Path) -> dict[str, Any]:
     # dependency graph, and ``swap_recovery_cmds`` already reaches it this way.
     from ..gravity.watch.cli_secrets import read_file_guarded
 
-    text, mode = read_file_guarded(path, label="recovery file", require_owner_only=False)
+    text, mode = read_file_guarded(path, label="recovery file", require_owner_only=False, operator_chosen_path=True)
     try:
         d = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -273,10 +321,14 @@ def load_recovery_json(path: Path) -> dict[str, Any]:
         raise ValidationError("recovery file is not a JSON object")
     if mode is not None and mode & 0o077 and _carries_private_key(d):
         # Action first: this message is rendered through ``sanitize_terminal(..., max_len=200)``
-        # at both CLI call sites, so the remedy must survive truncation.
+        # at both CLI call sites, so the remedy must survive truncation — and the remedy
+        # has to be one that can actually run, which `chmod` is not on read-only media or
+        # a root-written bind mount (`_tighten_hint` picks the workable one).
+        from ..gravity.watch.cli_secrets import _tighten_hint
+
         raise ValidationError(
             f"recovery file has mode {oct(mode)} and contains a private key — "
-            f"run `chmod 600 {path}` and retry. Treat those keys as exposed: at this mode "
+            f"{_tighten_hint(path)}. Treat those keys as exposed: at this mode "
             "anyone with an account on this host could already have read them."
         )
     return d

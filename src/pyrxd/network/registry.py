@@ -57,8 +57,10 @@ by definition a local, per-developer chain. That is honest rather than convenien
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 from ..security.errors import ValidationError
 from .tls_pin import normalize_pin
@@ -190,6 +192,26 @@ class Endpoint:
         return self.url.rstrip("/").lower()
 
 
+def _is_loopback_url(url: str) -> bool:
+    """True when *url*'s host is unambiguously this machine's loopback interface.
+
+    Deliberately strict, and it fails to ``False`` — the only caller uses this to EXEMPT an
+    endpoint from a security rule, so anything it cannot prove is loopback must keep the rule.
+    A literal loopback IP (``127.0.0.0/8``, ``::1``) or the exact name ``localhost`` qualifies;
+    ``127.0.0.1.evil.com``, ``localhost.evil.com``, a bare ``0.0.0.0``, a LAN address and the
+    abbreviated ``127.1`` (which :mod:`ipaddress` rejects) all do not.
+    """
+    host = urlsplit(url).hostname  # lowercases, strips userinfo and IPv6 brackets
+    if not host:
+        return False
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _assert_uniform_posture(network: str, endpoints: Sequence[Endpoint]) -> None:
     """Refuse a profile whose endpoints do not all carry the same security posture.
 
@@ -209,23 +231,40 @@ def _assert_uniform_posture(network: str, endpoints: Sequence[Endpoint]) -> None
 
     A profile where NO endpoint is pinned is fine (pinning is opt-in, see
     :mod:`pyrxd.network.tls_pin`); the refusal is only for a MIX, where failover would relax.
+
+    **Loopback endpoints are exempt, and are the only exemption.** The rule above is about what
+    failover *costs*, and failing over to ``ws://127.0.0.1`` costs nothing it protects: that
+    session never leaves the host, so there is no link to eavesdrop, no MITM position to take,
+    and no remote identity for TLS or an SPKI pin to authenticate — an attacker who can read
+    loopback already owns the process holding the keys. (This is the same judgement
+    :class:`Endpoint` already encodes by refusing ``spki_pins`` on a plaintext URL as
+    "meaningless".) The mix that motivated the rule is a *remote* plaintext or unpinned server,
+    where the downgrade is real and silent, and that is still refused. Mixing a local indexer
+    with a public one is the ordinary developer and operator layout — a guard that refuses it
+    refuses valid work, and a ``ws://`` URL is already an explicit opt-in via ``allow_insecure``.
+    ``_is_loopback_url`` fails closed, so anything it cannot prove local keeps the rule.
     """
     if len(endpoints) < 2:
         return
-    plaintext = [e.url for e in endpoints if e.url.startswith("ws://")]
-    if plaintext and len(plaintext) != len(endpoints):
+    remote = [e for e in endpoints if not _is_loopback_url(e.url)]
+    if len(remote) < 2:
+        return
+    plaintext = [e.url for e in remote if e.url.startswith("ws://")]
+    if plaintext and len(plaintext) != len(remote):
         raise ValidationError(
             f"network {network!r} mixes TLS and plaintext endpoints ({len(plaintext)} of "
-            f"{len(endpoints)} are ws://). Failover between them silently downgrades a wss:// "
-            "session to plaintext on the first transport error. Use one transport per profile."
+            f"{len(remote)} non-loopback are ws://). Failover between them silently downgrades a "
+            "wss:// session to plaintext on the first transport error. Use one transport per "
+            "profile (a loopback ws:// endpoint is exempt — it never leaves the host)."
         )
-    pinned = [e.url for e in endpoints if e.spki_pins]
-    if pinned and len(pinned) != len(endpoints):
+    pinned = [e.url for e in remote if e.spki_pins]
+    if pinned and len(pinned) != len(remote):
         raise ValidationError(
             f"network {network!r} mixes TLS-pinned and unpinned endpoints ({len(pinned)} of "
-            f"{len(endpoints)} carry spki_pins). Failover to an unpinned endpoint silently drops "
-            "the pin, so the check reads as enabled while not being in force. Pin every endpoint "
-            "in the profile (one pin list may hold several servers' pins), or none of them."
+            f"{len(remote)} non-loopback carry spki_pins). Failover to an unpinned endpoint "
+            "silently drops the pin, so the check reads as enabled while not being in force. Pin "
+            "every endpoint in the profile (one pin list may hold several servers' pins), or "
+            "none of them."
         )
 
 

@@ -116,6 +116,7 @@ class WatchOnlyTxBuilder:
         change_chain: int = _INTERNAL_CHAIN,
         fee_rate: int = DEFAULT_FEE_RATE,
         allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
     ) -> UnsignedSend:
         """Build an unsigned send of ``photons`` to ``to_address`` with change to
         ``change_chain/change_index``. Returns the unsigned tx + a SigningRequest.
@@ -135,6 +136,8 @@ class WatchOnlyTxBuilder:
         :param allow_below_relay_floor: the same deliberate, greppable escape
             hatch the other builders carry — for regtest and for chains the
             caller controls, which legitimately relay lower.
+        :param allow_overpay: its mirror, for a rate above the overpay ceiling.
+            Both bounds need a way through, or the guard refuses valid work.
         """
         if not isinstance(photons, int) or isinstance(photons, bool):
             raise ValidationError("photons must be int")
@@ -157,6 +160,7 @@ class WatchOnlyTxBuilder:
             fee_rate,
             what="WatchOnlyTxBuilder.build_send",
             allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
             error_type=ValidationError,
         )
         for label, val in (("change_index", change_index), ("change_chain", change_chain)):

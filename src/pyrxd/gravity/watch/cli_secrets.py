@@ -30,19 +30,51 @@ _module_logger = logging.getLogger("pyrxd.watchtower")
 MAX_SECRET_FILE_BYTES = 64 * 1024
 
 
+def _tighten_hint(file_path: Path) -> str:
+    """The remedy for a too-permissive keyful file — one the operator can actually run.
+
+    ``chmod 600 <path>`` is the right advice exactly when the operator owns the file and
+    the filesystem is writable. On the two cases this gate most often fires on it is
+    advice that CANNOT succeed, and a remedy that cannot succeed reads as the tool being
+    broken: a 0444 file on read-only media (an archived recovery set on a mounted image
+    or a squashfs) refuses the chmod with ``EROFS``, and a root-written file on a Docker
+    bind mount refuses it with ``EPERM`` for the unprivileged operator. Both have the
+    same working answer — take a private copy — so name it rather than leaving the
+    operator to discover the first one does not work.
+
+    Detection is best-effort and never raises: this runs inside the construction of an
+    error message, and an exception there would replace a useful diagnostic with a
+    stack trace.
+    """
+    remedy = f"Run `chmod 600 {file_path}` and retry"
+    try:
+        writable = os.access(file_path, os.W_OK)
+        owned = file_path.stat().st_uid == os.geteuid()
+    except OSError:  # pragma: no cover - defensive; the fd above just succeeded
+        return remedy + "."
+    if not writable or not owned:
+        why = "the file is not writable by this process" if not writable else "it is owned by another user"
+        return (
+            f"`chmod 600 {file_path}` cannot succeed here — {why} (read-only media, or a "
+            f"root-written bind mount). Take a private copy instead: "
+            f"`install -m 600 {file_path} ./recovery.json` (or `cp` then `chmod 600`), and pass that"
+        )
+    return remedy
+
+
 def read_file_guarded(
     path: str | Path,
     *,
     label: str,
     max_bytes: int = MAX_SECRET_FILE_BYTES,
     require_owner_only: bool = True,
+    operator_chosen_path: bool = False,
 ) -> tuple[str, int | None]:
     """:func:`read_secret_file`, but returning the mode so a caller can judge it itself.
 
-    Same single-fd gate; the only thing ``require_owner_only=False`` relaxes is the
-    ``mode & 0o077`` rejection. Symlink refusal, ``S_ISREG``, the ownership check and
-    the size bound always apply — those are not hygiene advice, they are the difference
-    between reading the file you named and reading something somebody else chose.
+    Same single-fd gate. ``require_owner_only=False`` relaxes the ``mode & 0o077``
+    rejection; ``operator_chosen_path=True`` relaxes the two gates that assume a
+    *machine-managed* path (see below). ``S_ISREG`` and the size bound always apply.
 
     Exists for a file whose *sensitivity depends on its contents*: a swap recovery
     JSON carries private keys in a single-operator harness run and only public
@@ -52,10 +84,38 @@ def read_file_guarded(
     the returned mode came from ``fstat`` on the fd the bytes were read from, deciding
     later is not a TOCTOU.
 
-    Returns:
-        ``(text, mode)`` where ``mode`` is the POSIX permission bits, or ``None`` on a
-        platform where they are not meaningful (and where, correspondingly, nothing
-        was gated).
+    ``operator_chosen_path`` — reconciling this gate with the wallet's
+    -----------------------------------------------------------------
+    :func:`pyrxd.hd.wallet._read_wallet_file` reads a file of at least equal value (a
+    BIP39 seed) and deliberately allows BOTH a symlink and a foreign owner. Two files
+    holding spending authority were answering the same question two ways, and one of
+    those answers is a lockout: the harnesses run their nodes in Docker, so a recovery
+    JSON written by a root process onto a bind mount is refused outright, mid-incident,
+    with no override. That is the inverse-bug shape — a guard refusing valid work — and
+    on a chain with neither RBF nor CPFP a refusal during a timelock race costs the
+    funds the guard was protecting.
+
+    They are reconciled by the property that actually governs each check, rather than
+    by making the two files identical (they are not: a wallet file is AES-256-GCM
+    sealed under a key derived from the operator's own mnemonic, so a substituted one
+    fails the tag; a recovery JSON is plaintext and self-describing, so substitution is
+    caught by nothing downstream).
+
+    * **Symlink — same answer as the wallet, allowed.** ``O_NOFOLLOW`` is right for a
+      *machine-managed* credential path, where a symlink is a red flag. A recovery file
+      path is typed by an operator, and symlinking it into external storage (a removable
+      volume, an encrypted mount, a synced directory) is ordinary. Because every verdict
+      here comes from ``fstat`` on the opened fd, allowing the symlink does not weaken
+      anything: the mode and owner reported are the TARGET's, which is the file whose
+      permissions actually matter.
+    * **Owner — NOT the same answer as the wallet.** A file owned by another
+      *unprivileged* uid is still refused, because a peer user who owns the file chooses
+      what your claim is built from and nothing downstream re-authenticates it. Root is
+      not a peer: a root-owned file was written by the administrator of the host this
+      process already runs on, who can substitute the interpreter, the package and the
+      file's contents regardless of what this check says. So uid 0 is accepted and every
+      other foreign uid is not — which admits the Docker bind-mount case and refuses the
+      shared-host substitution one.
     """
     file_path = Path(path)
     if os.name != "posix":  # no POSIX mode bits / no O_NOFOLLOW — bounded read only
@@ -67,7 +127,9 @@ def read_file_guarded(
             raise ValidationError(f"{label} {file_path} is larger than {max_bytes} bytes — refusing to read")
         return _decode(data, label=label, file_path=file_path), None
 
-    flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+    if not operator_chosen_path:
+        flags |= os.O_NOFOLLOW
     try:
         fd = os.open(str(file_path), flags)
     except OSError as exc:
@@ -82,10 +144,11 @@ def read_file_guarded(
         mode = st.st_mode & 0o777
         if require_owner_only and mode & 0o077:
             raise ValidationError(
-                f"{label} {file_path} has mode {oct(mode)}; must be 0o600 (owner-only). "
-                f"Run `chmod 600 {file_path}` and retry."
+                f"{label} {file_path} has mode {oct(mode)}; must be 0o600 (owner-only). {_tighten_hint(file_path)}"
             )
-        if st.st_uid != os.geteuid():
+        # uid 0 is accepted only on an operator-chosen path; see the docstring. Every
+        # other foreign uid is a peer user choosing what this process reads.
+        if st.st_uid != os.geteuid() and not (operator_chosen_path and st.st_uid == 0):
             raise ValidationError(
                 f"{label} {file_path} is owned by uid {st.st_uid}, not this process's uid {os.geteuid()} — "
                 "refusing to read a credential owned by another user"

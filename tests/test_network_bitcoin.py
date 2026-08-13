@@ -554,11 +554,119 @@ class TestMultiSourceBtcDataSource:
 
     @pytest.mark.asyncio
     async def test_get_tip_height_no_quorum_raises(self):
+        """Availability floor: fewer sources ANSWERING than the quorum still fails closed.
+
+        This case used to be written as "two sources one block apart", asserting that ordinary
+        block propagation was a refusable disagreement. It is not — see the skew tests below.
+        The refusal that remains is about how many sources replied at all.
+        """
         s1 = self._make_source(800000)
-        s2 = self._make_source(799999)  # disagrees
+        s2 = self._make_source(799999)
+        s2.get_tip_height = AsyncMock(side_effect=NetworkError("down"))
         multi = MultiSourceBtcDataSource([s1, s2], quorum=2)
         with pytest.raises(NetworkError, match="quorum not reached"):
             await multi.get_tip_height()
+
+    # -- tip height: honest skew is not a disagreement -------------------------------------
+    #
+    # A block takes time to propagate, so sources one (occasionally two) blocks apart is the
+    # normal reading, not evidence of a liar. Routing tip height through the exact-match quorum
+    # made every one of these raise, and the caller is an HTLC confirmation wait on a chain with
+    # neither RBF nor CPFP — an abort there during a timelock race costs funds.
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("heights", "quorum", "expected"),
+        [
+            ([900_000, 900_001], 1, 900_000),  # 2 sources, 1 block apart
+            ([900_000, 900_001], 2, 900_000),  # same, at the corroborating quorum
+            ([900_000, 900_000, 900_001, 900_001], 2, 900_000),  # an EVEN split
+            ([900_000, 900_000, 900_001], 2, 900_000),  # majority behind
+            ([900_001, 900_000, 900_000], 2, 900_000),  # order must not matter
+        ],
+    )
+    async def test_get_tip_height_tolerates_honest_propagation_skew(self, heights, quorum, expected):
+        srcs = [self._make_source(h) for h in heights]
+        multi = MultiSourceBtcDataSource(srcs, quorum=quorum)
+        assert int(await multi.get_tip_height()) == expected
+
+    @pytest.mark.asyncio
+    async def test_get_tip_height_refuses_an_inflated_tip_from_a_lying_minority(self):
+        """The property the quorum gate exists for. An inflated tip overstates confirmation
+        depth, so it must never be the answer — and the liar must be discarded, not raise."""
+        srcs = [self._make_source(900_000), self._make_source(900_000), self._make_source(999_999)]
+        multi = MultiSourceBtcDataSource(srcs, quorum=2)
+        assert int(await multi.get_tip_height()) == 900_000
+
+    @pytest.mark.asyncio
+    async def test_get_tip_height_refuses_an_inflated_tip_from_a_colluding_pair(self):
+        """Two colluding sources must not outvote three honest ones — the quorum is a FLOOR,
+        the decision is a strict majority of the sources that answered."""
+        srcs = [self._make_source(h) for h in (999_999, 999_999, 900_000, 900_000, 900_000)]
+        multi = MultiSourceBtcDataSource(srcs, quorum=2)
+        assert int(await multi.get_tip_height()) == 900_000
+
+    @pytest.mark.asyncio
+    async def test_get_tip_height_refuses_a_deflated_tip_from_a_lying_minority(self):
+        """The mirror property, and the reason this is not a plain ``min()``: one stuck source
+        reporting 0 would otherwise pin the answer at 0 and stall every confirmation wait."""
+        srcs = [self._make_source(900_000), self._make_source(900_000), self._make_source(0)]
+        multi = MultiSourceBtcDataSource(srcs, quorum=2)
+        assert int(await multi.get_tip_height()) == 900_000
+
+    @pytest.mark.asyncio
+    async def test_get_tip_height_at_full_quorum_takes_the_minimum(self):
+        """quorum == len(sources) is unanimity-or-nothing, so the answer is the most
+        pessimistic source — the same rule ``MultiSourceBtcFundingReader`` uses for depth."""
+        srcs = [self._make_source(h) for h in (900_002, 900_001, 900_000)]
+        multi = MultiSourceBtcDataSource(srcs, quorum=3)
+        assert int(await multi.get_tip_height()) == 900_000
+
+    # -- deterministic reads: the largest group wins, and a tie fails closed ----------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("order", [(0, 0, 0, 1, 1), (1, 1, 0, 0, 0), (0, 1, 0, 1, 0)])
+    async def test_deterministic_read_lets_the_majority_beat_a_colluding_pair(self, order):
+        """Three honest sources must not be vetoed by two colluding ones, at ANY position.
+
+        Refusing whenever two values both reached the quorum closed the positional flaw by
+        handing the minority a veto instead — still a minority deciding the outcome.
+        """
+        honest, liar = bytes.fromhex("aa" * 32), bytes.fromhex("bb" * 32)
+        srcs = []
+        for pick in order:
+            s = self._make_source()
+            s.get_block_hash = AsyncMock(return_value=Hex32(liar if pick else honest))
+            srcs.append(s)
+        multi = MultiSourceBtcDataSource(srcs, quorum=2)
+        assert bytes(await multi.get_block_hash(BlockHeight(100))) == honest
+
+    @pytest.mark.asyncio
+    async def test_deterministic_read_refuses_an_exact_tie(self):
+        """A 2-2 tie means half the sources are lying or forked. There is no majority truth to
+        find, and every tie-break on the VALUE is grindable by a source that chooses what it
+        reports — so this fails closed, deterministically and without regard to order."""
+        srcs = []
+        for h in ("aa", "aa", "bb", "bb"):
+            s = self._make_source()
+            s.get_block_hash = AsyncMock(return_value=Hex32(bytes.fromhex(h * 32)))
+            srcs.append(s)
+        multi = MultiSourceBtcDataSource(srcs, quorum=2)
+        with pytest.raises(NetworkError, match="tied at 2 source"):
+            await multi.get_block_hash(BlockHeight(100))
+
+    @pytest.mark.asyncio
+    async def test_deterministic_read_refuses_a_value_only_a_sub_quorum_minority_backs(self):
+        """The inflation direction for exact-match reads: a single dissenter neither wins nor
+        raises, and a value nobody corroborates to the quorum is refused outright."""
+        srcs = []
+        for h in ("aa", "bb", "cc"):
+            s = self._make_source()
+            s.get_block_hash = AsyncMock(return_value=Hex32(bytes.fromhex(h * 32)))
+            srcs.append(s)
+        multi = MultiSourceBtcDataSource(srcs, quorum=2)
+        with pytest.raises(NetworkError, match="quorum not reached"):
+            await multi.get_block_hash(BlockHeight(100))
 
     @pytest.mark.asyncio
     async def test_get_raw_tx_quorum(self):

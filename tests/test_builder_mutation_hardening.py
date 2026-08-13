@@ -24,6 +24,7 @@ import os
 
 import pytest
 
+from pyrxd.agent import WatchOnlyTxBuilder, WatchOnlyUtxo
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.fee_sizing import (
     MAX_FEE_OVERPAY_MULTIPLE,
@@ -48,12 +49,16 @@ from pyrxd.glyph.script import (
     is_legacy_container_script,
 )
 from pyrxd.glyph.types import GlyphRef, GlyphRoyalty
+from pyrxd.hd.bip32 import Xpub
 from pyrxd.hd.bip39 import mnemonic_from_entropy
 from pyrxd.hd.wallet import HdWallet
 from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
+from pyrxd.script.type import P2PKH
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
+from pyrxd.transaction.transaction import Transaction
+from pyrxd.transaction.transaction_output import TransactionOutput
 from pyrxd.wallet import SELECTION_BASE_BYTES, SELECTION_INPUT_BYTES, RxdWallet, greedy_select_count
 
 _FLOOR = relay_floor_photons_per_byte()
@@ -432,8 +437,9 @@ class TestTheRateGateBindsFromBothEnds:
     an NFT transfer and a sweep have no change output at all. Measured before
     the bound existed: ``build_nft_transfer_tx`` at ``fee_rate=10_000_000``,
     which is this module's own per-**kB** constant used as a per-**byte** rate,
-    burned 2,320,000,000 photons (23.2 RXD) off a 229-byte transfer and
-    reported success.
+    burned 2.32-2.33 BILLION photons (23.2-23.3 RXD) off a 229-230 byte
+    transfer and reported success. Ranges, not single figures: the fee tracks
+    the 71-or-72-byte DER signature, so it is one of two values run to run.
     """
 
     _CEILING = _FLOOR * MAX_FEE_OVERPAY_MULTIPLE
@@ -527,6 +533,134 @@ class TestTheRateGateBindsFromBothEnds:
         with pytest.raises(ValidationError, match="ceiling"):
             RxdWallet(PrivateKey(), "wss://example.invalid", fee_rate=absurd)
 
+    # -- the override has to be REACHABLE, or the ceiling is absolute -----------------------
+    #
+    # ``allow_overpay`` existed on the gate and was passed by none of its six call sites, so
+    # no public signature exposed it and 100_000 photons/byte was a hard wall. That is the
+    # inverse bug this whole class warns about: a caller who genuinely means a high rate —
+    # a fee war, a chain whose floor pyrxd has not been taught, a deadline-racing spend — was
+    # refused with nowhere to go, on a chain with neither RBF nor CPFP to repair it.
+
+    def test_every_builder_exposes_the_override(self) -> None:
+        key = PrivateKey()
+        ref = _ref()
+        absurd = RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
+
+        nft = GlyphBuilder().build_nft_transfer_tx(
+            TransferParams(
+                nft_utxo_txid=os.urandom(32).hex(),
+                nft_utxo_vout=0,
+                nft_utxo_value=5_000_000_000,
+                nft_script=build_nft_locking_script(_pkh(key), ref),
+                new_owner_pkh=_pkh(),
+                private_key=key,
+                fee_rate=absurd,
+                allow_overpay=True,
+            )
+        )
+        assert nft.fee > 0
+
+        ft_set = FtUtxoSet(
+            ref,
+            [
+                FtUtxo.from_output(
+                    txid=os.urandom(32).hex(),
+                    vout=0,
+                    value=50_000_000,
+                    ft_script=build_ft_locking_script(_pkh(key), ref),
+                )
+            ],
+        )
+        air = ft_set.build_airdrop_tx(
+            recipients=[AirdropRecipient(pkh=_pkh(), amount=250)],
+            private_key=key,
+            funding=[AirdropFunding(txid=os.urandom(32).hex(), vout=0, value=10**14, private_key=PrivateKey())],
+            fee_rate=absurd,
+            allow_overpay=True,
+        )
+        assert air.fee > 0
+        transfer = ft_set.build_transfer_tx(
+            250,
+            _pkh(),
+            key,
+            absurd,
+            funding=[AirdropFunding(txid=os.urandom(32).hex(), vout=0, value=10**14, private_key=PrivateKey())],
+            allow_overpay=True,
+        )
+        assert transfer.fee > 0
+
+        wallet = HdWallet.from_mnemonic(mnemonic_from_entropy(os.urandom(16)))
+        triples = [
+            (
+                UtxoRecord(tx_hash=f"{i:064x}", tx_pos=0, value=10**14, height=1),
+                wallet._derive_address(0, i),
+                wallet._privkey_for(0, i),
+            )
+            for i in range(2)
+        ]
+        dest = PrivateKey().public_key().address()
+        assert wallet.build_send_max_tx(triples, dest, fee_rate=absurd, allow_overpay=True).get_fee() > 0
+        assert wallet.build_send_tx(triples, dest, 10**9, fee_rate=absurd, allow_overpay=True).get_fee() > 0
+
+        assert RxdWallet(PrivateKey(), "wss://example.invalid", fee_rate=absurd, allow_overpay=True) is not None
+
+        src = Transaction()
+        src.add_output(TransactionOutput(P2PKH().lock(wallet._derive_address(0, 0)), 10**14))
+        unsigned = WatchOnlyTxBuilder(Xpub.from_xprv(wallet._xprv)).build_send(
+            [
+                WatchOnlyUtxo(
+                    txid=src.txid(),
+                    vout=0,
+                    value=10**14,
+                    change=0,
+                    index=0,
+                    source_tx_hex=src.serialize().hex(),
+                )
+            ],
+            dest,
+            10**9,
+            change_index=0,
+            fee_rate=absurd,
+            allow_overpay=True,
+        )
+        assert unsigned.input_total > 0
+
+    def test_the_ceiling_still_refuses_the_measured_overpay_by_default(self) -> None:
+        """The property the ceiling was added for, restated after making it optional:
+        the ~23 RXD burn is the DEFAULT behaviour to refuse, not an opt-in one.
+
+        ``fee_rate`` is the per-kB constant used as a per-byte rate on a ~229-byte NFT
+        transfer, which has no change output — the whole difference leaves with the miner.
+        The burn is asserted as a RANGE because it is one: the fee tracks the DER
+        signature length, so it is 2_320_000_000 or 2_330_000_000, never one figure.
+        """
+        key, ref = PrivateKey(), _ref()
+        params = dict(
+            nft_utxo_txid=os.urandom(32).hex(),
+            nft_utxo_vout=0,
+            nft_utxo_value=50_000_000_000,
+            nft_script=build_nft_locking_script(_pkh(key), ref),
+            new_owner_pkh=_pkh(),
+            private_key=key,
+            fee_rate=RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB,
+        )
+        with pytest.raises(ValueError, match="ceiling"):
+            GlyphBuilder().build_nft_transfer_tx(TransferParams(**params))
+        # And the overpay it was refusing is the measured one, against the SAME
+        # transaction's floor-rate fee — the comparison the ceiling actually makes.
+        burned = GlyphBuilder().build_nft_transfer_tx(TransferParams(**params, allow_overpay=True))
+        required = GlyphBuilder().build_nft_transfer_tx(TransferParams(**{**params, "fee_rate": _FLOOR})).fee
+        assert burned.fee in (2_320_000_000, 2_330_000_000)
+        assert 1000 <= burned.fee / required <= 1005
+        assert 229 <= len(burned.tx.serialize()) <= 230
+
+    def test_the_multiple_in_the_message_is_not_truncated_to_the_ceiling(self) -> None:
+        """``fee_rate // floor`` made 100_001 report "is 10x ... above the 10x ceiling" —
+        self-contradictory at exactly the boundary a caller is most likely standing on."""
+        with pytest.raises(ValueError) as exc:
+            assert_fee_rate_clears_relay_floor(_FLOOR * MAX_FEE_OVERPAY_MULTIPLE + 1, what="t")
+        assert "10.0x" in str(exc.value)
+
 
 class TestNoBuilderSignsAnOutpointTwice:
     """An outpoint is unique on chain, so a repeat is always a caller mistake.
@@ -605,6 +739,62 @@ class TestNoBuilderSignsAnOutpointTwice:
         assert len(outpoints) == len(set(outpoints)) == 3
         assert result.tx.outputs[0].satoshis == 250
 
+    # -- the guards compared the RENDERING, not the outpoint ------------------------------
+    #
+    # A txid is a 32-byte hash shown as hex, and hex has no case: the wire form is
+    # ``bytes.fromhex(txid)[::-1]``, identical for "ab…" and "AB…". Keying the sets on the
+    # raw ``str`` therefore let a caller who mixed cases — one txid from an API that
+    # upper-cases, one from a local read — walk through all three checks. Measured before
+    # the fix: ``total()`` reported 2,000 for a single 1,000-photon outpoint.
+
+    def test_the_wire_form_is_case_insensitive(self) -> None:
+        """The premise, stated once so the tests below are not taken on faith."""
+        txid = os.urandom(32).hex()
+        assert bytes.fromhex(txid)[::-1] == bytes.fromhex(txid.upper())[::-1]
+
+    def test_the_utxo_set_refuses_a_repeated_outpoint_in_a_different_case(self) -> None:
+        _key, ref, spk, txid = self._fixture()
+        a = FtUtxo.from_output(txid=txid, vout=0, value=1_000, ft_script=spk)
+        b = FtUtxo.from_output(txid=txid.upper(), vout=0, value=1_000, ft_script=spk)
+        with pytest.raises(ValidationError, match="appears more than once"):
+            FtUtxoSet(ref, [a, b])
+
+    def test_the_airdrop_refuses_a_repeated_funding_outpoint_in_a_different_case(self) -> None:
+        key, ref, spk, txid = self._fixture()
+        ft_set = FtUtxoSet(ref, [FtUtxo.from_output(txid=txid, vout=0, value=1_000_000, ft_script=spk)])
+        ftxid = os.urandom(32).hex()
+        with pytest.raises(ValidationError, match="repeats outpoint"):
+            ft_set.build_airdrop_tx(
+                recipients=[AirdropRecipient(pkh=_pkh(), amount=250)],
+                private_key=key,
+                funding=[
+                    AirdropFunding(txid=ftxid, vout=0, value=500_000_000, private_key=PrivateKey()),
+                    AirdropFunding(txid=ftxid.upper(), vout=0, value=500_000_000, private_key=PrivateKey()),
+                ],
+                fee_rate=_FLOOR,
+            )
+
+    def test_the_seam_check_refuses_an_outpoint_that_differs_only_in_case(self) -> None:
+        key, ref, spk, txid = self._fixture()
+        ft_set = FtUtxoSet(ref, [FtUtxo.from_output(txid=txid, vout=0, value=1_000_000, ft_script=spk)])
+        with pytest.raises(ValidationError, match="both as an FT UTXO and as plain-RXD funding"):
+            ft_set.build_airdrop_tx(
+                recipients=[AirdropRecipient(pkh=_pkh(), amount=250)],
+                private_key=key,
+                funding=[AirdropFunding(txid=txid.upper(), vout=0, value=500_000_000, private_key=PrivateKey())],
+                fee_rate=_FLOOR,
+            )
+
+    def test_case_folding_does_not_merge_two_genuinely_different_outpoints(self) -> None:
+        """The accept direction: canonicalising the case must not make distinct outpoints
+        collide, so an upper-cased txid still builds and still counts once."""
+        _key, ref, spk, txid = self._fixture()
+        other = os.urandom(32).hex()
+        a = FtUtxo.from_output(txid=txid.upper(), vout=0, value=1_000_000, ft_script=spk)
+        b = FtUtxo.from_output(txid=other, vout=0, value=2_000_000, ft_script=spk)
+        assert FtUtxoSet(ref, [a, b]).total() == 3_000_000
+        assert a.txid == txid  # canonicalised at construction, so every later read agrees
+
 
 class TestAirdropFundingValidatesItsValue:
     """``AirdropFunding.value`` is summed into the RXD budget the fee comes out
@@ -648,8 +838,10 @@ class TestRoyaltySplitsGuardsThatNothingReached:
         ``GlyphRoyalty`` requires ``sum(split.bps) <= bps``, so ``bps=0`` forces
         every split to 0 — but that shape is *constructible and legal*, and with
         a ``minimum`` set it resolves to a real payment. Measured against the
-        live module: ``GlyphRoyalty(bps=0, minimum=1000, splits=((addr, 0),))``
-        at ``sale_price=5000`` yields ``royalty_due == 1000`` and one payout.
+        live module: ``GlyphRoyalty(address=addr, bps=0, minimum=1000,
+        splits=((addr, 0),))`` — ``address`` is required, so a shorthand that
+        omits it raises ``TypeError`` and demonstrates nothing — at
+        ``sale_price=5000`` yields ``royalty_due == 1000`` and one payout.
         Delete the ``bps > 0`` half and the very next line divides by
         ``royalty.bps`` — ``ZeroDivisionError`` on a token whose terms are
         perfectly valid. Nothing offline executed this branch.

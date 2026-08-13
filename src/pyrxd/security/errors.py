@@ -125,11 +125,34 @@ def _looks_like_mnemonic(value: str) -> bool:
        wordlists are lowercase, so lowercasing a leaked phrase reproduces the
        mnemonic exactly.
 
-    Branch 2 is a vocabulary test rather than a second shape test on purpose.
-    Simply dropping branch 1's case condition would redact ordinary prose:
-    ``"Could not connect to the remote peer at this time"`` is eight alphabetic
-    tokens, and ``redact`` runs over the args of EVERY exception this SDK raises.
-    Requiring every token to be an actual BIP-39 word cannot match a sentence.
+    Branch 2 is a vocabulary test rather than a second shape test on purpose:
+    simply dropping branch 1's case condition would redact every capitalised
+    sentence of eight or more words, and ``redact`` runs over the args of EVERY
+    exception this SDK raises. Requiring real BIP-39 words is a far narrower net.
+
+    **What this deliberately does NOT claim.** An earlier version of this note said
+    the vocabulary test "cannot match a sentence". It can, and both branches
+    over-match by design — measured 2026-08-12 against the shipped 4096-word
+    vocabulary (en + zh-cn):
+
+    * Branch 1 matches any run of >= 8 lowercase alphabetic tokens, so
+      ``"could not connect to the remote peer at this time"`` IS redacted.
+    * Branch 2 matches a sentence built only from BIP-39 words, and English ones
+      exist: ``"Client Must Supply Valid Input Before Program Can Process Order"``
+      is ten words, every one on the list, and IS redacted.
+
+    That direction of error is the intended one and is not worth narrowing. The cost
+    of a false positive is one exception message reading ``<redacted>``; the cost of a
+    false negative is a seed phrase in a log. A caller who needs prose to survive
+    should not be passing it as a whole exception arg alongside secrets.
+
+    **The residual gap, stated rather than left to be discovered.** An UPPERCASE or
+    Title-Case phrase from a wordlist this SDK does not SHIP (fr/es/it/ja/ko/cs/pt) is
+    matched by neither branch — branch 1 sees the case, branch 2 has never read those
+    words — and passes through unredacted. Verified: a 12-word uppercase French
+    mnemonic is not redacted. Closing it means shipping those wordlists, which is a
+    packaging decision rather than a fix here; the two shipped languages and every
+    lowercase phrase in any language are covered.
     """
     tokens = value.split()
     if len(tokens) < 8 or not all(t.isalpha() for t in tokens):
