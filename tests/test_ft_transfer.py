@@ -891,3 +891,119 @@ class TestFtTransferParamsDefaults:
             private_key=_alice_key(),
         )
         assert params.funding == []
+
+
+# ---------------------------------------------------------------------------
+# The overpay ceiling has to be reachable through the params API too
+# ---------------------------------------------------------------------------
+#
+# ``assert_fee_rate_clears_relay_floor`` refuses a rate above
+# MAX_FEE_OVERPAY_MULTIPLE x the relay floor, and ``allow_overpay=True`` is the
+# deliberate way through. ``FtUtxoSet.build_transfer_tx`` / ``build_airdrop_tx``
+# take it; the ``GlyphBuilder`` params dataclasses in front of them did not, and
+# did not forward it either — so the SAME build succeeded through the UTXO set and
+# raised through the builder, with no argument that could change the outcome. A
+# ceiling with no reachable override is not a stricter guard, it is a guard that
+# refuses valid work, and Radiant has neither RBF nor CPFP to repair a late refusal.
+
+# 100_001 is the smallest rate the ceiling refuses: the floor is 10_000 photons/byte
+# and the multiple is 10. Re-derived here rather than hardcoded so a moved floor moves
+# the test with it.
+_OVERPAY_RATE = 100_001
+# ~510 bytes at 100_001 photons/byte is ~51M; fund well clear of it.
+_OVERPAY_FUNDING = 200_000_000
+
+
+class TestOverpayOverrideIsReachableThroughTheParamsAPI:
+    def test_ft_transfer_refuses_the_overpay_rate_by_default(self):
+        with pytest.raises((ValidationError, ValueError), match="ceiling"):
+            GlyphBuilder().build_ft_transfer_tx(
+                FtTransferParams(
+                    ref=_token_ref(),
+                    utxos=[_make_utxo(100)],
+                    amount=40,
+                    new_owner_pkh=Hex20(_BOB_PKH),
+                    private_key=_alice_key(),
+                    funding=[_funding(_OVERPAY_FUNDING)],
+                    fee_rate=_OVERPAY_RATE,
+                )
+            )
+
+    def test_ft_transfer_allow_overpay_reaches_the_builder(self):
+        result = GlyphBuilder().build_ft_transfer_tx(
+            FtTransferParams(
+                ref=_token_ref(),
+                utxos=[_make_utxo(100)],
+                amount=40,
+                new_owner_pkh=Hex20(_BOB_PKH),
+                private_key=_alice_key(),
+                funding=[_funding(_OVERPAY_FUNDING)],
+                fee_rate=_OVERPAY_RATE,
+                allow_overpay=True,
+            )
+        )
+        assert result.fee > 0
+
+    def test_the_params_path_and_the_direct_path_now_agree(self):
+        """The measured asymmetry: identical build, one raised and one succeeded."""
+        via_direct = FtUtxoSet(ref=_token_ref(), utxos=[_make_utxo(100)]).build_transfer_tx(
+            amount=40,
+            new_owner_pkh=Hex20(_BOB_PKH),
+            private_key=_alice_key(),
+            funding=[_funding(_OVERPAY_FUNDING)],
+            fee_rate=_OVERPAY_RATE,
+            allow_overpay=True,
+        )
+        via_builder = GlyphBuilder().build_ft_transfer_tx(
+            FtTransferParams(
+                ref=_token_ref(),
+                utxos=[_make_utxo(100)],
+                amount=40,
+                new_owner_pkh=Hex20(_BOB_PKH),
+                private_key=_alice_key(),
+                funding=[_funding(_OVERPAY_FUNDING)],
+                fee_rate=_OVERPAY_RATE,
+                allow_overpay=True,
+            )
+        )
+        assert via_builder.fee == via_direct.fee
+
+    def test_ft_airdrop_refuses_the_overpay_rate_by_default(self):
+        from pyrxd.glyph.builder import FtAirdropParams
+        from pyrxd.glyph.ft import AirdropRecipient
+
+        with pytest.raises((ValidationError, ValueError), match="ceiling"):
+            GlyphBuilder().build_ft_airdrop_tx(
+                FtAirdropParams(
+                    ref=_token_ref(),
+                    utxos=[_make_utxo(100)],
+                    recipients=[AirdropRecipient(pkh=Hex20(_BOB_PKH), amount=40)],
+                    private_key=_alice_key(),
+                    funding=[_funding(_OVERPAY_FUNDING)],
+                    fee_rate=_OVERPAY_RATE,
+                )
+            )
+
+    def test_ft_airdrop_allow_overpay_reaches_the_builder(self):
+        from pyrxd.glyph.builder import FtAirdropParams
+        from pyrxd.glyph.ft import AirdropRecipient
+
+        result = GlyphBuilder().build_ft_airdrop_tx(
+            FtAirdropParams(
+                ref=_token_ref(),
+                utxos=[_make_utxo(100)],
+                recipients=[AirdropRecipient(pkh=Hex20(_BOB_PKH), amount=40)],
+                private_key=_alice_key(),
+                funding=[_funding(_OVERPAY_FUNDING)],
+                fee_rate=_OVERPAY_RATE,
+                allow_overpay=True,
+            )
+        )
+        assert result.fee > 0
+
+    def test_the_default_is_still_off(self):
+        """The override must be opt-in — the ceiling is the reason it exists."""
+        from pyrxd.glyph.builder import FtAirdropParams
+
+        assert FtTransferParams.allow_overpay is False
+        assert FtAirdropParams.allow_overpay is False

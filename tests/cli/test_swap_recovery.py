@@ -1604,3 +1604,155 @@ def test_the_swap_status_reader_goes_through_the_gate_too(tmp_path: Path) -> Non
     p.chmod(0o644)
     with pytest.raises(ValidationError, match="chmod 600"):
         parse_recovery_file(p)
+
+
+# --------------------------------------------------------------------------- the gate judges VALUES
+#
+# The mode gate above was only ever as good as its list of field NAMES, and a name list
+# recognises the names somebody thought of. Measured against the pre-fix walker with a
+# real 52-character WIF from ``PrivateKey(os.urandom(32)).wif()``, every document in
+# ``KEYFUL_BY_VALUE`` was judged keyless and accepted at 0644 with the key in it.
+# ``key_hex`` was a marker while a bare ``key`` was not, which is the shape of the
+# problem rather than an entry to add: the list cannot be finished, so the gate has to
+# decode the value.
+
+
+def _fresh_wif() -> str:
+    """A real WIF from real entropy. Never a hand-written key — one weak inline test key
+    in this repo was swept on a live chain by a scanning bot."""
+    return PrivateKey(os.urandom(32)).wif()
+
+
+#: 12 BIP-39 words. Not a wallet anyone holds — it is the canonical all-``abandon``
+#: vector — but it is a real phrase from the shipped English wordlist, which is what
+#: ``pyrxd.security.errors._looks_like_mnemonic`` judges.
+_MNEMONIC = "abandon " * 11 + "about"
+
+
+@pytest.mark.parametrize(
+    "make_doc",
+    [
+        pytest.param(lambda w: {"key": w}, id="bare-key"),
+        pytest.param(lambda w: {"signing_key": w}, id="signing_key"),
+        pytest.param(lambda w: {"priv": w}, id="priv"),
+        pytest.param(lambda w: {"taker": w}, id="role-name-only"),
+        pytest.param(lambda w: {"parties": [w, w]}, id="bare-list-no-field-name"),
+        pytest.param(lambda w: {"a": {"b": [{"c": w}]}}, id="nested-under-nothing"),
+        pytest.param(lambda _w: {"recovery_phrase": _MNEMONIC}, id="mnemonic-unmarked-field"),
+        pytest.param(lambda _w: {"backup": ["  ".join(_MNEMONIC.split())]}, id="mnemonic-in-a-list"),
+        pytest.param(lambda _w: {"k": "9f" * 32}, id="raw-32-byte-hex-unknown-field"),
+    ],
+)
+def test_a_document_is_keyful_because_of_its_VALUE_not_its_field_name(tmp_path: Path, make_doc) -> None:
+    """Every one of these was accepted at 0644 before the gate decoded values."""
+    doc = _public_only_doc() | make_doc(_fresh_wif())
+    p = tmp_path / "byvalue.json"
+    p.write_text(json.dumps(doc))
+    p.chmod(0o644)
+    with pytest.raises(ValidationError, match="contains a private key"):
+        sr.load_recovery_json(p)
+
+
+def test_an_xprv_is_keyful_under_a_field_name_that_says_nothing(tmp_path: Path) -> None:
+    """A BIP-32 extended PRIVATE key is 78 payload bytes with 0x00 at index 45 — the
+    byte an xpub uses for its 0x02/0x03 SEC prefix. Decoding that byte is what tells the
+    two apart, and it is why this does not depend on the string starting with "xprv"."""
+    from pyrxd.base58 import base58check_encode
+
+    xprv = base58check_encode(bytes.fromhex("0488ade4") + b"\x00" * 41 + b"\x00" + os.urandom(32))
+    doc = _public_only_doc() | {"backup_blob": xprv}
+    p = tmp_path / "xprv.json"
+    p.write_text(json.dumps(doc))
+    p.chmod(0o644)
+    with pytest.raises(ValidationError, match="contains a private key"):
+        sr.load_recovery_json(p)
+
+
+@pytest.mark.parametrize(
+    "doc",
+    [
+        pytest.param({}, id="the-plain-public-file"),
+        pytest.param({"preimage_p_hex": "de" * 32}, id="preimage-p-is-public-once-revealed"),
+        pytest.param({"btc_claim_xonly_hex": "77" * 32}, id="x-only-pubkey-is-64-hex-and-public"),
+        pytest.param({"btc_funding_outpoint": "cc" * 32 + ":3"}, id="outpoint"),
+        pytest.param({"claim_txid": "ee" * 32}, id="txid-is-64-hex-and-public"),
+        pytest.param({"covenant_spk_hex": "76" * 32}, id="a-64-hex-scriptpubkey"),
+        pytest.param({"stage": "lock-claim", "rxd_network": "bc", "note": "handed to the taker"}, id="prose"),
+        pytest.param({"parties": [{"taker_rxd_pkh": "11" * 20}, {"maker_rxd_pkh": "22" * 20}]}, id="nested-pkhs"),
+    ],
+)
+def test_a_public_locator_file_is_STILL_readable_at_0644(tmp_path: Path, doc: dict) -> None:
+    """The accept direction, and the one that pays for the refusals above.
+
+    The two-host harnesses persist only public locators and pkhs — that workflow is why
+    ``--taker-pkh`` / ``--maker-pkh`` exist, and refusing it would be a guard that
+    refuses valid work. Note ``hashlock_H`` is 64 hex characters and is REQUIRED in
+    every recovery file, so a blanket "64 hex means key" rule would have made every
+    recovery file keyful; the public-field allowlist is what keeps that from happening,
+    and this case is what would catch it if the allowlist lost an entry.
+    """
+    p = tmp_path / "public.json"
+    p.write_text(json.dumps(_public_only_doc() | doc))
+    p.chmod(0o644)
+    assert sr.load_recovery_json(p)["t_rxd_blocks"] == 20
+
+
+def test_a_deeply_nested_file_does_not_raise_RecursionError(tmp_path: Path) -> None:
+    """A ~1 KB file of ~600 nested lists — well inside the 64 KB read bound — made the
+    recursive walker raise an uncaught ``RecursionError``, surfaced by the CLI as
+    "unexpected failure (RecursionError)", while ``json.loads`` parsed the same file
+    without complaint. Fails closed, so it was availability only; it is still the tool
+    breaking on a file it is supposed to judge.
+    """
+    doc = _public_only_doc() | {"deep": json.loads("[" * 600 + "]" * 600)}
+    p = tmp_path / "deep.json"
+    p.write_text(json.dumps(doc))
+    p.chmod(0o644)
+    assert sr.load_recovery_json(p)["t_rxd_blocks"] == 20
+
+
+def test_a_deeply_nested_file_json_loads_ITSELF_cannot_parse_is_a_clean_refusal(tmp_path: Path) -> None:
+    """The same defect one layer up, and it survives an iterative walker.
+
+    Measured on CPython 3.12: ``json.loads`` parses ~5,000 nested lists and raises
+    ``RecursionError`` at ~16,000 — 32 KB of ``[``, half of ``MAX_SECRET_FILE_BYTES``,
+    so the size bound does not exclude it. Uncaught it is the same "unexpected failure"
+    the walker used to produce.
+    """
+    p = tmp_path / "deeper.json"
+    p.write_text("[" * 20_000 + "]" * 20_000)
+    p.chmod(0o600)
+    with pytest.raises(ValidationError, match="nested too deeply"):
+        sr.load_recovery_json(p)
+
+
+def test_the_gate_and_the_status_command_cannot_disagree(tmp_path: Path) -> None:
+    """``swap status`` said ``has_keys=False`` about a ``{"mnemonic": …}`` file at 0600
+    while the gate refused the identical document at 0644 as "contains a private key" —
+    two answers to one question, from a tool an operator is consulting because they are
+    not sure what their file holds. ``has_keys`` is now the gate's own predicate.
+    """
+    from pyrxd.cli.swap_cmds import parse_recovery_file
+
+    doc = _public_only_doc() | {"mnemonic": _MNEMONIC}
+    p = tmp_path / "mnemonic.json"
+    p.write_text(json.dumps(doc))
+    p.chmod(0o600)
+    assert parse_recovery_file(p).has_keys is True
+
+    p.chmod(0o644)
+    with pytest.raises(ValidationError, match="contains a private key"):
+        parse_recovery_file(p)
+
+
+def test_has_keys_agrees_with_the_gate_on_a_public_file_too(tmp_path: Path) -> None:
+    """Agreement in the other direction: a public file is neither refused nor reported
+    as holding keys. ``holds_secrets`` still notices the preimage separately."""
+    from pyrxd.cli.swap_cmds import parse_recovery_file
+
+    p = tmp_path / "public_status.json"
+    p.write_text(json.dumps(_public_only_doc() | {"preimage_p_hex": "de" * 32}))
+    p.chmod(0o644)
+    facts = parse_recovery_file(p)
+    assert facts.has_keys is False
+    assert facts.has_preimage is True

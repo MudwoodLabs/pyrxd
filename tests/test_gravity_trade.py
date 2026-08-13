@@ -399,6 +399,112 @@ class TestWaitConfirmations:
         assert status.confirmations == 1
 
 
+class TestThePerCallOverrideIsBoundLikeTheConfigField:
+    """``TradeConfig`` has refused ``min_btc_confirmations < 1`` since it was written;
+    the per-call override went straight through to the source unchecked.
+
+    Measured before this bound, against a source holding the transaction in the mempool
+    only (any positive depth raises): ``min_confirmations=0`` returned
+    ``confirmed=True, confirmations=0`` on the FIRST poll, and ``min_confirmations=-5``
+    returned ``confirmations=-5``. Both are a "confirmed" verdict for a transaction with
+    no depth at all, handed to the caller who is about to release the other leg of a
+    swap. The depth this waits for MUST equal the covenant's header-depth N; zero is not
+    a weaker policy, it is no policy.
+    """
+
+    VALID_TXID = "ab" * 32
+
+    def _mempool_only_trade(self):
+        """A source that serves the tx at depth 0 and raises for any positive depth."""
+        rxd = mock_electrumx()
+        btc = mock_btc_source()
+        raw = RawTx(b"\x02\x00\x00\x00" + b"\x00" * 70)
+
+        async def fake_get_raw_tx(txid, min_confirmations=6):
+            if min_confirmations > 0:
+                raise NetworkError("not buried that deep")
+            return raw
+
+        btc.get_raw_tx.side_effect = fake_get_raw_tx
+        cfg = TradeConfig(min_btc_confirmations=6, poll_interval_seconds=0.01, max_poll_attempts=1)
+        return GravityTrade(radiant_network=rxd, bitcoin_source=btc, config=cfg)
+
+    @pytest.mark.parametrize("bad", [0, -1, -5])
+    @pytest.mark.asyncio
+    async def test_a_sub_one_override_is_refused(self, bad: int):
+        with pytest.raises(ValidationError, match="min_confirmations must be >= 1"):
+            await self._mempool_only_trade().wait_confirmations(self.VALID_TXID, min_confirmations=bad)
+
+    @pytest.mark.parametrize("bad", [0, -1, -5])
+    def test_the_config_field_refuses_the_same_values(self, bad: int):
+        """The two must agree — the whole defect was that one bound and one did not."""
+        with pytest.raises(ValidationError, match="min_btc_confirmations must be >= 1"):
+            TradeConfig(min_btc_confirmations=bad)
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_happens_before_any_source_read(self):
+        """It is a local input check, so a bad depth never reaches the network."""
+        rxd = mock_electrumx()
+        btc = mock_btc_source()
+        trade = GravityTrade(radiant_network=rxd, bitcoin_source=btc)
+        with pytest.raises(ValidationError):
+            await trade.wait_confirmations(self.VALID_TXID, min_confirmations=0)
+        btc.get_raw_tx.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_valid_override_still_works(self):
+        """Pair every refusal with the honest path: 1 is legal and must not be caught."""
+        rxd = mock_electrumx()
+        btc = mock_btc_source()
+        btc.get_raw_tx.return_value = RawTx(b"\x02\x00\x00\x00" + b"\x00" * 70)
+        cfg = TradeConfig(min_btc_confirmations=6, poll_interval_seconds=0.01, max_poll_attempts=3)
+        trade = GravityTrade(radiant_network=rxd, bitcoin_source=btc, config=cfg)
+        status = await trade.wait_confirmations(self.VALID_TXID, min_confirmations=1)
+        assert status.confirmed is True
+        assert status.confirmations == 1
+
+    @pytest.mark.asyncio
+    async def test_none_still_means_use_the_config(self):
+        rxd = mock_electrumx()
+        btc = mock_btc_source()
+        btc.get_raw_tx.return_value = RawTx(b"\x02\x00\x00\x00" + b"\x00" * 70)
+        cfg = TradeConfig(min_btc_confirmations=6, poll_interval_seconds=0.01, max_poll_attempts=3)
+        trade = GravityTrade(radiant_network=rxd, bitcoin_source=btc, config=cfg)
+        status = await trade.wait_confirmations(self.VALID_TXID, min_confirmations=None)
+        assert status.confirmations == 6
+
+
+class TestTheDepthCommentDescribesWhatTheSourceActuallyDoes:
+    """``wait_confirmations`` asks the SOURCE for the depth rather than computing it,
+    and the comment explaining that used to say the source applies "its own
+    (quorum-checked) view of the tip".
+
+    Re-derived from ``pyrxd/network/bitcoin.py``: on the ``MultiSourceBtcDataSource``
+    path ``get_raw_tx`` forwards ``min_confirmations`` to every leaf, each leaf applies
+    the depth check against its own un-quorumed tip, and ``_require_quorum`` then agrees
+    on the hash256 of the raw BYTES returned by the leaves that did not raise.
+    ``get_tip_height`` — the call that DOES have a majority rule — is never consulted by
+    ``get_raw_tx``. Strictly at least as strict as the comment claimed, but not the same
+    statement, and this pins the difference so the comment cannot drift back.
+    """
+
+    def test_multi_source_get_raw_tx_forwards_the_depth_to_every_leaf(self):
+        import inspect
+
+        from pyrxd.network.bitcoin import MultiSourceBtcDataSource
+
+        source = inspect.getsource(MultiSourceBtcDataSource.get_raw_tx)
+        assert "s.get_raw_tx(txid, min_confirmations)" in source
+        assert "get_tip_height" not in source
+
+    def test_the_trade_comment_no_longer_claims_a_quorum_checked_tip(self):
+        import inspect
+
+        source = inspect.getsource(GravityTrade.wait_confirmations)
+        assert "quorum-checked) view of the tip" not in source
+        assert "un-quorumed view of the tip" in source
+
+
 # ---------------------------------------------------------------------------
 # GravityTrade.finalize()
 # ---------------------------------------------------------------------------

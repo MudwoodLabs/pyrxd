@@ -65,9 +65,6 @@ class SwapFacts:
     asset_ft_amount: int | None = None
 
 
-_SECRET_KEY_MARKERS = ("wif", "key_hex", "secret", "preimage", "privkey")
-
-
 def parse_recovery_file(path: Path) -> SwapFacts:
     """Parse a harness recovery JSON into public :class:`SwapFacts`.
 
@@ -75,6 +72,20 @@ def parse_recovery_file(path: Path) -> SwapFacts:
     that gets ``has_keys=True`` reported about it is also refused if it holds those keys
     at a group/world-readable mode. Telling an operator their file contains private keys
     while reading it out of a 0644 file without comment was the wrong half of the job.
+
+    ``has_keys`` is :func:`~pyrxd.cli.swap_recovery._carries_private_key` itself, not a
+    second opinion about the same question. It used to be a private marker list here
+    (``("wif", "key_hex", "secret", "preimage", "privkey")``) scanned over the TOP-LEVEL
+    keys only, and the two answers measurably disagreed about the same document: a file
+    carrying ``{"mnemonic": …}`` was reported ``has_keys=False`` at 0600 and refused as
+    "contains a private key" at 0644. A tool that contradicts itself about whether a
+    file holds keys teaches an operator to disbelieve both answers.
+
+    The dropped ``"preimage"`` marker is not a lost signal: ``has_preimage`` reports it
+    separately and ``holds_secrets`` (what the command actually prints) is still
+    ``has_preimage or has_keys``. Dropping it from ``has_keys`` is deliberate — ``p`` is
+    published on-chain by the claim that reveals it, so it is not spending authority and
+    the mode gate rightly does not demand 0600 for it.
 
     Raises:
         ValueError: the document parses but does not look like a swap recovery file
@@ -85,7 +96,7 @@ def parse_recovery_file(path: Path) -> SwapFacts:
             ``ValueError`` after the read moved behind that gate; both in-repo callers
             already catch the wider type, so the promise was the thing that was wrong.
     """
-    from .swap_recovery import load_recovery_json
+    from .swap_recovery import _carries_private_key, load_recovery_json
 
     d = load_recovery_json(path)
     hashlock = d.get("hashlock_H")
@@ -97,7 +108,6 @@ def parse_recovery_file(path: Path) -> SwapFacts:
         raise ValueError("recovery file missing integer t_rxd_blocks")
 
     is_eth = ("eth_chain" in d) or (d.get("counter_chain") == "eth")
-    has_secret = any(any(m in k.lower() for m in _SECRET_KEY_MARKERS) for k in d)
     return SwapFacts(
         counter_chain="eth" if is_eth else "btc",
         hashlock_hex=str(hashlock),
@@ -106,8 +116,12 @@ def parse_recovery_file(path: Path) -> SwapFacts:
         rxd_network=str(d.get("rxd_network", "bc")),
         t_rxd_blocks=t_rxd,
         stage=d.get("stage"),
-        has_preimage="preimage_p_hex" in d,
-        has_keys=has_secret,
+        # Substring, not the exact ``preimage_p_hex`` this used to test for: the old
+        # marker list made ANY ``*preimage*`` field count toward ``holds_secrets``, and
+        # moving ``has_keys`` onto the gate's predicate would otherwise have narrowed
+        # that. Same top-level-only scope as before.
+        has_preimage=any(isinstance(k, str) and "preimage" in k.lower() for k in d),
+        has_keys=_carries_private_key(d),
         t_btc_blocks=d.get("t_btc_blocks"),
         btc_htlc_address=d.get("btc_htlc_address"),
         btc_network=d.get("btc_network"),

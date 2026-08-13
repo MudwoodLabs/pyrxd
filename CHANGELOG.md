@@ -49,6 +49,35 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   refusal started this whole thread. `tests/network/test_quorum_counts_silence_as_disagreement.py`
   pins both directions: 5 of its 12 tests go red against the previous source and
   7 are honest-path controls that pass either way.
+- **The recovery-file key gate now judges VALUES, not field names.** The mode
+  refusal added above asked "does this document contain a private key?" by matching
+  eight substrings against field *names*, and a name list only recognises the names
+  somebody thought of. Measured against the pre-fix walker with a real 52-character
+  WIF from `PrivateKey(os.urandom(32)).wif()`, every one of `{"key": …}`,
+  `{"signing_key": …}`, `{"priv": …}`, `{"taker": …}`, `{"parties": [wif, wif]}` (a
+  bare list, no field name at all) and `{"recovery_phrase": "<12 BIP-39 words>"}`
+  was judged keyless and read at mode 0644 with the key in it. `key_hex` was a
+  marker while a bare `key` was not — which is the shape of the problem, not an
+  entry to add.
+
+  Every string in the document is now DECODED: a WIF (base58check checksum plus a
+  known WIF version byte, via `decode_wif`), a BIP-32 extended *private* key (78
+  payload bytes with `0x00` at index 45, the byte an xpub uses for its SEC prefix),
+  or a BIP-39 phrase (`security.errors._looks_like_mnemonic`, so the gate and the
+  redactor agree on what a seed phrase is). None of those depends on the field
+  name; the eight name markers are kept only as a fast path.
+
+  One value shape stays name-scoped, deliberately: a bare 64-hex string is a raw
+  32-byte secret and a 32-byte hash written identically. It is treated as key
+  material *unless* it sits under a recognised public field
+  (`hashlock`/`preimage`/`xonly`/`pubkey`/`txid`/`tx_hash`/`outpoint`/`block_hash`/
+  `merkle`/`spk`/`script`), so an unknown field holding 64 hex characters fails
+  CLOSED. That allowlist is load-bearing rather than cosmetic: `hashlock_H` is 64
+  hex and is required in every recovery file, so a blanket "64 hex means key" rule
+  would have made every recovery file keyful and broken the 0644 public-locator
+  workflow that `--taker-pkh` / `--maker-pkh` exist for. Both directions are pinned
+  — nine refusal cases and eight accept cases, in
+  `tests/cli/test_swap_recovery.py`.
 
 - **A swap recovery file's private keys are now read under the same gate its fee
   key already got.** `pyrxd swap build-claim` / `build-refund` / `status` take two
@@ -207,6 +236,86 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`wait_confirmations`' per-call depth override was unbounded.** `TradeConfig`
+  has refused `min_btc_confirmations < 1` since it was written; the
+  `min_confirmations=` argument to `GravityTrade.wait_confirmations` went straight
+  through to the source. Measured against a source holding the transaction in the
+  mempool only (any positive depth raises): `min_confirmations=0` returned
+  `confirmed=True, confirmations=0` on the first poll, and `-5` returned
+  `confirmations=-5`. Both are a "confirmed" verdict for a transaction with no
+  depth at all, returned to the caller about to release the other leg of a swap.
+  The override is now bounded the same way the config field is, before any source
+  read; `min_confirmations=None` still means "use the config", and `1` still works.
+
+- **The recovery-file walk raised `RecursionError` on an ordinary file.** The
+  content-conditional key check walked the parsed JSON recursively. A ~1 KB file of
+  ~600 nested lists — well inside the 64 KB read bound — raised an uncaught
+  `RecursionError` that the CLI rendered as "unexpected failure (RecursionError)",
+  while `json.loads` parsed the same bytes without complaint. The walk is now
+  iterative, so there is no depth limit to exceed. The same defect one layer up is
+  closed too: `json.loads` itself raises `RecursionError` at roughly 16 000 nesting
+  levels (32 KB of `[`, half the size bound — measured on CPython 3.12), and that is
+  now a typed `ValidationError` naming the file. Both fail closed either way; this
+  is availability and diagnosis, not a key exposure.
+
+- **`swap status` and the recovery gate could disagree about the same file.**
+  `swap_cmds._SECRET_KEY_MARKERS` was a second, shorter marker list scanned over the
+  top-level keys only. Measured: a document carrying `{"mnemonic": …}` was reported
+  `has_keys=False` at 0600 and refused as "contains a private key" at 0644 — two
+  answers to one question, from the tool an operator consults precisely because they
+  are unsure what their file holds. `has_keys` is now the gate's own predicate. The
+  `"preimage"` marker it dropped is not a lost signal: `has_preimage` reports it
+  separately (widened from an exact `preimage_p_hex` match to the same substring the
+  old list used) and the printed `holds_secrets` is still
+  `has_preimage or has_keys`.
+
+- **The one runnable remedy was truncated out of the permissions error.** The mode
+  refusal is rendered by `swap_recovery_cmds._load` through `sanitize_terminal`,
+  which truncates from the right. `_tighten_hint` opened by explaining that
+  `chmod 600` could not succeed (read-only media, a root-written bind mount) and
+  named the workable `install -m 600 …` only afterwards. Measured with a `/tmp`
+  path: a 446-character message rendered at the then-current `max_len=200` cut the
+  usable suggestion, at index 238, off entirely — so the operator saw only the
+  remedy that cannot work. `_tighten_hint` now leads with the runnable command, and
+  the render limit is 400. The pre-existing test asserted on `str(exc.value)` — the
+  message the library builds, not the one the CLI prints — which is why it passed
+  throughout; the new tests assert on `res.output`.
+
+- **`GlyphBuilder.build_ft_transfer_tx` / `build_ft_airdrop_tx` could not reach the
+  fee-overpay override.** `FtUtxoSet.build_transfer_tx` / `build_airdrop_tx` take
+  `allow_overpay`, the deliberate opt-out from the `MAX_FEE_OVERPAY_MULTIPLE`
+  ceiling; `FtTransferParams` / `FtAirdropParams` had no such field and the
+  delegators did not forward one. Measured: `fee_rate=100_001` (the smallest rate the
+  ceiling refuses) raised through the builder with no argument that could change the
+  outcome, while the identical build via
+  `FtUtxoSet.build_transfer_tx(..., allow_overpay=True)` succeeded. A ceiling with no
+  reachable override is a guard that refuses valid work, and Radiant has neither RBF
+  nor CPFP to repair a late refusal. Both dataclasses gained the field, defaulting to
+  `False`, and both delegators forward it.
+
+- **`assert_fee_rate_clears_relay_floor`'s docstring claimed an override that does
+  not exist.** It asserted that both opt-outs were reachable from every public
+  builder behind the gate and listed the FT builders among them. Re-derived from the
+  signatures: `allow_below_relay_floor` is reachable from **no** glyph builder —
+  `FtUtxoSet.build_transfer_tx` / `build_airdrop_tx` and the `GlyphBuilder` params
+  dataclasses take only `allow_overpay` — so an FT transfer at a regtest rate of
+  `1_000` raises with no opt-out. The claim is corrected rather than the override
+  added: above the ceiling the overpay is already spent and the build-time refusal is
+  the only place the loss can be prevented, whereas below the floor nothing is spent
+  and the override would let a builder emit a transaction that cannot relay and, on
+  Radiant, cannot be bumped. The docstring now states which builder exposes which,
+  and `tests/test_swap_and_nft_fee_floors.py` re-derives it from the signatures.
+
+- **A comment misdescribed how the confirmation depth is quorum-checked.**
+  `GravityTrade.wait_confirmations` said the source applies "its own (quorum-checked)
+  view of the tip". On the `MultiSourceBtcDataSource` path `get_raw_tx` forwards
+  `min_confirmations` to every leaf, each leaf applies the depth check against its
+  own un-quorumed tip, and `_require_quorum` then agrees on the hash256 of the raw
+  bytes returned by the leaves that did not raise; `get_tip_height` — the call that
+  does have a majority rule — is never consulted by `get_raw_tx`. The behaviour is at
+  least as strict as the comment claimed, but it is not the same statement. Comment
+  corrected; no behaviour change.
+
 - **A dead tip-height read could abort the BTC confirmation wait.**
   `GravityTrade.wait_confirmations` — the poll a taker sits in while its BTC
   payment buries — opened every attempt with `await self._btc.get_tip_height()`,
@@ -224,8 +333,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   not even a guard. The call was vestigial: the comment beneath it described
   computing depth as `tip - block_height`, which the code does not do. It
   re-requests the tx at `min_confirmations` and lets the source apply its own
-  quorum-checked view of the tip, in one read rather than two. Call and stale
-  comment both removed.
+  view of the tip, in one read rather than two. Call and stale comment both
+  removed. (This entry originally said "quorum-checked view of the tip",
+  repeating the source comment corrected under *Fixed* below — on the
+  `MultiSourceBtcDataSource` path the depth is judged per leaf against that
+  leaf's own un-quorumed tip.)
 
   Why it survived is the more useful half, and the first version of this entry
   got it wrong. It claimed `wait_confirmations` "had no test at all" — it had

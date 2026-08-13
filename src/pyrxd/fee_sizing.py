@@ -346,13 +346,35 @@ def assert_fee_rate_clears_relay_floor(
     — for regtest and for chains the caller controls, which legitimately relay
     lower. ``allow_overpay`` is its mirror, for a caller who means an unusually high
     rate. Each skips only its own bound: the rate still has to be a positive int, and
-    opting out of one never opts out of the other. **Both overrides are reachable
-    from every public builder behind this gate** — ``RxdWallet.__init__``,
-    ``HdWallet.build_send_tx`` / ``build_send_max_tx`` / ``send`` / ``send_max``,
-    ``WatchOnlyTxBuilder.build_send``, ``FtUtxoSet.build_transfer_tx`` /
-    ``build_airdrop_tx``, and ``TransferParams.allow_overpay``. A ceiling with no
-    reachable override is not a stricter guard, it is a guard that refuses valid
-    work, and this chain has neither RBF nor CPFP to repair the refusal.
+    opting out of one never opts out of the other.
+
+    **Which override each public builder actually exposes** (re-derived 2026-08-13 by
+    reading the signatures, because the universal claim that used to sit here — that
+    both opt-outs could be reached from every public builder behind this gate — was
+    false in one direction and nobody had checked):
+
+    * BOTH — ``RxdWallet.__init__``, ``HdWallet.build_send_tx`` / ``build_send_max_tx``
+      / ``send`` / ``send_max``, ``WatchOnlyTxBuilder.build_send``.
+    * ``allow_overpay`` ONLY — ``FtUtxoSet.build_transfer_tx`` / ``build_airdrop_tx``
+      (and their ``GlyphBuilder`` wrappers via ``FtTransferParams`` /
+      ``FtAirdropParams``), and ``GlyphBuilder.build_nft_transfer_tx`` via
+      ``TransferParams.allow_overpay``. No glyph builder accepts
+      ``allow_below_relay_floor``, so an FT transfer at a regtest rate of ``1_000``
+      raises with no opt-out.
+
+    That asymmetry is kept, not repaired, and the two ends are not equivalent. Above
+    the ceiling the overpay is **already gone** by the time anything downstream could
+    notice — an NFT transfer and a sweep have no change output — so the build-time
+    refusal is the only place the loss can be prevented, and a caller who genuinely
+    means the rate must be able to say so. Below the floor nothing is spent: the
+    refusal costs a re-run at a higher rate, while the override would let a glyph
+    builder emit a transaction the network will not relay, which on Radiant cannot be
+    RBF'd or CPFP'd and squats its own inputs until mempool expiry 8 hours later. That
+    is why this module calls a sub-floor rate a fund-safety bug rather than a tuning
+    mistake, and why "a ceiling with no reachable override is a guard that refuses
+    valid work" is an argument about the CEILING specifically. Adding a sub-floor
+    opt-out to the glyph builders is a fund-safety API change and belongs to a change
+    that is about that, not to a docstring correction.
 
     **Why this is not the same bound as**
     :attr:`~pyrxd.gravity.fee_policy.DeadlineFeePolicy.max_urgency_multiplier`, which

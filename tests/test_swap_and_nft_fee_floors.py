@@ -748,3 +748,62 @@ class TestTheRateGuard:
     def test_the_error_type_is_the_callers_own(self) -> None:
         with pytest.raises(ValidationError):
             assert_fee_rate_clears_relay_floor(1, what="x", error_type=ValidationError)
+
+
+class TestTheGatesDocstringMatchesTheSignatures:
+    """The docstring is the only place this asymmetry is written down, so it is tested.
+
+    ``assert_fee_rate_clears_relay_floor`` used to assert "Both overrides are reachable
+    from every public builder behind this gate" and then LIST the FT builders among
+    them. Measured false: no glyph builder accepts ``allow_below_relay_floor``, so an FT
+    transfer at a regtest rate of 1_000 raises with no opt-out. The claim was kept and
+    the asymmetry documented rather than the override added — below the floor a refusal
+    costs a re-run and the override would let a builder emit a transaction that cannot
+    relay and, on Radiant, cannot be bumped.
+
+    A docstring assertion is worth having here because the sentence was load-bearing:
+    a reader deciding whether a rate is overridable had nothing else to consult.
+    """
+
+    @staticmethod
+    def _doc() -> str:
+        """The docstring with its line wrapping flattened — the claim spans two lines."""
+        return " ".join((assert_fee_rate_clears_relay_floor.__doc__ or "").split())
+
+    def test_the_false_universal_claim_is_gone(self) -> None:
+        assert "Both overrides are reachable from every public builder" not in self._doc()
+
+    def test_the_docstring_says_no_glyph_builder_takes_the_below_floor_opt_out(self) -> None:
+        doc = self._doc()
+        assert "allow_below_relay_floor" in doc
+        assert "No glyph builder accepts ``allow_below_relay_floor``" in doc
+
+    @pytest.mark.parametrize(
+        ("owner", "method", "below_floor", "overpay"),
+        [
+            ("pyrxd.glyph.ft:FtUtxoSet", "build_transfer_tx", False, True),
+            ("pyrxd.glyph.ft:FtUtxoSet", "build_airdrop_tx", False, True),
+            ("pyrxd.hd.wallet:HdWallet", "build_send_tx", True, True),
+            ("pyrxd.hd.wallet:HdWallet", "build_send_max_tx", True, True),
+            ("pyrxd.agent.watch_only:WatchOnlyTxBuilder", "build_send", True, True),
+        ],
+    )
+    def test_the_measured_reachability_is_what_the_docstring_now_describes(
+        self, owner: str, method: str, below_floor: bool, overpay: bool
+    ) -> None:
+        import importlib
+        import inspect
+
+        module_name, class_name = owner.split(":")
+        cls = getattr(importlib.import_module(module_name), class_name)
+        params = inspect.signature(getattr(cls, method)).parameters
+        assert ("allow_below_relay_floor" in params) is below_floor
+        assert ("allow_overpay" in params) is overpay
+
+    def test_the_glyph_params_dataclasses_expose_only_the_overpay_opt_out(self) -> None:
+        from pyrxd.glyph.builder import FtAirdropParams, FtTransferParams, TransferParams
+
+        for params_cls in (FtTransferParams, FtAirdropParams, TransferParams):
+            fields = params_cls.__dataclass_fields__
+            assert "allow_overpay" in fields, params_cls.__name__
+            assert "allow_below_relay_floor" not in fields, params_cls.__name__
