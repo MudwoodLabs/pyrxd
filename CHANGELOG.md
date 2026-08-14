@@ -6,6 +6,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.0] — 2026-08-13
+
+### Upgrade notes
+
+- **Multi-source BTC reads now need a majority of the CONFIGURED sources, not of the
+  ones that answered.** A two-source `MultiSourceBtcDataSource` with one endpoint down
+  now fails closed where `quorum=1` previously returned the survivor's word. Counting
+  only responders let a minority win by making the others unreachable. If you genuinely
+  want to trust one source, configure ONE source — the majority is then that source and
+  the read succeeds. Three sources tolerate one outage.
+- **A recovery file that contains a private key is refused unless it is `0600`**, and
+  "contains a key" is now decided by decoding the VALUES (WIF, xprv, BIP-39), not by
+  matching field names. A file holding only public locators and pkhs is still readable at
+  `0644`, which is the two-host workflow `--taker-pkh` / `--maker-pkh` exist for.
+- **A fee rate above `MAX_FEE_OVERPAY_MULTIPLE × relay_floor_photons_per_byte()`
+  (100_000 photons/byte) is refused.** Deliberate high-urgency rates pass
+  `allow_overpay=True`, which every builder behind the shared gate now accepts.
+- **`wait_confirmations(..., min_confirmations=N)` requires `N >= 1`.** `0` previously
+  returned `confirmed=True` at zero depth, and a negative value was echoed back.
+- **`pyrxd swap status` reports `has_keys` from the same predicate the read gate uses.**
+  It may now say `True` for a document it previously called keyless — the two disagreed.
+
+
 ### Security
 
 - **A minority of BTC sources could win a quorum read by making the honest ones
@@ -150,6 +173,95 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   exactly the shape where line coverage is least informative: `pyrxd.security` sits
   at 100% line and branch coverage, and that number cannot distinguish a guard whose
   removal a test would notice from one whose removal nothing would.
+
+- **The shared fee-rate gate now judges a rate from BOTH ends.**
+  `assert_fee_rate_clears_relay_floor` — the one check every builder runs on a
+  caller-supplied `fee_rate` — refused a rate below Radiant's relay floor and
+  accepted *anything* above it. A fee is `size × fee_rate`, so a rate `k` times
+  the floor pays `k` times the requirement, and the builders behind this gate
+  spend the difference irreversibly: an NFT transfer and a sweep have **no change
+  output at all**, so the whole overpay leaves with the miner. Measured on
+  `build_nft_transfer_tx` before the bound existed: `fee_rate=10_000_000` —
+  which is literally `RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`, the
+  per-**kB** constant `pyrxd.fee_sizing` exports one import away from the
+  per-**byte** one — burned **2.31-2.33 billion photons (23.1-23.3 RXD)** off a
+  228-230 byte transfer, silently, with the build reporting success. Ranges, not
+  single figures, because the fee tracks the DER signature length (228 B ↔ 70,
+  229 ↔ 71, 230 ↔ 72, one-to-one); re-measured over 400 builds.
+
+  The overpay *multiple* depends on which ratio is meant, so both are given
+  rather than one presented as the number. Against the caller's own rate the
+  slip is **exactly 1000x** by construction (`10_000_000 / 10_000`). Against the
+  relay fee the *final* transaction actually owed it reaches about **1009x**,
+  because the fee was sized from the trial signing pass and the final signature
+  can be a byte or two shorter. An earlier revision of this entry said the 1009x
+  figure "did not reproduce" — it does, under the second ratio; what did not
+  reproduce was 1009x as a single universal value.
+
+  The ceiling is `MAX_FEE_OVERPAY_MULTIPLE × relay_floor_photons_per_byte()` =
+  100_000 photons/byte. That constant is reused rather than a new number
+  invented, because `fee / requirement` and `fee_rate / floor` are the *same
+  ratio*. The highest deliberate rate anywhere in `src/` or `tests/` is 90_000
+  (9x), measured over every `fee_rate=` literal, so the bound has room; it is a
+  multiple, so it tracks the floor if the floor moves. `allow_overpay=True`
+  mirrors the existing `allow_below_relay_floor` hatch, and each skips only its
+  own bound. Stated rather than left to be discovered: one extra zero on a rate
+  that is already the floor lands on **exactly** 100_000, which is permitted —
+  the bound catches the 100x and 1000x slips, not every fat finger.
+  `RxdWallet`, `HdWallet`, the FT airdrop/transfer builders,
+  `build_nft_transfer_tx` and the watch-only builder all inherit it from the one
+  gate.
+
+- **No builder rejected a repeated outpoint; three now do.** An outpoint is
+  unique on chain, so the same `(txid, vout)` twice is always a caller mistake —
+  and nothing downstream noticed. Measured before the checks: an `FtUtxoSet`
+  holding one UTXO twice reported **double** the real balance from `total()` and
+  let `select()` hand the same outpoint back twice; `FtUtxoSet.build_airdrop_tx`
+  with one funding UTXO passed twice signed a transaction carrying a duplicate
+  input — rejected by every node as `bad-txns-inputs-duplicate` — and reported a
+  fee **4x** the real one, because `funding_total` and the final
+  `assert_pays_for_its_size` are handed the same double-counted number.
+  `FtUtxoSet.__init__` now refuses a repeated token outpoint,
+  `build_airdrop_tx` refuses a repeated funding outpoint and refuses an outpoint
+  listed as both token and funding (the seam neither list can see on its own).
+  All three key on `(txid, vout)` and not on `txid`: one transaction paying a
+  holder at several output indexes is ordinary and still builds.
+
+- **`AirdropFunding.value` is validated at construction**, the way
+  `FtUtxo.value` already was. It is summed into the RXD budget the fee comes out
+  of and was the only unchecked number there; a wrong one surfaced late and
+  unhelpfully — measured as `'float' object has no attribute 'to_bytes'` from
+  the middle of output serialisation, `OverflowError` for a negative, and for
+  `True` a nonsense "budget 1 photons" in the insufficient-funding message. The
+  floor is 1 photon, not 546: Radiant's real output rule is `nValue <= 0`.
+
+- **The soulbound classification is split into two tiers so the weaker one is
+  never sold as the stronger.** `classify_soulbound` matches on semantic
+  markers, which is right for its own job but too loose to drive a label:
+  measured against every locking-script builder in `src/`, a **dMint V1
+  contract, a dMint V2 contract, and a mutable-NFT script all return
+  `SOULBOUND_COVENANT`** — they bind a singleton ref and self-replicate, which
+  is every marker it looks for. So `inspect` reports `soulbound-covenant` only
+  on an **exact** round-trip against pyrxd's builder (parameters recovered,
+  builder re-run, bytes compared), and `self-replicating-covenant` when only
+  the markers are present, with a note saying plainly that container and vault
+  covenants self-replicate too. The dMint and `mut` parsers run *before* both,
+  and `tests/test_inspect_script_shapes.py` pins that ordering — move the
+  fallback above them and a token contract starts reading as a credential.
+
+- **`soulbound_detect._opcodes` no longer carries its own script walk.** It was
+  a fifth hand-written transcription of "how many bytes does this opcode
+  consume"; it is now a one-line projection over
+  `glyph.script.iter_script_ops_strict`, which is a filter over
+  `script/consensus.py`'s `get_script_op` — the `GetScriptOp` transcription
+  that was already the canonical answer. `glyph.script.iter_input_refs` was
+  collapsed onto the same primitive, removing a second copy. Behaviour change:
+  the helper now raises `TruncatedScriptError` on a script that does not
+  decode where it used to return a silent prefix. `classify_soulbound` already
+  returned `UNKNOWN` for those scripts via its `count_input_refs` pre-check, so
+  its verdicts are unchanged — but both paths now fail closed, and
+  `tests/test_ref_walker_differential.py` records the divergence from
+  `GetScriptOp` as *removed* rather than as documented leniency.
 
 ### Added
 
@@ -583,97 +695,6 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   fixture went missing and 32 tests ERRORed. Reproducible outside the mutation
   harness, so it is a suite-wide ordering hazard for any explicit multi-file
   `pytest` invocation.
-
-### Changed
-
-- **The shared fee-rate gate now judges a rate from BOTH ends.**
-  `assert_fee_rate_clears_relay_floor` — the one check every builder runs on a
-  caller-supplied `fee_rate` — refused a rate below Radiant's relay floor and
-  accepted *anything* above it. A fee is `size × fee_rate`, so a rate `k` times
-  the floor pays `k` times the requirement, and the builders behind this gate
-  spend the difference irreversibly: an NFT transfer and a sweep have **no change
-  output at all**, so the whole overpay leaves with the miner. Measured on
-  `build_nft_transfer_tx` before the bound existed: `fee_rate=10_000_000` —
-  which is literally `RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`, the
-  per-**kB** constant `pyrxd.fee_sizing` exports one import away from the
-  per-**byte** one — burned **2.31-2.33 billion photons (23.1-23.3 RXD)** off a
-  228-230 byte transfer, silently, with the build reporting success. Ranges, not
-  single figures, because the fee tracks the DER signature length (228 B ↔ 70,
-  229 ↔ 71, 230 ↔ 72, one-to-one); re-measured over 400 builds.
-
-  The overpay *multiple* depends on which ratio is meant, so both are given
-  rather than one presented as the number. Against the caller's own rate the
-  slip is **exactly 1000x** by construction (`10_000_000 / 10_000`). Against the
-  relay fee the *final* transaction actually owed it reaches about **1009x**,
-  because the fee was sized from the trial signing pass and the final signature
-  can be a byte or two shorter. An earlier revision of this entry said the 1009x
-  figure "did not reproduce" — it does, under the second ratio; what did not
-  reproduce was 1009x as a single universal value.
-
-  The ceiling is `MAX_FEE_OVERPAY_MULTIPLE × relay_floor_photons_per_byte()` =
-  100_000 photons/byte. That constant is reused rather than a new number
-  invented, because `fee / requirement` and `fee_rate / floor` are the *same
-  ratio*. The highest deliberate rate anywhere in `src/` or `tests/` is 90_000
-  (9x), measured over every `fee_rate=` literal, so the bound has room; it is a
-  multiple, so it tracks the floor if the floor moves. `allow_overpay=True`
-  mirrors the existing `allow_below_relay_floor` hatch, and each skips only its
-  own bound. Stated rather than left to be discovered: one extra zero on a rate
-  that is already the floor lands on **exactly** 100_000, which is permitted —
-  the bound catches the 100x and 1000x slips, not every fat finger.
-  `RxdWallet`, `HdWallet`, the FT airdrop/transfer builders,
-  `build_nft_transfer_tx` and the watch-only builder all inherit it from the one
-  gate.
-
-- **No builder rejected a repeated outpoint; three now do.** An outpoint is
-  unique on chain, so the same `(txid, vout)` twice is always a caller mistake —
-  and nothing downstream noticed. Measured before the checks: an `FtUtxoSet`
-  holding one UTXO twice reported **double** the real balance from `total()` and
-  let `select()` hand the same outpoint back twice; `FtUtxoSet.build_airdrop_tx`
-  with one funding UTXO passed twice signed a transaction carrying a duplicate
-  input — rejected by every node as `bad-txns-inputs-duplicate` — and reported a
-  fee **4x** the real one, because `funding_total` and the final
-  `assert_pays_for_its_size` are handed the same double-counted number.
-  `FtUtxoSet.__init__` now refuses a repeated token outpoint,
-  `build_airdrop_tx` refuses a repeated funding outpoint and refuses an outpoint
-  listed as both token and funding (the seam neither list can see on its own).
-  All three key on `(txid, vout)` and not on `txid`: one transaction paying a
-  holder at several output indexes is ordinary and still builds.
-
-- **`AirdropFunding.value` is validated at construction**, the way
-  `FtUtxo.value` already was. It is summed into the RXD budget the fee comes out
-  of and was the only unchecked number there; a wrong one surfaced late and
-  unhelpfully — measured as `'float' object has no attribute 'to_bytes'` from
-  the middle of output serialisation, `OverflowError` for a negative, and for
-  `True` a nonsense "budget 1 photons" in the insufficient-funding message. The
-  floor is 1 photon, not 546: Radiant's real output rule is `nValue <= 0`.
-
-- **The soulbound classification is split into two tiers so the weaker one is
-  never sold as the stronger.** `classify_soulbound` matches on semantic
-  markers, which is right for its own job but too loose to drive a label:
-  measured against every locking-script builder in `src/`, a **dMint V1
-  contract, a dMint V2 contract, and a mutable-NFT script all return
-  `SOULBOUND_COVENANT`** — they bind a singleton ref and self-replicate, which
-  is every marker it looks for. So `inspect` reports `soulbound-covenant` only
-  on an **exact** round-trip against pyrxd's builder (parameters recovered,
-  builder re-run, bytes compared), and `self-replicating-covenant` when only
-  the markers are present, with a note saying plainly that container and vault
-  covenants self-replicate too. The dMint and `mut` parsers run *before* both,
-  and `tests/test_inspect_script_shapes.py` pins that ordering — move the
-  fallback above them and a token contract starts reading as a credential.
-
-- **`soulbound_detect._opcodes` no longer carries its own script walk.** It was
-  a fifth hand-written transcription of "how many bytes does this opcode
-  consume"; it is now a one-line projection over
-  `glyph.script.iter_script_ops_strict`, which is a filter over
-  `script/consensus.py`'s `get_script_op` — the `GetScriptOp` transcription
-  that was already the canonical answer. `glyph.script.iter_input_refs` was
-  collapsed onto the same primitive, removing a second copy. Behaviour change:
-  the helper now raises `TruncatedScriptError` on a script that does not
-  decode where it used to return a silent prefix. `classify_soulbound` already
-  returned `UNKNOWN` for those scripts via its `count_input_refs` pre-check, so
-  its verdicts are unchanged — but both paths now fail closed, and
-  `tests/test_ref_walker_differential.py` records the divergence from
-  `GetScriptOp` as *removed* rather than as documented leniency.
 
 ### Documentation
 
