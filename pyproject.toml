@@ -251,6 +251,12 @@ check-manifest = "check-manifest"
 # push-fail-fix-push loop. ~3-5 min.
 # For a faster pre-commit pass, just run `task lint && task format-check && task test`.
 ci = "task lint && task format-check && task test && task coverage-security && task coverage-overall && task typecheck && task check-private-links"
+# `task ci-fast` is what the pre-push hook runs: every `task ci` check that does not
+# invoke pytest. Seconds instead of minutes. Two reasons it is the hook's job and not
+# `task ci`: the full suite duplicates what GitHub Actions already runs on every PR,
+# and a multi-minute pre-push hook triggers a push failure documented in
+# docs/runbooks/cutting-a-release.md. Run `task ci` by hand before opening a PR.
+ci-fast = "task lint && task format-check && task typecheck && task check-private-links"
 # `task mutate [group...]` runs cosmic-ray mutation testing. Default group is `spv`
 # (pow/merkle/chain/payment). `consensus` = the byte-exact groups (spv/script/
 # transaction/dmint); `value` = the value-moving ones (fee/wallet/glyph/swap/
