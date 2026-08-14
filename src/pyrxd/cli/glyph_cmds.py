@@ -82,6 +82,11 @@ from ..glyph.fees import (
 )
 from ..glyph.scanner import GlyphScanner
 from ..glyph.script import build_nft_locking_script, extract_ref_from_nft_script
+from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
+from ..glyph.transfer import find_plain_rxd_utxo as lib_find_plain_rxd_utxo
+from ..glyph.transfer import ft_funding as lib_ft_funding
+from ..glyph.transfer import select_ft_inputs as lib_select_ft_inputs
+from ..glyph.transfer import single_ft_signing_key as lib_single_ft_signing_key
 from ..glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
 from ..hd.wallet import HdWallet
 from ..network.confirm import wait_for_confirmation
@@ -115,7 +120,6 @@ from .glyph_helpers import (
     _parse_ref,
     _read_metadata_file,
     _scaffold_for,
-    _try_extract_ft_ref,
 )
 from .glyph_inspect import _HUMAN_STRING_CAP as _HUMAN_STRING_CAP
 from .glyph_inspect import _sanitize_display_string as _sanitize_display_string
@@ -869,76 +873,24 @@ async def _select_ft_inputs(
     filter is a place for them to silently diverge.
 
     Returns ``(FtUtxo, address, key)`` triples in the order they were selected.
+
+    The selection itself lives in :func:`pyrxd.glyph.transfer.select_ft_inputs` so the
+    SDK and the CLI cannot disagree about what counts as a spendable holding. This
+    wrapper only re-dresses the SDK error as a CLI one with a runnable fix.
     """
-    # Scan wallet for FT holdings of this ref.
-    scanner = GlyphScanner(client)
-    items: list[GlyphFt] = []
-    for rec in [r for r in wallet.addresses.values() if r.used]:
-        scanned = await scanner.scan_address(rec.address)
-        for item in scanned:
-            if isinstance(item, GlyphFt) and item.ref == ref:
-                items.append(item)
-
-    if not items:
+    try:
+        return await lib_select_ft_inputs(wallet, ref, amount, client)
+    except InsufficientFundsError as exc:
+        msg = str(exc)
+        if "no FT holdings" in msg:
+            raise UserError(
+                f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
+                fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+            ) from exc
         raise UserError(
-            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
-        )
-
-    # Convert GlyphFt holdings into FtUtxo records suitable for the builder.
-    # We need the actual utxo (tx_hash, vout, value) and ft_amount and the
-    # raw ft_script from each. The scanner's GlyphFt has ref + amount but
-    # we also need the underlying tx_hash and vout — those live on the
-    # original UtxoRecord. Use collect_spendable + per-address scan to
-    # rebuild the (utxo, address, key) → ft_amount mapping.
-    from ..glyph.script import is_ft_script
-
-    triples = await wallet.collect_spendable(client)
-    ft_inputs: list[tuple[FtUtxo, str, PrivateKey]] = []
-    total_ft = 0
-    for utxo, addr, pk in triples:
-        # Each utxo's locking script must be checked against the ref.
-        # We need the source tx output's script.
-        try:
-            raw = await client.get_transaction(Txid(utxo.tx_hash))
-            tx = Transaction.from_hex(bytes(raw))
-            if tx is None or utxo.tx_pos >= len(tx.outputs):
-                continue
-            out_script = tx.outputs[utxo.tx_pos].locking_script.serialize()
-            if not is_ft_script(out_script.hex()):
-                continue
-            ref_in_script = _try_extract_ft_ref(out_script)
-            if ref_in_script != ref:
-                continue
-            # 1 photon = 1 FT unit — ``from_output`` takes the number once so a
-            # future edit cannot reintroduce a second, divergent quantity.
-            ft_utxo = FtUtxo.from_output(
-                txid=utxo.tx_hash,
-                vout=utxo.tx_pos,
-                value=utxo.value,
-                ft_script=out_script,
-            )
-            ft_inputs.append((ft_utxo, addr, pk))
-            total_ft += ft_utxo.ft_amount
-        except NetworkError:
-            continue
-
-    if total_ft < amount:
-        raise UserError(
-            f"insufficient FT balance: need {amount}, have {total_ft}",
+            msg,
             fix="check holdings with `pyrxd glyph list --type ft`",
-        )
-
-    # Greedy descending selection until we have enough.
-    ft_inputs.sort(key=lambda t: t[0].ft_amount, reverse=True)
-    selected: list[tuple[FtUtxo, str, PrivateKey]] = []
-    selected_total = 0
-    for triple in ft_inputs:
-        selected.append(triple)
-        selected_total += triple[0].ft_amount
-        if selected_total >= amount:
-            break
-    return selected
+        ) from exc
 
 
 def _single_ft_signing_key(
@@ -952,15 +904,14 @@ def _single_ft_signing_key(
     invalid signatures on some inputs — rejected at broadcast, but only after
     the user has confirmed a spend. Refuse first instead.
     """
-    first_key = selected[0][2]
-    for _utxo, _addr, k in selected:
-        if k.public_key().address() != first_key.public_key().address():
-            raise UserError(
-                f"{what} across multiple wallet addresses isn't supported in Cut 2",
-                cause="selected FT utxos span multiple HD-derived keys",
-                fix="consolidate FT holdings to one address first (Cut 3 will lift this restriction)",
-            )
-    return first_key
+    try:
+        return lib_single_ft_signing_key(selected, what)
+    except ValidationError as exc:
+        raise UserError(
+            f"{what} across multiple wallet addresses isn't supported in Cut 2",
+            cause="selected FT utxos span multiple HD-derived keys",
+            fix="consolidate FT holdings to one address first (Cut 3 will lift this restriction)",
+        ) from exc
 
 
 async def _transfer_ft_inner(
@@ -974,37 +925,49 @@ async def _transfer_ft_inner(
 ) -> dict:
     """FT transfer: scan wallet, find FT utxos for ref, build + broadcast.
 
-    Built through ``build_ft_airdrop_tx`` with a single recipient rather than
-    through ``build_ft_transfer_tx``. That is a **fund-safety correction**, not a
-    refactor: the transfer builder sizes its output from the inputs' RXD instead
-    of from ``amount``, and because an FT's quantity IS its output value on
-    Radiant, this command used to deliver the wrong number of units. Measured on
-    a realistic holding — one 50,000,000-unit UTXO, ``amount=250`` — it produced
-    a 46,739,454-unit output to the recipient and kept 546. The airdrop builder
-    sizes each output from the units requested and pays the fee from a plain-RXD
-    input, which is the only arrangement that can be correct.
-    """
-    selected = await _select_ft_inputs(wallet, ref, amount, client)
-    first_key = _single_ft_signing_key(selected, "FT transfer")
-    funding = await _airdrop_funding(ctx, wallet, selected, n_outputs=1, client=client)
+    The build lives in :func:`pyrxd.glyph.transfer.build_ft_transfer` — including the
+    decision to route through ``build_ft_airdrop_tx`` with a single recipient rather
+    than ``build_ft_transfer_tx``, which is a fund-safety correction and not a
+    refactor (the transfer builder sizes its output from the inputs' RXD instead of
+    from ``amount``; see that module's docstring for the measured numbers). Keeping
+    that decision in one place is the point: a second copy is a place for the bug to
+    come back.
 
-    params = FtAirdropParams(
-        ref=ref,
-        utxos=[t[0] for t in selected],
-        recipients=[AirdropRecipient(pkh=to_pkh, amount=amount)],
-        private_key=first_key,
-        funding=[funding],
-        fee_rate=ctx.fee_rate,
-    )
+    This function owns what the SDK deliberately does not — showing the user what is
+    about to be spent, and broadcasting only after they agree.
+    """
     try:
-        transfer_result = GlyphBuilder().build_ft_airdrop_tx(params)
+        build = await lib_build_ft_transfer(
+            wallet,
+            ref,
+            amount,
+            to_pkh,
+            client=client,
+            fee_rate=ctx.fee_rate,
+        )
+    except InsufficientFundsError as exc:
+        msg = str(exc)
+        if "no FT holdings" in msg:
+            raise UserError(
+                f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
+                fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+            ) from exc
+        if "plain-RXD" in msg:
+            raise UserError(
+                "no plain-RXD UTXO large enough to fund the fee",
+                cause=msg,
+                fix="send some plain RXD to this wallet — the token cannot pay its own fee",
+            ) from exc
+        raise UserError(msg, fix="check holdings with `pyrxd glyph list --type ft`") from exc
     except (ValidationError, ValueError) as exc:
         raise UserError(
             "could not build the transfer",
             cause=str(exc),
             fix="fund the wallet with a little plain RXD — the token cannot pay its own fee",
         ) from exc
-    raw_hex = transfer_result.tx.serialize()
+
+    transfer_result = build
+    raw_hex = build.serialize()
 
     _confirm_or_abort(
         ctx,
@@ -1046,27 +1009,21 @@ async def _airdrop_funding(
     """
     est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50
     needed = est_bytes * ctx.fee_rate * 2
-    triples = await wallet.collect_spendable(client)
-    fund = await _find_plain_rxd_utxo(
-        triples,
-        client,
-        exclude={(u.txid, u.vout) for u, _a, _k in selected},
-        needed=needed,
-    )
-    if fund is None:
+    try:
+        return await lib_ft_funding(
+            wallet,
+            selected,
+            n_outputs=n_outputs,
+            fee_rate=ctx.fee_rate,
+            client=client,
+        )
+    except InsufficientFundsError as exc:
         raise UserError(
             "no plain-RXD UTXO large enough to fund the fee",
             cause=f"need about {needed:,} photons on a single non-token UTXO",
             fix="send some plain RXD to this wallet — an FT output's value is its unit count, "
             "so the token itself cannot pay the fee without burning units",
-        )
-    fund_utxo, _fund_addr, fund_key = fund
-    return AirdropFunding(
-        txid=fund_utxo.tx_hash,
-        vout=fund_utxo.tx_pos,
-        value=fund_utxo.value,
-        private_key=fund_key,
-    )
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -1398,21 +1355,11 @@ async def _find_plain_rxd_utxo(
     Verifies each candidate's on-chain script is a bare 25-byte P2PKH so a
     token-bearing UTXO is never spent as fee (which would burn the token).
     Excludes the given outpoints (e.g. the NFT being transferred).
+
+    Delegates to :func:`pyrxd.glyph.transfer.find_plain_rxd_utxo`; the P2PKH check is
+    a fund-safety property, so it lives in one place.
     """
-    for u, a, k in sorted(triples, key=lambda t: t[0].value, reverse=True):
-        if (u.tx_hash, u.tx_pos) in exclude or u.value < needed:
-            continue
-        try:
-            raw = await client.get_transaction(Txid(u.tx_hash))
-        except NetworkError:
-            continue
-        tx = Transaction.from_hex(bytes(raw))
-        if tx is None or u.tx_pos >= len(tx.outputs):
-            continue
-        spk = tx.outputs[u.tx_pos].locking_script.serialize()
-        if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":
-            return u, a, k
-    return None
+    return await lib_find_plain_rxd_utxo(triples, client, exclude=exclude, needed=needed)
 
 
 #: Modelled bytes of the ``transfer-nft`` transaction WITHOUT its change output and
