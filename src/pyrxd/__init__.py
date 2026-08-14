@@ -68,6 +68,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # top level because they are the pair a caller needs to mint at all — the store is a
     # required constructor argument, so exporting one without the other would leave the
     # advertised entry point unusable from `from pyrxd import ...`.
+    "GlyphClient": ("pyrxd.glyph", "GlyphClient"),
     "GlyphMinter": ("pyrxd.glyph", "GlyphMinter"),
     "GlyphProtocol": ("pyrxd.glyph", "GlyphProtocol"),
     "GlyphRef": ("pyrxd.glyph", "GlyphRef"),

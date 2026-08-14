@@ -44,6 +44,7 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "GlyphInspector": ("pyrxd.glyph.inspector", "GlyphInspector"),
     "GlyphItem": ("pyrxd.glyph.scanner", "GlyphItem"),
     "GlyphMetadata": ("pyrxd.glyph.types", "GlyphMetadata"),
+    "GlyphClient": ("pyrxd.glyph.client", "GlyphClient"),
     "GlyphMinter": ("pyrxd.glyph.mint", "GlyphMinter"),
     "GlyphNft": ("pyrxd.glyph.types", "GlyphNft"),
     "GlyphPolicy": ("pyrxd.glyph.types", "GlyphPolicy"),
