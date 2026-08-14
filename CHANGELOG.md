@@ -6,6 +6,17 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `GlyphClient` — one object for minting and moving Glyph tokens, exported from the top
+  level (`from pyrxd import GlyphClient`). Composes the existing `GlyphMinter` (unchanged)
+  with a new library-level transfer path. The `PendingStore` is optional: minting requires
+  one, transfers do not, and calling a mint method without one raises with the fix.
+- `pyrxd.glyph.transfer` — the FT transfer path, lifted out of the CLI where it was only
+  reachable as private helpers. `examples/ft_transfer_demo.py` needed 399 hand-rolled lines
+  because the working implementation was not importable.
+- `docs/runbooks/cutting-a-release.md` — end-to-end release procedure.
+
 ### Changed
 
 - The `pre-push` hook now runs `task ci-fast` — lint, format-check, typecheck and the
@@ -17,9 +28,13 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before opening a PR; GitHub Actions still gates every PR. The hook also now locates
   `.venv/bin/task` itself rather than aborting when the venv is not activated.
 
-### Added
+### Fixed
 
-- `docs/runbooks/cutting-a-release.md` — end-to-end release procedure.
+- FT transfers built through the SDK are now guarded against silently paying change to the
+  miner. `Transaction.fee()` drops every change output and leaves the remainder to the miner
+  when it does not cover them — correct for a sub-dust remainder, but silent and unbounded
+  otherwise. Builds now refuse when the fee exceeds what the transaction's size demands by a
+  dust threshold or more; `allow_overpay=True` is the deliberate way through.
 
 ## [0.18.0] — 2026-08-13
 
