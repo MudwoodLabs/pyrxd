@@ -1281,9 +1281,9 @@ class TestTransferNftPaysTheRelayFloor:
         transaction this command can produce, so sizing the bar against the two-output
         shape would refuse funding that in fact relays.
         """
-        from pyrxd.cli.glyph_cmds import _nft_transfer_funding_bar
         from pyrxd.fee_sizing import min_relay_fee
         from pyrxd.glyph.script import build_nft_locking_script
+        from pyrxd.glyph.transfer import nft_transfer_funding_bar as _nft_transfer_funding_bar
 
         locking = build_nft_locking_script(Hex20(PrivateKey().public_key().hash160()), GlyphRef(txid="aa" * 32, vout=0))
         bar = _nft_transfer_funding_bar(locking, cli_context.fee_rate)
@@ -1293,8 +1293,8 @@ class TestTransferNftPaysTheRelayFloor:
 
     def test_the_bar_scales_with_the_fee_rate(self, cli_context) -> None:
         """The defining property the flat literal lacked: it multiplies by the rate."""
-        from pyrxd.cli.glyph_cmds import _nft_transfer_funding_bar
         from pyrxd.glyph.script import build_nft_locking_script
+        from pyrxd.glyph.transfer import nft_transfer_funding_bar as _nft_transfer_funding_bar
 
         locking = build_nft_locking_script(Hex20(PrivateKey().public_key().hash160()), GlyphRef(txid="aa" * 32, vout=0))
         at_floor = _nft_transfer_funding_bar(locking, 10_000)
