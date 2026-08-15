@@ -20,13 +20,23 @@ SIZE_BYTES = 300
 
 
 class _StubTx:
-    """Only ``serialize()`` is used by the guard — its length is what matters."""
+    """Only ``serialize()`` is used by the guard — its length is what matters.
+
+    Returns **bytes**, because that is what
+    :meth:`pyrxd.transaction.transaction.Transaction.serialize` returns. It used to
+    return a hex string, and that single wrong character of contract hid a shipped
+    fund-safety bug: the guard divided the length by two, so the stub and the guard
+    agreed with each other while both disagreed with the real ``Transaction``, and
+    every honest transfer at a realistic fee rate was refused.
+    ``test_the_guard_agrees_with_a_real_transaction`` below is the seam that would
+    have caught it, and is the reason this stub cannot drift again.
+    """
 
     def __init__(self, size_bytes: int) -> None:
-        self._hex = "00" * size_bytes
+        self._raw = b"\x00" * size_bytes
 
-    def serialize(self) -> str:
-        return self._hex
+    def serialize(self) -> bytes:
+        return self._raw
 
 
 def _exact_fee(size_bytes: int = SIZE_BYTES) -> int:
@@ -79,6 +89,61 @@ class TestChangeSurvivedGuard:
         check — the builders already bound the fee from below.
         """
         assert_change_survived(_exact_fee() - 5_000, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+
+
+class TestTheGuardAgreesWithARealTransaction:
+    """The seam the stub cannot provide: what ``Transaction.serialize()`` really returns.
+
+    Every test above measures the guard against a stub, so any units mistake shared by
+    the stub and the guard is invisible to all of them. That is not hypothetical — it
+    shipped. ``assert_change_survived`` computed ``len(tx.serialize()) // 2`` while
+    ``Transaction.serialize()`` returns bytes, so it judged every transfer against half
+    its true size and reported half the fee as burned change.
+
+    These run at **Radiant's real relay floor**, not a token rate. At the 1-photon/byte
+    rates convenient for unit tests the halving produces an excess below the dust
+    threshold and the guard stays silent; only production parameters expose it. Same
+    lesson as the regtest node that inherited a tenth of mainnet's floor.
+    """
+
+    def _real_tx(self, n_outputs: int = 6):
+        from pyrxd.keys import PrivateKey
+        from pyrxd.script.type import P2PKH
+        from pyrxd.transaction.transaction import Transaction
+        from pyrxd.transaction.transaction_output import TransactionOutput
+
+        tx = Transaction()
+        for _ in range(n_outputs):
+            tx.add_output(TransactionOutput(P2PKH().lock(PrivateKey().public_key().address()), 1_000))
+        return tx
+
+    def test_serialize_returns_bytes_not_hex(self) -> None:
+        """The contract the guard depends on, pinned directly.
+
+        If this ever becomes ``str``, the guard's arithmetic is wrong by 2x and the
+        test above it would go on passing against its stub.
+        """
+        assert isinstance(self._real_tx().serialize(), bytes)
+
+    def test_an_honest_transfer_at_the_relay_floor_is_accepted(self) -> None:
+        """THE regression test. Fee is exactly what the size demands — nothing is
+        burned, nothing is folded — so there is nothing for the guard to object to."""
+        from pyrxd.fee_sizing import relay_floor_photons_per_byte
+
+        rate = relay_floor_photons_per_byte()
+        tx = self._real_tx()
+        honest_fee = len(tx.serialize()) * rate
+        assert_change_survived(honest_fee, tx, fee_rate=rate)
+
+    def test_a_real_burn_at_the_relay_floor_is_still_refused(self) -> None:
+        """The counterweight: widening the guard must not switch it off."""
+        from pyrxd.fee_sizing import relay_floor_photons_per_byte
+
+        rate = relay_floor_photons_per_byte()
+        tx = self._real_tx()
+        honest_fee = len(tx.serialize()) * rate
+        with pytest.raises(ValidationError, match="paid to the miner"):
+            assert_change_survived(honest_fee + DUST_THRESHOLD_PHOTONS, tx, fee_rate=rate)
 
 
 class TestGlyphClientStoreIsOptional:

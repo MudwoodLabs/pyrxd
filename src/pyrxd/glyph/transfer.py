@@ -328,7 +328,13 @@ def assert_change_survived(
     """
     if allow_overpay:
         return
-    size_bytes = len(tx.serialize()) // 2
+    # ``Transaction.serialize()`` returns BYTES, so its length is the byte count.
+    # This read ``len(...) // 2`` until 2026-08-15, halving every size it judged:
+    # at Radiant's relay floor an honest transfer whose fee was EXACTLY its size
+    # times the rate reported half the fee as burned change and was refused. The
+    # tests missed it because their stub returned a hex STRING, so the stub and
+    # the guard agreed with each other and both disagreed with ``Transaction``.
+    size_bytes = len(tx.serialize())
     excess = fee - (size_bytes * fee_rate)
     if excess >= DUST_THRESHOLD_PHOTONS:
         raise ValidationError(
