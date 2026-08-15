@@ -192,3 +192,36 @@ The pre-push hook fired on the actual push, found nothing new because `task ci` 
 
 **Existing solution docs in this category:**
 - (none) — this is the first structured solution doc in `docs/solutions/`
+
+---
+
+## Update 2026-08-14 — the hook now runs `task ci-fast`, not `task ci`
+
+The "run the full matrix in the hook" decision above was **partially reversed** while
+cutting 0.18.0. The parity goal still stands; the hook is no longer the place it is
+enforced.
+
+**Why.** Running `task ci` here does not just cost time — it breaks pushes. Git opens
+the connection to the remote ~1 s *before* running the hook, and GitHub closes an idle
+`git-receive-pack` session after ~5 minutes. `task ci` measures **395 s**, so git ends
+up writing the pack to a socket GitHub has already dropped and dies with exit
+**141 (SIGPIPE)**: hook passes, nothing transferred, no git-level error. Reproduced
+3/3, and it silently cost a release push twice during the 0.18.0 cut. Full evidence and
+test matrix in
+[the SIGPIPE solution doc](./long-pre-push-hook-makes-git-push-to-github-fail-with-sigpipe.md).
+
+**What changed.** `pyproject.toml` gains `ci-fast` — `lint && format-check &&
+typecheck && check-private-links`, the `task ci` members that do not invoke pytest.
+`scripts/git-hooks/pre-push` runs that instead. It measures **4.5 s** versus 395 s, so
+it stays far under GitHub's limit.
+
+**What this costs.** The tests, coverage floors, and their local gate are no longer
+enforced before push, so the push-fail-fix-push churn this doc was written to prevent
+can recur for *test* failures specifically. Formatting, lint, typecheck and the
+private-link guard — the original PR #14 triggers — are still caught locally. The
+mitigation is unchanged from what CONTRIBUTING already says: run `task ci` yourself
+before opening a PR. GitHub Actions remains the enforcing gate on every PR.
+
+The hook also now finds `.venv/bin/task` itself instead of aborting with a bare
+"task not found" when the venv is not activated — that failure mode wasted time
+during the 0.18.0 cut.

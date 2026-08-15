@@ -15,6 +15,18 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `pyrxd.glyph.transfer` — the FT transfer path, lifted out of the CLI where it was only
   reachable as private helpers. `examples/ft_transfer_demo.py` needed 399 hand-rolled lines
   because the working implementation was not importable.
+- `docs/runbooks/cutting-a-release.md` — end-to-end release procedure.
+
+### Changed
+
+- The `pre-push` hook now runs `task ci-fast` — lint, format-check, typecheck and the
+  private-link guard, ~4.5 s — instead of the full `task ci`, which measures ~395 s.
+  Beyond the time saved, the long hook was actively breaking pushes: git opens the
+  connection to the remote before running the hook, GitHub closes an idle
+  `git-receive-pack` session after ~5 minutes, and git then dies with exit 141
+  (SIGPIPE) having transferred nothing and printed no error. Run `task ci` yourself
+  before opening a PR; GitHub Actions still gates every PR. The hook also now locates
+  `.venv/bin/task` itself rather than aborting when the venv is not activated.
 
 ### Fixed
 

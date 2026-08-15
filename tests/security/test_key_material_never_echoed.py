@@ -59,15 +59,32 @@ _LEAK_WINDOW = 8
 
 def _every_rendering(exc: BaseException) -> list[str]:
     """All operator-visible text for *exc*: its own message and repr, plus the
-    whole ``__cause__`` / ``__context__`` chain — a traceback prints all of it."""
+    whole ``__cause__`` / ``__context__`` chain — a traceback prints all of it.
+
+    Each exception's own TYPE NAME is blanked out first. The name is static text
+    chosen by this library, never derived from the input, so an overlap between it
+    and the secret is a coincidence rather than a disclosure — and a coincidence
+    that happens: ``KeyMaterialError`` contains ``Material``, which is exactly the
+    title-cased BIP-39 word ``material``. ``material`` appears in 0.56% of
+    generated 12-word phrases (measured over 20,000; theory says
+    ``1-(2047/2048)**12`` = 0.58%), so the title-case parametrisation of
+    ``test_a_non_lowercase_mnemonic_does_not_reach_exception_args`` failed about 1
+    CI run in 180 while the redaction under test was working perfectly.
+
+    Blanked with a NUL rather than deleted: splicing the surrounding text together
+    could butt two fragments into a contiguous run that never appeared in any
+    rendering, inventing a leak instead of removing a phantom one. A NUL cannot
+    occur inside a mnemonic, a WIF or an xprv, so it can only ever break a window,
+    never complete one.
+    """
     out: list[str] = []
     seen: set[int] = set()
     node: BaseException | None = exc
     while node is not None and id(node) not in seen:
         seen.add(id(node))
-        out.append(str(node))
-        out.append(repr(node))
-        out.append(repr(node.args))
+        name = type(node).__name__
+        for text in (str(node), repr(node), repr(node.args)):
+            out.append(text.replace(name, "\x00"))
         node = node.__cause__ or node.__context__
     return out
 
@@ -392,6 +409,52 @@ def test_a_non_lowercase_mnemonic_does_not_reach_exception_args(transform) -> No
     written = transform(_generated_mnemonic())
     _assert_no_leak(KeyMaterialError(written), written)
     _assert_no_leak(ValidationError(f"{written}"), written)
+
+
+def _phrase_colliding_with_the_class_name() -> str:
+    """A title-cased phrase whose first word is the BIP-39 word ``material``.
+
+    Built by substitution into a generated phrase rather than written out, so no
+    fixed sequence of seed words is committed to this repo — the same reason
+    ``_tokens_outside_every_shipped_wordlist`` invents its tokens. The checksum is
+    invalid afterwards, which is irrelevant: ``redact`` matches vocabulary and
+    shape, not checksums.
+    """
+    words = _generated_mnemonic().split()
+    words[0] = "material"
+    return " ".join(w.capitalize() for w in words)
+
+
+def test_the_class_name_is_not_mistaken_for_the_secret() -> None:
+    """The false positive that took down ``test (3.12)`` on run 31851656343.
+
+    ``KeyMaterialError('<redacted>')`` contains ``Material``; a phrase containing
+    the BIP-39 word ``material``, title-cased, contains ``Material`` too. The old
+    window scan compared the two and reported a leak at offset 0 while the argument
+    had in fact been redacted to ``<redacted>``.
+
+    Deterministic here, ~1 CI run in 180 before, because it needed the word to turn
+    up in a generated phrase (0.56% of 12-word phrases, measured over 20,000).
+    """
+    written = _phrase_colliding_with_the_class_name()
+    # Guard the fixture: if this stops being redacted the test below proves nothing.
+    assert redact(written) == "<redacted>", "fixture no longer exercises the redaction path"
+    assert "Material" in repr(KeyMaterialError(written)), "the collision this pins is gone"
+    _assert_no_leak(KeyMaterialError(written), written)
+
+
+def test_the_leak_detector_still_detects_a_real_echo() -> None:
+    """The counterweight, and the reason the fix above is narrow.
+
+    Blanking the type name must not blind the check. ``RuntimeError`` is not an
+    ``RxdSdkError``, so nothing redacts its argument and the phrase is echoed
+    verbatim — exactly the disclosure this whole file exists to catch. If
+    ``_assert_no_leak`` ever stops failing here, every other assertion in this
+    module is vacuous.
+    """
+    written = _phrase_colliding_with_the_class_name()
+    with pytest.raises(AssertionError):
+        _assert_no_leak(RuntimeError(written), written)
 
 
 def test_the_disclosed_form_would_have_restored_the_wallet() -> None:

@@ -631,8 +631,20 @@ class TestTheRateGateBindsFromBothEnds:
 
         ``fee_rate`` is the per-kB constant used as a per-byte rate on a ~229-byte NFT
         transfer, which has no change output — the whole difference leaves with the miner.
-        The burn is asserted as a RANGE because it is one: the fee tracks the DER
-        signature length, so it is 2_320_000_000 or 2_330_000_000, never one figure.
+
+        Both figures below are BANDS, because both track DER signature lengths that
+        vary run to run. The fee is sized off a TRIAL signing pass —
+        ``fee == (trial_size + SIG_SIZE_SLACK_BYTES) * rate`` — so it follows that
+        pass's signature, while the serialized length follows this transaction's own;
+        the two are independent draws.
+
+        This first enumerated two fee values and a two-byte size window. Measured over
+        20,000 builds, that was wrong on both: the fee came out 2.31e9 in 89 of them
+        (2.32e9 and 2.33e9 splitting the rest), and the size came out 227 or 228 in 84.
+        Either miss fails the test, so it broke about 1 CI run in 115 — as one did.
+        A signature shorter still costs another factor of ~256 in probability, so both
+        bands now run four bytes below the common case, past the rarest value in that
+        sample, and the fee is still pinned to within 2%.
         """
         key, ref = PrivateKey(), _ref()
         params = dict(
@@ -650,9 +662,9 @@ class TestTheRateGateBindsFromBothEnds:
         # transaction's floor-rate fee — the comparison the ceiling actually makes.
         burned = GlyphBuilder().build_nft_transfer_tx(TransferParams(**params, allow_overpay=True))
         required = GlyphBuilder().build_nft_transfer_tx(TransferParams(**{**params, "fee_rate": _FLOOR})).fee
-        assert burned.fee in (2_320_000_000, 2_330_000_000)
+        assert 2_280_000_000 <= burned.fee <= 2_330_000_000
         assert 1000 <= burned.fee / required <= 1005
-        assert 229 <= len(burned.tx.serialize()) <= 230
+        assert 225 <= len(burned.tx.serialize()) <= 230
 
     def test_the_multiple_in_the_message_is_not_truncated_to_the_ceiling(self) -> None:
         """``fee_rate // floor`` made 100_001 report "is 10x ... above the 10x ceiling" —
