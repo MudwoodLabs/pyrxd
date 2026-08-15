@@ -5,19 +5,33 @@ implementation lived as private helpers. Nothing under ``cli/`` is importable as
 SDK surface, so every non-CLI caller re-implemented the path by hand —
 ``examples/ft_transfer_demo.py`` ran to 399 lines doing exactly that.
 
-**Why this is an extraction and not a fresh facade.** The obvious-looking way to
-build a transfer facade is over :class:`~pyrxd.glyph.builder.FtTransferParams` /
-:meth:`~pyrxd.glyph.builder.GlyphBuilder.build_ft_transfer_tx`. That is wrong, and
-wrong in a fund-losing direction: the transfer builder sizes its recipient output
-from the *inputs' RXD* rather than from the amount asked for, and on Radiant an FT's
-quantity **is** its output value, so it delivers the wrong number of units. Measured
-on a real holding — one 50,000,000-unit UTXO, ``amount=250`` — it produced a
-46,739,454-unit output to the recipient and kept 546.
+**Why this routes through the airdrop builder.** These functions build through
+:meth:`~pyrxd.glyph.builder.GlyphBuilder.build_ft_airdrop_tx` with a single
+recipient rather than through
+:meth:`~pyrxd.glyph.builder.GlyphBuilder.build_ft_transfer_tx`, because that is the
+shape the CLI had settled on and an extraction should carry decisions across, not
+re-litigate them.
 
-The CLI worked around that by building through the *airdrop* builder with a single
-recipient, which sizes each output from the units requested and pays the fee from a
-separate plain-RXD input. This module preserves that decision rather than
-rediscovering the bug.
+**Corrected 2026-08-15.** This paragraph used to justify the choice by saying the
+transfer builder "sizes its recipient output from the inputs' RXD rather than from
+the amount asked for", and quoted a measured 46,739,454-unit output for a 250-unit
+request. That WAS true, and it is exactly the kind of fund-losing defect worth
+routing around — but it was fixed in #393 (``3f4bce8``), before this module existed.
+The number is the historical figure recorded in
+:meth:`~pyrxd.glyph.ft.FtUtxoSet.build_transfer_tx`'s own warning, not a fresh
+observation, and writing it in the present tense implied a live hazard that is not
+there.
+
+What is true today: ``build_transfer_tx`` *is* the airdrop builder — it calls
+``build_airdrop_tx`` with one recipient and returns the result (``glyph/ft.py``).
+So the two paths are equivalent, and this module's choice is a matter of using the
+underlying builder directly rather than a fund-safety necessity. The reason to leave
+it alone is that ft.py's warning docstring asks the next reader not to "simplify"
+that sizing back, and a second caller of the wrapper is one more place to have to
+check.
+
+The FT hazard is therefore historical. The **NFT** hazard documented further down is
+current and measured — see the comment above :func:`build_nft_transfer`.
 
 **Build, don't broadcast.** Every entry point here returns a signed transaction and
 stops. The CLI shows the user a summary and asks before broadcasting; a facade
@@ -398,11 +412,26 @@ def assert_change_survived(
 # unusable for exactly the tokens it exists to move, and the only working path
 # lived under `cli/`, which nothing can import.
 #
-# This is the FT lesson again (see the module docstring): the importable builder
-# was wrong for the real case and the CLI had quietly routed around it. Extract
-# the working path rather than rebuild on the broken one. `build_nft_transfer_tx`
-# is left exactly as it is — correct for a carrier that holds enough RXD to pay
-# its own way, and reachable for callers who want that.
+# Measured on 2026-08-15 at Radiant's relay floor (10,000 photons/byte), which is
+# what makes this a live limitation rather than an inherited claim:
+#
+#     NFT carrying       546 photons -> REFUSED
+#     NFT carrying     1,000 photons -> REFUSED
+#     NFT carrying    10,000 photons -> REFUSED
+#     NFT carrying 1,000,000 photons -> REFUSED
+#     NFT carrying 3,000,000 photons -> built, fee 2,330,000, singleton left 670,000
+#
+# The cutoff is the fee plus the floor, ~2,330,546 photons. Above it the builder
+# works but erodes the carrier by the fee on every hop, so a singleton funded to
+# survive one transfer may not survive two.
+#
+# Note the FT half of this module documents a hazard that is HISTORICAL (fixed in
+# #393). This one is not: `TestWhyTheSelfFundedBuilderIsNotUsed` in
+# tests/test_glyph_nft_transfer.py re-measures the table above, so if the builder
+# ever grows a funding parameter this comment fails rather than rots.
+#
+# `build_nft_transfer_tx` is left exactly as it is — correct for a carrier that
+# holds enough RXD to pay its own way, and reachable for callers who want that.
 
 
 @dataclass(frozen=True)

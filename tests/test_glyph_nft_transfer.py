@@ -4,9 +4,14 @@ This path was reachable only through ``cli/glyph_cmds.py`` until it was extracte
 nothing outside the CLI could move an NFT at all. The importable builder that *looks*
 like the way to do it, :meth:`~pyrxd.glyph.builder.GlyphBuilder.build_nft_transfer_tx`,
 spends the singleton alone and takes the fee out of its own value — which refuses
-outright on a dust-valued NFT, i.e. on essentially every NFT. That is the same shape as
-the FT defect recorded in :mod:`pyrxd.glyph.transfer`'s docstring: the importable
-builder is wrong for the real case, and the CLI had quietly routed around it.
+outright on a dust-valued NFT, i.e. on essentially every NFT.
+
+``TestWhyTheSelfFundedBuilderIsNotUsed`` measures that rather than asserting it. The
+distinction matters here: the FT side of :mod:`pyrxd.glyph.transfer` carried a
+similar-sounding claim that turned out to describe a defect **already fixed** in #393,
+quoted in the present tense from another module's history note. This file exists so
+the NFT claim cannot decay the same way — if the builder ever learns to take funding,
+these tests fail and the comments get rewritten.
 
 Every refusal case below is paired with an honest case that must still pass. Radiant
 has neither RBF nor CPFP, so a build refused late costs an aborted send, but a build
