@@ -19,21 +19,25 @@ FEE_RATE = 10_000
 SIZE_BYTES = 300
 
 
-class _StubTx:
-    """Only ``serialize()`` is used by the guard — its length is what matters.
+INPUTS = 2
 
-    Returns **bytes**, because that is what
+
+class _StubTx:
+    """``serialize()`` and ``inputs`` are what the guard reads.
+
+    ``serialize()`` returns **bytes**, because that is what
     :meth:`pyrxd.transaction.transaction.Transaction.serialize` returns. It used to
     return a hex string, and that single wrong character of contract hid a shipped
     fund-safety bug: the guard divided the length by two, so the stub and the guard
     agreed with each other while both disagreed with the real ``Transaction``, and
     every honest transfer at a realistic fee rate was refused.
-    ``test_the_guard_agrees_with_a_real_transaction`` below is the seam that would
-    have caught it, and is the reason this stub cannot drift again.
+    ``TestTheGuardAgreesWithARealTransaction`` below is the seam that would have
+    caught it, and is the reason this stub cannot drift again.
     """
 
-    def __init__(self, size_bytes: int) -> None:
+    def __init__(self, size_bytes: int, n_inputs: int = INPUTS) -> None:
         self._raw = b"\x00" * size_bytes
+        self.inputs = [object()] * n_inputs
 
     def serialize(self) -> bytes:
         return self._raw
@@ -41,6 +45,18 @@ class _StubTx:
 
 def _exact_fee(size_bytes: int = SIZE_BYTES) -> int:
     return size_bytes * FEE_RATE
+
+
+def _allowance(n_inputs: int = INPUTS) -> int:
+    """What the guard tolerates: the builders' own sizing slack, then dust.
+
+    Derived here from the same constants rather than hardcoded, so a change to
+    ``SIG_SIZE_SLACK_BYTES`` moves the tests with the code instead of silently
+    loosening them.
+    """
+    from pyrxd.fee_sizing import SIG_SIZE_SLACK_BYTES
+
+    return (2 * SIG_SIZE_SLACK_BYTES) * n_inputs * FEE_RATE + DUST_THRESHOLD_PHOTONS
 
 
 class TestChangeSurvivedGuard:
@@ -57,21 +73,63 @@ class TestChangeSurvivedGuard:
         excess = DUST_THRESHOLD_PHOTONS - 1
         assert_change_survived(_exact_fee() + excess, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
-    def test_dust_sized_burn_refused(self) -> None:
-        """At the dust threshold the remainder could have been a real output."""
-        with pytest.raises(ValidationError, match="paid to the miner"):
+    def test_the_builders_own_sizing_slack_passes(self) -> None:
+        """THE case that made this guard refuse 100% of honest builds.
+
+        Every builder fees a TRIAL signing pass plus ``SIG_SIZE_SLACK_BYTES`` per
+        input, deliberately, so a longer final signature cannot leave the transaction
+        underpaid. That overshoot is bytes x rate — 60,000 photons on two inputs at
+        the floor rate — while the dust threshold is 546. Measured over 300 real
+        single-recipient FT transfers the overshoot ran 4-9 bytes and every one was
+        refused before this allowance existed.
+        """
+        from pyrxd.fee_sizing import SIG_SIZE_SLACK_BYTES
+
+        designed_in = SIG_SIZE_SLACK_BYTES * INPUTS * FEE_RATE
+        assert_change_survived(_exact_fee() + designed_in, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+
+    def test_the_worst_measured_overshoot_passes(self) -> None:
+        """9 bytes on two inputs was the worst of 300; the allowance is 12."""
+        assert_change_survived(_exact_fee() + 9 * FEE_RATE, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+
+    def test_one_photon_past_the_allowance_is_refused(self) -> None:
+        """The boundary, stated exactly rather than left to a magic number."""
+        with pytest.raises(ValidationError, match="exceeds what this transaction's size demands"):
             assert_change_survived(
-                _exact_fee() + DUST_THRESHOLD_PHOTONS,
+                _exact_fee() + _allowance() + 1,
                 _StubTx(SIZE_BYTES),
                 fee_rate=FEE_RATE,
             )
 
+    def test_exactly_at_the_allowance_passes(self) -> None:
+        """The paired honest side of the boundary above."""
+        assert_change_survived(_exact_fee() + _allowance(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+
     def test_large_burn_refused_and_reports_the_amount(self) -> None:
-        """The measured failure mode: a whole change output silently to the miner."""
-        burn = 23_100_000_000  # the 23.1 RXD overpay measured on a 229-byte transfer
+        """The failure mode worth refusing: a fee wildly past what the size demands.
+
+        23.1 RXD is 2,310,000 bytes' worth at the floor rate, against an allowance of
+        12 — so widening the tolerance for sizing slack costs nothing here.
+        """
+        burn = 23_100_000_000
         with pytest.raises(ValidationError) as exc:
             assert_change_survived(_exact_fee() + burn, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
         assert f"{burn:,}" in str(exc.value)
+
+    def test_the_allowance_scales_with_the_input_count(self) -> None:
+        """Slack is per input, so a one-input build must NOT get a two-input tolerance."""
+        two_input_slack = _allowance(2)
+        with pytest.raises(ValidationError):
+            assert_change_survived(
+                _exact_fee() + two_input_slack,
+                _StubTx(SIZE_BYTES, n_inputs=1),
+                fee_rate=FEE_RATE,
+            )
+        assert_change_survived(
+            _exact_fee() + _allowance(1),
+            _StubTx(SIZE_BYTES, n_inputs=1),
+            fee_rate=FEE_RATE,
+        )
 
     def test_allow_overpay_is_the_way_through(self) -> None:
         """Radiant has no RBF/CPFP, so a refusal with no override is its own hazard."""
@@ -142,8 +200,44 @@ class TestTheGuardAgreesWithARealTransaction:
         rate = relay_floor_photons_per_byte()
         tx = self._real_tx()
         honest_fee = len(tx.serialize()) * rate
-        with pytest.raises(ValidationError, match="paid to the miner"):
-            assert_change_survived(honest_fee + DUST_THRESHOLD_PHOTONS, tx, fee_rate=rate)
+        with pytest.raises(ValidationError, match="exceeds what this transaction's size demands"):
+            assert_change_survived(honest_fee + 23_100_000_000, tx, fee_rate=rate)
+
+    def test_a_real_build_from_the_real_builder_is_accepted(self) -> None:
+        """The end of the chain, and what a stub can never show.
+
+        A synthetic ``fee == size * rate`` is not what a builder produces: it fees a
+        trial pass plus per-input slack, so the real fee always sits a few bytes above
+        the final size. This drives ``build_ft_airdrop_tx`` — the builder the FT
+        transfer path actually calls — and asserts the guard accepts its output.
+        Before the allowance existed, 300 of 300 such builds were refused.
+        """
+        from pyrxd.fee_sizing import relay_floor_photons_per_byte
+        from pyrxd.glyph.builder import AirdropFunding, AirdropRecipient, FtAirdropParams, FtUtxo, GlyphBuilder
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.keys import PrivateKey
+        from pyrxd.security.types import Hex20
+
+        rate = relay_floor_photons_per_byte()
+        key, ref = PrivateKey(), GlyphRef(txid="aa" * 32, vout=0)
+        ftu = FtUtxo.from_output(
+            txid="bb" * 32,
+            vout=0,
+            value=50_000_000,
+            ft_script=build_ft_locking_script(Hex20(key.public_key().hash160()), ref),
+        )
+        result = GlyphBuilder().build_ft_airdrop_tx(
+            FtAirdropParams(
+                ref=ref,
+                utxos=[ftu],
+                recipients=[AirdropRecipient(pkh=Hex20(PrivateKey().public_key().hash160()), amount=250)],
+                private_key=key,
+                funding=[AirdropFunding(txid="cc" * 32, vout=0, value=500_000_000, private_key=PrivateKey())],
+                fee_rate=rate,
+            )
+        )
+        assert_change_survived(result.fee, result.tx, fee_rate=rate)
 
 
 class TestGlyphClientStoreIsOptional:
