@@ -388,6 +388,42 @@ class TestProtocolGuards:
         with pytest.raises(ValidationError, match="prepare_dmint_deploy"):
             await minter.commit_ft(metadata, supply=1_000_000)
 
+    async def test_the_mut_refusal_names_the_seed_output_the_caller_must_add(self):
+        """A refusal that sends the caller somewhere they will lose funds is not help.
+
+        "Use ``prepare_mutable_reveal`` directly" is true and, on its own, dangerous:
+        that reveal takes a SECOND input at ``commit_vout + 1``, so the commit has to
+        carry an ordinary output there. A caller who follows the old advice against
+        this module's commit shape finds vout 1 is the CHANGE output, which
+        ``Transaction.fee()`` removes when it cannot fund it — and the commit is a
+        hashlock with no owner-only spend path, so a commit broadcast without its seed
+        is unspendable forever.
+        """
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore())
+        metadata = GlyphMetadata(protocol=[GlyphProtocol.NFT, GlyphProtocol.MUT], name="m")
+        with pytest.raises(ValidationError) as exc:
+            await minter.commit_nft(metadata)
+        message = str(exc.value)
+        assert "commit_vout + 1" in message, "the refusal must name the seed output"
+        assert "hashlock" in message, "the refusal must say what stranding costs"
+        assert "nftAuthScript" in message, "the refusal must disclose that pyrxd cannot yet mutate it"
+
+    async def test_the_dmint_refusal_does_not_read_as_a_workaround(self):
+        """DMINT is not in the same position as MUT/WAVE and should not sound like it.
+
+        ``prepare_dmint_deploy`` is a complete, consensus-proven path — proven end to
+        end against a node in ``tests/test_dmint_premine_regtest_e2e.py``. Calling it
+        directly is the supported way to deploy, so the refusal points at a door rather
+        than apologising for a wall.
+        """
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore())
+        metadata = GlyphMetadata(protocol=[GlyphProtocol.FT, GlyphProtocol.DMINT], name="x")
+        with pytest.raises(ValidationError) as exc:
+            await minter.commit_ft(metadata, supply=1_000_000)
+        message = str(exc.value)
+        assert "num_contracts" in message, "say what shape the reveal actually is"
+        assert "not a workaround" in message
+
     async def test_commit_nft_requires_the_nft_tag(self):
         minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore())
         with pytest.raises(ValidationError, match="requires GlyphProtocol.NFT"):
