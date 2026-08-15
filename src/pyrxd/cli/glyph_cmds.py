@@ -967,7 +967,7 @@ async def _transfer_ft_inner(
         ) from exc
 
     transfer_result = build
-    raw_hex = build.serialize()
+    raw = build.serialize()  # bytes, not hex — `broadcast` takes bytes
 
     _confirm_or_abort(
         ctx,
@@ -984,7 +984,7 @@ async def _transfer_ft_inner(
             ),
         ],
     )
-    txid = await client.broadcast(raw_hex)
+    txid = await client.broadcast(raw)
     return {"txid": str(txid), "ref": f"{ref.txid}:{ref.vout}", "amount": amount, "to": to_address}
 
 

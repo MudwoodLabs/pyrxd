@@ -79,8 +79,16 @@ class FtTransferBuild:
     amount: int
     to_pkh: Hex20
 
-    def serialize(self) -> str:
-        """Raw transaction hex, ready for ``await client.broadcast(...)``."""
+    def serialize(self) -> bytes:
+        """Raw transaction BYTES, ready for ``await client.broadcast(...)``.
+
+        Annotated ``-> str`` and documented as "hex" until 2026-08-15, which was
+        wrong on both counts: :meth:`Transaction.serialize` returns bytes and
+        :meth:`ElectrumXClient.broadcast` takes them. Runtime was always correct;
+        the contract was not, and it was the same mistaken belief that made
+        :func:`assert_change_survived` halve every size it judged. CI's mypy scope
+        is ``src/pyrxd/security/`` only, so nothing checked this annotation.
+        """
         return self.tx.serialize()
 
 
