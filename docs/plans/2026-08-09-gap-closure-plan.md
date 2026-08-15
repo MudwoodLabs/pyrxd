@@ -167,8 +167,45 @@ order the legs by trust, size `t_btc` deliberately, don't auto-accept from unkno
      correct behaviour, not a bug. So today `glyph init-metadata --type container-nft` hands a
      user a template that `glyph mint-nft` will (safely) refuse.
 
-     **Concrete plan.** Build the commit→reveal orchestration once, for the whole class,
-     rather than three times:
+     > **SPIKED 2026-08-15 — do not build the dispatch table. The refusal is correct.**
+     >
+     > The plan below assumed the difference is a *reveal shape*. For MUT/WAVE it is not.
+     > `prepare_mutable_reveal`'s reveal takes a **second input** at
+     > `commit_txid:(commit_vout + 1)`, so the **commit** must carry an ordinary output
+     > there — the mutable contract's ref IS that outpoint, and the covenant recomputes
+     > the token ref as `mutable_ref.vout - 1`, so the two refs can never be the same
+     > (verified in `builder.py:706-750`, with the consensus rejection recorded against a
+     > v3.1.1 node). `GlyphMinter`'s commit emits `[commit_output, change]`, and
+     > `Transaction.fee()` drops a change output it cannot fund — so the seed would be
+     > *sometimes* present. The commit is a hashlock with no owner-only spend path, so the
+     > times it is absent strand the commit and its value permanently.
+     >
+     > Worse, there is no exit: pyrxd has **no builder for the `nftAuthScript` shape** a
+     > later `mod`/`sl` operation needs (only reference in the tree is the docstring note
+     > at `builder.py:752`; the working transaction exists as hand-spelled bytes in
+     > `tests/test_mut_wave_regtest_e2e.py`). Minting a mutable token that pyrxd cannot
+     > then mutate is a one-way door — the facade would be shipping the feature's name
+     > without the feature.
+     >
+     > WAVE is separately parked on a consumer
+     > (`docs/solutions/design-decisions/wave-protocol-deferred-until-consumer.md`).
+     >
+     > **DMINT is not in the same position.** `prepare_dmint_deploy` is complete and
+     > consensus-proven — re-proven end to end on 2026-08-15 (V1 and V2, real PoW, at
+     > mainnet's relay floor, `tests/test_dmint_premine_regtest_e2e.py`). Folding it into
+     > the facade would be convenience, not capability, and it drives both phases itself.
+     >
+     > **What was done instead:** the refusal now states, per protocol, what the caller
+     > must actually do — MUT/WAVE name the seed output, what stranding costs, and the
+     > missing mutate builder; DMINT points at a supported path rather than apologising
+     > for a wall. Two tests pin that guidance so it cannot flatten back into a shrug.
+     >
+     > **Un-parks when:** a builder for the `nftAuthScript` shape exists (so a minted MUT
+     > can be mutated), AND the commit builder can guarantee a non-change seed output at
+     > `commit_vout + 1`. Until both hold, the refusal is the fund-safe answer.
+
+     **Concrete plan (SUPERSEDED — see the spike box above).** Build the commit→reveal
+     orchestration once, for the whole class, rather than three times:
      - Extend `GlyphMinter` with a reveal-shape strategy so `_UNSUPPORTED_PROTOCOLS` becomes a
        dispatch table rather than a refusal list. `prepare_dmint_deploy` already proves the
        facade can carry a non-trivial shape — it just does so through a separate path.
@@ -183,9 +220,27 @@ order the legs by trust, size `t_btc` deliberately, don't auto-accept from unkno
        a transfer of the container.
      The membership/read half is the unknown, and it is the reason this was not rushed in
      alongside the other two. **ESTIMATED: M, unspiked — treat as an ordering hint only.**
-- **B3. External-miner progress frames** — extend the JSON-over-stdio protocol so third-party
-  miners can report live progress. Additive; the bundled miner already streams. Must preserve the
-  "stderr discarded to bound memory" defence. **ESTIMATED: S.**
+- **B3. External-miner progress frames** — ~~extend the JSON-over-stdio protocol so third-party
+  miners can report live progress~~ — **ALREADY SHIPPED (verified 2026-08-15).** Added after
+  0.13.0, which is why this plan (written at 0.13.0) still lists it.
+
+  Everything the item asked for is present and tested:
+  `MineProgress` + `parse_progress_line` in `contrib/miner/protocol.py`,
+  `_ExternalMinerProgressReader` draining stderr under a bounded line/byte cap in
+  `glyph/dmint/miner.py`, and the bundled miner emitting frames via `_make_progress_reporter`
+  in `contrib/miner/cli.py`.
+
+  The constraints were met, not worked around. Frames go to **stderr**, so stdout still carries
+  exactly one authoritative response line and every pre-existing consumer is unaffected; the
+  version stays `protocol=1` because the change is purely out-of-band; silence from an old miner
+  is valid; and `parse_progress_line` fails **soft** (returns `None`) so a malformed or hostile
+  progress line cannot abort a successful grind. The "stderr discarded to bound memory" defence
+  survives as a bounded reader rather than a discard.
+
+  Verified by running them, not by reading: 25 tests in
+  `tests/contrib/test_miner_external_{integration,progress}.py`, including
+  `test_real_miner_streams_progress_frames_before_timing_out`, which spawns a real
+  `python -m pyrxd.contrib.miner` subprocess and asserts frames arrive from it.
 
 ---
 
