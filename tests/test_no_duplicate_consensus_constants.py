@@ -73,6 +73,7 @@ premise that makes identity meaningful is asserted too, not assumed.
 from __future__ import annotations
 
 import ast
+import functools
 import re
 from pathlib import Path
 
@@ -129,6 +130,63 @@ _TEST_ALLOWLIST = {
 
 def _python_files(root: Path):
     return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+
+
+# ── source-segment extraction, without the quadratic stdlib path ──────────────
+#
+# These guards ask "how was this literal WRITTEN?" (0xd2 vs 210), which needs the
+# source text behind an AST node. The obvious tool, ``ast.get_source_segment``,
+# re-splits the WHOLE file on every call. Python 3.12 added a ``maxlines`` bound
+# to its internal splitter so it stops at the node's own line; 3.10 and 3.11 have
+# no such bound, so cost scales with file size per node rather than per line.
+#
+# Measured over this repo's 198 source files / 11,030 int constants:
+#
+#     ast.get_source_segment   3.12  6.8s   3.11  46.7s   3.10  71.3s
+#     pre-split + slice        3.12  0.1s   3.11   0.1s   3.10   0.1s
+#
+# That single function was the whole of CI's version gap: `test (3.10)` and
+# `test (3.11)` ran 33-39 minutes against `test (3.12)`'s 8, on identical tests.
+# ``TestSourceSegmentMatchesTheStdlib`` pins the equivalence, including the
+# line-ending and multi-byte cases the hand-rolled splitter has to get right.
+
+#: The parser's line rule, which is NOT ``str.splitlines()``: only ``\r``, ``\n``
+#: and ``\r\n`` end a line. ``str.splitlines`` also breaks on form feed, vertical
+#: tab and U+2028, which would shift every subsequent line number.
+_LINE_END = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+\Z")
+
+
+@functools.cache
+def _utf8_lines(source: str) -> tuple[bytes, ...]:
+    """*source* split into lines, each UTF-8 encoded, computed once per file.
+
+    Encoded because ``col_offset`` is a **byte** offset into the line, not a
+    character offset — the stdlib does the same ``.encode()[a:b].decode()`` dance
+    for exactly this reason, and a non-ASCII line would slice wrongly without it.
+    """
+    return tuple(m[0].encode() for m in _LINE_END.finditer(source))
+
+
+def _source_segment(source: str, node: ast.AST) -> str | None:
+    """Drop-in for :func:`ast.get_source_segment` (no ``padded`` support).
+
+    Single-line nodes — every literal these guards inspect — are served from the
+    cached split. Multi-line nodes fall through to the stdlib: they are rare
+    enough not to matter, and deferring keeps the exact semantics for the harder
+    case rather than reimplementing it.
+    """
+    try:
+        if node.end_lineno is None or node.end_col_offset is None:  # type: ignore[attr-defined]
+            return None
+        lineno = node.lineno - 1  # type: ignore[attr-defined]
+        end_lineno = node.end_lineno - 1  # type: ignore[attr-defined]
+        col_offset = node.col_offset  # type: ignore[attr-defined]
+        end_col_offset = node.end_col_offset  # type: ignore[attr-defined]
+    except AttributeError:
+        return None
+    if end_lineno != lineno:
+        return ast.get_source_segment(source, node)
+    return _utf8_lines(source)[lineno][col_offset:end_col_offset].decode()
 
 
 def _strip_comments_and_docstrings(text: str) -> str:
@@ -285,7 +343,7 @@ def respelled_centralised_value(source: str) -> list[str]:
         name = _GUARDED_VALUES.get(node.value)
         if name is None:
             continue
-        segment = ast.get_source_segment(source, node)
+        segment = _source_segment(source, node)
         if segment is None or not _DECIMAL_INT.fullmatch(segment.strip()):
             continue
         offenders.append(f"line {node.lineno}: {segment.strip()} is {name}")
@@ -394,7 +452,7 @@ def _is_hex_byte_literal(node: ast.AST, source: str) -> bool:
     """Is ``node`` an int constant WRITTEN as a ``0xdN`` byte?"""
     if not isinstance(node, ast.Constant) or not isinstance(node.value, int) or isinstance(node.value, bool):
         return False
-    segment = ast.get_source_segment(source, node)
+    segment = _source_segment(source, node)
     return bool(segment and _REF_OPCODE_BYTE.match(segment.strip()))
 
 
@@ -407,7 +465,14 @@ def _hex_ref_opcodes(node: ast.AST, source: str) -> set[int]:
     }
 
 
+@functools.cache
 def _parse(source: str):
+    """Parse once per distinct source.
+
+    These guards are parametrised (88 cases), and each case walked every one of
+    the ~198 source files, re-parsing all of them every time. The trees are only
+    ever read — never mutated — so sharing them across cases is safe.
+    """
     return ast.parse(source)
 
 
@@ -644,7 +709,7 @@ def hand_spelled_ref_widths(source: str) -> list[str]:
             # Written as a plain decimal? A hex or otherwise-spelled 36 is not
             # what a hand-rolled walk looks like, and demanding the spelling is
             # how the sibling detectors avoid AST false positives.
-            segment = ast.get_source_segment(source, node)
+            segment = _source_segment(source, node)
             if not segment or segment.strip() != str(node.value):
                 continue
             line = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
@@ -818,7 +883,7 @@ def compact_size_width_tables(source: str) -> list[str]:
         """
         if not isinstance(child, ast.Constant):
             return None
-        segment = ast.get_source_segment(source, child)
+        segment = _source_segment(source, child)
         if segment is None:
             return None
         segment = segment.strip()
@@ -886,7 +951,7 @@ def _decimal_int_constant(node: ast.AST, source: str, wanted: int) -> bool:
         return False
     if node.value != wanted:
         return False
-    segment = ast.get_source_segment(source, node)
+    segment = _source_segment(source, node)
     return bool(segment and _DECIMAL_INT.fullmatch(segment.strip()))
 
 
@@ -981,7 +1046,7 @@ def respelled_non_final_sequence(source: str) -> list[str]:
     """
     tree = _parse(source)
     return [
-        f"line {node.lineno}: {ast.get_source_segment(source, node) or node.value} is SEQUENCE_LOCKTIME_ENABLED"
+        f"line {node.lineno}: {_source_segment(source, node) or node.value} is SEQUENCE_LOCKTIME_ENABLED"
         for node in ast.walk(tree)
         if isinstance(node, ast.Constant)
         and not isinstance(node.value, bool)
@@ -1009,7 +1074,7 @@ def respelled_money_supply_cap(source: str) -> list[str]:
     caps = {BTC_MAX_SATS: "BTC_MAX_SATS", RADIANT_MAX_PHOTONS: "RADIANT_MAX_PHOTONS"}
     tree = _parse(source)
     return [
-        f"line {node.lineno}: {ast.get_source_segment(source, node)} is {caps[node.value]}"
+        f"line {node.lineno}: {_source_segment(source, node)} is {caps[node.value]}"
         for node in ast.walk(tree)
         if isinstance(node, ast.Constant)
         and not isinstance(node.value, bool)
@@ -1768,3 +1833,70 @@ def test_guarded_constants_have_expected_shape():
     assert PUSH_REF_OPCODES < REF_OPERAND_OPCODES
     assert REF_OPERAND_WIDTH == 36
     assert all(isinstance(o, int) for o in REF_OPERAND_OPCODES)
+
+
+class TestSourceSegmentMatchesTheStdlib:
+    """``_source_segment`` must agree with :func:`ast.get_source_segment`, always.
+
+    It exists only to be faster (the stdlib re-splits the whole file per node,
+    unboundedly so before Python 3.12). Faster is worthless if it answers
+    differently: every guard in this module decides whether a constant was
+    *written* as hex or decimal from that string, so a wrong slice silently
+    turns a real offence into a pass.
+
+    The cases below are the ones a hand-rolled line splitter gets wrong. Line
+    endings matter because ``str.splitlines()`` breaks on more characters than
+    the parser does — a form feed or U+2028 counted as a line end shifts every
+    subsequent line number and slices the wrong text.
+    """
+
+    SOURCES = {
+        "lf": "a = 0xd2\nb = 210\n",
+        "crlf": "a = 0xd2\r\nb = 210\r\n",
+        "cr_only": "a = 0xd2\rb = 210\r",
+        "no_trailing_newline": "a = 0xd2\nb = 210",
+        # \f and \v end a line for str.splitlines(), but NOT for the parser.
+        "form_feed": "a = 0xd2\n\x0cb = 210\n",
+        "vertical_tab_in_string": 'a = "\\x0b"\nb = 0xd2\n',
+        # col_offset is a BYTE offset: a multi-byte character before the literal
+        # shifts it, and slicing the str instead of its UTF-8 bytes misreads.
+        "non_ascii_before": 's = "café ☕"\nb = 0xd2\n',
+        "non_ascii_same_line": 's, b = "héllo", 0xd2\n',
+        "multiline_call": "x = foo(\n    0xd2,\n    210,\n)\n",
+        "nested_multiline": "y = {\n  'a': [0xd2,\n        210],\n}\n",
+        "empty_lines": "\n\n\na = 0xd2\n",
+        "comment_then_const": "# 0xd2 in a comment\na = 0xd2\n",
+    }
+
+    @pytest.mark.parametrize("name", sorted(SOURCES))
+    def test_every_node_matches(self, name: str) -> None:
+        source = self.SOURCES[name]
+        tree = ast.parse(source)
+        checked = 0
+        for node in ast.walk(tree):
+            if not hasattr(node, "lineno"):
+                continue
+            expected = ast.get_source_segment(source, node)
+            actual = _source_segment(source, node)
+            assert actual == expected, f"{name}: node {type(node).__name__} at line {node.lineno}"
+            checked += 1
+        assert checked, f"{name} exercised no nodes — the fixture is not testing anything"
+
+    def test_it_matches_across_a_real_module(self) -> None:
+        """The synthetic cases above are edge cases; this is the ordinary one.
+
+        One real source file, every node, compared against the stdlib. Cheap
+        because it is a single file — the cost this replaces came from doing it
+        for every file on every one of the parametrised guards.
+        """
+        source = (SRC_ROOT / "constants.py").read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        nodes = [n for n in ast.walk(tree) if hasattr(n, "lineno")]
+        assert len(nodes) > 50, "expected a substantial module"
+        for node in nodes:
+            assert _source_segment(source, node) == ast.get_source_segment(source, node)
+
+    def test_a_missing_position_returns_none_like_the_stdlib(self) -> None:
+        """Nodes without position info must return ``None``, not raise."""
+        node = ast.Constant(value=1)  # no lineno/col_offset at all
+        assert _source_segment("a = 1\n", node) is None
