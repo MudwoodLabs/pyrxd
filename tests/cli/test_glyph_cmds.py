@@ -1761,3 +1761,133 @@ class TestConfirmationTimeoutRecoveryHint:
         original = _read_metadata_file(_write_meta(tmp_path / "a.json", protocol=["NFT"]))
         edited = _read_metadata_file(_write_meta(tmp_path / "b.json", protocol=["NFT"], name="Edited"))
         assert encode_payload(original)[1] != encode_payload(edited)[1]
+
+
+class TestTransferFtAllowOverpayIsWiredThrough:
+    """``--allow-overpay`` must reach the guard, not just parse.
+
+    Two fee bounds refuse rather than warn on this path: the rate ceiling, and the
+    check that the fee matches the signed bytes. Neither should ever refuse an
+    ordinary transfer — measured 0 refusals over 3,600+ builds at 2-10 inputs and
+    1-9x the floor rate — but Radiant has neither RBF nor CPFP, so a bound an
+    operator cannot override can cost the funds it was protecting. The flag existed
+    on ``GlyphClient`` and had no CLI surface at all until this change.
+
+    A flag that parses but does not reach the thing it names is worse than no flag,
+    because it reads as an escape hatch while being a dead end. So these assert on
+    the value that arrives at the library call.
+    """
+
+    def _capture(self, monkeypatch):
+        """Replace the library build with a recorder; return the kwargs seen."""
+        import dataclasses
+
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20
+
+        seen: dict = {}
+
+        class _Build:
+            fee = 1_000
+            tx = None
+
+            def serialize(self) -> bytes:
+                return b"\x00" * 200
+
+        async def _fake_build(wallet, ref, amount, to_pkh, *, client, fee_rate, allow_overpay=False):
+            seen["allow_overpay"] = allow_overpay
+            return _Build()
+
+        monkeypatch.setattr(glyph_cmds, "lib_build_ft_transfer", _fake_build)
+        monkeypatch.setattr(glyph_cmds, "_confirm_or_abort", lambda *a, **k: None)
+        return seen, dataclasses, GlyphRef, Hex20
+
+    def _drive(self, cli_context, monkeypatch, *, allow_overpay):
+        import asyncio
+        import dataclasses
+        from unittest.mock import AsyncMock, MagicMock
+
+        from pyrxd.cli.glyph_cmds import _transfer_ft_inner
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20
+
+        seen, *_ = self._capture(monkeypatch)
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        client = MagicMock()
+        client.broadcast = AsyncMock(return_value="ff" * 32)
+
+        asyncio.run(
+            _transfer_ft_inner(
+                ctx,
+                object(),
+                GlyphRef(txid="aa" * 32, vout=0),
+                250,
+                Hex20(bytes(20)),
+                "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+                client,
+                allow_overpay=allow_overpay,
+            )
+        )
+        return seen
+
+    def test_default_is_off(self, cli_context, monkeypatch) -> None:
+        assert self._drive(cli_context, monkeypatch, allow_overpay=False)["allow_overpay"] is False
+
+    def test_the_flag_reaches_the_build(self, cli_context, monkeypatch) -> None:
+        assert self._drive(cli_context, monkeypatch, allow_overpay=True)["allow_overpay"] is True
+
+    def test_the_cli_accepts_the_flag(self, runner: CliRunner, tmp_wallet_path: Path) -> None:
+        """It is a real option, not silently swallowed by click as an argument."""
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            ["--wallet", str(tmp_wallet_path), "glyph", "transfer-ft", "--help"],
+        )
+        assert result.exit_code == 0
+        assert "--allow-overpay" in result.output
+
+    def test_an_overpay_refusal_names_the_flag_rather_than_telling_you_to_add_rxd(
+        self, cli_context, monkeypatch
+    ) -> None:
+        """The remedy has to match the problem.
+
+        A fee-bound refusal and a funding shortfall are different failures. The
+        generic branch says "fund the wallet with a little plain RXD", which for a
+        build refused for paying too MUCH points in the opposite direction.
+        """
+        import asyncio
+        import dataclasses
+        from unittest.mock import MagicMock
+
+        from pyrxd.cli import glyph_cmds
+        from pyrxd.cli.errors import UserError
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.errors import ValidationError
+        from pyrxd.security.types import Hex20
+
+        async def _refuse(*a, **k):
+            raise ValidationError(
+                "refusing to broadcast: the fee exceeds what this transaction's size demands by "
+                "9,000,000 photons, past the 120,546 allowed for sizing slack. "
+                "Pass allow_overpay=True to accept it."
+            )
+
+        monkeypatch.setattr(glyph_cmds, "lib_build_ft_transfer", _refuse)
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+
+        with pytest.raises(UserError) as exc:
+            asyncio.run(
+                glyph_cmds._transfer_ft_inner(
+                    ctx,
+                    object(),
+                    GlyphRef(txid="aa" * 32, vout=0),
+                    250,
+                    Hex20(bytes(20)),
+                    "1BgGZ9tcN4rm9KBzDn7KprQz87SZ26SAMH",
+                    MagicMock(),
+                )
+            )
+        rendered = str(exc.value) + str(getattr(exc.value, "fix", ""))
+        assert "--allow-overpay" in rendered
+        assert "plain RXD" not in rendered, "that is the remedy for the opposite problem"

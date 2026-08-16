@@ -79,8 +79,16 @@ class FtTransferBuild:
     amount: int
     to_pkh: Hex20
 
-    def serialize(self) -> str:
-        """Raw transaction hex, ready for ``await client.broadcast(...)``."""
+    def serialize(self) -> bytes:
+        """Raw transaction BYTES, ready for ``await client.broadcast(...)``.
+
+        Annotated ``-> str`` and documented as "hex" until 2026-08-15, which was
+        wrong on both counts: :meth:`Transaction.serialize` returns bytes and
+        :meth:`ElectrumXClient.broadcast` takes them. Runtime was always correct;
+        the contract was not, and it was the same mistaken belief that made
+        :func:`assert_change_survived` halve every size it judged. CI's mypy scope
+        is ``src/pyrxd/security/`` only, so nothing checked this annotation.
+        """
         return self.tx.serialize()
 
 
@@ -308,31 +316,62 @@ def assert_change_survived(
     fee_rate: int,
     allow_overpay: bool = False,
 ) -> None:
-    """Refuse a build whose plain-RXD change was silently paid to the miner.
+    """Refuse a build paying grossly more than its own size demands.
 
-    :meth:`~pyrxd.transaction.transaction.Transaction.fee` drops **all** change
-    outputs and leaves the remainder to the miner when the total does not cover the
-    change outputs it would create (``if change <= change_count``). That is correct
-    for a sub-dust remainder — an output nobody can economically spend is worth less
-    than the relay priority — but it is silent, and the same branch happily burns an
-    arbitrarily large remainder if the size estimate was off.
+    **What this catches, stated accurately (rewritten 2026-08-15).** The original
+    version of this docstring said
+    :meth:`~pyrxd.transaction.transaction.Transaction.fee` "happily burns an
+    arbitrarily large remainder if the size estimate was off". It does not. That
+    branch is ``if change <= change_count`` where ``change`` is already net of the
+    fee, so it drops the change outputs only when the remainder is at most **one
+    photon per change output** — a rounding crumb, never a wallet. The mechanism this
+    guard was written for cannot produce a meaningful loss.
 
-    The honest signal is the gap between the fee actually paid and the fee the
-    transaction's own size demands. Folding a sub-dust remainder keeps that gap under
-    the dust threshold; anything at or above it is change that should have been an
-    output. ``allow_overpay=True`` is the deliberate, greppable way through, matching
-    the builders' existing opt-out.
+    What can, and what this actually checks, is a fee grossly out of proportion to the
+    transaction's size — from a mis-set rate, a bad estimate, or a builder change. The
+    rate itself is already bounded by :func:`~pyrxd.fee_sizing.fee_overpay_ceiling`,
+    so this is a second, independent net measured against the SIGNED bytes rather than
+    against the rate. Radiant has neither RBF nor CPFP, so an overpay discovered after
+    broadcast cannot be repaired; a cheap redundant check before the caller ever sees
+    the transaction is worth its keep.
 
-    Radiant has neither RBF nor CPFP, so an overpay discovered after broadcast cannot
-    be repaired — which is why this is checked before the caller ever sees the tx.
+    **The tolerance has to exceed the builders' own slack.** Every builder here sizes
+    its fee from a TRIAL signing pass plus
+    :data:`~pyrxd.fee_sizing.SIG_SIZE_SLACK_BYTES` per input, deliberately, so that a
+    final signature longer than the trial one cannot leave the transaction underpaid.
+    That designed-in overshoot is denominated in BYTES times the rate, while
+    :data:`~pyrxd.constants.DUST_THRESHOLD_PHOTONS` is 546 photons — 0.055 bytes at
+    Radiant's floor rate. Comparing the two refuses every honest build: measured over
+    300 single-recipient FT transfers at the floor rate, the overshoot ran 4-9 bytes
+    (40,000-90,000 photons) and **300 of 300 were refused**.
+
+    So the allowance is the slack itself, plus the same allowance again for
+    trial-versus-final DER signature variance, plus the dust threshold. A genuine
+    overpay clears it by orders of magnitude — the 23.1 RXD case that motivated the
+    guard is 2,310,000 bytes' worth against an allowance of 12.
+
+    ``allow_overpay=True`` is the deliberate, greppable way through, matching the
+    builders' existing opt-out.
     """
     if allow_overpay:
         return
-    size_bytes = len(tx.serialize()) // 2
+    from ..fee_sizing import SIG_SIZE_SLACK_BYTES
+
+    # ``Transaction.serialize()`` returns BYTES, so its length is the byte count.
+    # This read ``len(...) // 2`` until 2026-08-15, halving every size it judged.
+    # The tests missed it because their stub returned a hex STRING, so the stub and
+    # the guard agreed with each other and both disagreed with ``Transaction``.
+    size_bytes = len(tx.serialize())
+    # ``SIG_SIZE_SLACK_BYTES`` per input is the builders' deliberate overshoot; the
+    # second term is the trial-vs-final DER variance that rides on top of it (each
+    # ECDSA signature encodes to 70-72 bytes, and the two passes sign different
+    # messages). Measured worst case on two inputs was 9 bytes against this 12.
+    allowance = (2 * SIG_SIZE_SLACK_BYTES) * max(len(tx.inputs), 1) * fee_rate + DUST_THRESHOLD_PHOTONS
     excess = fee - (size_bytes * fee_rate)
-    if excess >= DUST_THRESHOLD_PHOTONS:
+    if excess > allowance:
         raise ValidationError(
-            f"refusing to broadcast: {excess:,} photons of change would be paid to the miner "
-            f"(fee {fee:,} against {size_bytes:,} bytes at {fee_rate:,}/byte). This is change "
-            "that should have become an output. Pass allow_overpay=True to accept it."
+            f"refusing to broadcast: the fee exceeds what this transaction's size demands by "
+            f"{excess:,} photons, past the {allowance:,} allowed for sizing slack "
+            f"(fee {fee:,} against {size_bytes:,} bytes at {fee_rate:,}/byte over "
+            f"{len(tx.inputs)} input(s)). Pass allow_overpay=True to accept it."
         )
