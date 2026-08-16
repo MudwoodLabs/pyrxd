@@ -32,12 +32,12 @@ from .mint import (
     PendingMint,
     PendingStore,
 )
-from .transfer import FtTransferBuild, build_ft_transfer
+from .transfer import FtTransferBuild, NftTransferBuild, build_ft_transfer, build_nft_transfer
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .types import GlyphMetadata, GlyphRef
 
-__all__ = ["GlyphClient", "TransferReceipt"]
+__all__ = ["GlyphClient", "NftTransferReceipt", "TransferReceipt"]
 
 
 class TransferReceipt:
@@ -58,6 +58,28 @@ class TransferReceipt:
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return f"TransferReceipt(txid={self.txid!r}, amount={self.amount}, fee={self.fee})"
+
+
+class NftTransferReceipt:
+    """What a broadcast NFT transfer actually did.
+
+    Separate from :class:`TransferReceipt` rather than reusing it with ``amount=1``:
+    an NFT is a singleton, and its output value is dust that crosses the transfer
+    unchanged, not a unit count. Reporting a quantity for it would invite exactly the
+    confusion that makes FT value handling hazardous — where the output's value *is*
+    the number of units.
+    """
+
+    __slots__ = ("fee", "ref", "to_pkh", "txid")
+
+    def __init__(self, *, txid: str, ref: GlyphRef, fee: int, to_pkh: Hex20) -> None:
+        self.txid = txid
+        self.ref = ref
+        self.fee = fee
+        self.to_pkh = to_pkh
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"NftTransferReceipt(txid={self.txid!r}, fee={self.fee})"
 
 
 class GlyphClient:
@@ -212,3 +234,35 @@ class GlyphClient:
             fee=build.fee,
             to_pkh=to_pkh,
         )
+
+    async def build_nft_transfer(self, ref: GlyphRef, to_pkh: Hex20) -> NftTransferBuild:
+        """Build and sign an NFT transfer **without broadcasting it**.
+
+        The singleton keeps its own value; the fee comes from a separate plain-RXD
+        input. See :func:`pyrxd.glyph.transfer.build_nft_transfer` for why this does
+        not go through :meth:`GlyphBuilder.build_nft_transfer_tx`.
+        """
+        return await build_nft_transfer(
+            self._wallet,
+            ref,
+            to_pkh,
+            client=self._client,
+            fee_rate=self._fee_rate,
+        )
+
+    async def transfer_nft(self, ref: GlyphRef, to_pkh: Hex20) -> NftTransferReceipt:
+        """Send the NFT singleton ``ref`` to ``to_pkh``, and broadcast.
+
+        The singleton's value crosses unchanged and the fee is paid from plain RXD.
+        There is no ``amount``: a singleton is indivisible, and the value on an NFT
+        output is dust rather than a quantity.
+
+        Raises:
+            InsufficientFundsError: this wallet does not hold the NFT, or has no
+                plain-RXD UTXO large enough to pay the fee. Raised before anything is
+                signed or sent.
+            ValidationError: the signed transaction does not pay for its own size.
+        """
+        build = await self.build_nft_transfer(ref, to_pkh)
+        txid = await self._client.broadcast(build.serialize())
+        return NftTransferReceipt(txid=str(txid), ref=ref, fee=build.fee, to_pkh=to_pkh)

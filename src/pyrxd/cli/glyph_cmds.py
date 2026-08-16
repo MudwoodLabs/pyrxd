@@ -44,7 +44,6 @@ import click
 
 from ..constants import DUST_THRESHOLD_PHOTONS, MAX_OP_RETURN_MSG_BYTES, Network
 from ..fee_models import SatoshisPerKilobyte
-from ..fee_sizing import assert_pays_for_its_size, required_fee
 from ..glyph.builder import (
     AirdropFunding,
     AirdropRecipient,
@@ -81,8 +80,8 @@ from ..glyph.fees import (
     measure_reveal_fee,
 )
 from ..glyph.scanner import GlyphScanner
-from ..glyph.script import build_nft_locking_script, extract_ref_from_nft_script
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
+from ..glyph.transfer import build_nft_transfer as lib_build_nft_transfer
 from ..glyph.transfer import find_plain_rxd_utxo as lib_find_plain_rxd_utxo
 from ..glyph.transfer import ft_funding as lib_ft_funding
 from ..glyph.transfer import select_ft_inputs as lib_select_ft_inputs
@@ -1391,42 +1390,13 @@ async def _find_plain_rxd_utxo(
     return await lib_find_plain_rxd_utxo(triples, client, exclude=exclude, needed=needed)
 
 
-#: Modelled bytes of the ``transfer-nft`` transaction WITHOUT its change output and
-#: WITHOUT the NFT locking script (whose exact length is known at build time and is
-#: added by :func:`_nft_transfer_funding_bar`).
-#:
-#: ``4`` version + ``1`` input count + 2 x (``36`` outpoint + ``1`` script varint +
-#: ``107`` unlocking script + ``4`` sequence) + ``1`` output count + ``8`` value +
-#: ``1`` script varint + ``4`` locktime = **315**.
-#:
-#: ``107`` is :meth:`P2PKH.unlock`'s ``estimated_unlocking_byte_length``, and on this
-#: template it is an UPPER bound rather than an estimate: the real script is
-#: ``push(DER 69-71 B + sighash byte) + push(33-byte pubkey)`` = 105-107 bytes. So this
-#: models the LARGEST transaction the builder can produce and a funding UTXO that clears
-#: it clears the real one. It is still only a bar for *picking* funding — the fee the
-#: transaction actually pays is proven against its final signed bytes by
-#: :func:`~pyrxd.fee_sizing.assert_pays_for_its_size` further down.
-_NFT_TRANSFER_MODELLED_BYTES = 315
-
-
-def _nft_transfer_funding_bar(new_locking: bytes, fee_rate: int) -> int:
-    """Photons a plain-RXD UTXO must hold to fund one ``transfer-nft``, at *fee_rate*.
-
-    Sized from the transaction's real shape and multiplied by the rate — the bar this
-    replaced was the flat literal ``100_000``, which never multiplied by anything and
-    so could not cover a ~377-byte transfer at *any* rate at or above Radiant's relay
-    floor (raising the rate widened the gap). Every sibling funding bar in this module
-    is size- and rate-aware; this one alone was a magic constant.
-
-    Modelled on the **no-change** shape deliberately. :meth:`Transaction.fee` drops the
-    change output entirely when the funding cannot also cover it
-    (``transaction/transaction.py``: ``if change <= change_count: ... return``), and the
-    whole funding input then becomes the fee — so the smallest UTXO that can work is the
-    one that pays for the one-output transaction, not the two-output one. Sizing the bar
-    against the larger shape would refuse funding that in fact relays perfectly well,
-    which is its own fund-safety bug.
-    """
-    return required_fee(_NFT_TRANSFER_MODELLED_BYTES + len(new_locking), fee_rate)
+#: The ``transfer-nft`` funding bar moved to :mod:`pyrxd.glyph.transfer` alongside the
+#: build it sizes — see :data:`~pyrxd.glyph.transfer.NFT_TRANSFER_MODELLED_BYTES` and
+#: :func:`~pyrxd.glyph.transfer.nft_transfer_funding_bar`. No alias is left behind on
+#: purpose: two tests monkeypatch the bar by module path to restore the old flat
+#: literal and ask a node what happens, and an alias here would let those patches
+#: bind a name the build no longer reads — a differential test that silently proves
+#: nothing is worse than one that fails to import.
 
 
 async def _transfer_nft_inner(
@@ -1437,103 +1407,46 @@ async def _transfer_nft_inner(
     to_address: str,
     client: ElectrumXClient,
 ) -> dict:
-    """Find the singleton NFT utxo and re-lock it to to_pkh."""
-    triples = await wallet.collect_spendable(client)
-    found: tuple | None = None
-    for utxo, addr, pk in triples:
-        try:
-            raw = await client.get_transaction(Txid(utxo.tx_hash))
-            tx = Transaction.from_hex(bytes(raw))
-            if tx is None or utxo.tx_pos >= len(tx.outputs):
-                continue
-            out_script = tx.outputs[utxo.tx_pos].locking_script.serialize()
-            try:
-                this_ref = extract_ref_from_nft_script(out_script)
-            except Exception:  # noqa: S112 — non-NFT scripts raise; the loop is filtering, not handling errors  # nosec B112
-                continue
-            if this_ref == ref:
-                found = (utxo, addr, pk, out_script)
-                break
-        except NetworkError:
-            continue
-    if found is None:
-        raise UserError(
-            f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
-            fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
-        )
-    utxo, addr, pk, nft_script = found
+    """Find the singleton NFT utxo and re-lock it to to_pkh.
 
-    # The NFT singleton carries only dust, so the fee must come from a separate
-    # plain-RXD funding input (else the tx pays 0 fee and the node rejects it).
-    # The new locking script is built here rather than at assembly because its length
-    # is part of the size the funding bar has to cover.
-    new_locking = build_nft_locking_script(to_pkh, ref)
-    needed = _nft_transfer_funding_bar(new_locking, ctx.fee_rate)
-    fund = await _find_plain_rxd_utxo(triples, client, exclude={(utxo.tx_hash, utxo.tx_pos)}, needed=needed)
-    if fund is None:
+    The build lives in :func:`pyrxd.glyph.transfer.build_nft_transfer` — including
+    the decision to fund the fee from a separate plain-RXD input instead of taking
+    it out of the singleton, which is what ``GlyphBuilder.build_nft_transfer_tx``
+    does and why that builder cannot move a dust-valued NFT at all. Keeping the
+    working path in one importable place is the point; a second copy is a place for
+    the bug to come back.
+
+    This function owns what the SDK deliberately does not — showing the user what is
+    about to be spent, and broadcasting only after they agree.
+    """
+    try:
+        build = await lib_build_nft_transfer(
+            wallet,
+            ref,
+            to_pkh,
+            client=client,
+            fee_rate=ctx.fee_rate,
+        )
+    except InsufficientFundsError as exc:
+        msg = str(exc)
+        if "not held by this wallet" in msg:
+            raise UserError(
+                f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
+                fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
+            ) from exc
         raise UserError(
             "no plain-RXD UTXO large enough to fund the NFT transfer fee",
-            cause=f"need at least {needed:,} photons on a single non-token UTXO "
-            f"(~{_NFT_TRANSFER_MODELLED_BYTES + len(new_locking)} B at {ctx.fee_rate:,} photons/B)",
+            cause=msg,
             fix="fund this wallet with plain RXD (the NFT itself carries only dust)",
-        )
-    fund_utxo, fund_addr, fund_key = fund
-    fund_spk = P2PKH().lock(fund_addr)
+        ) from exc
+    except (ValidationError, ValueError) as exc:
+        raise UserError(
+            "could not build the NFT transfer",
+            cause=str(exc),
+            fix="fund this wallet with a little plain RXD and retry",
+        ) from exc
 
-    # Input 0: the NFT (P2PKH-gated to the owner), re-locked to the new owner.
-    # Input 1: the fee funding. Both source shims are padded to the real vout.
-    nft_src_outs = [TransactionOutput(Script(b""), 0) for _ in range(utxo.tx_pos)]
-    nft_src_outs.append(TransactionOutput(Script(nft_script), utxo.value))
-    nft_src = Transaction(tx_inputs=[], tx_outputs=nft_src_outs)
-    nft_src.txid = lambda: utxo.tx_hash  # type: ignore[method-assign]
-    nft_input = TransactionInput(
-        source_transaction=nft_src,
-        source_txid=utxo.tx_hash,
-        source_output_index=utxo.tx_pos,
-        unlocking_script_template=P2PKH().unlock(pk),
-    )
-    nft_input.satoshis = utxo.value
-    nft_input.locking_script = Script(nft_script)
-
-    fund_src_outs = [TransactionOutput(Script(b""), 0) for _ in range(fund_utxo.tx_pos)]
-    fund_src_outs.append(TransactionOutput(fund_spk, fund_utxo.value))
-    fund_src = Transaction(tx_inputs=[], tx_outputs=fund_src_outs)
-    fund_src.txid = lambda: fund_utxo.tx_hash  # type: ignore[method-assign]
-    fund_input = TransactionInput(
-        source_transaction=fund_src,
-        source_txid=fund_utxo.tx_hash,
-        source_output_index=fund_utxo.tx_pos,
-        unlocking_script_template=P2PKH().unlock(fund_key),
-    )
-    fund_input.satoshis = fund_utxo.value
-    fund_input.locking_script = fund_spk
-
-    nft_tx = Transaction(
-        tx_inputs=[nft_input, fund_input],
-        tx_outputs=[
-            TransactionOutput(Script(new_locking), utxo.value),  # NFT singleton -> new owner
-            TransactionOutput(fund_spk, 0, change=True),  # fee change back to this wallet
-        ],
-    )
-    nft_tx.fee(SatoshisPerKilobyte(ctx.fee_rate * 1000))
-    nft_tx.sign()
-
-    # Prove the SIGNED bytes pay for themselves, after the last `sign()` and before the
-    # broadcast. `Transaction.fee()` sizes against an ESTIMATE and, when the funding
-    # falls short, silently drops the change output instead of failing — turning a
-    # shortfall into "the whole UTXO is the fee", which was how this command came to
-    # sign and broadcast transactions no node would relay. The funding bar above should
-    # make this unreachable; this is what proves it rather than trusting it. Radiant has
-    # neither RBF nor CPFP, so an under-fee'd broadcast cannot be repaired.
-    raw = nft_tx.serialize()
-    fee_paid = nft_tx.get_fee()
-    assert_pays_for_its_size(
-        size_bytes=len(raw),
-        fee_paid=fee_paid,
-        fee_rate=ctx.fee_rate,
-        what="glyph transfer-nft",
-        error_type=UserError,
-    )
+    raw = build.serialize()
 
     _confirm_or_abort(
         ctx,
@@ -1542,17 +1455,17 @@ async def _transfer_nft_inner(
                 title="NFT transfer",
                 lines=[
                     f"ref:        {ref.txid}:{ref.vout}",
-                    f"from:       {addr}",
+                    f"from:       {build.from_address}",
                     f"to:         {to_address}",
-                    f"fee:        {fee_paid:,} photons ({len(raw)} B @ {ctx.fee_rate:,}/B)"
-                    + ("" if len(nft_tx.outputs) > 1 else " — no change: the whole funding UTXO is the fee"),
+                    f"fee:        {build.fee:,} photons ({len(raw)} B @ {ctx.fee_rate:,}/B)"
+                    + ("" if build.has_change else " — no change: the whole funding UTXO is the fee"),
                     f"network:    {ctx.network}",
                 ],
             ),
         ],
     )
     txid = await client.broadcast(raw)
-    return {"txid": str(txid), "ref": f"{ref.txid}:{ref.vout}", "to": to_address, "fee": fee_paid}
+    return {"txid": str(txid), "ref": f"{ref.txid}:{ref.vout}", "to": to_address, "fee": build.fee}
 
 
 # ---------------------------------------------------------------------------

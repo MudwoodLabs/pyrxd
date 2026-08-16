@@ -740,7 +740,7 @@ def test_transfer_nft_cli_relays_at_the_funding_bar_and_below_it_refuses(node):
     under it the command refuses before anything is signed.
     """
     from pyrxd.cli.errors import UserError
-    from pyrxd.cli.glyph_cmds import _nft_transfer_funding_bar
+    from pyrxd.glyph.transfer import nft_transfer_funding_bar as _nft_transfer_funding_bar
 
     rate = _node_rate(node)
     assert rate == MIN_FEE_RATE, "not at the mainnet floor; this proves nothing"
@@ -773,8 +773,13 @@ def test_the_old_transfer_nft_bar_produced_bytes_the_node_refuses(node, monkeypa
     assertion — and asks the node about whatever comes out. Without this the green run
     above would be equally true of a command that was never broken.
     """
-    monkeypatch.setattr("pyrxd.cli.glyph_cmds._nft_transfer_funding_bar", lambda _script, _rate: 100_000)
-    monkeypatch.setattr("pyrxd.cli.glyph_cmds.assert_pays_for_its_size", lambda **kw: kw["fee_paid"])
+    # Both targets moved with the build into `pyrxd.glyph.transfer` (the CLI now calls
+    # it rather than carrying its own copy). The bar is patched on that module because
+    # `build_nft_transfer` resolves it as a global at call time; `assert_pays_for_its_size`
+    # is patched at its source because that function re-imports it from `fee_sizing` on
+    # every call, so patching the importing module would not bind.
+    monkeypatch.setattr("pyrxd.glyph.transfer.nft_transfer_funding_bar", lambda _script, _rate: 100_000)
+    monkeypatch.setattr("pyrxd.fee_sizing.assert_pays_for_its_size", lambda **kw: kw["fee_paid"])
 
     rate = _node_rate(node)
     with pytest.raises(_NodeRefused) as ei:
