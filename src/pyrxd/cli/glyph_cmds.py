@@ -795,8 +795,18 @@ async def _deploy_ft_inner(
 @click.argument("amount", type=int)
 @click.option("--to", "to_address", required=True, help="Recipient address.")
 @click.option("--passphrase/--no-passphrase", default=False)
+@click.option(
+    "--allow-overpay",
+    is_flag=True,
+    default=False,
+    help="Accept a fee above what the transaction's size demands. Relaxes BOTH bounds: the "
+    "rate ceiling (10x the relay floor) and the check that the fee matches the signed bytes. "
+    "Neither should refuse an ordinary transfer — this exists so a refusal is never a dead end.",
+)
 @click.pass_obj
-def transfer_ft_cmd(ctx: CliContext, ref: str, amount: int, to_address: str, passphrase: bool) -> None:
+def transfer_ft_cmd(
+    ctx: CliContext, ref: str, amount: int, to_address: str, passphrase: bool, allow_overpay: bool
+) -> None:
     """Transfer FT units of REF (txid:vout) to --to ADDRESS.
 
     Builds a conservation-enforcing FT transfer via FtUtxoSet.
@@ -818,7 +828,9 @@ def transfer_ft_cmd(ctx: CliContext, ref: str, amount: int, to_address: str, pas
     async def _do_transfer() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _transfer_ft_inner(ctx, wallet, glyph_ref, amount, to_pkh, to_address, client)
+            return await _transfer_ft_inner(
+                ctx, wallet, glyph_ref, amount, to_pkh, to_address, client, allow_overpay=allow_overpay
+            )
 
     try:
         result = asyncio.run(_do_transfer())
@@ -922,16 +934,22 @@ async def _transfer_ft_inner(
     to_pkh: Hex20,
     to_address: str,
     client: ElectrumXClient,
+    *,
+    allow_overpay: bool = False,
 ) -> dict:
     """FT transfer: scan wallet, find FT utxos for ref, build + broadcast.
 
     The build lives in :func:`pyrxd.glyph.transfer.build_ft_transfer` — including the
-    decision to route through ``build_ft_airdrop_tx`` with a single recipient rather
-    than ``build_ft_transfer_tx``, which is a fund-safety correction and not a
-    refactor (the transfer builder sizes its output from the inputs' RXD instead of
-    from ``amount``; see that module's docstring for the measured numbers). Keeping
-    that decision in one place is the point: a second copy is a place for the bug to
+    decision to route through ``build_ft_airdrop_tx`` with a single recipient. Keeping
+    that decision in one place is the point: a second copy is a place for a bug to
     come back.
+
+    ``allow_overpay`` is the escape hatch for two fee bounds that both refuse rather
+    than warn — the rate ceiling and the fee-vs-signed-bytes check. Neither should
+    ever refuse an ordinary transfer (measured: 0 refusals over 3,600+ builds at 2-10
+    inputs and 1-9x the floor rate), but Radiant has neither RBF nor CPFP, so a bound
+    with no reachable override can cost the funds it was protecting. It is off by
+    default and greppable when used.
 
     This function owns what the SDK deliberately does not — showing the user what is
     about to be spent, and broadcasting only after they agree.
@@ -944,6 +962,7 @@ async def _transfer_ft_inner(
             to_pkh,
             client=client,
             fee_rate=ctx.fee_rate,
+            allow_overpay=allow_overpay,
         )
     except InsufficientFundsError as exc:
         msg = str(exc)
@@ -960,6 +979,16 @@ async def _transfer_ft_inner(
             ) from exc
         raise UserError(msg, fix="check holdings with `pyrxd glyph list --type ft`") from exc
     except (ValidationError, ValueError) as exc:
+        # A fee-bound refusal and a funding shortfall are different problems with
+        # different remedies. Telling someone to add RXD when the build was refused
+        # for paying too MUCH sends them in the opposite direction, and on a chain
+        # with no RBF/CPFP a refusal the operator cannot act on is its own hazard.
+        if "allow_overpay=True" in str(exc):
+            raise UserError(
+                "refusing to broadcast: the fee is above what this transaction's size demands",
+                cause=str(exc),
+                fix="lower --fee-rate, or pass --allow-overpay to accept it deliberately",
+            ) from exc
         raise UserError(
             "could not build the transfer",
             cause=str(exc),
