@@ -80,7 +80,7 @@ from ..glyph.fees import (
     measure_reveal_fee,
 )
 from ..glyph.scanner import GlyphScanner
-from ..glyph.transfer import NoFeeFundingError, NoHoldingsError
+from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, assert_fee_matches_size
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
 from ..glyph.transfer import build_nft_transfer as lib_build_nft_transfer
 from ..glyph.transfer import find_plain_rxd_utxo as lib_find_plain_rxd_utxo
@@ -1164,6 +1164,14 @@ def _load_recipients_file(path: Path) -> list[tuple[str, int]]:
     help="Recipients file: `.json` array of {address, amount}, or `address,amount` CSV.",
 )
 @click.option("--passphrase/--no-passphrase", default=False)
+@click.option(
+    "--allow-overpay",
+    is_flag=True,
+    default=False,
+    help="Accept a fee far above what the signed transaction's size demands. Relaxes the rate "
+    "ceiling (10x the relay floor) and the overpay check. It does NOT relax the underpay "
+    "invariant. Exists so a refusal is never a dead end on a chain with no RBF or CPFP.",
+)
 @click.pass_obj
 def airdrop_ft_cmd(
     ctx: CliContext,
@@ -1171,6 +1179,7 @@ def airdrop_ft_cmd(
     to_specs: tuple[str, ...],
     recipients_path: Path | None,
     passphrase: bool,
+    allow_overpay: bool,
 ) -> None:
     """Send FT units of REF (txid:vout) to many recipients in ONE transaction.
 
@@ -1236,7 +1245,9 @@ def airdrop_ft_cmd(
     async def _do_airdrop() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _airdrop_ft_inner(ctx, wallet, glyph_ref, recipients, pairs, client)
+            return await _airdrop_ft_inner(
+                ctx, wallet, glyph_ref, recipients, pairs, client, allow_overpay=allow_overpay
+            )
 
     try:
         result = asyncio.run(_do_airdrop())
@@ -1263,6 +1274,8 @@ async def _airdrop_ft_inner(
     recipients: list,  # list[AirdropRecipient]
     pairs: list[tuple[str, int]],
     client: ElectrumXClient,
+    *,
+    allow_overpay: bool = False,
 ) -> dict:
     """FT airdrop: scan wallet, select FT utxos for ref, fund the fee, broadcast."""
     total = sum(r.amount for r in recipients)
@@ -1281,6 +1294,15 @@ async def _airdrop_ft_inner(
     )
     try:
         airdrop_result = GlyphBuilder().build_ft_airdrop_tx(params)
+
+        # Same builder as `transfer-ft`, so the same bound applies. Without this the
+        # airdrop path was the weaker of the two guard levels for no stated reason.
+        assert_fee_matches_size(
+            airdrop_result.fee,
+            airdrop_result.tx,
+            fee_rate=ctx.fee_rate,
+            allow_overpay=allow_overpay,
+        )
     except (ValidationError, ValueError) as exc:
         raise UserError(
             "could not build the airdrop",

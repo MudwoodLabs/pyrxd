@@ -68,7 +68,7 @@ __all__ = [
     "NftTransferBuild",
     "NoFeeFundingError",
     "NoHoldingsError",
-    "assert_change_survived",
+    "assert_fee_matches_size",
     "build_ft_transfer",
     "build_nft_transfer",
     "find_nft_utxo",
@@ -125,7 +125,7 @@ class FtTransferBuild:
         wrong on both counts: :meth:`Transaction.serialize` returns bytes and
         :meth:`ElectrumXClient.broadcast` takes them. Runtime was always correct;
         the contract was not, and it was the same mistaken belief that made
-        :func:`assert_change_survived` halve every size it judged. CI's mypy scope
+        :func:`assert_fee_matches_size` halve every size it judged. CI's mypy scope
         is ``src/pyrxd/security/`` only, so nothing checked this annotation.
         """
         return self.tx.serialize()
@@ -203,10 +203,41 @@ async def select_ft_inputs(
     if total_ft < amount:
         raise InsufficientFundsError(f"insufficient FT balance: need {amount}, have {total_ft}")
 
-    ft_inputs.sort(key=lambda t: t[0].ft_amount, reverse=True)
+    # Select WITHIN one address, because `FtUtxoSet` signs every input with a single
+    # key and `single_ft_signing_key` refuses a selection that spans several.
+    #
+    # Sorting the whole wallet by amount and taking greedily — what this did before —
+    # produced selections that the very next call then rejected. A wallet holding
+    # A=100+100 and B=150, asked for 200, picked B then A, spanned two addresses, and
+    # was refused with "consolidate the token to one address first" — prescribing work
+    # that was not needed, since A alone covers 200 exactly. A guard refusing valid
+    # work is its own bug, and this one refused work it had itself constructed.
+    by_address: dict[str, list[tuple[FtUtxo, str, PrivateKey]]] = {}
+    for triple in ft_inputs:
+        by_address.setdefault(triple[1], []).append(triple)
+
+    # Best fit: among the addresses that CAN cover `amount`, take the one holding least,
+    # so a large consolidated holding is not fragmented to satisfy a small transfer.
+    sufficient = [
+        (sum(t[0].ft_amount for t in group), addr, group)
+        for addr, group in by_address.items()
+        if sum(t[0].ft_amount for t in group) >= amount
+    ]
+    if not sufficient:
+        best = max((sum(t[0].ft_amount for t in g) for g in by_address.values()), default=0)
+        raise InsufficientFundsError(
+            f"insufficient FT balance at any single address: need {amount}, and the largest "
+            f"single-address holding is {best} (wallet total {total_ft} across "
+            f"{len(by_address)} addresses). Consolidate the token to one address first — "
+            "every input of an FT transfer is signed with one key."
+        )
+    sufficient.sort(key=lambda t: t[0])
+    _total, _addr, group = sufficient[0]
+
+    group.sort(key=lambda t: t[0].ft_amount, reverse=True)
     selected: list[tuple[FtUtxo, str, PrivateKey]] = []
     selected_total = 0
-    for triple in ft_inputs:
+    for triple in group:
         selected.append(triple)
         selected_total += triple[0].ft_amount
         if selected_total >= amount:
@@ -216,7 +247,7 @@ async def select_ft_inputs(
 
 def single_ft_signing_key(
     selected: list[tuple[FtUtxo, str, PrivateKey]],
-    what: str = "FT transfer",
+    what: str,
 ) -> PrivateKey:
     """The one key that signs every selected FT input, or a clear refusal.
 
@@ -225,6 +256,8 @@ def single_ft_signing_key(
     with invalid signatures on some inputs — rejected at broadcast, but only after
     the caller believed the spend was under way. Refuse first instead.
     """
+    if not selected:
+        raise ValidationError(f"{what}: no inputs were selected, so there is no key to sign with")
     first_key = selected[0][2]
     for _utxo, _addr, k in selected:
         if k.public_key().address() != first_key.public_key().address():
@@ -351,11 +384,11 @@ async def build_ft_transfer(
     except (ValidationError, ValueError) as exc:
         raise ValidationError(f"could not build the FT transfer: {exc}") from exc
 
-    assert_change_survived(result.fee, result.tx, fee_rate=fee_rate, allow_overpay=allow_overpay)
+    assert_fee_matches_size(result.fee, result.tx, fee_rate=fee_rate, allow_overpay=allow_overpay)
     return FtTransferBuild(tx=result.tx, fee=result.fee, ref=ref, amount=amount, to_pkh=to_pkh)
 
 
-def assert_change_survived(
+def assert_fee_matches_size(
     fee: int,
     tx: Transaction,
     *,
@@ -363,6 +396,11 @@ def assert_change_survived(
     allow_overpay: bool = False,
 ) -> None:
     """Refuse a build paying grossly more than its own size demands.
+
+    Named ``assert_change_survived`` until 2026-08-17, which described a mechanism that
+    does not exist — see the paragraph below. Three independent reviewers flagged the
+    name as no longer matching the behaviour, which is how a guard ends up being
+    "simplified" by someone who trusts its name over its body.
 
     **What this catches, stated accurately (rewritten 2026-08-15).** The original
     version of this docstring said
@@ -690,7 +728,7 @@ async def build_nft_transfer(
         size_bytes=len(raw),
         fee_paid=fee_paid,
         fee_rate=fee_rate,
-        what="build_nft_transfer",
+        what="the NFT transfer",
     )
 
     return NftTransferBuild(

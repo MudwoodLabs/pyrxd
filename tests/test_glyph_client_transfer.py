@@ -12,7 +12,7 @@ import pytest
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.glyph.client import GlyphClient, TransferReceipt
 from pyrxd.glyph.mint import JsonFilePendingStore, UnsafeNullPendingStore
-from pyrxd.glyph.transfer import assert_change_survived
+from pyrxd.glyph.transfer import assert_fee_matches_size
 from pyrxd.security.errors import ValidationError
 
 FEE_RATE = 10_000
@@ -62,7 +62,7 @@ def _allowance(n_inputs: int = INPUTS) -> int:
 class TestChangeSurvivedGuard:
     def test_exact_fee_passes(self) -> None:
         """The ordinary case: fee is exactly what the size demands."""
-        assert_change_survived(_exact_fee(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_sub_dust_fold_passes(self) -> None:
         """Folding a sub-dust remainder into the fee is correct, not a burn.
@@ -71,7 +71,7 @@ class TestChangeSurvivedGuard:
         builder rolls it into the fee. The guard must not mistake that for a loss.
         """
         excess = DUST_THRESHOLD_PHOTONS - 1
-        assert_change_survived(_exact_fee() + excess, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() + excess, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_the_builders_own_sizing_slack_passes(self) -> None:
         """THE case that made this guard refuse 100% of honest builds.
@@ -86,16 +86,16 @@ class TestChangeSurvivedGuard:
         from pyrxd.fee_sizing import SIG_SIZE_SLACK_BYTES
 
         designed_in = SIG_SIZE_SLACK_BYTES * INPUTS * FEE_RATE
-        assert_change_survived(_exact_fee() + designed_in, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() + designed_in, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_the_worst_measured_overshoot_passes(self) -> None:
         """9 bytes on two inputs was the worst of 300; the allowance is 12."""
-        assert_change_survived(_exact_fee() + 9 * FEE_RATE, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() + 9 * FEE_RATE, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_one_photon_past_the_allowance_is_refused(self) -> None:
         """The boundary, stated exactly rather than left to a magic number."""
         with pytest.raises(ValidationError, match="exceeds what this transaction's size demands"):
-            assert_change_survived(
+            assert_fee_matches_size(
                 _exact_fee() + _allowance() + 1,
                 _StubTx(SIZE_BYTES),
                 fee_rate=FEE_RATE,
@@ -103,7 +103,7 @@ class TestChangeSurvivedGuard:
 
     def test_exactly_at_the_allowance_passes(self) -> None:
         """The paired honest side of the boundary above."""
-        assert_change_survived(_exact_fee() + _allowance(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() + _allowance(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_large_burn_refused_and_reports_the_amount(self) -> None:
         """The failure mode worth refusing: a fee wildly past what the size demands.
@@ -113,19 +113,19 @@ class TestChangeSurvivedGuard:
         """
         burn = 2_330_000_000
         with pytest.raises(ValidationError) as exc:
-            assert_change_survived(_exact_fee() + burn, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+            assert_fee_matches_size(_exact_fee() + burn, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
         assert f"{burn:,}" in str(exc.value)
 
     def test_the_allowance_scales_with_the_input_count(self) -> None:
         """Slack is per input, so a one-input build must NOT get a two-input tolerance."""
         two_input_slack = _allowance(2)
         with pytest.raises(ValidationError):
-            assert_change_survived(
+            assert_fee_matches_size(
                 _exact_fee() + two_input_slack,
                 _StubTx(SIZE_BYTES, n_inputs=1),
                 fee_rate=FEE_RATE,
             )
-        assert_change_survived(
+        assert_fee_matches_size(
             _exact_fee() + _allowance(1),
             _StubTx(SIZE_BYTES, n_inputs=1),
             fee_rate=FEE_RATE,
@@ -133,7 +133,7 @@ class TestChangeSurvivedGuard:
 
     def test_allow_overpay_is_the_way_through(self) -> None:
         """Radiant has no RBF/CPFP, so a refusal with no override is its own hazard."""
-        assert_change_survived(
+        assert_fee_matches_size(
             _exact_fee() + 10_000_000,
             _StubTx(SIZE_BYTES),
             fee_rate=FEE_RATE,
@@ -146,7 +146,7 @@ class TestChangeSurvivedGuard:
         Documents the boundary rather than silently covering two concerns with one
         check — the builders already bound the fee from below.
         """
-        assert_change_survived(_exact_fee() - 5_000, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() - 5_000, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
 
 class TestTheGuardAgreesWithARealTransaction:
@@ -154,7 +154,7 @@ class TestTheGuardAgreesWithARealTransaction:
 
     Every test above measures the guard against a stub, so any units mistake shared by
     the stub and the guard is invisible to all of them. That is not hypothetical — it
-    shipped. ``assert_change_survived`` computed ``len(tx.serialize()) // 2`` while
+    shipped. ``assert_fee_matches_size`` computed ``len(tx.serialize()) // 2`` while
     ``Transaction.serialize()`` returns bytes, so it judged every transfer against half
     its true size and reported half the fee as burned change.
 
@@ -191,7 +191,7 @@ class TestTheGuardAgreesWithARealTransaction:
         rate = relay_floor_photons_per_byte()
         tx = self._real_tx()
         honest_fee = len(tx.serialize()) * rate
-        assert_change_survived(honest_fee, tx, fee_rate=rate)
+        assert_fee_matches_size(honest_fee, tx, fee_rate=rate)
 
     def test_a_real_burn_at_the_relay_floor_is_still_refused(self) -> None:
         """The counterweight: widening the guard must not switch it off."""
@@ -201,7 +201,7 @@ class TestTheGuardAgreesWithARealTransaction:
         tx = self._real_tx()
         honest_fee = len(tx.serialize()) * rate
         with pytest.raises(ValidationError, match="exceeds what this transaction's size demands"):
-            assert_change_survived(honest_fee + 2_330_000_000, tx, fee_rate=rate)
+            assert_fee_matches_size(honest_fee + 2_330_000_000, tx, fee_rate=rate)
 
     def test_a_real_build_from_the_real_builder_is_accepted(self) -> None:
         """The end of the chain, and what a stub can never show.
@@ -237,7 +237,7 @@ class TestTheGuardAgreesWithARealTransaction:
                 fee_rate=rate,
             )
         )
-        assert_change_survived(result.fee, result.tx, fee_rate=rate)
+        assert_fee_matches_size(result.fee, result.tx, fee_rate=rate)
 
 
 class TestGlyphClientStoreIsOptional:

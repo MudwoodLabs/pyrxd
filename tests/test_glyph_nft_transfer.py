@@ -240,3 +240,85 @@ class TestWhyTheSelfFundedBuilderIsNotUsed:
 def h_fund_value() -> int:
     """Comfortably above the bar, so the honest-path tests exercise the change branch."""
     return 50_000_000
+
+
+class TestFtSelectionDoesNotRefuseWhatItPicked:
+    """Selection must not construct a spend the next call then rejects.
+
+    `FtUtxoSet` signs every input with one key, so `single_ft_signing_key` refuses a
+    selection spanning addresses. Selection used to sort the WHOLE wallet by amount and
+    take greedily, which produced exactly such selections — and the user was told to
+    "consolidate the token to one address first" even when one address already covered
+    the amount on its own. A guard refusing valid work is its own bug; this one refused
+    work it had itself constructed.
+    """
+
+    @staticmethod
+    def _wallet_with(holdings: dict[str, list[int]], ref):
+        """`{address_seed: [unit amounts]}` -> (wallet, client) over real scripts."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from pyrxd.glyph.script import build_ft_locking_script
+
+        triples, txmap = [], {}
+        for i, (_seed, amounts) in enumerate(sorted(holdings.items())):
+            key = PrivateKey()
+            spk = build_ft_locking_script(Hex20(key.public_key().hash160()), ref)
+            for j, amt in enumerate(amounts):
+                txid = f"{i:02x}{j:02x}" + "0" * 60
+                triples.append((UtxoRecord(tx_hash=txid, tx_pos=0, value=amt, height=1), key.address(), key))
+                txmap[txid] = _src(0, spk, amt)
+
+        wallet = MagicMock()
+        wallet.collect_spendable = AsyncMock(return_value=triples)
+        client = MagicMock()
+        client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+        return wallet, client
+
+    @pytest.mark.asyncio
+    async def test_it_uses_the_address_that_can_cover_alone(self) -> None:
+        """THE regression case: A=100+100, B=150, amount=200.
+
+        Old behaviour sorted by amount (B=150 first, then A=100), spanned two
+        addresses, and was refused. A alone covers 200 exactly.
+        """
+        from pyrxd.glyph.transfer import select_ft_inputs, single_ft_signing_key
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"A": [100, 100], "B": [150]}, ref)
+
+        selected = await select_ft_inputs(wallet, ref, 200, client)
+
+        assert sum(t[0].ft_amount for t in selected) >= 200
+        assert len({t[1] for t in selected}) == 1, "selection spans addresses and will be refused"
+        single_ft_signing_key(selected, "FT transfer")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_no_single_address_covers_says_so_precisely(self) -> None:
+        """When consolidation really IS required, the message must say why.
+
+        The wallet total is sufficient; no single address is. That is a genuinely
+        different situation from "you do not have enough", and it gets its own wording.
+        """
+        from pyrxd.glyph.transfer import select_ft_inputs
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"A": [100], "B": [100]}, ref)
+
+        with pytest.raises(InsufficientFundsError) as exc:
+            await select_ft_inputs(wallet, ref, 150, client)
+        msg = str(exc.value)
+        assert "any single address" in msg
+        assert "Consolidate" in msg
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_fragment_a_large_holding(self) -> None:
+        """Best fit, not first fit: a 10,000-unit address is not raided for 50 units
+        when a 100-unit address can serve it."""
+        from pyrxd.glyph.transfer import select_ft_inputs
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"big": [10_000], "small": [100]}, ref)
+
+        selected = await select_ft_inputs(wallet, ref, 50, client)
+        assert sum(t[0].ft_amount for t in selected) == 100, "raided the large holding"

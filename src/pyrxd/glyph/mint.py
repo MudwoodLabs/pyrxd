@@ -958,7 +958,23 @@ class GlyphMinter:
             # answer. If the server then names a different transaction, one of the two
             # keys is the one holding real value and we cannot tell which — so file the
             # payload under both rather than leave the other unrecoverable.
-            self._store.save(replace(pending, commit_txid=broadcast_txid))
+            duplicate = replace(pending, commit_txid=broadcast_txid)
+            self._store.save(duplicate)
+            # Read it back, as `_persist_or_abort` does. That helper RAISES, which is
+            # right before a broadcast and wrong after one: the commit is already on
+            # chain, so aborting here would strand the very payload this branch exists
+            # to preserve. Warn loudly instead and keep going.
+            try:
+                self._store.load(broadcast_txid)
+            except Exception as exc:
+                warnings.warn(
+                    f"could not read back the duplicate pending record for {broadcast_txid}: "
+                    f"{exc}. The payload under {pending.commit_txid} is still there; if the "
+                    "server's txid is the one that landed, reveal will need that record "
+                    "restored by hand.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             warnings.warn(
                 f"broadcast returned txid {broadcast_txid} but the signed commit hashes to "
                 f"{pending.commit_txid}. The pending payload has been stored under BOTH so either "
@@ -1037,7 +1053,7 @@ class GlyphMinter:
             min_confirmations=1,
             timeout_s=self._confirmation_timeout_s,
         )
-        self._store.delete(pending.commit_txid)
+        self._delete_record_and_any_duplicate(pending)
         return MintResult(
             commit_txid=pending.commit_txid,
             reveal_txid=str(reveal_txid),
@@ -1046,6 +1062,33 @@ class GlyphMinter:
             carrier_value=pending.carrier_value,
             owner_pkh=pending.owner_pkh,
         )
+
+    def _delete_record_and_any_duplicate(self, pending: PendingMint) -> None:
+        """Drop this mint's record, including a sibling filed under the server's txid.
+
+        When a broadcast echoes a different txid than the bytes hash to, the payload is
+        filed under BOTH keys so either can be revealed. Deleting only the one we were
+        handed left the other behind, and `list_pending()` then re-offers a mint that
+        has already been revealed — an operator following that prompt rebuilds a reveal
+        for a commit that is already spent.
+
+        The CBOR payload is unique per mint, so it identifies the sibling exactly.
+        """
+        self._store.delete(pending.commit_txid)
+        for key in list(self._store.list_pending()):
+            if key == pending.commit_txid:
+                continue
+            try:
+                other = self._store.load(key)
+            except Exception:  # noqa: S112  # nosec B112 - see below
+                # Deliberate: this loop hunts a DUPLICATE of a record already deleted. A
+                # stored record we cannot parse is, by definition, not the one we are
+                # looking for — and raising here would abort a cleanup that runs after a
+                # SUCCESSFUL reveal, handing the caller an exception for a mint that in
+                # fact completed.
+                continue
+            if other.cbor_bytes == pending.cbor_bytes:
+                self._store.delete(key)
 
     @staticmethod
     def _assert_payload_still_matches(pending: PendingMint, funding_key: Any) -> None:
