@@ -183,10 +183,47 @@ PENDING_MINT_SCHEMA_VERSION = 1
 # correctly with no special case. Before 0.15.0 it was listed here because
 # ``prepare_container_reveal`` could emit a 100-byte child-ref prefix; that shape was
 # unspendable and has been removed.
+#: Why each refused protocol is refused, and what a caller should actually do.
+#:
+#: The refusal used to say only "its reveal is not the single-output shape this facade
+#: builds — use ``GlyphBuilder.<method>`` directly". True, and for MUT/WAVE incomplete
+#: in a way that would strand funds: the reveal takes a SECOND input at
+#: ``commit_txid:(commit_vout + 1)``, so the COMMIT has to carry an ordinary output
+#: there, and a caller following that advice against this module's commit shape would
+#: find vout 1 is the change output — which ``Transaction.fee()`` removes outright when
+#: the remainder does not cover it. The commit is a hashlock with no owner-only spend
+#: path, so a commit broadcast without its seed is unspendable forever.
+#:
+#: Extending the facade to cover them was considered and rejected; see the spike note
+#: in ``docs/plans/2026-08-09-gap-closure-plan.md`` (§B2.3).
 _UNSUPPORTED_PROTOCOLS = {
-    GlyphProtocol.MUT: "prepare_mutable_reveal",
-    GlyphProtocol.WAVE: "prepare_wave_reveal",
-    GlyphProtocol.DMINT: "prepare_dmint_deploy",
+    GlyphProtocol.MUT: (
+        "prepare_mutable_reveal",
+        "Its reveal needs TWO inputs — the commit, plus a plain seed output at "
+        "commit_vout + 1 whose outpoint becomes the mutable contract's ref (the covenant "
+        "recomputes the token ref as mutable_ref.vout - 1, so the two cannot be the same "
+        "outpoint). This module's commit puts a CHANGE output at vout 1, and "
+        "Transaction.fee() drops change outputs it cannot fund, so the seed is not "
+        "guaranteed to exist. Note also that pyrxd has no builder for the nftAuthScript "
+        "shape a later mod/sl operation requires, so a MUT minted today cannot yet be "
+        "mutated through pyrxd — see tests/test_mut_wave_regtest_e2e.py for the working "
+        "transaction spelled out by hand.",
+    ),
+    GlyphProtocol.WAVE: (
+        "prepare_wave_reveal",
+        "WAVE is MUT plus a name, so it inherits the MUT reveal's two-input shape and the "
+        "same seed-output requirement. pyrxd's WAVE support is deliberately parked until a "
+        "concrete consumer needs it — see "
+        "docs/solutions/design-decisions/wave-protocol-deferred-until-consumer.md.",
+    ),
+    GlyphProtocol.DMINT: (
+        "prepare_dmint_deploy",
+        "Its reveal emits num_contracts parallel contract UTXOs (plus a premine output when "
+        "one is asked for), not one token output. Unlike MUT/WAVE this is a complete and "
+        "consensus-proven path already — prepare_dmint_deploy drives both phases itself and "
+        "is proven end to end against a node in tests/test_dmint_premine_regtest_e2e.py — so "
+        "calling it directly is the supported way to deploy, not a workaround.",
+    ),
 }
 
 
@@ -798,12 +835,14 @@ class GlyphMinter:
             raise ValidationError(
                 f"{method} requires GlyphProtocol.{required.name} in metadata.protocol; got {protocol!r}"
             )
-        for tag, builder_method in _UNSUPPORTED_PROTOCOLS.items():
+        for tag, (builder_method, why) in _UNSUPPORTED_PROTOCOLS.items():
             if tag in protocol:
                 raise ValidationError(
                     f"{method} cannot mint a {tag.name} glyph: its reveal is not the single-output "
-                    f"shape this facade builds. Use GlyphBuilder.{builder_method} directly — committing "
-                    "through here would broadcast a commit whose reveal this module cannot construct."
+                    f"shape this facade builds, and committing through here would broadcast a commit "
+                    f"whose reveal this module cannot construct — the commit output is a hashlock with "
+                    f"no owner-only spend path, so that commit and its value would be stranded. "
+                    f"Use GlyphBuilder.{builder_method} directly. {why}"
                 )
         # FT/NFT mutual exclusion is not re-checked here: GlyphMetadata.__post_init__
         # already rejects that combination (and the co-protocol requirements that make
