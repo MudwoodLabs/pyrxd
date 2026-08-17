@@ -128,8 +128,30 @@ _TEST_ALLOWLIST = {
 }
 
 
-def _python_files(root: Path):
-    return sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+@functools.cache
+def _python_files(root: Path) -> tuple[Path, ...]:
+    """Every ``.py`` under *root*, once per root rather than once per case.
+
+    Returns a tuple: a cached list would hand every caller the same mutable
+    object. See ``_read`` for why these three helpers are cached at all.
+    """
+    return tuple(sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts))
+
+
+@functools.cache
+def _read(path: Path) -> str:
+    """Read a source file once, not once per parametrised case.
+
+    ``_parse`` and ``_utf8_lines`` are keyed on the source STRING, so they only
+    start paying off after someone has produced that string — which meant the
+    disk read and UTF-8 decode of all ~198 files still ran for every case. This
+    is the layer under them.
+
+    Safe to cache because nothing in this module writes source files: it reads
+    the tree and asserts about it. Do not use this helper for a file a test
+    creates or edits.
+    """
+    return path.read_text(encoding="utf-8")
 
 
 # ── source-segment extraction, without the quadratic stdlib path ──────────────
@@ -189,6 +211,7 @@ def _source_segment(source: str, node: ast.AST) -> str | None:
     return _utf8_lines(source)[lineno][col_offset:end_col_offset].decode()
 
 
+@functools.cache
 def _strip_comments_and_docstrings(text: str) -> str:
     """Crude but adequate: drop ``#`` comments and triple-quoted blocks.
 
@@ -255,7 +278,7 @@ class TestSingleDefinition:
         for path in _python_files(root):
             if path == CANONICAL_MODULE or (root_name == "tests" and path.name in _TEST_ALLOWLIST):
                 continue
-            body = _strip_comments_and_docstrings(path.read_text(encoding="utf-8"))
+            body = _strip_comments_and_docstrings(_read(path))
             for match in assignment.finditer(body):
                 rhs = match.group("rhs").strip()
                 # Re-binding to the canonical object is allowed.
@@ -268,7 +291,7 @@ class TestSingleDefinition:
         )
 
     def test_canonical_module_defines_all_of_them(self):
-        body = CANONICAL_MODULE.read_text(encoding="utf-8")
+        body = _read(CANONICAL_MODULE)
         for name in _GUARDED_NAMES:
             assert re.search(rf"^{name}\s*[:=]", body, re.MULTILINE), (
                 f"{name} is guarded but no longer defined in src/pyrxd/constants.py"
@@ -377,7 +400,7 @@ class TestNoRespelledCentralisedValue:
             rel = str(path.relative_to(root))
             if path == CANONICAL_MODULE or rel in exempt:
                 continue
-            source = path.read_text(encoding="utf-8")
+            source = _read(path)
             offenders += [f"{_rel(path)}: {hit}" for hit in respelled_centralised_value(source)]
         # Another value's literal in this file is that value's failure, not this one's.
         offenders = [o for o in offenders if o.endswith(name)]
@@ -391,7 +414,7 @@ class TestNoRespelledCentralisedValue:
     def test_the_canonical_module_still_spells_each_value(self):
         """The other half. If ``constants.py`` stops holding these numbers, the
         scan above starts passing on a tree that lost the constant entirely."""
-        source = CANONICAL_MODULE.read_text(encoding="utf-8")
+        source = _read(CANONICAL_MODULE)
         found = {hit.split(" is ")[1] for hit in respelled_centralised_value(source)}
         missing = sorted(set(_GUARDED_VALUES.values()) - found)
         assert not missing, f"src/pyrxd/constants.py no longer spells: {missing} — the value guard is now vacuous"
@@ -416,8 +439,7 @@ class TestNoRespelledCentralisedValue:
             for value, rels in _VALUE_EXEMPTIONS.items()
             for rel in rels
             if not any(
-                hit.endswith(_GUARDED_VALUES[value])
-                for hit in respelled_centralised_value((SRC_ROOT / rel).read_text(encoding="utf-8"))
+                hit.endswith(_GUARDED_VALUES[value]) for hit in respelled_centralised_value(_read(SRC_ROOT / rel))
             )
         ]
         assert not stale, f"these exemptions no longer cover anything: {stale}"
@@ -594,7 +616,7 @@ class TestNoRespelledRefOperandSet:
         for path in _python_files(SRC_ROOT):
             if path == CANONICAL_MODULE:
                 continue
-            source = path.read_text(encoding="utf-8")
+            source = _read(path)
             offenders += [f"{_rel(path)}: {hit}" for hit in respelled_ref_collections(source)]
         assert not offenders, (
             "a literal collection of ref-operand opcodes was found outside "
@@ -616,7 +638,7 @@ class TestNoRespelledRefOperandSet:
         for path in _python_files(root):
             if root_name == "tests" and path.name in _TEST_ALLOWLIST:
                 continue
-            source = path.read_text(encoding="utf-8")
+            source = _read(path)
             offenders += [f"{_rel(path)}: {hit}" for hit in contiguous_ref_range_tests(source)]
         assert not offenders, (
             "a contiguous-range test over the ref opcode bytes was found. The "
@@ -722,7 +744,7 @@ def hand_spelled_ref_widths(source: str) -> list[str]:
 class TestWalkersShareTheConstant:
     @pytest.mark.parametrize("rel_path", sorted(_REF_WALKERS))
     def test_walker_references_the_shared_constant(self, rel_path):
-        body = _strip_comments_and_docstrings((SRC_ROOT / rel_path).read_text(encoding="utf-8"))
+        body = _strip_comments_and_docstrings(_read(SRC_ROOT / rel_path))
         assert re.search(r"\bREF_OPERAND_OPCODES\b|\bREF_OPCODES\b", body), (
             f"src/pyrxd/{rel_path} walks scripts but does not reference the shared "
             f"ref-operand constant. Import REF_OPERAND_OPCODES (or the REF_OPCODES alias) "
@@ -732,7 +754,7 @@ class TestWalkersShareTheConstant:
     @pytest.mark.parametrize("rel_path", sorted(_REF_WALKERS))
     def test_walker_does_not_hand_spell_the_operand_width(self, rel_path):
         """The width is a consensus fact too, and it was the one nobody imported."""
-        offenders = hand_spelled_ref_widths((SRC_ROOT / rel_path).read_text(encoding="utf-8"))
+        offenders = hand_spelled_ref_widths(_read(SRC_ROOT / rel_path))
         assert not offenders, (
             f"src/pyrxd/{rel_path} spells the ref-operand width by hand:\n  "
             + "\n  ".join(offenders)
@@ -754,7 +776,7 @@ class TestWalkersShareTheConstant:
             rel = str(path.relative_to(SRC_ROOT))
             if rel in _REF_WALKERS or path == CANONICAL_MODULE:
                 continue
-            source = path.read_text(encoding="utf-8")
+            source = _read(path)
             hits = ref_walk_strides(source)
             if hits:
                 unregistered.append(f"{_rel(path)}: {hits[0]}")
@@ -1182,7 +1204,7 @@ class TestOneImplementationPerPrimitive:
             rel = str(path.relative_to(SRC_ROOT))
             if rel in owners or rel in exempt:
                 continue
-            source = path.read_text(encoding="utf-8")
+            source = _read(path)
             offenders += [f"{_rel(path)}: {hit}" for hit in detector(source)]
         assert not offenders, (
             f"{primitive} is implemented outside {sorted(owners)}:\n  "
@@ -1195,7 +1217,7 @@ class TestOneImplementationPerPrimitive:
         """The other half. If the canonical implementation is moved or renamed,
         the guard above silently starts passing on an empty tree."""
         detector, owners, _ = _PRIMITIVE_GUARDS[primitive]
-        found = any(detector((SRC_ROOT / owner).read_text(encoding="utf-8")) for owner in owners)
+        found = any(detector(_read(SRC_ROOT / owner)) for owner in owners)
         assert found, (
             f"none of {sorted(owners)} contains an implementation of {primitive} any more. "
             f"Either it moved (update _PRIMITIVE_GUARDS) or the guard is now vacuous."
@@ -1263,7 +1285,7 @@ class TestDerivedRulesAreNotRetyped:
             for path in _python_files(root):
                 if path == CANONICAL_MODULE or str(path.relative_to(root)) in exempt:
                     continue
-                source = path.read_text(encoding="utf-8")
+                source = _read(path)
                 offenders += [f"{_rel(path)}: {hit}" for hit in detector(source)]
         assert not offenders, (
             f"{rule} is written out by hand:\n  " + "\n  ".join(offenders) + f"\nInstead: {remedy}. "
@@ -1282,7 +1304,7 @@ class TestDerivedRulesAreNotRetyped:
             "SEQUENCE_LOCKTIME_ENABLED must stay derived from SEQUENCE_FINAL, not become its own literal"
         )
         assert ETH_FINALIZATION_WINDOW_FLOOR_S == 2 * 32 * 12, "the ETH floor is no longer 2 epochs x 32 slots x 12 s"
-        types_src = (SRC_ROOT / "security" / "types.py").read_text(encoding="utf-8")
+        types_src = _read(SRC_ROOT / "security" / "types.py")
         for name in ("BTC_MAX_SATS", "RADIANT_MAX_PHOTONS"):
             assert re.search(rf"^{name}: int = [\d_]+ \* [\d_]+$", types_src, re.MULTILINE), (
                 f"{name} must stay a supply x subunit product. Flattening it to one literal makes "
@@ -1404,7 +1426,7 @@ class TestTheGuardCatchesTheBugsThatMotivatedIt:
         )
         # …and the projection that replaced it must NOT be flagged, or the
         # detector just bans the correct fix.
-        assert not ref_walk_strides((SRC_ROOT / "glyph" / "soulbound_detect.py").read_text(encoding="utf-8"))
+        assert not ref_walk_strides(_read(SRC_ROOT / "glyph" / "soulbound_detect.py"))
 
     def test_the_original_bugs_own_spelling_is_caught(self):
         """``frozenset(range(0xD0, 0xD9))`` — the literal source of the whole incident.
@@ -1889,7 +1911,7 @@ class TestSourceSegmentMatchesTheStdlib:
         because it is a single file — the cost this replaces came from doing it
         for every file on every one of the parametrised guards.
         """
-        source = (SRC_ROOT / "constants.py").read_text(encoding="utf-8")
+        source = _read(SRC_ROOT / "constants.py")
         tree = ast.parse(source)
         nodes = [n for n in ast.walk(tree) if hasattr(n, "lineno")]
         assert len(nodes) > 50, "expected a substantial module"

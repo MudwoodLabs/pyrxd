@@ -17,6 +17,7 @@ then enforces that the cited test keeps existing.
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 
@@ -29,9 +30,14 @@ _ROW = re.compile(r"^\|\s*`([A-Z][A-Z0-9-]+)`\s*\|")
 _PYTOKEN = re.compile(r"`([\w./-]+\.py)`")
 
 
+@functools.cache
 def _resolve(token: str) -> Path | None:
     """Resolve a register path token to a real file, or None. Handles repo-root-relative
-    (``tests/x.py``), src/pyrxd-relative (``gravity/x.py``), and bare basenames (``x.py``)."""
+    (``tests/x.py``), src/pyrxd-relative (``gravity/x.py``), and bare basenames (``x.py``).
+
+    Cached: the bare-basename arm walks three roots with ``rglob``, and the register
+    cites the same paths repeatedly, so cost scaled with register size x tree size.
+    Tokens are plain strings and the tree does not change mid-run."""
     for cand in (_REPO / token, _REPO / "src" / "pyrxd" / token):
         if cand.is_file():
             return cand

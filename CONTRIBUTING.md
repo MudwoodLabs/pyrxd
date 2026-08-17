@@ -16,27 +16,37 @@ cd pyrxd
 python3 -m venv .venv
 source .venv/bin/activate
 poetry install --sync     # installs all groups (dev + test) — matches CI exactly
-poetry run task test      # full pytest suite, ~45 seconds
+poetry run task test      # full pytest suite, ~2m40s (9,195 tests, with coverage)
 ```
 
 If you don't have Poetry installed, `pip install -e ".[dev]"` works for
 basic development but won't pull in the full `test` group (pytest-cov,
 hypothesis, pytest-mock). Use Poetry to match the exact CI environment.
 
-The full test suite runs in under a minute on a modern laptop. If
-something is slow, that's a regression — please flag it.
+The full suite is ~9,200 tests in ~2m40s with coverage on a developer
+machine. If it gets materially slower, that is worth chasing rather than
+absorbing — run `pytest --durations=25` and look at the top of the list.
+A single stdlib call in a per-node loop once made the Python 3.10 and 3.11
+CI jobs take 39 and 34 minutes against 3.12's 8, on identical tests; see
+`docs/solutions/performance-issues/ast-get-source-segment-rescans-the-whole-file-before-python-3-12.md`.
 
 ### Recommended: install the pre-push hook
 
-Run `task ci` (the full local-CI matrix) automatically before every push:
+Run the fast local checks automatically before every push:
 
 ```bash
 ./scripts/install-git-hooks.sh
 ```
 
-This catches the same failures CI catches, locally, in ~1-2 minutes —
-much faster than the push-fail-fix-push loop. Bypass for a specific push
-with `git push --no-verify`.
+The hook runs `task ci-fast` — lint, format-check, typecheck and the
+private-link guard, **~4.5 s**. It deliberately does **not** run the tests:
+a hook long enough to run them made `git push` die with exit 141 (SIGPIPE),
+because GitHub drops an idle `git-receive-pack` session after ~5 minutes.
+See `docs/solutions/integration-issues/long-pre-push-hook-makes-git-push-to-github-fail-with-sigpipe.md`.
+
+So the hook catches formatting, lint, typing and private-link failures, but
+**a test regression will reach CI**. Run `task ci` yourself before opening a
+PR. Bypass a specific push with `git push --no-verify`.
 
 ## Sign your commits (DCO)
 
@@ -100,7 +110,7 @@ runs both ruff hooks plus bandit and detect-secrets. Install hooks with
 Before opening a PR, run the full local CI matrix:
 
 ```bash
-poetry run task ci  # runs everything CI runs (~3-5 min)
+poetry run task ci  # runs everything CI runs (~5m20s)
 ```
 
 This is the canonical "is my PR likely to pass CI" check. Mirrors
@@ -226,12 +236,18 @@ versioned pre-push hook:
 ```
 
 This symlinks `scripts/git-hooks/pre-push` into `.git/hooks/pre-push`, so
-every `git push` runs `task ci` first. Bypass for a specific push with
+every `git push` runs `task ci-fast` first. Bypass for a specific push with
 `git push --no-verify` (e.g. for WIP branches you're sharing for review).
 
-The hook is **strongly recommended** if you push to PRs frequently —
-catching CI failures locally takes 3-5 minutes; finding out via a failed
-PR check takes 4-6 minutes plus another full CI run after fixing.
+The hook is **strongly recommended** if you push to PRs frequently — it costs
+~4.5 s and catches the lint, formatting, typing and private-link failures that
+are otherwise a wasted CI round-trip. It does not run the tests, so run
+`task ci` (~5m20s) before opening a PR: a test failure found in CI costs the
+slowest matrix leg, ~8m30s, plus a full re-run after fixing.
+
+> Timings are measured on one developer machine and are there to convey the
+> shape of each command's cost, not as a benchmark. `task test` is ~2m40s,
+> `task ci` ~5m20s, `task ci-fast` ~4.5 s.
 
 ### Test fixtures and secrets
 

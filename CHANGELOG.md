@@ -15,12 +15,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `pyrxd.glyph.transfer` — the FT transfer path, lifted out of the CLI where it was only
   reachable as private helpers. `examples/ft_transfer_demo.py` needed 399 hand-rolled lines
   because the working implementation was not importable.
+- **NFT transfers are importable too.** `GlyphClient.transfer_nft` / `.build_nft_transfer`,
+  returning `NftTransferReceipt`, over `pyrxd.glyph.transfer.build_nft_transfer`. The
+  singleton keeps its own value and the fee comes from a separate plain-RXD input, which is
+  what makes it usable at all: `GlyphBuilder.build_nft_transfer_tx` spends the NFT alone and
+  takes the fee out of its value, so at Radiant's relay floor it refuses any carrier holding
+  less than ~2,330,546 photons — measured, i.e. every ordinary dust-carrying NFT. That
+  builder is unchanged and still correct for a carrier that can pay its own way.
+  `NftTransferReceipt` is deliberately separate from `TransferReceipt`: an NFT has no unit
+  count, and an FT output's value **is** its quantity, so one type reporting both invites
+  exactly the confusion that makes FT value handling hazardous.
+- `glyph transfer-ft --allow-overpay` — the escape hatch for the two fee bounds on that
+  path (the rate ceiling, and the fee-vs-signed-bytes check). Neither should refuse an
+  ordinary transfer, but Radiant has neither RBF nor CPFP, so a bound with no reachable
+  override can cost the funds it was protecting.
 - `docs/runbooks/cutting-a-release.md` — end-to-end release procedure.
+- `docs/solutions/performance-issues/` — new category, opened with the write-up of why the
+  3.10 and 3.11 CI jobs ran 5x longer than 3.12.
 
 ### Changed
 
 - The `pre-push` hook now runs `task ci-fast` — lint, format-check, typecheck and the
-  private-link guard, ~4.5 s — instead of the full `task ci`, which measures ~395 s.
+  private-link guard, ~4.5 s — instead of the full `task ci`, which measured ~395 s
+  at the time (~320 s now, after the test-suite fix below).
   Beyond the time saved, the long hook was actively breaking pushes: git opens the
   connection to the remote before running the hook, GitHub closes an idle
   `git-receive-pack` session after ~5 minutes, and git then dies with exit 141
@@ -28,13 +45,37 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   before opening a PR; GitHub Actions still gates every PR. The hook also now locates
   `.venv/bin/task` itself rather than aborting when the venv is not activated.
 
+### Performance
+
+- The Python 3.10 and 3.11 CI jobs took **39.0 and 34.2 minutes against 3.12's 8.2**, on
+  identical tests. The whole gap was `ast.get_source_segment`, called per AST node by the
+  consensus-constant guards to tell `0xd2` from `210`: it re-splits the entire file on every
+  call, and Python 3.12 added a `maxlines` bound that 3.10 and 3.11 do not have. `ast.parse`
+  and `ast.walk` measure identical across all three, so it was never the interpreter. Sources
+  are now split once and cached, the parse and the file reads are memoised, and the matrix
+  runs **8.3 / 7.8 / 6.7 minutes** — finishing together instead of 3.12 waiting half an hour.
+  Equivalence with the stdlib is pinned by 14 tests covering CRLF, lone CR, form feed,
+  vertical tab and multi-byte offsets, because a faster answer that differs would silently
+  turn a real consensus-constant violation into a pass. Test-only; no shipped code changed.
+
 ### Fixed
 
-- FT transfers built through the SDK are now guarded against silently paying change to the
-  miner. `Transaction.fee()` drops every change output and leaves the remainder to the miner
-  when it does not cover them — correct for a sub-dust remainder, but silent and unbounded
-  otherwise. Builds now refuse when the fee exceeds what the transaction's size demands by a
-  dust threshold or more; `allow_overpay=True` is the deliberate way through.
+- FT transfers built through the SDK are now checked against paying grossly more than their
+  own size demands, measured on the **signed** bytes rather than on the rate (which
+  `assert_fee_rate_clears_relay_floor` already bounds at both ends). `allow_overpay=True`,
+  or `--allow-overpay` on the CLI, is the deliberate way through.
+
+  **This entry previously described a mechanism that does not exist**, and the guard it
+  described could not accept a transfer. It claimed `Transaction.fee()` leaves an
+  "unbounded" remainder to the miner; that branch is `if change <= change_count` with
+  `change` already net of the fee, so it can drop at most one photon per change output. And
+  the stated tolerance — a dust threshold, 546 photons — is 0.055 bytes at Radiant's floor
+  rate, while every builder deliberately overshoots by `SIG_SIZE_SLACK_BYTES` per input so a
+  long signature cannot leave a transaction underpaid. Measured over 300 real
+  single-recipient transfers, that overshoot ran 4-9 bytes and **300 of 300 were refused**.
+  The tolerance now allows the builders' own slack; 300 of 300 pass, while +13 bytes, +1 RXD
+  and the +23.1 RXD case are all still refused. None of this reached a release — the whole
+  cycle happened under this same `[Unreleased]` heading.
 
 ## [0.18.0] — 2026-08-13
 

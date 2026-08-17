@@ -22,6 +22,7 @@ premises regresses.
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 
@@ -110,6 +111,20 @@ def _mint(*, is_v1: bool, op_return_msg: bytes | None, funding_value: int = 500_
 # ---------------------------------------------------------------------------
 # 1. The 80-byte OP_RETURN "standardness limit"
 # ---------------------------------------------------------------------------
+@functools.cache
+def _citation_corpus() -> tuple[tuple[Path, tuple[str, ...]], ...]:
+    """Every file a stale-citation check has to scan, read once.
+
+    Three roots x two glob patterns x one read per file, previously redone for each
+    parametrised ``stale`` value. Returns tuples so a cached result cannot be mutated
+    by one case and observed by the next.
+    """
+    roots = [SRC, REPO_ROOT / "docs" / "runbooks", REPO_ROOT / "docs" / "reference"]
+    return tuple(
+        (path, tuple(path.read_text().splitlines()))
+        for root in roots
+        for path in list(root.rglob("*.py")) + list(root.rglob("*.md"))
+    )
 
 
 class TestOpReturnCapIsAnEncoderLimitNotStandardness:
@@ -311,12 +326,10 @@ class TestProseAgreesWithRadiantCore:
     )
     def test_no_citation_points_at_a_stale_line_number(self, stale: str):
         """Line numbers are at the tag ``tests/vendor/radiant_core/MANIFEST.json`` pins."""
-        roots = [SRC, REPO_ROOT / "docs" / "runbooks", REPO_ROOT / "docs" / "reference"]
         offenders = [
-            f"{p.relative_to(REPO_ROOT)}:{n}"
-            for root in roots
-            for p in list(root.rglob("*.py")) + list(root.rglob("*.md"))
-            for n, line in enumerate(p.read_text().splitlines(), start=1)
+            f"{path.relative_to(REPO_ROOT)}:{n}"
+            for path, lines in _citation_corpus()
+            for n, line in enumerate(lines, start=1)
             if stale in line
         ]
         assert offenders == []
