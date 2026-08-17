@@ -765,7 +765,14 @@ class GlyphMinter:
 
     # -- phase 2 -----------------------------------------------------------
 
-    async def reveal_nft(self, pending: PendingMint, *, fee_rate: int | None = None) -> MintResult:
+    async def reveal_nft(
+        self,
+        pending: PendingMint,
+        *,
+        fee_rate: int | None = None,
+        allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
+    ) -> MintResult:
         """Wait for the commit, then broadcast the NFT reveal.
 
         The stored record is re-validated against the commit script before anything is
@@ -780,9 +787,21 @@ class GlyphMinter:
                 "Revealing it as an NFT would build the wrong locking script and the commit "
                 "script's OP_REFTYPE_OUTPUT check would reject the spend."
             )
-        return await self._reveal(pending, fee_rate=fee_rate)
+        return await self._reveal(
+            pending,
+            fee_rate=fee_rate,
+            allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
+        )
 
-    async def reveal_ft(self, pending: PendingMint, *, fee_rate: int | None = None) -> MintResult:
+    async def reveal_ft(
+        self,
+        pending: PendingMint,
+        *,
+        fee_rate: int | None = None,
+        allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
+    ) -> MintResult:
         """Wait for the commit, then broadcast the FT deploy reveal.
 
         Mirrors :meth:`reveal_nft`; the reveal's token output carries the whole premined
@@ -796,7 +815,12 @@ class GlyphMinter:
                 "Revealing it as an FT would build the wrong locking script and the commit "
                 "script's OP_REFTYPE_OUTPUT check would reject the spend."
             )
-        return await self._reveal(pending, fee_rate=fee_rate)
+        return await self._reveal(
+            pending,
+            fee_rate=fee_rate,
+            allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
+        )
 
     # -- both phases -------------------------------------------------------
 
@@ -1003,7 +1027,14 @@ class GlyphMinter:
                 "payload would not be recoverable after a crash"
             )
 
-    async def _reveal(self, pending: PendingMint, *, fee_rate: int | None = None) -> MintResult:
+    async def _reveal(
+        self,
+        pending: PendingMint,
+        *,
+        fee_rate: int | None = None,
+        allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
+    ) -> MintResult:
         funding_key = self._key_for_address(pending.funding_address)
         self._assert_payload_still_matches(pending, funding_key)
 
@@ -1029,14 +1060,25 @@ class GlyphMinter:
         # not lift a sub-floor rate (`fee_sizing`), so a stale rate agrees with itself and
         # the check passes on a transaction no node will relay.
         #
-        # So judge the rate against the CURRENT floor first. A refusal here is recoverable
-        # — the record is still on disk and `fee_rate=` re-reveals at a live rate — whereas
-        # broadcasting an unrelayable reveal is not: Radiant has neither RBF nor CPFP, and
-        # it would sit until mempool expiry while the commit stays a hashlock.
+        # So judge the rate against the CURRENT floor — but judging it is NOT free, and an
+        # earlier version of this comment claimed a recoverability it did not provide.
+        #
+        # Raising the rate is not always an escape: the commit output was funded for the
+        # rate stored at commit time, so if the floor has risen 10x the commit simply does
+        # not hold enough to pay a floor-rate reveal (measured: a ~20 KB reveal needs
+        # 20,297,000 photons at 1,000/B and 202,970,000 at 10,000/B). Refusing with no way
+        # through would convert "this reveal may not relay" into "this commit can never be
+        # revealed" — strictly worse, because broadcasting at least gives it a chance.
+        #
+        # Hence both overrides are the CALLER'S: `allow_below_relay_floor=True` to send it
+        # anyway, `fee_rate=` to re-price upward when the commit can afford it. The default
+        # refuses, so the failure is loud and the record survives either way.
         assert_fee_rate_clears_relay_floor(
             effective_rate,
             what="glyph reveal",
-            allow_overpay=True,  # the ceiling was already judged when the commit was built
+            allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
+            error_type=ValidationError,
         )
 
         raw = reveal_tx.serialize()

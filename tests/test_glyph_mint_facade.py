@@ -909,3 +909,81 @@ class TestTheRecordOutlivesTheBroadcast:
             "the pending record was deleted for a reveal that never confirmed — "
             "the commit is a hashlock and its value is now unrecoverable"
         )
+
+
+class TestRevealRateAndEchoGuards:
+    """The reveal-time guards, none of which had a test when they were written.
+
+    An adversarial pass found: the `fee_rate=` override unexercised, the reveal-time
+    rate gate unexercised, and `TestTheRecordOutlivesTheBroadcast`'s fixture unable to
+    distinguish "waits on the locally derived txid" from "waits on the server's echo",
+    because its fake echoed the correct txid either way.
+    """
+
+    LIE = "ff" * 32
+
+    @classmethod
+    def _lying_client(cls):
+        """Echoes a txid it was not handed, and confirms ONLY that one.
+
+        The discrimination matters. An earlier version of this fake confirmed every
+        txid, so waiting on the echo and waiting on the locally derived value both
+        succeeded and the test proved nothing. Here the lie is the only confirmed
+        transaction: code that trusts the echo sees "confirmed" and deletes the record;
+        code that trusts its own bytes waits, times out, and keeps it.
+        """
+
+        class _Client(FakeClient):
+            async def broadcast(self, raw_tx: bytes) -> str:
+                self.broadcasts.append(raw_tx)
+                self.calls.append("broadcast")
+                return cls.LIE
+
+            async def get_transaction_verbose(self, txid: str) -> dict:
+                # The commit confirms (it is queried before any reveal exists), the lie
+                # confirms, and the real reveal never does.
+                if txid == cls.LIE or txid in {b.hex() for b in ()}:
+                    return {"confirmations": 1}
+                return {"confirmations": 1 if not self.broadcasts[1:] else 0}
+
+        return _Client()
+
+    async def test_a_lying_echo_does_not_confirm_someone_elses_transaction(self):
+        """THE case the previous fixture could not see.
+
+        The record's protection is the confirmation wait. If that wait polls the
+        server's echo, a server can drop the reveal, name an already-confirmed txid, and
+        the record is deleted for a transaction that never relayed. Waiting on the
+        locally derived txid is what makes the guard real — so a lying echo must NOT
+        produce a confirmed reveal against the wrong txid.
+        """
+        store = RecordingStore()
+        client = self._lying_client()
+        minter = GlyphMinter(client, FakeWallet(_key()), store, confirmation_timeout_s=0.2)
+        pending = await minter.commit_nft(_nft_metadata())
+
+        with pytest.warns(UserWarning, match="echoed txid"):
+            with pytest.raises(Exception):
+                await minter.reveal_nft(pending)
+
+        assert store.load(pending.commit_txid) is not None, "record deleted on a lie"
+
+    async def test_a_stale_sub_floor_rate_is_refused_but_recoverable(self):
+        """A commit priced below the CURRENT floor must fail loudly, not silently relay
+        into a mempool that will drop it — and must stay revealable.
+
+        Refusing with no way through would be worse than the bug: the commit was funded
+        at the old rate, so raising the rate is not always affordable. Hence
+        `allow_below_relay_floor=True`.
+        """
+        store = RecordingStore()
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store, fee_rate=1)
+        pending = await minter.commit_nft(_nft_metadata())
+
+        with pytest.raises((ValidationError, ValueError), match="floor|relay"):
+            await minter.reveal_nft(pending)
+        assert store.load(pending.commit_txid) is not None, "a refusal must keep the record"
+
+        # The escape hatch: send it anyway, deliberately.
+        result = await minter.reveal_nft(pending, allow_below_relay_floor=True)
+        assert result.reveal_txid

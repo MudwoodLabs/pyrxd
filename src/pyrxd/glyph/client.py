@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S
-from ..security.errors import ValidationError
+from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Hex20
 from .builder import MIN_FEE_RATE
 from .mint import (
@@ -60,11 +60,16 @@ class TransferReceipt:
         return f"TransferReceipt(txid={self.txid!r}, amount={self.amount}, fee={self.fee})"
 
 
-class BroadcastEchoMismatch(ValidationError):
+class BroadcastEchoMismatch(RxdSdkError):
     """The server's txid did not match the transaction we signed.
 
-    Carries ``local_txid`` so a caller can still check the chain for what was actually
-    sent — the transaction may well have relayed.
+    Deliberately NOT a :class:`ValidationError`. Both transfer methods document their
+    ``ValidationError`` as raised *before anything is signed or sent*, and this is the
+    opposite: the broadcast already happened and the transaction may well have relayed.
+    A caller with ``except ValidationError: retry`` would re-broadcast a transfer that
+    already moved tokens.
+
+    Carries ``local_txid`` so the caller can check the chain for what was actually sent.
     """
 
     def __init__(self, local_txid: str, echoed: object) -> None:
@@ -233,9 +238,27 @@ class GlyphClient:
         """Phase 1 of an NFT mint. See :meth:`GlyphMinter.commit_nft`."""
         return await self.minter.commit_nft(metadata, owner_pkh=owner_pkh)
 
-    async def reveal_nft(self, pending: PendingMint) -> MintResult:
-        """Phase 2 of an NFT mint. See :meth:`GlyphMinter.reveal_nft`."""
-        return await self.minter.reveal_nft(pending)
+    async def reveal_nft(
+        self,
+        pending: PendingMint,
+        *,
+        fee_rate: int | None = None,
+        allow_below_relay_floor: bool = False,
+        allow_overpay: bool = False,
+    ) -> MintResult:
+        """Phase 2 of an NFT mint. See :meth:`GlyphMinter.reveal_nft`.
+
+        The three overrides are forwarded because without them the minter's escape hatch
+        is unreachable from this facade: a commit whose stored fee rate now sits below a
+        risen relay floor cannot be revealed at all, and re-pricing upward is only
+        possible when the commit holds enough to pay it.
+        """
+        return await self.minter.reveal_nft(
+            pending,
+            fee_rate=fee_rate,
+            allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
+        )
 
     # -- transfers ---------------------------------------------------------
 

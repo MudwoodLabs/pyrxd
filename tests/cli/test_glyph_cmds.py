@@ -1144,7 +1144,12 @@ class TestTransferNftAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return "ff" * 32
+            # Echo the txid of what we were actually sent. A constant here models a
+            # server that lies about which transaction it relayed, which the CLI now
+            # refuses — see `BroadcastEchoMismatch`.
+            from pyrxd.transaction.transaction import Transaction
+
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
@@ -1162,7 +1167,7 @@ class TestTransferNftAssembly:
         total_in = 1000 + 50_000_000
         total_out = sum(o.satoshis for o in tx.outputs)
         assert total_in - total_out > 0, "pays a real (non-zero) fee"
-        assert result["txid"] == "ff" * 32
+        assert result["txid"] == tx.txid(), "reports the txid of the bytes it broadcast"
 
 
 def _run_transfer_nft(cli_context, *, fund_value: int) -> tuple[list[bytes], object]:
@@ -1202,7 +1207,9 @@ def _run_transfer_nft(cli_context, *, fund_value: int) -> tuple[list[bytes], obj
 
     async def _bcast(raw: bytes) -> str:
         captured.append(raw)
-        return "ff" * 32
+        from pyrxd.transaction.transaction import Transaction
+
+        return Transaction.from_hex(raw.hex()).txid()
 
     client = MagicMock()
     client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
@@ -1790,10 +1797,18 @@ class TestTransferFtAllowOverpayIsWiredThrough:
 
         class _Build:
             fee = 1_000
-            tx = None
+
+            def __init__(self) -> None:
+                from pyrxd.script.script import Script
+                from pyrxd.transaction.transaction import Transaction
+                from pyrxd.transaction.transaction_output import TransactionOutput
+
+                self.tx = Transaction(tx_inputs=[], tx_outputs=[TransactionOutput(Script(b""), 0)])
 
             def serialize(self) -> bytes:
-                return b"\x00" * 200
+                # Real serialized bytes, not filler: the CLI now derives the txid from
+                # what it broadcast, so an unparseable payload no longer round-trips.
+                return self.tx.serialize()
 
         async def _fake_build(wallet, ref, amount, to_pkh, *, client, fee_rate, allow_overpay=False):
             seen["allow_overpay"] = allow_overpay
@@ -1806,7 +1821,7 @@ class TestTransferFtAllowOverpayIsWiredThrough:
     def _drive(self, cli_context, monkeypatch, *, allow_overpay):
         import asyncio
         import dataclasses
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import MagicMock
 
         from pyrxd.cli.glyph_cmds import _transfer_ft_inner
         from pyrxd.glyph.types import GlyphRef
@@ -1815,7 +1830,14 @@ class TestTransferFtAllowOverpayIsWiredThrough:
         seen, *_ = self._capture(monkeypatch)
         ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
         client = MagicMock()
-        client.broadcast = AsyncMock(return_value="ff" * 32)
+
+        # Must echo what it is handed; a constant now trips the echo-mismatch guard.
+        async def _echo(raw: bytes) -> str:
+            from pyrxd.transaction.transaction import Transaction
+
+            return Transaction.from_hex(raw.hex()).txid()
+
+        client.broadcast = _echo
 
         asyncio.run(
             _transfer_ft_inner(

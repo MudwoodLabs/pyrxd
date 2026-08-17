@@ -57,6 +57,7 @@ from ..glyph.builder import (
     RevealParams,
     RevealScripts,
 )
+from ..glyph.client import BroadcastEchoMismatch, _confirmed_txid
 from ..glyph.dmint import (
     DEFAULT_MAX_ATTEMPTS,
     MAX_SHA256D_TARGET,
@@ -1012,8 +1013,19 @@ async def _transfer_ft_inner(
             ),
         ],
     )
-    txid = await client.broadcast(raw)
-    return {"txid": str(txid), "ref": f"{ref.txid}:{ref.vout}", "amount": amount, "to": to_address}
+    echoed = await client.broadcast(raw)
+    # Report the txid of what we signed. A server that drops the transfer and echoes some
+    # other well-formed txid would otherwise have the CLI print it as success.
+    try:
+        txid = _confirmed_txid(build, echoed)
+    except BroadcastEchoMismatch as exc:
+        raise UserError(
+            "the server returned a different transaction id than the one we signed",
+            cause=str(exc),
+            fix=f"check {exc.local_txid} on an explorer — if it is there the transfer went "
+            "through and only the server's reply was wrong",
+        ) from exc
+    return {"txid": txid, "ref": f"{ref.txid}:{ref.vout}", "amount": amount, "to": to_address}
 
 
 async def _airdrop_funding(
@@ -1364,6 +1376,12 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
 
     from ..utils import address_to_public_key_hash
 
+    # Same network pin as `transfer-ft` (:824) and `airdrop-ft` (:1239), and this is the
+    # worst of the three to omit: a testnet-prefixed address decodes to a perfectly valid
+    # PKH on mainnet, so the singleton is re-locked to a script no mainnet key can spend.
+    # An NFT has no second copy and Radiant has no RBF/CPFP — the transfer cannot be
+    # recalled and the token cannot be reissued.
+    _require_address_on_network(ctx, to_address, what="--to address")
     try:
         to_pkh = Hex20(address_to_public_key_hash(to_address))
     except (ValidationError, ValueError) as exc:
@@ -1502,8 +1520,17 @@ async def _transfer_nft_inner(
             ),
         ],
     )
-    txid = await client.broadcast(raw)
-    return {"txid": str(txid), "ref": f"{ref.txid}:{ref.vout}", "to": to_address, "fee": build.fee}
+    echoed = await client.broadcast(raw)
+    try:
+        txid = _confirmed_txid(build, echoed)
+    except BroadcastEchoMismatch as exc:
+        raise UserError(
+            "the server returned a different transaction id than the one we signed",
+            cause=str(exc),
+            fix=f"check {exc.local_txid} on an explorer — if it is there the transfer went "
+            "through and only the server's reply was wrong",
+        ) from exc
+    return {"txid": txid, "ref": f"{ref.txid}:{ref.vout}", "to": to_address, "fee": build.fee}
 
 
 # ---------------------------------------------------------------------------
