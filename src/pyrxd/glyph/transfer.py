@@ -160,6 +160,9 @@ async def select_ft_inputs(
         InsufficientFundsError: no holdings of ``ref``, or holdings that do not
             cover ``amount``. Raised before anything is built.
     """
+    if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
+        raise ValidationError("FT transfer amount must be a positive int")
+
     from .script import is_ft_script
 
     # The classification loop below is the ONLY source of truth for what this wallet
@@ -216,10 +219,28 @@ async def select_ft_inputs(
     for triple in ft_inputs:
         by_address.setdefault(triple[1], []).append(triple)
 
-    # Best fit: among the addresses that CAN cover `amount`, take the one holding least,
-    # so a large consolidated holding is not fragmented to satisfy a small transfer.
+    # Choose by INPUT COUNT first, not by holding size.
+    #
+    # An earlier version took the address with the smallest sufficient total, reasoning
+    # that a large consolidated holding should not be fragmented. That is the wrong cost
+    # model: the fee-funding bar scales with the number of inputs (`ft_funding` sizes at
+    # ~148 B each), so for amount=1000 it preferred an address holding 500+500 (two
+    # inputs) over one holding 1,000,000 (one input) — a more expensive transaction that
+    # can then be REFUSED for fee funding the single-input build would not have needed.
+    #
+    # So: fewest inputs wins; ties break on the smaller total, which keeps the original
+    # anti-fragmentation intent where it costs nothing.
+    def _inputs_needed(group: list[tuple[FtUtxo, str, PrivateKey]]) -> tuple[int, int]:
+        """(inputs required to cover `amount`, total held) for this address."""
+        running = 0
+        for n, triple in enumerate(sorted(group, key=lambda t: t[0].ft_amount, reverse=True), 1):
+            running += triple[0].ft_amount
+            if running >= amount:
+                return n, sum(t[0].ft_amount for t in group)
+        return len(group), sum(t[0].ft_amount for t in group)
+
     sufficient = [
-        (sum(t[0].ft_amount for t in group), addr, group)
+        (*_inputs_needed(group), addr, group)
         for addr, group in by_address.items()
         if sum(t[0].ft_amount for t in group) >= amount
     ]
@@ -231,8 +252,8 @@ async def select_ft_inputs(
             f"{len(by_address)} addresses). Consolidate the token to one address first — "
             "every input of an FT transfer is signed with one key."
         )
-    sufficient.sort(key=lambda t: t[0])
-    _total, _addr, group = sufficient[0]
+    sufficient.sort(key=lambda t: (t[0], t[1]))
+    _n_inputs, _total, _addr, group = sufficient[0]
 
     group.sort(key=lambda t: t[0].ft_amount, reverse=True)
     selected: list[tuple[FtUtxo, str, PrivateKey]] = []

@@ -31,7 +31,7 @@ from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
-from pyrxd.security.errors import InsufficientFundsError
+from pyrxd.security.errors import InsufficientFundsError, ValidationError
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
@@ -310,6 +310,36 @@ class TestFtSelectionDoesNotRefuseWhatItPicked:
         msg = str(exc.value)
         assert "any single address" in msg
         assert "Consolidate" in msg
+
+    @pytest.mark.asyncio
+    async def test_it_prefers_fewer_inputs_over_a_smaller_holding(self) -> None:
+        """The fee-funding bar scales with input COUNT, so holding size is the wrong
+        tie-breaker.
+
+        Found by an adversarial reviewer against the first version of this fix, which
+        took the smallest sufficient total: for amount=1000 it preferred an address
+        holding 500+500 (two inputs) over one holding 1,000,000 (one input) — a more
+        expensive transaction that `ft_funding` can then refuse for fee funding the
+        one-input build would not have needed.
+        """
+        from pyrxd.glyph.transfer import select_ft_inputs
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"many_small": [500, 500], "one_big": [1_000_000]}, ref)
+
+        selected = await select_ft_inputs(wallet, ref, 1000, client)
+        assert len(selected) == 1, "picked the multi-input address; the fee bar scales per input"
+
+    @pytest.mark.asyncio
+    async def test_a_non_positive_amount_is_refused_at_the_public_entry_point(self) -> None:
+        """`select_ft_inputs` is public API; only `build_ft_transfer` used to validate."""
+        from pyrxd.glyph.transfer import select_ft_inputs
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"A": [100]}, ref)
+        for bad in (0, -5):
+            with pytest.raises(ValidationError, match="positive int"):
+                await select_ft_inputs(wallet, ref, bad, client)
 
     @pytest.mark.asyncio
     async def test_it_does_not_fragment_a_large_holding(self) -> None:

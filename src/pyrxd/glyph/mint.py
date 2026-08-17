@@ -85,7 +85,7 @@ from typing import Any, ClassVar
 
 from ..constants import DUST_THRESHOLD_PHOTONS
 from ..fee_models import SatoshisPerKilobyte
-from ..fee_sizing import assert_pays_for_its_size
+from ..fee_sizing import assert_fee_rate_clears_relay_floor, assert_pays_for_its_size
 from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, wait_for_confirmation
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata, to_unlock_script_template
@@ -765,7 +765,7 @@ class GlyphMinter:
 
     # -- phase 2 -----------------------------------------------------------
 
-    async def reveal_nft(self, pending: PendingMint) -> MintResult:
+    async def reveal_nft(self, pending: PendingMint, *, fee_rate: int | None = None) -> MintResult:
         """Wait for the commit, then broadcast the NFT reveal.
 
         The stored record is re-validated against the commit script before anything is
@@ -780,9 +780,9 @@ class GlyphMinter:
                 "Revealing it as an NFT would build the wrong locking script and the commit "
                 "script's OP_REFTYPE_OUTPUT check would reject the spend."
             )
-        return await self._reveal(pending)
+        return await self._reveal(pending, fee_rate=fee_rate)
 
-    async def reveal_ft(self, pending: PendingMint) -> MintResult:
+    async def reveal_ft(self, pending: PendingMint, *, fee_rate: int | None = None) -> MintResult:
         """Wait for the commit, then broadcast the FT deploy reveal.
 
         Mirrors :meth:`reveal_nft`; the reveal's token output carries the whole premined
@@ -796,7 +796,7 @@ class GlyphMinter:
                 "Revealing it as an FT would build the wrong locking script and the commit "
                 "script's OP_REFTYPE_OUTPUT check would reject the spend."
             )
-        return await self._reveal(pending)
+        return await self._reveal(pending, fee_rate=fee_rate)
 
     # -- both phases -------------------------------------------------------
 
@@ -1003,7 +1003,7 @@ class GlyphMinter:
                 "payload would not be recoverable after a crash"
             )
 
-    async def _reveal(self, pending: PendingMint) -> MintResult:
+    async def _reveal(self, pending: PendingMint, *, fee_rate: int | None = None) -> MintResult:
         funding_key = self._key_for_address(pending.funding_address)
         self._assert_payload_still_matches(pending, funding_key)
 
@@ -1016,25 +1016,53 @@ class GlyphMinter:
 
         locking = P2PKH().lock(pending.funding_address)
         reveal_tx = self._build_reveal_tx(pending, funding_key, locking)
-        reveal_tx.fee(SatoshisPerKilobyte(pending.fee_rate * 1000))
+        effective_rate = pending.fee_rate if fee_rate is None else fee_rate
+        reveal_tx.fee(SatoshisPerKilobyte(effective_rate * 1000))
         reveal_tx.sign()
 
-        # The fee was sized from `pending.fee_rate`, captured when the COMMIT was built —
-        # possibly weeks ago, since this module advertises resuming after a reboot. If the
-        # relay floor has moved since, or `Transaction.fee()`'s estimate falls short of the
-        # signed bytes, this reveal is underpaid. Radiant has no RBF and no CPFP, so an
-        # underpaid reveal cannot be repaired: it sits until mempool expiry while the commit
-        # it was meant to spend stays a hashlock. Prove it pays for itself on the bytes about
-        # to be broadcast, before broadcasting them.
+        # Two separate checks, because they catch different things and the first one
+        # alone does NOT catch what an earlier version of this comment claimed.
+        #
+        # `assert_pays_for_its_size` measures the signed bytes against `pending.fee_rate`
+        # — the rate stored when the COMMIT was built, possibly weeks ago. It therefore
+        # cannot see a relay floor that has MOVED since: `required_fee` deliberately does
+        # not lift a sub-floor rate (`fee_sizing`), so a stale rate agrees with itself and
+        # the check passes on a transaction no node will relay.
+        #
+        # So judge the rate against the CURRENT floor first. A refusal here is recoverable
+        # — the record is still on disk and `fee_rate=` re-reveals at a live rate — whereas
+        # broadcasting an unrelayable reveal is not: Radiant has neither RBF nor CPFP, and
+        # it would sit until mempool expiry while the commit stays a hashlock.
+        assert_fee_rate_clears_relay_floor(
+            effective_rate,
+            what="glyph reveal",
+            allow_overpay=True,  # the ceiling was already judged when the commit was built
+        )
+
         raw = reveal_tx.serialize()
         assert_pays_for_its_size(
             size_bytes=len(raw),
             fee_paid=reveal_tx.get_fee(),
-            fee_rate=pending.fee_rate,
+            fee_rate=effective_rate,
             what="glyph reveal",
         )
 
-        reveal_txid = await self._client.broadcast(raw)
+        echoed = await self._client.broadcast(raw)
+
+        # Wait on the txid of what WE signed, not on what the server said. Otherwise the
+        # confirmation gate below — the whole point of which is to protect the record
+        # until the reveal is really mined — can be satisfied by a server that drops the
+        # reveal and echoes any already-confirmed txid. `client.py` derives receipts the
+        # same way; `get_transaction` already binds `hash256(raw)` on the read path.
+        reveal_txid = str(reveal_tx.txid())
+        if str(echoed) != reveal_txid:
+            warnings.warn(
+                f"broadcast echoed txid {echoed} but the signed reveal hashes to "
+                f"{reveal_txid}. Waiting on the local value; if the server relayed "
+                "something else, this will time out and the pending record is kept.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         # Deleting here used to be justified as "the reveal could still fail to relay" —
         # which reasons about rejection, and misses acceptance-then-eviction. A mempool
@@ -1064,31 +1092,30 @@ class GlyphMinter:
         )
 
     def _delete_record_and_any_duplicate(self, pending: PendingMint) -> None:
-        """Drop this mint's record, including a sibling filed under the server's txid.
+        """Drop the record for the mint that was just revealed — and ONLY that record.
 
-        When a broadcast echoes a different txid than the bytes hash to, the payload is
-        filed under BOTH keys so either can be revealed. Deleting only the one we were
-        handed left the other behind, and `list_pending()` then re-offers a mint that
-        has already been revealed — an operator following that prompt rebuilds a reveal
-        for a commit that is already spent.
+        An earlier version of this also hunted a sibling record filed under a server's
+        echoed txid, identifying it by matching ``cbor_bytes``. That was WRONG and
+        strictly more dangerous than the orphan it cleaned up.
 
-        The CBOR payload is unique per mint, so it identifies the sibling exactly.
+        ``encode_payload`` is a pure function of the metadata (``glyph/payload.py``), and
+        ``GlyphMetadata.created`` / ``commit_outpoint`` both default to ``""`` and are
+        omitted from the encoded dict when empty (``glyph/types.py:316-317, 452-455``).
+        So two independent mints of the SAME metadata — a batch of identical badges, or a
+        re-run after a perceived failure — produce byte-identical CBOR. Demonstrated:
+        two fresh ``GlyphMetadata`` objects with the same fields encode equal. Matching on
+        payload therefore matches a DIFFERENT mint's live record, and deleting it destroys
+        the only copy of the payload needed to spend that commit — which is a hashlock
+        with no owner-only spend path. Permanent loss, to tidy up a duplicate key.
+
+        The duplicate is left in place deliberately. It exists only in the rare branch
+        where a broadcast echoes a txid the signed bytes do not hash to, and that branch
+        already warns the operator to check which transaction landed. An extra record in
+        ``list_pending()`` is a prompt to re-check; a deleted record is unrecoverable
+        value. Removing it safely needs the echoed txid persisted ON the record, which is
+        a store-schema change and its own piece of work.
         """
         self._store.delete(pending.commit_txid)
-        for key in list(self._store.list_pending()):
-            if key == pending.commit_txid:
-                continue
-            try:
-                other = self._store.load(key)
-            except Exception:  # noqa: S112  # nosec B112 - see below
-                # Deliberate: this loop hunts a DUPLICATE of a record already deleted. A
-                # stored record we cannot parse is, by definition, not the one we are
-                # looking for — and raising here would abort a cleanup that runs after a
-                # SUCCESSFUL reveal, handing the caller an exception for a mint that in
-                # fact completed.
-                continue
-            if other.cbor_bytes == pending.cbor_bytes:
-                self._store.delete(key)
 
     @staticmethod
     def _assert_payload_still_matches(pending: PendingMint, funding_key: Any) -> None:

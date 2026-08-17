@@ -1291,6 +1291,10 @@ async def _airdrop_ft_inner(
         private_key=first_key,
         funding=[funding],
         fee_rate=ctx.fee_rate,
+        # Reaches the builder's OWN rate gate. Without it the flag relaxed only the
+        # post-build overpay check, so `--allow-overpay` could not get past a
+        # ceiling refusal — an override the help text promised and did not deliver.
+        allow_overpay=allow_overpay,
     )
     try:
         airdrop_result = GlyphBuilder().build_ft_airdrop_tx(params)

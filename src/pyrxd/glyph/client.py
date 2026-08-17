@@ -19,7 +19,6 @@ one-line fix rather than failing later.
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING, Any
 
 from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S
@@ -38,7 +37,7 @@ from .transfer import FtTransferBuild, NftTransferBuild, build_ft_transfer, buil
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .types import GlyphMetadata, GlyphRef
 
-__all__ = ["GlyphClient", "NftTransferReceipt", "TransferReceipt"]
+__all__ = ["BroadcastEchoMismatch", "GlyphClient", "NftTransferReceipt", "TransferReceipt"]
 
 
 class TransferReceipt:
@@ -61,6 +60,24 @@ class TransferReceipt:
         return f"TransferReceipt(txid={self.txid!r}, amount={self.amount}, fee={self.fee})"
 
 
+class BroadcastEchoMismatch(ValidationError):
+    """The server's txid did not match the transaction we signed.
+
+    Carries ``local_txid`` so a caller can still check the chain for what was actually
+    sent — the transaction may well have relayed.
+    """
+
+    def __init__(self, local_txid: str, echoed: object) -> None:
+        super().__init__(
+            f"broadcast echoed txid {echoed!r} but the signed transaction hashes to "
+            f"{local_txid!r}. The server may not have relayed what was sent. Check "
+            f"{local_txid} on an explorer before treating this transfer as done; if it is "
+            "there, the transfer succeeded and only the server's reply was wrong."
+        )
+        self.local_txid = local_txid
+        self.echoed = echoed
+
+
 def _confirmed_txid(build: FtTransferBuild | NftTransferBuild, echoed: object) -> str:
     """The txid of what we signed — not merely what the server said it was.
 
@@ -75,18 +92,16 @@ def _confirmed_txid(build: FtTransferBuild | NftTransferBuild, echoed: object) -
     requested txid for reads; this is the same discipline on the write path, which the
     swap stack adopted for the same reason.
 
-    A mismatch is not fatal — the transaction may well have relayed — so this warns
-    rather than raising, and always returns the locally derived value.
+    A mismatch RAISES rather than warning. An earlier version warned and returned a
+    normal success receipt, which is the wrong default for fund-moving code: programmatic
+    callers do not see warnings (``-W ignore``, log filters, non-tty runs), so a hostile
+    server could drop every transfer while the application recorded success. Failing loudly
+    costs an exception on a transfer that may have relayed anyway — and the exception
+    carries the local txid so that is checkable — while failing quietly costs the tokens.
     """
     local = str(build.tx.txid())
     if str(echoed) != local:
-        warnings.warn(
-            f"broadcast echoed txid {echoed!r} but the signed transaction hashes to "
-            f"{local!r}; reporting the local value. The server may not have relayed what "
-            "was sent — verify on an explorer before treating this transfer as done.",
-            RuntimeWarning,
-            stacklevel=3,
-        )
+        raise BroadcastEchoMismatch(local, echoed)
     return local
 
 
