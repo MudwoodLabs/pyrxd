@@ -21,6 +21,7 @@ asserting the tightened parser still accepts what consensus accepts.
 from __future__ import annotations
 
 import ast
+import functools
 import hashlib
 import inspect
 import re
@@ -76,6 +77,19 @@ _SRC = Path(__file__).resolve().parent.parent / "src" / "pyrxd"
 # fixed 36-byte immediate after each of the five ref opcodes. A walker that
 # clamps reports a chunk list for a script the node cannot read; a walker that
 # is ref-blind starts reading ref bytes as opcodes the moment one appears.
+
+
+@functools.cache
+def _parsed_source(path: Path):
+    """Read + parse a file once. Both whole-tree sweeps below want the same trees.
+
+    Single-caller today, so this buys little now — it is here because the identical
+    read-and-parse-per-file shape became a 5x CI penalty on Python 3.10/3.11 once it
+    sat inside a parametrisation (see
+    docs/solutions/performance-issues/ast-get-source-segment-rescans-the-whole-file-before-python-3-12.md).
+    Caching now means parametrising either sweep later cannot reintroduce it.
+    """
+    return ast.parse(path.read_text(encoding="utf-8"))
 
 
 def _truncated_scripts() -> list[tuple[str, bytes]]:
@@ -531,7 +545,7 @@ def _module_constant_offenders(names: set[str]) -> dict[str, list[str]]:
     for path in sorted(_SRC.rglob("*.py")):
         if path.name == "constants.py":
             continue
-        tree = ast.parse(path.read_text(encoding="utf-8"))
+        tree = _parsed_source(path)
         for node in ast.walk(tree):
             if not isinstance(node, ast.Assign):
                 continue
@@ -624,7 +638,7 @@ def _hash160_call_sites() -> list[str]:
         for path in sorted(scanned.rglob("*.py")):
             if path.name == "hash.py":
                 continue
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            for node in ast.walk(_parsed_source(path)):
                 if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
                     continue
                 if node.func.attr != "new" or not node.args:
