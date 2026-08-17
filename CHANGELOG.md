@@ -74,7 +74,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   long signature cannot leave a transaction underpaid. Measured over 300 real
   single-recipient transfers, that overshoot ran 4-9 bytes and **300 of 300 were refused**.
   The tolerance now allows the builders' own slack; 300 of 300 pass, while +13 bytes, +1 RXD
-  and the +23.1 RXD case are all still refused. None of this reached a release — the whole
+  and the +23.3 RXD case are all still refused. None of this reached a release — the whole
   cycle happened under this same `[Unreleased]` heading.
 
 ## [0.18.0] — 2026-08-13

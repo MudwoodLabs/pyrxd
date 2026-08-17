@@ -19,6 +19,7 @@ one-line fix rather than failing later.
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any
 
 from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S
@@ -60,6 +61,35 @@ class TransferReceipt:
         return f"TransferReceipt(txid={self.txid!r}, amount={self.amount}, fee={self.fee})"
 
 
+def _confirmed_txid(build: FtTransferBuild | NftTransferBuild, echoed: object) -> str:
+    """The txid of what we signed — not merely what the server said it was.
+
+    `broadcast` returns whatever the server replies, and the reply is only
+    format-checked. A lying or buggy ElectrumX can drop the transaction and echo any
+    well-formed txid — including a real, already-confirmed one — and the caller then
+    polls a txid that has nothing to do with their tokens, sees "confirmed", and
+    believes a transfer happened that did not.
+
+    The txid is a pure function of the signed bytes, so we do not have to take the
+    server's word for it. `get_transaction` already binds `hash256(raw)` to the
+    requested txid for reads; this is the same discipline on the write path, which the
+    swap stack adopted for the same reason.
+
+    A mismatch is not fatal — the transaction may well have relayed — so this warns
+    rather than raising, and always returns the locally derived value.
+    """
+    local = str(build.tx.txid())
+    if str(echoed) != local:
+        warnings.warn(
+            f"broadcast echoed txid {echoed!r} but the signed transaction hashes to "
+            f"{local!r}; reporting the local value. The server may not have relayed what "
+            "was sent — verify on an explorer before treating this transfer as done.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+    return local
+
+
 class NftTransferReceipt:
     """What a broadcast NFT transfer actually did.
 
@@ -97,7 +127,7 @@ class GlyphClient:
         receipt = await client.transfer_ft(ref, 250, recipient_pkh)
 
     Args:
-        client: an ElectrumX-style client — ``await broadcast(hex) -> txid``,
+        client: an ElectrumX-style client — ``await broadcast(raw_tx: bytes) -> txid``,
             ``await get_transaction(txid)``, ``await get_utxos(script_hash)``.
         wallet: an :class:`~pyrxd.hd.wallet.HdWallet`, or anything exposing
             ``await collect_spendable(client)``, ``privkey_for_address(address)`` and
@@ -168,9 +198,21 @@ class GlyphClient:
         """Commit and reveal an NFT singleton. See :meth:`GlyphMinter.mint_nft`."""
         return await self.minter.mint_nft(metadata, owner_pkh=owner_pkh)
 
-    async def deploy_ft(self, *args: Any, **kwargs: Any) -> MintResult:
-        """Deploy a fungible token with a full premine. See :meth:`GlyphMinter.deploy_ft`."""
-        return await self.minter.deploy_ft(*args, **kwargs)
+    async def deploy_ft(
+        self,
+        metadata: GlyphMetadata,
+        *,
+        supply: int,
+        treasury_pkh: Hex20 | bytes | None = None,
+    ) -> MintResult:
+        """Deploy a fungible token with a full premine. See :meth:`GlyphMinter.deploy_ft`.
+
+        Spelled out rather than ``*args, **kwargs``: this is a published SDK, and the
+        erased signature was the only one of the five facade methods that gave a caller
+        no completion, no type checking, and a ``TypeError`` from inside the minter
+        instead of at the call site.
+        """
+        return await self.minter.deploy_ft(metadata, supply=supply, treasury_pkh=treasury_pkh)
 
     async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 | bytes | None = None) -> PendingMint:
         """Phase 1 of an NFT mint. See :meth:`GlyphMinter.commit_nft`."""
@@ -226,16 +268,18 @@ class GlyphClient:
                 parameters, or change would have been paid to the miner.
         """
         build = await self.build_ft_transfer(ref, amount, to_pkh, allow_overpay=allow_overpay)
-        txid = await self._client.broadcast(build.serialize())
+        echoed = await self._client.broadcast(build.serialize())
         return TransferReceipt(
-            txid=str(txid),
+            txid=_confirmed_txid(build, echoed),
             ref=ref,
             amount=amount,
             fee=build.fee,
             to_pkh=to_pkh,
         )
 
-    async def build_nft_transfer(self, ref: GlyphRef, to_pkh: Hex20) -> NftTransferBuild:
+    async def build_nft_transfer(
+        self, ref: GlyphRef, to_pkh: Hex20, *, allow_overpay: bool = False
+    ) -> NftTransferBuild:
         """Build and sign an NFT transfer **without broadcasting it**.
 
         The singleton keeps its own value; the fee comes from a separate plain-RXD
@@ -248,9 +292,10 @@ class GlyphClient:
             to_pkh,
             client=self._client,
             fee_rate=self._fee_rate,
+            allow_overpay=allow_overpay,
         )
 
-    async def transfer_nft(self, ref: GlyphRef, to_pkh: Hex20) -> NftTransferReceipt:
+    async def transfer_nft(self, ref: GlyphRef, to_pkh: Hex20, *, allow_overpay: bool = False) -> NftTransferReceipt:
         """Send the NFT singleton ``ref`` to ``to_pkh``, and broadcast.
 
         The singleton's value crosses unchanged and the fee is paid from plain RXD.
@@ -263,6 +308,6 @@ class GlyphClient:
                 signed or sent.
             ValidationError: the signed transaction does not pay for its own size.
         """
-        build = await self.build_nft_transfer(ref, to_pkh)
-        txid = await self._client.broadcast(build.serialize())
-        return NftTransferReceipt(txid=str(txid), ref=ref, fee=build.fee, to_pkh=to_pkh)
+        build = await self.build_nft_transfer(ref, to_pkh, allow_overpay=allow_overpay)
+        echoed = await self._client.broadcast(build.serialize())
+        return NftTransferReceipt(txid=_confirmed_txid(build, echoed), ref=ref, fee=build.fee, to_pkh=to_pkh)

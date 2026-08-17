@@ -97,35 +97,18 @@ class TestTheAdapterSatisfiesTheTransferPath:
         assert records[0].address == key.public_key().address()
 
     @pytest.mark.asyncio
-    async def test_a_transfer_builds_end_to_end_through_glyphclient(self, scripted, monkeypatch) -> None:
+    async def test_a_transfer_builds_end_to_end_through_glyphclient(self, scripted) -> None:
         """The claim the rewrite rests on: the example's wallet drives the real path.
 
-        ``select_ft_inputs`` reaches for a ``GlyphScanner`` to confirm the wallet holds
-        the token before selecting inputs, which wants a live server. The scan is
-        stubbed to report the holding; everything after it — input selection against
-        the on-chain scripts, fee funding, the build — is the real code.
+        This used to stub a ``GlyphScanner``, because ``select_ft_inputs`` ran a scan
+        over every used address before selecting inputs. That scan was removed — its
+        result was discarded after an emptiness check the classification loop already
+        answers — so there is nothing left to stub and the whole path below is real
+        code: input selection against the on-chain locking scripts, fee funding, and
+        the build.
         """
         client, key, ref = scripted
         demo = _import_demo()
-
-        from pyrxd.glyph import transfer as transfer_mod
-        from pyrxd.glyph.types import GlyphFt
-
-        class _Scanner:
-            def __init__(self, _client):
-                pass
-
-            async def scan_address(self, _address):
-                return [
-                    GlyphFt(
-                        ref=ref,
-                        owner_pkh=Hex20(key.public_key().hash160()),
-                        amount=HOLDING,
-                        metadata=None,
-                    )
-                ]
-
-        monkeypatch.setattr(transfer_mod, "GlyphScanner", _Scanner)
 
         glyph = demo.GlyphClient(client, demo.SingleKeyWallet(key), fee_rate=FEE_RATE)
         build = await glyph.build_ft_transfer(ref, AMOUNT, Hex20(PrivateKey().public_key().hash160()))

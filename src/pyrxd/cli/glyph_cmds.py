@@ -80,6 +80,7 @@ from ..glyph.fees import (
     measure_reveal_fee,
 )
 from ..glyph.scanner import GlyphScanner
+from ..glyph.transfer import NoFeeFundingError, NoHoldingsError
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
 from ..glyph.transfer import build_nft_transfer as lib_build_nft_transfer
 from ..glyph.transfer import find_plain_rxd_utxo as lib_find_plain_rxd_utxo
@@ -798,9 +799,10 @@ async def _deploy_ft_inner(
     "--allow-overpay",
     is_flag=True,
     default=False,
-    help="Accept a fee above what the transaction's size demands. Relaxes BOTH bounds: the "
-    "rate ceiling (10x the relay floor) and the check that the fee matches the signed bytes. "
-    "Neither should refuse an ordinary transfer — this exists so a refusal is never a dead end.",
+    help="Accept a fee far above what the signed transaction's size demands. Relaxes the rate "
+    "ceiling (10x the relay floor) and the overpay check. It does NOT relax the underpay "
+    "invariant — a transaction must always pay for its own size. Exists so a refusal is "
+    "never a dead end on a chain with no RBF or CPFP.",
 )
 @click.pass_obj
 def transfer_ft_cmd(
@@ -891,15 +893,14 @@ async def _select_ft_inputs(
     """
     try:
         return await lib_select_ft_inputs(wallet, ref, amount, client)
-    except InsufficientFundsError as exc:
-        msg = str(exc)
-        if "no FT holdings" in msg:
-            raise UserError(
-                f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-                fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
-            ) from exc
+    except NoHoldingsError as exc:
         raise UserError(
-            msg,
+            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
+            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+        ) from exc
+    except InsufficientFundsError as exc:
+        raise UserError(
+            str(exc),
             fix="check holdings with `pyrxd glyph list --type ft`",
         ) from exc
 
@@ -963,20 +964,19 @@ async def _transfer_ft_inner(
             fee_rate=ctx.fee_rate,
             allow_overpay=allow_overpay,
         )
+    except NoHoldingsError as exc:
+        raise UserError(
+            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
+            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+        ) from exc
+    except NoFeeFundingError as exc:
+        raise UserError(
+            "no plain-RXD UTXO large enough to fund the fee",
+            cause=str(exc),
+            fix="send some plain RXD to this wallet — the token cannot pay its own fee",
+        ) from exc
     except InsufficientFundsError as exc:
-        msg = str(exc)
-        if "no FT holdings" in msg:
-            raise UserError(
-                f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-                fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
-            ) from exc
-        if "plain-RXD" in msg:
-            raise UserError(
-                "no plain-RXD UTXO large enough to fund the fee",
-                cause=msg,
-                fix="send some plain RXD to this wallet — the token cannot pay its own fee",
-            ) from exc
-        raise UserError(msg, fix="check holdings with `pyrxd glyph list --type ft`") from exc
+        raise UserError(str(exc), fix="check holdings with `pyrxd glyph list --type ft`") from exc
     except (ValidationError, ValueError) as exc:
         # A fee-bound refusal and a funding shortfall are different problems with
         # different remedies. Telling someone to add RXD when the build was refused
@@ -1323,8 +1323,16 @@ async def _airdrop_ft_inner(
 @click.argument("ref", type=str)
 @click.option("--to", "to_address", required=True, help="Recipient address.")
 @click.option("--passphrase/--no-passphrase", default=False)
+@click.option(
+    "--allow-overpay",
+    is_flag=True,
+    default=False,
+    help="Accept a fee far above what the signed transaction's size demands. Relaxes the rate "
+    "ceiling (10x the relay floor). It does NOT relax the underpay invariant. Exists so a "
+    "refusal is never a dead end on a chain with no RBF or CPFP.",
+)
 @click.pass_obj
-def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: bool) -> None:
+def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: bool, allow_overpay: bool) -> None:
     """Transfer the NFT singleton REF (txid:vout) to --to ADDRESS."""
     glyph_ref = _parse_ref(ref)
 
@@ -1340,7 +1348,9 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
     async def _do_transfer() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _transfer_nft_inner(ctx, wallet, glyph_ref, to_pkh, to_address, client)
+            return await _transfer_nft_inner(
+                ctx, wallet, glyph_ref, to_pkh, to_address, client, allow_overpay=allow_overpay
+            )
 
     try:
         result = asyncio.run(_do_transfer())
@@ -1406,6 +1416,8 @@ async def _transfer_nft_inner(
     to_pkh: Hex20,
     to_address: str,
     client: ElectrumXClient,
+    *,
+    allow_overpay: bool = False,
 ) -> dict:
     """Find the singleton NFT utxo and re-lock it to to_pkh.
 
@@ -1426,17 +1438,17 @@ async def _transfer_nft_inner(
             to_pkh,
             client=client,
             fee_rate=ctx.fee_rate,
+            allow_overpay=allow_overpay,
         )
+    except NoHoldingsError as exc:
+        raise UserError(
+            f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
+            fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
+        ) from exc
     except InsufficientFundsError as exc:
-        msg = str(exc)
-        if "not held by this wallet" in msg:
-            raise UserError(
-                f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
-                fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
-            ) from exc
         raise UserError(
             "no plain-RXD UTXO large enough to fund the NFT transfer fee",
-            cause=msg,
+            cause=str(exc),
             fix="fund this wallet with plain RXD (the NFT itself carries only dust)",
         ) from exc
     except (ValidationError, ValueError) as exc:

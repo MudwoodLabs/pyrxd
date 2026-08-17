@@ -857,3 +857,55 @@ def test_no_export_name_was_silently_overwritten():
     assert len(set(targets)) == len(targets), "two public names resolve to the same target"
     for name, (module, attr) in glyph_pkg._LAZY_EXPORTS.items():
         assert attr == name, f"{name} is re-exported under a different attribute name ({module}.{attr})"
+
+
+class TestTheRecordOutlivesTheBroadcast:
+    """The pending record must survive a reveal that relays but never confirms.
+
+    A mempool accept is not a block. If the reveal is evicted at expiry (~8h) and the
+    record was already deleted, the CBOR payload needed to rebuild it is gone — and the
+    commit output is a hashlock with no owner-only spend path, so its value is
+    unrecoverable. The delete therefore waits for the reveal to confirm.
+    """
+
+    @staticmethod
+    def _never_confirms():
+        """A client that accepts the broadcast and then reports 0 confirmations forever."""
+
+        class _Client(FakeClient):
+            def __init__(self) -> None:
+                super().__init__(confirmations=0)
+                self._commit_txid: str | None = None
+
+            async def get_transaction_verbose(self, txid: str) -> dict:
+                # The COMMIT confirms — the reveal cannot even be built otherwise. Every
+                # LATER txid is the reveal, and it never confirms: the accepted-then-evicted
+                # case this test exists for. Pinning the commit's txid on first sight is
+                # deliberate; an earlier version of this fake confirmed the first sighting
+                # of *any* txid, which silently confirmed the reveal too and made the test
+                # pass against the very bug it was written to catch.
+                if self._commit_txid is None:
+                    self._commit_txid = txid
+                return {"confirmations": 1 if txid == self._commit_txid else 0}
+
+        return _Client()
+
+    async def test_an_unconfirmed_reveal_keeps_the_record(self):
+        store = RecordingStore()
+        minter = GlyphMinter(
+            self._never_confirms(),
+            FakeWallet(_key()),
+            store,
+            confirmation_timeout_s=0.2,
+        )
+        pending = await minter.commit_nft(_nft_metadata())
+        assert store.load(pending.commit_txid) is not None
+
+        with pytest.raises(Exception):
+            await minter.reveal_nft(pending)
+
+        # THE assertion. Deleting here would strand the commit permanently.
+        assert store.load(pending.commit_txid) is not None, (
+            "the pending record was deleted for a reveal that never confirmed — "
+            "the commit is a hashlock and its value is now unrecoverable"
+        )

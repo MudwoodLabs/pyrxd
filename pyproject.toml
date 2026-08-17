@@ -206,7 +206,7 @@ lint = "ruff check src tests examples && bandit -r src/ -c pyproject.toml --quie
 format = "ruff format src tests examples"
 format-check = "ruff format --check src tests examples"
 test = "pytest"
-typecheck = "mypy src/pyrxd/security/"
+typecheck = "mypy src/pyrxd/security/ src/pyrxd/glyph/transfer.py src/pyrxd/glyph/client.py"
 coverage-security = 'pytest tests/security/ -o "addopts=" --cov=pyrxd.security --cov-fail-under=100'
 coverage-overall = 'pytest tests/ -o "addopts=" --cov=pyrxd --cov-fail-under=85'
 # `task check-private-links` ensures tracked docs (and staged additions) don't

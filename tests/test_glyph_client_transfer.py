@@ -108,10 +108,10 @@ class TestChangeSurvivedGuard:
     def test_large_burn_refused_and_reports_the_amount(self) -> None:
         """The failure mode worth refusing: a fee wildly past what the size demands.
 
-        23.1 RXD is 2,310,000 bytes' worth at the floor rate, against an allowance of
+        23.3 RXD is 2,330,000,000 photons — 233,000 bytes' worth at the floor rate, against an allowance of
         12 — so widening the tolerance for sizing slack costs nothing here.
         """
-        burn = 23_100_000_000
+        burn = 2_330_000_000
         with pytest.raises(ValidationError) as exc:
             assert_change_survived(_exact_fee() + burn, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
         assert f"{burn:,}" in str(exc.value)
@@ -201,7 +201,7 @@ class TestTheGuardAgreesWithARealTransaction:
         tx = self._real_tx()
         honest_fee = len(tx.serialize()) * rate
         with pytest.raises(ValidationError, match="exceeds what this transaction's size demands"):
-            assert_change_survived(honest_fee + 23_100_000_000, tx, fee_rate=rate)
+            assert_change_survived(honest_fee + 2_330_000_000, tx, fee_rate=rate)
 
     def test_a_real_build_from_the_real_builder_is_accepted(self) -> None:
         """The end of the chain, and what a stub can never show.

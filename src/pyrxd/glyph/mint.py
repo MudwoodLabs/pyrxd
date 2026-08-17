@@ -85,6 +85,7 @@ from typing import Any, ClassVar
 
 from ..constants import DUST_THRESHOLD_PHOTONS
 from ..fee_models import SatoshisPerKilobyte
+from ..fee_sizing import assert_pays_for_its_size
 from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, wait_for_confirmation
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata, to_unlock_script_template
@@ -1001,10 +1002,41 @@ class GlyphMinter:
         reveal_tx = self._build_reveal_tx(pending, funding_key, locking)
         reveal_tx.fee(SatoshisPerKilobyte(pending.fee_rate * 1000))
         reveal_tx.sign()
-        reveal_txid = await self._client.broadcast(reveal_tx.serialize())
 
-        # Only now is the record redundant. Deleting earlier would drop the CBOR bytes
-        # while the reveal could still fail to relay.
+        # The fee was sized from `pending.fee_rate`, captured when the COMMIT was built —
+        # possibly weeks ago, since this module advertises resuming after a reboot. If the
+        # relay floor has moved since, or `Transaction.fee()`'s estimate falls short of the
+        # signed bytes, this reveal is underpaid. Radiant has no RBF and no CPFP, so an
+        # underpaid reveal cannot be repaired: it sits until mempool expiry while the commit
+        # it was meant to spend stays a hashlock. Prove it pays for itself on the bytes about
+        # to be broadcast, before broadcasting them.
+        raw = reveal_tx.serialize()
+        assert_pays_for_its_size(
+            size_bytes=len(raw),
+            fee_paid=reveal_tx.get_fee(),
+            fee_rate=pending.fee_rate,
+            what="glyph reveal",
+        )
+
+        reveal_txid = await self._client.broadcast(raw)
+
+        # Deleting here used to be justified as "the reveal could still fail to relay" —
+        # which reasons about rejection, and misses acceptance-then-eviction. A mempool
+        # accept is not a block. If this reveal relays but is never mined it expires after
+        # ~8h (DEFAULT_MEMPOOL_EXPIRY), and with the record already gone the CBOR payload
+        # needed to rebuild it is gone too. The commit output is a hashlock with no
+        # owner-only spend path, so that is permanent, unrecoverable loss of its value.
+        #
+        # So the record outlives the broadcast and is dropped only once the reveal is
+        # actually confirmed. If the wait times out the record is KEPT and the timeout
+        # propagates: the caller can retry the reveal, which is exactly what the record
+        # exists for.
+        await wait_for_confirmation(
+            self._client,
+            str(reveal_txid),
+            min_confirmations=1,
+            timeout_s=self._confirmation_timeout_s,
+        )
         self._store.delete(pending.commit_txid)
         return MintResult(
             commit_txid=pending.commit_txid,

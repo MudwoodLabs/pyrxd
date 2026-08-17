@@ -55,8 +55,7 @@ from .builder import (
     FtUtxo,
     GlyphBuilder,
 )
-from .scanner import GlyphScanner
-from .types import GlyphFt, GlyphRef
+from .types import GlyphRef
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ..hd.wallet import HdWallet
@@ -67,6 +66,8 @@ __all__ = [
     "NFT_TRANSFER_MODELLED_BYTES",
     "FtTransferBuild",
     "NftTransferBuild",
+    "NoFeeFundingError",
+    "NoHoldingsError",
     "assert_change_survived",
     "build_ft_transfer",
     "build_nft_transfer",
@@ -78,6 +79,25 @@ __all__ = [
     "select_ft_inputs",
     "single_ft_signing_key",
 ]
+
+
+class NoHoldingsError(InsufficientFundsError):
+    """This wallet holds none of the requested token.
+
+    Distinct from "holds some, but not enough" and from "cannot pay the fee", because
+    the three want different advice and the CLI used to tell them apart by matching
+    substrings of the message. Rewording a message then silently changed which
+    remedy the user was given — and the fallback remedy, "fund the wallet with a
+    little plain RXD", is the wrong direction for two of the three.
+    """
+
+
+class NoFeeFundingError(InsufficientFundsError):
+    """No plain-RXD UTXO large enough to pay this transaction's fee.
+
+    The token cannot pay for itself: an FT output's value IS its unit count, and an
+    NFT singleton carries dust.
+    """
 
 
 @dataclass(frozen=True)
@@ -126,6 +146,7 @@ async def select_ft_inputs(
     ref: GlyphRef,
     amount: int,
     client: ElectrumXClient,
+    triples: list[tuple[UtxoRecord, str, PrivateKey]] | None = None,
 ) -> list[tuple[FtUtxo, str, PrivateKey]]:
     """Find this wallet's FT UTXOs for ``ref`` and greedily cover ``amount``.
 
@@ -141,19 +162,14 @@ async def select_ft_inputs(
     """
     from .script import is_ft_script
 
-    scanner = GlyphScanner(client)
-    items: list[GlyphFt] = []
-    for rec in [r for r in wallet.addresses.values() if r.used]:
-        for item in await scanner.scan_address(rec.address):
-            if isinstance(item, GlyphFt) and item.ref == ref:
-                items.append(item)
-
-    if not items:
-        raise InsufficientFundsError(
-            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet — refresh the wallet's used addresses and retry"
-        )
-
-    triples = await wallet.collect_spendable(client)
+    # The classification loop below is the ONLY source of truth for what this wallet
+    # holds. A `GlyphScanner` pre-pass used to run here over every used address, purely
+    # to produce a nicer "no holdings" message, and its result was then discarded — a
+    # full second sweep of the wallet, serial, for an emptiness check the loop below
+    # already answers. It also contradicted this function's own rule: the scanner IS
+    # the index path, and holdings here are read from the on-chain locking script.
+    if triples is None:
+        triples = await wallet.collect_spendable(client)
     ft_inputs: list[tuple[FtUtxo, str, PrivateKey]] = []
     total_ft = 0
     for utxo, addr, pk in triples:
@@ -180,6 +196,10 @@ async def select_ft_inputs(
         ft_inputs.append((ft_utxo, addr, pk))
         total_ft += ft_utxo.ft_amount
 
+    if not ft_inputs:
+        raise NoHoldingsError(
+            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet — refresh the wallet's used addresses and retry"
+        )
     if total_ft < amount:
         raise InsufficientFundsError(f"insufficient FT balance: need {amount}, have {total_ft}")
 
@@ -250,6 +270,7 @@ async def ft_funding(
     n_outputs: int,
     fee_rate: int,
     client: ElectrumXClient,
+    triples: list[tuple[UtxoRecord, str, PrivateKey]] | None = None,
 ) -> AirdropFunding:
     """Find a plain-RXD UTXO big enough to pay for ``n_outputs`` token outputs.
 
@@ -263,7 +284,8 @@ async def ft_funding(
     """
     est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50
     needed = est_bytes * fee_rate * 2
-    triples = await wallet.collect_spendable(client)
+    if triples is None:
+        triples = await wallet.collect_spendable(client)
     fund = await find_plain_rxd_utxo(
         triples,
         client,
@@ -271,7 +293,7 @@ async def ft_funding(
         needed=needed,
     )
     if fund is None:
-        raise InsufficientFundsError(
+        raise NoFeeFundingError(
             f"no plain-RXD UTXO large enough to fund the fee — need about {needed:,} photons "
             "on a single non-token UTXO. An FT output's value is its unit count, so the token "
             "cannot pay for itself."
@@ -306,9 +328,14 @@ async def build_ft_transfer(
     if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
         raise ValidationError("FT transfer amount must be a positive int")
 
-    selected = await select_ft_inputs(wallet, ref, amount, client)
+    # ONE wallet enumeration per build. Selection and fee funding both need the same
+    # UTXO set, and each used to fetch it (and each candidate's parent transaction)
+    # independently — doubling the round trips and opening a window in which the two
+    # phases could disagree about what the wallet holds.
+    triples = await wallet.collect_spendable(client)
+    selected = await select_ft_inputs(wallet, ref, amount, client, triples)
     first_key = single_ft_signing_key(selected, "FT transfer")
-    funding = await ft_funding(wallet, selected, n_outputs=1, fee_rate=fee_rate, client=client)
+    funding = await ft_funding(wallet, selected, n_outputs=1, fee_rate=fee_rate, client=client, triples=triples)
 
     params = FtAirdropParams(
         ref=ref,
@@ -366,8 +393,9 @@ def assert_change_survived(
 
     So the allowance is the slack itself, plus the same allowance again for
     trial-versus-final DER signature variance, plus the dust threshold. A genuine
-    overpay clears it by orders of magnitude — the 23.1 RXD case that motivated the
-    guard is 2,310,000 bytes' worth against an allowance of 12.
+    overpay clears it by orders of magnitude — the measured 23.3 RXD burn that motivated
+    the guard is 2,330,000,000 photons, i.e. 233,000 bytes' worth at the floor rate,
+    against an allowance of 12.
 
     ``allow_overpay=True`` is the deliberate, greppable way through, matching the
     builders' existing opt-out.
@@ -532,6 +560,7 @@ async def build_nft_transfer(
     *,
     client: ElectrumXClient,
     fee_rate: int,
+    allow_overpay: bool = False,
 ) -> NftTransferBuild:
     """Build (and sign) an NFT transfer, without broadcasting it.
 
@@ -550,17 +579,40 @@ async def build_nft_transfer(
         ValidationError: the signed transaction does not pay for its own size.
     """
     from ..fee_models import SatoshisPerKilobyte
-    from ..fee_sizing import assert_pays_for_its_size
+    from ..fee_sizing import assert_fee_rate_clears_relay_floor, assert_pays_for_its_size
     from ..script.script import Script
     from ..script.type import P2PKH
     from ..transaction.transaction_input import TransactionInput
     from ..transaction.transaction_output import TransactionOutput
     from .script import build_nft_locking_script
 
+    # Judge the RATE before any bytes exist. This is the gate every other
+    # fund-moving builder in this package already had and this path did not:
+    # `builder.py` calls it in `build_nft_transfer_tx`, `ft.py` calls it for the FT
+    # path. Without it this function was unbounded in BOTH directions.
+    #
+    # Below the floor: `assert_pays_for_its_size` further down cannot catch it, because
+    # it measures against the CALLER'S rate — a sub-floor build is internally
+    # consistent and agrees with itself. It would relay nowhere and squat the NFT plus
+    # the wallet's largest plain UTXO until mempool expiry, ~8h, with no RBF and no
+    # CPFP to repair it.
+    #
+    # Above the ceiling: `fee_sizing` records why that bound exists, and it is this
+    # exact transaction shape — `build_nft_transfer_tx` at `fee_rate=10_000_000` (the
+    # per-kB constant, one import away from the per-byte one) burned 23.2-23.3 RXD off
+    # a 230-byte transfer, silently, reporting success. An NFT transfer whose funding
+    # cannot also cover change has NO change output, so the whole difference leaves
+    # with the miner.
+    assert_fee_rate_clears_relay_floor(
+        fee_rate,
+        what="build_nft_transfer",
+        allow_overpay=allow_overpay,
+    )
+
     triples = await wallet.collect_spendable(client)
     found = await find_nft_utxo(triples, ref, client)
     if found is None:
-        raise InsufficientFundsError(f"NFT {ref.txid}:{ref.vout} is not held by this wallet")
+        raise NoHoldingsError(f"NFT {ref.txid}:{ref.vout} is not held by this wallet")
     utxo, addr, pk, nft_script = found
 
     # The new locking script is built before funding is chosen because its length is
@@ -574,7 +626,7 @@ async def build_nft_transfer(
         needed=needed,
     )
     if fund is None:
-        raise InsufficientFundsError(
+        raise NoFeeFundingError(
             "no plain-RXD UTXO large enough to fund the NFT transfer fee — need at least "
             f"{needed:,} photons on a single non-token UTXO "
             f"(~{NFT_TRANSFER_MODELLED_BYTES + len(new_locking)} B at {fee_rate:,} photons/B). "
@@ -620,7 +672,9 @@ async def build_nft_transfer(
             TransactionOutput(fund_spk, 0, change=True),  # fee change back to this wallet
         ],
     )
-    nft_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
+    # `Transaction.fee` is untyped (transaction/ is outside this module's typecheck
+    # scope); the call is correct, the annotation debt is upstream.
+    nft_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))  # type: ignore[no-untyped-call]
     nft_tx.sign()
 
     # Prove the SIGNED bytes pay for themselves, after the last `sign()`.
