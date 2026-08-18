@@ -823,11 +823,16 @@ class TestDmintCliAssembly:
                 return [(utxo, key.address(), key)]
 
         captured: list[bytes] = []
-        commit_txid = "11" * 32
 
         async def _bcast(raw: bytes) -> str:
+            # Echo the txid of what we were handed. The CLI now derives the commit txid
+            # from the signed bytes rather than trusting this reply — the reveal's
+            # outpoint AND the ref in its locking script both come from it, so a fake
+            # constant here would assert against a ref the code no longer builds.
+            from pyrxd.transaction.transaction import Transaction
+
             captured.append(raw)
-            return commit_txid if len(captured) == 1 else "22" * 32
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -847,6 +852,7 @@ class TestDmintCliAssembly:
         )
         result = asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), params, client))
 
+        commit_txid = Transaction.from_hex(captured[0]).txid()
         reveal = Transaction.from_hex(captured[1])
         assert reveal is not None
         # vout 0..1 contracts (1 photon each), vout 2 premine, vout 3 change.
@@ -859,7 +865,9 @@ class TestDmintCliAssembly:
         assert reveal.outputs[3].satoshis > 0
 
         assert result["premine"] == premine
-        assert result["premine_outpoint"] == f"{'22' * 32}:2"
+        # Derived from the reveal we actually broadcast, not from a constant the fake
+        # used to echo — the CLI no longer takes the server's word for a txid.
+        assert result["premine_outpoint"] == f"{reveal.txid()}:2"
         assert result["mineable_supply"] == 1000 * 100 * 2
         assert result["total_supply"] == 1000 * 100 * 2 + premine
 

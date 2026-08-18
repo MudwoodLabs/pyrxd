@@ -63,9 +63,9 @@ class TransferReceipt:
 class BroadcastEchoMismatch(RxdSdkError):
     """The server's txid did not match the transaction we signed.
 
-    Deliberately NOT a :class:`ValidationError`. Both transfer methods document their
-    ``ValidationError`` as raised *before anything is signed or sent*, and this is the
-    opposite: the broadcast already happened and the transaction may well have relayed.
+    Deliberately NOT a :class:`ValidationError`. Those are raised before anything is
+    SENT — ``transfer_nft``'s is raised after signing but before broadcast — whereas this
+    one can only happen after the broadcast, when the transaction may well have relayed.
     A caller with ``except ValidationError: retry`` would re-broadcast a transfer that
     already moved tokens.
 

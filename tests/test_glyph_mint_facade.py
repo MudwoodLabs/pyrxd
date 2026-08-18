@@ -928,9 +928,12 @@ class TestRevealRateAndEchoGuards:
 
         The discrimination matters. An earlier version of this fake confirmed every
         txid, so waiting on the echo and waiting on the locally derived value both
-        succeeded and the test proved nothing. Here the lie is the only confirmed
-        transaction: code that trusts the echo sees "confirmed" and deletes the record;
-        code that trusts its own bytes waits, times out, and keeps it.
+        succeeded and the test proved nothing.
+
+        Here exactly two transactions confirm: the COMMIT, hashed from the bytes this
+        fake was handed, and the LIE. The real reveal never does. So code that trusts the
+        echo sees "confirmed" and deletes the record, while code that trusts its own bytes
+        waits, times out, and keeps it.
         """
 
         class _Client(FakeClient):
@@ -940,11 +943,19 @@ class TestRevealRateAndEchoGuards:
                 return cls.LIE
 
             async def get_transaction_verbose(self, txid: str) -> dict:
-                # The commit confirms (it is queried before any reveal exists), the lie
-                # confirms, and the real reveal never does.
-                if txid == cls.LIE or txid in {b.hex() for b in ()}:
-                    return {"confirmations": 1}
-                return {"confirmations": 1 if not self.broadcasts[1:] else 0}
+                # Confirm the COMMIT (identified by hashing what we were actually handed)
+                # and the LIE. Everything else — including the real reveal — never
+                # confirms, unconditionally.
+                #
+                # An earlier version of this claimed to "confirm ONLY the lie" and did
+                # not: its commit clause iterated an empty tuple, so it was dead, and the
+                # fallback confirmed EVERY txid until a second broadcast had happened.
+                # The commit therefore confirmed by accident of call order. That is the
+                # same defect this fixture exists to catch, reproduced inside the fixture.
+                from pyrxd.transaction.transaction import Transaction
+
+                confirmed = {cls.LIE} | {Transaction.from_hex(b.hex()).txid() for b in self.broadcasts[:1]}
+                return {"confirmations": 1 if txid in confirmed else 0}
 
         return _Client()
 
@@ -972,18 +983,30 @@ class TestRevealRateAndEchoGuards:
         """A commit priced below the CURRENT floor must fail loudly, not silently relay
         into a mempool that will drop it — and must stay revealable.
 
-        Refusing with no way through would be worse than the bug: the commit was funded
-        at the old rate, so raising the rate is not always affordable. Hence
-        `allow_below_relay_floor=True`.
+        The rate is now judged in ``__init__``, so a minter cannot be BUILT below the
+        floor. The scenario this pins is the one that survives that gate: a commit made
+        while the floor was lower, revealed after it rose. The stale rate therefore lives
+        on the stored record, not on the minter — which is exactly where a real one would
+        be, since ``PendingMint.fee_rate`` is captured at commit time.
+
+        Refusing with no way through would be worse than the bug: the commit was funded at
+        the old rate, so re-pricing upward is not always affordable. Hence
+        ``allow_below_relay_floor=True``.
         """
+        import dataclasses
+
         store = RecordingStore()
-        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store, fee_rate=1)
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store)
         pending = await minter.commit_nft(_nft_metadata())
 
+        # The floor rose after the commit: the record's captured rate is now sub-floor.
+        stale = dataclasses.replace(pending, fee_rate=1)
+        store.save(stale)
+
         with pytest.raises((ValidationError, ValueError), match="floor|relay"):
-            await minter.reveal_nft(pending)
-        assert store.load(pending.commit_txid) is not None, "a refusal must keep the record"
+            await minter.reveal_nft(stale)
+        assert store.load(stale.commit_txid) is not None, "a refusal must keep the record"
 
         # The escape hatch: send it anyway, deliberately.
-        result = await minter.reveal_nft(pending, allow_below_relay_floor=True)
+        result = await minter.reveal_nft(stale, allow_below_relay_floor=True)
         assert result.reveal_txid

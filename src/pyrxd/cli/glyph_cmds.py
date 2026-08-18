@@ -462,7 +462,8 @@ async def _mint_nft_inner(
         ),
     ]
     _confirm_or_abort(ctx, sections)
-    commit_txid = await client.broadcast(commit_hex)
+    _echoed_commit = await client.broadcast(commit_hex)
+    commit_txid = _local_commit_txid(commit_hex, _echoed_commit)
 
     # 3) Poll for confirmation.
     if ctx.output_mode == "human":
@@ -736,7 +737,8 @@ async def _deploy_ft_inner(
             ),
         ],
     )
-    commit_txid = await client.broadcast(commit_tx.serialize())
+    _echoed_commit = await client.broadcast(commit_tx.serialize())
+    commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
 
     if ctx.output_mode == "human":
         click.echo(f"\ncommit broadcast: {commit_txid}")
@@ -925,6 +927,33 @@ def _single_ft_signing_key(
             cause="selected FT utxos span multiple HD-derived keys",
             fix="consolidate FT holdings to one address first (Cut 3 will lift this restriction)",
         ) from exc
+
+
+def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
+    """The commit txid derived from the bytes we signed, not the server's reply.
+
+    This one matters more than the transfer equivalent. The commit txid is not merely
+    reported — the REVEAL is built from it: it becomes the outpoint the reveal spends and
+    the ref baked into the token's locking script. Take the server's word for it and a
+    node that echoes some other confirmed txid gets a reveal built against the wrong
+    outpoint, carrying the wrong ref, which can never spend the real commit. That commit
+    is a hashlock with no owner-only path, so its value is gone.
+
+    Warns rather than raises: the commit may well have relayed, and the caller needs the
+    locally derived txid to carry on with the reveal either way.
+    """
+    from ..transaction.transaction import Transaction
+
+    tx = commit_tx_or_hex if hasattr(commit_tx_or_hex, "txid") else Transaction.from_hex(commit_tx_or_hex)
+    local = str(tx.txid())
+    if str(echoed) != local:
+        click.echo(
+            f"warning: the server returned txid {echoed} but the commit we signed hashes "
+            f"to {local}. Continuing with {local}; if the reveal fails, check both on an "
+            "explorer.",
+            err=True,
+        )
+    return local
 
 
 async def _transfer_ft_inner(
@@ -1346,7 +1375,8 @@ async def _airdrop_ft_inner(
             ),
         ],
     )
-    txid = await client.broadcast(airdrop_result.tx.serialize())
+    _echoed = await client.broadcast(airdrop_result.tx.serialize())
+    txid = _local_commit_txid(airdrop_result.tx, _echoed)
     return {
         "txid": str(txid),
         "ref": f"{ref.txid}:{ref.vout}",
@@ -1376,7 +1406,7 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
 
     from ..utils import address_to_public_key_hash
 
-    # Same network pin as `transfer-ft` (:824) and `airdrop-ft` (:1239), and this is the
+    # Same network pin as `transfer-ft` and `airdrop-ft` do, and this is the
     # worst of the three to omit: a testnet-prefixed address decodes to a perfectly valid
     # PKH on mainnet, so the singleton is re-locked to a script no mainnet key can spend.
     # An NFT has no second copy and Radiant has no RBF/CPFP — the transfer cannot be
@@ -2043,7 +2073,8 @@ async def _deploy_dmint_inner(
             ),
         ],
     )
-    commit_txid = await client.broadcast(commit_tx.serialize())
+    _echoed_commit = await client.broadcast(commit_tx.serialize())
+    commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
     # stderr (all modes): if the reveal later fails, the confirmed commit is recoverable.
     click.echo(f"commit broadcast: {commit_txid}", err=True)
     if ctx.output_mode == "human":

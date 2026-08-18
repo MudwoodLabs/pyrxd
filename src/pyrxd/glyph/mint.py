@@ -673,6 +673,23 @@ class GlyphMinter:
             )
         if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
             raise ValidationError("GlyphMinter fee_rate must be a positive int")
+        # Judge the rate HERE — before any commit exists, let alone reaches a node.
+        #
+        # An earlier version judged it only at reveal time. That is after the
+        # irreversible action: `mint_nft` would broadcast the commit, then refuse to
+        # reveal it, and neither `mint_nft` nor `deploy_ft` exposes an override — so the
+        # caller was left with an on-chain hashlock and had to fish the `PendingMint` out
+        # of the store by hand. Measured at `fee_rate=100_001` (one photon over the 10x
+        # ceiling): commit broadcast, reveal refused.
+        #
+        # Gating at construction also makes the reveal's `allow_overpay=True` honest: the
+        # ceiling really has been judged by then, which is what a previous comment claimed
+        # before it was true.
+        assert_fee_rate_clears_relay_floor(
+            fee_rate,
+            what="GlyphMinter fee_rate",
+            error_type=ValidationError,
+        )
         if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 1:
             raise ValidationError("GlyphMinter min_confirmations must be an int >= 1")
         self._client = client
@@ -1048,6 +1065,8 @@ class GlyphMinter:
         locking = P2PKH().lock(pending.funding_address)
         reveal_tx = self._build_reveal_tx(pending, funding_key, locking)
         effective_rate = pending.fee_rate if fee_rate is None else fee_rate
+        if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:
+            raise ValidationError("reveal fee_rate must be a positive int")
         reveal_tx.fee(SatoshisPerKilobyte(effective_rate * 1000))
         reveal_tx.sign()
 
@@ -1077,7 +1096,11 @@ class GlyphMinter:
             effective_rate,
             what="glyph reveal",
             allow_below_relay_floor=allow_below_relay_floor,
-            allow_overpay=allow_overpay,
+            # The ceiling was judged in `__init__`, before the commit was built — see
+            # there. What is re-judged here is the FLOOR, which can move between commit
+            # and reveal; the ceiling cannot, because the rate is fixed at construction.
+            # A caller-supplied `fee_rate=` override is judged on both ends below.
+            allow_overpay=allow_overpay or fee_rate is None,
             error_type=ValidationError,
         )
 
