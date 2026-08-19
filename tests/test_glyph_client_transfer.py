@@ -346,3 +346,63 @@ class TestAMintCapableClientJudgesTheFloorUpFront:
         """No store means no mint, and the transfer builders judge the floor themselves
         against their own chain."""
         assert GlyphClient(object(), object(), fee_rate=1_000) is not None
+
+
+class TestTheFacadeDoesNotForwardAPhantomOverride:
+    """``GlyphClient.reveal_nft`` defaulted ``allow_below_relay_floor`` to ``False`` and
+    forwarded it.
+
+    Once the minter learned to distinguish "the caller said nothing" (``None``) from "the
+    caller re-asserted the floor" (``False``), that default turned every ordinary reveal
+    through the facade into a deliberate override. A client built for a sub-floor chain
+    committed and then refused to reveal — and the commit is a hashlock with no owner-only
+    spend path, so the value goes with it. The constructor flag exists to prevent exactly
+    that; the facade reintroduced it one layer up.
+    """
+
+    @staticmethod
+    def _client(store):
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import FakeClient, FakeWallet, _key
+
+        return GlyphClient(FakeClient(), FakeWallet(_key()), store=store, fee_rate=1_000, allow_below_relay_floor=True)
+
+    def test_a_sub_floor_client_can_finish_the_mint_it_started(self):
+        import asyncio
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import RecordingStore, _nft_metadata
+
+        client = self._client(RecordingStore())
+        pending = asyncio.run(client.commit_nft(_nft_metadata()))
+        assert asyncio.run(client.reveal_nft(pending)).reveal_txid
+
+    def test_an_explicit_false_still_re_asserts_the_floor(self):
+        """The override must survive the fix — otherwise the default was replaced by a
+        different bug, one that silently ignores the caller instead of obeying a caller
+        who never spoke."""
+        import asyncio
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import RecordingStore, _nft_metadata
+
+        client = self._client(RecordingStore())
+        pending = asyncio.run(client.commit_nft(_nft_metadata()))
+        with pytest.raises(ValidationError, match="floor|relay"):
+            asyncio.run(client.reveal_nft(pending, allow_below_relay_floor=False))
+
+    def test_the_signature_matches_the_minter_it_forwards_to(self):
+        """A structural pin: the two defaults must not drift apart again. This bug was
+        created by changing one signature and not the other."""
+        import inspect
+
+        from pyrxd.glyph.mint import GlyphMinter
+
+        facade = inspect.signature(GlyphClient.reveal_nft).parameters["allow_below_relay_floor"]
+        minter = inspect.signature(GlyphMinter.reveal_nft).parameters["allow_below_relay_floor"]
+        assert facade.default == minter.default, "the facade must forward, not decide"
+        assert facade.default is None

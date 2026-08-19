@@ -111,6 +111,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   key can spend, with no refund path and no RBF. `transfer-ft`, `transfer-nft` and every
   airdrop recipient were already pinned; this path carries more value than any of them and
   was missed because nobody compared them side by side.
+- **Every network-pinned CLI command crashed on `--network regtest`** with an unhandled
+  `ValueError` rather than running: `Network` has only `mainnet` and `testnet`, while
+  `--network` also accepts `regtest`. That took out `transfer-nft`, `airdrop-ft` and
+  `deploy-ft` on the one network the `pyrxd regtest` developer onramp is built around.
+  Regtest addresses carry testnet's version byte, so they are pinned against that.
+- **`GlyphClient.reveal_nft` could not reveal a commit it had just made** on a sub-floor
+  chain. It defaulted `allow_below_relay_floor` to `False` and forwarded it, and the minter
+  reads an explicit `False` as "re-assert the floor" — so a client constructed with
+  `allow_below_relay_floor=True` committed and was then refused its own reveal, stranding a
+  hashlock that has no owner-only spend path. `GlyphMinter` was unaffected.
 - **`glyph transfer-nft` did not pin its recipient to the active network either**, and did
   not gate its fee rate against the relay floor — the FT path did both.
 - `glyph airdrop-ft` reported the server's echoed txid as success rather than raising on a

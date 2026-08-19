@@ -295,7 +295,7 @@ class GlyphClient:
         pending: PendingMint,
         *,
         fee_rate: int | None = None,
-        allow_below_relay_floor: bool = False,
+        allow_below_relay_floor: bool | None = None,
         allow_overpay: bool = False,
     ) -> MintResult:
         """Phase 2 of an NFT mint. See :meth:`GlyphMinter.reveal_nft`.
@@ -304,6 +304,15 @@ class GlyphClient:
         is unreachable from this facade: a commit whose stored fee rate now sits below a
         risen relay floor cannot be revealed at all, and re-pricing upward is only
         possible when the commit holds enough to pay it.
+
+        ``allow_below_relay_floor`` must stay ``None``-defaulted, not ``False``. The
+        minter reads ``None`` as "the caller said nothing, inherit the constructor" and
+        ``False`` as "the caller re-asserted the floor for this reveal". Defaulting to
+        ``False`` here forwarded a deliberate override on every ordinary call, so a client
+        built with ``allow_below_relay_floor=True`` committed and then refused to reveal —
+        stranding the commit, which is a hashlock with no owner-only spend path. That is
+        exactly the failure the constructor flag exists to prevent, reintroduced one layer
+        above it by a default that looked harmless.
         """
         return await self.minter.reveal_nft(
             pending,

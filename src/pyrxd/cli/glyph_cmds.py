@@ -877,7 +877,15 @@ def _require_address_on_network(ctx: CliContext, address: str, *, what: str) -> 
     glyph transfer paths did not, which is the same unrecoverable paste error
     with tokens on it instead of RXD.
     """
-    if not validate_address(address, network=Network(ctx.network)):
+    # `Network` has only MAINNET and TESTNET, but `--network` also accepts `regtest`, so
+    # `Network(ctx.network)` raised a bare `ValueError` — an unhandled traceback, not a
+    # UserError — for every pinned command on regtest. Regtest is the developer onramp
+    # `pyrxd regtest` exists to serve, so the guard was refusing the workflow the project
+    # ships to newcomers. Regtest addresses carry testnet's version byte and decode to
+    # `Network.TESTNET` (there are only two prefixes in ADDRESS_PREFIX_NETWORK_DICT), so
+    # that is the network to pin against.
+    expected = Network.TESTNET if ctx.network == "regtest" else Network(ctx.network)
+    if not validate_address(address, network=expected):
         raise UserError(
             f"invalid {what}",
             cause=f"not a valid {ctx.network} Radiant P2PKH address",

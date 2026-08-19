@@ -2074,20 +2074,27 @@ class TestTheCommitTxidHelperCannotStrandACommit:
     def test_the_cli_really_has_no_pending_store_to_point_at(self) -> None:
         """The premise behind the assertion above, checked rather than assumed."""
         import ast
-        import pkgutil
 
         import pyrxd.cli
 
+        # `rglob`, not `pkgutil.iter_modules`: the latter never yields `__init__` and does
+        # not descend into subpackages, so it would skip files silently. A guard with a
+        # hole in its own enumeration is the defect it exists to catch.
+        files = sorted(pathlib.Path(pyrxd.cli.__path__[0]).rglob("*.py"))
+        assert len(files) > 1, "enumeration found almost nothing — this would pass vacuously"
+
         offenders = []
-        for m in pkgutil.iter_modules(pyrxd.cli.__path__):
-            src = (pathlib.Path(pyrxd.cli.__path__[0]) / f"{m.name}.py").read_text()
-            for node in ast.walk(ast.parse(src)):
+        for path in files:
+            for node in ast.walk(ast.parse(path.read_text())):
                 # An IMPORT, not the mere word — the comment explaining this very absence
                 # says "PendingStore", and a substring check would trip over its own
-                # explanation.
+                # explanation. Both import forms count: `import pyrxd.glyph.mint` followed
+                # by `mint.JsonFilePendingStore(...)` would slip past an ImportFrom check.
                 if isinstance(node, ast.ImportFrom) and any(a.name.endswith("PendingStore") for a in node.names):
-                    offenders.append(m.name)
-        assert not offenders, f"the CLI now imports a PendingStore ({offenders}) — revisit the advice"
+                    offenders.append(path.name)
+                if isinstance(node, ast.Import) and any(a.name.endswith("glyph.mint") for a in node.names):
+                    offenders.append(path.name)
+        assert not offenders, f"the CLI now reaches a PendingStore ({offenders}) — revisit the advice"
 
 
 class TestALyingRevealEchoIsRefused:
@@ -2208,3 +2215,75 @@ class TestDeployFtPinsItsTreasury:
         runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
         result = self._invoke(runner, tmp_wallet_path, tmp_path, PrivateKey().public_key().address())
         assert "not a valid mainnet radiant p2pkh address" not in result.output.lower()
+
+
+class TestThePinWorksOnEveryNetworkTheCliAccepts:
+    """``Network(ctx.network)`` raised a bare ``ValueError`` on regtest.
+
+    ``Network`` has only MAINNET and TESTNET; ``--network`` also accepts ``regtest``. So
+    every pinned command died with an unhandled traceback on the one network the project's
+    own developer onramp (``pyrxd regtest``) is built around — a guard refusing the
+    workflow shipped to newcomers. Regtest addresses carry testnet's version byte, so
+    that is what they are pinned against.
+    """
+
+    @staticmethod
+    def _addr(network: str) -> str:
+        from pyrxd.constants import Network
+
+        if network == "mainnet":
+            return PrivateKey().public_key().address()
+        return PrivateKey().public_key().address(network=Network.TESTNET)
+
+    @pytest.mark.parametrize("network", ["mainnet", "testnet", "regtest"])
+    def test_a_matching_address_is_accepted(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path, network: str
+    ) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "--network",
+                network,
+                "glyph",
+                "deploy-ft",
+                str(_write_meta(tmp_path / "ft.json")),
+                "--supply",
+                "1000",
+                "--treasury",
+                self._addr(network),
+            ],
+        )
+        # CliRunner puts an unhandled exception in `result.exception`, NOT in `output`, so
+        # asserting on the text alone passed even while the command was crashing. Check the
+        # exception itself, or this pins nothing.
+        assert not isinstance(result.exception, ValueError), f"the pin crashed: {result.exception}"
+        assert "p2pkh address" not in result.output.lower(), f"a legitimate {network} address was refused on {network}"
+
+    @pytest.mark.parametrize("network", ["mainnet", "testnet", "regtest"])
+    def test_a_foreign_address_is_still_refused(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path, network: str
+    ) -> None:
+        """The guard must keep guarding on every network, not just stop crashing."""
+        foreign = self._addr("testnet" if network == "mainnet" else "mainnet")
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "--network",
+                network,
+                "glyph",
+                "deploy-ft",
+                str(_write_meta(tmp_path / "ft.json")),
+                "--supply",
+                "1000",
+                "--treasury",
+                foreign,
+            ],
+        )
+        assert result.exit_code != 0
+        assert "p2pkh address" in result.output.lower()
