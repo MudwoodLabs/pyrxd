@@ -390,12 +390,14 @@ class TestTheDocumentedExceptionIsTheOneRaised:
 
 
 class TestTheSizeCheckAlsoKeepsTheDocumentedContract:
-    """``build_nft_transfer`` has two refusals four lines apart. The rate gate was fixed to
-    raise the documented ``ValidationError``; the size check below it was left raising a
+    """``build_nft_transfer`` has two refusals, ~85 lines apart. The rate gate was fixed to
+    raise the documented ``ValidationError``; the size check further down was left raising a
     bare ``ValueError`` against the same docstring, which promises
     ``ValidationError: the signed transaction does not pay for its own size``.
 
-    Reviewing one diff hunk at a time is how the second one survived the fix to the first.
+    The distance is the point: far enough apart to land in separate diff hunks, which is how
+    the second survived the fix to the first. Reviewing a function's refusals as a set is
+    what catches that; reading hunks in order is not.
     """
 
     def test_the_call_site_names_its_exception_type(self) -> None:

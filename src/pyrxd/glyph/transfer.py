@@ -757,11 +757,12 @@ async def build_nft_transfer(
         fee_rate=fee_rate,
         what="the NFT transfer",
         # This function's docstring promises `ValidationError: the signed transaction does
-        # not pay for its own size` — this is that check, and without `error_type` it
-        # raised a bare `ValueError` instead. The rate gate four lines up had exactly the
-        # same defect and was fixed on its own; a review that compared the two call sites
-        # inside ONE function would have caught both at once, which is the whole argument
-        # for reading paths side by side rather than one diff hunk at a time.
+        # not pay for its own size` — this is that check, and without `error_type` it raised
+        # a bare `ValueError` instead. The rate gate near the top of this function had
+        # exactly the same defect and was fixed on its own, ~85 lines up: far enough apart
+        # to land in different diff hunks, which is precisely how the second survived the
+        # fix to the first. Comparing a function's refusals as a set catches what reading
+        # hunks in order does not.
         error_type=ValidationError,
     )
 

@@ -8,7 +8,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Upgrade notes
 
-- **Three refusals changed exception type from `ValueError` to `ValidationError`.**
+- **Three refusals changed exception type from `ValueError` to `ValidationError`.** This
+  affects only callers tracking `main`: all three functions were added after the 0.18.0 tag,
+  so nothing released has ever raised `ValueError` from them.
   `ValidationError` does **not** subclass `ValueError`, so `except ValueError` around these
   no longer catches them: `build_nft_transfer`'s rate gate and its signed-size check, and
   `GlyphMinter.reveal_*`'s signed-size check. The first two were already documented as
@@ -45,9 +47,11 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   did not. Now: FT transfers, NFT transfers and FT airdrops raise `BroadcastEchoMismatch`
   (which carries `local_txid`, and is deliberately **not** a `ValidationError` — those are
   raised before anything is sent, and a caller retrying on one would re-broadcast a transfer
-  that already moved tokens). Mint reveals refuse a mismatch in both the SDK and the CLI.
-  A mint **commit** warns and continues instead, because the reveal still needs the derived
-  txid to build against — and `deploy-dmint` builds its `contracts` outpoints and
+  that already moved tokens). The CLI's mint reveal raises too. The SDK's `GlyphMinter`
+  reveal instead warns and then **waits on the locally derived txid**, so a server that
+  echoes some other confirmed txid cannot satisfy the confirmation gate or get the pending
+  record deleted — the protection is the wait, not a refusal. A mint **commit** warns and
+  continues for a different reason: the reveal still needs the derived txid to build against — and `deploy-dmint` builds its `contracts` outpoints and
   `premine_outpoint` from the reveal txid, which is what miners then grind against.
 - `glyph transfer-nft --allow-overpay` and `glyph airdrop-ft --allow-overpay`, matching
   `transfer-ft`.
@@ -109,8 +113,9 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   address into a perfectly valid-looking 20-byte PKH, so a pasted testnet treasury would
   have built, confirmed, and locked the **entire premined supply** to a script no mainnet
   key can spend, with no refund path and no RBF. `transfer-ft`, `transfer-nft` and every
-  airdrop recipient were already pinned; this path carries more value than any of them and
-  was missed because nobody compared them side by side.
+  airdrop recipient are pinned (`transfer-nft` only as of this same cycle — see below);
+  this path carries more value than any of them and was missed because nobody compared them
+  side by side.
 - **Every network-pinned CLI command crashed on `--network regtest`** with an unhandled
   `ValueError` rather than running: `Network` has only `mainnet` and `testnet`, while
   `--network` also accepts `regtest`. That took out `transfer-nft`, `airdrop-ft` and
@@ -121,15 +126,19 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reads an explicit `False` as "re-assert the floor" — so a client constructed with
   `allow_below_relay_floor=True` committed and was then refused its own reveal, stranding a
   hashlock that has no owner-only spend path. `GlyphMinter` was unaffected.
-- **`glyph transfer-nft` did not pin its recipient to the active network either**, and did
-  not gate its fee rate against the relay floor — the FT path did both.
+- **`glyph transfer-nft` did not pin its recipient to the active network** — the FT path
+  did. (The CLI's fee rate itself was never ungated: `validated_fee_rate` has refused a
+  sub-floor rate for every command since 0.18.0. The missing floor gate was in the SDK's
+  `build_nft_transfer`, which the CLI reaches but library callers could also call directly.)
 - `glyph airdrop-ft` reported the server's echoed txid as success rather than raising on a
   mismatch, and enumerated the wallet twice — once to select token inputs and again to find
   the fee UTXO — leaving a window in which the two phases could disagree about what the
   wallet holds. Both now match `transfer-ft`.
-- FT input selection is address-aware and prefers the fewest inputs, so holdings spread
-  across several wallet addresses no longer fail to assemble a transfer that the balance
-  plainly covers.
+- FT input selection is address-aware: among the wallet addresses that can cover the
+  amount it now picks the one needing the fewest inputs, breaking ties on the smaller
+  total. A transfer still requires a **single** address to cover the amount — every input
+  of an FT transfer is signed with one key — and says so, naming the largest single-address
+  holding and the wallet total, rather than reporting a bare shortfall.
 - The CLI could crash between a commit broadcast and the line that prints its txid:
   `Transaction.from_hex` returns `None` rather than raising, and that `None` reached
   `.txid()`. The commit was on chain and its id was never shown. It now fails with the
