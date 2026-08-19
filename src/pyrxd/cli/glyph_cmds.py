@@ -500,7 +500,8 @@ async def _mint_nft_inner(
             )
         ],
     )
-    reveal_txid = await client.broadcast(reveal_hex)
+    _echoed_reveal = await client.broadcast(reveal_hex)
+    reveal_txid = _confirmed_reveal_txid(reveal_hex, _echoed_reveal)
     # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
     # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
     # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
@@ -773,7 +774,8 @@ async def _deploy_ft_inner(
             ),
         ],
     )
-    reveal_txid = await client.broadcast(reveal_tx.serialize())
+    _echoed_reveal = await client.broadcast(reveal_tx.serialize())
+    reveal_txid = _confirmed_reveal_txid(reveal_tx, _echoed_reveal)
     # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
     # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
     # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
@@ -880,6 +882,7 @@ async def _select_ft_inputs(
     ref: GlyphRef,
     amount: int,
     client: ElectrumXClient,
+    triples: list[tuple[UtxoRecord, str, PrivateKey]] | None = None,
 ) -> list[tuple[FtUtxo, str, PrivateKey]]:
     """Find this wallet's FT UTXOs for ``ref`` and greedily cover ``amount``.
 
@@ -895,7 +898,7 @@ async def _select_ft_inputs(
     wrapper only re-dresses the SDK error as a CLI one with a runnable fix.
     """
     try:
-        return await lib_select_ft_inputs(wallet, ref, amount, client)
+        return await lib_select_ft_inputs(wallet, ref, amount, client, triples)
     except NoHoldingsError as exc:
         raise UserError(
             f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
@@ -945,6 +948,22 @@ def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
     from ..transaction.transaction import Transaction
 
     tx = commit_tx_or_hex if hasattr(commit_tx_or_hex, "txid") else Transaction.from_hex(commit_tx_or_hex)
+    if tx is None:
+        # `from_hex` returns None rather than raising, and we are PAST the broadcast here.
+        # Letting that None reach `.txid()` raised `AttributeError` between the broadcast
+        # and the line that prints the txid — so the commit was on chain and the user was
+        # never told its id, which is the exact stranding this helper exists to prevent.
+        # Hand back the echoed txid in the message: unverified, but it is the only handle
+        # left on a commit that has already relayed.
+        raise UserError(
+            "the commit was broadcast but its txid could not be re-derived locally",
+            cause="the signed commit bytes did not parse back into a transaction",
+            fix=(
+                f"the server echoed {echoed} — check it on an explorer. If it is there, the "
+                "commit relayed and its PendingMint record is still in the store, so the "
+                "reveal can be resumed against it."
+            ),
+        )
     local = str(tx.txid())
     if str(echoed) != local:
         click.echo(
@@ -952,6 +971,43 @@ def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
             f"to {local}. Continuing with {local}; if the reveal fails, check both on an "
             "explorer.",
             err=True,
+        )
+    return local
+
+
+def _confirmed_reveal_txid(reveal_tx_or_hex: object, echoed: object) -> str:
+    """The reveal txid derived from the bytes we signed. RAISES on a mismatch.
+
+    The counterpart to :func:`_local_commit_txid`, and deliberately stricter. That one
+    warns because a commit has a next phase to carry on with, and the caller needs the
+    derived value to build it. A reveal is where the mint ENDS, so there is no later step
+    to notice the discrepancy — and what the CLI prints from this txid is not merely a
+    receipt. ``deploy-dmint`` builds its ``contracts`` outpoints and ``premine_outpoint``
+    from it, which is what miners then grind against and what the owner later spends. Take
+    a lying server's word here and the user is handed outpoints that do not exist, with
+    real work aimed at them.
+
+    The token's own ref is safe either way — it is the COMMIT outpoint, embedded in the
+    reveal's locking script — which is exactly why this went unnoticed: the most
+    load-bearing identifier on the page never depended on the echo.
+    """
+    from ..transaction.transaction import Transaction
+
+    tx = reveal_tx_or_hex if hasattr(reveal_tx_or_hex, "txid") else Transaction.from_hex(reveal_tx_or_hex)
+    if tx is None:
+        raise UserError(
+            "the reveal was broadcast but its txid could not be re-derived locally",
+            cause="the signed reveal bytes did not parse back into a transaction",
+            fix=f"the server echoed {echoed} — check it on an explorer before spending anything built on it",
+        )
+    local = str(tx.txid())
+    if str(echoed) != local:
+        raise UserError(
+            "the server returned a different transaction id than the reveal we signed",
+            cause=f"echoed {echoed}, but the signed reveal hashes to {local}",
+            fix=f"check {local} on an explorer — if it is there the mint completed and only the "
+            "server's reply was wrong. Do not use the echoed id: outpoints derived from it "
+            "would point at a transaction that does not exist.",
         )
     return local
 
@@ -1064,6 +1120,7 @@ async def _airdrop_funding(
     *,
     n_outputs: int,
     client: ElectrumXClient,
+    triples: list[tuple[UtxoRecord, str, PrivateKey]] | None = None,
 ) -> AirdropFunding:
     """Find a plain-RXD UTXO big enough to pay for ``n_outputs`` token outputs.
 
@@ -1085,6 +1142,7 @@ async def _airdrop_funding(
             n_outputs=n_outputs,
             fee_rate=ctx.fee_rate,
             client=client,
+            triples=triples,
         )
     except InsufficientFundsError as exc:
         raise UserError(
@@ -1320,10 +1378,16 @@ async def _airdrop_ft_inner(
 ) -> dict:
     """FT airdrop: scan wallet, select FT utxos for ref, fund the fee, broadcast."""
     total = sum(r.amount for r in recipients)
-    selected = await _select_ft_inputs(wallet, ref, total, client)
+    # Enumerate the wallet ONCE and let both phases read the same snapshot. Selecting
+    # inputs and finding the fee UTXO used to call `collect_spendable` independently,
+    # which leaves a window where the two disagree about what the wallet holds — the same
+    # split `build_ft_transfer` closed for `transfer-ft`. Both callees already accept a
+    # pre-collected list; only this site was still asking twice.
+    triples = await wallet.collect_spendable(client)
+    selected = await _select_ft_inputs(wallet, ref, total, client, triples)
     first_key = _single_ft_signing_key(selected, "FT airdrop")
 
-    funding = await _airdrop_funding(ctx, wallet, selected, n_outputs=len(recipients), client=client)
+    funding = await _airdrop_funding(ctx, wallet, selected, n_outputs=len(recipients), client=client, triples=triples)
 
     params = FtAirdropParams(
         ref=ref,
@@ -1376,7 +1440,20 @@ async def _airdrop_ft_inner(
         ],
     )
     _echoed = await client.broadcast(airdrop_result.tx.serialize())
-    txid = _local_commit_txid(airdrop_result.tx, _echoed)
+    # RAISE on a mismatch, like `transfer-ft` and `transfer-nft` — not the commit
+    # helper's warn-and-continue. That helper warns because a commit has a next phase to
+    # carry on with; an airdrop is terminal, so a warning on a non-tty run is no warning
+    # at all and `--json` would report success for tokens that never moved. It is also
+    # the widest blast radius of the three: N recipients in one transaction.
+    try:
+        txid = _confirmed_txid(airdrop_result, _echoed)
+    except BroadcastEchoMismatch as exc:
+        raise UserError(
+            "the server returned a different transaction id than the one we signed",
+            cause=str(exc),
+            fix=f"check {exc.local_txid} on an explorer — if it is there the airdrop went "
+            "through to every recipient and only the server's reply was wrong",
+        ) from exc
     return {
         "txid": str(txid),
         "ref": f"{ref.txid}:{ref.vout}",
@@ -2136,7 +2213,8 @@ async def _deploy_dmint_inner(
             ),
         ],
     )
-    reveal_txid = await client.broadcast(reveal_tx.serialize())
+    _echoed_reveal = await client.broadcast(reveal_tx.serialize())
+    reveal_txid = _confirmed_reveal_txid(reveal_tx, _echoed_reveal)
     mineable_supply = reward * max_height * num_contracts
     return {
         "version": "V2" if is_v2 else "V1",

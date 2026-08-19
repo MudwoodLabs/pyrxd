@@ -662,10 +662,16 @@ async def build_nft_transfer(
     # a 230-byte transfer, silently, reporting success. An NFT transfer whose funding
     # cannot also cover change has NO change output, so the whole difference leaves
     # with the miner.
+    # `error_type=` is not decoration: without it this helper raises a bare `ValueError`,
+    # and this function's own docstring promises `ValidationError`. `build_ft_transfer`
+    # happens to launder the same underlying `ValueError` through its `except
+    # (ValidationError, ValueError)` wrapper; this path has no such wrapper, so the
+    # contract was simply wrong here. The CLI survived only because it catches both.
     assert_fee_rate_clears_relay_floor(
         fee_rate,
         what="build_nft_transfer",
         allow_overpay=allow_overpay,
+        error_type=ValidationError,
     )
 
     triples = await wallet.collect_spendable(client)

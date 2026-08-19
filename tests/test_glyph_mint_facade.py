@@ -13,6 +13,7 @@ defining module, ``pyrxd.glyph.mint``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -1010,3 +1011,123 @@ class TestRevealRateAndEchoGuards:
         # The escape hatch: send it anyway, deliberately.
         result = await minter.reveal_nft(stale, allow_below_relay_floor=True)
         assert result.reveal_txid
+
+
+class TestTheRateIsJudgedWhereverItCameFrom:
+    """Round five moved the ceiling into ``__init__`` and shipped no test for it.
+
+    Two mutants that fully reverted the change passed the entire suite, so the guard
+    existed only as long as nobody edited it. These pin both ends of the check against
+    both provenances a rate can have: the constructor argument, and the number stored on
+    a :class:`PendingMint` that may have been written by an older pyrxd entirely.
+    """
+
+    OVER_CEILING = 10_000_000  # a per-kB figure pasted into a per-byte field
+    REGTEST_RATE = 1_000  # a tenth of mainnet's floor, and legitimate there
+
+    def test_an_over_ceiling_rate_cannot_construct_a_minter(self):
+        """The fat-finger is refused before a commit exists to be stranded by it."""
+        with pytest.raises(ValidationError, match="ceiling|x Radiant"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), fee_rate=self.OVER_CEILING)
+
+    def test_a_regtest_rate_constructs_only_with_the_opt_in(self):
+        """A guard that refuses honest work is a bug.
+
+        Judging the floor at construction also judged it for chains whose floor really is
+        lower, and there was no way to say so — a regtest minter could not be built at
+        all, which also stranded the reveal's own ``allow_below_relay_floor``: no public
+        path could produce a sub-floor record to use it on.
+        """
+        with pytest.raises(ValidationError, match="floor|relay"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), fee_rate=self.REGTEST_RATE)
+
+        minter = GlyphMinter(
+            FakeClient(),
+            FakeWallet(_key()),
+            RecordingStore(),
+            fee_rate=self.REGTEST_RATE,
+            allow_below_relay_floor=True,
+        )
+        assert minter is not None
+
+    def test_the_opt_in_reaches_the_reveal_so_a_mint_can_finish(self):
+        """Opting in at construction must survive to the reveal.
+
+        Otherwise the minter commits happily and then refuses to reveal — the commit is a
+        hashlock with no owner-only spend path, so that is the worst of both refusals.
+        """
+        minter = GlyphMinter(
+            FakeClient(),
+            FakeWallet(_key()),
+            RecordingStore(),
+            fee_rate=self.REGTEST_RATE,
+            allow_below_relay_floor=True,
+        )
+        result = asyncio.run(minter.mint_nft(_nft_metadata()))
+        assert result.reveal_txid
+
+    def test_an_over_ceiling_stored_rate_is_refused_at_reveal(self):
+        """The 26 RXD burn.
+
+        ``__init__`` judges the minter's rate; the reveal spends the RECORD's. They are
+        different numbers for any record loaded into another instance, or written by a
+        pyrxd predating the ceiling. Nothing downstream catches the difference:
+        ``assert_pays_for_its_size`` is a floor check, so an overpay passes it trivially.
+        """
+        import dataclasses
+
+        store = RecordingStore()
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+
+        # The shape a pre-ceiling pyrxd would have left on disk.
+        overpriced = dataclasses.replace(pending, fee_rate=self.OVER_CEILING)
+        store.save(overpriced)
+
+        with pytest.raises(ValidationError, match="ceiling|x Radiant"):
+            asyncio.run(minter.reveal_nft(overpriced))
+        assert store.load(overpriced.commit_txid) is not None, "a refusal must keep the record"
+
+    def test_the_overpay_hatch_opens_the_door_it_claims_to(self):
+        """``allow_overpay=True`` must actually retire the CEILING refusal.
+
+        It cannot be asserted by "and then it succeeds", because this fixture's commit is
+        funded at an ordinary rate and simply does not hold enough to pay an over-ceiling
+        reveal. That containment is real but incidental — it is a property of how THIS
+        commit was funded, not of the guard. It is also what made an adversarial reviewer
+        conclude the bug was contained everywhere: their commit could not fund the overpay
+        either, so the burn never materialised for them. Fund the commit to match the
+        stored rate — the shape a pre-ceiling pyrxd would leave behind — and the same code
+        paid 26 RXD without a word.
+
+        So assert the discrimination directly: the ceiling refuses, and with the hatch open
+        the refusal that remains is a DIFFERENT one, about funding rather than the rate.
+        """
+        import dataclasses
+
+        store = RecordingStore()
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+        overpriced = dataclasses.replace(pending, fee_rate=self.OVER_CEILING)
+        store.save(overpriced)
+
+        with pytest.raises(Exception) as gated:
+            asyncio.run(minter.reveal_nft(overpriced))
+        assert "ceiling" in str(gated.value) or "x Radiant" in str(gated.value)
+
+        with pytest.raises(Exception) as hatched:
+            asyncio.run(minter.reveal_nft(overpriced, allow_overpay=True))
+        assert "fee-sizing invariant" in str(hatched.value)
+        assert "ceiling" not in str(hatched.value)
+
+    def test_the_sub_floor_hatch_does_not_also_waive_the_ceiling(self):
+        """The two ends are independent. Saying "this chain is cheap" must not say
+        "and any overpay is fine" — they are opposite failures."""
+        with pytest.raises(ValidationError, match="ceiling|x Radiant"):
+            GlyphMinter(
+                FakeClient(),
+                FakeWallet(_key()),
+                RecordingStore(),
+                fee_rate=self.OVER_CEILING,
+                allow_below_relay_floor=True,
+            )

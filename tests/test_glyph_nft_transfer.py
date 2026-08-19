@@ -352,3 +352,38 @@ class TestFtSelectionDoesNotRefuseWhatItPicked:
 
         selected = await select_ft_inputs(wallet, ref, 50, client)
         assert sum(t[0].ft_amount for t in selected) == 100, "raided the large holding"
+
+
+class TestTheDocumentedExceptionIsTheOneRaised:
+    """``build_nft_transfer`` promised ``ValidationError`` and raised bare ``ValueError``.
+
+    Its rate gate omitted ``error_type=``, so it fell back to the helper's default. Every
+    sibling got this right: ``mint.py`` passes ``error_type`` explicitly at both of its
+    call sites, and ``build_ft_transfer`` launders the same underlying ``ValueError`` back
+    through its ``except (ValidationError, ValueError)`` wrapper. This path has no such
+    wrapper, so the contract was simply wrong — and it was invisible from the CLI, which
+    catches both together. Only a caller who followed the docstring would have been hurt,
+    which is the worst audience to be wrong for.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_over_ceiling_rate_raises_the_documented_type(self) -> None:
+        with pytest.raises(ValidationError):
+            await build_nft_transfer(
+                MagicMock(),
+                GlyphRef(txid="aa" * 32, vout=0),
+                Hex20(b"\x11" * 20),
+                client=MagicMock(),
+                fee_rate=10_000_000,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_sub_floor_rate_raises_the_documented_type(self) -> None:
+        with pytest.raises(ValidationError):
+            await build_nft_transfer(
+                MagicMock(),
+                GlyphRef(txid="aa" * 32, vout=0),
+                Hex20(b"\x11" * 20),
+                client=MagicMock(),
+                fee_rate=1,
+            )

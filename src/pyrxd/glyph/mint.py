@@ -649,6 +649,10 @@ class GlyphMinter:
             regtest key.
         store: where the :class:`PendingMint` is kept between phases. **Required.**
         fee_rate: photons per byte for both transactions.
+        allow_below_relay_floor: accept a ``fee_rate`` under the relay floor, for chains
+            whose floor really is lower — a regtest node runs at a tenth of mainnet's.
+            Applies to the reveal as well, so a minter built this way can finish what it
+            starts. Leave it False against mainnet.
         min_confirmations: depth required on the commit before the reveal is built.
             See :data:`DEFAULT_MINT_CONFIRMATIONS` — the default is convention.
         confirmation_timeout_s: how long ``reveal_*`` waits before raising
@@ -663,6 +667,7 @@ class GlyphMinter:
         store: PendingStore,
         *,
         fee_rate: int = MIN_FEE_RATE,
+        allow_below_relay_floor: bool = False,
         min_confirmations: int = DEFAULT_MINT_CONFIRMATIONS,
         confirmation_timeout_s: float = DEFAULT_CONFIRMATION_TIMEOUT_S,
     ) -> None:
@@ -682,12 +687,19 @@ class GlyphMinter:
         # of the store by hand. Measured at `fee_rate=100_001` (one photon over the 10x
         # ceiling): commit broadcast, reveal refused.
         #
-        # Gating at construction also makes the reveal's `allow_overpay=True` honest: the
-        # ceiling really has been judged by then, which is what a previous comment claimed
-        # before it was true.
+        # `allow_below_relay_floor` has to be a constructor argument, not just a reveal
+        # argument. This gate judges BOTH ends, so without it the check that was meant to
+        # catch a 1000x overpay also refused every legitimate sub-floor rate: a regtest
+        # node runs at a tenth of mainnet's floor, and `fee_rate=1000` could no longer
+        # construct a minter at all. That also stranded the reveal's own
+        # `allow_below_relay_floor=` — no public path could produce a sub-floor
+        # `PendingMint` to use it on, so the hatch existed with nothing able to reach it.
+        # A guard that refuses honest work is a bug, however sound its refusal of the
+        # dishonest kind.
         assert_fee_rate_clears_relay_floor(
             fee_rate,
             what="GlyphMinter fee_rate",
+            allow_below_relay_floor=allow_below_relay_floor,
             error_type=ValidationError,
         )
         if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 1:
@@ -696,6 +708,7 @@ class GlyphMinter:
         self._wallet = wallet
         self._store = store
         self._fee_rate = fee_rate
+        self._allow_below_relay_floor = allow_below_relay_floor
         self._min_confirmations = min_confirmations
         self._confirmation_timeout_s = confirmation_timeout_s
         self._builder = GlyphBuilder()
@@ -1067,43 +1080,53 @@ class GlyphMinter:
         effective_rate = pending.fee_rate if fee_rate is None else fee_rate
         if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:
             raise ValidationError("reveal fee_rate must be a positive int")
-        reveal_tx.fee(SatoshisPerKilobyte(effective_rate * 1000))
-        reveal_tx.sign()
-
-        # Two separate checks, because they catch different things and the first one
-        # alone does NOT catch what an earlier version of this comment claimed.
+        # Judge the rate BEFORE spending it — both ends, every time, whatever its
+        # provenance.
         #
-        # `assert_pays_for_its_size` measures the signed bytes against `pending.fee_rate`
-        # — the rate stored when the COMMIT was built, possibly weeks ago. It therefore
-        # cannot see a relay floor that has MOVED since: `required_fee` deliberately does
-        # not lift a sub-floor rate (`fee_sizing`), so a stale rate agrees with itself and
-        # the check passes on a transaction no node will relay.
+        # A previous version waived the ceiling whenever `fee_rate` was None, on the
+        # premise that `__init__` had already judged it. That premise was false in the one
+        # direction that costs money: `__init__` judges `self._fee_rate`, but this spends
+        # `pending.fee_rate` — a different number for any record that crossed instances,
+        # and `from_dict` copies it off disk with no bound check. Since `fee_rate is None`
+        # is the only path `mint_nft`/`deploy_ft` can take, the ceiling was unreachable on
+        # the default path.
         #
-        # So judge the rate against the CURRENT floor — but judging it is NOT free, and an
-        # earlier version of this comment claimed a recoverability it did not provide.
+        # Nothing downstream catches an overpay. `assert_pays_for_its_size` returns as
+        # soon as `fee_paid >= required`, so it is a FLOOR check that an overpay passes
+        # trivially. Measured on a record carrying `fee_rate=10_000_000` funded well
+        # enough to pay it: the reveal paid 2,600,000,000 photons (26 RXD), no refusal and
+        # no warning — the 1000x per-kB-as-per-byte burn this ceiling exists to stop. A
+        # record written by a pre-ceiling pyrxd is exactly that shape, and records outlive
+        # the code that wrote them.
         #
-        # Raising the rate is not always an escape: the commit output was funded for the
-        # rate stored at commit time, so if the floor has risen 10x the commit simply does
-        # not hold enough to pay a floor-rate reveal (measured: a ~20 KB reveal needs
-        # 20,297,000 photons at 1,000/B and 202,970,000 at 10,000/B). Refusing with no way
-        # through would convert "this reveal may not relay" into "this commit can never be
-        # revealed" — strictly worse, because broadcasting at least gives it a chance.
+        # The FLOOR is re-judged here for the opposite reason: it can MOVE between commit
+        # and reveal, and `required_fee` deliberately does not lift a sub-floor rate, so a
+        # stale rate agrees with itself and would sail through the size check on a
+        # transaction no node will relay.
         #
-        # Hence both overrides are the CALLER'S: `allow_below_relay_floor=True` to send it
-        # anyway, `fee_rate=` to re-price upward when the commit can afford it. The default
-        # refuses, so the failure is loud and the record survives either way.
+        # Both escape hatches stay the caller's and stay explicit, because refusing with
+        # no way through would turn "this reveal may not relay" into "this commit can
+        # never be revealed" — strictly worse, since the commit is a hashlock with no
+        # owner-only path. `allow_below_relay_floor=True` sends it anyway; `fee_rate=`
+        # re-prices upward when the commit can afford it (it cannot always: the commit was
+        # funded at the old rate). The default refuses loudly and keeps the record.
         assert_fee_rate_clears_relay_floor(
             effective_rate,
             what="glyph reveal",
-            allow_below_relay_floor=allow_below_relay_floor,
-            # The ceiling was judged in `__init__`, before the commit was built — see
-            # there. What is re-judged here is the FLOOR, which can move between commit
-            # and reveal; the ceiling cannot, because the rate is fixed at construction.
-            # A caller-supplied `fee_rate=` override is judged on both ends below.
-            allow_overpay=allow_overpay or fee_rate is None,
+            # Honour the construction-time opt-in too: a minter deliberately built for a
+            # sub-floor chain must be able to REVEAL on it, or it could commit and never
+            # finish — the worst of both refusals.
+            allow_below_relay_floor=allow_below_relay_floor or self._allow_below_relay_floor,
+            allow_overpay=allow_overpay,
             error_type=ValidationError,
         )
 
+        reveal_tx.fee(SatoshisPerKilobyte(effective_rate * 1000))
+        reveal_tx.sign()
+
+        # A second, different question: does the SIGNED transaction actually pay for the
+        # bytes it turned out to contain? The rate gate above judges the rate; this judges
+        # the result of applying it, after signatures have settled the real size.
         raw = reveal_tx.serialize()
         assert_pays_for_its_size(
             size_bytes=len(raw),

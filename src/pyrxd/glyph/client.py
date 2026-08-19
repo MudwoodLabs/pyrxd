@@ -19,8 +19,9 @@ one-line fix rather than failing later.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
+from ..fee_sizing import assert_fee_rate_clears_relay_floor
 from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S
 from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Hex20
@@ -83,7 +84,20 @@ class BroadcastEchoMismatch(RxdSdkError):
         self.echoed = echoed
 
 
-def _confirmed_txid(build: FtTransferBuild | NftTransferBuild, echoed: object) -> str:
+class _HasSignedTx(Protocol):
+    """Anything carrying the signed transaction that is about to be broadcast.
+
+    Structural on purpose. The check below needs one thing — the bytes we signed — and
+    every fund-moving build in this package has them under ``.tx``. Naming concrete
+    types here instead made the annotation the reason an airdrop kept the weaker,
+    warn-only txid helper while its transfer siblings raised.
+    """
+
+    @property
+    def tx(self) -> Any: ...
+
+
+def _confirmed_txid(build: _HasSignedTx, echoed: object) -> str:
     """The txid of what we signed — not merely what the server said it was.
 
     `broadcast` returns whatever the server replies, and the reply is only
@@ -154,7 +168,14 @@ class GlyphClient:
             ``addresses``.
         store: where a :class:`~pyrxd.glyph.mint.PendingMint` lives between commit and
             reveal. Required for minting, unused by transfers.
-        fee_rate: photons per byte, applied to every build.
+        fee_rate: photons per byte, applied to every build. A rate above the overpay
+            ceiling is refused here; a rate below the relay floor is left to each build
+            path to judge, since the floor is a property of the chain.
+        allow_below_relay_floor: let MINTS accept a sub-floor ``fee_rate``, for chains
+            whose floor really is lower. Transfers still refuse one — threading it
+            through the FT builder is a wider change than this flag, and doing it for
+            NFT alone would reintroduce the FT/NFT asymmetry that caused a release
+            blocker on this very surface.
         min_confirmations: depth required on a mint's commit before its reveal.
         confirmation_timeout_s: how long a reveal waits for the commit.
     """
@@ -166,6 +187,7 @@ class GlyphClient:
         *,
         store: PendingStore | None = None,
         fee_rate: int = MIN_FEE_RATE,
+        allow_below_relay_floor: bool = False,
         min_confirmations: int = DEFAULT_MINT_CONFIRMATIONS,
         confirmation_timeout_s: float = DEFAULT_CONFIRMATION_TIMEOUT_S,
     ) -> None:
@@ -177,10 +199,29 @@ class GlyphClient:
             )
         if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
             raise ValidationError("GlyphClient fee_rate must be a positive int")
+        # Judge the CEILING here, and only the ceiling.
+        #
+        # The two ends of this check answer different questions. A rate far ABOVE the
+        # floor is never legitimate — it is the fat-finger that pays a per-kB number as
+        # if it were per-byte, and it burns the difference — so refuse it at construction,
+        # before any build can spend it, and give the message the caller's own parameter
+        # name rather than one from a lazily-built object they never mentioned.
+        #
+        # A rate BELOW the floor is chain-dependent, not wrong: a regtest node's floor
+        # really is a tenth of mainnet's. Each build path judges that against its own
+        # context, so deciding it here would be deciding it too early and in the wrong
+        # place.
+        assert_fee_rate_clears_relay_floor(
+            fee_rate,
+            what="GlyphClient fee_rate",
+            allow_below_relay_floor=True,
+            error_type=ValidationError,
+        )
         self._client = client
         self._wallet = wallet
         self._store = store
         self._fee_rate = fee_rate
+        self._allow_below_relay_floor = allow_below_relay_floor
         self._min_confirmations = min_confirmations
         self._confirmation_timeout_s = confirmation_timeout_s
         self._minter: GlyphMinter | None = None
@@ -209,6 +250,7 @@ class GlyphClient:
                 self._wallet,
                 self._store,
                 fee_rate=self._fee_rate,
+                allow_below_relay_floor=self._allow_below_relay_floor,
                 min_confirmations=self._min_confirmations,
                 confirmation_timeout_s=self._confirmation_timeout_s,
             )

@@ -7,6 +7,8 @@ so every refusal case here is matched by an honest case that must pass.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
@@ -275,3 +277,40 @@ class TestTransferReceipt:
         assert receipt.amount == 250
         assert receipt.fee == 3_000_000
         assert "3000000" in repr(receipt) or "3_000_000" in repr(receipt) or "fee=3000000" in repr(receipt)
+
+
+class TestGlyphClientJudgesItsOwnFeeRate:
+    """The facade took a ``fee_rate`` and judged only that it was a positive int.
+
+    An over-ceiling rate constructed fine and was refused later by a lazily-built
+    ``GlyphMinter`` — in a message naming ``GlyphMinter fee_rate``, a parameter the
+    caller never spelled. For a transfer-only client the refusal did not arrive at all,
+    because no minter is ever built.
+    """
+
+    def test_an_over_ceiling_rate_is_refused_by_name(self):
+        with pytest.raises(ValidationError) as exc:
+            GlyphClient(object(), object(), fee_rate=10_000_000)
+        assert "GlyphClient fee_rate" in str(exc.value), "the message must name the caller's parameter"
+
+    def test_a_sub_floor_rate_is_left_to_the_build_paths(self):
+        """The two ends are not symmetric questions.
+
+        An overpay is never legitimate, so it is refused here, before any build can spend
+        it. A sub-floor rate is a property of the CHAIN — a regtest node's floor really is
+        a tenth of mainnet's — so it belongs to whichever build path knows its context,
+        not to a constructor that cannot.
+        """
+        assert GlyphClient(object(), object(), fee_rate=1_000) is not None
+
+    def test_the_mint_opt_in_is_forwarded_to_the_minter(self):
+        client = GlyphClient(
+            object(),
+            object(),
+            store=UnsafeNullPendingStore(),
+            fee_rate=1_000,
+            allow_below_relay_floor=True,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            assert client.minter is not None, "the minter must accept what the client accepted"
