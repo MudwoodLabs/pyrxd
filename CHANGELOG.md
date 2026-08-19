@@ -4,7 +4,7 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.0] — 2026-08-19
 
 ### Upgrade notes
 
