@@ -314,3 +314,35 @@ class TestGlyphClientJudgesItsOwnFeeRate:
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             assert client.minter is not None, "the minter must accept what the client accepted"
+
+
+class TestAMintCapableClientJudgesTheFloorUpFront:
+    """Deferring the floor entirely meant ``GlyphClient(store=..., fee_rate=1000)``
+    constructed, then failed from the lazily-built minter with ``GlyphMinter fee_rate`` —
+    a deferred refusal naming a parameter the caller never spelled, which is the fault the
+    constructor gate was added to fix, reappearing at the other end of it.
+    """
+
+    def test_a_mint_capable_client_refuses_a_sub_floor_rate_by_its_own_name(self):
+        with pytest.raises(ValidationError) as exc:
+            GlyphClient(object(), object(), store=UnsafeNullPendingStore(), fee_rate=1_000)
+        assert "GlyphClient fee_rate" in str(exc.value)
+
+    def test_the_opt_in_still_lets_a_regtest_client_mint(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            assert (
+                GlyphClient(
+                    object(),
+                    object(),
+                    store=UnsafeNullPendingStore(),
+                    fee_rate=1_000,
+                    allow_below_relay_floor=True,
+                ).minter
+                is not None
+            )
+
+    def test_a_transfer_only_client_keeps_the_deferral(self):
+        """No store means no mint, and the transfer builders judge the floor themselves
+        against their own chain."""
+        assert GlyphClient(object(), object(), fee_rate=1_000) is not None

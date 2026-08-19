@@ -691,11 +691,15 @@ class GlyphMinter:
         # argument. This gate judges BOTH ends, so without it the check that was meant to
         # catch a 1000x overpay also refused every legitimate sub-floor rate: a regtest
         # node runs at a tenth of mainnet's floor, and `fee_rate=1000` could no longer
-        # construct a minter at all. That also stranded the reveal's own
-        # `allow_below_relay_floor=` — no public path could produce a sub-floor
-        # `PendingMint` to use it on, so the hatch existed with nothing able to reach it.
-        # A guard that refuses honest work is a bug, however sound its refusal of the
-        # dishonest kind.
+        # construct a minter at all. A guard that refuses honest work is a bug, however
+        # sound its refusal of the dishonest kind.
+        #
+        # An earlier version of this comment also claimed the gate had stranded the
+        # reveal's own `allow_below_relay_floor=`, because no public path could produce a
+        # sub-floor record to use it on. That was false: `from_dict` restores whatever rate
+        # is on disk, checking only that it is a positive int, and a commit made before the
+        # floor rose is exactly that record. The hatch was always reachable; the
+        # construction refusal justifies the argument on its own.
         assert_fee_rate_clears_relay_floor(
             fee_rate,
             what="GlyphMinter fee_rate",
@@ -800,7 +804,7 @@ class GlyphMinter:
         pending: PendingMint,
         *,
         fee_rate: int | None = None,
-        allow_below_relay_floor: bool = False,
+        allow_below_relay_floor: bool | None = None,
         allow_overpay: bool = False,
     ) -> MintResult:
         """Wait for the commit, then broadcast the NFT reveal.
@@ -829,7 +833,7 @@ class GlyphMinter:
         pending: PendingMint,
         *,
         fee_rate: int | None = None,
-        allow_below_relay_floor: bool = False,
+        allow_below_relay_floor: bool | None = None,
         allow_overpay: bool = False,
     ) -> MintResult:
         """Wait for the commit, then broadcast the FT deploy reveal.
@@ -1062,7 +1066,7 @@ class GlyphMinter:
         pending: PendingMint,
         *,
         fee_rate: int | None = None,
-        allow_below_relay_floor: bool = False,
+        allow_below_relay_floor: bool | None = None,
         allow_overpay: bool = False,
     ) -> MintResult:
         funding_key = self._key_for_address(pending.funding_address)
@@ -1080,6 +1084,16 @@ class GlyphMinter:
         effective_rate = pending.fee_rate if fee_rate is None else fee_rate
         if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:
             raise ValidationError("reveal fee_rate must be a positive int")
+
+        # A minter built for a sub-floor chain must be able to REVEAL on it, or it could
+        # commit and never finish. But inherit that only when the caller said NOTHING:
+        # `allow_below_relay_floor or self._allow_below_relay_floor` also swallowed an
+        # EXPLICIT False, so a caller who deliberately re-asserted the floor for one reveal
+        # was silently overruled by the constructor. Measured: a minter built with the
+        # opt-in revealed at `fee_rate=1` despite being passed False — a transaction no
+        # node relays, holding its inputs until mempool expiry with neither RBF nor CPFP to
+        # rescue it. `None` means "unspecified"; False means False.
+        floor_opt_in = self._allow_below_relay_floor if allow_below_relay_floor is None else allow_below_relay_floor
         # Judge the rate BEFORE spending it — both ends, every time, whatever its
         # provenance.
         #
@@ -1116,7 +1130,7 @@ class GlyphMinter:
             # Honour the construction-time opt-in too: a minter deliberately built for a
             # sub-floor chain must be able to REVEAL on it, or it could commit and never
             # finish — the worst of both refusals.
-            allow_below_relay_floor=allow_below_relay_floor or self._allow_below_relay_floor,
+            allow_below_relay_floor=floor_opt_in,
             allow_overpay=allow_overpay,
             error_type=ValidationError,
         )
@@ -1133,6 +1147,11 @@ class GlyphMinter:
             fee_paid=reveal_tx.get_fee(),
             fee_rate=effective_rate,
             what="glyph reveal",
+            # Every other refusal on this path is a ValidationError. Leaving this one to
+            # the helper's bare-ValueError default made it the single hole a caller with
+            # `except ValidationError` falls through — on the funding failure, which is the
+            # one most likely to actually happen.
+            error_type=ValidationError,
         )
 
         echoed = await self._client.broadcast(raw)

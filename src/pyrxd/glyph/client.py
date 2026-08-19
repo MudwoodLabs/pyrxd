@@ -169,13 +169,15 @@ class GlyphClient:
         store: where a :class:`~pyrxd.glyph.mint.PendingMint` lives between commit and
             reveal. Required for minting, unused by transfers.
         fee_rate: photons per byte, applied to every build. A rate above the overpay
-            ceiling is refused here; a rate below the relay floor is left to each build
-            path to judge, since the floor is a property of the chain.
+            ceiling is always refused here. A sub-floor rate is refused here too when
+            ``store`` is given — mints judge it in the constructor — and otherwise left to
+            each build path, since the floor is a property of the chain.
         allow_below_relay_floor: let MINTS accept a sub-floor ``fee_rate``, for chains
-            whose floor really is lower. Transfers still refuse one — threading it
-            through the FT builder is a wider change than this flag, and doing it for
-            NFT alone would reintroduce the FT/NFT asymmetry that caused a release
-            blocker on this very surface.
+            whose floor really is lower. Required at construction when ``store`` is given,
+            since minting judges the rate in the constructor rather than per build.
+            Transfers still refuse a sub-floor rate — threading it through the FT builder
+            is a wider change than this flag, and doing it for NFT alone would reintroduce
+            the FT/NFT asymmetry that caused a release blocker on this very surface.
         min_confirmations: depth required on a mint's commit before its reveal.
         confirmation_timeout_s: how long a reveal waits for the commit.
     """
@@ -211,10 +213,18 @@ class GlyphClient:
         # really is a tenth of mainnet's. Each build path judges that against its own
         # context, so deciding it here would be deciding it too early and in the wrong
         # place.
+        # The floor is judged here too WHEN THIS CLIENT CAN MINT. Deferring it entirely
+        # meant `GlyphClient(store=..., fee_rate=1000)` constructed happily and then failed
+        # from the lazily-built minter with `GlyphMinter fee_rate: ...` — a deferred
+        # refusal naming a parameter the caller never spelled, which is the exact fault
+        # this gate was added to fix, reappearing at the other end of it.
+        #
+        # A transfer-only client keeps the deferral, because there its build paths really
+        # do judge the floor, each against its own chain.
         assert_fee_rate_clears_relay_floor(
             fee_rate,
             what="GlyphClient fee_rate",
-            allow_below_relay_floor=True,
+            allow_below_relay_floor=allow_below_relay_floor or store is None,
             error_type=ValidationError,
         )
         self._client = client

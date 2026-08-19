@@ -387,3 +387,31 @@ class TestTheDocumentedExceptionIsTheOneRaised:
                 client=MagicMock(),
                 fee_rate=1,
             )
+
+
+class TestTheSizeCheckAlsoKeepsTheDocumentedContract:
+    """``build_nft_transfer`` has two refusals four lines apart. The rate gate was fixed to
+    raise the documented ``ValidationError``; the size check below it was left raising a
+    bare ``ValueError`` against the same docstring, which promises
+    ``ValidationError: the signed transaction does not pay for its own size``.
+
+    Reviewing one diff hunk at a time is how the second one survived the fix to the first.
+    """
+
+    def test_the_call_site_names_its_exception_type(self) -> None:
+        import ast
+        import inspect
+
+        from pyrxd.glyph import transfer
+
+        src = inspect.getsource(transfer.build_nft_transfer)
+        calls = [
+            n
+            for n in ast.walk(ast.parse(src.lstrip()))
+            if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "assert_pays_for_its_size"
+        ]
+        assert calls, "the size check moved — this guard would silently stop guarding"
+        for call in calls:
+            assert any(kw.arg == "error_type" for kw in call.keywords), (
+                "assert_pays_for_its_size defaults to a bare ValueError; the docstring promises ValidationError"
+            )

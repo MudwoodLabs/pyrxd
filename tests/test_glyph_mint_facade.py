@@ -1131,3 +1131,52 @@ class TestTheRateIsJudgedWhereverItCameFrom:
                 fee_rate=self.OVER_CEILING,
                 allow_below_relay_floor=True,
             )
+
+
+class TestTheCallersWordBeatsTheConstructors:
+    """``allow_below_relay_floor or self._allow_below_relay_floor`` swallowed an explicit
+    ``False``.
+
+    The OR was meant to let a minter built for a sub-floor chain finish its own mints. It
+    also overruled a caller who deliberately re-asserted the floor for one reveal, which is
+    the opposite of what an explicit argument is for. ``None`` now means "unspecified" and
+    ``False`` means ``False``.
+    """
+
+    @staticmethod
+    def _sub_floor_minter(store):
+        return GlyphMinter(FakeClient(), FakeWallet(_key()), store, fee_rate=1_000, allow_below_relay_floor=True)
+
+    def test_an_explicit_false_re_asserts_the_floor(self):
+        store = RecordingStore()
+        minter = self._sub_floor_minter(store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+
+        with pytest.raises(ValidationError, match="floor|relay"):
+            asyncio.run(minter.reveal_nft(pending, fee_rate=1, allow_below_relay_floor=False))
+        assert store.load(pending.commit_txid) is not None, "a refusal must keep the record"
+
+    def test_saying_nothing_still_inherits_so_the_mint_can_finish(self):
+        minter = self._sub_floor_minter(RecordingStore())
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+        assert asyncio.run(minter.reveal_nft(pending)).reveal_txid
+
+
+class TestTheRevealsFundingRefusalIsTyped:
+    """The reveal's size check was the one refusal on that path left as a bare
+    ``ValueError`` — the hole a caller with ``except ValidationError`` falls through, on
+    the failure most likely to actually occur."""
+
+    def test_an_underfunded_reveal_raises_the_same_type_as_its_siblings(self):
+        import dataclasses
+
+        store = RecordingStore()
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+        # Over-ceiling with the ceiling deliberately waived: the commit cannot fund it, so
+        # the size check is what refuses.
+        overpriced = dataclasses.replace(pending, fee_rate=10_000_000)
+        store.save(overpriced)
+
+        with pytest.raises(ValidationError, match="fee-sizing invariant"):
+            asyncio.run(minter.reveal_nft(overpriced, allow_overpay=True))

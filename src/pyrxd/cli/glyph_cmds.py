@@ -586,6 +586,14 @@ def deploy_ft_cmd(
 
     from ..utils import address_to_public_key_hash
 
+    # Pin the network BEFORE deriving the PKH, for the reason `_require_address_on_network`
+    # documents: `address_to_public_key_hash` decodes a testnet address into a perfectly
+    # valid-looking 20-byte PKH, and the deploy then locks the ENTIRE premined supply to a
+    # script no key on this network can spend. Every other destination in this CLI is
+    # pinned — `transfer-ft`, `transfer-nft`, each airdrop recipient — and this one, which
+    # carries the most value of any of them, was not.
+    _require_address_on_network(ctx, treasury, what="--treasury address")
+
     try:
         treasury_pkh = Hex20(address_to_public_key_hash(treasury))
     except (ValidationError, ValueError) as exc:
@@ -958,10 +966,18 @@ def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
         raise UserError(
             "the commit was broadcast but its txid could not be re-derived locally",
             cause="the signed commit bytes did not parse back into a transaction",
+            # Name a recovery that EXISTS. An earlier version of this sent the user to a
+            # "PendingMint record still in the store" — this CLI has no PendingStore at
+            # all (that is the SDK's `GlyphMinter`), so the advice was fiction on a path
+            # where the commit is a hashlock with no owner-only spend path. `_wait_for_tx`
+            # above had this exact bug once and calls sending a user to a recovery that
+            # does not exist "the worst possible answer". Same answer here, same reason.
             fix=(
-                f"the server echoed {echoed} — check it on an explorer. If it is there, the "
-                "commit relayed and its PendingMint record is still in the store, so the "
-                "reveal can be resumed against it."
+                f"the server echoed {echoed} — check it on an explorer. If it is there the commit "
+                "relayed: rebuild the reveal with the SDK — GlyphBuilder.prepare_reveal("
+                "RevealParams(commit_txid=<txid>, commit_vout=0, commit_value=<photons>, "
+                "cbor_bytes=..., owner_pkh=..., is_nft=...)) using the SAME unmodified metadata "
+                "file and the SAME wallet. See docs/how-to/troubleshoot-common-errors.md"
             ),
         )
     local = str(tx.txid())

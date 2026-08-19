@@ -756,6 +756,13 @@ async def build_nft_transfer(
         fee_paid=fee_paid,
         fee_rate=fee_rate,
         what="the NFT transfer",
+        # This function's docstring promises `ValidationError: the signed transaction does
+        # not pay for its own size` — this is that check, and without `error_type` it
+        # raised a bare `ValueError` instead. The rate gate four lines up had exactly the
+        # same defect and was fixed on its own; a review that compared the two call sites
+        # inside ONE function would have caught both at once, which is the whole argument
+        # for reading paths side by side rather than one diff hunk at a time.
+        error_type=ValidationError,
     )
 
     return NftTransferBuild(

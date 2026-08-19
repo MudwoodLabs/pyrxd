@@ -734,6 +734,7 @@ class TestDmintCliHelpers:
 
 import asyncio
 import dataclasses
+import pathlib
 from unittest.mock import AsyncMock, MagicMock
 
 from pyrxd.glyph.dmint import build_mint_scriptsig
@@ -2062,6 +2063,31 @@ class TestTheCommitTxidHelperCannotStrandACommit:
         rendered = exc.value.format_message()
         assert echoed in rendered, "the echoed txid is the only handle left on a relayed commit"
         assert "explorer" in rendered
+        # The advice must name a recovery that EXISTS. An earlier version sent the user to
+        # a "PendingMint record still in the store"; this CLI has no PendingStore at all,
+        # so that was fiction on a path where the commit is an unspendable hashlock unless
+        # the reveal carries byte-identical CBOR. `_wait_for_tx` had this bug once and its
+        # docstring calls it "the worst possible answer".
+        assert "prepare_reveal" in rendered
+        assert "store" not in rendered.lower(), "names a recovery this CLI does not have"
+
+    def test_the_cli_really_has_no_pending_store_to_point_at(self) -> None:
+        """The premise behind the assertion above, checked rather than assumed."""
+        import ast
+        import pkgutil
+
+        import pyrxd.cli
+
+        offenders = []
+        for m in pkgutil.iter_modules(pyrxd.cli.__path__):
+            src = (pathlib.Path(pyrxd.cli.__path__[0]) / f"{m.name}.py").read_text()
+            for node in ast.walk(ast.parse(src)):
+                # An IMPORT, not the mere word — the comment explaining this very absence
+                # says "PendingStore", and a substring check would trip over its own
+                # explanation.
+                if isinstance(node, ast.ImportFrom) and any(a.name.endswith("PendingStore") for a in node.names):
+                    offenders.append(m.name)
+        assert not offenders, f"the CLI now imports a PendingStore ({offenders}) — revisit the advice"
 
 
 class TestALyingRevealEchoIsRefused:
@@ -2125,3 +2151,60 @@ class TestALyingRevealEchoIsRefused:
         assert str(Transaction.from_hex(captured[1]).txid()) in rendered
         assert "do not use the echoed id" in rendered.lower()
         assert "explorer" in rendered
+
+
+class TestDeployFtPinsItsTreasury:
+    """``deploy-ft --treasury`` receives the ENTIRE premined supply and was the one
+    destination in this CLI with no network pin.
+
+    Every sibling has one — ``transfer-ft``, ``transfer-nft``, each airdrop recipient —
+    each added after the same reasoning: ``address_to_public_key_hash`` decodes a testnet
+    address into a valid-looking 20-byte PKH, so the deploy would have built, confirmed,
+    and locked the whole supply to a script no mainnet key can spend. There is no refund
+    path and no RBF. This path carries more value than any of the ones already pinned, and
+    it was missed because nobody compared them side by side.
+    """
+
+    @staticmethod
+    def _testnet_address() -> str:
+        """``PublicKey.address()`` defaults to mainnet and does NOT read the key's own
+        network field, so this must be passed explicitly or the test asserts nothing."""
+        from pyrxd.constants import Network
+
+        return PrivateKey().public_key().address(network=Network.TESTNET)
+
+    def _invoke(self, runner: CliRunner, wallet: Path, tmp_path: Path, treasury: str):
+        return runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(wallet),
+                "glyph",
+                "deploy-ft",
+                str(_write_meta(tmp_path / "ft.json")),
+                "--supply",
+                "1000",
+                "--treasury",
+                treasury,
+            ],
+        )
+
+    def test_a_testnet_treasury_is_refused_on_mainnet(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path
+    ) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = self._invoke(runner, tmp_wallet_path, tmp_path, self._testnet_address())
+        assert result.exit_code != 0
+        assert "not a valid mainnet radiant p2pkh address" in result.output.lower()
+
+    def test_a_mainnet_treasury_gets_past_the_pin(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path
+    ) -> None:
+        """The other half: the guard must not refuse the address it exists to accept.
+
+        This stops before any broadcast — it only has to get past the pin, so whatever it
+        fails on later, it must not be the address.
+        """
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = self._invoke(runner, tmp_wallet_path, tmp_path, PrivateKey().public_key().address())
+        assert "not a valid mainnet radiant p2pkh address" not in result.output.lower()
