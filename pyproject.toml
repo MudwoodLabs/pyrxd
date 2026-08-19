@@ -302,7 +302,7 @@ dev = [
     # IndexFile.from_tree (GHSA-9rj7-rf2p-w77r, GHSA-4gmw-gg2m-w46p), all patched 3.1.58. cosmic-ray
     # sets no upper cap, so floor at the highest patched version. Dev-scope only — gitpython is not a
     # pyrxd runtime dependency and never ships in the published package.
-    "gitpython>=3.1.58",
+    "gitpython>=3.1.59",
 ]
 test = [
     "bandit[toml]>=1.9.4,<2.0.0",
