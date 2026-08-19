@@ -31,7 +31,7 @@ from pyrxd.keys import PrivateKey
 from pyrxd.network.electrumx import UtxoRecord
 from pyrxd.script.script import Script
 from pyrxd.script.type import P2PKH
-from pyrxd.security.errors import InsufficientFundsError
+from pyrxd.security.errors import InsufficientFundsError, ValidationError
 from pyrxd.security.types import Hex20
 from pyrxd.transaction.transaction import Transaction
 from pyrxd.transaction.transaction_output import TransactionOutput
@@ -240,3 +240,180 @@ class TestWhyTheSelfFundedBuilderIsNotUsed:
 def h_fund_value() -> int:
     """Comfortably above the bar, so the honest-path tests exercise the change branch."""
     return 50_000_000
+
+
+class TestFtSelectionDoesNotRefuseWhatItPicked:
+    """Selection must not construct a spend the next call then rejects.
+
+    `FtUtxoSet` signs every input with one key, so `single_ft_signing_key` refuses a
+    selection spanning addresses. Selection used to sort the WHOLE wallet by amount and
+    take greedily, which produced exactly such selections — and the user was told to
+    "consolidate the token to one address first" even when one address already covered
+    the amount on its own. A guard refusing valid work is its own bug; this one refused
+    work it had itself constructed.
+    """
+
+    @staticmethod
+    def _wallet_with(holdings: dict[str, list[int]], ref):
+        """`{address_seed: [unit amounts]}` -> (wallet, client) over real scripts."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from pyrxd.glyph.script import build_ft_locking_script
+
+        triples, txmap = [], {}
+        for i, (_seed, amounts) in enumerate(sorted(holdings.items())):
+            key = PrivateKey()
+            spk = build_ft_locking_script(Hex20(key.public_key().hash160()), ref)
+            for j, amt in enumerate(amounts):
+                txid = f"{i:02x}{j:02x}" + "0" * 60
+                triples.append((UtxoRecord(tx_hash=txid, tx_pos=0, value=amt, height=1), key.address(), key))
+                txmap[txid] = _src(0, spk, amt)
+
+        wallet = MagicMock()
+        wallet.collect_spendable = AsyncMock(return_value=triples)
+        client = MagicMock()
+        client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+        return wallet, client
+
+    @pytest.mark.asyncio
+    async def test_it_uses_the_address_that_can_cover_alone(self) -> None:
+        """THE regression case: A=100+100, B=150, amount=200.
+
+        Old behaviour sorted by amount (B=150 first, then A=100), spanned two
+        addresses, and was refused. A alone covers 200 exactly.
+        """
+        from pyrxd.glyph.transfer import select_ft_inputs, single_ft_signing_key
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"A": [100, 100], "B": [150]}, ref)
+
+        selected = await select_ft_inputs(wallet, ref, 200, client)
+
+        assert sum(t[0].ft_amount for t in selected) >= 200
+        assert len({t[1] for t in selected}) == 1, "selection spans addresses and will be refused"
+        single_ft_signing_key(selected, "FT transfer")  # must not raise
+
+    @pytest.mark.asyncio
+    async def test_no_single_address_covers_says_so_precisely(self) -> None:
+        """When consolidation really IS required, the message must say why.
+
+        The wallet total is sufficient; no single address is. That is a genuinely
+        different situation from "you do not have enough", and it gets its own wording.
+        """
+        from pyrxd.glyph.transfer import select_ft_inputs
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"A": [100], "B": [100]}, ref)
+
+        with pytest.raises(InsufficientFundsError) as exc:
+            await select_ft_inputs(wallet, ref, 150, client)
+        msg = str(exc.value)
+        assert "any single address" in msg
+        assert "Consolidate" in msg
+
+    @pytest.mark.asyncio
+    async def test_it_prefers_fewer_inputs_over_a_smaller_holding(self) -> None:
+        """The fee-funding bar scales with input COUNT, so holding size is the wrong
+        tie-breaker.
+
+        Found by an adversarial reviewer against the first version of this fix, which
+        took the smallest sufficient total: for amount=1000 it preferred an address
+        holding 500+500 (two inputs) over one holding 1,000,000 (one input) — a more
+        expensive transaction that `ft_funding` can then refuse for fee funding the
+        one-input build would not have needed.
+        """
+        from pyrxd.glyph.transfer import select_ft_inputs
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"many_small": [500, 500], "one_big": [1_000_000]}, ref)
+
+        selected = await select_ft_inputs(wallet, ref, 1000, client)
+        assert len(selected) == 1, "picked the multi-input address; the fee bar scales per input"
+
+    @pytest.mark.asyncio
+    async def test_a_non_positive_amount_is_refused_at_the_public_entry_point(self) -> None:
+        """`select_ft_inputs` is public API; only `build_ft_transfer` used to validate."""
+        from pyrxd.glyph.transfer import select_ft_inputs
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"A": [100]}, ref)
+        for bad in (0, -5):
+            with pytest.raises(ValidationError, match="positive int"):
+                await select_ft_inputs(wallet, ref, bad, client)
+
+    @pytest.mark.asyncio
+    async def test_it_does_not_fragment_a_large_holding(self) -> None:
+        """Best fit, not first fit: a 10,000-unit address is not raided for 50 units
+        when a 100-unit address can serve it."""
+        from pyrxd.glyph.transfer import select_ft_inputs
+
+        ref = GlyphRef(txid="aa" * 32, vout=0)
+        wallet, client = self._wallet_with({"big": [10_000], "small": [100]}, ref)
+
+        selected = await select_ft_inputs(wallet, ref, 50, client)
+        assert sum(t[0].ft_amount for t in selected) == 100, "raided the large holding"
+
+
+class TestTheDocumentedExceptionIsTheOneRaised:
+    """``build_nft_transfer`` promised ``ValidationError`` and raised bare ``ValueError``.
+
+    Its rate gate omitted ``error_type=``, so it fell back to the helper's default. Every
+    sibling got this right: ``mint.py`` passes ``error_type`` explicitly at both of its
+    call sites, and ``build_ft_transfer`` launders the same underlying ``ValueError`` back
+    through its ``except (ValidationError, ValueError)`` wrapper. This path has no such
+    wrapper, so the contract was simply wrong — and it was invisible from the CLI, which
+    catches both together. Only a caller who followed the docstring would have been hurt,
+    which is the worst audience to be wrong for.
+    """
+
+    @pytest.mark.asyncio
+    async def test_an_over_ceiling_rate_raises_the_documented_type(self) -> None:
+        with pytest.raises(ValidationError):
+            await build_nft_transfer(
+                MagicMock(),
+                GlyphRef(txid="aa" * 32, vout=0),
+                Hex20(b"\x11" * 20),
+                client=MagicMock(),
+                fee_rate=10_000_000,
+            )
+
+    @pytest.mark.asyncio
+    async def test_a_sub_floor_rate_raises_the_documented_type(self) -> None:
+        with pytest.raises(ValidationError):
+            await build_nft_transfer(
+                MagicMock(),
+                GlyphRef(txid="aa" * 32, vout=0),
+                Hex20(b"\x11" * 20),
+                client=MagicMock(),
+                fee_rate=1,
+            )
+
+
+class TestTheSizeCheckAlsoKeepsTheDocumentedContract:
+    """``build_nft_transfer`` has two refusals, ~85 lines apart. The rate gate was fixed to
+    raise the documented ``ValidationError``; the size check further down was left raising a
+    bare ``ValueError`` against the same docstring, which promises
+    ``ValidationError: the signed transaction does not pay for its own size``.
+
+    The distance is the point: far enough apart to land in separate diff hunks, which is how
+    the second survived the fix to the first. Reviewing a function's refusals as a set is
+    what catches that; reading hunks in order is not.
+    """
+
+    def test_the_call_site_names_its_exception_type(self) -> None:
+        import ast
+        import inspect
+
+        from pyrxd.glyph import transfer
+
+        src = inspect.getsource(transfer.build_nft_transfer)
+        calls = [
+            n
+            for n in ast.walk(ast.parse(src.lstrip()))
+            if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "assert_pays_for_its_size"
+        ]
+        assert calls, "the size check moved — this guard would silently stop guarding"
+        for call in calls:
+            assert any(kw.arg == "error_type" for kw in call.keywords), (
+                "assert_pays_for_its_size defaults to a bare ValueError; the docstring promises ValidationError"
+            )

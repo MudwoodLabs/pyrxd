@@ -1180,7 +1180,10 @@ class GlyphBuilder:
                 f"fee ({fee} for {size} bytes at {params.fee_rate} photons/byte): "
                 f"output would be {output_value}, below pyrxd's {DUST_THRESHOLD_PHOTONS}-photon "
                 "uneconomic-output floor (a pyrxd policy, NOT a Radiant relay limit — "
-                "Radiant's floor is 1 photon)."
+                "Radiant's floor is 1 photon). To move a dust-carrying singleton, use "
+                "pyrxd.glyph.transfer.build_nft_transfer (or GlyphClient.transfer_nft), "
+                "which funds the fee from a separate plain-RXD input and leaves the "
+                "singleton's value untouched."
             )
 
         # 6. Final pass: rebuild from scratch so there's no stale signature. Don't

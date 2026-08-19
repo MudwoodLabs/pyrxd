@@ -4,9 +4,57 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.0] — 2026-08-19
+
+### Upgrade notes
+
+- **Three refusals changed exception type from `ValueError` to `ValidationError`.** This
+  affects only callers tracking `main`: all three functions were added after the 0.18.0 tag,
+  so nothing released has ever raised `ValueError` from them.
+  `ValidationError` does **not** subclass `ValueError`, so `except ValueError` around these
+  no longer catches them: `build_nft_transfer`'s rate gate and its signed-size check, and
+  `GlyphMinter.reveal_*`'s signed-size check. The first two were already documented as
+  raising `ValidationError` — the docstring was right and the code was wrong. The third was
+  undocumented and was the only refusal on the reveal path that was not a `ValidationError`,
+  which made it the one hole a caller with `except ValidationError` fell through, on the
+  funding failure most likely to actually occur.
+- **A fee rate above the overpay ceiling is now refused at reveal whatever its provenance.**
+  Previously the ceiling was waived whenever the reveal was not given an explicit
+  `fee_rate=` — which is the only path `mint_nft` and `deploy_ft` take. Because
+  `PendingMint.from_dict` restores the stored rate checking only that it is a positive int,
+  a record written by a pyrxd predating the ceiling could carry a per-kB figure in a
+  per-byte field. Measured on such a record, funded to match: the reveal paid 2,600,000,000
+  photons (26 RXD) on a 260-byte transaction with no refusal and no warning. Nothing
+  downstream caught it, because `assert_pays_for_its_size` returns as soon as the fee covers
+  the size — it is a floor check that an overpay passes trivially. `allow_overpay=True`
+  remains the deliberate way through, and a refusal always keeps the record.
+- **`GlyphMinter` and `GlyphClient` judge `fee_rate` at construction.** An over-ceiling rate
+  is refused there, before a commit exists to be stranded by one. Constructing sub-floor now
+  needs `allow_below_relay_floor=True` — a regtest node's floor really is a tenth of
+  mainnet's — and that opt-in reaches the reveal, so a minter built for such a chain can
+  finish what it starts. An explicit `allow_below_relay_floor=False` at a reveal call site
+  overrides the constructor; passing nothing inherits it. For `GlyphClient` the floor is
+  judged at construction only when a `store` is given, since only then can it mint; a
+  transfer-only client leaves the floor to its build paths.
 
 ### Added
+
+- **The txid of a broadcast is derived from the bytes we signed, not taken from the
+  server's reply.** `broadcast` returns whatever the node says and the reply is only
+  format-checked, so a lying or buggy ElectrumX could drop a transaction and echo any
+  well-formed txid — including a real, already-confirmed one — leaving the caller polling a
+  txid unrelated to their tokens, seeing "confirmed", and believing a transfer happened that
+  did not. Now: FT transfers, NFT transfers and FT airdrops raise `BroadcastEchoMismatch`
+  (which carries `local_txid`, and is deliberately **not** a `ValidationError` — those are
+  raised before anything is sent, and a caller retrying on one would re-broadcast a transfer
+  that already moved tokens). The CLI's mint reveal raises too. The SDK's `GlyphMinter`
+  reveal instead warns and then **waits on the locally derived txid**, so a server that
+  echoes some other confirmed txid cannot satisfy the confirmation gate or get the pending
+  record deleted — the protection is the wait, not a refusal. A mint **commit** warns and
+  continues for a different reason: the reveal still needs the derived txid to build against — and `deploy-dmint` builds its `contracts` outpoints and
+  `premine_outpoint` from the reveal txid, which is what miners then grind against.
+- `glyph transfer-nft --allow-overpay` and `glyph airdrop-ft --allow-overpay`, matching
+  `transfer-ft`.
 
 - `GlyphClient` — one object for minting and moving Glyph tokens, exported from the top
   level (`from pyrxd import GlyphClient`). Composes the existing `GlyphMinter` (unchanged)
@@ -60,6 +108,44 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`glyph deploy-ft --treasury` was not pinned to the active network** — the one
+  destination in the CLI that was not. `address_to_public_key_hash` decodes a testnet
+  address into a perfectly valid-looking 20-byte PKH, so a pasted testnet treasury would
+  have built, confirmed, and locked the **entire premined supply** to a script no mainnet
+  key can spend, with no refund path and no RBF. `transfer-ft`, `transfer-nft` and every
+  airdrop recipient are pinned (`transfer-nft` only as of this same cycle — see below);
+  this path carries more value than any of them and was missed because nobody compared them
+  side by side.
+- **Every network-pinned CLI command crashed on `--network regtest`** with an unhandled
+  `ValueError` rather than running: `Network` has only `mainnet` and `testnet`, while
+  `--network` also accepts `regtest`. That took out `transfer-nft`, `airdrop-ft` and
+  `deploy-ft` on the one network the `pyrxd regtest` developer onramp is built around.
+  Regtest addresses carry testnet's version byte, so they are pinned against that.
+- **`GlyphClient.reveal_nft` could not reveal a commit it had just made** on a sub-floor
+  chain. It defaulted `allow_below_relay_floor` to `False` and forwarded it, and the minter
+  reads an explicit `False` as "re-assert the floor" — so a client constructed with
+  `allow_below_relay_floor=True` committed and was then refused its own reveal, stranding a
+  hashlock that has no owner-only spend path. `GlyphMinter` was unaffected.
+- **`glyph transfer-nft` did not pin its recipient to the active network** — the FT path
+  did. (The CLI's fee rate itself was never ungated: `validated_fee_rate` has refused a
+  sub-floor rate for every command since 0.18.0. The missing floor gate was in the SDK's
+  `build_nft_transfer`, which the CLI reaches but library callers could also call directly.)
+- `glyph airdrop-ft` reported the server's echoed txid as success rather than raising on a
+  mismatch, and enumerated the wallet twice — once to select token inputs and again to find
+  the fee UTXO — leaving a window in which the two phases could disagree about what the
+  wallet holds. Both now match `transfer-ft`.
+- FT input selection is address-aware: among the wallet addresses that can cover the
+  amount it now picks the one needing the fewest inputs, breaking ties on the smaller
+  total. A transfer still requires a **single** address to cover the amount — every input
+  of an FT transfer is signed with one key — and says so, naming the largest single-address
+  holding and the wallet total, rather than reporting a bare shortfall.
+- The CLI could crash between a commit broadcast and the line that prints its txid:
+  `Transaction.from_hex` returns `None` rather than raising, and that `None` reached
+  `.txid()`. The commit was on chain and its id was never shown. It now fails with the
+  echoed value and points at the SDK reveal-rebuild path, which is a recovery that exists —
+  the CLI has no pending-mint store to resume from.
+- A pending-mint record is deleted only after the reveal is confirmed, not merely broadcast.
+
 - FT transfers built through the SDK are now checked against paying grossly more than their
   own size demands, measured on the **signed** bytes rather than on the rate (which
   `assert_fee_rate_clears_relay_floor` already bounds at both ends). `allow_overpay=True`,
@@ -74,7 +160,7 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   long signature cannot leave a transaction underpaid. Measured over 300 real
   single-recipient transfers, that overshoot ran 4-9 bytes and **300 of 300 were refused**.
   The tolerance now allows the builders' own slack; 300 of 300 pass, while +13 bytes, +1 RXD
-  and the +23.1 RXD case are all still refused. None of this reached a release — the whole
+  and the +23.3 RXD case are all still refused. None of this reached a release — the whole
   cycle happened under this same `[Unreleased]` heading.
 
 ## [0.18.0] — 2026-08-13

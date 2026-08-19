@@ -86,6 +86,48 @@ is language-specific. Detect the dominant language from the scope:
 | Ruby on Rails | `compound-engineering:review:kieran-rails-reviewer` (or `dhh-rails-reviewer` for opinionated Rails idiom) |
 | Other / mixed | Skip this slot; you'll have 7 reviewers instead of 8 |
 
+### Step 3.5 — Assign models across the panel, don't pick one
+
+Pass `model:` on the `Agent` calls so the reviewers do not all run on the
+same model. The reason is not that one model is better at review — it is
+that **this skill's highest-value output is the consensus signal, and
+consensus between same-model reviewers is not independent evidence.**
+Eight reviewers on one model tend to miss the same things eight times,
+and their unanimity then reads as confidence when it is actually just
+correlation.
+
+A workable default:
+
+| Lane | Model |
+|---|---|
+| Red-team (slot 8) | `fable` |
+| security-sentinel | `fable` |
+| The other six | leave unset (inherit) or vary |
+
+**Observed once, 2026-08-17** (the 0.19.0 pre-release panel — one run, no
+control group, so treat this as an anecdote that motivates the practice
+rather than as a measurement):
+
+* The two `fable` lanes were the only reviewers to find that
+  `broadcast()` returns the *server's* txid unverified, while
+  `get_transaction` already binds `hash256(raw)`. Genuine added coverage.
+* The two `fable` lanes also agreed with **each other** on that finding
+  and no one else did — exactly the correlation this step is about. Had
+  the whole panel been `fable`, that would have looked like consensus.
+* The non-`fable` lanes independently found things the `fable` lanes did
+  not: a discarded whole-wallet scan (3 reviewers), a mypy scope hole, a
+  10x arithmetic error in a docstring, and a fund-loss ordering bug in
+  the mint store.
+* One `fable` lane produced the run's only **overreach** — a confident
+  claim that a guard "mathematically cannot" catch a mis-set rate, which
+  was false because the rate is refused upstream. Verified against the
+  code before it reached the report. Every model needs this check; see
+  Step 6.
+
+The transferable rule: **vary the model, and record which model produced
+which finding**, so the synthesis can tell "four reviewers agreed" from
+"four reviewers sharing one model agreed".
+
 ### Step 4 — Spawn all 8 reviewers in ONE message
 
 Critical: make all 8 `Agent` tool calls **in a single response so
@@ -209,6 +251,18 @@ gap.]
 [Concrete recommendations, ordered by severity. Don't pad — if 3
 findings are critical and 2 are medium, list 5 actions.]
 ```
+
+**Weight consensus by model, not just by count.** Two reviewers on the
+same model agreeing is weaker evidence than two on different models
+agreeing — same training, same blind spots. When tagging, say so: "3 of 8,
+across 2 models" beats a bare "3 of 8", and "2 of 8, both on the same
+model" is a flag to verify rather than a green light.
+
+**Verify load-bearing findings against the code before reporting them.**
+Reviewers state false things confidently. In the 2026-08-17 run the single
+most severe finding was real and independently confirmed by grep, while a
+neighbouring claim from the same reviewer was wrong in a way that would
+have embarrassed the report. Both cost about a minute to check.
 
 **Consensus tagging is the highest-value output.** A finding flagged
 by 3+ reviewers in different dimensions (e.g. security + simplicity

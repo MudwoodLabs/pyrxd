@@ -734,6 +734,7 @@ class TestDmintCliHelpers:
 
 import asyncio
 import dataclasses
+import pathlib
 from unittest.mock import AsyncMock, MagicMock
 
 from pyrxd.glyph.dmint import build_mint_scriptsig
@@ -769,7 +770,16 @@ class TestDmintCliAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return ("11" if len(captured) == 1 else "22") * 32
+            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
+            # carries on by design, so a lie there is a legitimate thing to exercise; the
+            # reveal helper now RAISES, because outpoints the user spends against are built
+            # from that txid. These fakes echoed constants for both, which is why nothing
+            # noticed the reveal was never verified.
+            from pyrxd.transaction.transaction import Transaction
+
+            if len(captured) == 1:
+                return "11" * 32
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -823,11 +833,22 @@ class TestDmintCliAssembly:
                 return [(utxo, key.address(), key)]
 
         captured: list[bytes] = []
-        commit_txid = "11" * 32
+
+        # LIE on the commit broadcast, truthfully echo everything after it.
+        #
+        # An honest echo here proves nothing: code that trusts the server and code that
+        # derives the txid locally both pass, because the two values agree. The lie is
+        # the whole point of the fixture — it is what fails if `_local_commit_txid` is
+        # ever reverted to `str(echoed)`.
+        COMMIT_LIE = "de" * 32
 
         async def _bcast(raw: bytes) -> str:
+            from pyrxd.transaction.transaction import Transaction
+
             captured.append(raw)
-            return commit_txid if len(captured) == 1 else "22" * 32
+            if len(captured) == 1:
+                return COMMIT_LIE
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -847,8 +868,15 @@ class TestDmintCliAssembly:
         )
         result = asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), params, client))
 
+        commit_txid = Transaction.from_hex(captured[0]).txid()
+        # The derived txid wins over the server's reply, and the reveal is built against
+        # the REAL commit — not the lie. If either regresses, the token's ref points at a
+        # transaction that does not exist and the commit becomes unspendable.
+        assert commit_txid != COMMIT_LIE
+        assert result["commit_txid"] == commit_txid
         reveal = Transaction.from_hex(captured[1])
         assert reveal is not None
+        assert str(reveal.inputs[0].source_txid) == commit_txid
         # vout 0..1 contracts (1 photon each), vout 2 premine, vout 3 change.
         assert [o.satoshis for o in reveal.outputs[:3]] == [1, 1, premine]
         owner_pkh = Hex20(key.public_key().hash160())
@@ -859,7 +887,9 @@ class TestDmintCliAssembly:
         assert reveal.outputs[3].satoshis > 0
 
         assert result["premine"] == premine
-        assert result["premine_outpoint"] == f"{'22' * 32}:2"
+        # Derived from the reveal we actually broadcast, not from a constant the fake
+        # used to echo — the CLI no longer takes the server's word for a txid.
+        assert result["premine_outpoint"] == f"{reveal.txid()}:2"
         assert result["mineable_supply"] == 1000 * 100 * 2
         assert result["total_supply"] == 1000 * 100 * 2 + premine
 
@@ -879,7 +909,16 @@ class TestDmintCliAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return ("11" if len(captured) == 1 else "22") * 32
+            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
+            # carries on by design, so a lie there is a legitimate thing to exercise; the
+            # reveal helper now RAISES, because outpoints the user spends against are built
+            # from that txid. These fakes echoed constants for both, which is why nothing
+            # noticed the reveal was never verified.
+            from pyrxd.transaction.transaction import Transaction
+
+            if len(captured) == 1:
+                return "11" * 32
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -937,7 +976,16 @@ class TestDmintCliAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return ("11" if len(captured) == 1 else "22") * 32
+            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
+            # carries on by design, so a lie there is a legitimate thing to exercise; the
+            # reveal helper now RAISES, because outpoints the user spends against are built
+            # from that txid. These fakes echoed constants for both, which is why nothing
+            # noticed the reveal was never verified.
+            from pyrxd.transaction.transaction import Transaction
+
+            if len(captured) == 1:
+                return "11" * 32
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -1023,7 +1071,16 @@ class TestMultiTxGlyphAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return ("11" if len(captured) == 1 else "22") * 32
+            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
+            # carries on by design, so a lie there is a legitimate thing to exercise; the
+            # reveal helper now RAISES, because outpoints the user spends against are built
+            # from that txid. These fakes echoed constants for both, which is why nothing
+            # noticed the reveal was never verified.
+            from pyrxd.transaction.transaction import Transaction
+
+            if len(captured) == 1:
+                return "11" * 32
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -1144,7 +1201,12 @@ class TestTransferNftAssembly:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return "ff" * 32
+            # Echo the txid of what we were actually sent. A constant here models a
+            # server that lies about which transaction it relayed, which the CLI now
+            # refuses — see `BroadcastEchoMismatch`.
+            from pyrxd.transaction.transaction import Transaction
+
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
@@ -1162,7 +1224,7 @@ class TestTransferNftAssembly:
         total_in = 1000 + 50_000_000
         total_out = sum(o.satoshis for o in tx.outputs)
         assert total_in - total_out > 0, "pays a real (non-zero) fee"
-        assert result["txid"] == "ff" * 32
+        assert result["txid"] == tx.txid(), "reports the txid of the bytes it broadcast"
 
 
 def _run_transfer_nft(cli_context, *, fund_value: int) -> tuple[list[bytes], object]:
@@ -1202,7 +1264,9 @@ def _run_transfer_nft(cli_context, *, fund_value: int) -> tuple[list[bytes], obj
 
     async def _bcast(raw: bytes) -> str:
         captured.append(raw)
-        return "ff" * 32
+        from pyrxd.transaction.transaction import Transaction
+
+        return Transaction.from_hex(raw.hex()).txid()
 
     client = MagicMock()
     client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
@@ -1426,7 +1490,16 @@ class TestDmintV2CliPaths:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return ("11" if len(captured) == 1 else "22") * 32
+            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
+            # carries on by design, so a lie there is a legitimate thing to exercise; the
+            # reveal helper now RAISES, because outpoints the user spends against are built
+            # from that txid. These fakes echoed constants for both, which is why nothing
+            # noticed the reveal was never verified.
+            from pyrxd.transaction.transaction import Transaction
+
+            if len(captured) == 1:
+                return "11" * 32
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -1472,7 +1545,16 @@ class TestDmintV2CliPaths:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return ("11" if len(captured) == 1 else "22") * 32
+            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
+            # carries on by design, so a lie there is a legitimate thing to exercise; the
+            # reveal helper now RAISES, because outpoints the user spends against are built
+            # from that txid. These fakes echoed constants for both, which is why nothing
+            # noticed the reveal was never verified.
+            from pyrxd.transaction.transaction import Transaction
+
+            if len(captured) == 1:
+                return "11" * 32
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -1517,7 +1599,16 @@ class TestRevealFeeGuard:
 
         async def _bcast(raw: bytes) -> str:
             captured.append(raw)
-            return ("11" if len(captured) == 1 else "22") * 32
+            # Lie on the COMMIT, tell the truth on the REVEAL. The commit helper warns and
+            # carries on by design, so a lie there is a legitimate thing to exercise; the
+            # reveal helper now RAISES, because outpoints the user spends against are built
+            # from that txid. These fakes echoed constants for both, which is why nothing
+            # noticed the reveal was never verified.
+            from pyrxd.transaction.transaction import Transaction
+
+            if len(captured) == 1:
+                return "11" * 32
+            return Transaction.from_hex(raw.hex()).txid()
 
         client = MagicMock()
         client.broadcast = _bcast
@@ -1790,10 +1881,18 @@ class TestTransferFtAllowOverpayIsWiredThrough:
 
         class _Build:
             fee = 1_000
-            tx = None
+
+            def __init__(self) -> None:
+                from pyrxd.script.script import Script
+                from pyrxd.transaction.transaction import Transaction
+                from pyrxd.transaction.transaction_output import TransactionOutput
+
+                self.tx = Transaction(tx_inputs=[], tx_outputs=[TransactionOutput(Script(b""), 0)])
 
             def serialize(self) -> bytes:
-                return b"\x00" * 200
+                # Real serialized bytes, not filler: the CLI now derives the txid from
+                # what it broadcast, so an unparseable payload no longer round-trips.
+                return self.tx.serialize()
 
         async def _fake_build(wallet, ref, amount, to_pkh, *, client, fee_rate, allow_overpay=False):
             seen["allow_overpay"] = allow_overpay
@@ -1806,7 +1905,7 @@ class TestTransferFtAllowOverpayIsWiredThrough:
     def _drive(self, cli_context, monkeypatch, *, allow_overpay):
         import asyncio
         import dataclasses
-        from unittest.mock import AsyncMock, MagicMock
+        from unittest.mock import MagicMock
 
         from pyrxd.cli.glyph_cmds import _transfer_ft_inner
         from pyrxd.glyph.types import GlyphRef
@@ -1815,7 +1914,14 @@ class TestTransferFtAllowOverpayIsWiredThrough:
         seen, *_ = self._capture(monkeypatch)
         ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
         client = MagicMock()
-        client.broadcast = AsyncMock(return_value="ff" * 32)
+
+        # Must echo what it is handed; a constant now trips the echo-mismatch guard.
+        async def _echo(raw: bytes) -> str:
+            from pyrxd.transaction.transaction import Transaction
+
+            return Transaction.from_hex(raw.hex()).txid()
+
+        client.broadcast = _echo
 
         asyncio.run(
             _transfer_ft_inner(
@@ -1891,3 +1997,293 @@ class TestTransferFtAllowOverpayIsWiredThrough:
         rendered = str(exc.value) + str(getattr(exc.value, "fix", ""))
         assert "--allow-overpay" in rendered
         assert "plain RXD" not in rendered, "that is the remedy for the opposite problem"
+
+
+class TestTerminalBroadcastsRaiseRatherThanWarn:
+    """Three adversarial lanes independently flagged the same line: ``airdrop-ft``
+    reported its txid through the mint-commit helper, which warns and carries on.
+
+    The commit helper warns for a reason that is specific to a commit — there is a reveal
+    still to come, and the caller needs the locally derived txid to build it. An airdrop
+    is terminal. A warning on a non-tty run is no warning at all, and ``--json`` would
+    have reported success for tokens that never moved, to the widest blast radius of the
+    three paths: N recipients in one transaction.
+    """
+
+    TERMINAL = ("_transfer_ft_inner", "_airdrop_ft_inner", "_transfer_nft_inner")
+
+    @staticmethod
+    def _body(name: str) -> str:
+        import ast
+        import inspect
+
+        from pyrxd.cli import glyph_cmds
+
+        tree = ast.parse(inspect.getsource(glyph_cmds))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef | ast.FunctionDef) and node.name == name:
+                return ast.dump(node)
+        raise AssertionError(f"{name} not found — rename it and this guard silently stops guarding")
+
+    @pytest.mark.parametrize("fn", TERMINAL)
+    def test_a_terminal_broadcast_verifies_its_txid_strictly(self, fn: str) -> None:
+        body = self._body(fn)
+        assert "_confirmed_txid" in body, f"{fn} must verify its broadcast txid by raising"
+        assert "_local_commit_txid" not in body, (
+            f"{fn} is terminal — the warn-and-continue commit helper is the wrong one here"
+        )
+
+    def test_the_commit_helper_is_still_used_where_a_phase_follows(self) -> None:
+        """The counterpart: a commit legitimately warns, because the reveal still needs
+        the derived txid whatever the server said."""
+        import inspect
+
+        from pyrxd.cli import glyph_cmds
+
+        assert "_local_commit_txid" in inspect.getsource(glyph_cmds.__dict__["_deploy_dmint_inner"])
+
+
+class TestTheCommitTxidHelperCannotStrandACommit:
+    """``Transaction.from_hex`` returns ``None`` rather than raising, and this helper runs
+    AFTER the broadcast. Letting that ``None`` reach ``.txid()`` raised ``AttributeError``
+    between the broadcast and the line that prints the txid — so the commit was on chain
+    and the user was never told its id. That is precisely the stranding the helper exists
+    to prevent, reproduced inside the helper.
+    """
+
+    @pytest.mark.parametrize("unparseable", [b"", b"\x01\x02\x03", "zz"])
+    def test_an_unparseable_commit_still_hands_back_the_echo(self, unparseable) -> None:
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _local_commit_txid
+
+        echoed = "ab" * 32
+        with pytest.raises(UserError) as exc:
+            _local_commit_txid(unparseable, echoed)
+
+        rendered = exc.value.format_message()
+        assert echoed in rendered, "the echoed txid is the only handle left on a relayed commit"
+        assert "explorer" in rendered
+        # The advice must name a recovery that EXISTS. An earlier version sent the user to
+        # a "PendingMint record still in the store"; this CLI has no PendingStore at all,
+        # so that was fiction on a path where the commit is an unspendable hashlock unless
+        # the reveal carries byte-identical CBOR. `_wait_for_tx` had this bug once and its
+        # docstring calls it "the worst possible answer".
+        assert "prepare_reveal" in rendered
+        assert "store" not in rendered.lower(), "names a recovery this CLI does not have"
+
+    def test_the_cli_really_has_no_pending_store_to_point_at(self) -> None:
+        """The premise behind the assertion above, checked rather than assumed."""
+        import ast
+
+        import pyrxd.cli
+
+        # `rglob`, not `pkgutil.iter_modules`: the latter never yields `__init__` and does
+        # not descend into subpackages, so it would skip files silently. A guard with a
+        # hole in its own enumeration is the defect it exists to catch.
+        files = sorted(pathlib.Path(pyrxd.cli.__path__[0]).rglob("*.py"))
+        assert len(files) > 1, "enumeration found almost nothing — this would pass vacuously"
+
+        offenders = []
+        for path in files:
+            for node in ast.walk(ast.parse(path.read_text())):
+                # An IMPORT, not the mere word — the comment explaining this very absence
+                # says "PendingStore", and a substring check would trip over its own
+                # explanation. Both import forms count: `import pyrxd.glyph.mint` followed
+                # by `mint.JsonFilePendingStore(...)` would slip past an ImportFrom check.
+                if isinstance(node, ast.ImportFrom) and any(a.name.endswith("PendingStore") for a in node.names):
+                    offenders.append(path.name)
+                if isinstance(node, ast.Import) and any(a.name.endswith("glyph.mint") for a in node.names):
+                    offenders.append(path.name)
+        assert not offenders, f"the CLI now reaches a PendingStore ({offenders}) — revisit the advice"
+
+
+class TestALyingRevealEchoIsRefused:
+    """The CLI hardened its COMMIT txid and left the REVEAL trusting the server.
+
+    That asymmetry was easy to miss because the token's own ref is safe either way — it
+    is the COMMIT outpoint, embedded in the reveal's locking script — so the most
+    load-bearing identifier on the page never depended on the echo. What did depend on it
+    was ``deploy-dmint``'s ``contracts`` list and ``premine_outpoint``: outpoints miners
+    grind against and the owner later spends, minted straight from the server's reply.
+    """
+
+    @staticmethod
+    def _client(captured: list[bytes], reveal_lie: str):
+        async def _bcast(raw: bytes) -> str:
+            from pyrxd.transaction.transaction import Transaction
+
+            captured.append(raw)
+            if len(captured) == 1:
+                return Transaction.from_hex(raw.hex()).txid()
+            return reveal_lie
+
+        client = MagicMock()
+        client.broadcast = _bcast
+        client.get_transaction_verbose = AsyncMock(return_value={"confirmations": 1})
+        return client
+
+    def test_deploy_dmint_refuses_outpoints_built_on_a_lie(self, cli_context) -> None:
+        from pyrxd.cli.errors import UserError
+        from pyrxd.cli.glyph_cmds import _deploy_dmint_inner
+        from pyrxd.glyph.builder import DmintV1DeployParams
+
+        lie = "ee" * 32
+        key = PrivateKey()
+        utxo = UtxoRecord(tx_hash="ab" * 32, tx_pos=0, value=500_000_000, height=100)
+
+        class _Wallet:
+            async def collect_spendable(self, client):
+                return [(utxo, key.address(), key)]
+
+        captured: list[bytes] = []
+        ctx = dataclasses.replace(cli_context, output_mode="json", yes=True)
+        meta = GlyphMetadata.for_dmint_ft(
+            ticker="TST", name="t", protocol=[int(GlyphProtocol.FT), int(GlyphProtocol.DMINT)]
+        )
+        params = DmintV1DeployParams(
+            metadata=meta,
+            owner_pkh=Hex20(b"\x00" * 20),
+            num_contracts=2,
+            max_height=100,
+            reward_photons=1000,
+            difficulty=1,
+            premine_amount=7_000_000,
+        )
+
+        with pytest.raises(UserError) as exc:
+            asyncio.run(_deploy_dmint_inner(ctx, _Wallet(), params, self._client(captured, lie)))
+
+        rendered = exc.value.format_message()
+        # The user is pointed at the txid we derived, and told not to build on the echo.
+        assert str(Transaction.from_hex(captured[1]).txid()) in rendered
+        assert "do not use the echoed id" in rendered.lower()
+        assert "explorer" in rendered
+
+
+class TestDeployFtPinsItsTreasury:
+    """``deploy-ft --treasury`` receives the ENTIRE premined supply and was the one
+    destination in this CLI with no network pin.
+
+    Every sibling has one — ``transfer-ft``, ``transfer-nft``, each airdrop recipient —
+    each added after the same reasoning: ``address_to_public_key_hash`` decodes a testnet
+    address into a valid-looking 20-byte PKH, so the deploy would have built, confirmed,
+    and locked the whole supply to a script no mainnet key can spend. There is no refund
+    path and no RBF. This path carries more value than any of the ones already pinned, and
+    it was missed because nobody compared them side by side.
+    """
+
+    @staticmethod
+    def _testnet_address() -> str:
+        """``PublicKey.address()`` defaults to mainnet and does NOT read the key's own
+        network field, so this must be passed explicitly or the test asserts nothing."""
+        from pyrxd.constants import Network
+
+        return PrivateKey().public_key().address(network=Network.TESTNET)
+
+    def _invoke(self, runner: CliRunner, wallet: Path, tmp_path: Path, treasury: str):
+        return runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(wallet),
+                "glyph",
+                "deploy-ft",
+                str(_write_meta(tmp_path / "ft.json")),
+                "--supply",
+                "1000",
+                "--treasury",
+                treasury,
+            ],
+        )
+
+    def test_a_testnet_treasury_is_refused_on_mainnet(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path
+    ) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = self._invoke(runner, tmp_wallet_path, tmp_path, self._testnet_address())
+        assert result.exit_code != 0
+        assert "not a valid mainnet radiant p2pkh address" in result.output.lower()
+
+    def test_a_mainnet_treasury_gets_past_the_pin(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path
+    ) -> None:
+        """The other half: the guard must not refuse the address it exists to accept.
+
+        This stops before any broadcast — it only has to get past the pin, so whatever it
+        fails on later, it must not be the address.
+        """
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = self._invoke(runner, tmp_wallet_path, tmp_path, PrivateKey().public_key().address())
+        assert "not a valid mainnet radiant p2pkh address" not in result.output.lower()
+
+
+class TestThePinWorksOnEveryNetworkTheCliAccepts:
+    """``Network(ctx.network)`` raised a bare ``ValueError`` on regtest.
+
+    ``Network`` has only MAINNET and TESTNET; ``--network`` also accepts ``regtest``. So
+    every pinned command died with an unhandled traceback on the one network the project's
+    own developer onramp (``pyrxd regtest``) is built around — a guard refusing the
+    workflow shipped to newcomers. Regtest addresses carry testnet's version byte, so
+    that is what they are pinned against.
+    """
+
+    @staticmethod
+    def _addr(network: str) -> str:
+        from pyrxd.constants import Network
+
+        if network == "mainnet":
+            return PrivateKey().public_key().address()
+        return PrivateKey().public_key().address(network=Network.TESTNET)
+
+    @pytest.mark.parametrize("network", ["mainnet", "testnet", "regtest"])
+    def test_a_matching_address_is_accepted(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path, network: str
+    ) -> None:
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "--network",
+                network,
+                "glyph",
+                "deploy-ft",
+                str(_write_meta(tmp_path / "ft.json")),
+                "--supply",
+                "1000",
+                "--treasury",
+                self._addr(network),
+            ],
+        )
+        # CliRunner puts an unhandled exception in `result.exception`, NOT in `output`, so
+        # asserting on the text alone passed even while the command was crashing. Check the
+        # exception itself, or this pins nothing.
+        assert not isinstance(result.exception, ValueError), f"the pin crashed: {result.exception}"
+        assert "p2pkh address" not in result.output.lower(), f"a legitimate {network} address was refused on {network}"
+
+    @pytest.mark.parametrize("network", ["mainnet", "testnet", "regtest"])
+    def test_a_foreign_address_is_still_refused(
+        self, runner: CliRunner, tmp_wallet_path: Path, tmp_path: Path, network: str
+    ) -> None:
+        """The guard must keep guarding on every network, not just stop crashing."""
+        foreign = self._addr("testnet" if network == "mainnet" else "mainnet")
+        runner.invoke(cli, _new_wallet_args(tmp_wallet_path))
+        result = runner.invoke(
+            cli,
+            [
+                "--wallet",
+                str(tmp_wallet_path),
+                "--network",
+                network,
+                "glyph",
+                "deploy-ft",
+                str(_write_meta(tmp_path / "ft.json")),
+                "--supply",
+                "1000",
+                "--treasury",
+                foreign,
+            ],
+        )
+        assert result.exit_code != 0
+        assert "p2pkh address" in result.output.lower()

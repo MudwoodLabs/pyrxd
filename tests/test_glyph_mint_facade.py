@@ -13,6 +13,7 @@ defining module, ``pyrxd.glyph.mint``.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import stat
@@ -857,3 +858,325 @@ def test_no_export_name_was_silently_overwritten():
     assert len(set(targets)) == len(targets), "two public names resolve to the same target"
     for name, (module, attr) in glyph_pkg._LAZY_EXPORTS.items():
         assert attr == name, f"{name} is re-exported under a different attribute name ({module}.{attr})"
+
+
+class TestTheRecordOutlivesTheBroadcast:
+    """The pending record must survive a reveal that relays but never confirms.
+
+    A mempool accept is not a block. If the reveal is evicted at expiry (~8h) and the
+    record was already deleted, the CBOR payload needed to rebuild it is gone — and the
+    commit output is a hashlock with no owner-only spend path, so its value is
+    unrecoverable. The delete therefore waits for the reveal to confirm.
+    """
+
+    @staticmethod
+    def _never_confirms():
+        """A client that accepts the broadcast and then reports 0 confirmations forever."""
+
+        class _Client(FakeClient):
+            def __init__(self) -> None:
+                super().__init__(confirmations=0)
+                self._commit_txid: str | None = None
+
+            async def get_transaction_verbose(self, txid: str) -> dict:
+                # The COMMIT confirms — the reveal cannot even be built otherwise. Every
+                # LATER txid is the reveal, and it never confirms: the accepted-then-evicted
+                # case this test exists for. Pinning the commit's txid on first sight is
+                # deliberate; an earlier version of this fake confirmed the first sighting
+                # of *any* txid, which silently confirmed the reveal too and made the test
+                # pass against the very bug it was written to catch.
+                if self._commit_txid is None:
+                    self._commit_txid = txid
+                return {"confirmations": 1 if txid == self._commit_txid else 0}
+
+        return _Client()
+
+    async def test_an_unconfirmed_reveal_keeps_the_record(self):
+        store = RecordingStore()
+        minter = GlyphMinter(
+            self._never_confirms(),
+            FakeWallet(_key()),
+            store,
+            confirmation_timeout_s=0.2,
+        )
+        pending = await minter.commit_nft(_nft_metadata())
+        assert store.load(pending.commit_txid) is not None
+
+        with pytest.raises(Exception):
+            await minter.reveal_nft(pending)
+
+        # THE assertion. Deleting here would strand the commit permanently.
+        assert store.load(pending.commit_txid) is not None, (
+            "the pending record was deleted for a reveal that never confirmed — "
+            "the commit is a hashlock and its value is now unrecoverable"
+        )
+
+
+class TestRevealRateAndEchoGuards:
+    """The reveal-time guards, none of which had a test when they were written.
+
+    An adversarial pass found: the `fee_rate=` override unexercised, the reveal-time
+    rate gate unexercised, and `TestTheRecordOutlivesTheBroadcast`'s fixture unable to
+    distinguish "waits on the locally derived txid" from "waits on the server's echo",
+    because its fake echoed the correct txid either way.
+    """
+
+    LIE = "ff" * 32
+
+    @classmethod
+    def _lying_client(cls):
+        """Echoes a txid it was not handed, and confirms ONLY that one.
+
+        The discrimination matters. An earlier version of this fake confirmed every
+        txid, so waiting on the echo and waiting on the locally derived value both
+        succeeded and the test proved nothing.
+
+        Here exactly two transactions confirm: the COMMIT, hashed from the bytes this
+        fake was handed, and the LIE. The real reveal never does. So code that trusts the
+        echo sees "confirmed" and deletes the record, while code that trusts its own bytes
+        waits, times out, and keeps it.
+        """
+
+        class _Client(FakeClient):
+            async def broadcast(self, raw_tx: bytes) -> str:
+                self.broadcasts.append(raw_tx)
+                self.calls.append("broadcast")
+                return cls.LIE
+
+            async def get_transaction_verbose(self, txid: str) -> dict:
+                # Confirm the COMMIT (identified by hashing what we were actually handed)
+                # and the LIE. Everything else — including the real reveal — never
+                # confirms, unconditionally.
+                #
+                # An earlier version of this claimed to "confirm ONLY the lie" and did
+                # not: its commit clause iterated an empty tuple, so it was dead, and the
+                # fallback confirmed EVERY txid until a second broadcast had happened.
+                # The commit therefore confirmed by accident of call order. That is the
+                # same defect this fixture exists to catch, reproduced inside the fixture.
+                from pyrxd.transaction.transaction import Transaction
+
+                confirmed = {cls.LIE} | {Transaction.from_hex(b.hex()).txid() for b in self.broadcasts[:1]}
+                return {"confirmations": 1 if txid in confirmed else 0}
+
+        return _Client()
+
+    async def test_a_lying_echo_does_not_confirm_someone_elses_transaction(self):
+        """THE case the previous fixture could not see.
+
+        The record's protection is the confirmation wait. If that wait polls the
+        server's echo, a server can drop the reveal, name an already-confirmed txid, and
+        the record is deleted for a transaction that never relayed. Waiting on the
+        locally derived txid is what makes the guard real — so a lying echo must NOT
+        produce a confirmed reveal against the wrong txid.
+        """
+        store = RecordingStore()
+        client = self._lying_client()
+        minter = GlyphMinter(client, FakeWallet(_key()), store, confirmation_timeout_s=0.2)
+        pending = await minter.commit_nft(_nft_metadata())
+
+        with pytest.warns(UserWarning, match="echoed txid"):
+            with pytest.raises(Exception):
+                await minter.reveal_nft(pending)
+
+        assert store.load(pending.commit_txid) is not None, "record deleted on a lie"
+
+    async def test_a_stale_sub_floor_rate_is_refused_but_recoverable(self):
+        """A commit priced below the CURRENT floor must fail loudly, not silently relay
+        into a mempool that will drop it — and must stay revealable.
+
+        The rate is now judged in ``__init__``, so a minter cannot be BUILT below the
+        floor. The scenario this pins is the one that survives that gate: a commit made
+        while the floor was lower, revealed after it rose. The stale rate therefore lives
+        on the stored record, not on the minter — which is exactly where a real one would
+        be, since ``PendingMint.fee_rate`` is captured at commit time.
+
+        Refusing with no way through would be worse than the bug: the commit was funded at
+        the old rate, so re-pricing upward is not always affordable. Hence
+        ``allow_below_relay_floor=True``.
+        """
+        import dataclasses
+
+        store = RecordingStore()
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store)
+        pending = await minter.commit_nft(_nft_metadata())
+
+        # The floor rose after the commit: the record's captured rate is now sub-floor.
+        stale = dataclasses.replace(pending, fee_rate=1)
+        store.save(stale)
+
+        with pytest.raises((ValidationError, ValueError), match="floor|relay"):
+            await minter.reveal_nft(stale)
+        assert store.load(stale.commit_txid) is not None, "a refusal must keep the record"
+
+        # The escape hatch: send it anyway, deliberately.
+        result = await minter.reveal_nft(stale, allow_below_relay_floor=True)
+        assert result.reveal_txid
+
+
+class TestTheRateIsJudgedWhereverItCameFrom:
+    """Round five moved the ceiling into ``__init__`` and shipped no test for it.
+
+    Two mutants that fully reverted the change passed the entire suite, so the guard
+    existed only as long as nobody edited it. These pin both ends of the check against
+    both provenances a rate can have: the constructor argument, and the number stored on
+    a :class:`PendingMint` that may have been written by an older pyrxd entirely.
+    """
+
+    OVER_CEILING = 10_000_000  # a per-kB figure pasted into a per-byte field
+    REGTEST_RATE = 1_000  # a tenth of mainnet's floor, and legitimate there
+
+    def test_an_over_ceiling_rate_cannot_construct_a_minter(self):
+        """The fat-finger is refused before a commit exists to be stranded by it."""
+        with pytest.raises(ValidationError, match="ceiling|x Radiant"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), fee_rate=self.OVER_CEILING)
+
+    def test_a_regtest_rate_constructs_only_with_the_opt_in(self):
+        """A guard that refuses honest work is a bug.
+
+        Judging the floor at construction also judged it for chains whose floor really is
+        lower, and there was no way to say so — a regtest minter could not be built at
+        all, which also stranded the reveal's own ``allow_below_relay_floor``: no public
+        path could produce a sub-floor record to use it on.
+        """
+        with pytest.raises(ValidationError, match="floor|relay"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), fee_rate=self.REGTEST_RATE)
+
+        minter = GlyphMinter(
+            FakeClient(),
+            FakeWallet(_key()),
+            RecordingStore(),
+            fee_rate=self.REGTEST_RATE,
+            allow_below_relay_floor=True,
+        )
+        assert minter is not None
+
+    def test_the_opt_in_reaches_the_reveal_so_a_mint_can_finish(self):
+        """Opting in at construction must survive to the reveal.
+
+        Otherwise the minter commits happily and then refuses to reveal — the commit is a
+        hashlock with no owner-only spend path, so that is the worst of both refusals.
+        """
+        minter = GlyphMinter(
+            FakeClient(),
+            FakeWallet(_key()),
+            RecordingStore(),
+            fee_rate=self.REGTEST_RATE,
+            allow_below_relay_floor=True,
+        )
+        result = asyncio.run(minter.mint_nft(_nft_metadata()))
+        assert result.reveal_txid
+
+    def test_an_over_ceiling_stored_rate_is_refused_at_reveal(self):
+        """The 26 RXD burn.
+
+        ``__init__`` judges the minter's rate; the reveal spends the RECORD's. They are
+        different numbers for any record loaded into another instance, or written by a
+        pyrxd predating the ceiling. Nothing downstream catches the difference:
+        ``assert_pays_for_its_size`` is a floor check, so an overpay passes it trivially.
+        """
+        import dataclasses
+
+        store = RecordingStore()
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+
+        # The shape a pre-ceiling pyrxd would have left on disk.
+        overpriced = dataclasses.replace(pending, fee_rate=self.OVER_CEILING)
+        store.save(overpriced)
+
+        with pytest.raises(ValidationError, match="ceiling|x Radiant"):
+            asyncio.run(minter.reveal_nft(overpriced))
+        assert store.load(overpriced.commit_txid) is not None, "a refusal must keep the record"
+
+    def test_the_overpay_hatch_opens_the_door_it_claims_to(self):
+        """``allow_overpay=True`` must actually retire the CEILING refusal.
+
+        It cannot be asserted by "and then it succeeds", because this fixture's commit is
+        funded at an ordinary rate and simply does not hold enough to pay an over-ceiling
+        reveal. That containment is real but incidental — it is a property of how THIS
+        commit was funded, not of the guard. It is also what made an adversarial reviewer
+        conclude the bug was contained everywhere: their commit could not fund the overpay
+        either, so the burn never materialised for them. Fund the commit to match the
+        stored rate — the shape a pre-ceiling pyrxd would leave behind — and the same code
+        paid 26 RXD without a word.
+
+        So assert the discrimination directly: the ceiling refuses, and with the hatch open
+        the refusal that remains is a DIFFERENT one, about funding rather than the rate.
+        """
+        import dataclasses
+
+        store = RecordingStore()
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+        overpriced = dataclasses.replace(pending, fee_rate=self.OVER_CEILING)
+        store.save(overpriced)
+
+        with pytest.raises(Exception) as gated:
+            asyncio.run(minter.reveal_nft(overpriced))
+        assert "ceiling" in str(gated.value) or "x Radiant" in str(gated.value)
+
+        with pytest.raises(Exception) as hatched:
+            asyncio.run(minter.reveal_nft(overpriced, allow_overpay=True))
+        assert "fee-sizing invariant" in str(hatched.value)
+        assert "ceiling" not in str(hatched.value)
+
+    def test_the_sub_floor_hatch_does_not_also_waive_the_ceiling(self):
+        """The two ends are independent. Saying "this chain is cheap" must not say
+        "and any overpay is fine" — they are opposite failures."""
+        with pytest.raises(ValidationError, match="ceiling|x Radiant"):
+            GlyphMinter(
+                FakeClient(),
+                FakeWallet(_key()),
+                RecordingStore(),
+                fee_rate=self.OVER_CEILING,
+                allow_below_relay_floor=True,
+            )
+
+
+class TestTheCallersWordBeatsTheConstructors:
+    """``allow_below_relay_floor or self._allow_below_relay_floor`` swallowed an explicit
+    ``False``.
+
+    The OR was meant to let a minter built for a sub-floor chain finish its own mints. It
+    also overruled a caller who deliberately re-asserted the floor for one reveal, which is
+    the opposite of what an explicit argument is for. ``None`` now means "unspecified" and
+    ``False`` means ``False``.
+    """
+
+    @staticmethod
+    def _sub_floor_minter(store):
+        return GlyphMinter(FakeClient(), FakeWallet(_key()), store, fee_rate=1_000, allow_below_relay_floor=True)
+
+    def test_an_explicit_false_re_asserts_the_floor(self):
+        store = RecordingStore()
+        minter = self._sub_floor_minter(store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+
+        with pytest.raises(ValidationError, match="floor|relay"):
+            asyncio.run(minter.reveal_nft(pending, fee_rate=1, allow_below_relay_floor=False))
+        assert store.load(pending.commit_txid) is not None, "a refusal must keep the record"
+
+    def test_saying_nothing_still_inherits_so_the_mint_can_finish(self):
+        minter = self._sub_floor_minter(RecordingStore())
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+        assert asyncio.run(minter.reveal_nft(pending)).reveal_txid
+
+
+class TestTheRevealsFundingRefusalIsTyped:
+    """The reveal's size check was the one refusal on that path left as a bare
+    ``ValueError`` — the hole a caller with ``except ValidationError`` falls through, on
+    the failure most likely to actually occur."""
+
+    def test_an_underfunded_reveal_raises_the_same_type_as_its_siblings(self):
+        import dataclasses
+
+        store = RecordingStore()
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+        # Over-ceiling with the ceiling deliberately waived: the commit cannot fund it, so
+        # the size check is what refuses.
+        overpriced = dataclasses.replace(pending, fee_rate=10_000_000)
+        store.save(overpriced)
+
+        with pytest.raises(ValidationError, match="fee-sizing invariant"):
+            asyncio.run(minter.reveal_nft(overpriced, allow_overpay=True))

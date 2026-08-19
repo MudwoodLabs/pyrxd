@@ -7,12 +7,14 @@ so every refusal case here is matched by an honest case that must pass.
 
 from __future__ import annotations
 
+import warnings
+
 import pytest
 
 from pyrxd.constants import DUST_THRESHOLD_PHOTONS
 from pyrxd.glyph.client import GlyphClient, TransferReceipt
 from pyrxd.glyph.mint import JsonFilePendingStore, UnsafeNullPendingStore
-from pyrxd.glyph.transfer import assert_change_survived
+from pyrxd.glyph.transfer import assert_fee_matches_size
 from pyrxd.security.errors import ValidationError
 
 FEE_RATE = 10_000
@@ -62,7 +64,7 @@ def _allowance(n_inputs: int = INPUTS) -> int:
 class TestChangeSurvivedGuard:
     def test_exact_fee_passes(self) -> None:
         """The ordinary case: fee is exactly what the size demands."""
-        assert_change_survived(_exact_fee(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_sub_dust_fold_passes(self) -> None:
         """Folding a sub-dust remainder into the fee is correct, not a burn.
@@ -71,7 +73,7 @@ class TestChangeSurvivedGuard:
         builder rolls it into the fee. The guard must not mistake that for a loss.
         """
         excess = DUST_THRESHOLD_PHOTONS - 1
-        assert_change_survived(_exact_fee() + excess, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() + excess, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_the_builders_own_sizing_slack_passes(self) -> None:
         """THE case that made this guard refuse 100% of honest builds.
@@ -86,16 +88,16 @@ class TestChangeSurvivedGuard:
         from pyrxd.fee_sizing import SIG_SIZE_SLACK_BYTES
 
         designed_in = SIG_SIZE_SLACK_BYTES * INPUTS * FEE_RATE
-        assert_change_survived(_exact_fee() + designed_in, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() + designed_in, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_the_worst_measured_overshoot_passes(self) -> None:
         """9 bytes on two inputs was the worst of 300; the allowance is 12."""
-        assert_change_survived(_exact_fee() + 9 * FEE_RATE, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() + 9 * FEE_RATE, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_one_photon_past_the_allowance_is_refused(self) -> None:
         """The boundary, stated exactly rather than left to a magic number."""
         with pytest.raises(ValidationError, match="exceeds what this transaction's size demands"):
-            assert_change_survived(
+            assert_fee_matches_size(
                 _exact_fee() + _allowance() + 1,
                 _StubTx(SIZE_BYTES),
                 fee_rate=FEE_RATE,
@@ -103,29 +105,29 @@ class TestChangeSurvivedGuard:
 
     def test_exactly_at_the_allowance_passes(self) -> None:
         """The paired honest side of the boundary above."""
-        assert_change_survived(_exact_fee() + _allowance(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() + _allowance(), _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
     def test_large_burn_refused_and_reports_the_amount(self) -> None:
         """The failure mode worth refusing: a fee wildly past what the size demands.
 
-        23.1 RXD is 2,310,000 bytes' worth at the floor rate, against an allowance of
+        23.3 RXD is 2,330,000,000 photons — 233,000 bytes' worth at the floor rate, against an allowance of
         12 — so widening the tolerance for sizing slack costs nothing here.
         """
-        burn = 23_100_000_000
+        burn = 2_330_000_000
         with pytest.raises(ValidationError) as exc:
-            assert_change_survived(_exact_fee() + burn, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+            assert_fee_matches_size(_exact_fee() + burn, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
         assert f"{burn:,}" in str(exc.value)
 
     def test_the_allowance_scales_with_the_input_count(self) -> None:
         """Slack is per input, so a one-input build must NOT get a two-input tolerance."""
         two_input_slack = _allowance(2)
         with pytest.raises(ValidationError):
-            assert_change_survived(
+            assert_fee_matches_size(
                 _exact_fee() + two_input_slack,
                 _StubTx(SIZE_BYTES, n_inputs=1),
                 fee_rate=FEE_RATE,
             )
-        assert_change_survived(
+        assert_fee_matches_size(
             _exact_fee() + _allowance(1),
             _StubTx(SIZE_BYTES, n_inputs=1),
             fee_rate=FEE_RATE,
@@ -133,7 +135,7 @@ class TestChangeSurvivedGuard:
 
     def test_allow_overpay_is_the_way_through(self) -> None:
         """Radiant has no RBF/CPFP, so a refusal with no override is its own hazard."""
-        assert_change_survived(
+        assert_fee_matches_size(
             _exact_fee() + 10_000_000,
             _StubTx(SIZE_BYTES),
             fee_rate=FEE_RATE,
@@ -146,7 +148,7 @@ class TestChangeSurvivedGuard:
         Documents the boundary rather than silently covering two concerns with one
         check — the builders already bound the fee from below.
         """
-        assert_change_survived(_exact_fee() - 5_000, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
+        assert_fee_matches_size(_exact_fee() - 5_000, _StubTx(SIZE_BYTES), fee_rate=FEE_RATE)
 
 
 class TestTheGuardAgreesWithARealTransaction:
@@ -154,7 +156,7 @@ class TestTheGuardAgreesWithARealTransaction:
 
     Every test above measures the guard against a stub, so any units mistake shared by
     the stub and the guard is invisible to all of them. That is not hypothetical — it
-    shipped. ``assert_change_survived`` computed ``len(tx.serialize()) // 2`` while
+    shipped. ``assert_fee_matches_size`` computed ``len(tx.serialize()) // 2`` while
     ``Transaction.serialize()`` returns bytes, so it judged every transfer against half
     its true size and reported half the fee as burned change.
 
@@ -191,7 +193,7 @@ class TestTheGuardAgreesWithARealTransaction:
         rate = relay_floor_photons_per_byte()
         tx = self._real_tx()
         honest_fee = len(tx.serialize()) * rate
-        assert_change_survived(honest_fee, tx, fee_rate=rate)
+        assert_fee_matches_size(honest_fee, tx, fee_rate=rate)
 
     def test_a_real_burn_at_the_relay_floor_is_still_refused(self) -> None:
         """The counterweight: widening the guard must not switch it off."""
@@ -201,7 +203,7 @@ class TestTheGuardAgreesWithARealTransaction:
         tx = self._real_tx()
         honest_fee = len(tx.serialize()) * rate
         with pytest.raises(ValidationError, match="exceeds what this transaction's size demands"):
-            assert_change_survived(honest_fee + 23_100_000_000, tx, fee_rate=rate)
+            assert_fee_matches_size(honest_fee + 2_330_000_000, tx, fee_rate=rate)
 
     def test_a_real_build_from_the_real_builder_is_accepted(self) -> None:
         """The end of the chain, and what a stub can never show.
@@ -237,7 +239,7 @@ class TestTheGuardAgreesWithARealTransaction:
                 fee_rate=rate,
             )
         )
-        assert_change_survived(result.fee, result.tx, fee_rate=rate)
+        assert_fee_matches_size(result.fee, result.tx, fee_rate=rate)
 
 
 class TestGlyphClientStoreIsOptional:
@@ -275,3 +277,132 @@ class TestTransferReceipt:
         assert receipt.amount == 250
         assert receipt.fee == 3_000_000
         assert "3000000" in repr(receipt) or "3_000_000" in repr(receipt) or "fee=3000000" in repr(receipt)
+
+
+class TestGlyphClientJudgesItsOwnFeeRate:
+    """The facade took a ``fee_rate`` and judged only that it was a positive int.
+
+    An over-ceiling rate constructed fine and was refused later by a lazily-built
+    ``GlyphMinter`` — in a message naming ``GlyphMinter fee_rate``, a parameter the
+    caller never spelled. For a transfer-only client the refusal did not arrive at all,
+    because no minter is ever built.
+    """
+
+    def test_an_over_ceiling_rate_is_refused_by_name(self):
+        with pytest.raises(ValidationError) as exc:
+            GlyphClient(object(), object(), fee_rate=10_000_000)
+        assert "GlyphClient fee_rate" in str(exc.value), "the message must name the caller's parameter"
+
+    def test_a_sub_floor_rate_is_left_to_the_build_paths(self):
+        """The two ends are not symmetric questions.
+
+        An overpay is never legitimate, so it is refused here, before any build can spend
+        it. A sub-floor rate is a property of the CHAIN — a regtest node's floor really is
+        a tenth of mainnet's — so it belongs to whichever build path knows its context,
+        not to a constructor that cannot.
+        """
+        assert GlyphClient(object(), object(), fee_rate=1_000) is not None
+
+    def test_the_mint_opt_in_is_forwarded_to_the_minter(self):
+        client = GlyphClient(
+            object(),
+            object(),
+            store=UnsafeNullPendingStore(),
+            fee_rate=1_000,
+            allow_below_relay_floor=True,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            assert client.minter is not None, "the minter must accept what the client accepted"
+
+
+class TestAMintCapableClientJudgesTheFloorUpFront:
+    """Deferring the floor entirely meant ``GlyphClient(store=..., fee_rate=1000)``
+    constructed, then failed from the lazily-built minter with ``GlyphMinter fee_rate`` —
+    a deferred refusal naming a parameter the caller never spelled, which is the fault the
+    constructor gate was added to fix, reappearing at the other end of it.
+    """
+
+    def test_a_mint_capable_client_refuses_a_sub_floor_rate_by_its_own_name(self):
+        with pytest.raises(ValidationError) as exc:
+            GlyphClient(object(), object(), store=UnsafeNullPendingStore(), fee_rate=1_000)
+        assert "GlyphClient fee_rate" in str(exc.value)
+
+    def test_the_opt_in_still_lets_a_regtest_client_mint(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            assert (
+                GlyphClient(
+                    object(),
+                    object(),
+                    store=UnsafeNullPendingStore(),
+                    fee_rate=1_000,
+                    allow_below_relay_floor=True,
+                ).minter
+                is not None
+            )
+
+    def test_a_transfer_only_client_keeps_the_deferral(self):
+        """No store means no mint, and the transfer builders judge the floor themselves
+        against their own chain."""
+        assert GlyphClient(object(), object(), fee_rate=1_000) is not None
+
+
+class TestTheFacadeDoesNotForwardAPhantomOverride:
+    """``GlyphClient.reveal_nft`` defaulted ``allow_below_relay_floor`` to ``False`` and
+    forwarded it.
+
+    Once the minter learned to distinguish "the caller said nothing" (``None``) from "the
+    caller re-asserted the floor" (``False``), that default turned every ordinary reveal
+    through the facade into a deliberate override. A client built for a sub-floor chain
+    committed and then refused to reveal — and the commit is a hashlock with no owner-only
+    spend path, so the value goes with it. The constructor flag exists to prevent exactly
+    that; the facade reintroduced it one layer up.
+    """
+
+    @staticmethod
+    def _client(store):
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import FakeClient, FakeWallet, _key
+
+        return GlyphClient(FakeClient(), FakeWallet(_key()), store=store, fee_rate=1_000, allow_below_relay_floor=True)
+
+    def test_a_sub_floor_client_can_finish_the_mint_it_started(self):
+        import asyncio
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import RecordingStore, _nft_metadata
+
+        client = self._client(RecordingStore())
+        pending = asyncio.run(client.commit_nft(_nft_metadata()))
+        assert asyncio.run(client.reveal_nft(pending)).reveal_txid
+
+    def test_an_explicit_false_still_re_asserts_the_floor(self):
+        """The override must survive the fix — otherwise the default was replaced by a
+        different bug, one that silently ignores the caller instead of obeying a caller
+        who never spoke."""
+        import asyncio
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import RecordingStore, _nft_metadata
+
+        client = self._client(RecordingStore())
+        pending = asyncio.run(client.commit_nft(_nft_metadata()))
+        with pytest.raises(ValidationError, match="floor|relay"):
+            asyncio.run(client.reveal_nft(pending, allow_below_relay_floor=False))
+
+    def test_the_signature_matches_the_minter_it_forwards_to(self):
+        """A structural pin: the two defaults must not drift apart again. This bug was
+        created by changing one signature and not the other."""
+        import inspect
+
+        from pyrxd.glyph.mint import GlyphMinter
+
+        facade = inspect.signature(GlyphClient.reveal_nft).parameters["allow_below_relay_floor"]
+        minter = inspect.signature(GlyphMinter.reveal_nft).parameters["allow_below_relay_floor"]
+        assert facade.default == minter.default, "the facade must forward, not decide"
+        assert facade.default is None

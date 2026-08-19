@@ -61,7 +61,7 @@ jobs:
       - name: Bandit security scan
         run: poetry run bandit -r src/ -c pyproject.toml
       - name: Type check
-        run: poetry run mypy src/pyrxd/security/
+        run: poetry run mypy src/pyrxd/security/ src/pyrxd/glyph/transfer.py src/pyrxd/glyph/client.py
       # check-manifest is already installed (it's a `test`-group dependency
       # `poetry install --sync` above pulled in) and diffs git-tracked files
       # against a built sdist -- run once, not once per Python version, since

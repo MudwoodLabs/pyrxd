@@ -197,11 +197,17 @@ docs/design/
 # portable or meaningful to another contributor; keeping it untracked
 # leaves `git status` clean for everyone.
 #
-# .claude/      — Claude Code per-machine config
+# .claude/*     — Claude Code per-machine config (settings, worktrees), EXCEPT
+#                 .claude/skills/, which is shared tooling and travels with the
+#                 repo: /security-panel is how a pre-release audit is run here, and
+#                 a skill only one machine has is a process nobody else can follow.
+#                 Written as `.claude/*` + a negation because git cannot re-include
+#                 a path whose parent directory is excluded.
 # .worktrees/   — git worktree checkouts (local-only by definition)
 # logs/         — fuzz / diagnostic run output (scripts/fuzz_*.sh)
 # poetry.lock   — library project; deps resolve from pyproject.toml
-.claude/
+.claude/*
+!.claude/skills/
 .worktrees/
 logs/
 poetry.lock

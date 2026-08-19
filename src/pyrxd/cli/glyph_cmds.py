@@ -57,6 +57,7 @@ from ..glyph.builder import (
     RevealParams,
     RevealScripts,
 )
+from ..glyph.client import BroadcastEchoMismatch, _confirmed_txid
 from ..glyph.dmint import (
     DEFAULT_MAX_ATTEMPTS,
     MAX_SHA256D_TARGET,
@@ -80,6 +81,7 @@ from ..glyph.fees import (
     measure_reveal_fee,
 )
 from ..glyph.scanner import GlyphScanner
+from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, assert_fee_matches_size
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
 from ..glyph.transfer import build_nft_transfer as lib_build_nft_transfer
 from ..glyph.transfer import find_plain_rxd_utxo as lib_find_plain_rxd_utxo
@@ -460,7 +462,8 @@ async def _mint_nft_inner(
         ),
     ]
     _confirm_or_abort(ctx, sections)
-    commit_txid = await client.broadcast(commit_hex)
+    _echoed_commit = await client.broadcast(commit_hex)
+    commit_txid = _local_commit_txid(commit_hex, _echoed_commit)
 
     # 3) Poll for confirmation.
     if ctx.output_mode == "human":
@@ -497,7 +500,8 @@ async def _mint_nft_inner(
             )
         ],
     )
-    reveal_txid = await client.broadcast(reveal_hex)
+    _echoed_reveal = await client.broadcast(reveal_hex)
+    reveal_txid = _confirmed_reveal_txid(reveal_hex, _echoed_reveal)
     # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
     # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
     # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
@@ -581,6 +585,14 @@ def deploy_ft_cmd(
         )
 
     from ..utils import address_to_public_key_hash
+
+    # Pin the network BEFORE deriving the PKH, for the reason `_require_address_on_network`
+    # documents: `address_to_public_key_hash` decodes a testnet address into a perfectly
+    # valid-looking 20-byte PKH, and the deploy then locks the ENTIRE premined supply to a
+    # script no key on this network can spend. Every other destination in this CLI is
+    # pinned — `transfer-ft`, `transfer-nft`, each airdrop recipient — and this one, which
+    # carries the most value of any of them, was not.
+    _require_address_on_network(ctx, treasury, what="--treasury address")
 
     try:
         treasury_pkh = Hex20(address_to_public_key_hash(treasury))
@@ -734,7 +746,8 @@ async def _deploy_ft_inner(
             ),
         ],
     )
-    commit_txid = await client.broadcast(commit_tx.serialize())
+    _echoed_commit = await client.broadcast(commit_tx.serialize())
+    commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
 
     if ctx.output_mode == "human":
         click.echo(f"\ncommit broadcast: {commit_txid}")
@@ -769,7 +782,8 @@ async def _deploy_ft_inner(
             ),
         ],
     )
-    reveal_txid = await client.broadcast(reveal_tx.serialize())
+    _echoed_reveal = await client.broadcast(reveal_tx.serialize())
+    reveal_txid = _confirmed_reveal_txid(reveal_tx, _echoed_reveal)
     # The genesis ref is the COMMIT outpoint, not the reveal txid: prepare_reveal
     # embeds GlyphRef(commit_txid, commit_vout) into the reveal's locking script
     # (glyph/builder.py), and that is what extract_ref_from_{nft,ft}_script reads
@@ -798,9 +812,10 @@ async def _deploy_ft_inner(
     "--allow-overpay",
     is_flag=True,
     default=False,
-    help="Accept a fee above what the transaction's size demands. Relaxes BOTH bounds: the "
-    "rate ceiling (10x the relay floor) and the check that the fee matches the signed bytes. "
-    "Neither should refuse an ordinary transfer — this exists so a refusal is never a dead end.",
+    help="Accept a fee far above what the signed transaction's size demands. Relaxes the rate "
+    "ceiling (10x the relay floor) and the overpay check. It does NOT relax the underpay "
+    "invariant — a transaction must always pay for its own size. Exists so a refusal is "
+    "never a dead end on a chain with no RBF or CPFP.",
 )
 @click.pass_obj
 def transfer_ft_cmd(
@@ -862,7 +877,15 @@ def _require_address_on_network(ctx: CliContext, address: str, *, what: str) -> 
     glyph transfer paths did not, which is the same unrecoverable paste error
     with tokens on it instead of RXD.
     """
-    if not validate_address(address, network=Network(ctx.network)):
+    # `Network` has only MAINNET and TESTNET, but `--network` also accepts `regtest`, so
+    # `Network(ctx.network)` raised a bare `ValueError` — an unhandled traceback, not a
+    # UserError — for every pinned command on regtest. Regtest is the developer onramp
+    # `pyrxd regtest` exists to serve, so the guard was refusing the workflow the project
+    # ships to newcomers. Regtest addresses carry testnet's version byte and decode to
+    # `Network.TESTNET` (there are only two prefixes in ADDRESS_PREFIX_NETWORK_DICT), so
+    # that is the network to pin against.
+    expected = Network.TESTNET if ctx.network == "regtest" else Network(ctx.network)
+    if not validate_address(address, network=expected):
         raise UserError(
             f"invalid {what}",
             cause=f"not a valid {ctx.network} Radiant P2PKH address",
@@ -875,6 +898,7 @@ async def _select_ft_inputs(
     ref: GlyphRef,
     amount: int,
     client: ElectrumXClient,
+    triples: list[tuple[UtxoRecord, str, PrivateKey]] | None = None,
 ) -> list[tuple[FtUtxo, str, PrivateKey]]:
     """Find this wallet's FT UTXOs for ``ref`` and greedily cover ``amount``.
 
@@ -890,16 +914,15 @@ async def _select_ft_inputs(
     wrapper only re-dresses the SDK error as a CLI one with a runnable fix.
     """
     try:
-        return await lib_select_ft_inputs(wallet, ref, amount, client)
-    except InsufficientFundsError as exc:
-        msg = str(exc)
-        if "no FT holdings" in msg:
-            raise UserError(
-                f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-                fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
-            ) from exc
+        return await lib_select_ft_inputs(wallet, ref, amount, client, triples)
+    except NoHoldingsError as exc:
         raise UserError(
-            msg,
+            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
+            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+        ) from exc
+    except InsufficientFundsError as exc:
+        raise UserError(
+            str(exc),
             fix="check holdings with `pyrxd glyph list --type ft`",
         ) from exc
 
@@ -923,6 +946,94 @@ def _single_ft_signing_key(
             cause="selected FT utxos span multiple HD-derived keys",
             fix="consolidate FT holdings to one address first (Cut 3 will lift this restriction)",
         ) from exc
+
+
+def _local_commit_txid(commit_tx_or_hex: object, echoed: object) -> str:
+    """The commit txid derived from the bytes we signed, not the server's reply.
+
+    This one matters more than the transfer equivalent. The commit txid is not merely
+    reported — the REVEAL is built from it: it becomes the outpoint the reveal spends and
+    the ref baked into the token's locking script. Take the server's word for it and a
+    node that echoes some other confirmed txid gets a reveal built against the wrong
+    outpoint, carrying the wrong ref, which can never spend the real commit. That commit
+    is a hashlock with no owner-only path, so its value is gone.
+
+    Warns rather than raises: the commit may well have relayed, and the caller needs the
+    locally derived txid to carry on with the reveal either way.
+    """
+    from ..transaction.transaction import Transaction
+
+    tx = commit_tx_or_hex if hasattr(commit_tx_or_hex, "txid") else Transaction.from_hex(commit_tx_or_hex)
+    if tx is None:
+        # `from_hex` returns None rather than raising, and we are PAST the broadcast here.
+        # Letting that None reach `.txid()` raised `AttributeError` between the broadcast
+        # and the line that prints the txid — so the commit was on chain and the user was
+        # never told its id, which is the exact stranding this helper exists to prevent.
+        # Hand back the echoed txid in the message: unverified, but it is the only handle
+        # left on a commit that has already relayed.
+        raise UserError(
+            "the commit was broadcast but its txid could not be re-derived locally",
+            cause="the signed commit bytes did not parse back into a transaction",
+            # Name a recovery that EXISTS. An earlier version of this sent the user to a
+            # "PendingMint record still in the store" — this CLI has no PendingStore at
+            # all (that is the SDK's `GlyphMinter`), so the advice was fiction on a path
+            # where the commit is a hashlock with no owner-only spend path. `_wait_for_tx`
+            # above had this exact bug once and calls sending a user to a recovery that
+            # does not exist "the worst possible answer". Same answer here, same reason.
+            fix=(
+                f"the server echoed {echoed} — check it on an explorer. If it is there the commit "
+                "relayed: rebuild the reveal with the SDK — GlyphBuilder.prepare_reveal("
+                "RevealParams(commit_txid=<txid>, commit_vout=0, commit_value=<photons>, "
+                "cbor_bytes=..., owner_pkh=..., is_nft=...)) using the SAME unmodified metadata "
+                "file and the SAME wallet. See docs/how-to/troubleshoot-common-errors.md"
+            ),
+        )
+    local = str(tx.txid())
+    if str(echoed) != local:
+        click.echo(
+            f"warning: the server returned txid {echoed} but the commit we signed hashes "
+            f"to {local}. Continuing with {local}; if the reveal fails, check both on an "
+            "explorer.",
+            err=True,
+        )
+    return local
+
+
+def _confirmed_reveal_txid(reveal_tx_or_hex: object, echoed: object) -> str:
+    """The reveal txid derived from the bytes we signed. RAISES on a mismatch.
+
+    The counterpart to :func:`_local_commit_txid`, and deliberately stricter. That one
+    warns because a commit has a next phase to carry on with, and the caller needs the
+    derived value to build it. A reveal is where the mint ENDS, so there is no later step
+    to notice the discrepancy — and what the CLI prints from this txid is not merely a
+    receipt. ``deploy-dmint`` builds its ``contracts`` outpoints and ``premine_outpoint``
+    from it, which is what miners then grind against and what the owner later spends. Take
+    a lying server's word here and the user is handed outpoints that do not exist, with
+    real work aimed at them.
+
+    The token's own ref is safe either way — it is the COMMIT outpoint, embedded in the
+    reveal's locking script — which is exactly why this went unnoticed: the most
+    load-bearing identifier on the page never depended on the echo.
+    """
+    from ..transaction.transaction import Transaction
+
+    tx = reveal_tx_or_hex if hasattr(reveal_tx_or_hex, "txid") else Transaction.from_hex(reveal_tx_or_hex)
+    if tx is None:
+        raise UserError(
+            "the reveal was broadcast but its txid could not be re-derived locally",
+            cause="the signed reveal bytes did not parse back into a transaction",
+            fix=f"the server echoed {echoed} — check it on an explorer before spending anything built on it",
+        )
+    local = str(tx.txid())
+    if str(echoed) != local:
+        raise UserError(
+            "the server returned a different transaction id than the reveal we signed",
+            cause=f"echoed {echoed}, but the signed reveal hashes to {local}",
+            fix=f"check {local} on an explorer — if it is there the mint completed and only the "
+            "server's reply was wrong. Do not use the echoed id: outpoints derived from it "
+            "would point at a transaction that does not exist.",
+        )
+    return local
 
 
 async def _transfer_ft_inner(
@@ -963,20 +1074,19 @@ async def _transfer_ft_inner(
             fee_rate=ctx.fee_rate,
             allow_overpay=allow_overpay,
         )
+    except NoHoldingsError as exc:
+        raise UserError(
+            f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
+            fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
+        ) from exc
+    except NoFeeFundingError as exc:
+        raise UserError(
+            "no plain-RXD UTXO large enough to fund the fee",
+            cause=str(exc),
+            fix="send some plain RXD to this wallet — the token cannot pay its own fee",
+        ) from exc
     except InsufficientFundsError as exc:
-        msg = str(exc)
-        if "no FT holdings" in msg:
-            raise UserError(
-                f"no FT holdings for {ref.txid}:{ref.vout} in this wallet",
-                fix="run `pyrxd balance --refresh` to discover used addresses, then retry",
-            ) from exc
-        if "plain-RXD" in msg:
-            raise UserError(
-                "no plain-RXD UTXO large enough to fund the fee",
-                cause=msg,
-                fix="send some plain RXD to this wallet — the token cannot pay its own fee",
-            ) from exc
-        raise UserError(msg, fix="check holdings with `pyrxd glyph list --type ft`") from exc
+        raise UserError(str(exc), fix="check holdings with `pyrxd glyph list --type ft`") from exc
     except (ValidationError, ValueError) as exc:
         # A fee-bound refusal and a funding shortfall are different problems with
         # different remedies. Telling someone to add RXD when the build was refused
@@ -1012,8 +1122,19 @@ async def _transfer_ft_inner(
             ),
         ],
     )
-    txid = await client.broadcast(raw)
-    return {"txid": str(txid), "ref": f"{ref.txid}:{ref.vout}", "amount": amount, "to": to_address}
+    echoed = await client.broadcast(raw)
+    # Report the txid of what we signed. A server that drops the transfer and echoes some
+    # other well-formed txid would otherwise have the CLI print it as success.
+    try:
+        txid = _confirmed_txid(build, echoed)
+    except BroadcastEchoMismatch as exc:
+        raise UserError(
+            "the server returned a different transaction id than the one we signed",
+            cause=str(exc),
+            fix=f"check {exc.local_txid} on an explorer — if it is there the transfer went "
+            "through and only the server's reply was wrong",
+        ) from exc
+    return {"txid": txid, "ref": f"{ref.txid}:{ref.vout}", "amount": amount, "to": to_address}
 
 
 async def _airdrop_funding(
@@ -1023,6 +1144,7 @@ async def _airdrop_funding(
     *,
     n_outputs: int,
     client: ElectrumXClient,
+    triples: list[tuple[UtxoRecord, str, PrivateKey]] | None = None,
 ) -> AirdropFunding:
     """Find a plain-RXD UTXO big enough to pay for ``n_outputs`` token outputs.
 
@@ -1044,6 +1166,7 @@ async def _airdrop_funding(
             n_outputs=n_outputs,
             fee_rate=ctx.fee_rate,
             client=client,
+            triples=triples,
         )
     except InsufficientFundsError as exc:
         raise UserError(
@@ -1164,6 +1287,14 @@ def _load_recipients_file(path: Path) -> list[tuple[str, int]]:
     help="Recipients file: `.json` array of {address, amount}, or `address,amount` CSV.",
 )
 @click.option("--passphrase/--no-passphrase", default=False)
+@click.option(
+    "--allow-overpay",
+    is_flag=True,
+    default=False,
+    help="Accept a fee far above what the signed transaction's size demands. Relaxes the rate "
+    "ceiling (10x the relay floor) and the overpay check. It does NOT relax the underpay "
+    "invariant. Exists so a refusal is never a dead end on a chain with no RBF or CPFP.",
+)
 @click.pass_obj
 def airdrop_ft_cmd(
     ctx: CliContext,
@@ -1171,6 +1302,7 @@ def airdrop_ft_cmd(
     to_specs: tuple[str, ...],
     recipients_path: Path | None,
     passphrase: bool,
+    allow_overpay: bool,
 ) -> None:
     """Send FT units of REF (txid:vout) to many recipients in ONE transaction.
 
@@ -1236,7 +1368,9 @@ def airdrop_ft_cmd(
     async def _do_airdrop() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _airdrop_ft_inner(ctx, wallet, glyph_ref, recipients, pairs, client)
+            return await _airdrop_ft_inner(
+                ctx, wallet, glyph_ref, recipients, pairs, client, allow_overpay=allow_overpay
+            )
 
     try:
         result = asyncio.run(_do_airdrop())
@@ -1263,13 +1397,21 @@ async def _airdrop_ft_inner(
     recipients: list,  # list[AirdropRecipient]
     pairs: list[tuple[str, int]],
     client: ElectrumXClient,
+    *,
+    allow_overpay: bool = False,
 ) -> dict:
     """FT airdrop: scan wallet, select FT utxos for ref, fund the fee, broadcast."""
     total = sum(r.amount for r in recipients)
-    selected = await _select_ft_inputs(wallet, ref, total, client)
+    # Enumerate the wallet ONCE and let both phases read the same snapshot. Selecting
+    # inputs and finding the fee UTXO used to call `collect_spendable` independently,
+    # which leaves a window where the two disagree about what the wallet holds — the same
+    # split `build_ft_transfer` closed for `transfer-ft`. Both callees already accept a
+    # pre-collected list; only this site was still asking twice.
+    triples = await wallet.collect_spendable(client)
+    selected = await _select_ft_inputs(wallet, ref, total, client, triples)
     first_key = _single_ft_signing_key(selected, "FT airdrop")
 
-    funding = await _airdrop_funding(ctx, wallet, selected, n_outputs=len(recipients), client=client)
+    funding = await _airdrop_funding(ctx, wallet, selected, n_outputs=len(recipients), client=client, triples=triples)
 
     params = FtAirdropParams(
         ref=ref,
@@ -1278,9 +1420,22 @@ async def _airdrop_ft_inner(
         private_key=first_key,
         funding=[funding],
         fee_rate=ctx.fee_rate,
+        # Reaches the builder's OWN rate gate. Without it the flag relaxed only the
+        # post-build overpay check, so `--allow-overpay` could not get past a
+        # ceiling refusal — an override the help text promised and did not deliver.
+        allow_overpay=allow_overpay,
     )
     try:
         airdrop_result = GlyphBuilder().build_ft_airdrop_tx(params)
+
+        # Same builder as `transfer-ft`, so the same bound applies. Without this the
+        # airdrop path was the weaker of the two guard levels for no stated reason.
+        assert_fee_matches_size(
+            airdrop_result.fee,
+            airdrop_result.tx,
+            fee_rate=ctx.fee_rate,
+            allow_overpay=allow_overpay,
+        )
     except (ValidationError, ValueError) as exc:
         raise UserError(
             "could not build the airdrop",
@@ -1308,7 +1463,21 @@ async def _airdrop_ft_inner(
             ),
         ],
     )
-    txid = await client.broadcast(airdrop_result.tx.serialize())
+    _echoed = await client.broadcast(airdrop_result.tx.serialize())
+    # RAISE on a mismatch, like `transfer-ft` and `transfer-nft` — not the commit
+    # helper's warn-and-continue. That helper warns because a commit has a next phase to
+    # carry on with; an airdrop is terminal, so a warning on a non-tty run is no warning
+    # at all and `--json` would report success for tokens that never moved. It is also
+    # the widest blast radius of the three: N recipients in one transaction.
+    try:
+        txid = _confirmed_txid(airdrop_result, _echoed)
+    except BroadcastEchoMismatch as exc:
+        raise UserError(
+            "the server returned a different transaction id than the one we signed",
+            cause=str(exc),
+            fix=f"check {exc.local_txid} on an explorer — if it is there the airdrop went "
+            "through to every recipient and only the server's reply was wrong",
+        ) from exc
     return {
         "txid": str(txid),
         "ref": f"{ref.txid}:{ref.vout}",
@@ -1323,13 +1492,27 @@ async def _airdrop_ft_inner(
 @click.argument("ref", type=str)
 @click.option("--to", "to_address", required=True, help="Recipient address.")
 @click.option("--passphrase/--no-passphrase", default=False)
+@click.option(
+    "--allow-overpay",
+    is_flag=True,
+    default=False,
+    help="Accept a fee far above what the signed transaction's size demands. Relaxes the rate "
+    "ceiling (10x the relay floor). It does NOT relax the underpay invariant. Exists so a "
+    "refusal is never a dead end on a chain with no RBF or CPFP.",
+)
 @click.pass_obj
-def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: bool) -> None:
+def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: bool, allow_overpay: bool) -> None:
     """Transfer the NFT singleton REF (txid:vout) to --to ADDRESS."""
     glyph_ref = _parse_ref(ref)
 
     from ..utils import address_to_public_key_hash
 
+    # Same network pin as `transfer-ft` and `airdrop-ft` do, and this is the
+    # worst of the three to omit: a testnet-prefixed address decodes to a perfectly valid
+    # PKH on mainnet, so the singleton is re-locked to a script no mainnet key can spend.
+    # An NFT has no second copy and Radiant has no RBF/CPFP — the transfer cannot be
+    # recalled and the token cannot be reissued.
+    _require_address_on_network(ctx, to_address, what="--to address")
     try:
         to_pkh = Hex20(address_to_public_key_hash(to_address))
     except (ValidationError, ValueError) as exc:
@@ -1340,7 +1523,9 @@ def transfer_nft_cmd(ctx: CliContext, ref: str, to_address: str, passphrase: boo
     async def _do_transfer() -> dict:
         client = ctx.make_client()
         async with client:
-            return await _transfer_nft_inner(ctx, wallet, glyph_ref, to_pkh, to_address, client)
+            return await _transfer_nft_inner(
+                ctx, wallet, glyph_ref, to_pkh, to_address, client, allow_overpay=allow_overpay
+            )
 
     try:
         result = asyncio.run(_do_transfer())
@@ -1406,6 +1591,8 @@ async def _transfer_nft_inner(
     to_pkh: Hex20,
     to_address: str,
     client: ElectrumXClient,
+    *,
+    allow_overpay: bool = False,
 ) -> dict:
     """Find the singleton NFT utxo and re-lock it to to_pkh.
 
@@ -1426,17 +1613,17 @@ async def _transfer_nft_inner(
             to_pkh,
             client=client,
             fee_rate=ctx.fee_rate,
+            allow_overpay=allow_overpay,
         )
+    except NoHoldingsError as exc:
+        raise UserError(
+            f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
+            fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
+        ) from exc
     except InsufficientFundsError as exc:
-        msg = str(exc)
-        if "not held by this wallet" in msg:
-            raise UserError(
-                f"NFT {ref.txid}:{ref.vout} is not held by this wallet",
-                fix="run `pyrxd balance --refresh` first; if still missing, the NFT is owned elsewhere",
-            ) from exc
         raise UserError(
             "no plain-RXD UTXO large enough to fund the NFT transfer fee",
-            cause=msg,
+            cause=str(exc),
             fix="fund this wallet with plain RXD (the NFT itself carries only dust)",
         ) from exc
     except (ValidationError, ValueError) as exc:
@@ -1464,8 +1651,17 @@ async def _transfer_nft_inner(
             ),
         ],
     )
-    txid = await client.broadcast(raw)
-    return {"txid": str(txid), "ref": f"{ref.txid}:{ref.vout}", "to": to_address, "fee": build.fee}
+    echoed = await client.broadcast(raw)
+    try:
+        txid = _confirmed_txid(build, echoed)
+    except BroadcastEchoMismatch as exc:
+        raise UserError(
+            "the server returned a different transaction id than the one we signed",
+            cause=str(exc),
+            fix=f"check {exc.local_txid} on an explorer — if it is there the transfer went "
+            "through and only the server's reply was wrong",
+        ) from exc
+    return {"txid": txid, "ref": f"{ref.txid}:{ref.vout}", "to": to_address, "fee": build.fee}
 
 
 # ---------------------------------------------------------------------------
@@ -1978,7 +2174,8 @@ async def _deploy_dmint_inner(
             ),
         ],
     )
-    commit_txid = await client.broadcast(commit_tx.serialize())
+    _echoed_commit = await client.broadcast(commit_tx.serialize())
+    commit_txid = _local_commit_txid(commit_tx, _echoed_commit)
     # stderr (all modes): if the reveal later fails, the confirmed commit is recoverable.
     click.echo(f"commit broadcast: {commit_txid}", err=True)
     if ctx.output_mode == "human":
@@ -2040,7 +2237,8 @@ async def _deploy_dmint_inner(
             ),
         ],
     )
-    reveal_txid = await client.broadcast(reveal_tx.serialize())
+    _echoed_reveal = await client.broadcast(reveal_tx.serialize())
+    reveal_txid = _confirmed_reveal_txid(reveal_tx, _echoed_reveal)
     mineable_supply = reward * max_height * num_contracts
     return {
         "version": "V2" if is_v2 else "V1",

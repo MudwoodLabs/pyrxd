@@ -85,6 +85,7 @@ from typing import Any, ClassVar
 
 from ..constants import DUST_THRESHOLD_PHOTONS
 from ..fee_models import SatoshisPerKilobyte
+from ..fee_sizing import assert_fee_rate_clears_relay_floor, assert_pays_for_its_size
 from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, wait_for_confirmation
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata, to_unlock_script_template
@@ -648,6 +649,10 @@ class GlyphMinter:
             regtest key.
         store: where the :class:`PendingMint` is kept between phases. **Required.**
         fee_rate: photons per byte for both transactions.
+        allow_below_relay_floor: accept a ``fee_rate`` under the relay floor, for chains
+            whose floor really is lower — a regtest node runs at a tenth of mainnet's.
+            Applies to the reveal as well, so a minter built this way can finish what it
+            starts. Leave it False against mainnet.
         min_confirmations: depth required on the commit before the reveal is built.
             See :data:`DEFAULT_MINT_CONFIRMATIONS` — the default is convention.
         confirmation_timeout_s: how long ``reveal_*`` waits before raising
@@ -662,6 +667,7 @@ class GlyphMinter:
         store: PendingStore,
         *,
         fee_rate: int = MIN_FEE_RATE,
+        allow_below_relay_floor: bool = False,
         min_confirmations: int = DEFAULT_MINT_CONFIRMATIONS,
         confirmation_timeout_s: float = DEFAULT_CONFIRMATION_TIMEOUT_S,
     ) -> None:
@@ -672,12 +678,41 @@ class GlyphMinter:
             )
         if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
             raise ValidationError("GlyphMinter fee_rate must be a positive int")
+        # Judge the rate HERE — before any commit exists, let alone reaches a node.
+        #
+        # An earlier version judged it only at reveal time. That is after the
+        # irreversible action: `mint_nft` would broadcast the commit, then refuse to
+        # reveal it, and neither `mint_nft` nor `deploy_ft` exposes an override — so the
+        # caller was left with an on-chain hashlock and had to fish the `PendingMint` out
+        # of the store by hand. Measured at `fee_rate=100_001` (one photon over the 10x
+        # ceiling): commit broadcast, reveal refused.
+        #
+        # `allow_below_relay_floor` has to be a constructor argument, not just a reveal
+        # argument. This gate judges BOTH ends, so without it the check that was meant to
+        # catch a 1000x overpay also refused every legitimate sub-floor rate: a regtest
+        # node runs at a tenth of mainnet's floor, and `fee_rate=1000` could no longer
+        # construct a minter at all. A guard that refuses honest work is a bug, however
+        # sound its refusal of the dishonest kind.
+        #
+        # An earlier version of this comment also claimed the gate had stranded the
+        # reveal's own `allow_below_relay_floor=`, because no public path could produce a
+        # sub-floor record to use it on. That was false: `from_dict` restores whatever rate
+        # is on disk, checking only that it is a positive int, and a commit made before the
+        # floor rose is exactly that record. The hatch was always reachable; the
+        # construction refusal justifies the argument on its own.
+        assert_fee_rate_clears_relay_floor(
+            fee_rate,
+            what="GlyphMinter fee_rate",
+            allow_below_relay_floor=allow_below_relay_floor,
+            error_type=ValidationError,
+        )
         if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 1:
             raise ValidationError("GlyphMinter min_confirmations must be an int >= 1")
         self._client = client
         self._wallet = wallet
         self._store = store
         self._fee_rate = fee_rate
+        self._allow_below_relay_floor = allow_below_relay_floor
         self._min_confirmations = min_confirmations
         self._confirmation_timeout_s = confirmation_timeout_s
         self._builder = GlyphBuilder()
@@ -764,7 +799,14 @@ class GlyphMinter:
 
     # -- phase 2 -----------------------------------------------------------
 
-    async def reveal_nft(self, pending: PendingMint) -> MintResult:
+    async def reveal_nft(
+        self,
+        pending: PendingMint,
+        *,
+        fee_rate: int | None = None,
+        allow_below_relay_floor: bool | None = None,
+        allow_overpay: bool = False,
+    ) -> MintResult:
         """Wait for the commit, then broadcast the NFT reveal.
 
         The stored record is re-validated against the commit script before anything is
@@ -779,9 +821,21 @@ class GlyphMinter:
                 "Revealing it as an NFT would build the wrong locking script and the commit "
                 "script's OP_REFTYPE_OUTPUT check would reject the spend."
             )
-        return await self._reveal(pending)
+        return await self._reveal(
+            pending,
+            fee_rate=fee_rate,
+            allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
+        )
 
-    async def reveal_ft(self, pending: PendingMint) -> MintResult:
+    async def reveal_ft(
+        self,
+        pending: PendingMint,
+        *,
+        fee_rate: int | None = None,
+        allow_below_relay_floor: bool | None = None,
+        allow_overpay: bool = False,
+    ) -> MintResult:
         """Wait for the commit, then broadcast the FT deploy reveal.
 
         Mirrors :meth:`reveal_nft`; the reveal's token output carries the whole premined
@@ -795,7 +849,12 @@ class GlyphMinter:
                 "Revealing it as an FT would build the wrong locking script and the commit "
                 "script's OP_REFTYPE_OUTPUT check would reject the spend."
             )
-        return await self._reveal(pending)
+        return await self._reveal(
+            pending,
+            fee_rate=fee_rate,
+            allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
+        )
 
     # -- both phases -------------------------------------------------------
 
@@ -957,7 +1016,23 @@ class GlyphMinter:
             # answer. If the server then names a different transaction, one of the two
             # keys is the one holding real value and we cannot tell which — so file the
             # payload under both rather than leave the other unrecoverable.
-            self._store.save(replace(pending, commit_txid=broadcast_txid))
+            duplicate = replace(pending, commit_txid=broadcast_txid)
+            self._store.save(duplicate)
+            # Read it back, as `_persist_or_abort` does. That helper RAISES, which is
+            # right before a broadcast and wrong after one: the commit is already on
+            # chain, so aborting here would strand the very payload this branch exists
+            # to preserve. Warn loudly instead and keep going.
+            try:
+                self._store.load(broadcast_txid)
+            except Exception as exc:
+                warnings.warn(
+                    f"could not read back the duplicate pending record for {broadcast_txid}: "
+                    f"{exc}. The payload under {pending.commit_txid} is still there; if the "
+                    "server's txid is the one that landed, reveal will need that record "
+                    "restored by hand.",
+                    UserWarning,
+                    stacklevel=2,
+                )
             warnings.warn(
                 f"broadcast returned txid {broadcast_txid} but the signed commit hashes to "
                 f"{pending.commit_txid}. The pending payload has been stored under BOTH so either "
@@ -986,7 +1061,14 @@ class GlyphMinter:
                 "payload would not be recoverable after a crash"
             )
 
-    async def _reveal(self, pending: PendingMint) -> MintResult:
+    async def _reveal(
+        self,
+        pending: PendingMint,
+        *,
+        fee_rate: int | None = None,
+        allow_below_relay_floor: bool | None = None,
+        allow_overpay: bool = False,
+    ) -> MintResult:
         funding_key = self._key_for_address(pending.funding_address)
         self._assert_payload_still_matches(pending, funding_key)
 
@@ -999,13 +1081,114 @@ class GlyphMinter:
 
         locking = P2PKH().lock(pending.funding_address)
         reveal_tx = self._build_reveal_tx(pending, funding_key, locking)
-        reveal_tx.fee(SatoshisPerKilobyte(pending.fee_rate * 1000))
-        reveal_tx.sign()
-        reveal_txid = await self._client.broadcast(reveal_tx.serialize())
+        effective_rate = pending.fee_rate if fee_rate is None else fee_rate
+        if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:
+            raise ValidationError("reveal fee_rate must be a positive int")
 
-        # Only now is the record redundant. Deleting earlier would drop the CBOR bytes
-        # while the reveal could still fail to relay.
-        self._store.delete(pending.commit_txid)
+        # A minter built for a sub-floor chain must be able to REVEAL on it, or it could
+        # commit and never finish. But inherit that only when the caller said NOTHING:
+        # `allow_below_relay_floor or self._allow_below_relay_floor` also swallowed an
+        # EXPLICIT False, so a caller who deliberately re-asserted the floor for one reveal
+        # was silently overruled by the constructor. Measured: a minter built with the
+        # opt-in revealed at `fee_rate=1` despite being passed False — a transaction no
+        # node relays, holding its inputs until mempool expiry with neither RBF nor CPFP to
+        # rescue it. `None` means "unspecified"; False means False.
+        floor_opt_in = self._allow_below_relay_floor if allow_below_relay_floor is None else allow_below_relay_floor
+        # Judge the rate BEFORE spending it — both ends, every time, whatever its
+        # provenance.
+        #
+        # A previous version waived the ceiling whenever `fee_rate` was None, on the
+        # premise that `__init__` had already judged it. That premise was false in the one
+        # direction that costs money: `__init__` judges `self._fee_rate`, but this spends
+        # `pending.fee_rate` — a different number for any record that crossed instances,
+        # and `from_dict` copies it off disk with no bound check. Since `fee_rate is None`
+        # is the only path `mint_nft`/`deploy_ft` can take, the ceiling was unreachable on
+        # the default path.
+        #
+        # Nothing downstream catches an overpay. `assert_pays_for_its_size` returns as
+        # soon as `fee_paid >= required`, so it is a FLOOR check that an overpay passes
+        # trivially. Measured on a record carrying `fee_rate=10_000_000` funded well
+        # enough to pay it: the reveal paid 2,600,000,000 photons (26 RXD), no refusal and
+        # no warning — the 1000x per-kB-as-per-byte burn this ceiling exists to stop. A
+        # record written by a pre-ceiling pyrxd is exactly that shape, and records outlive
+        # the code that wrote them.
+        #
+        # The FLOOR is re-judged here for the opposite reason: it can MOVE between commit
+        # and reveal, and `required_fee` deliberately does not lift a sub-floor rate, so a
+        # stale rate agrees with itself and would sail through the size check on a
+        # transaction no node will relay.
+        #
+        # Both escape hatches stay the caller's and stay explicit, because refusing with
+        # no way through would turn "this reveal may not relay" into "this commit can
+        # never be revealed" — strictly worse, since the commit is a hashlock with no
+        # owner-only path. `allow_below_relay_floor=True` sends it anyway; `fee_rate=`
+        # re-prices upward when the commit can afford it (it cannot always: the commit was
+        # funded at the old rate). The default refuses loudly and keeps the record.
+        assert_fee_rate_clears_relay_floor(
+            effective_rate,
+            what="glyph reveal",
+            # Honour the construction-time opt-in too: a minter deliberately built for a
+            # sub-floor chain must be able to REVEAL on it, or it could commit and never
+            # finish — the worst of both refusals.
+            allow_below_relay_floor=floor_opt_in,
+            allow_overpay=allow_overpay,
+            error_type=ValidationError,
+        )
+
+        reveal_tx.fee(SatoshisPerKilobyte(effective_rate * 1000))
+        reveal_tx.sign()
+
+        # A second, different question: does the SIGNED transaction actually pay for the
+        # bytes it turned out to contain? The rate gate above judges the rate; this judges
+        # the result of applying it, after signatures have settled the real size.
+        raw = reveal_tx.serialize()
+        assert_pays_for_its_size(
+            size_bytes=len(raw),
+            fee_paid=reveal_tx.get_fee(),
+            fee_rate=effective_rate,
+            what="glyph reveal",
+            # Every other refusal on this path is a ValidationError. Leaving this one to
+            # the helper's bare-ValueError default made it the single hole a caller with
+            # `except ValidationError` falls through — on the funding failure, which is the
+            # one most likely to actually happen.
+            error_type=ValidationError,
+        )
+
+        echoed = await self._client.broadcast(raw)
+
+        # Wait on the txid of what WE signed, not on what the server said. Otherwise the
+        # confirmation gate below — the whole point of which is to protect the record
+        # until the reveal is really mined — can be satisfied by a server that drops the
+        # reveal and echoes any already-confirmed txid. `client.py` derives receipts the
+        # same way; `get_transaction` already binds `hash256(raw)` on the read path.
+        reveal_txid = str(reveal_tx.txid())
+        if str(echoed) != reveal_txid:
+            warnings.warn(
+                f"broadcast echoed txid {echoed} but the signed reveal hashes to "
+                f"{reveal_txid}. Waiting on the local value; if the server relayed "
+                "something else, this will time out and the pending record is kept.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+        # Deleting here used to be justified as "the reveal could still fail to relay" —
+        # which reasons about rejection, and misses acceptance-then-eviction. A mempool
+        # accept is not a block. If this reveal relays but is never mined it expires after
+        # ~8h (DEFAULT_MEMPOOL_EXPIRY), and with the record already gone the CBOR payload
+        # needed to rebuild it is gone too. The commit output is a hashlock with no
+        # owner-only spend path, so that is permanent, unrecoverable loss of its value.
+        #
+        # So the record outlives the broadcast and is dropped only once the reveal is
+        # actually confirmed. If the wait times out the record is KEPT and the timeout
+        # propagates: the caller can retry the reveal, which is exactly what the record
+        # exists for.
+        await wait_for_confirmation(
+            self._client,
+            str(reveal_txid),
+            min_confirmations=1,
+            timeout_s=self._confirmation_timeout_s,
+        )
+        self._delete_record_and_any_duplicate(pending)
         return MintResult(
             commit_txid=pending.commit_txid,
             reveal_txid=str(reveal_txid),
@@ -1014,6 +1197,32 @@ class GlyphMinter:
             carrier_value=pending.carrier_value,
             owner_pkh=pending.owner_pkh,
         )
+
+    def _delete_record_and_any_duplicate(self, pending: PendingMint) -> None:
+        """Drop the record for the mint that was just revealed — and ONLY that record.
+
+        An earlier version of this also hunted a sibling record filed under a server's
+        echoed txid, identifying it by matching ``cbor_bytes``. That was WRONG and
+        strictly more dangerous than the orphan it cleaned up.
+
+        ``encode_payload`` is a pure function of the metadata (``glyph/payload.py``), and
+        ``GlyphMetadata.created`` / ``commit_outpoint`` both default to ``""`` and are
+        omitted from the encoded dict when empty (``glyph/types.py:316-317, 452-455``).
+        So two independent mints of the SAME metadata — a batch of identical badges, or a
+        re-run after a perceived failure — produce byte-identical CBOR. Demonstrated:
+        two fresh ``GlyphMetadata`` objects with the same fields encode equal. Matching on
+        payload therefore matches a DIFFERENT mint's live record, and deleting it destroys
+        the only copy of the payload needed to spend that commit — which is a hashlock
+        with no owner-only spend path. Permanent loss, to tidy up a duplicate key.
+
+        The duplicate is left in place deliberately. It exists only in the rare branch
+        where a broadcast echoes a txid the signed bytes do not hash to, and that branch
+        already warns the operator to check which transaction landed. An extra record in
+        ``list_pending()`` is a prompt to re-check; a deleted record is unrecoverable
+        value. Removing it safely needs the echoed txid persisted ON the record, which is
+        a store-schema change and its own piece of work.
+        """
+        self._store.delete(pending.commit_txid)
 
     @staticmethod
     def _assert_payload_still_matches(pending: PendingMint, funding_key: Any) -> None:
