@@ -15,7 +15,7 @@
 #   scripts/mutation_test.sh coordinator    # gravity/swap_coordinator.py — the swap state machine
 #   scripts/mutation_test.sh network        # network/ — RPC/ElectrumX response parsing + failover
 #   scripts/mutation_test.sh consensus      # the original four groups
-#   scripts/mutation_test.sh value          # the seven value-moving groups
+#   scripts/mutation_test.sh value          # the eight value-moving groups
 #   scripts/mutation_test.sh all            # every group, sequentially (many hours)
 #
 # Scope by group (why these files — the verification/byte-exact arithmetic):

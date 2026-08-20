@@ -18,12 +18,13 @@ poetry run task mutate fee                # fee_sizing.py — the one fee-sizing
 poetry run task mutate wallet             # wallet.py — the flat-key send/sweep builders
 poetry run task mutate hdwallet           # hd/wallet.py — the BIP32/44 send/sweep builders
 poetry run task mutate glyph              # glyph/ft.py + glyph/builder.py — token builders
+poetry run task mutate mint               # glyph/mint.py + transfer.py + client.py — mint/move facade
 poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
 poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
 poetry run task mutate network            # network/ — remote-response parsing + failover
 
 poetry run task mutate consensus          # the original four groups
-poetry run task mutate value              # the seven value-moving groups
+poetry run task mutate value              # the eight value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
 
@@ -117,6 +118,14 @@ Two constraints shape the value-group lists specifically:
 - **Group by the tests that decide, not by directory.** `wallet.py` and `hd/wallet.py` started as one
   group and their decisive suites turned out to be nearly disjoint, so each file's mutants were paying
   for the other file's tests — a ~15s clean suite where each half needs ~8s. They are two groups now.
+- **A slow test in the list is a slow test times the mutant count.** The clean-suite wall time is not
+  a detail of the list; it decides whether the group can be run at all. Scoping `mint` found
+  `test_glyph_mint_facade.py` at 30.8s — three tests each waiting out a 10s confirmation poll interval
+  that nothing could shorten, because neither of `_reveal`'s two waits was passed an `interval_s`.
+  Against 1,644 mutants that is the difference between **~11 hours and under an hour**, so the fix
+  (`poll_interval_s`, exposed on `GlyphMinter`/`GlyphClient`) was a prerequisite for the group rather
+  than a nicety. Before adding a group, time its list first: if it is far off the ~1-3s the others
+  run in, find out why before writing the group.
 
 ## Baseline results — spv (2026-06)
 
