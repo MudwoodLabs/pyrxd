@@ -11,11 +11,12 @@
 #   scripts/mutation_test.sh hdwallet       # hd/wallet.py — the BIP32/44 send/sweep builders
 #   scripts/mutation_test.sh glyph          # glyph/ft.py + glyph/builder.py — token builders
 #   scripts/mutation_test.sh mint           # glyph/mint.py + transfer.py + client.py — the mint/move facade
+#   scripts/mutation_test.sh glyphscript    # glyph/script.py + glyph/payload.py — token script + CBOR bytes
 #   scripts/mutation_test.sh swap           # gravity/htlc_spend.py + swap/rswp/orders.py
 #   scripts/mutation_test.sh coordinator    # gravity/swap_coordinator.py — the swap state machine
 #   scripts/mutation_test.sh network        # network/ — RPC/ElectrumX response parsing + failover
 #   scripts/mutation_test.sh consensus      # the original four groups
-#   scripts/mutation_test.sh value          # the eight value-moving groups
+#   scripts/mutation_test.sh value          # the nine value-moving groups
 #   scripts/mutation_test.sh all            # every group, sequentially (many hours)
 #
 # Scope by group (why these files — the verification/byte-exact arithmetic):
@@ -52,6 +53,15 @@
 #                26 RXD fee-ceiling burn and a commit-stranding facade default both lived in
 #                modules mutation testing had never touched — the same reason the value groups
 #                exist at all. See docs/solutions/logic-errors/glyph-mint-fee-ceiling-*.md.
+#   glyphscript  glyph/script.py (the locking scripts every token is held under) and
+#                glyph/payload.py (the CBOR a Glyph carries). Distinct from the `script` group,
+#                which is the Bitcoin script PRIMITIVES. These bytes are an interop surface: they
+#                must match what Photonic's indexer and the network expect, and a mutation that
+#                changes them CONSISTENTLY on both the write and read side is invisible to a
+#                round-trip test — only frozen-byte vectors can see it. `build_ft_locking_script`
+#                in particular is compared against real bytes in exactly one place
+#                (test_dmint_premine_regtest_e2e.py), which is integration-marked and therefore
+#                excluded from every mutation run by `-m 'not integration'`.
 #   swap         gravity/htlc_spend.py (hashlock claim + CSV refund spends) and
 #                swap/rswp/orders.py (the on-chain orderbook wire format).
 #   coordinator  gravity/swap_coordinator.py — the cross-chain HTLC state machine that decides
@@ -94,6 +104,7 @@ group_files() {
     hdwallet)    echo "hd/wallet" ;;
     glyph)       echo "glyph/ft glyph/builder" ;;
     mint)        echo "glyph/mint glyph/transfer glyph/client" ;;
+    glyphscript) echo "glyph/script glyph/payload" ;;
     swap)        echo "gravity/htlc_spend swap/rswp/orders" ;;
     coordinator) echo "gravity/swap_coordinator" ;;
     network)     echo "network/bitcoin network/electrumx network/failover network/confirm network/_guards network/tls_pin network/registry network/rxindexer network/chaintracker" ;;
@@ -136,6 +147,10 @@ group_tests() {
     # test_glyph_mint_facade.py cost 30.8s until `poll_interval_s` was exposed; two reveal waits
     # slept a 10s default nothing could shorten. At 31s this group was ~11 hours and not worth
     # running. Keep an eye on it: this group's whole viability is that clean-suite number.
+    # Cheapest-first matters more here than usual: with `-x`, a killed mutant exits at the first
+    # failing file, so the two ~1s files at the end only run for mutants that survived everything
+    # cheaper. No tests/cli/ entry, so the contiguity rule does not bite this list.
+    glyphscript) echo "tests/test_glyph_dmint.py tests/test_golden_vectors.py tests/test_glyph_red_team.py tests/test_mut_container_wave_builders.py tests/test_glyph.py tests/test_glyph_scanner.py tests/test_glyph_mint_facade.py tests/test_dmint_v1_mint.py" ;;
     mint)        echo "tests/test_glyph_transfer.py tests/test_glyph_nft_transfer.py tests/test_glyph_client_transfer.py tests/test_ft_transfer.py tests/test_ft_airdrop.py tests/test_glyph_mint_facade.py tests/cli/test_glyph_cmds.py" ;;
     swap)        echo "tests/test_htlc_spend_productized.py tests/test_htlc_spend_fee_floor.py tests/test_rswp_orders.py tests/test_rswp_wire.py tests/test_rswp_book.py tests/test_rswp_quoting.py tests/test_rswp_tracker.py tests/test_swap_order.py tests/test_htlc_covenant.py tests/test_rswp_covenant.py $GAPS tests/test_rswp_conformance_vectors.py" ;;
     coordinator) echo "tests/test_swap_coordinator.py tests/test_swap_coordinator_credential_gate.py tests/test_max_protected_value.py tests/test_finality_verdict.py tests/test_taker_asset_funding_gate_adversarial.py tests/test_btc_maker_counter_funding_adversarial.py tests/test_radiant_leg.py tests/test_btc_htlc_leg.py $GAPS tests/test_htlc_handshake_conformance_vectors.py" ;;
@@ -157,6 +172,7 @@ group_timeout() {
     hdwallet)    echo "60.0" ;;
     glyph)       echo "30.0" ;;
     mint)        echo "20.0" ;;
+    glyphscript) echo "15.0" ;;
     swap)        echo "30.0" ;;
     coordinator) echo "30.0" ;;
     network)     echo "30.0" ;;
@@ -178,7 +194,7 @@ group_marker() {
 }
 
 CONSENSUS_GROUPS="spv script transaction dmint"
-VALUE_GROUPS="fee wallet hdwallet glyph mint swap coordinator network"
+VALUE_GROUPS="fee wallet hdwallet glyph mint glyphscript swap coordinator network"
 
 GROUPS_REQUESTED="${*:-spv}"
 case "$GROUPS_REQUESTED" in
