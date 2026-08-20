@@ -32,6 +32,7 @@ from .mint import (
     MintResult,
     PendingMint,
     PendingStore,
+    _assert_positive_finite,
 )
 from .transfer import FtTransferBuild, NftTransferBuild, build_ft_transfer, build_nft_transfer
 
@@ -231,6 +232,14 @@ class GlyphClient:
             allow_below_relay_floor=allow_below_relay_floor or store is None,
             error_type=ValidationError,
         )
+        # Validate the wait parameters HERE, not on first `.minter` access. Deferring them
+        # reproduces, on the two newest arguments, exactly the fault the fee-rate gate above
+        # was added to fix: `GlyphClient(store=..., poll_interval_s=0)` constructed happily
+        # and then failed with "GlyphMinter poll_interval_s must be > 0" — a class the
+        # caller never wrote, about a parameter they spelled on this one. Third time this
+        # cycle, so it is checked here even though the minter checks it again.
+        _assert_positive_finite(confirmation_timeout_s, what="GlyphClient confirmation_timeout_s")
+        _assert_positive_finite(poll_interval_s, what="GlyphClient poll_interval_s")
         self._client = client
         self._wallet = wallet
         self._store = store

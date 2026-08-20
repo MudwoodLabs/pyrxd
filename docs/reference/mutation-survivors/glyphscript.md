@@ -10,6 +10,8 @@ is genuinely indistinguishable or whether nothing tests it.
 
 **221 surviving mutants across 2 modules**, of which 22 are marked `annot` — a type annotation rewritten by a BitOr-family operator, which cannot change behaviour. Start with the unmarked rows.
 
+> **Snapshot, not a live view.** These rows were produced by a sweep at commit `9c0617e` and the line numbers, source text and outcomes are all as of that tree. Code moves afterwards: a row can end up quoting today's production line as a *mutant* (this happened to a `poll_interval_s` bound within a day of the first sweep). Re-run the group before treating any single row as current.
+
 ## `src/pyrxd/glyph/payload.py` — 143 survivors (0 `annot`)
 
 | Line | Definition | Operator | Original | Mutant | |

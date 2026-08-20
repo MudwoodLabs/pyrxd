@@ -1246,6 +1246,21 @@ class TestThePollIntervalReachesEveryWait:
         on demand genuinely wants sub-second polling."""
         assert GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=0.001) is not None
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize("param", ["poll_interval_s", "confirmation_timeout_s"])
+    def test_a_non_finite_wait_parameter_is_refused(self, param: str, bad: float):
+        """`> 0` is not a finiteness check, and the gap hangs a mint.
+
+        `nan <= 0` and `inf <= 0` are both False, so both passed a bare positivity check.
+        `asyncio.sleep(nan)` and `asyncio.sleep(inf)` never return (measured: still
+        sleeping after 1.5s), and with `timeout_s=nan` the loop's `elapsed >= timeout_s`
+        is always False while `max_iterations` defaults to None — unbounded in both
+        directions. A reveal that never returns AND never raises leaves an on-chain
+        hashlock with no owner-only spend path, which is what these guards exist to stop.
+        """
+        with pytest.raises(ValidationError, match=param):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), **{param: bad})
+
     @pytest.mark.parametrize("bad", [-1, -0.001, "x", None, True])
     def test_a_bad_interval_is_refused_at_construction(self, bad):
         """Before a commit exists, not at reveal time. `wait_for_confirmation` validates
@@ -1428,10 +1443,20 @@ class TestTheEchoComparisonIsAnEqualityTest:
         minter = GlyphMinter(self._client_echoing(None), FakeWallet(_key()), store)
         pending = asyncio.run(minter.commit_nft(_nft_metadata()))
 
-        saved = [k for k in store.records] if hasattr(store, "records") else None
+        # Assert the WARNING, not the record count. With an honest echo the "duplicate"
+        # is `replace(pending, commit_txid=broadcast_txid)` — the same key — so the store
+        # overwrites and the count is 1 whether or not the mismatch branch fired. The
+        # count was vacuous for exactly the mutants this class is named after.
         assert store.load(pending.commit_txid) is not None
-        if saved is not None:
-            assert len(saved) == 1, f"an honest echo filed {len(saved)} records: {saved}"
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            asyncio.run(
+                GlyphMinter(self._client_echoing(None), FakeWallet(_key()), RecordingStore()).commit_nft(
+                    _nft_metadata()
+                )
+            )
+        echo_warnings = [w for w in caught if "broadcast returned txid" in str(w.message)]
+        assert not echo_warnings, f"an honest echo warned: {[str(w.message) for w in echo_warnings]}"
 
     def test_an_honest_reveal_echo_warns_about_nothing(self) -> None:
         """The reveal's counterpart. `>=`/`is not` would warn on every successful mint."""

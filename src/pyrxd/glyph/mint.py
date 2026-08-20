@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import abc
 import json
+import math
 import os
 import warnings
 from dataclasses import dataclass, replace
@@ -612,6 +613,31 @@ class UnsafeNullPendingStore(PendingStore):
 # ---------------------------------------------------------------------------
 
 
+def _assert_positive_finite(value: object, *, what: str) -> None:
+    """A wait parameter must be a real, positive, FINITE number of seconds.
+
+    `> 0` alone is not enough, and the gap is not academic: ``nan <= 0`` and ``inf <= 0``
+    are both False, so both sail through a bare positivity check. ``asyncio.sleep(nan)``
+    and ``asyncio.sleep(inf)`` never return (measured: still sleeping after 1.5s), and with
+    ``timeout_s=nan`` the loop's ``elapsed >= timeout_s`` is always False while
+    ``max_iterations`` defaults to None — so the wait is unbounded in both directions.
+
+    A reveal that never returns AND never raises leaves an on-chain commit that is a
+    hashlock with no owner-only spend path: the exact stranding these guards exist to
+    prevent, reached by the one input class the guards did not name.
+
+    ``network/confirm.py`` already applies ``math.isfinite`` to numbers coming off the
+    wire. This is the same rule applied to numbers coming from the caller, in one place so
+    the two constructors cannot drift apart.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValidationError(f"{what} must be a number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValidationError(f"{what} must be finite, got {value}")
+    if value <= 0:
+        raise ValidationError(f"{what} must be > 0")
+
+
 class GlyphMinter:
     """Two-phase Glyph minting over an ElectrumX client and an HD wallet.
 
@@ -722,12 +748,7 @@ class GlyphMinter:
         # about it holding an on-chain hashlock with no owner-only spend path, which is the
         # same "refuses after the irreversible action" trap this constructor already exists
         # to close for `fee_rate`.
-        if (
-            not isinstance(confirmation_timeout_s, (int, float))
-            or isinstance(confirmation_timeout_s, bool)
-            or confirmation_timeout_s <= 0
-        ):
-            raise ValidationError("GlyphMinter confirmation_timeout_s must be > 0")
+        _assert_positive_finite(confirmation_timeout_s, what="GlyphMinter confirmation_timeout_s")
         # Strictly positive, not `>= 0`. `wait_for_confirmation` polls the server once per
         # iteration and only THEN sleeps, so `interval_s=0` is a busy loop: measured at
         # ~715,000 polls/second, sustained for the whole `confirmation_timeout_s` (default
@@ -739,8 +760,7 @@ class GlyphMinter:
         # `wait_for_confirmation` itself still permits 0: it is the low-level primitive and
         # has `max_iterations` to bound it. This is the knob a caller tuning for a fast local
         # node reaches for, and 0 is never the right answer here.
-        if not isinstance(poll_interval_s, (int, float)) or isinstance(poll_interval_s, bool) or poll_interval_s <= 0:
-            raise ValidationError("GlyphMinter poll_interval_s must be > 0")
+        _assert_positive_finite(poll_interval_s, what="GlyphMinter poll_interval_s")
         self._client = client
         self._wallet = wallet
         self._store = store

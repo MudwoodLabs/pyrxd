@@ -160,4 +160,9 @@ async def wait_for_confirmation(
                 reason=f"max_iterations={max_iterations}"
                 + ("" if last_error is None else f" (last poll error: {last_error})"),
             )
-        await sleep(interval_s)
+        # Never sleep past the deadline. The poll happens before the sleep, so a plain
+        # `sleep(interval_s)` makes the wait run to the next interval boundary rather than
+        # to `timeout_s`: measured at `timeout_s=0.2, interval_s=3.0`, the timeout fired
+        # after 3.00s — a 15x overshoot. A units slip (ms where seconds are meant) turns
+        # that into hours, twice per mint, on a wait that is holding a hashlock commit.
+        await sleep(min(interval_s, max(0.0, timeout_s - (clock() - start))))

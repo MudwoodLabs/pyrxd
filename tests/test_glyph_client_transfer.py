@@ -442,14 +442,114 @@ class TestTheFacadeAndTheMinterDoNotDrift:
         assert not drift, f"facade/minter defaults drifted: {drift}"
 
     def test_every_shared_parameter_is_actually_forwarded(self):
-        """Matching defaults are not enough — the facade must also pass the value on.
+        """Behavioural, not textual.
 
-        A parameter accepted and then dropped looks correct in the signature and silently
-        applies the minter's default instead of the caller's value.
+        This began as a grep of the `minter` property's source for `name=self._name`. A
+        reviewer defeated it in one edit: cross-wiring `__init__` so
+        `self._poll_interval_s = confirmation_timeout_s` keeps the property's text intact
+        AND matches defaults, so both halves of the guard passed while every caller's value
+        was silently dropped — full offline suite green, 9,289 tests.
+
+        So construct a client with a NON-DEFAULT value for each shared name and read back
+        what the minter actually received. A text search cannot see cross-wiring; this can.
         """
-        import inspect
+        import warnings as _w
 
         _c, _m, names = self._shared()
-        src = inspect.getsource(GlyphClient.minter.fget)
-        missing = [n for n in names if f"{n}=self._{n}" not in src]
-        assert not missing, f"accepted by GlyphClient.__init__ but never forwarded: {missing}"
+        assert names, "no shared parameters found — the introspection broke, not the code"
+
+        # A distinct, legal, non-default value per parameter, so a cross-wire between any
+        # two of them shows up as a mismatch rather than coincidentally agreeing.
+        probes = {
+            "fee_rate": 12_345,
+            "allow_below_relay_floor": True,
+            "min_confirmations": 3,
+            "confirmation_timeout_s": 123.5,
+            "poll_interval_s": 4.25,
+        }
+        assert set(names) <= set(probes), f"new shared parameter needs a probe value: {set(names) - set(probes)}"
+
+        with _w.catch_warnings():
+            _w.simplefilter("ignore", UserWarning)
+            client = GlyphClient(object(), object(), store=UnsafeNullPendingStore(), **{n: probes[n] for n in names})
+            minter = client.minter
+
+        wrong = {
+            n: (probes[n], getattr(minter, f"_{n}", "<absent>"))
+            for n in names
+            if getattr(minter, f"_{n}", object()) != probes[n]
+        }
+        assert not wrong, f"the facade did not forward these (expected, actual): {wrong}"
+
+
+class TestTheClientsPollIntervalReachesTheWait:
+    """The signature-parity guard is a TEXTUAL check — it greps the `minter` property for
+    `poll_interval_s=self._poll_interval_s`.
+
+    That passes if `__init__` cross-wires the attribute (`self._poll_interval_s =
+    confirmation_timeout_s` — whose default is also forwarded, so the matching-defaults
+    half passes too), if the string appears in a comment, or if the minter accepts the
+    value and ignores it. The behavioural spy that proves the value reaches both waits
+    builds a `GlyphMinter` directly, so the facade layer had only the textual guard.
+
+    This closes it from the outside: set it on the client, observe what the wait receives.
+    """
+
+    def test_the_value_set_on_the_client_is_what_the_waits_receive(self):
+        import asyncio
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import FakeClient, FakeWallet, RecordingStore, _key, _nft_metadata
+
+        import pyrxd.glyph.mint as mint_mod
+
+        seen: list[float | None] = []
+        real = mint_mod.wait_for_confirmation
+
+        async def _spy(*a, **kw):
+            seen.append(kw.get("interval_s"))
+            return await real(*a, **kw)
+
+        mint_mod.wait_for_confirmation = _spy
+        try:
+            client = GlyphClient(
+                FakeClient(),
+                FakeWallet(_key()),
+                store=RecordingStore(),
+                poll_interval_s=0.005,
+            )
+            assert asyncio.run(client.mint_nft(_nft_metadata())).reveal_txid
+        finally:
+            mint_mod.wait_for_confirmation = real
+
+        assert seen == [0.005, 0.005], (
+            f"the client's poll_interval_s did not reach both waits: {seen} — a textual parity check cannot see this"
+        )
+
+
+class TestTheClientRefusesBadWaitParametersByItsOwnName:
+    """`GlyphClient` accepted both new wait parameters unvalidated, so the refusal arrived
+    only on first `.minter` access and named `GlyphMinter` — a class the caller never
+    wrote, about a parameter they spelled on this one.
+
+    That is the third time this cycle the same deferred-refusal fault has appeared: first
+    on `fee_rate`, then on the sub-floor gate, now on these. Checked here even though the
+    minter checks again, because "the layer below will catch it" is what produced the
+    other two.
+    """
+
+    @pytest.mark.parametrize("bad", [0, -1, float("nan"), float("inf")])
+    @pytest.mark.parametrize("param", ["poll_interval_s", "confirmation_timeout_s"])
+    def test_it_refuses_at_construction_naming_itself(self, param: str, bad: float) -> None:
+        with pytest.raises(ValidationError) as exc:
+            GlyphClient(object(), object(), store=UnsafeNullPendingStore(), **{param: bad})
+        msg = str(exc.value)
+        assert "GlyphClient" in msg and param in msg, msg
+        assert "GlyphMinter" not in msg, f"names the wrong class: {msg}"
+
+    def test_a_transfer_only_client_is_unaffected(self) -> None:
+        """No store means no mint path — but the parameters are still validated, because a
+        value that is nonsense is nonsense whether or not it is later used."""
+        with pytest.raises(ValidationError, match="GlyphClient"):
+            GlyphClient(object(), object(), poll_interval_s=float("nan"))

@@ -2287,3 +2287,63 @@ class TestThePinWorksOnEveryNetworkTheCliAccepts:
         )
         assert result.exit_code != 0
         assert "p2pkh address" in result.output.lower()
+
+
+class TestTheCliWaitPollsAtAnIntervalItChose:
+    """`_wait_for_tx` is the CLI's own confirmation wait, and it was the FOURTH sibling
+    missed in this cycle.
+
+    `GlyphMinter._reveal` has two `wait_for_confirmation` calls and both were given an
+    `interval_s`. This one — serving `mint-nft`, `deploy-ft` and `deploy-dmint` — was not,
+    so the CLI mint paths still slept the 10s default with no way to change it. That is
+    precisely the regtest caller the new `poll_interval_s` docstring names, and the
+    quickstart the project ships targets regtest.
+
+    The lesson, four for four now: when a call is duplicated, grep for every site before
+    calling the fix done. An anchor written against one of them will silently miss the rest.
+    """
+
+    def test_every_mint_command_passes_an_interval(self) -> None:
+        """Structural, and deliberately so — it is the check that would have caught this.
+
+        A behavioural test on one command proves that command; this proves there is no
+        fifth sibling hiding behind a default.
+        """
+        import ast
+        import inspect
+
+        from pyrxd.cli import glyph_cmds
+
+        tree = ast.parse(inspect.getsource(glyph_cmds))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_wait_for_tx"]
+        assert len(calls) >= 3, f"expected the three mint commands, found {len(calls)}"
+        missing = [c.lineno for c in calls if not any(k.arg == "interval_s" for k in c.keywords)]
+        assert not missing, f"_wait_for_tx called without interval_s at lines {missing}"
+
+    @pytest.mark.parametrize("network, expected", [("mainnet", 10.0), ("testnet", 10.0), ("regtest", 0.25)])
+    def test_the_interval_is_derived_from_the_network(self, network: str, expected: float) -> None:
+        from pyrxd.cli.config import Config
+        from pyrxd.cli.context import CliContext
+        from pyrxd.cli.glyph_cmds import _poll_interval_for
+
+        assert _poll_interval_for(CliContext(config=Config(), network=network)) == expected
+
+    def test_the_wrapper_forwards_what_it_was_given(self) -> None:
+        """The value has to survive the wrapper, not just be computed."""
+        import asyncio
+
+        import pyrxd.cli.glyph_cmds as gc
+
+        seen: list[float | None] = []
+        real = gc.wait_for_confirmation
+
+        async def _spy(*a, **kw):
+            seen.append(kw.get("interval_s"))
+            return 1
+
+        gc.wait_for_confirmation = _spy
+        try:
+            asyncio.run(gc._wait_for_tx(MagicMock(), "ab" * 32, interval_s=0.125))
+        finally:
+            gc.wait_for_confirmation = real
+        assert seen == [0.125], f"the wrapper dropped the interval: {seen}"
