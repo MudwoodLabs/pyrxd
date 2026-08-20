@@ -1242,3 +1242,130 @@ class TestThePollIntervalReachesEveryWait:
         """Same trap, same parameter family — it shared the defect and the fix."""
         with pytest.raises(ValidationError, match="confirmation_timeout_s"):
             GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), confirmation_timeout_s=bad)
+
+
+class TestTheCommitPaysForItsOwnBytes:
+    """The reveal proves it pays for its size; the commit never did.
+
+    `assert_pays_for_its_size` appears once in `mint.py`, on the reveal. The commit is
+    built, fee'd, signed and broadcast with no such check — and the first `mint` mutation
+    sweep found 12 survivors on the single line that converts the rate:
+
+        commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
+
+    That `* 1000` is the per-byte-to-per-kB conversion. Mutating it moves the commit's fee
+    by three orders of magnitude in either direction and nothing noticed. Under-fee'd, the
+    commit does not relay and holds its inputs until mempool expiry — Radiant has neither
+    RBF nor CPFP. Over-fee'd, the difference is simply gone.
+
+    These pin the property rather than a constant, so they survive a legitimate change to
+    how the commit is shaped.
+    """
+
+    @staticmethod
+    def _built_commit(fee_rate: int, metadata=None):
+        """The commit transaction object, captured as it is built."""
+        import pyrxd.glyph.mint as mint_mod
+
+        cap = {}
+        real = mint_mod._build_commit_tx
+
+        def _spy(*a, **k):
+            tx = real(*a, **k)
+            cap["tx"] = tx
+            return tx
+
+        mint_mod._build_commit_tx = _spy
+        try:
+            minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), fee_rate=fee_rate)
+            pending = asyncio.run(minter.commit_nft(metadata or _nft_metadata()))
+        finally:
+            mint_mod._build_commit_tx = real
+        return cap["tx"], pending
+
+    @pytest.mark.parametrize("fee_rate", [10_000, 20_000, 50_000])
+    def test_the_commit_covers_its_own_size_at_every_rate(self, fee_rate: int) -> None:
+        from pyrxd.fee_sizing import required_fee
+
+        tx, _pending = self._built_commit(fee_rate)
+        size = len(tx.serialize())
+        paid = tx.get_fee()
+        required = required_fee(size, fee_rate)
+        assert paid >= required, (
+            f"the commit is {size} bytes and pays {paid:,} at {fee_rate}/byte, under the "
+            f"{required:,} required — it will not relay, and Radiant cannot fee-bump it"
+        )
+
+    def test_the_commit_fee_is_not_wildly_over_its_size(self) -> None:
+        """The other direction of the same mutation. An over-fee'd commit is not a failed
+        broadcast, it is value gone — the difference leaves with the miner."""
+        from pyrxd.fee_sizing import required_fee
+
+        tx, _pending = self._built_commit(10_000)
+        paid, required = tx.get_fee(), required_fee(len(tx.serialize()), 10_000)
+        assert paid <= required * 2, f"commit paid {paid:,} for a {required:,} requirement"
+
+    def test_the_commit_fee_scales_with_the_rate(self) -> None:
+        """Kills the mutants that sever the rate from the fee entirely."""
+        low, _ = self._built_commit(10_000)
+        high, _ = self._built_commit(50_000)
+        assert high.get_fee() > low.get_fee() * 3, (
+            f"5x the rate produced {high.get_fee():,} against {low.get_fee():,} — the rate "
+            "is not reaching the commit's fee"
+        )
+
+
+class TestTheCommitFundingEstimateCoversTheCommit:
+    """`_commit`'s funding sufficiency arithmetic carried 22 survivors across two lines:
+
+        commit_fee_estimate = 300 * fee_rate  # ~300-byte commit
+        total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE
+
+    `total_required` decides whether the wallet is judged able to fund the mint at all. If
+    it drops below what the commit actually costs, the mint is attempted with too little and
+    fails after selection rather than before it.
+    """
+
+    @staticmethod
+    def _threshold(fee_rate: int) -> int:
+        """The smallest single UTXO `_commit` will mint from.
+
+        Found by probing, not by restating `total_required` — a test that recomputes the
+        formula passes for any formula, including a mutated one. `_commit` selects with
+        `value >= total_required`, so the smallest accepted value IS that number.
+        """
+
+        def _accepts(value: int) -> bool:
+            minter = GlyphMinter(FakeClient(), FakeWallet(_key(), value=value), RecordingStore(), fee_rate=fee_rate)
+            try:
+                asyncio.run(minter.commit_nft(_nft_metadata()))
+                return True
+            except InsufficientFundsError:
+                return False
+
+        lo, hi = 1, 2_000_000_000
+        assert _accepts(hi), "probe upper bound too low to bracket the threshold"
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _accepts(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    @pytest.mark.parametrize("fee_rate", [10_000, 50_000])
+    def test_the_wallet_is_judged_against_what_the_commit_really_costs(self, fee_rate: int) -> None:
+        """The threshold must cover the commit's own fee, or a wallet is judged able to fund
+        a mint it cannot pay for — and the failure lands after selection rather than before."""
+        tx, pending = TestTheCommitPaysForItsOwnBytes._built_commit(fee_rate)
+        real_cost = pending.commit_value + tx.get_fee()
+        threshold = self._threshold(fee_rate)
+        assert threshold >= real_cost, (
+            f"a wallet holding {threshold:,} is accepted, but the commit costs {real_cost:,} "
+            f"({pending.commit_value:,} output + {tx.get_fee():,} fee) at {fee_rate}/byte"
+        )
+
+    def test_the_threshold_tracks_the_fee_rate(self) -> None:
+        """A mutant that severs `fee_rate` from the estimate leaves a high-rate mint judged
+        fundable on a low-rate budget."""
+        assert self._threshold(50_000) > self._threshold(10_000)
