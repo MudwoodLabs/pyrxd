@@ -8,7 +8,7 @@ A survivor is *not* automatically a bug — see the equivalent-mutant classes ca
 interpreter-detail rewrites). Triage means deciding, per row, whether the mutated behaviour
 is genuinely indistinguishable or whether nothing tests it.
 
-**728 surviving mutants across 3 modules**, of which 319 are marked `annot` — a type annotation rewritten by a BitOr-family operator, which cannot change behaviour. Start with the unmarked rows.
+**603 surviving mutants across 3 modules**, of which 319 are marked `annot` — a type annotation rewritten by a BitOr-family operator, which cannot change behaviour. Start with the unmarked rows.
 
 ## `src/pyrxd/glyph/client.py` — 121 survivors (99 `annot`)
 
@@ -34,36 +34,36 @@ is genuinely indistinguishable or whether nothing tests it.
 | 193 | `__init__` | `ReplaceBinaryOperator_BitOr_RShift` | `store: PendingStore \| None = None,` | `store: PendingStore >> None = None,` | `annot` |
 | 193 | `__init__` | `ReplaceBinaryOperator_BitOr_Sub` | `store: PendingStore \| None = None,` | `store: PendingStore - None = None,` | `annot` |
 | 206 | `__init__` | `NumberReplacer` | `if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:` | `if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 1:` |  |
-| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes + None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 + bytes \| None = None) -> MintResult:` | `annot` |
-| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes & None = None) -> MintResult:` | `annot` |
+| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes + None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 & bytes \| None = None) -> MintResult:` | `annot` |
+| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes & None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_BitXor` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ^ None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_BitXor` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 ^ bytes \| None = None) -> MintResult:` | `annot` |
-| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Div` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes / None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Div` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 / bytes \| None = None) -> MintResult:` | `annot` |
-| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 // bytes \| None = None) -> MintResult:` | `annot` |
+| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Div` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes / None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes // None = None) -> MintResult:` | `annot` |
+| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 // bytes \| None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 << bytes \| None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes << None = None) -> MintResult:` | `annot` |
-| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes % None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 % bytes \| None = None) -> MintResult:` | `annot` |
-| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes * None = None) -> MintResult:` | `annot` |
+| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes % None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 * bytes \| None = None) -> MintResult:` | `annot` |
-| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ** None = None) -> MintResult:` | `annot` |
+| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes * None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 ** bytes \| None = None) -> MintResult:` | `annot` |
-| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 >> bytes \| None = None) -> MintResult:` | `annot` |
+| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ** None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes >> None = None) -> MintResult:` | `annot` |
+| 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 >> bytes \| None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Sub` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes - None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Sub` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 - bytes \| None = None) -> MintResult:` | `annot` |
 | 275 | `mint_nft` | `ReplaceBinaryOperator_Mul_Div` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, /, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` |  |
 | 282 | `deploy_ft` | `ReplaceBinaryOperator_Mul_Div` | `*,` | `/,` |  |
-| 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Add` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes + None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Add` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 + bytes \| None = None,` | `annot` |
+| 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Add` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes + None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes & None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 & bytes \| None = None,` | `annot` |
-| 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitXor` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 ^ bytes \| None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitXor` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes ^ None = None,` | `annot` |
+| 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitXor` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 ^ bytes \| None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Div` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes / None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Div` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 / bytes \| None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes // None = None,` | `annot` |
@@ -76,10 +76,10 @@ is genuinely indistinguishable or whether nothing tests it.
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Mul` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes * None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Pow` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes ** None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Pow` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 ** bytes \| None = None,` | `annot` |
-| 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 >> bytes \| None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes >> None = None,` | `annot` |
-| 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes - None = None,` | `annot` |
+| 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 >> bytes \| None = None,` | `annot` |
 | 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 - bytes \| None = None,` | `annot` |
+| 284 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes - None = None,` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 + bytes \| None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes + None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes & None = None) -> PendingMint:` | `annot` |
@@ -88,18 +88,18 @@ is genuinely indistinguishable or whether nothing tests it.
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_BitXor` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ^ None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Div` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 / bytes \| None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Div` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes / None = None) -> PendingMint:` | `annot` |
-| 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes // None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 // bytes \| None = None) -> PendingMint:` | `annot` |
-| 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes << None = None) -> PendingMint:` | `annot` |
+| 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes // None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 << bytes \| None = None) -> PendingMint:` | `annot` |
+| 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes << None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes % None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 % bytes \| None = None) -> PendingMint:` | `annot` |
-| 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 * bytes \| None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes * None = None) -> PendingMint:` | `annot` |
+| 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 * bytes \| None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ** None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 ** bytes \| None = None) -> PendingMint:` | `annot` |
-| 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 >> bytes \| None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes >> None = None) -> PendingMint:` | `annot` |
+| 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 >> bytes \| None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Sub` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes - None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Sub` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 - bytes \| None = None) -> PendingMint:` | `annot` |
 | 295 | `commit_nft` | `ReplaceBinaryOperator_Mul_Div` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, /, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` |  |
@@ -136,18 +136,18 @@ is genuinely indistinguishable or whether nothing tests it.
 | 403 | `transfer_nft` | `ReplaceBinaryOperator_Mul_Div` | `async def transfer_nft(self, ref: GlyphRef, to_pkh: Hex20, *, allow_overpay: bool = False) -> NftTransferReceipt:` | `async def transfer_nft(self, ref: GlyphRef, to_pkh: Hex20, /, allow_overpay: bool = False) -> NftTransferReceipt:` |  |
 | 403 | `transfer_nft` | `ReplaceFalseWithTrue` | `async def transfer_nft(self, ref: GlyphRef, to_pkh: Hex20, *, allow_overpay: bool = False) -> NftTransferReceipt:` | `async def transfer_nft(self, ref: GlyphRef, to_pkh: Hex20, *, allow_overpay: bool = True) -> NftTransferReceipt:` |  |
 
-## `src/pyrxd/glyph/mint.py` — 327 survivors (187 `annot`)
+## `src/pyrxd/glyph/mint.py` — 298 survivors (187 `annot`)
 
 | Line | Definition | Operator | Original | Mutant | |
 |---|---|---|---|---|---|
 | 276 | `(module level)` | `ReplaceTrueWithFalse` | `@dataclass(frozen=True)` | `@dataclass(frozen=False)` |  |
 | 323 | `__post_init__` | `ReplaceComparisonOperator_Lt_NotEq` | `if not isinstance(self.commit_vout, int) or isinstance(self.commit_vout, bool) or self.commit_vout < 0:` | `if not isinstance(self.commit_vout, int) or isinstance(self.commit_vout, bool) or self.commit_vout != 0:` |  |
-| 325 | `__post_init__` | `NumberReplacer` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 0:` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 1:` |  |
 | 325 | `__post_init__` | `NumberReplacer` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 0:` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= -1:` |  |
+| 325 | `__post_init__` | `NumberReplacer` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 0:` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 1:` |  |
 | 325 | `__post_init__` | `ReplaceComparisonOperator_LtE_Eq` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 0:` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value == 0:` |  |
 | 325 | `__post_init__` | `ReplaceComparisonOperator_LtE_Lt` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 0:` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value < 0:` |  |
-| 325 | `__post_init__` | `ReplaceOrWithAnd` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 0:` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) and self.commit_value <= 0:` |  |
 | 325 | `__post_init__` | `ReplaceOrWithAnd` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 0:` | `if not isinstance(self.commit_value, int) and isinstance(self.commit_value, bool) or self.commit_value <= 0:` |  |
+| 325 | `__post_init__` | `ReplaceOrWithAnd` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) or self.commit_value <= 0:` | `if not isinstance(self.commit_value, int) or isinstance(self.commit_value, bool) and self.commit_value <= 0:` |  |
 | 331 | `__post_init__` | `ReplaceComparisonOperator_NotEq_Lt` | `if not isinstance(self.owner_pkh, bytes) or len(self.owner_pkh) != 20:` | `if not isinstance(self.owner_pkh, bytes) or len(self.owner_pkh) < 20:` |  |
 | 335 | `__post_init__` | `NumberReplacer` | `if not isinstance(self.carrier_value, int) or isinstance(self.carrier_value, bool) or self.carrier_value <= 0:` | `if not isinstance(self.carrier_value, int) or isinstance(self.carrier_value, bool) or self.carrier_value <= 1:` |  |
 | 335 | `__post_init__` | `ReplaceComparisonOperator_LtE_Eq` | `if not isinstance(self.carrier_value, int) or isinstance(self.carrier_value, bool) or self.carrier_value <= 0:` | `if not isinstance(self.carrier_value, int) or isinstance(self.carrier_value, bool) or self.carrier_value == 0:` |  |
@@ -179,18 +179,18 @@ is genuinely indistinguishable or whether nothing tests it.
 | 497 | `__init__` | `ReplaceComparisonOperator_Eq_Is` | `if os.name == "posix":` | `if os.name is "posix":` |  |
 | 497 | `__init__` | `ReplaceComparisonOperator_Eq_LtE` | `if os.name == "posix":` | `if os.name <= "posix":` |  |
 | 518 | `save` | `ReplaceTrueWithFalse` | `body = json.dumps(pending.to_dict(), sort_keys=True).encode("utf-8")` | `body = json.dumps(pending.to_dict(), sort_keys=False).encode("utf-8")` |  |
-| 519 | `save` | `NumberReplacer` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 1), 0o600)` |  |
 | 519 | `save` | `NumberReplacer` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", -1), 0o600)` |  |
+| 519 | `save` | `NumberReplacer` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 1), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_Add` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY + os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
-| 519 | `save` | `ReplaceBinaryOperator_BitOr_Add` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT + os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_Add` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC + getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
+| 519 | `save` | `ReplaceBinaryOperator_BitOr_Add` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT + os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_BitAnd` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC & getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_BitXor` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY ^ os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
-| 519 | `save` | `ReplaceBinaryOperator_BitOr_BitXor` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC ^ getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_BitXor` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT ^ os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
+| 519 | `save` | `ReplaceBinaryOperator_BitOr_BitXor` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC ^ getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC // getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
-| 519 | `save` | `ReplaceBinaryOperator_BitOr_Mod` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT % os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_Mod` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC % getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
+| 519 | `save` | `ReplaceBinaryOperator_BitOr_Mod` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT % os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_Mul` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC * getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 519 | `save` | `ReplaceBinaryOperator_BitOr_RShift` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC \| getattr(os, "O_CLOEXEC", 0), 0o600)` | `fd = os.open(str(tmp), os.O_WRONLY \| os.O_CREAT \| os.O_TRUNC >> getattr(os, "O_CLOEXEC", 0), 0o600)` |  |
 | 540 | `_fsync_dir` | `NumberReplacer` | `dir_fd = os.open(str(self._dir), os.O_RDONLY \| getattr(os, "O_CLOEXEC", 0))` | `dir_fd = os.open(str(self._dir), os.O_RDONLY \| getattr(os, "O_CLOEXEC", 1))` |  |
@@ -214,48 +214,48 @@ is genuinely indistinguishable or whether nothing tests it.
 | 729 | `__init__` | `ReplaceComparisonOperator_Lt_LtE` | `if not isinstance(poll_interval_s, (int, float)) or isinstance(poll_interval_s, bool) or poll_interval_s < 0:` | `if not isinstance(poll_interval_s, (int, float)) or isinstance(poll_interval_s, bool) or poll_interval_s <= 0:` |  |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 + bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes + None = None) -> PendingMint:` | `annot` |
-| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 & bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes & None = None) -> PendingMint:` | `annot` |
-| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_BitXor` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ^ None = None) -> PendingMint:` | `annot` |
+| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 & bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_BitXor` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 ^ bytes \| None = None) -> PendingMint:` | `annot` |
+| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_BitXor` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ^ None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Div` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes / None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Div` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 / bytes \| None = None) -> PendingMint:` | `annot` |
-| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 // bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes // None = None) -> PendingMint:` | `annot` |
-| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes << None = None) -> PendingMint:` | `annot` |
+| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 // bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 << bytes \| None = None) -> PendingMint:` | `annot` |
-| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 % bytes \| None = None) -> PendingMint:` | `annot` |
+| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes << None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes % None = None) -> PendingMint:` | `annot` |
-| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 * bytes \| None = None) -> PendingMint:` | `annot` |
+| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 % bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes * None = None) -> PendingMint:` | `annot` |
-| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 ** bytes \| None = None) -> PendingMint:` | `annot` |
+| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 * bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ** None = None) -> PendingMint:` | `annot` |
-| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 >> bytes \| None = None) -> PendingMint:` | `annot` |
+| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 ** bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes >> None = None) -> PendingMint:` | `annot` |
+| 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 >> bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Sub` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 - bytes \| None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_BitOr_Sub` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes - None = None) -> PendingMint:` | `annot` |
 | 748 | `commit_nft` | `ReplaceBinaryOperator_Mul_Div` | `async def commit_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` | `async def commit_nft(self, metadata: GlyphMetadata, /, owner_pkh: Hex20 \| bytes \| None = None) -> PendingMint:` |  |
 | 778 | `commit_ft` | `ReplaceBinaryOperator_Mul_Div` | `*,` | `/,` |  |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Add` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes + None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Add` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 + bytes \| None = None,` | `annot` |
-| 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 & bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes & None = None,` | `annot` |
+| 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 & bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_BitXor` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes ^ None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_BitXor` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 ^ bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Div` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes / None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Div` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 / bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 // bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes // None = None,` | `annot` |
-| 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_LShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 << bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_LShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes << None = None,` | `annot` |
+| 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_LShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 << bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Mod` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes % None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Mod` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 % bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Mul` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes * None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Mul` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 * bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Pow` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes ** None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Pow` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 ** bytes \| None = None,` | `annot` |
-| 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes >> None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 >> bytes \| None = None,` | `annot` |
+| 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes >> None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 - bytes \| None = None,` | `annot` |
 | 780 | `commit_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes - None = None,` | `annot` |
 | 808 | `commit_ft` | `ReplaceComparisonOperator_Lt_LtE` | `if not isinstance(supply, int) or isinstance(supply, bool) or supply < DUST_THRESHOLD_PHOTONS:` | `if not isinstance(supply, int) or isinstance(supply, bool) or supply <= DUST_THRESHOLD_PHOTONS:` |  |
@@ -306,8 +306,8 @@ is genuinely indistinguishable or whether nothing tests it.
 | 857 | `reveal_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `allow_below_relay_floor: bool \| None = None,` | `allow_below_relay_floor: bool >> None = None,` | `annot` |
 | 857 | `reveal_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `allow_below_relay_floor: bool \| None = None,` | `allow_below_relay_floor: bool - None = None,` | `annot` |
 | 858 | `reveal_ft` | `ReplaceFalseWithTrue` | `allow_overpay: bool = False,` | `allow_overpay: bool = True,` |  |
-| 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes + None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 + bytes \| None = None) -> MintResult:` | `annot` |
+| 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Add` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes + None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 & bytes \| None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes & None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_BitXor` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ^ None = None) -> MintResult:` | `annot` |
@@ -316,12 +316,12 @@ is genuinely indistinguishable or whether nothing tests it.
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Div` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 / bytes \| None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 // bytes \| None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes // None = None) -> MintResult:` | `annot` |
-| 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes << None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 << bytes \| None = None) -> MintResult:` | `annot` |
+| 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_LShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes << None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 % bytes \| None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mod` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes % None = None) -> MintResult:` | `annot` |
-| 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes * None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 * bytes \| None = None) -> MintResult:` | `annot` |
+| 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Mul` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes * None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes ** None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_Pow` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 ** bytes \| None = None) -> MintResult:` | `annot` |
 | 882 | `mint_nft` | `ReplaceBinaryOperator_BitOr_RShift` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 \| bytes \| None = None) -> MintResult:` | `async def mint_nft(self, metadata: GlyphMetadata, *, owner_pkh: Hex20 >> bytes \| None = None) -> MintResult:` | `annot` |
@@ -334,82 +334,63 @@ is genuinely indistinguishable or whether nothing tests it.
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Add` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes + None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes & None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitAnd` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 & bytes \| None = None,` | `annot` |
-| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitXor` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 ^ bytes \| None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitXor` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes ^ None = None,` | `annot` |
-| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Div` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 / bytes \| None = None,` | `annot` |
+| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_BitXor` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 ^ bytes \| None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Div` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes / None = None,` | `annot` |
+| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Div` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 / bytes \| None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 // bytes \| None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes // None = None,` | `annot` |
-| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_LShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes << None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_LShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 << bytes \| None = None,` | `annot` |
-| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Mod` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes % None = None,` | `annot` |
+| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_LShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes << None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Mod` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 % bytes \| None = None,` | `annot` |
+| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Mod` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes % None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Mul` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes * None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Mul` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 * bytes \| None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Pow` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes ** None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Pow` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 ** bytes \| None = None,` | `annot` |
-| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 >> bytes \| None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes >> None = None,` | `annot` |
-| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes - None = None,` | `annot` |
+| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_RShift` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 >> bytes \| None = None,` | `annot` |
 | 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 - bytes \| None = None,` | `annot` |
+| 901 | `deploy_ft` | `ReplaceBinaryOperator_BitOr_Sub` | `treasury_pkh: Hex20 \| bytes \| None = None,` | `treasury_pkh: Hex20 \| bytes - None = None,` | `annot` |
 | 934 | `_commit` | `ReplaceBinaryOperator_Mul_Div` | `*,` | `/,` |  |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Add` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 + bytes \| None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Add` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes + None,` | `annot` |
-| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_BitAnd` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 & bytes \| None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_BitAnd` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes & None,` | `annot` |
-| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_BitXor` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes ^ None,` | `annot` |
+| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_BitAnd` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 & bytes \| None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_BitXor` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 ^ bytes \| None,` | `annot` |
-| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Div` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes / None,` | `annot` |
+| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_BitXor` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes ^ None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Div` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 / bytes \| None,` | `annot` |
-| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 // bytes \| None,` | `annot` |
+| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Div` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes / None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes // None,` | `annot` |
+| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_FloorDiv` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 // bytes \| None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_LShift` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes << None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_LShift` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 << bytes \| None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Mod` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes % None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Mod` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 % bytes \| None,` | `annot` |
-| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Mul` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 * bytes \| None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Mul` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes * None,` | `annot` |
-| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Pow` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes ** None,` | `annot` |
+| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Mul` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 * bytes \| None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Pow` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 ** bytes \| None,` | `annot` |
-| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_RShift` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes >> None,` | `annot` |
+| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Pow` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes ** None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_RShift` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 >> bytes \| None,` | `annot` |
-| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Sub` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 - bytes \| None,` | `annot` |
+| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_RShift` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes >> None,` | `annot` |
 | 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Sub` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 \| bytes - None,` | `annot` |
+| 938 | `_commit` | `ReplaceBinaryOperator_BitOr_Sub` | `owner_pkh: Hex20 \| bytes \| None,` | `owner_pkh: Hex20 - bytes \| None,` | `annot` |
 | 956 | `_commit` | `NumberReplacer` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 299 * fee_rate  # ~300-byte commit` |  |
 | 956 | `_commit` | `NumberReplacer` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 301 * fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_Add` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 + fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_BitAnd` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 & fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_BitOr` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 \| fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_BitXor` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 ^ fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_Div` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 / fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_FloorDiv` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 // fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_Mod` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 % fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_RShift` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 >> fee_rate  # ~300-byte commit` |  |
-| 956 | `_commit` | `ReplaceBinaryOperator_Mul_Sub` | `commit_fee_estimate = 300 * fee_rate  # ~300-byte commit` | `commit_fee_estimate = 300 - fee_rate  # ~300-byte commit` |  |
-| 957 | `_commit` | `ReplaceBinaryOperator_Add_BitAnd` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value & commit_fee_estimate + NFT_CARRIER_VALUE` |  |
 | 957 | `_commit` | `ReplaceBinaryOperator_Add_BitOr` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value + commit_fee_estimate \| NFT_CARRIER_VALUE` |  |
-| 957 | `_commit` | `ReplaceBinaryOperator_Add_BitOr` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value \| commit_fee_estimate + NFT_CARRIER_VALUE` |  |
 | 957 | `_commit` | `ReplaceBinaryOperator_Add_BitXor` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value + commit_fee_estimate ^ NFT_CARRIER_VALUE` |  |
-| 957 | `_commit` | `ReplaceBinaryOperator_Add_BitXor` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value ^ commit_fee_estimate + NFT_CARRIER_VALUE` |  |
-| 957 | `_commit` | `ReplaceBinaryOperator_Add_Div` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value + commit_fee_estimate / NFT_CARRIER_VALUE` |  |
-| 957 | `_commit` | `ReplaceBinaryOperator_Add_FloorDiv` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value + commit_fee_estimate // NFT_CARRIER_VALUE` |  |
-| 957 | `_commit` | `ReplaceBinaryOperator_Add_Mod` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value % commit_fee_estimate + NFT_CARRIER_VALUE` |  |
-| 957 | `_commit` | `ReplaceBinaryOperator_Add_Mod` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value + commit_fee_estimate % NFT_CARRIER_VALUE` |  |
 | 957 | `_commit` | `ReplaceBinaryOperator_Add_Sub` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value + commit_fee_estimate - NFT_CARRIER_VALUE` |  |
-| 957 | `_commit` | `ReplaceBinaryOperator_Add_Sub` | `total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE` | `total_required = commit_value - commit_fee_estimate + NFT_CARRIER_VALUE` |  |
 | 964 | `_commit` | `NumberReplacer` | `available=0,` | `available= -1,` |  |
 | 964 | `_commit` | `NumberReplacer` | `available=0,` | `available= 1,` |  |
 | 967 | `_commit` | `ReplaceTrueWithFalse` | `triples.sort(key=lambda t: t[0].value, reverse=True)` | `triples.sort(key=lambda t: t[0].value, reverse=False)` |  |
 | 968 | `_commit` | `ReplaceComparisonOperator_GtE_Gt` | `funding = next((t for t in triples if t[0].value >= total_required), None)` | `funding = next((t for t in triples if t[0].value > total_required), None)` |  |
 | 970 | `_commit` | `NumberReplacer` | `largest = triples[0][0].value` | `largest = triples[ -1][0].value` |  |
-| 1008 | `_commit` | `NumberReplacer` | `commit_value=commit_tx.outputs[0].satoshis,` | `commit_value=commit_tx.outputs[ -1].satoshis,` |  |
-| 1008 | `_commit` | `NumberReplacer` | `commit_value=commit_tx.outputs[0].satoshis,` | `commit_value=commit_tx.outputs[ 1].satoshis,` |  |
 | 1034 | `_commit` | `ReplaceComparisonOperator_NotEq_Gt` | `if broadcast_txid != pending.commit_txid:` | `if broadcast_txid > pending.commit_txid:` |  |
 | 1034 | `_commit` | `ReplaceComparisonOperator_NotEq_GtE` | `if broadcast_txid != pending.commit_txid:` | `if broadcast_txid >= pending.commit_txid:` |  |
 | 1034 | `_commit` | `ReplaceComparisonOperator_NotEq_IsNot` | `if broadcast_txid != pending.commit_txid:` | `if broadcast_txid is not pending.commit_txid:` |  |
 | 1048 | `_commit` | `ExceptionReplacer` | `except Exception as exc:` | `except CosmicRayTestingException as exc:` |  |
-| 1055 | `_commit` | `NumberReplacer` | `stacklevel=2,` | `stacklevel= 1,` |  |
 | 1055 | `_commit` | `NumberReplacer` | `stacklevel=2,` | `stacklevel= 3,` |  |
+| 1055 | `_commit` | `NumberReplacer` | `stacklevel=2,` | `stacklevel= 1,` |  |
 | 1062 | `_commit` | `NumberReplacer` | `stacklevel=2,` | `stacklevel= 3,` |  |
 | 1062 | `_commit` | `NumberReplacer` | `stacklevel=2,` | `stacklevel= 1,` |  |
 | 1078 | `_persist_or_abort` | `ReplaceComparisonOperator_NotEq_IsNot` | `if reloaded != pending:` | `if reloaded is not pending:` |  |
@@ -440,8 +421,8 @@ is genuinely indistinguishable or whether nothing tests it.
 | 1107 | `_reveal` | `NumberReplacer` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= -1:` |  |
 | 1107 | `_reveal` | `ReplaceComparisonOperator_LtE_Eq` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate == 0:` |  |
 | 1107 | `_reveal` | `ReplaceComparisonOperator_LtE_Lt` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate < 0:` |  |
-| 1107 | `_reveal` | `ReplaceOrWithAnd` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) and effective_rate <= 0:` |  |
 | 1107 | `_reveal` | `ReplaceOrWithAnd` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:` | `if not isinstance(effective_rate, int) and isinstance(effective_rate, bool) or effective_rate <= 0:` |  |
+| 1107 | `_reveal` | `ReplaceOrWithAnd` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) or effective_rate <= 0:` | `if not isinstance(effective_rate, int) or isinstance(effective_rate, bool) and effective_rate <= 0:` |  |
 | 1160 | `_reveal` | `NumberReplacer` | `reveal_tx.fee(SatoshisPerKilobyte(effective_rate * 1000))` | `reveal_tx.fee(SatoshisPerKilobyte(effective_rate * 1001))` |  |
 | 1160 | `_reveal` | `ReplaceBinaryOperator_Mul_LShift` | `reveal_tx.fee(SatoshisPerKilobyte(effective_rate * 1000))` | `reveal_tx.fee(SatoshisPerKilobyte(effective_rate << 1000))` |  |
 | 1187 | `_reveal` | `ReplaceComparisonOperator_NotEq_Gt` | `if str(echoed) != reveal_txid:` | `if str(echoed) > reveal_txid:` |  |
@@ -449,31 +430,20 @@ is genuinely indistinguishable or whether nothing tests it.
 | 1187 | `_reveal` | `ReplaceComparisonOperator_NotEq_IsNot` | `if str(echoed) != reveal_txid:` | `if str(echoed) is not reveal_txid:` |  |
 | 1193 | `_reveal` | `NumberReplacer` | `stacklevel=2,` | `stacklevel= 3,` |  |
 | 1193 | `_reveal` | `NumberReplacer` | `stacklevel=2,` | `stacklevel= 1,` |  |
-| 1332 | `_build_reveal_tx` | `NumberReplacer` | `TransactionOutput(change_locking, 0, change=True),` | `TransactionOutput(change_locking, 1, change=True),` |  |
 | 1332 | `_build_reveal_tx` | `NumberReplacer` | `TransactionOutput(change_locking, 0, change=True),` | `TransactionOutput(change_locking, -1, change=True),` |  |
+| 1332 | `_build_reveal_tx` | `NumberReplacer` | `TransactionOutput(change_locking, 0, change=True),` | `TransactionOutput(change_locking, 1, change=True),` |  |
 | 1356 | `_build_commit_tx` | `NumberReplacer` | `src_outs = [TransactionOutput(Script(b""), 0) for _ in range(funding_utxo.tx_pos)]` | `src_outs = [TransactionOutput(Script(b""), -1) for _ in range(funding_utxo.tx_pos)]` |  |
 | 1356 | `_build_commit_tx` | `NumberReplacer` | `src_outs = [TransactionOutput(Script(b""), 0) for _ in range(funding_utxo.tx_pos)]` | `src_outs = [TransactionOutput(Script(b""), 1) for _ in range(funding_utxo.tx_pos)]` |  |
-| 1374 | `_build_commit_tx` | `NumberReplacer` | `TransactionOutput(locking, 0, change=True),` | `TransactionOutput(locking, -1, change=True),` |  |
 | 1374 | `_build_commit_tx` | `NumberReplacer` | `TransactionOutput(locking, 0, change=True),` | `TransactionOutput(locking, 1, change=True),` |  |
-| 1377 | `_build_commit_tx` | `NumberReplacer` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1001))` |  |
+| 1374 | `_build_commit_tx` | `NumberReplacer` | `TransactionOutput(locking, 0, change=True),` | `TransactionOutput(locking, -1, change=True),` |  |
 | 1377 | `_build_commit_tx` | `NumberReplacer` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 999))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_Add` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate + 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_BitAnd` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate & 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_BitOr` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate \| 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_BitXor` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate ^ 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_Div` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate / 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_FloorDiv` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate // 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_LShift` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate << 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_Mod` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate % 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_RShift` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate >> 1000))` |  |
-| 1377 | `_build_commit_tx` | `ReplaceBinaryOperator_Mul_Sub` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate - 1000))` |  |
+| 1377 | `_build_commit_tx` | `NumberReplacer` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))` | `commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1001))` |  |
 
-## `src/pyrxd/glyph/transfer.py` — 280 survivors (33 `annot`)
+## `src/pyrxd/glyph/transfer.py` — 184 survivors (33 `annot`)
 
 | Line | Definition | Operator | Original | Mutant | |
 |---|---|---|---|---|---|
 | 60 | `(module level)` | `AddNot` | `if TYPE_CHECKING:  # pragma: no cover - typing only` | `if not TYPE_CHECKING:  # pragma: no cover - typing only` |  |
-| 103 | `(module level)` | `RemoveDecorator` | `` | `` |  |
 | 103 | `(module level)` | `ReplaceTrueWithFalse` | `@dataclass(frozen=True)` | `@dataclass(frozen=False)` |  |
 | 134 | `ft_ref_or_none` | `ReplaceBinaryOperator_BitOr_Add` | `def ft_ref_or_none(script: bytes) -> GlyphRef \| None:` | `def ft_ref_or_none(script: bytes) -> GlyphRef + None:` | `annot` |
 | 134 | `ft_ref_or_none` | `ReplaceBinaryOperator_BitOr_BitAnd` | `def ft_ref_or_none(script: bytes) -> GlyphRef \| None:` | `def ft_ref_or_none(script: bytes) -> GlyphRef & None:` | `annot` |
@@ -515,8 +485,8 @@ is genuinely indistinguishable or whether nothing tests it.
 | 206 | `select_ft_inputs` | `ReplaceComparisonOperator_Lt_Eq` | `if total_ft < amount:` | `if total_ft == amount:` |  |
 | 206 | `select_ft_inputs` | `ReplaceComparisonOperator_Lt_Is` | `if total_ft < amount:` | `if total_ft is amount:` |  |
 | 206 | `select_ft_inputs` | `ReplaceComparisonOperator_Lt_LtE` | `if total_ft < amount:` | `if total_ft <= amount:` |  |
-| 235 | `_inputs_needed` | `NumberReplacer` | `running = 0` | `running = -1` |  |
 | 235 | `_inputs_needed` | `NumberReplacer` | `running = 0` | `running = 1` |  |
+| 235 | `_inputs_needed` | `NumberReplacer` | `running = 0` | `running = -1` |  |
 | 236 | `_inputs_needed` | `NumberReplacer` | `for n, triple in enumerate(sorted(group, key=lambda t: t[0].ft_amount, reverse=True), 1):` | `for n, triple in enumerate(sorted(group, key=lambda t: t[0].ft_amount, reverse=True), 0):` |  |
 | 236 | `_inputs_needed` | `NumberReplacer` | `for n, triple in enumerate(sorted(group, key=lambda t: t[0].ft_amount, reverse=True), 1):` | `for n, triple in enumerate(sorted(group, key=lambda t: t[0].ft_amount, reverse=True), 2):` |  |
 | 236 | `_inputs_needed` | `ReplaceTrueWithFalse` | `for n, triple in enumerate(sorted(group, key=lambda t: t[0].ft_amount, reverse=True), 1):` | `for n, triple in enumerate(sorted(group, key=lambda t: t[0].ft_amount, reverse=False), 1):` |  |
@@ -526,8 +496,8 @@ is genuinely indistinguishable or whether nothing tests it.
 | 238 | `_inputs_needed` | `ReplaceComparisonOperator_GtE_Is` | `if running >= amount:` | `if running is amount:` |  |
 | 240 | `_inputs_needed` | `NumberReplacer` | `return len(group), sum(t[0].ft_amount for t in group)` | `return len(group), sum(t[ 1].ft_amount for t in group)` |  |
 | 240 | `_inputs_needed` | `NumberReplacer` | `return len(group), sum(t[0].ft_amount for t in group)` | `return len(group), sum(t[ -1].ft_amount for t in group)` |  |
-| 248 | `select_ft_inputs` | `NumberReplacer` | `best = max((sum(t[0].ft_amount for t in g) for g in by_address.values()), default=0)` | `best = max((sum(t[0].ft_amount for t in g) for g in by_address.values()), default= -1)` |  |
 | 248 | `select_ft_inputs` | `NumberReplacer` | `best = max((sum(t[0].ft_amount for t in g) for g in by_address.values()), default=0)` | `best = max((sum(t[0].ft_amount for t in g) for g in by_address.values()), default= 1)` |  |
+| 248 | `select_ft_inputs` | `NumberReplacer` | `best = max((sum(t[0].ft_amount for t in g) for g in by_address.values()), default=0)` | `best = max((sum(t[0].ft_amount for t in g) for g in by_address.values()), default= -1)` |  |
 | 255 | `select_ft_inputs` | `NumberReplacer` | `sufficient.sort(key=lambda t: (t[0], t[1]))` | `sufficient.sort(key=lambda t: (t[0], t[ 2]))` |  |
 | 258 | `select_ft_inputs` | `ReplaceTrueWithFalse` | `group.sort(key=lambda t: t[0].ft_amount, reverse=True)` | `group.sort(key=lambda t: t[0].ft_amount, reverse=False)` |  |
 | 260 | `select_ft_inputs` | `NumberReplacer` | `selected_total = 0` | `selected_total = 1` |  |
@@ -536,7 +506,6 @@ is genuinely indistinguishable or whether nothing tests it.
 | 264 | `select_ft_inputs` | `ReplaceComparisonOperator_GtE_Gt` | `if selected_total >= amount:` | `if selected_total > amount:` |  |
 | 264 | `select_ft_inputs` | `ReplaceComparisonOperator_GtE_Is` | `if selected_total >= amount:` | `if selected_total is amount:` |  |
 | 265 | `select_ft_inputs` | `ReplaceBreakWithContinue` | `break` | `continue` |  |
-| 282 | `single_ft_signing_key` | `NumberReplacer` | `first_key = selected[0][2]` | `first_key = selected[ 1][2]` |  |
 | 282 | `single_ft_signing_key` | `NumberReplacer` | `first_key = selected[0][2]` | `first_key = selected[ -1][2]` |  |
 | 283 | `single_ft_signing_key` | `ZeroIterationForLoop` | `for _utxo, _addr, k in selected:` | `for _utxo, _addr, k in []:` |  |
 | 284 | `single_ft_signing_key` | `ReplaceComparisonOperator_NotEq_Gt` | `if k.public_key().address() != first_key.public_key().address():` | `if k.public_key().address() > first_key.public_key().address():` |  |
@@ -555,7 +524,6 @@ is genuinely indistinguishable or whether nothing tests it.
 | 297 | `find_plain_rxd_utxo` | `ReplaceBinaryOperator_BitOr_RShift` | `) -> tuple[UtxoRecord, str, PrivateKey] \| None:` | `) -> tuple[UtxoRecord, str, PrivateKey] >> None:` | `annot` |
 | 297 | `find_plain_rxd_utxo` | `ReplaceBinaryOperator_BitOr_Sub` | `) -> tuple[UtxoRecord, str, PrivateKey] \| None:` | `) -> tuple[UtxoRecord, str, PrivateKey] - None:` | `annot` |
 | 304 | `find_plain_rxd_utxo` | `ReplaceTrueWithFalse` | `for u, a, k in sorted(triples, key=lambda t: t[0].value, reverse=True):` | `for u, a, k in sorted(triples, key=lambda t: t[0].value, reverse=False):` |  |
-| 306 | `find_plain_rxd_utxo` | `ReplaceContinueWithBreak` | `continue` | `break` |  |
 | 309 | `find_plain_rxd_utxo` | `ExceptionReplacer` | `except NetworkError:` | `except CosmicRayTestingException:` |  |
 | 310 | `find_plain_rxd_utxo` | `ReplaceContinueWithBreak` | `continue` | `break` |  |
 | 312 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_GtE_Eq` | `if tx is None or u.tx_pos >= len(tx.outputs):` | `if tx is None or u.tx_pos == len(tx.outputs):` |  |
@@ -564,16 +532,16 @@ is genuinely indistinguishable or whether nothing tests it.
 | 312 | `find_plain_rxd_utxo` | `ReplaceOrWithAnd` | `if tx is None or u.tx_pos >= len(tx.outputs):` | `if tx is None and u.tx_pos >= len(tx.outputs):` |  |
 | 313 | `find_plain_rxd_utxo` | `ReplaceContinueWithBreak` | `continue` | `break` |  |
 | 315 | `find_plain_rxd_utxo` | `NumberReplacer` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23: 26] == b"\x88\xac":` |  |
-| 315 | `find_plain_rxd_utxo` | `ReplaceAndWithOr` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 or spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
 | 315 | `find_plain_rxd_utxo` | `ReplaceAndWithOr` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" or spk[23:25] == b"\x88\xac":` |  |
-| 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_GtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) >= 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
-| 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_GtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] >= b"\x88\xac":` |  |
+| 315 | `find_plain_rxd_utxo` | `ReplaceAndWithOr` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 or spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
 | 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_GtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] >= b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
-| 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_IsNot` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] is not b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
+| 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_GtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] >= b"\x88\xac":` |  |
+| 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_GtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) >= 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
 | 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_IsNot` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] is not b"\x88\xac":` |  |
-| 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_LtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) <= 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
+| 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_IsNot` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] is not b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
 | 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_LtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] <= b"\x88\xac":` |  |
 | 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_LtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) == 25 and spk[:3] <= b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
+| 315 | `find_plain_rxd_utxo` | `ReplaceComparisonOperator_Eq_LtE` | `if len(spk) == 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` | `if len(spk) <= 25 and spk[:3] == b"\x76\xa9\x14" and spk[23:25] == b"\x88\xac":` |  |
 | 323 | `ft_funding` | `ReplaceBinaryOperator_Mul_Div` | `*,` | `/,` |  |
 | 327 | `ft_funding` | `ReplaceBinaryOperator_BitOr_Add` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] \| None = None,` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] + None = None,` |  |
 | 327 | `ft_funding` | `ReplaceBinaryOperator_BitOr_BitAnd` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] \| None = None,` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] & None = None,` |  |
@@ -586,129 +554,36 @@ is genuinely indistinguishable or whether nothing tests it.
 | 327 | `ft_funding` | `ReplaceBinaryOperator_BitOr_Pow` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] \| None = None,` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] ** None = None,` |  |
 | 327 | `ft_funding` | `ReplaceBinaryOperator_BitOr_RShift` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] \| None = None,` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] >> None = None,` |  |
 | 327 | `ft_funding` | `ReplaceBinaryOperator_BitOr_Sub` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] \| None = None,` | `triples: list[tuple[UtxoRecord, str, PrivateKey]] - None = None,` |  |
-| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 2) + 50` |  |
-| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 85 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 0) + 50` |  |
+| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 51` |  |
 | 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 1) + 148 * (len(selected) + 1) + 50` |  |
 | 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 147 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 49` |  |
 | 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 149 * (len(selected) + 1) + 50` |  |
 | 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 3) + 148 * (len(selected) + 1) + 50` |  |
 | 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 83 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 51` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitAnd` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) & 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitAnd` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) & 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitAnd` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs & 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitAnd` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) & 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitOr` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) \| 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitOr` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) \| 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitOr` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) \| 50` |  |
+| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 85 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
+| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 49` |  |
+| 339 | `ft_funding` | `NumberReplacer` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 2) + 50` |  |
 | 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitOr` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs \| 2) + 148 * (len(selected) + 1) + 50` |  |
+| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitOr` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) \| 50` |  |
 | 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitXor` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs ^ 2) + 148 * (len(selected) + 1) + 50` |  |
 | 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitXor` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) ^ 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitXor` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) ^ 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_BitXor` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) ^ 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Div` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) / 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Div` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) / 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Div` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs / 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Div` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) / 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_FloorDiv` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) // 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_FloorDiv` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) // 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_FloorDiv` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) // 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_FloorDiv` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs // 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_LShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs << 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_LShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) << 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_LShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) << 148 * (len(selected) + 1) + 50` |  |
 | 339 | `ft_funding` | `ReplaceBinaryOperator_Add_LShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) << 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Mod` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) % 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Mod` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) % 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Mod` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs % 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Mod` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) % 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Mul` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) * 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Mul` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) * 50` |  |
+| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_LShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs << 2) + 148 * (len(selected) + 1) + 50` |  |
 | 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Mul` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs * 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Mul` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) * 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Pow` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) ** 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Pow` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) ** 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Pow` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs ** 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Pow` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) ** 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_RShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) >> 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_RShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs >> 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_RShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) >> 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_RShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) >> 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Sub` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) - 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Sub` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) - 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Sub` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs - 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Add_Sub` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) - 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Add` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 + (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Add` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 + (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitAnd` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 & (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitAnd` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 & (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitOr` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 \| (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitOr` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 \| (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitXor` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 ^ (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitXor` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 ^ (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Div` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 / (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Div` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 / (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_FloorDiv` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 // (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_FloorDiv` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 // (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_LShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 << (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_LShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 << (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Mod` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 % (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Mod` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 % (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Pow` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 ** (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Pow` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 ** (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_RShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 >> (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_RShift` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 >> (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Sub` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 * (n_outputs + 2) + 148 - (len(selected) + 1) + 50` |  |
-| 339 | `ft_funding` | `ReplaceBinaryOperator_Mul_Sub` | `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` | `est_bytes = 84 - (n_outputs + 2) + 148 * (len(selected) + 1) + 50` |  |
 | 340 | `ft_funding` | `NumberReplacer` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate * 3` |  |
-| 340 | `ft_funding` | `NumberReplacer` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate * 1` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Add` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes + fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Add` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate + 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitAnd` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate & 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitAnd` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes & fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitOr` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate \| 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitOr` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes \| fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitXor` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes ^ fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_BitXor` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate ^ 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Div` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate / 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Div` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes / fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_FloorDiv` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes // fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_FloorDiv` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate // 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_LShift` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes << fee_rate * 2` |  |
 | 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_LShift` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate << 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Mod` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes % fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Mod` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate % 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Pow` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate ** 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Pow` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes ** fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_RShift` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes >> fee_rate * 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_RShift` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate >> 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Sub` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes * fee_rate - 2` |  |
-| 340 | `ft_funding` | `ReplaceBinaryOperator_Mul_Sub` | `needed = est_bytes * fee_rate * 2` | `needed = est_bytes - fee_rate * 2` |  |
-| 341 | `ft_funding` | `AddNot` | `if triples is None:` | `if not triples is None:` |  |
-| 341 | `ft_funding` | `ReplaceComparisonOperator_Is_IsNot` | `if triples is None:` | `if triples is not None:` |  |
-| 349 | `ft_funding` | `AddNot` | `if fund is None:` | `if not fund is None:` |  |
-| 349 | `ft_funding` | `ReplaceComparisonOperator_Is_IsNot` | `if fund is None:` | `if fund is not None:` |  |
 | 364 | `build_ft_transfer` | `ReplaceBinaryOperator_Mul_Div` | `*,` | `/,` |  |
 | 367 | `build_ft_transfer` | `ReplaceFalseWithTrue` | `allow_overpay: bool = False,` | `allow_overpay: bool = True,` |  |
-| 382 | `build_ft_transfer` | `AddNot` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` |  |
-| 382 | `build_ft_transfer` | `NumberReplacer` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= -1:` |  |
 | 382 | `build_ft_transfer` | `NumberReplacer` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 1:` |  |
+| 382 | `build_ft_transfer` | `NumberReplacer` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= -1:` |  |
 | 382 | `build_ft_transfer` | `ReplaceComparisonOperator_LtE_Eq` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount == 0:` |  |
-| 382 | `build_ft_transfer` | `ReplaceComparisonOperator_LtE_Gt` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount > 0:` |  |
-| 382 | `build_ft_transfer` | `ReplaceComparisonOperator_LtE_GtE` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount >= 0:` |  |
 | 382 | `build_ft_transfer` | `ReplaceComparisonOperator_LtE_Lt` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount < 0:` |  |
-| 382 | `build_ft_transfer` | `ReplaceComparisonOperator_LtE_NotEq` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount != 0:` |  |
 | 382 | `build_ft_transfer` | `ReplaceOrWithAnd` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) or isinstance(amount, bool) and amount <= 0:` |  |
 | 382 | `build_ft_transfer` | `ReplaceOrWithAnd` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if not isinstance(amount, int) and isinstance(amount, bool) or amount <= 0:` |  |
-| 382 | `build_ft_transfer` | `ReplaceUnaryOperator_Delete_Not` | `if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` | `if  isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:` |  |
-| 392 | `build_ft_transfer` | `NumberReplacer` | `funding = await ft_funding(wallet, selected, n_outputs=1, fee_rate=fee_rate, client=client, triples=triples)` | `funding = await ft_funding(wallet, selected, n_outputs= 0, fee_rate=fee_rate, client=client, triples=triples)` |  |
 | 392 | `build_ft_transfer` | `NumberReplacer` | `funding = await ft_funding(wallet, selected, n_outputs=1, fee_rate=fee_rate, client=client, triples=triples)` | `funding = await ft_funding(wallet, selected, n_outputs= 2, fee_rate=fee_rate, client=client, triples=triples)` |  |
-| 396 | `build_ft_transfer` | `NumberReplacer` | `utxos=[t[0] for t in selected],` | `utxos=[t[ -1] for t in selected],` |  |
-| 396 | `build_ft_transfer` | `NumberReplacer` | `utxos=[t[0] for t in selected],` | `utxos=[t[ 1] for t in selected],` |  |
-| 405 | `build_ft_transfer` | `ExceptionReplacer` | `except (ValidationError, ValueError) as exc:` | `except (CosmicRayTestingException, ValueError) as exc:` |  |
+| 392 | `build_ft_transfer` | `NumberReplacer` | `funding = await ft_funding(wallet, selected, n_outputs=1, fee_rate=fee_rate, client=client, triples=triples)` | `funding = await ft_funding(wallet, selected, n_outputs= 0, fee_rate=fee_rate, client=client, triples=triples)` |  |
 | 405 | `build_ft_transfer` | `ExceptionReplacer` | `except (ValidationError, ValueError) as exc:` | `except (ValidationError, CosmicRayTestingException) as exc:` |  |
+| 405 | `build_ft_transfer` | `ExceptionReplacer` | `except (ValidationError, ValueError) as exc:` | `except (CosmicRayTestingException, ValueError) as exc:` |  |
 | 415 | `assert_fee_matches_size` | `ReplaceBinaryOperator_Mul_Div` | `*,` | `/,` |  |
 | 475 | `assert_fee_matches_size` | `NumberReplacer` | `allowance = (2 * SIG_SIZE_SLACK_BYTES) * max(len(tx.inputs), 1) * fee_rate + DUST_THRESHOLD_PHOTONS` | `allowance = (2 * SIG_SIZE_SLACK_BYTES) * max(len(tx.inputs), 0) * fee_rate + DUST_THRESHOLD_PHOTONS` |  |
 | 524 | `(module level)` | `ReplaceTrueWithFalse` | `@dataclass(frozen=True)` | `@dataclass(frozen=False)` |  |
@@ -744,10 +619,10 @@ is genuinely indistinguishable or whether nothing tests it.
 | 697 | `build_nft_transfer` | `ReplaceBinaryOperator_Add_Pow` | `f"(~{NFT_TRANSFER_MODELLED_BYTES + len(new_locking)} B at {fee_rate:,} photons/B). "` | `f"(~{NFT_TRANSFER_MODELLED_BYTES ** len(new_locking)} B at {fee_rate:,} photons/B). "` |  |
 | 697 | `build_nft_transfer` | `ReplaceBinaryOperator_Add_RShift` | `f"(~{NFT_TRANSFER_MODELLED_BYTES + len(new_locking)} B at {fee_rate:,} photons/B). "` | `f"(~{NFT_TRANSFER_MODELLED_BYTES >> len(new_locking)} B at {fee_rate:,} photons/B). "` |  |
 | 697 | `build_nft_transfer` | `ReplaceBinaryOperator_Add_Sub` | `f"(~{NFT_TRANSFER_MODELLED_BYTES + len(new_locking)} B at {fee_rate:,} photons/B). "` | `f"(~{NFT_TRANSFER_MODELLED_BYTES - len(new_locking)} B at {fee_rate:,} photons/B). "` |  |
-| 709 | `_shim` | `NumberReplacer` | `outs = [TransactionOutput(Script(b""), 0) for _ in range(vout)]` | `outs = [TransactionOutput(Script(b""), 1) for _ in range(vout)]` |  |
 | 709 | `_shim` | `NumberReplacer` | `outs = [TransactionOutput(Script(b""), 0) for _ in range(vout)]` | `outs = [TransactionOutput(Script(b""), -1) for _ in range(vout)]` |  |
-| 737 | `build_nft_transfer` | `NumberReplacer` | `TransactionOutput(fund_spk, 0, change=True),  # fee change back to this wallet` | `TransactionOutput(fund_spk, 1, change=True),  # fee change back to this wallet` |  |
+| 709 | `_shim` | `NumberReplacer` | `outs = [TransactionOutput(Script(b""), 0) for _ in range(vout)]` | `outs = [TransactionOutput(Script(b""), 1) for _ in range(vout)]` |  |
 | 737 | `build_nft_transfer` | `NumberReplacer` | `TransactionOutput(fund_spk, 0, change=True),  # fee change back to this wallet` | `TransactionOutput(fund_spk, -1, change=True),  # fee change back to this wallet` |  |
+| 737 | `build_nft_transfer` | `NumberReplacer` | `TransactionOutput(fund_spk, 0, change=True),  # fee change back to this wallet` | `TransactionOutput(fund_spk, 1, change=True),  # fee change back to this wallet` |  |
 | 742 | `build_nft_transfer` | `NumberReplacer` | `nft_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))  # type: ignore[no-untyped-call]` | `nft_tx.fee(SatoshisPerKilobyte(fee_rate * 1001))  # type: ignore[no-untyped-call]` |  |
 | 775 | `build_nft_transfer` | `NumberReplacer` | `` | `` |  |
 | 775 | `build_nft_transfer` | `ReplaceComparisonOperator_Gt_GtE` | `` | `` |  |
