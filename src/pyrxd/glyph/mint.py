@@ -658,11 +658,13 @@ class GlyphMinter:
         confirmation_timeout_s: how long ``reveal_*`` waits before raising
             :class:`~pyrxd.security.errors.ConfirmationTimeoutError`. The
             :class:`PendingMint` survives a timeout, so the reveal can be retried.
-        poll_interval_s: seconds between confirmation polls. The default suits a chain
-            whose blocks are minutes apart; a regtest node that mines on demand wants a
-            much smaller value, and until this was exposed there was no way to ask for
-            one — the reveal always slept the full 10s default, so `confirmation_timeout_s`
-            below that could not take effect until a whole interval had elapsed.
+        poll_interval_s: seconds between confirmation polls; must be > 0. The default
+            suits a chain whose blocks are minutes apart; a regtest node that mines on
+            demand wants a much smaller value, and until this was exposed there was no way
+            to ask for one — the reveal always slept the full 10s default, so
+            `confirmation_timeout_s` below that could not take effect until a whole interval
+            had elapsed. Zero is refused: the poll happens before the sleep, so it would
+            busy-loop the server for the whole timeout.
     """
 
     def __init__(
@@ -726,8 +728,19 @@ class GlyphMinter:
             or confirmation_timeout_s <= 0
         ):
             raise ValidationError("GlyphMinter confirmation_timeout_s must be > 0")
-        if not isinstance(poll_interval_s, (int, float)) or isinstance(poll_interval_s, bool) or poll_interval_s < 0:
-            raise ValidationError("GlyphMinter poll_interval_s must be >= 0")
+        # Strictly positive, not `>= 0`. `wait_for_confirmation` polls the server once per
+        # iteration and only THEN sleeps, so `interval_s=0` is a busy loop: measured at
+        # ~715,000 polls/second, sustained for the whole `confirmation_timeout_s` (default
+        # 1800s). That is half an hour of maximum-rate traffic at whichever ElectrumX the
+        # caller is pointed at — a self-inflicted denial of service, and a plausible way to
+        # be banned by a public server mid-mint, which strands the very commit this wait
+        # exists to protect.
+        #
+        # `wait_for_confirmation` itself still permits 0: it is the low-level primitive and
+        # has `max_iterations` to bound it. This is the knob a caller tuning for a fast local
+        # node reaches for, and 0 is never the right answer here.
+        if not isinstance(poll_interval_s, (int, float)) or isinstance(poll_interval_s, bool) or poll_interval_s <= 0:
+            raise ValidationError("GlyphMinter poll_interval_s must be > 0")
         self._client = client
         self._wallet = wallet
         self._store = store

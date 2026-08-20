@@ -1229,6 +1229,23 @@ class TestThePollIntervalReachesEveryWait:
         minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore())
         assert minter._poll_interval_s == DEFAULT_POLL_INTERVAL_S == 10.0
 
+    def test_a_zero_interval_is_refused_because_it_busy_loops(self):
+        """Zero is not "poll as fast as possible", it is a denial of service.
+
+        `wait_for_confirmation` polls the server once per iteration and only then sleeps,
+        so `interval_s=0` spins: measured at ~715,000 polls/second against a counting
+        fake, sustained for the whole `confirmation_timeout_s` — 1800s by default. Aimed
+        at a public ElectrumX that is a good way to be banned mid-mint, which strands the
+        commit the wait exists to protect.
+        """
+        with pytest.raises(ValidationError, match="poll_interval_s"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=0)
+
+    def test_a_small_positive_interval_is_still_accepted(self):
+        """The honest path the refusal must not take with it — a regtest node that mines
+        on demand genuinely wants sub-second polling."""
+        assert GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=0.001) is not None
+
     @pytest.mark.parametrize("bad", [-1, -0.001, "x", None, True])
     def test_a_bad_interval_is_refused_at_construction(self, bad):
         """Before a commit exists, not at reveal time. `wait_for_confirmation` validates
