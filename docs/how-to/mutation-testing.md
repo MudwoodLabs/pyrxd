@@ -127,6 +127,30 @@ Two constraints shape the value-group lists specifically:
   than a nicety. Before adding a group, time its list first: if it is far off the ~1-3s the others
   run in, find out why before writing the group.
 
+### Verifying one mutant by hand — clear the bytecode cache
+
+The loop for proving a new test actually kills something is: plant the defect, run the
+suite, confirm RED, restore, confirm GREEN. Restoring with `cp` (or any write that keeps
+the file the same size within the same second) can leave Python serving the **cached
+bytecode of the mutant** — CPython invalidates a `.pyc` on mtime and size, and a
+same-length edit defeats both.
+
+It is not hypothetical: swapping `if n <= 75:` for `if n <= 74:` in `glyph/payload.py` and
+restoring produced a "failure" on clean source that took several minutes to chase, because
+the interpreter was still running the mutant. Same-length numeric and operator edits are
+exactly the mutations cosmic-ray generates most.
+
+So between plant and run, and again between restore and re-run:
+
+```bash
+find src -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
+```
+
+`scripts/mutation_test.sh` is not affected — it restores with `git checkout --`, and each
+cosmic-ray mutant runs in a fresh subprocess against a freshly written file — but the
+manual loop is, and a false SURVIVED reads as "my test is worthless" while a false KILLED
+reads as "my test works". Both are worse than no measurement.
+
 ## Baseline results — mint (2026-08)
 
 First sweep of the group, at 0.19.0 + the `poll_interval_s` fix. 1,644 mutants, 2.6s clean

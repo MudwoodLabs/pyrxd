@@ -1303,3 +1303,92 @@ class TestGlyphScriptShapeGuardsCheckEveryClause:
         corrupt[25] ^= 0xFF  # right length, wrong opcode -> only the regex can catch it
         with pytest.raises(ValidationError):
             extract_owner_pkh_from_ft_script(bytes(corrupt))
+
+
+class TestMutableScriptsigPushEncodingAtItsBoundaries:
+    """Kills the `_push_bytes` survivors in ``pyrxd.glyph.payload``.
+
+    `build_mutable_scriptsig` pushes the CBOR payload with a nested `_push_bytes`, which
+    picks the opcode by length: a bare length byte up to 75, `OP_PUSHDATA1` (0x4C) to 255,
+    `OP_PUSHDATA2` (0x4D, little-endian length) to 65535. The corrected `glyphscript` sweep
+    left 66 survivors across those four lines.
+
+    They were *executed* — a modest NFT's CBOR is 186 bytes, well past the first boundary —
+    but nothing asserted the resulting bytes, so swapping the opcode or the length width
+    went unnoticed. A wrong push makes a scriptSig the interpreter reads as a different
+    script, and the reveal is the only thing that can ever spend the commit output.
+
+    Sibling note: `_push_minimal_int` has surviving mutants on the *same-looking* branches,
+    and they are NOT the same case. Its condition is on the byte-length of an encoded
+    integer, so reaching `length >= 0x4C` needs n >= 2**608. Those are unreachable, not
+    untested, and no test should pretend otherwise.
+    """
+
+    @staticmethod
+    def _sig_for(cbor: bytes) -> bytes:
+        from pyrxd.glyph.payload import build_mutable_scriptsig
+
+        return build_mutable_scriptsig("mod", cbor, 0, 0, 0, 0)
+
+    @classmethod
+    def _scriptsig(cls, payload_len: int) -> bytes:
+        return cls._sig_for(b"\x5a" * payload_len)
+
+    @staticmethod
+    def _find(hay: bytes, needle: bytes) -> int:
+        i = hay.find(needle)
+        assert i != -1, "the payload push is not in the scriptsig at all"
+        return i
+
+    def test_a_short_payload_uses_a_bare_length_byte(self) -> None:
+        """75 is the last bare-length push.
+
+        Asserting only `sig[i-1] == 75` is not enough and a planted mutant proved it: the
+        length byte is 75 under BOTH encodings, so shifting the boundary to `n <= 74` sends
+        this payload down the PUSHDATA1 branch and the assertion still passes. The bare
+        form has to be asserted by its ABSENCE of an opcode prefix.
+        """
+        body = b"\x5a" * 75
+        sig = self._scriptsig(75)
+        assert bytes([75]) + body in sig
+        assert b"\x4c" + bytes([75]) + body not in sig, "75 bytes must not use PUSHDATA1"
+
+    def test_crossing_75_switches_to_pushdata1(self) -> None:
+        """The boundary itself: 75 is bare, 76 is OP_PUSHDATA1."""
+        body = b"\x5a" * 76
+        sig = self._scriptsig(76)
+        i = self._find(sig, body)
+        assert sig[i - 2 : i] == b"\x4c\x4c", f"expected OP_PUSHDATA1 + length 76, got {sig[i - 2 : i].hex()}"
+
+    def test_a_255_byte_payload_still_uses_pushdata1(self) -> None:
+        sig = self._scriptsig(255)
+        i = self._find(sig, b"\x5a" * 255)
+        assert sig[i - 2 : i] == b"\x4c\xff"
+
+    def test_crossing_255_switches_to_pushdata2_little_endian(self) -> None:
+        """256 needs OP_PUSHDATA2 and a two-byte LITTLE-endian length. Byte order is the
+        half a round-trip test cannot see: encode and decode agree either way."""
+        sig = self._scriptsig(256)
+        i = self._find(sig, b"\x5a" * 256)
+        assert sig[i - 3 : i] == b"\x4d\x00\x01", (
+            f"expected OP_PUSHDATA2 + 0x0100 little-endian, got {sig[i - 3 : i].hex()}"
+        )
+
+    def test_a_real_metadata_payload_lands_on_pushdata1(self) -> None:
+        """Not a synthetic length — the shape an ordinary mint actually produces."""
+        from pyrxd.glyph.payload import encode_payload
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+
+        cbor, _ = encode_payload(
+            GlyphMetadata(protocol=[GlyphProtocol.NFT], name="x" * 40, description="y" * 120, token_type="t")
+        )
+        assert 76 <= len(cbor) <= 255, f"fixture drifted out of the PUSHDATA1 band: {len(cbor)}"
+        sig = self._sig_for(cbor)
+        i = self._find(sig, cbor)
+        assert sig[i - 2 : i] == bytes([0x4C, len(cbor)])
+
+    def test_an_oversized_payload_is_refused(self) -> None:
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError):
+            self._scriptsig(65536)
