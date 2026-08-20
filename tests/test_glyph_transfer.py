@@ -14,6 +14,7 @@ from pyrxd.glyph.script import (
 )
 from pyrxd.glyph.types import GlyphRef
 from pyrxd.keys import PrivateKey
+from pyrxd.network.electrumx import UtxoRecord
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20, Txid
 from pyrxd.transaction.transaction import Transaction
@@ -343,3 +344,155 @@ class TestTransferParamsDefaults:
             private_key=_alice_private_key(),
         )
         assert params.fee_rate == 10_000
+
+
+class TestTheFeeEstimateThatPicksTheFundingUtxo:
+    """`ft_funding`'s estimate decides which plain-RXD UTXO is big enough to pay the fee,
+    and mutation testing found it completely unpinned.
+
+    Two lines — `est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50` and
+    `needed = est_bytes * fee_rate * 2` — carried **100 surviving mutants** in the first
+    `mint`-group sweep. Every constant and operator in them could be changed and no test
+    noticed. `needed` is not a diagnostic: it is passed to `find_plain_rxd_utxo`, which
+    skips any UTXO with `u.value < needed`, so shrinking it selects a UTXO that cannot
+    cover the real fee. Radiant has neither RBF nor CPFP, so an under-funded build either
+    fails late or holds its inputs until mempool expiry.
+
+    These tests pin the PROPERTY the docstring claims — "deliberately generous" — rather
+    than the constants. Restating the formula would be tautological: it would pass for any
+    formula, including a mutated one.
+    """
+
+    REF = GlyphRef(txid="ab" * 32, vout=0)
+
+    @staticmethod
+    def _wallet_and_client(fund_value: int):
+        """One FT holding of the target token, plus one plain-RXD UTXO of `fund_value`."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.script.script import Script
+        from pyrxd.script.type import P2PKH
+        from pyrxd.transaction.transaction import Transaction
+        from pyrxd.transaction.transaction_output import TransactionOutput
+
+        key = PrivateKey()
+        pkh = Hex20(key.public_key().hash160())
+        ref = TestTheFeeEstimateThatPicksTheFundingUtxo.REF
+
+        def _src(spk: bytes, value: int) -> bytes:
+            return Transaction(tx_inputs=[], tx_outputs=[TransactionOutput(Script(spk), value)]).serialize()
+
+        ft_spk = build_ft_locking_script(pkh, ref)
+        rxd_spk = P2PKH().lock(key.address()).serialize()
+        ft_utxo = UtxoRecord(tx_hash="bb" * 32, tx_pos=0, value=50_000_000, height=100)
+        rxd_utxo = UtxoRecord(tx_hash="cc" * 32, tx_pos=0, value=fund_value, height=100)
+
+        txmap = {"bb" * 32: _src(ft_spk, 50_000_000), "cc" * 32: _src(rxd_spk, fund_value)}
+        client = MagicMock()
+        client.get_utxos = AsyncMock(return_value=[ft_utxo, rxd_utxo])
+        client.get_transaction = AsyncMock(side_effect=lambda t: txmap[str(t)])
+
+        wallet = MagicMock()
+        wallet.collect_spendable = AsyncMock(
+            return_value=[(ft_utxo, key.address(), key), (rxd_utxo, key.address(), key)]
+        )
+        return wallet, client, key, pkh
+
+    def _threshold(self, fee_rate: int, n_outputs: int) -> int:
+        """The smallest funding UTXO `ft_funding` will accept — found by probing, not by
+        restating the formula it is meant to check."""
+        import asyncio
+
+        from pyrxd.glyph.transfer import ft_funding
+        from pyrxd.security.errors import InsufficientFundsError
+
+        def _accepts(value: int) -> bool:
+            wallet, client, key, pkh = self._wallet_and_client(value)
+            selected = [(_FtStub(pkh), key.address(), key)]
+            try:
+                asyncio.run(ft_funding(wallet, selected, n_outputs=n_outputs, fee_rate=fee_rate, client=client))
+                return True
+            except InsufficientFundsError:
+                return False
+
+        lo, hi = 1, 1_000_000_000
+        assert _accepts(hi), "the probe's upper bound is too low to bracket the threshold"
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _accepts(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    def _real_fee(self, fee_rate: int) -> int:
+        """What a real, signed transfer of this shape actually pays.
+
+        The yardstick has to come from a built transaction. An earlier version of these
+        tests bounded the threshold with a hand-rolled byte count, which was loose enough
+        that removing the documented 2x headroom entirely still passed.
+        """
+        import asyncio
+
+        from pyrxd.glyph.transfer import build_ft_transfer
+
+        wallet, client, _key, _pkh = self._wallet_and_client(500_000_000)
+        build = asyncio.run(
+            build_ft_transfer(
+                wallet,
+                self.REF,
+                250,
+                Hex20(PrivateKey().public_key().hash160()),
+                client=client,
+                fee_rate=fee_rate,
+            )
+        )
+        return build.fee
+
+    def test_the_estimate_keeps_the_headroom_its_docstring_promises(self) -> None:
+        """The dangerous direction, pinned to the documented property.
+
+        The docstring says the byte estimate is "then doubled for headroom", and that
+        doubling is the whole defence: below the real fee, `find_plain_rxd_utxo` hands back
+        a UTXO that cannot pay it, and on Radiant that cannot be repaired. Measured here at
+        2.33x — comfortably above 2x, because the byte estimate is itself generous.
+        """
+        fee_rate = 10_000
+        threshold = self._threshold(fee_rate, 1)
+        real_fee = self._real_fee(fee_rate)
+        assert threshold >= 2 * real_fee, (
+            f"threshold {threshold:,} is under 2x the {real_fee:,} a real transfer pays "
+            f"({threshold / real_fee:.2f}x) — the documented headroom is gone"
+        )
+
+    def test_the_estimate_is_generous_but_not_absurd(self) -> None:
+        """The other direction. An estimate inflated far past the real fee is a guard that
+        refuses honest funding — the failure mode this project keeps rediscovering."""
+        fee_rate = 10_000
+        threshold = self._threshold(fee_rate, 1)
+        real_fee = self._real_fee(fee_rate)
+        assert threshold <= 6 * real_fee, (
+            f"threshold {threshold:,} is more than 6x the {real_fee:,} a real transfer "
+            "pays; that refuses funding UTXOs that would comfortably have worked"
+        )
+
+    def test_the_threshold_scales_with_the_output_count(self) -> None:
+        """`n_outputs` must actually reach the estimate. A mutant that drops the term
+        leaves an airdrop to 100 recipients demanding what a 1-recipient transfer does."""
+        fee_rate = 10_000
+        assert self._threshold(fee_rate, 20) > self._threshold(fee_rate, 1)
+
+    def test_the_threshold_scales_with_the_fee_rate(self) -> None:
+        assert self._threshold(20_000, 1) > self._threshold(10_000, 1)
+
+
+class _FtStub:
+    """The minimal shape `ft_funding` reads off a selected FT utxo."""
+
+    def __init__(self, pkh) -> None:
+        self.txid = "bb" * 32
+        self.vout = 0
+        self.value = 50_000_000
+        self.ft_amount = 1_000
+        self.pkh = pkh

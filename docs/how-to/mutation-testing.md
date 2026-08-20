@@ -127,6 +127,41 @@ Two constraints shape the value-group lists specifically:
   than a nicety. Before adding a group, time its list first: if it is far off the ~1-3s the others
   run in, find out why before writing the group.
 
+## Baseline results — mint (2026-08)
+
+First sweep of the group, at 0.19.0 + the `poll_interval_s` fix. 1,644 mutants, 2.6s clean
+suite, ~40 minutes.
+
+| Module | Mutants | Killed | Survived | Killed | …of which unkillable | Logic survivors |
+|---|---|---|---|---|---|---|
+| `glyph/mint.py` | 804 | 477 | 327 | 59% | 187 annot + 9 signature | **131** |
+| `glyph/transfer.py` | 582 | 302 | 280 | 52% | 55 annot + 5 signature | **220** |
+| `glyph/client.py` | 258 | 137 | 121 | 53% | 99 annot + 11 signature | **11** |
+| **total** | **1644** | **916** | **728** | **56%** | 341 annot + 25 signature | **362** |
+
+The raw percentage understates the state of `client.py` badly: 99 of its 121 survivors are
+BitOr rewrites of type annotations, so its effective rate against *killable* mutants is 86%.
+`mint.py` is 77% on the same basis. `transfer.py` is the outlier at **55%** — the newest of
+the three, holding the FT/NFT fee guards, and never mutated before this run.
+
+**104 of `transfer.py`'s 220 logic survivors sat on two lines**, the fee estimate inside
+`ft_funding`:
+
+```python
+est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50
+needed = est_bytes * fee_rate * 2
+```
+
+`needed` is not a diagnostic — it is passed to `find_plain_rxd_utxo`, which skips any UTXO
+with `value < needed`. Every constant and operator there could be changed and nothing
+noticed, including removing the 2x headroom the docstring promises. The killer tests are in
+`tests/test_glyph_transfer.py::TestTheFeeEstimateThatPicksTheFundingUtxo`; they pin the
+*property* ("deliberately generous", measured at 2.33x a real transfer's fee) rather than
+the constants, because restating the formula would pass for any formula including a mutated
+one. A first version bounded the threshold with a hand-rolled byte count and was loose
+enough that deleting the headroom entirely still passed — worth knowing before writing the
+next one of these.
+
 ## Baseline results — spv (2026-06)
 
 | Module | Mutants | Killed | Survived | Killed |

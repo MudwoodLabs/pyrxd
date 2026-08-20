@@ -7,6 +7,7 @@ fee
 wallet
 hdwallet
 glyph
+mint
 swap
 coordinator
 network
