@@ -22,7 +22,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..fee_sizing import assert_fee_rate_clears_relay_floor
-from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S
+from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, DEFAULT_POLL_INTERVAL_S
 from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Hex20
 from .builder import MIN_FEE_RATE
@@ -180,6 +180,9 @@ class GlyphClient:
             the FT/NFT asymmetry that caused a release blocker on this very surface.
         min_confirmations: depth required on a mint's commit before its reveal.
         confirmation_timeout_s: how long a reveal waits for the commit.
+        poll_interval_s: seconds between confirmation polls, forwarded to
+            :class:`~pyrxd.glyph.mint.GlyphMinter`. Lower it for a chain that mines on
+            demand; the default suits minutes-apart blocks.
     """
 
     def __init__(
@@ -192,6 +195,7 @@ class GlyphClient:
         allow_below_relay_floor: bool = False,
         min_confirmations: int = DEFAULT_MINT_CONFIRMATIONS,
         confirmation_timeout_s: float = DEFAULT_CONFIRMATION_TIMEOUT_S,
+        poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     ) -> None:
         if store is not None and not isinstance(store, PendingStore):
             raise ValidationError(
@@ -234,6 +238,7 @@ class GlyphClient:
         self._allow_below_relay_floor = allow_below_relay_floor
         self._min_confirmations = min_confirmations
         self._confirmation_timeout_s = confirmation_timeout_s
+        self._poll_interval_s = poll_interval_s
         self._minter: GlyphMinter | None = None
 
     # -- minting (delegated to GlyphMinter, unchanged) ----------------------
@@ -263,6 +268,7 @@ class GlyphClient:
                 allow_below_relay_floor=self._allow_below_relay_floor,
                 min_confirmations=self._min_confirmations,
                 confirmation_timeout_s=self._confirmation_timeout_s,
+                poll_interval_s=self._poll_interval_s,
             )
         return self._minter
 

@@ -750,6 +750,7 @@ class TestRevealPhase:
             RecordingStore(),
             min_confirmations=6,
             confirmation_timeout_s=0.001,
+            poll_interval_s=0.001,
         )
         pending = await minter.commit_nft(_nft_metadata())
         with pytest.raises(ConfirmationTimeoutError):
@@ -898,6 +899,7 @@ class TestTheRecordOutlivesTheBroadcast:
             FakeWallet(_key()),
             store,
             confirmation_timeout_s=0.2,
+            poll_interval_s=0.001,
         )
         pending = await minter.commit_nft(_nft_metadata())
         assert store.load(pending.commit_txid) is not None
@@ -971,7 +973,7 @@ class TestRevealRateAndEchoGuards:
         """
         store = RecordingStore()
         client = self._lying_client()
-        minter = GlyphMinter(client, FakeWallet(_key()), store, confirmation_timeout_s=0.2)
+        minter = GlyphMinter(client, FakeWallet(_key()), store, confirmation_timeout_s=0.2, poll_interval_s=0.001)
         pending = await minter.commit_nft(_nft_metadata())
 
         with pytest.warns(UserWarning, match="echoed txid"):
@@ -1180,3 +1182,63 @@ class TestTheRevealsFundingRefusalIsTyped:
 
         with pytest.raises(ValidationError, match="fee-sizing invariant"):
             asyncio.run(minter.reveal_nft(overpriced, allow_overpay=True))
+
+
+class TestThePollIntervalReachesEveryWait:
+    """`_reveal` waits twice — once on the commit, once on the reveal before deleting the
+    record — and the poll interval has to reach both.
+
+    Until it was exposed, neither wait was given one, so both slept the 10s default. A
+    `confirmation_timeout_s` below that could not take effect until a whole interval had
+    elapsed: three tests here set timeouts of 0.001s and 0.2s and each still took 10.01s.
+    Forwarding it to only the first wait fixed one of the three and left the file at 20s,
+    which is why this asserts on **both** call sites rather than on total elapsed time.
+    """
+
+    @staticmethod
+    def _spy():
+        """Record the interval each `wait_for_confirmation` call was given."""
+        import pyrxd.glyph.mint as mint_mod
+
+        seen: list[float | None] = []
+        real = mint_mod.wait_for_confirmation
+
+        async def _spy_wait(*args, **kwargs):
+            seen.append(kwargs.get("interval_s"))
+            return await real(*args, **kwargs)
+
+        return seen, real, _spy_wait
+
+    def test_both_waits_receive_the_configured_interval(self, monkeypatch):
+        import pyrxd.glyph.mint as mint_mod
+
+        seen, _real, spy = self._spy()
+        monkeypatch.setattr(mint_mod, "wait_for_confirmation", spy)
+
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=0.001)
+        assert asyncio.run(minter.mint_nft(_nft_metadata())).reveal_txid
+
+        assert len(seen) == 2, f"expected a commit wait and a reveal wait, saw {len(seen)}"
+        assert seen == [0.001, 0.001], f"a wait did not get the interval: {seen}"
+
+    def test_the_default_is_unchanged_for_callers_who_say_nothing(self):
+        """The fix must not quietly re-tune production. A 10s poll is well inside a
+        Radiant block; only a chain that mines on demand wants less."""
+        from pyrxd.network.confirm import DEFAULT_POLL_INTERVAL_S
+
+        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore())
+        assert minter._poll_interval_s == DEFAULT_POLL_INTERVAL_S == 10.0
+
+    @pytest.mark.parametrize("bad", [-1, -0.001, "x", None, True])
+    def test_a_bad_interval_is_refused_at_construction(self, bad):
+        """Before a commit exists, not at reveal time. `wait_for_confirmation` validates
+        this too, but only once the commit is already on chain as a hashlock with no
+        owner-only spend path — the trap this constructor exists to close."""
+        with pytest.raises(ValidationError, match="poll_interval_s"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=bad)
+
+    @pytest.mark.parametrize("bad", [0, -1, "x", True])
+    def test_a_bad_confirmation_timeout_is_refused_at_construction(self, bad):
+        """Same trap, same parameter family — it shared the defect and the fix."""
+        with pytest.raises(ValidationError, match="confirmation_timeout_s"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), confirmation_timeout_s=bad)

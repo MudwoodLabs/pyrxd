@@ -4,6 +4,31 @@ All notable changes to pyrxd are documented here. Format based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); this project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `poll_interval_s` on `GlyphMinter` and `GlyphClient` — seconds between confirmation
+  polls, forwarded to both of the reveal's waits. The default is unchanged at 10s, which
+  suits a chain whose blocks are minutes apart; a regtest node that mines on demand wants
+  a much smaller value and previously had no way to ask for one. Until this was exposed,
+  `confirmation_timeout_s` could not take effect below 10s at all: the wait sleeps a full
+  poll interval before re-checking the deadline, so a 0.001s timeout still cost 10s.
+
+### Changed
+
+- `GlyphMinter` now validates `confirmation_timeout_s` and `poll_interval_s` at
+  construction. `wait_for_confirmation` already validated both, but only at reveal time —
+  after the commit is broadcast, which leaves the caller holding a hashlock with no
+  owner-only spend path. This is the same "refuses after the irreversible action" trap the
+  constructor already closes for `fee_rate`.
+
+### Performance
+
+- The offline test suite runs **147.8s, down from 175s** (measured, same machine). Three
+  tests in `test_glyph_mint_facade.py` each cost 10.01s waiting out a poll interval they
+  had no way to shorten — 30s of a 30.5s file, on every run of every Python job.
+
 ## [0.19.0] — 2026-08-19
 
 ### Upgrade notes

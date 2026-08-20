@@ -86,7 +86,7 @@ from typing import Any, ClassVar
 from ..constants import DUST_THRESHOLD_PHOTONS
 from ..fee_models import SatoshisPerKilobyte
 from ..fee_sizing import assert_fee_rate_clears_relay_floor, assert_pays_for_its_size
-from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, wait_for_confirmation
+from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, DEFAULT_POLL_INTERVAL_S, wait_for_confirmation
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata, to_unlock_script_template
 from ..security.errors import InsufficientFundsError, RxdSdkError, ValidationError
@@ -658,6 +658,11 @@ class GlyphMinter:
         confirmation_timeout_s: how long ``reveal_*`` waits before raising
             :class:`~pyrxd.security.errors.ConfirmationTimeoutError`. The
             :class:`PendingMint` survives a timeout, so the reveal can be retried.
+        poll_interval_s: seconds between confirmation polls. The default suits a chain
+            whose blocks are minutes apart; a regtest node that mines on demand wants a
+            much smaller value, and until this was exposed there was no way to ask for
+            one — the reveal always slept the full 10s default, so `confirmation_timeout_s`
+            below that could not take effect until a whole interval had elapsed.
     """
 
     def __init__(
@@ -670,6 +675,7 @@ class GlyphMinter:
         allow_below_relay_floor: bool = False,
         min_confirmations: int = DEFAULT_MINT_CONFIRMATIONS,
         confirmation_timeout_s: float = DEFAULT_CONFIRMATION_TIMEOUT_S,
+        poll_interval_s: float = DEFAULT_POLL_INTERVAL_S,
     ) -> None:
         if not isinstance(store, PendingStore):
             raise ValidationError(
@@ -708,6 +714,20 @@ class GlyphMinter:
         )
         if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 1:
             raise ValidationError("GlyphMinter min_confirmations must be an int >= 1")
+        # Judge the wait parameters HERE too, for the reason the fee rate is judged here:
+        # `wait_for_confirmation` validates both, but it does so at REVEAL time — after the
+        # commit has been broadcast. A caller who passed `poll_interval_s=-1` would learn
+        # about it holding an on-chain hashlock with no owner-only spend path, which is the
+        # same "refuses after the irreversible action" trap this constructor already exists
+        # to close for `fee_rate`.
+        if (
+            not isinstance(confirmation_timeout_s, (int, float))
+            or isinstance(confirmation_timeout_s, bool)
+            or confirmation_timeout_s <= 0
+        ):
+            raise ValidationError("GlyphMinter confirmation_timeout_s must be > 0")
+        if not isinstance(poll_interval_s, (int, float)) or isinstance(poll_interval_s, bool) or poll_interval_s < 0:
+            raise ValidationError("GlyphMinter poll_interval_s must be >= 0")
         self._client = client
         self._wallet = wallet
         self._store = store
@@ -715,6 +735,7 @@ class GlyphMinter:
         self._allow_below_relay_floor = allow_below_relay_floor
         self._min_confirmations = min_confirmations
         self._confirmation_timeout_s = confirmation_timeout_s
+        self._poll_interval_s = poll_interval_s
         self._builder = GlyphBuilder()
 
     @property
@@ -1077,6 +1098,7 @@ class GlyphMinter:
             pending.commit_txid,
             min_confirmations=self._min_confirmations,
             timeout_s=self._confirmation_timeout_s,
+            interval_s=self._poll_interval_s,
         )
 
         locking = P2PKH().lock(pending.funding_address)
@@ -1187,6 +1209,7 @@ class GlyphMinter:
             str(reveal_txid),
             min_confirmations=1,
             timeout_s=self._confirmation_timeout_s,
+            interval_s=self._poll_interval_s,
         )
         self._delete_record_and_any_duplicate(pending)
         return MintResult(
