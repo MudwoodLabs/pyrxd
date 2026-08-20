@@ -1185,3 +1185,121 @@ class TestSignValidation:
         tx = Transaction(tx_inputs=[_in()], tx_outputs=[_out(_P2PKH_AA, None)])
         with pytest.raises(ValueError, match="missing an amount"):
             tx.sign()
+
+
+class TestGlyphScriptShapeGuardsCheckEveryClause:
+    """Kills the compound-guard survivors in ``pyrxd.glyph.script``.
+
+    The parsers reject malformed scripts with one multi-clause condition, e.g.
+
+        if len(script) != 75 or script[25] != 0xBD or script[26] != 0xD0:
+
+    Mutating a single clause survives, because the other clauses still reject whatever
+    malformed input the suite happened to use. The first `glyphscript` sweep left 56 logic
+    survivors in the module and 25 of them sat on four such lines — the module scored 88%
+    overall precisely because these were the part nothing reached.
+
+    Killing them needs one case per clause: a script that is valid in every respect EXCEPT
+    the byte that clause checks. `extract_ref_from_ft_script` is the one that matters most —
+    `select_ft_inputs` uses it to verify a candidate UTXO really holds the token being
+    spent, rather than trusting an index or a cached balance, so a guard that has gone
+    permissive is the difference between checking a holding and assuming one.
+    """
+
+    @staticmethod
+    def _ft_script() -> bytes:
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20
+
+        return build_ft_locking_script(Hex20(b"\x11" * 20), GlyphRef(txid="ab" * 32, vout=0))
+
+    @staticmethod
+    def _nft_script() -> bytes:
+        from pyrxd.glyph.script import build_nft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20
+
+        return build_nft_locking_script(Hex20(b"\x22" * 20), GlyphRef(txid="cd" * 32, vout=1))
+
+    def test_the_valid_ft_script_is_accepted(self) -> None:
+        """Pair every refusal with the honest path, or the guard could reject everything
+        and still look green."""
+        from pyrxd.glyph.script import extract_ref_from_ft_script
+
+        ref = extract_ref_from_ft_script(self._ft_script())
+        assert ref.txid == "ab" * 32 and ref.vout == 0
+
+    @pytest.mark.parametrize("offset", [25, 26])
+    def test_each_checked_ft_opcode_byte_is_enforced(self, offset: int) -> None:
+        """One case per clause of `len != 75 or script[25] != 0xBD or script[26] != 0xD0`."""
+        from pyrxd.glyph.script import extract_ref_from_ft_script
+        from pyrxd.security.errors import ValidationError
+
+        corrupt = bytearray(self._ft_script())
+        corrupt[offset] ^= 0xFF
+        with pytest.raises(ValidationError):
+            extract_ref_from_ft_script(bytes(corrupt))
+
+    @pytest.mark.parametrize("delta", [-1, 1])
+    def test_the_ft_length_clause_is_enforced(self, delta: int) -> None:
+        from pyrxd.glyph.script import extract_ref_from_ft_script
+        from pyrxd.security.errors import ValidationError
+
+        s = self._ft_script()
+        wrong = s[:-1] if delta < 0 else s + b"\x00"
+        with pytest.raises(ValidationError):
+            extract_ref_from_ft_script(wrong)
+
+    @pytest.mark.parametrize(
+        "fn_name, expected",
+        [("extract_owner_pkh_from_nft_script", b"\x22" * 20), ("extract_ref_from_nft_script", None)],
+    )
+    def test_both_nft_extractors_check_the_marker_byte(self, fn_name: str, expected) -> None:
+        """`extract_ref_from_nft_script` and `extract_owner_pkh_from_nft_script` carry the
+        SAME guard, `len(script) != 63 or script[0] != 0xD8`, eighteen lines apart.
+
+        Testing one leaves the other's clause unpinned — verified: dropping the marker
+        clause from line 359 failed this class, dropping it from line 345 did not. Same
+        "fixed one, missed its sibling" shape as the two refusals in `build_nft_transfer`.
+        """
+        import pyrxd.glyph.script as gs
+        from pyrxd.security.errors import ValidationError
+
+        fn = getattr(gs, fn_name)
+        good = self._nft_script()
+        got = fn(good)
+        if expected is not None:
+            assert got == expected
+
+        corrupt = bytearray(good)
+        corrupt[0] ^= 0xFF
+        with pytest.raises(ValidationError):
+            fn(bytes(corrupt))
+
+    def test_the_nft_owner_guard_checks_its_marker_byte(self) -> None:
+        """`len(script) != 63 or script[0] != 0xD8` — the marker clause alone."""
+        from pyrxd.glyph.script import extract_owner_pkh_from_nft_script
+        from pyrxd.security.errors import ValidationError
+
+        good = self._nft_script()
+        assert extract_owner_pkh_from_nft_script(good) == bytes(b"\x22" * 20)
+
+        corrupt = bytearray(good)
+        corrupt[0] ^= 0xFF
+        with pytest.raises(ValidationError):
+            extract_owner_pkh_from_nft_script(bytes(corrupt))
+
+    def test_the_ft_owner_guard_checks_its_regex_clause(self) -> None:
+        """`len(script) != 75 or not FT_SCRIPT_RE.match(...)` — the regex clause alone,
+        reached with a script of the right length whose body is wrong."""
+        from pyrxd.glyph.script import extract_owner_pkh_from_ft_script
+        from pyrxd.security.errors import ValidationError
+
+        good = self._ft_script()
+        assert extract_owner_pkh_from_ft_script(good) == bytes(b"\x11" * 20)
+
+        corrupt = bytearray(good)
+        corrupt[25] ^= 0xFF  # right length, wrong opcode -> only the regex can catch it
+        with pytest.raises(ValidationError):
+            extract_owner_pkh_from_ft_script(bytes(corrupt))
