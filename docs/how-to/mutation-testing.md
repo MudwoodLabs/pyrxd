@@ -127,6 +127,27 @@ Two constraints shape the value-group lists specifically:
   than a nicety. Before adding a group, time its list first: if it is far off the ~1-3s the others
   run in, find out why before writing the group.
 
+### A third equivalent-mutant class: BitOr on OS flag constants
+
+The catalogued equivalents are type annotations, error-message f-strings and
+interpreter-detail rewrites. Add flag arithmetic.
+
+`JsonFilePendingStore.save` opens with `os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_CLOEXEC`,
+and `_fsync_dir` with `os.O_RDONLY | O_CLOEXEC`. Those constants are **pairwise disjoint**
+bits, so `|`, `+` and `^` produce the identical value — every BitOr_Add and BitOr_BitXor
+mutant on such a line is equivalent by construction.
+
+`_fsync_dir` is the extreme case: `os.O_RDONLY` is **0**, so `0 op O_CLOEXEC` is 0 or
+524288 (or -524288) for every operator cosmic-ray substitutes, and `os.open` on a directory
+succeeds with all of them — the only casualty is close-on-exec, which has no observable
+in-process effect. 12 of its 13 mutants survive and **none of them is killable**. The one
+that dies does so because `/` yields a float and `os.open` rejects it.
+
+Across the mint and glyphscript sweeps this class accounts for 22 survivors that would
+otherwise read as untested durability code. Recognising it matters because the surrounding
+code — atomic write, fsync, `0o600` — genuinely is fund-critical, so the temptation is to
+write a test. There is nothing there to test.
+
 ### Verifying one mutant by hand — clear the bytecode cache
 
 The loop for proving a new test actually kills something is: plant the defect, run the

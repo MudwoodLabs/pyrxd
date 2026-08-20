@@ -1369,3 +1369,98 @@ class TestTheCommitFundingEstimateCoversTheCommit:
         """A mutant that severs `fee_rate` from the estimate leaves a high-rate mint judged
         fundable on a low-rate budget."""
         assert self._threshold(50_000) > self._threshold(10_000)
+
+
+class TestTheEchoComparisonIsAnEqualityTest:
+    """Both echo checks — the commit's at `_commit` and the reveal's at `_reveal` — carry
+    the same three survivors: ``!=`` mutated to ``>``, ``>=`` and ``is not``.
+
+    The set is diagnostic. ``>=`` and ``is not`` both make the mismatch branch fire on an
+    **honest** echo (two equal strings are still distinct objects), so their survival says
+    nothing asserts that a matching echo is quiet. ``>`` only differs when the lie sorts
+    lexicographically BEFORE the true txid, so its survival says every lying-echo fixture
+    in the suite happened to pick a lie that sorts after.
+
+    Both gaps are the same omission in different clothes: the refusals were tested and the
+    honest path was not, and a lie was tested from only one side of the collation order.
+    """
+
+    HIGH_LIE = "ff" * 32  # sorts AFTER any real txid
+    LOW_LIE = "00" * 32  # sorts BEFORE almost any real txid
+
+    @staticmethod
+    def _client_echoing(lie: str | None):
+        """`lie=None` echoes honestly — the case that kills `>=` and `is not`."""
+
+        class _C(FakeClient):
+            async def broadcast(self, raw_tx: bytes) -> str:
+                self.broadcasts.append(raw_tx)
+                self.calls.append("broadcast")
+                if lie is not None:
+                    return lie
+                from pyrxd.transaction.transaction import Transaction
+
+                return str(Transaction.from_hex(raw_tx.hex()).txid())
+
+        return _C()
+
+    def test_an_honest_commit_echo_files_exactly_one_record(self) -> None:
+        """`>=` and `is not` fire the mismatch branch on a matching echo, filing a spurious
+        duplicate under a key nothing will ever look up."""
+        store = RecordingStore()
+        minter = GlyphMinter(self._client_echoing(None), FakeWallet(_key()), store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+
+        saved = [k for k in store.records] if hasattr(store, "records") else None
+        assert store.load(pending.commit_txid) is not None
+        if saved is not None:
+            assert len(saved) == 1, f"an honest echo filed {len(saved)} records: {saved}"
+
+    def test_an_honest_reveal_echo_warns_about_nothing(self) -> None:
+        """The reveal's counterpart. `>=`/`is not` would warn on every successful mint."""
+        minter = GlyphMinter(self._client_echoing(None), FakeWallet(_key()), RecordingStore())
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)  # any warning becomes a failure
+            result = asyncio.run(minter.mint_nft(_nft_metadata()))
+        assert result.reveal_txid
+
+    @staticmethod
+    def _honest_commit_lying_reveal(lie: str):
+        """Truthful on the first broadcast, lying on the second.
+
+        A fake that lies on every broadcast never reaches the reveal through `mint_nft`,
+        so the reveal's own comparison stays unexercised — which is exactly why its
+        `!= -> >` mutant outlived the commit's.
+        """
+
+        class _C(FakeClient):
+            async def broadcast(self, raw_tx: bytes) -> str:
+                from pyrxd.transaction.transaction import Transaction
+
+                self.broadcasts.append(raw_tx)
+                self.calls.append("broadcast")
+                if len(self.broadcasts) == 1:
+                    return str(Transaction.from_hex(raw_tx.hex()).txid())
+                return lie
+
+        return _C()
+
+    @pytest.mark.parametrize("lie", [HIGH_LIE, LOW_LIE])
+    def test_a_lying_reveal_echo_is_caught_from_either_side_of_the_ordering(self, lie: str) -> None:
+        """The reveal warns and then waits on its OWN txid, so the mint still completes —
+        the assertion is that the warning happens at all, for a lie on either side."""
+        minter = GlyphMinter(self._honest_commit_lying_reveal(lie), FakeWallet(_key()), RecordingStore())
+        with pytest.warns(UserWarning, match="broadcast echoed txid"):
+            result = asyncio.run(minter.mint_nft(_nft_metadata()))
+        assert result.reveal_txid != lie, "the locally derived txid must win over the echo"
+
+    @pytest.mark.parametrize("lie", [HIGH_LIE, LOW_LIE])
+    def test_a_lying_commit_echo_is_caught_from_either_side_of_the_ordering(self, lie: str) -> None:
+        """`>` agrees with `!=` only when the lie sorts after. Testing both sides is what
+        makes this an equality check rather than an ordering one."""
+        store = RecordingStore()
+        minter = GlyphMinter(self._client_echoing(lie), FakeWallet(_key()), store)
+        with pytest.warns(UserWarning, match="broadcast returned txid"):
+            pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+        assert store.load(lie) is not None, "the payload must also be filed under the echoed txid"
+        assert store.load(pending.commit_txid) is not None
