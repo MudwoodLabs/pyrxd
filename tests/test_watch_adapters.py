@@ -350,3 +350,198 @@ async def test_callback_alert_channel():
 def test_callback_alert_channel_rejects_non_callable():
     with pytest.raises(ValidationError):
         CallbackAlertChannel(send_fn="nope")
+
+
+class _FakeRnsTransport:
+    """Stands in for the RNS layer. The channel takes its transport injected, exactly as
+    WebhookAlertChannel takes a session, so none of these tests need `rns` installed."""
+
+    def __init__(self, fail: Exception | None = None):
+        self.sent: list[tuple[bytes, bytes]] = []
+        self._fail = fail
+
+    def send(self, destination: bytes, payload: bytes) -> None:
+        if self._fail is not None:
+            raise self._fail
+        self.sent.append((destination, payload))
+
+
+class _AsyncRnsTransport(_FakeRnsTransport):
+    async def send(self, destination: bytes, payload: bytes) -> None:  # type: ignore[override]
+        super().send(destination, payload)
+
+
+def _reticulum_page(message: str = "claim now", *, swap_id: str = "swap-7", corr: bool = False):
+    from pyrxd.gravity.watch.alerts import Page, Severity
+    from pyrxd.gravity.watch.decide import Intent
+
+    return Page(
+        swap_id=swap_id,
+        intent=Intent.PAGE_CLAIM,
+        severity=Severity.CRITICAL,
+        message=message,
+        recommended_action="taker_scrape_and_claim_asset",
+        deadline_rxd_height=172,
+        low_corroboration=corr,
+    )
+
+
+class TestReticulumAlertChannelFitsTheWire:
+    """Reticulum drops a packet that exceeds its payload — it is not "mostly delivered".
+
+    A realistic CRITICAL page serialises to 381 bytes under the webhook's own encoding,
+    against a 465-byte ceiling. It fits, with under 100 bytes of headroom, which is
+    exactly the kind of margin that holds in testing and fails on the one page that
+    matters. So the channel guarantees fit rather than assuming it.
+    """
+
+    from pyrxd.gravity.watch.adapters import RETICULUM_MAX_PAYLOAD as _MAX
+
+    @pytest.mark.parametrize("length", [0, 1, 100, 400, 465, 466, 4000, 100_000])
+    def test_every_message_length_fits(self, length: int) -> None:
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
+
+        ch = ReticulumAlertChannel("ab" * 16, transport=_FakeRnsTransport())
+        payload = ch.encode(_reticulum_page("X" * length))
+        assert len(payload) <= self._MAX, f"{length}-char message produced {len(payload)} bytes"
+
+    def test_the_actionable_fields_survive_truncation(self) -> None:
+        """What an operator needs at 3am is which swap, how bad, what to run and by when.
+        The prose is the compressible part, so it is what gets dropped."""
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
+
+        ch = ReticulumAlertChannel("ab" * 16, transport=_FakeRnsTransport())
+        decoded = json.loads(ch.encode(_reticulum_page("X" * 4000, corr=True)))
+        assert decoded["s"] == "swap-7"
+        assert decoded["v"] == "critical"
+        assert decoded["d"] == 172
+        assert decoded["a"] == "taker_scrape_and_claim_asset"
+        assert decoded["c"] == 1
+        assert decoded["m"].endswith("..."), "a silently clipped instruction reads as a complete one"
+
+    def test_a_page_that_cannot_fit_without_the_message_is_refused(self) -> None:
+        """Better a loud failure than a page with the deadline truncated away."""
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
+
+        ch = ReticulumAlertChannel("ab" * 16, transport=_FakeRnsTransport(), max_payload=40)
+        with pytest.raises(ValidationError, match="does not fit"):
+            ch.encode(_reticulum_page("anything"))
+
+    def test_the_compact_form_is_materially_smaller_than_the_webhook_form(self) -> None:
+        """The reason this encoding exists at all."""
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel, page_to_dict
+
+        page = _reticulum_page(
+            "swap-2026-08-21-btc-rxd-0007: BTC HTLC claim is live and the counter-leg "
+            "refund window opens at RXD height 172 — run `pyrxd swap claim` now",
+            swap_id="swap-2026-08-21-btc-rxd-0007",
+        )
+        webhook = len(json.dumps(page_to_dict(page), separators=(",", ":")).encode())
+        compact = len(ReticulumAlertChannel("ab" * 16, transport=_FakeRnsTransport()).encode(page))
+        assert compact < webhook, f"compact {compact} is not smaller than webhook {webhook}"
+
+
+class TestReticulumAlertChannelWiring:
+    @pytest.mark.parametrize("bad", ["ab" * 8, b"\x01" * 15, b"\x01" * 17, "zz" * 16, 42])
+    def test_a_destination_that_is_not_16_bytes_is_refused(self, bad) -> None:
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
+
+        with pytest.raises((ValidationError, ValueError)):
+            ReticulumAlertChannel(bad, transport=_FakeRnsTransport())
+
+    def test_a_transport_without_send_is_refused(self) -> None:
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
+
+        with pytest.raises(ValidationError, match="send"):
+            ReticulumAlertChannel("ab" * 16, transport=object())
+
+    @pytest.mark.parametrize("transport_cls", [_FakeRnsTransport, _AsyncRnsTransport])
+    async def test_it_sends_over_either_a_sync_or_async_transport(self, transport_cls) -> None:
+        """`rns` is synchronous; a future LXMF-backed transport would not be. Supporting
+        both keeps that swap from becoming a redesign."""
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
+
+        t = transport_cls()
+        await ReticulumAlertChannel("ab" * 16, transport=t).send(_reticulum_page())
+        assert len(t.sent) == 1
+        dest, payload = t.sent[0]
+        assert dest == bytes.fromhex("ab" * 16)
+        assert json.loads(payload)["s"] == "swap-7"
+
+    async def test_a_transport_failure_propagates_so_the_page_is_retried(self) -> None:
+        """DedupAlerter records dedup state only after send returns. Swallowing here would
+        mark an undelivered page as sent."""
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
+
+        ch = ReticulumAlertChannel("ab" * 16, transport=_FakeRnsTransport(fail=NetworkError("radio down")))
+        with pytest.raises(NetworkError, match="radio down"):
+            await ch.send(_reticulum_page())
+
+
+class TestReticulumFailureDoesNotSilenceTheOtherChannels:
+    """The whole point of the spike: adding a second path must not make the first one
+    worse. A dead LoRa link has to be strictly additive."""
+
+    async def test_the_webhook_still_fires_when_reticulum_is_down(self) -> None:
+        from pyrxd.gravity.watch.adapters import CompositeAlertChannel, ReticulumAlertChannel
+
+        class _Recording:
+            def __init__(self):
+                self.sent = []
+
+            async def send(self, page):
+                self.sent.append(page)
+
+        webhook = _Recording()
+        dead = ReticulumAlertChannel("ab" * 16, transport=_FakeRnsTransport(fail=NetworkError("no radio")))
+        composite = CompositeAlertChannel(dead, webhook)
+
+        # Composite raises so DedupAlerter retries the page it could not fully deliver...
+        with pytest.raises(NetworkError):
+            await composite.send(_reticulum_page())
+        # ...but the working channel was still attempted and delivered.
+        assert len(webhook.sent) == 1, "a dead Reticulum link swallowed the webhook page"
+
+
+class TestTheOptionalExtraStaysOptional:
+    """`rns` carries a custom non-OSI licence with field-of-use restrictions. It must
+    never reach anyone who did not ask for it — and the way that silently stops being
+    true is a stray top-level import."""
+
+    def test_pyrxd_imports_and_the_channel_works_without_rns(self) -> None:
+        import sys
+
+        assert "RNS" not in sys.modules, "something imported RNS at module scope"
+        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
+
+        ch = ReticulumAlertChannel("ab" * 16, transport=_FakeRnsTransport())
+        assert ch.encode(_reticulum_page())  # the whole channel is exercisable with rns absent
+
+    def test_nothing_outside_the_transport_adapter_references_rns(self) -> None:
+        """One containment point. If a second module starts importing it, the extra has
+        stopped being optional in practice even if pyproject still says otherwise."""
+        import ast
+        import pathlib
+
+        offenders = []
+        for path in pathlib.Path("src/pyrxd").rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                names = []
+                if isinstance(node, ast.Import):
+                    names = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    names = [node.module or ""]
+                if any(n.split(".")[0] in {"RNS", "rns", "LXMF"} for n in names):
+                    offenders.append(f"{path}:{node.lineno}")
+        stray = [o for o in offenders if not o.startswith("src/pyrxd/gravity/watch/adapters.py:")]
+        assert not stray, f"rns/LXMF imported outside the transport adapter: {stray}"
+        assert offenders, "the detector found nothing at all — it has stopped detecting"
+
+    def test_it_is_declared_as_an_extra_and_not_a_core_dependency(self) -> None:
+        import tomllib
+
+        with open("pyproject.toml", "rb") as fh:
+            cfg = tomllib.load(fh)
+        core = " ".join(cfg["project"]["dependencies"])
+        assert "rns" not in core.split(), "rns leaked into core dependencies"
+        assert "reticulum" in cfg["project"].get("optional-dependencies", {})

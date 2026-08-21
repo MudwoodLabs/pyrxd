@@ -55,6 +55,14 @@ dependencies = [
     "websockets>=15.0.1,<17.0.0",
 ]
 
+[project.optional-dependencies]
+# Opt-in, never bundled. `rns` carries a custom (non-OSI) licence with field-of-use
+# restrictions, so it must not land in anyone's dependency tree by default — and the
+# watchtower's Reticulum alert path is useful to a minority of operators, not to
+# everyone installing the SDK. `pyrxd.gravity.watch.adapters.RnsTransport` imports it
+# lazily; nothing else in pyrxd references it.
+reticulum = ["rns>=1.4.0,<2.0.0"]
+
 [project.urls]
 Homepage = "https://github.com/MudwoodLabs/pyrxd"
 Documentation = "https://mudwoodlabs.github.io/pyrxd/"

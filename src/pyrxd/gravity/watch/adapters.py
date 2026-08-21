@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -459,6 +460,127 @@ def aiohttp_timeout(seconds: float):
         return aiohttp.ClientTimeout(total=seconds)
     except Exception:  # pragma: no cover - aiohttp is a dep in practice
         return seconds
+
+
+#: Reticulum's maximum single-packet payload. The physical MTU is 500 bytes; header,
+#: addresses and context claim the rest. A page that does not fit is not "mostly
+#: delivered" — it is dropped by the stack, so the channel guarantees fit itself.
+RETICULUM_MAX_PAYLOAD = 465
+
+
+class ReticulumAlertChannel:
+    """Page the operator over a Reticulum destination — a path that does not use IP.
+
+    The dead-man's-switch exists because a tower that cannot reach the chain also cannot
+    usually reach its webhook: one link outage takes out both the ability to act and the
+    ability to say so. Every channel shipped today rides IP, so "use a DIFFERENT channel"
+    still shares that fate. Reticulum runs over LoRa, packet radio or serial, so it fails
+    independently — which is the entire point of adding it.
+
+    The transport is INJECTED, exactly as :class:`WebhookAlertChannel` takes a session.
+    Nothing here imports ``rns``: the channel is pure, testable with a fake, and the
+    optional dependency lives at the shell boundary where it is actually configured.
+    ``transport`` needs one method, ``send(destination: bytes, payload: bytes)``, sync or
+    async; a failure must raise, so :class:`~pyrxd.gravity.watch.alerts.DedupAlerter`
+    retries next tick rather than recording an undelivered page as sent.
+
+    **Fit is guaranteed, not hoped for.** A realistic CRITICAL page serialises to ~381
+    bytes against a 465-byte ceiling — it fits, with under 100 bytes of headroom, so a
+    longer message silently exceeds it. The payload therefore uses short keys and drops
+    the prose FIRST, because the actionable fields are the ones an operator needs at 3am:
+    which swap, how bad, what to run, and by which height. If those alone do not fit, the
+    channel raises rather than sending a page with the deadline missing.
+    """
+
+    def __init__(self, destination: bytes | str, *, transport, max_payload: int = RETICULUM_MAX_PAYLOAD) -> None:
+        dest = bytes.fromhex(destination) if isinstance(destination, str) else destination
+        if not isinstance(dest, (bytes, bytearray)) or len(dest) != 16:
+            raise ValidationError(
+                "ReticulumAlertChannel destination must be a 16-byte Reticulum destination "
+                f"hash (got {len(dest) if hasattr(dest, '__len__') else type(dest).__name__})"
+            )
+        if not callable(getattr(transport, "send", None)):
+            raise ValidationError("ReticulumAlertChannel transport needs a callable send()")
+        if not isinstance(max_payload, int) or isinstance(max_payload, bool) or max_payload < 1:
+            raise ValidationError("ReticulumAlertChannel max_payload must be a positive int")
+        self._dest = bytes(dest)
+        self._transport = transport
+        self._max = max_payload
+
+    def encode(self, page: Page) -> bytes:
+        """The wire form. Separate from :meth:`send` so the fit rule is testable without
+        a transport, and so an operator can see exactly what a link would carry."""
+        core = {
+            "s": page.swap_id,
+            "i": page.intent.value if page.intent is not None else None,
+            "v": page.severity.value,
+            "d": page.deadline_rxd_height,
+            "a": page.recommended_action,
+        }
+        if page.low_corroboration:
+            core["c"] = 1
+        skeleton = json.dumps({**core, "m": ""}, separators=(",", ":")).encode()
+        if len(skeleton) > self._max:
+            raise ValidationError(
+                f"ReticulumAlertChannel: page {page.swap_id} does not fit in {self._max} bytes "
+                f"even with no message ({len(skeleton)} bytes) — refusing to send a page whose "
+                "deadline or action would be truncated away"
+            )
+        budget = self._max - len(skeleton)
+        msg = page.message or ""
+        encoded = msg.encode()
+        if len(encoded) > budget:
+            # Truncate on a codepoint boundary, and SAY so — a silently clipped instruction
+            # reads as a complete one.
+            marker = b"..."
+            encoded = encoded[: max(0, budget - len(marker))].decode(errors="ignore").encode() + marker
+        return json.dumps({**core, "m": encoded.decode(errors="ignore")}, separators=(",", ":")).encode()
+
+    async def send(self, page: Page) -> None:
+        payload = self.encode(page)
+        result = self._transport.send(self._dest, payload)
+        if inspect.isawaitable(result):
+            await result
+
+
+class RnsTransport:
+    """The one place that touches ``rns``, imported lazily so pyrxd installs without it.
+
+    Kept deliberately thin: build the Reticulum instance and identity, then hand
+    :class:`ReticulumAlertChannel` something with a ``send(destination, payload)``. All
+    the logic worth testing — encoding, the fit guarantee, truncation policy — lives in
+    the channel, which never imports this.
+
+    Install with ``pip install 'pyrxd[reticulum]'``. Note the dependency carries a custom
+    licence with field-of-use restrictions, which is one reason it is an opt-in extra and
+    never bundled.
+
+    **This class is the untested leg of the spike.** Everything above it has unit tests
+    with a fake transport; this needs a real Reticulum instance and a radio to exercise,
+    so treat it as a starting point rather than a proven path until someone has watched a
+    page arrive over LoRa with the WAN unplugged.
+    """
+
+    def __init__(self, *, config_path: str | None = None, app_name: str = "pyrxd.watchtower") -> None:
+        try:
+            import RNS
+        except ImportError as exc:  # pragma: no cover - depends on the optional extra
+            raise ValidationError("RnsTransport needs the Reticulum stack: pip install 'pyrxd[reticulum]'") from exc
+        self._rns_mod = RNS
+        self._reticulum = RNS.Reticulum(config_path)
+        self._identity = RNS.Identity()
+        self._app_name = app_name
+
+    def send(self, destination: bytes, payload: bytes) -> None:  # pragma: no cover - needs a radio
+        RNS = self._rns_mod
+        dest = RNS.Destination(
+            RNS.Identity.recall(destination),
+            RNS.Destination.OUT,
+            RNS.Destination.SINGLE,
+            self._app_name,
+            "alert",
+        )
+        RNS.Packet(dest, payload).send()
 
 
 class CompositeAlertChannel:
