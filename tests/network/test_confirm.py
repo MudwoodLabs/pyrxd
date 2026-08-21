@@ -266,3 +266,85 @@ def test_finite_depths_still_work():
     assert _confirmations_of({"confirmations": 2.9}) == 2
     assert _confirmations_of({"confirmations": -5}) == 0
     assert _confirmations_of({"confirmations": True}) == 0
+
+
+class TestTheSleepNeverOvershootsTheDeadline:
+    """The poll happens before the sleep, so a plain ``sleep(interval_s)`` makes the wait
+    run to the next interval boundary rather than to ``timeout_s``.
+
+    Measured before the fix: ``timeout_s=0.2, interval_s=3.0`` raised after 3.00s — a 15x
+    overshoot. A units slip (milliseconds where seconds are meant) turns that into hours,
+    on a wait that is holding a Glyph commit: a hashlock with no owner-only spend path.
+
+    These use a clock advanced by the amount actually slept, rather than the module's
+    step-per-read ``_FakeClock``, because the fix reads the clock inside the sleep
+    expression — a fixture that advances per read would measure the fixture.
+    """
+
+    @staticmethod
+    def _run(timeout_s: float, interval_s: float):
+        import asyncio
+
+        now = [0.0]
+        slept: list[float] = []
+
+        async def _sleep(seconds: float) -> None:
+            slept.append(round(seconds, 6))
+            now[0] += seconds
+
+        reader = _Reader([{"confirmations": 0}])
+        with pytest.raises(ConfirmationTimeoutError):
+            asyncio.run(
+                wait_for_confirmation(
+                    reader,
+                    "ab" * 32,
+                    min_confirmations=1,
+                    timeout_s=timeout_s,
+                    interval_s=interval_s,
+                    sleep=_sleep,
+                    clock=lambda: now[0],
+                )
+            )
+        return slept, now[0]
+
+    @pytest.mark.parametrize(
+        "timeout_s, interval_s, expected",
+        [
+            (0.2, 3.0, [0.2]),  # the pathological case: one clamped sleep, not a 15x overshoot
+            (25.0, 10.0, [10.0, 10.0, 5.0]),  # uneven: only the LAST sleep is shortened
+            (30.0, 10.0, [10.0, 10.0, 10.0]),  # even division: untouched
+        ],
+    )
+    def test_the_sleeps_are_clamped_to_the_time_remaining(self, timeout_s, interval_s, expected):
+        slept, elapsed = self._run(timeout_s, interval_s)
+        assert slept == expected
+        assert elapsed <= timeout_s, f"waited {elapsed} against a {timeout_s} deadline"
+
+    def test_an_interval_longer_than_the_timeout_still_polls_once(self):
+        """Clamping must not turn a short timeout into a wait that never asks the node.
+
+        The poll precedes the sleep, so at least one real query happens before the
+        deadline — the caller learns the transaction's state rather than only that time
+        ran out.
+        """
+        reader = _Reader([{"confirmations": 0}])
+        import asyncio
+
+        now = [0.0]
+
+        async def _sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        with pytest.raises(ConfirmationTimeoutError):
+            asyncio.run(
+                wait_for_confirmation(
+                    reader,
+                    "ab" * 32,
+                    min_confirmations=1,
+                    timeout_s=0.05,
+                    interval_s=99.0,
+                    sleep=_sleep,
+                    clock=lambda: now[0],
+                )
+            )
+        assert reader.calls >= 1, "the node was never asked"
