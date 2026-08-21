@@ -278,7 +278,7 @@ docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
 [dependency-groups]
 dev = [
     "bandit[toml]>=1.9.4,<2.0.0",
-    "cosmic-ray>=8.4.6,<9.0.0",
+    "cosmic-ray>=8.7.0,<9.0.0",
     "detect-secrets>=1.5.0,<2.0.0",
     "hypothesis>=6.165.2,<7.0.0",
     "mypy>=2.3.0,<3.0.0",
