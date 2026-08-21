@@ -350,6 +350,16 @@ class TestTheSleepNeverOvershootsTheDeadline:
         assert reader.calls >= 1, "the node was never asked"
 
 
+async def _no_sleep(_seconds: float) -> None:
+    """A sleep that does not sleep.
+
+    `max_iterations` alone does not defuse `interval_s=nan`: the hang is inside
+    `asyncio.sleep(nan)`, which no iteration cap can interrupt. The function exposes a
+    `sleep` seam precisely so a test can reach the loop without real time — using it is
+    what turns a would-be CI wedge into a fast, red failure.
+    """
+
+
 class TestTheBoundsMustBeFinite:
     """`nan <= 0` and `inf <= 0` are both False, so a bare range check lets both through —
     and every one of them makes this loop unbounded.
@@ -365,6 +375,11 @@ class TestTheBoundsMustBeFinite:
     `GlyphMinter` and `GlyphClient` grew their own finiteness checks first. This is the
     primitive they wrap, it is `__all__`-exported, and it was still accepting exactly what
     they had learned to refuse.
+
+    ``max_iterations`` is not decoration. With the guard reverted these calls loop forever,
+    and no pytest-timeout is configured — so the regression would WEDGE CI rather than
+    redden it. Bounding the loop makes a regression fail fast with the wrong exception
+    instead of stalling the pipeline. A test that hangs on regression reports nothing.
     """
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
@@ -372,22 +387,43 @@ class TestTheBoundsMustBeFinite:
         import asyncio
 
         with pytest.raises(ValidationError, match="timeout_s"):
-            asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, timeout_s=bad))
+            asyncio.run(
+                wait_for_confirmation(
+                    _Reader([{"confirmations": 0}]), "ab" * 32, timeout_s=bad, max_iterations=3, sleep=_no_sleep
+                )
+            )
 
     @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
     def test_a_non_finite_interval_is_refused(self, bad: float) -> None:
         import asyncio
 
         with pytest.raises(ValidationError, match="interval_s"):
-            asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=bad))
+            asyncio.run(
+                wait_for_confirmation(
+                    _Reader([{"confirmations": 0}]), "ab" * 32, interval_s=bad, max_iterations=3, sleep=_no_sleep
+                )
+            )
 
-    def test_zero_interval_is_still_accepted_here(self) -> None:
-        """The primitive keeps allowing 0 — it is the low-level seam and `max_iterations`
-        bounds it. `GlyphMinter` refuses 0 separately, because there it is a busy loop
-        with nothing to stop it. The two layers disagree on purpose."""
+    def test_zero_interval_is_accepted_only_when_something_bounds_it(self) -> None:
+        """The primitive still allows 0 — it is the low-level seam, and a test injecting a
+        fake ``sleep`` legitimately wants no delay — but only WITH ``max_iterations``.
+
+        This test's earlier docstring justified 0 on the grounds that ``max_iterations``
+        bounds it. That was true only if the caller passed one, and it defaults to None:
+        measured, an unbounded zero interval runs 644,164 polls per second against the node
+        for the whole timeout. The test was pinning an oversight as a contract, so the
+        primitive now requires the two together and the sentence is true.
+        """
         import asyncio
 
         with pytest.raises(ConfirmationTimeoutError):
             asyncio.run(
                 wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=0, max_iterations=2)
             )
+
+    def test_an_unbounded_zero_interval_is_refused(self) -> None:
+        """The half the old test left open, and the one that costs a node."""
+        import asyncio
+
+        with pytest.raises(ValidationError, match="max_iterations"):
+            asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=0))

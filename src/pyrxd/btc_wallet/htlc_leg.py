@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
@@ -320,6 +321,19 @@ class BitcoinTaprootLeg:
             or policy.min_confirmations < 0
         ):
             raise ValidationError("min_confirmations must be a non-negative int")
+        if not math.isfinite(policy.fund_confirm_poll_s) or not math.isfinite(policy.fund_confirm_timeout_s):
+            # Finite, not merely non-negative. `nan < 0` and `nan <= 0` are both False, so
+            # a nan sails through every check below it — and the deadline clamp in
+            # `_read_funded_amount_sats` turns that from a slow unbounded loop into a
+            # full-rate one: `max(0.0, nan - now)` is `0.0`, so the sleep becomes
+            # `sleep(0.0)`. Measured on this loop's shape: ~590,000 reads/second against
+            # the funding reader, with the deadline never firing.
+            #
+            # The clamp was ported here from `network/confirm.py` and the finiteness guard
+            # that makes it safe was not — the sibling got half the fix, and the half it
+            # got sharpened the hazard the missing half exists to stop. A bound that is not
+            # finite is not a bound.
+            raise ValidationError("fund_confirm_poll_s/fund_confirm_timeout_s must be finite")
         if policy.fund_confirm_poll_s < 0 or policy.fund_confirm_timeout_s < 0:
             raise ValidationError("fund_confirm_poll_s/fund_confirm_timeout_s must be non-negative")
         if policy.fund_confirm_poll_s > 0 and policy.fund_confirm_timeout_s <= 0:

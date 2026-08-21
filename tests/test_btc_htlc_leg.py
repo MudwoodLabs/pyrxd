@@ -925,3 +925,62 @@ async def test_fund_poll_never_waits_past_its_own_deadline():
         f"the funding poll waited {elapsed:.2f}s against a 0.2s deadline — it is sleeping "
         "a whole poll interval past the deadline it just checked"
     )
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+@pytest.mark.parametrize("field", ["fund_confirm_poll_s", "fund_confirm_timeout_s"])
+async def test_non_finite_fund_confirm_settings_are_refused(field: str, bad: float):
+    """`nan < 0` and `nan <= 0` are both False, so a non-finite value passed every check
+    this ctor had.
+
+    That mattered only after the deadline clamp landed: `max(0.0, nan - now)` is `0.0`, so
+    the clamped sleep becomes `sleep(0.0)` and the funding wait spins at ~590,000 reads per
+    second against the funding reader — mempool.space, or the operator's own node — while
+    the deadline never fires. Before the clamp the same input was a slow infinite loop.
+
+    The clamp was ported from `network/confirm.py`; the finiteness guard that makes it safe
+    was not. The sibling got half the fix, and the half that arrived sharpened the hazard
+    the missing half exists to stop.
+    """
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    with pytest.raises(ValidationError, match="finite"):
+        BitcoinTaprootLeg(
+            network="bcrt",
+            taker_keypair=taker,
+            funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+            maker_claim_pubkey_xonly=_xonly_of(maker),
+            broadcaster=FakeBroadcaster(),
+            funding_reader=_ShallowThenConfirmReader(shallow_calls=0),
+            refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+            claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+            fee_sats=500,
+            min_confirmations=1,
+            **{
+                field: bad,
+                **(
+                    {"fund_confirm_timeout_s": 30.0}
+                    if field == "fund_confirm_poll_s"
+                    else {"fund_confirm_poll_s": 0.01}
+                ),
+            },
+        )
+
+
+async def test_ordinary_fund_confirm_settings_still_construct():
+    """The honest path the refusal must not take with it."""
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    leg = BitcoinTaprootLeg(
+        network="bcrt",
+        taker_keypair=taker,
+        funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+        maker_claim_pubkey_xonly=_xonly_of(maker),
+        broadcaster=FakeBroadcaster(),
+        funding_reader=_ShallowThenConfirmReader(shallow_calls=0),
+        refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+        claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+        fee_sats=500,
+        min_confirmations=1,
+        fund_confirm_poll_s=0.01,
+        fund_confirm_timeout_s=30.0,
+    )
+    assert leg.fund_confirm_poll_s == 0.01 and leg.fund_confirm_timeout_s == 30.0

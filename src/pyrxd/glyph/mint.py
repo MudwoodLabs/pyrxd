@@ -621,7 +621,7 @@ _MIN_WAIT_INTERVAL_S: float = 0.001
 #: Ceiling on a confirmation timeout. One year. Anything longer is a units slip, and the
 #: failure mode of an effectively-unbounded wait is an unrevealed commit — a hashlock with
 #: no owner-only spend path.
-_MAX_WAIT_TIMEOUT_S: float = 365 * 24 * 60 * 60
+_MAX_WAIT_TIMEOUT_S: float = 365.0 * 24 * 60 * 60
 
 
 def _assert_positive_finite(

@@ -298,7 +298,12 @@ class RegtestNode:
                     return
             except DevnetError:
                 pass
-            time.sleep(0.5)
+            # Clamp to the time remaining — the sixth instance of "deadline checked, then
+            # an unclamped fixed sleep" found in this codebase. The overshoot here is at
+            # most 0.5s of dev tooling, not a timelock race, so this is consistency rather
+            # than a fix: the shape is what keeps getting missed, and leaving one behind
+            # makes the next reader think it is acceptable somewhere.
+            time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
         raise DevnetError(f"regtest RPC did not become ready within {self._RPC_READY_TIMEOUT_S}s")
 
     def stop(self) -> None:

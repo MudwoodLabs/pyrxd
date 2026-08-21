@@ -138,6 +138,19 @@ async def wait_for_confirmation(
         or interval_s < 0
     ):
         raise ValidationError("wait_for_confirmation interval_s must be a finite number >= 0")
+    if interval_s == 0 and max_iterations is None:
+        # A zero interval is a busy loop, not a fast poll: measured at 644,164 polls per
+        # second against the node, sustained for the whole timeout. It is allowed here —
+        # this is the low-level seam, and a test injecting a fake `sleep` legitimately
+        # wants no delay — but only when something BOUNDS it.
+        #
+        # The docstring used to say `max_iterations` bounds it. That was true only if the
+        # caller passed one, and it defaults to None, so the sentence described an opt-in
+        # as if it were a default. Requiring them together makes the sentence true.
+        raise ValidationError(
+            "wait_for_confirmation interval_s=0 requires max_iterations — an unbounded "
+            "zero-interval poll is a busy loop against the node, not a faster confirmation"
+        )
     if (
         not isinstance(timeout_s, (int, float))
         or isinstance(timeout_s, bool)
