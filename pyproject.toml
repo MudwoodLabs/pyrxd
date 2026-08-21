@@ -278,13 +278,13 @@ docs-serve = "sphinx-autobuild docs docs/_build/html --open-browser"
 [dependency-groups]
 dev = [
     "bandit[toml]>=1.9.4,<2.0.0",
-    "cosmic-ray>=8.4.6,<9.0.0",
+    "cosmic-ray>=8.7.0,<9.0.0",
     "detect-secrets>=1.5.0,<2.0.0",
-    "hypothesis>=6.165.2,<7.0.0",
+    "hypothesis>=6.165.10,<7.0.0",
     "mypy>=2.3.0,<3.0.0",
     "pip-audit>=2.10.1,<3.0.0",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.1,<0.17.0",
+    "ruff>=0.16.3,<0.17.0",
     "taskipy>=1.14.1,<2.0.0",
     # Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
     # out-of-bounds-read / crash on Unpacker reuse after a caught error in <= 1.2.0
@@ -302,12 +302,12 @@ dev = [
     # IndexFile.from_tree (GHSA-9rj7-rf2p-w77r, GHSA-4gmw-gg2m-w46p), all patched 3.1.58. cosmic-ray
     # sets no upper cap, so floor at the highest patched version. Dev-scope only — gitpython is not a
     # pyrxd runtime dependency and never ships in the published package.
-    "gitpython>=3.1.58",
+    "gitpython>=3.1.59",
 ]
 test = [
     "bandit[toml]>=1.9.4,<2.0.0",
     "check-manifest==0.51",
-    "pre-commit==4.6.1",
+    "pre-commit==4.6.2",
     "pytest>=9.1.1",
     "pytest-cov==7.1.0",
     "pytest-github-actions-annotate-failures",
