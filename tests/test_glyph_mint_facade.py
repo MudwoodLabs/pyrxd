@@ -1204,7 +1204,19 @@ class TestThePollIntervalReachesEveryWait:
         real = mint_mod.wait_for_confirmation
 
         async def _spy_wait(*args, **kwargs):
-            seen.append(kwargs.get("interval_s"))
+            # Record EVERY forwarded argument, not just the interval. Recording one proved
+            # only that one reached the wait: a reviewer planted a mutant where both call
+            # sites hardcoded `timeout_s=DEFAULT_CONFIRMATION_TIMEOUT_S` and
+            # `min_confirmations=1`, and all 45 tests in the sibling file still passed.
+            # That mutant makes a caller who asked for depth 6 reveal at depth 1 —
+            # spending a commit that is still reorg-exposed.
+            seen.append(
+                {
+                    "interval_s": kwargs.get("interval_s"),
+                    "timeout_s": kwargs.get("timeout_s"),
+                    "min_confirmations": kwargs.get("min_confirmations"),
+                }
+            )
             return await real(*args, **kwargs)
 
         return seen, real, _spy_wait
@@ -1215,11 +1227,45 @@ class TestThePollIntervalReachesEveryWait:
         seen, _real, spy = self._spy()
         monkeypatch.setattr(mint_mod, "wait_for_confirmation", spy)
 
-        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=0.001)
+        minter = GlyphMinter(
+            FakeClient(),
+            FakeWallet(_key()),
+            RecordingStore(),
+            poll_interval_s=0.001,
+            confirmation_timeout_s=77.5,
+        )
         assert asyncio.run(minter.mint_nft(_nft_metadata())).reveal_txid
 
         assert len(seen) == 2, f"expected a commit wait and a reveal wait, saw {len(seen)}"
-        assert seen == [0.001, 0.001], f"a wait did not get the interval: {seen}"
+        for i, call in enumerate(seen):
+            assert call["interval_s"] == 0.001, f"wait {i} lost the interval: {call}"
+            assert call["timeout_s"] == 77.5, f"wait {i} lost the timeout: {call}"
+
+    def test_the_configured_depth_reaches_the_commit_wait(self, monkeypatch):
+        """`min_confirmations` is reorg safety, not a preference.
+
+        Reading it back off the minter proves only that it was stored. This proves the
+        commit wait actually asks for it — the difference between a caller getting the
+        depth they requested and getting depth 1 on a still-reorg-exposed commit.
+        """
+        import pyrxd.glyph.mint as mint_mod
+
+        seen, _real, spy = self._spy()
+        monkeypatch.setattr(mint_mod, "wait_for_confirmation", spy)
+        minter = GlyphMinter(
+            FakeClient(confirmations=9),
+            FakeWallet(_key()),
+            RecordingStore(),
+            poll_interval_s=0.001,
+            min_confirmations=6,
+        )
+        assert asyncio.run(minter.mint_nft(_nft_metadata())).reveal_txid
+        assert seen[0]["min_confirmations"] == 6, (
+            f"the commit wait asked for {seen[0]['min_confirmations']}, not the configured 6"
+        )
+        # The reveal wait deliberately uses 1: by then the commit is buried and the reveal
+        # only needs to land. Pinned so the intent is visible rather than incidental.
+        assert seen[1]["min_confirmations"] == 1
 
     def test_the_default_is_unchanged_for_callers_who_say_nothing(self):
         """The fix must not quietly re-tune production. A 10s poll is well inside a
@@ -1228,6 +1274,38 @@ class TestThePollIntervalReachesEveryWait:
 
         minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore())
         assert minter._poll_interval_s == DEFAULT_POLL_INTERVAL_S == 10.0
+
+    def test_a_zero_interval_is_refused_because_it_busy_loops(self):
+        """Zero is not "poll as fast as possible", it is a denial of service.
+
+        `wait_for_confirmation` polls the server once per iteration and only then sleeps,
+        so `interval_s=0` spins: measured at ~715,000 polls/second against a counting
+        fake, sustained for the whole `confirmation_timeout_s` — 1800s by default. Aimed
+        at a public ElectrumX that is a good way to be banned mid-mint, which strands the
+        commit the wait exists to protect.
+        """
+        with pytest.raises(ValidationError, match="poll_interval_s"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=0)
+
+    def test_a_small_positive_interval_is_still_accepted(self):
+        """The honest path the refusal must not take with it — a regtest node that mines
+        on demand genuinely wants sub-second polling."""
+        assert GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=0.001) is not None
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    @pytest.mark.parametrize("param", ["poll_interval_s", "confirmation_timeout_s"])
+    def test_a_non_finite_wait_parameter_is_refused(self, param: str, bad: float):
+        """`> 0` is not a finiteness check, and the gap hangs a mint.
+
+        `nan <= 0` and `inf <= 0` are both False, so both passed a bare positivity check.
+        `asyncio.sleep(nan)` and `asyncio.sleep(inf)` never return (measured: still
+        sleeping after 1.5s), and with `timeout_s=nan` the loop's `elapsed >= timeout_s`
+        is always False while `max_iterations` defaults to None — unbounded in both
+        directions. A reveal that never returns AND never raises leaves an on-chain
+        hashlock with no owner-only spend path, which is what these guards exist to stop.
+        """
+        with pytest.raises(ValidationError, match=param):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), **{param: bad})
 
     @pytest.mark.parametrize("bad", [-1, -0.001, "x", None, True])
     def test_a_bad_interval_is_refused_at_construction(self, bad):
@@ -1242,3 +1320,287 @@ class TestThePollIntervalReachesEveryWait:
         """Same trap, same parameter family — it shared the defect and the fix."""
         with pytest.raises(ValidationError, match="confirmation_timeout_s"):
             GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), confirmation_timeout_s=bad)
+
+
+class TestTheCommitPaysForItsOwnBytes:
+    """The reveal proves it pays for its size; the commit never did.
+
+    `assert_pays_for_its_size` appears once in `mint.py`, on the reveal. The commit is
+    built, fee'd, signed and broadcast with no such check — and the first `mint` mutation
+    sweep found 12 survivors on the single line that converts the rate:
+
+        commit_tx.fee(SatoshisPerKilobyte(fee_rate * 1000))
+
+    That `* 1000` is the per-byte-to-per-kB conversion. Mutating it moves the commit's fee
+    by three orders of magnitude in either direction and nothing noticed. Under-fee'd, the
+    commit does not relay and holds its inputs until mempool expiry — Radiant has neither
+    RBF nor CPFP. Over-fee'd, the difference is simply gone.
+
+    These pin the property rather than a constant, so they survive a legitimate change to
+    how the commit is shaped.
+    """
+
+    @staticmethod
+    def _built_commit(fee_rate: int, metadata=None):
+        """The commit transaction object, captured as it is built."""
+        import pyrxd.glyph.mint as mint_mod
+
+        cap = {}
+        real = mint_mod._build_commit_tx
+
+        def _spy(*a, **k):
+            tx = real(*a, **k)
+            cap["tx"] = tx
+            return tx
+
+        mint_mod._build_commit_tx = _spy
+        try:
+            minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), fee_rate=fee_rate)
+            pending = asyncio.run(minter.commit_nft(metadata or _nft_metadata()))
+        finally:
+            mint_mod._build_commit_tx = real
+        return cap["tx"], pending
+
+    @pytest.mark.parametrize("fee_rate", [10_000, 20_000, 50_000])
+    def test_the_commit_covers_its_own_size_at_every_rate(self, fee_rate: int) -> None:
+        from pyrxd.fee_sizing import required_fee
+
+        tx, _pending = self._built_commit(fee_rate)
+        size = len(tx.serialize())
+        paid = tx.get_fee()
+        required = required_fee(size, fee_rate)
+        assert paid >= required, (
+            f"the commit is {size} bytes and pays {paid:,} at {fee_rate}/byte, under the "
+            f"{required:,} required — it will not relay, and Radiant cannot fee-bump it"
+        )
+
+    def test_the_commit_fee_is_not_wildly_over_its_size(self) -> None:
+        """The other direction of the same mutation. An over-fee'd commit is not a failed
+        broadcast, it is value gone — the difference leaves with the miner."""
+        from pyrxd.fee_sizing import required_fee
+
+        tx, _pending = self._built_commit(10_000)
+        paid, required = tx.get_fee(), required_fee(len(tx.serialize()), 10_000)
+        assert paid <= required * 2, f"commit paid {paid:,} for a {required:,} requirement"
+
+    def test_the_commit_fee_scales_with_the_rate(self) -> None:
+        """Kills the mutants that sever the rate from the fee entirely."""
+        low, _ = self._built_commit(10_000)
+        high, _ = self._built_commit(50_000)
+        assert high.get_fee() > low.get_fee() * 3, (
+            f"5x the rate produced {high.get_fee():,} against {low.get_fee():,} — the rate "
+            "is not reaching the commit's fee"
+        )
+
+
+class TestTheCommitFundingEstimateCoversTheCommit:
+    """`_commit`'s funding sufficiency arithmetic carried 22 survivors across two lines:
+
+        commit_fee_estimate = 300 * fee_rate  # ~300-byte commit
+        total_required = commit_value + commit_fee_estimate + NFT_CARRIER_VALUE
+
+    `total_required` decides whether the wallet is judged able to fund the mint at all. If
+    it drops below what the commit actually costs, the mint is attempted with too little and
+    fails after selection rather than before it.
+    """
+
+    @staticmethod
+    def _threshold(fee_rate: int) -> int:
+        """The smallest single UTXO `_commit` will mint from.
+
+        Found by probing, not by restating `total_required` — a test that recomputes the
+        formula passes for any formula, including a mutated one. `_commit` selects with
+        `value >= total_required`, so the smallest accepted value IS that number.
+        """
+
+        def _accepts(value: int) -> bool:
+            minter = GlyphMinter(FakeClient(), FakeWallet(_key(), value=value), RecordingStore(), fee_rate=fee_rate)
+            try:
+                asyncio.run(minter.commit_nft(_nft_metadata()))
+                return True
+            except InsufficientFundsError:
+                return False
+
+        lo, hi = 1, 2_000_000_000
+        assert _accepts(hi), "probe upper bound too low to bracket the threshold"
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if _accepts(mid):
+                hi = mid
+            else:
+                lo = mid + 1
+        return lo
+
+    @pytest.mark.parametrize("fee_rate", [10_000, 50_000])
+    def test_the_wallet_is_judged_against_what_the_commit_really_costs(self, fee_rate: int) -> None:
+        """The threshold must cover the commit's own fee, or a wallet is judged able to fund
+        a mint it cannot pay for — and the failure lands after selection rather than before."""
+        tx, pending = TestTheCommitPaysForItsOwnBytes._built_commit(fee_rate)
+        real_cost = pending.commit_value + tx.get_fee()
+        threshold = self._threshold(fee_rate)
+        assert threshold >= real_cost, (
+            f"a wallet holding {threshold:,} is accepted, but the commit costs {real_cost:,} "
+            f"({pending.commit_value:,} output + {tx.get_fee():,} fee) at {fee_rate}/byte"
+        )
+
+    def test_the_threshold_tracks_the_fee_rate(self) -> None:
+        """A mutant that severs `fee_rate` from the estimate leaves a high-rate mint judged
+        fundable on a low-rate budget."""
+        assert self._threshold(50_000) > self._threshold(10_000)
+
+
+class TestTheEchoComparisonIsAnEqualityTest:
+    """Both echo checks — the commit's at `_commit` and the reveal's at `_reveal` — carry
+    the same three survivors: ``!=`` mutated to ``>``, ``>=`` and ``is not``.
+
+    The set is diagnostic. ``>=`` and ``is not`` both make the mismatch branch fire on an
+    **honest** echo (two equal strings are still distinct objects), so their survival says
+    nothing asserts that a matching echo is quiet. ``>`` only differs when the lie sorts
+    lexicographically BEFORE the true txid, so its survival says every lying-echo fixture
+    in the suite happened to pick a lie that sorts after.
+
+    Both gaps are the same omission in different clothes: the refusals were tested and the
+    honest path was not, and a lie was tested from only one side of the collation order.
+    """
+
+    HIGH_LIE = "ff" * 32  # sorts AFTER any real txid
+    LOW_LIE = "00" * 32  # sorts BEFORE almost any real txid
+
+    @staticmethod
+    def _client_echoing(lie: str | None):
+        """`lie=None` echoes honestly — the case that kills `>=` and `is not`."""
+
+        class _C(FakeClient):
+            async def broadcast(self, raw_tx: bytes) -> str:
+                self.broadcasts.append(raw_tx)
+                self.calls.append("broadcast")
+                if lie is not None:
+                    return lie
+                from pyrxd.transaction.transaction import Transaction
+
+                return str(Transaction.from_hex(raw_tx.hex()).txid())
+
+        return _C()
+
+    def test_an_honest_commit_echo_files_exactly_one_record(self) -> None:
+        """`>=` and `is not` fire the mismatch branch on a matching echo, filing a spurious
+        duplicate under a key nothing will ever look up."""
+        store = RecordingStore()
+        minter = GlyphMinter(self._client_echoing(None), FakeWallet(_key()), store)
+        pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+
+        # Assert the WARNING, not the record count. With an honest echo the "duplicate"
+        # is `replace(pending, commit_txid=broadcast_txid)` — the same key — so the store
+        # overwrites and the count is 1 whether or not the mismatch branch fired. The
+        # count was vacuous for exactly the mutants this class is named after.
+        assert store.load(pending.commit_txid) is not None
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            asyncio.run(
+                GlyphMinter(self._client_echoing(None), FakeWallet(_key()), RecordingStore()).commit_nft(
+                    _nft_metadata()
+                )
+            )
+        echo_warnings = [w for w in caught if "broadcast returned txid" in str(w.message)]
+        assert not echo_warnings, f"an honest echo warned: {[str(w.message) for w in echo_warnings]}"
+
+    def test_an_honest_reveal_echo_warns_about_nothing(self) -> None:
+        """The reveal's counterpart. `>=`/`is not` would warn on every successful mint."""
+        minter = GlyphMinter(self._client_echoing(None), FakeWallet(_key()), RecordingStore())
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", UserWarning)  # any warning becomes a failure
+            result = asyncio.run(minter.mint_nft(_nft_metadata()))
+        assert result.reveal_txid
+
+    @staticmethod
+    def _honest_commit_lying_reveal(lie: str):
+        """Truthful on the first broadcast, lying on the second.
+
+        A fake that lies on every broadcast never reaches the reveal through `mint_nft`,
+        so the reveal's own comparison stays unexercised — which is exactly why its
+        `!= -> >` mutant outlived the commit's.
+        """
+
+        class _C(FakeClient):
+            async def broadcast(self, raw_tx: bytes) -> str:
+                from pyrxd.transaction.transaction import Transaction
+
+                self.broadcasts.append(raw_tx)
+                self.calls.append("broadcast")
+                if len(self.broadcasts) == 1:
+                    return str(Transaction.from_hex(raw_tx.hex()).txid())
+                return lie
+
+        return _C()
+
+    @pytest.mark.parametrize("lie", [HIGH_LIE, LOW_LIE])
+    def test_a_lying_reveal_echo_is_caught_from_either_side_of_the_ordering(self, lie: str) -> None:
+        """The reveal warns and then waits on its OWN txid, so the mint still completes —
+        the assertion is that the warning happens at all, for a lie on either side."""
+        minter = GlyphMinter(self._honest_commit_lying_reveal(lie), FakeWallet(_key()), RecordingStore())
+        with pytest.warns(UserWarning, match="broadcast echoed txid"):
+            result = asyncio.run(minter.mint_nft(_nft_metadata()))
+        assert result.reveal_txid != lie, "the locally derived txid must win over the echo"
+
+    @pytest.mark.parametrize("lie", [HIGH_LIE, LOW_LIE])
+    def test_a_lying_commit_echo_is_caught_from_either_side_of_the_ordering(self, lie: str) -> None:
+        """`>` agrees with `!=` only when the lie sorts after. Testing both sides is what
+        makes this an equality check rather than an ordering one."""
+        store = RecordingStore()
+        minter = GlyphMinter(self._client_echoing(lie), FakeWallet(_key()), store)
+        with pytest.warns(UserWarning, match="broadcast returned txid"):
+            pending = asyncio.run(minter.commit_nft(_nft_metadata()))
+        assert store.load(lie) is not None, "the payload must also be filed under the echoed txid"
+        assert store.load(pending.commit_txid) is not None
+
+
+class TestTheWaitBoundsAreRangesNotJustLiterals:
+    """Refusing `inf` while accepting `1e308` is theatre, and refusing `0` while accepting
+    `5e-324` is the same busy loop under a different spelling.
+
+    Measured by a reviewer: `poll_interval_s=5e-324` drives 254,728 polls/second — against
+    a guard whose own docstring cites 715,000/s as the hazard it exists to stop. The check
+    had been written against the two literals a previous reviewer named rather than against
+    the behaviour those literals exemplify.
+    """
+
+    @pytest.mark.parametrize("tiny", [5e-324, 1e-12, 0.0009])
+    def test_a_sub_millisecond_interval_is_refused(self, tiny: float) -> None:
+        with pytest.raises(ValidationError, match="poll_interval_s"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=tiny)
+
+    @pytest.mark.parametrize("huge", [1e308, 1e12])
+    def test_an_absurd_timeout_is_refused(self, huge: float) -> None:
+        with pytest.raises(ValidationError, match="confirmation_timeout_s"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), confirmation_timeout_s=huge)
+
+    def test_the_bounds_admit_every_value_this_project_actually_uses(self) -> None:
+        """The honest path. 1ms is the floor and still permits 1,000 polls/second; the CLI
+        uses 0.25s on regtest and 10s elsewhere; the default timeout is 1800s."""
+        from pyrxd.network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, DEFAULT_POLL_INTERVAL_S
+
+        for interval in (0.001, 0.25, DEFAULT_POLL_INTERVAL_S):
+            for timeout in (1.0, DEFAULT_CONFIRMATION_TIMEOUT_S):
+                assert (
+                    GlyphMinter(
+                        FakeClient(),
+                        FakeWallet(_key()),
+                        RecordingStore(),
+                        poll_interval_s=interval,
+                        confirmation_timeout_s=timeout,
+                    )
+                    is not None
+                )
+
+    def test_the_bound_is_an_argument_not_a_guess_from_the_label(self) -> None:
+        """The first version keyed on `"interval" in what` — rename the parameter and the
+        bound silently disappears. The same substring-dispatch smell this project replaced
+        with typed exceptions elsewhere."""
+        import inspect
+
+        from pyrxd.glyph.mint import _assert_positive_finite
+
+        params = inspect.signature(_assert_positive_finite).parameters
+        assert "minimum" in params and "maximum" in params
+        src = inspect.getsource(_assert_positive_finite)
+        assert '"interval" in what' not in src and '"timeout" in what' not in src

@@ -127,40 +127,93 @@ Two constraints shape the value-group lists specifically:
   than a nicety. Before adding a group, time its list first: if it is far off the ~1-3s the others
   run in, find out why before writing the group.
 
-## Baseline results — mint (2026-08)
+### A third equivalent-mutant class: BitOr on OS flag constants
 
-First sweep of the group, at 0.19.0 + the `poll_interval_s` fix. 1,644 mutants, 2.6s clean
-suite, ~40 minutes.
+The catalogued equivalents are type annotations, error-message f-strings and
+interpreter-detail rewrites. Add flag arithmetic.
 
-| Module | Mutants | Killed | Survived | Killed | …of which unkillable | Logic survivors |
-|---|---|---|---|---|---|---|
-| `glyph/mint.py` | 804 | 477 | 327 | 59% | 187 annot + 9 signature | **131** |
-| `glyph/transfer.py` | 582 | 302 | 280 | 52% | 55 annot + 5 signature | **220** |
-| `glyph/client.py` | 258 | 137 | 121 | 53% | 99 annot + 11 signature | **11** |
-| **total** | **1644** | **916** | **728** | **56%** | 341 annot + 25 signature | **362** |
+`JsonFilePendingStore.save` opens with `os.O_WRONLY | os.O_CREAT | os.O_TRUNC | O_CLOEXEC`,
+and `_fsync_dir` with `os.O_RDONLY | O_CLOEXEC`. Those constants are **pairwise disjoint**
+bits, so `|`, `+` and `^` produce the identical value — every BitOr_Add and BitOr_BitXor
+mutant on such a line is equivalent by construction.
 
-The raw percentage understates the state of `client.py` badly: 99 of its 121 survivors are
-BitOr rewrites of type annotations, so its effective rate against *killable* mutants is 86%.
-`mint.py` is 77% on the same basis. `transfer.py` is the outlier at **55%** — the newest of
-the three, holding the FT/NFT fee guards, and never mutated before this run.
+`_fsync_dir` is the extreme case: `os.O_RDONLY` is **0**, so `0 op O_CLOEXEC` is 0 or
+524288 (or -524288) for every operator cosmic-ray substitutes, and `os.open` on a directory
+succeeds with all of them — the only casualty is close-on-exec, which has no observable
+in-process effect. 12 of its 13 mutants survive and **none of them is killable**. The one
+that dies does so because `/` yields a float and `os.open` rejects it.
 
-**104 of `transfer.py`'s 220 logic survivors sat on two lines**, the fee estimate inside
-`ft_funding`:
+Across the mint and glyphscript sweeps this class accounts for 22 survivors that would
+otherwise read as untested durability code. Recognising it matters because the surrounding
+code — atomic write, fsync, `0o600` — genuinely is fund-critical, so the temptation is to
+write a test. There is nothing there to test.
 
-```python
-est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50
-needed = est_bytes * fee_rate * 2
+### Verifying one mutant by hand — clear the bytecode cache
+
+The loop for proving a new test actually kills something is: plant the defect, run the
+suite, confirm RED, restore, confirm GREEN. Restoring with `cp` (or any write that keeps
+the file the same size within the same second) can leave Python serving the **cached
+bytecode of the mutant** — CPython invalidates a `.pyc` on mtime and size, and a
+same-length edit defeats both.
+
+It is not hypothetical: swapping `if n <= 75:` for `if n <= 74:` in `glyph/payload.py` and
+restoring produced a "failure" on clean source that took several minutes to chase, because
+the interpreter was still running the mutant. Same-length numeric and operator edits are
+exactly the mutations cosmic-ray generates most.
+
+So between plant and run, and again between restore and re-run:
+
+```bash
+find src -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null
 ```
 
-`needed` is not a diagnostic — it is passed to `find_plain_rxd_utxo`, which skips any UTXO
-with `value < needed`. Every constant and operator there could be changed and nothing
-noticed, including removing the 2x headroom the docstring promises. The killer tests are in
-`tests/test_glyph_transfer.py::TestTheFeeEstimateThatPicksTheFundingUtxo`; they pin the
-*property* ("deliberately generous", measured at 2.33x a real transfer's fee) rather than
-the constants, because restating the formula would pass for any formula including a mutated
-one. A first version bounded the threshold with a hand-rolled byte count and was loose
-enough that deleting the headroom entirely still passed — worth knowing before writing the
-next one of these.
+`scripts/mutation_test.sh` is not affected — it restores with `git checkout --`, and each
+cosmic-ray mutant runs in a fresh subprocess against a freshly written file — but the
+manual loop is, and a false SURVIVED reads as "my test is worthless" while a false KILLED
+reads as "my test works". Both are worse than no measurement.
+
+## Baseline results — mint and glyphscript (2026-08)
+
+Both groups were run twice. The first numbers are kept because the difference between
+them is the point: **a kill rate measures the test list as much as the code.** Both lists
+were first built by topic — files that looked related to the module — and both were wrong.
+Rebuilding them from which test files actually reference each module's symbols moved
+`glyph/payload.py` from 37% to 75%.
+
+| Module | Mutants | Killed | Survived | annot | Logic | Effective |
+|---|---|---|---|---|---|---|
+| `glyph/mint.py` | 804 | 506 | 298 | 187 | 102 | **82%** |
+| `glyph/transfer.py` | 582 | 398 | 184 | 55 | 124 | **76%** |
+| `glyph/client.py` | 258 | 137 | 121 | 99 | 11 | **86%** |
+| `glyph/script.py` | 703 | 625 | 78 | 22 | 55 | **92%** |
+| `glyph/payload.py` | 572 | 429 | 143 | 0 | 143 | **75%** |
+
+*Effective* is against killable mutants — survivors marked `annot` are BitOr rewrites of
+type annotations, which cannot change behaviour under `from __future__ import annotations`.
+The raw column understates `client.py` badly: 99 of its 121 survivors are that class.
+
+What the two sweeps actually found, and what was done about it:
+
+- **`ft_funding`'s fee estimate — 104 logic survivors on two lines.** The number deciding
+  which plain-RXD UTXO can pay an FT transfer's fee, passed to `find_plain_rxd_utxo`, which
+  skips anything below it. Every constant and operator was mutable with nothing noticing,
+  including deleting the 2x headroom the docstring promises. Now 18, pinned by probing the
+  acceptance threshold and bounding it against a real built transfer's fee.
+- **The commit's per-kB conversion — 12 survivors on one line.** `SatoshisPerKilobyte(fee_rate
+  * 1000)`. Note the asymmetry it sits in: `assert_pays_for_its_size` appears once in
+  `mint.py`, on the reveal. The commit is built, fee'd, signed and broadcast with no size
+  check. The tests assert the property the missing guard would have.
+- **`_push_bytes` — 66 survivors on the CBOR push opcode selection.** Executed by every
+  mint (a modest NFT's CBOR is 186 bytes) but never asserted, so the opcode and the
+  little-endian length width were both free to change.
+- **Compound shape guards in `script.py` — 25 survivors on four lines.** `if len(script) !=
+  75 or script[25] != 0xBD or script[26] != 0xD0:` — mutating one clause survives because
+  the others still reject the malformed inputs the suite uses. The module scored 92%
+  *because* these were the part nothing reached.
+
+Not everything surviving is worth a test. `_push_minimal_int` has survivors on branches that
+look identical to `_push_bytes`'s, but its condition is on the byte-length of an encoded
+integer: reaching `length >= 0x4C` needs n >= 2**608. Unreachable, not untested.
 
 ## Baseline results — spv (2026-06)
 

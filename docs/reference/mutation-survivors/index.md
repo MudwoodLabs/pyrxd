@@ -8,6 +8,7 @@ wallet
 hdwallet
 glyph
 mint
+glyphscript
 swap
 coordinator
 network

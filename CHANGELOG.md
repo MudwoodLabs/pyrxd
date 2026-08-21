@@ -6,38 +6,64 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **`wait_for_confirmation` now refuses non-finite and unbounded-zero arguments.** A
+  `timeout_s` or `interval_s` of `nan`/`inf` used to be accepted — `nan <= 0` and `inf <= 0`
+  are both False — and each made the wait unbounded in a different way: a `nan` deadline is
+  never reached, and `asyncio.sleep(nan)` never returns. `interval_s=0` is still allowed,
+  because a test injecting a fake `sleep` legitimately wants no delay, but now only
+  together with `max_iterations`: unbounded, it polls the node **644,164 times a second**
+  for the whole timeout.
+- **`GlyphMinter` and `GlyphClient` bound their wait parameters at construction**:
+  `poll_interval_s` must be finite and `>= 0.001s`, `confirmation_timeout_s` finite and
+  `<= 1 year`, `min_confirmations` an `int >= 1`. Values outside those ranges previously
+  constructed and failed later — or, in the case of a sub-millisecond interval, did not
+  fail at all and simply busy-looped. Both classes now refuse by their own name rather
+  than deferring to an error that named `GlyphMinter` for a parameter spelled on
+  `GlyphClient`.
+
 ### Added
 
 - `poll_interval_s` on `GlyphMinter` and `GlyphClient` — seconds between confirmation
-  polls, forwarded to both of the reveal's waits. The default is unchanged at 10s, which
-  suits a chain whose blocks are minutes apart; a regtest node that mines on demand wants
-  a much smaller value and previously had no way to ask for one. Until this was exposed,
-  `confirmation_timeout_s` could not take effect below 10s at all: the wait sleeps a full
-  poll interval before re-checking the deadline, so a 0.001s timeout still cost 10s.
-
-### Changed
-
-- `GlyphMinter` now validates `confirmation_timeout_s` and `poll_interval_s` at
-  construction. `wait_for_confirmation` already validated both, but only at reveal time —
-  after the commit is broadcast, which leaves the caller holding a hashlock with no
-  owner-only spend path. This is the same "refuses after the irreversible action" trap the
-  constructor already closes for `fee_rate`.
+  polls, forwarded to **both** of a reveal's waits (the commit wait and the reveal wait).
+  The default is unchanged at 10s. Until this was exposed, `confirmation_timeout_s` could
+  not take effect below 10s at all: the wait sleeps a full interval before re-checking the
+  deadline, so a 0.001s timeout still cost 10 seconds.
+- `pyrxd glyph mint-nft`, `deploy-ft` and `deploy-dmint` poll every **0.25s on regtest**
+  and 10s elsewhere. A regtest node mines on demand, usually in the same script that is
+  waiting, so a 10s poll meant sleeping ten seconds after the block already existed.
 
 ### Fixed
 
-- `ft_funding`'s fee estimate — the number deciding which plain-RXD UTXO is large enough to
-  pay an FT transfer's fee — had **no test at all**. It is passed to `find_plain_rxd_utxo`,
-  which skips any UTXO below it, so shrinking it selects a UTXO that cannot cover the real
-  fee, and Radiant has neither RBF nor CPFP. The first `mint` mutation sweep found 104
-  surviving mutants across its two lines, including one that deletes the 2x headroom the
-  docstring promises. No defect shipped — the formula was correct — but nothing would have
-  noticed if it stopped being.
+- **Confirmation waits no longer overshoot their own deadline.** The poll happens before
+  the sleep, so an unclamped `sleep(interval_s)` ran the wait to the next interval boundary
+  rather than to `timeout_s` — measured at `timeout_s=0.2, interval_s=3.0`, the timeout
+  fired after **3.00s**, a 15x overshoot, and a milliseconds/seconds slip would turn that
+  into hours. Fixed in `network/confirm.py` and in **`btc_wallet/htlc_leg.py`**, whose
+  funding wait had the identical shape; on an HTLC leg that deadline is when the caller
+  stops waiting for funding and starts deciding about the refund path.
+- **`BitcoinTaprootLeg` refuses non-finite `fund_confirm_poll_s`/`fund_confirm_timeout_s`.**
+  `nan` passed every existing check, and once the deadline clamp landed it collapsed the
+  sleep to `sleep(0.0)` — roughly **590,000 reads per second** against the funding reader,
+  with the deadline never firing.
+- `ft_funding`'s fee estimate — the number deciding which plain-RXD UTXO can pay an FT
+  transfer's fee, passed to `find_plain_rxd_utxo`, which skips anything below it — had no
+  test at all. The first `mint` mutation sweep found 104 surviving mutants across its two
+  lines, including one that deletes the 2x headroom its docstring promises. No defect
+  shipped; nothing would have noticed if one had.
 
 ### Performance
 
 - The offline test suite runs **147.8s, down from 175s** (measured, same machine). Three
-  tests in `test_glyph_mint_facade.py` each cost 10.01s waiting out a poll interval they
-  had no way to shorten — 30s of a 30.5s file, on every run of every Python job.
+  tests each cost 10.01s waiting out a poll interval they had no way to shorten.
+
+### Internal
+
+- Two new mutation-testing groups, `mint` (`glyph/mint`, `glyph/transfer`, `glyph/client`)
+  and `glyphscript` (`glyph/script`, `glyph/payload`), with survivor worklists published
+  under `docs/reference/mutation-survivors/`. Effective kill rates against killable
+  mutants: script 92%, client 86%, mint 82%, transfer 76%, payload 75%.
 
 ## [0.19.0] — 2026-08-19
 

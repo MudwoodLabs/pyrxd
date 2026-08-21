@@ -90,7 +90,11 @@ from ..glyph.transfer import select_ft_inputs as lib_select_ft_inputs
 from ..glyph.transfer import single_ft_signing_key as lib_single_ft_signing_key
 from ..glyph.types import GlyphFt, GlyphMetadata, GlyphNft, GlyphProtocol, GlyphRef
 from ..hd.wallet import HdWallet
-from ..network.confirm import wait_for_confirmation
+from ..network.confirm import (
+    DEFAULT_CONFIRMATION_TIMEOUT_S,
+    DEFAULT_POLL_INTERVAL_S,
+    wait_for_confirmation,
+)
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata
 from ..security.errors import (
@@ -469,7 +473,7 @@ async def _mint_nft_inner(
     if ctx.output_mode == "human":
         click.echo(f"\ncommit broadcast: {commit_txid}")
         click.echo("waiting for confirmation (this can take 10+ minutes)...")
-    await _wait_for_tx(client, str(commit_txid))
+    await _wait_for_tx(client, str(commit_txid), interval_s=_poll_interval_for(ctx))
 
     # 4) Build reveal — the same builder the dry run above measured, now with the real
     # commit txid (same length, so the same size and fee).
@@ -516,7 +520,29 @@ async def _mint_nft_inner(
     }
 
 
-async def _wait_for_tx(client: ElectrumXClient, txid: str, *, timeout_s: float = 1800.0) -> None:
+def _poll_interval_for(ctx: CliContext) -> float:
+    """How often to re-ask the node whether a commit has confirmed.
+
+    The default suits a chain whose blocks are minutes apart. A regtest node mines on
+    demand — usually in the same script that is waiting — so a 10s poll there means the
+    CLI sleeps ten seconds after the block already exists, on every mint, and a developer
+    following the quickstart concludes the tool is slow.
+
+    Deliberately derived from the network rather than added as a flag: nothing else about
+    the wait is user-tunable, and an argument no caller passes is the stranded escape hatch
+    this project has now shipped twice. If a real per-chain knob is wanted it belongs in
+    `[networks.<net>]` beside `fee_rate`, not as a one-off option on three commands.
+    """
+    return 0.25 if ctx.network == "regtest" else DEFAULT_POLL_INTERVAL_S
+
+
+async def _wait_for_tx(
+    client: ElectrumXClient,
+    txid: str,
+    *,
+    timeout_s: float = DEFAULT_CONFIRMATION_TIMEOUT_S,
+    interval_s: float = DEFAULT_POLL_INTERVAL_S,
+) -> None:
     """CLI wrapper around :func:`pyrxd.network.confirm.wait_for_confirmation`.
 
     The polling logic itself lives in the library, where both time seams are injected
@@ -534,7 +560,7 @@ async def _wait_for_tx(client: ElectrumXClient, txid: str, *, timeout_s: float =
     possible answer. The text below names the recovery that actually works.
     """
     try:
-        await wait_for_confirmation(client, txid, timeout_s=timeout_s)
+        await wait_for_confirmation(client, txid, timeout_s=timeout_s, interval_s=interval_s)
     except ConfirmationTimeoutError as exc:
         raise NetworkBoundaryError(
             "timed out waiting for confirmation",
@@ -752,7 +778,7 @@ async def _deploy_ft_inner(
     if ctx.output_mode == "human":
         click.echo(f"\ncommit broadcast: {commit_txid}")
         click.echo("waiting for confirmation (this can take 10+ minutes)...")
-    await _wait_for_tx(client, str(commit_txid))
+    await _wait_for_tx(client, str(commit_txid), interval_s=_poll_interval_for(ctx))
 
     # The same builder the dry run above measured, now with the real commit txid.
     # Premine: vout[0].value = the supply (1 photon = 1 unit).
@@ -2180,7 +2206,7 @@ async def _deploy_dmint_inner(
     click.echo(f"commit broadcast: {commit_txid}", err=True)
     if ctx.output_mode == "human":
         click.echo("waiting for confirmation (this can take 10+ minutes)...")
-    await _wait_for_tx(client, str(commit_txid))
+    await _wait_for_tx(client, str(commit_txid), interval_s=_poll_interval_for(ctx))
 
     # --- reveal tx: spend commit:0 (tokenRef + CBOR) AND commit:1..N (contractRefs) ---
     rev = deploy.build_reveal_outputs(str(commit_txid))

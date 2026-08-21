@@ -22,7 +22,13 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..fee_sizing import assert_fee_rate_clears_relay_floor
-from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, DEFAULT_POLL_INTERVAL_S
+from ..network.confirm import (
+    _MAX_WAIT_TIMEOUT_S,
+    _MIN_WAIT_INTERVAL_S,
+    DEFAULT_CONFIRMATION_TIMEOUT_S,
+    DEFAULT_POLL_INTERVAL_S,
+    _assert_positive_finite,
+)
 from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Hex20
 from .builder import MIN_FEE_RATE
@@ -231,6 +237,24 @@ class GlyphClient:
             allow_below_relay_floor=allow_below_relay_floor or store is None,
             error_type=ValidationError,
         )
+        # Validate the wait parameters HERE, not on first `.minter` access. Deferring them
+        # reproduces, on the two newest arguments, exactly the fault the fee-rate gate above
+        # was added to fix: `GlyphClient(store=..., poll_interval_s=0)` constructed happily
+        # and then failed with "GlyphMinter poll_interval_s must be > 0" — a class the
+        # caller never wrote, about a parameter they spelled on this one. Third time this
+        # cycle, so it is checked here even though the minter checks it again.
+        if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 1:
+            # The fourth instance of the same fault, and it was sitting in the function
+            # where the other three were fixed. `fee_rate`, then the sub-floor gate, then
+            # the two wait parameters — each was validated here only after a review found
+            # the refusal arriving late and naming `GlyphMinter`. This one was left because
+            # I was fixing the parameters a reviewer had named, not the ones that shared
+            # their shape.
+            raise ValidationError("GlyphClient min_confirmations must be an int >= 1")
+        _assert_positive_finite(
+            confirmation_timeout_s, what="GlyphClient confirmation_timeout_s", maximum=_MAX_WAIT_TIMEOUT_S
+        )
+        _assert_positive_finite(poll_interval_s, what="GlyphClient poll_interval_s", minimum=_MIN_WAIT_INTERVAL_S)
         self._client = client
         self._wallet = wallet
         self._store = store

@@ -266,3 +266,223 @@ def test_finite_depths_still_work():
     assert _confirmations_of({"confirmations": 2.9}) == 2
     assert _confirmations_of({"confirmations": -5}) == 0
     assert _confirmations_of({"confirmations": True}) == 0
+
+
+class TestTheSleepNeverOvershootsTheDeadline:
+    """The poll happens before the sleep, so a plain ``sleep(interval_s)`` makes the wait
+    run to the next interval boundary rather than to ``timeout_s``.
+
+    Measured before the fix: ``timeout_s=0.2, interval_s=3.0`` raised after 3.00s — a 15x
+    overshoot. A units slip (milliseconds where seconds are meant) turns that into hours,
+    on a wait that is holding a Glyph commit: a hashlock with no owner-only spend path.
+
+    These use a clock advanced by the amount actually slept, rather than the module's
+    step-per-read ``_FakeClock``, because the fix reads the clock inside the sleep
+    expression — a fixture that advances per read would measure the fixture.
+    """
+
+    @staticmethod
+    def _run(timeout_s: float, interval_s: float):
+        import asyncio
+
+        now = [0.0]
+        slept: list[float] = []
+
+        async def _sleep(seconds: float) -> None:
+            slept.append(round(seconds, 6))
+            now[0] += seconds
+
+        reader = _Reader([{"confirmations": 0}])
+        with pytest.raises(ConfirmationTimeoutError):
+            asyncio.run(
+                wait_for_confirmation(
+                    reader,
+                    "ab" * 32,
+                    min_confirmations=1,
+                    timeout_s=timeout_s,
+                    interval_s=interval_s,
+                    sleep=_sleep,
+                    clock=lambda: now[0],
+                )
+            )
+        return slept, now[0]
+
+    @pytest.mark.parametrize(
+        "timeout_s, interval_s, expected",
+        [
+            (0.2, 3.0, [0.2]),  # the pathological case: one clamped sleep, not a 15x overshoot
+            (25.0, 10.0, [10.0, 10.0, 5.0]),  # uneven: only the LAST sleep is shortened
+            (30.0, 10.0, [10.0, 10.0, 10.0]),  # even division: untouched
+        ],
+    )
+    def test_the_sleeps_are_clamped_to_the_time_remaining(self, timeout_s, interval_s, expected):
+        slept, elapsed = self._run(timeout_s, interval_s)
+        assert slept == expected
+        assert elapsed <= timeout_s, f"waited {elapsed} against a {timeout_s} deadline"
+
+    def test_an_interval_longer_than_the_timeout_still_polls_once(self):
+        """Clamping must not turn a short timeout into a wait that never asks the node.
+
+        The poll precedes the sleep, so at least one real query happens before the
+        deadline — the caller learns the transaction's state rather than only that time
+        ran out.
+        """
+        reader = _Reader([{"confirmations": 0}])
+        import asyncio
+
+        now = [0.0]
+
+        async def _sleep(seconds: float) -> None:
+            now[0] += seconds
+
+        with pytest.raises(ConfirmationTimeoutError):
+            asyncio.run(
+                wait_for_confirmation(
+                    reader,
+                    "ab" * 32,
+                    min_confirmations=1,
+                    timeout_s=0.05,
+                    interval_s=99.0,
+                    sleep=_sleep,
+                    clock=lambda: now[0],
+                )
+            )
+        assert reader.calls >= 1, "the node was never asked"
+
+
+async def _no_sleep(_seconds: float) -> None:
+    """A sleep that does not sleep.
+
+    `max_iterations` alone does not defuse `interval_s=nan`: the hang is inside
+    `asyncio.sleep(nan)`, which no iteration cap can interrupt. The function exposes a
+    `sleep` seam precisely so a test can reach the loop without real time — using it is
+    what turns a would-be CI wedge into a fast, red failure.
+    """
+
+
+class TestTheBoundsMustBeFinite:
+    """`nan <= 0` and `inf <= 0` are both False, so a bare range check lets both through —
+    and every one of them makes this loop unbounded.
+
+    Measured against a counting fake before the fix, all three ran past a 400-iteration
+    cap: `timeout_s=nan` (the deadline test is always False), `timeout_s=inf` (the deadline
+    never arrives), and `interval_s=nan` (`asyncio.sleep(nan)` never returns).
+
+    The deadline clamp made the `nan` case sharper, not safer: `min(interval_s, max(0.0,
+    nan - elapsed))` collapses to `sleep(0.0)`, turning a slow unbounded loop into a
+    full-rate one. A bound that is not finite is not a bound.
+
+    `GlyphMinter` and `GlyphClient` grew their own finiteness checks first. This is the
+    primitive they wrap, it is `__all__`-exported, and it was still accepting exactly what
+    they had learned to refuse.
+
+    ``max_iterations`` is not decoration. With the guard reverted these calls loop forever,
+    and no pytest-timeout is configured — so the regression would WEDGE CI rather than
+    redden it. Bounding the loop makes a regression fail fast with the wrong exception
+    instead of stalling the pipeline. A test that hangs on regression reports nothing.
+    """
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_timeout_is_refused(self, bad: float) -> None:
+        import asyncio
+
+        with pytest.raises(ValidationError, match="timeout_s"):
+            asyncio.run(
+                wait_for_confirmation(
+                    _Reader([{"confirmations": 0}]), "ab" * 32, timeout_s=bad, max_iterations=3, sleep=_no_sleep
+                )
+            )
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_interval_is_refused(self, bad: float) -> None:
+        import asyncio
+
+        with pytest.raises(ValidationError, match="interval_s"):
+            asyncio.run(
+                wait_for_confirmation(
+                    _Reader([{"confirmations": 0}]), "ab" * 32, interval_s=bad, max_iterations=3, sleep=_no_sleep
+                )
+            )
+
+    def test_zero_interval_is_accepted_only_when_something_bounds_it(self) -> None:
+        """The primitive still allows 0 — it is the low-level seam, and a test injecting a
+        fake ``sleep`` legitimately wants no delay — but only WITH ``max_iterations``.
+
+        This test's earlier docstring justified 0 on the grounds that ``max_iterations``
+        bounds it. That was true only if the caller passed one, and it defaults to None:
+        measured, an unbounded zero interval runs 644,164 polls per second against the node
+        for the whole timeout. The test was pinning an oversight as a contract, so the
+        primitive now requires the two together and the sentence is true.
+        """
+        import asyncio
+
+        with pytest.raises(ConfirmationTimeoutError):
+            asyncio.run(
+                wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=0, max_iterations=2)
+            )
+
+    def test_an_unbounded_zero_interval_is_refused(self) -> None:
+        """The half the old test left open, and the one that costs a node."""
+        import asyncio
+
+        with pytest.raises(ValidationError, match="max_iterations"):
+            asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=0))
+
+
+class TestTheRuleLivesAtOneLayer:
+    """Three layers validated the same wait parameters with three sets of rules, added by
+    three review rounds, and they drifted.
+
+    The mechanical cause was direction: `network/` cannot import from `glyph/`, so a shared
+    helper living in `glyph/mint.py` was structurally unreachable from the module that most
+    needed it. The helper now lives here and the Glyph constructors import it downward.
+
+    One divergence remains and it is deliberate: this primitive accepts a sub-floor
+    interval WHEN `max_iterations` bounds it, because it is the low-level seam and a test
+    injecting a fake `sleep` wants no delay. The constructors have no such escape, because
+    there nothing bounds a busy loop.
+    """
+
+    def test_the_glyph_constructors_import_the_rule_from_here(self) -> None:
+        """Not a copy. If someone reintroduces a second implementation upstream, the two
+        will drift again — that is exactly how this started."""
+        import pyrxd.glyph.client as client_mod
+        import pyrxd.glyph.mint as mint_mod
+        import pyrxd.network.confirm as confirm_mod
+
+        assert mint_mod._assert_positive_finite is confirm_mod._assert_positive_finite
+        assert client_mod._assert_positive_finite is confirm_mod._assert_positive_finite
+        assert mint_mod._MIN_WAIT_INTERVAL_S == confirm_mod._MIN_WAIT_INTERVAL_S
+        assert client_mod._MAX_WAIT_TIMEOUT_S == confirm_mod._MAX_WAIT_TIMEOUT_S
+
+    def test_a_sub_floor_interval_needs_a_bound_here(self) -> None:
+        import asyncio
+
+        with pytest.raises(ValidationError, match="max_iterations"):
+            asyncio.run(
+                wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=5e-324, timeout_s=1.0)
+            )
+
+    def test_a_sub_floor_interval_is_allowed_when_bounded(self) -> None:
+        """The seam the primitive exists to keep open."""
+        import asyncio
+
+        with pytest.raises(ConfirmationTimeoutError):
+            asyncio.run(
+                wait_for_confirmation(
+                    _Reader([{"confirmations": 0}]),
+                    "ab" * 32,
+                    interval_s=0,
+                    timeout_s=1.0,
+                    max_iterations=2,
+                    sleep=_no_sleep,
+                )
+            )
+
+    def test_the_ceiling_applies_here_too(self) -> None:
+        """`inf` refused and `1e308` accepted was the asymmetry that made the ceiling
+        theatre one layer up; it was still theatre here."""
+        import asyncio
+
+        with pytest.raises(ValidationError, match="timeout_s"):
+            asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, timeout_s=1e308))

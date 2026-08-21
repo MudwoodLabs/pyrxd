@@ -1185,3 +1185,210 @@ class TestSignValidation:
         tx = Transaction(tx_inputs=[_in()], tx_outputs=[_out(_P2PKH_AA, None)])
         with pytest.raises(ValueError, match="missing an amount"):
             tx.sign()
+
+
+class TestGlyphScriptShapeGuardsCheckEveryClause:
+    """Kills the compound-guard survivors in ``pyrxd.glyph.script``.
+
+    The parsers reject malformed scripts with one multi-clause condition, e.g.
+
+        if len(script) != 75 or script[25] != 0xBD or script[26] != 0xD0:
+
+    Mutating a single clause survives, because the other clauses still reject whatever
+    malformed input the suite happened to use. The first `glyphscript` sweep left 56 logic
+    survivors in the module and 25 of them sat on four such lines — the module scored 88%
+    overall precisely because these were the part nothing reached.
+
+    Killing them needs one case per clause: a script that is valid in every respect EXCEPT
+    the byte that clause checks. `extract_ref_from_ft_script` is the one that matters most —
+    `select_ft_inputs` uses it to verify a candidate UTXO really holds the token being
+    spent, rather than trusting an index or a cached balance, so a guard that has gone
+    permissive is the difference between checking a holding and assuming one.
+    """
+
+    @staticmethod
+    def _ft_script() -> bytes:
+        from pyrxd.glyph.script import build_ft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20
+
+        return build_ft_locking_script(Hex20(b"\x11" * 20), GlyphRef(txid="ab" * 32, vout=0))
+
+    @staticmethod
+    def _nft_script() -> bytes:
+        from pyrxd.glyph.script import build_nft_locking_script
+        from pyrxd.glyph.types import GlyphRef
+        from pyrxd.security.types import Hex20
+
+        return build_nft_locking_script(Hex20(b"\x22" * 20), GlyphRef(txid="cd" * 32, vout=1))
+
+    def test_the_valid_ft_script_is_accepted(self) -> None:
+        """Pair every refusal with the honest path, or the guard could reject everything
+        and still look green."""
+        from pyrxd.glyph.script import extract_ref_from_ft_script
+
+        ref = extract_ref_from_ft_script(self._ft_script())
+        assert ref.txid == "ab" * 32 and ref.vout == 0
+
+    @pytest.mark.parametrize("offset", [25, 26])
+    def test_each_checked_ft_opcode_byte_is_enforced(self, offset: int) -> None:
+        """One case per clause of `len != 75 or script[25] != 0xBD or script[26] != 0xD0`."""
+        from pyrxd.glyph.script import extract_ref_from_ft_script
+        from pyrxd.security.errors import ValidationError
+
+        corrupt = bytearray(self._ft_script())
+        corrupt[offset] ^= 0xFF
+        with pytest.raises(ValidationError):
+            extract_ref_from_ft_script(bytes(corrupt))
+
+    @pytest.mark.parametrize("delta", [-1, 1])
+    def test_the_ft_length_clause_is_enforced(self, delta: int) -> None:
+        from pyrxd.glyph.script import extract_ref_from_ft_script
+        from pyrxd.security.errors import ValidationError
+
+        s = self._ft_script()
+        wrong = s[:-1] if delta < 0 else s + b"\x00"
+        with pytest.raises(ValidationError):
+            extract_ref_from_ft_script(wrong)
+
+    @pytest.mark.parametrize(
+        "fn_name, expected",
+        [("extract_owner_pkh_from_nft_script", b"\x22" * 20), ("extract_ref_from_nft_script", None)],
+    )
+    def test_both_nft_extractors_check_the_marker_byte(self, fn_name: str, expected) -> None:
+        """`extract_ref_from_nft_script` and `extract_owner_pkh_from_nft_script` carry the
+        SAME guard, `len(script) != 63 or script[0] != 0xD8`, eighteen lines apart.
+
+        Testing one leaves the other's clause unpinned — verified: dropping the marker
+        clause from line 359 failed this class, dropping it from line 345 did not. Same
+        "fixed one, missed its sibling" shape as the two refusals in `build_nft_transfer`.
+        """
+        import pyrxd.glyph.script as gs
+        from pyrxd.security.errors import ValidationError
+
+        fn = getattr(gs, fn_name)
+        good = self._nft_script()
+        got = fn(good)
+        if expected is not None:
+            assert got == expected
+
+        corrupt = bytearray(good)
+        corrupt[0] ^= 0xFF
+        with pytest.raises(ValidationError):
+            fn(bytes(corrupt))
+
+    def test_the_nft_owner_guard_checks_its_marker_byte(self) -> None:
+        """`len(script) != 63 or script[0] != 0xD8` — the marker clause alone."""
+        from pyrxd.glyph.script import extract_owner_pkh_from_nft_script
+        from pyrxd.security.errors import ValidationError
+
+        good = self._nft_script()
+        assert extract_owner_pkh_from_nft_script(good) == bytes(b"\x22" * 20)
+
+        corrupt = bytearray(good)
+        corrupt[0] ^= 0xFF
+        with pytest.raises(ValidationError):
+            extract_owner_pkh_from_nft_script(bytes(corrupt))
+
+    def test_the_ft_owner_guard_checks_its_regex_clause(self) -> None:
+        """`len(script) != 75 or not FT_SCRIPT_RE.match(...)` — the regex clause alone,
+        reached with a script of the right length whose body is wrong."""
+        from pyrxd.glyph.script import extract_owner_pkh_from_ft_script
+        from pyrxd.security.errors import ValidationError
+
+        good = self._ft_script()
+        assert extract_owner_pkh_from_ft_script(good) == bytes(b"\x11" * 20)
+
+        corrupt = bytearray(good)
+        corrupt[25] ^= 0xFF  # right length, wrong opcode -> only the regex can catch it
+        with pytest.raises(ValidationError):
+            extract_owner_pkh_from_ft_script(bytes(corrupt))
+
+
+class TestMutableScriptsigPushEncodingAtItsBoundaries:
+    """Kills the `_push_bytes` survivors in ``pyrxd.glyph.payload``.
+
+    `build_mutable_scriptsig` pushes the CBOR payload with a nested `_push_bytes`, which
+    picks the opcode by length: a bare length byte up to 75, `OP_PUSHDATA1` (0x4C) to 255,
+    `OP_PUSHDATA2` (0x4D, little-endian length) to 65535. The corrected `glyphscript` sweep
+    left 66 survivors across those four lines.
+
+    They were *executed* — a modest NFT's CBOR is 186 bytes, well past the first boundary —
+    but nothing asserted the resulting bytes, so swapping the opcode or the length width
+    went unnoticed. A wrong push makes a scriptSig the interpreter reads as a different
+    script, and the reveal is the only thing that can ever spend the commit output.
+
+    Sibling note: `_push_minimal_int` has surviving mutants on the *same-looking* branches,
+    and they are NOT the same case. Its condition is on the byte-length of an encoded
+    integer, so reaching `length >= 0x4C` needs n >= 2**608. Those are unreachable, not
+    untested, and no test should pretend otherwise.
+    """
+
+    @staticmethod
+    def _sig_for(cbor: bytes) -> bytes:
+        from pyrxd.glyph.payload import build_mutable_scriptsig
+
+        return build_mutable_scriptsig("mod", cbor, 0, 0, 0, 0)
+
+    @classmethod
+    def _scriptsig(cls, payload_len: int) -> bytes:
+        return cls._sig_for(b"\x5a" * payload_len)
+
+    @staticmethod
+    def _find(hay: bytes, needle: bytes) -> int:
+        i = hay.find(needle)
+        assert i != -1, "the payload push is not in the scriptsig at all"
+        return i
+
+    def test_a_short_payload_uses_a_bare_length_byte(self) -> None:
+        """75 is the last bare-length push.
+
+        Asserting only `sig[i-1] == 75` is not enough and a planted mutant proved it: the
+        length byte is 75 under BOTH encodings, so shifting the boundary to `n <= 74` sends
+        this payload down the PUSHDATA1 branch and the assertion still passes. The bare
+        form has to be asserted by its ABSENCE of an opcode prefix.
+        """
+        body = b"\x5a" * 75
+        sig = self._scriptsig(75)
+        assert bytes([75]) + body in sig
+        assert b"\x4c" + bytes([75]) + body not in sig, "75 bytes must not use PUSHDATA1"
+
+    def test_crossing_75_switches_to_pushdata1(self) -> None:
+        """The boundary itself: 75 is bare, 76 is OP_PUSHDATA1."""
+        body = b"\x5a" * 76
+        sig = self._scriptsig(76)
+        i = self._find(sig, body)
+        assert sig[i - 2 : i] == b"\x4c\x4c", f"expected OP_PUSHDATA1 + length 76, got {sig[i - 2 : i].hex()}"
+
+    def test_a_255_byte_payload_still_uses_pushdata1(self) -> None:
+        sig = self._scriptsig(255)
+        i = self._find(sig, b"\x5a" * 255)
+        assert sig[i - 2 : i] == b"\x4c\xff"
+
+    def test_crossing_255_switches_to_pushdata2_little_endian(self) -> None:
+        """256 needs OP_PUSHDATA2 and a two-byte LITTLE-endian length. Byte order is the
+        half a round-trip test cannot see: encode and decode agree either way."""
+        sig = self._scriptsig(256)
+        i = self._find(sig, b"\x5a" * 256)
+        assert sig[i - 3 : i] == b"\x4d\x00\x01", (
+            f"expected OP_PUSHDATA2 + 0x0100 little-endian, got {sig[i - 3 : i].hex()}"
+        )
+
+    def test_a_real_metadata_payload_lands_on_pushdata1(self) -> None:
+        """Not a synthetic length — the shape an ordinary mint actually produces."""
+        from pyrxd.glyph.payload import encode_payload
+        from pyrxd.glyph.types import GlyphMetadata, GlyphProtocol
+
+        cbor, _ = encode_payload(
+            GlyphMetadata(protocol=[GlyphProtocol.NFT], name="x" * 40, description="y" * 120, token_type="t")
+        )
+        assert 76 <= len(cbor) <= 255, f"fixture drifted out of the PUSHDATA1 band: {len(cbor)}"
+        sig = self._sig_for(cbor)
+        i = self._find(sig, cbor)
+        assert sig[i - 2 : i] == bytes([0x4C, len(cbor)])
+
+    def test_an_oversized_payload_is_refused(self) -> None:
+        from pyrxd.security.errors import ValidationError
+
+        with pytest.raises(ValidationError):
+            self._scriptsig(65536)
