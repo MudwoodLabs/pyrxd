@@ -509,13 +509,42 @@ class TestTheOptionalExtraStaysOptional:
     true is a stray top-level import."""
 
     def test_pyrxd_imports_and_the_channel_works_without_rns(self) -> None:
+        """Run it in a fresh interpreter where RNS is unimportable.
+
+        The first version asserted ``"RNS" not in sys.modules``, which is a GLOBAL
+        condition any other test file may legitimately violate — and one does: the
+        integration module calls ``importorskip("RNS")`` at import time, so collecting it
+        put RNS in ``sys.modules`` and this failed for a reason that had nothing to do with
+        the property. The claim is "pyrxd works when rns is ABSENT", and only an isolated
+        interpreter with the import actually blocked can test that.
+        """
+        import subprocess
         import sys
 
-        assert "RNS" not in sys.modules, "something imported RNS at module scope"
-        from pyrxd.gravity.watch.adapters import ReticulumAlertChannel
-
-        ch = ReticulumAlertChannel("ab" * 16, transport=_FakeRnsTransport())
-        assert ch.encode(_reticulum_page())  # the whole channel is exercisable with rns absent
+        snippet = (
+            "import sys\n"
+            "class _Block:\n"
+            "    def find_module(self, name, path=None):\n"
+            "        return self if name.split('.')[0] in ('RNS', 'rns') else None\n"
+            "    def load_module(self, name):\n"
+            "        raise ImportError('blocked for test')\n"
+            "    def find_spec(self, name, path=None, target=None):\n"
+            "        if name.split('.')[0] in ('RNS', 'rns'):\n"
+            "            raise ImportError('blocked for test')\n"
+            "        return None\n"
+            "sys.meta_path.insert(0, _Block())\n"
+            "from pyrxd.gravity.watch.adapters import ReticulumAlertChannel\n"
+            "from pyrxd.gravity.watch.alerts import Page, Severity\n"
+            "from pyrxd.gravity.watch.decide import Intent\n"
+            "class T:\n"
+            "    def send(self, d, p): pass\n"
+            "pg = Page('s', Intent.PAGE_CLAIM, Severity.CRITICAL, 'm', 'a', 1, False)\n"
+            "assert ReticulumAlertChannel('ab'*16, transport=T()).encode(pg)\n"
+            "print('OK')\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", snippet], capture_output=True, text=True, timeout=60)
+        assert proc.returncode == 0, f"pyrxd failed with rns unavailable:\n{proc.stderr[-2000:]}"
+        assert "OK" in proc.stdout
 
     def test_nothing_outside_the_transport_adapter_references_rns(self) -> None:
         """One containment point. If a second module starts importing it, the extra has

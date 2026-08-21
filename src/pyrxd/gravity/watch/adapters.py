@@ -561,25 +561,49 @@ class RnsTransport:
     page arrive over LoRa with the WAN unplugged.
     """
 
-    def __init__(self, *, config_path: str | None = None, app_name: str = "pyrxd.watchtower") -> None:
+    def __init__(
+        self,
+        *,
+        config_path: str | None = None,
+        app_name: str = "pyrxd",
+        aspects: tuple[str, ...] = ("watchtower", "alert"),
+    ) -> None:
         try:
             import RNS
         except ImportError as exc:  # pragma: no cover - depends on the optional extra
             raise ValidationError("RnsTransport needs the Reticulum stack: pip install 'pyrxd[reticulum]'") from exc
         self._rns_mod = RNS
-        self._reticulum = RNS.Reticulum(config_path)
+        if "." in app_name:
+            # RNS raises ValueError("Dots can't be used in app names") — the aspect
+            # separator IS the dot, so a dotted app name is a namespace error, not a
+            # string. Caught here with the reason rather than deep inside Destination().
+            raise ValidationError(
+                f"RnsTransport app_name must not contain dots (got {app_name!r}); pass further aspects via `aspects=`"
+            )
+        # `RNS.Reticulum()` is a per-process singleton: constructing a second one raises
+        # OSError("Attempt to reinitialise Reticulum, when it was already running"). A
+        # watchtower would normally build one transport, but "normally" is not a guarantee
+        # — a second destination, a reconfigure, or two tests in one process all hit it.
+        # Reuse the running instance instead of exploding on the second construction.
+        running = RNS.Reticulum.get_instance()
+        self._reticulum = running if running is not None else RNS.Reticulum(config_path)
         self._identity = RNS.Identity()
         self._app_name = app_name
+        self._aspects = tuple(aspects)
 
-    def send(self, destination: bytes, payload: bytes) -> None:  # pragma: no cover - needs a radio
+    def send(self, destination: bytes, payload: bytes) -> None:
         RNS = self._rns_mod
-        dest = RNS.Destination(
-            RNS.Identity.recall(destination),
-            RNS.Destination.OUT,
-            RNS.Destination.SINGLE,
-            self._app_name,
-            "alert",
-        )
+        identity = RNS.Identity.recall(destination)
+        if identity is None:
+            # A SINGLE destination is addressed by hash but ENCRYPTED to a public key,
+            # which arrives in an announce. No announce seen yet means we cannot encrypt
+            # to it — a real condition on a fresh instance or a partitioned mesh, not a
+            # bug. Raising lets DedupAlerter retry once the announce lands.
+            raise NetworkError(
+                f"no Reticulum announce seen yet for {destination.hex()} — cannot encrypt "
+                "to a destination whose public key is unknown; it will be retried"
+            )
+        dest = RNS.Destination(identity, RNS.Destination.OUT, RNS.Destination.SINGLE, self._app_name, *self._aspects)
         RNS.Packet(dest, payload).send()
 
 
