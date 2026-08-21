@@ -427,3 +427,62 @@ class TestTheBoundsMustBeFinite:
 
         with pytest.raises(ValidationError, match="max_iterations"):
             asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=0))
+
+
+class TestTheRuleLivesAtOneLayer:
+    """Three layers validated the same wait parameters with three sets of rules, added by
+    three review rounds, and they drifted.
+
+    The mechanical cause was direction: `network/` cannot import from `glyph/`, so a shared
+    helper living in `glyph/mint.py` was structurally unreachable from the module that most
+    needed it. The helper now lives here and the Glyph constructors import it downward.
+
+    One divergence remains and it is deliberate: this primitive accepts a sub-floor
+    interval WHEN `max_iterations` bounds it, because it is the low-level seam and a test
+    injecting a fake `sleep` wants no delay. The constructors have no such escape, because
+    there nothing bounds a busy loop.
+    """
+
+    def test_the_glyph_constructors_import_the_rule_from_here(self) -> None:
+        """Not a copy. If someone reintroduces a second implementation upstream, the two
+        will drift again — that is exactly how this started."""
+        import pyrxd.glyph.client as client_mod
+        import pyrxd.glyph.mint as mint_mod
+        import pyrxd.network.confirm as confirm_mod
+
+        assert mint_mod._assert_positive_finite is confirm_mod._assert_positive_finite
+        assert client_mod._assert_positive_finite is confirm_mod._assert_positive_finite
+        assert mint_mod._MIN_WAIT_INTERVAL_S == confirm_mod._MIN_WAIT_INTERVAL_S
+        assert client_mod._MAX_WAIT_TIMEOUT_S == confirm_mod._MAX_WAIT_TIMEOUT_S
+
+    def test_a_sub_floor_interval_needs_a_bound_here(self) -> None:
+        import asyncio
+
+        with pytest.raises(ValidationError, match="max_iterations"):
+            asyncio.run(
+                wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=5e-324, timeout_s=1.0)
+            )
+
+    def test_a_sub_floor_interval_is_allowed_when_bounded(self) -> None:
+        """The seam the primitive exists to keep open."""
+        import asyncio
+
+        with pytest.raises(ConfirmationTimeoutError):
+            asyncio.run(
+                wait_for_confirmation(
+                    _Reader([{"confirmations": 0}]),
+                    "ab" * 32,
+                    interval_s=0,
+                    timeout_s=1.0,
+                    max_iterations=2,
+                    sleep=_no_sleep,
+                )
+            )
+
+    def test_the_ceiling_applies_here_too(self) -> None:
+        """`inf` refused and `1e308` accepted was the asymmetry that made the ceiling
+        theatre one layer up; it was still theatre here."""
+        import asyncio
+
+        with pytest.raises(ValidationError, match="timeout_s"):
+            asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, timeout_s=1e308))

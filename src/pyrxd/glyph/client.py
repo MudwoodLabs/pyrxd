@@ -22,19 +22,22 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..fee_sizing import assert_fee_rate_clears_relay_floor
-from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, DEFAULT_POLL_INTERVAL_S
+from ..network.confirm import (
+    _MAX_WAIT_TIMEOUT_S,
+    _MIN_WAIT_INTERVAL_S,
+    DEFAULT_CONFIRMATION_TIMEOUT_S,
+    DEFAULT_POLL_INTERVAL_S,
+    _assert_positive_finite,
+)
 from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Hex20
 from .builder import MIN_FEE_RATE
 from .mint import (
-    _MAX_WAIT_TIMEOUT_S,
-    _MIN_WAIT_INTERVAL_S,
     DEFAULT_MINT_CONFIRMATIONS,
     GlyphMinter,
     MintResult,
     PendingMint,
     PendingStore,
-    _assert_positive_finite,
 )
 from .transfer import FtTransferBuild, NftTransferBuild, build_ft_transfer, build_nft_transfer
 

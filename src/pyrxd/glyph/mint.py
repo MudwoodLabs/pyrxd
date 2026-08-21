@@ -77,7 +77,6 @@ from __future__ import annotations
 
 import abc
 import json
-import math
 import os
 import warnings
 from dataclasses import dataclass, replace
@@ -87,7 +86,14 @@ from typing import Any, ClassVar
 from ..constants import DUST_THRESHOLD_PHOTONS
 from ..fee_models import SatoshisPerKilobyte
 from ..fee_sizing import assert_fee_rate_clears_relay_floor, assert_pays_for_its_size
-from ..network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, DEFAULT_POLL_INTERVAL_S, wait_for_confirmation
+from ..network.confirm import (
+    _MAX_WAIT_TIMEOUT_S,
+    _MIN_WAIT_INTERVAL_S,
+    DEFAULT_CONFIRMATION_TIMEOUT_S,
+    DEFAULT_POLL_INTERVAL_S,
+    _assert_positive_finite,
+    wait_for_confirmation,
+)
 from ..script.script import Script
 from ..script.type import P2PKH, encode_pushdata, to_unlock_script_template
 from ..security.errors import InsufficientFundsError, RxdSdkError, ValidationError
@@ -611,64 +617,6 @@ class UnsafeNullPendingStore(PendingStore):
 # ---------------------------------------------------------------------------
 # The facade
 # ---------------------------------------------------------------------------
-
-
-#: Floor on a confirmation poll interval. 1ms still allows 1,000 polls/second — orders
-#: faster than any node needs — while excluding the denormal-sized values that make the
-#: wait a busy loop rather than a poll.
-_MIN_WAIT_INTERVAL_S: float = 0.001
-
-#: Ceiling on a confirmation timeout. One year. Anything longer is a units slip, and the
-#: failure mode of an effectively-unbounded wait is an unrevealed commit — a hashlock with
-#: no owner-only spend path.
-_MAX_WAIT_TIMEOUT_S: float = 365.0 * 24 * 60 * 60
-
-
-def _assert_positive_finite(
-    value: object, *, what: str, minimum: float | None = None, maximum: float | None = None
-) -> None:
-    """A wait parameter must be a real, positive, FINITE number of seconds.
-
-    `> 0` alone is not enough, and the gap is not academic: ``nan <= 0`` and ``inf <= 0``
-    are both False, so both sail through a bare positivity check. ``asyncio.sleep(nan)``
-    and ``asyncio.sleep(inf)`` never return (measured: still sleeping after 1.5s), and with
-    ``timeout_s=nan`` the loop's ``elapsed >= timeout_s`` is always False while
-    ``max_iterations`` defaults to None — so the wait is unbounded in both directions.
-
-    A reveal that never returns AND never raises leaves an on-chain commit that is a
-    hashlock with no owner-only spend path: the exact stranding these guards exist to
-    prevent, reached by the one input class the guards did not name.
-
-    ``network/confirm.py`` already applies ``math.isfinite`` to numbers coming off the
-    wire. This is the same rule applied to numbers coming from the caller, in one place so
-    the two constructors cannot drift apart.
-    """
-    if not isinstance(value, (int, float)) or isinstance(value, bool):
-        raise ValidationError(f"{what} must be a number")
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValidationError(f"{what} must be finite, got {value}")
-    if value <= 0:
-        raise ValidationError(f"{what} must be > 0")
-    # Bound the range, not just the two IEEE spellings of "no bound".
-    #
-    # Refusing `inf` and accepting `1e308` is theatre: a wait of 1e308 seconds is the
-    # never-returns case under a different name. And refusing `0` while accepting
-    # `5e-324` is the same busy loop — measured at 254,728 polls/second, against a
-    # docstring that cites 715,000/s as the hazard. The guard was written against the two
-    # literals a reviewer named rather than against the behaviour they exemplify.
-    #
-    # The floor is per-poll, so 1ms still permits 1,000 polls/second — far faster than any
-    # node needs, and well below the 0.25s this project uses on regtest. The ceiling is a
-    # year: a mint that waits longer than that is a units error, not a patient caller.
-    if minimum is not None and value < minimum:
-        raise ValidationError(
-            f"{what} must be >= {minimum}s — a shorter poll is a busy loop against the node, not a faster confirmation"
-        )
-    if maximum is not None and value > maximum:
-        raise ValidationError(
-            f"{what} must be <= {maximum}s; a longer wait is a units error, and a wait "
-            f"that never ends holds an unrevealed commit"
-        )
 
 
 class GlyphMinter:

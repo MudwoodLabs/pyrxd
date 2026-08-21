@@ -47,6 +47,91 @@ DEFAULT_POLL_INTERVAL_S: float = 10.0
 DEFAULT_CONFIRMATION_TIMEOUT_S: float = 1800.0
 
 
+# These live HERE, not in the callers that wrap this function.
+#
+# Three layers validated the same wait parameters with three sets of rules, added by
+# three different review rounds, and they drifted: the constructors refused a value
+# this primitive accepted, and vice versa. The mechanical cause was direction —
+# `network/` cannot import from `glyph/`, so the shared rule sitting in `glyph/mint.py`
+# was structurally unreachable from the module that most needed it.
+#
+# One implementation, per-layer policy: callers pass the bounds they mean. The
+# primitive allows a zero interval (it is the low-level seam, and a test injecting a
+# fake `sleep` wants no delay) provided `max_iterations` bounds it; the Glyph
+# constructors demand a millisecond floor, because there nothing bounds a busy loop.
+# Those two rules differ on purpose, and now differ in ONE place that says so.
+
+#: Floor on a confirmation poll interval. 1ms still allows 1,000 polls/second — orders
+#: faster than any node needs — while excluding the denormal-sized values that make the
+#: wait a busy loop rather than a poll.
+_MIN_WAIT_INTERVAL_S: float = 0.001
+
+#: Ceiling on a confirmation timeout. One year. Anything longer is a units slip, and the
+#: failure mode of an effectively-unbounded wait is an unrevealed commit — a hashlock with
+#: no owner-only spend path.
+_MAX_WAIT_TIMEOUT_S: float = 365.0 * 24 * 60 * 60
+
+
+def _assert_finite_number(value: object, *, what: str) -> float:
+    """The half every layer agrees on: it must be a real, finite number.
+
+    Split out because the layers genuinely disagree about the REST. This primitive accepts
+    a zero interval (bounded by `max_iterations`); the Glyph constructors do not. Forcing
+    one predicate on both would be the wrong kind of sharing — but the finiteness rule is
+    the part that actually drifted, and it now has one implementation.
+    """
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValidationError(f"{what} must be a number")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValidationError(f"{what} must be finite, got {value}")
+    return float(value)
+
+
+def _assert_positive_finite(
+    value: object, *, what: str, minimum: float | None = None, maximum: float | None = None
+) -> None:
+    """A wait parameter must be a real, positive, FINITE number of seconds.
+
+    `> 0` alone is not enough, and the gap is not academic: ``nan <= 0`` and ``inf <= 0``
+    are both False, so both sail through a bare positivity check. ``asyncio.sleep(nan)``
+    and ``asyncio.sleep(inf)`` never return (measured: still sleeping after 1.5s), and with
+    ``timeout_s=nan`` the loop's ``elapsed >= timeout_s`` is always False while
+    ``max_iterations`` defaults to None — so the wait is unbounded in both directions.
+
+    A reveal that never returns AND never raises leaves an on-chain commit that is a
+    hashlock with no owner-only spend path: the exact stranding these guards exist to
+    prevent, reached by the one input class the guards did not name.
+
+    ``network/confirm.py`` already applies ``math.isfinite`` to numbers coming off the
+    wire. This is the same rule applied to numbers coming from the caller, in one place so
+    the two constructors cannot drift apart.
+    """
+    _assert_finite_number(value, what=what)
+    assert isinstance(value, (int, float))  # narrowed by the check above
+    if value <= 0:
+        raise ValidationError(f"{what} must be > 0")
+    # Bound the range, not just the two IEEE spellings of "no bound".
+    #
+    # Refusing `inf` and accepting `1e308` is theatre: a wait of 1e308 seconds is the
+    # never-returns case under a different name. And refusing `0` while accepting
+    # `5e-324` is the same busy loop — measured at 254,728 polls/second, against a
+    # docstring that cites 715,000/s as the hazard. The guard was written against the two
+    # literals a reviewer named rather than against the behaviour they exemplify.
+    #
+    # The floor is per-poll, so 1ms still permits 1,000 polls/second — far faster than any
+    # node needs, and well below the 0.25s this project uses on regtest. The ceiling is a
+    # year: a mint that waits longer than that is a units error, not a patient caller.
+    if minimum is not None and value < minimum:
+        raise ValidationError(
+            f"{what} must be >= {minimum}s — a shorter poll is a busy loop against the node, not a faster confirmation"
+        )
+    if maximum is not None and value > maximum:
+        raise ValidationError(
+            f"{what} must be <= {maximum}s; a longer wait is a units error, and a wait "
+            f"that never ends holds an unrevealed commit"
+        )
+
+
 def _confirmations_of(info: Any) -> int:
     """Read the confirmation depth out of a ``get_transaction_verbose`` response.
 
@@ -131,14 +216,10 @@ async def wait_for_confirmation(
     # The deadline clamp below made the `nan` case sharper rather than safer: with
     # `timeout_s=nan` the clamp collapses to `sleep(0.0)`, turning a slow unbounded loop
     # into a full-rate one. A bound that is not finite is not a bound.
-    if (
-        not isinstance(interval_s, (int, float))
-        or isinstance(interval_s, bool)
-        or (isinstance(interval_s, float) and not math.isfinite(interval_s))
-        or interval_s < 0
-    ):
-        raise ValidationError("wait_for_confirmation interval_s must be a finite number >= 0")
-    if interval_s == 0 and max_iterations is None:
+    _assert_finite_number(interval_s, what="wait_for_confirmation interval_s")
+    if interval_s < 0:
+        raise ValidationError("wait_for_confirmation interval_s must be >= 0")
+    if interval_s < _MIN_WAIT_INTERVAL_S and max_iterations is None:
         # A zero interval is a busy loop, not a fast poll: measured at 644,164 polls per
         # second against the node, sustained for the whole timeout. It is allowed here —
         # this is the low-level seam, and a test injecting a fake `sleep` legitimately
@@ -148,16 +229,11 @@ async def wait_for_confirmation(
         # caller passed one, and it defaults to None, so the sentence described an opt-in
         # as if it were a default. Requiring them together makes the sentence true.
         raise ValidationError(
-            "wait_for_confirmation interval_s=0 requires max_iterations — an unbounded "
-            "zero-interval poll is a busy loop against the node, not a faster confirmation"
+            f"wait_for_confirmation interval_s below {_MIN_WAIT_INTERVAL_S}s requires "
+            "max_iterations — an unbounded sub-millisecond poll is a busy loop against the "
+            "node, not a faster confirmation"
         )
-    if (
-        not isinstance(timeout_s, (int, float))
-        or isinstance(timeout_s, bool)
-        or (isinstance(timeout_s, float) and not math.isfinite(timeout_s))
-        or timeout_s <= 0
-    ):
-        raise ValidationError("wait_for_confirmation timeout_s must be a finite number > 0")
+    _assert_positive_finite(timeout_s, what="wait_for_confirmation timeout_s", maximum=_MAX_WAIT_TIMEOUT_S)
     if max_iterations is not None and (not isinstance(max_iterations, int) or max_iterations < 0):
         raise ValidationError("wait_for_confirmation max_iterations must be a non-negative int or None")
 
