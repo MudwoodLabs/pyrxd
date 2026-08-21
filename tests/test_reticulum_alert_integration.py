@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import textwrap
@@ -198,3 +199,41 @@ def _page_for_unknown() -> Page:
         deadline_rxd_height=1,
         low_corroboration=False,
     )
+
+
+@pytest.mark.skipif(os.environ.get("PYRXD_RETICULUM_E2E") != "1", reason="set PYRXD_RETICULUM_E2E=1")
+def test_a_page_crosses_a_non_ip_link_with_networking_severed(tmp_path):
+    """The claim the whole channel exists for: a page arrives when IP does not work.
+
+    The TCP test above proves the plumbing and nothing more — Reticulum tunnelled over TCP
+    fails exactly when TCP fails, which is the outage being defended against. This runs the
+    same production path inside `unshare -rn`, where the only interface is a DOWN loopback:
+    no internet, no localhost. The two Reticulum instances talk over a virtual serial pair
+    (kernel ptys, cross-wired by a pump thread), so the bytes never touch the network stack.
+
+    A real RNode is a serial device too, driven by the same `SerialInterface`. What remains
+    untested after this is the physical layer — the radio itself — not the software path.
+
+    The probe asserts its own premise first and refuses to run if localhost is reachable,
+    because a green result from a namespace that quietly had networking would be worse than
+    no test at all.
+    """
+    if shutil.which("unshare") is None:
+        pytest.skip("needs unshare(1) to sever networking")
+    probe = Path(__file__).parent / "support" / "reticulum_noip_probe.py"
+    assert probe.is_file(), probe
+
+    env = {**os.environ, "PYRXD_NOIP_WORKDIR": str(tmp_path / "noip")}
+    proc = subprocess.run(
+        ["unshare", "-rn", sys.executable, str(probe)],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+    if proc.returncode == 2:
+        pytest.skip(f"namespace still had connectivity: {proc.stdout.strip()}")
+    assert proc.returncode == 0, f"probe failed:\n{proc.stdout[-3000:]}\n{proc.stderr[-2000:]}"
+    assert "no IP connectivity" in proc.stdout, "the probe did not verify its own premise"
+    assert "PAGE ARRIVED OVER A NON-IP LINK" in proc.stdout, proc.stdout[-2000:]
+    assert "deadline=172" in proc.stdout, "the actionable field did not survive the link"
