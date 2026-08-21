@@ -311,7 +311,7 @@ test-command = "$PYTEST $TESTS -x -q -p no:randomly -p no:cacheprovider -o addop
 name = "local"
 EOF
     f_t0=$(date +%s)
-    # Skip `init` when the session already exists. cosmic-ray 8.4.6 was observed to leave both the
+    # Skip `init` when the session already exists. cosmic-ray was observed (on 8.4.6, before the floor moved to 8.7.0) to leave both the
     # specs and the stored results intact when re-init'd over a populated session, so this is
     # belt-and-braces rather than a fix for a known wipe — but re-deriving specs is exactly the
     # step that would silently renumber them if the module had changed, so don't run it.
