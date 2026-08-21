@@ -406,3 +406,50 @@ class TestTheFacadeDoesNotForwardAPhantomOverride:
         minter = inspect.signature(GlyphMinter.reveal_nft).parameters["allow_below_relay_floor"]
         assert facade.default == minter.default, "the facade must forward, not decide"
         assert facade.default is None
+
+
+class TestTheFacadeAndTheMinterDoNotDrift:
+    """A generalisation of the single-parameter pin above.
+
+    `GlyphClient` forwards its mint settings to a lazily-built `GlyphMinter`. When the two
+    signatures drift, the facade silently starts *deciding* something it was only meant to
+    pass on: `reveal_nft`'s `allow_below_relay_floor` was changed to a `bool | None`
+    sentinel on the minter and left `bool = False` on the facade, so every ordinary reveal
+    through the client forwarded what the minter reads as a deliberate override — a
+    sub-floor client broadcast its commit and was then refused its own reveal.
+
+    Checking every shared constructor parameter, rather than the one that broke, is what
+    makes this a guard instead of a regression test.
+    """
+
+    IGNORE = {"self", "client", "wallet", "store"}
+
+    @staticmethod
+    def _shared():
+        import inspect
+
+        from pyrxd.glyph.mint import GlyphMinter
+
+        c = inspect.signature(GlyphClient.__init__).parameters
+        m = inspect.signature(GlyphMinter.__init__).parameters
+        names = [n for n in c if n in m and n not in TestTheFacadeAndTheMinterDoNotDrift.IGNORE]
+        return c, m, names
+
+    def test_every_shared_constructor_default_matches(self):
+        c, m, names = self._shared()
+        assert names, "no shared parameters found — the introspection broke, not the code"
+        drift = {n: (c[n].default, m[n].default) for n in names if c[n].default != m[n].default}
+        assert not drift, f"facade/minter defaults drifted: {drift}"
+
+    def test_every_shared_parameter_is_actually_forwarded(self):
+        """Matching defaults are not enough — the facade must also pass the value on.
+
+        A parameter accepted and then dropped looks correct in the signature and silently
+        applies the minter's default instead of the caller's value.
+        """
+        import inspect
+
+        _c, _m, names = self._shared()
+        src = inspect.getsource(GlyphClient.minter.fget)
+        missing = [n for n in names if f"{n}=self._{n}" not in src]
+        assert not missing, f"accepted by GlyphClient.__init__ but never forwarded: {missing}"
