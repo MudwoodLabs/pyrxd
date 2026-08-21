@@ -18,12 +18,13 @@ poetry run task mutate fee                # fee_sizing.py — the one fee-sizing
 poetry run task mutate wallet             # wallet.py — the flat-key send/sweep builders
 poetry run task mutate hdwallet           # hd/wallet.py — the BIP32/44 send/sweep builders
 poetry run task mutate glyph              # glyph/ft.py + glyph/builder.py — token builders
+poetry run task mutate mint               # glyph/mint.py + transfer.py + client.py — mint/move facade
 poetry run task mutate swap               # gravity/htlc_spend.py + swap/rswp/orders.py
 poetry run task mutate coordinator        # gravity/swap_coordinator.py — the swap state machine
 poetry run task mutate network            # network/ — remote-response parsing + failover
 
 poetry run task mutate consensus          # the original four groups
-poetry run task mutate value              # the seven value-moving groups
+poetry run task mutate value              # the eight value-moving groups
 poetry run task mutate all                # everything, sequentially (many hours)
 ```
 
@@ -117,6 +118,49 @@ Two constraints shape the value-group lists specifically:
 - **Group by the tests that decide, not by directory.** `wallet.py` and `hd/wallet.py` started as one
   group and their decisive suites turned out to be nearly disjoint, so each file's mutants were paying
   for the other file's tests — a ~15s clean suite where each half needs ~8s. They are two groups now.
+- **A slow test in the list is a slow test times the mutant count.** The clean-suite wall time is not
+  a detail of the list; it decides whether the group can be run at all. Scoping `mint` found
+  `test_glyph_mint_facade.py` at 30.8s — three tests each waiting out a 10s confirmation poll interval
+  that nothing could shorten, because neither of `_reveal`'s two waits was passed an `interval_s`.
+  Against 1,644 mutants that is the difference between **~11 hours and under an hour**, so the fix
+  (`poll_interval_s`, exposed on `GlyphMinter`/`GlyphClient`) was a prerequisite for the group rather
+  than a nicety. Before adding a group, time its list first: if it is far off the ~1-3s the others
+  run in, find out why before writing the group.
+
+## Baseline results — mint (2026-08)
+
+First sweep of the group, at 0.19.0 + the `poll_interval_s` fix. 1,644 mutants, 2.6s clean
+suite, ~40 minutes.
+
+| Module | Mutants | Killed | Survived | Killed | …of which unkillable | Logic survivors |
+|---|---|---|---|---|---|---|
+| `glyph/mint.py` | 804 | 477 | 327 | 59% | 187 annot + 9 signature | **131** |
+| `glyph/transfer.py` | 582 | 302 | 280 | 52% | 55 annot + 5 signature | **220** |
+| `glyph/client.py` | 258 | 137 | 121 | 53% | 99 annot + 11 signature | **11** |
+| **total** | **1644** | **916** | **728** | **56%** | 341 annot + 25 signature | **362** |
+
+The raw percentage understates the state of `client.py` badly: 99 of its 121 survivors are
+BitOr rewrites of type annotations, so its effective rate against *killable* mutants is 86%.
+`mint.py` is 77% on the same basis. `transfer.py` is the outlier at **55%** — the newest of
+the three, holding the FT/NFT fee guards, and never mutated before this run.
+
+**104 of `transfer.py`'s 220 logic survivors sat on two lines**, the fee estimate inside
+`ft_funding`:
+
+```python
+est_bytes = 84 * (n_outputs + 2) + 148 * (len(selected) + 1) + 50
+needed = est_bytes * fee_rate * 2
+```
+
+`needed` is not a diagnostic — it is passed to `find_plain_rxd_utxo`, which skips any UTXO
+with `value < needed`. Every constant and operator there could be changed and nothing
+noticed, including removing the 2x headroom the docstring promises. The killer tests are in
+`tests/test_glyph_transfer.py::TestTheFeeEstimateThatPicksTheFundingUtxo`; they pin the
+*property* ("deliberately generous", measured at 2.33x a real transfer's fee) rather than
+the constants, because restating the formula would pass for any formula including a mutated
+one. A first version bounded the threshold with a hand-rolled byte count and was loose
+enough that deleting the headroom entirely still passed — worth knowing before writing the
+next one of these.
 
 ## Baseline results — spv (2026-06)
 

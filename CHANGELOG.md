@@ -23,6 +23,16 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   owner-only spend path. This is the same "refuses after the irreversible action" trap the
   constructor already closes for `fee_rate`.
 
+### Fixed
+
+- `ft_funding`'s fee estimate — the number deciding which plain-RXD UTXO is large enough to
+  pay an FT transfer's fee — had **no test at all**. It is passed to `find_plain_rxd_utxo`,
+  which skips any UTXO below it, so shrinking it selects a UTXO that cannot cover the real
+  fee, and Radiant has neither RBF nor CPFP. The first `mint` mutation sweep found 104
+  surviving mutants across its two lines, including one that deletes the 2x headroom the
+  docstring promises. No defect shipped — the formula was correct — but nothing would have
+  noticed if it stopped being.
+
 ### Performance
 
 - The offline test suite runs **147.8s, down from 175s** (measured, same machine). Three
