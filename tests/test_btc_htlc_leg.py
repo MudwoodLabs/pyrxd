@@ -879,3 +879,49 @@ async def test_verify_counterparty_funded_rejects_malformed_outpoint(bad):
     leg, terms, _reader = _verify_leg()
     with pytest.raises(ValidationError):
         await leg.verify_counterparty_funded(bad, terms)
+
+
+async def test_fund_poll_never_waits_past_its_own_deadline():
+    """The funding poll must stop AT ``fund_confirm_timeout_s``, not at the next poll
+    boundary after it.
+
+    The deadline is checked before the sleep, so an unclamped ``sleep(poll_s)`` runs the
+    loop to the next interval instead — overshooting by up to a full poll, and by hours
+    under a milliseconds/seconds slip. On an HTLC leg that deadline is when the caller
+    stops waiting for funding and starts deciding about the refund path, so an overshoot
+    eats into a timelock race.
+
+    Configured here so the overshoot would be unmistakable: a 3s poll against a 0.2s
+    budget. Unclamped this takes ~3s; clamped it returns at ~0.2s.
+    """
+    import time as _time
+
+    taker, maker = generate_keypair("bcrt"), generate_keypair("bcrt")
+    terms = _terms(maker_kp=maker, taker_kp=taker)
+    bc = FakeBroadcaster()
+    reader = _ShallowThenConfirmReader(shallow_calls=10**9)  # never confirms
+    leg = BitcoinTaprootLeg(
+        network="bcrt",
+        taker_keypair=taker,
+        funding_utxo=BtcUtxo(txid="ab" * 32, vout=0, value=200_000),
+        maker_claim_pubkey_xonly=_xonly_of(maker),
+        broadcaster=bc,
+        funding_reader=reader,
+        refund_to_scriptpubkey=b"\x00\x14" + b"\x33" * 20,
+        claim_to_scriptpubkey=b"\x00\x14" + b"\x44" * 20,
+        fee_sats=500,
+        min_confirmations=1,
+        fund_confirm_poll_s=3.0,
+        fund_confirm_timeout_s=0.2,
+    )
+    bc._txid = _fund_built_txid(terms, leg, taker)
+
+    started = _time.monotonic()
+    with pytest.raises(InsufficientConfirmationsError):
+        await leg.fund(terms)
+    elapsed = _time.monotonic() - started
+
+    assert elapsed < 1.0, (
+        f"the funding poll waited {elapsed:.2f}s against a 0.2s deadline — it is sleeping "
+        "a whole poll interval past the deadline it just checked"
+    )

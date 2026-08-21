@@ -1204,7 +1204,19 @@ class TestThePollIntervalReachesEveryWait:
         real = mint_mod.wait_for_confirmation
 
         async def _spy_wait(*args, **kwargs):
-            seen.append(kwargs.get("interval_s"))
+            # Record EVERY forwarded argument, not just the interval. Recording one proved
+            # only that one reached the wait: a reviewer planted a mutant where both call
+            # sites hardcoded `timeout_s=DEFAULT_CONFIRMATION_TIMEOUT_S` and
+            # `min_confirmations=1`, and all 45 tests in the sibling file still passed.
+            # That mutant makes a caller who asked for depth 6 reveal at depth 1 —
+            # spending a commit that is still reorg-exposed.
+            seen.append(
+                {
+                    "interval_s": kwargs.get("interval_s"),
+                    "timeout_s": kwargs.get("timeout_s"),
+                    "min_confirmations": kwargs.get("min_confirmations"),
+                }
+            )
             return await real(*args, **kwargs)
 
         return seen, real, _spy_wait
@@ -1215,11 +1227,45 @@ class TestThePollIntervalReachesEveryWait:
         seen, _real, spy = self._spy()
         monkeypatch.setattr(mint_mod, "wait_for_confirmation", spy)
 
-        minter = GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=0.001)
+        minter = GlyphMinter(
+            FakeClient(),
+            FakeWallet(_key()),
+            RecordingStore(),
+            poll_interval_s=0.001,
+            confirmation_timeout_s=77.5,
+        )
         assert asyncio.run(minter.mint_nft(_nft_metadata())).reveal_txid
 
         assert len(seen) == 2, f"expected a commit wait and a reveal wait, saw {len(seen)}"
-        assert seen == [0.001, 0.001], f"a wait did not get the interval: {seen}"
+        for i, call in enumerate(seen):
+            assert call["interval_s"] == 0.001, f"wait {i} lost the interval: {call}"
+            assert call["timeout_s"] == 77.5, f"wait {i} lost the timeout: {call}"
+
+    def test_the_configured_depth_reaches_the_commit_wait(self, monkeypatch):
+        """`min_confirmations` is reorg safety, not a preference.
+
+        Reading it back off the minter proves only that it was stored. This proves the
+        commit wait actually asks for it — the difference between a caller getting the
+        depth they requested and getting depth 1 on a still-reorg-exposed commit.
+        """
+        import pyrxd.glyph.mint as mint_mod
+
+        seen, _real, spy = self._spy()
+        monkeypatch.setattr(mint_mod, "wait_for_confirmation", spy)
+        minter = GlyphMinter(
+            FakeClient(confirmations=9),
+            FakeWallet(_key()),
+            RecordingStore(),
+            poll_interval_s=0.001,
+            min_confirmations=6,
+        )
+        assert asyncio.run(minter.mint_nft(_nft_metadata())).reveal_txid
+        assert seen[0]["min_confirmations"] == 6, (
+            f"the commit wait asked for {seen[0]['min_confirmations']}, not the configured 6"
+        )
+        # The reveal wait deliberately uses 1: by then the commit is buried and the reveal
+        # only needs to land. Pinned so the intent is visible rather than incidental.
+        assert seen[1]["min_confirmations"] == 1
 
     def test_the_default_is_unchanged_for_callers_who_say_nothing(self):
         """The fix must not quietly re-tune production. A 10s poll is well inside a
@@ -1506,3 +1552,55 @@ class TestTheEchoComparisonIsAnEqualityTest:
             pending = asyncio.run(minter.commit_nft(_nft_metadata()))
         assert store.load(lie) is not None, "the payload must also be filed under the echoed txid"
         assert store.load(pending.commit_txid) is not None
+
+
+class TestTheWaitBoundsAreRangesNotJustLiterals:
+    """Refusing `inf` while accepting `1e308` is theatre, and refusing `0` while accepting
+    `5e-324` is the same busy loop under a different spelling.
+
+    Measured by a reviewer: `poll_interval_s=5e-324` drives 254,728 polls/second — against
+    a guard whose own docstring cites 715,000/s as the hazard it exists to stop. The check
+    had been written against the two literals a previous reviewer named rather than against
+    the behaviour those literals exemplify.
+    """
+
+    @pytest.mark.parametrize("tiny", [5e-324, 1e-12, 0.0009])
+    def test_a_sub_millisecond_interval_is_refused(self, tiny: float) -> None:
+        with pytest.raises(ValidationError, match="poll_interval_s"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), poll_interval_s=tiny)
+
+    @pytest.mark.parametrize("huge", [1e308, 1e12])
+    def test_an_absurd_timeout_is_refused(self, huge: float) -> None:
+        with pytest.raises(ValidationError, match="confirmation_timeout_s"):
+            GlyphMinter(FakeClient(), FakeWallet(_key()), RecordingStore(), confirmation_timeout_s=huge)
+
+    def test_the_bounds_admit_every_value_this_project_actually_uses(self) -> None:
+        """The honest path. 1ms is the floor and still permits 1,000 polls/second; the CLI
+        uses 0.25s on regtest and 10s elsewhere; the default timeout is 1800s."""
+        from pyrxd.network.confirm import DEFAULT_CONFIRMATION_TIMEOUT_S, DEFAULT_POLL_INTERVAL_S
+
+        for interval in (0.001, 0.25, DEFAULT_POLL_INTERVAL_S):
+            for timeout in (1.0, DEFAULT_CONFIRMATION_TIMEOUT_S):
+                assert (
+                    GlyphMinter(
+                        FakeClient(),
+                        FakeWallet(_key()),
+                        RecordingStore(),
+                        poll_interval_s=interval,
+                        confirmation_timeout_s=timeout,
+                    )
+                    is not None
+                )
+
+    def test_the_bound_is_an_argument_not_a_guess_from_the_label(self) -> None:
+        """The first version keyed on `"interval" in what` — rename the parameter and the
+        bound silently disappears. The same substring-dispatch smell this project replaced
+        with typed exceptions elsewhere."""
+        import inspect
+
+        from pyrxd.glyph.mint import _assert_positive_finite
+
+        params = inspect.signature(_assert_positive_finite).parameters
+        assert "minimum" in params and "maximum" in params
+        src = inspect.getsource(_assert_positive_finite)
+        assert '"interval" in what' not in src and '"timeout" in what' not in src

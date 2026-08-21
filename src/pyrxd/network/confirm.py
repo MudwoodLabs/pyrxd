@@ -108,7 +108,7 @@ async def wait_for_confirmation(
         timeout_s: give up once ``clock()`` has advanced this far past the start.
         sleep: awaitable sleep — inject to run without real time.
         clock: monotonic-ish time source — inject to reach the timeout branch. It is
-            read once at entry and once per iteration; a clock that never advances
+            read once at entry, then twice per iteration (the deadline test and the sleep clamp); a clock that never advances
             never times out, which is why ``max_iterations`` exists.
         max_iterations: hard bound on poll count. ``None`` = unbounded (the
             production default). Exhausting it raises the same timeout error with
@@ -116,10 +116,35 @@ async def wait_for_confirmation(
     """
     if not isinstance(min_confirmations, int) or isinstance(min_confirmations, bool) or min_confirmations < 1:
         raise ValidationError("wait_for_confirmation min_confirmations must be an int >= 1")
-    if not isinstance(interval_s, (int, float)) or isinstance(interval_s, bool) or interval_s < 0:
-        raise ValidationError("wait_for_confirmation interval_s must be >= 0")
-    if not isinstance(timeout_s, (int, float)) or isinstance(timeout_s, bool) or timeout_s <= 0:
-        raise ValidationError("wait_for_confirmation timeout_s must be > 0")
+    # Finite, not merely in-range. `nan <= 0` and `inf <= 0` are both False, so a bare
+    # bound lets both through, and every one of them makes this loop unbounded:
+    #   timeout_s=nan  -> `elapsed >= timeout_s` is always False
+    #   timeout_s=inf  -> the deadline never arrives
+    #   interval_s=nan -> `asyncio.sleep(nan)` never returns
+    # `max_iterations` defaults to None, so nothing else stops it.
+    #
+    # This belongs HERE, in the primitive, not only in the callers that wrap it. Both
+    # `GlyphMinter` and `GlyphClient` gained their own finiteness checks first, which
+    # protected their own paths and left this one — a public, `__all__`-exported function
+    # — accepting exactly what they had learned to refuse.
+    #
+    # The deadline clamp below made the `nan` case sharper rather than safer: with
+    # `timeout_s=nan` the clamp collapses to `sleep(0.0)`, turning a slow unbounded loop
+    # into a full-rate one. A bound that is not finite is not a bound.
+    if (
+        not isinstance(interval_s, (int, float))
+        or isinstance(interval_s, bool)
+        or (isinstance(interval_s, float) and not math.isfinite(interval_s))
+        or interval_s < 0
+    ):
+        raise ValidationError("wait_for_confirmation interval_s must be a finite number >= 0")
+    if (
+        not isinstance(timeout_s, (int, float))
+        or isinstance(timeout_s, bool)
+        or (isinstance(timeout_s, float) and not math.isfinite(timeout_s))
+        or timeout_s <= 0
+    ):
+        raise ValidationError("wait_for_confirmation timeout_s must be a finite number > 0")
     if max_iterations is not None and (not isinstance(max_iterations, int) or max_iterations < 0):
         raise ValidationError("wait_for_confirmation max_iterations must be a non-negative int or None")
 

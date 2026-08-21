@@ -553,3 +553,29 @@ class TestTheClientRefusesBadWaitParametersByItsOwnName:
         value that is nonsense is nonsense whether or not it is later used."""
         with pytest.raises(ValidationError, match="GlyphClient"):
             GlyphClient(object(), object(), poll_interval_s=float("nan"))
+
+
+class TestTheClientValidatesMinConfirmationsToo:
+    """The fourth instance of the deferred-refusal fault, found sitting in the very
+    function where the other three had just been fixed.
+
+    `fee_rate`, then the sub-floor gate, then `poll_interval_s`/`confirmation_timeout_s` —
+    each validated here only after a review found the refusal arriving late and naming
+    `GlyphMinter`, a class the caller never wrote. `min_confirmations` was left because the
+    fixes chased the parameters reviewers named rather than the ones sharing their shape.
+    """
+
+    @pytest.mark.parametrize("bad", [0, -1, True, "x", 1.5])
+    def test_it_refuses_at_construction_naming_itself(self, bad) -> None:
+        with pytest.raises(ValidationError) as exc:
+            GlyphClient(object(), object(), store=UnsafeNullPendingStore(), min_confirmations=bad)
+        msg = str(exc.value)
+        assert "GlyphClient" in msg and "min_confirmations" in msg, msg
+        assert "GlyphMinter" not in msg, f"names the wrong class: {msg}"
+
+    def test_a_legitimate_depth_is_still_accepted(self) -> None:
+        import warnings as _w
+
+        with _w.catch_warnings():
+            _w.simplefilter("ignore", UserWarning)
+            assert GlyphClient(object(), object(), store=UnsafeNullPendingStore(), min_confirmations=6) is not None

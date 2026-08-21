@@ -348,3 +348,46 @@ class TestTheSleepNeverOvershootsTheDeadline:
                 )
             )
         assert reader.calls >= 1, "the node was never asked"
+
+
+class TestTheBoundsMustBeFinite:
+    """`nan <= 0` and `inf <= 0` are both False, so a bare range check lets both through —
+    and every one of them makes this loop unbounded.
+
+    Measured against a counting fake before the fix, all three ran past a 400-iteration
+    cap: `timeout_s=nan` (the deadline test is always False), `timeout_s=inf` (the deadline
+    never arrives), and `interval_s=nan` (`asyncio.sleep(nan)` never returns).
+
+    The deadline clamp made the `nan` case sharper, not safer: `min(interval_s, max(0.0,
+    nan - elapsed))` collapses to `sleep(0.0)`, turning a slow unbounded loop into a
+    full-rate one. A bound that is not finite is not a bound.
+
+    `GlyphMinter` and `GlyphClient` grew their own finiteness checks first. This is the
+    primitive they wrap, it is `__all__`-exported, and it was still accepting exactly what
+    they had learned to refuse.
+    """
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_timeout_is_refused(self, bad: float) -> None:
+        import asyncio
+
+        with pytest.raises(ValidationError, match="timeout_s"):
+            asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, timeout_s=bad))
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_a_non_finite_interval_is_refused(self, bad: float) -> None:
+        import asyncio
+
+        with pytest.raises(ValidationError, match="interval_s"):
+            asyncio.run(wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=bad))
+
+    def test_zero_interval_is_still_accepted_here(self) -> None:
+        """The primitive keeps allowing 0 — it is the low-level seam and `max_iterations`
+        bounds it. `GlyphMinter` refuses 0 separately, because there it is a busy loop
+        with nothing to stop it. The two layers disagree on purpose."""
+        import asyncio
+
+        with pytest.raises(ConfirmationTimeoutError):
+            asyncio.run(
+                wait_for_confirmation(_Reader([{"confirmations": 0}]), "ab" * 32, interval_s=0, max_iterations=2)
+            )

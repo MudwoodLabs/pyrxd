@@ -582,7 +582,18 @@ class BitcoinTaprootLeg:
                     exc.required,
                     self.fund_confirm_poll_s,
                 )
-                await asyncio.sleep(self.fund_confirm_poll_s)
+                # Clamp to the time remaining. The deadline is checked BEFORE the sleep,
+                # so an unclamped `sleep(poll_s)` makes this loop run to the next poll
+                # boundary rather than to `fund_confirm_timeout_s` — overshooting by up to
+                # a full interval, and by hours under a milliseconds/seconds slip. On an
+                # HTLC leg the deadline is not a nicety: it is when the caller stops
+                # waiting for funding and starts deciding about the refund path.
+                #
+                # Same defect as `network/confirm.py` had, found in the same review round.
+                # That one was fixed first and its blast-radius note audited
+                # `gravity/trade.py` — attempt-count bounded, not this shape — and
+                # concluded there was no sibling. This is the sibling.
+                await asyncio.sleep(min(self.fund_confirm_poll_s, max(0.0, deadline - time.monotonic())))
 
     async def claim(self, locator: t.BtcHtlcLocator, preimage: bytes) -> str:
         """Build + idempotently broadcast the maker's claim tx (reveals ``p``).

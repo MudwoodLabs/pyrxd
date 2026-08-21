@@ -613,7 +613,20 @@ class UnsafeNullPendingStore(PendingStore):
 # ---------------------------------------------------------------------------
 
 
-def _assert_positive_finite(value: object, *, what: str) -> None:
+#: Floor on a confirmation poll interval. 1ms still allows 1,000 polls/second — orders
+#: faster than any node needs — while excluding the denormal-sized values that make the
+#: wait a busy loop rather than a poll.
+_MIN_WAIT_INTERVAL_S: float = 0.001
+
+#: Ceiling on a confirmation timeout. One year. Anything longer is a units slip, and the
+#: failure mode of an effectively-unbounded wait is an unrevealed commit — a hashlock with
+#: no owner-only spend path.
+_MAX_WAIT_TIMEOUT_S: float = 365 * 24 * 60 * 60
+
+
+def _assert_positive_finite(
+    value: object, *, what: str, minimum: float | None = None, maximum: float | None = None
+) -> None:
     """A wait parameter must be a real, positive, FINITE number of seconds.
 
     `> 0` alone is not enough, and the gap is not academic: ``nan <= 0`` and ``inf <= 0``
@@ -636,6 +649,26 @@ def _assert_positive_finite(value: object, *, what: str) -> None:
         raise ValidationError(f"{what} must be finite, got {value}")
     if value <= 0:
         raise ValidationError(f"{what} must be > 0")
+    # Bound the range, not just the two IEEE spellings of "no bound".
+    #
+    # Refusing `inf` and accepting `1e308` is theatre: a wait of 1e308 seconds is the
+    # never-returns case under a different name. And refusing `0` while accepting
+    # `5e-324` is the same busy loop — measured at 254,728 polls/second, against a
+    # docstring that cites 715,000/s as the hazard. The guard was written against the two
+    # literals a reviewer named rather than against the behaviour they exemplify.
+    #
+    # The floor is per-poll, so 1ms still permits 1,000 polls/second — far faster than any
+    # node needs, and well below the 0.25s this project uses on regtest. The ceiling is a
+    # year: a mint that waits longer than that is a units error, not a patient caller.
+    if minimum is not None and value < minimum:
+        raise ValidationError(
+            f"{what} must be >= {minimum}s — a shorter poll is a busy loop against the node, not a faster confirmation"
+        )
+    if maximum is not None and value > maximum:
+        raise ValidationError(
+            f"{what} must be <= {maximum}s; a longer wait is a units error, and a wait "
+            f"that never ends holds an unrevealed commit"
+        )
 
 
 class GlyphMinter:
@@ -748,7 +781,9 @@ class GlyphMinter:
         # about it holding an on-chain hashlock with no owner-only spend path, which is the
         # same "refuses after the irreversible action" trap this constructor already exists
         # to close for `fee_rate`.
-        _assert_positive_finite(confirmation_timeout_s, what="GlyphMinter confirmation_timeout_s")
+        _assert_positive_finite(
+            confirmation_timeout_s, what="GlyphMinter confirmation_timeout_s", maximum=_MAX_WAIT_TIMEOUT_S
+        )
         # Strictly positive, not `>= 0`. `wait_for_confirmation` polls the server once per
         # iteration and only THEN sleeps, so `interval_s=0` is a busy loop: measured at
         # ~715,000 polls/second, sustained for the whole `confirmation_timeout_s` (default
@@ -760,7 +795,7 @@ class GlyphMinter:
         # `wait_for_confirmation` itself still permits 0: it is the low-level primitive and
         # has `max_iterations` to bound it. This is the knob a caller tuning for a fast local
         # node reaches for, and 0 is never the right answer here.
-        _assert_positive_finite(poll_interval_s, what="GlyphMinter poll_interval_s")
+        _assert_positive_finite(poll_interval_s, what="GlyphMinter poll_interval_s", minimum=_MIN_WAIT_INTERVAL_S)
         self._client = client
         self._wallet = wallet
         self._store = store
