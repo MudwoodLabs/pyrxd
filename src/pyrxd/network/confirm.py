@@ -106,9 +106,11 @@ def _assert_positive_finite(
     wire. This is the same rule applied to numbers coming from the caller, in one place so
     the two constructors cannot drift apart.
     """
-    _assert_finite_number(value, what=what)
-    assert isinstance(value, (int, float))  # narrowed by the check above
-    if value <= 0:
+    # Take the narrowed value back rather than asserting the type. An `assert` here would
+    # be stripped by `python -O`, which is the one build where a silently-unvalidated wait
+    # parameter is least welcome — and bandit says so (B101).
+    number = _assert_finite_number(value, what=what)
+    if number <= 0:
         raise ValidationError(f"{what} must be > 0")
     # Bound the range, not just the two IEEE spellings of "no bound".
     #
@@ -121,11 +123,11 @@ def _assert_positive_finite(
     # The floor is per-poll, so 1ms still permits 1,000 polls/second — far faster than any
     # node needs, and well below the 0.25s this project uses on regtest. The ceiling is a
     # year: a mint that waits longer than that is a units error, not a patient caller.
-    if minimum is not None and value < minimum:
+    if minimum is not None and number < minimum:
         raise ValidationError(
             f"{what} must be >= {minimum}s — a shorter poll is a busy loop against the node, not a faster confirmation"
         )
-    if maximum is not None and value > maximum:
+    if maximum is not None and number > maximum:
         raise ValidationError(
             f"{what} must be <= {maximum}s; a longer wait is a units error, and a wait "
             f"that never ends holds an unrevealed commit"
