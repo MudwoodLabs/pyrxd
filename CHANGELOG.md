@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.0] — 2026-08-22
+
 ### Upgrade notes
 
 - **`wait_for_confirmation` now refuses non-finite and unbounded-zero arguments.** A
