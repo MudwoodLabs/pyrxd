@@ -201,6 +201,66 @@ class TestWalletSweep:
         assert "Mnemonic" not in result.output
         client.broadcast.assert_not_awaited()
 
+    @pytest.mark.parametrize("rate", ["100001", "10000000"])
+    def test_overpay_rejected_before_seed_prompt(self, runner: CliRunner, rate: str) -> None:
+        """#457. ``--fee-rate`` bounded only the LOW end; the SDK has bounded the high end
+        since #456, so the CLI was the looser guard over the likelier slip — a human
+        pasting a per-kB figure into a per-BYTE flag. ``10000000`` is exactly
+        ``RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB``, a 1000x overpay.
+
+        Sweep is the sharpest case in the CLI: it has **no change output**, so the entire
+        difference leaves with the miner, and Radiant has neither RBF nor CPFP to recover
+        it. Refused before the seed prompt, like the sub-floor case above."""
+        client = _funded_client(_addr(0, 0, 0, 0))
+        result = runner.invoke(
+            wallet_group,
+            ["sweep", "--coin-type", "0", "--to", DEST, "--fee-rate", rate],
+            obj=_ctx(client),
+            input="",
+        )
+        assert result.exit_code != 0
+        assert "ceiling" in result.output
+        assert "--allow-overpay" in result.output, "the message must name the way through"
+        client.broadcast.assert_not_awaited()
+
+    def test_allow_overpay_gets_past_the_ceiling_but_not_past_the_floor(self, runner: CliRunner) -> None:
+        """The opt-out skips its own bound only. A flag that also waived the floor would
+        turn a fat-finger guard into a way to build an unrelayable transaction."""
+        client = _funded_client(_addr(0, 0, 0, 0))
+        result = runner.invoke(
+            wallet_group,
+            ["sweep", "--coin-type", "0", "--to", DEST, "--fee-rate", "1", "--allow-overpay"],
+            obj=_ctx(client),
+            input="",
+        )
+        assert result.exit_code != 0
+        assert "relay floor" in result.output
+        client.broadcast.assert_not_awaited()
+
+    def test_allow_overpay_actually_reaches_the_builder_not_just_the_cli_gate(self, runner: CliRunner) -> None:
+        """The flag must be a real path, not a broken promise.
+
+        Found by exploiting the first cut of #457: ``--allow-overpay`` satisfied the CLI
+        gate and the builder was then called WITHOUT it, so the SDK's own ceiling refused
+        the spend a moment later. The operator is told "pass --allow-overpay", does, and
+        is refused again — a guard rejecting work the operator explicitly authorised,
+        which is the same bug class #458 exists to fix.
+
+        Asserting on the broadcast rather than the exit code is deliberate: a CLI-gate-only
+        fix would still fail here, because the refusal happens after the gate.
+        """
+        funded = _addr(0, 0, 0, 0)
+        client = _funded_client(funded, value=500_000_000)
+        result = _invoke(
+            runner,
+            _ctx(client),
+            ["sweep", "--coin-type", "0", "--to", DEST, "--fee-rate", "200000", "--allow-overpay"],
+            confirm="y",
+        )
+        assert "ceiling" not in result.output, "the builder refused a rate the operator authorised"
+        assert result.exit_code == 0, result.output
+        client.broadcast.assert_awaited_once()
+
     def test_fee_rate_help_says_per_byte_not_per_kB(self, runner: CliRunner) -> None:
         """``hd/wallet.py`` computes ``fee = size * fee_rate`` with size in BYTES.
         The help said "per kB", which understates the fee by 1000x to anyone who
@@ -223,3 +283,50 @@ class TestWalletSweep:
         assert "to address:" in result.output
         assert DEST in result.output
         assert "you receive" in result.output
+
+
+class TestTheOverpayOptOutReachesEveryBuilder:
+    """``--allow-overpay`` must reach the BUILDER, not just the CLI gate.
+
+    The first cut of #457 added the flag, validated it in ``_checked_fee_rate``, and then
+    called the builders without it — so the flag cleared one ceiling and was refused by
+    the next. Three call sites were affected (``sweep``, and both of ``send``'s paths:
+    agent and in-process), and two of them are inside module-level helpers that did not
+    take the parameter at all, which surfaced as a ``NameError`` rather than a wrong fee.
+
+    A source-level assertion rather than three behavioural ones: the failure is a MISSING
+    kwarg, so the thing worth pinning is that no call site can be added later without it.
+    """
+
+    @staticmethod
+    def _wallet_cmds_source() -> str:
+        import inspect
+
+        from pyrxd.cli import wallet_cmds
+
+        return inspect.getsource(wallet_cmds)
+
+    def test_every_builder_call_forwards_allow_overpay(self) -> None:
+        import re
+
+        src = self._wallet_cmds_source()
+        # Each call spans several lines after formatting, so match the call and take
+        # everything up to its closing paren at the same indent.
+        calls = re.findall(r"\.(build_send_max_tx|build_send_tx|build_send)\((.*?)\n(\s*)\)", src, re.S)
+        assert calls, "no builder calls found — this test has stopped testing anything"
+        for name, body, _indent in calls:
+            assert "allow_overpay" in body, (
+                f"{name}(...) does not forward allow_overpay; --allow-overpay would clear the "
+                "CLI gate and then be refused by the builder's own ceiling"
+            )
+
+    def test_both_send_helpers_accept_the_flag(self) -> None:
+        """They are module-level, so a closure will not carry the value for them."""
+        import inspect
+
+        from pyrxd.cli.wallet_cmds import _send_in_process, _send_via_agent
+
+        for fn in (_send_via_agent, _send_in_process):
+            params = inspect.signature(fn).parameters
+            assert "allow_overpay" in params, fn.__name__
+            assert params["allow_overpay"].default is False, f"{fn.__name__} must default closed"

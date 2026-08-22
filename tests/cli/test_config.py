@@ -421,7 +421,8 @@ def test_fee_rate_below_the_relay_floor_is_refused(tmp_path, monkeypatch):
     with pytest.raises(ValidationError, match="below Radiant's effective relay floor"):
         load()
 
-    # At the floor, and above it, are both fine — overpaying is the operator's call.
+    # At the floor, and a deliberate 5x above it, are both fine. Not *arbitrarily*
+    # above, though — see the ceiling tests below; 5x is inside the 10x band.
     for ok in (floor_per_byte, floor_per_byte * 5):
         monkeypatch.setenv("PYRXD_FEE_RATE", str(ok))
         assert load().fee_rate == ok
@@ -600,3 +601,106 @@ def test_an_unknown_network_in_the_file_names_the_file(tmp_path: Path, monkeypat
     cfg_file.write_text('network = "mainet"\n')
     with pytest.raises(ValidationError, match=str(cfg_file)):
         _config.load(cfg_file)
+
+
+# ---------------------------------------------------------------------------
+# The HIGH end of the band (#457). The CLI used to accept any rate at or above the
+# floor, documented as "overpaying is the operator's prerogative", while the SDK has
+# refused above MAX_FEE_OVERPAY_MULTIPLE x floor since #456. The CLI was therefore the
+# LOOSER guard over the population more likely to make a unit slip: a human pasting a
+# per-kB figure from a fee table into a per-BYTE flag.
+# ---------------------------------------------------------------------------
+
+
+def _floor_and_ceiling() -> tuple[int, int]:
+    from pyrxd.fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
+
+    floor = relay_floor_photons_per_byte()
+    return floor, floor * MAX_FEE_OVERPAY_MULTIPLE
+
+
+def test_a_fee_rate_above_the_overpay_ceiling_is_refused(monkeypatch) -> None:
+    """The exact slip this catches: the per-kB constant handed to a per-byte field.
+
+    ``RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB`` is 10_000_000 and the per-byte floor
+    is 10_000 — one is the other times 1000, and they are exported from the same module
+    one import apart. Passing the first where the second belongs is a 1000x overpay that
+    on Radiant cannot be recovered: no RBF, no CPFP, and ``wallet sweep`` has no change
+    output, so the whole difference leaves with the miner.
+    """
+    from pyrxd.gravity.fee_policy import RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
+
+    monkeypatch.setenv("PYRXD_FEE_RATE", str(RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB))
+    with pytest.raises(ValidationError, match="above the .*ceiling"):
+        load()
+
+
+def test_the_ceiling_is_judged_at_the_boundary_not_near_it(monkeypatch) -> None:
+    """At the ceiling is accepted; one photon over is refused.
+
+    Pinned because the error renders the multiple to one decimal specifically so the
+    smallest refused rate does not report "is 10x ... above the 10x ceiling" — a message
+    that reads as self-contradictory exactly where a caller is most likely to be standing.
+    """
+    _floor, ceiling = _floor_and_ceiling()
+
+    monkeypatch.setenv("PYRXD_FEE_RATE", str(ceiling))
+    assert load().fee_rate == ceiling
+
+    monkeypatch.setenv("PYRXD_FEE_RATE", str(ceiling + 1))
+    with pytest.raises(ValidationError) as exc:
+        load()
+    assert "10.0x" in str(exc.value), "the multiple must not floor-divide to a self-contradiction"
+
+
+def test_the_ceiling_error_names_where_the_value_came_from(tmp_path, monkeypatch) -> None:
+    """Same pointer the floor error gives. The source-naming block used to live inside
+    the sub-floor branch; a ceiling that could not name the file would send an operator
+    hunting for a value they cannot see."""
+    _floor, ceiling = _floor_and_ceiling()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'network = "mainnet"\nfee_rate = {ceiling * 10}\n')
+    monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+    with pytest.raises(ValidationError, match=str(cfg)):
+        _config.load(cfg)
+
+
+def test_a_per_network_ceiling_breach_names_the_table(tmp_path, monkeypatch) -> None:
+    """The per-network table is resolved by ``for_network``, not by ``load`` — so the
+    ceiling has to be enforced there too, exactly as the floor is. This mirrors
+    ``test_a_per_network_fee_rate_below_the_floor_is_refused``, which is the regression
+    test for the bypass where a ``[networks.<net>]`` key skipped a guard the top-level
+    key was subject to."""
+    _floor, ceiling = _floor_and_ceiling()
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'network = "regtest"\n\n[networks.regtest]\nfee_rate = {ceiling * 10}\n')
+    monkeypatch.delenv("PYRXD_FEE_RATE", raising=False)
+    loaded = _config.load(cfg)
+    with pytest.raises(ValidationError, match=r"\[networks\.regtest\]"):
+        loaded.for_network("regtest")
+
+
+def test_allow_overpay_is_the_way_through_and_only_for_the_ceiling() -> None:
+    """The opt-out must skip its OWN bound and nothing else.
+
+    An ``allow_overpay`` that also waived the floor would let the CLI emit a
+    transaction the network will not relay — the opposite failure, and one that cannot
+    be fee-bumped on Radiant.
+    """
+    from pyrxd.cli.config import validated_fee_rate
+
+    floor, ceiling = _floor_and_ceiling()
+
+    assert validated_fee_rate(ceiling * 100, None, allow_overpay=True) == ceiling * 100
+    with pytest.raises(ValidationError, match="below Radiant's effective relay floor"):
+        validated_fee_rate(floor - 1, None, allow_overpay=True)
+
+
+def test_an_ordinary_rate_still_loads_untouched(monkeypatch) -> None:
+    """The honest path. A guard that refuses valid work is a bug, and every rate an
+    operator actually uses sits inside the band."""
+    floor, ceiling = _floor_and_ceiling()
+
+    for ok in (floor, floor * 2, floor * 9, ceiling):
+        monkeypatch.setenv("PYRXD_FEE_RATE", str(ok))
+        assert load().fee_rate == ok

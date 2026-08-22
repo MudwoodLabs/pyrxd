@@ -6,6 +6,48 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **The CLI now refuses a fee rate above the overpay ceiling**, matching the SDK. It
+  previously accepted any rate at or above the relay floor, documented as "overpaying is
+  the operator's prerogative" — while `GlyphMinter`/`GlyphClient` have refused above
+  `MAX_FEE_OVERPAY_MULTIPLE x floor` (100,000 photons/byte) since 0.19.0. That made the
+  CLI the **looser** guard over the population likelier to make a unit slip: a human
+  pasting a per-**kB** figure from a fee table into a per-**BYTE** flag. Measured before
+  this: `validated_fee_rate(10_000_000)` was accepted, and 10,000,000 is exactly
+  `RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB` — a 1000x overpay, unrecoverable on a
+  chain with no RBF and no CPFP. `wallet sweep` is the sharpest case: no change output,
+  so the whole difference leaves with the miner.
+  `--allow-overpay` on `wallet send` / `wallet sweep` is the deliberate way through. It
+  is **not** reachable from a config file or `PYRXD_FEE_RATE`, on purpose: a rate that
+  persists across every future command is not where a situational decision belongs.
+
+### Added
+
+- `allow_below_relay_floor` now reaches the **transfer** paths, not just mints —
+  `FtUtxoSet.build_transfer_tx` / `build_airdrop_tx`, `build_ft_transfer`,
+  `build_nft_transfer`, and the three params dataclasses, with `GlyphClient` forwarding
+  its constructor flag. `relay_floor_photons_per_byte()` is a fixed **mainnet** constant,
+  so on a regtest node — whose floor really is a tenth of it — a mint at a sub-floor rate
+  succeeded while a transfer at the same rate on the same chain was refused with no way
+  through. That was the guard rejecting work valid on the caller's own chain.
+
+### Fixed
+
+- `validated_fee_rate`'s source-naming block (which file, which `[networks.<net>]` table,
+  or `PYRXD_FEE_RATE`) was computed **inside** the sub-floor branch, so it was unavailable
+  to any other check. Hoisted, so the new ceiling error points at the value's origin the
+  same way the floor error does.
+
+### Internal
+
+- Both fee bounds are independent by construction and by test: `allow_below_relay_floor`
+  never widens the ceiling and `allow_overpay` never lowers the floor. A single flag
+  covering both would hand back the 1000x overpay the ceiling exists to refuse, and the
+  two ends differ in kind — above the ceiling the money is already gone when the build
+  returns, below the floor nothing is spent but the transaction cannot relay and, on
+  Radiant, cannot be bumped.
+
 ## [0.20.0] — 2026-08-22
 
 ### Upgrade notes

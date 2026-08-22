@@ -348,33 +348,32 @@ def assert_fee_rate_clears_relay_floor(
     rate. Each skips only its own bound: the rate still has to be a positive int, and
     opting out of one never opts out of the other.
 
-    **Which override each public builder actually exposes** (re-derived 2026-08-13 by
-    reading the signatures, because the universal claim that used to sit here — that
-    both opt-outs could be reached from every public builder behind this gate — was
-    false in one direction and nobody had checked):
+    **Which override each public builder exposes** (re-derived by reading the
+    signatures, because the universal claim that once sat here was false in one
+    direction and nobody had checked): **both, everywhere** —
+    ``RxdWallet.__init__``, ``HdWallet.build_send_tx`` / ``build_send_max_tx`` /
+    ``send`` / ``send_max``, ``WatchOnlyTxBuilder.build_send``,
+    ``FtUtxoSet.build_transfer_tx`` / ``build_airdrop_tx`` (and their ``GlyphBuilder``
+    wrappers via ``FtTransferParams`` / ``FtAirdropParams``), and
+    ``GlyphBuilder.build_nft_transfer_tx`` via ``TransferParams``.
 
-    * BOTH — ``RxdWallet.__init__``, ``HdWallet.build_send_tx`` / ``build_send_max_tx``
-      / ``send`` / ``send_max``, ``WatchOnlyTxBuilder.build_send``.
-    * ``allow_overpay`` ONLY — ``FtUtxoSet.build_transfer_tx`` / ``build_airdrop_tx``
-      (and their ``GlyphBuilder`` wrappers via ``FtTransferParams`` /
-      ``FtAirdropParams``), and ``GlyphBuilder.build_nft_transfer_tx`` via
-      ``TransferParams.allow_overpay``. No glyph builder accepts
-      ``allow_below_relay_floor``, so an FT transfer at a regtest rate of ``1_000``
-      raises with no opt-out.
+    That symmetry is new (#458). Until then no glyph builder accepted
+    ``allow_below_relay_floor``, so a transfer at a regtest rate of ``1_000`` raised
+    with no way through — while a MINT at the same rate on the same chain succeeded,
+    because :class:`~pyrxd.glyph.mint.GlyphMinter` had the opt-out. :func:`relay_floor_photons_per_byte`
+    is a fixed **mainnet** constant, so that refusal was the guard rejecting work that
+    was valid on the caller's own chain, not a chain rule being enforced.
 
-    That asymmetry is kept, not repaired, and the two ends are not equivalent. Above
-    the ceiling the overpay is **already gone** by the time anything downstream could
-    notice — an NFT transfer and a sweep have no change output — so the build-time
-    refusal is the only place the loss can be prevented, and a caller who genuinely
-    means the rate must be able to say so. Below the floor nothing is spent: the
-    refusal costs a re-run at a higher rate, while the override would let a glyph
-    builder emit a transaction the network will not relay, which on Radiant cannot be
-    RBF'd or CPFP'd and squats its own inputs until mempool expiry 8 hours later. That
-    is why this module calls a sub-floor rate a fund-safety bug rather than a tuning
-    mistake, and why "a ceiling with no reachable override is a guard that refuses
-    valid work" is an argument about the CEILING specifically. Adding a sub-floor
-    opt-out to the glyph builders is a fund-safety API change and belongs to a change
-    that is about that, not to a docstring correction.
+    **The two ends still are not equivalent, and the difference is why each opt-out is
+    spelled separately rather than one flag covering both.** Above the ceiling the
+    overpay is **already gone** by the time anything downstream could notice — an NFT
+    transfer and a sweep have no change output — so the build-time refusal is the only
+    place the loss can be prevented. Below the floor nothing is spent: the refusal costs
+    a re-run, while the override lets a builder emit a transaction the network will not
+    relay, which on Radiant cannot be RBF'd or CPFP'd and squats its own inputs until
+    mempool expiry 8 hours later. That is why this module calls a sub-floor rate a
+    fund-safety bug rather than a tuning mistake, and why each override skips only its
+    own bound: passing ``allow_below_relay_floor`` must never quietly widen the ceiling.
 
     **Why this is not the same bound as**
     :attr:`~pyrxd.gravity.fee_policy.DeadlineFeePolicy.max_urgency_multiplier`, which

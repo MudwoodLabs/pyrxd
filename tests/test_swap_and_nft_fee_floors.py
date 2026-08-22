@@ -751,18 +751,24 @@ class TestTheRateGuard:
 
 
 class TestTheGatesDocstringMatchesTheSignatures:
-    """The docstring is the only place this asymmetry is written down, so it is tested.
+    """The docstring is the only place this reachability is written down, so it is tested.
 
-    ``assert_fee_rate_clears_relay_floor`` used to assert "Both overrides are reachable
-    from every public builder behind this gate" and then LIST the FT builders among
-    them. Measured false: no glyph builder accepts ``allow_below_relay_floor``, so an FT
-    transfer at a regtest rate of 1_000 raises with no opt-out. The claim was kept and
-    the asymmetry documented rather than the override added — below the floor a refusal
-    costs a re-run and the override would let a builder emit a transaction that cannot
-    relay and, on Radiant, cannot be bumped.
+    History, because it is the reason these tests are worth their weight.
+    ``assert_fee_rate_clears_relay_floor`` once asserted "Both overrides are reachable
+    from every public builder behind this gate" and then LISTED the FT builders among
+    them. Measured false: no glyph builder took ``allow_below_relay_floor``, so a
+    transfer at a regtest rate of 1_000 raised with no opt-out while a MINT at the same
+    rate on the same chain succeeded. The claim was corrected to describe the asymmetry
+    rather than repair it, and the repair deferred to a change that was about fund
+    safety rather than about a docstring.
 
-    A docstring assertion is worth having here because the sentence was load-bearing:
-    a reader deciding whether a rate is overridable had nothing else to consult.
+    #458 is that change. The opt-out now reaches every builder, so these tests assert
+    the SYMMETRY — and, critically, that the two bounds stay independent: an
+    ``allow_below_relay_floor`` that also widened the ceiling would hand back the
+    1000x overpay this module exists to refuse.
+
+    A docstring assertion is worth having because the sentence is load-bearing: a
+    reader deciding whether a rate is overridable has nothing else to consult.
     """
 
     @staticmethod
@@ -773,16 +779,20 @@ class TestTheGatesDocstringMatchesTheSignatures:
     def test_the_false_universal_claim_is_gone(self) -> None:
         assert "Both overrides are reachable from every public builder" not in self._doc()
 
-    def test_the_docstring_says_no_glyph_builder_takes_the_below_floor_opt_out(self) -> None:
+    def test_the_docstring_no_longer_claims_the_glyph_builders_lack_the_opt_out(self) -> None:
         doc = self._doc()
         assert "allow_below_relay_floor" in doc
-        assert "No glyph builder accepts ``allow_below_relay_floor``" in doc
+        assert "No glyph builder accepts ``allow_below_relay_floor``" not in doc
+
+    def test_the_docstring_still_states_the_two_bounds_are_independent(self) -> None:
+        """The property a reader most needs, and the one a careless refactor would drop."""
+        assert "skips only its own bound" in self._doc()
 
     @pytest.mark.parametrize(
         ("owner", "method", "below_floor", "overpay"),
         [
-            ("pyrxd.glyph.ft:FtUtxoSet", "build_transfer_tx", False, True),
-            ("pyrxd.glyph.ft:FtUtxoSet", "build_airdrop_tx", False, True),
+            ("pyrxd.glyph.ft:FtUtxoSet", "build_transfer_tx", True, True),
+            ("pyrxd.glyph.ft:FtUtxoSet", "build_airdrop_tx", True, True),
             ("pyrxd.hd.wallet:HdWallet", "build_send_tx", True, True),
             ("pyrxd.hd.wallet:HdWallet", "build_send_max_tx", True, True),
             ("pyrxd.agent.watch_only:WatchOnlyTxBuilder", "build_send", True, True),
@@ -800,10 +810,79 @@ class TestTheGatesDocstringMatchesTheSignatures:
         assert ("allow_below_relay_floor" in params) is below_floor
         assert ("allow_overpay" in params) is overpay
 
-    def test_the_glyph_params_dataclasses_expose_only_the_overpay_opt_out(self) -> None:
+    def test_the_glyph_params_dataclasses_expose_both_opt_outs_defaulting_closed(self) -> None:
         from pyrxd.glyph.builder import FtAirdropParams, FtTransferParams, TransferParams
 
         for params_cls in (FtTransferParams, FtAirdropParams, TransferParams):
             fields = params_cls.__dataclass_fields__
-            assert "allow_overpay" in fields, params_cls.__name__
-            assert "allow_below_relay_floor" not in fields, params_cls.__name__
+            for name in ("allow_overpay", "allow_below_relay_floor"):
+                assert name in fields, f"{params_cls.__name__}.{name}"
+                # Defaulting closed is the whole safety property: a params object built
+                # without mentioning fees must not carry an opt-out the caller never asked
+                # for. Both of these skip a fund-safety refusal.
+                assert fields[name].default is False, f"{params_cls.__name__}.{name} default"
+
+
+class TestTheSubFloorOptOutReachesTransfers:
+    """#458. A MINT could accept a sub-floor rate; a TRANSFER on the same chain could not.
+
+    ``relay_floor_photons_per_byte`` is a fixed MAINNET constant, so on a regtest node —
+    whose floor really is a tenth of it, per
+    ``docs/solutions/integration-issues/regtest-node-inherited-a-tenth-of-mainnets-relay-floor.md``
+    — the transfer refusal was the guard rejecting work valid on the caller's own chain,
+    not the chain rejecting it. A guard that refuses valid work is a bug.
+    """
+
+    REGTEST_RATE = 1_000  # a tenth of the mainnet floor
+
+    def test_the_ft_gate_refuses_by_default_and_accepts_with_the_opt_out(self) -> None:
+        from pyrxd.glyph.ft import _check_fee_rate
+
+        with pytest.raises((ValueError, ValidationError)):
+            _check_fee_rate(self.REGTEST_RATE)
+        _check_fee_rate(self.REGTEST_RATE, allow_below_relay_floor=True)  # must not raise
+
+    def test_the_opt_out_does_not_widen_the_ceiling(self) -> None:
+        """The property that makes two flags necessary rather than one.
+
+        Above the ceiling the overpay is already gone by the time anything downstream
+        could notice; below the floor nothing is spent. A single flag covering both
+        would hand back the 1000x overpay this module exists to refuse.
+        """
+        from pyrxd.glyph.ft import _check_fee_rate
+
+        with pytest.raises((ValueError, ValidationError), match="ceiling"):
+            _check_fee_rate(10_000_000, allow_below_relay_floor=True)
+
+    def test_the_default_stays_closed_on_every_public_transfer_entry_point(self) -> None:
+        """A caller who never mentions fees must not inherit an opt-out."""
+        import inspect
+
+        from pyrxd.glyph.transfer import build_ft_transfer, build_nft_transfer
+
+        for fn in (build_ft_transfer, build_nft_transfer):
+            param = inspect.signature(fn).parameters["allow_below_relay_floor"]
+            assert param.default is False, fn.__name__
+
+    def test_the_client_forwards_its_constructor_flag_to_both_transfer_paths(self) -> None:
+        """The gap that made this a real bug rather than a missing kwarg.
+
+        ``GlyphClient(fee_rate=<sub-floor>, allow_below_relay_floor=True)`` constructed
+        happily — the constructor gate lets a transfer-only client through — and then the
+        build path refused with no way to say what the constructor had already said.
+        """
+        import inspect
+
+        from pyrxd.glyph.client import GlyphClient
+
+        for name in ("build_ft_transfer", "build_nft_transfer"):
+            src = inspect.getsource(getattr(GlyphClient, name))
+            assert "allow_below_relay_floor=self._allow_below_relay_floor" in src, name
+
+    def test_the_client_docstring_no_longer_says_transfers_refuse(self) -> None:
+        """It documented the limitation as deliberate; leaving that in place would send a
+        reader looking for an escape hatch they now have."""
+        from pyrxd.glyph.client import GlyphClient
+
+        doc = " ".join((GlyphClient.__init__.__doc__ or "").split())
+        assert "Transfers still refuse a sub-floor rate" not in doc
