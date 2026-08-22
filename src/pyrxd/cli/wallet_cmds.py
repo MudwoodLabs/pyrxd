@@ -61,24 +61,42 @@ def _parse_int_csv(value: str, *, flag: str) -> list[int]:
     return out
 
 
-def _checked_fee_rate(fee_rate: int) -> int:
-    """Validate ``--fee-rate`` (photons per BYTE) against Radiant's relay floor.
+def _checked_fee_rate(fee_rate: int, *, allow_overpay: bool = False) -> int:
+    """Validate ``--fee-rate`` (photons per BYTE) against Radiant's relay band.
 
     ``--fee-rate`` used to be checked only for ``> 0``, so it was the one path into
     a spend that could still set a rate the network will not relay — and Radiant has
     neither RBF nor CPFP, so such a transaction cannot be bumped and squats on its
     inputs until mempool expiry. The config file's ``fee_rate`` has been floor-checked
     since ``e0772e0``; this applies the same floor to the flag that overrides it.
+
+    Since #457 the same call also bounds the HIGH end, because ``validated_fee_rate``
+    does. ``--allow-overpay`` is how an operator says they mean an unusually high rate;
+    without it, ``--fee-rate 10000000`` — the per-**kB** constant in a per-**byte** flag —
+    is refused rather than spent. ``wallet sweep`` is the sharpest case: it has no change
+    output, so the entire overpay leaves with the miner, and Radiant has neither RBF nor
+    CPFP to recover it.
     """
     if not isinstance(fee_rate, int) or isinstance(fee_rate, bool) or fee_rate <= 0:
         raise UserError("--fee-rate must be a positive integer (photons per byte)")
     try:
-        return validated_fee_rate(fee_rate, None)
+        return validated_fee_rate(fee_rate, None, allow_overpay=allow_overpay)
     except ValidationError as exc:
+        # The two ends need different remedies: "raise it" is wrong advice for a rate
+        # that is already 1000x too high, and would walk the operator further into the
+        # spend the guard just prevented.
+        too_high = "above the" in str(exc)
         raise UserError(
-            "--fee-rate is below Radiant's relay floor",
+            "--fee-rate is above Radiant's overpay ceiling"
+            if too_high
+            else "--fee-rate is below Radiant's relay floor",
             cause=str(exc),
-            fix=f"pass --fee-rate {DEFAULT_FEE_RATE} or higher (photons per byte)",
+            fix=(
+                f"pass --fee-rate {DEFAULT_FEE_RATE} (photons per BYTE), or --allow-overpay "
+                "if you deliberately mean this rate"
+                if too_high
+                else f"pass --fee-rate {DEFAULT_FEE_RATE} or higher (photons per byte)"
+            ),
         ) from exc
 
 
@@ -536,13 +554,25 @@ def wallet_recover(ctx: CliContext, scan: bool, coin_types: str, accounts: str, 
     help="Fee rate in photons per BYTE (fee = tx size in bytes x this).",
 )
 @click.option(
+    "--allow-overpay",
+    is_flag=True,
+    default=False,
+    help="Accept a --fee-rate above the 10x overpay ceiling. Radiant has no RBF or CPFP, so an overpay cannot be recovered.",
+)
+@click.option(
     "--passphrase/--no-passphrase",
     default=False,
     help="Prompt for the BIP39 passphrase if the seed was created with one.",
 )
 @click.pass_obj
 def wallet_sweep(
-    ctx: CliContext, coin_type: int, account: int, to_address: str, fee_rate: int, passphrase: bool
+    ctx: CliContext,
+    coin_type: int,
+    account: int,
+    to_address: str,
+    fee_rate: int,
+    allow_overpay: bool,
+    passphrase: bool,
 ) -> None:
     """Move ALL funds from a derived path to an address you control.
 
@@ -558,7 +588,7 @@ def wallet_sweep(
         raise UserError("--coin-type and --account must be non-negative")
     # Validate before the mnemonic prompt so a bad invocation fails
     # without the user first typing their seed.
-    fee_rate = _checked_fee_rate(fee_rate)
+    fee_rate = _checked_fee_rate(fee_rate, allow_overpay=allow_overpay)
     # Block --json without --yes early (a broadcast must not auto-confirm).
     ok, why = ctx.is_destructive_mode_safe()
     if not ok:
@@ -704,10 +734,18 @@ def _send_summary(ctx: CliContext, *, to_address: str, amount: int, fee: int, in
     help="Fee rate in photons per BYTE (fee = tx size in bytes x this).",
 )
 @click.option(
+    "--allow-overpay",
+    is_flag=True,
+    default=False,
+    help="Accept a --fee-rate above the 10x overpay ceiling. Radiant has no RBF or CPFP, so an overpay cannot be recovered.",
+)
+@click.option(
     "--passphrase/--no-passphrase", default=False, help="Prompt for the BIP39 passphrase (in-process fallback only)."
 )
 @click.pass_obj
-def wallet_send(ctx: CliContext, to_address: str, amount: int, fee_rate: int, passphrase: bool) -> None:
+def wallet_send(
+    ctx: CliContext, to_address: str, amount: int, fee_rate: int, allow_overpay: bool, passphrase: bool
+) -> None:
     """Send photons from this wallet's default account.
 
     If a signing agent is unlocked (``pyrxd agent unlock``), the transaction is
@@ -717,7 +755,7 @@ def wallet_send(ctx: CliContext, to_address: str, amount: int, fee_rate: int, pa
     """
     if not isinstance(amount, int) or amount <= 0:
         raise UserError("--amount must be a positive integer (photons)")
-    fee_rate = _checked_fee_rate(fee_rate)
+    fee_rate = _checked_fee_rate(fee_rate, allow_overpay=allow_overpay)
     ok, why = ctx.is_destructive_mode_safe()
     if not ok:
         raise UserError(why or "destructive op without --yes in --json mode")

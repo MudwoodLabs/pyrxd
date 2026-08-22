@@ -130,7 +130,7 @@ MAX_AIRDROP_RECIPIENTS: int = 1000
 _SIG_SIZE_SLACK_BYTES: int = SIG_SIZE_SLACK_BYTES
 
 
-def _check_fee_rate(fee_rate: int, *, allow_overpay: bool = False) -> None:
+def _check_fee_rate(fee_rate: int, *, allow_overpay: bool = False, allow_below_relay_floor: bool = False) -> None:
     """Reject a fee rate the network will not relay.
 
     Radiant has neither RBF nor CPFP (threat-model S21, verified against
@@ -143,8 +143,19 @@ def _check_fee_rate(fee_rate: int, *, allow_overpay: bool = False) -> None:
     used to be a second copy of the same three lines, and the NFT transfer builder
     next door had a third copy of *nothing*, which is the bug that made this shared.
     Kept as a named function because its callers document it by name.
+
+    ``allow_below_relay_floor`` is the sub-floor escape hatch the mint paths have had
+    since #456. Until #458 the transfer paths had no equivalent, and
+    :func:`~pyrxd.fee_sizing.relay_floor_photons_per_byte` is a fixed **mainnet**
+    constant, so a regtest node running at a tenth of that floor could mint but not
+    transfer — the guard refused work that was valid on the caller's own chain.
     """
-    assert_fee_rate_clears_relay_floor(fee_rate, what="FT builder", allow_overpay=allow_overpay)
+    assert_fee_rate_clears_relay_floor(
+        fee_rate,
+        what="FT builder",
+        allow_overpay=allow_overpay,
+        allow_below_relay_floor=allow_below_relay_floor,
+    )
 
 
 def outpoint_key(txid: str, vout: int) -> tuple[str, int]:
@@ -532,6 +543,7 @@ class FtUtxoSet:
         funding: Sequence[AirdropFunding] = (),
         *,
         allow_overpay: bool = False,
+        allow_below_relay_floor: bool = False,
     ) -> FtTransferResult:
         """Build a signed FT transfer: ``amount`` units of this token to one PKH.
 
@@ -611,6 +623,7 @@ class FtUtxoSet:
             change_pkh=change_pkh,
             dust_limit=dust_limit,
             allow_overpay=allow_overpay,
+            allow_below_relay_floor=allow_below_relay_floor,
         )
         return FtTransferResult(
             tx=result.tx,
@@ -635,6 +648,7 @@ class FtUtxoSet:
         sale_price: int = 0,
         pay_royalty: bool | None = None,
         allow_overpay: bool = False,
+        allow_below_relay_floor: bool = False,
     ) -> FtAirdropResult:
         """Build one signed transaction paying FT units to N recipients.
 
@@ -716,7 +730,7 @@ class FtUtxoSet:
         # 1. Validate. Fee rate first — the recipient-cap message quotes it, and
         #    quoting an unvalidated value produces a nonsense number in the one
         #    place a caller is being asked to reconsider a cost.
-        _check_fee_rate(fee_rate, allow_overpay=allow_overpay)
+        _check_fee_rate(fee_rate, allow_overpay=allow_overpay, allow_below_relay_floor=allow_below_relay_floor)
         if dust_limit < 1:
             raise ValueError(f"dust_limit must be >= 1, got {dust_limit}")
 

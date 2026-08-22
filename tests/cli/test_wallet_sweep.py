@@ -198,6 +198,42 @@ class TestWalletSweep:
         )
         assert result.exit_code != 0
         assert "relay floor" in result.output
+
+    @pytest.mark.parametrize("rate", ["100001", "10000000"])
+    def test_overpay_rejected_before_seed_prompt(self, runner: CliRunner, rate: str) -> None:
+        """#457. ``--fee-rate`` bounded only the LOW end; the SDK has bounded the high end
+        since #456, so the CLI was the looser guard over the likelier slip — a human
+        pasting a per-kB figure into a per-BYTE flag. ``10000000`` is exactly
+        ``RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB``, a 1000x overpay.
+
+        Sweep is the sharpest case in the CLI: it has **no change output**, so the entire
+        difference leaves with the miner, and Radiant has neither RBF nor CPFP to recover
+        it. Refused before the seed prompt, like the sub-floor case above."""
+        client = _funded_client(_addr(0, 0, 0, 0))
+        result = runner.invoke(
+            wallet_group,
+            ["sweep", "--coin-type", "0", "--to", DEST, "--fee-rate", rate],
+            obj=_ctx(client),
+            input="",
+        )
+        assert result.exit_code != 0
+        assert "ceiling" in result.output
+        assert "--allow-overpay" in result.output, "the message must name the way through"
+        client.broadcast.assert_not_awaited()
+
+    def test_allow_overpay_gets_past_the_ceiling_but_not_past_the_floor(self, runner: CliRunner) -> None:
+        """The opt-out skips its own bound only. A flag that also waived the floor would
+        turn a fat-finger guard into a way to build an unrelayable transaction."""
+        client = _funded_client(_addr(0, 0, 0, 0))
+        result = runner.invoke(
+            wallet_group,
+            ["sweep", "--coin-type", "0", "--to", DEST, "--fee-rate", "1", "--allow-overpay"],
+            obj=_ctx(client),
+            input="",
+        )
+        assert result.exit_code != 0
+        assert "relay floor" in result.output
+        client.broadcast.assert_not_awaited()
         assert "Mnemonic" not in result.output
         client.broadcast.assert_not_awaited()
 
