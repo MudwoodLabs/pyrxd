@@ -15,6 +15,7 @@ from __future__ import annotations
 # first attribute access.
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "AirdropFunding": ("pyrxd.glyph.ft", "AirdropFunding"),
+    "AirdropReceipt": ("pyrxd.glyph.client", "AirdropReceipt"),
     "AirdropRecipient": ("pyrxd.glyph.ft", "AirdropRecipient"),
     "ContainerChildRevealScripts": ("pyrxd.glyph.builder", "ContainerChildRevealScripts"),
     "ContainerRevealScripts": ("pyrxd.glyph.builder", "ContainerRevealScripts"),
@@ -44,8 +45,13 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "GlyphInspector": ("pyrxd.glyph.inspector", "GlyphInspector"),
     "GlyphItem": ("pyrxd.glyph.scanner", "GlyphItem"),
     "GlyphMetadata": ("pyrxd.glyph.types", "GlyphMetadata"),
+    "BroadcastEchoMismatch": ("pyrxd.glyph.client", "BroadcastEchoMismatch"),
+    "FtAirdropBuild": ("pyrxd.glyph.transfer", "FtAirdropBuild"),
+    "FtTransferBuild": ("pyrxd.glyph.transfer", "FtTransferBuild"),
     "GlyphClient": ("pyrxd.glyph.client", "GlyphClient"),
     "GlyphMinter": ("pyrxd.glyph.mint", "GlyphMinter"),
+    "NftTransferBuild": ("pyrxd.glyph.transfer", "NftTransferBuild"),
+    "TransferReceipt": ("pyrxd.glyph.client", "TransferReceipt"),
     "GlyphNft": ("pyrxd.glyph.types", "GlyphNft"),
     "GlyphPolicy": ("pyrxd.glyph.types", "GlyphPolicy"),
     "GlyphProtocol": ("pyrxd.glyph.types", "GlyphProtocol"),

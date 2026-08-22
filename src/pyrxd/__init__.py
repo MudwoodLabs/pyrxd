@@ -69,6 +69,11 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     # required constructor argument, so exporting one without the other would leave the
     # advertised entry point unusable from `from pyrxd import ...`.
     "GlyphClient": ("pyrxd.glyph", "GlyphClient"),
+    # The 0.19.0 notes tell callers to catch this on every fund-moving path, and it was
+    # reachable only as `pyrxd.glyph.client.BroadcastEchoMismatch` — an exception you are
+    # instructed to handle but cannot conveniently import is the same reachability gap
+    # the facade itself exists to close.
+    "BroadcastEchoMismatch": ("pyrxd.glyph", "BroadcastEchoMismatch"),
     "GlyphMinter": ("pyrxd.glyph", "GlyphMinter"),
     "GlyphProtocol": ("pyrxd.glyph", "GlyphProtocol"),
     "GlyphRef": ("pyrxd.glyph", "GlyphRef"),
