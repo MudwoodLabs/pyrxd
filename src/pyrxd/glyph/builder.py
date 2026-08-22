@@ -1084,12 +1084,16 @@ class GlyphBuilder:
         #    down can do it: `required_fee` binds the caller's rate and only the
         #    caller's rate (see its docstring), so a sub-floor rate produces a
         #    transaction that is internally consistent, passes every later assertion,
-        #    and is refused by every node on the network. Same no-opt-out refusal the
-        #    FT builders next door already make, via the same shared implementation.
+        #    and is refused by every node on the network. Same refusal the FT builders
+        #    next door make, via the same shared implementation — and, since #458, with
+        #    the same sub-floor opt-out. The floor is a fixed MAINNET constant, so
+        #    without one this refused a rate that is legitimate on a regtest node whose
+        #    floor really is a tenth of it.
         assert_fee_rate_clears_relay_floor(
             params.fee_rate,
             what="build_nft_transfer_tx",
             allow_overpay=params.allow_overpay,
+            allow_below_relay_floor=params.allow_below_relay_floor,
         )
 
         # 1. Validate input script shape and extract ref.
@@ -1253,6 +1257,7 @@ class GlyphBuilder:
             change_pkh=params.change_pkh,
             dust_limit=params.dust_limit,
             allow_overpay=params.allow_overpay,
+            allow_below_relay_floor=params.allow_below_relay_floor,
         )
 
     def build_ft_airdrop_tx(self, params: FtAirdropParams) -> FtAirdropResult:
@@ -1284,6 +1289,7 @@ class GlyphBuilder:
             sale_price=params.sale_price,
             pay_royalty=params.pay_royalty,
             allow_overpay=params.allow_overpay,
+            allow_below_relay_floor=params.allow_below_relay_floor,
         )
 
 
@@ -1883,6 +1889,7 @@ class TransferParams:
     private_key: Any
     fee_rate: int = MIN_FEE_RATE
     allow_overpay: bool = False
+    allow_below_relay_floor: bool = False
 
 
 @dataclass
@@ -1971,6 +1978,7 @@ class FtTransferParams:
     change_pkh: Hex20 | None = None
     dust_limit: int = FT_DUST_LIMIT
     allow_overpay: bool = False
+    allow_below_relay_floor: bool = False
 
 
 @dataclass
@@ -2017,3 +2025,4 @@ class FtAirdropParams:
     sale_price: int = 0
     pay_royalty: bool | None = None
     allow_overpay: bool = False
+    allow_below_relay_floor: bool = False

@@ -365,6 +365,7 @@ async def build_ft_transfer(
     client: ElectrumXClient,
     fee_rate: int,
     allow_overpay: bool = False,
+    allow_below_relay_floor: bool = False,
 ) -> FtTransferBuild:
     """Build (and sign) an FT transfer, without broadcasting it.
 
@@ -399,6 +400,7 @@ async def build_ft_transfer(
         funding=[funding],
         fee_rate=fee_rate,
         allow_overpay=allow_overpay,
+        allow_below_relay_floor=allow_below_relay_floor,
     )
     try:
         result = GlyphBuilder().build_ft_airdrop_tx(params)
@@ -620,6 +622,7 @@ async def build_nft_transfer(
     client: ElectrumXClient,
     fee_rate: int,
     allow_overpay: bool = False,
+    allow_below_relay_floor: bool = False,
 ) -> NftTransferBuild:
     """Build (and sign) an NFT transfer, without broadcasting it.
 
@@ -671,6 +674,7 @@ async def build_nft_transfer(
         fee_rate,
         what="build_nft_transfer",
         allow_overpay=allow_overpay,
+        allow_below_relay_floor=allow_below_relay_floor,
         error_type=ValidationError,
     )
 

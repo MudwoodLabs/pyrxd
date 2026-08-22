@@ -58,7 +58,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
-from ..fee_sizing import relay_floor_photons_per_byte
+from ..fee_sizing import MAX_FEE_OVERPAY_MULTIPLE, relay_floor_photons_per_byte
 from ..gravity.fee_policy import RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB
 from ..network.registry import (
     DEFAULT_ENDPOINTS,
@@ -356,8 +356,9 @@ def validated_fee_rate(
     *,
     from_env: bool = False,
     table: str | None = None,
+    allow_overpay: bool = False,
 ) -> int:
-    """Reject a fee rate below Radiant's effective relay floor.
+    """Reject a fee rate outside Radiant's effective relay band.
 
     Fund-safety, not tidiness. ``fee_rate`` is photons per BYTE; the chain's
     effective floor is :data:`RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB` per kB.
@@ -372,7 +373,24 @@ def validated_fee_rate(
     ``DeadlineFeePolicy`` already rejects a sub-floor rate for the swap stack; this
     closes the same gap for every other CLI command.
 
-    A HIGHER rate is always allowed: overpaying is the operator's prerogative.
+    **The high end is bounded too, as of #457.** This used to say a higher rate is
+    always allowed, because overpaying is the operator's prerogative. The premise was
+    backwards. The rate that gets pasted from a fee table into a per-BYTE field by a
+    human at a terminal is *more* likely to carry a unit slip than a literal passed by
+    a program — and the SDK has refused above
+    ``MAX_FEE_OVERPAY_MULTIPLE x floor`` since #456, so the CLI was the looser of the
+    two guards over the higher-risk population. Measured before this: the SDK refused
+    ``10_000_000`` while this accepted it, and ``10_000_000`` is exactly
+    :data:`RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB` — the per-**kB** constant handed
+    to a per-**byte** parameter, a 1000x overpay. On Radiant that is unrecoverable:
+    there is no RBF and no CPFP, and ``wallet sweep`` has no change output, so the whole
+    difference leaves with the miner.
+
+    ``allow_overpay`` is the deliberate way through, spelled ``--allow-overpay`` on the
+    commands that take ``--fee-rate``. It is not reachable from a config file or from
+    ``PYRXD_FEE_RATE`` **on purpose**: a rate that persists across every future command
+    is not where a situational "I need this to confirm now" decision belongs, and a
+    stored 1000x value is a unit slip with near-certainty.
 
     Args:
         rate: photons per byte.
@@ -386,26 +404,45 @@ def validated_fee_rate(
     # rounds DOWN, so a floor that is not an exact multiple of 1000 makes a hand-written
     # ``// 1000`` disagree with the module that owns the rule by one photon per byte.
     floor_per_byte = relay_floor_photons_per_byte()
+    # Name the ACTUAL source. An env override with a config file present would
+    # otherwise send the operator to edit a file that does not contain the value,
+    # and a `[networks.<net>]` override would send them to a top-level key that
+    # is not the one in force. Computed for BOTH bounds: it used to live inside the
+    # sub-floor branch, and the ceiling added in #457 needs the same pointer — a
+    # 1000x rate stored under `[networks.regtest]` is exactly the case where the
+    # operator has to be told which file and which table to edit.
+    if from_env:
+        where = " (set via the PYRXD_FEE_RATE environment variable)"
+    elif table is not None:
+        in_file = f" in {source_path}" if source_path is not None else ""
+        where = f" (set under [{table}]{in_file})"
+    elif source_path is not None:
+        where = f" (set in {source_path})"
+    else:
+        where = ""
     if rate < floor_per_byte:
-        # Name the ACTUAL source. An env override with a config file present would
-        # otherwise send the operator to edit a file that does not contain the value,
-        # and a `[networks.<net>]` override would send them to a top-level key that
-        # is not the one in force.
-        if from_env:
-            where = " (set via the PYRXD_FEE_RATE environment variable)"
-        elif table is not None:
-            in_file = f" in {source_path}" if source_path is not None else ""
-            where = f" (set under [{table}]{in_file})"
-        elif source_path is not None:
-            where = f" (set in {source_path})"
-        else:
-            where = ""
         raise ValidationError(
             f"fee_rate={rate} photons/byte is below Radiant's effective relay floor of "
             f"{floor_per_byte} photons/byte ({RADIANT_EFFECTIVE_MIN_RELAY_PHOTONS_PER_KB} per kB)"
             f"{where}. A transaction built at this rate will not relay, and Radiant has no RBF "
             "and no CPFP — it cannot be fee-bumped and will squat on its inputs until mempool "
             "expiry. Raise fee_rate to at least the floor."
+        )
+    ceiling_per_byte = floor_per_byte * MAX_FEE_OVERPAY_MULTIPLE
+    if not allow_overpay and rate > ceiling_per_byte:
+        # Same rendering choice as `assert_fee_rate_clears_relay_floor`: one decimal, NOT
+        # floor-divided, so the smallest refused rate does not report "is 10x ... above the
+        # 10x ceiling" at exactly the boundary a caller is most likely to be standing on.
+        multiple = f"{rate / floor_per_byte:.1f}"
+        raise ValidationError(
+            f"fee_rate={rate} photons/byte is {multiple}x Radiant's effective relay floor of "
+            f"{floor_per_byte} photons/byte, above the {MAX_FEE_OVERPAY_MULTIPLE}x ceiling "
+            f"({ceiling_per_byte} photons/byte){where}. A fee is size x fee_rate, so this "
+            f"pays {multiple}x what the network asks, and Radiant has no RBF and no CPFP — the "
+            "difference cannot be recovered once it confirms. Check whether you meant "
+            f"{floor_per_byte} photons per BYTE rather than {floor_per_byte * 1000} per kB: they "
+            "are the same fee rate written two ways, and passing the second where the first "
+            "belongs is a 1000x overpay."
         )
     return rate
 

@@ -178,12 +178,14 @@ class GlyphClient:
             ceiling is always refused here. A sub-floor rate is refused here too when
             ``store`` is given — mints judge it in the constructor — and otherwise left to
             each build path, since the floor is a property of the chain.
-        allow_below_relay_floor: let MINTS accept a sub-floor ``fee_rate``, for chains
-            whose floor really is lower. Required at construction when ``store`` is given,
-            since minting judges the rate in the constructor rather than per build.
-            Transfers still refuse a sub-floor rate — threading it through the FT builder
-            is a wider change than this flag, and doing it for NFT alone would reintroduce
-            the FT/NFT asymmetry that caused a release blocker on this very surface.
+        allow_below_relay_floor: accept a sub-floor ``fee_rate``, for chains whose floor
+            really is lower — :func:`~pyrxd.fee_sizing.relay_floor_photons_per_byte` is a
+            fixed **mainnet** constant, and a regtest node runs at a tenth of it. Required
+            at construction when ``store`` is given, since minting judges the rate in the
+            constructor rather than per build. **Since #458 this covers transfers as well
+            as mints**, on both the FT and NFT paths: it is threaded to the FT builder and
+            to ``build_nft_transfer`` together, because doing it for one alone would
+            reintroduce the FT/NFT asymmetry that caused a release blocker on this surface.
         min_confirmations: depth required on a mint's commit before its reveal.
         confirmation_timeout_s: how long a reveal waits for the commit.
         poll_interval_s: seconds between confirmation polls, forwarded to
@@ -374,6 +376,7 @@ class GlyphClient:
             client=self._client,
             fee_rate=self._fee_rate,
             allow_overpay=allow_overpay,
+            allow_below_relay_floor=self._allow_below_relay_floor,
         )
 
     async def transfer_ft(
@@ -422,6 +425,7 @@ class GlyphClient:
             client=self._client,
             fee_rate=self._fee_rate,
             allow_overpay=allow_overpay,
+            allow_below_relay_floor=self._allow_below_relay_floor,
         )
 
     async def transfer_nft(self, ref: GlyphRef, to_pkh: Hex20, *, allow_overpay: bool = False) -> NftTransferReceipt:
