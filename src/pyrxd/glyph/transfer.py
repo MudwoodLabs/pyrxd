@@ -41,6 +41,7 @@ of those two callers to be wrong, so the caller owns it.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -128,6 +129,33 @@ class FtTransferBuild:
         :func:`assert_fee_matches_size` halve every size it judged. CI's mypy scope
         is ``src/pyrxd/security/`` only, so nothing checked this annotation.
         """
+        return self.tx.serialize()
+
+
+@dataclass(frozen=True)
+class FtAirdropBuild:
+    """A signed, un-broadcast FT airdrop — the multi-recipient form of :class:`FtTransferBuild`.
+
+    :param tx: the signed :class:`~pyrxd.transaction.transaction.Transaction`
+    :param fee: photons paid, sourced from plain RXD rather than from the token
+    :param ref: the token distributed
+    :param recipients: destinations in **output order**, so ``recipients[i]`` describes
+        vout ``i``. Callers reconcile a broadcast against this, and an unordered
+        collection would make that reconciliation guesswork.
+    """
+
+    tx: Transaction
+    fee: int
+    ref: GlyphRef
+    recipients: tuple[AirdropRecipient, ...]
+
+    @property
+    def total(self) -> int:
+        """Units leaving the wallet across every recipient output."""
+        return sum(r.amount for r in self.recipients)
+
+    def serialize(self) -> bytes:
+        """Raw transaction BYTES, ready for ``await client.broadcast(...)``."""
         return self.tx.serialize()
 
 
@@ -383,19 +411,75 @@ async def build_ft_transfer(
     if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
         raise ValidationError("FT transfer amount must be a positive int")
 
+    build = await build_ft_airdrop(
+        wallet,
+        ref,
+        [AirdropRecipient(pkh=to_pkh, amount=amount)],
+        client=client,
+        fee_rate=fee_rate,
+        allow_overpay=allow_overpay,
+        allow_below_relay_floor=allow_below_relay_floor,
+        _what="FT transfer",
+    )
+    return FtTransferBuild(tx=build.tx, fee=build.fee, ref=ref, amount=amount, to_pkh=to_pkh)
+
+
+async def build_ft_airdrop(
+    wallet: HdWallet,
+    ref: GlyphRef,
+    recipients: Sequence[AirdropRecipient],
+    *,
+    client: ElectrumXClient,
+    fee_rate: int,
+    allow_overpay: bool = False,
+    allow_below_relay_floor: bool = False,
+    _what: str = "FT airdrop",
+) -> FtAirdropBuild:
+    """Build (and sign) a multi-recipient FT airdrop, without broadcasting it.
+
+    The general form of :func:`build_ft_transfer`, which is this with one recipient —
+    the same relationship :meth:`FtUtxoSet.build_transfer_tx` has to
+    :meth:`~pyrxd.glyph.ft.FtUtxoSet.build_airdrop_tx` one layer down. Written this way
+    round so there is a single orchestration to get right: the enumerate-once discipline
+    below, the signing-key check and the post-build fee assertion are fund-safety
+    properties, and two copies of them is two things to keep in step.
+
+    Until this existed the orchestration lived only in ``pyrxd.cli.glyph_cmds``
+    (``_airdrop_ft_inner``), so a library caller had to reimplement it — the same trap
+    that made ``examples/ft_transfer_demo.py`` 399 hand-rolled lines before
+    :func:`build_ft_transfer` was importable.
+
+    Output order follows ``recipients``: ``recipients[i]`` is vout ``i``.
+
+    Raises:
+        InsufficientFundsError: not enough of the token, or no plain-RXD UTXO to pay
+            the fee. Raised before anything is signed.
+        ValidationError: empty recipient list, the selected inputs span multiple keys,
+            or the builder rejected the parameters.
+    """
+    recipients = tuple(recipients)
+    if not recipients:
+        # The builder refuses this too, but only after a wallet enumeration and a fee
+        # funding round trip. Refusing here costs nothing and says which call was wrong.
+        raise ValidationError(f"{_what} needs at least one recipient")
+
+    total = sum(r.amount for r in recipients)
+
     # ONE wallet enumeration per build. Selection and fee funding both need the same
     # UTXO set, and each used to fetch it (and each candidate's parent transaction)
     # independently — doubling the round trips and opening a window in which the two
     # phases could disagree about what the wallet holds.
     triples = await wallet.collect_spendable(client)
-    selected = await select_ft_inputs(wallet, ref, amount, client, triples)
-    first_key = single_ft_signing_key(selected, "FT transfer")
-    funding = await ft_funding(wallet, selected, n_outputs=1, fee_rate=fee_rate, client=client, triples=triples)
+    selected = await select_ft_inputs(wallet, ref, total, client, triples)
+    first_key = single_ft_signing_key(selected, _what)
+    funding = await ft_funding(
+        wallet, selected, n_outputs=len(recipients), fee_rate=fee_rate, client=client, triples=triples
+    )
 
     params = FtAirdropParams(
         ref=ref,
         utxos=[t[0] for t in selected],
-        recipients=[AirdropRecipient(pkh=to_pkh, amount=amount)],
+        recipients=list(recipients),
         private_key=first_key,
         funding=[funding],
         fee_rate=fee_rate,
@@ -405,10 +489,10 @@ async def build_ft_transfer(
     try:
         result = GlyphBuilder().build_ft_airdrop_tx(params)
     except (ValidationError, ValueError) as exc:
-        raise ValidationError(f"could not build the FT transfer: {exc}") from exc
+        raise ValidationError(f"could not build the {_what}: {exc}") from exc
 
     assert_fee_matches_size(result.fee, result.tx, fee_rate=fee_rate, allow_overpay=allow_overpay)
-    return FtTransferBuild(tx=result.tx, fee=result.fee, ref=ref, amount=amount, to_pkh=to_pkh)
+    return FtAirdropBuild(tx=result.tx, fee=result.fee, ref=ref, recipients=recipients)
 
 
 def assert_fee_matches_size(

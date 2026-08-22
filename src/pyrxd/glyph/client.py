@@ -19,6 +19,7 @@ one-line fix rather than failing later.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Protocol
 
 from ..fee_sizing import assert_fee_rate_clears_relay_floor
@@ -32,6 +33,7 @@ from ..network.confirm import (
 from ..security.errors import RxdSdkError, ValidationError
 from ..security.types import Hex20
 from .builder import MIN_FEE_RATE
+from .ft import AirdropRecipient
 from .mint import (
     DEFAULT_MINT_CONFIRMATIONS,
     GlyphMinter,
@@ -39,7 +41,14 @@ from .mint import (
     PendingMint,
     PendingStore,
 )
-from .transfer import FtTransferBuild, NftTransferBuild, build_ft_transfer, build_nft_transfer
+from .transfer import (
+    FtAirdropBuild,
+    FtTransferBuild,
+    NftTransferBuild,
+    build_ft_airdrop,
+    build_ft_transfer,
+    build_nft_transfer,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .types import GlyphMetadata, GlyphRef
@@ -65,6 +74,38 @@ class TransferReceipt:
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return f"TransferReceipt(txid={self.txid!r}, amount={self.amount}, fee={self.fee})"
+
+
+class AirdropReceipt:
+    """What a broadcast airdrop actually did — the multi-recipient :class:`TransferReceipt`.
+
+    Carries ``recipients`` in **output order** as well as ``total``, because after the
+    fact those are two different questions: "how much left the wallet" is reconcilable
+    from the total, while "who got what, at which vout" is only answerable from the
+    ordered list, and re-deriving it means re-fetching and re-parsing the transaction.
+    """
+
+    __slots__ = ("fee", "recipients", "ref", "total", "txid")
+
+    def __init__(
+        self,
+        *,
+        txid: str,
+        ref: GlyphRef,
+        recipients: tuple[AirdropRecipient, ...],
+        total: int,
+        fee: int,
+    ) -> None:
+        self.txid = txid
+        self.ref = ref
+        self.recipients = recipients
+        self.total = total
+        self.fee = fee
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return (
+            f"AirdropReceipt(txid={self.txid!r}, recipients={len(self.recipients)}, total={self.total}, fee={self.fee})"
+        )
 
 
 class BroadcastEchoMismatch(RxdSdkError):
@@ -353,6 +394,52 @@ class GlyphClient:
             allow_overpay=allow_overpay,
         )
 
+    async def commit_ft(
+        self,
+        metadata: GlyphMetadata,
+        *,
+        supply: int,
+        treasury_pkh: Hex20 | bytes | None = None,
+    ) -> PendingMint:
+        """Phase 1 of an FT deploy. See :meth:`GlyphMinter.commit_ft`.
+
+        Added alongside :meth:`reveal_ft` rather than after it: exposing only the reveal
+        would let a caller FINISH a two-phase FT deploy through this facade that they
+        could not START through it — half of a pair is the asymmetry the facade exists to
+        remove, not a smaller version of the fix.
+        """
+        return await self.minter.commit_ft(metadata, supply=supply, treasury_pkh=treasury_pkh)
+
+    async def reveal_ft(
+        self,
+        pending: PendingMint,
+        *,
+        fee_rate: int | None = None,
+        allow_below_relay_floor: bool | None = None,
+        allow_overpay: bool = False,
+    ) -> MintResult:
+        """Phase 2 of an FT deploy. See :meth:`GlyphMinter.reveal_ft`.
+
+        The FT counterpart of :meth:`reveal_nft`, and it exists for the sharper half of
+        the reason that one does. A two-phase FT deploy could not be FINISHED through this
+        facade at all: a caller who committed had to reach past it into ``.minter``. The
+        commit output is a hashlock with **no owner-only spend path**, so the phase a
+        caller most needs to resume was the one not exposed.
+
+        ``allow_below_relay_floor`` must stay ``None``-defaulted, not ``False`` — the same
+        trap documented at length on :meth:`reveal_nft`. ``None`` means "inherit the
+        constructor"; ``False`` means "the caller re-asserted the floor for this reveal".
+        A ``False`` default here would forward a deliberate override on every ordinary
+        call, so a client built with ``allow_below_relay_floor=True`` would commit and then
+        refuse to reveal, stranding the commit and everything funded into it.
+        """
+        return await self.minter.reveal_ft(
+            pending,
+            fee_rate=fee_rate,
+            allow_below_relay_floor=allow_below_relay_floor,
+            allow_overpay=allow_overpay,
+        )
+
     # -- transfers ---------------------------------------------------------
 
     async def build_ft_transfer(
@@ -407,6 +494,64 @@ class GlyphClient:
             amount=amount,
             fee=build.fee,
             to_pkh=to_pkh,
+        )
+
+    async def build_ft_airdrop(
+        self,
+        ref: GlyphRef,
+        recipients: Sequence[AirdropRecipient],
+        *,
+        allow_overpay: bool = False,
+    ) -> FtAirdropBuild:
+        """Build and sign a multi-recipient FT airdrop **without broadcasting it**.
+
+        One transaction, not N transfers: sequential transfers chain, each spending the
+        previous one's change, so a failure partway leaves the set half-delivered and the
+        token's ref alone cannot tell you which half. Output order follows ``recipients``.
+        """
+        return await build_ft_airdrop(
+            self._wallet,
+            ref,
+            recipients,
+            client=self._client,
+            fee_rate=self._fee_rate,
+            allow_overpay=allow_overpay,
+            allow_below_relay_floor=self._allow_below_relay_floor,
+        )
+
+    async def airdrop_ft(
+        self,
+        ref: GlyphRef,
+        recipients: Sequence[AirdropRecipient],
+        *,
+        allow_overpay: bool = False,
+    ) -> AirdropReceipt:
+        """Distribute ``ref`` to many recipients in one transaction, and broadcast.
+
+        The orchestration behind this lived only in the CLI until now, so a library
+        caller had to reimplement it or drive the builder directly.
+
+        Like its transfer siblings the returned txid is derived from the bytes that were
+        signed, not from the node's echo: a lying or buggy server could drop the
+        transaction and echo a well-formed — even real and already-confirmed — txid,
+        leaving a caller polling something unrelated to their tokens.
+
+        Raises:
+            BroadcastEchoMismatch: the node echoed a txid other than the one the signed
+                bytes hash to. Deliberately **not** a ``ValidationError``: those are
+                raised before anything is sent, and a caller retrying on one would
+                re-broadcast a distribution that may already have moved tokens.
+            InsufficientFundsError: not enough of the token, or no plain-RXD UTXO to pay
+                the fee. Raised before anything is signed or sent.
+        """
+        build = await self.build_ft_airdrop(ref, recipients, allow_overpay=allow_overpay)
+        echoed = await self._client.broadcast(build.serialize())
+        return AirdropReceipt(
+            txid=_confirmed_txid(build, echoed),
+            ref=ref,
+            recipients=build.recipients,
+            total=build.total,
+            fee=build.fee,
         )
 
     async def build_nft_transfer(

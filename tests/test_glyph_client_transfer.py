@@ -579,3 +579,137 @@ class TestTheClientValidatesMinConfirmationsToo:
         with _w.catch_warnings():
             _w.simplefilter("ignore", UserWarning)
             assert GlyphClient(object(), object(), store=UnsafeNullPendingStore(), min_confirmations=6) is not None
+
+
+class TestTheFacadeCoversTheTwoPhaseFtMint:
+    """#459. ``GlyphClient`` could mint an NFT in two phases and an FT only in one shot.
+
+    A caller who committed an FT had to reach past the facade into ``.minter`` to finish —
+    and the commit output is a hashlock with **no owner-only spend path**, so the phase a
+    caller most needs to resume was the one not exposed.
+    """
+
+    @staticmethod
+    def _sub_floor_client(store):
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import FakeClient, FakeWallet, _key
+
+        return GlyphClient(FakeClient(), FakeWallet(_key()), store=store, fee_rate=1_000, allow_below_relay_floor=True)
+
+    def test_a_sub_floor_client_can_commit_and_then_finish_an_ft_deploy(self):
+        """The FT edition of the stranding bug.
+
+        ``reveal_ft`` must default ``allow_below_relay_floor`` to ``None``, not ``False``.
+        A ``False`` default reads to the minter as "the caller re-asserted the floor",
+        so a client built for a sub-floor chain would broadcast its commit and then be
+        refused its own reveal — stranding the commit and its funding.
+        """
+        import asyncio
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import RecordingStore, _ft_metadata
+
+        client = self._sub_floor_client(RecordingStore())
+        pending = asyncio.run(client.commit_ft(_ft_metadata(), supply=1_000_000))
+        assert asyncio.run(client.reveal_ft(pending)).reveal_txid
+
+    def test_an_explicit_false_still_re_asserts_the_floor_on_ft(self):
+        """The override must survive: obeying a caller who never spoke is one bug, and
+        ignoring a caller who did is the other."""
+        import asyncio
+        import sys
+
+        sys.path.insert(0, "tests")
+        from test_glyph_mint_facade import RecordingStore, _ft_metadata
+
+        client = self._sub_floor_client(RecordingStore())
+        pending = asyncio.run(client.commit_ft(_ft_metadata(), supply=1_000_000))
+        with pytest.raises(ValidationError, match="floor|relay"):
+            asyncio.run(client.reveal_ft(pending, allow_below_relay_floor=False))
+
+    @pytest.mark.parametrize("method", ["reveal_nft", "reveal_ft"])
+    def test_every_reveal_forwards_the_sentinel_rather_than_deciding(self, method: str) -> None:
+        """Structural pin across BOTH reveals, so the next one added cannot drift.
+
+        The original bug was created by changing one signature and not the other; pinning
+        only ``reveal_nft`` would have let ``reveal_ft`` arrive with the same defect.
+        """
+        import inspect
+
+        from pyrxd.glyph.mint import GlyphMinter
+
+        facade = inspect.signature(getattr(GlyphClient, method)).parameters["allow_below_relay_floor"]
+        minter = inspect.signature(getattr(GlyphMinter, method)).parameters["allow_below_relay_floor"]
+        assert facade.default == minter.default, f"{method}: the facade must forward, not decide"
+        assert facade.default is None
+
+    def test_the_facade_exposes_every_public_minter_method(self) -> None:
+        """The general form of #459: no fund-moving phase reachable only via ``.minter``.
+
+        ``store`` is excluded deliberately — it is a constructor argument of the facade,
+        not an operation.
+        """
+        from pyrxd.glyph.mint import GlyphMinter
+
+        facade = {m for m in dir(GlyphClient) if not m.startswith("_")}
+        minter = {m for m in dir(GlyphMinter) if not m.startswith("_")}
+        assert minter - facade <= {"store"}, f"only reachable past the facade: {sorted(minter - facade - {'store'})}"
+
+
+class TestTheFacadeCanAirdrop:
+    """The airdrop orchestration lived only in ``pyrxd.cli.glyph_cmds`` until #459."""
+
+    @staticmethod
+    def _recipients():
+        from pyrxd.glyph.ft import AirdropRecipient
+
+        return [AirdropRecipient(pkh="aa" * 20, amount=10), AirdropRecipient(pkh="bb" * 20, amount=20)]
+
+    def test_an_empty_recipient_list_is_refused_before_any_network_call(self) -> None:
+        """The builder refuses it too, but only after a wallet enumeration and a funding
+        round trip. Refusing up front costs nothing and names the call that was wrong."""
+        import asyncio
+
+        from pyrxd.glyph.transfer import build_ft_airdrop
+        from pyrxd.glyph.types import GlyphRef
+
+        class ExplodingClient:
+            async def collect_spendable(self, *a, **k):  # pragma: no cover - must not run
+                raise AssertionError("a network call happened before the recipient check")
+
+        with pytest.raises(ValidationError, match="at least one recipient"):
+            asyncio.run(
+                build_ft_airdrop(
+                    ExplodingClient(),
+                    GlyphRef(txid="cd" * 32, vout=0),
+                    [],
+                    client=ExplodingClient(),
+                    fee_rate=10_000,
+                )
+            )
+
+    def test_the_receipt_keeps_recipients_in_output_order(self) -> None:
+        """``recipients[i]`` describes vout ``i``. An unordered collection would make
+        reconciling a broadcast against the intended distribution guesswork."""
+        from pyrxd.glyph.client import AirdropReceipt
+        from pyrxd.glyph.types import GlyphRef
+
+        rs = tuple(self._recipients())
+        receipt = AirdropReceipt(txid="ab" * 32, ref=GlyphRef(txid="cd" * 32, vout=0), recipients=rs, total=30, fee=99)
+        assert receipt.recipients == rs
+        assert [r.amount for r in receipt.recipients] == [10, 20]
+        assert receipt.total == 30
+
+    def test_the_public_surface_a_caller_is_told_to_handle_is_importable(self) -> None:
+        """``BroadcastEchoMismatch`` is what the 0.19.0 notes tell callers to catch on
+        every fund-moving path, and it was reachable only as
+        ``pyrxd.glyph.client.BroadcastEchoMismatch``."""
+        import pyrxd
+        import pyrxd.glyph as g
+
+        assert pyrxd.BroadcastEchoMismatch is g.BroadcastEchoMismatch
+        for name in ("AirdropReceipt", "TransferReceipt", "FtAirdropBuild", "FtTransferBuild", "NftTransferBuild"):
+            assert getattr(g, name).__name__ == name

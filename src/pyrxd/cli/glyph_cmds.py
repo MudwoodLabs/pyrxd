@@ -50,7 +50,6 @@ from ..glyph.builder import (
     CommitParams,
     DmintV1DeployParams,
     DmintV2DeployParams,
-    FtAirdropParams,
     FtDeployRevealScripts,
     FtUtxo,
     GlyphBuilder,
@@ -81,7 +80,7 @@ from ..glyph.fees import (
     measure_reveal_fee,
 )
 from ..glyph.scanner import GlyphScanner
-from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, assert_fee_matches_size
+from ..glyph.transfer import NoFeeFundingError, NoHoldingsError, build_ft_airdrop
 from ..glyph.transfer import build_ft_transfer as lib_build_ft_transfer
 from ..glyph.transfer import build_nft_transfer as lib_build_nft_transfer
 from ..glyph.transfer import find_plain_rxd_utxo as lib_find_plain_rxd_utxo
@@ -1428,37 +1427,16 @@ async def _airdrop_ft_inner(
 ) -> dict:
     """FT airdrop: scan wallet, select FT utxos for ref, fund the fee, broadcast."""
     total = sum(r.amount for r in recipients)
-    # Enumerate the wallet ONCE and let both phases read the same snapshot. Selecting
-    # inputs and finding the fee UTXO used to call `collect_spendable` independently,
-    # which leaves a window where the two disagree about what the wallet holds — the same
-    # split `build_ft_transfer` closed for `transfer-ft`. Both callees already accept a
-    # pre-collected list; only this site was still asking twice.
-    triples = await wallet.collect_spendable(client)
-    selected = await _select_ft_inputs(wallet, ref, total, client, triples)
-    first_key = _single_ft_signing_key(selected, "FT airdrop")
-
-    funding = await _airdrop_funding(ctx, wallet, selected, n_outputs=len(recipients), client=client, triples=triples)
-
-    params = FtAirdropParams(
-        ref=ref,
-        utxos=[t[0] for t in selected],
-        recipients=recipients,
-        private_key=first_key,
-        funding=[funding],
-        fee_rate=ctx.fee_rate,
-        # Reaches the builder's OWN rate gate. Without it the flag relaxed only the
-        # post-build overpay check, so `--allow-overpay` could not get past a
-        # ceiling refusal — an override the help text promised and did not deliver.
-        allow_overpay=allow_overpay,
-    )
+    # The orchestration — enumerate the wallet ONCE, select, fund, build, then assert the
+    # fee against the built size — is `pyrxd.glyph.transfer.build_ft_airdrop` as of #459.
+    # It used to live here, which meant a library caller had to reimplement it; keeping a
+    # second copy would mean keeping two fund-safety sequences in step.
     try:
-        airdrop_result = GlyphBuilder().build_ft_airdrop_tx(params)
-
-        # Same builder as `transfer-ft`, so the same bound applies. Without this the
-        # airdrop path was the weaker of the two guard levels for no stated reason.
-        assert_fee_matches_size(
-            airdrop_result.fee,
-            airdrop_result.tx,
+        build = await build_ft_airdrop(
+            wallet,
+            ref,
+            recipients,
+            client=client,
             fee_rate=ctx.fee_rate,
             allow_overpay=allow_overpay,
         )
@@ -1468,6 +1446,7 @@ async def _airdrop_ft_inner(
             cause=str(exc),
             fix="fund the wallet with more plain RXD, or split the list into smaller batches",
         ) from exc
+    airdrop_result = build
 
     rows = [{"address": address, "amount": amount, "vout": vout} for vout, (address, amount) in enumerate(pairs)]
     _confirm_or_abort(

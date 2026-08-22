@@ -6,6 +6,29 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **`GlyphClient` covers the two-phase FT deploy**: `commit_ft` and `reveal_ft`. Only the
+  one-shot `deploy_ft` existed, so a caller who committed an FT had to reach past the
+  facade into `.minter` to finish — and the commit output is a hashlock with **no
+  owner-only spend path**, making the phase a caller most needs to resume the one not
+  exposed. `reveal_ft` defaults `allow_below_relay_floor` to `None`, not `False`, for the
+  reason documented on `reveal_nft`: `False` reads to the minter as a deliberate override,
+  so a sub-floor client would commit and then be refused its own reveal.
+  `commit_ft` ships with it rather than after it — half a pair is the asymmetry the facade
+  exists to remove.
+- **`GlyphClient.airdrop_ft` / `build_ft_airdrop`, and `pyrxd.glyph.transfer.build_ft_airdrop`.**
+  The airdrop orchestration lived only in the CLI, so a library caller had to reimplement
+  it. `build_ft_transfer` is now a single-recipient delegation to it — the same
+  relationship `FtUtxoSet.build_transfer_tx` has to `build_airdrop_tx` one layer down —
+  so the enumerate-once discipline, the signing-key check and the post-build fee assertion
+  exist once rather than twice. Like its transfer siblings, `airdrop_ft` derives the txid
+  from the bytes it signed and raises `BroadcastEchoMismatch` on a mismatch.
+- **`BroadcastEchoMismatch` is importable from `pyrxd`**, and `AirdropReceipt`,
+  `TransferReceipt`, `FtAirdropBuild`, `FtTransferBuild` and `NftTransferBuild` from
+  `pyrxd.glyph`. The 0.19.0 notes tell callers to catch `BroadcastEchoMismatch` on every
+  fund-moving path while it was reachable only as `pyrxd.glyph.client.BroadcastEchoMismatch`.
+
 ### Upgrade notes
 
 - **The CLI now refuses a fee rate above the overpay ceiling**, matching the SDK. It
