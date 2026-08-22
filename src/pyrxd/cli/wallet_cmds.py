@@ -637,7 +637,7 @@ def wallet_sweep(
                     cause="the scan found no UTXOs on this coin type / account",
                     fix="double-check --coin-type and --account (run `wallet recover --scan` first)",
                 )
-            tx = wallet.build_send_max_tx(triples, to_address, fee_rate=fee_rate)
+            tx = wallet.build_send_max_tx(triples, to_address, fee_rate=fee_rate, allow_overpay=allow_overpay)
             total_in = sum(t[0].value for t in triples)
             out_value = tx.outputs[0].satoshis
             fee = total_in - out_value
@@ -767,9 +767,9 @@ def wallet_send(
         )
 
     if AgentClient(_agent_socket(ctx)).is_live():
-        result = _send_via_agent(ctx, to_address, amount, fee_rate)
+        result = _send_via_agent(ctx, to_address, amount, fee_rate, allow_overpay=allow_overpay)
     else:
-        result = _send_in_process(ctx, to_address, amount, fee_rate, passphrase)
+        result = _send_in_process(ctx, to_address, amount, fee_rate, passphrase, allow_overpay=allow_overpay)
 
     if ctx.output_mode == "json":
         click.echo(emit(result, mode="json"))
@@ -780,7 +780,9 @@ def wallet_send(
         click.echo(f"Transaction: {result['txid']}")
 
 
-def _send_via_agent(ctx: CliContext, to_address: str, amount: int, fee_rate: int) -> dict[str, object]:
+def _send_via_agent(
+    ctx: CliContext, to_address: str, amount: int, fee_rate: int, allow_overpay: bool = False
+) -> dict[str, object]:
     """Build watch-only from the agent's xpub, let the agent sign, broadcast."""
     client = AgentClient(_agent_socket(ctx))
     xpub = Xpub(client.account_xpub())
@@ -797,7 +799,12 @@ def _send_via_agent(ctx: CliContext, to_address: str, amount: int, fee_rate: int
                     fix="fund the wallet, or check you unlocked the right account",
                 )
             built = builder.build_send(
-                scan.utxos, to_address, amount, change_index=scan.next_change_index, fee_rate=fee_rate
+                scan.utxos,
+                to_address,
+                amount,
+                change_index=scan.next_change_index,
+                fee_rate=fee_rate,
+                allow_overpay=allow_overpay,
             )
             fee = built.input_total - sum(o.satoshis for o in built.transaction.outputs)
             _send_summary(
@@ -822,7 +829,12 @@ def _send_via_agent(ctx: CliContext, to_address: str, amount: int, fee_rate: int
 
 
 def _send_in_process(
-    ctx: CliContext, to_address: str, amount: int, fee_rate: int, passphrase: bool
+    ctx: CliContext,
+    to_address: str,
+    amount: int,
+    fee_rate: int,
+    passphrase: bool,
+    allow_overpay: bool = False,
 ) -> dict[str, object]:
     """The fallback: prompt for the mnemonic and sign in-process (no agent)."""
     if not ctx.wallet_path.exists():
@@ -853,7 +865,7 @@ def _send_in_process(
                     cause="the scan found no UTXOs",
                     fix="fund the wallet first",
                 )
-            tx = wallet.build_send_tx(triples, to_address, amount, fee_rate=fee_rate)
+            tx = wallet.build_send_tx(triples, to_address, amount, fee_rate=fee_rate, allow_overpay=allow_overpay)
             input_total = sum(int(inp.satoshis) for inp in tx.inputs)
             fee = input_total - sum(o.satoshis for o in tx.outputs)
             if not _send_summary(
