@@ -23,6 +23,12 @@ from ..security.errors import ValidationError
 #: wrong-asset lock. Not Circle-issued; distinct liquidity. Linea is deliberately absent — its
 #: bridged USDC.e was upgraded IN PLACE to native USDC at the same address, so that address is
 #: now legitimate.
+#:
+#: Why address-pinning rather than symbol lookup, measured rather than assumed (2026-08-23,
+#: read live off each chain): the bridged contracts report ``symbol="USDC"`` and ``decimals=6``
+#: — metadata IDENTICAL to Circle's. Nothing in a token's own self-description distinguishes
+#: them, so any resolution by symbol would silently pick the wrong asset. The address is the
+#: only discriminator, which is why it is the thing that is pinned.
 _BRIDGED_LOOKALIKES: dict[str, str] = {
     "0xff970a61a04b1ca14834a43f5de4533ebddb5cc8": "Arbitrum One USDC.e (bridged, not Circle-issued)",
     "0x7f5c764cbc14f9669b88837ca1490cca17c31607": "Optimism USDC.e (bridged, not Circle-issued)",
@@ -85,6 +91,8 @@ class Erc20Token:
 
 #: Native Circle-issued USDC, keyed by chain id. Source: Circle's own published list
 #: (https://developers.circle.com/stablecoins/usdc-contract-addresses), fetched 2026-08-22.
+#: VERIFIED 2026-08-23 by reading ``symbol()`` and ``decimals()`` off each chain directly: all
+#: nine resolve to a live contract reporting USDC / 6. The doc was not taken on trust.
 KNOWN_TOKENS: dict[tuple[str, int], Erc20Token] = {
     ("USDC", 1): Erc20Token("USDC", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", 6, 1),
     ("USDC", 11155111): Erc20Token("USDC", "0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238", 6, 11155111),
