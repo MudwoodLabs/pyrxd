@@ -89,15 +89,13 @@ def fork_url():
         else:  # pragma: no cover
             pytest.fail("anvil fork did not become ready")
         # Give the taker USDC by impersonating a holder — no storage-slot derivation needed.
-        # Clear any EIP-7702 delegation on the dev accounts. On a MAINNET fork these well-known
-        # addresses inherit real state, and both currently carry a delegation designator
-        # (0xef0100 + delegate) — 23 bytes of code. `verify_funded`'s EOA-only check refuses any
-        # address with code, so without this the fork suite fails on state that has nothing to do
-        # with the swap. Recorded rather than worked around silently: that check refusing
-        # delegated EOAs is a real over-restriction for the TOKEN leg, whose payout is an ERC-20
-        # transfer and therefore never executes the recipient's code. Tracked separately.
-        for acct in (_ADDR_TAKER, _ADDR_MAKER):
-            _rpc_call(url, "anvil_setCode", [acct, "0x"])
+        # NOTE: the delegations are deliberately LEFT IN PLACE. On a mainnet fork both anvil dev
+        # addresses carry an EIP-7702 delegation designator (0xef0100 + delegate) — 23 bytes of
+        # code — because they are well-known addresses someone has delegated. An earlier version of
+        # this fixture cleared them with anvil_setCode to get past `verify_funded`'s EOA-only
+        # check. That check is now correctly relaxed for the token leg (#478), whose ERC-20 sweep
+        # calls the token and never the recipient, so the suite must pass WITH the delegations
+        # present. If this ever needs clearing again, the relaxation has regressed.
         _rpc_call(url, "anvil_impersonateAccount", [_WHALE])
         _rpc_call(url, "anvil_setBalance", [_WHALE, hex(10**18)])
         transfer = "0xa9059cbb" + _ADDR_TAKER[2:].rjust(64, "0") + hex(_AMOUNT * 10)[2:].rjust(64, "0")

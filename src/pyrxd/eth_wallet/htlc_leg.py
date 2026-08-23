@@ -190,7 +190,12 @@ class EthHtlcContractLeg:
         return all(e == o for e, o in zip(expected, on_chain) if e != 0)
 
     async def verify_funded(
-        self, locator: EthHtlcLocator, *, expected_amount_wei: int, block_identifier: str | int | None = None
+        self,
+        locator: EthHtlcLocator,
+        *,
+        expected_amount_wei: int,
+        block_identifier: str | int | None = None,
+        require_eoa_recipients: bool = True,
     ) -> None:
         """Pre-RXD-lock gate: the on-chain contract matches the negotiated terms.
 
@@ -241,10 +246,30 @@ class EthHtlcContractLeg:
         # 'finalized' the EOA-ness of claimant/refundee and the funded balance must be read at the
         # non-reorgable checkpoint too, not the reorg-able tip — else a reorg could flip an EOA to a
         # reverting contract, or show a balance the finalized state does not have.
-        if await self._rpc.get_code(locator.claimant, block_identifier):
-            raise ValidationError("claimant has contract code (not an EOA); a reverting recipient could lock funds")
-        if await self._rpc.get_code(locator.refundee, block_identifier):
-            raise ValidationError("refundee has contract code (not an EOA); a reverting recipient could lock funds")
+        # `require_eoa_recipients=False` is for a leg whose payout CANNOT be blocked by recipient
+        # code — an ERC-20 sweep calls the TOKEN, never the recipient, so a reverting delegate has
+        # nothing to revert. The default keeps the native behaviour exactly.
+        #
+        # This matters in practice, not in theory: an EIP-7702 delegated EOA carries 23 bytes of
+        # code (0xef0100 + delegate) and is still an ordinary EOA the user holds the key to. Both
+        # anvil dev addresses carry one on mainnet today. Refusing them on the token path would
+        # turn away honest counterparties for a failure mode that path does not have (#478).
+        if require_eoa_recipients:
+            for role, addr in (("claimant", locator.claimant), ("refundee", locator.refundee)):
+                code = await self._rpc.get_code(addr, block_identifier)
+                if not code:
+                    continue
+                delegated = bytes(code)[:3] == b"\xef\x01\x00"
+                raise ValidationError(
+                    f"{role} {addr} "
+                    + (
+                        "is an EIP-7702 DELEGATED EOA; this leg pays with a native ETH send, which "
+                        "executes the delegate's code, and a delegate that reverts on receive would "
+                        "lock the funds"
+                        if delegated
+                        else "has contract code (not an EOA); a reverting recipient could lock funds"
+                    )
+                )
         bal = await self._rpc.get_balance(locator.contract_address, block_identifier)
         # Lower bound, not exact-equal (red-team LOW): an attacker can force-send 1 wei (selfdestruct
         # / coinbase) to a contract, so an `== expected` check is griefable into a permanent verify

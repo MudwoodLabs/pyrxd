@@ -8,6 +8,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The token leg no longer refuses EIP-7702 delegated accounts** (#478). `verify_funded` rejects
+  any claimant/refundee with contract code, because a native ETH send *executes* the recipient's
+  code and a recipient that reverts on receive would lock the funds. An **EIP-7702 delegated EOA**
+  carries 23 bytes of code (`0xef0100` + delegate) and is an ordinary EOA the user holds the key
+  to — both anvil dev addresses carry one on mainnet today, so this is a live population. The
+  restriction is meaningless for the token leg, whose payout calls the **token** contract and never
+  the recipient, so it now opts out; the native default is unchanged. The native refusal message
+  also names EIP-7702 when that is what it found, instead of claiming "not an EOA" about an address
+  that is one.
 - **A transient RPC failure no longer destroys the preimage and strands a swap** (#479).
   `maker_claims_btc` zeroized `p` in a `finally`, on **every** exit — including failures where
   nothing had been broadcast, such as the chain-id assertion or a fee read. That destroyed the only

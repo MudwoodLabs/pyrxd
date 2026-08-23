@@ -181,3 +181,40 @@ class TestATokenSwapIsReachableThroughTheRealStack:
             token_address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
         )
         assert adapter.locked_amount(loc) == 12_345_678
+
+
+class TestTheTokenLegAcceptsEip7702DelegatedRecipients:
+    """#478. The EOA-only check is load-bearing for the NATIVE leg — an ETH send executes the
+    recipient's code, so a delegate that reverts on receive locks the funds. It is meaningless for
+    the TOKEN leg, whose payout calls the token contract and never the recipient.
+
+    An EIP-7702 delegated EOA carries 23 bytes of code (`0xef0100` + delegate) and is an ordinary
+    EOA the user holds the key to. Both anvil dev addresses carry one on mainnet today, so this is
+    a live population, not a hypothetical.
+    """
+
+    def test_the_token_leg_opts_out_of_the_eoa_restriction(self) -> None:
+        import inspect
+
+        src = inspect.getsource(Erc20HtlcLeg.verify_funded)
+        assert "require_eoa_recipients=False" in src
+
+    def test_the_native_default_is_unchanged(self) -> None:
+        """The native leg must keep the check: nothing about that corridor may loosen."""
+        import inspect
+
+        from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+
+        param = inspect.signature(EthHtlcContractLeg.verify_funded).parameters["require_eoa_recipients"]
+        assert param.default is True
+
+    def test_the_native_refusal_names_eip_7702_when_that_is_what_it_found(self) -> None:
+        """The old message said "not an EOA", which is actively wrong for a delegated account and
+        would send an operator looking for a bug that is not there."""
+        import inspect
+
+        from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+
+        src = inspect.getsource(EthHtlcContractLeg.verify_funded)
+        assert "EIP-7702" in src
+        assert 'b"\\xef\\x01\\x00"' in src, "must detect the delegation designator prefix"

@@ -239,7 +239,17 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 f"locator is denominated in {locator.token_address}, not the negotiated "
                 f"{self._token.symbol} at {self._token.address}"
             )
-        await super().verify_funded(locator, expected_amount_wei=0, block_identifier=block_identifier)
+        # require_eoa_recipients=False: this leg's payout is an ERC-20 sweep, which calls the
+        # TOKEN and never the recipient, so a recipient that would revert on receive has nothing to
+        # revert. Keeping the native restriction here would refuse EIP-7702 delegated EOAs — which
+        # are ordinary EOAs, increasingly common, and perfectly safe to pay in tokens (#478).
+        # Every other check the parent makes still runs: runtime code, the immutable binds, chain.
+        await super().verify_funded(
+            locator,
+            expected_amount_wei=0,
+            block_identifier=block_identifier,
+            require_eoa_recipients=False,
+        )
         await assert_token_matches_chain(self._rpc, self._token, block_identifier)
 
         web3 = _require_web3()
