@@ -155,3 +155,85 @@ class TestTheGateIsActuallyINVOKEDNotMerelyAvailable:
 
         src = inspect.getsource(Erc20HtlcLeg.claim)
         assert "htlc_address=locator.contract_address" in src
+
+
+class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
+    """A source-text assertion would pass on `if False: await gate(...)`. These drive the real
+    method and assert the outcome, which is the property the name claims."""
+
+    @staticmethod
+    def _leg(frozen: bool, held: int = 12_345_678):
+        import os
+
+        from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+        from pyrxd.security.secrets import PrivateKeyMaterial
+
+        class _Call:
+            def __init__(self, v):
+                self._v = v
+
+            async def call(self, *a, **k):
+                return self._v
+
+        class _Fns:
+            def isBlacklisted(self, *a, **k):
+                return _Call(frozen)
+
+            def balanceOf(self, *a, **k):
+                return _Call(held)
+
+            def decimals(self, *a, **k):
+                return _Call(6)
+
+        class _Contract:
+            functions = _Fns()
+
+        class _Eth:
+            def contract(self, *a, **k):
+                return _Contract()
+
+        class _W3:
+            eth = _Eth()
+
+        class _Rpc:
+            w3 = _W3()
+
+        import json
+        import pathlib
+
+        art = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
+        return Erc20HtlcLeg(
+            token=_USDC, rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=art
+        )
+
+    @staticmethod
+    def _locator():
+        from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+
+        return Erc20HtlcLocator(
+            chain_id=1,
+            contract_address="0x" + "11" * 20,
+            deploy_tx_hash="0x" + "22" * 32,
+            hashlock="0x" + "33" * 32,
+            claimant="0x" + "44" * 20,
+            refundee="0x" + "55" * 20,
+            timeout=1_800_000_000,
+            amount_wei=12_345_678,
+            token_address=_USDC.address,
+        )
+
+    def test_a_frozen_address_makes_claim_RAISE_and_never_broadcast(self) -> None:
+        from pyrxd.security.errors import ValidationError
+
+        leg = self._leg(frozen=True)
+        with pytest.raises(ValidationError, match="refusing to reveal the preimage"):
+            asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
+
+    def test_an_underfunded_contract_makes_claim_RAISE_before_the_freeze_read(self) -> None:
+        """The on-chain Underfunded revert does NOT keep the preimage secret — a reverted tx is
+        still mined and `p` is in its calldata. Refusing to BUILD the claim is the real defence."""
+        from pyrxd.security.errors import ValidationError
+
+        leg = self._leg(frozen=False, held=1)
+        with pytest.raises(ValidationError, match="refusing to build a claim"):
+            asyncio.run(leg.claim(self._locator(), b"\x00" * 32))

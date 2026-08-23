@@ -174,6 +174,21 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         The claim itself is the parent's, unchanged — this adds a precondition, not a different
         settlement path.
         """
+        # Re-read the funded balance at the TIP before building a claim. `verify_funded` ran
+        # earlier and at a finalized checkpoint, which is the right place for the immutables — but
+        # the contract's balance is what decides whether this claim pays, and the on-chain
+        # `Underfunded` revert does NOT keep the preimage secret: a reverted transaction is still
+        # mined and `p` is still in its calldata. So the last defence is refusing to BUILD the
+        # claim, not the contract refusing to honour it. This also closes the private-submission
+        # path, where the parent deliberately skips its eth_call preflight.
+        held = await balance_of(self._rpc, self._token, locator.contract_address)
+        if held < locator.amount_base_units:
+            raise ValidationError(
+                f"refusing to build a claim: the HTLC holds {held} base units of "
+                f"{self._token.symbol}, less than the {locator.amount_base_units} promised. "
+                "Broadcasting would publish the preimage in calldata for a payout that reverts, "
+                "letting the counterparty take the other leg for nothing."
+            )
         await assert_not_frozen_before_reveal(
             self._rpc,
             self._token,

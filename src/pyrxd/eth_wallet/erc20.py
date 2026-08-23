@@ -110,6 +110,12 @@ async def is_blacklisted(rpc: Any, token: Erc20Token, address: str) -> bool:
     when the caller is already in trouble. Whether the token *can* freeze is now pinned in the
     registry rather than inferred from a call that might fail, so there is no failure mode left to
     confuse with an answer: either we read the flag, or we raise.
+
+    **This defends a FAILING provider, not a LYING one.** The read is single-source. A hostile or
+    compromised RPC that returns ``False`` for a genuinely frozen address is not caught here, and
+    this gate guards the one unrecoverable outcome — a frozen HTLC bricks claim *and* refund. That
+    residual is the same single-provider trust the finality path documents, and a multi-source
+    quorum is the fix if this corridor ever carries real value.
     """
     if not token.has_blacklist:
         # Pinned capability, not a probe: a token that cannot freeze cannot freeze this swap.

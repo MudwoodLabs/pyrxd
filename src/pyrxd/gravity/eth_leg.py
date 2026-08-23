@@ -140,6 +140,19 @@ class EthLeg:
                 f"terms.eth_timeout_unix_s ({terms_timeout}) != this leg's eth_timeout_unix_s "
                 f"({self._eth_timeout_unix_s}); the validated deadline and the deployed deadline must agree"
             )
+        # Cross-check the ASSET before anything is broadcast. Without this a token leg driven by
+        # native terms deploys and pushes real USDC — `verify_funded` passes (self-consistent) and
+        # the amount bind passes (the integers match, the units do not) — and the disagreement is
+        # caught only by SwapRecord.__post_init__, i.e. AFTER the tokens sit in an HTLC the
+        # counterparty can already claim. A post-mortem is not a gate.
+        leg_token = getattr(self._leg, "token", None)
+        terms_token = getattr(terms, "token_address", "") or ""
+        if bool(leg_token) != bool(terms_token) or (leg_token and terms_token != leg_token.address):
+            raise ValidationError(
+                f"asset mismatch before funding: leg holds "
+                f"{leg_token.address if leg_token else 'native ETH'} but the terms name "
+                f"{terms_token or 'native ETH'}"
+            )
         locator = await self._leg.fund(
             hashlock=bytes(terms.hashlock),
             claimant=self._claim_to,
@@ -190,8 +203,18 @@ class EthLeg:
                     "refusing to build a locator that would misdescribe the asset"
                 )
             return EthHtlcLocator(**common)
-        if terms.token_address and terms.token_address != token.address:
-            raise ValidationError(f"terms name token {terms.token_address} but the leg is pinned to {token.address}")
+        # Both directions, and BEFORE anything is built. An empty terms_token against a token leg
+        # used to fall through silently and produce a token locator, leaving the disagreement to be
+        # caught by SwapRecord.__post_init__ — which on the fund path runs only AFTER the tokens are
+        # already in a deployed HTLC the counterparty can claim. A post-mortem is not a gate.
+        if not terms_token:
+            raise ValidationError(
+                f"this leg is pinned to {token.symbol} at {token.address} but the terms name no "
+                "token, so they describe a native-ETH swap; refusing rather than funding an asset "
+                "the counterparty did not agree to"
+            )
+        if terms_token != token.address:
+            raise ValidationError(f"terms name token {terms_token} but the leg is pinned to {token.address}")
         return Erc20HtlcLocator(**common, token_address=token.address)
 
     async def verify_counterparty_funded(
