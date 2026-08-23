@@ -61,49 +61,72 @@ class TestTheBoundaryIsMarkedByTheLegs:
         assert not issubclass(ValidationError, PreRevealAbort)
 
 
+def _both_locked(exc: BaseException):
+    """A real `SwapCoordinator` at BOTH_LOCKED whose counter leg fails the way we want.
+
+    Built through the coordinator's own transitions rather than by hand-constructing a record, so
+    the state it claims to be in is the state it actually reached.
+    """
+    import sys
+
+    sys.path.insert(0, "tests")
+    from test_swap_coordinator import FakeBtcLeg, FakeRadiantLeg, _coordinator, _terms
+    from test_swap_coordinator import generate_secret as _gen
+
+    p_secret, h = _gen()
+    terms = _terms(hashlock=h)
+    rxd = FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=FakeBtcLeg(), radiant_leg=rxd)
+
+    async def _reach():
+        await coord.taker_funds_btc(terms)
+        await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+
+    asyncio.run(_reach())
+
+    async def _failing_claim(*a, **k):
+        raise exc
+
+    coord.counter_leg.claim = _failing_claim
+    return coord, p_secret
+
+
+def _drive_real_coordinator(exc: BaseException) -> bool:
+    """Call the REAL `maker_claims_btc`; return True if the preimage survived."""
+    from pyrxd.gravity.swap_state import SwapState
+
+    coord, preimage = _both_locked(exc)
+    assert coord.record.state is SwapState.BOTH_LOCKED, "setup did not reach the state under test"
+    with pytest.raises(type(exc)):
+        asyncio.run(coord.maker_claims_btc(preimage))
+    try:
+        preimage.unsafe_raw_bytes()
+        return True
+    except Exception:
+        return False
+
+
 class TestTheCoordinatorKeepsTheSecretWhenNothingWasSent:
-    """Drives the real `maker_claims_btc` zeroize logic with a leg that fails on each side of the
-    boundary, and checks the preimage afterwards."""
+    """Drives the REAL `SwapCoordinator.maker_claims_btc`.
 
-    @staticmethod
-    def _run(exc: BaseException) -> bool:
-        """Mirror the coordinator's exact structure; return True if the secret survived."""
-        secret = PrivateKeyMaterial(os.urandom(32))
-
-        async def _claim():
-            raise exc
-
-        async def _drive():
-            try:
-                await _claim()
-            except PreRevealAbort:
-                raise
-            except BaseException:
-                secret.zeroize()
-                raise
-            else:
-                secret.zeroize()
-
-        with pytest.raises(type(exc)):
-            asyncio.run(_drive())
-        try:
-            secret.unsafe_raw_bytes()
-            return True
-        except Exception:
-            return False
+    The version this replaces defined a local `_drive()` closure that re-implemented the
+    coordinator's try/except/else and asserted on THAT — so reverting the coordinator to its old
+    `finally: preimage.zeroize()` left every test passing. A regression test for a coordinator fix
+    that never executes the coordinator is the "test of the test" pattern, in the one file whose
+    entire job is to pin that fix.
+    """
 
     def test_a_pre_broadcast_abort_preserves_the_preimage(self) -> None:
-        assert self._run(PreRevealAbort("rpc blip, nothing sent")) is True
+        assert _drive_real_coordinator(PreRevealAbort("rpc blip, nothing sent")) is True
 
     @pytest.mark.parametrize(
         "exc",
-        [NetworkError("failed while waiting for the receipt"), ValidationError("address is frozen")],
-        ids=["post-broadcast-transport", "actually-frozen"],
+        [NetworkError("failed while waiting for the receipt"), ValidationError("something else")],
+        ids=["post-broadcast-transport", "other-failure"],
     )
     def test_anything_else_still_zeroizes(self, exc: BaseException) -> None:
-        """The safety property must not regress: once a claim was attempted, or the swap is known
-        dead, the secret goes."""
-        assert self._run(exc) is False
+        """The safety property must not regress: once a claim was attempted, the secret goes."""
+        assert _drive_real_coordinator(exc) is False
 
 
 class TestNoPreRevealAbortCanEscapeFromPastTheSendBoundary:
