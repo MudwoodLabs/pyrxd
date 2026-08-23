@@ -217,3 +217,55 @@ class TestTheNoChangeDecisionsAreDeliberateNotAccidental:
         from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 
         assert Erc20HtlcLeg.verify_funded is not EthHtlcContractLeg.verify_funded
+
+
+class TestTheColdRecoveryPathAlreadyCoversATokenHtlc:
+    """The offline recovery toolkit (#374) needs no token-specific code, and this proves it.
+
+    `recover_preimage_from_eth_claim` binds provenance to the per-swap CONTRACT ADDRESS and scrapes
+    `p` from calldata and contract-emitted logs. Both are byte-identical for a token HTLC because
+    `Erc20Htlc.sol` keeps `claim(bytes32)` and the un-indexed `Claimed(bytes32)` event — the same
+    symmetry that let the leg inherit its settlement methods.
+
+    Worth an explicit test because the ORPHAN case is real and pre-existing: `fund()` returns a
+    locator only after funding lands, so a crash in between leaves a funded contract the record
+    does not reference. The native leg has the identical window (deploy → receipt → return). The
+    cold path is how an operator recovers from it, and it must work for the new asset too.
+    """
+
+    def test_p_is_recovered_from_a_token_htlc_claim(self) -> None:
+        import hashlib
+        import os
+
+        from pyrxd.cli.swap_recovery import recover_preimage_from_eth_claim
+
+        p = os.urandom(32)
+        h = hashlib.sha256(p).digest()
+        contract = "0x" + "ab" * 20
+
+        rec = recover_preimage_from_eth_claim(
+            hashlock=h,
+            contract_address=contract,
+            claim_tx={"hash": "0x" + "cd" * 32, "to": contract, "input": "0xaabbccdd" + p.hex()},
+            logs=[{"address": contract, "data": "0x" + p.hex(), "topics": ["0x" + "11" * 32]}],
+        )
+        assert bytes.fromhex(rec.preimage_hex) == p
+        assert rec.hashlock_hex == h.hex()
+
+    def test_a_claim_on_someone_elses_contract_is_still_refused(self) -> None:
+        """The provenance bind is the per-swap address, and it must not weaken for tokens: a
+        decoy that shares the hashlock but belongs to another swap has to be refused."""
+        import hashlib
+        import os
+
+        from pyrxd.cli.swap_recovery import ProvenanceRefused, recover_preimage_from_eth_claim
+
+        p = os.urandom(32)
+        h = hashlib.sha256(p).digest()
+        with pytest.raises(ProvenanceRefused):
+            recover_preimage_from_eth_claim(
+                hashlock=h,
+                contract_address="0x" + "ab" * 20,
+                claim_tx={"hash": "0x" + "cd" * 32, "to": "0x" + "ff" * 20, "input": "0xaabbccdd" + p.hex()},
+                logs=[{"address": "0x" + "ff" * 20, "data": "0x" + p.hex(), "topics": []}],
+            )
