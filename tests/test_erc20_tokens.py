@@ -80,3 +80,44 @@ class TestBaseUnitsCannotSilentlyLoseValue:
         """A guard that refuses valid work is a bug. Every ordinary amount must pass."""
         for whole, expected in [("0.01", 10_000), ("100", 100_000_000), ("1000000", 10**12)]:
             assert usdc.base_units(whole) == expected
+
+
+class TestTheErc20HtlcArtifactMatchesWhatTheLegNeeds:
+    """The artifact is compiled in a DIFFERENT REPO (`MudwoodLabs/pyrxd-eth-htlc`), so nothing in
+    this one would notice it drifting. These are the cross-repo compatibility pins."""
+
+    @staticmethod
+    def _artifact() -> dict:
+        import json
+        from pathlib import Path
+
+        return json.loads((Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
+
+    def test_it_has_the_keys_load_artifact_requires(self) -> None:
+        art = self._artifact()
+        for key in ("abi", "bytecode", "runtime_bytecode"):
+            assert key in art, key
+            assert art[key], f"{key} is empty"
+
+    def test_the_claimed_event_keeps_the_preimage_UNINDEXED(self) -> None:
+        """THE load-bearing pin. `eth_wallet/secret.py` recovers the secret by scanning the log
+        DATA for a 32-byte window hashing to H. If the preimage were `indexed` it would live in
+        topics as a HASH, the secret would be unrecoverable, and the failure would present as a
+        successful swap with an unclaimable counter-leg."""
+        events = [e for e in self._artifact()["abi"] if e.get("type") == "event" and e["name"] == "Claimed"]
+        assert len(events) == 1, "exactly one Claimed event"
+        (preimage,) = events[0]["inputs"]
+        assert preimage["type"] == "bytes32"
+        assert not preimage.get("indexed", False), "the preimage MUST stay in log data, not topics"
+
+    def test_the_immutables_verify_funded_reads_back_are_all_present(self) -> None:
+        """`verify_funded` binds the on-chain immutables to the negotiated terms. A missing getter
+        is a check that silently cannot run."""
+        getters = {f["name"] for f in self._artifact()["abi"] if f.get("type") == "function"}
+        assert {"hashlock", "claimant", "refundee", "timeout", "token", "amount"} <= getters
+
+    def test_there_is_no_approve_or_transferFrom_surface(self) -> None:
+        """The design has no allowances at all. A funding path that appeared here would mean the
+        contract had grown a pull mechanism nobody decided on."""
+        names = {f["name"] for f in self._artifact()["abi"] if f.get("type") == "function"}
+        assert not (names & {"approve", "transferFrom", "fund", "deposit"}), names
