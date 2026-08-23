@@ -232,8 +232,22 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
     def test_an_underfunded_contract_makes_claim_RAISE_before_the_freeze_read(self) -> None:
         """The on-chain Underfunded revert does NOT keep the preimage secret — a reverted tx is
         still mined and `p` is in its calldata. Refusing to BUILD the claim is the real defence."""
-        from pyrxd.security.errors import ValidationError
+        from pyrxd.security.errors import PreRevealAbort
 
         leg = self._leg(frozen=False, held=1)
-        with pytest.raises(ValidationError, match="refusing to build a claim"):
+        with pytest.raises(PreRevealAbort, match="refusing to build a claim"):
             asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
+
+    def test_the_underfunded_refusal_PRESERVES_the_preimage(self) -> None:
+        """The sibling lane of #479. Round 2 made a transport failure keep the secret but left this
+        value lane raising ValidationError, so a lagging provider's stale balance destroyed a
+        still-secret preimage. Nothing is broadcast here, so it must be retryable — and keeping p
+        costs nothing even when the contract really is short: the maker simply does not claim."""
+        from pyrxd.security.errors import PreRevealAbort, ValidationError
+
+        leg = self._leg(frozen=False, held=1)
+        with pytest.raises(PreRevealAbort) as exc:
+            asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
+        assert not isinstance(exc.value, ValidationError), (
+            "a ValidationError here would make the coordinator zeroize a preimage that never left the process"
+        )

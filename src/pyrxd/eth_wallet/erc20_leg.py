@@ -189,11 +189,18 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         except Exception as exc:
             raise PreRevealAbort(f"could not read the funded balance before revealing: {exc}") from exc
         if held < locator.amount_base_units:
-            raise ValidationError(
+            # PreRevealAbort, not ValidationError: this refusal is PRE-BROADCAST, so the preimage
+            # is still secret and the caller must not discard it. Round 2 fixed the transport-error
+            # lane of #479 and left this value lane behind — a load-balanced provider serving a
+            # lagging node returns a stale low balance, the claim is refused, and the secret dies
+            # for a reading that was simply out of date. Keeping p costs nothing even when the
+            # contract really is short: the maker just does not claim, and both sides refund.
+            raise PreRevealAbort(
                 f"refusing to build a claim: the HTLC holds {held} base units of "
                 f"{self._token.symbol}, less than the {locator.amount_base_units} promised. "
                 "Broadcasting would publish the preimage in calldata for a payout that reverts, "
-                "letting the counterparty take the other leg for nothing."
+                "letting the counterparty take the other leg for nothing. Nothing was sent, so the "
+                "preimage is still secret and this is retryable."
             )
         try:
             await assert_not_frozen_before_reveal(

@@ -219,26 +219,50 @@ class TestTheTokenLegAcceptsEip7702DelegatedRecipients:
         from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 
         src = inspect.getsource(EthHtlcContractLeg.verify_funded)
-        assert "EIP-7702" in src
-        assert 'b"\\xef\\x01\\x00"' in src, "must detect the delegation designator prefix"
+        assert "EIP-7702" in src, "the message must name what it actually found"
+        assert "is_eip7702_delegation(" in src, "detection must go through the shared predicate"
 
 
 class TestOnlyTheExactDelegationShapeIsAdmitted:
-    """`0xef0100` + 20 bytes is EXACTLY 23 bytes. Anything else is a contract, however it starts."""
+    """Executes the PRODUCTION predicate rather than re-deriving its rule.
 
-    @staticmethod
-    def _codes():
-        return {
-            "empty (plain EOA)": b"",
-            "7702 delegation (23 bytes)": b"\xef\x01\x00" + b"\x11" * 20,
-            "7702 prefix but too long": b"\xef\x01\x00" + b"\x11" * 40,
-            "7702 prefix but too short": b"\xef\x01\x00" + b"\x11" * 5,
-            "ordinary contract": b"\x60\x80\x60\x40" * 10,
-        }
+    The first version of this class recomputed `len(code) == 23 and code[:3] == 0xef0100` inline
+    and asserted on that — a test of the test. It would have passed against the **prefix-only**
+    check an earlier commit on this branch actually shipped, because the production code never ran.
+    That is why the rule now lives in a named predicate: so this can call it.
+    """
 
-    @pytest.mark.parametrize("label", list(_codes.__func__()))
-    def test_the_shape_test_is_exact(self, label: str) -> None:
-        code = self._codes()[label]
-        delegated = len(code) == 23 and code[:3] == b"\xef\x01\x00"
-        expected = label == "7702 delegation (23 bytes)"
-        assert delegated is expected, f"{label}: a prefix match alone must not count as a delegation"
+    @pytest.mark.parametrize(
+        ("label", "code", "is_delegation"),
+        [
+            ("7702 designator, exactly 23 bytes", b"\xef\x01\x00" + b"\x11" * 20, True),
+            ("7702 prefix but longer — a contract", b"\xef\x01\x00" + b"\x11" * 40, False),
+            ("7702 prefix but shorter", b"\xef\x01\x00" + b"\x11" * 5, False),
+            ("ordinary contract bytecode", b"\x60\x80\x60\x40" * 10, False),
+            ("empty — a plain EOA", b"", False),
+        ],
+    )
+    def test_the_production_predicate_matches_only_the_exact_shape(self, label, code, is_delegation) -> None:
+        from pyrxd.eth_wallet.htlc_leg import is_eip7702_delegation
+
+        assert is_eip7702_delegation(code) is is_delegation, label
+
+    def test_a_prefix_only_rule_would_fail_this(self) -> None:
+        """Names the specific regression: prefix-matching admits a contract that starts 0xEF.
+        EIP-3541 forbids DEPLOYING such code, but the check must not depend on that — a length
+        test is what makes the shape unforgeable here."""
+        from pyrxd.eth_wallet.htlc_leg import is_eip7702_delegation
+
+        impostor = b"\xef\x01\x00" + b"\x11" * 40
+        assert impostor[:3] == b"\xef\x01\x00", "the impostor does match on prefix"
+        assert is_eip7702_delegation(impostor) is False, "but must not be treated as a delegation"
+
+    def test_verify_funded_uses_the_predicate_rather_than_its_own_copy(self) -> None:
+        """Two copies of a security rule drift. This pins that there is one."""
+        import inspect
+
+        from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+
+        src = inspect.getsource(EthHtlcContractLeg.verify_funded)
+        assert "is_eip7702_delegation(" in src
+        assert "0xef" not in src.lower().replace("0xef0100", ""), "no second inline copy of the rule"

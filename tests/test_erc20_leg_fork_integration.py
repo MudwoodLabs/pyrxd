@@ -184,3 +184,92 @@ def test_the_freeze_gate_runs_against_the_real_blacklist(fork_url: str) -> None:
             leg._rpc, _USDC, htlc_address="0x" + "11" * 20, parties={"claimant": _ADDR_MAKER}
         )
     )
+
+
+_KEY_MAKER = "59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d"  # anvil dev key 1
+
+
+def _maker_leg(fork_url: str) -> Erc20HtlcLeg:
+    """A leg signing as the CLAIMANT — claiming is the maker's action."""
+    return Erc20HtlcLeg(
+        token=_USDC,
+        rpc=EthRpc(fork_url, expected_chain_id=_MAINNET),
+        signing_key=PrivateKeyMaterial(bytes.fromhex(_KEY_MAKER)),
+        chain_id=_MAINNET,
+        artifact=_ARTIFACT,
+    )
+
+
+def test_a_real_claim_pays_the_claimant_and_fits_the_gas_budget(fork_url: str) -> None:
+    """The suite stopped at `verify_funded` and never broadcast a claim, so the gas budget was
+    never exercised on the token path — the parent builds at 120,000, a limit sized for a native
+    ETH send. A token claim additionally does an SSTORE, a `balanceOf` and a full ERC-20 transfer
+    into a cold recipient slot.
+
+    That gap matters more than an ordinary one: if a claim ever exceeded the limit it would revert
+    **after** the preimage was already in public calldata, so the counterparty takes the other leg
+    while this one is dead. This drives the whole path against the real contract.
+    """
+    import hashlib
+    import os as _os
+
+    taker = _leg(fork_url)
+    preimage = _os.urandom(32)
+    hashlock = hashlib.sha256(preimage).digest()
+
+    locator = asyncio.run(
+        taker.fund(
+            hashlock=hashlock,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=int(time.time()) + 3600,
+            amount_wei=_AMOUNT,
+        )
+    )
+
+    before = asyncio.run(balance_of(taker._rpc, _USDC, _ADDR_MAKER))
+    tx_hash = asyncio.run(_maker_leg(fork_url).claim(locator, preimage))
+    assert tx_hash
+
+    receipt = _rpc_call(fork_url, "eth_getTransactionReceipt", [tx_hash])["result"]
+    assert int(receipt["status"], 16) == 1, "the claim reverted — check the gas budget"
+    used = int(receipt["gasUsed"], 16)
+    assert used < 120_000, f"claim used {used} gas against the inherited 120,000 limit"
+
+    after = asyncio.run(balance_of(taker._rpc, _USDC, _ADDR_MAKER))
+    assert after - before == _AMOUNT, "the claimant must be paid the exact amount, in base units"
+    assert asyncio.run(balance_of(taker._rpc, _USDC, locator.contract_address)) == 0, "swept"
+
+
+def test_the_preimage_is_recoverable_from_the_real_claim(fork_url: str) -> None:
+    """The counter-leg's whole purpose: `p` must be scrapeable from the claim. This is what the
+    un-indexed `Claimed(bytes32)` event and the identical calldata shape exist for, and it is only
+    truly proven against a real broadcast."""
+    import hashlib
+    import os as _os
+
+    from pyrxd.cli.swap_recovery import recover_preimage_from_eth_claim
+
+    taker = _leg(fork_url)
+    preimage = _os.urandom(32)
+    hashlock = hashlib.sha256(preimage).digest()
+    locator = asyncio.run(
+        taker.fund(
+            hashlock=hashlock,
+            claimant=_ADDR_MAKER,
+            refundee=_ADDR_TAKER,
+            timeout=int(time.time()) + 3600,
+            amount_wei=_AMOUNT,
+        )
+    )
+    tx_hash = asyncio.run(_maker_leg(fork_url).claim(locator, preimage))
+
+    tx = _rpc_call(fork_url, "eth_getTransactionByHash", [tx_hash])["result"]
+    receipt = _rpc_call(fork_url, "eth_getTransactionReceipt", [tx_hash])["result"]
+    rec = recover_preimage_from_eth_claim(
+        hashlock=hashlock,
+        contract_address=locator.contract_address,
+        claim_tx=tx,
+        logs=receipt.get("logs", []),
+    )
+    assert bytes.fromhex(rec.preimage_hex) == preimage

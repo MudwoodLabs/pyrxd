@@ -99,6 +99,22 @@ def _require_web3() -> Any:
     return web3
 
 
+def is_eip7702_delegation(code: bytes) -> bool:
+    """Whether ``code`` is an EIP-7702 delegation designator rather than a contract.
+
+    The designator is exactly ``0xef0100`` followed by the delegate's 20-byte address — 23 bytes
+    total. An account carrying it is an ordinary EOA whose key the holder still controls; it is
+    only *executing* borrowed code. EIP-3541 forbids deploying a contract whose code begins
+    ``0xEF``, so this shape cannot be forged by a contract.
+
+    **The length check is not decoration.** A prefix-only test would admit any contract that
+    happens to start with those bytes, and an earlier version of this branch shipped exactly that.
+    It lives here as a named predicate so a test can execute it: a test that re-derives the rule
+    inline is testing itself, which is how the prefix-only version passed review.
+    """
+    return len(code) == 23 and code[:3] == b"\xef\x01\x00"
+
+
 class EthHtlcContractLeg:
     """Native-ETH HTLC counter-chain leg (Sepolia-first).
 
@@ -263,7 +279,7 @@ class EthHtlcContractLeg:
             code = bytes(await self._rpc.get_code(addr, block_identifier) or b"")
             if not code:
                 continue
-            delegated = len(code) == 23 and code[:3] == b"\xef\x01\x00"
+            delegated = is_eip7702_delegation(code)
             if delegated and allow_delegated_eoa_recipients:
                 continue
             raise ValidationError(
