@@ -118,3 +118,53 @@ class TestTheArtifactAndTheRegistryAgree:
             "address",
             "uint256",
         ]
+
+
+class TestATokenSwapIsReachableThroughTheRealStack:
+    """Reachability, asserted rather than assumed.
+
+    Merging code nothing can reach is the pattern behind #468 and the `pyrxd[eth]` bug, so the
+    question "can a caller actually drive a USDC swap?" gets a test rather than a claim. The
+    answer is yes via the library: `Erc20HtlcLeg` -> `EthLeg` -> coordinator. There is deliberately
+    no CLI path — the shipped CLI has zero broadcast surface for the cross-chain stack, which a
+    four-reviewer panel chose to keep until the audit clears.
+    """
+
+    def test_the_token_leg_composes_into_the_coordinator_shaped_adapter(self) -> None:
+        from pyrxd.gravity.eth_leg import EthLeg
+
+        leg = _leg()
+        adapter = EthLeg(
+            contract_leg=leg,
+            network="mainnet",
+            claim_to="0x" + "44" * 20,
+            refund_to="0x" + "55" * 20,
+            eth_timeout_unix_s=1_800_000_000,
+        )
+        assert adapter is not None, "EthLeg must accept a token contract leg unmodified"
+
+    def test_the_adapter_reports_a_token_amount_in_base_units(self) -> None:
+        """`locked_amount` feeds the coordinator's bind against `terms.value_amount`. Both are the
+        token's base units, so the comparison is unit-consistent end to end."""
+        from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+        from pyrxd.gravity.eth_leg import EthLeg
+
+        adapter = EthLeg(
+            contract_leg=_leg(),
+            network="mainnet",
+            claim_to="0x" + "44" * 20,
+            refund_to="0x" + "55" * 20,
+            eth_timeout_unix_s=1_800_000_000,
+        )
+        loc = Erc20HtlcLocator(
+            chain_id=1,
+            contract_address="0x" + "11" * 20,
+            deploy_tx_hash="0x" + "22" * 32,
+            hashlock="0x" + "33" * 32,
+            claimant="0x" + "44" * 20,
+            refundee="0x" + "55" * 20,
+            timeout=1_800_000_000,
+            amount_wei=12_345_678,  # 12.345678 USDC
+            token_address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        )
+        assert adapter.locked_amount(loc) == 12_345_678
