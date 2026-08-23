@@ -8,6 +8,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **The USDC corridor is documented as issuer-trusted, not trustless**
+  (`docs/solutions/design-decisions/usdc-corridor-is-issuer-trusted-not-trustless.md`). RXD/Glyph ↔
+  USDC uses the same HTLC protocol as RXD ↔ ETH but **not the same guarantee**: native ETH is held
+  by the EVM, USDC by a contract whose issuer can freeze addresses. Measured on a mainnet fork
+  against the real contract — freezing the **HTLC itself** makes `claim` *and* `refund` revert
+  **permanently**, with no timeout to rescue the funds. Mitigations are per-swap contracts (a
+  freeze loses one swap, not all), a pre-reveal blacklist gate inside `claim`, and a deliberately
+  short funded window. None is a fix; the residual is accepted and must travel with any
+  user-facing description of the corridor, alongside the existing "swaps are unaudited" line.
 - **ERC-20 / USDC durable-record support** — `Erc20HtlcLocator` and `NegotiatedTerms.token_address`.
   An older binary cannot misread a token record: the locator serialises under its own
   `"eth-erc20"` chain tag, and a reader that predates the tag lands in `from_dict`'s existing
