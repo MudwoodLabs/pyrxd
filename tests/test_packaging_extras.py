@@ -16,7 +16,15 @@ import re
 from pathlib import Path
 
 import pytest
-import tomllib
+
+# tomllib landed in 3.11 and `requires-python` is >=3.10, so the 3.10 CI leg has no such module —
+# this file failed collection there with ModuleNotFoundError. Same fallback the shipped code
+# already uses (`pyrxd/cli/config.py:72-78`); `tomli` is a runtime dependency under exactly this
+# marker (`pyproject.toml:47`) and is what CPython adopted upstream as `tomllib`.
+try:
+    import tomllib  # type: ignore[import-not-found]
+except ModuleNotFoundError:  # pragma: no cover - only on Python 3.10
+    import tomli as tomllib  # type: ignore[import-not-found, no-redef]
 
 _ROOT = Path(__file__).resolve().parent.parent
 _PYPROJECT = _ROOT / "pyproject.toml"
