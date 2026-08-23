@@ -23,6 +23,12 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so the extra could never have supplied it and following that advice left the user where they
   started; it now says to reinstall the package.
 
+**Note for consumers**: installing the extra pulls `eth-account` 0.14.0, which calls
+`sys.setrecursionlimit(100_000)` **at import time** (0.13.7 did not). That is a process-global
+side effect of a third-party import, not something pyrxd does — but it is worth knowing if your
+application relies on the default limit, and it is why a pyrxd test that assumed the ambient limit
+now pins its own.
+
 Adding the extra introduces **no new package to any environment** — all three already resolved as
 part of the `test` group. It declares what was already true and makes it reachable. The base wheel
 stays dep-light: verified that a bare install has no web3, still imports, and fails the ETH paths

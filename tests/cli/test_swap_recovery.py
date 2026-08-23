@@ -17,6 +17,7 @@ import ast
 import hashlib
 import json
 import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -1722,8 +1723,22 @@ def test_a_deeply_nested_file_json_loads_ITSELF_cannot_parse_is_a_clean_refusal(
     p = tmp_path / "deeper.json"
     p.write_text("[" * 20_000 + "]" * 20_000)
     p.chmod(0o600)
-    with pytest.raises(ValidationError, match="nested too deeply"):
-        sr.load_recovery_json(p)
+
+    # Pin the recursion limit for the duration. This test asserts "WHEN json.loads recurses
+    # out, we render a clean refusal" — so the precondition has to be established, not assumed
+    # from ambient interpreter state. It is not ours to assume: `eth_account` 0.14.0 calls
+    # `sys.setrecursionlimit(100_000)` at IMPORT time (0.13.7 did not), and because the CI leg
+    # clears `addopts` it runs the eth suites in the same process. At 100_000 a 20_000-deep
+    # document simply parses on 3.10/3.11, the RecursionError never happens, and this test failed
+    # while nothing was wrong: the walker is an explicit stack with no depth limit and the node
+    # count is already bounded by the file-size gate, so parsing it is the safe outcome.
+    limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(1_000)
+    try:
+        with pytest.raises(ValidationError, match="nested too deeply"):
+            sr.load_recovery_json(p)
+    finally:
+        sys.setrecursionlimit(limit)
 
 
 def test_the_gate_and_the_status_command_cannot_disagree(tmp_path: Path) -> None:
