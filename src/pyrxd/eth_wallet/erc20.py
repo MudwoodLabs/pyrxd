@@ -18,7 +18,8 @@ from ..security.errors import NetworkError, ValidationError
 from .htlc_leg import _require_web3
 from .tokens import Erc20Token
 
-#: Only the four reads this module performs. A trimmed ABI is a safety property, not tidiness:
+#: The reads this module performs, plus ``symbol()`` — which nothing calls today and is kept
+#: only so an operator-facing tool can identify a token without a second ABI. A trimmed ABI is a safety property, not tidiness:
 #: nothing here can accidentally call a mutating function that is not in the list.
 ERC20_READ_ABI: list[dict[str, Any]] = [
     {
@@ -160,8 +161,12 @@ async def assert_not_frozen_before_reveal(
     """
     if not isinstance(htlc_address, str) or not htlc_address:
         raise ValidationError("htlc_address is required: it is the freeze that cannot be refunded")
-    checks = {"htlc contract": htlc_address, **(parties or {})}
-    frozen = [f"{role} ({addr})" for role, addr in checks.items() if await is_blacklisted(rpc, token, addr)]
+    # Pairs, not a dict merge. `{"htlc contract": htlc_address, **parties}` let a caller passing
+    # that same key OVERWRITE the mandatory address — silently defeating the guarantee two
+    # paragraphs above that it cannot be omitted. Nothing does that today; the point is that it
+    # would not have been noticed.
+    checks = [("htlc contract", htlc_address), *sorted((parties or {}).items())]
+    frozen = [f"{role} ({addr})" for role, addr in checks if await is_blacklisted(rpc, token, addr)]
     if frozen:
         raise ValidationError(
             f"refusing to reveal the preimage: {', '.join(frozen)} is frozen by the {token.symbol} "

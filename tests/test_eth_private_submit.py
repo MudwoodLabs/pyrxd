@@ -44,6 +44,12 @@ class _FakeRpc:
         self.public_sends: list[bytes] = []
 
         class _W3Eth:
+            async def get_block(self_inner, _which):
+                # The claim path now reads the clock to refuse a claim too close to the HTLC
+                # timeout — a late claim still mines with the preimage in its calldata. These
+                # tests are about private-submit ROUTING, so put "now" far before the deadline.
+                return {"timestamp": 0}
+
             def contract(self_inner, address, abi):
                 class _Fns:
                     def claim(self_fns, preimage):

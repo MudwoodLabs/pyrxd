@@ -121,3 +121,28 @@ class TestTheErc20HtlcArtifactMatchesWhatTheLegNeeds:
         contract had grown a pull mechanism nobody decided on."""
         names = {f["name"] for f in self._artifact()["abi"] if f.get("type") == "function"}
         assert not (names & {"approve", "transferFrom", "fund", "deposit"}), names
+
+
+class TestTheRegistryValidatesAsStrictlyAsEveryOtherAddressField:
+    """These were weaker than `locator._check_hex_addr` and than the `token_address` check on the
+    negotiated terms — the same field, validated three ways on one branch."""
+
+    def test_a_non_hex_address_is_refused_at_construction(self) -> None:
+        """Prefix and length alone admit "0x" + "z"*40, deferring the failure to
+        `to_checksum_address` at first on-chain use — far from the construction that caused it."""
+        with pytest.raises(ValidationError, match="not valid hex"):
+            Erc20Token("X", "0x" + "z" * 40, 6, 1)
+
+    def test_a_unicode_digit_amount_raises_the_documented_type(self) -> None:
+        """`"²".isdigit()` is True but `int("²")` raises, so this escaped as a bare
+        ValueError — which every caller here, catching ValidationError, would have missed."""
+        with pytest.raises(ValidationError, match="not a decimal amount"):
+            token_for("USDC", 1).base_units("²")
+
+    @pytest.mark.parametrize("bad", ["²", "①"])  # NB fullwidth digits ARE decimal and int() parses them
+    def test_other_unicode_digit_forms_too(self, bad: str) -> None:
+        with pytest.raises(ValidationError):
+            token_for("USDC", 1).base_units(bad)
+
+    def test_the_honest_path_is_untouched(self) -> None:
+        assert token_for("USDC", 1).base_units("12.345678") == 12_345_678

@@ -58,6 +58,14 @@ class Erc20Token:
     def __post_init__(self) -> None:
         if not isinstance(self.address, str) or not self.address.startswith("0x") or len(self.address) != 42:
             raise ValidationError(f"Erc20Token.address must be 0x + 40 hex chars, got {self.address!r}")
+        # Round-trip the tail, exactly as `locator._check_hex_addr` does. Length and prefix alone
+        # admit "0x" + "z"*40, deferring the failure to `to_checksum_address` at first on-chain use
+        # — far from the construction that introduced it, and for the field this class calls THE
+        # identity of the asset.
+        try:
+            bytes.fromhex(self.address[2:])
+        except ValueError as exc:
+            raise ValidationError(f"Erc20Token.address is not valid hex: {self.address!r}") from exc
         object.__setattr__(self, "address", self.address.lower())
         if not isinstance(self.decimals, int) or isinstance(self.decimals, bool) or not 0 <= self.decimals <= 36:
             raise ValidationError("Erc20Token.decimals must be an int in 0..36")
@@ -79,7 +87,10 @@ class Erc20Token:
         if neg:
             raise ValidationError("base_units refuses a negative amount")
         int_part, _, frac_part = text.partition(".")
-        if not int_part.isdigit() or (frac_part and not frac_part.isdigit()):
+        # isdecimal(), not isdigit(): the latter accepts Unicode digit forms such as "\u00b2" that
+        # int() then refuses, so a malformed amount escaped as a raw ValueError instead of this
+        # module's ValidationError — and every caller here catches ValidationError specifically.
+        if not int_part.isdecimal() or (frac_part and not frac_part.isdecimal()):
             raise ValidationError(f"not a decimal amount: {whole!r}")
         if len(frac_part) > self.decimals:
             raise ValidationError(

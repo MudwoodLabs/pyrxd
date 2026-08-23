@@ -99,13 +99,30 @@ def _require_web3() -> Any:
     return web3
 
 
+class _ClaimTooLate(Exception):
+    """Internal: too close to the deadline to broadcast. Surfaced as PreRevealAbort."""
+
+
+#: Seconds of head-room a claim must have before ``timeout`` to be worth broadcasting.
+#: ~8 Ethereum blocks at 12s. Sized to cover ordinary inclusion latency and a fee spike, not to be
+#: a precise deadline: the contract remains the source of truth. Deliberately generous, because the
+#: cost of refusing a claim that WOULD have made it is one retry, while the cost of broadcasting one
+#: that does not is the preimage published for nothing.
+CLAIM_INCLUSION_BUDGET_S: int = 96
+
+
 def is_eip7702_delegation(code: bytes) -> bool:
     """Whether ``code`` is an EIP-7702 delegation designator rather than a contract.
 
     The designator is exactly ``0xef0100`` followed by the delegate's 20-byte address — 23 bytes
-    total. An account carrying it is an ordinary EOA whose key the holder still controls; it is
-    only *executing* borrowed code. EIP-3541 forbids deploying a contract whose code begins
-    ``0xEF``, so this shape cannot be forged by a contract.
+    total. EIP-3541 forbids deploying a contract whose code begins ``0xEF``, so a CONTRACT cannot
+    wear this shape; that is the property being tested, and it is the only one.
+
+    **It does NOT prove anyone holds the key.** A 7702 authorization is ``ecrecover``-derived, so a
+    signature can be picked Nick's-method style to install a delegation on an address nobody
+    controls. That is harmless where this is used — claimant and refundee are each party's own
+    address, and an ERC-20 sweep never executes recipient code — but the justification must not be
+    reused if this predicate is ever asked about a counterparty-supplied address.
 
     **The length check is not decoration.** A prefix-only test would admit any contract that
     happens to start with those bytes, and an earlier version of this branch shipped exactly that.
@@ -228,7 +245,7 @@ class EthHtlcContractLeg:
         4. claimant and refundee are EOAs (empty code) — a contract recipient that
            reverts on ``receive`` would brick claim/refund via the contract's
            ``require(ok)``;
-        5. funded balance == expected amount (no underfunded contract).
+        5. funded balance >= expected amount (a LOWER bound — see the comment at the check) (no underfunded contract).
 
         ``block_identifier`` (red-team HIGH TOCTOU): pin EVERY read to one block. The taker's
         fund-time self-verify reads 'latest' (None). The MAKER's pre-lock re-verify passes
@@ -411,8 +428,29 @@ class EthHtlcContractLeg:
         # of a still-safe secret and strand a swap a retry would have finished (#479).
         try:
             await self._rpc.assert_chain()
+            # DEADLINE GUARD — the mirror of refund()'s maturity check, and the more dangerous of
+            # the two. `claim` reverts once block.timestamp >= timeout, and a reverted transaction
+            # is STILL MINED with the preimage in its calldata. So a claim that lands late does not
+            # merely fail: it publishes p for nothing, and the counterparty then refunds this leg
+            # AND takes the other one with the secret it just read. `fetch_claim_artifacts` says so
+            # in as many words — it scrapes p from a "reverted-but-mined" claim.
+            #
+            # On the mainnet-recommended PRIVATE path there is no eth_call preflight (it would leak
+            # p to the provider), so nothing downstream catches expiry either. This check is the
+            # only thing standing between a stalling counterparty and a free option.
+            now_ts = int((await self._rpc.w3.eth.get_block("latest"))["timestamp"])
+            deadline = int(locator.timeout)
+            if now_ts + CLAIM_INCLUSION_BUDGET_S >= deadline:
+                raise _ClaimTooLate(
+                    f"refusing to build a claim {deadline - now_ts}s before the HTLC timeout (needs "
+                    f"{CLAIM_INCLUSION_BUDGET_S}s of head-room): a claim that mines late still "
+                    "publishes the preimage in its calldata while paying nothing, which hands the "
+                    "counterparty both legs. Refund after the timeout instead."
+                )
             c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
             built = await c.functions.claim(bytes(preimage)).build_transaction(await self._base_tx(gas=120_000))
+        except _ClaimTooLate as exc:
+            raise PreRevealAbort(str(exc)) from exc
         except Exception as exc:
             raise PreRevealAbort(f"claim abandoned before broadcast; the preimage is still secret: {exc}") from exc
         # From here p may reach a provider: on the public path the preflight eth_call carries the

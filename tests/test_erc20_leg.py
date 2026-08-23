@@ -199,8 +199,12 @@ class TestTheTokenLegAcceptsEip7702DelegatedRecipients:
         import inspect
 
         src = inspect.getsource(Erc20HtlcLeg.verify_funded)
+        # Wiring pin ONLY — the behaviour lives in `test_eoa_recipient_policy.py`, which drives
+        # verify_funded with real delegation and contract bytecode. A sibling assertion here used
+        # to check `"require_eoa_recipients=False" not in src` for a parameter that had already
+        # been renamed away, so it could never fail. A vacuous assertion beside a real one is worse
+        # than none: it reads as coverage.
         assert "allow_delegated_eoa_recipients=True" in src
-        assert "require_eoa_recipients=False" not in src, "must not disable the check wholesale"
 
     def test_the_native_default_is_unchanged(self) -> None:
         """The native leg must keep the check: nothing about that corridor may loosen."""

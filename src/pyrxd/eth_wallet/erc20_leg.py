@@ -213,9 +213,16 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             # Could not TELL whether anything is frozen. Nothing was sent, so the preimage is
             # still secret and a retry can complete the swap — do not let the caller destroy it.
             raise PreRevealAbort(f"could not check freeze status before revealing: {exc}") from exc
-        # A ValidationError from the gate means something really IS frozen. That is deliberately
-        # NOT a PreRevealAbort: the swap cannot complete, and letting the caller discard the
-        # preimage is the right outcome rather than leaving a dead secret in memory.
+        except ValidationError as exc:
+            # An address really IS frozen — but that verdict comes from a SINGLE, unauthenticated
+            # read at the tip, and `is_blacklisted` documents itself as defending a failing
+            # provider rather than a lying one. Round 3's own argument for the balance lane applies
+            # verbatim and was inverted here: a hostile or misconfigured RPC answering `true` once
+            # would destroy the only copy of the secret. Blacklists are also reversible, so
+            # "the swap cannot complete" is not even durable. Nothing was sent, so keep `p` and let
+            # the operator decide; it is memory-only and never persisted, so retention costs
+            # nothing.
+            raise PreRevealAbort(f"refusing to reveal: {exc}") from exc
         return await super().claim(locator, preimage)
 
     async def verify_funded(

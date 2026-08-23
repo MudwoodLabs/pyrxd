@@ -146,5 +146,11 @@ class TestNoPreRevealAbortCanEscapeFromPastTheSendBoundary:
         import pathlib
 
         root = pathlib.Path(__file__).resolve().parent.parent / "src"
-        raisers = {p.name for p in root.rglob("*.py") if "raise PreRevealAbort(" in p.read_text()}
-        assert raisers <= {"htlc_leg.py", "erc20_leg.py"}, f"unexpected raisers: {sorted(raisers)}"
+        # Relative PATHS, not basenames. `src/pyrxd/btc_wallet/htlc_leg.py` shares a filename with
+        # the ETH leg, so a basename comparison let a raise added THERE pass unnoticed — verified by
+        # planting one. The BTC leg has no submit boundary of this shape at all.
+        raisers = {str(f.relative_to(root)) for f in root.rglob("*.py") if "raise PreRevealAbort(" in f.read_text()}
+        assert raisers <= {
+            "pyrxd/eth_wallet/htlc_leg.py",
+            "pyrxd/eth_wallet/erc20_leg.py",
+        }, f"unexpected raisers: {sorted(raisers)}"

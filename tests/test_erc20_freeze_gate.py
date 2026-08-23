@@ -223,10 +223,14 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
         )
 
     def test_a_frozen_address_makes_claim_RAISE_and_never_broadcast(self) -> None:
-        from pyrxd.security.errors import ValidationError
+        """PreRevealAbort, not ValidationError. The verdict comes from a SINGLE unauthenticated
+        read at the tip — `is_blacklisted` defends a failing provider, not a lying one — so a
+        hostile or misconfigured RPC answering `true` once must not destroy the only copy of the
+        secret. Blacklists are reversible too, so "the swap cannot complete" is not durable."""
+        from pyrxd.security.errors import PreRevealAbort
 
         leg = self._leg(frozen=True)
-        with pytest.raises(ValidationError, match="refusing to reveal the preimage"):
+        with pytest.raises(PreRevealAbort, match="refusing to reveal"):
             asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
 
     def test_an_underfunded_contract_makes_claim_RAISE_before_the_freeze_read(self) -> None:
@@ -251,3 +255,43 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
         assert not isinstance(exc.value, ValidationError), (
             "a ValidationError here would make the coordinator zeroize a preimage that never left the process"
         )
+
+
+class TestTheContractAddressCannotBeDisplacedByACallerKey:
+    """`{"htlc contract": htlc_address, **parties}` let a caller passing that same key OVERWRITE
+    the mandatory address — silently defeating the guarantee that it cannot be omitted. Nothing
+    does that today; the point is that nothing would have noticed."""
+
+    def test_a_colliding_party_key_does_not_replace_the_htlc_address(self) -> None:
+        frozen_addr = "0x" + "de" * 20
+        checked: list[str] = []
+
+        class _Recorder:
+            class w3:
+                class eth:
+                    @staticmethod
+                    def contract(*a, **k):
+                        class _C:
+                            class functions:
+                                @staticmethod
+                                def isBlacklisted(addr):
+                                    checked.append(addr)
+
+                                    class _Call:
+                                        async def call(self, *a, **k):
+                                            return addr == frozen_addr
+
+                                    return _Call()
+
+                        return _C()
+
+        with pytest.raises(Exception):
+            asyncio.run(
+                assert_not_frozen_before_reveal(
+                    _Recorder(),
+                    _USDC,
+                    htlc_address=frozen_addr,
+                    parties={"htlc contract": "0x" + "aa" * 20},  # tries to displace it
+                )
+            )
+        assert frozen_addr in checked, "the real HTLC address must still be checked"
