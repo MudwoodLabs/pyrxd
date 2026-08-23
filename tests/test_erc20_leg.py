@@ -193,11 +193,14 @@ class TestTheTokenLegAcceptsEip7702DelegatedRecipients:
     a live population, not a hypothetical.
     """
 
-    def test_the_token_leg_opts_out_of_the_eoa_restriction(self) -> None:
+    def test_the_token_leg_admits_delegates_but_NOT_arbitrary_contracts(self) -> None:
+        """The fix must not outgrow the finding. Delegated EOAs are admitted; a contract recipient
+        stays refused, because that is a different thing that was never the problem."""
         import inspect
 
         src = inspect.getsource(Erc20HtlcLeg.verify_funded)
-        assert "require_eoa_recipients=False" in src
+        assert "allow_delegated_eoa_recipients=True" in src
+        assert "require_eoa_recipients=False" not in src, "must not disable the check wholesale"
 
     def test_the_native_default_is_unchanged(self) -> None:
         """The native leg must keep the check: nothing about that corridor may loosen."""
@@ -205,8 +208,8 @@ class TestTheTokenLegAcceptsEip7702DelegatedRecipients:
 
         from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
 
-        param = inspect.signature(EthHtlcContractLeg.verify_funded).parameters["require_eoa_recipients"]
-        assert param.default is True
+        param = inspect.signature(EthHtlcContractLeg.verify_funded).parameters["allow_delegated_eoa_recipients"]
+        assert param.default is False, "the native leg must not admit delegates by default"
 
     def test_the_native_refusal_names_eip_7702_when_that_is_what_it_found(self) -> None:
         """The old message said "not an EOA", which is actively wrong for a delegated account and
@@ -218,3 +221,24 @@ class TestTheTokenLegAcceptsEip7702DelegatedRecipients:
         src = inspect.getsource(EthHtlcContractLeg.verify_funded)
         assert "EIP-7702" in src
         assert 'b"\\xef\\x01\\x00"' in src, "must detect the delegation designator prefix"
+
+
+class TestOnlyTheExactDelegationShapeIsAdmitted:
+    """`0xef0100` + 20 bytes is EXACTLY 23 bytes. Anything else is a contract, however it starts."""
+
+    @staticmethod
+    def _codes():
+        return {
+            "empty (plain EOA)": b"",
+            "7702 delegation (23 bytes)": b"\xef\x01\x00" + b"\x11" * 20,
+            "7702 prefix but too long": b"\xef\x01\x00" + b"\x11" * 40,
+            "7702 prefix but too short": b"\xef\x01\x00" + b"\x11" * 5,
+            "ordinary contract": b"\x60\x80\x60\x40" * 10,
+        }
+
+    @pytest.mark.parametrize("label", list(_codes.__func__()))
+    def test_the_shape_test_is_exact(self, label: str) -> None:
+        code = self._codes()[label]
+        delegated = len(code) == 23 and code[:3] == b"\xef\x01\x00"
+        expected = label == "7702 delegation (23 bytes)"
+        assert delegated is expected, f"{label}: a prefix match alone must not count as a delegation"
