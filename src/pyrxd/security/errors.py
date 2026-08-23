@@ -41,6 +41,7 @@ __all__ = [
     "NetworkError",
     "PolicyRejection",
     "PoolTooSmallError",
+    "PreRevealAbort",
     "RxdSdkError",
     "SpvVerificationError",
     "TlsPinMismatchError",
@@ -335,6 +336,25 @@ class InsufficientFundsError(ValidationError):
 
 class SpvVerificationError(RxdSdkError):
     """Raised when an SPV proof (Merkle path, header chain) fails to verify."""
+
+
+class PreRevealAbort(RxdSdkError):
+    """A claim was abandoned BEFORE the preimage could leave this process.
+
+    Raised only by the checks that run strictly before a claim is submitted — chain-id assertion,
+    fee/nonce reads, the ERC-20 freeze gate and funded-balance re-read. It is a promise about
+    *where* the failure happened, not about why: nothing was broadcast, no ``eth_call`` carried the
+    calldata to a provider, and the preimage is therefore **still secret**.
+
+    That distinction is load-bearing for the caller. ``SwapCoordinator.maker_claims_btc`` zeroizes
+    the preimage once a claim has been attempted, because from that point ``p`` may be public and
+    keeping a copy in memory buys nothing. Doing the same on a pre-broadcast failure would destroy
+    the only copy of a secret that is still safe, stranding a swap that a retry would have
+    completed — a transient RPC blip turning into a dead swap (see #479).
+
+    Any new check added before the submit MUST raise this rather than a bare ``NetworkError``, or
+    the caller will treat a recoverable failure as an irreversible one.
+    """
 
 
 class NetworkError(RxdSdkError):

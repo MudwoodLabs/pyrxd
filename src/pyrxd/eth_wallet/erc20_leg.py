@@ -20,7 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from ..security.errors import NetworkError, ValidationError
+from ..security.errors import NetworkError, PreRevealAbort, ValidationError
 from .erc20 import assert_not_frozen_before_reveal, assert_token_matches_chain, balance_of
 from .htlc_leg import EthHtlcContractLeg, _require_web3
 from .locator import Erc20HtlcLocator, EthHtlcLocator
@@ -181,7 +181,13 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # mined and `p` is still in its calldata. So the last defence is refusing to BUILD the
         # claim, not the contract refusing to honour it. This also closes the private-submission
         # path, where the parent deliberately skips its eth_call preflight.
-        held = await balance_of(self._rpc, self._token, locator.contract_address)
+        # These are the extra reads this leg adds before a reveal, and they are exactly why #479
+        # bites here first: three or four more chances for a transport blip to raise. Reported as
+        # PreRevealAbort so the caller knows nothing was sent and keeps the preimage.
+        try:
+            held = await balance_of(self._rpc, self._token, locator.contract_address)
+        except Exception as exc:
+            raise PreRevealAbort(f"could not read the funded balance before revealing: {exc}") from exc
         if held < locator.amount_base_units:
             raise ValidationError(
                 f"refusing to build a claim: the HTLC holds {held} base units of "
@@ -189,12 +195,20 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 "Broadcasting would publish the preimage in calldata for a payout that reverts, "
                 "letting the counterparty take the other leg for nothing."
             )
-        await assert_not_frozen_before_reveal(
-            self._rpc,
-            self._token,
-            htlc_address=locator.contract_address,
-            parties={"claimant": locator.claimant, "refundee": locator.refundee},
-        )
+        try:
+            await assert_not_frozen_before_reveal(
+                self._rpc,
+                self._token,
+                htlc_address=locator.contract_address,
+                parties={"claimant": locator.claimant, "refundee": locator.refundee},
+            )
+        except NetworkError as exc:
+            # Could not TELL whether anything is frozen. Nothing was sent, so the preimage is
+            # still secret and a retry can complete the swap — do not let the caller destroy it.
+            raise PreRevealAbort(f"could not check freeze status before revealing: {exc}") from exc
+        # A ValidationError from the gate means something really IS frozen. That is deliberately
+        # NOT a PreRevealAbort: the swap cannot complete, and letting the caller discard the
+        # preimage is the right outcome rather than leaving a dead secret in memory.
         return await super().claim(locator, preimage)
 
     async def verify_funded(

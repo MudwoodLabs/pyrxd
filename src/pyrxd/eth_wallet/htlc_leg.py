@@ -33,7 +33,7 @@ from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.gravity.counter_chain_leg import CounterChainLeg
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 __all__ = ["EthHtlcContractLeg", "load_artifact"]
@@ -357,10 +357,20 @@ class EthHtlcContractLeg:
         On the public-fallback path (no submitter) p goes public anyway, so the preflight stays."""
         if not isinstance(preimage, (bytes, bytearray)) or len(preimage) != 32:
             raise ValidationError("preimage must be 32 bytes")
-        await self._rpc.assert_chain()
-        c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
-        built = await c.functions.claim(bytes(preimage)).build_transaction(await self._base_tx(gas=120_000))
-        # Skip the p-leaking preflight when going private (submitter present).
+        # Everything up to `_sign_and_send` leaves nothing outside this process: `assert_chain` and
+        # `_base_tx` are reads that never carry the calldata. A failure here means p is STILL
+        # SECRET, so it is reported as PreRevealAbort — the caller zeroizes the preimage once a
+        # claim has been attempted, and doing that on a transport blip would destroy the only copy
+        # of a still-safe secret and strand a swap a retry would have finished (#479).
+        try:
+            await self._rpc.assert_chain()
+            c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+            built = await c.functions.claim(bytes(preimage)).build_transaction(await self._base_tx(gas=120_000))
+        except Exception as exc:
+            raise PreRevealAbort(f"claim abandoned before broadcast; the preimage is still secret: {exc}") from exc
+        # From here p may reach a provider: on the public path the preflight eth_call carries the
+        # calldata, and on the private path the submit does. Failures beyond this line are NOT
+        # PreRevealAbort — the caller must assume p is public.
         preflight = self._private_submitter is None
         return await self._sign_and_send(built, preflight=preflight, private=True)
 

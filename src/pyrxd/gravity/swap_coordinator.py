@@ -53,7 +53,7 @@ from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import SecretBytes
 
 from .eth_rxd_timelock import CrossClockMargin, assert_covenant_confirms_before_eth_deadline
@@ -1794,9 +1794,25 @@ class SwapCoordinator:
         raw = preimage.unsafe_raw_bytes()
         if hashlib.sha256(raw).digest() != self.record.terms.hashlock:
             raise ValidationError("preimage does not hash to the negotiated H; refusing to broadcast")
+        # Zeroize once a claim has been ATTEMPTED, not on every exit. Past the submit boundary p
+        # may be public — on the public path the preflight eth_call carries the calldata, on the
+        # private path the submit does — so holding a copy buys nothing and discarding it is right.
+        #
+        # Before that boundary nothing has left this process, and destroying the only copy of a
+        # still-secret p strands a swap that a retry would have completed: a transient RPC blip
+        # becoming a dead swap (#479). The legs mark that boundary by raising PreRevealAbort, which
+        # is a promise about WHERE the failure happened, not why.
+        #
+        # A gate refusal that is NOT a PreRevealAbort — an address really is frozen — still
+        # zeroizes: that swap cannot complete, and a dead secret should not linger in memory.
         try:
             await self.counter_leg.claim(self.record.counterchain_locator, raw)
-        finally:
+        except PreRevealAbort:
+            raise
+        except BaseException:
+            preimage.zeroize()
+            raise
+        else:
             preimage.zeroize()
         self._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
         await self._persist_record(self.record, shield=True)

@@ -8,6 +8,15 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **A transient RPC failure no longer destroys the preimage and strands a swap** (#479).
+  `maker_claims_btc` zeroized `p` in a `finally`, on **every** exit — including failures where
+  nothing had been broadcast, such as the chain-id assertion or a fee read. That destroyed the only
+  copy of a still-secret preimage and left both parties waiting out their timelocks, over a blip a
+  retry would have survived. Pre-existing on the native leg; the ERC-20 leg's extra pre-reveal
+  reads made it far likelier to fire. The legs now mark the submit boundary with a new
+  `PreRevealAbort` — a promise about *where* a failure happened, not why — and the coordinator
+  zeroizes on everything else, since past that boundary `p` may already be public and a genuine
+  freeze refusal means the swap cannot complete anyway.
 - **The USDC corridor is documented as issuer-trusted, not trustless**
   (`docs/solutions/design-decisions/usdc-corridor-is-issuer-trusted-not-trustless.md`). RXD/Glyph ↔
   USDC uses the same HTLC protocol as RXD ↔ ETH but **not the same guarantee**: native ETH is held
