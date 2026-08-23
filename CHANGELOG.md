@@ -6,6 +6,33 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **ERC-20 / USDC counter-leg groundwork** (`pyrxd.eth_wallet.tokens`, `.erc20`, `.erc20_leg`).
+  Not yet reachable from the coordinator — the terms, locator and durable-record wiring is a
+  separate change, deliberately, because it touches the mainnet-proven swap path.
+  - `Erc20HtlcLeg` is a **subclass** of `EthHtlcContractLeg`, not a fork and not an edit: **zero
+    lines change in the native leg**. Only `fund` and `verify_funded` are overridden; `claim`,
+    `refund`, `fetch_claim_artifacts`, `assert_claim_provenance`, `is_final` and
+    `claim_finality_verdict` are inherited unchanged, which works because `Erc20Htlc.sol` was
+    given the same `claim(bytes32)`/`refund()` signatures and the same **un-indexed**
+    `Claimed(bytes32)` event. Secret recovery therefore needs no token-specific code at all.
+  - Funding is a **push, not a pull**: deploy, then a plain `transfer`. A payable constructor
+    cannot pull a token, so no allowance is ever created — removing the approve race, the
+    dangling allowance and the reset-to-zero dance in one go. "Deployed" no longer implies
+    "funded", which costs nothing: the coordinator already documents that an HTLC address commits
+    to immutables, not to the funded balance.
+  - Token addresses are **pinned per chain id** from the issuer's own list and never resolved by
+    symbol. Bridged `USDC.e` on Arbitrum and Optimism is refused **by address**, named for what it
+    is, because it shares the symbol and is a different asset with different liquidity.
+  - Decimals are pinned **and** verified against the live contract at swap start; a 6-vs-18
+    disagreement is a factor of 10^12 in every amount.
+  - `assert_not_frozen_before_reveal` is the pre-reveal blacklist gate and includes the **HTLC
+    contract address**, not just the two parties: measured against the real USDC contract on a
+    mainnet fork, freezing the contract strands the funds permanently — `claim` reverts *and*
+    `refund` reverts, with no timeout to rescue them. It narrows the window rather than closing
+    it; check-then-reveal is itself a race.
+
 ### Fixed
 
 - **`pip install 'pyrxd[eth]'` now works.** It never did: five runtime errors instructed users to
