@@ -50,7 +50,13 @@ def _require_aiohttp():
 
         return aiohttp
     except ImportError as exc:  # pragma: no cover - exercised only without the extra installed
-        raise ValidationError("FlashbotsSubmitter needs aiohttp (a network dependency); install the eth extra") from exc
+        # NOT "install the eth extra": aiohttp is a RUNTIME dependency (pyproject.toml:35), so
+        # the extra would not supply it and following that advice would leave the user exactly
+        # where they started. If aiohttp is genuinely missing, the install itself is broken.
+        raise ValidationError(
+            "FlashbotsSubmitter needs aiohttp, which is a required runtime dependency of pyrxd — "
+            "reinstall the package (pip install --force-reinstall pyrxd)"
+        ) from exc
 
 
 def _require_eth_account():
@@ -60,7 +66,9 @@ def _require_eth_account():
 
         return Account, encode_defunct
     except ImportError as exc:  # pragma: no cover
-        raise ValidationError("FlashbotsSubmitter needs eth_account; install the eth extra") from exc
+        raise ValidationError(
+            "FlashbotsSubmitter needs eth_account; install it with: pip install 'pyrxd[eth]'"
+        ) from exc
 
 
 class FlashbotsSubmitter:

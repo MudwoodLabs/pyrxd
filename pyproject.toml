@@ -55,6 +55,31 @@ dependencies = [
     "websockets>=15.0.1,<17.0.0",
 ]
 
+[project.optional-dependencies]
+# The ETH counter-chain leg. Optional because the base wheel is deliberately dep-light and most
+# consumers never touch a counter-chain — `pyrxd.eth_wallet` imports web3 lazily so the package
+# loads without it (`eth_wallet/rpc.py:26-30`).
+#
+# This section did not exist until #476, while FIVE runtime errors instructed the user to
+# "install the eth extra" (`rpc.py:29`, `htlc_leg.py:96`, `keys.py:44`, `private_submit.py:53,63`).
+# `pip install 'pyrxd[eth]'` therefore warned "does not provide the extra 'eth'" and installed
+# nothing, and the import then failed telling the user to do the thing that had just no-opped.
+#
+# Floors are measured, not guessed (clean-venv resolution of web3 7.16.0, 2026-08-22):
+#   web3        — the same pin the `test` group already carries, so the tested configuration is
+#                 unchanged by declaring it here.
+#   eth-account — web3's OWN declared floor (`eth-account>=0.13.6`); imported directly by
+#                 `private_submit.py`, so pyrxd declares it rather than inheriting it.
+#   eth-keys    — web3 does NOT declare this; it arrives via eth-account. `keys.py` imports it
+#                 DIRECTLY, so leaving it implicit rests on two levels of transitive luck.
+#
+# aiohttp is deliberately absent: it is already a runtime dependency, not an eth-only one.
+eth = [
+    "web3>=7.16.0,<8.0.0",
+    "eth-account>=0.13.6,<1.0.0",
+    "eth-keys>=0.8.0,<1.0.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/MudwoodLabs/pyrxd"
 Documentation = "https://mudwoodlabs.github.io/pyrxd/"

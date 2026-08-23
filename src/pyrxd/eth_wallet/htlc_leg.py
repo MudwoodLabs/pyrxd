@@ -93,7 +93,9 @@ def _require_web3() -> Any:
     try:
         import web3  # type: ignore
     except ImportError as exc:  # pragma: no cover - exercised only without eth deps
-        raise ValidationError("the ETH leg needs web3 (a Phase-3 network dependency); install the eth extra") from exc
+        raise ValidationError(
+            "the ETH leg needs web3 (a Phase-3 network dependency); install it with: pip install 'pyrxd[eth]'"
+        ) from exc
     return web3
 
 

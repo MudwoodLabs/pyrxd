@@ -41,7 +41,9 @@ def derive_address(key: PrivateKeyMaterial) -> str:
     try:
         from eth_keys import keys as _eth_keys  # type: ignore
     except ImportError as exc:  # pragma: no cover - exercised only without eth deps
-        raise ValidationError("derive_address needs the eth stack (eth-keys/web3); install the eth extra") from exc
+        raise ValidationError(
+            "derive_address needs the eth stack (eth-keys/web3); install it with: pip install 'pyrxd[eth]'"
+        ) from exc
     raw = key.unsafe_raw_bytes()
     try:
         pk = _eth_keys.PrivateKey(raw)

@@ -6,6 +6,34 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **`pip install 'pyrxd[eth]'` now works.** It never did: five runtime errors instructed users to
+  "install the eth extra" (`eth_wallet/rpc.py`, `htlc_leg.py`, `keys.py`, `private_submit.py` ×2)
+  while `pyproject.toml` had **no `[project.optional-dependencies]` section at all**. The command
+  warned *"does not provide the extra 'eth'"*, installed nothing, and the subsequent import failed
+  telling the user to do the thing that had just silently no-opped — so a library consumer had no
+  supported way to install the ETH stack, `web3` being declared only in the `test`
+  dependency-group. The messages now name the working command.
+- **`eth-keys` and `eth-account` are declared rather than inherited.** Both are imported directly
+  by `eth_wallet`, and measured against a clean resolution of web3 7.16.0: web3 declares
+  `eth-account>=0.13.6` but **not** `eth-keys`, which arrives via eth-account. `from eth_keys
+  import` therefore rested on two levels of transitive luck with no version constraint anywhere.
+- **The aiohttp error no longer points at the extra.** aiohttp is a required *runtime* dependency,
+  so the extra could never have supplied it and following that advice left the user where they
+  started; it now says to reinstall the package.
+
+**Note for consumers**: installing the extra pulls `eth-account` 0.14.0, which calls
+`sys.setrecursionlimit(100_000)` **at import time** (0.13.7 did not). That is a process-global
+side effect of a third-party import, not something pyrxd does — but it is worth knowing if your
+application relies on the default limit, and it is why a pyrxd test that assumed the ambient limit
+now pins its own.
+
+Adding the extra introduces **no new package to any environment** — all three already resolved as
+part of the `test` group. It declares what was already true and makes it reachable. The base wheel
+stays dep-light: verified that a bare install has no web3, still imports, and fails the ETH paths
+with the corrected message. See #476.
+
 ### Added
 
 - **`GlyphClient` covers the two-phase FT deploy**: `commit_ft` and `reveal_ft`. Only the
