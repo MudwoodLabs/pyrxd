@@ -21,7 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..security.errors import NetworkError, ValidationError
-from .erc20 import assert_token_matches_chain, balance_of
+from .erc20 import assert_not_frozen_before_reveal, assert_token_matches_chain, balance_of
 from .htlc_leg import EthHtlcContractLeg, _require_web3
 from .locator import Erc20HtlcLocator, EthHtlcLocator
 from .tokens import Erc20Token
@@ -155,6 +155,32 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             amount_wei=int(amount_wei),
             token_address=self._token.address,
         )
+
+    async def claim(self, locator: EthHtlcLocator, preimage: bytes) -> str:
+        """Check the freeze gate, then claim exactly as the native leg does.
+
+        **The gate lives HERE because this is the reveal.** Broadcasting ``claim(preimage)`` puts
+        the secret in public calldata, and from that instant the counterparty can take the other
+        leg — so a freeze discovered afterwards is a one-sided loss with no recovery. A gate the
+        caller has to remember to invoke is a gate that gets skipped: it was defined and called
+        nowhere for a whole review cycle, which is the same shipped-but-unreachable failure as
+        #468. Putting it in front of the dangerous action makes it unskippable rather than
+        merely available.
+
+        The contract address is checked alongside both parties, because that is the freeze with
+        no way out: measured on a mainnet fork, freezing the HTLC makes ``claim`` AND ``refund``
+        revert permanently, so no timeout rescues it.
+
+        The claim itself is the parent's, unchanged — this adds a precondition, not a different
+        settlement path.
+        """
+        await assert_not_frozen_before_reveal(
+            self._rpc,
+            self._token,
+            htlc_address=locator.contract_address,
+            parties={"claimant": locator.claimant, "refundee": locator.refundee},
+        )
+        return await super().claim(locator, preimage)
 
     async def verify_funded(
         self, locator: EthHtlcLocator, *, expected_amount_wei: int, block_identifier: Any = None

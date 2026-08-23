@@ -115,3 +115,43 @@ class TestTheContractAddressCannotBeOmitted:
     def test_an_empty_contract_address_is_refused(self) -> None:
         with pytest.raises(Exception, match="htlc_address is required"):
             asyncio.run(assert_not_frozen_before_reveal(_Broken(Exception()), _USDC, htlc_address=""))
+
+
+class TestTheGateIsActuallyINVOKEDNotMerelyAvailable:
+    """The gate was defined and called NOWHERE in production for a full review cycle.
+
+    That is the same shipped-but-unreachable failure as #468 and as the critical bug this branch
+    already shipped once: a mechanism that exists, is tested, and is never reached by the path it
+    protects. Availability is not protection. These assert INVOCATION.
+    """
+
+    def test_claim_runs_the_gate_before_delegating(self) -> None:
+        import inspect
+
+        from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+
+        src = inspect.getsource(Erc20HtlcLeg.claim)
+        gate_at = src.index("assert_not_frozen_before_reveal")
+        claim_at = src.index("super().claim(")
+        assert gate_at < claim_at, "the gate must run BEFORE the reveal, not after"
+
+    def test_the_gate_is_reached_from_a_production_module_not_only_tests(self) -> None:
+        """A grep-shaped assertion on purpose: the defect was that only tests referenced it."""
+        import pathlib
+
+        src_root = pathlib.Path(__file__).resolve().parent.parent / "src"
+        callers = [
+            p.name
+            for p in src_root.rglob("*.py")
+            if "assert_not_frozen_before_reveal(" in p.read_text() and p.name != "erc20.py"
+        ]
+        assert callers, "no production module calls the freeze gate — it protects nothing"
+
+    def test_the_contract_address_is_what_gets_checked(self) -> None:
+        """The freeze with no way out is the CONTRACT's; a frozen party is still refundable."""
+        import inspect
+
+        from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+
+        src = inspect.getsource(Erc20HtlcLeg.claim)
+        assert "htlc_address=locator.contract_address" in src

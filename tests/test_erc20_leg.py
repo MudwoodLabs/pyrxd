@@ -50,7 +50,7 @@ class TestItReusesTheAuditedNativePathRatherThanReimplementingIt:
 
     @pytest.mark.parametrize(
         "method",
-        ["claim", "refund", "fetch_claim_artifacts", "assert_claim_provenance", "is_final", "claim_finality_verdict"],
+        ["refund", "fetch_claim_artifacts", "assert_claim_provenance", "is_final", "claim_finality_verdict"],
     )
     def test_the_settlement_and_secret_paths_are_inherited_UNCHANGED(self, method: str) -> None:
         """These work untouched only because Erc20Htlc.sol was given the same claim(bytes32) /
@@ -58,7 +58,20 @@ class TestItReusesTheAuditedNativePathRatherThanReimplementingIt:
         change broke that symmetry, this pin is what would notice."""
         assert getattr(Erc20HtlcLeg, method) is getattr(EthHtlcContractLeg, method)
 
-    def test_only_funding_and_verification_are_overridden(self) -> None:
+    def test_claim_WRAPS_the_parent_rather_than_reimplementing_it(self) -> None:
+        """`claim` is the one settlement method that diverges, and only to add a precondition.
+
+        It must still delegate: the audited claim path — private submission, receipt handling,
+        the whole thing — is the parent's. What the override adds is the pre-reveal freeze gate,
+        which sits here because broadcasting claim(preimage) IS the reveal.
+        """
+        import inspect
+
+        src = inspect.getsource(Erc20HtlcLeg.claim)
+        assert "assert_not_frozen_before_reveal" in src, "the gate must run before the reveal"
+        assert "super().claim(" in src, "settlement must delegate, not be reimplemented"
+
+    def test_only_funding_verification_and_the_gated_claim_are_overridden(self) -> None:
         overridden = {
             name
             for name in dir(EthHtlcContractLeg)
@@ -66,7 +79,7 @@ class TestItReusesTheAuditedNativePathRatherThanReimplementingIt:
             and callable(getattr(EthHtlcContractLeg, name, None))
             and getattr(Erc20HtlcLeg, name, None) is not getattr(EthHtlcContractLeg, name, None)
         }
-        assert overridden == {"fund", "verify_funded"}, f"unexpected divergence: {overridden}"
+        assert overridden == {"fund", "verify_funded", "claim"}, f"unexpected divergence: {overridden}"
 
     def test_it_still_satisfies_the_counter_chain_port(self) -> None:
         from pyrxd.gravity.counter_chain_leg import CounterChainLeg
