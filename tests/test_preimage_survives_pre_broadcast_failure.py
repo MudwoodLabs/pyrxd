@@ -104,3 +104,47 @@ class TestTheCoordinatorKeepsTheSecretWhenNothingWasSent:
         """The safety property must not regress: once a claim was attempted, or the swap is known
         dead, the secret goes."""
         assert self._run(exc) is False
+
+
+class TestNoPreRevealAbortCanEscapeFromPastTheSendBoundary:
+    """The coordinator TRUSTS the leg's claim about where it failed — that is what the round-2 fix
+    introduced. If a leg could raise `PreRevealAbort` after submitting, the caller would keep a
+    preimage that is already public and, worse, treat a sent claim as unsent.
+
+    The property is structural, so it is asserted structurally: every raise site must sit before
+    the send. A reviewer cannot re-derive that by eye on each change; a test can.
+    """
+
+    @pytest.mark.parametrize(
+        ("module", "method"),
+        [
+            ("pyrxd.eth_wallet.htlc_leg", "EthHtlcContractLeg.claim"),
+            ("pyrxd.eth_wallet.erc20_leg", "Erc20HtlcLeg.claim"),
+        ],
+    )
+    def test_every_raise_precedes_the_submit(self, module: str, method: str) -> None:
+        import importlib
+        import inspect
+
+        cls_name, fn_name = method.split(".")
+        fn = getattr(getattr(importlib.import_module(module), cls_name), fn_name)
+        src = inspect.getsource(fn)
+
+        raises = [i for i, line in enumerate(src.splitlines()) if "raise PreRevealAbort" in line]
+        sends = [i for i, line in enumerate(src.splitlines()) if "_sign_and_send(" in line or "super().claim(" in line]
+        if not raises:
+            pytest.skip(f"{method} raises no PreRevealAbort directly")
+        assert sends, f"{method}: no send found — the boundary this pins has moved"
+        assert max(raises) < min(sends), (
+            f"{method}: a PreRevealAbort is raised at or after the send, so the caller would be told "
+            "nothing was broadcast when something may have been"
+        )
+
+    def test_the_marker_is_not_raised_anywhere_outside_the_legs(self) -> None:
+        """If some other module started raising it, the boundary claim would stop being auditable
+        from the two claim paths alone."""
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parent.parent / "src"
+        raisers = {p.name for p in root.rglob("*.py") if "raise PreRevealAbort(" in p.read_text()}
+        assert raisers <= {"htlc_leg.py", "erc20_leg.py"}, f"unexpected raisers: {sorted(raisers)}"
