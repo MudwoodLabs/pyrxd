@@ -104,7 +104,13 @@ class EthLeg:
         ).digest()
 
     def locked_amount(self, locator: EthHtlcLocator) -> int:
-        """The funded amount the coordinator binds to ``terms.value_amount`` — wei for ETH."""
+        """The funded amount the coordinator binds to ``terms.value_amount``.
+
+        Wei for a native-ETH leg; the TOKEN's base units for an ``Erc20HtlcLocator`` (USDC has 6
+        decimals, not 18). The comparison stays correct across both because the same locator field
+        supplies this number and ``terms.value_amount`` was negotiated in the same unit — the unit
+        is carried by the locator TYPE and ``terms.token_address``, not by this method.
+        """
         return locator.amount_wei
 
     # -- fund / claim / refund -----------------------------------------------------------

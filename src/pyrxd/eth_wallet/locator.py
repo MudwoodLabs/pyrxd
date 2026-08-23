@@ -14,10 +14,11 @@ the maker is told to lock RXD.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import ClassVar
 
 from pyrxd.security.errors import ValidationError
 
-__all__ = ["EthHtlcLocator"]
+__all__ = ["Erc20HtlcLocator", "EthHtlcLocator"]
 
 
 def _check_hex_addr(name: str, val: str) -> str:
@@ -56,6 +57,12 @@ class EthHtlcLocator:
     amount_wei:
         The funded value (verified == negotiated before the maker locks RXD).
     """
+
+    #: The wire tag this locator serialises under inside ``counterchain_locator``.
+    #: ``SwapRecord.to_dict`` reads THIS rather than branching on the type, so a new locator
+    #: variant carries its own tag and cannot be silently mis-serialised by a missing branch —
+    #: which for a token locator would mean an older reader interpreting base units as wei.
+    CHAIN_TAG: ClassVar[str] = "eth"
 
     chain_id: int
     contract_address: str
@@ -118,3 +125,67 @@ class EthHtlcLocator:
             )
         except KeyError as exc:
             raise ValidationError(f"EthHtlcLocator.from_dict missing key: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class Erc20HtlcLocator(EthHtlcLocator):
+    """Durable retained state for a funded **ERC-20** HTLC.
+
+    **A subclass on purpose.** Six of the seven ``isinstance(..., EthHtlcLocator)`` sites in the
+    coordinator are settlement and finality paths — claim provenance, secret scraping, finality
+    verdicts — and every one of them applies to a token swap unchanged, for the same reason
+    :class:`~pyrxd.eth_wallet.erc20_leg.Erc20HtlcLeg` could inherit them: the contract keeps the
+    same ``claim(bytes32)``/``refund()`` shape and the same un-indexed ``Claimed`` event. Making
+    this a separate type would have required editing all seven and risked missing one.
+
+    The seventh site is serialisation, and it is handled by :attr:`CHAIN_TAG` rather than by
+    isinstance ordering — see the note there. That matters: had ``to_dict`` kept branching on the
+    type, a subclass would have serialised as ``chain: "eth"`` and an older binary would have read
+    the ``amount`` field, denominated in USDC's 6 decimals, as **wei**. A 10^12 error, arriving
+    through the very mechanism meant to prevent it.
+
+    ``amount_wei`` is inherited and carries the amount in the token's **BASE UNITS** — the field
+    name is the parent's, the unit is the token's. Prefer :attr:`amount_base_units` when reading;
+    the unit is unambiguous from the TYPE, which is the discriminator that matters.
+    """
+
+    CHAIN_TAG: ClassVar[str] = "eth-erc20"
+
+    token_address: str = ""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not self.token_address:
+            raise ValidationError(
+                "Erc20HtlcLocator.token_address is required — a token amount without the token it "
+                "is denominated in is not interpretable"
+            )
+        _check_hex_addr("token_address", self.token_address)
+        object.__setattr__(self, "token_address", self.token_address.lower())
+
+    @property
+    def amount_base_units(self) -> int:
+        """The amount in the TOKEN's base units. USDC has 6 decimals, not 18."""
+        return self.amount_wei
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        d["token_address"] = self.token_address
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> Erc20HtlcLocator:
+        try:
+            return cls(
+                chain_id=d["chain_id"],
+                contract_address=d["contract_address"],
+                deploy_tx_hash=d["deploy_tx_hash"],
+                hashlock=d["hashlock"],
+                claimant=d["claimant"],
+                refundee=d["refundee"],
+                timeout=d["timeout"],
+                amount_wei=d["amount_wei"],
+                token_address=d["token_address"],
+            )
+        except KeyError as exc:
+            raise ValidationError(f"Erc20HtlcLocator.from_dict missing field: {exc}") from exc

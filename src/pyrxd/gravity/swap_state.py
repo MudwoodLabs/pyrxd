@@ -30,7 +30,7 @@ from pyrxd.btc_wallet.taproot import (
     Timelock,
     TimeUnit,
 )
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.security.errors import ValidationError
 
 # SwapRecord wire schema version. v1 (absent) is the BTC-only form (bare ``btc_locator``);
@@ -270,7 +270,13 @@ class NegotiatedTerms:
     # Counter-chain selector + chain-neutral counter-leg amount. Defaulted so every existing
     # (BTC) construction is unchanged: counter_chain "btc"; value_amount 0 => mirror btc_sats.
     counter_chain: str = "btc"  # "btc" | "eth"
-    value_amount: int = 0  # counter-leg amount: sats (btc) | wei (eth); 0 sentinel => btc_sats
+    value_amount: int = 0  # counter-leg amount: sats (btc) | wei (eth) | token base units; 0 => btc_sats
+    # The ERC-20 contract this swap's counter leg is denominated in, lowercase hex, or "" for a
+    # native-currency leg. This is what makes ``value_amount``'s unit knowable: the chain name
+    # alone cannot tell you, because a USDC swap is still counter_chain "eth" while its amount is
+    # in 6-decimal base units rather than wei. Negotiated (not derived from the locator) because
+    # both parties must agree the ASSET before either funds anything.
+    token_address: str = ""
     # ETH counter leg: the ABSOLUTE unix-second refund deadline (the contract immutable
     # ``timeout``). This is the REAL counter-leg deadline for an ETH swap — first-class and
     # validated so the coordinator's cross-clock ordering gate checks the actual on-chain
@@ -312,6 +318,21 @@ class NegotiatedTerms:
             )
         if not _pos_int(self.value_amount):
             raise ValidationError("value_amount must be a positive int")
+        if self.token_address:
+            # A token leg is still counter_chain "eth" — the token is what makes the UNIT
+            # different, not the chain. Refuse the combination that cannot mean anything.
+            if self.counter_chain != "eth":
+                raise ValidationError(
+                    f"token_address is only meaningful on an ETH counter chain, not {self.counter_chain!r}"
+                )
+            addr = self.token_address
+            if not isinstance(addr, str) or not addr.startswith("0x") or len(addr) != 42:
+                raise ValidationError("token_address must be a 0x-prefixed 20-byte hex address")
+            try:
+                bytes.fromhex(addr[2:])
+            except ValueError as exc:
+                raise ValidationError("token_address is not valid hex") from exc
+            object.__setattr__(self, "token_address", addr.lower())
         # ETH absolute refund deadline: first-class for an ETH swap (the real counter-leg
         # deadline the coordinator's cross-clock ordering gate validates); forbidden for BTC
         # (whose deadline is the relative t_btc) so the two can never be silently confused.
@@ -390,6 +411,8 @@ class NegotiatedTerms:
             d["value_amount"] = self.value_amount
         if self.eth_timeout_unix_s is not None:
             d["eth_timeout_unix_s"] = self.eth_timeout_unix_s
+        if self.token_address:
+            d["token_address"] = self.token_address
         if self.credential_ref:
             d["credential_ref"] = self.credential_ref.hex()
         return d
@@ -410,6 +433,7 @@ class NegotiatedTerms:
             btc_refund_pubkey_xonly=bytes.fromhex(d["btc_refund_pubkey_xonly"]),
             counter_chain=str(d.get("counter_chain", "btc")),  # legacy records → btc
             value_amount=int(d.get("value_amount", 0)),  # 0 sentinel → __post_init__ = btc_sats
+            token_address=str(d.get("token_address", "")),  # "" => a native-currency leg
             eth_timeout_unix_s=(int(d["eth_timeout_unix_s"]) if d.get("eth_timeout_unix_s") is not None else None),
             credential_ref=bytes.fromhex(d["credential_ref"]) if d.get("credential_ref") else b"",
         )
@@ -529,7 +553,12 @@ class SwapRecord:
         loc = self.counterchain_locator
         if isinstance(loc, EthHtlcLocator):
             d["schema_version"] = SWAP_RECORD_SCHEMA_VERSION
-            d["counterchain_locator"] = {"chain": "eth", "locator": loc.to_dict()}
+            # The tag comes from the LOCATOR, not from a branch here. `Erc20HtlcLocator` subclasses
+            # `EthHtlcLocator`, so an isinstance branch would have written `chain: "eth"` for a token
+            # swap and an older reader would have taken its 6-decimal amount for wei — a 10^12 error
+            # arriving through the very mechanism meant to prevent it. Reading `CHAIN_TAG` means a
+            # new variant carries its own tag and a missing branch cannot exist.
+            d["counterchain_locator"] = {"chain": loc.CHAIN_TAG, "locator": loc.to_dict()}
         else:
             # BtcHtlcLocator or None → v1 wire form (byte-identical to the pre-ETH schema).
             d["btc_locator"] = loc.to_dict() if loc is not None else None
@@ -540,8 +569,14 @@ class SwapRecord:
         if "counterchain_locator" in d:  # v2 chain-tagged form
             cc = d["counterchain_locator"]
             chain, locd = cc.get("chain"), cc.get("locator")
+            # This dispatch IS the backward-compatibility defence, and the only one: the
+            # `schema_version` written above is never read back by anything. A binary that predates
+            # a tag lands in the else and REFUSES, rather than silently decoding a record whose
+            # amount is denominated in a unit it does not know about.
             if chain == "eth":
                 loc: BtcHtlcLocator | EthHtlcLocator | None = EthHtlcLocator.from_dict(locd)
+            elif chain == Erc20HtlcLocator.CHAIN_TAG:
+                loc = Erc20HtlcLocator.from_dict(locd)
             elif chain == "btc":
                 loc = BtcHtlcLocator.from_dict(locd)
             else:

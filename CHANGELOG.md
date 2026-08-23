@@ -8,6 +8,20 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **ERC-20 / USDC durable-record support** — `Erc20HtlcLocator` and `NegotiatedTerms.token_address`.
+  An older binary cannot misread a token record: the locator serialises under its own
+  `"eth-erc20"` chain tag, and a reader that predates the tag lands in `from_dict`'s existing
+  fail-closed branch and **refuses**. That dispatch is the entire backward-compatibility defence —
+  `schema_version` is written but **never read back**, so bumping it would have protected nothing
+  while changing the bytes under existing swaps.
+  The tag is read **off the locator** (`CHAIN_TAG`) rather than chosen by an isinstance branch.
+  That matters: `Erc20HtlcLocator` subclasses `EthHtlcLocator`, so a branch would have written
+  `chain: "eth"` for a token swap and an older reader would have taken its 6-decimal amount for
+  wei — a 10^12 error arriving through the mechanism meant to prevent it.
+  **`swap_coordinator.py` is unchanged** — zero lines. Six of its seven `EthHtlcLocator`
+  isinstance sites are settlement and finality paths that genuinely apply to a token swap, so
+  subclassing lets them stand; each of those decisions is pinned by a test rather than left to
+  look like an oversight.
 - **ERC-20 / USDC counter-leg groundwork** (`pyrxd.eth_wallet.tokens`, `.erc20`, `.erc20_leg`).
   Not yet reachable from the coordinator — the terms, locator and durable-record wiring is a
   separate change, deliberately, because it touches the mainnet-proven swap path.
