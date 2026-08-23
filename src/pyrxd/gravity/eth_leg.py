@@ -28,7 +28,7 @@ import hashlib
 
 from pyrxd.btc_wallet.htlc_leg import require_audit_cleared
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
 from pyrxd.gravity.finality import CounterClaimFinality
 from pyrxd.security.errors import ValidationError
 
@@ -162,16 +162,37 @@ class EthLeg:
         the on-chain contract at ``contract_address`` matches THIS expected locator, which is what
         binds the taker-deployed contract to 'pays the maker on claim, refunds the taker, on the
         agreed H/amount/deadline'. ``deploy_tx_hash`` is informational (not bound on-chain)."""
-        return EthHtlcLocator(
-            chain_id=self._leg.chain_id,
-            contract_address=contract_address,
-            deploy_tx_hash=deploy_tx_hash if (deploy_tx_hash and deploy_tx_hash.startswith("0x")) else "0x" + "00" * 32,
-            hashlock="0x" + bytes(terms.hashlock).hex(),
-            claimant=self._claim_to,
-            refundee=self._refund_to,
-            timeout=self._eth_timeout_unix_s,
-            amount_wei=int(terms.value_amount),
-        )
+        common = {
+            "chain_id": self._leg.chain_id,
+            "contract_address": contract_address,
+            "deploy_tx_hash": (
+                deploy_tx_hash if (deploy_tx_hash and deploy_tx_hash.startswith("0x")) else "0x" + "00" * 32
+            ),
+            "hashlock": "0x" + bytes(terms.hashlock).hex(),
+            "claimant": self._claim_to,
+            "refundee": self._refund_to,
+            "timeout": self._eth_timeout_unix_s,
+            "amount_wei": int(terms.value_amount),
+        }
+        # A token leg must produce a TOKEN locator, or the maker's expected record would say
+        # `chain: "eth"` while `amount_wei` held 6-decimal base units. The asset comes from the
+        # NEGOTIATED terms and is cross-checked against the leg's own pinned token, so the two
+        # sides cannot silently disagree about what is being paid.
+        token = getattr(self._leg, "token", None)
+        # `terms` is duck-typed here, and callers predating the token field pass objects without
+        # it — the existing suite caught exactly that. Absent means native, which is the correct
+        # reading of a terms object that has no concept of a token.
+        terms_token = getattr(terms, "token_address", "") or ""
+        if token is None:
+            if terms_token:
+                raise ValidationError(
+                    f"terms name token {terms_token} but this leg is a native-ETH leg; "
+                    "refusing to build a locator that would misdescribe the asset"
+                )
+            return EthHtlcLocator(**common)
+        if terms.token_address and terms.token_address != token.address:
+            raise ValidationError(f"terms name token {terms.token_address} but the leg is pinned to {token.address}")
+        return Erc20HtlcLocator(**common, token_address=token.address)
 
     async def verify_counterparty_funded(
         self, contract_address: str, terms, *, block_identifier: str | int | None = None

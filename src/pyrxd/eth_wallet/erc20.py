@@ -102,36 +102,60 @@ async def is_blacklisted(rpc: Any, token: Erc20Token, address: str) -> bool:
 
     Deliberately NOT read at a finalized checkpoint, unlike every other verification in this
     stack. A checkpoint lags fresh freezes by minutes, and a freeze that landed since the
-    checkpoint is exactly the one this call exists to catch. Reading stale here would defeat the
-    entire purpose.
+    checkpoint is exactly the one this call exists to catch.
 
-    Tokens without a blacklist simply do not have this function; a revert is reported as
-    "not blacklisted" rather than an error, because a token that cannot freeze cannot freeze this
-    swap either.
+    **Raises rather than guessing.** An earlier version caught every exception and returned
+    ``False``, so an unreachable, rate-limited or garbage-returning RPC reported "not frozen" —
+    a fail-OPEN in the one gate that prevents an unrecoverable loss, and one that fires precisely
+    when the caller is already in trouble. Whether the token *can* freeze is now pinned in the
+    registry rather than inferred from a call that might fail, so there is no failure mode left to
+    confuse with an answer: either we read the flag, or we raise.
     """
+    if not token.has_blacklist:
+        # Pinned capability, not a probe: a token that cannot freeze cannot freeze this swap.
+        return False
     try:
         return bool(await _contract(rpc, token).functions.isBlacklisted(address).call(block_identifier="latest"))
-    except Exception:  # includes "function does not exist" on non-freezable tokens
-        return False
+    except Exception as exc:
+        raise NetworkError(
+            f"could not determine whether {address} is frozen by {token.symbol}: {exc}. Refusing to "
+            "treat an unanswerable question as a safe answer — publishing the preimage on this "
+            "assumption is unrecoverable if it is wrong."
+        ) from exc
 
 
-async def assert_not_frozen_before_reveal(rpc: Any, token: Erc20Token, *, addresses: dict[str, str]) -> None:
+async def assert_not_frozen_before_reveal(
+    rpc: Any,
+    token: Erc20Token,
+    *,
+    htlc_address: str,
+    parties: dict[str, str] | None = None,
+) -> None:
     """The pre-reveal gate. Refuse to publish the preimage into a freeze.
 
     Call this immediately before the action that makes the preimage public. Once it is public the
     counterparty can take their leg, so a freeze landing after that point is a one-sided loss with
     no recovery; before it, abandoning the swap costs only fees.
 
-    ``addresses`` maps a role name to an address and **must include the HTLC contract itself**, not
-    just the two parties. Measured against the real USDC contract on a mainnet fork: freezing the
-    contract address strands the funds permanently — ``claim`` reverts *and* ``refund`` reverts, so
-    no timeout rescues it.
+    ``htlc_address`` is a REQUIRED, separate parameter rather than an entry in a free-form dict.
+    It is the most dangerous address to miss: measured against the real USDC contract on a mainnet
+    fork, freezing the CONTRACT strands the funds permanently — ``claim`` reverts *and* ``refund``
+    reverts, with no timeout to rescue them. A caller who passed only the two party addresses used
+    to skip that case while appearing to run the gate; now it cannot be omitted.
 
     This narrows the window; it does not close it. Check-then-reveal is itself a race, and a freeze
     landing after the reveal is unmitigated by construction. It is a seatbelt, not a fix, and the
     residual belongs in the disclosure rather than in a claim that the corridor is trustless.
+
+    Raises:
+        NetworkError: the freeze status could not be READ. Deliberately not treated as "not
+            frozen" — see :func:`is_blacklisted`.
+        ValidationError: some address is frozen; do not reveal.
     """
-    frozen = [f"{role} ({addr})" for role, addr in addresses.items() if await is_blacklisted(rpc, token, addr)]
+    if not isinstance(htlc_address, str) or not htlc_address:
+        raise ValidationError("htlc_address is required: it is the freeze that cannot be refunded")
+    checks = {"htlc contract": htlc_address, **(parties or {})}
+    frozen = [f"{role} ({addr})" for role, addr in checks.items() if await is_blacklisted(rpc, token, addr)]
     if frozen:
         raise ValidationError(
             f"refusing to reveal the preimage: {', '.join(frozen)} is frozen by the {token.symbol} "

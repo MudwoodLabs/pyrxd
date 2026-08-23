@@ -23,7 +23,7 @@ from typing import Any
 from ..security.errors import NetworkError, ValidationError
 from .erc20 import assert_token_matches_chain, balance_of
 from .htlc_leg import EthHtlcContractLeg, _require_web3
-from .locator import EthHtlcLocator
+from .locator import Erc20HtlcLocator, EthHtlcLocator
 from .tokens import Erc20Token
 
 #: Measured on a mainnet fork against the real USDC proxy (block 25,815,805): a `transfer` into a
@@ -139,7 +139,12 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 f"required — the HTLC at {address} is under-funded. Refund after the timeout."
             )
 
-        return EthHtlcLocator(
+        # Erc20HtlcLocator, NOT the parent. Returning the parent here made the whole chain-tag
+        # mechanism dead on the write side: the record would serialise as `chain: "eth"` carrying
+        # 6-decimal base units in a field every reader treats as wei — the 10^12 error the tag
+        # exists to prevent, as the DEFAULT behaviour of a real token swap. Caught by review, not
+        # by tests, because the tests built locators by hand and nothing exercised this producer.
+        return Erc20HtlcLocator(
             chain_id=self._chain_id,
             contract_address=address,
             deploy_tx_hash=deploy_hash if deploy_hash.startswith("0x") else "0x" + deploy_hash,
@@ -148,6 +153,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             refundee=checksum(refundee),
             timeout=int(timeout),
             amount_wei=int(amount_wei),
+            token_address=self._token.address,
         )
 
     async def verify_funded(
@@ -164,6 +170,20 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         contract, so an ``== expected`` check would be griefable into a permanent verify failure.
         Over-funding is safe because claim/refund sweep the whole balance to the winner.
         """
+        # Refuse a native locator outright. Without this the amount below would be compared in the
+        # right unit while the PERSISTED record said "eth" — the producer bug this check now makes
+        # unrepresentable rather than merely fixed.
+        if not isinstance(locator, Erc20HtlcLocator):
+            raise ValidationError(
+                f"a token leg requires an Erc20HtlcLocator, got {type(locator).__name__}: a native "
+                "locator would persist this swap as chain 'eth' with the amount in the token's base "
+                "units, which every reader would take for wei"
+            )
+        if locator.token_address != self._token.address:
+            raise ValidationError(
+                f"locator is denominated in {locator.token_address}, not the negotiated "
+                f"{self._token.symbol} at {self._token.address}"
+            )
         await super().verify_funded(locator, expected_amount_wei=0, block_identifier=block_identifier)
         await assert_token_matches_chain(self._rpc, self._token, block_identifier)
 
@@ -178,6 +198,20 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 f"the HTLC at {locator.contract_address} is denominated in {on_chain_token}, not the "
                 f"negotiated {self._token.symbol} at {self._token.address}. Refusing: this is how a "
                 "counterparty is handed an asset they did not price."
+            )
+
+        # Bind the contract's OWN amount immutable too. The balance check below is the real
+        # protection under sweep semantics, but binding this costs one call and would catch a
+        # counterparty deploying a look-alike whose stored amount disagrees with the negotiation —
+        # and it stops being merely defensive the moment the contract's payout stops being a sweep.
+        on_chain_amount = int(
+            await self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+            .functions.amount()
+            .call(block_identifier="latest" if block_identifier is None else block_identifier)
+        )
+        if on_chain_amount != expected_amount_wei:
+            raise ValidationError(
+                f"the HTLC's stored amount is {on_chain_amount} base units, not the negotiated {expected_amount_wei}"
             )
 
         held = await balance_of(self._rpc, self._token, locator.contract_address, block_identifier)

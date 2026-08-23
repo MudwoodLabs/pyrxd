@@ -407,7 +407,11 @@ class NegotiatedTerms:
         # all-BTC terms wire form is byte-for-byte identical to the pre-ETH schema.
         if self.counter_chain != "btc":
             d["counter_chain"] = self.counter_chain
-        if self.value_amount != self.btc_sats:
+        # Emit whenever this is not a BTC swap, not merely when it differs from btc_sats. The
+        # equality shortcut made an ETH/token record UNLOADABLE whenever the two happened to
+        # coincide: from_dict would fall back to the 0 sentinel, which __post_init__ refuses for a
+        # non-BTC swap. Token magnitudes make the collision likely — 6-decimal amounts overlap sats.
+        if self.counter_chain != "btc" or self.value_amount != self.btc_sats:
             d["value_amount"] = self.value_amount
         if self.eth_timeout_unix_s is not None:
             d["eth_timeout_unix_s"] = self.eth_timeout_unix_s
@@ -485,6 +489,29 @@ class SwapRecord:
                 raise ValidationError("a BtcHtlcLocator requires counter_chain == 'btc'")
             if isinstance(loc, EthHtlcLocator) and self.terms.counter_chain != "eth":
                 raise ValidationError("an EthHtlcLocator requires counter_chain == 'eth'")
+            # Chain agreement is not asset agreement. Both a native and a token leg are
+            # counter_chain "eth", so the check above cannot tell them apart — and a token swap
+            # persisted with a NATIVE locator serialises as `chain: "eth"` carrying 6-decimal base
+            # units in a field every reader takes for wei. That mismatch was real (the producers
+            # returned the parent type) and this record-level guard is what makes it
+            # unrepresentable rather than merely fixed at the two call sites that happened to
+            # exist. A record is the last place a disagreement can be caught before it is durable.
+            if isinstance(loc, Erc20HtlcLocator):
+                if not self.terms.token_address:
+                    raise ValidationError(
+                        "a token locator requires terms.token_address to name the same asset; "
+                        "empty terms would describe this swap as native ETH"
+                    )
+                if self.terms.token_address != loc.token_address:
+                    raise ValidationError(
+                        f"terms name token {self.terms.token_address} but the locator holds "
+                        f"{loc.token_address} — the record would misdescribe what was funded"
+                    )
+            elif isinstance(loc, EthHtlcLocator) and self.terms.token_address:
+                raise ValidationError(
+                    f"terms name token {self.terms.token_address} but the locator is a NATIVE "
+                    "EthHtlcLocator; its amount would be persisted as wei"
+                )
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:

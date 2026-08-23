@@ -44,6 +44,10 @@ class Erc20Token:
     address: str
     decimals: int
     chain_id: int
+    #: Whether the issuer can freeze addresses. PINNED, not probed: probing means a call that can
+    #: fail, and a failed probe is indistinguishable from "not frozen" unless the caller is very
+    #: careful — which is exactly the fail-open this field removes. USDC (FiatToken) can freeze.
+    has_blacklist: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.address, str) or not self.address.startswith("0x") or len(self.address) != 42:

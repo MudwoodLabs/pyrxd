@@ -39,7 +39,7 @@ class TestAnOlderBinaryCannotMisreadATokenRecord:
         makes a missing branch impossible."""
         from pyrxd.gravity.swap_state import SwapState
 
-        rec = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(), counterchain_locator=_erc20_locator())
+        rec = SwapRecord(state=SwapState.NEGOTIATED, terms=_token_terms(), counterchain_locator=_erc20_locator())
         tag = rec.to_dict()["counterchain_locator"]["chain"]
         assert tag == "eth-erc20", tag
         assert tag != "eth", "a token record tagged 'eth' is the 10^12 misread"
@@ -49,7 +49,9 @@ class TestAnOlderBinaryCannotMisreadATokenRecord:
         backward-compatibility story — `schema_version` is never read, so it protects nothing."""
         from pyrxd.gravity.swap_state import SwapState
 
-        d = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(), counterchain_locator=_erc20_locator()).to_dict()
+        d = SwapRecord(
+            state=SwapState.NEGOTIATED, terms=_token_terms(), counterchain_locator=_erc20_locator()
+        ).to_dict()
         d["counterchain_locator"]["chain"] = "eth-something-newer"
         with pytest.raises(ValidationError, match="unknown counterchain_locator chain"):
             SwapRecord.from_dict(d)
@@ -76,7 +78,7 @@ class TestAnOlderBinaryCannotMisreadATokenRecord:
     def test_a_token_record_round_trips(self) -> None:
         from pyrxd.gravity.swap_state import SwapState
 
-        rec = SwapRecord(state=SwapState.NEGOTIATED, terms=_terms(), counterchain_locator=_erc20_locator())
+        rec = SwapRecord(state=SwapState.NEGOTIATED, terms=_token_terms(), counterchain_locator=_erc20_locator())
         back = SwapRecord.from_dict(rec.to_dict())
         assert isinstance(back.counterchain_locator, Erc20HtlcLocator)
         assert back.counterchain_locator == rec.counterchain_locator
@@ -269,3 +271,123 @@ class TestTheColdRecoveryPathAlreadyCoversATokenHtlc:
                 claim_tx={"hash": "0x" + "cd" * 32, "to": "0x" + "ff" * 20, "input": "0xaabbccdd" + p.hex()},
                 logs=[{"address": "0x" + "ff" * 20, "data": "0x" + p.hex(), "topics": []}],
             )
+
+
+_USDC_MAINNET = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+
+
+def _token_terms():
+    """Terms that NAME the asset, which is what a real token swap carries. Pairing a token locator
+    with native terms is now refused at record construction — the guard that would have caught the
+    producers returning the wrong locator type."""
+    import dataclasses
+
+    return dataclasses.replace(_terms(), token_address=_USDC_MAINNET)
+
+
+class TestTheProducersEmitTheTaggedLocator:
+    """THE regression class for the critical bug this branch shipped with.
+
+    The tag mechanism was correct and fully tested — against locators built BY HAND in tests.
+    Neither production producer ever emitted one: `Erc20HtlcLeg.fund` and `EthLeg.expected_locator`
+    both returned the plain parent, because `fund` was written before the token locator existed and
+    nothing went back to update it. So every real token swap would have persisted as `chain: "eth"`
+    carrying 6-decimal base units in a field every reader takes for wei — the exact 10^12 error the
+    feature was built to prevent, as the DEFAULT behaviour.
+
+    9,442 tests passed with that bug in place. These assert the PRODUCERS, not the mechanism.
+    """
+
+    def test_the_maker_side_producer_emits_a_token_locator(self) -> None:
+        import os
+
+        from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+        from pyrxd.eth_wallet.tokens import token_for
+        from pyrxd.gravity.eth_leg import EthLeg
+        from pyrxd.security.secrets import PrivateKeyMaterial
+
+        artifact = _artifact()
+        leg = Erc20HtlcLeg(
+            token=token_for("USDC", 1),
+            rpc=object(),
+            signing_key=PrivateKeyMaterial(os.urandom(32)),
+            chain_id=1,
+            artifact=artifact,
+        )
+        adapter = EthLeg(
+            contract_leg=leg,
+            network="mainnet",
+            claim_to="0x" + "44" * 20,
+            refund_to="0x" + "55" * 20,
+            eth_timeout_unix_s=1_800_000_000,
+        )
+        loc = adapter.expected_locator(_token_terms(), contract_address="0x" + "11" * 20)
+        assert isinstance(loc, Erc20HtlcLocator), f"got {type(loc).__name__} — the tag would say 'eth'"
+        assert loc.CHAIN_TAG == "eth-erc20"
+        assert loc.token_address == _USDC_MAINNET.lower()
+
+    def test_a_native_leg_still_emits_a_native_locator(self) -> None:
+        """The honest path: nothing about the native corridor may change."""
+        import os
+
+        from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+        from pyrxd.gravity.eth_leg import EthLeg
+        from pyrxd.security.secrets import PrivateKeyMaterial
+
+        leg = EthHtlcContractLeg(
+            rpc=object(),
+            signing_key=PrivateKeyMaterial(os.urandom(32)),
+            chain_id=1,
+            artifact=_native_artifact(),
+        )
+        adapter = EthLeg(
+            contract_leg=leg,
+            network="mainnet",
+            claim_to="0x" + "44" * 20,
+            refund_to="0x" + "55" * 20,
+            eth_timeout_unix_s=1_800_000_000,
+        )
+        loc = adapter.expected_locator(_terms(), contract_address="0x" + "11" * 20)
+        assert type(loc) is EthHtlcLocator
+        assert loc.CHAIN_TAG == "eth"
+
+    def test_a_token_leg_refuses_terms_naming_a_DIFFERENT_token(self) -> None:
+        import dataclasses
+        import os
+
+        from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+        from pyrxd.eth_wallet.tokens import token_for
+        from pyrxd.gravity.eth_leg import EthLeg
+        from pyrxd.security.secrets import PrivateKeyMaterial
+
+        leg = Erc20HtlcLeg(
+            token=token_for("USDC", 1),
+            rpc=object(),
+            signing_key=PrivateKeyMaterial(os.urandom(32)),
+            chain_id=1,
+            artifact=_artifact(),
+        )
+        adapter = EthLeg(
+            contract_leg=leg,
+            network="mainnet",
+            claim_to="0x" + "44" * 20,
+            refund_to="0x" + "55" * 20,
+            eth_timeout_unix_s=1_800_000_000,
+        )
+        other = dataclasses.replace(_token_terms(), token_address="0x" + "99" * 20)
+        with pytest.raises(ValidationError, match="pinned to"):
+            adapter.expected_locator(other, contract_address="0x" + "11" * 20)
+
+
+def _artifact() -> dict:
+    import json
+    from pathlib import Path
+
+    return json.loads((Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
+
+
+def _native_artifact() -> dict:
+    import json
+    from pathlib import Path
+
+    return json.loads((Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
