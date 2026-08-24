@@ -200,15 +200,35 @@ def assert_covenant_confirms_before_eth_deadline(
     rxd_block_interval_s: float,
     max_covenant_confirm_wait_s: int,
 ) -> None:
-    """Mixed-clock funding-confirmation gate (re-audit SC-3/TLK-1).
+    """Covenant-punctuality gate (re-audit SC-3/TLK-1).
 
-    Because the RXD CSV clock starts at covenant MINING, the real RXD refund opens at
-    roughly::
+    WHAT THIS ACTUALLY VERIFIES — read before changing it. The arithmetic below looks like a
+    wall-clock projection of the RXD refund, and its previous docstring described it as one. It is
+    not, because ``rxd_block_interval_s`` **cancels**: ``eth_absolute_to_rxd_relative_blocks``
+    computes ``t_rxd = floor(budget_s / interval)`` and this function then computes
+    ``ceil(t_rxd * interval)``, which are inverse operations and return ``budget_s`` again. Measured
+    over 20 scenarios at six intervals spanning 9s to 1200s — a 133x range straddling the whole
+    observed RXD distribution — the verdict did not change once. The interval is a no-op input.
 
-        now_unix_s + max_covenant_confirm_wait_s + t_rxd.value * rxd_block_interval_s
+    Substituting the reduction, the check that actually happens is::
 
-    which must stay strictly before ``eth_timeout_unix_s - margin.total_s()``. The projected
-    open is rounded UP (``ceil``) so the gate errs toward refusing. Run this TWICE: (1)
+        now_unix_s + max_covenant_confirm_wait_s  <  expected_rxd_lock_time_unix_s
+
+    i.e. **does the covenant confirm by the time the sizing assumed it would**. That is a real and
+    useful property — the CSV clock starts at covenant MINING, so a covenant that confirms late
+    shifts the whole RXD window right — but it is punctuality, not a slow-chain defence.
+
+    DO NOT "FIX" THIS BY PASSING A SLOWER PERCENTILE. That was attempted and it refuses every
+    configuration at every budget, because sizing deliberately maximises the block count using a
+    FAST-tail interval while a projection multiplied by a slow-tail one inflates it by the ratio
+    between the two (~5.3x at p10 vs median). It would also be defending the wrong direction:
+    :func:`eth_absolute_to_rxd_relative_blocks` establishes that a slow RXD only lengthens the
+    MAKER'S LOCK — a liveness cost, never a safety one — because it gives the taker *more* time to
+    claim, not less. The safety-critical direction is RXD running FAST, and that is handled where
+    it belongs, in the sizing.
+
+    The projected open is rounded UP (``ceil``) so the gate errs toward refusing; that rounding is
+    the only residual effect the interval has, worth about one block at the boundary. Run this TWICE: (1)
     pre-lock with the worst-case ``max_covenant_confirm_wait_s`` (a projection before
     broadcasting the covenant), and (2) post-confirm with ``now_unix_s = actual mining time``
     and ``max_covenant_confirm_wait_s = 0``; if (2) fails the maker must refund the covenant
@@ -230,9 +250,12 @@ def assert_covenant_confirms_before_eth_deadline(
     projected_rxd_open_s = now_unix_s + max_covenant_confirm_wait_s + math.ceil(t_rxd.value * rxd_block_interval_s)
     if projected_rxd_open_s >= deadline_s:
         raise ValidationError(
-            f"covenant would confirm too late: projected RXD refund opens at "
-            f"{projected_rxd_open_s} >= ETH-deadline-minus-margin {deadline_s} — refusing to "
-            "lock RXD (SC-3/TLK-1 mixed-clock race)"
+            f"covenant would confirm too late: the RXD CSV clock starts at covenant MINING, and a "
+            f"confirmation at {now_unix_s + max_covenant_confirm_wait_s} is past the time the "
+            f"timelock sizing assumed ({projected_rxd_open_s} >= {deadline_s}), which shifts the "
+            "whole RXD refund window right — refusing to lock RXD (SC-3/TLK-1). This is a "
+            "PUNCTUALITY failure, not a slow-chain one: see this function's docstring before "
+            "changing the block interval in response to it."
         )
 
 
