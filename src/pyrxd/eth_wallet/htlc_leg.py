@@ -27,13 +27,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from typing import Any
 
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.gravity.counter_chain_leg import CounterChainLeg
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 __all__ = ["EthHtlcContractLeg", "load_artifact"]
@@ -97,6 +98,32 @@ def _require_web3() -> Any:
             "the ETH leg needs web3 (a Phase-3 network dependency); install it with: pip install 'pyrxd[eth]'"
         ) from exc
     return web3
+
+
+#: Seconds of head-room a claim must have before ``timeout`` to be worth broadcasting.
+#: ~8 Ethereum blocks at 12s. Sized to cover ordinary inclusion latency and a fee spike, not to be
+#: a precise deadline: the contract remains the source of truth. Deliberately generous, because the
+#: cost of refusing a claim that WOULD have made it is one retry, while the cost of broadcasting one
+#: that does not is the preimage published for nothing.
+CLAIM_INCLUSION_BUDGET_S: int = 96
+
+#: Seconds per L1 block, used ONLY to convert the budget above into a fee multiplier.
+_BLOCK_S: int = 12
+
+#: The fee ceiling a claim must carry to stay includable for the whole budget it was authorised
+#: against. EIP-1559 lets basefee rise 12.5% per block, so surviving N blocks costs 1.125**N.
+#:
+#: Round 5 found these two numbers had drifted apart: the guard authorised broadcasting with 96s
+#: (8 blocks) of head-room while `rpc.fee_fields` priced every tx at `2*base + tip`, and
+#: 1.125**6 = 2.03 — the ceiling expired after 72s. In the 24s gap the claim is unincludable but
+#: already broadcast; the taker refunds at the timeout, the claim then mines, reverts, and leaves
+#: `p` in its calldata for anyone to scrape. Deriving the multiplier FROM the budget is what stops
+#: them drifting again: change the budget and the fee follows.
+CLAIM_BASEFEE_HEADROOM: float = 1.125 ** (CLAIM_INCLUSION_BUDGET_S / _BLOCK_S)
+
+
+class _ClaimTooLate(Exception):
+    """Internal: too close to the deadline to broadcast. Surfaced as PreRevealAbort."""
 
 
 class EthHtlcContractLeg:
@@ -285,9 +312,17 @@ class EthHtlcContractLeg:
             return str(await self._private_submitter.submit_raw(signed.raw_transaction))
         return await self._rpc.send_raw(signed.raw_transaction)
 
-    async def _base_tx(self, *, gas: int) -> dict:
+    async def _base_tx(self, *, gas: int, basefee_headroom: float = 1.0) -> dict:
+        """Build the common tx fields. `basefee_headroom` scales the basefee share of
+        `maxFeePerGas` (never the tip) so a DEADLINE-BOUND tx stays includable for as long as it
+        was authorised to take. Defaults to 1.0 — the node's own 2x — for everything with no
+        deadline; only `claim` has one. See :data:`CLAIM_BASEFEE_HEADROOM`."""
         addr = self._account_address()
         fees = await self._rpc.fee_fields()
+        if basefee_headroom > 1.0:
+            tip = int(fees["maxPriorityFeePerGas"])
+            base_share = max(int(fees["maxFeePerGas"]) - tip, 0)
+            fees = {**fees, "maxFeePerGas": int(base_share * basefee_headroom) + tip}
         return {
             "from": addr,
             "chainId": self._chain_id,
@@ -357,10 +392,59 @@ class EthHtlcContractLeg:
         On the public-fallback path (no submitter) p goes public anyway, so the preflight stays."""
         if not isinstance(preimage, (bytes, bytearray)) or len(preimage) != 32:
             raise ValidationError("preimage must be 32 bytes")
-        await self._rpc.assert_chain()
-        c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
-        built = await c.functions.claim(bytes(preimage)).build_transaction(await self._base_tx(gas=120_000))
-        # Skip the p-leaking preflight when going private (submitter present).
+        # Everything up to `_sign_and_send` leaves nothing outside this process: `assert_chain` and
+        # `_base_tx` are reads that never carry the calldata. A failure here means p is STILL
+        # SECRET, so it is reported as PreRevealAbort — the caller zeroizes the preimage once a
+        # claim has been attempted, and doing that on a transport blip would destroy the only copy
+        # of a still-safe secret and strand a swap a retry would have finished (#479).
+        try:
+            await self._rpc.assert_chain()
+            # DEADLINE GUARD — the mirror of refund()'s maturity check, and the more dangerous of
+            # the two. `claim` reverts once block.timestamp >= timeout, and a reverted transaction
+            # is STILL MINED with the preimage in its calldata. So a claim that lands late does not
+            # merely fail: it publishes p for nothing, and the counterparty then refunds this leg
+            # AND takes the other one with the secret it just read. `fetch_claim_artifacts` says so
+            # in as many words — it scrapes p from a "reverted-but-mined" claim.
+            #
+            # On the mainnet-recommended PRIVATE path there is no eth_call preflight (it would leak
+            # p to the provider), so nothing downstream catches expiry either. This check is the
+            # only thing standing between a stalling counterparty and a free option.
+            head = await self._rpc.w3.eth.get_block("latest")
+            chain_ts, local_ts = int(head["timestamp"]), int(time.time())
+            # Take the LATER of chain head and local clock. A lagging or hostile provider can only
+            # push `chain_ts` BACKWARDS, and backwards is exactly the direction that makes this
+            # guard pass when it should refuse — round 5's finding: a provider 4 minutes behind, or
+            # any of the L2s in KNOWN_TOKENS during a sequencer halt, made the guard inert in the
+            # precise case it was written for. Local time cannot be moved by the provider, and
+            # forward skew only ever makes the guard stricter.
+            now_ts = max(chain_ts, local_ts)
+            if local_ts - chain_ts > CLAIM_INCLUSION_BUDGET_S:
+                raise _ClaimTooLate(
+                    f"the chain head is {local_ts - chain_ts}s stale (limit "
+                    f"{CLAIM_INCLUSION_BUDGET_S}s): with a head this old there is no way to reason "
+                    "about whether a claim would be included before the timeout, and a claim that "
+                    "mines late publishes the preimage for nothing. Check the provider, and check "
+                    "this machine's clock, then retry. Nothing was sent."
+                )
+            deadline = int(locator.timeout)
+            if now_ts + CLAIM_INCLUSION_BUDGET_S >= deadline:
+                raise _ClaimTooLate(
+                    f"refusing to build a claim {deadline - now_ts}s before the HTLC timeout (needs "
+                    f"{CLAIM_INCLUSION_BUDGET_S}s of head-room): a claim that mines late still "
+                    "publishes the preimage in its calldata while paying nothing, which hands the "
+                    "counterparty both legs. Refund after the timeout instead."
+                )
+            c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
+            built = await c.functions.claim(bytes(preimage)).build_transaction(
+                await self._base_tx(gas=120_000, basefee_headroom=CLAIM_BASEFEE_HEADROOM)
+            )
+        except _ClaimTooLate as exc:
+            raise PreRevealAbort(str(exc)) from exc
+        except Exception as exc:
+            raise PreRevealAbort(f"claim abandoned before broadcast; the preimage is still secret: {exc}") from exc
+        # From here p may reach a provider: on the public path the preflight eth_call carries the
+        # calldata, and on the private path the submit does. Failures beyond this line are NOT
+        # PreRevealAbort — the caller must assume p is public.
         preflight = self._private_submitter is None
         return await self._sign_and_send(built, preflight=preflight, private=True)
 

@@ -53,7 +53,7 @@ from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
-from pyrxd.security.errors import NetworkError, ValidationError
+from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import SecretBytes
 
 from .eth_rxd_timelock import CrossClockMargin, assert_covenant_confirms_before_eth_deadline
@@ -1796,7 +1796,17 @@ class SwapCoordinator:
             raise ValidationError("preimage does not hash to the negotiated H; refusing to broadcast")
         try:
             await self.counter_leg.claim(self.record.counterchain_locator, raw)
-        finally:
+        except PreRevealAbort:
+            # Nothing was broadcast and no eth_call carried the calldata to a provider, so `p` is
+            # STILL SECRET — keep it. A blanket `finally` here destroyed the only copy of a secret
+            # that was still safe, turning a transient RPC blip or a refused pre-flight check into
+            # a dead swap that a retry would have completed. See #479.
+            raise
+        except BaseException:
+            # Anything else may have reached the network with `p` in its calldata. Assume public.
+            preimage.zeroize()
+            raise
+        else:
             preimage.zeroize()
         self._advance(SwapEvent.MAKER_CLAIMS_BTC_REVEALS_P)
         await self._persist_record(self.record, shield=True)
