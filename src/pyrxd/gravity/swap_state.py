@@ -149,11 +149,24 @@ class SwapEvent(Enum):
 
 _TRANSITION_TABLE: frozenset[tuple[SwapState, SwapEvent, SwapState]] = frozenset(
     {
-        # NEGOTIATED --> BTC_LOCKED : taker funds BTC P2TR HTLC (locks FIRST)
+        # NEGOTIATED --> BTC_LOCKED : taker funds the counter leg.
+        #
+        # READ THIS BEFORE REASONING ABOUT ORDERING. These transitions record when the COORDINATOR
+        # observes each step, NOT the order value hits the chains. The maker's Radiant covenant is
+        # already broadcast and verified on-chain before this transition can fire:
+        # `taker_funds_btc` runs `pre_btc_lock_check`, whose step 5
+        # (`taker_verify_asset_funding`) reads the Radiant chain and fails closed. A taker who
+        # funded first would be robbed outright by a maker that locked nothing and then swept the
+        # counter leg with the `p` it has held since the envelope — so the protocol is
+        # MAKER-LOCKS-FIRST, and the code enforces it.
         (SwapState.NEGOTIATED, SwapEvent.TAKER_FUNDS_BTC, SwapState.BTC_LOCKED),
         # NEGOTIATED --> [*] (ABORTED) : taker never funds
         (SwapState.NEGOTIATED, SwapEvent.TAKER_NEVER_FUNDS, SwapState.ABORTED),
-        # BTC_LOCKED --> BOTH_LOCKED : maker locks asset in Radiant covenant
+        # BTC_LOCKED --> BOTH_LOCKED : maker REVALIDATES — the event name predates the flow and
+        # does not describe it. Nothing locks here: the covenant was broadcast before the taker
+        # funded (see above). This step re-reads the covenant SPK, re-verifies the taker's counter
+        # funding pinned to finality (the verify->lock TOCTOU) and checks the credential binding,
+        # because BOTH_LOCKED is the precondition for revealing `p`.
         (SwapState.BTC_LOCKED, SwapEvent.MAKER_LOCKS_ASSET, SwapState.BOTH_LOCKED),
         # BTC_LOCKED --> ABORTED : maker never locks; t_BTC elapses; taker refunds BTC
         (SwapState.BTC_LOCKED, SwapEvent.MAKER_NEVER_LOCKS_BTC_TIMEOUT, SwapState.ABORTED),
