@@ -83,7 +83,7 @@ class _FakeRpc:
     async def fee_fields(self):
         return {"maxFeePerGas": 1, "maxPriorityFeePerGas": 1}
 
-    async def get_transaction_count(self, addr):
+    async def get_transaction_count(self, addr, block="pending"):
         return 0
 
     async def send_raw(self, raw_tx):

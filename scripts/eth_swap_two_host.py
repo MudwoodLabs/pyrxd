@@ -84,6 +84,7 @@ from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
 from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
     CoordinatorConfig,
@@ -749,7 +750,13 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
         radiant_leg=rxd_leg,
         indexer=None,  # plain RXD has no genesis ref → no ref-authenticity indexer needed
         seen_store=DurableSeenStore(str(Path(keys_out).expanduser()) + ".seen.sqlite"),
-        config=CoordinatorConfig(margin_policy=_margin_policy(args), accept_estimated_eth_margins=True, role=role),
+        persist=JsonFileRecordSink(str(Path(keys_out).expanduser()) + ".swaprec.json"),
+        config=CoordinatorConfig(
+            margin_policy=_margin_policy(args),
+            accept_estimated_eth_margins=True,
+            role=role,
+            fund_lock=FileFundLock(str(Path(keys_out).expanduser())),
+        ),
     )
 
 

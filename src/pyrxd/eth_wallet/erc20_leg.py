@@ -209,6 +209,23 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # full amount (a push whose receipt was lost). Sending `amount_wei` unconditionally would
         # double-fund exactly the case a resume exists to handle.
         held = await balance_of(self._rpc, self._token, address)
+        # A balance read at `latest` CANNOT see a transfer still sitting in the mempool, while the
+        # nonce used to build the next one comes from `pending` — so a resume inside the receipt
+        # wait would read 0, compute the full shortfall, and send a SECOND transfer at the next
+        # nonce. Both mine; the HTLC ends up holding twice the negotiated amount, and claim sweeps
+        # the whole balance to the counterparty. "Reading the chain collapses the two cases into
+        # one" was true only for a push that had already mined. If this sender has anything in
+        # flight, the balance is not yet a fact and nothing may be sent against it.
+        sender = self._account_address()
+        pending_nonce = await self._rpc.get_transaction_count(sender, "pending")
+        latest_nonce = await self._rpc.get_transaction_count(sender, "latest")
+        if pending_nonce != latest_nonce:
+            raise NetworkError(
+                f"{pending_nonce - latest_nonce} transaction(s) from {sender} are still in flight "
+                f"(nonce pending={pending_nonce}, latest={latest_nonce}), so the HTLC balance "
+                f"{held} is not settled. One of them may be the token push for this very swap; "
+                "sending against this reading could fund the HTLC twice. Wait for them to mine."
+            )
         shortfall = int(amount_wei) - int(held)
         if shortfall > 0:
             # --- push the tokens in. No approve, no transferFrom. ---

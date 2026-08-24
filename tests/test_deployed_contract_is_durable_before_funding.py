@@ -102,7 +102,7 @@ def _leg(*, push_fails: bool = False, order: list, initial_held: int = 0):
         async def fee_fields(self):
             return {"maxPriorityFeePerGas": 1, "maxFeePerGas": 3}
 
-        async def get_transaction_count(self, _a):
+        async def get_transaction_count(self, _a, block="pending"):
             return 0
 
         async def wait_receipt(self, tx_hash, **_k):
@@ -296,7 +296,7 @@ _REFUNDEE = "0x" + "55" * 20
 _TIMEOUT = _FUND_TIMEOUT
 
 
-def _real_verify_leg(*, on_chain: dict, held: int, order: list):
+def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 0):
     """A leg whose `verify_funded` is the PRODUCTION one, backed by a node fake serving the
     contract's immutables. `on_chain` overrides let a test deploy a contract that is NOT this
     swap's and watch the real check refuse it."""
@@ -386,8 +386,10 @@ def _real_verify_leg(*, on_chain: dict, held: int, order: list):
         async def fee_fields(self):
             return {"maxPriorityFeePerGas": 1, "maxFeePerGas": 3}
 
-        async def get_transaction_count(self, _a):
-            return 0
+        async def get_transaction_count(self, _a, block="pending"):
+            # `inflight` models transactions sitting in the mempool: they advance the PENDING
+            # nonce while remaining invisible to a balance read at `latest`.
+            return inflight if block == "pending" else 0
 
         async def wait_receipt(self, *a, **k):
             state["held"] += state.pop("pending", 0)
@@ -442,5 +444,30 @@ class TestTheRealVerifyFundedRunsOnResume:
         else may be. Holding zero must still resume; that is what `require_balance=False` buys."""
         order: list = []
         leg = _real_verify_leg(on_chain={}, held=0, order=order)
+        assert _fund(leg, None, resume_from=_PENDING) is not None
+        assert order == ["tokens-pushed"]
+
+
+class TestAResumeRefusesWhileAPushIsStillInFlight:
+    """The single-process half of the double-fund. `balance_of` reads at `latest`, so a transfer
+    still in the mempool is invisible — while the nonce for the next transaction comes from
+    `pending`, so the resume's transfer gets a NEW nonce rather than replacing it. Both mine, and
+    the HTLC ends holding twice the negotiated amount, which claim sweeps to the counterparty.
+
+    The receipt wait is 300s by default, so this window is wide, and no concurrency is needed to
+    hit it — one process, crash, resume.
+    """
+
+    def test_it_refuses_when_the_sender_has_a_transaction_in_flight(self) -> None:
+        order: list = []
+        leg = _real_verify_leg(on_chain={}, held=0, order=order, inflight=1)
+        with pytest.raises(NetworkError, match="still in flight"):
+            _fund(leg, None, resume_from=_PENDING)
+        assert order == [], "a second transfer was sent while the first was still pending"
+
+    def test_it_proceeds_once_nothing_is_in_flight(self) -> None:
+        """Paired honest path — a settled mempool must not block a legitimate resume."""
+        order: list = []
+        leg = _real_verify_leg(on_chain={}, held=0, order=order, inflight=0)
         assert _fund(leg, None, resume_from=_PENDING) is not None
         assert order == ["tokens-pushed"]

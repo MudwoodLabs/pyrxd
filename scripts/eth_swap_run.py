@@ -69,6 +69,7 @@ from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg, RxinDexerRefAdapter
+from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
@@ -434,7 +435,13 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # real (non-dust) value-bearing ETH swap MUST use MarginPolicy.measured(...) instead.
     # accept_estimated_eth_margins stays (a separate ETH-margin dust opt-in, MEDIUM-1);
     # accept_nondurable_seen is dropped — the seen-store below is durable-by-default.
-    cfg = CoordinatorConfig(margin_policy=policy, accept_estimated_eth_margins=True)
+    cfg = CoordinatorConfig(
+        margin_policy=policy,
+        accept_estimated_eth_margins=True,
+        # Exclusive across processes: `reserve(H)` was the only mutual exclusion in the funding
+        # path, and resuming an interrupted fund skips it.
+        fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
+    )
     coord = SwapCoordinator(
         record=SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
         counter_leg=eth_leg,
@@ -443,6 +450,10 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         # Durable (SQLite) H-freshness store co-located with the mode-600 recovery file,
         # so the SEEN-1 reservation survives a restart / second process (was InMemSeen).
         seen_store=DurableSeenStore(str(Path(args.keys_out).expanduser()) + ".seen.sqlite"),
+        # An ETH contract address depends on the deployer's nonce and exists nowhere until the
+        # deploy receipt returns, so this hook is the ONLY thing that makes a mid-fund crash
+        # recoverable. The coordinator refuses an ETH counter-leg without it.
+        persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
         config=cfg,
     )
 

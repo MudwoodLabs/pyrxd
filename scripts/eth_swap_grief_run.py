@@ -46,6 +46,7 @@ from radiant_mainnet_chainio import SshTrRadiantClient
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState  # noqa: F401
 
@@ -145,10 +146,14 @@ async def run(args) -> None:
         radiant_leg=rxd_leg,
         indexer=None,
         seen_store=InMemSeen(),
+        persist=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
         # accept_estimated_eth_margins: operator-gated DUST griefing run; consciously accepts
         # estimated-margin risk on negligible value (MEDIUM-1). Non-dust value → measured policy.
         config=CoordinatorConfig(
-            margin_policy=_policy(args), accept_nondurable_seen=True, accept_estimated_eth_margins=True
+            margin_policy=_policy(args),
+            accept_nondurable_seen=True,
+            accept_estimated_eth_margins=True,
+            fund_lock=FileFundLock(str(Path(args.keys_out).expanduser())),
         ),
     )
 

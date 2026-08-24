@@ -392,7 +392,7 @@ def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
         async def fee_fields(self):
             return {"maxPriorityFeePerGas": 1, "maxFeePerGas": 3}
 
-        async def get_transaction_count(self, _a):
+        async def get_transaction_count(self, _a, block="pending"):
             return 0
 
     art = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())

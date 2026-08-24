@@ -261,7 +261,7 @@ def _fee_leg(now_ts: int, cap: list):
         async def fee_fields(self):
             return {"maxPriorityFeePerGas": _TIP, "maxFeePerGas": _BASE * 2 + _TIP}
 
-        async def get_transaction_count(self, _addr):
+        async def get_transaction_count(self, _addr, block="pending"):
             return 0
 
     leg = EthHtlcContractLeg(rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_ART)

@@ -88,10 +88,17 @@ class EthRpc:
         except Exception as exc:
             raise NetworkError(f"eth_getBalance failed: {exc}") from exc
 
-    async def get_transaction_count(self, address: str) -> int:
-        """Pending nonce for the sender."""
+    async def get_transaction_count(self, address: str, block: str = "pending") -> int:
+        """Nonce for the sender. Defaults to ``pending`` so a freshly built tx does not collide
+        with one still in the mempool.
+
+        The ``block`` parameter exists so a caller can compare the two: ``pending != latest`` means
+        this sender has transactions in flight. That is the difference between "the HTLC holds
+        nothing" and "the HTLC holds nothing YET", which a balance read alone cannot tell apart —
+        see the resume guard in :meth:`Erc20HtlcLeg._push_and_bind`.
+        """
         try:
-            return int(await self._w3.eth.get_transaction_count(address, "pending"))
+            return int(await self._w3.eth.get_transaction_count(address, block))
         except Exception as exc:
             raise NetworkError(f"eth_getTransactionCount failed: {exc}") from exc
 

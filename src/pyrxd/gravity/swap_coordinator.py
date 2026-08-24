@@ -32,6 +32,7 @@ Design rules (house style)
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import functools
 import hashlib
@@ -42,6 +43,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import Enum
 from fractions import Fraction
+from typing import Any
 
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
 from pyrxd.btc_wallet.taproot import (
@@ -908,6 +910,14 @@ class CoordinatorConfig:
     # runbook (the dust harness); a long-lived / multi-process deployment needs a
     # durable store (audit track), not this flag.
     accept_nondurable_seen: bool = False
+    # A zero-argument callable returning a context manager that holds EXCLUSIVE, host-local
+    # mutual exclusion over funding this swap (see `record_sink.FileFundLock`). REQUIRED to
+    # resume an interrupted ETH fund: `reserve(H)` is what stopped two funders proceeding, the
+    # resume deliberately skips it because the record already holds that reservation, and without
+    # a replacement two resumers each read the same pre-push balance and each send the shortfall —
+    # leaving twice the negotiated amount in an HTLC whose claim sweeps the whole balance to the
+    # counterparty. A fresh fund is still covered by the reserve itself.
+    fund_lock: Any = None
     # Explicit opt-in to run a VALUE-BEARING ETH (finalized-checkpoint) counter-leg swap
     # with an ESTIMATED (is_measured=False) margin policy. is_measured gates TWO ETH
     # defenses — the verify->lock 'finalized' reorg pin (a 'latest' re-verify cannot catch
@@ -1438,6 +1448,19 @@ class SwapCoordinator:
         # the resume completes the EXISTING contract rather than creating a second one, the leg
         # verifies that contract carries this swap's immutables before sending anything to it, and
         # it re-reads the balance so a lost receipt cannot double-fund.
+        # An ETH counter-leg address is not derivable from terms, so the ONLY thing that can make
+        # a mid-fund crash recoverable is a record written to durable storage. Without a persist
+        # hook `_persist_record` is a silent no-op and every guarantee below is a lie — which is
+        # exactly what shipped: not one runner injected one, so the durable handle never reached
+        # disk and the resume it enables could never trigger. Refuse rather than document it.
+        if terms.counter_chain == "eth" and self._persist is None:
+            raise ValidationError(
+                "an ETH counter-leg requires a durable persist hook: its contract address depends "
+                "on the deployer's nonce and exists nowhere until the deploy receipt returns, so "
+                "without one a crash between deploy and funding leaves real value on chain that "
+                "nothing references. Pass persist= (see gravity.record_sink.JsonFileRecordSink)."
+            )
+
         resume_from = None
         if self.record.pending_counter_contract:
             # CHECK the assumption instead of trusting it. "A pending deploy proves this swap won
@@ -1457,6 +1480,15 @@ class SwapCoordinator:
                     "it won the reservation. Refusing to resume — resolve the divergence (or "
                     "refund the deployed contract after the timeout) rather than funding against "
                     "an H another swap may also be using."
+                )
+            if self.config.fund_lock is None:
+                raise ValidationError(
+                    "resuming an interrupted fund requires CoordinatorConfig.fund_lock: this path "
+                    "skips the seen-store reserve (the record already holds that reservation), and "
+                    "the reserve was also the only mutual exclusion in the funding path. Two "
+                    "resumers without a lock each read the same pre-push balance and each send the "
+                    "shortfall, leaving twice the negotiated amount in an HTLC whose claim sweeps "
+                    "the whole balance to the counterparty. See gravity.record_sink.FileFundLock."
                 )
             resume_from = PendingDeploy(
                 address=self.record.pending_counter_contract,
@@ -1485,7 +1517,11 @@ class SwapCoordinator:
             await self._persist_record(self.record, shield=True)
 
         if terms.counter_chain == "eth":
-            locator = await self.counter_leg.fund(terms, on_deploy=_remember_deploy, resume_from=resume_from)
+            lock = self.config.fund_lock
+            # Held across deploy AND push: the window the lock exists to close is between reading
+            # the balance and sending the shortfall, which spans both.
+            with lock() if lock is not None else contextlib.nullcontext():
+                locator = await self.counter_leg.fund(terms, on_deploy=_remember_deploy, resume_from=resume_from)
         else:
             locator = await self.counter_leg.fund(terms)
         if not isinstance(locator, (BtcHtlcLocator, EthHtlcLocator)):

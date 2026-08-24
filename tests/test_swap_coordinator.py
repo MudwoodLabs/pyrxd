@@ -18,6 +18,7 @@ real legs would. This exercises:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import hashlib
 import json
@@ -2278,16 +2279,48 @@ async def test_pre_lock_dispatches_eth_ordering_gate():
 # --------------------------------------------------------------------------- ETH full lifecycle
 
 
-def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy=None):
+class _MemLock:
+    """A stand-in for `FileFundLock` that records whether it was actually entered."""
+
+    def __init__(self) -> None:
+        self.entries = 0
+
+    @contextlib.contextmanager
+    def __call__(self):
+        self.entries += 1
+        yield
+
+
+def _eth_coord_full(*, terms, eth_leg, radiant_leg=None, seen_store=None, policy=None, fund_lock=None):
+    """An ETH coordinator wired the way production must be.
+
+    `persist` is supplied unconditionally because the coordinator now REFUSES an ETH counter-leg
+    without one: an ETH contract address is not derivable from terms, so without a durable record a
+    mid-fund crash leaves value on chain that nothing references. Not one shipped runner injected a
+    hook, which is how the durable-handle work reached main-line code with no production caller.
+    Tests must therefore supply one too — and asserting on what it received is how the persistence
+    is checked at all.
+    """
     rec = SwapRecord(state=SwapState.NEGOTIATED, terms=terms)
-    return SwapCoordinator(
+    coord = SwapCoordinator(
         record=rec,
         counter_leg=eth_leg,
         radiant_leg=radiant_leg or FakeRadiantLeg(),
         indexer=FakeIndexer(),
         seen_store=seen_store or FakeSeenStore(),
-        config=CoordinatorConfig(margin_policy=policy or _eth_fund_policy(), maker_stall_safety_window_blocks=6),
+        config=CoordinatorConfig(
+            margin_policy=policy or _eth_fund_policy(),
+            maker_stall_safety_window_blocks=6,
+            fund_lock=fund_lock,
+        ),
     )
+    coord.persisted = []
+
+    async def _persist(record):
+        coord.persisted.append(record)
+
+    coord._persist = _persist
+    return coord
 
 
 async def test_eth_full_lifecycle_negotiated_to_completed():
@@ -2761,7 +2794,8 @@ async def test_a_crashed_fund_can_be_RESUMED_instead_of_being_refused_forever():
     secret, h = generate_secret()
     terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
     leg = FakeEthLeg(preimage=secret, verdict=_final())
-    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    lock = _MemLock()
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, fund_lock=lock)
 
     # Simulate the crash: the deploy landed and was persisted, nothing else completed.
     coord.record = dataclasses.replace(
@@ -2778,6 +2812,7 @@ async def test_a_crashed_fund_can_be_RESUMED_instead_of_being_refused_forever():
     assert leg.resumed_from is not None, "the leg was asked to fund fresh instead of resuming"
     assert leg.resumed_from.address == "0x" + "ab" * 20
     assert leg.resumed_from.deploy_tx_hash == "0x" + "cd" * 32
+    assert lock.entries == 1, "the fund ran without holding the exclusion lock"
 
 
 async def test_a_FRESH_fund_still_reserves_H_and_a_second_funder_is_refused():
@@ -2813,3 +2848,40 @@ async def test_a_resume_is_REFUSED_when_the_seen_store_no_longer_holds_the_reser
     with pytest.raises(ValidationError, match="NOT reserved"):
         await coord.taker_funds_btc(terms, now_unix_s=_NOW)
     assert "fund" not in leg.calls, "the leg was asked to fund against an unproven reservation"
+
+
+async def test_a_resume_without_a_FUND_LOCK_is_refused():
+    """`reserve(H)` was the only mutual exclusion in the funding path. The resume skips it — the
+    record already holds that reservation — so without a replacement lock two resumers each read
+    the same pre-push balance, each send the shortfall, and the HTLC ends holding twice the
+    negotiated amount, which claim sweeps entirely to the counterparty. Refusing is the only safe
+    default: a lock the caller may forget is a lock that will eventually not be taken.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)  # no fund_lock
+    coord.record = dataclasses.replace(
+        coord.record,
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+    )
+    coord.seen_store.reserve(h)
+    with pytest.raises(ValidationError, match="fund_lock"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert "fund" not in leg.calls, "the leg funded without mutual exclusion"
+
+
+async def test_an_ETH_fund_without_a_PERSIST_hook_is_refused():
+    """An ETH contract address depends on the deployer's nonce and exists nowhere until the deploy
+    receipt returns, so a record is the only thing that can make a mid-fund crash recoverable.
+    Without a persist hook `_persist_record` is a silent no-op — which is what shipped: not one
+    runner injected one, so the durable handle never reached disk in production at all."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    coord._persist = None  # the shipped configuration, before this guard
+    with pytest.raises(ValidationError, match="durable persist hook"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert "fund" not in leg.calls

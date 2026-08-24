@@ -475,6 +475,10 @@ def _measured_eth_policy():
     )
 
 
+async def _noop_persist(_record):
+    return None
+
+
 async def test_measured_eth_policy_pins_the_lock_time_reverify_to_finalized():
     """MUTANT: replace ``block_id = "finalized" if ...is_measured else None`` with ``None``.
 
@@ -495,6 +499,9 @@ async def test_measured_eth_policy_pins_the_lock_time_reverify_to_finalized():
         radiant_leg=rxd,
         indexer=FakeIndexer(),
         seen_store=FakeSeenStore(),
+        # An ETH counter-leg now requires a durable persist hook — its contract address is not
+        # derivable from terms, so without one a mid-fund crash leaves value nothing references.
+        persist=_noop_persist,
         config=CoordinatorConfig(margin_policy=_measured_eth_policy(), maker_stall_safety_window_blocks=8),
     )
     await coord.taker_funds_btc(terms, now_unix_s=_NOW)

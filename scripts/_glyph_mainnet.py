@@ -115,7 +115,9 @@ def _cli(rxd_client, *args: str):
 def _largest_wallet_utxo(rxd_client, min_photons: int) -> dict:
     utxos = [u for u in _cli(rxd_client, "listunspent", "1", "9999999") if round(u["amount"] * 1e8) >= min_photons]
     if not utxos:
-        raise RuntimeError(f"no mainnet wallet UTXO >= {min_photons} photons (~{min_photons / 1e8:.4f} RXD) to fund the mint")
+        raise RuntimeError(
+            f"no mainnet wallet UTXO >= {min_photons} photons (~{min_photons / 1e8:.4f} RXD) to fund the mint"
+        )
     return max(utxos, key=lambda x: x["amount"])
 
 
@@ -209,7 +211,9 @@ def mint_nft_inline(
     in_sats = round(u["amount"] * 1e8)
 
     meta = GlyphMetadata(protocol=[GlyphProtocol.NFT], name=name, token_type="object")  # noqa: S106 (glyph token kind, not a secret)
-    commit = builder.prepare_commit(CommitParams(metadata=meta, owner_pkh=pkh, change_pkh=pkh, funding_satoshis=in_sats))
+    commit = builder.prepare_commit(
+        CommitParams(metadata=meta, owner_pkh=pkh, change_pkh=pkh, funding_satoshis=in_sats)
+    )
 
     fin = TransactionInput(
         source_transaction=_src(u["txid"], int(u["vout"]), spk, in_sats),
@@ -227,7 +231,9 @@ def mint_nft_inline(
         ],
     )
     commit_tx.sign()
-    confirm_fn(f"mint step 1/2: broadcast the NFT COMMIT tx on mainnet ({commit_photons / 1e8:.4f} RXD into the commit output)")
+    confirm_fn(
+        f"mint step 1/2: broadcast the NFT COMMIT tx on mainnet ({commit_photons / 1e8:.4f} RXD into the commit output)"
+    )
     commit_txid = str(_cli(rxd_client, "sendrawtransaction", commit_tx.serialize().hex()))
     log(f"    commit -> {commit_txid}")
     _wait_confirmed(rxd_client, commit_txid, label="commit", poll_s=poll_s, log=log)
@@ -253,7 +259,9 @@ def mint_nft_inline(
     reveal_value = commit_photons - fee_photons
     reveal_tx = Transaction(tx_inputs=[rin], tx_outputs=[TransactionOutput(Script(rev.locking_script), reveal_value)])
     reveal_tx.sign()
-    confirm_fn(f"mint step 2/2: broadcast the NFT REVEAL tx (creates the singleton at reveal_txid:0, carrier {reveal_value / 1e8:.4f} RXD)")
+    confirm_fn(
+        f"mint step 2/2: broadcast the NFT REVEAL tx (creates the singleton at reveal_txid:0, carrier {reveal_value / 1e8:.4f} RXD)"
+    )
     reveal_txid = str(_cli(rxd_client, "sendrawtransaction", reveal_tx.serialize().hex()))
     # The genesis ref is the COMMIT outpoint the singleton carries (d8<ref>), NOT reveal_txid:0.
     g_txid, g_vout = _genesis_ref_from_singleton(rev.locking_script)
@@ -365,7 +373,9 @@ def mint_ft_inline(
     in_sats = round(u["amount"] * 1e8)
 
     meta = GlyphMetadata(protocol=[GlyphProtocol.FT], name=name, ticker=ticker)
-    commit = builder.prepare_commit(CommitParams(metadata=meta, owner_pkh=pkh, change_pkh=pkh, funding_satoshis=in_sats))
+    commit = builder.prepare_commit(
+        CommitParams(metadata=meta, owner_pkh=pkh, change_pkh=pkh, funding_satoshis=in_sats)
+    )
     fin = TransactionInput(
         source_transaction=_src(u["txid"], int(u["vout"]), spk, in_sats),
         source_txid=u["txid"],
@@ -382,7 +392,9 @@ def mint_ft_inline(
         ],
     )
     commit_tx.sign()
-    confirm_fn(f"FT mint step 1/2: broadcast the COMMIT tx on mainnet ({commit_photons / 1e8:.4f} RXD into the commit output)")
+    confirm_fn(
+        f"FT mint step 1/2: broadcast the COMMIT tx on mainnet ({commit_photons / 1e8:.4f} RXD into the commit output)"
+    )
     commit_txid = str(_cli(rxd_client, "sendrawtransaction", commit_tx.serialize().hex()))
     log(f"    commit -> {commit_txid}")
     _wait_confirmed(rxd_client, commit_txid, label="commit", poll_s=poll_s, log=log)
@@ -404,9 +416,7 @@ def mint_ft_inline(
     rin.satoshis = commit_photons
     rin.locking_script = Script(commit.commit_script)
     # ONE FT output (premine); the commit leftover (commit_photons - premine = fee_photons) is the fee.
-    reveal_tx = Transaction(
-        tx_inputs=[rin], tx_outputs=[TransactionOutput(Script(rev.locking_script), premine_amount)]
-    )
+    reveal_tx = Transaction(tx_inputs=[rin], tx_outputs=[TransactionOutput(Script(rev.locking_script), premine_amount)])
     reveal_tx.sign()
     g_txid, g_vout = _genesis_ref_from_ft_script(rev.locking_script)
     confirm_fn(f"FT mint step 2/2: broadcast the REVEAL tx (premines {premine_amount} FT units at reveal:0)")
@@ -492,6 +502,7 @@ def lock_ft_into_covenant(
     )
     feein.satoshis = fee_in_sats
     feein.locking_script = Script(fspk)
+
     # Two-pass fee: the 2-input lock with a ~224B covenant output is ~600B — well above the sub-kB
     # mint txs — so a flat fee can fall UNDER the mainnet min-relay (0.10 RXD/kB = 10_000 photons/B).
     # Measure the signed size and pay >= size * rate with margin (the FT value flows whole regardless;
@@ -509,7 +520,9 @@ def lock_ft_into_covenant(
 
     fee = max(fee_photons, _build(fee_photons).byte_length() * 15_000)  # 1.5x the 10_000 photons/B relay floor
     tx = _build(fee)
-    confirm_fn(f"lock the FT ({minted.ft_amount} units) into the covenant SPK on mainnet (fee {fee / 1e8:.4f} RXD from a separate input)")
+    confirm_fn(
+        f"lock the FT ({minted.ft_amount} units) into the covenant SPK on mainnet (fee {fee / 1e8:.4f} RXD from a separate input)"
+    )
     txid = str(_cli(rxd_client, "sendrawtransaction", tx.serialize().hex()))
     log(f"    FT asset lock -> {txid}")
     _wait_confirmed(rxd_client, txid, label="asset-lock", poll_s=poll_s, log=log)
