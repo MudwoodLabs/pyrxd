@@ -343,6 +343,7 @@ _SAMPLE_ARGS: dict[str, object] = {
     "code": -26,
     "attempts": 9,
     "elapsed_s": 1.5,
+    "tx_hash": "0x" + "ab" * 32,
 }
 
 
