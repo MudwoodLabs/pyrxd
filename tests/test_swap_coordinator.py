@@ -2791,3 +2791,25 @@ async def test_a_FRESH_fund_still_reserves_H_and_a_second_funder_is_refused():
     with pytest.raises(ValidationError, match="hashlock H reused"):
         await coord.taker_funds_btc(terms, now_unix_s=_NOW)
     assert coord.record.state is SwapState.NEGOTIATED
+
+
+async def test_a_resume_is_REFUSED_when_the_seen_store_no_longer_holds_the_reservation():
+    """The resume skips both the H-reuse probe and the atomic reserve, on the argument that a
+    pending-deploy record proves this swap already won the reservation. That holds only while the
+    seen-store and the record-store agree — a restored backup, a rotated store, or a non-durable
+    SeenStore beside durable records breaks it, and then a second swap under the same H could fund
+    a second HTLC where one revealed `p` drains both. Check the assumption, do not trust it.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    coord.record = dataclasses.replace(
+        coord.record,
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+    )
+    # The stores have diverged: a pending record, but H was never reserved here.
+    with pytest.raises(ValidationError, match="NOT reserved"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert "fund" not in leg.calls, "the leg was asked to fund against an unproven reservation"

@@ -129,9 +129,16 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             address = checksum(resume_from.address)
             deploy_hash = resume_from.deploy_tx_hash
             # PROVE it is ours before sending anything to it. `verify_funded` runs the full
-            # immutable binding (hashlock, claimant, refundee, timeout, token) plus the runtime-code
-            # and recipient checks; `expected_amount_wei=0` waives ONLY the balance requirement,
-            # which is the one thing a half-finished fund is legitimately allowed to fail.
+            # immutable binding (hashlock, claimant, refundee, timeout, token, AMOUNT) plus the
+            # runtime-code and recipient checks; `require_balance=False` waives the balance floor
+            # and nothing else, because a half-finished fund is legitimately short.
+            #
+            # It previously passed `expected_amount_wei=0` to mean "waive the balance". That was
+            # wrong and made the resume DEAD: the same parameter also binds the contract's `amount`
+            # IMMUTABLE, which is the positive negotiated amount and can never equal 0, so every
+            # resume raised before a token moved. The amount bind is exactly the check a resume
+            # most needs — it proves the deployed contract was constructed for THIS price — so it
+            # must be asserted, not waived. One parameter serving two checks is what hid this.
             await self.verify_funded(
                 self._locator_for(
                     address=address,
@@ -142,7 +149,8 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                     timeout=timeout,
                     amount_wei=amount_wei,
                 ),
-                expected_amount_wei=0,
+                expected_amount_wei=int(amount_wei),
+                require_balance=False,
             )
         else:
             address, deploy_hash = await self._deploy(
@@ -340,7 +348,12 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         return await super().claim(locator, preimage)
 
     async def verify_funded(
-        self, locator: EthHtlcLocator, *, expected_amount_wei: int, block_identifier: Any = None
+        self,
+        locator: EthHtlcLocator,
+        *,
+        expected_amount_wei: int,
+        block_identifier: Any = None,
+        require_balance: bool = True,
     ) -> None:
         """Every check the native leg makes, then the TOKEN balance instead of the ETH balance.
 
@@ -411,7 +424,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             )
 
         held = await balance_of(self._rpc, self._token, locator.contract_address, block_identifier)
-        if held < expected_amount_wei:
+        if require_balance and held < expected_amount_wei:
             raise ValidationError(
                 f"funded {self._token.symbol} balance {held} < negotiated {expected_amount_wei} "
                 "base units (under-funded)"

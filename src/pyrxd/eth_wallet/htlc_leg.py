@@ -393,6 +393,7 @@ class EthHtlcContractLeg:
         timeout: int,
         amount_wei: int,
         on_deploy: Callable[[str, str], Awaitable[None]] | None = None,
+        resume_from: Any = None,
     ) -> EthHtlcLocator:
         """Deploy + fund the HTLC (payable constructor). Returns the locator ONLY after
         the deploy tx confirms with status==1 (a reverted/dropped deploy never yields a
@@ -401,6 +402,19 @@ class EthHtlcContractLeg:
             raise ValidationError("hashlock must be 32 bytes")
         if amount_wei <= 0:
             raise ValidationError("amount_wei must be > 0")
+        if resume_from is not None:
+            # ACCEPTED so the adapter can forward it unconditionally, and REFUSED because this leg
+            # cannot honour it. Funding here is a single payable constructor: the ETH is in the
+            # contract the instant the deploy confirms, so there is no half-finished fund to
+            # complete. Ignoring the argument and deploying anyway would put a SECOND full amount
+            # of ETH into a SECOND contract while the first still holds the original — the exact
+            # double-fund the token leg's resume exists to prevent.
+            raise ValidationError(
+                f"the native ETH leg cannot resume: its funding is one payable constructor, so the "
+                f"contract at {getattr(resume_from, 'address', resume_from)} either holds the "
+                "value already or never will. Verify it on chain and refund after the timeout; "
+                "deploying again would fund a second contract."
+            )
         web3 = _require_web3()
         await self._rpc.assert_chain()
         c = self._rpc.w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])

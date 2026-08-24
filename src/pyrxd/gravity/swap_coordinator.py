@@ -1440,6 +1440,24 @@ class SwapCoordinator:
         # it re-reads the balance so a lost receipt cannot double-fund.
         resume_from = None
         if self.record.pending_counter_contract:
+            # CHECK the assumption instead of trusting it. "A pending deploy proves this swap won
+            # the reservation" holds only while the seen-store and the record-store agree. They can
+            # diverge — a restored backup, a rotated or deleted store, or a non-durable SeenStore
+            # configured alongside durable records — and then a pending record survives with NO live
+            # reservation. Skipping both the probe and the reserve on that record would let a second
+            # swap under the same H fund a second HTLC, where one revealed p drains both.
+            try:
+                still_reserved = self.seen_store.has_seen(terms.hashlock)
+            except Exception as exc:
+                raise ValidationError(f"seen-store unavailable; fail-closed ({exc})") from exc
+            if not still_reserved:
+                raise ValidationError(
+                    "record carries a pending counter-leg deploy but its hashlock is NOT reserved "
+                    "in the seen-store: the two stores have diverged, so this record cannot prove "
+                    "it won the reservation. Refusing to resume — resolve the divergence (or "
+                    "refund the deployed contract after the timeout) rather than funding against "
+                    "an H another swap may also be using."
+                )
             resume_from = PendingDeploy(
                 address=self.record.pending_counter_contract,
                 deploy_tx_hash=str(self.record.pending_counter_deploy_tx),
