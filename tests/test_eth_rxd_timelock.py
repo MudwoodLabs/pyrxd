@@ -286,3 +286,72 @@ def test_gate_requires_blocks_timelock():
             rxd_block_interval_s=600.0,
             max_covenant_confirm_wait_s=0,
         )
+
+
+class TestTheCovenantGateIsPunctualityNotASlowChainDefence:
+    """The gate LOOKS like a wall-clock projection of the RXD refund and was documented as one.
+    It is not: `rxd_block_interval_s` cancels, because sizing computes `floor(budget/interval)`
+    and the gate computes `ceil(t_rxd * interval)` — inverse operations.
+
+    These tests exist to stop the obvious "fix". Splitting the interval into fast and slow tails
+    and passing the slow one here was attempted; it refuses every configuration at every budget,
+    and it defends the wrong direction anyway — `eth_absolute_to_rxd_relative_blocks` establishes
+    that a slow RXD only lengthens the MAKER's lock, a liveness cost, because it gives the taker
+    MORE time to claim. The safety-critical direction is RXD running FAST, handled in the sizing.
+    """
+
+    @staticmethod
+    def _margin() -> CrossClockMargin:
+        return CrossClockMargin(
+            eth_reorg_finality_s=780,
+            rxd_claim_burial_s=1_800,
+            rxd_confirm_slack_s=600,
+            rounding_slack_s=300,
+            eth_finality_stall_tolerance_s=3_600,
+        )
+
+    def _verdict(self, interval: float, *, lock_delay: int, wait: int) -> bool:
+        now = 1_700_000_000
+        lock = now + lock_delay
+        eth_timeout = lock + 200_000
+        t_rxd = eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=eth_timeout,
+            expected_rxd_lock_time_unix_s=lock,
+            margin=self._margin(),
+            rxd_block_interval_s=interval,
+            floor_blocks=1,
+        )
+        try:
+            assert_covenant_confirms_before_eth_deadline(
+                now_unix_s=now,
+                eth_timeout_unix_s=eth_timeout,
+                margin=self._margin(),
+                t_rxd=t_rxd,
+                rxd_block_interval_s=interval,
+                max_covenant_confirm_wait_s=wait,
+            )
+            return True
+        except ValidationError:
+            return False
+
+    @pytest.mark.parametrize(("lock_delay", "wait"), [(600, 0), (3_600, 300), (7_200, 1_800), (20_000, 19_000)])
+    def test_the_verdict_does_not_depend_on_the_block_interval_at_all(self, lock_delay: int, wait: int) -> None:
+        """9s to 1200s is a 133x range straddling the entire observed RXD distribution (measured
+        mainnet: min 9s, p10 43s, median 229s, mean 330s). If a change ever makes one of these
+        disagree, the gate has started measuring something new — check it is the thing you meant,
+        and that it does not simply refuse everything."""
+        verdicts = {
+            iv: self._verdict(iv, lock_delay=lock_delay, wait=wait) for iv in (9.0, 43.0, 229.0, 330.0, 600.0, 1_200.0)
+        }
+        assert len(set(verdicts.values())) == 1, (
+            f"the interval changed the verdict: {verdicts}. The gate is documented as punctuality-"
+            "only precisely because it cannot see the block rate."
+        )
+
+    def test_it_refuses_a_LATE_covenant_confirmation(self) -> None:
+        """The property it really has: confirm past the time the sizing assumed and it refuses."""
+        assert not self._verdict(229.0, lock_delay=3_600, wait=7_200)
+
+    def test_it_accepts_a_PUNCTUAL_covenant_confirmation(self) -> None:
+        """Paired honest path — the gate must not refuse a covenant that confirms on time."""
+        assert self._verdict(229.0, lock_delay=3_600, wait=300)
