@@ -86,9 +86,21 @@ class FileFundLock:
 
     ``flock`` is the right primitive here and a lease is not: the kernel releases it when the
     holding process dies, so a crashed funder cannot deadlock the swap it was funding — which is
-    exactly the situation a resume exists to recover from. It is advisory and host-local; a swap
-    driven from two machines against one shared record needs a different lock, and this class
-    cannot detect that case, so do not use it across hosts.
+    exactly the situation a resume exists to recover from.
+
+    **SCOPE — read before wiring this anywhere.** It is advisory and HOST-LOCAL. Two processes on
+    one host, sharing one path, are excluded. Nothing else is: two hosts get two independent lock
+    files, an operator who copies the keys directory gets a third, and ``flock`` over NFS is
+    unreliable and silently local on many configurations. This class **cannot detect** any of those
+    — it will grant the lock and report success.
+
+    So a deployment where funding can be driven from more than one host must NOT pass this and
+    pretend it is covered. Pass nothing instead: the coordinator refuses to resume without a lock,
+    which is the honest outcome. `scripts/eth_swap_two_host.py` does exactly that.
+
+    The path is derived from the caller's key path, NOT from the hashlock, so two swaps sharing a
+    funding key share a lock — conservative (over-exclusion) rather than unsafe, but it means this
+    is not a per-swap lock and should not be described as one.
     """
 
     def __init__(self, path: str | Path) -> None:

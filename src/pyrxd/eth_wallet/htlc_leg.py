@@ -402,21 +402,34 @@ class EthHtlcContractLeg:
             raise ValidationError("hashlock must be 32 bytes")
         if amount_wei <= 0:
             raise ValidationError("amount_wei must be > 0")
-        if resume_from is not None:
-            # ACCEPTED so the adapter can forward it unconditionally, and REFUSED because this leg
-            # cannot honour it. Funding here is a single payable constructor: the ETH is in the
-            # contract the instant the deploy confirms, so there is no half-finished fund to
-            # complete. Ignoring the argument and deploying anyway would put a SECOND full amount
-            # of ETH into a SECOND contract while the first still holds the original — the exact
-            # double-fund the token leg's resume exists to prevent.
-            raise ValidationError(
-                f"the native ETH leg cannot resume: its funding is one payable constructor, so the "
-                f"contract at {getattr(resume_from, 'address', resume_from)} either holds the "
-                "value already or never will. Verify it on chain and refund after the timeout; "
-                "deploying again would fund a second contract."
-            )
         web3 = _require_web3()
         await self._rpc.assert_chain()
+        if resume_from is not None:
+            # RESUME, not refuse. Funding here is a single payable constructor, so the ETH is in
+            # the contract the instant the deploy confirms and there is no push to complete — but
+            # that is a reason to RE-VERIFY and hand back the locator, not to fail. Refusing made a
+            # native fund unrecoverable: a transient error after the deploy leaves a pending handle
+            # on the record, every retry takes the resume branch, and the leg rejected it forever
+            # while H was already consumed and the ETH sat in the contract.
+            #
+            # Deploying again is the one thing that must not happen — it would put a SECOND full
+            # amount into a SECOND contract while the first still holds the original — so this
+            # path never reaches the constructor below.
+            locator = EthHtlcLocator(
+                chain_id=self._chain_id,
+                contract_address=web3.Web3.to_checksum_address(resume_from.address),
+                deploy_tx_hash=resume_from.deploy_tx_hash,
+                hashlock="0x" + bytes(hashlock).hex(),
+                claimant=web3.Web3.to_checksum_address(claimant),
+                refundee=web3.Web3.to_checksum_address(refundee),
+                timeout=int(timeout),
+                amount_wei=int(amount_wei),
+            )
+            # Full binding INCLUDING the balance: unlike the token leg there is no half-funded
+            # state to tolerate, so a contract that does not already hold the amount is not this
+            # swap's funded HTLC and must not be reported as one.
+            await self.verify_funded(locator, expected_amount_wei=int(amount_wei))
+            return locator
         c = self._rpc.w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])
         # constructor(bytes32 _hashlock, address _claimant, address _refundee, uint256 _timeout)
         ctor = c.constructor(

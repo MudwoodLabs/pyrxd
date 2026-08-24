@@ -84,7 +84,7 @@ from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
-from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
+from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.seen_store import DurableSeenStore
 from pyrxd.gravity.swap_coordinator import (
     CoordinatorConfig,
@@ -755,7 +755,14 @@ def _coordinator(args, *, terms, eth_leg, rxd_leg, keys_out, record=None):
             margin_policy=_margin_policy(args),
             accept_estimated_eth_margins=True,
             role=role,
-            fund_lock=FileFundLock(str(Path(keys_out).expanduser())),
+            # NO fund_lock, deliberately. `FileFundLock` is `flock` — advisory and HOST-LOCAL —
+            # and this runner exists to split a swap across two operators on two hosts. Two hosts
+            # get two independent lock files, so it would provide zero exclusion in exactly the
+            # deployment it appears to protect: a guard that is not one. Without it the coordinator
+            # REFUSES to resume an interrupted fund here, which is the honest outcome — cross-host
+            # resume is unshipped. Fresh funding is unaffected: its exclusion comes from the atomic
+            # `reserve(H)`, which is durable and stronger. Same-host resume is refused too; that is
+            # a deliberate over-restriction rather than a lock that lies about its scope.
         ),
     )
 

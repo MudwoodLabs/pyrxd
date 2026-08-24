@@ -41,7 +41,7 @@ _USDC = token_for("USDC", 1)
 _FUND_TIMEOUT = int(time.time()) + 86_400
 
 
-def _leg(*, push_fails: bool = False, order: list, initial_held: int = 0):
+def _leg(*, push_fails: bool = False, order: list, initial_held: int = 0, inflight: int = 0):
     """A token leg whose deploy always succeeds; the push may fail.
 
     `initial_held` is what the HTLC already holds — 0 for a fresh deploy, non-zero to model a
@@ -103,7 +103,7 @@ def _leg(*, push_fails: bool = False, order: list, initial_held: int = 0):
             return {"maxPriorityFeePerGas": 1, "maxFeePerGas": 3}
 
         async def get_transaction_count(self, _a, block="pending"):
-            return 0
+            return inflight if block == "pending" else 0
 
         async def wait_receipt(self, tx_hash, **_k):
             if tx_hash == "0xdeploy":
@@ -471,3 +471,173 @@ class TestAResumeRefusesWhileAPushIsStillInFlight:
         leg = _real_verify_leg(on_chain={}, held=0, order=order, inflight=0)
         assert _fund(leg, None, resume_from=_PENDING) is not None
         assert order == ["tokens-pushed"]
+
+
+# ---------------------------------------------------------------------------
+# The NATIVE leg's resume. Round 6 made it refuse `resume_from`; round 7 found that turned a
+# transient post-deploy error into an unrecoverable swap — the record keeps a pending handle, every
+# retry takes the resume branch, and the leg rejected it forever while H was spent and the ETH sat
+# in the contract. It now re-verifies and returns the locator. NOTHING drove the real method with a
+# non-None `resume_from` before this, so both the old refusal and the new behaviour were untested.
+# ---------------------------------------------------------------------------
+
+_NATIVE_ART = json.loads((pathlib.Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
+_NATIVE_WEI = 10**15
+
+
+def _native_leg(*, on_chain: dict, balance: int, deployed: list):
+    from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
+
+    imm = {
+        "hashlock": b"\x33" * 32,
+        "claimant": _CLAIMANT,
+        "refundee": _REFUNDEE,
+        "timeout": _FUND_TIMEOUT,
+        **on_chain,
+    }
+
+    class _Call:
+        def __init__(self, v):
+            self._v = v
+
+        async def call(self, *a, **k):
+            return self._v
+
+    class _Fns:
+        def hashlock(self, *a, **k):
+            return _Call(imm["hashlock"])
+
+        def claimant(self, *a, **k):
+            return _Call(imm["claimant"])
+
+        def refundee(self, *a, **k):
+            return _Call(imm["refundee"])
+
+        def timeout(self, *a, **k):
+            return _Call(imm["timeout"])
+
+    class _Contract:
+        functions = _Fns()
+
+    class _Eth:
+        def contract(self, *a, **k):
+            return _Contract()
+
+    class _W3:
+        eth = _Eth()
+
+    class _Rpc:
+        w3 = _W3()
+
+        async def assert_chain(self):
+            return None
+
+        async def get_code(self, address, *a, **k):
+            if str(address).lower() == _DEPLOYED.lower():
+                return bytes.fromhex(_NATIVE_ART["runtime_bytecode"].removeprefix("0x"))
+            return b""
+
+        async def get_balance(self, *a, **k):
+            return balance
+
+    leg = EthHtlcContractLeg(
+        rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_NATIVE_ART
+    )
+
+    async def _sign_and_send(*a, **k):
+        deployed.append("DEPLOYED")
+        return "0x" + "ee" * 32
+
+    leg._sign_and_send = _sign_and_send
+    return leg
+
+
+def _native_fund(leg, resume_from):
+    return asyncio.run(
+        leg.fund(
+            hashlock=b"\x33" * 32,
+            claimant=_CLAIMANT,
+            refundee=_REFUNDEE,
+            timeout=_FUND_TIMEOUT,
+            amount_wei=_NATIVE_WEI,
+            resume_from=resume_from,
+        )
+    )
+
+
+class TestTheNativeLegResumesInsteadOfRedeploying:
+    def test_a_resume_returns_the_EXISTING_contract_and_deploys_NOTHING(self) -> None:
+        """Deploying again is the one thing that must not happen: the payable constructor would put
+        a SECOND full amount of ETH into a SECOND contract while the first still holds the original."""
+        deployed: list = []
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=deployed)
+        loc = _native_fund(leg, _PENDING)
+        assert deployed == [], "the native leg redeployed on a resume — a second full amount of ETH"
+        assert loc.contract_address.lower() == _DEPLOYED.lower()
+        assert loc.amount_wei == _NATIVE_WEI
+
+    def test_a_resume_REFUSES_a_contract_that_is_not_this_swap(self) -> None:
+        leg = _native_leg(on_chain={"hashlock": b"\x99" * 32}, balance=_NATIVE_WEI, deployed=[])
+        with pytest.raises(ValidationError):
+            _native_fund(leg, _PENDING)
+
+    def test_a_resume_REFUSES_a_contract_that_does_not_HOLD_the_value(self) -> None:
+        """Unlike the token leg there is no half-funded state to tolerate: the constructor is
+        payable, so a contract short of the amount is not this swap's funded HTLC and must not be
+        reported as one."""
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI - 1, deployed=[])
+        with pytest.raises(ValidationError):
+            _native_fund(leg, _PENDING)
+
+    def test_a_FRESH_native_fund_does_NOT_take_the_resume_branch(self) -> None:
+        """The resume must fire only when a handle is passed. If it leaked into the fresh path it
+        would report a locator for a contract this call never deployed — and the whole point of the
+        branch is that it returns WITHOUT deploying. Asserting the fresh call cannot produce a
+        locator here is what pins that separation; the fake deliberately has no deploy machinery,
+        so reaching the constructor is observable as a failure rather than a silent success."""
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=[])
+        with pytest.raises(Exception) as ei:
+            _native_fund(leg, None)
+        assert not isinstance(ei.value, ValidationError) or "hashlock" not in str(ei.value), (
+            "a fresh fund reached the resume path's verification instead of deploying"
+        )
+
+
+class TestTheInFlightGuardDoesNotBlockAFreshFund:
+    """The guard belongs to the resume and only to it.
+
+    On a fresh deploy the HTLC address was created by the transaction that just confirmed, so no
+    transfer to it can possibly be pending — the hazard is structurally impossible. Applying the
+    guard there would abort a legitimate fund AFTER the deploy had spent gas and consumed the
+    hashlock reservation, merely because the same key had some unrelated transaction in flight (a
+    fee bump, a second swap, an approval). A guard that refuses honest work is a defect, and this
+    one did until round 7.
+    """
+
+    def test_a_fresh_fund_proceeds_with_unrelated_transactions_pending(self) -> None:
+        order: list = []
+        leg = _leg(order=order, inflight=3)
+        loc = _fund(leg, None)
+        assert order == ["tokens-pushed"], f"a fresh fund was blocked by unrelated pending txs: {order}"
+        assert loc.contract_address.lower() == _DEPLOYED.lower()
+
+    def test_a_RESUME_is_still_blocked_by_the_same_pending_transactions(self) -> None:
+        """The pairing: identical mempool state, opposite verdict, because only the resume can be
+        misled by it."""
+        order: list = []
+        leg = _real_verify_leg(on_chain={}, held=0, order=order, inflight=3)
+        with pytest.raises(NetworkError, match="still in flight"):
+            _fund(leg, None, resume_from=_PENDING)
+        assert order == []
+
+    def test_a_resume_with_NOTHING_LEFT_TO_SEND_is_not_blocked_by_pending_txs(self) -> None:
+        """The push whose receipt was lost has MINED — the HTLC already holds the full amount, so
+        there is no second transfer to send and no way to double-fund. Refusing here stranded a
+        taker whose fund actually completed: its USDC is claimable with `p` while its own
+        coordinator would not acknowledge the fund, and a stuck transaction on that key keeps
+        `pending != latest` indefinitely."""
+        order: list = []
+        leg = _real_verify_leg(on_chain={}, held=_AMOUNT, order=order, inflight=3)
+        loc = _fund(leg, None, resume_from=_PENDING)
+        assert order == [], "a fully funded HTLC was topped up again"
+        assert loc.amount_wei == _AMOUNT

@@ -163,6 +163,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 on_deploy=on_deploy,
             )
         return await self._push_and_bind(
+            resuming=resume_from is not None,
             web3=web3,
             address=address,
             deploy_hash=deploy_hash,
@@ -201,7 +202,9 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             await on_deploy(address, deploy_hash)
         return address, deploy_hash
 
-    async def _push_and_bind(self, *, web3, address, deploy_hash, hashlock, claimant, refundee, timeout, amount_wei):
+    async def _push_and_bind(
+        self, *, resuming, web3, address, deploy_hash, hashlock, claimant, refundee, timeout, amount_wei
+    ):
         """Top the HTLC up to the promised amount and return its locator."""
         checksum = web3.Web3.to_checksum_address
         # READ FIRST. What is already there decides what to send: on a fresh deploy this is 0 and
@@ -216,17 +219,31 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # the whole balance to the counterparty. "Reading the chain collapses the two cases into
         # one" was true only for a push that had already mined. If this sender has anything in
         # flight, the balance is not yet a fact and nothing may be sent against it.
+        shortfall = int(amount_wei) - int(held)
+        # RESUME ONLY, and only when something is actually about to be SENT. Two scopings, each
+        # closing a way this refused honest work:
+        #
+        # * On a fresh deploy the address was created by the transaction that just confirmed, so no
+        #   transfer to it can be in flight — the hazard is structurally impossible, and refusing
+        #   would abort a legitimate fund AFTER the deploy had spent gas and consumed H.
+        # * When the shortfall is already zero the push whose receipt was lost has MINED and there
+        #   is nothing left to send. Refusing there strands a taker whose fund actually completed:
+        #   its USDC is claimable with `p` while its own coordinator will not acknowledge the fund,
+        #   and a stuck transaction on that key keeps `pending != latest` indefinitely.
+        #
+        # The rationale — "sending against this reading could fund the HTLC twice" — only bites
+        # when something is being sent.
         sender = self._account_address()
-        pending_nonce = await self._rpc.get_transaction_count(sender, "pending")
-        latest_nonce = await self._rpc.get_transaction_count(sender, "latest")
-        if pending_nonce != latest_nonce:
+        _check_inflight = resuming and shortfall > 0
+        pending_nonce = await self._rpc.get_transaction_count(sender, "pending") if _check_inflight else 0
+        latest_nonce = await self._rpc.get_transaction_count(sender, "latest") if _check_inflight else 0
+        if resuming and shortfall > 0 and pending_nonce != latest_nonce:
             raise NetworkError(
                 f"{pending_nonce - latest_nonce} transaction(s) from {sender} are still in flight "
                 f"(nonce pending={pending_nonce}, latest={latest_nonce}), so the HTLC balance "
                 f"{held} is not settled. One of them may be the token push for this very swap; "
                 "sending against this reading could fund the HTLC twice. Wait for them to mine."
             )
-        shortfall = int(amount_wei) - int(held)
         if shortfall > 0:
             # --- push the tokens in. No approve, no transferFrom. ---
             token_c = self._rpc.w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)
