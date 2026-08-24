@@ -74,6 +74,15 @@ class _FakeRpc:
 
         self.w3 = _W3()
 
+    async def wait_receipt(self, tx_hash, **_k):
+        # `claim` CONFIRMS before reporting success (status == 1 + a Claimed(p) log from this
+        # swap's own contract), so a routing test must serve a receipt or the honest path fails.
+        # Routing is still what is under test: both paths reach here identically.
+        return {
+            "status": 1,
+            "logs": [{"address": "0x" + "11" * 20, "topics": [], "data": "0x" + (b"\x01" * 32).hex()}],
+        }
+
     async def assert_chain(self):
         return None
 

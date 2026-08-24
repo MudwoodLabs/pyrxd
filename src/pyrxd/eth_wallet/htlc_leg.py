@@ -34,7 +34,7 @@ from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.gravity.counter_chain_leg import CounterChainLeg
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
-from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
+from pyrxd.security.errors import ClaimNotConfirmed, NetworkError, PreRevealAbort, ValidationError
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 __all__ = ["EthHtlcContractLeg", "load_artifact"]
@@ -446,7 +446,31 @@ class EthHtlcContractLeg:
         # calldata, and on the private path the submit does. Failures beyond this line are NOT
         # PreRevealAbort — the caller must assume p is public.
         preflight = self._private_submitter is None
-        return await self._sign_and_send(built, preflight=preflight, private=True)
+        tx_hash = await self._sign_and_send(built, preflight=preflight, private=True)
+        # CONFIRM, don't assume. `send_raw` and `submit_raw` both return on SUBMISSION — no receipt,
+        # no status — so returning here reported success for a transaction that may have reverted.
+        # Every revert cause still applies after the deadline guard above: a fee spike, a reorg, an
+        # unexpected revert, a gas underestimate. And a reverted claim is still MINED with `p` in
+        # its calldata, so the failure mode is the worst one available: the secret is public, the
+        # counterparty can take the other leg, this side collected nothing, and the caller's state
+        # machine recorded success. `private_submit` already documented that the caller "MUST drive
+        # maker-side confirmation" — nothing did.
+        #
+        # Reuses the same provenance check the TAKER runs against the maker's claim: status == 1
+        # AND a Claimed(p) log emitted by this swap's own contract.
+        try:
+            await self.assert_claim_provenance(
+                tx_hash, contract_address=locator.contract_address, preimage=bytes(preimage)
+            )
+        except Exception as exc:
+            raise ClaimNotConfirmed(
+                f"claim {tx_hash} was broadcast but could not be confirmed as successful: {exc}. "
+                "The preimage is PUBLIC — a reverted claim is still mined with p in its calldata — "
+                "so treat the counterparty as able to take the other leg. Do NOT record this swap "
+                "as claimed. Investigate this tx hash before deciding whether to retry or refund.",
+                tx_hash=tx_hash,
+            ) from exc
+        return tx_hash
 
     async def refund(self, locator: EthHtlcLocator) -> str:
         """Taker: call refund() after timeout; returns the tx hash. Taker-unilateral

@@ -28,6 +28,7 @@ from typing import Any
 
 __all__ = [
     "Base58Error",
+    "ClaimNotConfirmed",
     "ConfirmationTimeoutError",
     "ContractExhaustedError",
     "CovenantError",
@@ -336,6 +337,29 @@ class InsufficientFundsError(ValidationError):
 
 class SpvVerificationError(RxdSdkError):
     """Raised when an SPV proof (Merkle path, header chain) fails to verify."""
+
+
+class ClaimNotConfirmed(RxdSdkError):
+    """A claim was broadcast but could NOT be confirmed to have succeeded on chain.
+
+    The exact inverse of :class:`PreRevealAbort`: this one is raised only AFTER the transaction
+    left the process, so the preimage must be assumed **public**. It covers three outcomes that a
+    bare "submitted" return could not distinguish from success:
+
+    * the tx mined and REVERTED (``status != 1``) — expired, underfunded, already settled, frozen,
+      out of gas. A reverted claim is still mined WITH ``p`` in its calldata, so the counterparty
+      can take the other leg while this side received nothing.
+    * the tx mined but emitted no ``Claimed(p)`` log from this swap's own contract.
+    * no receipt arrived before the deadline — the outcome is simply unknown.
+
+    ``tx_hash`` is carried as an attribute because it is the only handle an operator has on a claim
+    that may be public but did not pay: without it there is nothing to investigate. The swap must
+    NOT be advanced to a revealed/completed state on this exception.
+    """
+
+    def __init__(self, message: str, *, tx_hash: str | None = None) -> None:
+        super().__init__(message)
+        self.tx_hash = tx_hash
 
 
 class PreRevealAbort(RxdSdkError):
