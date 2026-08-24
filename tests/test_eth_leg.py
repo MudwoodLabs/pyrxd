@@ -135,19 +135,62 @@ async def test_fund_derives_kwargs_and_runs_verify(monkeypatch):
 
     out = await leg.fund(_Terms(h, 10**15))
     assert out is loc
-    assert calls["fund"] == {
+    kw = calls["fund"]
+    assert {k: kw[k] for k in ("hashlock", "claimant", "refundee", "timeout", "amount_wei")} == {
         "hashlock": h,
         "claimant": _MAKER,
         "refundee": _TAKER,
         "timeout": _TIMEOUT,
         "amount_wei": 10**15,
-        # Forwarded even when None: the adapter must not silently swallow the hooks the
-        # coordinator uses to make a deployed address durable before value moves into it, or to
-        # resume an interrupted fund instead of deploying a second contract.
-        "on_deploy": None,
-        "resume_from": None,
     }
+    # The adapter WRAPS on_deploy (to stash the address before the caller's persist can fail), so
+    # it is a callable here rather than the None that was passed in. Asserting the literal dict
+    # only ever proved the defaults propagate — a regression hardcoding `on_deploy=None` in the
+    # forward would have passed unchanged, dropping the coordinator's hook silently.
+    assert callable(kw["on_deploy"])
     assert calls["verify"] == (loc, 10**15)  # post-deploy binding gate ran
+
+
+async def test_fund_forwards_the_REAL_hooks_not_just_their_defaults(monkeypatch):
+    """The gap the round-7 test audit named: nothing checked that a real `resume_from`, `push_nonce`
+    or `on_deploy` actually REACHES the inner leg. A forward that hardcoded the defaults would have
+    passed every existing assertion while silently discarding the coordinator's hooks — which is
+    how the durable handle and the nonce pin both become inert."""
+    from pyrxd.eth_wallet.locator import PendingDeploy
+
+    cl = _contract_leg()
+    loc = _locator(10**15)
+    calls = {}
+    seen: list = []
+
+    async def fake_fund(**kw):
+        calls["fund"] = kw
+        if kw.get("on_deploy") is not None:
+            await kw["on_deploy"]("0x" + "77" * 20, "0x" + "de" * 32)
+        return loc
+
+    async def fake_verify(locator, *, expected_amount_wei, block_identifier=None):
+        return None
+
+    monkeypatch.setattr(cl, "fund", fake_fund)
+    monkeypatch.setattr(cl, "verify_funded", fake_verify)
+    leg = _eth_leg(cl)
+    h = hashlib.sha256(os.urandom(32)).digest()
+    pending = PendingDeploy(address="0x" + "77" * 20, deploy_tx_hash="0x" + "de" * 32)
+
+    async def _hook(addr: str, tx: str) -> None:
+        seen.append((addr, tx))
+
+    await leg.fund(_Terms(h, 10**15), on_deploy=_hook, resume_from=pending, push_nonce=41)
+
+    assert calls["fund"]["resume_from"] is pending, "the resume handle never reached the leg"
+    assert calls["fund"]["push_nonce"] == 41, "the nonce pin never reached the leg"
+    assert seen == [("0x" + "77" * 20, "0x" + "de" * 32)], (
+        "the caller's on_deploy hook was not invoked through the adapter's wrapper"
+    )
+    assert leg.last_deployed_address == "0x" + "77" * 20, (
+        "the adapter did not stash the address before running the caller's persist"
+    )
 
 
 def test_expected_locator_built_from_own_config():

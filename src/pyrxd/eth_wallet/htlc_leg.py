@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -110,6 +111,8 @@ class _ClaimTooLate(Exception):
 #: a precise deadline: the contract remains the source of truth. Deliberately generous, because the
 #: cost of refusing a claim that WOULD have made it is one retry, while the cost of broadcasting one
 #: that does not is the preimage published for nothing.
+_LOG = logging.getLogger(__name__)
+
 CLAIM_INCLUSION_BUDGET_S: int = 96
 
 #: Seconds per L1 block, used ONLY to convert the budget above into a fee multiplier.
@@ -459,7 +462,22 @@ class EthHtlcContractLeg:
         # frame. `refund()` recovers it after the timeout, but only for an operator who knows where
         # to point it. See `Erc20HtlcLeg.fund`, where the same hazard spans two transactions.
         if on_deploy is not None:
-            await on_deploy(web3.Web3.to_checksum_address(addr), tx_hash)
+            try:
+                await on_deploy(web3.Web3.to_checksum_address(addr), tx_hash)
+            except Exception as exc:
+                # LOG AND CONTINUE, unlike the token leg. Here the value moved as part of the deploy
+                # itself — the constructor is payable — so aborting cannot un-move it and only
+                # discards the address. The token leg aborts because nothing has moved yet there and
+                # stopping genuinely prevents untracked value; the same rule inverted here made a
+                # persist failure destroy a fund that would otherwise have completed.
+                _LOG.error(
+                    "could not persist the deployed HTLC address %s (tx %s): %s. The ETH is ALREADY "
+                    "in that contract — record this address by hand; refund() pays the refundee "
+                    "after the timeout.",
+                    addr,
+                    tx_hash,
+                    exc,
+                )
         return EthHtlcLocator(
             chain_id=self._chain_id,
             contract_address=web3.Web3.to_checksum_address(addr),

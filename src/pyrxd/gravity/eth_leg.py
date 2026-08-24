@@ -161,8 +161,20 @@ class EthLeg:
                 f"{leg_token.address if leg_token else 'native ETH'} but the terms name "
                 f"{terms_token or 'native ETH'}"
             )
+        # Record the address the INSTANT the leg reports it, before the caller's hook runs. The
+        # hook persists, and a persist failure (ENOSPC, read-only mount) raises out of `fund` — so
+        # a stash set only after `fund` RETURNS is exactly the one a persist failure destroys,
+        # leaving the address in an exception string. Making the persist mandatory turned that from
+        # theoretical into reachable, which is a regression this restores.
+        self.last_deployed_address: str | None = None
+
+        async def _stash_then_persist(address: str, deploy_tx_hash: str) -> None:
+            self.last_deployed_address = address
+            if on_deploy is not None:
+                await on_deploy(address, deploy_tx_hash)
+
         locator = await self._leg.fund(
-            on_deploy=on_deploy,
+            on_deploy=_stash_then_persist,
             resume_from=resume_from,
             **(
                 {}

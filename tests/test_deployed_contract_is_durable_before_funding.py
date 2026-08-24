@@ -519,8 +519,15 @@ def _native_leg(*, on_chain: dict, balance: int, deployed: list):
         def timeout(self, *a, **k):
             return _Call(imm["timeout"])
 
+    class _Ctor:
+        async def build_transaction(self, tx):
+            return dict(tx)
+
     class _Contract:
         functions = _Fns()
+
+        def constructor(self, *a, **k):
+            return _Ctor()
 
     class _Eth:
         def contract(self, *a, **k):
@@ -542,6 +549,17 @@ def _native_leg(*, on_chain: dict, balance: int, deployed: list):
 
         async def get_balance(self, *a, **k):
             return balance
+
+        async def fee_fields(self):
+            return {"maxPriorityFeePerGas": 1, "maxFeePerGas": 3}
+
+        async def get_transaction_count(self, _a, block="pending"):
+            return 0
+
+        async def wait_receipt(self, *a, **k):
+            # The deploy confirms and the payable constructor now HOLDS the ETH — which is the
+            # whole reason a persist failure after this point must not discard the fund.
+            return {"status": 1, "contractAddress": _DEPLOYED, "logs": []}
 
     leg = EthHtlcContractLeg(
         rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_NATIVE_ART
@@ -592,18 +610,15 @@ class TestTheNativeLegResumesInsteadOfRedeploying:
         with pytest.raises(ValidationError):
             _native_fund(leg, _PENDING)
 
-    def test_a_FRESH_native_fund_does_NOT_take_the_resume_branch(self) -> None:
+    def test_a_FRESH_native_fund_DEPLOYS_rather_than_taking_the_resume_branch(self) -> None:
         """The resume must fire only when a handle is passed. If it leaked into the fresh path it
-        would report a locator for a contract this call never deployed — and the whole point of the
-        branch is that it returns WITHOUT deploying. Asserting the fresh call cannot produce a
-        locator here is what pins that separation; the fake deliberately has no deploy machinery,
-        so reaching the constructor is observable as a failure rather than a silent success."""
-        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=[])
-        with pytest.raises(Exception) as ei:
-            _native_fund(leg, None)
-        assert not isinstance(ei.value, ValidationError) or "hashlock" not in str(ei.value), (
-            "a fresh fund reached the resume path's verification instead of deploying"
-        )
+        would report a locator for a contract this call never deployed — the branch's whole purpose
+        is to return WITHOUT deploying, which is precisely wrong when there is nothing to resume."""
+        deployed: list = []
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=deployed)
+        loc = _native_fund(leg, None)
+        assert deployed == ["DEPLOYED"], "a fresh fund returned a locator without deploying anything"
+        assert loc.contract_address.lower() == _DEPLOYED.lower()
 
 
 class TestTheInFlightGuardDoesNotBlockAFreshFund:
@@ -723,3 +738,50 @@ class TestThePushNonceIsPinnedAndReused:
                 )
             )
         assert order == [], "value was sent against a pin that another transaction had consumed"
+
+
+class TestAPersistFailureDoesNotDiscardACommittedNativeFund:
+    """Making the persist hook mandatory created a regression on the NATIVE leg.
+
+    Its constructor is payable, so the ETH is in the contract the instant the deploy confirms.
+    Aborting on a persist failure cannot un-move it — it only discards the address, leaving it in an
+    exception string. The rule "if the caller cannot persist it, we must not push" is right for the
+    TOKEN leg, where nothing has moved yet and stopping genuinely prevents untracked value, and
+    inverted here.
+    """
+
+    def test_the_native_fund_survives_a_failing_persist_hook(self) -> None:
+        deployed: list = []
+        leg = _native_leg(on_chain={}, balance=_NATIVE_WEI, deployed=deployed)
+
+        async def _broken(_addr: str, _tx: str) -> None:
+            raise NetworkError("read-only filesystem")
+
+        # The DEPLOY path — the resume path never calls on_deploy at all, so testing through it
+        # would prove nothing about this fix.
+        loc = asyncio.run(
+            leg.fund(
+                hashlock=b"\x33" * 32,
+                claimant=_CLAIMANT,
+                refundee=_REFUNDEE,
+                timeout=_FUND_TIMEOUT,
+                amount_wei=_NATIVE_WEI,
+                on_deploy=_broken,
+            )
+        )
+        assert deployed == ["DEPLOYED"], "the deploy never happened, so the hook was never reached"
+        assert loc.contract_address.lower() == _DEPLOYED.lower(), (
+            "a persist failure discarded a fund whose ETH is already in the contract"
+        )
+
+    def test_the_TOKEN_leg_still_refuses_to_push_when_it_cannot_persist(self) -> None:
+        """The pairing. Narrowing the native rule must not disarm the token one, where the abort is
+        the only thing preventing value from moving into a contract nothing references."""
+        order: list = []
+
+        async def _broken(_addr: str, _tx: str) -> None:
+            raise NetworkError("read-only filesystem")
+
+        with pytest.raises(NetworkError, match="read-only filesystem"):
+            _fund(_leg(order=order), _broken)
+        assert "tokens-pushed" not in order
