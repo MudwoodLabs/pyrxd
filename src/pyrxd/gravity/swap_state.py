@@ -22,6 +22,7 @@ Design rules (house style)
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from enum import Enum
 
@@ -468,6 +469,17 @@ class SwapRecord:
     counterchain_locator: BtcHtlcLocator | EthHtlcLocator | None = None
     radiant_covenant_outpoint: str | None = None
     radiant_covenant_spk_hex: str | None = None
+    #: An ETH-side HTLC that has been DEPLOYED for this swap but is not yet an accepted funded
+    #: locator. It exists because a BTC funding address is derivable from terms before any
+    #: broadcast, while a CREATE address depends on the deployer's nonce and appears nowhere until
+    #: the deploy receipt returns. Persisting it is what makes the ERC-20 path's TWO-transaction
+    #: fund recoverable: deploy lands, the process dies before the token push or before the
+    #: locator is returned, and without this the only reference to a contract that may hold real
+    #: USDC is an exception string. `refund()` after the timeout can always recover the value —
+    #: but only if the operator still knows the address, and reconstructing a CREATE address by
+    #: hand is not a recovery procedure. Also covers the native leg, whose payable constructor is
+    #: one transaction but which can still die between the deploy receipt and `verify_funded`.
+    pending_counter_contract: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -507,6 +519,14 @@ class SwapRecord:
                     f"terms name token {self.terms.token_address} but the locator is a NATIVE "
                     "EthHtlcLocator; its amount would be persisted as wei"
                 )
+        if self.pending_counter_contract is not None:
+            check_hex_addr("pending_counter_contract", self.pending_counter_contract)
+            if self.terms.counter_chain != "eth":
+                raise ValidationError(
+                    "pending_counter_contract is an ETH-side handle; it is meaningless on "
+                    f"counter_chain {self.terms.counter_chain!r}"
+                )
+            object.__setattr__(self, "pending_counter_contract", self.pending_counter_contract.lower())
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -524,39 +544,33 @@ class SwapRecord:
         until they migrate to the chain-neutral ``counterchain_locator``."""
         return self.counterchain_locator if isinstance(self.counterchain_locator, BtcHtlcLocator) else None
 
+    # These use `dataclasses.replace` rather than re-listing every field. Re-listing means a field
+    # added later is SILENTLY DROPPED by each copy that predates it, with nothing to catch it —
+    # which is exactly what happened when `pending_counter_contract` was added: three constructors
+    # quietly discarded the durable handle to a contract that may hold value. `replace` carries
+    # forward whatever exists, so only DELIBERATE clearing needs to be written down.
+
     def with_state(self, state: SwapState) -> SwapRecord:
         """Return a copy advanced to ``state`` (transition not re-validated here;
         the coordinator validates via :func:`advance` before persisting)."""
-        return SwapRecord(
-            state=state,
-            terms=self.terms,
-            counterchain_locator=self.counterchain_locator,
-            radiant_covenant_outpoint=self.radiant_covenant_outpoint,
-            radiant_covenant_spk_hex=self.radiant_covenant_spk_hex,
-        )
+        return dataclasses.replace(self, state=state)
 
     def with_counter_lock(self, locator: BtcHtlcLocator | EthHtlcLocator) -> SwapRecord:
-        """Attach the funded counter-leg locator (BTC or ETH)."""
-        return SwapRecord(
-            state=self.state,
-            terms=self.terms,
-            counterchain_locator=locator,
-            radiant_covenant_outpoint=self.radiant_covenant_outpoint,
-            radiant_covenant_spk_hex=self.radiant_covenant_spk_hex,
-        )
+        """Attach the funded counter-leg locator (BTC or ETH).
+
+        Clears ``pending_counter_contract`` DELIBERATELY: that field exists to reference a contract
+        that may hold value but is not yet an accepted locator, and once the locator is attached it
+        carries the address itself. Leaving a stale "pending" handle behind would point recovery at
+        a swap that no longer needs it.
+        """
+        return dataclasses.replace(self, counterchain_locator=locator, pending_counter_contract=None)
 
     def with_btc_lock(self, locator: BtcHtlcLocator) -> SwapRecord:
         """Transitional alias for :meth:`with_counter_lock` (BTC reader sites)."""
         return self.with_counter_lock(locator)
 
     def with_radiant_lock(self, outpoint: str, spk_hex: str) -> SwapRecord:
-        return SwapRecord(
-            state=self.state,
-            terms=self.terms,
-            counterchain_locator=self.counterchain_locator,
-            radiant_covenant_outpoint=outpoint,
-            radiant_covenant_spk_hex=spk_hex,
-        )
+        return dataclasses.replace(self, radiant_covenant_outpoint=outpoint, radiant_covenant_spk_hex=spk_hex)
 
     def to_dict(self) -> dict:
         """JSON-serialisable form. The preimage ``p`` is NOT a field and is never written —
@@ -584,6 +598,10 @@ class SwapRecord:
         else:
             # BtcHtlcLocator or None → v1 wire form (byte-identical to the pre-ETH schema).
             d["btc_locator"] = loc.to_dict() if loc is not None else None
+        # Written ONLY when set, so a BTC record stays byte-identical to the v1 wire form and an
+        # ETH record that never had a pending deploy does not grow a null field either.
+        if self.pending_counter_contract:
+            d["pending_counter_contract"] = self.pending_counter_contract
         return d
 
     @classmethod
@@ -612,6 +630,7 @@ class SwapRecord:
             counterchain_locator=loc,
             radiant_covenant_outpoint=d.get("radiant_covenant_outpoint"),
             radiant_covenant_spk_hex=d.get("radiant_covenant_spk_hex"),
+            pending_counter_contract=d.get("pending_counter_contract"),
         )
 
 

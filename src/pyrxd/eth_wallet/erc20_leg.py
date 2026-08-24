@@ -18,6 +18,7 @@ balance, and it is the explicit amount bind that catches a wrong amount.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..security.errors import NetworkError, PreRevealAbort, ValidationError
@@ -69,7 +70,14 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         return self._token
 
     async def fund(
-        self, *, hashlock: bytes, claimant: str, refundee: str, timeout: int, amount_wei: int
+        self,
+        *,
+        hashlock: bytes,
+        claimant: str,
+        refundee: str,
+        timeout: int,
+        amount_wei: int,
+        on_deploy: Callable[[str], Awaitable[None]] | None = None,
     ) -> EthHtlcLocator:
         """Deploy the HTLC, push the tokens into it, and only then return a locator.
 
@@ -80,12 +88,17 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
 
         **Returning only after the tokens land is the contract, not an optimisation.** The ABC
         promises a funded locator, and the counterparty's ``verify_funded`` is what protects them.
-        A crash between the two transactions therefore never yields a locator: either the tokens
-        are still in the funder's wallet (crashed before the push) or they sit in an abandoned
-        contract recoverable by ``refund`` after the timeout (crashed after it). Neither strands
-        value, but the *resume* path — completing the push to the same address rather than
-        redeploying, and re-reading the balance before re-sending so a lost receipt cannot
-        double-fund — belongs to the coordinator and is not implemented here.
+        A crash between the two transactions never yields a locator: either the tokens are still
+        in the funder's wallet (crashed before the push) or they sit in an abandoned contract
+        recoverable by ``refund`` after the timeout (crashed after it).
+
+        ``refund`` can only recover the second case if the operator still KNOWS THE ADDRESS, and
+        a CREATE address depends on the deployer's nonce — it appears nowhere until this deploy
+        receipt returns. Saying the value is "recoverable" while its only reference was an
+        exception string was not true in any operational sense. ``on_deploy`` is awaited with the
+        deployed address after the deploy CONFIRMS and strictly BEFORE the token push, so the
+        caller can make it durable first; the coordinator passes a hook that writes it to the
+        swap record. A caller that passes nothing keeps the old behaviour.
         """
         if not isinstance(hashlock, (bytes, bytearray)) or len(hashlock) != 32:
             raise ValidationError("hashlock must be 32 bytes")
@@ -116,6 +129,12 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         if int(receipt.get("status", 0)) != 1:
             raise NetworkError(f"Erc20Htlc deploy reverted (status != 1): {deploy_hash}")
         address = checksum(receipt["contractAddress"])
+
+        # Make the address durable BEFORE the tokens move. This is the only ordering that helps:
+        # after the push, a crash leaves real value in a contract whose address was never written
+        # down. Awaited, not fire-and-forget — if the caller cannot persist it, we must not push.
+        if on_deploy is not None:
+            await on_deploy(address)
 
         # --- second transaction: push the tokens in. No approve, no transferFrom. ---
         token_c = self._rpc.w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)

@@ -32,6 +32,7 @@ Design rules (house style)
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import functools
 import hashlib
 import logging
@@ -1431,7 +1432,20 @@ class SwapCoordinator:
         if not reserved:
             raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
 
-        locator = await self.counter_leg.fund(terms)
+        # An ETH-side contract address is not derivable from terms — it depends on the deployer's
+        # nonce — so unlike the BTC path there is nothing to persist BEFORE the broadcast. The next
+        # best thing is to persist it the instant the deploy confirms and, for the token leg,
+        # strictly before the tokens are pushed into it. Without this the intent record above knows
+        # the swap exists but not WHERE its value went, and a crash mid-fund leaves real value in a
+        # contract referenced only by an exception string.
+        async def _remember_deploy(address: str) -> None:
+            self.record = dataclasses.replace(self.record, pending_counter_contract=address)
+            await self._persist_record(self.record, shield=True)
+
+        if terms.counter_chain == "eth":
+            locator = await self.counter_leg.fund(terms, on_deploy=_remember_deploy)
+        else:
+            locator = await self.counter_leg.fund(terms)
         if not isinstance(locator, (BtcHtlcLocator, EthHtlcLocator)):
             raise ValidationError("counter_leg.fund must return a Btc/Eth HtlcLocator (full durable retained state)")
         # Bind the funded amount to the negotiated price. A P2TR scriptPubKey commits to

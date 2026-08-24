@@ -66,11 +66,23 @@ class CounterChainLeg(ABC):
     """
 
     @abstractmethod
-    async def fund(self, terms: Any) -> Any:
+    async def fund(self, terms: Any, *, on_deploy: Any = None) -> Any:
         """Lock the counter-chain value into a fresh HTLC; return its durable locator.
 
         MUST NOT return a locator until the funding is confirmed/irreversible enough that
         treating the leg as "locked" is safe (e.g. ETH waits for the deploy tx status==1).
+
+        ``on_deploy`` is an optional ``async (address: str) -> None`` the leg MUST await as soon as
+        it knows an on-chain location that may hold value but is not yet a returned locator — and,
+        where funding takes more than one transaction, strictly BEFORE the value moves. It exists
+        because chains differ in when that location becomes knowable: a BTC P2TR funding address is
+        derived from terms before anything is broadcast, so the caller can persist it up front,
+        while an ETH CREATE address depends on the deployer's nonce and does not exist until the
+        deploy receipt returns. A leg whose address IS pre-derivable may ignore this.
+
+        Legs that ignore it must still ACCEPT it. The caller passes it to close a real fund-loss
+        gap — value on chain that no durable record references — and a leg that rejects the
+        argument turns that into a crash at funding time.
         """
 
     @abstractmethod

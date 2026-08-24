@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from pyrxd.eth_wallet.locator import EthHtlcLocator
@@ -384,7 +385,14 @@ class EthHtlcContractLeg:
         }
 
     async def fund(
-        self, *, hashlock: bytes, claimant: str, refundee: str, timeout: int, amount_wei: int
+        self,
+        *,
+        hashlock: bytes,
+        claimant: str,
+        refundee: str,
+        timeout: int,
+        amount_wei: int,
+        on_deploy: Callable[[str], Awaitable[None]] | None = None,
     ) -> EthHtlcLocator:
         """Deploy + fund the HTLC (payable constructor). Returns the locator ONLY after
         the deploy tx confirms with status==1 (a reverted/dropped deploy never yields a
@@ -416,6 +424,13 @@ class EthHtlcContractLeg:
         if int(receipt.get("status", 0)) != 1:
             raise NetworkError(f"deploy tx reverted (status != 1): {tx_hash}")
         addr = receipt["contractAddress"]
+        # Report the deployed address so the caller can make it durable. The native constructor is
+        # payable, so value is already IN the contract at this point — a crash between here and the
+        # caller's `verify_funded` leaves real ETH in a contract whose address exists only in this
+        # frame. `refund()` recovers it after the timeout, but only for an operator who knows where
+        # to point it. See `Erc20HtlcLeg.fund`, where the same hazard spans two transactions.
+        if on_deploy is not None:
+            await on_deploy(web3.Web3.to_checksum_address(addr))
         return EthHtlcLocator(
             chain_id=self._chain_id,
             contract_address=web3.Web3.to_checksum_address(addr),

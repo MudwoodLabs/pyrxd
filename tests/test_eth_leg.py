@@ -141,6 +141,9 @@ async def test_fund_derives_kwargs_and_runs_verify(monkeypatch):
         "refundee": _TAKER,
         "timeout": _TIMEOUT,
         "amount_wei": 10**15,
+        # Forwarded even when None: the adapter must not silently swallow the hook the coordinator
+        # uses to make a deployed address durable before value moves into it.
+        "on_deploy": None,
     }
     assert calls["verify"] == (loc, 10**15)  # post-deploy binding gate ran
 

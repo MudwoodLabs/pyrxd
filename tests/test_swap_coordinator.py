@@ -1736,10 +1736,14 @@ class FakeEthLeg:
     def locked_amount(self, locator) -> int:
         return locator.amount_wei
 
-    async def fund(self, terms) -> EthHtlcLocator:
+    async def fund(self, terms, *, on_deploy=None) -> EthHtlcLocator:
         # Deploy+fund THEN verify (the ETH ordering the audit flagged): if verify_raises, the
         # contract is already deployed on-chain when we raise — the atomicity inversion.
         self.calls.append("fund")
+        # Mirror the real leg: report the deployed address before returning a locator, so a
+        # coordinator test can observe what the record holds mid-fund.
+        if on_deploy is not None:
+            await on_deploy("0x" + "ab" * 20)
         loc = EthHtlcLocator(
             chain_id=11155111,
             contract_address="0x" + "ab" * 20,
@@ -2705,3 +2709,36 @@ def test_burial_safety_factor_below_one_rejected():
         MarginPolicy.measured(
             margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=300.0, burial_safety_factor=0.9
         )
+
+
+async def test_the_coordinator_persists_a_deployed_eth_contract_onto_the_record():
+    """Production entry point for the durable-deploy fix.
+
+    `taker_funds_btc` persists an intent record before broadcasting, and its comment claims that
+    record "knows WHERE the HTLC address is". True for BTC — the P2TR funding address derives from
+    terms before anything is broadcast. FALSE for ETH, where a CREATE address depends on the
+    deployer's nonce and does not exist until the deploy receipt returns. Without this, a crash
+    mid-fund left real value in a contract referenced only by an exception string, and `refund()`
+    could not be pointed at it.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    persisted: list = []
+    coord._persist = lambda rec: persisted.append(rec) or asyncio.sleep(0)
+
+    await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+
+    # THE property: at the moment the contract existed on chain but was not yet an accepted
+    # locator — the window a crash falls into — a record carrying its address had been WRITTEN.
+    addrs = [getattr(r, "pending_counter_contract", None) for r in persisted]
+    assert ("0x" + "ab" * 20) in addrs, (
+        f"no persisted record ever referenced the deployed contract, so a crash mid-fund would "
+        f"leave value on chain with nothing pointing at it; persisted values were {addrs}"
+    )
+    # And once funding SUCCEEDS the handle is cleared, because the locator now carries the
+    # address; a stale 'pending' would point recovery at a swap that no longer needs it.
+    assert coord.record.pending_counter_contract is None
+    assert coord.record.counterchain_locator is not None
+    assert coord.record.counterchain_locator.contract_address.lower() == "0x" + "ab" * 20

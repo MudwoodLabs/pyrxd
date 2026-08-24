@@ -115,7 +115,7 @@ class EthLeg:
 
     # -- fund / claim / refund -----------------------------------------------------------
 
-    async def fund(self, terms) -> EthHtlcLocator:
+    async def fund(self, terms, *, on_deploy=None) -> EthHtlcLocator:
         """Deploy + fund the ETH HTLC from the negotiated terms, then run the post-deploy
         binding gate (verify_funded) BEFORE returning — so the coordinator never tells the
         maker to lock RXD against a wrong/attacker/under-funded contract.
@@ -129,7 +129,13 @@ class EthLeg:
         taker) via ``refund()`` after ``timeout``. To make the stranded deploy recoverable
         WITHOUT a chain rescan, we stash the deployed locator on ``self.last_funded_locator``
         BEFORE verify — so a caller that sees ``fund`` raise still has the contract address to
-        drive the timelock refund. (A full coordinator-record-level recovery is a Phase-4 item.)
+        drive the timelock refund.
+
+        That stash is MEMORY-ONLY and dies with the process, which is why ``on_deploy`` now exists
+        alongside it: the leg awaits it with the deployed address as soon as the deploy confirms
+        (and, for the token leg, strictly before the tokens are pushed), so the coordinator can
+        write the address to the durable record first. This is the coordinator-record-level
+        recovery previously deferred as a Phase-4 item.
         """
         # Consistency (audit HIGH-1): the leg's absolute deadline MUST equal the negotiated
         # term the coordinator's cross-clock ordering gate validated — otherwise the leg could
@@ -154,6 +160,7 @@ class EthLeg:
                 f"{terms_token or 'native ETH'}"
             )
         locator = await self._leg.fund(
+            on_deploy=on_deploy,
             hashlock=bytes(terms.hashlock),
             claimant=self._claim_to,
             refundee=self._refund_to,
