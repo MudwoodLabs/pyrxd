@@ -1169,6 +1169,66 @@ def test_margin_policy_rejects_reorg_depth_below_floor():
         )
 
 
+def test_real_value_mode_requires_a_stall_tolerant_finality_margin():
+    """`eth_finality_stall_tolerance_s` defaults to 0 while its own docstring calls it "the single
+    most important safety addition" and cites an hour-long mainnet finality stall. Nothing in the
+    tree ever constructed a CrossClockMargin to override it, and unlike every other knob here it
+    carried no floor — so a real-value policy could be sized against happy-path finality, which is
+    the exact bug a stall triggers."""
+    from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+    from pyrxd.gravity.swap_coordinator import MAINNET_ETH_FINALITY_STALL_FLOOR_S
+
+    def _margin(tol: int) -> CrossClockMargin:
+        return CrossClockMargin(
+            eth_reorg_finality_s=780,
+            rxd_claim_burial_s=1_800,
+            rxd_confirm_slack_s=600,
+            rounding_slack_s=300,
+            eth_finality_stall_tolerance_s=tol,
+        )
+
+    for bad in (0, MAINNET_ETH_FINALITY_STALL_FLOOR_S - 1):
+        with pytest.raises(ValidationError, match="eth_finality_stall_tolerance_s"):
+            MarginPolicy(
+                margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+                block_interval_s=600.0,
+                is_measured=True,
+                require_measured=True,
+                cross_clock_margin=_margin(bad),
+            )
+
+    # The floor itself is accepted, and so is more. A guard that refuses valid work is a bug.
+    for good in (MAINNET_ETH_FINALITY_STALL_FLOOR_S, MAINNET_ETH_FINALITY_STALL_FLOOR_S * 3):
+        ok = MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=True,
+            require_measured=True,
+            cross_clock_margin=_margin(good),
+        )
+        assert ok.cross_clock_margin is not None
+
+
+def test_the_stall_floor_does_NOT_bind_outside_real_value_mode():
+    """Dust runs and tests must stay constructible with a zero tolerance — the floor is a
+    real-value gate, not a global one, and forcing it everywhere would break every fixture."""
+    from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+
+    ok = MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        cross_clock_margin=CrossClockMargin(
+            eth_reorg_finality_s=780,
+            rxd_claim_burial_s=1_800,
+            rxd_confirm_slack_s=600,
+            rounding_slack_s=300,
+        ),
+    )
+    assert ok.cross_clock_margin is not None
+    assert ok.cross_clock_margin.eth_finality_stall_tolerance_s == 0
+
+
 def _policy(*, btc_depth=6, rxd_burial=6):
     return MarginPolicy(
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
@@ -2705,3 +2765,76 @@ def test_burial_safety_factor_below_one_rejected():
         MarginPolicy.measured(
             margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=300.0, burial_safety_factor=0.9
         )
+
+
+@pytest.mark.asyncio
+async def test_mutual_refund_attempts_BOTH_legs_even_when_the_first_fails():
+    """`mutual_refund` is the "guaranteed-safe failure": both parties get their value back. It
+    broadcast the two refunds as a bare `await; await`, so a crash or error in the first skipped the
+    second entirely. Combined with the record staying BOTH_LOCKED, that made a partial refund
+    unrecoverable in-band: on retry the already-refunded leg raises first (its preflight reverts
+    against the settled contract) and the leg that STILL HOLDS VALUE never gets its turn.
+
+    The two refunds are independent — neither is a precondition for the other — so a failure in one
+    must not suppress the other.
+    """
+    terms = _terms()
+    btc, rxd = FakeBtcLeg(), FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+    refunded_radiant: list[bool] = []
+
+    async def _boom(*_a, **_k):
+        raise NetworkError("counter-leg refund already settled")
+
+    async def _radiant_refund(*_a, **_k):
+        refunded_radiant.append(True)
+        return "rxd-refund-txid"
+
+    coord.counter_leg.refund = _boom
+    coord.radiant_leg.refund_asset = _radiant_refund
+
+    with pytest.raises(NetworkError, match="mutual refund incomplete"):
+        await coord.mutual_refund()
+
+    assert refunded_radiant == [True], (
+        "the Radiant refund was skipped because the counter leg failed first — the leg still "
+        "holding value would never be refunded in-band"
+    )
+    assert coord.record.state is SwapState.BOTH_LOCKED, "state must not advance on a partial refund"
+
+
+@pytest.mark.asyncio
+async def test_mutual_refund_still_reports_when_the_SECOND_leg_fails():
+    """The mirror case, so the change cannot be read as 'swallow errors'. The first leg refunds,
+    the second fails, and the caller is told — silently reporting success would be worse than the
+    bug being fixed."""
+    terms = _terms()
+    btc, rxd = FakeBtcLeg(), FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+
+    async def _boom(*_a, **_k):
+        raise NetworkError("radiant node unreachable")
+
+    coord.radiant_leg.refund_asset = _boom
+    with pytest.raises(NetworkError, match="radiant leg"):
+        await coord.mutual_refund()
+    assert coord.record.state is SwapState.BOTH_LOCKED
+
+
+@pytest.mark.asyncio
+async def test_mutual_refund_HONEST_path_still_completes():
+    """A guard that refuses valid work is a bug: when both legs refund, the swap must still
+    advance out of BOTH_LOCKED exactly as before."""
+    terms = _terms()
+    btc, rxd = FakeBtcLeg(), FakeRadiantLeg()
+    coord = _coordinator(terms=terms, btc_leg=btc, radiant_leg=rxd)
+    await coord.taker_funds_btc(terms)
+    await coord.post_asset_lock_revalidate(await rxd.expected_covenant_scriptpubkey(terms))
+    rec = await coord.mutual_refund()
+    assert rec.state is not SwapState.BOTH_LOCKED, "an all-successful mutual refund must advance"
