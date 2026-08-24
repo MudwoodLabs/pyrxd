@@ -130,8 +130,31 @@ class TestTheRegistryValidatesAsStrictlyAsEveryOtherAddressField:
     def test_a_non_hex_address_is_refused_at_construction(self) -> None:
         """Prefix and length alone admit "0x" + "z"*40, deferring the failure to
         `to_checksum_address` at first on-chain use — far from the construction that caused it."""
-        with pytest.raises(ValidationError, match="not valid hex"):
+        with pytest.raises(ValidationError, match="0x-prefixed 20-byte hex address"):
             Erc20Token("X", "0x" + "z" * 40, 6, 1)
+
+    @pytest.mark.parametrize(
+        ("label", "addr"),
+        [
+            # THE round-5 finding, measured: `bytes.fromhex` silently skips ASCII whitespace, so
+            # this is 42 characters, round-trips as hex, and decodes to NINETEEN bytes.
+            ("trailing whitespace padding a short address", "0x" + "ab" * 19 + "  "),
+            ("interior whitespace", "0x" + "ab" * 10 + " " + "ab" * 9 + " "),
+            ("a trailing newline", "0x" + "ab" * 20 + "\n"),
+            ("no 0x prefix", "ab" * 20),
+        ],
+    )
+    def test_whitespace_cannot_smuggle_a_SHORT_address_past_the_length_check(self, label: str, addr: str) -> None:
+        """`len(addr) == 42` and a clean `bytes.fromhex` were BOTH true for the first case, which
+        is why round 4's round-trip fix did not close this. Only an anchored ASCII regex does."""
+        with pytest.raises(ValidationError, match="0x-prefixed 20-byte hex address"):
+            Erc20Token(symbol="USDC", address=addr, decimals=6, chain_id=1)
+
+    def test_an_honest_address_in_MIXED_case_is_still_accepted(self) -> None:
+        """A guard that refuses valid work is a bug. Checksummed addresses are mixed-case by
+        construction and must pass, normalising to lower."""
+        t = Erc20Token(symbol="USDC", address="0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", decimals=6, chain_id=1)
+        assert t.address == "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
 
     def test_a_unicode_digit_amount_raises_the_documented_type(self) -> None:
         """`"²".isdigit()` is True but `int("²")` raises, so this escaped as a bare

@@ -13,22 +13,40 @@ the maker is told to lock RXD.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import ClassVar
 
 from pyrxd.security.errors import ValidationError
 
-__all__ = ["Erc20HtlcLocator", "EthHtlcLocator"]
+__all__ = ["Erc20HtlcLocator", "EthHtlcLocator", "check_hex_addr"]
+
+
+#: The ONLY accepted spelling of an EVM address anywhere in this package. Anchored, ASCII-only.
+#:
+#: `bytes.fromhex` is NOT a substitute and was the round-5 hole: it silently skips ASCII
+#: whitespace, so "0x" + "ab"*19 + "  " passed the length check (42 chars) AND the hex round-trip
+#: while decoding to NINETEEN bytes. The failure was then deferred to `to_checksum_address` at
+#: first on-chain use — far from the construction that introduced it, and for the field that IS
+#: the identity of the asset being swapped. Three modules had independently copied that check.
+_HEX_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
+
+
+def check_hex_addr(name: str, val: str) -> str:
+    """Validate an EVM address strictly, or raise :class:`ValidationError`.
+
+    Canonical for the whole package — `tokens.Erc20Token` and `swap_state.NegotiatedTerms` both
+    call this rather than keeping their own copy, so a hole can only ever exist in one place.
+    """
+    if not isinstance(val, str):
+        raise ValidationError(f"{name} must be a 0x-prefixed 20-byte hex address")
+    if not _HEX_ADDR_RE.fullmatch(val):
+        raise ValidationError(f"{name} must be a 0x-prefixed 20-byte hex address, got {val!r}")
+    return val
 
 
 def _check_hex_addr(name: str, val: str) -> str:
-    if not isinstance(val, str) or not val.startswith("0x") or len(val) != 42:
-        raise ValidationError(f"{name} must be a 0x-prefixed 20-byte hex address")
-    try:
-        bytes.fromhex(val[2:])
-    except ValueError as exc:
-        raise ValidationError(f"{name} is not valid hex") from exc
-    return val
+    return check_hex_addr(name, val)
 
 
 @dataclass(frozen=True)

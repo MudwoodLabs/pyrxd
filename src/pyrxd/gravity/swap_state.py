@@ -30,7 +30,7 @@ from pyrxd.btc_wallet.taproot import (
     Timelock,
     TimeUnit,
 )
-from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
+from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator, check_hex_addr
 from pyrxd.security.errors import ValidationError
 
 # SwapRecord wire schema version. v1 (absent) is the BTC-only form (bare ``btc_locator``);
@@ -325,14 +325,9 @@ class NegotiatedTerms:
                 raise ValidationError(
                     f"token_address is only meaningful on an ETH counter chain, not {self.counter_chain!r}"
                 )
-            addr = self.token_address
-            if not isinstance(addr, str) or not addr.startswith("0x") or len(addr) != 42:
-                raise ValidationError("token_address must be a 0x-prefixed 20-byte hex address")
-            try:
-                bytes.fromhex(addr[2:])
-            except ValueError as exc:
-                raise ValidationError("token_address is not valid hex") from exc
-            object.__setattr__(self, "token_address", addr.lower())
+            # Canonical validator — the third and last copy of this check, removed in round 5.
+            check_hex_addr("token_address", self.token_address)
+            object.__setattr__(self, "token_address", self.token_address.lower())
         # ETH absolute refund deadline: first-class for an ETH swap (the real counter-leg
         # deadline the coordinator's cross-clock ordering gate validates); forbidden for BTC
         # (whose deadline is the relative t_btc) so the two can never be silently confused.

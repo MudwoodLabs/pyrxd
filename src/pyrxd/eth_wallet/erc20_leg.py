@@ -203,11 +203,19 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
                 "preimage is still secret and this is retryable."
             )
         try:
+            # Claimant ONLY — not the refundee. A `claim` sweeps the HTLC to the CLAIMANT; the
+            # refundee is touched solely by `refund()`, so a frozen refundee cannot make this
+            # claim revert. Round 4 rewrote this list without questioning its membership and round
+            # 5 caught it from two directions at once: refusing here is a guard refusing valid
+            # work, and worse, it hands the counterparty a free unilateral veto — a taker who
+            # becomes sanctioned after funding kills the maker's only path to the USDC it has
+            # already earned, for nothing. The refundee belongs in the pre-FUND gate, where a
+            # freeze really would strand the refund.
             await assert_not_frozen_before_reveal(
                 self._rpc,
                 self._token,
                 htlc_address=locator.contract_address,
-                parties={"claimant": locator.claimant, "refundee": locator.refundee},
+                parties={"claimant": locator.claimant},
             )
         except NetworkError as exc:
             # Could not TELL whether anything is frozen. Nothing was sent, so the preimage is

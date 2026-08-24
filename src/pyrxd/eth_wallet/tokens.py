@@ -15,9 +15,14 @@ something to disagree with — see :func:`assert_token_matches_chain`.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from ..security.errors import ValidationError
+from .locator import check_hex_addr
+
+#: ASCII 0-9 only — see `base_units`.
+_ASCII_DIGITS = re.compile(r"[0-9]+")
 
 #: Bridged variants, refused BY ADDRESS so a mistake is a named refusal rather than a silent
 #: wrong-asset lock. Not Circle-issued; distinct liquidity. Linea is deliberately absent — its
@@ -56,16 +61,11 @@ class Erc20Token:
     has_blacklist: bool = True
 
     def __post_init__(self) -> None:
-        if not isinstance(self.address, str) or not self.address.startswith("0x") or len(self.address) != 42:
-            raise ValidationError(f"Erc20Token.address must be 0x + 40 hex chars, got {self.address!r}")
-        # Round-trip the tail, exactly as `locator._check_hex_addr` does. Length and prefix alone
-        # admit "0x" + "z"*40, deferring the failure to `to_checksum_address` at first on-chain use
-        # — far from the construction that introduced it, and for the field this class calls THE
-        # identity of the asset.
-        try:
-            bytes.fromhex(self.address[2:])
-        except ValueError as exc:
-            raise ValidationError(f"Erc20Token.address is not valid hex: {self.address!r}") from exc
+        # ONE canonical validator for the package (`locator.check_hex_addr`), not a fourth copy.
+        # Round 5 measured the previous round-trip check accepting "0x" + "ab"*19 + "  " as a
+        # 42-char "address" that decodes to nineteen bytes — for the field that IS the identity
+        # of the asset. Three modules had each rolled their own; now none do.
+        check_hex_addr("Erc20Token.address", self.address)
         object.__setattr__(self, "address", self.address.lower())
         if not isinstance(self.decimals, int) or isinstance(self.decimals, bool) or not 0 <= self.decimals <= 36:
             raise ValidationError("Erc20Token.decimals must be an int in 0..36")
@@ -87,11 +87,19 @@ class Erc20Token:
         if neg:
             raise ValidationError("base_units refuses a negative amount")
         int_part, _, frac_part = text.partition(".")
-        # isdecimal(), not isdigit(): the latter accepts Unicode digit forms such as "\u00b2" that
-        # int() then refuses, so a malformed amount escaped as a raw ValueError instead of this
-        # module's ValidationError — and every caller here catches ValidationError specifically.
-        if not int_part.isdecimal() or (frac_part and not frac_part.isdecimal()):
+        # ASCII digits ONLY, and length-bounded. `isdecimal()` was round 4's fix for `isdigit()`,
+        # and round 5 measured two escapes it still allowed: non-ASCII decimal digits that int()
+        # happily converts (`base_units("\uff11\uff12") == 12_000_000`, and the Arabic-Indic
+        # "\u0663.\u0665" == 3_500_000 — a full-width paste silently becoming a real amount), and
+        # an int_part over CPython's 4300-digit conversion limit raising a RAW ValueError, the
+        # exact wrong-type escape isdecimal() was chosen to close. Callers catch ValidationError.
+        if not _ASCII_DIGITS.fullmatch(int_part) or (frac_part and not _ASCII_DIGITS.fullmatch(frac_part)):
             raise ValidationError(f"not a decimal amount: {whole!r}")
+        if len(int_part) > 32:
+            raise ValidationError(
+                f"amount has {len(int_part)} integer digits; no ERC-20 supply is near that and "
+                "unbounded int() conversion is its own denial-of-service"
+            )
         if len(frac_part) > self.decimals:
             raise ValidationError(
                 f"{whole!r} has {len(frac_part)} decimal places but {self.symbol} has "

@@ -8,6 +8,7 @@ written but never read back, so bumping it would accomplish nothing.
 
 from __future__ import annotations
 
+import dataclasses
 import pytest
 
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
@@ -391,3 +392,72 @@ def _native_artifact() -> dict:
     from pathlib import Path
 
     return json.loads((Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
+
+
+class TestTheRecordRefusesAnAssetDisagreementBeforeItIsDurable:
+    """The `SwapRecord.__post_init__` asset-agreement guard had NO test until round 5.
+
+    Chain agreement is not asset agreement: both legs are `counter_chain == "eth"`, so the
+    chain check cannot tell a native leg from a token leg. This guard is the record-level
+    chokepoint that made the round-1 CRITICAL (producers returning the parent locator type)
+    unrepresentable rather than merely fixed at the two call sites that existed that day.
+    Deleting the whole block used to pass the suite, which is how the class recurs.
+    """
+
+    def test_a_token_locator_with_no_named_token_is_refused(self) -> None:
+        """Empty `terms.token_address` describes the swap as native ETH while the locator holds
+        USDC — the 10^12 misread, written straight to disk."""
+        from pyrxd.gravity.swap_state import SwapState
+
+        with pytest.raises(ValidationError, match="a token locator requires"):
+            SwapRecord(
+                state=SwapState.NEGOTIATED,
+                terms=dataclasses.replace(_token_terms(), token_address=""),
+                counterchain_locator=_erc20_locator(),
+            )
+
+    def test_a_token_locator_naming_a_DIFFERENT_token_is_refused(self) -> None:
+        """Terms say one asset, the funded contract holds another. The record would misdescribe
+        what was funded, and every later reader — including refund — trusts the record."""
+        from pyrxd.gravity.swap_state import SwapState
+
+        with pytest.raises(ValidationError, match="would misdescribe what was funded"):
+            SwapRecord(
+                state=SwapState.NEGOTIATED,
+                terms=dataclasses.replace(_token_terms(), token_address="0x" + "99" * 20),
+                counterchain_locator=_erc20_locator(),
+            )
+
+    def test_a_NATIVE_locator_under_token_terms_is_refused(self) -> None:
+        """The exact shape of the round-1 CRITICAL: `fund()` returned the parent `EthHtlcLocator`
+        for a token swap. Its `amount_wei` would persist 6-decimal base units as wei."""
+        from pyrxd.gravity.swap_state import SwapState
+
+        native = EthHtlcLocator(
+            chain_id=1,
+            contract_address="0x" + "11" * 20,
+            deploy_tx_hash="0x" + "22" * 32,
+            hashlock="0x" + "33" * 32,
+            claimant="0x" + "44" * 20,
+            refundee="0x" + "55" * 20,
+            timeout=1_800_000_000,
+            amount_wei=12_345_678,
+        )
+        with pytest.raises(ValidationError, match="the locator is a NATIVE"):
+            SwapRecord(
+                state=SwapState.NEGOTIATED,
+                terms=_token_terms(),
+                counterchain_locator=native,
+            )
+
+    def test_the_HONEST_pairing_still_constructs(self) -> None:
+        """A guard that refuses valid work is a bug. Terms and locator naming the same token —
+        including in differing case, since both sides normalise — must still build."""
+        from pyrxd.gravity.swap_state import SwapState
+
+        rec = SwapRecord(
+            state=SwapState.NEGOTIATED,
+            terms=dataclasses.replace(_token_terms(), token_address=_USDC_MAINNET.upper().replace("0X", "0x")),
+            counterchain_locator=_erc20_locator(token_address=_USDC_MAINNET.lower()),
+        )
+        assert rec.counterchain_locator is not None

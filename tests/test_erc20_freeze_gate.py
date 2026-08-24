@@ -10,6 +10,7 @@ unrecoverable outcome, firing exactly when the caller is already in trouble.
 from __future__ import annotations
 
 import asyncio
+import time
 
 import pytest
 
@@ -242,6 +243,18 @@ class TestTheGateRefusesBEHAVIOURALLYNotJustInSource:
         with pytest.raises(PreRevealAbort, match="refusing to build a claim"):
             asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
 
+    def test_the_balance_check_runs_BEFORE_the_freeze_read_even_when_both_would_fire(self) -> None:
+        """The case above cannot actually pin the ordering: with `frozen=False` the freeze read
+        raises nothing, so it reads identically whether it ran first or second. Make BOTH
+        conditions true and the message names which check owns the refusal. Ordering matters
+        because the balance read is local and free while the freeze read costs two RPC round
+        trips against a provider that may be lying or down."""
+        from pyrxd.security.errors import PreRevealAbort
+
+        leg = self._leg(frozen=True, held=1)
+        with pytest.raises(PreRevealAbort, match="refusing to build a claim"):
+            asyncio.run(leg.claim(self._locator(), b"\x00" * 32))
+
     def test_the_underfunded_refusal_PRESERVES_the_preimage(self) -> None:
         """The sibling lane of #479. Round 2 made a transport failure keep the secret but left this
         value lane raising ValidationError, so a lagging provider's stale balance destroyed a
@@ -295,3 +308,135 @@ class TestTheContractAddressCannotBeDisplacedByACallerKey:
                 )
             )
         assert frozen_addr in checked, "the real HTLC address must still be checked"
+
+
+_HTLC = "0x" + "11" * 20
+_CLAIMANT = "0x" + "44" * 20
+_REFUNDEE = "0x" + "55" * 20
+
+
+def _freeze_locator():
+    from pyrxd.eth_wallet.locator import Erc20HtlcLocator
+
+    return Erc20HtlcLocator(
+        chain_id=1,
+        contract_address=_HTLC,
+        deploy_tx_hash="0x" + "22" * 32,
+        hashlock="0x" + "33" * 32,
+        claimant=_CLAIMANT,
+        refundee=_REFUNDEE,
+        timeout=int(time.time()) + 86_400,
+        amount_wei=12_345_678,
+        token_address=_USDC.address,
+    )
+
+
+def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
+    """A leg whose blacklist answers PER ADDRESS, and whose claim can actually complete.
+
+    The older `_leg` above answers the same `frozen` for every address, so it cannot express
+    "the refundee is frozen and nobody else" — which is the whole round-5 question.
+    """
+    import json
+    import os
+    import pathlib
+
+    from pyrxd.eth_wallet.erc20_leg import Erc20HtlcLeg
+    from pyrxd.security.secrets import PrivateKeyMaterial
+
+    lowered = {a.lower() for a in frozen_addrs}
+
+    class _Call:
+        def __init__(self, v):
+            self._v = v
+
+        async def call(self, *a, **k):
+            return self._v
+
+    class _Fns:
+        def isBlacklisted(self, addr, *a, **k):
+            return _Call(str(addr).lower() in lowered)
+
+        def balanceOf(self, *a, **k):
+            return _Call(held)
+
+        def decimals(self, *a, **k):
+            return _Call(6)
+
+        def claim(self, *a, **k):
+            class _B:
+                async def build_transaction(self_b, tx):
+                    return dict(tx)
+
+            return _B()
+
+    class _Contract:
+        functions = _Fns()
+
+    class _Eth:
+        def contract(self, *a, **k):
+            return _Contract()
+
+        async def get_block(self, _which):
+            return {"timestamp": int(time.time())}
+
+    class _W3:
+        eth = _Eth()
+
+    class _Rpc:
+        w3 = _W3()
+
+        async def assert_chain(self):
+            return None
+
+        async def fee_fields(self):
+            return {"maxPriorityFeePerGas": 1, "maxFeePerGas": 3}
+
+        async def get_transaction_count(self, _a):
+            return 0
+
+    art = json.loads((pathlib.Path(__file__).parent / "fixtures" / "Erc20Htlc.json").read_text())
+    leg = Erc20HtlcLeg(
+        token=_USDC, rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=art
+    )
+
+    async def _sign_and_send(*a, **k):
+        return "0x" + "ab" * 32
+
+    leg._sign_and_send = _sign_and_send
+    return leg
+
+
+
+class TestTheGateDoesNotVetoAClaimOnAnAddressThatCannotAffectIt:
+    """Round 5, flagged independently by two reviewers. `claim` sweeps to the CLAIMANT. The
+    refundee is touched only by `refund()`, so a frozen refundee cannot make a claim revert —
+    yet the gate refused on it, which is both a guard refusing valid work and a free veto handed
+    to the counterparty: a taker sanctioned after funding could kill the maker's only path to
+    USDC it had already earned.
+    """
+
+    def test_a_frozen_REFUNDEE_does_not_block_the_makers_claim(self) -> None:
+        leg = _leg_with_frozen(frozen_addrs={_REFUNDEE})
+        assert asyncio.run(leg.claim(_freeze_locator(), b"\x00" * 32)), (
+            "a frozen refundee cannot make a claim revert, so refusing the claim forfeits "
+            "USDC the maker has already earned"
+        )
+
+    def test_a_frozen_CLAIMANT_still_blocks_the_claim(self) -> None:
+        """The other half. Narrowing the gate must not disarm it: the claimant is the address the
+        payout actually reaches, so a freeze there really would revert the sweep."""
+        from pyrxd.security.errors import PreRevealAbort
+
+        leg = _leg_with_frozen(frozen_addrs={_CLAIMANT})
+        with pytest.raises(PreRevealAbort, match="refusing to reveal"):
+            asyncio.run(leg.claim(_freeze_locator(), b"\x00" * 32))
+
+    def test_a_frozen_HTLC_CONTRACT_still_blocks_the_claim(self) -> None:
+        """The measured worst case: freezing the contract strands the funds permanently — claim
+        AND refund both revert, with no timeout to rescue them."""
+        from pyrxd.security.errors import PreRevealAbort
+
+        leg = _leg_with_frozen(frozen_addrs={_HTLC})
+        with pytest.raises(PreRevealAbort, match="refusing to reveal"):
+            asyncio.run(leg.claim(_freeze_locator(), b"\x00" * 32))

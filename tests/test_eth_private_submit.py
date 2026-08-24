@@ -8,6 +8,8 @@ No real relay is contacted.
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg
@@ -45,10 +47,13 @@ class _FakeRpc:
 
         class _W3Eth:
             async def get_block(self_inner, _which):
-                # The claim path now reads the clock to refuse a claim too close to the HTLC
-                # timeout — a late claim still mines with the preimage in its calldata. These
-                # tests are about private-submit ROUTING, so put "now" far before the deadline.
-                return {"timestamp": 0}
+                # The claim path reads the clock to refuse a claim too close to the HTLC timeout —
+                # a late claim still mines with the preimage in its calldata. Round 5 additionally
+                # cross-checks the head against LOCAL time (a lagging provider under-reports "now",
+                # which is the direction that makes the guard pass when it should refuse), so this
+                # must return a REALISTIC head rather than a synthetic epoch. These tests are about
+                # private-submit ROUTING, so report now and let the locator sit a day out.
+                return {"timestamp": int(time.time())}
 
             def contract(self_inner, address, abi):
                 class _Fns:
@@ -94,7 +99,7 @@ def _locator():
         hashlock="0x" + "22" * 32,
         claimant="0x" + "33" * 20,
         refundee="0x" + "44" * 20,
-        timeout=10_000,
+        timeout=int(time.time()) + 86_400,
         amount_wei=10**14,
     )
 

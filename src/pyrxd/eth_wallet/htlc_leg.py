@@ -27,6 +27,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from typing import Any
 
 from pyrxd.eth_wallet.locator import EthHtlcLocator
@@ -109,6 +110,20 @@ class _ClaimTooLate(Exception):
 #: cost of refusing a claim that WOULD have made it is one retry, while the cost of broadcasting one
 #: that does not is the preimage published for nothing.
 CLAIM_INCLUSION_BUDGET_S: int = 96
+
+#: Seconds per L1 block, used ONLY to convert the budget above into a fee multiplier.
+_BLOCK_S: int = 12
+
+#: The fee ceiling a claim must carry to stay includable for the whole budget it was authorised
+#: against. EIP-1559 lets basefee rise 12.5% per block, so surviving N blocks costs 1.125**N.
+#:
+#: Round 5 found these two numbers had drifted apart: the guard authorised broadcasting with 96s
+#: (8 blocks) of head-room while `rpc.fee_fields` priced every tx at `2*base + tip`, and
+#: 1.125**6 = 2.03 — the ceiling expired after 72s. In the 24s gap the claim is unincludable but
+#: already broadcast; the taker refunds at the timeout, the claim then mines, reverts, and leaves
+#: `p` in its calldata for anyone to scrape. Deriving the multiplier FROM the budget is what stops
+#: them drifting again: change the budget and the fee follows.
+CLAIM_BASEFEE_HEADROOM: float = 1.125 ** (CLAIM_INCLUSION_BUDGET_S / _BLOCK_S)
 
 
 def is_eip7702_delegation(code: bytes) -> bool:
@@ -349,9 +364,17 @@ class EthHtlcContractLeg:
             return str(await self._private_submitter.submit_raw(signed.raw_transaction))
         return await self._rpc.send_raw(signed.raw_transaction)
 
-    async def _base_tx(self, *, gas: int) -> dict:
+    async def _base_tx(self, *, gas: int, basefee_headroom: float = 1.0) -> dict:
+        """Build the common tx fields. `basefee_headroom` scales the basefee share of
+        `maxFeePerGas` (never the tip) so a DEADLINE-BOUND tx stays includable for as long as it
+        was authorised to take. Defaults to 1.0 — the node's own 2x — for everything with no
+        deadline; only `claim` has one. See :data:`CLAIM_BASEFEE_HEADROOM`."""
         addr = self._account_address()
         fees = await self._rpc.fee_fields()
+        if basefee_headroom > 1.0:
+            tip = int(fees["maxPriorityFeePerGas"])
+            base_share = max(int(fees["maxFeePerGas"]) - tip, 0)
+            fees = {**fees, "maxFeePerGas": int(base_share * basefee_headroom) + tip}
         return {
             "from": addr,
             "chainId": self._chain_id,
@@ -438,7 +461,23 @@ class EthHtlcContractLeg:
             # On the mainnet-recommended PRIVATE path there is no eth_call preflight (it would leak
             # p to the provider), so nothing downstream catches expiry either. This check is the
             # only thing standing between a stalling counterparty and a free option.
-            now_ts = int((await self._rpc.w3.eth.get_block("latest"))["timestamp"])
+            head = await self._rpc.w3.eth.get_block("latest")
+            chain_ts, local_ts = int(head["timestamp"]), int(time.time())
+            # Take the LATER of chain head and local clock. A lagging or hostile provider can only
+            # push `chain_ts` BACKWARDS, and backwards is exactly the direction that makes this
+            # guard pass when it should refuse — round 5's finding: a provider 4 minutes behind, or
+            # any of the L2s in KNOWN_TOKENS during a sequencer halt, made the guard inert in the
+            # precise case it was written for. Local time cannot be moved by the provider, and
+            # forward skew only ever makes the guard stricter.
+            now_ts = max(chain_ts, local_ts)
+            if local_ts - chain_ts > CLAIM_INCLUSION_BUDGET_S:
+                raise _ClaimTooLate(
+                    f"the chain head is {local_ts - chain_ts}s stale (limit "
+                    f"{CLAIM_INCLUSION_BUDGET_S}s): with a head this old there is no way to reason "
+                    "about whether a claim would be included before the timeout, and a claim that "
+                    "mines late publishes the preimage for nothing. Check the provider, and check "
+                    "this machine's clock, then retry. Nothing was sent."
+                )
             deadline = int(locator.timeout)
             if now_ts + CLAIM_INCLUSION_BUDGET_S >= deadline:
                 raise _ClaimTooLate(
@@ -448,7 +487,9 @@ class EthHtlcContractLeg:
                     "counterparty both legs. Refund after the timeout instead."
                 )
             c = self._rpc.w3.eth.contract(address=locator.contract_address, abi=self._artifact["abi"])
-            built = await c.functions.claim(bytes(preimage)).build_transaction(await self._base_tx(gas=120_000))
+            built = await c.functions.claim(bytes(preimage)).build_transaction(
+                await self._base_tx(gas=120_000, basefee_headroom=CLAIM_BASEFEE_HEADROOM)
+            )
         except _ClaimTooLate as exc:
             raise PreRevealAbort(str(exc)) from exc
         except Exception as exc:
