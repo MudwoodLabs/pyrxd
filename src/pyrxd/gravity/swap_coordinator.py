@@ -1508,6 +1508,15 @@ class SwapCoordinator:
         # strictly before the tokens are pushed into it. Without this the intent record above knows
         # the swap exists but not WHERE its value went, and a crash mid-fund leaves real value in a
         # contract referenced only by an exception string.
+        async def _remember_push_nonce(nonce: int) -> None:
+            # Durable BEFORE the push is broadcast. The pin is only worth anything on a retry, and a
+            # retry only happens after a crash — so a pin recorded after the send is the one thing
+            # that crash destroys. Measured 2026-08-24: a re-send at a recorded nonce REPLACES
+            # rather than adds, which is what makes funding idempotent without a distributed lock,
+            # and unlike `flock` that property holds across hosts.
+            self.record = dataclasses.replace(self.record, pending_push_nonce=int(nonce))
+            await self._persist_record(self.record, shield=True)
+
         async def _remember_deploy(address: str, deploy_tx_hash: str) -> None:
             self.record = dataclasses.replace(
                 self.record,
@@ -1521,7 +1530,13 @@ class SwapCoordinator:
             # Held across deploy AND push: the window the lock exists to close is between reading
             # the balance and sending the shortfall, which spans both.
             with lock() if lock is not None else contextlib.nullcontext():
-                locator = await self.counter_leg.fund(terms, on_deploy=_remember_deploy, resume_from=resume_from)
+                locator = await self.counter_leg.fund(
+                    terms,
+                    on_deploy=_remember_deploy,
+                    resume_from=resume_from,
+                    push_nonce=self.record.pending_push_nonce,
+                    on_push_nonce=_remember_push_nonce,
+                )
         else:
             locator = await self.counter_leg.fund(terms)
         if not isinstance(locator, (BtcHtlcLocator, EthHtlcLocator)):

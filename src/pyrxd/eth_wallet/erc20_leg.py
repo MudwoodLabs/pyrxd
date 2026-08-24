@@ -79,6 +79,8 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         amount_wei: int,
         on_deploy: Callable[[str, str], Awaitable[None]] | None = None,
         resume_from: PendingDeploy | None = None,
+        push_nonce: int | None = None,
+        on_push_nonce: Callable[[int], Awaitable[None]] | None = None,
     ) -> EthHtlcLocator:
         """Deploy the HTLC, push the tokens into it, and only then return a locator.
 
@@ -164,6 +166,8 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             )
         return await self._push_and_bind(
             resuming=resume_from is not None,
+            push_nonce=push_nonce,
+            on_push_nonce=on_push_nonce,
             web3=web3,
             address=address,
             deploy_hash=deploy_hash,
@@ -203,7 +207,19 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         return address, deploy_hash
 
     async def _push_and_bind(
-        self, *, resuming, web3, address, deploy_hash, hashlock, claimant, refundee, timeout, amount_wei
+        self,
+        *,
+        resuming,
+        push_nonce,
+        on_push_nonce,
+        web3,
+        address,
+        deploy_hash,
+        hashlock,
+        claimant,
+        refundee,
+        timeout,
+        amount_wei,
     ):
         """Top the HTLC up to the promised amount and return its locator."""
         checksum = web3.Web3.to_checksum_address
@@ -234,10 +250,28 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # The rationale — "sending against this reading could fund the HTLC twice" — only bites
         # when something is being sent.
         sender = self._account_address()
+        # STOLEN-PIN CHECK FIRST — it is the more specific diagnosis. Running it after the
+        # in-flight guard let that guard fire on the same state and report a NEGATIVE count of
+        # in-flight transactions, hiding the real cause.
+        if resuming and shortfall > 0 and push_nonce is not None:
+            settled = await self._rpc.get_transaction_count(self._account_address(), "latest")
+            if settled > int(push_nonce):
+                raise NetworkError(
+                    f"the pinned push nonce {push_nonce} has already been consumed by another "
+                    f"transaction from this key (its settled nonce is {settled}) and the HTLC "
+                    f"still holds {held} of {amount_wei}. Re-pinning cannot be done safely: two "
+                    "resumers could pick different nonces and both land, funding the HTLC twice. "
+                    "Use a funding key dedicated to one swap. Refund after the timeout."
+                )
+
+        # `pending > latest`, NOT `!=`. A pending nonce BELOW the settled one is not "transactions
+        # in flight" — it means our view of the account is stale or the pinned slot was consumed by
+        # something else, and reporting `pending - latest` there printed a NEGATIVE count while
+        # masking the real diagnosis below.
         _check_inflight = resuming and shortfall > 0
         pending_nonce = await self._rpc.get_transaction_count(sender, "pending") if _check_inflight else 0
         latest_nonce = await self._rpc.get_transaction_count(sender, "latest") if _check_inflight else 0
-        if resuming and shortfall > 0 and pending_nonce != latest_nonce:
+        if resuming and shortfall > 0 and pending_nonce > latest_nonce:
             raise NetworkError(
                 f"{pending_nonce - latest_nonce} transaction(s) from {sender} are still in flight "
                 f"(nonce pending={pending_nonce}, latest={latest_nonce}), so the HTLC balance "
@@ -248,6 +282,19 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
             # --- push the tokens in. No approve, no transferFrom. ---
             token_c = self._rpc.w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)
             push_tx = await self._base_tx(gas=_TOKEN_TRANSFER_GAS)
+            # PIN THE NONCE, and reuse the pin on every retry. Measured on 2026-08-24: a second
+            # transaction at an already-used nonce is rejected ("nonce too low" once mined,
+            # "transaction already imported" while pending) and a higher-priced one REPLACES rather
+            # than adds — so two resumers, or a resume racing its own still-pending push, deliver
+            # the value exactly once. That is a property of the chain, so unlike the `flock` it
+            # holds across hosts, filesystems and a copied keys directory.
+            #
+            # The pin must be DURABLE before the broadcast or a retry cannot reuse it, which is the
+            # whole mechanism. See the design note under docs/solutions/design-decisions/.
+            if push_nonce is not None:
+                push_tx = {**push_tx, "nonce": int(push_nonce)}
+            elif on_push_nonce is not None:
+                await on_push_nonce(int(push_tx["nonce"]))
             push_built = await token_c.functions.transfer(address, shortfall).build_transaction(push_tx)
             push_hash = await self._sign_and_send(push_built)
             push_receipt = await self._rpc.wait_receipt(push_hash)

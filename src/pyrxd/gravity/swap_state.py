@@ -485,6 +485,13 @@ class SwapRecord:
     #: this hash — the `"0x" + "00"*32` placeholder `expected_locator` uses for an unknown deploy
     #: would silently break it. Unrecoverable after the fact, like the address itself.
     pending_counter_deploy_tx: str | None = None
+    #: The sender nonce the token push is PINNED to. Measured (2026-08-24, anvil): re-sending at a
+    #: recorded nonce is a REPLACEMENT, never an addition — two resumers, or a resume racing its own
+    #: still-pending push, deliver the value once and only once. That is a property of the chain
+    #: rather than of a lock, so unlike `flock` it holds across hosts, filesystems, and a copied
+    #: keys directory. Persisting it before the broadcast is what makes it usable on a retry.
+    #: See docs/solutions/design-decisions/nonce-pinning-makes-erc20-funding-idempotent.md.
+    pending_push_nonce: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -541,6 +548,9 @@ class SwapRecord:
         tx = self.pending_counter_deploy_tx
         if tx is not None and (not isinstance(tx, str) or not tx.startswith("0x")):
             raise ValidationError("pending_counter_deploy_tx must be a 0x-prefixed hex hash")
+        pin = self.pending_push_nonce
+        if pin is not None and (not isinstance(pin, int) or isinstance(pin, bool) or pin < 0):
+            raise ValidationError("pending_push_nonce must be a non-negative int")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -578,7 +588,11 @@ class SwapRecord:
         a swap that no longer needs it.
         """
         return dataclasses.replace(
-            self, counterchain_locator=locator, pending_counter_contract=None, pending_counter_deploy_tx=None
+            self,
+            counterchain_locator=locator,
+            pending_counter_contract=None,
+            pending_counter_deploy_tx=None,
+            pending_push_nonce=None,
         )
 
     def with_btc_lock(self, locator: BtcHtlcLocator) -> SwapRecord:
@@ -619,6 +633,8 @@ class SwapRecord:
         if self.pending_counter_contract:
             d["pending_counter_contract"] = self.pending_counter_contract
             d["pending_counter_deploy_tx"] = self.pending_counter_deploy_tx
+            if self.pending_push_nonce is not None:
+                d["pending_push_nonce"] = self.pending_push_nonce
         return d
 
     @classmethod
@@ -649,6 +665,7 @@ class SwapRecord:
             radiant_covenant_spk_hex=d.get("radiant_covenant_spk_hex"),
             pending_counter_contract=d.get("pending_counter_contract"),
             pending_counter_deploy_tx=d.get("pending_counter_deploy_tx"),
+            pending_push_nonce=d.get("pending_push_nonce"),
         )
 
 

@@ -394,6 +394,8 @@ class EthHtlcContractLeg:
         amount_wei: int,
         on_deploy: Callable[[str, str], Awaitable[None]] | None = None,
         resume_from: Any = None,
+        push_nonce: Any = None,
+        on_push_nonce: Any = None,
     ) -> EthHtlcLocator:
         """Deploy + fund the HTLC (payable constructor). Returns the locator ONLY after
         the deploy tx confirms with status==1 (a reverted/dropped deploy never yields a

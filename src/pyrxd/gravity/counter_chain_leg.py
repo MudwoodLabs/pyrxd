@@ -66,7 +66,15 @@ class CounterChainLeg(ABC):
     """
 
     @abstractmethod
-    async def fund(self, terms: Any, *, on_deploy: Any = None, resume_from: Any = None) -> Any:
+    async def fund(
+        self,
+        terms: Any,
+        *,
+        on_deploy: Any = None,
+        resume_from: Any = None,
+        push_nonce: Any = None,
+        on_push_nonce: Any = None,
+    ) -> Any:
         """Lock the counter-chain value into a fresh HTLC; return its durable locator.
 
         MUST NOT return a locator until the funding is confirmed/irreversible enough that
@@ -90,6 +98,12 @@ class CounterChainLeg(ABC):
         and it MUST verify that location really carries this swap's terms before sending anything
         to it. A leg whose funding address is derived from terms is idempotent by construction and
         may ignore this.
+
+        ``push_nonce`` / ``on_push_nonce`` pin the value-moving transaction to a specific sender
+        nonce and report that nonce so the caller can make it durable BEFORE the broadcast. A leg
+        whose chain gives exclusive, replace-not-add semantics per nonce gets idempotent funding
+        from this: a retry at the same pin delivers the value exactly once, no matter how many
+        processes or hosts attempt it. A leg on a chain without that property may ignore both.
         """
 
     @abstractmethod

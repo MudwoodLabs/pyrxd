@@ -115,7 +115,9 @@ class EthLeg:
 
     # -- fund / claim / refund -----------------------------------------------------------
 
-    async def fund(self, terms, *, on_deploy=None, resume_from=None) -> EthHtlcLocator:
+    async def fund(
+        self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None
+    ) -> EthHtlcLocator:
         """Deploy + fund the ETH HTLC from the negotiated terms, then run the post-deploy
         binding gate (verify_funded) BEFORE returning — so the coordinator never tells the
         maker to lock RXD against a wrong/attacker/under-funded contract.
@@ -162,6 +164,11 @@ class EthLeg:
         locator = await self._leg.fund(
             on_deploy=on_deploy,
             resume_from=resume_from,
+            **(
+                {}
+                if push_nonce is None and on_push_nonce is None
+                else {"push_nonce": push_nonce, "on_push_nonce": on_push_nonce}
+            ),
             hashlock=bytes(terms.hashlock),
             claimant=self._claim_to,
             refundee=self._refund_to,

@@ -63,6 +63,7 @@ def _leg(*, push_fails: bool = False, order: list, initial_held: int = 0, inflig
             class _B:
                 async def build_transaction(self_b, tx):
                     state["pending_transfer"] = int(amount)
+                    state["push_nonce_used"] = tx.get("nonce")
                     return dict(tx)
 
             return _B()
@@ -296,7 +297,7 @@ _REFUNDEE = "0x" + "55" * 20
 _TIMEOUT = _FUND_TIMEOUT
 
 
-def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 0):
+def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 0, settled: int = 0):
     """A leg whose `verify_funded` is the PRODUCTION one, backed by a node fake serving the
     contract's immutables. `on_chain` overrides let a test deploy a contract that is NOT this
     swap's and watch the real check refuse it."""
@@ -319,6 +320,15 @@ def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 
             return self._v
 
     class _Fns:
+        def transfer(self, _to, amount):
+            class _B:
+                async def build_transaction(self_b, tx):
+                    state["push_nonce_used"] = tx.get("nonce")
+                    state["pending"] = int(amount)
+                    return dict(tx)
+
+            return _B()
+
         def hashlock(self, *a, **k):
             return _Call(imm["hashlock"])
 
@@ -345,14 +355,6 @@ def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 
 
         def decimals(self, *a, **k):
             return _Call(6)
-
-        def transfer(self, _to, amount):
-            class _B:
-                async def build_transaction(self_b, tx):
-                    state["pending"] = int(amount)
-                    return dict(tx)
-
-            return _B()
 
     class _Contract:
         functions = _Fns()
@@ -389,7 +391,7 @@ def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 
         async def get_transaction_count(self, _a, block="pending"):
             # `inflight` models transactions sitting in the mempool: they advance the PENDING
             # nonce while remaining invisible to a balance read at `latest`.
-            return inflight if block == "pending" else 0
+            return inflight if block == "pending" else settled
 
         async def wait_receipt(self, *a, **k):
             state["held"] += state.pop("pending", 0)
@@ -404,6 +406,7 @@ def _real_verify_leg(*, on_chain: dict, held: int, order: list, inflight: int = 
         return "0xpush"
 
     leg._sign_and_send = _sign_and_send
+    leg._state = state
     return leg
 
 
@@ -641,3 +644,82 @@ class TestTheInFlightGuardDoesNotBlockAFreshFund:
         loc = _fund(leg, None, resume_from=_PENDING)
         assert order == [], "a fully funded HTLC was topped up again"
         assert loc.amount_wei == _AMOUNT
+
+
+class TestThePushNonceIsPinnedAndReused:
+    """Nonce pinning is what makes funding idempotent WITHOUT a distributed lock.
+
+    Measured against anvil on 2026-08-24: a second transaction at an already-used sender nonce is
+    rejected ("nonce too low" once mined, "transaction already imported" while pending), and a
+    higher-priced one REPLACES rather than adds. So two resumers — or a resume racing its own
+    still-pending push — deliver the value exactly once. That is a property of the chain, so unlike
+    `flock` it holds across hosts, filesystems, and a copied keys directory.
+
+    See docs/solutions/design-decisions/nonce-pinning-makes-erc20-funding-idempotent.md.
+    """
+
+    def test_a_fresh_fund_REPORTS_the_nonce_it_pinned(self) -> None:
+        """The pin is worthless unless the caller can make it durable before the broadcast — a pin
+        recorded after the send is the one thing a crash destroys."""
+        order: list = []
+        reported: list = []
+
+        async def _remember(nonce: int) -> None:
+            reported.append(nonce)
+
+        leg = _leg(order=order)
+        asyncio.run(
+            leg.fund(
+                hashlock=b"\x33" * 32,
+                claimant=_CLAIMANT,
+                refundee=_REFUNDEE,
+                timeout=_FUND_TIMEOUT,
+                amount_wei=_AMOUNT,
+                on_push_nonce=_remember,
+            )
+        )
+        assert reported, "the push nonce was never reported, so no retry could reuse it"
+        assert reported[0] == leg._test_state["push_nonce_used"], (
+            f"reported {reported[0]} but built the push with {leg._test_state['push_nonce_used']}"
+        )
+
+    def test_a_RESUME_reuses_the_recorded_pin_rather_than_a_fresh_nonce(self) -> None:
+        """THE property. A fresh nonce would be additive — both transactions mine and the HTLC ends
+        holding twice the amount. Reusing the pin makes the second send a replacement."""
+        order: list = []
+        leg = _real_verify_leg(on_chain={}, held=0, order=order)
+        asyncio.run(
+            leg.fund(
+                hashlock=b"\x33" * 32,
+                claimant=_CLAIMANT,
+                refundee=_REFUNDEE,
+                timeout=_FUND_TIMEOUT,
+                amount_wei=_AMOUNT,
+                resume_from=_PENDING,
+                push_nonce=41,
+            )
+        )
+        assert leg._state["push_nonce_used"] == 41, (
+            f"the resume built its push at nonce {leg._state['push_nonce_used']} instead of the "
+            "recorded pin 41 — a fresh nonce is ADDITIVE and funds the HTLC twice"
+        )
+
+    def test_a_STOLEN_pin_is_detected_and_fails_closed(self) -> None:
+        """The failure mode the spike surfaced. Any other transaction from the same key can take
+        the pinned slot; once it mines the pin is spent forever. Re-pinning silently would be the
+        double-fund again, because two resumers can re-pin to DIFFERENT nonces and both land."""
+        order: list = []
+        leg = _real_verify_leg(on_chain={}, held=0, order=order, inflight=0, settled=99)
+        with pytest.raises(NetworkError, match="already been consumed"):
+            asyncio.run(
+                leg.fund(
+                    hashlock=b"\x33" * 32,
+                    claimant=_CLAIMANT,
+                    refundee=_REFUNDEE,
+                    timeout=_FUND_TIMEOUT,
+                    amount_wei=_AMOUNT,
+                    resume_from=_PENDING,
+                    push_nonce=41,
+                )
+            )
+        assert order == [], "value was sent against a pin that another transaction had consumed"

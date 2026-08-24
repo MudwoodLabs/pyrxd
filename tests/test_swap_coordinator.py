@@ -1714,6 +1714,7 @@ class FakeEthLeg:
         self._verdict = verdict
         self.provenance_ok = provenance_ok
         self.resumed_from = None
+        self.push_nonce_seen = None
         self.fund_amount_delta = fund_amount_delta  # simulate a mis-funded (over/under) contract
         self.verify_raises = verify_raises  # simulate verify_funded failing AFTER deploy (atomicity inversion)
         self.calls: list[str] = []
@@ -1738,11 +1739,19 @@ class FakeEthLeg:
     def locked_amount(self, locator) -> int:
         return locator.amount_wei
 
-    async def fund(self, terms, *, on_deploy=None, resume_from=None) -> EthHtlcLocator:
+    async def fund(
+        self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None
+    ) -> EthHtlcLocator:
         # Deploy+fund THEN verify (the ETH ordering the audit flagged): if verify_raises, the
         # contract is already deployed on-chain when we raise — the atomicity inversion.
         self.calls.append("fund")
         self.resumed_from = resume_from
+        self.push_nonce_seen = push_nonce
+        # Mirror the real leg: report the nonce the push is pinned to BEFORE broadcasting, so the
+        # caller can make it durable. A fake that skipped this would hide a coordinator that never
+        # records the pin — and an unrecorded pin is no pin at all on the retry that needs it.
+        if on_push_nonce is not None and push_nonce is None:
+            await on_push_nonce(7)
         # Mirror the real leg: report the deployed address before returning a locator, so a
         # coordinator test can observe what the record holds mid-fund.
         if on_deploy is not None:
@@ -2885,3 +2894,42 @@ async def test_an_ETH_fund_without_a_PERSIST_hook_is_refused():
     with pytest.raises(ValidationError, match="durable persist hook"):
         await coord.taker_funds_btc(terms, now_unix_s=_NOW)
     assert "fund" not in leg.calls
+
+
+async def test_the_coordinator_records_the_pinned_push_nonce_before_the_push():
+    """Nonce pinning is what makes funding idempotent without a distributed lock — a re-send at a
+    recorded nonce REPLACES rather than adds (measured 2026-08-24). The pin is only worth anything
+    on a retry, and a retry only happens after a crash, so a pin the coordinator never persisted is
+    no pin at all.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+    await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+
+    pins = [getattr(r, "pending_push_nonce", None) for r in coord.persisted]
+    assert 7 in pins, (
+        f"the pinned push nonce was never PERSISTED, so a retry after a crash would build a fresh "
+        f"nonce and fund the HTLC a second time; persisted pins were {pins}"
+    )
+
+
+async def test_a_resume_passes_the_RECORDED_pin_down_to_the_leg():
+    """The other half: recording it is useless if the resume does not send it back."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, fund_lock=_MemLock())
+    coord.record = dataclasses.replace(
+        coord.record,
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+        pending_push_nonce=41,
+    )
+    coord.seen_store.reserve(h)
+    await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert leg.push_nonce_seen == 41, (
+        f"the resume sent push_nonce={leg.push_nonce_seen} instead of the recorded pin 41 — a fresh "
+        "nonce is additive and funds the HTLC twice"
+    )
