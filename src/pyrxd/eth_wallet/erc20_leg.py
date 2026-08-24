@@ -24,7 +24,7 @@ from typing import Any
 from ..security.errors import NetworkError, PreRevealAbort, ValidationError
 from .erc20 import assert_not_frozen_before_reveal, assert_token_matches_chain, balance_of
 from .htlc_leg import EthHtlcContractLeg, _require_web3
-from .locator import Erc20HtlcLocator, EthHtlcLocator
+from .locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy
 from .tokens import Erc20Token
 
 #: Measured on a mainnet fork against the real USDC proxy (block 25,815,805): a `transfer` into a
@@ -77,7 +77,8 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         refundee: str,
         timeout: int,
         amount_wei: int,
-        on_deploy: Callable[[str], Awaitable[None]] | None = None,
+        on_deploy: Callable[[str, str], Awaitable[None]] | None = None,
+        resume_from: PendingDeploy | None = None,
     ) -> EthHtlcLocator:
         """Deploy the HTLC, push the tokens into it, and only then return a locator.
 
@@ -99,6 +100,18 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         deployed address after the deploy CONFIRMS and strictly BEFORE the token push, so the
         caller can make it durable first; the coordinator passes a hook that writes it to the
         swap record. A caller that passes nothing keeps the old behaviour.
+
+        ``resume_from`` completes a fund that was interrupted, using the contract already deployed
+        instead of deploying a second one. Two things make that safe, and both are load-bearing:
+
+        * The existing contract's IMMUTABLES are verified against these arguments before anything
+          is sent to it. A resume is driven by a durable record, and sending tokens to an address
+          out of a record without re-deriving what it actually is would let a corrupted or
+          tampered record redirect the funds anywhere.
+        * The balance already there is READ FIRST and only the shortfall is sent. A lost receipt —
+          the push landed but the process died before seeing it — is indistinguishable from a push
+          that never happened, and re-sending the full amount on that reading would double-fund.
+          Reading the chain makes the two cases the same case.
         """
         if not isinstance(hashlock, (bytes, bytearray)) or len(hashlock) != 32:
             raise ValidationError("hashlock must be 32 bytes")
@@ -111,6 +124,49 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # these scales the difference is a factor of 10^12 in everything that follows.
         await assert_token_matches_chain(self._rpc, self._token)
 
+        checksum = web3.Web3.to_checksum_address
+        if resume_from is not None:
+            address = checksum(resume_from.address)
+            deploy_hash = resume_from.deploy_tx_hash
+            # PROVE it is ours before sending anything to it. `verify_funded` runs the full
+            # immutable binding (hashlock, claimant, refundee, timeout, token) plus the runtime-code
+            # and recipient checks; `expected_amount_wei=0` waives ONLY the balance requirement,
+            # which is the one thing a half-finished fund is legitimately allowed to fail.
+            await self.verify_funded(
+                self._locator_for(
+                    address=address,
+                    deploy_hash=deploy_hash,
+                    hashlock=hashlock,
+                    claimant=checksum(claimant),
+                    refundee=checksum(refundee),
+                    timeout=timeout,
+                    amount_wei=amount_wei,
+                ),
+                expected_amount_wei=0,
+            )
+        else:
+            address, deploy_hash = await self._deploy(
+                web3=web3,
+                hashlock=hashlock,
+                claimant=claimant,
+                refundee=refundee,
+                timeout=timeout,
+                amount_wei=amount_wei,
+                on_deploy=on_deploy,
+            )
+        return await self._push_and_bind(
+            web3=web3,
+            address=address,
+            deploy_hash=deploy_hash,
+            hashlock=hashlock,
+            claimant=claimant,
+            refundee=refundee,
+            timeout=timeout,
+            amount_wei=amount_wei,
+        )
+
+    async def _deploy(self, *, web3, hashlock, claimant, refundee, timeout, amount_wei, on_deploy):
+        """Deploy a fresh HTLC and report it before any value moves. Returns (address, tx hash)."""
         checksum = web3.Web3.to_checksum_address
         c = self._rpc.w3.eth.contract(abi=self._artifact["abi"], bytecode=self._artifact["bytecode"])
         ctor = c.constructor(
@@ -134,20 +190,31 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # after the push, a crash leaves real value in a contract whose address was never written
         # down. Awaited, not fire-and-forget — if the caller cannot persist it, we must not push.
         if on_deploy is not None:
-            await on_deploy(address)
+            await on_deploy(address, deploy_hash)
+        return address, deploy_hash
 
-        # --- second transaction: push the tokens in. No approve, no transferFrom. ---
-        token_c = self._rpc.w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)
-        push_tx = await self._base_tx(gas=_TOKEN_TRANSFER_GAS)
-        push_built = await token_c.functions.transfer(address, int(amount_wei)).build_transaction(push_tx)
-        push_hash = await self._sign_and_send(push_built)
-        push_receipt = await self._rpc.wait_receipt(push_hash)
-        if int(push_receipt.get("status", 0)) != 1:
-            raise NetworkError(
-                f"token transfer into {address} reverted (status != 1): {push_hash}. The HTLC is "
-                "deployed but UNFUNDED; it holds nothing, and the tokens are still in the sender's "
-                "wallet."
-            )
+    async def _push_and_bind(self, *, web3, address, deploy_hash, hashlock, claimant, refundee, timeout, amount_wei):
+        """Top the HTLC up to the promised amount and return its locator."""
+        checksum = web3.Web3.to_checksum_address
+        # READ FIRST. What is already there decides what to send: on a fresh deploy this is 0 and
+        # the shortfall is the whole amount, while on a resume it may be anything from 0 to the
+        # full amount (a push whose receipt was lost). Sending `amount_wei` unconditionally would
+        # double-fund exactly the case a resume exists to handle.
+        held = await balance_of(self._rpc, self._token, address)
+        shortfall = int(amount_wei) - int(held)
+        if shortfall > 0:
+            # --- push the tokens in. No approve, no transferFrom. ---
+            token_c = self._rpc.w3.eth.contract(address=checksum(self._token.address), abi=_TRANSFER_ABI)
+            push_tx = await self._base_tx(gas=_TOKEN_TRANSFER_GAS)
+            push_built = await token_c.functions.transfer(address, shortfall).build_transaction(push_tx)
+            push_hash = await self._sign_and_send(push_built)
+            push_receipt = await self._rpc.wait_receipt(push_hash)
+            if int(push_receipt.get("status", 0)) != 1:
+                raise NetworkError(
+                    f"token transfer into {address} reverted (status != 1): {push_hash}. The HTLC "
+                    f"holds {held} base units and needed {shortfall} more; the remainder is still "
+                    "in the sender's wallet."
+                )
 
         # Confirm from chain state rather than trusting the receipt: a fee-on-transfer or otherwise
         # non-standard token can succeed while delivering less than it was asked to.
@@ -163,13 +230,33 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # 6-decimal base units in a field every reader treats as wei — the 10^12 error the tag
         # exists to prevent, as the DEFAULT behaviour of a real token swap. Caught by review, not
         # by tests, because the tests built locators by hand and nothing exercised this producer.
+        return self._locator_for(
+            address=address,
+            deploy_hash=deploy_hash,
+            hashlock=hashlock,
+            claimant=checksum(claimant),
+            refundee=checksum(refundee),
+            timeout=timeout,
+            amount_wei=amount_wei,
+        )
+
+    def _locator_for(self, *, address, deploy_hash, hashlock, claimant, refundee, timeout, amount_wei):
+        """The single producer of this leg's locator.
+
+        `Erc20HtlcLocator`, NOT the parent. Returning the parent made the whole chain-tag mechanism
+        dead on the write side: the record serialised as `chain: "eth"` carrying 6-decimal base
+        units in a field every reader treats as wei — the 10^12 error the tag exists to prevent, as
+        the DEFAULT behaviour of a real token swap. It was caught by review, not by tests, because
+        the tests built locators by hand and nothing exercised the producer. Keeping ONE producer
+        is what stops the resume path from becoming a second place to get this wrong.
+        """
         return Erc20HtlcLocator(
             chain_id=self._chain_id,
             contract_address=address,
             deploy_tx_hash=deploy_hash if deploy_hash.startswith("0x") else "0x" + deploy_hash,
             hashlock="0x" + bytes(hashlock).hex(),
-            claimant=checksum(claimant),
-            refundee=checksum(refundee),
+            claimant=claimant,
+            refundee=refundee,
             timeout=int(timeout),
             amount_wei=int(amount_wei),
             token_address=self._token.address,

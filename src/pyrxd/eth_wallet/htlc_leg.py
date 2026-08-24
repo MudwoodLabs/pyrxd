@@ -392,7 +392,7 @@ class EthHtlcContractLeg:
         refundee: str,
         timeout: int,
         amount_wei: int,
-        on_deploy: Callable[[str], Awaitable[None]] | None = None,
+        on_deploy: Callable[[str, str], Awaitable[None]] | None = None,
     ) -> EthHtlcLocator:
         """Deploy + fund the HTLC (payable constructor). Returns the locator ONLY after
         the deploy tx confirms with status==1 (a reverted/dropped deploy never yields a
@@ -430,7 +430,7 @@ class EthHtlcContractLeg:
         # frame. `refund()` recovers it after the timeout, but only for an operator who knows where
         # to point it. See `Erc20HtlcLeg.fund`, where the same hazard spans two transactions.
         if on_deploy is not None:
-            await on_deploy(web3.Web3.to_checksum_address(addr))
+            await on_deploy(web3.Web3.to_checksum_address(addr), tx_hash)
         return EthHtlcLocator(
             chain_id=self._chain_id,
             contract_address=web3.Web3.to_checksum_address(addr),

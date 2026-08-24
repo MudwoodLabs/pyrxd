@@ -66,7 +66,7 @@ class CounterChainLeg(ABC):
     """
 
     @abstractmethod
-    async def fund(self, terms: Any, *, on_deploy: Any = None) -> Any:
+    async def fund(self, terms: Any, *, on_deploy: Any = None, resume_from: Any = None) -> Any:
         """Lock the counter-chain value into a fresh HTLC; return its durable locator.
 
         MUST NOT return a locator until the funding is confirmed/irreversible enough that
@@ -83,6 +83,13 @@ class CounterChainLeg(ABC):
         Legs that ignore it must still ACCEPT it. The caller passes it to close a real fund-loss
         gap — value on chain that no durable record references — and a leg that rejects the
         argument turns that into a crash at funding time.
+
+        ``resume_from`` is the same handle coming back: a previously reported location whose
+        funding did not complete. When set, the leg MUST NOT create a second HTLC — it completes
+        the existing one, re-reading what already landed there so a lost receipt cannot double-fund,
+        and it MUST verify that location really carries this swap's terms before sending anything
+        to it. A leg whose funding address is derived from terms is idempotent by construction and
+        may ignore this.
         """
 
     @abstractmethod

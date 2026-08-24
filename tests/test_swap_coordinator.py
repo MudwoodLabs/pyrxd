@@ -1712,6 +1712,7 @@ class FakeEthLeg:
         self._p = preimage.unsafe_raw_bytes() if isinstance(preimage, SecretBytes) else bytes(preimage)
         self._verdict = verdict
         self.provenance_ok = provenance_ok
+        self.resumed_from = None
         self.fund_amount_delta = fund_amount_delta  # simulate a mis-funded (over/under) contract
         self.verify_raises = verify_raises  # simulate verify_funded failing AFTER deploy (atomicity inversion)
         self.calls: list[str] = []
@@ -1736,14 +1737,15 @@ class FakeEthLeg:
     def locked_amount(self, locator) -> int:
         return locator.amount_wei
 
-    async def fund(self, terms, *, on_deploy=None) -> EthHtlcLocator:
+    async def fund(self, terms, *, on_deploy=None, resume_from=None) -> EthHtlcLocator:
         # Deploy+fund THEN verify (the ETH ordering the audit flagged): if verify_raises, the
         # contract is already deployed on-chain when we raise — the atomicity inversion.
         self.calls.append("fund")
+        self.resumed_from = resume_from
         # Mirror the real leg: report the deployed address before returning a locator, so a
         # coordinator test can observe what the record holds mid-fund.
         if on_deploy is not None:
-            await on_deploy("0x" + "ab" * 20)
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
         loc = EthHtlcLocator(
             chain_id=11155111,
             contract_address="0x" + "ab" * 20,
@@ -2742,3 +2744,50 @@ async def test_the_coordinator_persists_a_deployed_eth_contract_onto_the_record(
     assert coord.record.pending_counter_contract is None
     assert coord.record.counterchain_locator is not None
     assert coord.record.counterchain_locator.contract_address.lower() == "0x" + "ab" * 20
+
+
+async def test_a_crashed_fund_can_be_RESUMED_instead_of_being_refused_forever():
+    """The retry half of the mid-fund crash story, through the REAL coordinator.
+
+    `reserve(H)` commits before the only broadcast, on purpose — two concurrent funders of the same
+    H must not both proceed. But that made a crashed fund unrecoverable in-band: the record stays
+    NEGOTIATED, the reservation is spent, and every retry is refused with "H already reserved". The
+    only knob an operator actually had was calling `fund` directly, which deploys a SECOND contract
+    and pushes a second full amount.
+
+    A record carrying a pending deploy is proof this swap already won that race, so the retry
+    resumes rather than re-reserving.
+    """
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg)
+
+    # Simulate the crash: the deploy landed and was persisted, nothing else completed.
+    coord.record = dataclasses.replace(
+        coord.record,
+        pending_counter_contract="0x" + "ab" * 20,
+        pending_counter_deploy_tx="0x" + "cd" * 32,
+    )
+    # The reservation is already spent — as it would be after the crash.
+    coord.seen_store.reserve(h)
+
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+
+    assert rec.state is SwapState.BTC_LOCKED, "the resumed fund did not complete"
+    assert leg.resumed_from is not None, "the leg was asked to fund fresh instead of resuming"
+    assert leg.resumed_from.address == "0x" + "ab" * 20
+    assert leg.resumed_from.deploy_tx_hash == "0x" + "cd" * 32
+
+
+async def test_a_FRESH_fund_still_reserves_H_and_a_second_funder_is_refused():
+    """The guarantee the resume path must not weaken. Without a pending deploy on the record, the
+    reservation still runs and still refuses a second funder of the same H — otherwise the resume
+    would have turned a real defence into an opt-out."""
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    coord = _eth_coord_full(terms=terms, eth_leg=FakeEthLeg(preimage=secret, verdict=_final()))
+    coord.seen_store.reserve(h)  # somebody else got there first
+    with pytest.raises(ValidationError, match="hashlock H reused"):
+        await coord.taker_funds_btc(terms, now_unix_s=_NOW)
+    assert coord.record.state is SwapState.NEGOTIATED

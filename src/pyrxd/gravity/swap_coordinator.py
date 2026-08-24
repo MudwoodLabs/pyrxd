@@ -51,7 +51,7 @@ from pyrxd.btc_wallet.taproot import (
     btc_input_outpoints_from_raw,
 )
 from pyrxd.eth_wallet.chains import ETH_FINALIZATION_WINDOW_FLOOR_S
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import EthHtlcLocator, PendingDeploy
 from pyrxd.glyph.credential_binding import CredentialBindingError, assert_soulbound_credential
 from pyrxd.gravity.htlc_covenant import holder_hash
 from pyrxd.security.errors import NetworkError, PreRevealAbort, ValidationError
@@ -1254,7 +1254,13 @@ class SwapCoordinator:
         # 2. H freshness — advisory read-only probe for a clean early reject; the
         #    authoritative atomic reserve is in taker_funds_btc, pre-broadcast.
         try:
-            if self.seen_store.has_seen(terms.hashlock):
+            # A record carrying a pending deploy means THIS swap already reserved H and put a
+            # contract on chain before being interrupted, so seeing H here is expected rather than
+            # suspicious — refusing would make a crashed fund permanently unresumable, which is the
+            # state this whole handle exists to escape. The authoritative atomic reserve below is
+            # skipped on that same evidence; a resume completes the existing contract rather than
+            # creating a second one, so the property this probe defends is untouched.
+            if not self.record.pending_counter_contract and self.seen_store.has_seen(terms.hashlock):
                 return PreBtcLockGate(ok=False, reason="hashlock H reused (free-option / preimage-replay risk)")
         except Exception as exc:
             return PreBtcLockGate(ok=False, reason=f"seen-store unavailable; fail-closed ({exc})")
@@ -1425,12 +1431,26 @@ class SwapCoordinator:
         # (refuse to fund), never open. H is consumed at this COMMIT point, not after
         # fund() succeeds: an on-chain-locked HTLC has used its H, and a transient
         # post-fund failure must not re-open the free-option / preimage-replay window.
-        try:
-            reserved = self.seen_store.reserve(terms.hashlock)
-        except Exception as exc:
-            raise ValidationError(f"seen-store unavailable; fail-closed ({exc})") from exc
-        if not reserved:
-            raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
+        # RESUME, or reserve. A record carrying a pending deploy is proof that THIS swap already
+        # won the reservation race and got as far as putting a contract on chain — so re-reserving
+        # would refuse us our own H, permanently, which is exactly the state a mid-fund crash used
+        # to leave behind. Skipping the reserve here does not weaken the guarantee it provides:
+        # the resume completes the EXISTING contract rather than creating a second one, the leg
+        # verifies that contract carries this swap's immutables before sending anything to it, and
+        # it re-reads the balance so a lost receipt cannot double-fund.
+        resume_from = None
+        if self.record.pending_counter_contract:
+            resume_from = PendingDeploy(
+                address=self.record.pending_counter_contract,
+                deploy_tx_hash=str(self.record.pending_counter_deploy_tx),
+            )
+        else:
+            try:
+                reserved = self.seen_store.reserve(terms.hashlock)
+            except Exception as exc:
+                raise ValidationError(f"seen-store unavailable; fail-closed ({exc})") from exc
+            if not reserved:
+                raise ValidationError("hashlock H already reserved; refusing to fund (free-option / preimage-replay)")
 
         # An ETH-side contract address is not derivable from terms — it depends on the deployer's
         # nonce — so unlike the BTC path there is nothing to persist BEFORE the broadcast. The next
@@ -1438,12 +1458,16 @@ class SwapCoordinator:
         # strictly before the tokens are pushed into it. Without this the intent record above knows
         # the swap exists but not WHERE its value went, and a crash mid-fund leaves real value in a
         # contract referenced only by an exception string.
-        async def _remember_deploy(address: str) -> None:
-            self.record = dataclasses.replace(self.record, pending_counter_contract=address)
+        async def _remember_deploy(address: str, deploy_tx_hash: str) -> None:
+            self.record = dataclasses.replace(
+                self.record,
+                pending_counter_contract=address,
+                pending_counter_deploy_tx=deploy_tx_hash,
+            )
             await self._persist_record(self.record, shield=True)
 
         if terms.counter_chain == "eth":
-            locator = await self.counter_leg.fund(terms, on_deploy=_remember_deploy)
+            locator = await self.counter_leg.fund(terms, on_deploy=_remember_deploy, resume_from=resume_from)
         else:
             locator = await self.counter_leg.fund(terms)
         if not isinstance(locator, (BtcHtlcLocator, EthHtlcLocator)):

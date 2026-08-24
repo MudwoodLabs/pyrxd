@@ -480,6 +480,11 @@ class SwapRecord:
     #: hand is not a recovery procedure. Also covers the native leg, whose payable constructor is
     #: one transaction but which can still die between the deploy receipt and `verify_funded`.
     pending_counter_contract: str | None = None
+    #: The deploy transaction of :attr:`pending_counter_contract`. Persisted alongside the address
+    #: because a resume must rebuild a full locator, and the watchtower's claim-status path reads
+    #: this hash — the `"0x" + "00"*32` placeholder `expected_locator` uses for an unknown deploy
+    #: would silently break it. Unrecoverable after the fact, like the address itself.
+    pending_counter_deploy_tx: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.state, SwapState):
@@ -527,6 +532,15 @@ class SwapRecord:
                     f"counter_chain {self.terms.counter_chain!r}"
                 )
             object.__setattr__(self, "pending_counter_contract", self.pending_counter_contract.lower())
+        if bool(self.pending_counter_contract) != bool(self.pending_counter_deploy_tx):
+            raise ValidationError(
+                "pending_counter_contract and pending_counter_deploy_tx must be set together: "
+                "half a handle cannot rebuild a locator, and a resume that cannot rebuild one "
+                "would redeploy and double-fund"
+            )
+        tx = self.pending_counter_deploy_tx
+        if tx is not None and (not isinstance(tx, str) or not tx.startswith("0x")):
+            raise ValidationError("pending_counter_deploy_tx must be a 0x-prefixed hex hash")
         if self.radiant_covenant_outpoint is not None and not isinstance(self.radiant_covenant_outpoint, str):
             raise ValidationError("radiant_covenant_outpoint must be a str or None")
         if self.radiant_covenant_spk_hex is not None:
@@ -563,7 +577,9 @@ class SwapRecord:
         carries the address itself. Leaving a stale "pending" handle behind would point recovery at
         a swap that no longer needs it.
         """
-        return dataclasses.replace(self, counterchain_locator=locator, pending_counter_contract=None)
+        return dataclasses.replace(
+            self, counterchain_locator=locator, pending_counter_contract=None, pending_counter_deploy_tx=None
+        )
 
     def with_btc_lock(self, locator: BtcHtlcLocator) -> SwapRecord:
         """Transitional alias for :meth:`with_counter_lock` (BTC reader sites)."""
@@ -602,6 +618,7 @@ class SwapRecord:
         # ETH record that never had a pending deploy does not grow a null field either.
         if self.pending_counter_contract:
             d["pending_counter_contract"] = self.pending_counter_contract
+            d["pending_counter_deploy_tx"] = self.pending_counter_deploy_tx
         return d
 
     @classmethod
@@ -631,6 +648,7 @@ class SwapRecord:
             radiant_covenant_outpoint=d.get("radiant_covenant_outpoint"),
             radiant_covenant_spk_hex=d.get("radiant_covenant_spk_hex"),
             pending_counter_contract=d.get("pending_counter_contract"),
+            pending_counter_deploy_tx=d.get("pending_counter_deploy_tx"),
         )
 
 

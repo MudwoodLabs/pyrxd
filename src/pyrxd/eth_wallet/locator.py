@@ -19,7 +19,7 @@ from typing import ClassVar
 
 from pyrxd.security.errors import ValidationError
 
-__all__ = ["Erc20HtlcLocator", "EthHtlcLocator", "check_hex_addr"]
+__all__ = ["Erc20HtlcLocator", "EthHtlcLocator", "PendingDeploy", "check_hex_addr"]
 
 
 #: The ONLY accepted spelling of an EVM address anywhere in this package. Anchored, ASCII-only.
@@ -47,6 +47,27 @@ def check_hex_addr(name: str, val: str) -> str:
 
 def _check_hex_addr(name: str, val: str) -> str:
     return check_hex_addr(name, val)
+
+
+@dataclass(frozen=True)
+class PendingDeploy:
+    """An HTLC that exists on chain but is not yet an accepted funded locator.
+
+    The handle a resume needs, and the smallest thing that makes one possible. A CREATE address
+    depends on the deployer's nonce, so it is unknowable until the deploy receipt returns; the
+    deploy tx hash is equally unrecoverable afterwards and the watchtower's claim-status path reads
+    it. Persisting both is what turns "value on chain that nothing references" into "a fund that
+    can be completed".
+    """
+
+    address: str
+    deploy_tx_hash: str
+
+    def __post_init__(self) -> None:
+        check_hex_addr("PendingDeploy.address", self.address)
+        if not isinstance(self.deploy_tx_hash, str) or not self.deploy_tx_hash.startswith("0x"):
+            raise ValidationError("PendingDeploy.deploy_tx_hash must be a 0x-prefixed hex hash")
+        object.__setattr__(self, "address", self.address.lower())
 
 
 @dataclass(frozen=True)
