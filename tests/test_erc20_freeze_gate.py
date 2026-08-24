@@ -407,7 +407,6 @@ def _leg_with_frozen(*, frozen_addrs: set, held: int = 12_345_678):
     return leg
 
 
-
 class TestTheGateDoesNotVetoAClaimOnAnAddressThatCannotAffectIt:
     """Round 5, flagged independently by two reviewers. `claim` sweeps to the CLAIMANT. The
     refundee is touched only by `refund()`, so a frozen refundee cannot make a claim revert —

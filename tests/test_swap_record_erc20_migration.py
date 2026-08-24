@@ -9,6 +9,7 @@ written but never read back, so bumping it would accomplish nothing.
 from __future__ import annotations
 
 import dataclasses
+
 import pytest
 
 from pyrxd.eth_wallet.locator import Erc20HtlcLocator, EthHtlcLocator
