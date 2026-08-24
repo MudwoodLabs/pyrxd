@@ -33,6 +33,8 @@ from pyrxd.security.errors import PreRevealAbort
 from pyrxd.security.secrets import PrivateKeyMaterial
 
 _ART = json.loads((pathlib.Path(__file__).parent / "fixtures" / "EthHtlc.json").read_text())
+_CONTRACT = "0x" + "11" * 20
+_PREIMAGE = b"\x11" * 32
 _TIMEOUT = 1_800_000_000
 
 
@@ -66,6 +68,15 @@ def _leg(now_ts: int, *, sent: list):
 
         async def assert_chain(self):
             return None
+
+        async def wait_receipt(self, tx_hash, **_k):
+            # `claim` now CONFIRMS before reporting success: status == 1 plus a Claimed(p) log
+            # emitted by this swap's own contract. A fake that stops at submission would let a
+            # reverted claim look successful — which is the defect being fixed.
+            return {
+                "status": 1,
+                "logs": [{"address": _CONTRACT, "topics": [], "data": "0x" + _PREIMAGE.hex()}],
+            }
 
     leg = EthHtlcContractLeg(rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_ART)
 
@@ -263,6 +274,15 @@ def _fee_leg(now_ts: int, cap: list):
 
         async def get_transaction_count(self, _addr):
             return 0
+
+        async def wait_receipt(self, tx_hash, **_k):
+            # `claim` now CONFIRMS before reporting success: status == 1 plus a Claimed(p) log
+            # emitted by this swap's own contract. A fake that stops at submission would let a
+            # reverted claim look successful — which is the defect being fixed.
+            return {
+                "status": 1,
+                "logs": [{"address": _CONTRACT, "topics": [], "data": "0x" + _PREIMAGE.hex()}],
+            }
 
     leg = EthHtlcContractLeg(rpc=_Rpc(), signing_key=PrivateKeyMaterial(os.urandom(32)), chain_id=1, artifact=_ART)
 
