@@ -77,6 +77,7 @@ __all__ = [
     "ESTIMATED_BTC_CLAIM_REORG_DEPTH_BLOCKS",
     "ESTIMATED_DEFAULT_MARGIN_BLOCKS",
     "ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS",
+    "MAINNET_ETH_FINALITY_STALL_FLOOR_S",
     "MAKER_SECRET_TAKER_LOCKS_BTC_FIRST",
     "ClaimFinality",
     "MarginPolicy",
@@ -143,6 +144,14 @@ ESTIMATED_BTC_CLAIM_REORG_DEPTH_BLOCKS = 6
 # confirmations the taker's OWN asset claim must reach to be reorg-safe, and the slack
 # for it to get included — both consumed by the squeeze check below.
 ESTIMATED_RXD_CLAIM_BURIAL_BLOCKS = 6
+
+#: Minimum ``eth_finality_stall_tolerance_s`` a REAL-VALUE ETH-leg policy must carry, in seconds.
+#: Grounded in the May-2023 Ethereum mainnet finality incident (~9 epochs, roughly an hour) that
+#: `CrossClockMargin` cites as the case this budget exists for; the Sepolia 2026-06-01 stall this
+#: project observed directly ran ~20 min. An inactivity-leak worst case is unbounded, so this is a
+#: floor and not a sufficient value — larger is safer, and the cost of a larger value is only the
+#: maker's asset staying locked longer, which is liveness, never safety.
+MAINNET_ETH_FINALITY_STALL_FLOOR_S = 3600
 
 # Hard safety floor (in BLOCKS) for any reorg depth, enforced at MarginPolicy
 # construction. A 1-block depth is materially unsafe on a real chain (natural
@@ -308,6 +317,23 @@ class MarginPolicy:
                 )
         if self.cross_clock_margin is not None and not isinstance(self.cross_clock_margin, CrossClockMargin):
             raise ValidationError("MarginPolicy.cross_clock_margin must be a CrossClockMargin or None")
+        # `eth_finality_stall_tolerance_s` defaults to 0, and its own docstring calls it "the single
+        # most important safety addition" while citing an hour-long mainnet stall. A default of zero
+        # sizes the margin against HAPPY-PATH finality, which is precisely the bug a stall triggers,
+        # and nothing in this tree ever constructed a CrossClockMargin to override it — the value was
+        # entirely operator-supplied with no floor, unlike every other knob here. Enforced in
+        # real-value mode only, so tests and dust runs are unaffected.
+        if self.require_measured and self.cross_clock_margin is not None:
+            tol = self.cross_clock_margin.eth_finality_stall_tolerance_s
+            if tol < MAINNET_ETH_FINALITY_STALL_FLOOR_S:
+                raise ValidationError(
+                    f"real-value mode (require_measured=True) requires "
+                    f"CrossClockMargin.eth_finality_stall_tolerance_s >= "
+                    f"{MAINNET_ETH_FINALITY_STALL_FLOOR_S}s, got {tol}s. The taker waits for ETH "
+                    "FINALITY before claiming RXD, so the RXD refund must not open until the taker "
+                    "has had a stall-tolerant window; the May-2023 mainnet stall ran about an hour. "
+                    "Sizing this against happy-path finality is the exact bug a stall triggers."
+                )
         if self.max_covenant_confirm_wait_s is not None and (
             not isinstance(self.max_covenant_confirm_wait_s, int)
             or isinstance(self.max_covenant_confirm_wait_s, bool)
@@ -1731,9 +1757,10 @@ class SwapCoordinator:
         (recording the verified locator on the record so :meth:`maker_claims_btc` can claim it);
         RAISES on any mismatch — the maker MUST NOT lock the asset if this raises.
 
-        WHY THIS EXISTS: the runbook is TAKER-funds-counter-FIRST, MAKER-locks-asset-SECOND, so the
-        maker commits its own value against a leg the COUNTERPARTY built. Nothing else in the
-        handshake binds that leg: every other check the maker can run is a re-derivation of what the
+        WHY THIS EXISTS: the maker commits its own value against a leg the COUNTERPARTY built. The
+        runbook is MAKER-locks-asset-FIRST (the taker will not fund until `pre_btc_lock_check`
+        step 5 has read the covenant off the Radiant chain), then TAKER-funds-counter, then this.
+        Nothing else in the handshake binds that leg: every other check the maker can run is a re-derivation of what the
         counter leg SHOULD look like, and re-deriving a target says nothing about what the taker
         actually funded. This is the only place the maker compares the two against the chain.
 
@@ -2221,8 +2248,33 @@ class SwapCoordinator:
             raise ValidationError(f"mutual_refund only valid from BOTH_LOCKED, not {self.record.state.value}")
         if self.record.counterchain_locator is None:
             raise ValidationError("no BTC locator on record; BTC would strand (state was lost)")
-        await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
-        await self.radiant_leg.refund_asset(self.record)
+        # ATTEMPT BOTH, ALWAYS. These two refunds are independent — neither is a precondition for
+        # the other — so a failure in the first must not skip the second. Sequencing them with a
+        # bare `await; await` made a crash between the broadcasts unrecoverable: the record stays
+        # BOTH_LOCKED with the counter leg already refunded, and on retry the counter leg's
+        # preflight reverts against the settled contract and raises BEFORE the Radiant refund ever
+        # runs. The leg that still holds value could then never be refunded in-band, which is the
+        # opposite of what "the guaranteed-safe failure" promises.
+        failures: list[tuple[str, Exception]] = []
+        try:
+            await self.counter_leg.refund(self.record.counterchain_locator, self.record.terms.t_btc)
+        except Exception as exc:
+            failures.append(("counter leg", exc))
+        try:
+            await self.radiant_leg.refund_asset(self.record)
+        except Exception as exc:
+            failures.append(("radiant leg", exc))
+        if failures:
+            # State deliberately NOT advanced: still BOTH_LOCKED, so a retry re-attempts both. A
+            # leg that already refunded fails harmlessly the second time; a leg that did not gets
+            # its chance.
+            raise NetworkError(
+                "mutual refund incomplete — "
+                + "; ".join(f"{leg}: {exc}" for leg, exc in failures)
+                + ". The other leg was attempted regardless. The swap stays BOTH_LOCKED so a "
+                "retry re-attempts both; refunds are independent and re-attempting a settled leg "
+                "is harmless."
+            )
         self._advance(SwapEvent.BOTH_TIMEOUTS_ELAPSE)
         await self._persist_record(self.record, shield=True)
         return self.record
