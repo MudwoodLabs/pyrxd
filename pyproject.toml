@@ -309,7 +309,7 @@ dev = [
     "mypy>=2.3.0,<3.0.0",
     "pip-audit>=2.10.1,<3.0.0",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.3,<0.17.0",
+    "ruff>=0.16.4,<0.17.0",
     "taskipy>=1.14.1,<2.0.0",
     # Transitive security floor (dev-only): pip-audit -> cachecontrol pulls msgpack, which had an
     # out-of-bounds-read / crash on Unpacker reuse after a caught error in <= 1.2.0
