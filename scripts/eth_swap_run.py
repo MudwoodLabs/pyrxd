@@ -319,6 +319,33 @@ def _which(name: str) -> str:
 # --------------------------------------------------------------------------- sepolia-dust
 
 
+async def wait_for_covenant_funding(client, *, covenant_spk: bytes, expected_photons: int, poll_s: float):
+    """Block until the covenant SPK actually holds a confirmed UTXO. Polls the chain; asks nobody.
+
+    This replaces an operator ATTESTATION — a confirm() reading "you have funded the RXD covenant
+    SPK on mainnet and it has >= 1 conf". An attestation is only as good as the operator's check,
+    and under --yes it was auto-answered: the run asserted a fact nothing had verified, then handed
+    it to a gate that immediately disagreed. A question whose answer is on the chain should be
+    asked of the chain.
+    """
+    client.register_spk(covenant_spk)
+    script_hash = hashlib.sha256(bytes(covenant_spk)).digest()[::-1]
+    print(f"\n  Fund the RXD covenant SPK on MAINNET as the maker ({expected_photons} photons):")
+    print(f"    {covenant_spk.hex()}")
+    print("  waiting for it to appear on chain (this run does NOT proceed until it does)...")
+    while True:
+        utxos = await client.get_utxos(script_hash)
+        for u in utxos or []:
+            if int(u.value) == int(expected_photons):
+                print(f"  covenant funded: {u.txid}:{u.vout} ({u.value} photons)")
+                return u
+        if utxos:
+            # Present but wrong value: say so rather than waiting silently forever. The covenant
+            # pins its amount, so a mis-funded UTXO is not one the swap can ever use.
+            print(f"  SPK holds {[int(u.value) for u in utxos]} photons, need exactly {expected_photons}")
+        await asyncio.sleep(poll_s)
+
+
 async def run_sepolia_dust(args: argparse.Namespace) -> None:
     if not args.i_accept_dust_loss:
         raise SystemExit("stage=sepolia-dust requires --i-accept-dust-loss (you are moving REAL mainnet RXD)")
@@ -515,47 +542,15 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         )
 
     try:
-        # 1. Taker deploys + funds the ETH HTLC on Sepolia.
-        confirm("taker_funds_btc: deploy+fund the ETH HTLC on SEPOLIA (taker pays sepolia gas)", auto_yes=args.yes)
-        if args.resume:
-            # THE READ SIDE. Loads the record the interrupted run persisted and completes the fund
-            # it describes — reusing the deployed contract and the pinned nonce, so a retry cannot
-            # deploy a second HTLC or send a second transfer. Without this entry point the durable
-            # record was written and never read, and every guard on the resume path was unreachable.
-            rec = await coord.resume_interrupted_fund(
-                terms,
-                sink=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
-                now_unix_s=int(time.time()),
-            )
-        else:
-            rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
-        report.step(
-            name="taker_funds_eth",
-            chain="eth",
-            state=rec.state.value,
-            contract=rec.counterchain_locator.contract_address,
-        )
-        print(f"  -> {rec.state.value} (ETH HTLC: {rec.counterchain_locator.contract_address})")
-        # PERSIST the per-swap contract address now that it exists. It is the ETH-side
-        # provenance anchor (`pyrxd swap recover-preimage --eth-contract`): only artifacts
-        # bound to THIS address may be scraped for p. Previously only eth_swap_two_host.py
-        # wrote it, so a crash here left the address on the console alone.
-        merge_into_mode_600(keys_path, {"eth_contract_address": rec.counterchain_locator.contract_address})
-
-        # 1b. MAKER verifies the taker-deployed ETH HTLC binds to terms BEFORE locking RXD
-        #     (red-team CRITICAL/HIGH). In a real TWO-PARTY flow this is the maker's go/no-go gate —
-        #     it fails closed if the taker deployed claimant=self / underfunded / bad timeout, so the
-        #     maker never locks RXD for nothing. (Here, single-operator, taker_funds_btc already set
-        #     the locator and post_asset_lock_revalidate re-verifies pinned to finality as a backstop;
-        #     we still run it explicitly to exercise the gate and document the two-party step.)
-        confirm("maker_verify_counter_funding: verify the on-chain ETH HTLC pays the maker", auto_yes=args.yes)
-        rec = await coord.maker_verify_counter_funding(rec.counterchain_locator.contract_address)
-        report.step(name="maker_verify_counter_funding", chain="eth", state=rec.state.value)
-        print("  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
-
-        # 2. Maker locks the ASSET on MAINNET, then the taker re-validates (incl. the genesis-ref
-        #    authenticity gate for an NFT). NFT: spend the minted singleton INTO the covenant SPK
-        #    (harness-driven, confirm-each). RXD: the operator funds the SPK out-of-band.
+        # 1. MAKER LOCKS THE RADIANT ASSET FIRST. This ordering is the protocol, not a preference:
+        #    the maker is the party that knows p, so a maker who locks SECOND holds a free option —
+        #    it can watch the taker fund and walk away having risked nothing. HZ-1 enforces it from
+        #    the other side, refusing `taker_funds_btc` until the covenant is verified ON CHAIN.
+        #
+        #    This runner used to do the reverse: fund the counter leg at step 1 and print "fund the
+        #    RXD covenant" at step 2. That order predates HZ-1 (#392) and the gate has refused it
+        #    ever since — the runner has been unable to complete a swap, and nothing reported it
+        #    because exercising it costs real mainnet value.
         rxd_locked_at = rxd_blockcount(rxd_client)
         if args.asset_variant == "nft":
             lock_singleton_into_covenant(
@@ -577,8 +572,45 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
                 poll_s=args.confirm_poll_s,
             )
         else:
-            print(f"\n  Fund the RXD covenant SPK on MAINNET as the maker (>= 1 conf):\n    {cov.funded_spk.hex()}")
-            confirm("you have funded the RXD covenant SPK on mainnet and it has >= 1 conf", auto_yes=args.yes)
+            await wait_for_covenant_funding(
+                rxd_client,
+                covenant_spk=cov.funded_spk,
+                expected_photons=args.rxd_photons,
+                poll_s=args.confirm_poll_s,
+            )
+
+        # 2. TAKER funds the counter leg. The pre-lock gate re-reads the covenant off the chain
+        #    itself; the wait above only means we do not ask it to check something not there yet.
+        confirm(
+            f"taker_funds_btc: deploy+fund the {_asset} HTLC on {_eth_chain.name} (taker pays gas)",
+            auto_yes=args.yes,
+        )
+        if args.resume:
+            # THE READ SIDE. Loads the record the interrupted run persisted and completes the fund
+            # it describes — reusing the deployed contract and the pinned nonce, so a retry cannot
+            # deploy a second HTLC or send a second transfer. Without this entry point the durable
+            # record was written and never read, and every guard on the resume path was unreachable.
+            rec = await coord.resume_interrupted_fund(
+                terms,
+                sink=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
+                now_unix_s=int(time.time()),
+            )
+        else:
+            rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
+        report.step(
+            name="taker_funds_eth",
+            chain="eth",
+            state=rec.state.value,
+            contract=rec.counterchain_locator.contract_address,
+        )
+        print(f"  -> {rec.state.value} ({_asset} HTLC: {rec.counterchain_locator.contract_address})")
+        # PERSIST the per-swap contract address now that it exists. It is the ETH-side
+        # provenance anchor (`pyrxd swap recover-preimage --eth-contract`): only artifacts
+        # bound to THIS address may be scraped for p. Previously only eth_swap_two_host.py
+        # wrote it, so a crash here left the address on the console alone.
+        merge_into_mode_600(keys_path, {"eth_contract_address": rec.counterchain_locator.contract_address})
+
+        # 3. Taker re-validates the covenant pinned to finality -> BOTH_LOCKED.
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=int(time.time()))
         report.step(
             name="post_asset_lock_revalidate",
@@ -589,6 +621,16 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
         print(f"  -> {rec.state.value}")
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(f"covenant/timing mismatch -> {rec.state.value}; refund the ETH HTLC after the timeout")
+
+        # 4. MAKER verifies the counter leg binds to terms BEFORE revealing p (red-team CRITICAL).
+        #    It used to sit before the RXD lock, as the maker's go/no-go on whether to lock at all.
+        #    Under maker-locks-first that placement is impossible — the contract does not exist yet —
+        #    so the gate moves to the other irreversible moment it protects: publishing the preimage.
+        #    Fails closed on claimant=self / underfunded / wrong timeout, before p is public.
+        confirm("maker_verify_counter_funding: verify the on-chain HTLC pays the maker", auto_yes=args.yes)
+        rec = await coord.maker_verify_counter_funding(rec.counterchain_locator.contract_address)
+        report.step(name="maker_verify_counter_funding", chain="eth", state=rec.state.value)
+        print("  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
 
         print(
             "\n  *** MONITORING WINDOW (BOTH_LOCKED): a maker stall (maker never claims the ETH, so p "
