@@ -185,7 +185,9 @@ class RadiantChainIO:
             raise NetworkError("node reported an unreadable confirmation depth; fail-closed") from exc
         return depth if depth > 0 else 0
 
-    async def find_covenant_utxo(self, spk: bytes, *, expected_value: int | None = None) -> tuple[str, int, int]:
+    async def find_covenant_utxo(
+        self, spk: bytes, *, expected_value: int | None = None, pin_outpoint: str | None = None
+    ) -> tuple[str, int, int]:
         """Locate the funded covenant UTXO for ``spk`` -> ``(outpoint, value, height)``.
 
         Scans the UTXO set of the covenant scriptPubKey (ElectrumX script-hash =
@@ -212,7 +214,26 @@ class RadiantChainIO:
             utxos = [u for u in utxos if int(u.value) == int(expected_value)]
             if not utxos:
                 raise NetworkError("no covenant UTXO matches the expected carrier value; fail-closed")
+        if pin_outpoint is not None:
+            # PIN, do not re-discover. The covenant scriptPubKey is a pure function of PUBLIC
+            # negotiated terms, so anyone can pay it — and a second payment of the same value makes
+            # this scan ambiguous. Refusing on ambiguity then denies the spend, which turns a
+            # payment anyone can make into a permanent block on the taker's claim while the maker
+            # waits out the CSV and refunds. Once the funded outpoint is known there is nothing to
+            # discover: select it and ignore the noise. The value filter above still applies to it,
+            # so a record pointing at a wrong-value output is still refused.
+            picked = [u for u in utxos if f"{u.tx_hash}:{u.tx_pos}" == pin_outpoint]
+            if not picked:
+                raise NetworkError(
+                    f"the recorded covenant outpoint {pin_outpoint} is not in this scriptPubKey's "
+                    "live UTXO set — it has been spent, reorged out, or the record is wrong; "
+                    "fail-closed"
+                )
+            utxos = picked
         if len(utxos) > 1:
+            # Only reachable on the DISCOVERY path (no pin yet). There, ambiguity is genuinely
+            # suspicious and refusing is right: nothing has been committed against a specific
+            # outpoint, so there is nothing to deny.
             raise NetworkError(f"ambiguous covenant UTXO set ({len(utxos)} candidates); fail-closed")
         u = utxos[0]
         return f"{u.tx_hash}:{u.tx_pos}", int(u.value), int(u.height)
@@ -565,8 +586,12 @@ class RadiantCovenantLeg:
         round-trip for a number we already have.
         """
         cov = self._build_covenant(record.terms)
+        # Pin to the outpoint recorded when the covenant was revalidated. Re-deriving it by scan
+        # would let anyone brick this spend by paying the covenant SPK a second time.
         outpoint, value, _height = await self.chain_io.find_covenant_utxo(
-            cov.funded_spk, expected_value=record.terms.radiant_amount
+            cov.funded_spk,
+            expected_value=record.terms.radiant_amount,
+            pin_outpoint=record.radiant_covenant_outpoint,
         )
         txid = outpoint.split(":")[0]
         confs = await self.chain_io.confirmations(txid)

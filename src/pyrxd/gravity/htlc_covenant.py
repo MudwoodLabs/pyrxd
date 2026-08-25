@@ -51,7 +51,7 @@ from pyrxd.hash import hash256
 from pyrxd.script.consensus import has_valid_ops
 from pyrxd.security.errors import ValidationError
 from pyrxd.security.types import Hex20
-from pyrxd.utils import encode_data_push, encode_int, encode_script_num
+from pyrxd.utils import decode_script_num, encode_data_push, encode_int, encode_script_num
 
 __all__ = [
     "FT_EPILOGUE",
@@ -132,6 +132,10 @@ def _push(b: bytes) -> bytes:
     return encode_data_push(b, max_len=0xFFFF)
 
 
+#: CScriptNum is capped at 8 bytes (`maxIntegerSize`); a 9-byte body is a consensus range error.
+_MAX_SCRIPT_NUM = 2**63 - 1
+
+
 def _minimal_num_push(n: int) -> bytes:
     """Minimal CScriptNum push (MANDATORY MINIMALDATA): OP_0, OP_1..OP_16, else push.
 
@@ -144,6 +148,28 @@ def _minimal_num_push(n: int) -> bytes:
     """
     if not isinstance(n, int) or isinstance(n, bool) or n < 0:
         raise ValidationError("refund_csv must be a non-negative int")
+    if n > _MAX_SCRIPT_NUM:
+        # `maxIntegerSize` is 8 bytes; a 9-byte body raises INVALID_NUMBER_RANGE_64_BIT on BOTH
+        # branches, which stalls the asset permanently. Not reachable through the leg (chain supply
+        # is far below this) but reachable by any direct caller with a units slip — and the cost of
+        # that slip is the same permanent strand.
+        raise ValidationError(f"script number {n} exceeds the 8-byte CScriptNum range ({_MAX_SCRIPT_NUM})")
+    # ROUND-TRIP the NUMBER body, because push minimality and NUMBER minimality are two different
+    # consensus rules
+    # and this operand is subject to both. `CheckMinimalPush` governs the push opcode; a body is
+    # separately re-checked by `CScriptNum::IsMinimallyEncoded` wherever it is consumed
+    # numerically — under SCRIPT_VERIFY_MINIMALDATA, which is a BLOCK flag, so a violation is not
+    # even miner-recoverable. A fixed-width encoding (`02 05 00` for 5, or 8-byte LE) satisfies the
+    # first rule and fails the second, bricking both branches. GUARD 3 audits only the first, and
+    # cannot audit the second once the script is assembled because it can no longer tell a numeric
+    # operand from a 32-byte hash. Checking here, where the type IS known, is the reliable place.
+    body = encode_script_num(n)
+    if len(body) > 8 or body != encode_script_num(decode_script_num(body)):
+        raise ValidationError(
+            f"script number {n} does not have a minimal CScriptNum body (got {body.hex()}); a "
+            "non-minimal body trips CScriptNum::IsMinimallyEncoded and permanently bricks the "
+            "covenant on BOTH branches"
+        )
     return encode_int(n)
 
 

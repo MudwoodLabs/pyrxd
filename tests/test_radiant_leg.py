@@ -999,3 +999,91 @@ async def test_a_fee_source_without_release_unspent_still_works():
     with pytest.raises(InsufficientFundsError):
         await leg.claim_asset(rec, _P)
     assert client.broadcast_raw == []
+
+
+class TestASecondPaymentToTheCovenantCannotBlockTheSpend:
+    """The covenant scriptPubKey is a pure function of PUBLIC negotiated terms, so anyone can
+    construct it and anyone can pay it.
+
+    That made a discovery-time refusal into an attack: after revealing `p`, a maker sends a second
+    ordinary output of exactly `radiant_amount` to the same address, `find_covenant_utxo` refuses
+    with "ambiguous covenant UTXO set", and the taker's claim fails on every retry until `t_rxd`
+    expires — while the autonomous executor classifies the refusal as a transient read fault and
+    keeps retrying, looking healthy. The maker then CSV-refunds both outputs.
+
+    Once the funded outpoint is known there is nothing to discover, so the spend pins to it.
+    """
+
+    @staticmethod
+    def _two_utxos(value: int):
+        return [
+            UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=value, height=100),  # the real one
+            UtxoRecord(tx_hash="99" * 32, tx_pos=0, value=value, height=140),  # the poison
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_outpoint_is_selected_out_of_a_poisoned_set(self) -> None:
+        client = FakeClient()
+        client._utxos = self._two_utxos(100_000)
+        io = RadiantChainIO(client)
+        outpoint, value, _h = await io.find_covenant_utxo(
+            b"\x00" * 25, expected_value=100_000, pin_outpoint="ab" * 32 + ":1"
+        )
+        assert outpoint == "ab" * 32 + ":1", "the poison output was selected, or the spend refused"
+        assert value == 100_000
+
+    @pytest.mark.asyncio
+    async def test_WITHOUT_a_pin_an_ambiguous_set_is_still_refused(self) -> None:
+        """The discovery path keeps its fail-closed behaviour: nothing has been committed against a
+        specific outpoint yet, so there is nothing for a refusal to deny."""
+        client = FakeClient()
+        client._utxos = self._two_utxos(100_000)
+        io = RadiantChainIO(client)
+        with pytest.raises(NetworkError, match="ambiguous"):
+            await io.find_covenant_utxo(b"\x00" * 25, expected_value=100_000)
+
+    @pytest.mark.asyncio
+    async def test_a_pin_that_is_NOT_in_the_live_set_is_refused(self) -> None:
+        """Pinning must not become a way to spend something that is gone: a recorded outpoint that
+        has been spent or reorged out must fail closed, not fall back to whatever else is there."""
+        client = FakeClient()
+        client._utxos = self._two_utxos(100_000)
+        io = RadiantChainIO(client)
+        with pytest.raises(NetworkError, match="not in this scriptPubKey"):
+            await io.find_covenant_utxo(b"\x00" * 25, expected_value=100_000, pin_outpoint="ee" * 32 + ":0")
+
+    @pytest.mark.asyncio
+    async def test_a_pinned_outpoint_still_has_to_match_the_expected_value(self) -> None:
+        """The value filter runs BEFORE the pin, so a record pointing at a wrong-value output at
+        the right address is still refused — the pin narrows, it does not waive."""
+        client = FakeClient()
+        client._utxos = [UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=42, height=100)]
+        io = RadiantChainIO(client)
+        with pytest.raises(NetworkError, match="expected carrier value"):
+            await io.find_covenant_utxo(b"\x00" * 25, expected_value=100_000, pin_outpoint="ab" * 32 + ":1")
+
+
+@pytest.mark.asyncio
+async def test_the_SPEND_PATH_pins_the_recorded_outpoint_against_a_poisoned_set():
+    """The production entry point for the pin.
+
+    Selecting the right UTXO is useless if `_resolve_covenant` never passes the recorded outpoint
+    down — the poisoning attack works through the SPEND path (`claim_asset` / `refund_asset`), not
+    through a direct call to the scanner. This drives the real leg with a record that carries the
+    outpoint and a UTXO set containing a second, identically-valued payment to the same address.
+    """
+    from pyrxd.gravity.swap_state import SwapRecord, SwapState
+
+    terms = _rxd_terms(amount=100_000)
+    real = UtxoRecord(tx_hash="ab" * 32, tx_pos=1, value=100_000, height=100)
+    poison = UtxoRecord(tx_hash="99" * 32, tx_pos=0, value=100_000, height=140)
+    leg = _leg(client=FakeClient(utxos=[real, poison]))
+    record = SwapRecord(state=SwapState.BOTH_LOCKED, terms=terms).with_radiant_lock("ab" * 32 + ":1", "00" * 25)
+
+    cov, outpoint, carrier, _confs = await leg._resolve_covenant(record)
+    assert outpoint == "ab" * 32 + ":1", (
+        "the spend path re-discovered by scan instead of using the recorded outpoint, so a second "
+        "payment to the covenant address blocks it"
+    )
+    assert carrier == 100_000
+    assert cov is not None
