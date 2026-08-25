@@ -59,6 +59,7 @@ from pyrxd.security.errors import ValidationError
 __all__ = [
     "CrossClockMargin",
     "assert_covenant_confirms_before_eth_deadline",
+    "assert_t_rxd_fits_the_eth_deadline",
     "eth_absolute_to_rxd_relative_blocks",
 ]
 
@@ -233,6 +234,47 @@ def assert_covenant_confirms_before_eth_deadline(
             f"covenant would confirm too late: projected RXD refund opens at "
             f"{projected_rxd_open_s} >= ETH-deadline-minus-margin {deadline_s} — refusing to "
             "lock RXD (SC-3/TLK-1 mixed-clock race)"
+        )
+
+
+def assert_t_rxd_fits_the_eth_deadline(
+    *,
+    t_rxd: Timelock,
+    eth_timeout_unix_s: int,
+    expected_rxd_lock_time_unix_s: int,
+    margin: CrossClockMargin,
+    rxd_block_interval_s: float,
+    floor_blocks: int = 12,
+) -> None:
+    """Check a SUPPLIED ``t_rxd`` against the counter-chain deadline. Fail-closed.
+
+    :func:`eth_absolute_to_rxd_relative_blocks` DERIVES the largest safe window; this checks that an
+    independently-chosen one fits inside it. Both are needed because operators supply ``t_rxd`` as a
+    raw integer and the runners had no way to tell them it was wrong: the script-level check they
+    ran compared ``t_btc - t_rxd >= margin`` against a ``t_btc`` constructed as
+    ``t_rxd + margin + 4``, so it passed for every possible input while being labelled the safety
+    gate.
+
+    A ``t_rxd`` LARGER than the derived maximum pushes the Radiant refund past the counter-chain
+    deadline, which inverts the leg ordering the whole protocol rests on. Smaller is safe here and
+    deliberately permitted — a shorter window is the maker's own liveness cost, and #507 is the gate
+    that stops it being made TOO short.
+    """
+    if not isinstance(t_rxd, Timelock) or t_rxd.unit is not TimeUnit.BLOCKS:
+        raise ValidationError("t_rxd must be a BLOCKS Timelock")
+    largest = eth_absolute_to_rxd_relative_blocks(
+        eth_timeout_unix_s=eth_timeout_unix_s,
+        expected_rxd_lock_time_unix_s=expected_rxd_lock_time_unix_s,
+        margin=margin,
+        rxd_block_interval_s=rxd_block_interval_s,
+        floor_blocks=floor_blocks,
+    )
+    if int(t_rxd.value) > int(largest.value):
+        raise ValidationError(
+            f"t_rxd of {t_rxd.value} blocks exceeds the largest window the counter-chain deadline "
+            f"allows ({largest.value} blocks): the Radiant refund would open at or after the ETH "
+            "deadline minus margin, inverting the leg ordering. Shorten t_rxd or extend the ETH "
+            "timeout."
         )
 
 

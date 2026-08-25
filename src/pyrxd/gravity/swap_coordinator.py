@@ -194,6 +194,15 @@ class MarginPolicy:
     # because BTC and RXD block rates differ — treating BTC blocks 1:1 as RXD blocks
     # under-counts the RXD window the BTC burial consumes. Defaults to ~300s (Radiant).
     rxd_block_interval_s: float = 300.0
+    # The FAST-tail counterpart, for conversions that DIVIDE by the interval. Dividing wants a
+    # SMALL interval (more blocks = more cover); multiplying wants a large one. Reusing one value
+    # across an inverse pair is what made #484's filed fix refuse every configuration.
+    #
+    # Defaults to None = "use rxd_block_interval_s", preserving today's behaviour exactly. A
+    # REAL-VALUE policy must supply a measured one: at the measured p10 of 43s, a reserve computed
+    # with the 300s default covers about a sixth of the window it is meant to protect.
+    # See docs/solutions/design-decisions/sizing-t-rxd-the-two-directions-rule.md.
+    rxd_block_interval_fast_s: float | None = None
     # Reorg gate (plan 2026-05-26). The maker's BTC claim must reach this depth before
     # the taker relies on the revealed p; the taker's own Radiant claim must then bury
     # ``rxd_claim_burial`` deep — both BEFORE t_rxd opens. Unit-tagged so the squeeze
@@ -253,6 +262,24 @@ class MarginPolicy:
             raise ValidationError("MarginPolicy.block_interval_s must be > 0")
         if not isinstance(self.rxd_block_interval_s, (int, float)) or self.rxd_block_interval_s <= 0:
             raise ValidationError("MarginPolicy.rxd_block_interval_s must be > 0")
+        fast = self.rxd_block_interval_fast_s
+        if fast is not None:
+            if not isinstance(fast, (int, float)) or fast <= 0:
+                raise ValidationError("MarginPolicy.rxd_block_interval_fast_s must be > 0")
+            if fast > self.rxd_block_interval_s:
+                raise ValidationError(
+                    f"MarginPolicy.rxd_block_interval_fast_s ({fast}s) exceeds rxd_block_interval_s "
+                    f"({self.rxd_block_interval_s}s) — a fast-tail percentile cannot be slower than "
+                    "the nominal one; the two are swapped"
+                )
+        if self.require_measured and fast is None:
+            raise ValidationError(
+                "real-value mode (require_measured=True) requires a MEASURED "
+                "rxd_block_interval_fast_s: a reserve computed by DIVIDING by the interval needs a "
+                "fast-tail percentile, and the nominal value under-counts it. At the measured p10 "
+                "of 43s, a reserve computed with a 300s interval covers about a sixth of the "
+                "window it protects."
+            )
         if not isinstance(self.is_measured, bool):
             raise ValidationError("MarginPolicy.is_measured must be bool")
         if not isinstance(self.require_measured, bool):
@@ -344,6 +371,7 @@ class MarginPolicy:
         btc_claim_reorg_depth: Timelock | None = None,
         rxd_claim_burial: Timelock | None = None,
         rxd_block_interval_s: float | None = None,
+        rxd_block_interval_fast_s: float | None = None,
         rxd_reorg_cost_per_block: int | None = None,
         value_at_risk_photons: int | None = None,
         burial_safety_factor: float = 1.0,
@@ -355,6 +383,13 @@ class MarginPolicy:
         inputs; if omitted they fall back to the ESTIMATED defaults (acceptable only
         because a measured policy still carries the estimated reorg depths — supply
         measured values for a real mainnet swap).
+
+        ``rxd_block_interval_fast_s`` is the FAST-tail (p10) inter-block measurement, REQUIRED
+        here: every reserve computed by dividing a time span by the interval needs it, and the
+        nominal value under-counts them. Measured Radiant mainnet 2026-06-02: p10 43s against a
+        mean of 330s — a reserve sized with the mean covers about a sixth of its window. When it is
+        genuinely unknown, pass the same value as ``rxd_block_interval_s`` and know that the
+        reserves are then nominal rather than conservative.
 
         ``rxd_reorg_cost_per_block`` (measured, photons/block) + ``value_at_risk_photons``
         (the assessed economic value) drive the VALUE-SCALED claim burial (red-team HIGH):
@@ -369,6 +404,12 @@ class MarginPolicy:
             "burial_safety_factor": burial_safety_factor,
             "accept_flat_burial": accept_flat_burial,
         }
+        # Default the fast tail to the nominal so an existing measured policy keeps working with
+        # today's numbers rather than failing to construct; the __post_init__ requirement then
+        # surfaces as an explicit choice at the call site instead of a hidden under-count.
+        kwargs["rxd_block_interval_fast_s"] = (
+            rxd_block_interval_fast_s if rxd_block_interval_fast_s is not None else (rxd_block_interval_s or 300.0)
+        )
         if btc_claim_reorg_depth is not None:
             kwargs["btc_claim_reorg_depth"] = btc_claim_reorg_depth
         if rxd_claim_burial is not None:
@@ -615,6 +656,17 @@ class ClaimFinality(Enum):
     SQUEEZED = "squeezed"
 
 
+def _dividing_interval_s(policy: MarginPolicy) -> float:
+    """The interval to use when CONVERTING A TIME SPAN INTO A BLOCK COUNT.
+
+    Dividing by a small interval yields MORE blocks, which is more cover — so a reserve wants the
+    fast tail. Every `ceil(seconds / interval)` in this module goes through here so a site cannot
+    quietly pick the nominal value; the projections that MULTIPLY by an interval deliberately do
+    not, and want the slow tail instead.
+    """
+    return float(policy.rxd_block_interval_fast_s or policy.rxd_block_interval_s)
+
+
 def _value_scaled_burial_blocks(policy: MarginPolicy, value_at_risk_photons: int | None) -> int:
     """Required claim-burial depth (Radiant blocks) so a reorg of the taker's claim costs at
     least the value at stake — 0 when value-scaling is not configured (then the flat burial
@@ -826,7 +878,7 @@ def assess_claim_finality(
             )
         # F-007: the reorg depth is in counter-chain blocks; convert the wall-clock it
         # represents into RXD blocks before subtracting (the rates differ; round UP).
-        counter_reserve_rxd = math.ceil(required_depth_blocks * policy.block_interval_s / policy.rxd_block_interval_s)
+        counter_reserve_rxd = math.ceil(required_depth_blocks * policy.block_interval_s / _dividing_interval_s(policy))
     else:
         # Finalized-checkpoint (ETH) leg: finality is a TIME window, not a block depth (§9 #3).
         if policy.eth_finalization_window_s is None:
@@ -837,7 +889,7 @@ def assess_claim_finality(
         # Convert the finalization TIME window into RXD blocks; round UP (ceil) — this is a RESERVE,
         # so flooring would under-count it and let the gate say WAIT with too little margin. Same
         # direction as the depth branch above and reserve_to_blocks(); never floor a reserve.
-        counter_reserve_rxd = math.ceil(policy.eth_finalization_window_s / policy.rxd_block_interval_s)
+        counter_reserve_rxd = math.ceil(policy.eth_finalization_window_s / _dividing_interval_s(policy))
     if blocks_left - counter_reserve_rxd >= rxd_burial and counter_claim_finality.remaining_positive:
         return ClaimFinality.WAIT
     return ClaimFinality.SQUEEZED
@@ -1149,7 +1201,7 @@ class SwapCoordinator:
         # itself), so the floor is advisory there — a real-value swap MUST be is_measured=True.
         if record.terms.counter_chain != "btc" and config.margin_policy.is_measured:
             mp = config.margin_policy
-            fin_reserve_blocks = math.ceil(mp.eth_finalization_window_s / mp.rxd_block_interval_s)
+            fin_reserve_blocks = math.ceil(mp.eth_finalization_window_s / _dividing_interval_s(mp))
             # Use the SAME burial reserve the reorg gate uses (assess_claim_finality:
             # _reserve_to_blocks(policy.rxd_claim_burial, ...)) — NOT the hardcoded estimate (red-team
             # LOW): an operator who measures a burial != 6 would otherwise get a floor that blesses an

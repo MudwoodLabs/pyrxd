@@ -81,7 +81,7 @@ from pyrxd.eth_wallet.htlc_leg import EthHtlcContractLeg, load_artifact
 from pyrxd.eth_wallet.locator import EthHtlcLocator
 from pyrxd.eth_wallet.rpc import EthRpc
 from pyrxd.gravity.eth_leg import EthLeg
-from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin, assert_t_rxd_fits_the_eth_deadline
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
 from pyrxd.gravity.record_sink import JsonFileRecordSink
@@ -406,11 +406,25 @@ async def taker_phase_fund(args: argparse.Namespace) -> None:
     env = _read_public(io_dir, "envelope.json")
     terms = NegotiatedTerms.from_dict(env["terms"])
 
-    # --- THE safety gate: verify t_counterchain - t_rxd >= margin from the envelope ALONE. ---
-    # The taker uses its OWN margin policy (not a maker-supplied one) and REFUSES to fund on failure.
+    # --- THE safety gate: check t_rxd against the COUNTER-CHAIN DEADLINE, from the envelope alone.
+    #
+    # This used to call `assert_timelock_margin(terms.t_btc, terms.t_rxd, policy)` — which cannot
+    # fail here. On the ETH path `t_btc` is built as `t_rxd + margin_blocks + 4` (see
+    # `_build_terms_and_covenant`, where the comment already calls it "decorative for ETH"), so the
+    # difference it inspects is `margin_blocks + 4` by construction and the assertion passed for
+    # every possible input. It was labelled the safety gate and validated nothing.
+    #
+    # The real question is whether `t_rxd` fits inside the window the ETH deadline actually allows,
+    # which needs `eth_timeout_unix_s` — the quantity the old check never looked at.
     policy = _margin_policy(args)
     try:
-        assert_timelock_margin(terms.t_btc, terms.t_rxd, policy)
+        assert_t_rxd_fits_the_eth_deadline(
+            t_rxd=terms.t_rxd,
+            eth_timeout_unix_s=terms.eth_timeout_unix_s,
+            expected_rxd_lock_time_unix_s=int(time.time()),
+            margin=policy.cross_clock_margin,
+            rxd_block_interval_s=policy.rxd_block_interval_s,
+        )
     except Exception as exc:
         raise SystemExit(
             f"REFUSING to fund: independent timelock-margin check FAILED ({exc}). "

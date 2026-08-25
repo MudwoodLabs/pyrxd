@@ -16,6 +16,7 @@ from pyrxd.btc_wallet.taproot import Timelock, TimeUnit
 from pyrxd.gravity.eth_rxd_timelock import (
     CrossClockMargin,
     assert_covenant_confirms_before_eth_deadline,
+    assert_t_rxd_fits_the_eth_deadline,
     eth_absolute_to_rxd_relative_blocks,
 )
 from pyrxd.security.errors import ValidationError
@@ -286,3 +287,62 @@ def test_gate_requires_blocks_timelock():
             rxd_block_interval_s=600.0,
             max_covenant_confirm_wait_s=0,
         )
+
+
+class TestASuppliedTRxdIsCheckedAgainstTheCounterChainDeadline:
+    """Operators supply `t_rxd` as a raw integer, and the script-level check that was supposed to
+    catch a bad one could not fail: it compared `t_btc - t_rxd >= margin` against a `t_btc` built
+    as `t_rxd + margin + 4`, so the difference it inspected was constant by construction. It was
+    labelled the safety gate and validated nothing.
+
+    The real question needs `eth_timeout_unix_s` — the quantity the old check never looked at.
+    """
+
+    @staticmethod
+    def _margin() -> CrossClockMargin:
+        return CrossClockMargin(
+            eth_reorg_finality_s=780,
+            rxd_claim_burial_s=1_800,
+            rxd_confirm_slack_s=600,
+            rounding_slack_s=300,
+            eth_finality_stall_tolerance_s=3_600,
+        )
+
+    def _check(self, blocks: int, *, budget_s: int = 200_000, interval: float = 229.0):
+        now = 1_700_000_000
+        assert_t_rxd_fits_the_eth_deadline(
+            t_rxd=Timelock(blocks, TimeUnit.BLOCKS),
+            eth_timeout_unix_s=now + budget_s,
+            expected_rxd_lock_time_unix_s=now,
+            margin=self._margin(),
+            rxd_block_interval_s=interval,
+        )
+
+    def test_a_t_rxd_that_overruns_the_eth_deadline_is_REFUSED(self) -> None:
+        """The case the tautology could never catch: a Radiant refund opening at or after the ETH
+        deadline minus margin inverts the leg ordering the protocol rests on."""
+        largest = eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=1_700_000_000 + 200_000,
+            expected_rxd_lock_time_unix_s=1_700_000_000,
+            margin=self._margin(),
+            rxd_block_interval_s=229.0,
+        )
+        with pytest.raises(ValidationError, match="exceeds the largest window"):
+            self._check(int(largest.value) + 1)
+
+    def test_the_LARGEST_fitting_window_is_accepted(self) -> None:
+        """The boundary. Refusing here would reject the correctly-maximised window the sizer itself
+        computes — a guard that refuses valid work, on the parameter an honest maker must choose."""
+        largest = eth_absolute_to_rxd_relative_blocks(
+            eth_timeout_unix_s=1_700_000_000 + 200_000,
+            expected_rxd_lock_time_unix_s=1_700_000_000,
+            margin=self._margin(),
+            rxd_block_interval_s=229.0,
+        )
+        self._check(int(largest.value))
+
+    def test_a_SHORTER_window_is_permitted(self) -> None:
+        """Deliberately allowed: a shorter window is the maker's own liveness cost, and #507 is the
+        gate that stops it being made too short to contain the value-scaled burial. This check is
+        only about the upper bound."""
+        self._check(12)

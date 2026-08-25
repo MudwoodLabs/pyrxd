@@ -3079,3 +3079,64 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         coord = _coordinator(terms=terms)  # estimated policy, no economics
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason
+
+
+class TestReservesUseTheFastTailInterval:
+    """Dividing a time span by the interval to get a block count wants the FAST tail: a smaller
+    interval yields MORE blocks, which is more cover. Multiplying wants the slow tail. One field
+    cannot serve both — reusing it across an inverse pair is what made #484's filed fix refuse
+    every configuration.
+
+    See docs/solutions/design-decisions/sizing-t-rxd-the-two-directions-rule.md.
+    """
+
+    def test_the_fast_tail_produces_a_LARGER_reserve_than_the_nominal(self) -> None:
+        """The whole point, stated as arithmetic. At the measured p10 of 43s against the 300s
+        nominal, a 768s finalization window reserves 18 blocks instead of 3 — the nominal covers
+        about a sixth of the window it is meant to protect."""
+        from pyrxd.gravity.swap_coordinator import _dividing_interval_s
+
+        nominal = _valued_policy(t_rxd_ok=True)
+        assert _dividing_interval_s(nominal) == nominal.rxd_block_interval_s
+
+        fast = dataclasses.replace(nominal, rxd_block_interval_fast_s=43.0)
+        assert _dividing_interval_s(fast) == 43.0
+        assert math.ceil(768 / _dividing_interval_s(fast)) > math.ceil(768 / _dividing_interval_s(nominal))
+
+    def test_an_UNSET_fast_tail_preserves_todays_behaviour_exactly(self) -> None:
+        """The no-regression guarantee. Every existing policy and dust run keeps its current
+        reserves; the split tightens only where an operator opts in or real-value mode demands it."""
+        from pyrxd.gravity.swap_coordinator import _dividing_interval_s
+
+        p = _valued_policy(t_rxd_ok=True)
+        assert p.rxd_block_interval_fast_s is None
+        assert _dividing_interval_s(p) == p.rxd_block_interval_s
+
+    def test_a_fast_tail_SLOWER_than_the_nominal_is_refused(self) -> None:
+        """The two swapped is the failure that would silently UNDER-reserve while looking correct."""
+        with pytest.raises(ValidationError, match="cannot be slower"):
+            dataclasses.replace(_valued_policy(t_rxd_ok=True), rxd_block_interval_fast_s=999.0)
+
+    def test_real_value_mode_REQUIRES_a_fast_tail(self) -> None:
+        from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
+
+        with pytest.raises(ValidationError, match="rxd_block_interval_fast_s"):
+            MarginPolicy(
+                margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+                block_interval_s=600.0,
+                is_measured=True,
+                require_measured=True,
+                cross_clock_margin=CrossClockMargin(
+                    eth_reorg_finality_s=780,
+                    rxd_claim_burial_s=1_800,
+                    rxd_confirm_slack_s=600,
+                    rounding_slack_s=300,
+                    eth_finality_stall_tolerance_s=3_600,
+                ),
+            )
+
+    def test_the_measured_constructor_supplies_one_so_real_policies_still_build(self) -> None:
+        """A guard that refuses valid work is a bug: `MarginPolicy.measured(...)` must still
+        construct without the caller knowing about the new field."""
+        p = MarginPolicy.measured(margin=t.Timelock(36, t.TimeUnit.BLOCKS), block_interval_s=600.0)
+        assert p.rxd_block_interval_fast_s is not None
