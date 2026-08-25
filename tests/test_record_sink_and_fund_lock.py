@@ -129,3 +129,70 @@ class TestTheFundLockIsExclusive:
             except ValidationError:
                 time.sleep(0.05)
         pytest.fail("the lock outlived the process that held it")
+
+
+class TestLoadingBackIsFailClosed:
+    """The read side. The durable handle was WRITTEN for a whole release before anything read it
+    back, so the recoverability it promised did not exist — and a load path is only worth adding if
+    it refuses bad input, because it runs on a crash-restart, when disk state is least trustworthy.
+    """
+
+    def _rec(self):
+        from pyrxd.gravity.swap_state import SwapRecord, SwapState
+        from tests.test_swap_coordinator import _eth_terms
+
+        return SwapRecord(
+            state=SwapState.NEGOTIATED,
+            terms=_eth_terms(hashlock=b"\x33" * 32, eth_timeout_unix_s=1_800_000_000),
+            pending_counter_contract="0x" + "ab" * 20,
+            pending_counter_deploy_tx="0x" + "cd" * 32,
+            pending_push_nonce=41,
+        )
+
+    def test_a_written_record_round_trips_as_a_SwapRecord(self, tmp_path: Path) -> None:
+        """THE property the write side was missing. Not a dict — the real type, so `__post_init__`
+        runs and the pending handle is validated on the way back in."""
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        rec = self._rec()
+        asyncio.run(sink(rec))
+        back = sink.load_record()
+        assert back is not None
+        assert back.pending_counter_contract == rec.pending_counter_contract
+        assert back.pending_counter_deploy_tx == rec.pending_counter_deploy_tx
+        assert back.pending_push_nonce == 41, "the nonce pin did not survive the round trip"
+
+    def test_an_absent_record_is_None_not_an_error(self, tmp_path: Path) -> None:
+        assert JsonFileRecordSink(tmp_path / "nope.json").load_record() is None
+
+    @pytest.mark.parametrize(
+        ("label", "body"),
+        [
+            ("a torn write", '{"state": "negotiated", "ter'),
+            ("an empty file", ""),
+            ("whitespace only", "   \n"),
+            ("a JSON array", "[1, 2, 3]"),
+            ("a JSON scalar", '"negotiated"'),
+        ],
+    )
+    def test_an_unreadable_record_RAISES_rather_than_reading_as_absent(
+        self, tmp_path: Path, label: str, body: str
+    ) -> None:
+        """The dangerous failure is not an exception — it is a corrupt record decoding as "no swap
+        here", because the operator then re-runs from scratch while a contract holds real value."""
+        p = tmp_path / "swap.json"
+        p.write_text(body)
+        sink = JsonFileRecordSink(p)
+        with pytest.raises(ValidationError):
+            sink.load_record()
+
+    def test_a_record_with_HALF_a_pending_handle_is_refused_on_load(self, tmp_path: Path) -> None:
+        """The both-or-neither invariant must bind on the way IN, not only at construction — a
+        hand-edited or partially-migrated file is exactly how half a handle reaches a resume, and
+        half a handle cannot rebuild a locator."""
+        sink = JsonFileRecordSink(tmp_path / "swap.json")
+        asyncio.run(sink(self._rec()))
+        d = json.loads(sink.path.read_text())
+        del d["pending_counter_deploy_tx"]
+        sink.path.write_text(json.dumps(d))
+        with pytest.raises(ValidationError, match="must be set together"):
+            sink.load_record()

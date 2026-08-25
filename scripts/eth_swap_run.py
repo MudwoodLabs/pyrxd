@@ -296,7 +296,16 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     # Pre-flight: refuse BEFORE minting if the recovery file already exists (atomic_write_mode_600 is
     # O_EXCL). A leftover file from a prior/aborted run would otherwise crash the keys-persist step
     # AFTER the (real-value) mint — wasting the mint. Fail cheap, up front.
-    if Path(args.keys_out).expanduser().exists():
+    if args.resume:
+        # A resume REQUIRES the recovery file a fresh run refuses to overwrite: it holds the keys
+        # the interrupted run minted, and the swap record sits beside it.
+        if not Path(args.keys_out).expanduser().exists():
+            raise SystemExit(
+                f"--resume needs the recovery file from the interrupted run, and "
+                f"{Path(args.keys_out).expanduser()} does not exist. Without it the keys are gone "
+                "and the deployed contract can only be refunded by hand after its timeout."
+            )
+    elif Path(args.keys_out).expanduser().exists():
         raise SystemExit(
             f"recovery file already exists: {Path(args.keys_out).expanduser()} — move/delete it or pass a "
             f"fresh --keys-out before a new run (refusing to mint over a stale recovery file)"
@@ -467,7 +476,18 @@ async def run_sepolia_dust(args: argparse.Namespace) -> None:
     try:
         # 1. Taker deploys + funds the ETH HTLC on Sepolia.
         confirm("taker_funds_btc: deploy+fund the ETH HTLC on SEPOLIA (taker pays sepolia gas)", auto_yes=args.yes)
-        rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
+        if args.resume:
+            # THE READ SIDE. Loads the record the interrupted run persisted and completes the fund
+            # it describes — reusing the deployed contract and the pinned nonce, so a retry cannot
+            # deploy a second HTLC or send a second transfer. Without this entry point the durable
+            # record was written and never read, and every guard on the resume path was unreachable.
+            rec = await coord.resume_interrupted_fund(
+                terms,
+                sink=JsonFileRecordSink(str(Path(args.keys_out).expanduser()) + ".swaprec.json"),
+                now_unix_s=int(time.time()),
+            )
+        else:
+            rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
         report.step(
             name="taker_funds_eth",
             chain="eth",
@@ -600,6 +620,16 @@ def _args() -> argparse.Namespace:
     ap.add_argument("--stage", choices=["dry-run", "sepolia-dust"], required=True)
     ap.add_argument("--i-accept-dust-loss", action="store_true")
     ap.add_argument("--yes", action="store_true", help="auto-confirm broadcasts (dry-run / unattended only)")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "COMPLETE an interrupted fund instead of starting a fresh one. Loads the persisted "
+            "swap record written beside --keys-out and finishes the counter-leg funding it "
+            "describes, reusing the deployed contract and the pinned push nonce rather than "
+            "deploying a second HTLC. Requires the existing --keys-out (which a fresh run refuses)."
+        ),
+    )
     # ETH
     ap.add_argument("--eth-rpc-url", default="")
     ap.add_argument("--eth-key-hex", default="")

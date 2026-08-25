@@ -2933,3 +2933,90 @@ async def test_a_resume_passes_the_RECORDED_pin_down_to_the_leg():
         f"the resume sent push_nonce={leg.push_nonce_seen} instead of the recorded pin 41 — a fresh "
         "nonce is additive and funds the HTLC twice"
     )
+
+
+async def test_a_crashed_fund_resumes_THROUGH_A_REAL_PERSISTED_FILE(tmp_path):
+    """The end-to-end path that did not exist, and could not be tested, until the read side landed.
+
+    Every earlier resume test hand-built a `SwapRecord` with `pending_counter_contract` already set
+    — which no production code could ever produce, because nothing read the file back. This drives
+    the real `JsonFileRecordSink`: a first coordinator crashes mid-fund, its record is written to
+    disk by the real sink, and a SECOND coordinator (a fresh process, in effect) loads that file and
+    completes the fund. That is the whole point of the durable handle.
+    """
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+
+    # --- run 1: deploys, records the address and the nonce pin, then dies before completing ---
+    class _CrashAfterDeploy(FakeEthLeg):
+        async def fund(self, terms, *, on_deploy=None, resume_from=None, push_nonce=None, on_push_nonce=None):
+            await on_deploy("0x" + "ab" * 20, "0x" + "cd" * 32)
+            await on_push_nonce(7)
+            raise NetworkError("process died mid-fund")
+
+    seen = FakeSeenStore()
+    crashed = _eth_coord_full(
+        terms=terms, eth_leg=_CrashAfterDeploy(preimage=secret, verdict=_final()), seen_store=seen
+    )
+    crashed._persist = sink
+    with pytest.raises(NetworkError, match="died mid-fund"):
+        await crashed.taker_funds_btc(terms, now_unix_s=_NOW)
+
+    on_disk = sink.load_record()
+    assert on_disk is not None and on_disk.pending_counter_contract == "0x" + "ab" * 20, (
+        "the crash left nothing on disk pointing at the deployed contract"
+    )
+    assert on_disk.pending_push_nonce == 7
+
+    # --- run 2: a FRESH coordinator loads that file and completes the fund ---
+    leg2 = FakeEthLeg(preimage=secret, verdict=_final())
+    resumed = _eth_coord_full(terms=terms, eth_leg=leg2, seen_store=seen, fund_lock=_MemLock())
+    resumed._persist = sink
+    rec = await resumed.resume_interrupted_fund(terms, sink=sink, now_unix_s=_NOW)
+
+    assert rec.state is SwapState.BTC_LOCKED, "the resumed fund did not complete"
+    assert leg2.resumed_from is not None and leg2.resumed_from.address == "0x" + "ab" * 20, (
+        "the resume deployed a second contract instead of completing the recorded one"
+    )
+    assert leg2.push_nonce_seen == 7, "the recorded nonce pin was not carried into the resume"
+
+
+async def test_resume_REFUSES_when_there_is_nothing_to_resume(tmp_path):
+    """Falling through to a fresh fund would deploy a SECOND contract."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=terms, eth_leg=leg, fund_lock=_MemLock())
+    with pytest.raises(ValidationError, match="nothing to resume"):
+        await coord.resume_interrupted_fund(terms, sink=JsonFileRecordSink(tmp_path / "absent.json"), now_unix_s=_NOW)
+    assert "fund" not in leg.calls
+
+
+async def test_resume_REFUSES_terms_that_disagree_with_the_persisted_record(tmp_path):
+    """`taker_funds_btc` takes terms as an argument and never checks them against the record it is
+    about to act on, so a drifted argument would fund the contract from one swap using another
+    swap's parameters."""
+    from pyrxd.gravity.record_sink import JsonFileRecordSink
+
+    secret, h = generate_secret()
+    terms = _eth_terms(hashlock=h, eth_timeout_unix_s=_NOW + 40000)
+    sink = JsonFileRecordSink(tmp_path / "swap.json")
+    await sink(
+        dataclasses.replace(
+            SwapRecord(state=SwapState.NEGOTIATED, terms=terms),
+            pending_counter_contract="0x" + "ab" * 20,
+            pending_counter_deploy_tx="0x" + "cd" * 32,
+        )
+    )
+    _, other_h = generate_secret()
+    other = _eth_terms(hashlock=other_h, eth_timeout_unix_s=_NOW + 40000)
+    leg = FakeEthLeg(preimage=secret, verdict=_final())
+    coord = _eth_coord_full(terms=other, eth_leg=leg, fund_lock=_MemLock())
+    with pytest.raises(ValidationError, match="do not match the persisted record"):
+        await coord.resume_interrupted_fund(other, sink=sink, now_unix_s=_NOW)
+    assert "fund" not in leg.calls

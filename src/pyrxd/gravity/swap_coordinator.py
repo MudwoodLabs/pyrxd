@@ -1925,6 +1925,47 @@ class SwapCoordinator:
         await self._persist_record(self.record, shield=True)
         return self.record
 
+    async def resume_interrupted_fund(self, terms: NegotiatedTerms, *, sink: Any, now_unix_s: int) -> SwapRecord:
+        """Reload a crashed fund from durable storage and complete it.
+
+        THE READ SIDE. Without this the durable record was written and never read: every guard the
+        resume path carries — the nonce pin, the fund lock, the seen-store divergence check, the
+        immutable re-bind — was unreachable in production because `pending_counter_contract` could
+        only ever be set by a test that hand-built a record. A mechanism with no reader is half a
+        mechanism, and this is the missing half.
+
+        Fails closed on every disagreement, because the alternative to refusing here is funding a
+        second HTLC while the first holds real value:
+
+        * No record on disk → refuse. A resume with nothing to resume from is a fresh fund, and a
+          fresh fund is `taker_funds_btc`'s job; silently falling through to it would deploy again.
+        * A record with no pending handle → refuse. Either the fund completed (the locator is on
+          the record) or it never started; neither is a resume.
+        * Terms that disagree with the record's → refuse. `taker_funds_btc` takes `terms` as an
+          argument and never checks them against the record it is about to act on, so a drifted
+          argument would fund one thing while the record describes another.
+        """
+        rec = sink.load_record()
+        if rec is None:
+            raise ValidationError(
+                "no swap record found: there is nothing to resume. If the fund never started, run "
+                "the forward path instead — resuming into a fresh fund would deploy a second HTLC."
+            )
+        if not rec.pending_counter_contract:
+            state = rec.state.value if isinstance(rec.state, SwapState) else rec.state
+            raise ValidationError(
+                f"the swap record carries no pending counter-leg deploy (state {state}), so there "
+                "is no interrupted fund to complete. If the counter leg is already funded its "
+                "locator is on the record and the swap should continue from there."
+            )
+        if rec.terms.hashlock != terms.hashlock:
+            raise ValidationError(
+                "the supplied terms do not match the persisted record (different hashlock): "
+                "resuming would fund the contract from one swap using the parameters of another."
+            )
+        self.record = rec
+        return await self.taker_funds_btc(terms, now_unix_s=now_unix_s)
+
     def _assert_claim_tx_spends_our_htlc(self, maker_claim_tx_bytes: bytes) -> None:
         """Provenance gate: the supplied claim tx MUST spend OUR BTC HTLC funding outpoint.
 

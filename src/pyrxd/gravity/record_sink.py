@@ -69,10 +69,59 @@ class JsonFileRecordSink:
             raise NetworkError(f"could not persist the swap record to {self._path}: {exc}") from exc
 
     def load(self) -> dict | None:
-        """Read the record back, or None if it was never written."""
+        """Read the raw record dict back, or None if it was never written.
+
+        FAIL CLOSED on anything unreadable. This is called on a crash-restart — precisely when disk
+        state is least trustworthy — so a truncated write, a corrupted file or a hand-edited one
+        must raise a classified error rather than a bare `JSONDecodeError` or, worse, a partially
+        populated dict that a caller mistakes for a valid record.
+        """
         if not self._path.exists():
             return None
-        return json.loads(self._path.read_text())
+        try:
+            raw = self._path.read_text()
+        except OSError as exc:
+            raise NetworkError(f"could not read the swap record at {self._path}: {exc}") from exc
+        if not raw.strip():
+            raise ValidationError(
+                f"the swap record at {self._path} is EMPTY. A zero-length record is a torn write, "
+                "not an absent swap — refusing to treat it as 'nothing was funded'."
+            )
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValidationError(
+                f"the swap record at {self._path} is not valid JSON ({exc}). It may be a torn "
+                "write. Do NOT re-run the swap from scratch: the contract it referenced may hold "
+                "real value. Inspect the file by hand before doing anything else."
+            ) from exc
+        if not isinstance(loaded, dict):
+            raise ValidationError(f"the swap record at {self._path} is a {type(loaded).__name__}, not an object")
+        return loaded
+
+    def load_record(self) -> Any:
+        """Read the record back as a :class:`SwapRecord`, or None if it was never written.
+
+        The reason this exists rather than leaving callers to do `SwapRecord.from_dict(sink.load())`
+        themselves: the durable handle was WRITTEN for a whole release before anything read it back,
+        so the recoverability it promised did not exist. A load path that reconstructs the real type
+        — and therefore runs `__post_init__`, including the both-or-neither pending invariant — is
+        what makes the write side worth anything.
+        """
+        from pyrxd.gravity.swap_state import SwapRecord
+
+        raw = self.load()
+        if raw is None:
+            return None
+        try:
+            return SwapRecord.from_dict(raw)
+        except ValidationError:
+            raise
+        except Exception as exc:
+            raise ValidationError(
+                f"the swap record at {self._path} could not be decoded into a SwapRecord: {exc}. "
+                "Inspect it by hand — the contract it references may hold real value."
+            ) from exc
 
 
 class FileFundLock:
