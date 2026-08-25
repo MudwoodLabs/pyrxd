@@ -61,6 +61,7 @@ from pyrxd.gravity.record_sink import FileFundLock, JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.keys import PrivateKey
+from pyrxd.security.errors import NetworkError
 from pyrxd.security.secrets import PrivateKeyMaterial, SecretBytes
 from pyrxd.security.types import Hex20
 from tests.test_swap_coordinator import FakeIndexer
@@ -247,14 +248,22 @@ def _policy():
     )
 
 
-def _build(node, url, workdir, *, t_rxd_blocks=60):
-    """Covenant + BOTH real legs + the production coordinator, wired for RXD↔USDC."""
-    p_secret = SecretBytes(os.urandom(32))
+def _build(node, url, workdir, *, t_rxd_blocks=60, seen=None, reuse=None):
+    """Covenant + BOTH real legs + the production coordinator, wired for RXD↔USDC.
+
+    ``reuse`` carries a previous build's key material and deadline so a RESTARTED process rebuilds
+    byte-identical terms. Generating fresh keys would produce a different covenant script, and the
+    resume would then verify against a covenant nobody funded — a test artefact that looks exactly
+    like the failure it is meant to detect.
+    """
+    if reuse is None:
+        p_secret = SecretBytes(os.urandom(32))
+        taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
+        eth_timeout = _now(url) + 50_000
+    else:
+        p_secret, taker_rxd, maker_rxd, eth_timeout = reuse
     h = hashlib.sha256(p_secret.unsafe_raw_bytes()).digest()
     t_rxd = bt.Timelock(t_rxd_blocks, bt.TimeUnit.BLOCKS)
-    eth_timeout = _now(url) + 50_000
-
-    taker_rxd, maker_rxd = PrivateKey(os.urandom(32)), PrivateKey(os.urandom(32))
     taker_pkh = bytes(Hex20(taker_rxd.public_key().hash160()))
     maker_pkh = bytes(Hex20(maker_rxd.public_key().hash160()))
     cov = build_htlc_covenant_rxd(
@@ -317,7 +326,7 @@ def _build(node, url, workdir, *, t_rxd_blocks=60):
         counter_leg=eth_leg,
         radiant_leg=rxd_leg,
         indexer=FakeIndexer(),
-        seen_store=_InMemSeen(),
+        seen_store=seen if seen is not None else _InMemSeen(),
         persist=JsonFileRecordSink(keys + ".swaprec.json"),
         config=CoordinatorConfig(
             margin_policy=_policy(),
@@ -326,6 +335,7 @@ def _build(node, url, workdir, *, t_rxd_blocks=60):
             fund_lock=FileFundLock(keys),
         ),
     )
+    coord._token_leg = contract_leg  # the inner Erc20HtlcLeg, for tests that need to break it
     return coord, cov, p_secret, eth_leg, rxd_leg, taker_rxd, maker_rxd
 
 
@@ -440,3 +450,155 @@ async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
     # And the Radiant covenant is spent — refunded to the maker via the CSV branch.
     spent = node.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
     assert spent in (None, ""), "the Radiant covenant was not refunded"
+
+
+async def test_a_crash_between_deploy_and_transfer_RESUMES_without_double_funding(env):
+    """G3, on real chains: the crash the whole durable-handle and resume machinery exists for.
+
+    The ERC-20 fund is TWO transactions. Between them there is a contract on chain whose address
+    depends on the deployer's nonce and appears nowhere until the deploy receipt returns. Die there
+    and, before this machinery, the only reference to it was an exception string.
+
+    Everything under test here was built in one session and has never executed against a real
+    chain: the durable deploy handle, the nonce pin, the fund lock, the seen-store divergence check,
+    and the resume entry point. The property that matters is stated as arithmetic — ONE contract,
+    holding EXACTLY the negotiated amount, never two and never double.
+    """
+    node, url, workdir = env
+    seen = _InMemSeen()
+    coord, cov, p_secret, _eth_leg, _rxd, taker_rxd, maker_rxd = _build(node, url, workdir, t_rxd_blocks=60, seen=seen)
+    terms = coord.record.terms
+    reuse = (p_secret, taker_rxd, maker_rxd, terms.eth_timeout_unix_s)
+
+    _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+    node.rxd_mine(3)
+    taker_before = _usdc_balance(url, _ADDR_TAKER)
+
+    # CRASH: let the deploy land and be persisted, then die before the token push completes.
+    real_send = coord._token_leg._sign_and_send
+    calls = {"n": 0}
+
+    async def _die_on_the_push(tx, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await real_send(tx, **kw)  # the deploy really happens
+        raise RuntimeError("process died between deploy and transfer")
+
+    coord._token_leg._sign_and_send = _die_on_the_push
+    with pytest.raises(Exception):
+        await coord.taker_funds_btc(terms, now_unix_s=_now(url))
+
+    # The crash left a DURABLE handle: an address, its deploy tx, and the pinned push nonce.
+    assert calls["n"] == 2, (
+        f"_sign_and_send ran {calls['n']}x — the crash did not land BETWEEN the deploy and the "
+        "push, so this test is not exercising the window it was written for"
+    )
+    on_disk = json.loads((workdir / "swap.swaprec.json").read_text())
+    # .get, not []: a field written as absent and a field written as null are different failures,
+    # and the plant that removes it should read as THIS message, not as a KeyError from the test.
+    htlc = on_disk.get("pending_counter_contract")
+    assert htlc, "the crash left no reference to the deployed contract — it is unrecoverable"
+    assert on_disk["pending_counter_deploy_tx"].startswith("0x")
+    assert on_disk["pending_push_nonce"] is not None, "no nonce pin: a retry would be ADDITIVE"
+    code = _rpc(url, "eth_getCode", [htlc, "latest"])["result"]
+    assert code not in ("0x", ""), "no contract at the recorded address"
+    assert _usdc_balance(url, htlc) == 0, "the push should NOT have landed"
+
+    # RESUME in a fresh coordinator, as a restarted process would — loading the record from disk.
+    sink = JsonFileRecordSink(str(workdir / "swap") + ".swaprec.json")
+    coord2, cov2, _p2, _leg2, _rxd2, _tk2, _mk2 = _build(node, url, workdir, t_rxd_blocks=60, seen=seen, reuse=reuse)
+    assert cov2.funded_spk == cov.funded_spk, "the rebuilt covenant is not the funded one"
+    rec = await coord2.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
+
+    assert rec.state is SwapState.BTC_LOCKED, f"the resumed fund did not complete: {rec.state}"
+    assert rec.counterchain_locator.contract_address.lower() == htlc.lower(), (
+        "the resume DEPLOYED A SECOND CONTRACT instead of completing the recorded one"
+    )
+    # THE arithmetic: exactly the negotiated amount, in exactly one contract.
+    assert _usdc_balance(url, htlc) == _AMOUNT, (
+        f"the HTLC holds {_usdc_balance(url, htlc)}, not {_AMOUNT} — a resume that re-sent the full "
+        "amount would leave double, and claim sweeps the whole balance to the counterparty"
+    )
+    # The other half of the same arithmetic, from the payer's side. The contract balance alone
+    # cannot distinguish "funded once" from "funded twice into two contracts" — this can.
+    spent = taker_before - _usdc_balance(url, _ADDR_TAKER)
+    assert spent == _AMOUNT, f"the taker paid {spent}, not {_AMOUNT}: the crash cost them a second HTLC"
+
+
+async def test_a_crash_AFTER_the_push_broadcast_replaces_rather_than_adds(env):
+    """The window the NONCE PIN exists for — and which the crash test above does NOT reach.
+
+    Planting `push_nonce=None` (dropping the pin entirely) leaves the deploy/transfer crash test
+    passing, because that crash lands before the broadcast: there is no pending transaction for a
+    pin to replace, so the pin is inert and its absence invisible. The dangerous window is the
+    other one — the push IS in the mempool, unconfirmed, and the process dies. A resume that picks
+    a fresh nonce there does not retry the payment, it makes a SECOND one, and both mine.
+
+    Reproduced by turning anvil's automine off for the push, so the transfer sits pending exactly
+    as it would behind a congested basefee.
+    """
+    node, url, workdir = env
+    seen = _InMemSeen()
+    coord, cov, p_secret, _eth, _rxd, taker_rxd, maker_rxd = _build(node, url, workdir, t_rxd_blocks=60, seen=seen)
+    terms = coord.record.terms
+    reuse = (p_secret, taker_rxd, maker_rxd, terms.eth_timeout_unix_s)
+
+    _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+    node.rxd_mine(3)
+    taker_before = _usdc_balance(url, _ADDR_TAKER)
+
+    leg = coord._token_leg
+    real_send, real_wait = leg._sign_and_send, leg._rpc.wait_receipt
+    calls = {"n": 0}
+
+    async def _send(tx, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the push: stop mining so it stays pending, then broadcast for real
+            _rpc(url, "evm_setAutomine", [False])
+        return await real_send(tx, **kw)
+
+    async def _wait(h):
+        if calls["n"] >= 2:
+            raise RuntimeError("process died waiting for the push receipt")
+        return await real_wait(h)
+
+    leg._sign_and_send, leg._rpc.wait_receipt = _send, _wait
+    with pytest.raises(Exception):
+        await coord.taker_funds_btc(terms, now_unix_s=_now(url))
+
+    pending = _rpc(url, "eth_getBlockByNumber", ["pending", False])["result"]["transactions"]
+    assert pending, "the push never reached the mempool — this is the earlier crash, not this one"
+    on_disk = json.loads((workdir / "swap.swaprec.json").read_text())
+    pinned = on_disk.get("pending_push_nonce")
+    assert pinned is not None, "no durable nonce pin: the resume cannot replace its own pending push"
+
+    coord2, _c2, _p2, _l2, _r2, _t2, _m2 = _build(node, url, workdir, t_rxd_blocks=60, seen=seen, reuse=reuse)
+    sink = JsonFileRecordSink(str(workdir / "swap") + ".swaprec.json")
+
+    # WHILE THE PUSH IS PENDING the resume REFUSES, and does not reach the pinned re-send at all.
+    # This is the behaviour that actually holds, not the replacement the pin's comment describes:
+    # the in-flight check (erc20_leg.py) fires first and cannot tell our own pending push from an
+    # unrelated transaction. Fail-closed and correct — a resume that guessed here could double-fund
+    # — but it means the pin's "replaces rather than adds" property is NOT what protects this case.
+    with pytest.raises(NetworkError, match="still in flight"):
+        await coord2.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
+
+    # Let the pending push mine, as the refusal instructs ("Wait for them to mine").
+    _rpc(url, "evm_setAutomine", [True])
+    _rpc(url, "evm_mine", [])
+
+    # Now the resume completes — and finds nothing left to do, because the push it was going to
+    # retry is the one that just landed. THE property, end to end: crash mid-broadcast, resume,
+    # and the value is delivered EXACTLY once.
+    rec = await coord3_resume(node, url, workdir, seen, reuse, terms, sink)
+    htlc = on_disk["pending_counter_contract"]
+    assert rec.counterchain_locator.contract_address.lower() == htlc.lower()
+    assert _usdc_balance(url, htlc) == _AMOUNT, f"HTLC holds {_usdc_balance(url, htlc)}, not {_AMOUNT}"
+    spent = taker_before - _usdc_balance(url, _ADDR_TAKER)
+    assert spent == _AMOUNT, f"the taker paid {spent}, not {_AMOUNT}: the crashed push and the resume BOTH delivered"
+
+
+async def coord3_resume(node, url, workdir, seen, reuse, terms, sink):
+    """A third process, resuming after the pending push settled."""
+    coord3, _c, _p, _l, _r, _t, _m = _build(node, url, workdir, t_rxd_blocks=60, seen=seen, reuse=reuse)
+    return await coord3.resume_interrupted_fund(terms, sink=sink, now_unix_s=_now(url))
