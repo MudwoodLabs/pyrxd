@@ -381,6 +381,12 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
     # 3. MAKER revalidates and the swap is BOTH_LOCKED.
     rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_now(url))
     assert rec.state is SwapState.BOTH_LOCKED
+    # Positive control for the check at the end: the same helper, same outpoint, must report
+    # UNSPENT here. Without this, "spent" at the end could be a helper that always says spent —
+    # asking the wrong vout, or swallowing an RPC error — and the test would pass either way.
+    assert not _covenant_is_spent(node, rec.radiant_covenant_outpoint), (
+        "the covenant reads as spent while it is still locked — the check cannot distinguish"
+    )
 
     # 4. MAKER claims the USDC, revealing p on Ethereum.
     rec = await coord.maker_claims_btc(p_secret)
@@ -396,6 +402,28 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
         claim_tx, now_rxd_height=_rxd_height(node), asset_locked_at_height=_rxd_height(node) - 5
     )
     assert rec.state is SwapState.COMPLETED, f"the swap did not complete: {rec.state}"
+
+    # COMPLETED is a flag this process set about itself. What settles the swap is the covenant
+    # being SPENT, and the refund test checked that while this one — the path that actually moves
+    # the asset — did not. A claim that failed to broadcast, or paid the wrong key, would have left
+    # every assertion above green.
+    node.rxd_mine(1)
+    assert _covenant_is_spent(node, rec.radiant_covenant_outpoint), (
+        "the swap reports COMPLETED but the Radiant covenant is still unspent — the taker was "
+        "never paid, while the maker already has the USDC and p is public"
+    )
+
+
+def _covenant_is_spent(node, outpoint: str) -> bool:
+    """Is the funded covenant outpoint gone from the UTXO set?
+
+    Splits the vout off the outpoint instead of assuming 0. Hardcoding vout "0" made the answer
+    depend on where the funding transaction happened to place the covenant: if it ever landed at
+    vout 1, `gettxout(txid, 0)` would be asking about the CHANGE output, and its absence would read
+    as "the covenant was spent" — the assertion passing for a reason unrelated to the swap.
+    """
+    txid, _, vout = outpoint.partition(":")
+    return node.rxd("gettxout", txid, vout or "0") in (None, "")
 
 
 def _rxd_height(node) -> int:
@@ -448,8 +476,7 @@ async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
     assert _usdc_balance(url, _ADDR_MAKER) == maker_before, "the maker gained USDC on a refund path"
 
     # And the Radiant covenant is spent — refunded to the maker via the CSV branch.
-    spent = node.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
-    assert spent in (None, ""), "the Radiant covenant was not refunded"
+    assert _covenant_is_spent(node, coord.record.radiant_covenant_outpoint), "the Radiant covenant was not refunded"
 
 
 async def test_a_crash_between_deploy_and_transfer_RESUMES_without_double_funding(env):
