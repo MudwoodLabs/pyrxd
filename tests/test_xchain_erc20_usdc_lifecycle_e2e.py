@@ -390,3 +390,53 @@ async def test_rxd_usdc_swap_runs_end_to_end(env):
 
 def _rxd_height(node) -> int:
     return int(node.rxd("getblockcount"))
+
+
+async def test_mutual_refund_returns_the_usdc_and_the_rxd(env):
+    """The guaranteed-safe failure, on real chains: neither side suffers a one-sided loss.
+
+    Both legs are funded and NOBODY claims — the maker never reveals `p`. Each leg must come back to
+    the party that funded it: the USDC to the taker (the HTLC's immutable refundee), the Radiant
+    covenant to the maker via its CSV branch.
+
+    This is the path the happy-path run does not touch at all, and it is the one an operator
+    actually needs when a counterparty goes quiet. It also exercises `mutual_refund`'s repair from
+    this session: the two refunds are independent, so a failure in one must not skip the other.
+    """
+    node, url, workdir = env
+    coord, cov, _p_secret, _eth_leg, _rxd_leg, _tk, _mk = _build(node, url, workdir, t_rxd_blocks=8)
+    terms = coord.record.terms
+
+    taker_before = _usdc_balance(url, _ADDR_TAKER)
+    maker_before = _usdc_balance(url, _ADDR_MAKER)
+
+    # Both legs funded, exactly as the happy path — a stalling maker still has to LOCK; "never locks
+    # at all" is refused before any taker value moves.
+    _rxd_pay(node, cov.funded_spk, terms.radiant_amount)
+    node.rxd_mine(3)
+    rec = await coord.taker_funds_btc(terms, now_unix_s=_now(url))
+    assert rec.state is SwapState.BTC_LOCKED
+    htlc = rec.counterchain_locator.contract_address
+    assert _usdc_balance(url, htlc) == _AMOUNT
+    rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=_now(url))
+    assert rec.state is SwapState.BOTH_LOCKED
+
+    # Nobody claims. Mature the Radiant CSV, and warp past the ETH deadline.
+    node.rxd_mine(terms.t_rxd.value + 1)
+    _rpc(url, "evm_setNextBlockTimestamp", [terms.eth_timeout_unix_s + 1])
+    _mine(url, 1)
+
+    rec = await coord.mutual_refund()
+    assert rec.state is SwapState.MUTUAL_REFUND, f"mutual refund did not complete: {rec.state}"
+
+    # The USDC is back with the TAKER, who funded it — and the maker gained nothing.
+    assert _usdc_balance(url, htlc) == 0, "the HTLC still holds USDC after the refund"
+    # NET ZERO, not +_AMOUNT: `taker_before` is the balance BEFORE funding, so the taker paid the
+    # USDC out and got it back. Being made WHOLE is the property — an earlier version of this line
+    # expected a gain, which no refund path should ever produce.
+    assert _usdc_balance(url, _ADDR_TAKER) == taker_before, "the taker was not made whole by the refund"
+    assert _usdc_balance(url, _ADDR_MAKER) == maker_before, "the maker gained USDC on a refund path"
+
+    # And the Radiant covenant is spent — refunded to the maker via the CSV branch.
+    spent = node.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
+    assert spent in (None, ""), "the Radiant covenant was not refunded"
