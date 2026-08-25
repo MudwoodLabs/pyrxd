@@ -19,7 +19,7 @@ from typing import ClassVar
 
 from pyrxd.security.errors import ValidationError
 
-__all__ = ["Erc20HtlcLocator", "EthHtlcLocator", "PendingDeploy", "check_hex_addr"]
+__all__ = ["Erc20HtlcLocator", "EthHtlcLocator", "PendingDeploy", "check_hex_addr", "normalise_tx_hash"]
 
 
 #: The ONLY accepted spelling of an EVM address anywhere in this package. Anchored, ASCII-only.
@@ -30,6 +30,20 @@ __all__ = ["Erc20HtlcLocator", "EthHtlcLocator", "PendingDeploy", "check_hex_add
 #: first on-chain use — far from the construction that introduced it, and for the field that IS
 #: the identity of the asset being swapped. Three modules had independently copied that check.
 _HEX_ADDR_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
+
+
+def normalise_tx_hash(val: str) -> str:
+    """`0x`-prefix a transaction hash, idempotently.
+
+    A node may return a hash with or without the prefix, and the two writers of the durable deploy
+    handle disagreed about it: the locator producer normalised, while the record hook passed it
+    straight through to a field that REQUIRES the prefix. Reading the code, that looked cosmetic.
+    On a real chain it raised mid-fund, AFTER the contract was deployed — the first defect this
+    corridor's end-to-end run caught that nine rounds of review did not.
+    """
+    if not isinstance(val, str) or not val:
+        raise ValidationError("transaction hash must be a non-empty string")
+    return val if val.startswith("0x") else "0x" + val
 
 
 def check_hex_addr(name: str, val: str) -> str:

@@ -30,7 +30,7 @@ from typing import Any
 from ..security.errors import NetworkError, PreRevealAbort, ValidationError
 from .erc20 import assert_not_frozen_before_reveal, assert_token_matches_chain, balance_of
 from .htlc_leg import EthHtlcContractLeg, _require_web3
-from .locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy
+from .locator import Erc20HtlcLocator, EthHtlcLocator, PendingDeploy, normalise_tx_hash
 from .tokens import Erc20Token
 
 #: Measured on a mainnet fork against the real USDC proxy (block 25,815,805): a `transfer` into a
@@ -209,7 +209,7 @@ class Erc20HtlcLeg(EthHtlcContractLeg):
         # after the push, a crash leaves real value in a contract whose address was never written
         # down. Awaited, not fire-and-forget — if the caller cannot persist it, we must not push.
         if on_deploy is not None:
-            await on_deploy(address, deploy_hash)
+            await on_deploy(address, normalise_tx_hash(deploy_hash))
         return address, deploy_hash
 
     async def _push_and_bind(

@@ -32,7 +32,7 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from pyrxd.eth_wallet.locator import EthHtlcLocator
+from pyrxd.eth_wallet.locator import EthHtlcLocator, normalise_tx_hash
 from pyrxd.eth_wallet.secret import recover_secret
 from pyrxd.gravity.counter_chain_leg import CounterChainLeg
 from pyrxd.gravity.finality import CounterClaimFinality, CounterClaimState
@@ -463,7 +463,7 @@ class EthHtlcContractLeg:
         # to point it. See `Erc20HtlcLeg.fund`, where the same hazard spans two transactions.
         if on_deploy is not None:
             try:
-                await on_deploy(web3.Web3.to_checksum_address(addr), tx_hash)
+                await on_deploy(web3.Web3.to_checksum_address(addr), normalise_tx_hash(tx_hash))
             except Exception as exc:
                 # LOG AND CONTINUE, unlike the token leg. Here the value moved as part of the deploy
                 # itself — the constructor is payable — so aborting cannot un-move it and only
