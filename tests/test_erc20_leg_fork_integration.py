@@ -11,10 +11,27 @@ two things most likely to be wrong, and only the real contract has them.
 
 Run it with a fork RPC::
 
-    PYRXD_ETH_FORK_RPC=https://... .venv/bin/pytest tests/test_erc20_leg_fork_integration.py -m integration
+    PYRXD_ETH_FORK_RPC=https://ethereum-rpc.publicnode.com \
+        .venv/bin/pytest tests/test_erc20_leg_fork_integration.py -m integration
 
-It skips cleanly without one. CI has no key, so this is a local/manual gate rather than a
-per-push one — stated plainly rather than pretended otherwise.
+NO KEY IS NEEDED. Verified 2026-08-25 — these three public endpoints all fork successfully under
+anvil, and the suite passes 5/5 against real mainnet state on each:
+
+* ``https://ethereum-rpc.publicnode.com``  (used above)
+* ``https://eth.drpc.org``
+* ``https://1rpc.io/eth``  (has previously exhausted its free tier mid-session; prefer the others)
+
+Ones that do NOT work for forking: ``eth.llamarpc.com``, ``rpc.ankr.com/eth``, ``cloudflare-eth.com``.
+
+**The trap that made this look impossible.** Probing these endpoints with a plain Python
+``urllib`` POST returns ``403 Forbidden`` from all of them — they block by user-agent. That reads
+as "no RPC available without an account", which is wrong: anvil sends a different user-agent and
+connects fine. Test reachability by actually forking, not by curling from Python, or you will
+conclude a signup is required when it is not.
+
+It still skips cleanly without the variable. CI does not set one, so this remains a local/manual
+gate rather than a per-push one — which means the ONLY real-chain coverage of the token leg does
+not run on any push. Stated plainly rather than pretended otherwise.
 """
 
 from __future__ import annotations
