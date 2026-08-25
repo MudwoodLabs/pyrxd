@@ -27,6 +27,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import urllib.request
 
@@ -41,6 +42,7 @@ from pyrxd.gravity.eth_leg import EthLeg
 from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
 from pyrxd.gravity.htlc_covenant import build_htlc_covenant_ft, build_htlc_covenant_nft, build_htlc_covenant_rxd
 from pyrxd.gravity.radiant_leg import RadiantChainIO, RadiantCovenantLeg
+from pyrxd.gravity.record_sink import JsonFileRecordSink
 from pyrxd.gravity.swap_coordinator import CoordinatorConfig, MarginPolicy, SwapCoordinator
 from pyrxd.gravity.swap_state import NegotiatedTerms, SwapRecord, SwapState
 from pyrxd.gravity.watch import ChainObserver, DedupAlerter, EthClaimStatus, Intent, Reconciler, Severity
@@ -313,7 +315,7 @@ def _fund_spending_ref(node, dest_spk: bytes, amount: int, ref_utxo: dict) -> st
     return str(txid)
 
 
-def _build(node, url, *, t_rxd_blocks, asset_variant="rxd", role=None):
+def _build(node, url, *, t_rxd_blocks, asset_variant="rxd", role=None, record_path=None):
     """Build the covenant, the real legs, and the coordinator for an ETH↔(RXD|FT-glyph|NFT-glyph)
     swap. Returns (coord, cov, p_secret, eth_leg, rpc, ref_utxo) — ref_utxo is None for rxd, else
     the wallet UTXO that funds the singleton (the maker spends it to lock the asset)."""
@@ -417,6 +419,14 @@ def _build(node, url, *, t_rxd_blocks, asset_variant="rxd", role=None):
         radiant_leg=rxd_leg,
         indexer=indexer,
         seen_store=_MemSeen(),
+        # REQUIRED for an ETH counter leg since the durable-handle work: the contract address
+        # depends on the deployer's nonce and exists nowhere until the deploy receipt returns, so
+        # the coordinator refuses to fund without somewhere to write it. These tests are opt-in
+        # (XCHAIN_ETH_REGTEST) and never run in CI, so when that requirement landed they went red
+        # unnoticed — a whole e2e suite, including the only FT and NFT swap coverage there is.
+        persist=JsonFileRecordSink(
+            str(record_path) if record_path else tempfile.mkdtemp(prefix="xchain-e2e-") + "/swap.swaprec.json"
+        ),
         # anvil is treated as value-bearing (it can fork mainnet); accept the in-process seen
         # store for this single-process, single-shot, fresh-H-per-run e2e (the documented hatch).
         # accept_estimated_eth_margins: this e2e runs the estimated _eth_policy() (is_measured=False)
@@ -599,13 +609,20 @@ class TestWatchtowerEthIntentSequence:
 
     async def test_eth_reveal_with_closing_window_pages_squeezed(self, env):
         node, url = env
-        coord, p_secret, rpc = await _setup_eth_both_locked(node, url, t_rxd_blocks=8)
+        # 12 then mine 4, rather than negotiating 8. A swap this tight is now refused at FUND
+        # time, so it can no longer be set up by agreeing to it — which is right, and does not
+        # make the state unreachable: a window closes because BLOCKS PASS after both legs are
+        # locked. Reaching it that way is also the only way it happens in production.
+        coord, p_secret, rpc = await _setup_eth_both_locked(node, url, t_rxd_blocks=12)
         reconciler, channel = _eth_watchtower(node, url, coord, rpc)
 
-        # 1. pre-reveal, window not yet near → WATCH.
+        # 1. pre-reveal, full window → WATCH.
         r = await self._tick(reconciler)
         assert r.decision.intent is Intent.WATCH
         assert channel.pages == []
+
+        # The window CLOSES: 4 blocks pass, leaving the same 8 this test used to negotiate.
+        node.rxd_mine(4)
 
         # 2. maker reveals p but the claim is NOT finalized and t_rxd is too tight to wait
         #    (blocks_left 8 < the 9 a WAIT needs: 8 - reserve 3 < burial 6) → SQUEEZED → PAGE_SQUEEZED.
@@ -672,7 +689,11 @@ class TestEthRxdSwap:
 
     async def test_mutual_refund_when_maker_never_claims(self, env):
         node, url = env
-        coord, cov, _p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=3)
+        # 12, not 3: the fund-time burial gate refuses any t_rxd that can never reach a safe claim
+        # (burial 6 + counter-leg reserve 3 + 1 to mine = 10). A refund test still has to get
+        # PAST funding, and no real operator would negotiate 3 blocks either. The CSV wait below
+        # scales off terms.t_rxd, so nothing else changes.
+        coord, cov, _p_secret, _eth_leg, rpc, _ref = _build(node, url, t_rxd_blocks=12)
         terms = coord.record.terms
         now_unix = _anvil_now(url)
 
@@ -692,6 +713,7 @@ class TestEthRxdSwap:
 
         rec = await coord.mutual_refund()
         assert rec.state is SwapState.MUTUAL_REFUND
-        rxd_spent = node.rxd("gettxout", coord.record.radiant_covenant_outpoint.split(":")[0], "0")
+        _outpoint_txid, _, _outpoint_vout = coord.record.radiant_covenant_outpoint.partition(":")
+        rxd_spent = node.rxd("gettxout", _outpoint_txid, _outpoint_vout or "0")
         assert rxd_spent in (None, ""), "RXD covenant should be refunded (spent) on mutual refund"
         await rpc.close()
