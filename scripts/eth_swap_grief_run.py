@@ -39,6 +39,7 @@ from _dust_swap_shared import (
     atomic_write_mode_600,
     confirm,
     merge_into_mode_600,
+    wait_for_covenant_funding,
 )
 from eth_swap_run import _build_terms_and_covenant, _eth_leg
 from radiant_mainnet_chainio import SshTrRadiantClient
@@ -158,7 +159,22 @@ async def run(args) -> None:
     )
 
     try:
-        # 1. Taker funds the ETH HTLC on Sepolia.
+        # 1. MAKER LOCKS THE RXD COVENANT FIRST. The maker knows p, so a maker that locks SECOND
+        #    holds a free option: watch the taker fund, then walk away having risked nothing. HZ-1
+        #    (#392) enforces it from the other side — taker_funds_btc refuses until the covenant is
+        #    verified on chain, so the previous fund-then-lock order could not complete at all.
+        #
+        #    Note this script STAGES a griefing attack (the maker deliberately stalls later). The
+        #    lock order is not part of the deviation under test: the taker must still be protected
+        #    by HZ-1 while the maker misbehaves in the way this run is actually exercising.
+        await wait_for_covenant_funding(
+            rxd_client,
+            covenant_spk=cov.funded_spk,
+            expected_photons=terms.radiant_amount,
+            poll_s=args.poll_interval_s,
+        )
+
+        # 2. Taker funds the ETH HTLC, then re-validates the covenant pinned to finality.
         confirm("taker_funds: deploy+fund the ETH HTLC on SEPOLIA", auto_yes=args.yes)
         rec = await coord.taker_funds_btc(terms, now_unix_s=int(time.time()))
         report.step(
@@ -172,9 +188,6 @@ async def run(args) -> None:
         # toolkit binds a scraped preimage to (`pyrxd swap recover-preimage --eth-contract`).
         merge_into_mode_600(keys_path, {"eth_contract_address": rec.counterchain_locator.contract_address})
 
-        # 2. Maker locks the RXD covenant on MAINNET (operator funds the SPK).
-        print(f"\n  Fund the RXD covenant SPK on MAINNET (the maker lock; >= 1 conf):\n    {cov.funded_spk.hex()}")
-        confirm("you have funded the RXD covenant SPK on mainnet and it has >= 1 conf", auto_yes=args.yes)
         rec = await coord.post_asset_lock_revalidate(cov.funded_spk, now_unix_s=int(time.time()))
         report.step(
             name="post_asset_lock_revalidate",
@@ -243,6 +256,7 @@ def _args():
     ap.add_argument("--max-covenant-confirm-wait-s", type=int, default=120)
     ap.add_argument("--report-out", default="/tmp/eth_grief_report.json")  # noqa: S108
     ap.add_argument("--keys-out", default="~/.eth_grief_run_keys.json")
+    ap.add_argument("--poll-interval-s", type=float, default=60.0)
     return ap.parse_args()
 
 

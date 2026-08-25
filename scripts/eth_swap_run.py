@@ -48,6 +48,7 @@ from _dust_swap_shared import (
     confirm,
     merge_into_mode_600,
     rxd_blockcount,
+    wait_for_covenant_funding,
 )
 from _glyph_mainnet import (  # scripts/ sibling (NFT + FT paths)
     load_minted_ft,
@@ -317,33 +318,6 @@ def _which(name: str) -> str:
 
 
 # --------------------------------------------------------------------------- sepolia-dust
-
-
-async def wait_for_covenant_funding(client, *, covenant_spk: bytes, expected_photons: int, poll_s: float):
-    """Block until the covenant SPK actually holds a confirmed UTXO. Polls the chain; asks nobody.
-
-    This replaces an operator ATTESTATION — a confirm() reading "you have funded the RXD covenant
-    SPK on mainnet and it has >= 1 conf". An attestation is only as good as the operator's check,
-    and under --yes it was auto-answered: the run asserted a fact nothing had verified, then handed
-    it to a gate that immediately disagreed. A question whose answer is on the chain should be
-    asked of the chain.
-    """
-    client.register_spk(covenant_spk)
-    script_hash = hashlib.sha256(bytes(covenant_spk)).digest()[::-1]
-    print(f"\n  Fund the RXD covenant SPK on MAINNET as the maker ({expected_photons} photons):")
-    print(f"    {covenant_spk.hex()}")
-    print("  waiting for it to appear on chain (this run does NOT proceed until it does)...")
-    while True:
-        utxos = await client.get_utxos(script_hash)
-        for u in utxos or []:
-            if int(u.value) == int(expected_photons):
-                print(f"  covenant funded: {u.txid}:{u.vout} ({u.value} photons)")
-                return u
-        if utxos:
-            # Present but wrong value: say so rather than waiting silently forever. The covenant
-            # pins its amount, so a mis-funded UTXO is not one the swap can ever use.
-            print(f"  SPK holds {[int(u.value) for u in utxos]} photons, need exactly {expected_photons}")
-        await asyncio.sleep(poll_s)
 
 
 async def run_sepolia_dust(args: argparse.Namespace) -> None:

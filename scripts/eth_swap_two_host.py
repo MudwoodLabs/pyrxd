@@ -73,7 +73,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from _dust_swap_shared import atomic_write_mode_600, confirm
+from _dust_swap_shared import atomic_write_mode_600, confirm, wait_for_covenant_via_leg
 
 from pyrxd.btc_wallet import taproot as bt
 from pyrxd.btc_wallet.htlc_leg import AUDIT_CLEARED_NETWORKS
@@ -698,8 +698,14 @@ async def maker_phase_lock_claim(args: argparse.Namespace) -> None:
         print("  -> verified (claimant=maker, refundee=taker, H, timeout, funded)")
 
         # 2. Lock the RXD covenant: the operator funds the SPK out-of-band, then we re-validate.
-        print(f"\n  Fund the RXD covenant SPK on regtest now (>= 1 conf):\n    {covenant_spk_hex}")
-        confirm("you have funded the RXD covenant SPK on regtest and it has >= 1 conf", auto_yes=args.yes)
+        # Poll the chain instead of asking the operator to certify it. The prompt this replaces
+        # auto-answered itself under --yes, so the run asserted a fact nobody had checked.
+        await wait_for_covenant_via_leg(
+            rxd_leg,
+            covenant_spk=bytes.fromhex(covenant_spk_hex),
+            expected_photons=terms.radiant_amount,
+            poll_s=args.poll_interval_s,
+        )
         rec = await coord.post_asset_lock_revalidate(bytes.fromhex(covenant_spk_hex), now_unix_s=int(time.time()))
         if rec.state is not SwapState.BOTH_LOCKED:
             raise SystemExit(f"covenant/timing mismatch -> {rec.state.value}; refund the ETH HTLC after its timeout")

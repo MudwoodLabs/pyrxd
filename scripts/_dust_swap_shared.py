@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -341,3 +342,57 @@ __all__ = [
 # Pre-emptive asyncio guard — silence the noisy import-time warning on Python 3.13+
 # when this module is imported but never await'd. Cheap, removes nothing.
 _ = asyncio
+
+
+async def wait_for_covenant_funding(client, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 30.0):
+    """Block until the covenant SPK actually holds a confirmed UTXO of the pinned amount.
+
+    This replaces an operator ATTESTATION that appeared in every runner — a confirm() reading
+    "you have funded the RXD covenant SPK on mainnet and it has >= 1 conf".
+
+    There are two kinds of prompt in these scripts and they were sharing one flag. An
+    AUTHORISATION ("I am about to broadcast X, proceed?") is exactly what --yes is for: the
+    operator pre-authorised an unattended run. An ATTESTATION asks the operator to certify an
+    external fact, and under --yes it does not skip the question, it FABRICATES the answer — the
+    run then proceeds asserting something nobody checked.
+
+    A question whose answer is on the chain should be asked of the chain.
+    """
+    client.register_spk(covenant_spk)
+    script_hash = hashlib.sha256(bytes(covenant_spk)).digest()[::-1]
+    print(f"\n  Fund the RXD covenant SPK as the maker ({expected_photons} photons):")
+    print(f"    {covenant_spk.hex()}")
+    print("  waiting for it to appear on chain (this run does NOT proceed until it does)...")
+    while True:
+        utxos = await client.get_utxos(script_hash)
+        for u in utxos or []:
+            if int(u.value) == int(expected_photons):
+                print(f"  covenant funded: {u.txid}:{u.vout} ({u.value} photons)")
+                return u
+        if utxos:
+            # Present but wrong value: say so rather than waiting silently forever. The covenant
+            # pins its amount, so a mis-funded UTXO is not one this swap can ever use.
+            print(f"  SPK holds {[int(u.value) for u in utxos]} photons, need exactly {expected_photons}")
+        await asyncio.sleep(poll_s)
+
+
+async def wait_for_covenant_via_leg(leg, *, covenant_spk: bytes, expected_photons: int, poll_s: float = 10.0):
+    """Same contract as :func:`wait_for_covenant_funding`, driven through the RadiantCovenantLeg.
+
+    The two-host scripts hold a leg rather than a raw client, and `find_covenant_utxo` is the
+    PRODUCTION lookup the coordinator itself uses — including its fail-closed value match, so a
+    mis-funded covenant is rejected here instead of surfacing later as a confusing gate refusal.
+    """
+    print(f"\n  Fund the RXD covenant SPK as the maker ({expected_photons} photons):")
+    print(f"    {bytes(covenant_spk).hex()}")
+    print("  waiting for it to appear on chain (this run does NOT proceed until it does)...")
+    while True:
+        try:
+            outpoint, value, _height = await leg.find_covenant_utxo(
+                bytes(covenant_spk), expected_value=int(expected_photons)
+            )
+            print(f"  covenant funded: {outpoint} ({value} photons)")
+            return outpoint, value
+        except Exception as exc:  # not funded yet, or funded with the wrong amount
+            print(f"  not yet: {str(exc)[:110]}")
+        await asyncio.sleep(poll_s)

@@ -20,10 +20,24 @@ from pathlib import Path
 
 import pytest
 
-_RUNNER = Path(__file__).resolve().parent.parent / "scripts" / "eth_swap_run.py"
+_SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
+_RUNNER = _SCRIPTS / "eth_swap_run.py"
+
+#: EVERY runner that funds a counter leg against a Radiant covenant. The bug was found in one of
+#: these and was present in three — including both mainnet runners — so the guard is applied to the
+#: set rather than to the file that happened to surface it.
+_ALL_RUNNERS = [
+    "eth_swap_run.py",
+    "dust_swap_run.py",
+    "eth_swap_grief_run.py",
+    "btc_swap_two_host.py",
+    "eth_swap_two_host.py",
+]
 
 #: Any of these means "the maker's asset is now locked on Radiant".
 _LOCK_CALLS = {"wait_for_covenant_funding", "lock_singleton_into_covenant", "lock_ft_into_covenant"}
+#: The two-host scripts verify the maker's lock through a different call than the dust runners.
+_LOCK_CALLS_ANY = _LOCK_CALLS | {"verify_maker_asset_funded", "taker_verify_asset_funding"}
 _FUND_CALL = "taker_funds_btc"
 
 
@@ -101,3 +115,66 @@ def test_the_operator_is_not_asked_to_attest_that_the_covenant_is_funded(dust_st
     assert "you have funded the RXD covenant SPK" not in src, (
         "the operator attestation is back; poll the chain with wait_for_covenant_funding instead"
     )
+
+
+@pytest.mark.parametrize("script", _ALL_RUNNERS)
+def test_no_runner_asks_the_operator_to_attest_the_covenant_is_funded(script):
+    """Not one of them, not just the one the bug was found in.
+
+    Three of five runners shipped this attestation and two of those were MAINNET. The prompt is not
+    a safety mechanism — HZ-1 checks the covenant independently — but under --yes it makes the run
+    assert a fact nobody verified, which is strictly worse than not asking.
+    """
+    src = (_SCRIPTS / script).read_text()
+    assert "you have funded the RXD covenant SPK" not in src, (
+        f"{script} asks the operator to attest the covenant is funded; --yes fabricates that "
+        "answer. Poll the chain with wait_for_covenant_funding instead."
+    )
+
+
+@pytest.mark.parametrize("script", _ALL_RUNNERS)
+def test_every_runner_locks_the_radiant_asset_before_funding_the_counter_leg(script):
+    """The ordering rule holds for all of them. Checks the whole module, since these scripts differ
+    in shape — some drive the stage from a function, some inline it."""
+    tree = ast.parse((_SCRIPTS / script).read_text())
+    calls = _called_names_in_order(tree)
+    fund = [ln for ln, n in calls if n == _FUND_CALL]
+    lock = [ln for ln, n in calls if n in _LOCK_CALLS_ANY]
+    if not fund:
+        pytest.skip(f"{script} does not fund a counter leg")
+    assert lock, (
+        f"{script} calls {_FUND_CALL} with no Radiant lock step anywhere. HZ-1 refuses that, and a "
+        "maker locking second holds a free option over the taker."
+    )
+    assert min(lock) < min(fund), (
+        f"{script} funds the counter leg (line {min(fund)}) before locking the Radiant asset (line {min(lock)})"
+    )
+
+
+@pytest.mark.parametrize("script", _ALL_RUNNERS)
+def test_the_wait_helpers_are_imported_where_they_are_called(script):
+    """A name used but not imported is a NameError at the worst possible moment.
+
+    Written because it happened: replacing the attestations in the two-host scripts left the helper
+    called and un-imported, and the guards above stayed green — they check call ORDER and the
+    absence of a string, neither of which notices an unresolvable name. Ruff's F821 caught it. This
+    is the cheap in-suite version of that, scoped to the helpers this refactor introduced, so the
+    same slip does not depend on the linter alone.
+    """
+    tree = ast.parse((_SCRIPTS / script).read_text())
+    called = {n for _, n in _called_names_in_order(tree)}
+    imported = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            imported |= {a.asname or a.name for a in node.names}
+        elif isinstance(node, ast.Import):
+            imported |= {(a.asname or a.name).split(".")[0] for a in node.names}
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+            imported.add(node.name)
+
+    for helper in ("wait_for_covenant_funding", "wait_for_covenant_via_leg"):
+        if helper in called:
+            assert helper in imported, (
+                f"{script} calls {helper}() but never imports or defines it — NameError at the "
+                "moment the run reaches the covenant lock, with the counter leg not yet funded"
+            )
