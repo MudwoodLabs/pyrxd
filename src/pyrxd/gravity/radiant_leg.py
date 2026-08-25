@@ -64,6 +64,8 @@ from pyrxd.network._guards import finite_int
 from pyrxd.security.errors import InsufficientFundsError, NetworkError, ValidationError
 from pyrxd.security.types import Hex20
 
+_LOG = logging.getLogger(__name__)
+
 __all__ = [
     "FeeUtxoSource",
     "RadiantBroadcaster",
@@ -231,10 +233,27 @@ class RadiantChainIO:
                 )
             utxos = picked
         if len(utxos) > 1:
-            # Only reachable on the DISCOVERY path (no pin yet). There, ambiguity is genuinely
-            # suspicious and refusing is right: nothing has been committed against a specific
-            # outpoint, so there is nothing to deny.
-            raise NetworkError(f"ambiguous covenant UTXO set ({len(utxos)} candidates); fail-closed")
+            # SELECT, do not refuse. Refusing here was still the attack: the pin's only WRITER
+            # comes through this discovery path, so poisoning the address BEFORE the outpoint is
+            # recorded stopped the pin from ever being written — and every later spend then ran
+            # unpinned, back to the original brick. A refusal that can be triggered by anyone
+            # paying a public address is a denial, not a defence.
+            #
+            # Deterministic rule: the EARLIEST-confirmed match. The honest funding necessarily
+            # precedes any poison (the address is only interesting once it is funded), and both
+            # parties derive the same answer from the same chain, which a "deepest" or "first
+            # returned" rule would not guarantee across differing UTXO orderings. Height 0 means
+            # unconfirmed, which sorts last — a mempool output must never displace a mined one.
+            utxos = sorted(utxos, key=lambda u: (int(u.height) if int(u.height) > 0 else 1 << 62, u.tx_hash, u.tx_pos))
+            _LOG.warning(
+                "covenant scriptPubKey has %d matching UTXOs; selecting the earliest-confirmed "
+                "(%s:%d at height %s). Extra payments to a covenant address are anyone's to make "
+                "and must not block the spend.",
+                len(utxos),
+                utxos[0].tx_hash,
+                utxos[0].tx_pos,
+                utxos[0].height,
+            )
         u = utxos[0]
         return f"{u.tx_hash}:{u.tx_pos}", int(u.value), int(u.height)
 

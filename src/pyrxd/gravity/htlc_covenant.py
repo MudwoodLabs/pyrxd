@@ -164,7 +164,15 @@ def _minimal_num_push(n: int) -> bytes:
     # cannot audit the second once the script is assembled because it can no longer tell a numeric
     # operand from a 32-byte hash. Checking here, where the type IS known, is the reliable place.
     body = encode_script_num(n)
-    if len(body) > 8 or body != encode_script_num(decode_script_num(body)):
+    # `decode(encode(n)) == n`, NOT `encode(decode(body)) == body`. The latter is a TAUTOLOGY —
+    # `encode_script_num` is canonical by construction, so re-encoding its own output can never
+    # differ, and the check could not fail for any input. (Verified by sweeping 0..300 plus the
+    # 2**31 / 2**62 / 2**63-1 edges: zero values where it differs.) That is the same defect as the
+    # script-level gate removed in the sibling commit, written into its replacement.
+    #
+    # This form can fail: it catches an encoder or decoder that disagree about a value, which is
+    # the actual hazard — a mis-encoded operand bricks both covenant branches permanently.
+    if len(body) > 8 or decode_script_num(body) != n:
         raise ValidationError(
             f"script number {n} does not have a minimal CScriptNum body (got {body.hex()}); a "
             "non-minimal body trips CScriptNum::IsMinimallyEncoded and permanently bricks the "

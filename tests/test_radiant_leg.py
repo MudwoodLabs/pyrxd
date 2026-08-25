@@ -243,15 +243,34 @@ async def test_covenant_outpoint_fail_closed_when_unfunded():
         await leg.covenant_outpoint(terms)
 
 
-async def test_covenant_outpoint_ambiguous_utxo_fail_closed():
+async def test_covenant_outpoint_selects_the_earliest_confirmed_of_several():
+    """Was `..._ambiguous_utxo_fail_closed`, asserting a refusal.
+
+    That refusal was the attack one step earlier than the one it appeared to prevent: this is the
+    path that WRITES the outpoint later spends pin to, so anyone paying the covenant address before
+    it ran stopped the pin from ever being recorded, and every subsequent spend went back to
+    re-discovering — and refusing. Selecting the earliest-confirmed match is deterministic for both
+    parties and picks the honest funding, which necessarily precedes any poison.
+    """
     terms = _rxd_terms(amount=100_000)
     dupes = [
-        UtxoRecord(tx_hash="cd" * 32, tx_pos=0, value=100_000, height=100),
-        UtxoRecord(tx_hash="ce" * 32, tx_pos=1, value=100_000, height=101),
+        UtxoRecord(tx_hash="ce" * 32, tx_pos=1, value=100_000, height=101),  # later — the poison
+        UtxoRecord(tx_hash="cd" * 32, tx_pos=0, value=100_000, height=100),  # earlier — the real one
     ]
     leg = _leg(client=FakeClient(utxos=dupes))
-    with pytest.raises(NetworkError, match="ambiguous"):
-        await leg.covenant_outpoint(terms)
+    assert await leg.covenant_outpoint(terms) == "cd" * 32 + ":0"
+
+
+async def test_covenant_outpoint_prefers_a_CONFIRMED_output_over_a_mempool_one():
+    """Height 0 means unconfirmed. A mempool output must never displace a mined one, or an attacker
+    could steer the selection for free by broadcasting rather than paying."""
+    terms = _rxd_terms(amount=100_000)
+    dupes = [
+        UtxoRecord(tx_hash="ff" * 32, tx_pos=0, value=100_000, height=0),  # unconfirmed
+        UtxoRecord(tx_hash="cd" * 32, tx_pos=0, value=100_000, height=900),  # mined, but later-looking
+    ]
+    leg = _leg(client=FakeClient(utxos=dupes))
+    assert await leg.covenant_outpoint(terms) == "cd" * 32 + ":0"
 
 
 async def test_find_covenant_utxo_registers_spk_for_registry_client():
@@ -1033,14 +1052,22 @@ class TestASecondPaymentToTheCovenantCannotBlockTheSpend:
         assert value == 100_000
 
     @pytest.mark.asyncio
-    async def test_WITHOUT_a_pin_an_ambiguous_set_is_still_refused(self) -> None:
-        """The discovery path keeps its fail-closed behaviour: nothing has been committed against a
-        specific outpoint yet, so there is nothing for a refusal to deny."""
+    async def test_WITHOUT_a_pin_the_EARLIEST_CONFIRMED_match_is_selected(self) -> None:
+        """The discovery path must SELECT, not refuse — and this test previously asserted the
+        opposite, on the reasoning that "nothing has been committed yet, so there is nothing for a
+        refusal to deny". That was wrong: the pin's only WRITER comes through this path, so
+        poisoning the address before the outpoint is recorded stopped the pin from ever being
+        written, and every later spend ran unpinned. The refusal WAS the attack, one step earlier.
+
+        The honest funding necessarily precedes any poison, so earliest-confirmed picks it — and it
+        is deterministic across both parties, which "first returned" would not be.
+        """
         client = FakeClient()
         client._utxos = self._two_utxos(100_000)
         io = RadiantChainIO(client)
-        with pytest.raises(NetworkError, match="ambiguous"):
-            await io.find_covenant_utxo(b"\x00" * 25, expected_value=100_000)
+        outpoint, value, height = await io.find_covenant_utxo(b"\x00" * 25, expected_value=100_000)
+        assert outpoint == "ab" * 32 + ":1", "the later (poison) output was selected"
+        assert value == 100_000 and height == 100
 
     @pytest.mark.asyncio
     async def test_a_pin_that_is_NOT_in_the_live_set_is_refused(self) -> None:

@@ -1354,9 +1354,17 @@ class SwapCoordinator:
         # `rxd_reorg_cost_per_block` and a value-at-risk there is no basis to scale, the flat
         # burial stands, and there is nothing to check — see `_value_scaled_burial_blocks`.
         try:
-            required_burial = _value_scaled_burial_blocks(
-                self.config.margin_policy, self.config.margin_policy.value_at_risk_photons
-            )
+            # max(flat, value-scaled) — the SAME term `assess_claim_finality` uses at claim time
+            # (see the `rxd_burial = max(flat_burial, ...)` line there). Checking the value-scaled
+            # component alone let the FLAT burial dominate unnoticed: with the default 6-block flat
+            # burial and economics yielding a value-scaled 1, a t_rxd of 3 passed this gate and
+            # then SQUEEZED on every claim — precisely the state this exists to prevent. It also
+            # made the gate inert whenever `rxd_reorg_cost_per_block` was unset, since the
+            # value-scaled term is 0 there, so the flat burial was checked at NO point before the
+            # taker committed, in any configuration.
+            mp = self.config.margin_policy
+            flat_burial = _reserve_to_blocks(mp.rxd_claim_burial, mp.block_interval_s)
+            required_burial = max(flat_burial, _value_scaled_burial_blocks(mp, mp.value_at_risk_photons))
             if required_burial > 0:
                 t_rxd_blocks = int(terms.t_rxd.value)
                 if t_rxd_blocks < required_burial:

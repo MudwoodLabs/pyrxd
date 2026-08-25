@@ -1313,6 +1313,49 @@ def test_assess_claim_finality_f007_rxd_interval_scaling():
     assert assess_claim_finality(counter_claim_finality=_verdict(1, p1), **base, policy=p1) is ClaimFinality.WAIT
 
 
+def test_assess_claim_finality_uses_the_FAST_TAIL_interval_for_the_reserve():
+    """The production caller for the fast/slow split (#509).
+
+    The split was previously tested only by calling `_dividing_interval_s` directly — so reverting
+    all three call sites to the nominal field left the whole suite green. Mechanism proven, caller
+    unproven, which is the failure class this project keeps finding. This drives the real
+    `assess_claim_finality` and asserts the VERDICT changes.
+
+    Dividing by a SMALLER interval yields MORE reserve blocks, so a fast tail must be able to turn
+    a WAIT into a SQUEEZED — that is the whole point of reserving against a fast chain.
+    """
+
+    def _p(nominal, fast):
+        return MarginPolicy(
+            margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+            block_interval_s=600.0,
+            is_measured=False,
+            rxd_block_interval_s=nominal,
+            rxd_block_interval_fast_s=fast,
+            btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+            rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        )
+
+    base = dict(
+        now_rxd_height=1006,
+        asset_locked_at_height=1000,
+        t_rxd=t.Timelock(20, t.TimeUnit.BLOCKS),  # 14 blocks left
+    )
+    # Nominal 600s == BTC interval: reserve = ceil(6 * 600/600) = 6; 14 - 6 = 8 >= burial 6 -> WAIT.
+    nominal_only = _p(600.0, None)
+    assert (
+        assess_claim_finality(counter_claim_finality=_verdict(1, nominal_only), **base, policy=nominal_only)
+        is ClaimFinality.WAIT
+    )
+    # Same policy, but a measured FAST tail of 300s: reserve = ceil(6 * 600/300) = 12; 14 - 12 = 2
+    # < 6 -> SQUEEZED. The nominal field is unchanged, so ONLY the fast tail can produce this.
+    with_fast = _p(600.0, 300.0)
+    assert (
+        assess_claim_finality(counter_claim_finality=_verdict(1, with_fast), **base, policy=with_fast)
+        is ClaimFinality.SQUEEZED
+    ), "the reserve ignored rxd_block_interval_fast_s — the split is not wired to this call site"
+
+
 def test_assess_claim_finality_parity_sweep_byte_equivalent():
     """Auditor-grade regression: the verdict refactor reproduces the OLD int-based
     SAFE/WAIT/SQUEEZED decision byte-for-byte. Sweeps confs in 0..2*depth across several
@@ -3022,11 +3065,13 @@ async def test_resume_REFUSES_terms_that_disagree_with_the_persisted_record(tmp_
     assert "fund" not in leg.calls
 
 
-def _valued_policy(*, t_rxd_ok: bool):
+def _valued_policy():
     """A policy carrying real economics, so the value-scaled burial actually binds.
 
-    `cost` and `value` are chosen so B(V) = ceil(value/cost) is a round number, and the test picks
-    a t_rxd on either side of it.
+    `cost` and `value` are chosen so B(V) = ceil(value/cost) is exactly 30, and each test picks a
+    `t_rxd` on one side of that. The variation lives in `_terms(t_rxd_blocks=...)`, NOT here — an
+    earlier version took a `t_rxd_ok` flag it never read, which implied the policy itself was
+    tailored per case when every call returned the same object.
     """
     return MarginPolicy(
         margin=t.Timelock(36, t.TimeUnit.BLOCKS),
@@ -3054,7 +3099,7 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
     async def test_a_t_rxd_too_small_for_the_burial_is_REFUSED_before_funding(self) -> None:
         _secret, h = generate_secret()
         terms = _terms(hashlock=h, t_rxd_blocks=29)  # B(V) = 30
-        coord = _coordinator(terms=terms, policy=_valued_policy(t_rxd_ok=False))
+        coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert not gate.ok
         assert "value-scaled claim burial" in gate.reason, gate.reason
@@ -3066,17 +3111,35 @@ class TestTRxdMustBeAbleToContainTheValueScaledBurial:
         swaps."""
         _secret, h = generate_secret()
         terms = _terms(hashlock=h, t_rxd_blocks=30)
-        coord = _coordinator(terms=terms, policy=_valued_policy(t_rxd_ok=True))
+        coord = _coordinator(terms=terms, policy=_valued_policy())
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason
 
     @pytest.mark.asyncio
-    async def test_a_policy_with_NO_economics_does_not_bind(self) -> None:
-        """Without a measured reorg cost and a value-at-risk there is no basis to scale, the flat
-        burial stands, and there is nothing to check. Binding here would refuse every dust run."""
+    async def test_the_FLAT_burial_binds_even_without_economics(self) -> None:
+        """This test previously asserted the opposite — that a policy without economics does not
+        bind — which encoded the same mistake as the gate it was testing.
+
+        The gate checked only the VALUE-SCALED term, which is 0 when no reorg cost is configured.
+        So with the default 6-block flat burial, a t_rxd of 1 sailed through and then SQUEEZED on
+        every claim. The flat burial was checked at NO point before the taker committed, in any
+        configuration — and it is the term that dominates in exactly the dust runs this was
+        supposed to leave alone.
+        """
         _secret, h = generate_secret()
-        terms = _terms(hashlock=h, t_rxd_blocks=1)
-        coord = _coordinator(terms=terms)  # estimated policy, no economics
+        terms = _terms(hashlock=h, t_rxd_blocks=1)  # flat burial defaults to 6
+        coord = _coordinator(terms=terms)
+        gate = await coord.pre_btc_lock_check(terms)
+        assert not gate.ok
+        assert "claim burial" in gate.reason, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_an_ORDINARY_t_rxd_still_passes_without_economics(self) -> None:
+        """The paired honest path. Binding on the flat burial must not refuse a normal swap — the
+        default flat burial is 6 blocks and ordinary windows are far larger."""
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=72)
+        coord = _coordinator(terms=terms)
         gate = await coord.pre_btc_lock_check(terms)
         assert gate.ok, gate.reason
 
@@ -3096,7 +3159,7 @@ class TestReservesUseTheFastTailInterval:
         about a sixth of the window it is meant to protect."""
         from pyrxd.gravity.swap_coordinator import _dividing_interval_s
 
-        nominal = _valued_policy(t_rxd_ok=True)
+        nominal = _valued_policy()
         assert _dividing_interval_s(nominal) == nominal.rxd_block_interval_s
 
         fast = dataclasses.replace(nominal, rxd_block_interval_fast_s=43.0)
@@ -3108,14 +3171,14 @@ class TestReservesUseTheFastTailInterval:
         reserves; the split tightens only where an operator opts in or real-value mode demands it."""
         from pyrxd.gravity.swap_coordinator import _dividing_interval_s
 
-        p = _valued_policy(t_rxd_ok=True)
+        p = _valued_policy()
         assert p.rxd_block_interval_fast_s is None
         assert _dividing_interval_s(p) == p.rxd_block_interval_s
 
     def test_a_fast_tail_SLOWER_than_the_nominal_is_refused(self) -> None:
         """The two swapped is the failure that would silently UNDER-reserve while looking correct."""
         with pytest.raises(ValidationError, match="cannot be slower"):
-            dataclasses.replace(_valued_policy(t_rxd_ok=True), rxd_block_interval_fast_s=999.0)
+            dataclasses.replace(_valued_policy(), rxd_block_interval_fast_s=999.0)
 
     def test_real_value_mode_REQUIRES_a_fast_tail(self) -> None:
         from pyrxd.gravity.eth_rxd_timelock import CrossClockMargin
