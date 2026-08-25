@@ -3020,3 +3020,62 @@ async def test_resume_REFUSES_terms_that_disagree_with_the_persisted_record(tmp_
     with pytest.raises(ValidationError, match="do not match the persisted record"):
         await coord.resume_interrupted_fund(other, sink=sink, now_unix_s=_NOW)
     assert "fund" not in leg.calls
+
+
+def _valued_policy(*, t_rxd_ok: bool):
+    """A policy carrying real economics, so the value-scaled burial actually binds.
+
+    `cost` and `value` are chosen so B(V) = ceil(value/cost) is a round number, and the test picks
+    a t_rxd on either side of it.
+    """
+    return MarginPolicy(
+        margin=t.Timelock(36, t.TimeUnit.BLOCKS),
+        block_interval_s=600.0,
+        is_measured=False,
+        btc_claim_reorg_depth=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_claim_burial=t.Timelock(6, t.TimeUnit.BLOCKS),
+        rxd_reorg_cost_per_block=100_000,
+        value_at_risk_photons=3_000_000,  # B(V) = 30 blocks at factor 1.0
+    )
+
+
+class TestTRxdMustBeAbleToContainTheValueScaledBurial:
+    """`assess_claim_finality` returns SAFE only when `blocks_left >= B(V)`, and `blocks_left` is at
+    best `t_rxd`. So SAFE is reachable AT ALL only if `t_rxd >= B(V)` — and that was checked nowhere
+    before the taker committed its counter leg.
+
+    The maker chooses `t_rxd`, and shrinking it made the ordering gate pass MORE easily (`t_btc -
+    t_rxd` grows), so the one gate that looked at `t_rxd` rewarded exactly the direction that
+    nullifies the burial. A maker could hand over a swap that is unconditionally SQUEEZED, and the
+    taker would discover it only after revealing.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_t_rxd_too_small_for_the_burial_is_REFUSED_before_funding(self) -> None:
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=29)  # B(V) = 30
+        coord = _coordinator(terms=terms, policy=_valued_policy(t_rxd_ok=False))
+        gate = await coord.pre_btc_lock_check(terms)
+        assert not gate.ok
+        assert "value-scaled claim burial" in gate.reason, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_a_t_rxd_that_EXACTLY_fits_the_burial_is_accepted(self) -> None:
+        """The boundary. A guard that refuses valid work is a bug, and this one sits directly on a
+        parameter an honest maker has to choose — refusing at equality would reject correctly-sized
+        swaps."""
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=30)
+        coord = _coordinator(terms=terms, policy=_valued_policy(t_rxd_ok=True))
+        gate = await coord.pre_btc_lock_check(terms)
+        assert gate.ok, gate.reason
+
+    @pytest.mark.asyncio
+    async def test_a_policy_with_NO_economics_does_not_bind(self) -> None:
+        """Without a measured reorg cost and a value-at-risk there is no basis to scale, the flat
+        burial stands, and there is nothing to check. Binding here would refuse every dust run."""
+        _secret, h = generate_secret()
+        terms = _terms(hashlock=h, t_rxd_blocks=1)
+        coord = _coordinator(terms=terms)  # estimated policy, no economics
+        gate = await coord.pre_btc_lock_check(terms)
+        assert gate.ok, gate.reason

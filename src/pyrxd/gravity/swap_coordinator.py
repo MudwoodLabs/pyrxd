@@ -1285,6 +1285,42 @@ class SwapCoordinator:
         except ValidationError as exc:
             return PreBtcLockGate(ok=False, reason=f"margin check failed: {exc}")
 
+        # 3b. t_rxd must be able to CONTAIN the value-scaled claim burial.
+        #
+        # `assess_claim_finality` returns SAFE only when `blocks_left >= B(V)`, and `blocks_left` is
+        # at best `t_rxd` — at the instant the covenant is mined. So SAFE is reachable at all only
+        # if `t_rxd >= B(V)`. That was checked nowhere before the taker committed: the burial was
+        # verified at CLAIM time, when the value is already locked and the only remaining choices
+        # are to accept the reorg risk or walk away.
+        #
+        # The MAKER chooses t_rxd. And shrinking it makes the ordering check above pass MORE
+        # easily, because `t_btc - t_rxd` grows — so the one gate that did look at t_rxd rewarded
+        # exactly the direction that nullifies the burial. A maker could hand a taker a swap that
+        # is unconditionally SQUEEZED and the taker would only find out after revealing.
+        #
+        # Binds only when the policy actually carries the economics (a measured policy). Without
+        # `rxd_reorg_cost_per_block` and a value-at-risk there is no basis to scale, the flat
+        # burial stands, and there is nothing to check — see `_value_scaled_burial_blocks`.
+        try:
+            required_burial = _value_scaled_burial_blocks(
+                self.config.margin_policy, self.config.margin_policy.value_at_risk_photons
+            )
+            if required_burial > 0:
+                t_rxd_blocks = int(terms.t_rxd.value)
+                if t_rxd_blocks < required_burial:
+                    return PreBtcLockGate(
+                        ok=False,
+                        reason=(
+                            f"t_rxd is {t_rxd_blocks} blocks but the value-scaled claim burial needs "
+                            f"{required_burial} — this swap can NEVER reach a safe claim. The taker "
+                            "would reveal, find every claim SQUEEZED, and be left choosing between "
+                            "a reorg-reversible claim and walking away from a funded counter leg. "
+                            "Negotiate a longer t_rxd, or a lower value-at-risk."
+                        ),
+                    )
+        except ValidationError as exc:
+            return PreBtcLockGate(ok=False, reason=f"burial-vs-t_rxd check failed; fail-closed ({exc})")
+
         # 4. Maker-promised BTC params match locally re-derived funding SPK.
         try:
             expected_spk = self.counter_leg.derive_funding_scriptpubkey(terms)
